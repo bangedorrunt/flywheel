@@ -149,7 +149,7 @@ mod tests {
         m.presence.insert(
             "BrashOtter".into(),
             Presence::Busy {
-                source: "herdr".into(),
+                source: "hc".into(),
             },
         );
         m.presence.insert(
@@ -328,7 +328,7 @@ mod tests {
         use crate::workspace::Msg;
 
         let model = populated();
-        let msg = Msg::HerdrStatus {
+        let msg = Msg::PlaneStatus {
             pin: "BrashOtter".into(),
             status: "idle".into(),
         };

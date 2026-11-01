@@ -25,7 +25,7 @@ pub(crate) enum DoorbellCmd {
         workspace: String,
     },
     /// re-inject the peer-aware handler + identity line into EXISTING panes
-    /// (covers herdr pane-split additions and post-crash respawns).
+    /// (covers hc terminal-split additions and post-crash respawns).
     ReInject { project: String },
     /// batch captain-relevant wakes since the last digest (ADR-0010 D5).
     /// Folds tick from Default over the doorbell journal (same trust
@@ -91,7 +91,7 @@ pub(crate) enum DoorbellCmd {
     },
     /// subscribe an identity to wake delivery (D8, bd-woha): identity ×
     /// scope × sink × budget row in the subscription store. Cross-workspace
-    /// scopes and non-herdr sinks require the operator (refused loudly).
+    /// scopes and non-hc sinks require the operator (refused loudly).
     Subscribe {
         /// home workspace
         #[arg(long)]
@@ -99,8 +99,8 @@ pub(crate) enum DoorbellCmd {
         /// pin (adjective+noun) to subscribe
         #[arg(long)]
         pin: String,
-        /// sink: herdr (default), webhook, dm (endpoint binds at the adapter)
-        #[arg(long, default_value = "herdr")]
+        /// sink: hc (default), webhook, dm (endpoint binds at the adapter)
+        #[arg(long, default_value = "hc")]
         sink: String,
         /// where this row's wake lands (bd-8ulu): the webhook endpoint URL,
         /// e.g. `http://127.0.0.1:18999/wake`. Per-row, so two subscribers
@@ -118,7 +118,7 @@ pub(crate) enum DoorbellCmd {
         #[arg(long)]
         project: Option<String>,
     },
-    /// nearby join: herdr panes ∪ registry pins ∪ reservations (bd-gpj0.2).
+    /// nearby join: hc terminals ∪ registry pins ∪ reservations (bd-gpj0.2).
     /// One query instead of pane list + tokens + whois + git log.
     Roster {
         project: String,
@@ -290,7 +290,7 @@ fn run_introduce_subscribe(
         &Config::default(),
         workspace,
         pin,
-        "herdr",
+        "hc",
         None,
         &[],
         Some(project),
@@ -315,9 +315,9 @@ pub(crate) fn cmd_doorbell_roster(cfg: &Config, project: &str, json: bool) -> Re
             Some((pin, e.pane_id.clone(), e.name.clone()))
         })
         .collect();
-    let herdr = nearby_plane_agents(cfg);
+    let hc = nearby_plane_agents(cfg);
     let leases = nearby_leases(project);
-    let rows = crate::doorbell::join_nearby(&reg, &herdr, &leases);
+    let rows = crate::doorbell::join_nearby(&reg, &hc, &leases);
     if json {
         crate::output::print_json(&serde_json::to_value(&rows).unwrap_or_default());
     } else {
@@ -330,8 +330,8 @@ pub(crate) fn cmd_doorbell_roster(cfg: &Config, project: &str, json: bool) -> Re
 
 fn nearby_plane_agents(cfg: &Config) -> Vec<(String, String, String)> {
     // bd-f8zk: the roster reads the SELECTED plane. It used
-    // to connect to herdr directly, so on a rex plane every spawned pin joined
-    // against an empty herdr set and rendered `state=missing` while its pane
+    // to connect to hc directly, so on a rex plane every spawned pin joined
+    // against an empty hc set and rendered `state=missing` while its pane
     // was live and idle.
     let Ok(backend) = crate::backend::multiplexer_backend(cfg) else {
         return Vec::new();
@@ -590,10 +590,10 @@ pub(crate) fn cmd_doorbell_subscribe(
         Actor, Budget, Filter, Identity, Scope, SinkKind, Subscription, SubscriptionStore,
     };
     let kind = match sink {
-        "herdr" => SinkKind::Herdr,
+        "hc" => SinkKind::Hc,
         "webhook" => SinkKind::Webhook,
         "dm" => SinkKind::Dm,
-        other => anyhow::bail!("unknown sink {other} (herdr|webhook|dm)"),
+        other => anyhow::bail!("unknown sink {other} (hc|webhook|dm)"),
     };
     let mut ws = vec![workspace.to_string()];
     for e in extra {
@@ -607,8 +607,8 @@ pub(crate) fn cmd_doorbell_subscribe(
         Scope::Many(ws.clone())
     };
     // Console is the operator: cross-scope rows are operator-intended.
-    // Single-workspace herdr rows stay local-process.
-    let cross = scope.is_cross(workspace) || kind != SinkKind::Herdr;
+    // Single-workspace hc rows stay local-process.
+    let cross = scope.is_cross(workspace) || kind != SinkKind::Hc;
     let actor = if cross {
         Actor::operator()
     } else {
@@ -802,7 +802,7 @@ pub(crate) fn cmd_doorbell_digest(
 }
 
 /// bd-durable-doorbell-lngf requirement 4: re-inject the peer-aware handler
-/// and identity line into EXISTING panes — covers herdr pane-split additions
+/// and identity line into EXISTING panes — covers hc terminal-split additions
 /// and post-crash respawns that never got the spawn-time injection.
 pub(crate) fn cmd_doorbell_re_inject(cfg: &Config, project: &str) -> Result<()> {
     // bd-blank-project-spelling-non-mail-doors-76hi
@@ -860,7 +860,7 @@ pub(crate) fn cmd_internal_doorbell(
         return Ok(());
     }
     if once {
-        // herdr-mock: no pid file (must not clobber a live dispatcher).
+        // hc-mock: no pid file (must not clobber a live dispatcher).
         let mut map = BTreeMap::new();
         for pair in status {
             if let Some((pin, st)) = crate::doorbell::parse_status_pair(pair) {

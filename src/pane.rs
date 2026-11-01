@@ -1,14 +1,14 @@
 // governed-by: ADR-0024
 // governed-by: ADR-0027
 // governed-by: ADR-0011
-//! Pane runner (ADR-0010 Spec A pane row, P10.3, bd-ghcj.1): real herdr
+//! Pane runner (ADR-0010 Spec A pane row, P10.3, bd-ghcj.1): real hc
 //! PANE execution for interactive workflows — a crew pre-spawned from the
 //! workflow's `crew` plan, then each `dispatch_job` step sent to the running
 //! pane via the loop's proven `__send` confirmed-send leaf.
 
 //!
 //! - **Crew pre-spawn**: [`pre_spawn_crew`] turns a [`CrewPlan`] (role →
-//!   count) into real herdr panes: profile → harness/model → pane split +
+//!   count) into real hc terminals: profile → harness/model → pane split +
 //!   `agent_start` (kind = harness, AGENT_ARG = `--model` per harness),
 //!   recorded in the spawn registry with a PROFILE column so `@role` resolves
 //!   to a running pane.
@@ -18,7 +18,7 @@
 //!   leaf, no new dispatch code.
 //! - **Lifecycle**: ephemeral default (the caller reaps the workspace at run
 //!   end) + `--reuse WORKSPACE` (bind to the caller's workspace, never reap)
-//!   + `--retain` (keep the spawned workspace). herdr owns the panes — they
+//!   + `--retain` (keep the spawned workspace). hc owns the panes — they
 //!     survive a flywheel crash; the spawn registry re-binds them.
 //!
 //! governed-by: ADR-0024
@@ -91,7 +91,7 @@ impl LiveRegistry {
 
 /// bd-qx0z: dispatch-time registry for runners without a live client in
 /// scope (cron engines): load + prune against a fresh pane listing.
-/// Fail-open: an unreachable herdr keeps every loaded row (today's
+/// Fail-open: an unreachable hc keeps every loaded row (today's
 /// behavior — no regression, just no pruning). One socket roundtrip per
 /// construction; callers build once per engine, not per step.
 pub fn live_registry_for_dispatch(project: &str) -> LiveRegistry {
@@ -105,7 +105,7 @@ pub fn live_registry_for_dispatch(project: &str) -> LiveRegistry {
 }
 
 /// Names a crew pane: `crew-<workflow>-<role><ordinal>` (1-based per role),
-/// lowercased + non-alnum collapsed to `-` (herdr agent names: lowercase
+/// lowercased + non-alnum collapsed to `-` (hc agent names: lowercase
 /// letters/digits/-/_ only, 1-32 chars). Role is the stripped profile ref
 /// (`@planner` → `planner`); the name is unique within the run and carries
 /// the profile for registry resolution.
@@ -136,14 +136,14 @@ pub fn crew_agent_name(wf_name: &str, role: &str, ordinal: u32) -> String {
 /// Wait for a spawned role's pane to appear in `live_panes`, bounded.
 ///
 /// A row in the spawn registry is proof the pane was created, so its absence
-/// from herdr's listing is a spawn/list race rather than a dead pane — and
+/// from hc's listing is a spawn/list race rather than a dead pane — and
 /// [`live_registry_for_dispatch`]'s prune cannot tell those apart, because it
-/// drops every row whose `pane_id` herdr did not return. Without this, a crew
+/// drops every row whose `pane_id` hc did not return. Without this, a crew
 /// that spawned correctly loses the whole run to a missing-role bail.
 ///
 /// `live_panes` returns `None` when the probe is unavailable, which is treated
 /// as "cannot confirm" and keeps polling until the window closes — the same
-/// fail-open posture the prune already takes for an unreachable herdr.
+/// fail-open posture the prune already takes for an unreachable hc.
 ///
 /// The wait is bounded on purpose: an unbounded poll would hang the run on a
 /// genuinely dead pane. `None` means the window closed without the pane, and
@@ -353,7 +353,7 @@ pub fn resolve_pane_entry_nth<'a>(
 /// skills_injected=true mutes the readiness gate). Pure — the caller
 /// supplies the live pane set and decides failure policy.
 ///
-/// This is the DISPATCH gate, not the persisted clear: whatever herdr does not
+/// This is the DISPATCH gate, not the persisted clear: whatever hc does not
 /// list is not dispatchable, whatever its harness. The persisted reap
 /// ([`reap_closed_rows`]) asks the stricter bd-j0b5 question before it drops a
 /// row for good.
@@ -369,7 +369,7 @@ pub fn prune_dead_pane_rows(
 
 /// bd-bfwj: split a registry into the rows that survive the persisted clear
 /// plus a pruned count, given the live pane set. bd-j0b5: a gone pane is death
-/// only for a harness herdr injects — a mail-only pin keeps its row. Pure —
+/// only for a harness hc injects — a mail-only pin keeps its row. Pure —
 /// tests pin the decision, the IO helper below supplies the live set and
 /// persists.
 pub fn reap_closed_rows(
@@ -429,7 +429,7 @@ pub fn reap_dead_registry_rows(project: &str, c: &mut Client) -> usize {
         }
     }
 }
-/// bd-nwnb: the dead-row gauge core — rows herdr may clear, as
+/// bd-nwnb: the dead-row gauge core — rows hc may clear, as
 /// (pane_id, name) pairs. bd-p09m: a row is dead only when
 /// [`crate::pane_keep::pane_binding_may_clear`] is true, so a mail-only row
 /// the reap keeps never shows as dead. Pure; [`dead_registry_rows`] supplies
@@ -510,7 +510,7 @@ pub fn ensure_crew(plan: &CrewPlan, wf_name: &str) -> Result<()> {
 
 /// Pre-spawn the crew for a pane-mode run: resolve the project workspace
 /// (create or `--reuse`), then for each (role, count) in the plan spawn
-/// `count` herdr panes with the profile's harness + model. Registry entries
+/// `count` hc terminals with the profile's harness + model. Registry entries
 /// carry the PROFILE column; the workspace + entries come back in
 /// [`PaneRunCtx`] for the runner and the run-end reap decision.
 ///
@@ -533,7 +533,7 @@ pub fn pre_spawn_crew(
 ) -> Result<PaneRunCtx> {
     ensure_crew(plan, wf_name)?;
     // Rex door: a set REX_SESSION selects the rex multiplexer arm below —
-    // the herdr `Client` path after it stays exactly as it was. No
+    // the hc `Client` path after it stays exactly as it was. No
     // `Client::connect` on the rex arm.
     if rex_door_selected(cfg) {
         return pre_spawn_crew_rex(
@@ -626,7 +626,7 @@ pub fn pre_spawn_crew(
             reap_dead_registry_rows(project, &mut c);
         } else {
             bail!(
-                "found {} pre-existing workspace(s) for {project} — stale panes would race the crew: {}. Close them first (flywheel kill {project} or herdr workspace close <id>), or pass --retire-orphans / --reuse.",
+                "found {} pre-existing workspace(s) for {project} — stale panes would race the crew: {}. Close them first (flywheel kill {project} or terminal workspace close <id>), or pass --retire-orphans / --reuse.",
                 orphans.len(),
                 detail.join(", ")
             );
@@ -746,12 +746,12 @@ fn shell_gate_refusal(name: &str, pane_id: &str) -> anyhow::Error {
 
 /// Rex-native spawn door (LinenQuill: `REX_SESSION` selects the multiplexer).
 /// A set, non-empty `REX_SESSION` means this process runs inside rex, so the
-/// doors target rex; empty/missing keeps today's herdr `Client` path.
+/// doors target rex; empty/missing keeps today's hc `Client` path.
 pub(crate) fn rex_door_selected(cfg: &crate::config::Config) -> bool {
     // NOT `REX_SESSION`: since bd-rex-default-plane `auto` is rex-primary
     // whatever the env says, so a door keyed on the env split the planes —
     // measured 2026-10-31 with the rex CLI restored: `rex list` showed the
-    // spawned session, while `flywheel status` took the herdr client and
+    // spawned session, while `flywheel status` took the hc client and
     // reported "no flywheel swarm". One resolved plane (bd-mknvb), one door.
     crate::backend::factory::resolve_plane(cfg).plane == crate::backend::factory::Plane::Rex
 }
@@ -781,9 +781,9 @@ fn rex_quote_env_value(v: &str) -> String {
 }
 
 /// Build the one-string rex launch command. `session.new_split` has no env
-/// map, so the pane env rides as an `env K=V` prefix (LinenQuill). `HERDR_*`
-/// integration env belongs to the herdr plane and is dropped — a rex pane
-/// must not chase a herdr socket. Pure so the contract is testable.
+/// map, so the pane env rides as an `env K=V` prefix (LinenQuill). `plane_*`
+/// integration env belongs to the hc plane and is dropped — a rex pane
+/// must not chase an hc socket. Pure so the contract is testable.
 pub(crate) fn rex_env_command(
     env: &BTreeMap<String, String>,
     kind: &str,
@@ -792,7 +792,12 @@ pub(crate) fn rex_env_command(
     let mut parts = Vec::new();
     // BTreeMap iterates sorted, so the prefix order is deterministic.
     for (k, v) in env {
-        if k == "HERDR_ENV" || k.starts_with("HERDR_") {
+        if k == "HC_SOCKET_PATH"
+            || k == "HC_SESSION"
+            || k == "HC_TERMINAL_ID"
+            || k == "HC_TAB_ID"
+            || k == "HC_WORKSPACE_ID"
+        {
             continue;
         }
         parts.push(format!("{k}={}", rex_quote_env_value(v)));
@@ -811,9 +816,9 @@ pub(crate) fn rex_env_command(
 
 ///Wait for a rex pane's shell: `program_status` (read through the backend's
 /// agent list, which derives statuses from it) must read `idle` or `working`
-/// within `timeout`. Fail-closed with the same refusal as the herdr gate —
+/// within `timeout`. Fail-closed with the same refusal as the hc gate —
 /// typing into a booting shell mangles the launch. Never calls
-/// `herdr::wait_shell_prompt` (that prober speaks herdr, not rex). A backend
+/// `hc::wait_shell_prompt` (that prober speaks hc, not rex). A backend
 /// that never answers is the real reason and is reported as such instead of
 /// blaming the shell.
 pub(crate) fn wait_rex_shell_ready(
@@ -858,7 +863,7 @@ pub(crate) fn wait_rex_shell_ready(
 
 /// Rex arm of [`spawn_crew_into`]: same registry/mail/launch contract over
 /// `&dyn MultiplexerBackend`, never `Client::connect`. Kept as a separate
-/// function so the herdr path below stays byte-identical and this arm lifts
+/// function so the hc path below stays byte-identical and this arm lifts
 /// off cleanly. Known delta: a failed `pane_run` fails loudly (the
 /// rate-limit registry fallback below is `Client`-coupled).
 #[allow(clippy::too_many_arguments)]
@@ -904,8 +909,8 @@ fn spawn_crew_into_rex(
                 *n
             };
             let name = crew_agent_name(wf_name, role, ordinal);
-            // --reuse idempotency: same rule as the herdr path, read through
-            // the backend instead of the herdr client.
+            // --reuse idempotency: same rule as the hc path, read through
+            // the backend instead of the hc client.
             let live_agents = backend.agent_list()?;
             let existing = registry
                 .iter()
@@ -943,7 +948,7 @@ fn spawn_crew_into_rex(
                     agents.iter().map(|a| a.pane_id.clone()).collect();
                 let pane_ids: Vec<String> = panes.iter().map(|p| p.pane_id.clone()).collect();
                 // A seat whose model travels by env can never reuse a
-                // pre-existing pane (same reason as the herdr path: the env
+                // pre-existing pane (same reason as the hc path: the env
                 // is fixed at split, and rex has no env map to patch later).
                 let reusable = if env_model_pin.is_some() {
                     None
@@ -973,7 +978,7 @@ fn spawn_crew_into_rex(
                     }
                 };
                 // Shell gate BEFORE typing the launch: program_status must be
-                // idle or working within 15s. Fail CLOSED like the herdr
+                // idle or working within 15s. Fail CLOSED like the hc
                 // path — never dispatch into a booting shell.
                 wait_rex_shell_ready(backend, &pane_id, &name, &pane_id, Duration::from_secs(15))?;
                 // No env map on split: the pin + model pin ride as an
@@ -983,7 +988,7 @@ fn spawn_crew_into_rex(
                     .pane_run(&pane_id, &command)
                     .map_err(|e| anyhow!("pane crew: rex run for {name} ({pane_id}): {e:#}"))?;
                 if let Err(e) = backend.agent_rename(&pane_id, Some(name.as_str())) {
-                    // Warn like the herdr path's post-hoc rebind: the pane
+                    // Warn like the hc path's post-hoc rebind: the pane
                     // runs; the readiness wait + registry below still hold
                     // the name contract.
                     eprintln!("flywheel: warn: rex rename {pane_id} → {name} failed: {e:#}");
@@ -996,7 +1001,7 @@ fn spawn_crew_into_rex(
                     mail_identity.as_deref(),
                 );
                 // Readiness: the agent reports instead of the shell prompt.
-                // Best-effort like the herdr path — a wait failure degrades
+                // Best-effort like the hc path — a wait failure degrades
                 // to __send semantics, never a panic.
                 if let Err(e) = backend.agent_wait(
                     &name,
@@ -1214,7 +1219,7 @@ fn spawn_crew_into(
                 .cloned();
             // bd-pin-public-plane-s-easy.2: draw the mail PIN BEFORE the
             // pane exists so the pane env carries AGENT_NAME/FLYWHEEL_MAIL_AS
-            // (herdr injects env only at split/create).
+            // (hc injects env only at split/create).
             let mail_identity = crate::pinned_mail_identity(cfg, project, &name, harness);
             let (agent_pane_id, name, model_pin) = if let Some(e) = existing {
                 eprintln!(
@@ -1226,7 +1231,7 @@ fn spawn_crew_into(
                 (e.pane_id.clone(), name.clone(), e.model_pin.clone())
             } else {
                 // bd-crlx: resolve the launch plan BEFORE the pane exists.
-                // herdr injects env only at split/create, and a pane's env is
+                // hc injects env only at split/create, and a pane's env is
                 // fixed for the life of the process it launches — so a model
                 // the harness cannot take as argv (opencode's root command has
                 // no `--model`) has to be pinned into the pane env at creation
@@ -1302,13 +1307,13 @@ fn spawn_crew_into(
                     }
                 };
                 // bd-d7zu: WAIT FOR THE SHELL BEFORE TYPING THE LAUNCH ARG.
-                // herdr types AGENT_ARG into the pane PTY the moment
+                // hc types AGENT_ARG into the pane PTY the moment
                 // `agent.start` is called, and a fresh pane's shell is still
                 // booting (zsh running .zshrc, prompt not yet rendered, PTY in
                 // CANONICAL mode). The peer-aware template renders to a ~2.6KB
                 // single-quoted arg; typed into a booting shell it splits
                 // mid-quote and zsh parks at the PS2 continuation prompt with
-                // the agent never starting — herdr.rs documents this as
+                // the agent never starting — hc.rs documents this as
                 // the 2026-08-18 "coder2/coder3 dead-on-spawn" incident.
                 //
                 // `cmd_crew_control` (the relaunch path) has always gated on
@@ -1318,7 +1323,7 @@ fn spawn_crew_into(
                 //
                 // Fail CLOSED, unlike the relaunch path's warn-and-continue.
                 // Typing the launch arg into a shell that never reached its
-                // line editor does not merely risk a bad spawn: herdr rejects
+                // line editor does not merely risk a bad spawn: hc rejects
                 // it (`agent_pane_busy`), the readiness wait then reports
                 // `agent_not_running`, and the dispatch degrades to
                 // "dispatching anyway" — which surfaces as the permanent,
@@ -1787,13 +1792,13 @@ pub fn pane_dispatch(
     {
         Some(e) => e,
         // A registry row means the pane WAS spawned; the prune only knows
-        // herdr's listing, so a pane listed moments later looks absent.
+        // hc's listing, so a pane listed moments later looks absent.
         // Settle for it before failing the whole run (bd-ietv). bd-0s0y: settle
         // for THIS copy's pane, or copy 1 would settle onto copy 0's.
         None => match settle_for_role_slot(project, profile_name, copy_index) {
             Some(entry) => {
                 eprintln!(
-                    "flywheel: WARNING @{profile_name} pane {} was absent from herdr's listing at dispatch; settled and using it",
+                    "flywheel: WARNING @{profile_name} pane {} was absent from hc's listing at dispatch; settled and using it",
                     entry.pane_id
                 );
                 entry
@@ -2325,7 +2330,7 @@ fn dispatch_seed() -> u64 {
 }
 
 /// Boundary (bd-fa58): this stack is for the REMOTE dispatch chain only.
-/// Local herdr IPC (settle re-reads, text primes) stays on the small `retry`
+/// Local hc IPC (settle re-reads, text primes) stays on the small `retry`
 /// driver — unifying the two under one breaker or bulkhead would couple
 /// unrelated failures, so the two spellings coexist on purpose.
 fn dispatch_policy() -> RemotePolicy<Value, String> {
@@ -2441,7 +2446,7 @@ pub struct SpawnJobLaunch {
 /// bd-qlr1: the pane env for a launch, with any env-delivered model pin
 /// already merged in.
 ///
-/// herdr injects env ONLY at split/create, and a pane's env is fixed for the
+/// hc injects env ONLY at split/create, and a pane's env is fixed for the
 /// life of the process it launches — so the pin has to be in the map before the
 /// split, never applied afterwards. Every launch path that creates its own pane
 /// builds its env here, so the pin cannot be forgotten at a call site: if a
@@ -2452,7 +2457,7 @@ pub(crate) fn pane_env_for_launch(
     mail_identity: Option<&str>,
     env_model_pin: Option<&str>,
 ) -> Result<std::collections::BTreeMap<String, String>> {
-    let mut env = crate::hc_support::herdr_integration_env(cfg, mail_identity);
+    let mut env = crate::hc_support::plane_launch_env(cfg, mail_identity);
     if let Some(model) = env_model_pin {
         crate::hc_support::apply_opencode_model_pin(&mut env, model)?;
     }
@@ -2662,7 +2667,7 @@ pub fn launch_spawn_job(
         // pane env carries AGENT_NAME/FLYWHEEL_MAIL_AS.
         let mail_identity = crate::pinned_mail_identity(cfg, project, &name, &plan.harness);
         // bd-qlr1: the pin must be in the map BEFORE the split, because
-        // herdr injects env only at split/create and a pane's env is fixed for
+        // hc injects env only at split/create and a pane's env is fixed for
         // the life of the process it launches.
         let pane_env =
             pane_env_for_launch(cfg, mail_identity.as_deref(), plan.env_model_pin.as_deref())?;
@@ -3397,11 +3402,11 @@ mod tests {
     use crate::elm::TestClock;
 
     /// bd-ietv: a role whose registry row exists but whose pane is missing
-    /// from herdr's listing at dispatch time is the spawn/list race, not a
+    /// from hc's listing at dispatch time is the spawn/list race, not a
     /// dead pane. The prune drops the row, so without settling the whole run
     /// bails `no crew pane for @oracle` even though the crew spawned it.
     #[test]
-    fn settle_role_waits_out_a_pane_herdr_has_not_listed_yet() {
+    fn settle_role_waits_out_a_pane_plane_has_not_listed_yet() {
         use std::collections::HashSet;
         let rows = vec![SpawnEntry {
             pane_id: "w1:p1".into(),
@@ -3511,7 +3516,7 @@ mod tests {
 
     /// bd-ietv: an unavailable probe is treated as cannot-confirm, not as
     /// dead — the same fail-open posture the registry prune already takes for
-    /// an unreachable herdr.
+    /// an unreachable hc.
     #[test]
     fn settle_role_treats_an_unavailable_probe_as_not_confirmed() {
         use std::collections::HashSet;
@@ -3536,7 +3541,7 @@ mod tests {
             || {
                 probe += 1;
                 if probe < 2 {
-                    None // herdr unreachable
+                    None // hc unreachable
                 } else {
                     Some(HashSet::from(["w1:p5".to_string()]))
                 }
@@ -4490,17 +4495,17 @@ mod tests {
         let live: HashSet<String> = ["wLive:p1".to_string(), "wOther:p1".to_string()]
             .into_iter()
             .collect();
-        let (kept, pruned) = reap_closed_rows(entries, &live, "herdr");
+        let (kept, pruned) = reap_closed_rows(entries, &live, "hc");
         assert_eq!(pruned, 1);
         assert_eq!(kept.len(), 2);
         assert!(kept.iter().all(|e| e.pane_id != "wDead:p1"));
     }
 
-    /// bd-j0b5: the persisted clear keeps a row from a harness herdr cannot
+    /// bd-j0b5: the persisted clear keeps a row from a harness hc cannot
     /// inject (its pane is absent on purpose) and an unknown harness; only a
-    /// gone pane of a herdr-injectable harness is cleared.
+    /// gone pane of an hc-injectable harness is cleared.
     #[test]
-    fn reap_close_keeps_pins_herdr_cannot_inject() {
+    fn reap_close_keeps_pins_plane_cannot_inject() {
         use std::collections::HashSet;
         let mk = |pane: &str, name: &str, harness: Option<&str>| SpawnEntry {
             pane_id: pane.into(),
@@ -4521,7 +4526,7 @@ mod tests {
             mk("wLegacy:p3", "legacy-pin", None),
         ];
         let live: HashSet<String> = HashSet::new();
-        let (kept, pruned) = reap_closed_rows(entries, &live, "herdr");
+        let (kept, pruned) = reap_closed_rows(entries, &live, "hc");
         assert_eq!(pruned, 1);
         assert_eq!(kept.len(), 2);
         assert!(kept.iter().any(|e| e.pane_id == "wDead:p1"));
@@ -4553,7 +4558,7 @@ mod tests {
             mk("wLive:p1", "crew-new-planner"),
         ];
         let live: HashSet<String> = ["wLive:p1".to_string()].into_iter().collect();
-        let dead = find_dead_rows(&entries, &live, "herdr");
+        let dead = find_dead_rows(&entries, &live, "hc");
         assert_eq!(
             dead,
             vec![("wDead:p1".to_string(), "crew-old-planner".to_string())]
@@ -4564,14 +4569,14 @@ mod tests {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
-            "herdr",
+            "hc",
         );
         assert_eq!(none, [] as [(String, String); 0]);
     }
 
     /// bd-p09m: the gauge agrees with the clear — a mail-only row the reap
-    /// keeps is not a dead row. Only a gone pane of a herdr-injectable
-    /// harness on herdr is dead.
+    /// keeps is not a dead row. Only a gone pane of an hc-injectable
+    /// harness on hc is dead.
     #[test]
     fn a_kept_mail_only_row_is_not_a_dead_row() {
         use std::collections::HashSet;
@@ -4594,7 +4599,7 @@ mod tests {
             mk("wLegacy:p3", "legacy-pin", None),
         ];
         let live: HashSet<String> = HashSet::new();
-        let dead = find_dead_rows(&entries, &live, "herdr");
+        let dead = find_dead_rows(&entries, &live, "hc");
         assert_eq!(
             dead,
             vec![("wGone:p2".to_string(), "gone-opencode".to_string())]
@@ -4679,7 +4684,7 @@ mod tests {
     }
 
     /// P10.3: crew agent names are role-ordinal-suffixed, slugged + lowercased
-    /// (herdr agent-name rule: lowercase alnum/-/_ only, <= 32 chars).
+    /// (hc agent-name rule: lowercase alnum/-/_ only, <= 32 chars).
     #[test]
     fn crew_agent_names_are_role_ordinal() {
         assert_eq!(crew_agent_name("plan", "planner", 1), "crew-plan-planner");
@@ -4690,7 +4695,7 @@ mod tests {
             "crew-crew-wf-planner"
         );
         assert_eq!(crew_agent_name("My Plan", "coder", 1), "crew-my-plan-coder");
-        // long names truncate to stay within herdr's 32-char budget
+        // long names truncate to stay within hc's 32-char budget
         let long = crew_agent_name("a-very-long-workflow-name-that-goes-on", "reviewer", 1);
         assert!(long.len() <= 32, "name too long: {long} ({})", long.len());
         let short = crew_agent_name("wf", "reviewer", 1);
@@ -4864,7 +4869,7 @@ mod tests {
             if name == "@housekeeper" {
                 Some(json!({
                     "npub": "",
-                    "spec": { "harness": "pi", "model": "glm-5.3", "backend": "herdr", "role": "housekeeper" },
+                    "spec": { "harness": "pi", "model": "glm-5.3", "backend": "hc", "role": "housekeeper" },
                 }))
             } else {
                 None
@@ -4882,7 +4887,7 @@ mod tests {
         let spec = json!({
             "profile": "@housekeeper",
             "workflow": "weekly-upgrade",
-            "resolved": { "npub": "", "spec": { "harness": "pi", "model": "glm-5.3", "backend": "herdr", "role": "housekeeper" } },
+            "resolved": { "npub": "", "spec": { "harness": "pi", "model": "glm-5.3", "backend": "hc", "role": "housekeeper" } },
             "await": true,
         });
         let plan = spawn_launch_plan("prom-1", &spec, &test_catalog()).expect("plan");
@@ -5246,7 +5251,7 @@ mod bd_5yzp_tests {
 }
 
 /// ADR-0024 W1a / bd-42fs: the pane spawn one-shot registry fallback. The
-/// decision is pure, so these rows need no herdr pane and no live harness.
+/// decision is pure, so these rows need no hc terminal and no live harness.
 #[cfg(test)]
 mod pane_registry_fallback_tests {
     use super::*;
@@ -5605,23 +5610,23 @@ mod rex_door_tests {
     }
 
     /// The pane door follows the RESOLVED plane, never `REX_SESSION`:
-    /// a herdr pin wins even inside a rex terminal, and an explicit
+    /// an hc pin wins even inside a rex terminal, and an explicit
     /// superlogical pin selects rex. (The old contract let the env split the
-    /// planes: `rex list` saw the session while `flywheel status` read herdr.)
+    /// planes: `rex list` saw the session while `flywheel status` read hc.)
     #[test]
     fn the_door_follows_the_resolved_plane_not_rex_session() {
         let _guard = crate::config::lock_env();
         unsafe { std::env::set_var("REX_SESSION", "sess-1") };
         let mut cfg = crate::config::Config {
             backend: Some(crate::config::BackendConfig {
-                multiplexer: "herdr".to_string(),
+                multiplexer: "hc".to_string(),
                 mail: "toron".to_string(),
             }),
             ..Default::default()
         };
         assert!(
             !rex_door_selected(&cfg),
-            "a herdr pin wins over REX_SESSION"
+            "an hc pin wins over REX_SESSION"
         );
         cfg.backend = Some(crate::config::BackendConfig {
             multiplexer: "superlogical".to_string(),
@@ -5640,13 +5645,13 @@ mod rex_door_tests {
         assert!(!rex_shell_ready(&AgentStatus::Unknown));
     }
 
-    /// No env map on split: the pin rides as `env K=V`, herdr-only keys
+    /// No env map on split: the pin rides as `env K=V`, hc-only keys
     /// stay behind, and values with spaces are quoted.
     #[test]
-    fn env_command_filters_herdr_and_quotes() {
+    fn env_command_filters_plane_and_quotes() {
         let env: BTreeMap<String, String> = [
-            ("HERDR_ENV".to_string(), "1".to_string()),
-            ("HERDR_SOCKET_PATH".to_string(), "/tmp/x".to_string()),
+            ("HC_SESSION".to_string(), "default".to_string()),
+            ("HC_SOCKET_PATH".to_string(), "/tmp/x".to_string()),
             ("AGENT_NAME".to_string(), "Pin".to_string()),
             ("NOTE".to_string(), "a b".to_string()),
         ]
@@ -5818,7 +5823,7 @@ mod bd_qlr1_env_pin_wiring_tests {
     fn spec(harness: &str) -> serde_json::Value {
         json!({
             "profile": "@reviewer",
-            "resolved": { "npub": "", "spec": { "harness": harness, "backend": "herdr", "role": "reviewer" } },
+            "resolved": { "npub": "", "spec": { "harness": harness, "backend": "hc", "role": "reviewer" } },
             "await": false,
         })
     }

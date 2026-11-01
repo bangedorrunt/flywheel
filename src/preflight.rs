@@ -49,7 +49,7 @@ impl Check {
         }
     }
     /// A pass whose detail names HOW it passed (bd-mknvb: the plane that
-    /// actually served, e.g. `auto -> herdr fallback: rex CLI not found`).
+    /// actually served, e.g. `auto -> hc fallback: rex CLI not found`).
     pub(crate) fn pass_note(name: &'static str, note: impl Into<String>) -> Self {
         Self {
             name,
@@ -184,8 +184,8 @@ pub fn run(cfg: &Config, mode: Mode, project: Option<&str>) -> Vec<Check> {
 
     // 1. pane plane alive (cheapest meaningful check) — skipped for modes
     //    that never touch panes (cron is store-side only). Asks the SELECTED
-    //    backend, never a hardcoded herdr socket: rex answering is PASS with
-    //    herdr absent; herdr answering is PASS (the fallback works).
+    //    backend, never a hardcoded hc socket: rex answering is PASS with
+    //    hc absent; hc answering is PASS (the fallback works).
     if mode.needs_project || mode.needs_beads || mode.needs_mail {
         checks.push(check_pane_plane(cfg));
     }
@@ -361,13 +361,13 @@ pub fn to_json(checks: &[Check]) -> Value {
 // ─── individual checks (cheapest first) ──────────────────────────────────────
 
 /// The pane-plane check asks the SELECTED backend (`multiplexer_backend`
-/// plus a real `agent_list`), never a hardcoded herdr socket: rex answering
-/// is PASS with herdr absent, herdr answering is PASS through the fallback,
+/// plus a real `agent_list`), never a hardcoded hc socket: rex answering
+/// is PASS with hc absent, hc answering is PASS through the fallback,
 /// and neither is FAIL naming both planes with the remedy.
 ///
 /// bd-mknvb: the PASS line names the plane that ACTUALLY served. `auto` on a
 /// host without the rex CLI used to PASS silently through the fallback, so
-/// an operator who believed rex was primary got green lights on herdr.
+/// an operator who believed rex was primary got green lights on hc.
 fn check_pane_plane(cfg: &Config) -> Check {
     let plane = crate::backend::resolve_plane(cfg);
     match crate::backend::multiplexer_backend(cfg) {
@@ -377,7 +377,7 @@ fn check_pane_plane(cfg: &Config) -> Check {
             Err(e) => Check::fail(
                 "pane-plane",
                 format!(
-                    "pane plane unreachable via {}: {e:#} — remedy: install the rex CLI or start herdr (FLYWHEEL_BACKEND=herdr selects herdr explicitly)",
+                    "pane plane unreachable via {}: {e:#} — remedy: install the rex CLI or start hc (FLYWHEEL_BACKEND=hc selects hc explicitly)",
                     plane.reason
                 ),
             ),
@@ -478,21 +478,21 @@ pub fn registry_pin_panes(entries: &[crate::state::SpawnEntry]) -> Vec<String> {
         .collect()
 }
 
-/// How many of `pins` herdr actually hosts. A pure set intersection on pane id:
-/// herdr knows a pane by id whatever its agent is doing, and a pin may live in
+/// How many of `pins` hc actually hosts. A pure set intersection on pane id:
+/// hc knows a pane by id whatever its agent is doing, and a pin may live in
 /// ANY workspace (a project whose crew got re-hosted elsewhere is still
 /// materializable, so this never scopes to one workspace).
-pub fn hosted_pin_count(pins: &[String], herdr_panes: &BTreeSet<String>) -> usize {
-    pins.iter().filter(|p| herdr_panes.contains(*p)).count()
+pub fn hosted_pin_count(pins: &[String], plane_panes: &BTreeSet<String>) -> usize {
+    pins.iter().filter(|p| plane_panes.contains(*p)).count()
 }
 
 /// bd-uona: can this project's allocated panes host a dispatch at all?
 ///
 /// `preflight --mode workflow --project toron` returned 12/12 PASS while
 /// dispatch was impossible — agents started then died on the readiness wait
-/// with `agent_not_running`, the crew workspace was reaped, herdr had no
+/// with `agent_not_running`, the crew workspace was reaped, hc had no
 /// workspace matching the allocated id, and `doorbell status` read
-/// injectable=0 / panes_missing=12. `check_herdr` only pings the socket, so
+/// injectable=0 / panes_missing=12. `check_plane` only pings the socket, so
 /// nothing in preflight could see any of that.
 ///
 /// Pins present with ZERO of them hosted is the only failing shape. A fleet
@@ -504,7 +504,7 @@ pub fn pane_materializable(pins: usize, hosted: usize) -> bool {
 }
 
 /// bd-uona: the pane-materializability check — can the panes this project
-/// allocated still host an agent? A pin whose pane herdr no longer lists is
+/// allocated still host an agent? A pin whose pane hc no longer lists is
 /// a pin the dispatcher will target and never find, so agents start and die on
 /// the readiness wait. Fails loud and names the remediation, per the bead.
 fn check_pane_materializable(cfg: &Config, project: &str) -> Check {
@@ -515,8 +515,8 @@ fn check_pane_materializable(cfg: &Config, project: &str) -> Check {
             "no registry pins — nothing allocated to host",
         );
     }
-    // The SELECTED pane plane, never a hardcoded herdr socket: rex answers
-    // with herdr absent, herdr answers through the fallback.
+    // The SELECTED pane plane, never a hardcoded hc socket: rex answers
+    // with hc absent, hc answers through the fallback.
     let backend = match crate::backend::multiplexer_backend(cfg) {
         Ok(b) => b,
         Err(e) => {
@@ -537,7 +537,7 @@ fn check_pane_materializable(cfg: &Config, project: &str) -> Check {
         return Check::pass("pane-materializable");
     }
     // The plane hosts none of the allocated panes: name the plane that was
-    // asked (rex primary, herdr fallback) rather than a herdr workspace id.
+    // asked (rex primary, hc fallback) rather than an hc workspace id.
     let via = backend.name();
     Check::fail(
         "pane-materializable",
@@ -608,7 +608,7 @@ pub fn linked_worktrees(v: &[WorktreeInfo]) -> Vec<&WorktreeInfo> {
 fn check_worktree(cfg: &Config, project: &str) -> Check {
     let mut c = match Client::connect(Some(&cfg.socket_path())) {
         Ok(c) => c,
-        Err(e) => return Check::fail("worktree", format!("herdr connect failed: {e}")),
+        Err(e) => return Check::fail("worktree", format!("hc connect failed: {e}")),
     };
     let ws_id = match crate::find_workspace(&mut c, project) {
         Ok(id) => id,
@@ -1438,7 +1438,7 @@ mod tests {
 
     // ---- bd-uona: the compose door and the pane it materializes ----
 
-    /// bd-uona (1): `workflow compose --run` ALLOCATES herdr panes, so it must
+    /// bd-uona (1): `workflow compose --run` ALLOCATES hc terminals, so it must
     /// sit behind the same preflight gate as an executing run. It was the one
     /// dispatching door with no prerequisite check. The arm lives in `main`'s
     /// match (a binary crate seam with no callable entry), so the witness is
@@ -1489,12 +1489,12 @@ mod tests {
 
     /// bd-uona (2): the shape that actually failed — `preflight --mode workflow
     /// --project toron` returned 12/12 PASS while agents died on the readiness
-    /// wait, herdr had no workspace for the allocated id, and `doorbell status`
+    /// wait, hc had no workspace for the allocated id, and `doorbell status`
     /// reported injectable=0, panes_missing=12. Pins present and ZERO of them
     /// hosted is the only failing shape.
     #[test]
     fn preflight_gate_pane_materializable_fails_only_on_zero_hosted_pins() {
-        // The live failure: 12 pins, herdr hosts none of them.
+        // The live failure: 12 pins, hc hosts none of them.
         assert!(
             !pane_materializable(12, 0),
             "pins with zero hosted panes is dispatch-impossible and must fail"
@@ -1520,27 +1520,27 @@ mod tests {
     }
 
     /// bd-uona (2): hosted-pane counting is a set intersection over pane ids,
-    /// never a status filter. herdr knows a pane by id regardless of whether
+    /// never a status filter. hc knows a pane by id regardless of whether
     /// its agent is working, idle, or absent.
     #[test]
     fn preflight_gate_pane_hosting_counts_by_id_across_every_workspace() {
         let pins = vec!["w1Z:p1".to_string(), "w1Z:p2".to_string(), "w1W:p9".into()];
-        let herdr: BTreeSet<String> = ["w1Z:p1".to_string(), "w1Z:p2".to_string()]
+        let hc: BTreeSet<String> = ["w1Z:p1".to_string(), "w1Z:p2".to_string()]
             .into_iter()
             .collect();
         assert_eq!(
-            hosted_pin_count(&pins, &herdr),
+            hosted_pin_count(&pins, &hc),
             2,
-            "the reaped pin's pane is simply not in herdr's set"
+            "the reaped pin's pane is simply not in hc's set"
         );
-        assert_eq!(hosted_pin_count(&[], &herdr), 0, "no pins hosts nothing");
+        assert_eq!(hosted_pin_count(&[], &hc), 0, "no pins hosts nothing");
     }
 
     /// bd-rex-default-plane-xn1t: the pane-plane check asks the SELECTED
-    /// backend, never a hardcoded herdr socket. Over a fake rex (herdr
+    /// backend, never a hardcoded hc socket. Over a fake rex (hc
     /// absent) the check PASSes; an unresolvable plane FAILs naming the
     /// remedy.
-    const PANE_PLANE_FAKE_REX: &str = r#"#!/bin/sh
+    const PANE_HC_FAKE_REX: &str = r#"#!/bin/sh
 printf '%s\n' "$*" >> @@LOG@@
 cmd=""
 for arg in "$@"; do
@@ -1565,18 +1565,18 @@ case "$cmd" in
 esac
 "#;
 
-    /// Rex answering is PASS with herdr absent (no herdr socket is touched).
+    /// Rex answering is PASS with hc absent (no hc socket is touched).
     #[cfg(feature = "backend-superlogical")]
     #[test]
-    fn pane_plane_passes_over_fake_rex_with_herdr_absent() {
+    fn pane_plane_passes_over_fake_rex_with_plane_absent() {
         // The guard holds the env lock, so the FLYWHEEL_BACKEND mutation
         // below is serialized with every other env-mutating test.
-        let _guard = crate::backend::superlogical::RexBinGuard::install(PANE_PLANE_FAKE_REX);
+        let _guard = crate::backend::superlogical::RexBinGuard::install(PANE_HC_FAKE_REX);
         unsafe { std::env::set_var("FLYWHEEL_BACKEND", "superlogical") };
         let cfg = crate::config::Config::default();
         let pass = matches!(check_pane_plane(&cfg).status, Status::Pass);
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
-        assert!(pass, "rex answering is PASS with herdr absent");
+        assert!(pass, "rex answering is PASS with hc absent");
     }
 
     /// An unresolvable plane FAILs naming the plane and the remedy (fail
@@ -1598,11 +1598,11 @@ esac
 
     /// bd-rex-default-plane-xn1t: materializability reads the SELECTED
     /// plane. A registry pin the fake rex hosts is materializable with no
-    /// herdr socket anywhere near the check.
+    /// hc socket anywhere near the check.
     #[cfg(feature = "backend-superlogical")]
     #[test]
-    fn pane_materializable_reads_the_selected_plane_not_a_herdr_socket() {
-        let _guard = crate::backend::superlogical::RexBinGuard::install(PANE_PLANE_FAKE_REX);
+    fn pane_materializable_reads_the_selected_plane_not_a_plane_socket() {
+        let _guard = crate::backend::superlogical::RexBinGuard::install(PANE_HC_FAKE_REX);
         unsafe { std::env::set_var("FLYWHEEL_BACKEND", "superlogical") };
         // Hermetic XDG state comes with the guard: the registry below lands
         // in a temp dir, never the operator's real state.

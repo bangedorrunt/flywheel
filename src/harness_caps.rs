@@ -129,7 +129,7 @@ impl HarnessCaps {
     }
 }
 
-/// The witnesses that prove the herdr pane sink types what it renders. An
+/// The witnesses that prove the hc pane sink types what it renders. An
 /// injection row names one of these; a harness an operator adds names its own.
 const SINK_WITNESS: &str = "only_the_sink_types_into_panes";
 const SINK_SHAPE_WITNESS: &str = "every_pane_write_renders_a_constant_shape";
@@ -138,7 +138,7 @@ const FAKE_WITNESS: &str = "fake_harness_denies_once_and_types_no_interrupt";
 /// Harnesses this repo already names. No product row is verified for a hook,
 /// and `structured_question` / `mcp` are unsupported for every row: nothing in
 /// this repo implements them, so claiming them would be a lie the caller acts
-/// on. Injection, interrupt and resume go through the herdr sink, which the
+/// on. Injection, interrupt and resume go through the hc sink, which the
 /// sink fence and its shape test cover.
 pub const TABLE: &[HarnessCaps] = &[
     HarnessCaps {
@@ -185,7 +185,7 @@ pub const TABLE: &[HarnessCaps] = &[
         structured_question: Capability::unsupported(Fallback::Explicit),
         mcp: Capability::unsupported(Fallback::Explicit),
     },
-    // Kinds `pane_write::Harness::from_kind` already maps. They are herdr
+    // Kinds `pane_write::Harness::from_kind` already maps. They are hc
     // panes like any other, so they need a row: a kind with no row would be
     // read as unrecorded, and an unrecorded kind is not a claim about the
     // pane.
@@ -321,7 +321,7 @@ pub enum WakeRoute {
 ///
 /// A recorded row answers for itself. An UNRECORDED kind (no row: a legacy
 /// registry entry with no harness field, or a kind nobody mapped yet) is
-/// still a herdr pane, and the sink types into any pane it manages — the kind
+/// still an hc pane, and the sink types into any pane it manages — the kind
 /// only picks the launch bootstrap. So the unrecorded default is today's
 /// behavior, [`WakeRoute::Inject`], never a silent refusal: bd-9tkm. A row
 /// that records `inject` unsupported is the only producer of
@@ -585,7 +585,7 @@ mod tests {
                     assert!(row.hook.is_none() && row.verified_by.is_none());
                     assert!(
                         row.inject.supported,
-                        "{} is a herdr pane and must stay injectable",
+                        "{} is an hc pane and must stay injectable",
                         row.harness
                     );
                 }
@@ -610,7 +610,7 @@ mod tests {
 
     /// bd-harness-caps-6r1x + bd-9tkm: a row that records no injection door
     /// gets a typed no-door naming the fallback and the pane sink types
-    /// nothing; an unrecorded kind is still a herdr pane and still injects.
+    /// nothing; an unrecorded kind is still an hc pane and still injects.
     #[test]
     fn wake_falls_back_when_harness_cannot_inject() {
         assert_eq!(
@@ -644,7 +644,7 @@ mod tests {
             assert_eq!(
                 wake_route(unrecorded, false),
                 WakeRoute::Inject { interrupt: true },
-                "{unrecorded:?} is a herdr pane, not a refusal"
+                "{unrecorded:?} is an hc pane, not a refusal"
             );
         }
 

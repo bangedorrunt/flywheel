@@ -1,21 +1,21 @@
-//! A herdr pane binding may clear; a mail-only pin never does. bd-j0b5.
+//! An hc pane binding may clear; a mail-only pin never does. bd-j0b5.
 //!
-//! A pin from a harness herdr cannot inject (`freebuff`) or from a different
-//! multiplexer (`superlogical`) has no herdr pane on purpose, so "herdr lists
+//! A pin from a harness hc cannot inject (`freebuff`) or from a different
+//! multiplexer (`superlogical`) has no hc terminal on purpose, so "hc lists
 //! no pane" is not evidence of death. Clearing on absence alone would retire a
 //! live pin. One rule, shared by every clear (and by the supervisor heartbeat
-//! page): a binding clears only for a harness herdr can inject, on herdr, with
+//! page): a binding clears only for a harness hc can inject, on hc, with
 //! a non-empty pane id the known live set omits.
 
 use std::collections::HashSet;
 
-/// Harnesses herdr can inject. A pin herdr cannot inject has no herdr pane by
+/// Harnesses hc can inject. A pin hc cannot inject has no hc terminal by
 /// design, so a missing pane is never evidence against it.
-pub const HERDR_INJECTABLE: [&str; 4] = ["opencode", "pi", "grok", "omp"];
+pub const HC_INJECTABLE: [&str; 4] = ["opencode", "pi", "grok", "omp"];
 
 /// May this pane binding be cleared? True only on positive evidence: the
-/// active backend is herdr, the harness is one herdr injects, the binding
-/// names a pane, and a live pane set is known that omits it. `None` (herdr did
+/// active backend is hc, the harness is one hc injects, the binding
+/// names a pane, and a live pane set is known that omits it. `None` (hc did
 /// not answer) clears nothing, and an unknown harness keeps its row.
 pub fn pane_binding_may_clear(
     harness: &str,
@@ -23,8 +23,8 @@ pub fn pane_binding_may_clear(
     pane_id: &str,
     live_panes: Option<&HashSet<String>>,
 ) -> bool {
-    backend == "herdr"
-        && HERDR_INJECTABLE.contains(&harness)
+    backend == "hc"
+        && HC_INJECTABLE.contains(&harness)
         && !pane_id.is_empty()
         && live_panes.is_some_and(|live| !live.contains(pane_id))
 }
@@ -38,48 +38,48 @@ mod tests {
     }
 
     #[test]
-    fn a_freebuff_or_superlogical_pin_is_kept_when_herdr_has_no_pane() {
+    fn a_freebuff_or_superlogical_pin_is_kept_when_plane_has_no_pane() {
         let none_live = live(&[]);
-        // A freebuff pin is invisible to herdr on purpose — absence is not death.
+        // A freebuff pin is invisible to hc on purpose — absence is not death.
         assert!(!pane_binding_may_clear(
             "freebuff",
-            "herdr",
+            "hc",
             "w1:p1",
             Some(&none_live)
         ));
         assert!(!pane_binding_may_clear(
             "superlogical",
-            "herdr",
+            "hc",
             "w1:p1",
             Some(&none_live)
         ));
-        // A harness herdr injects may clear once its pane is gone.
+        // A harness hc injects may clear once its pane is gone.
         assert!(pane_binding_may_clear(
             "opencode",
-            "herdr",
+            "hc",
             "w1:p1",
             Some(&none_live)
         ));
         // Unknown and empty harnesses keep their row.
         assert!(!pane_binding_may_clear(
             "claude",
-            "herdr",
+            "hc",
             "w1:p1",
             Some(&none_live)
         ));
         assert!(!pane_binding_may_clear(
             "",
-            "herdr",
+            "hc",
             "w1:p1",
             Some(&none_live)
         ));
-        // Herdr not answering clears nothing.
-        assert!(!pane_binding_may_clear("opencode", "herdr", "w1:p1", None));
-        // A live pane is never cleared, and only herdr may clear at all.
+        // Hc not answering clears nothing.
+        assert!(!pane_binding_may_clear("opencode", "hc", "w1:p1", None));
+        // A live pane is never cleared, and only hc may clear at all.
         let present = live(&["w1:p1"]);
         assert!(!pane_binding_may_clear(
             "opencode",
-            "herdr",
+            "hc",
             "w1:p1",
             Some(&present)
         ));
@@ -92,7 +92,7 @@ mod tests {
         // An empty pane id names nothing, so it is not positive evidence.
         assert!(!pane_binding_may_clear(
             "opencode",
-            "herdr",
+            "hc",
             "",
             Some(&none_live)
         ));

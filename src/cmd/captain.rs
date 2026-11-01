@@ -11,14 +11,14 @@
 //! looping forever would recreate the wake problem it exists to solve.
 //!
 //! The decision logic is pure (`newest_since`, `stall_verdict`) so the
-//! poll-exit contract is testable without a live inbox, herdr, or repo.
+//! poll-exit contract is testable without a live inbox, hc, or repo.
 
 use anyhow::Result;
 use clap::Subcommand;
 use serde_json::{Value, json};
 
 // bd-nmmf4: the trait is only needed by the rex-only directory path
-// (`agent_list`); a herdr-only build must not warn about it.
+// (`agent_list`); a hc-only build must not warn about it.
 #[cfg(feature = "backend-superlogical")]
 use crate::backend::MultiplexerBackend as _;
 use crate::config::Config;
@@ -46,7 +46,7 @@ pub(crate) enum CaptainCmd {
         /// stall threshold in minutes (with --stall)
         #[arg(long, default_value_t = 45)]
         stall_minutes: u64,
-        /// act as this registered agent (adjective+noun or herdr short name)
+        /// act as this registered agent (adjective+noun or terminal short name)
         #[arg(long = "as")]
         as_agent: Option<String>,
         /// also exit when the project's preflight fails (store skew, missing
@@ -162,7 +162,7 @@ const PREFLIGHT_EXIT: i32 = 4;
 
 /// The FIRST failing check as `(name, message)`. Skips are advisory (the
 /// operation can proceed) and passes are silent; only a `Fail` arms the exit.
-/// Pure, so the arm's rule is pinned without a live herdr/resonate/toron.
+/// Pure, so the arm's rule is pinned without a live hc/resonate/toron.
 pub(crate) fn first_failing_check(checks: &[preflight::Check]) -> Option<(&'static str, String)> {
     checks.iter().find_map(|c| match &c.status {
         preflight::Status::Fail(msg) => Some((c.name, msg.clone())),
@@ -215,7 +215,7 @@ pub(crate) struct StallProbe {
     pub work_remaining: bool,
     /// a pin reads Busy (working/busy/blocked — an occupied pane)
     pub any_pane_working: bool,
-    /// herdr pins were readable. False → the fleet is UNKNOWABLE, so we never
+    /// plane pins were readable. False → the fleet is UNKNOWABLE, so we never
     /// alarm blind (a degraded read must not be read as calm AND must not be
     /// read as a stall).
     pub fleet_knowable: bool,
@@ -564,7 +564,7 @@ fn cmd_pull_fresh_tick(project: &str, pin: &str) -> Result<()> {
 /// `flywheel captain directory <project> [--json]`
 ///
 /// bd-nmmf4: this path is rex-only by design, so it needs the rex backend's
-/// cargo feature. A lean herdr-only build used to fail to COMPILE here
+/// cargo feature. A lean hc-only build used to fail to COMPILE here
 /// (the function named a cfg-gated module unconditionally); it now answers
 /// the same question with a loud, actionable refusal.
 #[cfg(feature = "backend-superlogical")]
@@ -572,7 +572,7 @@ fn cmd_captain_directory(cfg: &Config, project: &str, json_out: bool) -> Result<
     // Door-scoped rex backend (ADR-0019 D0): directory projects blocks, so
     // it always constructs SuperlogicalBackend. `auto` is already rex-primary
     // regardless of REX_SESSION (bd-mknvb / bd-l7b05); this path still pins
-    // rex explicitly so a herdr-only feature build refuses loudly above.
+    // rex explicitly so a hc-only feature build refuses loudly above.
     let backend = crate::backend::superlogical::SuperlogicalBackend;
     let ws_id = crate::find_workspace_dyn(&backend, project)?;
     let agents = backend
@@ -662,13 +662,13 @@ fn cmd_captain_directory(cfg: &Config, project: &str, json_out: bool) -> Result<
 }
 
 /// ADR-0019 D2/D4 read-only directory, in a build WITHOUT the rex backend.
-/// bd-nmmf4: the directory projects rex blocks, so a herdr-only build cannot
+/// bd-nmmf4: the directory projects rex blocks, so a hc-only build cannot
 /// answer it — refuse loudly instead of failing to compile.
 #[cfg(not(feature = "backend-superlogical"))]
 fn cmd_captain_directory(_cfg: &Config, _project: &str, _json_out: bool) -> Result<()> {
     anyhow::bail!(
         "captain directory needs the rex backend (build with --features backend-superlogical); \
-         a herdr-only build has no blocks to project"
+         a hc-only build has no blocks to project"
     )
 }
 /// The clock is an argument; whois, mail, journal, and dispatch follow in

@@ -323,7 +323,7 @@ impl StageLibrary {
             ),
             (
                 "wave-dispatch",
-                "Wave dispatch (ADR-0006 D3/D1/D4). FIRST read the gate artifact `.flywheel/wave/<wave-label>-ready.json` for `held` + `learnings[]` (bd-wave-swarm-graduation-fix-98io), then take the bead list LIVE: `br ready --json` scoped to this wave at dispatch time (typed `wave` == N, legacy `wave-N` label fallback) — the artifact is a snapshot and may be stale (bd-wave-gate-typed-authority-27et). If the file is missing or \"held\": true, post `[dispatch] held` and STOP. If the live ready set is empty and the artifact names `in_flight[]`, post `[dispatch] work in flight: <ids>` and continue without duplicating a running crew. For EACH bead in ready[] emit ONE payload to the crew's coder pane (find it: `herdr agent list`, this workspace, profile coder): `flywheel send --to <coder-pane-name> --stage ce-execute --param bead=<id> --param scope=<owned globs> --param exit=<the bead's VERIFY command from the artifact> --param channel=<steer-channel> --param pin=<coder-pin> --param report_file=/tmp/<id>-report-<epoch>.md` — and when the gate artifact carries learnings[], append `--param learnings=<paths csv>` so the brief's LEARNINGS field carries their constraints. fresh-eyes-explore is scout-only; coder execution is ce-execute. Every payload NAMES its bead id and carries the CLAIM/CLOSE CONTRACT — also post it once on the steer channel: claim before work (`br update <id> --claim --actor <the coder pin>` — the PIN, and `--claim` with it: the tracker stores a pin (a registered herdr slug folds to its pin) and refuses a username-class assignee, `--claim` is what runs the atomic guard so a second lane cannot overwrite the first lane's assignee, and without an actor the claim falls back to the host username, which matches no live pane), reserve files before editing, commit BEFORE close with the bead id in the message, gate the completion (`br gate report <id> --gate <verdict> --provider <pin> --status pass --to closed`) then close with the commit sha (`br close <id> --commit-sha <sha>`) carrying the VERIFY tail + principles citations. Full reports go to report_file; the steer channel gets a <=700-char summary plus the file path.",
+                "Wave dispatch (ADR-0006 D3/D1/D4). FIRST read the gate artifact `.flywheel/wave/<wave-label>-ready.json` for `held` + `learnings[]` (bd-wave-swarm-graduation-fix-98io), then take the bead list LIVE: `br ready --json` scoped to this wave at dispatch time (typed `wave` == N, legacy `wave-N` label fallback) — the artifact is a snapshot and may be stale (bd-wave-gate-typed-authority-27et). If the file is missing or \"held\": true, post `[dispatch] held` and STOP. If the live ready set is empty and the artifact names `in_flight[]`, post `[dispatch] work in flight: <ids>` and continue without duplicating a running crew. For EACH bead in ready[] emit ONE payload to the crew's coder pane (find it: `hc agent list`, this workspace, profile coder): `flywheel send --to <coder-pane-name> --stage ce-execute --param bead=<id> --param scope=<owned globs> --param exit=<the bead's VERIFY command from the artifact> --param channel=<steer-channel> --param pin=<coder-pin> --param report_file=/tmp/<id>-report-<epoch>.md` — and when the gate artifact carries learnings[], append `--param learnings=<paths csv>` so the brief's LEARNINGS field carries their constraints. fresh-eyes-explore is scout-only; coder execution is ce-execute. Every payload NAMES its bead id and carries the CLAIM/CLOSE CONTRACT — also post it once on the steer channel: claim before work (`br update <id> --claim --actor <the coder pin>` — the PIN, and `--claim` with it: the tracker stores a pin (a registered hc slug folds to its pin) and refuses a username-class assignee, `--claim` is what runs the atomic guard so a second lane cannot overwrite the first lane's assignee, and without an actor the claim falls back to the host username, which matches no live pane), reserve files before editing, commit BEFORE close with the bead id in the message, gate the completion (`br gate report <id> --gate <verdict> --provider <pin> --status pass --to closed`) then close with the commit sha (`br close <id> --commit-sha <sha>`) carrying the VERIFY tail + principles citations. Full reports go to report_file; the steer channel gets a <=700-char summary plus the file path.",
             ),
             (
                 "wave-observe",
@@ -1356,7 +1356,7 @@ mod tests {
     /// The taught close contract is gate → commit → sha-carrying close, and
     /// the claim names the PIN with `--claim`.
     ///
-    /// The assignee used to be taught as the herdr slug, never a pin
+    /// The assignee used to be taught as the hc slug, never a pin
     /// (bd-close-ceremony-gate-sha-68ms, GS-028 B13-B15+B3). That is the
     /// dialect the tracker refuses: `br` stores a PIN (a registered slug
     /// folds to its pin), refuses a username-class assignee, and the pane
@@ -1385,8 +1385,8 @@ mod tests {
             );
         }
         assert!(
-            !dispatch.contains("--assignee <herdr-name>"),
-            "wave-dispatch must not teach the herdr-slug assignee: the tracker stores a pin, \
+            !dispatch.contains("--assignee <hc-name>"),
+            "wave-dispatch must not teach the hc-slug assignee: the tracker stores a pin, \
              and a slug the registry does not know makes the claim hard-fail"
         );
         assert!(

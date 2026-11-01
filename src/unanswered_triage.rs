@@ -5,7 +5,7 @@
 /// The question this exists for is "is this pin mail-only BY DESIGN, or genuinely
 /// DEAD?", and it is semantic: the project's own record is that CODE CANNOT ANSWER
 /// IT. Absence of a pane is not evidence of death — 13 of 20 registry rows (65%)
-/// had a pane herdr did not list — and that distinction is the whole hazard
+/// had a pane hc did not list — and that distinction is the whole hazard
 /// bd-3uqz and bd-3uqz's sibling prunes are about. So the counting and the
 /// absence-reasoning stay in Rust and Jev only supplies the semantic read.
 ///
@@ -618,7 +618,7 @@ pub fn run(
 ///
 /// This exists because the first wired run returned `unknown` for all sixteen real
 /// pins, and the reason was not a bad question. The evidence the code could gather
-/// was `{pin, injects: false, pane_known_to_herdr: false}` — pure absence — so Jev
+/// was `{pin, injects: false, pane_known_to_plane: false}` — pure absence — so Jev
 /// correctly answered "confidently not dead" (0.12) and declined to say "mail-only
 /// by design", for which there was no evidence of design at all.
 ///
@@ -628,7 +628,7 @@ pub fn run(
 ///  - `toron presence list` is EMPTY for both live projects. These agents do not
 ///    publish heartbeats, so presence is not an instrument here at all.
 ///  - the journal's per-pin attribution exists but covers only 4 of 16 pins: it is
-///    written on `HerdrStatus` drains (`msg.pin`), while sweep rows carry no pin.
+///    written on `PlaneStatus` drains (`msg.pin`), while sweep rows carry no pin.
 ///    The top-level `pins` ARRAY is present in the schema and empty in every one of
 ///    4065 rows of the flywheel-toron journal, so a reader that trusted the field
 ///    name rather than the data would conclude every pin is dead.
@@ -726,7 +726,7 @@ pub fn evidence_with_liveness(
     let mut row = serde_json::json!({
         "pin": pin,
         "injects": false,
-        "pane_known_to_herdr": false,
+        "pane_known_to_plane": false,
         "file": file,
         "liveness": liveness.as_str(),
     });
@@ -1180,11 +1180,11 @@ mod tests {
         // number for both has measured nothing.
         let cases: Vec<(&str, serde_json::Value)> = vec![
             (
-                "a pin on a harness herdr cannot inject, still posting to the room",
+                "a pin on a harness hc cannot inject, still posting to the room",
                 serde_json::json!({
                     "pin": "IvoryRidge",
                     "harness": "freebuff",
-                    "pane_known_to_herdr": false,
+                    "pane_known_to_plane": false,
                     "injects": false,
                     "recent_signal": "posted to the channel 4 minutes ago",
                 }),
@@ -1194,7 +1194,7 @@ mod tests {
                 serde_json::json!({
                     "pin": "adr22",
                     "harness": "opencode",
-                    "pane_known_to_herdr": false,
+                    "pane_known_to_plane": false,
                     "injects": false,
                     "workspace_closed": true,
                     "agent_pruned": true,
@@ -1206,7 +1206,7 @@ mod tests {
                 serde_json::json!({
                     "pin": "adr22",
                     "harness": "opencode",
-                    "pane_known_to_herdr": false,
+                    "pane_known_to_plane": false,
                     "injects": false,
                     "recent_signal": "no journal rows, no room posts, no receipt",
                 }),

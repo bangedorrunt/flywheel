@@ -2,11 +2,11 @@
 // governed-by: ADR-0025
 // governed-by: ADR-0026
 // governed-by: ADR-0027
-//! flywheel — multi-agent swarm orchestrator on the herdr backend.
+//! flywheel — multi-agent swarm orchestrator on the hc backend.
 //!
 //! NTM-parity daily loop for opencode/pi/grok: spawn swarms, dispatch work,
 //! monitor states, checkpoint progress. All tracker state lives in br/bv;
-//! all coordination lives in agent-mail; herdr is the backend.
+//! all coordination lives in agent-mail; hc is the backend.
 //!
 //! governed-by: ADR-0022 §3.6 (workflow compose --from-yaml / --dry-run
 //! surface + budget-cap fail-closed gate in the Compose arm), ADR-0026
@@ -745,7 +745,7 @@ mod inbox_filter_tests {
 
 // ---- CLI surface ----
 
-/// Agent swarm orchestrator over herdr, toron mail, and the br bead ledger.
+/// Agent swarm orchestrator over hc, toron mail, and the br bead ledger.
 ///
 /// Session door: `flywheel arrive <project> --as <pin>`, then
 /// `flywheel briefing "<goal>" --project <p> --json`. Run the argv it prints.
@@ -772,7 +772,7 @@ mod inbox_filter_tests {
                   \tflywheel arrive flywheel --as <pin>\n\
                   \tflywheel briefing \"until the tests pass\" --project flywheel --json\n\
                   \n\
-                  Exit codes: 0 ok · 1 herdr/server error · 2 usage error.\n\
+                  Exit codes: 0 ok · 1 hc/server error · 2 usage error.\n\
                   Machine output: --json on list/status/view; --robot-snapshot for full state;\n\
                   --robot-capabilities for the agent command map.\n\
                   User config: ~/.config/flywheel  (flywheel config path)\n\
@@ -815,7 +815,7 @@ enum Commands {
         /// spawn recipe name from recipes.toml
         #[arg(long)]
         recipe: Option<String>,
-        /// extra herdr agent kind counts: --kind claude=1 (repeatable)
+        /// extran hc agent kind counts: --kind claude=1 (repeatable)
         #[arg(long = "kind", value_name = "KIND=COUNT", value_parser = parse_kind_count)]
         kinds: Vec<(String, u32)>,
         /// steer channels every spawned agent joins at pane creation
@@ -924,7 +924,7 @@ enum Commands {
     },
     /// List flywheel swarms and their agents
     List {
-        /// include non-flywheel herdr workspaces
+        /// include non-flywheel hc workspaces
         #[arg(long)]
         all: bool,
     },
@@ -1260,7 +1260,7 @@ enum Commands {
     },
     /// bd-swarm-cockpit-pczs: agent-session reads. `agent tail <pin>` shows
     /// the pin's recent actions (tool calls / commands) from the session
-    /// herdr reports (`agent_session`) — the debugging surface that used to
+    /// hc reports (`agent_session`) — the debugging surface that used to
     /// require finding the raw pi session JSONL by hand.
     Agent {
         #[command(subcommand)]
@@ -1310,7 +1310,7 @@ enum Commands {
         #[command(subcommand)]
         cmd: Option<ArtifactsCmd>,
     },
-    /// Zoom a pane (herdr pane.zoom)
+    /// Zoom a pane (hc terminal.zoom)
     Zoom {
         project: String,
         #[arg(long, default_value = "oc")]
@@ -1318,7 +1318,7 @@ enum Commands {
         #[arg(long)]
         off: bool,
     },
-    /// Attach to an agent's terminal (interactive; execs `herdr attach`)
+    /// Attach to an agent's terminal (interactive; execs `hc attach`)
     Attach {
         project: String,
         #[arg(long, default_value = "oc")]
@@ -1400,7 +1400,7 @@ enum Commands {
     /// (the real-time collab primitive: send urgent + block for the answer)
     Collab {
         project: String,
-        /// peer agent (adjective+noun or herdr short name)
+        /// peer agent (adjective+noun or terminal short name)
         #[arg(long)]
         to: String,
         #[arg(long)]
@@ -1671,7 +1671,7 @@ enum Commands {
         /// max planner↔reviewer change rounds before escalate (default 2)
         #[arg(long, default_value_t = 2)]
         max_change_rounds: u32,
-        /// herdr agent names (defaults: planner=oc, reviewer=pi, implementer=gk)
+        /// hc agent names (defaults: planner=oc, reviewer=pi, implementer=gk)
         #[arg(long)]
         planner: Option<String>,
         #[arg(long)]
@@ -1734,7 +1734,7 @@ enum Commands {
         project: String,
         #[arg(long)]
         workspace: String,
-        /// herdr-mock (SC-D1): stdin watch NDJSON → JSON injects, then exit.
+        /// hc-mock (SC-D1): stdin watch NDJSON → JSON injects, then exit.
         #[arg(long, hide = true)]
         once: bool,
         /// Print `dispatcher: up|down …` and exit (awareness-digest).
@@ -1744,7 +1744,7 @@ enum Commands {
         #[arg(long, hide = true)]
         status: Vec<String>,
     },
-    /// internal: block up to timeout collecting herdr push events (durable leaf)
+    /// internal: block up to timeout collecting hc push events (durable leaf)
     ///
     /// Forward-only `events.subscribe` — no replay. The loop's `__poll`
     /// heartbeat is the correctness floor (bd-event-subscribe-reactor).
@@ -1786,7 +1786,7 @@ enum Commands {
         project: String,
         target: String,
         pattern: String,
-        /// treat the pattern as a Rust regex (herdr-side) instead of a
+        /// treat the pattern as a Rust regex (hc-side) instead of a
         /// literal substring
         #[arg(long)]
         regex: bool,
@@ -2190,7 +2190,7 @@ pub(crate) fn project_dir(cfg: &Config, project: &str) -> PathBuf {
 }
 
 /// Fallible UTF-8 conversion of a filesystem path (193.1). Paths used as
-/// herdr cwd args and agent-mail keys must ROUND-TRIP — lossy conversion
+/// hc cwd args and agent-mail keys must ROUND-TRIP — lossy conversion
 /// would silently corrupt them. The wire protocols are JSON (UTF-8), so a
 /// non-UTF-8 path is a clear error, never a panic and never silent
 /// corruption.
@@ -2201,7 +2201,7 @@ pub(crate) fn utf8_path(p: &Path, what: &str) -> Result<String> {
 }
 
 /// `project_dir` as a UTF-8 string (193.1): the project path is a real path
-/// (herdr cwd, agent-mail key) — propagate non-UTF-8 as an error.
+/// (hc cwd, agent-mail key) — propagate non-UTF-8 as an error.
 fn project_dir_str(cfg: &Config, project: &str) -> Result<String> {
     utf8_path(
         &project_dir(cfg, project),
@@ -2257,12 +2257,12 @@ fn agent_name_n(project: &str, short: &str, ordinal: u32) -> String {
 /// Resolve a bare kind short (or any non-name value) to a concrete spawned
 /// agent name for the pattern drivers (debate, plan-review). review-fix F7:
 /// defaults like `oc`/`pi`/`gk` must resolve to the spawned
-/// `flywheel-<base>-<short>` (the herdr agent name) so `settle_agent` finds
+/// `flywheel-<base>-<short>` (the hc agent name) so `settle_agent` finds
 /// the agent and `resolve_mail_target` maps it to its registered identity.
 ///
 /// Pass-through rule (a value that is ALREADY a concrete name):
-/// - starts with `flywheel-` (a spawned herdr name) — pass through
-/// - is already a valid adjective+noun identity (`agent_mail_name` is
+/// - starts with `flywheel-` (a spawned terminal name) — pass through
+/// - is already a valid adjective+noun identity (`terminal_mail_name` is
 ///   idempotent on those — returns the value unchanged) — pass through
 /// - contains `:` (a raw pane id) — pass through
 ///
@@ -2270,7 +2270,7 @@ fn agent_name_n(project: &str, short: &str, ordinal: u32) -> String {
 /// ordinal of that kind.
 fn resolve_agent_default(project: &str, value: &str) -> String {
     let v = value.trim();
-    let already_concrete = v.starts_with("flywheel-") || v.contains(':') || agent_mail_name(v) == v;
+    let already_concrete = v.starts_with("flywheel-") || v.contains(':') || terminal_mail_name(v) == v;
     if v.is_empty() || already_concrete {
         v.to_string()
     } else {
@@ -2288,11 +2288,11 @@ fn agent_ordinal(name: &str, project: &str, short: &str) -> Option<u32> {
 }
 
 /// bd-o1zh: unique name per spawn attempt. A retried `spawn --profile`
-/// reuses the fixed ordinal-1 name; when herdr still holds it (stale
+/// reuses the fixed ordinal-1 name; when hc still holds it (stale
 /// binding or a launch_pending registration) the retry collides
 /// agent_name_taken. Bump past every taken name so the attempt lands on a
-/// free one. Pure: `taken` is the live herdr name set. The spawn
-/// derivation (effect-journal label) stays stable — only the herdr agent
+/// free one. Pure: `taken` is the live hc name set. The spawn
+/// derivation (effect-journal label) stays stable — only the hc agent
 /// name gains the suffix, so the retry is idempotent, not a duplicate.
 // governed-by: bd-o1zh
 pub(crate) fn free_spawn_ordinal(
@@ -2308,7 +2308,7 @@ pub(crate) fn free_spawn_ordinal(
     ordinal
 }
 
-/// Resolve a herdr workspace for a project by label; error if missing.
+/// Resolve an hc workspace for a project by label; error if missing.
 /// Labels that resolve `project` for status/send/kill: default swarm
 /// label, spawn-meta custom label, the raw token, and its slug.
 /// Captains pass `--label flywheel-omp-repro` then `status flywheel-omp-repro`
@@ -2352,7 +2352,7 @@ pub(crate) fn find_workspace_info(c: &mut Client, project: &str) -> Result<hc_su
     if matches.len() > 1 {
         let prefix = format!("flywheel-{}-", project_base(project));
         let agents = c.agent_list()?;
-        // bd-k8jn: a spawned crew's herdr name is its MAIL PIN, so the prefix
+        // bd-k8jn: a spawned crew's terminal name is its MAIL PIN, so the prefix
         // scan below cannot see it and the tie falls to list order — the stale
         // room carrying the bare project label. The spawn registry is the
         // project→pane map, so its panes name the live swarm.
@@ -2407,8 +2407,8 @@ fn resolve_agents(c: &mut Client, ws_id: &str, project: &str, to: &str) -> Resul
         .map(|a| a.name.clone().unwrap_or_default())
         .collect();
     // bd-pin-public-plane-s-easy.2: `--to <pin>` is the model-typed name —
-    // remap each token through the registry (herdr name, pane id, numbered
-    // short, or mail pin → the entry's herdr name). `all` passes through.
+    // remap each token through the registry (terminal name, pane id, numbered
+    // short, or mail pin → the entry's terminal name). `all` passes through.
     let want: Vec<WantToken> = if to == "all" {
         avail
             .iter()
@@ -2431,8 +2431,8 @@ fn resolve_agents(c: &mut Client, ws_id: &str, project: &str, to: &str) -> Resul
                     .unwrap_or_else(|| t.to_string());
                 let mut want = to_want_token(project, &name);
                 // The registry resolved the token to a PANE: keep it. The
-                // agent's herdr name may be the mail PIN (herdr lowercases
-                // it), so the canonical registry name and the herdr name can
+                // agent's terminal name may be the mail PIN (hc lowercases
+                // it), so the canonical registry name and the hc name can
                 // never meet — the pane id always can.
                 if let Some(e) = entry {
                     want.pane = Some(e.pane_id.clone());
@@ -2459,7 +2459,7 @@ fn resolve_agents(c: &mut Client, ws_id: &str, project: &str, to: &str) -> Resul
 /// durable-loop leaf handlers (`__poll` / `__send` / `__mail-blocked`), which
 /// construct their backend via the factory (`backend::multiplexer_backend`)
 /// per ADR-0002 §5. The one-shot CLI commands keep the `&mut Client` overloads
-/// (they're herdr-specific and don't need backend-agnosticism yet — migrating
+/// (they're hc-specific and don't need backend-agnosticism yet — migrating
 /// them is churn with no payoff until superlogical ships). The two overloads
 /// share the helper bodies via macros-free duplication (small, narrow).
 pub(crate) fn find_workspace_dyn(
@@ -2479,7 +2479,7 @@ pub(crate) fn find_workspace_dyn(
         // bd-ws-resolution (2026-08-17): a FOREIGN workspace sharing the
         // bare project label ("toron") outranked the flywheel-owned one
         // ("flywheel-toron") whenever the agent-name disambiguation below
-        // found no NAMED agents — herdr's raw agent_list has no names for
+        // found no NAMED agents — hc's raw agent_list has no names for
         // omp panes (the spawn registry overlay supplies them later), so
         // every disambiguation fell through to list order and dispatch
         // targeted the foreign (empty-of-flywheel-agents) workspace. The
@@ -2532,8 +2532,8 @@ fn resolve_agents_dyn(
         .map(|a| a.name.clone().unwrap_or_default())
         .collect();
     // bd-pin-public-plane-s-easy.2: `--to <pin>` is the model-typed name —
-    // remap each token through the registry (herdr name, pane id, numbered
-    // short, or mail pin → the entry's herdr name). `all` passes through.
+    // remap each token through the registry (terminal name, pane id, numbered
+    // short, or mail pin → the entry's terminal name). `all` passes through.
     let want: Vec<WantToken> = if to == "all" {
         avail
             .iter()
@@ -2556,8 +2556,8 @@ fn resolve_agents_dyn(
                     .unwrap_or_else(|| t.to_string());
                 let mut want = to_want_token(project, &name);
                 // The registry resolved the token to a PANE: keep it. The
-                // agent's herdr name may be the mail PIN (herdr lowercases
-                // it), so the canonical registry name and the herdr name can
+                // agent's terminal name may be the mail PIN (hc lowercases
+                // it), so the canonical registry name and the hc name can
                 // never meet — the pane id always can.
                 if let Some(e) = entry {
                     want.pane = Some(e.pane_id.clone());
@@ -2584,7 +2584,7 @@ fn resolve_agents_dyn(
 /// match against. Bare kind shorts (`oc`, `pi`, `gk`) wrap to the first
 /// ordinal (`flywheel-<base>-oc`); anything already concrete passes through
 /// unchanged:
-///   - `flywheel-...` (a spawned herdr name, exactly what `flywheel list`
+///   - `flywheel-...` (a spawned terminal name, exactly what `flywheel list`
 ///     shows) — pass through, do NOT double-wrap
 ///   - contains `:` (a raw pane id) — pass through
 ///
@@ -2610,8 +2610,8 @@ struct WantToken {
     ordinal: u32,
     /// The PANE the token resolved to through the spawn registry. The
     /// registry is the project→pane map, so the pane is the ground truth:
-    /// a spawned crew's herdr name is its mail PIN (herdr lowercases it),
-    /// and the registry's canonical name and the herdr name can therefore
+    /// a spawned crew's terminal name is its mail PIN (hc lowercases it),
+    /// and the registry's canonical name and the hc name can therefore
     /// never meet — the pane id always can.
     pane: Option<String>,
 }
@@ -2682,7 +2682,7 @@ fn name_matches_want(name: &str, want: &WantToken) -> bool {
 
 /// The `ordinal`-th (1-based) agent of `kind` in list order — the kind
 /// fallback for `--to` resolution (bd-4pxy): a short's NAME target may not
-/// exist (an omp agent named `flywheel-<base>-coder`), but the herdr kind
+/// exist (an omp agent named `flywheel-<base>-coder`), but the hc kind
 /// is stable. `None` when fewer than `ordinal` agents run that kind.
 fn kind_nth_index(agents: &[AgentInfo], kind: &str, ordinal: u32) -> Option<usize> {
     agents
@@ -2693,7 +2693,7 @@ fn kind_nth_index(agents: &[AgentInfo], kind: &str, ordinal: u32) -> Option<usiz
         .map(|(i, _)| i)
 }
 
-/// bd-rex-default-plane-xn1t: the default send path's resolver on a non-herdr
+/// bd-rex-default-plane-xn1t: the default send path's resolver on a non-hc
 /// plane. Same rule as `comms_send::backend_wake_target` (shared, not copied):
 /// a token names a block label or agent name EXACTLY, or it resolves through
 /// the spawn registry (mail pin, lane name, or pane id → pane ground truth).
@@ -2774,11 +2774,11 @@ fn match_indices(agents: &[AgentInfo], wants: &[WantToken]) -> Vec<usize> {
             && let Some(i) = agents.iter().position(|a| &a.pane_id == pane)
         {
             // The registry resolved the token to this PANE: the pane is the
-            // ground truth, whatever herdr calls the agent.
+            // ground truth, whatever hc calls the agent.
             out[i] = true;
         } else if let Some(i) = agents.iter().position(|a| a.pane_id == want.name) {
             // bd-a2bw: pane-id tokens never sit in `a.name`. Match the pane
-            // even when herdr reports name=null (omp profile splits).
+            // even when hc reports name=null (omp profile splits).
             out[i] = true;
         } else if let Some(short) = &want.short
             && let Some(i) = kind_nth_index(agents, short, want.ordinal)
@@ -2798,7 +2798,7 @@ fn agent_target(a: &AgentInfo) -> &str {
 }
 
 /// Render an agent for the `--to` failure hint (raw-pane addressing,
-/// 2026-09-07): registry name when present, else the raw herdr agent kind
+/// 2026-09-07): registry name when present, else the raw hc agent kind
 /// with its pane id (`grok (w6:p2)`), else the bare pane id. Raw panes (no
 /// spawn-registry entry) are addressable by kind (`--to grok`) or pane id
 /// (`--to w6:p2`); the error must name them instead of degrading to empty
@@ -2815,7 +2815,7 @@ fn agent_display(a: &AgentInfo) -> String {
 
 /// Bounded settle-retry over fallible live re-reads (bd-qs1c.1): a send
 /// racing a fresh spawn can miss the pin (registry not yet flushed) or the
-/// pane (not yet in herdr's list). Each attempt is a live re-read — never an
+/// pane (not yet in hc's list). Each attempt is a live re-read — never an
 /// invented observation (GS-037) — and exhaustion returns the last error for
 /// the caller to fail loud. `retries` counts RE-tries after the first try.
 ///
@@ -2852,9 +2852,9 @@ fn settle_retry<T, E>(
     )
 }
 
-/// bd-a2bw / ADR-0018: herdr omp panes drop names (bd-w17). Fill null
+/// bd-a2bw / ADR-0018: hc omp panes drop names (bd-w17). Fill null
 /// names from the spawn registry so `--to coder3` matches after overlay
-/// even though herdr kind stays `omp`.
+/// even though hc kind stays `omp`.
 fn overlay_registry_names(agents: &mut [AgentInfo], entries: &[state::SpawnEntry]) {
     for a in agents.iter_mut() {
         if a.name.is_some() {
@@ -2867,9 +2867,9 @@ fn overlay_registry_names(agents: &mut [AgentInfo], entries: &[state::SpawnEntry
 }
 
 /// bd-a2bw / bd-pin-public-plane-s-easy.2: resolve a send/rebind token to a
-/// spawn-registry row. Accepts the herdr name, a pane id, a numbered short
+/// spawn-registry row. Accepts the hc name, a pane id, a numbered short
 /// (`coder3` → `flywheel-<base>-coder3`), OR the agent's mail PIN
-/// (adjective+noun — `--to DustySparrow` resolves to the herdr name the
+/// (adjective+noun — `--to DustySparrow` resolves to the hc name the
 /// identity was pinned for).
 fn registry_entry_for_token<'a>(
     entries: &'a [state::SpawnEntry],
@@ -2889,7 +2889,7 @@ fn registry_entry_for_token<'a>(
         })
 }
 
-/// bd-a2bw: herdr `launch_pending` is stale when the pane is already
+/// bd-a2bw: hc `launch_pending` is stale when the pane is already
 /// input-ready (omp at `π >` with a session, status idle/working/blocked/
 /// done). Spawn/send must not treat that as still-booting.
 /// GS-049: shared with `snapshot::assemble` via `hc_support::agent_still_booting`.
@@ -2916,22 +2916,22 @@ fn main() {
         print_json(&json!({
             "tool": "flywheel",
             "version": VERSION,
-            "backend": format!("herdr (socket protocol v{})", hc_support::HDR_PROTOCOL),
+            "backend": format!("hc (socket protocol v{})", hc_support::HDR_PROTOCOL),
             "upstream_parity": upstream_parity::robot_summary(),
             "commands": [
                 "init spawn add list status decide rebind recover",
             "send interrupt view output watch zoom attach kill",
             "crew preview|control (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker)",
             "captain watch <project> [--interval N] [--json] [--as <pin>] [--stall --stall-minutes N] [--preflight --preflight-mode steer|loop|workflow|cron] (bd-captain-watch-poll-exit-bbwm: harness resume on the captain inbox. The push is escalate@1 mail from the supervisor. This command blocks on that inbox's water and exits with a preview when strictly-newer mail lands; --stall also exits 0 when every bead is closed, or exits 3 when no pane is working and no commit landed for the threshold with work remaining; an unreadable fleet never alarms; --preflight adds an arm that exits 4 with the FIRST failing check and its remedy line, checked at arm time and each poll. One shot: re-arm after each resume)",
-            "captain directory <project> [--json] (ADR-0019 D2/D4: read-only sessions, tiers, and per-pin addressability — ok <key> or err <code> — from the pure directory projection over an explicitly selected rex backend; never auto/herdr on this path)",
+            "captain directory <project> [--json] (ADR-0019 D2/D4: read-only sessions, tiers, and per-pin addressability — ok <key> or err <code> — from the pure directory projection over an explicitly selected rex backend; never auto/hc on this path)",
             "captain approve <project> --request-key <key> --decision approve|deny [--note <text>] --as <operator-pin> (ADR-0019 D10: verify the operator via whois, mail the asker the 4-line body, fetch-back verify, rehash the payload, run it or settle denied; missing row, self-approval, or unverified sender is approval_mismatch, never a dispatch)",
-            "loop-mode (alias: loop) run (--resume replays a killed run's checkpoints; default is FRESH) / supervise (child-process --once pass cadence, stops after 3 consecutive failures; a dead-stop probe each pass emits ONE loud escalation + one captain page when no pane is working and no commit landed for --stall-minutes, default 45, with work remaining — a recovering fleet clears it without a second; bd-pane-wedge-detect-respawn-pnyi: a per-pane wedge probe reads each registered pin's pane tail + process liveness and pages ONCE per wedge naming the pin, the pane, and the parked error line, cleared when a commit lands — herdr exposes no CPU counter, so zero-CPU is read as its observable equivalent, process still alive + nothing moved) / status/list/prune/doctor/replay/why work assign collab xproj mail toron steer ledger principles artifacts judgment",
+            "loop-mode (alias: loop) run (--resume replays a killed run's checkpoints; default is FRESH) / supervise (child-process --once pass cadence, stops after 3 consecutive failures; a dead-stop probe each pass emits ONE loud escalation + one captain page when no pane is working and no commit landed for --stall-minutes, default 45, with work remaining — a recovering fleet clears it without a second; bd-pane-wedge-detect-respawn-pnyi: a per-pane wedge probe reads each registered pin's pane tail + process liveness and pages ONCE per wedge naming the pin, the pane, and the parked error line, cleared when a commit lands — hc exposes no CPU counter, so zero-CPU is read as its observable equivalent, process still alive + nothing moved) / status/list/prune/doctor/replay/why work assign collab xproj mail toron steer ledger principles artifacts judgment",
                 "artifacts <run_id> [--json] + artifacts stitch <run_id> (state-dir per-run records, stitch_artifacts at artifact.rs:233)",
                 "upstream parity (embedded in --robot-capabilities; offline manifest: docs/upstream-parity.toml)",
             "doorbell status/start/stop/re-inject/afk/why/roster/introduce (supervised pane-wake layer: lazy-heal + persisted wake state; afk batches captain-relevant wakes; roster is nearby panes+pins+reservations; introduce is contact+channel+subscribe)",
             "snapshot <project> (fleet snapshot flywheel-snapshot.v1 as robot JSON)",
             "status <project> + progress [<project>] [--json] (bd-swarm-cockpit-pczs cockpit reads: status rows carry pin/npub/pane/verdict/bead/reservations/last_active_ts_us and print JSON when not a TTY; progress groups beads by wave-N label — closed/in_progress/ready/blocked/unknown — and names dispatching_wave, the lowest ready/in-progress wave; project defaults to the workspace cwd)",
-            "agent tail <pin> [--project <p>] [--json] [--n N] (bd-swarm-cockpit-pczs: the pin's recent actions — tool calls / commands — from the session herdr reports on the pane's agent_session; path sessions read the pi JSONL, id sessions read the opencode store; no newest-file guessing)",
+            "agent tail <pin> [--project <p>] [--json] [--n N] (bd-swarm-cockpit-pczs: the pin's recent actions — tool calls / commands — from the session hc reports on the pane's agent_session; path sessions read the pi JSONL, id sessions read the opencode store; no newest-file guessing)",
             "helm <project> (session-start drain: OPEN DECISIONS, UNREAD STATUS, RECORD DIVERGENCE)",
                 "coalition debate plan-review profile squad model slot catalog runs list/show/pending/digest/reconcile",
                 "workflow cron recipes workflows pipeline template stage ensemble",
@@ -2960,7 +2960,7 @@ fn main() {
             "loop_resume_window": "loop/loop-mode run --work (resume-window sweep, bead 4sa2): an in-progress bead resumes at most ONCE per (bead, pane) in a 15-min window (the watermark persists per project under the state dir, so it survives passes and processes — the in-memory `assigned` set does not); a peer-held bead (a DIFFERENT live pane's reservation reasons to it — a lane split, not a stall) draws NO resume; each pass releases leases whose reason bead is closed via the one pure rule durable::closed_reason_lease_ids. bd-loop-feeds-idle-panes-rh2z adds the idle-pane rotation: each IDLE pane takes ONE bead — its own stalled in-progress bead first, then a ready bead assigned to it, then an unowned ready bead, then any ready bead whose assignee is not a live pane — never a bead another live pane owns or a peer holds, never one already queued, and the picks go at the HEAD of the queue in fleet order (plan_actions pairs the k-th idle agent with the k-th item, so that order is what lands the pick on the pane the rotation chose). A tier-1 hit inside the window still defers for `resume_exempt_passes` consecutive starved passes (config [loop], default 2, counters persisted via state::load_pane_starvation/record_pane_starvation because loop-mode supervise runs each pass as a child process); from that pass the pick is marked window-exempt. Pure: durable::{within_resume_window, peer_held, should_resume_attempt, closed_reason_lease_ids, idle_pane_rotation}; fences: resume_window_dedupes_and_respects_peer_holds, loop_feeds_idle_panes_stalled_beads",
             "wave_swarm_compose_token": "preferred: workflow compose \"<objective>\" --parts wave-swarm --run (compose token); legacy alias: workflow run wave-swarm --execute. Expands GATE/DISPATCH/EXECUTE/OBSERVE/REVIEW/VERIFY/COMPOUND/SIGNOFF with an await step between each gated pair (retry over verify of .flywheel/wave/<label>-<stage>.done, the marker the predecessor writes; 240 x 30s per-step budget; exhaustion says 'wave in flight … widen the outer bound'). ADR-0009: REVIEW audits diffs pre-verify, COMPOUND captures learnings post-verify; SIGNOFF=request_approval (captain-only), announced by the compose approval drainer — resolve with `flywheel workflow approve`. Ordinary builtins (captain-audit): workflow run <name> --execute, NOT bare --parts. Outer bound: --timeout or FLYWHEEL_COMPOSE_MAX_SECONDS (ADR-0006 D3)",
             "beads_lifecycle_compose_token": "preferred: workflow compose \"<objective>\" --parts beads-lifecycle --run --project <p> (compose token); legacy alias: workflow run beads-lifecycle --execute. grill/create/review1/review2/integrate then implement=call_workflow wave-swarm (new graph) or babysit-bead (inputs.existing_bead / from=bead); verify; outer SIGNOFF. inputs.from=none|session|adr|bead; inputs.until early-exits SUCCESS after any phase; SIGNOFF outer-only (ADR-0008 6.7)",
-            "exit_codes": { "0": "ok", "1": "herdr/server error", "2": "usage error", "3": "captain watch --stall: fleet stalled (no pane working + no commit within threshold, work remaining)", "4": "captain watch --preflight: the project's preflight failed (the failing check is named; bd-captain-watch-preflight-arm-snak)" }
+            "exit_codes": { "0": "ok", "1": "hc/server error", "2": "usage error", "3": "captain watch --stall: fleet stalled (no pane working + no commit within threshold, work remaining)", "4": "captain watch --preflight: the project's preflight failed (the failing check is named; bd-captain-watch-preflight-arm-snak)" }
         }));
         return;
     }
@@ -2977,7 +2977,7 @@ fn main() {
                 print_json(&v);
                 return;
             }
-            Err(e) => die(&e, Some("is herdr running? (flywheel deps)")),
+            Err(e) => die(&e, Some("is hc running? (flywheel deps)")),
         }
     }
 
@@ -3894,7 +3894,7 @@ fn main() {
 
 fn print_concise_help() {
     println!(
-        "flywheel — herdr swarm orchestrator (v{VERSION})\n\n\
+        "flywheel — hc swarm orchestrator (v{VERSION})\n\n\
          Examples:\n\
          \x20 flywheel spawn notetoself --oc=1 --pi=1 --gk=1\n\
          \x20 flywheel send notetoself --to all --stage fresh-eyes-explore --wait\n\
@@ -4031,7 +4031,7 @@ pub(crate) fn latest_run_entries(
 }
 
 /// Only used by the serve-gated SSE server; gate it so the lean
-/// backend-only build (`--no-default-features --features backend-herdr,
+/// backend-only build (`--no-default-features --features backend-hc,
 /// mail-toron`) has no dead-code warning (bd-cargo-feature-flags).
 #[cfg(feature = "serve")]
 fn chrono_like_ts() -> String {
@@ -4245,7 +4245,7 @@ fn spawn_item_kind(
 /// stays profile-only: the operator named this pair explicitly, so there is
 /// no profile indirection to protect. Empty model -> no flags.
 /// bd-oc-bare-spawn-model-argv-zbzt: the bare kind/count lane launches through
-/// `herdr agent start --kind <harness>` — the same interactive entrypoint the
+/// `hc agent start --kind <harness>` — the same interactive entrypoint the
 /// profile lane uses — so it must deliver the model the same way: argv where
 /// the harness takes a flag, pane env where it does not (opencode's root
 /// command rejects `--model`). Returns `(argv, env_model_pin)`; the caller must
@@ -4345,7 +4345,7 @@ fn resolve_role_flag(registry: &models::ModelRegistry, raw: &str, harness: &str)
 /// `record_reroute_audit`, not folded back into this plan).
 ///
 /// bd-crlx: `env_model_pin` exists because `env_model_pin` being `Some` means
-/// the argv CANNOT carry the model. opencode v2's root command — the one herdr
+/// the argv CANNOT carry the model. opencode v2's root command — the one hc
 /// launches — has no `--model` flag (only `opencode run` does), so the TUI's
 /// model must be pinned through pane env instead. Making it a field on the plan
 /// rather than a silent omission means every pane-creating caller is forced by
@@ -4386,7 +4386,7 @@ pub(crate) fn profile_launch_plan(
     let model = registry.resolve_strict(&lookup, &harness)?;
     // bd-crlx: the INTERACTIVE plan, not the headless `model_args`. Every
     // caller of this function launches the agent through
-    // `herdr agent start --kind <harness>`, which runs the harness's
+    // `hc agent start --kind <harness>`, which runs the harness's
     // interactive entrypoint. For most harnesses that is the same flag
     // (`interactive_model_plan` routes them to `model_args` unchanged); for
     // opencode it is NOT — the root command rejects `--model` outright, so the
@@ -4442,7 +4442,7 @@ pub(crate) fn profile_launch_args(
 /// route rather than a profile (the rate-limit fallback hops).
 ///
 /// bd-oc-bare-spawn-model-argv-zbzt: ONE delivery rule for every pane launch.
-/// `herdr agent start --kind <harness>` runs the harness's interactive
+/// `hc agent start --kind <harness>` runs the harness's interactive
 /// entrypoint, so a model flag the headless form emits (`headless::model_args`
 /// → opencode `--model`) must never reach it — opencode's root command answers
 /// it with `ERROR Unrecognized flag: --model in command opencode` and the pane
@@ -4480,9 +4480,9 @@ pub(crate) fn interactive_pane_args(
 /// the agent starts) is injected as "your mail identity is X" so the agent
 /// boots knowing the exact name its peers/assigns address it by.
 ///
-/// bd-zq8u: the rendered output is the launch ARG — herdr rejects any arg
+/// bd-zq8u: the rendered output is the launch ARG — hc rejects any arg
 /// containing control characters (`arg.chars().any(char::is_control)`,
-/// herdr src/app/agents.rs). The template file keeps markdown newlines for
+/// hc src/app/agents.rs). The template file keeps markdown newlines for
 /// readability; the rendered string collapses them to spaces so the launch
 /// text is control-char-free. `ensure_ascii_launch_args` guards the same
 /// boundary defensively.
@@ -4504,7 +4504,7 @@ fn peer_prompt_template(
         )
         .replace("{poll_budget_minutes}", &poll_budget_minutes.to_string())
         .replace("{max_peer_prompts}", &max_peer_prompts.to_string());
-    // bd-zq8u: herdr's `is_control` check rejects \t \n \r \0 \x1b etc. —
+    // bd-zq8u: hc's `is_control` check rejects \t \n \r \0 \x1b etc. —
     // collapse every control char to a space (semantics preserved: the
     // prompt text survives, just de-blanked).
     rendered
@@ -4515,7 +4515,7 @@ fn peer_prompt_template(
 
 /// clap command signature — params map 1:1 to CLI flags (ADR-0002 CLI surface).
 #[allow(clippy::too_many_arguments)]
-/// bd-fw-stale-workspace-panes-hgp + bd-627z.3: pre-existing herdr
+/// bd-fw-stale-workspace-panes-hgp + bd-627z.3: pre-existing hc
 /// workspaces that share this project's label or host its agents, split by
 /// origin. Flywheel-owned workspaces (default swarm label `flywheel-<base>`,
 /// a recorded custom spawn label, or hosting agents named `flywheel-<base>-*`)
@@ -4721,7 +4721,7 @@ mod spawn_profile_plan_tests {
         // Compiled-in routing defaults apply zero-config (no models.toml).
         let p = profile("opencode", "deepseek-v4.1-flash");
         assert_eq!(
-            // bd-crlx: opencode gets NO model argv. The root command herdr
+            // bd-crlx: opencode gets NO model argv. The root command hc
             // launches has no `--model` (only `opencode run` does) and v2.0.16
             // rejects it outright. The pin travels by pane env instead.
             profile_launch_plan("opencode", &p, None)
@@ -4888,7 +4888,7 @@ mod spawn_profile_plan_tests {
     }
 
     /// bd-oc-bare-spawn-model-argv-zbzt: the bare kind/count lane launches
-    /// through `herdr agent start --kind <harness>` exactly like the profile
+    /// through `hc agent start --kind <harness>` exactly like the profile
     /// lane, so it must deliver the model the SAME way — argv for harnesses
     /// that take a flag, pane env for opencode, whose ROOT command rejects
     /// `--model` outright (`ERROR Unrecognized flag: --model in command
@@ -4940,7 +4940,7 @@ mod spawn_profile_plan_tests {
 
     /// bd-oc-bare-spawn-model-argv-zbzt: the rate-limit fallback hops re-launch
     /// INTO an existing pane, so they use the argv-only view — which must be
-    /// the INTERACTIVE form (opencode takes no model flag on the command herdr
+    /// the INTERACTIVE form (opencode takes no model flag on the command hc
     /// starts) and must REFUSE an env-delivered pin instead of silently
     /// launching a seat whose env already says something else.
     #[test]
@@ -5247,7 +5247,7 @@ mod profile_run_spawn_tests {
     }
 
     /// bd-ude8: `resolved_spec_workspace` must return a PANE id — `profile
-    /// run`/`squad spawn` hand it to `agent_start` as the pane, and herdr
+    /// run`/`squad spawn` hand it to `agent_start` as the pane, and hc
     /// rejects a workspace id with `agent_pane_not_found`.
     #[test]
     fn resolved_spec_workspace_returns_pane_id() {
@@ -6014,7 +6014,7 @@ mod steer_engine_tests {
     /// Shared harness: the exact execution shape the Run arm builds for a
     /// pane-mode steer — recording/counting runner, builtin+catalog
     /// workflow resolver, crew fan-out resolution, local engine over
-    /// Resonate::local. No herdr panes needed: dispatch_job side-effects
+    /// Resonate::local. No hc terminals needed: dispatch_job side-effects
     /// are recorded, control flow is real.
     fn steer_engine(
         calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -6286,7 +6286,7 @@ mod workspace_origin_tests {
 
     // bd-umb3: the `add` path must boot-prime each new pane (settle before
     // the send_text prime, retried, manual-socket fallback) — an unprimed
-    // pane reports idle in herdr but rejects `flywheel send` with
+    // pane reports idle in hc but rejects `flywheel send` with
     // `agent_not_ready` until a manual prime. Code-pointer gate: `cmd_add`
     // must (a) sleep the settle before priming, (b) call the retried
     // `prime_via_send_text` for non-in-arg kinds, (c) the prime helper
@@ -6366,7 +6366,7 @@ mod workspace_origin_tests {
         );
         // (c) helper warns with the manual socket one-liner on final failure
         assert!(
-            prime_body.contains("manual socket prime: herdr pane send-text"),
+            prime_body.contains("manual socket prime: hc terminal send-text"),
             "prime_via_send_text must warn with the manual socket one-liner (bd-umb3)"
         );
     }
@@ -7386,7 +7386,7 @@ fn arrive_registers_arriver_pin() {
     );
 }
 
-/// bd-gpj0: open-mode arrive must bind `HERDR_PANE_ID` so doorbell can push,
+/// bd-gpj0: open-mode arrive must bind `HC_TERMINAL_ID` so doorbell can push,
 /// or say pull-only when the env is absent. A pin with no pane stays
 /// digest-bound (`no_injectable_panes`).
 #[test]
@@ -7402,7 +7402,7 @@ fn arrive_binds_open_pane_or_says_pull_only() {
     let body = &src[start..end];
     assert!(
         body.contains("arrive_maybe_bind_pane"),
-        "arrive must bind the current herdr pane (or announce pull-only)"
+        "arrive must bind the current hc terminal (or announce pull-only)"
     );
     let bind = body.find("arrive_maybe_bind_pane").expect("bind helper");
     let register = body.find("register_agent").expect("register");
@@ -7519,14 +7519,14 @@ mod spawn_boot_reliability_tests {
     }
 
     /// bd-rename-clear-name-too-long-oxd7: the rename-clear escape hatch must
-    /// mint a herdr-LEGAL label for ANY name herdr itself accepted.
+    /// mint an hc-LEGAL label for ANY name hc itself accepted.
     ///
-    /// The bare `{name}-stale-{attempts}` concat overflows herdr's 32-char cap
+    /// The bare `{name}-stale-{attempts}` concat overflows hc's 32-char cap
     /// for a long project slug (`flywheel-elm-effect-rs-oc` (25) + `-stale-1`
-    /// = 33), and herdr answers `invalid_agent_name` — so the one door that
+    /// = 33), and hc answers `invalid_agent_name` — so the one door that
     /// frees a taken name wedges shut exactly when it is needed.
     #[test]
-    fn stale_rename_label_stays_herdr_legal() {
+    fn stale_rename_label_stays_plane_legal() {
         // The bead's witness: the pre-fix concat really was 33 chars.
         assert_eq!(
             "flywheel-elm-effect-rs-oc-stale-1".len(),
@@ -7537,18 +7537,18 @@ mod spawn_boot_reliability_tests {
         for attempts in [1u32, 2, 7, 19, u32::MAX] {
             let label = stale_rename_label(long, attempts);
             assert!(
-                is_herdr_legal_name(&label),
-                "{label:?} ({} chars) must be herdr-legal for attempts={attempts}",
+                is_terminal_legal_name(&label),
+                "{label:?} ({} chars) must be hc-legal for attempts={attempts}",
                 label.len()
             );
             // The attempt stays readable: a stale row must say WHICH pass it
-            // was, which a tail-truncating `herdr_agent_name()` would eat.
+            // was, which a tail-truncating `terminal_agent_name()` would eat.
             assert!(
                 label.ends_with(&format!("stale-{attempts}")),
                 "{label:?} must keep the attempt number"
             );
         }
-        // The exact bytes herdr is asked for in the live witness (keep this
+        // The exact bytes hc is asked for in the live witness (keep this
         // literal and the live run's label in sync).
         assert_eq!(
             stale_rename_label(long, 1),
@@ -7563,7 +7563,7 @@ mod spawn_boot_reliability_tests {
         );
         // A name already AT the cap still yields a legal label.
         let capped = "a".repeat(32);
-        assert!(is_herdr_legal_name(&stale_rename_label(&capped, 1)));
+        assert!(is_terminal_legal_name(&stale_rename_label(&capped, 1)));
     }
 
     /// The wiring gate: the stale label must be minted through the bounded
@@ -7585,7 +7585,7 @@ mod spawn_boot_reliability_tests {
         );
         assert!(
             !src.contains("format!(\"{name}-stale-{attempts}\")"),
-            "the raw `{{name}}-stale-{{attempts}}` concat overflows herdr's 32-char cap"
+            "the raw `{{name}}-stale-{{attempts}}` concat overflows hc's 32-char cap"
         );
     }
 
@@ -8099,7 +8099,7 @@ mod spawn_boot_reliability_tests {
         );
         assert!(
             brain_rt.contains("\"working\" | \"idle\" | \"done\" | \"blocked\""),
-            "Status arm must observe herdr status transitions"
+            "Status arm must observe hc status transitions"
         );
         assert!(
             brain_rt.contains("persist_wake"),
@@ -8126,7 +8126,7 @@ mod spawn_boot_reliability_tests {
             "P0-1 must NOT stamp last_wake from planned injects (no invent-green or_else+injects.first)"
         );
         // It MAY stamp via doorbell_note_observed_wake when --wait OBSERVED
-        // herdr settled_status working|idle|done|blocked after land (GS-039).
+        // hc settled_status working|idle|done|blocked after land (GS-039).
         // The old negative guard (cmd_send must not call the retired
         // `doorbell_persist_wake`) is subsumed: that symbol no longer exists, so
         // the positive OBSERVED-status gate below is the whole contract.
@@ -8422,17 +8422,17 @@ mod spawn_boot_reliability_tests {
 }
 
 #[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
-/// bd-bug-omp-herdr-wedge: harnesses whose herdr integration holds FULL
-/// lifecycle-hook authority (herdr skips screen/process detection for them)
+/// bd-bug-omp-hc-wedge: harnesses whose hc integration holds FULL
+/// lifecycle-hook authority (hc skips screen/process detection for them)
 /// The neutral boot prompt that opens the agent.prompt gate. H2
 /// (bd-harness-pane-send-text-7fe8): delivered via `pane.send_text` after the
 /// TUI owns the foreground (works for any kind, non-agent panes too), not as
 /// a positional MESSAGES launch arg.
 ///
 /// Lifecycle-authority kinds — pi/omp/kimi/opencode/kilo/mastracode (+grok) —
-/// gate agent.prompt on a processed prompt when their herdr integration is
+/// gate agent.prompt on a processed prompt when their hc integration is
 /// reporting; the prime is harmless for all kinds and removes the
-/// detection-class race entirely (bd-bug-omp-herdr-wedge, H5
+/// detection-class race entirely (bd-bug-omp-hc-wedge, H5
 /// bd-harness-prime-kind-list-eivx).
 fn boot_prime_line() -> &'static str {
     "Boot ready check: reply exactly READY and await captain instructions."
@@ -8469,7 +8469,7 @@ fn comms_inbox_on() -> bool {
     }
 }
 
-/// The spawn-time prime for pane `pane_id` running herdr kind `kind`. Flag on:
+/// The spawn-time prime for pane `pane_id` running hc kind `kind`. Flag on:
 /// the per-harness `PaneWrite::LaunchBootstrap` constant through the sink
 /// (pull contract: run `toron next`; no payload). Flag off: the legacy
 /// READY check, byte for byte as before.
@@ -8540,7 +8540,7 @@ fn boot_prime_policy() -> crate::retry::RetryPolicy {
 }
 
 /// Settle before Enter so a TUI that detects paste-by-timing does not treat
-/// an immediate Enter as a newline (tuios/herdr lesson; herdr plane harden).
+/// an immediate Enter as a newline (tuios/hc lesson; hc plane harden).
 const PRIME_ENTER_SETTLE: Duration = Duration::from_millis(100);
 
 /// Type `line` into `pane_id` and submit. Prefers `agent.prompt` (no wait)
@@ -8573,7 +8573,7 @@ fn prime_line_via_send_text(c: &mut Client, pane_id: &str, line: &str) -> bool {
             "flywheel: warn: boot-prime via pane.send_text failed for {pane_id} after {max} attempts: {e:#}"
         );
         eprintln!(
-            "flywheel:   manual socket prime: herdr pane send-text {pane_id} '{}' then send Enter (or herdr agent prompt {pane_id})",
+            "flywheel:   manual socket prime: hc terminal send-text {pane_id} '{}' then send Enter (or terminal agent prompt {pane_id})",
             line
         );
         return false;
@@ -8602,7 +8602,7 @@ fn prime_line_via_send_text(c: &mut Client, pane_id: &str, line: &str) -> bool {
 
 /// H3 (bd-harness-integration-preflight): lifecycle-hook-authority harness
 /// kinds — the same list the boot-prime machinery documents (see
-/// [`boot_prime_line`]): their herdr integration authors idle/working/blocked
+/// [`boot_prime_line`]): their hc integration authors idle/working/blocked
 /// from hook events, so a missing integration degrades lifecycle-state
 /// reporting. Warn-only by H3 decision; the env + prime machinery works
 /// regardless.
@@ -8617,7 +8617,7 @@ const LIFECYCLE_AUTHORITY_KINDS: &[&str] = &[
 ];
 
 /// H3 (bd-harness-integration-preflight): before a kind's first agent
-/// launches, make sure its herdr integration exists and is current.
+/// launches, make sure its hc integration exists and is current.
 /// Best-effort by contract — a missing/broken integration NEVER fails the
 /// spawn: install failures get the bd-627z.2 loud-warning treatment, and
 /// lifecycle-hook-authority kinds additionally warn that lifecycle-state
@@ -8629,7 +8629,7 @@ fn preflight_kind_integration(
     statuses: &HashMap<String, hc_support::IntegrationStatus>,
 ) {
     if hc_support::integration_target(kind).is_none() {
-        return; // custom kind with no herdr integration — nothing to preflight
+        return; // custom kind with no hc integration — nothing to preflight
     }
     let st = statuses
         .get(kind)
@@ -8644,12 +8644,12 @@ fn preflight_kind_integration(
             (Some(v), Some(e)) => format!("outdated ({v} < {e})"),
             _ => "outdated".to_string(),
         };
-        eprintln!("flywheel: warn: {kind} herdr integration {detail} — refreshing");
+        eprintln!("flywheel: warn: {kind} hc integration {detail} — refreshing");
     }
     match hc_support::integration_install_socket(c, kind) {
         Ok(messages) => {
             eprintln!(
-                "flywheel: herdr integration {kind} installed via socket{}",
+                "flywheel: hc integration {kind} installed via socket{}",
                 if messages.is_empty() {
                     String::new()
                 } else {
@@ -8668,24 +8668,24 @@ fn preflight_kind_integration(
 /// lifecycle-state reporting is degraded — warn-only, never block.
 fn warn_integration_install_failed(kind: &str, hook_authority: bool, e: &anyhow::Error) {
     eprintln!(
-        "\n!!! WARNING: the herdr integration for {kind} is missing or outdated and the \
+        "\n!!! WARNING: the hc integration for {kind} is missing or outdated and the \
          auto-install failed.\n\
-         Fix: run `herdr integration install {kind}` manually \
-         (herdr.dev/docs/preview/integrations/).\n\
+         Fix: run `hc integration install {kind}` manually \
+         (hc.dev/docs/preview/integrations/).\n\
          {kind} detection falls back to process-based heuristics until the integration reports.\n\
          (integration.install via socket failed: {e:#})\n"
     );
     if hook_authority {
         eprintln!(
             "    {kind} is a lifecycle-hook-authority harness: without a reporting integration,\n\
-             herdr cannot author idle/working/blocked from hook events, so lifecycle-state\n\
+             hc cannot author idle/working/blocked from hook events, so lifecycle-state\n\
              reporting is DEGRADED. The env + boot-prime machinery works regardless — the\n\
              spawn proceeds (H3 warn-only, do not block).\n"
         );
     }
 }
 
-/// One `herdr integration status` read per spawn/add — the preflight map all
+/// One `hc integration status` read per spawn/add — the preflight map all
 /// kinds share. A failed read degrades to an empty map (every kind looks
 /// not-installed → best-effort install attempt, the self-healing path).
 fn read_integration_statuses() -> HashMap<String, hc_support::IntegrationStatus> {
@@ -8693,7 +8693,7 @@ fn read_integration_statuses() -> HashMap<String, hc_support::IntegrationStatus>
         Ok(v) => v.into_iter().collect(),
         Err(e) => {
             eprintln!(
-                "flywheel: WARNING cannot read `herdr integration status` — spawn integration \
+                "flywheel: WARNING cannot read `hc integration status` — spawn integration \
                  preflight degraded: {e:#}"
             );
             HashMap::new()
@@ -8792,15 +8792,15 @@ impl Default for SpawnOpts {
     }
 }
 
-/// bd-rename-clear-name-too-long-oxd7: the herdr-legal label for a dead
+/// bd-rename-clear-name-too-long-oxd7: the hc-legal label for a dead
 /// binding that the rename-clear frees.
 ///
-/// herdr caps agent names at 32 chars, and a spawn name can already sit most of
+/// hc caps agent names at 32 chars, and a spawn name can already sit most of
 /// the way there (`flywheel-elm-effect-rs-oc` is 25), so the bare
-/// `{name}-stale-{attempts}` concat mints 33 and herdr refuses with
+/// `{name}-stale-{attempts}` concat mints 33 and hc refuses with
 /// `invalid_agent_name` — the one door that frees a taken name wedges shut
 /// exactly when it is needed. Truncate the BASE, never the tail:
-/// [`herdr_agent_name`]'s `truncate(32)` would eat the attempt number instead,
+/// [`terminal_agent_name`]'s `truncate(32)` would eat the attempt number instead,
 /// and that number is what tells two stale rows apart.
 fn stale_rename_label(name: &str, attempts: u32) -> String {
     let suffix = format!("-stale-{attempts}");
@@ -8818,17 +8818,17 @@ fn stale_rename_label(name: &str, attempts: u32) -> String {
 }
 
 /// ADR-0003 discipline: classify on the machine code, never the message text.
-/// `agent_name_taken` is herdr's wire code passed through as
+/// `agent_name_taken` is hc's wire code passed through as
 /// `BackendErrorCode::Other` — the one check every start door shares.
 fn is_taken_name_error(e: &hc_support::BackendError) -> bool {
     e.code().as_str() == "agent_name_taken"
 }
 
-/// bd-s91y: may the taken-name recovery free the binding? herdr's
+/// bd-s91y: may the taken-name recovery free the binding? hc's
 /// `agent rename <pane> <new>` renames whatever agent that pane HOLDS, so the
 /// rename-clear is only legal when the pane's OWN binding holds the contested
 /// name; a blind clear would rename a stranger. Pure, so the own/foreign
-/// split is unit-testable without herdr.
+/// split is unit-testable without hc.
 ///
 /// WHO ELSE holds the name is deliberately not an input: it shapes only the
 /// refusal MESSAGE, while the decision is the pane's own binding — so the
@@ -8870,7 +8870,7 @@ enum StartAttempt {
 }
 
 /// bd-s91y: the four backend reads/writes the taken-name recovery needs —
-/// implemented once over the concrete herdr client, once over the trait-object
+/// implemented once over the concrete hc client, once over the trait-object
 /// backend, so the recovery logic and its messages live in ONE place.
 trait TakenNameOps {
     fn start_agent(
@@ -8984,7 +8984,7 @@ impl TakenNameOps for DynTakenOps<'_> {
 /// (found while closing bd-rename-clear-name-too-long-oxd7). The recovery:
 /// start once; on a taken-name refusal read the pane's OWN binding, free it
 /// with the bounded [`stale_rename_label`], retry ONCE, and refuse loud if it
-/// is still taken — or if the holder is not this pane (herdr renames whatever
+/// is still taken — or if the holder is not this pane (hc renames whatever
 /// the pane holds, so a blind clear would rename a stranger).
 ///
 /// The clear is keyed on the pane's own BINDING, never on process liveness:
@@ -9016,7 +9016,7 @@ fn start_agent_with_taken_name_clear(
                             Ok(_) => StartAttempt::Started,
                             Err(e) if is_taken_name_error(&e) => {
                                 StartAttempt::Refused(anyhow::anyhow!(
-                                    "{name} ({pane_id}) agent_name_taken after rename-clear — refusing to burn the recovery budget. Close the workspace (flywheel kill <project> --force) or `herdr agent rename` the stale binding, then re-spawn."
+                                    "{name} ({pane_id}) agent_name_taken after rename-clear — refusing to burn the recovery budget. Close the workspace (flywheel kill <project> --force) or `hc agent rename` the stale binding, then re-spawn."
                                 ))
                             }
                             Err(e) => {
@@ -9064,7 +9064,7 @@ mod taken_name_recovery_tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// The error a herdr name collision really surfaces as: the wire code
+    /// The error an hc name collision really surfaces as: the wire code
     /// (no typed variant) plus the name in the message.
     fn taken(name: &str) -> BackendError {
         BackendError {
@@ -9096,8 +9096,8 @@ mod taken_name_recovery_tests {
         }
     }
 
-    /// The `(name, pane)` binding table a live herdr would show, with call
-    /// counters. `agent_start` refuses while ANY row holds the name (herdr's
+    /// The `(name, pane)` binding table a live hc would show, with call
+    /// counters. `agent_start` refuses while ANY row holds the name (hc's
     /// own semantics); `agent_rename` rewrites the row whose pane matches —
     /// exactly what "renames whatever agent that pane holds" means.
     struct NameMux {
@@ -9486,7 +9486,7 @@ mod taken_name_recovery_tests {
             );
             assert!(
                 !body.contains("format!(\"{name}-stale-{attempts}\")"),
-                "{door} must not mint a raw stale label (herdr's 32-char cap)"
+                "{door} must not mint a raw stale label (hc's 32-char cap)"
             );
         }
     }
@@ -9494,10 +9494,10 @@ mod taken_name_recovery_tests {
 
 /// bd-spawn-omp-boot-reliability-3h06: post-boot dead-shell verification for
 /// one spawned pane — assert the LIVE agent process (`pane_agent_alive`),
-/// never the herdr `launch_pending` flag. A pane can leave the launch window
+/// never the hc `launch_pending` flag. A pane can leave the launch window
 /// with `launch_pending=false` and still be a plain shell: the launch
 /// command was mangled by the booting shell and the agent never started;
-/// herdr reports the pane idle and it LOOKS like an agent until a send
+/// hc reports the pane idle and it LOOKS like an agent until a send
 /// fails (2026-08-17 w70: p4/p5 plain shells, only p1 TUI'd).
 ///
 /// A shell-fallback pane is recovered within `budget`: cancel any partial
@@ -9564,7 +9564,7 @@ fn verify_or_respawn_pane(
             std::thread::sleep(Duration::from_millis(500));
         }
         // Re-launch into the SAME pane through the shared taken-name recovery
-        // (bd-s91y). Direct agent.start, not start_agent_with_retry: herdr
+        // (bd-s91y). Direct agent.start, not start_agent_with_retry: hc
         // still lists the dead agent, so the registry short-circuit would
         // no-op instead of re-typing the launch — and a taken name is freed
         // only when THIS pane's own (dead) binding holds it.
@@ -9699,7 +9699,7 @@ fn cmd_spawn(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
     check_project_spelling(project, "spawn")?;
     let dir = project_dir(cfg, project);
     if !dir.exists() {
-        // bd-vik B: fail BEFORE any herdr side effect, and name the valid
+        // bd-vik B: fail BEFORE any hc side effect, and name the valid
         // projects so an invented project name is a fast, clear mistake.
         let mut msg = format!(
             "project dir missing: {} (run: flywheel init {project})",
@@ -9732,8 +9732,8 @@ projects available: {}",
     }
     // Spawn rides the RESOLVED plane (bd-mknvb): the configured name is not
     // evidence that rex can answer. On a host without the rex CLI, `auto`
-    // must dispatch on the herdr fallback — it used to take the rex arm, build
-    // a herdr workspace, and then die in `rex run`. An explicit rex pin with
+    // must dispatch on the hc fallback — it used to take the rex arm, build
+    // an hc workspace, and then die in `rex run`. An explicit rex pin with
     // no CLI fails HERE, before any workspace exists.
     // `REX_SESSION` never decides the plane. The unknown-name guard refuses
     // before any side effect instead of silently building panes.
@@ -9744,7 +9744,7 @@ projects available: {}",
         {
             if !plane.rex_reachable {
                 bail!(
-                    "spawn: {} — install the rex CLI or select the fallback (FLYWHEEL_BACKEND=herdr)",
+                    "spawn: {} — install the rex CLI or select the fallback (FLYWHEEL_BACKEND=hc)",
                     plane.reason
                 );
             }
@@ -9752,7 +9752,7 @@ projects available: {}",
         }
         #[cfg(not(feature = "backend-superlogical"))]
         bail!(
-            "spawn: the rex pane plane needs the backend-superlogical feature (this is a lean herdr-only build)"
+            "spawn: the rex pane plane needs the backend-superlogical feature (this is a lean hc-only build)"
         );
     }
     let kind_count_escape =
@@ -10015,19 +10015,19 @@ projects available: {}",
             return cmd_arrive(cfg, project, pin.as_deref(), None, None, None);
         } else {
             bail!(
-                "found {} pre-existing workspace(s) for {project} — stale panes from a killed swarm would race the new one: {}. Close them first (flywheel kill {project} or herdr workspace close <id>), pass --join to attach, or --retire-orphans to close them automatically.",
+                "found {} pre-existing workspace(s) for {project} — stale panes from a killed swarm would race the new one: {}. Close them first (flywheel kill {project} or terminal workspace close <id>), pass --join to attach, or --retire-orphans to close them automatically.",
                 orphans.len(),
                 detail.join(", ")
             );
         }
     }
-    // bd-bug-omp-herdr-wedge: herdr's agent.start launches the harness
-    // WITHOUT the HERDR_* env its own omp integration contract requires
-    // (agent.start has no env param). omp's herdr extension stays disabled,
-    // herdr skips screen detection for omp (full lifecycle hook authority),
+    // bd-bug-omp-hc-wedge: hc's agent.start launches the harness
+    // WITHOUT the plane_* env its own omp integration contract requires
+    // (agent.start has no env param). omp's hc extension stays disabled,
+    // hc skips screen detection for omp (full lifecycle hook authority),
     // and every agent.prompt gates on agent_not_ready. Inject the env at
-    // workspace creation (the one surface herdr's API accepts it); the
-    // extension then activates ("Herdr active") and reports on the first
+    // workspace creation (the one surface hc's API accepts it); the
+    // extension then activates ("Hc active") and reports on the first
     // processed prompt (see BOOT_PRIME in the spawn loop below).
     //
     // bd-pin-public-plane-s-easy.2: the FIRST agent runs on the ROOT pane,
@@ -10080,13 +10080,13 @@ projects available: {}",
         }
         None => None,
     };
-    let mut herdr_env = hc_support::herdr_integration_env(cfg, first_pin.as_deref());
+    let mut plane_env = hc_support::plane_launch_env(cfg, first_pin.as_deref());
     if let Some(m) = first_plan
         .as_ref()
         .and_then(|p| p.env_model_pin.clone())
         .or_else(|| first_bare.as_ref().and_then(|(_, pin)| pin.clone()))
     {
-        hc_support::apply_opencode_model_pin(&mut herdr_env, &m)?;
+        hc_support::apply_opencode_model_pin(&mut plane_env, &m)?;
     }
     // D9 (ADR-0013 Wave B): the spawn is an EFFECTFUL dispatch — the intent is
     // journaled before the workspace exists, so a crash or a dead pane can
@@ -10106,7 +10106,7 @@ projects available: {}",
         Some(&utf8_path(&dir, "workspace dir")?),
         Some(&label),
         !opts.no_focus,
-        Some(&herdr_env),
+        Some(&plane_env),
     )?;
     let root = root.ok_or_else(|| anyhow!("workspace_create returned no root pane"))?;
     println!(
@@ -10149,7 +10149,7 @@ projects available: {}",
     // H3 (bd-harness-integration-preflight): one status read per spawn;
     // preflight each kind before its first agent launches (deduped — a
     // recipe + explicit flags may repeat a kind).
-    // bd-o1zh: snapshot the live herdr names once so retried spawns skip
+    // bd-o1zh: snapshot the live hc names once so retried spawns skip
     // taken ones (fail-open to empty on an unlistable backend).
     let mut taken_names: std::collections::HashSet<String> = c
         .agent_list()
@@ -10165,7 +10165,7 @@ projects available: {}",
         for _ in 0..item.count {
             let ordinal = ordinals.entry(item.short.clone()).or_insert(0);
             *ordinal += 1;
-            // bd-o1zh: unique name per spawn attempt — skip names herdr
+            // bd-o1zh: unique name per spawn attempt — skip names hc
             // still holds (stale binding / launch_pending) so a retried
             // spawn does not collide agent_name_taken on the fixed
             // ordinal-1 name. Fail-open: an unlistable backend keeps the
@@ -10175,7 +10175,7 @@ projects available: {}",
             taken_names.insert(name.clone());
             // S9 (ADR-0018 D1a) + bd-pin-public-plane-s-easy.2: draw the
             // adj+noun PIN BEFORE the pane exists so the pane env carries
-            // AGENT_NAME/FLYWHEEL_MAIL_AS (herdr injects env only at
+            // AGENT_NAME/FLYWHEEL_MAIL_AS (hc injects env only at
             // split/create). GS-033: refuse_unpinned BEFORE agent_start
             // (add/profile/squad style) — never leave a dark orphan pane.
             let mail_identity = pinned_mail_identity(cfg, project, &name, &kind);
@@ -10188,7 +10188,7 @@ projects available: {}",
             }
             let identity = mail_identity.as_deref().unwrap_or(&name);
             // bd-crlx: resolve the launch plan BEFORE building the pane env.
-            // herdr injects env only at split/create, so a model that travels
+            // hc injects env only at split/create, so a model that travels
             // by env must be in the map that split receives. The first agent
             // reuses the plan resolved before workspace.create (its pane is the
             // root pane, so its pin went into the workspace env) — one
@@ -10235,7 +10235,7 @@ projects available: {}",
                     (args, None, env_pin)
                 }
             };
-            let mut pane_env = hc_support::herdr_integration_env(cfg, mail_identity.as_deref());
+            let mut pane_env = hc_support::plane_launch_env(cfg, mail_identity.as_deref());
             if let Some(m) = &env_model_pin {
                 hc_support::apply_opencode_model_pin(&mut pane_env, m)?;
             }
@@ -10287,14 +10287,14 @@ projects available: {}",
             // into the pane via pane.send_text AFTER the TUI owns the
             // foreground + settle (see below) — works for any kind and for
             // non-agent panes, replacing the old positional MESSAGES-arg
-            // prime (bd-bug-omp-herdr-wedge). Secondary in-arg path kept for
+            // prime (bd-bug-omp-hc-wedge). Secondary in-arg path kept for
             // kinds that need it (needs_in_arg_prime; currently none). A
             // supplied peer template IS the prime — never stack.
             if needs_in_arg_prime(&kind) && !has_peer_prime {
                 agent_args.push(boot_prime_line().to_string());
             }
             // bd-pattern-peer-triggered: gate the launch on the shell being
-            // INTERACTIVE. herdr types the launch command (peer template ~2.6KB)
+            // INTERACTIVE. hc types the launch command (peer template ~2.6KB)
             // immediately after pane.split; a booting shell (canonical mode,
             // 1024-byte MAX_CANON line limit) splits the single-quoted arg
             // mid-quote and zsh parks at `>....` — agent never starts
@@ -10379,7 +10379,7 @@ projects available: {}",
                     // GS-037 P0-1: dead-shell MUST exit nonzero (bail → die → 1).
                     // Never print "swarm ready" after this path.
                     bail!(
-                        "{name} ({pane_id}) has no live agent process after spawn + recovery — the pane is a dead shell. Inspect it (herdr pane read {pane_id}), then recover manually (flywheel recover {project} {name}) or kill + re-spawn."
+                        "{name} ({pane_id}) has no live agent process after spawn + recovery — the pane is a dead shell. Inspect it (hc terminal read {pane_id}), then recover manually (flywheel recover {project} {name}) or kill + re-spawn."
                     );
                 }
             }
@@ -10538,7 +10538,7 @@ projects available: {}",
         }
     }
 
-    // bd-vik A: post-spawn visibility check — herdr's session registry
+    // bd-vik A: post-spawn visibility check — hc's session registry
     // (session.json) can silently fail to persist, leaving the panes LIVE but
     // invisible to list/send/status. Verify the exact workspace_id we just
     // created is visible from the same view list/send use; fail loudly with
@@ -10548,9 +10548,9 @@ projects available: {}",
         let created_id = ws.workspace_id.clone();
         if !listed.iter().any(|lws| lws.workspace_id == created_id) {
             bail!(
-                "spawn created workspace {created_id} but `flywheel list` cannot see it — herdr's session registry (session.json) failed to persist the workspace.
-recovery: restart herdr (launchctl kickstart -k gui/$(id -u)/com.herdr... or `herdr restart`), then re-run: flywheel spawn {project}
-the panes may still be live in herdr; `--no-verify` skips this check in scripts"
+                "spawn created workspace {created_id} but `flywheel list` cannot see it — hc's session registry (session.json) failed to persist the workspace.
+recovery: restart hc (launchctl kickstart -k gui/$(id -u)/com.hc... or `hc restart`), then re-run: flywheel spawn {project}
+the panes may still be live in hc; `--no-verify` skips this check in scripts"
             );
         }
     }
@@ -10609,7 +10609,7 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
     }
 
     // bd-4pxy: spawn readiness — "swarm ready" must never print while an
-    // agent is still launch_pending (herdr: the launcher command has not
+    // agent is still launch_pending (hc: the launcher command has not
     // finished; a harness that cannot start stays pending). Wait briefly,
     // then FAIL naming the field + the pending agents (a silent ready is
     // the bug that produced dead sends).
@@ -10650,7 +10650,7 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!(
-                "swarm not ready: {} — no live agent process (dead shell). Re-run spawn, or recover manually (flywheel recover {project} <name> / herdr pane read <id>)",
+                "swarm not ready: {} — no live agent process (dead shell). Re-run spawn, or recover manually (flywheel recover {project} <name> / hc terminal read <id>)",
                 list
             );
         }
@@ -10785,14 +10785,14 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
 
 /// Rex arm of [`cmd_spawn`]: same plan/receipt/registry/presence contract over
 /// `&dyn MultiplexerBackend`, never `Client::connect`. Kept as a separate
-/// function so the herdr path above stays byte-identical and this arm lifts
-/// off cleanly. Selection is `REX_SESSION` (set = rex, empty = herdr);
+/// function so the hc path above stays byte-identical and this arm lifts
+/// off cleanly. Selection is `REX_SESSION` (set = rex, empty = hc);
 /// transport fallback inside `auto` stays Connect/Io/Timeout only.
 ///
-/// Known deltas vs the herdr path (all fail-closed or loud, never silent):
+/// Known deltas vs the hc path (all fail-closed or loud, never silent):
 /// shell gate bails instead of warning (no verify-or-respawn net on rex),
-/// per-kind herdr preflight and the process-liveness probe are skipped
-/// (herdr-client-coupled), and the harness launch-hook bootstrap is not
+/// per-kind hc preflight and the process-liveness probe are skipped
+/// (hc-client-coupled), and the harness launch-hook bootstrap is not
 /// installed (prime goes through `pane_run`).
 /// bd-rex-reliability-ioyz D: drain the pre-subscribed event stream for
 /// `terminal.child_exited` for `pane`. Raw lines carry the code (the event
@@ -10987,7 +10987,7 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
             detail.join(", ")
         );
     }
-    // No herdr liveness probe on this arm (client-coupled): any owned
+    // No hc liveness probe on this arm (client-coupled): any owned
     // workspace counts as live — refuse or retire, never auto-close.
     let orphans = split.owned;
     if !orphans.is_empty() {
@@ -11186,7 +11186,7 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
             // for and no chance to type into an unbooted shell.
             let command = crate::pane::rex_env_command(&pane_env, &kind, &agent_args);
             // `run` takes no anchor; `split` anchors to the previous block.
-            // Direction is the rex word (`below`), never herdr `down`.
+            // Direction is the rex word (`below`), never hc `down`.
             let pane_id = if first {
                 crate::backend::superlogical::create_agent_block(
                     &ws.workspace_id,
@@ -11242,7 +11242,7 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
             }
             // Prime through pane_run (write + enter): the peer template is
             // its own prime, else the identity line. The harness
-            // launch-hook bootstrap is herdr-client-coupled and is not
+            // launch-hook bootstrap is hc-client-coupled and is not
             // installed on this arm.
             if let Err(e) = backend.pane_run(&pane_id, &peer_args[0]) {
                 eprintln!("flywheel: warn: rex prime for {name} ({pane_id}) failed: {e:#}");
@@ -11436,8 +11436,8 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
     }
 
     // Readiness: "swarm ready" never prints while an agent is still
-    // launch_pending — same fail-closed shape as the herdr path (the
-    // process-liveness probe is herdr-client-coupled and skipped here).
+    // launch_pending — same fail-closed shape as the hc path (the
+    // process-liveness probe is hc-client-coupled and skipped here).
     if !opts.no_verify {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -11562,7 +11562,7 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
 /// bd-durable-doorbell-lngf: the registered workspaces of `project` that
 /// ever ran a dispatcher (the lazy-heal scope). The dispatcher key is the
 /// workspace LABEL (`swarm_label`, e.g. `flywheel-flywheel`) — the same key
-/// `cmd_spawn` writes pid/gen files under — never the herdr pane-id prefix.
+/// `cmd_spawn` writes pid/gen files under — never the hc pane-id prefix.
 fn doorbell_project_workspaces(project: &str) -> Vec<String> {
     let registry = state::load_spawn_registry(project);
     if registry.is_empty() {
@@ -11816,8 +11816,8 @@ fn cmd_doorbell_why(
                 doorbell_tick::DoorbellMsg::InboxRows { rows, pin } => {
                     workspace::Msg::InboxRows { rows, pin }
                 }
-                doorbell_tick::DoorbellMsg::HerdrStatus { pin, status } => {
-                    workspace::Msg::HerdrStatus { pin, status }
+                doorbell_tick::DoorbellMsg::PlaneStatus { pin, status } => {
+                    workspace::Msg::PlaneStatus { pin, status }
                 }
                 doorbell_tick::DoorbellMsg::Fact { summary } => workspace::Msg::Fact { summary },
                 doorbell_tick::DoorbellMsg::AckSlaTick { now } => {
@@ -11994,7 +11994,7 @@ fn cmd_doorbell_why(
         } else {
             match msg.get("WatchNdjson") {
                 Some(_) => "watch",
-                None => match msg.get("HerdrStatus") {
+                None => match msg.get("PlaneStatus") {
                     Some(_) => "status",
                     None => match msg.get("AckSlaTick") {
                         Some(_) => "ack-sla",
@@ -12007,7 +12007,7 @@ fn cmd_doorbell_why(
             }
         };
         let status = msg
-            .get("HerdrStatus")
+            .get("PlaneStatus")
             .and_then(|h| h.get("status"))
             .and_then(|s| s.as_str())
             .unwrap_or("");
@@ -12585,7 +12585,7 @@ fn why_entry_mentions_pin(
     match msg {
         workspace::Msg::InboxItems { pin: p, .. }
         | workspace::Msg::InboxRows { pin: p, .. }
-        | workspace::Msg::HerdrStatus { pin: p, .. } => p == pin,
+        | workspace::Msg::PlaneStatus { pin: p, .. } => p == pin,
         workspace::Msg::WatchNdjson { line } => line.contains(pin),
         _ => false,
     }
@@ -12891,7 +12891,7 @@ fn handle_workspace_cmds(
     // drain_waits (ADR-0028 E2 + ADR-0011 D7): the pending_wait sqlite
     // peek is the fast path AFTER a genuine wake (WatchNdjson) AND on
     // Sweep (D7 amends GS-016 — WaitCorr also drains on the 1s sweep).
-    // Fact, AckSla, HerdrStatus and Died batches still pass false so
+    // Fact, AckSla, PlaneStatus and Died batches still pass false so
     // those cadences cannot become a poll.
     let mut fetch_inbox = false;
     for cmd in cmds {
@@ -13442,15 +13442,15 @@ pub(crate) fn project_base(project: &str) -> String {
     project.rsplit('/').next().unwrap_or(project).to_string()
 }
 
-/// H1 (bd-harness-prime-agent-818f): herdr has NO kind for some harnesses —
+/// H1 (bd-harness-prime-agent-818f): hc has NO kind for some harnesses —
 /// its `Agent` enum is a closed 22-kind set (`agent.start --kind pa` →
 /// `unsupported_agent_kind`), and `server.agent_manifests` registers
 /// screen-detection rules only, NOT kinds. A harness WITH a spawn recipe
 /// (`[harness.<name>]`, compiled-in or profiles.toml) is launched via the
-/// recipe instead: `pane.run` the command. herdr's standard pane launch env
-/// already carries HERDR_ENV / HERDR_SOCKET_PATH / HERDR_PANE_ID, so
-/// prime-agent's built-in herdr extension activates and self-reports
-/// lifecycle (working/blocked/idle) through the socket — which herdr accepts
+/// recipe instead: `pane.run` the command. hc's standard pane launch env
+/// already carries HC_SOCKET_PATH / HC_SESSION / HC_TERMINAL_ID, so
+/// prime-agent's built-in hc extension activates and self-reports
+/// lifecycle (working/blocked/idle) through the socket — which hc accepts
 /// as hook authority even for unknown kinds (empirically verified: the pane
 /// shows up in `agent list` as `agent=prime-agent`). The normal wait/rename
 /// loop then binds the name. Returns `Ok(true)` when the recipe path was
@@ -13465,7 +13465,7 @@ fn try_recipe_launch(c: &mut Client, kind: &str, pane_id: &str, args: &[String])
         return Ok(false);
     };
     let cmd = recipe_launch_command(&recipe, args);
-    eprintln!("agent.start: herdr has no kind '{kind}'; launching via harness recipe: {cmd}");
+    eprintln!("agent.start: hc has no kind '{kind}'; launching via harness recipe: {cmd}");
     c.pane_run(pane_id, &cmd)?;
     Ok(true)
 }
@@ -13486,7 +13486,7 @@ fn try_recipe_launch_dyn(
         return Ok(false);
     };
     let cmd = recipe_launch_command(&recipe, args);
-    eprintln!("agent.start: herdr has no kind '{kind}'; launching via harness recipe: {cmd}");
+    eprintln!("agent.start: hc has no kind '{kind}'; launching via harness recipe: {cmd}");
     backend.pane_run(pane_id, &cmd)?;
     Ok(true)
 }
@@ -13579,9 +13579,9 @@ mod recipe_launch_tests {
     }
 }
 
-/// bd-zq8u: herdr's `agent.start` rejects launch args it cannot encode
+/// bd-zq8u: hc's `agent.start` rejects launch args it cannot encode
 /// safely for the target shell — `arg.chars().any(char::is_control)`
-/// (herdr src/app/agents.rs, added 2026-07-17): any control character
+/// (hc src/app/agents.rs, added 2026-07-17): any control character
 /// (tab, newline, CR, NUL, ESC) fails with `invalid_agent_argument`.
 /// Pre-validate BEFORE the retry loop: a poisoned launch arg must fail
 /// LOUD on the first call with an actionable error, never burn the retry
@@ -13595,7 +13595,7 @@ fn ensure_ascii_launch_args(args: &[String]) -> Result<()> {
         {
             bail!(
                 "agent launch argument {idx} contains non-ASCII or control character {c:?} \
-                 (U+{:04X}) at byte {byte_idx}: herdr cannot encode it safely for the \
+                 (U+{:04X}) at byte {byte_idx}: hc cannot encode it safely for the \
                  target shell. ASCII-fy the launch text (e.g. \
                  integrations/peer-aware.md.tpl, which must also be free of \
                  newlines/tabs) or pass --no-peer-aware",
@@ -13758,7 +13758,7 @@ pub(crate) fn start_agent_with_retry_profile(
                                 cf.evidence
                             ));
                         }
-                        // Deterministic herdr rejection for a kind it does not
+                        // Deterministic hc rejection for a kind it does not
                         // know: fall back to the harness spawn recipe once.
                         // No recipe -> fail fast instead of burning 30 retries.
                         // Classifier only sees it when recipes fail (ADR-0026).
@@ -13794,7 +13794,7 @@ pub(crate) fn start_agent_with_retry_profile(
             {
                 return Ok(a.clone());
             }
-            // pi agents frequently register NAMELESS (herdr pi integration,
+            // pi agents frequently register NAMELESS (hc pi integration,
             // bd-w17): accept the pane match and apply the name ourselves —
             // name-based resolution (send/loop/status) depends on it
             if let Some(a) = agents.iter().find(|a| a.pane_id == pane_id) {
@@ -13966,7 +13966,7 @@ fn start_agent_with_retry_dyn_profile(
                             ));
                         }
                         // H1 (bd-harness-prime-agent-818f): same recipe
-                        // fallback as the concrete-client variant — herdr
+                        // fallback as the concrete-client variant — hc
                         // rejects unknown kinds deterministically.
                         if matches!(&e.code, BackendErrorCode::Other(c) if c == "unsupported_agent_kind")
                         {
@@ -14020,7 +14020,7 @@ fn start_agent_with_retry_dyn_profile(
 }
 
 /// bd-zq8u: the peer-aware template is injected into agent.start launch
-/// args; herdr rejects non-ASCII bytes ("cannot be encoded safely for the
+/// args; hc rejects non-ASCII bytes ("cannot be encoded safely for the
 /// target shell"). These tests pin the ASCII contract on the rendered
 /// template AND the fail-fast guard (never a 30-attempt retry burn).
 #[cfg(test)]
@@ -14037,7 +14037,7 @@ mod peer_encoding_tests {
 
     /// S9/bd-zq8u: the rendered peer template is ASCII-only AND free of
     /// control characters for ALL substitution inputs — name,
-    /// mail_identity, and the three budget numbers. herdr rejects any arg
+    /// mail_identity, and the three budget numbers. hc rejects any arg
     /// with a control char (`arg.chars().any(char::is_control)`), so the
     /// rendered launch text must pass the strict launch guard.
     #[test]
@@ -14057,7 +14057,7 @@ mod peer_encoding_tests {
             );
             assert!(
                 !rendered.chars().any(char::is_control),
-                "rendered template must be control-char-free (herdr rejects \
+                "rendered template must be control-char-free (hc rejects \
                  is_control args) for name={name} identity={identity}"
             );
             ensure_ascii_launch_args(std::slice::from_ref(&rendered))
@@ -14067,7 +14067,7 @@ mod peer_encoding_tests {
 
     /// bd-zq8u: a poisoned launch arg fails LOUD with an actionable error
     /// naming the defect class, the character code, and the fix. The
-    /// control-char case is herdr's ACTUAL rejection criterion — the 2026-08-15
+    /// control-char case is hc's ACTUAL rejection criterion — the 2026-08-15
     /// regression that burned 30 retries was the multi-line template's
     /// newlines, not the non-ASCII glyphs.
     #[test]
@@ -14188,10 +14188,10 @@ mod peer_encoding_tests {
 }
 
 /// Register a spawned agent as an agent-mail identity (ADR-0001
-/// mail-register-on-spawn) and bridge it to its herdr pane (ADR-0001 A4,
+/// mail-register-on-spawn) and bridge it to its hc terminal (ADR-0001 A4,
 /// bd-mail-pane-identity-bridge): agent-mail only writes identity files for
 /// tmux panes, so flywheel writes the canonical identity file for the
-/// herdr pane itself — `resolve_pane_identity` can then map the pane to the
+/// hc terminal itself — `resolve_pane_identity` can then map the pane to the
 /// name. Best-effort: if mail isn't configured or the backend returns an
 /// error, the spawn still succeeded — log a warning and continue. The agent
 /// becomes addressable by name in mail once registered.
@@ -14209,9 +14209,9 @@ mod peer_encoding_tests {
 /// S9 (ADR-0018 D1a): the identity is a UNIQUE adjective+noun PIN (the
 /// legacy whitelist generator, collision-checked against the spawn
 /// registry pins AND the registered agents; retry on collision), not the
-/// canonical herdr name. The slug name stays the technical pane handle and
+/// canonical terminal name. The slug name stays the technical pane handle and
 /// resolves as an alias through the registry pin (wake + debate read it).
-/// A re-spawn of the same herdr name KEEPS its pinned identity — idempotent,
+/// A re-spawn of the same terminal name KEEPS its pinned identity — idempotent,
 /// never a fresh draw. The random npub stays underneath (registration
 /// creates or upserts the key for the pin).
 ///
@@ -14234,11 +14234,11 @@ pub(crate) fn register_spawned_agent(
 
 /// S9 (ADR-0018 D1a): draw + register the agent's mail PIN and write the
 /// slug → pin fold, WITHOUT binding a pane. Idempotent — a re-spawn of the
-/// same herdr name keeps its pin (registry-first), a fresh name draws a pin
+/// same terminal name keeps its pin (registry-first), a fresh name draws a pin
 /// collision-checked against the registry pins AND the agents table.
 ///
 /// bd-pin-public-plane-s-easy.2: the pin is drawn BEFORE the pane exists so
-/// the pane env can carry `AGENT_NAME` / `FLYWHEEL_MAIL_AS` (herdr injects
+/// the pane env can carry `AGENT_NAME` / `FLYWHEEL_MAIL_AS` (hc injects
 /// env only at split/create; agent.start has no env param). The caller then
 /// binds the pane with [`bind_pane_mail_identity`] once the pane id exists.
 pub(crate) fn pinned_mail_identity(
@@ -14301,7 +14301,7 @@ pub(crate) fn pinned_mail_identity(
         return None;
     }
     // S9 (ADR-0018 D1a): the mail identity is a UNIQUE adjective+noun pin.
-    // The canonical slug stays the herdr handle and resolves as an alias
+    // The canonical slug stays the hc handle and resolves as an alias
     // through the registry pin (wake + debate read it). A re-spawn of the
     // same name KEEPS its pinned identity (idempotent); a fresh name draws
     // a pin collision-checked against the spawn-registry pins AND the
@@ -14311,7 +14311,7 @@ pub(crate) fn pinned_mail_identity(
         .iter()
         .find(|e| e.name == name)
         .and_then(|e| e.mail_identity.clone())
-        .filter(|m| !m.is_empty() && m != name) // bd-bug-omp-herdr-wedge: a retained SLUG (pre-ADR-0018 D1a registry entry) is not a pin — redraw
+        .filter(|m| !m.is_empty() && m != name) // bd-bug-omp-hc-wedge: a retained SLUG (pre-ADR-0018 D1a registry entry) is not a pin — redraw
         .unwrap_or_else(|| {
             let mut taken: std::collections::HashSet<String> = registry
                 .iter()
@@ -14370,7 +14370,7 @@ pub(crate) fn pinned_mail_identity(
     {
         eprintln!("flywheel: mail fold_agent_name_alias failed for {name} -> {mail_name}: {e:#}");
     }
-    // persist the pin binding so a re-spawn of the same herdr name KEEPS the
+    // persist the pin binding so a re-spawn of the same terminal name KEEPS the
     // identity (idempotent — never a fresh draw) and wake/debate resolve
     // the slug through it. The spawn command saves the full registry too,
     // but the add path relies on this write.
@@ -14392,15 +14392,15 @@ pub(crate) fn pinned_mail_identity(
     Some(mail_name)
 }
 
-/// bd-pin-public-plane-s-easy.2: bind a drawn pin to its herdr pane — write
+/// bd-pin-public-plane-s-easy.2: bind a drawn pin to its hc terminal — write
 /// the pane identity bridge (pane → pin, so resolve_pane_identity names an
 /// identity that exists) and record the pane_id in the spawn registry. Runs
 /// AFTER the pane exists; the pin itself was drawn pre-split so the pane env
 /// could carry it.
 /// Stamp gate for `bind_pane_mail_identity` below: a rex `block:` id is
-/// not a herdr pane, so stamping it makes herdr say `pane_not_found`.
+/// not an hc pane, so stamping it makes hc say `pane_not_found`.
 /// Pure so the contract is testable.
-fn pane_takes_herdr_stamp(pane_id: &str) -> bool {
+fn pane_takes_hc_stamp(pane_id: &str) -> bool {
     !crate::inbox_ports::is_rex_block(pane_id)
 }
 
@@ -14418,20 +14418,20 @@ pub(crate) fn bind_pane_mail_identity(
         return;
     };
     if let Ok(mail) = backend::mail_backend(cfg) {
-        // bridge the identity to the herdr pane (best-effort, like register).
+        // bridge the identity to the hc pane (best-effort, like register).
         // The file holds the REGISTERED identity (the pin) so
         // resolve_pane_identity returns a name that exists in the registry.
         if let Err(e) = backend::run_mail(mail.write_pane_identity(&key, pane_id, pin)) {
             eprintln!("flywheel: mail write_pane_identity failed for {name} on {pane_id}: {e}");
         }
-        // bd-ab2p: stamp the herdr pane itself with the mail identity
+        // bd-ab2p: stamp the hc pane itself with the mail identity
         // (display-only metadata; toron resolves tokens-first). Best-effort
-        // like the file bridge above — a down herdr or missing pane is a
+        // like the file bridge above — a down hc or missing pane is a
         // stderr note, never a spawn failure. Connect first (fast fail when
-        // herdr is down) so the whois replay below never runs then. Rex
-        // blocks skip this entirely: herdr has no such pane and would only
+        // hc is down) so the whois replay below never runs then. Rex
+        // blocks skip this entirely: hc has no such pane and would only
         // print pane_not_found.
-        if pane_takes_herdr_stamp(pane_id) {
+        if pane_takes_hc_stamp(pane_id) {
             match toron_core::backend::hc::HcBackend::connect(None) {
                 Ok(_backend) => {
                     let npub = backend::run_mail(mail.whois(&key, pin))
@@ -14502,20 +14502,20 @@ fn record_spawn_comms_facts(project: &str, pin: &str, npub: &str) {
     }
 }
 
-/// Deterministic herdr-agent-name → adjective+noun pin mapping.
+/// Deterministic hc-agent-name → adjective+noun pin mapping.
 ///
 /// The pin shape follows the legacy agent-mail whitelist: a FIXED
 /// `VALID_ADJECTIVES` (75) × `VALID_NOUNS` (132) pair, lowercase-split +
 /// PascalCase (bd-odc). Any other shape is off-shape, INCLUDING lookalikes
-/// like `FrostDolphin` (dolphin isn't in the noun list). This maps any herdr
+/// like `FrostDolphin` (dolphin isn't in the noun list). This maps any hc
 /// name (`flywheel-flywheel-oc`) to a stable adjective+noun from that
 /// whitelist via FNV-1a hash into the lists.
 ///
-/// The mapping is deterministic — the same herdr name always maps to the
+/// The mapping is deterministic — the same terminal name always maps to the
 /// same pin, across runs and machines — so re-registration is idempotent and
-/// the reverse lookup (herdr name in task_description) is stable. Collisions
-/// (different herdr names → same pair) are possible but harmless: the
-/// registry is an upsert per name, and the herdr name is preserved in
+/// the reverse lookup (terminal name in task_description) is stable. Collisions
+/// (different terminal names → same pair) are possible but harmless: the
+/// registry is an upsert per name, and the hc name is preserved in
 /// task_description, so no information is lost.
 ///
 /// The lists are that agent-mail whitelist copied verbatim from
@@ -14527,7 +14527,7 @@ fn record_spawn_comms_facts(project: &str, pin: &str, npub: &str) {
 /// If `s` lowercases to a VALID_ADJECTIVES+VALID_NOUNS pair (the frozen
 /// whitelist shape, PascalCase after normalization), return the canonical
 /// PascalCase form; else None. This is the identity gate for
-/// [`agent_mail_name`]: an input already shaped as a pair passes through.
+/// [`terminal_mail_name`]: an input already shaped as a pair passes through.
 fn valid_pair(s: &str, adjectives: &[&str], nouns: &[&str]) -> Option<String> {
     let lower = s.to_ascii_lowercase();
     for adj in adjectives {
@@ -14545,23 +14545,23 @@ fn valid_pair(s: &str, adjectives: &[&str], nouns: &[&str]) -> Option<String> {
     None
 }
 
-fn agent_mail_name(herdr_name: &str) -> String {
+fn terminal_mail_name(terminal_name: &str) -> String {
     // idempotency guard: an input already shaped as a whitelist pair (e.g. a
     // previously mapped name) passes through unchanged — re-mapping a mapped
     // name must be a no-op, not a second hash into a DIFFERENT pair.
-    if let Some(pair) = valid_pair(herdr_name, &ADJECTIVES, &NOUNS) {
+    if let Some(pair) = valid_pair(terminal_name, &ADJECTIVES, &NOUNS) {
         return pair;
     }
-    // FROZEN whitelist (see `agent_mail_name`): index-addressed, never edited.
+    // FROZEN whitelist (see `terminal_mail_name`): index-addressed, never edited.
     // Module-scope: the S9 pin draw (unique_adjnoun_pin) shares the whitelist.
-    let h = state::fnv1a64(herdr_name);
+    let h = state::fnv1a64(terminal_name);
     adjnoun_from_fnv(h)
 }
 
-/// bd-recover-accepts-camelcase-pins-z5fz: the herdr agent-name rule, quoted
-/// from herdr's own refusal — 1..=32 chars of lowercase ASCII letters, digits,
+/// bd-recover-accepts-camelcase-pins-z5fz: the hc agent-name rule, quoted
+/// from hc's own refusal — 1..=32 chars of lowercase ASCII letters, digits,
 /// `-` or `_`.
-pub(crate) fn is_herdr_legal_name(name: &str) -> bool {
+pub(crate) fn is_terminal_legal_name(name: &str) -> bool {
     (1..=32).contains(&name.len())
         && name
             .chars()
@@ -14569,7 +14569,7 @@ pub(crate) fn is_herdr_legal_name(name: &str) -> bool {
 }
 
 /// bd-recover-accepts-camelcase-pins-z5fz: map a spawn-registry `name` to the
-/// herdr-legal agent name to restore/launch under.
+/// hc-legal agent name to restore/launch under.
 ///
 /// A registry row's `name` may hold a CamelCase adjective+noun PIN — an
 /// adopted/captain pane registered by pin rather than by kind short — and
@@ -14579,12 +14579,12 @@ pub(crate) fn is_herdr_legal_name(name: &str) -> bool {
 /// healthy pane draws no rename churn. Recovery, rebind, and the send-path
 /// auto-heal all route through this one mapping.
 ///
-/// Ceiling: two pins that lowercase to the same string collide on ONE herdr
-/// name (`QuietHeron`/`quietheron`). A herdr name is a display index, not
+/// Ceiling: two pins that lowercase to the same string collide on ONE hc
+/// name (`QuietHeron`/`quietheron`). An hc name is a display index, not
 /// identity — the pin (`mail_identity`) is identity — so a collision is a
 /// naming nuisance, never a misroute.
-pub(crate) fn herdr_agent_name(name: &str) -> String {
-    if is_herdr_legal_name(name) {
+pub(crate) fn terminal_agent_name(name: &str) -> String {
+    if is_terminal_legal_name(name) {
         return name.to_string();
     }
     let mut out: String = name
@@ -14604,11 +14604,11 @@ pub(crate) fn herdr_agent_name(name: &str) -> String {
 /// The state of one registry row against the live pane listing — the ONE rule
 /// `flywheel recover` and `flywheel rebind` act on.
 ///
-/// `Intact` compares the row's name to the pane's herdr name through the SAME
+/// `Intact` compares the row's name to the pane's terminal name through the SAME
 /// mapping the restore uses, so a CamelCase pin whose pane already carries the
 /// legal form reads `Intact` (no rename churn, no `invalid_agent_name`).
 /// Comparing the raw pin would read `Lost` forever and re-rename each pass —
-/// the bd-recover-accepts-camelcase-pins-z5fz bug. `None` means herdr does not
+/// the bd-recover-accepts-camelcase-pins-z5fz bug. `None` means hc does not
 /// list the pane at all; `Some(None)` means the pane exists with no name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BindingState {
@@ -14616,14 +14616,14 @@ pub(crate) enum BindingState {
     Intact,
     /// pane present, name is something else (restore it)
     Lost { was: String },
-    /// pane absent from herdr's listing
+    /// pane absent from hc's listing
     Gone,
 }
 
 pub(crate) fn binding_state(registry_name: &str, live: Option<Option<&str>>) -> BindingState {
     match live {
         None => BindingState::Gone,
-        Some(Some(actual)) if actual == herdr_agent_name(registry_name) => BindingState::Intact,
+        Some(Some(actual)) if actual == terminal_agent_name(registry_name) => BindingState::Intact,
         Some(other) => BindingState::Lost {
             was: other.unwrap_or("<null>").to_string(),
         },
@@ -14631,19 +14631,19 @@ pub(crate) fn binding_state(registry_name: &str, live: Option<Option<&str>>) -> 
 }
 
 #[cfg(test)]
-mod herdr_agent_name_tests {
-    use super::{BindingState, binding_state, herdr_agent_name, is_herdr_legal_name};
+mod terminal_agent_name_tests {
+    use super::{BindingState, binding_state, terminal_agent_name, is_terminal_legal_name};
 
     /// bd-recover-accepts-camelcase-pins-z5fz: a CamelCase pin is accepted by
-    /// recover (mapped to a legal herdr name); an already-legal herdr name is
+    /// recover (mapped to a legal terminal name); an already-legal terminal name is
     /// passed through byte-for-byte so a healthy pane is never renamed.
     #[test]
     fn recover_accepts_camelcase_pins() {
-        // The observed swarm pins: registered as `name`, illegal for herdr.
-        assert!(!is_herdr_legal_name("QuietHeron"));
-        assert_eq!(herdr_agent_name("QuietHeron"), "quietheron");
-        assert_eq!(herdr_agent_name("Buffy"), "buffy");
-        assert_eq!(herdr_agent_name("CobaltMaple"), "cobaltmaple");
+        // The observed swarm pins: registered as `name`, illegal for hc.
+        assert!(!is_terminal_legal_name("QuietHeron"));
+        assert_eq!(terminal_agent_name("QuietHeron"), "quietheron");
+        assert_eq!(terminal_agent_name("Buffy"), "buffy");
+        assert_eq!(terminal_agent_name("CobaltMaple"), "cobaltmaple");
         // Already-legal names are identity (no rename churn, no case damage).
         for legal in [
             "flywheel-beads-oc2",
@@ -14651,10 +14651,10 @@ mod herdr_agent_name_tests {
             "flywheel_oc3",
             "a1",
         ] {
-            assert!(is_herdr_legal_name(legal), "{legal} is herdr-legal");
-            assert_eq!(herdr_agent_name(legal), legal);
+            assert!(is_terminal_legal_name(legal), "{legal} is hc-legal");
+            assert_eq!(terminal_agent_name(legal), legal);
         }
-        // Every output satisfies the rule herdr enforces (the only thing that
+        // Every output satisfies the rule hc enforces (the only thing that
         // makes the restore succeed): non-empty, starts lowercase, legal bytes,
         // <=32 chars.
         for pin in [
@@ -14664,20 +14664,20 @@ mod herdr_agent_name_tests {
             "w22:p1",
             "A Very Long CamelCase Pin Name That Exceeds Thirty Two",
         ] {
-            let h = herdr_agent_name(pin);
-            assert!(is_herdr_legal_name(&h), "{pin} -> {h:?} must be legal");
+            let h = terminal_agent_name(pin);
+            assert!(is_terminal_legal_name(&h), "{pin} -> {h:?} must be legal");
             assert!(h.len() <= 32, "{pin} -> {h:?} is over 32 chars");
             assert!(
                 h.chars().next().is_some_and(|c| c.is_ascii_lowercase()),
-                "{pin} -> {h:?} must start lowercase (herdr's rule)"
+                "{pin} -> {h:?} must start lowercase (hc's rule)"
             );
         }
-        // A non-alnum byte never survives to reach herdr.
-        assert_eq!(herdr_agent_name("w22:p1"), "w22-p1");
+        // A non-alnum byte never survives to reach hc.
+        assert_eq!(terminal_agent_name("w22:p1"), "w22-p1");
 
         // The recover/rebind DECISION: a CamelCase pin whose pane already
         // carries the legal form is INTACT — never mistaken for a lost binding
-        // (which would re-rename every pass and trip herdr's refusal).
+        // (which would re-rename every pass and trip hc's refusal).
         assert_eq!(
             binding_state("QuietHeron", Some(Some("quietheron"))),
             BindingState::Intact
@@ -14725,7 +14725,7 @@ pub(crate) fn adjnoun_from_fnv(h: u64) -> String {
 }
 
 /// S9 (ADR-0018 D1a): draw a UNIQUE adjective+noun pin, deterministic under
-/// `seed` (the caller seeds per herdr name, so the FIRST candidate matches
+/// `seed` (the caller seeds per terminal name, so the FIRST candidate matches
 /// the legacy hash mapping when free). A candidate already in `taken`
 /// (spawn-registry pins + registered agents) redraws to the next candidate
 /// — the 9900-pair space makes the loop effectively single-pass and the
@@ -14744,7 +14744,7 @@ pub(crate) fn unique_adjnoun_pin(taken: &std::collections::HashSet<String>, seed
 }
 
 /// The FROZEN adjective whitelist — 75 entries, index-addressed by pin
-/// derivation (`agent_mail_name`); never reorder or edit.
+/// derivation (`terminal_mail_name`); never reorder or edit.
 const ADJECTIVES: [&str; 75] = [
     "red",
     "orange",
@@ -14823,7 +14823,7 @@ const ADJECTIVES: [&str; 75] = [
     "proud",
 ];
 /// The FROZEN noun whitelist — 132 entries, index-addressed by pin
-/// derivation (`agent_mail_name`); never reorder or edit.
+/// derivation (`terminal_mail_name`); never reorder or edit.
 const NOUNS: [&str; 132] = [
     "stone",
     "lake",
@@ -14960,18 +14960,18 @@ const NOUNS: [&str; 132] = [
 ];
 
 /// Resolve a mail-recipient specifier to a registered agent-mail identity
-/// name. A herdr agent name (`flywheel-<base>-<kind>[N]`, `crew-<wf>-<role>[N]`)
+/// name. An hc agent name (`flywheel-<base>-<kind>[N]`, `crew-<wf>-<role>[N]`)
 /// maps deterministically to its adjective+noun identity — registration uses
 /// the same mapping (bd-odc), so the identity exists. Anything else passes
 /// through unchanged: it is either an already-valid identity (the mapping is
 /// idempotent for those) or a recipient the server will reject honestly.
 /// Pure — no registry round trips.
 pub(crate) fn resolve_mail_target(target: &str) -> String {
-    // bd-mail-hyphen-loud-3r20: hash ONLY herdr-shaped names. The old
+    // bd-mail-hyphen-loud-3r20: hash ONLY hc-shaped names. The old
     // `contains('-')` rule hashed channel-shaped input (`steer-<ch>`) and
     // typos into a random adjective+noun pin — a misroute, never a mapping.
     if target.starts_with("flywheel-") || target.starts_with("crew-") {
-        agent_mail_name(target)
+        terminal_mail_name(target)
     } else {
         target.to_string()
     }
@@ -14981,7 +14981,7 @@ pub(crate) fn resolve_mail_target(target: &str) -> String {
 /// first — the identity pinned at spawn (pane → adjective+noun) wins over
 /// the pure hash mapping. Numbered agents (oc2/oc3/...) keep the SAME
 /// identity across calls, restarts, and daemon restarts because the binding
-/// is recorded at spawn, not re-derived from the (renumberable) herdr name.
+/// is recorded at spawn, not re-derived from the (renumberable) terminal name.
 /// Falls back to [`resolve_mail_target`] when the registry has no pin.
 ///
 /// Registry-miss reasons (the bead's clear-error contract): the target was
@@ -15006,7 +15006,7 @@ mod agent_mail_name_tests {
     use super::*;
 
     /// 193.1: a non-UTF-8 path converts to an actionable ERROR (never a
-    /// panic, never silent lossy corruption) — the herdr/mail wire protocols
+    /// panic, never silent lossy corruption) — the hc/mail wire protocols
     /// are UTF-8, so a non-UTF-8 path is a clear failure.
     #[test]
     fn utf8_path_rejects_non_utf8_with_error() {
@@ -15030,19 +15030,19 @@ mod agent_mail_name_tests {
         );
     }
 
-    /// The mapping is deterministic: same herdr name → same adjective+noun,
+    /// The mapping is deterministic: same terminal name → same adjective+noun,
     /// every call (and across machines — no randomness, no time).
     #[test]
     fn mapping_is_deterministic() {
-        let a = agent_mail_name("flywheel-flywheel-oc");
-        let b = agent_mail_name("flywheel-flywheel-oc");
+        let a = terminal_mail_name("flywheel-flywheel-oc");
+        let b = terminal_mail_name("flywheel-flywheel-oc");
         assert_eq!(a, b);
-        assert_eq!(a, agent_mail_name("flywheel-flywheel-oc"));
+        assert_eq!(a, terminal_mail_name("flywheel-flywheel-oc"));
     }
 
     /// The output is a whitelist pair: a VALID_ADJECTIVES member + a
     /// VALID_NOUNS member, total length >= 5. This is the REAL gate — it is
-    /// what makes `agent_mail_name` idempotent (a mapped pin passes back
+    /// what makes `terminal_mail_name` idempotent (a mapped pin passes back
     /// through `valid_pair`), and bd-odc proved off-shape pairs like
     /// FrostDolphin are rejected.
     #[test]
@@ -15055,7 +15055,7 @@ mod agent_mail_name_tests {
             "pi",
             "gk",
         ] {
-            let m = agent_mail_name(name);
+            let m = terminal_mail_name(name);
             let lower = m.to_ascii_lowercase();
             assert!(
                 lower.len() >= 5,
@@ -15298,7 +15298,7 @@ mod agent_mail_name_tests {
         ];
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for n in names {
-            seen.insert(agent_mail_name(n));
+            seen.insert(terminal_mail_name(n));
         }
         assert!(
             seen.len() >= 6,
@@ -15321,7 +15321,7 @@ mod agent_mail_name_tests {
             "AzurePine",
         ] {
             assert_eq!(
-                agent_mail_name(name),
+                terminal_mail_name(name),
                 name,
                 "{name} must pass through unchanged"
             );
@@ -15361,40 +15361,40 @@ mod agent_mail_name_tests {
         assert_eq!(valid_pair("", &adjs, &nouns), None);
     }
 
-    /// A herdr agent name maps to its identity; anything already a valid
+    /// An hc agent name maps to its identity; anything already a valid
     /// identity (or a bare short like "oc") passes through untouched.
     #[test]
-    fn resolve_mail_target_maps_herdr_names_and_passes_through_others() {
+    fn resolve_mail_target_maps_plane_names_and_passes_through_others() {
         assert_eq!(
             resolve_mail_target("flywheel-flywheel-oc"),
-            agent_mail_name("flywheel-flywheel-oc")
+            terminal_mail_name("flywheel-flywheel-oc")
         );
         assert_eq!(resolve_mail_target("TopazOx"), "TopazOx");
         assert_eq!(resolve_mail_target("oc"), "oc");
         assert_eq!(resolve_mail_target(""), "");
     }
 
-    /// bd-mail-hyphen-loud-3r20 (GS-028 NEW-2): ONLY herdr-shaped names hash.
+    /// bd-mail-hyphen-loud-3r20 (GS-028 NEW-2): ONLY hc-shaped names hash.
     /// Channel-shaped input (`steer-<ch>`) and hyphenated typos pass through
     /// so the server rejects them honestly instead of misrouting to a random
     /// adjective+noun pin. Crew pane names still map.
     #[test]
-    fn resolve_mail_target_hyphen_only_herdr_shapes_hash() {
+    fn resolve_mail_target_hyphen_only_plane_shapes_hash() {
         // channel-shaped: pass through, never hashed
         assert_eq!(resolve_mail_target("steer-abc123"), "steer-abc123");
         assert_eq!(resolve_mail_target("my-channel"), "my-channel");
         assert_eq!(
-            resolve_mail_target("not-a-herdr-name-at-all"),
-            "not-a-herdr-name-at-all"
+            resolve_mail_target("not-a-hc-name-at-all"),
+            "not-a-hc-name-at-all"
         );
-        // herdr-shaped: still maps (flywheel- and crew- prefixes)
+        // hc-shaped: still maps (flywheel- and crew- prefixes)
         assert_eq!(
             resolve_mail_target("flywheel-toron-oc"),
-            agent_mail_name("flywheel-toron-oc")
+            terminal_mail_name("flywheel-toron-oc")
         );
         assert_eq!(
             resolve_mail_target("crew-plan-coder"),
-            agent_mail_name("crew-plan-coder")
+            terminal_mail_name("crew-plan-coder")
         );
         // already-valid identities stay idempotent
         assert_eq!(resolve_mail_target("TopazOx"), "TopazOx");
@@ -15485,7 +15485,7 @@ mod agent_mail_name_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// review-fix F7: bare shorts resolve to the spawned herdr name; concrete
+    /// review-fix F7: bare shorts resolve to the spawned terminal name; concrete
     /// names pass through unchanged.
     #[test]
     fn resolve_agent_default_expands_shorts_and_passes_concrete() {
@@ -15508,7 +15508,7 @@ mod agent_mail_name_tests {
             "flywheel-hachiko-oc2"
         );
         // an already-mapped adjective+noun identity passes through
-        let mapped = agent_mail_name("flywheel-hachiko-oc");
+        let mapped = terminal_mail_name("flywheel-hachiko-oc");
         assert_eq!(resolve_agent_default("hachiko", &mapped), mapped);
         // raw pane id passes through
         assert_eq!(resolve_agent_default("hachiko", "w1:p1"), "w1:p1");
@@ -15516,7 +15516,7 @@ mod agent_mail_name_tests {
         assert_eq!(resolve_agent_default("hachiko", ""), "");
     }
 
-    /// bd-bwf: full herdr names shown by `flywheel list` must NOT be
+    /// bd-bwf: full terminal names shown by `flywheel list` must NOT be
     /// double-wrapped. Bare shorts expand; concrete names stay exact
     /// (WantToken.broaden=false) so a full name never drags in oc2.
     #[test]
@@ -15810,8 +15810,8 @@ fn cmd_add(
     }
     let mut prev = root.pane_id.clone();
     let mut spawned: Vec<Value> = Vec::new();
-    // bd-bug-omp-herdr-wedge: split panes do NOT inherit the workspace env —
-    // pass the herdr integration env at split time too (same as the spawn
+    // bd-bug-omp-hc-wedge: split panes do NOT inherit the workspace env —
+    // pass the hc integration env at split time too (same as the spawn
     // path's workspace.create injection). bd-pin-public-plane-s-easy.2: the
     // pin rides along as AGENT_NAME/FLYWHEEL_MAIL_AS in the per-pane env.
     // H3 (bd-harness-integration-preflight): same preflight as spawn — add
@@ -15836,7 +15836,7 @@ fn cmd_add(
             if mail_identity.is_none() {
                 refuse_unpinned_spawn(&name, None, backend::mail_backend(cfg).is_ok())?;
             }
-            let pane_env = hc_support::herdr_integration_env(cfg, mail_identity.as_deref());
+            let pane_env = hc_support::plane_launch_env(cfg, mail_identity.as_deref());
             let p = hc_support::pane_split(
                 &c,
                 &prev,
@@ -15873,7 +15873,7 @@ fn cmd_add(
             let agent = start_agent_with_retry(&mut c, &name, &kind, &prev, &add_args)
                 .with_context(|| {
                     format!(
-                        "add {name}: pane {prev} left behind — close it with `herdr pane close {prev}`"
+                        "add {name}: pane {prev} left behind — close it with `hc terminal close {prev}`"
                     )
                 })?;
             // H2: the add path previously had no settle — wait for the TUI to
@@ -15891,10 +15891,10 @@ fn cmd_add(
                     .map(|pi| hc_support::pane_agent_alive(&pi, &kind))
                 {
                     Ok(Some(false)) => bail!(
-                        "add {name}: agent process gone on {prev} — undriven shell left behind; close it with `herdr pane close {prev}`"
+                        "add {name}: agent process gone on {prev} — undriven shell left behind; close it with `hc terminal close {prev}`"
                     ),
                     Ok(_) => eprintln!(
-                        "flywheel: warn: {name} ({prev}) not foreground within 15s — boot unverified; check with `herdr pane process-info --pane {prev}`"
+                        "flywheel: warn: {name} ({prev}) not foreground within 15s — boot unverified; check with `hc terminal process-info --pane {prev}`"
                     ),
                     Err(e) => eprintln!(
                         "flywheel: warn: {name} ({prev}) liveness probe failed: {e:#} — boot unverified"
@@ -15980,7 +15980,7 @@ fn cmd_list(cfg: &Config, all: bool) -> Result<()> {
             .iter()
             .filter(|a| a.workspace_id == ws.workspace_id)
             .map(|a| {
-                // GS-037 P0-2: clear stale launch_pending when herdr already
+                // GS-037 P0-2: clear stale launch_pending when hc already
                 // reports idle/interactive_ready (is_still_booting=false).
                 let pending = is_still_booting(a);
                 json!({
@@ -16280,7 +16280,7 @@ pub fn facts_count_and_last(state_dir: &std::path::Path, project: &str) -> (usiz
 
 /// Captain surface: a fact becomes a single `[doorbell] <summary>` inject
 /// line for the captain pane. Reuses the existing `doorbell_prompt` wake
-/// path (herdr `agent_prompt` with pane fallback). No new Nostr kinds.
+/// path (hc `agent_prompt` with pane fallback). No new Nostr kinds.
 /// GS-006: NO alias or alias not in registry is a loud miss (FactMiss), not
 /// silent Ok(()), and never falls back to registry.first() (crew[0] misroute).
 pub fn captain_fact_inject(
@@ -16299,7 +16299,7 @@ pub fn captain_fact_inject(
         anyhow::bail!("captain fact miss: no alias for project {project}");
     }
     // Queue for the live dispatcher. workspace::tick owns Prompt/FactMiss.
-    // Never herdr-inject here (Tick Law).
+    // Never hc-inject here (Tick Law).
     append_pending_fact(state_dir, project, &line)
 }
 
@@ -16316,18 +16316,18 @@ pub fn ingress_adapters_for_project(
     let root = state_dir.to_path_buf();
     let proj = project.to_string();
     ingress::IngressAdapters {
-        // herdr/watch/cron reach the loop and doorbell through their own
+        // hc/watch/cron reach the loop and doorbell through their own
         // dedicated surfaces (__poll_events / Bell::Watch / cron runner) and
         // should NEVER arrive on this seam — if they do, that is a routing
         // bug and must be loud, not silently swallowed (GS-006 bd-d4qg).
-        herdr: Box::new(|e| eprintln!("ingress routing bug: herdr via fact seam: {e:?}")),
+        hc: Box::new(|e| eprintln!("ingress routing bug: hc via fact seam: {e:?}")),
         watch: Box::new(|w| eprintln!("ingress routing bug: watch via fact seam: {w:?}")),
         workflow: Box::new(|t| eprintln!("ingress routing bug: workflow via fact seam: {t:?}")),
         cron: Box::new(|n| eprintln!("ingress routing bug: cron via fact seam: {n}")),
         fact: Box::new(move |ev: &ingress::IngressEvent| {
             // Live Fact path: journal a pending Msg. The doorbell dispatcher
             // ticks it on the live WorkspaceModel (never Default, never
-            // herdr-inject that bypasses tick).
+            // hc-inject that bypasses tick).
             let summary = ingress::fact_doorbell_line(ev).unwrap_or_else(|| format!("{ev:?}"));
             let msg = crate::workspace::Msg::Fact {
                 summary: summary.clone(),
@@ -17046,18 +17046,18 @@ fn arrival_triple(project: &str, pin: &str) {
 }
 
 /// bd-gpj0: open-mode arrive can only be *pushed* if this pane is in the
-/// spawn registry. `HERDR_PANE_ID` is the current herdr pane; bind it to
+/// spawn registry. `HC_TERMINAL_ID` is the current hc terminal; bind it to
 /// the arriver pin. Without it, wakes stay digest-bound — say so loudly.
 fn arrive_maybe_bind_pane(cfg: &Config, project: &str, pin: &str) {
     let rex = std::env::var("REX_BLOCK").ok();
-    let herdr = std::env::var("HERDR_PANE_ID").ok();
-    match crate::inbox_ports::arrive_pane_from_env(rex.as_deref(), herdr.as_deref()) {
+    let hc = std::env::var("HC_TERMINAL_ID").ok();
+    match crate::inbox_ports::arrive_pane_from_env(rex.as_deref(), hc.as_deref()) {
         Some(pane) => {
             bind_pane_mail_identity(cfg, project, pin, pane, Some(pin));
             eprintln!("arrive bound pane {pane} to {pin} (doorbell can push)");
         }
         None => eprintln!(
-            "flywheel: no REX_BLOCK and no HERDR_PANE_ID — this session is pull-only; doorbell \
+            "flywheel: no REX_BLOCK and no HC_TERMINAL_ID — this session is pull-only; doorbell \
              pushes stay digest-bound. Pull with `toron mail inbox --since last`."
         ),
     }
@@ -17068,7 +17068,7 @@ fn arrive_maybe_bind_pane(cfg: &Config, project: &str, pin: &str) {
 ///
 /// Sources, strongest first: the spawn-registry row for this pane id (written
 /// by spawn before the pane existed) and `FLYWHEEL_MAIL_AS` (injected into the
-/// pane env at create; herdr injects env only at split/create). A
+/// pane env at create; hc injects env only at split/create). A
 /// user-exported `AGENT_NAME` is deliberately NOT read here — it is the mail
 /// ladder's operator fallback, not spawn evidence. A spawned pane may only
 /// arrive as its injected pin, and the captain pin is never a valid arrival
@@ -17156,7 +17156,7 @@ fn cmd_arrive(
     if let Some(requested) = as_agent {
         let dir = project_dir(cfg, project);
         let registry = state::load_spawn_registry(dir.to_str().unwrap_or(project));
-        let pane_id = std::env::var("HERDR_PANE_ID")
+        let pane_id = std::env::var("HC_TERMINAL_ID")
             .ok()
             .map(|p| p.trim().to_string())
             .filter(|p| !p.is_empty());
@@ -17439,7 +17439,7 @@ fn presence_pins(project: &str) -> HashSet<String> {
     presence_names(&rows)
 }
 
-/// bd-8pis: the herdr pane bound to `pin` (toron whois `pane_id`), if any.
+/// bd-8pis: the hc pane bound to `pin` (toron whois `pane_id`), if any.
 /// Best-effort: whois failure reads as unbound (the caller warns).
 fn whois_pane_id(project: &str, pin: &str) -> Option<String> {
     let out = std::process::Command::new("toron")
@@ -17458,10 +17458,10 @@ fn whois_pane_id(project: &str, pin: &str) -> Option<String> {
 
 /// bd-8pis: live pane ids on the SELECTED plane (status != dead). None when
 /// the backend is unreachable — the caller trusts whois bindings instead of
-/// warn-storming. bd-f8zk: this used to connect to herdr
+/// warn-storming. bd-f8zk: this used to connect to hc
 /// directly, so on a rex plane every rex pane read dead and a live pin drew
-/// a false "no live herdr pane" warning.
-pub(crate) fn live_plane_panes(cfg: &Config) -> Option<HashSet<String>> {
+/// a false "no live hc pane" warning.
+pub(crate) fn live_hc_panes(cfg: &Config) -> Option<HashSet<String>> {
     let backend = backend::multiplexer_backend(cfg).ok()?;
     let agents = backend.agent_list().ok()?;
     Some(
@@ -17497,7 +17497,7 @@ pub(crate) fn send_liveness_warnings(
     let heartbeats = presence_pins(project);
     // A whois binding alone can lie (dead panes stay bound) — check it
     // against the live plane set when the backend answers.
-    let live_panes = live_plane_panes(cfg);
+    let live_panes = live_hc_panes(cfg);
     // bd-f8zk: a spawned pane IS the liveness evidence even
     // when the pin never ran `arrive` (whois pane_id stays null). Without this
     // the rex crew drew a false "may reach nobody" advisory on every send.
@@ -17585,7 +17585,7 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
         return cmd_list(cfg, false);
     };
     // Rex door: inside rex list panes through the multiplexer backend;
-    // otherwise keep the herdr client. Read-only either way — status
+    // otherwise keep the hc client. Read-only either way — status
     // never creates a session.
     let (ws_id, agents, dead): (String, Vec<hc_support::AgentInfo>, Vec<(String, String)>) =
         if crate::pane::rex_door_selected(cfg) {
@@ -17596,7 +17596,7 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
                 .into_iter()
                 .filter(|a| a.workspace_id == ws_id)
                 .collect::<Vec<_>>();
-            // The dead-rows gauge is herdr-client-coupled (fail-open there);
+            // The dead-rows gauge is hc-client-coupled (fail-open there);
             // in rex mode it reports none — the reap still runs on
             // spawn/close.
             (ws_id, agents, Vec::new())
@@ -17656,13 +17656,13 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     let rows: Vec<Value> = agents
         .iter()
         .map(|a| {
-            // GS-037 P0-2: clear stale launch_pending when herdr reports idle.
+            // GS-037 P0-2: clear stale launch_pending when hc reports idle.
             let pending = is_still_booting(a);
             // ADR-0010 D3: status prints verdict+source per pin. No live
-            // Model in this render path, so resolve from herdr evidence:
+            // Model in this render path, so resolve from hc evidence:
             // native busy is evidence (labeled), native idle never trusted.
-            let herdr_status = a.agent_status.as_str();
-            let verdict = crate::workspace::verdict_for(None, herdr_status, herdr_status != "dead")
+            let plane_status = a.agent_status.as_str();
+            let verdict = crate::workspace::verdict_for(None, plane_status, plane_status != "dead")
                 .status_token();
             let expected_pin = registry
                 .iter()
@@ -17676,7 +17676,7 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
             // roster cannot answer) and which bead/reservations the LIVE
             // board binds it to (snapshot projection; no row = empty, never
             // a default).
-            let herdr_name = a.name.clone().unwrap_or_else(|| a.pane_id.clone());
+            let terminal_name = a.name.clone().unwrap_or_else(|| a.pane_id.clone());
             let who = expected_pin
                 .as_deref()
                 .and_then(|pin| mail.as_ref()?.whois(&key, pin).ok());
@@ -17687,11 +17687,11 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
             let last_active_ts_us = who
                 .as_ref()
                 .and_then(|w| w.get("last_active_ts_us").and_then(Value::as_u64));
-            let snap_pin = snap.pins.iter().find(|p| p.pin == herdr_name);
+            let snap_pin = snap.pins.iter().find(|p| p.pin == terminal_name);
             json!({
                 "name": a.name, "kind": a.agent,
                 // bd-4pxy: a launch_pending agent is NOT idle — still booting.
-                "status": status_label(pending, herdr_status),
+                "status": status_label(pending, plane_status),
                 "verdict": verdict,
                 "pane_id": a.pane_id, "cwd": a.cwd, "workspace_id": ws_id,
                 "launch_pending": pending,
@@ -17706,7 +17706,7 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
         })
         .collect();
     // H3 (bd-harness-integration-preflight): surface each distinct kind's
-    // herdr integration state (kind -> installed/current/version).
+    // hc integration state (kind -> installed/current/version).
     let integration_statuses = read_integration_statuses();
     let integrations: BTreeMap<String, hc_support::IntegrationStatus> = agents
         .iter()
@@ -18145,8 +18145,8 @@ fn cmd_rebind(cfg: &Config, project: &str) -> Result<()> {
     for entry in &entries {
         let (pane_id, name) = (&entry.pane_id, &entry.name);
         // bd-recover-accepts-camelcase-pins-z5fz: `flywheel rebind` shares the
-        // recover door's CamelCase-pin mapping (herdr rejects the pin shape).
-        let hname = herdr_agent_name(name);
+        // recover door's CamelCase-pin mapping (hc rejects the pin shape).
+        let hname = terminal_agent_name(name);
         let Some(a) = agents
             .iter()
             .find(|a| a.pane_id == *pane_id && a.workspace_id == ws_id)
@@ -18238,9 +18238,9 @@ fn recover_probe_kind<'a>(
 /// `cmd_recover` stays snappy across many agents.
 const RESPONSIVENESS_WINDOW: Duration = Duration::from_secs(3);
 
-/// bd-1np: probe one registered agent's process liveness via herdr
+/// bd-1np: probe one registered agent's process liveness vian hc
 /// `pane.process_info` — pane existence is NOT liveness (a dead agent's pane
-/// still lists in herdr with the binding intact). `Some(true)` = process
+/// still lists in hc with the binding intact). `Some(true)` = process
 /// alive, `Some(false)` = provably dead, `None` = probe unavailable or
 /// inconclusive (the caller falls back to legacy pane-existence
 /// classification — never a confident "healthy").
@@ -18275,7 +18275,7 @@ enum RecoverDecision<'a> {
 /// kind) if it died. Reports what was done per agent.
 ///
 /// bd-1np: an intact pane + binding is healthy ONLY if the process inside is
-/// alive. Each seemingly-healthy agent is liveness-probed via herdr
+/// alive. Each seemingly-healthy agent is liveness-probed vian hc
 /// `pane.process_info` (agent binary in the foreground process group); a pane
 /// whose process died (shell owns the foreground) is respawned in place, not
 /// classified healthy.
@@ -18304,15 +18304,15 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
     }
     let kinds = spawn_kinds_from_log(project);
     let agents = backend.agent_list()?;
-    // bd-1np: concrete herdr client for the process-liveness probe — the
-    // backend trait has no `pane.process_info`. Only the herdr backend can
+    // bd-1np: concrete hc client for the process-liveness probe — the
+    // backend trait has no `pane.process_info`. Only the hc backend can
     // probe; other backends fall back to pane-existence classification.
-    let mut probe = (backend.name() == "herdr")
+    let mut probe = (backend.name() == "hc")
         .then(|| Client::connect(Some(&cfg.socket_path())).ok())
         .flatten();
     let mut recovered: Vec<Value> = Vec::new();
     let mut healthy = 0usize;
-    // bd-f8zk: on herdr a pane outlives its agent (the
+    // bd-f8zk: on hc a pane outlives its agent (the
     // shell stays at a prompt), so a dead agent respawns IN it. On rex the
     // block IS the pane: closing it destroys the shell, and `pane_run` on the
     // stale id can only fail 30 times. Read the plane once; a row whose pane
@@ -18326,10 +18326,10 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
     let mut moved: Vec<(String, String)> = Vec::new();
     for entry in &entries {
         let (pane_id, name) = (&entry.pane_id, &entry.name);
-        // bd-recover-accepts-camelcase-pins-z5fz: herdr refuses a CamelCase
+        // bd-recover-accepts-camelcase-pins-z5fz: hc refuses a CamelCase
         // pin as an agent name, so restore/launch under the legal form and
-        // compare against THAT (what herdr will actually hold).
-        let hname = herdr_agent_name(name);
+        // compare against THAT (what hc will actually hold).
+        let hname = terminal_agent_name(name);
         let kind = recover_probe_kind(entry, &kinds);
         let live = agents
             .iter()
@@ -18384,7 +18384,7 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
                 backend.agent_rename(pane_id, Some(&hname))?;
                 recovered.push(json!({
                     "name": name, "pane_id": pane_id, "action": "rebound", "was": was,
-                    "herdr_name": hname
+                    "terminal_name": hname
                 }));
             }
             RecoverDecision::Respawn { reason } => {
@@ -18507,9 +18507,9 @@ fn rebind_from_registry(
         return Ok(false); // pane gone (respawned) — normal resolution finds the new pane
     };
     // bd-recover-accepts-camelcase-pins-z5fz: a CamelCase registry name is a
-    // legal identity but an illegal herdr name — map it, or the auto-heal
+    // legal identity but an illegal terminal name — map it, or the auto-heal
     // itself trips `invalid_agent_name`.
-    let target = herdr_agent_name(&entry.name);
+    let target = terminal_agent_name(&entry.name);
     if a.name.as_deref() == Some(target.as_str()) {
         return Ok(true);
     }
@@ -18684,17 +18684,17 @@ fn cmd_send_via_inbox(
     Ok(())
 }
 
-/// bd-rex-default-plane-xn1t: the default send path on a non-herdr plane.
+/// bd-rex-default-plane-xn1t: the default send path on a non-hc plane.
 /// The caller (`cmd_send`) runs the shared prep (stage text, task id, policy
 /// guard, plane tripwires) and passes the rendered text in. This arm then:
 /// resolve through the selected backend's `agent_list` (shared exact rule +
 /// registry), dispatch through `backend.prompt`, and `--wait` through
 /// `backend.prompt_coded` (agent_wait). A semantic reject stays a reject —
-/// no herdr retry exists on this arm, and nothing here mentions herdr: with
+/// no hc retry exists on this arm, and nothing here mentions hc: with
 /// a dead socket and a rex selection, every failure names the rex plane.
 /// Rows keep the `prior_status`/`landed` JSON fields. Exit 0 means every
 /// prompt was accepted (or, with `--wait`, settled); anything else is loud.
-/// Divergence from the herdr arm, by acceptance contract: no P0-A fail-loud
+/// Divergence from the hc arm, by acceptance contract: no P0-A fail-loud
 /// gate and no doorbell last_wake gate here — a prompt-ok row is the dispatch
 /// receipt, the same contract as `--via-inbox` `queued`/`woke`.
 #[cfg(feature = "backend-superlogical")]
@@ -18723,7 +18723,7 @@ fn cmd_send_rex(
     }
     let mut registry = state::load_spawn_registry(project);
     let targets = resolve_send_targets_dyn(&in_ws, &registry, project, to)?;
-    // Same broadcast guard as the herdr arm: a bare short reaching the whole
+    // Same broadcast guard as the hc arm: a bare short reaching the whole
     // crew races one prompt across N agents.
     if !force {
         let names: Vec<String> = targets
@@ -18933,11 +18933,11 @@ fn cmd_send(
     check_send_plane_tripwires(&text, plane, unsafe_plane, raw)?;
 
     // bd-rex-default-plane-xn1t: the default prompt lane rides the selected
-    // pane plane. `auto` and `superlogical` resolve rex-first (herdr is
-    // transport fallback only); only an explicit `herdr` selection takes the
-    // `Client` path below. Nothing on the rex arm mentions herdr.
+    // pane plane. `auto` and `superlogical` resolve rex-first (hc is
+    // transport fallback only); only an explicit `hc` selection takes the
+    // `Client` path below. Nothing on the rex arm mentions hc.
     #[cfg(feature = "backend-superlogical")]
-    if crate::backend::resolve_backend_name(cfg) != "herdr" {
+    if crate::backend::resolve_backend_name(cfg) != "hc" {
         return cmd_send_rex(
             cfg,
             project,
@@ -18965,7 +18965,7 @@ fn cmd_send(
         }
         // bd-a2bw: also rebind every nameless pane in the workspace — a
         // `--to coder3` miss must not depend on the token already being
-        // the full herdr name.
+        // the full terminal name.
         if let Ok(live) = c.agent_list() {
             let entries = state::load_spawn_registry(project);
             let mut rebound = false;
@@ -18974,22 +18974,22 @@ fn cmd_send(
                 .filter(|a| a.workspace_id == ws_id && a.name.is_none())
             {
                 if let Some(e) = entries.iter().find(|e| e.pane_id == a.pane_id)
-                    && c.agent_rename(&a.pane_id, &herdr_agent_name(&e.name))
+                    && c.agent_rename(&a.pane_id, &terminal_agent_name(&e.name))
                         .is_ok()
                 {
                     rebound = true;
                 }
             }
-            // bd-bug-omp-herdr-wedge: the omp herdr integration re-reports the
+            // bd-bug-omp-hc-wedge: the omp hc integration re-reports the
             // agent as UNNAMED on every processed prompt, so a name-addressed
-            // prompt racing the report misses herdr's name index. Settle a
+            // prompt racing the report misses hc's name index. Settle a
             // beat after the rename before re-resolving.
             if rebound {
                 std::thread::sleep(Duration::from_millis(400));
             }
         }
         // bd-qs1c.1: a send racing a fresh spawn can miss the pin (registry
-        // not yet flushed) or the pane (not yet in herdr's list) even after
+        // not yet flushed) or the pane (not yet in hc's list) even after
         // the rebind above. Settle on a short bounded budget — every attempt
         // is a live re-read, never an invented delivery (GS-037).
         if targets.is_err() {
@@ -19056,7 +19056,7 @@ fn cmd_send(
     };
     // GS-037 P0-C / GS-039 P0-1: snapshot wake BEFORE send so a later landed
     // check can require an observed advance (Status/poll/delivery, or
-    // herdr settled_status after --wait land — never invent from injects).
+    // hc settled_status after --wait land — never invent from injects).
     let wake_before_unix = if wait {
         let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
         doorbell::load_wake_state(&doorbell::wake_state_file(&config::state_dir(), &ws_label))
@@ -19066,7 +19066,7 @@ fn cmd_send(
     };
     for a in &targets {
         // --wait means "settle": idle, done, or blocked. An empty `until` array
-        // was sent before, which herdr cannot wait on meaningfully.
+        // was sent before, which hc cannot wait on meaningfully.
         let wait_opts = wait.then(|| WaitOptions {
             timeout_ms: timeout,
             until: vec![AgentStatus::Idle, AgentStatus::Done, AgentStatus::Blocked],
@@ -19118,7 +19118,7 @@ fn cmd_send(
             .map(str::to_string)
             .unwrap_or_else(|| format!("send:{name}:{baseline_seq}"));
         // bd-4pxy: a still-booting agent rejects name-addressed prompts with
-        // `agent_not_ready`; herdr accepts pane ids, so retry once via the
+        // `agent_not_ready`; hc accepts pane ids, so retry once via the
         // pane before giving up (bounded — never an infinite loop).
         let mut pane_retried = false;
         let agent = loop {
@@ -19142,7 +19142,7 @@ fn cmd_send(
                         None => {
                             if try_send_text_delivery(&mut c, project, &name, &target, &send_text) {
                                 // Pane send-text delivered bytes — that is
-                                // NOT herdr settled-wait. With --wait, refuse
+                                // NOT hc settled-wait. With --wait, refuse
                                 // invent-green landed/receipt (GS-037).
                                 if wait {
                                     bail!(
@@ -19166,9 +19166,9 @@ fn cmd_send(
                         }
                     }
                 }
-                // bd-bug-omp-herdr-wedge: omp's herdr integration re-reports
+                // bd-bug-omp-hc-wedge: omp's hc integration re-reports
                 // the agent UNNAMED on each processed prompt, so a
-                // name-addressed prompt can miss herdr's name index even
+                // name-addressed prompt can miss hc's name index even
                 // after the send-path heal. Rebind from the spawn registry
                 // and retry once via the pane.
                 Err(e)
@@ -19182,7 +19182,7 @@ fn cmd_send(
                         .cloned();
                     match entry {
                         Some(en) => {
-                            let _ = c.agent_rename(&en.pane_id, &herdr_agent_name(&name));
+                            let _ = c.agent_rename(&en.pane_id, &terminal_agent_name(&name));
                             std::thread::sleep(Duration::from_millis(400));
                             pane_retried = true;
                             eprintln!(
@@ -19211,7 +19211,7 @@ fn cmd_send(
                     match stall_step(&e.code, stalls_seen, respawn_on_stall) {
                         None => {
                             if wait && e.code == BackendErrorCode::Timeout {
-                                // bd-8vci: the wait timed out AFTER herdr
+                                // bd-8vci: the wait timed out AFTER hc
                                 // accepted the bytes — a bare Err here discards
                                 // the landed fact and invents a clean failure.
                                 // Emit the ambiguous row; genuinely non-landed
@@ -19234,7 +19234,7 @@ fn cmd_send(
                             return Err(e.into());
                         }
                         Some(StallStep::Retry) => {
-                            // toron wait.rs / herdr: read before retry, never
+                            // toron wait.rs / hc: read before retry, never
                             // blind resubmit. Same delivery_key across attempts.
                             let probe = probe_prompt_after_stall(
                                 &mut c,
@@ -19318,7 +19318,7 @@ fn cmd_send(
             );
         }
         // bd-pin-public-plane-s-easy.9: dispatched + prior_status — the
-        // herdr status at TARGET time (before the prompt), never a bare
+        // hc status at TARGET time (before the prompt), never a bare
         // `status` a captain reads as a miss when the agent was idle at
         // dispatch. landed + settled_status only after --wait observed it.
         results.push(send_result_row(
@@ -19342,7 +19342,7 @@ fn cmd_send(
     // GS-037 P0-A / P0-C: receipt honesty.
     // --wait with no landed must not exit 0 invent-green (P0-A wait-empty).
     // On landed:true, last_wake must advance from a REAL observation
-    // (herdr settled status working|idle|done|blocked after send lands, or
+    // (hc settled status working|idle|done|blocked after send lands, or
     // doorbell Status/delivery). Never invent from planned injects.
     let any_landed = results
         .iter()
@@ -19354,10 +19354,10 @@ fn cmd_send(
     }
     if wait && any_landed {
         let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
-        // GS-039 P0-1: when send --wait OBSERVES herdr settle (landed +
+        // GS-039 P0-1: when send --wait OBSERVES hc settle (landed +
         // settled_status in working|idle|done|blocked), stamp last_wake from
         // that observation. Covers idle→idle fast-path where doorbell Status
-        // push may not fire a transition. Not invent-green: gated on herdr
+        // push may not fire a transition. Not invent-green: gated on hc
         // wait receipt, not planned injects / doorbell_persist_wake.
         for r in &results {
             if r.get("landed") != Some(&json!(true)) {
@@ -19490,7 +19490,7 @@ fn delivery_id_of(fire_and_forget: &Option<String>) -> Option<&str> {
 }
 
 /// One send-result row. `dispatched: true` means the prompt was handed to
-/// herdr; it is NOT a receipt. GS-037 P0-A: fire-and-forget must not invent
+/// hc; it is NOT a receipt. GS-037 P0-A: fire-and-forget must not invent
 /// green — `receipt:false` without --wait, and cmd_send exits nonzero unless
 /// `--fire-and-forget` (or wait landed + wake). `landed` + `settled_status`
 /// appear ONLY after --wait/--confirm observed the prompt land.
@@ -19536,7 +19536,7 @@ fn send_result_row(
 }
 
 /// bd-8vci: row for a --wait send that ended WITHOUT a settled observation
-/// (timeout/stall) after herdr accepted the bytes. The prompt MAY have
+/// (timeout/stall) after hc accepted the bytes. The prompt MAY have
 /// started, so `landed` is deliberately ABSENT (not false) — ambiguity is
 /// the honest report. `observed_status` carries the one lifecycle read-back
 /// taken at failure time; omitted when that query itself failed.
@@ -19689,7 +19689,7 @@ fn read_pane_status(c: &mut Client, target: &str, name: &str) -> Option<String> 
     })
 }
 
-/// bd-8vci: wait timeout/stall after herdr accepted the send. Before declaring
+/// bd-8vci: wait timeout/stall after hc accepted the send. Before declaring
 /// ambiguity, poll briefly for the opencode lagging channel to catch up with a
 /// `working` transition (F9/F15); when it does, the prompt LANDED — emit the
 /// landed row and return Ok. Otherwise one read-back becomes the row's
@@ -19949,8 +19949,8 @@ fn stall_recovery_hint(project: &str) -> String {
     )
 }
 
-/// bd-4pxy: herdr reports `agent_not_ready` when a still-booting agent
-/// rejects a prompt addressed by NAME. herdr accepts pane ids too, and a
+/// bd-4pxy: hc reports `agent_not_ready` when a still-booting agent
+/// rejects a prompt addressed by NAME. hc accepts pane ids too, and a
 /// booting agent answers its pane even before the name binding settles —
 /// so the send path retries once via the pane id. `None` when the pane-id
 /// retry already happened (bounded — never an infinite retry loop).
@@ -19966,16 +19966,16 @@ fn not_ready_retry_target(
     }
 }
 
-/// bd-4pxy: herdr's `agent_not_ready` protocol code arrives unmapped
+/// bd-4pxy: hc's `agent_not_ready` protocol code arrives unmapped
 /// (BackendErrorCode::Other). Everything else (stalls, timeouts, connect)
 /// keeps its existing handling.
 fn is_agent_not_ready(code: &BackendErrorCode) -> bool {
     matches!(code, BackendErrorCode::Other(c) if c == "agent_not_ready")
 }
 
-/// H2 (bd-harness-jcode): herdr's `agent.prompt` gates on a recognized
+/// H2 (bd-harness-jcode): hc's `agent.prompt` gates on a recognized
 /// lifecycle-authority kind; recipe-launched harnesses (`pa`, `jcode`, ...)
-/// report state via their own hooks but have no herdr kind, so their panes
+/// report state via their own hooks but have no hc kind, so their panes
 /// reject `agent.prompt` with `agent_not_ready` even while idle. Deliver the
 /// prompt through the pane primitives instead: `pane.send_text` + Enter —
 /// the same path the boot prime uses. Returns `Ok(true)` when the text was
@@ -20118,7 +20118,7 @@ mod bd_4pxy_tests {
     }
 
     /// bd-8pjr: per-site fail-twice-then-succeed for boot-prime THROUGH the
-    /// site policy (no-op sleep — the real loop needs a herdr Client, so
+    /// site policy (no-op sleep — the real loop needs an hc Client, so
     /// the config rides the driver here).
     #[test]
     fn boot_prime_policy_fail_twice_then_succeeds() {
@@ -20145,7 +20145,7 @@ mod bd_4pxy_tests {
         assert_eq!(sleeps, 2);
     }
 
-    /// herdr plane harden: prime prefers agent.prompt, settles before Enter,
+    /// hc plane harden: prime prefers agent.prompt, settles before Enter,
     /// retries Enter only, and try_send_text_delivery returns the real bool.
     #[test]
     fn prime_and_try_send_delivery_honesty_tripwire() {
@@ -20271,12 +20271,12 @@ mod bd_4pxy_tests {
         assert!(w.short.is_none(), "pane id carries no kind short");
     }
 
-    /// bd-k8jn (the token half): a spawned crew's herdr name is its mail PIN
-    /// (herdr lowercases it) while the spawn registry keeps the canonical
+    /// bd-k8jn (the token half): a spawned crew's terminal name is its mail PIN
+    /// (hc lowercases it) while the spawn registry keeps the canonical
     /// name. The two can never meet, so the registry's PANE has to be the
     /// match: `--to <pin>` and `--to <pane id>` both name a live crew.
     #[test]
-    fn a_registry_pane_matches_the_agent_whatever_herdr_calls_it() {
+    fn a_registry_pane_matches_the_agent_whatever_plane_calls_it() {
         let crew = agent(
             Some("opencode"),
             Some("blueridge"),
@@ -20285,7 +20285,7 @@ mod bd_4pxy_tests {
             AgentStatus::Idle,
         );
         let want = WantToken {
-            // the registry's canonical name — which herdr never reports
+            // the registry's canonical name — which hc never reports
             name: "flywheel-toron-coder".to_string(),
             broaden: false,
             short: None,
@@ -20352,7 +20352,7 @@ mod bd_4pxy_tests {
 
     #[test]
     fn match_indices_raw_kind_hits_nameless_pane() {
-        // 2026-09-07 raw-pane addressing: a herdr pane with NO registry
+        // 2026-09-07 raw-pane addressing: an hc pane with NO registry
         // name (a raw harness agent, e.g. grok) is reachable by its agent
         // kind. Witness: `flywheel send --to KeenAuditor` failed against a
         // workspace whose only peers were raw omp/grok panes; `--to grok`
@@ -20458,9 +20458,9 @@ mod bd_4pxy_tests {
         a
     }
 
-    /// bd-a2bw: `--to w70:p3` must hit the pane even when herdr name is null
+    /// bd-a2bw: `--to w70:p3` must hit the pane even when terminal name is null
     /// (omp profile split; ADR-0018 seq-1 suffix-less names never land as
-    /// the herdr name on later splits).
+    /// the hc name on later splits).
     #[test]
     fn match_indices_resolves_pane_id_when_name_null() {
         let p1 = agent_on_pane(
@@ -20492,7 +20492,7 @@ mod bd_4pxy_tests {
     }
 
     /// bd-pin-public-plane-s-easy.2: `--to <pin>` (the adjective+noun mail
-    /// identity) resolves through the spawn registry to the agent's herdr
+    /// identity) resolves through the spawn registry to the agent's hc
     /// name — the pin is what a model types, the slug is internal.
     #[test]
     fn match_indices_resolves_pin_via_registry_mail_identity() {
@@ -20504,14 +20504,14 @@ mod bd_4pxy_tests {
             AgentStatus::Idle,
         );
         let agents = vec![oc];
-        // the spawn-registry entry binds the herdr name to its mail pin
+        // the spawn-registry entry binds the hc name to its mail pin
         let entries = vec![state::SpawnEntry::with_mail_identity(
             "w70:p1",
             "flywheel-toron-coder",
             "DustySparrow",
         )];
         // a pin token must resolve to the agent (via the registry mapping),
-        // while the herdr name and pane id keep working unchanged.
+        // while the hc name and pane id keep working unchanged.
         let resolved = registry_entry_for_token(&entries, "toron", "DustySparrow")
             .map(|e| e.name.as_str())
             .expect("pin resolves to a registry entry");
@@ -20527,7 +20527,7 @@ mod bd_4pxy_tests {
 
     /// bd-a2bw: `--to coder1` is suffix-less (ADR-0018); `--to coder3`
     /// resolves after overlaying the spawn-registry name onto a nameless
-    /// omp pane (herdr kind stays `omp`, so kind fallback cannot save us).
+    /// omp pane (hc kind stays `omp`, so kind fallback cannot save us).
     #[test]
     fn overlay_registry_names_lets_coder_short_hit_nameless_omp() {
         assert_eq!(
@@ -20586,7 +20586,7 @@ mod bd_4pxy_tests {
     }
 
     /// bd-a2bw: omp at `π >` with a session is idle + interactive_ready;
-    /// herdr may still report launch_pending. That bit is stale — send
+    /// hc may still report launch_pending. That bit is stale — send
     /// must proceed.
     #[test]
     fn is_still_booting_ignores_stale_launch_pending() {
@@ -20840,7 +20840,7 @@ fn cmd_interrupt(
 }
 
 /// bd-fw-view-alt-screen-blocked-ct9: a working agent's `recent` history is
-/// on the alternate screen and cannot be captured (herdr rejects with
+/// on the alternate screen and cannot be captured (hc rejects with
 /// `agent_not_idle`). Fall back to the `visible` buffer with a note instead
 /// of failing the whole view. Never falls back when the caller explicitly
 /// asked for `visible`.
@@ -20955,7 +20955,7 @@ fn cmd_watch(
     }
 
     // subscribe to status changes in this workspace (long-lived connection).
-    // The live herdr contract requires one subscription per pane
+    // The live hc contract requires one subscription per pane
     // (`pane.agent_status_changed` needs a concrete pane_id — a workspace
     // scope alone is rejected), so build one subscription per pane in the
     // workspace. Panes spawned after this point aren't subscribed; the poll
@@ -20972,7 +20972,7 @@ fn cmd_watch(
             None
         }
     };
-    // herdr 0.9 (protocol 22): subscriptions are live-only — a status change
+    // hc 0.9 (protocol 22): subscriptions are live-only — a status change
     // between the pane_list snapshot and the subscribe ack would never be
     // seen. One poll closes the window (bd-myab).
     if stream.is_some() && watch_poll(&mut c, &watch_names, until_status)? {
@@ -21001,8 +21001,8 @@ fn cmd_watch(
                     // The payload's `agent` field is the agent KIND, not the
                     // name — match via pane id (watch_targets).
                     match ev.data {
-                        hc_support::HerdrEventData::PaneAgentStatusChanged(change)
-                        | hc_support::HerdrEventData::PaneAgentStatusChangedSub(change) => {
+                        hc_support::TerminalEventData::PaneAgentStatusChanged(change)
+                        | hc_support::TerminalEventData::PaneAgentStatusChangedSub(change) => {
                             let Some(name) = watch_name_for_pane(&watch_targets, &change.pane_id)
                             else {
                                 continue;
@@ -21020,7 +21020,7 @@ fn cmd_watch(
                         _ => {}
                     }
                 }
-                Ok(None) => bail!("herdr socket closed"),
+                Ok(None) => bail!("hc socket closed"),
                 Err(_) => {
                     // transient read error: poll state as fallback
                     std::thread::sleep(Duration::from_millis(1000));
@@ -21093,10 +21093,10 @@ fn cmd_attach(cfg: &Config, project: &str, to: &str) -> Result<()> {
     let agents = resolve_agents(&mut c, &ws_id, project, to)?;
     let target = agent_target(&agents[0]);
     println!("{}", dim("attaching (detach with ctrl+b q)…"));
-    let status = Command::new("herdr")
+    let status = Command::new("hc")
         .args(["attach", target])
         .status()
-        .map_err(|e| anyhow!("herdr attach failed: {e}"))?;
+        .map_err(|e| anyhow!("hc attach failed: {e}"))?;
     std::process::exit(status.code().unwrap_or(1));
 }
 
@@ -21134,7 +21134,7 @@ fn cmd_kill(
         }
     }
     // bd-f8zk: kill rides the SELECTED plane. It used to
-    // connect to herdr directly, so on a rex plane `find_workspace` never
+    // connect to hc directly, so on a rex plane `find_workspace` never
     // matched and the verb refused a live workspace ("no flywheel swarm").
     let backend = backend::multiplexer_backend(cfg)?;
     let ws_id = find_workspace_dyn(&*backend, project)?;
@@ -21236,7 +21236,7 @@ fn cmd_kill(
     backend.workspace_close(&ws_id, false)?;
     doorbell::stop(&config::state_dir(), &ws_label);
     // bd-2o1v lifecycle symmetry: a full close drops THIS spawn's wake
-    // subscription rows — panes are gone, so their herdr-sink rows are
+    // subscription rows — panes are gone, so their hc-sink rows are
     // stale weight (20-row graveyards were the finding). Operator/cli
     // rows outlive swarms; the next spawn re-records its rows idempotently.
     // Continue/Adopt keeps crews alive and never reaches here.
@@ -21577,7 +21577,7 @@ fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&s
             })
             .unwrap_or_default()
     } else {
-        // explicit targets: herdr agent names resolve through the spawn
+        // explicit targets: hc agent names resolve through the spawn
         // registry (bd-627z.4 — the pinned pane→identity binding, so the
         // same agent gets the same identity every call); already-valid
         // identities pass through unchanged (bd-odc)
@@ -22072,7 +22072,7 @@ fn mail_project<'a>(
 /// `urgent > 0`, which IS meaningful (importance is a real message
 /// attribute).
 fn digest_for(mail: &mail::Mail, key: &str, name: &str) -> Result<Value> {
-    // bd-dbre: poll the inbox the agent actually READS. Herdr name and pin
+    // bd-dbre: poll the inbox the agent actually READS. Hc name and pin
     // are separate recipients (message_reads is per-recipient, bd-5icg);
     // waking on the name inbox means pin-side mark-read can never clear
     // the wake. wake_identity_pin maps name -> pin, falling back to the
@@ -22224,7 +22224,7 @@ fn mail_key_present(data_dir: &std::path::Path, slug: &str, name: &str) -> Optio
     import_source_key(data_dir, slug, name)
 }
 
-/// S8.1: the wake identity for a herdr agent name. The spawn-registry /
+/// S8.1: the wake identity for an hc agent name. The spawn-registry /
 /// agent-names pin (pane → name → mail identity) wins; otherwise the
 /// canonical name itself — the identity flywheel registers at spawn and the
 /// wake backstop registers idempotently BEFORE instructing fetch. Never the
@@ -22634,7 +22634,7 @@ fn refuse_unpinned_spawn(
     }
 }
 
-/// S8.3/S8.4: the mail profile a spawn registers — the CANONICAL herdr name
+/// S8.3/S8.4: the mail profile a spawn registers — the CANONICAL terminal name
 /// as the identity (the random npub stays underneath; toron accepts any
 /// name, the legacy agent-mail adjective+noun whitelist does not apply),
 /// with a fresh task stamp whose idempotent upsert overwrites stale task
@@ -23321,15 +23321,15 @@ mod wake_identity_tests {
         );
     }
 
-    /// Rex block stamp gate: a `block:` id is a rex block, not a herdr
-    /// pane — stamping it makes herdr say `pane_not_found`. `w6:p1`
-    /// still takes the herdr stamp.
+    /// Rex block stamp gate: a `block:` id is a rex block, not an hc
+    /// pane — stamping it makes hc say `pane_not_found`. `w6:p1`
+    /// still takes the hc stamp.
     #[test]
-    fn rex_block_skips_the_herdr_stamp() {
-        assert!(!pane_takes_herdr_stamp(
+    fn rex_block_skips_the_plane_stamp() {
+        assert!(!pane_takes_hc_stamp(
             "block:01a17136-a780-714f-9211-b78766ffd515"
         ));
-        assert!(pane_takes_herdr_stamp("w6:p1"));
+        assert!(pane_takes_hc_stamp("w6:p1"));
     }
 
     /// S9 (ADR-0018 D1a) integration (embedded mailbox): spawn registers a
@@ -23338,7 +23338,7 @@ mod wake_identity_tests {
     /// seed-draw candidate.
     #[test]
     fn bind_pane_mail_identity_stamps() {
-        // bd-ab2p: bind never fails the spawn — with no herdr pane behind
+        // bd-ab2p: bind never fails the spawn — with no hc terminal behind
         // the id the stamp degrades to a stderr note while the file bridge
         // + registry still land (registry is the contract this test pins).
         let _g = crate::config::lock_env();
@@ -23357,24 +23357,24 @@ mod wake_identity_tests {
         crate::mail::cleanup_test_data_dir(&data);
     }
 
-    /// bd-gpj0: arrive with HERDR_PANE_ID records the open-mode pane so
+    /// bd-gpj0: arrive with HC_TERMINAL_ID records the open-mode pane so
     /// doorbell injection can see it (clears `no_injectable_panes` when
-    /// herdr lists that pane).
+    /// hc lists that pane).
     #[test]
     fn arrive_maybe_bind_pane_records_current_pane() {
         let _home = crate::config::test_state_home();
         // Hermetic: `arrive_maybe_bind_pane` prefers ambient `REX_BLOCK`, so a
         // test run inside a rex pane would bind the operator's live block
-        // instead of the scripted herdr pane. Clear it for the guard's
+        // instead of the scripted hc terminal. Clear it for the guard's
         // lifetime and restore it after, or the test passes in CI and fails on
         // a rex box. NB: `test_state_home()` above already holds the env lock —
         // calling `lock_env()` here would self-deadlock (it is the same lock).
         let prev_rex = std::env::var("REX_BLOCK").ok();
         unsafe { std::env::remove_var("REX_BLOCK") };
         let data = std::env::temp_dir().join(format!("fw-arrive-bind-{}", uuid::Uuid::new_v4()));
-        let prev = std::env::var("HERDR_PANE_ID").ok();
+        let prev = std::env::var("HC_TERMINAL_ID").ok();
         unsafe { std::env::set_var("TORON_DATA_DIR", &data) };
-        unsafe { std::env::set_var("HERDR_PANE_ID", "wP:p2") };
+        unsafe { std::env::set_var("HC_TERMINAL_ID", "wP:p2") };
         let cfg = Config::default();
         let project = "fw-arrive-bind-proj";
         arrive_maybe_bind_pane(&cfg, project, "QuietHeron");
@@ -23385,8 +23385,8 @@ mod wake_identity_tests {
         assert_eq!(entry.pane_id, "wP:p2");
         assert_eq!(entry.mail_identity.as_deref(), Some("QuietHeron"));
         match prev {
-            Some(v) => unsafe { std::env::set_var("HERDR_PANE_ID", v) },
-            None => unsafe { std::env::remove_var("HERDR_PANE_ID") },
+            Some(v) => unsafe { std::env::set_var("HC_TERMINAL_ID", v) },
+            None => unsafe { std::env::remove_var("HC_TERMINAL_ID") },
         }
         match prev_rex {
             Some(v) => unsafe { std::env::set_var("REX_BLOCK", v) },
@@ -23443,7 +23443,7 @@ mod wake_identity_tests {
 
     /// bd-add-missing-mail-identity-16le: the ADD path's identity step mints
     /// a DISTINCT registered pin per added pane (oc/oc2/oc3 — even when the
-    /// seq counter reuses after a dead pane, distinct herdr names draw
+    /// seq counter reuses after a dead pane, distinct terminal names draw
     /// distinct pins), never the unroutable default ("bangedorrunt"), and
     /// the project-local agent-names.json mirror (written by cmd_add) holds
     /// every pin — so claims write the real identity, strand checks see
@@ -23468,7 +23468,7 @@ mod wake_identity_tests {
             let pin = register_spawned_agent(&cfg, project, slug, "opencode", &pane)
                 .expect("add pane registers an identity");
             assert_ne!(pin, "bangedorrunt", "never the unroutable default identity");
-            assert_ne!(pin, *slug, "the pin is not the herdr slug");
+            assert_ne!(pin, *slug, "the pin is not the hc slug");
             assert!(
                 valid_pair(&pin, &ADJECTIVES, &NOUNS).is_some(),
                 "adj+noun pin: {pin}"
@@ -24529,7 +24529,7 @@ fn cmd_loop_prune() -> Result<()> {
 /// wedge — the agent process still UP, parked on a fatal error line, with no
 /// commit movement inside the window. The verdict is `durable::pane_wedge_action`
 /// (pure); this is only the live read. Soft-fail everywhere: an unreachable
-/// herdr, an empty registry, or an unreadable pane yields no wedges — never a
+/// hc, an empty registry, or an unreadable pane yields no wedges — never a
 /// fabricated page.
 fn probe_pane_wedges(
     cfg: &Config,
@@ -24558,8 +24558,8 @@ fn probe_pane_wedges(
         let Some(a) = agents.iter().find(|a| a.pane_id == e.pane_id) else {
             continue; // pane gone — `recover`'s door, not this probe's
         };
-        // The kind rides on the live agent (`agent` is the harness herdr
-        // launched), so the process probe needs no profile lookup. A pane herdr
+        // The kind rides on the live agent (`agent` is the harness hc
+        // launched), so the process probe needs no profile lookup. A pane hc
         // reports with no kind probes as inconclusive (`None`), never alive.
         let kind = a.agent.as_deref().unwrap_or("");
         let alive = hc_support::pane_process_info(&c, &e.pane_id)
@@ -25666,7 +25666,7 @@ fn cmd_loop(
                                 let key = project_dir_str(cfg, project)?;
                                 let _ = m.ensure_project(&key);
                                 // the recipient is the agent's REGISTERED
-                                // agent-mail identity (bd-odc) — the herdr
+                                // agent-mail identity (bd-odc) — the hc
                                 // name is not a registrable identity;
                                 // bd-aseq: registry pin first, hash fallback
                                 let mail_target = resolve_mail_target_registry(project, name);
@@ -27049,7 +27049,7 @@ mod loop_tests {
 
     /// bd-rex-default-plane-xn1t: the default send path on a rex plane
     /// resolves `--to <pin>` through the shared exact rule and prompts once
-    /// on the pin's block — with a dead herdr socket anywhere near it.
+    /// on the pin's block — with a dead hc socket anywhere near it.
     #[cfg(feature = "backend-superlogical")]
     const REX_SEND_FAKE_REX: &str = r#"#!/bin/sh
 printf '%s\n' "$*" >> @@LOG@@
@@ -27091,8 +27091,8 @@ esac
 
     /// The pin resolves and exactly one prompt lands on the pin's block.
     /// No registry row exists, so this drives the shared exact-match rule;
-    /// a dead herdr socket is present in the environment shape (no socket
-    /// is ever touched — the log must stay herdr-free).
+    /// a dead hc socket is present in the environment shape (no socket
+    /// is ever touched — the log must stay hc-free).
     #[cfg(feature = "backend-superlogical")]
     #[test]
     fn rex_send_resolves_pin_and_prompts_once_on_the_rex_target() {
@@ -27124,7 +27124,7 @@ esac
             1,
             "one submit after the write:\n{log}"
         );
-        assert!(!log.contains("herdr"), "no herdr contact:\n{log}");
+        assert!(!log.contains("hc"), "no hc contact:\n{log}");
     }
 
     /// Registry ground truth: a lane name resolves to its pane even though
@@ -27215,11 +27215,11 @@ esac
         );
     }
 
-    /// Fence: the non-herdr send arm is selected by backend name and builds
-    /// no herdr client. Both halves are asserted so neither direction is
-    /// vacuous: the route must exist AND the herdr constructor must be gone.
+    /// Fence: the non-hc send arm is selected by backend name and builds
+    /// no hc client. Both halves are asserted so neither direction is
+    /// vacuous: the route must exist AND the hc constructor must be gone.
     #[test]
-    fn rex_send_arm_constructs_no_herdr_client() {
+    fn rex_send_arm_constructs_no_plane_client() {
         let src = include_str!("main.rs");
         let send = src
             .split_once("\nfn cmd_send(")
@@ -27233,7 +27233,7 @@ esac
             "cmd_send must route to the rex arm"
         );
         assert!(
-            send.contains("resolve_backend_name(cfg) != \"herdr\""),
+            send.contains("resolve_backend_name(cfg) != \"hc\""),
             "the route is by backend name, never REX_SESSION"
         );
         let rex = src
@@ -27253,11 +27253,11 @@ esac
         );
         assert!(
             !rex.contains("Client::connect"),
-            "no herdr client on the rex arm"
+            "no hc client on the rex arm"
         );
         assert!(
             !rex.contains("hc_support::Client"),
-            "no herdr client type on the rex arm"
+            "no hc client type on the rex arm"
         );
     }
 
@@ -27560,7 +27560,7 @@ esac
     #[test]
     fn spawn_retry_bumps_ordinal_past_taken_names() {
         use std::collections::HashSet;
-        // bd-o1zh: a retried spawn must not reuse a name herdr holds.
+        // bd-o1zh: a retried spawn must not reuse a name hc holds.
         let taken: HashSet<String> = ["flywheel-flywheel-pi", "flywheel-flywheel-pi2"]
             .into_iter()
             .map(str::to_string)
@@ -27695,12 +27695,12 @@ fn cmd_safety(cfg: &Config) -> Result<()> {
     let c = if let Ok(c) = Client::connect(Some(&cfg.socket_path())) {
         c
     } else {
-        println!("herdr: {}", error("unreachable"));
+        println!("hc: {}", error("unreachable"));
         return Ok(());
     };
-    println!("herdr: {}", status_paint(AgentStatus::Idle));
+    println!("hc: {}", status_paint(AgentStatus::Idle));
     if c.ping().is_ok() {
-        println!("herdr socket: ok");
+        println!("hc socket: ok");
     }
     println!(
         "br: {}",
@@ -28423,7 +28423,7 @@ fn setup_flywheel_backend(url: &str, dry: bool) -> Result<String> {
 mod protocol_check_tests {
     use super::*;
 
-    /// (live, pin) -> severity. herdr's protocol is additive: higher is safe,
+    /// (live, pin) -> severity. hc's protocol is additive: higher is safe,
     /// lower is the real safety net.
     #[test]
     fn protocol_check_three_states() {
@@ -28441,9 +28441,9 @@ mod protocol_check_tests {
     }
 }
 
-/// Severity of a live herdr protocol number vs the verified pin.
+/// Severity of a live hc protocol number vs the verified pin.
 ///
-/// herdr's protocol is *additive by design*: new optional fields, new event
+/// hc's protocol is *additive by design*: new optional fields, new event
 /// variants, new optional request params. A live protocol HIGHER than the pin
 /// is safe (the client ignores what it doesn't know) — `HDR_PROTOCOL` is the
 /// *verified floor*, not the ceiling. A live protocol LOWER than the pin is
@@ -28599,27 +28599,27 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
     }
     match Client::connect(Some(&cfg.socket_path())) {
         Ok(c) => match c.ping() {
-            Ok(_) => println!("herdr socket: {}", status_paint(AgentStatus::Idle)),
+            Ok(_) => println!("hc socket: {}", status_paint(AgentStatus::Idle)),
             Err(e) => {
                 ok = false;
-                println!("herdr socket: {} ({e:#})", error("FAIL"));
+                println!("hc socket: {} ({e:#})", error("FAIL"));
             }
         },
         Err(e) => {
             ok = false;
-            println!("herdr socket: {} ({e:#})", error("FAIL"));
+            println!("hc socket: {} ({e:#})", error("FAIL"));
         }
     }
 
-    // herdr protocol drift check. The socket has no protocol method in v18,
-    // so we shell out to the herdr CLI itself (`api schema --json` — the
+    // hc protocol drift check. The socket has no protocol method in v18,
+    // so we shell out to the hc CLI itself (`api schema --json` — the
     // canonical source; same binary as the socket server, so CLI vs socket
     // drift is not a concern). HDR_PROTOCOL is the *verified floor*: live ==
-    // pin is green, live > pin is forward-compatible INFO (herdr is additive
+    // pin is green, live > pin is forward-compatible INFO (hc is additive
     // by design — this is the signal that triggers a bd-protocol-v2X-bump
     // bead later), live < pin is ERROR + exit 1 (server too old — the safety
     // net, per ADR-0001 gap A1).
-    if let Some(p) = std::process::Command::new("herdr")
+    if let Some(p) = std::process::Command::new("hc")
         .args(["api", "schema", "--json"])
         .output()
         .ok()
@@ -28628,41 +28628,41 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
     {
         match protocol_check(p, u64::from(hc_support::HDR_PROTOCOL)) {
             ProtocolCheck::Match => println!(
-                "herdr protocol: {} (verified {})",
+                "hc protocol: {} (verified {})",
                 paint_ok(&p.to_string()),
                 hc_support::HDR_PROTOCOL
             ),
             ProtocolCheck::Newer => {
                 println!(
-                    "herdr protocol: {} (verified {})",
+                    "hc protocol: {} (verified {})",
                     crate::output::warn(&p.to_string()),
                     hc_support::HDR_PROTOCOL
                 );
                 eprintln!(
-                    "flywheel: INFO herdr protocol {p} > verified {} — forward-compatible (client ignores what it doesn't know), but flywheel may not use new features; rebuild against the newer schema when ready",
+                    "flywheel: INFO hc protocol {p} > verified {} — forward-compatible (client ignores what it doesn't know), but flywheel may not use new features; rebuild against the newer schema when ready",
                     hc_support::HDR_PROTOCOL
                 );
             }
             ProtocolCheck::Older => {
                 ok = false;
                 println!(
-                    "herdr protocol: {} (verified {})",
+                    "hc protocol: {} (verified {})",
                     crate::output::error(&p.to_string()),
                     hc_support::HDR_PROTOCOL
                 );
                 eprintln!(
-                    "flywheel: ERROR herdr protocol {p} < verified {} — server too old, our requests may be rejected; upgrade herdr or rebuild flywheel against the pinned schema",
+                    "flywheel: ERROR hc protocol {p} < verified {} — server too old, our requests may be rejected; upgrade hc or rebuild flywheel against the pinned schema",
                     hc_support::HDR_PROTOCOL
                 );
             }
         }
     } else {
         println!(
-            "herdr protocol: {} (verified {})",
+            "hc protocol: {} (verified {})",
             crate::output::warn("unknown"),
             hc_support::HDR_PROTOCOL
         );
-        eprintln!("flywheel: WARNING cannot read herdr protocol (herdr api schema --json failed)");
+        eprintln!("flywheel: WARNING cannot read hc protocol (hc api schema --json failed)");
     }
 
     // H3 (bd-harness-integration-preflight): per-kind integration state
@@ -28671,20 +28671,20 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
     // regardless of the CLI status read).
     match hc_support::integration_status_all() {
         Ok(list) => {
-            println!("herdr integrations:");
+            println!("hc integrations:");
             for (kind, st) in list {
                 println!("  {}", integration_status_line(&kind, &st));
             }
         }
         Err(e) => {
             eprintln!(
-                "flywheel: WARNING cannot read `herdr integration status` — integration surface degraded: {e:#}"
+                "flywheel: WARNING cannot read `hc integration status` — integration surface degraded: {e:#}"
             );
-            println!("herdr integrations: {}", crate::output::warn("unknown"));
+            println!("hc integrations: {}", crate::output::warn("unknown"));
         }
     }
 
-    for tool in ["br", "bv", "herdr"] {
+    for tool in ["br", "bv", "hc"] {
         if command_exists(tool) {
             println!("{tool}: {}", status_paint(AgentStatus::Idle));
         } else {
@@ -28897,7 +28897,7 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                     "profile {name} needs --harness, or a slot alias (@cheap/@standard/@premium)"
                 );
             }
-            // bd-enov (F6): validate the harness against the herdr kind
+            // bd-enov (F6): validate the harness against the hc kind
             // registry + the `[harness.<name>]` recipe catalog AT WRITE TIME.
             // `--harness oc` used to persist verbatim and die later at spawn
             // (`unsupported interactive agent kind oc`); normalize the alias,
@@ -28948,7 +28948,7 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
             let resolved = cat.resolve(name, None, &operator_npub, &|_, _| None)?;
             let spec = &resolved.spec;
 
-            // Spawn via the configured multiplexer backend (default herdr).
+            // Spawn via the configured multiplexer backend (default hc).
             let backend = backend::multiplexer_backend(cfg)?;
             let agent_name = format!("profile-{name}");
             let profile = cat.get(name).expect("resolve validated the profile above");
@@ -32043,11 +32043,11 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // A recording action runner: flywheel's CLI run exercises the
             // engine (delays, approvals park durably, graph scheduling,
             // control-flow); action side-effects are recorded, not dispatched
-            // (herdr dispatch is the P4 spawn-await binding). With
+            // (hc dispatch is the P4 spawn-await binding). With
             // `--execute --mode headless` the real headless runner replaces
             // it: spawn/dispatch_job steps run through `__run-headless`
             // (ADR-0010 Spec A/E, P10.1). `--execute --mode pane` pre-spawns
-            // a real herdr crew from the crew plan and dispatches each step
+            // a real hc crew from the crew plan and dispatches each step
             // via the loop's `__send` leaf (P10.3, bd-ghcj.1).
             let mut pane_ctx: Option<pane::PaneRunCtx> = None;
             let runner: toron_workflow::engine::EffectRunner = if *execute {
@@ -32449,7 +32449,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // concurrent projects / days. Encode project tag (4) + date-bearing
             // compact stamp %m%d%H%M%S (10) + pid nibble (2 hex) = 16 chars so
             // uniqueness holds across days within the 16-char crew slug budget
-            // (`crew-{slug}-{role}` still fits herdr's 32-char agent-name).
+            // (`crew-{slug}-{role}` still fits hc's 32-char agent-name).
             let proj_tag: String = std::path::Path::new(project_name)
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -33964,7 +33964,7 @@ fn is_builtin_profile(name: &str) -> bool {
 /// Resolve a pane id in the default project workspace for `profile run` /
 /// `squad spawn`: reuse the first workspace, else create one, then return a
 /// PANE id inside it — `agent_start` takes a pane id, never a workspace id
-/// (bd-ude8: herdr rejects a workspace id with `agent_pane_not_found`).
+/// (bd-ude8: hc rejects a workspace id with `agent_pane_not_found`).
 fn resolved_spec_workspace(
     _cfg: &Config,
     backend: &dyn backend::MultiplexerBackend,
@@ -34571,9 +34571,9 @@ fn cmd_plan_review(
 }
 
 /// Resolve the A/B/judge agents for a debate: explicit names, or default to
-/// the swarm's first agents. Returns the (a, b, j) herdr agent names.
+/// the swarm's first agents. Returns the (a, b, j) hc agent names.
 /// Resolve the A/B/judge agents for a debate: explicit names, or default to
-/// the swarm's first agents. Returns the (a, b, j) herdr agent names.
+/// the swarm's first agents. Returns the (a, b, j) hc agent names.
 /// review-fix F7: bare shorts (`oc`/`pi`/`gk`) expand to the spawned
 /// `flywheel-<base>-<short>` names; explicit full names pass through.
 fn resolve_debate_agents<'a>(
@@ -34769,7 +34769,7 @@ fn cmd_upgrade() -> Result<()> {
 
 fn cmd_tutorial() -> Result<()> {
     println!(
-        "flywheel — herdr swarm orchestrator\n\n\
+        "flywheel — hc swarm orchestrator\n\n\
          The daily loop (his P1→P8) — one durable command:\n\
          \x20 flywheel spawn <project> --oc=1 --pi=1 --gk=1\n\
          \x20 flywheel loop run <project> --queue p1,p2,p4,p5,p6,p8\n\
@@ -34813,7 +34813,7 @@ fn cmd_loop_status(cfg: &Config, project: &str) -> Result<()> {
 ///
 /// governed-by: ADR-0001 (A2 event stream) + ADR-0002 (backend factory).
 ///
-/// **Forward-only:** herdr `events.subscribe` has no since/seq param (schema-
+/// **Forward-only:** hc `events.subscribe` has no since/seq param (schema-
 /// verified). This leaf opens a fresh subscription, blocks up to `timeout_ms`,
 /// and returns whatever arrived. Crash recovery is NOT via event replay —
 /// the loop's `__poll` snapshot is the correctness floor. `after_seq` is
@@ -34998,7 +34998,7 @@ fn summarize_status_event(
 /// internal leaf: JSON [[name, status], ...] for a project's managed agents.
 ///
 /// governed-by: ADR-0002 — constructs the multiplexer via the factory so the
-/// durable loop is backend-agnostic (herdr today; superlogical/toron later).
+/// durable loop is backend-agnostic (hc today; superlogical/toron later).
 fn cmd_internal_poll(cfg: &Config, project: &str, to: &str) -> Result<()> {
     let backend = backend::multiplexer_backend(cfg)?;
     let ws_id = find_workspace_dyn(&*backend, project)?;
@@ -35010,7 +35010,7 @@ fn cmd_internal_poll(cfg: &Config, project: &str, to: &str) -> Result<()> {
     // [name, status, kind, pane_id, mail_identity] — pane_id enables
     // event→name routing (bd-event-dispatch-zero-latency); mail_identity is
     // the pinned adjective+noun name the loop substitutes for {AGENT_NAME}
-    // (bd-pin-public-plane-s-easy.2, never the herdr slug). Older parsers
+    // (bd-pin-public-plane-s-easy.2, never the hc slug). Older parsers
     // ignore the 4th/5th elements.
     let registry = state::load_spawn_registry(project);
     let pin_for = |name: &str| -> Option<&str> {
@@ -35083,7 +35083,7 @@ fn skill_injection_prefix(entry: &state::SpawnEntry, skills: &[String]) -> Optio
 /// bd-83as/bd-mcax: first-dispatch predicate for the readiness gate —
 /// true while the spawn registry shows skills not yet injected, i.e. this
 /// pane booted fresh under the current spawn. Landed history is NOT
-/// consulted: herdr names are stable across respawns, so a landed record
+/// consulted: terminal names are stable across respawns, so a landed record
 /// would silence the gate forever after the first send. Later dispatches
 /// (injected lane) skip the gate entirely.
 fn is_first_dispatch(skills_injected: bool) -> bool {
@@ -35157,7 +35157,7 @@ where
 /// internal leaf: send one prompt to a named agent.
 ///
 /// **ADR-0002 note:** this leaf is NOT yet migrated to the trait factory. The
-/// confirm-path uses `Client::agent_prompt_coded` (typed `HerdrError` code →
+/// confirm-path uses `Client::agent_prompt_coded` (typed `PlaneError` code →
 /// `classify_send_result` landing semantics), which the trait surface doesn't
 /// expose (the trait's `agent_prompt` returns a minimal JSON, losing the coded
 /// error). Migrating requires either a trait-level coded-prompt method or a
@@ -35167,7 +35167,7 @@ where
 ///
 /// Without `--confirm`: fire-and-forget (`wait: None`) — byte-identical to
 /// the legacy path. With `--confirm [TIMEOUT_MS]`: wait for the prompt to
-/// LAND (agent reaches working|blocked), classify the herdr error code, and
+/// LAND (agent reaches working|blocked), classify the hc error code, and
 /// emit `{"ok": true, "name", "landed", "status", "reason"}`. Exit 1 only
 /// for hard errors (agent not found); landing failures exit 0 with flags.
 fn cmd_internal_send(
@@ -35224,7 +35224,7 @@ fn cmd_internal_send(
     let started = std::time::Instant::now();
 
     // resume-dedup (bd-resume-dedup): a landed record for THIS invocation
-    // means the prompt was delivered before a crash — skip the herdr call
+    // means the prompt was delivered before a crash — skip the hc call
     // entirely. The __send subprocess is the idempotency boundary: it runs
     // FRESH at send time, so the check cannot go stale (a workflow-level
     // check's result would itself be checkpointed and replayed after the
@@ -35321,7 +35321,7 @@ fn cmd_internal_send(
 
     // review-fix F6: __send routes through the backend factory (ADR-0002).
     // The trait now exposes agent_prompt_coded with landing data, so the
-    // durable loop's dispatch leaf is backend-agnostic (herdr today; toron /
+    // durable loop's dispatch leaf is backend-agnostic (hc today; toron /
     // superlogical later) with byte-identical landing classification.
     let backend = backend::multiplexer_backend(cfg)?;
     let ws_id = find_workspace_dyn(&*backend, project)?;
@@ -35376,7 +35376,7 @@ fn cmd_internal_send(
     };
 
     let Some(timeout_ms) = confirm_ms else {
-        // legacy fire-and-forget path — a successful herdr call means the
+        // legacy fire-and-forget path — a successful hc call means the
         // prompt was written to the agent's terminal. bd-4pxy: a booting
         // agent rejects name-addressed prompts — retry once via the pane id.
         match backend.prompt(&target, &send_text, None) {
@@ -35544,7 +35544,7 @@ fn resolve_pane_id(agents: &[hc_support::AgentInfo], target: &str) -> Option<Str
     None
 }
 
-/// The wait-output mode for the `--regex` flag: herdr's literal-substring
+/// The wait-output mode for the `--regex` flag: hc's literal-substring
 /// mode is spelled `match` in the leaf (mapped to `substring` in the client).
 fn wait_output_mode(regex: bool) -> &'static str {
     if regex { "regex" } else { "match" }
@@ -35633,9 +35633,9 @@ fn cmd_internal_inprogress(cfg: &Config, project: &str) -> Result<()> {
 
 /// internal leaf (bd-627z.1, bd-qk9q, bd-reclaim-liveness-not-spelling-hn8b):
 /// re-open stranded in_progress beads to ready. The decision resolves the
-/// assignee through the spawn registry to its pane and asks herdr whether
+/// assignee through the spawn registry to its pane and asks hc whether
 /// that pane is live (`durable::reclaim_decision`) — no spelling list. Kept
-/// under BOTH registry names of a live pane (herdr name and mail pin), and a
+/// under BOTH registry names of a live pane (terminal name and mail pin), and a
 /// live reservation for the bead itself (reason = bead id) is a lease no
 /// reclaim may break. A spelling the registry cannot resolve and pane
 /// evidence cannot refute is KEPT — the old name comparison reclaimed live
@@ -35670,9 +35670,9 @@ fn cmd_internal_reclaim_stranded(cfg: &Config, project: &str, live: &str) -> Res
         }
         panes
     };
-    // Every spelling a LIVE pane answers to: the polled herdr names the loop
-    // passed, plus each live registry row's herdr name AND mail pin
-    // (bd-bvwf.6: claims use the pin, the loop passes herdr names).
+    // Every spelling a LIVE pane answers to: the polled terminal names the loop
+    // passed, plus each live registry row's terminal name AND mail pin
+    // (bd-bvwf.6: claims use the pin, the loop passes terminal names).
     let mut live_identities: std::collections::HashSet<String> = live_names.into_iter().collect();
     for e in &registry {
         if live_panes.contains(&e.pane_id) {
@@ -35764,7 +35764,7 @@ fn cmd_internal_reclaim_stranded(cfg: &Config, project: &str, live: &str) -> Res
     Ok(())
 }
 
-/// internal leaf: print the herdr agent kind of a named agent.
+/// internal leaf: print the hc agent kind of a named agent.
 fn cmd_internal_kind(cfg: &Config, project: &str, name: &str) -> Result<()> {
     let backend = backend::multiplexer_backend(cfg)?;
     let ws_id = find_workspace_dyn(&*backend, project)?;
@@ -35780,7 +35780,7 @@ fn cmd_internal_kind(cfg: &Config, project: &str, name: &str) -> Result<()> {
 /// internal leaf: the profile name an agent serves, from the spawn registry
 /// (bd-gsvn.1). Empty line when the agent has no profile (plain swarm
 /// spawns — byte-identical pre-migration behavior). Registry read only —
-/// never consults herdr.
+/// never consults hc.
 fn cmd_internal_profile(cfg: &Config, project: &str, name: &str) -> Result<()> {
     let dir = project_dir(cfg, project);
     let key = match dir.to_str() {
@@ -35821,9 +35821,9 @@ fn cmd_internal_read(cfg: &Config, project: &str, name: &str) -> Result<()> {
     // state-file fallback channel: parse the agent's state file when present.
     // Malformed/absent files yield null — never an error (the loop treats
     // null as "terminal channel only", identical to pre-zwa behavior).
-    // bd-context-limit-honor-luqg: try BOTH identity files (herdr name +
+    // bd-context-limit-honor-luqg: try BOTH identity files (terminal name +
     // registry mail pin) — the contract has pin-identity crews write the
-    // PIN file, which the herdr-keyed lookup never saw.
+    // PIN file, which the hc-keyed lookup never saw.
     let dir = project_dir(cfg, project);
     let pin_identity = {
         let reg = state::load_spawn_registry(project);
@@ -35837,7 +35837,7 @@ fn cmd_internal_read(cfg: &Config, project: &str, name: &str) -> Result<()> {
 }
 
 /// internal leaf: close the agent's pane, split a fresh pane, restart the agent
-/// under the same name (fresh session context). bd-ude8: omp-in-herdr
+/// under the same name (fresh session context). bd-ude8: omp-in-hc
 /// EXITS on PTY stdin EOF, and `pane.close` on its pane delivers exactly
 /// that — so omp restarts IN PLACE (same pane, no split, no close); other
 /// kinds keep the split+close cycle.
@@ -35866,7 +35866,7 @@ fn respawn_with_backend(
 ) -> Result<()> {
     let ws_id = find_workspace_dyn(backend, project)?;
     let dir = project_dir(cfg, project);
-    // The agent record may already be gone (herdr drops dead agents ~0.5s
+    // The agent record may already be gone (hc drops dead agents ~0.5s
     // after they stop responding — the escalation path respawns exactly
     // those). The pane itself usually survives; split from any pane in the
     // workspace and skip closing an old pane we cannot identify.
@@ -35918,7 +35918,7 @@ fn respawn_with_backend(
             .or_else(|| panes.first().map(|p| p.pane_id.clone()))
             .ok_or_else(|| anyhow!("no pane in {project} to split for respawn"))?;
         let pane = backend.pane_split(&anchor, "down", Some(&utf8_path(&dir, "workspace dir")?))?;
-        // best-effort close of the dead pane via the backend trait (herdr
+        // best-effort close of the dead pane via the backend trait (hc
         // implements it with the same `pane.close` RPC).
         if let Some(old) = &old_pane {
             let _ = backend.pane_close(old);
@@ -35927,7 +35927,7 @@ fn respawn_with_backend(
     };
     // bd-ude8: re-inject the profile's model/effort/role launch args on
     // respawn — the old `&[]` argv made the respawned agent fall back to
-    // harness defaults (and omp-in-herdr got no flags at all).
+    // harness defaults (and omp-in-hc got no flags at all).
     let args = respawn_launch_args(cfg, project, name, kind);
     let fresh = start_agent_with_retry_dyn(backend, name, kind, &new_pane, &args)?;
     // pane-identity bridge bookkeeping (best-effort — never fail the respawn
@@ -35944,7 +35944,7 @@ fn respawn_with_backend(
             eprintln!("flywheel: mail clear_pane_identity failed for {old}: {e}");
         }
         if let Err(e) =
-            backend::run_mail(mail.write_pane_identity(key, &fresh.pane_id, &agent_mail_name(name)))
+            backend::run_mail(mail.write_pane_identity(key, &fresh.pane_id, &terminal_mail_name(name)))
         {
             eprintln!(
                 "flywheel: mail write_pane_identity failed for {name} on {}: {e}",
@@ -36413,7 +36413,7 @@ fn cmd_internal_run_headless(
 /// The headless ActionRunner dispatch (ADR-0010 Spec A headless row, P10.1):
 /// `dispatch_job` resolves the step profile, prepends the behavior preamble
 /// (Spec C), and shells out to the `__run-headless` leaf — subprocess-reuse,
-/// never an in-process herdr/toron client (Spec A). The leaf's JSON (one
+/// never an in-process hc/toron client (Spec A). The leaf's JSON (one
 /// line) flows into `{{steps.<name>}}`; its run log carries response + usage.
 ///
 /// Non-dispatch actions stay recorded, never dispatched (P10.1 scope).
@@ -36712,18 +36712,18 @@ steps:
 /// S8.1: the digest RESOLVES the wake identity (spawn-registry /
 /// agent-names pin, else the canonical name) and registers it idempotently
 /// BEFORE the fetch — the wake prompt's "fetch as X" then names an identity
-/// that exists. `mail_identity` rides alongside `agent` (the herdr-name map
+/// that exists. `mail_identity` rides alongside `agent` (the hc-name map
 /// key the loop uses).
 ///
 /// S8.2: `urgent` counts only wake-filtered rows (read or already-executed
 /// assigns are excluded; duplicate assigns collapse).
 ///
-/// Output: `{ "agent": <herdr name>, "mail_identity": <registered identity>,
+/// Output: `{ "agent": <terminal name>, "mail_identity": <registered identity>,
 /// "recent": N, "urgent": N, "last_from": "...", "last_subject": "...",
 /// "thread_id": "..." }`.
 /// Soft-fail: mail down / unknown agent → zeroed digest, never an error.
 fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<()> {
-    // `agent` is the caller's key (herdr name from the poll snapshot) —
+    // `agent` is the caller's key (terminal name from the poll snapshot) —
     // echo it verbatim so the loop can key its digest map by the same name
     // it will look up in plan_actions.
     let key_name = agent.trim().to_string();
@@ -37901,7 +37901,7 @@ fn cmd_internal_mail_blocked(cfg: &Config, project: &str, name: &str, tier: u32)
     };
     let key = project_dir_str(cfg, project)?;
     // the recipient is the agent's REGISTERED agent-mail identity (bd-odc) —
-    // `name` is the herdr name, which is not a registrable identity;
+    // `name` is the hc name, which is not a registrable identity;
     // bd-aseq: registry pin first, hash fallback
     let mail_target = resolve_mail_target_registry(project, name);
     let thread = format!("health-{name}");
@@ -41698,7 +41698,7 @@ mod profile_cli_tests {
             .expect("resolve");
         assert_eq!(r.spec.harness, "pi");
         assert_eq!(r.spec.model, "opencode-go/muse-spark-1.3-contributor");
-        assert_eq!(r.spec.backend, "herdr");
+        assert_eq!(r.spec.backend, "hc");
         assert_eq!(
             r.signing,
             profile::SigningContext::Operator("npub-op".into())
@@ -42194,7 +42194,7 @@ mod send_result_row_tests {
     use super::*;
 
     /// bd-pin-public-plane-s-easy.9: fire-and-forget send JSON carries
-    /// `dispatched: true` + `prior_status` (the herdr status at target
+    /// `dispatched: true` + `prior_status` (the hc status at target
     /// time) — never a bare `status` a captain parses as a miss when the
     /// agent was idle at dispatch. No `landed` without --wait/--confirm.
     #[test]
@@ -42338,10 +42338,10 @@ mod send_failure_log_tests {
     /// fresh pane is impossible to misdiagnose.
     #[test]
     fn send_failure_keeps_raw_bytes() {
-        let line = format_send_failure("coder-1", "", "herdr: agent_not_ready", false, 1);
+        let line = format_send_failure("coder-1", "", "hc: agent_not_ready", false, 1);
         assert!(line.contains("coder-1"), "names the target: {line:?}");
         assert!(
-            line.contains("herdr: agent_not_ready"),
+            line.contains("hc: agent_not_ready"),
             "stderr bytes kept: {line:?}"
         );
         assert!(line.contains("status=1"), "exit status kept: {line:?}");
@@ -42376,7 +42376,7 @@ mod first_dispatch_gate_tests {
     }
 
     /// bd-83as/bd-mcax: first dispatch = skills not yet injected (fresh
-    /// spawn). Landed history never silences the gate — herdr names are
+    /// spawn). Landed history never silences the gate — terminal names are
     /// stable across respawns, so a landed record would mute it forever.
     #[test]
     fn first_dispatch_predicate() {
@@ -42516,7 +42516,7 @@ mod reservation_identity_tests {
     // lives with the ONE implementation it tests.
 
     /// bd-2mdo RED: an actor token that names a REGISTERED mailbox identity
-    /// passes through VERBATIM — it is an address, not a herdr slug to
+    /// passes through VERBATIM — it is an address, not an hc slug to
     /// re-derive. The hash fallback minted RainyElk for the literally-
     /// registered e2e-zord (e2e_serialize_worktree canary), a stranger no
     /// crew knows and the one-ladder rule forbids.
@@ -43246,16 +43246,16 @@ mod idempot_tests {
 
 #[cfg(test)]
 mod ingress_wiring_tests {
-    use crate::ingress::{HerdrEvent, IngressEvent, WatchHit};
+    use crate::ingress::{TerminalEvent, IngressEvent, WatchHit};
 
     #[test]
     fn ingress_wiring_all_variants_go_through_handle_ingress() {
         let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let adapters = crate::ingress::IngressAdapters {
-            herdr: {
+            hc: {
                 let h = hits.clone();
-                Box::new(move |_: &HerdrEvent| {
-                    h.lock().unwrap().push("herdr");
+                Box::new(move |_: &TerminalEvent| {
+                    h.lock().unwrap().push("hc");
                 })
             },
             watch: {
@@ -43284,9 +43284,9 @@ mod ingress_wiring_tests {
             },
         };
         crate::ingress::handle_ingress(
-            &IngressEvent::Herdr(HerdrEvent::PaneExited {
+            &IngressEvent::Hc(TerminalEvent::PaneExited {
                 pane_id: "p1".into(),
-                herdr_name: "n1".into(),
+                terminal_name: "n1".into(),
             }),
             &adapters,
         );
@@ -43313,7 +43313,7 @@ mod ingress_wiring_tests {
         );
         let h = hits.lock().unwrap();
         assert_eq!(h.len(), 4);
-        assert!(h.contains(&"herdr"));
+        assert!(h.contains(&"hc"));
         assert!(h.contains(&"watch"));
         assert!(h.contains(&"workflow"));
         assert!(h.contains(&"cron"));
@@ -43323,7 +43323,7 @@ mod ingress_wiring_tests {
     fn facts_variants_route_through_handle_ingress() {
         let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let adapters = crate::ingress::IngressAdapters {
-            herdr: Box::new(|_| {}),
+            hc: Box::new(|_| {}),
             watch: Box::new(|_| {}),
             workflow: Box::new(|_| {}),
             cron: Box::new(|_| {}),
@@ -43343,7 +43343,7 @@ mod ingress_wiring_tests {
             },
             crate::ingress::IngressEvent::PaneStalled {
                 pane_id: "w1:p1".into(),
-                herdr_name: "oc".into(),
+                terminal_name: "oc".into(),
                 last_status: "idle".into(),
                 bead_id: Some("bd-1".into()),
                 reason: "silent_idle".into(),
@@ -43391,7 +43391,7 @@ mod ingress_wiring_tests {
         );
         let stalled = crate::ingress::IngressEvent::PaneStalled {
             pane_id: "w2:p2".into(),
-            herdr_name: "pi".into(),
+            terminal_name: "pi".into(),
             last_status: "working".into(),
             bead_id: None,
             reason: "silent_idle".into(),

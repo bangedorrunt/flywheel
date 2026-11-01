@@ -22,7 +22,7 @@ pub(crate) enum CrewCmd {
     /// point: interrupt|exit|relaunch are the whole surface (ADR-0010 D7).
     Control {
         project: String,
-        /// the pane target (herdr agent name, kind short, or pane id)
+        /// the pane target (hc agent name, kind short, or pane id)
         pin: String,
         #[command(subcommand)]
         verb: ControlVerbCmd,
@@ -185,7 +185,7 @@ fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCm
                 .first()
                 .ok_or_else(|| anyhow!("workspace {ws_id} has no panes"))?;
             let mail_identity = old.mail_identity.clone();
-            let mut pane_env = crate::hc_support::herdr_integration_env(cfg, mail_identity.as_deref());
+            let mut pane_env = crate::hc_support::plane_launch_env(cfg, mail_identity.as_deref());
             if let Some(m) = &plan.env_model_pin {
                 crate::hc_support::apply_opencode_model_pin(&mut pane_env, m)?;
             }

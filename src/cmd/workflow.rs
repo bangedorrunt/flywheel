@@ -75,7 +75,7 @@ pub(crate) enum WorkflowCmd {
         execute: bool,
         /// execution mode with --execute (ADR-0010 Spec E): `headless` runs
         /// steps via the `__run-headless` subprocess; `pane` pre-spawns a
-        /// real herdr crew and dispatches via the loop's `__send` leaf
+        /// real hc crew and dispatches via the loop's `__send` leaf
         /// (P10.3, bd-ghcj.1).
         #[arg(long, value_parser = ["headless", "pane"], default_value = "headless")]
         mode: String,
@@ -184,7 +184,7 @@ pub(crate) enum WorkflowCmd {
         /// bd-enov (F6): per-run harness override for compose --run — every
         /// composed role spawns on KIND (e.g. `opencode`). Removes the need to
         /// mutate `~/.config/flywheel/profiles.toml` for a one-off run.
-        /// Validated against the herdr kind registry + `[harness.*]` recipes;
+        /// Validated against the hc kind registry + `[harness.*]` recipes;
         /// `oc`/`gk` normalize to `opencode`/`grok`.
         #[arg(long, value_name = "KIND")]
         harness: Option<String>,

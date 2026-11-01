@@ -895,7 +895,7 @@ graph:
             action: dispatch_job
             assignee: x
             build_slot: true
-            spec: { profile: "@coder", harness: "opencode", task: "PROTOTYPE COMPILE ARM {{item}} (of {{inputs.arms}}): implement your arm of the question in the PRIMARY TREE on a SCRATCH git ref (branch off current HEAD, never a herdr worktree). Question: {{inputs.question}}. One arm at a time: after implementing, MEASURE (build + test under the build slot — toron slot acquire before any cargo) and RESET the tree (git checkout the base + clean) so arm {{item}} leaves NO residue — the next arm starts only after your reset. No br, no .beads/ writes, no tracker writes. Report: what you built, the measurement result, the reset proof." }
+            spec: { profile: "@coder", harness: "opencode", task: "PROTOTYPE COMPILE ARM {{item}} (of {{inputs.arms}}): implement your arm of the question in the PRIMARY TREE on a SCRATCH git ref (branch off current HEAD, never an hc worktree). Question: {{inputs.question}}. One arm at a time: after implementing, MEASURE (build + test under the build slot — toron slot acquire before any cargo) and RESET the tree (git checkout the base + clean) so arm {{item}} leaves NO residue — the next arm starts only after your reset. No br, no .beads/ writes, no tracker writes. Report: what you built, the measurement result, the reset proof." }
       else:
         - name: arm
           action: parallel
@@ -946,7 +946,7 @@ graph:
             action: dispatch_job
             assignee: x
             build_slot: true
-            spec: { profile: "@coder", harness: "opencode", task: "ARENA COMPILE ARM {{item}} (of {{inputs.arms}}): run the SAME brief on YOUR assigned model on the SCRATCH git ref in the PRIMARY TREE (no herdr worktree). Brief: {{inputs.question}}. One arm at a time under the build slot (toron slot acquire before any cargo): after implementing, MEASURE (build + test) and RESET the tree (git checkout base + clean) — arm {{item}} must leave no residue; the next arm starts only after your reset. No br, no .beads/ writes, no tracker writes. Report: model used, what you built, measurement, reset proof." }
+            spec: { profile: "@coder", harness: "opencode", task: "ARENA COMPILE ARM {{item}} (of {{inputs.arms}}): run the SAME brief on YOUR assigned model on the SCRATCH git ref in the PRIMARY TREE (no hc worktree). Brief: {{inputs.question}}. One arm at a time under the build slot (toron slot acquire before any cargo): after implementing, MEASURE (build + test) and RESET the tree (git checkout base + clean) — arm {{item}} must leave no residue; the next arm starts only after your reset. No br, no .beads/ writes, no tracker writes. Report: model used, what you built, measurement, reset proof." }
       else:
         - name: arm
           action: parallel

@@ -63,8 +63,8 @@ pub(crate) struct Setting {
 pub(crate) const SETTINGS: &[Setting] = &[
     Setting {
         key: "socket_path",
-        summary: "Path of the herdr control socket flywheel connects to.",
-        default_hint: "~/.config/herdr/herdr.sock",
+        summary: "Path of the hc control socket flywheel connects to.",
+        default_hint: "~/.config/hc/hc.sock",
     },
     Setting {
         key: "workspace_root",
@@ -93,8 +93,8 @@ pub(crate) const SETTINGS: &[Setting] = &[
     },
     Setting {
         key: "backend.multiplexer",
-        summary: "Who owns panes. herdr is the supported multiplexer.",
-        default_hint: "herdr",
+        summary: "Who owns panes. hc is the supported multiplexer.",
+        default_hint: "hc",
     },
     Setting {
         key: "backend.mail",
@@ -203,7 +203,7 @@ fn effective_setting(cfg: &Config, key: &str) -> String {
             .backend
             .as_ref()
             .map(|b| b.multiplexer.clone())
-            .unwrap_or_else(|| "herdr".into()),
+            .unwrap_or_else(|| "hc".into()),
         "backend.mail" => cfg
             .backend
             .as_ref()

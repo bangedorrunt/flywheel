@@ -73,7 +73,7 @@ pub fn rebind_hint(ev: &CaptainEvidence, heartbeat_fresh: bool) -> Option<String
 }
 
 /// bd-8pis: is a bound pane LIVE? A whois `pane_id` alone can lie (dead
-/// panes stay bound) — against a reachable herdr daemon the pane must be
+/// panes stay bound) — against a reachable hc daemon the pane must be
 /// in the live set; when the daemon is unreachable the binding is trusted
 /// (best-effort, never a warn storm from a down daemon). None pane_id is
 /// never live.
@@ -264,7 +264,7 @@ mod tests {
     /// bd-8pis: bound-but-dead panes warn; daemon-down trusts the
     /// binding; unbound never lives.
     #[test]
-    fn dead_pin_bound_pane_needs_live_herdr() {
+    fn dead_pin_bound_pane_needs_live_plane() {
         use std::collections::HashSet;
         let live: HashSet<String> = ["w1W:p2".to_string()].into_iter().collect();
         assert!(bound_pane_is_live(Some("w1W:p2"), Some(&live)));
@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn whois_fresh_cli_actor_is_not_stolen() {
-        // TealDune is the flywheel mail CLI actor — no herdr pane, not stale.
+        // TealDune is the flywheel mail CLI actor — no hc terminal, not stale.
         let mut e = ev(Some("TealDune"));
         e.presence_fresh = true;
         assert_eq!(

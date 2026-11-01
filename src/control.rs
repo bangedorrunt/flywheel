@@ -4,7 +4,7 @@
 //! `flywheel crew control <project> <pin> interrupt|exit|relaunch` is the
 //! whole surface: no arbitrary-text entry point, because text the worker
 //! reads is not a lifecycle verb (boundary-discipline). The pure decision
-//! layer lives here; the herdr glue stays in `main.rs`.
+//! layer lives here; the hc glue stays in `main.rs`.
 //!
 //! - **interrupt**: Escape only (kill-style keys stay off this plane,
 //!   bd-fw-interrupt-kills-agent-or3). Composer-empty is provable only when
@@ -197,7 +197,7 @@ mod tests {
         SpawnEntry::with_mail_identity("w1:p2", "flywheel-demo-oc2", "AmberFox")
     }
 
-    // ADR-0010 D7 (bd-w5fn) AC: marker round-trips through a herdr prompt (byte-checked) — the
+    // ADR-0010 D7 (bd-w5fn) AC: marker round-trips through an hc prompt (byte-checked) — the
     // body must survive prefixing + stripping byte-identical, including
     // newlines and a body that itself contains the tag.
     #[test]

@@ -38,7 +38,7 @@ pub(crate) enum ProfileCmd {
         /// short task hint
         #[arg(long)]
         task_hint: Option<String>,
-        /// backend trait impl (default herdr)
+        /// backend trait impl (default hc)
         #[arg(long)]
         backend: Option<String>,
         /// default workflow name

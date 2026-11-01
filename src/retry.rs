@@ -7,7 +7,7 @@
 //! shared outage. The draw is an input, never read here: [`host_draw`] is the
 //! one host entropy seam and tests inject their own.
 //!
-//! Boundary (bd-fa58): this driver is for LOCAL ipc only — herdr socket
+//! Boundary (bd-fa58): this driver is for LOCAL ipc only — hc socket
 //! re-reads, pane text primes, registry settles. Remote dispatch rides the
 //! framework's `policy::remote` (see `dispatch_policy` in pane.rs) and must
 //! never be "unified" onto this driver: a shared breaker or bulkhead across

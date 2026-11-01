@@ -1,7 +1,7 @@
 //! The doorbell's inbox as one framework program (ADR-0018 §3 item 3).
 //!
 //! `DoorbellModel` and `WakeModel` become ONE program: the doorbell's
-//! edges — a tick, a herdr event, a mail ingress — are MESSAGES, and they
+//! edges — a tick, an hc event, a mail ingress — are MESSAGES, and they
 //! never call the model. The fold is pure (no clock, no environment, no
 //! store, no randomness); the interpreter runs the commands at the edge; the
 //! framework's log and producer carry the durable identity
@@ -63,7 +63,7 @@ pub struct InboxModel {
 /// What enters the fold. Every edge is a message; nothing calls the model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InboxMsg {
-    /// A doorbell edge: the periodic tick, a herdr status change, a mail
+    /// A doorbell edge: the periodic tick, an hc status change, a mail
     /// ingress, a captain fact, or the watch child's death.
     Edge(DoorbellMsg),
     /// The router's input — already-resolved facts (presence word, route
@@ -521,7 +521,7 @@ mod tests {
         // message folds to the same model and the same commands the core
         // produces.
         let model = InboxModel::default();
-        let edge = DoorbellMsg::HerdrStatus {
+        let edge = DoorbellMsg::PlaneStatus {
             pin: "EmeraldSparrow".into(),
             status: "idle".into(),
         };
@@ -542,7 +542,7 @@ mod tests {
         // The live path (the workspace's doorbell slice) and the program
         // share ONE fold: same message, same model, same commands.
         let model = DoorbellModel::default();
-        let edge = DoorbellMsg::HerdrStatus {
+        let edge = DoorbellMsg::PlaneStatus {
             pin: "EmeraldSparrow".into(),
             status: "idle".into(),
         };
@@ -559,11 +559,11 @@ mod tests {
     #[test]
     fn the_same_message_log_folds_to_the_same_commands() {
         let log = [
-            InboxMsg::Edge(DoorbellMsg::HerdrStatus {
+            InboxMsg::Edge(DoorbellMsg::PlaneStatus {
                 pin: "EmeraldSparrow".into(),
                 status: "working".into(),
             }),
-            InboxMsg::Edge(DoorbellMsg::HerdrStatus {
+            InboxMsg::Edge(DoorbellMsg::PlaneStatus {
                 pin: "EmeraldSparrow".into(),
                 status: "idle".into(),
             }),

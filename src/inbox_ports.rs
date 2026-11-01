@@ -1,12 +1,12 @@
 // governed-by: ADR-0041
 //! The flywheel side of the Phase 3 inbox host: [`FlywheelPorts`] implements
 //! [`crate::inbox_host::Ports`] over the live machinery. This is the only
-//! place the wake path touches the store, herdr and the filesystem.
+//! place the wake path touches the store, hc and the filesystem.
 //!
 //! - observe: the spawn registry names the recipients; the in-process comms
 //!   store answers `head` and `cursor`; the selected backend's `pane.list`
 //!   gives the pane state and the `report_metadata` tokens the binding is
-//!   verified against (herdr today; other backends list but cannot stamp
+//!   verified against (hc today; other backends list but cannot stamp
 //!   tokens yet, so their bindings stay unverified).
 //! - ring: the closed [`crate::pane_write::PaneWrite::WakeLine`], by pane id.
 //!   Nothing else can reach a pane from here.
@@ -41,14 +41,14 @@ pub struct FlywheelPorts {
     workspace: String,
     store: Option<InboxStore>,
     npubs: BTreeMap<String, String>,
-    herdr_was_down: bool,
+    plane_was_down: bool,
     facts_seen: BTreeSet<String>,
     warned_store: bool,
     /// Unread urgency from the last `observe`, keyed by npub. `ring` reads it.
     urgencies: BTreeMap<String, Urgency>,
 }
 
-/// Pure: herdr's word to the wake rule's pane state.
+/// Pure: hc's word to the wake rule's pane state.
 pub fn pane_state(s: AgentStatus) -> PaneState {
     match s {
         AgentStatus::Idle => PaneState::Idle,
@@ -72,7 +72,7 @@ pub fn verify_tokens(
     let get = |k: &str| tokens.get(k).and_then(Value::as_str).unwrap_or("");
     Bind {
         pane_id: pane_id.to_string(),
-        herdr_session: session.to_string(),
+        plane_session: session.to_string(),
         verified: get(TOKEN_PIN) == pin && get(TOKEN_NPUB) == npub && !npub.is_empty(),
         verified_by: VERIFIED_BY.to_string(),
     }
@@ -80,17 +80,17 @@ pub fn verify_tokens(
 
 /// Which pane id arrive binds. Rex first: a set `REX_BLOCK` is the block
 /// this process is typing in. An empty or whitespace value is the same as
-/// unset, and only then does `HERDR_PANE_ID` apply. Both empty means there
+/// unset, and only then does `HC_TERMINAL_ID` apply. Both empty means there
 /// is no pane to push into.
 pub fn arrive_pane_from_env<'a>(
     rex_block: Option<&'a str>,
-    herdr_pane: Option<&'a str>,
+    plane_pane: Option<&'a str>,
 ) -> Option<&'a str> {
     let rex = rex_block.map(str::trim).filter(|s| !s.is_empty());
     if rex.is_some() {
         return rex;
     }
-    herdr_pane.map(str::trim).filter(|s| !s.is_empty())
+    plane_pane.map(str::trim).filter(|s| !s.is_empty())
 }
 
 /// A rex block id. The doorbell child often has no `REX_SESSION` of its
@@ -145,7 +145,7 @@ pub fn verify_rex_binding(
 ) -> Bind {
     Bind {
         pane_id: pane.pane_id.clone(),
-        herdr_session: pane.workspace_id.clone(),
+        plane_session: pane.workspace_id.clone(),
         verified: pane.label.as_deref() == Some(pin)
             && pane.workspace_id == session_id
             && !npub.is_empty(),
@@ -165,7 +165,7 @@ pub fn verify_rex_block(pane: &crate::hc_support::PaneInfo, pin: &str, npub: &st
         .is_some_and(|label| label != pin && looks_like_pin(label));
     Bind {
         pane_id: pane.pane_id.clone(),
-        herdr_session: pane.workspace_id.clone(),
+        plane_session: pane.workspace_id.clone(),
         verified: is_rex_block(&pane.pane_id) && !npub.is_empty() && !pin.is_empty() && !other_pin,
         verified_by: "rex-block".to_string(),
     }
@@ -200,7 +200,7 @@ impl FlywheelPorts {
             workspace: workspace.to_string(),
             store: None,
             npubs: BTreeMap::new(),
-            herdr_was_down: false,
+            plane_was_down: false,
             facts_seen: BTreeSet::new(),
             warned_store: false,
             urgencies: BTreeMap::new(),
@@ -298,7 +298,7 @@ impl FlywheelPorts {
         }
     }
 
-    /// The host's session id on a non-herdr backend (label→id; empty when
+    /// The host's session id on a non-hc backend (label→id; empty when
     /// unresolvable, which verifies nothing). Labels collide across
     /// sessions, ids do not.
     fn host_session_for(backend: &dyn MultiplexerBackend, workspace: &str) -> String {
@@ -327,11 +327,11 @@ impl FlywheelPorts {
             Some(p) => {
                 // Stamped panes verify through tokens on every backend; an
                 // unstamped pane verifies through the rex label binding off
-                // herdr, and stays unverified on herdr exactly as before.
+                // hc, and stays unverified on hc exactly as before.
                 // `host_session` is the session id the host serves (resolved
                 // from its label); empty resolves against nothing, so an
                 // unresolvable host verifies nothing.
-                let bind = if backend_name != "herdr" && !p.tokens.contains_key(TOKEN_PIN) {
+                let bind = if backend_name != "hc" && !p.tokens.contains_key(TOKEN_PIN) {
                     let by_label = verify_rex_binding(p, host_session, pin, npub);
                     if by_label.verified {
                         by_label
@@ -613,11 +613,11 @@ impl Ports for FlywheelPorts {
     fn observe(&mut self) -> Observation {
         self.urgencies.clear();
         let registry = crate::state::load_spawn_registry(&self.project);
-        // The selected backend lists panes; herdr keeps the direct client
+        // The selected backend lists panes; hc keeps the direct client
         // path. `up` tracks the selected backend's reachability (the field
         // keeps its name; the fold bumps the generation fence on any flap).
         let selected = crate::backend::resolve_backend_name(&self.cfg);
-        let (panes, up, host_session) = if selected == "herdr" {
+        let (panes, up, host_session) = if selected == "hc" {
             let client = self.client();
             let up = client.is_some();
             let panes = client
@@ -627,7 +627,7 @@ impl Ports for FlywheelPorts {
             // Token verification needs no session id.
             (panes, up, String::new())
         } else {
-            // Non-herdr backends: agent rows (classified status included),
+            // Non-hc backends: agent rows (classified status included),
             // projected onto the pane shape, plus the host's own session id
             // (resolved label→id; labels collide across sessions, ids do
             // not). `pane_list` leaves status Unknown by construction, which
@@ -648,8 +648,8 @@ impl Ports for FlywheelPorts {
                 None => (Vec::new(), false, String::new()),
             }
         };
-        let herdr_restarted = up && self.herdr_was_down;
-        self.herdr_was_down = !up;
+        let plane_restarted = up && self.plane_was_down;
+        self.plane_was_down = !up;
         let mut seen = Vec::new();
         for e in &registry {
             let Some(pin) = e.mail_identity.clone() else {
@@ -691,7 +691,7 @@ impl Ports for FlywheelPorts {
         }
         Observation {
             seen,
-            herdr_restarted,
+            plane_restarted,
         }
     }
 
@@ -701,7 +701,7 @@ impl Ports for FlywheelPorts {
         let e = registry
             .iter()
             .find(|e| e.mail_identity.as_deref() == Some(pin.as_str()))?;
-        if crate::backend::resolve_backend_name(&self.cfg) != "herdr" {
+        if crate::backend::resolve_backend_name(&self.cfg) != "hc" {
             let backend = crate::backend::multiplexer_backend(&self.cfg).ok()?;
             let p = backend
                 .agent_list()
@@ -752,12 +752,12 @@ impl Ports for FlywheelPorts {
             crate::harness_caps::wake_route(&kind, crate::harness_caps::installed_from_env());
         // The pane id picks the typer. A `block:` id is Rex even when this
         // process has no `REX_SESSION` (the doorbell child often does not).
-        // A herdr pane id stays on herdr. An empty `REX_BLOCK` at arrive is
-        // what left a herdr id here.
+        // An hc pane id stays on hc. An empty `REX_BLOCK` at arrive is
+        // what left an hc id here.
         if !is_rex_block(pane_id) {
-            let client = self.client().ok_or("herdr unreachable")?;
+            let client = self.client().ok_or("hc unreachable")?;
             return match ring_wake(
-                &crate::pane_write::HerdrPanes(&client),
+                &crate::pane_write::HcPanes(&client),
                 pane_id,
                 wm,
                 line,
@@ -856,7 +856,7 @@ impl Ports for FlywheelPorts {
         }
         let who = self.pin_of_npub(npub);
         let text = deaf_text(&who, wm, cause);
-        // The loud, unconditional leg: the captain surface herdr offers us
+        // The loud, unconditional leg: the captain surface hc offers us
         // is a pane, and that is the inbox wake; this line is for the log.
         eprintln!("flywheel inbox: CAPTAIN: {text}");
         let Some(cap) = crate::state::load_captain_alias(&self.project) else {
@@ -1220,7 +1220,7 @@ mod tests {
     /// The wake rule's pane reading, backend-agnostic: found panes fold
     /// status plus token binding; a missing pane is Gone only when the
     /// backend is up, never a false Gone on an unreachable backend.
-    /// Off herdr, an unstamped pane verifies through the rex label binding
+    /// Off hc, an unstamped pane verifies through the rex label binding
     /// (label plus session); a label or session mismatch stays unverified.
     #[test]
     fn pane_observation_folds_found_gone_and_unknown() {
@@ -1228,7 +1228,7 @@ mod tests {
         let npub = "npub1test";
         let panes = vec![listed_pane("w1:p1", AgentStatus::Working, pin, npub)];
         let (state, bind) =
-            FlywheelPorts::pane_observation(&panes, "w1:p1", true, pin, npub, "herdr", "w1");
+            FlywheelPorts::pane_observation(&panes, "w1:p1", true, pin, npub, "hc", "w1");
         assert_eq!(state, PaneState::Working);
         assert!(bind.is_some_and(|b| b.verified));
 
@@ -1238,19 +1238,19 @@ mod tests {
             true,
             pin,
             "npub1other",
-            "herdr",
+            "hc",
             "w1",
         );
         assert_eq!(state, PaneState::Working);
         assert!(bind.is_some_and(|b| !b.verified));
 
         let (state, bind) =
-            FlywheelPorts::pane_observation(&panes, "w1:p9", true, pin, npub, "herdr", "w1");
+            FlywheelPorts::pane_observation(&panes, "w1:p9", true, pin, npub, "hc", "w1");
         assert_eq!(state, PaneState::Gone);
         assert_eq!(bind, None);
 
         let (state, bind) =
-            FlywheelPorts::pane_observation(&panes, "w1:p9", false, pin, npub, "herdr", "w1");
+            FlywheelPorts::pane_observation(&panes, "w1:p9", false, pin, npub, "hc", "w1");
         assert_eq!(state, PaneState::Unknown);
         assert_eq!(bind, None);
     }

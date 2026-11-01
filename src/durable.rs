@@ -15,11 +15,11 @@
 // `loop status` + the fleet snapshot (delivery-verdict ADR-0010 D10).
 //!
 //! Leaves shell out to the flywheel binary itself (`__poll` / `__poll_events` /
-//! `__send` hidden subcommands) so the blocking herdr socket client never runs
+//! `__send` hidden subcommands) so the blocking hc socket client never runs
 //! on the async executor and each side effect is a single crash-safe process.
 //!
 //! **Event stream (bd-event-subscribe-reactor):** `__poll_events` is a forward-
-//! only latency optimization. herdr has no since/seq replay. The heartbeat
+//! only latency optimization. hc has no since/seq replay. The heartbeat
 //! `__poll` (agent.list snapshot) is the correctness floor on every iteration
 //! and after crash-resume.
 //!
@@ -331,7 +331,7 @@ pub struct LoopModel {
     pub heal_threshold: u32,
     #[serde(default)]
     pub heal_budget: u32,
-    /// Herdr events buffered by `LoopMsg::Herdr` (bd-ugd1); drained on the
+    /// Hc events buffered by `LoopMsg::Hc` (bd-ugd1); drained on the
     /// next Tick through apply_events_to_states + route decisions.
     pub pending_events: Vec<PollEvent>,
     /// Double-dispatch guard (bd-nsb3 fold): names dispatched via the event
@@ -344,7 +344,7 @@ pub struct LoopModel {
     #[serde(default)]
     pub states: Vec<AgentState>,
     /// Graceful drain-stop (bd-zfnx.10): agents asked to finish their
-    /// VERIFY fence before a kill, keyed by herdr name. Tick owns the
+    /// VERIFY fence before a kill, keyed by terminal name. Tick owns the
     /// countdown; Heal-exit fulfills; Tick-expiry force-stops.
     #[serde(default)]
     pub drain_pending: std::collections::BTreeMap<String, DrainState>,
@@ -466,7 +466,7 @@ pub struct PausedWait {
 pub const DRAIN_GRACE_POLLS: u32 = 3;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum LoopMsg {
-    Herdr(PollEvent),
+    Hc(PollEvent),
     BrClose {
         bead_id: String,
     },
@@ -577,7 +577,7 @@ impl LoopSnapshot {
 pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
     let mut next = model.clone();
     let mut actions = Vec::new();
-    // Pure, total, deterministic: no I/O, no &mut, no br/herdr calls
+    // Pure, total, deterministic: no I/O, no &mut, no br/hc calls
     // Queue pop lives in model' where it is visible and replayable
     match msg {
         LoopMsg::Dispatch {
@@ -637,7 +637,7 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
                 actions.push(LoopAction::Reclaim {
                     bead_id: bead_id.clone(),
                     pin: claimant_pin.clone(),
-                    herdr_name: bead_id.clone(),
+                    terminal_name: bead_id.clone(),
                     reason: "reclaim".to_string(),
                 });
             }
@@ -817,7 +817,7 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
                     let brief = next.queue.remove(0);
                     let agent = next.states[i].name.clone();
                     // {AGENT_NAME} is the pin when the state knows it, else
-                    // the herdr name (bd-pin-public-plane-s-easy.2 — same as
+                    // the hc name (bd-pin-public-plane-s-easy.2 — same as
                     // plan_actions / route_event).
                     let pin = next.states[i]
                         .mail_identity
@@ -837,8 +837,8 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
                 }
             }
         }
-        LoopMsg::Herdr(pe) => {
-            // Herdr events buffer into Model and are drained/applied on the
+        LoopMsg::Hc(pe) => {
+            // Hc events buffer into Model and are drained/applied on the
             // next Tick (single-apply via Model.states, bd-p1ds).
             next.pending_events.push(pe.clone());
         }
@@ -896,19 +896,19 @@ fn default_active_interval() -> u64 {
 pub struct AgentState {
     pub name: String,
     pub status: String,
-    /// herdr agent kind (`opencode`/`pi`/...). Learned from polls; used to
-    /// respawn an agent whose herdr record has been dropped (the escalation
+    /// hc agent kind (`opencode`/`pi`/...). Learned from polls; used to
+    /// respawn an agent whose hc record has been dropped (the escalation
     /// path cannot poll_kind a gone record). `#[serde(default)]` so
     /// checkpoints written before this field existed still resume.
     #[serde(default)]
     pub kind: String,
-    /// herdr pane id — required to map push events → agent name
+    /// hc terminal id — required to map push events → agent name
     /// (bd-event-dispatch-zero-latency). `#[serde(default)]` for old polls.
     #[serde(default)]
     pub pane_id: String,
     /// the agent's mail PIN (adjective+noun) — populated by `__poll` from
     /// the spawn registry so `{AGENT_NAME}` substitutes the pin, not the
-    /// herdr slug (bd-pin-public-plane-s-easy.2). `#[serde(default)]` for
+    /// hc slug (bd-pin-public-plane-s-easy.2). `#[serde(default)]` for
     /// checkpoints written before this field existed.
     #[serde(default)]
     pub mail_identity: Option<String>,
@@ -2314,7 +2314,7 @@ fn default_xproj_limit() -> u32 {
 /// message attributes. `urgent` is the wake trigger.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MailDigest {
-    /// the herdr agent name — the loop's digest-map key (plan_actions looks
+    /// the hc agent name — the loop's digest-map key (plan_actions looks
     /// digests up by the agent state name)
     pub agent: String,
     /// S8.1: the REGISTERED mail identity this agent fetches as (the
@@ -2512,7 +2512,7 @@ pub enum DeadStopKind {
 pub struct DeadStopInputs {
     /// any bead not closed/done (ready or in_progress)
     pub work_remaining: bool,
-    /// herdr pins were readable. False → the fleet is UNKNOWABLE; never alarm
+    /// plane pins were readable. False → the fleet is UNKNOWABLE; never alarm
     /// blind (a degraded read is neither calm nor a stall).
     pub fleet_knowable: bool,
     pub any_pane_working: bool,
@@ -2594,12 +2594,12 @@ pub fn parked_error_line(recent_output: &str) -> Option<String> {
 }
 
 /// One pane's wedge evidence. Pure inputs so the verdict is testable without a
-/// live fleet, a herdr socket, or a clock.
+/// live fleet, an hc socket, or a clock.
 #[derive(Debug, Clone)]
 pub struct PaneWedgeInputs<'a> {
     pub pin: &'a str,
     pub pane_id: &'a str,
-    /// herdr's process probe: `Some(true)` = the agent process is ALIVE — the
+    /// hc's process probe: `Some(true)` = the agent process is ALIVE — the
     /// wedge shape (a pane whose process exited is `recover`'s job, never this
     /// probe's); `None` = inconclusive, never judged.
     pub process_alive: Option<bool>,
@@ -2632,7 +2632,7 @@ pub enum PaneWedgeAction {
 /// bd-pane-wedge-detect-respawn-pnyi: is this pane WEDGED — alive but making
 /// no progress because it is parked on a fatal error?
 ///
-/// The bead asks for "zero-CPU plus error output". herdr exposes no CPU
+/// The bead asks for "zero-CPU plus error output". hc exposes no CPU
 /// counter (`pane.process_info` lists processes only), so the observable
 /// equivalent is used and named honestly: the agent process is still UP (a
 /// dead one is `recover`'s job) AND the newest commit is older than the
@@ -2699,7 +2699,7 @@ async fn poll_swarm(args: PollArgs) -> Result<Vec<AgentState>> {
     Ok(out_states)
 }
 
-/// Collect herdr push events for up to `timeout_ms` (forward-only).
+/// Collect hc push events for up to `timeout_ms` (forward-only).
 /// Checkpointed. Empty batch on stream failure is a soft outcome (the
 /// heartbeat `__poll` remains the correctness floor).
 #[function]
@@ -2989,7 +2989,7 @@ fn parse_reply_check(v: &serde_json::Value) -> (Option<String>, Option<String>) 
 /// old lifecycle prose. The state-file contract (bd-prompt-state-file) tells
 /// the agent to write `.flywheel/agent-state/{AGENT_NAME}.json` when context
 /// is high; the `{AGENT_NAME}` placeholder is substituted with the receiving
-/// agent's herdr name at dispatch time (plan_actions) so the agent never
+/// agent's terminal name at dispatch time (plan_actions) so the agent never
 /// guesses the filename. `context_pct` < 80 is ignored by the READER
 /// (bd-read-state-fallback) — the threshold lives there, not here.
 /// Hard cap on the dispatched prompt (behavior + skills prefix + brief).
@@ -4161,7 +4161,7 @@ pub struct SendOutcome {
     pub status: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
-    /// true when __send skipped the herdr call because a landed record for
+    /// true when __send skipped the hc call because a landed record for
     /// this (name, prompt, invocation) already exists (resume-dedup)
     #[serde(default)]
     pub deduped: bool,
@@ -5293,7 +5293,7 @@ where
         };
         out.push(IngressEvent::PaneStalled {
             pane_id: state.pane_id.clone(),
-            herdr_name: state.name.clone(),
+            terminal_name: state.name.clone(),
             last_status: state.status.clone(),
             bead_id: Some(bead.id.clone()),
             reason,
@@ -5345,7 +5345,7 @@ fn emit_lease_lapsed(
 /// Pure planning: given current states, decide actions and drain the queue.
 /// Deterministic dispatch plan for one poll: working agents wait, blocked
 /// agents report, idle/done agents get the next queue item (or a nudge, or
-/// wait). `unknown` is NOT dispatchable by design: herdr cannot classify its
+/// wait). `unknown` is NOT dispatchable by design: hc cannot classify its
 /// lifecycle confidently — a prompt could land in a half-dead session and be
 /// silently lost. Unknown agents get `Wait` and never consume the queue.
 ///
@@ -5415,7 +5415,7 @@ pub enum LoopAction {
     Reclaim {
         bead_id: String,
         pin: String,
-        herdr_name: String,
+        terminal_name: String,
         reason: String,
     },
     /// bd-bpd9: the graph vehicle spawns a detached pane-mode engine run at
@@ -5458,7 +5458,7 @@ async fn poll_context_inbox(args: ContextInboxArgs) -> Result<Vec<crate::XprojIn
 }
 
 /// Map a CONTEXT_LIMIT sender to the crew agent it saturates: MAIL PIN
-/// first (the identity the contract addresses), then the bare herdr name.
+/// first (the identity the contract addresses), then the bare terminal name.
 /// An unknown sender maps to NOTHING — a human pasting the marker into a
 /// reply must never respawn an agent.
 pub fn context_limit_target(from: &str, states: &[AgentState]) -> Option<String> {
@@ -5617,7 +5617,7 @@ pub enum WaitReason {
 /// One dispatched bead's claim-watch entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimWatch {
-    /// the agent the bead prompt was dispatched to (herdr name)
+    /// the agent the bead prompt was dispatched to (terminal name)
     pub agent: String,
     /// consecutive polls the bead has stayed UNCLAIMED (still in `br ready`)
     /// while the dispatched agent is engaged
@@ -5782,7 +5782,7 @@ pub fn drain_prompt(bead_id: &str) -> String {
 /// REDISPATCH arms (Bead/Resume) are suppressed while a live lease exists —
 /// the reserve-before-work lifecycle makes the lease the durable "work is
 /// taken" record, visible even when the angle's mail is silent or its pane
-/// is a non-herdr harness that `states` cannot see. The tracker nudges
+/// is a non-hc harness that `states` cannot see. The tracker nudges
 /// (claim/close) still fire: they target the bead's own lane, never a
 /// second executor. Consultation order: live lease → assignee pane state →
 /// mail guard (the dispatch scan the loop runs on redispatch).
@@ -6029,7 +6029,7 @@ pub fn plan_actions_with_live_owned(
                 // bead/resume prompts carry a {AGENT_NAME} placeholder —
                 // substitute the receiving agent's mail PIN (the
                 // identity it is addressed by; bd-pin-public-plane-s-easy.2),
-                // falling back to the herdr name when no pin is known
+                // falling back to the hc name when no pin is known
                 let pin = s.mail_identity.clone().unwrap_or_else(|| s.name.clone());
                 let take = pending
                     .iter()
@@ -6103,7 +6103,7 @@ pub fn plan_actions_with_live_owned(
     actions
 }
 
-/// Resolve agent herdr name for a pane id from the latest poll snapshot.
+/// Resolve agent terminal name for a pane id from the latest poll snapshot.
 pub fn name_for_pane(states: &[AgentState], pane_id: &str) -> Option<String> {
     if pane_id.is_empty() {
         return None;
@@ -6118,13 +6118,13 @@ pub fn name_for_pane(states: &[AgentState], pane_id: &str) -> Option<String> {
 /// `agent.list` snapshot runs every this-many iterations when the event
 /// stream is healthy. Between snapshots the event stream asserts status
 /// changes ([`apply_events_to_states`]); the snapshot confirms. The FIRST
-/// iteration after crash-resume always snapshots (herdr has no since/seq
+/// iteration after crash-resume always snapshots (hc has no since/seq
 /// replay) — the correctness floor is never skipped.
 pub const HEARTBEAT_POLL_EVERY: u64 = 5;
 
 /// Snapshot-due policy (bd-w4-events-primary-gt0e): the authoritative
 /// `agent.list` snapshot runs when the loop has no state (crash-resume /
-/// first iteration — herdr has no since/seq replay, so the floor always
+/// first iteration — hc has no since/seq replay, so the floor always
 /// runs first), when the event stream errored (fallback), or at the
 /// heartbeat cadence (poll confirms what events asserted).
 pub fn snapshot_due(states_empty: bool, stream_error: bool, since_snapshot: u64) -> bool {
@@ -6200,7 +6200,7 @@ pub fn all_settled(states: &[AgentState]) -> bool {
 }
 
 /// Stranded-bead detection (bd-627z.1, bd-qk9q): an in_progress bead whose
-/// assignee is NOT a live swarm agent is stranded. Live = the herdr agent
+/// assignee is NOT a live swarm agent is stranded. Live = the hc agent
 /// names polled this tick (captain, dead agents, and unknown identities are
 /// NOT live — their beads would stall the batch forever).
 ///
@@ -6252,13 +6252,13 @@ pub fn blocking_inprogress<'a>(
 /// by the `__reclaim-stranded` leaf. The decision itself is pure — it only
 /// reads these sets (bd-reclaim-liveness-not-spelling-hn8b).
 pub struct ReclaimWorld<'a> {
-    /// Every name a LIVE pane answers to: the polled herdr names the loop
+    /// Every name a LIVE pane answers to: the polled terminal names the loop
     /// passed, plus each registry row's `name` and `mail_identity` when its
     /// pane is still listed.
     pub live_identities: &'a std::collections::HashSet<String>,
     /// Spawn-registry rows, used to resolve an assignee spelling to its pane.
     pub registry: &'a [crate::state::SpawnEntry],
-    /// Pane ids herdr lists right now.
+    /// Pane ids hc lists right now.
     pub live_panes: &'a std::collections::HashSet<String>,
     /// Bead ids carrying a live reservation; the lease is proof of life.
     pub leased_beads: &'a std::collections::HashSet<String>,
@@ -6269,7 +6269,7 @@ pub struct ReclaimWorld<'a> {
 pub enum ReclaimReason {
     /// No assignee and no lease — nobody holds it (bd-qk9q).
     Unowned,
-    /// The assignee resolves to a registry pane herdr no longer lists.
+    /// The assignee resolves to a registry pane hc no longer lists.
     DeadPane,
 }
 
@@ -6278,7 +6278,7 @@ pub enum ReclaimReason {
 pub enum ReclaimHold {
     /// A live reservation for the bead itself (reason = bead id).
     LiveLease,
-    /// The assignee resolves to a pane herdr lists right now.
+    /// The assignee resolves to a pane hc lists right now.
     LivePane,
     /// No pane evidence either way — never race an unproven-dead worker.
     UnknownIdentity,
@@ -6314,10 +6314,10 @@ pub enum ReclaimDecision {
 /// evidence proves the worker cannot be on it.
 ///
 /// The old predicate compared the assignee SPELLING against a name list, so a
-/// live claim written under any other name for the same agent (herdr slug vs
+/// live claim written under any other name for the same agent (hc slug vs
 /// pin vs registry row) read as stranded and got re-opened mid-work — racing
 /// the worker and resetting its claim every poll. This resolves the assignee
-/// through the registry to its pane and asks herdr. Kept under any of these
+/// through the registry to its pane and asks hc. Kept under any of these
 /// proofs, in order: live lease on the bead, the assignee matches a live
 /// identity, or the assignee resolves to a live pane. An unresolvable spelling
 /// is KEPT: absence of evidence is not evidence of death.
@@ -6372,9 +6372,9 @@ pub fn reclaim_decision(
 ///
 /// `pending_work` (bd-bvwf.2 — detection-retry): work is queued but NO agent
 /// is classified (all `unknown`, or the swarm is empty — a freshly spawned
-/// crew is not yet in herdr's agent.list). The first poll after a fresh spawn
+/// crew is not yet in hc's agent.list). The first poll after a fresh spawn
 /// otherwise sees an empty/unknown swarm and falls to `base_secs`, stranding
-/// the first bead for a full settled interval while herdr identifies the
+/// the first bead for a full settled interval while hc identifies the
 /// panes. With pending work and nothing classified, the loop re-polls on the
 /// ACTIVE cadence until detection completes.
 ///
@@ -6388,7 +6388,7 @@ pub fn reclaim_decision(
 /// and the (also deterministic) action plan.
 ///
 /// Follow-up idea (do NOT build here): a future redesign could wake the loop
-/// on herdr status events via a Resonate external promise — event-driven
+/// on hc status events via a Resonate external promise — event-driven
 /// instead of polled. Requires an event listener with its own durability.
 pub fn next_interval_secs(
     states: &[AgentState],
@@ -6499,7 +6499,7 @@ pub fn handle_send_result(
 
 /// Pure proof-of-life reset: agents showing `working` or `blocked` in the
 /// poll are receiving prompts — drop their failure history. Agents absent
-/// from the poll (herdr dropped them) or `unknown` keep their counters.
+/// from the poll (hc dropped them) or `unknown` keep their counters.
 pub fn clear_live_failures(
     failures: &mut std::collections::HashMap<String, u64>,
     states: &[AgentState],
@@ -6579,7 +6579,7 @@ pub const DEFAULT_UNKNOWN_DIAGNOSE_THRESHOLD: u32 = 3;
 pub const DEFAULT_RESPAWN_BUDGET: u32 = 2;
 
 /// Consecutive `unknown` polls treated as DETECTION GRACE (bd-bvwf.5).
-/// Default 6 (~3min at the 30s active cadence — herdr takes 30-60s to
+/// Default 6 (~3min at the 30s active cadence — hc takes 30-60s to
 /// classify a fresh pane): an unknown agent younger than this is presumed
 /// detecting, never Diagnosed or Respawnd. A genuinely dead pane is caught
 /// by the `pane.exited` event (immediate ladder) or by grace exhaustion.
@@ -6770,7 +6770,7 @@ pub fn plan_reclaim_with_policy(
     for b in beads {
         if stale_reclaim_due_with_policy(b, now_secs, panes, &ext_res, None, None, &[], policy) {
             let pin = b.assignee.clone().unwrap_or_default();
-            let herdr_name = panes
+            let terminal_name = panes
                 .iter()
                 .find(|p| p.name == pin)
                 .map(|p| p.name.clone())
@@ -6778,7 +6778,7 @@ pub fn plan_reclaim_with_policy(
             out.push(LoopAction::Reclaim {
                 bead_id: b.id.clone(),
                 pin: pin.clone(),
-                herdr_name,
+                terminal_name,
                 reason: "stale".to_string(),
             });
         }
@@ -6821,7 +6821,7 @@ pub fn plan_reclaim_ex(
             dirty_files,
         ) {
             let pin = b.assignee.clone().unwrap_or_default();
-            let herdr_name = panes
+            let terminal_name = panes
                 .iter()
                 .find(|p| p.name == pin)
                 .map(|p| p.name.clone())
@@ -6829,7 +6829,7 @@ pub fn plan_reclaim_ex(
             out.push(LoopAction::Reclaim {
                 bead_id: b.id.clone(),
                 pin: pin.clone(),
-                herdr_name,
+                terminal_name,
                 reason: "stale".to_string(),
             });
         }
@@ -6856,7 +6856,7 @@ pub fn reclaim_on_pane_exited(
     Some(LoopAction::Reclaim {
         bead_id: bead.id.clone(),
         pin: assignee.to_string(),
-        herdr_name: exited_name.to_string(),
+        terminal_name: exited_name.to_string(),
         reason: "pane_exited".to_string(),
     })
 }
@@ -6865,7 +6865,7 @@ pub struct ReclaimBeadArgs {
     pub project: String,
     pub bead_id: String,
     pub pin: String,
-    pub herdr_name: String,
+    pub terminal_name: String,
     pub reason: String,
 }
 #[function]
@@ -6899,8 +6899,8 @@ async fn reclaim_bead(args: ReclaimBeadArgs) -> Result<Value> {
         }
     };
     let evidence = format!(
-        "reclaim: previous in_progress claim appears abandoned; evidence: pin={}, herdr={}, reason={}, updated_at stale or pane_exited",
-        args.pin, args.herdr_name, args.reason
+        "reclaim: previous in_progress claim appears abandoned; evidence: pin={}, hc={}, reason={}, updated_at stale or pane_exited",
+        args.pin, args.terminal_name, args.reason
     );
     let project_dir = {
         let p = std::path::Path::new(&args.project);
@@ -7150,7 +7150,7 @@ async fn respawn_and_requeue(
         )
         .await
     {
-        // cg6.2: herdr hiccup during respawn must not kill the loop — the
+        // cg6.2: hc hiccup during respawn must not kill the loop — the
         // prompt is NOT requeued (the respawn may not have happened; the
         // next poll re-evaluates the agent's state).
         eprintln!("flywheel: respawn_agent leaf failed for {name} (continuing): {e}");
@@ -7167,8 +7167,8 @@ async fn respawn_and_requeue(
 /// ## Leaf-error policy (cg6.2)
 /// Leaf errors NEVER abort the loop. Every `ctx.run(...)` outcome below is
 /// converted to a soft default (logged via eprintln; the next poll is the
-/// correctness floor). A transient herdr/mail hiccup — an agent exiting
-/// between poll and read, herdr briefly down during a respawn, a daemon
+/// correctness floor). A transient hc/mail hiccup — an agent exiting
+/// between poll and read, hc briefly down during a respawn, a daemon
 /// blip on notify — degrades that tick, never kills the run. Genuinely
 /// fatal conditions (config errors, Resonate unreachable) live OUTSIDE the
 /// leaf boundary and still hard-fail.
@@ -7182,7 +7182,7 @@ async fn respawn_and_requeue(
 /// a crash-isolation replacement.
 ///
 /// bd-aseq: match an expected-reply key (the MAIL identity collab stored at
-/// send time) back to a swarm state. Priority: direct herdr name → the
+/// send time) back to a swarm state. Priority: direct terminal name → the
 /// state's pinned `mail_identity` → the spawn-registry pin → the legacy
 /// hash mapping. Pure.
 fn match_expected_agent<'a>(
@@ -7326,7 +7326,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // the checkpointed leaf results (poll states + send outcomes).
     let mut send_failures: std::collections::HashMap<String, u64> =
         std::collections::HashMap::new();
-    // per-agent herdr kind learned from polls — needed to respawn an agent
+    // per-agent hc kind learned from polls — needed to respawn an agent
     // whose record has been dropped (the escalation path).
     let mut agent_kinds: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -7444,7 +7444,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // snapshots the event stream asserts status changes
     // (apply_events_to_states) and the snapshot confirms
     // (snapshot_due: no state / stream error / cadence boundary). The first
-    // iteration after crash-resume ALWAYS snapshots — herdr has no since/seq
+    // iteration after crash-resume ALWAYS snapshots — hc has no since/seq
     // replay, so the correctness floor is never skipped.
     let mut states: Vec<AgentState> = Vec::new();
     let mut since_snapshot: u64 = 0;
@@ -7523,7 +7523,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // DEMOTED to the heartbeat cadence (bd-w4-events-primary-gt0e):
         // events assert status changes between snapshots
         // (apply_events_to_states below); the snapshot CONFIRMS at the
-        // heartbeat cadence, after crash-resume (no state yet — herdr has no
+        // heartbeat cadence, after crash-resume (no state yet — hc has no
         // since/seq replay, so the first iteration always snapshots), and as
         // the fallback when the event stream errored. The floor is never
         // skipped; it just stops running every iteration.
@@ -7568,7 +7568,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 }
                 Err(e) => {
                     // cg6.2: the correctness floor must not be a crash point —
-                    // a transient herdr failure yields an empty snapshot; the
+                    // a transient hc failure yields an empty snapshot; the
                     // next tick re-polls. bd-87hq: flag for the completion gate.
                     critical_leaf_failed_this_iter = true;
                     eprintln!(
@@ -8859,8 +8859,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         for pe in &event_batch.events {
             poll_actions.extend(fold(
                 &mut swarm,
-                crate::workspace::Msg::Herdr { event: pe.clone() },
-                LoopMsg::Herdr(pe.clone()),
+                crate::workspace::Msg::Hc { event: pe.clone() },
+                LoopMsg::Hc(pe.clone()),
             ));
         }
         // ADR-0010 D4/D12 producer: a drained pane may DECLARE a wait on a
@@ -8961,7 +8961,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             if let LoopAction::Reclaim {
                 bead_id,
                 pin,
-                herdr_name,
+                terminal_name,
                 reason,
             } = act
             {
@@ -8976,7 +8976,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     crate::workspace::Msg::Reclaim {
                         bead_id,
                         holder_pin: pin.clone(),
-                        claimant_pin: herdr_name,
+                        claimant_pin: terminal_name,
                         is_live: false,
                         reason,
                     },
@@ -9120,7 +9120,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         let mut escalate_names: Vec<String> = Vec::new();
         for (key, exp) in &mut expected_replies {
             // The file stores the MAIL identity (collab resolved it); the
-            // swarm states use herdr names — map one to the other so the
+            // swarm states use terminal names — map one to the other so the
             // settle check, the thread check, and the reminder target agree.
             // bd-aseq: match through the pinned identity (state field or
             // spawn registry), never the bare hash mapping alone.
@@ -9129,23 +9129,23 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             let Some(matched) = match_expected_agent(&params.project, &states, &agent) else {
                 continue; // agent not in this swarm (or expectation stale)
             };
-            let herdr_name = matched.name.clone();
-            if dispatch_pending.contains(&herdr_name) {
+            let terminal_name = matched.name.clone();
+            if dispatch_pending.contains(&terminal_name) {
                 continue; // just dispatched this iteration — give it time
             }
             let settled = states
                 .iter()
-                .any(|s| s.name == herdr_name && matches!(s.status.as_str(), "idle" | "done"));
+                .any(|s| s.name == terminal_name && matches!(s.status.as_str(), "idle" | "done"));
             if !settled {
                 continue; // working/blocked/unknown — not settled yet
             }
             let (newest_id, author) = match crate::elm::leaf::run_leaf_journaled(
                 &params.project,
                 "__check-reply",
-                &[&params.project, &herdr_name, &exp.thread],
+                &[&params.project, &terminal_name, &exp.thread],
                 &format!(
                     "check-reply:{}:{}:{}",
-                    params.project, herdr_name, exp.thread
+                    params.project, terminal_name, exp.thread
                 ),
             ) {
                 Ok(v) => parse_reply_check(&v),
@@ -9155,10 +9155,10 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 }
             };
             // The thread head reports the MAIL identity (CalmGate), not the
-            // herdr name — verify against the resolved identity. bd-aseq:
+            // terminal name — verify against the resolved identity. bd-aseq:
             // prefer the state's pinned identity; registry pin, then hash.
             let mail_name = matched.mail_identity.clone().unwrap_or_else(|| {
-                crate::resolve_mail_target_registry(&params.project, &herdr_name)
+                crate::resolve_mail_target_registry(&params.project, &terminal_name)
             });
             match verify_reply(
                 exp.head.as_deref(),
@@ -9174,7 +9174,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     );
                     // checkpointed cleanup: drop the (agent, thread)
                     // expectation so it stops keeping the loop alive. The
-                    // file keys by the MAIL identity (agent), not the herdr
+                    // file keys by the MAIL identity (agent), not the hc
                     // name — pass the file key.
                     let _ = crate::elm::leaf::run_leaf_journaled(
                         &params.project,
@@ -9190,7 +9190,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 ReplyVerdict::Reminded => {
                     let remind_args = RemindArgs {
                         project: params.project.clone(),
-                        name: herdr_name.clone(),
+                        name: terminal_name.clone(),
                         thread: exp.thread.clone(),
                         reminder_count: exp.reminder_count,
                         invocation: params.invocation.clone(),
@@ -9204,7 +9204,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         &remind_refs[1..],
                         &format!(
                             "remind-reply:{}:{}:{}:{}",
-                            params.project, herdr_name, exp.thread, exp.reminder_count
+                            params.project, terminal_name, exp.thread, exp.reminder_count
                         ),
                     ); // leaf logs ReplyMissing + sends; errors logged inside
                     exp.reminder_count = 1;
@@ -9213,7 +9213,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     // hand the silent agent to the existing blocked-escalation
                     // path (notify_blocked → T0-T3) — a missing reply is a
                     // form of block.
-                    escalate_names.push(herdr_name.clone());
+                    escalate_names.push(terminal_name.clone());
                 }
             }
         }
@@ -9360,7 +9360,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         },
                     };
                     clear_dispatch_pending(&mut dispatch_pending, name, outcome.landed);
-                    // resume-dedup: __send skipped the herdr call because this
+                    // resume-dedup: __send skipped the hc call because this
                     // prompt already landed for this invocation (is1.4: the
                     // SkippedDup event is logged INSIDE the send_prompt leaf —
                     // checkpointed; the landed handling below resets the
@@ -9749,7 +9749,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 LoopAction::Reclaim {
                     bead_id,
                     pin,
-                    herdr_name,
+                    terminal_name,
                     reason,
                 } => {
                     let _ = ctx
@@ -9759,7 +9759,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                 project: params.project.clone(),
                                 bead_id: bead_id.clone(),
                                 pin: pin.clone(),
-                                herdr_name: herdr_name.clone(),
+                                terminal_name: terminal_name.clone(),
                                 reason: reason.clone(),
                             },
                         )
@@ -10601,7 +10601,7 @@ pub fn route_event(
                     }
                     let text = queue.remove(0);
                     // bd-pin-public-plane-s-easy.2: {AGENT_NAME} is the pin
-                    // when the state knows it, else the herdr name.
+                    // when the state knows it, else the hc name.
                     let display = states
                         .iter()
                         .find(|s| s.name == name)
@@ -11241,7 +11241,7 @@ mod tests {
             st_pin("flywheel-aseq-oc2", "idle", "TanFern"),
             st("flywheel-aseq-oc", "done"),
         ];
-        // direct herdr name still matches
+        // direct terminal name still matches
         assert_eq!(
             match_expected_agent("p", &states, "flywheel-aseq-oc").map(|s| s.name.as_str()),
             Some("flywheel-aseq-oc")
@@ -11565,7 +11565,7 @@ mod tests {
     }
 
     /// bd-context-limit-honor-luqg: a CONTEXT_LIMIT sender maps to the crew
-    /// agent by MAIL PIN first, then herdr name; an unknown sender maps to
+    /// agent by MAIL PIN first, then terminal name; an unknown sender maps to
     /// nothing (a human pasting the marker must never trigger a respawn).
     #[test]
     fn context_limit_target_maps_pin_then_name_never_strangers() {
@@ -11587,7 +11587,7 @@ mod tests {
         assert_eq!(
             context_limit_target("oc2", &states).as_deref(),
             Some("oc2"),
-            "bare herdr name matches itself"
+            "bare terminal name matches itself"
         );
         assert_eq!(context_limit_target("StrangerPin", &states), None);
         assert_eq!(context_limit_target("", &states), None);
@@ -11979,9 +11979,9 @@ mod tests {
             live_panes: &live_panes,
             leased_beads: &leased,
         };
-        // live pane + herdr-name assignee -> keep
+        // live pane + hc-name assignee -> keep
         assert_eq!(
-            reclaim_decision("bd-herdr", Some("crew-x-coder"), &world),
+            reclaim_decision("bd-hc", Some("crew-x-coder"), &world),
             ReclaimDecision::Keep {
                 reason: ReclaimHold::LivePane
             }
@@ -12060,12 +12060,12 @@ mod tests {
     }
 
     /// bd-bvwf.2 detection-retry: pending work + NO classified agent (empty
-    /// or all-unknown swarm — a freshly spawned crew herdr has not identified
+    /// or all-unknown swarm — a freshly spawned crew hc has not identified
     /// yet) → ACTIVE cadence, so the loop re-polls in ~30s instead of the
     /// settled 300s and dispatches the moment detection completes.
     #[test]
     fn next_interval_pending_work_with_unclassified_swarm_is_active() {
-        // empty poll (agents not yet in herdr's agent.list)
+        // empty poll (agents not yet in hc's agent.list)
         let empty = vec![];
         assert_eq!(next_interval_secs(&empty, false, true, 300, 30), 30);
         // all-unknown poll
@@ -12291,7 +12291,7 @@ mod tests {
 
     #[test]
     fn clear_live_failures_keeps_absent_and_unknown() {
-        // an agent missing from the poll (herdr dropped it) or unknown keeps
+        // an agent missing from the poll (hc dropped it) or unknown keeps
         // its counter — no proof of life
         let mut f: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         f.insert("gone".to_string(), 1);
@@ -12756,7 +12756,7 @@ mod tests {
     }
 
     /// bd-pin-public-plane-s-easy.2: {AGENT_NAME} in the brief substitutes
-    /// the agent's mail PIN, never the herdr slug — the state-file path and
+    /// the agent's mail PIN, never the hc slug — the state-file path and
     /// br claim actor must match the identity the agent is addressed by.
     #[test]
     fn plan_actions_substitutes_pin_not_slug() {
@@ -12795,7 +12795,7 @@ mod tests {
         );
         match &actions[1] {
             LoopAction::Send { name, text } => {
-                assert_eq!(name, "flywheel-proj-oc", "send target stays the herdr name");
+                assert_eq!(name, "flywheel-proj-oc", "send target stays the hc name");
                 assert!(
                     text.contains(".flywheel/agent-state/DustySparrow.json"),
                     "state-file path uses the pin: {text}"
@@ -12987,11 +12987,11 @@ mod tests {
         assert!(matches!(&actions[1], LoopAction::Send { .. }));
     }
 
-    /// No known pin → the stamp falls back to the herdr name (still a
+    /// No known pin → the stamp falls back to the hc name (still a
     /// deterministic owner), and non-bead prompts never stamp.
     #[test]
     fn plan_actions_pin_stamp_falls_back_and_skips_non_bead_prompts() {
-        // herdr-name fallback for a bead brief with no registered pin.
+        // hc-name fallback for a bead brief with no registered pin.
         let queue = vec![brief("bd-13", "fallback owner")];
         let states = vec![st("flywheel-proj-oc", "idle")];
         let actions = plan_actions(
@@ -13025,7 +13025,7 @@ mod tests {
         );
         assert!(
             matches!(&actions[0], LoopAction::PinStamp { pin, .. } if pin == "flywheel-proj-oc"),
-            "herdr fallback stamps: {actions:?}"
+            "hc fallback stamps: {actions:?}"
         );
 
         // A plain instruction is dispatched without any stamp.
@@ -13530,7 +13530,7 @@ mod tests {
     }
 
     /// S8.1: the wake prompt instructs fetch/reply as the REGISTERED mail
-    /// identity (mail_identity), never the herdr name when they differ.
+    /// identity (mail_identity), never the hc name when they differ.
     #[test]
     fn urgent_wake_prompt_fetches_as_registered_identity() {
         let mut d = digest(1, 1, "CoralFinch", "[assign] x");
@@ -13546,7 +13546,7 @@ mod tests {
         );
         assert!(
             !text.contains("--as flywheel-proj-oc"),
-            "never fetch as the unregistered herdr name: {text}"
+            "never fetch as the unregistered terminal name: {text}"
         );
         // fallback: no mail_identity → the agent name
         let plain = urgent_wake_prompt(&digest(1, 1, "CoralFinch", "[assign] x"));
@@ -13931,7 +13931,7 @@ mod tests {
         assert!(p.contains("bd-12"), "names the bead");
         // bd-pin-public-plane-s-easy.5: claim --actor is the PIN — the pane
         // env sets AGENT_NAME=<pin> at spawn, so $AGENT_NAME expands to the
-        // pin the agent claims as (never the herdr slug).
+        // pin the agent claims as (never the hc slug).
         assert!(
             p.contains("--actor \"$AGENT_NAME\""),
             "claim as the pin via AGENT_NAME env: {p}"
@@ -16293,7 +16293,7 @@ mod tests {
     }
 
     // ---- bd-test-event-poll-parity: decision-level differential ----
-    // Live herdr session: tests/event_poll_parity.rs (#[ignore]).
+    // Live hc session: tests/event_poll_parity.rs (#[ignore]).
     // Pure tests prove plan_actions vs route_event agree on (agent, action, content).
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16338,10 +16338,10 @@ mod tests {
             LoopAction::Reclaim {
                 bead_id,
                 pin,
-                herdr_name,
+                terminal_name,
                 reason,
             } => Some(DispatchRec {
-                agent: herdr_name.clone(),
+                agent: terminal_name.clone(),
                 kind: "reclaim",
                 content: format!("{bead_id}:{pin}:{reason}"),
             }),
@@ -16526,39 +16526,39 @@ mod tests {
     }
 
     /// Grep acceptance: the loop path (durable.rs + the __poll_events
-    /// collector) contains no direct herdr event construction — the
+    /// collector) contains no direct hc event construction — the
     /// event stream comes via the backend trait. The scan covers the
     /// non-test source (the loop path), not this test's own strings.
     ///
     /// The fence denies code-level coupling only. The loop core legitimately
-    /// *names* herdr in prose and data: the `herdr_name` field (the agent's
-    /// herdr-assigned name — data, not a call), the `LoopMsg::Herdr`
-    /// envelope variant (populated by the backend trait, never by a herdr
-    /// client), and doc comments. A blanket `contains("herdr")` fails on
+    /// *names* hc in prose and data: the `terminal_name` field (the agent's
+    /// hc-assigned name — data, not a call), the `LoopMsg::Hc`
+    /// envelope variant (populated by the backend trait, never by an hc
+    /// client), and doc comments. A blanket `contains("hc")` fails on
     /// those load-bearing names, so it cannot be the fence.
     #[test]
-    fn events_primary_grep_no_herdr_in_loop_path() {
+    fn events_primary_grep_no_plane_in_loop_path() {
         let durable = include_str!("durable.rs");
         let loop_path = durable
             .split("#[cfg(test)]")
             .next()
             .expect("non-test source");
-        // Direct herdr code coupling: module paths, client types, direct
+        // Direct hc code coupling: module paths, client types, direct
         // event construction. Each is a real call shape, so deleting the
-        // fence's target (a herdr call) fails this test while renaming a
+        // fence's target (an hc call) fails this test while renaming a
         // prose mention does not.
         for denied in [
-            "herdr::",
-            "crate::herdr",
-            "HerdrClient",
-            "herdr_client",
-            "Herdr::",
-            "use herdr",
-            "extern crate herdr",
+            "hc::",
+            "crate::hc",
+            "HcClient",
+            "hc_client",
+            "Hc::",
+            "use hc",
+            "extern crate hc",
         ] {
             assert!(
                 !loop_path.contains(denied),
-                "durable.rs (the loop core) must not touch herdr directly: found {denied:?}"
+                "durable.rs (the loop core) must not touch hc directly: found {denied:?}"
             );
         }
         let main_src = include_str!("main.rs");
@@ -16572,8 +16572,8 @@ mod tests {
             "collect_poll_events must obtain the stream via the backend trait"
         );
         assert!(
-            !collect.contains("herdr"),
-            "collect_poll_events must not construct herdr events"
+            !collect.contains("hc"),
+            "collect_poll_events must not construct hc events"
         );
     }
 
@@ -16784,13 +16784,13 @@ mod tests {
         match &stalled[0] {
             IngressEvent::PaneStalled {
                 pane_id,
-                herdr_name,
+                terminal_name,
                 last_status,
                 bead_id,
                 ..
             } => {
                 assert_eq!(pane_id, "w1:p1");
-                assert_eq!(herdr_name, "StallAgent");
+                assert_eq!(terminal_name, "StallAgent");
                 assert_eq!(last_status, "idle");
                 assert_eq!(bead_id.as_deref(), Some("bd-stall-1"));
             }
@@ -18282,7 +18282,7 @@ mod reclaim_tests {
     }
 
     #[test]
-    fn reclaim_pane_exited_emits_for_in_progress_no_herdr() {
+    fn reclaim_pane_exited_emits_for_in_progress_no_plane() {
         let bead = ReadyBead {
             id: "bd-test".into(),
             title: "t".into(),
@@ -18305,12 +18305,12 @@ mod reclaim_tests {
             LoopAction::Reclaim {
                 bead_id,
                 pin,
-                herdr_name,
+                terminal_name,
                 reason,
             } => {
                 assert_eq!(bead_id, "bd-test");
                 assert_eq!(pin, "GoldCove");
-                assert_eq!(herdr_name, "GoldCove");
+                assert_eq!(terminal_name, "GoldCove");
                 assert_eq!(reason, "pane_exited");
             }
             _ => panic!("wrong"),
@@ -19876,7 +19876,7 @@ mod single_writer_tests {
             ["Msg::Watch", "Ndjson {"].concat(),
             ["Msg::Inbox", "Rows {"].concat(),
             ["Msg::Inbox", "Items {"].concat(),
-            ["Msg::Herdr", "Status {"].concat(),
+            ["Msg::Hc", "Status {"].concat(),
             ["Msg::Role", "Bound {"].concat(),
             ["Msg::Pres", "ence {"].concat(),
             ["Msg::Rece", "ipt {"].concat(),

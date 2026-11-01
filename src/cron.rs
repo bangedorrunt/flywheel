@@ -56,7 +56,7 @@ pub struct CronEntry {
 #[serde(rename_all = "lowercase")]
 pub enum CronMode {
     /// Autonomous: steps dispatch through the `__run-headless` subprocess
-    /// and log to `runs/<run_id>.jsonl` — no herdr pane, no workspace churn.
+    /// and log to `runs/<run_id>.jsonl` — no hc terminal, no workspace churn.
     #[default]
     Headless,
     /// Interactive: the P10.3 pane runner (crew dispatch via `__send`).

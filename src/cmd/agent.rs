@@ -1,6 +1,6 @@
 //! `flywheel agent` subcommand types (split from `main.rs`, bd-qbi8).
 //! bd-swarm-cockpit-pczs: `tail` reads a pin's recent actions from the
-//! session herdr reports for its pane (`agent_session`) — the path/id names
+//! session hc reports for its pane (`agent_session`) — the path/id names
 //! the exact session, so there is no newest-file guessing.
 
 use std::io::IsTerminal;
@@ -17,7 +17,7 @@ use crate::output::print_json;
 pub(crate) enum AgentCmd {
     /// tail a pin's recent actions (tool calls / commands) from its agent session
     Tail {
-        /// the pin (adjective+noun) or herdr name
+        /// the pin (adjective+noun) or terminal name
         pin: String,
         /// project slug (default: the workspace cwd, like `steer`)
         #[arg(long)]
@@ -44,7 +44,7 @@ pub(crate) fn cmd_agent(cfg: &Config, cmd: &AgentCmd) -> Result<()> {
 
 /// The pane a pin acts in. Live truth first (the pane's `toron_pin` token),
 /// then the spawn registry's pinned mail identity — the same
-/// name-vs-identity ladder `status` uses, so a numbered herdr name (oc2/pi2)
+/// name-vs-identity ladder `status` uses, so a numbered terminal name (oc2/pi2)
 /// still resolves to its pin. Pure over its inputs.
 fn pin_pane<'a>(
     panes: &'a [crate::hc_support::PaneInfo],

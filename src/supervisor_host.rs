@@ -13,7 +13,7 @@
 //!   skipped, so a replay never relaunches or escalates twice. [`recover`]
 //!   re-runs what the log says was asked and the journal says never
 //!   finished.
-//! - [`Ports`] is the effect boundary (herdr, mail, `br`, the captain
+//! - [`Ports`] is the effect boundary (hc, mail, `br`, the captain
 //!   page). The fold never touches it.
 //!
 //! The context log is the supervisor's fact log: one JSON line per accepted
@@ -70,7 +70,7 @@ pub trait EffectJournal {
 
 /// The effect boundary. Each method is one interpreted command.
 pub trait Ports {
-    /// Facts this round: registry spawns, cursors, deaf facts, herdr edges.
+    /// Facts this round: registry spawns, cursors, deaf facts, hc edges.
     fn observe(&mut self, model: &SupModel, now_ms: u64) -> Vec<SupMsg>;
     /// Start incarnation `generation` of `child`. A lead is a nested supervise
     /// process, never a pane write.
@@ -1222,12 +1222,12 @@ impl EffectJournal for MemJournal {
 
 // ---- production ports -----------------------------------------------------
 
-/// herdr + mail + the captain page, as the supervisor's effect boundary.
+/// hc + mail + the captain page, as the supervisor's effect boundary.
 pub struct LivePorts {
     cfg: crate::config::Config,
     project: String,
     inbox: crate::inbox_ports::FlywheelPorts,
-    herdr_up: Option<bool>,
+    plane_up: Option<bool>,
     facts_seen: BTreeSet<String>,
     /// rv23 #4: the inbox host's facts file, read incrementally.
     deaf: Option<FactsCursor>,
@@ -1252,7 +1252,7 @@ impl LivePorts {
             cfg: cfg.clone(),
             project: project.into(),
             inbox: crate::inbox_ports::FlywheelPorts::new(cfg, project, workspace),
-            herdr_up: None,
+            plane_up: None,
             facts_seen: BTreeSet::new(),
             deaf: None,
             lead_facts: BTreeMap::new(),
@@ -1348,8 +1348,8 @@ impl Ports for LivePorts {
         for c in self.lead_facts.values_mut() {
             c.commit();
         }
-        // Lead facts and a dead lease, before the herdr edge, so a lead
-        // failure still restarts while herdr reads up.
+        // Lead facts and a dead lease, before the hc edge, so a lead
+        // failure still restarts while hc reads up.
         let leads: Vec<String> = model
             .children
             .iter()
@@ -1364,17 +1364,17 @@ impl Ports for LivePorts {
             });
             out.extend(lead_upward(cur, model, &id, now_ms, dead));
         }
-        // herdr edges.
+        // hc edges.
         let up = self.client().is_some();
-        if self.herdr_up != Some(up) {
-            if self.herdr_up.is_some() || !up {
+        if self.plane_up != Some(up) {
+            if self.plane_up.is_some() || !up {
                 out.push(if up {
-                    SupMsg::HerdrUp { now_ms }
+                    SupMsg::PlaneUp { now_ms }
                 } else {
-                    SupMsg::HerdrDown { now_ms }
+                    SupMsg::PlaneDown { now_ms }
                 });
             }
-            self.herdr_up = Some(up);
+            self.plane_up = Some(up);
         }
         // Crews the registry knows that the model does not.
         for e in crate::state::load_spawn_registry(&self.project) {
@@ -1481,9 +1481,9 @@ impl Ports for LivePorts {
         let pane = self
             .pane_of(child)
             .ok_or_else(|| format!("no pane for {child}"))?;
-        let c = self.client().ok_or("herdr unavailable")?;
+        let c = self.client().ok_or("hc unavailable")?;
         crate::pane_write::write(
-            &crate::pane_write::HerdrPanes(&c),
+            &crate::pane_write::HcPanes(&c),
             &pane,
             &crate::pane_write::PaneWrite::Exit,
         )
@@ -2251,7 +2251,7 @@ fn probe_msgs(
         }
     }
     // Hardening slice 2 (bd-c0ha): a dead doorbell dispatcher or a stale
-    // heartbeat on a binding herdr may clear pages once, then holds. The
+    // heartbeat on a binding hc may clear pages once, then holds. The
     // model is the hold, so a replayed pass folds the same set.
     let mut hold = crate::health_page::HealthHold {
         dead_doorbells: model.dead_doorbells.clone(),
@@ -2259,7 +2259,7 @@ fn probe_msgs(
     };
     let presence = std::fs::read_to_string(crate::mail::presence_path()).unwrap_or_default();
     let rows = crate::health_page::registry_rows(cfg, project);
-    let live_panes = crate::live_plane_panes(cfg);
+    let live_panes = crate::live_hc_panes(cfg);
     for event in crate::health_page::probe_events(
         &crate::config::state_dir(),
         project,
@@ -2662,7 +2662,7 @@ mod tests {
         fn relaunch(&mut self, c: &str, g: u64, _kind: ChildKind) -> Result<(), String> {
             let mut w = self.0.lock().unwrap();
             if w.fail_relaunch {
-                return Err("herdr said no".into());
+                return Err("hc said no".into());
             }
             w.relaunched.push((c.into(), g));
             Ok(())

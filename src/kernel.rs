@@ -66,7 +66,7 @@ impl ProjectPath {
 pub(crate) enum PresenceSource {
     Unknown,
     Presence,
-    HerdrEvidence,
+    PlaneEvidence,
     Endpoint,
     Legacy,
 }
@@ -275,7 +275,7 @@ mod tests {
     #[test]
     fn only_authoritative_idle_presence_is_promptable() {
         assert!(Presence::Idle(PresenceSource::Presence).is_promptable());
-        assert!(!Presence::Idle(PresenceSource::HerdrEvidence).is_promptable());
+        assert!(!Presence::Idle(PresenceSource::PlaneEvidence).is_promptable());
         assert!(!Presence::Unknown.is_promptable());
     }
 }

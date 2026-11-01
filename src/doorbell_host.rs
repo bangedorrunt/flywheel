@@ -2,7 +2,7 @@
 //! Embedded host binding (bd-asr2.5): [`RtHost`] implements
 //! `doorbell_rt::Host` over the live flywheel machinery — `workspace::tick`
 //! as the decider, `handle_workspace_cmds` as the effect layer, the spawn
-//! registry / mailbox / herdr shims as producers. [`run_embedded`] wires
+//! registry / mailbox / hc shims as producers. [`run_embedded`] wires
 //! sensors around a `doorbell_rt::Brain` and runs it to shutdown.
 //!
 //! One implementation: every arm below mirrors `cmd_internal_doorbell`
@@ -41,7 +41,7 @@ pub struct RtHost {
     brain_tx: mpsc::Sender<BrainMsg>,
     /// Panes with an active multiplexed events.subscribe forwarder.
     /// Shared with the reader thread so stream death can clear coverage and
-    /// the next sweep re-arms (herdr/tuios: stream death must not leave a
+    /// the next sweep re-arms (hc/tuios: stream death must not leave a
     /// pane stuck "covered" forever).
     covered_panes: Arc<Mutex<HashSet<String>>>,
     /// Shared with the delivery path. bd-kz54 follow-up: `WatchRetry::reset()`
@@ -296,18 +296,18 @@ impl RtHost {
     /// Spawn push forwarders for registry panes without coverage (bd-8hv0):
     /// late crew panes get push coverage instead of the polling fallback.
     ///
-    /// Herdr only: when another backend is selected there is no herdr pane
+    /// Hc only: when another backend is selected there is no hc terminal
     /// to subscribe, and the level-triggered ticks decide without hints
     /// (bd-g5zs). A backend-native subscribe is a follow-up, not a silent
-    /// herdr attempt that fails every sweep.
+    /// hc attempt that fails every sweep.
     ///
     /// Multiplex: one `events.subscribe` covering all uncovered crew panes
-    /// (herdr/tuios per-caller stream cap). On stream death, clear covered
+    /// (hc/tuios per-caller stream cap). On stream death, clear covered
     /// so the next sweep re-arms. If subscribe rejects because a listed pane
     /// died, refresh the pane list and retry. `events_lost` stays TODO until
     /// toron-core surfaces it as a typed signal (see hook below).
     fn cover_new_panes(&mut self) {
-        if crate::backend::resolve_backend_name(&self.cfg) != "herdr" {
+        if crate::backend::resolve_backend_name(&self.cfg) != "hc" {
             return;
         }
         let registry = state::load_spawn_registry(&self.project);
@@ -339,7 +339,7 @@ impl RtHost {
                     break;
                 }
                 Err(e) => {
-                    // herdr rejects the whole request if any listed pane is gone.
+                    // hc rejects the whole request if any listed pane is gone.
                     eprintln!(
                         "flywheel doorbell: multiplex subscribe rejected ({e:#}) — refreshing pane list"
                     );
@@ -372,15 +372,15 @@ impl RtHost {
                 match stream.read_outcome() {
                     Ok(StreamOutcome::Event(ev)) => {
                         let ev = *ev;
-                        if let crate::hc_support::HerdrEventData::PaneAgentStatusChanged(change)
-                        | crate::hc_support::HerdrEventData::PaneAgentStatusChangedSub(change) =
+                        if let crate::hc_support::TerminalEventData::PaneAgentStatusChanged(change)
+                        | crate::hc_support::TerminalEventData::PaneAgentStatusChangedSub(change) =
                             ev.data
                         {
                             let pin = pin_by_pane
                                 .get(&change.pane_id)
                                 .cloned()
                                 .unwrap_or_else(|| change.pane_id.clone());
-                            let msg = BrainMsg::HerdrStatus {
+                            let msg = BrainMsg::PlaneStatus {
                                 pin,
                                 status: change.agent_status.as_str().to_string(),
                             };
@@ -431,7 +431,7 @@ fn clear_covered(covered: &Mutex<HashSet<String>>, ids: &[String]) {
 }
 
 /// After `events_lost`: pull authoritative status via `session.snapshot`
-/// (fall back to `agent.list`) and re-enter as HerdrStatus Msgs. Does not
+/// (fall back to `agent.list`) and re-enter as PlaneStatus Msgs. Does not
 /// invent delivery — only status facts for covered pins.
 fn reconcile_status_after_events_lost(
     socket: &str,
@@ -456,7 +456,7 @@ fn reconcile_status_after_events_lost(
         let Some(pin) = pin_by_pane.get(&ag.pane_id) else {
             continue;
         };
-        let msg = BrainMsg::HerdrStatus {
+        let msg = BrainMsg::PlaneStatus {
             pin: pin.clone(),
             status: ag.agent_status.as_str().to_string(),
         };
@@ -502,8 +502,8 @@ impl Host for RtHost {
     fn tick(&mut self, msg: &BrainMsg) -> Vec<Effect> {
         let (wmsg, drain_waits) = match msg {
             BrainMsg::Watch(line) => (workspace::Msg::WatchNdjson { line: line.clone() }, true),
-            BrainMsg::HerdrStatus { pin, status } => (
-                workspace::Msg::HerdrStatus {
+            BrainMsg::PlaneStatus { pin, status } => (
+                workspace::Msg::PlaneStatus {
                     pin: pin.clone(),
                     status: status.clone(),
                 },
@@ -1019,14 +1019,14 @@ async fn run_embedded_async(
     host.set_generation(generation.clone());
     let mut sinks = SinkManager::new(tx.clone());
     // Supervised registration (audit P1): fresh adapter + reconnect on a
-    // failed herdr client park (Transient policy) instead of dying until
+    // failed hc client park (Transient policy) instead of dying until
     // process restart. The generation stamps the fresh adapter so a
     // mid-run binary upgrade still self-retires it.
     // Flag-off no longer types the brain line. The inbox host is the only
     // pane writer, and only while comms is on. Operator waived the 2026-11-08
     // hold on 2026-10-17.
     let mut _inbox_guard: Option<crate::inbox_host::InboxHost> = None;
-    sinks.add_sink_with_factory("herdr", Box::new(doorbell_rt::NoTextSink::new()), || {
+    sinks.add_sink_with_factory("hc", Box::new(doorbell_rt::NoTextSink::new()), || {
         Box::new(doorbell_rt::NoTextSink::new())
     });
     if crate::comms_send::enabled(&cfg) {
@@ -1398,7 +1398,7 @@ mod parity_tests {
         // Each side runs SEQUENTIALLY under its own XDG state tree with
         // identical fixture files: sweep drains are destructive
         // (files deleted after read), so concurrent sides race.
-        // Hermetic: NOTHING writes outside temp dirs. Live toron/herdr
+        // Hermetic: NOTHING writes outside temp dirs. Live toron/hc
         // CLIs may run read-only (whois/inbox/list on fixture pins fail
         // empty); the toron transport is remote-refused (production uses
         // remote sync HTTP; in-process block_ons inside a runtime).
@@ -1443,8 +1443,8 @@ mod parity_tests {
             std::fs::write(
                 agents.join(format!("{key}.json")),
                 serde_json::json!([
-                    {"pane_id": "pane-a", "name": "herdr-a", "mail_identity": "PinA"},
-                    {"pane_id": "pane-b", "name": "herdr-b", "mail_identity": "PinB"}
+                    {"pane_id": "pane-a", "name": "hc-a", "mail_identity": "PinA"},
+                    {"pane_id": "pane-b", "name": "hc-b", "mail_identity": "PinB"}
                 ])
                 .to_string(),
             )
@@ -1479,11 +1479,11 @@ mod parity_tests {
             |ts: &str| serde_json::json!({"importance": "urgent", "created_ts": ts, "tags": []});
         let mk_script = || {
             vec![
-                BrainMsg::HerdrStatus {
+                BrainMsg::PlaneStatus {
                     pin: "PinA".into(),
                     status: "idle".into(),
                 },
-                BrainMsg::HerdrStatus {
+                BrainMsg::PlaneStatus {
                     pin: "PinB".into(),
                     status: "working".into(),
                 },
@@ -1503,7 +1503,7 @@ mod parity_tests {
                     "e3",
                     3,
                 )),
-                BrainMsg::HerdrStatus {
+                BrainMsg::PlaneStatus {
                     pin: "PinB".into(),
                     status: "idle".into(),
                 },
@@ -1526,7 +1526,7 @@ mod parity_tests {
                     pin: "PinA".into(),
                     state: "working".into(),
                 },
-                BrainMsg::HerdrStatus {
+                BrainMsg::PlaneStatus {
                     pin: "PinA".into(),
                     status: "working".into(),
                 },
@@ -1539,7 +1539,7 @@ mod parity_tests {
                     5,
                 )),
                 // Drain under busy presence: routine audits, urgent prompts.
-                BrainMsg::HerdrStatus {
+                BrainMsg::PlaneStatus {
                     pin: "PinA".into(),
                     status: "idle".into(),
                 },
@@ -1605,7 +1605,7 @@ mod parity_tests {
             .unwrap();
         let rep_a = rt.block_on(async {
             let mut sinks_a = SinkManager::new(tx_a.clone());
-            sinks_a.add_sink("herdr", Box::new(MockSink::new().0));
+            sinks_a.add_sink("hc", Box::new(MockSink::new().0));
             let brain_a = Brain::new(
                 BrainConfig::new(ws),
                 rt_host,
@@ -1626,7 +1626,7 @@ mod parity_tests {
         let (tx_b, rx_b) = tokio::sync::mpsc::channel(doorbell_rt::BRAIN_CAP);
         let mut fcfg = FileHostConfig::new(crate::config::state_dir(), project, ws.to_string());
         fcfg.toron_bin = "true".into();
-        fcfg.herdr_bin = "true".into();
+        fcfg.plane_bin = "true".into();
         let file_host = FileHost::new(fcfg).with_tx(tx_b.clone());
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -1634,7 +1634,7 @@ mod parity_tests {
             .unwrap();
         let rep_b = rt.block_on(async {
             let mut sinks_b = SinkManager::new(tx_b.clone());
-            sinks_b.add_sink("herdr", Box::new(MockSink::new().0));
+            sinks_b.add_sink("hc", Box::new(MockSink::new().0));
             let brain_b = Brain::new(
                 BrainConfig::new(ws),
                 file_host,
@@ -1777,7 +1777,7 @@ mod inbox_flag_tests {
         let tail = &src[a..a + 2500];
         assert!(tail.contains("doorbell_rt::NoTextSink::new()"));
         assert!(tail.contains("InboxHost::spawn("));
-        assert!(!tail.contains("HerdrPromptSink"), "flag-off typer is gone");
+        assert!(!tail.contains("PlanePromptSink"), "flag-off typer is gone");
     }
 }
 
@@ -1886,7 +1886,7 @@ mod off_runtime_tests {
 // state. Exact behavior is preserved: the edge writes the identical stderr
 // line handle_workspace_cmds writes today (src/main.rs, Cmd::Audit arm) —
 // twin noted here because the two cannot share code across the binary
-// boundary without moving the format. Next arms (Prompt with herdr
+// boundary without moving the format. Next arms (Prompt with hc
 // handles, ...) add edged services to the same runtime. interpret()
 // without services fails typed, never drops.
 // ---------------------------------------------------------------------------

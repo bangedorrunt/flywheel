@@ -1,7 +1,7 @@
 // governed-by: ADR-0019 Contract gate D0-D7
 //! Captain directory: tier, delivery word, session keys (ADR-0019 D2-D7).
 //!
-//! Pure projections only. No clock, env, rex, herdr, or I/O inside.
+//! Pure projections only. No clock, env, rex, hc, or I/O inside.
 //! `now_ms` and liveness enter as arguments.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -210,7 +210,7 @@ pub fn session_key(
     harness_session: Option<&str>,
     block_id: Option<&str>,
     pane_id: Option<&str>,
-    herdr_selected: bool,
+    plane_selected: bool,
 ) -> String {
     if location_hosted {
         return format!("hosted:{pin}");
@@ -221,7 +221,7 @@ pub fn session_key(
         return format!("{h}:{sid}");
     }
     if let Some(b) = block_id
-        && !herdr_selected
+        && !plane_selected
     {
         return format!("block:{b}");
     }
@@ -420,8 +420,8 @@ mod tests {
     }
 
     #[test]
-    fn tier_push_beats_herdr_absence() {
-        // Empty herdr listing with a live block: still push.
+    fn tier_push_beats_plane_absence() {
+        // Empty hc listing with a live block: still push.
         let s = snap_tier(true, true, false, false, true, false, true, true, false);
         assert_eq!(tier_of(&s), Tier::Push);
     }
@@ -763,7 +763,7 @@ mod tests {
             session_key(false, "P", None, None, None, Some("w1:p2"), true),
             "pane:w1:p2"
         );
-        // Rex block is never stored under a herdr key.
+        // Rex block is never stored under an hc key.
         assert!(
             session_key(false, "P", None, None, Some("b1"), Some("w1:p2"), false)
                 .starts_with("block:")

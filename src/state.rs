@@ -342,7 +342,7 @@ pub fn set_registry_root_override(root: PathBuf) -> RegistryRootOverrideGuard {
 /// Directory of the per-project spawn registry (pane_id → agent name).
 /// Written at spawn; used by `flywheel rebind` and the send auto-heal path
 /// (bd-fw-name-binding-loss-7rc) to restore a name binding an agent lost
-/// when its session restarted in the pane (herdr shows name:null, and name
+/// when its session restarted in the pane (hc shows name:null, and name
 /// resolution silently misses).
 pub fn agents_dir() -> PathBuf {
     state_dir().join("agents")
@@ -364,12 +364,12 @@ pub fn spawn_registry_file(project: &str) -> PathBuf {
 /// agent-mail identity (adjective+noun) to the pane/name AT SPAWN TIME.
 /// `assign` resolves through this map, so a numbered agent (oc2/oc3/...) keeps
 /// the SAME identity across calls and restarts — the deterministic binding
-/// instead of re-hashing the (renumberable) herdr name.
+/// instead of re-hashing the (renumberable) terminal name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SpawnEntry {
-    /// the herdr pane id the agent runs in
+    /// the hc pane id the agent runs in
     pub pane_id: String,
-    /// the agent (herdr) name
+    /// the agent (hc) name
     pub name: String,
     /// the crew profile this pane serves (`planner`, `coder`, ...); `None`
     /// for plain swarm spawns (legacy shape).
@@ -599,7 +599,7 @@ pub fn load_spawn_meta(project: &str) -> Option<String> {
 /// iteration to verify the thread actually moved before settling.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExpectedReply {
-    /// agent (herdr name) that was asked to reply in-thread
+    /// agent (terminal name) that was asked to reply in-thread
     pub agent: String,
     /// thread id the reply must land in
     pub thread: String,
@@ -733,7 +733,7 @@ fn fold_legacy_alias(
 /// Atomically persist the project's pane→name registry.
 /// bd-mail-crew-fanout-xq6b: expand the spawn registry into mail
 /// recipients — one addressed copy per live crew pin. Registry
-/// `mail_identity` wins (bd-627z.4 pin), falling back to the herdr name;
+/// `mail_identity` wins (bd-627z.4 pin), falling back to the hc name;
 /// the sender is excluded (never mail yourself); duplicates collapse,
 /// registry order preserved.
 pub fn crew_recipients(entries: &[SpawnEntry], sender: Option<&str>) -> Vec<String> {
@@ -780,7 +780,7 @@ pub fn load_spawn_registry(project: &str) -> Vec<SpawnEntry> {
     // (`.flywheel/agent-names.json`) still holds the pane→pin bindings the
     // panes POST with. Without this fallback `--to <pin>` cannot resolve a
     // LIVE crew pane and the miss reads as "no agents match", sending the
-    // operator back to herdr slugs (`crew-<run>-<role>`) — the exact F12
+    // operator back to hc slugs (`crew-<run>-<role>`) — the exact F12
     // regression. The mirror lives INSIDE the project, so it survives the
     // state loss that is the whole reason it exists.
     load_agent_names(&project_dir_hint(project))
@@ -1448,14 +1448,14 @@ pub fn project_checkpoint_dir(project: &str) -> PathBuf {
 // Per-project sidecar (NOT the shared loops.json — that file is written by
 // any loop on any project; a per-project file keeps writers disjoint and
 // atomic-write races impossible). Records what the `__send` leaf actually
-// delivered, so a crash between herdr's landing and Resonate's checkpoint
+// delivered, so a crash between hc's landing and Resonate's checkpoint
 // can be deduplicated on resume (bd-resume-dedup). Single-writer per project
 // (the loop; `promise_pending` guards against concurrent loops).
 
 /// One delivered (or attempted) prompt send.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SentRecord {
-    /// agent herdr name
+    /// agent terminal name
     pub name: String,
     /// stable FNV-1a 64 hash of the exact prompt text
     pub text_hash: u64,
@@ -1464,7 +1464,7 @@ pub struct SentRecord {
     pub invocation: String,
     /// loop iteration at send time (diagnostics)
     pub iteration: u64,
-    /// true when herdr confirmed the prompt landed (working|blocked)
+    /// true when hc confirmed the prompt landed (working|blocked)
     pub landed: bool,
     /// cg6.5: a timeout-confirm send is AMBIGUOUS — the prompt may have
     /// started, so resume-dedup must NOT re-delegate it (the next poll is

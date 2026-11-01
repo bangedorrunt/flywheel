@@ -154,7 +154,7 @@ fn operator_home_probe_child() {
         "XDG_DATA_HOME",
         "XDG_CACHE_HOME",
         "TMPDIR",
-        "HERDR_SOCKET_PATH",
+        "HC_SOCKET_PATH",
     ] {
         let value = std::env::var(var).unwrap_or_else(|_| panic!("{var} must be set"));
         assert!(
@@ -166,10 +166,10 @@ fn operator_home_probe_child() {
         std::env::var_os("TORON_MCP_URL").is_none(),
         "the contract must remove the ambient daemon URL"
     );
-    let sock = std::env::var("HERDR_SOCKET_PATH").expect("herdr socket path");
+    let sock = std::env::var("HC_SOCKET_PATH").expect("hc socket path");
     assert!(
         !Path::new(&sock).exists(),
-        "the herdr pin must name a socket that is not there, got {sock}"
+        "the hc pin must name a socket that is not there, got {sock}"
     );
 
     // The two dirs flywheel resolves for itself.

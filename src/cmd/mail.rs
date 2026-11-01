@@ -27,7 +27,7 @@ pub(crate) enum MailCmd {
         /// keep only messages in this thread (thread id or message id)
         #[arg(long = "thread-id")]
         thread_id: Option<String>,
-        /// act as this registered agent (adjective+noun or herdr short name)
+        /// act as this registered agent (adjective+noun or terminal short name)
         #[arg(long = "as")]
         as_agent: Option<String>,
         /// bd-mail-inbox-json-a7wc: emit a STABLE machine contract — one JSON
@@ -61,7 +61,7 @@ pub(crate) enum MailCmd {
         /// message id (toron hex event id)
         #[arg(long = "message-id")]
         message_id: String,
-        /// act as this registered agent (adjective+noun or herdr short name)
+        /// act as this registered agent (adjective+noun or terminal short name)
         #[arg(long = "as")]
         as_agent: Option<String>,
     },
@@ -73,7 +73,7 @@ pub(crate) enum MailCmd {
         /// message id (toron hex event id)
         #[arg(long = "message-id")]
         message_id: String,
-        /// act as this registered agent (adjective+noun or herdr short name)
+        /// act as this registered agent (adjective+noun or terminal short name)
         #[arg(long = "as")]
         as_agent: Option<String>,
     },
@@ -90,7 +90,7 @@ pub(crate) enum MailCmd {
         project_flag: Option<String>,
         #[arg(long, default_value = "20")]
         limit: u32,
-        /// filter by sender (adjective+noun or herdr name)
+        /// filter by sender (adjective+noun or terminal name)
         #[arg(long)]
         sender: Option<String>,
         /// filter by importance: low|normal|high|urgent
@@ -123,7 +123,7 @@ pub(crate) enum MailCmd {
         // bd-vben: same defect bd-g5q4 fixed for Search — a required
         // positional after an optional one trips clap's debug asserts, so
         // `<AGENT> [PROJECT]` is the only usable order.
-        /// agent (adjective+noun or herdr short name)
+        /// agent (adjective+noun or terminal short name)
         agent: String,
         project: Option<String>,
         #[arg(long = "project", value_name = "PROJECT")]
@@ -167,11 +167,11 @@ pub(crate) enum MailCmd {
         /// restrict to these path patterns (default: all of this identity's)
         #[arg(long)]
         paths: Vec<String>,
-        /// act as this registered agent (adjective+noun or herdr short name)
+        /// act as this registered agent (adjective+noun or terminal short name)
         #[arg(long = "as")]
         as_agent: Option<String>,
     },
-    /// operator force-release of a stale reservation (herdr-down / abandoned)
+    /// operator force-release of a stale reservation (hc-down / abandoned)
     ForceUnlock {
         project: Option<String>,
         #[arg(long = "project", value_name = "PROJECT")]
@@ -186,7 +186,7 @@ pub(crate) enum MailCmd {
         /// optional note for the released holder
         #[arg(long)]
         note: Option<String>,
-        /// act as this registered agent (adjective+noun or herdr short name)
+        /// act as this registered agent (adjective+noun or terminal short name)
         #[arg(long = "as")]
         as_agent: Option<String>,
     },
@@ -213,7 +213,7 @@ pub(crate) enum MailCmd {
         project: Option<String>,
         #[arg(long = "project", value_name = "PROJECT")]
         project_flag: Option<String>,
-        /// act as this registered agent (adjective+noun or herdr short name)
+        /// act as this registered agent (adjective+noun or terminal short name)
         #[arg(long = "as")]
         as_agent: Option<String>,
         /// digest every registered agent (table, --json = array)
@@ -247,7 +247,7 @@ pub(crate) enum MailCmd {
         project: Option<String>,
         #[arg(long = "project", value_name = "PROJECT")]
         project_flag: Option<String>,
-        /// recipients: comma-separated pins/herdr shorts; REQUIRED unless
+        /// recipients: comma-separated pins/terminal shorts; REQUIRED unless
         /// --crew expands them for you (bd-mail-crew-fanout-xq6b)
         #[arg(long)]
         to: Option<String>,
@@ -1286,7 +1286,7 @@ pub(crate) enum MailSlotCmd {
         exclusive: bool,
         #[arg(long, default_value = "1800")]
         ttl_seconds: u64,
-        /// act as this registered agent (adjective+noun or herdr short name)
+        /// act as this registered agent (adjective+noun or terminal short name)
         #[arg(long = "as")]
         as_agent: Option<String>,
     },
@@ -1299,7 +1299,7 @@ pub(crate) enum MailSlotCmd {
         slot: String,
         #[arg(long, default_value = "1800")]
         extend_seconds: u64,
-        /// act as this registered agent (adjective+noun or herdr short name)
+        /// act as this registered agent (adjective+noun or terminal short name)
         #[arg(long = "as")]
         as_agent: Option<String>,
     },
@@ -1310,7 +1310,7 @@ pub(crate) enum MailSlotCmd {
         project_flag: Option<String>,
         #[arg(long, default_value = "cargo")]
         slot: String,
-        /// act as this registered agent (adjective+noun or herdr short name)
+        /// act as this registered agent (adjective+noun or terminal short name)
         #[arg(long = "as")]
         as_agent: Option<String>,
     },

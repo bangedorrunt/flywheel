@@ -22,7 +22,7 @@
 //!
 //! | legacy | unified step | 1:1? |
 //! |---|---|---|
-//! | `Send{to, stage, msg}` | `dispatch_job` (assignee=`to`, spec carries the resolved stage prompt / raw msg) | YES (herdr-direct semantics preserved via the engine's injected runner) |
+//! | `Send{to, stage, msg}` | `dispatch_job` (assignee=`to`, spec carries the resolved stage prompt / raw msg) | YES (hc-direct semantics preserved via the engine's injected runner) |
 //! | `Wait{until}` | `delay` (no-op shell; the engine's `spawn{await}` binding is P4) | NO — flagged, run continues |
 //! | pipeline (chain) | workflow of `call_workflow` steps (closed action, engine sub-run) | YES |
 //!
@@ -718,7 +718,7 @@ fn absorb_workflow_steps(name: &str, steps: &[LegacyStep]) -> (Workflow, Vec<Map
             LegacyStep::Send { to, stage, msg } => {
                 // Send{to,stage,msg} -> dispatch_job. The stage prompt / raw
                 // message is carried in the spec so the injected ActionRunner
-                // (the herdr-direct surface) preserves semantics. `stage` is
+                // (the hc-direct surface) preserves semantics. `stage` is
                 // a contract field; the legacy `to`/`msg` pair rides in
                 // `extra` (bd-dispatch-spec-untyped-0iud).
                 let spec = toron_workflow::schema::DispatchSpec {

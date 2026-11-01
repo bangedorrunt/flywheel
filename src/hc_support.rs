@@ -1,4 +1,4 @@
-//! Flywheel hc helpers (ex-`herdr` shim). ClientExt is gone: `Client` is a
+//! Flywheel hc helpers (ex-`hc` shim). ClientExt is gone: `Client` is a
 //! newtype over `toron_core::backend::hc::Client` with inherent adapters for
 //! legacy call shapes, plus event-payload decoding and pane helpers.
 //!
@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 pub use toron_core::backend::error::{BackendError, BackendErrorCode};
 use toron_core::backend::EventStream as _;
 use toron_core::backend::hc::Client as HcClient;
-/// Was HDR_PROTOCOL on herdr; hc advertises generation via HC_GENERATION.
+/// Was HDR_PROTOCOL on hc; hc advertises generation via HC_GENERATION.
 pub use toron_core::backend::hc::HC_GENERATION as HDR_PROTOCOL;
 pub use toron_core::backend::types::{
     AgentInfo, AgentSessionInfo, AgentSessionRefKind, AgentStatus, PaneInfo, SendVerdict,
@@ -65,7 +65,7 @@ impl Client {
     }
 }
 
-/// GS-049 / bd-a2bw: herdr `launch_pending` is stale when the pane is already
+/// GS-049 / bd-a2bw: hc `launch_pending` is stale when the pane is already
 /// input-ready (idle/working/blocked/done). Shared by snapshot assemble and
 /// spawn/send readiness so live decide Snapshot never invent-greens 0.
 pub fn agent_still_booting(a: &AgentInfo) -> bool {
@@ -83,26 +83,27 @@ pub fn agent_still_booting(a: &AgentInfo) -> bool {
     true
 }
 
-/// bd-bug-omp-herdr-wedge: the HERDR_* integration env a herdr-launched
-/// harness needs to activate its herdr extension (omp's
-/// herdr-omp-agent-state.ts gates on HERDR_ENV=1 + socket + pane id).
-/// herdr's agent.start has NO env param and does not inherit pane env
+/// bd-bug-omp-hc-wedge: the HC_* launch env an hc-launched
+/// harness needs to activate its hc extension (omp's
+/// hc-omp-agent-state.ts gates on HC_SOCKET_PATH + pane/terminal id).
+/// hc's agent.start has NO env param and does not inherit pane env
 /// (direct exec), so the caller must inject at pane creation:
-/// workspace.create / pane.split both accept env. herdr fills the per-pane
-/// ids (HERDR_PANE_ID/TAB/WORKSPACE_ID) itself at agent.start; we supply
+/// workspace.create / pane.split both accept env. hc fills the per-pane
+/// ids (HC_TERMINAL_ID/TAB/WORKSPACE_ID) itself at agent.start; we supply
 /// the two workspace-level vars.
 ///
 /// bd-pin-public-plane-s-easy.2: the pane env additionally carries the
 /// agent's mail PIN (`AGENT_NAME` + `FLYWHEEL_MAIL_AS`) so a spawned agent
 /// boots knowing the identity it is addressed by — same pin the peer
 /// template injects and the loop's `{AGENT_NAME}` substitutes.
-pub fn herdr_integration_env(
+pub fn plane_launch_env(
     cfg: &crate::config::Config,
     pin: Option<&str>,
 ) -> std::collections::BTreeMap<String, String> {
+    let session = std::env::var("HC_SESSION").unwrap_or_else(|_| "default".into());
     let mut env = std::collections::BTreeMap::from([
-        ("HERDR_ENV".to_string(), "1".to_string()),
-        ("HERDR_SOCKET_PATH".to_string(), cfg.socket_path()),
+        ("HC_SOCKET_PATH".to_string(), cfg.socket_path()),
+        ("HC_SESSION".to_string(), session),
     ]);
     if let Some(pin) = pin.filter(|p| !p.is_empty()) {
         env.insert("AGENT_NAME".to_string(), pin.to_string());
@@ -140,7 +141,7 @@ pub fn apply_opencode_go_api_key_alias(env: &mut std::collections::BTreeMap<Stri
 
 /// bd-crlx: pin an opencode TUI agent's model for one pane.
 ///
-/// opencode v2's ROOT command (the one `herdr agent start --kind opencode`
+/// opencode v2's ROOT command (the one `hc agent start --kind opencode`
 /// launches) has no `--model` flag — the flag exists only on `opencode run`.
 /// The TUI's model is config, so the pin rides the pane env as
 /// `OPENCODE_CONFIG_CONTENT`.
@@ -200,7 +201,7 @@ pub fn apply_opencode_model_pin(
     Ok(())
 }
 
-/// GS-037 P1: herdr `integration.install` fails when parent config dirs are
+/// GS-037 P1: hc `integration.install` fails when parent config dirs are
 /// missing (pi/omp/opencode). Create the documented parent dirs before install
 /// so zero-touch spawn works on a cold box.
 pub fn ensure_integration_parent_dirs(kind: &str) {
@@ -228,7 +229,7 @@ pub fn parse_agent_status(s: &str) -> Result<AgentStatus> {
     s.parse().map_err(|e| anyhow!("{e}"))
 }
 
-/// Parse the protocol version from `herdr api schema --json` output (the
+/// Parse the protocol version from `hc api schema --json` output (the
 /// top-level `protocol` field). `None` on any failure — the caller decides
 /// how to surface an unreadable schema.
 pub fn parse_protocol(raw: &str) -> Option<u64> {
@@ -237,8 +238,8 @@ pub fn parse_protocol(raw: &str) -> Option<u64> {
         .and_then(|v| v.get("protocol").and_then(Value::as_u64))
 }
 
-/// A herdr agent integration's install state, parsed from a
-/// `herdr integration status` line (`<kind>: <state> (<path>)`).
+/// An hc agent integration's install state, parsed from a
+/// `hc integration status` line (`<kind>: <state> (<path>)`).
 ///
 /// H3 (bd-harness-integration-preflight): spawn preflights each launched
 /// kind's integration and installs it when missing/outdated; `flywheel
@@ -247,7 +248,7 @@ pub fn parse_protocol(raw: &str) -> Option<u64> {
 pub struct IntegrationStatus {
     /// integration file exists at the documented path
     pub installed: bool,
-    /// installed version equals the version herdr ships (vN == expected)
+    /// installed version equals the version hc ships (vN == expected)
     pub current: bool,
     /// installed version (`vN`) when known; `None` when not installed
     pub version: Option<String>,
@@ -258,7 +259,7 @@ pub struct IntegrationStatus {
 }
 
 impl IntegrationStatus {
-    /// The herdr default for any kind with no installed integration.
+    /// The hc default for any kind with no installed integration.
     pub fn not_installed() -> Self {
         Self {
             installed: false,
@@ -270,9 +271,9 @@ impl IntegrationStatus {
     }
 }
 
-/// Canonical herdr integration kinds (`herdr integration status` /
-/// `herdr integration install` surface, herdr.dev/docs/preview/integrations/
-/// build 2026-08-04-d78e3d3b5126). Flywheel custom kinds without a herdr
+/// Canonical hc integration kinds (`hc integration status` /
+/// `hc integration install` surface, hc.dev/docs/preview/integrations/
+/// build 2026-08-04-d78e3d3b5126). Flywheel custom kinds without an hc
 /// integration are NOT in this list — preflight skips them (nothing to
 /// install, nothing to report).
 pub const INTEGRATION_KINDS: &[&str] = &[
@@ -294,7 +295,7 @@ pub const INTEGRATION_KINDS: &[&str] = &[
 ];
 
 /// Map a flywheel kind to the socket `integration.install` target (the
-/// `IntegrationTarget` enum). `None` when the kind has no herdr integration.
+/// `IntegrationTarget` enum). `None` when the kind has no hc integration.
 /// The only spelling difference: `antigravity-cli` (CLI display) vs
 /// `antigravity_cli` (socket enum).
 pub fn integration_target(kind: &str) -> Option<&'static str> {
@@ -304,9 +305,9 @@ pub fn integration_target(kind: &str) -> Option<&'static str> {
     INTEGRATION_KINDS.iter().copied().find(|k| *k == kind)
 }
 
-/// Parse one line of `herdr integration status` output into `(kind, status)`.
+/// Parse one line of `hc integration status` output into `(kind, status)`.
 /// `None` for a line that does not match the `<kind>: <state> (<path>)`
-/// grammar herdr 0.8.0-preview emits. States:
+/// grammar hc 0.8.0-preview emits. States:
 /// - `current (v9) (/path)`        → installed + current
 /// - `outdated (v3 < v4) (/path)`  → installed, not current
 /// - `not installed (/path)`       → not installed
@@ -360,7 +361,7 @@ pub fn parse_integration_status_line(line: &str) -> Option<(&str, IntegrationSta
     ))
 }
 
-/// Parse full `herdr integration status` output into per-kind statuses
+/// Parse full `hc integration status` output into per-kind statuses
 /// (one call, N kinds — spawn/deps reuse the map). Kinds absent from the
 /// output are omitted; callers fall back to [`IntegrationStatus::not_installed`].
 pub fn parse_integration_status_output(raw: &str) -> Vec<(String, IntegrationStatus)> {
@@ -370,15 +371,15 @@ pub fn parse_integration_status_output(raw: &str) -> Vec<(String, IntegrationSta
         .collect()
 }
 
-/// Run `herdr integration status` once and return every kind's state.
+/// Run `hc integration status` once and return every kind's state.
 pub fn integration_status_all() -> Result<Vec<(String, IntegrationStatus)>> {
-    let out = std::process::Command::new("herdr")
+    let out = std::process::Command::new("hc")
         .args(["integration", "status"])
         .output()
-        .map_err(|e| anyhow!("cannot run `herdr integration status`: {e}"))?;
+        .map_err(|e| anyhow!("cannot run `hc integration status`: {e}"))?;
     if !out.status.success() {
         bail!(
-            "`herdr integration status` failed ({}): {}",
+            "`hc integration status` failed ({}): {}",
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         );
@@ -388,14 +389,14 @@ pub fn integration_status_all() -> Result<Vec<(String, IntegrationStatus)>> {
     )))
 }
 
-/// Install a kind's herdr integration through the socket `integration.install`
-/// method (herdr 0.8.0-preview raw method; the socket is the in-process
-/// surface — `herdr integration install <TARGET>` is the CLI twin). Returns
+/// Install a kind's hc integration through the socket `integration.install`
+/// method (hc 0.8.0-preview raw method; the socket is the in-process
+/// surface — `hc integration install <TARGET>` is the CLI twin). Returns
 /// the server's install messages. The CALLER decides how to surface
 /// failures — H3 preflight warns loudly and never fails the spawn.
 pub fn integration_install_socket(c: &Client, kind: &str) -> Result<Vec<String>> {
     let target = integration_target(kind)
-        .ok_or_else(|| anyhow!("kind {kind} has no herdr integration target"))?;
+        .ok_or_else(|| anyhow!("kind {kind} has no hc integration target"))?;
     // GS-037 P1: mkdir parent dirs before socket install (pi/omp/opencode).
     ensure_integration_parent_dirs(target);
     let resp = c.call("integration.install", json!({ "target": target }))?;
@@ -415,7 +416,7 @@ pub fn integration_install_socket(c: &Client, kind: &str) -> Result<Vec<String>>
 /// Strip terminal control sequences and TUI box-drawing chrome from a pane
 /// read (bd-3hd).
 ///
-/// herdr's `strip_ansi` (sent on every `agent.read`) only removes CSI color
+/// hc's `strip_ansi` (sent on every `agent.read`) only removes CSI color
 /// codes; the `visible` source keeps the full alternate-screen render —
 /// opencode's TUI border glyphs (┏━┃┗ etc) plus cursor/hyperlink sequences —
 /// so reads of a working agent are still garbled. This runs on ALL read
@@ -489,7 +490,7 @@ pub fn resolve_workspace_id(
         return matches[0].workspace_id.clone();
     }
     // bd-ws-resolution (2026-08-17): prefer the flywheel-OWNED workspace
-    // LABEL over a foreign workspace sharing the bare project label — herdr
+    // LABEL over a foreign workspace sharing the bare project label — hc
     // reports no names for omp panes, so the agent-name scan below found
     // nothing and dispatch fell to list order, targeting a foreign
     // workspace with zero flywheel agents ("no agents in workspace w37").
@@ -518,7 +519,7 @@ pub fn resolve_workspace_id(
 
 /// The workspace holding the project's REGISTERED panes.
 ///
-/// A spawned crew's herdr name is its MAIL PIN (the spawn names agents by the
+/// A spawned crew's terminal name is its MAIL PIN (the spawn names agents by the
 /// identity they were given), so the prefix scan in [`resolve_workspace_id`]
 /// cannot see it and the tie falls to list order — the stale room that merely
 /// carries the bare project label. The spawn registry is the project→pane
@@ -551,7 +552,7 @@ pub fn resolve_workspace_from_registry(
 }
 
 // ---------------------------------------------------------------------------
-// flywheel-local wire types (deleted `src/herdr.rs` — verbatim). toron-core
+// flywheel-local wire types (deleted `src/hc.rs` — verbatim). toron-core
 // models the client, not the per-event payload shapes flywheel routes on.
 // ---------------------------------------------------------------------------
 
@@ -561,16 +562,16 @@ pub fn resolve_workspace_from_registry(
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // bin matches on the typed `data` variant; `kind` is informational
 pub struct PushEvent {
-    pub kind: HerdrEventKind,
-    pub data: HerdrEventData,
+    pub kind: TerminalEventKind,
+    pub data: TerminalEventData,
 }
 
-/// All herdr event kinds: the 26 server events (snake_case wire names) plus
+/// All hc event kinds: the 26 server events (snake_case wire names) plus
 /// the 3 subscription pushes (dot namespaced wire names). `parse` accepts
 /// both namespaces; `as_wire_str` returns the exact wire name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // consumed by tests + the reactor; bin matches on data today
-pub enum HerdrEventKind {
+pub enum TerminalEventKind {
     WorkspaceCreated,
     WorkspaceUpdated,
     WorkspaceMetadataUpdated,
@@ -602,12 +603,12 @@ pub enum HerdrEventKind {
     PaneScrollChanged,
 }
 
-impl HerdrEventKind {
+impl TerminalEventKind {
     /// Parse a wire event name. Accepts both namespaces: the 26 snake_case
     /// server events and the 3 dotted subscription events.
     #[allow(dead_code)]
     pub fn parse(s: &str) -> Result<Self> {
-        use HerdrEventKind::{
+        use TerminalEventKind::{
             LayoutUpdated, PaneAgentDetected, PaneAgentStatusChanged, PaneAgentStatusChangedSub,
             PaneClosed, PaneCreated, PaneExited, PaneFocused, PaneMoved, PaneOutputChanged,
             PaneOutputMatched, PaneScrollChanged, PaneUpdated, TabClosed, TabCreated, TabFocused,
@@ -645,7 +646,7 @@ impl HerdrEventKind {
             "pane.agent_status_changed" => PaneAgentStatusChangedSub,
             "pane.output_matched" => PaneOutputMatched,
             "pane.scroll_changed" => PaneScrollChanged,
-            other => bail!("unknown herdr event kind: {other}"),
+            other => bail!("unknown hc event kind: {other}"),
         };
         Ok(kind)
     }
@@ -653,7 +654,7 @@ impl HerdrEventKind {
 
 // ---- typed event payloads ----
 //
-// Field sets mirror the live schema (`herdr api schema --json` →
+// Field sets mirror the live schema (`hc api schema --json` →
 // `schemas/event/$defs/EventData.oneOf`). Nested objects that flywheel does
 // not consume yet stay `Value` — the goal is type safety for the fields we
 // route on, not a full model of every payload. `WorkspaceInfo` and `PaneInfo`
@@ -902,7 +903,7 @@ pub struct PaneAgentDetected {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-// wire-contract struct: parsed from the herdr protocol; not every
+// wire-contract struct: parsed from the hc protocol; not every
 // field is consumed by the client — the unused ones must still deserialize.
 #[allow(dead_code)]
 pub struct PaneAgentStatusChanged {
@@ -949,7 +950,7 @@ pub struct PaneScrollChangedEvent {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // variant payloads consumed by tests + reactor
 #[allow(clippy::large_enum_variant, clippy::enum_variant_names)] // wire-fidelity names; parsed once per event
-pub enum HerdrEventData {
+pub enum TerminalEventData {
     WorkspaceCreated(WorkspaceCreated),
     WorkspaceUpdated(WorkspaceUpdated),
     WorkspaceMetadataUpdated(WorkspaceMetadataUpdated),
@@ -981,11 +982,11 @@ pub enum HerdrEventData {
     PaneScrollChanged(PaneScrollChangedEvent),
 }
 
-impl HerdrEventData {
+impl TerminalEventData {
     /// Deserialize the payload `data` for the given `kind`.
     #[allow(dead_code)]
-    pub fn from_kind(kind: HerdrEventKind, data: Value) -> Result<Self> {
-        use HerdrEventKind::{
+    pub fn from_kind(kind: TerminalEventKind, data: Value) -> Result<Self> {
+        use TerminalEventKind::{
             LayoutUpdated, PaneAgentDetected, PaneAgentStatusChanged, PaneAgentStatusChangedSub,
             PaneClosed, PaneCreated, PaneExited, PaneFocused, PaneMoved, PaneOutputChanged,
             PaneOutputMatched, PaneScrollChanged, PaneUpdated, TabClosed, TabCreated, TabFocused,
@@ -1028,25 +1029,25 @@ impl HerdrEventData {
     }
 }
 
-/// Typed herdr protocol error carrying the machine-readable code.
+/// Typed plane protocol error carrying the machine-readable code.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HerdrError {
+pub struct PlaneError {
     pub code: String,
     pub message: String,
 }
 
-impl std::fmt::Display for HerdrError {
+impl std::fmt::Display for PlaneError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "herdr error {}: {}", self.code, self.message)
+        write!(f, "plane error {}: {}", self.code, self.message)
     }
 }
 
-impl std::error::Error for HerdrError {}
+impl std::error::Error for PlaneError {}
 
 /// Map a toron-core `BackendError` onto the flywheel-local typed error.
 /// Classification stays on the machine code (`BackendErrorCode::as_str`).
-fn to_herdr_error(e: toron_core::backend::error::BackendError) -> HerdrError {
-    HerdrError {
+fn to_plane_error(e: toron_core::backend::error::BackendError) -> PlaneError {
+    PlaneError {
         code: e.code().as_str().to_string(),
         message: e.message.clone(),
     }
@@ -1068,19 +1069,19 @@ pub struct PaneWaitResult {
 /// Request params for `pane.wait_for_output` (protocol v18).
 ///
 /// `mode` mirrors the CLI's `--match`/`--regex`: `"match"` is a literal
-/// substring search, `"regex"` a Rust regex (herdr-side). Anything else is a
+/// substring search, `"regex"` a Rust regex (hc-side). Anything else is a
 /// caller bug — bail with code `"usage"`.
 pub fn wait_for_output_params(
     pane_id: &str,
     mode: &str,
     pattern: &str,
     timeout_ms: Option<u64>,
-) -> std::result::Result<Value, HerdrError> {
+) -> std::result::Result<Value, PlaneError> {
     let match_type = match mode {
         "match" => "substring",
         "regex" => "regex",
         other => {
-            return Err(HerdrError {
+            return Err(PlaneError {
                 code: "usage".into(),
                 message: format!(
                     "unknown pane wait-output mode: {other} (expected \"match\" or \"regex\")"
@@ -1101,8 +1102,8 @@ pub fn wait_for_output_params(
 /// object carrying the snapshot text; any shape drift becomes code `"parse"`.
 pub fn parse_wait_for_output_result(
     res: &Value,
-) -> std::result::Result<PaneWaitResult, HerdrError> {
-    let parse_err = |msg: String| HerdrError {
+) -> std::result::Result<PaneWaitResult, PlaneError> {
+    let parse_err = |msg: String| PlaneError {
         code: "parse".into(),
         message: msg,
     };
@@ -1177,22 +1178,22 @@ pub fn pane_split(
 /// `pane.zoom` — delegation over `Client::call`.
 pub fn pane_zoom(c: &Client, pane_id: &str, mode: &str) -> Result<Value> {
     c.call("pane.zoom", json!({ "pane_id": pane_id, "mode": mode }))
-        .map_err(|e| anyhow!("herdr pane.zoom failed: {e}"))
+        .map_err(|e| anyhow!("hc terminal.zoom failed: {e}"))
 }
 
 /// `pane.wait_for_output` — delegation over `Client::call_coded`. Returns a
-/// typed `HerdrError` so callers can classify (`timeout` code on a miss).
+/// typed `PlaneError` so callers can classify (`timeout` code on a miss).
 pub fn pane_wait_output(
     c: &Client,
     pane_id: &str,
     mode: &str,
     pattern: &str,
     timeout_ms: Option<u64>,
-) -> std::result::Result<PaneWaitResult, HerdrError> {
+) -> std::result::Result<PaneWaitResult, PlaneError> {
     let params = wait_for_output_params(pane_id, mode, pattern, timeout_ms)?;
     let res = c
         .call_coded("pane.wait_for_output", params)
-        .map_err(to_herdr_error)?;
+        .map_err(to_plane_error)?;
     parse_wait_for_output_result(&res)
 }
 
@@ -1200,7 +1201,7 @@ pub fn pane_wait_output(
 /// freshly-split pane until its shell has rendered a prompt, so the launch
 /// command lands in an INTERACTIVE shell — not a booting one.
 ///
-/// Why this gate exists: herdr's `agent.start` types the launch command
+/// Why this gate exists: hc's `agent.start` types the launch command
 /// into the pane's PTY immediately after `pane.split` returns. A new
 /// pane's shell is still starting up (zsh running `.zshrc`, prompt not yet
 /// rendered) and the PTY is in CANONICAL mode with a 1024-byte line limit
@@ -1302,7 +1303,7 @@ pub fn worktree_list(c: &Client, workspace_id: Option<&str>) -> Result<Vec<Workt
 /// foreground_process_group_id` while it runs; when the process dies the pane
 /// falls back to the shell prompt and the agent binary disappears from the
 /// list. This is the ground-truth liveness signal `flywheel recover` probes
-/// (a pane can exist in herdr while the process inside it is dead).
+/// (a pane can exist in hc while the process inside it is dead).
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct PaneProcessInfoProcess {
@@ -1335,8 +1336,8 @@ pub fn pane_process_info(c: &Client, pane_id: &str) -> Result<PaneProcessInfo> {
 }
 
 /// Known agent-kind → process-name mapping for the liveness probe (bd-1np).
-/// These are the canonical executables herdr launches per kind
-/// (`herdr agent start --kind <KIND>`); the foreground process's `name` /
+/// These are the canonical executables hc launches per kind
+/// (`hc agent start --kind <KIND>`); the foreground process's `name` /
 /// `argv0` matches one of these while the agent lives.
 pub fn kind_process_names(kind: &str) -> &'static [&'static str] {
     match kind {
@@ -1366,7 +1367,7 @@ fn process_name_matches(candidate: &str, expected: &str) -> bool {
 /// Pure liveness verdict from a `pane.process_info` snapshot (bd-1np).
 ///
 /// The agent process is alive iff its binary appears in the pane's foreground
-/// processes (herdr's process-info lists the whole foreground group; the live
+/// processes (hc's process-info lists the whole foreground group; the live
 /// agent is its leader). Rules:
 /// - binary match → `Some(true)` (ground truth, no other check needed);
 /// - no binary match AND the pane's shell owns the foreground group
@@ -1403,7 +1404,7 @@ pub fn pane_agent_alive(info: &PaneProcessInfo, kind: &str) -> Option<bool> {
 
 /// Spawn-to-dispatch readiness gate (bd-eign.6): poll `pane.process_info`
 ///
-/// herdr's `agent.start` returns once the launch command is dispatched, NOT
+/// hc's `agent.start` returns once the launch command is dispatched, NOT
 /// when the agent TUI is ready to receive input — during the 2-30s boot
 /// window (config load, MCP server spawn, model connect) the foreground
 /// process is the shell or a startup command, and a prompt dispatched in
@@ -1448,7 +1449,7 @@ pub fn wait_agent_foreground(
 ///
 /// `pane_agent_alive` proves the process exists and owns the foreground
 /// group; a frozen agent (stuck TUI, no event-loop progress) still passes
-/// that check. Responsiveness uses herdr's per-pane `state_change_seq`: a
+/// that check. Responsiveness uses hc's per-pane `state_change_seq`: a
 /// live agent's state counter advances on every state change, so a seq that
 /// does NOT advance across a full window while the agent reports Idle is a
 /// frozen process — provably unresponsive, needs respawn.
@@ -1522,7 +1523,7 @@ pub fn probe_agent_responsiveness(
 enum StreamItem {
     Event(PushEvent),
     Closed,
-    /// herdr subscriber fell behind — typed `events_lost` (toron surfaces it).
+    /// hc subscriber fell behind — typed `events_lost` (toron surfaces it).
     EventsLost,
     Error(String),
 }
@@ -1548,7 +1549,7 @@ pub struct EventStream {
     timeout: Option<Duration>,
 }
 
-/// Subscribe to herdr push events, returning the flywheel-shaped stream.
+/// Subscribe to hc push events, returning the flywheel-shaped stream.
 /// Delegation: the subscription handshake + socket lifecycle are entirely
 /// toron-core's.
 pub fn subscribe(c: &Client, _subscriptions: &[Subscription]) -> Result<EventStream> {
@@ -1578,8 +1579,8 @@ fn push_from_backend(ev: toron_core::backend::types::BackendEvent) -> Option<Pus
                 title: None,
             };
             Some(PushEvent {
-                kind: HerdrEventKind::PaneAgentStatusChangedSub,
-                data: HerdrEventData::PaneAgentStatusChangedSub(change),
+                kind: TerminalEventKind::PaneAgentStatusChangedSub,
+                data: TerminalEventData::PaneAgentStatusChangedSub(change),
             })
         }
         BackendEvent::AgentDetected { pane, agent, status } => {
@@ -1591,13 +1592,13 @@ fn push_from_backend(ev: toron_core::backend::types::BackendEvent) -> Option<Pus
                 released: None,
             };
             Some(PushEvent {
-                kind: HerdrEventKind::PaneAgentDetected,
-                data: HerdrEventData::PaneAgentDetected(change),
+                kind: TerminalEventKind::PaneAgentDetected,
+                data: TerminalEventData::PaneAgentDetected(change),
             })
         }
         BackendEvent::PaneExited { pane } => Some(PushEvent {
-            kind: HerdrEventKind::PaneExited,
-            data: HerdrEventData::PaneExited(PaneExited {
+            kind: TerminalEventKind::PaneExited,
+            data: TerminalEventData::PaneExited(PaneExited {
                 pane_id: pane.as_str().to_string(),
                 workspace_id: String::new(),
             }),
@@ -1660,19 +1661,19 @@ where
     loop {
         match read() {
             Ok(Some((kind, data))) => {
-                let ev = match HerdrEventKind::parse(&kind) {
-                    Ok(k) => match HerdrEventData::from_kind(k, data) {
+                let ev = match TerminalEventKind::parse(&kind) {
+                    Ok(k) => match TerminalEventData::from_kind(k, data) {
                         Ok(data) => PushEvent { kind: k, data },
                         Err(e) => {
                             let _ = tx.send(StreamItem::Error(format!(
-                                "malformed herdr event {kind}: {e}"
+                                "malformed hc event {kind}: {e}"
                             )));
                             break;
                         }
                     },
                     Err(e) => {
                         let _ = tx.send(StreamItem::Error(format!(
-                            "unknown herdr event kind {kind}: {e}"
+                            "unknown hc event kind {kind}: {e}"
                         )));
                         break;
                     }
@@ -1693,7 +1694,7 @@ where
                 }
             }
             Err(e) => {
-                let _ = tx.send(StreamItem::Error(format!("herdr read failed: {e}")));
+                let _ = tx.send(StreamItem::Error(format!("hc read failed: {e}")));
                 break;
             }
         }
@@ -1719,13 +1720,13 @@ impl EventStream {
         let item = match self.timeout {
             Some(d) => self.rx.recv_timeout(d).map_err(|e| match e {
                 std::sync::mpsc::RecvTimeoutError::Timeout => {
-                    anyhow!("herdr stream read timed out")
+                    anyhow!("hc stream read timed out")
                 }
                 std::sync::mpsc::RecvTimeoutError::Disconnected => {
-                    anyhow!("herdr stream closed")
+                    anyhow!("hc stream closed")
                 }
             }),
-            None => self.rx.recv().map_err(|_| anyhow!("herdr stream closed")),
+            None => self.rx.recv().map_err(|_| anyhow!("hc stream closed")),
         }?;
         match item {
             StreamItem::Event(e) => Ok(StreamOutcome::Event(Box::new(e))),
@@ -1929,8 +1930,8 @@ mod process_liveness_tests {
 }
 
 #[cfg(test)]
-mod herdr_env_tests {
-    use super::{apply_opencode_go_api_key_alias, herdr_integration_env};
+mod plane_launch_env_tests {
+    use super::{apply_opencode_go_api_key_alias, plane_launch_env};
 
     fn cfg() -> crate::config::Config {
         crate::config::Config::default()
@@ -1942,8 +1943,9 @@ mod herdr_env_tests {
     /// and the loop substitutes for {AGENT_NAME}).
     #[test]
     fn env_carries_pin_as_agent_name_and_mail_as() {
-        let env = herdr_integration_env(&cfg(), Some("DustySparrow"));
-        assert_eq!(env.get("HERDR_ENV").map(String::as_str), Some("1"));
+        let env = plane_launch_env(&cfg(), Some("DustySparrow"));
+        assert!(env.get("HC_SOCKET_PATH").map(|s| s.contains("herdr-core")).unwrap_or(false));
+        assert_eq!(env.get("HC_SESSION").map(String::as_str), Some("default"));
         assert_eq!(
             env.get("AGENT_NAME").map(String::as_str),
             Some("DustySparrow")
@@ -1956,15 +1958,15 @@ mod herdr_env_tests {
 
     #[test]
     fn env_without_pin_omits_identity_keys() {
-        let env = herdr_integration_env(&cfg(), None);
-        assert!(env.contains_key("HERDR_ENV"));
+        let env = plane_launch_env(&cfg(), None);
+        assert!(env.contains_key("HC_SOCKET_PATH"));
         assert!(!env.contains_key("AGENT_NAME"));
         assert!(!env.contains_key("FLYWHEEL_MAIL_AS"));
     }
 
     #[test]
     fn env_ignores_empty_pin() {
-        let env = herdr_integration_env(&cfg(), Some(""));
+        let env = plane_launch_env(&cfg(), Some(""));
         assert!(!env.contains_key("AGENT_NAME"));
         assert!(!env.contains_key("FLYWHEEL_MAIL_AS"));
     }
@@ -1977,7 +1979,7 @@ mod herdr_env_tests {
             std::env::remove_var("OPENCODE_API_KEY");
             std::env::set_var("OPENCODE_GO_API_KEY", "test-go-key-not-a-secret-fixture");
         }
-        let env = herdr_integration_env(&cfg(), None);
+        let env = plane_launch_env(&cfg(), None);
         assert_eq!(
             env.get("OPENCODE_API_KEY").map(String::as_str),
             Some("test-go-key-not-a-secret-fixture")
@@ -2704,7 +2706,7 @@ fn opencode_tail_parts(parts: &[Value], n: usize) -> Vec<Value> {
     }
 }
 
-/// bd-swarm-cockpit-pczs: the last `n` actions from the session herdr
+/// bd-swarm-cockpit-pczs: the last `n` actions from the session hc
 /// reports for a pane (`agent_session`). `path` sessions (pi JSONL) read the
 /// file; `id` sessions (opencode) run one DESC LIMIT query against the
 /// structured store. Both produce the same rows: `{ts, kind, tool, detail}`.
@@ -2766,23 +2768,23 @@ pub trait AltScreenReadOps {
     /// within the bound; `Ok(false)` = timed out; `Err` = wait failed.
     fn wait_idle(&mut self) -> Result<bool, BackendError>;
     /// Last resort: prompt the agent to write its recent output to a temp
-    /// file, then read the file back (herdr docs' file-path contract).
+    /// file, then read the file back (hc docs' file-path contract).
     fn file_fallback(&mut self) -> Result<String, BackendError>;
 }
 
-/// Bounded wait budget for `wait_idle` (herdr `agent.wait` timeout).
+/// Bounded wait budget for `wait_idle` (hc `agent.wait` timeout).
 pub const ALT_SCREEN_IDLE_WAIT_MS: u64 = 5_000;
 
-/// herdr wire `agent.read` source for unwrapped transcript history (the
+/// hc wire `agent.read` source for unwrapped transcript history (the
 /// docs call it `recent-unwrapped`; the protocol enum is
-/// `recent_unwrapped` — verified live against herdr
+/// `recent_unwrapped` — verified live against hc
 /// 0.8.0-preview.2026-08-04-d78e3d3b5126, 2026-08-15).
 pub const RECENT_UNWRAPPED_SOURCE: &str = "recent_unwrapped";
 
 /// H4 (bd-harness-alt-screen-reads): the alt-screen transcript read ladder.
 ///
 /// 1. `recent-unwrapped` (the transcript source — wire name
-///    `recent_unwrapped`; herdr auto-scrolls the mouse-scroll interface when
+///    `recent_unwrapped`; hc auto-scrolls the mouse-scroll interface when
 ///    the agent is idle).
 /// 2. `agent_not_idle` → bounded wait for idle + ONE retry.
 /// 3. Still unavailable → `visible` buffer.
@@ -2860,7 +2862,7 @@ pub fn alt_screen_file_fallback(
     })
 }
 
-/// H4 (bd-harness-alt-screen-reads): adapter over the toron-core herdr
+/// H4 (bd-harness-alt-screen-reads): adapter over the toron-core hc
 /// `Client` (cmd_view path).
 pub struct ClientAltScreenRead<'a> {
     c: &'a mut Client,
@@ -3262,7 +3264,7 @@ mod pi_tail_tests {
 
     fn path_session(p: &str) -> super::AgentSessionInfo {
         super::AgentSessionInfo {
-            source: "herdr:pi".into(),
+            source: "hc:pi".into(),
             agent: "pi".into(),
             kind: super::AgentSessionRefKind::Path,
             value: p.into(),
@@ -3306,7 +3308,7 @@ mod pi_tail_tests {
     }
 }
 
-/// H3 (bd-harness-integration-preflight): `herdr integration status` CLI
+/// H3 (bd-harness-integration-preflight): `hc integration status` CLI
 /// output parser + install-target mapping. The gate is
 /// `cargo test -p flywheel integration_status`.
 #[cfg(test)]
@@ -3320,7 +3322,7 @@ mod integration_status_tests {
     #[test]
     fn integration_status_parser_current() {
         let (kind, st) = parse_integration_status_line(
-            "opencode: current (v9) (/Users/bangedorrunt/.config/opencode/plugins/herdr-agent-state.js)",
+            "opencode: current (v9) (/Users/bangedorrunt/.config/opencode/plugins/plane-agent-state.js)",
         )
         .expect("current line parses");
         assert_eq!(kind, "opencode");
@@ -3330,7 +3332,7 @@ mod integration_status_tests {
         assert_eq!(st.expected_version, None);
         assert_eq!(
             st.path.as_deref(),
-            Some("/Users/bangedorrunt/.config/opencode/plugins/herdr-agent-state.js")
+            Some("/Users/bangedorrunt/.config/opencode/plugins/plane-agent-state.js")
         );
     }
 
@@ -3338,7 +3340,7 @@ mod integration_status_tests {
     #[test]
     fn integration_status_parser_outdated() {
         let (kind, st) = parse_integration_status_line(
-            "hermes: outdated (v3 < v4) (/Users/bangedorrunt/.hermes/plugins/herdr-agent-state/__init__.py)",
+            "hermes: outdated (v3 < v4) (/Users/bangedorrunt/.hermes/plugins/plane-agent-state/__init__.py)",
         )
         .expect("outdated line parses");
         assert_eq!(kind, "hermes");
@@ -3348,7 +3350,7 @@ mod integration_status_tests {
         assert_eq!(st.expected_version.as_deref(), Some("v4"));
         assert_eq!(
             st.path.as_deref(),
-            Some("/Users/bangedorrunt/.hermes/plugins/herdr-agent-state/__init__.py")
+            Some("/Users/bangedorrunt/.hermes/plugins/plane-agent-state/__init__.py")
         );
     }
 
@@ -3356,7 +3358,7 @@ mod integration_status_tests {
     #[test]
     fn integration_status_parser_not_installed() {
         let (kind, st) = parse_integration_status_line(
-            "claude: not installed (/Users/bangedorrunt/.claude/hooks/herdr-agent-state.sh)",
+            "claude: not installed (/Users/bangedorrunt/.claude/hooks/plane-agent-state.sh)",
         )
         .expect("not-installed line parses");
         assert_eq!(kind, "claude");
@@ -3366,22 +3368,22 @@ mod integration_status_tests {
         assert_eq!(st.expected_version, None);
         assert_eq!(
             st.path.as_deref(),
-            Some("/Users/bangedorrunt/.claude/hooks/herdr-agent-state.sh")
+            Some("/Users/bangedorrunt/.claude/hooks/plane-agent-state.sh")
         );
     }
 
-    /// A path containing spaces (herdr prints the literal path) must not
+    /// A path containing spaces (hc prints the literal path) must not
     /// break the state extraction — the LAST ` (...) ` group is the path.
     #[test]
     fn integration_status_parser_path_with_spaces() {
         let (_, st) = parse_integration_status_line(
-            "kimi: current (v2) (/Users/bangedorrunt/Library/Application Support/kimi/hooks/herdr-agent-state.sh)",
+            "kimi: current (v2) (/Users/bangedorrunt/Library/Application Support/kimi/hooks/plane-agent-state.sh)",
         )
         .expect("spacey path line parses");
         assert!(st.installed && st.current);
         assert_eq!(
             st.path.as_deref(),
-            Some("/Users/bangedorrunt/Library/Application Support/kimi/hooks/herdr-agent-state.sh")
+            Some("/Users/bangedorrunt/Library/Application Support/kimi/hooks/plane-agent-state.sh")
         );
     }
 
@@ -3409,10 +3411,10 @@ mod integration_status_tests {
     #[test]
     fn integration_status_output_parses_all_kinds() {
         let raw = "\
-pi: current (v8) (/Users/bangedorrunt/.pi/agent/extensions/herdr-agent-state.ts)
-omp: current (v8) (/Users/bangedorrunt/.omp/agent/extensions/herdr-omp-agent-state.ts)
-claude: not installed (/Users/bangedorrunt/.claude/hooks/herdr-agent-state.sh)
-hermes: outdated (v3 < v4) (/Users/bangedorrunt/.hermes/plugins/herdr-agent-state/__init__.py)
+pi: current (v8) (/Users/bangedorrunt/.pi/agent/extensions/plane-agent-state.ts)
+omp: current (v8) (/Users/bangedorrunt/.omp/agent/extensions/hc-omp-agent-state.ts)
+claude: not installed (/Users/bangedorrunt/.claude/hooks/plane-agent-state.sh)
+hermes: outdated (v3 < v4) (/Users/bangedorrunt/.hermes/plugins/plane-agent-state/__init__.py)
 ";
         let map: std::collections::HashMap<_, _> =
             parse_integration_status_output(raw).into_iter().collect();
@@ -3498,7 +3500,7 @@ mod shell_prompt_tests {
     }
 
     /// bd-ws-resolution (2026-08-17): with a foreign workspace sharing the
-    /// bare project label, the flywheel-OWNED label must win even when herdr
+    /// bare project label, the flywheel-OWNED label must win even when hc
     /// reports NO agent names (the omp case — the name scan finds nothing
     /// and the old code fell back to list order, dispatching into a foreign
     /// workspace: "no agents in workspace w37").
@@ -3683,10 +3685,10 @@ mod shell_gate_e2e {
     use super::*;
 
     #[test]
-    #[ignore = "bd-d7zu LIVE probe: needs a live herdr daemon"]
+    #[ignore = "bd-d7zu LIVE probe: needs a live hc daemon"]
     fn real_pane_reaches_a_detected_prompt() {
         let cfg = crate::Config::load().expect("config");
-        let mut c = Client::connect(Some(&cfg.socket_path())).expect("herdr connect");
+        let mut c = Client::connect(Some(&cfg.socket_path())).expect("hc connect");
         let created = c
             .call(
                 "workspace.create",
@@ -3870,7 +3872,7 @@ mod bd_crlx_model_pin_tests {
 
 
 
-/// Compatibility surface for call sites that still speak the old herdr Client
+/// Compatibility surface for call sites that still speak the old hc Client
 /// method names. Prefer MultiplexerBackend (rex primary / hc fallback) for new
 /// code. Methods that hc does not implement call through `call`/`call_coded`
 /// and surface `missing_method` from the server, or return Unsupported-shaped

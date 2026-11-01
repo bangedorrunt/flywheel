@@ -29,8 +29,8 @@
 //!   restart (`applied_by_restart`) or, for `cancel`, by exit (P10).
 //! - **Poison**: a child ending abnormally 3 incarnations in a row is
 //!   parked as a ceiling.
-//! - **herdr down**: log-only. No restarts; one escalation; the children
-//!   needing one restart (through the intensity check) once herdr is back.
+//! - **hc down**: log-only. No restarts; one escalation; the children
+//!   needing one restart (through the intensity check) once hc is back.
 //! - the loop pass child (`pass`), the wedge page set and the dead-stop
 //!   flag that `cmd_loop_supervise` kept in locals.
 //!
@@ -313,7 +313,7 @@ pub enum ChildState {
     Running,
     /// Relaunch asked, not yet confirmed.
     Restarting,
-    /// Needs a restart that herdr's absence deferred.
+    /// Needs a restart that hc's absence deferred.
     NeedsRestart,
     /// Ended normally (`Done`). Final.
     Done,
@@ -581,10 +581,10 @@ pub struct SupModel {
     pub rejects: u64,
     /// Pages emitted (keys the page commands).
     pub pages: u64,
-    /// herdr reachable.
-    pub herdr_up: bool,
-    /// herdr-down already escalated.
-    pub herdr_escalated: bool,
+    /// hc reachable.
+    pub plane_up: bool,
+    /// hc-down already escalated.
+    pub plane_escalated: bool,
     /// Pins paged for a wedge since work last moved.
     pub paged: BTreeSet<String>,
     /// Dead-stop already paged.
@@ -667,8 +667,8 @@ impl SupModel {
             escalations: 0,
             rejects: 0,
             pages: 0,
-            herdr_up: true,
-            herdr_escalated: false,
+            plane_up: true,
+            plane_escalated: false,
             paged: BTreeSet::new(),
             stalled: false,
             dead_doorbells: BTreeSet::new(),
@@ -846,13 +846,13 @@ pub enum SupMsg {
         /// Gen.
         generation: u64,
     },
-    /// herdr is unreachable.
-    HerdrDown {
+    /// hc is unreachable.
+    PlaneDown {
         /// Time.
         now_ms: u64,
     },
-    /// herdr is back.
-    HerdrUp {
+    /// hc is back.
+    PlaneUp {
         /// Time.
         now_ms: u64,
     },
@@ -887,7 +887,7 @@ pub enum SupMsg {
         /// Doorbell workspace label.
         label: String,
     },
-    /// A herdr-bound pin passed the presence TTL.
+    /// An hc-bound pin passed the presence TTL.
     StaleHeartbeat {
         /// Agent pin.
         pin: String,
@@ -1468,7 +1468,7 @@ fn pick_assignee(m: &SupModel, bead: &ReadyBead) -> Option<(String, u64)> {
 }
 
 /// A child ended abnormally: restart it, park it, or fail the supervisor.
-/// `count_incarnation` is false for a deferred restart (herdr was down).
+/// `count_incarnation` is false for a deferred restart (hc was down).
 fn abnormal_end(
     next: &mut SupModel,
     cmds: &mut Vec<SupCmd>,
@@ -1486,7 +1486,7 @@ fn abnormal_end(
         if !c.state.live() {
             return;
         }
-        // Already ended and waiting on herdr: one end is one incarnation.
+        // Already ended and waiting on hc: one end is one incarnation.
         if c.state == ChildState::NeedsRestart && count_incarnation {
             return;
         }
@@ -1521,7 +1521,7 @@ fn abnormal_end(
         });
         return;
     }
-    if !next.herdr_up {
+    if !next.plane_up {
         c.state = ChildState::NeedsRestart;
         return;
     }
@@ -1585,7 +1585,7 @@ fn abnormal_end(
 /// The children one failure of `failed` restarts, in start order, `failed`
 /// included. A pure function of the model, so replay recomputes it exactly.
 /// A sibling is in the set only while `Running`: one already `Restarting` (or
-/// waiting on herdr) is covered by the restart it has, never restarted twice.
+/// waiting on hc) is covered by the restart it has, never restarted twice.
 /// The loop pass is cadence, not a crew: it never joins another child's set
 /// and its own failure never cascades.
 fn restart_set(m: &SupModel, failed: &str) -> Vec<String> {
@@ -1922,23 +1922,23 @@ impl Program for SupervisorProgram {
                     c.state = ChildState::Running;
                 }
             }
-            SupMsg::HerdrDown { now_ms } => {
+            SupMsg::PlaneDown { now_ms } => {
                 next.now_ms = next.now_ms.max(*now_ms);
-                next.herdr_up = false;
-                if !next.herdr_escalated {
-                    next.herdr_escalated = true;
+                next.plane_up = false;
+                if !next.plane_escalated {
+                    next.plane_escalated = true;
                     escalate(
                         &mut next,
                         &mut cmds,
-                        "herdr_down",
-                        "herdr unreachable: log-only, no restarts until it is back".into(),
+                        "plane_down",
+                        "hc unreachable: log-only, no restarts until it is back".into(),
                     );
                 }
             }
-            SupMsg::HerdrUp { now_ms } => {
+            SupMsg::PlaneUp { now_ms } => {
                 next.now_ms = next.now_ms.max(*now_ms);
-                next.herdr_up = true;
-                next.herdr_escalated = false;
+                next.plane_up = true;
+                next.plane_escalated = false;
             }
             SupMsg::PassExit { ok, now_ms } => {
                 next.now_ms = next.now_ms.max(*now_ms);
@@ -2041,8 +2041,8 @@ impl Program for SupervisorProgram {
                 // nothing leaves the model equal, so the host logs nothing.
                 let now = next.now_ms.max(*now_ms);
                 if next.status == Status::Running {
-                    // A restart herdr's absence deferred (level-triggered).
-                    if next.herdr_up {
+                    // A restart hc's absence deferred (level-triggered).
+                    if next.plane_up {
                         let ids: Vec<String> = next
                             .children
                             .iter()
@@ -2808,12 +2808,12 @@ mod tests {
     }
 
     #[test]
-    fn a_cascade_deferred_by_herdr_down_runs_once_when_it_is_back() {
+    fn a_cascade_deferred_by_plane_down_runs_once_when_it_is_back() {
         let m = strat(Strategy::OneForAll, &["a", "b"]);
-        let (m, _) = step(&m, &SupMsg::HerdrDown { now_ms: 5 });
+        let (m, _) = step(&m, &SupMsg::PlaneDown { now_ms: 5 });
         let (m, c) = step(&m, &exit("a", 10));
         assert!(relaunches(&c).is_empty());
-        let (m, _) = step(&m, &SupMsg::HerdrUp { now_ms: 20 });
+        let (m, _) = step(&m, &SupMsg::PlaneUp { now_ms: 20 });
         let (m, c) = step(&m, &SupMsg::Tick { now_ms: 21 });
         assert_eq!(relaunches(&c), rl(&[("a", 2), ("b", 2)]));
         assert_eq!(m.restarts.len(), 1);
@@ -3816,7 +3816,7 @@ mod tests {
         assert_eq!(m.steers[&1].state, SteerState::Escalated);
     }
 
-    // ---- poison, restart kinds, cap, herdr down
+    // ---- poison, restart kinds, cap, hc down
 
     #[test]
     fn three_abnormal_incarnations_park_the_child_as_a_ceiling() {
@@ -3902,17 +3902,17 @@ mod tests {
     }
 
     #[test]
-    fn with_herdr_down_nothing_restarts_and_one_escalation_goes_out_then_it_catches_up() {
-        let (m, c) = step(&base(), &SupMsg::HerdrDown { now_ms: 10 });
+    fn with_plane_down_nothing_restarts_and_one_escalation_goes_out_then_it_catches_up() {
+        let (m, c) = step(&base(), &SupMsg::PlaneDown { now_ms: 10 });
         assert_eq!(escalations(&c), 1);
-        let (m, c) = step(&m, &SupMsg::HerdrDown { now_ms: 11 });
+        let (m, c) = step(&m, &SupMsg::PlaneDown { now_ms: 11 });
         assert_eq!(escalations(&c), 0, "once per outage");
         let (m, c) = step(&m, &exit("a", 20));
-        assert!(relaunches(&c).is_empty(), "log-only while herdr is down");
+        assert!(relaunches(&c).is_empty(), "log-only while hc is down");
         assert_eq!(m.children["a"].state, ChildState::NeedsRestart);
         let (m, c) = step(&m, &SupMsg::Tick { now_ms: 30 });
         assert!(relaunches(&c).is_empty(), "still down at the tick");
-        let (m, _) = step(&m, &SupMsg::HerdrUp { now_ms: 40 });
+        let (m, _) = step(&m, &SupMsg::PlaneUp { now_ms: 40 });
         let (m, c) = step(&m, &SupMsg::Tick { now_ms: 41 });
         assert_eq!(relaunches(&c), vec![("a".to_string(), 2)]);
         assert_eq!(m.children["a"].abnormal, 1, "one end is one incarnation");

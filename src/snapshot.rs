@@ -3,7 +3,7 @@
 //! One fleet snapshot contract (`flywheel-snapshot.v1`) + helm drain data.
 //!
 //! Assembled once per invocation from the workspace model (journal fold,
-//! same replay rule as `doorbell why`), beads JSON, herdr agent list, and
+//! same replay rule as `doorbell why`), beads JSON, hc agent list, and
 //! fallible sources that degrade to empty (never a hard error — a snapshot
 //! with degraded sources is still a snapshot; `degraded` names them).
 //! status / view / watch / steer_brief render from `assemble`; `helm`
@@ -90,7 +90,7 @@ pub struct Snapshot {
     #[serde(default)]
     pub coalitions: Vec<String>,
     /// GS-049: agents still honestly launch-pending (bd-a2bw). Assembled from
-    /// herdr — never invent-green hardcoded 0 in live decide Snapshot.
+    /// hc — never invent-green hardcoded 0 in live decide Snapshot.
     #[serde(default)]
     pub launch_pending: u32,
     /// ADR-0010 D10 delivery-verdict loop projection: per-bead phase, the
@@ -116,8 +116,8 @@ pub fn replay_msg(v: &serde_json::Value) -> Option<crate::workspace::Msg> {
             crate::doorbell_tick::DoorbellMsg::InboxRows { rows, pin } => {
                 Msg::InboxRows { rows, pin }
             }
-            crate::doorbell_tick::DoorbellMsg::HerdrStatus { pin, status } => {
-                Msg::HerdrStatus { pin, status }
+            crate::doorbell_tick::DoorbellMsg::PlaneStatus { pin, status } => {
+                Msg::PlaneStatus { pin, status }
             }
             crate::doorbell_tick::DoorbellMsg::Fact { summary } => Msg::Fact { summary },
             crate::doorbell_tick::DoorbellMsg::AckSlaTick { now } => Msg::AckSlaTick { now },
@@ -222,7 +222,7 @@ fn pick_snapshot_workspace(
     Some(matches[0].workspace_id.clone())
 }
 
-/// Fold one workspace's agents into snapshot pin rows. Shared by the herdr
+/// Fold one workspace's agents into snapshot pin rows. Shared by the hc
 /// and rex doors so both report the same shape.
 fn collect_pin_rows(
     agents: &[crate::hc_support::AgentInfo],
@@ -235,8 +235,8 @@ fn collect_pin_rows(
         if crate::hc_support::agent_still_booting(a) {
             *launch_pending = launch_pending.saturating_add(1);
         }
-        let herdr_status = a.agent_status.as_str();
-        let verdict = crate::workspace::verdict_for(None, herdr_status, herdr_status != "dead")
+        let plane_status = a.agent_status.as_str();
+        let verdict = crate::workspace::verdict_for(None, plane_status, plane_status != "dead")
             .status_token();
         pins.push(PinRow {
             pin: a.name.clone().unwrap_or_else(|| a.pane_id.clone()),
@@ -255,7 +255,7 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
 
     // Pins: agent list for this workspace (best effort). Rex door: inside
     // rex (`REX_SESSION` set) list through the multiplexer backend;
-    // otherwise keep the herdr client. Both paths are read-only — neither
+    // otherwise keep the hc client. Both paths are read-only — neither
     // creates a session.
     let mut pins = Vec::new();
     let mut launch_pending: u32 = 0;
@@ -292,7 +292,7 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
             Ok(mut c) => match crate::find_workspace(&mut c, project) {
                 Ok(ws_id) => match c.agent_list() {
                     Ok(agents) => {
-                        collect_pin_rows(&agents, &ws_id, "herdr", &mut pins, &mut launch_pending);
+                        collect_pin_rows(&agents, &ws_id, "hc", &mut pins, &mut launch_pending);
                     }
                     Err(_) => degraded.push("pins".to_string()),
                 },
@@ -505,7 +505,7 @@ fn read_reservation_board(
 /// reservations from the LIVE reservation board. A row's `reason` is the
 /// reserve-before-work lifecycle's bead id (the same rule `claim_watch_step`
 /// consults), and the row's `holder` is the resolved actor: a pane matches
-/// when the holder equals its herdr name OR the mail identity the caller
+/// when the holder equals its terminal name OR the mail identity the caller
 /// resolves for that name (leases bind the MAIL pin, not the pane title). A
 /// pin with no row keeps empty bead/reservations — absence, never a default.
 /// Pure over the parsed board and an injected identity lookup.
@@ -545,7 +545,7 @@ pub fn bind_pins_to_board(
     }
 }
 
-/// herdr pane ids look like `wP:p1` / `w6:p2`. A lone current pane is not a fleet.
+/// hc terminal ids look like `wP:p1` / `w6:p2`. A lone current pane is not a fleet.
 /// Compatibility wrappers for pure snapshot reporting predicates.
 #[allow(dead_code)]
 pub fn looks_like_pane_id(pin: &str) -> bool {
@@ -715,8 +715,8 @@ mod adr0010_d10_tests {
             freshness_epoch: 1000,
             pins: vec![PinRow {
                 pin: "P".into(),
-                verdict: "Idle(herdr)".into(),
-                source: "herdr".into(),
+                verdict: "Idle(hc)".into(),
+                source: "hc".into(),
                 since: String::new(),
                 bead: None,
                 reservations: vec![],
@@ -781,11 +781,11 @@ mod adr0010_d10_tests {
     }
 
     #[test]
-    fn lone_herdr_pane_is_not_joinable() {
+    fn lone_plane_pane_is_not_joinable() {
         let pins = vec![PinRow {
             pin: "wP:p1".into(),
-            verdict: "Busy(herdr-evidence)".into(),
-            source: "herdr".into(),
+            verdict: "Busy(hc-evidence)".into(),
+            source: "hc".into(),
             since: String::new(),
             bead: None,
             reservations: vec![],
@@ -794,8 +794,8 @@ mod adr0010_d10_tests {
         assert!(fleet_joinable("up", &pins));
         let named = vec![PinRow {
             pin: "LucidFalcon".into(),
-            verdict: "Idle(herdr)".into(),
-            source: "herdr".into(),
+            verdict: "Idle(hc)".into(),
+            source: "hc".into(),
             since: String::new(),
             bead: None,
             reservations: vec![],
@@ -879,7 +879,7 @@ mod adr0010_d10_tests {
     /// bd-swarm-cockpit-pczs Acceptance: a pane's bead claim and held
     /// reservations come from the LIVE reservation board — a row's `reason`
     /// is the reserve-before-work bead id (the rule `claim_watch_step`
-    /// consults), and it matches the pane either by its herdr name or by the
+    /// consults), and it matches the pane either by its terminal name or by the
     /// mail identity the caller resolves for it (leases bind the MAIL pin,
     /// not the pane title). A pane with no row stays empty: absence, never a
     /// fabricated claim.
@@ -888,16 +888,16 @@ mod adr0010_d10_tests {
         let mut pins = vec![
             PinRow {
                 pin: "crew-1-amberelk".into(),
-                verdict: "Busy(herdr-evidence)".into(),
-                source: "herdr".into(),
+                verdict: "Busy(hc-evidence)".into(),
+                source: "hc".into(),
                 since: String::new(),
                 bead: None,
                 reservations: vec![],
             },
             PinRow {
                 pin: "wP:p9".into(),
-                verdict: "Idle(herdr)".into(),
-                source: "herdr".into(),
+                verdict: "Idle(hc)".into(),
+                source: "hc".into(),
                 since: String::new(),
                 bead: None,
                 reservations: vec![],
@@ -911,7 +911,7 @@ mod adr0010_d10_tests {
                 {"path": "docs/x.md", "holder": "wP:p9", "reason": ""}
             ]
         });
-        // The registry resolves the herdr name to the mail pin the lease binds.
+        // The registry resolves the hc name to the mail pin the lease binds.
         let identities = |name: &str| (name == "crew-1-amberelk").then(|| "AmberElk".to_string());
         bind_pins_to_board(&mut pins, &board, &identities);
         assert_eq!(pins[0].bead.as_deref(), Some("bd-zgi9"));

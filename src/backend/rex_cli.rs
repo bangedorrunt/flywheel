@@ -877,7 +877,7 @@ pub mod rex_map {
         }
     }
 
-    /// Rex `--split` directions, plus the herdr words the trait already passes.
+    /// Rex `--split` directions, plus the hc words the trait already passes.
     pub fn split_direction(raw: &str) -> Option<&'static str> {
         Some(match raw {
             "left" => "left",
@@ -1141,7 +1141,7 @@ pub mod rex_map {
         }
 
         /// Both folds read one policy: the live `program_status` entry and
-        /// the projector agree on every shared fixture, so herdr and rex
+        /// the projector agree on every shared fixture, so hc and rex
         /// panes classify identically.
         #[test]
         fn both_folds_agree_on_shared_fixtures() {
@@ -1332,7 +1332,7 @@ mod tests {
 printf '%s\n' "$*" >> @@LOG@@
 for arg in "$@"; do
   case "$arg" in
-    *herdr*) echo "refusing herdr" >&2; exit 3 ;;
+    *hc*) echo "refusing hc" >&2; exit 3 ;;
   esac
 done
 for arg in "$@"; do
@@ -1357,7 +1357,7 @@ exit 2
         let log = guard.log_text();
         assert!(log.contains("ls"), "{log}");
         assert!(log.contains("--json"), "{log}");
-        assert!(!log.contains("herdr"), "{log}");
+        assert!(!log.contains("hc"), "{log}");
     }
 
     #[test]
@@ -1413,7 +1413,7 @@ exit 2
 
     /// Later blocks split below the previous block anchored to it (never
     /// focus), labelled the pin with `--keep-open`. The direction is the rex
-    /// word `below`: herdr `down` is not a rex direction.
+    /// word `below`: hc `down` is not a rex direction.
     #[test]
     fn split_labelled_args_anchors_below_with_pin_and_keep_open() {
         let cmd = [
@@ -1455,7 +1455,7 @@ exit 2
 printf '%s\n' "$*" >> @@LOG@@
 for arg in "$@"; do
   case "$arg" in
-    *herdr*) echo "refusing herdr" >&2; exit 3 ;;
+    *hc*) echo "refusing hc" >&2; exit 3 ;;
   esac
 done
 for arg in "$@"; do
@@ -1492,7 +1492,7 @@ exit 2
         for flag in ["do", "-e", "--args", "--json", "-s"] {
             assert!(log.contains(flag), "{log}");
         }
-        assert!(!log.contains("herdr"), "{log}");
+        assert!(!log.contains("hc"), "{log}");
     }
 
     /// D: `terminal.child_exited` with code 0 is the one-shot success, read

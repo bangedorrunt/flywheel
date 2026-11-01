@@ -173,7 +173,7 @@ fn resolve_over(over: &str, inputs: &BTreeMap<String, String>) -> u32 {
 }
 
 /// bd-0s0y: the crew a workflow needs, and every way it would self-collide.
-/// Pure — no registry, no panes, no herdr. The catalog-level test is what
+/// Pure — no registry, no panes, no hc. The catalog-level test is what
 /// makes it worth having.
 pub fn crew_demand(wf: &Workflow) -> CrewDemand {
     // Declared input defaults, so a templated `over: "{{inputs.reviewers}}"`

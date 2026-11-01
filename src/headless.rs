@@ -1290,7 +1290,7 @@ mod tests {
 }
 
 /// How a pinned model reaches a harness's INTERACTIVE entrypoint — the one
-/// `herdr agent start --kind <harness>` launches, as opposed to the headless
+/// `hc agent start --kind <harness>` launches, as opposed to the headless
 /// one-shot `build_argv_roles` uses.
 ///
 /// bd-crlx: this distinction is load-bearing, not cosmetic. `opencode` v2 has
@@ -1298,13 +1298,13 @@ mod tests {
 ///
 /// - `opencode run --model provider/model` — the headless one-shot. `--model`
 ///   is a real flag (`opencode run --help`: `--model, -m string`).
-/// - `opencode` (the root/TUI command herdr actually launches) — flags are
+/// - `opencode` (the root/TUI command hc actually launches) — flags are
 ///   `--standalone --server --auto --continue/-c --session/-s --prompt`.
 ///   There is **no `--model` and no `-m`**, and v2.0.16 rejects it outright:
 ///   `Unrecognized flag: --model in command opencode`.
 ///
 /// So reusing [`model_args`] on the pane path handed opencode a flag its own
-/// binary rejects. The process died on spawn, herdr's readiness wait reported
+/// binary rejects. The process died on spawn, hc's readiness wait reported
 /// `agent_not_running`, and the dispatch degraded into the permanent
 /// `agent <name> not found in toron` — every opencode pane seat, always.
 ///

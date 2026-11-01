@@ -791,13 +791,13 @@ pub fn send(cfg: &Config, req: Request<'_>) -> Result<Vec<SentRow>> {
         req.task_id,
         &req.task,
     ))?;
-    // Wake: the constant line only, to the recipient's pane. Off herdr the
+    // Wake: the constant line only, to the recipient's pane. Off hc the
     // typer and the target resolution follow the selected backend (same
-    // constant line, same no-host-rings rule); herdr keeps the path below.
+    // constant line, same no-host-rings rule); hc keeps the path below.
     // (Feature-gated: without the rex backend this selection cannot ring
-    // anywhere else, so the herdr path below stays the behavior.)
+    // anywhere else, so the hc path below stays the behavior.)
     #[cfg(feature = "backend-superlogical")]
-    if crate::backend::resolve_backend_name(cfg) != "herdr" {
+    if crate::backend::resolve_backend_name(cfg) != "hc" {
         for (row, addr) in rows.iter_mut().zip(parsed.iter()) {
             row.wake = match addr.pin() {
                 None => "no-pane (npub address; Phase 3 rings by binding)".into(),
@@ -808,11 +808,11 @@ pub fn send(cfg: &Config, req: Request<'_>) -> Result<Vec<SentRow>> {
         stamp_delivery(&project, &mut rows, &pins);
         return Ok(rows);
     }
-    let mut herdr = crate::hc_support::Client::connect(Some(&cfg.socket_path()));
+    let mut hc = crate::hc_support::Client::connect(Some(&cfg.socket_path()));
     for (row, addr) in rows.iter_mut().zip(parsed.iter()) {
-        row.wake = match (&mut herdr, addr.pin()) {
+        row.wake = match (&mut hc, addr.pin()) {
             (_, None) => "no-pane (npub address; Phase 3 rings by binding)".into(),
-            (Err(e), _) => format!("skipped: herdr unavailable ({e})"),
+            (Err(e), _) => format!("skipped: hc unavailable ({e})"),
             (Ok(c), Some(pin)) => match wake_target(c, &project, pin) {
                 Err(e) => format!("no-pane ({e:#})"),
                 // The doorbell's inbox host rings level-triggered with the ring
@@ -831,7 +831,7 @@ pub fn send(cfg: &Config, req: Request<'_>) -> Result<Vec<SentRow>> {
                         match send_wake(&kind, crate::harness_caps::installed_from_env()) {
                             SendWake::Skip(note) => note,
                             SendWake::Ring => {
-                                let panes = crate::pane_write::HerdrPanes(c);
+                                let panes = crate::pane_write::HcPanes(c);
                                 match crate::mail::block_on(ring(
                                     &store, &panes, &target, &row.npub,
                                 )) {
@@ -863,8 +863,8 @@ pub fn doorbell_owner(
     owner_of_workspace(&crate::config::state_dir(), project, workspace, now)
 }
 
-/// The sender's lookup for a herdr workspace: by the key its doorbell host
-/// was spawned under ([`host_key`]), never by the herdr workspace id.
+/// The sender's lookup for an hc workspace: by the key its doorbell host
+/// was spawned under ([`host_key`]), never by the hc workspace id.
 fn owner_of_workspace(
     state_dir: &std::path::Path,
     project: &str,
@@ -876,7 +876,7 @@ fn owner_of_workspace(
 
 /// A doorbell host runs as `__doorbell --workspace <label>`: its pid file,
 /// owner lease and inbox lease ([`crate::doorbell::inbox_owner_key`]) all
-/// carry the herdr workspace LABEL (prod: `owner-inbox-flywheel-flywheel.json`).
+/// carry the hc workspace LABEL (prod: `owner-inbox-flywheel-flywheel.json`).
 fn host_key(ws: &crate::hc_support::WorkspaceInfo) -> &str {
     &ws.label
 }
@@ -920,7 +920,7 @@ pub(crate) fn backend_wake_target(agents: &[AgentInfo], pin: &str) -> Result<Str
 
 /// Sender-side wake through the selected backend: resolve the pin to its
 /// block, gate on the harness door, and ring the constant line through the
-/// rex typer. String in, string out, matching the herdr arm's report
+/// rex typer. String in, string out, matching the hc arm's report
 /// shapes (`rung wm …`, skip notes, `no-pane …`, `failed: …`).
 #[cfg(feature = "backend-superlogical")]
 fn wake_via_backend(
@@ -1121,7 +1121,7 @@ pub fn loop_send(
     text: &str,
     task_id: &str,
 ) -> Result<Value> {
-    // The loop names its target by herdr agent name; the inbox is keyed by
+    // The loop names its target by hc agent name; the inbox is keyed by
     // the pane's mail pin (spawn registry), so map name -> pin first.
     let registry = crate::state::load_spawn_registry(project);
     let pin = crate::registry_entry_for_token(&registry, project, name)
@@ -1338,7 +1338,7 @@ mod tests {
         fn prompt(&self, target: &str, line: &str) -> Result<()> {
             self.0.lock().unwrap().push(format!("{target} {line}"));
             if self.1 {
-                Err(anyhow!("herdr stall"))
+                Err(anyhow!("hc stall"))
             } else {
                 Ok(())
             }
@@ -1497,15 +1497,15 @@ mod tests {
         );
     }
 
-    fn herdr_ws(id: &str, label: &str) -> crate::hc_support::WorkspaceInfo {
+    fn plane_ws(id: &str, label: &str) -> crate::hc_support::WorkspaceInfo {
         serde_json::from_value(json!({
             "workspace_id": id, "number": 1, "label": label, "focused": false,
             "pane_count": 1, "tab_count": 1, "active_tab_id": "t1", "agent_status": "idle"
         }))
-        .expect("a herdr workspace row")
+        .expect("an hc workspace row")
     }
 
-    /// rv23 S1/S2, the regression: the inbox host is spawned under the herdr
+    /// rv23 S1/S2, the regression: the inbox host is spawned under the hc
     /// workspace LABEL and leases `inbox-<label>`; the sender resolved the
     /// workspace ID (`w1`) and looked up `inbox-w1`, found nobody, and rang
     /// the pane itself on every send (two wakes per send, plus one to an
@@ -1515,7 +1515,7 @@ mod tests {
     fn the_sender_finds_the_inbox_host_by_the_workspace_label_not_its_id() {
         let dir = tempfile::tempdir().unwrap();
         let now = doorbell_rt::lease::unix_now();
-        let ws = herdr_ws("w1", "flywheel-proj");
+        let ws = plane_ws("w1", "flywheel-proj");
         assert_eq!(owner_of_workspace(dir.path(), "proj", Some(&ws), now), None);
         // Exactly what `run_inbox_only(cfg, "proj", "flywheel-proj")` leases.
         doorbell_rt::lease::acquire_lease(
@@ -1530,7 +1530,7 @@ mod tests {
             "the sender must defer to the live inbox host: one wake per send"
         );
         // Another workspace's host is not this one's, even with the same id.
-        let other = herdr_ws("w1", "flywheel-other");
+        let other = plane_ws("w1", "flywheel-other");
         assert_eq!(
             owner_of_workspace(dir.path(), "other", Some(&other), now),
             None
@@ -1559,10 +1559,10 @@ mod tests {
 
     /// bd-harness-caps-6r1x + bd-9tkm: the sender asks the harness record
     /// before typing. A row that records no door is skipped with a note; an
-    /// unrecorded kind keeps its door, because the sink types into any herdr
+    /// unrecorded kind keeps its door, because the sink types into any hc
     /// pane and legacy registry rows carry no harness field at all.
     #[test]
-    fn a_sender_rings_a_herdr_pane_and_skips_a_row_with_no_door() {
+    fn a_sender_rings_a_plane_pane_and_skips_a_row_with_no_door() {
         for kind in ["opencode", "oc", "fake", "claude", "codex", "", "widget"] {
             assert_eq!(send_wake(kind, true), SendWake::Ring, "kind {kind:?}");
         }

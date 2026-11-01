@@ -4,7 +4,7 @@
 //!
 //! Session id is the workspace id. Block id is the pane id. The process
 //! and the status fold live in `rex_cli` (the fold is `rex_cli::rex_map`).
-//! This file only chooses the rex command. It never calls herdr.
+//! This file only chooses the rex command. It never calls hc.
 //!
 //! `src/backend/mod.rs` and `src/backend/rex_map.rs` are exclusively leased
 //! by PurpleGorge for bd-i328, so this module declares `rex_cli` itself.
@@ -123,7 +123,7 @@ pub fn child_exit_code(line: &str) -> Option<(String, i32)> {
 
 /// Later crew block: `rex split` anchored to `anchor` with the pin label at
 /// creation and `--keep-open`. Same A+B contract as `create_agent_block`;
-/// `direction` is already a rex word (`below`, never herdr `down`).
+/// `direction` is already a rex word (`below`, never hc `down`).
 pub fn create_split_block(
     session: &str,
     anchor: &str,
@@ -264,7 +264,7 @@ impl SuperlogicalBackend {
         }
         if !ready(&status) {
             // Busy, never Connect/Io/Timeout: the fallback arm retries those
-            // on herdr, and a busy pane must never be re-sent there.
+            // on hc, and a busy pane must never be re-sent there.
             return Err(BackendError::new(
                 BackendErrorCode::Other("busy".into()),
                 format!(
@@ -288,7 +288,7 @@ impl SuperlogicalBackend {
         let receipt = rex
             .json(&write_args(session, block, text))
             .map_err(RexFail::into_backend)?;
-        // Submission is part of prompt semantics (herdr `agent.prompt`
+        // Submission is part of prompt semantics (hc `agent.prompt`
         // submits): `write` only queues bytes, so a prompt without Enter
         // would sit in the prompt buffer unread.
         rex.text(&send_key_args(session, block, &["enter"]))
@@ -408,7 +408,7 @@ impl MultiplexerBackend for SuperlogicalBackend {
             }
             .into_backend());
         }
-        // In-pane execution like herdr `pane.run` (send text, then Enter):
+        // In-pane execution like hc `pane.run` (send text, then Enter):
         // the command runs where the caller points, never in a fresh split.
         // A headless one-shot belongs in `do_args` Lua (`rex.exec`), not here.
         let rex = Self::rex()?;
@@ -473,7 +473,7 @@ impl MultiplexerBackend for SuperlogicalBackend {
         _close_group: bool,
     ) -> Result<(), toron_core::backend::BackendError> {
         // A rex session is the workspace. Both close flags destroy it.
-        // `session kill` does not fall through to herdr.
+        // `session kill` does not fall through to hc.
         let rex = Self::rex()?;
         rex.text(&session_kill_args(workspace_id))
             .map_err(RexFail::into_backend)?;
@@ -725,7 +725,7 @@ mod tests {
 printf '%s\n' "$*" >> @@LOG@@
 for arg in "$@"; do
   case "$arg" in
-    *herdr*) echo "refusing herdr" >&2; exit 3 ;;
+    *hc*) echo "refusing hc" >&2; exit 3 ;;
   esac
 done
 cmd=""
@@ -789,7 +789,7 @@ esac
         assert!(log.contains("--json"), "{log}");
         assert!(log.contains("session.list_blocks"), "{log}");
         assert!(log.contains("program_status"), "{log}");
-        assert!(!log.contains("herdr"), "{log}");
+        assert!(!log.contains("hc"), "{log}");
         assert!(!log.contains("session.close"), "{log}");
     }
 
@@ -858,7 +858,7 @@ esac
 "#;
 
     #[test]
-    fn superlogical_matches_herdr_lifecycle_on_a_fake_rex() {
+    fn superlogical_matches_plane_lifecycle_on_a_fake_rex() {
         let guard = RexBinGuard::install(PARITY_REX);
         let backend = SuperlogicalBackend;
         backend
@@ -895,7 +895,7 @@ esac
         assert!(log.contains("session kill"), "{log}");
         assert!(log.contains("send-key"), "{log}");
         assert!(log.contains("rename"), "{log}");
-        assert!(!log.contains("herdr"), "{log}");
+        assert!(!log.contains("hc"), "{log}");
     }
 
     #[test]
@@ -1000,7 +1000,7 @@ case "$cmd:$sub" in
 esac
 "#;
 
-    /// The remaining trait methods go through rex with no herdr contact:
+    /// The remaining trait methods go through rex with no hc contact:
     /// create, split, run, read, prompt, and the landed prompt_coded path.
     #[test]
     fn superlogical_covers_create_split_run_read_and_prompt() {
@@ -1063,7 +1063,7 @@ esac
         ] {
             assert!(log.contains(verb), "{log}");
         }
-        assert!(!log.contains("herdr"), "{log}");
+        assert!(!log.contains("hc"), "{log}");
     }
 
     const RUN_IN_PANE_REX: &str = r#"#!/bin/sh
@@ -1101,7 +1101,7 @@ case "$cmd:$sub" in
 esac
 "#;
 
-    /// `pane_run` executes in the pane like herdr (text, then Enter), never
+    /// `pane_run` executes in the pane like hc (text, then Enter), never
     /// in a fresh split: the write lands before the submit, and no split or
     /// run verb is invoked.
     #[test]
@@ -1165,7 +1165,7 @@ esac
         let log = guard.log_text();
         assert!(log.contains("program_status"), "{log}");
         assert!(log.contains("process"), "{log}");
-        assert!(!log.contains("herdr"), "{log}");
+        assert!(!log.contains("hc"), "{log}");
     }
 
     const TYPER_REX: &str = r#"#!/bin/sh
@@ -1215,7 +1215,7 @@ esac
 
     /// The rex typer writes the constant line and submits it: write first,
     /// then Enter (write-only leaves text pending in the prompt buffer).
-    /// Keys and close ride the matching block verbs. No herdr contact.
+    /// Keys and close ride the matching block verbs. No hc contact.
     #[test]
     fn rex_panes_typer_writes_then_submits() {
         use crate::pane_write::{PaneWrite, RexPanes, Urgency, Wm, write};
@@ -1239,7 +1239,7 @@ esac
         let key_at = log.find("send-key").expect("enter call");
         assert!(write_at < key_at, "write lands before Enter:\n{log}");
         assert!(log.contains("block.close"), "{log}");
-        assert!(!log.contains("herdr"), "{log}");
+        assert!(!log.contains("hc"), "{log}");
     }
 
     const CREATE_REX: &str = r#"#!/bin/sh
@@ -1285,7 +1285,7 @@ esac
         assert!(log.contains("--keep-open"), "{log}");
         assert!(log.contains("--json"), "{log}");
         assert!(!log.contains("--split"), "{log}");
-        assert!(!log.contains("herdr"), "{log}");
+        assert!(!log.contains("hc"), "{log}");
     }
 
     /// Later blocks split below the previous block anchored to it (never
@@ -1310,7 +1310,7 @@ esac
         assert!(log.contains("--label"), "{log}");
         assert!(log.contains("CoralTurtle"), "{log}");
         assert!(log.contains("--keep-open"), "{log}");
-        assert!(!log.contains("herdr"), "{log}");
+        assert!(!log.contains("hc"), "{log}");
     }
 
     /// Empty labels and commands are refused before spawn: an unlabelled
@@ -1366,7 +1366,7 @@ esac
 
     /// C: a prompt into a busy pane is refused `busy` before any write.
     /// `busy` is `Other`, never Connect/Io/Timeout — the fallback arm
-    /// retries those on herdr, and a busy pane must never be re-sent there.
+    /// retries those on hc, and a busy pane must never be re-sent there.
     #[test]
     fn prompt_into_a_busy_pane_is_refused_busy_with_no_write() {
         let script = GATE_REX.replace("@@STATUS@@", r#"{"records":[{"state":"working"}]}"#);
@@ -1407,7 +1407,7 @@ esac
 
     /// C: a pane that never reaches a prompt inside the bound is `busy`,
     /// never `Timeout` (a timeout would read as a transport shrug and could
-    /// fall through to herdr).
+    /// fall through to hc).
     #[test]
     fn prompt_wait_exhaustion_is_busy_never_timeout() {
         let script = GATE_REX.replace("@@STATUS@@", r#"{"records":[{"state":"working"}]}"#);

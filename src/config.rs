@@ -233,7 +233,7 @@ pub struct Config {
     pub doorbell: Option<DoorbellSection>,
     /// Resonate server URL for the durable loop (default http://localhost:8001)
     pub resonate_url: Option<String>,
-    /// short name -> herdr agent kind (default: oc=opencode, pi=pi, gk=grok)
+    /// short name -> hc agent kind (default: oc=opencode, pi=pi, gk=grok)
     pub kinds: Option<BTreeMap<String, String>>,
     /// backend selection (ADR-0002)
     pub backend: Option<BackendConfig>,
@@ -347,7 +347,7 @@ pub struct LoopConfig {
     /// consecutive `unknown` polls treated as DETECTION GRACE (bd-bvwf.5):
     /// an unknown agent younger than this is presumed detecting (fresh
     /// spawn / mid-identification), never Diagnosed or Respawnd. Default 6
-    /// (~3min at the 30s active cadence — herdr takes 30-60s to classify a
+    /// (~3min at the 30s active cadence — hc takes 30-60s to classify a
     /// fresh pane).
     pub unknown_detect_grace_polls: Option<u32>,
     /// completion drain-grace polls (bd-bvwf.3): the completion condition
@@ -687,7 +687,7 @@ impl Config {
         self.default_timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)
     }
 
-    /// Resolve a short agent name (oc/pi/gk) or full kind to a herdr agent kind.
+    /// Resolve a short agent name (oc/pi/gk) or full kind to an hc agent kind.
     pub fn resolve_kind(&self, short: &str) -> String {
         if let Some(map) = &self.kinds
             && let Some(k) = map.get(short)
@@ -772,9 +772,9 @@ pub fn registry_after_captain_death(
 }
 
 /// The XDG config BASE (is1.6): `$XDG_CONFIG_HOME` when set, else
-/// `~/.config`. `config_dir()` appends `/flywheel`; the herdr socket appends
+/// `~/.config`. `config_dir()` appends `/flywheel`; the hc socket appends
 /// `/herdr-core/default/default.sock` — both converge on this base (matches the canonical
-/// herdr client in toron-core).
+/// hc client in toron-core).
 pub fn xdg_config_base() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())

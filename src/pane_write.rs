@@ -1,5 +1,5 @@
 // governed-by: ADR-0041 (toron), build-plan §5 (Phase 2)
-//! The herdr pane sink: the ONLY code allowed to type into a pane.
+//! The hc pane sink: the ONLY code allowed to type into a pane.
 //!
 //! Captain decision (2026-10-11): panes never carry a payload. A pane write
 //! is one of four constant shapes, [`PaneWrite`], and nothing else:
@@ -14,7 +14,7 @@
 //!
 //! [`render`] is pure: it maps a `PaneWrite` to a [`PaneOp`] built only
 //! from constants and the watermark number. [`write`] is the I/O boundary,
-//! run through a [`PaneTyper`] (herdr in production, a recorder in tests).
+//! run through a [`PaneTyper`] (hc in production, a recorder in tests).
 //! `only_the_sink_types_into_panes` (below) fences the source tree: a new
 //! `agent_prompt` / `pane_send_text` call outside this file fails the build.
 
@@ -46,7 +46,7 @@ pub enum Harness {
 }
 
 impl Harness {
-    /// Map a herdr agent kind (`pi`, `opencode`, `claude`, ...) to a harness.
+    /// Map an hc agent kind (`pi`, `opencode`, `claude`, ...) to a harness.
     pub fn from_kind(kind: &str) -> Self {
         match kind.trim().to_ascii_lowercase().as_str() {
             "pi" => Self::Pi,
@@ -114,34 +114,34 @@ pub fn render(w: &PaneWrite) -> PaneOp {
     }
 }
 
-/// The pane boundary. Production: [`HerdrPanes`]. Tests: a recorder.
+/// The pane boundary. Production: [`HcPanes`]. Tests: a recorder.
 pub trait PaneTyper {
     fn prompt(&self, target: &str, line: &str) -> anyhow::Result<()>;
     fn keys(&self, target: &str, keys: &[&str]) -> anyhow::Result<()>;
     fn close(&self, pane_id: &str) -> anyhow::Result<()>;
 }
 
-/// herdr as the pane boundary.
-pub struct HerdrPanes<'a>(pub &'a crate::hc_support::Client);
+/// hc as the pane boundary.
+pub struct HcPanes<'a>(pub &'a crate::hc_support::Client);
 
-impl PaneTyper for HerdrPanes<'_> {
+impl PaneTyper for HcPanes<'_> {
     fn prompt(&self, target: &str, line: &str) -> anyhow::Result<()> {
         self.0
             .agent_prompt(target, line, None)
             .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("herdr agent.prompt {target}: {e}"))
+            .map_err(|e| anyhow::anyhow!("hc agent.prompt {target}: {e}"))
     }
     fn keys(&self, target: &str, keys: &[&str]) -> anyhow::Result<()> {
         self.0
             .agent_send_keys(target, keys)
             .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("herdr agent.send_keys {target}: {e}"))
+            .map_err(|e| anyhow::anyhow!("hc agent.send_keys {target}: {e}"))
     }
     fn close(&self, pane_id: &str) -> anyhow::Result<()> {
         self.0
             .call_coded("pane.close", serde_json::json!({ "pane_id": pane_id }))
             .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("herdr pane.close {pane_id}: {e}"))
+            .map_err(|e| anyhow::anyhow!("hc terminal.close {pane_id}: {e}"))
     }
 }
 
@@ -177,7 +177,7 @@ impl PaneTyper for RexPanes<'_> {
     }
 }
 
-/// herdr as the pane boundary for a SPAWN-time write: the agent has just
+/// hc as the pane boundary for a SPAWN-time write: the agent has just
 /// started, so `agent.prompt` may still be gated. Falls back to
 /// `pane.send_text` + settle + Enter (retried; Enter alone is retried once the
 /// text has landed, the text is never re-typed). Same boot semantics as the
@@ -202,7 +202,7 @@ impl PaneTyper for BootPanes<'_> {
                 crate::retry::host_draw,
                 std::thread::sleep,
             )
-            .map_err(|e| anyhow::anyhow!("herdr pane.send_text {target}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("hc terminal.send_text {target}: {e}"))?;
         std::thread::sleep(std::time::Duration::from_millis(100));
         policy
             .retry_with_backoff(
@@ -213,13 +213,13 @@ impl PaneTyper for BootPanes<'_> {
                 std::thread::sleep,
             )
             .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("herdr pane.send_input {target}: {e}"))
+            .map_err(|e| anyhow::anyhow!("hc terminal.send_input {target}: {e}"))
     }
     fn keys(&self, target: &str, keys: &[&str]) -> anyhow::Result<()> {
-        HerdrPanes(self.0).keys(target, keys)
+        HcPanes(self.0).keys(target, keys)
     }
     fn close(&self, pane_id: &str) -> anyhow::Result<()> {
-        HerdrPanes(self.0).close(pane_id)
+        HcPanes(self.0).close(pane_id)
     }
 }
 
@@ -273,7 +273,7 @@ pub(crate) const PANE_TEXT_CALLS: &[&str] = &[
 #[cfg(test)]
 pub(crate) const LEGACY_PANE_TEXT_SITES: &[(&str, usize)] = &[
     ("src/cmd/doorbell.rs", 1),
-    ("src/herdr.rs", 1),
+    ("src/hc.rs", 1),
     ("src/main.rs", 8),
 ];
 

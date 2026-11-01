@@ -19,7 +19,7 @@
 //! a shared tokio runtime (the remote path is ureq-sync, no runtime needed).
 //! The pane-identity bridge helpers (`project_hash`,
 //! `write_pane_identity`, …) are LOCAL filesystem ops regardless of backend —
-//! they bridge flywheel's own herdr panes, which only the local process sees.
+//! they bridge flywheel's own hc terminals, which only the local process sees.
 //!
 //! Known limitations (reported, not papered over):
 //! - toron message ids are hex event ids, not u64 sequence numbers;
@@ -1980,22 +1980,22 @@ impl Mail {
     }
 
     /// `cleanup_pane_identities` — prune identities whose panes are absent
-    /// from herdr's live pane list (ADR-0003 V6 surface restore). toron holds
-    /// no per-pane identity files (live herdr mapping), so in-process "prune"
+    /// from hc's live pane list (ADR-0003 V6 surface restore). toron holds
+    /// no per-pane identity files (live hc mapping), so in-process "prune"
     /// reports the stale names.
     ///
-    /// Honest errors (c3b.7): a herdr CONNECT failure when herdr IS the
+    /// Honest errors (c3b.7): an hc CONNECT failure when hc IS the
     /// active multiplexer is a real outage — the caller must see Err, not an
     /// Ok note that reads like success. The Ok-note path fires ONLY for the
     /// genuinely-not-applicable configuration (active multiplexer is not
-    /// herdr — the cleanup is herdr-specific; that is a config fact, not a
+    /// hc — the cleanup is hc-specific; that is a config fact, not a
     /// failure).
     pub fn cleanup_pane_identities(&self, _project_key: &str) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
-                if !multiplexer_is_herdr() {
+                if !multiplexer_is_hc() {
                     return Ok(json!({
-                        "note": "active multiplexer is not herdr; pane identity cleanup not applicable",
+                        "note": "active multiplexer is not hc; pane identity cleanup not applicable",
                     }));
                 }
                 match toron_core::backend::hc::HcBackend::connect(None) {
@@ -2004,7 +2004,7 @@ impl Mail {
                         Ok(json!({ "pruned": pruned }))
                     }
                     Err(e) => Err(anyhow!(
-                        "herdr unreachable; pane identity cleanup skipped: {e}"
+                        "hc unreachable; pane identity cleanup skipped: {e}"
                     )),
                 }
             }
@@ -2336,10 +2336,10 @@ impl Mail {
     /// bd-k6cw: live pane tokens first — a `toron:mail-identity` stamp
     /// (`toron_pin` token) wins over the file, so a reused pane id resolves
     /// to the current pin even when the identity file still names the
-    /// previous occupant. Any herdr failure degrades to the file bridge
+    /// previous occupant. Any hc failure degrades to the file bridge
     /// below, never an error.
     pub fn resolve_pane_identity(&self, project_key: &str, pane_id: &str) -> Value {
-        if multiplexer_is_herdr()
+        if multiplexer_is_hc()
             && let Ok(backend) = toron_core::backend::hc::HcBackend::connect(None)
         {
             let client = backend.client();
@@ -2378,13 +2378,13 @@ impl Mail {
 // Pane identity files (bd-mail-pane-identity-bridge, ADR-0001 A4)
 // ---------------------------------------------------------------------------
 
-/// c3b.7: is herdr the ACTIVE multiplexer? Distinguishes "herdr is the
+/// c3b.7: is hc the ACTIVE multiplexer? Distinguishes "hc is the
 /// configured mux but the daemon is down" (a REAL failure the caller must
-/// see) from "the mux is not herdr" (cleanup genuinely not applicable).
+/// see) from "the mux is not hc" (cleanup genuinely not applicable).
 /// Mirrors factory precedence: `FLYWHEEL_BACKEND` env > `[backend]
-/// multiplexer` config > default (`herdr`). Config load is best-effort —
+/// multiplexer` config > default (`hc`). Config load is best-effort —
 /// no config file means the default applies.
-fn multiplexer_is_herdr() -> bool {
+fn multiplexer_is_hc() -> bool {
     crate::config::Config::load()
         .map(|cfg| crate::backend::factory::resolve_backend_name(&cfg))
         .unwrap_or_else(|_| {
@@ -2395,12 +2395,12 @@ fn multiplexer_is_herdr() -> bool {
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| crate::backend::factory::DEFAULT_BACKEND.to_string())
         })
-        == "herdr"
+        == "hc"
 }
 
 //
-// flywheel's bridge for herdr panes: agent-mail writes per-pane identity
-// files only for tmux panes; herdr panes (wT:p1) never get one, so
+// flywheel's bridge for hc panes: agent-mail writes per-pane identity
+// files only for tmux panes; hc terminals (wT:p1) never get one, so
 // `resolve_pane_identity` can't discover agents spawned by flywheel. The
 // bridge writes the same file agent-mail core would have: 12-hex-char SHA-1
 // of the canonicalized absolute project path as the directory name, the
@@ -2457,7 +2457,7 @@ pub fn project_hash(project_key: &str) -> String {
 
 /// Sanitize a pane id for use as a filename: strip a tmux `%` prefix, map
 /// `:` to `-` and other filesystem-unsafe chars to `_` (agent-mail core
-/// parity — herdr `w1:p1` → `w1-p1`). Empty → `unknown`.
+/// parity — hc `w1:p1` → `w1-p1`). Empty → `unknown`.
 fn sanitize_pane_id(pane_id: &str) -> String {
     let stripped = pane_id.strip_prefix('%').unwrap_or(pane_id);
     let mut out = String::with_capacity(stripped.len());
@@ -4015,43 +4015,43 @@ mod tests {
         );
     }
 
-    /// c3b.7: herdr IS the active multiplexer (explicit `FLYWHEEL_BACKEND=herdr`;
+    /// c3b.7: hc IS the active multiplexer (explicit `FLYWHEEL_BACKEND=hc`;
     /// the default `auto` is rex-primary since bd-rex-default-plane-xn1t) but
     /// the daemon is unreachable → the cleanup must return Err naming the
     /// outage, never an Ok note that reads like success.
     #[test]
-    fn cleanup_pane_identities_herdr_down_is_err() {
+    fn cleanup_pane_identities_plane_down_is_err() {
         let _g = crate::config::lock_env();
-        unsafe { std::env::set_var("FLYWHEEL_BACKEND", "herdr") };
-        // Point the herdr socket at a dead path so connect fails fast.
-        unsafe { std::env::set_var("HERDR_SOCKET_PATH", "/tmp/flywheel-c3b7-dead.sock") };
+        unsafe { std::env::set_var("FLYWHEEL_BACKEND", "hc") };
+        // Point the hc socket at a dead path so connect fails fast.
+        unsafe { std::env::set_var("HC_SOCKET_PATH", "/tmp/flywheel-c3b7-dead.sock") };
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let err = mail
-            .cleanup_pane_identities("c3b7-herdr-down")
-            .expect_err("herdr down must be an error, not Ok(note)");
+            .cleanup_pane_identities("c3b7-hc-down")
+            .expect_err("hc down must be an error, not Ok(note)");
         let msg = err.to_string();
         assert!(
-            msg.contains("herdr unreachable"),
+            msg.contains("hc unreachable"),
             "names the outage + skip: {msg}"
         );
-        unsafe { std::env::remove_var("HERDR_SOCKET_PATH") };
+        unsafe { std::env::remove_var("HC_SOCKET_PATH") };
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
     }
 
-    /// c3b.7: the active multiplexer is NOT herdr (superlogical) → the cleanup is
+    /// c3b.7: the active multiplexer is NOT hc (superlogical) → the cleanup is
     /// genuinely not applicable → Ok with the not-wired note (a config fact,
     /// not a failure).
     #[test]
-    fn cleanup_pane_identities_non_herdr_mux_is_ok_note() {
+    fn cleanup_pane_identities_non_plane_mux_is_ok_note() {
         let _g = crate::config::lock_env();
         unsafe { std::env::set_var("FLYWHEEL_BACKEND", "superlogical") };
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let v = mail
-            .cleanup_pane_identities("c3b7-not-herdr")
-            .expect("non-herdr mux is not a failure");
+            .cleanup_pane_identities("c3b7-not-hc")
+            .expect("non-hc mux is not a failure");
         let note = v.get("note").and_then(Value::as_str).unwrap_or_default();
         assert!(
-            note.contains("not herdr"),
+            note.contains("not hc"),
             "note explains the config fact: {note}"
         );
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
@@ -4059,7 +4059,7 @@ mod tests {
 
     /// bd-k6cw: tokens-first contract — the stamped pin wins over a stale
     /// occupant name (pinned against toron's token-first core), and with
-    /// herdr unreachable the branch degrades to the legacy file bridge
+    /// hc unreachable the branch degrades to the legacy file bridge
     /// (same file-miss shape as before, never Err).
     #[test]
     fn resolve_prefers_pane_tokens_over_files() {
@@ -4095,7 +4095,7 @@ mod tests {
         // Degradation: dead socket → file bridge, file-miss shape, no error.
         let _g = crate::config::lock_env();
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
-        unsafe { std::env::set_var("HERDR_SOCKET_PATH", "/tmp/flywheel-k6cw-dead.sock") };
+        unsafe { std::env::set_var("HC_SOCKET_PATH", "/tmp/flywheel-k6cw-dead.sock") };
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let v = mail.resolve_pane_identity("k6cw-proj", "w9:p9");
         assert_eq!(v.get("pane_id").and_then(Value::as_str), Some("w9:p9"));
@@ -4103,7 +4103,7 @@ mod tests {
             v.get("error").is_some(),
             "no stamp, no file → file-miss shape"
         );
-        unsafe { std::env::remove_var("HERDR_SOCKET_PATH") };
+        unsafe { std::env::remove_var("HC_SOCKET_PATH") };
     }
 }
 

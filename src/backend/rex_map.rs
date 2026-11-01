@@ -1,4 +1,4 @@
-//! Rex session/block projectors onto the herdr shapes flywheel already
+//! Rex session/block projectors onto the hc shapes flywheel already
 //! consumes (bd-i328).
 //!
 //! Pure by contract: no process spawn, no live Rex, no I/O. Callers hand in
@@ -15,7 +15,7 @@ use toron_core::backend::AgentStatus;
 use toron_core::backend::{PaneInfo, WorkspaceInfo};
 use toron_core::osc7501::{Board, parse_report};
 
-/// A Rex session is a herdr workspace; the session id is the workspace id.
+/// A Rex session is an hc workspace; the session id is the workspace id.
 /// Its agent status is `Unknown`: a session with no records proves nothing.
 pub fn session_to_workspace(session_id: &str, label: &str) -> WorkspaceInfo {
     WorkspaceInfo {
@@ -31,7 +31,7 @@ pub fn session_to_workspace(session_id: &str, label: &str) -> WorkspaceInfo {
     }
 }
 
-/// A Rex block is a herdr pane: block id is the pane id, session id is the
+/// A Rex block is an hc pane: block id is the pane id, session id is the
 /// workspace id, and a Rex window is the tab. `terminal_id` stays empty —
 /// Rex has no second terminal handle beyond the block.
 pub fn block_to_pane(session_id: &str, block_id: &str, label: &str, window_id: &str) -> PaneInfo {
@@ -193,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn session_and_block_project_onto_herdr_shapes() {
+    fn session_and_block_project_onto_plane_shapes() {
         let workspace = session_to_workspace("sess-1", "rex-build");
         assert_eq!(workspace.workspace_id, "sess-1");
         assert_eq!(workspace.label, "rex-build");
@@ -206,11 +206,11 @@ mod tests {
         assert_eq!(pane.tab_id, "win-2");
     }
 
-    /// The toron-core contract this fold relies on: `herdr_status` carries
+    /// The toron-core contract this fold relies on: `plane_status` carries
     /// working/blocked/done and refuses idle/error/clear, so OSC idle never
     /// reads as finished-and-seen and OSC error never reads as done.
     #[test]
-    fn toron_osc_herdr_status_contract() {
+    fn toron_osc_plane_status_contract() {
         use toron_core::osc7501::parse_report;
         for (body, expected) in [
             ("state=working:app=rex", Some(AgentStatus::Working)),
@@ -221,7 +221,7 @@ mod tests {
             ("state=clear:id=eu-west", None),
         ] {
             let report = parse_report(&osc(body)).expect("spec-shaped report parses");
-            assert_eq!(report.herdr_status(), expected, "{body}");
+            assert_eq!(report.osc_status(), expected, "{body}");
         }
         assert!(parse_report("not a report").is_none());
     }

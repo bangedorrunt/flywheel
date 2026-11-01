@@ -879,7 +879,7 @@ impl CoalitionStore {
     /// dispatch a headless leaf worker (ADR-0011 Spec 5 reopen). The captain
     /// pre-splits a non-overlapping scope; the leaf receives it, runs
     /// ONE-SHOT via the `__run-headless` subprocess (ADR-0010 Spec A
-    /// subprocess-reuse — never an in-process herdr/toron client), the run
+    /// subprocess-reuse — never an in-process hc/toron client), the run
     /// logs to `runs/`, and the result lands in the coalition channel
     /// (kind-42 board post). No intent-declare/negotiate — leaf semantics.
     ///

@@ -182,10 +182,10 @@ pub fn resume_runs_for<'a>(
 
 /// Presence verdict per pin; missing key = Unknown (invariant 9).
 /// Governed-by: ADR-0010 D3. Busy/Idle/Dead carry the evidence source:
-/// "presence" (20001 wire authority), "herdr-evidence" (native busy,
+/// "presence" (20001 wire authority), "hc-evidence" (native busy,
 /// never authority), "legacy" (pre-D3 snapshot), "endpoint" (death).
 /// Unknown is never promoted, never absorbs a wake, never prompts.
-/// Native herdr idle is never trusted.
+/// Native hc idle is never trusted.
 // bd-b2b3-serialize: NOT `#[derive(Deserialize)]` here, deliberately. The
 // hand-written impl below accepts BOTH the pre-D3 flat unit string and the
 // current map form, landing unknown words as `Unknown` (never authority). A
@@ -290,12 +290,12 @@ impl<'de> serde::Deserialize<'de> for Presence {
 
 /// D3 verdict resolution: exact verdicts only. Known presence verdicts
 /// pass through untouched. Unknown/missing presence never promotes:
-/// native herdr busy yields Busy labeled "herdr-evidence" (evidence,
+/// native hc busy yields Busy labeled "hc-evidence" (evidence,
 /// not authority — consumers still never prompt from it), native idle is
 /// never trusted (stays Unknown), and only endpoint death overrides to
 /// Dead. The CLI status render calls this with known=None (no live
 /// Model in the render path); the tick path passes Model.presence.
-pub fn verdict_for(known: Option<&Presence>, herdr_status: &str, endpoint_alive: bool) -> Presence {
+pub fn verdict_for(known: Option<&Presence>, plane_status: &str, endpoint_alive: bool) -> Presence {
     if !endpoint_alive {
         return Presence::Dead {
             source: "endpoint".into(),
@@ -311,9 +311,9 @@ pub fn verdict_for(known: Option<&Presence>, herdr_status: &str, endpoint_alive:
         Some(Presence::Dead { source }) => Presence::Dead {
             source: source.clone(),
         },
-        Some(Presence::Unknown) | None => match herdr_status.trim().to_ascii_lowercase().as_str() {
+        Some(Presence::Unknown) | None => match plane_status.trim().to_ascii_lowercase().as_str() {
             "working" | "busy" => Presence::Busy {
-                source: "herdr-evidence".into(),
+                source: "hc-evidence".into(),
             },
             "dead" => Presence::Dead {
                 source: "endpoint".into(),
@@ -637,7 +637,7 @@ pub const PENDING_WAIT_CAP: usize = 512;
 // ---------------------------------------------------------------------------
 // ADR-0010 D1 (bd-w98c): re-ring ladder — the dispatcher wake budget.
 //
-// The toron message IS the delivery; the herdr prompt is a doorbell.
+// The toron message IS the delivery; the hc prompt is a doorbell.
 // An un-acked corr older than one grace window is due one re-ring per
 // window; after RING_MAX the wake escalates: Dead → respawn path,
 // Unknown → digest naming pin+corr+attempt count. This REPLACES the flat
@@ -667,7 +667,7 @@ pub const fn doorbell_ring_max() -> u32 {
     DOORBELL_RING_MAX_DEFAULT
 }
 
-/// D1 shrunk prompt: the payload rides the toron message, herdr gets
+/// D1 shrunk prompt: the payload rides the toron message, hc gets
 /// the doorbell only.
 pub fn doorbell_mail_line(unacked: usize, pin: &str, corr: &str) -> String {
     format!("[doorbell] inbox: {unacked} unacked for {pin}; latest corr={corr}; read + ack")
@@ -728,7 +728,7 @@ pub enum Msg {
     },
     /// Sole writer of doorbell.statuses. Working pins queue; the
     /// working→idle transition drains the queue into Prompt.
-    HerdrStatus {
+    PlaneStatus {
         pin: String,
         status: String,
     },
@@ -817,9 +817,9 @@ pub enum Msg {
     DiagnoseFailed {
         name: String,
     },
-    /// Herdr pane event. Enters as Msg (not a world-dump into pending_events).
+    /// Hc pane event. Enters as Msg (not a world-dump into pending_events).
     /// Delegates to the swarm slice.
-    Herdr {
+    Hc {
         event: crate::durable::PollEvent,
     },
     /// GS-048 / GS-047 §E.1: material context change (AUTHORITATIVE objective,
@@ -891,7 +891,7 @@ pub enum Cmd {
     Digest { entries: Vec<DigestEntry> },
 
     // swarm slice — data equivalents of LoopAction
-    /// Swarm send. Name is the herdr pane, text the full prompt.
+    /// Swarm send. Name is the hc pane, text the full prompt.
     Send { name: String, text: String },
     /// Swarm send. Records bead→pin binding for the spawn registry.
     PinStamp { bead_id: String, pin: String },
@@ -905,11 +905,11 @@ pub enum Cmd {
     Diagnose { name: String, reason: String },
     /// Swarm send. Respawn with reason; budgeted by the executor.
     Respawn { name: String, reason: String },
-    /// Swarm send. Reclaim carries bead + pin + herdr name + reason.
+    /// Swarm send. Reclaim carries bead + pin + terminal name + reason.
     Reclaim {
         bead_id: String,
         pin: String,
-        herdr_name: String,
+        terminal_name: String,
         reason: String,
     },
     /// Swarm send. Cooperative yield; no content.
@@ -1023,12 +1023,12 @@ impl Cmd {
             crate::durable::LoopAction::Reclaim {
                 bead_id,
                 pin,
-                herdr_name,
+                terminal_name,
                 reason,
             } => Self::Reclaim {
                 bead_id,
                 pin,
-                herdr_name,
+                terminal_name,
                 reason,
             },
             // ADR-0010 D4/D12: the declared wait's human re-surface path. The
@@ -1086,12 +1086,12 @@ impl Cmd {
             Self::Reclaim {
                 bead_id,
                 pin,
-                herdr_name,
+                terminal_name,
                 reason,
             } => Some(crate::durable::LoopAction::Reclaim {
                 bead_id: bead_id.clone(),
                 pin: pin.clone(),
-                herdr_name: herdr_name.clone(),
+                terminal_name: terminal_name.clone(),
                 reason: reason.clone(),
             }),
             Self::Wait => Some(crate::durable::LoopAction::Wait),
@@ -1981,10 +1981,10 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             }
             let _ = pin;
         }
-        Msg::HerdrStatus { pin, status } => {
+        Msg::PlaneStatus { pin, status } => {
             let (dm, c) = doorbell_slice(
                 &model.doorbell,
-                crate::doorbell_tick::DoorbellMsg::HerdrStatus {
+                crate::doorbell_tick::DoorbellMsg::PlaneStatus {
                     pin: pin.clone(),
                     status: status.clone(),
                 },
@@ -2179,7 +2179,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 c.push(Cmd::Reclaim {
                     bead_id: bead_id.clone(),
                     pin: holder_pin.clone(),
-                    herdr_name: claimant_pin.clone(),
+                    terminal_name: claimant_pin.clone(),
                     reason: if reason.is_empty() {
                         "reclaim".into()
                     } else {
@@ -2293,8 +2293,8 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 hs.awaiting_clear = false;
             }
         }
-        Msg::Herdr { event } => {
-            let (sm, c) = swarm_slice(&model.swarm, crate::durable::LoopMsg::Herdr(event.clone()));
+        Msg::Hc { event } => {
+            let (sm, c) = swarm_slice(&model.swarm, crate::durable::LoopMsg::Hc(event.clone()));
             next.swarm = sm;
             cmds.extend(c);
         }
@@ -2721,16 +2721,16 @@ mod tests {
     }
 
     #[test]
-    fn ws_model_herdr_status_is_inject_truth() {
+    fn ws_model_plane_status_is_inject_truth() {
         let mut m = empty_model();
         m.doorbell.index.insert_pin("BlueRidge".into(), None);
         // D3: prompt needs an exact Idle verdict (presence authority);
-        // herdr statuses remain evidence in doorbell.statuses.
+        // hc statuses remain evidence in doorbell.statuses.
         m.presence
             .insert("BlueRidge".into(), Presence::from_str("idle"));
         let (m, _) = tick(
             &m,
-            &Msg::HerdrStatus {
+            &Msg::PlaneStatus {
                 pin: "BlueRidge".into(),
                 status: "working".into(),
             },
@@ -2738,7 +2738,7 @@ mod tests {
         assert_eq!(
             m.doorbell.statuses.get("BlueRidge").map(String::as_str),
             Some("working"),
-            "HerdrStatus tick is the only status write"
+            "PlaneStatus tick is the only status write"
         );
         let line = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["h","ch-1"]],"content":"@BlueRidge hi"}"#;
         let (m, cmds) = tick(&m, &Msg::WatchNdjson { line: line.into() });
@@ -2749,7 +2749,7 @@ mod tests {
         assert_eq!(m.doorbell.queues.get("BlueRidge").map(Vec::len), Some(1));
         let (m2, cmds2) = tick(
             &m,
-            &Msg::HerdrStatus {
+            &Msg::PlaneStatus {
                 pin: "BlueRidge".into(),
                 status: "idle".into(),
             },
@@ -2772,7 +2772,7 @@ mod tests {
     fn ws_model_tick_composes_doorbell_watchndjson() {
         let mut m = empty_model();
         m.doorbell.index.insert_pin("BlueRidge".into(), None);
-        // D3: herdr idle alone never prompts (never trusted); the exact
+        // D3: hc idle alone never prompts (never trusted); the exact
         // Idle verdict below is the authority that lets the Prompt through.
         m.presence
             .insert("BlueRidge".into(), Presence::from_str("idle"));
@@ -3122,7 +3122,7 @@ mod tests {
                 rows: vec![],
                 pin: "P".into(),
             },
-            Msg::HerdrStatus {
+            Msg::PlaneStatus {
                 pin: "P".into(),
                 status: "idle".into(),
             },
@@ -3423,18 +3423,18 @@ mod bell_fold_tests {
     }
 
     #[test]
-    fn bell_fold_no_status_preinsert_before_herdr_tick() {
+    fn bell_fold_no_status_preinsert_before_plane_tick() {
         let src = include_str!("main.rs");
-        // pre-insert before HerdrStatus tick kills drain (tick must see from)
+        // pre-insert before PlaneStatus tick kills drain (tick must see from)
         let needle = "bell_model.statuses.insert(pin.clone(), to.clone())";
         let count = src.matches(needle).count();
         assert!(
             count <= 1,
-            "RED (bd-6b1y #7): main.rs still pre-inserts statuses before HerdrStatus tick"
+            "RED (bd-6b1y #7): main.rs still pre-inserts statuses before PlaneStatus tick"
         );
         assert!(
             !src.contains("status_by_pin.insert"),
-            "RED: dispatcher still writes a side map before HerdrStatus; tick owns Model.doorbell.statuses"
+            "RED: dispatcher still writes a side map before PlaneStatus; tick owns Model.doorbell.statuses"
         );
     }
 
@@ -3443,7 +3443,7 @@ mod bell_fold_tests {
         // bd-asr2.5 topology: the refresh/sweep helpers are gone (their arms
         // live in doorbell_host.rs + the rt Brain). The invariant survives:
         // no status side map anywhere — Model.doorbell.statuses is the only
-        // herdr-status map, written by tick alone.
+        // hc-status map, written by tick alone.
         let src = include_str!("main.rs");
         assert!(
             !src.contains("fn doorbell_refresh_status("),
@@ -3455,7 +3455,7 @@ mod bell_fold_tests {
         );
         assert!(
             !src.contains("status_by_pin"),
-            "RED: a status_by_pin side map survives; tick HerdrStatus writes Model"
+            "RED: a status_by_pin side map survives; tick PlaneStatus writes Model"
         );
         let host = include_str!("doorbell_host.rs");
         assert!(
@@ -3549,7 +3549,7 @@ mod bell_fold_tests {
         );
         assert!(
             !slice.contains("agent_prompt") && !slice.contains("Client::connect"),
-            "captain_fact_inject must not herdr-inject (Tick Law)"
+            "captain_fact_inject must not hc-inject (Tick Law)"
         );
         // adapter must not swallow Err into ()
         assert!(
@@ -3785,7 +3785,7 @@ mod loop_fold_tests {
         );
         assert!(
             !durable.contains("pending_events: event_batch.events.clone()"),
-            "do not world-dump poll events into the model before Tick; fold Msg::Herdr"
+            "do not world-dump poll events into the model before Tick; fold Msg::Hc"
         );
         assert!(
             !durable.contains("swarm: model.clone()"),
@@ -4370,9 +4370,9 @@ mod presence_model_tests {
     }
 
     #[test]
-    fn presence_model_inject_reads_model_not_herdr() {
+    fn presence_model_inject_reads_model_not_plane() {
         let src = include_str!("workspace.rs");
-        // Inject should read presence in Model, not herdr-only gossip
+        // Inject should read presence in Model, not hc-only gossip
         assert!(
             src.contains("presence") && src.contains("Presence"),
             "inject must read presence in Model"
@@ -4399,7 +4399,7 @@ mod presence_model_tests {
     // (line pubkey == pin's npub) or the trusted Msg::Presence edge.
     // A 20001 line whose author is not the claimed pin is a forge:
     // LoudMiss (+Audit), presence unchanged. Missing key = Unknown;
-    // Unknown never prompts (prompt_allowed falls back to herdr
+    // Unknown never prompts (prompt_allowed falls back to hc
     // "unknown" which should_inject rejects).
     #[test]
     fn presence_20001_forge_fails_loud() {
@@ -4448,7 +4448,7 @@ mod presence_model_tests {
     fn presence_unknown_pin_gets_no_prompt() {
         let mut m = empty_model();
         m.doorbell.index.insert_pin("GhostPin".into(), None);
-        // No presence entry (Unknown) and no herdr status (unknown):
+        // No presence entry (Unknown) and no hc status (unknown):
         // a kind-9 mention must not prompt.
         let line = r#"{"kind":9,"id":"ab","tags":[["p","GhostPin"],["h","ch-1"]],"content":"@GhostPin hi"}"#;
         let (_, cmds) = tick(&m, &Msg::WatchNdjson { line: line.into() });
@@ -4460,33 +4460,33 @@ mod presence_model_tests {
 
     /// D3 property: no consumer branch is reachable from Unknown.
     /// verdict_for never yields Idle from Unknown/missing presence;
-    /// herdr busy yields evidence-labeled Busy, never authority.
+    /// hc busy yields evidence-labeled Busy, never authority.
     #[test]
     fn d3_verdict_never_promotes_unknown() {
         let busy_evidence = Presence::Busy {
-            source: "herdr-evidence".into(),
+            source: "hc-evidence".into(),
         };
         let dead_endpoint = Presence::Dead {
             source: "endpoint".into(),
         };
-        for herdr in [
+        for hc in [
             "working", "busy", "idle", "done", "blocked", "unknown", "weird",
         ] {
-            let v = verdict_for(None, herdr, true);
-            let expected = match herdr {
+            let v = verdict_for(None, hc, true);
+            let expected = match hc {
                 "working" | "busy" => busy_evidence.clone(),
                 _ => Presence::Unknown,
             };
-            assert_eq!(v, expected, "herdr={herdr}");
+            assert_eq!(v, expected, "hc={hc}");
             assert_eq!(
-                verdict_for(None, herdr, false),
+                verdict_for(None, hc, false),
                 dead_endpoint,
-                "herdr={herdr}"
+                "hc={hc}"
             );
             assert_eq!(
-                verdict_for(Some(&Presence::Unknown), herdr, true),
+                verdict_for(Some(&Presence::Unknown), hc, true),
                 v,
-                "Unknown behaves as missing: herdr={herdr}"
+                "Unknown behaves as missing: hc={hc}"
             );
         }
         // Known verdicts pass through with source intact.
@@ -4511,7 +4511,7 @@ mod presence_model_tests {
             }
         );
         // Render tokens carry source.
-        assert_eq!(busy_evidence.status_token(), "Busy(herdr-evidence)");
+        assert_eq!(busy_evidence.status_token(), "Busy(hc-evidence)");
         assert_eq!(idle.status_token(), "Idle(presence)");
         assert_eq!(Presence::Unknown.status_token(), "Unknown");
         // Prompt gate: only exact Idle prompts.
@@ -6889,10 +6889,10 @@ impl CmdTrait for Cmd {
             Cmd::Reclaim {
                 bead_id,
                 pin,
-                herdr_name,
+                terminal_name,
                 ..
             } => Durability::Durable {
-                key: format!("reclaim:{bead_id}:{pin}:{herdr_name}"),
+                key: format!("reclaim:{bead_id}:{pin}:{terminal_name}"),
             },
             Cmd::SqliteUpsert { corr, .. } => Durability::Durable {
                 key: format!("upsert:{corr}"),
@@ -7047,7 +7047,7 @@ mod shadow_tests {
                 rows: vec![],
                 pin: "Pin".into(),
             },
-            Msg::HerdrStatus {
+            Msg::PlaneStatus {
                 pin: "P".into(),
                 status: "idle".into(),
             },
@@ -7107,7 +7107,7 @@ mod shadow_tests {
                 decide_reason: "d".into(),
                 explicit_topology: None,
             },
-            Msg::Herdr {
+            Msg::Hc {
                 event: crate::durable::PollEvent {
                     event_type: "status".into(),
                     pane_id: "w1:p1".into(),

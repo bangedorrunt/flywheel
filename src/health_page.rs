@@ -5,8 +5,8 @@
 //! a dispatcher whose pid file names no live process pages once; a live pid
 //! clears the hold so a later death pages again. A heartbeat older than the
 //! toron presence TTL pages only when [`pane_binding_may_clear`] says the
-//! binding is a herdr pane herdr actually answered for. A pin herdr cannot
-//! see on purpose (freebuff, superlogical, unknown harness) has no herdr
+//! binding is an hc pane hc actually answered for. A pin hc cannot
+//! see on purpose (freebuff, superlogical, unknown harness) has no hc
 //! heartbeat and is never a stall.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -32,14 +32,14 @@ pub enum DispatcherSignal {
     Unreadable,
 }
 
-/// What one herdr-bound pin's presence row says.
+/// What one hc-bound pin's presence row says.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HeartbeatSignal {
     /// A heartbeat inside the TTL.
     Fresh,
-    /// Stale, and the binding is one herdr may clear: page.
+    /// Stale, and the binding is one hc may clear: page.
     Stale { age_secs: u64, line: String },
-    /// Stale, but the binding is not herdr-injectable (or herdr did not
+    /// Stale, but the binding is not hc-injectable (or terminal did not
     /// answer): keep it, never page.
     StaleKept,
 }
@@ -52,7 +52,7 @@ pub enum HealthEvent {
     DeadDoorbell { label: String, line: String },
     /// A dispatcher is live again (or its workspace is gone): clear the hold.
     DoorbellRecovered { label: String },
-    /// A herdr-bound pin's heartbeat went stale and was not already paged.
+    /// An hc-bound pin's heartbeat went stale and was not already paged.
     StaleHeartbeat { pin: String, line: String },
     /// The heartbeat is fresh again (or the pin is gone): clear the hold.
     HeartbeatRecovered { pin: String },
@@ -119,8 +119,8 @@ impl HealthHold {
                         out.push(HealthEvent::HeartbeatRecovered { pin: pin.clone() });
                     }
                 }
-                // Kept is not recovery: herdr did not answer, or the pin is
-                // not one herdr injects. Stay silent until a fresh beat.
+                // Kept is not recovery: hc did not answer, or the pin is
+                // not one hc injects. Stay silent until a fresh beat.
                 HeartbeatSignal::StaleKept => {}
             }
         }
@@ -143,7 +143,7 @@ pub struct HeartbeatRow {
     pub pane_id: String,
 }
 
-/// Registry rows that could hold a herdr pane binding. A row with no pin or
+/// Registry rows that could hold an hc pane binding. A row with no pin or
 /// no pane is invisible to this probe (and to the wake layer).
 pub fn registry_rows(cfg: &crate::config::Config, project: &str) -> Vec<HeartbeatRow> {
     let effective = crate::backend::resolve_backend_name(cfg);
@@ -232,7 +232,7 @@ pub fn heartbeat_signals(
             HeartbeatSignal::Stale {
                 age_secs: age,
                 line: format!(
-                    "loop-mode supervise: STALE HEARTBEAT in {project} — {} (pane {}, harness {}) has not beat for {age}s (>{PRESENCE_TTL_SECS}s) and herdr no longer lists its pane",
+                    "loop-mode supervise: STALE HEARTBEAT in {project} — {} (pane {}, harness {}) has not beat for {age}s (>{PRESENCE_TTL_SECS}s) and hc no longer lists its pane",
                     row.pin, row.pane_id, row.harness
                 ),
             }
@@ -343,20 +343,20 @@ mod tests {
         let presence = format!(
             "{{\"name\":\"RustyOtter\",\"project\":\"p\",\"ts\":{stale_ts}}}\n\
              {{\"name\":\"SuperPin\",\"project\":\"p\",\"ts\":{stale_ts}}}\n\
-             {{\"name\":\"HerdrDown\",\"project\":\"p\",\"ts\":{stale_ts}}}\n"
+             {{\"name\":\"PlaneDown\",\"project\":\"p\",\"ts\":{stale_ts}}}\n"
         );
         // FreeBuff deliberately has no row: no heartbeat is not a stall.
         let rows = vec![
             HeartbeatRow {
                 pin: "RustyOtter".into(),
                 harness: "opencode".into(),
-                backend: "herdr".into(),
+                backend: "hc".into(),
                 pane_id: "w1:p2".into(),
             },
             HeartbeatRow {
                 pin: "FreeBuff".into(),
                 harness: "freebuff".into(),
-                backend: "herdr".into(),
+                backend: "hc".into(),
                 pane_id: "w1:p9".into(),
             },
             HeartbeatRow {
@@ -404,28 +404,28 @@ mod tests {
         );
         // The §6 gate itself, not only the absence of a heartbeat row.
         assert!(
-            !crate::pane_keep::pane_binding_may_clear("freebuff", "herdr", "w1:p9", Some(&live)),
-            "freebuff is never a clearable herdr binding"
+            !crate::pane_keep::pane_binding_may_clear("freebuff", "hc", "w1:p9", Some(&live)),
+            "freebuff is never a clearable hc binding"
         );
 
-        // herdr not answering is not a clearance either: the stale pin is
+        // hc not answering is not a clearance either: the stale pin is
         // kept and nothing pages.
         let down_rows = vec![HeartbeatRow {
-            pin: "HerdrDown".into(),
+            pin: "PlaneDown".into(),
             harness: "opencode".into(),
-            backend: "herdr".into(),
+            backend: "hc".into(),
             pane_id: "w1:p4".into(),
         }];
         let down_beats = heartbeat_signals("p", now, &down_rows, &presence, None);
         assert_eq!(
-            down_beats.get("HerdrDown"),
+            down_beats.get("PlaneDown"),
             Some(&HeartbeatSignal::StaleKept),
             "live_panes=None must keep the pin"
         );
         let mut down_hold = HealthHold::default();
         assert!(
             down_hold.observe(&BTreeMap::new(), &down_beats).is_empty(),
-            "herdr silence never pages"
+            "hc silence never pages"
         );
 
         // Pass 2: the same snapshot is silent; the hold is the page-once.

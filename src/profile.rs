@@ -83,7 +83,7 @@ pub struct Profile {
     /// When to pick this profile (one line on `profile show`).
     #[serde(default)]
     pub when: String,
-    /// Which backend trait impl to spawn on. Default `herdr` (ADR-0005
+    /// Which backend trait impl to spawn on. Default `hc` (ADR-0005
     /// Default Configuration). Resolved by the backend factory at spawn time.
     #[serde(default)]
     pub backend: String,
@@ -434,7 +434,7 @@ impl ProfileCatalog {
     }
 
     /// bd-enov (F6): is `kind` a harness flywheel can actually spawn? True for
-    /// a herdr integration kind (`crate::hc_support::INTEGRATION_KINDS`) or a
+    /// an hc integration kind (`crate::hc_support::INTEGRATION_KINDS`) or a
     /// `[harness.<name>]` spawn recipe (compiled-in `pa`/`jcode` or a user
     /// entry). Short aliases (`oc`, `gk`) are normalized FIRST so the caller
     /// can persist the canonical kind. `None` = unknown (reject loudly at
@@ -461,12 +461,12 @@ impl ProfileCatalog {
         out
     }
 
-    /// Resolve the backend identifier for a profile (defaults to `herdr`).
+    /// Resolve the backend identifier for a profile (defaults to `hc`).
     pub fn backend(&self, name: &str) -> &str {
         self.get(name)
             .map(|p| p.backend.as_str())
             .filter(|s| !s.is_empty())
-            .unwrap_or("herdr")
+            .unwrap_or("hc")
     }
 
     /// Resolve `@name` to a spawnable agent (ADR-0005 Spec 1 — the P2.3
@@ -787,10 +787,10 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
     m
 }
 
-/// bd-enov (F6): normalize the documented short harness aliases to the herdr
+/// bd-enov (F6): normalize the documented short harness aliases to the hc
 /// kind they mean. `profile create --harness oc` used to write `oc` verbatim
 /// and the spawn died later with `unsupported interactive agent kind oc`
-/// (herdr's kind is `opencode`). Pure; unknown values pass through untouched
+/// (hc's kind is `opencode`). Pure; unknown values pass through untouched
 /// so the caller can reject them loudly.
 pub fn normalize_harness_alias(kind: &str) -> String {
     // bd-drlm: the alias table moved to `harness_registry`. This used to be one
@@ -803,18 +803,18 @@ pub fn normalize_harness_alias(kind: &str) -> String {
 /// known harnesses directly). Seam for `[harness.<name>]` additions.
 pub fn compiled_in_harnesses() -> BTreeMap<String, HarnessConfig> {
     let mut m = BTreeMap::new();
-    // H1 (bd-harness-prime-agent-818f): prime-agent ships a BUILT-IN herdr
+    // H1 (bd-harness-prime-agent-818f): prime-agent ships a BUILT-IN hc
     // socket integration (`packages/coding-agent/src/core/extensions/builtin/
-    // herdr-agent-state.ts`) that activates on HERDR_ENV=1 + HERDR_SOCKET_PATH
-    // + HERDR_PANE_ID — all injected by herdr's standard pane launch env —
-    // and reports pane.report_agent (source "herdr:pi", agent "prime-agent",
-    // working/blocked/idle + session refs), which herdr accepts as hook
-    // authority even for unknown kinds. BUT herdr has NO `pa` kind: its
+    // hc agent-state extension`) that activates on HC_SOCKET_PATH
+    // + HC_TERMINAL_ID — all injected by hc's standard pane launch env —
+    // and reports pane.report_agent (source "hc:pi", agent "prime-agent",
+    // working/blocked/idle + session refs), which hc accepts as hook
+    // authority even for unknown kinds. BUT hc has NO `pa` kind: its
     // Agent enum is a closed 22-kind set (`agent.start --kind pa` →
     // `unsupported_agent_kind`), and `server.agent_manifests` registers
     // screen-detection rules only, not kinds. The spawn path therefore falls
-    // back to this recipe via `pane.run` when herdr rejects the kind (upstream
-    // kind request filed: herdrdev/herdr). `--offline` skips startup network
+    // back to this recipe via `pane.run` when hc rejects the kind (upstream
+    // kind request filed upstream). `--offline` skips startup network
     // checks so the TUI comes up fast in a bare pane.
     m.insert(
         "pa".to_string(),
@@ -823,12 +823,12 @@ pub fn compiled_in_harnesses() -> BTreeMap<String, HarnessConfig> {
         },
     );
     // H2 (bd-harness-jcode): jcode (the open-source terminal coding agent) is a
-    // flywheel custom kind — herdr has NO `jcode` kind, so the spawn path falls
-    // back to this recipe via `pane.run` (same as `pa`). herdr's standard pane
-    // launch env already carries HERDR_ENV / HERDR_SOCKET_PATH / HERDR_PANE_ID,
-    // so jcode's own herdr integration (the `herdr-agent-state.sh` lifecycle
-    // hook adapter, source `herdr:jcode`) activates and self-reports lifecycle
-    // (working/idle/blocked) through the socket — which herdr accepts as hook
+    // flywheel custom kind — hc has NO `jcode` kind, so the spawn path falls
+    // back to this recipe via `pane.run` (same as `pa`). hc's standard pane
+    // launch env already carries HC_SOCKET_PATH / HC_SESSION / HC_TERMINAL_ID,
+    // so jcode's own hc integration (the `hc agent-state hook` lifecycle
+    // hook adapter, source `hc:jcode`) activates and self-reports lifecycle
+    // (working/idle/blocked) through the socket — which hc accepts as hook
     // authority even for unknown kinds. The boot-prime line is appended as a
     // launch arg by `recipe_launch_command`; jcode runs as its TUI in the pane
     // and is primed via `pane.send_text` like any other agent. jcode's own
@@ -1273,8 +1273,8 @@ behavior = "be terse"
         assert_eq!(p.model, "claude-sonnet-4");
         assert_eq!(p.role, "tester");
         assert!(cat.names().contains(&"foo".to_string()), "listed");
-        // backend defaults to herdr when unset
-        assert_eq!(cat.backend("foo"), "herdr");
+        // backend defaults to hc when unset
+        assert_eq!(cat.backend("foo"), "hc");
     }
 
     #[test]
@@ -1463,7 +1463,7 @@ spawn_cmd = "hermes --project {project} --role {role}"
         );
     }
 
-    /// bd-enov (F6): `oc`/`gk` normalize to the herdr kinds, and a written
+    /// bd-enov (F6): `oc`/`gk` normalize to the hc kinds, and a written
     /// alias is repaired at load so an existing profile stops dying at spawn.
     #[test]
     fn harness_alias_normalizes_and_repairs_on_load() {
@@ -1724,7 +1724,7 @@ model = "deepseek-v4.1-flash"
         assert_eq!(r.npub, "npub-project-agent");
         assert_eq!(r.spec.harness, "pi");
         assert_eq!(r.spec.model, "opencode-go/muse-spark-1.3-contributor");
-        assert_eq!(r.spec.backend, "herdr");
+        assert_eq!(r.spec.backend, "hc");
         assert_eq!(
             r.signing,
             SigningContext::ProjectAgent {
@@ -1742,8 +1742,8 @@ model = "deepseek-v4.1-flash"
             .expect("resolve");
         assert_eq!(r.npub, "npub-operator");
         assert_eq!(r.signing, SigningContext::Operator("npub-operator".into()));
-        // backend defaults to herdr
-        assert_eq!(r.spec.backend, "herdr");
+        // backend defaults to hc
+        assert_eq!(r.spec.backend, "hc");
     }
 
     #[test]
@@ -1774,7 +1774,7 @@ model = "deepseek-v4.1-flash"
         assert_eq!(got["spec"]["harness"], "pi");
         assert_eq!(got["spec"]["model"], "zai/glm-5.3");
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(got["spec"]["backend"], "herdr");
+        assert_eq!(got["spec"]["backend"], "hc");
         assert_eq!(got["spec"]["role"], "planner");
         assert_eq!(
             cat.resolve_for_engine("planner").as_ref(),

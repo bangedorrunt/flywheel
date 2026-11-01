@@ -34,7 +34,7 @@ pub use doorbell_core::{
 /// The ONE inbox-lease key for a doorbell host (rv23 S1/S2).
 ///
 /// A doorbell host is spawned as `__doorbell --workspace <label>` and keys
-/// every file and lease by that herdr workspace LABEL, never by the herdr
+/// every file and lease by that hc workspace LABEL, never by the hc
 /// workspace id (`w1`). The inbox host leases this key and the sender looks
 /// up this key, so the two cannot drift: when the sender looked up
 /// `inbox-<workspace id>` it never found the host's `inbox-<label>` lease and
@@ -518,7 +518,7 @@ pub fn probe_workspace_presence(
 }
 
 /// Cutover registration (bd-asr2.13, Phase 3): spawn records one
-/// subscription row per pinned crew member (herdr sink, own workspace —
+/// subscription row per pinned crew member (hc sink, own workspace —
 /// local-actor allowed, D6). Best-effort: a store failure warns loudly and
 /// never fails the spawn. The daemon auto-hosts these rows (bd-2o1v) — it
 /// needs the project, so spawn names it. `kill` drops the spawn's own rows
@@ -539,7 +539,7 @@ pub fn register_workspace_subscriptions(
             identity: Identity::Pin(pin.clone()),
             scope: Scope::One(workspace.to_string()),
             filter: Filter::default(),
-            sink: SinkKind::Herdr,
+            sink: SinkKind::Hc,
             budget: Budget::default_530(),
             project: Some(project.to_string()),
             endpoint: None,
@@ -566,7 +566,7 @@ pub fn register_arrival_subscription(state_dir: &Path, project: &str, workspace:
         identity: Identity::Pin(pin.to_string()),
         scope: Scope::One(workspace.to_string()),
         filter: Filter::default(),
-        sink: SinkKind::Herdr,
+        sink: SinkKind::Hc,
         budget: Budget::default_530(),
         project: Some(project.to_string()),
         endpoint: None,
@@ -1444,7 +1444,7 @@ pub fn dead_audit_files(
 // Second reducers deleted per bd-3wzl.
 // Live dispatcher now routes every watch/status edge through `workspace::tick` (tick(&WorkspaceModel, &Msg)).
 /// Tests below port the same scenarios to `workspace::tick` (see `sc_d1_*`).
-/// herdr-mock: stdin watch lines + pin statuses → JSON injects via tick (no second reducer).
+/// hc-mock: stdin watch lines + pin statuses → JSON injects via tick (no second reducer).
 pub fn once_json(stdin: &str, status_by_pin: &BTreeMap<String, String>) -> String {
     let index = SelfIndex::from_pins(status_by_pin.keys().cloned());
     let mut model = crate::workspace::WorkspaceModel::default();
@@ -1452,7 +1452,7 @@ pub fn once_json(stdin: &str, status_by_pin: &BTreeMap<String, String>) -> Strin
     for (pin, status) in status_by_pin {
         let (next, _) = crate::workspace::tick(
             &model,
-            &crate::workspace::Msg::HerdrStatus {
+            &crate::workspace::Msg::PlaneStatus {
                 pin: pin.clone(),
                 status: status.clone(),
             },
@@ -1676,7 +1676,7 @@ pub fn render_roster(rows: &[RosterRow]) -> Vec<String> {
     out
 }
 
-/// Nearby discovery row (bd-gpj0.2): herdr panes ∪ registry pins ∪
+/// Nearby discovery row (bd-gpj0.2): hc terminals ∪ registry pins ∪
 /// reservation holders. Empty pin means an unbound pane — the thing four
 /// manual queries used to hunt for.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -1688,23 +1688,23 @@ pub struct NearbyRow {
     pub held: String,
 }
 
-/// Pure join: registry `(pin, pane, name)`, herdr `(pane, name, status)`,
+/// Pure join: registry `(pin, pane, name)`, hc `(pane, name, status)`,
 /// leases `(holder, path)`. Unbound panes stay in the list.
 pub fn join_nearby(
     registry: &[(String, String, String)],
-    herdr: &[(String, String, String)],
+    hc: &[(String, String, String)],
     leases: &[(String, String)],
 ) -> Vec<NearbyRow> {
-    let mut herdr_by_pane: std::collections::BTreeMap<String, (String, String)> =
+    let mut status_by_pane: std::collections::BTreeMap<String, (String, String)> =
         std::collections::BTreeMap::new();
-    for (pane, name, status) in herdr {
-        herdr_by_pane.insert(pane.clone(), (name.clone(), status.clone()));
+    for (pane, name, status) in hc {
+        status_by_pane.insert(pane.clone(), (name.clone(), status.clone()));
     }
     let mut seen_panes = std::collections::BTreeSet::new();
     let mut rows = Vec::new();
     for (pin, pane, name) in registry {
         seen_panes.insert(pane.clone());
-        let (hname, status) = herdr_by_pane
+        let (hname, status) = status_by_pane
             .get(pane)
             .cloned()
             .unwrap_or_else(|| (name.clone(), "missing".to_string()));
@@ -1720,7 +1720,7 @@ pub fn join_nearby(
             held: lease_paths(leases, pin),
         });
     }
-    for (pane, (name, status)) in &herdr_by_pane {
+    for (pane, (name, status)) in &status_by_pane {
         if seen_panes.contains(pane) {
             continue;
         }
@@ -2282,7 +2282,7 @@ mod tests {
             .statuses
             .insert("LilacChapel".into(), "idle".into());
         model.doorbell.index = SelfIndex::from_pins(["BlueRidge", "LilacChapel"]);
-        // D3 (bd-s8bo): herdr idle is evidence, never authority — the exact
+        // D3 (bd-s8bo): hc idle is evidence, never authority — the exact
         // Idle verdict below is what lets the Prompt through the gate.
         model.presence.insert(
             "BlueRidge".into(),
@@ -2328,29 +2328,29 @@ mod tests {
         status.insert("BlueRidge".into(), "idle".into());
         status.insert("LilacChapel".into(), "idle".into());
         // D3 (bd-s8bo): the once/debug path carries no presence authority,
-        // so herdr-only idle stays silent for every pin — mentioned or not.
+        // so hc-only idle stays silent for every pin — mentioned or not.
         // Mention routing with authority is covered at tick level by
         // sc_d1_kind9_at_pin_injects_when_idle.
         let json = once_json(kind9_at_blueridge(), &status);
         assert_eq!(
             json, "[]",
-            "herdr-only idle must not inject without presence authority: {json}"
+            "hc-only idle must not inject without presence authority: {json}"
         );
     }
 
     #[test]
-    fn once_json_seeds_statuses_via_herdr_tick() {
+    fn once_json_seeds_statuses_via_plane_tick() {
         // bd-adr0027-proven-leftovers-55nx.10 RED: statuses must enter via
-        // Msg::HerdrStatus ticks, never via direct map assign. (Needle is
+        // Msg::PlaneStatus ticks, never via direct map assign. (Needle is
         // split so this source-scan does not match its own literal.)
         let src = include_str!("doorbell.rs");
         let needle = ["model.doorbell.statuses ", "= status_by_pin"].concat();
         assert!(
             !src.contains(&needle),
-            "RED: once_json still map-assigns statuses; tick Msg::HerdrStatus instead"
+            "RED: once_json still map-assigns statuses; tick Msg::PlaneStatus instead"
         );
         // Behavioral: working pin must queue (no prompt). D3 (bd-s8bo):
-        // herdr idle alone never prompts (never trusted) — the once/debug
+        // hc idle alone never prompts (never trusted) — the once/debug
         // path carries no presence authority, so idle stays silent too.
         let mut working = BTreeMap::new();
         working.insert("BlueRidge".into(), "working".into());
@@ -2361,7 +2361,7 @@ mod tests {
         let json = once_json(kind9_at_blueridge(), &idle);
         assert_eq!(
             json, "[]",
-            "herdr-only idle must not inject without presence authority: {json}"
+            "hc-only idle must not inject without presence authority: {json}"
         );
     }
 
@@ -2489,7 +2489,7 @@ mod tests {
         for p in &pins {
             model.doorbell.index.insert_pin(p.clone(), None);
         }
-        let idle = crate::workspace::Msg::HerdrStatus {
+        let idle = crate::workspace::Msg::PlaneStatus {
             pin: "BlueRidge".into(),
             status: "idle".into(),
         };
@@ -2583,7 +2583,7 @@ mod tests {
             Some(&pins),
         );
         model = next;
-        let idle = Msg::HerdrStatus {
+        let idle = Msg::PlaneStatus {
             pin: "BlueRidge".into(),
             status: "idle".into(),
         };
@@ -2891,7 +2891,7 @@ mod tests {
             .collect();
         assert!(prompts.is_empty(), "working pin must not inject");
         assert_eq!(next.doorbell.queues.get("BlueRidge").map(Vec::len), Some(1));
-        // D3 (bd-s8bo): the drain needs presence authority; herdr idle
+        // D3 (bd-s8bo): the drain needs presence authority; hc idle
         // alone stays Unknown and silent.
         let mut next = next;
         next.presence.insert(
@@ -2900,7 +2900,7 @@ mod tests {
         );
         let (next2, cmds2) = crate::workspace::tick(
             &next,
-            &crate::workspace::Msg::HerdrStatus {
+            &crate::workspace::Msg::PlaneStatus {
                 pin: "BlueRidge".into(),
                 status: "idle".into(),
             },
@@ -2950,7 +2950,7 @@ mod tests {
             .statuses
             .insert("LilacChapel".into(), "idle".into());
         model.doorbell.index = index;
-        // D3 (bd-s8bo): exact Idle verdict required; herdr idle alone is evidence.
+        // D3 (bd-s8bo): exact Idle verdict required; hc idle alone is evidence.
         model.presence.insert(
             "BlueRidge".into(),
             crate::workspace::Presence::from_str("idle"),
@@ -2987,7 +2987,7 @@ mod tests {
             .statuses
             .insert("BlueRidge".into(), "idle".into());
         model.doorbell.index = SelfIndex::from_pins(["BlueRidge"]);
-        // D3 (bd-s8bo): exact Idle verdict required; herdr idle alone is evidence.
+        // D3 (bd-s8bo): exact Idle verdict required; hc idle alone is evidence.
         model.presence.insert(
             "BlueRidge".into(),
             crate::workspace::Presence::from_str("idle"),
@@ -3023,12 +3023,12 @@ mod tests {
     fn plane_p_urgent_injects_when_idle() {
         // bd-adr0027-proven-leftovers-55nx.2: ported from the deleted
         // apply_inbox_json second reducer to the live path —
-        // workspace::tick + Msg::InboxRows. Statuses enter as HerdrStatus
+        // workspace::tick + Msg::InboxRows. Statuses enter as PlaneStatus
         // Msgs, never a side map.
         use crate::workspace::{Msg, WorkspaceModel};
         let mut model = WorkspaceModel::default();
         model.doorbell.index.insert_pin("BlueRidge".into(), None);
-        // D3 (bd-s8bo): urgent still needs an exact Idle verdict; herdr
+        // D3 (bd-s8bo): urgent still needs an exact Idle verdict; hc
         // idle alone stays Unknown and silent.
         model.presence.insert(
             "BlueRidge".into(),
@@ -3036,7 +3036,7 @@ mod tests {
         );
         let (model, _) = crate::workspace::tick(
             &model,
-            &Msg::HerdrStatus {
+            &Msg::PlaneStatus {
                 pin: "BlueRidge".into(),
                 status: "idle".into(),
             },
@@ -3523,7 +3523,7 @@ mod tests {
     }
 
     /// Heal scope: the dispatcher key is the workspace LABEL (the pid/gen
-    /// file stem `swarm_label` writes), NEVER the herdr pane-id prefix —
+    /// file stem `swarm_label` writes), NEVER the hc pane-id prefix —
     /// a label-keyed heal finds the real pid files (bd-durable-doorbell-
     /// lngf graduation finding: w8B vs flywheel-flywheel).
     #[test]
@@ -3613,7 +3613,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dbljrn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
-        let msg = crate::doorbell_tick::DoorbellMsg::HerdrStatus {
+        let msg = crate::doorbell_tick::DoorbellMsg::PlaneStatus {
             pin: "BlueRidge".into(),
             status: "idle".into(),
         };
@@ -3646,7 +3646,7 @@ mod tests {
         let all = journal_read_all(&dir);
         assert_eq!(all.len(), 2, "two good entries survive the corrupt line");
         assert_eq!(all[0].0, "w1");
-        assert_eq!(all[1].1["msg"]["HerdrStatus"]["pin"], "BlueRidge");
+        assert_eq!(all[1].1["msg"]["PlaneStatus"]["pin"], "BlueRidge");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3756,7 +3756,7 @@ mod tests {
             "wP:p2".to_string(),
             "grok".to_string(),
         )];
-        let herdr = vec![
+        let hc = vec![
             (
                 "wP:p2".to_string(),
                 "grok".to_string(),
@@ -3769,7 +3769,7 @@ mod tests {
             ),
         ];
         let leases = vec![("QuietHeron".to_string(), "src/main.rs".to_string())];
-        let rows = join_nearby(&registry, &herdr, &leases);
+        let rows = join_nearby(&registry, &hc, &leases);
         assert_eq!(rows.len(), 2, "{rows:?}");
         let bound = rows.iter().find(|r| r.pin == "QuietHeron").expect("bound");
         assert_eq!(bound.pane, "wP:p2");
@@ -3969,7 +3969,7 @@ mod tests {
             identity: Identity::Pin(pin.to_string()),
             scope: Scope::One(ws.to_string()),
             filter: Filter::default(),
-            sink: SinkKind::Herdr,
+            sink: SinkKind::Hc,
             budget: Budget::default_530(),
             project: Some("proj".into()),
             endpoint: None,

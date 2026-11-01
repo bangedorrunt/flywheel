@@ -10,14 +10,14 @@
 //! [`Ports`] boundary:
 //!
 //! ```text
-//!   durable facts + herdr --observe--> msgs --InboxProgram::update--> cmds
+//!   durable facts + hc --observe--> msgs --InboxProgram::update--> cmds
 //!   cmds --Ports--> pane write (pane id + binding gen) / reverify / facts / notify
 //! ```
 //!
 //! Pure here: [`Core`] (translate an [`Observation`] into fold messages,
 //! step the fold, derive the `bind` facts). Effects here: only
 //! [`execute`], which calls [`Ports`]. The fold never reads a clock, the
-//! store or herdr; time arrives as `now_ms`.
+//! store or terminal; time arrives as `now_ms`.
 //!
 //! A ring is never delivery: `rings_since_advance` resets only on a `Cursor`
 //! fact the host reads from the log (the recipient ran `toron next`). At the
@@ -41,12 +41,12 @@ use toron_core::wake::{PaneState, Urgency};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bind {
     pub pane_id: String,
-    pub herdr_session: String,
+    pub plane_session: String,
     pub verified: bool,
     pub verified_by: String,
 }
 
-/// One recipient as observed this round: durable log facts plus herdr's view.
+/// One recipient as observed this round: durable log facts plus hc's view.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Seen {
     pub npub: String,
@@ -62,9 +62,9 @@ pub struct Seen {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Observation {
     pub seen: Vec<Seen>,
-    /// herdr was unreachable and is reachable again: pane ids may not be the
+    /// hc was unreachable and is reachable again: pane ids may not be the
     /// ones verified (invalidates every binding).
-    pub herdr_restarted: bool,
+    pub plane_restarted: bool,
 }
 
 /// The effect boundary. Production: `inbox_ports::FlywheelPorts`; tests:
@@ -111,7 +111,7 @@ pub struct Budget {
     /// is re-verified before any ring; a different pane is a new incarnation
     /// and gets a fresh budget (the fold's own rule).
     pub pane_id: Option<String>,
-    pub herdr_session: Option<String>,
+    pub plane_session: Option<String>,
 }
 
 /// First wait after a failed re-verify, doubling to [`REVERIFY_BACKOFF_CAP_MS`]
@@ -177,7 +177,7 @@ impl Core {
                         rings_since_advance: r.rings_since_advance,
                         deaf: r.deaf,
                         pane_id: r.binding.as_ref().map(|b| b.pane_id.clone()),
-                        herdr_session: r.binding.as_ref().map(|b| b.herdr_session.clone()),
+                        plane_session: r.binding.as_ref().map(|b| b.plane_session.clone()),
                     },
                 )
             })
@@ -198,7 +198,7 @@ impl Core {
                 .as_ref()
                 .map(|pane_id| toron_core::inbox_program::Binding {
                     pane_id: pane_id.clone(),
-                    herdr_session: b.herdr_session.clone().unwrap_or_default(),
+                    plane_session: b.plane_session.clone().unwrap_or_default(),
                     generation: self.model.generation,
                     verified: false,
                     verified_by: "restored".into(),
@@ -224,10 +224,10 @@ impl Core {
     /// the fold's own `Reverify` command, never silently here.
     pub fn msgs_for(&self, obs: &Observation) -> Vec<InboxMsg> {
         let mut m = Vec::new();
-        if obs.herdr_restarted {
-            m.push(InboxMsg::Invalidate(Invalidate::HerdrRestarted));
+        if obs.plane_restarted {
+            m.push(InboxMsg::Invalidate(Invalidate::PlaneRestarted));
         }
-        let generation = self.model.generation + u64::from(obs.herdr_restarted);
+        let generation = self.model.generation + u64::from(obs.plane_restarted);
         for s in &obs.seen {
             m.push(InboxMsg::Head {
                 recipient: s.npub.clone(),
@@ -262,14 +262,14 @@ fn bound_msg(npub: &str, b: &Bind, generation: u64) -> InboxMsg {
     InboxMsg::Bound {
         recipient: npub.to_string(),
         pane_id: b.pane_id.clone(),
-        herdr_session: b.herdr_session.clone(),
+        plane_session: b.plane_session.clone(),
         generation,
         verified: b.verified,
         verified_by: b.verified_by.clone(),
     }
 }
 
-/// Pure: the `bind{npub, pane_id, herdr_session, gen, verified_by}` facts
+/// Pure: the `bind{npub, pane_id, plane_session, gen, verified_by}` facts
 /// for every binding that changed between two models. Keyed so a replay
 /// writes each once.
 pub fn bind_facts(before: &InboxModel, after: &InboxModel) -> Vec<(String, Value)> {
@@ -286,7 +286,7 @@ pub fn bind_facts(before: &InboxModel, after: &InboxModel) -> Vec<(String, Value
                 "kind": "bind",
                 "npub": npub,
                 "pane_id": b.pane_id,
-                "herdr_session": b.herdr_session,
+                "plane_session": b.plane_session,
                 "gen": b.generation,
                 "verified": b.verified,
                 "verified_by": b.verified_by,
@@ -438,8 +438,8 @@ pub fn round(
             Input::Hint(n) => hints.push(n),
         }
     }
-    // A generation move (or a herdr restart) is a reason to look again now.
-    if obs.herdr_restarted || msgs.iter().any(|m| matches!(m, InboxMsg::Invalidate(_))) {
+    // A generation move (or an hc restart) is a reason to look again now.
+    if obs.plane_restarted || msgs.iter().any(|m| matches!(m, InboxMsg::Invalidate(_))) {
         core.reverify_fails.clear();
         core.reverify_next_ms.clear();
     }
@@ -568,7 +568,7 @@ pub struct InboxHost {
 /// `events_lost` without owning the host.
 static SIGNAL: OnceLock<Mutex<Option<mpsc::SyncSender<Input>>>> = OnceLock::new();
 
-/// Tell the running host (if any) that the herdr/wake stream shed frames:
+/// Tell the running host (if any) that the hc/wake stream shed frames:
 /// every binding is re-verified before the next ring.
 pub fn signal_invalidate(why: Invalidate) {
     if let Some(m) = SIGNAL.get()
@@ -709,7 +709,7 @@ mod tests {
         fn observe(&mut self) -> Observation {
             let mut w = self.0.lock().unwrap();
             let o = w.obs.clone();
-            w.obs.herdr_restarted = false;
+            w.obs.plane_restarted = false;
             o
         }
         fn reverify(&mut self, _npub: &str) -> Option<Bind> {
@@ -747,7 +747,7 @@ mod tests {
     fn bind(verified: bool) -> Bind {
         Bind {
             pane_id: "w1:p1".into(),
-            herdr_session: "s1".into(),
+            plane_session: "s1".into(),
             verified,
             verified_by: "report_metadata".into(),
         }
@@ -797,7 +797,7 @@ mod tests {
         let now = run(&mut core, &f, 3, 1_000);
         assert_eq!(f.0.lock().unwrap().rings.len(), 3);
         drop(core); // the doorbell dies; the budget was persisted before each ring
-        // herdr answers the re-verify of the restored (unverified) binding.
+        // hc answers the re-verify of the restored (unverified) binding.
         f.0.lock().unwrap().reverify = Some(bind(true));
         let mut core2 = restarted(&f);
         run(&mut core2, &f, 10, now);
@@ -817,7 +817,7 @@ mod tests {
         let mut core = Core::default();
         let now = run(&mut core, &f, 2, 1_000);
         drop(core);
-        // herdr cannot vouch for the pane yet: the restored binding stays
+        // hc cannot vouch for the pane yet: the restored binding stays
         // unverified and nothing is typed into it.
         f.0.lock().unwrap().reverify = None;
         let mut core2 = restarted(&f);
@@ -827,8 +827,8 @@ mod tests {
             2,
             "no ring on a restored, unverified binding"
         );
-        assert!(f.0.lock().unwrap().reverified >= 1, "it asks herdr");
-        // Once herdr vouches, the remaining budget is spent and no more.
+        assert!(f.0.lock().unwrap().reverified >= 1, "it asks hc");
+        // Once hc vouches, the remaining budget is spent and no more.
         f.0.lock().unwrap().reverify = Some(bind(true));
         core2.reverify_next_ms.clear();
         run(&mut core2, &f, 10, now + 10_000_000);
@@ -1152,7 +1152,7 @@ mod tests {
         let v = &binds[0].1;
         assert_eq!(v["npub"], R);
         assert_eq!(v["pane_id"], "w1:p1");
-        assert_eq!(v["herdr_session"], "s1");
+        assert_eq!(v["plane_session"], "s1");
         assert_eq!(v["gen"], 0);
         assert_eq!(v["verified"], true);
         assert_eq!(v["verified_by"], "report_metadata");
@@ -1217,14 +1217,14 @@ mod tests {
     }
 
     #[test]
-    fn a_herdr_restart_stales_every_binding() {
+    fn a_plane_restart_stales_every_binding() {
         let f = Fake::default();
         set(&f, seen(2, 0, true));
         let mut core = Core::default();
         let mut p = f.clone();
         round(&mut core, &mut p, vec![], 1_000);
-        f.0.lock().unwrap().obs.herdr_restarted = true;
-        f.0.lock().unwrap().reverify = None; // herdr cannot confirm yet
+        f.0.lock().unwrap().obs.plane_restarted = true;
+        f.0.lock().unwrap().reverify = None; // hc cannot confirm yet
         round(&mut core, &mut p, vec![], 2_000_000);
         round(&mut core, &mut p, vec![], 3_000_000);
         assert_eq!(f.0.lock().unwrap().rings.len(), 1, "unverified: no ring");
@@ -1253,7 +1253,7 @@ mod tests {
         let stale = InboxCmd::Ring {
             recipient: R.into(),
             pane_id: "w1:p1".into(),
-            herdr_session: "w1".into(),
+            plane_session: "w1".into(),
             binding_gen: 0,
             wm: 2,
             line: wake_line(2),
@@ -1412,7 +1412,7 @@ mod tests {
                     pane,
                     bind: Some(Bind {
                         pane_id: "block:fake-1".to_string(),
-                        herdr_session: "session:fake-1".to_string(),
+                        plane_session: "session:fake-1".to_string(),
                         verified,
                         verified_by: "rex-label".to_string(),
                     }),
@@ -1427,7 +1427,7 @@ mod tests {
         fn observe(&mut self) -> Observation {
             Observation {
                 seen: self.seen.clone(),
-                herdr_restarted: false,
+                plane_restarted: false,
             }
         }
 

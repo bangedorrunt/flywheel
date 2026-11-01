@@ -4,7 +4,7 @@
 //!
 //! Two contracts are proven here:
 //!
-//! 1. **Unit-level (no live servers)** — `HerdrBackend`/`ToronMailBackend`
+//! 1. **Unit-level (no live servers)** — `HcBackendLegacyRef`/`ToronMailBackend`
 //!    wrappers are **pure delegation**: a call through `Box<dyn MailBackend>`
 //!    produces the same result as a direct `Mail` call, because the wrapper
 //!    adds no logic. Plus error coercion + Unsupported-honesty (no accidental
@@ -118,7 +118,7 @@ mod tests {
 
     // ---- delegation shape (structural parity guarantee) ----
     //
-    // The wrappers in src/backend/{herdr,toron}.rs are PURE DELEGATION:
+    // The wrappers in src/backend/{hc,toron}.rs are PURE DELEGATION:
     // each method body is a single forward to the underlying Client/Mail
     // method (+ error coercion via `?` or `.map_err(BackendError::from)`).
     // There is no logic that could diverge from a direct call. This is

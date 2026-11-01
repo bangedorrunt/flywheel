@@ -184,21 +184,21 @@ impl From<anyhow::Error> for BackendError {
     }
 }
 
-impl From<crate::hc_support::HerdrError> for BackendError {
-    /// Preserve herdr's typed error code as an `Other` with a lossless
+impl From<crate::hc_support::PlaneError> for BackendError {
+    /// Preserve hc's typed error code as an `Other` with a lossless
     /// anyhow context. (Backend callers handle `BackendError::Unsupported`;
     /// transport errors stay opaque in `Other`.)
-    fn from(e: crate::hc_support::HerdrError) -> Self {
-        Self::Other(anyhow::anyhow!("herdr error {}: {}", e.code, e.message))
+    fn from(e: crate::hc_support::PlaneError) -> Self {
+        Self::Other(anyhow::anyhow!("hc error {}: {}", e.code, e.message))
     }
 }
 
 impl From<toron_core::backend::BackendError> for BackendError {
-    /// The toron-core herdr client's typed error (ADR-0003 Decision 3A,
+    /// The toron-core hc client's typed error (ADR-0003 Decision 3A,
     /// bd-o8j.2): classification on `code`, message in the `Other` context.
     fn from(e: toron_core::backend::BackendError) -> Self {
         Self::Other(anyhow::anyhow!(
-            "herdr error {}: {}",
+            "hc error {}: {}",
             e.code().as_str(),
             e.message
         ))

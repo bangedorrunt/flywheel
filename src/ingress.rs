@@ -1,24 +1,24 @@
 // governed-by: ADR-0025
-//! One ingress seam (ADR-0025 Spec 6): herdr events, toron watch hits, YAML
+//! One ingress seam (ADR-0025 Spec 6): hc events, toron watch hits, YAML
 //! workflow triggers, and cron ticks all arrive as one [`IngressEvent`] and
 //! are mapped into Spec 3's [`crate::durable::LoopMsg`] at the
 //! [`handle_ingress`] boundary (bd-0or2). Two enums, one seam — no new bus.
 //! Adapters are injected closures; this module does no IO. The runtime wires
-//! the real leaves (herdr subscribe, doorbell, WorkflowHost notify, cron
+//! the real leaves (hc subscribe, doorbell, WorkflowHost notify, cron
 //! runner) at the call sites. Zero behavior change: `tick` + journal remain
 //! the pins.
 use serde::{Deserialize, Serialize};
 use toron_workflow::schema::Trigger;
 
-/// Minimal typed herdr event surface the loop consumes today. Pane death is
+/// Minimal typed hc event surface the loop consumes today. Pane death is
 /// observable — the reclaim trigger (ADR-0025 Spec 1).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum HerdrEvent {
+pub enum TerminalEvent {
     /// A pane's agent status changed (idle/working/blocked/unknown).
     PaneAgentStatusChanged { pane_id: String, status: String },
     /// A pane exited: process gone.
-    PaneExited { pane_id: String, herdr_name: String },
+    PaneExited { pane_id: String, terminal_name: String },
 }
 
 /// Minimal typed watch hit (the `toron watch --once` doorbell).
@@ -42,11 +42,11 @@ pub enum LedgerEvent {
 
 /// The one ingress type: Jido's sensor shape onto the spine we already run
 /// (ADR-0025 Spec 6). Unification is the enum — no new bus. Adjacent
-/// tagging so the inner `HerdrEvent` type tag never collides.
+/// tagging so the inner `TerminalEvent` type tag never collides.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "ingress", content = "payload", rename_all = "snake_case")]
 pub enum IngressEvent {
-    Herdr(HerdrEvent),
+    Hc(TerminalEvent),
     Watch(WatchHit),
     WorkflowTrigger(Trigger),
     CronTick {
@@ -58,7 +58,7 @@ pub enum IngressEvent {
     },
     PaneStalled {
         pane_id: String,
-        herdr_name: String,
+        terminal_name: String,
         last_status: String,
         bead_id: Option<String>,
         #[serde(default = "default_stall_reason")]
@@ -105,7 +105,7 @@ pub fn fact_summary(event: &IngressEvent) -> Option<String> {
         }
         IngressEvent::PaneStalled {
             pane_id,
-            herdr_name,
+            terminal_name,
             last_status,
             bead_id,
             reason,
@@ -117,7 +117,7 @@ pub fn fact_summary(event: &IngressEvent) -> Option<String> {
                 .map(|b| format!(" bead {b}"))
                 .unwrap_or_default();
             Some(format!(
-                "pane stalled {pane_id} ({herdr_name} {last_status} {reason}/{severity}){bead}"
+                "pane stalled {pane_id} ({terminal_name} {last_status} {reason}/{severity}){bead}"
             ))
         }
         IngressEvent::LeaseLapsed { path, bead_id } => {
@@ -155,7 +155,7 @@ pub fn is_fact(event: &IngressEvent) -> bool {
 
 /// Adapter sinks [`handle_ingress`] fans out to. Injected, never global.
 pub struct IngressAdapters {
-    pub herdr: Box<dyn Fn(&HerdrEvent) + Send + Sync>,
+    pub hc: Box<dyn Fn(&TerminalEvent) + Send + Sync>,
     pub watch: Box<dyn Fn(&WatchHit) + Send + Sync>,
     pub workflow: Box<dyn Fn(&Trigger) + Send + Sync>,
     pub cron: Box<dyn Fn(&str) + Send + Sync>,
@@ -165,8 +165,8 @@ pub struct IngressAdapters {
 impl Default for IngressAdapters {
     fn default() -> Self {
         Self {
-            herdr: Box::new(|ev| {
-                eprintln!("ingress miss (no handler): herdr {:?}", ev);
+            hc: Box::new(|ev| {
+                eprintln!("ingress miss (no handler): hc {:?}", ev);
             }),
             watch: Box::new(|ev| {
                 eprintln!("ingress miss (no handler): watch {:?}", ev);
@@ -186,7 +186,7 @@ impl Default for IngressAdapters {
 /// and a `message_posted` trigger cannot bypass it — they ARE this enum.
 pub fn handle_ingress(event: &IngressEvent, adapters: &IngressAdapters) {
     match event {
-        IngressEvent::Herdr(e) => (adapters.herdr)(e),
+        IngressEvent::Hc(e) => (adapters.hc)(e),
         IngressEvent::Watch(w) => (adapters.watch)(w),
         IngressEvent::WorkflowTrigger(t) => (adapters.workflow)(t),
         IngressEvent::CronTick { name } => (adapters.cron)(name),
@@ -204,12 +204,12 @@ pub fn handle_ingress(event: &IngressEvent, adapters: &IngressAdapters) {
 #[cfg(test)]
 pub fn ingress_to_loop_msg(event: &IngressEvent) -> Option<crate::durable::LoopMsg> {
     match event {
-        IngressEvent::Herdr(he) => {
+        IngressEvent::Hc(he) => {
             // event_type strings MUST match what apply_events_to_states
             // consumes ("pane.agent_status_changed" / "pane.exited") —
             // an invented string here is a silent no-op downstream.
             let pe = match he {
-                HerdrEvent::PaneAgentStatusChanged { pane_id, status } => {
+                TerminalEvent::PaneAgentStatusChanged { pane_id, status } => {
                     crate::durable::PollEvent {
                         event_type: "pane.agent_status_changed".into(),
                         pane_id: pane_id.clone(),
@@ -218,18 +218,18 @@ pub fn ingress_to_loop_msg(event: &IngressEvent) -> Option<crate::durable::LoopM
                         seq: 0,
                     }
                 }
-                HerdrEvent::PaneExited {
+                TerminalEvent::PaneExited {
                     pane_id,
-                    herdr_name,
+                    terminal_name,
                 } => crate::durable::PollEvent {
                     event_type: "pane.exited".into(),
                     pane_id: pane_id.clone(),
-                    agent: Some(herdr_name.clone()),
+                    agent: Some(terminal_name.clone()),
                     status: None,
                     seq: 0,
                 },
             };
-            Some(crate::durable::LoopMsg::Herdr(pe))
+            Some(crate::durable::LoopMsg::Hc(pe))
         }
         // Only a CLOSED ledger fact is a BrClose. Claimed/Blocked/Reopened
         // are NOT closes — mapping them here would corrupt per_bead_phase.
@@ -257,17 +257,17 @@ mod tests {
     /// flow through handle_ingress — no bypass.
     #[test]
     fn ingress_pane_exited_and_message_posted_route_through_handle_ingress() {
-        let herdr_hits: Hits = Arc::new(Mutex::new(Vec::new()));
+        let terminal_hits: Hits = Arc::new(Mutex::new(Vec::new()));
         let wf_hits: Hits = Arc::new(Mutex::new(Vec::new()));
         let cron_hits: Hits = Arc::new(Mutex::new(Vec::new()));
         let watch_hits: Hits = Arc::new(Mutex::new(Vec::new()));
 
         let adapters = IngressAdapters {
-            herdr: {
-                let hits = herdr_hits.clone();
-                Box::new(move |e: &HerdrEvent| {
-                    if let HerdrEvent::PaneExited { herdr_name, .. } = e {
-                        hits.lock().unwrap().push(herdr_name.clone());
+            hc: {
+                let hits = terminal_hits.clone();
+                Box::new(move |e: &TerminalEvent| {
+                    if let TerminalEvent::PaneExited { terminal_name, .. } = e {
+                        hits.lock().unwrap().push(terminal_name.clone());
                     }
                 })
             },
@@ -292,9 +292,9 @@ mod tests {
             fact: Box::new(|_| {}),
         };
 
-        let exited = IngressEvent::Herdr(HerdrEvent::PaneExited {
+        let exited = IngressEvent::Hc(TerminalEvent::PaneExited {
             pane_id: "w1:p1".into(),
-            herdr_name: "flywheel-flywheel-oc3".into(),
+            terminal_name: "flywheel-flywheel-oc3".into(),
         });
         handle_ingress(&exited, &adapters);
         let posted = IngressEvent::WorkflowTrigger(Trigger::MessagePosted {
@@ -317,7 +317,7 @@ mod tests {
             &adapters,
         );
 
-        assert_eq!(herdr_hits.lock().unwrap().len(), 1, "pane_exited routed");
+        assert_eq!(terminal_hits.lock().unwrap().len(), 1, "pane_exited routed");
         assert_eq!(wf_hits.lock().unwrap().len(), 1, "trigger routed");
         assert_eq!(*cron_hits.lock().unwrap(), vec!["weekly".to_string()]);
         assert_eq!(watch_hits.lock().unwrap().len(), 1, "watch routed");
@@ -326,13 +326,13 @@ mod tests {
     #[test]
     fn ingress_serde_round_trip_all_variants() {
         let events = vec![
-            IngressEvent::Herdr(HerdrEvent::PaneAgentStatusChanged {
+            IngressEvent::Hc(TerminalEvent::PaneAgentStatusChanged {
                 pane_id: "w8E:p2".into(),
                 status: "working".into(),
             }),
-            IngressEvent::Herdr(HerdrEvent::PaneExited {
+            IngressEvent::Hc(TerminalEvent::PaneExited {
                 pane_id: "w8E:p3".into(),
-                herdr_name: "GoldCove".into(),
+                terminal_name: "GoldCove".into(),
             }),
             IngressEvent::Watch(WatchHit {
                 project: "toron".into(),
@@ -352,7 +352,7 @@ mod tests {
             },
             IngressEvent::PaneStalled {
                 pane_id: "w1:p1".into(),
-                herdr_name: "oc".into(),
+                terminal_name: "oc".into(),
                 last_status: "idle".into(),
                 bead_id: Some("bd-123".into()),
                 reason: "silent_idle".into(),
@@ -382,7 +382,7 @@ mod tests {
     fn facts_variants_route_through_handle_ingress() {
         let fact_hits: Hits = Arc::new(Mutex::new(Vec::new()));
         let adapters = IngressAdapters {
-            herdr: Box::new(|_| {}),
+            hc: Box::new(|_| {}),
             watch: Box::new(|_| {}),
             workflow: Box::new(|_| {}),
             cron: Box::new(|_| {}),
@@ -402,7 +402,7 @@ mod tests {
             },
             IngressEvent::PaneStalled {
                 pane_id: "w1:p1".into(),
-                herdr_name: "oc".into(),
+                terminal_name: "oc".into(),
                 last_status: "idle".into(),
                 bead_id: None,
                 reason: "silent_idle".into(),
@@ -447,7 +447,7 @@ mod tests {
         );
         let stalled = IngressEvent::PaneStalled {
             pane_id: "w1:p1".into(),
-            herdr_name: "oc".into(),
+            terminal_name: "oc".into(),
             last_status: "idle".into(),
             bead_id: Some("bd-9".into()),
             reason: "silent_idle".into(),
@@ -486,12 +486,12 @@ mod tests {
                 .starts_with("[doorbell] git")
         );
         // non-fact returns None
-        let herdr = IngressEvent::Herdr(HerdrEvent::PaneExited {
+        let hc = IngressEvent::Hc(TerminalEvent::PaneExited {
             pane_id: "w1:p1".into(),
-            herdr_name: "oc".into(),
+            terminal_name: "oc".into(),
         });
-        assert!(fact_summary(&herdr).is_none());
-        assert!(fact_doorbell_line(&herdr).is_none());
+        assert!(fact_summary(&hc).is_none());
+        assert!(fact_doorbell_line(&hc).is_none());
     }
 
     #[test]
@@ -511,29 +511,29 @@ mod tests {
     }
 
     #[test]
-    fn bd0or2_ingress_to_loop_msg_seam_exists_and_maps_herdr() {
+    fn bd0or2_ingress_to_loop_msg_seam_exists_and_maps_plane() {
         // event_type strings MUST match apply_events_to_states consumers —
         // an invented string would be a silent no-op downstream.
-        let status = IngressEvent::Herdr(HerdrEvent::PaneAgentStatusChanged {
+        let status = IngressEvent::Hc(TerminalEvent::PaneAgentStatusChanged {
             pane_id: "w1:p1".into(),
             status: "idle".into(),
         });
-        match ingress_to_loop_msg(&status).expect("herdr must map") {
-            crate::durable::LoopMsg::Herdr(pe) => {
+        match ingress_to_loop_msg(&status).expect("hc must map") {
+            crate::durable::LoopMsg::Hc(pe) => {
                 assert_eq!(pe.event_type, "pane.agent_status_changed");
                 assert_eq!(pe.status.as_deref(), Some("idle"));
             }
-            other => panic!("expected LoopMsg::Herdr, got {other:?}"),
+            other => panic!("expected LoopMsg::Hc, got {other:?}"),
         }
-        let he = IngressEvent::Herdr(HerdrEvent::PaneExited {
+        let he = IngressEvent::Hc(TerminalEvent::PaneExited {
             pane_id: "w1:p1".into(),
-            herdr_name: "oc".into(),
+            terminal_name: "oc".into(),
         });
-        match ingress_to_loop_msg(&he).expect("herdr must map") {
-            crate::durable::LoopMsg::Herdr(pe) => {
+        match ingress_to_loop_msg(&he).expect("hc must map") {
+            crate::durable::LoopMsg::Hc(pe) => {
                 assert_eq!(pe.event_type, "pane.exited");
             }
-            other => panic!("expected LoopMsg::Herdr, got {other:?}"),
+            other => panic!("expected LoopMsg::Hc, got {other:?}"),
         }
         let lf = IngressEvent::LedgerFact {
             bead_id: "bd-123".into(),
@@ -562,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn bd0or2_herdr_event_folds_into_tick_pending_and_drains_on_next_tick() {
+    fn bd0or2_plane_event_folds_into_tick_pending_and_drains_on_next_tick() {
         // bd-55nx.11: exercise the LIVE entry (workspace tick), not the
         // slice reducer — a green slice with a broken live entry must fail.
         use crate::durable::{LoopModel, PollEvent};
@@ -578,12 +578,12 @@ mod tests {
             status: Some("idle".into()),
             seq: 1,
         };
-        let (next, cmds) = ws_tick(&ws, &WsMsg::Herdr { event: pe });
+        let (next, cmds) = ws_tick(&ws, &WsMsg::Hc { event: pe });
         assert_eq!(cmds, [] as [crate::workspace::Cmd; 0]);
         assert_eq!(
             next.swarm.pending_events.len(),
             1,
-            "Herdr buffers into model'"
+            "Hc buffers into model'"
         );
         let (next2, _) = ws_tick(&next, &WsMsg::Tick { now: 0 });
         assert!(
