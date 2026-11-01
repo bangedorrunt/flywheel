@@ -1310,14 +1310,6 @@ enum Commands {
         #[command(subcommand)]
         cmd: Option<ArtifactsCmd>,
     },
-    /// Zoom a pane (hc terminal.zoom)
-    Zoom {
-        project: String,
-        #[arg(long, default_value = "oc")]
-        to: String,
-        #[arg(long)]
-        off: bool,
-    },
     /// Attach to an agent's terminal (interactive; execs `hc attach`)
     Attach {
         project: String,
@@ -2920,7 +2912,7 @@ fn main() {
             "upstream_parity": upstream_parity::robot_summary(),
             "commands": [
                 "init spawn add list status decide rebind recover",
-            "send interrupt view output watch zoom attach kill",
+            "send interrupt view output watch attach kill",
             "crew preview|control (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker)",
             "captain watch <project> [--interval N] [--json] [--as <pin>] [--stall --stall-minutes N] [--preflight --preflight-mode steer|loop|workflow|cron] (bd-captain-watch-poll-exit-bbwm: harness resume on the captain inbox. The push is escalate@1 mail from the supervisor. This command blocks on that inbox's water and exits with a preview when strictly-newer mail lands; --stall also exits 0 when every bead is closed, or exits 3 when no pane is working and no commit landed for the threshold with work remaining; an unreadable fleet never alarms; --preflight adds an arm that exits 4 with the FIRST failing check and its remedy line, checked at arm time and each poll. One shot: re-arm after each resume)",
             "captain directory <project> [--json] (ADR-0019 D2/D4: read-only sessions, tiers, and per-pin addressability — ok <key> or err <code> — from the pure directory projection over an explicitly selected rex backend; never auto/hc on this path)",
@@ -3443,7 +3435,6 @@ fn main() {
             project,
             cmd,
         }) => cmd_artifacts(run_id.as_deref(), *json, project.as_deref(), cmd),
-        Some(Commands::Zoom { project, to, off }) => cmd_zoom(&cfg, project, to, *off),
         Some(Commands::Attach { project, to }) => cmd_attach(&cfg, project, to),
         Some(Commands::Kill {
             project,
@@ -20779,7 +20770,7 @@ mod send_stall_recovery_tests {
     }
 }
 
-// ---- interrupt / view / watch / zoom / attach / kill ----
+// ---- interrupt / view / watch / attach / kill ----
 
 /// Kill-style key names that terminate the agent process (not just cancel
 /// the current call). Guarded behind --force (bd-fw-interrupt-kills-agent-or3).
@@ -21073,18 +21064,6 @@ fn all_matching(c: &mut Client, names: &[String], status: AgentStatus) -> Result
         }
     }
     Ok(true)
-}
-
-fn cmd_zoom(cfg: &Config, project: &str, to: &str, off: bool) -> Result<()> {
-    let mut c = Client::connect(Some(&cfg.socket_path()))?;
-    let ws_id = find_workspace(&mut c, project)?;
-    let targets = resolve_agents(&mut c, &ws_id, project, to)?;
-    let mode = if off { "off" } else { "on" };
-    for a in &targets {
-        hc_support::pane_zoom(&c, &a.pane_id, mode)?;
-    }
-    println!("zoom {mode} for {to}");
-    Ok(())
 }
 
 fn cmd_attach(cfg: &Config, project: &str, to: &str) -> Result<()> {

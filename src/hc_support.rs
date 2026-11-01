@@ -1175,12 +1175,6 @@ pub fn pane_split(
         .context("parse pane.split result")
 }
 
-/// `pane.zoom` — delegation over `Client::call`.
-pub fn pane_zoom(c: &Client, pane_id: &str, mode: &str) -> Result<Value> {
-    c.call("pane.zoom", json!({ "pane_id": pane_id, "mode": mode }))
-        .map_err(|e| anyhow!("hc terminal.zoom failed: {e}"))
-}
-
 /// `pane.wait_for_output` — delegation over `Client::call_coded`. Returns a
 /// typed `PlaneError` so callers can classify (`timeout` code on a miss).
 pub fn pane_wait_output(
