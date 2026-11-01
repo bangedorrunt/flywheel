@@ -2323,6 +2323,28 @@ pub(crate) fn workspace_label_aliases(project: &str, spawn_meta: Option<&str>) -
     out
 }
 
+/// True when `label` names a workspace this project owns: an exact alias, or
+/// a request-key superset of the swarm label.
+///
+/// `flywheel spawn --request-key k` names its workspace
+/// `flywheel-<base>-rk-<k>`, which no exact alias can match. The prefix arm is
+/// what keeps send/status/kill reachable after a keyed spawn; without it the
+/// verbs answered "no flywheel swarm" while the panes were running.
+pub(crate) fn workspace_label_is_owned(
+    project: &str,
+    label: &str,
+    spawn_meta: Option<&str>,
+) -> bool {
+    if workspace_label_aliases(project, spawn_meta)
+        .iter()
+        .any(|a| a == label)
+    {
+        return true;
+    }
+    let owned = swarm_label(project);
+    label.starts_with(&format!("{owned}-"))
+}
+
 pub(crate) fn find_workspace(c: &mut Client, project: &str) -> Result<String> {
     find_workspace_info(c, project).map(|ws| ws.workspace_id)
 }
@@ -2333,14 +2355,35 @@ pub(crate) fn find_workspace_info(
     c: &mut Client,
     project: &str,
 ) -> Result<hc_support::WorkspaceInfo> {
-    let aliases = workspace_label_aliases(project, state::load_spawn_meta(project).as_deref());
-    let mut matches: Vec<hc_support::WorkspaceInfo> = c
-        .workspace_list()?
-        .into_iter()
+    let meta = state::load_spawn_meta(project);
+    let aliases = workspace_label_aliases(project, meta.as_deref());
+    let ws_list = c.workspace_list()?;
+    let exact: Vec<hc_support::WorkspaceInfo> = ws_list
+        .iter()
         .filter(|ws| aliases.iter().any(|a| a == &ws.label))
+        .cloned()
         .collect();
+    let exact_match = !exact.is_empty();
+    let mut matches: Vec<hc_support::WorkspaceInfo> = if exact_match {
+        exact
+    } else {
+        ws_list
+            .into_iter()
+            .filter(|ws| workspace_label_is_owned(project, &ws.label, meta.as_deref()))
+            .collect()
+    };
     if matches.is_empty() {
         bail!("no flywheel swarm for {project} (run: flywheel spawn {project})")
+    }
+    // A keyed spawn names one workspace per request key, so more than one
+    // owned label means several live crews. Never pick one by list order.
+    let labels: std::collections::BTreeSet<&str> =
+        matches.iter().map(|ws| ws.label.as_str()).collect();
+    if !exact_match && labels.len() > 1 {
+        let labels: Vec<&str> = labels.into_iter().collect();
+        bail!(
+            "multiple flywheel swarms for {project}: {labels:?} — target an agent by pin (flywheel send --to <pin>) or give the swarm its own --label"
+        );
     }
     // duplicate labels (a stale workspace from a dropped agent vs the live
     // spawn — bd-nil): prefer the workspace holding managed agents; the
@@ -2465,14 +2508,33 @@ pub(crate) fn find_workspace_dyn(
     backend: &dyn backend::MultiplexerBackend,
     project: &str,
 ) -> Result<String> {
-    let aliases = workspace_label_aliases(project, state::load_spawn_meta(project).as_deref());
-    let matches: Vec<hc_support::WorkspaceInfo> = backend
-        .workspace_list()?
-        .into_iter()
+    let meta = state::load_spawn_meta(project);
+    let aliases = workspace_label_aliases(project, meta.as_deref());
+    let ws_list = backend.workspace_list()?;
+    let exact: Vec<hc_support::WorkspaceInfo> = ws_list
+        .iter()
         .filter(|ws| aliases.iter().any(|a| a == &ws.label))
+        .cloned()
         .collect();
+    let exact_match = !exact.is_empty();
+    let matches: Vec<hc_support::WorkspaceInfo> = if exact_match {
+        exact
+    } else {
+        ws_list
+            .into_iter()
+            .filter(|ws| workspace_label_is_owned(project, &ws.label, meta.as_deref()))
+            .collect()
+    };
     if matches.is_empty() {
         bail!("no flywheel swarm for {project} (run: flywheel spawn {project})")
+    }
+    let labels: std::collections::BTreeSet<&str> =
+        matches.iter().map(|ws| ws.label.as_str()).collect();
+    if !exact_match && labels.len() > 1 {
+        let labels: Vec<&str> = labels.into_iter().collect();
+        bail!(
+            "multiple flywheel swarms for {project}: {labels:?} — target an agent by pin (flywheel send --to <pin>) or give the swarm its own --label"
+        );
     }
     if matches.len() > 1 {
         // bd-ws-resolution (2026-08-17): a FOREIGN workspace sharing the
@@ -2507,6 +2569,27 @@ pub(crate) fn find_workspace_dyn(
         }
     }
     Ok(matches[0].workspace_id.clone())
+}
+
+/// Every owned workspace for a project (bd-request-key-resolution).
+///
+/// `send` resolves its target by agent pin, so it must see all live crews of
+/// a project, not one workspace picked by list order. A keyed spawn creates
+/// one workspace per request key; the union is where pins are searched.
+pub(crate) fn find_workspaces_dyn(
+    backend: &dyn backend::MultiplexerBackend,
+    project: &str,
+) -> Result<Vec<hc_support::WorkspaceInfo>> {
+    let meta = state::load_spawn_meta(project);
+    let matches: Vec<hc_support::WorkspaceInfo> = backend
+        .workspace_list()?
+        .into_iter()
+        .filter(|ws| workspace_label_is_owned(project, &ws.label, meta.as_deref()))
+        .collect();
+    if matches.is_empty() {
+        bail!("no flywheel swarm for {project} (run: flywheel spawn {project})")
+    }
+    Ok(matches)
 }
 
 fn resolve_agents_dyn(
@@ -4551,7 +4634,11 @@ fn classify_workspace_origin(
                 .map(|n| n.starts_with(&prefix))
                 .unwrap_or(false)
     });
-    if ws.label == label || hosts_agents || spawn_label == Some(ws.label.as_str()) {
+    if ws.label == label
+        || ws.label.starts_with(&prefix)
+        || hosts_agents
+        || spawn_label == Some(ws.label.as_str())
+    {
         Some(WorkspaceOrigin::Owned)
     } else if ws.label == base {
         Some(WorkspaceOrigin::Foreign)
@@ -5736,6 +5823,22 @@ mod steer_safety_tests {
     }
 
     #[test]
+    fn request_key_labels_resolve_to_the_project() {
+        assert!(workspace_label_is_owned(
+            "toron",
+            "flywheel-toron-rk-toron-host-cut-1",
+            None
+        ));
+        assert!(workspace_label_is_owned("toron", "flywheel-toron", None));
+        assert!(!workspace_label_is_owned(
+            "toron",
+            "flywheel-other-rk-x",
+            None
+        ));
+        assert!(!workspace_label_is_owned("toron", "scratchpad", None));
+    }
+
+    #[test]
     fn workspace_label_aliases_include_spawn_meta() {
         let aliases = workspace_label_aliases("flywheel", Some("captain-audit"));
         assert!(
@@ -6166,7 +6269,7 @@ mod workspace_origin_tests {
 
     #[test]
     fn classify_workspace_origin_rows() {
-        let cases: [OriginRow; 8] = [
+        let cases: [OriginRow; 9] = [
             // A foreign workspace (captain/omp session labeled like the
             // project) is NOT flywheel-owned — spawn must warn + proceed.
             OriginRow {
@@ -6179,6 +6282,13 @@ mod workspace_origin_tests {
             OriginRow {
                 case: "swarm_label_is_owned",
                 w: ws("w2A", "flywheel-toron", 3),
+                agents: vec![],
+                spawn_label: None,
+                want: Some(WorkspaceOrigin::Owned),
+            },
+            OriginRow {
+                case: "request_key_label_is_owned",
+                w: ws("w2C", "flywheel-toron-rk-toron-host-cut-1", 1),
                 agents: vec![],
                 spawn_label: None,
                 want: Some(WorkspaceOrigin::Owned),
@@ -18722,14 +18832,18 @@ fn cmd_send_rex(
     fire_and_forget: Option<&str>,
 ) -> Result<()> {
     let backend = backend::multiplexer_backend(cfg)?;
-    let ws_id = find_workspace_dyn(&*backend, project)?;
+    // One workspace per request key: search every owned workspace so a pin
+    // resolves regardless of which keyed swarm holds it.
+    let workspaces = find_workspaces_dyn(&*backend, project)?;
+    let ws_ids: Vec<&str> = workspaces.iter().map(|w| w.workspace_id.as_str()).collect();
     let agents = backend.agent_list()?;
     let in_ws: Vec<AgentInfo> = agents
         .into_iter()
-        .filter(|a| a.workspace_id == ws_id)
+        .filter(|a| ws_ids.contains(&a.workspace_id.as_str()))
         .collect();
     if in_ws.is_empty() {
-        bail!("no agents in workspace {ws_id} — is the swarm spawned?");
+        let labels: Vec<&str> = workspaces.iter().map(|w| w.label.as_str()).collect();
+        bail!("no agents in {labels:?} — is the swarm spawned?");
     }
     let mut registry = state::load_spawn_registry(project);
     let targets = resolve_send_targets_dyn(&in_ws, &registry, project, to)?;
