@@ -6,7 +6,7 @@
 # (which keeps its 6 loop-reliability scenarios); this suite adds the
 # captain-compose + crew-execution + cron + coalition + decide/profile gates.
 #
-# Requirements: flywheel (current build), herdr server up, br on PATH,
+# Requirements: flywheel (current build), hc server up, br on PATH,
 # Resonate server up (com.flywheel.resonate), toron daemon up.
 #
 # Every spawn passes --yes: this is a HEADLESS gate, so it must never enter
@@ -39,7 +39,7 @@ else
 fi
 
 # fresh scratch project (absolute path — never touches the repo). The base
-# name must be DOT-FREE (herdr agent names reject '.') AND UNIQUE per
+# name must be DOT-FREE (hc terminal names reject '.') AND UNIQUE per
 # scenario — a shared basename collides on the swarm label (a leftover
 # workspace makes the next spawn refuse).
 scratch() {
@@ -104,7 +104,7 @@ scenario_1_loop_orphans() { # bd-bvwf.1
   # the surviving workspace may carry the LAST spawn's label (osc-s3); count
   # every workspace whose label is one of this project's spawns (the gate:
   # exactly ONE remains)
-  n=$(TO 10 herdr workspace list 2>/dev/null | python3 -c "
+  n=$(TO 10 hc ls --json 2>/dev/null | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
 base='flywheel-$(basename "$PROJ")'
@@ -120,12 +120,12 @@ scenario_2_loop_fresh_detection() { # bd-bvwf.2
   scratch s2 || { fail "S2 setup"; return; }
   bead "fresh-detection" "Create done-fresh.txt containing ok, then br sync + commit." "test -f done-fresh.txt"
   "$FW" spawn "$PROJ" --oc 1 --retire-orphans --yes --no-verify --no-focus >/dev/null 2>&1
-  # spawn-verify: wait for the agent to be DETECTED (herdr classifies the
+  # spawn-verify: wait for the agent to be DETECTED (hc classifies the
   # fresh pane) before the loop's first poll — the loop must then dispatch
   # the ready bead on the active cadence (bd-bvwf.2: no first-poll stall)
   local base
   base=$(basename "$PROJ")
-  if ! wait_until "agent detected" 45 bash -c "herdr agent list 2>/dev/null | grep -q '$base'"; then
+  if ! wait_until "agent detected" 45 bash -c "hc ls 2>/dev/null | grep -q '$base'"; then
     fail "S2: agent not detected after spawn (setup)"; "$FW" kill "$PROJ" --force >/dev/null 2>&1; return
   fi
   nohup "$FW" loop run "$PROJ" --work --interval-active 10 --force >"$SCRATCH/loop2.log" 2>&1 &
@@ -154,7 +154,7 @@ scenario_3_loop_chain() { # bd-bvwf.3
   "$FW" spawn "$PROJ" --oc 2 --retire-orphans --yes --no-verify --no-focus >/dev/null 2>&1
   # spawn-verify (same as S2): the chain loop must not strand A on the
   # first poll before the fresh agents are detected (bd-bvwf.2/3)
-  if ! wait_until "agents detected" 45 bash -c "herdr agent list 2>/dev/null | grep -c '$(basename "$PROJ")' | grep -qE '[1-9]'"; then
+  if ! wait_until "agents detected" 45 bash -c "hc ls 2>/dev/null | grep -c '$(basename "$PROJ")' | grep -qE '[1-9]'"; then
     fail "S3: agents not detected (setup)"; "$FW" kill "$PROJ" --force >/dev/null 2>&1; return
   fi
   nohup "$FW" loop run "$PROJ" --work --interval-active 10 --force >"$SCRATCH/loop3.log" 2>&1 &
@@ -218,7 +218,7 @@ scenario_6_crew_execution() { # bd-efk1
     scratch s6 || { ok=0; break; }
     bead "crew-exec-$i" "Create done-ce$i.txt with ok, close." "test -f done-ce$i.txt"
     "$FW" spawn "$PROJ" --oc 1 --retire-orphans --yes --no-verify --no-focus >/dev/null 2>&1
-    if ! wait_until "agent detected" 45 bash -c "herdr agent list 2>/dev/null | grep -q '$(basename "$PROJ")'"; then
+    if ! wait_until "agent detected" 45 bash -c "hc ls 2>/dev/null | grep -q '$(basename "$PROJ")'"; then
       fail "S6 round $i: agent not detected"; ok=0; "$FW" kill "$PROJ" --force >/dev/null 2>&1; continue
     fi
     nohup "$FW" loop run "$PROJ" --work --interval-active 10 --force >"$SCRATCH/loop6.log" 2>&1 &

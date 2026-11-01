@@ -6,7 +6,7 @@
 # durable loop's tick invokes (`__close-check`, `__reopen-bead`,
 # `__loop-run-verify`) — against a throwaway scratch project (temp dir +
 # `.beads` + real git) with the embedded in-process toron mailbox isolated
-# via TORON_MCP_DATA_DIR. No herdr, no swarm, no mocks: real flywheel
+# via TORON_MCP_DATA_DIR. No pane plane, no swarm, no mocks: real flywheel
 # binary, real br, real git, real mailbox.
 #
 # Stages:
@@ -49,7 +49,7 @@ scratch() {
   mkdir -p "$base/proj" "$base/mailbox" "$base/cfg/flywheel"
   cat > "$base/cfg/flywheel/config.toml" <<'EOF'
 [backend]
-multiplexer = "herdr"
+multiplexer = "hc"
 mail = "toron"
 
 [agent_mail]

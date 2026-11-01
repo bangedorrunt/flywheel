@@ -1,14 +1,14 @@
 #!/bin/bash
-# e2e-hardened-loop — integration gate for the herdr-automation-hardening epic.
+# e2e-hardened-loop — integration gate for the pane-plane automation-hardening epic.
 #
 # Each scenario targets one epic guarantee and prints PASS/FAIL with evidence.
 # Run on a clean machine:  scripts/e2e-hardened-loop.sh
 #
-# Requirements: flywheel on PATH (cargo install --path . --force), herdr server up,
+# Requirements: flywheel on PATH (cargo install --path . --force), hc server up,
 # br on PATH, Resonate server up (launchd com.flywheel.resonate).
 #
 # Known build constraints (documented precisely, bd-ojx class):
-#   - herdr 0.7.5-preview drops dead/frozen agent RECORDS (~0.5s) instead of
+#   - hc drops dead/frozen agent RECORDS (~0.5s) instead of
 #     reporting agent_prompt_stalled / persistent unknown status. Escalation
 #     and unknown-repair therefore fire on the error/absent paths; the
 #     `stalled` and persistent-`unknown` verdicts are not producible live.
@@ -381,14 +381,14 @@ pkill -f "flywheel loop run $PROJ" 2>/dev/null; sleep 1
 
 # ===========================================================================
 say "=== scenario 4: blocked fast-alert (--on-blocked mail within ~2x active interval) ==="
-# herdr `blocked` = agent at an approval prompt. Try to drive one, then
+# hc `blocked` = agent at an approval prompt. Try to drive one, then
 # live-assert the alert delivery the latency bound governs.
 SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 AGENT=$(pick_agent "idle,done")
 if [ -n "$AGENT" ]; then
   # NOTE the fixed argv: `--confirm` takes the timeout as its own value
   # (`--confirm 30000`); the old `--timeout-ms` is not a flag and died as
-  # a usage error, so the bait never sent. opencode + herdr
+  # a usage error, so the bait never sent. opencode + hc
   # full-lifecycle-hook does not surface approvals as `blocked` on this
   # build (probe-verified: prompt lands, agent works, status never leaves
   # working) — a miss is recorded, not gated.
@@ -512,8 +512,8 @@ sqlite3 "$HOME/.local/state/flywheel/resonate.db" "SELECT id FROM promises WHERE
 
 # ===========================================================================
 say "=== scenario 6: unknown-agent repair (documented limitation on this build) ==="
-# Killing an agent makes herdr DROP its record (~0.5s) — the poll then has no
-# state for it. Persistent per-agent `unknown` is NOT producible on herdr
+# Killing an agent makes hc DROP its record (~0.5s) — the poll then has no
+# state for it. Persistent per-agent `unknown` is NOT producible on hc
 # 0.7.5-preview (verified in bd-unknown-respawn-6tr: kill -> ABSENT,
 # freeze-launch -> dropped, failed start -> cleaned). The skip-dispatch and
 # respawn machinery are the same code paths proven in scenarios 3/5; the
@@ -535,7 +535,7 @@ if [ -n "$AGENT" ]; then
   [ -n "${PID:-}" ] && kill -9 "$PID" 2>/dev/null
   sleep 3
   COUNT=$(count_project_agents)
-  pass "agent killed -> herdr record dropped (agents seen: $COUNT); persistent unknown not producible on this build — unknown-repair logic covered by unit tests (track_unknown) and the shared respawn machinery proven in scenarios 3/5"
+  pass "agent killed -> hc record dropped (agents seen: $COUNT); persistent unknown not producible on this build — unknown-repair logic covered by unit tests (track_unknown) and the shared respawn machinery proven in scenarios 3/5"
 else
   fail "no agent for scenario 6 (respawn also failed)"
 fi

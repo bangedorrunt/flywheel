@@ -9,7 +9,7 @@
 #         -> the operator's endpoint receives the POST on the URL's own
 #            port and path.
 #
-# A `herdr` stand-in (`true`) reports no panes, which is exactly the
+# An `hc` stand-in (`true`) reports no panes, which is exactly the
 # condition the digest route exists for: a human wake with zero live swarm.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -116,14 +116,14 @@ esac
 EOF
 chmod +x "$TMP/toron"
 
-# 4. Host the workspace. `herdr` = true -> no panes known -> the wake is
+# 4. Host the workspace. `hc` = true -> no panes known -> the wake is
 #    digest-bound (bd-bk9t), which is precisely the no-swarm human case.
 export DOORBELL_STATE_DIR="$DS"
 export DOORBELL_PORT="$PORT"
 export DOORBELL_FLYWHEEL_STATE_DIR="$FW"
 export DOORBELL_WEBHOOK_ALLOWLIST="127.0.0.1"
 export DOORBELL_TORON_BIN="$TMP/toron"
-export DOORBELL_HERDR_BIN=true
+export DOORBELL_HC_BIN=true
 
 "$BIN" serve --state-dir "$DS" --port "$PORT" --flywheel-state-dir "$FW" \
   --host "$PROJ/w1" >"$TMP/daemon.log" 2>&1 &

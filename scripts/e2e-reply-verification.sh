@@ -11,7 +11,7 @@
 #   T4  collab round-trip positive control: reply in-thread -> thread head
 #       moves (mail watch / __check-reply)
 #
-# Requirements: flywheel on PATH (current build), herdr up, Resonate up
+# Requirements: flywheel on PATH (current build), hc up, Resonate up
 # (launchd com.flywheel.resonate), toron mail reachable.
 #
 # Usage: scripts/e2e-reply-verification.sh [--skip-t1] [--skip-spawn]
@@ -94,7 +94,7 @@ fi
 if [ "$SKIP_SPAWN" = "0" ] && [ -n "$SCRATCH" ]; then
   say "=== T4: collab ask -> agent replies -> thread head moves ==="
   # the swarm agent's mail identity: the entry whose task references the
-  # herdr agent name (the list also contains the orchestrator identity)
+  # hc terminal/agent name (the list also contains the orchestrator identity)
   AGENT_MAIL=$("$FW" mail agents "$SCRATCH" 2>/dev/null | python3 -c "
 import json,sys
 d=json.load(sys.stdin)

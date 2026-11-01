@@ -19,9 +19,9 @@
 #   E4  durable loop dispatch resolves the agent's profile via the
 #       checkpointed __profile leaf (registry name->profile).
 #   E5  6-scenario loop gate (scripts/e2e-hardened-loop.sh) passes —
-#       run with --skip-t1 --skip-spawn when herdr/agents are unavailable.
+#       run with --skip-t1 --skip-spawn when hc/agents are unavailable.
 #
-# Requirements: flywheel on PATH (current build), herdr up, cargo.
+# Requirements: flywheel on PATH (current build), hc up, cargo.
 # Usage: scripts/verify-loop-engine-dispatch.sh [--skip-e2e]
 set -u
 
@@ -65,10 +65,10 @@ say "=== E2/E3: live __send --profile ==="
 SCRATCH=$(mktemp -d)
 trap 'rm -rf "$SCRATCH"' EXIT
 
-# profile-conditioned send (no herdr needed for the LOG; the send itself
-# needs an agent — skip gracefully when herdr is down)
-if herdr server status >/dev/null 2>&1 || herdr pane list >/dev/null 2>&1; then
-  say "herdr present — live conditioning check"
+# profile-conditioned send (no hc needed for the LOG; the send itself
+# needs an agent — skip gracefully when hc is down)
+if hc server status >/dev/null 2>&1 || hc ls >/dev/null 2>&1; then
+  say "hc present — live conditioning check"
   # a profile with a known behavior preamble
   "$FW" profile create verify-loop-dispatch --harness opencode --model claude-sonnet-4 --role verify >/dev/null 2>&1
   PROF_DIR="$HOME/.config/flywheel"
@@ -92,7 +92,7 @@ if herdr server status >/dev/null 2>&1 || herdr pane list >/dev/null 2>&1; then
   fi
   [ -n "$BAK" ] && cp "$BAK" "$PROF_DIR/profiles.toml"
 else
-  say "herdr down — live conditioning check skipped (unit surface covers the argv + conditioning)"
+  say "hc down — live conditioning check skipped (unit surface covers the argv + conditioning)"
 fi
 
 # E3: plain send argv never carries --profile (byte-identical legacy)

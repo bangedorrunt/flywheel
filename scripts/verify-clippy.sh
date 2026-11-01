@@ -25,4 +25,4 @@ cargo check --all-targets --all-features --locked $PKGS
 echo "-> check (no default features)"
 cargo check --locked --no-default-features -p flywheel
 echo "-> check (lean backend-only)"
-cargo check --locked --no-default-features --features backend-herdr,mail-toron -p flywheel
+cargo check --locked --no-default-features --features backend-hc,mail-toron -p flywheel

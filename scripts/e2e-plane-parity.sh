@@ -16,10 +16,10 @@
 #
 # Usage:
 #   scripts/e2e-plane-parity.sh                  # auto (rex primary on this box)
-#   FW_BACKEND=herdr scripts/e2e-plane-parity.sh # same list, herdr baseline
+#   FW_BACKEND=hc scripts/e2e-plane-parity.sh # same list, hc baseline
 #   scripts/e2e-plane-parity.sh --keep           # keep the scratch project
 #
-# Env: AGENT_NAME (required for sends), FW_BACKEND (auto|herdr|superlogical),
+# Env: AGENT_NAME (required for sends), FW_BACKEND (auto|hc|superlogical),
 #      E2E_BOOT_SECS (default 240), E2E_SEND_MS (default 120000)
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -49,7 +49,7 @@ d=json.load(sys.stdin)
 print(" active:", [b["name"] for b in d["backends"] if b.get("active")])
 r=d.get("resolved") or {}
 # bd-mknvb: name the plane that ACTUALLY serves, so a 10/10 here is
-# attributable to rex or to the herdr fallback instead of the configured name.
+# attributable to rex or to the hc fallback instead of the configured name.
 print(" resolved:", r.get("configured"), "->", r.get("plane"), "|", r.get("reason"))
 ' || true
 
@@ -133,7 +133,7 @@ rows=json.load(sys.stdin)
 hit=[r for r in rows if r.get("pin")==pin]
 print(hit[0]["state"] if hit else "absent")
 ' "$PIN")
-[ "$STATE" = "missing" ] && die "roster says the live pin is MISSING (herdr-only liveness)"
+[ "$STATE" = "missing" ] && die "roster says the live pin is MISSING (hc-plane liveness)"
 [ "$STATE" = "absent" ] && die "roster does not list the pin at all"
 pass "roster state=$STATE (pane is routable)"
 
@@ -159,8 +159,8 @@ done
 pass "send landed with a receipt"
 
 capture_pane() {
-  if [ "$BACKEND" = "herdr" ]; then
-    herdr agent read "$PANE" --lines 200 2>/dev/null
+  if [ "$BACKEND" = "hc" ]; then
+    hc read "$PANE" 2>/dev/null
   else
     local session="flywheel-$(basename "$PROJ")"
     rex capture -s "$session" -b "${PANE#block:}" 2>/dev/null
@@ -231,8 +231,8 @@ print(rows[-1]["pane_id"] + " " + rows[-1]["observed_pin"])
 ')
 V_PANE=${VICTIM%% *}
 V_PIN=${VICTIM##* }
-if [ "$BACKEND" = "herdr" ]; then
-  herdr pane close "$V_PANE" >/dev/null 2>&1 || die "herdr pane close"
+if [ "$BACKEND" = "hc" ]; then
+  hc kill "$V_PANE" >/dev/null 2>&1 || die "hc kill"
 else
   rex block close "${V_PANE#block:}" -s "flywheel-$(basename "$PROJ")" >/dev/null 2>&1 \
     || die "rex block close"
