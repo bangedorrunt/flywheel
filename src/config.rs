@@ -496,12 +496,15 @@ impl Config {
         }
         // bd-flywheel-probe-qjay: [resonate] url / RESONATE_URL is
         // deprecated and ignored — the engine store is local sqlite now.
-        // Warn once at load (file and env land in the same field); removal
-        // is step 5, so the field stays readable until then.
+        // Warn ONCE per process: Config::load runs many times per command,
+        // and the per-load warning flooded status output.
+        static RESONATE_URL_WARNED: std::sync::Once = std::sync::Once::new();
         if cfg.resonate_url.is_some() {
-            eprintln!(
-                "flywheel: [resonate] url / RESONATE_URL is deprecated and ignored — the engine store is local sqlite now; unset it to silence this warning"
-            );
+            RESONATE_URL_WARNED.call_once(|| {
+                eprintln!(
+                    "flywheel: [resonate] url / RESONATE_URL is deprecated and ignored — the engine store is local sqlite now; unset it to silence this warning"
+                );
+            });
         }
         // toron env surface (bd-euav): FLYWHEEL_TORON_URL / FLYWHEEL_TORON_TOKEN
         // feed `[mail.toron]`, merging over config.toml; FLYWHEEL_MAIL_NAME
