@@ -2399,8 +2399,8 @@ fn multiplexer_is_hc() -> bool {
 }
 
 //
-// flywheel's bridge for hc panes: agent-mail writes per-pane identity
-// files only for tmux panes; hc terminals (wT:p1) never get one, so
+// flywheel's bridge for hc panes: legacy pane backends wrote per-pane
+// identity files; hc terminals (`hc:t7`) never get one, so
 // `resolve_pane_identity` can't discover agents spawned by flywheel. The
 // bridge writes the same file agent-mail core would have: 12-hex-char SHA-1
 // of the canonicalized absolute project path as the directory name, the
