@@ -27870,6 +27870,10 @@ fn cmd_guards(_cfg: &Config) -> Result<()> {
 }
 
 // ---- deps / config / upgrade / tutorial ----
+/// Kept alive until removal step 5 (bd-flywheel-probe-qjay): the swarm
+/// loop still reads the server, so the health read stays even though
+/// doctor/preflight moved to the capability probe.
+#[allow(dead_code)]
 pub(crate) fn resonate_health(cfg: &Config) -> Result<()> {
     // 127.0.0.1, NOT localhost: localhost resolves ::1-first while the
     // resonate serve binds IPv4 — a naive probe reports DOWN against a
@@ -28859,11 +28863,14 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
         }
     }
 
-    match resonate_health(cfg) {
-        Ok(()) => println!("resonate server: {}", status_paint(AgentStatus::Idle)),
+    // bd-flywheel-probe-qjay: the engine-store capability probe stands
+    // where the Resonate /health check stood. The server read stays alive
+    // in `resonate_health` until removal step 5.
+    match crate::daemon::durable_capability_probe() {
+        Ok(()) => println!("engine store: {}", status_paint(AgentStatus::Idle)),
         Err(e) => {
             ok = false;
-            println!("resonate server: {} ({e:#})", error("FAIL"));
+            println!("engine store: {} ({e:#})", error("FAIL"));
         }
     }
 

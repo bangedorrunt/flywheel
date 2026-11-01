@@ -690,6 +690,82 @@ pub fn ensure_resonate(cfg: &crate::config::Config) -> anyhow::Result<EnsureOutc
     );
 }
 
+/// Parked-run capability probe (bd-flywheel-probe-qjay — step 1 of the
+/// Resonate removal): open a scratch run on the durable engine store, park
+/// it, and verify the wake fires via `drain_due`. A run that can park and
+/// wake is the health signal — not a vendor `/health` endpoint.
+///
+/// Opens the same sqlite the effect journal uses (`mail::mailbox_roots`),
+/// failing closed: a missing/unwritable dir or DB reads as DOWN, never as
+/// silent success. The scratch run is cancelled best-effort afterwards; its
+/// journal rows stay within the scope's retention bound.
+pub fn durable_capability_probe() -> anyhow::Result<()> {
+    let (data_dir, db) = crate::mail::mailbox_roots();
+    durable_capability_probe_at(&data_dir, &db)
+}
+
+pub(crate) fn durable_capability_probe_at(data_dir: &Path, db: &Path) -> anyhow::Result<()> {
+    use toron_core::index::durable_engine::ToronEngineStore;
+    use toron_core::index::schema;
+    use toron_core::journal::{JournalDb, ToronJournal};
+    use toron_core::kernel::{DurableEngine, EngineMsg, OurEngine};
+
+    std::fs::create_dir_all(data_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "probe: cannot create engine store dir {}: {e}",
+            data_dir.display()
+        )
+    })?;
+    let db_str = db.to_string_lossy().into_owned();
+    // Multi-thread: the store/journal handles are sync-over-channels, so
+    // the engine verbs below run in spawn_blocking while workers drive the
+    // store tasks. A current-thread runtime would deadlock here.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("probe runtime: {e}"))?;
+    rt.block_on(async move {
+        let pool = schema::connect(&db_str)
+            .await
+            .map_err(|e| anyhow::anyhow!("probe: cannot open engine store {db_str}: {e}"))?;
+        schema::migrate(&pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("probe: cannot migrate engine store {db_str}: {e}"))?;
+        let handle = tokio::runtime::Handle::current();
+        let store = ToronEngineStore::spawn(pool.clone(), &handle);
+        let journal = ToronJournal::spawn(JournalDb::new(pool, "probe", 64), &handle);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+            .map_err(|e| anyhow::anyhow!("probe: system clock: {e}"))?;
+        let run_id = format!("probe-capability-{}-{now_ms}", std::process::id());
+        tokio::task::spawn_blocking(move || {
+            let mut engine = OurEngine::with_journal(store, journal);
+            engine
+                .start(&run_id, now_ms)
+                .map_err(|e| anyhow::anyhow!("probe: engine start: {e}"))?;
+            let until_ms = now_ms.saturating_add(5_000);
+            engine
+                .park_until(&run_id, until_ms, 0, now_ms, None)
+                .map_err(|e| anyhow::anyhow!("probe: engine park: {e}"))?;
+            let wakes = engine
+                .drain_due(until_ms)
+                .map_err(|e| anyhow::anyhow!("probe: drain_due: {e}"))?;
+            if !wakes
+                .iter()
+                .any(|w| matches!(w, EngineMsg::Woke { key, .. } if key == &run_id))
+            {
+                return Err(anyhow::anyhow!("probe: parked run produced no wake"));
+            }
+            let _ = engine.cancel(&run_id, until_ms);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("probe task: {e}"))?
+    })
+}
+
 /// Short-timeout /health probe (2xx = up).
 fn resonate_healthy(url: &str) -> bool {
     matches!(
@@ -770,6 +846,42 @@ fn which_resonate() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd-flywheel-probe-qjay: the probe parks a scratch run and drains its
+    /// wake against a temp store — no server, no daemon, no live paths.
+    #[test]
+    fn capability_probe_park_and_wake() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("fw-probe-{}-{nanos}", std::process::id()));
+        let db = dir.join("probe.sqlite");
+        durable_capability_probe_at(&dir, &db).expect("scratch store parks and wakes");
+        // Second pass over the same file: a fresh run id each call, so the
+        // probe is idempotent and reruns green.
+        durable_capability_probe_at(&dir, &db).expect("probe reruns green");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The probe fails closed: a path that cannot host a store reads as
+    /// DOWN, never as silent success.
+    #[test]
+    fn capability_probe_refuses_a_broken_path() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let file =
+            std::env::temp_dir().join(format!("fw-probe-file-{}-{nanos}", std::process::id()));
+        std::fs::write(&file, "not a dir").unwrap();
+        let db = file.join("probe.sqlite");
+        assert!(
+            durable_capability_probe_at(&file, &db).is_err(),
+            "a file where the store dir belongs must fail"
+        );
+        let _ = std::fs::remove_file(&file);
+    }
 
     #[test]
     fn pidfile_parses_trimmed_u32() {

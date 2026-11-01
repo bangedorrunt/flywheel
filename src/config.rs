@@ -231,7 +231,8 @@ pub struct Config {
     /// exists). Absent section → embedded in-process host, with a 200ms
     /// loopback probe that still defers to a running daemon (D9).
     pub doorbell: Option<DoorbellSection>,
-    /// Resonate server URL for the durable loop (default http://localhost:8001)
+    /// Deprecated (bd-flywheel-probe-qjay): ignored since the engine store
+    /// went local sqlite. Warned at load, shown in config, removed step 5.
     pub resonate_url: Option<String>,
     /// short name -> hc agent kind (default: oc=opencode, pi=pi, gk=grok)
     pub kinds: Option<BTreeMap<String, String>>,
@@ -492,6 +493,15 @@ impl Config {
         }
         if let Ok(v) = std::env::var("RESONATE_URL") {
             cfg.resonate_url = Some(v);
+        }
+        // bd-flywheel-probe-qjay: [resonate] url / RESONATE_URL is
+        // deprecated and ignored — the engine store is local sqlite now.
+        // Warn once at load (file and env land in the same field); removal
+        // is step 5, so the field stays readable until then.
+        if cfg.resonate_url.is_some() {
+            eprintln!(
+                "flywheel: [resonate] url / RESONATE_URL is deprecated and ignored — the engine store is local sqlite now; unset it to silence this warning"
+            );
         }
         // toron env surface (bd-euav): FLYWHEEL_TORON_URL / FLYWHEEL_TORON_TOKEN
         // feed `[mail.toron]`, merging over config.toml; FLYWHEEL_MAIL_NAME

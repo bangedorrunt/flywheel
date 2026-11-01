@@ -187,7 +187,15 @@ fn effective_setting(cfg: &Config, key: &str) -> String {
         "socket_path" => cfg.socket_path(),
         "workspace_root" => cfg.workspace_root().display().to_string(),
         "default_timeout_ms" => cfg.timeout_ms().to_string(),
-        "resonate_url" => cfg.resonate_url().unwrap_or_else(|| "(unset)".into()),
+        // bd-flywheel-probe-qjay: show the deprecation where the value shows.
+        "resonate_url" => {
+            let v = cfg.resonate_url().unwrap_or_else(|| "(unset)".into());
+            if v == "(unset)" {
+                v
+            } else {
+                format!("{v} (deprecated: ignored)")
+            }
+        }
         "on_captain_death" => cfg
             .on_captain_death
             .unwrap_or_default()

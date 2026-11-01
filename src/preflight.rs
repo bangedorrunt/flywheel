@@ -2,7 +2,7 @@
 //! Preflight checks — verify prerequisites for a fleet operation before dispatching.
 //!
 //! Runs before `steer`, `loop run`, and `workflow run --execute` to catch
-//! environment/dependency failures in <1s instead of 30s+ into a Resonate
+//! environment/dependency failures in <1s instead of 30s+ into a dispatch
 //! cycle. `--skip-preflight` on each command bypasses the auto-check.
 //!
 //! governed-by: ADR-0005, ADR-0010, ADR-0026
@@ -12,10 +12,10 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
+use crate::command_exists;
 use crate::config::Config;
 use crate::hc_support::{Client, WorktreeInfo};
 use crate::mail::Mail;
-use crate::{command_exists, resonate_health};
 
 // ─── types ───────────────────────────────────────────────────────────────────
 
@@ -111,7 +111,7 @@ impl Mode {
         })
     }
 
-    /// Steer: needs the pane plane, resonate, mail, project dir.
+    /// Steer: needs the pane plane, the engine store, mail, project dir.
     pub fn steer() -> Self {
         Self {
             needs_beads: false,
@@ -123,7 +123,7 @@ impl Mode {
             needs_playbook_files: false,
         }
     }
-    /// Loop `--work`: needs the pane plane, resonate, br, beads, mail, project dir.
+    /// Loop `--work`: needs the pane plane, the engine store, br, beads, mail, project dir.
     pub fn loop_work() -> Self {
         Self {
             needs_beads: true,
@@ -135,7 +135,7 @@ impl Mode {
             needs_playbook_files: false,
         }
     }
-    /// Loop `--queue` (static stages): needs the pane plane, resonate, mail, project dir.
+    /// Loop `--queue` (static stages): needs the pane plane, the engine store, mail, project dir.
     pub fn loop_queue() -> Self {
         Self {
             needs_beads: false,
@@ -147,7 +147,7 @@ impl Mode {
             needs_playbook_files: false,
         }
     }
-    /// Workflow `--execute`: needs the pane plane, resonate, mail, project dir, and
+    /// Workflow `--execute`: needs the pane plane, the engine store, mail, project dir, and
     /// the playbook-run file conventions (no *V2* / *_improved* /
     /// *_enhanced* new files).
     pub fn workflow() -> Self {
@@ -161,7 +161,7 @@ impl Mode {
             needs_playbook_files: true,
         }
     }
-    /// Cron (headless): needs resonate only.
+    /// Cron (headless): needs the engine store only.
     pub fn cron() -> Self {
         Self {
             needs_beads: false,
@@ -190,8 +190,10 @@ pub fn run(cfg: &Config, mode: Mode, project: Option<&str>) -> Vec<Check> {
         checks.push(check_pane_plane(cfg));
     }
 
-    // 2. resonate server reachable
-    checks.push(check_resonate(cfg));
+    // 2. durable engine store answers (park + wake). The Resonate server
+    //    check stood here until bd-flywheel-probe-qjay renamed it; the
+    //    server read stays alive in `resonate_health` until removal step 5.
+    checks.push(check_engine());
 
     // 2b. doorbell daemon (durability ask; supersedes bd-0gmw's advisory
     //     SKIP): a configured [doorbell] url makes the loop DEFER to that
@@ -201,7 +203,7 @@ pub fn run(cfg: &Config, mode: Mode, project: Option<&str>) -> Vec<Check> {
     checks.push(check_doorbell(cfg));
 
     // 3. br binary on PATH — only bead-driven modes (matches the Mode doc:
-    //    "Cron (headless): needs resonate only")
+    //    "Cron (headless): needs the engine store only")
     if mode.needs_beads {
         checks.push(check_br());
     }
@@ -389,10 +391,10 @@ fn check_pane_plane(cfg: &Config) -> Check {
     }
 }
 
-fn check_resonate(cfg: &Config) -> Check {
-    match resonate_health(cfg) {
-        Ok(()) => Check::pass("resonate"),
-        Err(e) => Check::fail("resonate", format!("{e}")),
+fn check_engine() -> Check {
+    match crate::daemon::durable_capability_probe() {
+        Ok(()) => Check::pass("engine"),
+        Err(e) => Check::fail("engine", format!("{e:#}")),
     }
 }
 
@@ -926,7 +928,7 @@ mod tests {
     fn to_json_shapes_status_and_message() {
         let checks = vec![
             Check::pass("pane-plane"),
-            Check::fail("resonate", "unreachable"),
+            Check::fail("engine", "unreachable"),
             Check::skip("beads-db", "not work mode"),
         ];
         let v = to_json(&checks);
