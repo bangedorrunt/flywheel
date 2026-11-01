@@ -2527,6 +2527,230 @@ pub fn spawn_launch_plan(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Durable spawn consumer (bd-spawn-pane-consumer-6lmf)
+// ---------------------------------------------------------------------------
+
+/// One claimed durable spawn job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+// The flip bead wires the drainer to this consumer; until then the surface is
+// intentionally unused (bd-spawn-pane-consumer-6lmf).
+#[allow(dead_code)]
+pub struct SpawnClaim {
+    /// The correlation key the engine published (`run:node:attempt`).
+    pub spawn_key: String,
+    /// The step/node the job belongs to.
+    pub node: String,
+    /// Host time the claim was taken, unix millis.
+    pub claimed_at_ms: u64,
+}
+
+/// The claim registry: `spawn_key` → claim.
+///
+/// First claimer wins. A second claim for the same key is REFUSED, which is
+/// the exactly-once gate: the engine republishes on restart, and the claim —
+/// not a vendor promise — decides whether a child starts.
+#[derive(Default)]
+// The flip bead wires the drainer to this consumer; until then the surface is
+// intentionally unused (bd-spawn-pane-consumer-6lmf).
+#[allow(dead_code)]
+pub struct SpawnClaims {
+    inner: std::sync::Mutex<std::collections::HashMap<String, SpawnClaim>>,
+}
+
+impl std::fmt::Debug for SpawnClaims {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpawnClaims")
+            .field("len", &self.lock().len())
+            .finish()
+    }
+}
+
+// The flip bead wires the drainer to this consumer; until then the surface is
+// intentionally unused (bd-spawn-pane-consumer-6lmf).
+#[allow(dead_code)]
+impl SpawnClaims {
+    /// Empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, SpawnClaim>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Claim one key. # Errors
+    ///
+    /// `Err` when the key is already claimed — the duplicate-start refusal.
+    pub fn claim(
+        &self,
+        spec: &toron_workflow::engine::spawn::SpawnSpec,
+        now_ms: u64,
+    ) -> Result<SpawnClaim> {
+        let mut map = self.lock();
+        if let Some(existing) = map.get(&spec.spawn_key) {
+            anyhow::bail!(
+                "spawn {} is already claimed by {} at {}ms — a second start is refused",
+                spec.spawn_key,
+                existing.node,
+                existing.claimed_at_ms
+            );
+        }
+        let claim = SpawnClaim {
+            spawn_key: spec.spawn_key.clone(),
+            node: spec.node.clone(),
+            claimed_at_ms: now_ms,
+        };
+        map.insert(spec.spawn_key.clone(), claim.clone());
+        Ok(claim)
+    }
+
+    /// True when the key is already claimed.
+    pub fn is_claimed(&self, spawn_key: &str) -> bool {
+        self.lock().contains_key(spawn_key)
+    }
+
+    /// Drop a claim (a failed launch releases it so the job can be retried).
+    pub fn release(&self, spawn_key: &str) {
+        self.lock().remove(spawn_key);
+    }
+}
+
+/// Read the durable spec out of a kind-43001 body.
+///
+/// # Errors
+///
+/// `Err` when the event carries no `spec` object or it does not deserialize —
+/// a malformed job is refused before anything starts.
+// The flip bead wires the drainer to this consumer; until then the surface is
+// intentionally unused (bd-spawn-pane-consumer-6lmf).
+#[allow(dead_code)]
+pub fn spawn_spec_from_job(body: &Value) -> Result<toron_workflow::engine::spawn::SpawnSpec> {
+    let spec = body
+        .get("spec")
+        .ok_or_else(|| anyhow!("spawn job carries no spec"))?;
+    serde_json::from_value(spec.clone()).map_err(|e| anyhow!("spawn job spec does not parse: {e}"))
+}
+
+/// The launch plan for a durable spec.
+///
+/// The durable spec names the SUB-workflow `workflow_ref`; the legacy promise
+/// payload called it `workflow`. Map it once here and reuse the ONE plan
+/// builder, so the profile/harness/args/phase rules do not fork.
+// The flip bead wires the drainer to this consumer; until then the surface is
+// intentionally unused (bd-spawn-pane-consumer-6lmf).
+#[allow(dead_code)]
+pub fn spawn_launch_plan_from_spec(
+    spec: &toron_workflow::engine::spawn::SpawnSpec,
+    catalog: &ProfileCatalog,
+) -> Result<SpawnJobLaunch> {
+    let legacy = serde_json::json!({
+        "profile": spec.profile,
+        "workflow": spec.workflow_ref,
+        "resolved": spec.resolved,
+        "await": spec.await_,
+        "harness": spec.harness,
+        "context": spec.context,
+    });
+    spawn_launch_plan(&spec.spawn_key, &legacy, catalog)
+}
+
+/// The terminal job body the consumer publishes.
+///
+/// `spawn_key` is the correlation key; `result` mirrors kind-43004 (result) or
+/// kind-43006 (error) depending on `outcome`.
+// The flip bead wires the drainer to this consumer; until then the surface is
+// intentionally unused (bd-spawn-pane-consumer-6lmf).
+#[allow(dead_code)]
+pub fn spawn_terminal_body(
+    spec: &toron_workflow::engine::spawn::SpawnSpec,
+    outcome: &Result<Value>,
+) -> Value {
+    match outcome {
+        Ok(receipt) => serde_json::json!({
+            "spawn_key": spec.spawn_key,
+            "node": spec.node,
+            "run_id": spec.run_id,
+            "ok": true,
+            "result": receipt,
+        }),
+        Err(e) => serde_json::json!({
+            "spawn_key": spec.spawn_key,
+            "node": spec.node,
+            "run_id": spec.run_id,
+            "ok": false,
+            "error": format!("{e:#}"),
+        }),
+    }
+}
+
+/// One consumed durable spawn job.
+#[derive(Debug, Clone)]
+// The flip bead wires the drainer to this consumer; until then the surface is
+// intentionally unused (bd-spawn-pane-consumer-6lmf).
+#[allow(dead_code)]
+pub struct SpawnJobOutcome {
+    /// The claim that admitted the start.
+    pub claim: SpawnClaim,
+    /// The launch receipt (empty when the launch failed).
+    pub receipt: Value,
+    /// The kind-43004 / kind-43006 body the host publishes.
+    pub terminal: Value,
+}
+
+/// Drive ONE durable spawn job: claim, launch, terminal.
+///
+/// The claim is taken BEFORE the launch and a duplicate is refused before
+/// anything starts — that is the exactly-once gate the design names. A failed
+/// launch releases the claim (the job never started, so a retry is legitimate)
+/// and still yields a terminal error body: the run must not hang.
+// The flip bead wires the drainer to this consumer; until then the surface is
+// intentionally unused (bd-spawn-pane-consumer-6lmf).
+#[allow(dead_code)]
+pub fn consume_spawn_job(
+    claims: &SpawnClaims,
+    body: &Value,
+    catalog: &ProfileCatalog,
+    now_ms: u64,
+    mut launch: impl FnMut(SpawnJobLaunch) -> Result<Value>,
+) -> Result<SpawnJobOutcome> {
+    let spec = spawn_spec_from_job(body)?;
+    let claim = claims.claim(&spec, now_ms)?;
+    let plan = match spawn_launch_plan_from_spec(&spec, catalog) {
+        Ok(plan) => plan,
+        Err(e) => {
+            claims.release(&spec.spawn_key);
+            let outcome = Err(e);
+            return Ok(SpawnJobOutcome {
+                claim,
+                receipt: Value::Null,
+                terminal: spawn_terminal_body(&spec, &outcome),
+            });
+        }
+    };
+    match launch(plan) {
+        Ok(receipt) => {
+            let outcome = Ok(receipt.clone());
+            Ok(SpawnJobOutcome {
+                claim,
+                receipt,
+                terminal: spawn_terminal_body(&spec, &outcome),
+            })
+        }
+        Err(e) => {
+            claims.release(&spec.spawn_key);
+            let outcome = Err(e);
+            Ok(SpawnJobOutcome {
+                claim,
+                receipt: Value::Null,
+                terminal: spawn_terminal_body(&spec, &outcome),
+            })
+        }
+    }
+}
+
 /// bd-omwg contract: after `WorkflowEngine::invoke`, SpawnSink must NOT be
 /// silent. Drains every promise_id the engine pushed and hands each to the
 /// launcher (which owns the real pane launch + job completion wait).
@@ -3400,6 +3624,115 @@ pub fn start_spawn_drainer(
 mod tests {
     use super::*;
     use crate::elm::TestClock;
+
+    /// The durable spawn spec one 43001 carries (bd-spawn-pane-consumer-6lmf).
+    fn durable_spawn_spec() -> toron_workflow::engine::spawn::SpawnSpec {
+        toron_workflow::engine::spawn::SpawnSpec {
+            spawn_key: "run-1:spawn_it:1".into(),
+            run_id: "run-1".into(),
+            node: "spawn_it".into(),
+            workflow: "spawn-wf".into(),
+            project: None,
+            generation: 1,
+            profile: "@housekeeper".into(),
+            resolved: serde_json::json!({
+                "npub": "",
+                "spec": { "harness": "pi", "model": "glm-5.3", "backend": "hc", "role": "housekeeper" }
+            }),
+            harness: Some("pi".into()),
+            workflow_ref: None,
+            await_: true,
+            no_claim_timeout: 600,
+            context: None,
+        }
+    }
+
+    /// bd-spawn-pane-consumer-6lmf: one durable spawn job runs from the
+    /// kind-43001 spec alone — no promise, no server.
+    #[test]
+    fn spawn_job_runs_from_the_43001_spec_with_no_server() {
+        let spec = durable_spawn_spec();
+        let body = serde_json::json!({
+            "title": "spawn run-1/spawn_it",
+            "spec": serde_json::to_value(&spec).expect("spec json"),
+            "assignee": null,
+        });
+        let claims = SpawnClaims::new();
+        let mut launched: Vec<String> = Vec::new();
+        let outcome = consume_spawn_job(&claims, &body, &test_catalog(), 1_000, |plan| {
+            launched.push(plan.profile.clone());
+            assert_eq!(plan.harness, "pi", "the resolved harness rides the spec");
+            assert!(plan.await_job, "await: true parks the run");
+            Ok(serde_json::json!({"pane": "w1:p9"}))
+        })
+        .expect("consume the job");
+
+        assert_eq!(launched, ["housekeeper"], "exactly one start");
+        assert_eq!(outcome.claim.spawn_key, "run-1:spawn_it:1");
+        assert_eq!(
+            outcome.terminal["spawn_key"],
+            serde_json::json!("run-1:spawn_it:1")
+        );
+        assert_eq!(outcome.terminal["ok"], serde_json::json!(true));
+        assert_eq!(
+            outcome.terminal["result"]["pane"],
+            serde_json::json!("w1:p9")
+        );
+    }
+
+    /// The restart republish: the engine re-emits the same `spawn_key`; the
+    /// claim refuses it and NO second child starts.
+    #[test]
+    fn spawn_claim_refuses_a_second_start() {
+        let spec = durable_spawn_spec();
+        let body = serde_json::json!({
+            "title": "spawn",
+            "spec": serde_json::to_value(&spec).expect("spec json"),
+            "assignee": null,
+        });
+        let claims = SpawnClaims::new();
+        let mut starts = 0u32;
+        let first = consume_spawn_job(&claims, &body, &test_catalog(), 1_000, |_| {
+            starts += 1;
+            Ok(serde_json::json!({"pane": "w1:p9"}))
+        })
+        .expect("first start");
+        assert_eq!(first.terminal["ok"], serde_json::json!(true));
+
+        let second = consume_spawn_job(&claims, &body, &test_catalog(), 2_000, |_| {
+            starts += 1;
+            Ok(serde_json::json!({"pane": "w1:p10"}))
+        });
+        let err = second.expect_err("the claim refuses a duplicate");
+        assert!(format!("{err:#}").contains("already claimed"), "{err:#}");
+        assert_eq!(starts, 1, "one child, never two");
+        assert!(claims.is_claimed("run-1:spawn_it:1"));
+    }
+
+    /// A failed launch releases the claim and still yields a terminal error
+    /// body, so the run is never left hanging.
+    #[test]
+    fn spawn_launch_failure_releases_the_claim() {
+        let spec = durable_spawn_spec();
+        let body = serde_json::json!({ "spec": serde_json::to_value(&spec).expect("spec") });
+        let claims = SpawnClaims::new();
+        let outcome = consume_spawn_job(&claims, &body, &test_catalog(), 1_000, |_| {
+            anyhow::bail!("pane split refused")
+        })
+        .expect("a failed launch is a terminal, not an error");
+        assert_eq!(outcome.terminal["ok"], serde_json::json!(false));
+        assert!(
+            outcome.terminal["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("pane split refused")),
+            "{}",
+            outcome.terminal
+        );
+        assert!(
+            !claims.is_claimed("run-1:spawn_it:1"),
+            "the claim is released so the job can be retried"
+        );
+    }
 
     /// bd-ietv: a role whose registry row exists but whose pane is missing
     /// from hc's listing at dispatch time is the spawn/list race, not a
