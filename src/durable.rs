@@ -13568,12 +13568,12 @@ mod tests {
 
     // ---- ADR-0019 Spec 3: serialize-on-overlap + overlap wait reason ----
 
-    /// bd-9tbb (leafReply): the loop body must NEVER consume the checkpointed
-    /// `reservation_board` leaf — a replayed poll would read the STORED board
+    /// bd-9tbb (leafReply): the loop body must NEVER consume a checkpointed
+    /// board read — a replayed poll would read the STORED board
     /// and a stale always-serialize row would gate dispatch forever. The live
-    /// sites call `reservation_board_live`; the leaf stays for external
-    /// callers. Pinned by source shape: `ctx.run(reservation_board` must not
-    /// appear in swarm_loop's body.
+    /// sites call `reservation_board_live`; the checkpointed leaf is gone
+    /// (dead Resonate substrate removed). Pinned by source shape: no
+    /// checkpointed board read may appear in swarm_loop's body.
     #[test]
     fn board_reads_in_loop_body_are_live_not_checkpointed() {
         let src = std::fs::read_to_string(file!()).expect("durable.rs readable");
@@ -13594,11 +13594,6 @@ mod tests {
         assert!(
             body.contains("reservation_board_live("),
             "the live read helper is on the loop path"
-        );
-        // the checkpointed leaf itself still exists for external callers
-        assert!(
-            src.contains("async fn reservation_board(args: ReservationBoardArgs)"),
-            "checkpointed leaf retained for external/detached callers"
         );
     }
 
