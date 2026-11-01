@@ -1,4 +1,4 @@
-Agent swarm orchestrator over herdr, toron mail, and the br bead ledger.
+Agent swarm orchestrator over hc, toron mail, and the br bead ledger.
 
 Session door: `flywheel arrive <project> --as <pin>`, then `flywheel briefing "<goal>" --project <p> --json`. Run the argv it prints. `decide` is the classifier inside briefing, not a second door.
 
@@ -35,13 +35,12 @@ Commands:
   interrupt          Interrupt an agent (sends Escape by default — cancels the current tool call and returns to the prompt). Kill-style keys (ctrl+c) are REFUSED unless --force: they terminate the agent process and drop the pane to a shell (bd-fw-interrupt-kills-agent-or3)
   view               Read an agent's terminal output
   output             Read an agent's output from the opencode structured session store (bd-eign.5) — the SQLite session log, not TUI scrollback (which the alternate screen garbles). Resolves the latest session for the project directory, optionally narrowed by opencode role; --session targets an exact session id
-  agent              bd-swarm-cockpit-pczs: agent-session reads. `agent tail <pin>` shows the pin's recent actions (tool calls / commands) from the session herdr reports (`agent_session`) — the debugging surface that used to require finding the raw pi session JSONL by hand
+  agent              bd-swarm-cockpit-pczs: agent-session reads. `agent tail <pin>` shows the pin's recent actions (tool calls / commands) from the session hc reports (`agent_session`) — the debugging surface that used to require finding the raw pi session JSONL by hand
   watch              Watch a swarm: stream agent state changes until --until or timeout
   doorbell           bd-durable-doorbell-lngf: supervised pane-wake layer surface. Dispatchers are lazily healed — any of these (plus `recover`/`status`) restarts a dead one for workspaces that ever ran one
   loop-mode          Monitor a swarm: poll every N seconds, feed queued instructions to idle/finished agents, report blockers. Exits 0 when the queue is drained and the swarm settles. Runs as a durable Resonate workflow by default — crashes resume via `flywheel loop-mode run <project>` (same invocation id). For back-compat, the bare legacy form `flywheel loop <project>` (alias) is rewritten to `loop-mode run <project>` before parsing (see `rewrite_legacy_loop_args`). Renamed from `loop` to avoid harness built-in conflicts (bd-loop-mode-rename-0tqy) [alias: loop]
   artifacts          Typed artifacts (ADR-0025 Spec 2): list or stitch per-run records
-  zoom               Zoom a pane (herdr pane.zoom)
-  attach             Attach to an agent's terminal (interactive; execs `herdr attach`)
+  attach             Attach to an agent's terminal (interactive; execs `hc attach`)
   kill               Close (kill) a swarm workspace
   ledger             bead-verdict ledger (ADR-0019): br gate wrappers + receipt helper. `check` exits 0 only on a legal verdict for the current SHA; `receipt` writes only the receipt file (workers never write verdicts)
   judgment           host-side judgment surfaces (ADR-0014, bd-lpn6): miss ledger (resolve/list/needles), on-demand annotators, verify prescreen. Annotate-only — nothing here dispatches, holds, or closes
@@ -121,7 +120,7 @@ Examples:
 	flywheel arrive flywheel --as <pin>
 	flywheel briefing "until the tests pass" --project flywheel --json
 
-Exit codes: 0 ok · 1 herdr/server error · 2 usage error.
+Exit codes: 0 ok · 1 hc/server error · 2 usage error.
 Machine output: --json on list/status/view; --robot-snapshot for full state;
 --robot-capabilities for the agent command map.
 User config: ~/.config/flywheel  (flywheel config path)

@@ -12,7 +12,7 @@ Commands:
   whois         resolve an agent's profile (npub, program, model, task)
   register      register/refresh an agent identity (upsert). One operator is one identity (bd-register-portability-3c2b): a name is REQUIRED — bind an existing key with --from-project/--adopt-unnamed instead of minting
   renew         renew this identity's file reservations (extend the TTL)
-  force-unlock  operator force-release of a stale reservation (herdr-down / abandoned)
+  force-unlock  operator force-release of a stale reservation (hc-down / abandoned)
   slot          build slots: acquire/renew/release the advisory 'cargo' slot
   policy        set this agent's inbound contact policy
   digest        per-agent mail digest: unread/urgent counts + last sender/subject (orchestrator "who has mail" view; default = own identity)
