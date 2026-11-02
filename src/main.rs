@@ -154,13 +154,13 @@ use serde_json::{Value, json};
 use cmd::DaemonCmd;
 use cmd::{
     AgentCmd, ArtifactsCmd, AssetCmd, BackendCmd, CaptainCmd, CheckpointCmd, CoalitionCmd,
-    ConfigCmd, CrewCmd, CronCmd, DoorbellCmd, EngineCmd, JudgmentCmd, LedgerCmd, LoopCmd, MailCmd,
+    ConfigCmd, CrewCmd, CronCmd, DoorbellCmd, JudgmentCmd, LedgerCmd, LoopCmd, MailCmd,
     ModelCmd, PolicyCmd, PrinciplesCmd, ProfileCmd, RunsCmd, SlotCmd, SquadCmd, StageCmd,
     StandingOrdersCmd, ToronCmd, ToronMailCmd, WorkCmd, WorkflowCmd, WorktreeCmd, XprojCmd,
     cmd_agent, cmd_analytics, cmd_asset, cmd_audit, cmd_backend, cmd_captain, cmd_changes,
     cmd_checkpoint, cmd_config, cmd_crew, cmd_doorbell_digest, cmd_doorbell_gc,
     cmd_doorbell_inject, cmd_doorbell_introduce, cmd_doorbell_re_inject, cmd_doorbell_roster,
-    cmd_doorbell_start, cmd_doorbell_status, cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_engine,
+    cmd_doorbell_start, cmd_doorbell_status, cmd_doorbell_stop, cmd_doorbell_subscribe,
     cmd_history, cmd_internal_doorbell, cmd_judgment, cmd_ledger, cmd_mail, cmd_models, cmd_policy,
     cmd_principles, cmd_resume, cmd_runs, cmd_slot, cmd_stage, cmd_standing_orders, cmd_timeline,
     cmd_toron, cmd_work, cmd_worktree, cmd_xproj,
@@ -1489,7 +1489,7 @@ enum Commands {
     },
     /// Environment + toolchain health check
     Deps {
-        /// Best-effort bring-up of a down loopback resonate before the
+        /// Best-effort bring-up before reporting. The engine store is local,
         /// report (bd-ykqd). Without it, deps stays report-only.
         #[arg(long)]
         ensure: bool,
@@ -1545,11 +1545,6 @@ enum Commands {
     Runs {
         #[command(subcommand)]
         cmd: RunsCmd,
-    },
-    /// Engine-store maintenance: prune settled Resonate promises, then VACUUM
-    Engine {
-        #[command(subcommand)]
-        cmd: EngineCmd,
     },
     /// Captain-free steering (bd-t86p): ONE compose call at a target —
     /// `flywheel steer "<objective>"` drives the crew to completion with
@@ -3595,7 +3590,6 @@ fn main() {
         Some(Commands::Squad { cmd }) => cmd_squad(&cfg, cmd),
         Some(Commands::Coalition { cmd }) => cmd_coalition(cmd),
         Some(Commands::Runs { cmd }) => cmd_runs(&cfg, cmd),
-        Some(Commands::Engine { cmd }) => cmd_engine(&cfg, cmd),
         Some(Commands::Steer {
             objective,
             direct,
@@ -5887,7 +5881,7 @@ mod steer_safety_tests {
 mod steer_engine_tests {
     use super::*;
 
-    // bd-adr22-local-resonate-tx8q: engine runs now execute against the
+    // Engine runs execute against the
     // persistent server, where first task delivery can miss the SSE window
     // and wait on the server's tasks-retry-timeout (default 30s) — under a
     // fully parallel `cargo test` that plus slow CI boxes can exceed 60s.
@@ -6181,7 +6175,7 @@ mod steer_engine_tests {
     fn steer_direct_completes_as_engine_run() {
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (rt, engine, invoke_wf) = steer_engine(calls).expect("steer engine");
-        // bd-adr22-local-resonate-tx8q: engine runs are durably stored now —
+        // Engine runs are durably stored now —
         // run_ids must be unique per execution or a completed promise from a
         // prior run replays instead of executing.
         let run_id = format!("fw-cli-steer-engine-run-test-{}", std::process::id());
@@ -6196,7 +6190,7 @@ mod steer_engine_tests {
     fn steer_chain_redelivery_replays_recorded_run() {
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (rt, engine, invoke_wf) = steer_engine(calls.clone()).expect("steer engine");
-        // bd-adr22-local-resonate-tx8q: unique per PROCESS, stable within it —
+        // Unique per PROCESS, stable within it —
         // the redelivery contract needs same-id-twice in one lifetime, never
         // across lifetimes once the store is persistent.
         let run_id = format!("fw-cli-steer-redelivery-test-{}", std::process::id());
@@ -25195,7 +25189,6 @@ fn cmd_loop(
             unknown_detect_grace_polls: cfg.unknown_detect_grace_polls(),
             drain_grace_polls: cfg.drain_grace_polls(),
             claim_nudge_after_polls: cfg.claim_nudge_after_polls(),
-            resonate_url: String::new(),
             force,
             resume,
             strict,
@@ -28671,21 +28664,9 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
     let mut ok = true;
     println!("flywheel {}", dim(VERSION));
 
-    // bd-ykqd opt-in: bring the engine store up before reporting. Without
-    // --ensure this stays report-only (the resonate FAIL below still
-    // fails deps).
-    if ensure {
-        match daemon::ensure_resonate(cfg) {
-            Ok(outcome) => println!(
-                "resonate ensure: {}",
-                match outcome {
-                    daemon::EnsureOutcome::AlreadyUp => "already up",
-                    daemon::EnsureOutcome::Started => "started",
-                }
-            ),
-            Err(e) => println!("resonate ensure: {} ({e:#})", error("FAIL")),
-        }
-    }
+    // The engine store is local sqlite; there is nothing to bring up. The
+    // capability probe below is the check.
+    let _ = ensure;
     match Client::connect(Some(&cfg.socket_path())) {
         Ok(c) => match c.ping() {
             Ok(_) => println!("hc socket: {}", status_paint(AgentStatus::Idle)),
@@ -28812,9 +28793,7 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
         }
     }
 
-    // bd-flywheel-probe-qjay: the engine-store capability probe stands
-    // where the Resonate /health check stood. The server read stays alive
-    // in `resonate_health` until removal step 5.
+    // The engine-store capability probe: a scratch run that parks and wakes.
     match crate::daemon::durable_capability_probe() {
         Ok(()) => println!("engine store: {}", status_paint(AgentStatus::Idle)),
         Err(e) => {
@@ -32305,7 +32284,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     .map_err(|_| anyhow!("approval drainer thread panicked"));
                 out
             } else {
-                // bd-adr22-local-resonate-tx8q: ONE engine rail — the
+                // ONE engine rail — the
                 // headless/record arm uses the same durable store
                 // selection as pane mode (pane::local_engine), so a
                 // kill -9 mid-run resumes on restart regardless of
@@ -39742,15 +39721,6 @@ fn cmd_daemon(cmd: &DaemonCmd) -> Result<()> {
             // doorbell daemon is running (loud if its binary is absent —
             // autostart persistence stays opt-in via `doorbell install`).
             daemon::ensure_doorbell()?;
-            // Plane C store rides along (bd-ykqd): self-host resonate when
-            // its /health is down and the url is loopback. A failure here
-            // warns but does not fail daemon start — deps/preflight still
-            // report the unhealthy store.
-            match daemon::ensure_resonate(&Config::load()?) {
-                Ok(daemon::EnsureOutcome::AlreadyUp) => println!("resonate: already up"),
-                Ok(daemon::EnsureOutcome::Started) => println!("resonate: started"),
-                Err(e) => eprintln!("flywheel: WARNING resonate ensure failed: {e:#}"),
-            }
             Ok(())
         }
         DaemonCmd::Stop { port, force } => daemon::stop(&state, &addr(*port), *force),

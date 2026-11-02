@@ -4,7 +4,7 @@
 // governed-by: ADR-0027
 //! Durable swarm loop — the monitoring orchestrator as a Resonate workflow.
 //!
-//! Design (resonate-philosophy): the loop is sequential happy-path code with
+//! Design: the loop is sequential happy-path code with
 //! checkpoints. Every `ctx.run` (poll, send) and `ctx.sleep` is a durable save
 //! point — if the flywheel process crashes, the workflow resumes from the last
 //! checkpoint on restart with the same invocation id. The queue and the agent
@@ -144,10 +144,6 @@ pub struct LoopParams {
     /// cadence — the crew-execution gate's 60s claim bound).
     #[serde(default = "default_claim_nudge_after_polls")]
     pub claim_nudge_after_polls: u32,
-    /// Resonate server url for the engine path (bd-e0xk): set by the runner;
-    /// empty → engine default localhost:8001.
-    #[serde(default)]
-    pub resonate_url: String,
     /// force takeover (bd-bvwf.4 + bd-e131): with --force the loop REJECTS a
     /// stale pending invocation instead of resuming it — a killed loop's
     /// promise stays pending on the server forever, and a plain resume
@@ -1234,7 +1230,7 @@ fn parse_reservation_rows(v: &serde_json::Value) -> Vec<(String, String)> {
 
 /// bd-9tbb (leafReply): LIVE reservation-board read for the loop body —
 /// deliberately NOT a checkpointed leaf. A `ctx.run` board read replays its
-/// STORED result on every resume (resonate replay semantics), so a holder
+/// STORED result on every resume (durable checkpoint semantics), so a holder
 /// that released between the crash and the resume kept `serialize_all`
 /// pinned and dispatch stayed gated forever. The board is a world READ, not
 /// a durable effect: it must observe the world as of NOW, and the sends it
@@ -3438,8 +3434,7 @@ async fn send_prompt(args: SendArgs) -> anyhow::Result<SendOutcome> {
             };
             crate::comms_send::loop_send(&cfg, &a.project, &a.name, &a.text, &task_id)
         })
-        .await
-        ?;
+        .await?;
         return serde_json::from_value::<SendOutcome>(out)
             .map_err(|e| anyhow::anyhow!("inbox send outcome: {e}"));
     }
@@ -3663,8 +3658,7 @@ async fn notify_blocked(args: NotifyArgs) -> anyhow::Result<EscalationOutcome> {
         args.params,
         gate_acked,
         args.now_us,
-    )
-    ?;
+    )?;
     if should_mail {
         let exe = self_exe()?;
         let mut cmd = Command::new(&exe);
@@ -3955,7 +3949,6 @@ async fn renew_filtered_leases(args: RenewFilteredArgs) -> anyhow::Result<Value>
         renew_filtered_sync(&project, &paths, extend_seconds)
     })
     .await
-    
 }
 
 /// Lease TTL policy for loop-made reservations: an initial TTL of
@@ -7424,8 +7417,7 @@ async fn swarm_loop(
                                                         &sha,
                                                     )
                                                 },
-                                            )
-                                            ?;
+                                            )?;
                                             lr_band = settled
                                                 .get("band")
                                                 .and_then(Value::as_str)
@@ -13072,7 +13064,8 @@ mod tests {
     /// violations in a function bd-0fvb had already proven clean.
     #[test]
     fn bd_lf1u_leaf_scanner_actually_walks_bodies() {
-        let clean = "#[function]\nasync fn a_leaf(args: A) -> anyhow::Result<Value> { Ok(json!(1)) }\n";
+        let clean =
+            "#[function]\nasync fn a_leaf(args: A) -> anyhow::Result<Value> { Ok(json!(1)) }\n";
         assert_eq!(
             ambient_clock_reads_in_durable_leaves(clean),
             Vec::<String>::new()
@@ -13380,7 +13373,6 @@ mod tests {
             unknown_detect_grace_polls: 6,
             drain_grace_polls: 1,
             claim_nudge_after_polls: 2,
-            resonate_url: String::new(),
             force: false,
             resume: false,
             strict: false,

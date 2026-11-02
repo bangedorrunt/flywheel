@@ -192,7 +192,7 @@ pub fn run(cfg: &Config, mode: Mode, project: Option<&str>) -> Vec<Check> {
 
     // 2. durable engine store answers (park + wake). The Resonate server
     //    check stood here until bd-flywheel-probe-qjay renamed it; the
-    //    server read stays alive in `resonate_health` until removal step 5.
+    //    The engine store is local; the capability probe is the check.
     checks.push(check_engine());
 
     // 2b. doorbell daemon (durability ask; supersedes bd-0gmw's advisory

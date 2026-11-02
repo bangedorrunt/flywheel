@@ -307,12 +307,11 @@ mod tests {
 
     /// P4.5 acceptance (sequencing rule): the DEPLOYED docker-upgrade
     /// workflow carries explicit health-gate probes for the saga's five
-    /// services (aiostreams/resonate/honcho/pihole/dnscrypt) — one
-    /// `call_webhook` step per service, each `on_error: fail_run`. A dead
-    /// service errors the step and FAILS the run (Spec 0) → `on_failure:
-    /// bead`. This asserts the artifact in `toron/workflows/docker-upgrade.yaml`
-    /// matches the const here, so drift between the deployable YAML and the
-    /// proven design is caught.
+    /// services (aiostreams/engine-store/honcho/pihole/dnscrypt) — one
+    /// shell `verify` step per service, each `on_error: fail_run`. A dead
+    /// service exits non-zero and FAILS the run (Spec 0) → `on_failure: bead`.
+    /// `call_webhook` is Unsupported by contract, and the old vendor /health
+    /// probe is replaced by the in-house engine-store check.
     #[test]
     fn deployed_docker_upgrade_yaml_carries_the_five_gates() {
         use toron_workflow::schema::Action;
@@ -324,10 +323,10 @@ mod tests {
         .expect("deployed docker-upgrade.yaml readable");
 
         let wf = parse_workflow(&yaml).expect("deployed yaml parses");
-        // every health-gate step is a call_webhook with on_error: fail_run
+        // every health-gate step is a shell verify with on_error: fail_run
         let mut probe_count = 0;
         for step in &wf.steps {
-            if let Action::CallWebhook { url, .. } = &step.action {
+            if let Action::Verify { command } = &step.action {
                 assert_eq!(
                     step.on_error,
                     toron_workflow::schema::StepOnError::FailRun,
@@ -335,8 +334,8 @@ mod tests {
                     step.name.as_deref().unwrap_or("probe")
                 );
                 assert!(
-                    url.starts_with("http://127.0.0.1:"),
-                    "probe targets a host port: {url}"
+                    command.contains("127.0.0.1:") || command.contains("flywheel deps"),
+                    "probe targets a host port or the engine store: {command}"
                 );
                 probe_count += 1;
             }

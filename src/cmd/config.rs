@@ -77,11 +77,6 @@ pub(crate) const SETTINGS: &[Setting] = &[
         default_hint: "1800000 (30 minutes)",
     },
     Setting {
-        key: "resonate_url",
-        summary: "Resonate server for the durable loop. The loop does not start a server itself.",
-        default_hint: "http://localhost:8001",
-    },
-    Setting {
         key: "on_captain_death",
         summary: "What happens to crews when the captain pane dies: stop (kill crews), continue (leave them), or adopt (a new pin takes the captain alias).",
         default_hint: "stop",
@@ -187,15 +182,6 @@ fn effective_setting(cfg: &Config, key: &str) -> String {
         "socket_path" => cfg.socket_path(),
         "workspace_root" => cfg.workspace_root().display().to_string(),
         "default_timeout_ms" => cfg.timeout_ms().to_string(),
-        // bd-flywheel-probe-qjay: show the deprecation where the value shows.
-        "resonate_url" => {
-            let v = cfg.resonate_url().unwrap_or_else(|| "(unset)".into());
-            if v == "(unset)" {
-                v
-            } else {
-                format!("{v} (deprecated: ignored)")
-            }
-        }
         "on_captain_death" => cfg
             .on_captain_death
             .unwrap_or_default()
@@ -255,7 +241,7 @@ fn value_string(v: &toml::Value) -> String {
 /// raw table instead of round-tripping through [`Config`]: deserializing into
 /// `Config` and re-serializing DROPS every unrecognized field, so any config
 /// write from a stale binary silently erased newer keys (observed: a
-/// `resonate_url` set by hand vanished after an `install --force` + `set`
+/// foreign key set by hand vanished after an `install --force` + `set`
 /// rewrite). Pure — the sole authority mapping a CLI key to a config path.
 /// Returns an error for an unknown key so Get and Set share one allowlist.
 pub(crate) fn apply_key(table: &mut toml::Table, key: &str, value: &str) -> Result<()> {
@@ -514,36 +500,16 @@ pub(crate) fn cmd_config(cfg: &Config, cmd: &ConfigCmd) -> Result<()> {
 mod config_key_tests {
     use super::{SETTINGS, apply_key, config_template};
 
-    /// The CLI must be able to set every field `Config` actually reads —
-    /// `resonate_url` is the regression: it was readable but not settable, so
-    /// the documented "edit your config" path silently ignored it.
-    #[test]
-    fn apply_key_sets_resonate_url_and_round_trips() {
-        let mut table = toml::Table::new();
-        apply_key(
-            &mut table,
-            "resonate_url",
-            "https://resonate.example.ts.net",
-        )
-        .unwrap();
-        let reloaded: toml::Table =
-            toml::from_str(&toml::to_string_pretty(&table).unwrap()).unwrap();
-        assert_eq!(
-            reloaded.get("resonate_url").and_then(toml::Value::as_str),
-            Some("https://resonate.example.ts.net")
-        );
-    }
-
     /// THE forward-compat regression: a `config set` must not erase any field
     /// the running binary does not model. A stale `install`/`set` round-trip
     /// through `Config` used to drop unknown fields (a hand-set
-    /// `resonate_url` vanished). Setting one key must leave a foreign key and
+    /// `future_renamed_url` vanished). Setting one key must leave a foreign key and
     /// a nested table byte-intact.
     #[test]
     fn apply_key_preserves_fields_this_binary_does_not_model() {
         let mut table: toml::Table = toml::from_str(
             r#"
-            resonate_url = "https://resonate.example.ts.net"
+            future_renamed_url = "https://example.invalid"
             future_key_from_a_newer_binary = "keep-me"
             [some_future_section]
             nested = 42
@@ -557,7 +523,7 @@ mod config_key_tests {
         assert!(out.contains("some_future_section"), "{out}");
         assert!(out.contains("nested = 42"), "{out}");
         assert!(
-            out.contains("resonate_url"),
+            out.contains("future_renamed_url"),
             "must not drop the set field: {out}"
         );
     }
@@ -567,12 +533,12 @@ mod config_key_tests {
     #[test]
     fn apply_key_rejects_unknown_key() {
         let mut table: toml::Table =
-            toml::from_str("resonate_url = \"https://keep.example\"").unwrap();
+            toml::from_str("future_foreign_key = \"keep.example\"").unwrap();
         let err = apply_key(&mut table, "not_a_key", "x").unwrap_err();
         assert!(err.to_string().contains("unknown key"));
         assert_eq!(
-            table.get("resonate_url").and_then(toml::Value::as_str),
-            Some("https://keep.example"),
+            table.get("future_foreign_key").and_then(toml::Value::as_str),
+            Some("keep.example"),
             "a rejected set must not touch the table"
         );
     }
@@ -608,7 +574,6 @@ mod config_key_tests {
         assert!(text.contains("never overwrites"));
         for needle in [
             "socket_path",
-            "resonate_url",
             "on_captain_death",
             "default_timeout_ms",
             "[crew]",

@@ -160,7 +160,7 @@ const PREFLIGHT_EXIT: i32 = 4;
 
 /// The FIRST failing check as `(name, message)`. Skips are advisory (the
 /// operation can proceed) and passes are silent; only a `Fail` arms the exit.
-/// Pure, so the arm's rule is pinned without a live hc/resonate/toron.
+/// Pure, so the arm's rule is pinned without a live hc/toron.
 pub(crate) fn first_failing_check(checks: &[preflight::Check]) -> Option<(&'static str, String)> {
     checks.iter().find_map(|c| match &c.status {
         preflight::Status::Fail(msg) => Some((c.name, msg.clone())),
@@ -1025,7 +1025,7 @@ mod tests {
         use crate::preflight::{Check, Status};
         // Path clear: passes and skips only → the arm never fires.
         let clean = vec![
-            Check::pass("resonate"),
+            Check::pass("engine_store"),
             Check::skip("doorbell", "embedded (no [doorbell] url configured)"),
         ];
         assert!(

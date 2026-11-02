@@ -397,7 +397,7 @@ pub fn render_divergence(rows: &[Divergence]) -> String {
 /// workspace lifetime and seeds `swarm` from ActiveLoop (same
 /// `seed_swarm_resume` the loop uses) plus assignment from receipts.
 /// `swarm_loop` must not construct a second `WorkspaceModel::default()` —
-/// process split may remain (remote-resonate / durable replay), but two
+/// process split may remain (durable replay), but two
 /// RAM WorkspaceModels is Dual, not the end-state. The loop holds only
 /// `LoopModel` (effect runner + crash-resume slice) and folds swarm-slice
 /// Msgs through `tick` via a throwaway composition (`WorkspaceModel {

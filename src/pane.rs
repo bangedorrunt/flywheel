@@ -3139,23 +3139,19 @@ pub fn launch_spawn_job(
     }))
 }
 
-/// `Resonate::local` requires an entered Tokio runtime. Pane-mode keeps the
-/// engine alive across `invoke` so the spawn drainer can share it — enter
-/// the caller's runtime before construct, then drop the guard and `block_on`.
+/// Pane-mode keeps the engine alive across `invoke` so the spawn drainer can
+/// share it — enter the caller's runtime before construct, then drop the
+/// guard and `block_on`.
 ///
-/// bd-adr22-local-resonate-tx8q: engine runs are wired to a PERSISTENT store
-/// whenever one answers — [`cli_engine_store_url`] order is `RESONATE_URL`
-/// env pin > host-local serve `http://localhost:8001` (TCP-probed) — so
-/// compose/steer runs survive kill -9 mid-run and resume on restart
-/// (ADR-0022 W3/W4). With no server answering, falls back to the embedded
-/// in-memory runtime (previous behavior; in-process replay only).
+/// The dry engine records actions only (the `Recording` mode), so it stays
+/// in-memory by contract: no external effect is performed and a row claiming
+/// otherwise is the lie the journal exists to prevent.
 pub fn local_engine(
     rt: &tokio::runtime::Runtime,
     runner: toron_workflow::engine::EffectRunner,
     profile: toron_workflow::ProfileResolver,
     workflow: toron_workflow::WorkflowResolver,
 ) -> Result<toron_workflow::WorkflowEngine> {
-    let server_url = cli_engine_store_url();
     // Dry runs still need a recording seam so control-flow output contains
     // every dispatch node. The adapter records the action shape only; it
     // never calls the real host runner, so no external effect is performed.
@@ -3163,7 +3159,6 @@ pub fn local_engine(
         std::sync::Arc::new(|inv| Ok(json!({ "action": inv.action.type_name() })));
     local_engine_with_journal(
         rt,
-        server_url,
         runner,
         profile,
         workflow,
@@ -3213,36 +3208,12 @@ pub fn local_engine_journaled(
     profile: toron_workflow::ProfileResolver,
     workflow: toron_workflow::WorkflowResolver,
 ) -> Result<toron_workflow::WorkflowEngine> {
-    let server_url = cli_engine_store_url();
-    local_engine_with(cfg, rt, server_url, runner, profile, workflow)
+    local_engine_with(cfg, rt, runner, profile, workflow)
 }
 
-/// CLI engine store selection (bd-adr22-local-resonate-tx8q). The
-/// toron-workflow probe order also auto-probes the shared multi-host server
-/// (`https://resonate.example-tailnet.ts.net`) — deliberately NOT done here:
-/// on a shared server, foreign workers polling the same default group can
-/// claim a CLI run's tasks before this process does (observed: steer runs
-/// parked 60s with tasks executed elsewhere / never delivered). The shared
-/// server stays reachable via an explicit `RESONATE_URL` pin.
-///
-/// 127.0.0.1, NOT localhost: the host serve binds IPv4 while `localhost`
-/// resolves ::1-first here, so a naive probe silently demotes every run to
-/// the embedded in-memory store (observed live).
-pub fn cli_engine_store_url() -> Option<String> {
-    // ADR-0043: the engine is in-process; there is no server URL to select.
-    None
-}
-
-/// Store-selection seam: `Some(url)` => remote HttpNetwork-backed engine
-/// (durable), `None` => embedded in-memory runtime. Construction stays lazy;
-/// the URL is only dialed when runs/promise ops execute.
-/// [`local_engine_journaled`] is the only caller: the journal is always
-/// built here (bd-722a — the `journal` flag was always `true`, so its
-/// un-journaled branch was unreachable).
 fn local_engine_with(
     cfg: &crate::config::Config,
     rt: &tokio::runtime::Runtime,
-    server_url: Option<String>,
     runner: toron_workflow::engine::EffectRunner,
     profile: toron_workflow::ProfileResolver,
     workflow: toron_workflow::WorkflowResolver,
@@ -3268,16 +3239,7 @@ fn local_engine_with(
     // constructor is Enforced — its leaves really perform external effects,
     // so an uncovered sink must refuse, never run unjournaled.
     let mode = engine_journal_mode(true, effect.is_some())?;
-    local_engine_with_journal(
-        rt,
-        server_url,
-        runner,
-        profile,
-        workflow,
-        effect,
-        mode,
-        run_journal,
-    )
+    local_engine_with_journal(rt, runner, profile, workflow, effect, mode, run_journal)
 }
 
 /// The store-selection + constructor tail shared by both entry points.
@@ -3313,7 +3275,6 @@ pub fn engine_journal_mode(
 #[allow(clippy::too_many_arguments)]
 fn local_engine_with_journal(
     rt: &tokio::runtime::Runtime,
-    server_url: Option<String>,
     _runner: toron_workflow::engine::EffectRunner,
     profile: toron_workflow::ProfileResolver,
     workflow: toron_workflow::WorkflowResolver,
@@ -3341,25 +3302,26 @@ fn local_engine_with_journal(
                 as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         }) as toron_workflow::engine::AsyncRunJournal
     });
-    match server_url {
-        Some(url) => {
-            toron_workflow::WorkflowEngine::remote_with_resolvers_async_effect_mode_and_journal(
-                url,
-                profile,
-                workflow,
-                async_effect,
-                mode,
-                async_run_journal,
-            )
-        }
-        None => toron_workflow::WorkflowEngine::local_with_resolvers_async_effect_mode_and_journal(
+    let engine =
+        toron_workflow::WorkflowEngine::local_with_resolvers_async_effect_mode_and_journal(
             profile,
             workflow,
             async_effect,
             mode,
             async_run_journal,
-        ),
+        )?;
+    // A journaled engine PERSISTS through the same sqlite the effect journal
+    // uses; without it the run would be in-memory and a crash would lose the
+    // park. The dry arms (Recording) stay in-memory by contract.
+    if matches!(mode, toron_workflow::engine::EffectJournalMode::Enforced) {
+        let store = crate::effect_journal::journal_store().ok_or_else(|| {
+            anyhow::anyhow!(
+                "journaled engine requested but the durable store could not be opened — refusing to run unpersisted"
+            )
+        })?;
+        return Ok(engine.with_effect_store(store));
     }
+    Ok(engine)
 }
 
 /// bd-omwg: the pane-mode approval drainer thread. Surfaces each parked
@@ -5553,11 +5515,9 @@ steps:
         let profile: toron_workflow::ProfileResolver = std::sync::Arc::new(|_| None);
         let workflow: toron_workflow::WorkflowResolver = std::sync::Arc::new(|_| None);
         let rt = tokio::runtime::Runtime::new().expect("rt");
-        // None → embedded-local, so the assertion cannot depend on whether a
-        // Resonate server happens to answer on this host.
+        // Recording mode stays in-memory by contract.
         let engine = local_engine_with_journal(
             &rt,
-            None,
             runner,
             profile,
             workflow,

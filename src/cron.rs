@@ -2492,7 +2492,7 @@ owner = "housekeeper"
     }
 
     /// P4.5: the docker-upgrade health-gate — explicit probes for the five
-    /// saga services (aiostreams/resonate/honcho/pihole/dnscrypt), each with
+    /// saga services (aiostreams/engine-store/honcho/pihole/dnscrypt), each with
     /// `on_error: fail_run`. All up → run passes; any service down → run
     /// fails (the sequencing gate: the workflow must pass the SAME health
     /// gates as the bash saga before the systemd timer is disabled).

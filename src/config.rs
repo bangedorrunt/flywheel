@@ -231,9 +231,6 @@ pub struct Config {
     /// exists). Absent section → embedded in-process host, with a 200ms
     /// loopback probe that still defers to a running daemon (D9).
     pub doorbell: Option<DoorbellSection>,
-    /// Deprecated (bd-flywheel-probe-qjay): ignored since the engine store
-    /// went local sqlite. Warned at load, shown in config, removed step 5.
-    pub resonate_url: Option<String>,
     /// short name -> hc agent kind (default: oc=opencode, pi=pi, gk=grok)
     pub kinds: Option<BTreeMap<String, String>>,
     /// backend selection (ADR-0002)
@@ -491,21 +488,6 @@ impl Config {
                 anyhow::anyhow!("FLYWHEEL_TIMEOUT={v:?} is not a number of ms: {e}")
             })?);
         }
-        if let Ok(v) = std::env::var("RESONATE_URL") {
-            cfg.resonate_url = Some(v);
-        }
-        // bd-flywheel-probe-qjay: [resonate] url / RESONATE_URL is
-        // deprecated and ignored — the engine store is local sqlite now.
-        // Warn ONCE per process: Config::load runs many times per command,
-        // and the per-load warning flooded status output.
-        static RESONATE_URL_WARNED: std::sync::Once = std::sync::Once::new();
-        if cfg.resonate_url.is_some() {
-            RESONATE_URL_WARNED.call_once(|| {
-                eprintln!(
-                    "flywheel: [resonate] url / RESONATE_URL is deprecated and ignored — the engine store is local sqlite now; unset it to silence this warning"
-                );
-            });
-        }
         // toron env surface (bd-euav): FLYWHEEL_TORON_URL / FLYWHEEL_TORON_TOKEN
         // feed `[mail.toron]`, merging over config.toml; FLYWHEEL_MAIL_NAME
         // feeds the shared `[agent_mail]` identity.
@@ -690,10 +672,6 @@ impl Config {
                     .unwrap_or_else(|| PathBuf::from("/"))
                     .join("workspace")
             })
-    }
-
-    pub fn resonate_url(&self) -> Option<String> {
-        self.resonate_url.clone()
     }
 
     pub fn timeout_ms(&self) -> u64 {
