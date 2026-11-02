@@ -467,13 +467,14 @@ pub fn host_exit_reason(seen: &mut u32, presence: WorkspacePresence) -> Option<&
 /// Journal ONE host-exit reason row. The audit channel, not the tick journal:
 /// an exit is not a tick, and the audit log is the evidence channel for
 /// lifecycle facts (`FileStore::append_audit` is its single writer).
-pub fn journal_host_exit(state_dir: &Path, workspace: &str, reason: &str) {
+pub fn journal_host_exit(state_dir: &Path, workspace: &str, reason: &str, streak: u32) {
     let store = doorbell_rt::FileStore::new(state_dir.to_path_buf());
     let entry = serde_json::json!({
         "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         "workspace": workspace,
         "kind": "host_exit",
         "reason": reason,
+        "streak": streak,
     });
     let _ = store.append_audit(workspace, entry);
 }
@@ -488,8 +489,21 @@ pub fn host_exit_check(
     presence: WorkspacePresence,
 ) -> Option<&'static str> {
     let reason = host_exit_reason(seen, presence)?;
-    journal_host_exit(state_dir, workspace, reason);
+    journal_host_exit(state_dir, workspace, reason, *seen);
     Some(reason)
+}
+
+/// Pure classification of a workspace listing: an empty listing proves
+/// nothing (plane mid-restart), so it is `Unreadable`, never `Gone`.
+/// `Gone` needs a non-empty listing that lacks the workspace.
+pub fn classify_list_presence(list_empty: bool, found: bool) -> WorkspacePresence {
+    if found {
+        WorkspacePresence::Present
+    } else if list_empty {
+        WorkspacePresence::Unreadable
+    } else {
+        WorkspacePresence::Gone
+    }
 }
 
 /// Ask the selected plane whether this host's workspace still resolves.
@@ -512,6 +526,8 @@ pub fn probe_workspace_presence(
     }
     if list.iter().any(|ws| labels.iter().any(|l| l == &ws.label)) {
         WorkspacePresence::Present
+    } else if list.is_empty() {
+        WorkspacePresence::Unreadable
     } else {
         WorkspacePresence::Gone
     }
@@ -4468,6 +4484,50 @@ mod bd_gefp_host_exit_tests {
             audit.contains("\"reason\":\"workspace-gone\""),
             "audit: {audit}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Empty listings prove nothing: a plane mid-restart must read
+    /// `Unreadable`, never `Gone`. Scripted lookups: one miss survives,
+    /// only sustained confirmed `Gone` retires.
+    #[test]
+    fn transient_miss_never_retires() {
+        assert_eq!(
+            classify_list_presence(true, false),
+            WorkspacePresence::Unreadable
+        );
+        assert_eq!(
+            classify_list_presence(false, false),
+            WorkspacePresence::Gone
+        );
+        assert_eq!(
+            classify_list_presence(false, true),
+            WorkspacePresence::Present
+        );
+        let dir = scratch("scripted");
+        let ws = "flywheel-scratch-scripted";
+        let mut seen = 0u32;
+        // Script: Gone, Unreadable, Gone, Gone, Present, Gone, Gone, Gone.
+        // Only the final three consecutive Gone retire.
+        let script = [
+            WorkspacePresence::Gone,
+            WorkspacePresence::Unreadable,
+            WorkspacePresence::Gone,
+            WorkspacePresence::Gone,
+            WorkspacePresence::Present,
+            WorkspacePresence::Gone,
+            WorkspacePresence::Gone,
+        ];
+        for presence in script {
+            assert_eq!(host_exit_check(&dir, ws, &mut seen, presence), None);
+        }
+        let reason = host_exit_check(&dir, ws, &mut seen, WorkspacePresence::Gone)
+            .expect("three consecutive Gone retire");
+        assert_eq!(reason, "workspace-gone");
+        let store = doorbell_rt::FileStore::new(dir.clone());
+        let audit = std::fs::read_to_string(store.audit_file(ws))
+            .expect("exit must journal");
+        assert!(audit.contains("\"streak\":3"), "audit: {audit}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

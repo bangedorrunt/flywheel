@@ -1200,11 +1200,33 @@ async fn run_embedded_async(
             if ticks.is_multiple_of(WORKSPACE_PROBE_SECS) {
                 let (cfg_p, project_p, ws_p) =
                     (probe_cfg.clone(), probe_project.clone(), probe_ws.clone());
-                let presence = tokio::task::spawn_blocking(move || {
+                let mut presence = tokio::task::spawn_blocking(move || {
                     doorbell::probe_workspace_presence(&cfg_p, &project_p, &ws_p)
                 })
                 .await
                 .unwrap_or(doorbell::WorkspacePresence::Unreadable);
+                // Transient miss is not an exit: back off and re-list (bounded).
+                // Only a confirmed Gone feeds the streak; a Present/Unreadable
+                // re-list resets it. Exit stays with the shared streak fold.
+                if presence == doorbell::WorkspacePresence::Gone {
+                    for _ in 0..2 {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        let (cfg_q, project_q, ws_q) = (
+                            probe_cfg.clone(),
+                            probe_project.clone(),
+                            probe_ws.clone(),
+                        );
+                        let relist = tokio::task::spawn_blocking(move || {
+                            doorbell::probe_workspace_presence(&cfg_q, &project_q, &ws_q)
+                        })
+                        .await
+                        .unwrap_or(doorbell::WorkspacePresence::Unreadable);
+                        if relist != doorbell::WorkspacePresence::Gone {
+                            presence = relist;
+                            break;
+                        }
+                    }
+                }
                 if let Some(reason) =
                     doorbell::host_exit_check(&probe_dir, &probe_ws, &mut gone_streak, presence)
                 {
