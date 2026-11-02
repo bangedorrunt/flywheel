@@ -961,18 +961,35 @@ pub async fn run(cfg: &Config) -> Result<()> {
     // list made the idempotency guard skip every boot host: health showed
     // hosted strings with no Brain behind them, zero sweeps, clean exit).
     let hosted: Hosts = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    // Under the comms flag this daemon types nothing: the pane writer is the
+    // per-workspace `flywheel __doorbell` loop, and the MAIL wake path is its
+    // brain + bus watch (the inbox-host poll reads the comms inbox_log and
+    // sees head=0 for NIP-17 mail). A daemon host here is worse than useless:
+    // it takes the workspace lease as `no-text`, so the embedded loop defers
+    // to it, and the workspace is deaf. Stay standby and let the loops host.
+    let daemon_hosts = !doorbell_rt::comms_inbox_env();
+    let spawn_hosts: Vec<(String, String)> = if daemon_hosts {
+        cfg.hosts.clone()
+    } else {
+        Vec::new()
+    };
     eprintln!(
-        "doorbell serve: up on 127.0.0.1:{} + {} (hosting {})",
+        "doorbell serve: up on 127.0.0.1:{} + {} (hosting {}){})",
         cfg.port,
         sock_path.display(),
-        if cfg.hosts.is_empty() {
+        if spawn_hosts.is_empty() {
             "nothing (standby)".to_string()
         } else {
-            cfg.hosts
+            spawn_hosts
                 .iter()
                 .map(|(p, w)| format!("{p}/{w}"))
                 .collect::<Vec<_>>()
                 .join(", ")
+        },
+        if daemon_hosts {
+            ""
+        } else {
+            " — comms flag on: per-workspace loops type, this host holds none"
         }
     );
     // The cache is created before workers so a worker supervisor can
@@ -988,13 +1005,13 @@ pub async fn run(cfg: &Config) -> Result<()> {
     // and invalidate the health snapshot before the next probe can advertise
     // a worker that no longer exists.
     let loops: Loops = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-    for (project, workspace) in &cfg.hosts {
+    for (project, workspace) in &spawn_hosts {
         spawn_host_loop(cfg, &hosted, &loops, &owned, &health, project, workspace);
     }
     // bd-lorot: the workspaces this daemon actually hosts, captured BEFORE the
     // tick moves `cfg`. The prune may only touch workspaces outside this set.
     let prune_hosted: std::collections::BTreeSet<String> =
-        cfg.hosts.iter().map(|(_, ws)| ws.clone()).collect();
+        spawn_hosts.iter().map(|(_, ws)| ws.clone()).collect();
     let prune_state = cfg.flywheel_state.clone();
     let rotate_tick = tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
@@ -2156,7 +2173,13 @@ fn health_body(app: &AppState) -> String {
     // nudges — every wake path degrades to manual and NOTHING notices. Mark it
     // degraded and name the arming verb so `arrive`/`briefing`/`status` see it.
     let known_workspaces = known_journal_workspaces(&app.fw_state);
-    let wake_blind = standby_blind_to_wakes(hosted.len(), known_workspaces.len());
+    // Under the comms flag this daemon is SUPPOSED to hold nothing: the
+    // per-workspace `flywheel __doorbell` loop owns the workspace lease and
+    // its brain + bus watch types the pane. Calling that standby "blind" made
+    // every operator read DEGRADED for a healthy split.
+    let daemon_types = !doorbell_rt::comms_inbox_env();
+    let wake_blind =
+        daemon_types && standby_blind_to_wakes(hosted.len(), known_workspaces.len());
     if wake_blind {
         degraded.push("standby_with_known_workspaces".to_string());
     }
