@@ -524,13 +524,8 @@ pub fn probe_workspace_presence(
     if !labels.iter().any(|l| l == workspace) {
         labels.push(workspace.to_string());
     }
-    if list.iter().any(|ws| labels.iter().any(|l| l == &ws.label)) {
-        WorkspacePresence::Present
-    } else if list.is_empty() {
-        WorkspacePresence::Unreadable
-    } else {
-        WorkspacePresence::Gone
-    }
+    let found = list.iter().any(|ws| labels.iter().any(|l| l == &ws.label));
+    classify_list_presence(list.is_empty(), found)
 }
 
 /// Cutover registration (bd-asr2.13, Phase 3): spawn records one

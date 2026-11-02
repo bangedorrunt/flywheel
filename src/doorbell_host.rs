@@ -909,60 +909,6 @@ impl RtHost {
     }
 }
 
-/// The inbox host alone, beside a no-text daemon host (comms flag). It holds
-/// the `inbox-<ws>` lease (one pane writer per workspace), the pid file the
-/// spawn path uses, and nothing of the journal or the brain.
-fn run_inbox_only(cfg: &Config, project: &str, workspace: &str) -> anyhow::Result<()> {
-    let sd = config::state_dir();
-    let key = crate::doorbell::inbox_owner_key(workspace);
-    let mut lease = doorbell_rt::lease::acquire_lease(&sd, &key, doorbell_rt::lease::unix_now())
-        .map_err(|e| {
-            anyhow::anyhow!("flywheel doorbell: inbox host refuse double-run (live lease): {e:?}")
-        })?;
-    let path = doorbell::pid_file(&sd, workspace);
-    doorbell::write_pid(&path, std::process::id())?;
-    eprintln!(
-        "flywheel doorbell: comms flag on; a daemon host holds {project}/{workspace} but types nothing — running the inbox host only (pane writer)"
-    );
-    let mut host = crate::inbox_host::InboxHost::spawn(
-        crate::inbox_ports::FlywheelPorts::new(cfg, project, workspace),
-        crate::inbox_host::HostCfg::from_env(),
-    );
-    let mut beats = 0u32;
-    let mut timer_err = String::new();
-    let mut sweeper = crate::timer_watch::Sweeper::new(project);
-    while path.exists() {
-        std::thread::sleep(Duration::from_secs(1));
-        beats += 1;
-        // The daemon owns the brain on this path, so the timer sweep lives
-        // here. The embedded loop spawns its own thread for the same call.
-        if crate::timer_watch::host_enabled(cfg) {
-            match sweeper.sweep(
-                crate::timer_watch::now_us(),
-                crate::timer_watch::exec_allowed(),
-            ) {
-                Ok(_) => timer_err.clear(),
-                Err(e) if e == timer_err => {}
-                Err(e) => {
-                    eprintln!("timer sweep {project}: {e}");
-                    timer_err = e;
-                }
-            }
-        }
-        if beats.is_multiple_of(30) {
-            doorbell_rt::lease::refresh_lease(
-                &sd,
-                &key,
-                &mut lease,
-                doorbell_rt::lease::unix_now(),
-            );
-        }
-    }
-    host.stop();
-    doorbell_rt::lease::release_lease(&sd, &key, &lease);
-    Ok(())
-}
-
 pub fn run_embedded(cfg: &Config, project: &str, workspace: &str) -> anyhow::Result<()> {
     use anyhow::Context;
     // F3/bd-ene2 D9 layer 1 — claim the single-writer lease for THIS
@@ -972,13 +918,17 @@ pub fn run_embedded(cfg: &Config, project: &str, workspace: &str) -> anyhow::Res
     let now = doorbell_rt::lease::unix_now();
     let lease = match doorbell_rt::lease::acquire_lease(&config::state_dir(), workspace, now) {
         Ok(l) => l,
-        // Comms flag, workspace held by a daemon host that types nothing: it
-        // owns the journal and the brain; this process is the pane writer, so
-        // run the inbox host alone (follow-up a). Anything else: refuse.
+        // No-text holder (comms flag): serve never hosts, and an inbox host
+        // beside it cannot ring NIP-17 (head=0) — running one anyway hosts
+        // nothing, silently. A stale no-text lease never reaches here
+        // (acquire succeeds and the full loop runs, timer sweep included).
+        // A live one is a leftover: refuse LOUD so it gets cleared.
         Err(doorbell_rt::lease::LeaseDenied::Held(h))
             if crate::comms_send::enabled(cfg) && !doorbell_rt::lease::is_ringer(&h) =>
         {
-            return run_inbox_only(cfg, project, workspace);
+            return Err(anyhow::anyhow!(
+                "flywheel doorbell: no-text host holds {project}/{workspace} but serve never hosts and the inbox host cannot ring NIP-17 (head=0) — clear the leftover lease for {workspace} and retry; refusing to silently host nothing"
+            ));
         }
         Err(e) => {
             return Err(anyhow::anyhow!(
@@ -1765,36 +1715,40 @@ mod events_lost_tests {
 
 #[cfg(test)]
 mod inbox_flag_tests {
-    /// Follow-up (a): beside a no-text daemon host the embedded loop runs the
-    /// inbox host ALONE (no brain, no journal: the daemon owns them), under its
-    /// own lease; anything else still refuses a live lease.
+    /// bd-inbox-only-dead-path-0dt46: the inbox-only path is gone. Serve
+    /// never hosts, and an inbox host beside a no-text daemon cannot ring
+    /// NIP-17 (head=0) — running one anyway hosts nothing, silently. The
+    /// no-text case refuses LOUD; a stale no-text lease folds into the full
+    /// loop (acquire succeeds), which owns the timer sweep.
     #[test]
-    fn beside_a_no_text_daemon_the_inbox_host_runs_alone_under_its_own_lease() {
+    fn no_text_holder_refuses_loud_instead_of_hosting_nothing() {
         let src = include_str!("doorbell_host.rs");
-        let a = src.find("pub fn run_embedded(").unwrap();
-        let head = &src[a..a + 1500];
+        // Built without the literal so this absence check cannot match itself.
+        let needle = ["fn run", "_inbox_only("].concat();
         assert!(
-            head.contains("is_ringer(&h)")
-                && head.contains("run_inbox_only(cfg, project, workspace)")
+            !src.contains(&needle),
+            "the unrunnable inbox-only path must not exist"
+        );
+        let a = src.find("pub fn run_embedded(").unwrap();
+        let head = &src[a..a + 2500];
+        assert!(
+            head.contains("is_ringer(&h)"),
+            "the no-text case is still distinguished from a live ringer"
+        );
+        assert!(
+            head.contains("serve never hosts") && head.contains("leftover"),
+            "the no-text refuse must name the cause and the remedy"
         );
         assert!(
             head.contains("embedded refuse double-run"),
             "other live leases still refuse"
         );
-        let b = src.find("fn run_inbox_only(").unwrap();
-        let body = &src[b..src.find("pub fn run_embedded(").unwrap()];
-        // The one key the sender looks up too (rv23 S1/S2).
-        assert!(body.contains("crate::doorbell::inbox_owner_key(workspace)"));
-        assert!(body.contains("InboxHost::spawn("));
-        for banned in [
-            "Brain::",
-            "FileStore",
-            "RtHost",
-            "SinkManager",
-            "spawn_bus_watch",
-        ] {
-            assert!(!body.contains(banned), "inbox-only must not touch {banned}");
-        }
+        let b = src.find("fn run_embedded_async(").unwrap();
+        let tail = &src[b..(b + 15000).min(src.len())];
+        assert!(
+            tail.contains("spawn_sweep"),
+            "the timer sweep stays with the full loop"
+        );
     }
 
     #[test]
