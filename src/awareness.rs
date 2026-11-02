@@ -31,6 +31,10 @@ pub const SCHEDULE: &str = "*/15 * * * *";
 pub struct Facts {
     /// The one line: what an operator would read.
     pub line: String,
+    /// `line` WITHOUT the clock. Change detection reads this: a line that
+    /// carries `HH:MM` differs on every fire, so comparing `line` would make
+    /// the digest speak every 15 minutes forever.
+    pub fingerprint: String,
     /// Conflicts worth waking the captain for. Empty = healthy.
     pub conflicts: Vec<String>,
     /// Whether a swarm exists at all. No swarm = nothing to be aware of.
@@ -57,6 +61,9 @@ pub enum Action {
 pub struct Remembered {
     #[serde(default)]
     line: String,
+    /// The last fire's timestamp-free fingerprint — what change detection reads.
+    #[serde(default)]
+    fingerprint: String,
     #[serde(default)]
     signature: String,
     #[serde(default)]
@@ -84,7 +91,9 @@ pub fn facts(cfg: &crate::config::Config, project: &str) -> Result<Facts> {
     let unanswered =
         crate::doorbell::read_unanswered(&crate::doorbell::unanswered_file(&state_dir, &ws_label));
     let held: usize = snap.pins.iter().map(|p| p.reservations.len()).sum();
-    let swarm = agents > 0 || snap.dispatcher == "up";
+    // A live dispatcher is infrastructure, not a swarm: an idle host with a
+    // doorbell and no panes has nothing to report.
+    let swarm = agents > 0;
 
     let mut conflicts = Vec::new();
     if agents > 0 && snap.dispatcher != "up" {
@@ -105,14 +114,18 @@ pub fn facts(cfg: &crate::config::Config, project: &str) -> Result<Facts> {
     } else {
         format!("unanswered pin={}", unanswered.join(","))
     };
-    let line = format!(
-        "awareness {project} {} · dispatcher: {} · doorbell: {doorbell} · \
+    let fingerprint = format!(
+        "dispatcher: {} · doorbell: {doorbell} · \
          agents {agents} (busy {busy}, idle {idle}, dead {dead}, unknown {unknown}) · held {held}",
-        crate::cron::clock_hhmm(unix_secs()),
         snap.dispatcher,
+    );
+    let line = format!(
+        "awareness {project} {} · {fingerprint}",
+        crate::cron::clock_hhmm(unix_secs()),
     );
     Ok(Facts {
         line,
+        fingerprint,
         conflicts,
         swarm,
     })
@@ -159,7 +172,7 @@ pub fn decide(facts: &Facts, remembered: &Remembered) -> Action {
         // not a fault. Say nothing rather than wake anyone every 15 minutes.
         return Action::Silent;
     }
-    if facts.line == remembered.line {
+    if facts.fingerprint == remembered.fingerprint {
         return Action::Silent;
     }
     Action::Log(facts.line.clone())
@@ -182,6 +195,7 @@ pub async fn tick(cfg: &crate::config::Config, project: &str) -> Result<Option<S
         Action::Silent => Ok(None),
         Action::Log(line) => {
             remembered.line = line.clone();
+            remembered.fingerprint = facts.fingerprint.clone();
             remembered.swarm = facts.swarm;
             // A cleared conflict ends the episode, so the same fault can wake
             // the captain again if it comes back.
@@ -197,6 +211,7 @@ pub async fn tick(cfg: &crate::config::Config, project: &str) -> Result<Option<S
         } => {
             let bead = file_conflict(project, &line, &conflicts).await?;
             remembered.line = line.clone();
+            remembered.fingerprint = facts.fingerprint.clone();
             remembered.swarm = facts.swarm;
             remembered.signature = signature;
             remembered.bead = bead.clone();
@@ -316,6 +331,7 @@ mod tests {
     fn facts_of(line: &str, conflicts: &[&str], swarm: bool) -> Facts {
         Facts {
             line: line.to_string(),
+            fingerprint: line.to_string(),
             conflicts: conflicts.iter().map(|c| c.to_string()).collect(),
             swarm,
         }
@@ -327,11 +343,29 @@ mod tests {
         let facts = facts_of("awareness p · dispatcher: up", &[], true);
         assert_eq!(decide(&facts, &Remembered::default()), Action::Log(facts.line.clone()));
         let remembered = Remembered {
-            line: facts.line.clone(),
+            line: "a previous clock reading".into(),
+            fingerprint: facts.fingerprint.clone(),
             swarm: true,
             ..Default::default()
         };
         assert_eq!(decide(&facts, &remembered), Action::Silent);
+    }
+
+    /// The clock in the line must not count as a fact change, or the digest
+    /// speaks every 15 minutes for nothing.
+    #[test]
+    fn a_new_clock_with_the_same_facts_is_silent() {
+        let first = facts_of("awareness p 08:15 · agents 1", &[], true);
+        let mut later = facts_of("awareness p 08:30 · agents 1", &[], true);
+        // Same facts, later clock: only the timestamp differs.
+        later.fingerprint = first.fingerprint.clone();
+        let remembered = Remembered {
+            line: first.line.clone(),
+            fingerprint: first.fingerprint.clone(),
+            swarm: true,
+            ..Default::default()
+        };
+        assert_eq!(decide(&later, &remembered), Action::Silent);
     }
 
     /// No spawned swarm = no digest at all. An idle host is not an outage.
@@ -351,6 +385,7 @@ mod tests {
         };
         let remembered = Remembered {
             line: facts.line.clone(),
+            fingerprint: facts.fingerprint.clone(),
             signature,
             bead: Some("bd-1".into()),
             swarm: true,
@@ -388,6 +423,7 @@ mod tests {
         let facts = facts_of("awareness p · ok", &[], true);
         let remembered = Remembered {
             line: "awareness p · stale".into(),
+            fingerprint: "awareness p · stale".into(),
             signature: "unanswered doorbell: X".into(),
             bead: Some("bd-1".into()),
             swarm: true,
