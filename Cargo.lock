@@ -1232,7 +1232,6 @@ dependencies = [
  "hex",
  "ratatui",
  "regex-lite",
- "resonate-sdk",
  "serde",
  "serde_json",
  "serde_yaml",

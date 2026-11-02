@@ -1272,24 +1272,8 @@ pub fn dead_dispatchers(state_dir: &Path) -> Vec<(String, String)> {
     out
 }
 
-/// The durable supervisor leaf: heal every dead dispatcher. Checkpointed —
-/// a replay returns the stored result and never double-spawns a child.
-// resonate_sdk::function requires an args parameter; heal takes no input.
-// Item-level expect/allow cannot cover it: the macro regenerates the
-// function, so the lint fires on the emitted copy, not this node (see the
-// `no_effect_underscore_binding` allow in [lints.clippy]).
-#[resonate_sdk::function]
-async fn heal_tick(_args: ()) -> Result<Vec<String>> {
-    heal_tick_body()
-        .await
-        .map_err(|e| resonate_sdk::error::Error::Application {
-            message: format!("supervisor heal: {e:#}"),
-        })
-}
-
 /// The heal itself as a plain async fn (bd-flywheel-cron-elm-cn7p): the
-/// ElmCron host calls this directly — the macro name above is not callable.
-/// Same body, anyhow errors instead of the SDK error shape.
+/// ElmCron host calls this directly; the Resonate leaf and its macro are gone.
 pub async fn heal_tick_body() -> anyhow::Result<Vec<String>> {
     let state_dir = crate::config::state_dir();
     let exe = std::env::current_exe()?;

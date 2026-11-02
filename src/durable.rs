@@ -45,7 +45,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use resonate_sdk::prelude::*;
 use toron_core::mailbox::overlaps;
 
 use crate::config::Config;
@@ -1836,12 +1835,6 @@ pub struct XprojSpawnArgs {
     pub workers: u32,
 }
 
-fn map_err(e: anyhow::Error) -> Error {
-    Error::Application {
-        message: e.to_string(),
-    }
-}
-
 fn self_exe() -> anyhow::Result<std::path::PathBuf> {
     std::env::current_exe().map_err(anyhow::Error::from)
 }
@@ -1879,7 +1872,7 @@ pub(crate) const LEAF_WATCHDOG_GRACE: std::time::Duration = std::time::Duration:
 pub(crate) async fn run_leaf_cmd(
     cmd: std::process::Command,
     label: &'static str,
-) -> Result<std::process::Output> {
+) -> anyhow::Result<std::process::Output> {
     run_leaf_cmd_bounded(cmd, label, DEFAULT_LEAF_WATCHDOG).await
 }
 
@@ -1897,7 +1890,7 @@ pub(crate) async fn run_leaf_cmd_bounded(
     mut cmd: std::process::Command,
     label: &'static str,
     watchdog: std::time::Duration,
-) -> Result<std::process::Output> {
+) -> anyhow::Result<std::process::Output> {
     tokio::task::spawn_blocking(move || {
         // bd-jvka: the CHILD bound and the DRAIN bound are two failures. The
         // child runs in its own process group, so the timeout kills the whole
@@ -1916,8 +1909,8 @@ pub(crate) async fn run_leaf_cmd_bounded(
         })
     })
     .await
-    .map_err(|e| map_err(anyhow::anyhow!("{label} leaf task join failed: {e}")))?
-    .map_err(|e| map_err(anyhow::anyhow!("{label} spawn failed: {e}")))
+    .map_err(|e| anyhow::anyhow!("{label} leaf task join failed: {e}"))?
+    .map_err(|e| anyhow::anyhow!("{label} spawn failed: {e}"))
 }
 
 /// argv for one supervised pass (pure; the CLI spawns it as a child process
@@ -2117,8 +2110,8 @@ pub fn pane_wedge_action(i: &PaneWedgeInputs<'_>, already_paged: bool) -> PaneWe
 /// Collect hc push events for up to `timeout_ms` (forward-only).
 /// Checkpointed. Empty batch on stream failure is a soft outcome (the
 /// heartbeat `__poll` remains the correctness floor).
-async fn poll_events(args: PollEventsArgs) -> Result<PollEventsBatch> {
-    let exe = self_exe().map_err(map_err)?;
+async fn poll_events(args: PollEventsArgs) -> anyhow::Result<PollEventsBatch> {
+    let exe = self_exe()?;
     let mut cmd = Command::new(&exe);
     cmd.args([
         "__poll_events",
@@ -2150,7 +2143,7 @@ async fn poll_events(args: PollEventsArgs) -> Result<PollEventsBatch> {
         });
     }
     let raw = String::from_utf8_lossy(&out.stdout);
-    let batch = parse_poll_events_batch(raw.trim(), args.after_seq).map_err(map_err)?;
+    let batch = parse_poll_events_batch(raw.trim(), args.after_seq)?;
     // is1.4: log the batch INSIDE the leaf so the entries are checkpointed
     // with the result — a body-level log re-fires on every crash-resume
     // replay and duplicates JSONL entries (the event log feeds analytics).
@@ -3362,8 +3355,8 @@ pub fn escalation_tier(
 /// effect). The context_limit path passes `--force`: an idle-but-exhausted
 /// agent is healthy and MUST still be respawned — its replay window is
 /// documented at `__respawn` (main.rs).
-async fn respawn_agent(args: RespawnArgs) -> Result<()> {
-    let exe = self_exe().map_err(map_err)?;
+async fn respawn_agent(args: RespawnArgs) -> anyhow::Result<()> {
+    let exe = self_exe()?;
     let mut cmd = Command::new(&exe);
     cmd.args(["__respawn", &args.project, &args.name, &args.kind]);
     if args.reason == "context_limit" {
@@ -3371,10 +3364,10 @@ async fn respawn_agent(args: RespawnArgs) -> Result<()> {
     }
     let out = run_leaf_cmd(cmd, "__respawn").await?;
     if !out.status.success() {
-        return Err(map_err(anyhow::anyhow!(
+        return Err(anyhow::anyhow!(
             "__respawn failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
-        )));
+        ));
     }
     // a requeued prompt's delivery record dies with the respawned agent —
     // invalidate it so the fresh agent gets the prompt (resume-dedup)
@@ -3423,7 +3416,7 @@ pub struct SendOutcome {
 /// Send one prompt via the flywheel binary. Checkpointed side effect.
 /// With confirm, returns the parsed landing verdict; the legacy path returns
 /// an outcome with `landed: None`.
-async fn send_prompt(args: SendArgs) -> Result<SendOutcome> {
+async fn send_prompt(args: SendArgs) -> anyhow::Result<SendOutcome> {
     // build-plan §5: with the comms inbox on, the leaf IS the mail.append
     // effect, in process (no `__send` subprocess, no typing, no resend).
     // The task id is derived from (invocation, iteration, name, text), so a
@@ -3446,25 +3439,25 @@ async fn send_prompt(args: SendArgs) -> Result<SendOutcome> {
             crate::comms_send::loop_send(&cfg, &a.project, &a.name, &a.text, &task_id)
         })
         .await
-        .map_err(map_err)?;
+        ?;
         return serde_json::from_value::<SendOutcome>(out)
-            .map_err(|e| map_err(anyhow::anyhow!("inbox send outcome: {e}")));
+            .map_err(|e| anyhow::anyhow!("inbox send outcome: {e}"));
     }
-    let exe = self_exe().map_err(map_err)?;
+    let exe = self_exe()?;
     let mut cmd = Command::new(&exe);
     cmd.args(send_prompt_argv(&args));
     let confirm_bound = std::time::Duration::from_millis(args.confirm_timeout_ms.unwrap_or(45_000))
         + LEAF_WATCHDOG_GRACE;
     let out = run_leaf_cmd_bounded(cmd, "__send", confirm_bound).await?;
     if !out.status.success() {
-        return Err(map_err(anyhow::anyhow!(
+        return Err(anyhow::anyhow!(
             "__send failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
-        )));
+        ));
     }
     let raw = String::from_utf8_lossy(&out.stdout);
     let outcome: SendOutcome = serde_json::from_str(raw.trim())
-        .map_err(|e| map_err(anyhow::anyhow!("__send bad JSON: {e}: {raw}")))?;
+        .map_err(|e| anyhow::anyhow!("__send bad JSON: {e}: {raw}"))?;
     let _ = crate::state::log_event(
         &args.project,
         crate::state::EventKind::Send,
@@ -3657,7 +3650,7 @@ async fn blocked_ack_gate(args: &NotifyArgs) -> bool {
 /// first_blocked_ts → same tier, and the `last_ping_tier` marker (cg6.3)
 /// suppresses the duplicate mail: at most one ping per logical tier
 /// transition.
-async fn notify_blocked(args: NotifyArgs) -> Result<EscalationOutcome> {
+async fn notify_blocked(args: NotifyArgs) -> anyhow::Result<EscalationOutcome> {
     // ADR-0001 A6: the ladder is gated on the observed ack, read off toron's
     // per-recipient read state (not inferred from elapsed time). The read
     // happens BEFORE the step so an acked agent is never pinged again.
@@ -3671,9 +3664,9 @@ async fn notify_blocked(args: NotifyArgs) -> Result<EscalationOutcome> {
         gate_acked,
         args.now_us,
     )
-    .map_err(map_err)?;
+    ?;
     if should_mail {
-        let exe = self_exe().map_err(map_err)?;
+        let exe = self_exe()?;
         let mut cmd = Command::new(&exe);
         cmd.args([
             "__mail-blocked",
@@ -3684,10 +3677,10 @@ async fn notify_blocked(args: NotifyArgs) -> Result<EscalationOutcome> {
         ]);
         let out = run_leaf_cmd(cmd, "__mail-blocked").await?;
         if !out.status.success() {
-            return Err(map_err(anyhow::anyhow!(
+            return Err(anyhow::anyhow!(
                 "__mail-blocked failed: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
-            )));
+            ));
         }
         if tier == 3 {
             // is1.4: the T3 halt event is logged HERE (checkpointed with the
@@ -3828,15 +3821,15 @@ pub(crate) fn settle_dispatch_guard_output(
 /// Delegates to the `__xproj-spawn` leaf which calls `cmd_spawn` + replies
 /// in-thread. Soft-fail: spawn errors are surfaced in-thread by the leaf, the
 /// loop continues.
-async fn spawn_xproj(args: XprojSpawnArgs) -> Result<()> {
+async fn spawn_xproj(args: XprojSpawnArgs) -> anyhow::Result<()> {
     // cg6.3: at-most-once per request — mark BEFORE spawning so a crash-
     // window replay no-ops instead of spawning two swarms for one [xproj]
     // message (the loop's body-side seen_xproj set is re-seeded on replay).
-    if crate::state::xproj_seen_contains(&args.project, &args.message_id).map_err(map_err)? {
+    if crate::state::xproj_seen_contains(&args.project, &args.message_id)? {
         return Ok(());
     }
-    crate::state::xproj_seen_mark(&args.project, &args.message_id).map_err(map_err)?;
-    let exe = self_exe().map_err(map_err)?;
+    crate::state::xproj_seen_mark(&args.project, &args.message_id)?;
+    let exe = self_exe()?;
     let mut cmd = Command::new(&exe);
     cmd.args([
         "__xproj-spawn",
@@ -3853,10 +3846,10 @@ async fn spawn_xproj(args: XprojSpawnArgs) -> Result<()> {
         // marker file is the replay-dedup for SUCCESSFUL spawns only;
         // leaving it would drop the request forever.
         let _ = crate::state::xproj_seen_unmark(&args.project, &args.message_id);
-        return Err(map_err(anyhow::anyhow!(
+        return Err(anyhow::anyhow!(
             "__xproj-spawn failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
-        )));
+        ));
     }
     // is1.4: the spawn event is logged HERE (checkpointed with the leaf) —
     // the body-side log duplicated on crash-resume replay.
@@ -3875,8 +3868,8 @@ async fn spawn_xproj(args: XprojSpawnArgs) -> Result<()> {
 
 /// Diagnose an unresponsive agent: capture recent output + high-importance
 /// health mail (bd-event-self-heal). Soft-fail: never kill the loop.
-async fn diagnose_agent(args: DiagnoseArgs) -> Result<Value> {
-    let exe = self_exe().map_err(map_err)?;
+async fn diagnose_agent(args: DiagnoseArgs) -> anyhow::Result<Value> {
+    let exe = self_exe()?;
     let mut cmd = Command::new(&exe);
     cmd.args([
         "__diagnose",
@@ -3943,7 +3936,7 @@ fn renew_filtered_sync(
     Ok(json!({ "renewed": v.renewed, "paths": paths }))
 }
 
-async fn renew_filtered_leases(args: RenewFilteredArgs) -> Result<Value> {
+async fn renew_filtered_leases(args: RenewFilteredArgs) -> anyhow::Result<Value> {
     if args.paths.is_empty() {
         return Ok(json!({ "renewed": 0, "paths": [] }));
     }
@@ -3962,7 +3955,7 @@ async fn renew_filtered_leases(args: RenewFilteredArgs) -> Result<Value> {
         renew_filtered_sync(&project, &paths, extend_seconds)
     })
     .await
-    .map_err(map_err)
+    
 }
 
 /// Lease TTL policy for loop-made reservations: an initial TTL of
@@ -5814,8 +5807,8 @@ pub struct ReclaimBeadArgs {
     pub terminal_name: String,
     pub reason: String,
 }
-async fn reclaim_bead(args: ReclaimBeadArgs) -> Result<Value> {
-    let exe = self_exe().map_err(map_err)?;
+async fn reclaim_bead(args: ReclaimBeadArgs) -> anyhow::Result<Value> {
+    let exe = self_exe()?;
     let mut cmd = Command::new(&exe);
     cmd.args(["__release-bead-locks", &args.project, &args.bead_id]);
     let rel_out = run_leaf_cmd(cmd, "__release-bead-locks").await;
@@ -5876,7 +5869,7 @@ async fn reclaim_bead(args: ReclaimBeadArgs) -> Result<Value> {
         let mut c = cmd;
         let res = tokio::task::spawn_blocking(move || c.output())
             .await
-            .map_err(|e| map_err(anyhow::anyhow!("br comment task join failed: {e}")))?;
+            .map_err(|e| anyhow::anyhow!("br comment task join failed: {e}"))?;
         match res {
             Ok(o) if o.status.success() => true,
             Ok(o) => {
@@ -5910,7 +5903,7 @@ async fn reclaim_bead(args: ReclaimBeadArgs) -> Result<Value> {
         let mut c = cmd;
         let res = tokio::task::spawn_blocking(move || c.output())
             .await
-            .map_err(|e| map_err(anyhow::anyhow!("br open task join failed: {e}")))?;
+            .map_err(|e| anyhow::anyhow!("br open task join failed: {e}"))?;
         match res {
             Ok(o) if o.status.success() => true,
             Ok(o) => {
@@ -6240,7 +6233,7 @@ pub fn spawn_graph_vehicle(
 async fn swarm_loop(
     authority: crate::authority::RuntimeAuthority,
     params: LoopParams,
-) -> Result<String> {
+) -> anyhow::Result<String> {
     // bd-0fvb: host edge resolves authority once and passes it in; plain async, no replay.
     // bd-bpd9: beads whose graph vehicle was already spawned this process.
     let mut graph_invoked: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -6249,11 +6242,11 @@ async fn swarm_loop(
         let cfg = crate::config::Config::load().unwrap_or_default();
         let check = crate::preflight::check_loop_identity(&cfg, Some(&params.project));
         if let crate::preflight::Status::Fail(msg) = check.status {
-            return Err(map_err(anyhow::anyhow!(
+            return Err(anyhow::anyhow!(
                 "loop identity for '{}' has no local key — {} (ADR-0026 Spec 4; fix: flywheel mail register --name <pin> --from-project <project> or --adopt-unnamed <name>)",
                 params.project,
                 msg
-            )));
+            ));
         }
     }
     let mut queue = params.queue.clone();
@@ -6285,10 +6278,10 @@ async fn swarm_loop(
         }
         Ok(None) => {}
         Err(e) => {
-            return Err(map_err(anyhow::anyhow!(
+            return Err(anyhow::anyhow!(
                 "swarm_loop ActiveLoop seed failed for '{}': {e:#} (refusing silent empty resume)",
                 params.project
-            )));
+            ));
         }
     }
     // pane_exited names observed this iteration (event path feeds heal step)
@@ -6405,10 +6398,10 @@ async fn swarm_loop(
         if let Some(max) = params.max_iterations
             && iteration > max
         {
-            return Err(map_err(anyhow::anyhow!(
+            return Err(anyhow::anyhow!(
                 "loop timed out after {max} polls (queue remaining: {})",
                 queue.len()
-            )));
+            ));
         }
 
         // ---- event wake (latency optimization, forward-only) ----
@@ -7432,7 +7425,7 @@ async fn swarm_loop(
                                                     )
                                                 },
                                             )
-                                            .map_err(map_err)?;
+                                            ?;
                                             lr_band = settled
                                                 .get("band")
                                                 .and_then(Value::as_str)
@@ -8145,7 +8138,7 @@ async fn swarm_loop(
                 // run it best-effort through the __pin-stamp leaf (the
                 // orchestrator fills pin; failure never blocks dispatch).
                 LoopAction::PinStamp { bead_id, pin } => {
-                    let exe = self_exe().map_err(map_err)?;
+                    let exe = self_exe()?;
                     let mut cmd = Command::new(&exe);
                     cmd.args(["__pin-stamp", &params.project, bead_id, pin]);
                     match run_leaf_cmd_bounded(cmd, "__pin-stamp", LEAF_WATCHDOG_GRACE).await {
@@ -8287,10 +8280,10 @@ async fn swarm_loop(
                             }
                         }
                         Escalation::FailStop => {
-                            return Err(map_err(anyhow::anyhow!(
+                            return Err(anyhow::anyhow!(
                                 "{}",
                                 failstop_message(name, outcome.reason.as_deref())
-                            )));
+                            ));
                         }
                         Escalation::Cancelled => {
                             eprintln!(
@@ -8471,10 +8464,10 @@ async fn swarm_loop(
                                 );
                             }
                             Escalation::FailStop => {
-                                return Err(map_err(anyhow::anyhow!(
+                                return Err(anyhow::anyhow!(
                                     "{}",
                                     failstop_message(name, outcome.reason.as_deref())
-                                )));
+                                ));
                             }
                             Escalation::RespawnAndRequeue => {
                                 let attempts = send_failures.get(name).copied().unwrap_or(0);
@@ -8741,9 +8734,9 @@ async fn swarm_loop(
                         wait_secs = params.active_interval_secs.clamp(5, 30);
                     }
                     BlindCompletion::Abort => {
-                        return Err(map_err(anyhow::anyhow!(
+                        return Err(anyhow::anyhow!(
                             "loop abort: {blind_complete_failures} consecutive critical-leaf failures while the world looked empty (poll_events/poll_swarm/poll_ready/poll_inprogress/expected-replies) — the loop cannot see the tracker or the swarm. Fix: `flywheel loop-mode doctor --fix` (diagnose loop infrastructure), then re-run."
-                        )));
+                        ));
                     }
                 }
             } else {
@@ -13079,14 +13072,14 @@ mod tests {
     /// violations in a function bd-0fvb had already proven clean.
     #[test]
     fn bd_lf1u_leaf_scanner_actually_walks_bodies() {
-        let clean = "#[function]\nasync fn a_leaf(args: A) -> Result<Value> { Ok(json!(1)) }\n";
+        let clean = "#[function]\nasync fn a_leaf(args: A) -> anyhow::Result<Value> { Ok(json!(1)) }\n";
         assert_eq!(
             ambient_clock_reads_in_durable_leaves(clean),
             Vec::<String>::new()
         );
 
         // Attributes between `#[function]` and the signature must not hide it.
-        let planted = "#[function]\n#[allow(clippy::too_many_arguments)]\nasync fn b_leaf(args: A) -> Result<Value> {\n    let at = chrono::Utc::now();\n    Ok(json!(at))\n}\n";
+        let planted = "#[function]\n#[allow(clippy::too_many_arguments)]\nasync fn b_leaf(args: A) -> anyhow::Result<Value> {\n    let at = chrono::Utc::now();\n    Ok(json!(at))\n}\n";
         assert_eq!(
             ambient_clock_reads_in_durable_leaves(planted),
             vec!["b_leaf: chrono::Utc::now".to_string()],
@@ -13099,7 +13092,7 @@ mod tests {
             ("Instant::now", "monotonic"),
         ] {
             let src = format!(
-                "#[function]\nasync fn c_leaf(args: A) -> Result<Value> {{\n    let _ = {needle}();\n    Ok(json!(0))\n}}\n"
+                "#[function]\nasync fn c_leaf(args: A) -> anyhow::Result<Value> {{\n    let _ = {needle}();\n    Ok(json!(0))\n}}\n"
             );
             assert_eq!(
                 ambient_clock_reads_in_durable_leaves(&src),
@@ -13114,13 +13107,13 @@ mod tests {
         // must be scanned as its own body, not swallowed as a continuation.
         let tricky = concat!(
             "#[function]\n",
-            "async fn d_leaf(args: A) -> Result<Value> {\n",
+            "async fn d_leaf(args: A) -> anyhow::Result<Value> {\n",
             "    let msg = format!(\"{} {}\", args.a, args.b);\n",
             "    let raw = r#\"{\"ok\": true}\"#;\n",
             "    Ok(json!(msg))\n",
             "}\n",
             "#[function]\n",
-            "async fn e_leaf(args: A) -> Result<Value> { Ok(json!(1)) }\n",
+            "async fn e_leaf(args: A) -> anyhow::Result<Value> { Ok(json!(1)) }\n",
         );
         assert_eq!(
             ambient_clock_reads_in_durable_leaves(tricky),
@@ -13131,7 +13124,7 @@ mod tests {
         // A `#[function]` after a test module is out of scope: the SDK never
         // registers it, and this module's own fixtures carry the attribute as
         // text, which is how the first version scanned itself.
-        let after_tests = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() { let _ = \"#[function]\\nasync fn phantom(a: A) -> Result<Value> {\\n let _ = chrono::Utc::now();\\n\"; }\n}\n";
+        let after_tests = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() { let _ = \"#[function]\\nasync fn phantom(a: A) -> anyhow::Result<Value> {\\n let _ = chrono::Utc::now();\\n\"; }\n}\n";
         assert_eq!(
             ambient_clock_reads_in_durable_leaves(after_tests),
             Vec::<String>::new(),

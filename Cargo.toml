@@ -37,7 +37,6 @@ evalexpr = "13.1.0"
 toml = "0.8"
 regex-lite = "0.1"
 ureq = { version = "2", features = ["json"] }
-resonate-sdk = "0.6.0"
 # In-process toron integration (ADR-0003 Decision 3A, bd-o8j.1): flywheel
 # embeds toron-core's mailbox + toron-mcp's server surface with zero IPC.
 # se2.3: deps re-pointed from the stale toron-head snapshot to the live

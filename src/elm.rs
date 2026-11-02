@@ -8,8 +8,8 @@
 //! `decide` stays pure. Effectful leaves moved here go through the
 //! framework's `Interpret` shape: build a description, run it once at the
 //! edge. The 4-worker pool and 4096 bound live on the framework executor
-//! config, never inside combinators. `resonate-sdk` stays: `durable.rs`
-//! still uses it until a `WorkflowEngine` adapter runs the same loop.
+//! config, never inside combinators. `resonate-sdk` left flywheel with the
+//! substrate port; only toron-workflow's legacy engine still uses it.
 //!
 //! The framework types come from `toron_core::kernel`, the one module that
 //! re-exports the vendored elm-effect crates, so this workspace carries a

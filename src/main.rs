@@ -27839,27 +27839,6 @@ fn cmd_guards(_cfg: &Config) -> Result<()> {
 }
 
 // ---- deps / config / upgrade / tutorial ----
-/// Kept alive until removal step 5 (bd-flywheel-probe-qjay): the swarm
-/// loop still reads the server, so the health read stays even though
-/// doctor/preflight moved to the capability probe.
-#[allow(dead_code)]
-pub(crate) fn resonate_health(cfg: &Config) -> Result<()> {
-    // 127.0.0.1, NOT localhost: localhost resolves ::1-first while the
-    // resonate serve binds IPv4 — a naive probe reports DOWN against a
-    // healthy server (same live failure pane.rs::cli_engine_store_url
-    // documents for the engine seam).
-    let url = cfg
-        .resonate_url()
-        .unwrap_or_else(|| "http://127.0.0.1:8001".to_string());
-    let resp = ureq::get(&format!("{url}/health"))
-        .call()
-        .map_err(|e| anyhow!("resonate server unreachable at {url}: {e}"))?;
-    if !(200..300).contains(&resp.status()) {
-        bail!("resonate server unhealthy at {url}");
-    }
-    Ok(())
-}
-
 pub(crate) fn command_exists(name: &str) -> bool {
     Command::new("sh")
         .args(["-c", &format!("command -v {name} >/dev/null 2>&1")])
