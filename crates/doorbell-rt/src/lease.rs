@@ -22,6 +22,10 @@ pub struct OwnerLease {
     pub host: String,
     pub started_unix: u64,
     pub heartbeat_unix: u64,
+    /// Stable per-process start stamp (unix secs) of the holder.
+    /// Legacy files lack it (0) and read stale immediately.
+    #[serde(default)]
+    pub process_start_unix: u64,
     /// What the holder does with the workspace. `None` = a ringing writer
     /// (the legacy lease and the embedded host). [`KIND_NO_TEXT`] = a daemon
     /// host under the comms flag: it holds the workspace's journal and
@@ -60,19 +64,102 @@ pub fn unix_now() -> u64 {
 }
 
 pub fn boot_id() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+    if let Some(id) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .map(|s| s.trim().to_string())
         .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("unknown-{}", host_name()))
+    {
+        return id;
+    }
+    if let Some(id) = macos_boot_id() {
+        return id;
+    }
+    if let Some(btime) = linux_btime() {
+        return format!("boot-{btime}");
+    }
+    format!("unknown-{}", host_name())
+}
+
+fn macos_boot_id() -> Option<String> {
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", "kern.boottime"])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    let sec = s.split("sec = ").nth(1)?.split(',').next()?.trim();
+    let sec: u64 = sec.parse().ok()?;
+    Some(format!("boot-{sec}"))
+}
+
+fn linux_btime() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    for line in stat.lines() {
+        if let Some(rest) = line.strip_prefix("btime ") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
 }
 
 pub fn host_name() -> String {
-    std::fs::read_to_string("/etc/hostname")
+    if let Some(h) = std::fs::read_to_string("/etc/hostname")
         .map(|s| s.trim().to_string())
         .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".into())
+    {
+        return h;
+    }
+    if let Some(h) = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return h;
+    }
+    "localhost".into()
+}
+
+/// Stable start stamp (unix secs) for `pid`, or `None` when the platform
+/// cannot answer. Linux reads `/proc`; macOS parses `ps -o lstart=`.
+pub fn process_start_unix(pid: u32) -> Option<u64> {
+    if pid <= 1 {
+        return None;
+    }
+    if let Some(t) = linux_process_start(pid) {
+        return Some(t);
+    }
+    macos_process_start(pid)
+}
+
+fn linux_process_start(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after = stat.rsplit_once(')')?.1;
+    let fields: Vec<&str> = after.split_whitespace().collect();
+    let starttime: u64 = fields.get(19)?.parse().ok()?;
+    let btime = linux_btime()?;
+    // SAFETY: sysconf with _SC_CLK_TCK only reads a system constant.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+    Some(btime + starttime / ticks)
+}
+
+fn macos_process_start(pid: u32) -> Option<u64> {
+    let out = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        return None;
+    }
+    chrono::NaiveDateTime::parse_from_str(&s, "%a %b %e %H:%M:%S %Y")
+        .ok()
+        .and_then(|naive| naive.and_local_timezone(chrono::Local).single())
+        .map(|dt| dt.timestamp() as u64)
 }
 
 pub fn pid_alive(pid: u32) -> bool {
@@ -121,13 +208,49 @@ pub fn live_leases(state_dir: &Path, now_unix: u64) -> Vec<(String, OwnerLease)>
     out
 }
 
-/// Stale = pid dead OR heartbeat older than 90s (either suffices; a live
-/// pid with a stuck heartbeat is a wedged writer, not an owner).
-pub fn lease_stale(lease: &OwnerLease, now_unix: u64) -> bool {
-    if !pid_alive(lease.pid) {
+/// Injected observations for the pure staleness predicate: no clock, no
+/// spawn, no ambient reads inside the fold.
+pub struct LeaseInputs<'a> {
+    pub current_boot: &'a str,
+    pub pid_alive: bool,
+    pub pid_start: Option<u64>,
+}
+
+/// Pure staleness: different boot or mismatched start is stale now; a live
+/// pid on the same boot still needs a fresh heartbeat.
+pub fn lease_stale_pure(lease: &OwnerLease, now_unix: u64, inputs: &LeaseInputs) -> bool {
+    if lease.boot_id != inputs.current_boot {
+        return true;
+    }
+    if lease.process_start_unix == 0 {
+        return true;
+    }
+    if !inputs.pid_alive {
+        return true;
+    }
+    if let Some(start) = inputs.pid_start
+        && start != lease.process_start_unix
+    {
         return true;
     }
     now_unix.saturating_sub(lease.heartbeat_unix) > LEASE_STALE_SECS
+}
+
+/// Stale = different boot OR pid dead OR start mismatch OR heartbeat older
+/// than 90s. Edge: injects clock, boot, pid liveness, and start stamp.
+pub fn lease_stale(lease: &OwnerLease, now_unix: u64) -> bool {
+    let current_boot = boot_id();
+    let alive = pid_alive(lease.pid);
+    let start = process_start_unix(lease.pid);
+    lease_stale_pure(
+        lease,
+        now_unix,
+        &LeaseInputs {
+            current_boot: &current_boot,
+            pid_alive: alive,
+            pid_start: start,
+        },
+    )
 }
 
 /// Writer side: claim the lease (fails when a live lease holds it) and
@@ -159,6 +282,7 @@ pub fn acquire_lease_kind(
         host: host_name(),
         started_unix: now_unix,
         heartbeat_unix: now_unix,
+        process_start_unix: process_start_unix(std::process::id()).unwrap_or(now_unix),
         kind: kind.map(str::to_string),
     };
     write_lease(state_dir, workspace, &lease)?;
@@ -178,7 +302,12 @@ pub fn refresh_lease(
 pub fn release_lease(state_dir: &Path, workspace: &str, lease: &OwnerLease) {
     // Only release our own claim (pid + boot match); never drop a stranger.
     match read_lease(state_dir, workspace) {
-        Some(cur) if cur.pid == lease.pid && cur.boot_id == lease.boot_id => {
+        Some(cur)
+            if cur.pid == lease.pid
+                && cur.boot_id == lease.boot_id
+                && (cur.process_start_unix == 0
+                    || lease.process_start_unix == 0
+                    || cur.process_start_unix == lease.process_start_unix) => {
             let _ = std::fs::remove_file(owner_file(state_dir, workspace));
         }
         _ => {}
@@ -315,6 +444,8 @@ mod tests {
             host: host_name(),
             started_unix: now,
             heartbeat_unix: now,
+            process_start_unix: process_start_unix(std::process::id())
+                .unwrap_or(now),
             kind: None,
         };
         assert_eq!(
@@ -331,5 +462,60 @@ mod tests {
         };
         // Live pid but stuck heartbeat still counts stale (wedged writer).
         assert!(lease_stale(&stale, now));
+    }
+
+    /// bd-lease-boot-identity-tm6cg: dead pid is stale; a reused pid with a
+    /// different start stamp is stale now; a live holder with a fresh
+    /// heartbeat stays. Pure predicate over injected inputs, no sleep.
+    #[test]
+    fn boot_and_start_identity_decide_staleness() {
+        let now = unix_now();
+        let boot = boot_id();
+        let me = std::process::id();
+        let my_start = process_start_unix(me).unwrap_or(now);
+        let live = OwnerLease {
+            pid: me,
+            boot_id: boot.clone(),
+            host: host_name(),
+            started_unix: now,
+            heartbeat_unix: now,
+            process_start_unix: my_start,
+            kind: None,
+        };
+        let live_inputs = LeaseInputs {
+            current_boot: &boot,
+            pid_alive: true,
+            pid_start: Some(my_start),
+        };
+        assert!(!lease_stale_pure(&live, now, &live_inputs));
+        // Dead pid is stale even with a fresh heartbeat.
+        let dead_inputs = LeaseInputs {
+            current_boot: &boot,
+            pid_alive: false,
+            pid_start: None,
+        };
+        assert!(lease_stale_pure(&live, now, &dead_inputs));
+        // Reused pid with a different start stamp is stale now.
+        let reused_inputs = LeaseInputs {
+            current_boot: &boot,
+            pid_alive: true,
+            pid_start: Some(my_start.wrapping_add(3600)),
+        };
+        assert!(lease_stale_pure(&live, now, &reused_inputs));
+        // A different boot is stale now, even when everything else matches.
+        let other_inputs = LeaseInputs {
+            current_boot: "boot-0",
+            pid_alive: true,
+            pid_start: Some(my_start),
+        };
+        assert!(lease_stale_pure(&live, now, &other_inputs));
+        // Legacy file without a start stamp reads stale immediately.
+        let legacy = OwnerLease {
+            process_start_unix: 0,
+            ..live.clone()
+        };
+        assert!(lease_stale_pure(&legacy, now, &live_inputs));
+        // The edge wrapper agrees for the live holder.
+        assert!(!lease_stale(&live, now));
     }
 }

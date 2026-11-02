@@ -4117,10 +4117,14 @@ mod tests {
         let now = doorbell_rt::lease::unix_now();
         let lease = OwnerLease {
             pid: std::process::id(),
-            boot_id: "audit".into(),
+            boot_id: doorbell_rt::lease::boot_id(),
             host: "audit".into(),
             started_unix: now,
             heartbeat_unix: now,
+            process_start_unix: doorbell_rt::lease::process_start_unix(
+                std::process::id(),
+            )
+            .unwrap_or(now),
             kind: None,
         };
         std::fs::write(

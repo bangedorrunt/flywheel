@@ -2542,13 +2542,16 @@ mod prune_tests {
             .as_secs();
         const OLD: u64 = 30 * 24 * 60 * 60;
         let me = std::process::id();
+        let boot = crate::lease::boot_id();
+        let my_start = crate::lease::process_start_unix(me).unwrap_or(now);
         let lease = |pid: u32, heartbeat: u64| {
             serde_json::json!({
                 "pid": pid,
-                "boot_id": "test",
+                "boot_id": boot,
                 "host": "test",
                 "started_unix": heartbeat,
                 "heartbeat_unix": heartbeat,
+                "process_start_unix": my_start,
             })
             .to_string()
         };

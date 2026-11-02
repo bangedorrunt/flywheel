@@ -5246,12 +5246,15 @@ mod tests {
         let ws = supervise_lease_workspace("proj", Some("plane"));
         let path = doorbell_rt::lease::owner_file(&crate::config::state_dir(), &ws);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let now = doorbell_rt::lease::unix_now();
         let lease = doorbell_rt::lease::OwnerLease {
             pid: sleeper.id(),
-            boot_id: "test".into(),
+            boot_id: doorbell_rt::lease::boot_id(),
             host: "test".into(),
-            started_unix: 1,
-            heartbeat_unix: 1,
+            started_unix: now,
+            heartbeat_unix: now,
+            process_start_unix: doorbell_rt::lease::process_start_unix(sleeper.id())
+                .unwrap_or(now),
             kind: None,
         };
         std::fs::write(&path, serde_json::to_string(&lease).unwrap()).unwrap();
