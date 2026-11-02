@@ -1751,7 +1751,11 @@ async fn drive_cron_linear(
         let mut follow: Vec<RunEffect> = Vec::new();
         for effect in std::mem::take(&mut effects) {
             match effect {
-                RunEffect::ExecuteStep { index, step } => {
+                RunEffect::ExecuteStep {
+                    index,
+                    step,
+                    iteration,
+                } => {
                     let value = run_linear_step(
                         LinearStep {
                             run_id,
@@ -1761,6 +1765,7 @@ async fn drive_cron_linear(
                             index,
                             trigger: &trigger,
                             outputs: &mut outputs,
+                            iteration,
                         },
                         seams,
                     )
