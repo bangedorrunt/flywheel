@@ -37,8 +37,13 @@ fn age(path: &Path, secs: u64, now: u64) {
 }
 
 fn lease(pid: u32, heartbeat: u64) -> String {
+    // The staleness predicate is boot + start-stamp keyed since
+    // bd-lease-boot-identity-tm6cg: a fixture with boot_id="test" would read
+    // stale on every host and turn "live lease protects its logs" into a lie.
+    let boot = doorbell_rt::lease::boot_id();
+    let start = doorbell_rt::lease::process_start_unix(pid).unwrap_or(heartbeat);
     format!(
-        r#"{{"pid":{pid},"boot_id":"test","host":"test","started_unix":{heartbeat},"heartbeat_unix":{heartbeat}}}"#
+        r#"{{"pid":{pid},"boot_id":"{boot}","host":"test","started_unix":{heartbeat},"heartbeat_unix":{heartbeat},"process_start_unix":{start}}}"#
     )
 }
 
