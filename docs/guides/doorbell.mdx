@@ -25,6 +25,7 @@ See [Functional effect kernel](./effect-kernel) for the reducer/interpreter laws
 
 - Wake stamps (`last_wake`) come only from real observations: plane status or delivered prompt pins. Planned injects never forge them.
 - A pane wake is a **mail** event (`kind 9/14` on the wake bus) carried by the flywheel inbox host. `doorbell inject` journals a Fact for the digest only: the core reducer answers every `Fact` with `fact_miss`, so an inject never rings a pane on either plane.
+- **Who hosts under the comms flag.** `doorbell serve` stays standby: it holds no workspace and types nothing (`mode: standby`, `hosted: []` is healthy, not degraded). Each workspace is hosted by its own `flywheel __doorbell` loop, which owns the workspace lease and runs the brain + bus watch that types the pane. A daemon that armed hosts under comms took the lease as `no-text`, the local loop deferred to it as an inbox-only pane writer, and the workspace went deaf to ordinary `toron mail send` — this is why the daemon refuses to host while comms is on.
 - One live workspace model per workspace; sends are doorbell-with-inbox; waiters park on `WaitCorr` until a receipt drains them (on ndjson and sweep).
 - Budgets 5/30/3 are dispatcher-enforced.
 - After `[doorbell]`, publish presence `working` or post one kind-9 line within 120 seconds, or the pin is `unanswered`.
