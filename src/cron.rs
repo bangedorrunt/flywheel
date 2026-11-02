@@ -1274,32 +1274,10 @@ fn refusal_reason(workflow: &Workflow, has_store: bool) -> Option<String> {
                 .to_string(),
         );
     }
-    // bd-durable-call-workflow-mg6y: child runs need a workflow resolver this
-    // path does not carry yet, so a call body stays legacy instead of failing
-    // at open.
-    if body_has_call_workflow(workflow) {
-        return Some(
-            "call_workflow needs a child-run resolver; a cron body has none yet, so it stays on the legacy driver"
-                .to_string(),
-        );
-    }
     if let Err(reason) = toron_mcp::workflow_host::durable_route(workflow, has_store, false) {
         return Some(reason);
     }
     None
-}
-
-/// Any `call_workflow` step or graph node (bd-durable-call-workflow-mg6y).
-fn body_has_call_workflow(workflow: &Workflow) -> bool {
-    workflow
-        .steps
-        .iter()
-        .any(|s| matches!(s.action, Action::CallWorkflow { .. }))
-        || workflow.graph.as_ref().is_some_and(|g| {
-            g.nodes
-                .values()
-                .any(|n| matches!(n.action, Action::CallWorkflow { .. }))
-        })
 }
 
 /// Any `spawn` step or graph node: the cron path owns no pane launcher, so
@@ -1505,10 +1483,12 @@ async fn drive_cron_body(
             verify_sink: crate::durable_body::real_verify_sink(),
             journal_mode: EffectJournalMode::Enforced,
         },
-        // The cron partition refuses spawn and call_workflow bodies: neither a
-        // pane launcher nor a child resolver exists on this door.
+        // The cron partition refuses spawn bodies (no pane launcher on this
+        // door); call_workflow children resolve through the shared catalog.
         launcher: None,
-        resolve_child: None,
+        resolve_child: Some(std::sync::Arc::new(
+            crate::workflow_catalog::subworkflow_resolver(None),
+        )),
     };
     match crate::durable_body::drive(store, &fire.key, &body.workflow, trigger, &seams).await {
         crate::durable_body::BodyOutcome::Completed(output) => CronBodyOutcome::Completed(output),
@@ -1533,7 +1513,21 @@ async fn settle_cron_fire(
     match outcome {
         CronBodyOutcome::Completed(output) => {
             consecutive.lock().await.remove(&body.display);
-            if body.workflow.name == "weekly-review" {
+            // The cron history reads Workflow events by the cron NAME; log the
+            // completion under the name the operator types, not the tick
+            // wrapper's `-tick` workflow name.
+            crate::log(
+                project.unwrap_or("flywheel"),
+                crate::state::EventKind::Workflow,
+                serde_json::json!({
+                    "workflow": body.display,
+                    "cron": body.display,
+                    "status": "completed",
+                    "run_id": fire.key,
+                    "live": true,
+                }),
+            );
+            if body.display == "weekly-review" {
                 if let Some(idea) = review_idea_from_output(&output) {
                     match spawn_review_bead(&output, tick) {
                         Ok(Some(id)) => eprintln!(
@@ -1574,7 +1568,7 @@ async fn settle_cron_fire(
             };
             let bundle = toron_workflow::cron_failure::FailureBundle {
                 run_id: fire.key.clone(),
-                workflow: body.workflow.name.clone(),
+                workflow: body.display.clone(),
                 owner: body.owner.clone(),
                 error,
                 failed_step,
@@ -2860,13 +2854,17 @@ owner = "housekeeper"
         };
         let reason = refusal_reason(&approval, true).expect("approval refuses");
         assert!(reason.contains("resolution loop"), "{reason}");
+        // A call_workflow body is ADMITTED: the host supplies the shared
+        // catalog resolver (a cron may call a catalog workflow).
         let mut call = linear.clone();
         call.steps[0].action = Action::CallWorkflow {
             workflow: "child".into(),
             inputs: serde_json::json!({}),
         };
-        let reason = refusal_reason(&call, true).expect("call refuses");
-        assert!(reason.contains("child-run resolver"), "{reason}");
+        assert!(
+            refusal_reason(&call, true).is_none(),
+            "call_workflow is durable when the host has a child resolver"
+        );
         let mut graph = linear.clone();
         graph.steps.clear();
         graph.graph = Some(toron_workflow::schema::Graph {

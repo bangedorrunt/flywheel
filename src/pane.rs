@@ -3310,6 +3310,19 @@ fn local_engine_with_journal(
             mode,
             async_run_journal,
         )?;
+    // The engine ships a missing verify sink; flywheel bodies mean what they
+    // say, so install the shell sink (a compose path may override it with its
+    // receipt-writing sink afterwards).
+    *engine
+        .verify_sink()
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        crate::durable_body::real_verify_sink()
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
     // A journaled engine PERSISTS through the same sqlite the effect journal
     // uses; without it the run would be in-memory and a crash would lose the
     // park. The dry arms (Recording) stay in-memory by contract.
