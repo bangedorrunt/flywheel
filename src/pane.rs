@@ -5565,7 +5565,7 @@ steps:
         let rt = tokio::runtime::Runtime::new().expect("rt");
         assert!(
             local_engine(&rt, runner, profile, workflow).is_ok(),
-            "Resonate::local must succeed after Runtime::enter"
+            "the local engine must succeed after Runtime::enter"
         );
     }
 

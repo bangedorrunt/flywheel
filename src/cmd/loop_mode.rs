@@ -42,7 +42,7 @@ pub(crate) enum LoopCmd {
         /// agents to manage (default all)
         #[arg(long, default_value = "all")]
         to: String,
-        /// run the sync polling loop instead of the durable Resonate workflow
+        /// run the sync polling loop instead of the durable engine-backed workflow
         #[arg(long)]
         local: bool,
         /// bead-driven mode: source work from `br ready` each poll instead of
@@ -122,16 +122,16 @@ pub(crate) enum LoopCmd {
         #[arg(long)]
         context: Option<String>,
     },
-    /// Query the state of a durable loop invocation on the Resonate server
+    /// Query the state of a durable loop invocation from local state
     Status { project: String },
     /// List registered loop processes (pid registry) with live/dead status
     List,
     /// Remove pid-registry entries whose process is dead (stale cleanup)
     Prune,
-    /// Infrastructure diagnostics + repair (bd-eign.4): Resonate connectivity,
-    /// stale pending loop invocations, orphaned loop PIDs, loops.json
-    /// consistency. Human report by default, --json for machine. --fix rejects
-    /// stale invocations + prunes orphaned pid entries.
+    /// Infrastructure diagnostics + repair (bd-eign.4): engine-store capability,
+    /// stale loop rows, orphaned loop PIDs, loops.json consistency. Human
+    /// report by default, --json for machine. --fix drops stale rows + prunes
+    /// orphaned pid entries.
     Doctor {
         /// auto-repair: reject stale invocations, prune orphaned pids
         #[arg(long)]

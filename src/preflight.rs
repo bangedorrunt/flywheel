@@ -190,9 +190,9 @@ pub fn run(cfg: &Config, mode: Mode, project: Option<&str>) -> Vec<Check> {
         checks.push(check_pane_plane(cfg));
     }
 
-    // 2. durable engine store answers (park + wake). The Resonate server
-    //    check stood here until bd-flywheel-probe-qjay renamed it; the
-    //    The engine store is local; the capability probe is the check.
+    // 2. durable engine store answers (park + wake). The old vendor health
+    //    check was replaced by the capability probe (bd-flywheel-probe-qjay);
+    //    the store is local sqlite.
     checks.push(check_engine());
 
     // 2b. doorbell daemon (durability ask; supersedes bd-0gmw's advisory

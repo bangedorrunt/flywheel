@@ -1287,7 +1287,7 @@ enum Commands {
     },
     /// Monitor a swarm: poll every N seconds, feed queued instructions to
     /// idle/finished agents, report blockers. Exits 0 when the queue is drained
-    /// and the swarm settles. Runs as a durable Resonate workflow by default —
+    /// and the swarm settles. Runs as a durable engine-backed workflow by default —
     /// crashes resume via `flywheel loop-mode run <project>` (same invocation
     /// id). For back-compat, the bare legacy form `flywheel loop <project>`
     /// (alias) is rewritten to `loop-mode run <project>` before parsing (see
@@ -1695,7 +1695,7 @@ enum Commands {
     },
     /// Preflight: verify all prerequisites for a fleet operation before
     /// dispatching. Catches environment/dependency failures in <1s instead
-    /// of 30s+ into a Resonate cycle. Auto-runs before steer/loop/workflow
+    /// of 30s+ into a durable run. Auto-runs before steer/loop/workflow
     /// unless --skip-preflight is passed.
     Preflight {
         /// operation mode to check: steer|loop|workflow|cron (default loop)
@@ -6114,7 +6114,7 @@ mod steer_engine_tests {
     /// Shared harness: the exact execution shape the Run arm builds for a
     /// pane-mode steer — recording/counting runner, builtin+catalog
     /// workflow resolver, crew fan-out resolution, local engine over
-    /// Resonate::local. No hc terminals needed: dispatch_job side-effects
+    /// the in-house durable kernel. No hc terminals needed: dispatch_job side-effects
     /// are recorded, control flow is real.
     fn steer_engine(
         calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -11692,8 +11692,8 @@ fn doorbell_project_workspaces(project: &str) -> Vec<String> {
         .collect()
 }
 
-/// bd-durable-doorbell-lngf: register the Resonate-primary supervisor —
-/// `heal_tick` + a every-minute schedule on the host server (idempotent by
+/// bd-durable-doorbell-lngf: register the local supervisor —
+/// `heal_tick` + an every-minute schedule on the cron host (idempotent by
 /// name). This process becomes a supervisor WORKER until it exits; the
 /// schedule itself lives server-side, so ticks that land while nothing is
 /// connected stay queued and execute at-least-once later. Server
@@ -25151,7 +25151,7 @@ fn cmd_loop(
     }
     let mut queue_items = build_queue(queue, workflow, Some(project))?;
 
-    // durable mode (default): run the loop as a Resonate workflow so it
+    // durable mode (default): run the loop as a durable engine-backed workflow so it
     // survives crashes and restarts. --local / --once use the sync loop.
     if !local && !once {
         // durable loops have no wall clock; --timeout-ms becomes a poll cap
@@ -31331,7 +31331,7 @@ fn cmd_steer(
 
 /// ADR-0022 W4 testable seam: the exact Run command `flywheel steer`
 /// delegates to — execute=true, pane mode, goal/goal-direct. Durability is
-/// owned downstream by the Run arm (engine.invoke over Resonate::local);
+/// owned downstream by the Run arm (engine.invoke over the in-house engine);
 /// steer only picks the workflow and pre-fills the objective.
 #[allow(clippy::too_many_arguments)] // CLI-flag mirror of Steer args; a struct would duplicate the clap surface
 fn steer_run_cmd(
@@ -32840,7 +32840,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             let profile_resolver = profile::ProfileCatalog::catalog_profile_resolver();
             // bd-omwg: the SpawnSink drainer — pane mode keeps the engine
             // alive across invoke so the drainer thread can launch a real
-            // pane per spawned job and settle await:true promises.
+            // pane per spawned job and settle await:true jobs.
             let mut spawn_receipts: Vec<Value> = vec![];
             let engine = std::sync::Arc::new({
                 // bd-gs005: compose --run attaches the VerifySink exactly like
@@ -33605,9 +33605,9 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
                 };
                 // ADR-0022 §3.4 one-rail: construct through the SAME
                 // store-selection seam as compose/steer (`pane::local_engine`
-                // — RESONATE_URL pin > host-local serve > in-memory), never a
+                // — the local effect store, never a
                 // private in-memory constructor. A live fire is a durable run
-                // when a Resonate store answers.
+                // when the effect store answers.
                 // bd-engine-run-path-journaling-fwlx: cron --live force-fires
                 // the body through the real runner (headless subprocess or
                 // pane `__send`), so its leaves journal.

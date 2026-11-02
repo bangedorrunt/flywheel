@@ -4,7 +4,7 @@
 //! The unit test pins the pure selection rule; this drives the REAL binary so
 //! the wiring is proven too (a helper-only test stays green when the arm is
 //! deleted from the watch loop). A nonexistent project makes `project-dir`
-//! fail deterministically — no hc/resonate/toron store is required, and the
+//! fail deterministically — no hc/toron store is required, and the
 //! arm runs BEFORE the mail setup so no inbox is reached.
 //!
 //! governed-by: bd-captain-watch-preflight-arm-snak

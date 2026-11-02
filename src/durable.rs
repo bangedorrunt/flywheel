@@ -2,13 +2,14 @@
 // governed-by: ADR-0025
 // governed-by: ADR-0026
 // governed-by: ADR-0027
-//! Durable swarm loop — the monitoring orchestrator as a Resonate workflow.
+//! Durable swarm loop — the monitoring orchestrator as plain sequential code
+//! with a local liveness row and an effect journal.
 //!
-//! Design: the loop is sequential happy-path code with
-//! checkpoints. Every `ctx.run` (poll, send) and `ctx.sleep` is a durable save
-//! point — if the flywheel process crashes, the workflow resumes from the last
-//! checkpoint on restart with the same invocation id. The queue and the agent
-//! states are deterministic across replays because every effect is checkpointed.
+//! Design: the loop is direct async code; every leaf is a plain function or a
+//! journaled subprocess call. A process crash leaves the `ActiveLoop` row and
+//! the effect journal behind, and the next start sweeps the dead owner and
+//! starts fresh (or resumes by id with `--resume`). There is no vendor runtime
+//! and no replay VM.
 
 // LoopSnapshot and `tick` are wired: `tick` is the pure reducer folded by
 // every poll, and `LoopSnapshot` is the status projection consumed by
@@ -1541,7 +1542,7 @@ fn reopen_bead_journaled(project: &str, bead_id: &str, sha: &str) -> anyhow::Res
 }
 
 /// Args for the `__poll_events` leaf (bd-event-subscribe-reactor).
-/// Simple identifier params only — Resonate constraint.
+/// Simple identifier params only — the leaf contract's rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PollEventsArgs {
     pub project: String,
@@ -1838,7 +1839,7 @@ fn self_exe() -> anyhow::Result<std::path::PathBuf> {
 /// Run a leaf's blocking child-process wait on tokio's blocking pool
 /// (cg6.8). Every leaf body is `async fn` doing a plain synchronous
 /// `std::process::Command::output()` — a blocking child wait inline on the
-/// workflow task. Resonate SDK 0.6.0 executes leaves INLINE on the workflow
+/// workflow task. The old vendor SDK executed leaves INLINE on the workflow
 /// task (verified in context.rs), so a blocked worker thread is occupied for
 /// the leaf's full duration (up to 300s for `poll_events`). Benign on the
 /// current multi-threaded `Runtime::new()` (a blocked worker is masked by
@@ -3277,7 +3278,7 @@ pub fn idle_pane_rotation(inputs: &IdleRotationInputs<'_>) -> RotationPlan {
 
 /// Escalation tier for a blocked agent (bd-blocked-escalation-protocol, A6).
 ///
-/// Tiered by elapsed time since first_blocked (Resonate `ctx.now()` i64-µs,
+/// Tiered by elapsed time since first_blocked (injected host time i64-µs,
 /// deterministic):
 /// - `T0` (first detection): high + ack_required ping with the agent tail.
 /// - `T1` (+2×interval, still un-acked): reply in-thread, high, fresh tail.
@@ -3482,9 +3483,9 @@ async fn send_prompt(args: SendArgs) -> anyhow::Result<SendOutcome> {
 }
 
 /// Current wall-clock in microseconds since the epoch. Only called INSIDE
-/// leaves (cg6.1): leaf-side effects are checkpointed by Resonate, so a
-/// completed leaf's result is replayed as-is — the body must never read
-/// wall-clock directly (that was the replay-determinism bug).
+/// leaves (cg6.1): leaf-side effects settle through the journal, so a
+/// completed leaf is not re-executed; the body must never read wall-clock
+/// directly (that was the replay-determinism bug).
 #[cfg(test)]
 fn now_us_micros() -> i64 {
     std::time::SystemTime::now()
@@ -3639,12 +3640,11 @@ async fn blocked_ack_gate(args: &NotifyArgs) -> bool {
 /// first_blocked_ts, increments + persists ping_count, then mails. The
 /// workflow body only acts on the returned `EscalationOutcome`.
 ///
-/// At-least-once note (Resonate 0.6.0): a COMPLETED leaf invocation is never
-/// re-executed on replay (result checkpointed). For an IN-FLIGHT leaf at
-/// crash, re-execution derives from the persisted entry — same
-/// first_blocked_ts → same tier, and the `last_ping_tier` marker (cg6.3)
-/// suppresses the duplicate mail: at most one ping per logical tier
-/// transition.
+/// At-least-once note: a COMPLETED leaf is settled in the journal and never
+/// re-executed. An IN-FLIGHT leaf at crash re-executes on the next poll from
+/// the persisted entry — same first_blocked_ts → same tier, and the
+/// `last_ping_tier` marker (cg6.3) suppresses the duplicate mail: at most one
+/// ping per logical tier transition.
 async fn notify_blocked(args: NotifyArgs) -> anyhow::Result<EscalationOutcome> {
     // ADR-0001 A6: the ladder is gated on the observed ack, read off toron's
     // per-recipient read state (not inferred from elapsed time). The read
@@ -5329,7 +5329,7 @@ pub fn reclaim_decision(
 /// and the (also deterministic) action plan.
 ///
 /// Follow-up idea (do NOT build here): a future redesign could wake the loop
-/// on hc status events via a Resonate external promise — event-driven
+/// on hc status events via a durable park/waiter — event-driven
 /// instead of polled. Requires an event listener with its own durability.
 pub fn next_interval_secs(
     states: &[AgentState],
@@ -6096,7 +6096,7 @@ async fn respawn_and_requeue(
 /// correctness floor). A transient hc/mail hiccup — an agent exiting
 /// between poll and read, hc briefly down during a respawn, a daemon
 /// blip on notify — degrades that tick, never kills the run. Genuinely
-/// fatal conditions (config errors, Resonate unreachable) live OUTSIDE the
+/// fatal conditions (config errors, engine store unreachable) live OUTSIDE the
 /// leaf boundary and still hard-fail.
 ///
 /// Process-per-leaf cost (durable review #8): each iteration spawns 3-8
@@ -7323,7 +7323,7 @@ async fn swarm_loop(
                                         // swarm.done_mailed, crash-safe).
                                         if swarm.done_mailed.insert(bead_id.clone()) {
                                             // The done-mail leaf now runs through the journaled
-                                            // leaf loop instead of a Resonate checkpoint: same
+                                            // leaf loop instead of a vendor checkpoint: same
                                             // self-exe, same parse, same best-effort logging,
                                             // one intent journaled per run for the audit trail.
                                             match crate::elm::leaf::run_leaf_journaled(
@@ -8301,7 +8301,7 @@ async fn swarm_loop(
                 LoopAction::Blocked { name } => {
                     if params.on_blocked == "mail" {
                         // cg6.1: the ENTIRE escalation state machine lives in
-                        // the notify_blocked leaf (checkpointed by Resonate) —
+                        // the notify_blocked leaf (checkpointed by the effect journal) —
                         // it loads/initializes the escalation entry, computes
                         // the tier from the PERSISTED first_blocked_ts,
                         // increments + persists ping_count, and sends the
@@ -8753,7 +8753,7 @@ async fn swarm_loop(
             // Adaptive wait for the NEXT poll_events block. We already blocked
             // inside poll_events for wait_secs (or woke early on events), so
             // there is no trailing ctx.sleep — that would double the idle
-            // latency. Resonate still checkpoints each leaf; crash mid-wait
+            // latency. Each leaf settles through the journal; crash mid-wait
             // re-runs the leaf (fresh forward-only subscription — correct).
             wait_secs = next_interval_secs(
                 &states,
@@ -8773,13 +8773,13 @@ async fn swarm_loop(
 /// Register the durable functions and start (or resume) the loop invocation.
 /// Returns the workflow result; the process must stay alive while awaiting.
 pub async fn run_durable_loop(_cfg: &Config, mut params: LoopParams) -> anyhow::Result<String> {
-    // bd-flywheel-loop-substrate-ftpm: Resonate-free runner — local durable
+    // bd-flywheel-loop-substrate-ftpm: vendor-free runner — local durable
     // liveness row (ActiveLoop) + pid-registry dead-owner sweep. No server,
     // no worker/group anycast, no checkpoint replay.
     // bd-0fvb: resolve the host authority once and pass it to the loop body.
     let authority = crate::authority::RuntimeAuthority::resolve();
 
-    // no Resonate registration — plain async leaves, no worker/group.
+    // no vendor registration — plain async leaves, no worker/group.
 
     // Resume semantics (bd-swarm-loop-durable-panic-atlo): resuming a pending
     // invocation is OPT-IN via --resume. A pending promise at start belongs to
@@ -8942,7 +8942,7 @@ fn id_is_project_loop(id: &str, base: &str) -> bool {
 /// this run resumes/owns) is preserved; child promises (`.N`, a live
 /// checkpoint tree) and other projects' invocations are never candidates.
 /// Extracted from `clear_stale_loop_invocations` so the stale-root rejection
-/// is deterministically testable without a Resonate server.
+/// is deterministically testable without a vendor server.
 fn stale_loop_reject_ids<'a>(ids: &[&'a str], base: &str, except: Option<&str>) -> Vec<&'a str> {
     ids.iter()
         .copied()
@@ -12865,7 +12865,7 @@ mod tests {
     /// board read — a replayed poll would read the STORED board
     /// and a stale always-serialize row would gate dispatch forever. The live
     /// sites call `reservation_board_live`; the checkpointed leaf is gone
-    /// (dead Resonate substrate removed). Pinned by source shape: no
+    /// (dead vendor substrate removed). Pinned by source shape: no
     /// checkpointed board read may appear in swarm_loop's body.
     #[test]
     fn board_reads_in_loop_body_are_live_not_checkpointed() {

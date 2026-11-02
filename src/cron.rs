@@ -591,10 +591,9 @@ pub struct CronRun {
 ///
 /// - [`RegistryCronManager`] — today's default: reads `crons.toml` + the
 ///   workflow catalog + the state log. Pure catalog/control surface.
-/// - The P4.3 **cron manager** (BlueOak, in-progress): a Resonate
-///   durable-sleep loop that DRIVES ticks (register/pause/resume/status/history
-///   through the same contract). The CLI is backend-agnostic: swap the
-///   manager, the command surface is unchanged.
+/// - The **ElmCron host** ([`crate::cron::start_loops`]): a 30s tick loop
+///   over `ElmCron` with durable checkpoints; the CLI is backend-agnostic and
+///   the command surface is unchanged.
 ///
 /// `add` MUST fail closed on an unresolvable template / unparsable cron /
 /// unknown owner (the lint-gate contract); the CLI does not re-validate.
@@ -657,10 +656,9 @@ pub fn make_registry_manager(
     RegistryCronManager::new(workflows)
 }
 
-// ---- P4.5: wiring to the landed P4.3 cron manager (bd-p4-migrate-sagas-7rmo)
+// ---- cron registrations
 //
-// The toron-workflow `CronManager` (Resonate durable-sleep loop) drives ticks
-// over a `CronRegistry` closure returning enabled `CronRegistration`s. This
+// The ElmCron host drives ticks over the resolved cron set. This
 // section builds those registrations from the merged view (crons.toml +
 // schedule-triggered workflows in the catalog/built-ins), provides the
 // per-mode action runner (`call_webhook` probes; headless dispatch /
@@ -1073,23 +1071,16 @@ pub fn tick_date(tick_ts: i64) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Start (or resume) the durable cron loops over the current cron set —
-/// the ADR-0012 cron YAMLs (per-project > global > built-in) PLUS the legacy
-/// crons.toml/schedule-workflow registrations (P4 migrates those).
-/// Idempotent: re-invoking `cron-spec:{name}` / `cron:{name}` resumes the
-/// same durable function (restart survival). Returns once every loop is
-/// started; the loops run on the engine's in-process Resonate runtime.
+/// Start the durable cron host over the current cron set — the ADR-0012 cron
+/// YAMLs (per-project > global > built-in) plus the legacy crons.toml /
+/// schedule-workflow registrations.
 ///
-/// The health-gate + policy surface is live: `call_webhook` probes run, and
-/// `on_failure: bead` creates a `br` bead with the failure bundle. This is
-/// the P4.5 migration path — the old systemd timers stay until the workflows
-/// pass the same health-gates.
-/// Cron cadence host (bd-flywheel-cron-elm-cn7p): registrations still come
-/// from [`RegistryCronManager`], but ticks come from [`ElmCron`] and bodies
-/// run on the durable host — no Resonate durable-sleep loop. Bodies the
-/// durable router refuses (spawn/control-flow nodes, approval parks, or no
-/// store) keep the legacy toron `CronManager` path until their model lands;
-/// every refusal is loud per fire, never silent.
+/// Cadence comes from [`ElmCron`] on a 30s host tick with a durable checkpoint
+/// (`cron-last-fired.json`); each fire is an idempotent `fire_key(name, tick)`
+/// run. Bodies drive the shared `durable_body` host (linear or graph), with
+/// spawn/approval/control-flow bodies refused loudly rather than parked. The
+/// health-gate + policy surface is live (`verify` probes, `on_failure: bead`).
+/// Blocks; the caller supervises the process.
 pub async fn start_loops(cfg: &crate::config::Config, project: Option<&str>) -> Result<()> {
     let manager = RegistryCronManager::load()?;
     let registrations = manager.registrations()?;

@@ -18,7 +18,7 @@
 //!   `--allow-worktree` (preflight worktree check FAIL) and succeeds WITH it
 //!   (operator-only, logged). Opt-in (`FLYWHEEL_LIVE_E2E=1`, off by
 //!   default): it drives the real hc and the live preflight. Opted in,
-//!   it still skips when hc or resonate is down.
+//!   it still skips when hc or the engine store is down.
 //! - Assert the loop dispatch surface contains ZERO worktree-create calls
 //!   (source grep) — the brief bans worktrees, the action enum has no
 //!   worktree variant, and the preflight gate is the structural ban.
@@ -54,7 +54,7 @@ fn live_scenario_b_is_opt_in_before_anything_live() {
     let gate = body.find("if !live_e2e_opted_in()").expect("opt-in gate");
     for live in [
         "plane_up()",
-        "resonate_up()",
+        "engine_up()",
         "Command::new(",
         "plane_workspace_create(",
     ] {
@@ -75,9 +75,9 @@ fn plane_up() -> bool {
         .unwrap_or(false)
 }
 
-/// Resonate reachable? The `--allow-worktree` success half of Scenario B
-/// requires ALL preflight checks to pass, including the resonate check.
-fn resonate_up() -> bool {
+/// Engine store reachable? The `--allow-worktree` success half of Scenario B
+/// requires ALL preflight checks to pass, including the engine-store check.
+fn engine_up() -> bool {
     Command::new(flywheel())
         .args(["preflight", "--mode", "cron", "--json"])
         .output()
@@ -88,7 +88,7 @@ fn resonate_up() -> bool {
                 .as_array()
                 .map(|cs| {
                     cs.iter()
-                        .any(|c| c["name"] == "resonate" && c["status"] == "pass")
+                        .any(|c| c["name"] == "engine" && c["status"] == "pass")
                 })
                 .unwrap_or(false)
         })
@@ -457,12 +457,12 @@ fn allow_worktree_flag_is_exposed_on_run_surfaces() {
     }
 }
 
-// ---- Scenario B: linked-worktree preflight (live, hc + resonate) --------
+// ---- Scenario B: linked-worktree preflight (live, hc + engine store) ----
 
 /// `flywheel loop run <scratch>` in a workspace with an extra `git worktree
 /// add` sibling exits NON-ZERO without `--allow-worktree` (preflight FAIL
 /// naming the linked tree) and SUCCEEDS with it (operator opt-out LOGGED).
-/// Live-gated: needs hc (workspace + worktree list) and resonate (all
+/// Live-gated: needs hc (workspace + worktree list) and the engine store (all
 /// preflight checks must pass for the success half). Skips when down.
 ///
 /// Opt-in only (`FLYWHEEL_LIVE_E2E=1`): it creates a workspace on the REAL
@@ -483,8 +483,8 @@ fn linked_worktree_gates_loop_run_until_operator_optout() {
         eprintln!("hc down — Scenario B skipped (CLI surface covered above)");
         return;
     }
-    if !resonate_up() {
-        eprintln!("resonate down — Scenario B skipped (CLI surface covered above)");
+    if !engine_up() {
+        eprintln!("engine store down — Scenario B skipped (CLI surface covered above)");
         return;
     }
 

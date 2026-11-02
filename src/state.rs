@@ -17,7 +17,7 @@
 //!   (`bd-event-subscribe-reactor`); `null`/absent = start fresh.
 //! - `escalation: { "<agent>": { first_blocked_ts, ping_count, last_tail } }` —
 //!   tier continuity for blocked agents (`bd-blocked-escalation-protocol`).
-//!   `first_blocked_ts` is Resonate `ctx.now()` i64-µs (deterministic; never
+//!   `first_blocked_ts` is the injected host time i64-µs (deterministic; never
 //!   wall-clock `SystemTime`).
 //! - `respawn: { "<agent>": { diagnose_count, respawn_count } }` — bounded
 //!   self-heal budget (`bd-event-self-heal-unknown`).
@@ -98,10 +98,10 @@ pub struct EventCursor {
 }
 
 /// Per-agent blocked escalation tier state (bd-blocked-escalation-protocol).
-/// `first_blocked_ts` is Resonate `ctx.now()` i64-µs — stored, not recomputed.
+/// `first_blocked_ts` is the injected host time i64-µs — stored, not recomputed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct EscalationState {
-    /// Deterministic timestamp (Resonate ctx.now, µs). Never wall-clock.
+    /// Deterministic timestamp (injected host time, µs). Never wall-clock.
     pub first_blocked_ts: i64,
     pub ping_count: u32,
     /// The tier whose ping was last SENT (cg6.3): a replay re-execution at the
@@ -1448,7 +1448,7 @@ pub fn project_checkpoint_dir(project: &str) -> PathBuf {
 // Per-project sidecar (NOT the shared loops.json — that file is written by
 // any loop on any project; a per-project file keeps writers disjoint and
 // atomic-write races impossible). Records what the `__send` leaf actually
-// delivered, so a crash between hc's landing and Resonate's checkpoint
+// delivered, so a crash between hc's landing and the effect checkpoint
 // can be deduplicated on resume (bd-resume-dedup). Single-writer per project
 // (the loop; `promise_pending` guards against concurrent loops).
 

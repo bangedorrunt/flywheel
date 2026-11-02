@@ -265,7 +265,7 @@ pub fn leaf_journal_path(project: &str) -> std::path::PathBuf {
 
 /// Run one leaf through a journaled loop: boot on the project's leaf
 /// journal, run the single durable intent, and return the checkpointed
-/// outcome. Semantics match the Resonate leaf this replaces: every call runs
+/// outcome. Semantics match the durable leaf this replaces: every call runs
 /// the child fresh with one intent journaled per run for the audit trail; a
 /// crash mid-run simply re-runs on the next poll, which is the same
 /// at-least-once edge the checkpointed leaf had. Recovery without re-running
@@ -306,7 +306,7 @@ pub fn run_leaf_journaled_timeout(
 /// (tempdir) instead of the production state dir. The loop boots and drops
 /// on a plain OS thread, never the caller's: dropping a tokio runtime
 /// inside an async context panics, and the production caller is an async
-/// Resonate worker.
+/// host worker.
 #[cfg(test)]
 pub fn run_leaf_journaled_at(
     journal_path: &std::path::Path,

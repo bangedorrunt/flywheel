@@ -817,7 +817,7 @@ fn spawn_child(
     gen_path: &Path,
 ) -> Result<()> {
     // bd-durable-doorbell-lngf: record which project owns this workspace —
-    // the Resonate supervisor reads the sidecar to re-spawn the right
+    // the supervisor reads the sidecar to re-spawn the right
     // `__doorbell --project <p>` after a crash (the pid/gen files alone
     // don't carry it).
     if let Some(parent) = gen_path.parent() {
@@ -1224,8 +1224,8 @@ pub fn save_wake_state(path: &Path, st: &WakeState) -> Result<()> {
     Ok(())
 }
 
-// ---- bd-durable-doorbell-lngf: Resonate-primary supervision --------------
-// The lazily-healed watcher is the LOW-LATENCY push path; the Resonate
+// ---- bd-durable-doorbell-lngf: local supervisor --------------
+// The lazily-healed watcher is the LOW-LATENCY push path; the
 // schedule is the GUARANTEED path: the host server fires the supervisor
 // tick every minute whether or not any human touches flywheel. A tick that
 // lands while no worker is connected stays queued server-side and executes
@@ -1273,7 +1273,7 @@ pub fn dead_dispatchers(state_dir: &Path) -> Vec<(String, String)> {
 }
 
 /// The heal itself as a plain async fn (bd-flywheel-cron-elm-cn7p): the
-/// ElmCron host calls this directly; the Resonate leaf and its macro are gone.
+/// ElmCron host calls this directly; the old durable leaf and macro are gone.
 pub async fn heal_tick_body() -> anyhow::Result<Vec<String>> {
     let state_dir = crate::config::state_dir();
     let exe = std::env::current_exe()?;

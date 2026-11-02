@@ -618,7 +618,7 @@ pub fn ensure_doorbell() -> anyhow::Result<()> {
 
 /// Outcome of a best-effort service ensure (bd-ykqd).
 /// Parked-run capability probe (bd-flywheel-probe-qjay — step 1 of the
-/// Resonate removal): open a scratch run on the durable engine store, park
+/// vendor removal): open a scratch run on the durable engine store, park
 /// it, and verify the wake fires via `drain_due`. A run that can park and
 /// wake is the health signal — not a vendor `/health` endpoint.
 ///

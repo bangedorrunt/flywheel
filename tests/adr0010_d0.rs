@@ -9,7 +9,7 @@ const DURABLE: &str = include_str!("../src/durable.rs");
 const MAIN: &str = include_str!("../src/main.rs");
 
 /// D0 producer deletion: no durable `poll_mail_digests` definition and no
-/// resonate registration. A registered leaf is an available Msg producer even
+/// leaf registration. A registered leaf is an available Msg producer even
 /// when the live loop stops calling it (GS-030 only removed the call site).
 #[test]
 fn adr0010_d0_digest_producer_deleted() {
