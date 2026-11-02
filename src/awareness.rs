@@ -54,7 +54,7 @@ pub enum Action {
 
 /// What the last fire left behind, per project.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-struct Remembered {
+pub struct Remembered {
     #[serde(default)]
     line: String,
     #[serde(default)]
