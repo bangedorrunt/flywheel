@@ -2527,94 +2527,136 @@ pub fn spawn_launch_plan(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Durable spawn consumer (bd-spawn-pane-consumer-6lmf)
+// Durable spawn consumer (bd-spawn-pane-consumer-6lmf,
+// bd-spawn-launcher-flip-d8mv)
 // ---------------------------------------------------------------------------
 
-/// One claimed durable spawn job.
-#[derive(Debug, Clone, PartialEq, Eq)]
-// The flip bead wires the drainer to this consumer; until then the surface is
-// intentionally unused (bd-spawn-pane-consumer-6lmf).
-#[allow(dead_code)]
+/// One durable spawn claim.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SpawnClaim {
     /// The correlation key the engine published (`run:node:attempt`).
     pub spawn_key: String,
     /// The step/node the job belongs to.
     pub node: String,
+    /// The run the job belongs to.
+    pub run_id: String,
     /// Host time the claim was taken, unix millis.
     pub claimed_at_ms: u64,
+    /// The launch receipt, recorded once a pane started. `None` = the claim
+    /// exists but no child was started (a crash in that window).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<Value>,
 }
 
-/// The claim registry: `spawn_key` → claim.
+/// What a claim call did.
+#[derive(Debug, Clone)]
+pub enum SpawnClaimOutcome {
+    /// This caller took the key and must start the child.
+    Claimed(SpawnClaim),
+    /// An earlier attempt took the key: adopt, never start a second child.
+    Adopted(SpawnClaim),
+}
+
+/// The claim file: `spawn_key` → claim.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct SpawnClaimFile {
+    #[serde(default)]
+    claims: BTreeMap<String, SpawnClaim>,
+}
+
+/// Durable claim registry, keyed by `spawn_key` in flywheel's atomic state
+/// file (bd-spawn-launcher-flip-d8mv).
 ///
-/// First claimer wins. A second claim for the same key is REFUSED, which is
-/// the exactly-once gate: the engine republishes on restart, and the claim —
-/// not a vendor promise — decides whether a child starts.
-#[derive(Default)]
-// The flip bead wires the drainer to this consumer; until then the surface is
-// intentionally unused (bd-spawn-pane-consumer-6lmf).
-#[allow(dead_code)]
-pub struct SpawnClaims {
-    inner: std::sync::Mutex<std::collections::HashMap<String, SpawnClaim>>,
+/// The claim is written BEFORE the pane starts and lives across processes, so
+/// it — not a vendor promise — is the exactly-once gate. The engine republishes
+/// the same `spawn_key` after a restart; an existing claim is ADOPTED.
+#[derive(Clone, Debug)]
+pub struct SpawnClaimStore {
+    path: std::path::PathBuf,
 }
 
-impl std::fmt::Debug for SpawnClaims {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SpawnClaims")
-            .field("len", &self.lock().len())
-            .finish()
-    }
-}
-
-// The flip bead wires the drainer to this consumer; until then the surface is
-// intentionally unused (bd-spawn-pane-consumer-6lmf).
+// The flip's host wiring belongs to bd-flywheel-host-run-ofcw; until then the
+// consumer surface is intentionally unused.
 #[allow(dead_code)]
-impl SpawnClaims {
-    /// Empty registry.
-    pub fn new() -> Self {
-        Self::default()
+impl SpawnClaimStore {
+    /// The live registry: `spawn-claims.json` under flywheel's state dir (the
+    /// same atomic `update_locked` path the loops sidecars use).
+    pub fn open() -> Self {
+        Self::at(crate::config::state_dir().join("spawn-claims.json"))
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, SpawnClaim>> {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// A registry at an explicit file (tests).
+    pub fn at(path: impl Into<std::path::PathBuf>) -> Self {
+        Self { path: path.into() }
     }
 
-    /// Claim one key. # Errors
+    /// Take the key, or adopt the existing claim.
     ///
-    /// `Err` when the key is already claimed — the duplicate-start refusal.
+    /// # Errors
+    ///
+    /// `Err` when the state file cannot be written under its lock — a launch
+    /// must not start without a durable claim, so this fails closed.
     pub fn claim(
         &self,
         spec: &toron_workflow::engine::spawn::SpawnSpec,
         now_ms: u64,
-    ) -> Result<SpawnClaim> {
-        let mut map = self.lock();
-        if let Some(existing) = map.get(&spec.spawn_key) {
-            anyhow::bail!(
-                "spawn {} is already claimed by {} at {}ms — a second start is refused",
-                spec.spawn_key,
-                existing.node,
-                existing.claimed_at_ms
-            );
-        }
-        let claim = SpawnClaim {
-            spawn_key: spec.spawn_key.clone(),
-            node: spec.node.clone(),
-            claimed_at_ms: now_ms,
-        };
-        map.insert(spec.spawn_key.clone(), claim.clone());
-        Ok(claim)
+    ) -> Result<SpawnClaimOutcome> {
+        let mut outcome = None;
+        crate::state::update_locked::<SpawnClaimFile>(&self.path, |file| {
+            outcome = Some(match file.claims.get(&spec.spawn_key) {
+                Some(existing) => SpawnClaimOutcome::Adopted(existing.clone()),
+                None => {
+                    let claim = SpawnClaim {
+                        spawn_key: spec.spawn_key.clone(),
+                        node: spec.node.clone(),
+                        run_id: spec.run_id.clone(),
+                        claimed_at_ms: now_ms,
+                        receipt: None,
+                    };
+                    file.claims.insert(spec.spawn_key.clone(), claim.clone());
+                    SpawnClaimOutcome::Claimed(claim)
+                }
+            });
+        })?;
+        outcome.ok_or_else(|| anyhow!("spawn claim write produced no outcome"))
+    }
+
+    /// Record the launch receipt for a claimed key (best-effort at the call
+    /// site: a pane that started is not undone by a bookkeeping miss).
+    ///
+    /// # Errors
+    ///
+    /// `Err` when the state file cannot be written under its lock.
+    pub fn record_receipt(&self, spawn_key: &str, receipt: &Value) -> Result<()> {
+        crate::state::update_locked::<SpawnClaimFile>(&self.path, |file| {
+            if let Some(claim) = file.claims.get_mut(spawn_key) {
+                claim.receipt = Some(receipt.clone());
+            }
+        })
     }
 
     /// True when the key is already claimed.
     pub fn is_claimed(&self, spawn_key: &str) -> bool {
-        self.lock().contains_key(spawn_key)
+        self.load().claims.contains_key(spawn_key)
     }
 
-    /// Drop a claim (a failed launch releases it so the job can be retried).
-    pub fn release(&self, spawn_key: &str) {
-        self.lock().remove(spawn_key);
+    /// Drop a claim after a KNOWN failed launch (no child exists, so a retry
+    /// is legitimate).
+    ///
+    /// # Errors
+    ///
+    /// `Err` when the state file cannot be written under its lock.
+    pub fn release(&self, spawn_key: &str) -> Result<()> {
+        crate::state::update_locked::<SpawnClaimFile>(&self.path, |file| {
+            file.claims.remove(spawn_key);
+        })
+    }
+
+    fn load(&self) -> SpawnClaimFile {
+        std::fs::read_to_string(&self.path)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default()
     }
 }
 
@@ -2694,7 +2736,11 @@ pub fn spawn_terminal_body(
 pub struct SpawnJobOutcome {
     /// The claim that admitted the start.
     pub claim: SpawnClaim,
-    /// The launch receipt (empty when the launch failed).
+    /// `true` when a previous attempt already claimed the key, so nothing was
+    /// launched here (the exactly-once adopt path).
+    pub adopted: bool,
+    /// The launch receipt (empty when the launch failed or was adopted
+    /// without one).
     pub receipt: Value,
     /// The kind-43004 / kind-43006 body the host publishes.
     pub terminal: Value,
@@ -2702,29 +2748,52 @@ pub struct SpawnJobOutcome {
 
 /// Drive ONE durable spawn job: claim, launch, terminal.
 ///
-/// The claim is taken BEFORE the launch and a duplicate is refused before
-/// anything starts — that is the exactly-once gate the design names. A failed
-/// launch releases the claim (the job never started, so a retry is legitimate)
-/// and still yields a terminal error body: the run must not hang.
+/// The claim is written to the durable store BEFORE the launch; a republished
+/// key is ADOPTED instead of starting a second child — that is the
+/// exactly-once gate the design names. A claim with no recorded launch fails
+/// closed (the previous attempt died in the claim-to-pane window; a second
+/// start could double-run). A KNOWN failed launch releases the claim (no child
+/// exists, so a retry is legitimate) and still yields a terminal error body:
+/// the run must not hang.
 // The flip bead wires the drainer to this consumer; until then the surface is
 // intentionally unused (bd-spawn-pane-consumer-6lmf).
 #[allow(dead_code)]
 pub fn consume_spawn_job(
-    claims: &SpawnClaims,
+    claims: &SpawnClaimStore,
     body: &Value,
     catalog: &ProfileCatalog,
     now_ms: u64,
     mut launch: impl FnMut(SpawnJobLaunch) -> Result<Value>,
 ) -> Result<SpawnJobOutcome> {
     let spec = spawn_spec_from_job(body)?;
-    let claim = claims.claim(&spec, now_ms)?;
+    let (claim, adopted) = match claims.claim(&spec, now_ms)? {
+        SpawnClaimOutcome::Claimed(claim) => (claim, false),
+        SpawnClaimOutcome::Adopted(claim) => (claim, true),
+    };
+    if adopted {
+        let outcome = match claim.receipt.clone() {
+            Some(receipt) => Ok(receipt),
+            None => Err(anyhow!(
+                "spawn {} was claimed at {}ms but recorded no launch — refusing a second start",
+                claim.spawn_key,
+                claim.claimed_at_ms
+            )),
+        };
+        return Ok(SpawnJobOutcome {
+            claim,
+            adopted: true,
+            receipt: outcome.as_ref().ok().cloned().unwrap_or(Value::Null),
+            terminal: spawn_terminal_body(&spec, &outcome),
+        });
+    }
     let plan = match spawn_launch_plan_from_spec(&spec, catalog) {
         Ok(plan) => plan,
         Err(e) => {
-            claims.release(&spec.spawn_key);
+            claims.release(&spec.spawn_key)?;
             let outcome = Err(e);
             return Ok(SpawnJobOutcome {
                 claim,
+                adopted: false,
                 receipt: Value::Null,
                 terminal: spawn_terminal_body(&spec, &outcome),
             });
@@ -2732,18 +2801,23 @@ pub fn consume_spawn_job(
     };
     match launch(plan) {
         Ok(receipt) => {
+            // Best-effort: the pane exists, so a bookkeeping miss must not
+            // turn a started child into a failed consume.
+            let _ = claims.record_receipt(&spec.spawn_key, &receipt);
             let outcome = Ok(receipt.clone());
             Ok(SpawnJobOutcome {
                 claim,
+                adopted: false,
                 receipt,
                 terminal: spawn_terminal_body(&spec, &outcome),
             })
         }
         Err(e) => {
-            claims.release(&spec.spawn_key);
+            claims.release(&spec.spawn_key)?;
             let outcome = Err(e);
             Ok(SpawnJobOutcome {
                 claim,
+                adopted: false,
                 receipt: Value::Null,
                 terminal: spawn_terminal_body(&spec, &outcome),
             })
@@ -3647,6 +3721,18 @@ mod tests {
         }
     }
 
+    /// A fresh claim file per test (the live store is the machine state dir).
+    fn claim_store(tag: &str) -> SpawnClaimStore {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        SpawnClaimStore::at(std::env::temp_dir().join(format!(
+            "fw-spawn-claims-{tag}-{}-{nanos}.json",
+            std::process::id()
+        )))
+    }
+
     /// bd-spawn-pane-consumer-6lmf: one durable spawn job runs from the
     /// kind-43001 spec alone — no promise, no server.
     #[test]
@@ -3657,7 +3743,7 @@ mod tests {
             "spec": serde_json::to_value(&spec).expect("spec json"),
             "assignee": null,
         });
-        let claims = SpawnClaims::new();
+        let claims = claim_store("one");
         let mut launched: Vec<String> = Vec::new();
         let outcome = consume_spawn_job(&claims, &body, &test_catalog(), 1_000, |plan| {
             launched.push(plan.profile.clone());
@@ -3668,6 +3754,7 @@ mod tests {
         .expect("consume the job");
 
         assert_eq!(launched, ["housekeeper"], "exactly one start");
+        assert!(!outcome.adopted);
         assert_eq!(outcome.claim.spawn_key, "run-1:spawn_it:1");
         assert_eq!(
             outcome.terminal["spawn_key"],
@@ -3680,17 +3767,18 @@ mod tests {
         );
     }
 
-    /// The restart republish: the engine re-emits the same `spawn_key`; the
-    /// claim refuses it and NO second child starts.
+    /// The restart republish (bd-spawn-launcher-flip-d8mv): the engine
+    /// re-emits the same `spawn_key`; the DURABLE claim is adopted and NO
+    /// second child starts.
     #[test]
-    fn spawn_claim_refuses_a_second_start() {
+    fn spawn_claim_adopts_after_a_restart() {
         let spec = durable_spawn_spec();
         let body = serde_json::json!({
             "title": "spawn",
             "spec": serde_json::to_value(&spec).expect("spec json"),
             "assignee": null,
         });
-        let claims = SpawnClaims::new();
+        let claims = claim_store("adopt");
         let mut starts = 0u32;
         let first = consume_spawn_job(&claims, &body, &test_catalog(), 1_000, |_| {
             starts += 1;
@@ -3699,14 +3787,50 @@ mod tests {
         .expect("first start");
         assert_eq!(first.terminal["ok"], serde_json::json!(true));
 
-        let second = consume_spawn_job(&claims, &body, &test_catalog(), 2_000, |_| {
+        // A second process over the same file: the claim survives the "killed"
+        // consumer, so the republished key adopts instead of launching again.
+        let reopened = SpawnClaimStore::at(claims.path.clone());
+        let second = consume_spawn_job(&reopened, &body, &test_catalog(), 2_000, |_| {
             starts += 1;
             Ok(serde_json::json!({"pane": "w1:p10"}))
-        });
-        let err = second.expect_err("the claim refuses a duplicate");
-        assert!(format!("{err:#}").contains("already claimed"), "{err:#}");
+        })
+        .expect("a republished key adopts");
+        assert!(second.adopted, "the existing claim is adopted");
         assert_eq!(starts, 1, "one child, never two");
-        assert!(claims.is_claimed("run-1:spawn_it:1"));
+        assert_eq!(
+            second.terminal["result"]["pane"],
+            serde_json::json!("w1:p9"),
+            "the adopted terminal carries the original receipt"
+        );
+        assert!(reopened.is_claimed("run-1:spawn_it:1"));
+    }
+
+    /// A claim written before a crash that recorded no launch fails CLOSED: no
+    /// second child, because the first may have started.
+    #[test]
+    fn spawn_claim_without_a_recorded_launch_fails_closed() {
+        let spec = durable_spawn_spec();
+        let body = serde_json::json!({ "spec": serde_json::to_value(&spec).expect("spec") });
+        let claims = claim_store("unlaunched");
+        claims
+            .claim(&spec, 1_000)
+            .expect("claim without a launch (the crash window)");
+        let mut starts = 0u32;
+        let outcome = consume_spawn_job(&claims, &body, &test_catalog(), 2_000, |_| {
+            starts += 1;
+            Ok(serde_json::json!({"pane": "second"}))
+        })
+        .expect("an adopt is a terminal, not an error");
+        assert!(outcome.adopted);
+        assert_eq!(starts, 0, "no second child");
+        assert_eq!(outcome.terminal["ok"], serde_json::json!(false));
+        assert!(
+            outcome.terminal["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("recorded no launch")),
+            "{}",
+            outcome.terminal
+        );
     }
 
     /// A failed launch releases the claim and still yields a terminal error
@@ -3715,11 +3839,12 @@ mod tests {
     fn spawn_launch_failure_releases_the_claim() {
         let spec = durable_spawn_spec();
         let body = serde_json::json!({ "spec": serde_json::to_value(&spec).expect("spec") });
-        let claims = SpawnClaims::new();
+        let claims = claim_store("failed");
         let outcome = consume_spawn_job(&claims, &body, &test_catalog(), 1_000, |_| {
             anyhow::bail!("pane split refused")
         })
         .expect("a failed launch is a terminal, not an error");
+        assert!(!outcome.adopted);
         assert_eq!(outcome.terminal["ok"], serde_json::json!(false));
         assert!(
             outcome.terminal["error"]

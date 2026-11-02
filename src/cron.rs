@@ -1418,10 +1418,33 @@ fn refusal_reason(workflow: &Workflow, has_store: bool) -> Option<String> {
                 .to_string(),
         );
     }
-    if let Err(reason) = toron_mcp::workflow_host::durable_route(workflow, has_store) {
+    // bd-spawn-launcher-flip-d8mv: a cron body has no launcher, so a spawn
+    // would park forever on the durable host. Keep it explicit here as well
+    // as through the router's `spawn_capable = false`.
+    if body_has_spawn(workflow) {
+        return Some(
+            "spawn needs a launcher; a cron body has none, so it stays on the legacy driver"
+                .to_string(),
+        );
+    }
+    if let Err(reason) = toron_mcp::workflow_host::durable_route(workflow, has_store, false) {
         return Some(reason);
     }
     None
+}
+
+/// Any `spawn` step or graph node: the cron path owns no pane launcher, so
+/// these bodies stay legacy rather than park on a launch nobody performs.
+fn body_has_spawn(workflow: &Workflow) -> bool {
+    workflow
+        .steps
+        .iter()
+        .any(|s| matches!(s.action, Action::Spawn { .. }))
+        || workflow.graph.as_ref().is_some_and(|g| {
+            g.nodes
+                .values()
+                .any(|n| matches!(n.action, Action::Spawn { .. }))
+        })
 }
 
 /// Any `request_approval` step or graph node: the durable cron path has no
