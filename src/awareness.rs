@@ -154,7 +154,11 @@ fn overlaps(pins: &[crate::snapshot::PinRow]) -> Vec<(String, Vec<String>)> {
 /// the facts, so a test can pin every arm without a store.
 pub fn decide(facts: &Facts, remembered: &Remembered) -> Action {
     let mut conflicts = facts.conflicts.clone();
-    if remembered.swarm && !facts.swarm {
+    // `swarm` predates the fingerprint. A state file written by an older
+    // build has swarm=true from the old "dispatcher up" rule; treat it as no
+    // knowledge rather than escalate a vanish that never happened.
+    let prior_swarm = remembered.swarm && !remembered.fingerprint.is_empty();
+    if prior_swarm && !facts.swarm {
         // All panes gone is the loudest thing a digest can say, and it used to
         // be the quietest: "no swarm" was treated as idle.
         conflicts.push("swarm vanished: 0 agents, dispatcher not up".to_string());
@@ -192,7 +196,16 @@ pub async fn tick(cfg: &crate::config::Config, project: &str) -> Result<Option<S
     let mut remembered = load(project);
     let action = decide(&facts, &remembered);
     match action {
-        Action::Silent => Ok(None),
+        Action::Silent => {
+            // Silence is about OUTPUT, not bookkeeping: keep the fingerprint
+            // and swarm flag current so the next comparison is honest and a
+            // real vanish is not masked by a stale flag.
+            remembered.line = facts.line.clone();
+            remembered.fingerprint = facts.fingerprint.clone();
+            remembered.swarm = facts.swarm;
+            save(project, &remembered)?;
+            Ok(None)
+        }
         Action::Log(line) => {
             remembered.line = line.clone();
             remembered.fingerprint = facts.fingerprint.clone();
@@ -406,6 +419,7 @@ mod tests {
         let gone = facts_of("awareness p · agents 0", &[], false);
         let had_swarm = Remembered {
             line: "awareness p · agents 3".into(),
+            fingerprint: "awareness p · agents 3".into(),
             swarm: true,
             ..Default::default()
         };
