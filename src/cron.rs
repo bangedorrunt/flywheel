@@ -1427,10 +1427,32 @@ fn refusal_reason(workflow: &Workflow, has_store: bool) -> Option<String> {
                 .to_string(),
         );
     }
+    // bd-durable-call-workflow-mg6y: child runs need a workflow resolver this
+    // path does not carry yet, so a call body stays legacy instead of failing
+    // at open.
+    if body_has_call_workflow(workflow) {
+        return Some(
+            "call_workflow needs a child-run resolver; a cron body has none yet, so it stays on the legacy driver"
+                .to_string(),
+        );
+    }
     if let Err(reason) = toron_mcp::workflow_host::durable_route(workflow, has_store, false) {
         return Some(reason);
     }
     None
+}
+
+/// Any `call_workflow` step or graph node (bd-durable-call-workflow-mg6y).
+fn body_has_call_workflow(workflow: &Workflow) -> bool {
+    workflow
+        .steps
+        .iter()
+        .any(|s| matches!(s.action, Action::CallWorkflow { .. }))
+        || workflow.graph.as_ref().is_some_and(|g| {
+            g.nodes
+                .values()
+                .any(|n| matches!(n.action, Action::CallWorkflow { .. }))
+        })
 }
 
 /// Any `spawn` step or graph node: the cron path owns no pane launcher, so
@@ -1921,6 +1943,16 @@ async fn drive_cron_graph(
                     // Partitioned out (same rule as linear): loud stop.
                     return failed(
                         &format!("approval node {node} has no resolution loop"),
+                        Some(node),
+                    );
+                }
+                // bd-durable-call-workflow-mg6y: a call body stays legacy
+                // (no child resolver on this path), so these are unreachable.
+                // Fail closed rather than silently parking.
+                GraphEffect::ChildJoin { .. } => {}
+                GraphEffect::ChildRun { node, .. } => {
+                    return failed(
+                        &format!("child run for node {node} has no resolver on the cron path"),
                         Some(node),
                     );
                 }
@@ -3355,6 +3387,13 @@ owner = "housekeeper"
         };
         let reason = refusal_reason(&approval, true).expect("approval refuses");
         assert!(reason.contains("resolution loop"), "{reason}");
+        let mut call = linear.clone();
+        call.steps[0].action = Action::CallWorkflow {
+            workflow: "child".into(),
+            inputs: serde_json::json!({}),
+        };
+        let reason = refusal_reason(&call, true).expect("call refuses");
+        assert!(reason.contains("child-run resolver"), "{reason}");
         let mut graph = linear.clone();
         graph.steps.clear();
         graph.graph = Some(toron_workflow::schema::Graph {
