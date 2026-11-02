@@ -11,7 +11,7 @@ description: Named failures and their fixes. Door, spawn, loop, compose, and doo
 | `flywheel status` shows `workspaces: []` right after spawn | Race between state write and status read | Trust the spawn verification; take names from the send error's `available:` list or `flywheel status / hc ls` |
 | Send misses an idle agent | It did not miss: `prior_status: idle` means the brief landed | Only `landed: true` after `--wait`/`--confirm` counts as confirmed delivery |
 | Beadless `--work` loop resolves `complete` instantly | Nothing to claim | Create lane beads first, or drop `--work` |
-| Fresh loop parks after first poll | Resonate promise wedged | `resonate promises reject <id>`, relaunch |
+| Fresh loop parks after first poll | Stale loop invocation | `loop-mode doctor --fix`, relaunch |
 | Held beads named `WaveGate` | Wave ordering, not a stuck owner | Close the lower wave; do not nudge |
 | A pane waits for a ledger holder that does not exist; flips never land | The pane requested flips instead of checking the board | `toron reserve list`; no conformance holder means acquire it yourself (both glob levels), flip, commit, release. The ledger is a flip-scoped lease, never held between batches |
 | Sibling beads in one crate are walled off | A blanket lease (`crate/**` or `crate/*`) | Release it and re-acquire exact files; never blanket a shared crate — siblings run in it |
@@ -24,7 +24,7 @@ description: Named failures and their fixes. Door, spawn, loop, compose, and doo
 | Pane found but its name is `null` after a restart | Lost binding (the `toron_pin` label went with the old terminal) | `flywheel rebind` restores registered names; `recover` also respawns the dead |
 | SIGKILL on the binary | Stale signature | `codesign --force --sign - ~/.cargo/bin/flywheel` |
 | doorbell `answered by foreign owner, not child <pid>` | Port 18980 conflict | Stop the foreign holder or relocate; arrival itself was unaffected |
-| preflight `resonate ... connection refused` | Durable engine down | `flywheel deps --ensure` starts it, or run open-vehicle work and say so in the trail |
+| preflight `engine ... store unreachable` | Durable engine down | fix the store path and permissions, or run open-vehicle work and say so in the trail |
 | Mail to `captain` fails | Alias cleared by parent death or never bound | `flywheel mail whois captain <p>` to check; `recover`/`adopt` rebinds; `toron contact captain --pin <pin>` sets it |
 | `mode: standby` + `standby_with_known_workspaces` | Daemon adopted without hosts; zero wakes delivered | Arm it: `flywheel doorbell start <project>` for registry workspaces, or subscribe with `--project` and let auto-host fire within 60s |
 | `doorbell start` adopts but hosts nothing | `--host` only rides a fresh serve spawn | `doorbell stop`, then start with `--host p/w`; or subscribe and wait one reconcile tick |

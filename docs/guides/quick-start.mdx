@@ -11,7 +11,7 @@ what the command prints, and every step names what to do when it prints somethin
 ```bash
 toron daemon start                      # mailbox + MCP on 127.0.0.1:18080
 flywheel toron setup-mcp --flywheel     # point flywheel and harnesses at the same daemon
-flywheel deps --ensure                  # toolchain health; starts resonate if down
+flywheel deps --ensure                  # toolchain health
 ```
 
 ```text
@@ -19,7 +19,7 @@ running (launchd com.toron.serve)
 br: idle
 bv: idle
 plane: idle
-resonate server: idle
+engine store: idle
 mail (toron): idle
 config: /Users/you/.config/flywheel/config.toml
 ```
@@ -34,7 +34,7 @@ the exact function or agent list to update. `flywheel deps --ensure` repairs mis
 dependencies, but it cannot repair drift, by design: drift needs a human to decide which side
 is right. `flywheel preflight` adds hc socket, operator key, toron mail, and standing orders
 to the same check; fix FAILs there before any fleet work, because the loop and compose engine
-need resonate at `http://localhost:8001`.
+need the local engine store answering (open, park, wake).
 
 ## Every session
 

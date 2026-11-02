@@ -288,13 +288,12 @@ loud.
   publicity is explicit; the private default cannot be misrouted into.
 - **Subtract before you add.** Dead built-ins are deleted, not documented.
 
-## Durability (Resonate)
+## Durability (in-house engine)
 
-The loop runs as a **durable Resonate workflow** (requires a Resonate server,
-default `http://localhost:8001` — `flywheel deps --ensure` or
-`flywheel daemon start` starts one with sqlite state when none is running). Every poll, send, and
-sleep is a checkpoint: kill the loop process mid-run and `flywheel loop-mode
-run <project>` with the same flags **resumes the same invocation**. State is
+The loop runs on the **in-house durable engine** (local sqlite store — no
+server to run). Every poll, send, and sleep is recorded against a durable
+run id: kill the loop process mid-run and `flywheel loop-mode run <project>`
+with the same flags **resumes the same invocation**. State is
 queryable via `flywheel loop-mode status <project>`; `flywheel loop-mode list`
 shows the live-loop pid registry and `flywheel loop-mode prune` cleans dead
 entries. `--local` runs the plain sync loop; `--once` does a single poll pass.

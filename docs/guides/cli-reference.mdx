@@ -12,8 +12,8 @@ Conventions: `<p>` is the project slug. The full clap surface is `flywheel --hel
 | `briefing` | Observe + propose one topology; `--commit` runs the argv (`--yes` required non-TTY on spawn-class topologies — crew-confirm gate); names `role` |
 | `decide` | The classifier leaf: one captain primitive per target, `--json` (names `role`, read from the workflow's steps) |
 | `helm <p>` | Session-start drain: open decisions, unread status, divergence |
-| `preflight` | hc socket, resonate, operator key, toron mail, standing orders |
-| `deps` | Environment + toolchain health; `--ensure` starts a down loopback resonate |
+| `preflight` | hc socket, engine store, operator key, toron mail, standing orders |
+| `deps` | Environment + toolchain health; `--ensure` repairs missing dependencies (drift still needs a human) |
 | `spawn` | Spawn a swarm; `--profile <role>` is the default door, bare harness flags are the escape hatch |
 | `add` | Extend a running swarm with more panes |
 | `send` | Prompt one or more agents; stage params, `--wait`, `--raw` |
@@ -44,7 +44,7 @@ Conventions: `<p>` is the project slug. The full clap surface is `flywheel --hel
 | `artifacts` | Typed per-run records: `<run_id> [--json]`, `stitch <run_id>` |
 | `snapshot`, `checkpoint`, `resume`, `changes`, `timeline`, `audit`, `analytics`, `history` | Fleet state forensics |
 | `runs` | Runs dashboard: state, owner, per-run cost |
-| `engine` | Local Resonate store: `gc` counts or prunes settled promises older than a horizon, then VACUUMs; writes only with `--yes`, backs up first, refuses a live loopback engine without `--force` |
+| `engine` | Removed with the vendor store (see Disk maintenance in fleet-ops); engine rows live in the toron index sqlite |
 | `profile`, `squad`, `model`, `slot`, `catalog`, `backend` | Identity and routing: profiles, squads (recipes/template aliases), model registry, routing slots, TUI catalog hub, backend selection (`profile show` projects `fallback`/`model_fallback`; `subscribe --project` names the auto-host pair) |
 | `worktree` | git worktree swarms (never on loop-owned beads) |
 | `guards`, `policy`, `safety` | Active policy guards, destructive-command policy, posture |

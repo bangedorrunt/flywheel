@@ -3,7 +3,7 @@ title: Cron
 description: First-class scheduled primitives (ADR-0012). A cron is not a workflow with a schedule trigger; it owns its own body, policy, and fixer loop.
 ---
 
-A **cron** is a scheduled primitive, distinct from a workflow. It has its own multi-step body that composes workflows via `call_workflow`, plus cron-specific policy (owner, scope, repeat escalation, no-claim timeout). Both run on the same toron-workflow engine; the cron manager is a Resonate durable-sleep loop (`ctx.sleep` until the next tick), not systemd. Missed ticks follow `catchup: latest` (run the most recent due tick on wake), so a flywheel restart loses nothing.
+A **cron** is a scheduled primitive, distinct from a workflow. It has its own multi-step body that composes workflows via `call_workflow`, plus cron-specific policy (owner, scope, repeat escalation, no-claim timeout). Both run on the same toron-workflow engine; cadence comes from `ElmCron` (the host ticks every 30s, one idempotent fire per due schedule, last-fired checkpoints in the state file) and bodies run on the durable body driver — not systemd, not a server. Missed ticks follow `catchup: latest` (run the most recent due tick on wake), so a flywheel restart loses nothing.
 
 ## The 5-minute author
 

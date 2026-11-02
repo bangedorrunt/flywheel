@@ -78,7 +78,7 @@ Findings longer than about 20 lines go to a durable file first; the post carries
 
 | Symptom | Meaning | Move |
 |---|---|---|
-| `flywheel preflight`: resonate DOWN (127.0.0.1:8001 refused) | durable loop and compose engine degraded | `flywheel deps --ensure` starts it, or run open-vehicle work and say so |
+| `flywheel preflight`: engine store DOWN (sqlite missing/unwritable) | durable loop and compose engine degraded | fix the store path and permissions, or run open-vehicle work and say so |
 | toron unreachable | no mail, no reservations | claim with explicit assignee, record file scope in a bead comment, check `git status` + `br list --status in_progress`, minimal scope, note it in the close reason |
 | doorbell port held by a foreign owner | `doorbell start` fails loud | port conflict, not corruption: stop the foreign holder or relocate the daemon |
 | no live fleet, stale reservations | briefing may read file contention | check `held_paths` holders; stale leases are visible in `toron list_file_reservations` |
@@ -96,7 +96,7 @@ Findings longer than about 20 lines go to a durable file first; the post carries
 | `127.0.0.1:18080` | toron daemon (MCP + mailbox) |
 | `127.0.0.1:18081` | chiebukuro MCP (HTTP) |
 | `127.0.0.1:18980` | doorbell daemon |
-| `http://localhost:8001` | Resonate (durable execution) |
+| `~/.local/share/toron/index.sqlite` (engine store) | Durable execution (local sqlite, no server) |
 | `.beads/` | SQLite + `issues.jsonl` + `gates.jsonl` |
 | `.flywheel/` | project stages + standing orders |
 | `.toron/workflows/` | workflow YAML |
