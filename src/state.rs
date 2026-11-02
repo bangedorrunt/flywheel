@@ -1270,9 +1270,9 @@ pub fn save_active_loop(project: &str, al: &ActiveLoop) -> Result<()> {
     Ok(())
 }
 
-/// Delete a project's active-loop sidecar (no-op when absent). Used by tests
-/// and cleanup; there is no tombstone — absence means "no active loop".
-#[cfg(test)]
+/// Delete a project's active-loop sidecar (no-op when absent). Used by the
+/// doctor's stale-row fix and by tests; there is no tombstone — absence means
+/// "no active loop".
 pub fn remove_active_loop(project: &str) -> Result<()> {
     let path = sidecar_file(project);
     match std::fs::remove_file(&path) {

@@ -24806,26 +24806,26 @@ fn cmd_loop_doctor(cfg: &Config, fix: bool, json: bool) -> Result<()> {
         print_json(&report);
         return Ok(());
     }
-    let resonate_ok = report["resonate"]["ok"] == true;
+    let store_ok = report["engine_store"]["ok"] == true;
     println!(
-        "Resonate: {}",
-        if resonate_ok {
-            output::ok("connected")
+        "Engine store: {}",
+        if store_ok {
+            output::ok("park + wake")
         } else {
-            output::error("UNREACHABLE")
+            output::error("UNUSABLE")
         }
     );
-    if !resonate_ok {
+    if !store_ok {
         println!(
             "  {}",
-            report["resonate"]["error"]
+            report["engine_store"]["error"]
                 .as_str()
                 .unwrap_or("unknown error")
         );
     }
     let stale = report["stale_invocations"]["count"].as_u64().unwrap_or(0);
     println!(
-        "Stale pending invocations: {}",
+        "Stale loop rows: {}",
         if stale == 0 {
             output::ok("none")
         } else {
@@ -24894,17 +24894,16 @@ fn cmd_loop_doctor(cfg: &Config, fix: bool, json: bool) -> Result<()> {
         .flatten()
     {
         println!(
-            "  {} [{}] {} (pid {} alive={}, promise {})",
+            "  {} [{}] {} (pid {} alive={})",
             e["project"].as_str().unwrap_or("?"),
             e["verdict"].as_str().unwrap_or("?"),
             e["invocation"].as_str().unwrap_or("?"),
             e["pid"].as_u64().unwrap_or(0),
-            e["process_alive"].as_bool().unwrap_or(false),
-            e["promise"].as_str().unwrap_or("?")
+            e["process_alive"].as_bool().unwrap_or(false)
         );
     }
     if fix {
-        let rejected = report["fixed"]["rejected"]
+        let dropped = report["fixed"]["dropped"]
             .as_array()
             .map(std::vec::Vec::len)
             .unwrap_or(0);
@@ -24913,13 +24912,13 @@ fn cmd_loop_doctor(cfg: &Config, fix: bool, json: bool) -> Result<()> {
             .map(std::vec::Vec::len)
             .unwrap_or(0);
         println!(
-            "Fixed: rejected {} stale invocation(s), pruned {} orphaned pid(s)",
-            rejected, pruned
+            "Fixed: dropped {} stale loop row(s), pruned {} orphaned pid(s)",
+            dropped, pruned
         );
     } else {
         println!(
             "{}",
-            output::dim("re-run with --fix to reject stale invocations + prune orphaned pids")
+            output::dim("re-run with --fix to drop stale loop rows + prune orphaned pids")
         );
     }
     Ok(())

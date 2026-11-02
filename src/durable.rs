@@ -8974,46 +8974,26 @@ pub async fn run_engine_loop(cfg: &Config, params: LoopParams) -> anyhow::Result
     run_durable_loop(cfg, params).await
 }
 // Local liveness row (ActiveLoop) is the pending record — no server query.
-/// bd-gny: verdict over the promise state + loop-process liveness. The
-/// monitor loop's promise stays PENDING for its entire lifetime (it resolves
-/// only when the loop ends), so the raw state alone cannot distinguish a
-/// healthy running loop from an orphaned invocation left behind by a killed
-/// process — the source of the "stuck in Pending forever" confusion.
-fn loop_verdict(state: Option<&PromiseState>, process_alive: bool) -> &'static str {
-    match (state, process_alive) {
-        (Some(PromiseState::Pending), true) => "running",
-        (Some(PromiseState::Pending), false) => "stale",
-        (Some(PromiseState::Resolved), _) => "complete",
-        (Some(PromiseState::Rejected), _) => "failed",
-        (Some(PromiseState::RejectedCanceled), _) => "canceled",
-        (Some(PromiseState::RejectedTimedout), _) => "timed-out",
-        (None, _) => "stale",
+/// bd-gny, re-pointed at rows (bd-flywheel-loop-substrate-ftpm): verdict over
+/// the LOCAL liveness row + loop-process liveness. The row is written at loop
+/// start and stays until the next run replaces it; only the pid registry can
+/// say whether the owner is alive.
+fn loop_verdict(row_present: bool, process_alive: bool) -> &'static str {
+    match (row_present, process_alive) {
+        (true, true) => "running",
+        (true, false) => "stale",
+        (false, _) => "absent",
     }
 }
 
-/// Query the current state of a durable loop invocation.
-pub async fn loop_status(cfg: &Config, project: &str) -> anyhow::Result<serde_json::Value> {
-    let url = cfg
-        .resonate_url()
-        .unwrap_or_else(|| "http://127.0.0.1:8001".to_string());
-    let resonate = Resonate::new(ResonateConfig {
-        url: Some(url),
-        ..Default::default()
-    });
+/// Query the current state of a durable loop invocation (local rows only).
+pub async fn loop_status(_cfg: &Config, project: &str) -> anyhow::Result<serde_json::Value> {
     let Some(al) = crate::state::load_active_loop(project)? else {
         return Ok(serde_json::json!({
             "project": project,
             "loop": "none recorded — run: flywheel loop run <project>"
         }));
     };
-    // bd-gny: a promise the server no longer has (404) is not an error — it is
-    // the definitive stale signal. Any other query failure still propagates.
-    let rec = match resonate.promises.get(&al.id).await {
-        Ok(rec) => Some(rec),
-        Err(Error::ServerError { code: 404, .. }) => None,
-        Err(e) => return Err(anyhow::anyhow!("query {}: {e}", al.id)),
-    };
-    let _ = resonate.stop().await;
     let pid_entry = crate::state::load_loop_pids().get(project).cloned();
     let process_alive = pid_entry
         .as_ref()
@@ -9022,15 +9002,11 @@ pub async fn loop_status(cfg: &Config, project: &str) -> anyhow::Result<serde_js
     Ok(serde_json::json!({
         "project": project,
         "id": al.id,
-        "state": rec
-            .as_ref()
-            .map(|r| format!("{:?}", r.state))
-            .unwrap_or_else(|| "absent".to_string()),
-        "verdict": loop_verdict(rec.as_ref().map(|r| &r.state), process_alive),
+        "state": "row",
+        "verdict": loop_verdict(true, process_alive),
         "pid": pid_entry.as_ref().map(|e| e.pid),
         "process_alive": process_alive,
         "started_at": pid_entry.as_ref().map(|e| e.started_at.clone()),
-        "value": rec.map(|r| r.value),
         "mail_degraded": al.mail_degraded,
         "mail_health": al.mail_health,
         // ADR-0010 D10: the per-bead phase / queue / watermark projection the
@@ -9052,113 +9028,41 @@ fn is_loop_invocation(id: &str) -> bool {
 }
 
 /// bd-eign.4: `flywheel loop doctor` — infrastructure diagnostics + repair.
-/// Checks: (1) Resonate connectivity, (2) stale pending loop invocations
-/// (killed runs leave `swarm-loop:*`/`engine-loop:*` roots pending forever),
-/// (3) orphaned loop PIDs (pid-registry entries whose process is dead),
-/// (4) loops.json consistency (registry entries vs live processes + promises).
-/// `fix=true` rejects stale invocations and prunes orphaned pid entries.
-/// A failed check is recorded in the report, never a hard error — the doctor
-/// must diagnose a broken stack, not fail on it.
-pub async fn loop_doctor(cfg: &Config, fix: bool) -> anyhow::Result<serde_json::Value> {
-    let url = cfg
-        .resonate_url()
-        .unwrap_or_else(|| "http://127.0.0.1:8001".to_string());
-    let resonate = Resonate::new(ResonateConfig {
-        url: Some(url.clone()),
-        ..Default::default()
-    });
-
-    // (1) connectivity — the search is the ping.
-    let connectivity = match resonate
-        .promises
-        .search(Some("pending"), None, Some(1), None)
-        .await
-    {
-        Ok(_) => json!({"ok": true, "url": url, "error": null}),
-        Err(e) => json!({"ok": false, "url": url, "error": e.to_string()}),
+/// Checks: (1) the durable engine-store capability, (2) stale loop rows
+/// (a stored row whose pid is not alive), (3) orphaned loop PIDs, (4) the
+/// loops registry consistency. `fix=true` drops stale rows and prunes
+/// orphaned pid entries. A failed check is recorded in the report, never a
+/// hard error — the doctor must diagnose a broken stack, not fail on it.
+pub async fn loop_doctor(_cfg: &Config, fix: bool) -> anyhow::Result<serde_json::Value> {
+    // (1) the store the loop actually runs on, not a vendor server.
+    let engine_store = match crate::daemon::durable_capability_probe() {
+        Ok(()) => json!({"ok": true, "error": null}),
+        Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
     };
-    let server_up = connectivity["ok"] == true;
 
-    // (2) stale pending loop invocations — page through all pending roots.
-    let mut stale_ids: Vec<String> = Vec::new();
-    let mut rejected: Vec<String> = Vec::new();
-    if server_up {
-        let mut cursor: Option<String> = None;
-        loop {
-            let result = match resonate
-                .promises
-                .search(Some("pending"), None, Some(200), cursor.as_deref())
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("flywheel: doctor: pending search failed: {e}");
-                    break;
-                }
-            };
-            stale_ids.extend(
-                result
-                    .promises
-                    .iter()
-                    .filter(|p| is_loop_invocation(&p.id))
-                    .map(|p| p.id.clone()),
-            );
-            match result.cursor {
-                Some(c) if !c.is_empty() => cursor = Some(c),
-                _ => break,
-            }
-        }
-        stale_ids.sort();
-        if fix {
-            let v = resonate_sdk::types::Value::from_serializable(serde_json::json!({
-                "rejected": "loop-doctor",
-            }))
-            .unwrap_or_default();
-            for id in &stale_ids {
-                match resonate.promises.reject(id, v.clone()).await {
-                    Ok(_) => rejected.push(id.clone()),
-                    Err(e) => eprintln!("flywheel: doctor: reject {id} failed: {e}"),
-                }
-            }
-        }
-    }
-
-    // (4) loops.json consistency — per-project entries vs process + promise.
-    // Query promises while the client is still live.
     let pids = crate::state::load_loop_pids();
     let (_schema, loops) = crate::state::load_loops_registry()?;
+
+    // (2) stale rows — a stored invocation with no live owner.
+    let mut stale_ids: Vec<String> = Vec::new();
     let mut registry: Vec<serde_json::Value> = Vec::new();
     for (project, al) in &loops {
         let pid_entry = pids.get(project);
         let process_alive = pid_entry
             .map(|e| crate::state::pid_alive(e.pid))
             .unwrap_or(false);
-        let promise = if server_up {
-            match resonate.promises.get(&al.id).await {
-                Ok(rec) => format!("{:?}", rec.state),
-                Err(Error::ServerError { code: 404, .. }) => "absent".to_string(),
-                Err(e) => format!("query-error: {e}"),
-            }
-        } else {
-            "unchecked".to_string()
-        };
-        let verdict = if !process_alive {
-            "orphaned-process"
-        } else if promise == "Pending" {
-            "running"
-        } else {
-            "no-pending-promise"
-        };
+        if !process_alive && is_loop_invocation(&al.id) {
+            stale_ids.push(al.id.clone());
+        }
         registry.push(json!({
             "project": project,
             "invocation": al.id,
             "pid": pid_entry.map(|e| e.pid),
             "process_alive": process_alive,
-            "promise": promise,
-            "verdict": verdict,
+            "verdict": loop_verdict(true, process_alive),
         }));
     }
-    let _ = resonate.stop().await;
+    stale_ids.sort();
 
     // (3) orphaned loop PIDs — registry entries whose process is dead.
     let mut orphaned: Vec<serde_json::Value> = Vec::new();
@@ -9184,9 +9088,19 @@ pub async fn loop_doctor(cfg: &Config, fix: bool) -> anyhow::Result<serde_json::
         crate::state::save_loop_pids(&remaining)?;
     }
 
+    let mut dropped: Vec<String> = Vec::new();
+    if fix {
+        for (project, al) in &loops {
+            if stale_ids.contains(&al.id) {
+                crate::state::remove_active_loop(project)?;
+                dropped.push(al.id.clone());
+            }
+        }
+    }
+
     Ok(json!({
         "fix": fix,
-        "resonate": connectivity,
+        "engine_store": engine_store,
         "stale_invocations": {
             "count": stale_ids.len(),
             "ids": stale_ids,
@@ -9200,7 +9114,7 @@ pub async fn loop_doctor(cfg: &Config, fix: bool) -> anyhow::Result<serde_json::
             "entries": registry,
         },
         "fixed": {
-            "rejected": rejected,
+            "dropped": dropped,
             "pruned": pruned,
         },
     }))
@@ -10054,53 +9968,28 @@ mod tests {
     }
 
     #[test]
-    fn loop_verdict_pending_plus_alive_is_running() {
+    fn loop_verdict_row_with_live_process_is_running() {
         assert_eq!(
-            loop_verdict(Some(&PromiseState::Pending), true),
+            loop_verdict(true, true),
             "running",
-            "a pending promise with a live loop process is a healthy running loop"
+            "a stored row with a live loop process is a healthy running loop"
         );
     }
 
     #[test]
-    fn loop_verdict_pending_without_process_is_stale() {
+    fn loop_verdict_row_without_process_is_stale() {
         assert_eq!(
-            loop_verdict(Some(&PromiseState::Pending), false),
+            loop_verdict(true, false),
             "stale",
-            "a pending promise with no live process is an orphaned invocation \
-             (killed loop, promise never settled) — the bd-gny stuck report"
+            "a stored row with no live process is an orphaned invocation — the \
+             bd-gny stuck report, now read from local rows"
         );
     }
 
     #[test]
-    fn loop_verdict_absent_promise_is_stale() {
-        assert_eq!(
-            loop_verdict(None, true),
-            "stale",
-            "a state file pointing at a promise the server no longer has is stale"
-        );
-        assert_eq!(loop_verdict(None, false), "stale");
-    }
-
-    #[test]
-    fn loop_verdict_settled_states_ignore_liveness() {
-        assert_eq!(
-            loop_verdict(Some(&PromiseState::Resolved), true),
-            "complete"
-        );
-        assert_eq!(
-            loop_verdict(Some(&PromiseState::Resolved), false),
-            "complete"
-        );
-        assert_eq!(loop_verdict(Some(&PromiseState::Rejected), true), "failed");
-        assert_eq!(
-            loop_verdict(Some(&PromiseState::RejectedCanceled), false),
-            "canceled"
-        );
-        assert_eq!(
-            loop_verdict(Some(&PromiseState::RejectedTimedout), false),
-            "timed-out"
-        );
+    fn loop_verdict_absent_row_is_absent() {
+        assert_eq!(loop_verdict(false, true), "absent");
+        assert_eq!(loop_verdict(false, false), "absent");
     }
 
     fn pev(event_type: &str, pane: &str, status: &str, seq: u64) -> PollEvent {
