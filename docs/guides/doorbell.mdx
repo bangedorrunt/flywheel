@@ -24,6 +24,7 @@ The runtime brain is an interpreter and single writer, not a second policy engin
 See [Functional effect kernel](./effect-kernel) for the reducer/interpreter laws.
 
 - Wake stamps (`last_wake`) come only from real observations: plane status or delivered prompt pins. Planned injects never forge them.
+- A pane wake is a **mail** event (`kind 9/14` on the wake bus) carried by the flywheel inbox host. `doorbell inject` journals a Fact for the digest only: the core reducer answers every `Fact` with `fact_miss`, so an inject never rings a pane on either plane.
 - One live workspace model per workspace; sends are doorbell-with-inbox; waiters park on `WaitCorr` until a receipt drains them (on ndjson and sweep).
 - Budgets 5/30/3 are dispatcher-enforced.
 - After `[doorbell]`, publish presence `working` or post one kind-9 line within 120 seconds, or the pin is `unanswered`.

@@ -86,6 +86,29 @@ and would fail silently into human-in-the-loop. `lint` always runs first, before
 
 Sources and precedence: built-ins (compiled-in), global (`~/.config/flywheel/crons/`), per-project (`<project>/.flywheel/crons/`). Per-project wins over global wins over built-in.
 
+## The awareness digest (host-native, no agent)
+
+`awareness-digest` is **not** a workflow cron. Its facts are local, so the host
+computes them every 15 minutes (`*/15 * * * *`) in `src/awareness.rs`:
+
+```text
+awareness flywheel 06:15 · dispatcher: up pid=1234 · doorbell: ok · agents 5 (busy 2, idle 3, dead 0) · held 4
+```
+
+It is silent unless something moved: no swarm spawned means no digest at all
+(an idle host is not an outage), an unchanged line writes nothing, and a
+**new** conflict files one bead — dispatcher down with panes, an unanswered
+doorbell pin, or two pins holding one reservation path. The beads poller wakes
+an idle captain on a ready bead, so the escalation costs no tokens. One bead
+per conflict episode: while the same conflict persists the digest stays quiet,
+and a cleared conflict resets so a recurrence can ring again. State lives in
+`~/.local/state/flywheel/awareness/<project>.json`.
+
+The catalog entry `awareness-digest` remains as the **on-demand narrative**
+(`flywheel workflow run awareness-digest --execute`): a housekeeper explains
+the numbers when a human asks. It carries no schedule trigger on purpose; a
+trigger would schedule the LLM path this replaced.
+
 ## The self-reporting loop (never "self-healing")
 
 A failing step (one with `on_error: fail_run`, kind-46012 `status=failed`) triggers policy:

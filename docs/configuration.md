@@ -159,7 +159,7 @@ ladder: CLI > `TORON_*` env > `./.toron.toml` > `~/.config/toron/`
 |---|---|---|---|---|
 | toron | `toron serve` | 18080 | `com.toron.serve` | mail, reservations, pins, workflow host. One writer |
 | flywheel | `flywheel serve` | 8787 | `dev.flywheel.daemon` | HTTP window: health, snapshot, send, events. Not a second mail store |
-| flywheel cron | `flywheel cron start` | — | `dev.flywheel.cron` | cron ticks (30s `ElmCron`) and the doorbell-supervisor minute schedule, from the project root |
+| flywheel cron | `flywheel cron start` | — | `dev.flywheel.cron` | cron ticks (30s `ElmCron`), the doorbell-supervisor minute schedule, and the host-native awareness digest (15 min, no agent), from the project root |
 | doorbell | `doorbell serve` | 18980 | `com.doorbell.serve` | the only wake while this port answers |
 
 All units are launchd-persisted (macOS) / systemd user (Linux).

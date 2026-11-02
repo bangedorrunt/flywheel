@@ -1534,12 +1534,7 @@ steps:
         "awareness-digest",
         r#"
 name: awareness-digest
-description: "Captain digest (no loop): presence + reservations + expired request-release + guard denials. First line MUST be dispatcher: up|down <since>. Post kind 9 on the steer channel; DM captain on conflict only."
-trigger:
-  type: schedule
-  cron: "*/15 * * * *"
-  owner: flywheel
-  scope: project
+description: "On-demand narrative fleet digest. The PERIODIC digest is host-native (no agent, no tokens) and files a bead on a new conflict; run this only when a human asks for the story behind the numbers."
 principles:
   - never-block-on-the-human
   - prove-it-works
@@ -1552,7 +1547,7 @@ steps:
     spec:
       profile: "@housekeeper"
       harness: "opencode"
-      task: "AWARENESS DIGEST for {{inputs.project}} (no loop run). First lines MUST be `flywheel status {{inputs.project}}` JSON `dispatcher` + `unanswered` (or `flywheel __doorbell --project {{inputs.project}} --workspace <label> --report`): `dispatcher: up|down …` then `doorbell: ok` or `doorbell: unanswered pin=…`. Then snapshot: presence list, active reservations, expired request-release, guard denials. Post the digest as one kind-9 on the project steer channel. DM the captain on conflict: dispatcher down, unanswered doorbell (deaf pane), hard reservation overlap, unanswered request-release. No beads, no repo edits. Per-project cron YAML lives at {{inputs.project}}/.flywheel/crons/ (builtin is the default)."
+      task: "Read-only fleet narrative for {{inputs.project}}. Start from `flywheel status {{inputs.project}}` (JSON) and `flywheel __doorbell --project {{inputs.project}} --report`; do not re-derive what those print. Explain, in a few lines: is the dispatcher up, which panes are busy/idle/dead, which reservation paths are held and by whom, and whether any conflict is waiting on a human (dispatcher down with panes, an unanswered doorbell pin, a hard reservation overlap, an unanswered request-release). Name the next action per conflict. Do NOT post to a channel, do NOT DM anyone, do NOT file beads: the periodic host-native digest already escalates conflicts by bead. No repo edits."
     on_error: fail_run
 "#,
     ),
@@ -2682,36 +2677,32 @@ mod tests {
         }
     }
 
+    /// The periodic digest is host-native (`awareness::tick`): paying an agent
+    /// every 15 minutes to re-read local state is the cost this removes. The
+    /// catalog entry stays as the ON-DEMAND narrative, so it must not carry a
+    /// schedule trigger — a trigger would schedule the LLM path again.
     #[test]
-    fn awareness_digest_is_project_schedule() {
-        use toron_workflow::schema::{CronScope, Trigger};
+    fn awareness_digest_is_on_demand_not_scheduled() {
         let wfs = builtin_workflows();
         let d = wfs
             .get("awareness-digest")
             .expect("awareness-digest builtin");
-        match &d.trigger {
-            Some(Trigger::Schedule { cron, scope, .. }) => {
-                assert!(!cron.is_empty(), "schedule cron present");
-                assert_eq!(*scope, CronScope::Project, "per-project digest");
-            }
-            other => panic!("expected schedule trigger, got {other:?}"),
-        }
+        assert!(
+            d.trigger.is_none(),
+            "the periodic digest is host-native; a schedule trigger here re-adds the LLM cron"
+        );
         let yaml = BUILTIN_WORKFLOWS_YAML
             .iter()
             .find(|(n, _)| *n == "awareness-digest")
             .map(|(_, y)| *y)
             .unwrap();
         assert!(
-            yaml.contains("dispatcher: up|down"),
-            "digest first line is dispatcher liveness"
+            yaml.contains("host-native"),
+            "the on-demand entry must say where the periodic digest lives"
         );
         assert!(
-            yaml.contains("no loop run"),
-            "digest must not require loop run"
-        );
-        assert!(
-            yaml.contains("unanswered"),
-            "digest must treat unanswered doorbell as conflict"
+            yaml.contains("do NOT DM anyone"),
+            "the narrative must not duplicate the host-native escalation"
         );
     }
 

@@ -1090,7 +1090,7 @@ pub async fn start_loops(cfg: &crate::config::Config, project: Option<&str>) -> 
     }
 
     let store = crate::effect_journal::journal_store();
-    let plan = partition_cron_work(&manager, &registrations, &rows, store.is_some())?;
+    let mut plan = partition_cron_work(&manager, &registrations, &rows, store.is_some())?;
     for note in &plan.refused {
         eprintln!("cron {note}");
     }
@@ -1100,11 +1100,33 @@ pub async fn start_loops(cfg: &crate::config::Config, project: Option<&str>) -> 
         plan.refused.len()
     );
 
+    // The awareness digest is host-native (local facts, no agent). A catalog
+    // copy of the old workflow would otherwise schedule a second, LLM-backed
+    // fire under the same name; the host's schedule owns that name.
+    let native = [crate::awareness::NAME];
+    let before = plan.durable.len();
+    plan.durable.retain(|b| {
+        let keep = !native.contains(&b.display.as_str());
+        if !keep {
+            eprintln!(
+                "cron {}: host-native schedule (no agent body scheduled; the authored workflow body is ignored)",
+                b.display
+            );
+        }
+        keep
+    });
+    if plan.durable.len() != before {
+        // The supervisor and digest still ride the host, so this count is the
+        // workflow bodies only.
+        eprintln!("cron: {} workflow body(ies) planned", plan.durable.len());
+    }
+
     // The ElmCron host always runs when a store exists — it also carries
     // the doorbell-supervisor minute schedule. Without a store everything
     // is legacy by construction (the router refuses without one).
     let elm_handle = match store {
         Some(store) => Some(tokio::spawn(run_elm_cron_host(
+            cfg.clone(),
             plan.durable,
             store,
             project.map(str::to_string),
@@ -1122,6 +1144,14 @@ pub async fn start_loops(cfg: &crate::config::Config, project: Option<&str>) -> 
         let _ = handle.await;
     }
     Ok(())
+}
+
+/// `HH:MM` on the host clock — the digest's timestamp prefix.
+pub(crate) fn clock_hhmm(unix_secs: u64) -> String {
+    let secs = i64::try_from(unix_secs).unwrap_or(i64::MAX);
+    chrono::DateTime::from_timestamp(secs, 0)
+        .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+        .unwrap_or_default()
 }
 
 /// ElmCron host cadence: one [`ElmCron::tick`] per interval (bd-25g7.4
@@ -1370,7 +1400,13 @@ fn unix_ms() -> u64 {
 /// persist checkpoints at fire time (toron semantics — a body failure never
 /// rewinds the checkpoint), drive each fire in its own task. Runs until the
 /// process dies, like the legacy drain tasks.
+///
+/// Three kinds of fire: workflow bodies (the plan), the doorbell supervisor
+/// (heals panes every minute), and the awareness digest (local facts, no
+/// agent). The last two are host-native and still get an engine run from
+/// `tick`, so both settle that run themselves.
 async fn run_elm_cron_host(
+    cfg: crate::config::Config,
     bodies: Vec<CronBody>,
     store: toron_core::index::workflow_effects::WorkflowEffectStore,
     project: Option<String>,
@@ -1409,6 +1445,19 @@ async fn run_elm_cron_host(
             .unwrap_or(0),
     ) {
         eprintln!("cron doorbell-supervisor: invalid schedule: {e:#}");
+    }
+    // The awareness digest is host-native too: its facts are local, so paying
+    // an agent to re-read them every 15 minutes was the expensive way to say
+    // "nothing changed".
+    if let Err(e) = elm.add(
+        crate::awareness::NAME,
+        crate::awareness::SCHEDULE,
+        checkpoints
+            .get(crate::awareness::NAME)
+            .copied()
+            .unwrap_or(0),
+    ) {
+        eprintln!("cron {}: invalid schedule: {e:#}", crate::awareness::NAME);
     }
     let consecutive: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, u32>>> =
         Default::default();
@@ -1458,7 +1507,34 @@ async fn run_elm_cron_host(
                     // run `ElmCron::tick` started must still be settled here, or
                     // every minute leaves a `running` run and an `in_flight`
                     // journal row that nothing will ever finish.
-                    settle_supervisor_run(store, key, healed.is_ok()).await;
+                    settle_native_run(store, key, healed.is_ok(), crate::doorbell::SUPERVISOR_NAME)
+                        .await;
+                });
+                continue;
+            }
+            if fire.name == crate::awareness::NAME {
+                let store = store.clone();
+                let key = fire.key.clone();
+                let cfg = cfg.clone();
+                let digests = project.clone();
+                tokio::spawn(async move {
+                    let outcome = match digests.as_deref() {
+                        Some(project) => crate::awareness::tick(&cfg, project).await,
+                        // A host started outside any project has no fleet to
+                        // be aware of; the schedule still settles.
+                        None => Ok(None),
+                    };
+                    match &outcome {
+                        Ok(_) => {}
+                        Err(e) => eprintln!("cron {}: {e:#}", crate::awareness::NAME),
+                    }
+                    settle_native_run(
+                        store,
+                        key,
+                        outcome.is_ok(),
+                        crate::awareness::NAME,
+                    )
+                    .await;
                 });
                 continue;
             }
@@ -1478,12 +1554,13 @@ async fn run_elm_cron_host(
     }
 }
 
-/// Settle the supervisor's out-of-band fire in the journal scope that started
-/// it (`cron`), so its run row reaches a terminal phase.
-async fn settle_supervisor_run(
+/// Settle a host-native fire (doorbell supervisor, awareness digest) in the
+/// journal scope that started it (`cron`), so its run row reaches a phase.
+async fn settle_native_run(
     store: toron_core::index::workflow_effects::WorkflowEffectStore,
     run_key: String,
     succeeded: bool,
+    label: &'static str,
 ) {
     use toron_core::index::durable_engine::ToronEngineStore;
     use toron_core::journal::{JournalDb, ToronJournal};
@@ -1504,8 +1581,8 @@ async fn settle_supervisor_run(
     .await;
     match joined {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => eprintln!("cron doorbell-supervisor: settle failed: {e}"),
-        Err(e) => eprintln!("cron doorbell-supervisor: settle task failed: {e}"),
+        Ok(Err(e)) => eprintln!("cron {label}: settle failed: {e}"),
+        Err(e) => eprintln!("cron {label}: settle task failed: {e}"),
     }
 }
 

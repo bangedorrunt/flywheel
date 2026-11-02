@@ -170,6 +170,7 @@ pub fn plist_xml(
     working_dir: Option<&Path>,
     out_log: &Path,
     err_log: &Path,
+    path_env: Option<&str>,
 ) -> String {
     let mut program = format!("\t\t<string>{}</string>\n", binary.display());
     for arg in args {
@@ -180,6 +181,13 @@ pub fn plist_xml(
             "\t<key>WorkingDirectory</key>\n\t<string>{}</string>\n",
             dir.display()
         )
+    });
+    // launchd's default PATH is /usr/bin:/bin:/usr/sbin:/sbin: no `rex`, no
+    // `hc`, no `br`, no `toron`. Every child lookup quietly degrades (the pane
+    // plane falls back to hc, `on_failure: bead` cannot file). The unit
+    // inherits the PATH of the install that wrote it.
+    let path_env = path_env.map_or_else(String::new, |path| {
+        format!("\t\t<key>PATH</key>\n\t\t<string>{path}</string>\n")
     });
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -208,7 +216,7 @@ pub fn plist_xml(
 	<dict>
 		<key>RUST_LOG</key>
 		<string>warn</string>
-	</dict>
+{path_env}	</dict>
 </dict>
 </plist>
 "#,
@@ -384,6 +392,7 @@ fn install_unit(state: &Path, spec: &UnitSpec<'_>) -> anyhow::Result<()> {
                 spec.working_dir,
                 &out_log,
                 &err_log,
+                std::env::var("PATH").ok().as_deref(),
             ),
         )?;
         let _ = Command::new("launchctl")
@@ -413,10 +422,13 @@ fn install_unit(state: &Path, spec: &UnitSpec<'_>) -> anyhow::Result<()> {
         let working_dir = spec.working_dir.map_or_else(String::new, |dir| {
             format!("WorkingDirectory={}\n", dir.display())
         });
+        let path_env = std::env::var("PATH")
+            .map(|path| format!("Environment=PATH={path}\n"))
+            .unwrap_or_default();
         std::fs::write(
             &unit,
             format!(
-                "[Unit]\nDescription=flywheel {} host\n\n[Service]\n{working_dir}ExecStart={} {}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+                "[Unit]\nDescription=flywheel {} host\n\n[Service]\n{working_dir}{path_env}ExecStart={} {}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
                 spec.stem,
                 binary.display(),
                 spec.args.join(" ")
@@ -881,6 +893,7 @@ mod tests {
             Some(Path::new("/work/flywheel")),
             Path::new("/state/cron.out.log"),
             Path::new("/state/cron.err.log"),
+            Some("/opt/homebrew/bin:/usr/bin:/bin"),
         );
         assert!(xml.contains("<string>cron</string>"));
         assert!(xml.contains("<string>--project</string>"));
@@ -899,9 +912,13 @@ mod tests {
             None,
             Path::new("/state/serve.out.log"),
             Path::new("/state/serve.err.log"),
+            Some("/opt/homebrew/bin:/usr/bin:/bin"),
         );
         assert!(serve.contains("<string>serve</string>"));
         assert!(!serve.contains("WorkingDirectory"));
+        // launchd's bare PATH hides rex/hc/br/toron from every child.
+        assert!(xml.contains("<key>PATH</key>"));
+        assert!(xml.contains("/opt/homebrew/bin"));
     }
 
     /// bd-flywheel-probe-qjay: the probe parks a scratch run and drains its
@@ -978,6 +995,7 @@ mod tests {
             None,
             Path::new("/tmp/out.log"),
             Path::new("/tmp/err.log"),
+            None,
         );
         assert!(xml.contains("/usr/local/bin/flywheel"));
         assert!(xml.contains("<string>serve</string>"));

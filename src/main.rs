@@ -28,6 +28,7 @@ mod agentstate;
 mod approval;
 mod artifact;
 mod authority;
+mod awareness;
 mod backend;
 mod briefing;
 mod builtin_workflows;
