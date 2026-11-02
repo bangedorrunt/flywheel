@@ -1855,8 +1855,14 @@ async fn drive_cron_graph(
                     wave: _,
                     attempt,
                     inputs,
+                    item,
                 } => {
-                    let Some(node_def) = body
+                    // bd-durable-foreach-jpgx: the lowered/expanded graph lives
+                    // on the MODEL (a `steps:` fan-out gains nodes at open,
+                    // a foreach gains them when it is ready), never on the
+                    // authored body.
+                    let Some(node_def) = run
+                        .model()
                         .workflow
                         .graph
                         .as_ref()
@@ -1880,6 +1886,7 @@ async fn drive_cron_graph(
                             attempt,
                             trigger: &trigger,
                             inputs: &snapshot,
+                            item: item.as_ref(),
                         },
                         seams,
                     )
