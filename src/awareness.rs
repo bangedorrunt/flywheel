@@ -61,6 +61,10 @@ struct Remembered {
     signature: String,
     #[serde(default)]
     bead: Option<String>,
+    /// Whether the last fire saw a swarm. A swarm that VANISHES is news; a
+    /// host that never had one is not.
+    #[serde(default)]
+    swarm: bool,
 }
 
 /// Compute the facts for one project from local state.
@@ -136,11 +140,17 @@ fn overlaps(pins: &[crate::snapshot::PinRow]) -> Vec<(String, Vec<String>)> {
 /// Decide what this fire does. Pure: the state file is the only input beyond
 /// the facts, so a test can pin every arm without a store.
 pub fn decide(facts: &Facts, remembered: &Remembered) -> Action {
-    let signature = facts.conflicts.join(" | ");
+    let mut conflicts = facts.conflicts.clone();
+    if remembered.swarm && !facts.swarm {
+        // All panes gone is the loudest thing a digest can say, and it used to
+        // be the quietest: "no swarm" was treated as idle.
+        conflicts.push("swarm vanished: 0 agents, dispatcher not up".to_string());
+    }
+    let signature = conflicts.join(" | ");
     if !signature.is_empty() && signature != remembered.signature {
         return Action::Escalate {
             line: facts.line.clone(),
-            conflicts: facts.conflicts.clone(),
+            conflicts,
             signature,
         };
     }
@@ -172,6 +182,7 @@ pub async fn tick(cfg: &crate::config::Config, project: &str) -> Result<Option<S
         Action::Silent => Ok(None),
         Action::Log(line) => {
             remembered.line = line.clone();
+            remembered.swarm = facts.swarm;
             // A cleared conflict ends the episode, so the same fault can wake
             // the captain again if it comes back.
             remembered.signature.clear();
@@ -186,6 +197,7 @@ pub async fn tick(cfg: &crate::config::Config, project: &str) -> Result<Option<S
         } => {
             let bead = file_conflict(project, &line, &conflicts).await?;
             remembered.line = line.clone();
+            remembered.swarm = facts.swarm;
             remembered.signature = signature;
             remembered.bead = bead.clone();
             save(project, &remembered)?;
@@ -316,6 +328,7 @@ mod tests {
         assert_eq!(decide(&facts, &Remembered::default()), Action::Log(facts.line.clone()));
         let remembered = Remembered {
             line: facts.line.clone(),
+            swarm: true,
             ..Default::default()
         };
         assert_eq!(decide(&facts, &remembered), Action::Silent);
@@ -340,6 +353,7 @@ mod tests {
             line: facts.line.clone(),
             signature,
             bead: Some("bd-1".into()),
+            swarm: true,
         };
         assert_eq!(decide(&facts, &remembered), Action::Silent);
         // A second, different conflict is a new episode.
@@ -351,6 +365,23 @@ mod tests {
         assert!(matches!(decide(&worse, &remembered), Action::Escalate { .. }));
     }
 
+    /// A swarm that disappears is an escalation, not "idle host, say nothing".
+    #[test]
+    fn a_vanished_swarm_rings_once() {
+        let gone = facts_of("awareness p · agents 0", &[], false);
+        let had_swarm = Remembered {
+            line: "awareness p · agents 3".into(),
+            swarm: true,
+            ..Default::default()
+        };
+        let Action::Escalate { conflicts, .. } = decide(&gone, &had_swarm) else {
+            panic!("a vanished swarm must escalate");
+        };
+        assert!(conflicts.iter().any(|c| c.contains("swarm vanished")));
+        // A host that never had a swarm stays silent on the same facts.
+        assert_eq!(decide(&gone, &Remembered::default()), Action::Silent);
+    }
+
     /// A cleared conflict forgets the signature, so a recurrence rings again.
     #[test]
     fn a_cleared_conflict_can_ring_again() {
@@ -359,6 +390,7 @@ mod tests {
             line: "awareness p · stale".into(),
             signature: "unanswered doorbell: X".into(),
             bead: Some("bd-1".into()),
+            swarm: true,
         };
         assert_eq!(decide(&facts, &remembered), Action::Log(facts.line.clone()));
     }
