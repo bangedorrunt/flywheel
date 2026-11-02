@@ -120,11 +120,12 @@ fn unix_ms() -> u64 {
 fn handles(
     store: &WorkflowEffectStore,
     handle: &tokio::runtime::Handle,
+    journal_scope: &str,
 ) -> (EngineStore, Journal, State) {
     let pool = store.pool().clone();
     (
         ToronEngineStore::spawn(pool.clone(), handle),
-        ToronJournal::spawn(JournalDb::new(pool.clone(), "body", 64), handle),
+        ToronJournal::spawn(JournalDb::new(pool.clone(), journal_scope, 64), handle),
         SyncWorkflowState::spawn(pool, handle),
     )
 }
@@ -158,12 +159,28 @@ pub async fn drive(
     trigger: Value,
     seams: &BodySeams,
 ) -> BodyOutcome {
+    drive_in_scope(store, run_id, workflow, trigger, seams, "body").await
+}
+
+/// [`drive`], in the journal scope that STARTED the run.
+///
+/// The engine key is one run: a host that starts it (cron's `ElmCron`) and a
+/// body that drives it must share the journal scope, or the body settles a
+/// second row and the starter's row stays `in_flight` forever.
+pub async fn drive_in_scope(
+    store: &WorkflowEffectStore,
+    run_id: &str,
+    workflow: &Workflow,
+    trigger: Value,
+    seams: &BodySeams,
+    journal_scope: &str,
+) -> BodyOutcome {
     let handle = tokio::runtime::Handle::current();
     let graph = needs_graph_model(workflow);
     if graph {
-        drive_graph(store, &handle, run_id, workflow, trigger, seams).await
+        drive_graph(store, &handle, run_id, workflow, trigger, seams, journal_scope).await
     } else {
-        drive_linear(store, &handle, run_id, workflow, trigger, seams).await
+        drive_linear(store, &handle, run_id, workflow, trigger, seams, journal_scope).await
     }
 }
 
@@ -174,8 +191,9 @@ async fn drive_linear(
     workflow: &Workflow,
     trigger: Value,
     seams: &BodySeams,
+    journal_scope: &str,
 ) -> BodyOutcome {
-    let (engine_store, journal, state) = handles(store, handle);
+    let (engine_store, journal, state) = handles(store, handle, journal_scope);
     let wf = workflow.clone();
     let rid = run_id.to_string();
     let trig = trigger.clone();
@@ -299,8 +317,9 @@ async fn drive_graph(
     workflow: &Workflow,
     trigger: Value,
     seams: &BodySeams,
+    journal_scope: &str,
 ) -> BodyOutcome {
-    let (engine_store, journal, state) = handles(store, handle);
+    let (engine_store, journal, state) = handles(store, handle, journal_scope);
     let wf = workflow.clone();
     let rid = run_id.to_string();
     let trig = trigger.clone();

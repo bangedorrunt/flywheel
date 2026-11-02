@@ -1211,7 +1211,7 @@ fn partition_cron_work(
             }
         }
     }
-    for reg in registrations.iter().filter(|r| r.enabled) {
+    for reg in unowned_registrations(rows, registrations) {
         let entry = manager
             .show(&reg.name)?
             .map(|m| m.entry)
@@ -1241,6 +1241,25 @@ fn partition_cron_work(
         }
     }
     Ok(plan)
+}
+
+/// The registrations that are NOT already covered by a spec row.
+///
+/// A builtin workflow with a schedule trigger appears in both views: the row
+/// set (`builtin_crons` / the cron YAML tiers) and the merged catalog view.
+/// Planning both would register the same cron twice and fire two bodies per
+/// tick, so the row owns the name and the registration is the duplicate view
+/// of it. A workflow-only schedule (no cron YAML entry) is still planned.
+fn unowned_registrations<'a>(
+    rows: &[CronRow],
+    registrations: &'a [toron_workflow::CronRegistration],
+) -> Vec<&'a toron_workflow::CronRegistration> {
+    let owned: std::collections::BTreeSet<&str> =
+        rows.iter().map(|row| row.name()).collect();
+    registrations
+        .iter()
+        .filter(|reg| reg.enabled && !owned.contains(reg.name.as_str()))
+        .collect()
 }
 
 /// Why one body cannot run on the durable host: no store, an approval park
@@ -1423,8 +1442,11 @@ async fn run_elm_cron_host(
         }
         for fire in fires {
             if fire.name == crate::doorbell::SUPERVISOR_NAME {
+                let store = store.clone();
+                let key = fire.key.clone();
                 tokio::spawn(async move {
-                    match crate::doorbell::heal_tick_body().await {
+                    let healed = crate::doorbell::heal_tick_body().await;
+                    match &healed {
                         Ok(healed) => {
                             if !healed.is_empty() {
                                 eprintln!("cron doorbell-supervisor: healed {}", healed.join(","));
@@ -1432,6 +1454,11 @@ async fn run_elm_cron_host(
                         }
                         Err(e) => eprintln!("cron doorbell-supervisor: heal failed: {e}"),
                     }
+                    // This body is not a workflow: it heals panes directly. The
+                    // run `ElmCron::tick` started must still be settled here, or
+                    // every minute leaves a `running` run and an `in_flight`
+                    // journal row that nothing will ever finish.
+                    settle_supervisor_run(store, key, healed.is_ok()).await;
                 });
                 continue;
             }
@@ -1448,6 +1475,37 @@ async fn run_elm_cron_host(
             });
         }
         tokio::time::sleep(std::time::Duration::from_secs(ELM_TICK_INTERVAL_SECS)).await;
+    }
+}
+
+/// Settle the supervisor's out-of-band fire in the journal scope that started
+/// it (`cron`), so its run row reaches a terminal phase.
+async fn settle_supervisor_run(
+    store: toron_core::index::workflow_effects::WorkflowEffectStore,
+    run_key: String,
+    succeeded: bool,
+) {
+    use toron_core::index::durable_engine::ToronEngineStore;
+    use toron_core::journal::{JournalDb, ToronJournal};
+    use toron_core::kernel::{OurEngine, RunEnd, end_run};
+
+    let handle = tokio::runtime::Handle::current();
+    let joined = tokio::task::spawn_blocking(move || {
+        let journal = ToronJournal::spawn(JournalDb::new(store.pool().clone(), "cron", 64), &handle);
+        let engine_store = ToronEngineStore::spawn(store.pool().clone(), &handle);
+        let mut engine = OurEngine::with_journal(engine_store, journal);
+        let end = if succeeded {
+            RunEnd::Succeeded
+        } else {
+            RunEnd::Failed
+        };
+        end_run(&mut engine, &run_key, end).map_err(|e| e.to_string())
+    })
+    .await;
+    match joined {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("cron doorbell-supervisor: settle failed: {e}"),
+        Err(e) => eprintln!("cron doorbell-supervisor: settle task failed: {e}"),
     }
 }
 
@@ -1481,7 +1539,19 @@ async fn drive_cron_body(
             crate::workflow_catalog::subworkflow_resolver(None),
         )),
     };
-    match crate::durable_body::drive(store, &fire.key, &body.workflow, trigger, &seams).await {
+    match crate::durable_body::drive_in_scope(
+        store,
+        &fire.key,
+        &body.workflow,
+        trigger,
+        &seams,
+        // ElmCron started this run in the `cron` journal. Driving it in any
+        // other scope would settle a second row and leave the starter's row
+        // `in_flight` forever.
+        "cron",
+    )
+    .await
+    {
         crate::durable_body::BodyOutcome::Completed(output) => CronBodyOutcome::Completed(output),
         crate::durable_body::BodyOutcome::Failed { error, step } => CronBodyOutcome::Failed {
             error,
@@ -1780,6 +1850,45 @@ mod tests {
             enabled: true,
             created_at: "2026-08-08T00:00:00Z".to_string(),
         }
+    }
+
+    /// A builtin schedule workflow shows up in both the row set and the merged
+    /// registration view. Only the row may be planned, or every tick fires the
+    /// same cron twice (two engines, two bodies).
+    #[test]
+    fn a_row_owns_its_name_so_the_registration_is_not_planned_twice() {
+        let row_name = builtin_crons()
+            .keys()
+            .next()
+            .expect("at least one builtin cron")
+            .clone();
+        let rows = load_crons(&crate::config::Config::load().unwrap(), None).unwrap();
+        let planned = |name: &str| toron_workflow::CronRegistration {
+            name: name.to_string(),
+            cron: "*/15 * * * *".to_string(),
+            workflow: toron_workflow::schema::Workflow {
+                name: name.to_string(),
+                description: None,
+                trigger: None,
+                policy: None,
+                guard: None,
+                principles: vec![],
+                steps: vec![],
+                graph: None,
+                inputs: vec![],
+                crew: None,
+            },
+            owner: "housekeeper".to_string(),
+            scope: toron_workflow::schema::CronScope::Host,
+            enabled: true,
+        };
+        let registrations = vec![planned(&row_name), planned("workflow-only")];
+        let kept = unowned_registrations(&rows, &registrations);
+        assert_eq!(
+            kept.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["workflow-only"],
+            "the row owns {row_name}; only the workflow-only schedule is new"
+        );
     }
 
     /// ADR-0032 Spec 9 tail: `cron history` reads the same run rows as
