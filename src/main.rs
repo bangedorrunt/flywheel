@@ -43837,7 +43837,7 @@ mod adr0010_d7_tests {
             .expect("relaunch arm");
         let exit_arm = &body[exit..relaunch];
         assert!(
-            exit_arm.contains("pane.close"),
+            exit_arm.contains("terminal_kill") || exit_arm.contains("pane.close"),
             "exit closes the pane: {exit_arm}"
         );
         for banned in [
@@ -43863,7 +43863,10 @@ mod adr0010_d7_tests {
         let checkpoint = relaunch_arm
             .find("save_relaunch_journal")
             .expect("journal checkpoint");
-        let stop = relaunch_arm.find("pane.close").expect("stop");
+        let stop = relaunch_arm
+            .find("terminal_kill")
+            .or_else(|| relaunch_arm.find("pane.close"))
+            .expect("stop");
         assert!(
             checkpoint < stop,
             "checkpoint BEFORE stop (journaled transaction)"

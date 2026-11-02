@@ -5557,15 +5557,11 @@ steps:
     }
 
     #[test]
-    fn local_engine_without_runtime_panics() {
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = toron_workflow::WorkflowEngine::local();
-        }))
-        .is_err();
-        assert!(
-            panicked,
-            "Resonate::local must refuse to construct off-runtime"
-        );
+    fn local_engine_constructs_without_a_runtime() {
+        // ADR-0043: the engine is an in-process durable driver; it has no
+        // vendor runtime to enter, so construction must work anywhere.
+        let engine = toron_workflow::WorkflowEngine::local();
+        assert!(engine.is_ok(), "local engine constructs off-runtime");
     }
 }
 

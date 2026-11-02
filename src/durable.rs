@@ -12951,10 +12951,11 @@ mod tests {
             .expect("run_durable_loop after swarm_loop");
         let body = &loop_body[..loop_end];
         assert!(
-            body.contains(
-                "let authority = ctx.get_dependency::<crate::authority::RuntimeAuthority>();"
-            ),
-            "bd-0fvb: swarm_loop must take RuntimeAuthority from ctx.get_dependency (host DI)"
+            loop_body
+                .split('{')
+                .next()
+                .is_some_and(|sig| sig.contains("authority: crate::authority::RuntimeAuthority")),
+            "bd-0fvb: swarm_loop must take RuntimeAuthority as a host-injected parameter"
         );
         assert!(
             !body.contains(&["RuntimeAuthority::", "resolve()"].concat()),
@@ -12967,11 +12968,13 @@ mod tests {
             );
         }
         let host = &loop_body[loop_end..];
-        let inject = [".with_dependency(", "authority.clone())"].concat();
+        let resolve = ["let authority = crate::authority::", "RuntimeAuthority::resolve();"].concat();
         let stamp = ["let now_nanos = authority", ".clock.now_nanos();"].concat();
         assert!(
-            host.contains(&inject) && host.contains(&stamp),
-            "bd-0fvb: the host edge must inject the resolved authority and stamp time from it"
+            host.contains(&resolve)
+                && host.contains(&stamp)
+                && host.contains("swarm_loop(authority"),
+            "bd-0fvb: the host edge must resolve the authority once, pass it in, and stamp time from it"
         );
     }
 
@@ -14991,7 +14994,7 @@ mod tests {
             .next()
             .expect("arm body");
         assert!(
-            arm.contains("release_bead_locks"),
+            arm.contains("__release-bead-locks"),
             "the open->closed arm must release the bead's reservations (bd-lob1)"
         );
         // The leaf is the operator-signed door, and main.rs implements it via
