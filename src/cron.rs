@@ -1639,7 +1639,10 @@ async fn drive_cron_body(
         verify_sink: VerifySink::default(),
         journal_mode: EffectJournalMode::Enforced,
     };
-    if body.workflow.graph.is_some() {
+    // bd-durable-parallel-53um: a `steps:` fan-out is lowered onto the graph,
+    // so the routing predicate is the shape's, not `graph.is_some()`. Driving
+    // it linearly would refuse at open and lose the body.
+    if toron_workflow::engine::durable::needs_graph_model(&body.workflow) {
         drive_cron_graph(store, &handle, body, &fire.key, trigger, digest, &seams).await
     } else {
         drive_cron_linear(store, &handle, body, &fire.key, trigger, digest, &seams).await
