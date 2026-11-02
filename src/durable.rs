@@ -1202,23 +1202,6 @@ pub fn wave_scope_filter(
         .collect())
 }
 
-/// Args for the `__mail-not-ready` leaf (ADR-0019): tell the planner a
-/// ready bead is NOT dispatchable because its `## VERIFY` fence is
-/// missing/malformed (or its PRINCIPLES section is incomplete — bd-4spn).
-/// The loop mails at most once per bead per invocation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NotReadyMailArgs {
-    pub project: String,
-    pub bead_id: String,
-    pub title: String,
-    /// bd-bead-create-contract-lint-4tdd: the exact block reason
-    /// (`principles_block_reason` / the fence error) — carried in the mail
-    /// body, not just stderr. The 2026-08-17 mislabeled-log class ended
-    /// with a generic body + a wrong parser hunt.
-    #[serde(default)]
-    pub reason: Option<String>,
-}
-
 /// Pure: the loop's status word for one `__mail-not-ready` leaf result. A
 /// leaf reporting `ok:false` — or JSON carrying no `ok` at all — is a
 /// FAILURE. The old line printed `planner mailed: {v}` unconditionally, a
@@ -1231,45 +1214,6 @@ pub(crate) fn not_ready_mail_status(v: &serde_json::Value) -> &'static str {
         _ => "planner NOT mailed",
     }
 }
-
-/// Checkpointed leaf — mail the planner that bead `bead_id` is NOT ready
-/// (missing/malformed `## VERIFY` fence, ADR-0019). The underlying
-/// `__mail-not-ready` command always exits 0 with `{ok, notified, error}` —
-/// a mail hiccup must never kill the loop.
-
-/// Args for the `__mail-done` leaf (programmatic done-mail, 2026-08-18):
-/// the loop mails the captain the close-reason REPORT when a watched bead
-/// closes with a legal verdict. One mail per bead per loop invocation (the
-/// `done_mailed` set) — the courtesy does not depend on the agent
-/// remembering; the close reason is the durable copy, this mail is the
-/// captain's copy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-// Constructed by serde at the `#[function]` entry point, not by a literal.
-#[allow(dead_code)]
-pub struct MailDoneArgs {
-    pub project: String,
-    pub bead_id: String,
-}
-
-/// Checkpointed leaf — mail the captain that bead `bead_id` closed with a
-/// legal verdict. Always exits 0 with `{ok, notified, error}` — a mail
-/// hiccup must never kill the loop.
-
-/// Args for the `__reservation-board` leaf (ADR-0019 Spec 3.4/3.5).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReservationBoardArgs {
-    pub project: String,
-}
-
-/// Checkpointed leaf — the project's active reservation board as
-/// `(path_pattern, reason)` rows (reason = the holding bead's id, from
-/// `active_reservations`, bd-dsu1). Kept for EXTERNAL / detached callers
-/// and tests. bd-9tbb: the live loop body must NOT consume this leaf — a
-/// checkpointed reply replays the stored board on resume, so a stale
-/// always-serialize row serializes dispatch forever. The loop reads the
-/// board LIVE via [`reservation_board_live`].
-/// Always exits 0 — a mail hiccup degrades to an empty board (no
-/// suppression, existing behavior), never a loop crash.
 
 /// Parse the `__reservation-board` JSON into `(path, reason)` rows. Shared
 /// by the checkpointed leaf and the live read (bd-9tbb).
@@ -1370,268 +1314,6 @@ pub fn pause_resurface_line(name: &str, bead_id: &str, owner: &str, age_secs: u6
     format!(
         "pause-resurface: {name} declared `paused: {owner}` ({age_secs}s held, bead {bead_id}) — the wait needs {owner}; the pane is held, never auto-interrupted"
     )
-}
-
-/// Args for the `__close-check` leaf (ADR-0019, bd-w1-reopen-f6tw).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CloseCheckArgs {
-    pub project: String,
-    pub bead_id: String,
-}
-
-/// Checkpointed leaf — close-detect check: SHA rule + ledger
-/// (`verdict::close_check`). Returns `{status: legal, sha}` |
-/// `{status: missing, sha, receipt_eligible}` | `{status: no-commit}`. The
-/// loop reopens (and mails once per (bead, sha)) on anything non-legal.
-/// Always exits 0 — a git/br hiccup must never kill the loop.
-
-/// Args for the `__reopen-bead` leaf (ADR-0019, bd-w1-reopen-f6tw).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReopenBeadArgs {
-    pub project: String,
-    pub bead_id: String,
-    /// The derived close sha (empty for the no-commit case — marker keyed
-    /// "nocommit" so the one-mail-per-(bead, sha) guard still holds).
-    pub sha: String,
-}
-
-/// Checkpointed leaf — reopen an unverified close: `br reopen` (idempotent)
-/// + ONE mail per (bead, sha) on `thread_id=<bead_id>` (marker-deduped,
-///   durable across ticks and invocations). Always exits 0.
-
-/// Args for the `__verify-dispatch` leaf (ADR-0019 Spec 4,
-/// bd-w1-verifier-degrade-a6fk).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VerifyDispatchArgs {
-    pub project: String,
-    pub bead_id: String,
-    /// Worker model id; absent -> unknown family (every candidate is a
-    /// different family).
-    #[serde(default)]
-    pub worker_model: Option<String>,
-    /// Candidate verifier model ids; absent -> every registered model.
-    #[serde(default)]
-    pub candidates: Option<Vec<String>>,
-    #[serde(default)]
-    pub blast: Option<String>,
-    #[serde(default)]
-    pub ac: Option<String>,
-}
-
-/// Checkpointed leaf — close-detect verifier dispatch: decide the
-/// independent-verifier plan for a closed bead that needs one. Degrade
-/// (single-family swarm) blocks the bead `verifier-family-missing` + mails
-/// the captain exactly once (marker-deduped) + never respawns. Returns
-/// `{plan: none-required|degrade|dispatch, model?}`. Always exits 0 — a
-/// block/mail hiccup must never kill the loop.
-
-/// Args for the `__loop-run-verify` leaf (ADR-0019 cheap band,
-/// bd-w1-loop-run-verify-mbbe).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoopRunVerifyArgs {
-    pub project: String,
-    pub bead_id: String,
-    #[serde(default)]
-    pub sha: Option<String>,
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
-    #[serde(default)]
-    pub strict: bool,
-}
-
-/// The verdict row's timestamp, read from injected authority.
-///
-/// A free function rather than an inline call so the leaf body holds no
-/// ambient read at all (the `bd_lf1u` guard scans leaf bodies) and so the
-/// conversion is testable against a fixed clock.
-fn verdict_at(authority: &crate::authority::RuntimeAuthority) -> chrono::DateTime<chrono::Utc> {
-    authority.now_datetime()
-}
-
-/// Checkpointed leaf — close-detect loop-run VERIFY (cheap band): the LOOP
-/// is the verifier. Executes the bead's VERIFY (TIMEBOX timeout, cargo under
-/// the build slot), then IN-PROCESS (armed) writes the machine receipt and
-/// records `command-verified`. Non-zero exit / timeout -> failed-head marker
-/// (NEVER re-verify the same broken head) + reopen. Returns
-/// `{band: loop-runnable|non-runnable, recorded?|reopened?}`.
-///
-/// bd-lf1u: takes `&Info` and stamps the verdict row's `at` from the
-/// INJECTED authority rather than sampling `chrono::Utc::now()`. That row is
-/// durable DATA — a replay re-reads it — so ambient time made the recorded
-/// proof depend on when the replay happened. The SDK's `LeafWithInfo` kind is
-/// the seam: `&Info` as the first parameter leaves the durable args (and the
-/// replay key built from them) untouched, because `&Info` is supplied by the
-/// runtime and is not serialized.
-async fn loop_run_verify(info: &Info, args: LoopRunVerifyArgs) -> Result<Value> {
-    let authority = info.get_dependency::<crate::authority::RuntimeAuthority>();
-    let exe = self_exe().map_err(map_err)?;
-    let mut cmd = Command::new(&exe);
-    cmd.args(["__loop-run-verify", &args.project, &args.bead_id]);
-    if let Some(sha) = &args.sha {
-        cmd.args(["--sha", sha]);
-    }
-    if let Some(t) = args.timeout_secs {
-        cmd.args(["--timeout-secs", &t.to_string()]);
-    }
-    let out = run_leaf_cmd_bounded(
-        cmd,
-        "__loop-run-verify",
-        std::time::Duration::from_secs(args.timeout_secs.unwrap_or(600)) + LEAF_WATCHDOG_GRACE,
-    )
-    .await?;
-    if !out.status.success() {
-        return Err(map_err(anyhow::anyhow!(
-            "__loop-run-verify failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let v: Value = serde_json::from_str(raw.trim())
-        .unwrap_or_else(|_| serde_json::json!({ "band": "non-runnable", "raw": raw.trim() }));
-    if v.get("band").and_then(Value::as_str) != Some("loop-runnable") {
-        return Ok(v);
-    }
-    let dir = v.get("dir").and_then(Value::as_str).unwrap_or(".");
-    let cwd = std::path::Path::new(dir);
-    let sha = args.sha.clone().unwrap_or_default();
-    let skipped = v.get("skipped").and_then(Value::as_str).is_some();
-    let timed_out = v.get("timed_out").and_then(Value::as_bool).unwrap_or(false);
-    let exit = v.get("exit").and_then(Value::as_i64).unwrap_or(-1);
-    if !skipped && exit == 0 {
-        // Armed in-process writes: only the loop records the proof. The
-        // worker cannot forge what it does not write (anti-forgery).
-        let output = v.get("output_tail").and_then(Value::as_str).unwrap_or("");
-        let verify_cmd = v
-            .get("verify")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        // bd-p4oc: vacuous VERIFY gate — reuse part-1 parse. Cargo-test-shaped
-        // filters that matched 0 tests are evidence of nothing.
-        let is_cargo = crate::is_cargo_test_verify(&verify_cmd);
-        let (passed, filtered) = if is_cargo {
-            crate::parse_cargo_test_counts(output)
-        } else {
-            (None, None)
-        };
-        let is_vacuous = is_cargo && passed == Some(0);
-        // ADR-0016: strictness is loop-params data (resolved once at loop
-        // start), never a mid-leaf env read.
-        let effective_strict = args.strict;
-        if is_vacuous {
-            let warning = format!(
-                "WARNING: vacuous VERIFY — filter `{verify_cmd}` matched 0 tests (evidence proves nothing)"
-            );
-            eprintln!("{warning}");
-            if effective_strict {
-                // Strict: refuse to write verdict, keep bead open with evidence.
-                // Write vacuous evidence receipt for inspection, then reopen.
-                let evidence = format!(
-                    "{warning}\nfiltered out: {}\noutput tail:\n{}\n",
-                    filtered
-                        .map(|n| n.to_string())
-                        .unwrap_or_else(|| "unknown".into()),
-                    output
-                );
-                // Best-effort evidence write (arm check still required for the
-                // real receipt, but vacuous evidence is advisory — ignore errors)
-                let _ = (|| -> anyhow::Result<()> {
-                    // Use the loop-armed writer if armed, else fallback to plain write
-                    let dir = cwd.join(".flywheel").join("receipts");
-                    std::fs::create_dir_all(&dir)?;
-                    let path = dir.join(format!("{}-{}.vacuous.txt", args.bead_id, sha));
-                    std::fs::write(&path, &evidence)?;
-                    Ok(())
-                })();
-                let mut cmd = Command::new(&exe);
-                cmd.args(["__reopen-bead", &args.project, &args.bead_id, &sha]);
-                let out = run_leaf_cmd(cmd, "__reopen-bead").await?;
-                if !out.status.success() {
-                    return Err(map_err(anyhow::anyhow!(
-                        "__reopen-bead failed: {}",
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    )));
-                }
-                return Ok(serde_json::json!({
-                    "band": "loop-runnable",
-                    "reopened": true,
-                    "vacuous": true,
-                    "bead_id": args.bead_id,
-                    "warning": warning,
-                    "filtered": filtered,
-                }));
-            }
-            // Advisory: annotate + warn, but still record the proof.
-            // The warning will be appended to the receipt after it is written.
-        }
-        let receipt =
-            crate::verdict::write_command_verified_receipt(cwd, &args.bead_id, &sha, output);
-        match receipt {
-            Ok(receipt_path) => {
-                // advisory vacuous: annotate the receipt even though we still record
-                if is_vacuous && !effective_strict {
-                    let warning = format!(
-                        "WARNING: vacuous VERIFY — filter `{verify_cmd}` matched 0 tests (evidence proves nothing)"
-                    );
-                    let _ = crate::append_to_receipt(
-                        &receipt_path,
-                        &format!(
-                            "\n{warning}\nfiltered out: {}\n",
-                            filtered
-                                .map(|n| n.to_string())
-                                .unwrap_or_else(|| "unknown".into())
-                        ),
-                    );
-                }
-                let verdict = crate::verdict::Verdict {
-                    kind: crate::verdict::VerdictKind::CommandVerified,
-                    bead_id: args.bead_id.clone(),
-                    sha: sha.clone(),
-                    at: verdict_at(&authority),
-                    actor: crate::verdict::AgentName::new("flywheel-toron-loop1"),
-                    receipt_path,
-                    verify_cmd,
-                };
-                match crate::verdict::report_pass(cwd, &verdict) {
-                    Ok(()) => Ok(serde_json::json!({
-                        "band": "loop-runnable",
-                        "recorded": true,
-                        "bead_id": args.bead_id,
-                        "sha": sha,
-                    })),
-                    Err(e) => Err(map_err(anyhow::anyhow!(
-                        "loop-run-verify record failed for {}: {e}",
-                        args.bead_id
-                    ))),
-                }
-            }
-            Err(e) => Err(map_err(anyhow::anyhow!(
-                "loop-run-verify receipt write failed for {}: {e}",
-                args.bead_id
-            ))),
-        }
-    } else {
-        // Failed or skipped-head: reopen via the `__reopen-bead` leaf command
-        // (idempotent, one mail per (bead, sha); the reopened bead IS the fix
-        // unit — it re-dispatches with the failure in its thread). Never a
-        // re-verify of the same broken head.
-        let mut cmd = Command::new(&exe);
-        cmd.args(["__reopen-bead", &args.project, &args.bead_id, &sha]);
-        let out = run_leaf_cmd(cmd, "__reopen-bead").await?;
-        if !out.status.success() {
-            return Err(map_err(anyhow::anyhow!(
-                "__reopen-bead failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
-        }
-        Ok(serde_json::json!({
-            "band": "loop-runnable",
-            "reopened": true,
-            "bead_id": args.bead_id,
-            "timed_out": timed_out,
-            "exit": exit,
-        }))
-    }
 }
 
 /// The close-path settle plan (bd-5ouq): what one `__loop-run-verify`
@@ -1863,25 +1545,6 @@ fn reopen_bead_journaled(project: &str, bead_id: &str, sha: &str) -> anyhow::Res
         .map_err(|e| anyhow::anyhow!("__reopen-bead failed: {e:#}"))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReadyArgs {
-    pub project: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PollKindArgs {
-    pub project: String,
-    pub name: String,
-}
-
-/// Args for the `__profile` leaf (bd-gsvn.1): the profile name an agent
-/// serves, resolved from the spawn registry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProfileArgs {
-    pub project: String,
-    pub name: String,
-}
-
 /// Args for the `__poll_events` leaf (bd-event-subscribe-reactor).
 /// Simple identifier params only — Resonate constraint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1918,14 +1581,6 @@ pub struct PollEventsBatch {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReadArgs {
-    pub project: String,
-    pub name: String,
-    /// Wall-clock observation captured by the workflow host before the leaf.
-    pub now_unix: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RespawnArgs {
     pub project: String,
     pub name: String,
@@ -1940,12 +1595,6 @@ pub struct RespawnArgs {
     /// respawned agent; the fresh agent must get the prompt again).
     #[serde(default)]
     pub text_hash: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PollArgs {
-    pub project: String,
-    pub to: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2071,31 +1720,6 @@ pub fn verify_reply(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExpectedArgs {
-    pub project: String,
-}
-
-pub fn load_expected_replies_argv(args: &ExpectedArgs) -> Vec<String> {
-    vec!["__expected-replies".to_string(), args.project.clone()]
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheckReplyArgs {
-    pub project: String,
-    pub name: String,
-    pub thread: String,
-}
-
-pub fn check_reply_argv(args: &CheckReplyArgs) -> Vec<String> {
-    vec![
-        "__check-reply".to_string(),
-        args.project.clone(),
-        args.name.clone(),
-        args.thread.clone(),
-    ]
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemindArgs {
     pub project: String,
     pub name: String,
@@ -2121,22 +1745,6 @@ pub fn remind_reply_argv(args: &RemindArgs) -> Vec<String> {
         argv.push(args.iteration.to_string());
     }
     argv
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReplySettledArgs {
-    pub project: String,
-    pub name: String,
-    pub thread: String,
-}
-
-pub fn reply_settled_argv(args: &ReplySettledArgs) -> Vec<String> {
-    vec![
-        "__reply-settled".to_string(),
-        args.project.clone(),
-        args.name.clone(),
-        args.thread.clone(),
-    ]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2213,19 +1821,6 @@ pub struct MailDigest {
     pub last_subject: Option<String>,
     #[serde(default)]
     pub thread_id: Option<String>,
-}
-
-/// Args for the dispatch-dedupe guard leaf (bd-dispatch-dedupe-2zlz):
-/// which bead's thread to scan before a GOAL dispatch.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DispatchGuardArgs {
-    pub project: String,
-    pub bead: String,
-    /// ADR-0016: freshness TTL (µs) resolved at loop start — the leaf never
-    /// reads env mid-tick.
-    pub dispatch_ttl_us: i64,
-    /// Wall-clock observation captured by the workflow host before the leaf.
-    pub now_us: i64,
 }
 
 /// Args for the xproj-spawn leaf (cross-project swarm receive, full branch).
@@ -2323,22 +1918,6 @@ pub(crate) async fn run_leaf_cmd_bounded(
     .await
     .map_err(|e| map_err(anyhow::anyhow!("{label} leaf task join failed: {e}")))?
     .map_err(|e| map_err(anyhow::anyhow!("{label} spawn failed: {e}")))
-}
-
-/// Poll the swarm via the flywheel binary itself. Checkpointed.
-///
-/// SOFT-FAIL: if `__poll` exits non-zero (e.g. the swarm was killed or never
-/// spawned — a normal operational state, not an error), return an EMPTY state
-/// list so the durable loop settles cleanly (`all_settled` treats an empty
-/// swarm as settled) instead of crashing the whole invocation. This mirrors
-/// the `poll_events` leaf's soft-fail and fixes the "durable loop invocation
-/// failed: __poll failed" that killed a run after `flywheel kill <proj>`.
-///
-/// Build the argv for the `__poll` leaf invocation. Pure (testable without
-/// spawning a process). Regression pin for bd-fw-loop-durable-wrong-project:
-/// the leaf must poll the project passed in the loop args — never a default.
-pub fn poll_swarm_argv(project: &str, to: &str) -> Vec<String> {
-    vec!["__poll".to_string(), project.to_string(), to.to_string()]
 }
 
 /// argv for one supervised pass (pure; the CLI spawns it as a child process
@@ -2658,9 +2237,6 @@ pub fn log_poll_events(project: &str, batch: &PollEventsBatch) {
         );
     }
 }
-
-/// List ready beads via the flywheel binary (`br ready --json` in the project).
-/// Checkpointed.
 
 /// Parse the `{"beads": [...]}` leaf output shared by `__ready` (id/title)
 /// and `__inprogress` (id/title/assignee) into `ReadyBead` rows. Pure —
@@ -3777,35 +3353,6 @@ pub fn escalation_tier(
     }
 }
 
-/// Args for the `__reclaim-stranded` leaf (bd-627z.1).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReclaimArgs {
-    pub project: String,
-    pub live: Vec<String>,
-}
-
-/// Result of one `__reclaim-stranded` call: which beads were re-opened to
-/// ready (the loop re-dispatches them this poll) and which failed.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ReclaimResult {
-    #[serde(default)]
-    pub reclaimed: Vec<String>,
-    #[serde(default)]
-    pub failed: Vec<serde_json::Value>,
-}
-
-/// Reclaim stranded in_progress beads (bd-627z.1): each in_progress bead
-/// whose assignee is NOT a live agent is re-opened to ready via the
-/// `__reclaim-stranded` leaf. Checkpointed. Returns the reclaimed ids.
-
-/// Agent kind (opencode/pi/grok) for respawn. Checkpointed.
-
-/// The profile name an agent serves (bd-gsvn.1), from the spawn registry.
-/// Checkpointed leaf — the workflow body never reads files directly (replay
-/// determinism). Empty = plain swarm agent (no profile → raw dispatch).
-
-/// Recent agent output via the flywheel binary. Checkpointed.
-
 /// Replace an exhausted agent with a fresh instance in a new pane.
 /// Checkpointed. Logs a `Respawn` event (side effect inside the leaf so the
 /// log entry is checkpointed with the call).
@@ -4110,22 +3657,6 @@ async fn blocked_ack_gate(args: &NotifyArgs) -> bool {
 /// first_blocked_ts → same tier, and the `last_ping_tier` marker (cg6.3)
 /// suppresses the duplicate mail: at most one ping per logical tier
 /// transition.
-/// bd-a7j leaf: reload the project's expected-reply entries through a
-/// checkpointed subprocess (collab may have written new ones mid-run).
-
-/// bd-a7j leaf: newest (message id, author) in the thread from the asked
-/// agent. Checkpointed — replay sees the same head, so reminder/escalation
-/// decisions reproduce exactly.
-
-/// bd-a7j leaf: log `reply_missing` + dispatch the concrete reminder
-/// (checkpointed unit — the event and the send land together or not at all;
-/// the send recurses into `__send` with the loop invocation, so the last-sent
-/// registry dedups re-fires on crash-resume).
-
-/// bd-a7j leaf: drop a satisfied (agent, thread) expectation so it stops
-/// keeping the loop alive. Checkpointed — the workflow body never writes
-/// files (cg6.1 discipline).
-
 async fn notify_blocked(args: NotifyArgs) -> Result<EscalationOutcome> {
     // ADR-0001 A6: the ladder is gated on the observed ack, read off toron's
     // per-recipient read state (not inferred from elapsed time). The read
@@ -4239,16 +3770,6 @@ pub struct ComposeRequestRow {
     pub body: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-// Constructed by serde at the `#[function]` entry point, not by a literal.
-#[allow(dead_code)]
-pub struct ComposeInboxArgs {
-    pub project: String,
-    pub limit: u32,
-}
-
-/// Scan orchestrator inbox for `[xproj]` requests. Soft-fail empty.
-
 /// bd-dispatch-dedupe-2zlz leaf: run the GOAL gate for one bead. Collects
 /// thread signals + receipts freshness via the `__dispatch-guard` collector,
 /// then applies the pure [`eval_dispatch_guard`] verdict. Scan INFRA
@@ -4302,8 +3823,6 @@ pub(crate) fn settle_dispatch_guard_output(
         Err(reason) => serde_json::json!({ "bead": bead, "dispatch": false, "reason": reason }),
     }
 }
-
-/// scan that says hold always wins.
 
 /// Spawn the swarm for a parsed `[xproj]` request (full loop branch).
 /// Delegates to the `__xproj-spawn` leaf which calls `cmd_spawn` + replies
@@ -4390,21 +3909,6 @@ async fn diagnose_agent(args: DiagnoseArgs) -> Result<Value> {
     }))
 }
 
-/// Args for the [`renew_leases`] leaf.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RenewLeaseArgs {
-    pub project: String,
-    /// TTL extension per active reservation, in seconds.
-    pub extend_seconds: u64,
-}
-
-/// Renew the orchestrator's active file reservations (ADR-0001 gap A3,
-/// bd-mail-lease-renewal-durable). Checkpointed side effect: the leaf calls
-/// `__renew-leases` in a fresh process, so a crash between ticks is resumed
-/// idempotently (renewing an already-fresh lease is a no-op). Best-effort by
-/// contract: the caller logs a failure and continues — a missed renew is
-/// recoverable on the next tick and must never kill an overnight loop.
-
 /// bd-bd79: filtered renewal — renew only leases whose reason matches an
 /// in_progress bead with a live assignee and that are near expiry.
 /// Checkpointed leaf; a failed renewal is surfaced as Err so the caller can
@@ -4460,20 +3964,6 @@ async fn renew_filtered_leases(args: RenewFilteredArgs) -> Result<Value> {
     .await
     .map_err(map_err)
 }
-
-/// Args for the [`release_bead_locks`] leaf.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReleaseBeadLocksArgs {
-    pub project: String,
-    pub bead_id: String,
-}
-
-/// Release every live file reservation whose reason is the closed bead id
-/// (bd-h3oj release-on-bead-close). Checkpointed side effect: the leaf calls
-/// `__release-bead-locks` in a fresh process, so a crash between ticks is
-/// resumed idempotently (a no-op release is fine). Best-effort by contract:
-/// the caller logs a failure and continues — a failed release is recoverable
-/// on a later tick and must never kill the loop.
 
 /// Lease TTL policy for loop-made reservations: an initial TTL of
 /// Renewal extension per heartbeat tick: `4 × heartbeat_interval`, floored at
@@ -4921,19 +4411,6 @@ pub enum LoopAction {
     /// LoopAction stays the loop's own decision set.
     Wait,
 }
-
-/// Args for the context-limit inbox leaf (bd-context-limit-honor-luqg).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-// Constructed by serde at the `#[function]` entry point, not by a literal.
-#[allow(dead_code)]
-pub struct ContextInboxArgs {
-    pub project: String,
-    pub limit: u32,
-}
-
-/// Scan the orchestrator inbox for exact-body CONTEXT_LIMIT crew replies
-/// (bd-context-limit-honor-luqg). Runs `__context-inbox`; a failure yields
-/// an empty list — a mail hiccup must never stall the loop.
 
 /// Map a CONTEXT_LIMIT sender to the crew agent it saturates: MAIL PIN
 /// first (the identity the contract addresses), then the bare terminal name.
@@ -7918,35 +7395,18 @@ async fn swarm_loop(
                                         // reopens (never re-verify the same
                                         // broken head — failed-head marker).
                                         let mut lr_band = String::new();
-                                        let lr_args = LoopRunVerifyArgs {
-                                            project: params.project.clone(),
-                                            bead_id: bead_id.clone(),
-                                            sha: Some(sha.clone()),
-                                            timeout_secs: None,
-                                            strict: params.strict,
-                                        };
                                         // bd-5ouq: the child runs through the
                                         // journaled leaf (same argv); settling
                                         // stays inline with caller authority.
-                                        let mut lr_argv = vec![
-                                            params.project.clone(),
-                                            bead_id.clone(),
-                                            "--sha".to_string(),
-                                            sha.clone(),
-                                        ];
-                                        if let Some(t) = lr_args.timeout_secs {
-                                            lr_argv.push("--timeout-secs".to_string());
-                                            lr_argv.push(t.to_string());
-                                        }
                                         let lr_refs: Vec<&str> =
-                                            lr_argv.iter().map(String::as_str).collect();
+                                            vec![&params.project, &bead_id, "--sha", &sha];
                                         let lr_value =
                                             match crate::elm::leaf::run_leaf_journaled_timeout(
                                                 &params.project,
                                                 "__loop-run-verify",
                                                 &lr_refs,
                                                 &format!("loop-run-verify:{bead_id}:{sha}"),
-                                                lr_args.timeout_secs,
+                                                None,
                                             ) {
                                                 Ok(v) => Some(v),
                                                 Err(e) => {
@@ -10055,31 +9515,6 @@ mod reply_verify_tests {
                 "7"
             ]
         );
-        let ca = CheckReplyArgs {
-            project: "proj".into(),
-            name: "oc".into(),
-            thread: "t1".into(),
-        };
-        assert_eq!(
-            check_reply_argv(&ca),
-            vec!["__check-reply", "proj", "oc", "t1"]
-        );
-        let ea = ExpectedArgs {
-            project: "proj".into(),
-        };
-        assert_eq!(
-            load_expected_replies_argv(&ea),
-            vec!["__expected-replies", "proj"]
-        );
-        let sa = ReplySettledArgs {
-            project: "proj".into(),
-            name: "oc".into(),
-            thread: "t1".into(),
-        };
-        assert_eq!(
-            reply_settled_argv(&sa),
-            vec!["__reply-settled", "proj", "oc", "t1"]
-        );
     }
 }
 
@@ -11909,22 +11344,6 @@ mod tests {
         // below the 60s floor → floor
         assert_eq!(lease_renew_seconds(10), 60);
         assert_eq!(lease_renew_seconds(0), 60);
-    }
-
-    /// The leaf args serialize/deserialize round-trip (Resonate requires
-    /// serializable leaf params; simple identifier params per the SDK rule).
-    #[test]
-    fn renew_lease_args_serde_roundtrip() {
-        let a = RenewLeaseArgs {
-            project: "proj-a".into(),
-            extend_seconds: 1200,
-        };
-        let v = serde_json::to_value(&a).unwrap();
-        assert_eq!(v["project"], "proj-a");
-        assert_eq!(v["extend_seconds"], 1200);
-        let back: RenewLeaseArgs = serde_json::from_value(v).unwrap();
-        assert_eq!(back.project, a.project);
-        assert_eq!(back.extend_seconds, a.extend_seconds);
     }
 
     #[test]
@@ -14170,19 +13589,6 @@ mod tests {
         let back: SendArgs = serde_json::from_value(v).unwrap();
         assert!(back.confirm);
         assert_eq!(back.confirm_timeout_ms, Some(45_000));
-    }
-
-    #[test]
-    fn poll_swarm_argv_uses_loop_project_not_default() {
-        // bd-fw-loop-durable-wrong-project regression: `flywheel loop toron`
-        // must poll "toron" — a hardcoded/default project would make every
-        // project's loop poll the wrong swarm (and log "no flywheel swarm
-        // for flywheel" while monitoring toron).
-        let argv = poll_swarm_argv("toron", "all");
-        assert_eq!(argv, vec!["__poll", "toron", "all"]);
-        assert_ne!(argv[1], "flywheel");
-        let argv = poll_swarm_argv("hachiko", "oc");
-        assert_eq!(argv, vec!["__poll", "hachiko", "oc"]);
     }
 
     #[test]
@@ -17414,26 +16820,6 @@ mod verify_field_tests {
             r.contains("typed verify"),
             "verify reason names the gate: {r}"
         );
-    }
-
-    /// bd-bead-create-contract-lint-4tdd: the checkpointed mail args carry
-    /// the reason across the durable boundary (serde round-trip).
-    #[test]
-    fn not_ready_mail_args_carry_reason() {
-        let args = NotReadyMailArgs {
-            project: "p".into(),
-            bead_id: "bd-1".into(),
-            title: "t".into(),
-            reason: Some("PRINCIPLES is required for priority <= 2 beads".into()),
-        };
-        let json = serde_json::to_string(&args).expect("serialize");
-        let back: NotReadyMailArgs = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.reason.as_deref(), args.reason.as_deref());
-        // legacy args (no reason) still deserialize.
-        let legacy: NotReadyMailArgs =
-            serde_json::from_str(r#"{"project":"p","bead_id":"bd-1","title":"t"}"#)
-                .expect("legacy args deserialize");
-        assert!(legacy.reason.is_none());
     }
 
     /// The `## PRINCIPLES` section extractor: everything after the exact
