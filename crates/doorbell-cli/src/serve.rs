@@ -961,36 +961,24 @@ pub async fn run(cfg: &Config) -> Result<()> {
     // list made the idempotency guard skip every boot host: health showed
     // hosted strings with no Brain behind them, zero sweeps, clean exit).
     let hosted: Hosts = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-    // Under the comms flag this daemon types nothing: the pane writer is the
-    // per-workspace `flywheel __doorbell` loop, and the MAIL wake path is its
-    // brain + bus watch (the inbox-host poll reads the comms inbox_log and
-    // sees head=0 for NIP-17 mail). A daemon host here is worse than useless:
-    // it takes the workspace lease as `no-text`, so the embedded loop defers
-    // to it, and the workspace is deaf. Stay standby and let the loops host.
-    let daemon_hosts = !doorbell_rt::comms_inbox_env();
-    let spawn_hosts: Vec<(String, String)> = if daemon_hosts {
-        cfg.hosts.clone()
-    } else {
-        Vec::new()
-    };
+    // The daemon never hosts a workspace. It has no pane typer in ANY mode
+    // (`host_workspace` installs a NoTextSink; the legacy typer is gone), and
+    // a host that cannot type still takes the workspace lease as `no-text`,
+    // so the per-workspace `flywheel __doorbell` loop defers to it as an
+    // inbox-only writer. That writer polls the comms inbox_log (head=0 for
+    // NIP-17 mail), while the mail wake path is the loop's own brain + bus
+    // watch — so every daemon-hosted workspace is deaf. The loops own the
+    // lease, the brain, and the typing; this process owns /health and reads.
+    //
+    // `--host` stays accepted and persisted (hosts.json is the arm list a
+    // future typer would use), it just no longer spawns a loop.
+    let spawn_hosts: Vec<(String, String)> = Vec::new();
     eprintln!(
-        "doorbell serve: up on 127.0.0.1:{} + {} (hosting {}){})",
+        "doorbell serve: up on 127.0.0.1:{} + {} (standby: per-workspace loops host and type; \
+         {} armed for reads)",
         cfg.port,
         sock_path.display(),
-        if spawn_hosts.is_empty() {
-            "nothing (standby)".to_string()
-        } else {
-            spawn_hosts
-                .iter()
-                .map(|(p, w)| format!("{p}/{w}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        },
-        if daemon_hosts {
-            ""
-        } else {
-            " — comms flag on: per-workspace loops type, this host holds none"
-        }
+        cfg.hosts.len()
     );
     // The cache is created before workers so a worker supervisor can
     // invalidate /health in the same task turn that removes a dead host.
@@ -2162,11 +2150,9 @@ fn health_body(app: &AppState) -> String {
             .unwrap_or(0.0)
             .total_cmp(&a["holes_pct"].as_f64().unwrap_or(0.0))
     });
-    let mode = if hosted.is_empty() {
-        "standby"
-    } else {
-        "hosted"
-    };
+    // Under comms the daemon genuinely holds no workspace, whatever the
+    // persisted arm list says: the per-workspace loops host.
+    let mode = "standby";
     // bd-enov (F17): standby is NOT green when known workspaces exist. A daemon
     // that adopted without `--host` (plain `doorbell start`) reports
     // mode=standby and delivers no rings, no inbox-digest wakes, no ack-SLA
@@ -2177,7 +2163,9 @@ fn health_body(app: &AppState) -> String {
     // per-workspace `flywheel __doorbell` loop owns the workspace lease and
     // its brain + bus watch types the pane. Calling that standby "blind" made
     // every operator read DEGRADED for a healthy split.
-    let daemon_types = !doorbell_rt::comms_inbox_env();
+    // No daemon typer exists, so a standby daemon is never "blind" to wakes:
+    // the per-workspace loops deliver them.
+    let daemon_types = false;
     let wake_blind =
         daemon_types && standby_blind_to_wakes(hosted.len(), known_workspaces.len());
     if wake_blind {
