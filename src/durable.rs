@@ -12968,7 +12968,11 @@ mod tests {
             );
         }
         let host = &loop_body[loop_end..];
-        let resolve = ["let authority = crate::authority::", "RuntimeAuthority::resolve();"].concat();
+        let resolve = [
+            "let authority = crate::authority::",
+            "RuntimeAuthority::resolve();",
+        ]
+        .concat();
         let stamp = ["let now_nanos = authority", ".clock.now_nanos();"].concat();
         assert!(
             host.contains(&resolve)

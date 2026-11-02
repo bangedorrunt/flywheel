@@ -154,16 +154,15 @@ use serde_json::{Value, json};
 use cmd::DaemonCmd;
 use cmd::{
     AgentCmd, ArtifactsCmd, AssetCmd, BackendCmd, CaptainCmd, CheckpointCmd, CoalitionCmd,
-    ConfigCmd, CrewCmd, CronCmd, DoorbellCmd, JudgmentCmd, LedgerCmd, LoopCmd, MailCmd,
-    ModelCmd, PolicyCmd, PrinciplesCmd, ProfileCmd, RunsCmd, SlotCmd, SquadCmd, StageCmd,
-    StandingOrdersCmd, ToronCmd, ToronMailCmd, WorkCmd, WorkflowCmd, WorktreeCmd, XprojCmd,
-    cmd_agent, cmd_analytics, cmd_asset, cmd_audit, cmd_backend, cmd_captain, cmd_changes,
-    cmd_checkpoint, cmd_config, cmd_crew, cmd_doorbell_digest, cmd_doorbell_gc,
-    cmd_doorbell_inject, cmd_doorbell_introduce, cmd_doorbell_re_inject, cmd_doorbell_roster,
-    cmd_doorbell_start, cmd_doorbell_status, cmd_doorbell_stop, cmd_doorbell_subscribe,
-    cmd_history, cmd_internal_doorbell, cmd_judgment, cmd_ledger, cmd_mail, cmd_models, cmd_policy,
-    cmd_principles, cmd_resume, cmd_runs, cmd_slot, cmd_stage, cmd_standing_orders, cmd_timeline,
-    cmd_toron, cmd_work, cmd_worktree, cmd_xproj,
+    ConfigCmd, CrewCmd, CronCmd, DoorbellCmd, JudgmentCmd, LedgerCmd, LoopCmd, MailCmd, ModelCmd,
+    PolicyCmd, PrinciplesCmd, ProfileCmd, RunsCmd, SlotCmd, SquadCmd, StageCmd, StandingOrdersCmd,
+    ToronCmd, ToronMailCmd, WorkCmd, WorkflowCmd, WorktreeCmd, XprojCmd, cmd_agent, cmd_analytics,
+    cmd_asset, cmd_audit, cmd_backend, cmd_captain, cmd_changes, cmd_checkpoint, cmd_config,
+    cmd_crew, cmd_doorbell_digest, cmd_doorbell_gc, cmd_doorbell_inject, cmd_doorbell_introduce,
+    cmd_doorbell_re_inject, cmd_doorbell_roster, cmd_doorbell_start, cmd_doorbell_status,
+    cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_history, cmd_internal_doorbell, cmd_judgment,
+    cmd_ledger, cmd_mail, cmd_models, cmd_policy, cmd_principles, cmd_resume, cmd_runs, cmd_slot,
+    cmd_stage, cmd_standing_orders, cmd_timeline, cmd_toron, cmd_work, cmd_worktree, cmd_xproj,
 };
 use config::{Config, Recipe, WorkflowStep};
 use hc_support::{

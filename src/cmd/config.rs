@@ -537,7 +537,9 @@ mod config_key_tests {
         let err = apply_key(&mut table, "not_a_key", "x").unwrap_err();
         assert!(err.to_string().contains("unknown key"));
         assert_eq!(
-            table.get("future_foreign_key").and_then(toml::Value::as_str),
+            table
+                .get("future_foreign_key")
+                .and_then(toml::Value::as_str),
             Some("keep.example"),
             "a rejected set must not touch the table"
         );

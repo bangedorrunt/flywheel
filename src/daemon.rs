@@ -822,6 +822,4 @@ mod tests {
             "opt-out must degrade, got {got:?}"
         );
     }
-
-
 }
