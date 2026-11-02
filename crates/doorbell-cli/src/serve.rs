@@ -2325,7 +2325,10 @@ fn health_body(app: &AppState) -> String {
     // used to be invisible — a hosted daemon with zero hc agents read
     // `degraded: []` while no wake could ever land (gs-044's hard part).
     let inj = hosted_injection(&app.fw_state, &hosted, &bins.hc);
-    let no_prompt_hop = prompt_hop_degraded(hosted.len(), &inj);
+    // Under the comms flag the daemon types nothing: the per-workspace loops
+    // own the prompt hop, so "this daemon has no injectable pane" is the
+    // correct split, not a fault.
+    let no_prompt_hop = daemon_types && prompt_hop_degraded(hosted.len(), &inj);
     if no_prompt_hop {
         degraded.push("no_injectable_panes".to_string());
     }
