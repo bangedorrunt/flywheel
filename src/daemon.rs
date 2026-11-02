@@ -160,9 +160,27 @@ pub fn current_uid() -> String {
 }
 
 /// Render the launchd plist (pure — golden-tested). KeepAlive on
-/// non-zero exit; logs under the state dir.
+/// non-zero exit; logs under the state dir. `working_dir` pins the unit's cwd
+/// (cron resolves its project tier and `br` from there).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub fn plist_xml(label: &str, binary: &Path, port: u16, out_log: &Path, err_log: &Path) -> String {
+pub fn plist_xml(
+    label: &str,
+    binary: &Path,
+    args: &[String],
+    working_dir: Option<&Path>,
+    out_log: &Path,
+    err_log: &Path,
+) -> String {
+    let mut program = format!("\t\t<string>{}</string>\n", binary.display());
+    for arg in args {
+        program.push_str(&format!("\t\t<string>{arg}</string>\n"));
+    }
+    let working_dir = working_dir.map_or_else(String::new, |dir| {
+        format!(
+            "\t<key>WorkingDirectory</key>\n\t<string>{}</string>\n",
+            dir.display()
+        )
+    });
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -172,14 +190,10 @@ pub fn plist_xml(label: &str, binary: &Path, port: u16, out_log: &Path, err_log:
 	<string>{label}</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>{}</string>
-		<string>serve</string>
-		<string>--port</string>
-		<string>{port}</string>
-	</array>
+{program}	</array>
 	<key>RunAtLoad</key>
 	<true/>
-	<key>KeepAlive</key>
+{working_dir}	<key>KeepAlive</key>
 	<dict>
 		<key>SuccessfulExit</key>
 		<false/>
@@ -198,7 +212,6 @@ pub fn plist_xml(label: &str, binary: &Path, port: u16, out_log: &Path, err_log:
 </dict>
 </plist>
 "#,
-        binary.display(),
         out_log.display(),
         err_log.display(),
     )
@@ -328,26 +341,53 @@ pub fn start(state: &Path, addr: &str) -> anyhow::Result<()> {
 
 /// Write + bootstrap the LaunchAgent / user unit. Idempotent.
 pub fn install(state: &Path, port: u16) -> anyhow::Result<()> {
+    install_unit(
+        state,
+        &UnitSpec {
+            label: DAEMON_LABEL,
+            args: vec!["serve".into(), "--port".into(), port.to_string()],
+            working_dir: None,
+            stem: "serve",
+        },
+    )
+}
+
+/// One supervised process: its launchd label / systemd unit name, argv, cwd,
+/// and log stem under the state dir.
+struct UnitSpec<'a> {
+    label: &'a str,
+    args: Vec<String>,
+    working_dir: Option<&'a Path>,
+    stem: &'a str,
+}
+
+/// Write + bootstrap one unit. Idempotent: the old unit is booted out first so
+/// an edited argv/cwd takes effect.
+fn install_unit(state: &Path, spec: &UnitSpec<'_>) -> anyhow::Result<()> {
+    let label = spec.label;
     let binary = std::env::current_exe()?;
     std::fs::create_dir_all(state)?;
+    let out_log = state.join(format!("{}.out.log", spec.stem));
+    let err_log = state.join(format!("{}.err.log", spec.stem));
     #[cfg(target_os = "macos")]
     {
         let uid = current_uid();
         let agents = home_launch_agents()?;
         std::fs::create_dir_all(&agents)?;
-        let plist = agents.join(format!("{DAEMON_LABEL}.plist"));
+        let plist = agents.join(format!("{label}.plist"));
         std::fs::write(
             &plist,
             plist_xml(
-                DAEMON_LABEL,
+                label,
                 &binary,
-                port,
-                &state.join("serve.out.log"),
-                &state.join("serve.err.log"),
+                &spec.args,
+                spec.working_dir,
+                &out_log,
+                &err_log,
             ),
         )?;
         let _ = Command::new("launchctl")
-            .args(["bootout", &format!("gui/{uid}/{DAEMON_LABEL}")])
+            .args(["bootout", &format!("gui/{uid}/{label}")])
             .output();
         let out = Command::new("launchctl")
             .args([
@@ -362,29 +402,31 @@ pub fn install(state: &Path, port: u16) -> anyhow::Result<()> {
                 anyhow::bail!("launchctl bootstrap failed: {stderr}");
             }
         }
-        println!(
-            "installed + started {DAEMON_LABEL} (plist {})",
-            plist.display()
-        );
+        println!("installed + started {label} (plist {})", plist.display());
         Ok(())
     }
     #[cfg(target_os = "linux")]
     {
         let units = home_systemd_user()?;
         std::fs::create_dir_all(&units)?;
-        let unit = units.join(format!("{DAEMON_LABEL}.service"));
+        let unit = units.join(format!("{label}.service"));
+        let working_dir = spec.working_dir.map_or_else(String::new, |dir| {
+            format!("WorkingDirectory={}\n", dir.display())
+        });
         std::fs::write(
             &unit,
             format!(
-                "[Unit]\nDescription=flywheel serve daemon\n\n[Service]\nExecStart={} serve --port {port}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
-                binary.display()
+                "[Unit]\nDescription=flywheel {} host\n\n[Service]\n{working_dir}ExecStart={} {}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+                spec.stem,
+                binary.display(),
+                spec.args.join(" ")
             ),
         )?;
         let _ = Command::new("systemctl")
             .args(["--user", "daemon-reload"])
             .output();
         let out = Command::new("systemctl")
-            .args(["--user", "enable", "--now", DAEMON_LABEL])
+            .args(["--user", "enable", "--now", label])
             .output()?;
         if !out.status.success() {
             anyhow::bail!(
@@ -392,18 +434,123 @@ pub fn install(state: &Path, port: u16) -> anyhow::Result<()> {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
-        println!(
-            "installed + started {DAEMON_LABEL} (unit {})",
-            unit.display()
-        );
+        println!("installed + started {label} (unit {})", unit.display());
         Ok(())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (state, port, binary);
+        let _ = (state, spec, binary);
         anyhow::bail!(
             "daemon install: unsupported host — use `flywheel daemon start` (pidfile mode)"
         )
+    }
+}
+
+/// The cron host's unit: `flywheel cron start` as its own supervised process.
+///
+/// Not folded into `serve` on purpose. `serve` is the HTTP/wake surface and
+/// dies on a bind conflict or a handler panic; cron owns ticks and the
+/// doorbell-supervisor minute schedule. Separate units keep one failure from
+/// stopping the other, and each restarts at boot (`RunAtLoad`).
+pub const CRON_LABEL: &str = "dev.flywheel.cron";
+
+/// Install + start the cron host. `working_dir` becomes the unit's cwd, so the
+/// project tier (`<project>/.flywheel/crons`) and `br create` resolve exactly
+/// as an interactive `flywheel cron start` from that directory does.
+pub fn start_cron(
+    state: &Path,
+    working_dir: &Path,
+    project: Option<&str>,
+) -> anyhow::Result<()> {
+    if cron_running() {
+        println!("{CRON_LABEL} already running (supervised)");
+        return Ok(());
+    }
+    let mut args = vec!["cron".to_string(), "start".to_string()];
+    if let Some(project) = project {
+        args.push("--project".to_string());
+        args.push(project.to_string());
+    }
+    install_unit(
+        state,
+        &UnitSpec {
+            label: CRON_LABEL,
+            args,
+            working_dir: Some(working_dir),
+            stem: "cron",
+        },
+    )
+}
+
+/// Stop the cron host. Idempotent.
+pub fn stop_cron() -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let uid = current_uid();
+        let out = Command::new("launchctl")
+            .args(["bootout", &format!("gui/{uid}/{CRON_LABEL}")])
+            .output()?;
+        if out.status.success() {
+            println!("stopped {CRON_LABEL} (launchd)");
+        } else {
+            println!("{CRON_LABEL} not running");
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let out = Command::new("systemctl")
+            .args(["--user", "stop", CRON_LABEL])
+            .output()?;
+        if out.status.success() {
+            println!("stopped {CRON_LABEL} (systemd)");
+        } else {
+            println!("{CRON_LABEL} not running");
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        anyhow::bail!("no supervisor on this host; run `flywheel cron start` in the foreground")
+    }
+}
+
+/// Whether the cron unit is loaded and running.
+pub fn cron_running() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // `print` also succeeds for a loaded-but-dead job, so read the job's
+        // own state line: only `state = running` means ticks are happening.
+        let uid = current_uid();
+        Command::new("launchctl")
+            .args(["print", &format!("gui/{uid}/{CRON_LABEL}")])
+            .output()
+            .is_ok_and(|out| {
+                out.status.success()
+                    && String::from_utf8_lossy(&out.stdout)
+                        .lines()
+                        .any(|line| line.trim() == "state = running")
+            })
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("systemctl")
+            .args(["--user", "is-active", "--quiet", CRON_LABEL])
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
+
+/// Print the cron host's supervision state (a stopped host is why ticks stop).
+pub fn status_cron() {
+    if cron_running() {
+        println!("cron: running (supervised {CRON_LABEL})");
+    } else {
+        println!("cron: stopped — `flywheel daemon start` installs {CRON_LABEL}");
     }
 }
 
@@ -717,6 +864,46 @@ fn which_doorbell() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    /// The cron host's unit carries its own argv and cwd: `cron start` (plus
+    /// `--project` when detected) in the project directory, so a supervised
+    /// host resolves the project tier instead of launching at `/`.
+    #[test]
+    fn cron_unit_plist_pins_argv_and_working_dir() {
+        let xml = plist_xml(
+            CRON_LABEL,
+            Path::new("/opt/bin/flywheel"),
+            &[
+                "cron".to_string(),
+                "start".to_string(),
+                "--project".to_string(),
+                "flywheel".to_string(),
+            ],
+            Some(Path::new("/work/flywheel")),
+            Path::new("/state/cron.out.log"),
+            Path::new("/state/cron.err.log"),
+        );
+        assert!(xml.contains("<string>cron</string>"));
+        assert!(xml.contains("<string>--project</string>"));
+        assert!(xml.contains("<string>flywheel</string>"));
+        assert!(xml.contains("<key>WorkingDirectory</key>\n\t<string>/work/flywheel</string>"));
+        assert!(
+            xml.contains("<key>RunAtLoad</key>\n\t<true/>"),
+            "a reboot must bring the host back"
+        );
+        assert!(xml.contains("<key>SuccessfulExit</key>\n\t\t<false/>"));
+        // The serve unit keeps its own argv and no cwd override.
+        let serve = plist_xml(
+            DAEMON_LABEL,
+            Path::new("/opt/bin/flywheel"),
+            &["serve".to_string(), "--port".to_string(), "8787".to_string()],
+            None,
+            Path::new("/state/serve.out.log"),
+            Path::new("/state/serve.err.log"),
+        );
+        assert!(serve.contains("<string>serve</string>"));
+        assert!(!serve.contains("WorkingDirectory"));
+    }
+
     /// bd-flywheel-probe-qjay: the probe parks a scratch run and drains its
     /// wake against a temp store — no server, no daemon, no live paths.
     #[test]
@@ -787,7 +974,8 @@ mod tests {
         let xml = plist_xml(
             "dev.flywheel.daemon",
             Path::new("/usr/local/bin/flywheel"),
-            SERVE_PORT_DEFAULT,
+            &["serve".to_string(), "--port".to_string(), SERVE_PORT_DEFAULT.to_string()],
+            None,
             Path::new("/tmp/out.log"),
             Path::new("/tmp/err.log"),
         );

@@ -86,7 +86,7 @@ Commands:
   plan-review        Plan → review gate → implement → verify (ADR-0001 §9.2; paper-first)
   upgrade            Reinstall the binary from source (cargo install --path)
   tutorial           Interactive walkthrough
-  daemon             Daemon lifecycle (toron-parity): start|stop|restart|status over the `serve` HTTP surface. macOS launchd / Linux systemd user unit / pidfile fallback. `restart` VERIFIES the new daemon answers. (feature: serve — compiled out without it)
+  daemon             Daemon lifecycle (toron-parity): start|stop|restart|status over the `serve` HTTP surface AND the `cron start` host. `start` installs and supervises both units (`dev.flywheel.daemon`, `dev.flywheel.cron`); macOS launchd / Linux systemd user unit / pidfile fallback. `restart` VERIFIES the new daemon answers. (feature: serve — compiled out without it)
   serve              Local REST + SSE server (feature: serve)
   toron              In-process toron mailbox/MCP integration (ADR-0003 Decision 3A, bd-o8j.1)
   preflight          Preflight: verify all prerequisites for a fleet operation before dispatching. Catches environment/dependency failures in <1s instead of 30s+ into a durable run. Auto-runs before steer/loop/workflow unless --skip-preflight is passed

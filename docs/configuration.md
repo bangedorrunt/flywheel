@@ -157,12 +157,16 @@ ladder: CLI > `TORON_*` env > `./.toron.toml` > `~/.config/toron/`
 
 | Daemon | Binary | Port | Unit | Owns |
 |---|---|---|---|---|
-| toron | `toron serve` | 18080 | `com.toron.serve` | mail, reservations, pins. One writer |
+| toron | `toron serve` | 18080 | `com.toron.serve` | mail, reservations, pins, workflow host. One writer |
 | flywheel | `flywheel serve` | 8787 | `dev.flywheel.daemon` | HTTP window: health, snapshot, send, events. Not a second mail store |
+| flywheel cron | `flywheel cron start` | — | `dev.flywheel.cron` | cron ticks (30s `ElmCron`) and the doorbell-supervisor minute schedule, from the project root |
 | doorbell | `doorbell serve` | 18980 | `com.doorbell.serve` | the only wake while this port answers |
-| resonate | `resonate` | 8001 | (dev process) | durable promises |
 
-All three units are launchd-persisted (macOS) / systemd user (Linux).
+All units are launchd-persisted (macOS) / systemd user (Linux).
+`dev.flywheel.cron` is separate from `dev.flywheel.daemon` so a crashed HTTP
+daemon cannot stop ticks and a stuck cron body cannot take down the HTTP
+surface; both are `RunAtLoad` with restart-on-failure, and both are driven by
+`flywheel daemon start|stop|restart|status`.
 Ports, pidfiles (`{flywheel,doorbell}.pid`), sockets and units are
 disjoint — daemons never fight over binds (second binder exits 0 over a
 healthy doorbell peer, hard-fails naming a squatter).
@@ -174,8 +178,9 @@ decision logs; `owner-{ws}.json` leases arbitrate the single writer per
 workspace (stale = pid dead or heartbeat > 90s).
 
 Start/stop asymmetry (by design, now documented): `flywheel daemon start`
-ALSO ensures the doorbell daemon (ride-along); `daemon stop`, `kill`, and
-`doorbell stop` never touch the other daemon. `flywheel kill` drops the
+ALSO installs/starts `dev.flywheel.cron` and ensures the doorbell daemon
+(ride-along); `daemon stop`, `kill`, and `doorbell stop` never touch the
+other daemons. `flywheel kill` drops the
 spawn's subscription rows but never the daemon. `doorbell stop` refuses
 unmanaged holders, even with `--force`.
 

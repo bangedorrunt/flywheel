@@ -12,7 +12,8 @@ pub(crate) enum DaemonCmd {
         #[arg(long, default_value_t = crate::daemon::SERVE_PORT_DEFAULT)]
         port: u16,
     },
-    /// Stop the daemon. Idempotent; refuses unmanaged holders without --force.
+    /// Stop the daemons (serve + cron). Idempotent; refuses unmanaged holders
+    /// without --force.
     Stop {
         #[arg(long, default_value_t = crate::daemon::SERVE_PORT_DEFAULT)]
         port: u16,

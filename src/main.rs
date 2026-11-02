@@ -1675,9 +1675,11 @@ enum Commands {
     /// Interactive walkthrough
     Tutorial,
     /// Daemon lifecycle (toron-parity): start|stop|restart|status over the
-    /// `serve` HTTP surface. macOS launchd / Linux systemd user unit /
-    /// pidfile fallback. `restart` VERIFIES the new daemon answers.
-    /// (feature: serve — compiled out without it)
+    /// `serve` HTTP surface AND the `cron start` host. `start` installs and
+    /// supervises both units (`dev.flywheel.daemon`, `dev.flywheel.cron`);
+    /// macOS launchd / Linux systemd user unit / pidfile fallback. `restart`
+    /// VERIFIES the new daemon answers. (feature: serve — compiled out
+    /// without it)
     #[cfg(feature = "serve")]
     Daemon {
         #[command(subcommand)]
@@ -3698,7 +3700,7 @@ fn main() {
         Some(Commands::Upgrade) => cmd_upgrade(),
         Some(Commands::Tutorial) => cmd_tutorial(),
         #[cfg(feature = "serve")]
-        Some(Commands::Daemon { cmd }) => cmd_daemon(cmd),
+        Some(Commands::Daemon { cmd }) => cmd_daemon(&cfg, cmd),
         Some(Commands::Serve { port }) => cmd_serve(&cfg, *port),
         Some(Commands::Toron { cmd }) => cmd_toron(&cfg, cmd),
         Some(Commands::Preflight {
@@ -39709,23 +39711,40 @@ fn load_closed_bead_ids(cfg: &Config, project: &str) -> Result<std::collections:
 // ---- serve (feature: serve) ----
 
 #[cfg(feature = "serve")]
-fn cmd_daemon(cmd: &DaemonCmd) -> Result<()> {
+fn cmd_daemon(cfg: &Config, cmd: &DaemonCmd) -> Result<()> {
     let state = daemon::default_state_dir();
     std::fs::create_dir_all(&state)?;
     let addr = |port: u16| format!("127.0.0.1:{port}");
+    // The cron host's unit runs from the directory `daemon start` was invoked
+    // in: the project tier and `br` resolve the same way an interactive
+    // `flywheel cron start` would.
+    let cron_host = || -> Result<()> {
+        let cwd = std::env::current_dir()?;
+        let project = cron::detect_project(cfg, None);
+        daemon::start_cron(&state, &cwd, project.as_deref())
+    };
     match cmd {
         DaemonCmd::Start { port } => {
             daemon::start(&state, &addr(*port))?;
+            cron_host()?;
             // Plane D rides along: `flywheel daemon start` also ensures the
             // doorbell daemon is running (loud if its binary is absent —
             // autostart persistence stays opt-in via `doorbell install`).
             daemon::ensure_doorbell()?;
             Ok(())
         }
-        DaemonCmd::Stop { port, force } => daemon::stop(&state, &addr(*port), *force),
-        DaemonCmd::Restart { port, force } => daemon::restart(&state, &addr(*port), *force),
+        DaemonCmd::Stop { port, force } => {
+            daemon::stop(&state, &addr(*port), *force)?;
+            daemon::stop_cron()
+        }
+        DaemonCmd::Restart { port, force } => {
+            daemon::restart(&state, &addr(*port), *force)?;
+            daemon::stop_cron()?;
+            cron_host()
+        }
         DaemonCmd::Status { port } => {
             daemon::status(&state, &addr(*port));
+            daemon::status_cron();
             Ok(())
         }
     }

@@ -38,8 +38,26 @@ flywheel cron status                  # one line per cron: due | paused | runnin
 flywheel cron lint weekly-review      # fail-stop gate; run always
 flywheel cron run weekly-review       # on demand (25s dry-run default; --live fires once)
 flywheel cron history weekly-review   # NAME is required here, not optional
-flywheel cron start                   # start or resume the durable cron loops
+flywheel cron start                   # run the host in the foreground (debugging)
+flywheel daemon start                 # supervise the host (installs dev.flywheel.cron)
+flywheel daemon status                # serve + cron supervision state
 ```
+
+`cron start` is the host; it blocks and ticks every 30s. Nothing else starts
+it — `flywheel serve` is the HTTP/wake daemon and does not tick. In normal
+operation the **supervisor** owns it: `flywheel daemon start` installs and
+starts a second unit, `dev.flywheel.cron` (launchd on macOS, a systemd user
+unit on Linux), whose argv is `flywheel cron start --project <p>` and whose
+working directory is the project root. That cwd matters: the per-project tier
+(`<project>/.flywheel/crons/`) is detected from it, and `on_failure: bead`
+files into that project's `.beads`.
+
+Cron is a separate unit from `serve` on purpose. A crashed HTTP daemon, a bind
+conflict, or a handler panic must not stop ticks, and a stuck body must not
+take down the HTTP surface. Both units are `RunAtLoad` + restart-on-failure, so
+a reboot brings the whole host back. A host that is not supervised stops
+ticking the moment its terminal closes; `flywheel daemon status` prints both
+lines, and a stopped cron line names the command that fixes it.
 
 ```text
 $ flywheel cron list
@@ -79,3 +97,4 @@ A failing step (one with `on_error: fail_run`, kind-46012 `status=failed`) trigg
 The loop closes only when a defined fixer consumes the failure bead and the next tick succeeds. Authoring rule: the step that must fail the run needs `on_error: fail_run`; the default `continue` means the failure never reaches `on_failure: bead`.
 
 Legacy systemd sagas keep running but are not the model; new scheduled work is cron YAML.
+
