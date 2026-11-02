@@ -21,37 +21,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use toron_workflow::engine::ActionInvocation;
-use toron_workflow::engine::durable::{GraphEffect, RunEffect};
-use toron_workflow::engine::durable_host::{DurableGraphRun, DurableRun};
+use toron_workflow::engine::EffectJournalMode;
 use toron_workflow::engine::leaf::LeafSeams;
-use toron_workflow::engine::linear_step::{
-    GraphNodeStep, LinearStep, run_graph_node_step, run_linear_step,
-};
-use toron_workflow::engine::{EffectJournalMode, VerifySink};
 use toron_workflow::schema::{Action, CronScope, CronSpec, FailureAction, Workflow};
 use toron_workflow::{CronFire, ElmCron};
-
-/// Concrete durable drivers over the shared journal pool
-/// (bd-flywheel-cron-elm-cn7p).
-type HostDurableRun = toron_workflow::engine::durable_host::DurableRun<
-    toron_core::index::durable_engine::ToronEngineStore,
-    toron_core::journal::ToronJournal,
-    toron_core::index::durable_workflow::SyncWorkflowState,
->;
-type HostDurableGraphRun = toron_workflow::engine::durable_host::DurableGraphRun<
-    toron_core::index::durable_engine::ToronEngineStore,
-    toron_core::journal::ToronJournal,
-    toron_core::index::durable_workflow::SyncWorkflowState,
->;
-
-/// Terminal-failure outcome helper.
-fn failed(error: &str, failed_step: Option<String>) -> CronBodyOutcome {
-    CronBodyOutcome::Failed {
-        error: error.to_string(),
-        failed_step,
-    }
-}
-
 /// One registered cron: a schedule bound to a workflow template.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CronEntry {
@@ -1131,9 +1104,9 @@ pub async fn start_loops(cfg: &crate::config::Config, project: Option<&str>) -> 
         eprintln!("cron {note}");
     }
     eprintln!(
-        "cron: {} durable, {} legacy (Resonate)",
+        "cron: {} durable, {} refused (no legacy driver)",
         plan.durable.len(),
-        plan.legacy_rows.len() + plan.legacy_regs.len()
+        plan.refused.len()
     );
 
     // The ElmCron host always runs when a store exists — it also carries
@@ -1147,141 +1120,15 @@ pub async fn start_loops(cfg: &crate::config::Config, project: Option<&str>) -> 
         ))),
         None => None,
     };
-    if !plan.legacy_rows.is_empty() || !plan.legacy_regs.is_empty() {
-        start_legacy_loops(cfg, &manager, &plan.legacy_regs, &plan.legacy_rows, project).await?;
+    // ADR-0043: the vendor runtime is gone, so a body the durable router
+    // refuses has no legacy driver left. Say so per body instead of running
+    // it on a substrate that no longer exists.
+    for note in &plan.refused {
+        eprintln!("cron: REFUSED (no durable model, no legacy driver): {note}");
     }
+    let _ = &manager;
     if let Some(handle) = elm_handle {
         let _ = handle.await;
-    }
-    Ok(())
-}
-
-/// The legacy toron-`CronManager` path (bd-flywheel-cron-elm-cn7p): kept for
-/// refused bodies only — same behavior as before this slice, one shared
-/// fallback. Deleted when the last refusal class lands its model.
-async fn start_legacy_loops(
-    cfg: &crate::config::Config,
-    manager: &RegistryCronManager,
-    registrations: &[toron_workflow::CronRegistration],
-    rows: &[CronRow],
-    project: Option<&str>,
-) -> Result<()> {
-    use toron_workflow::{CronManager, CronSpecRegistration, CronSpecRegistry};
-
-    // One engine + manager PER cron (P10.4): the ActionRunner receives only
-    // the action, so the per-cron mode/name must be closed over at engine
-    // construction. The durable loop ids `cron-spec:{name}` (ADR-0012 YAML
-    // crons) and `cron:{name}` (legacy registrations) are unchanged.
-    let mut drain_tasks = Vec::new();
-
-    // ADR-0012 YAML crons: the spec IS the registration (schedule + owner +
-    // policy + steps body all from the YAML, one engine two input types).
-    for row in rows.iter().filter(|r| r.enabled()) {
-        // bd-engine-run-path-journaling-fwlx: a cron body's `dispatch_job` is
-        // an external effect — journal it. The resolver is spelled explicitly
-        // (it is `local_with`'s default) so the combined constructor can carry
-        // the effect runner without changing what a cron body can resolve.
-        let spec_run = spec_runner(&row.spec);
-        // bd-mi9n: both journal halves (effect runner + run lifecycle) come
-        // from the one store, so a live cron fire's run row and effect rows
-        // agree on run_id.
-        let built = crate::effect_journal::journals(cfg, spec_run.clone());
-        let (effect, run_journal) = match built {
-            Some(j) => (Some(j.effect), Some(j.run)),
-            None => (None, None),
-        };
-        // bd-engine-run-path-journaling-fwlx (the Spec 6 flip): a live cron
-        // body really dispatches, so its engine is Enforced when the journal
-        // opened; with no journal the mode stays Recording so the bypass
-        // marker keeps the gap visible instead of failing every fire.
-        let mode = if effect.is_some() {
-            toron_workflow::engine::EffectJournalMode::Enforced
-        } else {
-            toron_workflow::engine::EffectJournalMode::Recording
-        };
-        let engine = std::sync::Arc::new(
-            toron_workflow::WorkflowEngine::local_with_resolvers_effect_mode_and_run_journal(
-                crate::profile::ProfileCatalog::catalog_profile_resolver(),
-                toron_workflow::WorkflowEngine::default_workflow_resolver(),
-                effect,
-                mode,
-                run_journal,
-            )
-            .map_err(|e| anyhow!("engine for cron {}: {e}", row.name()))?,
-        );
-        let cron_mgr = CronManager::with_spec_registry(
-            engine.clone(),
-            std::sync::Arc::new(Vec::<toron_workflow::CronRegistration>::new),
-            Some({
-                let spec = row.spec.clone();
-                let spec_registry: CronSpecRegistry = std::sync::Arc::new(move || {
-                    vec![CronSpecRegistration {
-                        spec: spec.clone(),
-                        enabled: true,
-                        start_ts: None,
-                    }]
-                });
-                spec_registry
-            }),
-        )?;
-        let sink = engine.policy_sink().clone();
-        let proj = project.map(str::to_string);
-        drain_tasks.push(tokio::spawn(async move {
-            let _ = cron_mgr.start().await;
-            drain_policy_sink(sink, proj).await;
-        }));
-    }
-
-    // Legacy crons.toml + schedule-workflow registrations (P4 migrates).
-    for reg in registrations.iter().filter(|r| r.enabled) {
-        let entry = manager
-            .show(&reg.name)?
-            .map(|m| m.entry)
-            .ok_or_else(|| anyhow!("cron {:?} vanished between load and start", reg.name))?;
-        let cron_run = cron_runner(&entry);
-        let built = crate::effect_journal::journals(cfg, cron_run.clone());
-        let (effect, run_journal) = match built {
-            Some(j) => (Some(j.effect), Some(j.run)),
-            None => (None, None),
-        };
-        // Same flip as the YAML cron above: Enforced only when journaled.
-        let mode = if effect.is_some() {
-            toron_workflow::engine::EffectJournalMode::Enforced
-        } else {
-            toron_workflow::engine::EffectJournalMode::Recording
-        };
-        let engine = std::sync::Arc::new(
-            toron_workflow::WorkflowEngine::local_with_resolvers_effect_mode_and_run_journal(
-                crate::profile::ProfileCatalog::catalog_profile_resolver(),
-                toron_workflow::WorkflowEngine::default_workflow_resolver(),
-                effect,
-                mode,
-                run_journal,
-            )
-            .map_err(|e| anyhow!("engine for cron {}: {e}", reg.name))?,
-        );
-        let cron_mgr = CronManager::new(engine.clone(), {
-            // bd-flywheel-cron-elm-cn7p: `registrations` is a borrowed slice
-            // here, so snapshot the one cron owned (`clone()` on a slice
-            // would only copy the borrow, not the rows).
-            let regs = registrations
-                .iter()
-                .filter(|&r| r.name == reg.name)
-                .cloned()
-                .collect::<Vec<_>>();
-            let name = reg.name.clone();
-            std::sync::Arc::new(move || regs.iter().filter(|&r| r.name == name).cloned().collect())
-        })?;
-        let sink = engine.policy_sink().clone();
-        let proj = project.map(str::to_string);
-        drain_tasks.push(tokio::spawn(async move {
-            let _ = cron_mgr.start().await;
-            drain_policy_sink(sink, proj).await;
-        }));
-    }
-
-    for h in drain_tasks {
-        let _ = h.await;
     }
     Ok(())
 }
@@ -1635,18 +1482,14 @@ async fn run_elm_cron_host(
     }
 }
 
-/// Drive one tick body on the durable host (bd-flywheel-cron-elm-cn7p):
-/// linear bodies through `DurableRun` + `run_linear_step`, graph bodies
-/// through `DurableGraphRun` + single-shot `run_graph_node_step` (never the
-/// looping variant — scheduler-level retry owns attempts). Sequential
-/// nodes: cron bodies favor determinism over wave parallelism.
+/// Drive one tick body on the shared durable body driver
+/// (bd-flywheel-host-run-ofcw). Cron bodies favor determinism over wave
+/// parallelism; the driver's single-shot node executors own that.
 async fn drive_cron_body(
     store: &toron_core::index::workflow_effects::WorkflowEffectStore,
     body: &CronBody,
     fire: &CronFire,
 ) -> CronBodyOutcome {
-    let handle = tokio::runtime::Handle::current();
-    let digest = toron_workflow::identity::workflow_digest(&body.workflow);
     // Same schedule trigger the toron loop synthesizes per tick.
     let trigger = serde_json::json!({
         "type": "schedule",
@@ -1655,330 +1498,24 @@ async fn drive_cron_body(
         "owner": body.owner,
         "scope": body.scope,
     });
-    let seams = LeafSeams {
-        async_runner: None,
-        sync_runner: Some(body.runner.clone()),
-        verify_sink: VerifySink::default(),
-        journal_mode: EffectJournalMode::Enforced,
+    let seams = crate::durable_body::BodySeams {
+        leaf: LeafSeams {
+            async_runner: None,
+            sync_runner: Some(body.runner.clone()),
+            verify_sink: crate::durable_body::real_verify_sink(),
+            journal_mode: EffectJournalMode::Enforced,
+        },
+        // The cron partition refuses spawn and call_workflow bodies: neither a
+        // pane launcher nor a child resolver exists on this door.
+        launcher: None,
+        resolve_child: None,
     };
-    // bd-durable-parallel-53um: a `steps:` fan-out is lowered onto the graph,
-    // so the routing predicate is the shape's, not `graph.is_some()`. Driving
-    // it linearly would refuse at open and lose the body.
-    if toron_workflow::engine::durable::needs_graph_model(&body.workflow) {
-        drive_cron_graph(store, &handle, body, &fire.key, trigger, digest, &seams).await
-    } else {
-        drive_cron_linear(store, &handle, body, &fire.key, trigger, digest, &seams).await
-    }
-}
-
-/// Run one sync driver verb in `spawn_blocking` (the handles are
-/// sync-over-channels and must never run on an async worker).
-async fn cron_verb<T, E, F>(run_id: &str, what: &str, f: F) -> Option<T>
-where
-    F: FnOnce() -> Result<T, E> + Send + 'static,
-    T: Send + 'static,
-    E: Send + std::fmt::Display + 'static,
-{
-    match tokio::task::spawn_blocking(f).await {
-        Ok(Ok(v)) => Some(v),
-        Ok(Err(e)) => {
-            eprintln!("cron {run_id}: durable {what} failed: {e}");
-            None
-        }
-        Err(e) => {
-            eprintln!("cron {run_id}: durable {what} task failed: {e}");
-            None
-        }
-    }
-}
-
-/// Handles for one driven body (bd-flywheel-cron-elm-cn7p). Built per fire:
-/// cheap channel handles over the shared pool, no shared mutable state.
-fn cron_handles(
-    store: &toron_core::index::workflow_effects::WorkflowEffectStore,
-    handle: &tokio::runtime::Handle,
-) -> (
-    toron_core::index::durable_engine::ToronEngineStore,
-    toron_core::journal::ToronJournal,
-    toron_core::index::durable_workflow::SyncWorkflowState,
-) {
-    use toron_core::index::durable_engine::ToronEngineStore;
-    use toron_core::index::durable_workflow::SyncWorkflowState;
-    use toron_core::journal::{JournalDb, ToronJournal};
-    let pool_inner = store.pool().clone();
-    (
-        ToronEngineStore::spawn(pool_inner.clone(), handle),
-        ToronJournal::spawn(JournalDb::new(pool_inner.clone(), "cron", 64), handle),
-        SyncWorkflowState::spawn(pool_inner, handle),
-    )
-}
-
-async fn drive_cron_linear(
-    store: &toron_core::index::workflow_effects::WorkflowEffectStore,
-    handle: &tokio::runtime::Handle,
-    body: &CronBody,
-    run_id: &str,
-    trigger: serde_json::Value,
-    digest: String,
-    seams: &LeafSeams,
-) -> CronBodyOutcome {
-    use toron_core::kernel::OurEngine;
-
-    let (engine_store, journal, state) = cron_handles(store, handle);
-    let workflow = body.workflow.clone();
-    let rid = run_id.to_string();
-    let trigger_for_open = trigger.clone();
-    let opened = tokio::task::spawn_blocking(move || {
-        let engine = OurEngine::with_journal(engine_store, journal);
-        DurableRun::open(engine, state, rid, workflow, trigger_for_open, unix_ms())
-    })
-    .await;
-    let (mut run, mut effects) = match opened {
-        Ok(Ok(pair)) => pair,
-        Ok(Err(e)) => {
-            return failed(&format!("durable open: {e}"), None);
-        }
-        Err(e) => {
-            return failed(&format!("durable open task: {e}"), None);
-        }
-    };
-    let mut outputs: serde_json::Map<String, serde_json::Value> =
-        run.model().outputs.clone().into_iter().collect();
-    loop {
-        if effects.is_empty() {
-            return failed("durable drive ran out of effects while non-terminal", None);
-        }
-        let mut follow: Vec<RunEffect> = Vec::new();
-        for effect in std::mem::take(&mut effects) {
-            match effect {
-                RunEffect::ExecuteStep {
-                    index,
-                    step,
-                    iteration,
-                } => {
-                    let value = run_linear_step(
-                        LinearStep {
-                            run_id,
-                            workflow: &body.workflow.name,
-                            workflow_digest: &digest,
-                            step: &step,
-                            index,
-                            trigger: &trigger,
-                            outputs: &mut outputs,
-                            iteration,
-                        },
-                        seams,
-                    )
-                    .await;
-                    let then = move |mut run: HostDurableRun| {
-                        run.step_done(value, unix_ms()).map(|eff| (run, eff))
-                    };
-                    let Some((back, mut eff)) =
-                        cron_verb(run_id, "step feed", move || then(run)).await
-                    else {
-                        return failed("step feed failed", None);
-                    };
-                    outputs = back.model().outputs.clone().into_iter().collect();
-                    follow.append(&mut eff);
-                    run = back;
-                }
-                RunEffect::ParkUntil { until_ms, .. } => {
-                    let now = unix_ms();
-                    if until_ms > now {
-                        tokio::time::sleep(std::time::Duration::from_millis(until_ms - now)).await;
-                    }
-                    let then =
-                        move |mut run: HostDurableRun| run.woke(unix_ms()).map(|eff| (run, eff));
-                    let Some((back, mut eff)) = cron_verb(run_id, "wake", move || then(run)).await
-                    else {
-                        return failed("wake failed", None);
-                    };
-                    run = back;
-                    follow.append(&mut eff);
-                }
-                RunEffect::AwaitApproval { step, .. } => {
-                    // Partitioned out: an approval body never reaches the
-                    // durable drive. Loud stop, never a silent hang.
-                    return failed(
-                        &format!("approval node {step} has no resolution loop"),
-                        Some(step),
-                    );
-                }
-                // bd-spawn-park-toron-vwu3: spawn is still refused by the
-                // durable route; reaching here is an invariant violation.
-                RunEffect::StartSpawn { .. } | RunEffect::SpawnDetached { .. } => {
-                    return failed(
-                        "spawn reached the cron durable drive but is still refused",
-                        None,
-                    );
-                }
-                RunEffect::Complete { output } => {
-                    return CronBodyOutcome::Completed(output);
-                }
-                RunEffect::Fail { step, output } => {
-                    let error = output
-                        .get("error")
-                        .and_then(|e| e.as_str())
-                        .unwrap_or("step failed")
-                        .to_string();
-                    return CronBodyOutcome::Failed {
-                        error,
-                        failed_step: Some(step),
-                    };
-                }
-                RunEffect::Cancelled => {
-                    return failed("run cancelled", None);
-                }
-                RunEffect::Unsupported { reason } => {
-                    return failed(&format!("unsupported after open: {reason}"), None);
-                }
-            }
-        }
-        effects = follow;
-    }
-}
-
-async fn drive_cron_graph(
-    store: &toron_core::index::workflow_effects::WorkflowEffectStore,
-    handle: &tokio::runtime::Handle,
-    body: &CronBody,
-    run_id: &str,
-    trigger: serde_json::Value,
-    digest: String,
-    seams: &LeafSeams,
-) -> CronBodyOutcome {
-    use toron_core::kernel::OurEngine;
-
-    let (engine_store, journal, state) = cron_handles(store, handle);
-    let workflow = body.workflow.clone();
-    let rid = run_id.to_string();
-    let trigger_for_open = trigger.clone();
-    let opened = tokio::task::spawn_blocking(move || {
-        let engine = OurEngine::with_journal(engine_store, journal);
-        DurableGraphRun::open(engine, state, rid, workflow, trigger_for_open, unix_ms())
-    })
-    .await;
-    let (mut run, mut effects) = match opened {
-        Ok(Ok(pair)) => pair,
-        Ok(Err(e)) => {
-            return failed(&format!("durable graph open: {e}"), None);
-        }
-        Err(e) => {
-            return failed(&format!("durable graph open task: {e}"), None);
-        }
-    };
-    loop {
-        if effects.is_empty() {
-            return failed(
-                "durable graph drive ran out of effects while non-terminal",
-                None,
-            );
-        }
-        let mut follow: Vec<GraphEffect> = Vec::new();
-        for effect in std::mem::take(&mut effects) {
-            match effect {
-                GraphEffect::ExecuteNode {
-                    node,
-                    wave: _,
-                    attempt,
-                    inputs,
-                    item,
-                } => {
-                    // bd-durable-foreach-jpgx: the lowered/expanded graph lives
-                    // on the MODEL (a `steps:` fan-out gains nodes at open,
-                    // a foreach gains them when it is ready), never on the
-                    // authored body.
-                    let Some(node_def) = run
-                        .model()
-                        .workflow
-                        .graph
-                        .as_ref()
-                        .and_then(|g| g.nodes.get(&node))
-                        .cloned()
-                    else {
-                        return failed(&format!("unknown graph node {node}"), Some(node));
-                    };
-                    // Sequential nodes: cron bodies favor determinism over
-                    // wave parallelism (the effect already carries the
-                    // spawn-time snapshot, so order never leaks into renders).
-                    let snapshot: serde_json::Map<String, serde_json::Value> =
-                        inputs.into_iter().collect();
-                    let value = run_graph_node_step(
-                        GraphNodeStep {
-                            run_id,
-                            workflow: &body.workflow.name,
-                            workflow_digest: &digest,
-                            node_name: &node,
-                            node: &node_def,
-                            attempt,
-                            trigger: &trigger,
-                            inputs: &snapshot,
-                            item: item.as_ref(),
-                        },
-                        seams,
-                    )
-                    .await;
-                    let then = move |mut run: HostDurableGraphRun| {
-                        run.node_done(&node, value, unix_ms()).map(|eff| (run, eff))
-                    };
-                    let Some((back, mut eff)) =
-                        cron_verb(run_id, "node feed", move || then(run)).await
-                    else {
-                        return failed("node feed failed", None);
-                    };
-                    run = back;
-                    follow.append(&mut eff);
-                }
-                GraphEffect::ParkUntil { until_ms, .. } => {
-                    let now = unix_ms();
-                    if until_ms > now {
-                        tokio::time::sleep(std::time::Duration::from_millis(until_ms - now)).await;
-                    }
-                    let then = move |mut run: HostDurableGraphRun| {
-                        run.woke(unix_ms()).map(|eff| (run, eff))
-                    };
-                    let Some((back, mut eff)) = cron_verb(run_id, "wake", move || then(run)).await
-                    else {
-                        return failed("wake failed", None);
-                    };
-                    run = back;
-                    follow.append(&mut eff);
-                }
-                GraphEffect::AwaitApproval { node, .. } => {
-                    // Partitioned out (same rule as linear): loud stop.
-                    return failed(
-                        &format!("approval node {node} has no resolution loop"),
-                        Some(node),
-                    );
-                }
-                // bd-durable-call-workflow-mg6y: a call body stays legacy
-                // (no child resolver on this path), so these are unreachable.
-                // Fail closed rather than silently parking.
-                GraphEffect::ChildJoin { .. } => {}
-                GraphEffect::ChildRun { node, .. } => {
-                    return failed(
-                        &format!("child run for node {node} has no resolver on the cron path"),
-                        Some(node),
-                    );
-                }
-                GraphEffect::Complete { output } => {
-                    return CronBodyOutcome::Completed(output);
-                }
-                GraphEffect::Fail { fail } => {
-                    return CronBodyOutcome::Failed {
-                        error: fail.error.clone(),
-                        failed_step: Some(fail.node.clone()),
-                    };
-                }
-                GraphEffect::Cancelled => {
-                    return failed("run cancelled", None);
-                }
-                GraphEffect::Unsupported { reason } => {
-                    return failed(&format!("unsupported after open: {reason}"), None);
-                }
-            }
-        }
-        effects = follow;
+    match crate::durable_body::drive(store, &fire.key, &body.workflow, trigger, &seams).await {
+        crate::durable_body::BodyOutcome::Completed(output) => CronBodyOutcome::Completed(output),
+        crate::durable_body::BodyOutcome::Failed { error, step } => CronBodyOutcome::Failed {
+            error,
+            failed_step: step,
+        },
     }
 }
 
@@ -2066,75 +1603,6 @@ async fn settle_cron_fire(
     }
 }
 
-/// Drain a cron engine's policy sink (bead side-effects) until Ctrl-C. The
-/// weekly-review SUCCESS side-effect (bd-m7ac): its tick output carries the
-/// oracle's idea — EXACTLY ONE bead tagged weekly-review+date; None (no bead)
-/// when the oracle honestly found nothing worth proposing. Failure events for
-/// the same cron still take the failure-bead path below (the output won't
-/// parse as an idea).
-async fn drain_policy_sink(sink: toron_workflow::PolicySink, project: Option<String>) {
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        let drained: Vec<toron_workflow::PolicyEvent> = {
-            let mut guard = sink.lock().await;
-            std::mem::take(&mut *guard)
-        };
-        for ev in drained {
-            if ev.bundle.workflow == "weekly-review" && ev.output.as_ref().is_some() {
-                let out = ev
-                    .output
-                    .as_ref()
-                    .expect("output presence checked in the guard above");
-                if let Some(idea) = review_idea_from_output(out) {
-                    match spawn_review_bead(out, ev.tick) {
-                        Ok(Some(id)) => eprintln!(
-                            "cron {}({}): weekly-review -> bead {id} (\"{}\")",
-                            ev.cron, ev.tick, idea.title
-                        ),
-                        Ok(None) => eprintln!(
-                            "cron {}({}): weekly-review found nothing worth proposing — no bead",
-                            ev.cron, ev.tick
-                        ),
-                        Err(e) => eprintln!(
-                            "cron {}({}): weekly-review bead side-effect failed: {e}",
-                            ev.cron, ev.tick
-                        ),
-                    }
-                    continue;
-                }
-                eprintln!(
-                    "cron {}({}): weekly-review output carried no idea — no bead",
-                    ev.cron, ev.tick
-                );
-                continue;
-            }
-            match ev.action {
-                toron_workflow::schema::FailureAction::Bead => {
-                    match spawn_failure_bead(&ev.bundle) {
-                        Ok(id) => eprintln!(
-                            "cron {}({}): failure -> bead {id} ({}#{})",
-                            ev.cron, ev.tick, ev.bundle.workflow, ev.bundle.consecutive
-                        ),
-                        Err(e) => eprintln!(
-                            "cron {}({}): bead side-effect failed: {e}",
-                            ev.cron, ev.tick
-                        ),
-                    }
-                }
-                other => eprintln!(
-                    "cron {}({}): policy action {other:?} (side-effect not wired)",
-                    ev.cron, ev.tick
-                ),
-            }
-            // bd-asr2.16 (doorbell sink, flag-gated): every drained tick
-            // completion journals a Fact wake (digest-visible with zero
-            // swarm). Best-effort inside the flag check; never fails drain.
-            if let Some(p) = project.as_deref() {
-                crate::doorbell::cron_tick_wake(p, &ev.cron, &ev.tick.to_string(), "fired");
-            }
-        }
-    }
-}
 impl CronManager for RegistryCronManager {
     fn list(&self) -> Result<Vec<MergedCron>> {
         self.merged()

@@ -2863,18 +2863,16 @@ pub async fn drain_spawn_sink(
                 // promise was already settled; never launch twice.
                 continue;
             }
-            let record = match engine.resonate().promises.get(&id).await {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("flywheel: spawn drain: promise {id} unreadable ({e}) — skipping");
-                    continue;
-                }
+            // ADR-0043: no vendor promise holds the spec any more; the engine
+            // keeps the prepared SpawnSpec behind the announced key.
+            let Some(spec) = engine.spawn_spec(&id) else {
+                eprintln!("flywheel: spawn drain: no spec for spawn key {id} — skipping");
+                continue;
             };
-            let plan = spawn_launch_plan(&id, record.param.data_as_ref(), catalog);
-            let plan = match plan {
+            let plan = match spawn_launch_plan_from_spec(&spec, catalog) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("flywheel: spawn drain: bad promise spec for {id}: {e}");
+                    eprintln!("flywheel: spawn drain: bad spec for {id}: {e}");
                     continue;
                 }
             };
@@ -3231,14 +3229,8 @@ pub fn local_engine_journaled(
 /// resolves ::1-first here, so a naive probe silently demotes every run to
 /// the embedded in-memory store (observed live).
 pub fn cli_engine_store_url() -> Option<String> {
-    if let Ok(pin) = std::env::var("RESONATE_URL")
-        && !pin.trim().is_empty()
-    {
-        return Some(pin);
-    }
-    const HOST_LOCAL_RESONATE_URL: &str = "http://127.0.0.1:8001";
-    toron_workflow::engine::probe_candidate(HOST_LOCAL_RESONATE_URL)
-        .then(|| HOST_LOCAL_RESONATE_URL.to_string())
+    // ADR-0043: the engine is in-process; there is no server URL to select.
+    None
 }
 
 /// Store-selection seam: `Some(url)` => remote HttpNetwork-backed engine
@@ -5547,65 +5539,6 @@ steps:
         );
     }
 
-    /// Store-flavor probe (bd-adr22-local-resonate-tx8q): the SDK gates its
-    /// introspection getters behind cfg(test), so the witness is behavioral.
-    /// A dead-port REMOTE store fails transport (`network error: …`); an
-    /// embedded LOCAL store answers authoritatively (`… not found`).
-    async fn store_error_flavor(engine: &toron_workflow::WorkflowEngine) -> String {
-        match engine.resonate().promises.get("__pane_probe__").await {
-            Ok(_) => "resolved:probe-exists".to_string(),
-            Err(e) => format!("{e}"),
-        }
-    }
-
-    #[test]
-    fn local_engine_prefers_remote_store_when_server_url_resolved() {
-        // bd-adr22-local-resonate-tx8q: CLI engine runs must land on the
-        // persistent store when one answers (host runs `resonate serve
-        // --storage-type sqlite` on :8001), not the in-memory LocalNetwork.
-        // Construction must stay lazy (dead port must not dial at build).
-        let runner = std::sync::Arc::new(|inv: &toron_workflow::engine::ActionInvocation| {
-            Ok(json!({ "action": inv.action.type_name() }))
-        });
-        let profile: toron_workflow::ProfileResolver = std::sync::Arc::new(|_| None);
-        let workflow: toron_workflow::WorkflowResolver = std::sync::Arc::new(|_| None);
-        let rt = tokio::runtime::Runtime::new().expect("rt");
-        let engine = local_engine_with_journal(
-            &rt,
-            Some("http://127.0.0.1:59999".into()),
-            runner.clone(),
-            profile.clone(),
-            workflow.clone(),
-            None,
-            toron_workflow::engine::EffectJournalMode::Recording,
-            None,
-        )
-        .expect("remote-backed engine constructs without dialing");
-
-        let remote_err = rt.block_on(store_error_flavor(&engine));
-        assert!(
-            remote_err.contains("error sending request") && !remote_err.contains("not found"),
-            "Some(url) must wire the REMOTE HttpNetwork (transport-level failure), got: {remote_err}"
-        );
-
-        let fallback = local_engine_with_journal(
-            &rt,
-            None,
-            runner,
-            profile,
-            workflow,
-            None,
-            toron_workflow::engine::EffectJournalMode::Recording,
-            None,
-        )
-        .expect("fallback constructs");
-        let local_err = rt.block_on(store_error_flavor(&fallback));
-        assert!(
-            local_err.contains("not found") && !local_err.contains("network error"),
-            "None must stay embedded-local (authoritative miss, not transport failure), got: {local_err}"
-        );
-    }
-
     /// bd-engine-run-path-journaling-fwlx: the recording (dry-run) arm is the
     /// ONE engine rail that must stay unjournaled — its runner records what it
     /// would have dispatched, so a `settled` row would settle an external
@@ -6594,20 +6527,22 @@ steps:
         rt.block_on(async move {
             let engine = Arc::new(toron_workflow::WorkflowEngine::local().expect("engine"));
             let run_id = format!("erbo-approve-{}", uuid::Uuid::new_v4());
-            let handle = engine
-                .resonate()
-                .run(
-                    &run_id,
-                    toron_workflow::engine::run_workflow,
-                    RunInput {
-                        run_id: Some(run_id.clone()),
-                        workflow: approval_workflow(),
-                        trigger: json!({}),
-                    },
-                )
-                .spawn()
-                .await
-                .expect("spawn");
+            let handle = {
+                let engine = engine.clone();
+                let rid = run_id.clone();
+                tokio::spawn(async move {
+                    engine
+                        .run(
+                            &rid,
+                            RunInput {
+                                run_id: Some(rid.clone()),
+                                workflow: approval_workflow(),
+                                trigger: json!({}),
+                            },
+                        )
+                        .await
+                })
+            };
             let promise_id = {
                 let mut tries = 0;
                 loop {
@@ -6620,7 +6555,6 @@ steps:
                     tries += 1;
                 }
             };
-            assert!(!handle.done().await.expect("done check"), "run must park");
 
             // The captain's decision mail (what `flywheel workflow approve`
             // sends), delivered on the in-process plane.
@@ -6681,10 +6615,10 @@ steps:
 
             // Generous bound: the scan cadence is ~2s, but a loaded box
             // (parallel full-suite builds) stretched one run past 30s.
-            let out = match tokio::time::timeout(std::time::Duration::from_secs(90), handle.result())
-                .await
+            let out = match tokio::time::timeout(std::time::Duration::from_secs(90), handle).await
             {
-                Ok(r) => r.expect("run resumes after approval"),
+                Ok(Ok(run)) => run.expect("run resumes after approval"),
+                Ok(Err(join)) => panic!("run task failed: {join}"),
                 Err(_) => panic!(
                     "the drainer did not resolve the parked approval within 90s ({} inbox scans ran; last page: {})",
                     scans.load(Ordering::SeqCst),

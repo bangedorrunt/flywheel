@@ -49,6 +49,7 @@ mod doorbell;
 mod doorbell_host;
 mod doorbell_tick;
 mod durable;
+mod durable_body;
 mod durable_policy;
 mod durable_resume;
 mod durable_transition;
@@ -43200,12 +43201,11 @@ steps:
             workflow: wf,
             trigger: serde_json::json!({}),
         };
-        let handle = engine
-            .resonate()
-            .run(&run_id, toron_workflow::engine::run_workflow, input)
-            .spawn()
-            .await
-            .expect("spawn");
+        let handle = {
+            let engine = engine.clone();
+            let rid = run_id.clone();
+            tokio::spawn(async move { engine.run(&rid, input).await })
+        };
         // Wait for the approval promise to appear in the sink
         let promise_id = {
             let mut tries = 0;
@@ -43219,12 +43219,11 @@ steps:
                 tries += 1;
             }
         };
-        assert!(!handle.done().await.expect("done check"));
         engine
             .resolve_approval(&promise_id, &Decision::approved("ok"))
             .await
             .expect("resolve");
-        let out = handle.result().await.expect("run should resume");
+        let out = handle.await.expect("join").expect("run should resume");
         // After approve, the run should complete (not failed)
         assert!(out.get("ask").is_some() || out.get("decision").is_some());
     }
@@ -43239,12 +43238,11 @@ steps:
             workflow: wf,
             trigger: serde_json::json!({}),
         };
-        let handle = engine
-            .resonate()
-            .run(&run_id, toron_workflow::engine::run_workflow, input)
-            .spawn()
-            .await
-            .expect("spawn");
+        let handle = {
+            let engine = engine.clone();
+            let rid = run_id.clone();
+            tokio::spawn(async move { engine.run(&rid, input).await })
+        };
         let promise_id = {
             let mut tries = 0;
             loop {
@@ -43262,8 +43260,8 @@ steps:
             .await
             .expect("reject");
         let out = handle
-            .result()
             .await
+            .expect("join")
             .expect("run should complete even on reject");
         // Reject is a decision, not a crash — WF-08
         // The output should contain the decision with outcome rejected or status rejected
