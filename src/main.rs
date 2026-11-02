@@ -10664,23 +10664,42 @@ the panes may still be live in hc; `--no-verify` skips this check in scripts"
     }
 
     // GS-039 P0-4: atomic name-binding — after settle, rename every registry
-    // pane to its registered name; fail spawn if any pane remains unbound
+    // pane to its routable label; fail spawn if any pane remains unbound
     // (name:null). Never declare ready with addressable-by-name holes.
+    //
+    // The routable label is the mail PIN on hc, never the kind slug: hc
+    // `agent_rename` writes the `toron_pin` LABEL, and mail/doorbell routing
+    // resolves a pin → pane through it. Renaming to `e.name` (the kind) made
+    // `resolve_pane_identity` answer the kind, so `identity_divergent` fired
+    // and a doorbell wake could never map `CobaltCoast` to `hc:t1j`. Rex
+    // keeps `e.name`: there the rename is the terminal/block name, not the
+    // mail identity (bd-rex-reliability-ioyz).
     if !opts.no_verify && !registry.is_empty() {
+        let routable = |e: &state::SpawnEntry| -> String {
+            if pane_takes_hc_stamp(&e.pane_id) {
+                e.mail_identity
+                    .clone()
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or_else(|| e.name.clone())
+            } else {
+                e.name.clone()
+            }
+        };
         let agents_now = c.agent_list()?;
         for e in &registry {
             if e.pane_id.is_empty() {
                 continue;
             }
+            let want = routable(e);
             let unbound = agents_now.iter().any(|a| {
                 a.pane_id == e.pane_id
                     && (a.name.as_deref().is_none_or(|n| n.is_empty())
-                        || a.name.as_deref() != Some(e.name.as_str()))
+                        || a.name.as_deref() != Some(want.as_str()))
             });
-            if unbound && let Err(err) = c.agent_rename(&e.pane_id, &e.name) {
+            if unbound && let Err(err) = c.agent_rename(&e.pane_id, &want) {
                 eprintln!(
                     "flywheel: GS-039 P0-4 name-bind rename {} → {} failed: {err:#}",
-                    e.pane_id, e.name
+                    e.pane_id, want
                 );
             }
         }
@@ -10694,8 +10713,9 @@ the panes may still be live in hc; `--no-verify` skips this check in scripts"
                 match agents_after.iter().find(|a| a.pane_id == e.pane_id) {
                     None => true, // pane vanished — unbound
                     Some(a) => {
+                        let want = routable(e);
                         a.name.as_deref().is_none_or(|n| n.is_empty())
-                            || a.name.as_deref() != Some(e.name.as_str())
+                            || a.name.as_deref() != Some(want.as_str())
                     }
                 }
             })
