@@ -232,6 +232,26 @@ fn hosted_keys_for_health(hosts: &[HostedLoop]) -> Vec<String> {
     })
 }
 
+/// bd-health-loop-hosted-b98hy: workspaces live loops hold (live
+/// owner-<ws>.json leases) that no daemon loop hosts. Pure: daemon
+/// `project/workspace` keys plus bare lease workspace names in, the
+/// uncovered lease names out (sorted, deduped). Standby semantics stay
+/// with the daemon `hosted` projection; this only names the loops.
+pub fn lease_hosted_for_health(daemon_keys: &[String], lease_ws: &[String]) -> Vec<String> {
+    let covered: std::collections::BTreeSet<&str> = daemon_keys
+        .iter()
+        .filter_map(|h| hosted_workspace(h))
+        .collect();
+    let mut out: Vec<String> = lease_ws
+        .iter()
+        .filter(|w| !covered.contains(w.as_str()))
+        .cloned()
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// The external CLIs this daemon execs. Resolved through the shared search
 /// order (`doorbell_rt::binpath`) — under launchd/systemd `PATH` is
 /// `/usr/bin:/bin:/usr/sbin:/sbin`, which holds neither `toron` nor
@@ -2340,6 +2360,16 @@ fn health_body(app: &AppState) -> String {
     let mailbox_root = doorbell_rt::toron_data_root(None);
     let presence_age =
         doorbell_rt::watchbeat::file_age_secs(&doorbell_rt::presence_path(&mailbox_root));
+    // bd-health-loop-hosted-b98hy: the daemon hosts nothing under comms, so
+    // /health.hosted is [] while per-workspace loops hold live leases. Name
+    // them here (standby semantics unchanged: `mode` still reads the daemon).
+    let lease_hosted = lease_hosted_for_health(
+        &hosted,
+        &doorbell_rt::lease::live_leases(&app.fw_state, doorbell_rt::lease::unix_now())
+            .into_iter()
+            .map(|(ws, _)| ws)
+            .collect::<Vec<_>>(),
+    );
     serde_json::json!({
         "protocol": doorbell_rt::api::PING.protocol,
         "core_v": doorbell_rt::api::PING.core_v,
@@ -2347,6 +2377,7 @@ fn health_body(app: &AppState) -> String {
         "uptime_s": app.started.elapsed().as_secs(),
         "mode": mode,
         "hosted": hosted,
+        "lease_hosted": lease_hosted,
         // bd-k0p7: the build identity of the RUNNING binary. `core_v` is a
         // compiled-in constant every build shares, so on its own it cannot
         // tell a stale installed binary from a fresh one; this names the build
@@ -2624,6 +2655,16 @@ fn stats_body(app: &AppState) -> String {
         "uptime_s": app.started.elapsed().as_secs(),
         "mode": if hosted.is_empty() { "standby" } else { "hosted" },
         "hosted": hosted,
+        "lease_hosted": lease_hosted_for_health(
+            &hosted_keys(&app.hosted.lock()),
+            &doorbell_rt::lease::live_leases(
+                &app.fw_state,
+                doorbell_rt::lease::unix_now(),
+            )
+            .into_iter()
+            .map(|(ws, _)| ws)
+            .collect::<Vec<_>>(),
+        ),
         // bd-k0p7: same stamp on the compact body, so neither /health shape
         // can be the one that hides a stale build.
         "build": running_build_stamp(doorbell_rt::lease::unix_now()),
@@ -3543,6 +3584,34 @@ mod tests {
             health,
             vec!["aaa/alpha".to_string(), "zzz/beta".to_string()],
             "health primary follows alphabetical workspace slug"
+        );
+    }
+
+    #[test]
+    fn lease_hosted_names_live_loops_the_daemon_does_not() {
+        // Daemon keys are project/workspace; leases are bare workspace names.
+        // Covered leases stay out (deduped by workspace half), the rest are
+        // named sorted: standby keeps its semantics, blindness ends.
+        let daemon = vec!["flywheel/flywheel".to_string()];
+        let leases = vec!["toron".to_string(), "flywheel".to_string()];
+        assert_eq!(
+            super::lease_hosted_for_health(&daemon, &leases),
+            vec!["toron".to_string()],
+        );
+        assert_eq!(
+            super::lease_hosted_for_health(&[], &leases),
+            vec!["flywheel".to_string(), "toron".to_string()],
+            "standby daemon with live loops names every loop"
+        );
+        assert_eq!(
+            super::lease_hosted_for_health(&daemon, &[]),
+            Vec::<String>::new(),
+            "no leases, no loop names"
+        );
+        let dupes = vec!["b".to_string(), "a".to_string(), "b".to_string()];
+        assert_eq!(
+            super::lease_hosted_for_health(&[], &dupes),
+            vec!["a".to_string(), "b".to_string()],
         );
     }
 
