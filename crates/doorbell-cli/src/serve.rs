@@ -848,11 +848,23 @@ pub async fn run(cfg: &Config) -> Result<()> {
             }
         });
     }
+    // The daemon never hosts a workspace: it has no pane typer in any mode,
+    // and a host that cannot type still takes the lease as `no-text`, which
+    // makes the per-workspace loop defer or refuse — the deafness this split
+    // exists to prevent. The loops own the lease, the brain, and the typing;
+    // this process owns /health and reads. `--host` stays accepted and
+    // persisted (hosts.json is the arm list a future typer would use).
+    let spawn_hosts: Vec<(String, String)> = Vec::new();
     // D9 layer 1 first, per workspace: a live lease means another writer
     // runs there — refuse before touching its socket (never clobber a
     // stranger's bind). Leases live in the FLYWHEEL state dir, shared
     // with embedded loops, so either side excludes the other per ws.
-    for (project, workspace) in &cfg.hosts {
+    //
+    // Scoped to `spawn_hosts`: with no daemon typer the armed list is a read
+    // list, and the per-workspace loops hold those leases by design. Checking
+    // (or claiming, below) `cfg.hosts` would refuse to start beside them and
+    // then re-deafen every armed workspace with a `no-text` lease.
+    for (project, workspace) in &spawn_hosts {
         if let Some(cur) = lease::read_lease(&cfg.flywheel_state, workspace)
             && !lease::lease_stale(&cur, now)
         {
@@ -893,17 +905,19 @@ pub async fn run(cfg: &Config) -> Result<()> {
         }
         Err(e) => return Err(e).with_context(|| format!("bind 127.0.0.1:{}", cfg.port)),
     };
-    // Claim one writer lease per hosted workspace before serving.
+    // Claim one writer lease per hosted workspace before serving. Empty in
+    // practice: `spawn_hosts` is empty because this process types nothing;
+    // the per-workspace loops own their leases.
     let owned: Shared<Vec<(String, doorbell_rt::lease::OwnerLease)>> =
         std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-    for (_, workspace) in &cfg.hosts {
+    for (_, workspace) in &spawn_hosts {
         match lease::acquire_lease_kind(
             &cfg.flywheel_state,
             workspace,
             lease::unix_now(),
             daemon_lease_kind(),
         ) {
-            Ok(l) => owned.lock().push((workspace.clone(), l)),
+            Ok(l) => owned.lock().push((workspace.to_string(), l)),
             Err(e) => {
                 for (ws, l) in owned.lock().iter() {
                     lease::release_lease(&cfg.flywheel_state, ws, l);
@@ -972,7 +986,6 @@ pub async fn run(cfg: &Config) -> Result<()> {
     //
     // `--host` stays accepted and persisted (hosts.json is the arm list a
     // future typer would use), it just no longer spawns a loop.
-    let spawn_hosts: Vec<(String, String)> = Vec::new();
     eprintln!(
         "doorbell serve: up on 127.0.0.1:{} + {} (standby: per-workspace loops host and type; \
          {} armed for reads)",
@@ -1425,7 +1438,7 @@ fn reconcile_once(
             Err(e) => eprintln!("doorbell serve: reap {id} failed: {e:?}"),
         }
     }
-    let now = lease::unix_now();
+    let _now = lease::unix_now();
     // Bind the work list BEFORE looping: the `hosted` guard must not be
     // held across the loop body — `spawn_host_loop` locks it again and
     // parking_lot mutexes are not reentrant (self-deadlock wedged the
@@ -1436,26 +1449,12 @@ fn reconcile_once(
     // statement, and `retire_unsubscribed` locks `hosted` again — parking_lot
     // mutexes are not reentrant, so the inline form self-deadlocks the
     // reconcile task forever (and every /health handler behind it).
-    let unhosted = unhosted_subscribed(&subs, &hosted_keys(&hosted.lock()));
-    for (project, workspace) in unhosted {
-        if let Some(cur) = lease::read_lease(&cfg.flywheel_state, &workspace)
-            && !lease::lease_stale(&cur, now)
-        {
-            continue; // a live writer (embedded loop) owns it — never steal
-        }
-        match lease::acquire_lease_kind(&cfg.flywheel_state, &workspace, now, daemon_lease_kind()) {
-            Ok(l) => {
-                owned.lock().push((workspace.clone(), l));
-                eprintln!("doorbell serve: auto-hosting {project}/{workspace} (subscribed)");
-                // The worker shares the served cache, so an immediate
-                // startup failure invalidates the same snapshot /health uses.
-                spawn_host_loop(cfg, hosted, loops, owned, health, &project, &workspace);
-            }
-            Err(e) => {
-                eprintln!("doorbell serve: auto-host {project}/{workspace} lease failed: {e:?}")
-            }
-        }
-    }
+    // Auto-hosting is gone with the daemon typer: a host here would take
+    // the workspace lease as `no-text`, and the per-workspace loop that CAN
+    // type would defer to it (or refuse) — the deafness this whole split
+    // exists to prevent. The subscribed set still drives reap/retire below.
+    let _unhosted = unhosted_subscribed(&subs, &hosted_keys(&hosted.lock()));
+    let _ = (owned, health, cfg);
     // bd-mk60: retire what this tick did not justify. Runs AFTER the auto-host
     // pass so a pair that is still subscribed is already hosted — and that
     // ordering is what makes the retire rule safe: an auto-hosted key is in
@@ -2663,8 +2662,8 @@ mod tests {
         let prod = &src[..src.find("\nmod tests {").unwrap()];
         assert_eq!(
             prod.matches("lease::acquire_lease_kind(").count(),
-            2,
-            "boot + auto-host claim"
+            1,
+            "boot claim only: there is no daemon typer, so auto-host must not claim"
         );
         assert!(
             !prod.contains("lease::acquire_lease(&cfg"),
