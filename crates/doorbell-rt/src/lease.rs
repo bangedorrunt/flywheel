@@ -237,9 +237,22 @@ pub fn lease_stale_pure(lease: &OwnerLease, now_unix: u64, inputs: &LeaseInputs)
 }
 
 /// Stale = different boot OR pid dead OR start mismatch OR heartbeat older
-/// than 90s. Edge: injects clock, boot, pid liveness, and start stamp.
+/// than 90s. Edge: cheap checks first (heartbeat age, boot, legacy stamp
+/// need no subprocess), then pid liveness and start stamp only when those
+/// pass — the supervisor calls this for every known workspace each heal
+/// tick, and the common dead/stale verdict must not cost a `ps` spawn.
+/// The verdict still goes through [`lease_stale_pure`].
 pub fn lease_stale(lease: &OwnerLease, now_unix: u64) -> bool {
+    if now_unix.saturating_sub(lease.heartbeat_unix) > LEASE_STALE_SECS {
+        return true;
+    }
     let current_boot = boot_id();
+    if lease.boot_id != current_boot {
+        return true;
+    }
+    if lease.process_start_unix == 0 {
+        return true;
+    }
     let alive = pid_alive(lease.pid);
     let start = process_start_unix(lease.pid);
     lease_stale_pure(
@@ -517,5 +530,45 @@ mod tests {
         assert!(lease_stale_pure(&legacy, now, &live_inputs));
         // The edge wrapper agrees for the live holder.
         assert!(!lease_stale(&live, now));
+    }
+
+    /// bd-lease-stale-hotpath-awm4z: the cheap path decides stale without
+    /// a start stamp. Heartbeat older than the window, or a boot mismatch
+    /// on a fresh heartbeat, is stale with `pid_start: None` — no `ps`.
+    #[test]
+    fn cheap_checks_decide_stale_without_a_start_stamp() {
+        let now = unix_now();
+        let boot = boot_id();
+        let no_start = LeaseInputs {
+            current_boot: &boot,
+            pid_alive: true,
+            pid_start: None,
+        };
+        // Stale heartbeat: stale even for a live pid with no start stamp.
+        let old = OwnerLease {
+            pid: std::process::id(),
+            boot_id: boot.clone(),
+            host: host_name(),
+            started_unix: now - LEASE_STALE_SECS - 10,
+            heartbeat_unix: now - LEASE_STALE_SECS - 10,
+            process_start_unix: 12345,
+            kind: None,
+        };
+        assert!(lease_stale_pure(&old, now, &no_start));
+        // Boot mismatch on a fresh heartbeat: stale, still no start stamp.
+        let fresh = OwnerLease {
+            heartbeat_unix: now,
+            started_unix: now,
+            ..old.clone()
+        };
+        let other_boot = LeaseInputs {
+            current_boot: "boot-0",
+            pid_alive: true,
+            pid_start: None,
+        };
+        assert!(lease_stale_pure(&fresh, now, &other_boot));
+        // Same inputs, matching boot, fresh heartbeat: not stale — the
+        // expensive checks are the only ones left to run.
+        assert!(!lease_stale_pure(&fresh, now, &no_start));
     }
 }
