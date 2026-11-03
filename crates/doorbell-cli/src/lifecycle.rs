@@ -1464,7 +1464,7 @@ pub fn restart(cfg: &Config) -> Result<()> {
 /// wording is pinned by a test instead of by a live daemon (bd-gefp).
 pub fn status_summary(alive: bool, hosts: usize, stopped_by_operator: bool) -> String {
     if alive {
-        format!("doorbell status: daemon UP — serving {hosts} host(s)")
+        format!("doorbell status: daemon UP — standby, {hosts} armed for reads; loops host")
     } else if stopped_by_operator {
         format!(
             "doorbell status: daemon STOPPED by operator — deliberate, not an outage \
@@ -3448,7 +3448,10 @@ mod status_verdict_tests {
 
         let live = status_summary(true, 2, false);
         assert!(live.contains("daemon UP"), "{live}");
-        assert!(live.contains("serving 2 host(s)"), "{live}");
+        assert!(live.contains("standby"), "{live}");
+        assert!(live.contains("2 armed for reads"), "{live}");
+        assert!(live.contains("loops host"), "{live}");
+        assert!(!live.contains("serving"), "{live}");
     }
 
     /// A deliberate stop is not an outage: once the unit re-runs an idle job,
