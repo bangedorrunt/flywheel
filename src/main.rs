@@ -8409,6 +8409,29 @@ mod spawn_boot_reliability_tests {
     }
 
     #[test]
+    fn kill_resolves_through_the_status_door() {
+        // bd-kill-hc-lookup-j2zb3: kill must see what status sees — the rex
+        // door rides the selected plane, otherwise the hc client. Pin the
+        // shared door, not the plane: a second resolver is the defect.
+        let src = include_str!("main.rs");
+        let kill = crate::tripwire::find_fn(src, "cmd_kill");
+        let kill_end = crate::tripwire::find_fn(src, "cmd_assign");
+        let kbody = &src[kill..kill_end];
+        assert!(
+            kbody.contains("rex_door_selected"),
+            "cmd_kill must take the status door, not one fixed resolver"
+        );
+        assert!(
+            kbody.contains("find_workspace_dyn(&*backend, project)"),
+            "rex arm resolves through the selected plane"
+        );
+        assert!(
+            kbody.contains("find_workspace(&mut c, project)"),
+            "hc arm resolves through the hc client, like status"
+        );
+    }
+
+    #[test]
     fn spawn_no_peer_aware_keeps_identity_skips_dispatcher() {
         let src = include_str!("main.rs");
         let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
@@ -21256,18 +21279,31 @@ fn cmd_kill(
             bail!("refusing to close {project} without confirmation — pass --force");
         }
     }
-    // bd-f8zk: kill rides the SELECTED plane. It used to
-    // connect to hc directly, so on a rex plane `find_workspace` never
-    // matched and the verb refused a live workspace ("no flywheel swarm").
+    // bd-kill-hc-lookup-j2zb3: kill resolves through the same door status
+    // uses — rex door rides the selected plane, otherwise the hc client —
+    // so kill sees what status sees. (bd-f8zk moved kill to the selected
+    // plane for rex; on hc that plane's list disagreed with the client's
+    // and kill refused a live workspace.) Force/confirmation semantics below
+    // are unchanged, and the backend handle stays for prompt/close.
     let backend = backend::multiplexer_backend(cfg)?;
-    let ws_id = find_workspace_dyn(&*backend, project)?;
-    // pane-identity bridge files can be cleared (no stale lookups after
-    // pane_exited, bd-mail-pane-identity-bridge)
-    let agents: Vec<AgentInfo> = backend
-        .agent_list()?
-        .into_iter()
-        .filter(|a| a.workspace_id == ws_id)
-        .collect();
+    let (ws_id, agents): (String, Vec<AgentInfo>) = if crate::pane::rex_door_selected(cfg) {
+        let ws_id = find_workspace_dyn(&*backend, project)?;
+        let agents = backend
+            .agent_list()?
+            .into_iter()
+            .filter(|a| a.workspace_id == ws_id)
+            .collect();
+        (ws_id, agents)
+    } else {
+        let mut c = Client::connect(Some(&cfg.socket_path()))?;
+        let ws_id = find_workspace(&mut c, project)?;
+        let agents = c
+            .agent_list()?
+            .into_iter()
+            .filter(|a| a.workspace_id == ws_id)
+            .collect();
+        (ws_id, agents)
+    };
     // ADR-0025 Spec 4: on_captain_death + --reap-crews
     let mut policy = cfg.on_captain_death();
     if reap_crews {
