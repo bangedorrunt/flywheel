@@ -277,9 +277,19 @@ pub(crate) const PANE_TEXT_CALLS: &[&str] = &[
 #[cfg(test)]
 pub(crate) const LEGACY_PANE_TEXT_SITES: &[(&str, usize)] = &[
     ("src/cmd/doorbell.rs", 1),
-    ("src/hc.rs", 1),
     ("src/main.rs", 8),
 ];
+
+/// Transport-implementation calls (bd-pane-fence-hc-jwq4s): the two
+/// `.agent_prompt_coded(` sites in `src/hc_support.rs` ARE the PaneWrite
+/// door's backend, not bypasses. `Client::agent_prompt` (which the sink's
+/// `HcPanes` typer calls) delegates to `Client::agent_prompt_coded`, the
+/// single method that reaches the wire; the alt-screen read fallback prompts
+/// through that same method — a read, not a comms write, and the closed
+/// `PaneWrite` shapes cannot represent it. Counted separately with the same
+/// shrink-only rule, so any third site still fails the fence.
+#[cfg(test)]
+pub(crate) const TRANSPORT_IMPL_SITES: &[(&str, usize)] = &[("src/hc_support.rs", 2)];
 
 /// The file allowed to type into panes.
 #[cfg(test)]
@@ -305,10 +315,14 @@ pub(crate) fn fence_violations(files: &[(String, String)]) -> Vec<String> {
             continue;
         }
         let n = pane_text_calls(src);
-        let allowed = LEGACY_PANE_TEXT_SITES
+        let allowed: usize = LEGACY_PANE_TEXT_SITES
             .iter()
             .find(|(p, _)| p == path)
-            .map_or(0, |(_, n)| *n);
+            .map_or(0, |(_, n)| *n)
+            + TRANSPORT_IMPL_SITES
+                .iter()
+                .find(|(p, _)| p == path)
+                .map_or(0, |(_, n)| *n);
         if n > allowed {
             out.push(format!(
                 "{path}: {n} pane-text call(s), {allowed} allowed — only {SINK_FILE} may type into a pane (PaneWrite)"
@@ -427,7 +441,12 @@ mod tests {
             .expect("comms_send.rs");
         assert_eq!(pane_text_calls(&comms.1), 0);
         // Ratchet: a legacy entry above its real count must be lowered.
-        for (path, allowed) in LEGACY_PANE_TEXT_SITES {
+        // Same rule for the transport-implementation allowance: the exception
+        // covers exactly the documented sites, never more.
+        for (path, allowed) in LEGACY_PANE_TEXT_SITES
+            .iter()
+            .chain(TRANSPORT_IMPL_SITES.iter())
+        {
             let src = files
                 .iter()
                 .find(|(p, _)| p == path)
@@ -439,6 +458,33 @@ mod tests {
                 "{path}: lower the frozen count"
             );
         }
+    }
+
+    /// The transport exception covers exactly the two documented sites:
+    /// the sink-called delegation and the read-path fallback, both behind
+    /// the `PaneTyper` boundary. Any other pane-text call in hc_support
+    /// fails the count below.
+    #[test]
+    fn transport_sink_sites_are_exactly_the_documented_two() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let src = std::fs::read_to_string(root.join("src/hc_support.rs"))
+            .unwrap_or_default();
+        // `Client::agent_prompt` delegates to `agent_prompt_coded`: the sink's
+        // `HcPanes` typer calls the former, so this is the door's backend.
+        assert!(
+            src.contains("self.agent_prompt_coded(target, text, wait)"),
+            "the sink-called delegation must stay the documented line"
+        );
+        // The alt-screen read fallback prompts through the same transport.
+        assert!(
+            src.contains("c.agent_prompt_coded("),
+            "the read-path fallback must stay the documented line"
+        );
+        assert_eq!(
+            pane_text_calls(&src),
+            2,
+            "hc_support holds exactly the two transport sites"
+        );
     }
 
     /// Phase 3 extension negative control: the lower primitives (Enter /
