@@ -15894,6 +15894,228 @@ mod agent_mail_name_tests {
 
 // ---- add ----
 
+/// bd-add-plane-dnzz: rex-plane add. The hc arm below builds an
+/// `hc::Client` and its workspace list, so a rex-plane swarm is invisible
+/// ("no flywheel-owned swarm") and `spawn --join` never gains a pane.
+/// This arm resolves the owned workspace through the multiplexer backend
+/// (`partition_workspaces` + `add_target_from_split`, the same partition
+/// spawn uses) and creates panes through it too (`pane_split` + `pane_run`
+/// with the env-prefixed command, the same shape `cmd_spawn_rex` uses —
+/// the trait's `pane_split` carries no env map, so the pin rides as an
+/// `env K=V` prefix via `rex_env_command`). hc-only gates (shell-prompt
+/// wait, foreground wait, integration preflight, send-text prime) are
+/// skipped: rex blocks report readiness via `agent_wait` and the prime
+/// rides `pane_run`.
+fn cmd_add_rex(
+    cfg: &Config,
+    project: &str,
+    counts: &AgentCounts,
+    kinds: &[(String, u32)],
+    settle_secs: u64,
+    request_key: Option<&str>,
+) -> Result<()> {
+    // bd-blank-project-spelling-non-mail-doors-76hi
+    check_project_spelling(project, "add")?;
+    let plan = recipe_counts(None, counts, kinds)?;
+    // Same receipt gate + intent row as the hc arm (bd-command-receipts-zile):
+    // the slot is namespaced under the swarm label plus `-add`.
+    let request_key = request_key.map(str::trim).filter(|k| !k.is_empty());
+    let add_base = format!("{}-add", swarm_label(project));
+    let add_subject = match request_key {
+        Some(key) => request_receipts::label_for_request_key(&add_base, key),
+        None => slugify_label(&add_base).0,
+    };
+    let add_plan = request_receipts::plan_digest(
+        &plan
+            .iter()
+            .map(|(short, n)| (cfg.resolve_kind(short), *n, None))
+            .collect::<Vec<_>>(),
+    );
+    if let Some(key) = request_key {
+        match request_receipts::spawn_gate(
+            request_receipts::load_spawn_row(project, &add_subject).as_ref(),
+            &add_plan,
+        ) {
+            request_receipts::Gate::Proceed => {}
+            request_receipts::Gate::Replay => {
+                print_json(&json!({
+                    "request_key": key,
+                    "slot": add_subject,
+                    "already_added": true,
+                    "replay": true,
+                }));
+                eprintln!(
+                    "flywheel: add request key {key:?} already settled this slot ({add_subject}) — \
+                     replaying, no second add. Its panes: flywheel list --json."
+                );
+                return Ok(());
+            }
+            request_receipts::Gate::InFlight => bail!(
+                "add request key {key:?} is IN FLIGHT (slot {add_subject}) — a second dispatch \
+                 could add panes into a workspace that is still receiving the first. Inspect it \
+                 with `flywheel status {project}`, or retry with a fresh --request-key."
+            ),
+            request_receipts::Gate::Conflict => bail!(
+                "add request key {key:?} was already used for a DIFFERENT plan (the recorded plan \
+                 digest differs) — refusing to hand back another add's slot under this key. Use a \
+                 fresh --request-key for the new plan."
+            ),
+        }
+    }
+    let add_effect = match request_key {
+        Some(_) => agent_ref::AgentEffectGuard::begin_with(
+            agent_ref::AgentEffect::prepare(project, &add_subject, agent_ref::AgentPhase::Spawn)
+                .with_plan_digest(add_plan),
+        )?,
+        None => {
+            agent_ref::AgentEffectGuard::begin(project, &add_subject, agent_ref::AgentPhase::Spawn)?
+        }
+    };
+    let dir = project_dir(cfg, project);
+    let backend = backend::multiplexer_backend(cfg)?;
+    let ws_list = backend.workspace_list()?;
+    let agents = backend.agent_list().unwrap_or_default();
+    let split = partition_workspaces(
+        project,
+        ws_list,
+        &agents,
+        state::load_spawn_meta(project).as_deref(),
+    );
+    if !split.foreign.is_empty() {
+        let detail: Vec<String> = split
+            .foreign
+            .iter()
+            .map(|ws| {
+                format!(
+                    "{} (label {:?}, {} panes)",
+                    ws.workspace_id, ws.label, ws.pane_count
+                )
+            })
+            .collect();
+        eprintln!(
+            "flywheel: warn: {} foreign workspace(s) share the {project} label but are not flywheel-owned — leaving them alone: {}",
+            split.foreign.len(),
+            detail.join(", ")
+        );
+    }
+    // bd-bug-add-foreign-workspace-m7dg: owned swarm workspace only, same
+    // partition as the hc arm — never the foreign captain workspace.
+    let ws_id = add_target_from_split(&split, &agents, project)?;
+    let existing: Vec<AgentInfo> = agents
+        .into_iter()
+        .filter(|a| a.workspace_id == ws_id)
+        .collect();
+    let panes = backend.pane_list(Some(&ws_id))?;
+    let root = panes
+        .first()
+        .ok_or_else(|| anyhow!("workspace {ws_id} has no panes"))?
+        .pane_id
+        .clone();
+    // seed per-kind ordinals from existing agents so added names stay unique
+    let mut ordinals: BTreeMap<String, u32> = BTreeMap::new();
+    for a in &existing {
+        let Some(name) = a.name.as_deref() else {
+            continue;
+        };
+        for (short, _) in &plan {
+            if let Some(o) = agent_ordinal(name, project, short) {
+                ordinals
+                    .entry(short.clone())
+                    .and_modify(|m| *m = (*m).max(o))
+                    .or_insert(o);
+            }
+        }
+    }
+    let mut prev = root;
+    let mut spawned: Vec<Value> = Vec::new();
+    for (short, n) in &plan {
+        let kind = cfg.resolve_kind(short);
+        for _ in 0..*n {
+            let ordinal = ordinals.entry(short.clone()).or_insert(0);
+            *ordinal += 1;
+            let name = agent_name_n(project, short, *ordinal);
+            // bd-pin-public-plane-s-easy.2: draw the pin BEFORE the split so
+            // it rides the launch env.
+            let mail_identity = pinned_mail_identity(cfg, project, &name, &kind);
+            // GS-033: add-path fail-closed when mail is configured (same
+            // fate as cmd_spawn).
+            if mail_identity.is_none() {
+                refuse_unpinned_spawn(&name, None, backend::mail_backend(cfg).is_ok())?;
+            }
+            let identity = mail_identity.as_deref().unwrap_or(&name);
+            let mut add_args: Vec<String> = Vec::new();
+            if needs_in_arg_prime(&kind) {
+                add_args.push(boot_prime_line().to_string());
+            }
+            // No env map on the trait's `pane_split`: the pin rides as an
+            // `env K=V` command prefix (same as `cmd_spawn_rex`).
+            let pane_env = hc_support::plane_launch_env(cfg, mail_identity.as_deref());
+            let cwd = utf8_path(&dir, "workspace dir")?;
+            let split_pane = backend
+                .pane_split(&prev, "down", Some(&cwd))
+                .map_err(|e| anyhow!("add {name}: rex split failed: {e:#}"))?;
+            prev = split_pane.pane_id.clone();
+            let command = crate::pane::rex_env_command(&pane_env, &kind, &add_args);
+            if let Err(e) = backend.pane_run(&prev, &command) {
+                bail!("add {name}: rex run failed on {prev}: {e:#}");
+            }
+            // Label the block with the pin so wake routing resolves it
+            // (best-effort: the pane is live even when the rename lags).
+            if let Err(e) = backend.agent_rename(&prev, Some(identity)) {
+                eprintln!("flywheel: warn: add rename {prev} → {identity} failed: {e:#}");
+            }
+            // Readiness: the agent reports instead of the shell prompt
+            // (same bound as `cmd_spawn_rex`). Best-effort — a wait
+            // failure degrades to dispatch-side errors, never a panic.
+            if let Err(e) = backend.agent_wait(
+                &prev,
+                &[
+                    hc_support::AgentStatus::Idle,
+                    hc_support::AgentStatus::Working,
+                ],
+                Some(90_000),
+            ) {
+                eprintln!("flywheel: warn: {name} not ready within 90s of add: {e:#}");
+            }
+            if settle_secs > 0 {
+                std::thread::sleep(Duration::from_secs(settle_secs));
+            }
+            // Prime through pane_run (write + enter): the identity line.
+            // Warn-only like the hc arm's retried prime.
+            if let Err(e) = backend.pane_run(
+                &prev,
+                &doorbell::identity_prime(&name, identity),
+            ) {
+                eprintln!("flywheel: warn: rex prime for {name} ({prev}) failed: {e:#}");
+            }
+            // bd-627z.4 / bd-add-missing-mail-identity-16le: bind the pane
+            // identity now that the pane exists (same as the hc arm).
+            bind_pane_mail_identity(cfg, project, &name, &prev, mail_identity.as_deref());
+            // GS-030 slice 3: auto-bind the kind role to the pin (add path
+            // carries no profile — the kind short is the role noun).
+            bind_spawn_role(cfg, project, None, short, mail_identity.as_deref())?;
+            println!("  {} {}", kind_paint(&kind), prev);
+            spawned.push(json!({ "name": name, "kind": kind, "pane_id": prev }));
+        }
+    }
+    // bd-add-missing-mail-identity-16le: mirror the spawn contract — pins
+    // land in `.flywheel/agent-names.json` too. Best-effort like spawn.
+    let registry = state::load_spawn_registry(project);
+    if let Err(e) = state::save_agent_names(&dir, &registry) {
+        eprintln!("flywheel: cannot save .flywheel/agent-names.json: {e:#}");
+    }
+    log(
+        project,
+        EventKind::Add,
+        json!({ "workspace_id": ws_id, "agents": spawned }),
+    );
+    // The apply evidence for this row is the same one the caller waits for:
+    // the panes it just booted. A bail above leaves the row IN FLIGHT on
+    // purpose — a half-added swarm is not a settled add.
+    add_effect.settle(Some(&format!("workspace={ws_id} added={}", spawned.len())));
+    Ok(())
+}
+
 fn cmd_add(
     cfg: &Config,
     project: &str,
@@ -15904,6 +16126,11 @@ fn cmd_add(
 ) -> Result<()> {
     // bd-blank-project-spelling-non-mail-doors-76hi
     check_project_spelling(project, "add")?;
+    // bd-add-plane-dnzz: on the rex door the hc workspace list cannot see
+    // the swarm — route through the multiplexer backend instead.
+    if crate::pane::rex_door_selected(cfg) {
+        return cmd_add_rex(cfg, project, counts, kinds, settle_secs, request_key);
+    }
     let plan = recipe_counts(None, counts, kinds)?;
     // bd-command-receipts-zile: add creates panes, so it carries the same
     // intent-before-dispatch row as spawn (D9) and answers a request key from
