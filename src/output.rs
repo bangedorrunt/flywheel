@@ -243,6 +243,21 @@ mod bd_confirm_tests {
             .expect_err("json must refuse without --yes");
         assert!(format!("{err:#}").contains("--yes"));
     }
+
+    #[test]
+    fn interactive_confirmation_matches_or_aborts() {
+        use super::confirm_destructive_with;
+        use std::io::Cursor;
+        let mut reader = Cursor::new("overwrite\n");
+        confirm_destructive_with("overwrite", &targets(), false, false, true, &mut reader)
+            .expect("matching confirmation must succeed");
+
+        let mut bad_reader = Cursor::new("no\n");
+        let err =
+            confirm_destructive_with("overwrite", &targets(), false, false, true, &mut bad_reader)
+                .expect_err("mismatched confirmation must abort");
+        assert!(format!("{err:#}").contains("aborted"));
+    }
 }
 
 #[cfg(test)]
@@ -299,6 +314,23 @@ pub fn confirm_destructive(
     yes: bool,
     json: bool,
 ) -> anyhow::Result<()> {
+    let is_terminal = if cfg!(test) {
+        false
+    } else {
+        std::io::stdin().is_terminal()
+    };
+    let mut stdin = std::io::stdin().lock();
+    confirm_destructive_with(what, targets, yes, json, is_terminal, &mut stdin)
+}
+
+pub fn confirm_destructive_with<R: std::io::BufRead>(
+    what: &str,
+    targets: &[String],
+    yes: bool,
+    json: bool,
+    is_terminal: bool,
+    reader: &mut R,
+) -> anyhow::Result<()> {
     if targets.is_empty() {
         return Ok(());
     }
@@ -310,7 +342,7 @@ pub fn confirm_destructive(
                 targets.join(", ")
             );
         }
-        if !std::io::stdin().is_terminal() {
+        if !is_terminal {
             // Forty filenames inline is a wall of text that hides the one fact
             // that matters (it refused, and here is the fix). Print a few, point
             // at --dry-run for the rest.
@@ -343,7 +375,7 @@ pub fn confirm_destructive(
         use std::io::Write;
         std::io::stdout().flush().ok();
         let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
+        reader.read_line(&mut answer)?;
         if answer.trim() != what {
             anyhow::bail!("aborted: confirmation did not match {what:?}");
         }

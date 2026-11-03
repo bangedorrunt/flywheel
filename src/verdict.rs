@@ -834,11 +834,26 @@ pub(crate) enum NoteBinding {
 }
 
 pub(crate) fn note_binding(note: &str) -> NoteBinding {
-    match note_tokens(note).first() {
-        None => NoteBinding::NoLeadingBinding,
-        Some((k, _)) if *k != "sha" => NoteBinding::NoLeadingBinding,
-        Some((_, v)) if !is_full_sha(v) => NoteBinding::MalformedSha((*v).to_string()),
-        Some((_, v)) => NoteBinding::Bound((*v).to_string()),
+    let tokens = note_tokens(note);
+    let sha_entry = match tokens.as_slice() {
+        [(k, v), ..] if *k == "sha" => Some(*v),
+        [(k0, _), (k1, _), ..] if *k0 == "task" && *k1 == "verdict" => tokens
+            .iter()
+            .skip(2)
+            .find(|(k, _)| *k == "sha")
+            .map(|(_, v)| *v),
+        _ => None,
+    };
+
+    let Some(raw_val) = sha_entry else {
+        return NoteBinding::NoLeadingBinding;
+    };
+
+    let trimmed = raw_val.trim_end_matches(';');
+    if !is_full_sha(trimmed) {
+        NoteBinding::MalformedSha(raw_val.to_string())
+    } else {
+        NoteBinding::Bound(trimmed.to_string())
     }
 }
 
@@ -939,6 +954,31 @@ mod note_binding_tests {
             None
         );
     }
+
+    #[test]
+    fn note_binding_accepts_proved_prefixed_and_semicolon_shas() {
+        let sha = "f".repeat(40);
+        // Preceded by task= and verdict= (Phase 5 proved format)
+        let note = format!("task=task-123 verdict=verdict-456 sha={sha}");
+        assert_eq!(note_binding(&note), NoteBinding::Bound(sha.clone()));
+        assert!(note_has_sha(&note, &sha));
+
+        // Trailing semicolon is stripped
+        let note_semi = format!("sha={sha};");
+        assert_eq!(note_binding(&note_semi), NoteBinding::Bound(sha.clone()));
+        assert!(note_has_sha(&note_semi, &sha));
+
+        // Both: Phase 5 proved format with trailing semicolon
+        let note_both = format!("task=t1 verdict=v1 sha={sha}; receipt=/tmp/r.txt");
+        assert_eq!(note_binding(&note_both), NoteBinding::Bound(sha.clone()));
+        assert!(note_has_sha(&note_both, &sha));
+
+        // note_proved strips trailing semicolons
+        assert_eq!(
+            note_proved("task=task-1; verdict=verdict-2;"),
+            Some(("task-1".to_string(), "verdict-2".to_string()))
+        );
+    }
 }
 
 fn note_has_sha(note: &str, sha: &str) -> bool {
@@ -954,6 +994,8 @@ pub(crate) fn note_proved(note: &str) -> Option<(String, String)> {
     if k0 != "task" || k1 != "verdict" {
         return None;
     }
+    let v0 = v0.trim_end_matches(';');
+    let v1 = v1.trim_end_matches(';');
     if !is_binding_id(v0) || !is_binding_id(v1) {
         return None;
     }
