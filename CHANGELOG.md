@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-11-03
+
+### Added
+- **`dev.flywheel.cron`, the supervised cron host (bd-cron-supervision-unit-ww8hi).** A second launchd/systemd unit runs `flywheel cron start --project <p>` with `WorkingDirectory` = the project root (`RunAtLoad` + restart-on-crash), driven by `flywheel daemon start|stop|restart|status`. `flywheel serve` stays the HTTP/wake daemon and never ticks. The installer renders the shell PATH into both units, restoring `rex`, `hc`, `br` and `toron` lookups that launchd's bare PATH hid.
+- **Host-native awareness digest (bd-awareness-native-fm4zu).** `src/awareness.rs` computes dispatcher/doorbell/presence facts every 15 minutes with **no agent**: silent when no swarm exists or the facts did not move, and one bead per new conflict episode (dispatcher down with panes, unanswered doorbell pin, reservation overlap, vanished swarm). The beads poller wakes the captain, so escalation costs no tokens. The catalog workflow stays as the on-demand narrative and no longer carries a schedule trigger.
+- **`lease_hosted` in `/health`** names the workspaces per-workspace loops host, deduped with daemon-hosted keys.
+
+### Changed
+- **The doorbell daemon never hosts a workspace (bd-comms-daemon-standby-7etpp, bd-daemon-autohost-claim-0updx).** No pane typer exists in any mode, so a daemon host could only take the workspace lease as `no-text` and deafen the loop that types. `serve` is standby (health/reads only); per-workspace `flywheel __doorbell` loops own the lease, brain, bus watch and pane. The boot lease claim, the pre-bind refusal and the auto-host reconcile now follow the (empty) spawn set; `/health` reports `standby` with `degraded []`, and `doorbell status` says "standby — N armed for reads; loops host".
+
+### Fixed
+- **Cron fired each schedule twice and leaked a journal row per fire (bd-cron-single-fire-qc0ci).** A builtin schedule workflow appears in both the row set and the merged catalog view; `unowned_registrations` lets the row own the name. `drive_in_scope` drives cron bodies in the `cron` journal the tick started, and the doorbell-supervisor fire is ended through `end_run`, so runs reach a terminal phase.
+- **A transient workspace miss no longer retires a doorbell loop (bd-loop-workspace-gone-uwc2g).** An empty listing is `Unreadable`, never `Gone`; a confirmed `Gone` is re-listed with bounded backoff before feeding the streak, and the audit row carries the streak.
+- **Lease staleness is identity-keyed (bd-lease-boot-identity-tm6cg).** `LeaseOwner` carries a real boot id (Linux boot_id, macOS `kern.boottime`) and a per-process start stamp; the pure predicate treats a different boot, dead pid, mismatched start or legacy zero stamp as stale, so a reused pid cannot keep a dead host's lease live.
+- **`flywheel kill` resolves through the status door on every plane (bd-kill-hc-lookup-j2zb3)**, so an hc workspace that `status` lists is never "no flywheel swarm".
+- **hc panes keep their pin as the routable label (bd-hc-pin-label-tzg6l).** The GS-039 name-bind loop no longer renames a pane to its kind and clobbers `toron_pin`, so `resolve_pane_identity` and the doorbell can map a pin to its pane.
+- **The pane-text fence names the hc transport as the sink backend (bd-pane-fence-hc-jwq4s, bd-pane-fence-hc-b6rdm).** The two `hc_support` prompt sites are the `PaneWrite` door's backend, not bypasses; the allowlist is exact and the stale `src/hc.rs` entry is gone.
+- **The unrunnable inbox-only host path is deleted (bd-inbox-only-dead-path-0dt46).** It polled the comms inbox log and saw `head=0` for NIP-17 mail; a live `no-text` holder now refuses loud with the remedy.
+- **`lease_stale` decides cheap first (bd-lease-stale-hotpath-awm4z)** — boot/heartbeat verdicts no longer spawn `ps` for the pid start.
+- **Prune fixture** carries a real boot and start stamp (the suite's own regression after the identity change).
+
+### Removed
+- The daemon's `no-text` lease claim and the auto-host reconcile — both re-deafened loop-hosted workspaces.
+
 ## [0.9.0] — 2026-10-24
 
 ### Added
