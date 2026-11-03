@@ -3988,6 +3988,48 @@ fn print_concise_help() {
 // ---- robot snapshot ----
 
 fn robot_snapshot(cfg: &Config) -> Result<Value> {
+    if crate::pane::rex_door_selected(cfg) {
+        let backend = backend::multiplexer_backend(cfg)?;
+        let workspaces = backend.workspace_list()?;
+        let agents = backend.agent_list()?;
+        let fly: Vec<Value> = workspaces
+            .iter()
+            .filter(|w| w.label.starts_with("flywheel-"))
+            .map(|w| {
+                let ws_agents: Vec<Value> = agents
+                    .iter()
+                    .filter(|a| a.workspace_id == w.workspace_id)
+                    .map(|a| {
+                        json!({
+                            "name": a.name, "kind": a.agent, "status": a.agent_status.as_str(),
+                            "pane_id": a.pane_id, "cwd": a.cwd, "interactive_ready": a.interactive_ready
+                        })
+                    })
+                    .collect();
+                json!({
+                    "workspace_id": w.workspace_id,
+                    "label": w.label,
+                    "cwd": w.cwd,
+                    "pane_count": w.pane_count,
+                    "agents": ws_agents
+                })
+            })
+            .collect();
+        // P6.4: runs section — the same log-derived run list the `runs` CLI
+        // serves, so an agent driver polls run-state from the snapshot alone.
+        let runs: Vec<Value> = snapshot_runs();
+        return Ok(json!({
+            "tool": "flywheel",
+            "version": VERSION,
+            "ts": state::now_iso(),
+            "workspaces": fly,
+            "runs": runs,
+            "agents": agents.iter().map(|a| json!({
+                "name": a.name, "kind": a.agent, "status": a.agent_status.as_str(),
+                "workspace_id": a.workspace_id, "pane_id": a.pane_id
+            })).collect::<Vec<_>>()
+        }));
+    }
     let c = Client::connect(Some(&cfg.socket_path()))?;
     let workspaces = c.workspace_list()?;
     let agents = c.agent_list()?;
@@ -20956,9 +20998,6 @@ fn cmd_interrupt(
 ) -> Result<()> {
     // bd-blank-project-spelling-non-mail-doors-76hi
     check_project_spelling(project, "interrupt")?;
-    let mut c = Client::connect(Some(&cfg.socket_path()))?;
-    let ws_id = find_workspace(&mut c, project)?;
-    let targets = resolve_agents(&mut c, &ws_id, project, to)?;
     let keys: Vec<&str> = if keys.is_empty() {
         vec!["Escape"]
     } else {
@@ -20969,6 +21008,55 @@ fn cmd_interrupt(
             "--keys {k} TERMINATES the agent process (pane drops to a shell and the session binding is lost). Prefer the default Escape, which cancels the current tool call and returns to the prompt. Pass --force to send {k} deliberately."
         );
     }
+    if crate::pane::rex_door_selected(cfg) {
+        let backend = backend::multiplexer_backend(cfg)?;
+        let workspaces = find_workspaces_dyn(&*backend, project)?;
+        let ws_ids: Vec<&str> = workspaces.iter().map(|w| w.workspace_id.as_str()).collect();
+        let agents = backend.agent_list()?;
+        let in_ws: Vec<AgentInfo> = agents
+            .into_iter()
+            .filter(|a| ws_ids.contains(&a.workspace_id.as_str()))
+            .collect();
+        if in_ws.is_empty() {
+            let labels: Vec<&str> = workspaces.iter().map(|w| w.label.as_str()).collect();
+            bail!("no agents in {labels:?} — is the swarm spawned?");
+        }
+        let registry = state::load_spawn_registry(project);
+        let targets = resolve_send_targets_dyn(&in_ws, &registry, project, to)?;
+        // bd-pin-public-plane-s-easy.9: interrupting a WORKING agent needs
+        // --force — a captain must not nudge a working agent off its task
+        // because a send JSON showed prior idle (false-fail root cause).
+        for a in &targets {
+            let prior =
+                hc_support::parse_agent_status(a.agent_status.as_str()).unwrap_or(AgentStatus::Unknown);
+            interrupt_guard_working(prior, force)?;
+        }
+        let is_kill = kill_key(&keys).is_some();
+        for a in &targets {
+            let target_id = if let Some(n) = a.name.as_deref().filter(|n| !n.is_empty()) {
+                n
+            } else {
+                &a.pane_id
+            };
+            backend.agent_send_keys(target_id, &keys)?;
+            if std::io::stdout().is_terminal() {
+                println!(
+                    "interrupted {} ({})",
+                    dim(agent_target(a)),
+                    if is_kill { "kill keys" } else { "soft" }
+                );
+            }
+        }
+        log(
+            project,
+            EventKind::Interrupt,
+            json!({ "to": to, "keys": keys, "kill": is_kill }),
+        );
+        return Ok(());
+    }
+    let mut c = Client::connect(Some(&cfg.socket_path()))?;
+    let ws_id = find_workspace(&mut c, project)?;
+    let targets = resolve_agents(&mut c, &ws_id, project, to)?;
     // bd-pin-public-plane-s-easy.9: interrupting a WORKING agent needs
     // --force — a captain must not nudge a working agent off its task
     // because a send JSON showed prior idle (false-fail root cause).
