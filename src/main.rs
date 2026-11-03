@@ -21020,7 +21020,6 @@ fn client_read_with_fallback(
 fn cmd_view(cfg: &Config, project: &str, to: &str, lines: Option<u32>, source: &str) -> Result<()> {
     // bd-blank-project-spelling-non-mail-doors-76hi
     check_project_spelling(project, "view")?;
-    let mut c = Client::connect(Some(&cfg.socket_path()))?;
     // ADR-0010 D10 (bd-67qg): one snapshot call feeds the TTY bearings
     // line (pipes stay byte-identical).
     if std::io::stdout().is_terminal() {
@@ -21028,6 +21027,38 @@ fn cmd_view(cfg: &Config, project: &str, to: &str, lines: Option<u32>, source: &
         let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
         eprintln!("{}", snapshot::bearings_line(&snap));
     }
+    #[cfg(feature = "backend-superlogical")]
+    if crate::pane::rex_door_selected(cfg) {
+        let backend = backend::multiplexer_backend(cfg)?;
+        let workspaces = find_workspaces_dyn(&*backend, project)?;
+        let ws_ids: Vec<&str> = workspaces.iter().map(|w| w.workspace_id.as_str()).collect();
+        let agents = backend.agent_list()?;
+        let in_ws: Vec<AgentInfo> = agents
+            .into_iter()
+            .filter(|a| ws_ids.contains(&a.workspace_id.as_str()))
+            .collect();
+        if in_ws.is_empty() {
+            let labels: Vec<&str> = workspaces.iter().map(|w| w.label.as_str()).collect();
+            bail!("no agents in {labels:?} — is the swarm spawned?");
+        }
+        let registry = state::load_spawn_registry(project);
+        let targets = resolve_send_targets_dyn(&in_ws, &registry, project, to)?;
+        for a in &targets {
+            let target_id = agent_target(a);
+            let val = backend.agent_read(target_id, source, lines.unwrap_or(0))?;
+            let text = val.get("text").and_then(Value::as_str).unwrap_or("");
+            let text = sanitize_pane_text(text);
+            if std::io::stdout().is_terminal() && targets.len() > 1 {
+                println!("--- {} ---", agent_target(a));
+            }
+            print!("{text}");
+            if !text.ends_with('\n') {
+                println!();
+            }
+        }
+        return Ok(());
+    }
+    let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let ws_id = find_workspace(&mut c, project)?;
     let targets = resolve_agents(&mut c, &ws_id, project, to)?;
     for a in &targets {
