@@ -203,19 +203,19 @@ fn pick_snapshot_workspace(
     aliases: &[String],
     owned_label: &str,
 ) -> Option<String> {
+    let prefix = format!("{owned_label}-");
     let matches: Vec<&crate::hc_support::WorkspaceInfo> = workspaces
         .iter()
-        .filter(|ws| aliases.iter().any(|a| a == &ws.label))
+        .filter(|ws| aliases.iter().any(|a| a == &ws.label) || ws.label.starts_with(&prefix))
         .collect();
     if matches.is_empty() {
         return None;
     }
     if matches.len() > 1 {
-        let prefix = format!("{owned_label}-");
-        if let Some(ws) = matches
+        let preferred = matches
             .iter()
-            .find(|ws| ws.label == owned_label || ws.label.starts_with(&prefix))
-        {
+            .find(|ws| ws.label == owned_label || ws.label.starts_with(&prefix));
+        if let Some(ws) = preferred {
             return Some(ws.workspace_id.clone());
         }
     }
@@ -966,5 +966,15 @@ mod adr0010_d10_tests {
         );
         let none: Vec<String> = vec![];
         assert_eq!(pick_snapshot_workspace(&list, &none, "flywheel-proj"), None);
+    }
+
+    #[test]
+    fn snapshot_workspace_pick_matches_keyed_workspace() {
+        let list = vec![ws("w-keyed", "flywheel-proj-rk-loop-1")];
+        let aliases = vec!["flywheel-proj".to_string(), "proj".to_string()];
+        assert_eq!(
+            pick_snapshot_workspace(&list, &aliases, "flywheel-proj").as_deref(),
+            Some("w-keyed")
+        );
     }
 }
