@@ -603,11 +603,62 @@ pub fn linked_worktrees(v: &[WorktreeInfo]) -> Vec<&WorktreeInfo> {
     v.iter().filter(|w| w.is_linked_worktree).collect()
 }
 
+/// Pure: linked worktree paths from `git worktree list --porcelain` — every
+/// `worktree <path>` line after the first (the primary tree) is a linked
+/// checkout the loop must never adopt.
+pub fn parse_git_worktree_linked(output: &str) -> Vec<String> {
+    let mut paths: Vec<String> = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree ").map(str::to_string))
+        .collect();
+    if paths.is_empty() {
+        return paths;
+    }
+    paths.remove(0);
+    paths
+}
+
+/// Native linked worktrees via `git worktree list --porcelain` in `dir`.
+fn native_linked_worktrees(dir: &Path) -> Result<Vec<String>, String> {
+    let out = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("git worktree list failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git worktree list failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(parse_git_worktree_linked(&String::from_utf8_lossy(
+        &out.stdout,
+    )))
+}
+
 /// ADR-0019 Spec 3.3: fail the run when the project workspace carries an
 /// extra linked worktree — the loop will not dispatch `--work` into it and
 /// will not ledger-check a SHA from it. Removing it (or the operator's
 /// `--allow-worktree`) unblocks the run.
 fn check_worktree(cfg: &Config, project: &str) -> Check {
+    if crate::pane::rex_door_selected(cfg) {
+        let dir = crate::project_dir(cfg, project);
+        let linked = match native_linked_worktrees(&dir) {
+            Ok(v) => v,
+            Err(e) => return Check::fail("worktree", e),
+        };
+        if linked.is_empty() {
+            return Check::pass("worktree");
+        }
+        return Check::fail(
+            "worktree",
+            format!(
+                "{} linked worktree(s): {} — worktrees are forbidden in the loop (ADR-0019 Spec 3); remove them or pass --allow-worktree (operator-only, logged)",
+                linked.len(),
+                linked.join(", ")
+            ),
+        );
+    }
     let mut c = match Client::connect(Some(&cfg.socket_path())) {
         Ok(c) => c,
         Err(e) => return Check::fail("worktree", format!("hc connect failed: {e}")),
@@ -1048,6 +1099,18 @@ mod tests {
         assert_eq!(linked_only.len(), 1);
         assert_eq!(linked_only[0].path, "/w/exp");
         assert!(linked_worktrees(&[]).is_empty());
+    }
+
+    /// bd-k779v: native `git worktree list --porcelain` — first entry is the
+    /// primary tree, every later `worktree <path>` line is linked.
+    #[test]
+    fn parse_git_worktree_linked_skips_primary() {
+        let out = "worktree /w/main\nHEAD abc\nbranch refs/heads/main\n\n\
+                       worktree /w/exp\nHEAD def\ndetached\n\n";
+        assert_eq!(parse_git_worktree_linked(out), vec!["/w/exp".to_string()]);
+        let solo = "worktree /w/main\nHEAD abc\nbranch refs/heads/main\n\n";
+        assert!(parse_git_worktree_linked(solo).is_empty());
+        assert!(parse_git_worktree_linked("").is_empty());
     }
 
     /// ADR-0019 Spec 3.3: `--allow-worktree` is operator-only — the opt-out
