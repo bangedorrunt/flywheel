@@ -1418,9 +1418,11 @@ async fn run_elm_cron_host(
     let pool = store.pool().clone();
     let checkpoints = load_cron_checkpoints();
     let handle = tokio::runtime::Handle::current();
+    let engine_store = ToronEngineStore::spawn(pool.clone(), &handle);
+    let journal = ToronJournal::spawn(JournalDb::new(pool, "cron", 64), &handle);
     let mut elm = ElmCron::with_engine(OurEngine::with_journal(
-        ToronEngineStore::spawn(pool.clone(), &handle),
-        ToronJournal::spawn(JournalDb::new(pool, "cron", 64), &handle),
+        engine_store.clone(),
+        journal.clone(),
     ));
     for body in &bodies {
         if let Err(e) = elm.add(
@@ -1459,7 +1461,7 @@ async fn run_elm_cron_host(
     ) {
         eprintln!("cron {}: invalid schedule: {e:#}", crate::awareness::NAME);
     }
-    let consecutive: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, u32>>> =
+    let consecutive: std::sync::Arc<tokio::sync::Mutex<std::collections::BTreeMap<String, u32>>> =
         Default::default();
     loop {
         let now_ms = unix_ms();
@@ -1491,7 +1493,8 @@ async fn run_elm_cron_host(
         }
         for fire in fires {
             if fire.name == crate::doorbell::SUPERVISOR_NAME {
-                let store = store.clone();
+                let engine_store = engine_store.clone();
+                let journal = journal.clone();
                 let key = fire.key.clone();
                 tokio::spawn(async move {
                     let healed = crate::doorbell::heal_tick_body().await;
@@ -1507,13 +1510,14 @@ async fn run_elm_cron_host(
                     // run `ElmCron::tick` started must still be settled here, or
                     // every minute leaves a `running` run and an `in_flight`
                     // journal row that nothing will ever finish.
-                    settle_native_run(store, key, healed.is_ok(), crate::doorbell::SUPERVISOR_NAME)
+                    settle_native_run(engine_store, journal, key, healed.is_ok(), crate::doorbell::SUPERVISOR_NAME)
                         .await;
                 });
                 continue;
             }
             if fire.name == crate::awareness::NAME {
-                let store = store.clone();
+                let engine_store = engine_store.clone();
+                let journal = journal.clone();
                 let key = fire.key.clone();
                 let cfg = cfg.clone();
                 let digests = project.clone();
@@ -1529,7 +1533,8 @@ async fn run_elm_cron_host(
                         Err(e) => eprintln!("cron {}: {e:#}", crate::awareness::NAME),
                     }
                     settle_native_run(
-                        store,
+                        engine_store,
+                        journal,
                         key,
                         outcome.is_ok(),
                         crate::awareness::NAME,
@@ -1557,19 +1562,15 @@ async fn run_elm_cron_host(
 /// Settle a host-native fire (doorbell supervisor, awareness digest) in the
 /// journal scope that started it (`cron`), so its run row reaches a phase.
 async fn settle_native_run(
-    store: toron_core::index::workflow_effects::WorkflowEffectStore,
+    engine_store: toron_core::index::durable_engine::ToronEngineStore,
+    journal: toron_core::journal::ToronJournal,
     run_key: String,
     succeeded: bool,
     label: &'static str,
 ) {
-    use toron_core::index::durable_engine::ToronEngineStore;
-    use toron_core::journal::{JournalDb, ToronJournal};
     use toron_core::kernel::{OurEngine, RunEnd, end_run};
 
-    let handle = tokio::runtime::Handle::current();
     let joined = tokio::task::spawn_blocking(move || {
-        let journal = ToronJournal::spawn(JournalDb::new(store.pool().clone(), "cron", 64), &handle);
-        let engine_store = ToronEngineStore::spawn(store.pool().clone(), &handle);
         let mut engine = OurEngine::with_journal(engine_store, journal);
         let end = if succeeded {
             RunEnd::Succeeded
@@ -1644,7 +1645,7 @@ async fn settle_cron_fire(
     body: &CronBody,
     fire: &CronFire,
     outcome: CronBodyOutcome,
-    consecutive: &tokio::sync::Mutex<std::collections::HashMap<String, u32>>,
+    consecutive: &tokio::sync::Mutex<std::collections::BTreeMap<String, u32>>,
     project: Option<&str>,
 ) {
     let tick = (fire.tick_ms / 1000) as i64;

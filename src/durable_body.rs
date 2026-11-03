@@ -103,10 +103,7 @@ pub fn real_verify_sink() -> toron_workflow::engine::VerifySink {
             error: None,
         })
     });
-    *sink
-        .0
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(f);
+    *sink.0.lock().expect("verify sink lock poisoned") = Some(f);
     sink
 }
 
@@ -579,4 +576,83 @@ fn failed(error: impl Into<String>, step: Option<String>) -> BodyOutcome {
 
 fn digest(workflow: &Workflow) -> String {
     toron_workflow::identity::workflow_digest(workflow)
+}
+
+#[cfg(test)]
+mod tests {
+    /// bd-36cbt: a timed-out in-flight run moves InFlight -> Unknown ->
+    /// ReconcilePending -> Settled through expire_lease + reconcile over
+    /// ToronEngineStore + ToronJournal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expire_lease_and_reconcile_settle_timed_out_run() {
+        use toron_core::index::durable_engine::ToronEngineStore;
+        use toron_core::index::schema;
+        use toron_core::journal::{JournalDb, ToronJournal};
+        use toron_core::kernel::{
+            DurableEngine, EffectState, OurEngine, RunPhase, StartOutcome,
+        };
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let db = std::env::temp_dir().join(format!(
+            "fw-durable-lease-{}-{}.sqlite",
+            std::process::id(),
+            nanos
+        ));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let handle = tokio::runtime::Handle::current();
+        let mut engine = OurEngine::with_journal(
+            ToronEngineStore::spawn(pool.clone(), &handle),
+            ToronJournal::spawn(JournalDb::new(pool, "body-test", 64), &handle),
+        );
+        let key = "bd-36cbt-lease-expiry";
+        match engine.start(key, 0).expect("start") {
+            StartOutcome::Started { .. } => {}
+            StartOutcome::Already { status } => {
+                panic!("fresh key already started: {status:?}")
+            }
+        }
+        assert_eq!(
+            engine.query(key).expect("query running").phase,
+            RunPhase::Running,
+            "fresh start is Running (InFlight)"
+        );
+        engine
+            .park_until(key, 1_000, 60, 0, None)
+            .expect("park");
+        let expired = engine
+            .expire_lease(key, 0)
+            .expect("expire")
+            .expect("timed-out lease must transition to Unknown");
+        assert_eq!(
+            expired.state,
+            EffectState::Unknown,
+            "expire settles the journal to Unknown"
+        );
+        assert_eq!(
+            engine.query(key).expect("query unknown").phase,
+            RunPhase::Unknown,
+            "storage projects Unknown after expire"
+        );
+        let settled = engine
+            .reconcile(key, expired.generation, EffectState::Settled)
+            .expect("reconcile")
+            .expect("reconcile must return a row after expire");
+        assert_eq!(
+            settled.state,
+            EffectState::Settled,
+            "reconciled to Settled"
+        );
+        assert_eq!(
+            engine.query(key).expect("query settled").phase,
+            RunPhase::Settled,
+            "run settled after reconcile"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
 }
