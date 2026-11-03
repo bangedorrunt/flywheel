@@ -16155,9 +16155,12 @@ fn cmd_add(
 // ---- list / status ----
 
 fn cmd_list(cfg: &Config, all: bool) -> Result<()> {
-    let c = Client::connect(Some(&cfg.socket_path()))?;
-    let workspaces = c.workspace_list()?;
-    let agents = c.agent_list()?;
+    // bd-3vw3q: route through the resolved multiplexer backend so the
+    // rex plane is visible (hc Client::connect answers 'no flywheel
+    // swarms' on rex hosts).
+    let backend = backend::multiplexer_backend(cfg)?;
+    let workspaces = backend.workspace_list()?;
+    let agents = backend.agent_list()?;
     let mut rows: Vec<Value> = Vec::new();
     for ws in workspaces
         .iter()
