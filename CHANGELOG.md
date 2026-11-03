@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] — 2026-11-03
+
+### Fixed
+- **A failed OSC 7501 record no longer reads as done (bd-xgea, toron-core 1.6.1).** `fold_attention` ranked `done` above `error`, so a `done` child masked a failed root and the pane status said `Done`. Failure now outranks success and maps to `Unknown`; `working` still wins while the terminal is busy. The full bin suite is green again (2745 passed, 0 failed).
+- **The `loop` topology wire word loads as `open` (bd-topology-loop-alias-qkdl, toron-core 1.6.1)** — the retired variant is gone from `ALL`/`as_str`/`global_of`, and a stored `loop` fact deserializes to `open` as documented.
+
 ## [0.10.0] — 2026-11-03
 
 ### Added
