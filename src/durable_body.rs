@@ -25,13 +25,13 @@ use toron_core::index::durable_workflow::SyncWorkflowState;
 use toron_core::index::workflow_effects::WorkflowEffectStore;
 use toron_core::journal::{JournalDb, ToronJournal};
 use toron_core::kernel::OurEngine;
+use toron_workflow::engine::ProfileResolver;
 use toron_workflow::engine::durable::{GraphEffect, RunEffect, needs_graph_model};
 use toron_workflow::engine::durable_host::{DurableGraphRun, DurableRun, HostError};
 use toron_workflow::engine::leaf::LeafSeams;
 use toron_workflow::engine::linear_step::{
     GraphNodeStep, LinearStep, run_graph_node_step, run_linear_step,
 };
-use toron_workflow::engine::ProfileResolver;
 use toron_workflow::engine::spawn::{SpawnLauncher, SpawnSeams, SpawnSpec};
 use toron_workflow::schema::Workflow;
 
