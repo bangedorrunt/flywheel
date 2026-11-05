@@ -787,7 +787,7 @@ pub mod rex_map {
     use toron_core::backend::{AgentStatus, BackendEvent, PaneId};
     use toron_core::osc7501::{Board, ProgramState, parse_report};
 
-    use toron_core::backend::rex_map::fold_status;
+    use toron_core::backend::rex::fold_status;
 
     /// Map one `program_status` payload to the trait status.
     ///
@@ -1127,7 +1127,7 @@ pub mod rex_map {
         /// panes classify identically.
         #[test]
         fn both_folds_agree_on_shared_fixtures() {
-            use toron_core::backend::rex_map::status_from_records;
+            use toron_core::backend::rex::status_from_records;
             for records in [
                 r#"[]"#,
                 r#"[{"state":"error","app":"freebuff"}]"#,
