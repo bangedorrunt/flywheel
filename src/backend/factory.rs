@@ -306,7 +306,7 @@ mod tests {
     /// A missing rex binary is an install error, not "not yet released",
     /// and it must not fall through to the operator's live server.
     #[test]
-    fn superlogical_stub_is_honest_unsupported() {
+    fn a_missing_rex_cli_is_an_install_error() {
         let _g = lock_env();
         let dir = tempfile::tempdir().expect("empty rex dir");
         let prev = std::env::var_os("REX_BIN_DIR");

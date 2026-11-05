@@ -53,16 +53,6 @@ impl Client {
             inner: HcClient::connect(socket_path)?,
         })
     }
-
-    #[allow(dead_code)]
-    pub fn connect_with_policy(
-        socket_path: Option<&str>,
-        policy: toron_core::osc7501::FoldPolicy,
-    ) -> Result<Self, BackendError> {
-        Ok(Self {
-            inner: HcClient::connect_with_policy(socket_path, policy)?,
-        })
-    }
 }
 
 /// GS-049 / bd-a2bw: hc `launch_pending` is stale when the pane is already
@@ -436,8 +426,9 @@ pub fn resolve_workspace_from_registry(
 /// push notification payload wrapper (`kind` names the producer, `data`
 /// is the typed payload). Built at the toron-core `BackendEvent` edge by
 /// `push_from_backend` — the bin matches on the typed `data` variant.
-#[derive(Debug, Clone)]
+// `kind` is part of the push envelope; consumers route on `data`.
 #[allow(dead_code)]
+#[derive(Debug, Clone)]
 pub struct PushEvent {
     pub kind: TerminalEventKind,
     pub data: TerminalEventData,
@@ -455,8 +446,9 @@ pub enum TerminalEventKind {
 }
 
 /// flywheel-shaped worktree record. toron-core's `WorktreeInfo` models the
-#[derive(Debug, Clone, Deserialize)]
+// serde wire shape: parsed for completeness, not every field is read.
 #[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct WorktreeInfo {
     pub path: String,
     pub branch: Option<String>,
@@ -471,8 +463,9 @@ pub struct WorktreeInfo {
 /// A terminal ended. Built from toron-core's `BackendEvent::PaneExited` —
 /// the only exit signal the doorbell routes on.
 
-#[derive(Debug, Clone, Deserialize)]
+// serde wire shape: the exit signal is routed by pane, not by these ids.
 #[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PaneExited {
     pub pane_id: String,
     pub workspace_id: String,
@@ -482,8 +475,9 @@ pub struct PaneExited {
 /// `BackendEvent::AgentStatusChanged` (the `Sub` variant is the subscribe
 /// push; the bare variant is what the watch loop's `match` names — both
 /// carry this payload).
-#[derive(Debug, Clone, Deserialize)]
+// serde wire shape: status + pane are read; the rest are optional metadata.
 #[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PaneAgentStatusChanged {
     pub pane_id: String,
     pub workspace_id: String,
@@ -501,6 +495,8 @@ pub struct PaneAgentStatusChanged {
 /// `PaneAgentStatusChanged` variant is what the watch loop + doorbell match
 /// arms name (the subscription push lands as `..Sub` with the same payload).
 #[derive(Debug, Clone)]
+// The bare variant is matched by the watch loop even though today only the
+// `Sub` form is constructed; removing it would break that arm.
 #[allow(dead_code, clippy::enum_variant_names)]
 pub enum TerminalEventData {
     PaneAgentStatusChanged(PaneAgentStatusChanged),
@@ -712,50 +708,6 @@ pub fn pane_wait_output(
 /// canonical line limit). Poll every 250ms until the prompt appears (→
 /// `Ok(true)`), the probe errors continuously, or `timeout` elapses (→
 /// `Ok(false)` — the caller warns; the old race is the fallback).
-/// hc 0.1.18 feature wrappers — additive only. All reachable via
-/// `Client::call`/`call_coded`; these are convenience entry points so future
-/// integration code doesn't re-derive params. Full method inventory (32):
-/// hello, server.status, server.stop, server.restart, terminal.run,
-/// templates.list, terminal.list, terminal.get, terminal.kill, terminal.rm,
-/// terminal.keep, terminal.label, terminal.read, terminal.attach,
-/// terminal.send, terminal.wait, terminal.keys, terminal.interrupt,
-/// terminal.put, machine.exec, file.read, file.write, file.edit, doc.get,
-/// doc.set, events.subscribe, machine.add, machine.list, machine.connect,
-/// machine.rename, machine.rm, rpc.discover. Wrapped below: interrupt, keep,
-/// put, templates_list, server_status. The rest are invoked through
-/// `Client::call` where needed (machine/file/doc/attach) — no wrapper yet
-/// to avoid speculative surface.
-pub fn terminal_interrupt(c: &Client, terminal: &str, timeout_ms: Option<u64>) -> Result<Value, BackendError> {
-    let mut params = serde_json::json!({ "terminal": toron_core::backend::hc::strip_id_prefix(terminal) });
-    if let Some(ms) = timeout_ms {
-        params["timeout"] = serde_json::json!(ms as f64 / 1000.0);
-    }
-    c.call("terminal.interrupt", params)
-}
-
-pub fn terminal_keep(c: &Client, terminal: &str, keep: bool) -> Result<Value, BackendError> {
-    c.call("terminal.keep", serde_json::json!({
-        "terminal": toron_core::backend::hc::strip_id_prefix(terminal),
-        "keep": keep,
-    }))
-}
-
-pub fn terminal_put(c: &Client, terminal: &str, name: &str, data: &str) -> Result<Value, BackendError> {
-    c.call("terminal.put", serde_json::json!({
-        "terminal": toron_core::backend::hc::strip_id_prefix(terminal),
-        "name": name,
-        "data": data,
-    }))
-}
-
-pub fn templates_list(c: &Client) -> Result<Value, BackendError> {
-    c.call("templates.list", serde_json::json!({}))
-}
-
-pub fn server_status(c: &Client) -> Result<Value, BackendError> {
-    c.call("server.status", serde_json::json!({}))
-}
-
 pub fn wait_shell_prompt(c: &Client, pane_id: &str, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     let mut last_err: Option<String> = None;
@@ -827,8 +779,9 @@ pub fn worktree_list(_c: &Client, _workspace_id: Option<&str>) -> Result<Vec<Wor
 /// falls back to the shell prompt and the agent binary disappears from the
 /// list. This is the ground-truth liveness signal `flywheel recover` probes
 /// (a pane can exist in hc while the process inside it is dead).
-#[derive(Debug, Clone, Deserialize)]
+// serde wire shape: the liveness read keeps pid for diagnostics.
 #[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PaneProcessInfoProcess {
     pub pid: u64,
     pub name: String,
@@ -839,8 +792,9 @@ pub struct PaneProcessInfoProcess {
 /// Result of the `terminal.get` liveness read (bd-1np). `foreground_processes` lists the
 /// the group leader (`pid == foreground_process_group_id`); the `shell_pid`
 /// is the pane's shell, which reclaims the foreground after the agent exits.
-#[derive(Debug, Clone, Deserialize)]
+// serde wire shape: parsed from `terminal.get`; only the process list is read.
 #[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PaneProcessInfo {
     pub pane_id: String,
     #[serde(default)]
@@ -3516,22 +3470,6 @@ impl Client {
     }
     pub fn worktree_remove(&self, _workspace_id: &str, _force: bool) -> Result<(), BackendError> {
         Err(unsupported_on_hc("worktree_remove"))
-    }
-    #[allow(dead_code)]
-    pub fn subscribe(&self, _subscriptions: &[Subscription]) -> Result<Value, BackendError> {
-        Err(unsupported_on_hc(
-            "subscribe(legacy); use subscribe_terminals",
-        ))
-    }
-    #[allow(dead_code)]
-    pub fn pane_report_metadata(
-        &self,
-        _pane_id: &str,
-        _pin: &str,
-        _project: &str,
-        _npub: &str,
-    ) -> Result<Value, BackendError> {
-        Ok(json!({ "ok": true }))
     }
     pub fn ping(&self) -> Result<Value, BackendError> {
         self.terminal_list(false)

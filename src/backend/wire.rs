@@ -32,7 +32,6 @@ pub fn ensure_project_args(project_key: &str) -> Value {
 /// ensure_project accepts identity_mode; the fold only resolves in swarm).
 /// Only consumer is `Mail::set_identity_mode`, itself suppressed in the
 /// default build until the wave wires the caller.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn ensure_project_with_mode_args(project_key: &str, mode: &str) -> Value {
     json!({ "human_key": project_key, "identity_mode": mode })
 }
