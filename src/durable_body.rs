@@ -55,6 +55,7 @@ pub struct BodySeams {
 }
 
 /// How one body ended.
+#[derive(Debug)]
 pub enum BodyOutcome {
     /// The terminal output value.
     Completed(Value),
@@ -481,6 +482,10 @@ async fn drive_graph(
                     run = back;
                     follow.append(&mut eff);
                 }
+                // Informational only: feeding the `ChildRun` result back
+                // (`child_succeeded` / `child_failed`) already settled the
+                // node in the fold. A restart re-emits `ChildRun` for a child
+                // that never settled, so there is nothing left to do here.
                 GraphEffect::ChildJoin { .. } => {}
                 GraphEffect::Complete { output } => return BodyOutcome::Completed(output),
                 GraphEffect::Fail { fail } => {
@@ -600,6 +605,7 @@ fn digest(workflow: &Workflow) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// bd-36cbt: a timed-out in-flight run moves InFlight -> Unknown ->
     /// ReconcilePending -> Settled through expire_lease + reconcile over
@@ -794,11 +800,14 @@ mod tests {
         )
         .expect("parse child");
 
+        // A counting fake, not `real_verify_sink`: the witness must prove the
+        // child's verify leaf ran exactly once without spawning a shell.
+        let verify_calls = Arc::new(AtomicUsize::new(0));
         let seams = BodySeams {
             leaf: LeafSeams {
                 async_runner: None,
                 sync_runner: None,
-                verify_sink: real_verify_sink(),
+                verify_sink: counting_verify_sink(verify_calls.clone()),
                 journal_mode: toron_workflow::engine::EffectJournalMode::Recording,
             },
             launcher: None,
@@ -827,9 +836,101 @@ mod tests {
             }
         };
         assert_eq!(
-            output["call"]["steps"]["check"]["ok"], true,
+            output["call"]["steps"]["check"]["ok"],
+            serde_json::json!(true),
             "the child verify ran and its terminal joined: {output}"
         );
+        assert_eq!(
+            verify_calls.load(Ordering::SeqCst),
+            1,
+            "the child's verify leaf runs exactly once"
+        );
         let _ = std::fs::remove_file(&db);
+    }
+
+    /// Child-call refusal witness: without a child resolver the graph refuses
+    /// at open with the host's exact contract text, before any leaf can run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graph_child_call_without_a_resolver_refuses_at_open() {
+        use toron_core::index::schema;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let db = std::env::temp_dir().join(format!(
+            "fw-durable-child-none-{}-{nanos}.sqlite",
+            std::process::id()
+        ));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let store = toron_core::index::workflow_effects::WorkflowEffectStore::new(pool);
+
+        let parent = toron_workflow::schema::parse_workflow(
+            "name: parent\nsteps:\n  - name: call\n    action: call_workflow\n    workflow: child\n    inputs: {}\n",
+        )
+        .expect("parse parent");
+
+        let verify_calls = Arc::new(AtomicUsize::new(0));
+        let seams = BodySeams {
+            leaf: LeafSeams {
+                async_runner: None,
+                sync_runner: None,
+                verify_sink: counting_verify_sink(verify_calls.clone()),
+                journal_mode: toron_workflow::engine::EffectJournalMode::Recording,
+            },
+            launcher: None,
+            spawn_resolver: None,
+            resolve_child: None,
+        };
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            drive(
+                &store,
+                "graph-child-no-resolver",
+                &parent,
+                serde_json::json!({}),
+                &seams,
+            ),
+        )
+        .await
+        .expect("a refused child graph must not hang");
+        match outcome {
+            BodyOutcome::Failed { error, step } => {
+                assert!(
+                    error.contains("call_workflow needs a workflow resolver on this host"),
+                    "the host's refusal text reaches the caller: {error}"
+                );
+                assert_eq!(step, None, "refusal happens at open, before a node runs");
+            }
+            other => panic!("a resolver-less child graph must fail at open: {other:?}"),
+        }
+        assert_eq!(
+            verify_calls.load(Ordering::SeqCst),
+            0,
+            "a refused open runs no leaf"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// A fake verify sink: counts calls, never shells out.
+    fn counting_verify_sink(calls: Arc<AtomicUsize>) -> toron_workflow::engine::VerifySink {
+        use toron_workflow::engine::{VerifyRequest, VerifyResult, VerifySink};
+        let sink = VerifySink::default();
+        let f = Arc::new(move |_: &VerifyRequest| -> anyhow::Result<VerifyResult> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(VerifyResult {
+                ok: true,
+                exit: 0,
+                stdout_path: None,
+                stderr_path: None,
+                error: None,
+            })
+        });
+        *sink.0.lock().expect("verify sink lock poisoned") = Some(f);
+        sink
     }
 }
