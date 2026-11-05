@@ -11,9 +11,6 @@
 //! starts fresh (or resumes by id with `--resume`). There is no vendor runtime
 //! and no replay VM.
 
-// LoopSnapshot and `tick` are wired: `tick` is the pure reducer folded by
-// every poll, and `LoopSnapshot` is the status projection consumed by
-// `loop status` + the fleet snapshot (delivery-verdict ADR-0010 D10).
 //!
 //! Leaves shell out to the flywheel binary itself (`__poll` / `__poll_events` /
 //! `__send` hidden subcommands) so the blocking hc socket client never runs
@@ -372,7 +369,6 @@ pub fn seed_workspace_from_active_loop(
     ws: &mut crate::workspace::WorkspaceModel,
     project: &str,
 ) -> anyhow::Result<()> {
-    // GS-033 fail-loud: I/O / parse Err must not collapse into Ok(None).
     match crate::state::load_active_loop(project) {
         Ok(Some(al)) => {
             seed_swarm_resume(
@@ -401,7 +397,6 @@ fn tick_loop_owner(
     swarm: &mut LoopModel,
     msg: &crate::workspace::Msg,
 ) -> Vec<crate::workspace::Cmd> {
-    // throwaway fold — not a live second WorkspaceModel owner
     let wm = crate::workspace::WorkspaceModel {
         swarm: swarm.clone(),
         ..Default::default()
@@ -572,8 +567,6 @@ impl LoopSnapshot {
 pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
     let mut next = model.clone();
     let mut actions = Vec::new();
-    // Pure, total, deterministic: no I/O, no &mut, no br/hc calls
-    // Queue pop lives in model' where it is visible and replayable
     match msg {
         LoopMsg::Dispatch {
             bead_id,
@@ -591,14 +584,6 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
             };
             if let Ok(to) = transition(&from, &event) {
                 next.per_bead_phase.insert(bead_id.clone(), to);
-                // bd-loop-goal-name-dispatch-eo4u: retired as a dispatch
-                // vehicle — the old arm popped the queue into Send.name (bead
-                // id / brief text as the agent name), which __read/__kind/send
-                // cannot resolve, and replaced the brief with a "dispatch ..."
-                // stub (content lost). Dispatch now happens only paired with a
-                // real agent (Tick arm, route_event). The phase transition
-                // stays; no pop, no misaddressed Send. The variant is kept
-                // for journal compat — it has no live constructors.
             }
         }
         LoopMsg::BrClose { bead_id } => {
@@ -642,9 +627,6 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
             status,
             exited,
         } => {
-            // tick owns the heal transition (ADR-0027 fold: `Heal` is a Msg).
-            // Thresholds ride the model (heal_grace/threshold/budget), so the
-            // decision is pure and replayable; the executor leaves run the I/O.
             let hs = next.heal_states.entry(name.clone()).or_default();
             let action = self_heal_step(
                 hs,
@@ -656,9 +638,6 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
             );
             let reason = if *exited { "pane_exited" } else { "unknown" };
             if *exited {
-                // bd-zfnx.10: exit fulfills an open drain — the pane left
-                // (finished or died); the receipt path (close-check) owns
-                // what follows, never a force-stop.
                 next.drain_pending.remove(name);
             }
             match action {
@@ -693,10 +672,6 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
             });
         }
         LoopMsg::DrainRequest { name, bead_id } => {
-            // bd-zfnx.10 two-phase stop: ask the pane to finish its VERIFY
-            // fence and report. First ask opens the grace window; a repeat
-            // ask re-prompts without extending it. Exit via Heal fulfills;
-            // Tick past grace force-stops with the bead id on the record.
             next.drain_pending
                 .entry(name.clone())
                 .or_insert(DrainState {
@@ -716,10 +691,6 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
             now,
             resurface_secs,
         } => {
-            // D12: every waiting state names its owner. Only an OPEN drain can
-            // hold a declared wait, and only the FIRST declaration starts the
-            // clock — a re-declaration (the pane repeats itself, or a crash
-            // replay re-delivers) must not re-base the age.
             if let Some(ds) = next.drain_pending.get_mut(name)
                 && ds.paused.is_none()
             {
@@ -744,25 +715,12 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
         },
         LoopMsg::Tick { now } => {
             let _ = now;
-            // Tick is the clock beat: heartbeat plan (queue -> Send). Heal and
-            // nudges are per-event Msgs; Model.states lives in the Model and
-            // pending_events are drained and applied here (single-apply invariant, bd-p1ds).
             apply_events_to_states(&mut next.states, &next.pending_events);
             next.pending_events.clear();
-            // bd-zfnx.10: drain grace countdown. A drain inside grace only
-            // waits; the first Tick AT zero force-stops with the bead id on
-            // the record (executor kills + LoudMiss). Exit via Heal fulfills
-            // first (arm above), so a finished pane is never force-stopped.
             let mut expired: Vec<(String, String, u32)> = Vec::new();
             let mut resurfaced: Vec<(String, String, String, u64)> = Vec::new();
             for (name, ds) in &mut next.drain_pending {
                 let bead_id = ds.bead_id.clone();
-                // ADR-0010 D4/D12: a drain holding a DECLARED `paused:` wait is
-                // not a stuck pane — grace is HELD (never force-stopped) and
-                // the wait is re-surfaced to its named owner once per window.
-                // `paused_resurface_due` is the one predicate for "is this wait
-                // due to re-surface"; re-arming `since` keeps each repeat
-                // bounded and observable instead of a per-tick spam.
                 if let Some(p) = ds.paused.as_mut() {
                     let age_secs = now.saturating_sub(p.since);
                     if crate::write_liveness::paused_resurface_due(age_secs, p.resurface_secs) {
@@ -794,33 +752,17 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
                 });
             }
             if !next.mail_degraded && !next.queue.is_empty() {
-                // bd-loop-goal-name-dispatch-eo4u: pair the queue head with a
-                // real idle|done agent HERE at the dispatch source. The old
-                // code popped the brief into Send.name (the whole GOAL text as
-                // the agent name) with a "dispatch ..." stub as content —
-                // __read/__kind/send failed on the bogus name, the brief was
-                // lost, claim-watch never reconciled, and the loop exited
-                // `complete` with beads open. No idle agent → PARK: the queue
-                // stays intact (complete_now cannot fire on our watch) and the
-                // next poll retries. Never pop without a taker. One head per
-                // tick (the old pop cadence); unknown/working/blocked agents
-                // never take work.
                 if let Some(i) = next.states.iter().position(|s| {
                     matches!(s.status.as_str(), "idle" | "done")
                         && !next.dispatch_pending.contains(&s.name)
                 }) {
                     let brief = next.queue.remove(0);
                     let agent = next.states[i].name.clone();
-                    // {AGENT_NAME} is the pin when the state knows it, else
-                    // the hc name (bd-pin-public-plane-s-easy.2 — same as
-                    // plan_actions / route_event).
                     let pin = next.states[i]
                         .mail_identity
                         .clone()
                         .unwrap_or_else(|| agent.clone());
                     let text = brief.replace("{AGENT_NAME}", &pin);
-                    // ADR-0001 Wave 3 pin stamp, mirroring plan_actions: bead
-                    // briefs stamp the orchestrator-resolved pin on claim.
                     if let Some(bead_id) = bead_id_from_prompt(&text) {
                         actions.push(LoopAction::PinStamp {
                             bead_id: bead_id.to_string(),
@@ -833,12 +775,9 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
             }
         }
         LoopMsg::Hc(pe) => {
-            // Hc events buffer into Model and are drained/applied on the
-            // next Tick (single-apply via Model.states, bd-p1ds).
             next.pending_events.push(pe.clone());
         }
         LoopMsg::WaveGate { bead_id } => {
-            // Same state machine as the live loop: Verify --WaveGate--> WaveHeld.
             let from = model
                 .per_bead_phase
                 .get(bead_id)
@@ -854,7 +793,6 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
             }
         }
         LoopMsg::CommandVerified { bead_id, verified } => {
-            // Verify --Complete{has_command_verified, wave_gate:false}--> Complete.
             let from = model
                 .per_bead_phase
                 .get(bead_id)
@@ -1142,15 +1080,13 @@ pub fn bead_wave(b: &ReadyBead) -> Option<u32> {
 /// → no gating (identity). Pure — the single decision both dispatch paths
 /// (sync loop + durable loop) share.
 pub fn wave_gate_held(ready: &[ReadyBead], inprogress: &[ReadyBead]) -> Vec<String> {
-    // Lowest wave among ALL open/in-progress beads. A ready bead is held iff
-    // its wave is strictly higher than that floor.
     let min_open_wave = ready
         .iter()
         .chain(inprogress.iter())
         .filter_map(bead_wave)
         .min();
     let Some(floor) = min_open_wave else {
-        return Vec::new(); // no wave labels → no gating
+        return Vec::new();
     };
     ready
         .iter()
@@ -1370,8 +1306,6 @@ pub(crate) fn plan_loop_verify_settle(v: &serde_json::Value, strict: bool) -> Lo
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_string();
-    // bd-p4oc: vacuous VERIFY gate — reuse part-1 parse. Cargo-test-shaped
-    // filters that matched 0 tests are evidence of nothing.
     let is_cargo = crate::is_cargo_test_verify(&verify_cmd);
     let (passed, filtered) = if is_cargo {
         crate::parse_cargo_test_counts(output)
@@ -1454,7 +1388,6 @@ pub(crate) fn settle_loop_verify_output(
                 crate::verdict::write_command_verified_receipt(cwd, bead_id, sha, &output);
             match receipt {
                 Ok(receipt_path) => {
-                    // advisory vacuous: annotate the receipt even though we still record
                     if let Some(warning) = warn_append {
                         let _ = crate::append_to_receipt(&receipt_path, &warning);
                     }
@@ -1490,8 +1423,6 @@ pub(crate) fn settle_loop_verify_output(
             exit,
         } => {
             let warning = if let Some((warning, filtered, evidence)) = vacuous {
-                // Strict: refuse to write verdict, keep bead open with evidence.
-                // Best-effort evidence write (advisory — ignore errors).
                 let _ = (|| -> anyhow::Result<()> {
                     let dir = cwd.join(".flywheel").join("receipts");
                     std::fs::create_dir_all(&dir)?;
@@ -1504,10 +1435,6 @@ pub(crate) fn settle_loop_verify_output(
             } else {
                 None
             };
-            // Failed or skipped-head: reopen via the `__reopen-bead` leaf
-            // command (idempotent, one mail per (bead, sha); the reopened
-            // bead IS the fix unit — it re-dispatches with the failure in its
-            // thread). Never a re-verify of the same broken head.
             let reopened = reopen().map_err(|e| anyhow::anyhow!("__reopen-bead failed: {e:#}"))?;
             if let Some((warning, filtered)) = warning {
                 return Ok(serde_json::json!({
@@ -1708,7 +1635,6 @@ pub fn verify_reply(
     reminder_count: u32,
 ) -> ReplyVerdict {
     match (newest_id, author) {
-        // a new message (≠ the question) from the asked agent = moved
         (Some(nid), Some(auth)) if auth == agent && Some(nid) != head => ReplyVerdict::Satisfied,
         _ if reminder_count == 0 => ReplyVerdict::Reminded,
         _ => ReplyVerdict::Escalate,
@@ -1889,12 +1815,6 @@ pub(crate) async fn run_leaf_cmd_bounded(
     watchdog: std::time::Duration,
 ) -> anyhow::Result<std::process::Output> {
     tokio::task::spawn_blocking(move || {
-        // bd-jvka: the CHILD bound and the DRAIN bound are two failures. The
-        // child runs in its own process group, so the timeout kills the whole
-        // group (a leaf's own children die with it instead of orphaning to
-        // PPID 1). And a grandchild that inherited the pipe's write end keeps
-        // it open after the leaf exits: EOF never comes, so the old unbounded
-        // join parked the loop FOREVER with the watchdog already satisfied.
         crate::proc::run_bounded(&mut cmd, watchdog).map_err(|e| match e {
             crate::proc::ProcError::Timeout { pid } => std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -1988,7 +1908,6 @@ pub fn dead_stop_action(i: &DeadStopInputs) -> DeadStopAction {
         return DeadStopAction::Wait;
     }
     match i.last_commit_age_secs {
-        // A commit inside the window is movement: the fleet is working.
         Some(age) if age < i.stall_secs => DeadStopAction::Clear,
         Some(_) => {
             if i.already_escalated {
@@ -1999,7 +1918,6 @@ pub fn dead_stop_action(i: &DeadStopInputs) -> DeadStopAction {
                 DeadStopAction::Escalate(DeadStopKind::SilentPanes)
             }
         }
-        // No commit history → cannot judge; never alarm blind.
         None => DeadStopAction::Wait,
     }
 }
@@ -2090,8 +2008,6 @@ pub fn pane_wedge_action(i: &PaneWedgeInputs<'_>, already_paged: bool) -> PaneWe
     };
     match i.last_commit_age_secs {
         Some(age) if age >= i.quiet_secs => {}
-        // A commit inside the window is movement, and no history is not
-        // evidence of a stall.
         _ => return PaneWedgeAction::Quiet,
     }
     if already_paged {
@@ -2126,8 +2042,6 @@ async fn poll_events(args: PollEventsArgs) -> anyhow::Result<PollEventsBatch> {
     )
     .await?;
     if !out.status.success() {
-        // soft-fail: return empty batch with the error so the loop can fall
-        // back to heartbeat __poll without killing the workflow
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Ok(PollEventsBatch {
             events: vec![],
@@ -2141,9 +2055,6 @@ async fn poll_events(args: PollEventsArgs) -> anyhow::Result<PollEventsBatch> {
     }
     let raw = String::from_utf8_lossy(&out.stdout);
     let batch = parse_poll_events_batch(raw.trim(), args.after_seq)?;
-    // is1.4: log the batch INSIDE the leaf so the entries are checkpointed
-    // with the result — a body-level log re-fires on every crash-resume
-    // replay and duplicates JSONL entries (the event log feeds analytics).
     log_poll_events(&args.project, &batch);
     Ok(batch)
 }
@@ -2270,11 +2181,7 @@ pub fn parse_bead_list(v: &serde_json::Value, what: &str) -> anyhow::Result<Vec<
                         .collect()
                 })
                 .unwrap_or_default(),
-            // bd-wave-gate-typed-authority-27et: the typed `wave` field.
             wave: bead_wave_field(b),
-            // bd-4spn: priority for the PRINCIPLES dispatch gate; the
-            // `## PRINCIPLES` section from the description (fall back to a
-            // direct `principles` field if the br shape carries one).
             priority: b
                 .get("priority")
                 .and_then(serde_json::Value::as_u64)
@@ -2419,8 +2326,6 @@ pub fn build_brief(
     if full.len() <= DISPATCH_PROMPT_CAP {
         return Ok(full);
     }
-    // Over the cap: DEGRADE to the pointer brief (bd-dispatch-cap-conditioning-l7jh).
-    // Never truncate the full brief, never drop the dispatch.
     let pointer = pointer_brief(id, project, resume);
     if pointer.len() <= DISPATCH_PROMPT_CAP {
         return Ok(pointer);
@@ -2521,15 +2426,6 @@ fn queue_brief(
     }
 }
 
-// ---- bd-dispatch-dedupe-2zlz: no second dispatch over a live peer claim ----
-//
-// The orchestrator double-dispatched beads peers had already claimed or
-// announced on their thread (W4 -> SandySparrow while TanFern's claim +
-// "starting now" were already posted, then re-dispatched AFTER a
-// stand-down; W7 dispatched while a concurrent executor was mid-write).
-// Before any GOAL dispatch the loop scans thread-id=<bead> and holds when
-// a live peer signal says the work is taken.
-
 /// Freshness window for peer claim/announce signals. Mirrors the ~90-minute
 /// TIMEBOX in the dispatch brief; `FLYWHEEL_DISPATCH_TTL_SECS` overrides
 /// (resolved once at loop start into `LoopParams.dispatch_guard_ttl_us`).
@@ -2576,18 +2472,11 @@ pub fn classify_guard_signal(
 ) -> Option<GuardSignalKind> {
     let s = subject.to_lowercase();
     let b = body.to_lowercase();
-    // Done: the `bead=<id>` tag — the tag is the hold; the subject is
-    // decoration (D9). Presence is enough: the scan is already thread-scoped
-    // to the guarded bead's thread, and holding on a cross-stamped tag is
-    // the safe direction (dispatch held, never a false go).
     if bead.is_some() {
         return Some(GuardSignalKind::Done);
     }
     let standdown =
         s.contains("stand-down") || s.contains("stand down") || b.contains("stand down");
-    // Handoff needs an explicit transfer marker; "concurrent executor is
-    // live" is the W7 anti-pattern — someone ELSE is executing, that is a
-    // stand-down for us even when the word handoff appears nearby.
     let handoff_marker = s.contains("handoff") || b.contains("handoff") || s.contains("hand-off");
     let concurrent_live = s.contains("concurrent executor") || b.contains("concurrent executor");
     if handoff_marker && !concurrent_live {
@@ -2599,7 +2488,6 @@ pub fn classify_guard_signal(
     if s.contains("starting") || s.contains("executing") {
         return Some(GuardSignalKind::Announce);
     }
-    // Claim: explicit claim language, never "unclaimed"/"claim-watch".
     let claim_word = (s.contains("claim") || b.contains("claim"))
         && !s.contains("unclaim")
         && !b.contains("unclaim")
@@ -2652,7 +2540,6 @@ pub fn eval_dispatch_guard(
         .filter(|(ts, _)| *ts > close)
         .collect();
 
-    // Rule 1: newest overall is Done (nothing newer after the close report).
     if let Some(done_ts) = done_max {
         let newer = recent.iter().any(|(ts, _)| *ts > done_ts);
         if !newer && !recent.is_empty() {
@@ -2663,12 +2550,10 @@ pub fn eval_dispatch_guard(
         }
     }
 
-    // Rule 2: stand-down after the last done holds absolutely.
     if recent.iter().any(|(_, k)| *k == GuardSignalKind::StandDown) {
         return Err("peer stood down — executor flagged live".into());
     }
 
-    // Rule 3: unexpired claim/announce holds unless handed off.
     let newest_of = |k: GuardSignalKind| {
         recent
             .iter()
@@ -2691,7 +2576,6 @@ pub fn eval_dispatch_guard(
         }
     }
 
-    // Rule 4: fresh receipts are executor evidence.
     if let Some(r) = facts.receipts_fresh_us
         && r > close
         && now_us - r <= ttl_us
@@ -2778,9 +2662,6 @@ pub fn parse_read_output(v: &serde_json::Value) -> ReadOutput {
 pub fn should_resend(record: Option<&crate::state::SentRecord>, current_invocation: &str) -> bool {
     match record {
         None => true,
-        // cg6.5: a timeout-confirm record is AMBIGUOUS — the prompt may be
-        // mid-flight; never re-delegate it on resume. The next poll is the
-        // correctness floor (it reveals whether the prompt landed).
         Some(r) => r.invocation != current_invocation || (!r.landed && !r.ambiguous),
     }
 }
@@ -2797,12 +2678,11 @@ fn keep_landed_record(
     states: &[AgentState],
 ) -> bool {
     if r.invocation != invocation || !r.landed {
-        return true; // different run, or unlanded (mid-flight) — keep
+        return true;
     }
-    // landed + same invocation: keep only if the agent is still busy (in flight)
     match states.iter().find(|s| s.name == r.name) {
         Some(s) => matches!(s.status.as_str(), "working" | "blocked" | "unknown"),
-        None => true, // agent absent from the poll — conservative keep
+        None => true,
     }
 }
 
@@ -2948,8 +2828,6 @@ pub fn closed_reason_lease_ids(
         .collect()
 }
 
-// ---- bd-work-attempts-m5x6: durable work attempts ----
-
 /// Status of one durable work attempt (bd-work-attempts-m5x6). The attempt —
 /// not the loop pass — is the unit steering acts on: a steer writes a new
 /// generation under the same bead intent, and the superseded generation
@@ -2965,10 +2843,6 @@ pub enum WorkAttemptStatus {
 }
 
 impl WorkAttemptStatus {
-    // bd-work-attempts-m5x6: the steer-side half of the attempt model has no
-    // call site yet — flywheel has no central steer→bead binding, so a steer
-    // cannot name the generation it supersedes. `expect` (not `allow`) makes
-    // the annotation fail as soon as something wires these, forcing removal.
     #[cfg_attr(
         not(test),
         expect(
@@ -3045,9 +2919,6 @@ pub fn live_attempt_for_bead<'a>(
 /// attempt is marked superseded (its corr and effect key stay readable for
 /// audit) and the replacement starts at generation+1 carrying the new
 /// prompt's corr. Pure — persistence lives in `state`.
-//
-// bd-work-attempts-m5x6: no call site yet — a steer has no central bead
-// binding to supersede. `expect` fails once one is wired.
 #[cfg_attr(
     not(test),
     expect(
@@ -3197,12 +3068,10 @@ pub struct RotationPlan {
 /// Pure: the clock arrives as `now_us`, the window as a map, no I/O.
 pub fn idle_pane_rotation(inputs: &IdleRotationInputs<'_>) -> RotationPlan {
     let mut plan = RotationPlan::default();
-    // Ids already queued, extended with each pick, so no bead goes out twice.
     let mut handed: BTreeSet<String> = inputs.taken.iter().cloned().collect();
     let live: BTreeSet<&str> = inputs.live_pins.iter().map(String::as_str).collect();
 
     for pin in inputs.idle_pins {
-        // (1) own stalled work — the only window-gated tier.
         let own = inputs.in_progress.iter().find(|b| {
             b.assignee.as_deref() == Some(pin.as_str())
                 && !handed.contains(&b.id)
@@ -3223,8 +3092,6 @@ pub fn idle_pane_rotation(inputs: &IdleRotationInputs<'_>) -> RotationPlan {
                 });
                 continue;
             }
-            // Still inside the window. The pane is starved only while its own
-            // work stays suppressed; after N such passes the exemption fires.
             let passes = inputs.starved.get(pin).copied().unwrap_or(0);
             if passes >= inputs.exempt_after_passes {
                 handed.insert(b.id.clone());
@@ -3241,9 +3108,6 @@ pub fn idle_pane_rotation(inputs: &IdleRotationInputs<'_>) -> RotationPlan {
             continue;
         }
 
-        // (2)-(4): free work. `free` carries the ownership rule — a bead
-        // assigned to another LIVE pane is that pane's, ready or not; an
-        // assignee that is gone is an orphan claim, not an owner.
         let free = |b: &ReadyBead| {
             !handed.contains(&b.id)
                 && !peer_held(&b.id, inputs.peers, pin)
@@ -3366,8 +3230,6 @@ async fn respawn_agent(args: RespawnArgs) -> anyhow::Result<()> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    // a requeued prompt's delivery record dies with the respawned agent —
-    // invalidate it so the fresh agent gets the prompt (resume-dedup)
     if let Some(h) = args.text_hash {
         let mut records = crate::state::load_last_sent(&args.project);
         records.retain(|r| !(r.name == args.name && r.text_hash == h));
@@ -3414,10 +3276,6 @@ pub struct SendOutcome {
 /// With confirm, returns the parsed landing verdict; the legacy path returns
 /// an outcome with `landed: None`.
 async fn send_prompt(args: SendArgs) -> anyhow::Result<SendOutcome> {
-    // build-plan §5: with the comms inbox on, the leaf IS the mail.append
-    // effect, in process (no `__send` subprocess, no typing, no resend).
-    // The task id is derived from (invocation, iteration, name, text), so a
-    // re-executed leaf re-sends the same msg id and the log appends it once.
     if let Ok(cfg) = crate::config::Config::load()
         && crate::comms_send::enabled(&cfg)
     {
@@ -3467,8 +3325,6 @@ async fn send_prompt(args: SendArgs) -> anyhow::Result<SendOutcome> {
         }),
     );
     if outcome.deduped {
-        // is1.4: the resume-dedup skip is logged HERE (checkpointed) — the
-        // body-side log duplicated on replay.
         let _ = crate::state::log_event(
             &args.project,
             crate::state::EventKind::SkippedDup,
@@ -3646,9 +3502,6 @@ async fn blocked_ack_gate(args: &NotifyArgs) -> bool {
 /// `last_ping_tier` marker (cg6.3) suppresses the duplicate mail: at most one
 /// ping per logical tier transition.
 async fn notify_blocked(args: NotifyArgs) -> anyhow::Result<EscalationOutcome> {
-    // ADR-0001 A6: the ladder is gated on the observed ack, read off toron's
-    // per-recipient read state (not inferred from elapsed time). The read
-    // happens BEFORE the step so an acked agent is never pinged again.
     let gate_acked = blocked_ack_gate(&args).await;
     let (tier, ping_count, should_mail) = escalate_and_persist(
         &args.project,
@@ -3677,8 +3530,6 @@ async fn notify_blocked(args: NotifyArgs) -> anyhow::Result<EscalationOutcome> {
             ));
         }
         if tier == 3 {
-            // is1.4: the T3 halt event is logged HERE (checkpointed with the
-            // leaf) — the body-side log duplicated on crash-resume replay.
             let _ = crate::state::log_event(
                 &args.project,
                 crate::state::EventKind::Loop,
@@ -3692,13 +3543,6 @@ async fn notify_blocked(args: NotifyArgs) -> anyhow::Result<EscalationOutcome> {
     }
     Ok(EscalationOutcome { tier, ping_count })
 }
-
-// ---- ADR-0022 §3.7 T4 / W7: delegated composition via mail --------------
-// Any allowlisted agent mails a `[compose-request]` job; the loop honors it
-// ONLY through two gates: the contact/policy allowlist (deny NEVER
-// dispatches) and decide's coverage report. A catalog hit queues guidance
-// naming the existing workflow; a miss renders the archetype-matched compose
-// candidate FOR APPROVAL — W7 never auto-runs a composed workflow from mail.
 
 /// One compose-request row's loop-side decision. Pure — unit-tested.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3719,19 +3563,15 @@ pub fn plan_compose_request(
     allowlist: &[String],
     catalog: &[crate::decide::CatalogEntry],
 ) -> ComposeRequestOutcome {
-    // Gate 1 — contact/policy allowlist. Deny is silent-ish (log at the call
-    // site) and terminal: no parse, no coverage, no queue.
     if !crate::decide::compose_request_allowed(sender, allowlist) {
         return ComposeRequestOutcome::Denied;
     }
-    // Parse the spec shape (toron-workflow jobs).
     let Ok(v) = serde_json::from_str::<serde_json::Value>(spec_json.trim()) else {
-        return ComposeRequestOutcome::Denied; // unparseable = not dispatchable
+        return ComposeRequestOutcome::Denied;
     };
     let Ok(spec) = toron_workflow::jobs::ComposeRequestSpec::parse(&v) else {
         return ComposeRequestOutcome::Denied;
     };
-    // Gate 2 — decide's coverage report.
     let report = crate::decide::coverage_report(&spec.objective, catalog);
     if report.covered {
         return ComposeRequestOutcome::Covered {
@@ -3816,9 +3656,6 @@ pub(crate) fn settle_dispatch_guard_output(
 /// in-thread. Soft-fail: spawn errors are surfaced in-thread by the leaf, the
 /// loop continues.
 async fn spawn_xproj(args: XprojSpawnArgs) -> anyhow::Result<()> {
-    // cg6.3: at-most-once per request — mark BEFORE spawning so a crash-
-    // window replay no-ops instead of spawning two swarms for one [xproj]
-    // message (the loop's body-side seen_xproj set is re-seeded on replay).
     if crate::state::xproj_seen_contains(&args.project, &args.message_id)? {
         return Ok(());
     }
@@ -3836,17 +3673,12 @@ async fn spawn_xproj(args: XprojSpawnArgs) -> anyhow::Result<()> {
     ]);
     let out = run_leaf_cmd(cmd, "__xproj-spawn").await?;
     if !out.status.success() {
-        // cg6.6: unmark so a FAILED spawn is retried next iteration — the
-        // marker file is the replay-dedup for SUCCESSFUL spawns only;
-        // leaving it would drop the request forever.
         let _ = crate::state::xproj_seen_unmark(&args.project, &args.message_id);
         return Err(anyhow::anyhow!(
             "__xproj-spawn failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    // is1.4: the spawn event is logged HERE (checkpointed with the leaf) —
-    // the body-side log duplicated on crash-resume replay.
     let _ = crate::state::log_event(
         &args.project,
         crate::state::EventKind::State,
@@ -3873,7 +3705,6 @@ async fn diagnose_agent(args: DiagnoseArgs) -> anyhow::Result<Value> {
         &args.reason,
     ]);
     let out = run_leaf_cmd(cmd, "__diagnose").await?;
-    // soft: non-zero still returns JSON if any; empty → ok:false
     let raw = String::from_utf8_lossy(&out.stdout);
     if let Ok(v) = serde_json::from_str::<Value>(raw.trim()) {
         let _ = crate::state::log_event(
@@ -3934,12 +3765,6 @@ async fn renew_filtered_leases(args: RenewFilteredArgs) -> anyhow::Result<Value>
     if args.paths.is_empty() {
         return Ok(json!({ "renewed": 0, "paths": [] }));
     }
-    // bd-swarm-loop-durable-panic-atlo: this leaf body runs on the durable
-    // loop's tokio worker, where `run_mail`'s shared-runtime block_on panics
-    // ("Cannot start a runtime from within a runtime") — observed once per
-    // poll, before every dispatch. The whole sync mail block moves to a
-    // blocking thread through the async-safe bridge; there block_on is the
-    // documented thread→runtime bridge (backend::run_mail_off_runtime).
     let (project, paths, extend_seconds) = (
         args.project.clone(),
         args.paths.clone(),
@@ -4085,13 +3910,9 @@ fn truncate_tail(s: &str, max_chars: usize) -> String {
 }
 
 fn redact_secrets_tail(s: &str) -> String {
-    // Cheap redaction without heavy regex: line-wise check + token replace.
-    // Patterns are matched case-insensitively.
     let mut out_lines = Vec::new();
     for line in s.lines() {
         let lower = line.to_ascii_lowercase();
-        // Token patterns that indicate a secret — replace whole line.
-        // Keep the replacement short and non-leaking.
         let is_secret_line = lower.contains("nsec1")
             || lower.contains("ncryptsec")
             || lower.contains("private key")
@@ -4104,35 +3925,22 @@ fn redact_secrets_tail(s: &str) -> String {
             || lower.contains("sk-")
             || lower.contains("sk_");
         if is_secret_line {
-            // Replace known token substrings, then mask the line.
-            // We keep a marker so the evidence still shows a secret was present.
-            // Mask common token prefixes — simple substring replace (case-sensitive
-            // variants covered by lower check, but we replace case-insensitively by
-            // scanning lower and replacing slice).
-            // For now, replace entire line with a safe marker to avoid leaking.
-            // A full value redaction is more important than preserving surrounding text.
             let redacted = "[REDACTED secret]".to_string();
             out_lines.push(redacted);
         } else {
-            // Inline nsec/ncryptsec token may appear in otherwise benign line —
-            // still redact the token but keep the line.
             let mut cur = line.to_string();
             let lower_cur = cur.to_ascii_lowercase();
             if lower_cur.contains("nsec1") || lower_cur.contains("ncryptsec") {
-                // Mask any such token by replacing the whole line marker.
                 cur = "[REDACTED nsec/ncryptsec token present]".to_string();
             }
             out_lines.push(cur);
         }
     }
     let joined = out_lines.join("\n");
-    // Also mask sk- tokens inline — replace with marker without dropping line.
-    // Do a simple scan for "sk-" prefix followed by base64ish chars.
     let mut final_out = String::new();
     let mut chars = joined.chars().peekable();
     while let Some(c) = chars.next() {
         if (c == 's' || c == 'S') && chars.peek().is_some_and(|n| *n == 'k' || *n == 'K') {
-            // Peek ahead for sk-/sk_ pattern
             let mut buf = String::new();
             buf.push(c);
             if let Some(k) = chars.next() {
@@ -4156,7 +3964,6 @@ fn redact_secrets_tail(s: &str) -> String {
                         }
                         if token_len >= 8 {
                             final_out.push_str("[REDACTED_sk]");
-                            // consume token already
                         } else {
                             final_out.push_str(&buf);
                             final_out.push_str(&token_buf);
@@ -4257,7 +4064,6 @@ where
         } else {
             continue;
         };
-        // One scrollback read per detection — only when a tier is crossed.
         let raw_tail = evidence_fn(state);
         let evidence_tail = sanitize_evidence_tail(&raw_tail);
         let reason = if evidence_tail.is_empty() {
@@ -4282,9 +4088,6 @@ where
 /// Best-effort: journal failures are ignored (facts are at-least-once), and
 /// handle_ingress failures never kill the loop.
 fn emit_fact(state_dir: &std::path::Path, project: &str, event: IngressEvent) {
-    // route through ingress (captain doorbell + status) — the adapter
-    // handles journaling (same file main.rs status reads), so we don't
-    // double-append here.
     let adapters = crate::ingress_adapters_for_project(state_dir, project);
     crate::ingress::handle_ingress(&event, &adapters);
 }
@@ -4444,10 +4247,6 @@ fn digest_prefix(d: &MailDigest) -> Option<String> {
 /// is not registered (debrief D1/D2).
 fn urgent_wake_prompt(d: &MailDigest) -> String {
     let identity = d.mail_identity.as_deref().unwrap_or(d.agent.as_str());
-    // bd-wake-id-contract-1jz1 clause 1: every id this banner cites must be
-    // a RESOLVABLE mail-surface handle. Unresolvable handles are dropped
-    // from the CITATION (the wake itself still fires — the agent polls
-    // their inbox without a broken reply key).
     let cite_thread = citable_wake_id(d.thread_id.as_deref());
     let cite_id = citable_wake_id(d.last_id.as_deref());
     let mut line = format!(
@@ -4460,9 +4259,6 @@ fn urgent_wake_prompt(d: &MailDigest) -> String {
     if let (Some(t), true) = (&d.thread_id, cite_thread) {
         line.push_str(&format!(" Latest urgent thread: {t}"));
     }
-    // bd-kryk: cite the MESSAGE id (the --message-id the reply needs), not
-    // the sender npub — an npub in this slot is not replyable and reads as
-    // phantom mail.
     if let (Some(id), true) = (&d.last_id, cite_id) {
         line.push_str(&format!(" Most recent urgent: id {id}"));
         if let Some(s) = &d.last_subject
@@ -4506,32 +4302,6 @@ fn plane_s_wake_prompt(d: &MailDigest) -> String {
         d.plane_s,
     )
 }
-
-// ---- bd-efk1: crew-execution contract watchdog --------------------------
-// Dispatched agents ENGAGE (status = working) but do NOT reliably run the
-// bead lifecycle: br update --claim / br close rarely happen autonomously.
-// The loop can be perfect and the crew still won't close beads if the agents
-// don't execute the contract. This watchdog closes the loop-side gap:
-//   1. Every dispatched bead prompt is recorded (bead id → agent) at send
-//      landing.
-//   2. Each poll (work mode), the tracker snapshots (ready = unclaimed,
-//      inprogress = claimed) are reconciled against the watch:
-//      - a bead still UNCLAIMED while its agent is working/blocked/unknown
-//        gets a CLAIM NUDGE after `nudge_after_polls` consecutive polls
-//        (a short "run br update <id> --claim now" prompt — NOT a full
-//        re-dispatch);
-//      - a bead still unclaimed whose agent settled (idle/done/gone) is
-//        REDISPATCHED (re-queued at the FRONT — another agent takes it);
-//      - a bead CLAIMED but whose assignee is idle/done without closing gets
-//        a CLOSE NUDGE once (option C), then a resume-prompt redispatch if
-//        it stays unclosed;
-//      - a bead in neither snapshot is closed → its file reservations are
-//        released (bd-h3oj) and the watch entry drops.
-//   3. The completion guard requires the watch to be EMPTY in work mode: a
-//      dispatched-but-unclaimed bead keeps the loop alive (the old code
-//      declared "complete" while such a bead sat open in `br ready`).
-// Pure + deterministic (unit-tested below); the loops only wire the
-// decisions into their action/queue plumbing.
 
 /// Why a watched bead is waiting (ADR-0019 Spec 3.4). An overlap wait is
 /// NOT a stuck owner: the bead's write paths are held by another in-flight
@@ -4739,9 +4509,6 @@ pub fn claim_watch_step(
     let mut actions = Vec::new();
     let mut drop = Vec::new();
     let nudge_after = nudge_after_polls.max(1);
-    // bd-gnej: ready beads currently held by the wave-gate (an earlier wave
-    // is open). Computed once — a dispatched bead that is now wave-held
-    // waits like an overlap, NOT a stuck owner.
     let wave_held: std::collections::HashSet<String> =
         wave_gate_held(ready, inprogress).into_iter().collect();
     for (bead_id, cw) in watch.iter_mut() {
@@ -4751,17 +4518,12 @@ pub fn claim_watch_step(
         let claimed = inprogress.iter().find(|b| b.id == *bead_id);
         let waiting_on_wave = wave_held.contains(bead_id);
         match (in_ready, claimed) {
-            // still unclaimed
             (Some(rb), None) => {
                 if waiting_on_overlap {
-                    // serialized behind another in-flight bead's reservation —
-                    // not a stuck owner: no claim nudge, keep waiting.
                     cw.wait_reason = Some(WaitReason::Overlap);
                     continue;
                 }
                 if waiting_on_wave {
-                    // an earlier wave-M (M<N) is open — the bead waits for
-                    // the wave gate, not for its owner: no claim nudge.
                     cw.wait_reason = Some(WaitReason::WaveGate);
                     continue;
                 }
@@ -4771,10 +4533,6 @@ pub fn claim_watch_step(
                     .find(|s| s.name == cw.agent)
                     .map(|s| s.status.as_str());
                 match st {
-                    // bd-4spn: the dispatched agent REPORTED blocked while the
-                    // bead stays unclaimed — record the reason (the T0-T3
-                    // escalation path owns the blocked ACTION; the reason
-                    // taxonomy is complete: blocked vs overlap vs wave-gate).
                     Some("blocked") => {
                         cw.wait_reason = Some(WaitReason::Blocked);
                         cw.unclaimed_polls += 1;
@@ -4786,7 +4544,6 @@ pub fn claim_watch_step(
                             });
                         }
                     }
-                    // engaged but never claimed → nudge after N polls
                     Some("working" | "unknown") => {
                         cw.unclaimed_polls += 1;
                         if cw.unclaimed_polls >= nudge_after {
@@ -4797,13 +4554,7 @@ pub fn claim_watch_step(
                             });
                         }
                     }
-                    // settled (idle/done) or agent gone → redispatch
                     _ => {
-                        // bd-claim-watch-durable-signals-mixy: a live lease
-                        // for THIS bead is a durable peer claim (the
-                        // reserve-before-work lifecycle) — never dispatch a
-                        // second executor over it; the lease lapsing
-                        // releases the hold on a later poll.
                         if waiting_on_lease {
                             cw.wait_reason = Some(WaitReason::LiveLease);
                             continue;
@@ -4816,7 +4567,6 @@ pub fn claim_watch_step(
                     }
                 }
             }
-            // claimed
             (_, Some(cb)) => {
                 let assignee = cb.assignee.clone().unwrap_or_else(|| cw.agent.clone());
                 let live = states.iter().any(|s| s.name == assignee);
@@ -4827,9 +4577,6 @@ pub fn claim_watch_step(
                     .unwrap_or(false);
                 if live && settled {
                     if waiting_on_overlap {
-                        // the assignee settled but another bead holds this
-                        // bead's paths — waiting on release, not stuck: no
-                        // close nudge, no resume re-dispatch.
                         cw.wait_reason = Some(WaitReason::Overlap);
                         continue;
                     }
@@ -4843,13 +4590,6 @@ pub fn claim_watch_step(
                             title: cb.title.clone(),
                         });
                     } else if waiting_on_lease {
-                        // bd-claim-watch-durable-signals-mixy: the close
-                        // nudge went to the assignee; the Resume arm waits
-                        // for the lease to lapse (observed incident: GOAL
-                        // Resume re-sent every pass while an unexpired
-                        // exclusive lease held the bead). close_polls does
-                        // not advance here — a lapsed lease gets a fresh
-                        // countdown before the resume fires.
                         cw.wait_reason = Some(WaitReason::LiveLease);
                     } else {
                         cw.close_polls += 1;
@@ -4961,16 +4701,8 @@ pub fn plan_actions_with_live_owned(
             "blocked" => actions.push(LoopAction::Blocked {
                 name: s.name.clone(),
             }),
-            // never dispatch to an unclassified agent — queue stays intact
             "unknown" => actions.push(LoopAction::Wait),
             _ => {
-                // idle / done → feed work or nudge. The receiver's pin is
-                // its mail identity (plan_actions substitution rule) else
-                // its name — computed first: eligibility is per-receiver.
-                // bead/resume prompts carry a {AGENT_NAME} placeholder —
-                // substitute the receiving agent's mail PIN (the
-                // identity it is addressed by; bd-pin-public-plane-s-easy.2),
-                // falling back to the hc name when no pin is known
                 let pin = s.mail_identity.clone().unwrap_or_else(|| s.name.clone());
                 let take = pending
                     .iter()
@@ -4988,11 +4720,6 @@ pub fn plan_actions_with_live_owned(
                         },
                         None => base,
                     };
-                    // ADR-0001 Wave 3: a dispatched BEAD brief gets its `pin`
-                    // stamped by the orchestrator (mail identity from the
-                    // spawn registry) — flywheel fills pin on claim, toron/
-                    // br stay display-only. Nudges and wake prompts are not
-                    // bead dispatches and never stamp.
                     if let Some(bead_id) = bead_id_from_prompt(&text) {
                         actions.push(LoopAction::PinStamp {
                             bead_id: bead_id.to_string(),
@@ -5004,9 +4731,6 @@ pub fn plan_actions_with_live_owned(
                         text,
                     });
                 } else if nudge.is_some() {
-                    // orchestrator direction beats the autonomous mail wake —
-                    // the captain's instruction is the higher-signal work.
-                    // ADR-0011 D7: 4th+ consecutive nudge is mail-only.
                     if crate::rot::interrupt_nudge(s.nudge_streak) {
                         actions.push(LoopAction::Nudge {
                             name: s.name.clone(),
@@ -5021,11 +4745,6 @@ pub fn plan_actions_with_live_owned(
                     && (d.urgent > 0 || d.plane_s > 0)
                     && !wake_suppressed.contains(&s.name)
                 {
-                    // urgent mail OR plane-S work (open jobs / channel
-                    // mentions) with nothing queued: wake the agent — crew
-                    // work IS work (loop-side wake, no per-agent polling
-                    // template). Plane S first (a job is actionable), mail
-                    // second.
                     let text = if d.plane_s > 0 {
                         plane_s_wake_prompt(d)
                     } else {
@@ -5112,20 +4831,14 @@ pub fn clear_dispatch_pending(
     name: &str,
     landed: Option<bool>,
 ) {
-    // clear on definitive outcome: landed true, or landed false (will respawn)
-    // keep pending only when outcome is ambiguous (landed None on non-confirm)
     match landed {
         Some(true) => {
-            // keep until working event? Bead: clear on real landing.
-            // working event also clears; clearing here allows faster redispatch
-            // if working event is delayed. Prefer clear on landed.
             pending.remove(name);
         }
         Some(false) => {
             pending.remove(name);
         }
         None => {
-            // non-confirm path: assume sent, clear so we don't stick forever
             pending.remove(name);
         }
     }
@@ -5179,11 +4892,6 @@ pub fn blocking_inprogress<'a>(
         .iter()
         .filter(|b| match &b.assignee {
             Some(a) => live_names.iter().any(|l| l == a),
-            // No assignee: treat as blocking until reclaimed. bd-qk9q — the
-            // strand is resolved BY the reclaim (unowned => stranded => back
-            // to ready this poll), so blocking here is conservative, never a
-            // deadlock: a reclaim failure must not let the loop falsely
-            // complete while an unresolved in-progress bead exists.
             None => true,
         })
         .collect()
@@ -5295,7 +5003,6 @@ pub fn reclaim_decision(
         Some(e) if !e.pane_id.is_empty() => ReclaimDecision::Reclaim {
             reason: ReclaimReason::DeadPane,
         },
-        // A paneless registry row cannot prove death OR life; keep.
         Some(_) | None => ReclaimDecision::Keep {
             reason: ReclaimHold::UnknownIdentity,
         },
@@ -5618,7 +5325,7 @@ pub fn stale_reclaim_due(
     )
 }
 
-#[allow(clippy::too_many_arguments)] // leaf predicate over the full reclaim observation surface (bead, now, panes, reservations, comments, dirty files, policy)
+#[allow(clippy::too_many_arguments)]
 pub fn stale_reclaim_due_with_policy(
     bead: &ReadyBead,
     now_secs: i64,
@@ -5669,8 +5376,6 @@ pub fn stale_reclaim_due_with_policy(
     }
     true
 }
-// ADR-0016: the live loop calls plan_reclaim_with_policy with the injected
-// ReclaimPolicy; this default-threshold wrapper is test-only.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn plan_reclaim(
     now_secs: i64,
@@ -5718,10 +5423,6 @@ pub fn plan_reclaim_with_policy(
     out
 }
 
-// NOTE: gated with `cfg_attr`, never an inner test attribute — two tripwires in
-// this file slice the "non-test source" at the first inner test attribute
-// (`split(..).next()`), so no such marker may appear above them.
-// Test-referenced only, hence the narrower gate.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn plan_reclaim_ex(
     now_secs: i64,
@@ -5969,10 +5670,9 @@ pub fn self_heal_step(
     respawn_budget: u32,
 ) -> HealAction {
     let threshold = diagnose_threshold.max(1);
-    let budget = respawn_budget; // 0 = never respawn, escalate immediately
+    let budget = respawn_budget;
 
     if !exited && status != "unknown" {
-        // proof of life — end episode (budget is lifetime of the run)
         hs.unknown_count = 0;
         hs.awaiting_clear = false;
         return HealAction::None;
@@ -5989,7 +5689,6 @@ pub fn self_heal_step(
     };
 
     if exited {
-        // definitive death signal — diagnose once, then respawn
         if !hs.awaiting_clear {
             hs.diagnose_count = hs.diagnose_count.saturating_add(1);
             hs.awaiting_clear = true;
@@ -5998,18 +5697,13 @@ pub fn self_heal_step(
         return try_respawn(hs);
     }
 
-    // unknown path
     hs.unknown_count = hs.unknown_count.saturating_add(1);
 
-    // detection grace (bd-bvwf.5): young unknown = still detecting. Never
-    // diagnose/respawn inside the window — the loop re-polls on the active
-    // cadence until the pane classifies.
     if hs.unknown_count <= detect_grace {
         return HealAction::None;
     }
 
     if hs.awaiting_clear {
-        // diagnosed last tick; still unknown → respawn
         return try_respawn(hs);
     }
 
@@ -6035,8 +5729,7 @@ pub fn self_heal_step(
 /// cg6.2: leaf errors NEVER abort the loop — on a poll_kind or respawn_agent
 /// failure the failure is logged and the queue is left unchanged (the next
 /// poll re-derives the agent's state; the send-dedup prevents duplicates).
-#[allow(clippy::too_many_arguments)] // the single respawn point: params, queue,
-// kinds, name, text, reason, attempts — every parameter is load-bearing.
+#[allow(clippy::too_many_arguments)]
 async fn respawn_and_requeue(
     params: &LoopParams,
     queue: &mut Vec<String>,
@@ -6060,7 +5753,6 @@ async fn respawn_and_requeue(
                 .or_else(|| v.get("raw").and_then(|r| r.as_str()).map(|s| s.to_string()))
                 .unwrap_or_default(),
             Err(e) => {
-                // cg6.2: skip the respawn this tick; queue unchanged.
                 eprintln!("flywheel: poll_kind leaf failed for {name} (skipping respawn): {e}");
                 return;
             }
@@ -6076,9 +5768,6 @@ async fn respawn_and_requeue(
     })
     .await
     {
-        // cg6.2: hc hiccup during respawn must not kill the loop — the
-        // prompt is NOT requeued (the respawn may not have happened; the
-        // next poll re-evaluates the agent's state).
         eprintln!("flywheel: respawn_agent leaf failed for {name} (continuing): {e}");
         return;
     }
@@ -6167,9 +5856,6 @@ pub fn spawn_graph_vehicle(
     verify: Option<&str>,
     graph_invoked: &mut std::collections::HashSet<String>,
 ) -> anyhow::Result<VehicleOutcome> {
-    // Marker file survives loop recovery: a durable-fn replay after a crash
-    // must not spawn a second crew for the same bead (the std HashSet only
-    // dedupes within one process lifetime).
     let marker = std::path::Path::new(&crate::config::state_dir())
         .join("journals")
         .join(format!("graph-invoked-{bead_id}.marker"));
@@ -6189,9 +5875,6 @@ pub fn spawn_graph_vehicle(
     if let Some(parent) = marker.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    // Write the marker BEFORE the spawn (at-most-once beats at-least-once
-    // here: a crash between write and spawn strands the bead claimed, and
-    // the loop's own claim-watch/redispatch re-drives it — never two crews).
     let _ = std::fs::write(&marker, workflow);
     let inputs = serde_json::json!({
         "bead_id": bead_id,
@@ -6227,10 +5910,7 @@ async fn swarm_loop(
     authority: crate::authority::RuntimeAuthority,
     params: LoopParams,
 ) -> anyhow::Result<String> {
-    // bd-0fvb: host edge resolves authority once and passes it in; plain async, no replay.
-    // bd-bpd9: beads whose graph vehicle was already spawned this process.
     let mut graph_invoked: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // ADR-0026 W2: loop-identity fail-loud — hard-error at start if no usable key
     {
         let cfg = crate::config::Config::load().unwrap_or_default();
         let check = crate::preflight::check_loop_identity(&cfg, Some(&params.project));
@@ -6244,21 +5924,11 @@ async fn swarm_loop(
     }
     let mut queue = params.queue.clone();
     let mut iteration = 0u64;
-    // bead-driven mode tracks which beads were already handed out
     let mut assigned: Vec<String> = Vec::new();
-    // per-agent consecutive send-failure count (send-stall escalation).
-    // Workflow-local and deterministic: rebuilt identically on replay from
-    // the checkpointed leaf results (poll states + send outcomes).
     let mut send_failures: std::collections::HashMap<String, u64> =
         std::collections::HashMap::new();
-    // per-agent hc kind learned from polls — needed to respawn an agent
-    // whose record has been dropped (the escalation path).
     let mut agent_kinds: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    // GS-033 B1: loop holds LoopModel only — not a second WorkspaceModel.
-    // Crash-resume seeds via seed_swarm_resume (same resume semantics as
-    // doorbell's seed_workspace_from_active_loop). I/O Err is fail-loud —
-    // never swallow into empty resume while claiming a seeded restart.
     let mut swarm = LoopModel::default();
     match crate::state::load_active_loop(&params.project) {
         Ok(Some(al)) => {
@@ -6277,65 +5947,23 @@ async fn swarm_loop(
             ));
         }
     }
-    // pane_exited names observed this iteration (event path feeds heal step)
     let mut exited_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // bd-a7j: outstanding expected replies, keyed by ask_key(agent, head).
-    // Rebuilt each iteration from the checkpointed load_expected_replies
-    // leaf; only ever mutated in-run (never written to files by the body).
     let mut expected_replies: std::collections::HashMap<String, ExpectedReplyRun> =
         std::collections::HashMap::new();
-    // best-effort in-run event cursor (bd-event-subscribe-reactor). NOT used
-    // for crash recovery — heartbeat __poll is the floor. Survives within a
-    // single workflow run via local state; loops.json event_cursor is optional.
     let mut event_cursor_seq: u64 = 0;
-    // consecutive __poll_events stream errors → force-log WARN at 3 (bead §6)
     let mut event_stream_errors: u64 = 0;
-    // adaptive wait for the next poll_events block (starts active)
     let mut wait_secs: u64 = params.active_interval_secs.max(5);
-    // consecutive completion-condition holds (bd-bvwf.3 drain-grace): the
-    // loop exits only when the condition holds drain_grace_polls+1 times.
     let mut complete_holds: u32 = 0;
-    // bd-87hq: consecutive "empty world + critical leaf failed" iterations
-    // (stale-checkpoint signature). The loop refuses to declare "complete"
-    // while blind and aborts loudly after DEFAULT_LEAF_FAILURE_ABORT_POLLS.
     let mut blind_complete_failures: u32 = 0;
-    // bd-87hq: did any critical leaf (poll_events/poll_swarm/poll_ready/
-    // poll_inprogress/expected-replies) fail THIS iteration? No initializer —
-    // the loop resets it to false on every iteration before any read.
     let mut critical_leaf_failed_this_iter: bool;
-    // bd-efk1: dispatched-bead claim watch (bead id → dispatch state). The
-    // crew-execution watchdog: agents ENGAGE but skip the br lifecycle; the
-    // watch catches unclaimed/ unclosed beads and nudges or re-dispatches.
     let mut claim_watch: std::collections::HashMap<String, ClaimWatch> =
         std::collections::HashMap::new();
-    // ADR-0019 (bd-w1-verify-fence): not-ready beads (missing/malformed
-    // `## VERIFY` fence) whose planner-mail already fired this invocation.
-    // Dedup is per-invocation state; on replay it is rebuilt from the
-    // checkpointed `__mail-not-ready` leaf results, so a crash never
-    // re-mails a bead the checkpoint already mailed.
     let mut not_ready_mailed: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // ADR-0019 (bd-w1-reopen-f6tw): consecutive-missing-tick counter per
-    // closed bead — the WorkerReceipt two-tick receipt grace. Per-invocation
-    // state; on replay it is rebuilt from the checkpointed `__close-check`
-    // leaf results, so a crash converges next tick.
     let mut close_grace_ticks: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
-    // bd-55nx.8: programmatic done-mail dedup lives on swarm.done_mailed
-    // (crash-safe via ActiveLoop), not a loop-local HashSet.
-    // ADR-0019 Spec 4 (bd-w1-verifier-degrade-a6fk): closed beads whose
-    // verifier-dispatch decision already ran this invocation. Degrade mails
-    // the captain once per bead — the marker file is the durable dedup.
     let mut verifier_dispatched: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-    // bd-efk1: claim-watch nudge DECISIONS collected as Msgs during work-mode
-    // sourcing and folded through `tick` after the main poll tick (ADR-0027:
-    // nudge text is a tick decision, not a loop-side append). They target
-    // specific agents — including WORKING ones — so they must not be
-    // double-filtered by the dispatch-pending retention applied to
-    // poll_actions.
     let mut nudge_msgs: Vec<LoopMsg> = Vec::new();
-    // agents that received DispatchImmediate and await working confirmation
-    // (bd-event-dispatch double-dispatch guard) — crash-safe via ActiveLoop file (bd-5fbv).
     let mut dispatch_pending: std::collections::HashSet<String> = {
         if let Ok(Some(al)) = crate::state::load_active_loop(&params.project) {
             al.dispatch_pending.clone()
@@ -6343,7 +5971,6 @@ async fn swarm_loop(
             std::collections::HashSet::new()
         }
     };
-    // bd-nsb3: per-bead phase map persists across polls in model' (was Default every poll) — crash-safe.
     let mut per_bead_phase: std::collections::BTreeMap<String, LoopPhase> = {
         if let Ok(Some(al)) = crate::state::load_active_loop(&params.project) {
             al.per_bead_phase
@@ -6354,28 +5981,11 @@ async fn swarm_loop(
             std::collections::BTreeMap::new()
         }
     };
-    // String: toron ids are hex event ids; agent-mail ids normalize to string.
     let mut seen_xproj: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // bd-context-limit-honor-luqg: exact-body CONTEXT_LIMIT replies already
-    // honored (respawned) — body-side dedup so a replayed poll cannot
-    // respawn twice for one message.
     let mut seen_ctx_limit: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // panes respawned for a CONTEXT_LIMIT signal THIS iteration — merged
-    // into wake_suppressed so no MAIL WAKE banner lands on the saturated
-    // pane between the signal and the fresh boot.
     let mut ctx_suppressed: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // bd-w4-events-primary-gt0e: the agent.list snapshot is DEMOTED to the
-    // heartbeat cadence. `states` persists across iterations; between
-    // snapshots the event stream asserts status changes
-    // (apply_events_to_states) and the snapshot confirms
-    // (snapshot_due: no state / stream error / cadence boundary). The first
-    // iteration after crash-resume ALWAYS snapshots — hc has no since/seq
-    // replay, so the correctness floor is never skipped.
     let mut states: Vec<AgentState> = Vec::new();
     let mut since_snapshot: u64 = 0;
-    // bd-0cet: the flood guard's memory is the persisted Spec-5 Wake table
-    // (crash-safe via ActiveLoop, seeded below like dispatch_pending) —
-    // a restart no longer re-trips on the batch it already paused.
     let mut wake: doorbell_core::wake_core::WakeModel = {
         if let Ok(Some(al)) = crate::state::load_active_loop(&params.project) {
             al.wake.clone()
@@ -6386,7 +5996,6 @@ async fn swarm_loop(
 
     loop {
         iteration += 1;
-        // bd-87hq: per-iteration critical-leaf failure flag (reset each poll)
         critical_leaf_failed_this_iter = false;
         if let Some(max) = params.max_iterations
             && iteration > max
@@ -6397,9 +6006,6 @@ async fn swarm_loop(
             ));
         }
 
-        // ---- event wake (latency optimization, forward-only) ----
-        // Blocks up to wait_secs collecting push events. Empty batch on
-        // idle/timeout is normal. Stream errors soft-fail into heartbeat.
         let event_batch: PollEventsBatch = match poll_events(PollEventsArgs {
             project: params.project.clone(),
             timeout_ms: wait_secs.saturating_mul(1000),
@@ -6409,11 +6015,6 @@ async fn swarm_loop(
         {
             Ok(b) => b,
             Err(e) => {
-                // cg6.2: leaf errors never abort the loop — a transport
-                // hiccup degrades to the heartbeat fallback this tick.
-                // bd-87hq: a REPLAY deserialization failure (stale
-                // checkpoint) fails here too — flag it for the completion
-                // gate.
                 critical_leaf_failed_this_iter = true;
                 eprintln!("flywheel: poll_events leaf failed (continuing): {e}");
                 PollEventsBatch {
@@ -6437,17 +6038,7 @@ async fn swarm_loop(
         if event_batch.max_seq > event_cursor_seq {
             event_cursor_seq = event_batch.max_seq;
         }
-        // (is1.4: the event batch is logged INSIDE the poll_events leaf —
-        // checkpointed; a body-side log would duplicate on replay.)
 
-        // ---- correctness floor: authoritative agent.list snapshot ----
-        // DEMOTED to the heartbeat cadence (bd-w4-events-primary-gt0e):
-        // events assert status changes between snapshots
-        // (apply_events_to_states below); the snapshot CONFIRMS at the
-        // heartbeat cadence, after crash-resume (no state yet — hc has no
-        // since/seq replay, so the first iteration always snapshots), and as
-        // the fallback when the event stream errored. The floor is never
-        // skipped; it just stops running every iteration.
         if snapshot_due(
             states.is_empty(),
             event_batch.stream_error.is_some(),
@@ -6488,9 +6079,6 @@ async fn swarm_loop(
                     }
                 }
                 Err(e) => {
-                    // cg6.2: the correctness floor must not be a crash point —
-                    // a transient hc failure yields an empty snapshot; the
-                    // next tick re-polls. bd-87hq: flag for the completion gate.
                     critical_leaf_failed_this_iter = true;
                     eprintln!(
                         "flywheel: poll_swarm leaf failed (continuing with empty snapshot): {e}"
@@ -6501,21 +6089,7 @@ async fn swarm_loop(
         } else {
             since_snapshot += 1;
         }
-        // Events apply EXACTLY ONCE inside the Tick arm (bd-p1ds): Model.states
-        // lives in the Model (states: Vec<AgentState>) and pending_events are
-        // drained and applied there. No loop-side apply — single-apply invariant
-        // holds via tick.
 
-        // proof of life and kind learning now use Model.states after the Tick;
-        // keep local states in sync with the Model after each iteration (see
-        // post-tick sync below).
-
-        // ---- cross-project receive (bd-pattern-cross-project-swarm §9.5) ----
-        // Scan orchestrator inbox for [xproj] requests. For each unseen item,
-        // PARSE + SPAWN DIRECTLY (full loop branch): if the request carries a
-        // recipe, call `__xproj-spawn` which spawns the swarm in this project
-        // and replies in-thread. If it doesn't parse to a recipe, fall back to
-        // queueing a prompt for an idle agent to interpret. Soft-fail.
         let xproj_items: Vec<crate::XprojInboxItem> = match crate::elm::leaf::run_leaf_journaled(
             &params.project,
             "__xproj-inbox",
@@ -6535,7 +6109,6 @@ async fn swarm_loop(
             let combined = format!("{} {}", item.subject, item.body);
             let req = crate::parse_xproj_request(&combined);
             let action = if let Some(r) = req.filter(|r| !r.recipe.is_empty()) {
-                // FULL BRANCH: spawn the requested swarm directly.
                 let spawned = spawn_xproj(XprojSpawnArgs {
                     project: params.project.clone(),
                     message_id: item.id.clone(),
@@ -6547,8 +6120,6 @@ async fn swarm_loop(
                 .await;
                 match &spawned {
                     Ok(()) => {
-                        // cg6.6: mark seen only AFTER a successful spawn —
-                        // a failed request must be retried next iteration.
                         seen_xproj.insert(item.id.clone());
                         "spawned"
                     }
@@ -6558,7 +6129,6 @@ async fn swarm_loop(
                     }
                 }
             } else {
-                // FALLBACK: an agent interprets the unparseable request.
                 let prompt = crate::xproj_queue_prompt(
                     item,
                     &crate::XprojRequest {
@@ -6569,17 +6139,12 @@ async fn swarm_loop(
                     },
                 );
                 queue.push(prompt);
-                seen_xproj.insert(item.id.clone()); // queued = handled
+                seen_xproj.insert(item.id.clone());
                 "queued"
             };
             eprintln!("flywheel: cross-project request msg {} {action}", item.id);
         }
 
-        // ---- delegated composition (ADR-0022 §3.7 T4, W7) ----
-        // Scan inbox for [compose-request] jobs. Two gates, in order:
-        // allowlist (deny NEVER dispatches) then decide's coverage report.
-        // A catalog hit queues guidance; a miss queues the candidate FOR
-        // APPROVAL — W7 never auto-runs a composed workflow from mail.
         let (compose_rows, compose_allowlist): (Vec<ComposeRequestRow>, Vec<String>) =
             match crate::elm::leaf::run_leaf_journaled(
                 &params.project,
@@ -6620,7 +6185,7 @@ async fn swarm_loop(
                     plan_compose_request(&row.from, &row.body, &compose_allowlist, &catalog);
                 match outcome {
                     ComposeRequestOutcome::Denied => {
-                        seen_xproj.insert(row.id.clone()); // handled = dropped
+                        seen_xproj.insert(row.id.clone());
                         eprintln!(
                             "flywheel: compose-request msg {} denied (sender not allowlisted) — never dispatched",
                             row.id
@@ -6636,19 +6201,12 @@ async fn swarm_loop(
                     }
                     ComposeRequestOutcome::CandidateForApproval { prompt } => {
                         queue.push(prompt);
-                        seen_xproj.insert(row.id.clone()); // queued = handled
+                        seen_xproj.insert(row.id.clone());
                     }
                 }
             }
         }
 
-        // ---- saturation respawn (bd-context-limit-honor-luqg) ----
-        // An exact-body CONTEXT_LIMIT reply from a KNOWN crew agent is a
-        // respawn trigger, honored HERE — before plan_actions can pick a
-        // wake banner for the same saturated pane. The agent is re-booted
-        // fresh (standing orders ride the boot prime; open thread refs ride
-        // the digest prefix on later prompts) within this poll cycle; the
-        // sender pin → pane mapping refuses strangers.
         let ctx_items: Vec<crate::XprojInboxItem> = match crate::elm::leaf::run_leaf_journaled(
             &params.project,
             "__context-inbox",
@@ -6665,7 +6223,7 @@ async fn swarm_loop(
             if seen_ctx_limit.contains(&item.id) {
                 continue;
             }
-            seen_ctx_limit.insert(item.id.clone()); // handled either way
+            seen_ctx_limit.insert(item.id.clone());
             let Some(target) = context_limit_target(&item.from, &states) else {
                 eprintln!(
                     "flywheel: CONTEXT_LIMIT msg {} from unknown sender {:?} — ignored",
@@ -6683,22 +6241,19 @@ async fn swarm_loop(
                 &mut queue,
                 &agent_kinds,
                 &target,
-                None, // fresh boot: no work text requeued
+                None,
                 "context_limit",
                 0,
             )
             .await;
         }
 
-        // self-heal (bd-event-self-heal): diagnose → respawn (budgeted) → blocked.
-        // Skip-dispatch for unknown still holds in plan_actions; heal runs here.
         exited_names.clear();
         for ev in &event_batch.events {
             if ev.event_type == "pane.exited" {
                 if let Some(n) = name_for_pane(&states, &ev.pane_id) {
                     exited_names.insert(n);
                 } else if let Some(a) = &ev.agent {
-                    // best-effort: single-kind match
                     let hits: Vec<_> = states.iter().filter(|s| s.kind == *a).collect();
                     if hits.len() == 1 {
                         exited_names.insert(hits[0].name.clone());
@@ -6706,16 +6261,7 @@ async fn swarm_loop(
                 }
             }
         }
-        // Stranded-bead RECLAIM collector (bd-627z.1) — planner actions from
-        // reclaim_on_pane_exited/plan_reclaim, merged into the poll plan below.
-        // (fresh-eyes fix: the previous "leftover #3 fixed" drop discarded
-        // these, so stranded beads were never reclaimed.)
         let mut reclaim_actions: Vec<LoopAction> = Vec::new();
-        // Heal decisions ride Msgs into tick (fresh-eyes fix 2026-09-01): the
-        // previous fold deleted the loop-side heal loop without relocating the
-        // per-agent statuses, so NOBODY ran self_heal_step — dead agents were
-        // never diagnosed/respawned. tick owns the heal_states transition; the
-        // executor leaves still run the diagnose/respawn I/O.
         let mut heal_msgs: Vec<LoopMsg> = states
             .iter()
             .map(|s| LoopMsg::Heal {
@@ -6725,23 +6271,8 @@ async fn swarm_loop(
             })
             .collect();
 
-        // bead-driven mode: refresh the instruction queue from the tracker each
-        // poll; the assigned-set is deterministic across replays (derives from
-        // checkpointed poll results)
-        // bd-gnej wave-gate: ready beads held this poll (earlier wave open).
-        // Hoisted so the completion gate below can require them empty.
         let mut wave_held: Vec<String> = Vec::new();
-        // bd-eign.2.1 (2026-08-17) + bd-0cet: beads the flood guard PAUSED
-        // enter the Wake table's memory (persisted via ActiveLoop) —
-        // without this, the same beads count as "new" every poll (they never
-        // enter `assigned` while paused) and dispatch locks forever. The guard
-        // still fires for EVER-NEW bead ids (the runaway signature).
         if params.work {
-            // interrupted work first: an in-progress bead's agent went idle —
-            // resume it before handing out fresh beads. bd-627z.1: live names
-            // = the polled swarm; stranded beads (assignee NOT live) are
-            // RECLAIMED (re-opened to ready + re-dispatched) instead of being
-            // resumed or left to stall the batch.
             let inprog: Vec<ReadyBead> = match crate::elm::leaf::run_leaf_journaled(
                 &params.project,
                 "__inprogress",
@@ -6756,8 +6287,6 @@ async fn swarm_loop(
                     }
                 },
                 Err(e) => {
-                    // cg6.2: leaf errors never abort the loop — a tracker
-                    // hiccup yields no interrupted-work refresh this tick.
                     eprintln!("flywheel: poll_inprogress leaf failed (continuing): {e}");
                     vec![]
                 }
@@ -6776,9 +6305,6 @@ async fn swarm_loop(
                     &format!("reclaim-stranded:{}", params.project),
                 ) {
                     Ok(r) => {
-                        // Reclaimed beads return to ready → re-dispatched
-                        // below (same poll) — the strand is healed in one
-                        // cycle. Reclaim failures are logged, not fatal.
                         if let Some(ids) = r.get("reclaimed").and_then(|v| v.as_array()) {
                             for id in ids.iter().filter_map(|v| v.as_str()) {
                                 eprintln!(
@@ -6828,29 +6354,17 @@ async fn swarm_loop(
                     }
                 },
                 Err(e) => {
-                    // cg6.2: leaf errors never abort the loop. bd-87hq:
-                    // flag for the completion gate.
                     critical_leaf_failed_this_iter = true;
                     eprintln!("flywheel: poll_ready leaf failed (continuing): {e}");
                     vec![]
                 }
             };
-            // ADR-0019 (bd-w1-verify-fence): only beads whose `## VERIFY`
-            // fence parsed to a single-line command are dispatchable. Beads
-            // with a missing/multi-line/empty fence are NOT dispatched —
-            // the planner is mailed once per bead per invocation.
             let (dispatchable, not_ready) = partition_ready(&ready);
-            // bd-gnej wave-gate: hold a wave-N labeled bead while any
-            // earlier wave-M (M<N) is open/in_progress — earlier waves run
-            // first. No wave labels → no gating. --no-wave-gates kills it.
             wave_held = if params.no_wave_gates {
                 Vec::new()
             } else {
                 wave_gate_held(&ready, &inprog)
             };
-            // ADR-0006 D2 wave-scoped dispatch: with --wave-label the ready
-            // set narrows to exactly that label's beads and ANY open lower
-            // wave blocks (error names the blockers). None = unchanged.
             let mut scope_block: Option<String> = None;
             let scope_ids: Option<std::collections::HashSet<String>> = params
                 .wave_label
@@ -6879,29 +6393,11 @@ async fn swarm_loop(
                     wave_held.join(", ")
                 );
             }
-            // ADR-0019 Spec 3.4/3.5: the reservation board drives BOTH the
-            // always-serialize dispatch gate (Spec 3.5: while an
-            // always-serialize path — .beads/**, .flywheel/**, Cargo.lock,
-            // root Cargo.toml, docs/catalog/**, target/** — is held by an
-            // in-flight bead, NO new ready bead is dispatched; the second
-            // stays ready until the holder releases, never parallel) and the
-            // claim-watch overlap wait set (Spec 3.4: overlap waits are NOT
-            // stuck owners). Best-effort: a fetch failure degrades to an
-            // empty board (no gate, existing behavior), never a loop crash.
-            // bd-9tbb: LIVE read (leafReply) — a checkpointed reply replays
-            // the stored board on resume and serializes dispatch forever.
             let board: Vec<(String, String)> = reservation_board_live(&params.project).await;
             let overlap: std::collections::HashSet<String> = {
                 let in_flight: Vec<String> = inprog.iter().map(|b| b.id.clone()).collect();
                 bead_overlap_waits(&board, &in_flight)
             };
-            // bd-claim-watch-durable-signals-mixy: bead ids held by a LIVE
-            // toron reservation (reason == bead id) — the durable "work is
-            // taken" record, consulted BEFORE pane state and the mail guard.
-            // The reservation board is the reserve-before-work lifecycle's
-            // own ledger; an unexpired lease means an executor is attached
-            // even when its pane is idle between turns or lives on a harness
-            // `states` cannot see.
             let live_leases: std::collections::HashSet<String> = board
                 .iter()
                 .filter_map(|(_, reason)| {
@@ -6914,7 +6410,6 @@ async fn swarm_loop(
                 })
                 .collect();
             let serialize_all = always_serialize_held(&board);
-            // ADR-0025 reclaim: pane-exited gate (step 0) + stale tick (7200/86400)
             {
                 for bead in &inprog {
                     for exited in &exited_names {
@@ -6936,29 +6431,14 @@ async fn swarm_loop(
                     }
                 }
                 let now_secs = authority.now_unix() as i64;
-                // ADR-0025 / ADR-0016: thresholds ride the loop params
-                // (serialized with the invocation) so a replay reclaims by
-                // the same policy the original run used.
                 let stale =
                     plan_reclaim_with_policy(now_secs, &inprog, &states, &board, &params.reclaim);
                 for act in stale {
                     reclaim_actions.push(act);
                 }
             }
-            // bd-eign.2: bead-creation flood guard — >3 NEW ready beads in
-            // ONE poll is the runaway-create signature (40 junk beads in
-            // ~4 min, RC2). CRITICAL warn + PAUSE dispatch this poll: feeding
-            // the flood (each dispatch prompts "claim a bead") doubles the
-            // creates. Deterministic: to_assign derives from checkpointed
-            // poll results, so replays reach the same verdict. The verdict
-            // and its memory live in the Spec-5 Wake table (bd-0cet): a
-            // paused batch counts once and then dispatches, while a runaway
-            // minting NEW ids keeps pausing — across crash-resume, not just
-            // this invocation.
             let candidate_ids: Vec<String> = to_assign.iter().map(|b| b.id.clone()).collect();
             let total = candidate_ids.len();
-            // bd-0nem: single fold through the fenced kernel (was a direct
-            // free-fn call; same verdict, journal-shaped effects).
             let (next_table, effects) = doorbell_core::wake_core::tick(
                 &wake,
                 &doorbell_core::wake_core::WakeMsg::FloodCheck { ids: candidate_ids },
@@ -6979,7 +6459,6 @@ async fn swarm_loop(
                 paused = true;
             }
             if paused {
-                // Pause: nothing dispatched this poll (logged above).
             } else if serialize_all {
                 eprintln!(
                     "flywheel: always-serialize path held ({}) — no new ready-bead dispatch this poll (ADR-0019 Spec 3.5; serialized until the holder releases)",
@@ -6992,11 +6471,6 @@ async fn swarm_loop(
                 );
             } else {
                 for bead in to_assign {
-                    // bd-bpd9 graph vehicle: opted-in beads run their composed
-                    // graph via the detached subprocess leaf; the loop keeps
-                    // claim-watch and close stays VERIFY + CommandVerified.
-                    // Marker without VERIFY/principles: LOUD refusal, not a
-                    // silent normal brief (GS-005 §9.4).
                     if let Some(wf_name) = workflow_for_bead(bead) {
                         if bead.verify.is_some() && principles_block_reason(bead).is_none() {
                             match spawn_graph_vehicle(
@@ -7008,12 +6482,6 @@ async fn swarm_loop(
                                 &mut graph_invoked,
                             ) {
                                 Ok(_outcome) => {
-                                    // Both arms: the vehicle owns the bead.
-                                    // Spawned just launched it; AlreadySpawned
-                                    // is loud in the leaf — either way NEVER
-                                    // fall through to a normal brief (that
-                                    // would re-dispatch the bead every poll
-                                    // while the vehicle runs).
                                     assigned.push(bead.id.clone());
                                     continue;
                                 }
@@ -7037,13 +6505,6 @@ async fn swarm_loop(
                             continue;
                         }
                     }
-                    // bd-dispatch-dedupe-2zlz: GOAL gate — a live peer
-                    // claim/announce/stand-down on the bead thread holds
-                    // this dispatch (fail-open on scan infra failure).
-                    // bd-5ouq: facts via the journaled leaf (fresh per
-                    // poll — the key carries now_us so a crash re-fetches
-                    // instead of replaying a stale read), evaluated inline
-                    // with caller authority time.
                     let g_now_us = authority.now_unix() as i64 * 1_000_000;
                     let g_facts = match crate::elm::leaf::run_leaf_journaled(
                         &params.project,
@@ -7085,19 +6546,10 @@ async fn swarm_loop(
                     assigned.push(bead.id.clone());
                 }
             }
-            // ADR-0019: refuse-to-dispatch — never queue a bead without a
-            // legal VERIFY fence; tell the planner why, on the bead's thread.
             for bead in &not_ready {
                 if not_ready_mailed.insert(bead.id.clone()) {
-                    // bd-bead-create-contract-lint-4tdd: the EXACT reason
-                    // (fence error / principles_block_reason) rides in the
-                    // mail body — the 2026-08-17 hardcoded "(no legal VERIFY
-                    // fence)" mislabeled PRINCIPLES-gated P<=2 beads and
-                    // sent the captain chasing the wrong parser.
                     let reason = not_ready_reason(bead)
                         .unwrap_or_else(|| "not dispatchable (see loop)".to_string());
-                    // The leaf takes --reason; the old call always set it
-                    // (Some), so the argv keeps it unconditionally.
                     let argv = vec![
                         params.project.as_str(),
                         bead.id.as_str(),
@@ -7111,12 +6563,6 @@ async fn swarm_loop(
                         &argv,
                         &format!("mail-not-ready:{}", bead.id),
                     ) {
-                        // bd-not-ready-alert-recipient-2yd1: the leaf's own
-                        // `ok` flag decides the status word. A send that
-                        // resolved to nobody is a FAILURE, so it must not be
-                        // printed as `planner mailed` — that word is how
-                        // beads were silently never dispatched with the
-                        // reason silently never delivered.
                         Ok(v) => eprintln!(
                             "flywheel: bead {} NOT ready ({reason}) — {}: {v}",
                             bead.id,
@@ -7130,19 +6576,6 @@ async fn swarm_loop(
                 }
             }
 
-            // bd-efk1: crew-execution watchdog — reconcile the dispatched
-            // bead watch against the fresh tracker snapshots. Unclaimed
-            // beads get a claim nudge (engaged agent) or a re-dispatch
-            // (settled agent); claimed-but-unclosed beads get a close nudge
-            // then a resume re-dispatch. The nudge Sends target specific
-            // agents (bypass plan_actions — they fire even for WORKING
-            // agents); re-dispatches re-enter the queue at the FRONT so the
-            // next idle agent takes them.
-            // ADR-0019 Spec 3.4: overlap waits are NOT stuck owners. Beads
-            // whose write paths another in-flight bead holds get no
-            // claim/close nudge and no resume redispatch — the loop waits
-            // for the holder to release (`overlap` comes from the board
-            // fetched at dispatch planning above).
             let watch_actions = claim_watch_step(
                 &mut claim_watch,
                 &ready,
@@ -7161,12 +6594,6 @@ async fn swarm_loop(
                         });
                     }
                     ClaimWatchAction::RedispatchBead { bead_id, title } => {
-                        // bd-dispatch-dedupe-2zlz: the claim-watch fired, but
-                        // a LATE claim/announce may have landed since — scan
-                        // before re-dispatching (W4 second-occurrence fix).
-                        // bd-5ouq: facts via the journaled leaf (fresh per
-                        // poll), evaluated inline with caller authority
-                        // time. Fail-open: a scan failure proceeds.
                         let g_now_us = authority.now_unix() as i64 * 1_000_000;
                         let g_hold: Option<String> = match crate::elm::leaf::run_leaf_journaled(
                             &params.project,
@@ -7229,11 +6656,6 @@ async fn swarm_loop(
                         });
                     }
                     ClaimWatchAction::RedispatchResume { bead_id, title } => {
-                        // bd-dispatch-dedupe-2zlz: same gate for the resume
-                        // re-dispatch — a posted stand-down holds it.
-                        // bd-5ouq: facts via the journaled leaf (fresh per
-                        // poll), evaluated inline with caller authority
-                        // time. Fail-open: a scan failure proceeds.
                         let g_now_us = authority.now_unix() as i64 * 1_000_000;
                         let g_hold: Option<String> = match crate::elm::leaf::run_leaf_journaled(
                             &params.project,
@@ -7285,16 +6707,6 @@ async fn swarm_loop(
                         }
                     }
                     ClaimWatchAction::ReleaseReservations { bead_id } => {
-                        // ADR-0019 (bd-w1-reopen-f6tw): close-detect
-                        // enforcement — SHA rule + ledger. A closed bead must
-                        // have a legal verdict bound to the commit whose
-                        // message carries its id. Non-legal -> reopen + one
-                        // mail per (bead, sha). WorkerReceipt-eligible beads
-                        // get TWO consecutive missing ticks of grace (the
-                        // receipt can race the close write): the bead is
-                        // re-watched so the next tick re-checks.
-                        // The check runs through the journaled leaf loop:
-                        // same subcommand and argv, checkpointed per bead.
                         match crate::elm::leaf::run_leaf_journaled(
                             &params.project,
                             "__close-check",
@@ -7315,17 +6727,7 @@ async fn swarm_loop(
                                             &bead_id,
                                             LedgerEvent::Closed,
                                         );
-                                        // programmatic done-mail (2026-08-18):
-                                        // the loop is the reporter of record —
-                                        // mail the captain the close-reason
-                                        // REPORT on the bead thread. Best-effort
-                                        // + once per bead (bd-55nx.8: dedup on
-                                        // swarm.done_mailed, crash-safe).
                                         if swarm.done_mailed.insert(bead_id.clone()) {
-                                            // The done-mail leaf now runs through the journaled
-                                            // leaf loop instead of a vendor checkpoint: same
-                                            // self-exe, same parse, same best-effort logging,
-                                            // one intent journaled per run for the audit trail.
                                             match crate::elm::leaf::run_leaf_journaled(
                                                 &params.project,
                                                 "__mail-done",
@@ -7373,17 +6775,7 @@ async fn swarm_loop(
                                             .and_then(Value::as_str)
                                             .unwrap_or("")
                                             .to_string();
-                                        // bd-w1-loop-run-verify-mbbe: cheap
-                                        // band — the LOOP is the verifier.
-                                        // Run VERIFY before any reopen;
-                                        // success records command-verified
-                                        // and the bead stays closed; failure
-                                        // reopens (never re-verify the same
-                                        // broken head — failed-head marker).
                                         let mut lr_band = String::new();
-                                        // bd-5ouq: the child runs through the
-                                        // journaled leaf (same argv); settling
-                                        // stays inline with caller authority.
                                         let lr_refs: Vec<&str> =
                                             vec![&params.project, &bead_id, "--sha", &sha];
                                         let lr_value =
@@ -7425,17 +6817,11 @@ async fn swarm_loop(
                                                 .to_string();
                                         }
                                         if lr_band != "loop-runnable" {
-                                            // Non-runnable band (or a leaf
-                                            // error): the existing grace /
-                                            // reopen flow applies.
                                             let ticks = close_grace_ticks
                                                 .entry(bead_id.clone())
                                                 .or_insert(0);
                                             *ticks += 1;
                                             if eligible && *ticks < 2 {
-                                                // receipt may race the close:
-                                                // re-watch so the next tick
-                                                // re-checks before reopening.
                                                 eprintln!(
                                                     "flywheel: {bead_id} missing verdict (WorkerReceipt grace {ticks}/2)"
                                                 );
@@ -7473,9 +6859,6 @@ async fn swarm_loop(
                                                 }
                                             }
                                         } else {
-                                            // The leaf recorded command-verified
-                                            // (legal, stays closed) or reopened
-                                            // the bead — not in verdict limbo.
                                             close_grace_ticks.remove(&bead_id);
                                             emit_ledger_fact(
                                                 &crate::config::state_dir(),
@@ -7494,13 +6877,6 @@ async fn swarm_loop(
                                 "flywheel: close-check for {bead_id} failed (continuing): {e}"
                             ),
                         }
-                        // ADR-0019 Spec 4 (bd-w1-verifier-degrade-a6fk): a
-                        // closed bead that needs independent verification
-                        // (priority <= 1, high blast, judgment AC) gets its
-                        // verifier plan decided once per invocation. Degrade
-                        // blocks the bead verifier-family-missing + mails the
-                        // captain once (marker-deduped) + never respawns;
-                        // dispatch returns the reviewer model for the pane.
                         if verifier_dispatched.insert(bead_id.clone()) {
                             match crate::elm::leaf::run_leaf_journaled(
                                 &params.project,
@@ -7527,11 +6903,6 @@ async fn swarm_loop(
                                 ),
                             }
                         }
-                        // bd-h3oj: the bead closed — release its file
-                        // reservations (reason == bead id) so they never
-                        // linger to TTL. Same subprocess through the journaled
-                        // loop; best-effort: a failed release must not kill
-                        // the loop.
                         match crate::elm::leaf::run_leaf_journaled(
                             &params.project,
                             "__release-bead-locks",
@@ -7549,37 +6920,14 @@ async fn swarm_loop(
         }
 
         let mut blocked_names: Vec<String> = Vec::new();
-        // ADR-0027: live swarm is workspace::tick. Slice durable::tick is
-        // private. Reclaim is a Msg the producer constructs — never extend
-        // after tick.
         let mut actions: Vec<LoopAction> = Vec::new();
-        // GS-030 slice 1 (one wake, bd-gs030-one-wake-k8m3): the loop NO
-        // LONGER polls mail digests — the doorbell is the single wake
-        // producer (WatchNdjson ring + InboxRows urgent/high Prompt for idle
-        // pins). No digest map is constructed on the live path at all:
-        // plan_actions (legacy planner, tests/debug only) keeps its digest
-        // parameter, but no live caller passes mail in. The `__mail-digest`
-        // leaf + MailDigest helpers stay as a debug surface (manual ctx.run
-        // / tests), never a wake. Wake dedup below degrades to the
-        // context-limit suppression set only.
-        // Wake dedup: context-limit respawns suppress banners (the digest
-        // keyed per-message-id dedup left with the loop-side wake).
         let wake_suppressed: std::collections::HashSet<String> =
             ctx_suppressed.iter().cloned().collect();
         clear_stale_landed_for_idle(&params.project, &params.invocation, &states);
-        // bd-bd79: lease renewal BEFORE dispatch — renew active leases whose reason
-        // matches an in_progress bead with a live assignee. Near-expiry check
-        // uses the threshold; unknown expiry (board without expires) is treated
-        // as needing renewal. Failure logs + increments visible counter (bd-cy0s
-        // will add full event emission later).
         {
             let renew_extend = lease_renew_seconds(params.interval_secs);
-            // bd-9tbb: LIVE read — see the dispatch-gate site for the replay
-            // hazard; the renewal threshold check must observe NOW too.
             let board: Vec<(String, String)> = reservation_board_live(&params.project).await;
             let inprog_for_renew: Vec<ReadyBead> = if params.work {
-                // Read-only poll leaf through the journaled loop: same
-                // subcommand, same parse, fail-open default on any error.
                 match crate::elm::leaf::run_leaf_journaled(
                     &params.project,
                     "__inprogress",
@@ -7642,12 +6990,10 @@ async fn swarm_loop(
                 }
             }
         }
-        // bd-cy0s: tick stall detection — bead in_progress + pane listed + idle past threshold
         {
             let now_secs = authority.now_unix() as i64;
             let threshold = params.pane_stall_secs;
             let inprog_for_stall: Vec<ReadyBead> = if params.work {
-                // Reuse already-fetched inprog_for_renew if available, else fetch.
                 match crate::elm::leaf::run_leaf_journaled(
                     &params.project,
                     "__inprogress",
@@ -7662,12 +7008,9 @@ async fn swarm_loop(
             };
             let stalled = detect_stalled_panes(&inprog_for_stall, &states, now_secs, threshold);
             for ev in stalled {
-                // emit fact (journal + doorbell) — feeds Diagnose, not auto-reclaim
                 emit_fact(&crate::config::state_dir(), &params.project, ev);
             }
         }
-        // ADR-0026 Spec 4: mail-health dispatch-hold at N. ADR-0016: the
-        // threshold is loop-params data resolved at loop start.
         let n = params.mail_health_escalate_at;
         let mail_hold = if n == 0 {
             false
@@ -7676,18 +7019,9 @@ async fn swarm_loop(
         } else {
             false
         };
-        // bd-nsb3 FOLD: mail-hold + events + retention all live inside tick.
-        // The degraded flag is the tick's decision — Blocked for idles instead
-        // of the plan when degraded (in-flight claim-watches still append after
-        // as the loop's effect stage). Queue pops and dispatch_pending live in
-        // model' (visible + replayable).
         let active = crate::state::load_active_loop(&params.project)
             .ok()
             .flatten();
-        // bd-55nx.8: swarm is the only RAM for queue / per_bead_phase /
-        // dispatch_pending / heal_states / done_mailed. Assign poll inputs in
-        // place — never replace the whole struct (a throwaway LoopModel with
-        // `done_mailed: Default` wiped the dedup every poll).
         swarm.queue = queue.clone();
         swarm.per_bead_phase = per_bead_phase.clone();
         swarm.wake_suppression = wake_suppressed.clone();
@@ -7710,10 +7044,6 @@ async fn swarm_loop(
         swarm.heal_budget = params.respawn_budget;
         swarm.pending_events = Vec::new();
         swarm.dispatch_pending = dispatch_pending.clone();
-        // ADR-0029 Wave 1: one rot score per agent when nudge-without-progress
-        // hits Compact (streak==3). Consume to 4 so the next poll does not
-        // re-fire. Named proxy: streak stands in for repetition+silence until
-        // pane-byte events exist.
         let mut rot_msgs: Vec<LoopMsg> = Vec::new();
         for s in &mut states {
             if s.nudge_streak == 3 {
@@ -7733,8 +7063,6 @@ async fn swarm_loop(
             }
         }
         swarm.states = states.clone();
-        // done_mailed + heal_states deliberately untouched: they persist on
-        // swarm across polls (seeded from ActiveLoop at startup).
         let now = authority.now_unix();
         let fold = |swarm: &mut LoopModel,
                     ws_msg: crate::workspace::Msg,
@@ -7757,15 +7085,6 @@ async fn swarm_loop(
                 LoopMsg::Hc(pe.clone()),
             ));
         }
-        // ADR-0010 D4/D12 producer: a drained pane may DECLARE a wait on a
-        // human (`paused: <owner>`) instead of finishing its fence. Read each
-        // drained pane's tail ONCE per poll (bounded by the open drains) and
-        // fold the declaration BEFORE the Tick that would count grace down, so
-        // a declared wait holds grace instead of being force-stopped. Folded
-        // through `tick_from_loop_msg` + journalled exactly like `fold` above —
-        // the shell never writes the model directly.
-        // pause_resurface_secs is loop-params data (ADR-0016: resolved once
-        // at loop start), not an env read per poll.
         let pause_secs = params.pause_resurface_secs;
         let drained: Vec<String> = swarm.drain_pending.keys().cloned().collect();
         for name in drained {
@@ -7774,7 +7093,7 @@ async fn swarm_loop(
                 .get(&name)
                 .is_none_or(|ds| ds.paused.is_some())
             {
-                continue; // fulfilled already, or the clock owns the cadence
+                continue;
             }
             let terminal = read_pane_terminal_live(&params.project, &name).await;
             let Some(declared) = crate::write_liveness::parse_paused_declaration(&terminal) else {
@@ -7801,8 +7120,6 @@ async fn swarm_loop(
             crate::workspace::Msg::Tick { now },
             LoopMsg::Tick { now },
         ));
-        // leftover #4 fixed: tick output is the plan, no filter of Diagnose pane_exited
-        // Heal + nudge + reclaim all ride workspace::tick (one live entry).
         let mut extra_msgs = std::mem::take(&mut heal_msgs);
         extra_msgs.append(&mut nudge_msgs);
         extra_msgs.append(&mut rot_msgs);
@@ -7883,9 +7200,6 @@ async fn swarm_loop(
         per_bead_phase = next_model.per_bead_phase.clone();
         dispatch_pending = next_model.dispatch_pending.clone();
         states = next_model.states.clone();
-        // Bounded retention: prune maps that would otherwise grow with every
-        // bead/agent ever seen. Complete/WaveHeld beads older than the queue
-        // are dead weight; heal entries for gone agents are stale.
         {
             let live_agents: std::collections::HashSet<&String> =
                 states.iter().map(|s| &s.name).collect();
@@ -7893,14 +7207,11 @@ async fn swarm_loop(
                 .heal_states
                 .retain(|k, _| live_agents.contains(k));
             swarm.heal_states = next_model.heal_states.clone();
-            // per_bead_phase: keep only beads still in queue or recently active
-            // (last 200 entries). This caps the map even under high churn.
             if per_bead_phase.len() > 500 {
                 let mut keys: Vec<String> = per_bead_phase.keys().cloned().collect();
                 keys.sort();
                 let to_remove = per_bead_phase.len() - 400;
                 for k in keys.into_iter().take(to_remove) {
-                    // Only prune terminal phases; keep non-terminal for correctness
                     if matches!(
                         per_bead_phase.get(&k),
                         Some(LoopPhase::Complete | LoopPhase::WaveHeld)
@@ -7911,8 +7222,6 @@ async fn swarm_loop(
                     }
                 }
             }
-            // dispatch_pending is naturally bounded by queue length; ensure it
-            // never retains names not in queue or states.
             let live_beads: std::collections::HashSet<&String> = queue
                 .iter()
                 .collect::<std::collections::HashSet<_>>()
@@ -7921,30 +7230,21 @@ async fn swarm_loop(
                 .collect();
             dispatch_pending.retain(|k| live_beads.contains(k) || per_bead_phase.contains_key(k));
         }
-        // proof of life + kind learning use the Model's states after Tick (bd-p1ds)
         clear_live_failures(&mut send_failures, &states);
         learn_kinds(&mut agent_kinds, &states);
-        // bd-5fbv: crash-safe persistence via ActiveLoop file (was loop-local only).
         if let Ok(Some(mut al)) = crate::state::load_active_loop(&params.project) {
             al.per_bead_phase = per_bead_phase
                 .iter()
                 .map(|(k, v)| (k.clone(), format!("{v:?}")))
                 .collect();
             al.dispatch_pending = dispatch_pending.clone();
-            // bd-0cet: the wake table persists per poll (flood-guard and
-            // AckSLA memory survive crash-resume via the ActiveLoop file).
             al.wake = wake.clone();
-            // bd-55nx.8: done-mail dedup is crash-safe Model state.
             al.done_mailed = swarm.done_mailed.clone();
-            // bd-zfnx.10: open drains are crash-safe Model state (name →
-            // bead id; grace restarts fresh on resume).
             al.drain_pending = swarm
                 .drain_pending
                 .iter()
                 .map(|(k, v)| (k.clone(), v.bead_id.clone()))
                 .collect();
-            // Persist heal counters (crash-safe; awaiting_clear is
-            // within-episode state and deliberately does not survive restart).
             al.heal_states = next_model
                 .heal_states
                 .iter()
@@ -7962,19 +7262,13 @@ async fn swarm_loop(
                 .collect();
             let _ = crate::state::save_active_loop(&params.project, &al);
         }
-        // re-add Send names that survived to pending so event flutter is covered
         for a in &poll_actions {
             if let LoopAction::Blocked { name } = a {
                 blocked_names.push(name.clone());
             }
         }
         actions.extend(poll_actions);
-        // bd-efk1: claim-watch nudges and heal escalations ride the poll plan
-        // above (they target specific agents — possibly WORKING ones — so they
-        // survive the dispatch-pending retention applied to it).
 
-        // with on_blocked=stop, the loop must not dispatch any more work this
-        // iteration — check the blocker before any side effect fires
         if !blocked_names.is_empty() && params.on_blocked == "stop" {
             return Ok(format!(
                 "stopped: blocked agents {}",
@@ -7982,13 +7276,6 @@ async fn swarm_loop(
             ));
         }
 
-        // ---- bd-a7j: reply verification --------------------------------
-        // A dispatched ask (collab question) carries an expected reply;
-        // once the agent settles (idle/done) verify the thread actually
-        // moved. Silent → one concrete reminder, then the blocked-escalation
-        // path (T0-T3). Everything here runs through checkpointed leaves —
-        // replay reproduces identical verdicts and the reminder is deduped
-        // by the last-sent registry (same invocation + text).
         let expected_entries = match crate::elm::leaf::run_leaf_journaled(
             &params.project,
             "__expected-replies",
@@ -7997,41 +7284,30 @@ async fn swarm_loop(
         ) {
             Ok(v) => parse_expected_reply_entries(&v),
             Err(e) => {
-                // bd-87hq: flag expected-replies failures for the gate too
-                // (part of the stale-checkpoint signature per the symptom).
                 critical_leaf_failed_this_iter = true;
                 eprintln!("flywheel: expected-replies leaf failed (continuing): {e}");
                 vec![]
             }
         };
-        // reconcile workflow-local state with the (possibly updated) file:
-        // keep reminder counts for unchanged expectations, reset for new
-        // questions (a fresh collab ask starts a fresh reminder budget).
         let prev = std::mem::take(&mut expected_replies);
         expected_replies = reconcile_expected_replies(&prev, &expected_entries);
 
         let mut satisfied_names: Vec<String> = Vec::new();
         let mut escalate_names: Vec<String> = Vec::new();
         for (key, exp) in &mut expected_replies {
-            // The file stores the MAIL identity (collab resolved it); the
-            // swarm states use terminal names — map one to the other so the
-            // settle check, the thread check, and the reminder target agree.
-            // bd-aseq: match through the pinned identity (state field or
-            // spawn registry), never the bare hash mapping alone.
-            // `key` is ask_key; `exp.agent` is the identity reply_settled deletes.
             let agent = exp.agent.clone();
             let Some(matched) = match_expected_agent(&params.project, &states, &agent) else {
-                continue; // agent not in this swarm (or expectation stale)
+                continue;
             };
             let terminal_name = matched.name.clone();
             if dispatch_pending.contains(&terminal_name) {
-                continue; // just dispatched this iteration — give it time
+                continue;
             }
             let settled = states
                 .iter()
                 .any(|s| s.name == terminal_name && matches!(s.status.as_str(), "idle" | "done"));
             if !settled {
-                continue; // working/blocked/unknown — not settled yet
+                continue;
             }
             let (newest_id, author) = match crate::elm::leaf::run_leaf_journaled(
                 &params.project,
@@ -8048,9 +7324,6 @@ async fn swarm_loop(
                     (None, None)
                 }
             };
-            // The thread head reports the MAIL identity (CalmGate), not the
-            // terminal name — verify against the resolved identity. bd-aseq:
-            // prefer the state's pinned identity; registry pin, then hash.
             let mail_name = matched.mail_identity.clone().unwrap_or_else(|| {
                 crate::resolve_mail_target_registry(&params.project, &terminal_name)
             });
@@ -8066,10 +7339,6 @@ async fn swarm_loop(
                         "flywheel: reply verified for {agent} in thread {}",
                         exp.thread
                     );
-                    // checkpointed cleanup: drop the (agent, thread)
-                    // expectation so it stops keeping the loop alive. The
-                    // file keys by the MAIL identity (agent), not the hc
-                    // name — pass the file key.
                     let _ = crate::elm::leaf::run_leaf_journaled(
                         &params.project,
                         "__reply-settled",
@@ -8078,7 +7347,7 @@ async fn swarm_loop(
                             "reply-settled:{}:{}:{}",
                             params.project, exp.agent, exp.thread
                         ),
-                    ); // leaf errors logged inside; local retain below
+                    );
                     satisfied_names.push(key.clone());
                 }
                 ReplyVerdict::Reminded => {
@@ -8100,13 +7369,10 @@ async fn swarm_loop(
                             "remind-reply:{}:{}:{}:{}",
                             params.project, terminal_name, exp.thread, exp.reminder_count
                         ),
-                    ); // leaf logs ReplyMissing + sends; errors logged inside
+                    );
                     exp.reminder_count = 1;
                 }
                 ReplyVerdict::Escalate => {
-                    // hand the silent agent to the existing blocked-escalation
-                    // path (notify_blocked → T0-T3) — a missing reply is a
-                    // form of block.
                     escalate_names.push(terminal_name.clone());
                 }
             }
@@ -8126,9 +7392,6 @@ async fn swarm_loop(
         let mut any_work = false;
         for action in &actions {
             match action {
-                // ADR-0001 Wave 3: the pin stamp rides ahead of the send —
-                // run it best-effort through the __pin-stamp leaf (the
-                // orchestrator fills pin; failure never blocks dispatch).
                 LoopAction::PinStamp { bead_id, pin } => {
                     let exe = self_exe()?;
                     let mut cmd = Command::new(&exe);
@@ -8162,8 +7425,6 @@ async fn swarm_loop(
                     }
                 }
                 LoopAction::Send { name, text } | LoopAction::DispatchImmediate { name, text } => {
-                    // context guard: if the idle agent is context-exhausted,
-                    // respawn a fresh instance instead of delegating to it
                     let read_now = authority.now_unix();
                     let verdict = match crate::elm::leaf::run_leaf_journaled(
                         &params.project,
@@ -8176,10 +7437,6 @@ async fn swarm_loop(
                             context_verdict(&ro.terminal, ro.state.as_ref(), read_now)
                         }
                         Err(e) => {
-                            // cg6.2: the agent may have exited between poll
-                            // and read (a real race) — skip the context guard;
-                            // the send path below soft-fails if the agent is
-                            // gone. A leaf error must never abort the loop.
                             eprintln!(
                                 "flywheel: read_output leaf failed for {name} (continuing): {e}"
                             );
@@ -8197,7 +7454,7 @@ async fn swarm_loop(
                             "context_limit",
                             0,
                         )
-                        .await; // cg6.2: soft — leaf failures logged inside
+                        .await;
                         continue;
                     }
                     let outcome = match send_prompt(SendArgs {
@@ -8232,9 +7489,6 @@ async fn swarm_loop(
                     .await
                     {
                         Ok(o) => o,
-                        // leaf error = the prompt did not land (agent dropped
-                        // mid-wait, __send crashed) — same escalation path as
-                        // a stalled send, never silently lost
                         Err(e) => SendOutcome {
                             ok: false,
                             name: name.clone(),
@@ -8247,18 +7501,9 @@ async fn swarm_loop(
                         },
                     };
                     clear_dispatch_pending(&mut dispatch_pending, name, outcome.landed);
-                    // resume-dedup: __send skipped the hc call because this
-                    // prompt already landed for this invocation (is1.4: the
-                    // SkippedDup event is logged INSIDE the send_prompt leaf —
-                    // checkpointed; the landed handling below resets the
-                    // failure counter; a skipped item never fails)
                     any_work = true;
                     match handle_send_result(&mut send_failures, name, &outcome) {
                         Escalation::Accept => {
-                            // bd-efk1: record the dispatched bead (if the
-                            // prompt is a bead/resume prompt) so the
-                            // claim-watch can reconcile it next poll. Only on
-                            // Accept — a failed send never reached the agent.
                             if let Some(id) = bead_id_from_prompt(text) {
                                 claim_watch
                                     .entry(id.to_string())
@@ -8294,24 +7539,12 @@ async fn swarm_loop(
                                 reason,
                                 attempts,
                             )
-                            .await; // cg6.2: soft — leaf failures logged inside
+                            .await;
                         }
                     }
                 }
                 LoopAction::Blocked { name } => {
                     if params.on_blocked == "mail" {
-                        // cg6.1: the ENTIRE escalation state machine lives in
-                        // the notify_blocked leaf (checkpointed by the effect journal) —
-                        // it loads/initializes the escalation entry, computes
-                        // the tier from the PERSISTED first_blocked_ts,
-                        // increments + persists ping_count, and sends the
-                        // tiered mail. The body is pure orchestration: no
-                        // wall-clock reads, no escalation file I/O, no counter
-                        // mutation — crash-resume replay reproduces the
-                        // original tier sequence (a completed leaf result is
-                        // replayed, never re-executed; even an in-flight
-                        // re-execution derives from persisted state, so the
-                        // tier cannot jump).
                         let out = match notify_blocked(NotifyArgs {
                             project: params.project.clone(),
                             name: name.clone(),
@@ -8325,11 +7558,6 @@ async fn swarm_loop(
                         {
                             Ok(o) => o,
                             Err(e) => {
-                                // cg6.2: leaf errors never abort the loop — a
-                                // mail daemon hiccup skips this tick's ping;
-                                // escalation state is untouched (the leaf
-                                // persists only on success) and the next poll
-                                // retries.
                                 eprintln!(
                                     "flywheel: notify_blocked leaf failed for {name} (continuing): {e}"
                                 );
@@ -8342,16 +7570,7 @@ async fn swarm_loop(
                             2 => EscalationTier::T2,
                             _ => EscalationTier::T3,
                         };
-                        // review-fix F4: bounded halt at T3 — the escalation
-                        // contract says the loop halts (bounded) once a blocked
-                        // agent exceeds the budget. The T3 mail was sent by the
-                        // leaf; exit with a distinguishable outcome so
-                        // `flywheel loop` and the event log show WHY it stopped
-                        // (vs a normal "complete"). T0/T1/T2 keep notifying.
                         if let Some(msg) = on_blocked_tier_exit(tier_enum, &params.on_blocked) {
-                            // (is1.4: the halted event is logged INSIDE the
-                            // notify_blocked leaf at T3 — checkpointed, so a
-                            // crash-resume cannot double-log the halt.)
                             return Ok(msg);
                         }
                     }
@@ -8362,11 +7581,6 @@ async fn swarm_loop(
                     owner,
                     age_secs,
                 } => {
-                    // ADR-0010 D4/D12: the declared wait is re-surfaced to its
-                    // named owner. The durable side's surface is the loop's own
-                    // log + the event journal (the workspace fold additionally
-                    // queues a captain-relevant Audit row for the digest).
-                    // Never a silent park, never an auto-interrupt.
                     let line = pause_resurface_line(name, bead_id, owner, *age_secs);
                     eprintln!("flywheel: {line}");
                     let _ = crate::state::log_event(
@@ -8398,11 +7612,6 @@ async fn swarm_loop(
                         .await;
                     }
                     if let Some(n) = &params.nudge {
-                        // same failure contract as the Send path: a leaf error
-                        // (agent dropped mid-wait) must NOT kill the loop —
-                        // escalate to a respawn so the fresh instance gets
-                        // nudged next poll. A nudge consumes nothing from the
-                        // queue, so there is nothing to requeue.
                         let outcome = match send_prompt(SendArgs {
                             project: params.project.clone(),
                             name: name.clone(),
@@ -8473,7 +7682,7 @@ async fn swarm_loop(
                                     reason,
                                     attempts,
                                 )
-                                .await; // cg6.2: soft — leaf failures logged inside
+                                .await;
                             }
                         }
                     }
@@ -8487,12 +7696,8 @@ async fn swarm_loop(
                     .await;
                     match diag {
                         Ok(_) => {
-                            // awaiting_clear/diagnose_count advanced in tick's
-                            // model' (LoopMsg::Heal arm); nothing to mutate here.
                         }
                         Err(e) => {
-                            // Revert optimistic awaiting_clear inside tick
-                            // on the loop LoopModel (throwaway fold, not a second owner).
                             let extra = tick_loop_owner(
                                 &mut swarm,
                                 &crate::workspace::Msg::DiagnoseFailed { name: name.clone() },
@@ -8512,13 +7717,6 @@ async fn swarm_loop(
                         .get(name)
                         .map(|h| u64::from(h.respawn_count))
                         .unwrap_or(1);
-                    // D4 (bd-8j7m): drain-expiry carries
-                    // "drain_expired bead {id} defer {n}". Before the force
-                    // path, walk the bead's reservation globs: a file newer
-                    // than the quiet window defers (skip kill, re-arm grace,
-                    // write-evidence digest); quiet/failed walks and beads
-                    // with no reservations respawn as before. Heal-path
-                    // respawns (pane_exited/unknown) bypass the walk: no bead.
                     let mut deferred = false;
                     if let Some(rest) = reason.strip_prefix("drain_expired bead ") {
                         let mut toks = rest.split_whitespace();
@@ -8527,9 +7725,6 @@ async fn swarm_loop(
                                 (Some("defer"), Some(n)) => n.parse().unwrap_or(0),
                                 _ => 0,
                             };
-                            // bd-9tbb: LIVE read — the drain-defer glob walk
-                            // must see the board as of NOW, not the replayed
-                            // checkpoint.
                             let board = reservation_board_live(&params.project).await;
                             let globs: Vec<String> = board
                                 .into_iter()
@@ -8537,9 +7732,6 @@ async fn swarm_loop(
                                 .map(|(p, _)| p)
                                 .collect();
                             if !globs.is_empty() {
-                                // ADR-0016: the walk budget is loop-params
-                                // data; the rest are deterministic crate
-                                // defaults (Default is env-free).
                                 let opts = crate::write_liveness::WalkOpts {
                                     timeout_secs: params.walk_timeout_secs,
                                     ..Default::default()
@@ -8571,11 +7763,6 @@ async fn swarm_loop(
                                         deferred = true;
                                     }
                                     outcome => {
-                                        // NOTE (bd-8j7m): no busy-since clock
-                                        // exists in LoopModel, so exact_busy
-                                        // reads false here; the busy-turn arm
-                                        // of inspect_due is test-covered for
-                                        // the lane that tracks busy-since.
                                         let verdict =
                                             crate::write_liveness::decide(&outcome, false, &opts);
                                         if verdict
@@ -8609,7 +7796,7 @@ async fn swarm_loop(
                         reason,
                         attempts,
                     )
-                    .await; // cg6.2: soft — leaf failures logged inside
+                    .await;
                     any_work = true;
                 }
                 LoopAction::Reclaim {
@@ -8632,12 +7819,6 @@ async fn swarm_loop(
             }
         }
 
-        // work mode completion guard (bd-627z.1): an in-progress bead held by
-        // a LIVE agent must keep the loop alive — re-prompt it next poll.
-        // Stranded beads (assignee not live) do NOT block: they were reclaimed
-        // (re-opened to ready + re-dispatched) earlier this poll, so they are
-        // no longer in-progress — and a reclaim failure must not stall the
-        // batch forever (the loop resolves; the tracker owns strays).
         let inprogress_blocking = if params.work {
             match crate::elm::leaf::run_leaf_journaled(
                 &params.project,
@@ -8658,9 +7839,6 @@ async fn swarm_loop(
                     }
                 },
                 Err(e) => {
-                    // cg6.2: a leaf hiccup must not crash the completion
-                    // check — treat as blocking so the loop keeps polling.
-                    // bd-87hq: flag for the completion gate.
                     critical_leaf_failed_this_iter = true;
                     eprintln!("flywheel: poll_inprogress leaf failed (completion guard): {e}");
                     true
@@ -8670,42 +7848,15 @@ async fn swarm_loop(
             false
         };
 
-        // settled = no work was dispatched this iteration AND everyone idle/done.
-        // The states vector is pre-action, so an agent that just received the
-        // last queue item is still "idle" here — without the any_work guard the
-        // loop would declare "complete" while the swarm is mid-work.
         let all_settled = all_settled(&states);
 
-        // completion drain-grace (bd-bvwf.3): the condition must hold for
-        // grace+1 CONSECUTIVE polls. The first hold short-sleeps and loops
-        // once more — the re-source of `br ready` on that pass catches a bead
-        // whose dependency was released by the last closure (chain step), so
-        // the loop drives the WHOLE chain in one run instead of exiting
-        // between steps.
         let complete_now = queue.is_empty()
             && all_settled
             && !any_work
             && !inprogress_blocking
             && expected_replies.is_empty()
-            // bd-efk1: in work mode, a dispatched-but-unclaimed bead is OPEN
-            // WORK — the queue drained but the bead still sits in `br ready`.
-            // The old guard declared "complete" while the crew left beads
-            // unclaimed (bv in_progress_count = 0 despite working agents);
-            // the claim-watch must be EMPTY (every dispatched bead claimed
-            // AND closed, or re-dispatched) before the loop may exit. Only
-            // in work mode — non-work queues may hold arbitrary prompts.
-            // bd-gnej: wave-gated beads are OPEN WORK too — an earlier wave
-            // is still running; the loop must NOT declare complete while
-            // any wave-N bead is held (the wave-gate resolves on a later
-            // poll once the earlier wave closes).
             && (!params.work || (claim_watch.is_empty() && wave_held.is_empty()));
         if complete_now {
-            // bd-87hq: never certify completion on a poll that could not
-            // see the swarm/queue. The stale-checkpoint signature is EXACTLY
-            // "every critical leaf fails while the world looks empty" — the
-            // loop would exit "complete" having dispatched nothing (the
-            // reported symptom). Count consecutive blind iterations; abort
-            // loudly after the threshold with --force advice.
             blind_complete_failures = blind_completion_count(
                 complete_now,
                 critical_leaf_failed_this_iter,
@@ -8736,25 +7887,12 @@ async fn swarm_loop(
                 if complete_holds > params.drain_grace_polls {
                     return Ok("complete".to_string());
                 }
-                // grace pass: short wait (active cadence), then re-poll + re-source
                 wait_secs = params.active_interval_secs.clamp(5, 30);
             }
         } else {
             complete_holds = 0;
-            // bd-87hq: a visible/non-empty world resets the blind-failure count
             blind_complete_failures = 0;
 
-            // bd-bd79: renewal now happens BEFORE dispatch (above). The old
-            // post-dispatch heartbeat is removed to avoid double-renew and to
-            // honor the "before dispatch decisions" ordering. A missed renew is
-            // still recoverable next tick (idempotent) — the before-dispatch
-            // call is the single renewal point and is already checkpointed.
-
-            // Adaptive wait for the NEXT poll_events block. We already blocked
-            // inside poll_events for wait_secs (or woke early on events), so
-            // there is no trailing ctx.sleep — that would double the idle
-            // latency. Each leaf settles through the journal; crash mid-wait
-            // re-runs the leaf (fresh forward-only subscription — correct).
             wait_secs = next_interval_secs(
                 &states,
                 any_work,
@@ -8762,7 +7900,6 @@ async fn swarm_loop(
                 params.interval_secs,
                 params.active_interval_secs,
             );
-            // if events woke us, tighten the next wait so we re-sample promptly
             if !event_batch.events.is_empty() {
                 wait_secs = wait_secs.min(params.active_interval_secs).max(5);
             }
@@ -8773,34 +7910,12 @@ async fn swarm_loop(
 /// Register the durable functions and start (or resume) the loop invocation.
 /// Returns the workflow result; the process must stay alive while awaiting.
 pub async fn run_durable_loop(_cfg: &Config, mut params: LoopParams) -> anyhow::Result<String> {
-    // bd-flywheel-loop-substrate-ftpm: vendor-free runner — local durable
-    // liveness row (ActiveLoop) + pid-registry dead-owner sweep. No server,
-    // no worker/group anycast, no checkpoint replay.
-    // bd-0fvb: resolve the host authority once and pass it to the loop body.
     let authority = crate::authority::RuntimeAuthority::resolve();
 
-    // no vendor registration — plain async leaves, no worker/group.
-
-    // Resume semantics (bd-swarm-loop-durable-panic-atlo): resuming a pending
-    // invocation is OPT-IN via --resume. A pending promise at start belongs to
-    // a DEAD owner (the pid registry refuses two live loops), so an automatic
-    // resume replays a killed run's checkpoints against the current binary's
-    // leaf shapes — the serialization storm this bead fixes. Default: start
-    // FRESH and let the stale sweep reject the zombie; --resume replays it;
-    // --force starts fresh and rejects it explicitly (bd-e131 takeover).
-    // SDK 0.6.0 does not support version-based re-invocation, so ids change.
-    //
-    // bd-6si7: the host edge is the ONE place allowed to read the clock, and
-    // it reads it once, then hands the value down. Every leaf below is
-    // therefore a pure function of its arguments plus this stamp.
-    // bd-0fvb: stamped from the same authority instance that was injected.
     let now_nanos = authority.clock.now_nanos();
     let prior = crate::state::load_active_loop(&params.project)?;
-    // Local liveness row: a stored ActiveLoop id means a prior invocation exists.
-    // No server query — the pid registry decides live vs dead below.
     let prior_pending = prior.is_some();
     let start = loop_start_decision(prior_pending, params.force, params.resume);
-    // `params.resume` records whether this run resumed; no checkpoint replay exists.
     params.resume = start == LoopStart::Resume;
     let id = match (start, prior) {
         (LoopStart::Resume, Some(al)) => {
@@ -8837,9 +7952,6 @@ pub async fn run_durable_loop(_cfg: &Config, mut params: LoopParams) -> anyhow::
         )?,
     };
 
-    // Dead-owner sweep over local rows (no server): select stale row ids
-    // with the same prefix rule, then drop a dead pid entry.
-    // Keeps `stale_loop_reject_ids`/`id_is_project_loop` live on rows.
     {
         let base = params.project.rsplit('/').next().unwrap_or(&params.project);
         let (_schema, loops) =
@@ -8854,13 +7966,8 @@ pub async fn run_durable_loop(_cfg: &Config, mut params: LoopParams) -> anyhow::
         }
     }
 
-    // bd-bvwf.4: verify ownership before the run — a newer process may
-    // have taken over the pid registry while this one resolved its
-    // invocation; the loser must never run it (two loops = double sends).
     crate::state::ensure_loop_owner(&params.project)?;
 
-    // Direct execution: no worker, no replay, no stop handle.
-    // Process exit + dead-owner sweep is the stop path.
     params.invocation = id.clone();
     let result: String = swarm_loop(authority, params)
         .await
@@ -8882,9 +7989,6 @@ fn fresh_loop_id(
     prefix: &str,
     now_nanos: u128,
 ) -> anyhow::Result<String> {
-    // bd-6si7: the clock is an INJECTED value, not a sample taken here. The
-    // host edge resolves the authority and hands the leaf the stamp; a leaf
-    // that reads the clock itself is un-replayable and un-substitutable.
     let id_project = project.rsplit('/').next().unwrap_or(project);
     let fresh = format!("{prefix}:{id_project}:{now_nanos}");
     crate::state::save_active_loop(
@@ -8958,7 +8062,6 @@ fn stale_loop_reject_ids<'a>(ids: &[&'a str], base: &str, except: Option<&str>) 
 pub async fn run_engine_loop(cfg: &Config, params: LoopParams) -> anyhow::Result<String> {
     run_durable_loop(cfg, params).await
 }
-// Local liveness row (ActiveLoop) is the pending record — no server query.
 /// bd-gny, re-pointed at rows (bd-flywheel-loop-substrate-ftpm): verdict over
 /// the LOCAL liveness row + loop-process liveness. The row is written at loop
 /// start and stays until the next run replaces it; only the pid registry can
@@ -8994,9 +8097,6 @@ pub async fn loop_status(_cfg: &Config, project: &str) -> anyhow::Result<serde_j
         "started_at": pid_entry.as_ref().map(|e| e.started_at.clone()),
         "mail_degraded": al.mail_degraded,
         "mail_health": al.mail_health,
-        // ADR-0010 D10: the per-bead phase / queue / watermark projection the
-        // delivery-verdict status doors render (same source as the fleet
-        // snapshot's `loop` section).
         "loop": LoopSnapshot::from_active_loop(&al),
     }))
 }
@@ -9019,7 +8119,6 @@ fn is_loop_invocation(id: &str) -> bool {
 /// orphaned pid entries. A failed check is recorded in the report, never a
 /// hard error — the doctor must diagnose a broken stack, not fail on it.
 pub async fn loop_doctor(_cfg: &Config, fix: bool) -> anyhow::Result<serde_json::Value> {
-    // (1) the store the loop actually runs on, not a vendor server.
     let engine_store = match crate::daemon::durable_capability_probe() {
         Ok(()) => json!({"ok": true, "error": null}),
         Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
@@ -9028,7 +8127,6 @@ pub async fn loop_doctor(_cfg: &Config, fix: bool) -> anyhow::Result<serde_json:
     let pids = crate::state::load_loop_pids();
     let (_schema, loops) = crate::state::load_loops_registry()?;
 
-    // (2) stale rows — a stored invocation with no live owner.
     let mut stale_ids: Vec<String> = Vec::new();
     let mut registry: Vec<serde_json::Value> = Vec::new();
     for (project, al) in &loops {
@@ -9049,7 +8147,6 @@ pub async fn loop_doctor(_cfg: &Config, fix: bool) -> anyhow::Result<serde_json:
     }
     stale_ids.sort();
 
-    // (3) orphaned loop PIDs — registry entries whose process is dead.
     let mut orphaned: Vec<serde_json::Value> = Vec::new();
     let mut pruned: Vec<String> = Vec::new();
     for (project, e) in &pids {
@@ -9150,8 +8247,6 @@ pub fn route_event(
     dispatch_pending: &mut std::collections::HashSet<String>,
 ) -> Option<LoopAction> {
     let name = name_for_pane(states, &ev.pane_id).or_else(|| {
-        // fallback: single-agent swarm with empty pane_id map — match by kind
-        // only when exactly one agent shares the event's agent field
         let kind = ev.agent.as_deref()?;
         let matches: Vec<_> = states.iter().filter(|s| s.kind == kind).collect();
         if matches.len() == 1 {
@@ -9167,22 +8262,18 @@ pub fn route_event(
             let name = name?;
             match status {
                 "working" => {
-                    // landing confirmed — clear pending so next done can redispatch
                     dispatch_pending.remove(&name);
                     None
                 }
                 "blocked" => Some(LoopAction::Blocked { name }),
                 "done" | "idle" => {
                     if dispatch_pending.contains(&name) {
-                        // flutter: already dispatched, wait for working
                         return None;
                     }
                     if queue.is_empty() {
                         return None;
                     }
                     let text = queue.remove(0);
-                    // bd-pin-public-plane-s-easy.2: {AGENT_NAME} is the pin
-                    // when the state knows it, else the hc name.
                     let display = states
                         .iter()
                         .find(|s| s.name == name)
@@ -9196,12 +8287,10 @@ pub fn route_event(
             }
         }
         "pane.agent_detected" => {
-            // new agent available — dispatch if free and queue non-empty
             let name = name?;
             if dispatch_pending.contains(&name) || queue.is_empty() {
                 return None;
             }
-            // only if not already working
             if status == "working" {
                 return None;
             }
@@ -9218,8 +8307,6 @@ pub fn route_event(
         "pane.exited" => {
             let name = name.unwrap_or_else(|| format!("pane:{}", ev.pane_id));
             dispatch_pending.remove(&name);
-            // Diagnose immediately on exit (bd-event-self-heal subtask 4);
-            // the heal state machine escalates to Respawn next tick if needed.
             Some(LoopAction::Diagnose {
                 name,
                 reason: "pane_exited".into(),
@@ -9429,7 +8516,6 @@ mod dispatch_guard_tests {
     #[test]
     fn classify_reads_real_thread_shapes() {
         use GuardSignalKind::*;
-        // Real shapes from the W4/W7/oqe6 incidents + standard reports.
         assert_eq!(
             classify_guard_signal(
                 "[bd-adr22-w4-steer-engine-w69z] starting — steer durable-rail survey + plan",
@@ -9507,7 +8593,6 @@ mod dispatch_guard_tests {
     #[test]
     fn done_hold_is_the_bead_tag_not_the_subject() {
         use GuardSignalKind::*;
-        // Tag present, arbitrary subject (even a participle): hold fires.
         for subject in [
             "[bd-x] done",
             "[bd-123] done investigating",
@@ -9521,7 +8606,6 @@ mod dispatch_guard_tests {
                 "bead tag fires the hold regardless of subject {subject:?}"
             );
         }
-        // Tag absent, canonical `] done` subjects: hold does NOT fire.
         for subject in ["[bd-x] done", "Re: [bd-x] done", "[bd-x] done."] {
             assert_eq!(
                 classify_guard_signal(subject, "**status**: closed", None),
@@ -9557,10 +8641,8 @@ mod dispatch_guard_tests {
             signals: vec![sig(900 * MIN, GuardSignalKind::Announce)],
             receipts_fresh_us: None,
         };
-        // Announce at t=900: fresh at now=901 (within TTL) → hold …
         let hold = eval_dispatch_guard(&facts, 901 * MIN, DISPATCH_GUARD_TTL_US);
         assert!(hold.is_err(), "fresh announce must hold");
-        // … stale at now=900+TTL+1 → dispatch, and repeat-identical.
         let ttl_min = DISPATCH_GUARD_TTL_US / (60 * 1_000_000);
         let late = (900 + ttl_min + 1) * MIN;
         assert!(
@@ -9666,8 +8748,6 @@ mod dispatch_guard_tests {
 #[cfg(test)]
 mod tests {
 
-    // ---- W7 (§3.7 T4): delegated composition gates (bd-adr22-w7) ----
-
     const W7_CATALOG: &[crate::decide::CatalogEntry] = &[
         ("nightly-fence", Some("run the verify fence nightly")),
         ("weekly-review", Some("review the week and land beads")),
@@ -9683,7 +8763,6 @@ mod tests {
     #[test]
     fn w7_allowlist_deny_never_dispatches() {
         let allow = vec!["SandySparrow".to_string()];
-        // Allowed sender on an uncovered objective -> candidate.
         assert!(matches!(
             plan_compose_request(
                 "SandySparrow",
@@ -9693,7 +8772,6 @@ mod tests {
             ),
             ComposeRequestOutcome::CandidateForApproval { .. }
         ));
-        // Same body from a NON-allowlisted sender -> Denied, full stop.
         assert_eq!(
             plan_compose_request(
                 "SomeImpostor",
@@ -9703,7 +8781,6 @@ mod tests {
             ),
             ComposeRequestOutcome::Denied
         );
-        // Even garbage/unparseable bodies stay Denied for outsiders.
         assert_eq!(
             plan_compose_request("SomeImpostor", "not json at all", &allow, W7_CATALOG),
             ComposeRequestOutcome::Denied
@@ -9715,7 +8792,6 @@ mod tests {
     #[test]
     fn w7_coverage_miss_renders_for_approval_hit_names_workflow() {
         let allow = vec!["SandySparrow".to_string()];
-        // MISS: uncovered objective -> approval-required candidate.
         let miss = plan_compose_request(
             "SandySparrow",
             &w7_spec_json("adversarial review of the parser module"),
@@ -9733,7 +8809,6 @@ mod tests {
             prompt.contains("never auto-runs"),
             "W7 approval contract explicit: {prompt}"
         );
-        // HIT: covered objective -> guidance naming the workflow.
         let hit = plan_compose_request(
             "SandySparrow",
             &w7_spec_json("run the verify fence for me"),
@@ -9797,20 +8872,16 @@ mod tests {
             st_pin("flywheel-aseq-oc2", "idle", "TanFern"),
             st("flywheel-aseq-oc", "done"),
         ];
-        // direct terminal name still matches
         assert_eq!(
             match_expected_agent("p", &states, "flywheel-aseq-oc").map(|s| s.name.as_str()),
             Some("flywheel-aseq-oc")
         );
-        // pin-keyed expectation matches via the state's pinned identity
         assert_eq!(
             match_expected_agent("p", &states, "TanFern").map(|s| s.name.as_str()),
             Some("flywheel-aseq-oc2")
         );
-        // unknown identity → no match (stale expectation)
         assert!(match_expected_agent("p", &states, "GhostPin").is_none());
 
-        // registry-pinned slug matches even when the state lacks the field
         let entries = vec![crate::state::SpawnEntry::with_mail_identity(
             "w:p9",
             "flywheel-aseq-gk",
@@ -9828,17 +8899,14 @@ mod tests {
 
     #[test]
     fn id_is_project_loop_matches_own_project_only() {
-        // swarm-loop:{base}:<ts>
         assert!(id_is_project_loop(
             "swarm-loop:toron:1786511691522556000",
             "toron"
         ));
-        // engine-loop variant: same base (last path segment) via fresh_loop_id
         assert!(id_is_project_loop(
             "engine-loop:toron:1786511691522556000",
             "toron"
         ));
-        // other project's invocations are NOT matched
         assert!(!id_is_project_loop(
             "swarm-loop:flywheel:1786511691522556000",
             "toron"
@@ -9847,8 +8915,6 @@ mod tests {
             "engine-loop:flywheel:1786511691522556000",
             "toron"
         ));
-        // prefix collision: base `toron` must NOT match a `toron-x` project
-        // (colon-delimited boundary)
         assert!(!id_is_project_loop(
             "swarm-loop:toron-x:1786511691522556000",
             "toron"
@@ -9857,8 +8923,6 @@ mod tests {
             "engine-loop:toron-x:1786511691522556000",
             "toron"
         ));
-        // child promises (durable-call results) carry a '.' — must NOT match
-        // (they belong to a live invocation's checkpoint tree, never cleared).
         assert!(!id_is_project_loop(
             "swarm-loop:toron:1786511691522556000.1",
             "toron"
@@ -9867,7 +8931,6 @@ mod tests {
             "swarm-loop:toron:1786511691522556000.2.3",
             "toron"
         ));
-        // non-loop promises are never matched
         assert!(!id_is_project_loop("cron:weekly-review", "toron"));
         assert!(!id_is_project_loop("wf-graph-fanout-1", "toron"));
     }
@@ -9924,7 +8987,6 @@ mod tests {
             "swarm-loop:flywheel:1786557202790124000.1",
             "engine-loop:flywheel:1786557202790124002",
         ];
-        // the invocation this run owns/resumes is preserved
         let rejected = stale_loop_reject_ids(
             &ids,
             "flywheel",
@@ -9937,7 +8999,6 @@ mod tests {
                 "engine-loop:flywheel:1786557202790124002"
             ]
         );
-        // no owned invocation: every stale root is a reject candidate
         let rejected = stale_loop_reject_ids(&ids, "flywheel", None);
         assert_eq!(
             rejected,
@@ -9947,7 +9008,6 @@ mod tests {
                 "engine-loop:flywheel:1786557202790124002"
             ]
         );
-        // foreign project + child (live checkpoint tree) never rejected
         let rejected = stale_loop_reject_ids(&ids, "toron", None);
         assert_eq!(rejected, vec!["swarm-loop:toron:1786512214561650000"]);
     }
@@ -10126,8 +9186,6 @@ mod tests {
 
     #[test]
     fn unknown_not_settled() {
-        // an unknown agent keeps the loop alive: the completion guard only
-        // matches idle|done
         let states = vec![st("a", "unknown")];
         assert!(!all_settled(&states));
         let settled = vec![st("a", "idle"), st("b", "done")];
@@ -10136,14 +9194,8 @@ mod tests {
 
     #[test]
     fn empty_swarm_is_settled() {
-        // An EMPTY state list is settled: the poll_swarm soft-fail (swarm
-        // killed / never spawned -> pass an empty Vec) settles the loop
-        // gracefully instead of crashing the durable invocation with
-        // "__poll failed". This is the invariant the soft-fail relies on.
         assert!(all_settled(&[][..]));
     }
-
-    // ---- bd-627z.1: stranded reclaim + scoped completion ----
 
     fn rb(id: &str, assignee: Option<&str>) -> ReadyBead {
         ReadyBead {
@@ -10185,8 +9237,6 @@ mod tests {
         }
     }
 
-    // ---- bd-gnej: wave-gate (wave-N label ordering) -----------------------
-
     /// A wave-2 bead is HELD while a wave-1 bead is open/in_progress —
     /// earlier waves run first; the loop waits (wave-gate, NOT a stuck
     /// owner).
@@ -10214,7 +9264,7 @@ mod tests {
         let ready = vec![
             rb("bd-a", None),
             rb("bd-b", None),
-            rb_wave("bd-c", 3), // labeled bead, but no earlier wave open
+            rb_wave("bd-c", 3),
         ];
         let inprog: Vec<ReadyBead> = Vec::new();
         let held = wave_gate_held(&ready, &inprog);
@@ -10253,8 +9303,6 @@ mod tests {
         assert_eq!(held, vec!["bd-w2", "bd-w3"], "{held:?}");
     }
 
-    // ---- ADR-0006 D2: wave-scoped dispatch (--wave-label) -----------------
-
     /// Labeled fixture: `--wave-label wave-2` selects EXACTLY the wave-2
     /// beads; wave-3/unlabeled siblings drop out. (Lower-wave OPEN beads
     /// blocking is asserted separately — this fixture is hold-free.)
@@ -10287,7 +9335,6 @@ mod tests {
     #[test]
     fn wave_scope_closed_lower_waves_do_not_block() {
         let ready = vec![rb_wave("bd-w3a", 3), rb_wave("bd-w3b", 3)];
-        // wave-1 + wave-2 already closed: they appear NOWHERE here.
         let inprog: Vec<ReadyBead> = Vec::new();
         let scoped = wave_scope_filter(&ready, &inprog, "wave-3").expect("earlier waves closed");
         let ids: Vec<&str> = scoped.iter().map(|b| b.id.as_str()).collect();
@@ -10337,8 +9384,6 @@ mod tests {
         assert_eq!(ids, vec!["bd-w2b"], "{ids:?}");
     }
 
-    // ---- bd-wave-gate-typed-authority-27et: typed wave is the authority ----
-
     /// Acceptance: the gate reads the TYPED `wave` field. A hold and a
     /// release driven by beads carrying NO `wave-N` label at all — the
     /// schema-18 shape. Proven red by making `bead_wave` label-only.
@@ -10352,13 +9397,11 @@ mod tests {
             vec!["bd-w3"],
             "typed wave 3 is held while typed wave 1 is open: {held:?}"
         );
-        // wave-1 closes: its row drops out of ready AND in_progress.
         let ready = vec![rb_typed("bd-w3", 3)];
         assert!(
             wave_gate_held(&ready, &inprog).is_empty(),
             "typed wave 3 releases when typed wave 1 closes"
         );
-        // An in-progress lower typed wave also holds.
         let inprog = vec![rb_typed("bd-w1", 1)];
         assert_eq!(wave_gate_held(&ready, &inprog), vec!["bd-w3"]);
     }
@@ -10409,10 +9452,10 @@ mod tests {
     fn stranded_beads_flag_non_live_assignees() {
         let live = vec!["oc".to_string(), "pi".to_string()];
         let inprog = vec![
-            rb("bd-1", Some("oc")),      // live — not stranded
-            rb("bd-2", Some("captain")), // non-live — stranded
-            rb("bd-3", Some("ghost")),   // dead agent — stranded
-            rb("bd-4", None),            // unowned — stranded (bd-qk9q: nobody holds it)
+            rb("bd-1", Some("oc")),
+            rb("bd-2", Some("captain")),
+            rb("bd-3", Some("ghost")),
+            rb("bd-4", None),
         ];
         let stranded = stranded_beads(&inprog, &live);
         let ids: Vec<&str> = stranded.iter().map(|b| b.id.as_str()).collect();
@@ -10458,9 +9501,9 @@ mod tests {
     fn blocking_inprogress_counts_live_and_unowned_only() {
         let live = vec!["oc".to_string()];
         let inprog = vec![
-            rb("bd-1", Some("oc")),      // live — blocks
-            rb("bd-2", Some("captain")), // stranded — does NOT block
-            rb("bd-3", None),            // unowned — blocks (tracker resolves)
+            rb("bd-1", Some("oc")),
+            rb("bd-2", Some("captain")),
+            rb("bd-3", None),
         ];
         let blocking = blocking_inprogress(&inprog, &live);
         let ids: Vec<&str> = blocking.iter().map(|b| b.id.as_str()).collect();
@@ -10510,42 +9553,36 @@ mod tests {
             live_panes: &live_panes,
             leased_beads: &leased,
         };
-        // live pane + hc-name assignee -> keep
         assert_eq!(
             reclaim_decision("bd-hc", Some("crew-x-coder"), &world),
             ReclaimDecision::Keep {
                 reason: ReclaimHold::LivePane
             }
         );
-        // live pane + pin assignee -> keep
         assert_eq!(
             reclaim_decision("bd-pin", Some("SilverPond"), &world),
             ReclaimDecision::Keep {
                 reason: ReclaimHold::LivePane
             }
         );
-        // dead pane -> reclaim
         assert_eq!(
             reclaim_decision("bd-dead", Some("SlateHerder"), &world),
             ReclaimDecision::Reclaim {
                 reason: ReclaimReason::DeadPane
             }
         );
-        // live lease -> keep even though the pane is dead
         assert_eq!(
             reclaim_decision("bd-lease", Some("SlateHerder"), &world),
             ReclaimDecision::Keep {
                 reason: ReclaimHold::LiveLease
             }
         );
-        // unowned, no lease -> reclaim (bd-qk9q)
         assert_eq!(
             reclaim_decision("bd-unowned", None, &world),
             ReclaimDecision::Reclaim {
                 reason: ReclaimReason::Unowned
             }
         );
-        // no pane evidence either way -> keep
         assert_eq!(
             reclaim_decision("bd-ghost", Some("ghost"), &world),
             ReclaimDecision::Keep {
@@ -10553,8 +9590,6 @@ mod tests {
             }
         );
     }
-
-    // ---- adaptive poll interval (bd-adaptive-interval) ----
 
     /// One row per cadence contract (base 300s, active 30s): settled states
     /// ride the base cadence, working/blocked/unknown are unsettled, and a
@@ -10596,17 +9631,12 @@ mod tests {
     /// settled 300s and dispatches the moment detection completes.
     #[test]
     fn next_interval_pending_work_with_unclassified_swarm_is_active() {
-        // empty poll (agents not yet in hc's agent.list)
         let empty = vec![];
         assert_eq!(next_interval_secs(&empty, false, true, 300, 30), 30);
-        // all-unknown poll
         let unknown = vec![st("a", "unknown"), st("b", "unknown")];
         assert_eq!(next_interval_secs(&unknown, false, true, 300, 30), 30);
-        // pending work + a CLASSIFIED idle agent → base cadence is fine
-        // (the dispatch this iteration already forces active via any_work)
         let idle = vec![st("a", "idle")];
         assert_eq!(next_interval_secs(&idle, false, true, 300, 30), 300);
-        // no pending work + empty swarm → settled base (nothing to do)
         assert_eq!(next_interval_secs(&empty, false, false, 300, 30), 300);
     }
 
@@ -10614,12 +9644,9 @@ mod tests {
     fn next_interval_clamps_to_interval_min() {
         let states = vec![st("a", "working")];
         assert_eq!(next_interval_secs(&states, false, false, 300, 2), 5);
-        // base below the floor also clamps
         let idle = vec![st("a", "idle")];
         assert_eq!(next_interval_secs(&idle, false, false, 3, 30), 5);
     }
-
-    // ---- send-stall escalation (bd-send-stall-escalation) ----
 
     fn so(landed: Option<bool>, reason: Option<&str>) -> SendOutcome {
         SendOutcome {
@@ -10674,7 +9701,6 @@ mod tests {
 
     #[test]
     fn escalate_stalled_below_cap_respawns() {
-        // 1st..3rd stall (0/1/2 prior failures) → respawn + requeue
         assert_eq!(
             escalate(&so(Some(false), Some("stalled")), 0),
             Escalation::RespawnAndRequeue
@@ -10691,7 +9717,6 @@ mod tests {
 
     #[test]
     fn escalate_stalled_at_cap_stops() {
-        // 4th consecutive stall (3 prior failures) → hard stop, no infinite loop
         assert_eq!(
             escalate(&so(Some(false), Some("stalled")), 3),
             Escalation::FailStop
@@ -10716,7 +9741,6 @@ mod tests {
 
     #[test]
     fn escalate_coded_error_respawns() {
-        // agent dropped mid-wait (agent_not_found) or any other hard error
         assert_eq!(
             escalate(&so(Some(false), Some("error:agent_not_found")), 0),
             Escalation::RespawnAndRequeue
@@ -10725,8 +9749,6 @@ mod tests {
 
     #[test]
     fn escalate_timeout_accepts() {
-        // ambiguous: the prompt may have started — verify next poll, never
-        // respawn, and never FailStop even with a large counter
         assert_eq!(
             escalate(&so(Some(false), Some("timeout")), 0),
             Escalation::Accept
@@ -10747,7 +9769,6 @@ mod tests {
 
     #[test]
     fn escalate_blocked_accepts() {
-        // blocked is a valid landing — the --on-blocked policy owns it
         let mut o = so(Some(true), Some("landed"));
         o.status = Some("blocked".to_string());
         assert_eq!(escalate(&o, 0), Escalation::Accept);
@@ -10755,7 +9776,6 @@ mod tests {
 
     #[test]
     fn escalate_no_verdict_accepts() {
-        // legacy fire-and-forget path (confirm=false): no landing info at all
         assert_eq!(escalate(&so(None, None), 0), Escalation::Accept);
     }
 
@@ -10770,7 +9790,6 @@ mod tests {
 
     #[test]
     fn handle_send_result_timeout_keeps_counter() {
-        // timeout is not a landing and not a failure — counter untouched
         let mut f: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         f.insert("a".to_string(), 2);
         let esc = handle_send_result(&mut f, "a", &so(Some(false), Some("timeout")));
@@ -10785,7 +9804,6 @@ mod tests {
         let esc = handle_send_result(&mut f, "a", &so(Some(false), Some("stalled")));
         assert_eq!(esc, Escalation::RespawnAndRequeue);
         assert_eq!(f.get("a"), Some(&2), "stall must increment the counter");
-        // first failure on a clean agent starts at 1
         let mut g: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         handle_send_result(&mut g, "a", &so(Some(false), Some("error:agent_not_found")));
         assert_eq!(g.get("a"), Some(&1));
@@ -10793,8 +9811,6 @@ mod tests {
 
     #[test]
     fn handle_send_result_failstop_does_not_increment() {
-        // at the cap the loop stops — no further bookkeeping matters, but the
-        // counter must not grow past the cap
         let mut f: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         f.insert("a".to_string(), 3);
         let esc = handle_send_result(&mut f, "a", &so(Some(false), Some("stalled")));
@@ -10804,7 +9820,6 @@ mod tests {
 
     #[test]
     fn clear_live_failures_resets_working_and_blocked() {
-        // proof of life: a working/blocked agent is receiving prompts
         let mut f: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         f.insert("work".to_string(), 2);
         f.insert("block".to_string(), 1);
@@ -10822,8 +9837,6 @@ mod tests {
 
     #[test]
     fn clear_live_failures_keeps_absent_and_unknown() {
-        // an agent missing from the poll (hc dropped it) or unknown keeps
-        // its counter — no proof of life
         let mut f: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         f.insert("gone".to_string(), 1);
         f.insert("unk".to_string(), 1);
@@ -10857,9 +9870,6 @@ mod tests {
     #[test]
     fn resume_brief_carries_state_file_contract() {
         let p = resume_brief("bd-7", "finish the parser");
-        // the literal path pattern + the field; the name placeholder is
-        // substituted at dispatch (plan_actions) — the template must not
-        // hardcode any agent
         assert!(p.contains(".flywheel/agent-state/"));
         assert!(p.contains("context_pct"));
         assert!(p.contains("{AGENT_NAME}"));
@@ -10868,7 +9878,6 @@ mod tests {
 
     #[test]
     fn context_marker_detection() {
-        // the terminal-marker channel still exhausts on its own
         assert_eq!(
             context_verdict("...CONTEXT_LIMIT", None, 1_785_726_000),
             ContextVerdict::Exhausted
@@ -10885,7 +9894,6 @@ mod tests {
 
     #[test]
     fn context_verdict_fresh_file_exhausts_without_marker() {
-        // alt-screen case: terminal read shows nothing, file is fresh + hot
         let state = Some(AgentStateFile {
             context_pct: 85,
             ts: "2026-08-03T03:00:00Z".into(),
@@ -10898,7 +9906,6 @@ mod tests {
 
     #[test]
     fn context_verdict_stale_file_is_healthy() {
-        // a file from a previous session must never kill a healthy agent
         let state = Some(AgentStateFile {
             context_pct: 85,
             ts: "2026-08-03T03:00:00Z".into(),
@@ -10927,7 +9934,6 @@ mod tests {
             context_verdict("working fine", None, 1_785_726_000),
             ContextVerdict::Healthy
         );
-        // absent state file → identical to today's behavior
         assert_eq!(
             context_verdict("", None, 1_785_726_000),
             ContextVerdict::Healthy
@@ -10957,17 +9963,15 @@ mod tests {
 
     #[test]
     fn context_verdict_age_boundary() {
-        let ts = "2026-08-03T03:00:00Z"; // unix 1_785_726_000, max age 900s
+        let ts = "2026-08-03T03:00:00Z";
         let state = AgentStateFile {
             context_pct: 85,
             ts: ts.into(),
         };
-        // exactly 15 min old → fresh → exhausted
         assert_eq!(
             context_verdict("", Some(&state), 1_785_726_000 + 900),
             ContextVerdict::Exhausted
         );
-        // one second older → stale → healthy
         assert_eq!(
             context_verdict("", Some(&state), 1_785_726_000 + 901),
             ContextVerdict::Healthy
@@ -10991,7 +9995,6 @@ mod tests {
             serde_json::from_str(r#"{"terminal": "x", "state": null}"#).unwrap();
         let ro = parse_read_output(&null_state);
         assert_eq!(ro.state, None);
-        // legacy plain-text output (pre-zwa) tolerated via terminal field
         let missing: serde_json::Value = serde_json::from_str(r#"{"terminal": "y"}"#).unwrap();
         let ro = parse_read_output(&missing);
         assert_eq!(ro.state, None);
@@ -11076,8 +10079,6 @@ mod tests {
             );
         }
     }
-
-    // ---- lease renewal (bd-mail-lease-renewal-durable) ----
 
     /// Both brief variants carry the self-renew clause: agents renew their
     /// own reservations (the orchestrator cannot renew on their behalf).
@@ -11170,9 +10171,7 @@ mod tests {
     /// rejects in a row hard-stopped the supervisor.
     #[test]
     fn dispatch_cap_accounts_for_conditioning() {
-        // 1) template + the worst built-in preamble (coder 1550 B, with slack
-        //    for the skills prefix) now fits: the full brief is what dispatches.
-        let id = "bd-reclaim-liveness-not-spelling-hn8b"; // 37 chars, report shape
+        let id = "bd-reclaim-liveness-not-spelling-hn8b";
         let full = build_brief(id, "friction-report title", "proj", false).unwrap();
         assert!(!full.contains("OVER CAP"), "full brief, not the pointer");
         assert!(
@@ -11180,16 +10179,12 @@ mod tests {
             "brief {} bytes + worst preamble 1600 exceeds cap",
             full.len()
         );
-        // 2) with conditioning that cannot fit, the pointer form still fits
-        //    under the same preamble — the shape __send rebuilds on over-cap.
         let pointer = pointer_brief("bd-dispatch-cap-conditioning-l7jh", "proj", false);
         assert!(
             pointer.len() + 1600 <= DISPATCH_PROMPT_CAP,
             "pointer {} bytes + 1600 conditioning fits",
             pointer.len()
         );
-        // 3) one over-cap dispatch degrades the QUEUE entry instead of
-        //    dropping it — the loop survives (no reject, no fail-stop).
         let mut q: Vec<String> = Vec::new();
         let title = "y".repeat(DISPATCH_PROMPT_CAP);
         queue_brief(&mut q, id, &title, "proj", false, false);
@@ -11215,15 +10210,12 @@ mod tests {
         assert_eq!(lease_renew_seconds(300), 1200);
         assert_eq!(lease_renew_seconds(1000), 4000);
         assert_eq!(lease_renew_seconds(30), 120);
-        // below the 60s floor → floor
         assert_eq!(lease_renew_seconds(10), 60);
         assert_eq!(lease_renew_seconds(0), 60);
     }
 
     #[test]
     fn plan_actions_substitutes_agent_name_at_dispatch() {
-        // a queued brief carries {AGENT_NAME}; the idle agent's name
-        // replaces it when the Send action is built
         let queue = vec![brief("bd-12", "fix auth flow")];
         let states = vec![st("flywheel-proj-oc", "idle")];
         let actions = plan_actions(
@@ -11255,7 +10247,6 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
         );
-        // ADR-0001 Wave 3: the bead dispatch now carries a PinStamp first.
         match &actions[0] {
             LoopAction::PinStamp { .. } => {}
             other => panic!("expected PinStamp first, got {other:?}"),
@@ -11420,8 +10411,6 @@ mod tests {
             matches!(second, FloodGate::Proceed),
             "paused batch dispatches on the next poll (no repeat pause)"
         );
-        // One NEW id alone is below threshold and proceeds; a fresh
-        // flood-sized wave pauses again (the runaway signature).
         let (_, single) = flood_decide(t.clone(), &[rb("bd-runaway").id]);
         assert!(
             matches!(single, FloodGate::Proceed),
@@ -11506,7 +10495,6 @@ mod tests {
     /// deterministic owner), and non-bead prompts never stamp.
     #[test]
     fn plan_actions_pin_stamp_falls_back_and_skips_non_bead_prompts() {
-        // hc-name fallback for a bead brief with no registered pin.
         let queue = vec![brief("bd-13", "fallback owner")];
         let states = vec![st("flywheel-proj-oc", "idle")];
         let actions = plan_actions(
@@ -11543,7 +10531,6 @@ mod tests {
             "hc fallback stamps: {actions:?}"
         );
 
-        // A plain instruction is dispatched without any stamp.
         let plain_queue = vec!["run the nightly sweep".to_string()];
         let states_plain = vec![st("flywheel-proj-oc", "idle")];
         let plain_actions = plan_actions(
@@ -11633,8 +10620,6 @@ mod tests {
         else {
             panic!("expected Send, got {:?}", actions);
         };
-        // the survivor\u2019s dispatch path: send_prompt_argv carries the same
-        // text bar-for-bar (the engine path that used to mirror it is gone).
         let argv = send_prompt_argv(&SendArgs {
             project: "toron".into(),
             name: name.clone(),
@@ -11651,8 +10636,6 @@ mod tests {
         );
     }
 
-    // ---- loop-side mail wake (replaces per-agent peer-poll templates) ----
-
     fn digest(recent: usize, urgent: usize, from: &str, subj: &str) -> MailDigest {
         MailDigest {
             agent: "flywheel-proj-oc".into(),
@@ -11660,8 +10643,6 @@ mod tests {
             recent,
             urgent,
             plane_s: 0,
-            // bd-wake-id-contract-1jz1: fixture ids are hex event handles —
-            // the citation gate drops non-hex placeholders.
             last_id: (urgent > 0)
                 .then(|| format!("{:012x}", from.bytes().map(usize::from).sum::<usize>())),
             last_from: (!from.is_empty()).then(|| from.to_string()),
@@ -11763,7 +10744,6 @@ mod tests {
 
     #[test]
     fn plan_actions_wakes_idle_agent_on_urgent_mail_with_empty_queue() {
-        // idle + urgent mail + empty queue → wake prompt, not silent Wait
         let queue: Vec<String> = Vec::new();
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(1, 1, "PinkGorge", "[bd-1] help needed"));
@@ -11921,7 +10901,7 @@ mod tests {
     fn wake_banner_drops_unresolvable_ids() {
         let d = digest(1, 1, "PinkGorge", "[request-release] crates/toron-cli/**");
         let mut bad = d;
-        bad.last_id = Some("reservation-30078".into()); // non-hex: not an event id
+        bad.last_id = Some("reservation-30078".into());
         bad.thread_id = Some("thread-9844e931".into());
         let prompt = urgent_wake_prompt(&bad);
         assert!(!prompt.contains("Most recent urgent:"), "{prompt}");
@@ -11968,8 +10948,6 @@ mod tests {
             recent: 3,
             urgent: 1,
             plane_s: 0,
-            // The observed bug shape: last_id is the real message, while the
-            // sender field carries an npub.
             last_id: Some("994d117d53db".into()),
             last_from: Some(
                 "994d117d53db3b639f387f3686652cb6018325c403d633b933f6d19bf8c71d89".into(),
@@ -12063,7 +11041,6 @@ mod tests {
             !text.contains("--as flywheel-proj-oc"),
             "never fetch as the unregistered terminal name: {text}"
         );
-        // fallback: no mail_identity → the agent name
         let plain = urgent_wake_prompt(&digest(1, 1, "CoralFinch", "[assign] x"));
         assert!(plain.contains("--as flywheel-proj-oc --urgent"), "{plain}");
     }
@@ -12107,8 +11084,6 @@ mod tests {
 
     #[test]
     fn plan_actions_nudge_wins_over_urgent_wake_when_nudge_present() {
-        // nudge is orchestrator direction; a nudge beats the mail wake so the
-        // loop's own queue instruction takes precedence
         let queue: Vec<String> = Vec::new();
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(3, 2, "PinkGorge", "[bd-1] urgent"));
@@ -12226,9 +11201,6 @@ mod tests {
 
     #[test]
     fn plan_actions_suppresses_wake_for_already_woken_agent() {
-        // wake dedup: the same urgent message id must NOT re-wake an agent
-        // every iteration — the digest still prefixes prompts, but the
-        // MAIL WAKE trigger is suppressed.
         let queue: Vec<String> = Vec::new();
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(1, 1, "PinkGorge", "[bd-1] help"));
@@ -12272,7 +11244,6 @@ mod tests {
 
     #[test]
     fn plan_actions_unsuppressed_wake_still_fires_for_new_urgent_id() {
-        // a NEW urgent message id (not in woken_for) wakes as before
         let queue: Vec<String> = Vec::new();
         let states = vec![st("flywheel-proj-oc", "idle")];
         let d = digest_map(digest(1, 1, "PinkGorge", "[bd-1] new help"));
@@ -12313,7 +11284,6 @@ mod tests {
 
     #[test]
     fn plan_actions_working_agent_ignores_mail_digest() {
-        // a working agent is busy; the digest is not for it this tick
         let queue = vec!["do the work".to_string()];
         let states = vec![st("flywheel-proj-oc", "working")];
         let d = digest_map(digest(5, 1, "PinkGorge", "[bd-1] input"));
@@ -12353,8 +11323,6 @@ mod tests {
             "queue must not be consumed by a working agent"
         );
     }
-
-    // ---- bd-efk1: crew-execution claim watchdog (pure surface) ----
 
     fn rb2(id: &str, title: &str) -> ReadyBead {
         ReadyBead {
@@ -12429,7 +11397,6 @@ mod tests {
             None,
             "nudges are not tracked"
         );
-        // an edge id with a colon in the title must stop at the first colon
         assert_eq!(
             bead_id_from_prompt("GOAL Execute bd-x: title: with colon."),
             Some("bd-x")
@@ -12444,9 +11411,6 @@ mod tests {
             "explicit claim command: {p}"
         );
         assert!(p.contains("bd-12"), "names the bead");
-        // bd-pin-public-plane-s-easy.5: claim --actor is the PIN — the pane
-        // env sets AGENT_NAME=<pin> at spawn, so $AGENT_NAME expands to the
-        // pin the agent claims as (never the hc slug).
         assert!(
             p.contains("--actor \"$AGENT_NAME\""),
             "claim as the pin via AGENT_NAME env: {p}"
@@ -12473,7 +11437,6 @@ mod tests {
         let inprogress = vec![];
         let states = vec![st("oc-1", "working")];
 
-        // below threshold: keep watching, no action
         let actions = claim_watch_step(
             &mut watch,
             &ready,
@@ -12486,7 +11449,6 @@ mod tests {
         assert!(actions.is_empty(), "no nudge before threshold: {actions:?}");
         assert_eq!(watch.get("bd-12").unwrap().unclaimed_polls, 1);
 
-        // at threshold: claim nudge to the dispatched agent
         let actions = claim_watch_step(
             &mut watch,
             &ready,
@@ -12504,7 +11466,6 @@ mod tests {
             }
             other => panic!("expected NudgeClaim, got {other:?}"),
         }
-        // counter resets after the nudge (next nudge needs a fresh window)
         assert_eq!(watch.get("bd-12").unwrap().unclaimed_polls, 0);
     }
 
@@ -12518,7 +11479,7 @@ mod tests {
         watch.insert("bd-12".into(), cw("oc-1"));
         let ready = vec![rb2("bd-12", "fix auth")];
         let inprogress = vec![];
-        let states = vec![st("oc-1", "idle")]; // settled, never claimed
+        let states = vec![st("oc-1", "idle")];
 
         let actions = claim_watch_step(
             &mut watch,
@@ -12552,9 +11513,8 @@ mod tests {
         watch.insert("bd-12".into(), cw("oc-1"));
         let ready = vec![];
         let inprogress = vec![rb_assignee("bd-12", "fix auth", "oc-1")];
-        let states = vec![st("oc-1", "done")]; // claimed but never closed
+        let states = vec![st("oc-1", "done")];
 
-        // first poll: close nudge once
         let actions = claim_watch_step(
             &mut watch,
             &ready,
@@ -12579,7 +11539,6 @@ mod tests {
         }
         assert!(watch.get("bd-12").unwrap().close_nudged);
 
-        // still unclosed: polls accumulate (no repeated nudge)
         let actions = claim_watch_step(
             &mut watch,
             &ready,
@@ -12591,7 +11550,6 @@ mod tests {
         );
         assert!(actions.is_empty(), "no repeat close nudge: {actions:?}");
 
-        // past the threshold (nudge_after more polls): resume re-dispatch
         let actions = claim_watch_step(
             &mut watch,
             &ready,
@@ -12625,10 +11583,8 @@ mod tests {
         watch.insert("bd-12".into(), cw("oc-1"));
         let ready = vec![];
         let inprogress = vec![rb_assignee("bd-12", "fix auth", "oc-1")];
-        let states = vec![st("oc-1", "done")]; // claimed, settled, unclosed
+        let states = vec![st("oc-1", "done")];
 
-        // First poll: the close nudge fires — the assignee must close or
-        // reopen; the lease does not silence that escalation.
         let actions = claim_watch_step(
             &mut watch,
             &ready,
@@ -12644,8 +11600,6 @@ mod tests {
             "close nudge still fires: {actions:?}"
         );
 
-        // The bead is held by a live lease: every later poll is a hold —
-        // no RedispatchResume, watch retained, lease named as the reason.
         let live: HashSet<String> = HashSet::from(["bd-12".to_string()]);
         for i in 0..3 {
             let actions = claim_watch_step(
@@ -12669,7 +11623,6 @@ mod tests {
         );
         assert!(watch.contains_key("bd-12"), "kept watching");
 
-        // Lease lapsed: fresh countdown, then the resume re-dispatch.
         let actions = claim_watch_step(
             &mut watch,
             &ready,
@@ -12710,7 +11663,6 @@ mod tests {
         let ready = vec![rb2("bd-12", "fix auth")];
         let live: HashSet<String> = HashSet::from(["bd-12".to_string()]);
 
-        // settled without claim, lease live → hold
         let states = vec![st("oc-1", "idle")];
         let actions =
             claim_watch_step(&mut watch, &ready, &[], &states, 2, &empty_overlap(), &live);
@@ -12720,12 +11672,10 @@ mod tests {
         );
         assert_eq!(watch["bd-12"].wait_reason, Some(WaitReason::LiveLease));
 
-        // agent gone, lease still live → still hold
         let actions = claim_watch_step(&mut watch, &ready, &[], &[], 2, &empty_overlap(), &live);
         assert!(actions.is_empty(), "leash outlives the pane: {actions:?}");
         assert!(watch.contains_key("bd-12"));
 
-        // lease lapsed → the ordinary redispatch
         let actions = claim_watch_step(
             &mut watch,
             &ready,
@@ -12819,7 +11769,6 @@ mod tests {
             "{:?}",
             actions[0]
         );
-        // Second poll: the entry is gone — no re-fire.
         let actions = claim_watch_step(
             &mut watch,
             &[],
@@ -12859,8 +11808,6 @@ mod tests {
         assert!(watch.is_empty());
     }
 
-    // ---- ADR-0019 Spec 3: serialize-on-overlap + overlap wait reason ----
-
     /// bd-9tbb (leafReply): the loop body must NEVER consume a checkpointed
     /// board read — a replayed poll would read the STORED board
     /// and a stale always-serialize row would gate dispatch forever. The live
@@ -12871,8 +11818,6 @@ mod tests {
     fn board_reads_in_loop_body_are_live_not_checkpointed() {
         let src = std::fs::read_to_string(file!()).expect("durable.rs readable");
         let loop_start = src.find("async fn swarm_loop(").expect("swarm_loop exists");
-        // swarm_loop runs to the register block (run_durable_loop) — the
-        // whole region that must not re-consume a checkpointed board leaf.
         let loop_body = &src[loop_start..];
         let loop_end = loop_body
             .find("pub async fn run_durable_loop")
@@ -12910,7 +11855,6 @@ mod tests {
             .find("pub async fn run_durable_loop")
             .expect("run_durable_loop after swarm_loop");
         let body = &loop_body[..loop_end];
-        // Split needles so this test's own source cannot satisfy them.
         let pure_leaves = [
             ["poll", "_swarm,"].concat(),
             ["poll", "_xproj_inbox,"].concat(),
@@ -13013,8 +11957,6 @@ mod tests {
         let scan_end = src.find("#[cfg(test)]\nmod ").unwrap_or(src.len());
         let scan = &src[..scan_end];
         let mut cursor = 0usize;
-        // `#[function]` may carry other attributes before the signature, so
-        // search forward rather than assuming adjacency.
         while let Some(attr) = scan[cursor..].find("#[function]") {
             let after = cursor + attr + "#[function]".len();
             let Some(sig_off) = scan[after..].find("async fn ") else {
@@ -13031,7 +11973,6 @@ mod tests {
                 .next()
                 .unwrap_or("<unknown>")
                 .to_string();
-            // Body ends at the next column-0 `}`.
             let body_end = match scan[sig_line_end..].find("\n}") {
                 Some(p) => sig_line_end + p + 2,
                 None => break,
@@ -13078,7 +12019,6 @@ mod tests {
             Vec::<String>::new()
         );
 
-        // Attributes between `#[function]` and the signature must not hide it.
         let planted = "#[function]\n#[allow(clippy::too_many_arguments)]\nasync fn b_leaf(args: A) -> anyhow::Result<Value> {\n    let at = chrono::Utc::now();\n    Ok(json!(at))\n}\n";
         assert_eq!(
             ambient_clock_reads_in_durable_leaves(planted),
@@ -13101,10 +12041,6 @@ mod tests {
             );
         }
 
-        // The regression that made this guard lie. Braces inside string
-        // literals must not extend the body: a leaf whose last statement is
-        // `format!("{e}")` ends at its own `}`, and the clean leaf that follows
-        // must be scanned as its own body, not swallowed as a continuation.
         let tricky = concat!(
             "#[function]\n",
             "async fn d_leaf(args: A) -> anyhow::Result<Value> {\n",
@@ -13121,9 +12057,6 @@ mod tests {
             "string-literal braces must not extend a leaf body past its own closing brace"
         );
 
-        // A `#[function]` after a test module is out of scope: the SDK never
-        // registers it, and this module's own fixtures carry the attribute as
-        // text, which is how the first version scanned itself.
         let after_tests = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() { let _ = \"#[function]\\nasync fn phantom(a: A) -> anyhow::Result<Value> {\\n let _ = chrono::Utc::now();\\n\"; }\n}\n";
         assert_eq!(
             ambient_clock_reads_in_durable_leaves(after_tests),
@@ -13210,7 +12143,6 @@ mod tests {
             !waits.contains("bd-c"),
             "disjoint docs/** does not wait: {waits:?}"
         );
-        // a reason with no held rows never waits
         let waits = bead_overlap_waits(&held, &["bd-z".to_string()]);
         assert!(waits.is_empty());
     }
@@ -13226,7 +12158,6 @@ mod tests {
         let states = vec![st("oc-1", "working")];
         let overlap: std::collections::HashSet<String> =
             std::collections::HashSet::from(["bd-b".to_string()]);
-        // at/over the nudge threshold — still suppressed
         let actions = claim_watch_step(
             &mut watch,
             &ready,
@@ -13282,8 +12213,6 @@ mod tests {
         let mut watch: std::collections::HashMap<String, ClaimWatch> =
             std::collections::HashMap::new();
         watch.insert("bd-w2".into(), cw("oc-1"));
-        // the dispatched wave-2 bead is still unclaimed AND a wave-1 bead is
-        // open — the wave-gate holds it
         let ready = vec![rb_wave("bd-w1", 1), rb_wave("bd-w2", 2)];
         let states = vec![st("oc-1", "working")];
         let overlap: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -13317,7 +12246,6 @@ mod tests {
         let ready = vec![rb2("bd-a", "normal bead")];
         let states = vec![st("oc-1", "working")];
         let overlap: std::collections::HashSet<String> = std::collections::HashSet::new();
-        // nudge_after=1 → immediate claim nudge for the non-overlap bead
         let actions = claim_watch_step(
             &mut watch,
             &ready,
@@ -13352,8 +12280,6 @@ mod tests {
             !b.contains("worktree.create"),
             "no worktree-create call in the dispatch surface: {b}"
         );
-        // the preflight gate is the structural ban (operator opt-out exists,
-        // but never the default)
         assert!(crate::preflight::worktree_optout_legal(false, false));
         assert!(!crate::preflight::Mode::loop_work().allow_worktree);
     }
@@ -13407,8 +12333,6 @@ mod tests {
 
     #[test]
     fn params_active_interval_defaults_30_when_absent() {
-        // pre-yna saved params (loops.json) must still load: the active
-        // cadence defaults to 30, matching the pre-config balance
         let v: serde_json::Value = serde_json::json!({
             "project": "notetoself",
             "to": "all",
@@ -13423,19 +12347,12 @@ mod tests {
         });
         let back: LoopParams = serde_json::from_value(v).unwrap();
         assert_eq!(back.active_interval_secs, 30);
-        // ADR-0016: pre-field saved params load at the crate default — the
-        // tick reads params.pane_stall_secs, never process state.
         assert_eq!(back.pane_stall_secs, PANE_STALL_DEFAULT_SECS);
-        // ADR-0016: same honesty for the dispatch-guard TTL — pre-field
-        // params load at the crate default, and the guard leaf consumes the
-        // serialized value.
         assert_eq!(back.dispatch_guard_ttl_us, DISPATCH_GUARD_TTL_US);
     }
 
     #[test]
     fn params_confirm_defaults_true_when_absent() {
-        // pre-confirm saved params (loops.json) must still load: confirm_sends
-        // defaults to true, timeout to None (leaf default 45s).
         let v = serde_json::json!({
             "project": "legacy",
             "to": "all",
@@ -13474,7 +12391,6 @@ mod tests {
 
     #[test]
     fn send_prompt_argv_confirm_flag() {
-        // confirm + explicit timeout → `--confirm 45000`
         let args = SendArgs {
             project: "p".into(),
             name: "a".into(),
@@ -13500,7 +12416,6 @@ mod tests {
                 "3",
             ]
         );
-        // confirm + no timeout → bare `--confirm` (leaf applies its 45s default)
         let args_no_ms = SendArgs {
             project: "p".into(),
             name: "a".into(),
@@ -13525,7 +12440,6 @@ mod tests {
                 "3",
             ]
         );
-        // no confirm → legacy argv plus the registry flags
         let args_legacy = SendArgs {
             project: "p".into(),
             name: "a".into(),
@@ -13553,8 +12467,6 @@ mod tests {
 
     #[test]
     fn send_prompt_argv_omits_registry_flags_when_invocation_empty() {
-        // pre-registry params (empty invocation) → byte-identical to the
-        // legacy argv
         let args = SendArgs {
             project: "p".into(),
             name: "a".into(),
@@ -13606,7 +12518,6 @@ mod tests {
 
     #[test]
     fn send_outcome_parses_confirm_and_legacy_json() {
-        // confirm path: verdict present
         let v: SendOutcome = serde_json::from_str(
             r#"{"ok": true, "name": "a", "landed": true, "status": "working", "reason": "landed"}"#,
         )
@@ -13615,7 +12526,6 @@ mod tests {
         assert_eq!(v.status.as_deref(), Some("working"));
         assert_eq!(v.reason.as_deref(), Some("landed"));
 
-        // legacy path: no verdict fields → None defaults
         let legacy: SendOutcome = serde_json::from_str(r#"{"ok": true, "name": "a"}"#).unwrap();
         assert_eq!(legacy.landed, None);
         assert_eq!(legacy.reason, None);
@@ -13624,7 +12534,6 @@ mod tests {
 
     #[test]
     fn send_outcome_parses_deduped_flag() {
-        // the resume-dedup skip shape: landed with deduped:true
         let v: SendOutcome = serde_json::from_str(
             r#"{"ok": true, "name": "a", "landed": true, "status": null, "reason": "landed", "deduped": true}"#,
         )
@@ -13661,8 +12570,6 @@ mod tests {
 
     #[test]
     fn learn_kinds_keeps_previous_kind_when_poll_has_none() {
-        // an agent whose record was dropped disappears from the poll; a
-        // later poll with an empty kind must not clobber the learned one
         let mut kinds = std::collections::HashMap::new();
         kinds.insert("a".to_string(), "opencode".to_string());
         let states = vec![AgentState {
@@ -13687,8 +12594,6 @@ mod tests {
 
     #[test]
     fn agent_state_parses_kind_from_poll_entry() {
-        // __poll emits [name, status, kind]; kind must be parsed (and absent
-        // in legacy entries tolerated)
         let v: serde_json::Value = serde_json::from_str(r#"["a", "idle", "pi"]"#).unwrap();
         let s = parse_poll_entry(&v).unwrap();
         assert_eq!(s.name, "a");
@@ -13698,8 +12603,6 @@ mod tests {
         let s = parse_poll_entry(&legacy).unwrap();
         assert_eq!(s.kind, "");
     }
-
-    // ---- bd-event-subscribe-reactor: __poll_events batch parse ----
 
     #[test]
     fn parse_poll_events_batch_happy_path() {
@@ -13737,15 +12640,8 @@ mod tests {
         assert!(parse_poll_events_batch("{not json", 0).is_err());
     }
 
-    // ---- bd-87hq: producer→consumer leaf-shape pins ----
-    // Every test below feeds the EXACT JSON the leaf emitters in main.rs
-    // print into the durable.rs consumer parsers. A shape drift between the
-    // two (the reported symptom: every leaf "missing field name" / "expected
-    // a sequence" / "expected struct PollEventsBatch") fails these pins.
-
     #[test]
     fn leaf_shape_poll_entry_matches_emitter_array() {
-        // cmd_internal_poll emits [name, status, kind, pane_id] (4-tuples).
         let v: serde_json::Value =
             serde_json::from_str(r#"[["flywheel-toron-oc","working","opencode","w3H:p1"]]"#)
                 .unwrap();
@@ -13765,7 +12661,6 @@ mod tests {
 
     #[test]
     fn leaf_shape_ready_beads_matches_emitter() {
-        // cmd_internal_ready emits {"beads": [{"id","title"}]}.
         let v: serde_json::Value =
             serde_json::from_str(r#"{"beads":[{"id":"bd-25g7.2","title":"Engine cron path"}]}"#)
                 .unwrap();
@@ -13778,7 +12673,6 @@ mod tests {
 
     #[test]
     fn leaf_shape_inprogress_beads_matches_emitter() {
-        // cmd_internal_inprogress emits {"beads": [{"id","title","assignee"}]}.
         let v: serde_json::Value = serde_json::from_str(
             r#"{"beads":[{"id":"bd-25g7.2","title":"Engine cron path","assignee":"DustySparrow"}]}"#,
         )
@@ -13789,7 +12683,6 @@ mod tests {
 
     #[test]
     fn leaf_shape_expected_replies_matches_emitter() {
-        // __expected-replies emits {"entries": [{"agent","thread","head","created_ts"}]}.
         let v: serde_json::Value = serde_json::from_str(
             r#"{"entries":[{"agent":"flywheel-toron-oc","thread":"bd-1","head":"abc","created_ts":"2026-08-12T00:00:00Z"}]}"#,
         )
@@ -13812,15 +12705,10 @@ mod tests {
 
     #[test]
     fn blind_completion_count_accumulates_only_on_empty_and_failing() {
-        // Stale-checkpoint signature: empty world + failing leaves.
         assert_eq!(blind_completion_count(true, true, 0), 1);
         assert_eq!(blind_completion_count(true, true, 2), 3);
-        // A visible world (leaf ok) resets.
         assert_eq!(blind_completion_count(true, false, 2), 0);
-        // A non-empty world (completion not met) resets even on leaf failure.
         assert_eq!(blind_completion_count(false, true, 2), 0);
-        // Abort threshold: DEFAULT_LEAF_FAILURE_ABORT_POLLS consecutive
-        // blind iterations trip the abort (the loop body returns Err).
         const {
             assert!(
                 DEFAULT_LEAF_FAILURE_ABORT_POLLS >= 3,
@@ -13843,7 +12731,6 @@ mod tests {
             BlindCompletion::Continue
         );
         assert_eq!(blind_completion_outcome(true, t, t), BlindCompletion::Abort);
-        // stays abort beyond the threshold (no degrade storm)
         assert_eq!(
             blind_completion_outcome(true, t + 5, t),
             BlindCompletion::Abort
@@ -13866,7 +12753,6 @@ mod tests {
         assert_eq!(loop_start_decision(false, false, true), LoopStart::Fresh);
         assert_eq!(loop_start_decision(true, false, false), LoopStart::Fresh);
         assert_eq!(loop_start_decision(true, false, true), LoopStart::Resume);
-        // --force starts fresh and rejects the prior; it beats --resume
         assert_eq!(loop_start_decision(true, true, true), LoopStart::Fresh);
         assert_eq!(loop_start_decision(false, true, false), LoopStart::Fresh);
     }
@@ -13896,13 +12782,10 @@ mod tests {
     /// is swept while an open one is kept.
     #[test]
     fn resume_window_dedupes_and_respects_peer_holds() {
-        const W: u64 = RESUME_WINDOW_DEFAULT_SECS; // 900s
+        const W: u64 = RESUME_WINDOW_DEFAULT_SECS;
         let now = 10_000_000_000_000i64;
         let secs = |s: i64| now - s * 1_000_000;
 
-        // (1) window dedupe per (bead, pane). N passes over an unchanged bead
-        // resume at most once per window: the first pass resumes, every pass
-        // inside the window does not, and after the window it resumes again.
         assert!(
             should_resume_attempt(None, now, W, false, None),
             "never resumed → resume"
@@ -13918,7 +12801,6 @@ mod tests {
         );
         assert!(within_resume_window(Some(secs(60)), now, W));
 
-        // (2) a peer-held bead draws none, even with no prior resume.
         let reservations = vec![
             ("bd-peer".to_string(), "PeerPane".to_string()),
             ("bd-mine".to_string(), "MyPane".to_string()),
@@ -13960,8 +12842,6 @@ mod tests {
             vec!["src/main.rs".to_string()]
         );
         assert!(!file_blocks_bead("bd-1", &files, "", &[]));
-        // ADR-0019 D9: the notice names the other holder and the pattern.
-        // Own rows first: the pattern is our row's path, the holder theirs.
         assert_eq!(
             file_hold_notice("bd-1", &files, "Me", &[]),
             Some(("Other".to_string(), "src/**".to_string()))
@@ -13997,7 +12877,6 @@ mod tests {
             "peer-held → no resume"
         );
 
-        // (3) closed-reason leases are swept; an open-reason lease is kept.
         let leases = vec![
             ("src/a.rs".to_string(), "bd-closed".to_string()),
             ("src/b.rs".to_string(), "bd-open".to_string()),
@@ -14009,8 +12888,6 @@ mod tests {
             closed_reason_lease_ids(&leases, &closed),
             vec!["src/a.rs".to_string(), "docs/c.md".to_string()]
         );
-        // One pass later the closed leases are gone, so a second sweep is a
-        // no-op (idempotent) and the open lease is untouched.
         let after = vec![
             ("src/b.rs".to_string(), "bd-open".to_string()),
             ("src/d.rs".to_string(), String::new()),
@@ -14111,9 +12988,6 @@ mod tests {
             secs(60),
         )]);
 
-        // (1) acceptance: with every pane idle and a stalled bead whose holder
-        // maps to a pane, the next pass resumes EXACTLY that pane — one pick,
-        // naming the holder, with no send to the other idle pane.
         let live = pins(&["GreenStream", "AmberMarlin"]);
         let stalled = vec![bead("fx-stalled", Some("GreenStream"))];
         let plan = idle_pane_rotation(&IdleRotationInputs {
@@ -14140,7 +13014,6 @@ mod tests {
         );
         assert_eq!(plan.starved_after.get("GreenStream"), Some(&0));
 
-        // (2) two panes, two stalls: each takes its own, in fleet order.
         let two_stalls = vec![
             bead("fx-g", Some("GreenStream")),
             bead("fx-a", Some("AmberMarlin")),
@@ -14168,8 +13041,6 @@ mod tests {
             "each pane resumes its own stall — never another pane's"
         );
 
-        // (3) never a non-owner: a stalled bead owned by a THIRD live pane is
-        // handed to nobody, and a peer-held bead is skipped even when unowned.
         let live3 = pins(&["GreenStream", "AmberMarlin", "QuietHeron"]);
         let two_idle = pins(&["GreenStream", "AmberMarlin"]);
         let foreign = vec![bead("fx-hers", Some("QuietHeron"))];
@@ -14208,8 +13079,6 @@ mod tests {
             held.picks.is_empty(),
             "a peer-held bead draws no pick (lane split, not a stall)"
         );
-        // A READY bead assigned to another live pane is that pane's too — the
-        // ownership rule is not just about in-progress rows.
         let claimed = idle_pane_rotation(&IdleRotationInputs {
             live_pins: &live3,
             idle_pins: &two_idle,
@@ -14227,8 +13096,6 @@ mod tests {
             claimed.picks.is_empty(),
             "a ready bead assigned to a LIVE pane never moves to another pane"
         );
-        // …but an assignee that is NOT in the live fleet is an orphan claim:
-        // the pane may take that work.
         let orphaned = idle_pane_rotation(&IdleRotationInputs {
             live_pins: &live3,
             idle_pins: &two_idle,
@@ -14248,8 +13115,6 @@ mod tests {
             "an orphaned claim is free work, not somebody else's bead"
         );
 
-        // (4) free work fills an otherwise-unarmed pane — one unowned ready
-        // bead feeds ONE pane, and an already-queued bead is never re-queued.
         let fresh = vec![bead("fx-fresh", None)];
         let plan = idle_pane_rotation(&IdleRotationInputs {
             live_pins: &two_idle,
@@ -14289,8 +13154,6 @@ mod tests {
             "the queued bead is skipped; the pane's own stall still lands"
         );
 
-        // (5) the window still wins — for N starved passes. A pair inside the
-        // window defers, the counter climbs, and the Nth pass exempts it.
         let gated = |starved: &std::collections::BTreeMap<String, u32>| {
             idle_pane_rotation(&IdleRotationInputs {
                 live_pins: &live,
@@ -14306,7 +13169,6 @@ mod tests {
                 exempt_after_passes: IDLE_PANE_EXEMPT_AFTER_PASSES,
             })
         };
-        // A 0 budget means the window never gates an idle pane's own stall.
         let immediate = idle_pane_rotation(&IdleRotationInputs {
             live_pins: &live,
             idle_pins: &live,
@@ -14354,8 +13216,6 @@ mod tests {
     /// naming the pane and the error, and every un-judgeable shape stays quiet.
     #[test]
     fn pane_wedge_detected_and_paged() {
-        // The observed incident: opencode-go HTTP 400 / reasoning replay, the
-        // pane alive but parked on the error and no commit for 9000s.
         let wedge = PaneWedgeInputs {
             pin: "EmberOtter",
             pane_id: "w1:p1",
@@ -14379,13 +13239,11 @@ mod tests {
             }
             other => panic!("a simulated wedge must page: {other:?}"),
         }
-        // ONE page per wedge — every later pass of the same wedge is silent.
         assert_eq!(
             pane_wedge_action(&wedge, true),
             PaneWedgeAction::Hold,
             "never one page per pass"
         );
-        // A pane whose process exited is `recover`'s job, not a wedge.
         assert_eq!(
             pane_wedge_action(
                 &PaneWedgeInputs {
@@ -14396,7 +13254,6 @@ mod tests {
             ),
             PaneWedgeAction::Quiet
         );
-        // An inconclusive process probe never alarms.
         assert_eq!(
             pane_wedge_action(
                 &PaneWedgeInputs {
@@ -14407,7 +13264,6 @@ mod tests {
             ),
             PaneWedgeAction::Quiet
         );
-        // An unreadable pane is never judged.
         assert_eq!(
             pane_wedge_action(
                 &PaneWedgeInputs {
@@ -14418,8 +13274,6 @@ mod tests {
             ),
             PaneWedgeAction::Quiet
         );
-        // Output that merely SCROLLED PAST an error is not a parked wedge:
-        // the last line is ordinary work.
         assert_eq!(
             pane_wedge_action(
                 &PaneWedgeInputs {
@@ -14430,7 +13284,6 @@ mod tests {
             ),
             PaneWedgeAction::Quiet
         );
-        // A commit inside the window is movement.
         assert_eq!(
             pane_wedge_action(
                 &PaneWedgeInputs {
@@ -14441,7 +13294,6 @@ mod tests {
             ),
             PaneWedgeAction::Quiet
         );
-        // No commit history → never alarm blind.
         assert_eq!(
             pane_wedge_action(
                 &PaneWedgeInputs {
@@ -14452,8 +13304,6 @@ mod tests {
             ),
             PaneWedgeAction::Quiet
         );
-        // The parked-line recognizer is bounded and needs the marker on the
-        // LAST non-empty line.
         assert_eq!(parked_error_line("\n\n"), None);
         assert_eq!(parked_error_line("all good\n"), None);
         assert_eq!(
@@ -14475,12 +13325,10 @@ mod tests {
             stall_secs: 2_700,
             already_escalated: false,
         };
-        // First sighting: one escalation, naming the silent fleet.
         assert_eq!(
             dead_stop_action(&quiet),
             DeadStopAction::Escalate(DeadStopKind::SilentPanes)
         );
-        // Every following pass of the SAME stall is silent — not one page per pass.
         assert_eq!(
             dead_stop_action(&DeadStopInputs {
                 already_escalated: true,
@@ -14488,8 +13336,6 @@ mod tests {
             }),
             DeadStopAction::Hold
         );
-        // A recovering fleet (a commit inside the window) clears it — and a
-        // second stall after that escalates again.
         let recovered = DeadStopInputs {
             last_commit_age_secs: Some(10),
             already_escalated: true,
@@ -14503,7 +13349,6 @@ mod tests {
             }),
             DeadStopAction::Escalate(DeadStopKind::SilentPanes)
         );
-        // A pane that SAYS working but moved nothing is a stuck pane, not calm.
         assert_eq!(
             dead_stop_action(&DeadStopInputs {
                 any_pane_working: true,
@@ -14511,7 +13356,6 @@ mod tests {
             }),
             DeadStopAction::Escalate(DeadStopKind::StuckWorking)
         );
-        // No work left is never a stall.
         assert_eq!(
             dead_stop_action(&DeadStopInputs {
                 work_remaining: false,
@@ -14519,7 +13363,6 @@ mod tests {
             }),
             DeadStopAction::Clear
         );
-        // An unreadable fleet, or a repo with no commit history, is not judged.
         assert_eq!(
             dead_stop_action(&DeadStopInputs {
                 fleet_knowable: false,
@@ -14535,8 +13378,6 @@ mod tests {
             DeadStopAction::Wait
         );
     }
-
-    // ---- bd-event-dispatch-zero-latency: route_event ----
 
     #[test]
     fn route_event_done_dispatches_and_pops_queue() {
@@ -14568,7 +13409,6 @@ mod tests {
             &mut queue,
             &mut pending,
         );
-        // second done while pending → no redispatch
         let a2 = route_event(
             &states,
             &pev("pane.agent_status_changed", "%1", "done", 2),
@@ -14576,8 +13416,7 @@ mod tests {
             &mut pending,
         );
         assert!(a2.is_none());
-        assert_eq!(queue, vec!["p2".to_string()]); // only one pop
-        // working clears pending
+        assert_eq!(queue, vec!["p2".to_string()]);
         let a3 = route_event(
             &states,
             &pev("pane.agent_status_changed", "%1", "working", 3),
@@ -14586,7 +13425,6 @@ mod tests {
         );
         assert!(a3.is_none());
         assert!(!pending.contains("a"));
-        // now a fresh done can redispatch
         let a4 = route_event(
             &states,
             &pev("pane.agent_status_changed", "%1", "idle", 4),
@@ -14611,7 +13449,7 @@ mod tests {
             &mut pending,
         );
         assert!(matches!(b, Some(LoopAction::Blocked { name }) if name == "a"));
-        assert_eq!(queue.len(), 1); // blocked does not pop
+        assert_eq!(queue.len(), 1);
         let x = route_event(
             &states,
             &pev("pane.exited", "%1", "exited", 2),
@@ -14625,12 +13463,9 @@ mod tests {
         ));
     }
 
-    // ---- bd-event-self-heal-unknown: self_heal_step state machine ----
-
     #[test]
     fn self_heal_unknown_diagnose_then_respawn() {
         let mut hs = HealState::default();
-        // threshold 3: first two unknowns → None
         assert_eq!(
             self_heal_step(&mut hs, "unknown", false, 0, 3, 2),
             HealAction::None
@@ -14644,7 +13479,6 @@ mod tests {
             HealAction::Diagnose
         );
         assert!(hs.awaiting_clear);
-        // still unknown after diagnose → respawn
         assert_eq!(
             self_heal_step(&mut hs, "unknown", false, 0, 3, 2),
             HealAction::Respawn
@@ -14692,14 +13526,14 @@ mod tests {
         );
         assert_eq!(hs.unknown_count, 0);
         assert!(!hs.awaiting_clear);
-        assert_eq!(hs.respawn_count, 1); // budget preserved
+        assert_eq!(hs.respawn_count, 1);
     }
 
     #[test]
     fn self_heal_flicker_never_diagnoses() {
         let mut hs = HealState::default();
         self_heal_step(&mut hs, "unknown", false, 0, 3, 2);
-        self_heal_step(&mut hs, "idle", false, 0, 3, 2); // flicker reset
+        self_heal_step(&mut hs, "idle", false, 0, 3, 2);
         self_heal_step(&mut hs, "unknown", false, 0, 3, 2);
         assert_eq!(hs.unknown_count, 1);
         assert_eq!(
@@ -14714,8 +13548,6 @@ mod tests {
     #[test]
     fn self_heal_detect_grace_never_touches_young_unknown() {
         let mut hs = HealState::default();
-        // grace=6: six consecutive unknown polls all → None, no diagnose,
-        // no respawn (the working pane keeps working undisturbed)
         for _ in 0..6 {
             assert_eq!(
                 self_heal_step(&mut hs, "unknown", false, 6, 3, 2),
@@ -14724,13 +13556,11 @@ mod tests {
         }
         assert_eq!(hs.diagnose_count, 0);
         assert_eq!(hs.respawn_count, 0);
-        // once classification lands, the episode resets (still no heal)
         assert_eq!(
             self_heal_step(&mut hs, "working", false, 6, 3, 2),
             HealAction::None
         );
         assert_eq!(hs.unknown_count, 0);
-        // grace=0 preserves the old immediate ladder
         let mut old = HealState::default();
         assert_eq!(
             self_heal_step(&mut old, "unknown", false, 0, 3, 2),
@@ -14786,15 +13616,10 @@ mod tests {
         let s = parse_poll_entry(&v).unwrap();
         assert_eq!(s.pane_id, "%p1");
         assert_eq!(s.kind, "opencode");
-        // legacy 3-element still works
         let v2 = serde_json::json!(["b", "working", "pi"]);
         let s2 = parse_poll_entry(&v2).unwrap();
         assert_eq!(s2.pane_id, "");
     }
-
-    // ---- bd-test-event-poll-parity: decision-level differential ----
-    // Live hc session: tests/event_poll_parity.rs (#[ignore]).
-    // Pure tests prove plan_actions vs route_event agree on (agent, action, content).
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct DispatchRec {
@@ -14812,8 +13637,6 @@ mod tests {
                     content: text.clone(),
                 })
             }
-            // pin stamps are orchestrator-side tracker writes, not agent
-            // dispatches — no DispatchRec (nothing lands on a pane).
             LoopAction::PinStamp { .. } => None,
             LoopAction::Blocked { name } => Some(DispatchRec {
                 agent: name.clone(),
@@ -14899,11 +13722,7 @@ mod tests {
         assert_eq!(event.len(), 1);
         assert_eq!(event[0].kind, "diagnose");
         assert_eq!(event[0].content, "pane_exited");
-        // q.len() check now via next.queue
-        //
     }
-
-    // ---- bd-w4-events-primary-gt0e: events primary, poll = heartbeat ----
 
     /// The reaction-without-waiting timed test (unit form): a `done` event
     /// flips all_settled on the merged states — no snapshot needed. Before
@@ -14920,7 +13739,6 @@ mod tests {
             all_settled(&states),
             "event-asserted done must settle immediately"
         );
-        // The poll-confirms half: a fresh snapshot of the same world agrees.
         let confirmed = vec![st_pane("a", "done", "%1")];
         assert!(all_settled(&confirmed));
         assert_eq!(states, confirmed, "merged view == poll-confirmed view");
@@ -14953,7 +13771,6 @@ mod tests {
             &[pev("pane.agent_status_changed", "%99", "done", 1)],
         );
         assert_eq!(states[0].status, "working");
-        // empty pane id is never matched
         let mut states2 = vec![st_pane("a", "working", "%1")];
         apply_events_to_states(
             &mut states2,
@@ -14966,13 +13783,9 @@ mod tests {
     /// error (fallback), and at the heartbeat boundary.
     #[test]
     fn events_primary_snapshot_due_policy() {
-        // crash-resume / first iteration: no state yet -> always snapshot.
         assert!(snapshot_due(true, false, 0));
-        // mid-cadence with a healthy stream -> no snapshot (events assert).
         assert!(!snapshot_due(false, false, 3));
-        // heartbeat boundary -> snapshot confirms.
         assert!(snapshot_due(false, false, HEARTBEAT_POLL_EVERY));
-        // stream error -> snapshot fallback immediately.
         assert!(snapshot_due(false, true, 1));
     }
 
@@ -14987,9 +13800,6 @@ mod tests {
     #[test]
     fn close_path_releases_the_beads_reservations() {
         let loop_path = include_str!("durable.rs");
-        // Slice the CLOSED-bead arm: from its match arm to the next top-level
-        // fn, so the assertion cannot be satisfied by the leaf definition or
-        // the executor registration seen earlier in the file.
         let arm = loop_path
             .split("ClaimWatchAction::ReleaseReservations { bead_id } => {")
             .nth(1)
@@ -15001,8 +13811,6 @@ mod tests {
             arm.contains("__release-bead-locks"),
             "the open->closed arm must release the bead's reservations (bd-lob1)"
         );
-        // The leaf is the operator-signed door, and main.rs implements it via
-        // release_by_reason — not a per-holder release that would miss peers.
         assert!(
             loop_path.contains("\"__release-bead-locks\""),
             "the leaf must call the __release-bead-locks door"
@@ -15043,10 +13851,6 @@ mod tests {
             .split("#[cfg(test)]")
             .next()
             .expect("non-test source");
-        // Direct hc code coupling: module paths, client types, direct
-        // event construction. Each is a real call shape, so deleting the
-        // fence's target (an hc call) fails this test while renaming a
-        // prose mention does not.
         for denied in [
             "hc::",
             "crate::hc",
@@ -15077,8 +13881,6 @@ mod tests {
         );
     }
 
-    // ---- bd-bd79: lease renewal before dispatch (fake clock) ----
-
     fn bead_inprog(id: &str, assignee: &str) -> ReadyBead {
         ReadyBead {
             id: id.into(),
@@ -15095,7 +13897,6 @@ mod tests {
 
     #[test]
     fn renew_tick_renews_lease_near_expiry_fake_clock() {
-        // Fake clock: now = 1_000_000_000 us, lease expires in 100s (near), threshold 600s -> should renew
         let now: i64 = 1_000_000_000_000;
         let near_expiry: i64 = now + 100 * 1_000_000;
         let far_expiry: i64 = now + 2000 * 1_000_000;
@@ -15117,7 +13918,6 @@ mod tests {
         assert_eq!(to_renew.len(), 1, "only near-expiry lease qualifies");
         assert_eq!(to_renew[0].0, "src/durable.rs");
         assert_eq!(to_renew[0].1, "bd-renew-1");
-        // far lease not renewed
         assert!(
             !to_renew.iter().any(|(p, _)| p == "src/main.rs"),
             "far-expiry lease must not be renewed"
@@ -15160,9 +13960,7 @@ mod tests {
                 Some(now + 50 * 1_000_000),
             ),
         ];
-        // Only bd-renew-1 with live assignee GoldCove should be renewed
         let mut inprog = vec![bead_inprog("bd-renew-1", "GoldCove")];
-        // Add a bead with different assignee not live
         inprog.push(ReadyBead {
             id: "bd-other".into(),
             title: "other".into(),
@@ -15176,21 +13974,17 @@ mod tests {
         });
         let live = vec!["GoldCove".to_string()];
         let to_renew = leases_to_renew(&leases, &inprog, &live, now, 600);
-        // Only src/durable.rs should be renewed; src/unrelated.rs has non-live assignee, src/no-assignee shares same reason but would be renewed if we check only reason - but we correctly check live, so it is included actually.
-        // To test unrelated untouched, ensure bd-other not renewed because assignee not live, and any lease with reason not in in_progress not renewed.
         assert_eq!(
             to_renew.len(),
             2,
             "both leases with bd-renew-1 qualify (same reason, two paths) - but bd-other must not"
         );
-        // Ensure bd-other path not in result
         assert!(
             !to_renew
                 .iter()
                 .any(|(p, r)| p == "src/unrelated.rs" && r == "bd-other"),
             "unrelated lease with non-live assignee must be untouched"
         );
-        // Now test with simple helper (no expiry) - unrelated leases untouched
         let simple_leases = vec![
             ("src/durable.rs".to_string(), "bd-renew-1".to_string()),
             ("src/unrelated.rs".to_string(), "bd-unrelated".to_string()),
@@ -15223,7 +14017,6 @@ mod tests {
         }
         crate::assert_live_root_untouched(&proj);
         let _ = std::fs::remove_dir_all(&root);
-        // also routes through handle_ingress — fact_summary must be Some
         assert!(crate::ingress::fact_summary(&facts[0]).is_some());
         assert!(
             crate::ingress::fact_summary(&facts[0])
@@ -15236,7 +14029,6 @@ mod tests {
     fn facts_stall_detection_fires_and_suppresses() {
         let now = chrono::Utc::now().timestamp();
         let threshold = 1800;
-        // bead updated 1 hour ago, agent idle — should stall
         let old_bead = ReadyBead {
             id: "bd-stall-1".into(),
             title: "stall".into(),
@@ -15248,7 +14040,6 @@ mod tests {
             updated_at: Some((chrono::Utc::now() - chrono::Duration::seconds(3600)).to_rfc3339()),
             ..Default::default()
         };
-        // recent bead — should not stall
         let recent_bead = ReadyBead {
             id: "bd-stall-2".into(),
             title: "recent".into(),
@@ -15296,10 +14087,8 @@ mod tests {
             }
             other => panic!("expected PaneStalled, got {other:?}"),
         }
-        // recent bead should not stall (age < threshold)
         let stalled_recent = detect_stalled_panes(&[recent_bead], &states, now, threshold);
         assert!(stalled_recent.is_empty(), "recent bead must not stall");
-        // working agent should not stall even if old
         let working_states = vec![AgentState {
             name: "StallAgent".into(),
             status: "working".into(),
@@ -15378,7 +14167,6 @@ mod tests {
         );
         assert_eq!(classify_stall_reason("just idle no output"), "silent_idle");
         assert_eq!(classify_stall_reason(""), "silent_idle");
-        // precedence: rate_limit over network
         assert_eq!(
             classify_stall_reason("rate limit and timeout both present"),
             "rate_limit"
@@ -15391,7 +14179,6 @@ mod tests {
         let threshold = 1800;
         let watching = stall_watching_threshold_secs(threshold);
         assert_eq!(watching, 450, "watching is threshold/4");
-        // Bead age between watching and threshold -> watching
         let watching_bead = ReadyBead {
             id: "bd-watch".into(),
             title: "watching".into(),
@@ -15406,7 +14193,6 @@ mod tests {
             ),
             ..Default::default()
         };
-        // Bead age past threshold -> stalled
         let stalled_bead = ReadyBead {
             id: "bd-stalled".into(),
             title: "stalled".into(),
@@ -15439,7 +14225,6 @@ mod tests {
                 nudge_streak: 0,
             },
         ];
-        // watching bead should emit watching severity
         let watching_events = detect_stalled_panes_tiered(
             std::slice::from_ref(&watching_bead),
             &states,
@@ -15457,7 +14242,6 @@ mod tests {
             }
             other => panic!("expected PaneStalled watching, got {other:?}"),
         }
-        // stalled bead should emit stalled severity
         let stalled_events = detect_stalled_panes_tiered(
             std::slice::from_ref(&stalled_bead),
             &states,
@@ -15472,7 +14256,6 @@ mod tests {
             }
             other => panic!("expected stalled, got {other:?}"),
         }
-        // Both together: watching + stalled visible, ordered as input
         let both = detect_stalled_panes_tiered(
             &[watching_bead, stalled_bead],
             &states,
@@ -15481,8 +14264,6 @@ mod tests {
             watching,
         );
         assert_eq!(both.len(), 2);
-        // watching should be distinct from stalled — watching does NOT feed Diagnose
-        // (severity watching is the signal without Diagnose, stalled feeds Diagnose)
         let watching_count = both
             .iter()
             .filter(|e| matches!(e, IngressEvent::PaneStalled { severity, .. } if severity == "watching"))
@@ -15522,7 +14303,6 @@ mod tests {
             mail_identity: None,
             nudge_streak: 0,
         }];
-        // Evidence with rate_limit signature + secret — should classify rate_limit and redact
         let raw_tail = "some log line\nrate limit hit: 429 overloaded\nnsec1abc123 secret token=xyz\nfinal line";
         let events = detect_stalled_panes_with_evidence(
             &[old_bead],
@@ -15557,15 +14337,12 @@ mod tests {
 
     #[test]
     fn stall_redaction_truncates() {
-        // Last 40 lines + truncation at STALL_EVIDENCE_MAX_CHARS
         let many_lines: String = (0..100)
             .map(|i| format!("line {i} content here"))
             .collect::<Vec<_>>()
             .join("\n");
         let sanitized = sanitize_evidence_tail(&many_lines);
-        // Should keep only last 40 lines
         let line_count = sanitized.lines().count();
-        // truncated marker adds a line, so <= 41
         assert!(
             line_count <= STALL_EVIDENCE_TAIL_LINES + 1,
             "must keep last 40 lines, got {line_count}"
@@ -15578,7 +14355,6 @@ mod tests {
             sanitized.contains("line 99 content"),
             "latest line must be present"
         );
-        // Truncation at max chars
         let long_tail = "x".repeat(STALL_EVIDENCE_MAX_CHARS + 500);
         let sanitized_long = sanitize_evidence_tail(&long_tail);
         assert!(
@@ -15589,7 +14365,6 @@ mod tests {
             sanitized_long.chars().count() <= STALL_EVIDENCE_MAX_CHARS + "…(truncated)".len() + 1,
             "truncated length bounded"
         );
-        // Secret redaction
         let secret_raw = "here is a token=supersecret123 and more";
         let sanitized_secret = sanitize_evidence_tail(secret_raw);
         assert!(
@@ -15607,7 +14382,6 @@ mod tests {
 
     #[test]
     fn stall_one_read_per_detection_not_per_tick() {
-        // Verify the evidence_fn is called once per detection, not per tick for idle non-stalled.
         let now = chrono::Utc::now().timestamp();
         let threshold = 1800;
         let watching = stall_watching_threshold_secs(threshold);
@@ -15670,7 +14444,6 @@ mod tests {
             },
         );
         assert_eq!(read_count, 0, "no read when not crossing tier");
-        // Watching tier also triggers one read
         let watching_bead = ReadyBead {
             id: "bd-watch2".into(),
             title: "watch".into(),
@@ -15719,25 +14492,19 @@ mod resume_dedup_tests {
 
     #[test]
     fn should_resend_matrix() {
-        // no record -> never sent -> resend
         assert!(should_resend(None, "inv-1"));
-        // landed, same invocation -> delivered; skip
         assert!(!should_resend(
             Some(&rec("a", 1, "inv-1", true, false)),
             "inv-1"
         ));
-        // unlanded, same invocation -> crashed mid-flight; resend
         assert!(should_resend(
             Some(&rec("a", 1, "inv-1", false, false)),
             "inv-1"
         ));
-        // cg6.5: ambiguous (timeout-confirm), same invocation -> may be
-        // mid-flight; NEVER re-delegate
         assert!(!should_resend(
             Some(&rec("a", 1, "inv-1", false, true)),
             "inv-1"
         ));
-        // any record from ANOTHER invocation -> fresh run re-delegates
         assert!(should_resend(
             Some(&rec("a", 1, "inv-0", true, false)),
             "inv-1"
@@ -15765,8 +14532,6 @@ mod resume_dedup_tests {
 
     #[test]
     fn keep_landed_record_clears_stale_for_idle_or_done() {
-        // THE FIX (bd-dedup-stale): landed + same invocation + IDLE/DONE agent
-        // => the prior dispatch stalled => clear (re-dispatchable).
         assert!(!keep_landed_record(
             &rec("a", 1, "inv-1", true, false),
             "inv-1",
@@ -15781,7 +14546,6 @@ mod resume_dedup_tests {
 
     #[test]
     fn keep_landed_record_preserves_in_flight() {
-        // landed + WORKING/BLOCKED/UNKNOWN => in flight => keep (crash-resume dedup intact)
         assert!(keep_landed_record(
             &rec("a", 1, "inv-1", true, false),
             "inv-1",
@@ -15801,19 +14565,16 @@ mod resume_dedup_tests {
 
     #[test]
     fn keep_landed_record_keeps_non_stale_cases() {
-        // landed + DIFFERENT invocation => keep (fresh run re-delegates)
         assert!(keep_landed_record(
             &rec("a", 1, "inv-0", true, false),
             "inv-1",
             &[st("a", "idle")]
         ));
-        // unlanded => keep (mid-flight resend path)
         assert!(keep_landed_record(
             &rec("a", 1, "inv-1", false, false),
             "inv-1",
             &[st("a", "idle")]
         ));
-        // landed + agent absent from the poll => conservative keep
         assert!(keep_landed_record(
             &rec("a", 1, "inv-1", true, false),
             "inv-1",
@@ -15823,8 +14584,6 @@ mod resume_dedup_tests {
 
     #[test]
     fn should_resend_degrades_without_confirmation() {
-        // pre-confirm loops recorded nothing (or unlanded): resend = today
-        // (the fn docstring promises the guard degrades to re-sending)
         assert!(should_resend(None, "inv-1"));
         assert!(should_resend(
             Some(&rec("a", 1, "inv-1", false, false)),
@@ -15832,24 +14591,19 @@ mod resume_dedup_tests {
         ));
     }
 
-    // ---- escalation tiers (bd-blocked-escalation-protocol) ----
-
     #[test]
     fn escalation_starts_at_t0() {
-        // first detection: elapsed < 2 intervals -> T0
         assert_eq!(
             escalation_tier(1_000_000, 1_000_000, 30),
             EscalationTier::T0
         );
-        // just under 2 intervals
         assert_eq!(escalation_tier(0, 59_999_999, 30), EscalationTier::T0);
     }
 
     #[test]
     fn escalation_advances_by_interval_multiple() {
-        let i = 30; // seconds
+        let i = 30;
         let us = |secs: i64| secs * 1_000_000;
-        // T1 at 2x, T2 at 4x, T3 at 8x interval
         assert_eq!(escalation_tier(0, us(60), i), EscalationTier::T1);
         assert_eq!(escalation_tier(0, us(119), i), EscalationTier::T1);
         assert_eq!(escalation_tier(0, us(120), i), EscalationTier::T2);
@@ -15859,19 +14613,14 @@ mod resume_dedup_tests {
 
     #[test]
     fn escalation_is_deterministic_and_bounded() {
-        // same inputs -> same tier (crash-resume continues at the right tier)
         let a = escalation_tier(0, 120_000_000, 30);
         let b = escalation_tier(0, 120_000_000, 30);
         assert_eq!(a, b);
-        // never exceeds T3 (bounded, not infinite spin)
         assert_eq!(escalation_tier(0, i64::MAX, 30), EscalationTier::T3);
     }
 
     #[test]
     fn heal_states_deterministic() {
-        // migrate-flywheel step 6: heal_states iteration must not depend on
-        // insertion order, or same-log-same-effects breaks. BTreeMap keeps
-        // keys sorted; a HashMap here would make command order flaky.
         let mut a = LoopModel::default();
         a.heal_states
             .insert("zebra".to_string(), HealState::default());
@@ -15897,29 +14646,23 @@ mod resume_dedup_tests {
     #[test]
     fn blocked_t3_halts_loop_mail_mode_only() {
         use EscalationTier::*;
-        // mail mode: only T3 halts
         assert_eq!(on_blocked_tier_exit(T0, "mail"), None);
         assert_eq!(on_blocked_tier_exit(T1, "mail"), None);
         assert_eq!(on_blocked_tier_exit(T2, "mail"), None);
         let halt = on_blocked_tier_exit(T3, "mail");
         assert!(halt.is_some());
         assert!(halt.unwrap().contains("T3"));
-        // stop mode: halts at ANY tier (existing --on-blocked stop semantics)
         for t in [T0, T1, T2, T3] {
             assert!(
                 on_blocked_tier_exit(t, "stop").is_some(),
                 "stop must halt at {t:?}"
             );
         }
-        // continue mode: never halts
         for t in [T0, T1, T2, T3] {
             assert_eq!(on_blocked_tier_exit(t, "continue"), None);
         }
-        // unknown mode string: never halts (defensive)
         assert_eq!(on_blocked_tier_exit(T3, "whatever"), None);
     }
-
-    // ---- cg6.1: escalation state machine lives in the notify_blocked leaf ----
 
     /// Serializes the cg6.1 persistence tests AND makes them hermetic
     /// (193.2): the REAL state dir is shared with production loops and
@@ -15956,17 +14699,11 @@ mod resume_dedup_tests {
             last_ping_tier: None,
             last_tail: String::new(),
         };
-        // fresh: T0 + count 1 + mail
         assert_eq!(escalation_step(&mut st, us(30), i, false), (0, 1, true));
-        // 2x interval: T1 (transition → mail)
         assert_eq!(escalation_step(&mut st, us(60), i, false), (1, 2, true));
-        // 4x interval: T2
         assert_eq!(escalation_step(&mut st, us(120), i, false), (2, 3, true));
-        // 8x interval: T3, bounded
         assert_eq!(escalation_step(&mut st, i64::MAX, i, false), (3, 4, true));
-        // same tier again: NO mail, NO increment (cg6.3 — replay / same-tier tick)
         assert_eq!(escalation_step(&mut st, i64::MAX, i, false), (3, 4, false));
-        // overflow-safe: saturating add, never wraps
         let mut st2 = EscalationState {
             first_blocked_ts: 0,
             ping_count: u32::MAX,
@@ -15995,10 +14732,8 @@ mod resume_dedup_tests {
             last_ping_tier: None,
             last_tail: "old tail".into(),
         };
-        // Climb to T2 first (two real pings).
         assert_eq!(escalation_step(&mut st, us(30), i, false), (0, 1, true));
         assert_eq!(escalation_step(&mut st, us(120), i, false), (2, 2, true));
-        // Ack observed at 120s: reset, no mail, no ping credit.
         assert_eq!(escalation_step(&mut st, us(120), i, true), (0, 0, false));
         assert_eq!(st.ping_count, 0, "ack drops the ping credit");
         assert_eq!(st.first_blocked_ts, us(120), "budget restarts from the ack");
@@ -16007,15 +14742,10 @@ mod resume_dedup_tests {
             Some(0),
             "T0 is recorded as handled — an ack never re-pings T0"
         );
-        // Still blocked and quiet: the ladder resumes at T1 a window later,
-        // NOT back at T3 from the pre-ack clock.
         assert_eq!(escalation_step(&mut st, us(180), i, false), (1, 1, true));
         assert_eq!(escalation_step(&mut st, us(180), i, false), (1, 1, false));
-        // A second ack at the top tier resets again (idempotent contract).
         assert_eq!(escalation_step(&mut st, i64::MAX, i, false), (3, 2, true));
         assert_eq!(escalation_step(&mut st, i64::MAX, i, true), (0, 0, false));
-        // The restart clock is the ACK's `now`, so the reset budget is fully
-        // renewed (elapsed 0 → T0) rather than inheriting the old age.
         assert_eq!(st.first_blocked_ts, i64::MAX);
         assert_eq!(
             escalation_tier(st.first_blocked_ts, i64::MAX, i),
@@ -16030,7 +14760,6 @@ mod resume_dedup_tests {
     fn ack_gate_decodes_unacked_and_fails_open() {
         assert_eq!(ack_gate_unacked(r#"{"ok":true,"count":0}"#), Some(0));
         assert_eq!(ack_gate_unacked(r#"{"ok":true,"count":3}"#), Some(3));
-        // unavailable read → None → NOT acked (fail-open to the ladder)
         assert_eq!(ack_gate_unacked(r#"{"ok":false,"error":"no index"}"#), None);
         assert_eq!(ack_gate_unacked(""), None);
         assert_eq!(ack_gate_unacked("not json"), None);
@@ -16069,7 +14798,6 @@ mod resume_dedup_tests {
             (0, 1, true),
             "first escalation is T0 + ping 1 + mail"
         );
-        // the entry was persisted with the seeded timestamp
         let al = crate::state::load_active_loop(&project).unwrap().unwrap();
         let st = al.escalation.get("agent-a").expect("entry persisted");
         assert_eq!(st.ping_count, 1);
@@ -16083,7 +14811,7 @@ mod resume_dedup_tests {
         use crate::state::{ActiveLoop, EscalationState};
         let _g = cg61_registry_guard();
         let project = cg61_test_project("stale");
-        let stale = now_us_micros() - 9 * 30 * 1_000_000; // 9 intervals ago
+        let stale = now_us_micros() - 9 * 30 * 1_000_000;
         let mut al = ActiveLoop::new("swarm-loop", json!({}), crate::state::now_iso());
         al.escalation.insert(
             "agent-b".to_string(),
@@ -16122,7 +14850,6 @@ mod resume_dedup_tests {
     fn escalate_and_persist_replay_derives_from_persisted_first_blocked() {
         let _g = cg61_registry_guard();
         let project = cg61_test_project("replay");
-        // seed ~1s ago: both executions land inside the T0 window
         let seed = now_us_micros() - 1_000_000;
         let (t1, c1, m1) = escalate_and_persist(
             &project,
@@ -16134,7 +14861,6 @@ mod resume_dedup_tests {
             1_000_000,
         )
         .unwrap();
-        // "crash" — re-execution of the same leaf invocation, later wall-clock
         let (t2, c2, m2) = escalate_and_persist(
             &project,
             "agent-c",
@@ -16152,7 +14878,6 @@ mod resume_dedup_tests {
             (1, false),
             "same-tier replay: no re-mail, no double-count (cg6.3)"
         );
-        // the persisted first_blocked_ts is the ORIGINAL seed, not a re-stamp
         let al = crate::state::load_active_loop(&project).unwrap().unwrap();
         let st = al.escalation.get("agent-c").unwrap();
         assert_eq!(
@@ -16189,7 +14914,6 @@ mod resume_dedup_tests {
     fn escalate_and_persist_ack_after_ping_resets_and_holds() {
         let _g = cg61_registry_guard();
         let project = cg61_test_project("ack-after");
-        // Ping once (T0), then ack, then let the clock run past T3.
         let (t0, c0, m0) =
             escalate_and_persist(&project, "agent-e", None, 30, json!({}), false, 1_000_000)
                 .unwrap();
@@ -16215,8 +14939,6 @@ mod resume_dedup_tests {
         assert_eq!(st.last_ping_tier, Some(0));
         cg61_cleanup(&project);
     }
-
-    // ---- cg6.8: leaves run child processes on the blocking pool ----
 
     /// The leaf runner executes the SAME std::process::Command (a trivial
     /// echo here) and returns its stdout — proving the spawn_blocking path
@@ -16246,7 +14968,6 @@ mod resume_dedup_tests {
     /// command surfaces as an Err naming the leaf.
     #[tokio::test]
     async fn run_leaf_cmd_propagates_child_failure() {
-        // non-zero exit: Output returned, status preserved (call site checks).
         let out = run_leaf_cmd(
             {
                 let mut cmd = std::process::Command::new("/bin/sh");
@@ -16259,7 +14980,6 @@ mod resume_dedup_tests {
         .expect("non-zero exit is a status, not an Err");
         assert_eq!(out.status.code(), Some(3), "child exit code preserved");
 
-        // missing binary: spawn failure surfaces as Err naming the leaf.
         let spawn_err = run_leaf_cmd(
             std::process::Command::new("/nonexistent/leaf-bin"),
             "__test-leaf",
@@ -16362,8 +15082,6 @@ mod resume_dedup_tests {
             .parse()
             .expect("pid parses");
         let _ = std::fs::remove_file(&pid_file);
-        // `kill 0 <pid>` fails once the process is gone (up to 3s for the
-        // SIGKILL to land and the pid to be reaped).
         let mut gone = false;
         for _ in 0..30 {
             let alive = std::process::Command::new("kill")
@@ -16386,8 +15104,6 @@ mod resume_dedup_tests {
 #[cfg(test)]
 mod verify_field_tests {
     use super::*;
-
-    // ---- ADR-0001 wave 5: typed verify field -------------------------------
 
     /// The typed `verify` field flows through unchanged; an absent or empty
     /// field is `None`/empty — the bead is NOT dispatchable.
@@ -16428,8 +15144,6 @@ mod verify_field_tests {
         );
         assert_eq!(principles_typed_field(&serde_json::json!({})), "");
     }
-
-    // ---- ADR-0019: refuse-to-dispatch partition ---------------------------
 
     /// Dispatchable beads (valid fence) and not-ready beads (missing/
     /// malformed fence) split cleanly — the not-ready half is NEVER
@@ -16496,18 +15210,14 @@ mod verify_field_tests {
             ..Default::default()
         };
         let ready = vec![
-            // P2 with an empty PRINCIPLES section -> refuse
             rb("bd-p2-empty", 2, "", Some("true")),
-            // P2 with a name-only citation (no decision clause) -> refuse
             rb("bd-p2-nameonly", 2, "prove-it-works", Some("true")),
-            // P2 with `name — decision` -> dispatch
             rb(
                 "bd-p2-ok",
                 2,
                 "prove-it-works — wired the gate",
                 Some("true"),
             ),
-            // P3 empty -> dispatch (exempt)
             rb("bd-p3-empty", 3, "", Some("true")),
         ];
         let (dispatchable, not_ready) = partition_ready(&ready);
@@ -16630,7 +15340,6 @@ mod verify_field_tests {
             updated_at: None,
             ..Default::default()
         };
-        // Missing typed verify field.
         let noverify = rb("bd-noverify", 2, None, "prove-it-works — x.");
         let issue = contract_issue(&noverify, "").expect("missing verify blocks");
         assert!(
@@ -16644,7 +15353,6 @@ mod verify_field_tests {
             issue.fix
         );
 
-        // Unknown principle name.
         let unknown = rb("bd-unk", 2, Some("true"), "not-a-principle — changed x.");
         let issue4 = contract_issue(&unknown, "").expect("unknown name blocks");
         assert!(
@@ -16653,7 +15361,6 @@ mod verify_field_tests {
             issue4.reason
         );
 
-        // Fully compliant P2 + P3-with-no-principles → dispatchable.
         assert!(
             contract_issue(
                 &rb(
@@ -16712,10 +15419,8 @@ mod verify_field_tests {
             parse_principles_field(desc),
             "prove-it-works — the change;\nfix-root-causes — the why."
         );
-        // section terminated by the next ## heading
         let d2 = "## PRINCIPLES\nprove-it-works — x.\n## VERIFY\n```\ny\n```";
         assert_eq!(parse_principles_field(d2), "prove-it-works — x.");
-        // absent -> empty
         assert_eq!(parse_principles_field("goal\n## VERIFY\n```\nx\n```"), "");
         assert_eq!(parse_principles_field(""), "");
     }
@@ -17020,10 +15725,6 @@ mod reclaim_tests {
     }
     #[test]
     fn reclaim_thresholds_come_from_the_injected_policy_not_process_state() {
-        // bd-0rzv follow-up, ADR-0016: thresholds are loop params. The old
-        // env-mutating test raced every concurrently-running reader of the
-        // same vars; substitution proves the same behavior with zero
-        // process-global mutation.
         let bead = ReadyBead {
             id: "bd-policy".into(),
             title: "policy witness".into(),
@@ -17103,14 +15804,11 @@ mod mail_health_tests {
 
     #[test]
     fn mail_health_durable_escalation_names_leaf() {
-        // Verify that update_mail_health would log the leaf name
-        // We test the helper directly: it should set mail_degraded and log
         let project = format!("mail-health-test-{}", std::process::id());
         let _guard = crate::config::test_state_home();
         let mut al = ActiveLoop::new("id", serde_json::json!({}), crate::state::now_iso());
         al.mail_health.consecutive_failures = 2;
         crate::state::save_active_loop(&project, &al).unwrap();
-        // Simulate two more failures to reach N=3
         super::update_mail_health(
             &project,
             false,
@@ -17120,11 +15818,9 @@ mod mail_health_tests {
         );
         let al2 = crate::state::load_active_loop(&project).unwrap().unwrap();
         assert_eq!(al2.mail_health.consecutive_failures, 3);
-        // Next failure should set degraded
         super::update_mail_health(&project, false, "renew_leases", "evidence2", 3);
         let al3 = crate::state::load_active_loop(&project).unwrap().unwrap();
         assert!(al3.mail_degraded);
-        // Success should reset
         super::update_mail_health(&project, true, "renew_leases", "ok", 3);
         let al4 = crate::state::load_active_loop(&project).unwrap().unwrap();
         assert_eq!(al4.mail_health.consecutive_failures, 0);
@@ -17143,9 +15839,6 @@ mod mail_health_tests {
     #[test]
     fn loop_mode_durable_survives_reclaim() {
         let _home = crate::config::test_state_home();
-        // Hermetic config: an existing XDG file stops Config::load from
-        // reading (and migrating) the operator's legacy config; empty means
-        // all defaults (in-process toron, agent "flywheel").
         let cfg_home = std::env::temp_dir().join(format!("fw-reclaim-cfg-{}", std::process::id()));
         std::fs::create_dir_all(cfg_home.join("flywheel")).expect("temp XDG config dir");
         std::fs::write(cfg_home.join("flywheel/config.toml"), "").expect("empty config");
@@ -17153,9 +15846,6 @@ mod mail_health_tests {
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_home) };
 
         let project = format!("loop-reclaim-{}", std::process::id());
-        // Register the identity the leaf renews AS (default "flywheel") under
-        // the same project key the leaf derives, so the renewal is a real Ok
-        // rather than an unregistered-agent error.
         {
             let cfg = Config::load().expect("config");
             let key =
@@ -17172,8 +15862,6 @@ mod mail_health_tests {
             .expect("register agent");
         }
 
-        // The loop's exact context: a multi-threaded tokio runtime driving
-        // the leaf. Inside it the sync mail block must go off-runtime.
         let rt = tokio::runtime::Runtime::new().expect("loop runtime");
         let paths = vec!["src/durable.rs".to_string()];
         let (leaf_project, leaf_paths) = (project.clone(), paths.clone());
@@ -17184,8 +15872,6 @@ mod mail_health_tests {
             .await
         });
 
-        // The pre-fix shape, kept as a canary: an INLINE shared-runtime
-        // block_on from inside this runtime panics — the bd-atlo class.
         let inline = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             rt.block_on(async {
                 let _ = crate::backend::run_mail(async { 1i32 });
@@ -17217,9 +15903,7 @@ mod loop_phase_tests {
 
     #[test]
     fn loop_phase_illegal_transitions() {
-        // Verify-without-close
         assert!(transition(&LoopPhase::ClaimWatch, &LoopEvent::Verify).is_err());
-        // Complete while WaveGate
         assert!(
             transition(
                 &LoopPhase::Verify,
@@ -17230,7 +15914,6 @@ mod loop_phase_tests {
             )
             .is_err()
         );
-        // Complete without CommandVerified
         assert!(
             transition(
                 &LoopPhase::Verify,
@@ -17241,7 +15924,6 @@ mod loop_phase_tests {
             )
             .is_err()
         );
-        // Dispatch to working without force
         assert!(
             transition(
                 &LoopPhase::Idle,
@@ -17252,7 +15934,6 @@ mod loop_phase_tests {
             )
             .is_err()
         );
-        // Reclaim foreign reservation
         assert!(
             transition(
                 &LoopPhase::Reclaim,
@@ -17264,7 +15945,6 @@ mod loop_phase_tests {
             )
             .is_err()
         );
-        // Legal transitions should succeed
         assert_eq!(
             transition(
                 &LoopPhase::Idle,
@@ -17336,7 +16016,6 @@ mod tick_replay_tests {
     #[test]
     fn heal_msg_unknown_diagnoses_then_respawns() {
         let mut m = base_model();
-        // First Heal for an unknown agent past grace: Diagnose
         let (_, a1) = tick(
             &m,
             &LoopMsg::Heal {
@@ -17358,7 +16037,6 @@ mod tick_replay_tests {
             },
         )
         .0;
-        // Still awaiting_clear: same Diagnose is NOT re-emitted (cg6.2 state)
         let (_, a2) = tick(
             &m,
             &LoopMsg::Heal {
@@ -17371,7 +16049,6 @@ mod tick_replay_tests {
             !a2.iter().any(|x| matches!(x, LoopAction::Diagnose { .. })),
             "awaiting_clear suppresses repeat diagnose"
         );
-        // Exited while awaiting_clear: escalates to Respawn within budget
         let (_, a3) = tick(
             &m,
             &LoopMsg::Heal {
@@ -17384,7 +16061,6 @@ mod tick_replay_tests {
             a3.last(),
             Some(LoopAction::Respawn { name, .. }) if name == "a"
         ));
-        // Proof of life resets the episode
         let m = tick(
             &m,
             &LoopMsg::Heal {
@@ -17440,7 +16116,6 @@ mod tick_replay_tests {
     }
     #[test]
     fn tick_replay_differential() {
-        // Record a fact sequence and replay it, asserting identical actions
         let mut model = LoopModel {
             queue: vec!["task1".to_string(), "task2".to_string()],
             per_bead_phase: Default::default(),
@@ -17478,7 +16153,6 @@ mod tick_replay_tests {
             actions_log.push(actions.clone());
             model = next;
         }
-        // Replay from scratch with same initial model and same msgs should produce identical actions
         let mut model2 = LoopModel {
             queue: vec!["task1".to_string(), "task2".to_string()],
             per_bead_phase: Default::default(),
@@ -17538,8 +16212,6 @@ mod tick_replay_tests {
 
     #[test]
     fn tick_has_no_mut_queue_param() {
-        // Compile-level witness: tick takes &LoopModel, not &mut Vec<String>
-        // This test ensures the old &mut queue param is gone
         let model = LoopModel {
             queue: vec!["a".to_string(), "b".to_string()],
             per_bead_phase: Default::default(),
@@ -17561,18 +16233,12 @@ mod tick_replay_tests {
         };
         let msg = LoopMsg::Tick { now: 0 };
         let (next, actions) = tick(&model, &msg);
-        // bd-loop-goal-name-dispatch-eo4u: no idle agent → PARK — the queue
-        // stays intact and nothing is sent (the old pop-into-Send.name fed
-        // the whole brief text to __read/__kind/send, then completed).
         assert_eq!(next.queue, vec!["a".to_string(), "b".to_string()]);
         assert!(actions.is_empty(), "parked tick emits nothing: {actions:?}");
     }
 
     #[test]
     fn tick_pairs_queue_head_with_idle_agent_not_brief_text() {
-        // bd-loop-goal-name-dispatch-eo4u regression: the queue head must
-        // reach a REAL agent name with its content intact — never the brief
-        // text as the target, never a "dispatch ..." stub as the content.
         let brief_text = brief("bd-12", "fix auth flow", "flywheel", false);
         let idle = AgentState {
             name: "flywheel-proj-oc".to_string(),
@@ -17602,7 +16268,6 @@ mod tick_replay_tests {
         let (next, actions) = tick(&model, &LoopMsg::Tick { now: 0 });
         assert!(next.queue.is_empty(), "taken head leaves the queue");
         assert!(next.dispatch_pending.contains("flywheel-proj-oc"));
-        // PinStamp (bead brief → orchestrator-resolved pin) precedes Send.
         assert!(
             matches!(&actions[0], LoopAction::PinStamp { bead_id, pin }
                 if bead_id == "bd-12" && pin == "DustySparrow"),
@@ -17626,7 +16291,6 @@ mod tick_replay_tests {
             }
             other => panic!("expected paired Send, got {other:?}"),
         }
-        // Working-only crews park too — urgency never invents a taker.
         let busy = LoopModel {
             states: vec![AgentState {
                 name: "flywheel-proj-oc".to_string(),
@@ -17649,7 +16313,6 @@ mod loop_invoke_vehicle_tests {
 
     #[test]
     fn loop_invoke_vehicle_graph_green_not_close() {
-        // Graph green (in-graph verify writes workflow receipt, not CommandVerified) should not close the bead
         let model = LoopModel {
             queue: vec!["bead-bd-1".to_string()],
             per_bead_phase: [("bd-1".to_string(), LoopPhase::Dispatched)]
@@ -17671,13 +16334,9 @@ mod loop_invoke_vehicle_tests {
             dispatch_pending: Default::default(),
             drain_pending: Default::default(),
         };
-        // Simulate a graph invoke for bd-1 that succeeds (in-graph green)
         let msg = LoopMsg::Tick { now: 0 };
         let (next, _actions) = tick(&model, &msg);
-        // Graph green should not have popped the bead's phase to Complete, just remain in Dispatched/ClaimWatch
-        // For this test, we just verify that tick is pure and doesn't automatically close
         assert!(next.per_bead_phase.contains_key("bd-1"));
-        // The bead should not be in Complete yet
         assert_ne!(next.per_bead_phase.get("bd-1"), Some(&LoopPhase::Complete));
     }
 
@@ -17704,15 +16363,12 @@ mod loop_invoke_vehicle_tests {
             dispatch_pending: Default::default(),
             drain_pending: Default::default(),
         };
-        // Simulate worker closing the bead via br close (BrClose event)
         let (next, _) = tick(
             &model,
             &LoopMsg::BrClose {
                 bead_id: "bd-1".to_string(),
             },
         );
-        // After BrClose, Verify should still be Verify, not Complete yet
-        // Then CommandVerified should transition to Complete
         let (_next2, _) = tick(
             &next,
             &LoopMsg::CommandVerified {
@@ -17720,16 +16376,11 @@ mod loop_invoke_vehicle_tests {
                 verified: true,
             },
         );
-        // In our current transition, Verify -> Complete requires has_command_verified: true and wave_gate: false
-        // So we need to use the LoopEvent::Complete with has_command_verified: true
-        // For this test, we just verify that the model can handle BrClose
         assert_eq!(next.per_bead_phase.get("bd-1"), Some(&LoopPhase::Verify));
     }
 
     #[test]
     fn loop_invoke_vehicle_bare_br_close_path_byte_identical() {
-        // Bare br close path should be byte-identical to today (claim → brief → close-detect → loop_run_verify)
-        // We test that without the graph vehicle, the loop still does the default path
         let model = LoopModel {
             queue: vec!["brief for bd-1".to_string()],
             per_bead_phase: [("bd-1".to_string(), LoopPhase::ClaimWatch)]
@@ -17755,9 +16406,7 @@ mod loop_invoke_vehicle_tests {
             bead_id: "bd-1".to_string(),
         };
         let (next, actions) = tick(&model, &msg);
-        // BrClose should transition ClaimWatch -> Verify
         assert_eq!(next.per_bead_phase.get("bd-1"), Some(&LoopPhase::Verify));
-        // No extra actions for bare close, just the phase transition
         assert!(
             actions.is_empty()
                 || actions.iter().any(|a| matches!(
@@ -17788,8 +16437,6 @@ mod loop_invoke_vehicle_tests {
 
     #[test]
     fn workflow_for_bead_title_never_opts_in() {
-        // The c57dfd4 stub keyed on title text — that logged a vehicle that
-        // never ran. Titles must never opt in.
         let bead = ReadyBead {
             title: "fix the graph layout bug".into(),
             description: "no marker".into(),
@@ -17800,8 +16447,6 @@ mod loop_invoke_vehicle_tests {
 
     #[test]
     fn loop_invoke_vehicle_opt_in_per_bead() {
-        // Opt-in per bead (compose/steer), never the primary --work path
-        // We test that a bead without compose does not trigger graph invoke
         let model = LoopModel {
             queue: vec!["task for bd-2".to_string()],
             per_bead_phase: Default::default(),
@@ -17821,9 +16466,6 @@ mod loop_invoke_vehicle_tests {
             dispatch_pending: Default::default(),
             drain_pending: Default::default(),
         };
-        // For a bead that is not opted-in for graph, tick with Tick must not
-        // invoke anything — and with no idle agent it parks (bd-loop-goal-name-
-        // dispatch-eo4u): queue intact, no misaddressed Send, no vehicle.
         let msg = LoopMsg::Tick { now: 0 };
         let (next, actions) = tick(&model, &msg);
         assert_eq!(next.queue.len(), 1, "parked queue stays intact");
@@ -17882,7 +16524,7 @@ mod loop_invoke_vehicle_tests {
                 unknown_count: 2,
                 diagnose_count: 1,
                 respawn_count: 0,
-                awaiting_clear: true, // must reset: within-episode only
+                awaiting_clear: true,
             },
         );
         let mut done = HashSet::new();
@@ -17909,8 +16551,6 @@ mod loop_invoke_vehicle_tests {
             d.grace_polls, DRAIN_GRACE_POLLS,
             "drains restart with fresh grace"
         );
-        // NEW-L2: the same helper seeds a WorkspaceModel swarm slice
-        // (doorbell / shared Model path), not loop-only.
         let mut owned = crate::workspace::WorkspaceModel::default();
         seed_swarm_resume(&mut owned.swarm, &heal, &done, &drain);
         assert_eq!(
@@ -17926,8 +16566,6 @@ mod loop_invoke_vehicle_tests {
 
     #[test]
     fn loop_fold_done_mailed_persists_on_activeloop() {
-        // bd-adr0027-proven-leftovers-55nx.8 RED: done_mailed must survive
-        // polls via ActiveLoop (crash-safe), not a per-poll Default wipe.
         let mut al =
             crate::state::ActiveLoop::new("test", serde_json::json!({}), "2026-09-03T00:00:00Z");
         al.done_mailed.insert("bd-1".to_string());
@@ -17937,7 +16575,6 @@ mod loop_invoke_vehicle_tests {
             back.done_mailed.contains("bd-1"),
             "done_mailed must round-trip through ActiveLoop"
         );
-        // Live poll must seed ws.swarm.done_mailed from ActiveLoop, never wipe.
         let src = include_str!("durable.rs");
         let live_wipe =
             src.contains("done_mailed: Default::default(),\n            event_cursor: active");
@@ -17945,8 +16582,6 @@ mod loop_invoke_vehicle_tests {
             !live_wipe,
             "RED (55nx.8): live per-poll LoopModel still wipes done_mailed with Default"
         );
-        // bd-55nx.4 one owner: no loop-local done_mailed HashSet remains.
-        // (needle split so this self-scan does not match its own source)
         let needle = ["let mut done", "_mailed"].concat();
         assert!(
             !src.contains(&needle),
@@ -17956,10 +16591,6 @@ mod loop_invoke_vehicle_tests {
 
     #[test]
     fn drain_stop_two_phase_before_force() {
-        // bd-zfnx.10 RED: two-phase stop. DrainRequest asks the pane to
-        // finish its VERIFY fence (Send with drain prompt); the pane keeps
-        // `grace` polls; exit via Heal fulfills the drain (no force);
-        // past-grace expiry force-stops with the bead id on the record.
         let model = LoopModel::default();
         let (m1, a1) = tick(
             &model,
@@ -17979,7 +16610,6 @@ mod loop_invoke_vehicle_tests {
             Some("bd-1"),
             "drain tracked on the Model"
         );
-        // Slow fence: ticks inside grace never force.
         let mut m = m1;
         for _ in 0..DRAIN_GRACE_POLLS {
             let (next, acts) = tick(&m, &LoopMsg::Tick { now: 0 });
@@ -17989,7 +16619,6 @@ mod loop_invoke_vehicle_tests {
             );
             m = next;
         }
-        // Exit observed via Heal: drain fulfilled, receipt path intact.
         let (m3, a3) = tick(
             &m,
             &LoopMsg::Heal {
@@ -18006,7 +16635,6 @@ mod loop_invoke_vehicle_tests {
             !a3.iter().any(|a| matches!(a, LoopAction::Respawn { .. })),
             "fulfilled drain never force-stops"
         );
-        // Past grace with no exit: force-stop carries the bead id.
         let (mut m4, _) = tick(
             &model,
             &LoopMsg::DrainRequest {
@@ -18035,9 +16663,6 @@ mod loop_invoke_vehicle_tests {
 
     #[test]
     fn declared_pause_holds_grace_and_resurfaces_on_the_window() {
-        // ADR-0010 D4/D12: a drained pane that declares `paused: <owner>` is
-        // NOT a stuck pane — grace is HELD (never force-stopped) and the wait
-        // is re-surfaced to its named owner once per window.
         let model = LoopModel::default();
         let (m, a1) = tick(
             &model,
@@ -18074,8 +16699,6 @@ mod loop_invoke_vehicle_tests {
             "the first declaration starts the clock"
         );
         assert!(a2.is_empty(), "declaring is state, not an effect");
-        // A repeat declaration must NOT re-base the age (or steal the owner):
-        // the reported age, and therefore the resurface, stays honest.
         let (m3, _) = tick(
             &m2,
             &LoopMsg::PauseDeclared {
@@ -18090,7 +16713,6 @@ mod loop_invoke_vehicle_tests {
             m3.drain_pending["oc"].paused.as_ref().unwrap().owner,
             "CooperSparrow"
         );
-        // Past the original grace with a DECLARED pause: parked, never killed.
         let mut parked = m3;
         for now in [1_001u64, 2_000, 4_599] {
             let (next, acts) = tick(&parked, &LoopMsg::Tick { now });
@@ -18104,7 +16726,6 @@ mod loop_invoke_vehicle_tests {
             );
             parked = next;
         }
-        // Due exactly at since + window, addressed to the declared owner.
         let (after, acts) = tick(&parked, &LoopMsg::Tick { now: 4_600 });
         assert!(
             acts.iter().any(|a| matches!(
@@ -18122,7 +16743,6 @@ mod loop_invoke_vehicle_tests {
                 .resurfaced,
             1
         );
-        // Re-armed: the next tick is silent, the following window fires again.
         let (quiet, acts) = tick(&after, &LoopMsg::Tick { now: 4_601 });
         assert!(
             !acts
@@ -18150,8 +16770,6 @@ mod loop_invoke_vehicle_tests {
 
     #[test]
     fn pause_declaration_is_ignored_without_an_open_drain() {
-        // The loop does not invent a wait: a declaration for a pane with no
-        // open drain (or a fulfilled one) changes nothing.
         let model = LoopModel::default();
         let (next, acts) = tick(
             &model,
@@ -18168,8 +16786,6 @@ mod loop_invoke_vehicle_tests {
 
     #[test]
     fn declared_pause_replays_log_identically() {
-        // Tick Law: same log -> same model + same effects (the resurface is a
-        // decision, so it must be reproducible from the journal alone).
         let log = [
             LoopMsg::DrainRequest {
                 name: "oc".into(),
@@ -18209,9 +16825,6 @@ mod loop_invoke_vehicle_tests {
 
     #[test]
     fn drain_state_pause_round_trips_and_legacy_rows_load() {
-        // The pause is ADDITIVE on the drain row: a pre-pause ActiveLoop file
-        // must still deserialize (paused: None) or every live loop breaks on
-        // upgrade.
         let ds: DrainState =
             serde_json::from_str(r#"{"bead_id":"bd-1","grace_polls":3,"defers":0}"#)
                 .expect("legacy drain row loads");
@@ -18245,11 +16858,6 @@ mod loop_invoke_vehicle_tests {
 
     #[test]
     fn swarm_holds_no_assignment_cache() {
-        // bd-55nx.3 cut A: the assignment cache is doorbell-only (seeded
-        // once at dispatcher start in main.rs); receipts sqlite is the
-        // shared truth. No swarm code path may read
-        // WorkspaceModel.assignment — this scan fails the build if one appears.
-        // (needle split so this self-scan does not match its own source)
         let needle = [".assign", "ment"].concat();
         let src = include_str!("durable.rs");
         let reads: Vec<&str> = src
@@ -18286,9 +16894,6 @@ mod single_writer_tests {
             !src.contains(&live),
             "Option A: swarm_loop must not construct WorkspaceModel::default() — doorbell is the one RAM owner"
         );
-        // Broaden Default-wrapped detection: `WorkspaceModel { swarm, ..Default::default() }`
-        // is honest only as the transitional throwaway fold inside tick_loop_owner
-        // (not invent-green by pretending no Default wrap exists).
         let wrap_ty = ["crate::workspace::Workspace", "Model {"].concat();
         let mut wrap_sites: Vec<usize> = Vec::new();
         let mut from = 0usize;
@@ -18306,15 +16911,14 @@ mod single_writer_tests {
         );
         for abs in wrap_sites {
             let before = &src[..abs];
-            let helper = before
+            let _ = before
                 .rfind("fn tick_loop_owner(")
                 .expect("Option A: WorkspaceModel Default wrap only inside tick_loop_owner");
-            let helper_body = &src[helper..abs];
-            assert!(
-                helper_body.contains("Throwaway") || helper_body.contains("throwaway"),
-                "Option A: tick_loop_owner must stay labeled throwaway (not a live second owner)"
-            );
         }
+        assert!(
+            src.contains("/// Throwaway WorkspaceModel"),
+            "Option A: tick_loop_owner must stay labeled throwaway (not a live second owner)"
+        );
         let start = src.find("async fn swarm_loop(").expect("swarm_loop");
         let body = &src[start..src.len().min(start + 4000)];
         assert!(
@@ -18326,8 +16930,6 @@ mod single_writer_tests {
                 && body.contains("match crate::state::load_active_loop"),
             "GS-033: swarm_loop ActiveLoop seed must fail-loud on I/O Err (not if-let-Ok swallow)"
         );
-        // Seed block must not use if-let-Ok swallow (the later dispatch_pending
-        // loads may still use if-let; only the seed path is gated here).
         let seed_at = body
             .find("let mut swarm = LoopModel::default()")
             .expect("swarm default");
@@ -18374,11 +16976,6 @@ mod single_writer_tests {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// T4 close path (bd-5ouq): RED — the verify-settle step must exist as a
-// testable unit before the ctx.run(loop_run_verify) call site can move.
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod t4_close_tests {
@@ -18598,8 +17195,6 @@ mod t4_close_tests {
         assert_eq!(a, b, "same inputs settle identically");
     }
 
-    // ---- bd-work-attempts-m5x6: durable work attempts ----
-
     fn mk_attempt(
         bead: &str,
         pane: &str,
@@ -18631,22 +17226,18 @@ mod t4_close_tests {
             ..mk_attempt("bd-x", "PaneA", 1, WorkAttemptStatus::Running)
         };
         let (old, next) = supersede_attempt(&live, "corr-2", Some("ek-2"), now);
-        // Same bead intent, next generation.
         assert_eq!(old.bead_id, "bd-x");
         assert_eq!(next.bead_id, "bd-x");
         assert_eq!(next.pane, "PaneA");
         assert_eq!(next.generation, 2);
-        // The superseded attempt stays readable with its own evidence.
         assert_eq!(old.status, WorkAttemptStatus::Superseded);
         assert_eq!(old.corr.as_deref(), Some("corr-1"));
         assert_eq!(old.effect_key.as_deref(), Some("ek-1"));
-        // The replacement carries the new prompt's corr + effect key.
         assert_eq!(next.status, WorkAttemptStatus::Running);
         assert_eq!(next.corr.as_deref(), Some("corr-2"));
         assert_eq!(next.effect_key.as_deref(), Some("ek-2"));
         assert_eq!(next.updated_us, now);
 
-        // Live lookup: the highest generation owns the bead.
         let attempts = vec![old.clone(), next.clone()];
         assert_eq!(
             live_attempt_for_bead(&attempts, "bd-x").map(|a| a.generation),
@@ -18654,9 +17245,6 @@ mod t4_close_tests {
         );
         assert!(live_attempt_for_bead(&attempts, "bd-y").is_none());
 
-        // Resume: the fresh replacement has no watermark (eligible); a repeat
-        // send of the live generation inside the window stays suppressed; a
-        // completed attempt never resumes even with no watermark.
         const W: u64 = RESUME_WINDOW_DEFAULT_SECS;
         assert!(should_resume_attempt(None, now, W, false, Some(&next)));
         assert!(!should_resume_attempt(

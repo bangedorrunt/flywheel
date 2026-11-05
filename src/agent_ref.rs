@@ -46,8 +46,6 @@ pub fn redact_evidence(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len().min(EVIDENCE_JOURNAL_MAX * 2));
     let mut i = 0;
     while i < raw.len() {
-        // Token boundary: start, or previous char not alphanumeric (so
-        // "pre-sk-…" still redacts; "ask-…" does not match mid-word "sk-").
         let at_boundary = i == 0
             || !raw[..i]
                 .chars()
@@ -86,7 +84,6 @@ fn match_secret_at(s: &str, i: usize) -> Option<(usize, &'static str)> {
     let rest = &s[i..];
     let lower = rest.to_ascii_lowercase();
     if lower.starts_with("authorization:") {
-        // Consume scheme + credential only (not the rest of the stderr line).
         let mut n = "authorization:".len();
         while n < rest.len() && rest.as_bytes()[n].is_ascii_whitespace() {
             n += 1;
@@ -99,7 +96,6 @@ fn match_secret_at(s: &str, i: usize) -> Option<(usize, &'static str)> {
         n += consume_token(&rest[n..]);
         return Some((n, "Authorization: [REDACTED]"));
     }
-    // Bare "Bearer <token>" (not already under Authorization:)
     if lower.starts_with("bearer ") {
         let after = consume_token(&rest["bearer ".len()..]);
         return Some(("bearer ".len() + after, "Bearer [REDACTED]"));
@@ -461,8 +457,6 @@ pub fn journal_effect(project: &str, effect: &AgentEffect) -> anyhow::Result<()>
         for_log.evidence = Some(redact_evidence(&ev));
     }
     let mut entry = serde_json::to_value(&for_log)?;
-    // Tagged so a reader can tell a spawn-lifecycle row from a rebind row
-    // without guessing from the field set.
     if let serde_json::Value::Object(map) = &mut entry {
         map.insert(
             "journal".to_string(),
@@ -553,7 +547,6 @@ impl Drop for AgentEffectGuard {
 
 /// Journal intent-before-dispatch (I4). Uses flywheel event log — not mailbox.
 pub fn journal_rebind(project: &str, intent: &RebindIntent) -> anyhow::Result<()> {
-    // C1: never persist raw harness stderr — redact keys/tokens, truncate snippet.
     let mut for_log = intent.clone();
     match &mut for_log.reason {
         RebindReason::CaptainRequest { note } => {
@@ -753,7 +746,6 @@ pub fn load_reclassify_by_key(
 ) -> anyhow::Result<Option<ReclassifyIntent>> {
     let path = state::project_log_path(project);
     let lines = state::read_tail_lines(&path, state::LOG_TAIL_LINES, state::LOG_TAIL_BYTES)?;
-    // Newest first: the first match wins, and no row after it is parsed.
     for line in lines.iter().rev() {
         let Ok(entry) = serde_json::from_str::<state::LogEntry>(line) else {
             continue;
@@ -802,7 +794,6 @@ pub fn commit_reclassify<F, T>(
 where
     F: FnOnce(&ReclassifyIntent) -> anyhow::Result<T>,
 {
-    // insert_or_load already journaled Prepared; advance to InFlight.
     intent.state = EffectState::InFlight;
     journal_reclassify(project, &intent)?;
     match apply(&intent) {
@@ -890,13 +881,11 @@ mod tests {
     /// adopted enum is the one that is actually persisted.
     #[test]
     fn effect_state_is_the_one_persisted_enum() {
-        // The four states the old copy could not express exist here.
         let _ = EffectState::Accepted;
         let _ = EffectState::ReconcilePending;
         let _ = EffectState::Cancelled;
         let _ = EffectState::Parked;
         // And it IS toron-core's type: a row written here and a row written
-        // by the workflow engine are the same value, not two vocabularies.
         let same: toron_core::index::workflow_effects::EffectState = EffectState::Parked;
         assert_eq!(
             same,
@@ -914,7 +903,6 @@ mod tests {
             FailureKind::Billing,
             ""
         ));
-        // B2: rate_limit with empty evidence also refuses (pane must not hop).
         assert!(!RebindIntent::allowed_from_failure(
             FailureKind::RateLimit,
             ""
@@ -1100,7 +1088,6 @@ mod tests {
             let guard = AgentEffectGuard::begin(project, "sink", AgentPhase::Spawn)
                 .expect("intent committed");
             assert_eq!(guard.effect.state, EffectState::InFlight);
-            // returns early with no terminal row — Drop must fail closed
         }
         let log = effect_log(project);
         assert!(log.contains("\"state\":\"failed\""), "{log}");
@@ -1181,7 +1168,6 @@ mod tests {
                 "{state}: {log}"
             );
         }
-        // Every row for this logical effect shares the same primary key.
         let rows: Vec<_> = log
             .lines()
             .filter(|l| l.contains("\"journal\":\"reclassify\""))

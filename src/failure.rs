@@ -115,8 +115,6 @@ pub fn classify_with_stage(
         };
         truncate_evidence(&raw, 512)
     };
-    // Allowance does not pass by waiting. It shares the billing hop (another
-    // agent), not the rate-limit hop (same agent, other model).
     if lower.contains("402")
         || lower.contains("insufficient balance")
         || lower.contains("insufficient_balance")
@@ -152,7 +150,6 @@ pub fn classify_with_stage(
             stage: stage.unwrap_or("execute"),
         };
     }
-    // A blip passes by itself: wait, then the same agent. Not an allowance.
     if lower.contains("429")
         || lower.contains("rate limit")
         || lower.contains("rate_limit")
@@ -212,13 +209,9 @@ pub fn classify_with_stage(
             retryable: false,
             reroute_eligible: false,
             evidence,
-            // Reservation conflict parks the work unit — not an execute miss.
             stage: stage.unwrap_or("park"),
         };
     }
-    // ADR-0026 Spec 1 taxonomy arm: an operator/agent cancellation is its own
-    // kind (never retried, never rerouted). Deliberately narrow needles — a
-    // generic "interrupted" substring would reclassify transport noise.
     if lower.contains("cancelled")
         || lower.contains("canceled")
         || lower.contains("sigint")
@@ -431,8 +424,6 @@ mod tests {
         assert_eq!(c.kind, FailureKind::Cancelled);
         assert!(!c.retryable);
         assert!(!c.reroute_eligible);
-        // Narrow needles: a bare "interrupted" substring is transport noise,
-        // not a cancellation — it must stay Unknown.
         let c = classify("connection interrupted", None, None);
         assert_eq!(c.kind, FailureKind::Unknown);
     }
@@ -492,7 +483,6 @@ mod tests {
     #[test]
     fn classify_rows_from_every_call_site() {
         let rows: [(&str, &str, FailureKind, Option<bool>); 9] = [
-            // 429 carried the same expectation in all three modules.
             (
                 "rate_limit (cron+pane+headless)",
                 "429 Too Many Requests",
@@ -529,10 +519,6 @@ mod tests {
                 FailureKind::Blocked,
                 Some(false),
             ),
-            // Unclassified stays Unknown, and the engine's on_error default is
-            // Continue: the runner surfaces the kind and lets the engine
-            // decide. Only pane ever asserted retryable here, so the other two
-            // rows leave it unpinned rather than inventing a value.
             (
                 "unclassified_cron",
                 "cron succeeded but no error",
@@ -559,7 +545,6 @@ mod tests {
                 assert_eq!(cf.retryable, want, "{case}");
             }
         }
-        // The pane module's extra pins: the wire label and the reroute verdicts.
         assert_eq!(
             classify("429 Too Many Requests", None, None)
                 .kind

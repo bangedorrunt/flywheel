@@ -34,8 +34,6 @@ pub fn newest_match_age_secs(path: &Path, needle: &str, now: u64) -> Option<u64>
     f.seek(SeekFrom::Start(start)).ok()?;
     let mut buf = String::new();
     f.take(MAX_TAIL_BYTES).read_to_string(&mut buf).ok()?;
-    // Walking backwards finds the newest match first; the first line of a
-    // mid-file window may be torn, and a torn line simply fails to parse.
     for line in buf.lines().rev() {
         if !line.contains(needle) {
             continue;
@@ -145,13 +143,7 @@ pub fn audit_tear(path: &Path) -> Option<AuditTear> {
         newest_row: None,
         tear_after: None,
     };
-    // A window that starts mid-file begins in the MIDDLE of a row, so its
-    // first line is a fragment that is torn by construction. Counting it would
-    // report a fault on every healthy file larger than the window, which is the
-    // one way a truth-telling field teaches an operator to ignore it.
     let mid_file = start > 0;
-    // The last datable row seen, carried forward so a torn line can be bounded
-    // by the row in front of it.
     let mut last_dated: Option<u64> = None;
     for (n, line) in buf.lines().enumerate() {
         if mid_file && n == 0 {
@@ -168,7 +160,6 @@ pub fn audit_tear(path: &Path) -> Option<AuditTear> {
                     tear.newest_row = Some(tear.newest_row.map_or(ts, |cur: u64| cur.max(ts)));
                 }
             }
-            // A bare string/number parses but is not a row either.
             _ => {
                 tear.torn += 1;
                 tear.tear_after = last_dated;
@@ -283,7 +274,6 @@ mod tests {
                 .unwrap()
                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
         };
-        // healthy: restarts 109 s apart, both inside a 300 s window
         let healthy = dir.join("healthy.jsonl");
         let mut body = String::new();
         for off in [-218, -109, 0] {
@@ -291,7 +281,6 @@ mod tests {
                 "{{\"ts\":\"{}\",\"actions\":[\"RestartWatch\"]}}\n",
                 at(off)
             ));
-            // sweep rows are the bulk of a real journal
             body.push_str(&format!(
                 "{{\"ts\":\"{}\",\"actions\":[\"FetchInbox\"]}}\n",
                 at(off)
@@ -299,7 +288,6 @@ mod tests {
         }
         fs::write(&healthy, body).expect("write healthy");
         assert_eq!(count_matches_within(&healthy, "RestartWatch", now, 300), 3);
-        // thrash: every 16 s
         let thrash = dir.join("thrash.jsonl");
         let mut body = String::new();
         for off in (0..=288).step_by(16) {

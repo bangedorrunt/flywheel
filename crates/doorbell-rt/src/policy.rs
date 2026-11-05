@@ -82,13 +82,11 @@ mod tests {
     #[test]
     fn transient_parks_after_cap() {
         let mut p = RestartPolicy::transient_cap(5, 5);
-        // Five rapid failures consume the cap; the sixth parks.
         for t in 0..5 {
             assert!(p.should_restart(t), "restart {t}");
         }
         assert!(!p.should_restart(4), "parks at cap");
         assert!(p.parked(4));
-        // Window slides: old failures age out, restarts resume.
         assert!(p.should_restart(100));
     }
 

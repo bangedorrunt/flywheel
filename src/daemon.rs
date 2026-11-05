@@ -1,13 +1,4 @@
-// Daemon lifecycle: `flywheel daemon start|stop|restart|status`.
-//
-// Mirrors toron's daemon.rs supervision strategy, adapted to `flywheel serve`:
-// - macOS: launchd LaunchAgent (`~/Library/LaunchAgents/<label>.plist`).
-// - Linux with systemd: user unit (`~/.config/systemd/user/<label>.service`).
-// - Fallback: pidfile + detached `flywheel serve` spawn
-//   (`~/.local/state/flywheel/flywheel.pid`).
-//
 // SAFETY: no `unsafe` — host supervision shells out to `id -u` / `kill`,
-// matching toron's approach.
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -182,10 +173,6 @@ pub fn plist_xml(
             dir.display()
         )
     });
-    // launchd's default PATH is /usr/bin:/bin:/usr/sbin:/sbin: no `rex`, no
-    // `hc`, no `br`, no `toron`. Every child lookup quietly degrades (the pane
-    // plane falls back to hc, `on_failure: bead` cannot file). The unit
-    // inherits the PATH of the install that wrote it.
     let path_env = path_env.map_or_else(String::new, |path| {
         format!("\t\t<key>PATH</key>\n\t\t<string>{path}</string>\n")
     });
@@ -283,7 +270,6 @@ pub fn start(state: &Path, addr: &str) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
         let uid = current_uid();
-        // kickstart -k restarts a loaded-but-crashed job.
         let out = Command::new("launchctl")
             .args(["kickstart", "-k", &format!("gui/{uid}/{DAEMON_LABEL}")])
             .output();
@@ -296,7 +282,6 @@ pub fn start(state: &Path, addr: &str) -> anyhow::Result<()> {
             println!("started {DAEMON_LABEL} (launchd)");
             return Ok(());
         }
-        // Not loaded yet — install (idempotent) then kickstart.
         install(state, port)?;
         let out = Command::new("launchctl")
             .args(["kickstart", "-k", &format!("gui/{uid}/{DAEMON_LABEL}")])
@@ -531,8 +516,6 @@ pub fn stop_cron() -> anyhow::Result<()> {
 pub fn cron_running() -> bool {
     #[cfg(target_os = "macos")]
     {
-        // `print` also succeeds for a loaded-but-dead job, so read the job's
-        // own state line: only `state = running` means ticks are happening.
         let uid = current_uid();
         Command::new("launchctl")
             .args(["print", &format!("gui/{uid}/{CRON_LABEL}")])
@@ -594,8 +577,6 @@ pub fn stop(state: &Path, addr: &str, force: bool) -> anyhow::Result<()> {
         if let Ok(o) = out
             && o.status.success()
         {
-            // Grace window: a fresh-bootout socket still accepting is a
-            // teardown race, not a holder.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while addr_alive(addr) && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(250));
@@ -732,9 +713,6 @@ pub fn ensure_doorbell_spawn() -> DoorbellEnsure {
             ),
         };
     };
-    // A unit-hosted daemon (launchd/systemd) answers health without a
-    // pidfile, which `doorbell start` reads as a foreign squatter and
-    // refuses. So: healthy port first means already running.
     if let Ok(o) = Command::new(&bin).arg("status").output() {
         let body = String::from_utf8_lossy(&o.stdout);
         if o.status.success() && (body.contains("\"alive\":true") || body.contains("\"health\":{"))
@@ -803,9 +781,6 @@ pub(crate) fn durable_capability_probe_at(data_dir: &Path, db: &Path) -> anyhow:
         )
     })?;
     let db_str = db.to_string_lossy().into_owned();
-    // Multi-thread: the store/journal handles are sync-over-channels, so
-    // the engine verbs below run in spawn_blocking while workers drive the
-    // store tasks. A current-thread runtime would deadlock here.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -904,7 +879,6 @@ mod tests {
             "a reboot must bring the host back"
         );
         assert!(xml.contains("<key>SuccessfulExit</key>\n\t\t<false/>"));
-        // The serve unit keeps its own argv and no cwd override.
         let serve = plist_xml(
             DAEMON_LABEL,
             Path::new("/opt/bin/flywheel"),
@@ -916,7 +890,6 @@ mod tests {
         );
         assert!(serve.contains("<string>serve</string>"));
         assert!(!serve.contains("WorkingDirectory"));
-        // launchd's bare PATH hides rex/hc/br/toron from every child.
         assert!(xml.contains("<key>PATH</key>"));
         assert!(xml.contains("/opt/homebrew/bin"));
     }
@@ -932,8 +905,6 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fw-probe-{}-{nanos}", std::process::id()));
         let db = dir.join("probe.sqlite");
         durable_capability_probe_at(&dir, &db).expect("scratch store parks and wakes");
-        // Second pass over the same file: a fresh run id each call, so the
-        // probe is idempotent and reruns green.
         durable_capability_probe_at(&dir, &db).expect("probe reruns green");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -979,7 +950,6 @@ mod tests {
 
     #[test]
     fn dead_port_is_not_alive() {
-        // Bind without listening: deterministic RST, port stays reserved.
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
         drop(l);

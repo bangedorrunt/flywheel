@@ -460,8 +460,6 @@ async fn drive_graph(
                     run = back;
                     follow.append(&mut eff);
                 }
-                // The join marker follows the parent's own child-settled verb;
-                // nothing to execute.
                 GraphEffect::ChildJoin { .. } => {}
                 GraphEffect::Complete { output } => return BodyOutcome::Completed(output),
                 GraphEffect::Fail { fail } => {

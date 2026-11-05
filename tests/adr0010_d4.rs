@@ -30,8 +30,6 @@ fn adr0010_d4_walk_knobs_present() {
 
 #[test]
 fn adr0010_d4_drain_checks_writes_before_respawn() {
-    // The about-to-respawn leaf (drain-expiry arm) walks the bead's
-    // reservation globs first; fresh writes defer via re-arm, never kill.
     assert!(
         DURABLE.contains("write_liveness"),
         "drain arm must call into write_liveness"
@@ -44,7 +42,6 @@ fn adr0010_d4_drain_checks_writes_before_respawn() {
         DURABLE.contains("defers"),
         "DrainState must count consecutive write-evidence defers"
     );
-    // Failed/timed-out walk fails toward existing behavior (respawn).
     assert!(
         LIVENESS.contains("WalkFailed") || LIVENESS.contains("walk_failed"),
         "walk failure must be an explicit outcome that respawns"
@@ -53,8 +50,6 @@ fn adr0010_d4_drain_checks_writes_before_respawn() {
 
 #[test]
 fn adr0010_d4_never_auto_interrupt() {
-    // The defer path skips the kill and re-arms grace; auto-kill stays
-    // --force-working (kill keys, not this bead).
     assert!(
         DURABLE.contains("write-evidence"),
         "defer must emit a write-evidence digest, not silence"

@@ -49,7 +49,7 @@ use crate::state_log::{RunStateModel, ThreadId, boundary_payload};
 
 /// Largest model payload this recorder will store. See the module docs: a
 /// refusal is honest, a truncation is not.
-pub const MAX_PAYLOAD_BYTES: usize = 1 << 20; // 1 MiB
+pub const MAX_PAYLOAD_BYTES: usize = 1 << 20;
 
 /// Bound on boundaries enqueued but not yet durable. A stalled writer must
 /// surface as a loud refusal, not as unbounded memory growth.
@@ -83,8 +83,6 @@ impl std::fmt::Debug for RunStateRecorder {
         f.debug_struct("RunStateRecorder")
             .field("store", &self.store)
             .field("thread", &self.thread)
-            // The field itself, not `next_seq()`: the lint tracks field reads,
-            // and AtomicI64 is Debug.
             .field("seq", &self.seq)
             .field(
                 "pending",
@@ -213,12 +211,6 @@ impl Clone for RunStateRecorder {
     }
 }
 
-// bd-4dpq remaining slice: the READ side (the replay/fork verbs) is not wired
-// yet. `with_store` / `pending_len` / `record` / `latest` / `thread` are its
-// seams — a deterministic drain a test can drive instead of racing the writer
-// thread, and the test constructor. They are tested and fail-closed, so they are
-// allow-listed rather than deleted: shipping a write-only checkpoint log would be
-// worse than an annotated gap.
 #[allow(dead_code)]
 impl RunStateRecorder {
     /// Open a recorder over the existing toron index, or `None` when no index
@@ -509,11 +501,6 @@ mod recorder_tests {
     async fn oversized_model_is_refused_and_does_not_advance_the_counter() {
         let (r, _d) = recorder("toobig").await;
         let mut model = WorkspaceModel::default();
-        // Past the 1 MiB cap without allocating a giant model: a long queue of
-        // distinct corrs is the realistic way doorbell.queues grows, and each
-        // entry serializes to ~14 bytes of JSON, so 120k clears the cap with
-        // room to spare (40k only reached ~546 KB and did NOT refuse, which is
-        // why this count is explicit rather than incidental).
         model.doorbell.queues.insert(
             "pin".into(),
             (0..120_000).map(|i| format!("corr-{i:08}")).collect(),
@@ -656,7 +643,6 @@ mod recorder_tests {
         toron_core::index::schema::migrate(&pool)
             .await
             .expect("migrate");
-        // A clock that returns the SAME value forever.
         let frozen = Arc::new(|| 7_i64);
         let r = RunStateRecorder::with_store(RunStateStore::new(pool), "flywheel/w6", frozen)
             .expect("recorder");

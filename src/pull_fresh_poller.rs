@@ -59,8 +59,6 @@ mod tests {
         assert!(due(None, 0));
         assert!(!due(Some(0), 59_999));
         assert!(due(Some(0), 60_000));
-        // Mutant: a 15s cadence would still be due at 60s, but would also
-        // be due at 15s — pin the lower bound.
         assert!(!due(Some(0), 15_000));
     }
 
@@ -83,7 +81,6 @@ mod tests {
                 "--json",
             ]
         );
-        // Mutant: dropping --as would poll as the operator, not the pin.
         assert!(
             argv.windows(2)
                 .any(|w| w[0] == "--as" && w[1] == "HostedGrok")

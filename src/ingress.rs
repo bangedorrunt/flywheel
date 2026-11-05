@@ -208,9 +208,6 @@ pub fn handle_ingress(event: &IngressEvent, adapters: &IngressAdapters) {
 pub fn ingress_to_loop_msg(event: &IngressEvent) -> Option<crate::durable::LoopMsg> {
     match event {
         IngressEvent::Hc(he) => {
-            // event_type strings MUST match what apply_events_to_states
-            // consumes ("pane.agent_status_changed" / "pane.exited") —
-            // an invented string here is a silent no-op downstream.
             let pe = match he {
                 TerminalEvent::PaneAgentStatusChanged { pane_id, status } => {
                     crate::durable::PollEvent {
@@ -234,17 +231,12 @@ pub fn ingress_to_loop_msg(event: &IngressEvent) -> Option<crate::durable::LoopM
             };
             Some(crate::durable::LoopMsg::Hc(pe))
         }
-        // Only a CLOSED ledger fact is a BrClose. Claimed/Blocked/Reopened
-        // are NOT closes — mapping them here would corrupt per_bead_phase.
         IngressEvent::LedgerFact {
             bead_id,
             event: LedgerEvent::Closed,
         } => Some(crate::durable::LoopMsg::BrClose {
             bead_id: bead_id.clone(),
         }),
-        // Watch/Workflow/Cron/other facts map is intentionally None today —
-        // they fan into doorbell or fact journal, not LoopMsg. The seam
-        // exists so a future tick arm can be added without a second bus.
         _ => None,
     }
 }
@@ -488,7 +480,6 @@ mod tests {
                 .unwrap()
                 .starts_with("[doorbell] git")
         );
-        // non-fact returns None
         let hc = IngressEvent::Hc(TerminalEvent::PaneExited {
             pane_id: "w1:p1".into(),
             terminal_name: "oc".into(),
@@ -515,8 +506,6 @@ mod tests {
 
     #[test]
     fn bd0or2_ingress_to_loop_msg_seam_exists_and_maps_plane() {
-        // event_type strings MUST match apply_events_to_states consumers —
-        // an invented string would be a silent no-op downstream.
         let status = IngressEvent::Hc(TerminalEvent::PaneAgentStatusChanged {
             pane_id: "w1:p1".into(),
             status: "idle".into(),
@@ -544,7 +533,6 @@ mod tests {
         };
         let lm2 = ingress_to_loop_msg(&lf).expect("closed ledger fact maps to BrClose");
         assert!(matches!(lm2, crate::durable::LoopMsg::BrClose { .. }));
-        // A claim is NOT a close — must not corrupt per_bead_phase.
         let claim = IngressEvent::LedgerFact {
             bead_id: "bd-123".into(),
             event: LedgerEvent::Claimed,
@@ -566,8 +554,6 @@ mod tests {
 
     #[test]
     fn bd0or2_plane_event_folds_into_tick_pending_and_drains_on_next_tick() {
-        // bd-55nx.11: exercise the LIVE entry (workspace tick), not the
-        // slice reducer — a green slice with a broken live entry must fail.
         use crate::durable::{LoopModel, PollEvent};
         use crate::workspace::{Msg as WsMsg, WorkspaceModel, tick as ws_tick};
         let ws = WorkspaceModel {
@@ -593,9 +579,6 @@ mod tests {
 
     #[test]
     fn ingress_tests_use_live_entry_not_slice() {
-        // bd-55nx.11 RED: tests must exercise the live entry
-        // (workspace tick), never the slice reducer directly.
-        // (needle split so this self-scan does not match its own source)
         let needle = ["durable", "::tick"].concat();
         let src = include_str!("ingress.rs");
         assert!(

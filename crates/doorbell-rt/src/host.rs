@@ -191,8 +191,6 @@ impl MockHost {
 impl Host for MockHost {
     fn tick(&mut self, msg: &BrainMsg) -> Vec<Effect> {
         self.tick_log.push(format!("{msg:?}"));
-        // Record the new status at tick time (mirrors FileHost/RtHost):
-        // a pre-tick `prev_status` read sees the previous value.
         if let BrainMsg::PlaneStatus { pin, status } = msg {
             self.statuses.insert(pin.clone(), status.clone());
         }
@@ -221,9 +219,6 @@ impl Host for MockHost {
     fn scan_ack_sla(&mut self) -> Vec<String> {
         std::mem::take(&mut self.sla)
     }
-
-    // bd-1i8c: the mock's mailbox is in RAM, so the default (inline) fetch
-    // and scan are the honest shape for it — no override needed.
 
     fn restart_wake(&mut self) -> bool {
         if self.restart_pending {

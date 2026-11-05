@@ -53,11 +53,6 @@ fn stop_under_a_fake_home_never_boots_out_the_service() {
     shim(&bin, "launchctl", &log);
     shim(&bin, "systemctl", &log);
 
-    // A live pid for the doorbell to stop: the clean-exit arm unloads the
-    // supervisor, which is the call under test. A reaper thread collects the
-    // corpse, so a stopped child is not a zombie the doorbell's `kill -0`
-    // still sees; the handle stays shared so the test can still kill its own
-    // child if the stop failed.
     let child = std::sync::Arc::new(std::sync::Mutex::new(
         Command::new("sleep").arg("300").spawn().expect("sleep"),
     ));

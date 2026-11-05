@@ -15,18 +15,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const PROBE_MARKER: &str = "FLYWHEEL_TEST_ENV_PROBE";
-// Literal, not `module_path!()`: in a bin target that macro is prefixed with
-// the crate name, and the harness lists the test without it.
 const PROBE: &str = "test_env_contract::operator_home_probe_child";
 
 #[test]
 fn a_test_process_does_not_touch_the_operator_home() {
     let root = doorbell_rt::testkit::harness_root();
     let _ = std::fs::remove_dir_all(&root);
-    // A SIBLING of the harness root, never inside it: the contract has to take
-    // the child out of this tree, so the child's own "inside the root" checks
-    // must be able to fail. Still under the OS temp dir, so a mutant that loses
-    // the pins writes here and never into the operator's real home.
     let operator_home =
         std::env::temp_dir().join(format!("flywheel-operator-home-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&operator_home);
@@ -34,8 +28,6 @@ fn a_test_process_does_not_touch_the_operator_home() {
     std::fs::create_dir_all(&operator_home).expect("fake operator home");
     std::fs::create_dir_all(&shim_dir).expect("shim dir");
 
-    // A tripwire, not a stub: anything in the child that reaches for the
-    // supervisor service writes here and the assertion below fails.
     let launchctl_log = root.join("launchctl.log");
     let shim = shim_dir.join("launchctl");
     std::fs::write(
@@ -61,16 +53,12 @@ fn a_test_process_does_not_touch_the_operator_home() {
         "--test-threads=1",
         "--nocapture",
     ])
-    // The OPERATOR's environment, faked: a test harness that inherits this is
-    // exactly the incident. Pointing every root at a scratch home keeps a
-    // mutant that loses the contract out of the real one.
     .env("HOME", &operator_home)
     .env("XDG_CONFIG_HOME", operator_home.join(".config"))
     .env("XDG_STATE_HOME", operator_home.join(".local/state"))
     .env("XDG_DATA_HOME", operator_home.join(".local/share"))
     .env("XDG_CACHE_HOME", operator_home.join(".cache"))
     .env("PATH", format!("{}:/usr/bin:/bin", shim_dir.display()))
-    // Exported on purpose: the contract's job is to take it back off.
     .env("TORON_MCP_URL", "http://127.0.0.1:1/never-a-daemon")
     .env(PROBE_MARKER, "1");
     doorbell_rt::testkit::apply_test_env(&mut cmd);
@@ -79,7 +67,6 @@ fn a_test_process_does_not_touch_the_operator_home() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    // A run that matched zero tests also exits 0. The child must have run.
     assert!(
         stdout.contains("running 1 test"),
         "the probe child did not run a test, so nothing was proved:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
@@ -105,7 +92,6 @@ fn a_test_process_does_not_touch_the_operator_home() {
         "the probe reached the supervisor service: {calls}"
     );
 
-    // Not just absent from HOME: the sandbox is where it actually went.
     for landed in [
         "home/.config/flywheel",
         "home/.local/state/flywheel",
@@ -137,9 +123,6 @@ fn operator_home_probe_child() {
             .expect("TORON_UNDER_TEST must be set by the harness"),
     );
 
-    // Resolution FIRST, then the assertions: a mutant that loses the pins must
-    // actually write where it would write, so the red run shows the leak
-    // instead of stopping at the first env mismatch.
     let config = crate::config::config_dir();
     let state = crate::config::state_dir();
     let (data, db) = crate::mail::mailbox_roots();
@@ -172,7 +155,6 @@ fn operator_home_probe_child() {
         "the hc pin must name a socket that is not there, got {sock}"
     );
 
-    // The two dirs flywheel resolves for itself.
     assert!(
         config.starts_with(&root),
         "config dir escaped the sandbox: {}",
@@ -184,7 +166,6 @@ fn operator_home_probe_child() {
         state.display()
     );
 
-    // The store the incident wrote: resolution only, never a live daemon.
     assert!(
         data.starts_with(&root) && db.starts_with(&root),
         "mail roots escaped the sandbox: {} / {}",

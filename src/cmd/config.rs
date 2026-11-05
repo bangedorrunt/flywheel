@@ -154,8 +154,6 @@ fn is_known(key: &str) -> bool {
 /// Commented config.toml. Every setting is named, with what it does and the
 /// default. Nothing is active until you uncomment it or `config set` it.
 pub(crate) fn config_template() -> String {
-    // One template. config.sample.toml is the annotated inventory. The header
-    // says seed will not replace the file after this first write.
     format!(
         "# Written by `flywheel config seed` because config.toml was missing.\n\
          # Seed never overwrites this file, even with --overwrite all.\n\
@@ -481,8 +479,6 @@ pub(crate) fn cmd_config(cfg: &Config, cmd: &ConfigCmd) -> Result<()> {
             } else {
                 String::new()
             };
-            // Edit the parsed table, not a `Config` round-trip: preserves
-            // every field this binary does not model (see apply_key).
             let mut table: toml::Table = toml::from_str(&raw).unwrap_or_default();
             apply_key(&mut table, key, value)?;
             if let Some(parent) = path.parent() {

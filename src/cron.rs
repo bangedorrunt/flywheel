@@ -84,7 +84,7 @@ pub fn crons_file() -> PathBuf {
     crate::config::config_dir().join("crons.toml")
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // legacy crons.toml write surface — P4 (bd-25g7.4) migrates/retires
+#[cfg_attr(not(test), allow(dead_code))]
 impl Crons {
     /// Load the registry from the real XDG path (missing file = empty).
     pub fn load() -> Result<Self> {
@@ -108,8 +108,6 @@ impl Crons {
 
     /// Persist to an explicit path.
     pub fn save_to(&self, path: &Path) -> Result<()> {
-        // Atomic temp+rename (l4s.3): a torn write would corrupt crons.toml
-        // and take the whole schedule surface down. Shared helper.
         let raw = toml::to_string_pretty(self)?;
         crate::fs_util::atomic_write(path, raw.as_bytes())
             .with_context(|| format!("write {}", path.display()))
@@ -142,7 +140,7 @@ impl Crons {
 
 /// A cron as surfaced by `flywheel cron list`: a registry entry OR a
 /// schedule-triggered workflow from the catalog/built-ins.
-#[cfg_attr(not(test), allow(dead_code))] // legacy merged view — P4 (bd-25g7.4) migrates/retires
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub struct MergedCron {
     pub entry: CronEntry,
@@ -189,12 +187,6 @@ pub fn merged_entries(
     out.sort_by(|a, b| a.entry.name.cmp(&b.entry.name));
     out
 }
-
-// ---------------------------------------------------------------------------
-// ADR-0012 Spec 4: user dirs + precedence (P12.3, bd-25g7.3). Crons are YAML
-// files in three tiers; per-project > global > built-in. The spec IS the
-// source — pause/resume only toggles `enabled` in the tier's YAML file.
-// ---------------------------------------------------------------------------
 
 /// Where a cron definition lives (ADR-0012 Spec 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,8 +318,6 @@ pub fn detect_project(cfg: &crate::config::Config, explicit: Option<&str>) -> Op
 /// global > built-in (ADR-0012 Spec 4). A higher tier with the same name
 /// SHADOWS the lower tier entirely — list shows only the winner.
 pub fn load_crons(cfg: &crate::config::Config, project: Option<&str>) -> Result<Vec<CronRow>> {
-    // bd-blank-project-spelling-non-mail-doors-76hi: Some("") used to alias
-    // the project tier onto the workspace root.
     if let Some(p) = project {
         crate::check_project_spelling(p, "cron")?;
     }
@@ -486,12 +476,9 @@ fn normalize_cron(expr: &str) -> String {
 
 /// Remap one day-of-week token from vixie to crate ordinals.
 fn normalize_dow(token: &str) -> String {
-    // Names and bare `*` already match the crate's convention.
     if token.chars().any(|c| c.is_ascii_alphabetic()) || token == "*" {
         return token.to_string();
     }
-    // Comma-separated list of items; each item is `d`, `a-b`, `d/step`,
-    // `a-b/step` or `*/step`. Remap only the numeric leaves.
     token
         .split(',')
         .map(|item| {
@@ -542,7 +529,7 @@ pub fn derive_status(enabled: bool, in_flight: bool, last_status: Option<&str>) 
 }
 
 /// The `--json` row shape for list/status (agent-driver surface).
-#[cfg_attr(not(test), allow(dead_code))] // legacy merged-row shape — P4 (bd-25g7.4) migrates/retires
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn row_json(mc: &MergedCron, status: &str, next_due_ts: Option<i64>) -> Value {
     json!({
         "name": mc.entry.name,
@@ -566,7 +553,7 @@ pub fn row_json(mc: &MergedCron, status: &str, next_due_ts: Option<i64>) -> Valu
 
 /// A cron's derived status row (Spec 3): paused | due | running | succeeded |
 /// failed, plus the next-due tick for the scheduler.
-#[cfg_attr(not(test), allow(dead_code))] // legacy derived-status row — P4 (bd-25g7.4) migrates/retires
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CronStatus {
     pub name: String,
@@ -597,7 +584,7 @@ pub struct CronRun {
 ///
 /// `add` MUST fail closed on an unresolvable template / unparsable cron /
 /// unknown owner (the lint-gate contract); the CLI does not re-validate.
-#[cfg_attr(not(test), allow(dead_code))] // legacy manager contract — P4 (bd-25g7.4) migrates/retires
+#[cfg_attr(not(test), allow(dead_code))]
 pub trait CronManager {
     /// The merged view: registry entries + schedule-triggered workflows.
     fn list(&self) -> Result<Vec<MergedCron>>;
@@ -655,16 +642,6 @@ pub fn make_registry_manager(
 ) -> RegistryCronManager {
     RegistryCronManager::new(workflows)
 }
-
-// ---- cron registrations
-//
-// The ElmCron host drives ticks over the resolved cron set. This
-// section builds those registrations from the merged view (crons.toml +
-// schedule-triggered workflows in the catalog/built-ins), provides the
-// per-mode action runner (`call_webhook` probes; headless dispatch /
-// pane dispatch / recorded dry-run), and starts the loops. Failure policy
-// (`on_failure: bead`) is executed by draining the engine's `PolicySink`
-// → `br create`.
 
 impl RegistryCronManager {
     /// The enabled [`CronRegistration`]s the durable cron manager drives:
@@ -870,8 +847,6 @@ pub fn spawn_failure_bead(bundle: &toron_workflow::FailureBundle) -> Result<Stri
             "1",
             "--description",
             &description,
-            // Fail-closed br: P1 needs a runnable VERIFY + a principle.
-            // Re-observe the failing surface: green history = fixed.
             "--verify",
             &format!("flywheel cron history {}", bundle.workflow),
             "--principle",
@@ -886,7 +861,6 @@ pub fn spawn_failure_bead(bundle: &toron_workflow::FailureBundle) -> Result<Stri
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    // `br create --json` returns the created issue; extract its id.
     let raw = String::from_utf8_lossy(&out.stdout);
     let id: String = match serde_json::from_str::<Value>(raw.trim()) {
         Ok(v) => {
@@ -1017,8 +991,6 @@ pub fn spawn_review_bead(output: &serde_json::Value, tick_ts: i64) -> Result<Opt
             "2",
             "--description",
             &description,
-            // Fail-closed br: P2 needs a runnable VERIFY + a principle.
-            // Re-observe the originating surface on triage.
             "--verify",
             "flywheel cron history weekly-review",
             "--principle",
@@ -1100,9 +1072,6 @@ pub async fn start_loops(cfg: &crate::config::Config, project: Option<&str>) -> 
         plan.refused.len()
     );
 
-    // The awareness digest is host-native (local facts, no agent). A catalog
-    // copy of the old workflow would otherwise schedule a second, LLM-backed
-    // fire under the same name; the host's schedule owns that name.
     let native = [crate::awareness::NAME];
     let before = plan.durable.len();
     plan.durable.retain(|b| {
@@ -1116,14 +1085,9 @@ pub async fn start_loops(cfg: &crate::config::Config, project: Option<&str>) -> 
         keep
     });
     if plan.durable.len() != before {
-        // The supervisor and digest still ride the host, so this count is the
-        // workflow bodies only.
         eprintln!("cron: {} workflow body(ies) planned", plan.durable.len());
     }
 
-    // The ElmCron host always runs when a store exists — it also carries
-    // the doorbell-supervisor minute schedule. Without a store everything
-    // is legacy by construction (the router refuses without one).
     let elm_handle = match store {
         Some(store) => Some(tokio::spawn(run_elm_cron_host(
             cfg.clone(),
@@ -1133,9 +1097,6 @@ pub async fn start_loops(cfg: &crate::config::Config, project: Option<&str>) -> 
         ))),
         None => None,
     };
-    // ADR-0043: the vendor runtime is gone, so a body the durable router
-    // refuses has no legacy driver left. Say so per body instead of running
-    // it on a substrate that no longer exists.
     for note in &plan.refused {
         eprintln!("cron: REFUSED (no durable model, no legacy driver): {note}");
     }
@@ -1305,9 +1266,6 @@ fn refusal_reason(workflow: &Workflow, has_store: bool) -> Option<String> {
                 .to_string(),
         );
     }
-    // bd-spawn-launcher-flip-d8mv: a cron body has no launcher, so a spawn
-    // would park forever on the durable host. Keep it explicit here as well
-    // as through the router's `spawn_capable = false`.
     if body_has_spawn(workflow) {
         return Some(
             "spawn needs a launcher; a cron body has none, so it stays on the legacy driver"
@@ -1436,8 +1394,6 @@ async fn run_elm_cron_host(
             );
         }
     }
-    // Doorbell minute schedule rides this host (folded from the
-    // server-side supervisor registration, which is gone).
     if let Err(e) = elm.add(
         crate::doorbell::SUPERVISOR_NAME,
         crate::doorbell::SUPERVISOR_CRON,
@@ -1448,9 +1404,6 @@ async fn run_elm_cron_host(
     ) {
         eprintln!("cron doorbell-supervisor: invalid schedule: {e:#}");
     }
-    // The awareness digest is host-native too: its facts are local, so paying
-    // an agent to re-read them every 15 minutes was the expensive way to say
-    // "nothing changed".
     if let Err(e) = elm.add(
         crate::awareness::NAME,
         crate::awareness::SCHEDULE,
@@ -1506,10 +1459,6 @@ async fn run_elm_cron_host(
                         }
                         Err(e) => eprintln!("cron doorbell-supervisor: heal failed: {e}"),
                     }
-                    // This body is not a workflow: it heals panes directly. The
-                    // run `ElmCron::tick` started must still be settled here, or
-                    // every minute leaves a `running` run and an `in_flight`
-                    // journal row that nothing will ever finish.
                     settle_native_run(engine_store, journal, key, healed.is_ok(), crate::doorbell::SUPERVISOR_NAME)
                         .await;
                 });
@@ -1524,8 +1473,6 @@ async fn run_elm_cron_host(
                 tokio::spawn(async move {
                     let outcome = match digests.as_deref() {
                         Some(project) => crate::awareness::tick(&cfg, project).await,
-                        // A host started outside any project has no fleet to
-                        // be aware of; the schedule still settles.
                         None => Ok(None),
                     };
                     match &outcome {
@@ -1595,7 +1542,6 @@ async fn drive_cron_body(
     body: &CronBody,
     fire: &CronFire,
 ) -> CronBodyOutcome {
-    // Same schedule trigger the toron loop synthesizes per tick.
     let trigger = serde_json::json!({
         "type": "schedule",
         "cron": body.schedule,
@@ -1603,15 +1549,15 @@ async fn drive_cron_body(
         "owner": body.owner,
         "scope": body.scope,
     });
+    let journal_mode = crate::pane::engine_journal_mode(true, true)
+        .unwrap_or(EffectJournalMode::Enforced);
     let seams = crate::durable_body::BodySeams {
         leaf: LeafSeams {
             async_runner: None,
             sync_runner: Some(body.runner.clone()),
             verify_sink: crate::durable_body::real_verify_sink(),
-            journal_mode: EffectJournalMode::Enforced,
+            journal_mode,
         },
-        // The cron partition refuses spawn bodies (no pane launcher on this
-        // door); call_workflow children resolve through the shared catalog.
         launcher: None,
         resolve_child: Some(std::sync::Arc::new(
             crate::workflow_catalog::subworkflow_resolver(None),
@@ -1623,9 +1569,6 @@ async fn drive_cron_body(
         &body.workflow,
         trigger,
         &seams,
-        // ElmCron started this run in the `cron` journal. Driving it in any
-        // other scope would settle a second row and leave the starter's row
-        // `in_flight` forever.
         "cron",
     )
     .await
@@ -1652,9 +1595,6 @@ async fn settle_cron_fire(
     match outcome {
         CronBodyOutcome::Completed(output) => {
             consecutive.lock().await.remove(&body.display);
-            // The cron history reads Workflow events by the cron NAME; log the
-            // completion under the name the operator types, not the tick
-            // wrapper's `-tick` workflow name.
             crate::log(
                 project.unwrap_or("flywheel"),
                 crate::state::EventKind::Workflow,
@@ -1746,8 +1686,6 @@ impl CronManager for RegistryCronManager {
     }
 
     fn add(&mut self, entry: CronEntry) -> Result<()> {
-        // fail-stop validation, mirroring lint_flywheel_tier: template must
-        // resolve, owner profile must exist, cron must parse (upsert checks).
         if !self.workflows.contains_key(&entry.template) {
             bail!(
                 "template {:?} does not resolve (flywheel workflow list)",
@@ -1787,7 +1725,7 @@ impl CronManager for RegistryCronManager {
 }
 
 /// Derive a [`CronStatus`] row for a merged cron (registry state + state log).
-#[cfg_attr(not(test), allow(dead_code))] // legacy — P4 (bd-25g7.4) migrates/retires
+#[cfg_attr(not(test), allow(dead_code))]
 fn cron_status(mc: &MergedCron) -> CronStatus {
     let (last, in_flight) = last_run_state(&mc.entry.name);
     let status = derive_status(mc.entry.enabled, in_flight, last.as_deref());
@@ -1804,8 +1742,6 @@ fn cron_status(mc: &MergedCron) -> CronStatus {
 pub fn last_run_state(name: &str) -> (Option<String>, bool) {
     let mut last_status: Option<String> = None;
     let mut in_flight = false;
-    // One shared sweep (bd-2jyp): reserved bookkeeping logs (miss-ledger) use
-    // a different row schema and must never be parsed as projects.
     for project in crate::state::project_logs() {
         let Ok(events) = crate::state::read_log(&project) else {
             continue;
@@ -1843,8 +1779,6 @@ pub fn cron_history(name: &str) -> Vec<CronRun> {
             if owner != Some(name) {
                 continue;
             }
-            // Annotation rows (ship link gates, plan-warn telemetry, loop
-            // monitor notices) share the run event kinds; they are not runs.
             if crate::is_annotation_row(&e) {
                 continue;
             }
@@ -1856,9 +1790,6 @@ pub fn cron_history(name: &str) -> Vec<CronRun> {
                     .get("run_id")
                     .and_then(Value::as_i64)
                     .map(|i| i.to_string()),
-                // ADR-0032 Spec 9 tail: an unrecorded status is `unknown`,
-                // never a defaulted `done` (shared with `runs list` /
-                // `--robot-snapshot`).
                 status: crate::history_row_status(&e.data),
                 bead: e
                     .data
@@ -1868,9 +1799,6 @@ pub fn cron_history(name: &str) -> Vec<CronRun> {
             });
         }
     }
-    // P10.4: headless runs land in `runs/<run_id>.jsonl` (the __run-headless
-    // leaf) with the cron name on the entry — the same history surface must
-    // read them, or cron outcomes would be invisible here.
     for hl in crate::run_log::read_runs() {
         if hl.cron.as_deref() != Some(name) {
             continue;
@@ -2092,13 +2020,6 @@ owner = "housekeeper"
     #[test]
     fn pane_mode_runner_dispatches_not_records() {
         use toron_workflow::schema::Action;
-        // Hermetic XDG: no catalog, no spawn registry → the dispatch path
-        // must fail fast (the recording runner would return Ok).
-        // state_dir() honors XDG_STATE_HOME, so the live spawn registry
-        // (state dir, not config dir) must be redirected too — otherwise
-        // the test reads the operator's live panes and dispatches for real.
-        // bd-3dge: snapshot what we touch — an unrestored XDG leaves later
-        // tests resolving the ambient/relative store.
         let _g = crate::config::lock_env();
         let prev_config = std::env::var_os("XDG_CONFIG_HOME");
         let prev_state = std::env::var_os("XDG_STATE_HOME");
@@ -2107,9 +2028,6 @@ owner = "housekeeper"
         std::fs::create_dir_all(&dir).unwrap();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
         unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
-        // The project-local mirror (.flywheel/agent-names.json) resolves
-        // via the registry root, not XDG — without this the test reads the
-        // operator's live bindings and dispatches for real.
         let _reg = crate::state::set_registry_root_override(dir.clone());
         let mut e = sample("weekly-x");
         e.mode = CronMode::Pane;
@@ -2147,9 +2065,6 @@ owner = "housekeeper"
     #[test]
     fn recording_runner_records_headless_body_steps() {
         use toron_workflow::schema::Action;
-        // a headless-mode cron: spec_runner for it dispatches, but the
-        // on-demand path must NOT use spec_runner — the recording runner is
-        // the dry-run surface for every mode.
         let mut e = sample("weekly-x");
         e.mode = CronMode::Headless;
         let runner = recording_runner();
@@ -2164,7 +2079,7 @@ owner = "housekeeper"
                 channel: None,
             },
             Action::CallWebhook {
-                url: "http://127.0.0.1:9/probe".into(), // unroutable: recorded as failure, still completes
+                url: "http://127.0.0.1:9/probe".into(),
                 method: None,
                 body: None,
             },
@@ -2187,9 +2102,6 @@ owner = "housekeeper"
     /// neither corrupts the destination nor survives the save.
     #[test]
     fn save_to_is_atomic_leaves_no_temp() {
-        // Hermetic per-test dir (193.2): the temp root is shared across
-        // processes (sibling agents' cargo runs, cron_cli subprocesses) —
-        // stale-file names must not collide with other tests' artifacts.
         let dir = tmp_path("atomic");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("crons.toml");
@@ -2197,9 +2109,6 @@ owner = "housekeeper"
         crons.upsert(sample("atomic-cron")).unwrap();
         crons.save_to(&path).unwrap();
 
-        // Simulated crash residue: a stale temp file must be ignored (the
-        // atomic rename never touches it) and a fresh save must produce a
-        // clean, loadable destination with no NEW temp leftovers.
         let stale = dir.join(".crons.toml.tmp-999999");
         std::fs::write(&stale, b"garbage").unwrap();
         crons.upsert(sample("atomic-cron-2")).unwrap();
@@ -2270,8 +2179,6 @@ owner = "housekeeper"
     /// next_due finds a future tick for a valid expr; None for garbage.
     #[test]
     fn next_due_computes_future_tick() {
-        // 2026-08-08T04:00:00Z — the expr is daily 03:30 UTC, so the next due
-        // is the NEXT DAY 03:30 (today's 03:30 already passed).
         let from = chrono::DateTime::parse_from_rfc3339("2026-08-08T04:00:00Z")
             .unwrap()
             .timestamp();
@@ -2287,7 +2194,6 @@ owner = "housekeeper"
     /// The Spec 3 day-of-week `0` (vixie Sunday) normalizes to `7` and parses.
     #[test]
     fn next_due_accepts_vixie_sunday_zero() {
-        // 2026-08-08 is a Saturday; Sunday 03:30 UTC is the next day.
         let from = chrono::DateTime::parse_from_rfc3339("2026-08-08T04:00:00Z")
             .unwrap()
             .timestamp();
@@ -2381,8 +2287,6 @@ owner = "housekeeper"
         let names: Vec<&str> = merged.iter().map(|m| m.entry.name.as_str()).collect();
         assert_eq!(names, vec!["weekly-backup", "weekly-docker-upgrade"]);
 
-        // registry wins: the crons.toml entry (host, housekeeper) shadows the
-        // derived workflow (project, other)
         let reg = merged
             .iter()
             .find(|m| m.entry.name == "weekly-docker-upgrade")
@@ -2392,7 +2296,6 @@ owner = "housekeeper"
         assert_eq!(reg.entry.scope, CronScope::Host);
         assert_eq!(reg.entry.cron, "30 3 * * 0");
 
-        // derived: built-in schedule workflow surfaces with source=builtin
         let derived = merged
             .iter()
             .find(|m| m.entry.name == "weekly-backup")
@@ -2493,11 +2396,9 @@ owner = "housekeeper"
         let mut mgr = MockManager::default();
         let mut entry = sample("weekly-docker-upgrade");
 
-        // add
         mgr.add(entry.clone()).expect("add");
         assert_eq!(mgr.list().unwrap().len(), 1);
 
-        // show + status (due before any runs)
         let shown = mgr.show("weekly-docker-upgrade").unwrap().expect("show");
         assert_eq!(shown.entry.template, "weekly-docker-upgrade-wf");
         let st = mgr
@@ -2507,7 +2408,6 @@ owner = "housekeeper"
         assert_eq!(st.status, "due");
         assert!(st.next_due.is_some(), "next_due computed");
 
-        // pause → status flips to paused, entry preserved
         mgr.set_enabled("weekly-docker-upgrade", false).unwrap();
         let paused = mgr.status("weekly-docker-upgrade").unwrap().unwrap();
         assert_eq!(paused.status, "paused");
@@ -2521,19 +2421,16 @@ owner = "housekeeper"
             "pause preserves cron expr"
         );
 
-        // resume → back to due
         mgr.set_enabled("weekly-docker-upgrade", true).unwrap();
         assert_eq!(
             mgr.status("weekly-docker-upgrade").unwrap().unwrap().status,
             "due"
         );
 
-        // status_all + history complete the surface
         let all = mgr.status_all().unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(mgr.history("weekly-docker-upgrade").unwrap().len(), 0);
 
-        // the same lifecycle through a trait object (the CLI's dispatch shape)
         let mut dyn_mgr: Box<dyn CronManager> = Box::new(MockManager::default());
         dyn_mgr.add(entry.clone()).unwrap();
         entry.enabled = false;
@@ -2602,7 +2499,7 @@ owner = "housekeeper"
     #[test]
     fn registrations_fail_on_unresolved_template() {
         let mut crons = Crons::default();
-        crons.upsert(sample("ghost-cron")).unwrap(); // template ghost-cron-wf
+        crons.upsert(sample("ghost-cron")).unwrap();
         let mgr = make_registry_manager(BTreeMap::new());
         assert!(mgr.registrations_from(&crons).is_err());
     }
@@ -2631,9 +2528,6 @@ owner = "housekeeper"
         std::thread::spawn(move || serve(listener));
         std::thread::sleep(std::time::Duration::from_millis(20));
 
-        // The probe behavior lives on the recording runner (the dry-run
-        // surface) — pane mode dispatches (bd-5qls), headless shells out to
-        // __run-headless.
         let runner = recording_runner();
         let ok = runner(&inv_of(Action::CallWebhook {
             url: format!("http://127.0.0.1:{port}/health"),
@@ -2643,8 +2537,7 @@ owner = "housekeeper"
         .unwrap();
         assert_eq!(ok["ok"], true, "live probe succeeds: {ok}");
 
-        // closed port → probe errors (a step with on_error: fail_run fails)
-        let dead_port = 1; // port 1 is not listening
+        let dead_port = 1;
         let dead = runner(&inv_of(Action::CallWebhook {
             url: format!("http://127.0.0.1:{dead_port}/health"),
             method: Some("GET".into()),
@@ -2652,7 +2545,6 @@ owner = "housekeeper"
         }));
         assert!(dead.is_err(), "dead probe errors: {dead:?}");
 
-        // non-webhook actions are recorded, not dispatched
         let rec = runner(&inv_of(Action::SendDm {
             to: "housekeeper".into(),
             body: "x".into(),
@@ -2688,7 +2580,6 @@ owner = "housekeeper"
             let port = {
                 let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
                 listener.local_addr().expect("local addr").port()
-                // listener drops here, releasing the port
             };
             if std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
                 return port;
@@ -2718,9 +2609,6 @@ owner = "housekeeper"
     async fn docker_upgrade_health_gate_fails_when_a_service_is_down() {
         use toron_workflow::schema::{Action, Step, StepOnError};
 
-        // Five live listeners standing in for the saga's health-gated services.
-        // Each reads the request, then replies (a proper HTTP handshake — the
-        // bash saga's real services behave the same way).
         fn serve(listener: std::net::TcpListener) {
             use std::io::{Read, Write};
             for stream in listener.incoming() {
@@ -2738,11 +2626,6 @@ owner = "housekeeper"
             ports.push(listener.local_addr().unwrap().port());
             std::thread::spawn(move || serve(listener));
         }
-        // Listener-readiness barrier (193.2 flake fix): a fixed sleep races
-        // parallel test load (sibling agents' cargo runs, the loop's own
-        // subprocesses) — accept() may not have been reached yet and the
-        // probe gets connection-refused. Poll until every listener accepts
-        // (bounded 5s), THEN build the workflow.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let ready = ports
@@ -2758,7 +2641,6 @@ owner = "housekeeper"
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
 
-        // One explicit probe step per service, each on_error: fail_run.
         let probe_step = |name: &str, port: u16| Step {
             name: Some(name.into()),
             guard: None,
@@ -2787,9 +2669,6 @@ owner = "housekeeper"
             crew: None,
         };
 
-        // All five up → every recording-runner probe succeeds. The workflow
-        // engine deliberately rejects the deprecated CallWebhook action, so
-        // this unit exercises the live probe adapter directly.
         let runner = recording_runner();
         for port in &ports {
             let out = runner(&inv_of(Action::CallWebhook {
@@ -2801,9 +2680,6 @@ owner = "housekeeper"
             assert_eq!(out["ok"], true, "all services up => probe passes: {out}");
         }
 
-        // One dead service (e.g. honcho down) → the probe fails. The port is
-        // CONFIRMED closed rather than assumed to be: `last + 1` is just a
-        // number, and on a busy machine it belongs to somebody else.
         let dead = confirmed_closed_port();
         let dead_out = runner(&inv_of(Action::CallWebhook {
             url: format!("http://127.0.0.1:{dead}/health"),
@@ -2851,8 +2727,6 @@ owner = "housekeeper"
         assert!(description.contains("gate-honcho"), "desc failed_step");
         assert!(description.contains("consecutive: 2"), "desc streak");
     }
-
-    // ---- bd-m7ac: weekly-review bead extraction ----
 
     /// The oracle's `{"idea": {...}}` in the tick output extracts cleanly.
     #[test]
@@ -2933,7 +2807,6 @@ owner = "housekeeper"
     /// The tick's unix timestamp formats to its calendar date.
     #[test]
     fn tick_date_formats_calendar_date() {
-        // 2026-08-10T01:00:00Z
         assert_eq!(tick_date(1786323600), "2026-08-10");
         assert_eq!(tick_date(0), "1970-01-01");
         assert_eq!(tick_date(-5), "unknown", "pre-epoch degrades safely");
@@ -2964,7 +2837,6 @@ owner = "housekeeper"
         let fires = first.tick(now_ms).expect("tick");
         assert_eq!(fires.len(), 1);
         let checkpoint = first.last_fired_ms("cron:test").expect("checkpoint");
-        // Restart: fresh scheduler restored from the checkpoint.
         let mut second = ElmCron::new();
         second
             .add("cron:test", "* * * * *", checkpoint)
@@ -3032,8 +2904,6 @@ owner = "housekeeper"
         };
         let reason = refusal_reason(&approval, true).expect("approval refuses");
         assert!(reason.contains("resolution loop"), "{reason}");
-        // A call_workflow body is ADMITTED: the host supplies the shared
-        // catalog resolver (a cron may call a catalog workflow).
         let mut call = linear.clone();
         call.steps[0].action = Action::CallWorkflow {
             workflow: "child".into(),

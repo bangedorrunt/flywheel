@@ -27,8 +27,6 @@ use toron_core::backend::{
 #[path = "rex_cli.rs"]
 pub(crate) mod rex_cli;
 
-// Test-only reuse: preflight's pane-plane tests drive the same fake `rex`
-// binary. Test builds only; no production surface.
 #[cfg(test)]
 pub(crate) use rex_cli::RexBinGuard;
 
@@ -213,9 +211,6 @@ impl SuperlogicalBackend {
     fn block_status(rex: &Rex, session: &str, block: &str) -> Result<AgentStatus, RexFail> {
         let records = rex.json(&program_status_args(session, block))?;
         let (board, order) = board_of(&records);
-        // Records win when any exist; the process fallback only covers the
-        // empty board (a harness that never reports, e.g. opencode today).
-        // One extra call per silent block, skipped for reporting harnesses.
         if board.is_empty() {
             let process = rex.json(&process_args(session, block))?;
             Ok(status_for_block(
@@ -238,11 +233,6 @@ impl SuperlogicalBackend {
     ) -> Result<Value, toron_core::backend::BackendError> {
         let rex = Self::rex()?;
         let (session, block) = Self::locate(&rex, target).map_err(RexFail::into_backend)?;
-        // A prompt into a booting or busy TUI is lost or misplaces the Enter
-        // (what `--settle-secs` papers over). Write + Enter only at a
-        // prompt-ish status. OSC `clear` removes the record before it folds,
-        // so it never surfaces as an `AgentStatus` here; the three ready
-        // states cover it.
         let ready = |s: &AgentStatus| {
             matches!(
                 s,
@@ -263,8 +253,6 @@ impl SuperlogicalBackend {
             }
         }
         if !ready(&status) {
-            // Busy, never Connect/Io/Timeout: the fallback arm retries those
-            // on hc, and a busy pane must never be re-sent there.
             return Err(BackendError::new(
                 BackendErrorCode::Other("busy".into()),
                 format!(
@@ -288,9 +276,6 @@ impl SuperlogicalBackend {
         let receipt = rex
             .json(&write_args(session, block, text))
             .map_err(RexFail::into_backend)?;
-        // Submission is part of prompt semantics (hc `agent.prompt`
-        // submits): `write` only queues bytes, so a prompt without Enter
-        // would sit in the prompt buffer unread.
         rex.text(&send_key_args(session, block, &["enter"]))
             .map_err(RexFail::into_backend)?;
         Ok(receipt)
@@ -389,7 +374,6 @@ impl MultiplexerBackend for SuperlogicalBackend {
     }
 
     fn pane_close(&self, pane_id: &str) -> Result<(), toron_core::backend::BackendError> {
-        // One block. `block.close` does not destroy the session.
         let rex = Self::rex()?;
         let (session, block) = Self::locate(&rex, pane_id).map_err(RexFail::into_backend)?;
         rex.text(&block_close_args(&session.session_id, &block.block_id))
@@ -408,9 +392,6 @@ impl MultiplexerBackend for SuperlogicalBackend {
             }
             .into_backend());
         }
-        // In-pane execution like hc `pane.run` (send text, then Enter):
-        // the command runs where the caller points, never in a fresh split.
-        // A headless one-shot belongs in `do_args` Lua (`rex.exec`), not here.
         let rex = Self::rex()?;
         let (session, block) = Self::locate(&rex, pane_id).map_err(RexFail::into_backend)?;
         rex.json(&write_args(&session.session_id, &block.block_id, command))
@@ -472,8 +453,6 @@ impl MultiplexerBackend for SuperlogicalBackend {
         workspace_id: &str,
         _close_group: bool,
     ) -> Result<(), toron_core::backend::BackendError> {
-        // A rex session is the workspace. Both close flags destroy it.
-        // `session kill` does not fall through to hc.
         let rex = Self::rex()?;
         rex.text(&session_kill_args(workspace_id))
             .map_err(RexFail::into_backend)?;
@@ -546,7 +525,6 @@ impl MultiplexerBackend for SuperlogicalBackend {
         until: &[AgentStatus],
         timeout_ms: Option<u64>,
     ) -> Result<AgentInfo, toron_core::backend::BackendError> {
-        // No timeout means one read. An open wait would never return.
         let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
         loop {
             let rex = Self::rex()?;
@@ -1004,9 +982,6 @@ esac
     /// create, split, run, read, prompt, and the landed prompt_coded path.
     #[test]
     fn superlogical_covers_create_split_run_read_and_prompt() {
-        // The guard serializes `REX_BIN_DIR` globally (REX lock plus the
-        // crate-wide env lock), so no manual hold is needed or allowed
-        // here — nesting another env acquisition would self-deadlock.
         let guard = RexBinGuard::install(PARITY_REMAINING_REX);
         let backend = SuperlogicalBackend;
 

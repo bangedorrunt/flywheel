@@ -249,22 +249,17 @@ pub(crate) fn cmd_models(cmd: &ModelCmd) -> Result<()> {
             no_input,
             dry_run,
         } => {
-            // Resolve the id first (bare → composite via default provider).
             let reg = crate::models::ModelRegistry::load_routing()?;
             let key = reg
                 .key_for(id)
                 .ok_or_else(|| anyhow!("unknown model {id:?} — register it first: flywheel model add {id} --provider <p>"))?;
             let entry = reg.models.get(&key).cloned();
             let entry = entry.ok_or_else(|| anyhow!("unknown model {id:?}"))?;
-            // Grok is closed-source with its own proprietary model: it is
-            // not a slot target and a grok-caps-only model cannot serve a
-            // slot default (operator decision 2026-09-05).
             if entry.caps.len() == 1 && entry.caps[0] == "grok" {
                 bail!(
                     "model {key} is grok-only — grok is closed-source with its own proprietary model and cannot serve as a slot default"
                 );
             }
-            // Target slot: flag, else TTY select, else error.
             let slot_name = match slot.as_deref().map(str::trim) {
                 Some(s) if !s.is_empty() => s.to_string(),
                 _ => {
@@ -285,9 +280,6 @@ pub(crate) fn cmd_models(cmd: &ModelCmd) -> Result<()> {
             }
             let routing = crate::models::ModelRegistry::load_routing()?;
             let current = routing.slot(&slot_name).cloned().unwrap_or_default();
-            // Loud warn (not refusal — the operator may know something the
-            // registry does not): a caps whitelist that excludes the slot's
-            // harness means every spawn detours through the fallback ladder.
             if let Some(h) = (!current.harness.is_empty()).then_some(current.harness.as_str())
                 && !entry.caps.is_empty()
                 && !entry.caps.iter().any(|c| c == h)
@@ -311,10 +303,6 @@ pub(crate) fn cmd_models(cmd: &ModelCmd) -> Result<()> {
                 }));
                 return Ok(());
             }
-            // bd-ll3k: persist through the USER registry only — saving the
-            // routing layer here baked every compiled-in entry into the
-            // user file (contradicting this verb's own never-bake rule and
-            // freezing future compiled-in updates out for this user).
             let mut user = crate::models::ModelRegistry::load()?;
             user.slots.insert(slot_name.clone(), next);
             user.save()?;
@@ -328,8 +316,6 @@ pub(crate) fn cmd_models(cmd: &ModelCmd) -> Result<()> {
             dry_run,
         } => {
             let reg = crate::models::ModelRegistry::load_routing()?;
-            // Resolve halves: flags, else TTY prompt, else error.
-            // Non-interactive callers must pass both halves explicitly.
             let mut model_id = model.as_deref().map(str::trim).unwrap_or("").to_string();
             let mut harness_id = harness.as_deref().map(str::trim).unwrap_or("").to_string();
             if (model_id.is_empty() || harness_id.is_empty())
@@ -454,8 +440,6 @@ pub(crate) fn cmd_models(cmd: &ModelCmd) -> Result<()> {
                 if *no_input || !std::io::stdin().is_terminal() {
                     bail!("model remove: pass at least one id (flywheel model list)");
                 }
-                // TTY + no ids → dialoguer MultiSelect over USER models only
-                // (compiled-in ids are never deletable — D4).
                 let user = crate::models::ModelRegistry::load()?;
                 if user.models.is_empty() {
                     bail!("no user models to remove (compiled-in ids are not deletable)");
@@ -475,8 +459,6 @@ pub(crate) fn cmd_models(cmd: &ModelCmd) -> Result<()> {
             let mut removed: Vec<String> = Vec::new();
             let mut skipped: Vec<String> = Vec::new();
             for raw in &picked_ids {
-                // Bare id → composite via the routing layer's default-provider
-                // resolution; provider/model keys pass through verbatim.
                 let key = if raw.contains('/') || !*resolve {
                     raw.clone()
                 } else {

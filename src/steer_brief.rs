@@ -114,7 +114,6 @@ pub fn run_briefing(
     )?;
     writeln!(out, "  {} {}", dim("objective:"), accent(&ctx.objective))?;
 
-    // (1) total pane budget N (ADR-0011 D2). Per-role counts are packed, not edited.
     let unique = ctx.crew_plan.len() as u32;
     let default_n = if ctx.default_budget > 0 {
         ctx.default_budget
@@ -152,7 +151,6 @@ pub fn run_briefing(
         writeln!(out, "  {} -> {}", dim("N"), ok(&format!("{n}")))?;
     }
 
-    // (2) per-role models with cost/caps + funded column (ADR-0026 Spec 2).
     writeln!(
         out,
         "\n{} {}",
@@ -206,7 +204,6 @@ pub fn run_briefing(
         }
     }
 
-    // (3) squad recommendation + per-role harness remix (bound into argv).
     writeln!(out, "\n{} {}", accent_lav("[3/4]"), ok("fleet shape:"))?;
     match &ctx.squad_recommendation {
         Some(squad) => writeln!(out, "  {} {}", dim("recommended squad:"), accent(squad))?,
@@ -273,7 +270,6 @@ pub fn run_briefing(
         }
     }
 
-    // (4) resolved stage-chain preview.
     writeln!(
         out,
         "\n{} {} {:?}:",
@@ -285,7 +281,6 @@ pub fn run_briefing(
         writeln!(out, "  {} {}", dim("-"), stage)?;
     }
 
-    // go/no-go — amber gate per hacker-night warning slot
     write!(out, "\n{} > ", warn("dispatch? [Y/n]"))?;
     out.flush()?;
     let verdict = read_line(input)?;
@@ -309,8 +304,6 @@ fn read_line(input: &mut dyn BufRead) -> std::io::Result<String> {
     let mut line = String::new();
     let n = input.read_line(&mut line)?;
     if n == 0 {
-        // EOF: treat as Enter (keep defaults) so a piped-closed stdin never
-        // spins — the non-TTY path never reaches here, this is a guard.
         return Ok(String::new());
     }
     Ok(line)
@@ -378,13 +371,11 @@ mod tests {
 
     #[test]
     fn blank_answers_keep_defaults_and_go() {
-        // N + 1 model + 1 harness + go/no-go
         let (outcome, rendered) = drive(&["", "", "", ""]);
         assert_eq!(
             outcome,
             go(2, &[("coder", "deepseek-v4.1-flash")], &[("coder", "omp")])
         );
-        // The golden sections all render.
         assert!(rendered.contains("== captain briefing: steer \"goal\""));
         assert!(rendered.contains("crew budget N"));
         assert!(rendered.contains("default=2"));
@@ -472,7 +463,6 @@ mod tests {
 
     #[test]
     fn eof_on_any_prompt_keeps_defaults_never_spins() {
-        // Empty stdin = immediate EOF at every read.
         let mut inp = std::io::Cursor::new("");
         let mut out: Vec<u8> = Vec::new();
         let outcome = run_briefing(&ctx(), &mut inp, &mut out).expect("eof-safe");
@@ -509,8 +499,6 @@ mod tests {
 
     #[test]
     fn workflow_source_renders_workflow_prefix_and_shared_shape() {
-        // bd-nmzk: same prompt module, same 4 sections — only the header
-        // source differs (workflow vs steer). Lockstep guarantee.
         let c = BriefingContext {
             objective: "run the weekly-review flow".into(),
             workflow: "weekly-review".into(),

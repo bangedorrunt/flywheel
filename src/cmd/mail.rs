@@ -79,10 +79,6 @@ pub(crate) enum MailCmd {
     },
     /// FTS5 search over the project's indexed messages
     Search {
-        // bd-g5q4: required positionals must precede optional ones — the old
-        // `[PROJECT] <QUERY>` order panicked in clap's debug asserts, making
-        // this subcommand unusable in any arg order. Search is project-scoped
-        // FTS (no identity in the query contract), so there is no --as here.
         /// FTS5 query (phrase/prefix/boolean; hyphenated ids are quoted)
         query: String,
         project: Option<String>,
@@ -120,9 +116,6 @@ pub(crate) enum MailCmd {
     },
     /// resolve an agent's profile (npub, program, model, task)
     Whois {
-        // bd-vben: same defect bd-g5q4 fixed for Search — a required
-        // positional after an optional one trips clap's debug asserts, so
-        // `<AGENT> [PROJECT]` is the only usable order.
         /// agent (adjective+noun or terminal short name)
         agent: String,
         project: Option<String>,
@@ -374,22 +367,12 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             let mail = crate::mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
             let name = mail.name.clone();
-            // 2026-08-15: an UNREGISTERED --as identity previously made the
-            // inbox projection scan without an agent scope (multi-second
-            // hang). Fail fast with the registration command instead.
             if mail.whois(&key, &name).is_err() {
                 anyhow::bail!(
                     "mail identity {name} is not registered for {project} — register it \
                      first: flywheel mail register {project} --name <adjnoun-pin>"
                 );
             }
-            // --unread needs the filtered surface; --urgent rides the same
-            // inbox() call, which honors the flag with id-set parity to
-            // inbox_filtered/MCP urgent_only (bd-mail-surface-drift-7r2o).
-            // bd-zd2v: --since (RFC3339 or the `last` cursor) rides the
-            // filtered surface with the other flags passed through; without
-            // it the legacy path below is byte-identical to before.
-            // bd-44hw: --thread-id rides it too (post-unwrap server-side).
             let v = match crate::inbox_cli_filter(
                 *urgent,
                 *unread,
@@ -400,9 +383,6 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 Some(f) => mail.inbox_filtered(&key, &name, &f)?,
                 None => mail.inbox(&key, &name, *urgent, *limit)?,
             };
-            // bd-mail-inbox-json-a7wc: --json is the DOCUMENTED machine
-            // contract (stable keys + types); the default dump stays
-            // byte-identical to before.
             print_json(&if *json {
                 crate::mail::inbox_json_rows(&v)
             } else {
@@ -520,7 +500,6 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             let key = crate::project_dir_str(cfg, project)?;
             let mail = crate::mail_or_die(cfg)?;
             mail.ensure_project(&key)?;
-            // bd-register-portability-3c2b: never mint an unnamed identity.
             let mut decided = crate::resolve_register_name(name.clone(), from_project.as_deref())?;
             if let Some(adopt) = adopt_unnamed.as_deref() {
                 let (data_dir, _) = crate::mail::mailbox_roots();
@@ -535,11 +514,6 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                      project's identities binds here"
                 );
             }
-            // Import: copy the source project's key into this project's
-            // named slot BEFORE registering — register_agent then REUSES
-            // that npub instead of minting a second identity. bd-zugo: a
-            // missing source key is a LOUD refusal, never a silent fresh
-            // mint (the ghost holder that could lease but never commit).
             if let Some(from) = from_project.as_deref()
                 && from != project
             {
@@ -663,8 +637,6 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         } => {
             if let Some(pkey) = product {
                 // governed-by: bd-jcqq — product fan-out lives in
-                // product_digest_for; the CLI only lists members, anchors
-                // the actor, and resolves member dirs.
                 let probe = crate::mail_or_die(cfg)?;
                 let members: Vec<String> = probe
                     .ensure_product(pkey, None)?
@@ -676,9 +648,6 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                             .collect()
                     })
                     .unwrap_or_default();
-                // Actor anchor: first member (ensure+register there, like
-                // the single-project path). No members → bare facade, no
-                // writes; product_digest_for renders the gap.
                 let mail = match members.first() {
                     Some(first) => crate::mail_as(
                         cfg,
@@ -712,8 +681,6 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                     for a in arr {
                         let n = a.get("name").and_then(|x| x.as_str()).unwrap_or("");
                         if let Ok(d) = crate::digest_for(&mail, &key, n) {
-                            // bd-dbre: name-alias identities resolve to the
-                            // same pin inbox — emit one row per identity.
                             let id = d.get("mail_identity").and_then(|v| v.as_str());
                             if id.is_some_and(|i| !seen_identities.insert(i.to_string())) {
                                 continue;
@@ -767,10 +734,6 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             let key = crate::project_dir_str(cfg, project)?;
             let mail = crate::mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
-            // bd-mail-crew-fanout-xq6b: --crew expands the project spawn
-            // registry into recipients (sender excluded, deduped); explicit
-            // --to entries union on top. toron rejects broadcast=true (AM
-            // invariant) — this is the supported per-recipient alternative.
             let mut targets: Vec<String> = Vec::new();
             if *crew {
                 let entries = crate::state::load_spawn_registry(project);
@@ -801,14 +764,11 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 ),
                 None => {}
             }
-            // ADR-0025 Spec 4: alias cleared under continue/adopt — --to captain fails loud until rebound
             for t in &targets {
                 if t.eq_ignore_ascii_case("captain") {
                     crate::state::resolve_captain_target(project, t)?;
                 }
             }
-            // GS-006 plane tripwire: mail is gift-wrap private. Job-assign via private gift-wrap is the wrong plane
-            // (should be channel/doorbell/job). Secret→public does not fire here (mail is private, safe), but job→private does.
             {
                 let has_p = !targets.is_empty();
                 if let Err(e) = crate::plane_route::check_job_tripwire(
@@ -817,9 +777,6 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                     anyhow::bail!(e);
                 }
             }
-            // bd-8pis: dead-pin hardening — loud advisory warn per
-            // recipient with no live pane and no heartbeat. Mail stays
-            // async: the send below runs regardless.
             for line in crate::send_liveness_warnings(cfg, project, &targets) {
                 eprintln!("{line}");
             }
@@ -850,8 +807,6 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             let key = crate::project_dir_str(cfg, project)?;
             let mail = crate::mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
-            // ADR-0010 D8 (bd-d8e4): look the receipt up FIRST — the resend is
-            // only safe while the corr is genuinely outstanding.
             let receipt = crate::mail::block_on(async {
                 let mb = crate::mail::try_mailbox()
                     .ok_or_else(|| anyhow::anyhow!("no in-process toron mailbox"))?;
@@ -873,8 +828,6 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                     anyhow::bail!("{}", toron_core::mailbox::receipts::DEGRADED_NOTE);
                 }
                 Some(r) => {
-                    // Preserve the original wake tag; default tasked (the
-                    // send default) when the receipt carries none.
                     let wake = r
                         .wake
                         .map(|w| w.as_str().to_string())
@@ -913,11 +866,6 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 let key = crate::project_dir_str(cfg, project)?;
                 let mail = crate::mail_as(cfg, &key, as_agent.as_deref())?;
                 mail.ensure_project(&key)?;
-                // bd-reservation-identity-tlnf: the lease holder is the
-                // RESOLVED actor (mail.name), never the raw `--as` spelling —
-                // the guard attributes commits to the resolved identity, so a
-                // slug-held lease and its pin-attributed commit were two
-                // different holders.
                 let agent = mail.name.clone();
                 let v = mail.reserve(&key, &agent, paths, *ttl_seconds, *exclusive, reason)?;
                 print_json(&v);
@@ -953,7 +901,6 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             let project = crate::mail_project(project, project_flag, "unlock")?;
             let key = crate::project_dir_str(cfg, project)?;
             let mail = crate::mail_as(cfg, &key, as_agent.as_deref())?;
-            // bd-reservation-identity-tlnf: resolved actor, never the raw slug.
             let agent = mail.name.clone();
             let v = mail.release_paths(&key, &agent, &[])?;
             print_json(&v);
@@ -968,7 +915,6 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             let key = crate::project_dir_str(cfg, project)?;
             let mail = crate::mail_as(cfg, &key, as_agent.as_deref())?;
             mail.ensure_project(&key)?;
-            // bd-reservation-identity-tlnf: resolved actor, never the raw slug.
             let agent = mail.name.clone();
             let v = mail.conflicts_for(&key, &agent, paths)?;
             print_json(&v);
@@ -983,9 +929,6 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             let key = crate::project_dir_str(cfg, project)?;
             let mail = crate::mail_or_die(cfg)?;
             mail.ensure_project(&key)?;
-            // Roster = CURRENT agents by default (active <24h); --all shows
-            // the full registration history (ADR-0018 keeps legacy
-            // identities registered for attribution).
             let active_within = if *all { None } else { Some(1) };
             let v = mail.list_agents(&key, active_within)?;
             let registered: std::collections::HashSet<String> = v
@@ -1025,8 +968,6 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 let mail = crate::mail_as(cfg, &key, None)?;
                 mail.ensure_project(&key)?;
                 let from = mail.name.clone();
-                // bd-aseq: registry pin first (same-project peers); a
-                // cross-project target misses and falls back to the hash.
                 let to_mail = crate::resolve_mail_target_registry(project, to);
                 let to_proj = to_project
                     .as_ref()
@@ -1045,8 +986,6 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 let key = crate::project_dir_str(cfg, project)?;
                 let mail = crate::mail_as(cfg, &key, None)?;
                 let to = mail.name.clone();
-                // bd-aseq: registry pin first (same-project peers); a
-                // cross-project requester misses and falls back to the hash.
                 let from_mail = crate::resolve_mail_target_registry(project, from);
                 let v = mail.respond_contact(&key, &to, &from_mail, true)?;
                 print_json(&v);
@@ -1217,7 +1156,6 @@ pub(crate) enum MailLockCmd {
     },
     /// show the holders of one path/glob (glob-overlap match)
     Show {
-        // bd-vben: required positional precedes the optional one (clap).
         /// path or glob whose holders to show
         path: String,
         project: Option<String>,

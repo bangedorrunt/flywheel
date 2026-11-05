@@ -19,14 +19,11 @@ fn flywheel() -> &'static str {
 /// one JSON object naming the failing check and its message — the remedy line.
 #[test]
 fn captain_watch_exits_on_preflight_failure_e2e() {
-    // Temp dirs pinned as XDG homes so the probe cannot read the operator's
-    // real config/state; the dir lives to the end of the test.
     let dir = tempfile::TempDir::new().expect("temp dir");
     let out = Command::new(flywheel())
         .args([
             "captain",
             "watch",
-            // A project that cannot exist → `project-dir` must FAIL.
             "/nonexistent-flywheel-preflight-arm-proj",
             "--preflight",
             "--preflight-mode",
@@ -61,9 +58,6 @@ fn captain_watch_exits_on_preflight_failure_e2e() {
         !msg.is_empty(),
         "the failing check's message is rendered: {v}"
     );
-    // The named failure must be one the REAL preflight can produce, so a
-    // fabricated exit cannot pass this: the nonexistent project fails
-    // `project-dir`, or (when hc is unreachable) that check is named first.
     assert!(
         check == "project-dir" || check == "hc-socket",
         "the named failure is one the real preflight produces: {v}"

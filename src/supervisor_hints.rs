@@ -110,8 +110,6 @@ impl Watcher {
                         last = now;
                         pending = true;
                     }
-                    // A change inside the gap is held and sent when it ends:
-                    // never lost, never faster than one per `min_gap`.
                     if pending && sent.elapsed() >= min_gap {
                         pending = false;
                         sent = Instant::now();
@@ -233,7 +231,7 @@ mod tests {
             ms(20),
         );
         assert!(!recv_within(&rx, ms(150)), "nothing changed: no hint");
-        std::fs::write(&wal, b"first").unwrap(); // the file did not exist: appearing is a change
+        std::fs::write(&wal, b"first").unwrap();
         assert!(recv_within(&rx, ms(500)), "the WAL appeared");
         settle(&rx);
         std::fs::write(&inbox, b"{}\n").unwrap();
@@ -279,12 +277,12 @@ mod tests {
         std::fs::write(&f, b"0").unwrap();
         let (tx, rx) = sync_channel::<()>(8);
         let _w = Watcher::spawn(vec![f.clone()], tx, ms(5), ms(150));
-        std::thread::sleep(ms(60)); // let the watcher take its first look before the change
+        std::thread::sleep(ms(60));
         std::fs::write(&f, b"11").unwrap();
         assert!(recv_within(&rx, ms(400)));
-        std::thread::sleep(ms(20)); // still inside the 150 ms gap of that hint
+        std::thread::sleep(ms(20));
         while rx.try_recv().is_ok() {}
-        std::fs::write(&f, b"222").unwrap(); // inside the gap of the first
+        std::fs::write(&f, b"222").unwrap();
         assert!(
             recv_within(&rx, ms(600)),
             "the held change arrives once the gap ends"

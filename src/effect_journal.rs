@@ -75,10 +75,7 @@ fn journal_executor() -> &'static tokio::sync::mpsc::Sender<ExecutorTask> {
     static QUEUE: std::sync::OnceLock<tokio::sync::mpsc::Sender<ExecutorTask>> =
         std::sync::OnceLock::new();
     QUEUE.get_or_init(|| {
-        // Bounded: saturation is a loud error at submit, never silent growth.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ExecutorTask>(EXECUTOR_QUEUE_BOUND);
-        // One pump task: submission order stays FIFO through the channel,
-        // and each task runs on the shared 4-worker pool.
         journal_runtime().spawn_boxed(Box::pin(async move {
             while let Some(task) = rx.recv().await {
                 journal_runtime().spawn_boxed(task);
@@ -110,16 +107,6 @@ where
     journal_executor().try_send(task).map_err(|_| {
         anyhow::anyhow!("journal executor saturated (>{EXECUTOR_QUEUE_BOUND} parked submits)")
     })?;
-    // The wait must never park an async worker: inside a runtime it hops to
-    // a plain thread for the block (the old per-leaf spawn did the same by
-    // accident of design); outside one it blocks inline with no spawn.
-    //
-    // bd-722a: the hop alone did NOT unblock the worker — the `.join()` right
-    // after it parked the async worker for the whole wait, which is the exact
-    // case this module's doc cites as its motivation. On a multi-threaded
-    // runtime `block_in_place` hands the worker back to the pool while we
-    // wait; on a current-thread runtime there is no other worker to hand it
-    // to, so the plain-thread hop stays.
     let reply = match tokio::runtime::Handle::try_current().ok() {
         Some(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(move || wait.blocking_recv())
@@ -228,19 +215,11 @@ pub fn effect_runner(
     let dispatcher = EffectDispatcher::new(store);
     Arc::new(move |inv: &ActionInvocation| {
         let ActionPartition::HostSink { sink } = partition(&inv.action) else {
-            // Engine-owned control flow is sequenced by the engine. A runner
-            // that journaled it would claim an external effect nobody
-            // performed, so it stays a pass-through (the engine's boundary
-            // rejects a real misdispatch on its own).
             return Ok(leaf_value((inner)(inv)));
         };
         match sink {
-            // The leaf runner is the provider: a real pane or a real
-            // `__run-headless` subprocess performs the effect.
             SINK_JOB => {
                 let provider = inner.clone();
-                // Owned clone: the deferred box is 'static, so the
-                // provider cannot borrow the caller's invocation.
                 let owned = inv.clone();
                 Ok(fenced_outcome(dispatch_once(
                     &dispatcher,
@@ -248,12 +227,6 @@ pub fn effect_runner(
                     Box::new(move || provider_outcome((provider)(&owned))),
                 )))
             }
-            // The mailbox is its own provider (flywheel's leaf runners record
-            // mailbox actions rather than dispatching them), so without a
-            // sender there is no effect to journal — and bd-v9em fails
-            // closed instead of running unjournaled: a remote/absent plane
-            // cannot carry `corr == effect_key` (Spec 5.4), so the send is
-            // refused, never performed without its journal row.
             SINK_MAILBOX => {
                 let Some(plane) = plane.clone() else {
                     return Ok(refuse_unjournaled(
@@ -274,47 +247,16 @@ pub fn effect_runner(
                     }),
                 )))
             }
-            // `verify` (bd-engine-run-path-journaling-fwlx, the Spec 6 flip):
-            // the engine runs the embedding's VerifySink FIRST and hands the
-            // already-executed result to this runner via
-            // `RunContext.provider_result` — the sink stays the executor
-            // (ADR-0024 Spec 2). The result is returned as the step value
-            // with no journal row: a verify is an observation, not an
-            // effect, and a persisted outcome would replay stale checks
-            // instead of re-observing (bd-mszc). No provider_result means
-            // the invocation came from outside the engine's verify path, so
-            // there is no observed result to return and refusing is the
-            // only honest answer.
             SINK_VERIFY => {
                 let Some(result) = inv.run.provider_result.clone() else {
-                    // bd-v9em: no observed effect, no row, no run — refuse
-                    // loud instead of journaling a lie or performing blind.
                     return Ok(refuse_unjournaled(
                         "verify",
                         "no engine-observed verify result on this invocation — the VerifySink \
                          never ran, so there is no effect to journal",
                     ));
                 };
-                // The SINK is verify's provider, so this is the one sink whose
-                // "provider" is not the leaf runner: the engine already
-                // executed it and handed us the result. The leaf runner is
-                // deliberately NOT invoked — for a verify action both live
-                // runners (`pane_dispatch`, `headless_dispatch`) return a bare
-                // `{action: …}` no-op, so calling it adds no evidence, and
-                // calling it wholesale would double-perform the command the
-                // moment a runner grew real verify handling.
-                //
-                // A verify is an observation the sink already executed, not
-                // an external effect: journaling it would replay a stale
-                // check instead of re-observing, so a retry-over-verify could
-                // never see a newly written marker (bd-mszc). Return the
-                // observed result as the step value with no journal row —
-                // same shape the fenced path produced, minus the journal.
                 Ok(verify_step_value(inv, result))
             }
-            // A sink this runner does not cover is refused loud (fail-closed):
-            // journaling it would settle work nobody did, and running it
-            // unjournaled is the bypass Spec 6 forbids.
             other => Ok(refuse_unjournaled(other, "no provider performs this sink")),
         }
     })
@@ -450,8 +392,6 @@ fn mail_delivery(inv: &ActionInvocation) -> Result<MailDelivery> {
             subject.clone(),
             body.clone(),
         ),
-        // A DM names one recipient and carries no subject; "workflow dm" is
-        // the toron host's own placeholder, reused so both planes read alike.
         toron_workflow::schema::Action::SendDm { to, body, project } => (
             project.clone().unwrap_or_default(),
             vec![to.clone()],
@@ -522,7 +462,6 @@ fn leaf_value(result: Result<Value>) -> Value {
         Err(e) => serde_json::json!({
             "ok": false,
             "error": e.to_string(),
-            // GS-049 P1-3: phase-bearing — leaf Err is an execute-stage failure
             "stage": "execute",
         }),
     }
@@ -542,18 +481,9 @@ pub struct Journals {
 /// loud `bypassed-no-effect-runner` marker rather than a run that only looks
 /// journaled.
 pub fn journals(cfg: &crate::config::Config, inner: EffectRunner) -> Option<Journals> {
-    // Mail first: when it is in-process it also builds the pool the journal
-    // borrows, so the two share one connection instead of opening two.
     let plane = mail_plane(cfg);
     match journal_store() {
         Some(store) => {
-            // bd-effect-sweep-x464: every journaled engine build sweeps
-            // expired leases first through this same run surface (no new
-            // verb, so the skill-sync contract does not fire). Reclaimable
-            // rows are left for the next dispatch (same key, next attempt);
-            // refused rows are already unknown with sweep evidence; unknown
-            // rows page loud here. Best-effort: a sweep failure never fails
-            // the engine build — the dispatch path refuses loud on its own.
             match submit_journal_wait(sweep_expired_leases(
                 store.clone(),
                 now_us(),
@@ -614,9 +544,6 @@ pub fn journals(cfg: &crate::config::Config, inner: EffectRunner) -> Option<Jour
 pub fn run_journal(store: WorkflowEffectStore) -> RunJournal {
     Arc::new(move |t: &RunTransition| {
         let target = match t.phase {
-            // `workflow_runs` is born `started`; the engine's Started/Running
-            // pair advances it to `running` exactly once (the CAS refuses a
-            // repeat).
             RunPhase::Started | RunPhase::Running => RunStatus::Running,
             RunPhase::Succeeded => RunStatus::Succeeded,
             RunPhase::Failed => RunStatus::Failed,
@@ -678,33 +605,22 @@ fn mail_plane(cfg: &crate::config::Config) -> Option<MailPlane> {
         );
         return None;
     }
-    // In-process plane: make sure the shared mailbox exists (runtime-safe) and
-    // deliver through it.
     let _ = crate::mail::Mail::from_config(None);
     let mailbox = crate::mail::try_mailbox()?.clone();
     let send: MailSender = {
         let mailbox = mailbox.clone();
         Arc::new(move |message: SendMessage| {
             let mailbox = mailbox.clone();
-            // Provider-nested work runs on its own runtime, never the shared
-            // journal pool: this closure executes inside a dispatched journal
-            // future, so the pool path would nest pool work inside pool work.
             submit_provider_wait(
                 async move { mailbox.send_message(&message).await.map(|r| r.count) },
             )
         })
     };
-    // The sender is the ONE actor ladder (explicit `--as` cannot exist in a
-    // workflow, so the env ladder then the config default), read against the
-    // project's live roster and registered best-effort — the same identity
-    // every other flywheel send binds, so leases and mail agree.
     let actor: MailActor = {
         let mailbox = mailbox.clone();
         Arc::new(move |project: &str| {
             let mailbox = mailbox.clone();
             let project = project.to_string();
-            // Same nested-lane rule as `send` above: this runs inside a
-            // dispatched journal future.
             submit_provider_wait(async move {
                 let roster: Vec<String> = mailbox
                     .list_agents(&project, toron_core::mailbox::ListAgentsOptions::default())
@@ -824,9 +740,6 @@ fn dispatch_request(inv: &ActionInvocation) -> DispatchRequest {
         action_type: action_type.clone(),
         action_digest: action_digest_of(&redacted),
         redacted_action: Some(redacted),
-        // bd-effect-sweep-x464: the HOST declares the mailbox idempotency
-        // contract (corr claim), so an expired-lease mailbox row reclaims
-        // under the same key instead of refusing blind.
         capability: host_capability_for_action_type(&action_type),
     }
 }
@@ -838,9 +751,6 @@ fn fenced_outcome(result: Result<toron_mcp::workflow_host::DispatchResult>) -> V
     match result {
         Ok(res) if res.state == EffectState::Settled => res.outcome,
         Ok(res) => {
-            // bd-6ppj: the engine fallback reads flat .error, so a fenced
-            // non-settled shape carries the provider error top-level too —
-            // nested outcome.error alone printed bare "step failed" live.
             let err = res
                 .outcome
                 .get("error")
@@ -859,13 +769,10 @@ fn fenced_outcome(result: Result<toron_mcp::workflow_host::DispatchResult>) -> V
         Err(e) => serde_json::json!({
             "ok": false,
             "error": format!("{e:#}"),
-            // GS-049 P1-3: fence dispatch Err — effect stage
             "stage": "effect",
         }),
     }
 }
-
-// ---- bd-effect-sweep-x464: expired-lease sweep with per-action policy ----
 
 /// Bound on rows acted on per sweep. The fold is run-scoped (hundreds of
 /// rows); the report names truncation instead of letting one pass grow.
@@ -926,11 +833,9 @@ pub fn sweep_verdict(action_type: &str, state: EffectState) -> SweepVerdict {
         EffectState::Unknown => SweepVerdict::Page {
             reason: "outcome uncertain after an expired lease; operator decides from the row's evidence",
         },
-        // Owned by a reconciler or a wake time — the sweep must not steal.
         EffectState::ReconcilePending | EffectState::Parked => SweepVerdict::RefuseBlindRetry {
             reason: "owned by a reconciler or a wake time; the sweep does not steal live work",
         },
-        // Terminal rows never reach the sweep; refusing is the closed shape.
         EffectState::Settled | EffectState::Failed | EffectState::Cancelled => {
             SweepVerdict::RefuseBlindRetry {
                 reason: "terminal rows are never swept",
@@ -972,8 +877,6 @@ pub async fn sweep_expired_leases(
     let fold = store.fold_projected().await?;
     let mut report = SweepReport::default();
     let mut acted = 0usize;
-    // BTreeMap order: deterministic across passes, so truncation resumes
-    // at the same frontier instead of starving one key range.
     for (key, (row, _)) in fold.effects.iter() {
         if !matches!(row.state, EffectState::InFlight | EffectState::Accepted) {
             continue;
@@ -1012,9 +915,6 @@ pub async fn sweep_expired_leases(
                 }
             }
             SweepVerdict::Page { reason } => {
-                // Unreachable from the query above (unknown rows carry no
-                // lease) — kept so a future caller sweeping unknown rows
-                // pages instead of inventing an outcome.
                 report.paged.push((key.clone(), reason.to_string()));
                 acted += 1;
             }
@@ -1043,7 +943,6 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let ticks = Arc::new(AtomicUsize::new(0));
         let counter = ticks.clone();
-        // The submit FIRST: it takes the only worker for the wait.
         let submit = tokio::spawn(async move {
             super::submit_journal_wait(async {
                 tokio::time::sleep(std::time::Duration::from_millis(80)).await;
@@ -1225,9 +1124,6 @@ mod tests {
         for _ in 0..16 {
             let seen = seen.clone();
             handles.push(tokio::spawn(async move {
-                // `submit_journal_wait` from async contexts would block the
-                // worker, so drive it from a plain thread like the sync
-                // runner paths do.
                 std::thread::spawn(move || {
                     super::submit_journal_wait(async move {
                         seen.lock().unwrap().insert(std::thread::current().id());
@@ -1288,9 +1184,6 @@ mod tests {
         let inner: EffectRunner = Arc::new(move |_inv: &ActionInvocation| {
             let store = probe_store.clone();
             let k = probe_key.clone();
-            // The probe runs inside the dispatched provider, so it takes the
-            // nested lane: the pool path would nest pool work inside pool
-            // work and starve under parallel tests.
             let row = submit_provider_wait(async move { store.get_effect(&k).await })
                 .expect("probe read")
                 .expect("the intent row exists before the provider runs");
@@ -1521,8 +1414,6 @@ mod tests {
         let out = fx(&inv).expect("runner returns a value");
 
         let key = effect_key_for(&inv);
-        // Clone out of the guard so no `MutexGuard` is live across the awaits
-        // below (clippy::await_holding_lock); the guard drops here.
         let sent = seen.lock().unwrap().clone();
         assert_eq!(sent.len(), 1, "exactly one delivery for one logical effect");
         let msg = &sent[0];
@@ -1623,29 +1514,28 @@ mod tests {
     /// mailbox — the plane `corr` requires.
     #[tokio::test]
     async fn in_process_mailbox_sender_delivers_a_workflow_message() {
+        let _env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev_agent = std::env::var_os("AGENT_NAME");
+        unsafe { std::env::set_var("AGENT_NAME", "JournalRelay") };
         let (_dir, store) = test_store().await;
         crate::mail::Mail::from_config(None)
             .expect("mail config")
             .expect("in-process facade");
         let mailbox = crate::mail::mailbox().clone();
-        // The recipient must exist in the project before the mailbox will route
-        // to it — the same precondition any workflow send has in production.
         submit_journal_wait({
             let mailbox = mailbox.clone();
             let profile = toron_core::nostr::identity::AgentProfile {
-                name: "pi".to_string(),
+                name: "RelayWorker".to_string(),
                 program: Some("opencode".into()),
                 model: None,
                 persona: None,
                 task_description: None,
             };
             async move {
-                mailbox.register_agent("demo", &profile).await?;
-                // ADR-0037 W2: the workflow actor pin (`flywheel`) already
-                // holds a key in other projects of this shared test store;
-                // register it here by reusing that key (proof of possession)
-                // so the runner finds it on the roster instead of minting.
-                let actor = toron_core::nostr::identity::AgentProfile::new("flywheel");
+                crate::mail::fixture_register_async(&mailbox, "demo", &profile).await?;
+                let actor = toron_core::nostr::identity::AgentProfile::new("JournalRelay");
                 crate::mail::fixture_register_async(&mailbox, "demo", &actor).await
             }
         })
@@ -1656,9 +1546,22 @@ mod tests {
         let inner: EffectRunner =
             Arc::new(|inv: &ActionInvocation| Ok(json!({ "action": inv.action.type_name() })));
         let fx = effect_runner(inner, store.clone(), Some(plane));
-        let inv = invocation(send_message(), "run-mail-live", "notify");
+        let inv = invocation(
+            Action::SendMessage {
+                to: vec!["RelayWorker".to_string()],
+                subject: "handoff".to_string(),
+                body: "body".to_string(),
+                project: Some("demo".to_string()),
+            },
+            "run-mail-live",
+            "notify",
+        );
 
         let out = fx(&inv).expect("runner returns a value");
+        match prev_agent {
+            Some(v) => unsafe { std::env::set_var("AGENT_NAME", v) },
+            None => unsafe { std::env::remove_var("AGENT_NAME") },
+        }
 
         assert_eq!(
             out["ok"],
@@ -1782,8 +1685,6 @@ mod tests {
         let first = fx(&inv).expect("first evaluation");
         assert_eq!(first["ok"], json!(false), "{first}");
 
-        // The marker appears between evaluations: same invocation, new
-        // observed result — the runner must hand back the new outcome.
         inv.run.provider_result = Some(json!({ "ok": true, "exit": 0 }));
         let second = fx(&inv).expect("re-observation");
 
@@ -1818,8 +1719,6 @@ mod tests {
             ProviderOutcome::ProvenFailed(_)
         ));
     }
-
-    // ---- bd-mi9n: run-lifecycle rows through the injected journal ----
 
     fn transition(run_id: &str, workflow: &str, phase: RunPhase) -> RunTransition {
         RunTransition {
@@ -1856,7 +1755,6 @@ mod tests {
                     RunPhase::Started,
                     RunPhase::Running,
                     RunPhase::Succeeded,
-                    // the replay
                     RunPhase::Started,
                     RunPhase::Running,
                 ],
@@ -1885,7 +1783,6 @@ mod tests {
         for phase in [RunPhase::Started, RunPhase::Running, RunPhase::Succeeded] {
             journal(&transition("run-life-2", "ship", phase));
         }
-        // An effect row for the SAME run, through the same store.
         let inner: EffectRunner = Arc::new(|_inv: &ActionInvocation| Ok(json!({ "ok": true })));
         let fx = effect_runner(inner, store.clone(), None);
         let inv = invocation(dispatch_job(), "run-life-2", "ship");
@@ -1935,7 +1832,6 @@ mod tests {
     #[tokio::test]
     async fn effect_runner_interpret() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        // Success: one invoke, settled row, provider's own value.
         let (_dir, store) = test_store().await;
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_c = calls.clone();
@@ -1957,10 +1853,6 @@ mod tests {
             EffectState::Settled
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1, "one invoke per dispatch");
-        // Retry is refused, not blind: an ambiguous first attempt leaves
-        // `unknown`, and the re-drive refuses a second dispatch when the
-        // provider offers no query or idempotency contract — the row stays
-        // `unknown` and the provider runs exactly once, never twice.
         let (_dir2, store2) = test_store().await;
         let tries = Arc::new(AtomicUsize::new(0));
         let tries_c = tries.clone();
@@ -1985,8 +1877,6 @@ mod tests {
             EffectState::Unknown
         );
         assert_eq!(tries.load(Ordering::SeqCst), 1, "exactly one invoke");
-        // Unknown never settles as success while the provider stays
-        // ambiguous.
         let (_dir3, store3) = test_store().await;
         let down: EffectRunner =
             Arc::new(|_inv: &ActionInvocation| Err(anyhow::anyhow!("connection reset by peer")));
@@ -1995,7 +1885,6 @@ mod tests {
         let once = fx3(&inv3).expect("a fenced runner returns a value");
         assert_eq!(once["ok"], json!(false));
         assert_eq!(once["effect_state"], json!("unknown"), "{once}");
-        // Again: refused, not retried — still unknown, never success.
         let twice = fx3(&inv3).expect("a fenced runner returns a value");
         assert_eq!(twice["ok"], json!(false), "{twice}");
         assert_eq!(
@@ -2007,13 +1896,10 @@ mod tests {
                 .state,
             EffectState::Unknown
         );
-        // Pool knobs are still 4 workers and a 4096 blocking bound.
         assert_eq!(super::EXECUTOR_QUEUE_BOUND, 4096);
         let rt = super::journal_runtime();
         assert_eq!(rt.max_blocking_threads(), 4096);
     }
-
-    // ---- bd-effect-sweep-x464: expired-lease sweep with per-action policy ----
 
     use toron_core::index::workflow_effects::{ClaimAttempt, NewEffect, now_us};
 
@@ -2052,7 +1938,6 @@ mod tests {
                     attempt: 1,
                     attempt_id: format!("att-{run_id}-a1"),
                     claim_token: "tok-dead-owner".to_string(),
-                    // Already expired: the owner is dead, not slow.
                     lease_expires_at: now_us() - 60_000_000,
                     expected_claim_token: None,
                 },
@@ -2088,11 +1973,6 @@ mod tests {
             "the sweep performs no effect, so the row is untouched: {row:?}"
         );
 
-        // The next legitimate dispatch reclaims the same key: one delivery,
-        // attempt 2, settled — the transport corr claim (same
-        // project/sender/corr/content) converges the retry onto one rumor.
-        // (The mailbox sink's provider is the plane, not the leaf runner, so
-        // the delivery — not a leaf counter — is what proves one invoke.)
         let inner: EffectRunner =
             Arc::new(|inv: &ActionInvocation| Ok(json!({ "action": inv.action.type_name() })));
         let seen: Arc<std::sync::Mutex<Vec<SendMessage>>> = Arc::new(std::sync::Mutex::new(vec![]));

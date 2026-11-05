@@ -122,8 +122,6 @@ impl WalkOpts {
         {
             o.wedge_inspect_count = v;
         }
-        // The declared-pause window is resolved once at loop start
-        // (LoopParams.pause_resurface_secs) — env no longer tunes it here.
         o
     }
 }
@@ -143,7 +141,6 @@ fn match_segments(pat: &[&str], segs: &[&str]) -> bool {
         return segs.is_empty();
     }
     if pat[0] == "**" {
-        // `**` eats zero or more segments.
         for i in 0..=segs.len() {
             if match_segments(&pat[1..], &segs[i..]) {
                 return true;
@@ -162,7 +159,6 @@ fn match_segments(pat: &[&str], segs: &[&str]) -> bool {
 
 fn match_segment(pat: &str, seg: &str) -> bool {
     let (mut p, mut s) = (pat.as_bytes(), seg.as_bytes());
-    // `*` backtracking over one segment.
     let (mut star, mut ss) = (None, 0);
     let (mut pi, mut si) = (0, 0);
     while si < s.len() {
@@ -455,7 +451,6 @@ mod tests {
         std::fs::write(d.join("target/x"), "x").unwrap();
         std::fs::write(d.join("notes.txt"), "x").unwrap();
         let o = walk(&d, &["target/**".to_string()], &WalkOpts::default());
-        // target/ is pruned: never descended, so Quiet with no freshest.
         assert_eq!(
             o,
             WalkOutcome::Quiet {
@@ -508,14 +503,11 @@ mod tests {
             decide(&recent_quiet, false, &opts),
             LivenessVerdict::Respawn { inspect: false }
         );
-        // Exact-busy needs the busy-turn max, not the quiet window.
         assert!(!inspect_due(Some(300), true, &opts));
         assert!(inspect_due(Some(3600), true, &opts));
         assert!(!inspect_due(None, false, &opts));
-        // Pause resurface twins the 3600s window.
         assert!(paused_resurface_due(3600, 3600));
         assert!(!paused_resurface_due(3599, 3600));
-        // A zero/unset window must not make every tick a resurface.
         assert!(!paused_resurface_due(u64::MAX, 0));
     }
 
@@ -530,24 +522,18 @@ mod tests {
         let p = parse_paused_declaration("some work\npaused: CooperSparrow (needs the AC call)\n")
             .expect("declaration");
         assert_eq!(p.owner, "CooperSparrow");
-        // Case-insensitive key, list/quote decoration tolerated, `@` stripped.
         let p = parse_paused_declaration("- PAUSED:   @NavyDog  — waiting on sign-off")
             .expect("declaration");
         assert_eq!(p.owner, "NavyDog");
-        // The FIRST declaring line wins: the age must not be re-based by a
-        // later echo of the same wait.
         let p = parse_paused_declaration("paused: First\npaused: Second").expect("declaration");
         assert_eq!(p.owner, "First");
     }
 
     #[test]
     fn parse_paused_declaration_refuses_an_unnamed_wait() {
-        // D12: every waiting state names its owner — an unnamed wait has no
-        // re-surface path, so it is not a declaration (ordinary drain path).
         assert_eq!(parse_paused_declaration("paused:\n"), None);
         assert_eq!(parse_paused_declaration("paused:   `  `"), None);
         assert_eq!(parse_paused_declaration("paused :"), None);
-        // A different key, or prose that merely mentions the word.
         assert_eq!(parse_paused_declaration("blocked: someone"), None);
         assert_eq!(parse_paused_declaration("I am paused right now"), None);
         assert_eq!(parse_paused_declaration(""), None);

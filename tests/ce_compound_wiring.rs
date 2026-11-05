@@ -11,7 +11,6 @@ const INBOX_README: &str = include_str!("../docs/learnings/inbox/README.md");
 
 #[test]
 fn ce_compound_read_lanes_labeled_offline_safe() {
-    // Three labeled read lanes, no web: corpus rg, wiki qmd, episodic recall.
     for needle in [
         "rg -il",
         "chie qmd search",
@@ -37,8 +36,6 @@ fn ce_compound_memory_record_on_write() {
 
 #[test]
 fn ce_compound_auto_promote_inbox_perishable_with_provenance() {
-    // Auto-promote target is the inbox, tier-perishable with provenance —
-    // never straight to docs/learnings/, never gated on a human at write.
     for needle in [
         "docs/learnings/inbox/",
         "tier: perishable",
@@ -58,7 +55,6 @@ fn ce_compound_auto_promote_inbox_perishable_with_provenance() {
 
 #[test]
 fn ce_compound_human_gate_at_sweep_not_write() {
-    // Write-time is filing, not approval: the human reviews at sweep.
     assert!(
         STAGES.contains("sweep"),
         "compound must defer human review to sweep (src/stages.rs)"

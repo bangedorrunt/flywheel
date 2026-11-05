@@ -159,7 +159,6 @@ mod tests {
         );
         assert_eq!(d.sha, sha_hex(d.json.as_bytes()));
         assert!(is_sha(&d.sha));
-        // The same delta in another key order and spacing is the same delta.
         assert_eq!(
             ok(r#"{"goal":"ship it"}"#).sha,
             ok("{ \"goal\" :\n \"ship it\" }").sha
@@ -216,7 +215,6 @@ mod tests {
                 .to_string()
                 .contains("max")
         );
-        // Whitespace padding does not count against the delta.
         let padded = format!("{}{}", r#"{"goal":"x"}"#, " ".repeat(MAX_DELTA_BYTES + 100));
         assert!(parse(padded.as_bytes()).is_ok());
     }
@@ -227,7 +225,6 @@ mod tests {
         let delta = ok(r#"{"goal":"g"}"#);
         let sha = store(d.path(), "proj", &delta).unwrap();
         assert_eq!(load(d.path(), "proj", &sha).unwrap(), delta);
-        // Tamper: same name, other bytes.
         let p = dir_for(d.path(), "proj").join(format!("{sha}.json"));
         std::fs::write(&p, br#"{"goal":"evil"}"#).unwrap();
         assert!(

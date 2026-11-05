@@ -73,8 +73,6 @@ fn created_id(v: &serde_json::Value) -> String {
 }
 
 fn ready_ids(v: &serde_json::Value) -> Vec<String> {
-    // `br ready --json` returns a bare array in scratch projects (no
-    // `{"issues": [...]}` wrapper) — accept both shapes.
     let arr = v
         .get("issues")
         .and_then(|i| i.as_array())
@@ -94,17 +92,8 @@ fn closing_blocker_unblocks_dependent() {
     let dir = scratch_dir("close-unblocks");
     std::fs::create_dir_all(&dir).unwrap();
     br_ok(&dir, &["init", "--json"]);
-    // Pin a short id prefix: the id is derived from the project path, so a
-    // long $TMPDIR + scratch name would silently flip the create output to
-    // the wrapped shape. This test is about dependency resolution; the
-    // wrapped shape has its own fixture below.
     br_ok(&dir, &["config", "set", "id.prefix", "cf"]);
 
-    // b1 is the blocker; b2 depends on b1. Both carry a TYPED verify field —
-    // schema-18 br's ready predicate refuses verify-less beads (bd-3566,
-    // beads_rust-wave5-flywheel-parser-strip-dkpvi).
-    // Fail-closed create (bd-h8d6): title alone refuses — a description is
-    // required. Same titles, priority, and verify as before.
     let b1 = br_stdout(
         &dir,
         &[
@@ -137,17 +126,12 @@ fn closing_blocker_unblocks_dependent() {
     let id2 = created_id(&b2);
     br_ok(&dir, &["dep", "add", &id2, &id1]);
 
-    // With b1 open, b2 must NOT be ready (its dependency blocks it).
     let ready_before = ready_ids(&br_stdout(&dir, &["ready", "--json"]));
     assert!(
         !ready_before.contains(&id2),
         "dependent must NOT be ready while the blocker is open: {ready_before:?}"
     );
 
-    // Close the blocker. schema-18 fail-closed br demands a commit-sha (no
-    // git repo here to cite) — this test is about dependency resolution, not
-    // close legality, so manufacture it via operator bypass
-    // (bd-adr0006-cosmetic-sweep-q0g0).
     let out = Command::new("br")
         .args([
             "close",
@@ -168,7 +152,6 @@ fn closing_blocker_unblocks_dependent() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Now b2 IS ready — the chain unblocked.
     let ready_after = ready_ids(&br_stdout(&dir, &["ready", "--json"]));
     assert!(
         ready_after.contains(&id2),
@@ -184,7 +167,6 @@ fn closing_blocker_unblocks_dependent() {
 /// a property of the operator's $TMPDIR.
 #[test]
 fn budget_warning_shape_is_readable() {
-    // Long enough that the derived bead id pushes a standard dispatch brief
     // past br's safety margin — the case that flipped the shape in the wild.
     const LONG: &str = "conformance-fixture-long-prefix-budget-warn";
 
@@ -206,8 +188,6 @@ fn budget_warning_shape_is_readable() {
             "--json",
         ],
     );
-    // Anti-vacuity: if br's budget moves, this fixture stops forcing the
-    // shape and the test must say so instead of passing on the bare form.
     assert!(
         wrapped.get("budget_warning").is_some() && wrapped.get("created").is_some(),
         "the pinned prefix must FORCE the wrapped shape (re-pin LONG if br's budget moved): {wrapped}"
@@ -218,7 +198,6 @@ fn budget_warning_shape_is_readable() {
         "the wrapped id is the created bead's own: {long_id}"
     );
 
-    // …and the short-prefix form STILL reads as the bare object.
     let short = scratch_dir("short");
     std::fs::create_dir_all(&short).unwrap();
     br_ok(&short, &["init", "--json"]);

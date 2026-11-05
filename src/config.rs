@@ -61,10 +61,6 @@ pub struct TestStateHome {
 #[cfg(test)]
 impl Drop for TestStateHome {
     fn drop(&mut self) {
-        // Restore, don't remove: a test that set XDG_STATE_HOME WITHOUT this
-        // lock must not have its value erased by whoever ran next. Removing
-        // would hand the following test the real state dir — the bd-uu58 leak
-        // arriving through the drop path instead of the constructor.
         match self.prev.take() {
             Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
             None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
@@ -450,13 +446,7 @@ impl Config {
     }
 
     pub fn load() -> Result<Self> {
-        // Load .env first (non-fatal if absent). dotenvy does NOT override
-        // already-set env vars, so a real env var wins over .env (ADR-0002 §3.3
-        // precedence: flag > env > .env > config.toml > default).
         let _ = dotenvy::dotenv();
-        // Dual-read (ADR-0003 V5): XDG first; the legacy macOS path as a
-        // fallback. On the first successful legacy load, COPY to XDG and keep
-        // the legacy file as backup; every later run reads/writes XDG.
         let xdg = config_file();
         let legacy = legacy_config_file();
         let mut cfg: Self = if xdg.exists() {
@@ -468,13 +458,11 @@ impl Config {
                 .with_context(|| format!("read {}", legacy.display()))?;
             let parsed: Self =
                 toml::from_str(&raw).with_context(|| format!("parse {}", legacy.display()))?;
-            // Write-through to XDG thereafter (copy, not move — V5).
             migrate_legacy_config(&legacy, &xdg);
             parsed
         } else {
             Self::default()
         };
-        // env overrides
         if let Ok(v) = std::env::var("FLYWHEEL_SOCKET") {
             cfg.socket_path = Some(v);
         }
@@ -482,15 +470,10 @@ impl Config {
             cfg.workspace_root = Some(v);
         }
         if let Ok(v) = std::env::var("FLYWHEEL_TIMEOUT") {
-            // Fail loudly on bad input (is1.6): a typo'd value must abort
-            // startup, never silently fall back to the default.
             cfg.default_timeout_ms = Some(v.parse().map_err(|e| {
                 anyhow::anyhow!("FLYWHEEL_TIMEOUT={v:?} is not a number of ms: {e}")
             })?);
         }
-        // toron env surface (bd-euav): FLYWHEEL_TORON_URL / FLYWHEEL_TORON_TOKEN
-        // feed `[mail.toron]`, merging over config.toml; FLYWHEEL_MAIL_NAME
-        // feeds the shared `[agent_mail]` identity.
         let (toron_url, toron_token, mail_name) = Self::mail_env_overrides();
         if toron_url.is_some() || toron_token.is_some() {
             let mut toron = cfg
@@ -619,9 +602,6 @@ impl Config {
     }
 
     pub fn socket_path(&self) -> String {
-        // hc resolve order (toron_core::backend::hc::resolve_socket_path):
-        // explicit config → HC_SOCKET_PATH → $XDG_STATE_HOME/herdr-core/$session/$session.sock
-        // (session defaults to `default`).
         if let Some(p) = self.socket_path.clone().filter(|s| !s.is_empty()) {
             return p;
         }
@@ -685,16 +665,9 @@ impl Config {
         {
             return k.clone();
         }
-        // bd-drlm: this was a fifth private table. A project's `kinds` map
-        // above still wins — config may rename a kind — and the registry only
-        // answers the built-in spellings.
         crate::harness_registry::canonical(short)
     }
 }
-
-// ---- parent-death policy helpers (ADR-0025 Spec 4, Wave 4a Phase 1) ----
-// Pure helpers over the spawn registry. Phase 2 wires these into
-// `kill`/`recover` in main.rs; Phase 1 only proves the policy + attribution.
 
 /// Pins the spawn registry attributes to `captain_pin`.
 ///
@@ -822,15 +795,6 @@ fn migrate_legacy_config(legacy: &Path, xdg: &Path) {
 }
 
 pub fn state_dir() -> PathBuf {
-    // Honor XDG_STATE_HOME first (193.2): hermetic state for tests/prod,
-    // matching how config_dir() honors XDG_CONFIG_HOME. The fallback is
-    // ~/.local/state — NEVER dirs::state_dir() (macOS: ~/Library/Application
-    // Support): daemon::default_state_dir() resolves XDG-or-~/.local/state,
-    // and a second fallback here is an env-conditional split-brain (the CLI
-    // reads one tree, the daemon another). The App Support path holds no
-    // live state (fossil evidence: a never-read owner.json), so no
-    // migration — a copy could resurrect stale leases. Live App Support
-    // state from an old install moves to ~/.local/state manually. (bd-y6gw)
     std::env::var_os("XDG_STATE_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
@@ -841,8 +805,6 @@ pub fn state_dir() -> PathBuf {
         })
         .join("flywheel")
 }
-
-// ---- recipes ----
 
 /// A spawn recipe: named counts of agent kinds.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -872,8 +834,6 @@ impl Recipes {
         toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))
     }
 }
-
-// ---- workflows ----
 
 /// One step of a workflow: either a send (to agents) or a wait.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -913,8 +873,6 @@ impl Workflows {
         toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))
     }
 }
-
-// ---- pipelines ----
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Pipelines {
@@ -995,8 +953,6 @@ mod tests {
 
     #[test]
     fn doorbell_url_defaults_to_daemon_host() {
-        // bd-0zcr.1 unit 1: `[doorbell]` without url selects the daemon
-        // host; absent section selects embedded.
         let c: Config = toml::from_str("[doorbell]").unwrap();
         assert_eq!(c.doorbell_url().as_deref(), Some("http://127.0.0.1:18980"));
         let c: Config = toml::from_str("").unwrap();
@@ -1255,9 +1211,6 @@ daily = [
             ambient
         };
         {
-            // The guard is built from a lock this test re-takes, never by
-            // calling `test_state_home()` while holding one (ENV_LOCK is not
-            // reentrant, so that deadlocks the whole binary).
             let _g = ENV_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1275,10 +1228,6 @@ daily = [
             }
         }
         {
-            // The struct's drop released the lock, so re-take it for the read:
-            // a sibling that ran in the gap pinned its own dir and restored what
-            // it found — the sentinel — so the value is invariant across holders
-            // and this is a stable sample.
             let _g = ENV_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1288,7 +1237,6 @@ daily = [
                 "drop puts the foreign value back. remove_var here would hand the next \
                  test the real state dir — the bd-uu58 leak through the drop path"
             );
-            // Leave the process exactly as found, under the lock.
             unsafe { std::env::remove_var("XDG_STATE_HOME") };
             if let Some(a) = ambient {
                 unsafe { std::env::set_var("XDG_STATE_HOME", a) };
@@ -1330,7 +1278,7 @@ daily = [
     fn per_backend_config_split_isolates_urls() {
         let cfg = Config {
             agent_mail: Some(MailConfig {
-                url: Some("http://127.0.0.1:18080".into()), // legacy (ignored)
+                url: Some("http://127.0.0.1:18080".into()),
                 token: Some("shared".into()),
                 name: Some("Orchid".into()),
             }),
@@ -1342,8 +1290,6 @@ daily = [
             }),
             ..Default::default()
         };
-        // toron reads [mail.toron] + shared identity name; the legacy
-        // [agent_mail] url must NOT leak into it — that was the BUG1 misroute.
         let toron = cfg.toron_mail_config();
         assert_eq!(toron.url.as_deref(), Some("http://127.0.0.1:18080"));
         assert_eq!(toron.token.as_deref(), Some("toron-token"));
@@ -1388,13 +1334,6 @@ daily = [
         assert_eq!(toron.name, None);
     }
 
-    // ---- ADR-0003 V5: XDG config convergence ----
-    //
-    // `config_dir()` returns the REAL XDG path ($XDG_CONFIG_HOME ||
-    // ~/.config/flywheel), NOT `dirs::config_dir()` (macOS Application
-    // Support — the doc used to lie). These tests isolate HOME/XDG in a temp
-    // dir (serialized via ENV_LOCK — env mutation is process-global).
-
     /// Real XDG dir: `$XDG_CONFIG_HOME` wins; else `~/.config/flywheel`.
     #[test]
     fn config_dir_is_real_xdg() {
@@ -1418,9 +1357,6 @@ daily = [
         let _g = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // bd-3dge: snapshot everything this test touches — an unrestored
-        // HOME/XDG leaves later tests (and any toron CLI child they spawn)
-        // resolving the ambient/relative store instead of the pinned root.
         let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
         let prev_home = std::env::var_os("HOME");
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
@@ -1498,7 +1434,6 @@ daily = [
     #[test]
     fn flywheel_timeout_env_fails_loudly() {
         let _g = lock_env();
-        // Isolate HOME + XDG so load() only sees our env.
         let home = std::env::temp_dir().join(format!("flywheel-to-home-{}", std::process::id()));
         let xdg = std::env::temp_dir().join(format!("flywheel-to-xdg-{}", std::process::id()));
         unsafe { std::env::set_var("HOME", &home) };
@@ -1556,7 +1491,6 @@ daily = [
         let _g = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Isolate HOME + XDG in temp dirs (clean; no real config interference).
         let home =
             std::env::temp_dir().join(format!("flywheel-legacy-home-{}", std::process::id()));
         let xdg = std::env::temp_dir().join(format!("flywheel-xdg-{}", std::process::id()));
@@ -1564,7 +1498,6 @@ daily = [
         let _ = std::fs::remove_dir_all(&xdg);
         unsafe { std::env::set_var("HOME", &home) };
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
-        // legacy macOS path + live [agent_mail] block (ADR-0003 V5)
         let legacy_dir = home.join("Library/Application Support/flywheel");
         std::fs::create_dir_all(&legacy_dir).unwrap();
         std::fs::write(
@@ -1579,7 +1512,6 @@ daily = [
             Some("Orchid"),
             "live [agent_mail] block survives migration"
         );
-        // Copied to XDG; legacy kept as backup (NOT moved).
         let xdg_file = xdg.join("flywheel/config.toml");
         assert!(xdg_file.exists(), "legacy config copied to XDG");
         assert!(
@@ -1627,8 +1559,6 @@ daily = [
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
 
-    // ---- ADR-0025 Spec 4 Wave 4a Phase 1 ----
-
     #[test]
     fn on_captain_death_default_is_stop() {
         let cfg = Config::default();
@@ -1645,10 +1575,8 @@ daily = [
         assert_eq!(c.on_captain_death(), OnCaptainDeath::Continue);
         let c: Config = toml::from_str(r#"on_captain_death = "adopt""#).unwrap();
         assert_eq!(c.on_captain_death(), OnCaptainDeath::Adopt);
-        // recover is alias for adopt (Spec 4: recover == adopt)
         let c: Config = toml::from_str(r#"on_captain_death = "recover""#).unwrap();
         assert_eq!(c.on_captain_death(), OnCaptainDeath::Adopt);
-        // case-insensitive
         let c: Config = toml::from_str(r#"on_captain_death = "STOP""#).unwrap();
         assert_eq!(c.on_captain_death(), OnCaptainDeath::Stop);
     }
@@ -1664,13 +1592,11 @@ daily = [
     fn on_captain_death_recover_sets_alias() {
         let mut aliases: BTreeMap<String, String> = BTreeMap::new();
         aliases.insert("proj".into(), "OldCaptain".into());
-        // recover == adopt: alias rebound to recovering pin
         apply_captain_adopt(&mut aliases, "proj", "NewCaptain");
         assert_eq!(
             aliases.get("proj").map(std::string::String::as_str),
             Some("NewCaptain")
         );
-        // clear helper (toron contact captain --clear)
         clear_captain_alias(&mut aliases, "proj");
         assert!(captain_alias_cleared(&aliases, "proj"));
     }
@@ -1684,7 +1610,6 @@ daily = [
         let unrelated = SpawnEntry::with_mail_identity("pane-other", "other", "UnrelatedPin");
         let registry = vec![captain_entry, child, unrelated];
 
-        // continue: captain removed, children + unrelated stay
         let after_continue =
             registry_after_captain_death(&registry, captain, OnCaptainDeath::Continue);
         assert!(
@@ -1699,7 +1624,6 @@ daily = [
             !after_continue.iter().any(|e| e.pane_id == "pane-cap"),
             "captain itself cleared"
         );
-        // alias cleared on continue
         let mut aliases = BTreeMap::from([("proj".to_string(), captain.to_string())]);
         clear_captain_alias(&mut aliases, "proj");
         assert!(captain_alias_cleared(&aliases, "proj"));
@@ -1711,7 +1635,6 @@ daily = [
         let captain = "BraveCaptain";
         let child = SpawnEntry::with_mail_identity("pane-child", "child1", "ChildPin");
         let captain_entry = SpawnEntry::with_mail_identity("pane-cap", "cap", captain);
-        // Unrelated pin lives outside this project's registry (different project / no entry)
         let registry = vec![captain_entry, child];
 
         let attributed = captain_attributed_pins(&registry, captain);
@@ -1726,7 +1649,6 @@ daily = [
             !after_stop.iter().any(|e| e.pane_id == "pane-child"),
             "stop removes attributed child"
         );
-        // unrelated outside registry is trivially unchanged — not in filtered set
         assert!(
             !after_stop
                 .iter()
@@ -1743,7 +1665,6 @@ daily = [
             SpawnEntry::with_mail_identity("pane-cap", "cap", captain),
             child,
         ];
-        // reap_crews overrides continue → behaves like Stop (children reaped)
         let with_reap = {
             let policy = if true {
                 OnCaptainDeath::Stop
@@ -1756,7 +1677,6 @@ daily = [
             !with_reap.iter().any(|e| e.pane_id == "pane-child"),
             "--reap-crews must reap crews even under continue"
         );
-        // without reap, continue leaves child
         let without_reap =
             registry_after_captain_death(&registry, captain, OnCaptainDeath::Continue);
         assert!(without_reap.iter().any(|e| e.pane_id == "pane-child"));
@@ -1767,16 +1687,13 @@ daily = [
         use crate::state as st;
         let _home = test_state_home();
         let proj = format!("oncap-mail-{}", std::process::id());
-        // initially alias present
         st::save_captain_alias(&proj, "BraveCaptain").unwrap();
         assert!(st::resolve_captain_target(&proj, "captain").is_ok());
-        // continue clears alias → mail --to captain fails loud
         st::clear_captain_alias_file(&proj);
         let err =
             st::resolve_captain_target(&proj, "captain").expect_err("cleared alias must fail");
         assert!(format!("{err}").contains("alias cleared"));
         assert!(format!("{err}").contains("recover"));
-        // recover (= adopt) rebounds alias → mail succeeds again
         st::save_captain_alias(&proj, "NewCaptain").unwrap();
         assert!(st::resolve_captain_target(&proj, "captain").is_ok());
         assert!(st::resolve_captain_target(&proj, "CAPTAIN").is_ok());
@@ -1792,7 +1709,6 @@ daily = [
         let child = SpawnEntry::with_mail_identity("pane-child", "child1", "ChildPin");
         st::save_spawn_registry(&proj, &[child]).unwrap();
         st::save_captain_alias(&proj, captain).unwrap();
-        // simulate kill with continue: crews remain, alias cleared, doorbell would stay (not stopped)
         let registry = st::load_spawn_registry(&proj);
         let remain = registry_after_captain_death(&registry, captain, OnCaptainDeath::Continue);
         st::save_spawn_registry(&proj, &remain).unwrap();
@@ -1806,7 +1722,6 @@ daily = [
             st::is_captain_alias_cleared(&proj),
             "alias cleared until rebound"
         );
-        // adopt via recover
         st::save_captain_alias(&proj, "AdoptedCaptain").unwrap();
         assert_eq!(
             st::load_captain_alias(&proj).as_deref(),
@@ -1874,8 +1789,6 @@ daily = [
                         end = end.min(t + i);
                     }
                 }
-                // The next test bounds this one, but search PAST this block's
-                // own marker or the block would be empty.
                 if let Some(i) = rest[t + TEST.len()..].find(TEST) {
                     end = end.min(t + TEST.len() + i);
                 }
@@ -1900,15 +1813,6 @@ daily = [
                 if !block.contains("set_var(\"XDG_STATE_HOME\"") {
                     continue;
                 }
-                // The guard the rule demands is serialization: a setter that
-                // does not hold ENV_LOCK can be observed mid-flight by any other
-                // test. `ENV_LOCK` itself counts, not only the hermetic
-                // accessors — a block that takes the raw lock and restores what
-                // it found cannot produce the "already been deleted" state home
-                // this rule exists to prevent. (bd-uu58: excluding the raw lock
-                // meant the only way to reach `TestStateHome`'s Some arm of the
-                // restore was a block the lint flagged, so the arm was untestable
-                // and M2 of scripts/mutations/state-home.spec.sh reported VACUOUS.)
                 if block.contains("test_state_home()")
                     || block.contains("lock_env()")
                     || block.contains("ENV_LOCK")
@@ -2015,13 +1919,9 @@ daily = [
         .is_err();
         assert!(panicked, "the poisoning panic must actually fire");
 
-        // The lock is now poisoned. Taking it again must still hand out a guard
-        // rather than exploding, and that guard must be usable.
         let guard = lock_env();
         drop(guard);
 
-        // A second acquisition must also work, proving the lock is genuinely
-        // released and not merely handed out once.
         let guard = lock_env();
         drop(guard);
     }

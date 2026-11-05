@@ -19,13 +19,6 @@
 //! means the command never ran. A dropped command value performs no I/O:
 //! the fold only ever builds values, and the edge runs them.
 
-// The framework half of this port — the `Program` impl, the interpreter, the
-// edge and the loop entry point — is the shape the doorbell daemon adopts
-// when it can reach the framework (a `toron_core::kernel` dependency in a
-// deliberately light crate is a decision, not a line). Until then the fold
-// is the live path and the tests are the framework half's only caller, so
-// the build gate would read it as dead code. The allowance is scoped to
-// this module and says exactly that.
 #![allow(dead_code)]
 
 use std::sync::Arc;
@@ -39,7 +32,6 @@ use toron_core::kernel::{
 use doorbell_core::wake_core::{GateDecision, RouteInput, WakeEffect, WakeModel, WakeMsg};
 use doorbell_core::{SelfIndex, fnv1a64};
 
-// The doorbell's own vocabulary: the plane's name for the core's model.
 use crate::doorbell_tick::{DoorbellAction, DoorbellModel, DoorbellMsg, tick};
 
 /// The doorbell's model: the dispatcher's state and the router's state, in
@@ -202,12 +194,8 @@ impl InboxCmd {
 impl CmdTrait for InboxCmd {
     fn durability(&self) -> Durability {
         if self.is_signal() {
-            // A signal to the host: the host asks for it again every cycle,
-            // so there is nothing to redeliver after a crash.
             Durability::Ephemeral
         } else {
-            // A delivery, a digest, a loud miss: never a silent drop. The
-            // key names the row, so a redelivery after a crash joins it.
             Durability::Durable { key: self.key() }
         }
     }
@@ -282,9 +270,6 @@ impl Program for InboxProgram {
     type Err = String;
 
     fn init(boot: &Boot) -> Update<InboxModel, InboxCmd> {
-        // The pin index the dispatcher routes by: the host's, carried in the
-        // boot config as JSON, so the model starts whole. No index, no
-        // routing: an empty index routes nothing and says so.
         let index = boot
             .get("index")
             .and_then(|raw| serde_json::from_str::<SelfIndex>(raw).ok())
@@ -302,7 +287,6 @@ impl Program for InboxProgram {
     fn update(model: &InboxModel, msg: &InboxMsg) -> Update<InboxModel, InboxCmd> {
         match msg {
             InboxMsg::Edge(edge) => {
-                // The dispatcher's decision, by the one implementation of it.
                 let (next, commands) = InboxProgram::fold(&model.dispatcher, edge);
                 Update {
                     model: InboxModel {
@@ -314,7 +298,6 @@ impl Program for InboxProgram {
                 }
             }
             InboxMsg::Route(input) => {
-                // The router's decision, by the one implementation of it.
                 let (next, commands) = InboxProgram::fold_route(&model.wake, input);
                 Update {
                     model: InboxModel {
@@ -327,12 +310,6 @@ impl Program for InboxProgram {
             }
             InboxMsg::Settled { .. } => Update::quiet(model.clone()),
             InboxMsg::Failed(failure) => {
-                // The command did not settle as success. The cause is kept
-                // apart from the others, and the model records it: the
-                // journal already holds the message row, so the miss is
-                // never a silent drop. No command comes out of it — a
-                // failure that produced commands would ask the edge to
-                // report the failure, and a failing report would ask again.
                 let mut next = model.clone();
                 next.failure = Some(failure.clone());
                 Update::quiet(next)
@@ -343,25 +320,19 @@ impl Program for InboxProgram {
     fn failure(failure: &Failure<String>) -> InboxMsg {
         let label = "command".to_string();
         match failure {
-            // The edge's typed refusal.
             Failure::Fail(why) => InboxMsg::Failed(InboxFailure::Typed {
                 label,
                 detail: why.clone(),
             }),
-            // A defect is a bug, not an answer: it is kept apart so a reader
-            // never reads it as the command having failed.
             Failure::Defect(defect) => InboxMsg::Failed(InboxFailure::Defect {
                 label,
                 detail: format!("{defect:?}"),
             }),
-            // Interruption is not a failure and must not settle as one.
             Failure::Interrupted => InboxMsg::Failed(InboxFailure::Interrupted { label }),
-            // The journal refused the append, so the command never ran.
             Failure::NotAppended(error) => InboxMsg::Failed(InboxFailure::NotAppended {
                 label,
                 detail: format!("{error:?}"),
             }),
-            // The append may have landed. Never report this as "did not run".
             Failure::Unknown(error) => InboxMsg::Failed(InboxFailure::JournalUnknown {
                 label,
                 detail: format!("{error:?}"),
@@ -392,8 +363,6 @@ pub struct InboxInterpret;
 
 impl Interpret<InboxProgram> for InboxInterpret {
     fn interpret(cmd: &InboxCmd) -> Effect<InboxMsg, String> {
-        // No edge in hand: the command cannot run. That is a typed failure
-        // the fold records, never a silent drop.
         Effect::succeed(InboxMsg::Failed(InboxFailure::Typed {
             label: cmd.label(),
             detail: "no edge in hand: boot the loop with a runtime that carries the edge".into(),
@@ -511,15 +480,11 @@ mod tests {
             update.model.failure,
             Some(InboxFailure::JournalUnknown { .. })
         ));
-        // Parked: no command asks the edge to run anything again.
         assert!(update.commands.is_empty());
     }
 
     #[test]
     fn the_fold_agrees_with_the_core_it_delegates_to() {
-        // The program owns the SHAPE, not a second decision: the same edge
-        // message folds to the same model and the same commands the core
-        // produces.
         let model = InboxModel::default();
         let edge = DoorbellMsg::PlaneStatus {
             pin: "EmeraldSparrow".into(),
@@ -539,8 +504,6 @@ mod tests {
 
     #[test]
     fn the_workspace_slice_and_the_program_fold_the_same_way() {
-        // The live path (the workspace's doorbell slice) and the program
-        // share ONE fold: same message, same model, same commands.
         let model = DoorbellModel::default();
         let edge = DoorbellMsg::PlaneStatus {
             pin: "EmeraldSparrow".into(),
@@ -581,8 +544,6 @@ mod tests {
 
     #[test]
     fn a_dropped_command_value_performs_no_io() {
-        // Building the fold's output must not run it: the edge sees nothing
-        // until the interpreter runs the command.
         let edge = Arc::new(Recorder::default());
         let update = InboxProgram::update(
             &InboxModel::default(),
@@ -608,8 +569,6 @@ mod tests {
             let InboxMsg::Failed(failure) = outcome else {
                 panic!("a failure folds as a failure");
             };
-            // Each cause keeps its own shape, and none of them settles as
-            // success.
             let update = InboxProgram::update(&model, outcome);
             assert!(update.commands.is_empty(), "a failure asks for no work");
             assert_eq!(update.model.failure.as_ref(), Some(failure));
@@ -630,8 +589,6 @@ mod tests {
 
     #[test]
     fn the_interpreter_runs_the_command() {
-        // The edge runs the command, and the outcome folds back as a settled
-        // message: the model records no failure.
         let edge = Arc::new(Recorder::default());
         let cmd = InboxCmd::dispatch(DoorbellAction::Prompt {
             pin: "EmeraldSparrow".into(),
@@ -690,9 +647,6 @@ mod tests {
 
     #[test]
     fn the_loop_journals_the_identity_and_refolds_after_a_crash() {
-        // The durable identity is the framework's: the journal rows carry
-        // (producer_id, epoch, seq), and a recovery replays the fold from
-        // the log instead of asking the host again.
         let dir = std::env::temp_dir().join(format!("flywheel-inbox-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
@@ -717,15 +671,11 @@ mod tests {
             .expect("send folds");
         assert!(path.exists(), "the journal reached disk");
         let rows = std::fs::read_to_string(&path).expect("journal rows");
-        // The file holds one JSON object per line whose "envelope" is the
-        // stamped record: the durable identity travels all three parts.
         assert!(rows.contains("inbox-test"), "the producer id: {rows}");
         assert!(rows.contains(r#"\"epoch\":0"#), "the epoch: {rows}");
         assert!(rows.contains(r#"\"seq\":"#), "the seq: {rows}");
-        drop(loop_); // Crash: no shutdown, no snapshot.
+        drop(loop_);
 
-        // Recover: the fold is replayed from the journal, and the producer
-        // resumes after its own last record.
         let recovered = Loop::<InboxProgram, InboxInterpret>::recover(
             &boot,
             ManagedRuntime::make(
@@ -740,8 +690,6 @@ mod tests {
             recovered.in_flight().is_empty(),
             "nothing is left in flight"
         );
-        // The replayed fold asked for the same work, and the edge ran it
-        // again: the journal is the durable record, not the host's memory.
         assert!(
             edge.ran.lock().unwrap().len() >= 2,
             "the replay ran the command"
@@ -751,8 +699,6 @@ mod tests {
 
     #[test]
     fn the_router_decides_in_the_same_program() {
-        // The router's verdict is a command of the SAME program, so a wake's
-        // fate is decided in one fold: inject, digest, hold or drop.
         let model = InboxModel::default();
         let update = InboxProgram::update(
             &model,
@@ -770,9 +716,6 @@ mod tests {
 
     #[test]
     fn a_wake_that_cannot_be_prompted_is_never_a_silent_drop() {
-        // A busy pane holds the wake for the digest batch; a spent budget
-        // holds it for a later poll. Neither is a silent drop: the wake
-        // reaches a reader either way.
         let busy = RouteInput {
             presence: PresenceVerdict::Busy,
             ..route_input("EmeraldSparrow", "wake")
@@ -797,8 +740,6 @@ mod tests {
 
     #[test]
     fn a_signal_is_ephemeral_and_a_delivery_is_durable() {
-        // The host re-derives a signal every cycle, so there is nothing to
-        // redeliver; a delivery must not be lost, so it names its row.
         let signal = InboxCmd::dispatch(DoorbellAction::FetchInbox);
         assert_eq!(signal.durability(), Durability::Ephemeral);
         let delivery = InboxCmd::dispatch(DoorbellAction::Prompt {
@@ -811,7 +752,6 @@ mod tests {
                 key: delivery.key()
             }
         );
-        // The same work names the same row, so a redelivery joins it.
         let again = InboxCmd::dispatch(DoorbellAction::Prompt {
             pin: "EmeraldSparrow".into(),
             line: "[doorbell] wake".into(),

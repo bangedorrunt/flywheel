@@ -78,8 +78,6 @@ pub fn run_bounded(cmd: &mut Command, timeout: Duration) -> Result<Output, ProcE
             }
         }
     };
-    // The drain is bounded: the child is gone, but a grandchild may still
-    // hold the pipe's write end, so EOF may never come.
     join_bounded(out_handle, Instant::now() + DRAIN_GRACE);
     join_bounded(err_handle, Instant::now() + DRAIN_GRACE);
     Ok(Output {
@@ -163,7 +161,6 @@ mod tests {
     #[test]
     fn watchdog_drain_is_bounded_when_a_grandchild_holds_the_pipe() {
         let mut cmd = Command::new("sh");
-        // The grandchild inherits stdout and sleeps; the shell itself exits.
         cmd.arg("-c").arg("(sleep 30 &) ; printf 'child-done'");
         let started = Instant::now();
         let out = run_bounded(&mut cmd, Duration::from_secs(5)).expect("the child exits");

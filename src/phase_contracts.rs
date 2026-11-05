@@ -47,9 +47,6 @@ pub const REVIEW_VERDICTS: [&str; 3] = ["AGREE", "AGREE-WITH-CHANGES", "REJECT"]
 /// `{"response": "<json>"}` (headless leaf) parses the inner JSON; an
 /// already-object value passes through; anything else is not a report.
 pub fn agent_report(step_out: &serde_json::Value) -> Option<serde_json::Value> {
-    // The headless leaf wraps agent stdout in `response` — that inner JSON
-    // is the report (the wrapper itself never is). Bare objects/strings
-    // pass through for direct-report callers (tests, pane reports).
     if let Some(r) = step_out.get("response").and_then(serde_json::Value::as_str) {
         return serde_json::from_str(r.trim()).ok();
     }
@@ -163,8 +160,6 @@ pub fn plan_contract(report: &serde_json::Value) -> PhaseContractReport {
 
 /// A bead id as it appears in commit messages (`bd-cvv9`, `bd-lease-liveness-bo0g`).
 pub fn cites_bead_id(text: &str) -> bool {
-    // bd- followed by 3+ [a-z0-9] — loose on purpose: message-cited ids are
-    // evidence of linkage, not of format policing.
     let mut rest = text;
     while let Some(i) = rest.find("bd-") {
         let tail = &rest[i + 3..];
@@ -293,8 +288,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    // ---- agent_report -------------------------------------------------
-
     #[test]
     fn agent_report_parses_headless_response_string() {
         let out = json!({ "response": r#"{"target":"x"}"#, "ok": true });
@@ -306,8 +299,6 @@ mod tests {
     fn agent_report_rejects_prose() {
         assert!(agent_report(&json!({ "response": "I am done, trust me" })).is_none());
     }
-
-    // ---- resolve: passing + failing witnesses --------------------------
 
     #[test]
     fn resolve_contract_passing_witness() {
@@ -330,8 +321,6 @@ mod tests {
         assert!(r.evidence.contains("open_questions"), "{}", r.evidence);
     }
 
-    // ---- plan ----------------------------------------------------------
-
     #[test]
     fn plan_contract_passing_witness() {
         let r = plan_contract(&json!({
@@ -344,15 +333,12 @@ mod tests {
 
     #[test]
     fn plan_contract_failing_witnesses() {
-        // no beads
         let r = plan_contract(&json!({ "beads": [], "dep_cycles": 0 }));
         assert!(!r.ok && r.evidence.contains("empty"));
-        // bead without acceptance
         let r = plan_contract(&json!({
             "beads": [ { "id": "bd-abc1", "acceptance": " " } ], "dep_cycles": 0
         }));
         assert!(!r.ok && r.evidence.contains("acceptance"), "{}", r.evidence);
-        // cycles present
         let r = plan_contract(&json!({
             "beads": [ { "id": "bd-abc1", "acceptance": "x" } ], "dep_cycles": 2
         }));
@@ -361,14 +347,11 @@ mod tests {
             "{}",
             r.evidence
         );
-        // dep_cycles not injected (agent self-certification is not evidence)
         let r = plan_contract(&json!({
             "beads": [ { "id": "bd-abc1", "acceptance": "x" } ]
         }));
         assert!(!r.ok && r.evidence.contains("inject"), "{}", r.evidence);
     }
-
-    // ---- implement -----------------------------------------------------
 
     #[test]
     fn implement_contract_passing_witness() {
@@ -382,7 +365,6 @@ mod tests {
 
     #[test]
     fn implement_contract_failing_witnesses() {
-        // commit does not cite a bead id
         let r = implement_contract(&json!({
             "commit_sha": "abc123", "commit_message": "fix the thing",
             "gate": { "command": "true", "exit": 0, "output": "" }
@@ -392,7 +374,6 @@ mod tests {
             "{}",
             r.evidence
         );
-        // gate non-zero / missing output
         let r = implement_contract(&json!({
             "commit_sha": "abc123", "commit_message": "fix (bd-abc1)",
             "gate": { "command": "cargo test", "exit": 101 }
@@ -402,7 +383,6 @@ mod tests {
             "{}",
             r.evidence
         );
-        // no commit at all
         let r = implement_contract(&json!({ "gate": { "command": "true", "exit": 0 } }));
         assert!(!r.ok && r.evidence.contains("commit_sha"));
     }
@@ -415,8 +395,6 @@ mod tests {
         assert!(!cites_bead_id("bd- is not an id"));
         assert!(!cites_bead_id("CBD-123 not lower"));
     }
-
-    // ---- review --------------------------------------------------------
 
     #[test]
     fn review_contract_passing_and_failing_witnesses() {
@@ -437,8 +415,6 @@ mod tests {
         let no_findings = review_contract(&json!({ "verdict": "AGREE" }));
         assert!(!no_findings.ok && no_findings.evidence.contains("findings"));
     }
-
-    // ---- verify --------------------------------------------------------
 
     #[test]
     fn verify_contract_passing_and_failing_witnesses() {
@@ -461,8 +437,6 @@ mod tests {
         }));
         assert!(!no_output.ok, "output must be recorded");
     }
-
-    // ---- dispatch table + report extraction ----------------------------
 
     #[test]
     fn check_phase_end_to_end_over_headless_leaf_shape() {

@@ -135,8 +135,6 @@ pub(crate) fn require_npub(pin: &str, npub: Option<String>) -> Result<String, St
     npub.ok_or_else(|| format!("no npub for {pin}"))
 }
 
-// ---- the context log ------------------------------------------------------
-
 #[derive(Serialize, Deserialize)]
 struct Entry {
     seq: u64,
@@ -203,7 +201,6 @@ pub fn read_log(p: &CtxPaths) -> Result<(Vec<SupMsg>, u64, u64)> {
 
 fn append_log(p: &CtxPaths, e: &Entry) -> Result<()> {
     if let Some(d) = p.log.parent() {
-        // 0700/0600, not the ambient umask. A log line can carry a steer sha.
         crate::private_fs::create_private_dir_all(d)?;
     }
     let mut f = crate::private_fs::open_private_append(&p.log)?;
@@ -280,12 +277,9 @@ pub fn append_input(p: &CtxPaths, msg: &SupMsg) -> Result<()> {
         crate::private_fs::create_private_dir_all(d)?;
     }
     let mut f = crate::private_fs::open_private_append(&p.inbox)?;
-    // One write per line: O_APPEND keeps concurrent writers' lines whole.
     f.write_all(format!("{}\n", serde_json::to_string(msg)?).as_bytes())?;
     Ok(())
 }
-
-// ---- the core: model + log ------------------------------------------------
 
 /// Model, log and read position.
 pub struct Core {
@@ -368,8 +362,6 @@ impl Core {
     }
 
     fn append_fold(&mut self, m: SupMsg) -> Result<Vec<SupCmd>> {
-        // Free text is flattened before the fold, so the log, the replay, and
-        // the page all see the same line. A token never lands in the jsonl.
         let m = scrub_msg(m);
         let u = SupervisorProgram::update(&self.model, &m);
         if u.model != self.model || !u.commands.is_empty() {
@@ -394,8 +386,6 @@ impl Core {
         &self.paths
     }
 }
-
-// ---- executing commands ---------------------------------------------------
 
 /// `steer@1` body.
 ///
@@ -768,8 +758,6 @@ fn key_of(c: &SupCmd) -> String {
     }
 }
 
-// Test threads set this so a long fixture does not flip the process-wide
-// env under a sibling test that is also folding.
 #[cfg(test)]
 thread_local! {
     static EXEC_FORCE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -856,7 +844,6 @@ pub fn execute(
                 why: format!("journal unavailable: {why}"),
             }];
         }
-        // Not a failure of the child: a refused claim spends no restart.
         Begin::Held(holder) => {
             rep.held += 1;
             return vec![SupMsg::CmdHeld { key, holder }];
@@ -984,11 +971,8 @@ pub fn round(
     msgs.extend(ports.observe(&core.model, now_ms));
     msgs.push(SupMsg::Tick { now_ms });
     feed(core, j, ports, msgs, &mut rep)?;
-    // Inputs that changed nothing still advance the read position.
     if let Some(off) = core.pending_in_off.take() {
         core.in_off = off;
-        // Persisted with the next logged message; a restart re-reads them
-        // and the fold ignores them again (deterministic no-ops).
         core.pending_in_off = Some(off);
     }
     Ok(rep)
@@ -1007,9 +991,6 @@ pub fn recover(
     let mut rep = RoundReport::default();
     let mut follow = Vec::new();
     for c in &cmds {
-        // The log already recorded this append (a `steer@1`, or a notify from
-        // before that contract). Do not send another envelope. A still-pending
-        // steer is closed when its child restarts (`AppliedByRestart`).
         if let SupCmd::AppendSteer { seq, .. } = c
             && core
                 .model
@@ -1036,14 +1017,6 @@ pub fn recover(
             continue;
         }
         let fed = dispatch(core, j, ports, c, &mut rep)?;
-        // `execute` returns nothing for a Relaunch only when the journal skipped
-        // it (a run feeds back `Relaunched` or `CmdFailed`). A settled relaunch is skipped, but if the host
-        // died before `Relaunched` was logged the child would sit `Restarting`
-        // until its lease ran out (and then be restarted again, spending the
-        // budget). The settled row IS the confirmation: feed it, and only while
-        // the model is still waiting for it (defence in depth: the fold ignores
-        // a confirmation that is not current anyway). The log-only switch also
-        // returns nothing, and that is not a confirmation: nobody spawned.
         if fed.is_empty()
             && exec_allowed()
             && let SupCmd::Relaunch {
@@ -1064,8 +1037,6 @@ pub fn recover(
     feed(core, j, ports, follow, &mut rep)?;
     Ok(rep)
 }
-
-// ---- production journal ---------------------------------------------------
 
 /// The effect-journal scope of one host. The root's is unchanged. A nested
 /// lead's is its own: its fold numbers steers from 1 as well, so sharing the
@@ -1150,17 +1121,6 @@ impl EffectJournal for ToronEffectJournal {
         };
         let claimed = match claim(&self.owner) {
             Ok(Some(r)) => r,
-            // Refused: another owner's lease is live. If that owner is this
-            // context's predecessor (a lower sup_epoch, so a host that is
-            // dead: the context lease admits one live host and the epoch
-            // claim fenced it), take its claim over and run the key once more.
-            // The claim keeps the predecessor's owner token until its lease
-            // expires (the kernel refuses a cross-owner claim while a lease is
-            // live); the fence is the generation the takeover bumps, so the
-            // dead host's late settle cannot land. Waiting out the lease
-            // instead made the fold count the refusal as a child failure: an
-            // extra generation and a spent restart slot per host crash
-            // (rv23 S2).
             Ok(None) => match row.owner.as_deref() {
                 Some(theirs) if takes_over(&self.owner, theirs) => match claim(theirs) {
                     Ok(Some(r)) => r,
@@ -1219,8 +1179,6 @@ impl EffectJournal for MemJournal {
         }
     }
 }
-
-// ---- production ports -----------------------------------------------------
 
 /// hc + mail + the captain page, as the supervisor's effect boundary.
 pub struct LivePorts {
@@ -1342,14 +1300,10 @@ impl Ports for LivePorts {
 
     fn observe(&mut self, model: &SupModel, now_ms: u64) -> Vec<SupMsg> {
         let mut out = Vec::new();
-        // rv23 #4: the last round's facts are folded by now; record how far
-        // they were read.
         let reader = self.context.clone().unwrap_or_else(|| "root".into());
         for c in self.lead_facts.values_mut() {
             c.commit();
         }
-        // Lead facts and a dead lease, before the hc edge, so a lead
-        // failure still restarts while hc reads up.
         let leads: Vec<String> = model
             .children
             .iter()
@@ -1364,7 +1318,6 @@ impl Ports for LivePorts {
             });
             out.extend(lead_upward(cur, model, &id, now_ms, dead));
         }
-        // hc edges.
         let up = self.client().is_some();
         if self.plane_up != Some(up) {
             if self.plane_up.is_some() || !up {
@@ -1376,7 +1329,6 @@ impl Ports for LivePorts {
             }
             self.plane_up = Some(up);
         }
-        // Crews the registry knows that the model does not.
         for e in crate::state::load_spawn_registry(&self.project) {
             let Some(pin) = e.mail_identity.clone() else {
                 continue;
@@ -1396,7 +1348,6 @@ impl Ports for LivePorts {
                 now_ms,
             });
         }
-        // Cursors, for children with a steer in flight (the ack).
         for s in model.steers.values() {
             if s.state != crate::supervisor_program::SteerState::Pending || s.offset.is_none() {
                 continue;
@@ -1418,7 +1369,6 @@ impl Ports for LivePorts {
                 });
             }
         }
-        // The inbox host's deaf facts, by the npub they name.
         let deaf_path = self.inbox_facts_path();
         let deaf = self
             .deaf
@@ -1457,11 +1407,8 @@ impl Ports for LivePorts {
 
     fn relaunch(&mut self, child: &str, generation: u64, kind: ChildKind) -> Result<(), String> {
         if child == PASS {
-            // The next interval is the relaunch of the pass child.
             return Ok(());
         }
-        // Lead argv is a nested supervise. This host only runs under the
-        // comms flag (`run_supervise`); a second host is refused by the lease.
         let st = std::process::Command::new(&self.relaunch_bin)
             .args(relaunch_argv(&self.project, child, kind))
             .env("FLYWHEEL_SUPERVISOR_GENERATION", generation.to_string())
@@ -1491,11 +1438,7 @@ impl Ports for LivePorts {
     }
 
     fn append_steer(&mut self, s: &SteerSend) -> Result<u64, String> {
-        // rv23 #6: never steer without a lead claimed at this epoch.
         steer_gate(self.lead, s.sup_epoch)?;
-        // The delta comes from the side store by sha and is refused unless its
-        // bytes hash to that sha. It rides the steer@1 body, never a pane.
-        // The supervisor log keeps the sha (the fold's message), not these bytes.
         let delta = match &s.delta_sha {
             Some(sha) => Some(
                 crate::steer_delta::load(&CtxPaths::default_dir(), &self.project, sha)
@@ -1507,8 +1450,6 @@ impl Ports for LivePorts {
             .inbox
             .npub_of(&s.child)
             .ok_or_else(|| format!("no npub for {}", s.child))?;
-        // The steer's context and `from` are this host's lead context and
-        // holder: a nested lead steers in `project/<sub>`, not the root's.
         let ctx = self.lead_context();
         let producer = crate::lead_claim::lead_holder(&ctx);
         let epoch = self.inbox.claim_epoch_as(&producer)?;
@@ -1539,9 +1480,6 @@ impl Ports for LivePorts {
         } else {
             vec![evidence_s.clone()]
         };
-        // No captain pin: there is no npub to address. The page below is the
-        // same sink as before. A bound captain gets escalate@1 as well.
-        // The body is the flattened text, so `toron next` does not show the token.
         if let Some(cap) = crate::state::load_captain_alias(&self.project) {
             let to = self
                 .inbox
@@ -1582,8 +1520,6 @@ impl Ports for LivePorts {
             json!({"kind": "page", "page": kind, "pin": pin}),
         )?;
         match kind {
-            // The health pages are their own subject: the captain can tell a
-            // dead dispatcher from a dead stop without reading the body.
             "dead_doorbell" => crate::page_captain_mail(
                 &self.cfg,
                 &self.project,
@@ -1611,8 +1547,6 @@ impl Ports for LivePorts {
         )
     }
 }
-
-// ---- the host loop (`loop-mode supervise` under the comms flag) -----------
 
 /// Settings from the environment (fixtures shorten these; production uses
 /// the defaults).
@@ -1989,8 +1923,6 @@ pub fn run_supervise(
         Some(c) => format!("supervise-{project}-{c}-{}", std::process::id()),
         None => format!("supervise-{project}-{}", std::process::id()),
     };
-    // One live host per context (the log has one writer). A lead does not
-    // take the root's lease, so the two processes can run together.
     let lease_ws = supervise_lease_workspace(project, context);
     let sd = crate::config::state_dir();
     let now_s = || chrono::Utc::now().timestamp().max(0) as u64;
@@ -2038,7 +1970,6 @@ fn host_loop(
     context: Option<&str>,
 ) -> Result<()> {
     let mut core = Core::open(paths.clone(), me, Tier::Lead, hc.policy())?;
-    // rv23 #6: a nested lead claims and steers in its own context.
     let lead_ctx = crate::lead_claim::lead_context(project, context);
     let claim = claim_for_host(&mut core, project, &lead_ctx, me)?;
     let epoch = claim.epoch;
@@ -2079,8 +2010,6 @@ fn host_loop(
             now_ms: now_ms(),
         });
     }
-    // 4b.7: the tick stays the truth; a change to the files a round reads wakes
-    // the next round early. Dropping the channel (hints off) is the plain tick.
     let (hint_tx, hint_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let _watcher = if hc.hints {
         let (_, index_db) = crate::mail::mailbox_roots();
@@ -2108,7 +2037,6 @@ fn host_loop(
                 ok: st.success(),
                 now_ms: now,
             });
-            // The dead-stop and wedge probes ride the end of a pass, as before.
             extra.extend(probe_msgs(
                 cfg,
                 project,
@@ -2250,9 +2178,6 @@ fn probe_msgs(
             });
         }
     }
-    // Hardening slice 2 (bd-c0ha): a dead doorbell dispatcher or a stale
-    // heartbeat on a binding hc may clear pages once, then holds. The
-    // model is the hold, so a replayed pass folds the same set.
     let mut hold = crate::health_page::HealthHold {
         dead_doorbells: model.dead_doorbells.clone(),
         stale_pins: model.stale_pins.clone(),
@@ -2286,8 +2211,6 @@ fn probe_msgs(
     }
     out
 }
-
-// ---- the operator/crew CLI (`flywheel supervisor ...`) --------------------
 
 /// `flywheel supervisor` subcommands.
 #[derive(clap::Subcommand, Debug)]
@@ -2438,8 +2361,6 @@ pub fn run_cli(cmd: &SupervisorCmd) -> Result<()> {
                 _ => CtxPaths::new(&dir, project),
             };
             let op = parse_op(op)?;
-            // Validate and stash the delta BEFORE queueing the steer: a bad
-            // file queues nothing.
             let delta_sha = match (op, delta_file) {
                 (SteerOp::Redirect, Some(f)) => {
                     let raw = std::fs::read(f).with_context(|| format!("read {}", f.display()))?;
@@ -2547,9 +2468,6 @@ pub fn queue_halt(
         }
     };
     let request_key = request_key.map(str::trim).filter(|k| !k.is_empty());
-    // The digest rides the OFFERED inputs, not the resolved epoch: a retry of
-    // the same call always matches, while a different context (or a new
-    // explicit epoch) is a different halt and needs its own key.
     let epoch_part = match sup_epoch {
         Some(e) => e.to_string(),
         None => "auto".to_string(),
@@ -2739,7 +2657,6 @@ mod tests {
             fn umask(mask: u16) -> u16;
         }
         // SAFETY: the guard restores the previous mask on drop. The test
-        // body is the only window, and it runs under the env lock.
         unsafe { umask(mask as u16) as u32 }
     }
 
@@ -2926,7 +2843,6 @@ mod tests {
         let env = steer_envelope("proj", &producer, 0, NPUB, &s, None).unwrap();
         assert_eq!(holder, env.from, "the holder is the steer's `from`");
         assert_ne!(holder, me, "the pid-bearing name is not the holder");
-        // And the store keeps the steer (F7: from == holder at the epoch).
         let st = store.clone();
         let kept = crate::mail::block_on(async move {
             let claim = st.claim_epoch(&producer, "test").await.unwrap();
@@ -2987,7 +2903,7 @@ mod tests {
     fn live_append_steer_is_gated_on_the_lead() {
         let src = include_str!("supervisor_host.rs");
         let at = src
-            .find("    fn append_steer(&mut self, s: &SteerSend) -> Result<u64, String> {\n        // rv23")
+            .find("    fn append_steer(&mut self, s: &SteerSend) -> Result<u64, String> {")
             .expect("LivePorts::append_steer");
         let body = &src[at..at + 400];
         assert!(
@@ -3021,7 +2937,6 @@ mod tests {
         assert_eq!(lead_row(&store, "proj"), (lead_holder("proj"), rc.epoch));
         assert_eq!(lead_row(&store, &sub), (lead_holder(&sub), lc.epoch));
         assert_ne!(lead_holder("proj"), lead_holder(&sub));
-        // `as_ctx` signs as that context's holder; `into` is the steer's context.
         let steer = |as_ctx: &str, into: &str, child: &str, sup_epoch: u64| {
             let s = SteerSend {
                 child: child.into(),
@@ -3065,7 +2980,7 @@ mod tests {
         );
         assert!(body.contains("claim_for_host(&mut core, project, &lead_ctx, me)?"));
         let at = src
-            .find("    fn append_steer(&mut self, s: &SteerSend) -> Result<u64, String> {\n        // rv23")
+            .find("    fn append_steer(&mut self, s: &SteerSend) -> Result<u64, String> {")
             .expect("LivePorts::append_steer");
         let steer = &src[at..at + 1400];
         assert!(steer.contains("let ctx = self.lead_context();"), "{steer}");
@@ -3266,7 +3181,6 @@ mod tests {
             ChildState::Running,
             "Relaunched fed back"
         );
-        // A tick later changes nothing and relaunches nothing.
         go(&mut c, &mut j, &f, vec![], 3_000);
         assert_eq!(f.0.lock().unwrap().relaunched.len(), 1);
     }
@@ -3313,8 +3227,6 @@ mod tests {
     fn allow_exec_zero_records_the_crash_and_does_not_spawn() {
         let _home = crate::config::lock_env();
         let _clear = ClearExec;
-        // The env itself is the switch. Hold it only for this assert so a
-        // sibling fold in this process does not go log-only.
         unsafe { std::env::set_var("FLYWHEEL_ALLOW_EXEC", "0") };
         assert!(!exec_allowed());
         unsafe { std::env::set_var("FLYWHEEL_ALLOW_EXEC", "1") };
@@ -3368,7 +3280,6 @@ mod tests {
             log.contains("\"kind\":\"exit\""),
             "the crash is in the log: {log}"
         );
-        // Recover must not invent a relaunch the switch refused.
         recover(&mut c, &mut j, &mut live).unwrap();
         assert!(!marker.exists(), "recover spawned under the switch");
         assert_eq!(c.model.children["a"].state, ChildState::Restarting);
@@ -3482,8 +3393,6 @@ mod tests {
                 "never a"
             );
         }
-        // Crash model: c's relaunch ran but its journal row never settled.
-        // Only unsettled commands may re-run.
         j.rows.get_mut("relaunch:c:2").unwrap().0 = false;
         drop(c);
         let f2 = Fake::default();
@@ -3509,8 +3418,6 @@ mod tests {
             Fake::default(),
         );
         go(&mut c, &mut j, &f, vec![spawn("a"), spawn("b")], 1_000);
-        // The crash window: the exit is logged, the relaunch ran and settled,
-        // the host died before `Relaunched` was fed back.
         let cmds = c
             .append_fold(SupMsg::Exit {
                 child: "a".into(),
@@ -3539,10 +3446,8 @@ mod tests {
             "confirmed from the settled journal row"
         );
         assert_eq!(c2.model.children["b"].state, ChildState::Running);
-        // A second recovery over the now-complete log changes nothing (a no-op
-        // message is never logged, so the log does not grow either).
         drop(c2);
-        let mut c3 = open_with(d.path(), Strategy::RestForOne); // opening logs its own rebind/claim
+        let mut c3 = open_with(d.path(), Strategy::RestForOne);
         let n = read_log(&CtxPaths::new(d.path(), "proj")).unwrap().0.len();
         recover(&mut c3, &mut j, &mut f2.clone()).unwrap();
         assert_eq!(
@@ -3778,7 +3683,6 @@ mod tests {
             &format!("echo $$ > {}\nexec sleep 20", pidf.display()),
         );
         let deadline = Duration::from_secs(10);
-        // Zero until br is up and has its pid written, then the deadline.
         let mut clock = || match std::fs::read_to_string(&pidf) {
             Ok(s) if s.ends_with('\n') => deadline,
             _ => Duration::ZERO,
@@ -3904,11 +3808,11 @@ mod tests {
             stop.clone(),
             acked.clone(),
         );
-        std::thread::sleep(std::time::Duration::from_millis(150)); // the loop is now waiting out its tick
+        std::thread::sleep(std::time::Duration::from_millis(150));
         f.0.lock().unwrap().obs.push(SupMsg::Cursor {
             child: "a".into(),
             cursor: 10,
-        }); // toron next
+        });
         let t = std::time::Instant::now();
         tx.send(()).unwrap();
         while !acked.load(Ordering::Relaxed) && t.elapsed() < std::time::Duration::from_secs(2) {
@@ -3930,7 +3834,6 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let d1 = tempfile::tempdir().unwrap();
         let d2 = tempfile::tempdir().unwrap();
-        // Hinted run.
         let (c, j, f) = steered_core(d1.path());
         let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
         let (stop, acked) = (
@@ -3956,7 +3859,6 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         let _ = tx.send(());
         let hinted = h.join().unwrap();
-        // The channel dropped: only the tick drives it.
         let (c, j, f) = steered_core(d2.path());
         let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
         drop(tx);
@@ -4010,8 +3912,6 @@ mod tests {
         unsafe { std::env::remove_var("FLYWHEEL_SUPERVISOR_HINTS") };
     }
 
-    // ---- 4b.8: steer@1 body. The doorbell rings; the pane never sees the delta.
-
     fn send(op: SteerOp, sha: Option<&str>) -> SteerSend {
         SteerSend {
             seq: 1,
@@ -4039,7 +3939,6 @@ mod tests {
             br#"{"goal":"port the parser to the new AST","acceptance":"cargo test"}"#,
         )
         .unwrap();
-        // urgent: false on purpose. Priority follows the op, not the flag.
         let redirect = built(&send(SteerOp::Redirect, Some(&delta.sha)), Some(&delta));
         assert_eq!(redirect.contract.name, "steer");
         assert_eq!(redirect.contract.major, 1);
@@ -4055,7 +3954,6 @@ mod tests {
             delta.sha,
             "body delta hashes to the sha the log stores"
         );
-        // No epoch: the caller passes 0. The body records that, it does not invent one.
         let mut none = send(SteerOp::Redirect, Some(&delta.sha));
         none.sup_epoch = 0;
         assert_eq!(built(&none, Some(&delta)).body["sup_epoch"], 0);
@@ -4067,7 +3965,6 @@ mod tests {
         assert_eq!(resume.body["op"], "resume");
         assert!(resume.body.get("delta").is_none(), "resume omits delta");
 
-        // A pause is urgent and still has no delta. The delta bytes are not a pane line.
         let pause = steer_v1(&send(SteerOp::Pause, None), Some(&delta));
         assert_eq!(pause.priority, "urgent");
         assert!(pause.delta.is_none());
@@ -4119,9 +4016,7 @@ mod tests {
             std::fs::write(&p, body).unwrap();
             p
         };
-        // No file: refused.
         assert!(run_cli(&steer_cmd("redirect", None)).is_err());
-        // Unknown key, wrong shape, not JSON, too big: refused.
         for (n, b) in [
             ("k.json", br#"{"goal":"x","rm":"-rf"}"#.to_vec()),
             ("s.json", br#"{"goal":5}"#.to_vec()),
@@ -4136,7 +4031,6 @@ mod tests {
                 "{n}"
             );
         }
-        // A file on another op: refused.
         assert!(run_cli(&steer_cmd("pause", Some(w("ok.json", br#"{"goal":"x"}"#)))).is_err());
         assert_eq!(queued(), "", "nothing was queued by any refused call");
         assert!(
@@ -4184,7 +4078,6 @@ mod tests {
                 0o600
             );
         }
-        // Other ops still queue without a file.
         run_cli(&steer_cmd("cancel", None)).unwrap();
     }
 
@@ -4219,7 +4112,6 @@ mod tests {
         );
         let want = c.model.clone();
         drop(c);
-        // "kill -9": reopen from the log alone.
         let paths = CtxPaths::new(d.path(), "proj");
         let (msgs, _, _) = read_log(&paths).unwrap();
         let (replayed, _) = crate::supervisor_program::replay(&msgs);
@@ -4293,7 +4185,6 @@ mod tests {
             2_100,
         );
         assert_eq!(f.0.lock().unwrap().relaunched.len(), 2);
-        // Crash model: the second relaunch's journal row never settled.
         j.rows.get_mut("relaunch:b:2").unwrap().0 = false;
         drop(c);
         let f2 = Fake::default();
@@ -4362,7 +4253,6 @@ mod tests {
             Some(10),
             "the offset came back as a fact"
         );
-        // While pending, the child's done is refused (P13).
         go(
             &mut c,
             &mut j,
@@ -4378,7 +4268,6 @@ mod tests {
             f.0.lock().unwrap().rejects.last().unwrap().1,
             "steer_pending"
         );
-        // The cursor reaches the steer: acked.
         f.0.lock().unwrap().obs.push(SupMsg::Cursor {
             child: "a".into(),
             cursor: 10,
@@ -4392,7 +4281,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let (mut c, mut j, f) = (open(d.path()), MemJournal::default(), Fake::default());
         go(&mut c, &mut j, &f, vec![spawn("a")], 1_000);
-        c.claim("lead-1").unwrap(); // epoch 2
+        c.claim("lead-1").unwrap();
         append_input(
             c.paths(),
             &SupMsg::Control {
@@ -4425,7 +4314,6 @@ mod tests {
             },
         )
         .unwrap();
-        // A torn write: no newline yet.
         std::fs::OpenOptions::new()
             .append(true)
             .open(&p.inbox)
@@ -4492,8 +4380,6 @@ mod tests {
 
     #[test]
     fn a_failed_log_replays_failed_but_a_new_host_is_a_new_incarnation_that_runs() {
-        // D6: after "restart intensity exceeded" the message says re-run
-        // supervise; a re-run used to exit at once until the log was deleted.
         let d = tempfile::tempdir().unwrap();
         let (mut c, mut j, f) = (open(d.path()), MemJournal::default(), Fake::default());
         go(&mut c, &mut j, &f, vec![spawn("a"), spawn("b")], 1_000);
@@ -4513,13 +4399,11 @@ mod tests {
         assert_eq!(c.model.status, Status::Failed);
         drop(c);
         let paths = CtxPaths::new(d.path(), "proj");
-        // The log alone still says Failed: replay is faithful (P8).
         let (msgs, _, _) = read_log(&paths).unwrap();
         assert_eq!(
             crate::supervisor_program::replay(&msgs).0.status,
             Status::Failed
         );
-        // A new host process claims the next epoch and runs.
         let mut c2 = Core::open(paths.clone(), "lead-2", Tier::Lead, None).unwrap();
         c2.claim("lead-2").unwrap();
         assert_eq!(
@@ -4532,8 +4416,6 @@ mod tests {
             "the intensity window starts over"
         );
         assert_eq!(c2.model.escalations, 1, "the escalation fact is kept");
-        // The same effect journal: a re-run keeps the old keys settled, so the
-        // new incarnation's commands must not collide with them.
         let j2 = &mut j;
         let before = f.0.lock().unwrap().relaunched.len();
         go(&mut c2, j2, &f, vec![spawn("a")], 10_000);
@@ -4574,8 +4456,6 @@ mod tests {
             "the current claim settles it"
         );
     }
-
-    // ---- the real journal -------------------------------------------------
 
     fn toron_journal() -> (ToronEffectJournal, tokio::runtime::Runtime) {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -4678,7 +4558,6 @@ mod tests {
             Begin::Run(g) => g,
             other => panic!("{other:?}"),
         };
-        // The predecessor never settles: it was killed.
         let g2 = match js[1].begin("relaunch:b:2") {
             Begin::Run(g) => g,
             other => panic!("the restarted host must take over: {other:?}"),
@@ -4686,7 +4565,6 @@ mod tests {
         assert!(g2 > g1, "the takeover fences the dead claim");
         js[1].finish("relaunch:b:2", g2, true);
         assert_eq!(js[1].begin("relaunch:b:2"), Begin::Skip);
-        // Never taken: another context's live claim, or a NEWER epoch's.
         assert!(matches!(js[2].begin("relaunch:x:2"), Begin::Run(_)));
         assert_eq!(js[1].begin("relaunch:x:2"), Begin::Held(other_ctx.clone()));
         assert!(matches!(js[3].begin("relaunch:y:2"), Begin::Run(_)));
@@ -4710,9 +4588,6 @@ mod tests {
         let root = journal_owner(&supervise_lease_workspace("proj", None), 2);
         assert_eq!(lead1, format!("supervise-{key}--plane@e1"));
         let (mut js, _rt) = toron_journals(&[&lead1, &lead2, &lead3, &root]);
-        // The wiring, not just the rule: the owner is the context lease plus
-        // the epoch, so a successor recomputes the SAME context and only the
-        // epoch moves. A pid or the root's workspace here would never take over.
         let src = include_str!("supervisor_host.rs");
         let at = src
             .find("let mut journal = ToronEffectJournal::open(")
@@ -4722,19 +4597,15 @@ mod tests {
             "{}",
             &src[at..at + 240]
         );
-        // The dead lead claimed the relaunch and never settled.
         let g1 = match js[0].begin("relaunch:x:2") {
             Begin::Run(g) => g,
             other => panic!("{other:?}"),
         };
-        // Its successor, same lead context at the next epoch, takes it over.
         let g2 = match js[1].begin("relaunch:x:2") {
             Begin::Run(g) => g,
             other => panic!("the restarted lead must take over: {other:?}"),
         };
         assert!(g2 > g1, "the takeover fences the dead claim");
-        // The fence is the generation: the dead host's late settle, at the
-        // generation it held, cannot land on the taken-over row.
         js[0].finish("relaunch:x:2", g1, true);
         let g3 = match js[1].begin("relaunch:x:2") {
             Begin::Run(g) => g,
@@ -4742,21 +4613,16 @@ mod tests {
         };
         js[1].finish("relaunch:x:2", g3, true);
         assert_eq!(js[1].begin("relaunch:x:2"), Begin::Skip);
-        // The root is another context: it never steals the lead's live claim.
         let held = match js[1].begin("relaunch:y:2") {
             Begin::Run(g) => g,
             other => panic!("{other:?}"),
         };
         assert_eq!(js[3].begin("relaunch:y:2"), Begin::Held(lead2.clone()));
-        // A newer epoch of the lead does take the older one's claim.
         let g4 = match js[2].begin("relaunch:y:2") {
             Begin::Run(g) => g,
             other => panic!("the newer epoch of the lead must take over: {other:?}"),
         };
         assert!(g4 > held, "the newer epoch supersedes the older claim");
-        // The fold half: the dead host logged the exit, claimed the relaunch,
-        // and was killed before it settled. The successor must run that one
-        // command at its original generation, spending no second slot.
         let d = tempfile::tempdir().unwrap();
         let me = "supervise-proj-plane-1";
         let mut dead = Core::open(
@@ -4794,7 +4660,7 @@ mod tests {
             "the exit asks for relaunch:b:2: {cmds:?}"
         );
         assert!(matches!(js[0].begin("relaunch:b:2"), Begin::Run(_)));
-        drop(dead); // kill -9: the lead's claim is never settled.
+        drop(dead);
         let me2 = "supervise-proj-plane-2";
         let mut live = Core::open(
             CtxPaths::with_context(d.path(), "proj", "plane"),
@@ -4875,7 +4741,6 @@ mod tests {
         };
         j.finish("relaunch:a:2", g, true);
         assert_eq!(j.begin("relaunch:a:2"), Begin::Skip, "settled: never again");
-        // Claimed, effect lost, never settled: runs again under a newer claim.
         let g1 = match j.begin("relaunch:b:2") {
             Begin::Run(g) => g,
             other => panic!("{other:?}"),
@@ -4885,9 +4750,8 @@ mod tests {
             other => panic!("{other:?}"),
         };
         assert!(g2 > g1, "a newer claim fences the older");
-        j.finish("relaunch:b:2", g1, true); // the stale claim settles nothing
+        j.finish("relaunch:b:2", g1, true);
         assert!(matches!(j.begin("relaunch:b:2"), Begin::Run(_)));
-        // A failed settle is terminal too.
         let g3 = match j.begin("park:c") {
             Begin::Run(g) => g,
             other => panic!("{other:?}"),
@@ -4916,7 +4780,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(f.0.lock().unwrap().relaunched, vec![("a".to_string(), 2)]);
-        // Same command again (a replay): the journal says settled.
         let mut rep = RoundReport::default();
         let again = execute(
             &mut j,
@@ -4931,8 +4794,6 @@ mod tests {
         assert!(again.is_empty() && rep.skipped == 1);
         assert_eq!(f.0.lock().unwrap().relaunched.len(), 1);
     }
-
-    // ---- the one path ------------------------------------------------------
 
     /// ADR-0018 §3 item 4: the supervisor is ONE mechanism.
     ///
@@ -5124,7 +4985,6 @@ mod tests {
     fn the_host_loop_runs_on_a_plain_thread_and_the_fold_never_shells_out() {
         let me = include_str!("supervisor_host.rs");
         let prog = include_str!("supervisor_program.rs");
-        // The fold is pure: no process, fs, clock, or runtime in it.
         let pure = &prog[..prog.find("#[cfg(test)]").unwrap()];
         for banned in [
             "std::process",
@@ -5141,7 +5001,6 @@ mod tests {
                 "supervisor_program must stay pure: {banned}"
             );
         }
-        // The host never types into a pane except through the PaneWrite sink.
         let host = &me[..me.find("#[cfg(test)]").unwrap()];
         for call in crate::pane_write::PANE_TEXT_CALLS {
             assert!(
@@ -5154,12 +5013,6 @@ mod tests {
     #[test]
     fn the_host_loop_waits_on_the_hint_channel_and_arms_the_watcher_unless_hints_are_off() {
         let me = include_str!("supervisor_host.rs");
-        // Production slice only: the loop starts at the single `fn host_loop`
-        // and ends where the test module starts, so neither the test-only
-        // imports at the top nor this test's own assertions below can match.
-        // (Truncating at the first `#[cfg(test)]` broke when test-only
-        // imports moved above the loop; searching the whole file
-        // self-matched this very assertion.)
         let start = me.find("fn host_loop(").expect("host loop exists");
         let end = me.find("mod tests").expect("test module exists");
         let body = &me[start..end];
@@ -5381,7 +5234,6 @@ mod tests {
                 );
             }
         };
-        // Two crews, so poison does not park either one before the window fills.
         bump("a", 1_000);
         bump("b", 2_000);
         bump("a", 3_000);

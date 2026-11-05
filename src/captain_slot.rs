@@ -63,12 +63,11 @@ pub fn next_action(ev: &CaptainEvidence, arriver: &str) -> CaptainAction {
 pub fn rebind_hint(ev: &CaptainEvidence, heartbeat_fresh: bool) -> Option<String> {
     let holder = ev.holder.as_ref()?;
     if ev.override_pin.is_some() {
-        return None; // explicit override wins; nothing to offer
+        return None;
     }
     if ev.pane_alive || ev.last_wake_fresh || heartbeat_fresh || ev.pull_fresh {
-        return None; // a live signal backs the holder
+        return None;
     }
-    // Kept only because roster-presence says fresh.
     (!holder_stale(ev)).then(|| holder.clone())
 }
 
@@ -213,9 +212,8 @@ mod tests {
     #[test]
     fn roster_only_holder_offers_rebind() {
         let mut e = ev(Some("QuietAnvil"));
-        e.presence_fresh = true; // whois.stale=false (7-day threshold)
+        e.presence_fresh = true;
         assert_eq!(rebind_hint(&e, false).as_deref(), Some("QuietAnvil"));
-        // Any live signal silences the offer.
         assert!(rebind_hint(&e, true).is_none(), "heartbeat backs it");
         let mut pane = e.clone();
         pane.pane_alive = true;
@@ -223,10 +221,8 @@ mod tests {
         let mut wake = e.clone();
         wake.last_wake_fresh = true;
         assert!(rebind_hint(&wake, false).is_none(), "dispatcher backs it");
-        // An already-stale holder is CLAIMED (claim_line), not merely offered.
         let dead = ev(Some("QuietAnvil"));
         assert!(rebind_hint(&dead, false).is_none());
-        // Override already wins — no offer.
         let mut ov = e.clone();
         ov.override_pin = Some("HumanPin".into());
         assert!(rebind_hint(&ov, false).is_none());
@@ -239,7 +235,6 @@ mod tests {
         use std::collections::HashSet;
         let pane: HashSet<String> = ["PlumGoose".to_string()].into_iter().collect();
         let heart: HashSet<String> = ["TealDune".to_string()].into_iter().collect();
-        // Bound pane: silent. Heartbeat (CLI actor, no pane): silent.
         assert_eq!(
             dead_pin_warnings(&["PlumGoose".into()], &pane, &heart),
             [] as [String; 0]
@@ -248,12 +243,10 @@ mod tests {
             dead_pin_warnings(&["TealDune".into()], &pane, &heart),
             [] as [String; 0]
         );
-        // Roster-only pin (bound to nothing, no heartbeat): loud.
         let warns = dead_pin_warnings(&["QuietHeron".into()], &pane, &heart);
         assert_eq!(warns.len(), 1);
         assert!(warns[0].contains("QuietHeron"), "{}", warns[0]);
         assert!(warns[0].contains("advisory"), "{}", warns[0]);
-        // Lone @ stripped; empty targets warn nothing.
         assert_eq!(
             dead_pin_warnings(&["@QuietHeron".into()], &pane, &heart).len(),
             1
@@ -286,7 +279,6 @@ mod tests {
 
     #[test]
     fn whois_fresh_cli_actor_is_not_stolen() {
-        // TealDune is the flywheel mail CLI actor — no hc terminal, not stale.
         let mut e = ev(Some("TealDune"));
         e.presence_fresh = true;
         assert_eq!(

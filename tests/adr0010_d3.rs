@@ -9,7 +9,6 @@ const TPL: &str = include_str!("../integrations/peer-aware.md.tpl");
 
 #[test]
 fn adr0010_d3_presence_is_sourced_verdict_enum() {
-    // Exact verdicts with source; old flat states gone as variants.
     for variant in ["Busy", "Idle", "Unknown", "Dead"] {
         assert!(
             WORKSPACE.contains(variant),
@@ -30,7 +29,6 @@ fn adr0010_d3_presence_is_sourced_verdict_enum() {
 
 #[test]
 fn adr0010_d3_no_consumer_branch_reachable_from_unknown() {
-    // The prompt gate never prompts from Unknown; hc is evidence, never authority.
     assert!(
         WORKSPACE.contains("Some(Presence::Idle { .. }) => true"),
         "prompt gate must prompt only on exact Idle"

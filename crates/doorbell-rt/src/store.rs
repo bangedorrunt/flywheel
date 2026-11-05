@@ -128,7 +128,6 @@ pub fn journal_workspace(name: &str) -> Option<&str> {
     let rest = name.strip_prefix("doorbell-journal-")?;
     let rest = rest.strip_suffix(".jsonl")?;
     let ws = match rest.rsplit_once('.') {
-        // A generation is digits, and something must remain in front of the dot.
         Some((head, tail))
             if !head.is_empty() && !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) =>
         {
@@ -136,10 +135,6 @@ pub fn journal_workspace(name: &str) -> Option<&str> {
         }
         _ => rest,
     };
-    // Never hand back a name that identifies nothing. `doorbell-journal-.jsonl`
-    // and `doorbell-journal-flywheel..jsonl` are malformed files, not workspaces,
-    // and a caller that receives Some("") has been handed a key no hosted set can
-    // ever contain — which is the same missing-liveness-guard failure one level up.
     if ws.is_empty() || ws.ends_with('.') {
         return None;
     }
@@ -216,7 +211,7 @@ static AUDIT_WRITE_FAILURES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// How many audit-row appends have failed since process start.
-#[allow(dead_code)] // consumed by tests today; health wiring is a follow-up, not this bead
+#[allow(dead_code)]
 pub(crate) fn audit_write_failures() -> usize {
     AUDIT_WRITE_FAILURES.load(std::sync::atomic::Ordering::SeqCst)
 }
@@ -311,12 +306,6 @@ impl FileStore {
         if let Ok(entries) = std::fs::read_dir(self.state_dir.join("journals")) {
             for entry in entries.filter_map(std::result::Result::ok) {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                // bd-oa4u: parse through the shared helper so a GENERATION file
-                // resolves to the workspace it belongs to. The previous inline
-                // parse produced `flywheel.1`, which is in no hosted set, so every
-                // retained generation of every live workspace was a prune
-                // candidate the moment it aged past the window. What the comment
-                // here claimed, and the code did not do.
                 let Some(ws) = journal_workspace(&name) else {
                     continue;
                 };
@@ -345,32 +334,6 @@ impl FileStore {
                 }
             }
         }
-        // bd-lorot: the LIVENESS stamps get the same two guards, and they matter
-        // more than the journals. `watch-<ws>.hb` is a heartbeat that exists to
-        // say "this workspace's bus is delivering". One left behind for a
-        // workspace nobody hosts is a liveness artifact vouching for nothing,
-        // and a reader who trusts a file over the hosted set is worse off than
-        // one with no file. Measured 10 stale, the oldest 14.4 days.
-        //
-        // gc/audit: the AUDIT logs get the same two guards. Nothing ever
-        // removed them — the journal prune predates them and the audit rotate
-        // only bounds ONE workspace's file. Measured on this host: 74 MB in
-        // this dir, 17 MB of it one long-dead workspace's audit log. The
-        // `.audit.loudmiss` tombstone is deliberately NOT pruned (its comment
-        // above: a bounded store cannot hold dedup state for itself), so the
-        // suffix table names the one big file only.
-        //
-        // One read_dir for both families (it used to scan twice, once per
-        // stamp suffix).
-        // gc/sidecars: the per-workspace host records a dead host leaves
-        // behind — `<ws>.pid`, `<ws>.gen`, `<ws>.project`, `owner-<ws>.json`.
-        // A dead pid makes all of them garbage, but nothing ever removed
-        // them: measured here 23 dead pid files, 71 gen, 57 project and 31
-        // stale owner leases (half of the 470 files in the dir). The guard is
-        // the PID, not the mtime alone: `.pid` is written once at spawn and
-        // never refreshed, so age alone would delete a live idle host's
-        // identity. `<ws>.unanswered` is NOT pruned — it is load-bearing by
-        // policy (a cleanup that empties it silently disarms the gate).
         let leased: std::collections::BTreeSet<String> =
             crate::lease::live_leases(&self.state_dir, now_secs)
                 .into_iter()
@@ -392,10 +355,6 @@ impl FileStore {
                 }
             }
         }
-        // gc/one-rule: a `.project` sidecar naming an absolute path that no
-        // longer exists is a finished gate run's temp root — abandoned at any
-        // age. Read ONCE, before any family is deleted, so pruning the sidecar
-        // cannot erase the signal its audit log still needs.
         let mut project_gone: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
         if let Ok(entries) = std::fs::read_dir(self.state_dir.join("doorbell")) {
@@ -471,9 +430,6 @@ impl FileStore {
             else {
                 continue;
             };
-            // gc/one-rule: an AUDIT log is judged by the shared predicate (it
-            // also honours a vanished absolute `.project` sidecar); every other
-            // family is age-only.
             let abandoned = if matches!(kind, Kind::Audit) {
                 audit_abandon_reason(
                     ws,
@@ -534,8 +490,6 @@ impl FileStore {
         self.append_journal_seq(workspace, msg, actions, executed, pins, None, None)
     }
 
-    // 8 args stay positional: 3 call sites, all pass-through journal
-    // fields; a params struct adds indirection for zero behavior gain.
     #[allow(clippy::too_many_arguments)]
     pub fn append_journal_seq(
         &self,
@@ -563,8 +517,6 @@ impl FileStore {
         if let (Some(seq), Some(obj)) = (seq, entry.as_object_mut()) {
             obj.insert("seq".into(), seq.into());
         }
-        // D5: subscriber tag (additive — v1 readers tolerate unknown fields;
-        // full per-subscriber scoping rides journal v2 in bd-asr2.9).
         if let (Some(sub), Some(obj)) = (subscriber, entry.as_object_mut()) {
             obj.insert("subscriber".into(), sub.into());
         }
@@ -603,21 +555,9 @@ impl FileStore {
         const KEEP_LINES: usize = 4000;
         let mut dropped_lines = 0usize;
         let mut dropped_bytes = 0u64;
-        // The seq range this rotation removes. Without it the drop record cannot
-        // be tied to the gap it leaves, so a designed drop and a lost write look
-        // identical to the fold — which is why seven workspaces read "torn" for
-        // days while the daemon knew perfectly well what it had deleted.
         let mut drop_lo: Option<u64> = None;
         let mut drop_hi: Option<u64> = None;
-        // bd-xz7k: every destructive step is CHECKED. This method is the one that
-        // deletes rows, and it used to discard every write error (`let _ =`) and
-        // then report a clean drop carrying a seq range — so a failed rewrite
-        // both destroyed the journal and produced a record that excused the loss
-        // (the flywheel-chiebukuro shape: four generations on disk, 89 gaps, and
-        // a sum of recorded dropped_lines of zero).
         let mut failed: Vec<String> = Vec::new();
-        // A plain fn, not a closure: a closure would hold the `drop_lo`/`drop_hi`
-        // borrows for the whole body, and the audit row at the end reads them.
         fn note(acc: &mut Option<u64>, other: &mut Option<u64>, lo: Option<u64>, hi: Option<u64>) {
             if let Some(l) = lo {
                 *acc = Some(acc.map_or(l, |x: u64| x.min(l)));
@@ -628,9 +568,6 @@ impl FileStore {
         }
         let active = self.journal_file(workspace);
         let active_lines = count_lines(&active);
-        // Spill the active excess into a fresh .1 (shift first, dropping
-        // the oldest past the cap). Whole-file moves would let the totals
-        // enforcer delete everything at once — chunks keep history dense.
         if active_lines > KEEP_LINES {
             let Ok(raw) = std::fs::read_to_string(&active) else {
                 return;
@@ -641,8 +578,6 @@ impl FileStore {
             if overflow.exists() {
                 dropped_lines += count_lines(&overflow);
                 dropped_bytes += file_bytes(&overflow);
-                // Read before removing: this is the only moment the span is
-                // recoverable.
                 if let Ok(raw) = std::fs::read_to_string(&overflow) {
                     let lines: Vec<&str> = raw.lines().collect();
                     let (lo, hi) = seq_span(&lines);
@@ -660,10 +595,6 @@ impl FileStore {
                     failed.push(format!("shift {}: {e}", from.display()));
                 }
             }
-            // The head is committed to .1 BEFORE the active file is trimmed, on
-            // purpose: if the trim fails, those rows still exist twice (in .1
-            // and in the untrimmed active) — visible and recoverable. The other
-            // order would lose them outright.
             if let Err(e) = private_replace(
                 &self.journal_gen_file(workspace, 1),
                 (head.join("\n") + "\n").as_bytes(),
@@ -676,13 +607,6 @@ impl FileStore {
                 failed.push(format!("rewrite active: {e}"));
             }
         }
-        // Enforce totals, oldest first. Whole-generation deletion
-        // overshoots crumb excesses (it would eat a fresh .1 for one row
-        // over), so trim the oldest generation partially instead — keep
-        // its newest rows, drop exactly the excess.
-        // A half-applied spill must not be compounded by the totals enforcer:
-        // deleting more files on top of a broken chain is how a recoverable
-        // inconsistency becomes an unrecoverable one.
         while failed.is_empty() {
             let (total_lines, total_bytes, oldest) = self.generation_totals(workspace);
             if total_lines <= RETENTION_LINES && total_bytes <= RETENTION_BYTES {
@@ -693,7 +617,6 @@ impl FileStore {
             let gb = file_bytes(&p);
             let excess_l = total_lines.saturating_sub(RETENTION_LINES);
             let excess_b = total_bytes.saturating_sub(RETENTION_BYTES);
-            // Bytes excess converts via average row size (floor 64B).
             let avg = (total_bytes / total_lines.max(1) as u64).max(64);
             let need = excess_l.max((excess_b / avg) as usize + usize::from(excess_b > 0));
             if need == 0 || gl == 0 {
@@ -727,8 +650,6 @@ impl FileStore {
                 break;
             }
         }
-        // Loud first (GS-039): an operator watching stderr must not have to read
-        // the audit to learn that the rotation failed.
         if !failed.is_empty() {
             eprintln!(
                 "doorbell-rt: journal ROTATION FAILED on {workspace} — refuse silent drop \
@@ -745,9 +666,6 @@ impl FileStore {
         });
         if let Some(obj) = row.as_object_mut() {
             if failed.is_empty() {
-                // A range may only be recorded for rows we are SURE we removed.
-                // A wrong range does not merely misreport: it EXCUSES a later
-                // gap, because `RetentionDrop::explains` trusts it.
                 obj.insert("seq_from".into(), drop_lo.into());
                 obj.insert("seq_to".into(), drop_hi.into());
             } else {
@@ -761,7 +679,6 @@ impl FileStore {
     fn generation_totals(&self, workspace: &str) -> (usize, u64, Option<PathBuf>) {
         let mut lines = 0usize;
         let mut bytes = 0u64;
-        // Oldest = highest generation number; ascending keeps the last hit.
         let mut oldest: Option<PathBuf> = None;
         for n in 1..=RETENTION_GENS {
             let p = self.journal_gen_file(workspace, n);
@@ -786,9 +703,6 @@ impl FileStore {
     /// order the reader folds them, and a rotation that dropped a contiguous range
     /// still reads as 0% holes rather than as a burn.
     pub fn journal_seq_holes(&self, workspace: &str) -> SeqHoles {
-        // rv23 #3: borrow the lines from the file buffers. This runs on every
-        // `/health` refresh, and an owned `String` per retained row was the
-        // probe's second-largest share of the idle RSS climb.
         let mut raws: Vec<String> = Vec::new();
         for n in (1..=RETENTION_GENS).rev() {
             let p = self.journal_gen_file(workspace, n);
@@ -919,11 +833,6 @@ impl FileStore {
         let mut first_seq: Option<u64> = None;
         let mut prev_seq: Option<u64> = None;
         let mut torn: Option<TornTail> = None;
-        // A designed drop is not a tear. Retention records what it removed, so a
-        // gap a record accounts for is folded straight through: calling a
-        // healthy workspace degraded forever is how a signal stops meaning
-        // anything (measured: seven workspaces, `journal_torn_tail`
-        // permanently red, most of them for drops the daemon performed itself).
         let drops = self.retention_drops(workspace);
         let chain = self.journal_chain(workspace);
         'files: for path in &chain {
@@ -955,11 +864,6 @@ impl FileStore {
                     if let Some(p) = prev_seq
                         && s != p + 1
                     {
-                        // bd-3rpb: a seq that moves BACKWARDS (or repeats) has
-                        // no forward gap to describe — `s - 1` / `s - p - 1`
-                        // underflowed u64 and panicked the whole digest on an
-                        // empty-or-rewritten journal. Report it as the tear it
-                        // is instead of doing gap arithmetic that cannot hold.
                         if s <= p {
                             torn = Some(TornTail {
                                 at_line: idx + 1,
@@ -981,7 +885,6 @@ impl FileStore {
                         let missing_to = s - 1;
                         let missing = s - p - 1;
                         match drops.iter().find(|d| d.explains(missing_from, missing_to)) {
-                            // Retention, on the record: not a tear.
                             Some(_) => {}
                             None => {
                                 torn = Some(TornTail {
@@ -1010,24 +913,12 @@ impl FileStore {
             }
         }
         if let Some(t) = torn.as_mut() {
-            // How much history the tear hides. The fold STOPS here, so every row
-            // after it is unreachable from `doorbell why` — a cost the old
-            // boolean never mentioned, and the reason a single 16-row gap looked
-            // the same as a 5,175-row one.
             t.rows_withheld = rows_withheld_after(&chain, &t.file, t.at_line);
         }
         if let Some(t) = &torn {
-            // bd-lorot: this fired on EVERY fold, and a health probe folds, so a
-            // workspace left torn wrote a LoudMiss row every few seconds forever
-            // (observed 13:06:55, 13:07:20, 13:07:26, 13:07:27). The row is a
-            // REPORT, and a report that repeats unchanged is noise that trains
-            // a reader to skip the field. One row per distinct tear.
             let fingerprint = format!("{}:{}:{}", t.file, t.at_line, t.reason);
             let already = self.tear_already_reported(workspace, &fingerprint);
             if !already {
-                // Mark BEFORE the append, and separately: the marker has to exist
-                // even if the audit write fails, or a failed report becomes a
-                // permanently re-firing one.
                 self.mark_tear_reported(workspace, &fingerprint);
                 let _ = self.append_audit(
                     workspace,
@@ -1152,13 +1043,6 @@ impl FileStore {
             }
         };
         use std::io::Write;
-        // bd-sfvq: ONE write per row, not a `Display` stream. `O_APPEND` makes
-        // each `write(2)` land at the current end, so a row serialized through
-        // `Display` (which emits the document fragment by fragment) is spliced
-        // by any second appender into a line that is neither row — 513 such
-        // rows live in one workspace's audit. Serialize first, newline included
-        // in the same buffer, so the whole row is one syscall and O_APPEND does
-        // the rest.
         let mut line = match serde_json::to_string(&entry) {
             Ok(s) => s,
             Err(e) => {
@@ -1321,8 +1205,6 @@ fn rows_withheld_after(chain: &[std::path::PathBuf], torn_file: &str, at_line: u
                 continue;
             }
             reached = true;
-            // 1-based: the row AT the tear is discarded too (the fold breaks
-            // before pushing it), so it counts as withheld history as well.
             withheld += count_lines(path).saturating_sub(at_line - 1);
         } else if let Ok(raw) = std::fs::read_to_string(path) {
             withheld += raw.lines().filter(|l| !l.trim().is_empty()).count();
@@ -1557,12 +1439,9 @@ mod tests {
     #[test]
     fn rotation_keeps_generations_and_audits_drops() {
         let (st, dir) = test_store("rot");
-        // Small rows (production-shaped): the line budget binds first.
         for seq in 1..=6000u64 {
             append_seq(&st, "w", seq);
         }
-        // Retention enforced: total lines bounded, generations exist, the
-        // drop is an audit row (never silent).
         let (lines, _, _) = st.generation_totals("w");
         assert!(
             lines <= super::RETENTION_LINES,
@@ -1571,7 +1450,6 @@ mod tests {
         assert!(st.journal_gen_file("w", 1).exists(), "generation retained");
         let audit = std::fs::read_to_string(st.audit_file("w")).unwrap();
         assert!(audit.contains("journal_rotated"), "{audit}");
-        // Fold still works across generations, oldest first, seq-continuous.
         let fold = st.fold_workspace("w");
         assert!(fold.torn.is_none(), "rotation must not tear the fold");
         assert!(!fold.rows.is_empty());
@@ -1592,8 +1470,6 @@ mod tests {
     #[test]
     fn a_failed_rotation_hides_no_rows_and_claims_no_range() {
         let (st, dir) = test_store("rot-fail");
-        // A production-sized active journal, written directly so no append can
-        // trigger maybe_rotate first and rotate it out from under the test.
         let mut body = String::new();
         for seq in 1..=5000u64 {
             body.push_str(&format!(
@@ -1637,7 +1513,6 @@ mod tests {
     #[test]
     fn a_failed_audit_append_is_reported_not_swallowed() {
         let (st, dir) = test_store("audit-fail");
-        // Block the audit path itself: a directory where the file belongs.
         std::fs::create_dir_all(st.audit_file("w")).expect("block the audit file");
         let result = st.append_audit("w", serde_json::json!({"kind": "probe"}));
         assert!(
@@ -1651,8 +1526,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn private_files_and_dirs() {
-        // Audit P2: journal/audit/wake/unanswered files are created
-        // owner-only (0600, dirs 0700) — they carry wake metadata.
         let (st, dir) = test_store("perms");
         append_seq(&st, "w", 1);
         let _ = st.append_audit("w", serde_json::json!({"kind": "x"}));
@@ -1697,8 +1570,6 @@ mod tests {
         writeln!(f, "{{\"v\": 1, \"seq\": 4, BROKEN").unwrap();
         drop(f);
 
-        // SPLIT the two halves so a failure names WHICH one is flaky: detection
-        // (the fold saw a tear) and the report (the audit row landed).
         let fold = st.fold_workspace("w");
         assert_eq!(
             fold.rows.len(),
@@ -1721,11 +1592,9 @@ mod tests {
         };
         assert_eq!(count(&st), 1, "the first fold reports the tear");
 
-        // Fold again with the audit intact: still one (the pre-existing dedup).
         st.fold_workspace("w");
         assert_eq!(count(&st), 1, "an un-deduped report repeats on every fold");
 
-        // Now the audit loses everything. The MARKER must still remember.
         std::fs::write(st.audit_file("w"), "").unwrap();
         st.fold_workspace("w");
         assert_eq!(
@@ -1796,7 +1665,6 @@ mod tests {
         append_seq(&st, "w", 1);
         append_seq(&st, "w", 2);
         append_seq(&st, "w", 3);
-        // Rotation or a rewrite put an OLDER seq on the tail.
         append_seq(&st, "w", 0);
         let fold = st.fold_workspace("w");
         let torn = fold.torn.expect("a backwards seq must report a tear");
@@ -1817,7 +1685,6 @@ mod tests {
         for seq in 1..=3u64 {
             append_seq(&st, "w", seq);
         }
-        // Crash mid-line: torn tail.
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
             .append(true)
@@ -1829,23 +1696,16 @@ mod tests {
         assert_eq!(fold.rows.len(), 3, "fold stops at the tear");
         let torn = fold.torn.expect("tear detected");
         assert_eq!(torn.at_line, 4);
-        // Loud: a LoudMiss audit row names the tear.
         let audit = std::fs::read_to_string(st.audit_file("w")).unwrap();
         assert!(audit.contains("journal_torn_tail"), "{audit}");
         assert!(
             st.any_torn_tail_among(&["w"]),
             "health probe sees the tear on a HOSTED workspace"
         );
-        // bd-lorot: the same tear on a workspace we do NOT host must degrade
-        // nothing. An unhosted journal cannot affect delivery, so it is history,
-        // not a fault — and it held `degraded` red for hours here.
         assert!(
             !st.any_torn_tail_among(&["other"]),
             "an unhosted torn workspace degraded the daemon"
         );
-        // bd-lorot: and the LoudMiss REPORT is emitted once, not once per fold.
-        // A health probe folds on every call, so an un-deduped report repeats
-        // every few seconds forever.
         let rows_before = std::fs::read_to_string(st.audit_file("w"))
             .unwrap()
             .lines()
@@ -1878,7 +1738,6 @@ mod tests {
         for seq in 1..=3u64 {
             append_seq(&st, "w", seq);
         }
-        // 4..=19 gone, exactly the shape of the live opencode hole.
         for seq in 20..=21u64 {
             append_seq(&st, "w", seq);
         }
@@ -1939,8 +1798,6 @@ mod tests {
             5,
             "the fold must carry on past a designed drop instead of throwing the tail away"
         );
-        // A record that does NOT cover the range must not excuse it: a guessed
-        // range would hide a real lost write.
         let _ = st.append_audit(
             "w",
             serde_json::json!({"kind": "journal_rotated", "dropped_lines": 2, "seq_from": 4, "seq_to": 5}),
@@ -1960,7 +1817,6 @@ mod tests {
     fn seq_gap_stops_fold_and_legacy_rows_tolerated() {
         let (st, dir) = test_store("gap");
         append_seq(&st, "w", 1);
-        // Legacy row without seq: tolerated, no contiguity check.
         st.append_journal(
             "w",
             &serde_json::json!({"rt_kind": "Legacy"}),
@@ -1970,7 +1826,6 @@ mod tests {
         )
         .unwrap();
         append_seq(&st, "w", 2);
-        // Gap: 2 -> 4 skips 3.
         append_seq(&st, "w", 4);
         let fold = st.fold_workspace("w");
         assert_eq!(fold.rows.len(), 3, "rows before the gap fold");
@@ -1980,8 +1835,6 @@ mod tests {
     }
     #[test]
     fn mixed_v1_v2_folds_in_order() {
-        // F9: migration mix — legacy v1 rows plus v2 seq/subscriber rows fold
-        // in order with no tear; unknown fields tolerated.
         let (st, dir) = test_store("mixv");
         use std::io::Write;
         let path = st.journal_file("w");
@@ -2041,8 +1894,6 @@ mod audit_append_tests {
         let dir = std::env::temp_dir().join(format!("dbrt-auditappend-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = FileStore::new(&dir);
-        // Pre-build the payloads: a Value built per row would put the race
-        // behind the allocator as well as the writer.
         let payloads: Vec<Vec<serde_json::Value>> = (0..WRITERS)
             .map(|w| {
                 (0..PER_WRITER)
@@ -2090,11 +1941,6 @@ mod audit_append_tests {
                 "row {n} carries exactly this row's fields, so no other writer's \
                  fragment rode in: {line:.200}"
             );
-            // Completeness, NOT order. Which writer's row lands on which line
-            // is a race with no contract, so an ordering assertion here would
-            // be a test of the scheduler. What must hold is that every
-            // (writer, seq) pair appears exactly once: nothing lost, nothing
-            // duplicated.
             let pair = (obj["writer"].as_u64(), obj["seq"].as_u64());
             assert!(
                 pair.0.is_some() && pair.1.is_some(),
@@ -2152,11 +1998,8 @@ mod prune_tests {
             ),
             ("doorbell-journal-flywheel.abc.jsonl", Some("flywheel.abc")),
             ("doorbell-journal-flywheel.1x.jsonl", Some("flywheel.1x")),
-            // Nothing in front of the dot, or nothing behind it: not a generation,
-            // and not a workspace either.
             ("doorbell-journal-.jsonl", None),
             ("doorbell-journal-flywheel..jsonl", None),
-            // Not ours.
             ("flywheel.audit.jsonl", None),
             ("doorbell-journal-flywheel.jsonl.bak", None),
         ] {
@@ -2183,7 +2026,6 @@ mod prune_tests {
         let _ = std::fs::remove_dir_all(&dir);
         let st = FileStore::new(&dir);
 
-        // The daemon's first sweep finds three pins it could not wake.
         st.save_unanswered(
             "w",
             &[
@@ -2192,11 +2034,6 @@ mod prune_tests {
                 "IvoryRidge".into(),
             ],
         );
-        // Compared as a SET, not a sequence. `load_unanswered` returns file order
-        // and the order is not a contract: `save_unanswered` writes whatever the
-        // caller passed, and `Hear::seed_unanswered` feeds a BTreeSet, which
-        // normalizes. Asserting an order here would pin a property nothing relies
-        // on and would fail on a harmless reordering.
         let mut round_trip = st.load_unanswered("w");
         round_trip.sort();
         assert_eq!(
@@ -2205,8 +2042,6 @@ mod prune_tests {
             "a round trip must preserve every pin: this file IS the P2b signal"
         );
 
-        // EmberOtter is answered, so `heard` removed it and the next persist_hear
-        // rewrites the file without it. No window, no clock, no policy.
         st.save_unanswered("w", &["TealMarlin".into(), "IvoryRidge".into()]);
         let mut after = st.load_unanswered("w");
         after.sort();
@@ -2216,10 +2051,6 @@ mod prune_tests {
             "a pin that stopped being unanswered must LEAVE, with no age policy involved"
         );
 
-        // And the file keeps existing even with nothing in it. P2b reads this path,
-        // so a future "skip writing when the list is empty" optimisation would turn
-        // "no invisible pins" into "the file is gone" — indistinguishable from a
-        // daemon that never looked. The file must stay, and stay empty.
         st.save_unanswered("w", &[]);
         assert!(
             st.unanswered_file("w").exists(),
@@ -2231,7 +2062,6 @@ mod prune_tests {
             "and must read as no pins rather than as a phantom row"
         );
 
-        // A workspace never seen reads as empty rather than failing.
         assert!(
             st.load_unanswered("never-seen").is_empty(),
             "an absent file is an empty signal, not an error"
@@ -2261,8 +2091,6 @@ mod prune_tests {
     /// a small exact case and asserts the numbers, not just the shape.
     #[test]
     fn a_burned_range_is_counted_against_the_span() {
-        // seq 1..=6 present, 7..=15 burned, 16..=20 present: a 20-number span
-        // carrying 11 rows, so 9 holes — 45.0%.
         let mut lines: Vec<String> = (1..=6).map(|s| row(Some(s))).collect();
         lines.extend((16..=20).map(|s| row(Some(s))));
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
@@ -2279,7 +2107,6 @@ mod prune_tests {
     /// flywheel-chiebukuro and the field would be pure noise.
     #[test]
     fn a_contiguous_tail_drop_is_a_drop_not_a_hole() {
-        // Rows 1001..=1100 retained after a rotation that dropped 1..=1000.
         let lines: Vec<String> = (1001..=1100).map(|s| row(Some(s))).collect();
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         let h = seq_holes(&refs);
@@ -2293,7 +2120,7 @@ mod prune_tests {
     #[test]
     fn a_duplicated_seq_is_named_and_does_not_hide_holes() {
         let mut lines: Vec<String> = (1..=5).map(|s| row(Some(s))).collect();
-        lines.push(row(Some(3))); // replay of 3
+        lines.push(row(Some(3)));
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         let h = seq_holes(&refs);
         assert_eq!(h.rows, 6);
@@ -2358,7 +2185,6 @@ mod prune_tests {
         let now = 2_000_000_000u64;
         const OLD: u64 = 30 * 24 * 60 * 60;
 
-        // One hosted workspace, its active file and all four retained generations.
         for generation in 0..=super::RETENTION_GENS {
             let path = if generation == 0 {
                 ws_file(&dir, "live")
@@ -2371,7 +2197,6 @@ mod prune_tests {
                 .and_then(|f| f.set_modified(old))
                 .unwrap_or_else(|e| panic!("age {}: {e}", path.display()));
         }
-        // A genuinely abandoned workspace, generation file included, as the control.
         std::fs::write(ws_gen_file(&dir, "gone", 1), "row\n").expect("write");
         let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(now - OLD);
         std::fs::File::open(ws_gen_file(&dir, "gone", 1))
@@ -2410,8 +2235,6 @@ mod prune_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("journals")).expect("dirs");
         let store = FileStore::new(&dir);
-        // Real current time: a logical future `now` would make a file written
-        // just now look decades old, which is a broken fixture, not a finding.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -2421,8 +2244,6 @@ mod prune_tests {
         for ws in ["gone-old", "live-old", "gone-young"] {
             std::fs::write(ws_file(&dir, ws), "row\n").expect("write");
         }
-        // gone-old: unhosted and a month old. live-old: a month old but HOSTED.
-        // gone-young: unhosted but written an hour ago.
         let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(now - OLD);
         std::fs::File::open(ws_file(&dir, "gone-old"))
             .and_then(|f| f.set_modified(old))
@@ -2676,12 +2497,6 @@ mod prune_tests {
             std::fs::write(dir.join("doorbell").join(format!("watch-{ws}.event")), "y")
                 .expect("ev");
         }
-        // BOTH the dead AND the live workspace are aged. This is the point: if
-        // only the dead one is old, the live one is protected by the AGE gate
-        // and the hosted guard is never exercised — a fence that passes for the
-        // wrong reason is worse than no fence, because it reads as coverage.
-        // `young` is deliberately NOT aged; that is what makes the age gate
-        // falsifiable in this path instead of only in the journal path.
         for ws in ["dead", "live"] {
             for suffix in ["hb", "event"] {
                 std::fs::File::open(dir.join("doorbell").join(format!("watch-{ws}.{suffix}")))

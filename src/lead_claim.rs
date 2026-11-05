@@ -325,7 +325,6 @@ mod tests {
         ];
         let mut mapped = 0;
         for (v, cause) in wire {
-            // `Reject` borrows (`Deserialize<'static>` only): a leaked line.
             let line: &'static str = Box::leak(v.to_string().into_boxed_str());
             let Ok(r) = serde_json::from_str::<Reject>(line) else {
                 continue;

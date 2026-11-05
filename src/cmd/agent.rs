@@ -134,8 +134,6 @@ fn cmd_agent_tail(
     }
     for e in tail["events"].as_array().cloned().unwrap_or_default() {
         let ts = e["ts"].as_str().unwrap_or("-");
-        // ISO timestamps render as the clock time; a bare date stays as-is
-        // (and an opencode `null` stays "-" — not recorded, never fabricated).
         let clock: String = ts
             .split_once('T')
             .map(|(_, t)| t)

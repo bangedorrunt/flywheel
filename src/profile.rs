@@ -147,7 +147,6 @@ mod skills_digest_tests {
         assert!(first.starts_with("skills-v1:"), "{first}");
         assert!(first.ends_with(":n=2"), "{first}");
         assert!(first.len() <= 40, "bounded: {first}");
-        // A reordered list is a different attach.
         let b = vec!["code-quality".to_string(), "tdd".to_string()];
         assert_ne!(first, skills_digest(&b).expect("digest"));
     }
@@ -287,10 +286,6 @@ impl ProfileCatalog {
                 .with_context(|| format!("read {}", path.display()))?;
             let toml: ProfilesToml =
                 toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
-            // Layered: user profiles OVERRIDE built-ins field-by-field
-            // (empty user fields inherit the compiled-in value), so a
-            // partial `[profiles.scout] {model=...}` keeps the built-in
-            // harness. Unknown user names are added as-is.
             for (name, user) in toml.profiles {
                 match profiles.get(&name) {
                     Some(base) => {
@@ -341,9 +336,6 @@ impl ProfileCatalog {
                 }
             }
         }
-        // bd-enov (F6): repair short aliases already written to disk
-        // (`harness = "oc"`) so an existing broken profile spawns instead of
-        // dying with `unsupported interactive agent kind oc`.
         for profile in profiles.values_mut() {
             if !profile.harness.is_empty() {
                 profile.harness = normalize_harness_alias(&profile.harness);
@@ -721,8 +713,6 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
             },
         ),
         // governed-by: bd-ln4k — language-specialized coders share the CODER
-        // discipline plus the effect-oriented skill; language idioms ride the
-        // behavior text (no new skill docs per laziness-protocol).
         (
             "rust-coder",
             Profile {
@@ -794,9 +784,6 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
 /// (hc's kind is `opencode`). Pure; unknown values pass through untouched
 /// so the caller can reject them loudly.
 pub fn normalize_harness_alias(kind: &str) -> String {
-    // bd-drlm: the alias table moved to `harness_registry`. This used to be one
-    // of seven independent `match` statements that each knew a different subset
-    // of the harness names, which is how `codex` ended up unreachable.
     crate::harness_registry::canonical(kind)
 }
 
@@ -804,37 +791,12 @@ pub fn normalize_harness_alias(kind: &str) -> String {
 /// known harnesses directly). Seam for `[harness.<name>]` additions.
 pub fn compiled_in_harnesses() -> BTreeMap<String, HarnessConfig> {
     let mut m = BTreeMap::new();
-    // H1 (bd-harness-prime-agent-818f): prime-agent ships a BUILT-IN hc
-    // socket integration (`packages/coding-agent/src/core/extensions/builtin/
-    // hc agent-state extension`) that activates on HC_SOCKET_PATH
-    // + HC_TERMINAL_ID — all injected by hc's standard pane launch env —
-    // and reports pane.report_agent (source "hc:pi", agent "prime-agent",
-    // working/blocked/idle + session refs), which hc accepts as hook
-    // authority even for unknown kinds. BUT hc has NO `pa` kind: its
-    // Agent enum is a closed 22-kind set (`agent.start --kind pa` →
-    // `unsupported_agent_kind`), and `server.agent_manifests` registers
-    // screen-detection rules only, not kinds. The spawn path therefore falls
-    // back to this recipe via `pane.run` when hc rejects the kind (upstream
-    // kind request filed upstream). `--offline` skips startup network
-    // checks so the TUI comes up fast in a bare pane.
     m.insert(
         "pa".to_string(),
         HarnessConfig {
             spawn_cmd: Some("prime-agent --offline".to_string()),
         },
     );
-    // H2 (bd-harness-jcode): jcode (the open-source terminal coding agent) is a
-    // flywheel custom kind — hc has NO `jcode` kind, so the spawn path falls
-    // back to this recipe via `pane.run` (same as `pa`). hc's standard pane
-    // launch env already carries HC_SOCKET_PATH / HC_SESSION / HC_TERMINAL_ID,
-    // so jcode's own hc integration (the `hc agent-state hook` lifecycle
-    // hook adapter, source `hc:jcode`) activates and self-reports lifecycle
-    // (working/idle/blocked) through the socket — which hc accepts as hook
-    // authority even for unknown kinds. The boot-prime line is appended as a
-    // launch arg by `recipe_launch_command`; jcode runs as its TUI in the pane
-    // and is primed via `pane.send_text` like any other agent. jcode's own
-    // default model/provider is used when the profile leaves `model` empty; a
-    // pinned model is injected as `-m <bare-id>` via the `model_args` jcode arm.
     m.insert(
         "jcode".to_string(),
         HarnessConfig {
@@ -978,9 +940,6 @@ fn every_profile_routes_on_every_bare_harness() {
     let cat = ProfileCatalog::load().expect("profiles.toml");
     let harnesses = canonical_harnesses();
 
-    // bd-hhyl's trap, refused explicitly: a matrix that enumerated nothing would
-    // report green and mean nothing. Assert the axes are populated FIRST, so an
-    // empty registry fails loudly instead of passing vacuously.
     assert!(
         !harnesses.is_empty(),
         "the harness registry produced no canonical harnesses"
@@ -1006,21 +965,12 @@ fn every_profile_routes_on_every_bare_harness() {
             ));
             continue;
         };
-        // A profile with no model is a BARE spawn by design: the harness
-        // launches model-less. A legitimate cell, not a hole in the matrix.
         if p.model.trim().is_empty() {
             bare += 1;
             continue;
         }
         for h in &harnesses {
             cells += 1;
-            // The LADDER, not `resolve_strict`. My first version called
-            // `resolve_strict` directly and reported 54 of 81 cells failing,
-            // because most profiles name a SLOT (`@standard`) and that function
-            // accepts only a concrete model id — so it answered "model
-            // '@standard' is not in the registry" for a perfectly valid
-            // configuration. The product was right and the test was wrong.
-            // `resolve_profile_route_full` is the spawn-time path.
             match reg.resolve_profile_route_full(h, &p.model, &p.model_fallback) {
                 Ok((_h, model, step)) => {
                     routed += 1;
@@ -1034,16 +984,6 @@ fn every_profile_routes_on_every_bare_harness() {
                     }
                 }
                 Err(e) => {
-                    // bd-ziy9: NOT every harness may receive a model, and this branch
-                    // now asserts WHICH ones may not rather than demanding all nine
-                    // route. A Closed-tier harness is a frontier CLI with its own
-                    // model, documented as "Never asked for one"
-                    // (harness_registry.rs:25); handing one a `zai/*` id would delete
-                    // that constraint rather than satisfy the requirement, and the
-                    // `big-pickle` cap is the same kind of cost fact. So the previous
-                    // "all 9 must route" assertion was not a stricter test — it was a
-                    // test that could only be made green by breaking a rule, which is
-                    // why it was red.
                     let open = crate::harness_registry::tier_of(h).is_some_and(
                         crate::harness_registry::HarnessTier::may_be_asked_for_a_model,
                     );
@@ -1066,9 +1006,6 @@ fn every_profile_routes_on_every_bare_harness() {
         "the profile catalog disagrees with itself: {}",
         failures.join("\n  - ")
     );
-    // Non-vacuity on the NEW axis too: a matrix where every cell is refused, or where
-    // no cell ever needed a default, would report green while testing nothing. The
-    // dynamic rung is the point of bd-ziy9, so its absence must be a failure.
     assert!(
         refused > 0,
         "no CLOSED-tier harness was exercised, so the 'must refuse' half of the contract is \
@@ -1110,8 +1047,6 @@ fn every_profile_routes_on_every_bare_harness() {
 #[test]
 fn every_harness_named_by_a_workflow_is_registered() {
     let workflows = crate::builtin_workflows::builtin_workflows();
-    // The non-vacuity guard, asserted BEFORE the property: a catalog accessor that
-    // started returning nothing would make the loop below pass in silence.
     assert!(
         workflows.len() >= 20,
         "only {} workflows enumerated; the catalog accessor changed and this guard is \
@@ -1124,14 +1059,8 @@ fn every_harness_named_by_a_workflow_is_registered() {
     let mut referenced: std::collections::BTreeSet<String> = Default::default();
     for wf in workflows.values() {
         let blob = format!("{wf:?}");
-        // Deliberately generous about the SHAPE and strict about the VALUE: the bug
-        // is a value that is not a registered harness, not a field named `harness`.
         for chunk in blob.split("harness:").skip(1) {
             let tail = chunk.trim_start();
-            // `Debug` renders the field as `Some("pi")` or `None`, so the naive
-            // read produced the literal strings "Some" and "None" as harness names.
-            // Unwrap the Option first and take the quoted contents; a bare `None`
-            // means the workflow pins nothing and contributes no name at all.
             let v = match tail.strip_prefix("Some(") {
                 Some(rest) => rest
                     .trim_start()
@@ -1166,10 +1095,6 @@ fn every_slot_harness_and_its_fallback_are_live_registry_entries() {
     let mut checked = 0usize;
     let mut bad: Vec<String> = Vec::new();
     for (slot, spec) in &reg.slots {
-        // `harness` is a plain String and `fallback_harness` an Option, so both are
-        // normalized to Option<&str> rather than matched separately. An EMPTY harness
-        // is skipped too: it means the slot pins no harness and the caller's default
-        // applies, which is a legitimate configuration and not a broken reference.
         let named: [(&str, Option<&str>); 2] = [
             (
                 "harness",
@@ -1187,9 +1112,6 @@ fn every_slot_harness_and_its_fallback_are_live_registry_entries() {
             }
         }
     }
-    // The counter exists to be ASSERTED. A count that is computed and never
-    // read is a non-vacuity guard that guards nothing — the same trap as a
-    // test filter that matches nothing and reports green.
     assert!(
         checked > 0,
         "no slot named a harness, so this guard proved nothing"
@@ -1216,8 +1138,6 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    // Temp-dir creation without a tempfile dep. Atomic counter keeps parallel
-    // tests from colliding on the same path.
     static TMP_LOCK: Mutex<()> = Mutex::new(());
     static TMP_SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -1252,7 +1172,6 @@ model = "big-pickle"
         assert_eq!(raw.len(), 2, "exactly the user entries: {raw:?}");
         assert!(raw.contains_key("scout"), "builtin-name override preserved");
         assert!(raw.contains_key("mybot"));
-        // No layering: absent names stay absent.
         let empty = ProfileCatalog::load_user_file(None);
         assert!(empty.is_empty());
     }
@@ -1274,13 +1193,11 @@ behavior = "be terse"
         assert_eq!(p.model, "claude-sonnet-4");
         assert_eq!(p.role, "tester");
         assert!(cat.names().contains(&"foo".to_string()), "listed");
-        // backend defaults to hc when unset
         assert_eq!(cat.backend("foo"), "hc");
     }
 
     #[test]
     fn compiled_in_defaults_appear_without_profiles_toml() {
-        // No file -> defaults only (zero-config baseline).
         let cat = ProfileCatalog::load_from(None).expect("load defaults");
         for name in [
             "oracle",
@@ -1337,12 +1254,8 @@ model = "deepseek-v3"
 "#,
         );
         let cat = ProfileCatalog::load_from(Some(&path)).expect("load");
-        // Layered: the built-in still exists, with the user's model override.
         let s = cat.get("scout").expect("scout present");
         assert_eq!(s.model, "deepseek-v3");
-        // ADR-0007: built-in harness is empty (slot inherit). A user override
-        // pinning a CONCRETE model without a harness must resolve loudly at
-        // spawn time (D1: pin a harness or a slot alias).
         assert_eq!(s.harness, "", "built-in harness stays empty (slot inherit)");
     }
 
@@ -1365,7 +1278,6 @@ plan = "glm-5.2"
         assert_eq!(c.slow, "", "absent role stays empty");
         assert_eq!(c.model, "@standard", "base model untouched (slot inherit)");
         assert_eq!(c.harness, "", "built-in harness stays empty (slot inherit)");
-        // omp profiles fill smol/slow/plan with slot aliases (ADR-0007 D2).
         for name in ["oracle", "planner", "reviewer"] {
             let p = cat.get(name).expect(name);
             assert_eq!(p.smol, "@cheap", "{name}.smol");
@@ -1399,12 +1311,9 @@ model = "big-pickle"
         let c = cat.get("coder").expect("coder present");
         assert_eq!(c.provider, "deepseek", "explicit provider parsed");
         assert_eq!(c.model, "deepseek-v4.1-flash");
-        // Built-in untouched by an unrelated override keeps empty provider.
         let s = cat.get("scout").expect("scout present");
         assert_eq!(s.provider, "", "absent provider defaults empty");
         assert_eq!(s.harness, "", "built-in harness stays empty (slot inherit)");
-        // A partial user override with NO provider inherits the built-in's
-        // (empty) provider — same layering rule as every other field.
         let path2 = tmp_profiles_toml(
             r#"
 [profiles.coder]
@@ -1441,7 +1350,6 @@ provider = "opencode-go"
             r.spec.provider, "opencode-go",
             "explicit provider passes into SpawnSpec"
         );
-        // Default catalog profiles carry no provider.
         let base = catalog()
             .resolve("planner", None, "npub-operator", &no_project)
             .expect("base resolve");
@@ -1585,8 +1493,6 @@ model = "deepseek-v4.1-flash"
         assert!(res.is_err(), "malformed toml must error");
     }
 
-    // ---- Profile::resolve (ADR-0005 Spec 1 resolution rule) ----
-
     fn catalog() -> ProfileCatalog {
         ProfileCatalog::load_from(None).expect("defaults")
     }
@@ -1597,13 +1503,6 @@ model = "deepseek-v4.1-flash"
 
     #[test]
     fn builtins_have_verbatim_preamble_and_skills() {
-        // ADR-0005 Spec 1b + ADR-0019 Spec 6 (amended): the 6 canonical
-        // profiles ship with the EXACT verbatim preamble (first line) and
-        // skills — the preamble is NEVER paraphrased. Since wave 3 the
-        // behavior body ALSO cites the principle NAMES that role owns
-        // (ADR-0019 Spec 6: names only, never the leaf text — the full leaf
-        // is `flywheel principles show <name>`, on demand). A stub (empty
-        // behavior) or a pasted leaf both fail here.
         let cat = catalog();
         let expect: &[(&str, &str, &[&str], &[&str])] = &[
             (
@@ -1666,10 +1565,6 @@ model = "deepseek-v4.1-flash"
             for s in *skills {
                 assert!(p.skills.iter().any(|x| x == s), "{name} missing skill {s}");
             }
-            // ADR-0019 Spec 6: the behavior cites the role's principle NAMES
-            // inline and points at the on-demand leaf — it never pastes the
-            // leaf text (length bound; the leaves are compiled in the
-            // registry).
             for name_token in *principles {
                 assert!(
                     p.behavior.contains(name_token),
@@ -1681,19 +1576,14 @@ model = "deepseek-v4.1-flash"
                 "{name} behavior points at the on-demand leaf"
             );
         }
-        // No leaf text anywhere: distinctive phrases from the compiled
-        // leaves must NOT appear in any built-in behavior.
         for leaf_phrase in [
-            "Prefer deletion",                // laziness-protocol leaf
-            "Check the real artifact",        // prove-it-works leaf
-            "Bulk to subagents",              // guard-the-context-window leaf
-            "Converge to the same end state", // make-operations-idempotent leaf
+            "Prefer deletion",
+            "Check the real artifact",
+            "Bulk to subagents",
+            "Converge to the same end state",
         ] {
             for (name, preamble, _skills, _principles) in expect {
                 let p = cat.get(name).unwrap();
-                // The preamble is the behavior's opening line — never a stub
-                // and never the leaf text itself (bd-llbe: use the column,
-                // don't underscore it).
                 assert!(
                     !preamble.trim().is_empty() && p.behavior.starts_with(preamble),
                     "{name} preamble must be a non-empty verbatim behavior start"
@@ -1743,7 +1633,6 @@ model = "deepseek-v4.1-flash"
             .expect("resolve");
         assert_eq!(r.npub, "npub-operator");
         assert_eq!(r.signing, SigningContext::Operator("npub-operator".into()));
-        // backend defaults to hc
         assert_eq!(r.spec.backend, "hc");
     }
 
@@ -1759,10 +1648,6 @@ model = "deepseek-v4.1-flash"
     /// Engine DI seam (ADR-0005 Spec 4a): `@planner` resolves, `@ghost` is None.
     #[test]
     fn resolve_for_engine_known_at_prefix_and_unknown_none() {
-        // Hermetic (bd-17ry rule): the resolved MODEL comes from the model
-        // registry, which reads the operator's models.toml. Without a pinned
-        // XDG the answer flips between the compiled-in pair and whatever the
-        // real machine has, and the test fails on the wrong day.
         let _g = crate::config::lock_env();
         let dir = std::env::temp_dir().join(format!("fw-prof-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp config dir");
@@ -1771,7 +1656,6 @@ model = "deepseek-v4.1-flash"
         let got = cat
             .resolve_for_engine("@planner")
             .expect("@planner must resolve");
-        // bd-47fu: the planner's default harness is pi; omp is dropped.
         assert_eq!(got["spec"]["harness"], "pi");
         assert_eq!(got["spec"]["model"], "zai/glm-5.3");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1799,7 +1683,6 @@ model = "deepseek-v4.1-flash"
 
     #[test]
     fn recipe_to_squad_maps_kinds_to_profile_counts() {
-        // Legacy Recipe{oc:1, pi:1} + an extra kind -> a squad of profiles.
         use crate::config::Recipe;
         let r = Recipe {
             oc: Some(1),
@@ -1828,7 +1711,6 @@ model = "deepseek-v4.1-flash"
             "extra kinds map to profile counts"
         );
         assert_eq!(squad.counts.get("gk"), None, "zero gk dropped");
-        // Deterministic member order by profile name.
         let members: Vec<(&str, u32)> = squad.members();
         assert_eq!(
             members,

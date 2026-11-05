@@ -61,13 +61,11 @@ pub fn list_agents_args(project_key: &str, active_within_days: Option<u64>) -> V
 
 /// `whois`.
 pub fn whois_args(project_key: &str, name: &str) -> Value {
-    // the daemon's WhoisArgs field is `agent_name` (not `name` — wire drift
-    // caught by live test 2026-08-09)
     json!({ "project_key": project_key, "agent_name": name })
 }
 
 /// `send_message`.
-#[allow(clippy::too_many_arguments)] // mirrors the MailBackend::send trait surface
+#[allow(clippy::too_many_arguments)]
 pub fn send_args(
     project_key: &str,
     sender_name: &str,
@@ -121,7 +119,7 @@ pub fn reply_args(
 }
 
 /// `fetch_inbox` with the full filter bag (c3b.3 fields included).
-#[allow(clippy::too_many_arguments)] // mirrors the InboxFilter struct surface
+#[allow(clippy::too_many_arguments)]
 pub fn inbox_args(
     project_key: &str,
     agent_name: &str,
@@ -308,7 +306,7 @@ pub fn slot_renew_args(
 
 /// `search_messages` — only the args the wire accepts are emitted (absent
 /// optional filters are omitted, matching agent-mail's optionality).
-#[allow(clippy::too_many_arguments)] // mirrors the SearchFilter struct surface
+#[allow(clippy::too_many_arguments)]
 pub fn search_args(
     project_key: &str,
     query: &str,
@@ -486,7 +484,6 @@ mod tests {
                 "ack_required": true,
             })
         );
-        // thread_id present only when Some.
         let with_tid = send_args("p", "s", &[], "sub", "b", "low", false, Some("t1"));
         assert_eq!(with_tid["thread_id"], json!("t1"));
         assert_eq!(
@@ -508,7 +505,6 @@ mod tests {
                 "message_id": 42,
             })
         );
-        // toron divergence: same common fields, `thread_id` string key.
         assert_eq!(
             reply_args(
                 "p",
@@ -552,7 +548,6 @@ mod tests {
                 "thread_id": "debate-1",
             })
         );
-        // since_ts + thread_id omitted when None.
         let no_since = inbox_args("p", "a", false, false, false, false, 10, None, None);
         assert!(no_since.get("since_ts").is_none());
         assert!(no_since.get("thread_id").is_none());
@@ -593,7 +588,6 @@ mod tests {
                 "ranking": "recency",
             })
         );
-        // sparse search: only present filters emitted.
         let sparse = search_args("p", "q", 3, false, None, None, None, None, None, None);
         assert_eq!(
             sparse,

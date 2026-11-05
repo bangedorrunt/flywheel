@@ -8,10 +8,6 @@ use std::io::IsTerminal;
 
 use crate::hc_support::AgentStatus;
 
-// ---------------------------------------------------------------------------
-// color capability detection
-// ---------------------------------------------------------------------------
-
 /// Whether ANSI color should be emitted for the given stream.
 pub fn color_enabled() -> bool {
     if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
@@ -40,15 +36,10 @@ fn use_256() -> bool {
     if !color_enabled() || truecolor_enabled() {
         return false;
     }
-    // TERM contains 256color → 256 palette available; otherwise fall back to 16
     std::env::var("TERM")
         .map(|t| t.contains("256color"))
         .unwrap_or(false)
 }
-
-// ---------------------------------------------------------------------------
-// hacker-night palette — Ghostty v2 neon-on-void
-// ---------------------------------------------------------------------------
 
 /// Semantic color slots — widget code references these, never raw hex/ANSI.
 #[derive(Debug, Clone, Copy)]
@@ -80,48 +71,48 @@ pub fn slot_rgb(slot: Slot) -> (u8, u8, u8) {
         Slot::BgBase => (0x08, 0x08, 0x0e),
         Slot::BgSurface => (0x12, 0x12, 0x2a),
         Slot::BgOverlay => (0x1a, 0x1a, 0x3e),
-        Slot::AccentCyan => (0x0d, 0xb9, 0xd7), // vivid cyan #0db9d7
-        Slot::AccentLav => (0xbb, 0x9a, 0xf7),  // electric lavender
-        Slot::Success => (0x73, 0xda, 0xca),    // neon mint
-        Slot::Info => (0x89, 0xdd, 0xff),       // ice cyan — working
-        Slot::Warning => (0xe0, 0xaf, 0x68),    // amber gold
-        Slot::Error => (0xf7, 0x76, 0x8e),      // hot pink-red (AA on void)
+        Slot::AccentCyan => (0x0d, 0xb9, 0xd7),
+        Slot::AccentLav => (0xbb, 0x9a, 0xf7),
+        Slot::Success => (0x73, 0xda, 0xca),
+        Slot::Info => (0x89, 0xdd, 0xff),
+        Slot::Warning => (0xe0, 0xaf, 0x68),
+        Slot::Error => (0xf7, 0x76, 0x8e),
     }
 }
 
 /// Nearest xterm-256 index for each slot (hand-picked, not auto-quantized).
 fn slot_256(slot: Slot) -> &'static str {
     match slot {
-        Slot::FgDefault => "38;5;189", // lavender-grey approx
-        Slot::FgMuted => "38;5;60",    // muted slate
+        Slot::FgDefault => "38;5;189",
+        Slot::FgMuted => "38;5;60",
         Slot::FgEmphasis => "38;5;255",
         Slot::BgBase => "48;5;233",
         Slot::BgSurface => "48;5;235",
         Slot::BgOverlay => "48;5;236",
-        Slot::AccentCyan => "38;5;44", // vivid cyan
+        Slot::AccentCyan => "38;5;44",
         Slot::AccentLav => "38;5;141",
-        Slot::Success => "38;5;79",  // mint
-        Slot::Info => "38;5;117",    // ice
-        Slot::Warning => "38;5;180", // amber
-        Slot::Error => "38;5;210",   // pink-red
+        Slot::Success => "38;5;79",
+        Slot::Info => "38;5;117",
+        Slot::Warning => "38;5;180",
+        Slot::Error => "38;5;210",
     }
 }
 
 /// 16 ANSI fallback — Ghostty maps these to hacker-night hues correctly.
 fn slot_ansi(slot: Slot) -> &'static str {
     match slot {
-        Slot::FgDefault => "37",  // white → #c8d0e8 via palette 7
-        Slot::FgMuted => "90",    // bright black → #565f89
-        Slot::FgEmphasis => "97", // bright white
-        Slot::BgBase => "40",     // black bg — rarely used directly
+        Slot::FgDefault => "37",
+        Slot::FgMuted => "90",
+        Slot::FgEmphasis => "97",
+        Slot::BgBase => "40",
         Slot::BgSurface => "40",
         Slot::BgOverlay => "48;5;236",
-        Slot::AccentCyan => "36", // cyan → #0db9d7 via palette 6
-        Slot::AccentLav => "35",  // magenta → #bb9af7 via palette 5
-        Slot::Success => "32",    // green → #73daca via palette 2
-        Slot::Info => "96",       // bright cyan → #89ddff via palette 12
-        Slot::Warning => "33",    // yellow → #e0af68 via palette 3
-        Slot::Error => "91",      // bright red fallback for error
+        Slot::AccentCyan => "36",
+        Slot::AccentLav => "35",
+        Slot::Success => "32",
+        Slot::Info => "96",
+        Slot::Warning => "33",
+        Slot::Error => "91",
     }
 }
 
@@ -138,10 +129,6 @@ fn paint_slot(s: &str, slot: Slot) -> String {
     }
     format!("\x1b[{}m{s}\x1b[0m", slot_ansi(slot))
 }
-
-// ---------------------------------------------------------------------------
-// public paint helpers — now semantic, still backwards-compatible names
-// ---------------------------------------------------------------------------
 
 pub fn status_paint(status: AgentStatus) -> String {
     let s = status.as_str();
@@ -266,9 +253,6 @@ mod tests {
 
     #[test]
     fn warn_marks_text() {
-        // NO_COLOR forces the plain form; the text survives either way.
-        // Env mutation is process-global — serialize under the crate-wide
-        // env lock (193.2).
         let _g = crate::config::lock_env();
         unsafe { std::env::set_var("NO_COLOR", "1") };
         assert_eq!(warn("drift"), "drift");
@@ -343,9 +327,6 @@ pub fn confirm_destructive_with<R: std::io::BufRead>(
             );
         }
         if !is_terminal {
-            // Forty filenames inline is a wall of text that hides the one fact
-            // that matters (it refused, and here is the fix). Print a few, point
-            // at --dry-run for the rest.
             anyhow::bail!(
                 "refusing to {what} {} file(s): no TTY to confirm on. \
                  Re-run with --yes to accept, or --dry-run to see the full list. \

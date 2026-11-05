@@ -62,11 +62,6 @@ pub fn model_args(harness: &str, model: &str, effort: Option<&str>) -> Vec<Strin
         "pi" => {
             let mut args = vec!["--model".to_string(), model.to_string()];
             if let Some(e) = effort {
-                // bd-pi-thinking-equals-form: TWO argv entries, not
-                // `--thinking=<e>`. pi 0.87.1's parser accepts the space form and
-                // rejects the equals form with `Unknown option: --thinking`,
-                // even though its own --help advertises the flag. Covered by
-                // pi_emitted_effort_arg_form_is_accepted_by_the_real_binary.
                 args.push("--thinking".to_string());
                 args.push(e.to_string());
             }
@@ -83,17 +78,7 @@ pub fn model_args(harness: &str, model: &str, effort: Option<&str>) -> Vec<Strin
 /// dispatch proceeds in prompt mode. One match arm per harness; this
 /// registry is the ONLY place a harness's phase vocabulary lives.
 pub fn phase_launch_args(harness: &str, phase: &str) -> (Vec<String>, bool) {
-    // Mechanics verified against the installed binaries 2026-08-21:
-    // - omp `--plan-yolo`: "Force read-only plan mode at start" (omp --help).
-    // - opencode `--agent plan`: the builtin `plan` (primary) agent
-    //   (`opencode agent list`). opencode reads `--agent <name>`.
-    // - opencode `--agent build` (bd-adr22-implement-not-degraded-puhs):
-    //   the builtin `build` (primary) implement agent, same list.
-    // pi/grok expose no phase mechanic — documented loud degradation.
     match (harness, phase) {
-        // bd-adr22-implement-not-degraded-puhs: implement IS the no-flag
-        // baseline on every harness — baseline mode is not a degrade. The
-        // single exception: opencode's real `build` agent is mechanized.
         ("opencode", "implement") => (vec!["--agent".to_string(), "build".to_string()], false),
         (_, "implement") => (vec![], false),
         ("opencode", "plan") => (vec!["--agent".to_string(), "plan".to_string()], false),
@@ -111,12 +96,6 @@ pub fn phase_launch_args(harness: &str, phase: &str) -> (Vec<String>, bool) {
 pub fn build_argv_roles(
     harness: &str,
     model: Option<&str>,
-    // bd-47fu: ACCEPTED AND IGNORED, deliberately. `effort` was only ever consumed by
-    // the `omp` arm and the role ids only by `role_model_args` (also omp-only); both
-    // went with the harness. Underscore-prefixed rather than deleted because 12 call
-    // sites would need re-arguing, and a reader who finds `_smol` LEARNS the field is
-    // inert, where a deleted parameter is only rediscovered by a stale caller.
-    // Signature + `Profile::smol/slow/plan` cleanup is bd-dvq7.
     _effort: Option<&str>,
     _smol: &str,
     _slow: &str,
@@ -138,10 +117,6 @@ pub fn build_argv_roles(
             }
         }
         "grok" => {
-            // `-p` alone fails this grok build ("a value is required for
-            // '--single <PROMPT>'"); the prompt must ride the `--single`
-            // value. Build it here (the prompt is appended at the end for
-            // the other harnesses).
             let single = format!("--single={prompt}");
             argv.extend(
                 [
@@ -203,7 +178,7 @@ impl HarnessOutcome {
 /// `message.model`. Non-JSON lines (startup banners) are skipped; a stream
 /// with no JSON at all is treated as plain text.
 pub fn parse_stream(stdout: &str, harness: &str) -> HarnessOutcome {
-    let _ = harness; // parser hint; the NDJSON shape is harness-agnostic today
+    let _ = harness;
     let mut response = String::new();
     let mut tokens_in = 0u64;
     let mut tokens_out = 0u64;
@@ -217,16 +192,11 @@ pub fn parse_stream(stdout: &str, harness: &str) -> HarnessOutcome {
             continue;
         }
         let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue; // banner noise, not stream corruption
+            continue;
         };
         saw_json = true;
 
         // bd-7wah: a TOP-LEVEL `type: "error"` is how opencode reports a rejected
-        // request, and the old parser never looked at it — the error was only ever
-        // read from INSIDE a `message_end`, so a provider 400 became an empty
-        // success. Measured on this host: every opencode headless dispatch was
-        // failing with `maximum context length is 36864 tokens ... you requested
-        // about 37930`, and 383 of 442 run records recorded it as a success.
         if v.get("type").and_then(Value::as_str) == Some("error") {
             if error.is_none() {
                 error = Some(HarnessOutcome::describe_error_frame(&v));
@@ -273,16 +243,8 @@ pub fn parse_stream(stdout: &str, harness: &str) -> HarnessOutcome {
         }
     }
     if !saw_json {
-        // plain-text harness output (no JSON stream): raw stdout IS the
-        // response, no usage accounting available.
         response = stdout.to_string();
     } else if response.is_empty() && error.is_none() {
-        // bd-7wah: we were told this is a JSON stream and it contained no assistant
-        // message. That is a PROTOCOL DISAGREEMENT — the harness and this build do
-        // not agree on the shape — and it used to be reported as `success` with an
-        // empty response, which is how a broken dispatch looked like a working one.
-        // Distinct from "the agent finished and said nothing", which is a different
-        // bug with a different fix, and both are now distinguishable from success.
         error = Some(format!(
             "unrecognised stream shape: {} JSON line(s), none carrying an assistant \
              message. The harness and this build disagree on the NDJSON shape.",
@@ -439,8 +401,6 @@ pub fn phase_registry_probe(
                         .to_string(),
                 );
             };
-            // Wired builtin agents appear as "<name> (primary)" / "<name>":
-            // match each bare name on an agent-list line.
             let missing: Vec<&str> = ["plan", "build"]
                 .into_iter()
                 .filter(|agent| {
@@ -457,7 +417,6 @@ pub fn phase_registry_probe(
                 ))
             }
         }
-        // No mechanic registered -> nothing to probe.
         _ => None,
     }
 }
@@ -511,9 +470,6 @@ pub fn spec_extra(spec: &DispatchSpec, key: &str, inputs: &Value) -> Option<Stri
             Some(v) => {
                 let rendered = v.to_string();
                 out.replace_range(start..start + "{{inputs.".len() + end + 2, &rendered);
-                // The rendered value could itself contain a ref — restart the
-                // scan; an unresolvable ref (replaced by itself) must NOT
-                // loop forever.
                 if out[start..].starts_with("{{inputs.") {
                     break;
                 }
@@ -569,9 +525,6 @@ mod tests {
                     .to_vec(),
             ),
             (
-                // bd-47fu: the `omp-equals-form` row is gone with omp. No
-                // live harness emits `--model=`, and pi 0.87.1 REJECTS the
-                // equals form, so a row asserting it would pin a bug.
                 "pi-space-form",
                 build_argv_roles("pi", Some("zai/glm-5.3"), None, "", "", "", "hi").unwrap(),
                 ["pi", "-p", "--mode", "json", "--model", "zai/glm-5.3", "hi"]
@@ -638,10 +591,6 @@ mod tests {
             vec!["--model", "claude-sonnet-4"]
         );
         assert_eq!(model_args("grok", "grok-4", None), vec!["-m", "grok-4"]);
-        // bd-47fu: the omp `=`-form, jcode's -p/-m split, and pa's
-        // `--thinking` are all gone with their harnesses. The live forms
-        // are opencode `--model X`, grok `-m X`, pi `--model X` + a
-        // SEPARATE `--thinking <e>` (the equals form pi rejects).
         assert_eq!(
             model_args("pi", "zai/glm-5.3", Some("max")),
             vec!["--model", "zai/glm-5.3", "--thinking", "max"]
@@ -659,16 +608,11 @@ mod tests {
                 "medium"
             ]
         );
-        // bd-47fu: jcode's -p/-m split and omp's `=`-form are gone with
-        // their harnesses; the rows above pin every live form instead.
-        // A bare (provider-less) model id still emits only the model.
         assert_eq!(model_args("grok", "gpt-5.5", None), vec!["-m", "gpt-5.5"]);
         assert_eq!(
             model_args("pi", "glm-5.2", None),
             vec!["--model", "glm-5.2"]
         );
-        // H1 (bd-harness-prime-agent-818f): prime-agent takes `--model` +
-        // `--thinking` (omitted when no effort is set).
         assert_eq!(
             model_args("pi", "opencode-go/deepseek-v4.1-flash", None),
             vec!["--model", "opencode-go/deepseek-v4.1-flash"]
@@ -732,8 +676,6 @@ mod tests {
         );
         assert!(effort_degraded("opencode"), "opencode effort degrades loud");
         assert!(!effort_degraded("pi"), "pi effort is native");
-        // bd-47fu: opencode is the loud-degradation harness; grok's effort
-        // is not asserted here because the registry records its own tier.
         assert!(
             effort_degraded("opencode"),
             "opencode effort degrades loudly"
@@ -763,16 +705,11 @@ mod tests {
             .args(["--print"])
             .args(&emitted)
             .arg("x")
-            // stdout goes to null, NOT a pipe: this test asserts only on stderr,
-            // and an unread pipe fills its buffer and blocks the child, which
-            // would surface as a spurious timeout rather than a real failure.
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn()
         {
             Ok(c) => c,
-            // pi is not installed here; the pure argv assertions still cover the
-            // shape. Skipping loudly beats a green test that proved nothing.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 eprintln!("pi not on PATH — skipping the real-binary arg check");
                 return;
@@ -780,10 +717,6 @@ mod tests {
             Err(e) => panic!("spawn pi: {e}"),
         };
 
-        // BOUNDED WAIT (effect-oriented principle 10). `output()` would block
-        // forever if pi hung — e.g. waiting on a credential prompt the
-        // non-interactive flag should prevent but does not guarantee. An
-        // unbounded wait in a test is a CI hang, not a failure.
         const ARGS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
         let deadline = std::time::Instant::now() + ARGS_TIMEOUT;
         let status = loop {
@@ -850,13 +783,9 @@ mod tests {
     /// phase vocabulary lives.
     #[test]
     fn phase_registry_table_per_harness() {
-        // bd-47fu: omp carried `--plan-yolo` and is dropped with its arm, so
-        // a harness with no phase mechanic must DEGRADE loudly rather than
-        // pretend it planned.
         let (args, degraded) = phase_launch_args("pi", "plan");
         assert_eq!(args, Vec::<String>::new());
         assert!(degraded, "no phase mechanic is a loud degradation");
-        // opencode: plan -> the builtin plan-mode agent.
         let (args, degraded) = phase_launch_args("opencode", "plan");
         assert_eq!(args, vec!["--agent", "plan"]);
         assert!(!degraded);
@@ -866,7 +795,6 @@ mod tests {
     /// trailing prompt positional and reports degradation to the caller.
     #[test]
     fn build_argv_roles_phase_inserts_before_prompt() {
-        // opencode + plan: `--agent plan` lands before the prompt, not after.
         let (argv, degraded) = build_argv_roles_phase(
             "opencode",
             Some("anthropic/claude-sonnet-4"),
@@ -890,7 +818,6 @@ mod tests {
         assert!(pos_flag < pos_prompt, "flag must precede prompt: {argv:?}");
         assert_eq!(pos_prompt, argv.len() - 1, "prompt stays last");
 
-        // No phase -> byte-identical to build_argv_roles, never degraded.
         let (plain, degraded) = build_argv_roles_phase(
             "opencode",
             Some("anthropic/claude-sonnet-4"),
@@ -917,8 +844,6 @@ mod tests {
             .unwrap()
         );
 
-        // Degraded pair: args stay empty, degraded reported (pi has no
-        // mechanic) — the caller warns + tags, argv unchanged shape.
         let (argv, degraded) =
             build_argv_roles_phase("pi", None, None, "", "", "", "hi", Some("plan")).expect("argv");
         assert!(degraded);
@@ -949,8 +874,6 @@ mod tests {
             Some("streaming-messages-json")
         );
 
-        // The contrast that makes the rule necessary: pi/opencode DO end with
-        // the prompt, so len-1 is right for them.
         for harness in ["pi", "opencode"] {
             let argv = build_argv_roles(harness, None, None, "", "", "", prompt).expect("argv");
             assert_eq!(
@@ -969,13 +892,9 @@ mod tests {
     fn phase_args_never_split_a_flag_from_its_value() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
 
-        // opencode shape: before the trailing prompt positional.
         let oc = s(&["opencode", "run", "--agent", "plan", "PROMPT"]);
         assert_eq!(phase_argv_insert_at(&oc, "PROMPT"), oc.len() - 1);
 
-        // grok shape: appended, because there is no trailing prompt positional
-        // and `len - 1` would put the args between --output-format and its
-        // value.
         let gk = s(&[
             "grok",
             "--single=PROMPT",
@@ -984,12 +903,9 @@ mod tests {
         ]);
         assert_eq!(phase_argv_insert_at(&gk, "PROMPT"), gk.len());
 
-        // A harness whose last element merely CONTAINS the prompt is not a
-        // trailing positional prompt either.
         let inline = s(&["grok", "--single=PROMPT"]);
         assert_eq!(phase_argv_insert_at(&inline, "PROMPT"), inline.len());
 
-        // Empty argv cannot underflow: nothing is a trailing prompt, so append.
         assert_eq!(phase_argv_insert_at(&[], "PROMPT"), 0);
     }
 
@@ -1028,16 +944,12 @@ mod tests {
                 _ => None,
             }
         };
-        // bd-47fu: omp's probe arm is gone with the harness, so the drift
-        // contract is proven on opencode alone.
         let oc_problem = phase_registry_probe("opencode", &drifted).expect("opencode drift caught");
         assert!(
             oc_problem.contains("plan") && oc_problem.contains("build"),
             "{oc_problem}"
         );
 
-        // Partial drift: build lost but plan intact still names the missing
-        // wired agent (bd-adr22-implement-not-degraded-puhs).
         let lost_build = |bin: &str, _args: &[&str]| -> Option<String> {
             match bin {
                 "opencode" => Some("plan (primary)\nexplore (subagent)".into()),
@@ -1048,7 +960,6 @@ mod tests {
             phase_registry_probe("opencode", &lost_build).expect("build drift caught");
         assert!(build_problem.contains("build"), "{build_problem}");
 
-        // Unprobeable harness (binary gone) -> warn, not panic.
         let dead = |_: &str, _: &[&str]| -> Option<String> { None };
         assert!(phase_registry_probe("opencode", &dead).is_some());
     }
@@ -1064,16 +975,12 @@ mod tests {
             assert!(args.is_empty(), "{harness}: no mechanic -> no args");
             assert!(degraded, "{harness}: plan must degrade");
         }
-        // Known harnesses degrade on phases they have no mechanic for.
-        // bd-adr22-implement-not-degraded-puhs: `implement` is NOT in this
-        // list anymore — it is the no-flag baseline (see the baseline test).
         for phase in ["resolve", "review", "ship"] {
             let (_, degraded) = phase_launch_args("omp", phase);
             assert!(degraded, "omp {phase}: no mechanic -> degraded");
             let (_, degraded) = phase_launch_args("opencode", phase);
             assert!(degraded, "opencode {phase}: no mechanic -> degraded");
         }
-        // Unknown phase strings on a known harness degrade too.
         let (args, degraded) = phase_launch_args("omp", "brainstorm");
         assert_eq!(args, [] as [String; 0]);
         assert!(degraded);
@@ -1087,7 +994,6 @@ mod tests {
     /// (`build (primary)` in `opencode agent list`) and gets wired.
     #[test]
     fn implement_phase_is_baseline_not_degraded_on_every_harness() {
-        // No-mechanic harnesses: plain baseline, NOT degraded.
         for harness in ["pi", "grok", "fx", "hermes-unknown"] {
             let (args, degraded) = phase_launch_args(harness, "implement");
             assert!(
@@ -1099,8 +1005,6 @@ mod tests {
                 "{harness}: implement must not be tagged phase_degraded"
             );
         }
-        // opencode: the real builtin `build` agent is the implement
-        // mechanic — mechanized AND not degraded.
         let (args, degraded) = phase_launch_args("opencode", "implement");
         assert_eq!(args, vec!["--agent", "build"]);
         assert!(!degraded, "opencode implement: wired agent is not degraded");
@@ -1350,9 +1254,6 @@ pub fn interactive_model_plan(
     effort: Option<&str>,
 ) -> InteractiveModelPlan {
     if harness == "opencode" {
-        // Still warn about effort here, exactly as model_args does, so a
-        // profile asking for `effort = max` on opencode is told the pin is
-        // model-only rather than silently losing the request.
         let effort = effort.filter(|e| !e.is_empty());
         if let Some(e) = effort {
             eprintln!(
@@ -1405,8 +1306,6 @@ mod bd_crlx_interactive_model_tests {
         for (harness, model) in [
             ("pi", "opencode-go/muse-spark-1.3-contributor"),
             ("grok", "grok-4"),
-            // opencode and fx deliver by PANE ENV, not argv (bd-crlx), so
-            // they belong to the env-pin test, not this one.
             ("claude", "anthropic/opus-5"),
             ("codex", "openai/gpt-5.2"),
         ] {

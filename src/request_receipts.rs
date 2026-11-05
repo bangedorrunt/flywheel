@@ -43,10 +43,6 @@ pub enum Gate {
 /// door's own guards stay the last line.
 fn gate_core(state: EffectState, recorded: Option<&str>, offered_digest: &str) -> Gate {
     match state {
-        // Prepared, InFlight, Accepted, ReconcilePending and Parked are all
-        // "the effect has not reached a terminal verdict" (bd-ozpj: the
-        // adopted enum is toron-core's nine-state one, so the states that
-        // flywheel's old five-state copy could not express arrive here).
         EffectState::Prepared
         | EffectState::InFlight
         | EffectState::Accepted
@@ -54,12 +50,8 @@ fn gate_core(state: EffectState, recorded: Option<&str>, offered_digest: &str) -
         | EffectState::Parked => Gate::InFlight,
         EffectState::Settled => match recorded {
             Some(recorded) if recorded != offered_digest => Gate::Conflict,
-            // A row from before digests were recorded cannot be compared; the
-            // slot settled, so the replay is still the answer.
             _ => Gate::Replay,
         },
-        // A cancelled effect did NOT happen: the slot is free for a new
-        // attempt, exactly like a failed or unknown one.
         EffectState::Failed | EffectState::Unknown | EffectState::Cancelled => Gate::Proceed,
     }
 }
@@ -195,7 +187,7 @@ impl DoorReceipt {
     }
 
     /// Evidence word recorded at settle time (compat reader for old rows).
-    #[cfg_attr(not(test), allow(dead_code))] // compat reader for pre-payload rows; pinned by test
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn evidence_word(&self) -> Option<&str> {
         self.evidence.as_deref()
     }
@@ -266,7 +258,6 @@ impl DoorReceiptGuard {
 
 fn journal_receipt(project: &str, receipt: &DoorReceipt) -> anyhow::Result<()> {
     let mut entry = serde_json::to_value(receipt)?;
-    // Tagged so a reader can tell a door row from an agent effect row.
     if let serde_json::Value::Object(map) = &mut entry {
         map.insert(
             "journal".to_string(),
@@ -366,8 +357,6 @@ pub fn park_steer(
     receipt.payload = Some(payload);
     receipt.asker = Some(asker.to_string());
     receipt.parked_at_ms = Some(now_ms());
-    // Prepared first so a crash between writes reads as in-flight, never
-    // as settled.
     journal_receipt(project, &receipt)?;
     receipt.state = EffectState::Parked;
     journal_receipt(project, &receipt)?;
@@ -546,8 +535,6 @@ mod tests {
             "another model is another plan"
         );
 
-        // The label a key pins is stable and slug-shaped, so a retry reads the
-        // same slot as the first attempt.
         let label = label_for_request_key("flywheel-flywheel", "Deploy 42");
         assert_eq!(
             label,
@@ -559,8 +546,6 @@ mod tests {
             label_for_request_key("flywheel-flywheel", "Deploy 43")
         );
 
-        // The door's contract, driven through the same gate it uses: the
-        // second attempt must not touch the dispatch.
         let mut journal: std::collections::BTreeMap<String, AgentEffect> =
             std::collections::BTreeMap::new();
         let mut dispatched = 0u32;
@@ -586,8 +571,6 @@ mod tests {
         );
         assert_eq!(dispatched, 1, "and dispatches nothing");
 
-        // A second attempt while the first is unresolved refuses: the door
-        // may be mid-dispatch, and a fork is worse than a refusal.
         let unresolved = std::collections::BTreeMap::from([(
             "Deploy 43".to_string(),
             row(EffectState::InFlight, Some(&plan)),
@@ -603,8 +586,6 @@ mod tests {
             );
         }
 
-        // The same key with another plan is a typed conflict, never a replay
-        // of somebody else's crew.
         let other = plan_digest(&[("opencode".into(), 5, None)]);
         assert_eq!(
             spawn_gate(Some(&row(EffectState::Settled, Some(&plan))), &other),
@@ -615,8 +596,6 @@ mod tests {
             Gate::Replay
         );
 
-        // An unsettled row (the documented at-least-once window) proceeds, and
-        // an absent receipt is not a settled one.
         for state in [EffectState::Failed, EffectState::Unknown] {
             assert_eq!(
                 spawn_gate(Some(&row(state, Some(&plan))), &plan),
@@ -649,16 +628,12 @@ mod tests {
             "another mode is another payload"
         );
 
-        // Doors namespace their slots: one key on two doors is two slots, and
-        // the same key on the same door is the same slot.
         let steer = door_slot("flywheel", "steer", "Deploy 42");
         let halt = door_slot("flywheel", "halt", "Deploy 42");
         assert_eq!(steer, "flywheel-steer-rk-deploy-42");
         assert_eq!(steer, door_slot("flywheel", "steer", "Deploy 42"));
         assert_ne!(steer, halt, "a steer key never names a halt slot");
 
-        // The door's contract, driven through the same gate it uses: the
-        // second attempt must not send anything.
         let mut rows: std::collections::BTreeMap<String, DoorReceipt> =
             std::collections::BTreeMap::new();
         let mut sent = 0u32;
@@ -683,9 +658,6 @@ mod tests {
         );
         assert_eq!(sent, 1, "and sends nothing");
 
-        // An unresolved slot refuses (a dispatch may be running right now),
-        // another payload under the same key is a typed conflict, and an
-        // unsettled row proceeds.
         let slot = door_slot("flywheel", "steer", "Deploy 42");
         for state in [EffectState::Prepared, EffectState::InFlight] {
             let mut row = DoorReceipt::prepare("steer", &slot, &digest);
@@ -716,20 +688,17 @@ mod tests {
         assert_eq!(p.request_key, "k1");
         assert_eq!(p.decision, "approve");
         assert_eq!(p.project, None);
-        // Fifth line only cross-project.
         let bx = approval_body("k2", "deny", "no", Some("toron"));
         assert!(bx.ends_with("\nproject=toron"));
         assert_eq!(
             parse_approval_body(&bx).expect("parse").project,
             Some("toron".to_string())
         );
-        // Prose is not approval.
         assert_eq!(parse_approval_body("approved, ship it"), None);
         assert_eq!(
             parse_approval_body("flywheel-approval.v1\nabout=k\ndecision=maybe\nnote=x"),
             None
         );
-        // Long note cut at 500 chars with the cut marked, one line.
         let long = "w ".repeat(400);
         let bc = approval_body("k3", "approve", &long, None);
         let note_line = bc.lines().nth(3).expect("note line");
@@ -772,7 +741,6 @@ mod tests {
             r.asker = Some(asker.to_string());
             r
         }
-        // Slot A: parked, then settled denied. Slot B: new key.
         let history = vec![
             row("a", EffectState::Prepared, "pin"),
             row("a", EffectState::Parked, "pin"),
@@ -782,7 +750,6 @@ mod tests {
             !latest_parked_other(&history, "pin", "b"),
             "a settled slot's parked history must not block a fresh key"
         );
-        // Slot A parked (latest row Parked), slot B fresh.
         let parked = vec![row("a", EffectState::Parked, "pin")];
         assert!(latest_parked_other(&parked, "pin", "b"));
         assert!(

@@ -34,9 +34,6 @@ use serde_json::{Value, json};
 
 use toron_workflow::schema::Action;
 
-// ADR-0018 §1: the framework's shapes come from THIS plane's port module
-// (`src/elm`), never straight from toron's — one door per repo, so an
-// upstream API move lands in the port and not in the protocol code.
 use crate::elm::{
     BreakerConfig, Cause, ClockImpl, Defect, Effect, Exit, Remote, RemoteError, RemotePolicy,
     Runtime, SystemClock, kernel_millis,
@@ -162,7 +159,6 @@ where
     F: FnMut() -> Option<std::collections::HashSet<String>>,
 {
     let registry = LiveRegistry(rows.to_vec());
-    // No row for the role means it was never spawned: nothing to settle.
     let want = match nth {
         Some(i) => resolve_pane_entry_nth(&registry, role, i)?,
         None => resolve_pane_entry(&registry, role)?,
@@ -230,8 +226,6 @@ fn best_generation<'a>(
 }
 
 pub fn resolve_pane_entry<'a>(entries: &'a LiveRegistry, profile: &str) -> Option<&'a SpawnEntry> {
-    // bd-rkx8: highest incarnation wins — names are stable across
-    // respawns, so first-match could return a stale generation.
     best_generation(
         entries
             .entries()
@@ -325,8 +319,6 @@ pub fn resolve_pane_entry_nth<'a>(
     nth: usize,
 ) -> Option<&'a SpawnEntry> {
     let serves = |e: &SpawnEntry| e.profile.as_deref() == Some(profile) || e.name == profile;
-    // First appearance of each name fixes the slot order; spawn order is the
-    // order the crew created the copies in, and it is what `nth` means.
     let mut slots: Vec<&SpawnEntry> = Vec::new();
     for e in entries.entries().iter().filter(|e| serves(e)) {
         if !slots.iter().any(|s| s.name == e.name) {
@@ -407,8 +399,6 @@ pub fn reap_dead_registry_rows(project: &str, c: &mut Client) -> usize {
             return 0;
         }
     };
-    // bd-j0b5: resolve the process backend once so the pure clear can decide;
-    // config load is best-effort and mirrors the multiplexer precedence.
     let backend = crate::config::Config::load()
         .map(|cfg| crate::backend::factory::resolve_backend_name(&cfg))
         .unwrap_or_else(|_| {
@@ -461,8 +451,6 @@ pub fn dead_registry_rows(project: &str, c: &mut Client) -> Vec<(String, String)
         return Vec::new();
     };
     let live: std::collections::HashSet<String> = panes.into_iter().map(|p| p.pane_id).collect();
-    // bd-p09m: same backend resolution as the reap, so the gauge agrees
-    // with the clear.
     let backend = crate::config::Config::load()
         .map(|cfg| crate::backend::factory::resolve_backend_name(&cfg))
         .unwrap_or_else(|_| {
@@ -478,14 +466,10 @@ pub fn resolve_pane_by_harness<'a>(
     entries: &'a LiveRegistry,
     harness: &str,
 ) -> Option<&'a SpawnEntry> {
-    // bd-rkx8: highest incarnation wins, ties keep insertion order.
     best_generation(entries.entries().iter().enumerate().filter(|(_, e)| {
         if let Some(h) = &e.harness {
             return h == harness;
         }
-        // Legacy entry (no harness column): the catalog resolves the
-        // profile's harness — the pane was spawned with it. A catalog load
-        // failure degrades to `false` (no match) rather than panicking.
         let Some(profile_name) = e.profile.as_deref() else {
             return false;
         };
@@ -520,7 +504,7 @@ pub fn ensure_crew(plan: &CrewPlan, wf_name: &str) -> Result<()> {
 /// (captain/omp session labeled like the project) only warns — with
 /// `--reuse WORKSPACE` the named workspace is bound instead (never blocked,
 /// never reaped).
-#[allow(clippy::too_many_arguments)] // one param per CLI flag, mirrors cmd_spawn
+#[allow(clippy::too_many_arguments)]
 pub fn pre_spawn_crew(
     cfg: &Config,
     project: &str,
@@ -532,9 +516,6 @@ pub fn pre_spawn_crew(
     retire_orphans: bool,
 ) -> Result<PaneRunCtx> {
     ensure_crew(plan, wf_name)?;
-    // Rex door: a set REX_SESSION selects the rex multiplexer arm below —
-    // the hc `Client` path after it stays exactly as it was. No
-    // `Client::connect` on the rex arm.
     if rex_door_selected(cfg) {
         return pre_spawn_crew_rex(
             cfg,
@@ -558,8 +539,6 @@ pub fn pre_spawn_crew(
     let label = crate::swarm_label(project);
     let split = crate::project_workspaces(&mut c, project)?;
 
-    // --reuse: bind the named workspace (caller-owned, never reaped, and the
-    // orphan guard skips it — it IS the target).
     if let Some(ws_id) = reuse {
         if !split
             .owned
@@ -578,8 +557,6 @@ pub fn pre_spawn_crew(
     }
     let orphans = split.owned;
 
-    // bd-627z.3: a foreign workspace (captain/omp session labeled like the
-    // project) is not the stale-pane race — warn and proceed, never close it.
     if !split.foreign.is_empty() {
         let detail: Vec<String> = split
             .foreign
@@ -598,8 +575,6 @@ pub fn pre_spawn_crew(
         );
     }
 
-    // Fresh workspace: stale panes would race the new crew — same contract as
-    // cmd_spawn.
     if !orphans.is_empty() {
         let detail: Vec<String> = orphans
             .iter()
@@ -621,8 +596,6 @@ pub fn pre_spawn_crew(
                     eprintln!("flywheel: close {} failed: {e:#}", ws.workspace_id);
                 }
             }
-            // bd-bfwj: closing kills these panes — reap their registry rows
-            // now so no later dispatch resolves them.
             reap_dead_registry_rows(project, &mut c);
         } else {
             bail!(
@@ -677,9 +650,6 @@ pub(crate) fn registry_fallback_route<F>(
 where
     F: FnOnce() -> Option<ModelRegistry>,
 {
-    // Stage-typed classify: the pane spawn hop is an INPUT failure, and only a
-    // rate limit opens it. A timeout or an auth failure must re-raise — those
-    // do not get better by changing the model.
     let cf = crate::failure::classify_with_action_stage(
         error,
         None,
@@ -721,7 +691,6 @@ pub(crate) fn model_fallback_intent(
             harness: route.harness.clone(),
             location: crate::agent_ref::BindingLocation::Pane,
         },
-        // The gate above is RateLimit, so the reason kind is fixed here.
         crate::agent_ref::RebindReason::ModelFallback {
             kind: "rate_limit".into(),
             evidence,
@@ -748,11 +717,6 @@ fn shell_gate_refusal(name: &str, pane_id: &str) -> anyhow::Error {
 /// A set, non-empty `REX_SESSION` means this process runs inside rex, so the
 /// doors target rex; empty/missing keeps today's hc `Client` path.
 pub(crate) fn rex_door_selected(cfg: &crate::config::Config) -> bool {
-    // NOT `REX_SESSION`: since bd-rex-default-plane `auto` is rex-primary
-    // whatever the env says, so a door keyed on the env split the planes —
-    // measured 2026-10-31 with the rex CLI restored: `rex list` showed the
-    // spawned session, while `flywheel status` took the hc client and
-    // reported "no flywheel swarm". One resolved plane (bd-mknvb), one door.
     crate::backend::factory::resolve_plane(cfg).plane == crate::backend::factory::Plane::Rex
 }
 
@@ -790,7 +754,6 @@ pub(crate) fn rex_env_command(
     args: &[String],
 ) -> String {
     let mut parts = Vec::new();
-    // BTreeMap iterates sorted, so the prefix order is deterministic.
     for (k, v) in env {
         if k == "HC_SOCKET_PATH"
             || k == "HC_SESSION"
@@ -844,14 +807,10 @@ pub(crate) fn wait_rex_shell_ready(
                 }
             }
             Err(e) => {
-                // Fail-open inside the budget (transport blip at startup),
-                // fail-closed at the deadline below.
                 list_err = Some(anyhow!("{e:#}"));
             }
         }
         if start.elapsed() >= timeout {
-            // A backend we could never read is the real reason — say so
-            // instead of blaming the shell.
             if !saw_ok && let Some(e) = list_err {
                 return Err(e.context(format!("rex: cannot read status for {name} ({pane_id})")));
             }
@@ -909,8 +868,6 @@ fn spawn_crew_into_rex(
                 *n
             };
             let name = crew_agent_name(wf_name, role, ordinal);
-            // --reuse idempotency: same rule as the hc path, read through
-            // the backend instead of the hc client.
             let live_agents = backend.agent_list()?;
             let existing = registry
                 .iter()
@@ -947,9 +904,6 @@ fn spawn_crew_into_rex(
                 let occupied: std::collections::HashSet<String> =
                     agents.iter().map(|a| a.pane_id.clone()).collect();
                 let pane_ids: Vec<String> = panes.iter().map(|p| p.pane_id.clone()).collect();
-                // A seat whose model travels by env can never reuse a
-                // pre-existing pane (same reason as the hc path: the env
-                // is fixed at split, and rex has no env map to patch later).
                 let reusable = if env_model_pin.is_some() {
                     None
                 } else {
@@ -977,20 +931,12 @@ fn spawn_crew_into_rex(
                         split.pane_id
                     }
                 };
-                // Shell gate BEFORE typing the launch: program_status must be
-                // idle or working within 15s. Fail CLOSED like the hc
-                // path — never dispatch into a booting shell.
                 wait_rex_shell_ready(backend, &pane_id, &name, &pane_id, Duration::from_secs(15))?;
-                // No env map on split: the pin + model pin ride as an
-                // `env K=V` command prefix, then rename binds the name.
                 let command = rex_env_command(&pane_env, harness, &agent_args);
                 backend
                     .pane_run(&pane_id, &command)
                     .map_err(|e| anyhow!("pane crew: rex run for {name} ({pane_id}): {e:#}"))?;
                 if let Err(e) = backend.agent_rename(&pane_id, Some(name.as_str())) {
-                    // Warn like the hc path's post-hoc rebind: the pane
-                    // runs; the readiness wait + registry below still hold
-                    // the name contract.
                     eprintln!("flywheel: warn: rex rename {pane_id} → {name} failed: {e:#}");
                 }
                 crate::bind_pane_mail_identity(
@@ -1000,9 +946,6 @@ fn spawn_crew_into_rex(
                     &pane_id,
                     mail_identity.as_deref(),
                 );
-                // Readiness: the agent reports instead of the shell prompt.
-                // Best-effort like the hc path — a wait failure degrades
-                // to __send semantics, never a panic.
                 if let Err(e) = backend.agent_wait(
                     &name,
                     &[AgentStatus::Idle, AgentStatus::Working],
@@ -1049,7 +992,7 @@ fn spawn_crew_into_rex(
 
 /// Rex arm of [`pre_spawn_crew`]: same reuse/orphan contract over
 /// `&dyn MultiplexerBackend`, never `Client::connect`.
-#[allow(clippy::too_many_arguments)] // same flag set as pre_spawn_crew
+#[allow(clippy::too_many_arguments)]
 fn pre_spawn_crew_rex(
     cfg: &Config,
     project: &str,
@@ -1070,9 +1013,6 @@ fn pre_spawn_crew_rex(
     let backend = crate::backend::factory::multiplexer_backend(cfg)?;
     let label = crate::swarm_label(project);
     let ws_list = backend.workspace_list()?;
-    // Owned = the swarm label (or the recorded spawn-meta label); rex has no
-    // captain/omp sessions to classify as foreign, so anything else is
-    // unrelated and left alone.
     let spawn_meta = state::load_spawn_meta(project);
     let owned: Vec<_> = ws_list
         .iter()
@@ -1148,7 +1088,7 @@ fn pre_spawn_crew_rex(
         retained: retain,
     })
 }
-#[allow(clippy::too_many_arguments)] // one param per caller mirror, mirrors cmd_spawn
+#[allow(clippy::too_many_arguments)]
 fn spawn_crew_into(
     cfg: &Config,
     project: &str,
@@ -1159,13 +1099,6 @@ fn spawn_crew_into(
     ws_id: &str,
     label: &str,
 ) -> Result<LiveRegistry> {
-    // Preserve pre-existing registry entries (swarm panes, prior crew) —
-    // only entries whose NAME we are about to (re)spawn are replaced, so a
-    // --reuse re-run re-binds the crew without clobbering unrelated panes.
-    // bd-op8b: prune rows whose pane is gone everywhere first — dead rows
-    // otherwise win the first profile-match in dispatch resolution and send
-    // fresh-crew work into closed panes (live proof fw-composed-2026-09-23).
-    // Fail-open: an unlistable backend keeps every row (existing behavior).
     let mut registry: Vec<SpawnEntry> = state::load_spawn_registry(project);
     let mut live_known: Option<std::collections::HashSet<String>> = c
         .pane_list()
@@ -1180,16 +1113,12 @@ fn spawn_crew_into(
         }
     }
     let mut ordinals: BTreeMap<String, u32> = BTreeMap::new();
-    // pane-split chain: first agent on the root pane, rest split down.
     let mut prev: Option<String> = None;
     let dir = crate::project_dir(cfg, project);
     for (role, count) in &plan.members {
         let profile = catalog
             .get(role)
             .ok_or_else(|| anyhow!("pane crew: unknown profile @{role} (flywheel profile list)"))?;
-        // ADR-0007 D1: resolve the slot ladder first — a slot-aliased profile
-        // (@cheap/@standard/@premium) inherits the slot's harness. The raw
-        // profile.harness is empty by design on those profiles.
         let model_reg =
             ModelRegistry::load_routing().map_err(|e| anyhow!("pane crew: model registry: {e}"))?;
         let (harness_resolved, _slot_model) =
@@ -1202,11 +1131,6 @@ fn spawn_crew_into(
                 *n
             };
             let name = crew_agent_name(wf_name, role, ordinal);
-            // --reuse / re-run idempotency: a registry entry for this name
-            // whose pane is STILL ALIVE binds instead of re-spawning (agent
-            // names are taken — re-spawning would fail with agent_name_taken).
-            // A stale entry (pane closed/respawned) is re-spawned: its pane
-            // is gone, and binding it would dispatch into a dead pane.
             let live_panes = c.agent_list()?;
             let existing = registry
                 .iter()
@@ -1217,25 +1141,14 @@ fn spawn_crew_into(
                         .any(|a| a.pane_id == e.pane_id && a.workspace_id == ws_id)
                 })
                 .cloned();
-            // bd-pin-public-plane-s-easy.2: draw the mail PIN BEFORE the
-            // pane exists so the pane env carries AGENT_NAME/FLYWHEEL_MAIL_AS
-            // (hc injects env only at split/create).
             let mail_identity = crate::pinned_mail_identity(cfg, project, &name, harness);
             let (agent_pane_id, name, model_pin) = if let Some(e) = existing {
                 eprintln!(
                     "  crew {}: reusing {} ({}) @{}",
                     label, name, e.pane_id, role
                 );
-                // A reused live pane keeps the provenance its own spawn
-                // recorded (ADR-0013 P1-7) — this path resolves no plan.
                 (e.pane_id.clone(), name.clone(), e.model_pin.clone())
             } else {
-                // bd-crlx: resolve the launch plan BEFORE the pane exists.
-                // hc injects env only at split/create, and a pane's env is
-                // fixed for the life of the process it launches — so a model
-                // the harness cannot take as argv (opencode's root command has
-                // no `--model`) has to be pinned into the pane env at creation
-                // time. There is no "set it afterwards".
                 let (agent_args, model_pin, env_model_pin): (
                     Vec<String>,
                     Option<String>,
@@ -1251,28 +1164,12 @@ fn spawn_crew_into(
                     pane_env_for_launch(cfg, mail_identity.as_deref(), env_model_pin.as_deref())?;
                 let pane_id = match &prev {
                     None => {
-                        // bd-lifecycle-occupied-pane-wedge-07tx: PROBE BEFORE
-                        // BIND. The old code took panes.first() blind; an
-                        // occupied root pane (unnamed shell occupant) made
-                        // agent.start fail agent_pane_busy and the packing
-                        // crew wedged in a not-ready retry loop. Pick the
-                        // first pane in the workspace whose agent slot is
-                        // EMPTY (no live agent session on it); if none is,
-                        // SPLIT a fresh pane off the root instead of binding
-                        // into an occupied one.
                         let panes = c.pane_list()?;
                         let agents = c.agent_list()?;
                         let occupied: std::collections::HashSet<String> =
                             agents.iter().map(|a| a.pane_id.clone()).collect();
                         let pane_ids: Vec<String> =
                             panes.iter().map(|p| p.pane_id.clone()).collect();
-                        // bd-crlx: a seat whose model travels by env can never
-                        // reuse a pre-existing pane. Those panes were created by
-                        // `workspace_create` with a different env, and a
-                        // process's env is fixed at its start — reusing one
-                        // would launch the agent unpinned, which is exactly the
-                        // silent model downgrade this pin exists to prevent.
-                        // Always split a fresh pane so the pin is really there.
                         let reusable = if env_model_pin.is_some() {
                             None
                         } else {
@@ -1306,58 +1203,19 @@ fn spawn_crew_into(
                         split.pane_id
                     }
                 };
-                // bd-d7zu: WAIT FOR THE SHELL BEFORE TYPING THE LAUNCH ARG.
-                // hc types AGENT_ARG into the pane PTY the moment
-                // `agent.start` is called, and a fresh pane's shell is still
-                // booting (zsh running .zshrc, prompt not yet rendered, PTY in
-                // CANONICAL mode). The peer-aware template renders to a ~2.6KB
-                // single-quoted arg; typed into a booting shell it splits
-                // mid-quote and zsh parks at the PS2 continuation prompt with
-                // the agent never starting — hc.rs documents this as
-                // the 2026-08-18 "coder2/coder3 dead-on-spawn" incident.
-                //
-                // `cmd_crew_control` (the relaunch path) has always gated on
-                // `wait_shell_prompt`; this crew path did not, which is why
-                // `flywheel crew control relaunch` survives and
-                // `workflow compose --run` dead-on-spawns.
-                //
-                // Fail CLOSED, unlike the relaunch path's warn-and-continue.
-                // Typing the launch arg into a shell that never reached its
-                // line editor does not merely risk a bad spawn: hc rejects
-                // it (`agent_pane_busy`), the readiness wait then reports
-                // `agent_not_running`, and the dispatch degrades to
-                // "dispatching anyway" — which surfaces as the permanent,
-                // unactionable `agent <name> not found in toron`. Proceeding
-                // past a failed gate is the defect (bd-d7zu principle
-                // `fail-closed`); refuse with the real reason instead. A
-                // measured fresh pane needs ~770ms, so a 15s budget that
-                // expires is a genuinely broken shell, not a slow one.
                 if !crate::hc_support::wait_shell_prompt(c, &pane_id, Duration::from_secs(15)) {
                     return Err(shell_gate_refusal(&name, &pane_id));
                 }
-                // AGENT_ARG / the pane-env pin were resolved BEFORE the pane
-                // existed (bd-crlx): the plan form (not the argv-only view) so
-                // the registry row below carries the same resolved Muse/slot
-                // pin the launch actually carries, honoring Profile.provider
-                // through the same registry pin as cmd_spawn /
-                // spawn_launch_plan (ADR-0027 compose gap, ADR-0013 P1-7).
-                // ADR-0024 W1a: pane spawn one-shot registry-fallback for rate_limit (bd-42fs pattern)
                 let agent =
                     match crate::start_agent_with_retry(c, &name, harness, &pane_id, &agent_args) {
                         Ok(a) => a,
                         Err(e) => {
-                            // A registry we cannot read, a failure that is not a
-                            // rate limit, or a model with no fallback all re-raise
-                            // the original error untouched.
                             let route = registry_fallback_route(
                                 &e.to_string(),
                                 &profile.model,
                                 harness,
                                 || match ModelRegistry::load_routing() {
                                     Ok(registry) => Some(registry),
-                                    // An unparseable models.toml is LOUD by
-                                    // design. Do not let the fallback path
-                                    // swallow it into a bare "no fallback".
                                     Err(err) => {
                                         eprintln!(
                                             "pane crew: model registry unreadable \
@@ -1368,11 +1226,6 @@ fn spawn_crew_into(
                                 },
                             );
                             let Some(route) = route else { return Err(e) };
-                            // bd-oc-bare-spawn-model-argv-zbzt: argv for the
-                            // interactive re-launch, never the headless form.
-                            // A route this pane cannot carry (opencode's pin
-                            // travels by env, and this pane's env is already
-                            // fixed) refuses here, before the rebind journal.
                             let fallback_args = crate::interactive_pane_args(
                                 &route.harness,
                                 &route.model,
@@ -1387,7 +1240,6 @@ fn spawn_crew_into(
                                     route.model_id
                                 )
                             })?;
-                            // GS-043 I4: journal before ModelEntry.fallback hop.
                             let intent = model_fallback_intent(
                                 project,
                                 &name,
@@ -1412,8 +1264,6 @@ fn spawn_crew_into(
                             })?
                         }
                     };
-                // bd-pin-public-plane-s-easy.2: bind the pane identity now
-                // that the pane exists (pane → pin bridge + registry).
                 crate::bind_pane_mail_identity(
                     cfg,
                     project,
@@ -1421,12 +1271,6 @@ fn spawn_crew_into(
                     &agent.pane_id,
                     mail_identity.as_deref(),
                 );
-                // The first dispatch fires as soon as the engine runs step 1 —
-                // a still-booting agent rejects prompts (`agent_not_ready`).
-                // Wait for the pane to settle idle before returning
-                // (best-effort: a wait failure degrades to the __send landing
-                // semantics, which classify not-ready as a per-step error,
-                // never a panic).
                 if let Err(e) = c.agent_wait(&name, &[AgentStatus::Idle], Some(90_000)) {
                     eprintln!(
                         "flywheel: crew {name} readiness wait failed (dispatching anyway): {e}"
@@ -1435,21 +1279,14 @@ fn spawn_crew_into(
                 (agent.pane_id.clone(), name.clone(), model_pin)
             };
             prev = Some(agent_pane_id.clone());
-            // bd-rkx8: generation past the highest on record — names are
-            // stable across respawns, so the new row must outrank any
-            // surviving row for resolution and readiness.
             let incarnation = next_incarnation(&registry, &name);
             registry.retain(|e| e.name != name);
-            // bd-627z.4: the pin (drawn pre-split above) binds this pane's
-            // agent deterministically — assign resolves through it.
             registry.push(SpawnEntry {
                 pane_id: agent_pane_id.clone(),
                 name: name.clone(),
                 profile: Some(role.clone()),
                 harness: Some(harness.clone()),
                 model: None,
-                // ADR-0013 P1-7/P1-8: the same resolved plan the pane launched
-                // with — pin + bounded skills digest, never a second resolution.
                 model_pin,
                 skills_digest: crate::profile::skills_digest(&profile.skills),
                 mail_identity,
@@ -1458,20 +1295,13 @@ fn spawn_crew_into(
                 harness_session: None,
             });
             eprintln!("  crew {}: {} ({}) @{}", label, name, agent_pane_id, role);
-            // bd-qx0z: panes split here are live by construction — track
-            // them so the returned LiveRegistry covers the fresh crew even
-            // though the load-time snapshot predates the splits.
             if let Some(live) = live_known.as_mut() {
                 live.insert(agent_pane_id.clone());
             }
         }
     }
-    // Persist the crew registry (pane_id, name, profile) — `__send`'s auto-
-    // heal re-binds lost names from it.
     state::save_spawn_registry(project, &registry)?;
     Ok(match live_known {
-        // Fail-open twin of the prune above: with no pane listing the live
-        // set is exactly what we hold — keeps every row (existing behavior).
         Some(live) => LiveRegistry::prune(registry, &live),
         None => {
             let all: std::collections::HashSet<String> =
@@ -1533,8 +1363,6 @@ pub const DISPATCH_HOLD_BOUND_MS: u64 = 600_000;
 fn dispatch_pool() -> &'static toron_workflow::DispatchPool {
     DISPATCH_POOL.get_or_init(|| {
         toron_workflow::DispatchPool::new(toron_workflow::DispatchConfig {
-            // Pane crews are already capped at 5; this is a backstop, not the
-            // crew size.
             max_concurrency: 16,
             hold_bound_ms: DISPATCH_HOLD_BOUND_MS,
         })
@@ -1579,7 +1407,6 @@ pub fn fence_action_for_effects(
     use toron_core::busy_owner::BusyOwnerEffect as E;
     for e in effects {
         match e {
-            // Re-check at the fence's deadline. Do NOT extend it.
             E::SleepUntilDeadline { until_ms, .. } | E::HoldContinued { until_ms, .. } => {
                 return FenceAction::Park {
                     until_ms: *until_ms,
@@ -1590,7 +1417,6 @@ pub fn fence_action_for_effects(
             E::Released { .. } | E::GenerationAdvanced { .. } | E::ReleaseIgnored { .. } => {}
         }
     }
-    // No decisive effect: contention, never permission to send.
     FenceAction::CapContention
 }
 
@@ -1608,8 +1434,6 @@ pub fn acquire_dispatch_fence(agent: &str, now_ms: u64) -> Result<FenceOutcome<'
                 "fence refused for {agent} but reported no park or expiry reason"
             )),
             FenceAction::ForkAndRetry => {
-                // Advance the generation so a stale worker cannot reclaim the
-                // agent, then hand the caller a fresh acquire.
                 let _ = pool.fork_rebind(agent);
                 Ok(FenceOutcome::ForkAndRetry)
             }
@@ -1659,9 +1483,6 @@ pub fn fresh_session_respawn_args(project: &str, name: &str, kind: &str) -> Vec<
 
 pub fn harness_override_conflicts(profile_harness: &str, spec_harness: Option<&str>) -> bool {
     match spec_harness {
-        // An EMPTY profile harness (ADR-0007 slot-inherit) never conflicts:
-        // the profile resolves its harness from the slot at spawn time, so
-        // any explicit override is simply authoritative for the step.
         Some(h) if !h.trim().is_empty() => !profile_harness.is_empty() && h != profile_harness,
         _ => false,
     }
@@ -1686,15 +1507,11 @@ pub fn pane_dispatch(
     copy_index: Option<usize>,
 ) -> Result<Value> {
     let Action::DispatchJob { spec, .. } = action else {
-        // bd-omwg: a Spawn reaching the runner is an engine-routing bug —
-        // fail closed, never record it as done (ADR-0010 Spec E).
         if matches!(action, Action::Spawn { .. }) {
             bail!(
                 "pane runner: Action::Spawn must be handled by the engine (run_spawn) — routing bug"
             );
         }
-        // Recorded, not dispatched — the P10.3 backward-compat surface for
-        // non-dispatch actions (byte-identical to the no-op runner).
         return Ok(json!({ "action": action.type_name() }));
     };
     let profile_ref = headless::dispatch_spec_profile(spec)
@@ -1703,23 +1520,11 @@ pub fn pane_dispatch(
     let profile = catalog.get(profile_name).ok_or_else(|| {
         anyhow!("pane dispatch: unknown profile @{profile_name} (flywheel profile list)")
     })?;
-    // ADR-0024 Spec 2: DispatchSpec.context fresh = new session.
-    // Honoring: map fresh onto a new spawn pane (pane.rs respawn split).
-    // For Spawn jobs, launch_spawn_job skips reuse when context==fresh.
-    // For dispatch, we log the fresh request; the crew pane's transcript is
-    // logically fresh for this dispatch (embedding ensures new session).
     if spec.context == Some(toron_workflow::schema::ContextMode::Fresh) {
         eprintln!(
             "pane dispatch: dispatch_job @{profile_name} requests context=fresh — new session (honored: fresh maps to new spawn pane)"
         );
     }
-    // bd-42fs step 5 / bd-lvyi: a per-step harness override (spec.harness)
-    // resolves to a crew pane OF THAT HARNESS when one exists (the crew
-    // pre-spawns per profile, but a squad can contain a pane whose harness
-    // matches the override — e.g. a debate squad with an opencode reviewer
-    // pane); error clearly when no pane of the overridden harness exists.
-    // Crew pre-spawn stays profile-based; the override only reroutes THIS
-    // step's dispatch.
     let mut override_entry: Option<&SpawnEntry> = None;
     if let Some(override_h) = headless::dispatch_spec_harness(spec)
         && harness_override_conflicts(&profile.harness, Some(override_h))
@@ -1733,11 +1538,6 @@ pub fn pane_dispatch(
                 override_entry = Some(e);
             }
             None => {
-                // bd-ytr6: the pin check compares raw profile.harness while
-                // spawn stores the resolved harness, so on hosts where
-                // models.toml defaults short-circuit slot aliases the pin can
-                // name a harness no pane runs. Fall back to the step's @role
-                // pane if one exists; only bail when neither exists.
                 if let Some(role_entry) = resolve_role_slot(entries, profile_name, copy_index)? {
                     eprintln!(
                         "flywheel: WARNING step @{profile_name} pins harness={override_h} but no {override_h} pane exists; dispatching to @{profile_name} pane {} (harness={})",
@@ -1759,13 +1559,6 @@ pub fn pane_dispatch(
             }
         }
     }
-    // Role conditioning (Spec C): the behavior preamble is prepended INSIDE
-    // `__send --profile` (bd-gsvn.1) — the ONE conditioning site shared by
-    // the pane runner and both loop paths. The runner passes the raw stage
-    // prompt (or goal fallback) and the profile name.
-    // Same prompt order as headless: an inline task is the mission. A stage
-    // is the fallback. Pane used to drop `spec.task`, so a repair pass ran
-    // the stage boilerplate instead of the iteration instructions.
     let mut base = match headless::dispatch_spec_task(spec) {
         Some(task) if !task.trim().is_empty() => task.to_string(),
         _ => match headless::dispatch_spec_stage(spec) {
@@ -1782,19 +1575,11 @@ pub fn pane_dispatch(
         }
     }
     let prompt = base;
-    // @role -> running pane: a per-step harness override's matched pane
-    // wins; otherwise profile column first, name fallback. bd-op8b: the
-    // resolved target is logged — dispatching into a dead pane used to be
-    // silent until the bare leaf downstream.
     let entry: SpawnEntry = match override_entry
         .or(resolve_role_slot(entries, profile_name, copy_index)?)
         .cloned()
     {
         Some(e) => e,
-        // A registry row means the pane WAS spawned; the prune only knows
-        // hc's listing, so a pane listed moments later looks absent.
-        // Settle for it before failing the whole run (bd-ietv). bd-0s0y: settle
-        // for THIS copy's pane, or copy 1 would settle onto copy 0's.
         None => match settle_for_role_slot(project, profile_name, copy_index) {
             Some(entry) => {
                 eprintln!(
@@ -1803,11 +1588,6 @@ pub fn pane_dispatch(
                 );
                 entry
             }
-            // bd-07m2: settling failed, so now the cause is knowable. A fan-out
-            // copy that is short gets the slot-counted shortfall (the crew
-            // genuinely lacks copies); anything else keeps the original
-            // "no crew pane" wording, which is the honest verdict when the role
-            // was never spawned at all.
             None => match copy_index {
                 Some(i) => return Err(shortfall_error(entries, profile_name, i)),
                 None => bail!(
@@ -1826,8 +1606,6 @@ pub fn pane_dispatch(
         "flywheel: dispatch @{} → {} ({})",
         profile_name, entry.name, entry.pane_id
     );
-    // context: fresh means an empty transcript. Respawn with --force: a
-    // healthy idle agent would otherwise no-op and keep the old session.
     if spec.context == Some(toron_workflow::schema::ContextMode::Fresh) {
         let kind = entry
             .harness
@@ -1853,39 +1631,13 @@ pub fn pane_dispatch(
         }
     }
 
-    // Subprocess-reuse (Spec A): the `__send` leaf owns the confirmed send
-    // (landing wait, last-sent dedup, auto-heal, Spec C conditioning) — no
-    // new dispatch code. A freshly spawned agent may still be booting when
-    // the first step fires: `agent_not_ready` is transient — retry with
-    // backoff (bounded; a persistent not-ready surfaces as a per-step error,
-    // never a hang).
-    // P1+P2: transient dispatch retries ride the framework's remote stack
-    // (`policy::remote`) — 6 attempts, 5s base, 10s cap — with the
-    // consecutive-failure breaker (5/60s) as its ARGUMENT, not as a second
-    // breaker beside it. Open breaker = fast escalate, never a hammered pane.
-    // The envelope lives in `dispatch_policy` below; the loop itself needs a
-    // live pane, so the stack's ORDER is pinned by the unit tests there.
-    // bd-jvka: the breaker is consulted INSIDE the chain — before every
-    // attempt, so an open breaker stops the chain instead of letting it
-    // hammer the pane for six more tries.
-    // bd-fen3: the busy-owner fence, adopted from toron-workflow. This replaces
-    // the bd-5llv in-process idle gate, which is DELETED rather than kept
-    // alongside — one concern, one mechanism. The fence owns the hold bound and
-    // does not restart it on HoldContinued, the pool enforces one-in-flight per
-    // agent so two dispatches cannot race into one agent, and FencedStale closes
-    // the read-then-rebind race the old gate had no generation check for.
     let fence = acquire_dispatch_fence(&entry.name, unix_millis())?;
-    // One refusal, two shapes: a park can name its deadline and the other two
-    // cannot, so the tail is shared rather than copied into both arms.
     let fenced_tail = "— refusing to send a second prompt into an agent that already holds one. \
                        The busy-owner fence requires a durable park, which toron-workflow's \
                        engine has no step for; see bd-fen3. Give each concurrent stage its \
                        own agent.";
     let _permit = match fence {
         FenceOutcome::Send(p) => Some(p),
-        // bd-fen3: `until_ms` is the part a caller has to act on. "Busy" alone
-        // cannot tell "retry in a moment" from "this agent is held for another
-        // ten minutes", and those are different decisions.
         FenceOutcome::Park { until_ms } => {
             let wait_s = until_ms.saturating_sub(unix_millis()) / 1_000;
             return Err(anyhow!(
@@ -1901,28 +1653,12 @@ pub fn pane_dispatch(
             ));
         }
     };
-    // bd-mukq: 429 reroute state — the CURRENT send target (starts at the
-    // resolved entry) plus the attempted profiles (starts at the step's
-    // own). A 429 swaps the target to a live fallback-profile pane and
-    // re-drives the same loop ONCE; the second 429 fails loud with a
-    // trail instead of redriving the exhausted route.
     let mut attempt_entry: &SpawnEntry = &entry;
     let mut attempt_profile = profile_name.to_string();
     let mut attempted: Vec<String> = vec![profile_name.to_string()];
     let mut reroute_trail: Vec<Value> = Vec::new();
     let rate_limit_kind = crate::failure::FailureKind::RateLimit.to_string();
-    // bd-jvka: the ROUTE chain and the FALLBACK are separate. The chain
-    // retries ONE route — the breaker is consulted INSIDE it, the budget
-    // bounds it, the attempt timeout is ON the call. The 429 fallback picks
-    // the NEXT route and runs a NEW chain, so the fallback is OUTSIDE the
-    // retry (effect-kernel law 10) and the new route gets its own budget.
     'route: loop {
-        // ADR-0018 §3 item 5: the chain IS the framework's remote stack, with
-        // the breaker as its argument (there is no second breaker beside it).
-        // The framework calls the attempt through a 'static closure, so the
-        // route's data is owned here - cloned once per chain, never borrowed.
-        // `send_*` are the closure's own copies: the route's live values stay
-        // owned by the loop, which reroutes and retries them.
         let send_agent = attempt_entry.name.clone();
         let send_profile = attempt_profile.clone();
         let send_project = project.to_string();
@@ -1936,8 +1672,6 @@ pub fn pane_dispatch(
             move || -> Effect<Value, String, ()> {
                 let exe = match std::env::current_exe() {
                     Ok(exe) => exe,
-                    // A host error, not the child's typed failure: a defect,
-                    // so the framework does not retry it.
                     Err(e) => {
                         return Effect::die(Defect::new(format!(
                             "pane dispatch: resolve the flywheel executable: {e}"
@@ -1952,13 +1686,8 @@ pub fn pane_dispatch(
                     .arg("--confirm")
                     .arg("--profile")
                     .arg(&send_profile);
-                // bd-jvka: the attempt timeout ON the call — a `__send` child
-                // that never exits must not park the dispatch.
                 let output = match crate::proc::run_bounded(&mut cmd, dispatch_attempt_timeout()) {
                     Ok(output) => output,
-                    // The child never came back: a host error, not the child's
-                    // typed failure - a defect, so the framework does not
-                    // retry it.
                     Err(crate::proc::ProcError::Timeout { .. }) => {
                         return Effect::die(Defect::new(format!(
                             "__send for @{send_profile} ({send_agent}) exceeded the attempt timeout ({:?}) - the child never exited",
@@ -1980,53 +1709,26 @@ pub fn pane_dispatch(
                         .map(is_transient_dispatch_reason)
                         .unwrap_or(false);
                     if transient {
-                        // bd-lifecycle-occupied-pane-wedge-07tx: bounded-fail-loud.
-                        // The pane is not coming up (occupied bind, dead split,
-                        // stuck boot). The CHAIN turns this into a typed
-                        // transient failure and the step fails loudly once the
-                        // chain is spent — never the old soft ok-payload the
-                        // engine re-drove forever (idle crews + endless
-                        // "@not ready (attempt 1/6)").
                         let reason = v
                             .get("reason")
                             .and_then(Value::as_str)
                             .unwrap_or("transient")
                             .to_string();
-                        // The child's TYPED failure: the framework retries it
-                        // and charges the breaker once per attempt.
                         return Effect::fail(reason);
                     }
-                    // ADR-0022 §3.5 warn-first plan-artifact gate (bd-cvv9): same
-                    // contract as the headless path — warn + tag, never block
-                    // (the W5 flip owns blocking).
                     if crate::phase_chain::plan_artifact_missing(&send_spec, &send_inputs) {
                         eprintln!(
                             "flywheel: phase implement dispatch has NO completed plan artifact — \
                      warn-first gate (ADR-0022 §3.5); step output tagged plan_artifact_missing"
                         );
                     }
-                    // bd-5llv: carry the verdict's `ok` at the TOP level, always.
-                    //
-                    // It used to be set only on the failure path, which meant a
-                    // SUCCESSFUL send produced a receipt with no top-level `ok` at
-                    // all. The breaker's charge read that field, so every success
-                    // fell to the else and recorded a FAILURE — the dispatch COUNT
-                    // predicted failure, not the result. That is why wave-swarm (6
-                    // dispatches) failed every single time while a 2-prompt compose
-                    // always succeeded, and why the error blamed an "unavailable
-                    // pane" when every prompt had in fact landed.
                     let mut out = json!({
                         "profile": send_profile.clone(),
                         "agent": send_agent.clone(),
                         "ok": dispatch_receipt_ok(&v),
                         "send": v.clone(),
                     });
-                    // ADR-0024 W1a: classify pane dispatch failures (rate_limit/timeout/auth)
                     if v.get("ok").and_then(Value::as_bool) == Some(false) {
-                        // bd-5yzp: every failure payload carries ok:false + a
-                        // non-empty error + kind (unknown included) — an
-                        // error-less or kind-less ok:false misroutes as bare
-                        // {error: step failed} downstream (bd-nyrn).
                         let leaf_err = v.get("error").and_then(Value::as_str).unwrap_or("");
                         let err_str =
                             dispatch_failure_error(&send_profile, &send_agent, &raw, leaf_err);
@@ -2040,7 +1742,6 @@ pub fn pane_dispatch(
                     return Effect::succeed(out);
                 }
                 let err = String::from_utf8_lossy(&output.stderr).to_string();
-                // bd-5yzp: never error:'' — stderr, stdout, then scoped fallback.
                 let err_str = dispatch_failure_error(&send_profile, &send_agent, &raw, &err);
                 let cf = crate::failure::classify(&err_str, None, None);
                 Effect::succeed(json!({
@@ -2048,16 +1749,12 @@ pub fn pane_dispatch(
                     "error": err_str,
                     "profile": send_profile.clone(),
                     "agent": send_agent.clone(),
-                    // GS-049 P1-3: phase-bearing failure (ActionStage)
                     "stage": cf.stage,
                     "kind": cf.kind.to_string(),
                     "retryable": cf.retryable,
                 }))
             },
         );
-        // bd-jvka: the FALLBACK is OUTSIDE the chain. The chain is done; only
-        // now may a 429 reroute pick the next route and start a NEW chain (with
-        // its own retry budget).
         let mut out = match chain {
             Ok(out) => out,
             Err(DispatchErr::Transient { reason }) => {
@@ -2079,11 +1776,6 @@ pub fn pane_dispatch(
             }
             Err(DispatchErr::Fatal(msg)) => return Err(anyhow!(msg)),
         };
-        // bd-mukq: 429 reroute — ONE hop to a live fallback-profile pane
-        // (ADR-0026 shared chain; the running agent keeps its model and
-        // session, the self-contained prompt reroutes). No chain or no live
-        // pane, or the second 429, fails LOUD with a trail + hint instead of
-        // redriving exhausted quota.
         if out.get("kind").and_then(Value::as_str) == Some(rate_limit_kind.as_str()) {
             let err_str = out
                 .get("error")
@@ -2100,10 +1792,6 @@ pub fn pane_dispatch(
                         crate::failure::FailureKind::RateLimit,
                         &err_str,
                     );
-                    // GS-043 B2 / I4: ProfileFallback full lifecycle —
-                    // Prepared → InFlight → Settled|Unknown (not Prepared-only).
-                    // Pane path cannot swap model in-session; profile.fallback
-                    // pane hop is the rate_limit reroute here.
                     eprintln!(
                         "flywheel: dispatch @{attempt_profile} rate-limited (429) — rerouting prompt to @{next_profile} ({next_name}), one hop"
                     );
@@ -2135,7 +1823,6 @@ pub fn pane_dispatch(
                                 continue 'route;
                             }
                             Ok(None) => {
-                                // Settled as Unknown: target pane gone mid-hop.
                                 out["reroute"] = json!("target-pane-gone");
                             }
                             Err(e) => {
@@ -2146,9 +1833,6 @@ pub fn pane_dispatch(
                             }
                         }
                     } else {
-                        // B2 residual / I4: empty or disallowed evidence must NOT
-                        // invent a profile hop without journal. Fail-closed —
-                        // journal Unknown, refuse hop (no silent continue).
                         eprintln!(
                             "flywheel: pane 429 ProfileFallback refused — evidence gate closed (I4); no silent hop to @{next_profile}"
                         );
@@ -2183,10 +1867,6 @@ pub fn pane_dispatch(
         if !reroute_trail.is_empty() {
             out["reroute_trail"] = json!(reroute_trail);
         }
-        // ADR-0018 §3 item 5: the breaker's state lives in the framework's
-        // stack, which charged it once per FAILED ATTEMPT inside the chain
-        // and reset it on a success. Charging it here too would be the
-        // second carrier the ADR forbids.
         return Ok(crate::phase_chain::annotate_dispatch_output(
             spec, inputs, out,
         ));
@@ -2270,10 +1950,6 @@ fn map_dispatch_cause(cause: Cause<RemoteError<String>>) -> DispatchErr {
             DispatchErr::Fatal("the dispatch attempt exceeded its timeout".to_string())
         }
         Some(RemoteError::BulkheadFull) => {
-            // bd-fa58: name what it means, not just the kind — the shared
-            // stack admitted no permit in time, so this dispatch never ran.
-            // Dispatches are sequential, so reaching this means the shared
-            // stack itself is saturated, not the pane.
             DispatchErr::Fatal(
                 "the dispatch bulkhead admitted no permit in time — the shared stack is saturated"
                     .to_string(),
@@ -2335,7 +2011,6 @@ fn dispatch_seed() -> u64 {
 /// unrelated failures, so the two spellings coexist on purpose.
 fn dispatch_policy() -> RemotePolicy<Value, String> {
     RemotePolicy {
-        // The framework counts RETRIES after the first attempt.
         retries: MAX_ATTEMPTS.saturating_sub(1),
         backoff: kernel_millis(DISPATCH_BACKOFF),
         ceiling: kernel_millis(DISPATCH_BACKOFF_CAP),
@@ -2346,8 +2021,6 @@ fn dispatch_policy() -> RemotePolicy<Value, String> {
             max_failures: 5,
             reset: kernel_millis(std::time::Duration::from_secs(60)),
         }),
-        // The fallback stays OUTSIDE the stack (bd-jvka): the chain hands the
-        // rate-limit verdict back, and only the caller picks the next route.
         ..Default::default()
     }
 }
@@ -2480,22 +2153,16 @@ pub fn spawn_launch_plan(
         .unwrap_or_default()
         .to_string();
     let workflow = spec["workflow"].as_str().map(str::to_string);
-    // An explicit spawn `harness:` overrides the profile's resolved harness.
     let harness = spec["harness"]
         .as_str()
         .filter(|h| !h.trim().is_empty())
         .or_else(|| spec["resolved"]["spec"]["harness"].as_str())
         .unwrap_or_default()
         .to_string();
-    // ADR-0022 W2: the step's lifecycle phase (typed spec, resolved copy).
     let phase = spec["resolved"]["spec"]["phase"]
         .as_str()
         .filter(|p| !p.is_empty())
         .map(str::to_string);
-    // bd-qlr1: the PLAN form, not the argv-only view. The argv-only view
-    // REFUSES when the harness needs an env-delivered pin, and this path
-    // creates its own pane — so it must resolve the plan and carry the pin to
-    // the split rather than refusing a launch it can actually satisfy.
     let (args, env_model_pin) = match catalog.get(&profile) {
         Some(p) => {
             let plan = crate::profile_launch_plan(&harness, p, phase.as_deref())
@@ -2504,8 +2171,6 @@ pub fn spawn_launch_plan(
         }
         None => (Vec::new(), None),
     };
-    // Degradation is decided by the registry itself so the plan carries the
-    // flag to the drainer (loud at launch, never silent).
     let phase_degraded = match &phase {
         Some(ph) => headless::phase_launch_args(&harness, ph).1,
         None => false,
@@ -2526,10 +2191,6 @@ pub fn spawn_launch_plan(
         context,
     })
 }
-
-// Durable spawn consumer (bd-spawn-pane-consumer-6lmf,
-// bd-spawn-launcher-flip-d8mv)
-// ---------------------------------------------------------------------------
 
 /// One durable spawn claim.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -2575,8 +2236,6 @@ pub struct SpawnClaimStore {
     path: std::path::PathBuf,
 }
 
-// The flip's host wiring belongs to bd-flywheel-host-run-ofcw; until then the
-// consumer surface is intentionally unused.
 #[allow(dead_code)]
 impl SpawnClaimStore {
     /// The live registry: `spawn-claims.json` under flywheel's state dir (the
@@ -2666,8 +2325,6 @@ impl SpawnClaimStore {
 ///
 /// `Err` when the event carries no `spec` object or it does not deserialize —
 /// a malformed job is refused before anything starts.
-// The flip bead wires the drainer to this consumer; until then the surface is
-// intentionally unused (bd-spawn-pane-consumer-6lmf).
 #[allow(dead_code)]
 pub fn spawn_spec_from_job(body: &Value) -> Result<toron_workflow::engine::spawn::SpawnSpec> {
     let spec = body
@@ -2681,8 +2338,6 @@ pub fn spawn_spec_from_job(body: &Value) -> Result<toron_workflow::engine::spawn
 /// The durable spec names the SUB-workflow `workflow_ref`; the legacy promise
 /// payload called it `workflow`. Map it once here and reuse the ONE plan
 /// builder, so the profile/harness/args/phase rules do not fork.
-// The flip bead wires the drainer to this consumer; until then the surface is
-// intentionally unused (bd-spawn-pane-consumer-6lmf).
 #[allow(dead_code)]
 pub fn spawn_launch_plan_from_spec(
     spec: &toron_workflow::engine::spawn::SpawnSpec,
@@ -2703,8 +2358,6 @@ pub fn spawn_launch_plan_from_spec(
 ///
 /// `spawn_key` is the correlation key; `result` mirrors kind-43004 (result) or
 /// kind-43006 (error) depending on `outcome`.
-// The flip bead wires the drainer to this consumer; until then the surface is
-// intentionally unused (bd-spawn-pane-consumer-6lmf).
 #[allow(dead_code)]
 pub fn spawn_terminal_body(
     spec: &toron_workflow::engine::spawn::SpawnSpec,
@@ -2730,8 +2383,6 @@ pub fn spawn_terminal_body(
 
 /// One consumed durable spawn job.
 #[derive(Debug, Clone)]
-// The flip bead wires the drainer to this consumer; until then the surface is
-// intentionally unused (bd-spawn-pane-consumer-6lmf).
 #[allow(dead_code)]
 pub struct SpawnJobOutcome {
     /// The claim that admitted the start.
@@ -2755,8 +2406,6 @@ pub struct SpawnJobOutcome {
 /// start could double-run). A KNOWN failed launch releases the claim (no child
 /// exists, so a retry is legitimate) and still yields a terminal error body:
 /// the run must not hang.
-// The flip bead wires the drainer to this consumer; until then the surface is
-// intentionally unused (bd-spawn-pane-consumer-6lmf).
 #[allow(dead_code)]
 pub fn consume_spawn_job(
     claims: &SpawnClaimStore,
@@ -2801,8 +2450,6 @@ pub fn consume_spawn_job(
     };
     match launch(plan) {
         Ok(receipt) => {
-            // Best-effort: the pane exists, so a bookkeeping miss must not
-            // turn a started child into a failed consume.
             let _ = claims.record_receipt(&spec.spawn_key, &receipt);
             let outcome = Ok(receipt.clone());
             Ok(SpawnJobOutcome {
@@ -2859,12 +2506,8 @@ pub async fn drain_spawn_sink(
         }
         for id in ids {
             if !seen.insert(id.clone()) {
-                // Replay re-push (the resume re-executes run_spawn) — this
-                // promise was already settled; never launch twice.
                 continue;
             }
-            // ADR-0043: no vendor promise holds the spec any more; the engine
-            // keeps the prepared SpawnSpec behind the announced key.
             let Some(spec) = engine.spawn_spec(&id) else {
                 eprintln!("flywheel: spawn drain: no spec for spawn key {id} — skipping");
                 continue;
@@ -2902,9 +2545,6 @@ pub async fn drain_spawn_sink(
                 }
                 Err(e) => {
                     eprintln!("flywheel: spawn drain: launch {id} failed: {e:#}");
-                    // The run parks on this promise — without a settle it
-                    // hangs forever. Reject it: the job never started is
-                    // a FAILURE, not a fake success (Spec 0 propagation).
                     if let Err(re) = engine.reject_spawn(&id, &e.to_string()).await {
                         eprintln!("flywheel: spawn drain: reject {id} failed: {re}");
                     }
@@ -2930,12 +2570,9 @@ pub fn launch_spawn_job(
     plan: &SpawnJobLaunch,
 ) -> Result<Value> {
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
-    // Reuse a live registry entry of the same name (re-run idempotency,
-    // mirroring spawn_crew_into); else split a fresh pane + start.
     let name = crew_agent_name(wf_name, &format!("spawn-{}", plan.profile), 1);
     let registry = state::load_spawn_registry(project);
     let live_panes = c.agent_list()?;
-    // ADR-0024 Spec 2: `context: fresh` maps to a new spawn pane (never reuse).
     let is_fresh = plan.context.as_deref() == Some("fresh");
     let existing = if is_fresh {
         None
@@ -2959,12 +2596,7 @@ pub fn launch_spawn_job(
             .last()
             .map(|p| p.pane_id.clone())
             .ok_or_else(|| anyhow!("spawn drain: no panes in workspace {ws_id}"))?;
-        // bd-pin-public-plane-s-easy.2: draw the pin BEFORE the split so the
-        // pane env carries AGENT_NAME/FLYWHEEL_MAIL_AS.
         let mail_identity = crate::pinned_mail_identity(cfg, project, &name, &plan.harness);
-        // bd-qlr1: the pin must be in the map BEFORE the split, because
-        // hc injects env only at split/create and a pane's env is fixed for
-        // the life of the process it launches.
         let pane_env =
             pane_env_for_launch(cfg, mail_identity.as_deref(), plan.env_model_pin.as_deref())?;
         let split = crate::hc_support::pane_split(
@@ -2983,12 +2615,6 @@ pub fn launch_spawn_job(
         ) {
             Ok(a) => a,
             Err(e) => {
-                // The rung keys on the PROFILE's model id, which lives in the
-                // catalog, so the catalog is read here — once per failed
-                // spawn. The gate INSIDE `registry_fallback_route` still keeps
-                // `models.toml` off a failure that cannot hop. An unreadable
-                // catalog is loud: it means no rung, never a silently
-                // different launch.
                 let profile_model = match crate::profile::ProfileCatalog::load() {
                     Ok(catalog) => catalog.get(&plan.profile).map(|p| p.model.clone()),
                     Err(err) => {
@@ -2999,8 +2625,6 @@ pub fn launch_spawn_job(
                         None
                     }
                 };
-                // Carry the rung's key alongside the route: the row's `from`
-                // binding and the registry lookup must be one string.
                 let hop = profile_model.as_deref().and_then(|model| {
                     registry_fallback_route(&e.to_string(), model, plan.harness.as_str(), || {
                         match ModelRegistry::load_routing() {
@@ -3016,20 +2640,9 @@ pub fn launch_spawn_job(
                     })
                     .map(|route| (model.to_string(), route))
                 });
-                // Not a rate limit, no catalog, no registry, no rung (or a
-                // rung that is itself unroutable): all re-raise the original
-                // error untouched.
                 let Some((from_model, route)) = hop else {
                     return Err(e);
                 };
-                // argv shape preserved from the hand-rolled hop: no effort
-                // flag and no role flags, unlike the crew hop in
-                // `spawn_crew_into`. bd-oc-bare-spawn-model-argv-zbzt: the
-                // argv must be the INTERACTIVE form — the headless one types
-                // `--model` into opencode's root command, which rejects it (and
-                // this pane's env is already fixed, so the pin cannot ride
-                // there either): refuse rather than kill the pane or run an
-                // unpinned seat.
                 let fallback_args =
                     crate::interactive_pane_args(&route.harness, &route.model, None).map_err(
                         |why| {
@@ -3041,7 +2654,6 @@ pub fn launch_spawn_job(
                             )
                         },
                     )?;
-                // GS-043 I4: journal before ModelEntry.fallback hop.
                 let intent = model_fallback_intent(
                     project,
                     &name,
@@ -3066,8 +2678,6 @@ pub fn launch_spawn_job(
                 })?
             }
         };
-        // bd-pin-public-plane-s-easy.2: bind the pane identity now that the
-        // pane exists.
         crate::bind_pane_mail_identity(
             cfg,
             project,
@@ -3084,9 +2694,6 @@ pub fn launch_spawn_job(
         project,
         state::SpawnEntry::profiled(&pane_id, &name, &plan.profile, &harness, mail_identity),
     );
-    // Readiness (mirrors spawn_crew_into): the first __send must not hit a
-    // booting agent. Best-effort — a wait failure degrades to the __send
-    // landing semantics, never a panic.
     if let Err(e) = c.agent_wait(&name, &[AgentStatus::Idle], Some(90_000)) {
         eprintln!("flywheel: spawn drain {name} readiness wait failed (dispatching anyway): {e}");
     }
@@ -3119,8 +2726,6 @@ pub fn launch_spawn_job(
             mission_err = Some(String::from_utf8_lossy(&output.stderr).to_string());
         }
     }
-    // await: true — the job finishes when the agent returns to Idle after
-    // its mission. Bound by the configured wait timeout (default 30 min).
     if plan.await_job {
         let timeout_ms = cfg.default_timeout_ms.unwrap_or(1_800_000);
         c.agent_wait(&name, &[AgentStatus::Idle], Some(timeout_ms))?;
@@ -3152,9 +2757,6 @@ pub fn local_engine(
     profile: toron_workflow::ProfileResolver,
     workflow: toron_workflow::WorkflowResolver,
 ) -> Result<toron_workflow::WorkflowEngine> {
-    // Dry runs still need a recording seam so control-flow output contains
-    // every dispatch node. The adapter records the action shape only; it
-    // never calls the real host runner, so no external effect is performed.
     let recording_runner: toron_workflow::engine::EffectRunner =
         std::sync::Arc::new(|inv| Ok(json!({ "action": inv.action.type_name() })));
     local_engine_with_journal(
@@ -3164,9 +2766,6 @@ pub fn local_engine(
         workflow,
         Some(recording_runner),
         toron_workflow::engine::EffectJournalMode::Recording,
-        // Dry engine: no effect journal, so no run rows either — the engine
-        // performs nothing, and a row claiming otherwise is the lie the
-        // journal exists to prevent (bd-mi9n).
         None,
     )
 }
@@ -3218,15 +2817,6 @@ fn local_engine_with(
     profile: toron_workflow::ProfileResolver,
     workflow: toron_workflow::WorkflowResolver,
 ) -> Result<toron_workflow::WorkflowEngine> {
-    // bd-mi9n: the journal is claimed in TWO halves — the effect runner the
-    // leaves dispatch through, and the run-lifecycle journal the engine feeds
-    // its own Started → Running → terminal rows through. Both come from one
-    // store, so the run row and its effect rows are keyed by the same run_id.
-    //
-    // bd-ozpj: a JOURNALED constructor that cannot journal REFUSES. The old
-    // code degraded to Recording when the journal could not be opened, so the
-    // leaves would perform their external effects with NO journal row — the
-    // exact thing `Enforced` exists to prevent, and it was silent.
     let (effect, run_journal) = match crate::effect_journal::journals(cfg, runner.clone()) {
         Some(j) => (Some(j.effect), Some(j.run)),
         None => {
@@ -3235,9 +2825,6 @@ fn local_engine_with(
             );
         }
     };
-    // bd-engine-run-path-journaling-fwlx (the Spec 6 flip): a journaled
-    // constructor is Enforced — its leaves really perform external effects,
-    // so an uncovered sink must refuse, never run unjournaled.
     let mode = engine_journal_mode(true, effect.is_some())?;
     local_engine_with_journal(rt, runner, profile, workflow, effect, mode, run_journal)
 }
@@ -3270,8 +2857,6 @@ pub fn engine_journal_mode(
     Ok(toron_workflow::engine::EffectJournalMode::Enforced)
 }
 
-// One parameter per engine seam part; this is the local constructor, not a
-// public API.
 #[allow(clippy::too_many_arguments)]
 fn local_engine_with_journal(
     rt: &tokio::runtime::Runtime,
@@ -3283,17 +2868,7 @@ fn local_engine_with_journal(
     run_journal: Option<toron_workflow::engine::RunJournal>,
 ) -> Result<toron_workflow::WorkflowEngine> {
     let _enter = rt.enter();
-    // Flag-day (bd-fuql): the legacy runner is gone — the journaled effect
-    // wins when present, else this runner executes leaves directly through
-    // the supported context-bearing seam (same preference the old engine
-    // applied to its two-runner inputs).
     let effect = effect;
-    // Pane dispatch owns subprocesses and retry waits. Lift both host-owned
-    // synchronous seams onto the engine's async surface so the workflow
-    // executor never sleeps or waits for a child on its Tokio worker thread.
-    // The blocking work is isolated in Tokio's blocking pool until the pane
-    // dispatcher is fully async, while cancellation of the engine future can
-    // still propagate at the async boundary.
     let async_effect = effect.map(asyncify_runner);
     let async_run_journal = run_journal.map(|journal| {
         std::sync::Arc::new(move |transition: toron_workflow::engine::RunTransition| {
@@ -3310,9 +2885,6 @@ fn local_engine_with_journal(
             mode,
             async_run_journal,
         )?;
-    // The engine ships a missing verify sink; flywheel bodies mean what they
-    // say, so install the shell sink (a compose path may override it with its
-    // receipt-writing sink afterwards).
     *engine
         .verify_sink()
         .0
@@ -3323,9 +2895,6 @@ fn local_engine_with_journal(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-    // A journaled engine PERSISTS through the same sqlite the effect journal
-    // uses; without it the run would be in-memory and a crash would lose the
-    // park. The dry arms (Recording) stay in-memory by contract.
     if matches!(mode, toron_workflow::engine::EffectJournalMode::Enforced) {
         let store = crate::effect_journal::journal_store().ok_or_else(|| {
             anyhow::anyhow!(
@@ -3395,8 +2964,6 @@ fn production_drainer_reads(cfg: Config, project: String) -> DrainerReads {
             |l| crate::doorbell::dispatcher_token(&crate::config::state_dir(), l),
         );
         let snap = crate::snapshot::assemble(&cfg, &signoff_project, &ws, now);
-        // REVIEW residual: any non-closed lane. Bead status is never the word
-        // "review", so that filter always auto-passed.
         let review_residual = snap.lanes.iter().filter(|l| l.status != "closed").count();
         let review_degraded = snap.degraded.iter().any(|d| d.contains("review"));
         crate::signoff::observe(snap.decisions.len(), review_residual, review_degraded)
@@ -3463,11 +3030,6 @@ pub(crate) fn start_approval_drainer_with(
     let handle = std::thread::Builder::new()
         .name("approval-drainer".into())
         .spawn(move || {
-            // bd-1ub5: the drainer is the RESOLVE path. Parked promises are
-            // resolved by scanning the project inbox for a captain decision
-            // mail (`approve:<promise_id>` / `reject:<promise_id>` subject
-            // token) — `flywheel workflow approve` sends exactly that. Mail
-            // unavailable degrades to the sink-only behavior.
             let reads = make_reads();
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -3475,8 +3037,6 @@ pub(crate) fn start_approval_drainer_with(
                 .map_err(|e| anyhow!("approval drainer runtime: {e}"))?;
             rt.block_on(async {
                 let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-                // Loud, not spammy: a failing read prints when its error text
-                // changes, never silently `continue`s.
                 let mut last_scan_err: Option<String> = None;
                 let mut pass: u32 = 0;
                 loop {
@@ -3495,15 +3055,10 @@ pub(crate) fn start_approval_drainer_with(
                         new_ids
                     };
                     for promise_id in ids {
-                        // Surface to captain: the decision token they reply with.
                         let run_tag = format!("run-{}", &promise_id[..promise_id.len().min(8)]);
                         eprintln!(
                             "flywheel: approval parked: promise {promise_id} for project {project} — resolve with: flywheel workflow approve {run_tag} {promise_id} --decision approve|reject --project {project}",
                         );
-                        // ADR-0011 D7: SIGNOFF auto-pass iff REVIEW residual
-                        // empty AND OPEN DECISIONS empty. Irreversible
-                        // preference still parks. erbo: the snapshot read
-                        // shells mail, so it runs off this runtime.
                         let observe = reads.signoff_clear.clone();
                         let clear = match crate::backend::run_mail_off_runtime(move || Ok(observe()))
                             .await
@@ -3538,15 +3093,12 @@ pub(crate) fn start_approval_drainer_with(
                             }
                         }
                     }
-                    // Resolve pass: scan inbox for decision tokens on parked ids.
                     if let Some(inbox) = &reads.inbox {
                         let parked: Vec<String> = {
                             let sink = engine.approval_sink().lock().await;
                             sink.iter().cloned().collect()
                         };
                         if !parked.is_empty() && pass.is_multiple_of(APPROVAL_SCAN_EVERY_PASSES) {
-                            // One page per pass, shared by every parked id (it
-                            // used to be re-fetched once per promise).
                             let read = inbox.clone();
                             let page = crate::backend::run_mail_off_runtime(move || read()).await;
                             let rows = match page {
@@ -3638,8 +3190,6 @@ pub fn start_spawn_drainer(
                         }
                     }
                     if stop.load(Ordering::Relaxed) {
-                        // Final drain (an await:true resolve may have landed
-                        // between the last poll and stop) — then exit.
                         let receipts = drain_spawn_sink(&engine, &catalog, &mut seen, |plan| {
                             launch_spawn_job(&cfg, &project, &wf_name, &ws_id, &plan)
                         })
@@ -3754,8 +3304,6 @@ mod tests {
         .expect("first start");
         assert_eq!(first.terminal["ok"], serde_json::json!(true));
 
-        // A second process over the same file: the claim survives the "killed"
-        // consumer, so the republished key adopts instead of launching again.
         let reopened = SpawnClaimStore::at(claims.path.clone());
         let second = consume_spawn_job(&reopened, &body, &test_catalog(), 2_000, |_| {
             starts += 1;
@@ -3846,7 +3394,6 @@ mod tests {
             skills_injected: false,
             incarnation: 0,
         }];
-        // First two probes report the pane absent (the race), third sees it.
         let mut probe = 0u32;
         let got = settle_role_slot_with(
             &rows,
@@ -3966,7 +3513,7 @@ mod tests {
             || {
                 probe += 1;
                 if probe < 2 {
-                    None // hc unreachable
+                    None
                 } else {
                     Some(HashSet::from(["w1:p5".to_string()]))
                 }
@@ -4065,7 +3612,6 @@ mod tests {
     #[test]
     fn workflow_packing_bounded_fail_loud_is_pinned() {
         let src = std::fs::read_to_string(file!()).expect("pane.rs readable");
-        // probe-before-bind: the root-pane pick consults occupancy
         assert!(
             src.contains("select_empty_pane(&pane_ids, &occupied)"),
             "spawn_crew_into must probe occupancy before binding the root pane"
@@ -4074,8 +3620,6 @@ mod tests {
             src.contains("pane_split(\n                                    c,"),
             "all-occupied falls through to a fresh split, never a blind bind"
         );
-        // bounded-fail-loud: transient exhaustion returns Err (per-step),
-        // never the old fall-through Ok payload
         assert!(
             src.contains("failed after {MAX_ATTEMPTS} transient retries"),
             "pane_dispatch must fail loud after transient retries are exhausted"
@@ -4096,7 +3640,6 @@ mod tests {
             ceiling: kernel_millis(Duration::ZERO),
             attempt_timeout: kernel_millis(Duration::from_secs(30)),
             budget: kernel_millis(Duration::from_secs(60)),
-            // ONE failure opens the breaker, so the chain stops right after it.
             breaker: Some(BreakerConfig {
                 max_failures: 1,
                 reset: kernel_millis(Duration::from_secs(60)),
@@ -4148,8 +3691,6 @@ mod tests {
     /// either.
     #[test]
     fn dispatch_chain_budget_bounds_the_chain() {
-        // A clock that advances a millisecond per read: the budget compares
-        // the ELAPSED time, so a frozen clock can never show a spent budget.
         struct TickingClock(std::sync::atomic::AtomicU64);
         impl ClockImpl for TickingClock {
             fn sleep(
@@ -4168,7 +3709,6 @@ mod tests {
             backoff: kernel_millis(Duration::ZERO),
             ceiling: kernel_millis(Duration::ZERO),
             attempt_timeout: kernel_millis(Duration::from_secs(30)),
-            // zero budget: the first read of the clock already shows it spent
             budget: kernel_millis(Duration::ZERO),
             ..Default::default()
         });
@@ -4200,7 +3740,6 @@ mod tests {
     #[test]
     fn dispatch_chain_bulkhead_full_is_a_loud_fatal() {
         // No field names the Bulkhead type: zero the default's bounds
-        // through field assignment, so the port gains no new name.
         let mut policy = RemotePolicy::<Value, String>::default();
         policy.bulkhead.permits = 0;
         policy.bulkhead.queue = 0;
@@ -4273,19 +3812,16 @@ mod tests {
     #[test]
     fn effect_state_journaled_constructor_refuses_without_a_journal() {
         use toron_workflow::engine::EffectJournalMode;
-        // A journaled constructor with a journal: Enforced.
         assert_eq!(
             crate::pane::engine_journal_mode(true, true).expect("journaled"),
             EffectJournalMode::Enforced
         );
-        // A journaled constructor whose journal could NOT be opened: refuse.
         let err = crate::pane::engine_journal_mode(true, false)
             .expect_err("a journaled constructor that cannot journal must refuse");
         assert!(
             err.to_string().contains("refusing to run unjournaled"),
             "the refusal must say what it refuses: {err}"
         );
-        // The dry arm (no journal requested): Recording, visibly.
         assert_eq!(
             crate::pane::engine_journal_mode(false, false).expect("dry"),
             EffectJournalMode::Recording
@@ -4330,23 +3866,19 @@ mod tests {
             entry("w1:p1", "crew-wf-oracle", "oracle"),
             entry("w1:p2", "crew-wf-coder", "coder"),
         ]);
-        // Oracle 429s → coder pane is live: one hop.
         assert_eq!(
             dispatch_reroute_target(&catalog, &entries, "oracle", &[]),
             Some(("coder".to_string(), "crew-wf-coder".to_string()))
         );
-        // Coder has no chain: fail loud locally.
         assert_eq!(
             dispatch_reroute_target(&catalog, &entries, "coder", &[]),
             None
         );
-        // Fallback pane not live in this run: no hop.
         let oracle_only = as_live(vec![entry("w1:p1", "crew-wf-oracle", "oracle")]);
         assert_eq!(
             dispatch_reroute_target(&catalog, &oracle_only, "oracle", &[]),
             None
         );
-        // Already hopped once: terminal, never a second hop.
         assert_eq!(
             dispatch_reroute_target(
                 &catalog,
@@ -4367,11 +3899,9 @@ mod tests {
             src.contains("refused-empty-evidence"),
             "pane 429 empty-evidence path must expose refused-empty-evidence"
         );
-        let dispatch = src.find("bd-mukq: 429 reroute").expect("429 reroute block");
-        // Scope the slice to the FUNCTION, not a fixed byte count. The magic
-        // 12000-byte window silently excluded the arm's tail as soon as the
-        // dispatch grew (bd-jvka moved the chain in front of it), which reads
-        // as "the marker is missing" when it is merely further down.
+        let dispatch = src
+            .find("Some(rate_limit_kind.as_str())")
+            .expect("429 reroute block");
         let end = src[dispatch..]
             .find("\nfn ")
             .map_or(dispatch, |i| dispatch + i);
@@ -4384,7 +3914,6 @@ mod tests {
             arm.contains("refused-empty-evidence"),
             "429 arm must refuse empty-evidence hop"
         );
-        // The refuse arm journals Unknown via commit_rebind_opt → Ok(None)
         let idx = src.find("refused-empty-evidence").expect("refused marker");
         let window = &src[idx.saturating_sub(900)..idx.saturating_add(200)];
         assert!(
@@ -4399,18 +3928,12 @@ mod tests {
         let start = src
             .find("fn spawn_crew_into(")
             .expect("spawn_crew_into present");
-        // Scope the slice to the FUNCTION, not a fixed byte count. A magic
-        // window silently starts excluding the function's own tail as soon as
-        // the function grows (bd-crlx added the env-pin resolution ahead of the
-        // registry row and pushed the row out of a 16000-char window), which
-        // reads as "the row is missing" when it is merely further down.
         let end = src[start..].find("\nfn ").map_or(start, |i| start + i);
         let slice = &src[start..end];
         assert!(
             slice.contains("profile_launch_plan(harness, profile, None)"),
             "compose pre-spawn must honor Profile.provider via the launch PLAN"
         );
-        // The row itself, not just a call somewhere in the arm.
         assert!(
             slice.contains("model_pin,\n                skills_digest:"),
             "the crew registry row must carry the pin + skills digest (ADR-0013 P1-7/P1-8)"
@@ -4554,9 +4077,6 @@ mod tests {
     /// end to end, at any crew size.
     #[test]
     fn fanout_copies_resolve_to_distinct_panes() {
-        // The shape a real crew writes: ONE pane per unique role is what the
-        // packer spawns for `crew: auto`, and a role with copies gets
-        // `…-oracle`, `…-oracle2`, `…-oracle3` on separate panes.
         let entries = as_live(vec![
             SpawnEntry {
                 pane_id: "w2:p1".into(),
@@ -4612,9 +4132,6 @@ mod tests {
             },
         ]);
 
-        // The defect, stated as an assertion: the single-entry lookup is
-        // ordinal-blind, so all three copies collapse onto one agent. This is
-        // what put "fenced as busy" on the second copy.
         let first = resolve_pane_entry(&entries, "oracle").expect("profile hit");
         let again = resolve_pane_entry(&entries, "oracle").expect("profile hit");
         assert_eq!(
@@ -4623,7 +4140,6 @@ mod tests {
              is the defect, not an accident of these rows"
         );
 
-        // The fix: copy i reaches copy i.
         let picked: Vec<String> = (0..3)
             .map(|i| {
                 resolve_pane_entry_nth(&entries, "oracle", i)
@@ -4638,15 +4154,11 @@ mod tests {
             "3 copies of `over: \"3\"` must reach 3 distinct panes, got {picked:?}"
         );
 
-        // A 4th copy does not exist: the fence must fail loud on an
-        // over-count rather than silently reuse copy 0's pane.
         assert!(
             resolve_pane_entry_nth(&entries, "oracle", 3).is_none(),
             "one more copy than the crew has panes must be None, never a reuse"
         );
 
-        // A single-copy role is unchanged, so the working path cannot regress:
-        // nth 0 is exactly the entry the old lookup returned.
         assert_eq!(
             resolve_pane_entry_nth(&entries, "coder", 0)
                 .expect("coder")
@@ -4690,7 +4202,6 @@ mod tests {
                 .collect(),
         );
 
-        // `over: "3"` over `@oracle`: three copies, three panes.
         for (key, want) in [("p0", "w4:p1"), ("p1", "w4:p2"), ("p2", "w4:p3")] {
             let ordinal =
                 toron_workflow::identity::copy_ordinal(Some(key)).expect("a copy key parses");
@@ -4727,7 +4238,6 @@ mod tests {
             skills_injected: false,
             incarnation: 0,
         }]);
-        // Must NOT be an error: the settle arm has to be reachable.
         let got = resolve_role_slot(&entries, "oracle", Some(1))
             .expect("an over-count is not an error, it is a settle candidate");
         assert!(
@@ -4767,7 +4277,6 @@ mod tests {
         };
         let entries = as_live(vec![
             row("w7:p1", "crew-goal-oracle", 0),
-            // Same name, newer generation, different pane.
             row("w7:p9", "crew-goal-oracle", 1),
         ]);
         let msg = shortfall_error(&entries, "oracle", 1).to_string();
@@ -4825,7 +4334,6 @@ mod tests {
                 skills_injected: false,
                 incarnation: 0,
             },
-            // Same name, newer generation, different pane.
             SpawnEntry {
                 pane_id: "w3:p9".into(),
                 name: "crew-goal-oracle".into(),
@@ -5029,7 +4537,6 @@ mod tests {
             dead,
             vec![("wGone:p2".to_string(), "gone-opencode".to_string())]
         );
-        // A superlogical process clears nothing, whatever the harness.
         let none = find_dead_rows(&entries, &live, "superlogical");
         assert_eq!(none, [] as [(String, String); 0]);
     }
@@ -5095,7 +4602,6 @@ mod tests {
             },
             SpawnEntry::legacy("w1:p3", "plain"),
         ]);
-        // Legacy entries have profile=None → never match (honest: unknown).
         assert!(
             resolve_pane_by_harness(&entries, "omp").is_some(),
             "coder's omp column matches"
@@ -5114,13 +4620,11 @@ mod tests {
     fn crew_agent_names_are_role_ordinal() {
         assert_eq!(crew_agent_name("plan", "planner", 1), "crew-plan-planner");
         assert_eq!(crew_agent_name("plan", "coder", 2), "crew-plan-coder2");
-        // Uppercase + spaces slug down (CREW-WF -> crew-wf)
         assert_eq!(
             crew_agent_name("CREW-WF", "planner", 1),
             "crew-crew-wf-planner"
         );
         assert_eq!(crew_agent_name("My Plan", "coder", 1), "crew-my-plan-coder");
-        // long names truncate to stay within hc's 32-char budget
         let long = crew_agent_name("a-very-long-workflow-name-that-goes-on", "reviewer", 1);
         assert!(long.len() <= 32, "name too long: {long} ({})", long.len());
         let short = crew_agent_name("wf", "reviewer", 1);
@@ -5153,8 +4657,6 @@ mod tests {
         assert!(!harness_override_conflicts("omp", None));
         assert!(!harness_override_conflicts("omp", Some("")));
         assert!(!harness_override_conflicts("opencode", Some("opencode")));
-        // ADR-0007: slot-aliased profiles carry an EMPTY harness — the
-        // override is authoritative for the step, never a conflict.
         assert!(
             !harness_override_conflicts("", Some("pi")),
             "empty (slot-inherit) harness must not conflict"
@@ -5169,7 +4671,6 @@ mod tests {
     /// payload proves only the routing decision (agent = role pane).
     #[test]
     fn pane_dispatch_harness_fallback_dispatches_role_pane() {
-        // reviewer with a RESOLVED harness (pi) so the opencode pin conflicts.
         let catalog = test_catalog_with_reviewer_harness("pi");
         let entry = |pane_id: &str, name: &str, profile: &str, harness: &str| SpawnEntry {
             pane_id: pane_id.to_string(),
@@ -5184,7 +4685,6 @@ mod tests {
             skills_injected: false,
             incarnation: 0,
         };
-        // No opencode pane anywhere — the role pane runs pi.
         let entries = as_live(vec![entry("w1:p1", "crew-goal-reviewer", "reviewer", "pi")]);
         let action = Action::DispatchJob {
             assignee: "x".into(),
@@ -5268,7 +4768,6 @@ mod tests {
         let plan = CrewPlan::default();
         let err = ensure_crew(&plan, "plan").unwrap_err();
         assert!(err.to_string().contains("needs a crew"), "{err}");
-        // non-empty passes the guard
         let mut plan = CrewPlan::default();
         plan.members.insert("planner".to_string(), 1);
         ensure_crew(&plan, "plan").expect("non-empty plan passes");
@@ -5386,8 +4885,6 @@ steps:
             }
         });
         // Wait for the park (the created job promise is a remote todo the
-        // 0.6 runtime suspends on), then drain — exactly what the production
-        // drainer does.
         let mut receipts = None;
         let mut seen = std::collections::HashSet::new();
         for _ in 0..500 {
@@ -5430,10 +4927,6 @@ steps:
             "launch args carried: {:?}",
             receipts[0]["args"]
         );
-        // The resume REPLAYS the run, re-executing run_spawn → the same
-        // promise id lands in the sink again. The drainer's idempotent
-        // re-drain (seen-dedup) consumes it — the sink is never left with
-        // an unread spawn.
         for _ in 0..100 {
             if engine.spawn_sink().lock().await.is_empty() {
                 break;
@@ -5477,8 +4970,6 @@ steps:
                     .await
             }
         });
-        // The drainer: poll the sink while the run parks, then launch +
-        // resolve (the fake launcher "completes the job" by sleeping).
         let catalog = test_catalog();
         let drainer = tokio::spawn({
             let engine = engine.clone();
@@ -5528,7 +5019,6 @@ steps:
         let profile: toron_workflow::ProfileResolver = std::sync::Arc::new(|_| None);
         let workflow: toron_workflow::WorkflowResolver = std::sync::Arc::new(|_| None);
         let rt = tokio::runtime::Runtime::new().expect("rt");
-        // Recording mode stays in-memory by contract.
         let engine = local_engine_with_journal(
             &rt,
             runner,
@@ -5571,8 +5061,6 @@ steps:
 
     #[test]
     fn local_engine_constructs_without_a_runtime() {
-        // ADR-0043: the engine is an in-process durable driver; it has no
-        // vendor runtime to enter, so construction must work anywhere.
         let engine = toron_workflow::WorkflowEngine::local();
         assert!(engine.is_ok(), "local engine constructs off-runtime");
     }
@@ -5678,9 +5166,6 @@ mod pane_registry_fallback_tests {
                 expected: None,
             },
             RouteRow {
-                // A timeout never reaches the hop, and a 401 is
-                // reroute-eligible WITHOUT being model-swappable — neither
-                // gets better by changing the model.
                 case: "timeout-never-hops",
                 error: "operation timeout after 30s",
                 profile_model: "fleet/claude-opus-4",
@@ -5770,9 +5255,6 @@ mod pane_registry_fallback_tests {
         let mut applies = 0;
         let err = crate::agent_ref::commit_rebind(project, intent, |_| {
             applies += 1;
-            // The effect law: intent is journaled BEFORE the provider runs.
-            // Read the log from inside the attempt — that is the only place
-            // the ordering is observable at all.
             let before = std::fs::read_to_string(crate::state::project_log_path(project))
                 .expect("journal written before the provider ran");
             for state in ["prepared", "in_flight"] {
@@ -5785,7 +5267,6 @@ mod pane_registry_fallback_tests {
                 !before.contains("\"state\":\"settled\""),
                 "nothing may be settled while apply is still running: {before}"
             );
-            // the rung rate-limited too: fail, do not hop again
             Err::<(), _>(anyhow!("429 Too Many Requests"))
         });
         assert!(err.is_err(), "a failed fallback must propagate");
@@ -5844,8 +5325,6 @@ mod pane_registry_fallback_tests {
             || Some(routing()),
         )
         .expect("a rate limit with a rung routes");
-        // main.rs passes the profile name as both pin and role, under its
-        // hardcoded "flywheel" project.
         let got = model_fallback_intent(
             "flywheel",
             "coder",
@@ -6064,12 +5543,6 @@ mod rex_door_tests {
     }
 }
 
-// bd-5llv's idle-gate tests are GONE with the mechanism they covered. The gate
-// they pinned (a synchronous in-process agent_wait) was replaced by the
-// toron-workflow busy-owner fence in bd-fen3; keeping tests for a deleted
-// mechanism would be a lie about what protects dispatch. The receipt-shape fix
-// from the same bead is unrelated and stays.
-
 #[cfg(test)]
 mod bd_5llv_receipt_tests {
     use super::dispatch_receipt_ok;
@@ -6204,7 +5677,6 @@ mod bd_qlr1_env_pin_wiring_tests {
         )
         .expect("valid json");
         assert_eq!(doc["model"], "opencode-go/muse-spark-1.3-contributor");
-        // The identity env must survive alongside the pin.
         assert_eq!(env.get("AGENT_NAME").map(String::as_str), Some("SomeOwl"));
     }
 
@@ -6225,7 +5697,6 @@ mod bd_qlr1_env_pin_wiring_tests {
     /// model nobody selected.
     #[test]
     fn an_unhonourable_pin_is_an_error_not_a_bare_launch() {
-        // A bare model id has no provider half; opencode would drop it.
         let err = pane_env_for_launch(&cfg(), Some("SomeOwl"), Some("gpt-5.2"))
             .expect_err("a bare model id must refuse");
         assert!(
@@ -6395,10 +5866,6 @@ mod approval_drainer_off_runtime_tests {
     const PROJECT: &str = "comms-p0-erbo-fixture";
     const APPROVER: &str = "ErboApprover";
     const DRAINER: &str = "ErboDrainer";
-    // ADR-0037 W2: a pin holds ONE key across every project of the shared
-    // per-process test store, so the drainer-scan test (its own per-run
-    // project) registers its OWN pins instead of re-registering
-    // ErboApprover/ErboDrainer in a second project (W2 refuses that).
     const SCAN_APPROVER: &str = "ErboScanApprover";
     const SCAN_DRAINER: &str = "ErboScanDrainer";
 
@@ -6480,9 +5947,6 @@ steps:
     /// from within a runtime", the run never resumes, and the join is `Err`.
     #[test]
     fn drainer_inbox_scan_resolves_parked_approval_inside_a_runtime() {
-        // A per-run project: the in-process store is a process singleton
-        // whose root other tests may point at a reused dir, so a fixed slug
-        // could hand the drainer an inbox full of earlier runs' decisions.
         let project = format!(
             "{PROJECT}-{}",
             &uuid::Uuid::new_v4().simple().to_string()[..8]
@@ -6525,8 +5989,6 @@ steps:
                 }
             };
 
-            // The captain's decision mail (what `flywheel workflow approve`
-            // sends), delivered on the in-process plane.
             let sender_mail = mail.clone().with_name(SCAN_APPROVER.to_string());
             let subject = format!("approve:{promise_id}");
             let send_project = project.clone();
@@ -6552,7 +6014,6 @@ steps:
                 let mail = mail.clone();
                 let project = project.clone();
                 DrainerReads {
-                    // Keep the promise parked: only the inbox scan may resolve it.
                     signoff_clear: Arc::new(|| false),
                     inbox: Some(Arc::new(move || -> anyhow::Result<Value> {
                         scans.fetch_add(1, Ordering::SeqCst);
@@ -6582,8 +6043,6 @@ steps:
             )
             .expect("drainer starts");
 
-            // Generous bound: the scan cadence is ~2s, but a loaded box
-            // (parallel full-suite builds) stretched one run past 30s.
             let out = match tokio::time::timeout(std::time::Duration::from_secs(90), handle).await
             {
                 Ok(Ok(run)) => run.expect("run resumes after approval"),

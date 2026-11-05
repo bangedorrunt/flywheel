@@ -77,8 +77,6 @@ const SHUTDOWN_WORKER_GRACE: std::time::Duration = std::time::Duration::from_sec
 
 /// Per-subscription sink actors with shed-to-digest and supervision.
 pub struct SinkManager {
-    // Ordered by sink name so shutdown, status, and audit traversal are
-    // deterministic across replays and process restarts.
     sinks: BTreeMap<String, Sink>,
     degraded_tx: mpsc::Sender<BrainMsg>,
     cap: usize,
@@ -342,8 +340,6 @@ async fn worker_loop(
     mut adapter: Box<dyn PromptSink>,
     degraded_tx: mpsc::Sender<BrainMsg>,
 ) {
-    // Pumps intents in order; the manager mediates parking (single writer
-    // for state, worker only reads/writes under the same lock).
     loop {
         let next = {
             let mut guard = inner.lock().await;
@@ -353,14 +349,6 @@ async fn worker_loop(
                     if guard.closed {
                         return;
                     }
-                    // Wait WITHOUT holding the lock across the await. Holding
-                    // it wedges `send()` (audit P0, probe-proven): the parked
-                    // worker owns the lock while awaiting, so a sender can
-                    // never take the lock to push+notify — the first prompt
-                    // after the worker goes idle hung forever. Clone the
-                    // Notify handle, drop the guard, then await: tokio's
-                    // Notify stores a permit when no waiter is registered,
-                    // so a send between drop and await cannot be missed.
                     let notify = guard.notify.clone();
                     drop(guard);
                     notify.notified().await;
@@ -370,11 +358,6 @@ async fn worker_loop(
         };
         let (pin, line) = next;
         if let Err(e) = adapter.send(&pin, &line) {
-            // Park + shed the remainder AND the failed intent under one
-            // lock. Audit P2: the failed intent itself used to be dropped
-            // here (only the queue remainder shed) — contradicting
-            // at-least-once; it now lands in shed overflow first so the
-            // original order is preserved.
             let mut guard = inner.lock().await;
             guard.parked = true;
             guard.sheds += (guard.queue.len() + 1) as u64;
@@ -390,7 +373,6 @@ async fn worker_loop(
                 .await;
             return;
         }
-        // F5: delivery receipt — hear keys off this, never enqueue.
         let _ = degraded_tx.send(BrainMsg::Delivered { pin }).await;
     }
 }
@@ -651,8 +633,6 @@ impl WebhookSink {
                 .map_err(|e| RtError::InvalidUrl(format!("{authority}: {e:?}")))?,
             self.timeout,
         )?;
-        // Only plain-http loopback/allowlisted hosts in Phase 2 (TLS via
-        // the operator's terminator; revisit with push transport).
         stream.set_write_timeout(Some(self.timeout))?;
         stream.set_read_timeout(Some(self.timeout))?;
         write!(
@@ -676,8 +656,6 @@ impl WebhookSink {
 
 impl PromptSink for WebhookSink {
     fn send(&mut self, pin: &str, line: &str) -> Result<(), RtError> {
-        // Subscriber identity rides from the subscription store binding in
-        // bd-asr2.11; until then the pin scopes the payload.
         self.post(&self.render(pin, pin, line))
     }
 
@@ -732,8 +710,6 @@ impl PromptSink for DmSink {
 
 impl DmSink {
     fn service_id_for(&self, _pin: &str) -> String {
-        // Per-subscriber recipient mapping binds with the subscription
-        // store in bd-asr2.11; today the service identity is the recipient.
         self.service_id.clone()
     }
 }
@@ -809,7 +785,6 @@ mod tests {
         let mut mgr = SinkManager::new(deg_tx);
         let (sink, sent) = MockSink::new();
         mgr.add_sink("hc", Box::new(sink));
-        // Yield long enough for the worker to drain the (empty) queue and park.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             mgr.send("hc", "p", "after-idle").await
@@ -835,7 +810,6 @@ mod tests {
         sink.stall_ms = 12_000;
         mgr.add_sink("hc", Box::new(sink));
         mgr.send("hc", "p", "in-flight").await;
-        // Let the worker pop the intent so it sits inside the 20s send.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let done = tokio::time::timeout(std::time::Duration::from_secs(8), mgr.shutdown()).await;
         assert!(
@@ -851,7 +825,6 @@ mod tests {
         let (mut sink, sent) = MockSink::new();
         sink.stall_ms = 200;
         mgr.add_sink("hc", Box::new(sink));
-        // Cap 2: first two queue, the rest must shed — never block.
         let mut outcomes = Vec::new();
         for i in 0..6 {
             outcomes.push(mgr.send("hc", "p", &format!("m{i}")).await);
@@ -873,7 +846,6 @@ mod tests {
         let (mut sink, _sent) = MockSink::new();
         sink.fail_after = Some(0);
         mgr.add_sink("webhook", Box::new(sink));
-        // First intent fails at the endpoint → park; everything sheds after.
         mgr.send("webhook", "p", "one").await;
         mgr.send("webhook", "p", "two").await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -927,7 +899,6 @@ mod tests {
             Some(("ops.example".to_string(), 8443, "/a/b".to_string())),
             "an https URL keeps the written port (TLS terminates at the edge)"
         );
-        // Malformed is refused rather than guessed at.
         assert_eq!(url_host_port_path("hooks.internal:18999/wake"), None);
         assert_eq!(url_host_port_path("http://"), None);
         assert_eq!(url_host_port_path("http://h:notaport/"), None);
@@ -989,7 +960,6 @@ mod tests {
         assert!(allow.allows("http://x.ops.example/y"));
         assert!(!allow.allows("https://evil.example/doorbell"));
         assert!(!allow.allows("https://ops.example.evil/y"));
-        // Construction refuses loudly (fail-closed, D6).
         assert!(WebhookSink::new("https://evil.example/h", &allow, false).is_err());
         assert!(WebhookSink::new("https://hooks.internal/h", &allow, false).is_ok());
     }
@@ -1012,7 +982,6 @@ mod tests {
 
     #[test]
     fn dm_sink_refuses_human_keys() {
-        // Only daemon-minted service identities; human/operator keys never.
         assert!(DmSink::for_service("svc:ci-1", Box::new(MockDmTransport::new())).is_ok());
         assert!(DmSink::for_service("npub1abc", Box::new(MockDmTransport::new())).is_err());
         assert!(DmSink::for_service("nsec1abc", Box::new(MockDmTransport::new())).is_err());
@@ -1021,8 +990,6 @@ mod tests {
 
     #[tokio::test]
     async fn e15_stalled_webhook_sheds_while_plane_prompt_fast() {
-        // E15: webhook stalled 30s (simulated) → shed-to-digest + Degraded;
-        // hc-prompt latency unaffected (brain never blocks on a sink).
         let (deg_tx, mut deg_rx) = mpsc::channel(16);
         let mut mgr = SinkManager::with_cap(deg_tx, 1);
         let (mut stall, _sent) = MockSink::new();
@@ -1030,7 +997,6 @@ mod tests {
         mgr.add_sink("webhook", Box::new(stall));
         let (fast, sent) = MockSink::new();
         mgr.add_sink("hc", Box::new(fast));
-        // Fill the webhook queue past its cap of 1.
         assert!(matches!(
             mgr.send("webhook", "svc", "one").await,
             SendOutcome::Queued
@@ -1042,8 +1008,6 @@ mod tests {
             }
         }
         assert!(sheds >= 3, "stalled webhook must shed, got {sheds}");
-        // Hc prompt latency: fast path answers immediately despite the
-        // stalled sibling (per-sink isolation, not a shared pump).
         let t = tokio::time::Instant::now();
         assert!(matches!(
             mgr.send("hc", "p", "urgent").await,
@@ -1055,15 +1019,11 @@ mod tests {
         );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(sent_len(&sent), 1, "hc worker pumps independently");
-        // A shed storm is visible: drain overflow names the subscriber sink.
         let _ = deg_rx.try_recv();
     }
 
     #[tokio::test]
     async fn failed_intent_is_preserved_in_shed_overflow() {
-        // Audit P2: the intent that FAILED at the endpoint used to be
-        // dropped (only the queue remainder shed) — contradicting
-        // at-least-once. It must land in shed overflow, first.
         let (deg_tx, _deg_rx) = mpsc::channel(16);
         let mut mgr = SinkManager::new(deg_tx);
         let (mut sink, _sent) = MockSink::new();
@@ -1085,8 +1045,6 @@ mod tests {
 
     #[tokio::test]
     async fn restart_sink_revives_and_requeues() {
-        // Audit P1: supervised restart with a fresh adapter; the shed
-        // overflow requeues and the new worker delivers it.
         let (deg_tx, _deg_rx) = mpsc::channel(16);
         let mut mgr = SinkManager::new(deg_tx);
         let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1131,8 +1089,6 @@ mod tests {
             "fresh adapter delivered the requeued intent"
         );
         assert!(!mgr.parked("webhook").await);
-        // Missing sink / not parked: restart refuses without burning a
-        // policy slot.
         assert!(!mgr.restart_sink("missing", 9_000).await);
         assert!(!mgr.restart_sink("webhook", 9_000).await);
     }

@@ -1,16 +1,7 @@
 // governed-by: ADR-0019
-// Wave-2 minimal principle-name registry (bd-w2-name-registry-8d6u): the 21
-// canonical pstack-derived names from ADR-0019 Spec 5, names only. No leaves,
-// no CLI — that is wave 3. Wave-2 lints validate `principles:` names against
-// this list.
-//
-// Lint-bridge contract: flywheel passes `PRINCIPLE_NAMES` into toron-workflow
-// lint (flywheel -> toron-workflow), keeping the dep direction clean — no
-// reverse dependency.
 
 /// The 21 canonical principle names (ADR-0019 Spec 5, pstack-derived).
 pub const PRINCIPLE_NAMES: [&str; 21] = [
-    // Core
     "laziness-protocol",
     "foundational-thinking",
     "redesign-from-first-principles",
@@ -20,21 +11,17 @@ pub const PRINCIPLE_NAMES: [&str; 21] = [
     "experience-first",
     "exhaust-the-design-space",
     "build-the-lever",
-    // Architecture
     "model-the-domain",
     "boundary-discipline",
     "type-system-discipline",
     "make-operations-idempotent",
     "migrate-callers-then-delete-legacy-apis",
     "separate-before-serializing-shared-state",
-    // Verification
     "prove-it-works",
     "fix-root-causes",
     "sequence-verifiable-units",
-    // Delegation
     "guard-the-context-window",
     "never-block-on-the-human",
-    // Meta
     "encode-lessons-in-structure",
 ];
 
@@ -224,9 +211,6 @@ pub fn check_principles(priority: u8, principles: &str) -> PrinciplesCheck {
         };
     }
     for line in &lines {
-        // The brief shapes citations as `<name> — <the decision it
-        // changed>` (em-dash). Anything without the separator is a
-        // name-only cargo-cult citation.
         let Some((name, decision)) = line.split_once('—') else {
             return PrinciplesCheck::Incomplete {
                 reason: format!("citation has no decision clause (name-only is a skip): {line:?}"),
@@ -288,7 +272,6 @@ mod tests {
             assert!(!p.when.is_empty(), "{}: when must be non-empty", p.name);
             assert!(!p.rule.is_empty(), "{}: rule must be non-empty", p.name);
         }
-        // The leaf names are byte-identical to the wave-2 name registry.
         let leaf_names: Vec<&str> = PRINCIPLES.iter().map(|p| p.name).collect();
         let mut registry = PRINCIPLE_NAMES.to_vec();
         registry.sort_unstable();
@@ -307,7 +290,6 @@ mod tests {
             assert_eq!(leaf.name, p.name);
             assert_eq!(leaf.rule, p.rule);
         }
-        // The canonical example: prove-it-works prints the full rule.
         let leaf = show("prove-it-works").expect("prove-it-works resolves");
         assert_eq!(
             leaf.rule,
@@ -325,8 +307,6 @@ mod tests {
         assert_eq!(suggest(""), None);
         assert_eq!(suggest("zzz-nothing"), None);
     }
-
-    // ---- bd-w3-brief-principles-yy39: report PRINCIPLES checker ----
 
     /// Empty PRINCIPLES on a P0-P2 report -> incomplete; on P3/P4 the field
     /// is optional.
@@ -379,7 +359,6 @@ mod tests {
             ("name_only_multiline", 2, "fix-root-causes\nprove-it-works"),
             ("unknown_name_typo", 2, "prove-it-work — did something"),
             ("unknown_name_truncated", 4, "laziness — deleted a wrapper"),
-            // A known name in a garbled line still fails on the name parse.
             ("garbled_line", 2, "prove-it-works - checked the ledger"),
         ];
         for (case, priority, text) in cases {
@@ -417,14 +396,12 @@ mod tests {
                 .iter()
                 .any(|i| i.message.contains("unknown principle name"))
         };
-        // The real flywheel registry resolves the citation.
         let real = toron_workflow::lint_workflow_with_principles(&wf, names());
         assert!(
             !unknown(&real),
             "canonical registry accepts: {:?}",
             real.issues
         );
-        // Tamper: drop laziness-protocol from the passed list.
         let tampered: Vec<&str> = names()
             .iter()
             .copied()
@@ -436,8 +413,6 @@ mod tests {
             "tampered registry must reject the citation: {:?}",
             report.issues
         );
-        // The in-crate fallback still knows the name — the tampered list,
-        // not the fallback, was live.
         let fallback = toron_workflow::lint_workflow(&wf);
         assert!(!unknown(&fallback), "fallback still resolves the name");
     }

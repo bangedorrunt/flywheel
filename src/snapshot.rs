@@ -253,10 +253,6 @@ fn collect_pin_rows(
 pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now: u64) -> Snapshot {
     let mut degraded = Vec::new();
 
-    // Pins: agent list for this workspace (best effort). Rex door: inside
-    // rex (`REX_SESSION` set) list through the multiplexer backend;
-    // otherwise keep the hc client. Both paths are read-only — neither
-    // creates a session.
     let mut pins = Vec::new();
     let mut launch_pending: u32 = 0;
     if crate::pane::rex_door_selected(cfg) {
@@ -302,14 +298,12 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
         }
     }
 
-    // Lanes: beads JSON.
     let project_dir: PathBuf = crate::project_dir(cfg, project);
     let (lanes, lanes_degraded) = read_lanes(&project_dir, now);
     if lanes_degraded {
         degraded.push("lanes".to_string());
     }
 
-    // Journal fold: decisions, journal watermarks, drain/afk depths.
     let journal_entries = crate::doorbell::journal_read_all(&crate::config::state_dir());
     let model = fold_model_for(&journal_entries, ws_label);
     let decisions: Vec<DecisionRow> = crate::workspace::open_decisions(&model)
@@ -350,13 +344,10 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
     let drain_pending = model.wake.waits.len();
     let afk = model.wake.digests.len();
 
-    // ADR-0011 D6: attempt live mail/reservation reads; degrade only on miss.
     let (mail, mail_degraded) = read_mail_counts(project);
     if mail_degraded {
         degraded.push("mail".to_string());
     }
-    // bd-swarm-cockpit-pczs: the board is read ONCE — `held_paths` and the
-    // per-pin `bead`/`reservations` binding are two projections of it.
     let (board, res_degraded) = read_reservation_board(cfg, project);
     if res_degraded {
         degraded.push("reservations".to_string());
@@ -376,9 +367,6 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
     let coalitions = list_active_coalitions(project, now);
     let joinable = fleet_joinable(&dispatcher, &pins);
 
-    // ADR-0010 D10: the durable loop's projection. A run with no loop recorded
-    // (or an unreadable file, which degrades loudly) reports the default shape
-    // — never a fabricated phase.
     let loop_state = match crate::state::load_active_loop(project) {
         Ok(Some(al)) => crate::durable::LoopSnapshot::from_active_loop(&al),
         Ok(None) => crate::durable::LoopSnapshot::default(),
@@ -411,7 +399,6 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
 }
 
 fn read_mail_counts(_project: &str) -> (MailCounts, bool) {
-    // `toron receipt list` has no --project (sqlite is the daemon store).
     let out = std::process::Command::new("toron")
         .args(["receipt", "list", "--json"])
         .output();
@@ -490,8 +477,6 @@ fn read_reservation_board(
     cfg: &crate::config::Config,
     project: &str,
 ) -> (Option<serde_json::Value>, bool) {
-    // Mail facade covers remote daemon AND in-process. try_mailbox() is
-    // in-process only — a configured URL never fills it, so helm degraded.
     match crate::mail::Mail::from_config(Some(&cfg.toron_mail_config())) {
         Ok(Some(mail)) => match mail.list_active(project, None, None) {
             Ok(v) => (Some(v), false),
@@ -826,7 +811,6 @@ mod adr0010_d10_tests {
             text.contains("br show bd-1") || text.contains("RECORD DIVERGENCE"),
             "{text}"
         );
-        // Divergence: no closed beads, open corr c-1 with no linkage rows.
         assert!(text.contains("RECORD DIVERGENCE"), "{text}");
     }
 
@@ -911,15 +895,12 @@ mod adr0010_d10_tests {
                 {"path": "docs/x.md", "holder": "wP:p9", "reason": ""}
             ]
         });
-        // The registry resolves the hc name to the mail pin the lease binds.
         let identities = |name: &str| (name == "crew-1-amberelk").then(|| "AmberElk".to_string());
         bind_pins_to_board(&mut pins, &board, &identities);
         assert_eq!(pins[0].bead.as_deref(), Some("bd-zgi9"));
         assert_eq!(pins[0].reservations, vec!["src/crew.rs", "CHANGELOG.md"]);
-        // A no-reason row binds reservations but invents no claim.
         assert_eq!(pins[1].bead, None);
         assert_eq!(pins[1].reservations, vec!["docs/x.md"]);
-        // Re-binding is idempotent; a boardless read binds nothing.
         bind_pins_to_board(&mut pins, &board, &identities);
         assert_eq!(
             pins[0].reservations.len(),
@@ -946,8 +927,6 @@ mod adr0010_d10_tests {
 
     #[test]
     fn snapshot_workspace_pick_prefers_owned_label() {
-        // Rex door: duplicate labels resolve to the flywheel-owned one,
-        // the same rule as `find_workspace_dyn`.
         let list = vec![ws("w-stale", "proj"), ws("w-live", "flywheel-proj")];
         let aliases = vec!["flywheel-proj".to_string(), "proj".to_string()];
         assert_eq!(

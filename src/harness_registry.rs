@@ -40,7 +40,7 @@ impl HarnessTier {
     /// that accepts a chosen model from a closed one that does not, instead of
     /// guessing from a profile list. Derived from the same enum the gate uses, so
     /// the word cannot disagree with the gate.
-    #[allow(dead_code)] // bd-drlm: read by the Jev state, wired when the ranker lands
+    #[allow(dead_code)]
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -84,14 +84,12 @@ pub const REGISTRY: &[HarnessSpec] = &[
         implied_slot: Some(SLOT_STANDARD),
     },
     HarnessSpec {
-        // Closed: grok picks its own frontier model.
         canonical: "grok",
         aliases: &["gk"],
         tier: HarnessTier::Closed,
         implied_slot: Some(SLOT_PREMIUM),
     },
     HarnessSpec {
-        // bd-drlm: added for future use. Closed like every frontier CLI.
         canonical: "codex",
         aliases: &[],
         tier: HarnessTier::Closed,
@@ -176,8 +174,6 @@ mod tests {
     #[test]
     fn every_registered_harness_is_tiered() {
         for s in REGISTRY {
-            // Compile-time proof the field is not a placeholder: a closed
-            // harness must refuse a model and an open one must accept it.
             match s.tier {
                 HarnessTier::Open => assert!(
                     s.tier.may_be_asked_for_a_model(),
@@ -311,7 +307,6 @@ mod tests {
     #[test]
     fn the_four_legacy_tables_agree_with_the_registry() {
         for s in REGISTRY {
-            // profile.rs::normalize_harness_alias
             assert_eq!(
                 crate::profile::normalize_harness_alias(s.canonical),
                 s.canonical
@@ -319,7 +314,6 @@ mod tests {
             for alias in s.aliases {
                 assert_eq!(crate::profile::normalize_harness_alias(alias), s.canonical);
             }
-            // models.rs::implied_slot_name_for_harness
             assert_eq!(
                 crate::models::implied_slot_name_for_harness(s.canonical),
                 s.implied_slot,
@@ -370,7 +364,6 @@ mod tests {
     fn the_registry_holds_exactly_the_named_harnesses() {
         let got: BTreeSet<&str> = REGISTRY.iter().map(|s| s.canonical).collect();
         let want: BTreeSet<&str> = [
-            // bd-47fu (operator-directed): omp, pa, jcode dropped.
             "opencode", "pi", "grok", "codex", "claude", "fx",
         ]
         .into_iter()

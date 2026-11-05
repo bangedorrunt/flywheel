@@ -85,14 +85,10 @@ pub fn facts(cfg: &crate::config::Config, project: &str) -> Result<Facts> {
     let busy = snap.pins.iter().filter(|p| p.verdict.starts_with("Busy")).count();
     let idle = snap.pins.iter().filter(|p| p.verdict.starts_with("Idle")).count();
     let dead = snap.pins.iter().filter(|p| p.verdict.starts_with("Dead")).count();
-    // A plane that publishes no verdict reads Unknown; say so instead of
-    // printing three zeroes beside a non-zero agent count.
     let unknown = agents.saturating_sub(busy + idle + dead);
     let unanswered =
         crate::doorbell::read_unanswered(&crate::doorbell::unanswered_file(&state_dir, &ws_label));
     let held: usize = snap.pins.iter().map(|p| p.reservations.len()).sum();
-    // A live dispatcher is infrastructure, not a swarm: an idle host with a
-    // doorbell and no panes has nothing to report.
     let swarm = agents > 0;
 
     let mut conflicts = Vec::new();
@@ -154,13 +150,8 @@ fn overlaps(pins: &[crate::snapshot::PinRow]) -> Vec<(String, Vec<String>)> {
 /// the facts, so a test can pin every arm without a store.
 pub fn decide(facts: &Facts, remembered: &Remembered) -> Action {
     let mut conflicts = facts.conflicts.clone();
-    // `swarm` predates the fingerprint. A state file written by an older
-    // build has swarm=true from the old "dispatcher up" rule; treat it as no
-    // knowledge rather than escalate a vanish that never happened.
     let prior_swarm = remembered.swarm && !remembered.fingerprint.is_empty();
     if prior_swarm && !facts.swarm {
-        // All panes gone is the loudest thing a digest can say, and it used to
-        // be the quietest: "no swarm" was treated as idle.
         conflicts.push("swarm vanished: 0 agents, dispatcher not up".to_string());
     }
     let signature = conflicts.join(" | ");
@@ -172,8 +163,6 @@ pub fn decide(facts: &Facts, remembered: &Remembered) -> Action {
         };
     }
     if !facts.swarm && signature.is_empty() {
-        // Nothing is spawned: "dispatcher down" here is the normal idle state,
-        // not a fault. Say nothing rather than wake anyone every 15 minutes.
         return Action::Silent;
     }
     if facts.fingerprint == remembered.fingerprint {
@@ -184,10 +173,6 @@ pub fn decide(facts: &Facts, remembered: &Remembered) -> Action {
 
 /// One digest fire: compute, decide, remember, and escalate a new conflict.
 pub async fn tick(cfg: &crate::config::Config, project: &str) -> Result<Option<String>> {
-    // `snapshot::assemble` reads mail/reservations through `block_on`; on a
-    // tokio worker that panics ("Cannot start a runtime from within a
-    // runtime"). The whole gather is synchronous I/O, so it belongs on the
-    // blocking pool.
     let gather_cfg = cfg.clone();
     let gather_project = project.to_string();
     let facts = tokio::task::spawn_blocking(move || facts(&gather_cfg, &gather_project))
@@ -197,9 +182,6 @@ pub async fn tick(cfg: &crate::config::Config, project: &str) -> Result<Option<S
     let action = decide(&facts, &remembered);
     match action {
         Action::Silent => {
-            // Silence is about OUTPUT, not bookkeeping: keep the fingerprint
-            // and swarm flag current so the next comparison is honest and a
-            // real vanish is not masked by a stale flag.
             remembered.line = facts.line.clone();
             remembered.fingerprint = facts.fingerprint.clone();
             remembered.swarm = facts.swarm;
@@ -210,8 +192,6 @@ pub async fn tick(cfg: &crate::config::Config, project: &str) -> Result<Option<S
             remembered.line = line.clone();
             remembered.fingerprint = facts.fingerprint.clone();
             remembered.swarm = facts.swarm;
-            // A cleared conflict ends the episode, so the same fault can wake
-            // the captain again if it comes back.
             remembered.signature.clear();
             save(project, &remembered)?;
             println!("cron {NAME}: {line}");
@@ -370,7 +350,6 @@ mod tests {
     fn a_new_clock_with_the_same_facts_is_silent() {
         let first = facts_of("awareness p 08:15 · agents 1", &[], true);
         let mut later = facts_of("awareness p 08:30 · agents 1", &[], true);
-        // Same facts, later clock: only the timestamp differs.
         later.fingerprint = first.fingerprint.clone();
         let remembered = Remembered {
             line: first.line.clone(),
@@ -404,7 +383,6 @@ mod tests {
             swarm: true,
         };
         assert_eq!(decide(&facts, &remembered), Action::Silent);
-        // A second, different conflict is a new episode.
         let worse = facts_of(
             "awareness p · dispatcher: down",
             &["unanswered doorbell: X", "dispatcher down with 2 pane(s)"],
@@ -427,7 +405,6 @@ mod tests {
             panic!("a vanished swarm must escalate");
         };
         assert!(conflicts.iter().any(|c| c.contains("swarm vanished")));
-        // A host that never had a swarm stays silent on the same facts.
         assert_eq!(decide(&gone, &Remembered::default()), Action::Silent);
     }
 

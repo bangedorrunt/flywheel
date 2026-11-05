@@ -129,10 +129,6 @@ impl Rex {
 
     pub fn run(&self, args: &[String]) -> Result<Output, RexFail> {
         match self.run_raw(args) {
-            // E: failure path only — a missing method names the skew, so no
-            // command pays the probe's startup latency. The probe is cached
-            // (one `rex api list -q` per process); an unlistable server keeps
-            // the original error, never a skew accusation.
             Err(RexFail::Exited { code, stderr }) => match self.skew_method() {
                 Some(method) => Err(RexFail::VersionSkew { method }),
                 None => Err(RexFail::Exited { code, stderr }),
@@ -143,9 +139,6 @@ impl Rex {
 
     fn run_raw(&self, args: &[String]) -> Result<Output, RexFail> {
         let mut cmd = std::process::Command::new(&self.bin);
-        // Piped stdout is not a terminal, but `--color never` keeps a
-        // later redirect from painting the JSON. `--timeout` is rex's own
-        // connection bound; the process-group kill below is the hang bound.
         cmd.arg("--color")
             .arg("never")
             .arg("--timeout")
@@ -501,10 +494,6 @@ pub fn split_labelled_args(
 }
 
 pub fn rename_args(session: &str, block: &str, label: &str) -> Vec<String> {
-    // `rename` takes the block positionally: no `-b` flag exists here
-    // (unlike `send`/`capture`). Verified against `rex block rename --help`
-    // and the live server — the fake accepts anything, so only the live
-    // shape guards this.
     vec![
         "block".into(),
         "rename".into(),
@@ -1014,9 +1003,6 @@ pub mod rex_map {
                 pane: PaneId::new(pane),
             };
         }
-        // D: `terminal.child_exited` stays `Raw` on purpose — mapping it to
-        // `PaneExited` would drop the exit code, and the headless one-shot
-        // outcome IS the code. Parse it with `child_exit_from_line`.
         BackendEvent::Raw(line.to_string())
     }
 
@@ -1040,9 +1026,6 @@ pub mod rex_map {
     pub fn child_exit_from_line(line: &str) -> Option<(String, i32)> {
         let value: Value = serde_json::from_str(line.trim()).ok()?;
         let inner = value.pointer("/payload/event").unwrap_or(&value);
-        // A block event carries the name at `event.payload.name`; the
-        // synthetic fixture puts it at `type`. Read all three or a real stream
-        // line never matches.
         let name = inner
             .pointer("/payload/name")
             .and_then(Value::as_str)
@@ -1053,7 +1036,6 @@ pub mod rex_map {
             return None;
         }
         let payload = inner.get("payload").unwrap_or(&Value::Null);
-        // The real block event nests its fields under `payload.payload`.
         let fields = payload.get("payload").unwrap_or(payload);
         let field = |key: &str| -> Option<&Value> { fields.get(key).or_else(|| payload.get(key)) };
         let block = field("block_id")
@@ -1510,7 +1492,6 @@ exit 2
             Some(("block:01a17dfc-2922-7999-a186-b7c86f574eef".to_string(), 7)),
             "a real stream line names the event in `name`, not `type`"
         );
-        // A sibling block event that is NOT an exit stays None.
         let bell = r#"{"type":"session_event","payload":{"event":{"type":"block_event","payload":{"block_id":"block:b","name":"bell","payload":{}}}}}"#;
         assert_eq!(child_exit_from_line(bell), None);
     }
@@ -1530,7 +1511,6 @@ exit 2
         let got = stream.next_line().expect("line").expect("one line");
         let exit = child_exit_from_line(&got).expect("child_exited parses");
         assert_eq!(exit, ("block:new-1".to_string(), 0));
-        // The nested envelope the server actually sends parses the same way.
         let nested = r#"{"payload":{"event":{"type":"terminal.child_exited","payload":{"block_id":"block:new-1","exit_code":0}}}}"#;
         assert_eq!(
             child_exit_from_line(nested),
@@ -1559,7 +1539,6 @@ exit 2
         assert_eq!(exit.0, "block:new-1");
         assert_eq!(exit.1, 1, "the code is the verdict: {exit:?}");
         assert_ne!(exit.1, 0, "nonzero is failure, never success: {exit:?}");
-        // A status line is not an exit and must never read as one.
         assert_eq!(
             child_exit_from_line(r#"{"records":[{"state":"idle"}]}"#),
             None

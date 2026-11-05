@@ -151,7 +151,6 @@ fn collab_recipes_are_wired_into_the_cli() {
     let help = String::from_utf8_lossy(&out.stdout);
     assert!(help.contains("--peer-aware"), "spawn has --peer-aware");
 
-    // recipe catalog on disk
     let catalog = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/collab/recipes.md");
     assert!(catalog.is_file(), "docs/collab/recipes.md missing");
 }
@@ -206,7 +205,6 @@ fn debate_soak_three_rounds_ack_gated_verdict() {
         return;
     }
 
-    // Fast path: debate without valid distinct agents should fail fast (not hang).
     let t0 = std::time::Instant::now();
     let out = Command::new(exe)
         .args([
@@ -217,7 +215,7 @@ fn debate_soak_three_rounds_ack_gated_verdict() {
             "--agent-a",
             "oc",
             "--agent-b",
-            "oc", // same agent → error
+            "oc",
         ])
         .output()
         .expect("debate");
@@ -231,7 +229,6 @@ fn debate_soak_three_rounds_ack_gated_verdict() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Distinct agents: may fail if panes missing, but must finish < 30s and not panic.
     let t1 = std::time::Instant::now();
     let out = Command::new(exe)
         .args([
@@ -253,12 +250,8 @@ fn debate_soak_three_rounds_ack_gated_verdict() {
         "debate wall clock budget exceeded: {:?}",
         t1.elapsed()
     );
-    // success optional (needs live agents); failure must be structured (exit 1)
     if out.status.success() {
         let stdout = String::from_utf8_lossy(&out.stdout);
-        // review-fix F9/F1: a SUCCESSFUL debate must produce a real verdict —
-        // the judge line (which harvests reply bodies, not subjects). Assert
-        // the verdict marker so a contentless debate cannot silently pass.
         assert!(
             stdout.contains("verdict"),
             "successful debate must print a verdict: {stdout}"
@@ -268,8 +261,6 @@ fn debate_soak_three_rounds_ack_gated_verdict() {
             "successful debate must harvest the judge's verdict: {stdout}"
         );
     } else {
-        // acceptable only when live agents are absent — the skip reason must be
-        // explicit, and a panic is never acceptable
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(!err.contains("panic"), "debate must not panic: {err}");
         eprintln!(
@@ -286,8 +277,6 @@ fn plan_review_implement_soak_three_paths() {
     let out = run(&["plan-review", "--help"]);
     assert!(out.status.success());
 
-    // unit-level paths already in plan_review_tests; assert binary embeds tokens
-    // via help text / --help mentioning max-change-rounds
     let help = String::from_utf8_lossy(&out.stdout);
     assert!(help.contains("max-change-rounds") || help.contains("FEATURE"));
 
@@ -301,7 +290,6 @@ fn plan_review_implement_soak_three_paths() {
         return;
     }
 
-    // Missing agents: must exit without multi-minute hang
     let t0 = std::time::Instant::now();
     let out = Command::new(exe)
         .args([
@@ -324,7 +312,6 @@ fn plan_review_implement_soak_three_paths() {
         "plan-review hung: {:?}",
         t0.elapsed()
     );
-    // may fail settle; must not panic
     assert!(
         !String::from_utf8_lossy(&out.stderr).contains("panic"),
         "stderr={}",
@@ -340,9 +327,6 @@ fn peer_triggered_soak_a_wakes_b() {
     let help = String::from_utf8_lossy(&out.stdout);
     assert!(help.contains("--peer-aware"));
 
-    // Peer-aware spawn template documents peer mail wake (AGENTS.md was
-    // trimmed to repo invariants; the peer contract lives in the template
-    // injected into every peer-aware pane).
     let tpl =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("integrations/peer-aware.md.tpl");
     let body = std::fs::read_to_string(&tpl).unwrap_or_default();
@@ -367,9 +351,6 @@ fn cross_project_xproj_and_product_surface() {
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
     assert_eq!(v["recipe"], "soak");
 
-    // Opt-in: the mail probe and the inbox leaf below each open the
-    // configured mail store and register a project there
-    // (`flywheel-mail-probe`, `flywheel-xproj-e2e`).
     if !live_e2e_opted_in() {
         eprintln!("{LIVE_E2E} unset — live xproj inbox skipped (parse contract covered above)");
         return;
@@ -379,25 +360,7 @@ fn cross_project_xproj_and_product_surface() {
         eprintln!("mail down — skip the product surface");
         return;
     }
-    // bd-3mjv: the `mail product ensure --name trading-research` call that used
-    // to sit here is gone. Two reasons, both measured.
-    //
-    // 1. It asserted only `!stderr.contains("panic")` — a tautology that says a
-    //    process did not print one word, and it is the only reason the block
-    //    existed at all.
-    // 2. It MUTATED the operator's live state. `ensure_product` signs a
-    //    kind-30011 manifest with the OPERATOR key and publishes it, and the verb
-    //    takes no --project and no store override, so there is no way to aim it at
-    //    a scratch dir. The row is still there: the live index.sqlite carries
-    //    product id=1 `trading-research`, created 2026-08-08T21:31:25Z by a suite
-    //    run. It is idempotent (re-reads if present), which is why it never
-    //    failed — a test that writes to the operator's identity store and is
-    //    green either way.
-    //
-    // The cross-project PARSE contract above is the real subject of this test and
-    // it is hermetic; the xproj-inbox leaf below still runs.
 
-    // xproj-inbox leaf soft-empty
     let out = Command::new(exe)
         .args(["__xproj-inbox", "/tmp/flywheel-xproj-e2e", "--limit", "5"])
         .output()

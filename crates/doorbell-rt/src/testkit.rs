@@ -61,8 +61,6 @@ pub fn apply_test_env(cmd: &mut Command) -> &mut Command {
         .env("XDG_DATA_HOME", home.join(".local").join("share"))
         .env("XDG_CACHE_HOME", home.join(".cache"))
         .env("TMPDIR", &root)
-        // A path under the sandbox that was never bound: a child that dials it
-        // fails here instead of reaching the operator's live multiplexer.
         .env("HC_SOCKET_PATH", root.join("no-hc.sock"))
         .env_remove("TORON_MCP_URL")
 }
@@ -97,8 +95,6 @@ mod tests {
             );
         }
         assert!(!std::path::Path::new(&envs["HC_SOCKET_PATH"]).exists());
-        // A removal is RECORDED, not merely absent: the child must see it gone
-        // even when the parent never exported it.
         assert_eq!(
             cmd.get_envs()
                 .find(|(k, _)| *k == "TORON_MCP_URL")

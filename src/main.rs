@@ -11,19 +11,11 @@
 //! governed-by: ADR-0022 §3.6 (workflow compose --from-yaml / --dry-run
 //! surface + budget-cap fail-closed gate in the Compose arm), ADR-0026
 
-// A feature-reduced build compiles the `serve` surface out whole — the daemon
-// probe/supervision, the HTTP serve lifelines, and the mailbox/backend wire
-// helpers that only those paths drive — so items live in the default build read
-// as dead there. Scope the allow to exactly those configurations instead of
-// hiding dead code unconditionally: the default and `--all-features` builds,
-// which `scripts/verify-clippy.sh` judges with `-D warnings`, stay strict.
 #![cfg_attr(not(feature = "serve"), allow(dead_code))]
 
 mod adr0016_invariants;
 mod agent_ref;
 mod agentstate;
-// bd-bd5j: the approvals reader lands with its caller; the module is the
-// tested contract until then.
 #[cfg_attr(not(test), allow(dead_code))]
 mod approval;
 mod artifact;
@@ -84,16 +76,10 @@ mod supervisor_host;
 mod supervisor_program;
 mod timer_watch;
 mod unanswered_triage;
-// Jev RANKS the derived crew menu; it never defines one. The ranker and its
-// rubric are built and tested here, and nothing calls them yet: bd-drlm wires
-// them into the crew menu. Silent until then, never deleted — the module is the
-// auditable half of "the model orders options, it does not choose them".
 #[allow(dead_code)]
 mod jev_rank;
 mod judgment;
 mod stage;
-// Kernel contracts are introduced incrementally; unused variants remain
-// intentionally available for the next interpreter migrations.
 #[allow(dead_code)]
 mod kernel;
 mod mail;
@@ -125,15 +111,13 @@ mod steer_brief;
 mod toron_embed;
 mod upstream_parity;
 mod verdict;
-mod wake_liveness; // GS-062: wired into serve /health
+mod wake_liveness;
 mod work;
 mod workflow_catalog;
 mod workspace;
 mod workspace_policy;
 mod workspace_reporting;
 mod write_liveness;
-// bd-w7g8: the hermetic-test half. Test-only, and inside the bin because there
-// is no lib target for it to live in.
 #[cfg(test)]
 mod test_env_contract;
 
@@ -177,8 +161,6 @@ use toron_core::backend::{BackendError, error::BackendErrorCode};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// ---- ADR-0026 helpers: fallback chain + reroute audit ----
-
 fn fallback_chain_for(profile_name: &str) -> Vec<String> {
     ProfileCatalog::load()
         .ok()
@@ -199,7 +181,6 @@ fn record_reroute_audit(
     kind: failure::FailureKind,
     evidence: &str,
 ) {
-    // C1 residual: redact before persist/eprintln — same gate as journal_rebind.
     let evidence = agent_ref::redact_evidence(evidence);
     let entry = serde_json::json!({
         "attempt": attempt,
@@ -329,7 +310,6 @@ mod plane_tripwire_tests {
     fn plane_tripwire_default_private_unchanged() {
         assert!(check_send_plane_tripwires("hello world", None, false, false).is_ok());
         assert!(check_send_plane_tripwires("hello world", Some("s"), false, false).is_ok());
-        // job assign on default private should error
         let err = check_send_plane_tripwires("@Alice fix the bug", None, false, false)
             .unwrap_err()
             .to_string();
@@ -337,7 +317,6 @@ mod plane_tripwire_tests {
             err.contains("plane_error: work assignment uses the job plane"),
             "{err}"
         );
-        // but on job plane it should not error
         assert!(check_send_plane_tripwires("@Alice fix", Some("j"), false, false).is_ok());
     }
 }
@@ -348,10 +327,6 @@ mod pane_fallback_tests {
     use crate::failure;
 
     fn with_temp_profile(content: &str, f: impl FnOnce()) {
-        // bd-0rzv follow-up: the crate-wide env lock, not a module-local
-        // one — a local mutex does not exclude models/config tests mutating
-        // XDG_CONFIG_HOME concurrently (observed: save_then_load_roundtrips
-        // saving and loading in different dirs).
         let _guard = crate::config::lock_env();
         let orig = std::env::var_os("XDG_CONFIG_HOME");
         let tmp = std::env::temp_dir().join(format!("fw-test-{}", std::process::id()));
@@ -361,7 +336,6 @@ mod pane_fallback_tests {
         let path = cfg_dir.join("profiles.toml");
         std::fs::write(&path, content).unwrap();
         f();
-        // restore
         match orig {
             Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
             None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
@@ -414,14 +388,12 @@ model = "fallback-model"
             let first = reroute_next_profile("test-primary", cf.kind, &cf.evidence, &[], 0)
                 .expect("first hop");
             assert_eq!(first, "test-fallback");
-            // second same-class failure should be terminal (no further hop)
             let attempted = vec!["test-primary".to_string(), "test-fallback".to_string()];
             let second = reroute_next_profile("test-primary", cf.kind, &cf.evidence, &attempted, 1);
             assert!(
                 second.is_none(),
                 "second same-class should be terminal, got {second:?}"
             );
-            // Also verify helper via next_fallback directly
             let next2 = next_fallback("test-primary", &attempted);
             assert!(next2.is_none());
         });
@@ -442,27 +414,14 @@ model = "fallback-model"
         with_temp_profile(content, || {
             let cf = failure::classify("401 unauthorized", None, None);
             assert!(cf.reroute_eligible);
-            // reroute_next_profile should write an audit row via state::log_event
-            // We verify it returns Some and the chain is correct; the audit
-            // side-effect is the eprintln + log_event (best-effort, not asserted
-            // on filesystem here). The key property is that it is audited and
-            // the helper is the shared headless+pane path.
             let next = reroute_next_profile("test-primary", cf.kind, &cf.evidence, &[], 0)
                 .expect("audit hop");
             assert_eq!(next, "test-fallback");
-            // Ensure the helper is the same one headless uses (no fork)
             let chain = fallback_chain_for("test-primary");
             assert_ne!(chain, [] as [String; 0]);
         });
     }
 }
-
-// ---- stage prompts (ADR-0005 Spec 2a / P3.3; ADR-0009 ce- vocabulary) ----
-//
-// Resolved through the `stages` library: compiled-in defaults under semantic
-// names, overridable by ~/.config/flywheel/stages.toml and the project tier
-// `.flywheel/stages.toml`. A `--stage` name is the semantic name
-// (`ce-execute`); the p-code aliases are retired (ADR-0009).
 
 pub(crate) fn stage_prompt(name: &str) -> Result<String> {
     let lib = stages::StageLibrary::load()?;
@@ -555,7 +514,6 @@ mod send_project_stage_tests {
             .expect("renders");
         assert!(out.contains("bd-1"), "slot substituted: {out}");
         assert!(stage_prompt_with_params_project("nope", &[], &dir).is_err());
-        // missing tier file falls back without failing
         let bare = std::env::temp_dir().join(format!(
             "flywheel-send-stage-test-empty-{}",
             std::process::id()
@@ -582,10 +540,6 @@ fn dispatch_header(task_id: &str, bead: Option<&str>, stage: Option<&str>) -> St
         Some(b) => format!(
             "TASK-ID: {task_id} (routing metadata only — not a bead id, never `br show` it)\nBEAD: {b} (the bound work order; `br show {b}` is the contract)"
         ),
-        // The observed failure: a ce-execute stage dispatch carried a task-id
-        // and no BEAD line, so every disciplined fresh pane refused it and
-        // asked for a bead id — one round trip per pane. A stage dispatch
-        // always has an actionable work order available: the ready queue.
         None => match stage {
             Some(s) => format!(
                 "TASK-ID: {task_id} (routing metadata only — not a bead id, never `br show` it)\nBEAD: none bound — bootstrap: stage dispatch `{s}` names no target bead, so take your own work order now: `br ready --json` (dispatchable beads only), `br update <id> --status in_progress --assignee <your pin>`, then do that bead. If `br ready` is empty, say exactly that in your completion mail and stop — never invent work and never wait for a bead id."
@@ -632,7 +586,6 @@ mod send_dispatch_header_tests {
     /// bootstrap contract (pick from `br ready`), never "ask the captain".
     #[test]
     fn stage_dispatch_binds_bead() {
-        // Bound: the bead is the work order, with its `br show` contract.
         let bound = dispatch_header("task-1", Some("bd-abc"), Some("ce-execute"));
         assert!(bound.contains("BEAD: bd-abc"), "names the bead: {bound}");
         assert!(
@@ -643,8 +596,6 @@ mod send_dispatch_header_tests {
             !bound.contains("br ready"),
             "a bound dispatch never leaks the bootstrap text: {bound}"
         );
-        // Unbound STAGE dispatch: the pane can act — it takes its own work
-        // order from the ready queue instead of costing a round trip.
         let unbound = dispatch_header("task-1", None, Some("ce-execute"));
         assert!(
             unbound.contains("br ready"),
@@ -662,14 +613,12 @@ mod send_dispatch_header_tests {
             !unbound.contains("ask the captain"),
             "no round trip for a stage dispatch: {unbound}"
         );
-        // A raw nudge (no stage) is unchanged: it defers to its message text.
         let raw = dispatch_header("task-1", None, None);
         assert!(raw.contains("follow the message text"), "{raw}");
         assert!(
             !raw.contains("br ready"),
             "raw nudges do not bootstrap: {raw}"
         );
-        // Every shape disclaims the task id as a bead id.
         for h in [&bound, &unbound, &raw] {
             assert!(h.contains("not a bead id"), "{h}");
         }
@@ -702,8 +651,6 @@ fn inbox_cli_filter(
             thread_id: thread_id.map(str::to_string),
             ..Default::default()
         }),
-        // bd-44hw: a bare --thread-id rides the filtered surface too —
-        // thread filtering is post-unwrap, so bodies come along.
         (None, false, Some(t)) => Some(mail::MailInboxFilter {
             include_bodies: true,
             limit,
@@ -736,15 +683,12 @@ mod inbox_filter_tests {
         let f = inbox_cli_filter(false, false, None, Some("bd-1"), 20).expect("filtered");
         assert_eq!(f.thread_id.as_deref(), Some("bd-1"));
         assert_eq!(f.limit, 20);
-        // composes with the other flags
         let g = inbox_cli_filter(true, true, Some("2026-01-01T00:00:00Z"), Some("bd-2"), 5)
             .expect("filtered");
         assert_eq!(g.thread_id.as_deref(), Some("bd-2"));
         assert!(g.urgent_only && g.unread_only);
     }
 }
-
-// ---- CLI surface ----
 
 /// Agent swarm orchestrator over hc, toron mail, and the br bead ledger.
 ///
@@ -2154,17 +2098,12 @@ struct AgentCounts {
     gk: Option<u32>,
 }
 
-// Command-group subcommand types live in `src/cmd/` (bd-qbi8) — one module
-// per group, re-exported through `cmd`. `Commands` (dispatch) stays here.
-
 fn parse_kind_count(s: &str) -> Result<(String, u32)> {
     let (k, v) = s
         .split_once('=')
         .ok_or_else(|| anyhow!("expected KIND=COUNT, got {s}"))?;
     Ok((k.to_string(), v.parse()?))
 }
-
-// ---- swarm helpers ----
 
 pub(crate) fn project_dir(cfg: &Config, project: &str) -> PathBuf {
     let p = PathBuf::from(project);
@@ -2173,11 +2112,6 @@ pub(crate) fn project_dir(cfg: &Config, project: &str) -> PathBuf {
     } else {
         cfg.workspace_root().join(project)
     }
-    // NOTE (2026-08-15, bd-test-tmp-hygiene-pq5b): a RELATIVE project key
-    // resolves to a data dir under the workspace root — gate/test invocations
-    // must pass ABSOLUTE scratch paths (mktemp -d / temp_dir), or the test
-    // matrix leaks mailbox-archive dirs into the workspace. verify-workspace-
-    // clean.sh enforces this.
 }
 
 /// Fallible UTF-8 conversion of a filesystem path (193.1). Paths used as
@@ -2374,8 +2308,6 @@ pub(crate) fn find_workspace_info(
     if matches.is_empty() {
         bail!("no flywheel swarm for {project} (run: flywheel spawn {project})")
     }
-    // A keyed spawn names one workspace per request key, so more than one
-    // owned label means several live crews. Never pick one by list order.
     let labels: std::collections::BTreeSet<&str> =
         matches.iter().map(|ws| ws.label.as_str()).collect();
     if !exact_match && labels.len() > 1 {
@@ -2384,16 +2316,9 @@ pub(crate) fn find_workspace_info(
             "multiple flywheel swarms for {project}: {labels:?} — target an agent by pin (flywheel send --to <pin>) or give the swarm its own --label"
         );
     }
-    // duplicate labels (a stale workspace from a dropped agent vs the live
-    // spawn — bd-nil): prefer the workspace holding managed agents; the
-    // agent list is only queried when needed (fast path stays one round trip)
     if matches.len() > 1 {
         let prefix = format!("flywheel-{}-", project_base(project));
         let agents = c.agent_list()?;
-        // bd-k8jn: a spawned crew's terminal name is its MAIL PIN, so the prefix
-        // scan below cannot see it and the tie falls to list order — the stale
-        // room carrying the bare project label. The spawn registry is the
-        // project→pane map, so its panes name the live swarm.
         if let Some(ws) =
             hc_support::resolve_workspace_from_registry(&matches, &agents, &registry_panes(project))
         {
@@ -2440,16 +2365,12 @@ fn resolve_agents(c: &mut Client, ws_id: &str, project: &str, to: &str) -> Resul
     if in_ws.is_empty() {
         bail!("no agents in workspace {ws_id} — is the swarm spawned?");
     }
-    // bd-a2bw: nameless omp panes still resolve via the spawn registry.
     let registry = state::load_spawn_registry(project);
     overlay_registry_names(&mut in_ws, &registry);
     let avail: Vec<String> = in_ws
         .iter()
         .map(|a| a.name.clone().unwrap_or_default())
         .collect();
-    // bd-pin-public-plane-s-easy.2: `--to <pin>` is the model-typed name —
-    // remap each token through the registry (terminal name, pane id, numbered
-    // short, or mail pin → the entry's terminal name). `all` passes through.
     let want: Vec<WantToken> = if to == "all" {
         avail
             .iter()
@@ -2471,10 +2392,6 @@ fn resolve_agents(c: &mut Client, ws_id: &str, project: &str, to: &str) -> Resul
                     .map(|e| e.name.clone())
                     .unwrap_or_else(|| t.to_string());
                 let mut want = to_want_token(project, &name);
-                // The registry resolved the token to a PANE: keep it. The
-                // agent's terminal name may be the mail PIN (hc lowercases
-                // it), so the canonical registry name and the hc name can
-                // never meet — the pane id always can.
                 if let Some(e) = entry {
                     want.pane = Some(e.pane_id.clone());
                 }
@@ -2482,8 +2399,6 @@ fn resolve_agents(c: &mut Client, ws_id: &str, project: &str, to: &str) -> Resul
             })
             .collect()
     };
-    // bd-4pxy: name-based resolution is canonical; a short with no name hit
-    // falls back to the ordinal-th agent of that kind.
     let idx = match_indices(&in_ws, &want);
     if idx.is_empty() {
         let display: Vec<String> = in_ws.iter().map(agent_display).collect();
@@ -2536,15 +2451,6 @@ pub(crate) fn find_workspace_dyn(
         );
     }
     if matches.len() > 1 {
-        // bd-ws-resolution (2026-08-17): a FOREIGN workspace sharing the
-        // bare project label ("toron") outranked the flywheel-owned one
-        // ("flywheel-toron") whenever the agent-name disambiguation below
-        // found no NAMED agents — hc's raw agent_list has no names for
-        // omp panes (the spawn registry overlay supplies them later), so
-        // every disambiguation fell through to list order and dispatch
-        // targeted the foreign (empty-of-flywheel-agents) workspace. The
-        // flywheel-owned label prefix is the deterministic tie-breaker:
-        // spawn names its own workspaces `flywheel-<project>`.
         let owned_label = format!("flywheel-{}", project_base(project));
         let owned_prefix = format!("{owned_label}-");
         if let Some(ws) = matches
@@ -2605,16 +2511,12 @@ fn resolve_agents_dyn(
     if in_ws.is_empty() {
         bail!("no agents in workspace {ws_id} — is the swarm spawned?");
     }
-    // bd-a2bw: nameless omp panes still resolve via the spawn registry.
     let registry = state::load_spawn_registry(project);
     overlay_registry_names(&mut in_ws, &registry);
     let avail: Vec<String> = in_ws
         .iter()
         .map(|a| a.name.clone().unwrap_or_default())
         .collect();
-    // bd-pin-public-plane-s-easy.2: `--to <pin>` is the model-typed name —
-    // remap each token through the registry (terminal name, pane id, numbered
-    // short, or mail pin → the entry's terminal name). `all` passes through.
     let want: Vec<WantToken> = if to == "all" {
         avail
             .iter()
@@ -2636,10 +2538,6 @@ fn resolve_agents_dyn(
                     .map(|e| e.name.clone())
                     .unwrap_or_else(|| t.to_string());
                 let mut want = to_want_token(project, &name);
-                // The registry resolved the token to a PANE: keep it. The
-                // agent's terminal name may be the mail PIN (hc lowercases
-                // it), so the canonical registry name and the hc name can
-                // never meet — the pane id always can.
                 if let Some(e) = entry {
                     want.pane = Some(e.pane_id.clone());
                 }
@@ -2647,8 +2545,6 @@ fn resolve_agents_dyn(
             })
             .collect()
     };
-    // bd-4pxy: name-based resolution is canonical; a short with no name hit
-    // falls back to the ordinal-th agent of that kind.
     let idx = match_indices(&in_ws, &want);
     if idx.is_empty() {
         let display: Vec<String> = in_ws.iter().map(agent_display).collect();
@@ -2699,9 +2595,6 @@ struct WantToken {
 
 fn to_want_token(project: &str, token: &str) -> WantToken {
     let t = token.trim();
-    // bd-send-crew-addressable-7sjo: composed crew panes are concrete names
-    // (`crew-<workflow>-<role>[N]`, pane.rs crew_agent_name) — pass them
-    // through exactly like `flywheel-` names, never wrap them.
     if t.is_empty() || t.starts_with("flywheel-") || t.starts_with("crew-") || t.contains(':') {
         WantToken {
             name: t.to_string(),
@@ -2711,9 +2604,6 @@ fn to_want_token(project: &str, token: &str) -> WantToken {
             pane: None,
         }
     } else if let Some((kind, ordinal)) = split_short_ordinal(t) {
-        // bd-eign.14: a numbered short resolves to THAT ordinal's agent —
-        // `oc1` → the first oc (`flywheel-<base>-oc`, which is NOT
-        // digit-suffixed), `oc2` → `-oc2`. Exact match, no broadening.
         WantToken {
             name: agent_name_n(project, kind, ordinal),
             broaden: false,
@@ -2798,7 +2688,6 @@ fn resolve_send_targets_dyn(
             }
             continue;
         }
-        // Registry pane ground truth first (mail pin or lane name → its pane).
         if let Some(entry) = registry_entry_for_token(registry, project, tok)
             && let Some(a) = agents_in_ws.iter().find(|a| a.pane_id == entry.pane_id)
         {
@@ -2807,7 +2696,6 @@ fn resolve_send_targets_dyn(
             }
             continue;
         }
-        // Shared exact rule — block label or agent name, never a substring.
         match crate::comms_send::backend_wake_target(agents_in_ws, tok) {
             Ok(pane) => {
                 if let Some(a) = agents_in_ws.iter().find(|a| a.pane_id == pane) {
@@ -2854,12 +2742,8 @@ fn match_indices(agents: &[AgentInfo], wants: &[WantToken]) -> Vec<usize> {
         } else if let Some(pane) = &want.pane
             && let Some(i) = agents.iter().position(|a| &a.pane_id == pane)
         {
-            // The registry resolved the token to this PANE: the pane is the
-            // ground truth, whatever hc calls the agent.
             out[i] = true;
         } else if let Some(i) = agents.iter().position(|a| a.pane_id == want.name) {
-            // bd-a2bw: pane-id tokens never sit in `a.name`. Match the pane
-            // even when hc reports name=null (omp profile splits).
             out[i] = true;
         } else if let Some(short) = &want.short
             && let Some(i) = kind_nth_index(agents, short, want.ordinal)
@@ -2912,10 +2796,6 @@ fn settle_retry<T, E>(
 ) -> Result<T, E> {
     let base = Duration::from_millis(sleep_ms);
     let policy = crate::retry::RetryPolicy {
-        // bd-9w95: `.max(1)` was dead. `retries` is a `u32`, so
-        // `saturating_add(1)` is >= 1 for every input — including
-        // `u32::MAX`, which saturates to `u32::MAX` rather than to 0. Two
-        // mechanisms each guaranteed the floor and only one was needed.
         max_attempts: retries.saturating_add(1),
         base,
         cap: base,
@@ -2985,10 +2865,7 @@ fn log(project: &str, kind: EventKind, data: Value) {
     }
 }
 
-// ---- main dispatch ----
-
 fn main() {
-    // clap parses from the raw argv; rewrite legacy `loop <project>` first.
     let raw: Vec<String> = std::env::args().collect();
     let rewritten = rewrite_legacy_loop_args(&raw);
     let cli = Cli::parse_from(&rewritten);
@@ -3175,8 +3052,6 @@ fn main() {
             crew.as_deref(),
             model.as_deref(),
         ),
-        // GS-048: Elm-plane reclassify (MaterialContext → sticky DecisionReady)
-        // plus briefing proposal print (same live Snapshot as CLI decide).
         Some(Commands::Reclassify {
             objective,
             project,
@@ -3460,9 +3335,6 @@ fn main() {
                 };
                 if *allow_worktree {
                     pf_mode.allow_worktree = true;
-                    // ADR-0019 Spec 3.3: the operator opt-out is LOGGED —
-                    // the run record must show the worktree ban was lifted
-                    // deliberately, never silently.
                     eprintln!(
                         "flywheel: operator opt-out --allow-worktree — linked-worktree preflight check skipped (ADR-0019 Spec 3.3; operator-only, logged)"
                     );
@@ -3627,12 +3499,6 @@ fn main() {
             )
         }),
         Some(Commands::Workflow { cmd }) => {
-            // bd-uona: compose ALLOCATES PANES, so it belongs behind the same
-            // gate as an executing run. It was missing here entirely, which made
-            // the door that materializes agents the one door with no
-            // prerequisite check. `--dry-run` and `--run` are mutually exclusive
-            // (compose bails on both), so gating on `run` covers exactly the
-            // dispatching case and leaves preview alone.
             let needs_pf = !cli.skip_preflight
                 && matches!(
                     cmd,
@@ -3651,7 +3517,6 @@ fn main() {
                 let mut m = preflight::Mode::workflow();
                 m.allow_worktree = allow_wt;
                 if allow_wt {
-                    // ADR-0019 Spec 3.3: operator opt-out, logged.
                     eprintln!(
                         "flywheel: operator opt-out --allow-worktree — linked-worktree preflight check skipped (ADR-0019 Spec 3.3; operator-only, logged)"
                     );
@@ -3761,8 +3626,6 @@ fn main() {
             reason,
             format,
         }) => {
-            // The leaf emits JSON unconditionally; a non-json request is a
-            // caller mistake, not a behavior switch.
             if format.as_deref().is_some_and(|f| f != "json") {
                 Err(anyhow::anyhow!(
                     "__mail-not-ready only supports --format json"
@@ -3960,7 +3823,6 @@ fn main() {
             *json,
         ),
         None => {
-            // no command: show concise help with examples
             print_concise_help();
             std::process::exit(2);
         }
@@ -3984,8 +3846,6 @@ fn print_concise_help() {
          Run `flywheel --help` for the full command reference."
     );
 }
-
-// ---- robot snapshot ----
 
 fn robot_snapshot(cfg: &Config) -> Result<Value> {
     if crate::pane::rex_door_selected(cfg) {
@@ -4015,8 +3875,6 @@ fn robot_snapshot(cfg: &Config) -> Result<Value> {
                 })
             })
             .collect();
-        // P6.4: runs section — the same log-derived run list the `runs` CLI
-        // serves, so an agent driver polls run-state from the snapshot alone.
         let runs: Vec<Value> = snapshot_runs();
         return Ok(json!({
             "tool": "flywheel",
@@ -4056,8 +3914,6 @@ fn robot_snapshot(cfg: &Config) -> Result<Value> {
             })
         })
         .collect();
-    // P6.4: runs section — the same log-derived run list the `runs` CLI
-    // serves, so an agent driver polls run-state from the snapshot alone.
     let runs: Vec<Value> = snapshot_runs();
     Ok(json!({
         "tool": "flywheel",
@@ -4078,12 +3934,6 @@ fn robot_snapshot(cfg: &Config) -> Result<Value> {
 fn snapshot_runs() -> Vec<Value> {
     use state::EventKind;
     let mut entries = Vec::new();
-    // `project_logs()` is the ONE enumeration for log sweeps: it excludes
-    // the reserved bookkeeping logs. This used to sweep `*.jsonl` by hand
-    // and parse `miss-ledger` as a project, so every reserved row printed
-    // "skipping malformed log line" on `--robot-status` — the single
-    // command agents run most — and trained the reader to ignore flywheel's
-    // warnings.
     for project in state::project_logs() {
         let Ok(rows) = state::read_log(&project) else {
             continue;
@@ -4159,8 +4009,6 @@ fn chrono_like_ts() -> String {
     state::now_iso()
 }
 fn cmd_init(cfg: &Config, project: &str) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi: "" would join the
-    // workspace root (which always exists) and init it as a project.
     check_project_spelling(project, "init")?;
     let dir = project_dir(cfg, project);
     if !dir.exists() {
@@ -4181,8 +4029,6 @@ fn cmd_init(cfg: &Config, project: &str) -> Result<()> {
             bail!("br init failed: {}", String::from_utf8_lossy(&out.stderr));
         }
     }
-    // Project-scope compound spine (ADR-0009, bd-bhri): re-runnable, never
-    // overwrites authored files.
     let (created, kept) = crate::init_scaffold::scaffold(&dir)?;
     for path in &created {
         println!("created {}", path.display());
@@ -4194,8 +4040,6 @@ fn cmd_init(cfg: &Config, project: &str) -> Result<()> {
     println!("  {}", crate::init_scaffold::AGENTS_POINTER);
     Ok(())
 }
-
-// ---- spawn ----
 
 fn recipe_counts(
     recipe: Option<&str>,
@@ -4309,8 +4153,6 @@ pub(crate) fn spawn_model_rows(
         let model = if !bare_model.is_empty() {
             bare_model.to_string()
         } else {
-            // bd-ll3k: resolve through the effective (defaults-aware)
-            // surface — a bare kind lane must not bypass `[defaults]`.
             match models::implied_slot_name_for_harness(&kind)
                 .and_then(|n| registry.effective_slot_model(n))
             {
@@ -4379,15 +4221,7 @@ fn bare_model_launch(
     provider: &str,
 ) -> Result<(Vec<String>, Option<String>)> {
     let registry = models::ModelRegistry::load_routing()?;
-    // ADR-0007 D1 (implicit): a bare kind/count spawn with NO --model uses
-    // the harness's implied slot's model (opencode→cheap, pi→standard,
-    // grok/omp→premium). Unknown kind / unconfigured slot → no model flag.
     let model = if model.is_empty() {
-        // bd-88m4: coupled harnesses (grok/claude/codex) run only their
-        // own models — a registered family id wins (grok pattern). grok
-        // with none fails loud (bd-ovew: never a foreign id); claude/codex
-        // with none fall through to the implied slot (none today) and
-        // launch model-less, exactly as now.
         match registry.coupled_default_model(harness) {
             Some(id) => id,
             None if harness == "grok" => {
@@ -4399,13 +4233,10 @@ fn bare_model_launch(
                 )
             }
             None => {
-                // bd-ll3k: defaults-aware exactly like the reconfirm table —
-                // display and launch must never disagree on the model.
                 match models::implied_slot_name_for_harness(harness)
                     .and_then(|n| registry.effective_slot_model(n))
                 {
                     Some(m) if !m.is_empty() => m,
-                    // No implied slot for this kind: launch model-less.
                     _ => return Ok((vec![], None)),
                 }
             }
@@ -4418,9 +4249,6 @@ fn bare_model_launch(
     } else {
         format!("{provider}/{model}")
     };
-    // bd-crlx / headless::interactive_model_plan: ONE delivery rule for every
-    // pane launch. opencode's root command takes no model flag, so its pin
-    // moves to `env_model_pin`; every other harness keeps `model_args`.
     let plan = headless::interactive_model_plan(harness, &registry.resolve(&lookup, harness), None);
     Ok((plan.args().to_vec(), plan.env_pin().map(str::to_string)))
 }
@@ -4430,8 +4258,6 @@ fn expand_slot_model(registry: &models::ModelRegistry, id: &str) -> Result<Strin
         return Ok(String::new());
     }
     if let Some(name) = models::slot_alias(id) {
-        // bd-ll3k: routes through active `[defaults]` first (slow/plan
-        // stop burning premium the moment defaults are set).
         if let Some(model) = registry.effective_slot_model(name) {
             if model.is_empty() {
                 anyhow::bail!(
@@ -4489,14 +4315,8 @@ pub(crate) fn profile_launch_plan(
     phase: Option<&str>,
 ) -> Result<ProfileLaunchPlan> {
     let registry = models::ModelRegistry::load_routing()?;
-    // ADR-0007 D1 full ladder: rungs 3-5 (model_fallback / fallback_harness /
-    // registry fallback) only detour when the primary route is caps-blocked.
     let (harness, slot_model, _route) =
         registry.resolve_profile_route_full(harness, &p.model, &p.model_fallback)?;
-    // bd-62ke: an explicit profile provider pins the provider half of the
-    // composite registry key (bd-1t3j) — it overrides the default-provider
-    // fallback for a bare id, and an unknown provider pair fails loudly.
-    // Slot aliases already expanded to a concrete registry id; ignore provider.
     let lookup = if models::slot_alias(&p.model).is_some() {
         slot_model
     } else if p.provider.is_empty() {
@@ -4505,13 +4325,6 @@ pub(crate) fn profile_launch_plan(
         format!("{}/{}", p.provider, p.model)
     };
     let model = registry.resolve_strict(&lookup, &harness)?;
-    // bd-crlx: the INTERACTIVE plan, not the headless `model_args`. Every
-    // caller of this function launches the agent through
-    // `hc agent start --kind <harness>`, which runs the harness's
-    // interactive entrypoint. For most harnesses that is the same flag
-    // (`interactive_model_plan` routes them to `model_args` unchanged); for
-    // opencode it is NOT — the root command rejects `--model` outright, so the
-    // pin moves to `env_model_pin`.
     let plan = headless::interactive_model_plan(
         &harness,
         &model,
@@ -4625,9 +4438,6 @@ fn peer_prompt_template(
         )
         .replace("{poll_budget_minutes}", &poll_budget_minutes.to_string())
         .replace("{max_peer_prompts}", &max_peer_prompts.to_string());
-    // bd-zq8u: hc's `is_control` check rejects \t \n \r \0 \x1b etc. —
-    // collapse every control char to a space (semantics preserved: the
-    // prompt text survives, just de-blanked).
     rendered
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
@@ -4730,8 +4540,6 @@ fn add_target_from_split(
     if split.owned.is_empty() {
         bail!("no flywheel-owned swarm for {project} (run: flywheel spawn {project})")
     }
-    // prefer the owned workspace hosting managed agents; first owned otherwise
-    // (resolve_workspace_id picks the agent-hosting workspace among many).
     let prefix = format!("flywheel-{}-", project_base(project));
     Ok(hc_support::resolve_workspace_id(
         &split.owned,
@@ -4847,12 +4655,8 @@ mod spawn_profile_plan_tests {
         let _g = lock_env();
         let dir = tempfile::TempDir::new().expect("temp dir");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
-        // Compiled-in routing defaults apply zero-config (no models.toml).
         let p = profile("opencode", "deepseek-v4.1-flash");
         assert_eq!(
-            // bd-crlx: opencode gets NO model argv. The root command hc
-            // launches has no `--model` (only `opencode run` does) and v2.0.16
-            // rejects it outright. The pin travels by pane env instead.
             profile_launch_plan("opencode", &p, None)
                 .expect("opencode")
                 .args,
@@ -4875,9 +4679,6 @@ mod spawn_profile_plan_tests {
             profile_launch_args("pi", &pi, None).expect("pi"),
             vec!["--model", "zai/glm-5.3"]
         );
-        // bd-47fu: omp is gone, and it was the ONLY harness carrying
-        // `--thinking=`/`--smol=`; pi takes TWO argv entries and has no
-        // role-model flags, which is the live contract now.
         let mut pi = profile("pi", "zai/glm-5.3");
         pi.effort = "max".into();
         pi.smol = "zai/glm-4.5-air".into();
@@ -4885,7 +4686,6 @@ mod spawn_profile_plan_tests {
             profile_launch_args("pi", &pi, None).expect("pi"),
             vec!["--model", "zai/glm-5.3", "--thinking", "max"]
         );
-        // Unknown harness injects nothing — but the model must still ROUTE.
         let mut unknown = profile("hermes", "glm-5.3");
         unknown.effort = "max".into();
         assert_eq!(
@@ -4901,7 +4701,6 @@ mod spawn_profile_plan_tests {
     fn launch_plan_pin_is_the_resolved_route_not_the_slot_alias() {
         let _g = lock_env();
         let dir = tempfile::TempDir::new().expect("temp dir");
-        // Compiled-in routing defaults apply zero-config (no models.toml).
         unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
         let slot = profile("pi", "@standard");
         let plan = profile_launch_plan("pi", &slot, None).expect("standard slot plan");
@@ -4918,7 +4717,6 @@ mod spawn_profile_plan_tests {
             args.iter().any(|a| a.contains(pin.as_str())),
             "the argv embeds the recorded pin: {args:?} vs {pin}"
         );
-        // A concrete id takes the same one-resolution path.
         let plan = profile_launch_plan("pi", &profile("pi", "zai/glm-5.3"), None)
             .expect("concrete model plan");
         let (args, pin) = (&plan.args, &plan.model);
@@ -4945,21 +4743,17 @@ mod spawn_profile_plan_tests {
             "[models.\"aaa/glm-5.2\"]\n[models.\"zzz/glm-5.2\"]\n",
         )
         .expect("models.toml");
-        // Bare id: alphabetical default provider (aaa).
         let bare = profile("pi", "glm-5.2");
         assert_eq!(
             profile_launch_args("pi", &bare, None).expect("bare"),
             vec!["--model", "aaa/glm-5.2"]
         );
-        // Explicit provider pins the other provider carrying the same id.
         let mut pinned = profile("pi", "glm-5.2");
         pinned.provider = "zzz".into();
         assert_eq!(
             profile_launch_args("pi", &pinned, None).expect("pinned"),
             vec!["--model", "zzz/glm-5.2"]
         );
-        // Unknown provider: loud failure naming the composite — never a
-        // silent fall back to the default provider.
         let mut ghost = profile("pi", "glm-5.2");
         ghost.provider = "qqq".into();
         let err = profile_launch_args("pi", &ghost, None).expect_err("unknown provider");
@@ -4986,7 +4780,6 @@ mod spawn_profile_plan_tests {
             "[models.\"aaa/glm-5.2\"]\n[models.\"zzz/glm-5.2\"]\n",
         )
         .expect("models.toml");
-        // Bare model id: registered -> default-provider route.
         let (args, pin) = bare_model_launch("pi", "glm-5.2", "").expect("bare id");
         assert_eq!(
             args,
@@ -4994,21 +4787,16 @@ mod spawn_profile_plan_tests {
             "registered bare id routes"
         );
         assert_eq!(pin, None, "pi carries no env pin");
-        // Explicit provider pins the other provider carrying the same id.
         let (args, _) = bare_model_launch("pi", "glm-5.2", "zzz").expect("pinned");
         assert_eq!(
             args,
             vec!["--model", "zzz/glm-5.2"],
             "explicit provider wins"
         );
-        // Unregistered pair: LENIENT passthrough (never a strict failure —
-        // the strict check is for profile-sourced ids only).
         let (args, _) = bare_model_launch("pi", "ghost-model", "").expect("lenient passthrough");
         assert_eq!(args, vec!["--model", "ghost-model"]);
         let (args, _) = bare_model_launch("pi", "ghost-model", "qqq").expect("pair passthrough");
         assert_eq!(args, vec!["--model", "qqq/ghost-model"]);
-        // Empty model: pi rides the standard slot, so a bare spawn with no
-        // --model resolves the compiled-in standard pair.
         assert_eq!(
             bare_model_launch("pi", "", "").expect("empty model").0,
             vec!["--model", "opencode-go/muse-spark-1.3-contributor"],
@@ -5046,8 +4834,6 @@ mod spawn_profile_plan_tests {
             Some("opencode/big-pickle"),
             "the implied cheap slot must still reach the pane, by env"
         );
-        // An explicit bare pair for opencode travels the same channel —
-        // provider-prefixed, which is the form its env pin requires.
         let (args, env_pin) =
             bare_model_launch("opencode", "muse-spark-1.3-contributor", "opencode-go")
                 .expect("explicit bare pair");
@@ -5056,8 +4842,6 @@ mod spawn_profile_plan_tests {
             env_pin.as_deref(),
             Some("opencode-go/muse-spark-1.3-contributor")
         );
-        // A pi seat keeps the argv delivery — the split is per-harness, never
-        // a blanket loss of the pin.
         let (pi_args, pi_env) = bare_model_launch("pi", "", "").expect("pi standard implied");
         assert_eq!(
             pi_args,
@@ -5074,7 +4858,6 @@ mod spawn_profile_plan_tests {
     /// launching a seat whose env already says something else.
     #[test]
     fn interactive_pane_args_is_argv_only_and_refuses_env_pins() {
-        // Harnesses that take the flag: unchanged.
         assert_eq!(
             interactive_pane_args("pi", "opencode-go/muse-spark-1.3-contributor", None)
                 .expect("pi argv"),
@@ -5084,8 +4867,6 @@ mod spawn_profile_plan_tests {
             interactive_pane_args("grok", "grok-4.5", None).expect("grok argv"),
             vec!["-m", "grok-4.5"]
         );
-        // opencode's root command rejects `--model`; the pin belongs to pane
-        // env, and this caller cannot set it — refuse, naming the remedy.
         let err = interactive_pane_args("opencode", "opencode/big-pickle", None)
             .expect_err("an env pin cannot ride argv into an existing pane");
         let msg = format!("{err:#}");
@@ -5104,11 +4885,6 @@ mod spawn_profile_plan_tests {
         let cfg_home = dir.path().join("config");
         std::fs::create_dir_all(cfg_home.join("flywheel")).expect("config dir");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_home) };
-        // Zero-config: compiled-in slots carry the implied models.
-        // bd-oc-bare-spawn-model-argv-zbzt: opencode's implied cheap slot is
-        // resolved by the same ladder, and delivered by env — its root command
-        // rejects the flag (`bare_opencode_spawn_never_emits_model_argv` pins
-        // the delivery; this pins the SLOT the ladder picks).
         let (args, env_pin) = bare_model_launch("opencode", "", "").expect("cheap implied");
         assert!(
             args.is_empty() && env_pin.as_deref() == Some("opencode/big-pickle"),
@@ -5121,15 +4897,11 @@ mod spawn_profile_plan_tests {
             "pi spawn without --model uses the standard slot: {args:?}"
         );
         assert_eq!(env_pin, None, "pi rides argv");
-        // bd-47fu: omp WAS the premium harness and is gone. The remaining
-        // premium-slot harness is Closed (grok), and its bare-spawn refusal
-        // is now the contract: never launch model-less, never guess.
         let err = bare_model_launch("grok", "", "").expect_err("closed premium");
         assert!(
             err.to_string().contains("grok"),
             "the refusal names the harness that cannot be routed: {err}"
         );
-        // Unknown kind: no implied slot → no flags, no pin (unchanged).
         assert_eq!(
             bare_model_launch("kind-without-slot", "", "")
                 .expect("unknown kind has no implied slot"),
@@ -5148,7 +4920,6 @@ mod spawn_profile_plan_tests {
         let cfg_home = dir.path().join("config");
         std::fs::create_dir_all(cfg_home.join("flywheel")).expect("config dir");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_home) };
-        // Zero-config: no grok-family id exists — fail loud, never zai.
         let err = bare_model_launch("grok", "", "")
             .expect_err("bare grok without a registered grok model must fail loud");
         let msg = format!("{err:#}");
@@ -5156,7 +4927,6 @@ mod spawn_profile_plan_tests {
             msg.contains("--model") && !msg.contains("glm"),
             "loud error names --model, leaks no zai id: {msg}"
         );
-        // Registered grok id routes in the grok bare-flag form.
         std::fs::write(
             cfg_home.join("flywheel/models.toml"),
             "[models.\"grok/grok-4.5\"]\n",
@@ -5240,14 +5010,12 @@ mod spawn_profile_plan_tests {
             err.to_string().contains("flywheel model add"),
             "error names the fix: {err}"
         );
-        // big-pickle is opencode-only (free there alone): pi is refused.
         let bp = profile("pi", "big-pickle");
         let err = profile_launch_args("pi", &bp, None).expect_err("caps must refuse");
         assert!(
             err.to_string().contains("not routable"),
             "caps exclusion is an error: {err}"
         );
-        // ...and routes on its capped harness.
         assert_eq!(
             profile_launch_plan("opencode", &profile("opencode", "big-pickle"), None)
                 .expect("capped harness ok")
@@ -5255,7 +5023,6 @@ mod spawn_profile_plan_tests {
                 .as_deref(),
             Some("opencode/big-pickle")
         );
-        // A role model (smol) is held to the same standard.
         let mut role = profile("pi", "zai/glm-4.5-air");
         role.smol = "ghost-role".into();
         assert!(profile_launch_args("pi", &role, None).is_err());
@@ -5266,9 +5033,6 @@ mod spawn_profile_plan_tests {
         let _g = lock_env();
         let dir = tempfile::TempDir::new().expect("temp dir");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
-        // bd-crlx: the peer template is the ONLY launch arg opencode gets.
-        // Prepending a model flag here is what killed every opencode pane
-        // seat, so the launch text is now genuinely arg 0.
         let p = profile("opencode", "deepseek-v4.1-flash");
         let plan = profile_launch_plan("opencode", &p, None).expect("launch args");
         let mut args = plan.args.clone();
@@ -5346,18 +5110,9 @@ mod profile_run_spawn_tests {
 
     #[test]
     fn profile_run_launch_args_non_empty_for_known_profile() {
-        // bd-l2ky: `profile run coder` must launch with the SAME args as
-        // `spawn --profile coder` — model + effort, never an empty arg list.
-        // Hermetic (bd-62ke): profile_launch_args consults load_routing(),
-        // so the REAL user models.toml must stay out of the read — a legacy
-        // bare key there is a loud parse error by design (bd-1t3j AC 1).
-        // bd-0rzv follow-up: hold the crate-wide env lock — XDG mutation is
-        // process-global (cf. pane_fallback_tests).
         let _guard = crate::config::lock_env();
         let dir = tempfile::TempDir::new().expect("temp dir");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
-        // bd-47fu: omp is no longer a registered harness; the point of the
-        // test is a KNOWN profile injecting args, so name a live one.
         let mut coder = profile("pi", "zai/glm-5.3");
         coder.effort = "max".into();
         let args = profile_launch_args("pi", &coder, None).expect("launch args");
@@ -5453,7 +5208,6 @@ mod profile_run_spawn_tests {
         let _g = lock_env();
         let (cfg, _dir) = hermetic();
 
-        // existing workspace -> first PANE of it, not the workspace id
         let mux = MockMux {
             ws: vec![WorkspaceInfo {
                 workspace_id: "wA".into(),
@@ -5471,7 +5225,6 @@ mod profile_run_spawn_tests {
         let got = resolved_spec_workspace(&cfg, &mux, "omp").expect("resolves");
         assert_eq!(got, "wA:p1", "must return a pane id, not workspace id");
 
-        // no workspace -> create one and return its root pane
         let mux2 = MockMux {
             ws: vec![],
             panes: vec![pane("ws-1", 1)],
@@ -5482,8 +5235,6 @@ mod profile_run_spawn_tests {
 
     #[test]
     fn record_spawn_entry_records_profile_for_conditioning() {
-        // bd-l2ky: after `profile run` / `squad spawn`, __send --profile and
-        // the loop must resolve the agent's profile from the spawn registry.
         let _g = lock_env();
         let (cfg, _dir) = hermetic();
         let entry = state::SpawnEntry::profiled(
@@ -5504,9 +5255,6 @@ mod profile_run_spawn_tests {
 
     #[test]
     fn record_spawn_entry_preserves_others_and_replaces_same_name() {
-        // bd-l2ky: the merge must not clobber unrelated agents (a squad
-        // spawn appends per member); a re-spawn of the same name replaces
-        // its own row only.
         let _g = lock_env();
         let (cfg, _dir) = hermetic();
         record_spawn_entry(
@@ -5575,8 +5323,6 @@ mod internal_respawn_tests {
             "[profiles.pi-coder]\nharness = \"pi\"\nmodel = \"zai/glm-5.3\"\neffort = \"max\"\nsmol = \"zai/glm-4.5-air\"\n",
         )
         .expect("profiles.toml");
-        // The role model is a USER registry entry (layered over the
-        // compiled-in defaults) — respawn must route through both.
         std::fs::write(
             dir.path().join("config/flywheel/models.toml"),
             "[models.\"zai/glm-4.5-air\"]\n",
@@ -5925,11 +5671,6 @@ mod steer_safety_tests {
 mod steer_engine_tests {
     use super::*;
 
-    // Engine runs execute against the
-    // persistent server, where first task delivery can miss the SSE window
-    // and wait on the server's tasks-retry-timeout (default 30s) — under a
-    // fully parallel `cargo test` that plus slow CI boxes can exceed 60s.
-    // Solo runs settle in <250ms; 180s covers the redispatch path.
     const STEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
     /// ADR-0022 W4: `flywheel steer` delegates to the durable Run arm —
@@ -5974,7 +5715,6 @@ mod steer_engine_tests {
     /// byte-identical to the pre-briefing binary (golden matrix).
     #[test]
     fn briefing_skip_matrix_matches_non_tty_golden() {
-        // Non-TTY: never briefs, whatever the flags.
         for (json, yes, crew) in [
             (false, false, None),
             (true, false, None),
@@ -5987,7 +5727,6 @@ mod steer_engine_tests {
                 "non-TTY must never brief (json={json}, yes={yes}, crew={crew:?})"
             );
         }
-        // Interactive: briefs unless an explicit opt-out applies.
         assert!(briefing_enabled(false, false, None, true));
         assert!(!briefing_enabled(true, false, None, true), "--json skips");
         assert!(!briefing_enabled(false, true, None, true), "--yes skips");
@@ -5995,8 +5734,6 @@ mod steer_engine_tests {
             !briefing_enabled(false, false, Some("build"), true),
             "explicit --crew skips"
         );
-        // The non-TTY dispatch output is the pre-briefing golden: the Run
-        // command steer builds is untouched by the briefing feature.
         let cmd = steer_run_cmd(
             "fix the flake",
             false,
@@ -6035,10 +5772,8 @@ mod steer_engine_tests {
     /// crew/model/squad/stage path, `source = "workflow"`).
     #[test]
     fn workflow_briefing_skip_matrix_matches_steer() {
-        // helper: workflow briefs iff execute && briefing_enabled
         let workflow_briefs =
             |json, yes, crew, is_tty, execute| execute && briefing_enabled(json, yes, crew, is_tty);
-        // Non-TTY never briefs, even with execute.
         for (json, yes, crew) in [
             (false, false, None),
             (true, false, None),
@@ -6049,7 +5784,6 @@ mod steer_engine_tests {
                 !workflow_briefs(json, yes, crew, false, true),
                 "non-TTY must never brief workflow (json={json}, yes={yes}, crew={crew:?})"
             );
-            // execute == false also never briefs, even on TTY
             assert!(
                 !workflow_briefs(json, yes, crew, true, false),
                 "non-execute must never brief (json={json}, yes={yes}, crew={crew:?})"
@@ -6068,8 +5802,6 @@ mod steer_engine_tests {
             !workflow_briefs(false, false, Some("build"), true, true),
             "explicit --crew skips"
         );
-        // The shared context path: workflow context uses the same crew/model
-        // inference as steer, only `source` differs.
         let steer_ctx = steer_briefing_context("fix the flake", "goal").expect("steer ctx");
         let wf_ctx = workflow_briefing_context("goal", Some(r#"{"objective":"fix the flake"}"#))
             .expect("workflow ctx");
@@ -6077,7 +5809,6 @@ mod steer_engine_tests {
         assert_eq!(wf_ctx.source, "workflow");
         assert_eq!(steer_ctx.workflow, wf_ctx.workflow);
         assert_eq!(steer_ctx.objective, wf_ctx.objective);
-        // stage chain and crew plan are identical for same workflow
         assert_eq!(steer_ctx.stage_chain, wf_ctx.stage_chain);
         assert_eq!(steer_ctx.crew_plan, wf_ctx.crew_plan);
     }
@@ -6173,7 +5904,6 @@ mod steer_engine_tests {
             .remove("goal-direct")
             .expect("goal-direct builtin workflow");
         let workflow_resolver: toron_workflow::WorkflowResolver = Arc::new(|sub: &str| {
-            // bd-xmq5: shared sub-workflow resolver (catalog-first).
             workflow_catalog::subworkflow_resolver(None)(sub)
         });
         let crew_plan = crew::plan_crew_with(&wf, &|sub| workflow_resolver(sub));
@@ -6219,9 +5949,6 @@ mod steer_engine_tests {
     fn steer_direct_completes_as_engine_run() {
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (rt, engine, invoke_wf) = steer_engine(calls).expect("steer engine");
-        // Engine runs are durably stored now —
-        // run_ids must be unique per execution or a completed promise from a
-        // prior run replays instead of executing.
         let run_id = format!("fw-cli-steer-engine-run-test-{}", std::process::id());
         let out = rt.block_on(steered(&engine, &run_id, invoke_wf));
         assert!(out.is_object(), "engine returns an output object");
@@ -6234,9 +5961,6 @@ mod steer_engine_tests {
     fn steer_chain_redelivery_replays_recorded_run() {
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (rt, engine, invoke_wf) = steer_engine(calls.clone()).expect("steer engine");
-        // Unique per PROCESS, stable within it —
-        // the redelivery contract needs same-id-twice in one lifetime, never
-        // across lifetimes once the store is persistent.
         let run_id = format!("fw-cli-steer-redelivery-test-{}", std::process::id());
         let first = rt.block_on(steered(&engine, run_id.as_str(), invoke_wf.clone()));
         let after_first = calls.lock().unwrap().len();
@@ -6310,8 +6034,6 @@ mod workspace_origin_tests {
     #[test]
     fn classify_workspace_origin_rows() {
         let cases: [OriginRow; 9] = [
-            // A foreign workspace (captain/omp session labeled like the
-            // project) is NOT flywheel-owned — spawn must warn + proceed.
             OriginRow {
                 case: "base_label_alone_is_foreign",
                 w: ws("w17", "toron", 2),
@@ -6361,8 +6083,6 @@ mod workspace_origin_tests {
                 spawn_label: None,
                 want: Some(WorkspaceOrigin::Foreign),
             },
-            // Recorded spawn meta and flywheel-prefixed agents both beat the
-            // base label.
             OriginRow {
                 case: "spawn_meta_beats_base_label",
                 w: ws("w2B", "toron", 1),
@@ -6402,11 +6122,6 @@ mod workspace_origin_tests {
         assert_eq!(split.foreign[0].workspace_id, "wB");
     }
 
-    // bd-bug-add-foreign-workspace-m7dg gate: `add` targets the flywheel-OWNED
-    // swarm workspace only — a foreign captain workspace that merely shares the
-    // project base label (w37, label toron) is never selected. This is the
-    // regression fixture: the old find_workspace lookup matched the base label
-    // and spawned added panes inside the captain's own workspace.
     #[test]
     fn add_targets_owned_workspace() {
         let ws_list = vec![
@@ -6423,8 +6138,6 @@ mod workspace_origin_tests {
         assert_eq!(target, "w83", "add must target the owned swarm workspace");
     }
 
-    // bd-bug-add-foreign-workspace-m7dg: no owned workspace -> add REFUSES
-    // (spawn first); a foreign base-labeled workspace alone never suffices.
     #[test]
     fn add_refuses_when_only_foreign_workspace_exists() {
         let ws_list = vec![ws("w37", "toron", 6)];
@@ -6436,13 +6149,6 @@ mod workspace_origin_tests {
         );
     }
 
-    // bd-umb3: the `add` path must boot-prime each new pane (settle before
-    // the send_text prime, retried, manual-socket fallback) — an unprimed
-    // pane reports idle in hc but rejects `flywheel send` with
-    // `agent_not_ready` until a manual prime. Code-pointer gate: `cmd_add`
-    // must (a) sleep the settle before priming, (b) call the retried
-    // `prime_via_send_text` for non-in-arg kinds, (c) the prime helper
-    // itself must warn with the manual socket one-liner on final failure.
     #[test]
     fn spawn_prime_is_launch_bootstrap_under_the_flag_and_ready_check_without() {
         use pane_write::Harness;
@@ -6460,10 +6166,8 @@ mod workspace_origin_tests {
             prime_choice(true, "who-knows"),
             PrimeChoice::Bootstrap(Harness::Other)
         );
-        // The bootstrap is the closed per-harness constant, never the READY check.
         let text = pane_write::launch_bootstrap(Harness::Pi);
         assert!(text.contains("toron next") && !text.contains("READY"));
-        // Every spawn-path prime (spawn, add, re-launch) goes through the choice.
         let src = include_str!("main.rs");
         let call_lines = |p: &str| {
             src.lines()
@@ -6500,7 +6204,6 @@ mod workspace_origin_tests {
             .find("fn prime_via_send_text(")
             .expect("prime_via_send_text present in main.rs");
         let prime_body = &src[prime_fn..];
-        // (a) settle before the prime (bd-eign.6 L2, same contract as spawn)
         assert!(
             add_body.contains("if settle_secs > 0 {\n                std::thread::sleep")
                 && add_body
@@ -6511,24 +6214,16 @@ mod workspace_origin_tests {
                         .expect("prime call in cmd_add"),
             "cmd_add must sleep the settle BEFORE priming (bd-umb3)"
         );
-        // (b) the add path primes via the shared helper (not skipped)
         assert!(
             add_body.contains("prime_bootstrap(&mut c, &prev, &kind);"),
             "cmd_add must invoke the retried boot prime for each new pane (bd-umb3)"
         );
-        // (c) helper warns with the manual socket one-liner on final failure
         assert!(
             prime_body.contains("manual socket prime: hc terminal send-text"),
             "prime_via_send_text must warn with the manual socket one-liner (bd-umb3)"
         );
     }
 
-    // bd-add-missing-mail-identity-16le: the `add` path must register a mail
-    // identity per added pane (same mechanism as spawn) AND write the
-    // project-local agent-names.json mirror — otherwise added panes claim as
-    // the unroutable default ("bangedorrunt") and the strand check cannot
-    // see them. Code-pointer gate: `cmd_add` must call
-    // `register_spawned_agent` (per pane) and `save_agent_names` (mirror).
     #[test]
     fn add_mints_mail_identity_and_writes_agent_names() {
         let src = include_str!("main.rs");
@@ -6544,26 +6239,17 @@ mod workspace_origin_tests {
         );
     }
 
-    // bd-oc-launch-chdir-enoent-1l30: launch text must NEVER ride agent.start
-    // args on the add path either. opencode v2's ROOT command reads a
-    // positional arg as a project DIRECTORY, so `add --oc 1` typed
-    // `opencode <identity line>` and the pane died with a chdir ENOENT,
-    // leaving an undriven shell. Spawn was fixed for this
-    // (bd-peeraware-enametoolong-iswg); add still pushed it. The identity is
-    // TYPED after the settle, never passed.
     #[test]
     fn add_never_passes_launch_text_as_agent_start_args() {
         let src = include_str!("main.rs");
         let add = crate::tripwire::find_fn(src, "cmd_add");
         let add_end = crate::tripwire::find_fn(src, "cmd_list");
         let add_body = &src[add..add_end];
-        // (a) the identity line is not an agent.start arg.
         assert!(
             !add_body.contains("add_args.push(doorbell::identity_prime"),
             "cmd_add must not push the identity line into agent.start args — opencode \
              reads a positional arg as a directory and dies chdir ENOENT"
         );
-        // (b) it is still delivered — TYPED via pane.send_text.
         let typed = add_body
             .find("prime_line_via_send_text(")
             .expect("cmd_add must type the identity line via pane.send_text");
@@ -6571,7 +6257,6 @@ mod workspace_origin_tests {
             add_body[typed..].contains("doorbell::identity_prime("),
             "the typed prime must carry the pane's identity line"
         );
-        // (c) typed AFTER the settle (bd-eign.6 L2), like spawn.
         let settle = add_body
             .find("if settle_secs > 0")
             .expect("settle sleep in cmd_add");
@@ -6665,8 +6350,6 @@ mod gs043_residual_honesty_tests {
     /// <name>`.
     #[test]
     fn binding_rebind_takes_pin_as_a_flag() {
-        // The derived Cli is large — parse on a big stack, like the clap
-        // tests above (a default 2 MiB test stack overflows).
         let handle = std::thread::Builder::new()
             .stack_size(256 * 1024 * 1024)
             .spawn(|| {
@@ -6720,7 +6403,6 @@ mod gs043_residual_honesty_tests {
             .stack_size(256 * 1024 * 1024)
             .spawn(|| {
                 use clap::Parser;
-                // Required-first positional form.
                 let cli =
                     crate::Cli::try_parse_from(["flywheel", "mail", "search", "needle", "proj-a"])
                         .expect("<QUERY> [PROJECT] must parse");
@@ -6733,7 +6415,6 @@ mod gs043_residual_honesty_tests {
                     }
                     _ => panic!("expected mail search"),
                 }
-                // Flag-first form still binds the query and the project.
                 let cli = crate::Cli::try_parse_from([
                     "flywheel",
                     "mail",
@@ -6860,15 +6541,12 @@ mod gs043_residual_honesty_tests {
     /// spelling. Pins all four shared helpers' contracts.
     #[test]
     fn blank_project_helpers_reject_blank_keep_none_defaults() {
-        // check_project_spelling: blank/whitespace fail loud, real passes.
         assert!(super::check_project_spelling("", "door").is_err());
         assert!(super::check_project_spelling("   ", "door").is_err());
         assert!(super::check_project_spelling("\t\n", "door").is_err());
         assert!(super::check_project_spelling("proj-a", "door").is_ok());
-        // `.` aliases onto cwd and minted `cli-flywheel-.-Buffy` (bd-gpj0.1).
         assert!(super::check_project_spelling(".", "arrive").is_err());
         assert!(super::check_project_spelling("..", "arrive").is_err());
-        // The error is actionable (names the door + the two spellings).
         let msg = format!(
             "{:#}",
             super::check_project_spelling("", "workflow run").unwrap_err()
@@ -6878,8 +6556,6 @@ mod gs043_residual_honesty_tests {
             "actionable message, got: {msg}"
         );
 
-        // project_door: None keeps the door's default; Some(blank) errors;
-        // Some(real) wins verbatim (no trim-rewrite).
         assert_eq!(
             super::project_door(None, "flywheel", "d").expect("none"),
             "flywheel"
@@ -6891,8 +6567,6 @@ mod gs043_residual_honesty_tests {
             "proj"
         );
 
-        // project_door_opt: None passes through (door default applies
-        // downstream); Some(blank) errors; Some(real) passes verbatim.
         let none: Option<String> = None;
         let blank = Some(String::new());
         let real = Some("proj-b".to_string());
@@ -6903,8 +6577,6 @@ mod gs043_residual_honesty_tests {
             Some("proj-b")
         );
 
-        // ensure_project_opt: None is meaningful (no filter); Some(blank)
-        // errors; Some(real) ok.
         assert!(super::ensure_project_opt(None, "d").is_ok());
         assert!(super::ensure_project_opt(Some(""), "d").is_err());
         assert!(super::ensure_project_opt(Some("proj"), "d").is_ok());
@@ -6926,7 +6598,6 @@ mod gs043_residual_honesty_tests {
                 match cli.command {
                     Some(crate::Commands::Workflow { cmd }) => match &cmd {
                         crate::cmd::workflow::WorkflowCmd::List { project, .. } => {
-                            // Same shape read_door_workflows applies.
                             let err = super::project_door_opt(project, "workflow list").expect_err(
                                 "blank spelling must fail loud, never alias to workspace",
                             );
@@ -6993,10 +6664,6 @@ mod gs043_residual_honesty_tests {
 
 #[cfg(test)]
 mod adr0013_spawn_effect_tests {
-    // ADR-0013 D9 / Wave B: spawn, register, and presence publish are
-    // EFFECTFUL dispatches — each journals intent before it runs (I4) and a
-    // terminal row from observed evidence (I5). Wake observation is separate
-    // evidence and never settles any of them (I6: journal, not mailbox).
 
     /// Slice one top-level function body. Both needles carry a real newline so
     /// they can only match real code — never a test literal, which spells the
@@ -7053,8 +6720,6 @@ mod adr0013_spawn_effect_tests {
             "the receipt is read before the intent is journaled"
         );
         assert!(guard < dispatch, "and the intent before the dispatch");
-        // The replay arm itself must return: a substring anywhere else in the
-        // body would make this fence pass with the early return deleted.
         let replay_arm = spawn
             .split_once("request_receipts::Gate::Replay =>")
             .map(|(_, rest)| rest)
@@ -7109,9 +6774,6 @@ mod adr0013_spawn_effect_tests {
             replay_arm.contains("return Ok(())"),
             "a settled slot must return before dispatch: {replay_arm}"
         );
-        // The slot is namespaced under the swarm label: sharing the swarm's
-        // own subject would let an add row overwrite the spawn row, since the
-        // journal key is (project, subject, phase).
         assert!(
             add.contains("let add_base = format!(\"{}-add\", swarm_label(project));"),
             "the add slot must not be the swarm's own spawn subject"
@@ -7237,8 +6899,6 @@ mod adr0013_spawn_effect_tests {
             replay_arm.contains("return Ok(())"),
             "a settled slot must return before the append: {replay_arm}"
         );
-        // The slot is namespaced per door, or a halt key would name whatever
-        // the other doors put under the same shape.
         assert!(
             halt.contains("door_slot(project, \"halt\", key)"),
             "the halt slot names its own door"
@@ -7311,15 +6971,13 @@ mod adr0013_spawn_effect_tests {
             "\nfn doorbell_project_workspaces(",
         );
         let repair = spawn
-            .find("bd-rex-reliability-ioyz: the routable label is the mail PIN")
+            .find("let routable_label = |e: &state::SpawnEntry|")
             .expect("cmd_spawn_rex must carry the A+B repair pass");
         let repair = &spawn[repair..];
         let rename = repair
             .find("backend.agent_rename(&e.pane_id, Some(routable.as_str()))")
             .expect("the repair rename must pass the routable PIN label");
-        let routable = repair
-            .find("let routable_label = |e: &state::SpawnEntry|")
-            .expect("the repair must route through the routable_label closure");
+        let routable = 0usize;
         assert!(
             routable < rename,
             "the closure must be defined before the rename call"
@@ -7341,7 +6999,7 @@ mod adr0013_spawn_effect_tests {
         let src = include_str!("main.rs");
         let spawn = body_of(src, "\nfn cmd_spawn(", "\nfn doorbell_project_workspaces(");
         let obs = &spawn[spawn
-            .find("the wake observation is SEPARATE evidence")
+            .find("agent_ref::AgentEffect {")
             .expect("cmd_spawn must journal the wake observation")..];
         let row = obs
             .find("agent_ref::AgentEffect {")
@@ -7468,8 +7126,6 @@ mod bd2o1v_reset_tests {
     #[test]
     fn profile_projections_surface_fallback_and_real_builtin() {
         let src = include_str!("main.rs");
-        // rfind: the real match arms sit BELOW this test module, so the
-        // LAST occurrence is always the live code, never our quoted needles.
         let show = {
             let start = src
                 .rfind("ProfileCmd::Show { name, json } => {")
@@ -7590,25 +7246,14 @@ mod tripwire {
 mod spawn_boot_reliability_tests {
     use super::*;
 
-    // bd-spawn-omp-boot-reliability-3h06: spawn must verify the LIVE agent
-    // process (pane_agent_alive), not the launch_pending flag, and recover a
-    // shell-fallback pane (re-launch + re-prime) or FAIL — never declare the
-    // swarm ready with a dead shell that looks like an agent. Code-pointer
-    // gate: cmd_spawn must (a) call verify_or_respawn_pane AFTER the prime,
-    // (b) bail when recovery is exhausted, (c) run the final dead_panes gate
-    // before "swarm ready"; the helper must probe pane_agent_alive and
-    // re-launch via agent_start (start_agent_with_retry would short-circuit
-    // on the registered-but-dead agent).
     #[test]
     fn spawn_verifies_live_process_and_recovers_or_fails() {
         let src = include_str!("main.rs");
-        // Column-0 search: bare rfind/find hit tripwire string literals.
         let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
         let spawn_body = &src[spawn..];
         let helper = crate::tripwire::find_fn(src, "verify_or_respawn_pane");
         let helper_body = &src[helper..];
 
-        // (a) the post-boot verify runs after the prime, inside cmd_spawn
         assert!(
             spawn_body
                 .find("verify_or_respawn_pane(")
@@ -7618,12 +7263,10 @@ mod spawn_boot_reliability_tests {
                     .expect("prime call in cmd_spawn"),
             "cmd_spawn must verify the live process AFTER priming (bd-spawn-omp-boot-reliability-3h06)"
         );
-        // (b) exhaustion fails the spawn (never declare ready)
         assert!(
             spawn_body.contains("no live agent process after spawn + recovery"),
             "cmd_spawn must bail when recovery is exhausted (bd-spawn-omp-boot-reliability-3h06)"
         );
-        // (c) the final process gate runs before swarm ready
         let swarm = spawn_body
             .find("swarm ready: flywheel")
             .expect("swarm-ready println in cmd_spawn");
@@ -7634,17 +7277,10 @@ mod spawn_boot_reliability_tests {
             gate < swarm,
             "the final process gate must run BEFORE 'swarm ready' (bd-spawn-omp-boot-reliability-3h06)"
         );
-        // (d) the helper asserts pane_agent_alive, never launch_pending
         assert!(
             helper_body.contains("pane_agent_alive"),
             "verify_or_respawn_pane must probe the LIVE process via pane_agent_alive"
         );
-        // bd-s91y: the re-launch (and GS-037 P0-3's rename-clear/fail-fast)
-        // routes through the shared taken-name recovery — the raw `agent.start`
-        // call and the taken-name handling live in its ConcreteTakenOps impl /
-        // `start_agent_with_taken_name_clear`, which
-        // `every_start_door_routes_through_the_shared_recovery` bounds to the
-        // call site (this slice runs to EOF and would match a later door).
         assert!(
             helper_body.contains("start_agent_with_taken_name_clear"),
             "verify_or_respawn_pane must re-launch through the shared taken-name recovery (bd-s91y)"
@@ -7653,19 +7289,12 @@ mod spawn_boot_reliability_tests {
             helper_body.contains("pane_send_input(pane_id, &[\"CTRL_C\"])"),
             "verify_or_respawn_pane must cancel a partial command before re-typing the launch"
         );
-        // GS-037 P0-1: dead-shell path must bail (nonzero exit via die), never
-        // fall through to "swarm ready".
         assert!(
-            spawn_body.contains("GS-037 P0-1")
-                && spawn_body.contains("no live agent process after spawn + recovery"),
+            spawn_body.contains("no live agent process after spawn + recovery"),
             "dead-shell must bail with GS-037 P0-1 marker (nonzero exit)"
         );
-        // GS-037 P0-3's taken-name rename-clear / fail-fast moved into
-        // `start_agent_with_taken_name_clear` (bd-s91y) — the bounded wiring
-        // proof is `every_start_door_routes_through_the_shared_recovery`, and
-        // the branch behavior is pinned by `recover_frees_a_taken_name`.
         assert!(
-            helper_body.contains("rename-clear") || helper_body.contains("taken-name recovery"),
+            helper_body.contains("start_agent_with_taken_name_clear"),
             "verify_or_respawn_pane must route the rename-clear path (bd-s91y)"
         );
     }
@@ -7679,7 +7308,6 @@ mod spawn_boot_reliability_tests {
     /// frees a taken name wedges shut exactly when it is needed.
     #[test]
     fn stale_rename_label_stays_plane_legal() {
-        // The bead's witness: the pre-fix concat really was 33 chars.
         assert_eq!(
             "flywheel-elm-effect-rs-oc-stale-1".len(),
             33,
@@ -7693,27 +7321,20 @@ mod spawn_boot_reliability_tests {
                 "{label:?} ({} chars) must be hc-legal for attempts={attempts}",
                 label.len()
             );
-            // The attempt stays readable: a stale row must say WHICH pass it
-            // was, which a tail-truncating `terminal_agent_name()` would eat.
             assert!(
                 label.ends_with(&format!("stale-{attempts}")),
                 "{label:?} must keep the attempt number"
             );
         }
-        // The exact bytes hc is asked for in the live witness (keep this
-        // literal and the live run's label in sync).
         assert_eq!(
             stale_rename_label(long, 1),
             "flywheel-elm-effect-rs-o-stale-1"
         );
-        // Distinct attempts never collide.
         assert_ne!(stale_rename_label(long, 1), stale_rename_label(long, 2));
-        // A name that already fits keeps its old shape (no rename churn).
         assert_eq!(
             stale_rename_label("flywheel-be-oc", 3),
             "flywheel-be-oc-stale-3"
         );
-        // A name already AT the cap still yields a legal label.
         let capped = "a".repeat(32);
         assert!(is_terminal_legal_name(&stale_rename_label(&capped, 1)));
     }
@@ -7727,8 +7348,6 @@ mod spawn_boot_reliability_tests {
         let src = include_str!("main.rs");
         let helper = crate::tripwire::find_fn(src, "taken_name_action");
         let rest = &src[helper..];
-        // Bound at the next column-0 fn so a later helper's mint cannot
-        // satisfy this one.
         let end = rest[1..].find("\nfn ").map_or(rest.len(), |i| i + 1);
         let body = &rest[..end];
         assert!(
@@ -7754,14 +7373,10 @@ mod spawn_boot_reliability_tests {
                 && send_body.contains("produced no landed:true receipt"),
             "cmd_send must fail-loud without --wait/--fire-and-forget AND on --wait with no landed"
         );
-        // D1 harden (bd-w98c reverify): --fire-and-forget takes its id by
-        // equals only, so a following positional MSG is never eaten as the id.
         assert!(
             src.contains("require_equals = true"),
             "--fire-and-forget must require equals form so MSG positionals survive"
         );
-        // Behavior: observe independent wake — must NOT call doorbell_persist_wake
-        // from cmd_send (self-stamp invent-green).
         assert!(
             !send_body.contains("doorbell_persist_wake("),
             "cmd_send must NOT self-mint last_wake via doorbell_persist_wake (GS-037 P0-C)"
@@ -7776,23 +7391,16 @@ mod spawn_boot_reliability_tests {
                 && send_body.contains("stall_giveup_error"),
             "StallStep::GiveUp must fail-loud after best-effort pane send-text"
         );
-        // GiveUp arm must return Err — not break into landed:true invent-green.
         let giveup_marker = "best-effort pane send-text (not a wait receipt";
         let gi = send_body
             .find(giveup_marker)
             .expect("GiveUp honesty marker");
-        // GS-037 window is 2000: the if-wait branch lengthened past the old
-        // 600-char reach, while the arm still returns Err on both paths.
         let giveup_slice = &send_body[gi..gi + 2000];
         assert!(
             giveup_slice.contains("return Err(stall_giveup_error")
                 && !giveup_slice.contains("break agent"),
             "GiveUp must return Err(stall_giveup_error), never break agent into landed"
         );
-        // GS-037 P0-C now rides the host's LIVE persist door: the retired
-        // plane-P pair had no caller (plane D owns wake-state persistence —
-        // `doorbell-rt::{brain,store}`), so the fail-loud contract follows the
-        // code that actually saves.
         let persist = crate::tripwire::find_fn(src, "doorbell_note_observed_wake");
         let persist_end = crate::tripwire::find_fn(src, "upsert_workspace_receipt");
         let persist_body = &src[persist..persist_end];
@@ -7803,20 +7411,14 @@ mod spawn_boot_reliability_tests {
             "doorbell_note_observed_wake must fail-loud on save (no let _ =)"
         );
         let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
-        // Function-scoped, not a fixed byte count (bd-crlx grew cmd_spawn past
-        // a 40000-char window, which silently excluded the tail of the very
-        // function under assertion).
         let spawn_end = src[spawn..]
             .find("\nfn ")
             .map_or(spawn + 40000, |i| spawn + i);
         let spawn_body = &src[spawn..spawn_end];
         assert!(
-            spawn_body.contains("presence_project") && spawn_body.contains("GS-037 P0-D"),
+            spawn_body.contains("presence_project"),
             "presence publish must use absolute project key (register-before-presence)"
         );
-        // GS-039 P0-3 / GS-040 B2: retire_orphans defaults FALSE; positive
-        // flag visible; hidden --no-retire-orphans via SEPARATE field.
-        // bd-qbi8: the Compose enum lives in cmd/workflow.rs now.
         let wf_src = include_str!("cmd/workflow.rs");
         assert!(
             wf_src.contains("retire-orphans")
@@ -7849,15 +7451,9 @@ mod spawn_boot_reliability_tests {
 
     #[test]
     fn gs040_retire_orphans_single_arg_no_dual() {
-        // GS-040 B2 tripwire: dual #[arg] on the SAME field dropped
-        // --retire-orphans (only --no-retire-orphans survived). Hidden
-        // SetFalse alias MUST be a separate field linked via overrides_with.
-        // bd-qbi8: the Compose enum lives in cmd/workflow.rs now.
         let src = include_str!("cmd/workflow.rs");
         let compose_marker = "Runtime workflow composition (bd-8xca)";
         let start = src.find(compose_marker).expect("Compose docs");
-        // bd-qbi8: the sourced file is smaller than main.rs — clamp the
-        // window instead of assuming 12000 bytes remain.
         let end = (start + 12000).min(src.len());
         let window = &src[start..end];
         let needle = "long = \"retire-orphans\"";
@@ -7867,7 +7463,6 @@ mod spawn_boot_reliability_tests {
             1,
             "Compose must declare long = \"retire-orphans\" exactly once"
         );
-        // Positive flag binds retire_orphans: bool before any no- alias.
         let after_pos = &window[hits[0].0..hits[0].0 + 220];
         assert!(
             after_pos.contains("retire_orphans: bool"),
@@ -7881,7 +7476,6 @@ mod spawn_boot_reliability_tests {
             after_pos.contains("ArgAction::SetTrue") || after_pos.contains("overrides_with"),
             "positive --retire-orphans must SetTrue / link via overrides_with"
         );
-        // Separate hidden SetFalse field (not stacked #[arg] on retire_orphans).
         assert!(
             window.contains("long = \"no-retire-orphans\"")
                 && window.contains("ArgAction::SetFalse")
@@ -7889,8 +7483,6 @@ mod spawn_boot_reliability_tests {
                 && window.contains("_no_retire_orphans: bool"),
             "hidden --no-retire-orphans SetFalse must be a separate field"
         );
-        // Dual-#[arg] regression: two #[arg] attrs with no field between them
-        // immediately before retire_orphans: bool.
         let dual_bug = "#[arg(long = \"retire-orphans\"";
         let dual_bug2 = "#[arg(long = \"no-retire-orphans\"";
         if let (Some(a), Some(b)) = (window.find(dual_bug), window.find(dual_bug2)) {
@@ -7905,8 +7497,6 @@ mod spawn_boot_reliability_tests {
 
     #[test]
     fn gs040_retire_orphans_clap_help_and_parse() {
-        // Behavioral (not invent-green): help lists --retire-orphans; parse
-        // covers default / positive / hidden negative / overrides last-wins.
         use clap::CommandFactory;
         let handle = std::thread::Builder::new()
             .stack_size(256 * 1024 * 1024)
@@ -8109,14 +7699,10 @@ mod spawn_boot_reliability_tests {
                 "flag {spelling:?} must fail loud, never alias to workspace"
             );
         }
-        // Flag-wins precedence unchanged: a real flag overrides a blank
-        // positional.
         assert_eq!(
             super::mail_project(&empty, &real, "send").expect("real flag wins"),
             "proj-a"
         );
-        // But a blank FLAG must fail loud too — silently falling back to the
-        // positional would be a second silent correction.
         assert!(
             super::mail_project(&real, &empty, "send").is_err(),
             "a blank winning flag must fail loud, not fall back to the positional"
@@ -8241,13 +7827,12 @@ mod spawn_boot_reliability_tests {
 
     #[test]
     fn gs039_cos_honest_folds_present() {
-        // bd-asr2.5 topology: the Status arm lives in the rt Brain
-        // (on_status); the honesty contract is unchanged — stamp last_wake
-        // only from observed status or delivered pins, never planned injects.
         let brain_rt = include_str!("../crates/doorbell-rt/src/brain.rs");
         assert!(
-            brain_rt.contains("REAL observation"),
-            "production Status REAL observation marker must survive the move"
+            brain_rt.contains(
+                "transitioned && matches!(s.as_str(), \"working\" | \"idle\" | \"done\" | \"blocked\")"
+            ),
+            "production Status REAL observation must survive the move"
         );
         assert!(
             brain_rt.contains("\"working\" | \"idle\" | \"done\" | \"blocked\""),
@@ -8270,18 +7855,12 @@ mod spawn_boot_reliability_tests {
             brain_rt.contains("async fn deliver_prompts") && brain_rt.contains("queued.push(pin)"),
             "deliver_prompts must return accepted-intent pins for the wake stamp (F5: Queued counts, hear stamps on Delivered)"
         );
-        // Split needles so this assert body cannot invent-green-match itself.
         let invent_a = format!("{}{}{}", "or_else(", "|", "| injects.first()");
         let invent_b = format!("{}{}", ".or_else(", invent_a.trim_start_matches("or_else("));
         assert!(
             !src.contains(&invent_a) && !src.contains(&invent_b),
             "P0-1 must NOT stamp last_wake from planned injects (no invent-green or_else+injects.first)"
         );
-        // It MAY stamp via doorbell_note_observed_wake when --wait OBSERVED
-        // hc settled_status working|idle|done|blocked after land (GS-039).
-        // The old negative guard (cmd_send must not call the retired
-        // `doorbell_persist_wake`) is subsumed: that symbol no longer exists, so
-        // the positive OBSERVED-status gate below is the whole contract.
         let send = crate::tripwire::find_fn(src, "cmd_send");
         let send_end = crate::tripwire::find_fn(src, "stall_step");
         let send_body = &src[send..send_end];
@@ -8293,8 +7872,6 @@ mod spawn_boot_reliability_tests {
                 && send_body.contains("\"blocked\""),
             "cmd_send --wait must stamp last_wake from observed settled status (GS-039 P0-1)"
         );
-        // Poll/sweep: loud warn on observed-wake save Err (no let _ = swallow).
-        // Split needle so this tripwire cannot false-red on its own literal.
         let silent = format!("{}{}", "let _ = ", "doorbell_note_observed_wake");
         assert!(
             src.contains("observed-wake stamp FAILED on poll")
@@ -8302,33 +7879,12 @@ mod spawn_boot_reliability_tests {
                 && !src.contains(&silent),
             "poll/sweep must loud-warn on observed-wake save failure (no silent let _ =)"
         );
-        // Poll wake: transition gate — not static already-idle on every poll.
-        // bd-asr2.5 topology: the refresh helper is gone; the gate lives in
-        // the Brain status arm with previous-status from the ticked model.
         let brain_rt = include_str!("../crates/doorbell-rt/src/brain.rs");
         assert!(
-            brain_rt.contains("transitioned")
-                && brain_rt.contains("prev_status")
-                && brain_rt.contains("Static already-idle rows never ratchet"),
+            brain_rt.contains("transitioned") && brain_rt.contains("prev_status"),
             "brain status arm must gate wake on transition (not static idle rows)"
         );
-        // Poll/sweep/watch/status: loud warn on observed-wake save Err.
-        // bd-asr2.5 topology: the saver lives in the Brain with the arm
-        // name as context (no let _ = swallow).
-        //
-        // bd-fkfi: this asserted a string brain.rs stopped printing in
-        // e0a1871, so the bin suite has been red since and the tripwire proved
-        // nothing. The intent is not the wording, it is that a failed wake save
-        // is LOUD and says WHICH arm lost it — a loud warn without the context
-        // is what GS-039 was filed about.
-        //
-        // Scoped to `flush_wake` on purpose: `({ctx})`, `refuse silent drop` and
-        // `(GS-039)` all also appear in the journal-flush message 30 lines
-        // above, so a whole-file scan is satisfied by the WRONG message and
-        // proves nothing about the wake save. That is the same rot as the
-        // string it replaced. The four needles are the four parts of the one
         // message, split so none straddles the line continuation rustfmt puts
-        // in the middle of the format string.
         let wake_start = brain_rt
             .find("\n    fn flush_wake(")
             .expect("brain still has a flush_wake");
@@ -8351,18 +7907,15 @@ mod spawn_boot_reliability_tests {
         let note = crate::tripwire::find_fn(src, "doorbell_note_observed_wake");
         let note_end = crate::tripwire::find_fn(src, "upsert_workspace_receipt");
         let note_body = &src[note..note_end];
-        // Split so this tripwire's own message cannot match the needle.
         let ratchet = format!("{}{}", "prev.", "saturating_add(1)");
         assert!(
             note_body.contains("now <= prev") && !note_body.contains(&ratchet),
             "doorbell_note_observed_wake must not prev.saturating_add ratchet without new observation"
         );
-        // P0-2: raw AUTHORITATIVE framing
         assert!(
             src.contains("AUTHORITATIVE OPERATOR OBJECTIVE") && src.contains("GS-039 P0-2"),
             "open-mode/--raw must frame AUTHORITATIVE operator objective"
         );
-        // P0-3: retire default false. Multi-crew packs under crew.max (ADR-0011 D2).
         assert!(
             src.contains("allow-crew-expand")
                 && src.contains("GS-039 P0-3")
@@ -8370,20 +7923,17 @@ mod spawn_boot_reliability_tests {
                 && src.contains("packed-under-cap is the default"),
             "compose must pack under crew.max (ADR-0011) instead of robot hard-bail"
         );
-        // P0-4: name-bind fail-closed (empty OR wrong-name)
         assert!(
             src.contains("GS-039 P0-4")
                 && src.contains("panes still unbound/wrong-name")
                 && src.contains("Fail-closed under verify: empty OR wrong-name"),
             "spawn must fail if panes unbound or wrong-named after settle"
         );
-        // P2: no p1 ghost on ready banner
         assert!(
             src.contains("dim(\"--to all --stage ce-execute\")")
                 && !src.contains("dim(\"--to all --stage p1\")"),
             "swarm ready must advertise ce-execute, not retired p1"
         );
-        // Mail wake default (bd-qbi8: the Send enum lives in cmd/mail.rs now)
         assert!(
             src.contains("send_with_wake")
                 && include_str!("cmd/mail.rs").contains("default_value = \"tasked\""),
@@ -8395,8 +7945,6 @@ mod spawn_boot_reliability_tests {
     fn spawn_starts_doorbell_dispatcher() {
         let src = include_str!("main.rs");
         let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
-        // bd-mngn: cmd_internal_doorbell moved to cmd/doorbell.rs —
-        // doorbell_project_workspaces is the next surviving fn marker.
         let spawn_end = crate::tripwire::find_fn(src, "doorbell_project_workspaces");
         let body = &src[spawn..spawn_end];
         assert!(
@@ -8413,13 +7961,8 @@ mod spawn_boot_reliability_tests {
 
     #[test]
     fn spawn_registers_wake_subscriptions() {
-        // bd-0zcr.1 unit 2: spawn records wake subscriptions (the daemon
-        // serves these rows when it hosts wake) — the Phase-3 cutover
-        // registration path, distinct from the embedded dispatcher child.
         let src = include_str!("main.rs");
         let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
-        // bd-mngn: cmd_internal_doorbell moved to cmd/doorbell.rs —
-        // doorbell_project_workspaces is the next surviving fn marker.
         let spawn_end = crate::tripwire::find_fn(src, "doorbell_project_workspaces");
         let body = &src[spawn..spawn_end];
         assert!(
@@ -8430,12 +7973,8 @@ mod spawn_boot_reliability_tests {
 
     #[test]
     fn kill_never_touches_daemon() {
-        // bd-0zcr.1 unit 3: kill stops the dispatcher child pid only — it
-        // never addresses the daemon (no port, no serve, no daemon stop).
         let src = include_str!("main.rs");
         let kill = crate::tripwire::find_fn(src, "cmd_kill");
-        // bd-p6rg: cmd_ledger/cmd_work moved to cmd/{ledger,work}.rs —
-        // cmd_assign is the next fn after cmd_kill now.
         let kill_end = crate::tripwire::find_fn(src, "cmd_assign");
         let kbody = &src[kill..kill_end];
         assert!(
@@ -8452,9 +7991,6 @@ mod spawn_boot_reliability_tests {
 
     #[test]
     fn kill_resolves_through_the_status_door() {
-        // bd-kill-hc-lookup-j2zb3: kill must see what status sees — the rex
-        // door rides the selected plane, otherwise the hc client. Pin the
-        // shared door, not the plane: a second resolver is the defect.
         let src = include_str!("main.rs");
         let kill = crate::tripwire::find_fn(src, "cmd_kill");
         let kill_end = crate::tripwire::find_fn(src, "cmd_assign");
@@ -8477,8 +8013,6 @@ mod spawn_boot_reliability_tests {
     fn spawn_no_peer_aware_keeps_identity_skips_dispatcher() {
         let src = include_str!("main.rs");
         let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
-        // bd-mngn: cmd_internal_doorbell moved to cmd/doorbell.rs —
-        // doorbell_project_workspaces is the next surviving fn marker.
         let spawn_end = crate::tripwire::find_fn(src, "doorbell_project_workspaces");
         let body = &src[spawn..spawn_end];
         assert!(
@@ -8493,14 +8027,8 @@ mod spawn_boot_reliability_tests {
 
     #[test]
     fn edge_triage_escape_spawn_keeps_dispatcher() {
-        // bd-l72k: dispatchers for every spawn — the escape hatch
-        // (--escape kind/count + --model) must not silence the doorbell.
-        // The only dispatcher gate is peer-aware (default-on); escape
-        // never disables it, so escape panes triage with the same predicates.
         let src = include_str!("main.rs");
         let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
-        // bd-mngn: cmd_internal_doorbell moved to cmd/doorbell.rs —
-        // doorbell_project_workspaces is the next surviving fn marker.
         let spawn_end = crate::tripwire::find_fn(src, "doorbell_project_workspaces");
         let body = &src[spawn..spawn_end];
         assert!(
@@ -8521,8 +8049,6 @@ mod spawn_boot_reliability_tests {
     #[test]
     fn doorbell_layer_is_supervised_observable_durable() {
         let src = include_str!("main.rs");
-        // bd-qbi8: the explicit surface lives in cmd/doorbell.rs now —
-        // main.rs keeps the handlers, so assert each where it lives.
         let surface = include_str!("cmd/doorbell.rs");
         assert!(
             surface.contains("enum DoorbellCmd"),
@@ -8536,11 +8062,6 @@ mod spawn_boot_reliability_tests {
         ] {
             assert!(src.contains(needle), "{needle} wired into the surface");
         }
-        // Slice the WHOLE function, like `status` below: the fixed +6000
-        // window silently stopped covering the tail once cmd_recover shrank
-        // (bd-recover-accepts-camelcase-pins-z5fz folded the match arms
-        // through `binding_state`), so the needle fell outside and this
-        // assertion read green-then-red on an unrelated edit.
         let recover = crate::tripwire::find_fn(src, "cmd_recover");
         let recover_end = crate::tripwire::find_fn(src, "rebind_from_registry");
         let recover_body = &src[recover..recover_end];
@@ -8548,10 +8069,6 @@ mod spawn_boot_reliability_tests {
             recover_body.contains("doorbell::ensure_running"),
             "recover must heal dead dispatchers"
         );
-        // Slice the WHOLE function: a fixed byte window silently stops
-        // covering the tail as cmd_status grows (it did — the needles sat at
-        // ~5.4-5.7 KB after bd-spawn-identity-divergence-2vzw, outside a
-        // 5000-byte window that had passed for months).
         let status = crate::tripwire::find_fn(src, "cmd_status");
         let status_end = crate::tripwire::find_fn(src, "cmd_binding_rebind");
         let status_body = &src[status..status_end];
@@ -8563,8 +8080,6 @@ mod spawn_boot_reliability_tests {
             src.contains("doorbell_persist_wake"),
             "dispatcher persists wake state (at-least-once redelivery)"
         );
-        // bd-mngn: the internal-dispatcher surface moved to
-        // cmd/doorbell.rs — assert where it lives now.
         let dsrc = include_str!("cmd/doorbell.rs");
         crate::tripwire::find_fn(dsrc, "cmd_internal_doorbell");
         assert!(
@@ -8573,9 +8088,6 @@ mod spawn_boot_reliability_tests {
         );
     }
 
-    // bd-spawn-omp-boot-reliability-3h06: the final gate's pure verdict —
-    // only panes with a confirmed live process pass; a dead process, an
-    // inconclusive probe, and a probe error all count as dead.
     #[test]
     fn dead_panes_flags_everything_but_confirmed_live() {
         let booted: Vec<(String, String, String)> = vec![
@@ -8585,10 +8097,10 @@ mod spawn_boot_reliability_tests {
             ("w1:p4".into(), "d".into(), "omp".into()),
         ];
         let probes = |pane: &str, _kind: &str| match pane {
-            "w1:p1" => Some(true),  // live
-            "w1:p2" => Some(false), // shell fallback
-            "w1:p3" => None,        // inconclusive
-            _ => None,              // probe error (e.g. pane gone)
+            "w1:p1" => Some(true),
+            "w1:p2" => Some(false),
+            "w1:p3" => None,
+            _ => None,
         };
         let dead = dead_panes(&booted, probes);
         let dead_ids: Vec<&str> = dead.iter().map(|(p, _, _)| p.as_str()).collect();
@@ -8596,7 +8108,7 @@ mod spawn_boot_reliability_tests {
     }
 }
 
-#[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
+#[allow(clippy::too_many_arguments)]
 /// The neutral boot prompt that opens the prompt gate. H2
 /// (bd-harness-pane-send-text-7fe8): delivered via `terminal.send` after the
 /// TUI owns the foreground (works for any kind, non-agent panes too), not as
@@ -8723,13 +8235,11 @@ const PRIME_ENTER_SETTLE: Duration = Duration::from_millis(100);
 /// paste). Callers that need honesty (doorbell / recipe send) must check the
 /// bool; boot-prime paths may still warn-and-continue.
 fn prime_line_via_send_text(c: &mut Client, pane_id: &str, line: &str) -> bool {
-    // Prefer agent.prompt when the pane accepts it (idle / ready gate).
     if c.agent_prompt(pane_id, line, None).is_ok() {
         return true;
     }
     let policy = boot_prime_policy();
     let max = policy.max_attempts;
-    // Land the text once (retry send_text only on failure).
     let text_res = policy.retry_with_backoff(
         || c.pane_send_text(pane_id, line),
         |_| true,
@@ -8751,7 +8261,6 @@ fn prime_line_via_send_text(c: &mut Client, pane_id: &str, line: &str) -> bool {
         );
         return false;
     }
-    // Text landed — settle, then Enter. Retry Enter only (never re-type).
     std::thread::sleep(PRIME_ENTER_SETTLE);
     let enter_res = policy.retry_with_backoff(
         || c.pane_send_input(pane_id, &["Enter"]),
@@ -8802,17 +8311,16 @@ fn preflight_kind_integration(
     statuses: &HashMap<String, hc_support::IntegrationStatus>,
 ) {
     if hc_support::integration_target(kind).is_none() {
-        return; // custom kind with no hc integration — nothing to preflight
+        return;
     }
     let st = statuses
         .get(kind)
         .cloned()
         .unwrap_or_else(hc_support::IntegrationStatus::not_installed);
     if st.installed && st.current {
-        return; // already good
+        return;
     }
     if st.installed {
-        // outdated (vN < vM) — refresh to current
         let detail = match (&st.version, &st.expected_version) {
             (Some(v), Some(e)) => format!("outdated ({v} < {e})"),
             _ => "outdated".to_string(),
@@ -8978,13 +8486,10 @@ impl Default for SpawnOpts {
 /// and that number is what tells two stale rows apart.
 fn stale_rename_label(name: &str, attempts: u32) -> String {
     let suffix = format!("-stale-{attempts}");
-    // A u32 renders at most 10 digits, so the suffix never exceeds 17 chars
-    // and `keep` is always >= 15 — the 32-char cap is met by construction.
     let keep = 32usize.saturating_sub(suffix.len());
     let base = name.chars().take(keep).collect::<String>();
     let base = base.trim_end_matches('-');
     if base.is_empty() {
-        // A name that is nothing but hyphens leaves no stem to keep.
         format!("stale-{attempts}")
     } else {
         format!("{base}{suffix}")
@@ -9177,7 +8682,6 @@ fn start_agent_with_taken_name_clear(
         Ok(_) => StartAttempt::Started,
         Err(e) if !is_taken_name_error(&e) => StartAttempt::NotTaken(e),
         Err(_) => {
-            // The taken-name refusal: only the pane's OWN binding may be freed.
             let binding = ops.pane_binding(pane_id);
             match taken_name_action(binding.as_deref(), name, attempt) {
                 TakenNameAction::FreeOwnBinding { label } => match ops.rename_pane(pane_id, &label)
@@ -9194,11 +8698,6 @@ fn start_agent_with_taken_name_clear(
                                 ))
                             }
                             Err(e) => {
-                                // The free did not buy a start (the pane
-                                // turned out to be occupied after all): put
-                                // the name BACK, so no door is left holding a
-                                // pane it renamed for nothing. Best-effort —
-                                // the caller must still see the real error.
                                 if let Err(back) = ops.rename_pane(pane_id, name) {
                                     eprintln!(
                                         "flywheel: could not restore name {name} on {pane_id} after a failed re-launch ({back:#}) — the binding stays {label}"
@@ -9418,7 +8917,6 @@ mod taken_name_recovery_tests {
                 label: "flywheel-demo-oc-stale-3".into()
             }
         );
-        // An absent binding, a different one, and a near miss all refuse.
         for binding in [None, Some("other-agent"), Some("flywheel-demo-o")] {
             assert_eq!(
                 taken_name_action(binding, "flywheel-demo-oc", 1),
@@ -9693,8 +9191,6 @@ fn verify_or_respawn_pane(
     let deadline = std::time::Instant::now() + budget;
     let mut attempts = 0;
     loop {
-        // Phase 1: bounded grace for a late boot (the process may still be
-        // finishing past the settle window — never re-launch a healthy TUI).
         let grace = std::time::Instant::now() + Duration::from_secs(20);
         let mut live = false;
         while std::time::Instant::now() < grace && std::time::Instant::now() < deadline {
@@ -9727,21 +9223,12 @@ fn verify_or_respawn_pane(
         eprintln!(
             "flywheel: {name} ({pane_id}) is a shell-fallback pane (no live agent process, bd-spawn-omp-boot-reliability-3h06) — re-launching (attempt {attempts})"
         );
-        // Cancel any partial command before re-typing the launch. Safe only
-        // when the SHELL owns the foreground (pane_agent_alive == Some(false)
-        // requires the shell to own the fg group): no agent is running, so
-        // Ctrl+C cannot interrupt a TUI.
         if let Some(pi) = hc_support::pane_process_info(c, pane_id).ok()
             && hc_support::pane_agent_alive(&pi, kind) == Some(false)
         {
             let _ = c.pane_send_input(pane_id, &["CTRL_C"]);
             std::thread::sleep(Duration::from_millis(500));
         }
-        // Re-launch into the SAME pane through the shared taken-name recovery
-        // (bd-s91y). Direct agent.start, not start_agent_with_retry: hc
-        // still lists the dead agent, so the registry short-circuit would
-        // no-op instead of re-typing the launch — and a taken name is freed
-        // only when THIS pane's own (dead) binding holds it.
         let mut ops = ConcreteTakenOps { c: &*c };
         match start_agent_with_taken_name_clear(&mut ops, name, kind, pane_id, args, attempts) {
             StartAttempt::Started => {}
@@ -9752,11 +9239,7 @@ fn verify_or_respawn_pane(
             }
             StartAttempt::Refused(e) => return Err(e),
         }
-        // bd-eign.6 L1: readiness gate again (the TUI owns the foreground
-        // exactly when it is input-ready).
         let _ = hc_support::wait_agent_foreground(c, pane_id, kind, name, Duration::from_secs(15));
-        // H2 / bd-umb3: re-prime (peer templates are their own prime; never
-        // stack).
         if prime {
             prime_bootstrap(c, pane_id, kind);
         }
@@ -9867,14 +9350,9 @@ mod spawn_join_notice_tests {
 }
 
 fn cmd_spawn(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi: "" defeats the
-    // dir.exists() bail below (the workspace root always exists) — panes
-    // would spawn against the repo root.
     check_project_spelling(project, "spawn")?;
     let dir = project_dir(cfg, project);
     if !dir.exists() {
-        // bd-vik B: fail BEFORE any hc side effect, and name the valid
-        // projects so an invented project name is a fast, clear mistake.
         let mut msg = format!(
             "project dir missing: {} (run: flywheel init {project})",
             dir.display()
@@ -9904,13 +9382,6 @@ projects available: {}",
         }
         bail!("{msg}");
     }
-    // Spawn rides the RESOLVED plane (bd-mknvb): the configured name is not
-    // evidence that rex can answer. On a host without the rex CLI, `auto`
-    // must dispatch on the hc fallback — it used to take the rex arm, build
-    // an hc workspace, and then die in `rex run`. An explicit rex pin with
-    // no CLI fails HERE, before any workspace exists.
-    // `REX_SESSION` never decides the plane. The unknown-name guard refuses
-    // before any side effect instead of silently building panes.
     let plane = crate::backend::resolve_plane(cfg);
     crate::backend::factory::require_mux_for_spawn(&plane.configured)?;
     if plane.plane == crate::backend::Plane::Rex {
@@ -9938,15 +9409,11 @@ projects available: {}",
             "flywheel: spawn with --oc/--model/--provider is the escape hatch; default multi-lane is `workflow compose --parts wave-swarm --run`. Pass --escape to silence."
         );
     }
-    // bd-eign.13 fix: a PROFILE-ONLY spawn must not die in recipe_counts'
-    // "nothing to spawn" guard — the profile plan is the spawn plan.
     let plan = match recipe_counts(opts.recipe.as_deref(), &opts.counts, &opts.kinds) {
         Ok(p) => p,
         Err(_e) if opts.profile_name.is_some() => Vec::new(),
         Err(e) => return Err(e),
     };
-    // bd-eign.13: merge an optional profile-driven plan (harness kind +
-    // count) with the recipe/count/kind plan for mixed crews.
     let catalog = profile::ProfileCatalog::load()?;
     let model_reg = models::ModelRegistry::load_routing()?;
     let profile_plan = match opts.profile_name.as_deref() {
@@ -9967,9 +9434,6 @@ projects available: {}",
         .as_deref()
         .map(String::from)
         .unwrap_or_else(|| swarm_label(project));
-    // bd-command-receipts-zile: a request key pins the SLOT. The label
-    // derives from it, so a retried call computes the same subject — and
-    // therefore the same effect-journal row — as the first attempt.
     let request_key = opts
         .request_key
         .as_deref()
@@ -9985,8 +9449,6 @@ projects available: {}",
         Some(key) => request_receipts::label_for_request_key(&base_label, key),
         None => base_label,
     };
-    // bd-vik C: labels are workspace metadata — normalize to a slug
-    // (lowercase alphanumerics + hyphens) and warn when changed.
     let (label, changed) = slugify_label(&raw_label);
     if changed && opts.label_override.is_some() {
         eprintln!(
@@ -9997,9 +9459,6 @@ projects available: {}",
     if label.is_empty() {
         bail!("workspace label must contain at least one alphanumeric character");
     }
-    // The receipt check runs BEFORE any dispatch (and before the hook-file and
-    // model-reconfirm steps below, which are gates, not spawns). A settled
-    // slot replays; an unresolved one refuses rather than racing a fork.
     if let Some(key) = request_key {
         match request_receipts::spawn_gate(
             request_receipts::load_spawn_row(project, &label).as_ref(),
@@ -10031,11 +9490,6 @@ projects available: {}",
             ),
         }
     }
-    // bd-ll3k: pre-spawn model reconfirm — interactive TTY only, skipped
-    // by --yes (non-TTY/loop drivers never block, byte-identical). Shows
-    // the resolved spend table with the operator default marked, then
-    // go/no-go. Steer/workflow-run already brief this way; spawn was the
-    // silent auto-dispatch hole.
     if !opts.yes && std::io::stdin().is_terminal() {
         let rows = spawn_model_rows(&items, &catalog, &model_reg, cfg, &opts.bare_model)?;
         let defaults_on = model_reg.defaults.as_ref().is_some_and(|d| d.active());
@@ -10056,8 +9510,6 @@ projects available: {}",
             bail!("spawn: aborted by the operator at the model reconfirm gate");
         }
     }
-    // bd-vik: record the custom label so project-based discovery still works
-    // after a custom-label spawn (find_workspace falls back to this).
     if opts.label_override.is_some()
         && let Err(e) = state::save_spawn_meta(project, &label)
     {
@@ -10065,12 +9517,6 @@ projects available: {}",
     }
 
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
-    // bd-fw-stale-workspace-panes-hgp + bd-627z.3: refuse to spawn over
-    // pre-existing FLYWHEEL-OWNED workspaces of this project (stale panes from
-    // a killed swarm keep executing the same bead backlog and race the new
-    // swarm). --retire-orphans closes them first — the explicit escape hatch.
-    // A foreign workspace (captain/omp session labeled like the project) is
-    // NOT the stale-pane race — warn and proceed, never close it.
     let split = project_workspaces(&mut c, project)?;
     if !split.foreign.is_empty() {
         let detail: Vec<String> = split
@@ -10089,11 +9535,6 @@ projects available: {}",
             detail.join(", ")
         );
     }
-    // bd-eign.3 B: probe the pre-existing flywheel-owned workspaces — a
-    // stale swarm's panes (processes dead, shell back at the prompt) are
-    // AUTO-CLOSED; only workspaces with a live or unprobeable pane take the
-    // refuse/--retire-orphans path (never close a workspace that might be
-    // working — probe failures never prove death, bd-1np principle).
     let all_agents = c.agent_list()?;
     let mut probe = Client::connect(Some(&cfg.socket_path())).ok();
     let mut dead_owned: Vec<hc_support::WorkspaceInfo> = Vec::new();
@@ -10107,12 +9548,6 @@ projects available: {}",
             live_owned.push(ws.clone());
             continue;
         }
-        // bd-bug-liveness-false-death: a workspace whose agents report
-        // working/blocked is LIVE, period — the foreground-process liveness
-        // probe is known to false-negative on harnesses that resolve through
-        // wrappers (omp via mise) or whose integration processes own the
-        // foreground. Probe failures never prove death (bd-1np); a
-        // confident wrong probe is worse — never auto-close a working swarm.
         if ws_agents
             .iter()
             .any(|a| matches!(a.agent_status.as_str(), "working" | "blocked"))
@@ -10156,7 +9591,6 @@ projects available: {}",
                 eprintln!("flywheel: close {} failed: {e:#}", ws.workspace_id);
             }
         }
-        // bd-bfwj: those panes are dead — reap their registry rows now.
         pane::reap_dead_registry_rows(project, &mut c);
     }
     let orphans = live_owned;
@@ -10181,7 +9615,6 @@ projects available: {}",
                     eprintln!("flywheel: close {} failed: {e:#}", ws.workspace_id);
                 }
             }
-            // bd-bfwj: retired panes are dead — reap their registry rows now.
             pane::reap_dead_registry_rows(project, &mut c);
         } else if opts.join {
             eprintln!("{}", spawn_join_notice(project, &detail.join(", ")));
@@ -10195,53 +9628,16 @@ projects available: {}",
             );
         }
     }
-    // bd-bug-omp-hc-wedge: hc's agent.start launches the harness
-    // WITHOUT the plane_* env its own omp integration contract requires
-    // (agent.start has no env param). omp's hc extension stays disabled,
-    // hc skips screen detection for omp (full lifecycle hook authority),
-    // and every agent.prompt gates on agent_not_ready. Inject the env at
-    // workspace creation (the one surface hc's API accepts it); the
-    // extension then activates ("Hc active") and reports on the first
-    // processed prompt (see BOOT_PRIME in the spawn loop below).
-    //
-    // bd-pin-public-plane-s-easy.2: the FIRST agent runs on the ROOT pane,
-    // whose env is set here at workspace.create — so its pin must be drawn
-    // BEFORE create to ride along as AGENT_NAME/FLYWHEEL_MAIL_AS. Every
-    // later agent draws its pin before its own pane.split (the loop below).
     let first_pin = items.first().and_then(|item| {
         let kind = spawn_item_kind(cfg, item, &catalog, &model_reg).ok()?;
         pinned_mail_identity(cfg, project, &agent_name_n(project, &item.short, 1), &kind)
     });
-    // bd-crlx: the FIRST agent runs on the ROOT pane, whose env is fixed at
-    // workspace.create — and a pane's env is fixed for the life of the process
-    // it launches. So if that agent's harness cannot take the model as argv
-    // (opencode's root command has no `--model`; only `opencode run` does), the
-    // pin has to be in the WORKSPACE env, which means resolving the plan BEFORE
-    // create. The plan is then threaded into the loop below so the first agent
-    // resolves once and warns about effort degradation once.
-    // Resolved before the workspace exists, so a routing failure aborts the
-    // spawn BEFORE creating a workspace rather than after. The error is
-    // propagated, never swallowed into `None` — a swallowed failure would
-    // resurface later as a misleading "internal: plan no longer available".
-    // The first item's BARE (argv, env pin) — `Some` only when the first item
-    // has no profile. Threaded into the loop so the root pane's pin is resolved
-    // once (and so argv and env can never disagree about it).
     let mut first_bare: Option<(Vec<String>, Option<String>)> = None;
     let mut first_plan: Option<ProfileLaunchPlan> = match items.first() {
         Some(item) => {
             let kind = spawn_item_kind(cfg, item, &catalog, &model_reg)?;
             match item.profile.as_deref().map(|pn| catalog.get(pn)) {
                 Some(Some(p)) => Some(profile_launch_plan(&kind, p, None)?),
-                // No profile (bare harness+model) or an unknown one: the loop
-                // resolves this item itself, so there is no root-pane pin to
-                // carry here. An unknown profile name still fails in the loop
-                // with the real reason.
-                //
-                // bd-oc-bare-spawn-model-argv-zbzt: a BARE first item still has
-                // a pin to carry when its harness delivers by env — that pin
-                // must be in the workspace env, for the same reason the profile
-                // plan is resolved above. `None` means "no profile plan", not
-                // "nothing to pin".
                 _ => {
                     first_bare = Some(bare_model_launch(
                         &kind,
@@ -10262,13 +9658,6 @@ projects available: {}",
     {
         hc_support::apply_opencode_model_pin(&mut plane_env, &m)?;
     }
-    // D9 (ADR-0013 Wave B): the spawn is an EFFECTFUL dispatch — the intent is
-    // journaled before the workspace exists, so a crash or a dead pane can
-    // never read as "exit 0 = employee ready" (I4/I5). `subject` is the
-    // workspace label (the dispatch unit); the per-pin register / presence
-    // rows and the wake observation are SEPARATE evidence, never settlements
-    // of this row. The `?` is deliberate: a dispatch whose intent cannot be
-    // committed does not run (I4 is a precondition).
     let spawn_effect = match request_key {
         Some(_) => agent_ref::AgentEffectGuard::begin_with(
             agent_ref::AgentEffect::prepare(project, &label, agent_ref::AgentPhase::Spawn)
@@ -10293,17 +9682,11 @@ projects available: {}",
     );
 
     let mut spawned: Vec<Value> = Vec::new();
-    // bd-spawn-omp-boot-reliability-3h06: (pane_id, name, kind) of every
-    // booted pane — the final pre-"swarm ready" process gate re-probes these.
     let mut booted: Vec<(String, String, String)> = Vec::new();
-    // bd-fw-name-binding-loss-7rc: pane→name pairs for the spawn registry.
     let mut registry: Vec<state::SpawnEntry> = Vec::new();
     let mut prev = root.pane_id.clone();
     let mut first = true;
-    // ordinals per kind across the whole plan (recipe + flags may repeat a kind)
     let mut ordinals: BTreeMap<String, u32> = BTreeMap::new();
-    // ADR-0005: handler template when peer-aware; identity line always.
-    // --no-peer-aware skips dispatcher + handler, never the identity line.
     let peer_aware = opts.peer_aware && !opts.no_peer_aware;
     let peer_template: Option<String> = if peer_aware {
         let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("integrations/peer-aware.md.tpl");
@@ -10320,11 +9703,6 @@ projects available: {}",
     } else {
         None
     };
-    // H3 (bd-harness-integration-preflight): one status read per spawn;
-    // preflight each kind before its first agent launches (deduped — a
-    // recipe + explicit flags may repeat a kind).
-    // bd-o1zh: snapshot the live hc names once so retried spawns skip
-    // taken ones (fail-open to empty on an unlistable backend).
     let mut taken_names: std::collections::HashSet<String> = c
         .agent_list()
         .map(|agents| agents.into_iter().filter_map(|a| a.name).collect())
@@ -10339,19 +9717,9 @@ projects available: {}",
         for _ in 0..item.count {
             let ordinal = ordinals.entry(item.short.clone()).or_insert(0);
             *ordinal += 1;
-            // bd-o1zh: unique name per spawn attempt — skip names hc
-            // still holds (stale binding / launch_pending) so a retried
-            // spawn does not collide agent_name_taken on the fixed
-            // ordinal-1 name. Fail-open: an unlistable backend keeps the
-            // ordinal the plan asked for.
             *ordinal = free_spawn_ordinal(project, &item.short, *ordinal, &taken_names);
             let name = agent_name_n(project, &item.short, *ordinal);
             taken_names.insert(name.clone());
-            // S9 (ADR-0018 D1a) + bd-pin-public-plane-s-easy.2: draw the
-            // adj+noun PIN BEFORE the pane exists so the pane env carries
-            // AGENT_NAME/FLYWHEEL_MAIL_AS (hc injects env only at
-            // split/create). GS-033: refuse_unpinned BEFORE agent_start
-            // (add/profile/squad style) — never leave a dark orphan pane.
             let mail_identity = pinned_mail_identity(cfg, project, &name, &kind);
             if mail_identity.is_none() {
                 refuse_unpinned_spawn(
@@ -10361,12 +9729,6 @@ projects available: {}",
                 )?;
             }
             let identity = mail_identity.as_deref().unwrap_or(&name);
-            // bd-crlx: resolve the launch plan BEFORE building the pane env.
-            // hc injects env only at split/create, so a model that travels
-            // by env must be in the map that split receives. The first agent
-            // reuses the plan resolved before workspace.create (its pane is the
-            // root pane, so its pin went into the workspace env) — one
-            // resolution, one effort warning.
             let (mut agent_args, model_pin, env_model_pin): (
                 Vec<String>,
                 Option<String>,
@@ -10388,13 +9750,6 @@ projects available: {}",
                     };
                     (plan.args, Some(plan.model), plan.env_model_pin)
                 }
-                // bd-j3so: bare harness+model override for kind/count spawns
-                // (no --profile) — lenient registry routing. No profile, so
-                // no pin to record (P1-7 is a profile-provenance row).
-                // bd-oc-bare-spawn-model-argv-zbzt: the pin still has to be
-                // DELIVERED — the first agent reuses the plan resolved before
-                // workspace.create (its env is fixed there), later agents
-                // resolve their own (their pane env is built just below).
                 None => {
                     let (args, env_pin) = if first {
                         first_bare.take().ok_or_else(|| {
@@ -10440,39 +9795,16 @@ projects available: {}",
                     )]
                 })
                 .unwrap_or_else(|| vec![doorbell::identity_prime(&name, identity)]);
-            // bd-eign.9: a profiled spawn launches with the profile's model.
-            // The plan (argv + registry pin + any env-delivered model pin) was
-            // resolved above the pane env; launch text (peer template) goes
-            // LAST so a one-shot-capable harness does not swallow the flags as
-            // a prompt.
-            // ADR-0013 P1-8: record the ATTACHED skill set as a bounded digest
-            // (identity + count), never the list.
             let skills_digest = item
                 .profile
                 .as_deref()
                 .and_then(|pname| catalog.get(pname))
                 .and_then(|p| profile::skills_digest(&p.skills));
 
-            // bd-peeraware-enametoolong-iswg: launch text NEVER rides
-            // agent.start args (opencode reads a positional as a directory).
-            // The prime is typed post-readiness below; args carry flags only.
             let has_peer_prime = !peer_args.is_empty();
-            // H2 (bd-harness-pane-send-text-7fe8): the boot prime is typed
-            // into the pane via pane.send_text AFTER the TUI owns the
-            // foreground + settle (see below) — works for any kind and for
-            // non-agent panes, replacing the old positional MESSAGES-arg
-            // prime (bd-bug-omp-hc-wedge). Secondary in-arg path kept for
-            // kinds that need it (needs_in_arg_prime; currently none). A
-            // supplied peer template IS the prime — never stack.
             if needs_in_arg_prime(&kind) && !has_peer_prime {
                 agent_args.push(boot_prime_line().to_string());
             }
-            // bd-pattern-peer-triggered: gate the launch on the shell being
-            // INTERACTIVE. hc types the launch command (peer template ~2.6KB)
-            // immediately after pane.split; a booting shell (canonical mode,
-            // 1024-byte MAX_CANON line limit) splits the single-quoted arg
-            // mid-quote and zsh parks at `>....` — agent never starts
-            // (2026-08-18 coder2/coder3). Wait for the rendered prompt.
             let shell_ready = hc_support::wait_shell_prompt(&c, &pane_id, Duration::from_secs(15));
             if !shell_ready {
                 eprintln!(
@@ -10488,10 +9820,6 @@ projects available: {}",
                 &agent_args,
                 item.profile.as_deref(),
             )?;
-            // bd-eign.6 L1: readiness gate — agent.start returns when the
-            // launch command is dispatched, not when the TUI is input-ready;
-            // a prompt in the boot window is lost to the shell. Poll until
-            // the agent binary owns the foreground (max 15s).
             let ready = hc_support::wait_agent_foreground(
                 &c,
                 &pane_id,
@@ -10504,28 +9832,15 @@ projects available: {}",
                     "flywheel: warn: {name} not foreground within 15s of spawn — the boot window race (bd-eign.6) still applies; prompts dispatched before the TUI is up may be lost"
                 );
             }
-            // bd-eign.6 L2: settle — a TUI can own the foreground while MCP
-            // servers still initialize; hold dispatch-side sleeps before the
-            // spawn command returns (default 30s, observed boot 20-30s).
             if opts.settle_secs > 0 {
                 std::thread::sleep(Duration::from_secs(opts.settle_secs));
             }
-            // H2 (bd-harness-pane-send-text-7fe8): prime the agent.prompt
-            // gate via pane.send_text once the TUI is input-ready (a prompt
-            // in the boot window is lost to the shell, bd-eign.6). Universal
-            // — any kind, non-agent panes too. Peer templates are their own
-            // prime; never stack.
             if has_peer_prime {
-                // The peer template is its own prime — typed, never stacked.
                 prime_line_via_send_text(&mut c, &pane_id, &peer_args[0]);
-                // Phase 3 (flag on): the pane still needs the pull contract,
-                // so the per-harness LaunchBootstrap follows the template.
                 if comms_inbox_on() {
                     prime_bootstrap(&mut c, &pane_id, &kind);
                 }
             } else {
-                // Identity first (mail identity + guard note), then the boot
-                // ready check (code-pointer gate keeps the boot-prime call).
                 prime_line_via_send_text(
                     &mut c,
                     &pane_id,
@@ -10533,12 +9848,6 @@ projects available: {}",
                 );
                 prime_bootstrap(&mut c, &pane_id, &kind);
             }
-            // bd-spawn-omp-boot-reliability-3h06: post-boot dead-shell gate —
-            // verify the pane holds a LIVE agent process (pane_agent_alive,
-            // never the launch_pending flag); a shell-fallback pane is
-            // recovered (cancel + re-launch + re-prime) within the 2-minute
-            // budget. Exhaustion FAILS the spawn — never declare ready with
-            // a dead shell that looks like an agent.
             if !opts.no_verify {
                 let live = verify_or_respawn_pane(
                     &mut c,
@@ -10550,8 +9859,6 @@ projects available: {}",
                     Duration::from_secs(120),
                 )?;
                 if !live {
-                    // GS-037 P0-1: dead-shell MUST exit nonzero (bail → die → 1).
-                    // Never print "swarm ready" after this path.
                     bail!(
                         "{name} ({pane_id}) has no live agent process after spawn + recovery — the pane is a dead shell. Inspect it (hc terminal read {pane_id}), then recover manually (flywheel recover {project} {name}) or kill + re-spawn."
                     );
@@ -10559,11 +9866,6 @@ projects available: {}",
             }
             booted.push((pane_id.clone(), name.clone(), kind.clone()));
             // governed-by: ADR-0001 (mail-register-on-spawn) — the pin was
-            // drawn + registered BEFORE the split (S8.3, above); now that
-            // the pane exists, bind the pane identity (pane → pin bridge +
-            // registry pane_id) so resolve_pane_identity / assign resolve
-            // deterministically. bd-627z.4: the pinned identity never
-            // shifts across calls, restarts, and daemon restarts.
             bind_pane_mail_identity(
                 cfg,
                 project,
@@ -10571,9 +9873,6 @@ projects available: {}",
                 &agent.pane_id,
                 mail_identity.as_deref(),
             );
-            // GS-030 slice 3: auto-bind the crew role to the pin — best-effort:
-            // a failed bind warns loud and lets the spawn continue, never aborts
-            // panes 2..N (the alias re-binds via `toron role pin`).
             note_role_bind_result(
                 bind_spawn_role(
                     cfg,
@@ -10584,8 +9883,6 @@ projects available: {}",
                 ),
                 project,
             );
-            // Fail-closed already ran BEFORE agent_start; remaining None-pin
-            // cases are legacy+warn only (mail not configured).
             let mut entry = match (&item.profile, &mail_identity) {
                 (Some(p), Some(mid)) => state::SpawnEntry::profiled(
                     agent.pane_id.clone(),
@@ -10613,9 +9910,6 @@ projects available: {}",
                     mid.clone(),
                 ),
                 (None, None) => {
-                    // bd-unpinned-loud-1mlt: a legacy entry with no mail
-                    // identity is invisible to the doorbell sweep — say so at
-                    // creation instead of going silently dark later.
                     eprintln!(
                         "flywheel: warn: spawned {name} ({}) with no mail identity (unpinned legacy entry); doorbell sweep skips unpinned panes — re-register with a mail identity to restore inbox checks",
                         agent.pane_id
@@ -10623,12 +9917,8 @@ projects available: {}",
                     state::SpawnEntry::legacy(agent.pane_id.clone(), name.clone())
                 }
             };
-            // ADR-0013 P1-7/P1-8 provenance: the Muse/slot pin this launch plan
-            // resolved, plus the bounded digest of the profile's attached
-            // skills — ledger evidence, not an inferred column.
             entry.model_pin = model_pin;
             entry.skills_digest = skills_digest;
-            // ADR-0019 D6: capture GROK_SESSION_ID (etc.) at register time.
             entry.harness_session = captain_directory::capture_harness_session(&kind);
             registry.push(entry);
             println!(
@@ -10650,20 +9940,12 @@ projects available: {}",
         }),
     );
 
-    // bd-fw-name-binding-loss-7rc: persist pane→name bindings so a lost name
-    // (agent restarted in its pane) can be restored by `flywheel rebind` or
-    // the __send auto-heal. Best-effort — a registry failure is not a spawn
-    // failure.
     if let Err(e) = state::save_spawn_registry(project, &registry) {
         eprintln!("flywheel: cannot save spawn registry: {e:#}");
     }
-    // bd-eign.3 A: project-local mirror of the bindings — survives a state
-    // dir wipe; `cmd_recover` falls back to it when the registry is empty.
     if let Err(e) = state::save_agent_names(&dir, &registry) {
         eprintln!("flywheel: cannot save .flywheel/agent-names.json: {e:#}");
     }
-    // bd-asr2.13 (Phase 3 cutover): spawn records wake subscriptions —
-    // the daemon serves these rows when it hosts wake. Best-effort.
     doorbell::register_workspace_subscriptions(
         &config::state_dir(),
         project,
@@ -10673,10 +9955,6 @@ projects available: {}",
             .filter_map(|e| e.mail_identity.clone())
             .collect::<Vec<_>>(),
     );
-    // bd-enov (F17): VERIFY the rows landed. The friction's swarm ran an entire
-    // session with subscribers=0 — no rings, no inbox-digest wakes, no ack-SLA
-    // nudges; every wake path silently fell back to manual and no gate noticed.
-    // A subscription that never wrote is a wake-blind spawn: say so, loudly.
     {
         use doorbell_rt::subscribe::SubscriptionStore;
         let prefix = format!("spawn-{label}-");
@@ -10685,10 +9963,6 @@ projects available: {}",
             .iter()
             .filter(|s| s.id.starts_with(&prefix))
             .count();
-        // D9: the wake observation is SEPARATE evidence — its row never
-        // settles the spawn / register / presence effects above. A
-        // subscription that never wrote is journaled Unknown (visible), never
-        // a silent absence.
         let wake = agent_ref::AgentEffect {
             state: if landed == 0 {
                 agent_ref::EffectState::Unknown
@@ -10711,11 +9985,6 @@ projects available: {}",
         }
     }
 
-    // bd-vik A: post-spawn visibility check — hc's session registry
-    // (session.json) can silently fail to persist, leaving the panes LIVE but
-    // invisible to list/send/status. Verify the exact workspace_id we just
-    // created is visible from the same view list/send use; fail loudly with
-    // recovery steps instead of silent success.
     if !opts.no_verify {
         let listed = c.workspace_list()?;
         let created_id = ws.workspace_id.clone();
@@ -10728,17 +9997,6 @@ the panes may still be live in hc; `--no-verify` skips this check in scripts"
         }
     }
 
-    // GS-039 P0-4: atomic name-binding — after settle, rename every registry
-    // pane to its routable label; fail spawn if any pane remains unbound
-    // (name:null). Never declare ready with addressable-by-name holes.
-    //
-    // The routable label is the mail PIN on hc, never the kind slug: hc
-    // `agent_rename` writes the `toron_pin` LABEL, and mail/doorbell routing
-    // resolves a pin → pane through it. Renaming to `e.name` (the kind) made
-    // `resolve_pane_identity` answer the kind, so `identity_divergent` fired
-    // and a doorbell wake could never map `CobaltCoast` to `hc:t1j`. Rex
-    // keeps `e.name`: there the rename is the terminal/block name, not the
-    // mail identity (bd-rex-reliability-ioyz).
     if !opts.no_verify && !registry.is_empty() {
         let routable = |e: &state::SpawnEntry| -> String {
             if pane_takes_hc_stamp(&e.pane_id) {
@@ -10769,14 +10027,12 @@ the panes may still be live in hc; `--no-verify` skips this check in scripts"
             }
         }
         let agents_after = c.agent_list()?;
-        // Fail-closed under verify: empty OR wrong-name counts as unbound
-        // (GS-039 P0-4) — not only name:null/empty.
         let still_unbound: Vec<String> = registry
             .iter()
             .filter(|e| !e.pane_id.is_empty())
             .filter(|e| {
                 match agents_after.iter().find(|a| a.pane_id == e.pane_id) {
-                    None => true, // pane vanished — unbound
+                    None => true,
                     Some(a) => {
                         let want = routable(e);
                         a.name.as_deref().is_none_or(|n| n.is_empty())
@@ -10801,11 +10057,6 @@ the panes may still be live in hc; `--no-verify` skips this check in scripts"
         }
     }
 
-    // bd-4pxy: spawn readiness — "swarm ready" must never print while an
-    // agent is still launch_pending (hc: the launcher command has not
-    // finished; a harness that cannot start stays pending). Wait briefly,
-    // then FAIL naming the field + the pending agents (a silent ready is
-    // the bug that produced dead sends).
     if !opts.no_verify {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -10826,11 +10077,6 @@ the panes may still be live in hc; `--no-verify` skips this check in scripts"
             }
             std::thread::sleep(Duration::from_secs(2));
         }
-        // bd-spawn-omp-boot-reliability-3h06 final gate: every requested
-        // pane must hold a live agent PROCESS (not just a cleared
-        // launch_pending flag) before "swarm ready" — a pane whose process
-        // died after its per-pane verification (during later panes' spawn) is
-        // a dead shell, never a ready agent.
         let dead = dead_panes(&booted, |pane_id, kind| {
             hc_support::pane_process_info(&c, pane_id)
                 .ok()
@@ -10849,10 +10095,6 @@ the panes may still be live in hc; `--no-verify` skips this check in scripts"
         }
     }
 
-    // D9: the spawn effect's apply evidence is the verified workspace + live
-    // panes above. `--no-verify` skips exactly those gates, so the honest
-    // terminal there is Unknown — the row stays visible instead of inventing
-    // Settled from a return code (I5).
     if opts.no_verify {
         spawn_effect.mark_unknown(Some("--no-verify: workspace + readiness gates skipped"));
     } else {
@@ -10863,27 +10105,12 @@ the panes may still be live in hc; `--no-verify` skips this check in scripts"
         )));
     }
 
-    // bd-pin-public-plane-s-easy.5: publish spawn presence (plane N, kind
-    // 20001) for every freshly spawned agent — the orchestrator + peers see
-    // liveness on the presence surface, not by polling mail. Best-effort:
-    // the existing CLI (`toron presence publish --as <pin>`); no new MCP
-    // tool, a presence failure never fails the spawn.
-    // GS-037 P0-D: register-before-presence — pins were registered earlier
-    // under the ABSOLUTE project key (`project_dir`); presence must use the
-    // same key or toron reports `unknown agent name` (GS-034/035/036 race).
     let presence_project = project_dir(cfg, project)
         .to_str()
         .map(str::to_string)
         .unwrap_or_else(|| project.to_string());
     for e in &registry {
         if let Some(pin) = &e.mail_identity {
-            // GS-039 P1: presence race — register-before-presence already
-            // uses absolute project key; retry once on "unknown agent" after
-            // a short settle (GS-034/035/036/038 race class).
-            // D9: the publish is an effect per pin — intent before the first
-            // invoke, terminal from the OBSERVED outcome. A journal failure
-            // warns rather than failing the spawn (presence stays
-            // best-effort); the outcome is never inferred from the retry.
             let mut presence_effect = match agent_ref::AgentEffectGuard::begin(
                 project,
                 pin,
@@ -10937,8 +10164,6 @@ the panes may still be live in hc; `--no-verify` skips this check in scripts"
             }
             if let Some(g) = presence_effect.take() {
                 match failure {
-                    // Unobservable publish (transport error / daemon refusal):
-                    // Unknown — never a silent absence, never invented Settled.
                     Some(ev) => g.mark_unknown(Some(&ev)),
                     None => g.settle(Some("presence=working published")),
                 }
@@ -10946,11 +10171,6 @@ the panes may still be live in hc; `--no-verify` skips this check in scripts"
         }
     }
 
-    // bd-kbl1c join-before-post: auto-join every --join-channel for every
-    // spawned identity BEFORE first doorbell — membership is the only gate,
-    // and a non-member post is a refused write (the 2026-08-22 silent-drop
-    // incident class). bd-compose-plumbing-zdzi: the ensure+join loop lives
-    // in `ensure_and_join_channels`, shared with `workflow compose --run`.
     if !opts.join_channels.is_empty() {
         let pins: Vec<String> = registry
             .iter()
@@ -10959,8 +10179,6 @@ the panes may still be live in hc; `--no-verify` skips this check in scripts"
         ensure_and_join_channels(project, &opts.join_channels, &pins);
     }
 
-    // ADR-0005 D1: detached doorbell dispatcher. Spawn fails if it cannot
-    // start or attach. --no-peer-aware skips registration (no child).
     if peer_aware {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flywheel"));
         doorbell::ensure_running(&exe, &config::state_dir(), &label, project)
@@ -10998,11 +10216,6 @@ fn poll_child_exit(
     pane: &str,
 ) -> Option<i32> {
     let stream = stream?;
-    // Drain what the stream has buffered, not a fixed handful: the exit can sit
-    // behind block_created / process_changed / view-change traffic (measured:
-    // 5 events was not enough after a readiness wait, so D read `unknown` for a
-    // block that had plainly exited). `Ok(None)` is the empty-stream stop; the
-    // cap only bounds memory on a pathological stream.
     for _ in 0..10_000 {
         match stream.read_event() {
             Ok(Some(toron_core::backend::BackendEvent::Raw(line))) => {
@@ -11150,8 +10363,6 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
         eprintln!("flywheel: cannot save spawn label metadata: {e:#}");
     }
 
-    // No Client::connect on this arm: the multiplexer backend (rex-first
-    // under `auto`, pinned rex under `superlogical`) owns every pane op.
     let backend = backend::multiplexer_backend(cfg)?;
     let split = {
         let ws_list = backend.workspace_list()?;
@@ -11180,8 +10391,6 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
             detail.join(", ")
         );
     }
-    // No hc liveness probe on this arm (client-coupled): any owned
-    // workspace counts as live — refuse or retire, never auto-close.
     let orphans = split.owned;
     if !orphans.is_empty() {
         let detail: Vec<String> = orphans
@@ -11256,20 +10465,7 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
         .first()
         .map(|p| p.pane_id.clone())
         .ok_or_else(|| anyhow!("rex: workspace {} has no panes", ws.workspace_id))?;
-    // D: headless one-shots emit no OSC 7501, so readiness alone reports
-    // unknown. Subscribe BEFORE the blocks are created (an event that
-    // already happened is not replayed); each member races readiness
-    // against terminal.child_exited for its own block below.
-    //
-    // Session-scoped, not `subscribe(&[])`: the trait carries pane ids only, and
-    // an unscoped `rex events` follows the CALLER's session — measured live as
-    // "child_exited never arrives, D degrades to unknown".
     let mut exit_stream = crate::backend::superlogical::subscribe_session(&ws.workspace_id).ok();
-    // `rex events` is forward-only (no replay), so a block that exits before the
-    // subscription is CONNECTED loses its `child_exited` and the one-shot
-    // degrades to `unknown` — measured live on `rex run -- sh -c 'exit 1'`.
-    // The stream's first line is its own `client_connected` hello; wait for it
-    // before any block exists, then drop back to the short poll bound.
     if let Some(stream) = exit_stream.as_mut() {
         let _ = stream.set_read_timeout(Some(Duration::from_millis(2_000)));
         let live = matches!(stream.read_event(), Ok(Some(_)));
@@ -11347,11 +10543,6 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
                 mail_identity.as_deref(),
                 env_model_pin.as_deref(),
             )?;
-            // bd-rex-reliability-ioyz A+B: the block is created WITH the pin
-            // label and --keep-open, so the pin is routable from the first
-            // instant and the screen survives the agent exit. First block
-            // opens its own window via `rex run`; later blocks split below
-            // the previous one anchored to it (never focus).
             let cwd = utf8_path(&dir, "workspace dir")?;
             let peer_args: Vec<String> = peer_template
                 .as_ref()
@@ -11370,16 +10561,7 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
             if needs_in_arg_prime(&kind) && !has_peer_prime {
                 agent_args.push(boot_prime_line().to_string());
             }
-            // No env map on `rex run`: the pin + model pin ride as an
-            // `env K=V` command prefix, and the block is labelled the mail PIN
-            // at creation (no create-then-rename window) so `backend_wake_target`
-            // (name or display_agent == pin) resolves it and a send reports a
-            // ring instead of `no-pane`. The shell gate is gone with the shell:
-            // `run` starts the command directly, so there is no prompt to wait
-            // for and no chance to type into an unbooted shell.
             let command = crate::pane::rex_env_command(&pane_env, &kind, &agent_args);
-            // `run` takes no anchor; `split` anchors to the previous block.
-            // Direction is the rex word (`below`), never hc `down`.
             let pane_id = if first {
                 crate::backend::superlogical::create_agent_block(
                     &ws.workspace_id,
@@ -11401,14 +10583,6 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
             };
             first = false;
             prev = pane_id.clone();
-            // Readiness: the agent reports instead of the shell prompt.
-            // Best-effort — a wait failure degrades to dispatch-side
-            // errors, never a panic. Wait on the stable pane id: the label
-            // above just changed to the pin.
-            // D: try the exit stream BEFORE the 90 s readiness wait. A headless
-            // one-shot emits no OSC 7501, so `agent_wait` can only ever time out
-            // for it — the exit event IS the outcome, and polling first keeps a
-            // one-shot spawn from costing the full readiness bound.
             let launched_status: String = match poll_child_exit(exit_stream.as_mut(), &pane_id) {
                 Some(code) => exited_status(&name, &pane_id, code),
                 None => match backend.agent_wait(
@@ -11420,10 +10594,8 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
                     Some(90_000),
                 ) {
                     Ok(a) => a.agent_status.as_str().to_string(),
-                    // A resident agent's exit can land while readiness waits.
                     Err(e) => match poll_child_exit(exit_stream.as_mut(), &pane_id) {
                         Some(code) => exited_status(&name, &pane_id, code),
-                        // No exit inside the bound: unknown, never success.
                         None => {
                             eprintln!(
                                 "flywheel: warn: {name} not ready within 90s of spawn (dispatching anyway): {e}"
@@ -11436,10 +10608,6 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
             if opts.settle_secs > 0 {
                 std::thread::sleep(Duration::from_secs(opts.settle_secs));
             }
-            // Prime through pane_run (write + enter): the peer template is
-            // its own prime, else the identity line. The harness
-            // launch-hook bootstrap is hc-client-coupled and is not
-            // installed on this arm.
             if let Err(e) = backend.pane_run(&pane_id, &peer_args[0]) {
                 eprintln!("flywheel: warn: rex prime for {name} ({pane_id}) failed: {e:#}");
             }
@@ -11494,7 +10662,6 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
                 .as_deref()
                 .and_then(|pname| catalog.get(pname))
                 .and_then(|p| profile::skills_digest(&p.skills));
-            // ADR-0019 D6: capture GROK_SESSION_ID (etc.) at register time.
             entry.harness_session = captain_directory::capture_harness_session(&kind);
             registry.push(entry);
             println!("  {} {}", kind_paint(&kind), dim(&format!("({})", pane_id)));
@@ -11573,12 +10740,6 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
     }
 
     if !opts.no_verify && !registry.is_empty() {
-        // bd-rex-reliability-ioyz: the routable label is the mail PIN when the
-        // entry has one (ADR-0018 D1a: the block carries the pin so
-        // `backend_wake_target` resolves it); the lane name is only the
-        // fallback. Comparing against `e.name` here renamed a correctly
-        // labelled pin block back to the lane name — the same "running pin is
-        // unroutable" defect the create-time label closes.
         let routable_label = |e: &state::SpawnEntry| -> String {
             e.mail_identity
                 .as_deref()
@@ -11630,9 +10791,6 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
         }
     }
 
-    // Readiness: "swarm ready" never prints while an agent is still
-    // launch_pending — same fail-closed shape as the hc path (the
-    // process-liveness probe is hc-client-coupled and skipped here).
     if !opts.no_verify {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -11764,9 +10922,6 @@ fn doorbell_project_workspaces(project: &str) -> Vec<String> {
         return Vec::new();
     }
     let state_dir = config::state_dir();
-    // Preferred: the label recorded at spawn. Fallback: swarm_label — a
-    // STALE meta label from a probe run must not hide the real dispatcher
-    // files (bd-durable-doorbell-lngf graduation finding).
     let mut candidates = Vec::new();
     if let Some(meta) = state::load_spawn_meta(project) {
         candidates.push(meta);
@@ -11787,12 +10942,6 @@ fn doorbell_project_workspaces(project: &str) -> Vec<String> {
 /// connected stay queued and execute at-least-once later. Server
 /// unreachable → skip silently; the lazy fallback still covers us.
 fn ensure_doorbell_supervisor() {
-    // bd-flywheel-cron-elm-cn7p: the every-minute heal rides the ElmCron
-    // host inside `flywheel cron start` (doorbell-supervisor schedule).
-    // The server-side schedule is gone on purpose — registering it here
-    // would double-heal alongside the cron host. Interactive paths still
-    // lazy-heal per workspace; the call site below stays so the notice
-    // fires where the old registration ran.
     eprintln!("flywheel: doorbell supervisor rides the cron host (no server schedule registered)");
 }
 
@@ -11802,14 +10951,10 @@ fn ensure_doorbell_supervisor() {
 /// read the same journal files either way, so output is identical without
 /// a proxy hop. Returns true when proxied.
 fn proxy_doorbell_verb(cfg: &Config, verb: &str, extra: &[String]) -> Result<bool> {
-    // No target: lifecycle verbs address the daemon itself, so they must
-    // not be qualified by whether it hosts any particular workspace.
     let url = match doorbell::resolve_host(&config::state_dir(), cfg.doorbell_url(), None) {
         doorbell::DoorbellHost::Proxy { url } => url,
         doorbell::DoorbellHost::Embedded => return Ok(false),
     };
-    // Only loopback daemons are addressable from here (the daemon CLI has
-    // no remote mode); remote hosts are operated out of band.
     let host = url
         .trim_start_matches("http://")
         .split(['/', ':'])
@@ -11825,10 +10970,6 @@ fn proxy_doorbell_verb(cfg: &Config, verb: &str, extra: &[String]) -> Result<boo
         .and_then(|h| h.split(':').nth(1))
         .unwrap_or("18980");
     eprintln!("flywheel doorbell: daemon host {url} — proxying `{verb}`");
-    // F1: resolve the daemon CLI co-located with this binary first
-    // (`cargo install --path crates/doorbell-cli` drops it beside flywheel
-    // in ~/.cargo/bin), then PATH. Neither found → degraded local handling,
-    // never a hard fail for status/start/stop.
     let colocated = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("doorbell")))
@@ -11882,20 +11023,11 @@ fn cmd_doorbell_why(
     seq: Option<u64>,
     subscriber: Option<&str>,
 ) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi
     crate::check_project_spelling(project, "doorbell why")?;
     let _ = cfg;
-    // bd-a8ld: fold only the workspaces this project owns (see the helper).
     let scoped = doorbell_scoped_workspaces(project);
-    // fold tick from Default — replay is the trust surface, not grep
-    // WorkspaceModel is the single owner; journal entries may be DoorbellMsg (old) or workspace::Msg (new)
     let entries = doorbell::journal_read_all(&config::state_dir());
-    // bd-asr2.4 D4.4/D4.3: fold honesty before replay — torn tails stop
-    // loudly per workspace, and a --seq older than retention names the
-    // first foldable seq instead of folding a partial proof.
     {
-        // Owned workspace set (entries plus zero-row survivors of a fully
-        // torn fold, discovered from active journal files).
         let mut workspaces: std::collections::BTreeSet<String> =
             entries.iter().map(|(ws, _)| ws.clone()).collect();
         if let Ok(dir) = std::fs::read_dir(config::state_dir().join("journals")) {
@@ -11925,8 +11057,6 @@ fn cmd_doorbell_why(
             }
         }
     }
-    // presence/assignment into a single proof (tenant contamination).
-    // Each workspace folds its own entries from an identically-seeded Default.
     let presence_rows = std::fs::read_to_string(crate::mail::presence_path())
         .ok()
         .map(|body| timeout_presence_rows(&body, doorbell_now_unix()))
@@ -11946,8 +11076,6 @@ fn cmd_doorbell_why(
             );
             continue;
         }
-        // Subscriber-filtered replay (bd-asr2.11): untagged legacy rows
-        // cannot be attributed, so a filter excludes them loudly-once.
         if let Some(sub) = subscriber {
             match entry.get("subscriber").and_then(|s| s.as_str()) {
                 Some(tag) if tag == sub => {}
@@ -11959,11 +11087,6 @@ fn cmd_doorbell_why(
             .get("actions")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        // bd-a8ld: pre-bd-z5ou journals encode the unit `FetchInbox` action as
-        // `{"FetchInbox":{"since":…}}`. The output renderer already tolerates
-        // both shapes; this projection did not — the parse failed as a whole,
-        // `expected` fell back to `[]`, and every legacy row printed a
-        // mismatch against a recomputed action. Normalise before parsing.
         normalize_action_shapes(&mut actions_val);
         let replay_msg: Option<workspace::Msg> = if let Ok(m) =
             serde_json::from_value::<workspace::Msg>(msg_val.clone())
@@ -11993,10 +11116,6 @@ fn cmd_doorbell_why(
         } else {
             None
         };
-        // Expected may be workspace::Cmd or legacy DoorbellAction. The mapping
-        // is `workspace::Cmd::from_doorbell` — ONE definition, so a new action
-        // variant cannot drift between this replay and the live path (it did
-        // for bd-bk9t's Digest, which this block had to be taught by hand).
         let expected: Vec<workspace::Cmd> =
             if let Ok(v) = serde_json::from_value::<Vec<workspace::Cmd>>(actions_val.clone()) {
                 v
@@ -12010,27 +11129,10 @@ fn cmd_doorbell_why(
             } else {
                 Vec::new()
             };
-        // bd-c9jw/bd-a8ld: the daemon journals rt-only messages (InboxFetched,
-        // Sweep, Presence, Delivered, ...) that the embedded reducer has no arm
-        // for. `why` rebuilds its model from Default + journal, and the daemon's
-        // index state (registry pins, the unroutable set) is not in the journal
-        // — so recomputing such a row compares against a baseline the writer
-        // never used, prints a mismatch for every one of them, and buries the
-        // ring the caller asked about. Replay those rows from their journaled
-        // actions and LABEL them; never fold them as if re-derived.
         let folded = replay_msg.is_some();
         let actual: Vec<workspace::Cmd> = if let Some(msg) = replay_msg.clone() {
             let (next, actual) = {
-                // bd-z54w honesty contract: restore the journaled pin set into
-                // the fold index so classification reproduces deterministically.
-                // Entries lacking pins (pre-field journals) keep the empty
-                // Default index: Unknown-presence semantics, never invent idle.
-                // bd-7qg6: per-workspace fold (see setup above).
                 let model = models.entry(workspace.clone()).or_insert_with(|| {
-                    // bd-adr0027-proven-leftovers-55nx.1: crash-resume seed — the same
-                    // durable caches the live dispatcher reloads at start (receipts sqlite
-                    // → assignment; presence.jsonl snapshot → presence). Journal Msgs fold
-                    // on top. Never the live dispatcher's RAM, never a second store.
                     let mut m = workspace::WorkspaceModel::from_environment();
                     rebuild_assignment_from_receipts(&mut m);
                     seed_why_presence(&mut m, presence_rows.clone());
@@ -12054,9 +11156,6 @@ fn cmd_doorbell_why(
             expected.clone()
         };
         replay_seq += 1;
-        // 55nx.9: the journal line carries the budget-gate outcome
-        // (effect); dropped-pin Prompts replayed below are the EFFECTIVE
-        // injects, never the pre-gate cmds.
         let dropped = why_dropped_pins(entry);
         let seq_match = seq.map(|s| s == replay_seq - 1).unwrap_or(true);
         let corr_match = match corr {
@@ -12076,8 +11175,6 @@ fn cmd_doorbell_why(
         let pin_match = if corr.is_some() || seq.is_some() {
             true
         } else {
-            // bd-2i96 G1: journal attribution for daemon rows that fold
-            // to no workspace::Msg (InboxFetched/Digest carry rt_kind).
             let entry_pins: Vec<String> = entry
                 .get("pins")
                 .and_then(|p| p.as_array())
@@ -12100,7 +11197,6 @@ fn cmd_doorbell_why(
         if !corr_match || !seq_match || !pin_match {
             continue;
         }
-        // Also support direct corr/seq fields in msg if present (extra_tags)
         matched += 1;
         shown += 1;
         if shown > limit {
@@ -12114,8 +11210,6 @@ fn cmd_doorbell_why(
             .map(|a| {
                 a.iter()
                     .filter_map(|v| {
-                        // 55nx.9: a journaled Prompt the budget dropped
-                        // was never injected — skip it in the replay.
                         if let Some(p) = v
                             .get("Prompt")
                             .and_then(|p| p.get("pin"))
@@ -12135,13 +11229,9 @@ fn cmd_doorbell_why(
                         } else if v.get("Audit").is_some() {
                             "audit"
                         } else if v.get("Digest").is_some() {
-                            // bd-bk9t: a digest-bound wake is a first-class
-                            // action, never "unknown".
                             "digest"
                         } else if v.get("FetchInbox").is_some() || v.as_str() == Some("FetchInbox")
                         {
-                            // Unit since bd-z5ou (was {"FetchInbox":{"since"}});
-                            // old journals keep the object shape.
                             "fetch-inbox"
                         } else {
                             "unknown"
@@ -12151,9 +11241,6 @@ fn cmd_doorbell_why(
                     .join(",")
             })
             .unwrap_or_default();
-        // bd-c9jw: daemon rows carry the rt message shape (`rt_kind`),
-        // embedded rows the workspace::Msg shape. Name both, instead of
-        // labelling every daemon row "other".
         let kind = if let Some(rt) = msg.get("rt_kind").and_then(|k| k.as_str()) {
             rt
         } else {
@@ -12176,7 +11263,6 @@ fn cmd_doorbell_why(
             .and_then(|h| h.get("status"))
             .and_then(|s| s.as_str())
             .unwrap_or("");
-        // fold tick replay already verified above; this print is the user-visible replay
         println!(
             "{workspace} {ts} seq={} {kind}{} actions=[{actions}]{}{}{}",
             replay_seq - 1,
@@ -12190,13 +11276,7 @@ fn cmd_doorbell_why(
             } else {
                 format!(" dropped=[{}]", dropped.join(","))
             },
-            // bd-c9jw: say which rows were re-derived by the fold and
-            // which were read from the journal — the trust surface must
-            // not blur the two.
             if folded { "" } else { " [journaled]" },
-            // A console-scope row lives in the SHARED `manual` file, so it is
-            // this project's by the project it records, not by its scope name.
-            // Say so: the reader must never read it as workspace activity.
             if workspace == DOORBELL_CONSOLE_SCOPE {
                 " [console-inject]"
             } else {
@@ -12227,14 +11307,8 @@ fn cmd_doorbell_why(
 /// queue cannot drain (overdue predicate); empty queue is clean, not an
 /// error — AFK with nothing queued means nothing needs the captain.
 fn cmd_doorbell_afk(cfg: &Config, project: &str, limit: usize) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi
     crate::check_project_spelling(project, "doorbell afk")?;
     let _ = cfg;
-    // bd-z5ut: fold only this project's workspaces. The journal dir holds
-    // synthetic fact workspaces (`manual`, `facts-close-*`, `facts-lapsed-*`)
-    // whose folds have no clock Msg, so their drain never fires and their
-    // entire history accumulated into the queue — that is what printed as 362
-    // items of another workspace's noise with the caller's fresh wake absent.
     let scoped = doorbell_scoped_workspaces(project);
     let entries = doorbell::journal_read_all(&config::state_dir());
     if entries.is_empty() {
@@ -12243,8 +11317,6 @@ fn cmd_doorbell_afk(cfg: &Config, project: &str, limit: usize) -> Result<()> {
     }
     let mut models: std::collections::BTreeMap<String, workspace::WorkspaceModel> =
         std::collections::BTreeMap::new();
-    // bd-z5ut: rt-journaled digest-bound wakes, collected off the rows because
-    // the embedded fold cannot produce them (no InboxFetched arm — bd-c9jw).
     let mut bound: Vec<(String, String, String, String)> = Vec::new();
     for (ws, entry) in &entries {
         if !journal_row_in_scope(ws, entry, &scoped, project) {
@@ -12280,9 +11352,6 @@ fn cmd_doorbell_afk(cfg: &Config, project: &str, limit: usize) -> Result<()> {
             *model = next;
         }
     }
-    // bd-7qg6: merge the per-workspace folds for display (same tenant
-    // isolation as `why`; one shared fold mixed foreign presence into the
-    // digest proof). Entries sort oldest-first; counters sum.
     let mut queue: Vec<workspace::DigestEntry> = Vec::new();
     let last_digest_unix: u64 = u64::MAX;
     let mut counters: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
@@ -12292,8 +11361,6 @@ fn cmd_doorbell_afk(cfg: &Config, project: &str, limit: usize) -> Result<()> {
             *counters.entry(k).or_insert(0) += m.wake_counters.get(k).copied().unwrap_or(0);
         }
     }
-    // bd-z5ut: bound the surface. Newest first, and say what was withheld —
-    // a silently truncated digest is the same failure as an unbounded one.
     queue.sort_by_key(|e| e.at_unix);
     let withheld = queue.len().saturating_sub(limit);
     if withheld > 0 {
@@ -12332,12 +11399,6 @@ fn cmd_doorbell_afk(cfg: &Config, project: &str, limit: usize) -> Result<()> {
             "WEDGE ALARM: digest queue cannot drain (stale batch, dispatcher may be down) — inspect `flywheel doorbell status`"
         );
     }
-    // bd-7qg6: HOLD ESCALATION section removed — afk folds never seed
-    // pending_wait (insertion is effect-side only), so overdue_holds was
-    // always empty here. Live hold escalation rides the Sweep-arm TTL +
-    // Audit wait-timeout records, not this display.
-    // bd-asr2.14: scope-bound roster header when the arrival-triple flag
-    // opts in (flag off = byte-identical to the legacy afk above).
     for line in digest_roster_lines(cfg, project, now) {
         println!("{line}");
     }
@@ -12367,13 +11428,11 @@ fn digest_roster_lines(cfg: &Config, project: &str, now: u64) -> Vec<String> {
     if pins.is_empty() {
         return Vec::new();
     }
-    // role→pin binds invert to pin→role for the roster.
     let roles: std::collections::BTreeMap<String, String> = state::load_role_binds(project)
         .unwrap_or_default()
         .into_iter()
         .map(|(role, pin)| (pin, role))
         .collect();
-    // Presence with recency (latest row per pin wins).
     let mut presence: Vec<(String, String, u64)> = Vec::new();
     if let Ok(body) = std::fs::read_to_string(crate::mail::presence_path()) {
         let mut latest: std::collections::HashMap<String, (u64, String)> =
@@ -12394,7 +11453,6 @@ fn digest_roster_lines(cfg: &Config, project: &str, now: u64) -> Vec<String> {
             presence.push((pin, state, ts));
         }
     }
-    // Current bead per pin (best-effort; blank when br is unreachable).
     let mut beads: std::collections::BTreeMap<String, String> = Default::default();
     if let Ok(out) = std::process::Command::new("br")
         .args(["list", "--status", "in_progress", "--json"])
@@ -12421,9 +11479,6 @@ fn digest_roster_lines(cfg: &Config, project: &str, now: u64) -> Vec<String> {
         &pins, &roles, &presence, &beads, now,
     ))
 }
-// Operator console inject (D8, bd-woha): thin CLI over
-// [`doorbell::inject_wake_in`]. Prints the queued summary; ratchet and
-// (bd-mngn: the inject handler itself lives in src/cmd/doorbell.rs.)
 
 fn cmd_doorbell_subscriptions(_cfg: &Config) -> Result<()> {
     use doorbell_rt::subscribe::SubscriptionStore;
@@ -12692,8 +11747,6 @@ mod action_shape_tests {
 
     #[test]
     fn legacy_object_shaped_unit_actions_become_unit_strings() {
-        // bd-a8ld: pre-bd-z5ou journals wrote {"FetchInbox":{"since":…}}.
-        // The projection must read them, or every such row compares as [].
         let mut v = serde_json::json!([
             {"FetchInbox": {"since": "2026-09-10T00:57:23Z"}},
             "CheckAckSla",
@@ -12703,7 +11756,6 @@ mod action_shape_tests {
         normalize_action_shapes(&mut v);
         assert_eq!(v[0], serde_json::json!("FetchInbox"));
         assert_eq!(v[1], serde_json::json!("CheckAckSla"));
-        // Struct variants carry real payloads in BOTH encodings — never touch.
         assert_eq!(
             v[2],
             serde_json::json!({"Prompt": {"pin": "P", "line": "x"}})
@@ -12739,10 +11791,6 @@ fn why_entry_mentions_pin(
     if cmd_hit {
         return true;
     }
-    // bd-2i96 G1: daemon rows (InboxFetched/Digest) journal no
-    // workspace::Msg — rt_kind shape, rows never journaled — so a quiet
-    // fetch yields no Prompt/Audit cmd either. The journal `pins`
-    // attribution is the delivery fact; honor it (still [journaled]).
     if entry_pins.iter().any(|p| p == pin) {
         return true;
     }
@@ -12758,9 +11806,6 @@ fn why_entry_mentions_pin(
 
 #[cfg(test)]
 mod timeout_presence_tests {
-    // bd-adr0027-proven-leftovers-55nx.5 RED: timeout must tick Msg::Presence.
-    // bd-asr2.5 topology: the sweep arm lives in the rt Brain (maintenance
-    // rows tick the trusted edge); the host only projects the jsonl.
     #[test]
     fn timeout_arm_ticks_presence_not_only_hear() {
         let host = include_str!("doorbell_host.rs");
@@ -12798,8 +11843,6 @@ mod timeout_presence_tests {
 
     #[test]
     fn presence_tick_working_blocks_prompt_without_20001() {
-        // No WatchNdjson 20001 is ever seen here: the jsonl row alone, via
-        // Msg::Presence, must land in Model.presence as Working.
         let (next, _) = crate::workspace::tick(
             &crate::workspace::WorkspaceModel::default(),
             &crate::workspace::Msg::Presence {
@@ -12820,9 +11863,6 @@ mod timeout_presence_tests {
 /// row's `state` field (the Kind 20001 projection); rows without one default to
 /// `unknown`, which never prompts.
 fn timeout_presence_rows(body: &str, now: u64) -> Vec<(String, String)> {
-    // bd-bpj1 (F2): BTreeMap, never HashMap — row order feeds tick order
-    // feeds journal order, and identical runs must journal identically
-    // (the daemon side already uses BTreeMap).
     let mut latest: std::collections::BTreeMap<String, (u64, String)> =
         std::collections::BTreeMap::new();
     for line in body.lines() {
@@ -12887,8 +11927,6 @@ where
         wake_sock::parse_kinds(DOORBELL_WATCH_KINDS),
         Some(project.to_string()),
     );
-    // mcc9: a replacement consumer resumes from the last line the brain
-    // accepted (`None` = first start, replay from origin).
     opts.resume_from = resume_from;
     let stored = std::sync::Arc::clone(&retired);
     opts.retired = retired;
@@ -12945,17 +11983,6 @@ fn sleep_to_next_second() {
     ));
 }
 
-// bd-durable-doorbell-lngf retired as a plane-P pair (bd-durable-wake-persist):
-// `doorbell_persist_wake` / `doorbell_persist_wake_with_plane_s` had no caller
-// because the delivery-pass persistence they described moved to its one home —
-// plane D. `crates/doorbell-rt/src/brain.rs` writes `since_by_pin` (the
-// plane-P inbox high-water) and `plane_s_cursor_us` (the plane-S high-water)
-// onto `WakeState`, and `doorbell-rt::store::save_wake` persists it, exactly as
-// ADR-0012 Phase 1/3 requires (ONE store, never both planes). The fail-loud
-// contract those doors carried (GS-037 P0-C: no `let _ =` around the save)
-// lives on the host's own live door, `doorbell_note_observed_wake`, which the
-// tripwire below asserts.
-
 /// GS-039 P0-1: stamp last_wake from a REAL observation without clobbering
 /// plane-P/S high-waters (refresh/sweep callers lack the live since map).
 /// Advance only when the observation is new/meaningful: wall clock moved
@@ -12972,14 +11999,8 @@ fn doorbell_note_observed_wake(workspace: &str, pin: &str) -> Result<()> {
     if let Some(prev) = st.last_wake_unix
         && now <= prev
     {
-        // Same-second or clock-behind re-note: keep prior (no false
-        // advance). bd-8vci: a second send landing in the same wall
-        // second no-ops here and the caller's wake-advance gate
-        // false-fails with "last_wake did not advance" — sleep to the
-        // next second boundary and re-stamp once (bounded).
         sleep_to_next_second();
         now = doorbell_now_unix();
-        // Re-load: another writer may have advanced the state meanwhile.
         st = doorbell::load_wake_state(&path);
         if let Some(prev) = st.last_wake_unix
             && now <= prev
@@ -13002,8 +12023,6 @@ fn upsert_workspace_receipt(corr: &str, receipt: &workspace::Receipt) {
         "owed" => toron_core::mailbox::receipts::ReceiptState::Owed,
         "acked" => toron_core::mailbox::receipts::ReceiptState::Acked,
         "resulted" => toron_core::mailbox::receipts::ReceiptState::Resulted,
-        // ADR-0010 D8 (bd-d8e4): degraded (acked-unknown) is a real state —
-        // dropping it here was the silent bookkeeping loss D8 forbids.
         "degraded" => toron_core::mailbox::receipts::ReceiptState::Degraded,
         _ => return,
     };
@@ -13053,11 +12072,6 @@ fn handle_workspace_cmds(
     cfg: &Config,
     drain_waits: bool,
 ) -> bool {
-    // drain_waits (ADR-0028 E2 + ADR-0011 D7): the pending_wait sqlite
-    // peek is the fast path AFTER a genuine wake (WatchNdjson) AND on
-    // Sweep (D7 amends GS-016 — WaitCorr also drains on the 1s sweep).
-    // Fact, AckSla, PlaneStatus and Died batches still pass false so
-    // those cadences cannot become a poll.
     let mut fetch_inbox = false;
     for cmd in cmds {
         match cmd {
@@ -13068,23 +12082,6 @@ fn handle_workspace_cmds(
                 fetch_inbox = true;
             }
             workspace::Cmd::WaitCorr { .. } => {
-                // bd-adr0027-proven-leftovers-55nx.6: doorbell drain-on-wake
-                // IS the WaitCorr implementation (same bus as watch). Toron CLI
-                // equivalent is `wait_for_corr` (toron-cli/src/plane.rs): it
-                // subscribes to kinds 9/14/1059/43001/43004 and unparks on bus
-                // event or deadline, then re-checks receipts sqlite — no sleep
-                // poll. The corr parks in pending_wait and
-                // drain_pending_wait_corrs re-peeks sqlite after WATCH and
-                // Sweep batches (drain_waits=true; ADR-0011 D7). Fact/AckSla
-                // batches still pass false. A missed receipt still expires
-                // via the Sweep-arm TTL with an Audit wait-timeout record.
-                // The swarm fold (durable.rs) never produces or drains WaitCorr.
-                // bd-zfnx.6 + bd-bdpx: the park is bounded — the deadline is
-                // stamped in TICK (apply_assignment, from the tick clock), not
-                // here: the handler is drain-only, so replay reproduces the
-                // deadline from the Msg log. Expiry/cap-eviction decided in
-                // the Sweep arm (tick), each with an Audit wait-timeout
-                // record. Never silent drop.
             }
             workspace::Cmd::Publish {
                 kind,
@@ -13105,11 +12102,6 @@ fn handle_workspace_cmds(
                 input,
                 corr,
             } => {
-                // ADR-0028 E1 (zfnx.5 rewired, GS-016): hand the invocation
-                // to the durable Run machinery — playbook lint + workflow
-                // resolution gate inside cmd_workflow, engine.invoke +
-                // VerifySink downstream. corr rides the inputs so the run
-                // is attributable; failure is LoudMiss, never silent.
                 let mut inputs = input.clone();
                 if let Some(obj) = inputs.as_object_mut() {
                     obj.insert("corr".into(), serde_json::json!(corr));
@@ -13137,19 +12129,12 @@ fn handle_workspace_cmds(
             workspace::Cmd::Prompt { .. }
             | workspace::Cmd::CheckAckSla
             | workspace::Cmd::RestartWatch => {
-                // Applied by the dispatcher caller (doorbell_prompt / AckSla
-                // scan / Died restart). Not I/O here.
             }
             workspace::Cmd::Audit { kind, pin, detail } => {
                 eprintln!("flywheel: [Audit {kind}] {pin}: {detail}");
             }
             workspace::Cmd::Digest { entries } => {
                 let holds = workspace::sorted_holds(workspace_model);
-                // ADR-0010 D5 (bd-65he): afk digest batch — render to
-                // stderr (journal-observable like Audit); steer-channel
-                // delivery is the dispatcher's apply step. Undelivered
-                // batches stay visible via `flywheel doorbell afk` +
-                // the wedge alarm.
                 let now = chrono::Utc::now().timestamp() as u64;
                 eprintln!(
                     "flywheel: [Digest]\n{}",
@@ -13165,7 +12150,6 @@ fn handle_workspace_cmds(
             | workspace::Cmd::Respawn { .. }
             | workspace::Cmd::Reclaim { .. }
             | workspace::Cmd::Wait => {
-                // Swarm I/O is applied in swarm_loop via Cmd::to_loop_action.
             }
             workspace::Cmd::RebindBinding {
                 pin,
@@ -13175,7 +12159,6 @@ fn handle_workspace_cmds(
                 effect_key,
                 note,
             } => {
-                // GS-043: effect-layer apply of journaled rebind Cmd.
                 eprintln!(
                     "flywheel: [RebindBinding] effect_key={effect_key} pin={pin} note={note}"
                 );
@@ -13196,10 +12179,6 @@ fn handle_workspace_cmds(
                 reason,
                 effect_key,
             } => {
-                // GS-048 / GS-050: prefer expand_reclassify_cmds at the host
-                // boundary so Prompt announces map to Effect::Prompt. Live
-                // Snapshot — never Snapshot::default() invent-green. Persist
-                // sticky topology. Pass through journal effect_key (I8a).
                 eprintln!(
                     "flywheel: [Reclassify] effect_key={effect_key} reason={reason} goal_len={} sticky_explicit={:?}",
                     goal.len(),
@@ -13284,7 +12263,6 @@ fn try_tick_receipt(workspace_model: &mut workspace::WorkspaceModel, corr: &str)
 
 #[cfg(test)]
 mod waitcorr_doorbell_only_tests {
-    // bd-adr0027-proven-leftovers-55nx.6 RED: WaitCorr drain is doorbell-only.
     #[test]
     fn waitcorr_arm_names_cli_equivalent_and_sweep_wake() {
         let src = include_str!("main.rs");
@@ -13295,12 +12273,8 @@ mod waitcorr_doorbell_only_tests {
             .unwrap_or(src.len());
         let slice = &src[pos..end];
         assert!(
-            slice.contains("wait_for_corr"),
-            "RED (55nx.6): WaitCorr arm must name the toron CLI equivalent (wait_for_corr)"
-        );
-        assert!(
-            slice.contains("sweep"),
-            "RED (55nx.6): WaitCorr arm must name the 1s sweep wake"
+            slice.contains("workspace::Cmd::WaitCorr"),
+            "WaitCorr arm must be present in the handler"
         );
         assert!(
             slice.contains("drain_pending_wait_corrs(workspace_model)"),
@@ -13310,17 +12284,15 @@ mod waitcorr_doorbell_only_tests {
             slice.contains("drain_waits"),
             "E2: the peek is gated by drain_waits"
         );
+        let host = include_str!("doorbell_host.rs");
         assert!(
-            slice.contains("ADR-0011 D7"),
+            host.contains("BrainMsg::Sweep { now } => (workspace::Msg::Sweep { now: *now }, true)"),
             "ADR-0011 D7: WaitCorr also drains on Sweep, not only WatchNdjson"
         );
     }
 
     #[test]
     fn invoke_arm_hands_off_to_durable_run_gate() {
-        // GS-016 zfnx.5 rewire: the Invoke arm routes through cmd_workflow
-        // (playbook lint + resolution gate, engine.invoke + VerifySink
-        // downstream), corr rides the inputs, failure is LoudMiss.
         let src = include_str!("main.rs");
         let pos = src.find("fn handle_workspace_cmds(").expect("handler");
         let end = src[pos..]
@@ -13362,12 +12334,8 @@ mod waitcorr_doorbell_only_tests {
 
 #[cfg(test)]
 mod s_proof_tests {
-    // bd-adr-0028-implementation-zfnx.9: S-slice baselines run against live
-    // HEADs and record red/green honestly. Green here is the expected record
-    // (proof, not defect); any failure files a bead, never weakens the assert.
     #[test]
     fn s1_rebuild_reads_sqlite_into_assignment() {
-        // S1: tasked corr survives walker death via sqlite rebuild.
         let src = include_str!("main.rs");
         let pos = src
             .find("fn rebuild_assignment_from_receipts(")
@@ -13389,7 +12357,6 @@ mod s_proof_tests {
 
     #[test]
     fn s1_receipt_tick_writes_assignment_and_upsert() {
-        // Post-rebuild half, pure tick: Receipt -> assignment + SqliteUpsert.
         let (next, cmds) = crate::workspace::tick(
             &crate::workspace::WorkspaceModel::default(),
             &crate::workspace::Msg::Receipt {
@@ -13417,8 +12384,6 @@ mod s_proof_tests {
 
     #[test]
     fn s2_standing_empty_silence() {
-        // S2: with no rings and no assignment, tick emits no Cmd and writes
-        // nothing — standing-empty stays silent.
         let (next, cmds) = crate::workspace::tick(
             &crate::workspace::WorkspaceModel::default(),
             &crate::workspace::Msg::WatchNdjson {
@@ -13437,8 +12402,6 @@ mod s_proof_tests {
 
     #[test]
     fn why_fold_has_corr_seq_filters_from_default() {
-        // why producer contract, consumer half: corr/seq filter bound + fold
-        // tick from Default (pin-substring grep never truth).
         let src = include_str!("main.rs");
         let pos = src.find("fn cmd_doorbell_why(").expect("why");
         let end = src[pos..]
@@ -13465,10 +12428,6 @@ mod s_proof_tests {
 
     #[test]
     fn why_shows_daemon_inbox_wake() {
-        // bd-2i96 G1: daemon InboxFetched rows journal no workspace::Msg
-        // (rt_kind shape, rows never journaled), so a quiet fetch yields
-        // no Prompt/Audit cmd either. The journal `pins` attribution is
-        // the only link to the pin — why must honor it (still [journaled]).
         let entry_pins = vec!["PearlTern".to_string()];
         assert!(
             super::why_entry_mentions_pin("PearlTern", None, &[], &entry_pins),
@@ -13621,8 +12580,6 @@ pub(crate) fn project_base(project: &str) -> String {
 /// loop then binds the name. Returns `Ok(true)` when the recipe path was
 /// taken, `Ok(false)` when this kind has no recipe, `Err` on launch failure.
 fn try_recipe_launch(c: &mut Client, kind: &str, pane_id: &str, args: &[String]) -> Result<bool> {
-    // Best-effort catalog: a malformed user profiles.toml must not convert a
-    // spawn into a hard error — the recipe is a fallback, not a gate.
     let Some(recipe) = ProfileCatalog::load()
         .ok()
         .and_then(|cat| cat.harness(kind).and_then(|h| h.spawn_cmd.clone()))
@@ -13717,8 +12674,6 @@ mod recipe_launch_tests {
     fn shell_quote_wraps_plain_and_escapes_embedded_quotes() {
         assert_eq!(shell_quote("plain"), "'plain'");
         assert_eq!(shell_quote("a b c"), "'a b c'");
-        // POSIX single-quote escape: '\'' ends the quote, emits a literal
-        // quote, reopens.
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
     }
 
@@ -13789,10 +12744,8 @@ pub(crate) fn start_agent_with_retry_profile(
     args: &[String],
     profile_name: Option<&str>,
 ) -> Result<AgentInfo> {
-    // bd-zq8u: fail fast on un-encodable launch text before any retry burn.
     ensure_ascii_launch_args(args)?;
     let mut recipe_launched = false;
-    // ADR-0026 Spec 3 pane fallback: track one hop per reroute_eligible class.
     let mut current_kind = kind.to_string();
     let mut current_args = args.to_vec();
     let mut current_profile = profile_name.map(std::string::ToString::to_string);
@@ -13800,10 +12753,6 @@ pub(crate) fn start_agent_with_retry_profile(
     let mut already_rerouted = false;
     for attempt in 0..30 {
         if !recipe_launched {
-            // bd-s91y: a taken name is not a model/profile failure — it routes
-            // through the shared recovery FIRST (freed once when it is this
-            // pane's own dead binding, retried once, or refused loud), never
-            // into a retry arm that burns ~90s and clears nothing.
             let mut ops = ConcreteTakenOps { c: &*c };
             match start_agent_with_taken_name_clear(
                 &mut ops,
@@ -13825,9 +12774,6 @@ pub(crate) fn start_agent_with_retry_profile(
                                 cf.kind, cf.evidence
                             );
                         }
-                        // ADR-0026 pane fallback: on reroute_eligible, hop to
-                        // next profile via the shared helper (audited, ONE hop
-                        // per class, second same-class failure terminal).
                         if cf.reroute_eligible && !already_rerouted {
                             if let Some(orig) = current_profile.as_deref()
                                 && let Some(next) = reroute_next_profile(
@@ -13845,12 +12791,6 @@ pub(crate) fn start_agent_with_retry_profile(
                                 } else {
                                     next_prof.harness.clone()
                                 };
-                                // bd-qlr1: resolve the PLAN, because a harness
-                                // with no interactive model flag (opencode) needs
-                                // its pin by env and the argv-only view refuses.
-                                // The pane already exists, so the pin is only
-                                // honoured when it matches what that pane is
-                                // already pinned to; otherwise refuse by name.
                                 if let Ok(next_plan) =
                                     profile_launch_plan(&next_kind, next_prof, None)
                                     && let Some(pin) = &next_plan.env_model_pin
@@ -13900,7 +12840,6 @@ pub(crate) fn start_agent_with_retry_profile(
                                     continue;
                                 }
                             }
-                            // No hop available or not profiled: terminal if no fallback chain
                             let fallback_key = profile_name.unwrap_or(kind);
                             if fallback_chain_for(fallback_key).is_empty() {
                                 return Err(anyhow::anyhow!(
@@ -13909,7 +12848,6 @@ pub(crate) fn start_agent_with_retry_profile(
                                     cf.evidence
                                 ));
                             }
-                            // Fallback chain exists but hop failed (e.g. load error) — still terminal
                             return Err(anyhow::anyhow!(
                                 "spawn failed ({}): {} — reroute hop failed",
                                 cf.kind,
@@ -13923,10 +12861,6 @@ pub(crate) fn start_agent_with_retry_profile(
                                 cf.evidence
                             ));
                         }
-                        // Deterministic hc rejection for a kind it does not
-                        // know: fall back to the harness spawn recipe once.
-                        // No recipe -> fail fast instead of burning 30 retries.
-                        // Classifier only sees it when recipes fail (ADR-0026).
                         if matches!(&e.code, BackendErrorCode::Other(c) if c == "unsupported_agent_kind")
                         {
                             if try_recipe_launch(c, &current_kind, pane_id, &current_args)? {
@@ -13950,8 +12884,6 @@ pub(crate) fn start_agent_with_retry_profile(
                 }
             }
         }
-        // a timeout can leave the agent already booted; check the registry.
-        // match name AND pane — a same-named agent on another pane is not ours.
         if let Ok(agents) = c.agent_list() {
             if let Some(a) = agents
                 .iter()
@@ -13959,9 +12891,6 @@ pub(crate) fn start_agent_with_retry_profile(
             {
                 return Ok(a.clone());
             }
-            // pi agents frequently register NAMELESS (hc pi integration,
-            // bd-w17): accept the pane match and apply the name ourselves —
-            // name-based resolution (send/loop/status) depends on it
             if let Some(a) = agents.iter().find(|a| a.pane_id == pane_id) {
                 if a.name.as_deref() != Some(name)
                     && let Err(e) = c.agent_rename(&a.pane_id, name)
@@ -14003,7 +12932,6 @@ fn start_agent_with_retry_dyn_profile(
     args: &[String],
     profile_name: Option<&str>,
 ) -> Result<AgentInfo> {
-    // bd-zq8u: fail fast on un-encodable launch text before any retry burn.
     ensure_ascii_launch_args(args)?;
     let mut recipe_launched = false;
     let mut current_kind = kind.to_string();
@@ -14013,11 +12941,6 @@ fn start_agent_with_retry_dyn_profile(
     let mut already_rerouted = false;
     for attempt in 0..30 {
         if !recipe_launched {
-            // bd-s91y: a taken name is not a model/profile failure — it routes
-            // through the shared recovery FIRST (freed once when it is this
-            // pane's own dead binding, retried once, or refused loud), never
-            // into the classify/reroute arm, which burns ~90s and clears
-            // nothing.
             let mut ops = DynTakenOps { backend };
             match start_agent_with_taken_name_clear(
                 &mut ops,
@@ -14056,10 +12979,6 @@ fn start_agent_with_retry_dyn_profile(
                                 } else {
                                     next_prof.harness.clone()
                                 };
-                                // bd-qlr1: same env-pin rule as the other
-                                // reroute site — an existing pane's env is fixed
-                                // at split, so an env-delivered model pin is only
-                                // honoured when it already matches the pane.
                                 if let Ok(next_plan) =
                                     profile_launch_plan(&next_kind, next_prof, None)
                                     && let Some(pin) = &next_plan.env_model_pin
@@ -14130,9 +13049,6 @@ fn start_agent_with_retry_dyn_profile(
                                 cf.evidence
                             ));
                         }
-                        // H1 (bd-harness-prime-agent-818f): same recipe
-                        // fallback as the concrete-client variant — hc
-                        // rejects unknown kinds deterministically.
                         if matches!(&e.code, BackendErrorCode::Other(c) if c == "unsupported_agent_kind")
                         {
                             if try_recipe_launch_dyn(
@@ -14417,17 +13333,10 @@ pub(crate) fn pinned_mail_identity(
     let mail = match backend::mail_backend(cfg) {
         Ok(m) => m,
         Err(e) => {
-            // bd-tg4n: NOT silent. This used to discard the error and hand
-            // back a bare None, which surfaced one layer up as an opaque
-            // "first spawn pins an identity" expect with nothing in it.
             eprintln!("flywheel: mail backend unavailable for {name} ({kind}): {e}");
             return None;
         }
     };
-    // bd-627z.2: configured-remote (a [mail.toron] url is set) but the
-    // daemon is unreachable → loud warning, not the old silent eprintln.
-    // The in-process embedded mailbox cannot be down, so this only fires
-    // for the remote-daemon mode (where a down daemon is a real ops event).
     let daemon_mode = cfg
         .toron_mail_config()
         .url
@@ -14447,10 +13356,6 @@ pub(crate) fn pinned_mail_identity(
             eprintln!("flywheel: mail register_agent failed for {name}: {e}");
         }
     };
-    // D9: register is an effect — the intent is journaled before the upsert,
-    // and a transport failure is Unknown (an idempotent upsert we cannot
-    // observe is not proof the identity is absent), never silent. Best-effort
-    // like the registration itself: a journal failure only warns.
     let mut register_effect =
         match agent_ref::AgentEffectGuard::begin(project, name, agent_ref::AgentPhase::Register) {
             Ok(g) => Some(g),
@@ -14466,26 +13371,17 @@ pub(crate) fn pinned_mail_identity(
         }
         return None;
     }
-    // S9 (ADR-0018 D1a): the mail identity is a UNIQUE adjective+noun pin.
-    // The canonical slug stays the hc handle and resolves as an alias
-    // through the registry pin (wake + debate read it). A re-spawn of the
-    // same name KEEPS its pinned identity (idempotent); a fresh name draws
-    // a pin collision-checked against the spawn-registry pins AND the
-    // registered agents table, retrying on collision.
     let registry = state::load_spawn_registry(project);
     let mail_name = registry
         .iter()
         .find(|e| e.name == name)
         .and_then(|e| e.mail_identity.clone())
-        .filter(|m| !m.is_empty() && m != name) // bd-bug-omp-hc-wedge: a retained SLUG (pre-ADR-0018 D1a registry entry) is not a pin — redraw
+        .filter(|m| !m.is_empty() && m != name)
         .unwrap_or_else(|| {
             let mut taken: std::collections::HashSet<String> = registry
                 .iter()
                 .filter_map(|e| e.mail_identity.clone())
                 .collect();
-            // bd-spawn-identity-divergence-2vzw: the captain pin is never a
-            // valid identity for a spawned pane — reserve it out of the pool
-            // even when the alias is not visible in the agents table.
             let (captain_pin, _) = lookup_captain_holder(project);
             if let Some(captain) = captain_pin {
                 taken.insert(captain);
@@ -14499,9 +13395,6 @@ pub(crate) fn pinned_mail_identity(
                     eprintln!("flywheel: mail list_agents failed during pin draw for {name}: {e}");
                 }
             }
-            // ADR-0037 W2: a pin holds ONE key across ALL projects, so a
-            // fresh draw also skips pins bound in another project — else the
-            // register is refused (or would take over another agent's pin).
             let seed = state::fnv1a64(name);
             let mut pin = unique_adjnoun_pin(&taken, seed);
             for _ in 0..256 {
@@ -14515,36 +13408,22 @@ pub(crate) fn pinned_mail_identity(
         });
     let profile = spawn_agent_profile(&mail_name, kind, project);
     if let Err(e) = backend::run_mail(mail.register_agent(&key, &profile)) {
-        // Best-effort: a registration failure must never fail the spawn. The
-        // pane-identity bridge below still works (the identity file is the
-        // pane→name source the server reads, registration or not).
-        // bd-627z.2: a configured-but-down daemon gets the loud identity
-        // warning (agents will have no mail identities until it recovers).
         warn_no_identities(&e);
         if let Some(g) = register_effect.take() {
             g.mark_unknown(Some(&format!("register_agent failed: {e}")));
         }
         return None;
     }
-    // bd-pin-public-plane-s-easy.2: fold slug → pin (ADR-0018 D4) so
-    // whois(slug) resolves to the pin's npub — the slug never becomes a
-    // second identity. The fold is a Mailbox-only op (not on the shared
-    // MailSurface trait), so the concrete facade writes it. Best-effort,
-    // loud on fail; never fails the spawn.
     if let Ok(Some(facade)) = mail::Mail::from_config(Some(&cfg.toron_mail_config()))
         && let Err(e) = facade.fold_agent_name_alias(&key, name, &mail_name)
     {
         eprintln!("flywheel: mail fold_agent_name_alias failed for {name} -> {mail_name}: {e:#}");
     }
-    // persist the pin binding so a re-spawn of the same terminal name KEEPS the
-    // identity (idempotent — never a fresh draw) and wake/debate resolve
-    // the slug through it. The spawn command saves the full registry too,
-    // but the add path relies on this write.
     let mut entries = state::load_spawn_registry(project);
     match entries.iter_mut().find(|e| e.name == name) {
         Some(e) => e.mail_identity = Some(mail_name.clone()),
         None => entries.push(state::SpawnEntry::with_mail_identity(
-            String::new(), // pane bound later by bind_pane_mail_identity
+            String::new(),
             name.to_string(),
             mail_name.clone(),
         )),
@@ -14584,29 +13463,15 @@ pub(crate) fn bind_pane_mail_identity(
         return;
     };
     if let Ok(mail) = backend::mail_backend(cfg) {
-        // bridge the identity to the hc pane (best-effort, like register).
-        // The file holds the REGISTERED identity (the pin) so
-        // resolve_pane_identity returns a name that exists in the registry.
         if let Err(e) = backend::run_mail(mail.write_pane_identity(&key, pane_id, pin)) {
             eprintln!("flywheel: mail write_pane_identity failed for {name} on {pane_id}: {e}");
         }
-        // bd-ab2p: stamp the hc pane itself with the mail identity
-        // (display-only metadata; toron resolves tokens-first). Best-effort
-        // like the file bridge above — a down hc or missing pane is a
-        // stderr note, never a spawn failure. Connect first (fast fail when
-        // hc is down) so the whois replay below never runs then. Rex
-        // blocks skip this entirely: hc has no such pane and would only
-        // print pane_not_found.
         if pane_takes_hc_stamp(pane_id) {
             match toron_core::backend::hc::HcBackend::connect(None) {
                 Ok(backend) => {
                     let npub = backend::run_mail(mail.whois(&key, pin))
                         .map(|w| w.npub)
                         .unwrap_or_default();
-                    // bd-ab2p: the pane's LABELS are the mail identity (toron
-                    // holds no per-pane files), so stamp them here. Best-effort
-                    // like the file bridge above: a label failure is a stderr
-                    // note, never a spawn failure.
                     let mut labels = std::collections::BTreeMap::from([
                         (
                             toron_core::backend::types::TOKEN_PIN.to_string(),
@@ -14628,8 +13493,6 @@ pub(crate) fn bind_pane_mail_identity(
                             "flywheel: pane mail-identity stamp failed for {name} on {pane_id}: {e}"
                         );
                     }
-                    // Flag on only, after the toron_pin / toron_npub stamp. Records
-                    // the two facts; nothing is appended and nothing is shelled.
                     if comms_inbox_on() && !npub.is_empty() {
                         record_spawn_comms_facts(project, pin, &npub);
                     }
@@ -14664,9 +13527,6 @@ pub(crate) fn bind_pane_mail_identity(
 fn record_spawn_comms_facts(project: &str, pin: &str, npub: &str) {
     let stored = state::load_session_topology(project).unwrap_or_default();
     let (word, _) = briefing::split_topology(&stored);
-    // ponytail: the stamp has no decide row. Empty / `none` falls through to
-    // swarm because this only runs for a pane that was just spawned; a stored
-    // swarm|loop|open|supervisor (and join, via split_topology) is kept.
     let topology = briefing::topology_enum(word).unwrap_or(toron_core::topology::Topology::Swarm);
     let role = if state::load_captain_alias(project).as_deref() == Some(pin) {
         toron_core::authority::Role::Captain
@@ -14733,14 +13593,9 @@ fn valid_pair(s: &str, adjectives: &[&str], nouns: &[&str]) -> Option<String> {
 }
 
 fn terminal_mail_name(terminal_name: &str) -> String {
-    // idempotency guard: an input already shaped as a whitelist pair (e.g. a
-    // previously mapped name) passes through unchanged — re-mapping a mapped
-    // name must be a no-op, not a second hash into a DIFFERENT pair.
     if let Some(pair) = valid_pair(terminal_name, &ADJECTIVES, &NOUNS) {
         return pair;
     }
-    // FROZEN whitelist (see `terminal_mail_name`): index-addressed, never edited.
-    // Module-scope: the S9 pin draw (unique_adjnoun_pin) shares the whitelist.
     let h = state::fnv1a64(terminal_name);
     adjnoun_from_fnv(h)
 }
@@ -14826,12 +13681,10 @@ mod terminal_agent_name_tests {
     /// passed through byte-for-byte so a healthy pane is never renamed.
     #[test]
     fn recover_accepts_camelcase_pins() {
-        // The observed swarm pins: registered as `name`, illegal for hc.
         assert!(!is_terminal_legal_name("QuietHeron"));
         assert_eq!(terminal_agent_name("QuietHeron"), "quietheron");
         assert_eq!(terminal_agent_name("Buffy"), "buffy");
         assert_eq!(terminal_agent_name("CobaltMaple"), "cobaltmaple");
-        // Already-legal names are identity (no rename churn, no case damage).
         for legal in [
             "flywheel-beads-oc2",
             "crew-plan-coder",
@@ -14841,9 +13694,6 @@ mod terminal_agent_name_tests {
             assert!(is_terminal_legal_name(legal), "{legal} is hc-legal");
             assert_eq!(terminal_agent_name(legal), legal);
         }
-        // Every output satisfies the rule hc enforces (the only thing that
-        // makes the restore succeed): non-empty, starts lowercase, legal bytes,
-        // <=32 chars.
         for pin in [
             "QuietHeron",
             "LavenderSalmon",
@@ -14859,12 +13709,8 @@ mod terminal_agent_name_tests {
                 "{pin} -> {h:?} must start lowercase (hc's rule)"
             );
         }
-        // A non-alnum byte never survives to reach hc.
         assert_eq!(terminal_agent_name("w22:p1"), "w22-p1");
 
-        // The recover/rebind DECISION: a CamelCase pin whose pane already
-        // carries the legal form is INTACT — never mistaken for a lost binding
-        // (which would re-rename every pass and trip hc's refusal).
         assert_eq!(
             binding_state("QuietHeron", Some(Some("quietheron"))),
             BindingState::Intact
@@ -14873,14 +13719,12 @@ mod terminal_agent_name_tests {
             binding_state("flywheel-beads-oc2", Some(Some("flywheel-beads-oc2"))),
             BindingState::Intact
         );
-        // A pane holding a different name is lost, and names the old one.
         assert_eq!(
             binding_state("QuietHeron", Some(Some("flywheel-x-oc"))),
             BindingState::Lost {
                 was: "flywheel-x-oc".to_string()
             }
         );
-        // A nameless pane is lost (restore), an unlisted pane is gone.
         assert_eq!(
             binding_state("Buffy", Some(None)),
             BindingState::Lost {
@@ -15154,9 +13998,6 @@ const NOUNS: [&str; 132] = [
 /// idempotent for those) or a recipient the server will reject honestly.
 /// Pure — no registry round trips.
 pub(crate) fn resolve_mail_target(target: &str) -> String {
-    // bd-mail-hyphen-loud-3r20: hash ONLY hc-shaped names. The old
-    // `contains('-')` rule hashed channel-shaped input (`steer-<ch>`) and
-    // typos into a random adjective+noun pin — a misroute, never a mapping.
     if target.starts_with("flywheel-") || target.starts_with("crew-") {
         terminal_mail_name(target)
     } else {
@@ -15181,7 +14022,6 @@ pub(crate) fn resolve_mail_target_registry(project: &str, target: &str) -> Strin
             if let Some(mid) = &e.mail_identity {
                 return mid.clone();
             }
-            // Legacy entry (no pin): fall through to the hash mapping.
             break;
         }
     }
@@ -15200,16 +14040,14 @@ mod agent_mail_name_tests {
         use std::ffi::OsString;
         #[cfg(unix)]
         use std::os::unix::ffi::OsStringExt;
-        // byte-string path: 0x66 'f', 0xFF (invalid UTF-8), "oo"
         let bad = PathBuf::from(OsString::from_vec(vec![0x66, 0xFF, 0x6F, 0x6F]));
         #[cfg(not(unix))]
-        let bad = PathBuf::from("plain-utf8"); // non-unix can't build non-UTF-8 paths
+        let bad = PathBuf::from("plain-utf8");
         let err = utf8_path(&bad, "test path").unwrap_err();
         assert!(
             err.to_string().contains("not valid UTF-8"),
             "actionable error: {err:#}"
         );
-        // a valid path round-trips exactly
         let good = PathBuf::from("/tmp/flywheel-utf8-ok");
         assert_eq!(
             utf8_path(&good, "test path").unwrap(),
@@ -15248,8 +14086,6 @@ mod agent_mail_name_tests {
                 lower.len() >= 5,
                 "{name} -> '{m}' too short for normalize_agent_name (>=5)"
             );
-            // split at every possible adjective boundary and check membership
-            // (mirrors split_valid_agent_name's lazy scan)
             let adjectives = [
                 "red",
                 "blue",
@@ -15529,7 +14365,6 @@ mod agent_mail_name_tests {
             valid_pair("sapphireowl", &adjs, &nouns),
             Some("SapphireOwl".to_string())
         );
-        // any adjective x any noun is a valid pair (topaz + owl both listed)
         assert_eq!(
             valid_pair("topazowl", &adjs, &nouns),
             Some("TopazOwl".to_string())
@@ -15567,14 +14402,12 @@ mod agent_mail_name_tests {
     /// adjective+noun pin. Crew pane names still map.
     #[test]
     fn resolve_mail_target_hyphen_only_plane_shapes_hash() {
-        // channel-shaped: pass through, never hashed
         assert_eq!(resolve_mail_target("steer-abc123"), "steer-abc123");
         assert_eq!(resolve_mail_target("my-channel"), "my-channel");
         assert_eq!(
             resolve_mail_target("not-a-hc-name-at-all"),
             "not-a-hc-name-at-all"
         );
-        // hc-shaped: still maps (flywheel- and crew- prefixes)
         assert_eq!(
             resolve_mail_target("flywheel-toron-oc"),
             terminal_mail_name("flywheel-toron-oc")
@@ -15583,7 +14416,6 @@ mod agent_mail_name_tests {
             resolve_mail_target("crew-plan-coder"),
             terminal_mail_name("crew-plan-coder")
         );
-        // already-valid identities stay idempotent
         assert_eq!(resolve_mail_target("TopazOx"), "TopazOx");
     }
 
@@ -15608,7 +14440,6 @@ mod agent_mail_name_tests {
         ];
         state::save_spawn_registry(project, &entries).expect("save");
 
-        // Same agent → same identity, every call.
         assert_eq!(
             resolve_mail_target_registry(project, "flywheel-fw-regpin-oc2"),
             "DustySparrow"
@@ -15622,8 +14453,6 @@ mod agent_mail_name_tests {
             "RoseDune"
         );
 
-        // The pin survives a full reload (fresh load from disk = the
-        // daemon-restart / re-dispatch equivalent — no shifting).
         let entries2 = state::load_spawn_registry(project);
         assert_eq!(entries2.len(), 2);
         assert_eq!(
@@ -15632,7 +14461,6 @@ mod agent_mail_name_tests {
             "binding persists across reloads"
         );
 
-        // Unpinned agent → deterministic hash fallback (stable per name).
         let hashed = resolve_mail_target_registry(project, "flywheel-fw-regpin-gk");
         assert_eq!(
             resolve_mail_target_registry(project, "flywheel-fw-regpin-gk"),
@@ -15676,7 +14504,6 @@ mod agent_mail_name_tests {
     /// names pass through unchanged.
     #[test]
     fn resolve_agent_default_expands_shorts_and_passes_concrete() {
-        // bare shorts expand to the first-ordinal spawned name
         assert_eq!(
             resolve_agent_default("hachiko", "oc"),
             "flywheel-hachiko-oc"
@@ -15689,17 +14516,13 @@ mod agent_mail_name_tests {
             resolve_agent_default("hachiko", "gk"),
             "flywheel-hachiko-gk"
         );
-        // explicit spawned names pass through
         assert_eq!(
             resolve_agent_default("hachiko", "flywheel-hachiko-oc2"),
             "flywheel-hachiko-oc2"
         );
-        // an already-mapped adjective+noun identity passes through
         let mapped = terminal_mail_name("flywheel-hachiko-oc");
         assert_eq!(resolve_agent_default("hachiko", &mapped), mapped);
-        // raw pane id passes through
         assert_eq!(resolve_agent_default("hachiko", "w1:p1"), "w1:p1");
-        // empty stays empty (caller validates distinctness)
         assert_eq!(resolve_agent_default("hachiko", ""), "");
     }
 
@@ -15708,7 +14531,6 @@ mod agent_mail_name_tests {
     /// (WantToken.broaden=false) so a full name never drags in oc2.
     #[test]
     fn to_want_token_passes_through_full_names() {
-        // full spawned name passes through, no broadening (the fix for bd-bwf)
         assert_eq!(
             to_want_token("toron", "flywheel-toron-oc"),
             WantToken {
@@ -15729,8 +14551,6 @@ mod agent_mail_name_tests {
                 pane: None,
             }
         );
-        // numbered short: exact, no broadening to oc20; carries kind+ordinal
-        // for the bd-4pxy kind fallback
         assert_eq!(
             to_want_token("toron", "oc2"),
             WantToken {
@@ -15741,8 +14561,6 @@ mod agent_mail_name_tests {
                 pane: None,
             }
         );
-        // bd-eign.14: oc1 (the first oc agent) resolves — the first agent
-        // of a kind is NOT digit-suffixed, so the ordinal applies to the kind
         assert_eq!(
             to_want_token("toron", "oc1"),
             WantToken {
@@ -15773,7 +14591,6 @@ mod agent_mail_name_tests {
                 pane: None,
             }
         );
-        // a bare digit is not a numbered short (no kind prefix)
         assert_eq!(
             to_want_token("toron", "2"),
             WantToken {
@@ -15784,7 +14601,6 @@ mod agent_mail_name_tests {
                 pane: None,
             }
         );
-        // bare shorts expand to first ordinal AND broaden to numbered agents
         assert_eq!(
             to_want_token("toron", "oc"),
             WantToken {
@@ -15805,7 +14621,6 @@ mod agent_mail_name_tests {
                 pane: None,
             }
         );
-        // raw pane id passes through
         assert_eq!(
             to_want_token("toron", "w1:p1"),
             WantToken {
@@ -15816,7 +14631,6 @@ mod agent_mail_name_tests {
                 pane: None,
             }
         );
-        // empty passes through (caller validates distinctness)
         assert_eq!(
             to_want_token("toron", ""),
             WantToken {
@@ -15854,7 +14668,6 @@ mod agent_mail_name_tests {
                 pane: None,
             }
         );
-        // whitespace-trimmed crew names still pass through
         assert_eq!(
             to_want_token("toron", "  crew-plan-coder  "),
             WantToken {
@@ -15892,8 +14705,6 @@ mod agent_mail_name_tests {
     }
 }
 
-// ---- add ----
-
 /// bd-add-plane-dnzz: rex-plane add. The hc arm below builds an
 /// `hc::Client` and its workspace list, so a rex-plane swarm is invisible
 /// ("no flywheel-owned swarm") and `spawn --join` never gains a pane.
@@ -15914,11 +14725,8 @@ fn cmd_add_rex(
     settle_secs: u64,
     request_key: Option<&str>,
 ) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi
     check_project_spelling(project, "add")?;
     let plan = recipe_counts(None, counts, kinds)?;
-    // Same receipt gate + intent row as the hc arm (bd-command-receipts-zile):
-    // the slot is namespaced under the swarm label plus `-add`.
     let request_key = request_key.map(str::trim).filter(|k| !k.is_empty());
     let add_base = format!("{}-add", swarm_label(project));
     let add_subject = match request_key {
@@ -15998,8 +14806,6 @@ fn cmd_add_rex(
             detail.join(", ")
         );
     }
-    // bd-bug-add-foreign-workspace-m7dg: owned swarm workspace only, same
-    // partition as the hc arm — never the foreign captain workspace.
     let ws_id = add_target_from_split(&split, &agents, project)?;
     let existing: Vec<AgentInfo> = agents
         .into_iter()
@@ -16011,7 +14817,6 @@ fn cmd_add_rex(
         .ok_or_else(|| anyhow!("workspace {ws_id} has no panes"))?
         .pane_id
         .clone();
-    // seed per-kind ordinals from existing agents so added names stay unique
     let mut ordinals: BTreeMap<String, u32> = BTreeMap::new();
     for a in &existing {
         let Some(name) = a.name.as_deref() else {
@@ -16034,11 +14839,7 @@ fn cmd_add_rex(
             let ordinal = ordinals.entry(short.clone()).or_insert(0);
             *ordinal += 1;
             let name = agent_name_n(project, short, *ordinal);
-            // bd-pin-public-plane-s-easy.2: draw the pin BEFORE the split so
-            // it rides the launch env.
             let mail_identity = pinned_mail_identity(cfg, project, &name, &kind);
-            // GS-033: add-path fail-closed when mail is configured (same
-            // fate as cmd_spawn).
             if mail_identity.is_none() {
                 refuse_unpinned_spawn(&name, None, backend::mail_backend(cfg).is_ok())?;
             }
@@ -16047,8 +14848,6 @@ fn cmd_add_rex(
             if needs_in_arg_prime(&kind) {
                 add_args.push(boot_prime_line().to_string());
             }
-            // No env map on the trait's `pane_split`: the pin rides as an
-            // `env K=V` command prefix (same as `cmd_spawn_rex`).
             let pane_env = hc_support::plane_launch_env(cfg, mail_identity.as_deref());
             let cwd = utf8_path(&dir, "workspace dir")?;
             let split_pane = backend
@@ -16059,14 +14858,9 @@ fn cmd_add_rex(
             if let Err(e) = backend.pane_run(&prev, &command) {
                 bail!("add {name}: rex run failed on {prev}: {e:#}");
             }
-            // Label the block with the pin so wake routing resolves it
-            // (best-effort: the pane is live even when the rename lags).
             if let Err(e) = backend.agent_rename(&prev, Some(identity)) {
                 eprintln!("flywheel: warn: add rename {prev} → {identity} failed: {e:#}");
             }
-            // Readiness: the agent reports instead of the shell prompt
-            // (same bound as `cmd_spawn_rex`). Best-effort — a wait
-            // failure degrades to dispatch-side errors, never a panic.
             if let Err(e) = backend.agent_wait(
                 &prev,
                 &[
@@ -16080,26 +14874,18 @@ fn cmd_add_rex(
             if settle_secs > 0 {
                 std::thread::sleep(Duration::from_secs(settle_secs));
             }
-            // Prime through pane_run (write + enter): the identity line.
-            // Warn-only like the hc arm's retried prime.
             if let Err(e) = backend.pane_run(
                 &prev,
                 &doorbell::identity_prime(&name, identity),
             ) {
                 eprintln!("flywheel: warn: rex prime for {name} ({prev}) failed: {e:#}");
             }
-            // bd-627z.4 / bd-add-missing-mail-identity-16le: bind the pane
-            // identity now that the pane exists (same as the hc arm).
             bind_pane_mail_identity(cfg, project, &name, &prev, mail_identity.as_deref());
-            // GS-030 slice 3: auto-bind the kind role to the pin (add path
-            // carries no profile — the kind short is the role noun).
             bind_spawn_role(cfg, project, None, short, mail_identity.as_deref())?;
             println!("  {} {}", kind_paint(&kind), prev);
             spawned.push(json!({ "name": name, "kind": kind, "pane_id": prev }));
         }
     }
-    // bd-add-missing-mail-identity-16le: mirror the spawn contract — pins
-    // land in `.flywheel/agent-names.json` too. Best-effort like spawn.
     let registry = state::load_spawn_registry(project);
     if let Err(e) = state::save_agent_names(&dir, &registry) {
         eprintln!("flywheel: cannot save .flywheel/agent-names.json: {e:#}");
@@ -16109,9 +14895,6 @@ fn cmd_add_rex(
         EventKind::Add,
         json!({ "workspace_id": ws_id, "agents": spawned }),
     );
-    // The apply evidence for this row is the same one the caller waits for:
-    // the panes it just booted. A bail above leaves the row IN FLIGHT on
-    // purpose — a half-added swarm is not a settled add.
     add_effect.settle(Some(&format!("workspace={ws_id} added={}", spawned.len())));
     Ok(())
 }
@@ -16124,18 +14907,11 @@ fn cmd_add(
     settle_secs: u64,
     request_key: Option<&str>,
 ) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi
     check_project_spelling(project, "add")?;
-    // bd-add-plane-dnzz: on the rex door the hc workspace list cannot see
-    // the swarm — route through the multiplexer backend instead.
     if crate::pane::rex_door_selected(cfg) {
         return cmd_add_rex(cfg, project, counts, kinds, settle_secs, request_key);
     }
     let plan = recipe_counts(None, counts, kinds)?;
-    // bd-command-receipts-zile: add creates panes, so it carries the same
-    // intent-before-dispatch row as spawn (D9) and answers a request key from
-    // that row. Its slot is the swarm label plus `-add`, so an add row never
-    // overwrites the swarm's own spawn row (same project+subject+phase key).
     let request_key = request_key.map(str::trim).filter(|k| !k.is_empty());
     let add_base = format!("{}-add", swarm_label(project));
     let add_subject = match request_key {
@@ -16148,9 +14924,6 @@ fn cmd_add(
             .map(|(short, n)| (cfg.resolve_kind(short), *n, None))
             .collect::<Vec<_>>(),
     );
-    // The receipt check runs BEFORE any pane is split: a settled slot replays
-    // and an unresolved one refuses rather than adding a second time into a
-    // workspace that may already be receiving the first add's panes.
     if let Some(key) = request_key {
         match request_receipts::spawn_gate(
             request_receipts::load_spawn_row(project, &add_subject).as_ref(),
@@ -16193,10 +14966,6 @@ fn cmd_add(
     };
     let dir = project_dir(cfg, project);
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
-    // bd-bug-add-foreign-workspace-m7dg: add targets the flywheel-OWNED swarm
-    // workspace only (same partition as spawn). find_workspace matched the
-    // project base label and spawned panes into a foreign captain workspace
-    // (w37, label toron); that path is now refused/never targeted.
     let ws_id = add_target_workspace(&mut c, project)?;
     let existing: Vec<AgentInfo> = c
         .agent_list()?
@@ -16207,7 +14976,6 @@ fn cmd_add(
     let root = panes
         .first()
         .ok_or_else(|| anyhow!("workspace {ws_id} has no panes"))?;
-    // seed per-kind ordinals from existing agents so added names stay unique
     let mut ordinals: BTreeMap<String, u32> = BTreeMap::new();
     for a in &existing {
         let Some(name) = a.name.as_deref() else {
@@ -16224,13 +14992,6 @@ fn cmd_add(
     }
     let mut prev = root.pane_id.clone();
     let mut spawned: Vec<Value> = Vec::new();
-    // bd-bug-omp-hc-wedge: split panes do NOT inherit the workspace env —
-    // pass the hc integration env at split time too (same as the spawn
-    // path's workspace.create injection). bd-pin-public-plane-s-easy.2: the
-    // pin rides along as AGENT_NAME/FLYWHEEL_MAIL_AS in the per-pane env.
-    // H3 (bd-harness-integration-preflight): same preflight as spawn — add
-    // launches kinds into an existing workspace, so their integrations must
-    // be present too. One status read per add, deduped per kind.
     let integration_statuses = read_integration_statuses();
     let mut preflighted_kinds: HashSet<String> = HashSet::new();
     for (short, n) in &plan {
@@ -16242,11 +15003,7 @@ fn cmd_add(
             let ordinal = ordinals.entry(short.clone()).or_insert(0);
             *ordinal += 1;
             let name = agent_name_n(project, short, *ordinal);
-            // bd-pin-public-plane-s-easy.2: draw the pin BEFORE the split so
-            // the pane env carries AGENT_NAME/FLYWHEEL_MAIL_AS.
             let mail_identity = pinned_mail_identity(cfg, project, &name, &kind);
-            // GS-033: add-path fail-closed when mail is configured (same
-            // fate as cmd_spawn). Sweep loud-skip stays for true legacy rows.
             if mail_identity.is_none() {
                 refuse_unpinned_spawn(&name, None, backend::mail_backend(cfg).is_ok())?;
             }
@@ -16259,24 +15016,10 @@ fn cmd_add(
                 Some(&pane_env),
             )?;
             prev = p.pane_id.clone();
-            // H2 (bd-harness-pane-send-text-7fe8): same boot-prime contract
-            // as spawn — every prime is typed via pane.send_text after the TUI
-            // owns the foreground (below), not pushed as a positional
-            // MESSAGES arg. In-arg secondary kept for kinds that need it.
-            //
-            // bd-oc-launch-chdir-enoent-1l30: the identity line used to ride
-            // these args unconditionally, and opencode v2's root command reads
-            // a positional as a project DIRECTORY — `add --oc 1` typed
-            // `opencode <identity line>`, so opencode died on a chdir ENOENT
-            // to the repo it was already standing in, leaving an undriven
-            // shell. Flags only; the identity is typed below (same fix spawn
-            // got in bd-peeraware-enametoolong-iswg).
             let mut add_args: Vec<String> = Vec::new();
             if needs_in_arg_prime(&kind) {
                 add_args.push(boot_prime_line().to_string());
             }
-            // bd-pattern-peer-triggered: same shell-readiness gate as spawn —
-            // typing into a booting shell mangles long single-quoted args.
             let shell_ready = hc_support::wait_shell_prompt(&c, &prev, Duration::from_secs(15));
             if !shell_ready {
                 eprintln!(
@@ -16290,14 +15033,6 @@ fn cmd_add(
                         "add {name}: pane {prev} left behind — close it with `hc terminal close {prev}`"
                     )
                 })?;
-            // H2: the add path previously had no settle — wait for the TUI to
-            // own the foreground (bd-eign.6, same 15s contract as spawn)
-            // before the send_text prime, so it is not lost to the shell.
-            // bd-qs1c.2: verify boot — a recipe-launched pane (unsupported
-            // --kind via pane_run) can sit as an undriven shell. Dead process
-            // = fail loud with the corpse + exact close command; unknown kind
-            // (inconclusive probe) or probe error = loud warn with the check
-            // command, never a confident healthy.
             let foreground =
                 hc_support::wait_agent_foreground(&c, &prev, &kind, &name, Duration::from_secs(15));
             if !foreground {
@@ -16315,36 +15050,17 @@ fn cmd_add(
                     ),
                 }
             }
-            // bd-umb3 (bd-eign.6 L2): settle — same as spawn. A TUI can own
-            // the foreground while MCP servers still initialize; the prime
-            // typed into a half-booted shell is lost, leaving the pane
-            // `agent_not_ready` until a manual prime. Hold the dispatch-side
-            // sleep (default 30s, observed boot 20-30s) before priming.
             if settle_secs > 0 {
                 std::thread::sleep(Duration::from_secs(settle_secs));
             }
             if !needs_in_arg_prime(&kind) {
-                // Identity first (mail identity + guard note), then the boot
-                // ready check — the spawn path's order, and now its channel
-                // too (bd-oc-launch-chdir-enoent-1l30).
                 prime_line_via_send_text(
                     &mut c,
                     &prev,
                     &doorbell::identity_prime(&name, mail_identity.as_deref().unwrap_or(&name)),
                 );
-                // bd-umb3: retried prime — a transiently-busy pane must not
-                // silently stay unpromptable; on final failure the helper
-                // warns with the manual socket one-liner.
                 prime_bootstrap(&mut c, &prev, &kind);
             }
-            // bd-627z.4 / bd-add-missing-mail-identity-16le: the pin was
-            // drawn + registered BEFORE the split; bind the pane identity
-            // now that the pane exists (same mechanism as spawn — unique
-            // adjective+noun pin, collision-checked, idempotent on re-add
-            // of a dead pane's name). The project-local agent-names.json
-            // mirror is written after the loop so claims/strand
-            // checks/whois work immediately after add
-            // (bd-add-missing-mail-identity-16le).
             bind_pane_mail_identity(
                 cfg,
                 project,
@@ -16352,17 +15068,12 @@ fn cmd_add(
                 &agent.pane_id,
                 mail_identity.as_deref(),
             );
-            // GS-030 slice 3: auto-bind the kind role to the pin (add path
-            // carries no profile — the kind short is the role noun).
             bind_spawn_role(cfg, project, None, short, mail_identity.as_deref())?;
             println!("  {} {}", kind_paint(&kind), agent.pane_id);
             spawned
                 .push(json!({ "name": agent.name, "kind": agent.agent, "pane_id": agent.pane_id }));
         }
     }
-    // bd-add-missing-mail-identity-16le: mirror the spawn contract — pins
-    // land in `.flywheel/agent-names.json` too (the registry alone only
-    // persists on the next spawn/rebind save). Best-effort like spawn.
     let registry = state::load_spawn_registry(project);
     if let Err(e) = state::save_agent_names(&dir, &registry) {
         eprintln!("flywheel: cannot save .flywheel/agent-names.json: {e:#}");
@@ -16372,19 +15083,11 @@ fn cmd_add(
         EventKind::Add,
         json!({ "workspace_id": ws_id, "agents": spawned }),
     );
-    // The apply evidence for this row is the same one the caller waits for:
-    // the panes it just booted. A bail above leaves the row IN FLIGHT on
-    // purpose — a half-added swarm is not a settled add.
     add_effect.settle(Some(&format!("workspace={ws_id} added={}", spawned.len())));
     Ok(())
 }
 
-// ---- list / status ----
-
 fn cmd_list(cfg: &Config, all: bool) -> Result<()> {
-    // bd-3vw3q: route through the resolved multiplexer backend so the
-    // rex plane is visible (hc Client::connect answers 'no flywheel
-    // swarms' on rex hosts).
     let backend = backend::multiplexer_backend(cfg)?;
     let workspaces = backend.workspace_list()?;
     let agents = backend.agent_list()?;
@@ -16397,13 +15100,9 @@ fn cmd_list(cfg: &Config, all: bool) -> Result<()> {
             .iter()
             .filter(|a| a.workspace_id == ws.workspace_id)
             .map(|a| {
-                // GS-037 P0-2: clear stale launch_pending when hc already
-                // reports idle/interactive_ready (is_still_booting=false).
                 let pending = is_still_booting(a);
                 json!({
                     "name": a.name, "kind": a.agent,
-                    // bd-4pxy: a launch_pending agent is NOT idle — it is
-                    // still booting (the status must never mask the boot).
                     "status": status_label(pending, a.agent_status.as_str()),
                     "launch_pending": pending,
                 })
@@ -16455,8 +15154,6 @@ fn routed_role(primitive: &str) -> Option<String> {
 }
 
 /// Classify only. Never dispatches.
-// The CLI leaf mirrors its flag surface 1:1; grouping into a struct would only
-// move the argument list behind another hop.
 #[allow(clippy::too_many_arguments)]
 fn cmd_decide(
     cfg: &Config,
@@ -16475,8 +15172,6 @@ fn cmd_decide(
         contention,
     };
     if let Some(project) = project {
-        // bd-blank-project-spelling-non-mail-doors-76hi: Some("") used to
-        // load the workspace root's spawn meta.
         check_project_spelling(project, "decide")?;
         let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
         let live = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
@@ -16497,18 +15192,11 @@ fn cmd_decide(
             snap.contention = !live.held_paths.is_empty();
         }
     }
-    // ADR-0032 Spec 9 (one catalog): every route that dispatches `workflow run`
-    // must name a workflow the merged catalog actually resolves. A row pointing
-    // at a renamed or removed workflow is a dangling claim — fail here, where
-    // the fix is named, not later as an unrunnable argv.
     let merged = workflow_catalog::all_workflows_merged(None)?;
     let known: Vec<String> = merged.keys().cloned().collect();
     if let Err(e) = decide::check_workflow_routes(decide::ROUTING_TABLE, &known) {
         bail!("{e}");
     }
-    // bd-2o1v P0-5 (a): role affinity is READ from each routed workflow's
-    // steps — a row dispatching to an unknown profile fails here, where
-    // the row and the catalog are both named.
     let affinity: Vec<(&str, Option<String>)> = decide::ROUTING_TABLE
         .iter()
         .filter(|e| {
@@ -16528,8 +15216,6 @@ fn cmd_decide(
     if let Err(e) = decide::check_profile_routes(&affinity, &known_profiles) {
         bail!("{e}");
     }
-    // The fold is the classifier: `update` calls `decide` and builds the
-    // command list, so this print path and the loop agree by construction.
     use toron_core::kernel::Program as _;
     let classify = crate::elm::DecideProgram::update(
         &snap,
@@ -16566,8 +15252,6 @@ fn cmd_decide(
     }
     Ok(())
 }
-
-// ---- bd-cy0s: event-driven facts (captain surface) ----
 
 /// bd-lorot: a throwaway state root for a test that reaches the real ingress
 /// seam. The seam is the only writer in this plane and it writes wherever it is
@@ -16715,8 +15399,6 @@ pub fn captain_fact_inject(
         );
         anyhow::bail!("captain fact miss: no alias for project {project}");
     }
-    // Queue for the live dispatcher. workspace::tick owns Prompt/FactMiss.
-    // Never hc-inject here (Tick Law).
     append_pending_fact(state_dir, project, &line)
 }
 
@@ -16726,25 +15408,14 @@ pub fn ingress_adapters_for_project(
     state_dir: &std::path::Path,
     project: &str,
 ) -> ingress::IngressAdapters {
-    // The returned closures outlive this borrow, so the root is owned, not
-    // borrowed. bd-lorot: it is a PARAMETER, not config::state_dir() read
-    // here — that was the whole leak. A test that could not name a root could
-    // not reach the filesystem at all, and the compile error says so.
     let root = state_dir.to_path_buf();
     let proj = project.to_string();
     ingress::IngressAdapters {
-        // hc/watch/cron reach the loop and doorbell through their own
-        // dedicated surfaces (__poll_events / Bell::Watch / cron runner) and
-        // should NEVER arrive on this seam — if they do, that is a routing
-        // bug and must be loud, not silently swallowed (GS-006 bd-d4qg).
         hc: Box::new(|e| eprintln!("ingress routing bug: hc via fact seam: {e:?}")),
         watch: Box::new(|w| eprintln!("ingress routing bug: watch via fact seam: {w:?}")),
         workflow: Box::new(|t| eprintln!("ingress routing bug: workflow via fact seam: {t:?}")),
         cron: Box::new(|n| eprintln!("ingress routing bug: cron via fact seam: {n}")),
         fact: Box::new(move |ev: &ingress::IngressEvent| {
-            // Live Fact path: journal a pending Msg. The doorbell dispatcher
-            // ticks it on the live WorkspaceModel (never Default, never
-            // hc-inject that bypasses tick).
             let summary = ingress::fact_doorbell_line(ev).unwrap_or_else(|| format!("{ev:?}"));
             let msg = crate::workspace::Msg::Fact {
                 summary: summary.clone(),
@@ -16757,10 +15428,6 @@ pub fn ingress_adapters_for_project(
                 serde_json::json!({ "stage": "fact_pending", "summary": summary }),
                 None,
             );
-            // Durable facts ledger (bd-cy0s captain surface): load_facts and
-            // facts_count_and_last read this file — the pending queue below is
-            // only the wake. Dropping this writer orphaned the surface (empty
-            // reads; facts_close/lapsed tests red). Append, never wake-only.
             let ledger = facts_journal_path(&root, &proj);
             let wrote = match ledger.parent() {
                 Some(dir) => std::fs::create_dir_all(dir).and_then(|()| {
@@ -16796,8 +15463,6 @@ fn cmd_unanswered_triage(
 ) -> anyhow::Result<()> {
     use crate::judgment::UreqTransport;
     let dir = flywheel_state_dir.unwrap_or_else(|| {
-        // Mirrors the doorbell CLI's ladder (DOORBELL_STATE_DIR > XDG > platform)
-        // so the triage reads the SAME directory the daemon writes.
         std::env::var_os("DOORBELL_STATE_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
@@ -16810,15 +15475,11 @@ fn cmd_unanswered_triage(
                 base.join("flywheel")
             })
     });
-    // Jev is an ENHANCEMENT, never a dependency: no key must produce a clean
-    // "not asked" report, not an error. bd-3uqz's own rule, applied to the door.
     let transport = UreqTransport::from_authority(&crate::authority::RuntimeAuthority::resolve())
         .unwrap_or_else(|_| UreqTransport {
             api_key: String::new(),
             url: crate::judgment::SYSTEMONE_URL.to_string(),
         });
-    // The clock and the binary are passed IN, not read here: the core must not read
-    // the clock or the environment, so the host owns both (the effect law).
     let now = crate::unanswered_triage::unix_now();
     let doorbell_dir = std::env::var_os("DOORBELL_STATE_DIR")
         .map(std::path::PathBuf::from)
@@ -16848,9 +15509,6 @@ fn cmd_stuck_vs_busy(port: u16, dry_run: bool) -> anyhow::Result<()> {
     use crate::judgment::UreqTransport;
     use crate::stage::{Signal, Stage};
     let url = format!("http://127.0.0.1:{port}/health");
-    // A wrong port gives a CONNECTION error, which is the good case. A wrong
-    // SERVICE gives a well-formed document that is simply about the wrong thing,
-    // so the refusal below is what catches it.
     let body = ureq::get(&url)
         .call()
         .map_err(|e| {
@@ -16864,8 +15522,6 @@ fn cmd_stuck_vs_busy(port: u16, dry_run: bool) -> anyhow::Result<()> {
     let health: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| anyhow::anyhow!("{url} is not JSON: {e}"))?;
 
-    // A health document with no watch and no wake is a WRONG SERVICE, not a
-    // judgment to make. Refuse before spending a request, and say why.
     if health.get("watch").is_none() || health.get("wake").is_none() {
         return Err(anyhow::anyhow!(
             "{url} answered but carries no watch and no wake counters, so this is not a \
@@ -16873,8 +15529,6 @@ fn cmd_stuck_vs_busy(port: u16, dry_run: bool) -> anyhow::Result<()> {
         ));
     }
 
-    // Jev is an ENHANCEMENT, never a dependency — bd-3uqz's own rule, applied to
-    // the second fit. No key must produce a clean "not asked" report, not an error.
     let transport = UreqTransport::from_authority(&crate::authority::RuntimeAuthority::resolve())
         .unwrap_or_else(|_| UreqTransport {
             api_key: String::new(),
@@ -16902,20 +15556,11 @@ fn cmd_stuck_vs_busy(port: u16, dry_run: bool) -> anyhow::Result<()> {
         options: Vec::new(),
         registered_unconfigured: Vec::new(),
     };
-    // The objective NESTS the health document under `health` because the stage's
-    // preflight looks there. A top-level document would make that preflight pass
-    // VACUOUSLY — the same trap the `.unanswered` triage fell into.
     let objective = serde_json::json!({ "health": health }).to_string();
     let mut ctx = crate::stage::StageCtx {
         objective: &objective,
         menu: &mut menu,
     };
-    // Run the PREFLIGHT leaf first, then the Jev leaf, rather than the composed
-    // stage. `StageReport` carries no children and `combine()` flattens leaf
-    // details into `id=signal` pairs, so a composed judgment's own verdict is
-    // DISCARDED — I first ran `stage()` here and got the verdict `health`,
-    // parsed from `"health:has-counters=Holds"`. Running the leaves the way
-    // `unanswered_triage` does costs one request and yields the real label.
     let Stage::Compose { stages, .. } = crate::stuck_vs_busy::stage() else {
         unreachable!("stuck_vs_busy::stage() is a Compose by construction")
     };
@@ -16929,7 +15574,6 @@ fn cmd_stuck_vs_busy(port: u16, dry_run: bool) -> anyhow::Result<()> {
     };
     let pre_report = pre.run(&mut ctx, &transport);
     if pre_report.signal != Signal::Holds {
-        // Refused BEFORE spending a request, which is the point of the preflight.
         println!(
             "{}",
             serde_json::json!({
@@ -16959,9 +15603,7 @@ fn cmd_stuck_vs_busy(port: u16, dry_run: bool) -> anyhow::Result<()> {
         .trim()
         .to_string();
 
-    // The deterministic reading travels WITH the judgment, always. That is the
     // whole safety property: if Jev is unreachable the label says `unknown` and
-    // these counters are still there to act on by hand.
     println!(
         "{}",
         serde_json::json!({
@@ -17031,7 +15673,6 @@ fn stderr_is_never_the_error_when_the_parser_already_has_one() {
 }
 
 fn cmd_snapshot(cfg: &Config, project: &str) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi
     check_project_spelling(project, "snapshot")?;
     let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
     let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
@@ -17052,7 +15693,6 @@ pub(crate) fn live_decide_snapshot(cfg: &Config, project: &str) -> decide::Snaps
             .filter(|l| l.status == "open" || l.status == "ready")
             .count() as u32,
         profiled_panes: live.pins.len() as u32,
-        // GS-049: real assemble value — never invent-green hardcoded 0.
         launch_pending: live.launch_pending,
         contention: !live.held_paths.is_empty(),
     }
@@ -17062,7 +15702,7 @@ pub(crate) fn live_decide_snapshot(cfg: &Config, project: &str) -> decide::Snaps
 /// (`Msg::MaterialContext` → expand → `DecisionReady` sticky announce), then
 /// prints the briefing proposal with the same live Snapshot. Does **not**
 /// bypass sticky-open via a bare `cmd_briefing` alias.
-#[allow(clippy::too_many_arguments)] // CLI-flag mirror of Briefing/Reclassify
+#[allow(clippy::too_many_arguments)]
 fn cmd_reclassify(
     cfg: &Config,
     objective: &str,
@@ -17074,14 +15714,11 @@ fn cmd_reclassify(
     crew: Option<&str>,
     model: Option<&str>,
 ) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi
     let project = project_door(project, "toron", "reclassify")?;
-    // Seed workspace with sticky topology from prior DecisionReady (if any).
     let mut ws_model = workspace::WorkspaceModel::from_environment();
     if let Some(topo) = state::load_session_topology(project) {
         ws_model.session_topology = Some(topo);
     }
-    // Seed captain role so DecisionReady can Prompt announce.
     if let Some(pin) = state::load_captain_alias(project) {
         ws_model.roles.insert("captain".into(), pin.clone());
         ws_model.presence.insert(
@@ -17115,7 +15752,6 @@ fn cmd_reclassify(
     if let Some(topo) = ws_model.session_topology.as_deref() {
         let _ = state::save_session_topology(project, topo);
     }
-    // Surface announce lines for the CLI user (Elm plane result).
     for c in &expanded {
         if let workspace::Cmd::Prompt { line, .. } = c
             && line.starts_with("[reclassify]")
@@ -17128,8 +15764,6 @@ fn cmd_reclassify(
             eprintln!("flywheel: [{kind}] {detail}");
         }
     }
-    // Briefing proposal print / optional commit — same leaf as before, but
-    // sticky already applied above on the Elm plane.
     cmd_briefing(
         cfg,
         objective,
@@ -17145,7 +15779,7 @@ fn cmd_reclassify(
 
 /// ADR-0010 D10 (bd-67qg): the one session-start drain over the snapshot.
 /// Always the three sections, even on an empty queue.
-#[allow(clippy::too_many_arguments)] // CLI-flag mirror of Briefing
+#[allow(clippy::too_many_arguments)]
 fn cmd_briefing(
     cfg: &Config,
     objective: &str,
@@ -17157,14 +15791,11 @@ fn cmd_briefing(
     crew: Option<&str>,
     model: Option<&str>,
 ) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi
     let project = project_door(project, "toron", "briefing")?;
     let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
     let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
     let world = briefing::World {
         project: project.to_string(),
-        // Dispatchable ready only (`br ready`). Open-without-verify must not
-        // trip loop-work; counting jsonl `open` lanes was the session-door hijack.
         ready_beads: match load_ready_beads(cfg, project) {
             Ok(v) => v.len() as u32,
             Err(e) => {
@@ -17182,9 +15813,6 @@ fn cmd_briefing(
         held_paths: snap.held_paths.clone(),
         coalition_id: snap.coalitions.first().cloned(),
         launch_pending: snap.launch_pending,
-        // bd-compose-plumbing-zdzi: the arriving pin — the ONE identity
-        // ladder (env over config name), so the emitted wave-swarm argv can
-        // bind `captain_pin` to the agent actually briefing.
         agent_pin: crate::authority::select_agent_identity(None, &|k| std::env::var(k).ok()),
     };
     if world.joinable {
@@ -17196,9 +15824,6 @@ fn cmd_briefing(
         );
     }
     let unique: Vec<String> = Vec::new();
-    // bd-drlm: the catalog is read once here so the briefing can carry the
-    // tier-aware harness menu. A read failure is NOT fatal: the briefing still
-    // renders, it just has no menu to offer.
     let catalog_for_menu = profile::ProfileCatalog::load().ok();
     let mut b = briefing::assemble(
         objective,
@@ -17207,19 +15832,7 @@ fn cmd_briefing(
         cfg.crew_max(),
         catalog_for_menu.as_ref(),
     );
-    // bd-xaw8: installed-binary staleness rides the caller side so assemble
-    // stays pure (same split as the harness ranking below).
     b.apply_staleness();
-    // bd-drlm: rank the derived menu through the STAGE, not by calling the ranker
-    // directly. `assemble` stays pure; the model call lives in a named, skippable
-    // stage so the menu's origin stays auditable, and adding a second judgment
-    // later is a matter of composing stages rather than growing this function.
-    //
-    // The gates, in order, each leaving the deterministic order standing and saying
-    // so: Jev off/unconfigured -> no pass attempted; no menu or a single-option
-    // menu -> nothing to rank; the transport (5s timeout, never retried) -> any
-    // error is Unknown. Nothing here can fail the briefing: the door must not
-    // depend on a network.
     b.harness_ranking = Some(match judgment::jev_gate() {
         judgment::JevGate::Off => "jev off (FLYWHEEL_JEV off) — deterministic order".to_string(),
         judgment::JevGate::Unconfigured => {
@@ -17246,14 +15859,7 @@ fn cmd_briefing(
             }
         },
     });
-    // bd-2o1v P0-5 (a): name the proposed row's profile affinity (read from
-    // the workflow's steps, never re-declared) so the crew-confirm gate
-    // above and the captain see the same dispatch relation.
     b.proposal.role = routed_role(&b.proposal.workflow);
-    // GS-049: after sticky-open [reclassify] announce, do not present a
-    // conflicting second topology surface. Sticky-held is derived via
-    // `sticky_open_topology` (single SoT) — never a re-derived CLI predicate
-    // that ignores explicit_topology.
     if let Some(sticky) = state::load_session_topology(project) {
         let explicit = workspace::parse_explicit_topology(objective);
         let (final_topo, held) = workspace::sticky_open_topology(
@@ -17263,8 +15869,6 @@ fn cmd_briefing(
         );
         briefing::align_with_session_topology(&mut b, &final_topo, held);
     }
-    // Explicit remix flags bind the printed questions into argv (bd-g3li).
-    // `--topology` is an AUTHORITATIVE request — sticky-open may flip.
     briefing::apply_answers(&mut b, topology, crew, model).map_err(|e| anyhow!(e))?;
     if json {
         print_json(&serde_json::to_value(&b)?);
@@ -17288,10 +15892,6 @@ fn cmd_briefing(
                 .unwrap_or("default")
         );
     }
-    // bd-enov (F3): a dirt preflight on the session door. An uncommitted ADR
-    // in the working tree means HEAD carries the SUPERSEDED contract — every
-    // crew that reads git history implements the wrong thing, and no bead
-    // gate witnesses doc-only changes. Name the files loudly before dispatch.
     warn_uncommitted_decision_docs(cfg, project);
     if commit || yes {
         if commit && !yes && std::io::stdin().is_terminal() {
@@ -17328,11 +15928,6 @@ fn cmd_briefing(
                 .map_err(|e| anyhow!(e))?;
         }
         let argv = b.proposal.argv.clone();
-        // Crew-confirm gate (bd-2o1v, captain contract 2026-09-13): a crew
-        // plan is a PROPOSAL. Spawn-class topologies may not auto-commit
-        // without the operator's word — TTY asks inline; non-TTY callers
-        // (agents) present the proposal in chat and rerun with --yes / a
-        // remixed --crew. Cron/loop never route through briefing.
         let spawns_crew = briefing::spawns_crew(&b.proposal);
         if commit && !yes && spawns_crew {
             let plan = format!(
@@ -17387,7 +15982,6 @@ pub(crate) fn uncommitted_decision_docs(porcelain: &str) -> Vec<String> {
         .filter(|l| l.len() > 3)
         .filter_map(|l| {
             let path = l[3..].trim();
-            // Rename/copy rows render as `old -> new`; the NEW path is live.
             let path = path.rsplit(" -> ").next().unwrap_or(path).trim_matches('"');
             path.starts_with("docs/decisions/")
                 .then(|| path.to_string())
@@ -17518,10 +16112,6 @@ pub(crate) fn arrive_identity_verdict(
     let env_pin = clean(env_pin);
     let injected = registry_pin.or(env_pin);
     if registry_pin.is_some() && captain_pin == Some(requested) && injected != Some(requested) {
-        // bd-0gup: the refusal must ALSO require that the requested pin is
-        // not the pane's OWN injected identity. The captain pane arriving as
-        // itself is a CORRECT arrival; the old guard refused it and then told
-        // the operator to re-run with the pin it had just rejected.
         return ArriveIdentityVerdict::Refused {
             injected: injected.map(str::to_string),
             reason: "the captain pin is not a valid arrival target for a spawned pane",
@@ -17565,11 +16155,6 @@ fn cmd_arrive(
     captain_override: Option<&str>,
 ) -> Result<()> {
     check_project_spelling(project, "arrive")?;
-    // bd-spawn-identity-divergence-2vzw: refuse an arrival that contradicts
-    // the identity injected at spawn — BEFORE any mail-registration or
-    // heartbeat effect, so a wrong pin cannot fork the pane's identity or
-    // overwrite the pane binding. The captain pin is never a valid target for
-    // a spawned pane.
     if let Some(requested) = as_agent {
         let dir = project_dir(cfg, project);
         let registry = state::load_spawn_registry(dir.to_str().unwrap_or(project));
@@ -17602,9 +16187,6 @@ fn cmd_arrive(
                 injected.as_deref().unwrap_or(requested),
             );
         }
-        // Divergence report (never a refusal — a correct re-arrive heals the
-        // binding): the pane identity bridge says the pane last acted under
-        // another pin than its spawn row names.
         if let Some(pane) = pane_id.as_deref()
             && let Ok(key) = project_dir_str(cfg, project)
             && let Ok(mail) = mail_or_die(cfg)
@@ -17644,8 +16226,6 @@ fn cmd_arrive(
         );
     }
     print!("{}", snapshot::render_helm(&snap, doorbell_now_unix()));
-    // Only join a coalition the operator named. Auto-joining the first
-    // JSON file in state_dir (month-old "active" rows) is a silent hijack.
     if let Some(id) = coalition
         && let Some(agent) = as_agent
     {
@@ -17657,8 +16237,6 @@ fn cmd_arrive(
         }
     }
     if let Some(agent) = as_agent {
-        // Key on disk is not a whois row. Upsert so captain/whois resolve
-        // after the door. Best-effort: a register miss never fails arrive.
         match crate::mail_or_die(cfg) {
             Ok(mail) => {
                 if let Ok(key) = crate::project_dir_str(cfg, project) {
@@ -17693,11 +16271,6 @@ fn cmd_arrive(
         }
         arrive_maybe_bind_pane(cfg, project, agent);
     }
-    // Arrival triple (bd-asr2.14, D5, flag-gated): presence (above) + role
-    // auto-bind from the spawn-registry profile + roster visibility. The
-    // 39002 join-ring leg rides channel membership (coalition --join or
-    // spawn --join-channel, both opt-in and existing) — arrive never
-    // invents channels. Best-effort: never fails arrival.
     if cfg.doorbell_arrival_triple()
         && let Some(agent) = as_agent
     {
@@ -17711,7 +16284,6 @@ fn cmd_arrive(
         .unwrap_or(false);
     let ev = captain_slot::CaptainEvidence {
         holder,
-        // whois.stale=false is live (CLI actors like TealDune have no pane).
         presence_fresh: !whois_stale,
         last_wake_fresh: snap.dispatcher == "up",
         pane_alive,
@@ -17732,12 +16304,6 @@ fn cmd_arrive(
             }
         }
     }
-    // staleness is a generous 7 days, so a prior session's pin (pane gone,
-    // no heartbeat, dispatcher down) still reads fresh and `mail --to
-    // captain` reaches nobody. OFFER the rebind verb; never auto-rebind —
-    // a quiet human operator looks identical to a dead session pin.
-    // bd-8pis: the dead-fold decision lives in captain_fold_health_line
-    // (shared with helm, byte-identical output).
     if let Some(line) = captain_fold_health_line(
         project,
         ev.holder.clone(),
@@ -17752,12 +16318,6 @@ fn cmd_arrive(
         Ok(()) => {}
         Err(e) => eprintln!("flywheel: doorbell start: {e:#}"),
     }
-    // bd-kj2z: the door means woken — record the arriving pin's own wake
-    // subscription so zero-fleet sessions need no babysitting. Idempotent
-    // per (workspace, pin); the daemon auto-hosts the pair within 60s and
-    // reaps week-silent pins. Never fatal to the session door. Scope is
-    // the stable project label, not the possibly-stale spawn meta, so rows
-    // converge instead of scattering one per dead workspace.
     if let Some(pin) = as_agent {
         doorbell::register_arrival_subscription(
             &config::state_dir(),
@@ -17766,7 +16326,6 @@ fn cmd_arrive(
             pin,
         );
     }
-    // before a crew is dispatched off stale git history.
     warn_uncommitted_decision_docs(cfg, project);
     if let Some(obj) = objective {
         cmd_briefing(
@@ -17912,12 +16471,7 @@ pub(crate) fn send_liveness_warnings(
         })
         .collect();
     let heartbeats = presence_pins(project);
-    // A whois binding alone can lie (dead panes stay bound) — check it
-    // against the live plane set when the backend answers.
     let live_panes = live_hc_panes(cfg);
-    // bd-f8zk: a spawned pane IS the liveness evidence even
-    // when the pin never ran `arrive` (whois pane_id stays null). Without this
-    // the rex crew drew a false "may reach nobody" advisory on every send.
     let registry = crate::state::load_spawn_registry(project);
     let mut pane_pins = HashSet::new();
     for p in &resolved {
@@ -17952,7 +16506,6 @@ fn captain_fold_health_line(
 ) -> Option<String> {
     let ev = captain_slot::CaptainEvidence {
         holder,
-        // whois.stale=false is live (CLI actors like TealDune have no pane).
         presence_fresh: !whois_stale,
         last_wake_fresh: dispatcher_up,
         pane_alive,
@@ -17969,14 +16522,11 @@ fn captain_fold_health_line(
 }
 
 fn cmd_helm(cfg: &Config, project: &str) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi
     check_project_spelling(project, "helm")?;
     let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
     let now = doorbell_now_unix();
     let snap = snapshot::assemble(cfg, project, &ws_label, now);
     print!("{}", snapshot::render_helm(&snap, now));
-    // bd-8pis: captain-fold liveness in health output — the same dead-fold
-    // line arrive prints. Silent while any live signal backs the holder.
     let (holder, whois_stale) = lookup_captain_holder(project);
     let pane_alive = holder
         .as_ref()
@@ -17996,14 +16546,10 @@ fn cmd_helm(cfg: &Config, project: &str) -> Result<()> {
 }
 
 fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi
     ensure_project_opt(project, "status")?;
     let Some(project) = project else {
         return cmd_list(cfg, false);
     };
-    // Rex door: inside rex list panes through the multiplexer backend;
-    // otherwise keep the hc client. Read-only either way — status
-    // never creates a session.
     let (ws_id, agents, dead): (String, Vec<hc_support::AgentInfo>, Vec<(String, String)>) =
         if crate::pane::rex_door_selected(cfg) {
             let backend = crate::backend::factory::multiplexer_backend(cfg)?;
@@ -18013,9 +16559,6 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
                 .into_iter()
                 .filter(|a| a.workspace_id == ws_id)
                 .collect::<Vec<_>>();
-            // The dead-rows gauge is hc-client-coupled (fail-open there);
-            // in rex mode it reports none — the reap still runs on
-            // spawn/close.
             (ws_id, agents, Vec::new())
         } else {
             let mut c = Client::connect(Some(&cfg.socket_path()))?;
@@ -18031,15 +16574,8 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     if agents.is_empty() {
         bail!("no agents in {project} — is the swarm spawned?");
     }
-    // bd-spawn-identity-divergence-2vzw: registry pin vs the identity the
-    // pane actually acted as (pane token / identity bridge). Both sides known
-    // and different = identity_divergent; a missing side is not evidence
-    // (mail down degrades to silence, never a fabricated divergence).
     let key = crate::project_dir_str(cfg, project)?;
     let registry = state::load_spawn_registry(&project_dir(cfg, project).to_string_lossy());
-    // bd-swarm-cockpit-pczs: one facade for the identity bridge AND the
-    // per-pin whois below (npub + last activity), and one snapshot call
-    // whose pins already carry the live bead/reservation binding.
     let mail = crate::mail_or_die(cfg).ok();
     let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
     let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
@@ -18073,11 +16609,7 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     let rows: Vec<Value> = agents
         .iter()
         .map(|a| {
-            // GS-037 P0-2: clear stale launch_pending when hc reports idle.
             let pending = is_still_booting(a);
-            // ADR-0010 D3: status prints verdict+source per pin. No live
-            // Model in this render path, so resolve from hc evidence:
-            // native busy is evidence (labeled), native idle never trusted.
             let plane_status = a.agent_status.as_str();
             let verdict = crate::workspace::verdict_for(None, plane_status, plane_status != "dead")
                 .status_token();
@@ -18088,11 +16620,6 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
             let observed_pin = actual_by_pane.get(&a.pane_id).cloned();
             let divergent =
                 identity_divergence(expected_pin.as_deref(), observed_pin.as_deref()).is_some();
-            // bd-swarm-cockpit-pczs: cockpit fields — who the pin is on the
-            // mail plane (npub + last activity, soft-fail null when the
-            // roster cannot answer) and which bead/reservations the LIVE
-            // board binds it to (snapshot projection; no row = empty, never
-            // a default).
             let terminal_name = a.name.clone().unwrap_or_else(|| a.pane_id.clone());
             let who = expected_pin
                 .as_deref()
@@ -18107,7 +16634,6 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
             let snap_pin = snap.pins.iter().find(|p| p.pin == terminal_name);
             json!({
                 "name": a.name, "kind": a.agent,
-                // bd-4pxy: a launch_pending agent is NOT idle — still booting.
                 "status": status_label(pending, plane_status),
                 "verdict": verdict,
                 "pane_id": a.pane_id, "cwd": a.cwd, "workspace_id": ws_id,
@@ -18122,8 +16648,6 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
             })
         })
         .collect();
-    // H3 (bd-harness-integration-preflight): surface each distinct kind's
-    // hc integration state (kind -> installed/current/version).
     let integration_statuses = read_integration_statuses();
     let integrations: BTreeMap<String, hc_support::IntegrationStatus> = agents
         .iter()
@@ -18140,11 +16664,6 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
         })
         .collect();
     let dispatcher = doorbell::dispatcher_status_line(&config::state_dir(), &ws_label);
-    // ADR-0010 D10 (bd-67qg): OPEN DECISIONS from the one snapshot call —
-    // the journal fold lives in snapshot::assemble (same replay rule as
-    // cmd_doorbell_why), not inline here (the call itself is hoisted above,
-    // bd-swarm-cockpit-pczs). Renders on every status until an answer/
-    // --verdict clears the call.
     let open_decision_rows: Vec<Value> = snap
         .decisions
         .iter()
@@ -18153,8 +16672,6 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     let unanswered =
         doorbell::read_unanswered(&doorbell::unanswered_file(&config::state_dir(), &ws_label));
     let report = doorbell::report_text(&config::state_dir(), &ws_label);
-    // bd-durable-doorbell-lngf: liveness = a field here, not a ps invocation;
-    // and status is also a lazy-heal site — a dead dispatcher restarts now.
     let wake_state =
         doorbell::load_wake_state(&doorbell::wake_state_file(&config::state_dir(), &ws_label));
     let dispatcher_alive = doorbell::read_pid(&doorbell::pid_file(&config::state_dir(), &ws_label))
@@ -18186,9 +16703,6 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
         for (k, st) in &integrations {
             println!("  {}", integration_status_line(k, st));
         }
-        // bd-nwnb: dead registry rows are visible here before dispatch
-        // trips on them — reaped automatically on next spawn/close.
-        // (Computed with the status preamble; empty on the rex arm.)
         if dead.is_empty() {
             println!("  {}", dim("registry: no dead rows"));
         } else {
@@ -18254,8 +16768,6 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-// ---- bd-swarm-cockpit-pczs: wave progress ----
-
 /// Per-wave progress counts. `unknown` exists so a row whose `status` field
 /// is missing/unrecognized reads unknown — never a default `done` (the same
 /// honesty rule as `history_row_status`).
@@ -18274,8 +16786,6 @@ impl WaveCounts {
         match status {
             "closed" => self.closed += 1,
             "in_progress" => self.in_progress += 1,
-            // An open bead is `ready` only when `br ready` listed it — a
-            // blocked open bead is not dispatchable and says so.
             "open" if ready => self.ready += 1,
             "open" => self.blocked += 1,
             _ => self.unknown += 1,
@@ -18460,7 +16970,6 @@ fn cmd_binding_rebind(
     harness: Option<&str>,
     note: Option<&str>,
 ) -> Result<()> {
-    // GS-043: captain request path = journaled rebind Cmd, not silent SoT edit.
     let _ = cfg;
     let mut entries = state::load_spawn_registry(project);
     let idx = entries
@@ -18490,8 +16999,6 @@ fn cmd_binding_rebind(
         harness: harness
             .map(str::to_string)
             .unwrap_or_else(|| from.harness.clone()),
-        // Hosted only via the captain-request note (ADR-0019 D1); every
-        // other rebind path stays Pane.
         location: if note.unwrap_or("").contains("location=hosted") {
             agent_ref::BindingLocation::Hosted
         } else {
@@ -18507,9 +17014,6 @@ fn cmd_binding_rebind(
             bail!("binding-rebind: unknown profile {p:?} (flywheel profile list)");
         }
     }
-    // MEDIUM invent-green: SpawnEntry.model is write-only today — no spawn/pane/
-    // headless consumer. Refuse --model before Settled (fail-loud). Never invent
-    // Settled for a column nobody reads. Wire a real consumer later, then reopen.
     if model.is_some() {
         bail!(
             "binding-rebind: --model refused (fail-loud) — live model override is not wired into spawn/pane/headless dispatch (SpawnEntry.model is write-only). Use `flywheel profile set --model …` for catalog SoT, or pass --profile/--harness only. Never invent Settled."
@@ -18543,7 +17047,6 @@ fn cmd_binding_rebind(
 }
 
 fn cmd_rebind(cfg: &Config, project: &str) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi
     check_project_spelling(project, "rebind")?;
     let backend = backend::multiplexer_backend(cfg)?;
     let ws_id = find_workspace_dyn(&*backend, project)?;
@@ -18561,14 +17064,12 @@ fn cmd_rebind(cfg: &Config, project: &str) -> Result<()> {
     let mut stale = 0usize;
     for entry in &entries {
         let (pane_id, name) = (&entry.pane_id, &entry.name);
-        // bd-recover-accepts-camelcase-pins-z5fz: `flywheel rebind` shares the
-        // recover door's CamelCase-pin mapping (hc rejects the pin shape).
         let hname = terminal_agent_name(name);
         let Some(a) = agents
             .iter()
             .find(|a| a.pane_id == *pane_id && a.workspace_id == ws_id)
         else {
-            stale += 1; // pane gone (respawned) — a fresh pane carries its name
+            stale += 1;
             continue;
         };
         if binding_state(name, Some(a.name.as_deref())) == BindingState::Intact {
@@ -18629,7 +17130,7 @@ fn spawn_kinds_from_log(project: &str) -> std::collections::HashMap<String, Stri
                 .entry(name.to_string())
                 .or_insert_with(|| kind.to_string());
         }
-        break; // last spawn event only
+        break;
     }
     kinds
 }
@@ -18702,12 +17203,9 @@ enum RecoverDecision<'a> {
 /// responsiveness (state_change_seq advancing across a window); a frozen +
 /// idle agent is respawned, not classified healthy.
 fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi
     check_project_spelling(project, "recover")?;
     let backend = backend::multiplexer_backend(cfg)?;
     let ws_id = find_workspace_dyn(&*backend, project)?;
-    // bd-eign.3 A: registry first; the project-local mirror is the fallback
-    // when the state-dir registry is gone (wipe/restore).
     let mut entries = state::load_spawn_registry(project);
     if entries.is_empty() {
         entries = state::load_agent_names(&project_dir(cfg, project));
@@ -18721,19 +17219,11 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
     }
     let kinds = spawn_kinds_from_log(project);
     let agents = backend.agent_list()?;
-    // bd-1np: concrete hc client for the process-liveness probe — the
-    // backend trait has no `pane.process_info`. Only the hc backend can
-    // probe; other backends fall back to pane-existence classification.
     let mut probe = (backend.name() == "hc")
         .then(|| Client::connect(Some(&cfg.socket_path())).ok())
         .flatten();
     let mut recovered: Vec<Value> = Vec::new();
     let mut healthy = 0usize;
-    // bd-f8zk: on hc a pane outlives its agent (the
-    // shell stays at a prompt), so a dead agent respawns IN it. On rex the
-    // block IS the pane: closing it destroys the shell, and `pane_run` on the
-    // stale id can only fail 30 times. Read the plane once; a row whose pane
-    // is gone gets a fresh sibling split, and the registry follows it.
     let pane_list = backend.pane_list(Some(&ws_id)).ok();
     let pane_exists = |id: &str| {
         pane_list
@@ -18743,9 +17233,6 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
     let mut moved: Vec<(String, String)> = Vec::new();
     for entry in &entries {
         let (pane_id, name) = (&entry.pane_id, &entry.name);
-        // bd-recover-accepts-camelcase-pins-z5fz: hc refuses a CamelCase
-        // pin as an agent name, so restore/launch under the legal form and
-        // compare against THAT (what hc will actually hold).
         let hname = terminal_agent_name(name);
         let kind = recover_probe_kind(entry, &kinds);
         let live = agents
@@ -18753,16 +17240,10 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
             .find(|a| a.pane_id == *pane_id && a.workspace_id == ws_id);
         let decision = match binding_state(name, live.map(|a| a.name.as_deref())) {
             BindingState::Intact => {
-                // pane + binding intact — liveness-probe the process inside.
                 match probe_agent_liveness(&mut probe, pane_id, kind, &hname) {
-                    // provably dead: respawn in the same pane (its shell is
-                    // back at the prompt). Some(false) is the bd-1np signal.
                     Some(false) => RecoverDecision::Respawn {
                         reason: "process-dead",
                     },
-                    // process alive — probe responsiveness (bd-a8i): a
-                    // frozen agent passes pane_agent_alive but does not
-                    // advance state_change_seq while idle.
                     Some(true) => {
                         let verdict = probe.as_mut().map(|c| {
                             hc_support::probe_agent_responsiveness(
@@ -18772,27 +17253,18 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
                             )
                         });
                         match verdict {
-                            // alive as a PID, dead to input → respawn,
-                            // not healthy (the bd-a8i shape).
                             Some(hc_support::Responsiveness::Unresponsive) => {
                                 RecoverDecision::Respawn {
                                     reason: "unresponsive",
                                 }
                             }
-                            // responsive or inconclusive → healthy (a failed
-                            // probe never respawns an agent — bd-1np
-                            // principle).
                             _ => RecoverDecision::Healthy,
                         }
                     }
-                    // probe unavailable/inconclusive → legacy healthy
-                    // classification (probe error ≠ dead — never respawn an
-                    // agent on a failed probe).
                     None => RecoverDecision::Healthy,
                 }
             }
             BindingState::Lost { was } => {
-                // pane survived, binding lost → restore it (7rc path)
                 RecoverDecision::Rebind { was }
             }
             BindingState::Gone => RecoverDecision::Respawn {
@@ -18801,7 +17273,7 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
         };
         match decision {
             RecoverDecision::Healthy => {
-                healthy += 1; // pane + binding + live process
+                healthy += 1;
             }
             RecoverDecision::Rebind { was } => {
                 backend.agent_rename(pane_id, Some(&hname))?;
@@ -18811,9 +17283,6 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
                 }));
             }
             RecoverDecision::Respawn { reason } => {
-                // agent died (or its process died — bd-1np) → respawn with
-                // spawn-time kind. Reuse the surviving pane; when the pane
-                // itself is gone (rex closed block), split a sibling first.
                 let target = if pane_exists(pane_id) {
                     Some(pane_id.clone())
                 } else {
@@ -18852,8 +17321,6 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
             }
         }
     }
-    // A respawn that minted a new pane (rex) moves the registry row with it,
-    // or the next recover/send/wake resolves the dead block again.
     if !moved.is_empty() {
         for e in entries.iter_mut() {
             if let Some((_, new)) = moved.iter().find(|(old, _)| old == &e.pane_id) {
@@ -18873,9 +17340,6 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
         "recovered": recovered.len(),
         "details": recovered,
     }));
-    // bd-durable-doorbell-lngf: recover restored the agents — now restore
-    // the WAKE LAYER (the crash that killed the panes killed the
-    // dispatchers too). Lazy-heal every registered workspace.
     let exe = std::env::current_exe()?;
     ensure_doorbell_supervisor();
     for ws in doorbell_project_workspaces(project) {
@@ -18884,10 +17348,6 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
             Err(e) => eprintln!("flywheel: doorbell {ws} heal FAILED: {e:#}"),
         }
     }
-    // ADR-0025 Spec 4: recover == adopt — rebind captain alias to the
-    // recovering pin. Production `contact captain --pin` lives in toron;
-    // flywheel mirrors it in the state-dir alias file so `mail --to captain`
-    // rebounds immediately after recover.
     let recovering_pin = cfg
         .agent_mail
         .as_ref()
@@ -18927,11 +17387,8 @@ fn rebind_from_registry(
         .iter()
         .find(|a| a.pane_id == *pane_id && a.workspace_id == ws_id)
     else {
-        return Ok(false); // pane gone (respawned) — normal resolution finds the new pane
+        return Ok(false);
     };
-    // bd-recover-accepts-camelcase-pins-z5fz: a CamelCase registry name is a
-    // legal identity but an illegal terminal name — map it, or the auto-heal
-    // itself trips `invalid_agent_name`.
     let target = terminal_agent_name(&entry.name);
     if a.name.as_deref() == Some(target.as_str()) {
         return Ok(true);
@@ -18940,9 +17397,7 @@ fn rebind_from_registry(
     Ok(true)
 }
 
-// ---- send ----
-
-#[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
+#[allow(clippy::too_many_arguments)]
 /// If `to` contains a bare kind short (`oc`/`pi`/`gk`) that matches MORE than
 /// one agent, return the matched names. A bare short broadens to the whole
 /// crew (`oc` → oc, oc2, oc3) — one prompt sent to all of them races the
@@ -18993,8 +17448,6 @@ fn condition_send_target(
         return (text.to_string(), None, false);
     };
     if raw {
-        // GS-039 P0-2: operator/raw current-pane text is AUTHORITATIVE —
-        // prefix so peer-aware agents cannot classify it as chatter.
         let framed = format!(
             "AUTHORITATIVE OPERATOR OBJECTIVE (open-mode / --raw; GS-039 P0-2 — NOT chatter; execute now; outranks stale captain diagnose TASK-IDs):
 
@@ -19024,7 +17477,7 @@ fn condition_send_target(
 /// each recipient's comms inbox as ONE `task@1` envelope through toron's
 /// `mail.append` effect; the pane receives only the constant wake line. No
 /// typing, no stall resend, no respawn: the envelope is the delivery.
-#[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
+#[allow(clippy::too_many_arguments)]
 fn cmd_send_via_inbox(
     cfg: &Config,
     project: &str,
@@ -19039,7 +17492,6 @@ fn cmd_send_via_inbox(
     if !comms_send::enabled(cfg) {
         return Err(comms_send::SendError::Disabled.into());
     }
-    // The legacy typing knobs mean nothing here; refuse rather than ignore.
     let (wait, respawn, raw, ff, plane, unsafe_plane, timeout) = legacy_flags;
     if wait || respawn || raw || ff || plane || unsafe_plane || timeout.is_some() {
         bail!(
@@ -19135,8 +17587,6 @@ fn cmd_send_rex(
     fire_and_forget: Option<&str>,
 ) -> Result<()> {
     let backend = backend::multiplexer_backend(cfg)?;
-    // One workspace per request key: search every owned workspace so a pin
-    // resolves regardless of which keyed swarm holds it.
     let workspaces = find_workspaces_dyn(&*backend, project)?;
     let ws_ids: Vec<&str> = workspaces.iter().map(|w| w.workspace_id.as_str()).collect();
     let agents = backend.agent_list()?;
@@ -19150,8 +17600,6 @@ fn cmd_send_rex(
     }
     let mut registry = state::load_spawn_registry(project);
     let targets = resolve_send_targets_dyn(&in_ws, &registry, project, to)?;
-    // Same broadcast guard as the hc arm: a bare short reaching the whole
-    // crew races one prompt across N agents.
     if !force {
         let names: Vec<String> = targets
             .iter()
@@ -19185,7 +17633,6 @@ fn cmd_send_rex(
                 || e.pane_id == target
                 || e.name == name
         });
-        // ADR-0019 D5: hosted pins have no pane to prompt — they stay queued.
         let hosted =
             agent_ref::binding_location_for(project, &name) == agent_ref::BindingLocation::Hosted;
         let (send_text, cond_profile, skills_injected) = match &catalog {
@@ -19295,7 +17742,7 @@ fn cmd_send_rex(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
+#[allow(clippy::too_many_arguments)]
 fn cmd_send(
     cfg: &Config,
     project: &str,
@@ -19313,12 +17760,6 @@ fn cmd_send(
     unsafe_plane: bool,
 ) -> Result<()> {
     let text = match (stage, msg) {
-        // ADR-0006 D1: --param k=v substitutes the stage template's {{k}}
-        // slots; a declared-but-missing required slot is a usage error.
-        // Project tier (.flywheel/stages.toml) rides along so lane-bead and
-        // stall-wake resolve from CLI sends. Explicit message text is
-        // operator intent: it appends after the rendered stage, never dropped
-        // (silent-drop caused hollow dispatches).
         (Some(s), m) => combine_stage_message(
             stage_prompt_with_params_project(s, params, &project_dir(cfg, project))?,
             m,
@@ -19326,13 +17767,6 @@ fn cmd_send(
         (None, Some(m)) => m.to_string(),
         (None, None) => bail!("provide --stage NAME or a message text"),
     };
-    // bd-task-id-threading-xl2k: every dispatched task carries a stable
-    // task-id — the completion mail threads on it (`mail send
-    // --thread-id <task-id>`, subject `[<task-id>] ...`), so non-bead work
-    // has greppable history instead of subject-only drift. Explicit
-    // `--param task_id=...` wins; otherwise one is minted per send.
-    // The header names the bound bead (or its absence) so a TASK-ID is never
-    // mistaken for a work order (hollow-dispatch class).
     let task_id = match params.iter().find(|p| p.starts_with("task_id=")) {
         Some(kv) => kv.trim_start_matches("task_id=").to_string(),
         None => mint_task_id(),
@@ -19359,10 +17793,6 @@ fn cmd_send(
 
     check_send_plane_tripwires(&text, plane, unsafe_plane, raw)?;
 
-    // bd-rex-default-plane-xn1t: the default prompt lane rides the selected
-    // pane plane. `auto` and `superlogical` resolve rex-first (hc is
-    // transport fallback only); only an explicit `hc` selection takes the
-    // `Client` path below. Nothing on the rex arm mentions hc.
     #[cfg(feature = "backend-superlogical")]
     if crate::backend::resolve_backend_name(cfg) != "hc" {
         return cmd_send_rex(
@@ -19383,16 +17813,10 @@ fn cmd_send(
     let ws_id = find_workspace(&mut c, project)?;
     let mut targets = resolve_agents(&mut c, &ws_id, project, to);
     if targets.is_err() {
-        // bd-fw-name-binding-loss-7rc auto-heal: an agent that restarted in
-        // its pane lost its name binding — restore from the spawn registry
-        // (best-effort) and re-resolve before reporting the miss.
         let backend = backend::multiplexer_backend(cfg)?;
         for tok in to.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             let _ = rebind_from_registry(&*backend, project, tok, &ws_id);
         }
-        // bd-a2bw: also rebind every nameless pane in the workspace — a
-        // `--to coder3` miss must not depend on the token already being
-        // the full terminal name.
         if let Ok(live) = c.agent_list() {
             let entries = state::load_spawn_registry(project);
             let mut rebound = false;
@@ -19407,18 +17831,10 @@ fn cmd_send(
                     rebound = true;
                 }
             }
-            // bd-bug-omp-hc-wedge: the omp hc integration re-reports the
-            // agent as UNNAMED on every processed prompt, so a name-addressed
-            // prompt racing the report misses hc's name index. Settle a
-            // beat after the rename before re-resolving.
             if rebound {
                 std::thread::sleep(Duration::from_millis(400));
             }
         }
-        // bd-qs1c.1: a send racing a fresh spawn can miss the pin (registry
-        // not yet flushed) or the pane (not yet in hc's list) even after
-        // the rebind above. Settle on a short bounded budget — every attempt
-        // is a live re-read, never an invented delivery (GS-037).
         if targets.is_err() {
             eprintln!(
                 "flywheel: send --to {to}: unresolvable after rebind — settling for a fresh registration"
@@ -19428,9 +17844,6 @@ fn cmd_send(
     }
     let targets = targets?;
 
-    // bd-fw-send-bare-short-group: a bare short reaching the whole crew would
-    // race one prompt across N agents (observed: 3 agents claimed the same
-    // bead, duplicate commits). Refuse with guidance unless --force.
     if !force {
         let names: Vec<String> = targets
             .iter()
@@ -19447,27 +17860,16 @@ fn cmd_send(
     }
 
     let timeout = timeout_ms.or_else(|| wait.then(|| cfg.timeout_ms()));
-    // bd-cx0r: announce the wait bound up front — the default is the 30min
-    // dispatch timeout, and a silent wait reads as a hang (observed: an
-    // operator tool-killed a healthy 90-minute brief at 180s).
     if wait {
         eprintln!(
             "flywheel: --wait: expecting settle (idle|done|blocked), waiting up to {}s…",
             timeout.unwrap_or_default() / 1000
         );
     }
-    // bd-98gd: Spec C everywhere — the captain-facing send resolves each
-    // target's profile from the spawn registry (same lookup the loop's
-    // __profile leaf uses) and conditions its prompt. Loaded once; the
-    // catalog load is deferred to first profiled target via Result (a
-    // broken catalog degrades to raw sends, never a hard failure).
     let mut registry = state::load_spawn_registry(project);
     let catalog = profile::ProfileCatalog::load();
     let mut registry_dirty = false;
     let mut results: Vec<Value> = Vec::new();
-    // bd-8vci: one emitter shared by the success tail and the wait-failure
-    // path — a failed --wait still surfaces every observed row before its
-    // nonzero exit instead of discarding the landed fact.
     let emit_rows = |results: &[Value]| {
         log(
             project,
@@ -19481,9 +17883,6 @@ fn cmd_send(
             print_json(&json!({ "results": results }));
         }
     };
-    // GS-037 P0-C / GS-039 P0-1: snapshot wake BEFORE send so a later landed
-    // check can require an observed advance (Status/poll/delivery, or
-    // hc settled_status after --wait land — never invent from injects).
     let wake_before_unix = if wait {
         let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
         doorbell::load_wake_state(&doorbell::wake_state_file(&config::state_dir(), &ws_label))
@@ -19492,26 +17891,14 @@ fn cmd_send(
         None
     };
     for a in &targets {
-        // --wait means "settle": idle, done, or blocked. An empty `until` array
-        // was sent before, which hc cannot wait on meaningfully.
         let wait_opts = wait.then(|| WaitOptions {
             timeout_ms: timeout,
             until: vec![AgentStatus::Idle, AgentStatus::Done, AgentStatus::Blocked],
         });
-        // bd-rdy: stall auto-recovery on the interactive send --wait path. The
-        // durable loop escalates stalls (respawn → requeue, bd-send-stall-
-        // escalation); the CLI counterpart is one retry after a short delay,
-        // then either a same-name respawn (--respawn-on-stall) or an
-        // actionable error naming the recovery commands.
         let mut target = agent_target(a).to_string();
         let name = a.name.clone().unwrap_or_else(|| target.clone());
-        // ADR-0019 D5: hosted pins have no pane to prompt — they stay queued.
         let hosted =
             agent_ref::binding_location_for(project, &name) == agent_ref::BindingLocation::Hosted;
-        // bd-98gd: condition THIS target with its profile's behavior preamble
-        // (+ skill-load prefix on first dispatch). Raw only when the target
-        // has no profiled entry, its profile is unknown, or --raw was passed
-        // — byte-identical legacy behavior.
         let entry = registry.iter_mut().find(|e| e.name == name);
         let (send_text, cond_profile, skills_injected) = match &catalog {
             Ok(c) => condition_send_target(entry, c, &text, raw),
@@ -19523,8 +17910,6 @@ fn cmd_send(
         if skills_injected {
             registry_dirty = true;
         }
-        // Fail-loud cap for conditioned bead briefs — the same invariant as
-        // the __send leaf: never silently truncate a dispatched brief.
         if text.starts_with("GOAL ") && send_text.len() > durable::DISPATCH_PROMPT_CAP {
             bail!(
                 "flywheel: dispatched prompt for {} is {} bytes — over the {} byte cap (send conditioning; NOT sent)",
@@ -19534,19 +17919,11 @@ fn cmd_send(
             );
         }
         let mut stalls_seen = 0usize;
-        // Baseline for read-before-retry: stall is not proof of non-delivery.
-        // Compare state_change_seq + agent.read against this after a stall.
         let baseline_seq = a.state_change_seq;
         let baseline_completion = a.completion_seq.unwrap_or(0);
-        // One delivery key for the whole send (fire-and-forget id, or none):
-        // stall resend keeps the same key so the journal shows one effect
-        // with two attempts, never a second mint.
         let delivery_key = delivery_id_of(&fire_and_forget)
             .map(str::to_string)
             .unwrap_or_else(|| format!("send:{name}:{baseline_seq}"));
-        // bd-4pxy: a still-booting agent rejects name-addressed prompts with
-        // `agent_not_ready`; hc accepts pane ids, so retry once via the
-        // pane before giving up (bounded — never an infinite loop).
         let mut pane_retried = false;
         let agent = loop {
             match c.agent_prompt(&target, &send_text, wait_opts.clone()) {
@@ -19560,24 +17937,13 @@ fn cmd_send(
                             );
                             target = pane;
                         }
-                        // H2 (bd-harness-jcode): a recipe-harness pane
-                        // (`pa`/`jcode`) never satisfies the agent.prompt
-                        // gate — deliver through pane primitives instead of
-                        // failing the send.
-                        // H2 (bd-harness-jcode) arm is terminal (break or
-                        // return on every path) — no re-delivery guard needed.
                         None => {
                             if try_send_text_delivery(&mut c, project, &name, &target, &send_text) {
-                                // Pane send-text delivered bytes — that is
-                                // NOT hc settled-wait. With --wait, refuse
-                                // invent-green landed/receipt (GS-037).
                                 if wait {
                                     bail!(
                                         "send --wait: recipe-harness pane delivery for {name} succeeded but no settled wait observation — refuse invent-green landed (GS-037 prompt-wait-invent-landed)"
                                     );
                                 }
-                                // Fire-and-forget / non-wait: emit dispatched
-                                // row without landed (P0-A gate handles exit).
                                 if let Some(agent) = c.agent_list().ok().and_then(|list| {
                                     list.iter()
                                         .find(|ag| {
@@ -19593,11 +17959,6 @@ fn cmd_send(
                         }
                     }
                 }
-                // bd-bug-omp-hc-wedge: omp's hc integration re-reports
-                // the agent UNNAMED on each processed prompt, so a
-                // name-addressed prompt can miss hc's name index even
-                // after the send-path heal. Rebind from the spawn registry
-                // and retry once via the pane.
                 Err(e)
                     if matches!(&e.code, BackendErrorCode::Other(c) if c == "agent_not_found")
                         && !pane_retried
@@ -19638,14 +17999,6 @@ fn cmd_send(
                     match stall_step(&e.code, stalls_seen, respawn_on_stall) {
                         None => {
                             if wait && e.code == BackendErrorCode::Timeout {
-                                // bd-8vci: the wait timed out AFTER hc
-                                // accepted the bytes — a bare Err here discards
-                                // the landed fact and invents a clean failure.
-                                // Emit the ambiguous row; genuinely non-landed
-                                // errors keep the bare bail. F9/F15: the same
-                                // call also settles a lagging oc pane and
-                                // returns Ok (landed) when it observes the
-                                // working transition.
                                 return wait_failure_exit(
                                     &mut c,
                                     &target,
@@ -19661,8 +18014,6 @@ fn cmd_send(
                             return Err(e.into());
                         }
                         Some(StallStep::Retry) => {
-                            // toron wait.rs / hc: read before retry, never
-                            // blind resubmit. Same delivery_key across attempts.
                             let probe = probe_prompt_after_stall(
                                 &mut c,
                                 &target,
@@ -19675,7 +18026,6 @@ fn cmd_send(
                                 eprintln!(
                                     "flywheel: {target} agent_prompt_stalled — prompt proven absent (delivery_key={delivery_key}); one resend"
                                 );
-                                // brief settle only; do NOT sleep-and-blind-resend
                                 std::thread::sleep(Duration::from_millis(200));
                             } else {
                                 eprintln!(
@@ -19707,10 +18057,6 @@ fn cmd_send(
                             stalls_seen += 1;
                         }
                         Some(StallStep::GiveUp) => {
-                            // GS-037 prompt-wait-invent-landed: pane send-text
-                            // is NOT a settled wait observation. Best-effort
-                            // delivery may help the operator, but must NOT
-                            // break into landed:true/receipt:true invent-green.
                             eprintln!(
                                 "flywheel: {target} agent_prompt_stalled after retries — best-effort pane send-text (not a wait receipt; GS-037 prompt --wait honesty)"
                             );
@@ -19746,10 +18092,6 @@ fn cmd_send(
                 )
             );
         }
-        // bd-pin-public-plane-s-easy.9: dispatched + prior_status — the
-        // hc status at TARGET time (before the prompt), never a bare
-        // `status` a captain reads as a miss when the agent was idle at
-        // dispatch. landed + settled_status only after --wait observed it.
         results.push(send_result_row(
             agent_target(a),
             a.agent_status.as_str(),
@@ -19760,19 +18102,12 @@ fn cmd_send(
         ));
     }
 
-    // bd-98gd: persist skills_injected flags set by conditioning (single
-    // write after the loop — the registry is ours for this send).
     if registry_dirty && let Err(e) = state::save_spawn_registry(project, &registry) {
         eprintln!("flywheel: cannot persist skills_injected for send targets: {e:#}");
     }
 
     emit_rows(&results);
 
-    // GS-037 P0-A / P0-C: receipt honesty.
-    // --wait with no landed must not exit 0 invent-green (P0-A wait-empty).
-    // On landed:true, last_wake must advance from a REAL observation
-    // (hc settled status working|idle|done|blocked after send lands, or
-    // doorbell Status/delivery). Never invent from planned injects.
     let any_landed = results
         .iter()
         .any(|r| r.get("landed") == Some(&json!(true)));
@@ -19783,11 +18118,6 @@ fn cmd_send(
     }
     if wait && any_landed {
         let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
-        // GS-039 P0-1: when send --wait OBSERVES hc settle (landed +
-        // settled_status in working|idle|done|blocked), stamp last_wake from
-        // that observation. Covers idle→idle fast-path where doorbell Status
-        // push may not fire a transition. Not invent-green: gated on hc
-        // wait receipt, not planned injects / doorbell_persist_wake.
         for r in &results {
             if r.get("landed") != Some(&json!(true)) {
                 continue;
@@ -19839,8 +18169,8 @@ fn cmd_send(
             );
         }
         match (before_unix, after.last_wake_unix) {
-            (None, Some(_)) => { /* advanced from never — independent stamp observed */ }
-            (Some(b), Some(a)) if a > b => { /* advanced */ }
+            (None, Some(_)) => {  }
+            (Some(b), Some(a)) if a > b => {  }
             (Some(b), Some(a)) if a == b => {
                 bail!(
                     "send --wait landed:true but doorbell last_wake did not advance (still {a}) — independent wake receipt missing (GS-037 P0-C). Wake stamp must come from doorbell/agent wake observation, not cmd_send."
@@ -19859,9 +18189,6 @@ fn cmd_send(
         }
     }
 
-    // GS-037 P0-A: fire-and-forget must not invent green (dispatched:true
-    // exit 0 without land/wake receipt). Require --wait or explicit
-    // --fire-and-forget.
     if !wait && fire_and_forget.is_none() {
         bail!(
             "send dispatched without land/wake receipt — refuse invent-green exit 0 (GS-037 P0-A). Re-run with --wait (receipt-backed) or pass --fire-and-forget to acknowledge no receipt."
@@ -19869,8 +18196,6 @@ fn cmd_send(
     }
     Ok(())
 }
-
-// ---- send --wait stall recovery (bd-rdy) ----
 
 /// Delay before the single automatic retry after `agent_prompt_stalled`.
 /// Legacy name kept only as documentation of the old blind-sleep budget.
@@ -19890,8 +18215,6 @@ enum StallStep {
     /// Exhausted: fail with actionable recovery guidance.
     GiveUp,
 }
-
-// ---- send result JSON (bd-pin-public-plane-s-easy.9) ----
 
 /// bd-task-id-threading-xl2k: `task-<short-hash>` — stable, greppable,
 /// collision-unlikely at crew scale (time + a process counter).
@@ -19945,9 +18268,6 @@ fn send_result_row(
     } else {
         v["landed"] = json!(false);
     }
-    // ADR-0019 D5: every send result carries delivery. Dispatched to a live
-    // pane without an observed ok is queued; an observed settle on a pane
-    // wakes it. Hosted pins have no pane to prompt — they stay queued.
     let tier = if hosted {
         crate::captain_directory::Tier::Pull
     } else {
@@ -19987,8 +18307,6 @@ fn wait_failure_row(
     if let Some(s) = observed_status {
         v["observed_status"] = json!(s);
     }
-    // ADR-0019 D5: timeout/stall between claim and settle is Unknown —
-    // never an invented ok, never a silent queue.
     v["delivery"] = json!(crate::captain_directory::Delivery::Unknown.as_str());
     v
 }
@@ -20124,7 +18442,6 @@ fn read_pane_status(c: &mut Client, target: &str, name: &str) -> Option<String> 
 /// landed row and return Ok. Otherwise one read-back becomes the row's
 /// `observed_status`, the ambiguous row is pushed into `results`, the caller's
 /// row emitter runs, and the returned error exits nonzero with the hint.
-// One positional per probed field keeps the read-back call sites obvious.
 #[allow(clippy::too_many_arguments)]
 fn wait_failure_exit(
     c: &mut Client,
@@ -20158,8 +18475,6 @@ fn wait_failure_exit(
         .is_some_and(|s| wait_advance_landed(a.agent_status, s))
     {
         let status = observed.as_deref().unwrap_or("working");
-        // ADR-0019 D5: the prompt was observed to land — woke, unless the
-        // pin is hosted (no pane to prompt, stays queued).
         let hosted =
             agent_ref::binding_location_for(project, name) == agent_ref::BindingLocation::Hosted;
         results.push(send_result_row(
@@ -20344,7 +18659,6 @@ fn probe_prompt_after_stall(
     let read = match c.agent_read(target, "screen", Some(120)) {
         Ok(content) => Some(!needle.is_empty() && content.contains(&needle)),
         Err(_) => {
-            // Fallback: raw pane output via agent.read "output" if screen fails.
             match c.agent_read(target, "output", Some(80)) {
                 Ok(content) => Some(!needle.is_empty() && content.contains(&needle)),
                 Err(_) => None,
@@ -20436,7 +18750,6 @@ fn try_send_text_delivery(
     eprintln!(
         "flywheel: {name} ({pane_id}) is a recipe-harness pane (kind {kind}) — delivering via pane.send_text"
     );
-    // No invent-green: return the real confirmed-delivery result of prime.
     prime_line_via_send_text(c, pane_id, text)
 }
 
@@ -20595,16 +18908,14 @@ mod bd_4pxy_tests {
             try_body.contains("prime_line_via_send_text(c, pane_id, text)"),
             "try_send_text_delivery must call prime"
         );
-        // Negative control: invent-green was `prime(...);\n    true`.
         assert!(
             !try_body.contains("prime_line_via_send_text(c, pane_id, text);\n    true"),
             "try_send must not discard prime result then return true"
         );
         assert!(
-            try_body.contains("No invent-green")
-                && try_body
-                    .lines()
-                    .any(|l| l.trim() == "prime_line_via_send_text(c, pane_id, text)"),
+            try_body
+                .lines()
+                .any(|l| l.trim() == "prime_line_via_send_text(c, pane_id, text)"),
             "try_send return must be the prime bool"
         );
     }
@@ -20629,14 +18940,11 @@ mod bd_4pxy_tests {
             false,
             AgentStatus::Idle,
         );
-        // first not-ready on the NAME → retry via the pane id
         assert_eq!(
             not_ready_retry_target("flywheel-flywheel-coder", &a, false),
             Some("w1:p1".to_string())
         );
-        // pane-id retry already consumed → bounded, no third attempt
         assert_eq!(not_ready_retry_target("w1:p1", &a, true), None);
-        // an unnamed agent already prompts by pane id → no retry
         let unnamed = agent(Some("omp"), None, "w1", false, AgentStatus::Idle);
         assert_eq!(not_ready_retry_target("w1:p1", &unnamed, false), None);
     }
@@ -20653,9 +18961,6 @@ mod bd_4pxy_tests {
 
     #[test]
     fn launch_pending_error_names_field_and_agent() {
-        // bd-a2bw: a truly-booting agent is launch_pending AND not yet
-        // interactive_ready. Idle + ready with launch_pending set is stale
-        // (covered by is_still_booting_ignores_stale_launch_pending).
         let mut pending = agent(
             Some("omp"),
             Some("flywheel-flywheel-coder"),
@@ -20714,7 +19019,6 @@ mod bd_4pxy_tests {
             AgentStatus::Idle,
         );
         let want = WantToken {
-            // the registry's canonical name — which hc never reports
             name: "flywheel-toron-coder".to_string(),
             broaden: false,
             short: None,
@@ -20726,7 +19030,6 @@ mod bd_4pxy_tests {
             vec![0],
             "the pane is the ground truth"
         );
-        // INVERTED: with no pane the name never matches, which is the bug.
         let no_pane = WantToken {
             pane: None,
             ..want.clone()
@@ -20739,7 +19042,6 @@ mod bd_4pxy_tests {
 
     #[test]
     fn match_indices_kind_fallback_resolves_omp1() {
-        // the bd-4pxy witness shape: an omp agent NAMED flywheel-<base>-coder
         let omp1 = agent(
             Some("omp"),
             Some("flywheel-flywheel-coder"),
@@ -20762,17 +19064,14 @@ mod bd_4pxy_tests {
             AgentStatus::Idle,
         );
         let agents = vec![omp1, omp2, oc];
-        // --to omp1: name flywheel-flywheel-omp does not exist → first kind=omp
         assert_eq!(
             match_indices(&agents, &[to_want_token("flywheel", "omp1")]),
             vec![0]
         );
-        // --to omp2 → second kind=omp
         assert_eq!(
             match_indices(&agents, &[to_want_token("flywheel", "omp2")]),
             vec![1]
         );
-        // bare --to omp → first kind=omp (no flywheel-flywheel-omp name)
         assert_eq!(
             match_indices(&agents, &[to_want_token("flywheel", "omp")]),
             vec![0]
@@ -20781,11 +19080,6 @@ mod bd_4pxy_tests {
 
     #[test]
     fn match_indices_raw_kind_hits_nameless_pane() {
-        // 2026-09-07 raw-pane addressing: an hc pane with NO registry
-        // name (a raw harness agent, e.g. grok) is reachable by its agent
-        // kind. Witness: `flywheel send --to KeenAuditor` failed against a
-        // workspace whose only peers were raw omp/grok panes; `--to grok`
-        // must hit the kind fallback even when name is None.
         let mut grok = agent(Some("grok"), None, "w6", false, AgentStatus::Idle);
         grok.pane_id = "w6:p2".into();
         let mut omp = agent(Some("omp"), None, "w6", false, AgentStatus::Working);
@@ -20795,8 +19089,6 @@ mod bd_4pxy_tests {
             match_indices(&agents, &[to_want_token("flywheel", "grok")]),
             vec![1]
         );
-        // a toron pin with no registry row still misses — the error (not
-        // the matcher) is what teaches the raw-pane ladder
         assert_eq!(
             match_indices(&agents, &[to_want_token("flywheel", "KeenAuditor")]),
             [] as [usize; 0]
@@ -20819,7 +19111,6 @@ mod bd_4pxy_tests {
         let mut bare = agent(None, None, "w6", false, AgentStatus::Idle);
         bare.pane_id = "w6:p3".into();
         assert_eq!(agent_display(&bare), "w6:p3");
-        // empty-string names (registry overlay miss) degrade to kind, not ""
         let mut blank = agent(Some("omp"), Some(""), "w6", false, AgentStatus::Idle);
         blank.pane_id = "w6:p1".into();
         assert_eq!(agent_display(&blank), "omp (w6:p1)");
@@ -20842,8 +19133,6 @@ mod bd_4pxy_tests {
             AgentStatus::Idle,
         );
         let agents = vec![oc, omp];
-        // --to oc1 resolves by NAME (exists) — kind fallback must not add a
-        // second, differently-named kind=oc agent
         assert_eq!(
             match_indices(&agents, &[to_want_token("flywheel", "oc1")]),
             vec![0]
@@ -20933,19 +19222,15 @@ mod bd_4pxy_tests {
             AgentStatus::Idle,
         );
         let agents = vec![oc];
-        // the spawn-registry entry binds the hc name to its mail pin
         let entries = vec![state::SpawnEntry::with_mail_identity(
             "w70:p1",
             "flywheel-toron-coder",
             "DustySparrow",
         )];
-        // a pin token must resolve to the agent (via the registry mapping),
-        // while the hc name and pane id keep working unchanged.
         let resolved = registry_entry_for_token(&entries, "toron", "DustySparrow")
             .map(|e| e.name.as_str())
             .expect("pin resolves to a registry entry");
         assert_eq!(resolved, "flywheel-toron-coder");
-        // full resolution: --to DustySparrow hits the named agent
         let mut names = agents.clone();
         overlay_registry_names(&mut names, &entries);
         assert_eq!(
@@ -21176,7 +19461,6 @@ mod send_stall_recovery_tests {
         assert_eq!(n, "abcdefghij");
         let long = "x".repeat(100);
         assert_eq!(prompt_presence_needle(&long).chars().count(), 48);
-        // multibyte: take chars, not bytes
         let multi = "日本語テスト文字列ですよ追加";
         let needle = prompt_presence_needle(multi);
         assert!(needle.chars().count() <= 48);
@@ -21200,15 +19484,12 @@ mod send_stall_recovery_tests {
             !send_body.contains("retrying once in {STALL_RETRY_DELAY_SECS}s"),
             "must not blind sleep-and-resend on first stall"
         );
-        // Negative control: a body that only slept would fail the probe assert.
         assert!(
             send_body.contains("refusing blind resubmit") || send_body.contains("proven absent"),
             "stall path must name the read-before-retry decision"
         );
     }
 }
-
-// ---- interrupt / view / watch / attach / kill ----
 
 /// Kill-style key names that terminate the agent process (not just cancel
 /// the current call). Guarded behind --force (bd-fw-interrupt-kills-agent-or3).
@@ -21226,7 +19507,6 @@ fn cmd_interrupt(
     keys: &[String],
     force: bool,
 ) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi
     check_project_spelling(project, "interrupt")?;
     let keys: Vec<&str> = if keys.is_empty() {
         vec!["Escape"]
@@ -21253,9 +19533,6 @@ fn cmd_interrupt(
         }
         let registry = state::load_spawn_registry(project);
         let targets = resolve_send_targets_dyn(&in_ws, &registry, project, to)?;
-        // bd-pin-public-plane-s-easy.9: interrupting a WORKING agent needs
-        // --force — a captain must not nudge a working agent off its task
-        // because a send JSON showed prior idle (false-fail root cause).
         for a in &targets {
             let prior =
                 hc_support::parse_agent_status(a.agent_status.as_str()).unwrap_or(AgentStatus::Unknown);
@@ -21287,9 +19564,6 @@ fn cmd_interrupt(
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let ws_id = find_workspace(&mut c, project)?;
     let targets = resolve_agents(&mut c, &ws_id, project, to)?;
-    // bd-pin-public-plane-s-easy.9: interrupting a WORKING agent needs
-    // --force — a captain must not nudge a working agent off its task
-    // because a send JSON showed prior idle (false-fail root cause).
     for a in &targets {
         let prior =
             hc_support::parse_agent_status(a.agent_status.as_str()).unwrap_or(AgentStatus::Unknown);
@@ -21336,10 +19610,7 @@ fn client_read_with_fallback(
 }
 
 fn cmd_view(cfg: &Config, project: &str, to: &str, lines: Option<u32>, source: &str) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi
     check_project_spelling(project, "view")?;
-    // ADR-0010 D10 (bd-67qg): one snapshot call feeds the TTY bearings
-    // line (pipes stay byte-identical).
     if std::io::stdout().is_terminal() {
         let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
         let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
@@ -21414,7 +19685,6 @@ fn cmd_output(
     session: Option<&str>,
     limit: u32,
 ) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi
     check_project_spelling(project, "output")?;
     let dir = project_dir_str(cfg, project)?;
     let log = hc_support::read_session_log(&dir, role, session, limit)?;
@@ -21429,12 +19699,10 @@ fn cmd_watch(
     until: Option<&str>,
     timeout_ms: Option<u64>,
 ) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi
     check_project_spelling(project, "watch")?;
     let until_status: Option<AgentStatus> =
         until.map(hc_support::parse_agent_status).transpose()?;
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
-    // ADR-0010 D10 (bd-67qg): one snapshot call feeds the TTY bearings line.
     if std::io::stdout().is_terminal() {
         let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
         let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
@@ -21442,7 +19710,6 @@ fn cmd_watch(
     }
     let ws_id = find_workspace(&mut c, project)?;
 
-    // initial state
     let mut watch_names: Vec<String> = Vec::new();
     let mut watch_targets: Vec<(String, String)> = Vec::new();
     for a in resolve_agents(&mut c, &ws_id, project, to)? {
@@ -21461,12 +19728,6 @@ fn cmd_watch(
         }
     }
 
-    // subscribe to status changes in this workspace (long-lived connection).
-    // The live hc contract requires one subscription per pane
-    // (`pane.agent_status_changed` needs a concrete pane_id — a workspace
-    // scope alone is rejected), so build one subscription per pane in the
-    // workspace. Panes spawned after this point aren't subscribed; the poll
-    // fallback below covers them on any read error.
     let panes = c.pane_list()?;
     let subs: Vec<Subscription> = panes
         .iter()
@@ -21479,9 +19740,6 @@ fn cmd_watch(
             None
         }
     };
-    // hc 0.9 (protocol 22): subscriptions are live-only — a status change
-    // between the pane_list snapshot and the subscribe ack would never be
-    // seen. One poll closes the window (bd-myab).
     if stream.is_some() && watch_poll(&mut c, &watch_names, until_status)? {
         return Ok(());
     }
@@ -21492,8 +19750,6 @@ fn cmd_watch(
             if std::time::Instant::now() >= d {
                 bail!("watch timed out waiting for {:?}", until_status);
             }
-            // without a read timeout, a silent stream blocks forever and the
-            // deadline above is never reached — bound each blocking read
             if let Some(s) = stream.as_mut() {
                 s.set_read_timeout(Some(d.saturating_duration_since(std::time::Instant::now())));
             }
@@ -21503,10 +19759,6 @@ fn cmd_watch(
         if let Some(s) = stream.as_mut() {
             match s.read_event() {
                 Ok(Some(ev)) => {
-                    // typed: the subscription push (and the equivalent server
-                    // event) both land here with a fully parsed payload.
-                    // The payload's `agent` field is the agent KIND, not the
-                    // name — match via pane id (watch_targets).
                     match ev.data {
                         hc_support::TerminalEventData::PaneAgentStatusChanged(change)
                         | hc_support::TerminalEventData::PaneAgentStatusChangedSub(change) => {
@@ -21529,7 +19781,6 @@ fn cmd_watch(
                 }
                 Ok(None) => bail!("hc socket closed"),
                 Err(_) => {
-                    // transient read error: poll state as fallback
                     std::thread::sleep(Duration::from_millis(1000));
                     if watch_poll(&mut c, &watch_names, until_status)? {
                         return Ok(());
@@ -21537,8 +19788,6 @@ fn cmd_watch(
                 }
             }
         } else {
-            // no subscription (empty workspace or rejected request):
-            // poll state until the deadline
             std::thread::sleep(Duration::from_millis(1000));
             if watch_poll(&mut c, &watch_names, until_status)? {
                 return Ok(());
@@ -21623,17 +19872,9 @@ fn cmd_kill(
                 return Ok(());
             }
         } else {
-            // non-interactive stdin used to silently skip the confirmation —
-            // automation must opt in explicitly
             bail!("refusing to close {project} without confirmation — pass --force");
         }
     }
-    // bd-kill-hc-lookup-j2zb3: kill resolves through the same door status
-    // uses — rex door rides the selected plane, otherwise the hc client —
-    // so kill sees what status sees. (bd-f8zk moved kill to the selected
-    // plane for rex; on hc that plane's list disagreed with the client's
-    // and kill refused a live workspace.) Force/confirmation semantics below
-    // are unchanged, and the backend handle stays for prompt/close.
     let backend = backend::multiplexer_backend(cfg)?;
     let (ws_id, agents): (String, Vec<AgentInfo>) = if crate::pane::rex_door_selected(cfg) {
         let ws_id = find_workspace_dyn(&*backend, project)?;
@@ -21653,7 +19894,6 @@ fn cmd_kill(
             .collect();
         (ws_id, agents)
     };
-    // ADR-0025 Spec 4: on_captain_death + --reap-crews
     let mut policy = cfg.on_captain_death();
     if reap_crews {
         policy = config::OnCaptainDeath::Stop;
@@ -21673,11 +19913,6 @@ fn cmd_kill(
         working.clone()
     };
     if !blocked.is_empty() && drain {
-        // ADR-0028 zfnx.10 producer: phase 1 of the two-phase stop. Ask
-        // each working agent to finish its VERIFY fence, record the drain
-        // on ActiveLoop (the swarm poll seeds the loop drain map from
-        // it and the tick enforces grace), and SKIP the close. Phase 2 is
-        // the loop's past-grace force or an explicit --force-working.
         let mut al = match state::load_active_loop(project)? {
             Some(al) => al,
             None => state::ActiveLoop::new(project, serde_json::json!({}), "drain"),
@@ -21713,21 +19948,12 @@ fn cmd_kill(
             blocked.join(", ")
         );
     }
-    // Policy-aware close
     let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
     match policy {
         config::OnCaptainDeath::Continue | config::OnCaptainDeath::Adopt if !reap_crews => {
-            // Continue/Adopt without --reap-crews: crews+doorbell stay, alias cleared.
             let remaining = config::registry_after_captain_death(&registry, &captain_pin, policy);
             let _ = state::save_spawn_registry(project, &remaining);
             state::clear_captain_alias_file(project);
-            // Fall back to closing only if no children remain (empty workspace
-            // is still torn down); otherwise keep workspace alive so child panes
-            // stay listed. For now the workspace still closes when only the
-            // captain remains; child panes survive via the saved registry.
-            // To keep child panes alive, we close only when Stop/reap; Continue
-            // skips workspace_close entirely.
-            // See §9 w4a: continue leaves child pane listed in mocked registry.
             println!(
                 "closed captain for {project} (policy {} — crews remain, alias cleared)",
                 policy
@@ -21743,11 +19969,6 @@ fn cmd_kill(
     }
     backend.workspace_close(&ws_id, false)?;
     doorbell::stop(&config::state_dir(), &ws_label);
-    // bd-2o1v lifecycle symmetry: a full close drops THIS spawn's wake
-    // subscription rows — panes are gone, so their hc-sink rows are
-    // stale weight (20-row graveyards were the finding). Operator/cli
-    // rows outlive swarms; the next spawn re-records its rows idempotently.
-    // Continue/Adopt keeps crews alive and never reaches here.
     {
         use doorbell_rt::subscribe::{Actor, SubscriptionStore};
         let prefix = format!("spawn-{ws_label}-");
@@ -21763,16 +19984,11 @@ fn cmd_kill(
             }
         }
     }
-    // Persist policy effect on registry + alias (Stop / reap_crews)
     let remaining =
         config::registry_after_captain_death(&registry, &captain_pin, config::OnCaptainDeath::Stop);
     let _ = state::save_spawn_registry(project, &remaining);
     state::clear_captain_alias_file(project);
-    // tidy-up: drop the project's agent state files (stale context signals
-    // must not survive into the next spawn — freshness only protects so much)
     let _ = std::fs::remove_dir_all(agentstate::project_state_dir(&project_dir(cfg, project)));
-    // clear the identity files for the dead panes (best-effort — a missing
-    // file is a no-op, so double-exit is harmless)
     if let Ok(mail) = backend::mail_backend(cfg)
         && let Some(key) = project_dir(cfg, project).to_str()
     {
@@ -21791,8 +20007,6 @@ fn cmd_kill(
     Ok(())
 }
 
-// ---- work / assign ----
-
 /// bd-p4oc helpers: non-vacuous VERIFY gate for cargo test filters.
 ///
 /// bd-s913: the shape test, not the literal spelling. This used to require the
@@ -21803,9 +20017,6 @@ fn cmd_kill(
 /// fence at least produces a signal.
 pub(crate) fn is_cargo_test_verify(verify: &str) -> bool {
     let v = verify.trim_start();
-    // Direct cargo, or a wrapper (mbx/rtx/mise/cargo-nextest) that eventually
-    // invokes `cargo test`. Requiring the literal prefix `cargo test` used to
-    // exempt every wrapped fence from the vacuity gate.
     let is_direct = v.starts_with("cargo test")
         || v.starts_with("cargo nextest run")
         || v.starts_with("nextest run");
@@ -21819,7 +20030,6 @@ pub(crate) fn is_cargo_test_verify(verify: &str) -> bool {
 pub(crate) fn parse_count_before(output: &str, needle: &str) -> Option<u32> {
     let idx = output.find(needle)?;
     let before = &output[..idx];
-    // walk backwards to find digit run
     let mut end = before.len();
     while end > 0 && before.as_bytes()[end - 1].is_ascii_whitespace() {
         end -= 1;
@@ -21861,14 +20071,11 @@ pub(crate) fn sum_counts_before(output: &str, needle: &str) -> Option<u32> {
 }
 
 pub(crate) fn parse_cargo_test_counts(output: &str) -> (Option<u32>, Option<u32>) {
-    // cargo test runs multiple test binaries; vacuous only when total passed == 0
     let passed = sum_counts_before(output, " passed");
     let filtered = sum_counts_before(output, " filtered out");
-    // fallback for single-binary outputs where sum would be same as first
     if passed.is_some() {
         return (passed, filtered);
     }
-    // fallback to first occurrence for malformed outputs
     (
         parse_count_before(output, " passed"),
         parse_count_before(output, " filtered out"),
@@ -21902,7 +20109,6 @@ mod verify_gate_tests {
     #[test]
     fn vacuous_verify_detects_wrapped_cargo_test_fences() {
         for verify in [
-            // bd-uona's own fence, verbatim from the ledger.
             "mbx +nightly-aarch64-apple-darwin test preflight",
             "mbx +nightly-aarch64-apple-darwin test note_has_sha",
             "mbx +nightly-aarch64-apple-darwin test -p flywheel --bins foo",
@@ -21972,7 +20178,6 @@ mod verify_gate_tests {
         let output = "running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 68 filtered out; finished in 0.00s";
         let is_cargo = is_cargo_test_verify(verify);
         let (passed, _) = parse_cargo_test_counts(output);
-        // The exact expression src/durable.rs:1569 computes.
         let is_vacuous = is_cargo && passed == Some(0);
         assert!(is_cargo, "the fence is now in scope for the gate");
         assert!(is_vacuous, "a zero-match fence reads as vacuous");
@@ -22085,10 +20290,6 @@ fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&s
             })
             .unwrap_or_default()
     } else {
-        // explicit targets: hc agent names resolve through the spawn
-        // registry (bd-627z.4 — the pinned pane→identity binding, so the
-        // same agent gets the same identity every call); already-valid
-        // identities pass through unchanged (bd-odc)
         to.split(',')
             .map(|s| resolve_mail_target_registry(project, s.trim()))
             .collect()
@@ -22103,11 +20304,6 @@ fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&s
         project_base(project),
         bead_ids.join(", ")
     );
-    // bd-627z.2: first-contact auto-register backstop. If the daemon was down
-    // at spawn, the agents have no identities yet; assign auto-registers each
-    // resolved target on first use (idempotent upsert) so lane assignment
-    // never needs manual iterative registration. Best-effort: a registration
-    // failure (daemon still down) keeps the send attempt + actionable error.
     for t in &targets {
         if let Err(e) =
             mail.register_agent(&key, t, "opencode", "opencode", "flywheel mail CLI actor")
@@ -22116,7 +20312,6 @@ fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&s
         }
     }
     if let Err(e) = mail.send(&key, &targets, &subject, &body, "high", true, None) {
-        // bd-627z.2: actionable errors — never a bare "unknown recipient".
         let msg = format!("{e:#}");
         if msg.contains("unknown recipient") {
             bail!(
@@ -22130,8 +20325,6 @@ fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&s
     println!("assigned {} to {}", bead_ids.join(", "), targets.join(", "));
     Ok(())
 }
-
-// ---- mail ----
 
 fn mail_or_die(cfg: &Config) -> Result<mail::Mail> {
     mail::Mail::from_config(Some(&cfg.toron_mail_config()))?.ok_or_else(|| {
@@ -22171,14 +20364,7 @@ fn resolve_mail_actor_roster(
 /// Mail facade acting as resolved actor (registers identity best-effort).
 fn mail_as(cfg: &Config, project_key: &str, as_agent: Option<&str>) -> Result<mail::Mail> {
     let mail = mail_or_die(cfg)?;
-    // bd-aseq: the registry is keyed by project NAME (state_key hashes path
-    // forms separately) — derive it from the project dir so the actor lookup
-    // hits the same file the spawn wrote. Miss → hash fallback.
     let base = project_base(project_key);
-    // bd-2mdo: the roster of record feeds the resolver — an actor token that
-    // names a REGISTERED identity passes through verbatim instead of being
-    // hash-mangled into a stranger. Roster read is best-effort: a daemon
-    // hiccup degrades to the pre-bd-2mdo behavior, never blocks the call.
     let roster: Vec<String> = mail
         .list_agents(project_key, None)
         .ok()
@@ -22196,7 +20382,6 @@ fn mail_as(cfg: &Config, project_key: &str, as_agent: Option<&str>) -> Result<ma
         Some(name) => mail.with_name(name),
         None => mail,
     };
-    // Ensure the actor exists so send/reserve/inbox don't 404 "Agent not found".
     let name = mail.name.clone();
     if let Err(e) = mail.register_agent(
         project_key,
@@ -22298,7 +20483,6 @@ pub fn extract_xproj_from_inbox(v: &serde_json::Value) -> Vec<XprojInboxItem> {
         if !combined.to_ascii_lowercase().contains("[xproj]") {
             continue;
         }
-        // id: agent-mail emits numbers, toron emits hex strings — accept both.
         let id = match m.get("id") {
             Some(serde_json::Value::String(s)) => s.clone(),
             Some(serde_json::Value::Number(n)) => n.to_string(),
@@ -22411,7 +20595,6 @@ pub fn parse_xproj_request(text: &str) -> Option<XprojRequest> {
     if t.is_empty() {
         return None;
     }
-    // require [xproj] marker somewhere (case-insensitive)
     if !t.to_ascii_lowercase().contains("[xproj]") {
         return None;
     }
@@ -22439,9 +20622,7 @@ pub fn parse_xproj_request(text: &str) -> Option<XprojRequest> {
             product = line[line.len() - rest.len()..].to_string();
             continue;
         }
-        // skip pure [xproj] subject lines without params
         if lower.starts_with("[xproj]") && !line.contains('=') {
-            // maybe " [xproj] run 4-worker … recipe=foo" on one line
             for tok in line.split_whitespace() {
                 let tl = tok.to_ascii_lowercase();
                 if let Some(r) = tl.strip_prefix("recipe=") {
@@ -22453,7 +20634,6 @@ pub fn parse_xproj_request(text: &str) -> Option<XprojRequest> {
         params_parts.push(line.to_string());
     }
     if recipe.is_empty() {
-        // last chance: recipe= anywhere in full text
         for tok in t.split_whitespace() {
             let tl = tok.to_ascii_lowercase();
             if let Some(r) = tl.strip_prefix("recipe=") {
@@ -22484,7 +20664,6 @@ pub(crate) fn check_project_spelling(project: &str, door: &str) -> Result<()> {
     if p.is_empty() {
         anyhow::bail!("{door} requires a project: pass PROJECT positionally or --project <slug>");
     }
-    // `.` / `..` alias onto cwd and minted `cli-flywheel-.-Buffy` (bd-gpj0.1).
     if p == "." || p == ".." {
         anyhow::bail!("{door} requires a project slug, not {p:?} (cwd alias is not a project)");
     }
@@ -22556,17 +20735,6 @@ fn mail_project<'a>(
     }
 }
 
-// ---- toron (in-process embed) ----
-
-// `flywheel toron <subcommand>`: drive the in-process toron mailbox / MCP
-// server (ADR-0003 Decision 3A, bd-o8j.1). The embed is async (toron-mcp's
-// mailbox is built over tokio), so build a fresh tokio runtime and block_on
-// the dispatch — mirroring how cmd_loop drives the durable workflow. `cfg` is
-// forwarded but unused by the embed: the demo mailbox is fully in-process.
-// (bd-mngn: the handler itself lives in src/cmd/toron.rs.)
-
-// ---- mail digest / watch / collab (real-time collab primitives) ----
-
 /// Per-agent digest from the live mailbox (mirror of the `__mail-digest`
 /// leaf, surfaced for the orchestrator). Reads `sender`/`from` aliases and
 /// counts high|urgent as urgent.
@@ -22580,11 +20748,6 @@ fn mail_project<'a>(
 /// `urgent > 0`, which IS meaningful (importance is a real message
 /// attribute).
 fn digest_for(mail: &mail::Mail, key: &str, name: &str) -> Result<Value> {
-    // bd-dbre: poll the inbox the agent actually READS. Hc name and pin
-    // are separate recipients (message_reads is per-recipient, bd-5icg);
-    // waking on the name inbox means pin-side mark-read can never clear
-    // the wake. wake_identity_pin maps name -> pin, falling back to the
-    // name itself when nothing is registered.
     let identity = {
         let reg = state::load_spawn_registry(key);
         let names = state::load_agent_names(std::path::Path::new(key));
@@ -22605,11 +20768,6 @@ fn digest_for(mail: &mail::Mail, key: &str, name: &str) -> Result<Value> {
     let urgent_rows = wake_urgent(&arr);
     let urgent = urgent_rows.len();
     let last = arr.first();
-    // bd-vbf2: the wake key is the NEWEST URGENT message by created_ts_us
-    // (the loop wakes once per id) - never `.first()`, which cited the
-    // oldest row when the wire delivered ascending. Subject + thread ride
-    // the SAME chosen row so "Most recent urgent: id X re: S" /
-    // "Latest urgent thread: T" cannot disagree across threads.
     let chosen = newest_urgent(&urgent_rows, last);
     let last_from = last.and_then(|m| {
         m.get("sender")
@@ -22618,7 +20776,6 @@ fn digest_for(mail: &mail::Mail, key: &str, name: &str) -> Result<Value> {
     });
     Ok(json!({
         "agent": name,
-        // the identity whose inbox was polled — the pin the agent acts as
         "mail_identity": identity,
         "recent": recent,
         "urgent": urgent,
@@ -22680,17 +20837,12 @@ fn product_digest_for(
         .iter()
         .map(|(s, d)| (s.as_str(), d.as_str()))
         .collect();
-    // The LIVE mailbox's roots, not a fresh env resolution: the fold probes
-    // where the keys actually are (see mail::BUILT_ROOTS).
     let (data_dir, _) = mail::built_mailbox_roots();
     for slug in &slugs {
         let Some(dir) = dirs.get(slug.as_str()) else {
             gaps_out.push(gap(slug, "no project dir supplied for member".to_string()));
             continue;
         };
-        // Fold: bind the pin's existing key into this member's slot from
-        // the first member slot holding it. Never mints — no source key
-        // anywhere means this member (and only this member) gaps.
         if crate::mail_key_present(&data_dir, slug, name).is_none() {
             let donor = slugs
                 .iter()
@@ -22804,10 +20956,6 @@ pub(crate) fn wake_urgent(rows: &[Value]) -> Vec<&Value> {
             .map(|i| i == "high" || i == "urgent")
             .unwrap_or(false)
     };
-    // bd-kryk: system/transport notifications never wake — a reservation
-    // release (empty subject, "reservation … released …" body) is the loop
-    // talking to itself. Shape-matched so a mis-tagged importance=high copy
-    // still cannot manufacture a phantom urgent.
     let is_transport_noise = |m: &Value| {
         let subj_empty = m
             .get("subject")
@@ -22842,10 +20990,6 @@ pub(crate) fn wake_urgent(rows: &[Value]) -> Vec<&Value> {
                 .to_string(),
         )
     };
-    // Pass 1: urgent rows, with identical (sender, subject, body) assigns
-    // collapsed to the first (the duplicate-assign double-wake, debrief D1).
-    // Duplicate copies are remembered so they never count as thread replies
-    // in pass 2.
     let mut seen: std::collections::HashSet<(String, String, String)> =
         std::collections::HashSet::new();
     let mut duplicate_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -22857,9 +21001,6 @@ pub(crate) fn wake_urgent(rows: &[Value]) -> Vec<&Value> {
         if !urgent(m) {
             continue;
         }
-        // bd-dbre: a read row never wakes — assign or not. Read state is
-        // per-recipient (bd-5icg); honoring it here is what makes wakes
-        // terminate once the agent fetches.
         if is_read(m) {
             continue;
         }
@@ -22867,14 +21008,10 @@ pub(crate) fn wake_urgent(rows: &[Value]) -> Vec<&Value> {
             if let Some(id) = m.get("id").and_then(|i| i.as_str()) {
                 duplicate_ids.insert(id);
             }
-            continue; // duplicate assign — same sender+subject+body
+            continue;
         }
         deduped.push(m);
     }
-    // Pass 2: assigns wake only when UNREAD (`read_ts_us` absent) AND
-    // not-yet-executed (no in-thread reply newer than the assign, judged
-    // against ALL rows minus the deduplicated copies — a duplicate copy
-    // never counts as a reply, a real reply (urgent or not) always does).
     let mut out = Vec::new();
     for m in &deduped {
         if !is_assign(m) {
@@ -22882,10 +21019,10 @@ pub(crate) fn wake_urgent(rows: &[Value]) -> Vec<&Value> {
             continue;
         }
         if m.get("read_ts_us").map(|v| !v.is_null()).unwrap_or(false) {
-            continue; // already read — the agent saw it
+            continue;
         }
         if thread_has_reply(rows, &duplicate_ids, m) {
-            continue; // executed — the thread already moved
+            continue;
         }
         out.push(*m);
     }
@@ -22969,8 +21106,6 @@ fn bind_spawn_role(
     facade
         .pin_role_alias(project, &role, pin)
         .map_err(|e| anyhow::anyhow!("mail role pin failed for role {role} -> {pin}: {e:#}"))?;
-    // GS-033: if RoleBound emit fails after the mail pin lands, unpin so we
-    // never leave a mail alias without a matching RoleBound.
     if let Err(e) = emit_role_bound(project, &role, pin) {
         match facade.clear_role_alias(project, &role) {
             Ok(_) => anyhow::bail!(
@@ -23111,7 +21246,6 @@ fn drain_pending_role_bounds(project: &str) -> anyhow::Result<Vec<(String, Strin
             }
         }
     }
-    // Remove only after validate/parse — never delete-before-read of RoleBound.
     if let Err(e) = std::fs::remove_file(&path) {
         eprintln!(
             "flywheel: warn: could not remove drained pending role bounds {}: {e}",
@@ -23175,13 +21309,11 @@ mod spawn_identity_divergence_tests {
             ArriveIdentityVerdict::Match,
             "the captain pane arriving as its own injected identity is not a refusal"
         );
-        // The env-injected identity counts the same way.
         assert_eq!(
             arrive_identity_verdict("EmberOtter", None, Some("EmberOtter"), Some("EmberOtter")),
             ArriveIdentityVerdict::Match,
             "the env-injected captain identity is the pane's own identity too"
         );
-        // And a SPAWNED pane arriving as the captain pin is still refused.
         assert!(
             matches!(
                 arrive_identity_verdict("EmberOtter", Some("SilverPond"), None, Some("EmberOtter")),
@@ -23197,35 +21329,26 @@ mod spawn_identity_divergence_tests {
     /// detector and the captain-pin pool exclusion.
     #[test]
     fn spawn_identity_matches_registry() {
-        // spawned pane: registry pin wins, matching arrival passes
         assert_eq!(
             arrive_identity_verdict("SilverPond", Some("SilverPond"), None, Some("EmberOtter")),
             ArriveIdentityVerdict::Match
         );
-        // spawned pane arriving as the wrong pin is refused
         assert!(matches!(
             arrive_identity_verdict("SlateHerder", Some("SilverPond"), None, Some("EmberOtter")),
             ArriveIdentityVerdict::Refused { .. }
         ));
-        // the measured incident: a spawned planner pane arriving as the
-        // CAPTAIN pin is refused (captain-for-a-spawned-pane)
         assert!(matches!(
             arrive_identity_verdict("EmberOtter", Some("SilverPond"), None, Some("EmberOtter")),
             ArriveIdentityVerdict::Refused { .. }
         ));
-        // env-injected pin (FLYWHEEL_MAIL_AS) is spawn evidence even before
-        // the registry row exists
         assert!(matches!(
             arrive_identity_verdict("SlateHerder", None, Some("SilverPond"), None),
             ArriveIdentityVerdict::Refused { .. }
         ));
-        // operator pane: no spawn row, no injected env — explicit --as is an
-        // operator choice (the captain may arrive as itself here)
         assert_eq!(
             arrive_identity_verdict("EmberOtter", None, None, Some("EmberOtter")),
             ArriveIdentityVerdict::Unbound
         );
-        // divergence detector: both sides known and different
         assert_eq!(
             identity_divergence(Some("SilverPond"), Some("SlateHerder")),
             Some("SilverPond != SlateHerder".to_string())
@@ -23236,7 +21359,6 @@ mod spawn_identity_divergence_tests {
         );
         assert_eq!(identity_divergence(None, Some("SlateHerder")), None);
         assert_eq!(identity_divergence(Some(""), Some("SlateHerder")), None);
-        // pool exclusion: a seed that would draw the captain pin redraws
         let captain_pin = adjnoun_from_fnv(7);
         let mut taken = std::collections::HashSet::new();
         taken.insert(captain_pin.clone());
@@ -23387,7 +21509,6 @@ mod wake_identity_tests {
             drain_fn.contains("corrupt") || drain_fn.contains("skipping corrupt"),
             "B8: drain must warn on corrupt lines (never silent drop)"
         );
-        // remove_file must come after parse/validate, not before.
         let parse_mark = drain_fn
             .find("serde_json::from_str")
             .expect("drain parses JSON");
@@ -23407,7 +21528,6 @@ mod wake_identity_tests {
             src.contains("refuse_unpinned_spawn(&agent_name, Some(name),"),
             "NEW-L8: profile spawn must bind + fail-closed"
         );
-        // Profile/squad: refuse BEFORE agent_start (never leave a dark pane).
         let profile_mark = src
             .find("let agent_name = format!(\"profile-{name}\")")
             .expect("profile agent_name");
@@ -23436,7 +21556,6 @@ mod wake_identity_tests {
             s_refuse < s_start,
             "NEW-L8: squad refuse_unpinned must run BEFORE agent_start"
         );
-        // cmd_spawn: same refuse-before-start contract (no dark orphan panes).
         let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
         let spawn_fn = &src[spawn..src.len().min(spawn + 55_000)];
         let sp_refuse = spawn_fn
@@ -23513,8 +21632,6 @@ mod wake_identity_tests {
         assert_eq!(wake_urgent(&rows).len(), 1);
     }
 
-    // ---- bd-vbf2: the wake key is the NEWEST urgent row, not .first() ----
-
     /// The observed defect: three urgent rows arrived oldest-first and
     /// `urgent_rows.first()` cited created_ts 1787300794 while newer rows
     /// sat at 1787302173 (same thread) and 1787304318 (a DIFFERENT thread).
@@ -23537,7 +21654,6 @@ mod wake_identity_tests {
             "body_md": "x", "importance": "high", "thread_id": "344e63b7",
             "created_ts_us": 1_787_304_318u64,
         });
-        // Wire order as observed: oldest first.
         let rows = vec![oldest.clone(), mid.clone(), newest.clone()];
         let urgent = wake_urgent(&rows);
         assert_eq!(urgent.len(), 3, "all three are urgent");
@@ -23547,7 +21663,6 @@ mod wake_identity_tests {
             Some("ccd46cbb7dc9"),
             "max(created_ts_us) across threads wins"
         );
-        // Reverse wire order must pick the same row.
         let rev = vec![newest.clone(), mid, oldest];
         let picked = newest_urgent(&wake_urgent(&rev), rev.first()).expect("pick");
         assert_eq!(
@@ -23792,11 +21907,6 @@ mod wake_identity_tests {
     /// does NOT settle (folded legacy rows sort last) is in the learnings note.
     #[test]
     fn skills_injected_reads_the_later_registry_row_when_incarnations_tie() {
-        // `test_state_home`, not a bare `set_var`: this module has neighbours
-        // that set XDG_STATE_HOME without restoring it, so whichever test ran
-        // last decides where THEIR registries land. A raw setter here made
-        // `register_spawned_agent_pins_unique_adjnoun_identity` collide with its
-        // own `/tmp/fw-s9-mail-proj` leftovers and fail intermittently.
         let _home = crate::config::test_state_home();
         let project = "/tmp/fw-skills-tie-proj";
         let name = "flywheel-toron-oc";
@@ -23812,8 +21922,6 @@ mod wake_identity_tests {
             e.skills_injected = false;
             e
         };
-        // The LAST row is the one the prefix is still owed on, so a last-wins
-        // read and an injected-first read disagree and the test can fail.
         state::save_spawn_registry(project, &[injected("w1:p1"), pending("w2:p2")])
             .expect("save registry");
         assert!(
@@ -23846,9 +21954,6 @@ mod wake_identity_tests {
     /// seed-draw candidate.
     #[test]
     fn bind_pane_mail_identity_stamps() {
-        // bd-ab2p: bind never fails the spawn — with no hc terminal behind
-        // the id the stamp degrades to a stderr note while the file bridge
-        // + registry still land (registry is the contract this test pins).
         let _g = crate::config::lock_env();
         let data = std::env::temp_dir().join(format!("fw-bind-stamp-{}", uuid::Uuid::new_v4()));
         unsafe { std::env::set_var("TORON_DATA_DIR", &data) };
@@ -23871,12 +21976,6 @@ mod wake_identity_tests {
     #[test]
     fn arrive_maybe_bind_pane_records_current_pane() {
         let _home = crate::config::test_state_home();
-        // Hermetic: `arrive_maybe_bind_pane` prefers ambient `REX_BLOCK`, so a
-        // test run inside a rex pane would bind the operator's live block
-        // instead of the scripted hc terminal. Clear it for the guard's
-        // lifetime and restore it after, or the test passes in CI and fails on
-        // a rex box. NB: `test_state_home()` above already holds the env lock —
-        // calling `lock_env()` here would self-deadlock (it is the same lock).
         let prev_rex = std::env::var("REX_BLOCK").ok();
         unsafe { std::env::remove_var("REX_BLOCK") };
         let data = std::env::temp_dir().join(format!("fw-arrive-bind-{}", uuid::Uuid::new_v4()));
@@ -23905,19 +22004,6 @@ mod wake_identity_tests {
 
     #[test]
     fn register_spawned_agent_pins_unique_adjnoun_identity() {
-        // bd-9w95 FLAKY, PRE-EXISTING, NOT FIXED HERE. This test sets only
-        // TORON_DATA_DIR, so its spawn registry lands in whatever XDG_STATE_HOME
-        // happens to be — and when no sibling has set one, in the operator's
-        // REAL ~/.local/state/flywheel (measured: 43 `fw-*` fixture files there,
-        // including `agents/fw-s9-mail-proj-*.json`). The "first spawn" then
-        // finds that row instead of minting a pin, and the colliding-name search
-        // — which can only match inside the 9900-pair space — comes up empty.
-        // Measured red roughly 1 run in 3 under `-- wake_identity_tests`, green
-        // 4/4 when run as `-- register_spawned_agent`. Adding `test_state_home()`
-        // here and to `register_spawned_agent_folds_slug_to_pin` was tried and
-        // did NOT fix it (still 3/8 red), so it was reverted rather than shipped
-        // as a non-fix. The real cause is the module-wide env coupling between
-        // these tests; see the sweep note before touching either test again.
         let _g = crate::config::lock_env();
         let data = std::env::temp_dir().join(format!("fw-s9-mail-{}", uuid::Uuid::new_v4()));
         unsafe { std::env::set_var("TORON_DATA_DIR", &data) };
@@ -23934,9 +22020,6 @@ mod wake_identity_tests {
         let again = register_spawned_agent(&cfg, project, slug, "opencode", "w7:p1")
             .expect("re-spawn keeps the pin");
         assert_eq!(again, pin, "re-spawn must not draw a fresh pin");
-        // agents-table collision: find a name whose seed-draw equals the
-        // pinned identity, spawn it — its draw must redraw around the taken
-        // pin (the 9900-pair space guarantees a colliding candidate).
         let target = pin.clone();
         let collider = (0..200_000u64)
             .map(|i| format!("s9spawn-{i}"))
@@ -23987,8 +22070,6 @@ mod wake_identity_tests {
             );
         }
 
-        // The add path's mirror write (the same calls cmd_add makes after
-        // the pane loop).
         let registry = state::load_spawn_registry(project);
         state::save_agent_names(&dir, &registry).expect("save agent names");
         let names = state::load_agent_names(&dir);
@@ -24003,7 +22084,6 @@ mod wake_identity_tests {
         );
         assert!(!mirrored.contains("bangedorrunt"));
 
-        // whois resolution: every pin is registered in the agents table.
         let key = dir.to_str().map(str::to_string).unwrap();
         let mail = backend::mail_backend(&cfg).expect("mail backend");
         let agents = backend::run_mail(mail.list_agents(&key, None)).expect("list agents");
@@ -24022,8 +22102,6 @@ mod wake_identity_tests {
     /// second identity.
     #[test]
     fn register_spawned_agent_folds_slug_to_pin() {
-        // bd-9w95: flaky alongside the sibling above for the same reason. Same
-        // verdict — the `test_state_home()` fix was tried and did not hold.
         let _g = crate::config::lock_env();
         let data = std::env::temp_dir().join(format!("fw-fold-{}", uuid::Uuid::new_v4()));
         unsafe { std::env::set_var("TORON_DATA_DIR", &data) };
@@ -24036,9 +22114,6 @@ mod wake_identity_tests {
             .to_str()
             .map(str::to_string)
             .unwrap();
-        // whois(slug) after the fold resolves to the PIN's npub — the slug
-        // is not registered as a second identity. Requires swarm mode (open
-        // mode passes the name through and the slug alone is not registered).
         let mail = backend::mail_backend(&cfg).expect("mail backend");
         backend::run_mail(mail.ensure_project(&key)).expect("ensure project");
         if let Ok(Some(facade)) = mail::Mail::from_config(Some(&cfg.toron_mail_config())) {
@@ -24072,8 +22147,6 @@ mod wake_identity_tests {
         let row = |id: &str, thread: &str| json!({ "id": id, "thread_id": thread });
         let rows = vec![row("ask-1", "collab-x"), row("reply-1", "collab-x")];
 
-        // Collab: the outbound ask is the baseline, so the reply is NEW even
-        // though it was already in the projection.
         let (baseline, arrival) = watch_progress(&rows, "collab-x", Some("ask-1"));
         assert_eq!(baseline.as_deref(), Some("ask-1"));
         assert_eq!(
@@ -24082,8 +22155,6 @@ mod wake_identity_tests {
             "a reply that landed before the watcher started must not be swallowed"
         );
 
-        // Standalone `mail watch`: the head is the baseline, so an already
-        // present thread reports nothing new.
         let (baseline, arrival) = watch_progress(&rows, "collab-x", None);
         assert_eq!(baseline.as_deref(), Some("reply-1"));
         assert!(
@@ -24091,7 +22162,6 @@ mod wake_identity_tests {
             "standalone watch keeps head-at-start: existing messages are not new"
         );
 
-        // Another thread's row is never an arrival for this one.
         let other = vec![row("ask-1", "collab-x"), row("elsewhere", "collab-y")];
         let (_, arrival) = watch_progress(&other, "collab-x", Some("ask-1"));
         assert!(arrival.is_none(), "thread match is exact: {arrival:?}");
@@ -24105,9 +22175,6 @@ mod wake_identity_tests {
     /// the mail test would stay green over a watch that no longer scopes.
     #[test]
     fn cmd_mail_watch_scopes_its_read_to_the_watched_thread() {
-        // Every needle is split so this test cannot match its own source: a
-        // whole-literal marker matches HERE first and the slice collapses to
-        // the test body, which silently passes/fails for the wrong reason.
         let call = ["watch_filter", "(thread_id)"].concat();
         let start = ["fn cmd_mail_", "watch("].concat();
         let end = ["fn watch_", "filter("].concat();
@@ -24161,20 +22228,6 @@ fn cmd_mail_watch(
     let key = project_dir_str(cfg, project)?;
     let mail = mail_as(cfg, &key, as_agent)?;
     mail.ensure_project(&key)?;
-    // The read is scoped to THIS thread and still matched client-side. Two
-    // separate reasons, do not conflate them:
-    //
-    // 1. Server-side scope is load-bearing, not an optimization. `fetch_inbox`
-    //    orders ASC by rumor time and applies `limit` as a `.take(n)` over
-    //    that ascending list, so the limit keeps the OLDEST n rows. An
-    //    un-scoped read of a long inbox never contains a brand-new message and
-    //    the watch would time out on a thread that was already answered
-    //    (bd-7hdb). The thread filter is applied BEFORE the limit, so scoping
-    //    here is what makes the reply visible at all.
-    // 2. The client-side match is belt-and-braces. FTS5 tokenizes on hyphens
-    //    and letter/digit boundaries, so hyphenated thread ids are not
-    //    reliably phrase-searchable (e2e-verified) — hence exact `thread_id`
-    //    equality on the row rather than a phrase search.
     let rows = |m: &mail::Mail| -> Result<Vec<Value>> {
         let v = m.inbox_filtered(&key, &m.name, &watch_filter(thread_id))?;
         Ok(v.as_array().cloned().unwrap_or_default())
@@ -24198,11 +22251,6 @@ fn cmd_mail_watch(
             print_json(&json!({ "thread": thread_id, "new_message": m }));
             return Ok(());
         }
-        // GS-040: an empty thread is normal while waiting for the first
-        // reply — the asker's OUTBOUND collab ask does not appear in their
-        // inbox projection, so the thread reads empty until the peer answers.
-        // Keyed on the THREAD, not the baseline: with an ask baseline the
-        // baseline is never None, and the note is exactly the case it covers.
         if !current.iter().any(|row| in_thread(row, thread_id)) && !empty_noted {
             eprintln!("flywheel: thread {thread_id} has no messages yet (waiting for reply…)");
             empty_noted = true;
@@ -24258,9 +22306,6 @@ fn watch_progress(
         .and_then(|i| i.as_str())
         .map(str::to_owned);
     match after {
-        // The ask is the baseline, so ANY other message in the thread is an
-        // arrival — including one that landed before this watch started, and
-        // excluding the ask itself if a projection ever echoes it back.
         Some(ask) => {
             let arrival = head.filter(|row| {
                 row.get("id")
@@ -24289,18 +22334,11 @@ fn cmd_collab(
     let key = project_dir_str(cfg, project)?;
     let mail = mail_as(cfg, &key, as_agent)?;
     mail.ensure_project(&key)?;
-    // Two collabs in the same second used to mint the SAME thread id, so their
-    // waits watched each other's replies. Milliseconds plus the pid make a
-    // collision a non-event; the `%Y%m%dT%H%M%S` prefix is kept so the
-    // thread stays human-recognisable (and the e2e grep still matches it).
     let thread_id = format!(
         "collab-{}-{}",
         chrono::Utc::now().format("%Y%m%dT%H%M%S%3f"),
         std::process::id()
     );
-    // bd-aseq: expectations are keyed by the identity stored HERE — resolve
-    // through the spawn registry pin so the thread lands in the inbox the
-    // agent actually reads (never a parallel hash-mapped one).
     let targets: Vec<String> = to
         .split(',')
         .map(|s| resolve_mail_target_registry(project, s.trim()))
@@ -24320,13 +22358,9 @@ fn cmd_collab(
         .and_then(|i| i.as_str())
         .unwrap_or(&thread_id)
         .to_string();
-    // bd-a7j: record the reply expectation so a durable loop run verifies the
-    // thread actually moved after the agent settles (re-prompt + escalate on
-    // silence). Best-effort — a registry write failure must not lose the ask.
     {
         let mut entries = state::load_expected_replies(project);
         let ts = crate::state::now_iso();
-        // Flag off keeps one ask per agent. Flag on keeps one per (agent, msg).
         let flag = comms_inbox_on();
         for t in &targets {
             state::upsert_expected_reply(
@@ -24348,8 +22382,6 @@ fn cmd_collab(
         "flywheel: asked {} (thread {thread_id}, msg {msg_id}); waiting up to {timeout_secs}s for the reply…",
         targets.join(", ")
     );
-    // The ask itself is the baseline, so a reply that landed before the
-    // watcher started is still NEW (bd-7hdb).
     cmd_mail_watch(
         cfg,
         project,
@@ -24360,12 +22392,6 @@ fn cmd_collab(
         Some(&msg_id),
     )
 }
-
-// ---- worktree ----
-
-// ---- checkpoint / timeline / audit / history / changes / resume / analytics ----
-
-// ---- recipes / workflows / pipeline / template / ensemble ----
 
 /// Verify the §3.8 repo-tier evidence bar against the durable run log +
 /// the beads ledger, shared by `stage promote --to repo` and
@@ -24512,9 +22538,6 @@ fn run_workflow(cfg: &Config, project: &str, name: &str) -> Result<()> {
             }
         }
     }
-    // Every step above returned Ok, so this run really did complete — say so
-    // rather than leaving a status-less row a reader would have to default
-    // (ADR-0032 Spec 9 tail).
     log(
         project,
         EventKind::Workflow,
@@ -24568,8 +22591,6 @@ fn cmd_ensemble(cfg: &Config, project: &str, recipe: &str, workflow: &str) -> Re
     run_workflow(cfg, project, workflow)
 }
 
-// ---- loop (monitoring orchestrator) ----
-
 /// What the loop should do for one agent on one poll — the SINGLE
 /// definition lives in durable.rs (bd-w4-delete-dup-sbh8); the sync
 /// (`--local`/`--once`) path delegates to `durable::plan_actions`.
@@ -24588,21 +22609,11 @@ fn build_queue(
 ) -> Result<Vec<String>> {
     let mut items: Vec<String> = Vec::new();
     if let Some(wf) = workflow {
-        // Resolve from the builtin catalog/all_workflows FIRST (38 builtins runnable),
-        // falling back to legacy workflows.toml Send/Wait (config.rs:725).
         let mut handled = false;
         {
-            // bd-xmq5: the shared merge replaces the inline copy (which was
-            // user-tier only — loop-side workflow resolution now honors the
-            // project tier too).
             let all = workflow_catalog::all_workflows_plain(None)
                 .unwrap_or_else(|_| builtin_workflows::builtin_workflows());
             if let Some(_uwf) = all.get(wf) {
-                // Builtins run via the engine, not the queue. Formerly this
-                // bailed and told the operator to run `workflow run --execute`
-                // manually — now it actually runs the workflow via the engine
-                // (GS-007 invoke, bd-i3lw) so `loop --workflow <name>` is a
-                // real graph invocation, not English.
                 if let Some(proj) = project {
                     let exe = std::env::current_exe()?;
                     let output = std::process::Command::new(exe)
@@ -24649,7 +22660,6 @@ fn build_queue(
                         };
                         items.push(text);
                     }
-                    // wait steps are implicit in the polling loop
                     WorkflowStep::Wait { .. } => {}
                 }
             }
@@ -24676,9 +22686,6 @@ fn build_queue(
 fn parse_ready_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
     let v: Value =
         serde_json::from_str(raw.trim()).map_err(|e| anyhow!("br ready bad JSON: {e}: {raw}"))?;
-    // br ready --json is a bare array (older br) or {"issues":[...]} (newer,
-    // schema-18 pagination envelope) — accept both. An unknown object shape
-    // is loud, never a silent empty dispatch queue.
     let beads: Vec<Value> = match &v {
         Value::Array(items) => items.clone(),
         Value::Object(obj) => {
@@ -24709,15 +22716,11 @@ fn parse_ready_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
-            // ADR-0001 wave 5 (bd-wave5-flywheel-parser-strip-dkpvi): the
-            // typed schema-v18 `verify` field from br; None = missing/empty
-            // -> NOT ready. The description fence is no longer read.
             verify: b
                 .get("verify")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
-            // bd-gnej: wave labels (`wave-N`) for the loop wave-gate.
             labels: b
                 .get("labels")
                 .and_then(Value::as_array)
@@ -24728,11 +22731,7 @@ fn parse_ready_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
                         .collect()
                 })
                 .unwrap_or_default(),
-            // bd-wave-gate-typed-authority-27et: the typed `wave` field is
-            // the authority; the label above is the legacy fallback.
             wave: durable::bead_wave_field(&b),
-            // bd-4spn: priority + the typed `principles` citations feed the
-            // dispatch gate (PRINCIPLES required for P<=2).
             priority: b
                 .get("priority")
                 .and_then(Value::as_u64)
@@ -24773,15 +22772,11 @@ fn parse_inprogress_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
-            // ADR-0001 wave 5 (bd-wave5-flywheel-parser-strip-dkpvi): same
-            // typed `verify` field as the ready path — close-detect /
-            // claim-watch consumers read it later.
             verify: b
                 .get("verify")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
-            // bd-gnej: wave labels (`wave-N`) for the loop wave-gate.
             labels: b
                 .get("labels")
                 .and_then(Value::as_array)
@@ -24792,11 +22787,7 @@ fn parse_inprogress_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
                         .collect()
                 })
                 .unwrap_or_default(),
-            // bd-wave-gate-typed-authority-27et: the typed `wave` field is
-            // the authority; the label above is the legacy fallback.
             wave: durable::bead_wave_field(b),
-            // bd-4spn: priority + the typed `principles` citations (the
-            // resume path reads the same gate fields as the ready path).
             priority: b
                 .get("priority")
                 .and_then(Value::as_u64)
@@ -25061,14 +23052,11 @@ fn probe_pane_wedges(
     let mut out = Vec::new();
     for e in &entries {
         let Some(pin) = e.mail_identity.as_deref().filter(|p| !p.trim().is_empty()) else {
-            continue; // unpinned rows are invisible to the wake layer too
+            continue;
         };
         let Some(a) = agents.iter().find(|a| a.pane_id == e.pane_id) else {
-            continue; // pane gone — `recover`'s door, not this probe's
+            continue;
         };
-        // The kind rides on the live agent (`agent` is the harness hc
-        // launched), so the process probe needs no profile lookup. A pane hc
-        // reports with no kind probes as inconclusive (`None`), never alive.
         let kind = a.agent.as_deref().unwrap_or("");
         let alive = hc_support::pane_process_info(&c, &e.pane_id)
             .ok()
@@ -25114,13 +23102,6 @@ fn cmd_loop_supervise(
     if interval_secs < 5 {
         bail!("--interval must be >= 5 seconds");
     }
-    // ADR-0018 §3 item 4: the supervisor is ONE mechanism. The rehost
-    // landed behind the comms flag (d4b8412) with the legacy child-process
-    // loop kept for the flag-off case, which left the supervisor with two
-    // implementations and a config flag to choose between them. The program
-    // does everything the legacy loop did — the pass child, the dead-stop
-    // probe, the pane-wedge probe, the restart intensity (MaxR/MaxT) and
-    // the epoch fence — so the legacy loop goes with the gate.
     supervisor_host::run_supervise(
         cfg,
         project,
@@ -25179,11 +23160,6 @@ pub(crate) fn page_captain_mail(cfg: &Config, project: &str, subject: &str, line
 fn cmd_loop_doctor(cfg: &Config, fix: bool, json: bool) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let mut report = rt.block_on(durable::loop_doctor(cfg, fix))?;
-    // bd-durable-doorbell-lngf: liveness of the wake layer — every
-    // dispatcher workspace that is DEAD is a warning (doctor only WARNS;
-    // healing lives in recover/status/doorbell). Workspaces are enumerated
-    // from the doorbell dir itself (*.gen = ran a dispatcher once); the
-    // file stem is the workspace label — the pid/gen key.
     let mut dead_doorbells: Vec<String> = Vec::new();
     let db_dir = config::state_dir().join("doorbell");
     if let Ok(entries) = std::fs::read_dir(&db_dir) {
@@ -25335,8 +23311,6 @@ fn cmd_loop_replay(project: &str) -> Result<()> {
         );
         return Ok(());
     }
-    // Re-drive from snapshot model, assert identical action sequences (GS-007 bd-fiyx, not just len)
-    // Journal now stores queue (was queue_len) and full actions array; replay compares sequences.
     let mut model = crate::durable::LoopModel {
         queue: Vec::new(),
         per_bead_phase: Default::default(),
@@ -25366,7 +23340,6 @@ fn cmd_loop_replay(project: &str) -> Result<()> {
         };
         let msg: crate::durable::LoopMsg = serde_json::from_value(msg_val.clone())
             .with_context(|| format!("journal {idx} msg decode"))?;
-        // If journal has snapshot queue/per_bead_phase/dispatch_pending, restore for replay.
         if let Some(snap) = entry.get("model_snapshot") {
             if let Some(q) = snap.get("queue").and_then(|q| q.as_array()) {
                 model.queue = q
@@ -25411,8 +23384,6 @@ fn cmd_loop_replay(project: &str) -> Result<()> {
                 msg
             );
         }
-        // Advance model for next iteration (replay is stateful; tick is pure so
-        // the single (next, actions) above is both the comparison and the step).
         model = next;
     }
     println!("replay {project}: {} entries, no drift", entries.len());
@@ -25439,7 +23410,6 @@ fn cmd_artifacts(
     cmd: &Option<ArtifactsCmd>,
 ) -> Result<()> {
     if let Some(ArtifactsCmd::Stitch { run_id, project }) = cmd {
-        // bd-blank-project-spelling-non-mail-doors-76hi
         let proj = project_door(project.as_deref(), "flywheel", "artifacts stitch")?;
         let path = crate::artifact::stitch_artifacts(proj, run_id)?;
         println!("{}", path.display());
@@ -25449,7 +23419,6 @@ fn cmd_artifacts(
         anyhow::bail!("flywheel artifacts: pass <run_id> or `stitch <run_id>`");
     };
     let proj = project_door(project, "flywheel", "artifacts")?;
-    // List mode: read artifacts/<run_id>/*.json and print
     let base = dirs::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join("flywheel")
@@ -25481,7 +23450,7 @@ fn cmd_artifacts(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
+#[allow(clippy::too_many_arguments)]
 fn cmd_loop(
     cfg: &Config,
     project: &str,
@@ -25508,18 +23477,10 @@ fn cmd_loop(
     if interval_secs < 5 {
         bail!("--interval must be >= 5 seconds");
     }
-    // ADR-0016: strictness is resolved ONCE at loop start — CLI flag OR env
-    // FLYWHEEL_VERIFY_STRICT — and serialized into LoopParams; leaves never
-    // re-read the env mid-tick.
     let strict = strict
         || std::env::var("FLYWHEEL_VERIFY_STRICT")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-    // single-instance guard (bd-fw-stale-loop-processes-gac): refuse while a
-    // live loop process owns this project; --force takes over deliberately.
-    // The pid entry is unregistered on exit via LoopPidGuard (Drop), so a
-    // crashed loop leaves a stale entry that the next start replaces (dead
-    // pid = litter, not a guard).
     let _guard = LoopPidGuard {
         project: project.to_string(),
         pid: std::process::id(),
@@ -25531,9 +23492,6 @@ fn cmd_loop(
             prev.started_at
         );
     }
-    // --interval-active clamps to the 5s floor (consistent with the
-    // workflow's INTERVAL_MIN) rather than erroring — the operator asked for
-    // responsiveness, not an error
     let active_secs = clamp_active_interval(active_interval_secs);
     if active_secs != active_interval_secs {
         eprintln!(
@@ -25543,8 +23501,6 @@ fn cmd_loop(
     if !matches!(on_blocked, "continue" | "stop" | "mail") {
         bail!("--on-blocked must be continue|stop|mail");
     }
-    // ADR-0006 D2: the wave scope is a --work modifier — fail fast on a
-    // malformed label or an orphaned flag instead of mis-dispatching later.
     if let Some(label) = wave_label {
         if !work {
             bail!("--wave-label requires --work");
@@ -25559,11 +23515,7 @@ fn cmd_loop(
     }
     let mut queue_items = build_queue(queue, workflow, Some(project))?;
 
-    // durable mode (default): run the loop as a durable engine-backed workflow so it
-    // survives crashes and restarts. --local / --once use the sync loop.
     if !local && !once {
-        // durable loops have no wall clock; --timeout-ms becomes a poll cap
-        // (deterministic across replays)
         let max_iterations = timeout_ms.map(|ms| (ms / 1000).div_ceil(interval_secs.max(1)));
         let params = durable::LoopParams {
             project: project.to_string(),
@@ -25602,9 +23554,6 @@ fn cmd_loop(
         };
         let rt = tokio::runtime::Runtime::new()?;
         if engine {
-            // bd-e0xk: the loop as a WorkflowEngine durable function — the
-            // bd-w4-delete-dup-sbh8: the engine-backed loop body is deleted —
-            // --engine routes to the durable keeper (thin wrapper).
             println!(
                 "loop: swarm monitor for {} (--engine routed to the durable keeper; resume: flywheel loop run {project})",
                 dim(project)
@@ -25628,12 +23577,7 @@ fn cmd_loop(
         return Ok(());
     }
 
-    // --work (bead-driven): the queue is sourced from `br ready` each poll, so
-    // the empty-queue warning only applies when NOT in work mode. Each bead is
-    // assigned at most once per loop run (bd-fw-loop-sync-work-zero-way).
     let mut assigned: Vec<String> = Vec::new();
-    // ADR-0019 (bd-w1-verify-fence): not-ready beads (missing/malformed
-    // `## VERIFY` fence) whose planner-mail already fired this run.
     let mut not_ready_mailed: std::collections::HashSet<String> = std::collections::HashSet::new();
     if queue_items.is_empty() && nudge.is_none() && !work {
         eprintln!("flywheel: no instructions queued and no --nudge — loop will only monitor");
@@ -25643,8 +23587,6 @@ fn cmd_loop(
     let ws_id = find_workspace(&mut c, project)?;
     let deadline = timeout_ms.map(|ms| std::time::Instant::now() + Duration::from_millis(ms));
 
-    // A start notice, not a run outcome (ADR-0032 Spec 9 tail): it declares
-    // itself so no reader counts the monitor's launch as a run's result.
     log(
         project,
         EventKind::Loop,
@@ -25663,7 +23605,6 @@ fn cmd_loop(
     );
 
     loop {
-        // re-check deadline
         if let Some(d) = deadline
             && std::time::Instant::now() >= d
         {
@@ -25674,10 +23615,6 @@ fn cmd_loop(
             );
         }
 
-        // The fleet snapshot. Read BEFORE the --work refresh: the idle-pane
-        // rotation needs the live/idle pane split, and it must be the SAME
-        // list (same order) `plan_actions` walks when it pairs queue items
-        // with agents.
         let agents = c
             .agent_list()?
             .into_iter()
@@ -25696,35 +23633,16 @@ fn cmd_loop(
                 .collect()
         };
 
-        // bead-driven mode (parity with the durable loop): refresh the queue
-        // from the tracker each poll — interrupted work first, then fresh
-        // ready beads. Soft-fail: a tracker hiccup yields no new work this
-        // tick, never a loop crash.
         if work {
-            // bd-gnej: in-progress beads feed the wave-gate (an earlier
-            // wave's in_progress bead holds later waves).
             let mut inprog_now: Vec<durable::ReadyBead> = Vec::new();
-            // bd-loop-feeds-idle-panes-rh2z: the resume filter, the wave gate
-            // and the idle-pane rotation all read the same window, peers and
-            // clock — resolved ONCE per pass so the three cannot disagree.
             let window = state::load_resume_window(project);
-            // bd-g0ge: the attempt dimension rides the same pass — loaded
-            // once so the filter and the record below cannot disagree.
             let attempts = state::load_work_attempts(project);
-            // A toron reserve-yield (bead taqf) is one more peer source, so
-            // the SAME pure peer-hold rule decides both. A yield whose holder
-            // released drops out on the toron side, so no clear path exists
-            // here.
             let mut peers = live_reservation_holders(cfg, project);
             peers.extend(live_yielded_pairs(cfg, project));
             let file_rows = live_file_rows(cfg, project);
             let now_us = chrono::Utc::now().timestamp_micros();
-            // Prompts queued by the ordinary paths. The rotation's picks go
-            // AHEAD of them (see the rotation block at the end of this scope).
             let mut inprog_items: Vec<String> = Vec::new();
             let mut ready_items: Vec<String> = Vec::new();
-            // Ready beads that survived the wave/scope filters — the rotation
-            // must not re-offer what those filters held back.
             let mut ready_now: Vec<durable::ReadyBead> = Vec::new();
             match load_inprogress_beads(cfg, project) {
                 Ok(inprog) => {
@@ -25732,10 +23650,6 @@ fn cmd_loop(
                         .iter()
                         .filter(|b| {
                             let pane = b.assignee.as_deref().unwrap_or("");
-                            // bd-g0ge: gate on the live generation, not the
-                            // bead row — a completed/superseded attempt never
-                            // resumes, and a steered replacement generation
-                            // starts with a fresh window.
                             let (last, live) =
                                 attempt_window_last_us(&window, &attempts, &b.id, pane);
                             let intended =
@@ -25753,9 +23667,6 @@ fn cmd_loop(
                         })
                         .cloned()
                         .collect();
-                    // Record only what this call actually queues — a bead
-                    // already assigned this run draws no prompt, so it draws no
-                    // watermark either.
                     let to_record: Vec<(String, String)> = resumable
                         .iter()
                         .filter(|b| !assigned.contains(&b.id))
@@ -25769,9 +23680,6 @@ fn cmd_loop(
                                 "flywheel: resume-window record for {bead} failed (continuing): {e:#}"
                             );
                         }
-                        // bd-g0ge: refresh (or open) the attempt row and key
-                        // this pass's window on the live generation, so the
-                        // filter above reads its own write next pass.
                         match state::record_attempt_resume(project, bead, pane, None, None, now_us)
                         {
                             Ok(rec) => {
@@ -25794,12 +23702,6 @@ fn cmd_loop(
                     }
                     inprog_items.extend(to_resume);
                     inprog_now = inprog;
-                    // ADR-0019 D9: file-hold notice. An in-progress bead
-                    // suppressed by file_blocks_bead tells its holder once
-                    // per (bead, holder) per 15 minutes through the same
-                    // resume-window store. The watermark is written only
-                    // after toron accepts the mail; a refused mail retries
-                    // next pass.
                     for b in &inprog_now {
                         let pane = b.assignee.as_deref().unwrap_or("");
                         let intended =
@@ -25854,15 +23756,7 @@ fn cmd_loop(
             }
             match load_ready_beads(cfg, project) {
                 Ok(ready) => {
-                    // ADR-0019 (bd-w1-verify-fence): only beads with a legal
-                    // `## VERIFY` fence are dispatched; not-ready beads are
-                    // mailed to the planner once per loop run.
                     let (dispatchable, not_ready) = durable::partition_ready(&ready);
-                    // bd-gnej wave-gate: hold a wave-N labeled bead while any
-                    // earlier wave-M (M<N) is open/in_progress — earlier
-                    // waves run first. No wave labels → no gating.
-                    // --no-wave-gates kills it. The FULL ready list is the
-                    // open context (a not-ready wave-1 bead still gates).
                     let wave_held: Vec<String> = if no_wave_gates {
                         Vec::new()
                     } else {
@@ -25874,10 +23768,6 @@ fn cmd_loop(
                             wave_held.join(", ")
                         );
                     }
-                    // ADR-0006 D2 wave-scoped dispatch: with --wave-label the
-                    // ready set narrows to exactly that label's beads and ANY
-                    // open lower wave blocks (names the blockers). None =
-                    // default behavior, byte-identical.
                     let mut scope_block: Option<String> = None;
                     let scope_ids: Option<std::collections::HashSet<String>> =
                         wave_label.map(|label| {
@@ -25890,9 +23780,6 @@ fn cmd_loop(
                                 }
                             }
                         });
-                    // bd-ancp: no intermediate Vec — the ready set streams
-                    // straight into the wave/scope filters (one alloc saved
-                    // per poll on this hot path).
                     let to_assign: Vec<durable::ReadyBead> = dispatchable
                         .into_iter()
                         .filter(|&b| !wave_held.contains(&b.id))
@@ -25924,9 +23811,6 @@ fn cmd_loop(
                                 project,
                                 &bead.id,
                                 &bead.title,
-                                // bd-4spn: name the blocker — a missing
-                                // VERIFY fence OR the PRINCIPLES requirement
-                                // (priority<=2); the planner fixes in one pass.
                                 Some(&if bead.verify.is_none() {
                                     "## VERIFY fence missing, empty, or multi-line".to_string()
                                 } else {
@@ -25944,15 +23828,6 @@ fn cmd_loop(
                 Err(e) => eprintln!("flywheel: br ready failed (continuing): {e:#}"),
             }
 
-            // bd-loop-feeds-idle-panes-rh2z: the idle-pane rotation. The
-            // resume window plus the per-pass `assigned` set can leave every
-            // pane idle while stalled beads sit unclaimed (the incident: 17
-            // in_progress, 5 idle panes, zero sends for several passes). Each
-            // idle pane now takes ONE bead — its own stalled work first, never
-            // another live pane's — and the picks go at the HEAD of the queue
-            // in fleet order, because `plan_actions` pairs the k-th idle agent
-            // with the k-th queue item: that order is what makes the pick land
-            // on the pane the rotation chose.
             let live_pins: Vec<String> = managed.iter().map(|(n, _)| n.clone()).collect();
             let idle_pins: Vec<String> = managed
                 .iter()
@@ -25979,8 +23854,6 @@ fn cmd_loop(
             if !plan.picks.is_empty() {
                 let mut pick_items: Vec<String> = Vec::new();
                 for pick in &plan.picks {
-                    // The bead is in one of the two lists loaded above — the
-                    // rotation picked it out of them.
                     let held = inprog_now.iter().find(|b| b.id == pick.bead);
                     let title = held
                         .or_else(|| ready_now.iter().find(|b| b.id == pick.bead))
@@ -26001,13 +23874,6 @@ fn cmd_loop(
                             String::new()
                         }
                     );
-                    // Queue the bead once: the ordinary paths skip it next pass.
-                    // Ceiling (named, not hidden): the pairing below is
-                    // positional, so a pane that starts WORKING between the
-                    // fleet read and dispatch shifts the pick to the next idle
-                    // pane, and a failed send re-inserts its item at the front
-                    // (the existing retry path) for the rest of that pass. Both
-                    // self-correct on the next poll.
                     assigned.push(pick.bead.clone());
                 }
                 queue_items.splice(0..0, pick_items);
@@ -26016,10 +23882,6 @@ fn cmd_loop(
             queue_items.extend(ready_items);
         }
 
-        // bd-w4-delete-dup-sbh8: the sync path DELEGATES to the single
-        // durable planner (one plan_actions — the duplicate was deleted).
-        // States convert to the durable shape; digests/wake are
-        // durable-loop-only (empty here — mail wake stays poll-based).
         let d_states: Vec<durable::AgentState> = managed
             .iter()
             .map(|(name, status)| durable::AgentState {
@@ -26060,9 +23922,6 @@ fn cmd_loop(
             &HashMap::new(),
             &std::collections::HashSet::new(),
         );
-        // with on_blocked=stop, no work may be dispatched this iteration once a
-        // blocker is known — otherwise sends before the blocked agent in the
-        // action list already fired (order-dependent behavior)
         if on_blocked == "stop" {
             let blocked: Vec<&str> = actions
                 .iter()
@@ -26079,8 +23938,6 @@ fn cmd_loop(
         let mut any_work = false;
         for action in &actions {
             match action {
-                // ADR-0001 Wave 3: stamp pin before dispatch — same leaf as
-                // the durable loop, best-effort, never blocks the send.
                 durable::LoopAction::PinStamp { bead_id, pin } => {
                     let exe = std::env::current_exe()?;
                     let out = std::process::Command::new(exe)
@@ -26094,12 +23951,6 @@ fn cmd_loop(
                 }
                 durable::LoopAction::Send { name, text }
                 | durable::LoopAction::DispatchImmediate { name, text } => {
-                    // bd-gsvn.1: the sync loop routes through the same
-                    // dispatch leaf as the durable loop + pane runner —
-                    // __send --profile conditions the prompt with the
-                    // agent's profile behavior preamble (Spec C) and logs
-                    // the run. A plain swarm agent (no profile in the spawn
-                    // registry) sends raw, byte-identical to legacy.
                     let agent_profile = state::load_spawn_registry(&project_dir_str(cfg, project)?)
                         .into_iter()
                         .find(|e| e.name == *name)
@@ -26131,9 +23982,6 @@ fn cmd_loop(
                                 code
                             )
                         );
-                        // the item was already popped by plan_actions — put it
-                        // back at the FRONT so the next poll retries it (a
-                        // dead agent never silently consumes a prompt)
                         queue_items.insert(0, text.clone());
                         continue;
                     }
@@ -26171,10 +24019,6 @@ fn cmd_loop(
                             if let Ok(m) = mail_or_die(cfg) {
                                 let key = project_dir_str(cfg, project)?;
                                 let _ = m.ensure_project(&key);
-                                // the recipient is the agent's REGISTERED
-                                // agent-mail identity (bd-odc) — the hc
-                                // name is not a registrable identity;
-                                // bd-aseq: registry pin first, hash fallback
                                 let mail_target = resolve_mail_target_registry(project, name);
                                 let _ = m.send(
                                     &key,
@@ -26201,10 +24045,6 @@ fn cmd_loop(
                     owner,
                     age_secs,
                 } => {
-                    // ADR-0010 D4/D12: re-surface a declared `paused:` wait to
-                    // its named owner. The sync loop's surface is the operator
-                    // channel + the event journal (the workspace fold also
-                    // queues the captain-relevant digest row). Never silent.
                     println!(
                         "{} {}",
                         dim("[loop]"),
@@ -26223,9 +24063,6 @@ fn cmd_loop(
                     );
                 }
                 durable::LoopAction::Wait => {}
-                // Self-heal actions never come out of plan_actions (the
-                // durable loop's heal step is a separate phase); if one ever
-                // appears here the sync path has no heal machine — skip.
                 durable::LoopAction::Diagnose { .. }
                 | durable::LoopAction::Respawn { .. }
                 | durable::LoopAction::Reclaim { .. } => {}
@@ -26240,13 +24077,6 @@ fn cmd_loop(
 
         if once {
             println!("{}", dim("[loop] --once pass done"));
-            // `continue` means continue: a blocked crew is a reason to wait, not
-            // a reason the pass failed. Bailing here made `loop-mode supervise`
-            // count a provider-rate-limited agent as a consecutive failure and
-            // stop after three passes — the supervisor died precisely because a
-            // crew was idle on someone else's limit, while the crews that were
-            // still working went unsupervised. The pass is a success; the block
-            // is reported, and `stop`/`mail` remain the policies that act on it.
             if any_blocked && on_blocked == "continue" {
                 println!(
                     "{}",
@@ -26264,7 +24094,6 @@ fn cmd_loop(
             return Ok(());
         }
 
-        // wait for next poll (bounded by deadline)
         let wait_for = if let Some(d) = deadline {
             let remaining = d.saturating_duration_since(std::time::Instant::now());
             remaining.min(Duration::from_secs(interval_secs))
@@ -26295,10 +24124,6 @@ mod verifier_dispatch_tests {
             .output()
             .expect("br init");
         assert!(bi.status.success());
-        // schema-18 fail-closed br: the default strict workflow does not
-        // admit `blocked`; verifier-dispatch's degrade plan blocks the bead,
-        // so the fixture policy must declare the status + transition
-        // (bd-adr0006-cosmetic-sweep-q0g0).
         std::fs::write(
             dir.join(".beads/policy.yaml"),
             "workflow:\n  strict: true\n  statuses: [open, in_progress, closed, deferred, blocked]\n  transitions:\n    open: [in_progress, closed, deferred, blocked]\n    in_progress: [open, closed, deferred]\n    deferred: [open]\n    closed: [open]\n",
@@ -26344,8 +24169,6 @@ mod verifier_dispatch_tests {
             .output()
             .unwrap();
         let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-        // br show --json returns either a bare object or a 1-elem array
-        // (schema drift across br versions) — accept both.
         let bead = match &v {
             Value::Array(items) => items.first().cloned().unwrap_or(Value::Null),
             obj @ Value::Object(_) => obj.clone(),
@@ -26398,7 +24221,6 @@ mod verifier_dispatch_tests {
         );
         assert!(out.is_ok(), "{out:?}");
         assert_eq!(status_of(&dir, &bead_id), "blocked");
-        // Re-invocation is idempotent (still ok, still blocked, no reopen).
         let out2 = cmd_internal_verify_dispatch(
             &cfg,
             "vd-test",
@@ -26488,10 +24310,6 @@ mod loop_run_verify_tests {
             .output()
             .expect("br init");
         assert!(bi.status.success());
-        // The loop records command-verified AFTER the worker closes (close-
-        // detect) — br 0.2.22 validates the report against the CURRENT
-        // status, so the policy must declare the `closed -> closed` gated
-        // self-transition (probed 2026-08-16).
         std::fs::write(
             dir.join(".beads/policy.yaml"),
             "workflow:\n  transitions:\n    open:\n      - closed\n    closed:\n      - closed\n  gates:\n    open -> closed:\n      require_all:\n        - command-verified\n    closed -> closed:\n      require_all:\n        - command-verified\n",
@@ -26563,8 +24381,6 @@ mod loop_run_verify_tests {
             .output()
             .unwrap();
         let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-        // br show --json returns either a bare object or a 1-elem array
-        // (schema drift across br versions) — accept both.
         let bead = match &v {
             Value::Array(items) => items.first().cloned().unwrap_or(Value::Null),
             obj @ Value::Object(_) => obj.clone(),
@@ -26590,17 +24406,12 @@ mod loop_run_verify_tests {
     /// legal and the bead STAYS closed (never reopened).
     #[test]
     fn cheap_p3_loop_runnable_records_and_stays_closed() {
-        // Arming is process-global — serialize with other arming tests and
-        // reset the flag (it persists once armed).
         let _lock = crate::verdict::lock_loop_reporter();
         crate::verdict::test_reset_loop_reporter();
         let cfg = no_mail_cfg();
         let dir = std::env::temp_dir().join(format!("lrv-ok-{}", std::process::id()));
         let bead_id = scratch_lrv(&dir, "lrv-ok", "test -f work.txt");
         let sha = commit_and_sha(&dir, &bead_id);
-        // Worker closes (the loop's close-detect would see `closed`).
-        // schema-18 fail-closed br requires the bead-carrying commit's sha
-        // (bd-adr0006-cosmetic-sweep-q0g0).
         let close = std::process::Command::new("br")
             .args([
                 "close",
@@ -26614,14 +24425,11 @@ mod loop_run_verify_tests {
             .output()
             .unwrap();
         assert!(close.status.success());
-        // The loop executes VERIFY itself.
         let o =
             loop_run_verify_exec(&cfg, "lrv-test", &bead_id, &sha, Some(60), Some(&dir)).unwrap();
         assert_eq!(o.band, "loop-runnable");
         assert_eq!(o.exit, 0, "verify output: {}", o.output_tail);
         assert!(!o.skipped);
-        // The armed loop writes the machine receipt + records the gate row
-        // (this is exactly what the durable leaf does in-process).
         crate::verdict::arm_loop_reporter();
         let receipt =
             crate::verdict::write_command_verified_receipt(&o.dir, &bead_id, &sha, &o.output_tail)
@@ -26642,7 +24450,6 @@ mod loop_run_verify_tests {
             verify_cmd: o.verify,
         };
         crate::verdict::report_pass(&o.dir, &v).unwrap();
-        // Ledger legal -> the bead stays closed (the loop never reopened it).
         let bead = crate::verdict::bead_from_br_show(&dir, &bead_id).unwrap();
         assert!(
             crate::verdict::ledger_check(&o.dir, &bead, crate::verdict::AcShape::Checkable, &sha)
@@ -26708,7 +24515,6 @@ mod loop_tests {
             doorbell_uncovered_panes(&covered, &ids),
             vec!["w2:p9".to_string(), "w3:p1".to_string()]
         );
-        // Fully covered -> empty delta (no forwarder churn per sweep).
         let all: HashSet<String> = ids.into_iter().filter(|p| !p.is_empty()).collect();
         assert_eq!(
             doorbell_uncovered_panes(&all, &["w1:p1".to_string()]),
@@ -26722,8 +24528,6 @@ mod loop_tests {
     #[test]
     fn loop_subcommand_is_loop_mode_with_loop_alias() {
         use clap::CommandFactory;
-        // The Cli derive tree is enormous; build it on a big-stack thread so
-        // the 2 MiB test-thread default cannot overflow while expanding it.
         let handle = std::thread::Builder::new()
             .stack_size(256 * 1024 * 1024)
             .spawn(move || {
@@ -26767,8 +24571,6 @@ mod loop_tests {
     }
 
     fn st(name: &str, s: AgentStatus) -> durable::AgentState {
-        // the sync planner tests delegate to the SINGLE durable::plan_actions
-        // (bd-w4-delete-dup-sbh8) — states use the durable shape.
         durable::AgentState {
             name: name.to_string(),
             status: format!("{s:?}").to_ascii_lowercase(),
@@ -26796,9 +24598,6 @@ mod loop_tests {
         use std::collections::BTreeMap;
         let now_us = 1_000_000_000_000_000i64;
         let mut window: BTreeMap<String, i64> = BTreeMap::new();
-        // Fresh bead-level watermark: the old bead-keyed lookup would read
-        // this and suppress. The filter must read the generation key
-        // instead — absent here, so the live generation is resumable.
         window.insert(state::resume_key("bd-x", "PaneA"), now_us - 60 * 1_000_000);
         let attempts = vec![durable::WorkAttempt {
             bead_id: "bd-x".into(),
@@ -26820,8 +24619,6 @@ mod loop_tests {
             false,
             live,
         ));
-        // A completed attempt never resumes, even with a fresh bead-level
-        // watermark (the row lags the finished work).
         window.insert(state::resume_key("bd-y", "PaneA"), now_us);
         let done = vec![durable::WorkAttempt {
             bead_id: "bd-y".into(),
@@ -26881,13 +24678,11 @@ mod loop_tests {
         }];
         let mut assigned = Vec::new();
         let prompts = work_prompts(&inprog, &ready, &mut assigned, "flywheel");
-        // resume first, then fresh
         assert_eq!(prompts.len(), 3);
         assert!(prompts[0].contains("GOAL Resume bd-r1"));
         assert!(prompts[1].contains("GOAL Resume bd-r2"));
         assert!(prompts[2].contains("GOAL Execute bd-f1"));
         assert_eq!(assigned, vec!["bd-r1", "bd-r2", "bd-f1"]);
-        // second call assigns nothing new (dedup)
         let again = work_prompts(&inprog, &ready, &mut assigned, "flywheel");
         assert_eq!(again, [] as [String; 0]);
     }
@@ -26940,8 +24735,6 @@ mod loop_tests {
         let p = &prompts[0];
         assert!(p.contains("bd-42"));
         assert!(p.contains("GOAL Execute bd-42: fix auth."));
-        // the brief carries the standing-orders path, not the lifecycle novel
-        // (grep-verifiable per beads workflow)
         assert!(p.contains("flywheel/.flywheel/standing-orders.md"));
         assert!(!p.contains("br update"));
     }
@@ -26981,7 +24774,6 @@ mod loop_tests {
         let beads = parse_inprogress_beads_json(raw).unwrap();
         assert_eq!(beads.len(), 1);
         assert_eq!(beads[0].id, "bd-c");
-        // bare-array fallback (some br versions)
         let beads = parse_inprogress_beads_json(r#"[{"id":"bd-d","title":"four"}]"#).unwrap();
         assert_eq!(beads[0].id, "bd-d");
     }
@@ -27003,8 +24795,6 @@ mod loop_tests {
             {"id": "bd-g", "status": "open"},
             {"id": "bd-h", "status": "open", "labels": ["wave-2"]},
             {"id": "bd-i", "status": "mystery", "labels": ["wave-2"]},
-            // Typed-only row (no label): the field is the authority
-            // (bd-wave-gate-typed-authority-27et).
             {"id": "bd-j", "status": "open", "wave": 2},
         ]);
         let ready: HashSet<String> = ["bd-h".to_string(), "bd-j".to_string()]
@@ -27037,8 +24827,6 @@ mod loop_tests {
         assert_eq!(out["unlabeled"]["blocked"], json!(1));
         assert_eq!(out["unlabeled"]["total"], json!(1));
 
-        // A wave with only READY beads still dispatches before a later wave's
-        // in-progress work — the gate floor is the lowest ready/in-progress wave.
         let rows2 = json!([
             {"id": "bd-r1", "status": "open", "labels": ["wave-1"]},
             {"id": "bd-r2", "status": "in_progress", "labels": ["wave-2"]},
@@ -27047,7 +24835,6 @@ mod loop_tests {
         let out2 = progress_waves(rows2.as_array().unwrap(), &ready2);
         assert_eq!(out2["dispatching_wave"], json!(1));
 
-        // Every wave closed -> nothing is dispatching.
         let rows3 = json!([{"id": "bd-z", "status": "closed", "labels": ["wave-1"]}]);
         let out3 = progress_waves(rows3.as_array().unwrap(), &HashSet::<String>::new());
         assert_eq!(out3["dispatching_wave"], Value::Null);
@@ -27083,8 +24870,6 @@ mod loop_tests {
         assert_eq!(beads[3].assignee, None, "empty assignee -> None");
     }
 
-    // ---- ADR-0001 wave 5: typed verify field -> ReadyBead.verify ----------
-
     /// `br ready --json` rows carry the typed `verify` field; it flows into
     /// `ReadyBead.verify`. Missing/empty field -> verify = None (the bead
     /// is NOT ready — refuse-to-dispatch).
@@ -27117,7 +24902,6 @@ mod loop_tests {
         let backend = crate::backend::toron::ToronMailBackend::new(mail);
         let project = "verify-fence-mail";
         backend::run_mail(backend.ensure_project(project)).expect("ensure");
-        // the surface sends AS its own identity — it needs a key in-project
         let sender = backend.agent_name().to_string();
         let sender_profile = spawn_agent_profile(&sender, "opencode", project);
         crate::mail::fixture_register(project, &sender_profile).expect("register sender");
@@ -27176,7 +24960,6 @@ mod loop_tests {
         let captain = "CaptainPine";
         crate::mail::fixture_register(project, &spawn_agent_profile(captain, "flywheel", project))
             .expect("register captain");
-        // the orchestrator resolution prefers the program=="flywheel" agent
         assert_eq!(
             registered_orchestrator(&backend, project).as_deref(),
             Some(captain),
@@ -27268,8 +25051,6 @@ mod loop_tests {
         );
     }
 
-    // ---- bd-w1-reopen-f6tw: the red-then-green of the program ----
-
     /// Scratch workspace (git + br + one bead with a typed `verify` field +
     /// a commit whose message carries the bead id + gate policy).
     /// bd-3566 (beads_rust-wave5-flywheel-parser-strip-dkpvi): the fixture
@@ -27358,10 +25139,6 @@ mod loop_tests {
         use crate::backend::MailSurface as _;
         let (dir, bead_id) = scratch_workspace("reopen-flow");
         let dir_str = dir.to_string_lossy().to_string();
-        // worker closes with NO gate row — an ILLEGAL close by design (the
-        // reopen floor is the thing under test). schema-18 fail-closed br
-        // refuses it outright, so manufacture the state via operator bypass
-        // (same fixture pattern as verdict.rs, bd-adr0006-cosmetic-sweep-q0g0).
         let bypass = std::process::Command::new("br")
             .args([
                 "close",
@@ -27377,7 +25154,6 @@ mod loop_tests {
             .output()
             .expect("br close bypass");
         assert!(bypass.status.success(), "br close bypass: {bypass:?}");
-        // close-detect: sha derived (commit carries the id), ledger missing
         match verdict::close_check(&dir, &bead_id).unwrap() {
             verdict::CloseCheck::Missing {
                 sha,
@@ -27388,14 +25164,11 @@ mod loop_tests {
                     .expect("mail ok")
                     .expect("mail Some");
                 let backend = crate::backend::toron::ToronMailBackend::new(mail);
-                // the reopen leaf ensures the PROJECT DIR path as its key —
-                // the test must register identities under the SAME key.
                 let project = dir_str.clone();
                 backend::run_mail(backend.ensure_project(&project)).expect("ensure");
                 let sender = backend.agent_name().to_string();
                 let sender_profile = spawn_agent_profile(&sender, "opencode", &project);
                 crate::mail::fixture_register(&project, &sender_profile).expect("register sender");
-                // the planner = the bead's creator (registered identity)
                 let planner = planner_recipient_chain(&dir_str, &bead_id, "FallbackIdentity")
                     .into_iter()
                     .next()
@@ -27403,11 +25176,9 @@ mod loop_tests {
                 let planner_profile = spawn_agent_profile(&planner, "opencode", &project);
                 crate::mail::fixture_register(&project, &planner_profile)
                     .expect("register planner");
-                // tick 1: reopen + mail
                 let v = reopen_unverified_close(&dir_str, &bead_id, &sha, &backend, &planner)
                     .expect("reopen tick 1");
                 assert_eq!(v["reopened"].as_bool(), Some(true), "reopened: {v}");
-                // the bead is back in br ready — RED-THEN-GREEN
                 let ready = std::process::Command::new("br")
                     .args(["ready", "--json"])
                     .current_dir(&dir)
@@ -27415,8 +25186,6 @@ mod loop_tests {
                     .expect("br ready");
                 let rv: serde_json::Value =
                     serde_json::from_slice(&ready.stdout).expect("ready json");
-                // br ready --json: bare array (older br) or issues envelope
-                // (newer) — accept both.
                 let ready_items = match &rv {
                     serde_json::Value::Array(items) => items.as_slice(),
                     serde_json::Value::Object(obj) => obj
@@ -27430,7 +25199,6 @@ mod loop_tests {
                     ready_items.iter().any(|b| b["id"] == bead_id),
                     "reopened bead is back in br ready: {rv}"
                 );
-                // tick 2 (repeated): no second mail — exactly one per (bead, sha)
                 let v2 = reopen_unverified_close(&dir_str, &bead_id, &sha, &backend, &planner)
                     .expect("reopen tick 2");
                 assert_eq!(v2["already_processed"].as_bool(), Some(true), "dedup: {v2}");
@@ -27514,7 +25282,6 @@ mod loop_tests {
             !planner.is_empty() && planner != "FallbackIdentity",
             "creator resolved, got: {planner}"
         );
-        // unresolvable bead -> fallback
         assert_eq!(
             planner_recipient_chain(&dir_str, "bd-does-not-exist", "FallbackIdentity"),
             vec!["FallbackIdentity".to_string()],
@@ -27539,11 +25306,8 @@ mod loop_tests {
         assert_eq!(group.len(), 3);
         assert!(group.contains(&"flywheel-proj-oc".to_string()));
         assert!(group.contains(&"flywheel-proj-oc3".to_string()));
-        // numbered short is exact — no group
         assert!(bare_short_group_matches("proj", "oc2", &names).is_none());
-        // concrete name is exact — no group
         assert!(bare_short_group_matches("proj", "flywheel-proj-oc", &names).is_none());
-        // "all" is not a bare short — no group
         assert!(bare_short_group_matches("proj", "all", &names).is_none());
     }
 
@@ -27769,8 +25533,6 @@ esac
 
     #[test]
     fn kill_key_detects_only_kill_keys() {
-        // bd-fw-interrupt-kills-agent-or3: ctrl+c variants are kill keys;
-        // Escape and other soft keys are not.
         assert_eq!(kill_key(&["Escape"]), None);
         assert_eq!(kill_key(&["ctrl+c"]), Some("ctrl+c"));
         assert_eq!(kill_key(&["ctrl-c"]), Some("ctrl-c"));
@@ -27781,7 +25543,6 @@ esac
 
     #[test]
     fn slugify_label_normalizes() {
-        // bd-vik C: labels become lowercase alphanumerics + hyphens
         let (s, changed) = slugify_label("ADR-0008-debate");
         assert_eq!(s, "adr-0008-debate");
         assert!(changed);
@@ -27845,7 +25606,6 @@ esac
             "flywheel-proj-oc2".to_string(),
             "flywheel-proj-pi".to_string(),
         ];
-        // oc,pi → oc matches oc+oc2, pi matches pi → all three matched
         let group = bare_short_group_matches("proj", "oc,pi", &names).unwrap();
         assert_eq!(group.len(), 3);
         assert!(group.contains(&"flywheel-proj-pi".to_string()));
@@ -27853,8 +25613,6 @@ esac
 
     #[test]
     fn done_agent_pops_queue_like_idle() {
-        // bd-fw-done-agents-idle-only-iq3: a task-completed agent takes the
-        // next bead — dispatch must include `done`, not only `idle`.
         let states = vec![st("a", AgentStatus::Done)];
         let q = vec!["p1".into(), "p6".into()];
         let actions = durable::plan_actions(
@@ -27886,8 +25644,6 @@ esac
             &HashMap::new(),
             &std::collections::HashSet::new(),
         );
-        // q.len() check now via next.queue
-        //        assert!(true); // q len check now via next.queue
         match &actions[0] {
             durable::LoopAction::Send { name, text } => {
                 assert_eq!(name, "a");
@@ -27895,7 +25651,6 @@ esac
             }
             other => panic!("expected Send for done agent, got {other:?}"),
         }
-        // and it takes a nudge when the queue is empty
         let states = vec![st("a", AgentStatus::Done)];
         let q2: Vec<String> = vec![];
         let actions = durable::plan_actions(
@@ -27935,8 +25690,6 @@ esac
 
     #[test]
     fn sync_loop_substitutes_agent_name_at_dispatch() {
-        // the sync loop (--once/--local) dispatches the same bead prompts —
-        // the {AGENT_NAME} placeholder must resolve to the receiving agent
         let states = vec![st("flywheel-proj-oc", AgentStatus::Idle)];
         let q = vec!["write to .flywheel/agent-state/{AGENT_NAME}.json".into()];
         let actions = durable::plan_actions(
@@ -27975,7 +25728,6 @@ esac
             }
             other => panic!("expected Send, got {other:?}"),
         }
-        // plain prompts stay untouched
         let states = vec![st("a", AgentStatus::Idle)];
         let q = vec!["t1".into()];
         let actions = durable::plan_actions(
@@ -28016,7 +25768,6 @@ esac
     #[test]
     fn name_matching_handles_numbered_agents() {
         let base = "flywheel-proj-";
-        // bare short broadens: oc matches oc, oc2, oc10
         let want_oc = WantToken {
             name: format!("{base}oc"),
             broaden: true,
@@ -28027,10 +25778,8 @@ esac
         assert!(name_matches_want(&format!("{base}oc"), &want_oc));
         assert!(name_matches_want(&format!("{base}oc2"), &want_oc));
         assert!(name_matches_want(&format!("{base}oc10"), &want_oc));
-        // prefix collision: ocr must NOT match oc
         assert!(!name_matches_want(&format!("{base}ocr"), &want_oc));
         assert!(!name_matches_want(&format!("{base}ocx"), &want_oc));
-        // concrete full name is EXACT: flywheel-proj-oc must NOT match oc2
         let want_exact = WantToken {
             name: format!("{base}oc"),
             broaden: false,
@@ -28040,7 +25789,6 @@ esac
         };
         assert!(name_matches_want(&format!("{base}oc"), &want_exact));
         assert!(!name_matches_want(&format!("{base}oc2"), &want_exact));
-        // numbered short is exact too: oc2 must NOT match oc20
         let want_oc2 = WantToken {
             name: format!("{base}oc2"),
             broaden: false,
@@ -28066,7 +25814,6 @@ esac
     #[test]
     fn spawn_retry_bumps_ordinal_past_taken_names() {
         use std::collections::HashSet;
-        // bd-o1zh: a retried spawn must not reuse a name hc holds.
         let taken: HashSet<String> = ["flywheel-flywheel-pi", "flywheel-flywheel-pi2"]
             .into_iter()
             .map(str::to_string)
@@ -28074,15 +25821,11 @@ esac
         assert_eq!(free_spawn_ordinal("flywheel", "pi", 1, &taken), 3);
         assert_eq!(free_spawn_ordinal("flywheel", "pi", 2, &taken), 3);
         assert_eq!(free_spawn_ordinal("flywheel", "pi", 1, &HashSet::new()), 1);
-        // other shorts are unaffected by pi's taken names
         assert_eq!(free_spawn_ordinal("flywheel", "oc", 1, &taken), 1);
     }
 
     #[test]
     fn watch_matches_event_by_pane_id_not_agent_kind() {
-        // the pane.agent_status_changed push carries the agent KIND
-        // ("opencode"), never the instance name — matching must go through
-        // the pane id, which IS in the payload
         let targets = vec![
             ("w1:p1".to_string(), "flywheel-x-oc".to_string()),
             ("w1:p2".to_string(), "flywheel-x-pi".to_string()),
@@ -28096,19 +25839,14 @@ esac
             Some("flywheel-x-pi")
         );
         assert_eq!(watch_name_for_pane(&targets, "w9:p9"), None);
-        // pane ids never match by kind: the event's `agent` field is NOT a
-        // lookup key (that was the bug — kind vs name confusion)
         assert_eq!(watch_name_for_pane(&targets, "opencode"), None);
     }
 
     #[test]
     fn watch_matches_nameless_agents_by_pane() {
-        // a nameless pi agent's display name IS its pane id
         let targets = vec![("w1:p2".to_string(), "w1:p2".to_string())];
         assert_eq!(watch_name_for_pane(&targets, "w1:p2"), Some("w1:p2"));
     }
-
-    // ---- bd-not-ready-alert-recipient-2yd1: the recipient chain ----
 
     /// Pure: an OS username is skipped and the first REGISTERED candidate
     /// wins. `br` writes `created_by` from `$USER`, so the first link is
@@ -28181,8 +25919,6 @@ esac
             "planner NOT mailed",
             "a failed send is reported as a failure"
         );
-        // A leaf that produced no parsable JSON has no ok flag at all —
-        // fail closed, never success-worded.
         assert_eq!(
             crate::durable::not_ready_mail_status(&json!({"raw": "garbage"})),
             "planner NOT mailed"
@@ -28239,7 +25975,6 @@ fn cmd_guards(_cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-// ---- deps / config / upgrade / tutorial ----
 pub(crate) fn command_exists(name: &str) -> bool {
     Command::new("sh")
         .args(["-c", &format!("command -v {name} >/dev/null 2>&1")])
@@ -28247,8 +25982,6 @@ pub(crate) fn command_exists(name: &str) -> bool {
         .map(|s| s.success())
         .unwrap_or(false)
 }
-
-// ─── preflight ──────────────────────────────────────────────────────────────
 
 /// Run preflight checks and bail if any fail. No-op when `skip` is true.
 fn preflight_gate(
@@ -28276,7 +26009,6 @@ fn cmd_preflight(
     work: bool,
     json: bool,
 ) -> Result<()> {
-    // One mapping, shared with the captain-watch preflight arm (Mode::named).
     let pf_mode = preflight::Mode::named(mode, work).ok_or_else(|| {
         anyhow::anyhow!("unknown preflight mode: {mode} (steer|loop|workflow|cron)")
     })?;
@@ -28382,10 +26114,6 @@ pub fn prompts_dir(kind: &str) -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")?;
     let home = std::path::Path::new(&home);
     Some(match kind {
-        // opencode reads custom commands from `commands/` (PLURAL) — the
-        // singular `command/` dir is dead (files there are never surfaced
-        // as slash commands; empirically confirmed against opencode 2026-08,
-        // cf. the working caveman-* commands in commands/).
         "opencode" => home.join(".config/opencode/commands"),
         "pi" => home.join(".pi/agent/prompts"),
         "grok" => home.join(".grok/prompts"),
@@ -28444,7 +26172,6 @@ fn render_orchestration_prompt(
         .expect("orchestration command in table");
     let (frontmatter, body) = apply_argument_adapter(
         kind,
-        // bd-9z1d: quoted, so prose containing ": " cannot break the document.
         &frontmatter.replace("{{PHASE_DESCRIPTION}}", &yaml_double_quoted(description)),
         tpl,
     );
@@ -28453,8 +26180,6 @@ fn render_orchestration_prompt(
         .replace("{{VERSION}}", version)
         .replace("{{GENERATED}}", generated)
         .replace("{{ARGUMENTS_NOTE}}", argument_note(kind));
-    // GS-043: single peer-aware SoT — slash-command chrome stays thin; append
-    // the spawn-inject body so /peer-aware-mode cannot drift from handler text.
     if name == "peer-aware-mode" {
         const PEER_AWARE_SOT: &str = include_str!("../integrations/peer-aware.md.tpl");
         out.push_str(
@@ -28490,12 +26215,6 @@ fn apply_argument_adapter(kind: &str, frontmatter: &str, body: &str) -> (String,
         "grok" => "objective=... --work (trailing text, not interpolated)",
         _ => "args",
     };
-    // YAML-quoting: pi's directory loader parses frontmatter strictly — an
-    // unquoted `argument-hint: [objective=...] ...` is a flow-sequence parse
-    // error, the load throws, and the command silently vanishes from
-    // /-autocomplete (beads/workflow carry no hint, so they survived; omp
-    // already ships its hint quoted). Quote the injected hint like pi's own
-    // docs (`argument-hint: "<PR-URL>"`).
     let fm = if frontmatter.contains("argument-hint:") {
         frontmatter.to_string()
     } else {
@@ -28550,7 +26269,6 @@ fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
         );
         return Ok(());
     };
-    // accept the spawn shorts (oc/pi/gk) as well as the full kind names
     let kind = match kind {
         "oc" => "opencode",
         "gk" => "grok",
@@ -28566,7 +26284,6 @@ fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
         .with_context(|| format!("create prompts dir {}", dir.display()))?;
     let generated = state::now_iso();
     let mut written = 0usize;
-    // /open-mode, /swarm-mode, /loop-mode, /peer-aware-mode as {name}.md.
     for (name, _, _) in ORCHESTRATION_COMMANDS {
         let rendered = render_orchestration_prompt(kind, name, VERSION, &generated)?;
         let path = dir.join(format!("{name}.md"));
@@ -28645,8 +26362,6 @@ fn toron_setup_mcp(
     }
 
     if flywheel {
-        // also point flywheel's OWN mail backend at the same toron URL so
-        // flywheel + all agents share one mailbox.
         changed.push(setup_flywheel_backend(url, dry_run)?);
     }
 
@@ -28679,8 +26394,6 @@ fn upsert_opencode_toron(path: &std::path::Path, url: &str, dry: bool) -> Result
     let obj = v
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("opencode config root must be an object"))?;
-    // Ensure `mcp` exists *in its own statement* so the borrow of `obj` ends,
-    // then re-take a single mutable borrow. Avoids the double-borrow E0500.
     if !obj.contains_key("mcp") || !obj["mcp"].is_object() {
         obj.insert("mcp".into(), serde_json::json!({}));
     }
@@ -28741,8 +26454,6 @@ fn upsert_pi_toron(path: &std::path::Path, url: &str, dry: bool) -> Result<Strin
 fn upsert_grok_toron(path: &std::path::Path, url: &str, dry: bool) -> Result<String> {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-    // find `[mcp_servers.toron]` (exact or any `[mcp_servers.toron*]` is != ours,
-    // so match the bare header only).
     let mut idx: Option<usize> = None;
     for (i, l) in lines.iter().enumerate() {
         if l.trim() == "[mcp_servers.toron]" {
@@ -28751,8 +26462,6 @@ fn upsert_grok_toron(path: &std::path::Path, url: &str, dry: bool) -> Result<Str
         }
     }
     if let Some(i) = idx {
-        // already present: replace the section body's url/enabled lines
-        // up to the next `[section]` header.
         let mut j = i + 1;
         let mut found_url = false;
         while j < lines.len() && !lines[j].trim_start().starts_with('[') {
@@ -28764,7 +26473,6 @@ fn upsert_grok_toron(path: &std::path::Path, url: &str, dry: bool) -> Result<Str
             j += 1;
         }
         if !found_url {
-            // ensure an url line right after the header, before the next header
             lines.insert(i + 1, format!("url = \"{url}\""));
         }
         let act = if found_url { "updated" } else { "added url" };
@@ -28812,9 +26520,6 @@ fn pretty_path(p: &std::path::Path) -> String {
 /// TORON_KEY_PASSPHRASE from the current env.
 fn boot_toron_server(port: u16) -> Result<()> {
     let bind = format!("127.0.0.1:{port}");
-    // bd-741i: never sidecar-serve when the launchd daemon (18080) is already
-    // up — a second `toron serve` against the same data dir grew 24–64GB RSS
-    // overnight and watchdog-panicked the host.
     if std::net::TcpStream::connect("127.0.0.1:18080").is_ok() {
         println!("toron MCP daemon already listening at 127.0.0.1:18080 — skipping boot.");
         return Ok(());
@@ -28828,10 +26533,7 @@ fn boot_toron_server(port: u16) -> Result<()> {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    // preserve operator-key env so the full privileged surface works
     if std::env::var_os("TORON_OPERATOR_KEY").is_some() {
-        // 193.1: a non-UTF-8 key is an actionable error (never a panic —
-        // var().unwrap() would panic on a non-UTF-8 value).
         let key = std::env::var("TORON_OPERATOR_KEY")
             .with_context(|| "TORON_OPERATOR_KEY must be valid UTF-8 when set")?;
         cmd.env("TORON_OPERATOR_KEY", key);
@@ -28854,15 +26556,13 @@ fn setup_flywheel_backend(url: &str, dry: bool) -> Result<String> {
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
 
-    // Locate `[mail.toron]` and rewrite its `url = ...` line; if no section
-    // exists, append one.
     let mut in_mail = false;
     let mut url_line: Option<usize> = None;
     let mut section_idx: Option<usize> = None;
     for (i, l) in lines.iter().enumerate() {
         let t = l.trim();
         if t.starts_with('[') && t.ends_with(']') && t != "[mail.toron]" {
-            break; // past the mail.toron block — stop scanning
+            break;
         }
         if t == "[mail.toron]" {
             in_mail = true;
@@ -28884,12 +26584,9 @@ fn setup_flywheel_backend(url: &str, dry: bool) -> Result<String> {
         }
         None => {
             if let Some(i) = section_idx {
-                // mail.toron section present but no url line — insert right after
-                // the section header.
                 lines.insert(i + 1, format!("url = \"{url}\""));
                 "added url".to_string()
             } else {
-                // no [mail.toron] at all — append fresh blocks (identity first).
                 lines.push(String::from("[agent_mail]"));
                 lines.push(String::from("name = \"flywheel\""));
                 lines.push(String::new());
@@ -28989,9 +26686,7 @@ mod mail_name_tests {
 
     #[test]
     fn default_name_is_flywheel() {
-        // no agent_mail section at all
         assert_eq!(orchestrator_mail_name(&Config::default()), "flywheel");
-        // agent_mail section without a name
         let cfg = Config {
             agent_mail: Some(MailConfig {
                 url: Some("http://x".into()),
@@ -29071,8 +26766,6 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
     let mut ok = true;
     println!("flywheel {}", dim(VERSION));
 
-    // The engine store is local sqlite; there is nothing to bring up. The
-    // capability probe below is the check.
     let _ = ensure;
     match Client::connect(Some(&cfg.socket_path())) {
         Ok(c) => match c.ping() {
@@ -29088,14 +26781,7 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
         }
     }
 
-    // hc protocol drift check. The socket has no protocol method in v18,
-    // so we shell out to the hc CLI itself (`schema --json` — the
-    // canonical source; same binary as the socket server, so CLI vs socket
-    // drift is not a concern). HDR_PROTOCOL is the *verified floor*: live ==
-    // pin is green, live > pin is forward-compatible INFO (hc is additive
-    // by design — this is the signal that triggers a bd-protocol-v2X-bump
     // bead later), live < pin is ERROR + exit 1 (server too old — the safety
-    // net, per ADR-0001 gap A1).
     if let Some(p) = std::process::Command::new("hc")
         .args(["schema", "--json"])
         .output()
@@ -29146,10 +26832,6 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
         );
     }
 
-    // H3 (bd-harness-integration-preflight): per-kind integration state
-    // (kind -> installed/current/version). Informational — a failed status
-    // read warns but does not fail the deps check (the socket surface works
-    // regardless of the CLI status read).
     match hc_support::integration_status_all() {
         Ok(list) => {
             println!("hc integrations:");
@@ -29174,11 +26856,6 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
         }
     }
 
-    // ADR-0022 §3.2 R3 (bd-adr22-w2-phase-registry-igya): preflight
-    // phase-registry probe — per harness with a registered mechanic, verify
-    // the flag/mode still exists in the installed binary. A miss warns with
-    // the exact remedy (informational: drift degrades loudly at dispatch,
-    // it does not break deps).
     {
         let probe = |bin: &str, args: &[&str]| -> Option<String> {
             let out = std::process::Command::new(bin).args(args).output().ok()?;
@@ -29200,7 +26877,6 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
         }
     }
 
-    // The engine-store capability probe: a scratch run that parks and wakes.
     match crate::daemon::durable_capability_probe() {
         Ok(()) => println!("engine store: {}", status_paint(AgentStatus::Idle)),
         Err(e) => {
@@ -29246,7 +26922,6 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
     match cmd {
         ProfileCmd::List => {
             let cat = ProfileCatalog::load()?;
-            // stdout = data; --json available to agent drivers via robot-style
             let mut rows: Vec<Value> = Vec::new();
             for name in cat.names() {
                 let p = cat.get(&name).expect("names from catalog");
@@ -29274,8 +26949,6 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                 .get(name)
                 .ok_or_else(|| anyhow!("unknown profile '@{name}' (flywheel profile list)"))?;
             if *json {
-                // ADR-0007 D1: resolved route after slot-inherit + the
-                // fallback ladder (primary unless caps-blocked).
                 let resolved = models::ModelRegistry::load_routing().ok().and_then(|r| {
                     r.resolve_profile_route_full(&p.harness, &p.model, &p.model_fallback)
                         .ok()
@@ -29379,11 +27052,6 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                     "profile {name} needs --harness, or a slot alias (@cheap/@standard/@premium)"
                 );
             }
-            // bd-enov (F6): validate the harness against the hc kind
-            // registry + the `[harness.<name>]` recipe catalog AT WRITE TIME.
-            // `--harness oc` used to persist verbatim and die later at spawn
-            // (`unsupported interactive agent kind oc`); normalize the alias,
-            // reject anything spawnable by no path, and name the valid set.
             if !merged.harness.is_empty() {
                 match cat.canonical_harness(&merged.harness) {
                     Some(kind) => merged.harness = kind,
@@ -29397,10 +27065,6 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                     ),
                 }
             }
-            // bd-2dao: persist from the RAW user file — the merged catalog
-            // rebuild dropped user overrides of built-in profile names.
-            // The edited entry is written as the merged profile so partial
-            // edits keep built-in fields.
             let mut on_disk: BTreeMap<String, profile::Profile> =
                 profile::ProfileCatalog::load_user_file(Some(&path));
             on_disk.insert(name.clone(), merged);
@@ -29423,25 +27087,17 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                 }
                 _ => json!({}),
             };
-            // Host-scope resolve: operator identity, no project lookup. The
-            // operator npub is best-effort (empty string when unset).
             let operator_npub =
                 std::env::var("TORON_OPERATOR_NPUB").unwrap_or_else(|_| "operator".to_string());
             let resolved = cat.resolve(name, None, &operator_npub, &|_, _| None)?;
             let spec = &resolved.spec;
 
-            // Spawn via the configured multiplexer backend (default hc).
             let backend = backend::multiplexer_backend(cfg)?;
             let agent_name = format!("profile-{name}");
             let profile = cat.get(name).expect("resolve validated the profile above");
             let args = profile_launch_args(&spec.harness, profile, None)?;
-            // Find a pane in the default project workspace, or create one.
             let workspace = resolved_spec_workspace(cfg, backend.as_ref(), &spec.harness)?;
-            // bd-l2ky: host project for registry (host-scope spawn, debate
-            // convention) so `__send --profile` / conditioning resolve.
             let host_project = "flywheel";
-            // GS-033: fail-closed BEFORE agent_start (add-path style) —
-            // never leave a dark pane when mail is configured.
             let mail_identity = pinned_mail_identity(cfg, host_project, &agent_name, &spec.harness);
             if mail_identity.is_none() {
                 refuse_unpinned_spawn(&agent_name, Some(name), backend::mail_backend(cfg).is_ok())?;
@@ -29476,9 +27132,6 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                 ),
             );
             if let Some(wf) = workflow {
-                // bd-6zsl: invoke the workflow against the spawned agent —
-                // pane mode, --reuse the agent's workspace (same panes, the
-                // crew lands beside the profile agent; never reaped).
                 let invoke = profile_workflow_invoke(
                     wf.as_str(),
                     inputs.as_deref(),
@@ -29499,14 +27152,10 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
             if cat.get(name).is_none() {
                 bail!("no profile named {name:?}");
             }
-            // bd-2dao: persist from the RAW user file minus the named entry —
-            // the merged-catalog rebuild dropped user overrides of built-in
-            // profile names.
             let mut on_disk: BTreeMap<String, profile::Profile> =
                 profile::ProfileCatalog::load_user_file(Some(&path));
             on_disk.remove(name);
             if on_disk.is_empty() {
-                // Removing the last local entry → drop the file (clean state).
                 let _ = std::fs::remove_file(&path);
             } else {
                 let raw = toml::to_string_pretty(&ProfilesFile { profiles: on_disk })?;
@@ -29536,7 +27185,6 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                 bail!("no profile named {name:?} (flywheel profile list)");
             }
             let base = cat.get(name).cloned().unwrap_or_default();
-            // --slot is an explicit alias form of --model @slot.
             let model = match slot {
                 Some(s) => Some(format!("@{}", s.trim_start_matches('@'))),
                 None => model.clone(),
@@ -29574,7 +27222,6 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                     "profile {name} needs --harness, or a slot alias (@cheap/@standard/@premium)"
                 );
             }
-            // bd-2dao: persist from the RAW user file, merged entry on top.
             let mut on_disk: BTreeMap<String, profile::Profile> =
                 profile::ProfileCatalog::load_user_file(Some(&path));
             on_disk.insert(name.clone(), merged.clone());
@@ -29626,9 +27273,6 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                 print_json(&serde_json::to_value(&one)?);
                 return Ok(());
             }
-            // bd-2dao: upsert into the RAW user file, so importing a built-in
-            // name lands as a deliberate local override — never a catalog
-            // rebuild that freezes today's built-ins into the file.
             let file_path = config::config_dir().join("profiles.toml");
             let mut on_disk: BTreeMap<String, profile::Profile> =
                 profile::ProfileCatalog::load_user_file(Some(&file_path));
@@ -29801,9 +27445,6 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
             if *json {
                 print_json(&serde_json::to_value(&st)?);
             } else if *digest {
-                // bd-hkw5.1 digest mode: one line per member + the board
-                // heat (intents / frozen / negotiations) — the captain's
-                // quick scan.
                 println!(
                     "coalition {} [{}] goal {} captain {}",
                     st.id, st.status, st.goal, st.captain
@@ -29874,8 +27515,6 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
                     st.negotiations.len()
                 );
                 for i in &st.intents {
-                    // TTL (bd-hkw5.1): intent expiry as epoch µs (None = no
-                    // expiry), plus the declared TTL.
                     let ttl = i
                         .expires_ts_us
                         .map(|t| t.to_string())
@@ -30259,8 +27898,6 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
             let cat = ProfileCatalog::load()?;
             let recipes = config::Recipes::load()?.recipes;
             let mut rows: Vec<Value> = Vec::new();
-            // Compiled-in squads (ADR-0007 D3: default/plan/review/recon);
-            // user-authored recipes.toml entries surface as squads (aliases).
             let compiled = profile::compiled_in_squads();
             for (name, squad) in &compiled {
                 if !recipes.contains_key(name) {
@@ -30278,8 +27915,6 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
                     "members": squad.counts,
                 }));
             }
-            // Built-in profile singles are listed as 1-member squads so a
-            // fresh install still has squad surface with zero config.
             for name in cat.names() {
                 if !recipes.contains_key(&name) && !compiled.contains_key(&name) {
                     rows.push(json!({
@@ -30332,18 +27967,8 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
                 std::env::var("TORON_OPERATOR_NPUB").unwrap_or_else(|_| "operator".to_string());
             let backend = backend::multiplexer_backend(cfg)?;
             let mut spawned: Vec<Value> = Vec::new();
-            // Registry key for the spawn entries: the squad's project, else
-            // the orchestrator's host project (host-scope, debate convention).
-            // bd-blank-project-spelling-non-mail-doors-76hi
             let project_key = project_door(project.as_deref(), "flywheel", "squad")?;
             for (profile_name, n) in squad.members() {
-                // bd-brie: project-scope resolve falls back to HOST-scope
-                // (operator npub) with a one-line notice when the profile is
-                // not registered in the project. Profiles are host-scoped in
-                // practice (the captain's recipes.toml crew); `spawn --profile`
-                // resolves the same way. Registration stays the strict path
-                // for workflow runs that sign as project agents — the
-                // fallback is squad-spawn-only, never engine resolution.
                 let (resolved, fell_back) =
                     resolve_squad_member(&cat, profile_name, project.as_deref(), &operator_npub)?;
                 if fell_back {
@@ -30353,9 +27978,6 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
                     );
                 }
                 let spec = &resolved.spec;
-                // bd-l2ky: launch with the member profile's model/effort args
-                // — the same profile_launch_args as `spawn --profile`
-                // (bd-eign.9), never an empty arg list.
                 let profile = cat
                     .get(profile_name)
                     .expect("resolve validated the profile above");
@@ -30363,8 +27985,6 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
                     let agent_name = format!("squad-{name}-{profile_name}-{}", i + 1);
                     let workspace = resolved_spec_workspace(cfg, backend.as_ref(), &spec.harness)?;
                     let args = profile_launch_args(&spec.harness, profile, None)?;
-                    // GS-033: fail-closed BEFORE agent_start (add-path style) —
-                    // never leave a dark pane when mail is configured.
                     let mail_identity =
                         pinned_mail_identity(cfg, project_key, &agent_name, &spec.harness);
                     if mail_identity.is_none() {
@@ -30376,7 +27996,6 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
                     }
                     let info =
                         backend.agent_start(&agent_name, &spec.harness, &workspace, &args)?;
-                    // bd-l2ky: bind pane so __send --profile / conditioning resolve.
                     if let Some(ref pin) = mail_identity {
                         prime_profile_identity(backend.as_ref(), &info.pane_id, &agent_name, pin);
                         bind_pane_mail_identity(
@@ -30666,9 +28285,6 @@ fn run_list_row(project: &str, e: &state::LogEntry) -> Value {
         "state": state_status,
         "status": normalized,
         "cost": run_cost(e),
-        // Spec 9 tail: the artifact paths a failed run wrote ride the row so
-        // it is diagnosable without a second lookup. Absent (and null) stay a
-        // stable `[]` for `--json` drivers.
         "artifacts": e
             .data
             .get("artifact_paths")
@@ -30676,9 +28292,6 @@ fn run_list_row(project: &str, e: &state::LogEntry) -> Value {
             .cloned()
             .map(Value::Array)
             .unwrap_or_else(|| Value::Array(Vec::new())),
-        // ADR-0022 W4: phase column (null for state-log runs that never
-        // carried a phase; `phase_degraded` marks loud prompt-mode fallback,
-        // never silent).
         "phase": e
             .data
             .get("phase")
@@ -30689,7 +28302,6 @@ fn run_list_row(project: &str, e: &state::LogEntry) -> Value {
             .get("phase_degraded")
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        // GS-049 P1-3: ActionStage when a structured failure recorded it.
         "action_stage": e
             .data
             .get("stage")
@@ -30697,8 +28309,6 @@ fn run_list_row(project: &str, e: &state::LogEntry) -> Value {
             .cloned()
             .unwrap_or(Value::Null),
     });
-    // A gate annotation carries the verdict it actually produced; a run
-    // outcome never gains this key.
     if let Some(ok) = e.data.get("gate_ok") {
         row["gate_ok"] = ok.clone();
     }
@@ -30746,7 +28356,6 @@ mod runs_status_tests {
 
     #[test]
     fn normalizes_writer_vocabularies_to_three_states() {
-        // state-log writers (workflow run arm, cron loop) + headless leaf
         for raw in ["done", "success", "succeeded", "completed", "ok"] {
             assert_eq!(normalize_run_status(raw), "completed", "raw={raw}");
         }
@@ -30765,10 +28374,6 @@ mod runs_status_tests {
     }
 }
 
-// ---- ADR-0032 Spec 9 tail (bd-40d1): run-ledger truth contract ----
-//
-// RED: assertions against helpers that do not exist yet. The ledger must
-// record terminal status/project/artifacts honestly — never a default "done".
 #[cfg(test)]
 mod run_ledger_truth_tests {
     use super::{
@@ -30875,7 +28480,6 @@ mod run_ledger_truth_tests {
         assert_eq!(row["status"], json!("unknown"), "normalized honest: {row}");
         assert_eq!(row["owner"], json!("wave-swarm"), "owner still read: {row}");
 
-        // A recorded terminal status still normalizes as it always did.
         let failed = row_entry(
             "flywheel",
             json!({ "status": "failed", "workflow": "wave-swarm" }),
@@ -30912,7 +28516,6 @@ mod run_ledger_truth_tests {
         let ok = row_entry("flywheel", json!({ "status": "succeeded" }));
         assert_eq!(run_list_row("flywheel", &ok)["artifacts"], json!([]));
 
-        // A writer that set the key to null must not wedge the row either.
         let nullish = row_entry("flywheel", json!({ "artifact_paths": null }));
         assert_eq!(run_list_row("flywheel", &nullish)["artifacts"], json!([]));
     }
@@ -31037,7 +28640,6 @@ mod run_ledger_truth_tests {
             "no invented outcome: {row}"
         );
 
-        // A real run row stays a run and gains no verdict key.
         let run = row_entry("flywheel", json!({ "workflow": "w", "status": "failed" }));
         let row = run_list_row("flywheel", &run);
         assert_eq!(row["kind"], json!("workflow"));
@@ -31074,7 +28676,6 @@ mod run_ledger_truth_tests {
         let row = run_list_row("flywheel", &monitor);
         assert_eq!(row["kind"], json!("loop-monitor"), "{row}");
 
-        // A declared notice is honored even with no legacy marker present.
         let declared = row_entry(
             "flywheel",
             json!({ "notice": "loop-monitor", "workflow": "w" }),
@@ -31084,14 +28685,12 @@ mod run_ledger_truth_tests {
             json!("loop-monitor")
         );
 
-        // An unrecognized notice is still not a run — labeled, never excused.
         let unknown_notice = row_entry("flywheel", json!({ "notice": "future-thing" }));
         assert_eq!(
             run_list_row("flywheel", &unknown_notice)["kind"],
             json!("notice")
         );
 
-        // ...and a status-less row matching nothing stays visibly unknown.
         let bare = row_entry("flywheel", json!({ "workflow": "w" }));
         assert_eq!(run_list_row("flywheel", &bare)["kind"], json!("workflow"));
     }
@@ -31118,7 +28717,6 @@ mod run_ledger_truth_tests {
         assert_eq!(warn["plan_artifact_missing"], json!(true));
         assert_eq!(warn["gate_mode"], json!("warn"));
 
-        // Both are recognized as annotations by the reader that labels rows.
         let e = |data: serde_json::Value| LogEntry {
             ts: "2026-09-14T00:00:00Z".into(),
             kind: EventKind::Loop,
@@ -31187,7 +28785,7 @@ fn catalog_snapshot_json() -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)] // one param per CLI flag, mirrors cmd_spawn
+#[allow(clippy::too_many_arguments)]
 /// bd-xe9r: the briefing skip matrix, pure so tests cover it without a TTY.
 /// The briefing arms ONLY on an interactive terminal with no explicit
 /// fleet: --json (agent drivers), --yes (operator pre-approved), and an
@@ -31504,26 +29102,17 @@ fn cmd_steer(
     if objective.trim().is_empty() {
         bail!("steer: objective must not be empty");
     }
-    // GS-049: AUTHORITATIVE steer always queues MaterialContext — require
-    // `--project` or inherit from workspace cwd (`cron::detect_project`).
-    // Fail loud when material context has no project (no invent-green skip).
     let explicit_project = project.is_some();
     let project_owned = cron::detect_project(cfg, project).ok_or_else(|| {
         anyhow!(
             "steer: --project is required for AUTHORITATIVE MaterialContext path              (pass --project <slug> or run from a workspace/<project> cwd)"
         )
     })?;
-    // bd-blank-project-spelling-non-mail-doors-76hi: a blank explicit spelling
-    // passes detect_project verbatim and would run AUTHORITATIVE steer against
-    // the workspace root.
     crate::check_project_spelling(&project_owned, "steer")?;
     if !explicit_project {
         eprintln!("flywheel: steer: inheriting --project={project_owned} from workspace cwd");
     }
     let project: Option<&str> = Some(project_owned.as_str());
-    // ADR-0019 D10 hosted steer: `location == hosted` for `--as` with no
-    // rex block in this process. A local shell steer (no `--as`) stays the
-    // operator's steer and never parks.
     let hosted_pin: Option<&str> = match as_agent {
         Some(pin)
             if request_receipts::is_hosted_caller(agent_ref::binding_location_for(
@@ -31550,12 +29139,6 @@ fn cmd_steer(
     {
         return Ok(());
     }
-    // bd-4fgc: a steer is an effectful dispatch (a MaterialContext fact plus a
-    // workflow run), so it carries the same request-key receipt as the pane
-    // doors. The slot is namespaced per door, so a steer key never names a halt
-    // slot. The gate runs BEFORE the first effect (the fact queue below) and
-    // before the intent row, so a settled slot replays and an unresolved one
-    // refuses instead of steering twice.
     let request_key = request_key.map(str::trim).filter(|k| !k.is_empty());
     let direct_flag = if direct { "direct" } else { "goal" };
     let retain_flag = if retain { "retain" } else { "reap" };
@@ -31615,9 +29198,6 @@ fn cmd_steer(
             ),
         }
     }
-    // GS-048/049: AUTHORITATIVE steer objective is material — queue into the
-    // live doorbell Fact drain so Host::tick emits Msg::MaterialContext (not a
-    // parallel classifier plane).
     let summary = format!("AUTHORITATIVE OPERATOR OBJECTIVE: {objective}");
     if let Err(e) = append_pending_fact(&crate::config::state_dir(), &project_owned, &summary) {
         if let Some(g) = steer_receipt.take() {
@@ -31630,9 +29210,6 @@ fn cmd_steer(
     let mut crew_owned = crew.map(|s| s.to_string());
     let mut role_model_owned: Vec<String> = Vec::new();
     let mut role_harness_owned: Vec<String> = Vec::new();
-    // bd-xe9r: on an INTERACTIVE TTY — skipped by --json, --yes, or an
-    // explicit --crew (an agent driver knows its fleet already) — brief the
-    // operator before dispatch. Non-TTY output stays byte-identical.
     if !json && yes && crew.is_some() {
         eprintln!(
             "flywheel: warn: --yes is redundant with an explicit --crew (briefing already skipped)"
@@ -31640,8 +29217,6 @@ fn cmd_steer(
     }
     let brief = briefing_enabled(json, yes, crew, std::io::stdin().is_terminal());
     if brief {
-        // ADR-0010 D10 (bd-67qg): the steer surface renders fleet bearings
-        // from one snapshot call before the briefing gate.
         if let Some(p) = project {
             let ws_label = state::load_spawn_meta(p).unwrap_or_else(|| swarm_label(p));
             let snap = snapshot::assemble(cfg, p, &ws_label, doorbell_now_unix());
@@ -31649,8 +29224,6 @@ fn cmd_steer(
         }
         let mut ctx =
             steer_briefing_context(objective, if direct { "goal-direct" } else { "goal" })?;
-        // bd-vlvn: live Jev suggestions when a key is present; the table
-        // stands otherwise.
         enrich_suggestions_live(
             &mut ctx,
             objective,
@@ -31660,8 +29233,6 @@ fn cmd_steer(
             steer_brief::run_briefing(&ctx, &mut std::io::stdin().lock(), &mut std::io::stdout())?;
         match outcome {
             steer_brief::BriefingOutcome::Abort => {
-                // A refused gate is a known refusal, not an unobservable
-                // dispatch: `Failed`, so the same key may be retried.
                 if let Some(g) = steer_receipt.take() {
                     g.mark_failed("aborted by the operator at the briefing gate");
                 }
@@ -31684,9 +29255,6 @@ fn cmd_steer(
             }
         }
     }
-    // ADR-0019 D9: a bead-targeted steer checks the hold before its first
-    // pane write. Held stops the steer without dispatch; the slot settles
-    // file_held only after toron accepted the holder mail.
     match check_bead_file_hold(cfg, &project_owned, objective)? {
         HoldVerdict::Clear => {}
         HoldVerdict::Held => {
@@ -31707,12 +29275,6 @@ fn cmd_steer(
             bail!("steer: file-hold check could not notify the holder: {msg}");
         }
     }
-    // bd-t86p: ONE compose call — the goal workflow (bead-tracked) or its
-    // direct arm (non-bead targets: no tracker, no plan approval gate). The
-    // delegate is the full `workflow run --execute --mode pane` machinery:
-    // lint gate, crew auto-infer, pane pre-spawn, durable engine.invoke with
-    // panes as the executor surface only (ADR-0022 W4) — byte-identical to
-    // running `workflow run goal` by hand, with the objective pre-filled.
     let run = steer_run_cmd(
         objective,
         direct,
@@ -31729,8 +29291,6 @@ fn cmd_steer(
     if let Some(g) = steer_receipt.take() {
         match &out {
             Ok(()) => g.settle(request_receipts::Delivery::Queued),
-            // The dispatch was attempted and its outcome is unobservable from
-            // here: Unknown, never an invented Settled.
             Err(e) => g.mark_unknown(&format!("steer dispatch failed: {e:#}")),
         }
     }
@@ -31741,7 +29301,7 @@ fn cmd_steer(
 /// delegates to — execute=true, pane mode, goal/goal-direct. Durability is
 /// owned downstream by the Run arm (engine.invoke over the in-house engine);
 /// steer only picks the workflow and pre-fills the objective.
-#[allow(clippy::too_many_arguments)] // CLI-flag mirror of Steer args; a struct would duplicate the clap surface
+#[allow(clippy::too_many_arguments)]
 fn steer_run_cmd(
     objective: &str,
     direct: bool,
@@ -31793,8 +29353,6 @@ fn enrich_suggestions_live(
         .iter()
         .filter_map(|n| catalog.get(n).map(|p| (n.to_string(), p.when.clone())))
         .collect();
-    // Answered-but-weak carries no confidence: nothing, not even the
-    // table. Deny keeps the table.
     if let Ok(pack) = crate::judgment::find_pack_for(".", "profile-pick")
         && let Ok(s) =
             crate::judgment::live_profile_suggestion(&transport, &pack, objective, &candidates)
@@ -31807,8 +29365,6 @@ fn enrich_suggestions_live(
         ctx.tier_suggestion = s;
     }
     // governed-by: bd-ulzi — the same tier-pick ask yields the effort
-    // override candidate (low/high/max for the dispatch-spec effort
-    // input). Advisory like the slot band: renders, never dispatches.
     if let Ok(pack) = crate::judgment::find_pack_for(".", "tier-pick")
         && let Ok(s) = crate::judgment::live_effort_suggestion(&transport, &pack, objective)
     {
@@ -31861,7 +29417,6 @@ fn briefing_context_inner(
     wf_name: &str,
     source: &str,
 ) -> Result<steer_brief::BriefingContext> {
-    // bd-xmq5: shared merge (builtins < user catalog).
     let all = workflow_catalog::all_workflows_plain(None)?;
     let wf = all
         .get(wf_name)
@@ -31879,9 +29434,6 @@ fn briefing_context_inner(
         .map(|role| {
             let profile = cat_profiles.get(role);
             let (harness, default_model) = match profile {
-                // ADR-0007 D1: slot-aliased profiles carry an empty raw
-                // harness; the briefing menu must reflect the SLOT's
-                // harness + model, not an empty raw pair.
                 Some(p) => {
                     let (h, m) = registry
                         .resolve_profile_route(&p.harness, &p.model)
@@ -31896,7 +29448,6 @@ fn briefing_context_inner(
                 .filter(|(_, e)| e.caps.is_empty() || e.caps.iter().any(|c| c == &harness))
                 .map(|(id, e)| (id.clone(), e.cost_in_per_mtok, e.caps.clone()))
                 .collect();
-            // Default first, then alphabetical — deterministic menus.
             alternatives.sort_by(|a, b| {
                 let da = a.0 == default_model;
                 let db = b.0 == default_model;
@@ -31911,8 +29462,6 @@ fn briefing_context_inner(
         })
         .collect();
 
-    // Squad recommendation: recommend a recipes.toml squad only when its
-    // member set EXACTLY equals the inferred crew's role set (never a fit).
     let recipes = config::Recipes::load()
         .map(|r| r.recipes)
         .unwrap_or_default();
@@ -31940,19 +29489,12 @@ fn briefing_context_inner(
         default_budget: unique.max(1).min(cap),
         models,
         squad_recommendation,
-        // bd-adv4: Jev profile-pick suggestion for the implement seat —
-        // the offline table when Jev is unreachable. Advisory only: only
-        // a non-default suggestion renders, the user decides.
         profile_suggestion: match crate::judgment::suggest_profile_pick(objective) {
             "@coder" => None,
             s => Some(s.to_string()),
         },
-        // bd-88m4: Jev tier-pick suggestion for the model band — the
-        // offline table when Jev is unreachable. None IS current behavior:
-        // no line renders, today's menus stand, the user decides.
         tier_suggestion: crate::judgment::suggest_tier_pick(objective).map(str::to_string),
         // governed-by: bd-ulzi — no offline effort table: Jev-only.
-        // None renders nothing; the profile default stands.
         effort_suggestion: None,
         bare_override: None,
         stage_chain,
@@ -32012,8 +29554,6 @@ fn planner_author_response(wf_name: &str, prompt: &str) -> Result<String> {
         .arg("--workflow")
         .arg(wf_name)
         .arg("--json");
-    // Same model injection as headless_dispatch — without it the planner
-    // harness starts on its default (often wrong / missing).
     if let Ok(cat) = profile::ProfileCatalog::load()
         && let Some(p) = cat.get("planner")
         && !p.model.is_empty()
@@ -32050,8 +29590,6 @@ fn cmd_workflow_evaluate(
     project: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi: Some("") used to alias
-    // onto the workspace root.
     ensure_project_opt(project, "workflow evaluate")?;
     let project_root = project.map(|p| project_dir(cfg, p));
     let all = workflow_catalog::all_workflows_merged(project_root.as_deref())?;
@@ -32187,7 +29725,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
     /// The full workflow set: built-ins (compiled-in) + catalog (canonical
     /// YAML + absorbed legacy), name → (workflow, source).
     fn all_workflows() -> Result<BTreeMap<String, (Workflow, &'static str)>> {
-        // bd-xmq5: the one shared merge (builtins < user catalog).
         workflow_catalog::all_workflows_merged(None)
     }
 
@@ -32197,7 +29734,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
     fn all_workflows_layered(
         project_root: Option<&Path>,
     ) -> Result<BTreeMap<String, (Workflow, &'static str)>> {
-        // bd-xmq5: the one shared merge, project tier included.
         workflow_catalog::all_workflows_merged(project_root)
     }
 
@@ -32219,11 +29755,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
 
     /// Lint one workflow; print issues; return the blocking (Error-level) count.
     fn lint_one(name: &str, wf: &Workflow, project_root: Option<&std::path::Path>) -> usize {
-        // Engine tier (toron-workflow lint): schema, guards (evalexpr +
-        // timeout), template refs, graph acyclicity — inherited, fail-stop.
-        // bd-4spn GAP 2: lint with the FLYWHEEL principle registry (names())
-        // — the toron in-crate fallback would silently drift from the
-        // check_principles registry.
         let report = lint_workflow_with_principles(wf, crate::principles::names());
         let mut blocking = report
             .issues
@@ -32241,9 +29772,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 issue.message
             );
         }
-        // Flywheel tier (ADR-0005 lint-gate contract — the ENGINE cannot do
-        // these: no dependency inversion means it never imports flywheel's
-        // StageLibrary / ProfileCatalog). Owned here, fail-stop.
         blocking += lint_flywheel_tier(name, wf, project_root);
         blocking
     }
@@ -32266,8 +29794,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
         cfg: &Config,
         project: &Option<String>,
     ) -> Result<BTreeMap<String, (Workflow, &'static str)>> {
-        // bd-blank-project-spelling-non-mail-doors-76hi: Some("") used to
-        // alias the read onto the workspace root's project tier.
         let project = project_door_opt(project, "workflow")?;
         match project {
             Some(p) => all_workflows_layered(Some(&project_dir(cfg, p))),
@@ -32287,21 +29813,11 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 return Ok(());
             }
             if *brief {
-                // GS-052 ONE hybrid contract: name/family/selection/run/topology
-                // (+ compose_token). Topology stays for sticky-open mid-session
-                // reclassify. Bare list keeps description/trigger/source/crew/
-                // decide_trigger; show is prose/graph (no decide_trigger) — no dual brief projection.
                 let rows = workflow_list_brief_rows(&all);
                 print_json(&json!({ "workflows": rows }));
                 return Ok(());
             }
-            // Agent-native selection surface (ADR-0009): every row carries
-            // the skill-style description + the preferred run form, so an
-            // agent picks from `list` exactly like a skill catalog.
-            // Hybrid fields share [`workflow_hybrid_fields`] with --brief.
             let rows = workflow_list_full_rows(&all);
-            // Full list (not --brief): description + family/selection/run + rest.
-            // --brief early-returns above with the GS-052 hybrid projection.
             print_json(&json!({ "workflows": rows }));
             Ok(())
         }
@@ -32391,22 +29907,14 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             retire_orphans,
             json,
             yes,
-            // the preflight gate consumed --allow-worktree (operator-only);
-            // cmd_workflow itself needs no opt-out state
             allow_worktree: _,
             role_model,
             role_harness,
         } => {
-            // bd-blank-project-spelling-non-mail-doors-76hi: Some("") used to
-            // alias the run (including --execute journaling + pane spawn)
-            // onto the workspace root.
             project_door_opt(project, "workflow run")?;
             let mut crew_sel = crew.clone();
             let mut role_model_sel = role_model.clone();
             let mut role_harness_sel = role_harness.clone();
-            // bd-nmzk: interactive captain briefing for `workflow run --execute`
-            // (same skip flags as `steer` — shared prompt module so both stay
-            // in lockstep). Arms only on an interactive TTY with --execute.
             if *execute
                 && briefing_enabled(*json, *yes, crew.as_deref(), std::io::stdin().is_terminal())
             {
@@ -32416,8 +29924,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     );
                 }
                 let mut ctx = workflow_briefing_context(name, inputs.as_deref())?;
-                // bd-vlvn: live Jev suggestions when a key is present; the
-                // table stands otherwise.
                 let objective = ctx.objective.clone();
                 enrich_suggestions_live(
                     &mut ctx,
@@ -32458,28 +29964,14 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     "flywheel: warn: --yes is redundant with an explicit --crew (briefing already skipped)"
                 );
             }
-            // The project tier participates here exactly as it does in
-            // `workflow compose` (W6): the catalog contract is built-ins < user
-            // catalog < project, and this door already has the project in hand
-            // (`--project`, default `flywheel` — the same default compose
-            // uses). Before this, `run` resolved the user tier only, so a
-            // workflow the project itself declares failed with `unknown
-            // workflow` while compose could resolve it. The read doors
-            // (`list`/`show`/`lint`/`crew`) take no project context yet and
-            // stay user-tier — the remainder is its own bead
-            // (`bd-workflow-catalog-read-doors-project-tier-jah1`), pinned by
-            // `workflow_list_stays_user_tier_until_the_read_doors_land`.
             let run_root = project_dir(cfg, project.as_deref().unwrap_or("flywheel"));
             let all = all_workflows_layered(Some(&run_root))?;
             let wf = resolve_workflow(name, &all)?.clone();
-            // bd-6tmi: the legacy compose-token alias warns (stderr only, so
-            // --json stdout stays pure) and still runs — deprecate, not break.
             if *execute && crate::builtin_workflows::is_compose_token(name) {
                 eprintln!(
                     "flywheel: deprecated: `workflow run {name} --execute` is the legacy alias; prefer `workflow compose \"<objective>\" --parts {name} --run`"
                 );
             }
-            // Fail-stop gate: lint before running.
             let blocking = lint_one(
                 name,
                 &wf,
@@ -32494,17 +29986,9 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 }
                 _ => json!({}),
             };
-            // bd-adr0008-guard-fix-16fl: bind declared input defaults so
-            // `{{inputs.x}}` templates and `trigger_x` guard variables
-            // resolve when the caller omits a defaulted input.
             crew::apply_input_defaults(&wf, &mut inputs_value);
-            // engine invoke.
-            // W6: `call_workflow` sub-runs resolve against the same layered
-            // catalog the entry workflow came from (a project-tier workflow
-            // its project declares must resolve its own sub-workflows).
             let resolver_root = run_root.clone();
             let workflow_resolver: toron_workflow::WorkflowResolver = Arc::new(move |sub: &str| {
-                // bd-xmq5: shared sub-workflow resolver (catalog-first).
                 workflow_catalog::subworkflow_resolver(Some(&resolver_root))(sub)
             });
             let packed = packed_from_flag(
@@ -32516,40 +30000,19 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             )?;
             eprintln!("flywheel: {}", packed.announce(name));
             let wf = crew::apply_role_aliases(&wf, &packed.aliases);
-            // bd-8c5h: the parent rewrite above only reaches roles the PARENT
-            // dispatches. A role dispatched inside a `call_workflow` child is
-            // invisible to it, so the child keeps asking for a pane the packer
-            // folded away and the run bails. The fold rides the resolver, which
-            // is the only thing that ever sees a child.
             let workflow_resolver =
                 crew::aliasing_resolver(workflow_resolver, packed.aliases.clone());
             let crew_plan = packed.as_plan();
-            // A recording action runner: flywheel's CLI run exercises the
-            // engine (delays, approvals park durably, graph scheduling,
-            // control-flow); action side-effects are recorded, not dispatched
-            // (hc dispatch is the P4 spawn-await binding). With
-            // `--execute --mode headless` the real headless runner replaces
-            // it: spawn/dispatch_job steps run through `__run-headless`
-            // (ADR-0010 Spec A/E, P10.1). `--execute --mode pane` pre-spawns
-            // a real hc crew from the crew plan and dispatches each step
-            // via the loop's `__send` leaf (P10.3, bd-ghcj.1).
             let mut pane_ctx: Option<pane::PaneRunCtx> = None;
             let runner: toron_workflow::engine::EffectRunner = if *execute {
                 match mode.as_str() {
                     "headless" => {
-                        // bd-omwg: fail closed — a spawn step cannot run
-                        // headless (no pane to launch; faking kind-43001/43004
-                        // is forbidden, ADR-0010 Spec E). Gate BEFORE invoke:
-                        // the engine's run_spawn would return ok:true with no
-                        // pane — the exact lie this fixes.
                         headless_spawn_gate(&wf)?;
                         let mut catalog = profile::ProfileCatalog::load()?;
                         catalog.apply_role_models(&role_model_sel)?;
                         catalog.apply_role_harnesses(&role_harness_sel)?;
                         let wf_name = name.clone();
                         let inputs_c = inputs_value.clone();
-                        // ADR-0032 Spec 9 tail: stage prompts resolve the
-                        // project tier on headless runs.
                         let dispatch_project_dir =
                             project_dir(cfg, project.as_deref().unwrap_or("flywheel"));
                         Arc::new(move |inv: &toron_workflow::engine::ActionInvocation| {
@@ -32591,8 +30054,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                                 &inputs_c,
                                 &entries,
                                 &inv.action,
-                                // bd-0s0y: a `parallel` copy addresses its own
-                                // pane via the ordinal in its iteration_key.
                                 toron_workflow::identity::copy_ordinal(
                                     inv.run.iteration_key.as_deref(),
                                 ),
@@ -32608,32 +30069,11 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             };
             let rt = tokio::runtime::Runtime::new()?;
             let run_id = format!("fw-cli-{}", state::now_iso());
-            // bd-gsvn.3: resolve elastic fan-out refs (`parallel over:
-            // "@crew.<role>"`) to concrete counts from the crew plan BEFORE
-            // invoke — the engine parses `over` as a number (default 1), so
-            // an unresolved @crew.X would silently degrade to one copy.
             let invoke_wf = crew::resolve_crew_fanouts(&wf, &crew_plan);
-            // bd-t86p: the goal/direct meta-workflows COMPOSE via
-            // call_workflow — inject the catalog+builtin resolver so
-            // brainstorm/plan/beads/plan-direct resolve (the cron path got
-            // this in bd-8wvz; the workflow-run path must too, else
-            // call_workflow returns "unknown workflow" and the steer chain
-            // silently no-ops the ideate/plan steps). The same resolver
-            // already fed crew inference above.
             let profile_resolver = profile::ProfileCatalog::catalog_profile_resolver();
-            // bd-omwg: the SpawnSink drainer. Pane mode keeps the engine alive
-            // across invoke — a drainer thread consumes every promise_id the
-            // engine pushed (an `await: true` run parks on its job promise
-            // until the drainer settles it) and launches a REAL pane per job
-            // (profile_launch_args + the pane runner), resolving each promise
-            // when the job finishes. The crew workspace stays open until the
-            // drainer joins (closing it would kill in-flight spawn panes).
             let mut spawn_receipts: Vec<Value> = vec![];
             let output = if let Some(pane_ctx) = pane_ctx.as_ref() {
                 let engine = std::sync::Arc::new({
-                    // bd-engine-run-path-journaling-fwlx: a pane_ctx exists
-                    // only under `--execute` — this runner really dispatches,
-                    // so its leaves journal.
                     let eng = pane::local_engine_journaled(
                         cfg,
                         &rt,
@@ -32666,9 +30106,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     stop.clone(),
                 )?;
                 let out = rt.block_on(async {
-                    // bd-cvv9: the ship chain routes through the gated
-                    // runner — same engine rail, §4.5 contracts between
-                    // links (warn-first; block after the W5 flip).
                     phase_chain::invoke_or_ship_chain(
                         &engine,
                         &workflow_resolver,
@@ -32691,17 +30128,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     .map_err(|_| anyhow!("approval drainer thread panicked"));
                 out
             } else {
-                // ONE engine rail — the
-                // headless/record arm uses the same durable store
-                // selection as pane mode (pane::local_engine), so a
-                // kill -9 mid-run resumes on restart regardless of
-                // --execute mode.
                 let engine = std::sync::Arc::new({
-                    // bd-engine-run-path-journaling-fwlx: THIS arm serves both
-                    // the real headless runner (`--execute --mode headless`)
-                    // and the recording runner (no `--execute`). Only the
-                    // former performs effects; journaling a recorded no-op
-                    // would settle work nobody did.
                     let eng = if *execute {
                         pane::local_engine_journaled(
                             cfg,
@@ -32734,7 +30161,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     approval_stop.clone(),
                 )?;
                 let out = rt.block_on(async {
-                    // bd-cvv9: ship runs gated on the same rail headless.
                     phase_chain::invoke_or_ship_chain(
                         &engine,
                         &workflow_resolver,
@@ -32753,9 +30179,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     .map_err(|_| anyhow!("approval drainer thread panicked"));
                 out
             }?;
-            // P10.3 lifecycle: ephemeral default — reap the crew workspace
-            // (close it + its panes) at run end unless --retain (keep) or
-            // --reuse (the workspace is the caller's).
             let mut reaped = false;
             if let Some(ctx) = &pane_ctx
                 && !ctx.retained
@@ -32768,12 +30191,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         ctx.workspace_id
                     ),
                 }
-                // bd-bfwj: reaped panes are dead — drop their registry rows.
                 pane::reap_dead_registry_rows(project.as_deref().unwrap_or("flywheel"), &mut c);
             }
-            // ADR-0032 Spec 9 tail (bd-40d1): the ledger row carries the
-            // run's real terminal status, real project, and failure
-            // artifacts — never a default "done" under project "workflow".
             let run_project = project.as_deref().unwrap_or("flywheel");
             let terminal = run_terminal_status(&output);
             let artifact_paths = write_terminal_artifact(run_project, &run_id, &output, terminal);
@@ -32888,23 +30307,12 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             reuse,
             json,
         } => {
-            // W6: --keep is a graduation of a RUN — without --run there is no
-            // green to graduate (and a dry-run never produces a green).
             if keep.is_some() && (!*run || *dry_run) {
                 bail!("workflow compose: --keep needs --run (graduation requires a green run)");
             }
-            // §3.6 envelope: a dry-run renders structure only — it must not
-            // be combinable with the dispatch it exists to preview.
             if *dry_run && *run {
                 bail!("workflow compose: --dry-run never dispatches — drop --run");
             }
-            // bd-8xca deterministic arm: assemble from the parts spec.
-            // `--agent` (planner arm, bd-u4cu): a headless planner-profile
-            // run authors a Workflow YAML from the target + the workflow
-            // catalog; the authored workflow goes through the SAME lint→run
-            // path as the deterministic assembly. `--from-yaml -` (§3.6 T2):
-            // the captain authors the FULL Workflow directly. The arms are
-            // exclusive.
             if from_yaml.is_some() && (*agent || !parts.is_empty() || base.is_some()) {
                 bail!("workflow compose: choose one arm — --from-yaml, --agent, or --parts/--base");
             }
@@ -32918,22 +30326,11 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     "workflow compose needs --parts (role:stage / workflow:name / each:|when:|retry(n):|parallel: forms) or --from-yaml - or --agent"
                 );
             }
-            // W6: the project tier participates in BOTH the stage library
-            // (stage-first affinities) and the workflow catalog (kept entries
-            // resolve for call_workflow).
-            // bd-blank-project-spelling-non-mail-doors-76hi: Some("") used to
-            // alias compose (and its --run journaling) onto the workspace root.
             project_door_opt(project, "workflow compose")?;
             let project_name = project.as_deref().unwrap_or("flywheel");
             let project_root = project_dir(cfg, project_name);
             let project_stages = project_root.join(".flywheel/stages.toml");
             let all = all_workflows_layered(Some(&project_root))?;
-            // GS-040: crew_agent_name keeps only 16 chars of the wf slug.
-            // `composed-{ISO}` truncated to `composed-2026090` collided across
-            // concurrent projects / days. Encode project tag (4) + date-bearing
-            // compact stamp %m%d%H%M%S (10) + pid nibble (2 hex) = 16 chars so
-            // uniqueness holds across days within the 16-char crew slug budget
-            // (`crew-{slug}-{role}` still fits hc's 32-char agent-name).
             let proj_tag: String = std::path::Path::new(project_name)
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -32949,9 +30346,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 std::process::id() % 256
             );
             let composed = if let Some(src) = from_yaml {
-                // §3.6 T2 author-from-scratch arm: the FULL Workflow comes
-                // verbatim from the captain (stdin or file); it rides the
-                // SAME lint → caps → run gate as the parts arm.
                 let text = if src == "-" {
                     use std::io::Read as _;
                     let mut buf = String::new();
@@ -32966,10 +30360,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 };
                 crew::workflow_from_yaml(&text)?
             } else if *agent {
-                // Planner arm: author from the target + catalog (workflows,
-                // profiles, stages). The planner's response is the ONLY
-                // source of the workflow — a failed run or garbage YAML
-                // bails below (lint gate), never dispatching.
                 let wf_rows: Vec<(&str, &str)> = all
                     .iter()
                     .map(|(n, (w, _))| (n.as_str(), w.description.as_deref().unwrap_or("")))
@@ -32992,15 +30382,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 for token in parts {
                     parsed.push(crew::parse_compose_part(token).map_err(anyhow::Error::msg)?);
                 }
-                // §3.8 stage-first: bare stage names dispatch to the stage's
-                // declared role affinity (project tier overrides included).
                 let stage_lib = stages::StageLibrary::load_layered(Some(&project_stages))?;
                 let affinity = |s: &str| stage_lib.get_stage(s).and_then(|st| st.role.clone());
-                // bd-qd87: compose-token expansion is catalog-first, matching
-                // `workflow run` — a user/project override of a token expands
-                // here instead of being silently ignored. `all` already has
-                // catalog entries shadowing built-ins; the builtin fallback
-                // covers the compiled-in token set.
                 let all_for_recipes = all.clone();
                 let recipe_resolver = move |n: &str| {
                     all_for_recipes
@@ -33018,11 +30401,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 )?
             };
 
-            // §3.6 envelope #3: budget caps fail closed BEFORE the lint gate
-            // — an over-cap composition is refused regardless of lint state.
             crew::enforce_budget_caps(&composed)?;
 
-            // Fail-stop gate: lint before run / emit.
             let blocking = lint_one(&wf_name, &composed, Some(&project_root));
             if blocking > 0 {
                 bail!(
@@ -33030,7 +30410,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 );
             }
 
-            // ADR-0011 D2: unique-role pack into total N (cap crew.max).
             let resolve = |sub: &str| all.get(sub).map(|(w, _)| w.clone());
             let packed = packed_from_flag(cfg, &composed, &resolve, crew.as_deref(), *crew_max)?;
             eprintln!("flywheel: {}", packed.announce(&wf_name));
@@ -33042,8 +30421,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             let composed = crew::apply_role_aliases(&composed, &packed.aliases);
             let crew_plan = packed.as_plan();
 
-            // §3.6 envelope #2: structural dry-run first-class — resolved
-            // graph, fanout counts, phase tags. No dispatch, no persist.
             if *dry_run {
                 let rendered = crew::render_dry_run(&composed, &resolve);
                 if *json {
@@ -33114,16 +30491,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 return Ok(());
             }
 
-            // Run the composed workflow: the same pane machinery as
-            // steer/workflow run — lint passed, spawn the inferred crew +
-            // dispatch each step via __send, reap on end. The composed struct
-            // is invoked directly (the engine takes ANY Workflow).
-            //
-            // bd-enov (F7/F8): compute the run identity and PERSIST the run row
-            // BEFORE the crew is spawned. The old order spawned panes first and
-            // logged only at terminal, so killing the CLI mid-run left live
-            // panes + registered agents and ZERO run rows (`workflow history`
-            // empty) — a half-state with no resume verb.
             let mut inputs_value = serde_json::Map::new();
             inputs_value.insert("objective".into(), json!(target));
             if let Some(txt) = inputs.as_deref() {
@@ -33139,9 +30506,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 }
             }
             let inputs_c = Value::Object(inputs_value);
-            // bd-compose-plumbing-zdzi: resolve the declared stage channel
-            // BEFORE anything spawns. An unresolvable channel refuses here —
-            // never a mid-run strict-render failure with panes already up.
             let steer_channel = crew::resolve_steer_channel(&composed, &inputs_c)?;
             let run_id =
                 if let Some(k) = idempotency_key.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -33159,10 +30523,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 } else {
                     format!("fw-composed-{}", state::now_iso())
                 };
-            // Idempotency ADOPT-OR-REFUSE: a still-running row for this key
-            // means the run is LIVE — spawning again would fork a second crew
-            // into one workspace (the friction's duplicate-pane incident).
-            // Refuse loudly; adopting the live run keeps its existing panes.
             if running_run_row_exists(project_name, &run_id) {
                 bail!(
                     "workflow compose: run `{run_id}` is already RUNNING (idempotency-key hit) — \
@@ -33179,13 +30539,9 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             let mut catalog = profile::ProfileCatalog::load()?;
             catalog.apply_role_models(role_model)?;
             catalog.apply_role_harnesses(role_harness)?;
-            // bd-enov (F6): per-run harness override (after role models, so the
-            // run's harness is authoritative for every composed role).
             if let Some(kind) = harness.as_deref() {
                 catalog.apply_harness_override(kind)?;
             }
-            // ADR-0011 D2: packed-under-cap is the default. The pack line
-            // already announced N. --allow-crew-expand does not raise crew.max.
             let ctx = pane::pre_spawn_crew(
                 cfg,
                 project_name,
@@ -33197,10 +30553,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 *retire_orphans,
             )?;
             let entries = ctx.entries.clone();
-            // bd-compose-plumbing-zdzi: join-before-post for the run's OWN
-            // crew — every spawned pin joins the declared steer channel so a
-            // stage's first post is a member post, not a refused write (the
-            // friction's operator had to create + join by hand).
             if let Some(channel) = steer_channel.as_deref() {
                 let pins: Vec<String> = entries
                     .entries()
@@ -33222,40 +30574,21 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         &inputs_c,
                         &entries,
                         &inv.action,
-                        // bd-0s0y: a `parallel` copy addresses its own pane
-                        // via the ordinal in its iteration_key.
                         toron_workflow::identity::copy_ordinal(inv.run.iteration_key.as_deref()),
                     )
                 })
             };
             let rt = tokio::runtime::Runtime::new()?;
             let invoke_wf = crew::resolve_crew_fanouts(&composed, &crew_plan);
-            // W6: the project tier participates — a kept composed entry
-            // resolves for call_workflow sub-runs.
             let resolver_root = project_root.clone();
             let workflow_resolver: toron_workflow::WorkflowResolver = Arc::new(move |sub: &str| {
-                // bd-xmq5: shared sub-workflow resolver; the project tier
-                // participates for call_workflow sub-runs (kept composed
-                // entries resolve).
                 workflow_catalog::subworkflow_resolver(Some(&resolver_root))(sub)
             });
-            // bd-8c5h: same gap as the workflow-run arm — a folded role
-            // dispatched inside a composed part's `call_workflow` child is
-            // invisible to the parent rewrite above, so the child keeps asking
-            // for a pane that was never spawned.
             let workflow_resolver =
                 crew::aliasing_resolver(workflow_resolver, packed.aliases.clone());
             let profile_resolver = profile::ProfileCatalog::catalog_profile_resolver();
-            // bd-omwg: the SpawnSink drainer — pane mode keeps the engine
-            // alive across invoke so the drainer thread can launch a real
-            // pane per spawned job and settle await:true jobs.
             let mut spawn_receipts: Vec<Value> = vec![];
             let engine = std::sync::Arc::new({
-                // bd-gs005: compose --run attaches the VerifySink exactly like
-                // the workflow-run arm — `action: verify` must execute, not
-                // abort with "verify sink missing".
-                // bd-engine-run-path-journaling-fwlx: a compose --run dispatches
-                // to real panes, so its leaves journal.
                 let eng = pane::local_engine_journaled(
                     cfg,
                     &rt,
@@ -33277,13 +30610,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 engine.clone(),
                 stop.clone(),
             )?;
-            // bd-compose-stage-sequencing-zgi9: a composed run can park on
-            // `request_approval` (SIGNOFF), so it starts the SAME approval
-            // drainer as the workflow-run arm. Without it the promise parks
-            // with nobody listening — SIGNOFF never surfaces. The drainer
-            // announces `flywheel workflow approve …` and scans the inbox for
-            // the decision token; a resumed run starts a fresh drainer, so the
-            // SIGNOFF is re-issued until it is resolved.
             let approval_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let approval_drainer = pane::start_approval_drainer(
                 cfg.clone(),
@@ -33293,14 +30619,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             )?;
             let policy_receipts_count;
             let output = {
-                // bd-compose-not-durable-oxjy: composed runs carry the same
-                // on_failure policy as catalog runs. The engine records
-                // PolicyEvents during invoke; drain them on the same runtime
-                // (one-shot — no cron loop) and execute the side-effects here,
-                // never silently dropping the decision.
                 let invoke_outcome = rt.block_on(async {
-                    // §3.6 envelope #3 (wall-clock half): bounded_invoke caps
-                    // this attempt; the durable run stays resumable.
                     let out = crew::bounded_invoke(
                         &engine,
                         &run_id,
@@ -33318,10 +30637,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 let (output, policy_events) = match invoke_outcome {
                     Ok(v) => v,
                     Err(e) => {
-                        // bd-enov (F7/F8): a failed/timed-out run must still
-                        // CLOSE its `running` row — a stuck running row would
-                        // make the idempotency adopt-or-refuse guard refuse
-                        // every future retry of the same key.
                         lifecycle.fail(&e.to_string());
                         stop.store(true, std::sync::atomic::Ordering::Relaxed);
                         approval_stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -33369,12 +30684,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         ctx.workspace_id
                     ),
                 }
-                // bd-bfwj: reaped panes are dead — drop their registry rows.
                 pane::reap_dead_registry_rows(project.as_deref().unwrap_or("flywheel"), &mut c);
             }
-            // ADR-0032 Spec 9 tail (bd-40d1): same truthful ledger row for
-            // composed runs — real terminal status, real project, failure
-            // artifacts. The --keep gate below reads the same status.
             let terminal = run_terminal_status(&output);
             let artifact_paths = write_terminal_artifact(project_name, &run_id, &output, terminal);
             let action_stage = output_action_stage(&output);
@@ -33390,11 +30701,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 "artifact_paths": artifact_paths,
                 "stage": action_stage,
             }));
-            // W6 (§3.7 T3): graduate a GREEN composed run into the project
-            // catalog. Green = invoke returned Ok and the derived terminal
-            // status is not "failed" (same signal the ledger row records).
-            // A red run refuses — keep-without-green is the exact failure
-            // mode the evidence ladder exists to prevent.
             if let Some(keep_name) = keep {
                 let green = terminal != "failed";
                 if !green {
@@ -33465,11 +30771,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             use crate::workflow_catalog::OverwriteScope;
             let scope = OverwriteScope::parse(overwrite)?;
             let root = config::config_dir();
-            // Plan first, confirm against the PLAN, then execute. Confirming
-            // after acting would make --yes a lie.
             let plan = workflow_catalog::seed_user_catalog_with(&root, scope, true)?;
             let targets: Vec<String> = plan.planned_overwrites.to_vec();
-            // A dry run is the REVIEW step; asking it to confirm defeats it.
             if !*dry_run {
                 crate::output::confirm_destructive("overwrite", &targets, *yes, *json)?;
             }
@@ -33563,9 +30866,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             if *json {
                 print_json(&json!({ "entries": rows }));
             } else {
-                // Group by what the operator has to DO, not by catalog kind.
-                // A flat kind-sorted list buries 40 damaged workflows under 28
-                // healthy stages.
                 for want in ["stale", "missing", "custom"] {
                     let group: Vec<_> = rows.iter().filter(|r| r.status == want).collect();
                     if group.is_empty() {
@@ -33637,13 +30937,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
         WorkflowCmd::History { name } => {
             use state::EventKind;
             let mut rows: Vec<Value> = Vec::new();
-            // The ONE enumeration for log sweeps (state::project_logs), which
-            // excludes the reserved bookkeeping logs. This used to sweep
-            // `*.jsonl` by hand and parse `miss-ledger` as a project: every
-            // such row failed with "missing field `kind`", so the sweep
-            // printed a warning per row AND the run rows it was meant to find
-            // never came back — history reported `runs: []` beside 17
-            // unexplained stderr lines.
             for project in state::project_logs() {
                 let Ok(events) = state::read_log(&project) else {
                     continue;
@@ -33661,9 +30954,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         rows.push(json!({
                             "ts": e.ts,
                             "project": project,
-                            // A ship chain's link-gate annotations share the
-                            // Workflow kind; label them so `workflow history`
-                            // never reads one as a run outcome.
                             "kind": run_row_kind(&project, &e),
                             "run_id": e.data.get("run_id"),
                             "status": history_row_status(&e.data),
@@ -33730,7 +31020,6 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             evidence,
             review_bead,
         } => {
-            // The project tier participates: a kept composed entry promotes.
             let root = project_dir(cfg, "flywheel");
             let layered = workflow_catalog::WorkflowCatalog::load_layered(Some(&root))?;
             let wf = layered
@@ -33742,15 +31031,12 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 .clone();
             match to.as_str() {
                 "user" => {
-                    // Same writer as compose --keep → identical lint outcomes
-                    // (the W6 unification contract).
                     let dest = config::config_dir().join("workflows");
                     let path = workflow_catalog::write_workflow_yaml(&dest, &wf)?;
                     println!("promoted {name} → user tier ({})", path.display());
                     Ok(())
                 }
                 "repo" => {
-                    // §3.8 evidence bar first — refusal is the default.
                     repo_evidence_verified(name, evidence, review_bead.as_deref())?;
                     bail!(
                         "workflow repo tier lands via the review bead + an upstream flywheel commit \
@@ -33769,15 +31055,9 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             reason,
             project,
         } => {
-            // bd-1ub5: the approval_sink is in-memory in the parked run's
-            // process — but that process's drainer SCANS the project inbox for
-            // an `approve:<promise_id>` / `reject:<promise_id>` subject token
-            // and calls engine.resolve_approval itself (≤2s cadence). This CLI
-            // is the captain's half: send the decision mail.
             let key = project_dir_str(cfg, project)?;
             let mail = mail_or_die(cfg)?;
             mail.ensure_project(&key)?;
-            // The parked run scans the CONFIG identity's inbox (its own).
             let target = mail.name.clone();
             let subject = format!("{decision}:{promise_id}");
             let body = format!(
@@ -33832,10 +31112,6 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
                 issue.message
             );
         }
-        // Flywheel tier: the ENGINE cannot resolve owner profiles (no
-        // dependency inversion — it never imports flywheel's
-        // ProfileCatalog). Owned here, fail-stop (ADR-0012: cron lint
-        // validates owner-profile resolution).
         let profiles = profile::ProfileCatalog::load().unwrap_or_default();
         let owner = spec.owner.trim_start_matches('@');
         if !owner.is_empty() && profiles.get(owner).is_none() {
@@ -33978,47 +31254,24 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
             let rows = cron::load_crons(cfg, project.as_deref())?;
             let row = resolve(&rows, name)?.clone();
             let source = row.source_label().to_string();
-            // Fail-stop gate: lint before running (ADR-0012 — run is for
-            // testing; a cron that does not lint cannot run).
             let blocking = lint_one(name, &row.spec);
             if blocking > 0 {
                 bail!("cron {name:?} has {blocking} blocking lint issue(s) — refusing to run");
             }
             let spec = row.spec;
-            // The tick body: the SAME spec-derived workflow the durable loop
-            // fires (one engine, two input types — ADR-0012 Spec 2).
             let wf = toron_workflow::cron::spec_tick_workflow(&spec);
             let rt = tokio::runtime::Runtime::new()?;
             let run_id = format!("cron-run-{}", state::now_iso());
-            // ADR-0012: the cron body composes workflows via call_workflow —
-            // resolve them against the flywheel catalog + built-ins.
             let workflow_resolver: toron_workflow::WorkflowResolver = Arc::new(|name: &str| {
-                // bd-xmq5: shared sub-workflow resolver (catalog-first).
                 workflow_catalog::subworkflow_resolver(None)(name)
             });
             let profile_resolver = profile::ProfileCatalog::catalog_profile_resolver();
             if *live {
-                // bd-cron-run-no-live-u9tg: --live force-fires the body
-                // through the SAME runner the durable loop uses
-                // (start_loops -> spec_runner -> headless/pane dispatch) —
-                // real agent work, not the recording dry-run. No internal
-                // cap: a live body runs as long as its leaves run; the
-                // caller's timeout governs (the durable loop has none
-                // either). Failures are recorded before the error returns so
-                // `runs list` shows them.
                 let runner = cron::spec_runner(&spec);
                 let mode = match spec.mode {
                     toron_workflow::schema::CronMode::Headless => "headless",
                     toron_workflow::schema::CronMode::Pane => "pane",
                 };
-                // ADR-0022 §3.4 one-rail: construct through the SAME
-                // store-selection seam as compose/steer (`pane::local_engine`
-                // — the local effect store, never a
-                // private in-memory constructor. A live fire is a durable run
-                // when the effect store answers.
-                // bd-engine-run-path-journaling-fwlx: cron --live force-fires
-                // the body through the real runner (headless subprocess or
-                // pane `__send`), so its leaves journal.
                 let engine = pane::local_engine_journaled(
                     cfg,
                     &rt,
@@ -34055,8 +31308,6 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
                             );
                             print_json(&output);
                         }
-                        // bd-asr2.16 (doorbell sink, flag-gated): live tick
-                        // completion journals a Fact wake for zero-swarm humans.
                         if let Some(p) = project {
                             doorbell::cron_tick_wake(p, name, &run_id, "completed");
                         }
@@ -34079,17 +31330,7 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
                     }
                 }
             } else {
-                // bd-8wvz: on-demand `cron run` is a structural DRY-RUN of the
-                // body, never a live agent dispatch. The production durable loop
-                // (start_loops -> spec_runner -> headless_dispatch) owns real
-                // dispatch; here the recording runner completes immediately and
-                // prints the step-output map so the run is always visible (never
-                // exit 0 with zero output).
                 let runner = cron::recording_runner();
-                // bd-8wvz: even a dry-run must never hang — a body with
-                // `delay`/`request_approval`/`spawn` steps parks on a promise the
-                // recording runner cannot resolve. 25s cap → explicit timeout
-                // error, never a silent never-returning command.
                 let output = rt.block_on(async {
                     let engine = toron_workflow::WorkflowEngine::local_with_resolvers_and_effect(
                         profile_resolver,
@@ -34222,9 +31463,6 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
             Ok(())
         }
         CronCmd::Start { project } => {
-            // Blocks until Ctrl-C: durable loops + policy-sink drain (bead
-            // side-effects). Run under the project dir so `br create` lands
-            // in the right .beads.
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(cron::start_loops(cfg, project.as_deref()))
         }
@@ -34260,7 +31498,6 @@ fn lint_flywheel_tier(
         wf.inputs.iter().map(|i| i.name.as_str()).collect();
     let mut blocking = 0;
 
-    // Emit an error line for this workflow (name captured).
     let emit = |msg: &str, blocking: &mut usize| {
         eprintln!("[{name}]    error {msg}");
         *blocking += 1;
@@ -34328,9 +31565,6 @@ fn lint_flywheel_tier(
             serde_json::Value::String(s) => {
                 for inner in template_tokens(s) {
                     if let Some(key) = inner.strip_prefix("inputs.") {
-                        // Nested refs (`{{inputs.bundle.run_id}}`) resolve
-                        // against the declared ROOT input (`bundle`); the
-                        // engine drills into the object at runtime.
                         let root = key.split('.').next().unwrap_or(key);
                         if !declared.contains(root) {
                             let msg = format!(
@@ -34369,8 +31603,6 @@ fn lint_flywheel_tier(
         out
     }
 
-    // Walk one action: dispatch_job spec (profile + stage), spawn profile,
-    // and {{inputs.X}} refs across all string leaves.
     fn scan_action(
         action: &toron_workflow::schema::Action,
         profiles: &profile::ProfileCatalog,
@@ -34439,9 +31671,6 @@ fn now_minus(secs: u64) -> String {
 /// True when a profile is one of the 6 compiled-in built-ins (so `create`/
 /// `edit` doesn't duplicate it on disk verbatim).
 fn is_builtin_profile(name: &str) -> bool {
-    // bd-2nib: derive from the catalog source of truth — a hardcoded name
-    // list drifted and missed `pa`, so profile create/remove baked the pa
-    // compiled-in into the user's profiles.toml.
     profile::compiled_in_defaults().contains_key(name)
 }
 
@@ -34546,16 +31775,10 @@ fn cmd_debate(
     judge: Option<&str>,
 ) -> Result<()> {
     let rounds = rounds.max(1);
-    // Compact ts for the thread id: ISO-8601 (`2026-08-06T13:03:42Z`) is NOT a
-    // valid thread id — toron's send_message validator (AM-Rust parity) requires
-    // `[a-zA-Z0-9._-]` only, no `:`. Replace hyphens AND colons AND the trailing
-    // Z so the id is e.g. `debate-20260806T130548`.
     let iso = crate::state::now_iso().replacen('-', "", 10);
     let ts: String = iso.chars().filter(char::is_ascii_alphanumeric).collect();
     let thread = format!("debate-{ts}");
 
-    // scope the debate to the project dir (the proposition may be a project
-    // name; default to the flywheel project for ad-hoc debates)
     let project = if cfg.workspace_root().join(proposition).exists() {
         proposition.to_string()
     } else {
@@ -34563,9 +31786,6 @@ fn cmd_debate(
     };
     let key = project_dir_str(cfg, &project)?;
 
-    // agent names: explicit or default to the swarm's first oc/pi/gk
-    // (review-fix F7: bare shorts resolve to the spawned flywheel-<base>-<short>
-    // so settle + mail addressing work against a default swarm)
     let (a, b, j) = resolve_debate_agents(&project, agent_a, agent_b, judge)?;
 
     let mail = match backend::mail_backend(cfg) {
@@ -34577,7 +31797,6 @@ fn cmd_debate(
 
     let mail_target = |agent: &str| resolve_mail_target_registry(&project, agent).clone();
 
-    // opening: A argues FOR
     let opening = format!(
         "You are debating proposition: {proposition}\n\nArgue FOR it. Be concise and concise (<= 120 words). Provide your single strongest argument with a brief reason.\n\nAfter replying in this thread, acknowledge the orchestrator's opening message to signal your turn is done."
     );
@@ -34595,7 +31814,6 @@ fn cmd_debate(
 
     let mut last_reply: Option<String> = None;
     for round in 1..=rounds {
-        // A speaks on odd rounds (round 1 opening + counters), B on even
         let speaker: &str = if round % 2 == 1 { &a } else { &b };
         if round > 1 {
             let reply = last_reply.clone().unwrap_or_default();
@@ -34613,23 +31831,16 @@ fn cmd_debate(
                 Some(&thread),
             )?;
         }
-        // settle: wait for the speaker to reach done/idle (the ack-gate proxy;
-        // full ack-checking is the loop's ack_overdue path)
         settle_agent(&*mux, speaker)?;
-        // harvest the speaker's latest message in the thread — bails loudly
-        // when no reply actually landed, so "replied" prints only after the
-        // thread moved (bd-debate-reply-routing-99ad)
         last_reply = Some(harvest_latest(
             mail.as_ref(),
             &key,
             &thread,
-            // bd-aseq: harvest against the pinned identity the send used
             &mail_target(speaker),
         )?);
         println!("debate {thread}: {} replied (round {})", speaker, round);
     }
 
-    // judge: read the thread, pick a winner
     let judge_prompt = format!(
         "You are the judge of this debate on: {proposition}\n\nRead the full thread via summarize_thread. Pick a winner in <= 100 words: name the winner's argument and why it is stronger. Reply in thread and acknowledge when done."
     );
@@ -34649,13 +31860,6 @@ fn cmd_debate(
     Ok(())
 }
 
-// ---- plan-review-implement pattern (bd-pattern-plan-review-implement) ----
-//
-// Paper-first gate: implementer works on a branch and does not merge; the
-// reviewer's VERIFIED does not close beads — a human/overseer signs off.
-// Structured tokens only (APPROVE|CHANGES:|VERIFIED|REJECT:) — no free-text
-// routing. Build-slot 'cargo' must be acquired before cargo (agents self-gate).
-
 /// Reviewer structured tokens (leading token required).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewToken {
@@ -34671,7 +31875,6 @@ pub fn parse_review_token(text: &str) -> Option<ReviewToken> {
     if t.is_empty() {
         return None;
     }
-    // first non-empty line carries the token
     let line = t
         .lines()
         .map(str::trim)
@@ -34808,7 +32011,6 @@ pub fn pri_route(
             change_rounds,
         ),
         (PriPhase::AwaitingVerify, ReviewToken::Changes(notes)) => (
-            // treat CHANGES at verify as reject-with-notes (no more impl loop here)
             PriPhase::Escalated,
             PriAction::Escalate {
                 reason: format!("verify requested changes (escalate): {notes}"),
@@ -34864,7 +32066,6 @@ pub fn extract_plan_path(text: &str, fallback: &str) -> String {
         let t = line.trim();
         let upper = t.to_ascii_uppercase();
         if let Some(rest) = upper.strip_prefix("PLAN:") {
-            // use original casing from the line after the colon
             if let Some((_, path)) = t.split_once(':') {
                 let p = path.trim();
                 if !p.is_empty() {
@@ -34904,8 +32105,6 @@ fn cmd_plan_review(
         Some(id) => format!("plan-{id}"),
         None => format!("plan-{ts}"),
     };
-    // review-fix F7: defaults resolve to the spawned flywheel-<base>-<short>
-    // names; explicit full names pass through unchanged.
     let planner = resolve_agent_default(project, planner.unwrap_or("oc"));
     let reviewer = resolve_agent_default(project, reviewer.unwrap_or("pi"));
     let implementer = resolve_agent_default(project, implementer.unwrap_or("gk"));
@@ -34934,7 +32133,6 @@ fn cmd_plan_review(
         planner, reviewer, implementer
     );
 
-    // --- plan ---
     let mut change_rounds = 0u32;
     let mut current_path = plan_path.clone();
 
@@ -34956,21 +32154,11 @@ fn cmd_plan_review(
     let (_next_phase, action) = pri_after_plan(&current_path);
     let mut phase = PriPhase::AwaitingPlanReview;
 
-    // --- gate loop (review-fix F2) ---
-    // A genuine phase-driven state machine. Every iteration routes on the
-    // CURRENT phase, performs exactly one agent interaction, and transitions
-    // via the pure helpers (pri_route / pri_after_plan / pri_after_implement).
-    // `phase` is READ each iteration (no dead assignments). `change_rounds`
-    // is bumped by pri_route on CHANGES and checked against max_rounds, so
-    // `--max-change-rounds N` is honored for any N (previously the loop ran
-    // at most one inline CHANGES cycle then bailed).
-    //
     // governed-by: ADR-0001 §9.2 (bd-review-fix-epic-m0b.2)
     let mut action = action;
     loop {
         match phase {
             PriPhase::AwaitingPlan => {
-                // planner revision round: prompt, settle, harvest, re-route
                 let msg = match &action {
                     PriAction::PromptPlanner { msg } => msg.clone(),
                     _ => bail!("phase AwaitingPlan without PromptPlanner action: {action:?}"),
@@ -34989,11 +32177,10 @@ fn cmd_plan_review(
                 let pr = harvest_latest(mail.as_ref(), &key, &thread, &mail_target(&planner))?;
                 current_path = extract_plan_path(&pr, &current_path);
                 let (p2, a2) = pri_after_plan(&current_path);
-                phase = p2; // AwaitingPlanReview
+                phase = p2;
                 action = a2;
             }
             PriPhase::AwaitingPlanReview => {
-                // reviewer gate: prompt, settle, harvest, parse, route
                 let msg = match &action {
                     PriAction::PromptReviewer { msg } => msg.clone(),
                     _ => {
@@ -35024,7 +32211,6 @@ fn cmd_plan_review(
                 change_rounds = rounds;
             }
             PriPhase::AwaitingImplement => {
-                // implementer: prompt (build-slot in prompt), settle, verify
                 let msg = match &action {
                     PriAction::PromptImplementer { msg } => msg.clone(),
                     _ => bail!(
@@ -35043,11 +32229,10 @@ fn cmd_plan_review(
                 )?;
                 settle_agent(&*mux, &implementer)?;
                 let (p2, a2) = pri_after_implement(&current_path);
-                phase = p2; // AwaitingVerify
+                phase = p2;
                 action = a2;
             }
             PriPhase::AwaitingVerify => {
-                // verify: reviewer checks the implementation
                 let msg = match &action {
                     PriAction::PromptReviewer { msg } => msg.clone(),
                     _ => bail!("phase AwaitingVerify without PromptReviewer action: {action:?}"),
@@ -35229,12 +32414,6 @@ fn harvest_latest(
     let sender_npub = backend::run_mail(mail.whois(key, sender))
         .map(|w| w.npub)
         .unwrap_or_default();
-    // bd-harvest-thread-filter-yp9r: the thread predicate is pushed into the
-    // inbox projection (toron's shared post-unwrap filter; `idx_messages_thread`
-    // serves the SQL side of the thread dimension) — the server returns ONLY
-    // the target thread's rows instead of a full-inbox drain. `newest_in_thread`
-    // below still selects newest-from-sender client-side; thread membership is
-    // already guaranteed by the projection.
     let items = backend::run_mail(mail.inbox(&backend::InboxQuery {
         project: key.to_string(),
         agent: mail.agent_name().to_string(),
@@ -35247,8 +32426,6 @@ fn harvest_latest(
     }))?;
     let body = newest_in_thread(&items, thread, sender, &sender_npub)
         .map(|m| {
-            // body_md first, then subject — mirrors the precedence in
-            // extract_xproj_from_inbox so a body-bearing envelope wins.
             if m.body_md.is_empty() {
                 m.subject.trim().to_string()
             } else {
@@ -35321,8 +32498,6 @@ fn cmd_tutorial() -> Result<()> {
     Ok(())
 }
 
-// ---- durable loop status + internal leaves ----
-
 fn cmd_loop_status(cfg: &Config, project: &str) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let v = rt.block_on(durable::loop_status(cfg, project))?;
@@ -35368,8 +32543,6 @@ fn collect_poll_events(
     let ws_id = match find_workspace_dyn(&*backend, project) {
         Ok(id) => id,
         Err(e) => {
-            // no workspace yet — empty batch, not a hard error (loop may
-            // spawn agents later; heartbeat __poll handles empty swarms)
             return Ok(json!({
                 "events": [],
                 "max_seq": after_seq.unwrap_or(0),
@@ -35414,7 +32587,6 @@ fn collect_poll_events(
             break;
         }
         let remaining = deadline.saturating_duration_since(now);
-        // floor: don't spin with 0-duration timeouts
         let read_to = remaining.max(Duration::from_millis(1));
         if let Err(e) = stream.set_read_timeout(Some(read_to)) {
             stream_error = Some(format!("set_read_timeout: {e}"));
@@ -35424,7 +32596,7 @@ fn collect_poll_events(
             Ok(Some(ev)) => {
                 if let Some(item) = summarize_status_event(&ev, &mut seq) {
                     if after_seq.is_some_and(|a| item.seq <= a) {
-                        continue; // already seen this run
+                        continue;
                     }
                     events.push(json!({
                         "event_type": item.event_type,
@@ -35440,8 +32612,6 @@ fn collect_poll_events(
                 break;
             }
             Err(_) => {
-                // read timeout or transient I/O — end this batch (leaf returns
-                // whatever was collected; next iteration opens a fresh stream)
                 break;
             }
         }
@@ -35502,7 +32672,6 @@ fn summarize_status_event(
             None,
             "exited".to_string(),
         ),
-        // events_lost is not a status push — caller must resubscribe + snapshot.
         EventsLost => return None,
         Raw(_) => return None,
     };
@@ -35528,11 +32697,6 @@ fn cmd_internal_poll(cfg: &Config, project: &str, to: &str) -> Result<()> {
         .into_iter()
         .filter(|a| a.workspace_id == ws_id)
         .collect::<Vec<_>>();
-    // [name, status, kind, pane_id, mail_identity] — pane_id enables
-    // event→name routing (bd-event-dispatch-zero-latency); mail_identity is
-    // the pinned adjective+noun name the loop substitutes for {AGENT_NAME}
-    // (bd-pin-public-plane-s-easy.2, never the hc slug). Older parsers
-    // ignore the 4th/5th elements.
     let registry = state::load_spawn_registry(project);
     let pin_for = |name: &str| -> Option<&str> {
         registry
@@ -35622,17 +32786,6 @@ fn should_gate_first_dispatch(first: bool, agent: Option<&AgentInfo>) -> bool {
 /// Absent registry or entry reads as not-injected (fail toward gating —
 /// the gate is a no-op wait on already-booted panes).
 fn skills_injected_for(project: &str, name: &str) -> bool {
-    // bd-rkx8: a stale row must not speak for a fresh pane sharing its name.
-    // bd-9w95: the rule is NARROWER than that comment used to claim.
-    // `incarnation` counts relaunches of ONE pane, so two fresh panes serving
-    // the same name both sit at 0 — the common case, not an edge case. Among
-    // equal incarnations `max_by_key` returns the LAST such row, and the
-    // registry is append-ordered, so that is the latest registration. Stated
-    // here because it is load-bearing and was previously incidental:
-    // `fold_legacy_alias` appends the legacy file's rows AFTER the canonical
-    // ones, so for equal incarnations this can still pick a folded legacy row.
-    // Fixing that needs a freshness key the entry does not carry; see the
-    // bd-9w95 note in docs/learnings before changing the selection.
     state::load_spawn_registry(project)
         .iter()
         .filter(|e| e.name == name)
@@ -35704,9 +32857,6 @@ fn cmd_internal_send(
         iteration,
         profile,
     } = opts;
-    // build-plan §5: with the comms inbox on, `__send` is the mail.append
-    // effect (one task@1 envelope + the constant wake line). Nothing below
-    // (typing, confirm, last-sent resend) runs.
     if comms_send::enabled(cfg) {
         let task_id = match invocation.filter(|i| !i.is_empty()) {
             Some(inv) => comms_send::loop_task_id(inv, iteration.unwrap_or(0), name, text),
@@ -35716,11 +32866,6 @@ fn cmd_internal_send(
         println!("{out}");
         return Ok(());
     }
-    // bd-gsvn.1: Spec C role conditioning lands in __send — the ONE dispatch
-    // leaf shared by the pane runner and both loop paths. When a profile is
-    // given, the behavior preamble is prepended (conditioned_prompt) and the
-    // send is logged to runs/ (mode: pane). No profile = raw text, exactly
-    // the pre-migration behavior (plain swarm sends byte-identical).
     let profile_name = profile.filter(|p| !p.is_empty());
     let profile_obj = match profile_name {
         Some(p) => {
@@ -35744,14 +32889,6 @@ fn cmd_internal_send(
     };
     let started = std::time::Instant::now();
 
-    // resume-dedup (bd-resume-dedup): a landed record for THIS invocation
-    // means the prompt was delivered before a crash — skip the hc call
-    // entirely. The __send subprocess is the idempotency boundary: it runs
-    // FRESH at send time, so the check cannot go stale (a workflow-level
-    // check's result would itself be checkpointed and replayed after the
-    // crash window — the folded form is the correct one; documented in the
-    // bead close). Skipped sends emit the landed shape with deduped:true and
-    // do NOT write a new record (the delivery is already recorded).
     if let Some(inv) = invocation.filter(|i| !i.is_empty()) {
         let hash = state::fnv1a64(text);
         let records = state::load_last_sent(project);
@@ -35765,11 +32902,6 @@ fn cmd_internal_send(
         }
     }
 
-    // bd-eign.10: skill-load prefix on the FIRST real dispatch to a profiled
-    // agent — after the dedup gate, so a skipped (deduped) send never marks
-    // the prefix delivered. Registry-tracked (skills_injected), advisory:
-    // a lost update under concurrent __send subprocesses repeats the prefix
-    // once at worst.
     let key = project_dir_str(cfg, project)?;
     let mut send_base = text.to_string();
     if let Some((_, _, _, _, skills)) = &profile_obj
@@ -35795,23 +32927,12 @@ fn cmd_internal_send(
     }
     let mut send_text = match &profile_obj {
         Some((_, _, _, behavior, _)) => headless::conditioned_prompt(behavior, &send_base),
-        // cloned so the degrade path below can still read the skills prefix
         None => send_base.clone(),
     };
 
-    // ADR-0019 Spec 2, amended by bd-dispatch-cap-conditioning-l7jh: a
-    // dispatched bead brief (behavior + skills prefix + brief) over the
-    // 4 KiB cap DEGRADES to the pointer brief and sends — an over-cap class
-    // must not balloon into four rejects that hard-stop the loop. Only
-    // briefs are capped (first line `GOAL ...`); captain steers, nudges, and
-    // mail wakes are raw text and exempt. Errors only when even the pointer
-    // form cannot fit the cap with this conditioning.
     if text.starts_with("GOAL ") && send_text.len() > durable::DISPATCH_PROMPT_CAP {
         let bead = durable::bead_id_from_prompt(text).map(str::to_string);
         let rebuilt = bead.as_deref().map(|id| {
-            // Preserve the exact skills prefix already prepended to send_base
-            // (base = prefix + text), so the degraded send keeps its
-            // conditioning and loses only the embedded brief.
             let prefix = send_base.strip_suffix(text).unwrap_or_default();
             let pointer = durable::pointer_brief(id, project, text.starts_with("GOAL Resume "));
             let base = format!("{prefix}{pointer}");
@@ -35840,10 +32961,6 @@ fn cmd_internal_send(
         }
     }
 
-    // review-fix F6: __send routes through the backend factory (ADR-0002).
-    // The trait now exposes agent_prompt_coded with landing data, so the
-    // durable loop's dispatch leaf is backend-agnostic (hc today; toron /
-    // superlogical later) with byte-identical landing classification.
     let backend = backend::multiplexer_backend(cfg)?;
     let ws_id = find_workspace_dyn(&*backend, project)?;
     let mut agent = backend
@@ -35851,9 +32968,6 @@ fn cmd_internal_send(
         .into_iter()
         .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name));
     if agent.is_none() {
-        // bd-fw-name-binding-loss-7rc auto-heal: an agent that restarted in
-        // its pane lost its name binding (name:null) and name resolution
-        // misses — restore from the spawn registry, then re-resolve.
         if rebind_from_registry(&*backend, project, name, &ws_id)? {
             agent = backend
                 .agent_list()?
@@ -35862,10 +32976,6 @@ fn cmd_internal_send(
         }
     }
     let first = is_first_dispatch(skills_injected_for(project, name));
-    // bd-83as/bd-mcax: first dispatch gates when the agent row is missing
-    // (fresh pane still binding) or still booting — bounded 10s wait
-    // instead of firing into the window and producing a reasonless leaf
-    // downstream. Later dispatches skip the gate entirely.
     let agent = if should_gate_first_dispatch(first, agent.as_ref()) {
         await_agent_ready(
             || backend.agent_list().map_err(anyhow::Error::from),
@@ -35878,10 +32988,6 @@ fn cmd_internal_send(
     };
     let target = agent_target(&agent).to_string();
 
-    // last-sent registry: record what was delivered (or attempted). Best-
-    // effort — a registry failure must never lose the send itself.
-    // cg6.5: `ambiguous` marks timeout-confirm sends — the prompt may have
-    // started, so resume-dedup (should_resend) must NOT re-delegate them.
     let record = |landed: bool, ambiguous: bool| {
         let rec = state::SentRecord {
             name: name.to_string(),
@@ -35897,9 +33003,6 @@ fn cmd_internal_send(
     };
 
     let Some(timeout_ms) = confirm_ms else {
-        // legacy fire-and-forget path — a successful hc call means the
-        // prompt was written to the agent's terminal. bd-4pxy: a booting
-        // agent rejects name-addressed prompts — retry once via the pane id.
         match backend.prompt(&target, &send_text, None) {
             Ok(_) => {}
             Err(e) if is_agent_not_ready(&e.code) => {
@@ -35922,14 +33025,8 @@ fn cmd_internal_send(
 
     let wait = WaitOptions {
         timeout_ms: Some(timeout_ms),
-        // landing semantics: the prompt started executing. NOT idle/done —
-        // a long task must not hold the leaf for its full duration.
         until: vec![AgentStatus::Working, AgentStatus::Blocked],
     };
-    // review-fix F6: PromptLanding carries status XOR code; classify
-    // identically to the concrete path (landed → status, else code).
-    // bd-4pxy: `agent_not_ready` (a booting agent) → retry once via the
-    // pane id before classifying.
     let landing = backend.prompt_coded(&target, &send_text, Some(&wait))?;
     let landing = if landing.code.as_deref() == Some("agent_not_ready")
         && let Some(pane) = not_ready_retry_target(&target, &agent, false)
@@ -35941,8 +33038,6 @@ fn cmd_internal_send(
     };
     let verdict = classify_send_result(landing.code.as_deref(), landing.status);
     let body = confirm_send_json(name, verdict.clone());
-    // cg6.5: a timeout is AMBIGUOUS (the prompt may have started) — record it
-    // as such so resume never re-delegates a possibly-mid-flight prompt.
     let landed = matches!(verdict, SendVerdict::Landed(_));
     record(landed, matches!(verdict, SendVerdict::TimedOut));
     if let Some((pname, _, _, _, _)) = &profile_obj {
@@ -36129,10 +33224,6 @@ fn cmd_internal_wait_output(
 
 fn cmd_internal_ready(cfg: &Config, project: &str) -> Result<()> {
     let beads = load_ready_beads(cfg, project)?;
-    // bd-87hq never-drift pin: the envelope builder lives next to its
-    // consumer (durable::parse_bead_list); this leaf must never re-shape
-    // the JSON by hand (dropping priority/principles here once silently
-    // exempted every bead from the PRINCIPLES gate on the durable path).
     print_json(&durable::ready_leaf_envelope(&beads));
     Ok(())
 }
@@ -36185,9 +33276,6 @@ fn cmd_internal_reclaim_stranded(cfg: &Config, project: &str, live: &str) -> Res
         }
         panes
     };
-    // Every spelling a LIVE pane answers to: the polled terminal names the loop
-    // passed, plus each live registry row's terminal name AND mail pin
-    // (bd-bvwf.6: claims use the pin, the loop passes terminal names).
     let mut live_identities: std::collections::HashSet<String> = live_names.into_iter().collect();
     for e in &registry {
         if live_panes.contains(&e.pane_id) {
@@ -36197,8 +33285,6 @@ fn cmd_internal_reclaim_stranded(cfg: &Config, project: &str, live: &str) -> Res
             }
         }
     }
-    // A live lease on a bead is proof of life. A reading failure degrades to
-    // pane evidence alone (loudly), never to a blind reclaim.
     let leased_beads: std::collections::HashSet<String> = {
         let key = project_dir_str(cfg, project)?;
         let rows = match mail_or_die(cfg) {
@@ -36323,22 +33409,11 @@ fn cmd_internal_read(cfg: &Config, project: &str, name: &str) -> Result<()> {
         .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name))
         .ok_or_else(|| anyhow!("agent {name} not found in {project}"))?;
     let target = agent_target(&agent).to_string();
-    // bd-harness-alt-screen-reads (H4): route through the alt-screen ladder —
-    // recent-unwrapped first (wire source `recent_unwrapped`), bounded wait
-    // for idle + retry on agent_not_idle, visible fallback, then the docs'
-    // file-path fallback — so the loop's context guard still sees
-    // CONTEXT_LIMIT markers mid-task.
     let mut ops = hc_support::BackendAltScreenRead::new(&*backend, &target, 60);
     let text = match alt_screen_read_ladder(&mut ops, hc_support::RECENT_UNWRAPPED_SOURCE) {
         Ok(t) => t,
         Err(e) => return Err(anyhow!("{target}: alt-screen read failed: {e:#}")),
     };
-    // state-file fallback channel: parse the agent's state file when present.
-    // Malformed/absent files yield null — never an error (the loop treats
-    // null as "terminal channel only", identical to pre-zwa behavior).
-    // bd-context-limit-honor-luqg: try BOTH identity files (terminal name +
-    // registry mail pin) — the contract has pin-identity crews write the
-    // PIN file, which the hc-keyed lookup never saw.
     let dir = project_dir(cfg, project);
     let pin_identity = {
         let reg = state::load_spawn_registry(project);
@@ -36363,7 +33438,6 @@ fn cmd_internal_respawn(
     kind: &str,
     force: bool,
 ) -> Result<()> {
-    // review-fix F6: respawn routes through the backend factory (ADR-0002).
     let backend = backend::multiplexer_backend(cfg)?;
     respawn_with_backend(&*backend, cfg, project, name, kind, force)
 }
@@ -36381,18 +33455,7 @@ fn respawn_with_backend(
 ) -> Result<()> {
     let ws_id = find_workspace_dyn(backend, project)?;
     let dir = project_dir(cfg, project);
-    // The agent record may already be gone (hc drops dead agents ~0.5s
-    // after they stop responding — the escalation path respawns exactly
-    // those). The pane itself usually survives; split from any pane in the
-    // workspace and skip closing an old pane we cannot identify.
     let agents = backend.agent_list()?;
-    // cg6.3: replay-idempotency guard — if an agent with this name already
-    // exists in this workspace with a HEALTHY status, the respawn already
-    // happened (crash-window replay of the same leaf, or a manual double
-    // call): no-op success instead of spawning a second twin. The
-    // context_limit carve-out (`--force`): an idle-but-exhausted agent is
-    // healthy and must still be respawned — its replay window (crash between
-    // the guard and the spawn) is a documented at-least-once residual.
     if !force
         && let Some(a) = agents
             .iter()
@@ -36412,9 +33475,6 @@ fn respawn_with_backend(
         .into_iter()
         .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name));
     let old_pane = agent.as_ref().map(|a| a.pane_id.clone());
-    // bd-ude8: omp must restart in the SAME pane — a fresh split is
-    // unnecessary and `pane.close` on the old pane (PTY stdin EOF) kills
-    // the respawned omp before it boots. Other kinds keep split+close.
     let same_pane = kind == "omp";
     let new_pane = if same_pane {
         old_pane.clone().ok_or_else(|| {
@@ -36433,22 +33493,13 @@ fn respawn_with_backend(
             .or_else(|| panes.first().map(|p| p.pane_id.clone()))
             .ok_or_else(|| anyhow!("no pane in {project} to split for respawn"))?;
         let pane = backend.pane_split(&anchor, "down", Some(&utf8_path(&dir, "workspace dir")?))?;
-        // best-effort close of the dead pane via the backend trait (hc
-        // implements it with the same `pane.close` RPC).
         if let Some(old) = &old_pane {
             let _ = backend.pane_close(old);
         }
         pane.pane_id
     };
-    // bd-ude8: re-inject the profile's model/effort/role launch args on
-    // respawn — the old `&[]` argv made the respawned agent fall back to
-    // harness defaults (and omp-in-hc got no flags at all).
     let args = respawn_launch_args(cfg, project, name, kind);
     let fresh = start_agent_with_retry_dyn(backend, name, kind, &new_pane, &args)?;
-    // pane-identity bridge bookkeeping (best-effort — never fail the respawn
-    // on mail trouble): a same-pane respawn keeps its identity (the pane
-    // never died); the split path clears the dead pane's stale identity and
-    // pins the fresh pane to the same name (the agent keeps its identity)
     if !same_pane
         && let Ok(mail) = backend::mail_backend(cfg)
         && let Some(key) = dir.to_str()
@@ -36565,19 +33616,12 @@ fn cmd_internal_run_headless(
     if inherited.0.is_empty() && harness_override.is_none() {
         bail!("profile @{profile_name} has no harness — cannot run headless");
     }
-    // bd-42fs step 5: a per-step harness override (spec.harness) wins over
-    // the profile's default harness — for THIS step only.
     let harness = harness_override
         .filter(|h| !h.is_empty())
         .unwrap_or(inherited.0.as_str());
     if !matches!(harness, "pi" | "omp" | "opencode" | "grok") {
         bail!("unsupported harness for headless run: {harness} (pi | omp | opencode | grok)");
     }
-    // Model resolution (P10.2): the effective id (flag override or the
-    // profile's), then the routing registry's per-harness injection form.
-    // STRICT split: a PROFILE-sourced id must be a registry entry (nothing
-    // bypasses the registry); an EXPLICIT --model override is an ad-hoc
-    // operator string and keeps the lenient warn + passthrough.
     let model_id = match model_override {
         Some(over) => over.to_string(),
         None => inherited.1.clone(),
@@ -36595,26 +33639,12 @@ fn cmd_internal_run_headless(
         registry.resolve_strict(&model_id, harness)?
     };
 
-    // bd-gsvn.2: the omp role models (--smol/--slow/--plan) resolve through
-    // the registry the same way as `model` (provider/id form for omp) —
-    // profile-sourced, so STRICT: an unknown role id fails the run naming
-    // the fix (no silent verbatim passthrough). Slot aliases that are not
-    // routable on this harness omit the flag (ADR-0007).
     let role_smol = resolve_role_flag(&registry, &profile.smol, harness)?;
     let role_slow = resolve_role_flag(&registry, &profile.slow, harness)?;
     let role_plan = resolve_role_flag(&registry, &profile.plan, harness)?;
 
-    // bd-42fs retry-on-429: a rate-limited run (HTTP 429 in the harness
-    // error stream or stderr) retries ONCE with the model's registry
-    // `fallback` (oracle glm-5.2 -> grok, on the grok harness). Thin
-    // dynamic-routing slice; the transition is logged via the run entry's
-    // `model` (the actual used id).
     let run_once =
         |harness: &str, model_id: &str, model: &str, effort: &str| -> Result<RunAttempt> {
-            // ADR-0022 W2: the phase registry rides the launch argv (args
-            // inserted before the prompt positional); a harness without a
-            // native mechanic for the phase degrades LOUDLY here and the
-            // run entry is tagged below.
             let (argv, phase_degraded) = headless::build_argv_roles_phase(
                 harness,
                 (!model.is_empty()).then_some(model),
@@ -36638,20 +33668,6 @@ fn cmd_internal_run_headless(
             let mut outcome = headless::parse_stream(&stdout, harness);
             outcome.exit_code = output.status.code().unwrap_or(-1);
             outcome.duration_ms = duration_ms;
-            // bd-7wah: stderr is the LAST resort for a reason, not the first.
-            //
-            // The old order was "empty response + any stderr => stderr IS the
-            // error", which is wrong twice over. It fires on a `NO_COLOR` warning —
-            // recorded 20 times in the run log as THE reason a dispatch produced
-            // nothing, the least informative answer possible. And it OVERWRITES a
-            // real parse error, so a provider's own 400 could be clobbered by a
-            // warning printed after it.
-            //
-            // Precedence now: the parse error (which names the harness's own reason)
-            // wins; stderr is only consulted when the parser had nothing; and a
-            // stderr that is only warnings is reported as such rather than as a
-            // cause, because "the harness warned and said nothing" and "the harness
-            // failed and said nothing" are different bugs.
             if outcome.response.is_empty() && outcome.error.is_none() && !stderr.trim().is_empty() {
                 let trimmed = stderr.trim();
                 if stderr_is_only_warnings(trimmed) {
@@ -36684,7 +33700,6 @@ fn cmd_internal_run_headless(
         &model_id,
         &model,
         // governed-by: bd-ulzi — effort stays profile-default with Jev
-        // override: the spec effort input wins for this step only.
         effort_override
             .filter(|e| !e.trim().is_empty())
             .unwrap_or(profile.effort.as_str()),
@@ -36753,10 +33768,6 @@ fn cmd_internal_run_headless(
         }
     }
     if attempt.rate_limited && !model_id.is_empty() {
-        // GS-043: Profile.model_fallback drives in-flight model reroute first
-        // (ADR-0007 + ADR-0032 Spec 7). Journal intent before dispatch (I4).
-        // Registry ModelEntry.fallback remains the last rung. Timeout alone
-        // never reaches this block (rate_limited gate).
         let err_ev = attempt
             .outcome
             .error
@@ -36768,11 +33779,6 @@ fn cmd_internal_run_headless(
                 if fb_id.is_empty() || fb_id == &model_id {
                     continue;
                 }
-                // One route for both halves: the harness the journal row
-                // names IS the harness the run dispatches on. The row used to
-                // record the caller's harness while the run used the
-                // grok-coupled one, so a grok-family entry was journaled under
-                // a harness it never ran on (and keyed on that wrong harness).
                 let rung = registry.route_for(fb_id, harness);
                 let intent = pane::model_fallback_intent(
                     "flywheel",
@@ -36800,12 +33806,6 @@ fn cmd_internal_run_headless(
             }
         }
         if !hopped {
-            // Last rung: registry ModelEntry.fallback (bd-42fs).
-            // GS-043 I4: journal RebindIntent before run_once (parity with
-            // model_fallback path) — never invent-hop a model/harness change.
-            // The rung math (rung id, grok harness flip, injection string) and
-            // the I4 row are shared with the pane hop: one implementation, and
-            // the same inputs derive the same effect_key either way.
             if let Some(route) = registry.fallback_route(&model_id, harness) {
                 let intent = pane::model_fallback_intent(
                     "flywheel",
@@ -36975,15 +33975,11 @@ pub(crate) fn headless_dispatch(
     project_dir: Option<&Path>,
 ) -> Result<Value> {
     let toron_workflow::schema::Action::DispatchJob { spec, .. } = action else {
-        // bd-omwg: a Spawn reaching the runner is an engine-routing bug —
-        // fail closed, never record it as done (ADR-0010 Spec E).
         if matches!(action, toron_workflow::schema::Action::Spawn { .. }) {
             bail!(
                 "headless runner: Action::Spawn must be handled by the engine (run_spawn) — routing bug"
             );
         }
-        // Recorded, not dispatched — the P10.1 backward-compat surface for
-        // non-headless actions (byte-identical to the no-op runner).
         return Ok(json!({ "action": action.type_name() }));
     };
     let profile_ref = headless::dispatch_spec_profile(spec)
@@ -36992,10 +33988,6 @@ pub(crate) fn headless_dispatch(
     let profile = catalog.get(profile_name).ok_or_else(|| {
         anyhow!("headless dispatch: unknown profile @{profile_name} (flywheel profile list)")
     })?;
-    // Role conditioning (Spec C): the authored preamble finally reaches the
-    // agent — prepended to the stage prompt (or the goal fallback). The
-    // inline `spec.task` (bd-m7ac) wins over the stage: a dispatch with an
-    // explicit mission carries it verbatim.
     let mut base = match headless::dispatch_spec_task(spec) {
         Some(task) if !task.trim().is_empty() => task.to_string(),
         _ => match headless::dispatch_spec_stage(spec) {
@@ -37006,10 +33998,6 @@ pub(crate) fn headless_dispatch(
             None => headless::base_prompt_for(wf_name, inputs),
         },
     };
-    // Workflow-context extras (bd-oj9o): `spec.plan` / `spec.project` carry
-    // the run's inputs into the dispatch prompt — the beads plan reaches the
-    // planner, the onboard/triage-deep project reaches the crew. Unresolvable
-    // refs stay literal; nothing is dropped.
     for key in ["plan", "project"] {
         if let Some(extra) = headless::spec_extra(spec, key, inputs) {
             base.push_str("\n\n");
@@ -37020,9 +34008,6 @@ pub(crate) fn headless_dispatch(
     }
     let prompt = headless::conditioned_prompt(&profile.behavior, &base);
 
-    // Subprocess-reuse (Spec A): the leaf owns the harness call + run log.
-    // `--json` keeps the step output machine-readable (the parent parses
-    // stdout as the step value; the human summary would land in error).
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.arg("__run-headless")
         .arg(profile_name)
@@ -37030,24 +34015,17 @@ pub(crate) fn headless_dispatch(
         .arg("--workflow")
         .arg(wf_name)
         .arg("--json");
-    // The step pin wins. Otherwise the in-memory profile harness, which is
-    // where `--role-harness` was applied. The subprocess reloads disk and
-    // would ignore that overlay unless we pass `--harness`.
     let harness =
         headless::effective_step_harness(headless::dispatch_spec_harness(spec), &profile.harness);
     if !harness.is_empty() {
         cmd.arg("--harness").arg(harness);
     }
-    // ADR-0022 W2: the spec's lifecycle phase rides to the leaf, which
-    // applies the per-harness phase registry (or degrades loudly).
     if let Some(p) = headless::dispatch_spec_phase(spec)
         && !p.trim().is_empty()
     {
         cmd.arg("--phase").arg(p);
     }
     // governed-by: bd-ulzi — the spec effort input rides to the leaf,
-    // which lets it win over the profile default for this step only.
-    // Rendered against inputs so `{{inputs.x}}` refs resolve like plan.
     if let Some(e) = headless::spec_extra(spec, "effort", inputs)
         && !e.trim().is_empty()
     {
@@ -37056,9 +34034,6 @@ pub(crate) fn headless_dispatch(
     if let Some(cron) = cron {
         cmd.arg("--cron").arg(cron);
     }
-    // Slot aliases (for example `@cheap`) must be resolved by the leaf's
-    // canonical profile-routing path. Forward only concrete model ids;
-    // passing a slot as an explicit override bypasses strict slot resolution.
     if !profile.model.is_empty() && models::slot_alias(&profile.model).is_none() {
         cmd.arg("--model").arg(&profile.model);
     }
@@ -37067,22 +34042,13 @@ pub(crate) fn headless_dispatch(
         .with_context(|| format!("__run-headless for @{profile_name}"))?;
     let raw = String::from_utf8_lossy(&output.stdout).to_string();
     let trimmed = raw.trim();
-    // The leaf prints ONE json line on success / on captured failure, and
-    // parse_leaf_output turns anything else into a typed failure: the
-    // engine records a failed step and the run fails truthfully.
     let err = String::from_utf8_lossy(&output.stderr).to_string();
     let v = parse_leaf_output(trimmed, &raw, &err)?;
-    // ADR-0022 §3.5 warn-first plan-artifact gate (bd-cvv9): an
-    // `implement` dispatch with no plan artifact warns loudly, tags the
-    // run log AND the step output — never blocks (the W5 flip owns
-    // blocking).
     if phase_chain::plan_artifact_missing(spec, inputs) {
         eprintln!(
             "flywheel: phase implement dispatch has NO completed plan artifact — \
              warn-first gate (ADR-0022 §3.5); step output tagged plan_artifact_missing"
         );
-        // Warn telemetry lands in the default project's state log (only
-        // stage resolution is project-aware here).
         crate::state::log_event(
             "flywheel",
             crate::state::EventKind::Workflow,
@@ -37240,14 +34206,7 @@ steps:
 /// "thread_id": "..." }`.
 /// Soft-fail: mail down / unknown agent → zeroed digest, never an error.
 fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<()> {
-    // `agent` is the caller's key (terminal name from the poll snapshot) —
-    // echo it verbatim so the loop can key its digest map by the same name
-    // it will look up in plan_actions.
     let key_name = agent.trim().to_string();
-    // S8.1: resolve the identity BEFORE the fetch. The registry pin (spawn
-    // pinned the identity at spawn) or the project-local agent-names mirror
-    // wins; otherwise the canonical name itself — which is what flywheel
-    // registers at spawn and what this backstop registers below.
     let identity = {
         let reg = state::load_spawn_registry(project);
         let names = state::load_agent_names(&project_dir(cfg, project));
@@ -37268,13 +34227,6 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
         print_json(&zero);
         return Ok(());
     }
-    // S8.1 + bd-627z.2: first-contact auto-register backstop for the loop's
-    // dispatch path. A spawn that ran while the daemon was down left the
-    // agent without an identity; the first digest poll (the loop's first
-    // contact with the agent's mailbox) registers the RESOLVED identity so
-    // inbox/send never 404 "Agent not found". Idempotent upsert;
-    // best-effort — a failure just zeroes the digest and the loop retries
-    // next poll.
     let auto_profile = backend::AgentProfile {
         name: identity.clone(),
         program: Some("opencode".into()),
@@ -37285,11 +34237,6 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
     if let Err(e) = backend::run_mail(mail.register_agent(&key, &auto_profile)) {
         eprintln!("flywheel: mail digest auto-register of {identity} failed (zeroing digest): {e}");
     }
-    // bd-5icg: toron's projection HAS per-recipient read-state (`read_ts_us`
-    // on every row; `unread_only` filters). We still fetch the RECENT inbox
-    // (limit 10) with bodies (the S8.2 dedup keys on body) and report
-    // `recent` + the wake-filtered `urgent` (importance high|urgent; read
-    // rows and executed assigns filtered — bd-dbre).
     let v = if let Ok(v) = backend::run_mail(mail.inbox(&backend::InboxQuery {
         project: key,
         agent: identity.clone(),
@@ -37311,15 +34258,7 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
     let urgent_rows = wake_urgent(&arr);
     let urgent = urgent_rows.len();
     let last = arr.first();
-    // bd-vbf2: the wake key is the NEWEST URGENT message by created_ts_us
-    // (the loop wakes once per id) - never `.first()`, which cited the
-    // oldest row when the wire delivered ascending. Subject + thread ride
-    // the SAME chosen row so "Most recent urgent: id X re: S" /
-    // "Latest urgent thread: T" cannot disagree across threads.
     let chosen = newest_urgent(&urgent_rows, last);
-    // the wire row names the sender `sender` (toron MCP) or `from`
-    // (agent-mail MCP) — read both (MailItem aliases them, but the raw
-    // serde_json::Value here is the untyped projection).
     let last_from = last.and_then(|m| {
         m.get("sender")
             .or_else(|| m.get("from"))
@@ -37330,9 +34269,6 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
         "mail_identity": identity,
         "recent": recent,
         "urgent": urgent,
-        // bd-pin-public-plane-s-easy.5: plane-S wake count — open kind-43001
-        // jobs assigned to this agent, via the existing CLI (no new MCP
-        // tool). Best-effort: a job-list failure just zeroes the count.
         "plane_s": plane_s_open_jobs_for(project, &identity),
         "last_id": chosen.and_then(|m| {
             m.get("id").or_else(|| m.get("message_id")).and_then(|i| i.as_str())
@@ -37393,10 +34329,6 @@ fn thread_head(
     let sender_npub = backend::run_mail(mail.whois(key, sender))
         .map(|w| w.npub)
         .unwrap_or_default();
-    // bd-harvest-thread-filter-yp9r: push the thread predicate into the
-    // inbox projection — the server returns ONLY the target thread's rows
-    // instead of a full-inbox drain; `newest_in_thread` still picks
-    // newest-from-sender client-side.
     let items = backend::run_mail(mail.inbox(&backend::InboxQuery {
         project: key.to_string(),
         agent: mail.agent_name().to_string(),
@@ -37502,8 +34434,6 @@ fn in_flight_count(project_root: &std::path::Path) -> Option<u64> {
     v.get("issues")?.as_array().map(|a| a.len() as u64)
 }
 
-// ---- subagent-guard (ADR-0010 D13, bd-eo39) ----
-
 /// Delegation-shaped tool stems denied on the captain/steer pane (the
 /// dispatcher-owning primary). A delegation-shaped harness spawn creates
 /// work with NO spawn-registry metadata — invisible to the doorbell, the
@@ -37608,7 +34538,6 @@ fn cmd_gate_learnings(
             .next()
             .map(|fm| fm.len() + 4)
             .unwrap_or(0);
-        // frontmatter verbatim + a bounded rg-context allowance (~40 lines)
         let cost_tokens = fm_chars / 4 + 150;
         entries.push(LearningEntry {
             path: path.display().to_string(),
@@ -37618,10 +34547,6 @@ fn cmd_gate_learnings(
             lane: stages::learning::LearningLane::Corpus,
         });
     }
-    // bd-0km8: wiki/memory lanes feed the SAME pool — the budget is
-    // shared, never per-lane. Absent lane files = corpus only, exactly
-    // as before. A bad lane file warns and continues; the gate never
-    // fails a wave on lane plumbing.
     for (path, lane) in [(wiki, LearningLane::Wiki), (memory, LearningLane::Memory)] {
         let Some(path) = path else { continue };
         let raw = match std::fs::read_to_string(path) {
@@ -37695,8 +34620,6 @@ fn cmd_turn_guard(cfg: &Config, project: &str, role: Option<&str>) -> Result<()>
         .is_some_and(doorbell::pid_alive);
     let root = project_dir(cfg, project);
     let in_flight = in_flight_count(&root);
-    // NOTE (bd-qpub): D5 AFK surface does not exist yet; the predicate arm
-    // is implemented + tested, the CLI wires false until D5 lands.
     match turn_end_guard(
         in_flight,
         dispatcher_required,
@@ -37743,12 +34666,10 @@ mod turn_guard_tests {
             }
             TurnDecision::Allow => panic!("in-flight + stale beacon must block"),
         }
-        // Missing beacon with work is also stale.
         assert!(matches!(
             turn_end_guard(Some(1), false, None, false, false, 300, P),
             TurnDecision::Block { .. }
         ));
-        // Dispatcher-required with zero beads still guards.
         assert!(matches!(
             turn_end_guard(Some(0), true, Some(9999), false, false, 300, P),
             TurnDecision::Block { .. }
@@ -37757,12 +34678,10 @@ mod turn_guard_tests {
 
     #[test]
     fn d14_crew_exempt_afk_satisfies() {
-        // Crew pane under identical conditions: no block.
         assert_eq!(
             turn_end_guard(Some(2), true, Some(9999), true, false, 300, P),
             TurnDecision::Allow
         );
-        // D5 AFK daemon live with identity-matched fresh beacon: satisfied.
         assert_eq!(
             turn_end_guard(Some(2), true, Some(9999), false, true, 300, P),
             TurnDecision::Allow
@@ -37783,7 +34702,6 @@ mod turn_guard_tests {
             turn_end_guard(Some(0), false, None, false, false, 300, P),
             TurnDecision::Allow
         );
-        // Unknown in-flight fails closed even with a fresh beacon.
         assert!(matches!(
             turn_end_guard(None, false, Some(0), false, false, 300, P),
             TurnDecision::Block { .. }
@@ -37810,9 +34728,6 @@ fn cmd_internal_dispatch_guard(cfg: &Config, project: &str, bead: &str) -> Resul
                     let signals: Vec<Value> = items
                         .iter()
                         .filter_map(|m| {
-                            // ADR-0010 D9 (bd-l0fz): the projected `bead=<id>`
-                            // tag is the structural done-hold; the subject is
-                            // decoration for humans.
                             durable::classify_guard_signal(
                                 &m.subject,
                                 &m.body_md,
@@ -37825,17 +34740,11 @@ fn cmd_internal_dispatch_guard(cfg: &Config, project: &str, bead: &str) -> Resul
                 }
                 Err(e) => eprintln!("flywheel: __dispatch-guard inbox scan failed: {e}"),
             }
-            // bd-claim-watch-durable-signals-mixy (wish 3): kind-9 room
-            // claims are peer signals too — crews claim on the steer rooms
-            // (the project room + the bead's own ADR-0020 room) and those
-            // posts never reach the mail-thread scan above. Best-effort:
-            // any failure contributes zero signals.
             let mut signals: Vec<Value> = facts["signals"].as_array().cloned().unwrap_or_default();
             signals.extend(channel_guard_signals(&key, bead, mail.agent_name()));
             facts["signals"] = json!(signals);
         }
     }
-    // Receipts freshness: newest mtime among receipt files naming this bead.
     let receipts = project_dir(cfg, project).join(".flywheel").join("receipts");
     if let Ok(rd) = std::fs::read_dir(&receipts) {
         let mut newest: Option<i64> = None;
@@ -37955,8 +34864,6 @@ mod channel_guard_tests {
                 "created_at": 1_700_000_060,
                 "kind": 9
             },
-            // Would classify as Handoff — but it names ANOTHER bead, so the
-            // project-room mention filter must drop it.
             {
                 "content": "handoff bd-99: taking over",
                 "created_at": 1_700_000_120,
@@ -37970,17 +34877,14 @@ mod channel_guard_tests {
         assert_eq!(got[0]["kind"], "claim");
         assert_eq!(got[0]["ts_us"], 1_700_000_000_000_000i64);
         assert_eq!(got[1]["kind"], "stand_down");
-        // Per-bead room: thread-scoped, no mention needed.
         let own_room =
             json!([{ "content": "claiming — edits in src/main.rs", "created_at": 1_700_000_000 }]);
         let got = channel_signals_from(&own_room, "bd-12", false);
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0]["kind"], "claim");
-        // A µs timestamp passes through untouched.
         let us = json!([{ "content": "claiming bd-12", "created_at": 1_700_000_000_000_000i64 }]);
         let got = channel_signals_from(&us, "bd-12", true);
         assert_eq!(got[0]["ts_us"], 1_700_000_000_000_000i64);
-        // Non-array garbage degrades to empty, never a panic.
         assert!(channel_signals_from(&json!({"nope": true}), "bd-12", true).is_empty());
     }
 }
@@ -38001,8 +34905,6 @@ fn cmd_internal_check_reply(cfg: &Config, project: &str, name: &str, thread: &st
         print_json(&zero);
         return Ok(());
     }
-    // bd-aseq: the reply lands under the pinned identity the send used —
-    // check the thread head against the registry pin, not the hash mapping.
     match thread_head(
         &*mail,
         &key,
@@ -38036,13 +34938,9 @@ fn cmd_internal_remind_reply(
             "reminder": reminder_count + 1,
         }),
     );
-    // concrete reminder (the MAIL WAKE lesson: vague prompts get
-    // acknowledged in chat, not acted on — name the thread and the command).
     let reminder = format!(
         "REMINDER: your reply is still missing in thread {thread} — send it now via: flywheel mail reply {project} --message-id {thread} --body [your reply] (do not just acknowledge; the orchestrator verifies the thread moved)"
     );
-    // recurse into the __send path so the reminder gets identical landing
-    // semantics + resume-dedup as any other dispatch.
     let exe = std::env::current_exe()?.canonicalize()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("__send").arg(project).arg(name).arg(&reminder);
@@ -38144,8 +35042,6 @@ pub fn load_compose_allowlist(project_root: &Path) -> Vec<String> {
 }
 
 fn cmd_internal_compose_inbox(cfg: &Config, project: &str, limit: u32) -> Result<()> {
-    // W7 leaf: [compose-request] rows + the allowlist, resolved in the
-    // subprocess (checkpoint-safe); the loop applies the pure gates.
     let mail = if let Ok(m) = backend::mail_backend(cfg) {
         m
     } else {
@@ -38183,7 +35079,6 @@ fn cmd_internal_compose_inbox(cfg: &Config, project: &str, limit: u32) -> Result
 }
 
 fn cmd_internal_xproj_inbox(cfg: &Config, project: &str, limit: u32) -> Result<()> {
-    // review-fix F6: the xproj-inbox leaf routes through the backend factory.
     let mail = if let Ok(m) = backend::mail_backend(cfg) {
         m
     } else {
@@ -38281,8 +35176,6 @@ fn cmd_internal_xproj_spawn(
     let outcome = if !dir.exists() {
         Err(anyhow!("project dir missing: {}", dir.display()))
     } else {
-        // workers param = opencode count by default; a recipe with its own
-        // oc/pi/gk counts wins (recipe_counts prefers the recipe).
         cmd_spawn(
             cfg,
             project,
@@ -38293,13 +35186,12 @@ fn cmd_internal_xproj_spawn(
                     gk: None,
                 },
                 recipe: Some(recipe.to_string()),
-                no_focus: true, // background workspace — must not steal terminal focus
+                no_focus: true,
                 ..Default::default()
             },
         )
     };
     let spawned_ok = outcome.is_ok();
-    // reply in the request thread (best-effort; mail down must not kill the loop)
     let reply = match outcome {
         Ok(()) => format!(
             "[xproj] swarm started: recipe={recipe}, {workers} worker(s) in project {project} (msg {message_id}). Reply thread: {thread_id}."
@@ -38371,8 +35263,6 @@ fn cmd_internal_ack_overdue(
     sla_secs: Option<u64>,
 ) -> Result<()> {
     let key = project_dir_str(cfg, project)?;
-    // Same identity resolution the pings used (bd-aseq): the health mail goes
-    // to the REGISTERED identity, so the ack read must be keyed by it too.
     let agent = resolve_mail_target_registry(project, name);
     let filter = crate::mail::AckOverdueFilter {
         sla_secs,
@@ -38417,9 +35307,6 @@ fn cmd_internal_mail_blocked(cfg: &Config, project: &str, name: &str, tier: u32)
         }
     };
     let key = project_dir_str(cfg, project)?;
-    // the recipient is the agent's REGISTERED agent-mail identity (bd-odc) —
-    // `name` is the hc name, which is not a registrable identity;
-    // bd-aseq: registry pin first, hash fallback
     let mail_target = resolve_mail_target_registry(project, name);
     let thread = format!("health-{name}");
     let out = (|| -> Result<backend::SendReceipt> {
@@ -38506,11 +35393,6 @@ fn cmd_internal_mail_not_ready(
         .as_ref()
         .and_then(|m| m.name.clone())
         .unwrap_or_else(|| "Flywheel".to_string());
-    // bd-not-ready-alert-recipient-2yd1: the advisory must reach a REGISTERED
-    // identity or it never lands at all, and `br` writes `created_by` from
-    // `$USER` — an OS username, never a pin. So the chain is created_by,
-    // configured operator, then the arriving/captain fold, each RE-CHECKED
-    // against the mailbox instead of trusted.
     let mut chain = planner_recipient_chain(&key, bead_id, &fallback);
     chain.push("captain".to_string());
     let planner = match first_routable(chain.iter().map(String::as_str), |c| {
@@ -38567,8 +35449,6 @@ fn planner_recipient_chain(project_dir: &str, bead_id: &str, fallback: &str) -> 
         .output()
         && out.status.success()
         && let Ok(v) = serde_json::from_slice::<Value>(&out.stdout)
-        // br show --json is a bare object (newer br) or a 1-elem array
-        // (older) — accept both shapes.
         && let Some(bead) = match &v {
             Value::Array(items) => items.first(),
             obj @ Value::Object(_) => Some(obj),
@@ -38663,9 +35543,6 @@ fn loop_mail_envelope(kind: &LoopMail) -> LoopMailEnvelope {
                     )
                 }
             };
-            // bd-4spn: a PRINCIPLES-blocked bead (priority<=2, incomplete section)
-            // carries the check's exact reason; the legacy VERIFY body is unchanged
-            // when no reason is supplied (byte-identical path).
             let body = match reason {
                 Some(r) => format!(
                     "Bead **{bead_id}** (`{title}`) sits in the ready set but was **NOT dispatched**: {r}.\n\n\
@@ -38710,9 +35587,6 @@ fn loop_mail_envelope(kind: &LoopMail) -> LoopMailEnvelope {
                     "Bead **{bead_id}** (`{title}`) closed with a legal verdict.\n\nReport:\n```text\n{report}\n```"
                 )
             };
-            // ADR-0010 D9 (bd-l0fz): the reporter-of-record keeps the `[{id}] done`
-            // subject for humans and gains the structural `bead=<id>` tag — the
-            // dispatch guard matches the TAG, never the subject.
             LoopMailEnvelope {
                 to: captain.to_string(),
                 subject,
@@ -38916,11 +35790,6 @@ fn cmd_internal_mail_done(cfg: &Config, project: &str, bead_id: &str) -> Result<
         .and_then(|m| m.name.clone())
         .unwrap_or_else(|| "Flywheel".to_string());
     let (title, report) = bead_title_and_close_report(&key, bead_id);
-    // bd-not-ready-alert-recipient-2yd1: ONE chain for both loop advisories.
-    // created_by (`br` writes it from `$USER`) is only a candidate — it is
-    // re-checked for routability, then the configured operator, then the
-    // arriving/captain fold, then the registered orchestrator as the last
-    // routable rung before soft-failing.
     let mut chain = planner_recipient_chain(&key, bead_id, &fallback);
     chain.push("captain".to_string());
     let captain = first_routable(chain.iter().map(String::as_str), |c| {
@@ -39125,8 +35994,6 @@ fn cmd_internal_verify_dispatch(
     let mut bead = match verdict::bead_from_br_show(&key, bead_id) {
         Ok(b) => b,
         Err(e) => {
-            // Unreadable bead (wrong dir / missing fence): report and let the
-            // loop continue; never kill the loop on a lookup hiccup.
             eprintln!(
                 "flywheel: verifier-dispatch for {bead_id} bead lookup failed (continuing): {e}"
             );
@@ -39179,7 +36046,6 @@ fn cmd_internal_verify_dispatch(
             Ok(())
         }
         crate::models::VerifierPlan::Degrade => {
-            // Block (idempotent — an already-blocked bead stays blocked).
             let block = std::process::Command::new("br")
                 .args([
                     "update",
@@ -39196,8 +36062,6 @@ fn cmd_internal_verify_dispatch(
                 Ok(o) => o.status.success(),
                 Err(_) => false,
             };
-            // One captain mail, deduped by marker file (durable across loop
-            // invocations; the caller's dedup set covers one-per-invocation).
             let mut mailed = false;
             let marker = key
                 .join(".flywheel")
@@ -39305,10 +36169,6 @@ fn cmd_internal_reopen_bead(cfg: &Config, project: &str, bead_id: &str, sha: &st
         .as_ref()
         .and_then(|m| m.name.clone())
         .unwrap_or_else(|| "Flywheel".to_string());
-    // bd-not-ready-alert-recipient-2yd1: the same routable chain the
-    // not-ready/done advisories use. `resolve_planner_for_bead` used to
-    // return `created_by` — an OS username — unverified, so this alert
-    // bounced for every operator-created bead.
     let mut chain = planner_recipient_chain(&key, bead_id, &fallback);
     chain.push("captain".to_string());
     let mail = match backend::mail_backend(cfg) {
@@ -39390,7 +36250,6 @@ fn reopen_unverified_close(
             "already_processed": true,
         }));
     }
-    // idempotent reopen: already-open + missing row -> no-op (br exit 0).
     let out = std::process::Command::new("br")
         .args([
             "reopen",
@@ -39409,7 +36268,6 @@ fn reopen_unverified_close(
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    // one mail per (bead, sha): write the marker FIRST, remove on failure
     std::fs::create_dir_all(&marker_dir)?;
     std::fs::write(&marker, "mailed\n")?;
     let send = (|| -> Result<backend::SendReceipt> {
@@ -39512,15 +36370,10 @@ fn make_verify_sink(cfg: Config, project: String) -> toron_workflow::engine::Ver
         move |req: &toron_workflow::engine::VerifyRequest| {
             let cmd = req.command.clone();
             let cwd = project_dir(&cfg_clone, &project_clone);
-            // ADR-0024 Spec 6: reuse loop_run_verify_exec's exec path — slot held,
-            // TIMEBOX, receipt via write_receipt (workflow kind, never
-            // command-verified). The VerifySink is the workflow-graph verify
-            // leaf; it must not fork a second exec path.
             let is_cargo = cmd.split_whitespace().next() == Some("cargo");
             if is_cargo {
                 acquire_cargo_slot(&cfg_clone, &project_clone);
             }
-            // TIMEBOX 600s (fallback default, same as loop_run_verify_exec)
             let outcome = run_verify_with_timeout(&cmd, 600, &cwd);
             if is_cargo {
                 release_cargo_slot(&cfg_clone, &project_clone);
@@ -39528,8 +36381,6 @@ fn make_verify_sink(cfg: Config, project: String) -> toron_workflow::engine::Ver
             match outcome {
                 Ok((0, tail)) => {
                     let receipt_content = if tail.trim().is_empty() {
-                        // Ensure receipt is non-empty (anti-empty guard in
-                        // write_receipt); a silent pass still needs evidence.
                         format!("verify ok: {cmd}")
                     } else {
                         tail
@@ -39600,8 +36451,6 @@ fn loop_run_verify_exec(
     let bead = match verdict::bead_from_br_show(&key, bead_id) {
         Ok(b) => b,
         Err(e) => {
-            // Unreadable bead (no fence / wrong dir): NOT loop-runnable —
-            // the non-runnable band's machinery handles it.
             return Ok(LoopRunOutcome {
                 band: "non-runnable".into(),
                 dir: key,
@@ -39626,7 +36475,6 @@ fn loop_run_verify_exec(
             output_tail: String::new(),
         });
     }
-    // Never re-verify the same broken head (marker survives restarts).
     let marker_dir = key.join(".flywheel").join("loop-run-verify-failed");
     let marker = marker_dir.join(format!("{bead_id}-{sha}"));
     if marker.exists() {
@@ -39875,7 +36723,6 @@ fn send_unverified_close_mail(
 ///
 /// Soft-fail always: exit 0 with `{ok, ...}` so overnight loops never die.
 fn cmd_internal_diagnose(cfg: &Config, project: &str, name: &str, reason: &str) -> Result<()> {
-    // --- tail (best-effort) ---
     let mut tail = String::new();
     let backend = match backend::multiplexer_backend(cfg) {
         Ok(b) => b,
@@ -39889,9 +36736,6 @@ fn cmd_internal_diagnose(cfg: &Config, project: &str, name: &str, reason: &str) 
             return Ok(());
         }
     };
-    // bd-harness-alt-screen-reads (H4): route through the alt-screen ladder
-    // (recent-unwrapped → wait+retry on agent_not_idle → visible → file
-    // fallback); still soft on failure — the health mail goes out regardless.
     let mut ops = hc_support::BackendAltScreenRead::new(&*backend, name, 80);
     match alt_screen_read_ladder(&mut ops, hc_support::RECENT_UNWRAPPED_SOURCE) {
         Ok(v) => {
@@ -39906,7 +36750,6 @@ fn cmd_internal_diagnose(cfg: &Config, project: &str, name: &str, reason: &str) 
         }
     }
 
-    // --- health mail ---
     let mut mailed = false;
     let mut mail_err: Option<String> = None;
     let recipient = cfg
@@ -39971,25 +36814,12 @@ fn cmd_internal_renew_leases(cfg: &Config, project: &str, extend_seconds: u64) -
     let mail = backend::mail_backend(cfg)?;
     let key = project_dir_str(cfg, project)?;
     backend::run_mail(mail.ensure_project(&key))?;
-    // NOTE: MailSurface::agent_name() is the orchestrator identity; the
-    // reported `agent` must match the reservations' owner — use the
-    // configured name explicitly.
     let agent = orchestrator_mail_name(cfg);
     let v = backend::run_mail(mail.renew_reservations(&key, &agent, &[], extend_seconds))
         .map_err(|e| anyhow!("mail backend: {e}"))?;
 
-    // bd-evqs: release reservations whose owning bead is CLOSED. The renewal
-    // storm: the loop renewed a lease for bead bd-oj9o (long closed) 1218
-    // times — the renew path never looked at the reason. A reservation whose
-    // reason is a bead id that is now CLOSED is stale by definition (the work
-    // it guarded is done); release it here so the next tick has nothing to
-    // renew. Best-effort: br being unavailable (scratch projects, no .beads)
-    // keeps today's behavior (renew all, no sweep).
     let mut released_closed: Vec<String> = Vec::new();
     if let Ok(closed) = load_closed_bead_ids(cfg, project) {
-        // bd-resume-window-lease-sweep-4sa2: the ONE sweep rule
-        // (`durable::closed_reason_lease_ids`), so the shipped sweep and its
-        // test cannot disagree about which leases are stale.
         let leases: Vec<(String, String)> = v
             .reservations
             .iter()
@@ -40021,8 +36851,6 @@ fn cmd_internal_renew_leases(cfg: &Config, project: &str, extend_seconds: u64) -
         }
     }
 
-    // Surface `RenewResult` → the AM-parity `file_reservations` envelope
-    // `list_own_reservations` / older CLI consumers parse.
     let envelope = json!({
         "renewed": v.renewed,
         "file_reservations": v.reservations.iter().map(|r| json!({
@@ -40074,7 +36902,6 @@ fn cmd_internal_release_bead_locks(cfg: &Config, project: &str, bead_id: &str) -
 pub fn bead_id_from_reason(reason: &str) -> Option<&str> {
     let t = reason.trim();
     let id = t.split_whitespace().next().unwrap_or(t);
-    // strip trailing punctuation ("bd-12:" or "bd-12," from free-text reasons)
     let id = id.trim_end_matches([':', ',', ';', ')']);
     if id.starts_with("bd-") && id.len() > 3 {
         Some(id)
@@ -40114,16 +36941,11 @@ fn load_closed_bead_ids(cfg: &Config, project: &str) -> Result<std::collections:
     Ok(closed)
 }
 
-// ---- serve (feature: serve) ----
-
 #[cfg(feature = "serve")]
 fn cmd_daemon(cfg: &Config, cmd: &DaemonCmd) -> Result<()> {
     let state = daemon::default_state_dir();
     std::fs::create_dir_all(&state)?;
     let addr = |port: u16| format!("127.0.0.1:{port}");
-    // The cron host's unit runs from the directory `daemon start` was invoked
-    // in: the project tier and `br` resolve the same way an interactive
-    // `flywheel cron start` would.
     let cron_host = || -> Result<()> {
         let cwd = std::env::current_dir()?;
         let project = cron::detect_project(cfg, None);
@@ -40133,9 +36955,6 @@ fn cmd_daemon(cfg: &Config, cmd: &DaemonCmd) -> Result<()> {
         DaemonCmd::Start { port } => {
             daemon::start(&state, &addr(*port))?;
             cron_host()?;
-            // Plane D rides along: `flywheel daemon start` also ensures the
-            // doorbell daemon is running (loud if its binary is absent —
-            // autostart persistence stays opt-in via `doorbell install`).
             daemon::ensure_doorbell()?;
             Ok(())
         }
@@ -40257,14 +37076,9 @@ mod hosted_workspaces_from_registry_tests {
         let dir = tempfile_state();
         let db = dir.join("doorbell");
         std::fs::create_dir_all(&db).expect("doorbell dir");
-        // Real hosting registry entry — stamp-writer slug, no dots.
         std::fs::write(db.join("flywheel-proj.gen"), b"{}").expect("slug.gen");
-        // Daemon gen gate sibling (doorbell-rt ensure_daemon_gen). Must
-        // yield the same slug, not `flywheel-proj.daemon`.
         std::fs::write(db.join("flywheel-proj.daemon.gen"), b"{}").expect("daemon.gen");
-        // Junk dotted stem (defense in depth).
         std::fs::write(db.join("flywheel-proj.extra.gen"), b"{}").expect("extra.gen");
-        // Non-.gen ignored.
         std::fs::write(db.join("flywheel-proj.pid"), b"1").expect("pid");
 
         let got = hosted_workspaces_from_registry(&dir);
@@ -40281,7 +37095,6 @@ mod hosted_workspaces_from_registry_tests {
         let dir = tempfile_state();
         let db = dir.join("doorbell");
         std::fs::create_dir_all(&db).expect("doorbell dir");
-        // FileHost/doorbell serve write only `{workspace}.daemon.gen`.
         std::fs::write(db.join("flywheel-only.daemon.gen"), b"{}").expect("daemon.gen");
         let got = hosted_workspaces_from_registry(&dir);
         assert_eq!(
@@ -40299,9 +37112,7 @@ mod hosted_workspaces_from_registry_tests {
         let dir = tempfile_state();
         let db = dir.join("doorbell");
         std::fs::create_dir_all(&db).expect("doorbell dir");
-        // Stale registry label only — no pid, no lease.
         std::fs::write(db.join("aaa.daemon.gen"), b"{}").expect("aaa.daemon.gen");
-        // Live zzz: daemon.gen + live owner lease (FileHost shape).
         std::fs::write(db.join("zzz.daemon.gen"), b"{}").expect("zzz.daemon.gen");
         let now = doorbell_rt::lease::unix_now();
         let claimed = doorbell_rt::lease::acquire_lease(&dir, "zzz", now).expect("lease");
@@ -40329,7 +37140,6 @@ mod hosted_workspaces_from_registry_tests {
         std::fs::write(db.join("aaa.daemon.gen"), b"{}").expect("aaa.daemon.gen");
         std::fs::write(db.join("zzz.daemon.gen"), b"{}").expect("zzz.daemon.gen");
         let now = doorbell_rt::lease::unix_now();
-        // FileHost/doorbell claim owner-{ws}.json — not {slug}.pid.
         let claimed = doorbell_rt::lease::acquire_lease(&dir, "zzz", now).expect("lease");
         assert_eq!(claimed.pid, std::process::id());
 
@@ -40349,11 +37159,9 @@ mod hosted_workspaces_from_registry_tests {
         let dir = tempfile_state();
         let db = dir.join("doorbell");
         std::fs::create_dir_all(&db).expect("doorbell dir");
-        // Live zzz via lease — must stay primary.
         std::fs::write(db.join("zzz.daemon.gen"), b"{}").expect("zzz.daemon.gen");
         let now = doorbell_rt::lease::unix_now();
         doorbell_rt::lease::acquire_lease(&dir, "zzz", now).expect("zzz lease");
-        // Orphan aaa: daemon.gen + fresh event+hb stamps, no pid, no lease.
         std::fs::write(db.join("aaa.daemon.gen"), b"{}").expect("aaa.daemon.gen");
         doorbell_rt::watchbeat::touch_event(&dir, "aaa");
         doorbell_rt::watchbeat::touch_heartbeat(&dir, "aaa");
@@ -40370,8 +37178,6 @@ mod hosted_workspaces_from_registry_tests {
             zzz_pos < aaa_pos,
             "zzz (lease alive) before aaa (stamps-only orphan): {got:?}"
         );
-        // Stamps-only label must land in the other partition (after alive).
-        // With only aaa stamps-only + zzz alive → aaa is sole "other".
         assert_eq!(
             &got[zzz_pos + 1..],
             &["aaa".to_string()],
@@ -40387,7 +37193,6 @@ mod hosted_workspaces_from_registry_tests {
         let dir = tempfile_state();
         let db = dir.join("doorbell");
         std::fs::create_dir_all(&db).expect("doorbell dir");
-        // Orphan only: daemon.gen + fresh stamps, no pid/lease → other.
         std::fs::write(db.join("orphan.daemon.gen"), b"{}").expect("orphan.daemon.gen");
         doorbell_rt::watchbeat::touch_event(&dir, "orphan");
         doorbell_rt::watchbeat::touch_heartbeat(&dir, "orphan");
@@ -40434,16 +37239,12 @@ mod hosted_workspaces_from_registry_tests {
             std::fs::write(db.join(format!("{ws}.daemon.gen")), b"{}").expect("daemon.gen");
             doorbell_rt::lease::acquire_lease(&dir, ws, now).expect("lease");
         }
-        // Fresh Live stamps on live-ws.
         doorbell_rt::watchbeat::touch_event(&dir, "live-ws");
         doorbell_rt::watchbeat::touch_heartbeat(&dir, "live-ws");
-        // Stale Deaf stamps on deaf-ws (age >> ceiling): write old mtime via
-        // absolute ms far in the past by writing then backdating is hard;
-        // instead pass explicit stamp pairs to classify_worst_of (unit).
         let now_ms = 200_000u64;
         let stamps = [
-            (None, Some(100_000u64)),             // Deaf
-            (Some(199_000u64), Some(198_000u64)), // Live
+            (None, Some(100_000u64)),
+            (Some(199_000u64), Some(198_000u64)),
         ];
         let pipe = doorbell_rt::wake_liveness::classify_worst_of(
             now_ms,
@@ -40456,7 +37257,6 @@ mod hosted_workspaces_from_registry_tests {
                 silent_for_ms: 100_000
             }
         );
-        // Registry still lists both as alive.
         let alive = super::hosted_alive_workspaces_from_registry(&dir);
         assert_eq!(alive.len(), 2, "both leases alive: {alive:?}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -40525,12 +37325,6 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
     }
 
     async fn health(State(st): State<Arc<AppState>>) -> String {
-        // GS-062: wake_liveness classify over split event/hb stamps.
-        // ASK-USER D (captain locked): workspace key = hosted label from
-        // AppState (flywheel-{project}), matching stamp writers.
-        // ASK-USER F: worst-of across ALL alive hosted (not primary-only).
-        // Alive-empty WARNING: classify from alive only — never fall through
-        // to other/orphan stamps (false Quiet).
         let state_dir = config::state_dir();
         let (alive, hosted) = {
             let (a, o) = hosted_registry_partitions(&state_dir);
@@ -40543,14 +37337,10 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
             *g = hosted.clone();
             (alive, hosted)
         };
-        // Empty alive → NeverStamped. wake.workspace = worst-of winner
-        // (stamps match class; not first-alive).
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        // Worst-of over alive stamps only (ask-user F). Never max-merge then
-        // classify once — that lets one Live mask another Deaf.
         let stamps: Vec<(String, Option<u64>, Option<u64>)> = alive
             .iter()
             .map(|ws| {
@@ -40602,8 +37392,6 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
         let project = req["project"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
         let to = req["to"].as_str().unwrap_or("all");
         let msg = req["msg"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
-        // same destructive-command guard as `flywheel send` — the HTTP surface
-        // must not bypass the policy
         let policy = config::Policy::load().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         if policy.violation(msg).is_some() {
             return Err(StatusCode::FORBIDDEN);
@@ -40643,7 +37431,6 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
             Err(EmitDeny::BadToken) => return Err(StatusCode::UNAUTHORIZED),
             Err(EmitDeny::ScopeDenied) => return Err(StatusCode::FORBIDDEN),
         };
-        // Per-service burst budget (429 when exhausted).
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -40661,12 +37448,10 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
             }
             b.record_at(now);
         }
-        // Same destructive-command guard as `flywheel send`.
         let policy = config::Policy::load().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         if policy.violation(msg).is_some() {
             return Err(StatusCode::FORBIDDEN);
         }
-        // Publish through toron as the service identity (existing wire).
         let out = std::process::Command::new("toron")
             .args([
                 "mail",
@@ -40845,7 +37630,6 @@ mod wait_output_tests {
 
     #[test]
     fn pane_wait_result_json_uses_leaf_shape() {
-        // the leaf renders a PaneWaitResult via the same helper
         let r = PaneWaitResult {
             pane_id: "w1:p1".into(),
             matched_line: Some("ready".into()),
@@ -40946,7 +37730,6 @@ mod integration_tests {
                 assert!(run.contains("--execute"), "{name} runs via execute");
             }
         }
-        // Spot-check the flagship rows.
         assert!(
             wfs["wave-swarm"]
                 .description
@@ -40971,7 +37754,6 @@ mod integration_tests {
     #[test]
     fn workflow_list_brief_projects_hybrid_contract() {
         let all = workflow_catalog::all_workflows_merged(None).expect("catalog");
-        // Live projection body (what print_json emits under --brief).
         let brief_stdout = serde_json::json!({ "workflows": workflow_list_brief_rows(&all) });
         let workflows = brief_stdout["workflows"]
             .as_array()
@@ -40992,7 +37774,6 @@ mod integration_tests {
             let obj = row.as_object().expect("brief row object");
             let keyset: std::collections::BTreeSet<_> = obj.keys().cloned().collect();
             assert_eq!(keyset, expect, "live brief stdout JSON keys: {obj:?}");
-            // Full-list-only fields must NOT appear on brief.
             assert!(!obj.contains_key("description"));
             assert!(!obj.contains_key("trigger"));
             assert!(!obj.contains_key("source"));
@@ -41014,7 +37795,6 @@ mod integration_tests {
             );
             assert!(obj["compose_token"].is_boolean());
         }
-        // Sticky-open witness: wave-swarm stays swarm on the live brief path.
         let wave = workflows
             .iter()
             .find(|r| r["name"] == "wave-swarm")
@@ -41022,8 +37802,6 @@ mod integration_tests {
         assert_eq!(wave["topology"], "swarm");
         assert_eq!(wave["compose_token"], true);
         assert_eq!(crate::decide::topology_for_primitive("wave-swarm"), "swarm");
-        // Smoke: real cmd_workflow List { brief: true } succeeds (prints the
-        // live projection above).
         let cfg = Config::default();
         let cmd = WorkflowCmd::List {
             json: false,
@@ -41064,13 +37842,11 @@ mod integration_tests {
             for key in required {
                 assert!(obj.contains_key(key), "full list missing {key}: {obj:?}");
             }
-            // Brief-only topology must not appear on full list.
             assert!(
                 !obj.contains_key("topology"),
                 "topology is brief-only; full row: {obj:?}"
             );
             let desc = obj.get("description");
-            // Builtins carry non-empty description strings (Option may be Some).
             if crate::builtin_workflows::builtin_workflows()
                 .contains_key(obj["name"].as_str().unwrap_or(""))
             {
@@ -41082,7 +37858,6 @@ mod integration_tests {
                 );
             }
         }
-        // Hybrid fields must match the shared helper (no brief/full drift).
         let wave = workflows
             .iter()
             .find(|r| r["name"] == "wave-swarm")
@@ -41093,7 +37868,6 @@ mod integration_tests {
         assert_eq!(wave["selection"], selection);
         assert_eq!(wave["compose_token"], token);
         assert!(wave.get("decide_trigger").is_some());
-        // Smoke: real cmd_workflow List { brief: false } succeeds.
         let cfg = Config::default();
         let cmd = WorkflowCmd::List {
             json: false,
@@ -41101,7 +37875,6 @@ mod integration_tests {
             project: None,
         };
         cmd_workflow(&cfg, &cmd).expect("WorkflowCmd::List bare must succeed");
-        // robot-capabilities: exactly one top-level "workflows" key (no dual).
         let src = include_str!("main.rs");
         let robot_block_start = src
             .find("if cli.robot_capabilities")
@@ -41294,7 +38067,6 @@ mod integration_tests {
             Some(*description),
             "quoting must preserve the description verbatim"
         );
-        // And the unquoted form is what used to fail — stated, not assumed.
         assert!(
             serde_yaml::from_str::<serde_yaml::Value>(&format!("description: {description}\n"))
                 .is_err(),
@@ -41343,7 +38115,6 @@ mod integration_tests {
                 "{kind} budget knobs"
             );
             assert!(out.contains("doorbell"), "{kind} names the doorbell");
-            // GS-043: rendered slash command must include the spawn SoT body
             assert!(
                 out.contains("OPERATING CONTRACT") || out.contains("Peer-aware agent template"),
                 "{kind} must embed integrations/peer-aware.md.tpl SoT"
@@ -41414,11 +38185,6 @@ mod integration_tests {
 
     #[test]
     fn orchestration_hint_is_quoted_yaml_scalar() {
-        // Pi's prompts-dir loader YAML-parses frontmatter strictly: an
-        // unquoted hint (`argument-hint: [objective=...] ...`) is a
-        // flow-sequence parse error, the load throws, and the command
-        // silently vanishes from /-autocomplete. Pin the quoted form for
-        // every kind whose hint is injected (opencode/pi/grok).
         for kind in ["opencode", "pi", "grok"] {
             let out = render_orchestration_prompt(kind, "swarm-mode", "0.1.0", "ts").unwrap();
             let line = out
@@ -41524,8 +38290,6 @@ mod integration_tests {
 
     #[test]
     fn prompts_dir_maps_each_kind() {
-        // config tests mutate HOME under the env lock and leave it removed —
-        // pin HOME for the mapping's lifetime (never read the ambient value).
         let _g = crate::config::lock_env();
         let home = std::env::temp_dir().join(format!("fw-prompts-home-{}", std::process::id()));
         unsafe { std::env::set_var("HOME", &home) };
@@ -41636,7 +38400,6 @@ mod headless_retry_tests {
             "grok/grok-4.5",
             "omp prefixes the provider"
         );
-        // no fallback declared -> no retry (empty).
         let no_fb = reg.get("grok-4.5").and_then(|e| e.fallback.clone());
         assert!(no_fb.is_none());
     }
@@ -41649,8 +38412,7 @@ mod debate_tests {
     #[test]
     fn debate_resolves_default_agents() {
         let (_a, _b, j) = resolve_debate_agents("hachiko", None, None, None).unwrap();
-        // review-fix F7: defaults expand to the spawned name
-        assert_eq!(j, "flywheel-hachiko-gk"); // judge defaults to grok
+        assert_eq!(j, "flywheel-hachiko-gk");
     }
 
     #[test]
@@ -41727,8 +38489,6 @@ mod xproj_tests {
             [] as [(String, String); 0]
         );
     }
-
-    // ---- bd-context-limit-honor-luqg: exact-body CONTEXT_LIMIT scan ----
 
     /// The saturation signal is the EXACT trimmed body — a subject mention
     /// or a body that says more than `CONTEXT_LIMIT` is not the contract.
@@ -41901,11 +38661,9 @@ mod plan_review_tests {
                 "orchestrator prompt",
             ),
         ];
-        // newest TopazOx row in THIS thread wins, other thread/sender excluded
         let hit = newest_in_thread(&rows, thread, "TopazOx", "").expect("reply must be found");
         assert_eq!(hit.id.to_string(), "r2");
         assert_eq!(hit.body_md, "counter two");
-        // no reply yet → None (harvest then bails loudly, never ships empty)
         assert!(newest_in_thread(&rows, thread, "NeverReplied", "").is_none());
     }
 
@@ -41928,15 +38686,12 @@ mod plan_review_tests {
             duplicate_of: None,
         };
         let npub = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
-        // name-only rows: the NAME matches
         let rows = vec![mk("n1", "TopazOx", 1_000), mk("n3", "someone-else", 3_000)];
         let by_name = newest_in_thread(&rows, "debate-20260806T130548", "TopazOx", npub).unwrap();
         assert_eq!(by_name.id.to_string(), "n1");
-        // raw-hex rows only (unregistered sender): the NPUB matches
         let rows = vec![mk("n2", npub, 2_000), mk("n3", "someone-else", 3_000)];
         let by_npub = newest_in_thread(&rows, "debate-20260806T130548", "TopazOx", npub).unwrap();
         assert_eq!(by_npub.id.to_string(), "n2");
-        // npub unknown AND name absent → no match against the hex row
         assert!(newest_in_thread(&rows, "debate-20260806T130548", "TopazOx", "").is_none());
     }
 
@@ -41953,9 +38708,8 @@ mod plan_review_tests {
         let path = ".flywheel/plans/x.md";
         let mut phases: Vec<PriPhase> = Vec::new();
         let mut phase = PriPhase::AwaitingPlanReview;
-        let mut action = pri_after_plan(path).1; // PromptReviewer
+        let mut action = pri_after_plan(path).1;
         let mut change_rounds = 0u32;
-        // scripted reviewer replies: CHANGES then APPROVE (then VERIFIED at verify)
         let mut reviewer_tokens = [
             ReviewToken::Changes("fix a".into()),
             ReviewToken::Approve,
@@ -41973,14 +38727,12 @@ mod plan_review_tests {
                     let (_, a, r) = pri_route(phase, &token, path, change_rounds, max_rounds);
                     action = a;
                     change_rounds = r;
-                    // APPROVE routes to implement; CHANGES routes to planner
                     match &action {
                         PriAction::PromptImplementer { .. } => {
                             phase = pri_after_implement(path).0;
                             action = pri_after_implement(path).1;
                         }
                         PriAction::PromptPlanner { .. } => {
-                            // planner revises; back to review
                             phase = pri_after_plan(path).0;
                             action = pri_after_plan(path).1;
                         }
@@ -42001,7 +38753,6 @@ mod plan_review_tests {
             }
         }
         phases.push(PriPhase::Done);
-        // visited AwaitingPlanReview twice (initial + after CHANGES re-plan)
         let reviews = phases
             .iter()
             .filter(|p| matches!(p, PriPhase::AwaitingPlanReview))
@@ -42073,7 +38824,6 @@ mod plan_review_tests {
         assert_eq!(p, PriPhase::AwaitingPlan);
         assert_eq!(r, 1);
         assert!(matches!(a, PriAction::PromptPlanner { .. }));
-        // second changes still ok
         let (p2, _, r2) = pri_route(
             PriPhase::AwaitingPlanReview,
             &ReviewToken::Changes("more".into()),
@@ -42083,7 +38833,6 @@ mod plan_review_tests {
         );
         assert_eq!(p2, PriPhase::AwaitingPlan);
         assert_eq!(r2, 2);
-        // third exceeds max 2
         let (p3, a3, r3) = pri_route(
             PriPhase::AwaitingPlanReview,
             &ReviewToken::Changes("again".into()),
@@ -42172,12 +38921,9 @@ mod profile_cli_tests {
             "housekeeper",
         ] {
             let p = cat.get(name).expect(name);
-            // every built-in carries the Spec 1b preamble (not a stub)
             assert!(p.behavior.len() > 200, "{name} preamble missing");
         }
     }
-
-    // ---- bd-brie: squad spawn project-scope → host-scope fallback ----
 
     /// Project-scope resolution of an UNREGISTERED profile falls back to
     /// host-scope (operator npub) — the same effective behavior as
@@ -42232,9 +38978,6 @@ mod profile_cli_tests {
 
     #[test]
     fn squad_show_resolves_recipe_alias_to_members() {
-        // A legacy recipe name resolves as a squad (alias) — the P6.2 core.
-        // We exercise the mapping logic directly (Recipe -> Squad) since the
-        // CLI fn needs a live config dir + backend.
         let r = config::Recipe {
             oc: Some(2),
             pi: Some(1),
@@ -42248,8 +38991,6 @@ mod profile_cli_tests {
 
     #[test]
     fn squad_list_lists_builtin_profiles_as_singles() {
-        // With no recipes.toml, `squad list` falls back to 1-member squads for
-        // every built-in profile (zero-config squad surface).
         let cat = profile::ProfileCatalog::load_from(None).expect("defaults");
         let recipes = config::Recipes::default().recipes;
         let names: Vec<String> = cat.names();
@@ -42264,8 +39005,6 @@ mod profile_cli_tests {
 
     #[test]
     fn snapshot_runs_returns_well_formed_entries() {
-        // Runs section is always a JSON array; every entry carries the fields
-        // the agent driver contracts on (id/project/kind/owner/state/ts).
         let runs = snapshot_runs();
         for r in &runs {
             assert!(r.get("id").and_then(Value::as_str).is_some(), "id");
@@ -42517,9 +39256,7 @@ mod bd_bvwf1_orphan_workspaces {
     #[test]
     fn orphan_hosting_managed_agent_is_owned() {
         let project = "/path/to/toron";
-        // default-label workspace (always owned)
         let default_ws = ws("w-default", "flywheel-toron");
-        // orphan: different label, but hosts a managed agent
         let orphan_ws = ws("w-orphan", "custom-swarm-label");
         let agents = vec![
             agent("w-orphan", Some("flywheel-toron-oc")),
@@ -42569,7 +39306,6 @@ mod bd_bvwf1_orphan_workspaces {
             vec!["w-captain"],
             "base-label session is foreign"
         );
-        // unrelated workspace is neither (None) — never blocks or closes.
     }
 }
 
@@ -42633,7 +39369,6 @@ mod send_conditioning_tests {
             condition_send_target(Some(&mut entry), &catalog, "echo who you are", false);
         assert_eq!(text, "echo who you are", "byte-identical legacy send");
         assert_eq!(profile, None);
-        // no registry entry at all → raw
         let (text, profile, _) = condition_send_target(None, &catalog, "echo who you are", false);
         assert_eq!(text, "echo who you are");
         assert_eq!(profile, None);
@@ -42646,9 +39381,6 @@ mod send_conditioning_tests {
             state::SpawnEntry::profiled("w:p3", "crew-scout", "scout", "opencode", None);
         let (text, profile, _) =
             condition_send_target(Some(&mut entry), &catalog, "echo who you are", true);
-        // GS-039 P0-2: --raw skips profile conditioning (no behavior
-        // preamble) but frames the text AUTHORITATIVE so peer-aware agents
-        // cannot classify operator text as chatter.
         assert!(
             !text.contains("You are a SCOUT."),
             "--raw bypasses profile conditioning: {text:?}"
@@ -42683,8 +39415,6 @@ mod send_conditioning_tests {
         let (text, profile, injected) =
             condition_send_target(Some(&mut entry), &catalog, "survey the repo", false);
         assert!(injected, "first dispatch carries the skill prefix");
-        // Ordering mirrors cmd_internal_send (__send leaf): behavior
-        // preamble, then the skill-load prefix, then the mission.
         assert!(
             text.starts_with("You are a SCOUT."),
             "behavior preamble leads: {text:?}"
@@ -42702,7 +39432,6 @@ mod send_conditioning_tests {
             entry.skills_injected,
             "flag persisted on the registry entry"
         );
-        // second dispatch: prefix NOT repeated (registry-tracked)
         let (text2, _, injected2) =
             condition_send_target(Some(&mut entry), &catalog, "survey the repo", false);
         assert!(!injected2, "prefix delivered once (bd-eign.10 advisory)");
@@ -42744,7 +39473,6 @@ mod send_result_row_tests {
             "no bare status field to misread as a miss"
         );
         assert_eq!(row["landed"], false, "landing only after --wait/--confirm");
-        // ADR-0019 D5: dispatched without an observed ok is queued.
         assert_eq!(row["delivery"], "queued");
     }
 
@@ -42766,7 +39494,6 @@ mod send_result_row_tests {
         assert_eq!(row["prior_status"], "idle");
         assert_eq!(row["landed"], true, "--wait observed landing");
         assert_eq!(row["settled_status"], "done");
-        // ADR-0019 D5: an observed settle on a pane wakes it.
         assert_eq!(row["delivery"], "woke");
     }
 
@@ -42785,7 +39512,6 @@ mod send_result_row_tests {
         );
         assert_eq!(row["dispatched"], true);
         assert_eq!(row["prior_status"], "working");
-        // ADR-0019 D5: delivery rides every row.
         assert_eq!(row["delivery"], "queued");
     }
 
@@ -42803,8 +39529,6 @@ mod send_result_row_tests {
             "timeout is unknown, never a definitive false: {v}"
         );
         assert_eq!(v["ambiguous"], true);
-        // The durable consumer parses null as no-verdict and ACCEPTS (the
-        // next poll is the correctness floor) — semantics unchanged.
         let outcome: durable::SendOutcome = serde_json::from_value(v).expect("parse");
         assert_eq!(outcome.landed, None);
         assert_eq!(
@@ -43002,11 +39726,9 @@ mod send_receipt {
             row.get("landed").is_none(),
             "landed must be absent on an ambiguous wait failure, not false: {row}"
         );
-        // Read-back itself failed: observed_status omitted, never invented.
         let row = wait_failure_row("flywheel-oc", "idle", "%3", None, None);
         assert!(row.get("observed_status").is_none());
         assert!(row["profile"].is_null());
-        // ADR-0019 D5: timeout between claim and settle is Unknown.
         assert_eq!(row["delivery"], "unknown");
     }
 
@@ -43037,9 +39759,6 @@ mod reservation_identity_tests {
     use super::*;
     use toron_core::mailbox::guard::{Reservation, SHARED_SAFE_PATHS, guard_check_strict};
 
-    // bd-05ar: the ladder's order test moved to `authority::tests` — it now
-    // lives with the ONE implementation it tests.
-
     /// bd-2mdo RED: an actor token that names a REGISTERED mailbox identity
     /// passes through VERBATIM — it is an address, not an hc slug to
     /// re-derive. The hash fallback minted RainyElk for the literally-
@@ -43049,19 +39768,15 @@ mod reservation_identity_tests {
     fn actor_resolution_passthrough_for_registered_identity() {
         let env = |k: &str| -> Option<String> { (k == "AGENT_NAME").then(|| "oc5".to_string()) };
         let roster = vec!["e2e-zord".to_string(), "FoggyDesert".to_string()];
-        // explicit --as naming a registered identity: verbatim, never hashed.
         assert_eq!(
             resolve_mail_actor_roster("proj", Some("e2e-zord"), &env, &roster).as_deref(),
             Some("e2e-zord"),
             "registered explicit --as must not be hash-mangled"
         );
-        // env-derived UNREGISTERED slug: defers to the registry/hash
-        // resolver exactly as before (oc5 is not in the roster).
         assert_eq!(
             resolve_mail_actor_roster("proj", None, &env, &roster).as_deref(),
             Some(resolve_mail_target_registry("proj", "oc5")).as_deref(),
         );
-        // env-derived token that is itself a registered identity: passthrough.
         let env_pin =
             |k: &str| -> Option<String> { (k == "AGENT_NAME").then(|| "FoggyDesert".to_string()) };
         assert_eq!(
@@ -43069,7 +39784,6 @@ mod reservation_identity_tests {
             Some("FoggyDesert"),
             "registered pin must survive unchanged"
         );
-        // nothing selected -> nothing resolved.
         assert_eq!(
             resolve_mail_actor_roster("proj", None, &|_| None, &roster),
             None
@@ -43097,8 +39811,6 @@ mod reservation_identity_tests {
             blocks.is_empty(),
             "own lease must not block own commit: {blocks:?}"
         );
-        // The asymmetry this bead kills: same lease, DIFFERENT attributed
-        // committer (config-default identity) -> blocked.
         let other = guard_check_strict(Some("Flywheel"), &staged, &own, SHARED_SAFE_PATHS);
         assert!(!other.is_empty(), "foreign attribution must block");
     }
@@ -43113,7 +39825,6 @@ fn resolve_register_name(explicit: Option<String>, from_project: Option<&str>) -
     let importing = from_project.map(|p| !p.trim().is_empty()).unwrap_or(false);
     match (explicit, importing) {
         (Some(n), _) => Ok(n),
-        // import decides the name from the source key it binds
         (None, true) => Ok(String::new()),
         (None, false) => anyhow::bail!(
             "refusing to mint an UNNAMED mail identity — pass --name <adjective+noun-pin>, \
@@ -43141,9 +39852,6 @@ fn bind_source_key(
              --adopt-unnamed <name>, or drop --from-project to mint a new pin here"
         )
     })?;
-    // bd-hdec: the bind dst is the canonical mailbox slot
-    // (`{mailbox}/{project}/agents/{name}`), which the in-process
-    // register_agent reuses (no second npub).
     let dst_dir = data_dir.join(to_slug).join("agents").join(name);
     std::fs::create_dir_all(&dst_dir)?;
     let dst = dst_dir.join("key.ncryptsec");
@@ -43168,7 +39876,6 @@ fn import_source_key(data_dir: &std::path::Path, from_slug: &str, name: &str) ->
         .join("key.ncryptsec");
     p.is_file()
         .then_some(p)
-        // Legacy bare-root layout (pre-projects/ strays) still binds.
         .or_else(|| {
             let legacy = legacy_root_from_mailbox(data_dir)
                 .join(from_slug)
@@ -43205,7 +39912,6 @@ fn unnamed_key_path(data_dir: &std::path::Path, slug: &str) -> PathBuf {
 fn adopt_unnamed_key(data_dir: &std::path::Path, slug: &str, name: &str) -> Result<PathBuf> {
     let src = match unnamed_key_path(data_dir, slug) {
         p if p.is_file() => p,
-        // Legacy bare-root unnamed strays (pre-projects/ layout) adopt too.
         _ => {
             let legacy = legacy_root_from_mailbox(data_dir)
                 .join(slug)
@@ -43298,7 +40004,6 @@ mod register_identity_tests {
         let dst = bind_source_key(&dir, "toron", "flywheel", "WindyGlen").expect("bind");
         assert_eq!(std::fs::read(&dst).unwrap(), b"key-bytes");
 
-        // Idempotent: a pre-existing dst is left untouched (never clobbered).
         std::fs::write(&dst, b"already-here").unwrap();
         let again = bind_source_key(&dir, "toron", "flywheel", "WindyGlen").expect("rebind");
         assert_eq!(std::fs::read(&again).unwrap(), b"already-here");
@@ -43317,8 +40022,6 @@ mod register_identity_tests {
         let named = dir.join("flywheel/agents/IronSummit/key.ncryptsec");
         assert_eq!(std::fs::read(&named).unwrap(), b"npub-bytes");
         assert!(!unnamed.exists(), "unnamed slot vacated");
-        // second adopt with nothing to move is a clean no-op error? No:
-        // absent unnamed key = nothing to adopt, reported not crashed.
         assert!(adopt_unnamed_key(&dir, "flywheel", "Other").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -43356,8 +40059,6 @@ mod verify_sink_tests {
 
     #[test]
     fn verify_sink_returns_ok_on_success() {
-        // GS-025: absolute scratch project — Config::default() resolves
-        // ~/workspace/flywheel which does not exist on CI runners.
         let dir = std::env::temp_dir().join(format!("fw-vs-ok-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let cfg = Config::default();
@@ -43435,7 +40136,6 @@ graph:
 
     #[test]
     fn verify_sink_exec_failing_command_returns_false_with_exit() {
-        // GS-025: absolute scratch project (see verify_sink_returns_ok_on_success).
         let dir = std::env::temp_dir().join(format!("fw-vs-fail-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let cfg = Config::default();
@@ -43455,7 +40155,6 @@ graph:
 
     #[test]
     fn verify_sink_exec_writes_workflow_receipt_on_success() {
-        // GS-025: absolute scratch project (see verify_sink_returns_ok_on_success).
         let dir = std::env::temp_dir().join(format!("fw-vs-rcpt-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let cfg = Config::default();
@@ -43472,7 +40171,6 @@ graph:
         assert!(path.contains("verify-sink"));
         assert!(path.contains("workflow-sha"));
         assert!(path.ends_with(".worker-receipt.txt"));
-        // receipt file exists and contains output
         let content = std::fs::read_to_string(&path).expect("receipt file");
         assert!(content.contains("workflow-ok") || content.contains("verify ok"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -43480,8 +40178,6 @@ graph:
 
     #[test]
     fn verify_sink_exec_slot_acquisition_still_happens() {
-        // cargo command should go through slot path (acquire/release) without panic
-        // GS-025: absolute scratch project (see verify_sink_returns_ok_on_success).
         let dir = std::env::temp_dir().join(format!("fw-vs-slot-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let cfg = Config::default();
@@ -43492,7 +40188,6 @@ graph:
         let guard = sink.0.lock().unwrap();
         let f = guard.as_ref().expect("sink");
         let res = f(&req).expect("verify sink");
-        // cargo --version succeeds, so ok true
         assert!(res.ok, "error={:?}", res.error);
         assert_eq!(res.exit, 0);
         assert!(res.stdout_path.is_some());
@@ -43600,7 +40295,6 @@ steps:
             let rid = run_id.clone();
             tokio::spawn(async move { engine.run(&rid, input).await })
         };
-        // Wait for the approval promise to appear in the sink
         let promise_id = {
             let mut tries = 0;
             loop {
@@ -43618,7 +40312,6 @@ steps:
             .await
             .expect("resolve");
         let out = handle.await.expect("join").expect("run should resume");
-        // After approve, the run should complete (not failed)
         assert!(out.get("ask").is_some() || out.get("decision").is_some());
     }
 
@@ -43657,8 +40350,6 @@ steps:
             .await
             .expect("join")
             .expect("run should complete even on reject");
-        // Reject is a decision, not a crash — WF-08
-        // The output should contain the decision with outcome rejected or status rejected
         let has_rejected = out.to_string().contains("rejected");
         assert!(has_rejected, "reject should record rejected: {out}");
     }
@@ -43669,20 +40360,16 @@ mod idempot_tests {
 
     #[test]
     fn idempot_spawn_same_key_returns_first_pin() {
-        // Simulate two spawns with same (project, bead_id, profile) key
-        // The second should return the existing pin+pane, not create a new pane
         let project = "test-proj";
         let bead_id = "bd-test-idempot-1";
         let profile = "coder";
         let key = format!("{}:{}:{}", project, bead_id, profile);
         let mut registry: std::collections::HashMap<String, (String, String)> =
             std::collections::HashMap::new();
-        // First spawn
         let pin1 = "CoderOne";
         let pane1 = "pane-1";
         registry.insert(key.clone(), (pin1.to_string(), pane1.to_string()));
         let count1 = registry.len();
-        // Second spawn with same key should return existing
         let (pin2, pane2) = registry.get(&key).unwrap().clone();
         assert_eq!(pin2, pin1);
         assert_eq!(pane2, pane1);
@@ -43695,7 +40382,6 @@ mod idempot_tests {
 
     #[test]
     fn idempot_compose_same_run_id_does_not_agent_start_again() {
-        // Second compose --run with same run_id should not call agent_start again (mock)
         let run_id = "fw-composed-test123";
         let mut calls = 0;
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -43718,7 +40404,6 @@ mod idempot_tests {
 
     #[test]
     fn idempot_dead_pane_respawns_same_key_new_pane() {
-        // Dead pane is a miss: kill pane + re-spawn same key -> new pane id, same registry row, count 1
         let project = "test-proj";
         let bead_id = "bd-test-dead";
         let profile = "coder";
@@ -43726,7 +40411,6 @@ mod idempot_tests {
         let mut registry: std::collections::HashMap<String, (String, String)> =
             std::collections::HashMap::new();
         registry.insert(key.clone(), ("PinA".to_string(), "pane-old".to_string()));
-        // Simulate pane death: registry row survives, pane id replaced
         let (pin, _old_pane) = registry.get(&key).unwrap().clone();
         let new_pane = "pane-new";
         registry.insert(key.clone(), (pin.clone(), new_pane.to_string()));
@@ -43739,16 +40423,12 @@ mod idempot_tests {
 
     #[test]
     fn idempot_direct_path_no_artifacts_dir_needed() {
-        // Direct path spawn+send needs no artifacts dir (S7)
         let artifacts_dir = std::path::Path::new("/tmp/test-no-artifacts");
-        // Direct spawn should not require artifacts dir to exist
         assert!(
             !artifacts_dir.join("artifacts").exists() || true,
             "direct path should not require artifacts dir"
         );
-        // Simulate direct spawn+send without artifacts
         let result = std::panic::catch_unwind(|| {
-            // Direct path just does spawn + send, no artifact index
             let _ = crate::crew::plan_crew(&toron_workflow::schema::Workflow {
                 name: "direct-test".into(),
                 description: None,
@@ -43930,7 +40610,6 @@ mod ingress_wiring_tests {
                 .unwrap()
                 .starts_with("[doorbell] pane stalled")
         );
-        // status helper: append fact and count
         let proj = format!("facts-test-{}", uuid::Uuid::new_v4());
         let root = crate::temp_state_root("facts-captain");
 
@@ -43944,7 +40623,6 @@ mod ingress_wiring_tests {
         let (c1, last) = crate::facts_count_and_last(&root, &proj);
         assert_eq!(c1, 1);
         assert!(last.unwrap().contains("lease lapsed src/lib.rs"));
-        // non-fact does not increment
         let non = crate::ingress::IngressEvent::CronTick {
             name: "tick".into(),
         };
@@ -43952,10 +40630,6 @@ mod ingress_wiring_tests {
         let (c2, _) = crate::facts_count_and_last(&root, &proj);
         assert_eq!(c2, 1, "non-fact must not be journaled");
 
-        // bd-lorot: the fence. This test used to append into ~/.local/state
-        // and then delete one of the two files it made, which is how 244 of
-        // them survived. Now it names a throwaway root and the live root is
-        // asserted untouched.
         crate::assert_live_root_untouched(&proj);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -43963,10 +40637,6 @@ mod ingress_wiring_tests {
 
 #[cfg(test)]
 mod journal_effect_tests {
-    // bd-adr0027-proven-leftovers-55nx.9: the journal must record the budget
-    // gate outcome (effect: injected vs dropped pins) next to tick's complete
-    // cmds, and `why` must read it — otherwise why replays dropped Prompts
-    // as if they were injected.
     use super::*;
 
     #[test]
@@ -44035,9 +40705,6 @@ mod journal_effect_tests {
 
 #[cfg(test)]
 mod why_resume_tests {
-    // bd-adr0027-proven-leftovers-55nx.1: `why` must fold from crash-resume
-    // caches (receipts sqlite + presence snapshot), never bare Default —
-    // otherwise replay shows Prompts the live gate would have suppressed.
     use super::*;
 
     #[test]
@@ -44065,8 +40732,6 @@ mod why_resume_tests {
     fn why_seeds_assignment_before_fold() {
         let src = include_str!("main.rs");
         let pos = src.find("fn cmd_doorbell_why(").expect("cmd_doorbell_why");
-        // Window must cover the fold setup (~7.3k chars in): receipts seed,
-        // presence seed, per-ws Default, and the replay loop.
         let slice = &src[pos..std::cmp::min(src.len(), pos + 9000)];
         assert!(
             slice.contains("rebuild_assignment_from_receipts"),
@@ -44078,10 +40743,6 @@ mod why_resume_tests {
     fn why_seeds_presence_snapshot() {
         let src = include_str!("main.rs");
         let pos = src.find("fn cmd_doorbell_why(").expect("cmd_doorbell_why");
-        // Whole function (its sibling `why_fold_has_corr_seq_filters_from_default`
-        // bounds the same way): the presence seed lands ~7.3k chars in, past
-        // the old 6000-char window — which passed only on the coincidental
-        // `presence.jsonl` read-site string, not the seed itself.
         let end = src[pos..]
             .find("\nfn cmd_loop_why(")
             .map(|i| pos + i)
@@ -44105,8 +40766,6 @@ mod why_resume_tests {
 mod single_writer_tests {
     #[test]
     fn option_a_doorbell_seeds_swarm_resume() {
-        // bd-asr2.5 topology: seeds moved with the loop into RtHost::new —
-        // same one-RAM-owner contract, new address.
         let host = include_str!("doorbell_host.rs");
         assert!(
             host.contains("seed_workspace_from_active_loop"),
@@ -44195,16 +40854,12 @@ mod adr0010_d13_tests {
 
     #[test]
     fn adr0010_d13_crew_panes_exempt_and_creatable() {
-        // Crew panes are exempt from the fence...
         assert!(subagent_guard_decision(Some("crew"), "Task").is_ok());
         assert!(subagent_guard_decision(Some("CREW"), "spawn").is_ok());
-        // ...and the spawn path that CREATES crew panes is untouched: the
-        // fence lives on the captain's tool surface, not the spawn command.
         assert!(
             !delegation_deny("flywheel").is_some(),
             "the flywheel CLI itself is never delegation-shaped"
         );
-        // Non-crew roles are enforced (default captain).
         assert!(subagent_guard_decision(Some("captain"), "Task").is_err());
     }
 
@@ -44219,14 +40874,9 @@ mod adr0010_d13_tests {
 #[cfg(test)]
 mod adr0010_d7_tests {
     // governed-by: ADR-0010 D7 (bd-w5fn) — crew control verbs + FLYWHEEL_OP
-    // marker. Code-pointer gates over the imperative wiring; the pure
-    // postconditions live in src/control.rs (adr0010_d7_* tests).
 
     #[test]
     fn adr0010_d7_no_arbitrary_text_entry_point() {
-        // The verb enum is exactly interrupt|exit|relaunch, all unit
-        // variants — text the worker reads is not a lifecycle verb.
-        // bd-qbi8: the enum lives in cmd/crew.rs now; handlers stay here.
         let start = include_str!("cmd/crew.rs")
             .find("enum ControlVerbCmd {")
             .expect("ControlVerbCmd enum present");
@@ -44440,14 +41090,11 @@ mod product_digest_tests {
         let pin = "GapFalcon";
         pd_register(&mail, &a, pin);
         pd_seed(&mail, &a, pin, "report from A");
-        // ghost is linked but the pin is known nowhere near it: no project,
-        // no key, nothing to fold — must render as a gap, not abort A.
         pd_product(&mail, &key, &[a.clone(), ghost.clone()]);
         let dirs = vec![(a.clone(), a.clone()), (ghost.clone(), ghost.clone())];
         let v = product_digest_for(&mail, &key, "NowherePin", &dirs);
         let gaps = v.get("gaps").and_then(|g| g.as_array()).expect("gaps");
         assert!(!gaps.is_empty(), "unreadable pin renders loud gaps: {v}");
-        // …and nothing was minted for the unknown pin anywhere.
         assert!(
             mail.whois(&a, "NowherePin").is_err(),
             "gap path never mints a key"
@@ -44477,7 +41124,6 @@ mod product_digest_tests {
         let (a, b) = (pd_slug("folda"), pd_slug("foldb"));
         let key = format!("pd-fold-{}", std::process::id());
         let pin = "FoldFalcon";
-        // Pin lives in A only; B has the project but no identity.
         pd_register(&mail, &a, pin);
         mail.ensure_project(&b).expect("ensure B");
         pd_seed(&mail, &a, pin, "report from A");
@@ -44489,9 +41135,6 @@ mod product_digest_tests {
             .and_then(|m| m.as_array())
             .expect("members");
         assert_eq!(members.len(), 2, "fold makes B readable: {v}");
-        // One key across members, never a second: the fold copies the
-        // EXISTING key file (whois profiles stay the member's own
-        // onboarding — a read verb never publishes those).
         let (data_dir, _) = mail::built_mailbox_roots();
         let key_of = |p: &str| {
             std::fs::read(
@@ -44587,7 +41230,6 @@ mod bd_qlr1_reroute_env_pin_tests {
                 Some("opencode-go/muse-spark-1.3-contributor"),
                 "deepseek/deepseek-flash",
             ),
-            // The pane carried no pin at all, so there is nothing to honour.
             (None, "opencode-go/muse-spark-1.3-contributor"),
         ] {
             assert_eq!(

@@ -140,8 +140,6 @@ pub fn parse_state_file(content: &str) -> Option<AgentStateFile> {
 /// use for negative epochs). Leap-second `:60` timestamps are rejected by
 /// chrono (RFC3339-strict; the old hand-rolled parser tolerated them).
 pub fn parse_ts(ts: &str) -> Option<u64> {
-    // chrono's RFC3339 parser tolerates a SPACE date-time separator; the
-    // contract (`state::now_iso` shape) requires the literal 'T' — pin it.
     if ts.as_bytes().get(10) != Some(&b'T') {
         return None;
     }
@@ -161,13 +159,9 @@ pub fn is_fresh_at(ts: &str, now_unix: u64, max_age: Duration) -> bool {
     }
 }
 
-// ---- parsing helpers ----
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---- path building ----
 
     #[test]
     fn state_file_path_builds_contract_path() {
@@ -204,7 +198,6 @@ mod tests {
 
     #[test]
     fn state_file_path_rejects_embedded_separators() {
-        // any separator must fail even when the name looks plausible
         assert!(state_file_path(Path::new("/proj"), "a/b").is_err());
         assert!(state_file_path(Path::new("/proj"), "a\\b").is_err());
     }
@@ -231,21 +224,16 @@ mod tests {
             )
             .unwrap();
         };
-        // hc-name file present, pin file fresher → pin wins.
         write("oc3", 85, "2026-08-22T01:00:00Z");
         write("TanFern", 92, "2026-08-22T01:05:00Z");
         let s = read_state_for_agent(&root, "oc3", Some("TanFern")).expect("some state");
         assert_eq!(s.context_pct, 92, "fresher pin file preferred");
-        // pin file absent → hc-name file still found (no regression).
         write("oc2", 80, "2026-08-22T01:00:00Z");
         let s2 = read_state_for_agent(&root, "oc2", Some("NoSuchPin")).expect("fallback");
         assert_eq!(s2.context_pct, 80);
-        // neither identity has a file → None.
         assert!(read_state_for_agent(&root, "ghost", Some("GhostPin")).is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
-
-    // ---- parse ----
 
     #[test]
     fn parse_state_file_happy() {
@@ -258,22 +246,20 @@ mod tests {
     fn parse_state_file_malformed_is_none() {
         assert_eq!(parse_state_file("not json"), None);
         assert_eq!(parse_state_file(""), None);
-        assert_eq!(parse_state_file(r#"{ "context_pct": 82 }"#), None); // missing ts
+        assert_eq!(parse_state_file(r#"{ "context_pct": 82 }"#), None);
         assert_eq!(
             parse_state_file(r#"{ "ts": "2026-08-03T03:00:00Z" }"#),
             None
-        ); // missing pct
+        );
         assert_eq!(
             parse_state_file(r#"{ "context_pct": 150, "ts": "2026-08-03T03:00:00Z" }"#),
-            None // out of range
+            None
         );
         assert_eq!(
             parse_state_file(r#"{ "context_pct": 82, "ts": "not-a-time" }"#),
-            None // bad ts
+            None
         );
     }
-
-    // ---- ts parsing ----
 
     /// One row per accepted shape: `Z` and a fractional second both land on
     /// the same second (fractions truncate, they never round up).
@@ -299,15 +285,15 @@ mod tests {
     fn parse_ts_rejects_garbage() {
         for bad in [
             "",
-            "2026-08-03 03:00:00Z", // space instead of T
-            "2026-13-03T03:00:00Z", // month 13
-            "2026-08-32T03:00:00Z", // day 32
-            "2026-02-29T03:00:00Z", // not a leap year
-            "2026-08-03T24:00:00Z", // hour 24
-            "2026-08-03T03:00:00",  // no timezone
-            "2026-08-03T03:00:00X", // bad tz
+            "2026-08-03 03:00:00Z",
+            "2026-13-03T03:00:00Z",
+            "2026-08-32T03:00:00Z",
+            "2026-02-29T03:00:00Z",
+            "2026-08-03T24:00:00Z",
+            "2026-08-03T03:00:00",
+            "2026-08-03T03:00:00X",
             "hello world",
-            "2026-08-03T03:00:00+02:00Z", // double tz
+            "2026-08-03T03:00:00+02:00Z",
         ] {
             assert_eq!(parse_ts(bad), None, "ts {bad:?} must be rejected");
         }
@@ -315,7 +301,6 @@ mod tests {
 
     #[test]
     fn parse_ts_leap_year() {
-        // 2024-02-29 is a leap day; 2024 is a leap year
         assert_eq!(parse_ts("2024-02-29T00:00:00Z"), Some(1_709_164_800));
     }
 
@@ -324,29 +309,19 @@ mod tests {
     #[test]
     fn parse_ts_epoch_and_leap_century_boundaries() {
         assert_eq!(parse_ts("1970-01-01T00:00:00Z"), Some(0));
-        // 2000-02-29 is a leap day (divisible by 400)
         assert_eq!(parse_ts("2000-02-29T00:00:00Z"), Some(951_782_400));
-        // 2100-02-29 does not exist (century non-leap) — rejected
         assert_eq!(parse_ts("2100-02-29T00:00:00Z"), None);
-        // pre-epoch — the fresh/stale heuristic returns None (never a respawn)
         assert_eq!(parse_ts("1969-12-31T23:59:59Z"), None);
     }
 
-    // ---- freshness ----
-
     #[test]
     fn freshness_boundary() {
-        let ts = "2026-08-03T03:00:00Z"; // unix 1_785_726_000
+        let ts = "2026-08-03T03:00:00Z";
         let max = Duration::from_mins(15);
-        // exactly max_age old → fresh
         assert!(is_fresh_at(ts, 1_785_726_000 + 900, max));
-        // one second older → stale
         assert!(!is_fresh_at(ts, 1_785_726_000 + 901, max));
-        // much older (previous session) → stale
         assert!(!is_fresh_at(ts, 1_785_726_000 + 3600, max));
-        // now == ts → fresh
         assert!(is_fresh_at(ts, 1_785_726_000, max));
-        // future ts (clock skew) → fresh, never a stale signal
         assert!(is_fresh_at(ts, 1_785_726_000 - 60, max));
     }
 

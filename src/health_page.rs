@@ -17,9 +17,6 @@ use std::path::Path;
 /// different signals and stay separate.
 pub const PRESENCE_TTL_SECS: u64 = 60;
 
-// §6: the single clear rule lives in `crate::pane_keep::pane_binding_may_clear`;
-// this page calls it, never a copy.
-
 /// What one doorbell workspace's pid file says.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DispatcherSignal {
@@ -119,8 +116,6 @@ impl HealthHold {
                         out.push(HealthEvent::HeartbeatRecovered { pin: pin.clone() });
                     }
                 }
-                // Kept is not recovery: hc did not answer, or the pin is
-                // not one hc injects. Stay silent until a fresh beat.
                 HeartbeatSignal::StaleKept => {}
             }
         }
@@ -156,8 +151,6 @@ pub fn registry_rows(cfg: &crate::config::Config, project: &str) -> Vec<Heartbea
                 return None;
             }
             let harness = e.harness.unwrap_or_default();
-            // The profile is the spawn-time route; a bare row follows the
-            // process backend.
             let backend = e
                 .profile
                 .as_deref()
@@ -329,8 +322,6 @@ mod tests {
 
     #[test]
     fn a_dead_doorbell_pages_once_and_a_mail_only_pin_does_not() {
-        // tempfile: HOME/XDG are hermetic in the harness; the tempdir keeps
-        // the fake doorbell dir off the operator's state.
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path();
         write_workspace(state, "deadws", Some(&NO_SUCH_PID.to_string()));
@@ -345,7 +336,6 @@ mod tests {
              {{\"name\":\"SuperPin\",\"project\":\"p\",\"ts\":{stale_ts}}}\n\
              {{\"name\":\"PlaneDown\",\"project\":\"p\",\"ts\":{stale_ts}}}\n"
         );
-        // FreeBuff deliberately has no row: no heartbeat is not a stall.
         let rows = vec![
             HeartbeatRow {
                 pin: "RustyOtter".into(),
@@ -368,7 +358,6 @@ mod tests {
         ];
         let mut hold = HealthHold::default();
 
-        // Pass 1: the dead dispatcher and the one clearable stale pin page.
         let dispatchers = dispatcher_signals(state, "p");
         assert!(matches!(
             dispatchers.get("deadws"),
@@ -402,14 +391,11 @@ mod tests {
             page_pin(&events, "SuperPin").is_none(),
             "a superlogical backend never pages"
         );
-        // The §6 gate itself, not only the absence of a heartbeat row.
         assert!(
             !crate::pane_keep::pane_binding_may_clear("freebuff", "hc", "w1:p9", Some(&live)),
             "freebuff is never a clearable hc binding"
         );
 
-        // hc not answering is not a clearance either: the stale pin is
-        // kept and nothing pages.
         let down_rows = vec![HeartbeatRow {
             pin: "PlaneDown".into(),
             harness: "opencode".into(),
@@ -428,7 +414,6 @@ mod tests {
             "hc silence never pages"
         );
 
-        // Pass 2: the same snapshot is silent; the hold is the page-once.
         let events = hold.observe(
             &dispatcher_signals(state, "p"),
             &heartbeat_signals("p", now, &rows, &presence, Some(&live)),
@@ -438,7 +423,6 @@ mod tests {
             "the next pass must not page again: {events:?}"
         );
 
-        // Recovery: a live pid and a fresh beat clear both holds.
         write_workspace(state, "deadws", Some(&std::process::id().to_string()));
         let fresh = format!("{{\"name\":\"RustyOtter\",\"project\":\"p\",\"ts\":{now}}}\n");
         let events = hold.observe(
@@ -460,7 +444,6 @@ mod tests {
         assert!(hold.dead_doorbells.is_empty());
         assert!(hold.stale_pins.is_empty());
 
-        // A later death pages once more.
         write_workspace(state, "deadws", Some(&NO_SUCH_PID.to_string()));
         let events = hold.observe(
             &dispatcher_signals(state, "p"),

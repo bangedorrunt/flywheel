@@ -65,11 +65,7 @@ pub(crate) fn cmd_ledger(_cfg: &Config, cmd: &LedgerCmd) -> Result<()> {
             let cwd = dir
                 .clone()
                 .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
-            // SHA rule first when a commit carries the bead id. A Phase 5
-            // proved note is a second legal hit and does not need that commit.
             let sha = crate::verdict::derive_head_sha(&cwd, bead_id);
-            // Crediting a close is not dispatching: a triage bead has no
-            // VERIFY and its legal proof is a record review (bd-tfxv).
             let mut bead = crate::verdict::bead_from_br_show_for_close(&cwd, bead_id)?;
             bead.blast = match blast.as_str() {
                 "high" => crate::verdict::Blast::High,
@@ -90,8 +86,6 @@ pub(crate) fn cmd_ledger(_cfg: &Config, cmd: &LedgerCmd) -> Result<()> {
                 return Ok(());
             }
             let sha = sha?;
-            // bd-0z00: name the competing `sha=` candidates so the
-            // failure is actionable, not just "no legal verdict".
             let why = crate::verdict::ledger_check_diagnostics(&cwd, &bead, &sha)?;
             let detail = if why.is_empty() {
                 String::new()
@@ -124,9 +118,6 @@ pub(crate) fn cmd_ledger(_cfg: &Config, cmd: &LedgerCmd) -> Result<()> {
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut content)?;
             let path = crate::verdict::write_receipt(&cwd, bead_id, &sha, kind, &content)?;
             println!("receipt {}", path.display());
-            // ADR-0006 VERIFY piece (bd-principles-receipts-mmzc): advisory
-            // close-reason check — findings are lint warnings, never a
-            // hard failure of the receipt write.
             if let Some(reason) = close_reason {
                 let c = crate::verdict::check_close_reason(reason);
                 if !c.verify_tail_present {
@@ -141,18 +132,11 @@ pub(crate) fn cmd_ledger(_cfg: &Config, cmd: &LedgerCmd) -> Result<()> {
                         c.citations.len()
                     );
                 }
-                // ADR-0006 D3: the wave-swarm VERIFY stage's hard verdict on
-                // the same reason — advisory lint stays advisory, the gate
-                // does not.
                 match crate::verdict::verify_close_reason(reason) {
                     Ok(()) => println!("wave-verify gate: PASS"),
                     Err(e) => println!("wave-verify gate: REJECT ({e})"),
                 }
             }
-            // bd-p4oc: non-vacuous VERIFY gate — when the bead's VERIFY is
-            // cargo-test-shaped, RUN it and parse N passed / M filtered output.
-            // Advisory by default (WARNING in receipt + stderr naming filter),
-            // strict escalates vacuous to exit-nonzero.
             let effective_strict = *strict
                 || std::env::var("FLYWHEEL_VERIFY_STRICT")
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -166,12 +150,10 @@ pub(crate) fn cmd_ledger(_cfg: &Config, cmd: &LedgerCmd) -> Result<()> {
                         Ok((exit, output)) => {
                             let (passed, filtered) = crate::parse_cargo_test_counts(&output);
                             if exit != 0 {
-                                // failures → existing behavior (receipt already written; just log)
                                 eprintln!(
                                     "verify gate: VERIFY command failed (exit {exit}) — see receipt {}",
                                     path.display()
                                 );
-                                // append failure tail to receipt for evidence
                                 let _ = crate::append_to_receipt(
                                     &path,
                                     &format!("\nVERIFY failed (exit {exit}):\n{output}\n"),
@@ -208,8 +190,6 @@ pub(crate) fn cmd_ledger(_cfg: &Config, cmd: &LedgerCmd) -> Result<()> {
                                     ),
                                 );
                             } else {
-                                // exit 0 but no parsed count — treat empty / non-cargo shape as advisory vacuous
-                                // (spec: non-cargo VERIFY exit 0 with empty output should warn)
                                 if output.trim().is_empty() {
                                     let warning = format!(
                                         "WARNING: vacuous VERIFY — command `{verify}` produced empty output (evidence proves nothing)"

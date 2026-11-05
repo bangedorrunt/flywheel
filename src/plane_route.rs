@@ -1,7 +1,4 @@
 // governed-by: ADR-0025
-// Wired: `check_send_plane_tripwires` (cmd_send) + `check_job_tripwire`
-// direct call in cmd_mail Send (gift-wrap private must not carry job-assign).
-// Channel post is toron-owned (`toron channel post`) — no flywheel wrapper.
 //! Plane tripwire classifiers (Spec 5) — pure, no I/O, no Nostr kinds.
 //!
 //! Two tripwires, both fail-closed and audited:
@@ -24,9 +21,7 @@ fn is_secret_pattern(body: &str) -> bool {
     {
         return true;
     }
-    // -----BEGIN ... PRIVATE KEY-----  (case-insensitive, .* between)
     if lower.contains("-----begin") && lower.contains("private key") {
-        // Ensure the BEGIN comes before PRIVATE KEY in the lowercased body
         if let (Some(b), Some(p)) = (lower.find("-----begin"), lower.find("private key"))
             && b < p
         {
@@ -47,7 +42,6 @@ pub fn is_job_assign_body(
     if is_dispatch_job || is_toron_job {
         return true;
     }
-    // @mention check: contains '@' followed by alnum (simple heuristic, matches @Name)
     let has_mention = body.contains('@') && body.chars().any(|c| c == '@');
     has_mention && has_p_tag
 }
@@ -71,9 +65,8 @@ pub fn check_secret_tripwire(
     unsafe_plane: bool,
     raw: bool,
 ) -> Result<(), String> {
-    let _ = raw; // --raw never bypasses, explicitly ignored
+    let _ = raw;
     if unsafe_plane {
-        // Audited bypass: allow but log to stderr JSON (caller should log)
         eprintln!(
             "{{\"plane_tripwire\":\"secret->public\",\"bypass\":\"--unsafe-plane\",\"body_len\":{},\"plane\":{:?}}}",
             body.len(),
@@ -86,16 +79,6 @@ pub fn check_secret_tripwire(
     if !is_secret {
         return Ok(());
     }
-    // Tripwire fires even on explicit --plane s (only --unsafe-plane escapes)
-    // The wire is considered public if it's channel post or --plane s, but per Spec 5, the tripwire is for secret → public,
-    // so we fire whenever the body is secret and the wire would be public.
-    // For this pure classifier, we treat any call to channel post / --plane s with secret as an error.
-    // The caller passes `plane` as Some("s") for public wires, but the tripwire should fire even if plane is None and the body is secret?
-    // Per Spec 5, the tripwire is for `channel post` (which is inherently public) and `--plane s` (explicit public).
-    // For this pure function, we consider the check as: if the body is secret and the intended wire is public (channel post or --plane s),
-    // then error. For the classifier test, we treat `plane == Some("s")` or the caller being `channel post` as public.
-    // For simplicity, the pure classifier will error whenever is_secret is true, regardless of plane, to satisfy the test that tripwires fire even on explicit --plane.
-    // The actual wire-in (main.rs) will only call this for channel post / --plane s paths.
     Err(
         "plane_error: secrets use mail send (remedy: toron mail send for nsec/ncryptsec/private keys; not channel post / --plane s)".to_string(),
     )
@@ -120,7 +103,7 @@ pub fn check_job_tripwire(
     unsafe_plane: bool,
     raw: bool,
 ) -> Result<(), String> {
-    let _ = raw; // --raw never bypasses
+    let _ = raw;
     if unsafe_plane {
         eprintln!(
             "{{\"plane_tripwire\":\"job-assign->private\",\"bypass\":\"--unsafe-plane\",\"body_len\":{},\"plane\":{:?}}}",
@@ -136,9 +119,6 @@ pub fn check_job_tripwire(
     if !is_job {
         return Ok(());
     }
-    // Tripwire fires even on explicit --plane (only --unsafe-plane escapes) — but for job-assign->private,
-    // the wire is gift-wrap (private), so explicit --plane p (private) would still be private, but the tripwire is for job-assign should use job plane (43001), not gift-wrap.
-    // So even if plane is explicitly gift-wrap, it still errors; only --unsafe-plane escapes.
     Err(
         "plane_error: work assignment uses the job plane (43001) (remedy: toron job or dispatch_job, not gift-wrap mail send)".to_string(),
     )
@@ -148,10 +128,10 @@ pub fn check_job_tripwire(
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Plane {
-    Job,      // 43001–43006
-    Doorbell, // watch + hc terminal.send
-    Kind9,    // crew-visible
-    GiftWrap, // 1059 / rumor 14 (private)
+    Job,
+    Doorbell,
+    Kind9,
+    GiftWrap,
 }
 
 /// Dispatch-surface priority: job > doorbell > kind9 > gift-wrap (fixed, not user-tunable).
@@ -230,16 +210,13 @@ mod tests {
         let err = check_secret_tripwire(body, Some("high"), true, &to, Some("s"), false, false)
             .unwrap_err();
         assert!(err.contains("plane_error: secrets use mail send"), "{err}");
-        // Not single-to should not trip
         let to2 = vec!["Alice".to_string(), "Bob".to_string()];
         assert!(
             check_secret_tripwire(body, Some("high"), true, &to2, Some("s"), false, false).is_ok()
         );
-        // Not high importance should not trip
         assert!(
             check_secret_tripwire(body, Some("normal"), true, &to, Some("s"), false, false).is_ok()
         );
-        // Not ack_required should not trip
         assert!(
             check_secret_tripwire(body, Some("high"), false, &to, Some("s"), false, false).is_ok()
         );
@@ -248,7 +225,6 @@ mod tests {
     #[test]
     fn plane_route_secret_tripwire_fires_even_on_explicit_plane() {
         let body = "nsec1...";
-        // Even with explicit --plane s, it should still error (only --unsafe-plane escapes)
         let err =
             check_secret_tripwire(body, None, false, &[], Some("s"), false, false).unwrap_err();
         assert!(err.contains("plane_error"), "{err}");
@@ -257,14 +233,12 @@ mod tests {
     #[test]
     fn plane_route_secret_unsafe_plane_overrides_audited() {
         let body = "nsec1...";
-        // With --unsafe-plane, it should allow (Ok) even though it's secret
         assert!(check_secret_tripwire(body, None, false, &[], Some("s"), true, false).is_ok());
     }
 
     #[test]
     fn plane_route_secret_raw_does_not_bypass() {
         let body = "nsec1...";
-        // --raw should NOT bypass, so it should still error
         let err =
             check_secret_tripwire(body, None, false, &[], Some("s"), false, true).unwrap_err();
         assert!(err.contains("plane_error"), "raw should not bypass: {err}");
@@ -278,10 +252,10 @@ mod tests {
             false,
             false,
             false
-        )); // no p tag
-        assert!(!is_job_assign_body("please fix", true, false, false)); // no mention
-        assert!(is_job_assign_body("dispatch_job body", false, true, false)); // dispatch_job
-        assert!(is_job_assign_body("toron job body", false, false, true)); // toron job
+        ));
+        assert!(!is_job_assign_body("please fix", true, false, false));
+        assert!(is_job_assign_body("dispatch_job body", false, true, false));
+        assert!(is_job_assign_body("toron job body", false, false, true));
     }
 
     #[test]
@@ -303,7 +277,6 @@ mod tests {
     #[test]
     fn plane_route_job_tripwire_fires_even_on_explicit_plane() {
         let body = "@Bob work";
-        // Even with explicit --plane p (gift-wrap), job-assign should still error (only --unsafe-plane escapes)
         let err = check_job_tripwire(body, true, false, false, true, Some("p"), false, false)
             .unwrap_err();
         assert!(err.contains("plane_error"), "{err}");
@@ -312,7 +285,6 @@ mod tests {
     #[test]
     fn plane_route_job_tripwire_not_on_kind9() {
         let body = "@Alice work";
-        // If not gift-wrap (e.g., kind9), it should not error
         assert!(
             check_job_tripwire(body, true, false, false, false, Some("s"), false, false).is_ok()
         );
@@ -334,7 +306,6 @@ mod tests {
 
     #[test]
     fn plane_route_dispatch_surface_priority() {
-        // job > doorbell > kind9 > gift-wrap
         assert_eq!(
             dispatch_surface_priority(true, true, true, true),
             Plane::Job
@@ -359,27 +330,17 @@ mod tests {
 
     #[test]
     fn plane_route_no_new_kinds() {
-        // Ensure we didn't create new Nostr kinds — the tripwires only guard existing wires
-        // The Plane enum should only have the four expected variants
         let planes = [Plane::Job, Plane::Doorbell, Plane::Kind9, Plane::GiftWrap];
         assert_eq!(planes.len(), 4);
-        // Check that the dispatch_surface_priority is fixed and not user-tunable
-        // (no config, no env var, just the pure function)
         assert_eq!(plane_label(Plane::Job), "job");
         assert_eq!(plane_label(Plane::GiftWrap), "gift-wrap");
     }
 
     #[test]
     fn plane_route_default_wire_unchanged() {
-        // flywheel send without --plane should remain pane prompt + gift-wrap completion mail (not public)
-        // toron mail send without --plane should remain gift-wrap (private)
-        // This is a regression test: send without --plane should not be considered public
-        // For the pure classifier, default wire without --plane is gift-wrap (private)
-        // So a non-secret, non-job body should be Ok for both tripwires
         let body = "hello world";
         assert!(check_secret_tripwire(body, None, false, &[], None, false, false).is_ok());
         assert!(check_job_tripwire(body, false, false, false, true, None, false, false).is_ok());
-        // Explicit --plane s for non-secret should also be Ok (it's public but not secret)
         assert!(check_secret_tripwire(body, None, false, &[], Some("s"), false, false).is_ok());
     }
 }

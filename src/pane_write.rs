@@ -32,8 +32,6 @@ pub enum Urgency {
 pub struct Wm(pub u64);
 
 /// The harness a pane runs, for the launch bootstrap constant.
-// Spawn starts typing `LaunchBootstrap` in Phase 3 (build-plan §6); until
-// then only the render tests construct these.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Harness {
@@ -82,7 +80,6 @@ pub enum PaneOp {
 /// The constant wake line for a watermark (redesign §4.1, §6A.4).
 pub fn wake_line(wm: Wm, urgency: Urgency) -> String {
     match urgency {
-        // toron_core owns the line: one constant per watermark (ADR-0041).
         Urgency::Normal => toron_core::wake::wake_line(wm.0),
         Urgency::Urgent => format!("{WAKE_MARK} URGENT steer (wm {:x}) — run: toron next", wm.0),
     }
@@ -150,7 +147,6 @@ impl PaneTyper for HcPanes<'_> {
 /// `prompt` submits (the backend appends Enter: `write` only queues bytes,
 /// proven live). Selected by the spawn/observe lanes; until then fake-rex
 /// tests are the only callers.
-// ponytail: allow(dead_code) until bd-bio8/bd-9201 select this typer.
 #[cfg(feature = "backend-superlogical")]
 #[allow(dead_code)]
 pub struct RexPanes<'a>(pub &'a dyn crate::backend::MultiplexerBackend);
@@ -261,9 +257,6 @@ pub(crate) const PANE_TEXT_CALLS: &[&str] = &[
     ".agent_prompt_coded(",
     ".pane_send_text(",
     "\"agent\", \"prompt\"",
-    // Phase 3 extension: the Enter/keys half of a typed line and the raw
-    // wire method names, so a payload cannot be typed around the sink by
-    // calling the lower primitive. Legacy counts below include these.
     ".pane_send_input(",
     "\"pane.send_text\"",
     "\"pane.send_input\"",
@@ -385,7 +378,6 @@ mod tests {
                 format!("prompt w1:p1 {}", launch_bootstrap(Harness::Pi)),
             ]
         );
-        // Every typed line is the wake shape or the bootstrap constant.
         for w in &all {
             if let PaneOp::Prompt(line) = render(w) {
                 assert!(line.starts_with(WAKE_MARK) || line == launch_bootstrap(Harness::Other));
@@ -434,15 +426,11 @@ mod tests {
         );
         let v = fence_violations(&files);
         assert!(v.is_empty(), "pane-text fence:\n{}", v.join("\n"));
-        // The comms send path itself has no pane-text call at all.
         let comms = files
             .iter()
             .find(|(p, _)| p == "src/comms_send.rs")
             .expect("comms_send.rs");
         assert_eq!(pane_text_calls(&comms.1), 0);
-        // Ratchet: a legacy entry above its real count must be lowered.
-        // Same rule for the transport-implementation allowance: the exception
-        // covers exactly the documented sites, never more.
         for (path, allowed) in LEGACY_PANE_TEXT_SITES
             .iter()
             .chain(TRANSPORT_IMPL_SITES.iter())
@@ -469,13 +457,10 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let src = std::fs::read_to_string(root.join("src/hc_support.rs"))
             .unwrap_or_default();
-        // `Client::agent_prompt` delegates to `agent_prompt_coded`: the sink's
-        // `HcPanes` typer calls the former, so this is the door's backend.
         assert!(
             src.contains("self.agent_prompt_coded(target, text, wait)"),
             "the sink-called delegation must stay the documented line"
         );
-        // The alt-screen read fallback prompts through the same transport.
         assert!(
             src.contains("c.agent_prompt_coded("),
             "the read-path fallback must stay the documented line"
@@ -503,7 +488,6 @@ mod tests {
             )];
             assert_eq!(fence_violations(&files).len(), 1, "{bad}");
         }
-        // and a comment mentioning them is fine
         let ok = vec![(
             "src/doorbell_host.rs".to_string(),
             "// pane.send_text\n".to_string(),

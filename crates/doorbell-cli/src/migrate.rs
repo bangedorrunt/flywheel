@@ -63,7 +63,6 @@ pub fn migrate(from: &Path, to: &Path) -> Result<Vec<String>> {
             }
             let bytes = std::fs::read(entry.path()).with_context(|| "read source")?;
             std::fs::write(&dst, &bytes).with_context(|| format!("write {}", dst.display()))?;
-            // Byte-identical proof at copy time, not later.
             let back = std::fs::read(&dst).with_context(|| "re-read")?;
             if back != bytes {
                 anyhow::bail!("copy mismatch on {}", dst.display());

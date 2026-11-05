@@ -338,7 +338,6 @@ impl WatchForwarder {
     /// The audit row naming the range is written by the wake consumer.
     pub fn note_events_lost(&self) {
         self.counters.events_lost.fetch_add(1, Ordering::SeqCst);
-        // A gap is a loss: it degrades `/health` the way a drop does.
         self.counters
             .last_drop_unix
             .store((self.unix_now)(), Ordering::SeqCst);
@@ -395,7 +394,6 @@ impl WatchForwarder {
         {
             *g = Some(c);
         }
-        // Episode end: the disk snapshot catches up with the exact count.
         if self.counters.dirty.swap(false, Ordering::SeqCst) {
             self.persist();
         }
@@ -433,10 +431,6 @@ impl WatchForwarder {
     fn audit_row(&self, kind: &str, reason: &str) {
         let Some(audit) = &self.audit else { return };
         let s = self.counters.snapshot();
-        // Totals are exact and cumulative for the workspace. The key is never
-        // the bare word `dropped` on a full row, so summing `dropped` over
-        // `wake_brain_full` rows (the bead's forensic script) cannot double
-        // count these.
         audit(
             kind,
             serde_json::json!({
@@ -455,7 +449,6 @@ impl WatchForwarder {
         if let Some(path) = &self.persist_to
             && let Err(e) = write_snapshot(path, &self.counters.snapshot())
         {
-            // Loud, never fatal: the in-process count stays exact.
             eprintln!(
                 "doorbell: wake-brain snapshot write failed ({}): {e}",
                 path.display()
@@ -495,7 +488,6 @@ mod tests {
         let raw: WakeBrainSnapshot =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(raw.events_lost, 3, "persisted at once");
-        // An older snapshot (no field) still reads, as zero.
         let old: WakeBrainSnapshot = serde_json::from_str(
             r#"{"forwarded":1,"wake_brain_full":0,"backpressured":0,"dropped":0,"resumed":0,"last_drop_unix":null}"#,
         )
@@ -561,7 +553,6 @@ mod tests {
             watch_line_cursor(&line(7)).as_deref(),
             Some(format!("1007:{}", hex(7)).as_str())
         );
-        // A non-64-hex id would make the sidecar refuse the whole subscribe.
         let short = crate::wake_sock::format_watch_line(9, "abc", "pk", "c", &[], 5);
         assert_eq!(watch_line_cursor(&short), None);
         assert_eq!(watch_line_cursor("not json"), None);
@@ -596,7 +587,6 @@ mod tests {
         tx.try_send(BrainMsg::Watch("filler".into())).unwrap();
         let rx = Arc::new(Mutex::new(rx));
         let brain = rx.clone();
-        // The brain frees one slot on the 3rd park.
         let park = FakePark::new(move |n| {
             if n == 2 {
                 brain.lock().unwrap().try_recv().unwrap();
@@ -659,7 +649,6 @@ mod tests {
         assert_eq!(s.backpressured, 0);
         assert_eq!(s.dropped, 499, "exact, not sampled");
         assert!(s.last_drop_unix.is_some());
-        // The window was honoured on the fake clock: ~wait/poll parks, once.
         let expected_parks =
             (BACKPRESSURE_WAIT.as_millis() / BACKPRESSURE_POLL.as_millis()) as usize;
         assert_eq!(park.parks.load(Ordering::SeqCst), expected_parks);
@@ -668,7 +657,6 @@ mod tests {
             Some(format!("1001:{}", hex(1))),
             "the replacement must replay from the last accepted line"
         );
-        // Bounded audit trail, totals exact on the newest drop row.
         let rows = rows.lock().unwrap();
         let drop_rows: Vec<_> = rows
             .iter()
@@ -729,7 +717,6 @@ mod tests {
             let _ = first.forward(line(n));
         }
         assert_eq!(c.snapshot().dropped, 9);
-        // The brain drains; the replacement consumer resumes and lands a line.
         rx.try_recv().unwrap();
         let second = WatchForwarder::new(tx, c.clone(), resume)
             .with_park(FakePark::new(|_| {}))

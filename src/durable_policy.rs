@@ -28,8 +28,6 @@ impl Default for ReclaimPolicy {
 }
 
 impl ReclaimPolicy {
-    // Test-only constructor; production resolves via `default()` (crate
-    // constants) or `from_environment()` (loop start).
     #[cfg(test)]
     pub const fn new(swarm_secs: u64, human_secs: u64) -> Self {
         Self {

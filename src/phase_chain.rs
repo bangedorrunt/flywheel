@@ -80,7 +80,7 @@ pub fn render_link_inputs(
 /// block, until the W5 flip.
 pub fn plan_artifact_missing(spec: &toron_workflow::schema::DispatchSpec, inputs: &Value) -> bool {
     if spec.phase.as_deref() != Some("implement") {
-        return false; // only implement is gated on a plan artifact
+        return false;
     }
     let spec_carries_plan = spec
         .plan
@@ -133,10 +133,6 @@ fn ship_links(ship: &Workflow) -> Vec<(String, String)> {
 /// dispatch_job step of the linked workflow (the phase built-ins are
 /// single-dispatch chains; review's is nested inside its parallel fanout).
 fn phase_dispatch_output(link_out: &Value) -> Value {
-    // invoke output maps step names to outputs; the phase built-ins name
-    // their dispatch step `phase-<p>` (namespace: the ADR-0005 `plan`
-    // builtin predates and keeps its name). The review fanout collects a
-    // list under its step key — take the last reviewer's report.
     for phase in ["resolve", "plan", "implement", "review", "verify"] {
         let key = format!("phase-{phase}");
         if let Some(v) = link_out.get(key.as_str()).or_else(|| link_out.get(phase)) {
@@ -176,12 +172,10 @@ fn inject_dep_cycles(report: &mut Value, project_dir: &std::path::Path) {
 /// (under `response` when the leaf wrapped it) so `check_phase("plan", ..)`
 /// sees it. Best-effort shape handling; a miss fails the contract honestly.
 fn merge_dep_cycles_into_step(step_out: &mut Value, project_dir: &std::path::Path) {
-    // direct object report
     if step_out.get("dep_cycles").is_none() && step_out.get("beads").is_some() {
         inject_dep_cycles(step_out, project_dir);
         return;
     }
-    // headless leaf shape: {"response": "<report json>"}
     if let Some(r) = step_out.get("response").and_then(Value::as_str)
         && let Ok(mut report) = serde_json::from_str::<Value>(r.trim())
     {
@@ -255,9 +249,6 @@ pub async fn run_ship_chain(
             merge_dep_cycles_into_step(&mut step_out, project_dir);
         }
         let verdict = check_phase(phase, &step_out);
-        // The child engine run is useful for execution tracing, but the
-        // evaluation belongs to the parent ship run so `artifacts stitch
-        // <run_id>` exposes the complete chain in one evidence trail.
         let evaluation = crate::artifact::EvaluationEvidence::from_phase_contract(
             run_id,
             "ship",
@@ -379,8 +370,6 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    // ---- render_link_inputs -------------------------------------------
-
     #[test]
     fn render_link_inputs_resolves_inputs_and_steps_refs() {
         let template = json!({ "goal": "{{inputs.objective}}", "plan": "{{steps.plan}}" });
@@ -402,8 +391,6 @@ mod tests {
         assert_eq!(out, json!("cargo test"));
     }
 
-    // ---- plan-artifact warn gate --------------------------------------
-
     fn implement_spec(plan: Option<&str>) -> toron_workflow::schema::DispatchSpec {
         serde_json::from_value(json!({ "phase": "implement", "profile": "@coder",
             "plan": plan, "acceptance": "cargo test" }))
@@ -418,13 +405,10 @@ mod tests {
 
     #[test]
     fn implement_with_plan_artifact_is_clean() {
-        // spec.plan carrying the prior link's artifact (rendered, not the template)
         let spec = implement_spec(Some("{\"beads\":[...]}"));
         assert!(!plan_artifact_missing(&spec, &json!({})));
-        // unrendered template ref with NO other artifact stays warnworthy
         let spec = implement_spec(Some("{{steps.plan}}"));
         assert!(plan_artifact_missing(&spec, &json!({})));
-        // run inputs carrying the plan
         let spec = implement_spec(None);
         assert!(!plan_artifact_missing(
             &spec,
@@ -452,8 +436,6 @@ mod tests {
         assert!(clean.get("plan_artifact_missing").is_none());
     }
 
-    // ---- ship shape ----------------------------------------------------
-
     #[test]
     fn is_ship_chain_requires_the_name_and_links() {
         let not_ship = crate::builtin_workflows::builtin_workflows()
@@ -462,8 +444,6 @@ mod tests {
             .clone();
         assert!(!is_ship_chain("goal-direct", &not_ship));
     }
-
-    // ---- bd-cvv9 wiring: invoke_or_ship_chain routing -------------------
 
     /// Contract-passing reports per phase — the fake leaf every linked
     /// built-in dispatch lands on. The plan report PRE-injects dep_cycles=0
@@ -521,7 +501,6 @@ mod tests {
             .expect("clock")
             .as_nanos();
 
-        // ship → gated chain output (gates between ALL five links)
         let out = rt.block_on(async {
             tokio::time::timeout(
                 std::time::Duration::from_secs(120),
@@ -553,7 +532,6 @@ mod tests {
             vec!["resolve", "plan", "implement", "review", "verify"]
         );
 
-        // goal-direct → plain invoke (no gates key on the output)
         let out2 = rt.block_on(async {
             tokio::time::timeout(
                 std::time::Duration::from_secs(120),

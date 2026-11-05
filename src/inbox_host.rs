@@ -335,8 +335,6 @@ pub fn execute(core: &mut Core, ports: &mut dyn Ports, cmds: Vec<InboxCmd>, rep:
                 line,
                 ..
             } => {
-                // by pane id and binding generation, never by name: a ring
-                // for a generation the fold has since invalidated is dropped.
                 if binding_gen != core.model.generation {
                     Err(format!(
                         "ring for gen {binding_gen} dropped: fold is at gen {}",
@@ -351,9 +349,6 @@ pub fn execute(core: &mut Core, ports: &mut dyn Ports, cmds: Vec<InboxCmd>, rep:
                 }
             }
             InboxCmd::Reverify { recipient } => {
-                // Follow-up c: an unbound recipient is re-verified at a
-                // backed-off pace, not a `pane.list` per tick. Escalation
-                // counts ticks, so it is not delayed by this.
                 let due = core
                     .reverify_next_ms
                     .get(&recipient)
@@ -438,7 +433,6 @@ pub fn round(
             Input::Hint(n) => hints.push(n),
         }
     }
-    // A generation move (or an hc restart) is a reason to look again now.
     if obs.plane_restarted || msgs.iter().any(|m| matches!(m, InboxMsg::Invalidate(_))) {
         core.reverify_fails.clear();
         core.reverify_next_ms.clear();
@@ -450,10 +444,7 @@ pub fn round(
             now_ms,
         });
     }
-    // The periodic full re-evaluation: level-triggered, so a lost hint or a
-    // dead channel costs nothing.
     msgs.push(InboxMsg::Tick { now_ms });
-    // TEMPORARY bd-fd09 diagnostic (revert before close).
     let _debug_round = std::env::var("FLYWHEEL_INBOX_DEBUG_ROUND").is_ok();
     let cmds = core.fold(&msgs);
     if _debug_round {
@@ -478,8 +469,6 @@ pub fn round(
         );
     }
     write_binds(core, &before, ports, &mut rep);
-    // Follow-up b: the budget a ring spends is persisted BEFORE the ring goes
-    // out, so a crash between the two can only under-ring, never exceed it.
     let snap = core.snapshot();
     if snap != core.saved {
         match ports.save_budget(&snap) {
@@ -582,7 +571,6 @@ pub fn signal_invalidate(why: Invalidate) {
 impl InboxHost {
     /// Start the host thread over `ports`.
     pub fn spawn(mut ports: impl Ports, cfg: HostCfg) -> Self {
-        // A tiny channel on purpose: hints are only an accelerator.
         let (tx, rx) = mpsc::sync_channel::<Input>(64);
         let stats = Arc::new(Stats::default());
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -646,7 +634,6 @@ impl InboxHost {
         {
             *g = None;
         }
-        // Wake the recv_timeout so the stop flag is read now.
         let _ = self.tx.try_send(Input::Hint(String::new()));
         if let Some(j) = self.join.take() {
             let _ = j.join();
@@ -796,8 +783,7 @@ mod tests {
         let mut core = Core::default();
         let now = run(&mut core, &f, 3, 1_000);
         assert_eq!(f.0.lock().unwrap().rings.len(), 3);
-        drop(core); // the doorbell dies; the budget was persisted before each ring
-        // hc answers the re-verify of the restored (unverified) binding.
+        drop(core);
         f.0.lock().unwrap().reverify = Some(bind(true));
         let mut core2 = restarted(&f);
         run(&mut core2, &f, 10, now);
@@ -817,8 +803,6 @@ mod tests {
         let mut core = Core::default();
         let now = run(&mut core, &f, 2, 1_000);
         drop(core);
-        // hc cannot vouch for the pane yet: the restored binding stays
-        // unverified and nothing is typed into it.
         f.0.lock().unwrap().reverify = None;
         let mut core2 = restarted(&f);
         run(&mut core2, &f, 3, now);
@@ -828,7 +812,6 @@ mod tests {
             "no ring on a restored, unverified binding"
         );
         assert!(f.0.lock().unwrap().reverified >= 1, "it asks hc");
-        // Once hc vouches, the remaining budget is spent and no more.
         f.0.lock().unwrap().reverify = Some(bind(true));
         core2.reverify_next_ms.clear();
         run(&mut core2, &f, 10, now + 10_000_000);
@@ -838,7 +821,7 @@ mod tests {
     #[test]
     fn a_restart_remembers_a_partially_read_cursor_so_it_is_not_mistaken_for_an_ack() {
         let f = Fake::default();
-        set(&f, seen(9, 4, true)); // read up to 4 of 9
+        set(&f, seen(9, 4, true));
         let mut core = Core::default();
         let now = run(&mut core, &f, 2, 1_000);
         assert_eq!(f.0.lock().unwrap().rings.len(), 2);
@@ -877,7 +860,6 @@ mod tests {
 
     #[test]
     fn a_restart_keeps_the_budget_only_for_the_same_pane_and_an_unadvanced_cursor() {
-        // A new pane is a new incarnation: fresh budget (the fold's rule).
         let f = Fake::default();
         set(&f, seen(4, 0, true));
         let mut core = Core::default();
@@ -888,7 +870,6 @@ mod tests {
         let mut core2 = restarted(&f);
         run(&mut core2, &f, 10, now);
         assert_eq!(f.0.lock().unwrap().rings.len() as u32, 3 + MAX_RINGS);
-        // The agent ran `toron next` while the doorbell was down: cursor moved.
         let g = Fake::default();
         set(&g, seen(4, 0, true));
         let mut c = Core::default();
@@ -923,13 +904,11 @@ mod tests {
             "each ring is already inside the saved budget when it goes out"
         );
         assert_eq!(w.budget[R].deaf, Some(4));
-        // The ring that follows a save is already inside the saved count.
         let g = Fake::default();
         set(&g, seen(9, 0, true));
         let mut c = Core::default();
         run(&mut c, &g, 1, 1_000);
         assert_eq!(g.0.lock().unwrap().budget[R].rings_since_advance, 1);
-        // Budget survives a JSON round trip (the file format).
         let j = serde_json::to_string(&g.0.lock().unwrap().budget).unwrap();
         let back: BTreeMap<String, Budget> = serde_json::from_str(&j).unwrap();
         assert_eq!(back, g.0.lock().unwrap().budget);
@@ -990,10 +969,8 @@ mod tests {
         let mut core = Core::default();
         let now = ticks(&mut core, &f, 3, 1_000, None);
         let before = f.0.lock().unwrap().reverified;
-        // inside the backoff nothing is called...
         let now = ticks(&mut core, &f, 1, now, None);
         assert_eq!(f.0.lock().unwrap().reverified, before);
-        // ...until events_lost moves the generation.
         ticks(
             &mut core,
             &f,
@@ -1012,7 +989,6 @@ mod tests {
         let now = ticks(&mut core, &f, 2, 1_000, None);
         assert!(core.reverify_next_ms.contains_key(R));
         f.0.lock().unwrap().reverify = Some(bind(true));
-        // the next due reverify succeeds
         ticks(&mut core, &f, 5, now, None);
         assert!(!core.reverify_next_ms.contains_key(R) && !core.reverify_fails.contains_key(R));
         assert!(f.0.lock().unwrap().reverified >= 2);
@@ -1031,8 +1007,6 @@ mod tests {
     fn the_production_ports_persist_the_budget_atomically() {
         let src = include_str!("inbox_ports.rs");
         assert!(src.contains("fn load_budget") && src.contains("fn save_budget"));
-        // Atomicity lives in one helper now: save_budget must route through
-        // it, and the helper itself must rename (not truncate in place).
         let a = src.find("fn save_budget").unwrap();
         assert!(
             src[a..a + 900].contains("write_private_atomic"),
@@ -1052,7 +1026,6 @@ mod tests {
         set(&f, seen(7, 0, true));
         let (mut core, mut p) = (Core::default(), f.clone());
         round(&mut core, &mut p, vec![], 1_000);
-        // same facts, 1 s later: inside the backoff, no second ring
         round(&mut core, &mut p, vec![], 2_000);
         let w = f.0.lock().unwrap();
         assert_eq!(w.rings.len(), 1, "{:?}", w.rings);
@@ -1069,7 +1042,6 @@ mod tests {
         let (mut core, mut p) = (Core::default(), f.clone());
         set(&f, seen(3, 0, true));
         round(&mut core, &mut p, vec![], 1_000);
-        // the reader runs `toron next` (cursor 3); two more arrive (head 9)
         set(&f, seen(9, 3, true));
         round(&mut core, &mut p, vec![], 2_000);
         let w = f.0.lock().unwrap();
@@ -1079,13 +1051,10 @@ mod tests {
 
     #[test]
     fn an_unanswered_message_rings_exactly_max_rings_then_goes_deaf_once() {
-        // The budget is toron's (`toron_core::wake`); the live fixture and the
-        // docs assume 5. A change there must be a decision here, not a drift.
         assert_eq!(MAX_RINGS, 5, "toron changed the ring budget");
         let f = Fake::default();
         set(&f, seen(4, 0, true));
         let mut core = Core::default();
-        // MAX_RINGS - 1 rounds: still ringing, no deaf fact yet.
         let now = run(&mut core, &f, u64::from(MAX_RINGS) - 1, 1_000);
         {
             let w = f.0.lock().unwrap();
@@ -1093,14 +1062,12 @@ mod tests {
             assert!(w.facts.iter().all(|(_, v)| v["kind"] != "deaf"));
             assert!(w.sup.is_empty() && w.cap.is_empty());
         }
-        // the MAX_RINGS-th ring goes out and nothing else yet...
         let now = run(&mut core, &f, 1, now);
         {
             let w = f.0.lock().unwrap();
             assert_eq!(w.rings.len() as u32, MAX_RINGS);
             assert!(w.sup.is_empty());
         }
-        // ...the next round escalates; further rounds neither ring nor repeat.
         run(&mut core, &f, 5, now);
         let w = f.0.lock().unwrap();
         assert_eq!(w.rings.len() as u32, MAX_RINGS, "no ring past the budget");
@@ -1122,13 +1089,11 @@ mod tests {
         set(&f, seen(4, 0, true));
         let mut core = Core::default();
         let now = run(&mut core, &f, 3, 1_000);
-        // the reader acks: cursor reaches head
         set(&f, seen(4, 4, true));
         let now = run(&mut core, &f, 4, now);
         let before = f.0.lock().unwrap().rings.len();
         assert_eq!(before, 3);
         assert_eq!(core.model.recipients[R].rings_since_advance, 0);
-        // new mail after the read rings at once with the new watermark
         set(&f, seen(6, 4, true));
         run(&mut core, &f, 1, now);
         let w = f.0.lock().unwrap();
@@ -1189,7 +1154,6 @@ mod tests {
         let mut p = f.clone();
         round(&mut core, &mut p, vec![], 1_000);
         assert_eq!(f.0.lock().unwrap().rings.len(), 1);
-        // events_lost: the generation moves; unread mail remains
         f.0.lock().unwrap().reverify = Some(bind(true));
         let now = 2_000_000;
         round(
@@ -1224,7 +1188,7 @@ mod tests {
         let mut p = f.clone();
         round(&mut core, &mut p, vec![], 1_000);
         f.0.lock().unwrap().obs.plane_restarted = true;
-        f.0.lock().unwrap().reverify = None; // hc cannot confirm yet
+        f.0.lock().unwrap().reverify = None;
         round(&mut core, &mut p, vec![], 2_000_000);
         round(&mut core, &mut p, vec![], 3_000_000);
         assert_eq!(f.0.lock().unwrap().rings.len(), 1, "unverified: no ring");
@@ -1297,7 +1261,6 @@ mod tests {
         let f = Fake::default();
         set(&f, seen(3, 0, true));
         let threads = Arc::new(Mutex::new(Vec::new()));
-        // Spawn from inside a runtime: the host must still be outside one.
         let rt = tokio::runtime::Runtime::new().unwrap();
         let host = rt.block_on(async {
             InboxHost::spawn(
@@ -1361,9 +1324,6 @@ mod tests {
 
     #[test]
     fn the_wake_line_is_built_only_from_the_folds_watermark() {
-        // Source fence: the host never formats a wake line itself; the only
-        // constructors are toron's `wake_line` (inside the fold) and the
-        // pane sink's render of the same watermark.
         let host = include_str!("inbox_host.rs");
         let body = &host[..host.find("#[cfg(test)]\nmod tests").unwrap()];
         assert!(!body.contains("new work"), "no hand-written wake text");
@@ -1371,18 +1331,11 @@ mod tests {
             !body.contains("wake_line("),
             "the host never builds the line"
         );
-        // The sink's only writes: an interrupt control plus the urgent and
-        // normal wake-line renders. (Was one before the urgency split.)
-        // Truncated at the test module: the fold's own "new work" text
-        // appears in the tests' assertions below, and the fence guards
-        // production code, not its own checks.
         let ports_all = include_str!("inbox_ports.rs");
         let ports = &ports_all[..ports_all.find("#[cfg(test)]\nmod tests").unwrap()];
         assert_eq!(ports.matches("pane_write::write(").count(), 3);
-        // the sink's rendering must equal the fold's line, or nothing is typed
         assert!(ports.contains("!= line"), "ring compares the fold's line");
         assert!(!ports.contains("new work"));
-        // (spelled in pieces: the pane-text fence scans this file too)
         let (a, b) = (
             concat!(".agent_", "prompt("),
             concat!(".pane_send_", "text("),
@@ -1473,17 +1426,14 @@ mod tests {
     fn unread_verified_idle_recipient_rings_then_goes_deaf() {
         let mut ports = ScriptedPorts::viewing(41, 0, PaneState::Idle, true);
         let mut core = Core::default();
-        // Round one: fresh mail, no prior ring — immediate ring at head.
         let rep = round(&mut core, &mut ports, vec![], 1_000_000);
         assert_eq!(rep.rings, 1, "first round rings");
         assert_eq!(
             *ports.rung.lock().unwrap(),
             vec![("block:fake-1".to_string(), 41)]
         );
-        // Backoff holds until 30s after the first ring.
         let rep = round(&mut core, &mut ports, vec![], 1_000_000 + 29_999);
         assert_eq!(rep.rings, 0, "backoff holds");
-        // Four more rings across the ladder, then deaf with both notices.
         let mut at = 1_000_000 + 30_000;
         for _ in 0..4 {
             at += 600_000;

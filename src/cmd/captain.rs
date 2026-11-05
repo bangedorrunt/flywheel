@@ -17,8 +17,6 @@ use anyhow::Result;
 use clap::Subcommand;
 use serde_json::{Value, json};
 
-// bd-nmmf4: the trait is only needed by the rex-only directory path
-// (`agent_list`); a hc-only build must not warn about it.
 #[cfg(feature = "backend-superlogical")]
 use crate::backend::MultiplexerBackend as _;
 use crate::config::Config;
@@ -110,7 +108,6 @@ pub(crate) fn cmd_captain(cfg: &Config, cmd: &CaptainCmd) -> Result<()> {
             preflight,
             preflight_mode,
         } => {
-            // An unknown mode must refuse loudly, not silently arm nothing.
             let pf = if *preflight {
                 Some(preflight::Mode::named(preflight_mode, true).ok_or_else(|| {
                     anyhow::anyhow!(
@@ -245,7 +242,7 @@ fn stall_verdict(p: &StallProbe) -> StallVerdict {
     }
 }
 
-#[allow(clippy::too_many_arguments)] // one param per CLI flag (clap handler).
+#[allow(clippy::too_many_arguments)]
 fn cmd_captain_watch(
     cfg: &Config,
     project: &str,
@@ -256,10 +253,6 @@ fn cmd_captain_watch(
     as_agent: Option<&str>,
     preflight: Option<preflight::Mode>,
 ) -> Result<()> {
-    // The preflight arm runs FIRST: a project whose environment is already
-    // broken (skewed store, missing binary, unreachable relay) must not arm a
-    // watch that cannot do anything with the wake it would receive. Re-checked
-    // each poll so a fault that develops after arming still exits once.
     if let Some(mode) = preflight
         && let Some(code) = preflight_arm_exit(cfg, project, mode, json_out)
     {
@@ -270,9 +263,6 @@ fn cmd_captain_watch(
     let mail = crate::mail_as(cfg, &key, as_agent)?;
     mail.ensure_project(&key)?;
 
-    // Our own water: capture the inbox high-water ONCE at arm time. Mail that
-    // was already here is not new (same contract as `mail watch`); only what
-    // lands after arming resumes the captain.
     let armed = inbox_rows(&mail, &key, None)?;
     let baseline_us = armed.iter().filter_map(created_us).max().unwrap_or(0);
     let baseline_rfc = doorbell_core::inbox_high_water_from_values(armed.iter().collect());
@@ -292,7 +282,6 @@ fn cmd_captain_watch(
     loop {
         std::thread::sleep(std::time::Duration::from_secs(interval));
 
-        // 1) Mail — the primary poll-exit.
         let rows = inbox_rows(&mail, &key, baseline_rfc.as_deref())?;
         if let Some(row) = newest_since(&rows, baseline_us) {
             if json_out {
@@ -319,14 +308,12 @@ fn cmd_captain_watch(
             return Ok(());
         }
 
-        // 2) Preflight — opt-in, re-checked each poll.
         if let Some(mode) = preflight
             && let Some(code) = preflight_arm_exit(cfg, project, mode, json_out)
         {
             std::process::exit(code);
         }
 
-        // 3) Stall — only when asked; the mail exit above is the common case.
         if !stall {
             continue;
         }
@@ -494,10 +481,6 @@ fn assemble_directory(
     });
     let (directory, truncated) = dir::project_directory(sessions.clone());
     let _ = directory;
-    // Addressability per pin. Peer holds are viewer-relative, so the
-    // directory reports file holds globally; the sender is the pin itself
-    // when arrived, else the first arrived pin (else the lookup itself is
-    // unarrived, which is the honest answer for a stranger).
     let bead_assignee: std::collections::BTreeMap<String, String> = beads
         .iter()
         .filter_map(|(id, a)| a.clone().map(|a| (id.clone(), a)))
@@ -566,10 +549,6 @@ fn cmd_pull_fresh_tick(project: &str, pin: &str) -> Result<()> {
 /// the same question with a loud, actionable refusal.
 #[cfg(feature = "backend-superlogical")]
 fn cmd_captain_directory(cfg: &Config, project: &str, json_out: bool) -> Result<()> {
-    // Door-scoped rex backend (ADR-0019 D0): directory projects blocks, so
-    // it always constructs SuperlogicalBackend. `auto` is already rex-primary
-    // regardless of REX_SESSION (bd-mknvb / bd-l7b05); this path still pins
-    // rex explicitly so a hc-only feature build refuses loudly above.
     let backend = crate::backend::superlogical::SuperlogicalBackend;
     let ws_id = crate::find_workspace_dyn(&backend, project)?;
     let agents = backend
@@ -743,7 +722,6 @@ fn cmd_captain_approve(
     }
     let slot = crate::request_receipts::door_slot(project, "steer", request_key);
     let row = crate::request_receipts::load_door_receipt(project, "steer", &slot);
-    // Deny ignores any objective; approve requires the payload to re-derive.
     let payload_ok = decision == "deny"
         || row
             .as_ref()
@@ -852,8 +830,6 @@ fn cmd_captain_approve(
     let mut row = row.expect("gate Ready means a row");
     let payload = row.payload.clone().expect("gate Ready means a payload");
     let asker = row.asker.clone().expect("gate Ready means an asker");
-    // The operator must be a known identity, and must not be the asker.
-    // npub compare is alias-proof; the pin compare covers unarrived askers.
     let approver_npub =
         crate::mail::block_on(crate::mail::comms_mailbox()?.whois(project, approver))
             .map_err(|_| {
@@ -874,8 +850,6 @@ fn cmd_captain_approve(
         }));
         anyhow::bail!("captain approve: asker cannot approve its own steer — approval_mismatch");
     }
-    // D12: an asker who has not arrived in this project parks cross-project;
-    // the approval body gains the project line, bound to the steer project.
     let cross_project = asker_npub.is_none();
     let body = crate::request_receipts::approval_body(
         request_key,
@@ -893,8 +867,6 @@ fn cmd_captain_approve(
     };
     let sent = crate::mail::block_on(crate::mail::mailbox().send_message(&args))
         .map_err(|e| anyhow::anyhow!("captain approve: approval mail not accepted: {e:#}"))?;
-    // The body must parse back: never claim a mail our own verifier rejects.
-    // (Notices skip this — `decision=expired` is not an approval.)
     if crate::request_receipts::parse_approval_body(&body)
         .filter(|p| p.decision == decision)
         .is_none()
@@ -910,8 +882,6 @@ fn cmd_captain_approve(
         }));
         anyhow::bail!("captain approve: unverified sender — approval_mismatch");
     }
-    // Fetch-back: the asker's inbox must hold the exact lines authorized.
-    // Delivery that cannot be read back is not claimed.
     let inbox = crate::mail::block_on(crate::mail::comms_mailbox()?.fetch_inbox(
         &toron_core::mailbox::messaging::FetchInbox {
             project_slug: project.to_string(),
@@ -955,9 +925,6 @@ fn cmd_captain_approve(
         }));
         return Ok(());
     }
-    // ADR-0019 D9: the approved payload targets an existing bead — check the
-    // hold before the first pane write. Held settles file_held (the mail was
-    // accepted); an untellable holder settles Unknown, never a dispatch.
     match crate::check_bead_file_hold(cfg, project, &payload.objective)? {
         crate::HoldVerdict::Clear => {}
         crate::HoldVerdict::Held => {
@@ -979,7 +946,6 @@ fn cmd_captain_approve(
             anyhow::bail!("captain approve: file-hold check could not notify the holder: {msg}");
         }
     }
-    // Approve: Parked -> InFlight, run the payload, settle by outcome.
     row.state = crate::agent_ref::EffectState::InFlight;
     crate::request_receipts::journal_door_row(project, &row)?;
     let out = crate::run_approved_steer(cfg, &payload);
@@ -1023,7 +989,6 @@ mod tests {
     #[test]
     fn captain_watch_exits_on_preflight_failure() {
         use crate::preflight::{Check, Status};
-        // Path clear: passes and skips only → the arm never fires.
         let clean = vec![
             Check::pass("engine_store"),
             Check::skip("doorbell", "embedded (no [doorbell] url configured)"),
@@ -1032,7 +997,6 @@ mod tests {
             first_failing_check(&clean).is_none(),
             "a clean preflight must not exit the watch"
         );
-        // The skew the bead observed: the toron store is ahead of the binary.
         let skewed = vec![
             Check::pass("pane-plane"),
             Check::fail(
@@ -1048,18 +1012,14 @@ mod tests {
             msg.contains("store_skew") && msg.contains("reinstall toron"),
             "the message carries the failing check's remedy line: {msg}"
         );
-        // Status is the only discriminator — a Skip whose reason reads like a
-        // failure is not a failure.
         assert!(
             first_failing_check(&[Check::skip("x", "preflight failed")]).is_none(),
             "skip is advisory, never an exit"
         );
-        // A fail-only set is still an exit even with every other check green.
         assert_eq!(
             first_failing_check(&[Check::pass("a"), Check::fail("b", "boom")]).map(|(n, _)| n),
             Some("b")
         );
-        // Sanity: the discriminants the arm reads are the ones the renderer uses.
         assert!(matches!(skewed[1].status, Status::Fail(_)));
     }
 
@@ -1068,23 +1028,19 @@ mod tests {
     /// idle-plus-silent with work left.
     #[test]
     fn captain_watch_poll_exit() {
-        // Mail: nothing newer than the water is not an exit.
         let armed = vec![row(1_000, "old"), row(2_000, "also old")];
         assert!(
             newest_since(&armed, 2_000).is_none(),
             "a row at the water is not new mail"
         );
-        // A strictly-newer row is the exit, and the NEWEST such row wins.
         let mut rows = armed.clone();
         rows.push(row(3_000, "new"));
         rows.push(row(4_000, "newer"));
         let hit = newest_since(&rows, 2_000).expect("new mail");
         assert_eq!(hit.get("subject").and_then(Value::as_str), Some("newer"));
-        // A malformed row is not an arrival.
         let junk = vec![json!({ "subject": "no ts" }), row(2_000, "at water")];
         assert!(newest_since(&junk, 2_000).is_none());
 
-        // Stall: no work left is complete, regardless of the clock.
         let base = StallProbe {
             work_remaining: false,
             any_pane_working: false,
@@ -1093,7 +1049,6 @@ mod tests {
             stall_secs: 2_700,
         };
         assert_eq!(stall_verdict(&base), StallVerdict::AllComplete);
-        // Idle, knowable fleet, old commit, work left → the one stall shape.
         assert_eq!(
             stall_verdict(&StallProbe {
                 work_remaining: true,
@@ -1101,7 +1056,6 @@ mod tests {
             }),
             StallVerdict::Stalled
         );
-        // A working pane is never a stall.
         assert_eq!(
             stall_verdict(&StallProbe {
                 work_remaining: true,
@@ -1110,7 +1064,6 @@ mod tests {
             }),
             StallVerdict::Working
         );
-        // An unknowable fleet is never alarmed on.
         assert_eq!(
             stall_verdict(&StallProbe {
                 work_remaining: true,
@@ -1120,7 +1073,6 @@ mod tests {
             }),
             StallVerdict::Working
         );
-        // Under threshold, or with no commit history, it is still working.
         assert_eq!(
             stall_verdict(&StallProbe {
                 work_remaining: true,
@@ -1259,7 +1211,6 @@ mod tests {
             .expect("hosted");
         assert_eq!(hosted.tier, crate::captain_directory::Tier::Pull);
         assert_eq!(hosted.session_key, "hosted:HostedPin");
-        // A file-held bead resolves to its code through the same snapshot.
         let snap = crate::captain_directory::DirSnapshot {
             sessions,
             bead_assignee: [("bd-1".to_string(), "LivePin".to_string())]

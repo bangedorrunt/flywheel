@@ -181,7 +181,7 @@ pub(crate) fn resolve_as_pin(
     crate::authority::select_agent_identity(explicit, env)
 }
 
-#[allow(clippy::too_many_arguments)] // clap leaf: one param per CLI flag, single call site.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_doorbell_introduce(
     project: &str,
     pin: &str,
@@ -329,10 +329,6 @@ pub(crate) fn cmd_doorbell_roster(cfg: &Config, project: &str, json: bool) -> Re
 }
 
 fn nearby_plane_agents(cfg: &Config) -> Vec<(String, String, String)> {
-    // bd-f8zk: the roster reads the SELECTED plane. It used
-    // to connect to hc directly, so on a rex plane every spawned pin joined
-    // against an empty hc set and rendered `state=missing` while its pane
-    // was live and idle.
     let Ok(backend) = crate::backend::multiplexer_backend(cfg) else {
         return Vec::new();
     };
@@ -376,8 +372,6 @@ fn nearby_leases(project: &str) -> Vec<(String, String)> {
 }
 
 pub(crate) fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi: a blank positional used
-    // to alias onto the workspace root's workspaces.
     crate::check_project_spelling(project, "doorbell status")?;
     if crate::proxy_doorbell_verb(cfg, "status", &[])? {
         return Ok(());
@@ -385,10 +379,6 @@ pub(crate) fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
     crate::ensure_doorbell_supervisor();
     let _ = cfg;
     let state_dir = crate::config::state_dir();
-    // bd-bdpx: unbound-but-live panes are invisible to role wake and skipped
-    // by the sweep — surface them in status (not just the per-sweep stderr
-    // warn) so the operator sees them in one place. Re-bind via
-    // `toron role pin <role> <pin> --project <project>`.
     let unpinned = crate::unpinned_registry_names(&crate::state::load_spawn_registry(project));
     let unpinned_seg = if unpinned.is_empty() {
         String::new()
@@ -409,8 +399,6 @@ pub(crate) fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
                 )
             })
             .unwrap_or_else(|| "last_wake=never".into());
-        // mcc9: the wake → brain counters, from the snapshot the host writes,
-        // so a dropping hop is visible here even with no daemon answering.
         let wake_brain =
             wake_brain_status_segment(doorbell_rt::wake_brain::read_snapshot(&state_dir, &ws));
         println!(
@@ -427,10 +415,6 @@ pub(crate) fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
                 }
             },
             unpinned_seg,
-            // bd-7qg6: plane-S cursor age makes a hung-but-alive watch child
-            // inspectable — dispatcher `up` with an ancient cursor and fresh
-            // bus traffic is the live-pid-deaf signature (heal_tick only
-            // restarts dead pids). Age alone never triggers a restart here.
             match wake.plane_s_cursor_us {
                 Some(us) => {
                     let age = crate::doorbell_now_unix().saturating_sub((us / 1_000_000) as u64);
@@ -440,7 +424,6 @@ pub(crate) fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
             },
         );
         if !alive {
-            // lazy heal: report AND restart (requirement 1)
             match crate::doorbell::ensure_running(
                 &std::env::current_exe()?,
                 &crate::config::state_dir(),
@@ -469,23 +452,14 @@ fn wake_brain_status_segment(snap: Option<doorbell_rt::wake_brain::WakeBrainSnap
 }
 
 pub(crate) fn cmd_doorbell_start(cfg: &Config, project: &str) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi
     crate::check_project_spelling(project, "doorbell start")?;
     let workspaces = crate::doorbell_project_workspaces(project);
-    // bd-enov (F17): ARM the plane with this project's workspaces. The old
-    // call proxied a bare `doorbell start` (no --host) — which only adopts the
-    // daemon in STANDBY (mode:standby, subscribers:0). Every wake path then
-    // degrades to manual for the whole swarm and nothing notices. A stale
-    // `doorbell` binary that predates `--host` now fails LOUD here instead of
-    // silently arming a wake-blind plane (proxy bails on non-success).
     let mut arm: Vec<String> = Vec::new();
     for ws in &workspaces {
         arm.push("--host".to_string());
         arm.push(format!("{project}/{ws}"));
     }
     let proxied = crate::proxy_doorbell_verb(cfg, "start", &arm)?;
-    // A healthy daemon used to end start here. Under the comms flag that
-    // daemon types nothing, so the local loop still has to arm.
     if !crate::doorbell::local_loop_after_proxy(proxied, crate::comms_send::enabled(cfg)) {
         return Ok(());
     }
@@ -505,10 +479,7 @@ pub(crate) fn cmd_doorbell_start(cfg: &Config, project: &str) -> Result<()> {
 }
 
 pub(crate) fn cmd_doorbell_stop(cfg: &Config, project: &str, workspace: &str) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi
     crate::check_project_spelling(project, "doorbell stop")?;
-    // Daemon mode owns all wake: any stop targets the daemon (per-workspace
-    // dispatchers no longer exist there; Phase 3 removes them everywhere).
     if workspace == "all" && crate::proxy_doorbell_verb(cfg, "stop", &[])? {
         return Ok(());
     }
@@ -532,7 +503,6 @@ pub(crate) fn cmd_doorbell_inject(
     line: &str,
     workspace: &str,
 ) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi
     crate::check_project_spelling(project, "doorbell inject")?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -570,12 +540,7 @@ pub(crate) fn cmd_doorbell_subscribe(
     extra: &[String],
     project: Option<&str>,
 ) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi: None is meaningful here
-    // (workspace-scoped door), Some("") is not.
     crate::ensure_project_opt(project, "doorbell subscribe")?;
-    // bd-zawk G8: a missing --project stores a legacy row that is never
-    // auto-hosted — the operator reads "subscribed" while nothing can ring.
-    // Refuse the silent store LOUDLY instead of minting a dead row.
     // governed-by: bd-zawk
     let project = match project {
         Some(p) => p,
@@ -606,17 +571,12 @@ pub(crate) fn cmd_doorbell_subscribe(
     } else {
         Scope::Many(ws.clone())
     };
-    // Console is the operator: cross-scope rows are operator-intended.
-    // Single-workspace hc rows stay local-process.
     let cross = scope.is_cross(workspace) || kind != SinkKind::Hc;
     let actor = if cross {
         Actor::operator()
     } else {
         Actor::local_process()
     };
-    // bd-8ulu: the endpoint is the row's destination, so a webhook row
-    // without one is stored as-is (the daemon then registers nothing and the
-    // wake stays digest-visible) — never silently pointed at a default host.
     let endpoint = url
         .map(str::trim)
         .filter(|u| !u.is_empty())
@@ -653,12 +613,7 @@ pub(crate) fn cmd_doorbell_digest(
     since: Option<&str>,
     format: &str,
 ) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi
     crate::check_project_spelling(project, "doorbell digest")?;
-    // x3s2: the required PROJECT is the scope of the answer. Reading every
-    // workspace's journal made a scoped question return the whole host's
-    // wakes, so a project with no state of its own read as though it held a
-    // long list of unanswered pins.
     let state_dir = crate::config::state_dir();
     let scoped = crate::doorbell::project_workspaces(&state_dir, project);
     let entries: Vec<(String, serde_json::Value)> = crate::doorbell::journal_read_all(&state_dir)
@@ -666,7 +621,6 @@ pub(crate) fn cmd_doorbell_digest(
         .filter(|(ws, _)| scoped.contains(ws))
         .collect();
     let since_us = since.and_then(|s| doorbell_core::parse_rfc3339_micros(s).ok());
-    // Unanswered pins escalate first (deaf services surface, S3).
     let mut unanswered: std::collections::BTreeSet<String> = Default::default();
     for ws in &scoped {
         for pin in
@@ -689,10 +643,6 @@ pub(crate) fn cmd_doorbell_digest(
                 .and_then(|p| p.as_array())
                 .map(|a| a.iter().filter_map(|v| v.as_str()).any(|p| p == id))
                 .unwrap_or(false);
-            // bd-ff92: watch-decided rows carry pins:[] — the addressed pin
-            // lives only inside actions[].Digest.pin (digest-bound wake for
-            // a pane-less pin). Without this the observed live wake line is
-            // invisible to `digest --identity`, exactly the reported symptom.
             let in_actions = entry
                 .get("actions")
                 .and_then(|a| a.as_array())
@@ -749,9 +699,6 @@ pub(crate) fn cmd_doorbell_digest(
                     })
                     .unwrap_or_default()
             });
-        // bd-bk9t: a digest-bound wake (a pane-less subscribed pin) has no
-        // prompt route, so its `Digest` action row IS the delivery. Without
-        // the line here the batch could only be read by grepping the journal.
         let detail = crate::digest_action_entries(entry)
             .into_iter()
             .map(|(_, line, _)| line)
@@ -805,7 +752,6 @@ pub(crate) fn cmd_doorbell_digest(
 /// and identity line into EXISTING panes — covers hc terminal-split additions
 /// and post-crash respawns that never got the spawn-time injection.
 pub(crate) fn cmd_doorbell_re_inject(cfg: &Config, project: &str) -> Result<()> {
-    // bd-blank-project-spelling-non-mail-doors-76hi
     crate::check_project_spelling(project, "doorbell re-inject")?;
     crate::ensure_doorbell_supervisor();
     let registry = crate::state::load_spawn_registry(project);
@@ -822,13 +768,9 @@ pub(crate) fn cmd_doorbell_re_inject(cfg: &Config, project: &str) -> Result<()> 
         let mut lines = vec![crate::doorbell::identity_prime(&e.name, identity)];
         lines.push(crate::peer_prompt_template(
             peer_tpl, &e.name, identity,
-            // ADR-0005 budget defaults (5/30/3) — same as `spawn`'s.
             5, 30, 3,
         ));
         for line in lines {
-            // ADR-0005 H2: agent.prompt is gated until the pane's first
-            // prompt lands — the identity prime IS that neutral opener, so
-            // the handler inject behind it goes through.
             c.agent_prompt(&e.pane_id, &line, None).map_err(|err| {
                 anyhow::anyhow!(
                     "re-inject {}: pane {} not promptable ({err}) — is the agent up?",
@@ -860,7 +802,6 @@ pub(crate) fn cmd_internal_doorbell(
         return Ok(());
     }
     if once {
-        // hc-mock: no pid file (must not clobber a live dispatcher).
         let mut map = BTreeMap::new();
         for pair in status {
             if let Some((pin, st)) = crate::doorbell::parse_status_pair(pair) {
@@ -874,11 +815,6 @@ pub(crate) fn cmd_internal_doorbell(
         return Ok(());
     }
 
-    // bd-asr2.5: host selection — one implementation, two hosts. Daemon
-    // mode never runs a local loop (subscription registration via API
-    // lands in bd-asr2.8); embedded mode drives doorbell-rt's Brain.
-    // Comms flag: the inbox host in THIS loop is the pane writer; a daemon
-    // host types nothing, so it never takes the loop (follow-up a).
     let comms_on = crate::comms_send::enabled(cfg);
     match crate::doorbell::host_for(comms_on, || {
         crate::doorbell::resolve_host(

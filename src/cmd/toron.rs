@@ -87,9 +87,6 @@ pub(crate) enum ToronMailCmd {
 }
 
 pub(crate) fn cmd_toron(cfg: &Config, cmd: &ToronCmd) -> Result<()> {
-    // The MCP-config wiring is pure file I/O — it runs synchronously and does
-    // not need the tokio embed runtime. Handle it before delegating to the
-    // in-process mailbox dispatch.
     if let ToronCmd::SetupMcp {
         url,
         agents,
@@ -100,11 +97,6 @@ pub(crate) fn cmd_toron(cfg: &Config, cmd: &ToronCmd) -> Result<()> {
     {
         return crate::toron_setup_mcp(url.as_deref(), agents, *boot_port, *dry_run, *flywheel);
     }
-    // bd-toron-embed-blank-project-doors-rmg9: a blank project spelling used
-    // to reach the embed — `agents --project ""` answered `[]` (a silently
-    // authoritative-looking empty roster) and send/inbox garbled their
-    // actionable errors with the blank slug ("project  first"). Fail loud
-    // with the house message before any runtime boots.
     match cmd {
         ToronCmd::Agents { project } => {
             crate::check_project_spelling(project, "toron agents")?;
@@ -161,7 +153,6 @@ mod blank_project_tests {
                 "actionable message, got: {msg}"
             );
         }
-        // Whitespace spellings are blank too.
         let err = crate::cmd_toron(
             &cfg,
             &ToronCmd::Agents {

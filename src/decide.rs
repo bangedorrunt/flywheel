@@ -110,13 +110,6 @@ fn apply_crew_budget(d: &mut Decision, target: &str) {
     }
 }
 
-// ---- ADR-0032 Spec 9 (bd-himk): one catalog-driven routing table ----
-//
-// The flywheel-owned static routing catalog. `decide` and `briefing`
-// consume this one compiled table: matchers are declarative data,
-// overlapping claims fail `compile_routing_table` loud, and table order
-// never decides (most-specific needle wins; ties are explicit none).
-//
 // governed-by: ADR-0032 Spec 9
 
 /// Which snapshots/words admit a routing row.
@@ -433,8 +426,6 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         argv: RouteArgv::SpawnSend,
         reason: "one pane — spawn --profile <role> --count 1, then send --to <full-name> --wait (never --oc)",
     },
-    // Declared wave trigger only: bare swarm/lanes/waves substrings and lone
-    // budgets never route here (the old wave_shaped sniffing is deleted).
     RouteEntry {
         primitive: "wave-swarm",
         matchers: &["wave-swarm", "wave swarm"],
@@ -541,8 +532,6 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
     },
     RouteEntry {
         primitive: "loop-work",
-        // Phrase needles only. Bare "work" matches "workflow"; bare "beads"
-        // matches "beads-lifecycle" and any diagnosis that names the tracker.
         matchers: &["work the ready beads", "ready beads", "loop-mode", "loop"],
         topology: "open",
         gate: RouteGate::ReadyBeadsWork,
@@ -565,7 +554,6 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         argv: RouteArgv::SteerDirect,
         reason: "implement, no tracker — steer --direct",
     },
-    // Plane-S steering is an explicit route, never the silent fallback.
     RouteEntry {
         primitive: "steer",
         matchers: &["crew-steer", "mention peer", "peer mention"],
@@ -642,8 +630,6 @@ impl RouteEntry {
     /// (empty goal, contention with no keyword) sort last so an explicit
     /// mention always beats world state.
     fn match_key(&self, t: &str, implement: bool, snap: &Snapshot) -> Option<(usize, usize)> {
-        // A goal that asks to keep going is the loop, even when a one-shot
-        // word ("failing", "slow") appears earlier in the sentence.
         if self.primitive == "bug-fix" && has(t, UNTIL_GREEN) {
             return None;
         }
@@ -709,7 +695,6 @@ pub fn check_routing_table(table: &[RouteEntry]) -> Result<(), String> {
 }
 
 fn gates_compatible(a: RouteGate, b: RouteGate) -> bool {
-    // 0 = diagnosis-only, 1 = implement-only, 2 = either.
     fn implement_req(g: RouteGate) -> u8 {
         match g {
             RouteGate::NoImplement | RouteGate::ReadyBeadsWork => 0,
@@ -938,11 +923,6 @@ fn build_decision(entry: &RouteEntry, target: &str, snap: &Snapshot) -> Decision
 /// `decide` is the classifier leaf: it resolves the one routing table and
 /// applies the crew budget. Briefing consumes its output directly.
 pub fn decide(target: &str, snap: &Snapshot) -> Decision {
-    // bd-0bf8: beadless profile-only goals never ride wave-swarm — its gate
-    // and verify assume beads by construction. A lone --profile with no
-    // ready beads is one-pane work, so short-circuit to the spawn-send row
-    // before earliest-match can let an incidental "wave-swarm" claim it.
-    // With beads the declared trigger still routes via the table below.
     if snap.ready_bead_count == 0
         && target.to_ascii_lowercase().contains("--profile")
         && let Some(entry) = ROUTING_TABLE.iter().find(|e| e.primitive == "spawn-send")
@@ -1010,8 +990,6 @@ fn pick(mut hits: Vec<((usize, usize), &RouteEntry)>, target: &str, snap: &Snaps
     )
 }
 
-// ---- bd-x6x4: decide trigger phrase per builtin (workflow list --json) ----
-
 /// Primitives that are deliberately NOT keyword-routed: the command-adjacent
 /// shapes the captain invokes by name (`steer`), the lifecycle fan-out
 /// (`join` / `spawn-send` / `loop-work`), and the compose / cron forms.
@@ -1046,8 +1024,6 @@ pub fn decide_trigger_for(workflow: &str) -> Option<&'static str> {
         .find(|e| e.primitive == workflow)
         .and_then(|e| e.matchers.first().copied())
 }
-
-// ---- ADR-0022 §3.7 T4 / W7: delegated composition coverage (bd-adr22-w7) ----
 
 /// The compose-request archetype (§3.7 T4): the shape of work a mailed
 /// objective asks for, driving which stage-first parts a candidate carries.
@@ -1236,7 +1212,6 @@ mod tests {
         }
     }
 
-    // Row 1 — audit/read-only/analyze (not implement/fix) → captain-audit.
     #[test]
     fn row1_audit_is_captain_audit() {
         for t in [
@@ -1244,7 +1219,6 @@ mod tests {
             "read-only review of the loop",
             "analyze the spawn backlog",
         ] {
-            // Beads ready must not win over a read-only audit.
             let d = decide(t, &with_beads(5));
             assert_eq!(d.primitive, "captain-audit", "target: {t}");
             assert!(
@@ -1260,7 +1234,6 @@ mod tests {
         }
     }
 
-    // Row 1 boundary — audit + implement/fix must NOT classify as audit.
     #[test]
     fn row1_audit_plus_implement_is_steer_not_audit() {
         let d = decide("audit then fix the tracker", &snap());
@@ -1268,8 +1241,6 @@ mod tests {
         assert_eq!(d.primitive, "steer");
     }
 
-    // Row 2 — ready beads + empty|work-the-ready|loop → loop-work.
-    // Bare "beads" / "workflow" must NOT trip this (substring hijack).
     #[test]
     fn row2_ready_beads_is_loop_work() {
         for t in [
@@ -1295,7 +1266,6 @@ mod tests {
         }
     }
 
-    // Row 2 boundary — no ready beads → not loop-work even for "work".
     #[test]
     fn row2_no_ready_beads_is_not_loop_work() {
         let d = decide("work", &snap());
@@ -1331,10 +1301,8 @@ mod tests {
         assert_ne!(d.primitive, "loop-work", "argv: {:?}", d.argv);
     }
 
-    // Row 3 — implement/fix + beads|tracker|gate → steer.
     #[test]
     fn row3_implement_with_tracker_is_steer() {
-        // Beads ready must not hijack an implement request into loop-work.
         let d = decide("implement the parser with a plan gate", &with_beads(3));
         assert_eq!(d.primitive, "steer");
         assert!(d.argv.contains(&"steer".to_string()));
@@ -1344,7 +1312,6 @@ mod tests {
         );
     }
 
-    // Wave-label sniffing deleted: a wave- label is not a declared trigger.
     #[test]
     fn wave_label_without_trigger_is_none() {
         let d = decide("implement the parser for wave-1", &with_beads(3));
@@ -1352,7 +1319,6 @@ mod tests {
         assert_eq!(d.topology, "none");
     }
 
-    // Wave sniffing deleted: bare lanes/swarm never route to wave-swarm.
     #[test]
     fn lanes_keyword_is_not_wave_swarm() {
         let d = decide("run the lanes", &snap());
@@ -1382,10 +1348,6 @@ mod tests {
         );
     }
 
-    // bd-0bf8: beadless profile-only goals never ride wave-swarm (its gate
-    // and verify assume beads by construction). A lone --profile with no
-    // ready beads is one-pane work -> spawn-send, even when the goal
-    // mentions wave-swarm. With beads, the declared trigger still routes.
     #[test]
     fn beadless_profile_only_is_not_wave_swarm() {
         for t in ["spawn --profile coder", "wave-swarm --profile coder"] {
@@ -1424,7 +1386,6 @@ mod tests {
         assert_eq!(parse_budget_n("work the ready beads"), None);
     }
 
-    // Row 4 — implement/fix + no tracker|direct → steer-direct.
     #[test]
     fn row4_implement_direct_is_steer_direct() {
         for t in ["implement this direct", "fix the widget no tracker"] {
@@ -1438,7 +1399,6 @@ mod tests {
         }
     }
 
-    // Row 5 — compose|catalog miss|parts: → compose-parts.
     #[test]
     fn row5_compose_parts_is_compose_parts() {
         for t in [
@@ -1488,7 +1448,6 @@ mod tests {
         }
     }
 
-    // Row 6 — shape unknown|improvise|author workflow → compose-agent.
     #[test]
     fn row6_shape_unknown_is_compose_agent() {
         for t in [
@@ -1506,7 +1465,6 @@ mod tests {
         }
     }
 
-    // Row 7 — contention|coalition|shared-file (target or snap) → coalition-form.
     #[test]
     fn row7_contention_is_coalition_form() {
         for t in [
@@ -1524,13 +1482,11 @@ mod tests {
         assert_eq!(decide("ship it", &s).primitive, "coalition-form");
     }
 
-    // Row 8 — one pane|watch me|single agent → spawn-send.
     #[test]
     fn row8_one_pane_is_spawn_send() {
         for t in ["one pane for the oracle", "watch me", "single agent job"] {
             let d = decide(t, &snap());
             assert_eq!(d.primitive, "spawn-send", "target: {t}");
-            // MUST be --profile; NEVER add --oc; --to carries a full name.
             assert!(
                 d.argv.contains(&"--profile".to_string()),
                 "--profile MUST be present: {:?}",
@@ -1554,7 +1510,6 @@ mod tests {
         }
     }
 
-    // Row 9 — cron|schedule|nightly → cron-start.
     #[test]
     fn row9_scheduled_is_cron_start() {
         for t in [
@@ -1568,9 +1523,6 @@ mod tests {
         }
     }
 
-    // Row 10 — crew-steer|mention peer|peer mention → steer (plane S verbs
-    // run inside the steer target; no new primitive — an explicit row, never
-    // the silent fallback).
     #[test]
     fn row10_crew_steer_is_steer_not_new_primitive() {
         for t in [
@@ -1580,8 +1532,6 @@ mod tests {
         ] {
             let d = decide(t, &snap());
             assert_eq!(d.primitive, "steer", "target: {t}");
-            // No flywheel channel subcommand (ADR-0020 wave 1) — the steer
-            // target drives `toron channel post --mention` / `toron job claim`.
             assert!(
                 !d.argv.iter().any(|a| a == "channel"),
                 "no flywheel channel subcommand: {:?}",
@@ -1590,7 +1540,6 @@ mod tests {
         }
     }
 
-    // Fallback — unmatched targets are explicit none, never silent steer.
     #[test]
     fn unmatched_target_is_explicit_none() {
         let d = decide("zzz something odd", &snap());
@@ -1598,17 +1547,6 @@ mod tests {
         assert_eq!(d.topology, "none");
         assert!(d.argv.is_empty(), "none carries no dispatch: {:?}", d.argv);
     }
-
-    // ===== ADR-0019 Spec 8 rows (bd-w2-decide-drgi) =====
-    //
-    // One table instead of the 29 tests that used to spell these out. Every
-    // target and every expectation is carried over verbatim; `row` keeps the
-    // ADR-0019 spec row in the failure message so a break still names the
-    // contract row rather than a test index, and `primitive` names the
-    // ROUTING_TABLE row the case pins. The argv pins stay per-row because the
-    // rows genuinely differ: bug-fix dispatches pane, forensics and
-    // interrogate add headless, pause takes no --mode, and figure-it-out goes
-    // through compose --agent. Rows 15-23 arrived later under bd-x6x4.
 
     /// One Spec 8 routing case: targets that must resolve together, plus the
     /// argv shape they must produce.
@@ -1811,7 +1749,6 @@ mod tests {
             argv_has: &["triage-deep", "pane"],
             argv_lacks: &[],
         },
-        // triage-deep must win over plain triage.
         Spec8Case {
             row: "row17-guard",
             primitive: Some("triage-deep"),
@@ -1961,13 +1898,11 @@ mod tests {
             decide_trigger_for("awareness-digest"),
             Some("awareness-digest")
         );
-        // routed since ADR-0009 (agent-native pickup)
         assert_eq!(decide_trigger_for("debate"), Some("argue both sides"));
         assert_eq!(decide_trigger_for("ce-brainstorm"), Some("brainstorm"));
         assert_eq!(decide_trigger_for("ce-plan"), Some("break this down"));
         assert_eq!(decide_trigger_for("ship"), Some("ship the chain"));
         assert_eq!(decide_trigger_for("beads"), Some("convert to beads"));
-        // deliberately unrouted
         assert_eq!(decide_trigger_for("plan-review"), None);
         assert_eq!(decide_trigger_for("phase-resolve"), None);
         assert_eq!(decide_trigger_for("wave-swarm"), Some("wave-swarm"));
@@ -1981,20 +1916,15 @@ mod tests {
         );
     }
 
-    // Existing rows still win where they should (regression anchors).
     #[test]
     fn rows_keep_audit_loop_work_and_steer_anchors() {
-        // audit + implement still steers (no bug-shaped needle).
         let d = decide("audit then fix the tracker", &snap());
-        assert_eq!(d.primitive, "steer"); // plain implement without a playbook needle still steers.
+        assert_eq!(d.primitive, "steer");
         let d2 = decide("fix the tracker", &snap());
         assert_eq!(d2.primitive, "steer");
-        // ready beads + work intent still loop-work (no new-row needle hits).
         let d3 = decide("work the ready beads", &with_beads(3));
         assert_eq!(d3.primitive, "loop-work");
     }
-
-    // ---- W7 (§3.7 T4): coverage report + archetype + allowlist ----
 
     #[test]
     fn w7_coverage_hit_names_workflow_no_candidate() {
@@ -2059,16 +1989,10 @@ mod tests {
         );
         assert!(!compose_request_allowed("", &allow), "empty sender denies");
         assert!(!compose_request_allowed("  ", &allow));
-        // Case-exact pins: near-miss casing denies (pins are CamelCase).
         assert!(!compose_request_allowed("sandysparrow", &allow));
     }
 }
 
-// ---- ADR-0032 Spec 9 (bd-himk): catalog-driven router contract ----
-//
-// RED batch A: assertions against the existing API. These encode the new
-// truth (explicit none, no wave sniffing, declared topology, ce-review)
-// and MUST fail until the routing table lands.
 #[cfg(test)]
 mod decide_router_tests {
     use super::*;
@@ -2077,7 +2001,6 @@ mod decide_router_tests {
         Snapshot::default()
     }
 
-    // No match returns explicit none, never silent steer.
     #[test]
     fn decide_router_no_match_is_explicit_none() {
         let d = decide("zzz something odd", &snap());
@@ -2087,8 +2010,6 @@ mod decide_router_tests {
         assert!(!d.reason.is_empty(), "none names the reason");
     }
 
-    // wave_shaped substring sniffing is deleted: bare swarm/lanes/waves and
-    // a lone budget never route to wave-swarm. Only the declared trigger does.
     #[test]
     fn decide_router_bare_swarm_lanes_budget_do_not_route_wave() {
         for t in [
@@ -2109,8 +2030,6 @@ mod decide_router_tests {
         );
     }
 
-    // Topology is declared per workflow: babysit-bead is open, and unknown
-    // primitives are none — the `_ => swarm` bucket is gone.
     #[test]
     fn decide_router_topology_declared_no_silent_swarm() {
         assert_eq!(topology_for_primitive("babysit-bead"), "open");
@@ -2121,8 +2040,6 @@ mod decide_router_tests {
         );
     }
 
-    // Fronted intent wins over an incidental later mention: pause@0 beats
-    // arena@6, goal@0 beats onboard@14. Table order never decides.
     #[test]
     fn decide_router_earliest_match_wins() {
         let d = decide("pause the arena", &snap());
@@ -2131,10 +2048,6 @@ mod decide_router_tests {
         assert_eq!(d.primitive, "goal", "fronted topic is the intent: {d:?}");
     }
 
-    // bd-2o1v P0-5 (a): role affinity is READ from workflow steps, never
-    // re-declared on the row — every WorkflowRun row's first dispatch_job
-    // role must exist in the profile catalog, and roles that are pins
-    // (CamelCase) never become affinity.
     #[test]
     fn decide_router_profile_affinity() {
         use crate::profile::ProfileCatalog;
@@ -2166,7 +2079,6 @@ mod decide_router_tests {
         );
     }
 
-    // Exact same-position contention across primitives is explicit none.
     #[test]
     fn decide_router_same_position_tie_is_explicit_none() {
         static TIE_A: RouteEntry = RouteEntry {
@@ -2194,7 +2106,6 @@ mod decide_router_tests {
         );
     }
 
-    // Stale stage reference: the review archetype composes ce-review.
     #[test]
     fn decide_router_review_archetype_is_ce_review() {
         assert_eq!(
@@ -2204,14 +2115,12 @@ mod decide_router_tests {
         );
     }
 
-    // The live table loads loud-clean.
     #[test]
     fn decide_router_table_compiles_clean() {
         compile_routing_table().expect("live routing table must load clean");
         assert!(!ROUTING_TABLE.is_empty(), "one routing truth exists");
     }
 
-    // Overlapping matcher claims fail load, naming the needle + claimants.
     #[test]
     fn decide_router_overlap_fails_load() {
         let dup = [
@@ -2240,8 +2149,6 @@ mod decide_router_tests {
         );
     }
 
-    // Spec 9: one trigger per phrase — two primitives sharing a first matcher
-    // would make decide_trigger_for ambiguous, so the catalog refuses to load.
     #[test]
     fn decide_router_shared_trigger_fails_load() {
         let dup = [
@@ -2270,8 +2177,6 @@ mod decide_router_tests {
         );
     }
 
-    // Spec 9: a row that runs a workflow must name a workflow that resolves;
-    // the live table + live catalog are checked together in main.rs.
     #[test]
     fn decide_router_orphan_workflow_route_fails_load() {
         let table = [RouteEntry {
@@ -2287,7 +2192,6 @@ mod decide_router_tests {
         assert!(err.contains("ghost-wf"), "names the orphan: {err}");
         check_workflow_routes(&table, &["ghost-wf".to_string()])
             .expect("a resolvable workflow admits the route");
-        // A non-workflow argv shape is never subject to the cross-check.
         let non_wf = [RouteEntry {
             primitive: "join",
             matchers: &["join it"],
@@ -2299,10 +2203,6 @@ mod decide_router_tests {
         check_workflow_routes(&non_wf, &[]).expect("Join is not a `workflow run` route");
     }
 
-    // The LIVE catalog proves the table: every `workflow run` route resolves to
-    // a real workflow. This is the "one catalog" proof — a rename in the
-    // catalog that leaves a route behind turns this red instead of shipping a
-    // decide argv that cannot run.
     #[test]
     fn decide_router_live_table_resolves_against_the_real_catalog() {
         let known: Vec<String> = crate::builtin_workflows::builtin_workflows()
@@ -2316,7 +2216,6 @@ mod decide_router_tests {
             .expect("every routed `workflow run` primitive must exist in the catalog");
     }
 
-    // The unrouted declaration is one place, and every name in it is real.
     #[test]
     fn decide_router_unrouted_list_is_real_and_not_keyword_routed() {
         for name in UNROUTED_PRIMITIVES {
@@ -2330,11 +2229,6 @@ mod decide_router_tests {
                 "{name} is not keyword-routed"
             );
         }
-        // Every OTHER primitive is keyword-routed, and its trigger is the FIRST
-        // row's first matcher. A multi-row primitive (bug-fix: repro…, then
-        // bug…; steer: beads…, then crew-steer…) keeps its secondary needles
-        // out of the trigger position — the phrase is per-primitive, so the
-        // first row owns it.
         let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         for e in ROUTING_TABLE {
             if UNROUTED_PRIMITIVES.contains(&e.primitive) || !seen.insert(e.primitive) {
@@ -2354,8 +2248,6 @@ mod decide_router_tests {
         );
     }
 
-    // One truth: every routed workflow's decide_trigger phrase is its row's
-    // first matcher, so `workflow list --json` and `decide` cannot diverge.
     #[test]
     fn decide_router_trigger_phrase_is_first_matcher() {
         let pairs = [

@@ -112,7 +112,6 @@ const ALWAYS_SERIALIZE_PATHS: &[&str] = &[
 /// decision (the loop's real decision is durable.rs `always_serialize_held`).
 fn overlaps_always_serialize(path: &str) -> bool {
     ALWAYS_SERIALIZE_PATHS.iter().any(|a| {
-        // glob-lite: `**` suffix matches any subpath; otherwise prefix match
         if let Some(stripped) = a.strip_suffix("/**") {
             path == stripped || path.starts_with(&format!("{stripped}/"))
         } else {
@@ -120,8 +119,6 @@ fn overlaps_always_serialize(path: &str) -> bool {
         }
     })
 }
-
-// ---- hermetic scratch harness (mirrors e2e_verdict_reopen) ----------------
 
 /// Scratch project dir + isolated mailbox + isolated config. Absolute path
 /// (the reservation board leaf takes the project dir as the project key; the
@@ -146,10 +143,6 @@ impl Scratch {
         };
         std::fs::create_dir_all(&s.dir).unwrap();
         std::fs::create_dir_all(&s.cfg).unwrap();
-        // Minimal config: embedded in-process toron (NO [mail.toron] url →
-        // `Mail::from_config` picks the in-process mailbox), identity
-        // e2e-zord. XDG_CONFIG_HOME points here; the real machine config is
-        // never touched.
         std::fs::write(
             s.cfg.join("config.toml"),
             "[backend]\nmultiplexer = \"hc\"\nmail = \"toron\"\n\n[agent_mail]\nname = \"e2e-zord\"\n",
@@ -252,8 +245,6 @@ impl Scratch {
     }
 }
 
-// ---- Scenario A: serialize-on-overlap DATA path (hermetic) ----------------
-
 /// The loop's serialize-on-overlap data: reserving an always-serialize path
 /// (`.beads/**`, the bead tracker itself) with reason = a bead id makes the
 /// `__reservation-board` leaf — the exact leaf the durable loop polls every
@@ -262,16 +253,13 @@ impl Scratch {
 #[test]
 fn serialize_on_overlap_board_reports_always_serialize_holds() {
     let s = Scratch::new("board");
-    // git + beads tracker (the real tracker the loop reads).
     run_ok(&s.dir, "git", &["init", "-q"], "git init");
     run_ok(&s.dir, "br", &["init"], "br init");
     s.register("e2e-zord");
 
-    // Empty board first: nothing held → no serialization.
     let board = s.reservation_board();
     assert_eq!(board["count"], 0, "empty board: {board}");
 
-    // Hold `.beads/**` (reason = an in-flight bead id).
     s.reserve("e2e-zord", ".beads/**", "bd-zord-a");
     let board = s.reservation_board();
     assert_eq!(board["count"], 1, "one hold: {board}");
@@ -287,7 +275,6 @@ fn serialize_on_overlap_board_reports_always_serialize_holds() {
         "`.beads/**` must be an always-serialize path"
     );
 
-    // Release → the gate clears (loop resumes parallel dispatch).
     s.unlock("e2e-zord");
     let board = s.reservation_board();
     assert_eq!(board["count"], 0, "released board: {board}");
@@ -316,8 +303,6 @@ fn cargo_lock_gates_but_normal_source_does_not() {
     );
     s.unlock("e2e-zord");
 
-    // Normal source path: reported on the board (other beads' overlap waits
-    // still see it) but NOT an always-serialize gate.
     s.reserve("e2e-zord", "src/durable.rs", "bd-zord-c");
     let board = s.reservation_board();
     assert_eq!(board["count"], 1, "row present: {board}");
@@ -351,8 +336,6 @@ fn serialize_gate_unit_suite_is_pinned() {
             "durable.rs must keep the {name} serialize/overlap acceptance surface"
         );
     }
-    // ALWAYS_SERIALIZE_PATHS must still cover .beads/** + Cargo.lock
-    // (the two paths Scenario A names).
     assert!(
         src.contains(".beads/**"),
         "ALWAYS_SERIALIZE_PATHS keeps .beads/**"
@@ -361,9 +344,6 @@ fn serialize_gate_unit_suite_is_pinned() {
         src.contains("Cargo.lock"),
         "ALWAYS_SERIALIZE_PATHS keeps Cargo.lock"
     );
-    // bd-9tbb (leafReply): the loop's board reads are LIVE — a checkpointed
-    // board leaf replays its STORED rows on resume, so a released holder
-    // would keep the always-serialize gate closed forever.
     assert!(
         src.contains("reservation_board_live"),
         "durable.rs must keep the live (non-checkpointed) board read on the loop path"
@@ -379,18 +359,10 @@ fn serialize_gate_unit_suite_is_pinned() {
 /// worktree calls" contract at the surface that produces those logs.
 #[test]
 fn loop_dispatch_surface_has_zero_worktree_creates() {
-    // durable.rs is the loop keeper (run_durable_loop / run_engine_loop /
-    // plan_actions): it must contain NO worktree-create call of any spelling.
-    // The unit test NAME `serialize_overlap_loop_never_calls_worktree_create`
-    // legitimately contains `worktree_create(` — it IS the pinned acceptance
-    // test; skip that line, every other occurrence is a violation.
     let durable = std::fs::read_to_string("src/durable.rs").unwrap_or_default();
     let without_test_name: String = durable
         .lines()
         .filter(|l| !l.contains("fn serialize_overlap_loop_never_calls_worktree_create"))
-        // the pinned acceptance test's OWN assertions quote the tokens
-        // (`assert!(!b.contains("worktree.create"), ...)`) — those literals
-        // are the pin, not violations.
         .filter(|l| !l.contains("contains(\"worktree"))
         .collect::<Vec<_>>()
         .join("\n");
@@ -405,10 +377,6 @@ fn loop_dispatch_surface_has_zero_worktree_creates() {
             "durable.rs (loop keeper) must never call {needle}"
         );
     }
-    // main.rs: the ONLY worktree-create calls live in cmd_worktree (the
-    // operator's explicit `worktree create` CLI, lines ~10269+); the loop
-    // command handler (cmd_loop, ~11084+) must not contain them. Pin by
-    // ordering: the last worktree_create( occurrence must precede cmd_loop.
     let main = std::fs::read_to_string("src/main.rs").unwrap_or_default();
     let last_wt_create = main.match_indices("worktree_create(").map(|(i, _)| i).max();
     let loop_fn = main.find("fn cmd_loop(").expect("cmd_loop exists");
@@ -418,12 +386,10 @@ fn loop_dispatch_surface_has_zero_worktree_creates() {
             "worktree_create( must live only in cmd_worktree, before cmd_loop"
         );
     }
-    // the brief bans worktrees explicitly (ADR-0019 Spec 3.2 FORBIDDEN)
     assert!(
         durable.contains("No worktree"),
         "brief FORBIDDEN bans worktrees"
     );
-    // the preflight gate is the structural ban with an operator-only opt-out
     let preflight = std::fs::read_to_string("src/preflight.rs").unwrap_or_default();
     assert!(
         preflight.contains("linked_worktrees"),
@@ -456,8 +422,6 @@ fn allow_worktree_flag_is_exposed_on_run_surfaces() {
         );
     }
 }
-
-// ---- Scenario B: linked-worktree preflight (live, hc + engine store) ----
 
 /// `flywheel loop run <scratch>` in a workspace with an extra `git worktree
 /// add` sibling exits NON-ZERO without `--allow-worktree` (preflight FAIL
@@ -492,17 +456,10 @@ fn linked_worktree_gates_loop_run_until_operator_optout() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    // Unique repo dir PER RUN: the hc workspace label derives from the
-    // repo dir's basename (`flywheel-<base>`), so a fixed name like
-    // `primary` would collide across runs — a stale duplicate label makes
-    // find_workspace resolve the WRONG (already-removed) workspace and the
-    // worktree check fails with `not_git_worktree`. Run-unique base keeps
-    // labels disjoint.
     let base = std::env::temp_dir().join(format!("fw-zord-live-{}-{ts}", std::process::id()));
-    let primary = base.clone(); // the git repo IS the unique base dir
+    let primary = base.clone();
     std::fs::create_dir_all(&primary).unwrap();
 
-    // scratch git repo + an extra linked worktree sibling
     run_ok(&primary, "git", &["init", "-q"], "git init");
     run_ok(
         &primary,
@@ -529,7 +486,6 @@ fn linked_worktree_gates_loop_run_until_operator_optout() {
         "git worktree add sibling",
     );
 
-    // an hc workspace whose label resolves the project (flywheel-<base>)
     let project = primary.to_str().unwrap().to_string();
     let label = format!(
         "flywheel-{}",
@@ -537,7 +493,6 @@ fn linked_worktree_gates_loop_run_until_operator_optout() {
     );
     let ws = plane_workspace_create(&label, &project);
 
-    // Scenario B part 1: WITHOUT --allow-worktree → non-zero + linked-tree FAIL
     let out = Command::new(flywheel())
         .args(["loop", "run", &project, "--once", "--timeout-ms", "8000"])
         .output()
@@ -557,7 +512,6 @@ fn linked_worktree_gates_loop_run_until_operator_optout() {
         "FAIL must point at the operator opt-out: {err}"
     );
 
-    // Scenario B part 2: WITH --allow-worktree → exit 0 + operator opt-out LOGGED
     let out = Command::new(flywheel())
         .args([
             "loop",
@@ -590,7 +544,6 @@ fn linked_worktree_gates_loop_run_until_operator_optout() {
         "sync loop must complete its single pass: {all}"
     );
 
-    // cleanup: linked sibling + scratch workspace
     let _ = Command::new("git")
         .args(["worktree", "remove", "--force", sibling.to_str().unwrap()])
         .current_dir(&primary)
@@ -602,8 +555,6 @@ fn linked_worktree_gates_loop_run_until_operator_optout() {
     }
     let _ = std::fs::remove_dir_all(&base);
 }
-
-// ---- helpers ----------------------------------------------------------------
 
 fn run(cwd: &Path, bin: &str, args: &[&str]) -> Output {
     Command::new(bin)

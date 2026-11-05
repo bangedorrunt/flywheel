@@ -46,8 +46,6 @@ fn has_test(src: &str, needle: &str) -> bool {
 
 #[test]
 fn invariant_2_reducers_replay_byte_identically() {
-    // "Same model plus same message produces byte-identical next model
-    // and the same command list." One tripwire per reducer, all four.
     for (rel, needle) in [
         (
             "src/workspace.rs",
@@ -73,9 +71,6 @@ fn invariant_2_reducers_replay_byte_identically() {
 
 #[test]
 fn invariant_1_reducers_own_no_clock() {
-    // "Reducers have no I/O, clock reads, randomness, environment reads."
-    // A SOURCE tripwire, because the property is about the file, not a
-    // call: the string is spliced so this very test cannot satisfy it.
     let src = file("src/workspace.rs");
     let instant = ["Instant", "::now"].concat();
     let system = ["SystemTime", "::now"].concat();
@@ -91,8 +86,6 @@ fn invariant_1_reducers_own_no_clock() {
 
 #[test]
 fn invariant_5_effects_are_bounded() {
-    // "Every external effect has a bounded timeout and bounded retry."
-    // The bounded-wait wrapper is the enforcement point.
     let src = file("src/durable.rs");
     assert!(
         has_test(&src, "leaf_is_bounded") || src.contains("run_leaf_cmd_bounded"),
@@ -107,8 +100,6 @@ fn invariant_5_effects_are_bounded() {
 
 #[test]
 fn invariant_6_effectful_runs_are_journaled() {
-    // "Every effectful real run uses enforced journaling; dry runs do
-    // NOT claim they ran." Both halves, or the gate is theatre.
     let pane = file("src/pane.rs");
     assert!(
         pane.contains("EffectJournalMode::Enforced"),
@@ -134,8 +125,6 @@ fn invariant_6_effectful_runs_are_journaled() {
 
 #[test]
 fn invariant_7_unknown_is_persisted_not_converted() {
-    // "`Unknown` is persisted and visible; it is never silently
-    // converted." Asserted on a REAL symbol, not prose.
     let src = file("src/verdict.rs");
     assert!(
         src.contains("Unknown"),
@@ -149,8 +138,6 @@ fn invariant_7_unknown_is_persisted_not_converted() {
 
 #[test]
 fn invariant_8_queue_acceptance_is_not_delivery() {
-    // "Queue acceptance is never reported as provider delivery." The wake
-    // gate's decision type is the place that distinction is made.
     let mut found = false;
     for rel in [
         "crates/doorbell-core/src/wake_core.rs",
@@ -170,9 +157,6 @@ fn invariant_8_queue_acceptance_is_not_delivery() {
 
 #[test]
 fn invariants_are_enumerated_so_this_file_cannot_drift() {
-    // The point of this module: nine invariants, and a reader must be able
-    // to see that all nine have a home. If ADR-0016 gains a tenth, this
-    // count is the tripwire that forces someone to name its gate.
     const INVARIANTS: [&str; 9] = [
         "1 reducers own no I/O, clock, randomness, env",
         "2 same model + same msg => identical model and commands",
@@ -185,9 +169,6 @@ fn invariants_are_enumerated_so_this_file_cannot_drift() {
         "9 Unknown presence never prompts; unroutable wakes stay in the digest",
     ];
     assert_eq!(INVARIANTS.len(), 9, "ADR-0016 lists nine invariants");
-    // Invariant 3 is enforced structurally: the Tick Law requires BTreeMap
-    // for output-affecting iteration. Name the check so a reader can find
-    // it rather than trusting this comment.
     assert!(
         file("src/workspace.rs").contains("BTreeMap")
             || file("src/durable.rs").contains("BTreeMap"),

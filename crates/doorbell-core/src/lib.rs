@@ -64,21 +64,15 @@ pub fn classify(ev: &RingInput) -> Option<EventClass> {
     if ev.addressed_to_self && ev.kind == 43001 {
         return Some(EventClass::Job);
     }
-    // GS-006 bug 1: kind 9 mail-delivered (NIP-17 gift-wrap wake) must pull mail, not channel.
-    // bd-v8vi: delivery is routine (urgency unknowable sealed); only the
-    // ack-sla-expiry ring stays urgent. Phantom urgents otherwise.
     if ev.addressed_to_self && ev.kind == 9 && ev.toron_kind_ack_sla {
         return Some(EventClass::PlanePUrgent);
     }
-    // Tagged `toron-kind=mail-delivered` on kind 9; routine inbox pull.
     if ev.addressed_to_self && ev.kind == 9 && ev.toron_kind_mail_delivered {
         return Some(EventClass::PlanePMail);
     }
     if ev.addressed_to_self && ev.kind == 9 {
         return Some(EventClass::Channel);
     }
-    // GS-006 bug 2: kind 39002 join/leave addressed to self must ring.
-    // Reuse Channel semantics (membership wake) — hint falls back to channel read.
     if ev.addressed_to_self && ev.kind == 39002 {
         return Some(EventClass::Channel);
     }
@@ -113,9 +107,6 @@ pub struct DoorbellQueue {
 impl DoorbellQueue {
     pub fn push(&mut self, class: EventClass, line: impl Into<String>) {
         let line = line.into();
-        // hint is the Pull part; use full line as key fallback when hint unknown.
-        // For correct per-channel dedup, callers pass the hint-derived line.
-        // Extract the hint suffix for keying when possible.
         let hint = line.split("Pull: ").nth(1).unwrap_or(&line).to_string();
         self.pending.insert((class, hint), line);
     }
@@ -361,9 +352,6 @@ pub fn parse_watch_ndjson(line: &str, index: &SelfIndex) -> Option<(EventClass, 
             })
             .unwrap_or(false)
     });
-    // mail-delivered AND ack-sla-expired are mailbox wakes (kind 9 metadata
-    // rings for sealed NIP-17 mail) — both must pull the inbox, never
-    // `channel read` on a thread id.
     let toron_kind_is = |want: &str| {
         tags.iter().any(|t| {
             t.as_array()
@@ -374,8 +362,6 @@ pub fn parse_watch_ndjson(line: &str, index: &SelfIndex) -> Option<(EventClass, 
                 .unwrap_or(false)
         })
     };
-    // bd-v8vi: delivery notice vs expiry are different urgencies — a
-    // sealed delivery is routine until the inbox fold says otherwise.
     let toron_kind_mail_delivered = toron_kind_is("mail-delivered");
     let toron_kind_ack_sla = toron_kind_is("ack-sla-expired");
     let class = classify(&RingInput {
@@ -560,9 +546,6 @@ pub fn parse_status_pair(s: &str) -> Option<(String, String)> {
     Some((pin.to_string(), st.to_string()))
 }
 
-// ---- Elm tick (moved verbatim from src/doorbell_tick.rs) ------------------
-// Pure `tick(Model,Msg)->(Model,Actions)` — no I/O, no &mut, no hc/toron.
-
 /// One doorbell message. Every bus/inbox/status edge is a Msg; nothing
 /// happens outside `tick`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -739,7 +722,6 @@ pub fn is_urgent_line(line: &str) -> bool {
         || line.contains("kind 30031")
         || line.contains("ack-sla-expired")
         || line.contains("unacked for")
-        // GS-048: mid-session reclassify vehicle announce must deliver (counts as wake).
         || line.starts_with("[reclassify]")
 }
 
@@ -789,7 +771,6 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
             }
         }
         DoorbellMsg::InboxRows { rows, pin } => {
-            // Plane-P sweep path: rows already parsed (Values), no round-trip.
             for item in rows {
                 let Some((class, hint)) = parse_inbox_item(item) else {
                     continue;
@@ -817,21 +798,15 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
             next.statuses.insert(pin.clone(), status.clone());
         }
         DoorbellMsg::Fact { summary } => {
-            // The doorbell-side reducer has no captain alias — an alias-less
-            // fact is a LOUD miss (never registry.first()).
             actions.push(DoorbellAction::FactMiss {
                 why: format!("fact without captain alias: {}", summary),
             });
         }
         DoorbellMsg::AckSlaTick { .. } => {
-            // The scan is check_ack_sla_expired (toron), not an inbox fetch.
-            // Overdue wakes arrive back as kind-9 ack-sla-expired WatchNdjson.
             actions.push(DoorbellAction::CheckAckSla);
-            // leftover #13: FetchInbox is now a real Cmd whose rows re-enter as InboxRows
             actions.push(DoorbellAction::FetchInbox);
         }
         DoorbellMsg::WatchDied => {
-            // Never exit the dispatcher: restart is the only path (heal_tick is backup).
             actions.push(DoorbellAction::RestartWatch);
         }
     }
@@ -853,8 +828,6 @@ fn route_or_queue(
         .map(String::as_str)
         .unwrap_or("unknown");
     // governed-by: bd-zawk — per-wake verdict via the typed InjectGate so the
-    // hc-string path agrees with the presence-verdict path by construction.
-    // blocked+urgent prompts; blocked+routine digests with a reason.
     if should_inject(status) {
         match inject_gate_for_plane(status, is_urgent_line(&line)) {
             InjectGate::Inject => {
@@ -872,21 +845,12 @@ fn route_or_queue(
             }
         }
     } else if next.unroutable.contains(pin) {
-        // bd-bk9t: no pane means no drain is possible, ever. Queueing here
-        // would be a memory leak wearing a delivery intent — the RAM-only
-        // queue is lost on restart and no `PlaneStatus` will ever drain it.
-        // The wake is real and the human is the addressee, so it goes to
-        // the digest with a named reason instead.
         actions.push(DoorbellAction::Digest {
             pin: pin.to_string(),
             line,
             why: "no_route".into(),
         });
     } else {
-        // should_ring parity (Busy × urgency): a working pane breaks
-        // through for urgent lines instead of queueing behind its own
-        // turn; routine lines still queue for the drain. Blocked never
-        // reaches here (injectable above), so its shape is untouched.
         if matches!(
             inject_gate_for_plane(status, is_urgent_line(&line)),
             InjectGate::Inject
@@ -897,11 +861,6 @@ fn route_or_queue(
             });
             return;
         }
-        // bd-ztek: a queued ring leaves one journal-visible Audit on the
-        // empty→non-empty transition per pin. Without it the queue was
-        // silent (no action row), so `why` showed nothing for dead-pane
-        // pins and the wake looked lost. Bounded: further enqueues while
-        // non-empty stay quiet; the drain still emits the Prompts.
         let fresh = next.queues.get(pin).is_none_or(std::vec::Vec::is_empty);
         next.queues
             .entry(pin.to_string())
@@ -945,8 +904,6 @@ mod tests {
 
     #[test]
     fn presence_word_map_is_single_sourced() {
-        // bd-z5ou: both hosts read through this — blocked is Busy, done
-        // is Idle, dead words are Dead, garbage is Unknown (never idle).
         for w in ["idle", "done", " IDLE "] {
             assert_eq!(parse_presence_word(w), PresenceVerdict::Idle);
         }
@@ -963,8 +920,6 @@ mod tests {
 
     #[test]
     fn inject_gate_blocked_urgent_injects_routine_digests() {
-        // bd-zawk G6: one typed gate for both paths — blocked+urgent injects,
-        // blocked+routine digests with a reason, never a silent drop.
         assert_eq!(inject_gate_for_plane("blocked", true), InjectGate::Inject);
         assert!(matches!(
             inject_gate_for_plane("blocked", false),
@@ -980,7 +935,6 @@ mod tests {
             inject_gate_for_plane("unknown", true),
             InjectGate::Digest(_)
         ));
-        // Verdict path agrees with the hc-string path by construction.
         assert_eq!(inject_gate(PresenceVerdict::Busy, true), InjectGate::Inject);
         assert!(matches!(
             inject_gate(PresenceVerdict::Busy, false),
@@ -990,7 +944,6 @@ mod tests {
 
     #[test]
     fn fact_promotion_prefers_captain_over_wheelhouse() {
-        // bd-z5ou: precedence + line shape shared by both hosts.
         let mut roles = BTreeMap::new();
         assert_eq!(fact_captain_pin(&roles), None);
         roles.insert("wheelhouse".into(), "PinW".into());
@@ -1009,14 +962,10 @@ mod tests {
 
     #[test]
     fn redelivery_floor_is_now_minus_24h() {
-        // bd-5d0v: the cursor-less backfill floor is exactly the documented
-        // 24h lookback, RFC3339 seconds, parseable by the same parser the
-        // high-water uses.
         let now = 1_700_000_000u64;
         let floor = redelivery_floor_rfc3339(now);
         let us = parse_rfc3339_micros(&floor).expect("floor parses");
         assert_eq!(us, (now - 24 * 3600) as i64 * 1_000_000, "{floor}");
-        // Saturates instead of underflowing near epoch.
         assert!(parse_rfc3339_micros(&redelivery_floor_rfc3339(10)).is_ok());
     }
 
@@ -1085,8 +1034,6 @@ mod tests {
 
     #[test]
     fn queue_audit_fires_once_per_nonempty_stretch() {
-        // bd-ztek: bounded noise — the second enqueue while queued stays
-        // quiet; a new stretch after a drain audits again.
         let mut model = model_with("BlueRidge");
         model.statuses.insert("BlueRidge".into(), "working".into());
         let line = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["h","ch-1"]],"content":"@BlueRidge hi"}"#;
@@ -1100,8 +1047,6 @@ mod tests {
 
     #[test]
     fn working_urgent_steer_rings_now() {
-        // should_ring parity: working + urgent breaks through instead of
-        // queueing; the inbox wake text carries `URGENT steer`.
         assert!(
             is_urgent_line("⟦toron⟧ URGENT steer (wm 7) — run: toron next"),
             "inbox wake text must read urgent"
@@ -1130,7 +1075,6 @@ mod tests {
 
     #[test]
     fn working_normal_line_still_queues() {
-        // should_ring parity the other way: working + routine waits.
         let mut model = model_with("BlueRidge");
         model.statuses.insert("BlueRidge".into(), "working".into());
         let mut actions = Vec::new();
@@ -1151,7 +1095,6 @@ mod tests {
 
     #[test]
     fn blocked_routing_unchanged() {
-        // Blocked stays as it is: urgent prompts, routine digests.
         let mut model = model_with("BlueRidge");
         model.statuses.insert("BlueRidge".into(), "blocked".into());
         let mut urgent = Vec::new();
@@ -1180,10 +1123,6 @@ mod tests {
 
     #[test]
     fn unroutable_pin_wake_goes_to_digest_not_queue() {
-        // bd-bk9t: a subscribed identity with no spawn row has no pane, so
-        // its status can never leave "unknown" and the per-pin queue can
-        // never drain. The wake must reach the digest instead of parking in
-        // RAM with a delivery intent it can never honour.
         let mut model = model_with("QuietHeron");
         model.statuses.remove("QuietHeron");
         model.unroutable.insert("QuietHeron".into());
@@ -1207,9 +1146,6 @@ mod tests {
 
     #[test]
     fn unroutable_pin_still_prompts_when_injectable() {
-        // Defensive: routability is about the *pane*, injectability about
-        // the *status*. If a pane ever turns up for a previously pane-less
-        // pin and it is idle, the prompt gate still wins.
         let mut model = model_with("QuietHeron");
         model.unroutable.insert("QuietHeron".into());
         let line = r#"{"kind":9,"id":"ab","tags":[["p","QuietHeron"],["h","ch-1"]],"content":"@QuietHeron hi"}"#;
@@ -1224,9 +1160,6 @@ mod tests {
 
     #[test]
     fn routable_unknown_pin_still_queues_not_digests() {
-        // Regression: a spawned pin whose status has not arrived yet is a
-        // *transient* unknown — it will drain when hc reports. Only the
-        // index-marked pane-less kind is digest-bound.
         let mut model = model_with("BlueRidge");
         model.statuses.remove("BlueRidge");
         let line = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["h","ch-1"]],"content":"@BlueRidge hi"}"#;
@@ -1241,10 +1174,6 @@ mod tests {
 
     #[test]
     fn mail_delivered_is_routine_mail_not_urgent() {
-        // bd-v8vi: a sealed envelope's urgency is unknowable on the watch
-        // path — every delivery labeled urgent manufactured phantom
-        // urgents (5 QuietHeron digests, zero urgent mail). Delivery rings
-        // a routine inbox-pull; urgency comes from the inbox fold.
         let index = SelfIndex::from_pins(["BlueRidge"]);
         let line = r#"{"kind":9,"id":"aa","tags":[["p","BlueRidge"],["toron-kind","mail-delivered"],["h","t-1"]],"content":"sealed"}"#;
         let (class, hint) = parse_watch_ndjson(line, &index).expect("mail-delivered must ring");
@@ -1263,8 +1192,6 @@ mod tests {
 
     #[test]
     fn ack_sla_expired_stays_urgent() {
-        // Unacked-corr expiry IS urgent by nature (the ack never came) —
-        // only routine deliveries downgrade, never the SLA ring.
         let index = SelfIndex::from_pins(["BlueRidge"]);
         let line = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["toron-kind","ack-sla-expired"]],"content":"sealed"}"#;
         let (class, _) = parse_watch_ndjson(line, &index).expect("ack-sla-expired must ring");
@@ -1301,8 +1228,6 @@ mod tests {
 
     #[test]
     fn doorbell_tick_inbox_messages_wrapper_parses() {
-        // fetch_inbox also emits {"messages":[...]} — must expand, not treat
-        // the wrapper as one unparseable row.
         let model = model_with("BlueRidge");
         let raw = r#"{"messages":[{"importance":"urgent"},{"importance":"high"},{"importance":"normal"}]}"#;
         let (_, actions) = tick(
@@ -1358,14 +1283,11 @@ mod tests {
         use std::collections::BTreeMap;
         let mut m: BTreeMap<String, super::PinBudget> = BTreeMap::new();
         let one = |pin: &str| vec![(pin.to_string(), "x".into())];
-        // 3 prompts for one pin pass; the 4th inside the window drops.
         for _ in 0..3 {
             assert_eq!(super::take_allowed(one("p"), &mut m, 1000).len(), 1);
         }
         assert!(super::take_allowed(one("p"), &mut m, 1001).is_empty());
-        // A different pin is unaffected (per-pin buckets).
         assert_eq!(super::take_allowed(one("q"), &mut m, 1001).len(), 1);
-        // Window slides: 30 min later the pin passes again.
         assert_eq!(super::take_allowed(one("p"), &mut m, 1000 + 1800).len(), 1);
     }
 }

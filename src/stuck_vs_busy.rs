@@ -89,8 +89,6 @@ pub fn triage(wedged: Option<f64>, working: Option<f64>) -> (Triage, String) {
             format!("not judged: no answer (wedged={wedged:?} working={working:?})"),
         );
     };
-    // Both numbers in every branch: a verdict whose detail says only "unknown" is
-    // indistinguishable from a stage that never ran.
     let nums = format!("wedged={w:.2} working={k:.2}");
     if w > YES && k < NO {
         return (
@@ -156,9 +154,6 @@ pub fn evidence(health: &serde_json::Value) -> String {
     };
     let event_age = num(&watch, "last_event_age_s");
     let ceiling_ms = num(&wake, "deaf_ceiling_ms");
-    // Both operands normalised to seconds BEFORE comparing, because one is
-    // milliseconds and the other is not. Comparing them raw is the kind of
-    // unit bug that makes a healthy daemon look 60000x overdue.
     let age_vs_ceiling = match (event_age, ceiling_ms) {
         (Some(a), Some(c)) => {
             let ceiling_s = c as f64 / 1000.0;
@@ -270,9 +265,6 @@ pub fn stage() -> Stage {
                         .as_ref()
                         .and_then(|v| v.get("health"))
                         .unwrap_or(&serde_json::Value::Null);
-                    // The objective NESTS the health document under `health`, so a
-                    // top-level check would always pass — the same trap the
-                    // unanswered triage's preflight fell into.
                     let has_watch = health.get("watch").is_some();
                     let has_wake = health.get("wake").is_some();
                     if has_watch && has_wake {
@@ -305,9 +297,6 @@ pub fn stage() -> Stage {
                         _ => None,
                     };
                     let (verdict, detail) = triage(pick(Q_WEDGED), pick(Q_WORKING));
-                    // `Holds` for every verdict INCLUDING Unknown: a shrug is a
-                    // completed judgment, and this module cannot act on any of them,
-                    // so there is no safe direction for `Fails` to imply.
                     (Signal::Holds, format!("{}: {detail}", verdict.as_str()))
                 },
             },
@@ -342,12 +331,8 @@ mod tests {
         .expect("json");
         let v: serde_json::Value = serde_json::from_str(&evidence(&health)).expect("json");
         let c = &v["counters"];
-        // 2 of 18 = 11.1%. Computed here, not asked for.
         assert_eq!(c["watch"]["restart_budget_used_pct"], 11.1);
-        // 1s against a 60000ms (60s) ceiling = 1.7%. The UNIT MIX is the point: the
-        // raw operands are 1 and 60000, so a naive comparison is off by 1000x.
         assert_eq!(c["event_age_pct_of_deaf_ceiling"], 1.7);
-        // The alarming fields survive verbatim, with the reading note attached.
         assert_eq!(c["injection"]["injectable"], 0);
         assert_eq!(c["injection"]["panes_missing"], 13);
         let notes: String = v["how_to_read"]
@@ -389,9 +374,6 @@ mod tests {
         assert_eq!(v, Triage::Wedged, "{d}");
         let (v2, d2) = triage(Some(0.05), Some(0.93));
         assert_eq!(v2, Triage::Working, "{d2}");
-        // One confident signal is never enough: wedged-yes with working-unknown
-        // must not commit, or a model that only answers one question produces a
-        // label from half the evidence.
         let (v3, d3) = triage(Some(0.95), Some(0.5));
         assert_eq!(v3, Triage::Unknown, "{d3}");
     }
@@ -522,8 +504,6 @@ mod tests {
                 working: 0.05,
             },
         );
-        // bd-utzj: the composed stage carries the leaf verdict now, so no
-        // leaf re-run — the caller reads report.detail straight.
         assert!(
             composed.detail.contains("wedged=0.95") && composed.detail.contains("working=0.05"),
             "the verdict lives in the composed detail: {}",
@@ -536,9 +516,6 @@ mod tests {
     #[test]
     fn the_live_verdict_shape_commits_to_working() {
         let mut m = menu();
-        // The live brain: 0 of 18 restarts, 27s event age, 0 of 7 injectable, no
-        // degraded entries. `injectable: 0` is the alarming-looking field and the
-        // judgment must not fire on it.
         let body = r#"{"health":{"watch":{"restarts":0,"last_event_age_s":27,
                     "restart_budget_per_window":18},"wake":{"class":"Live","deaf_ceiling_ms":60000},
                     "sweep":{"last_age_s":2},"injection":{"pins":7,"injectable":0}}}"#;
@@ -559,8 +536,6 @@ mod tests {
             "{}",
             report.detail
         );
-        // Same probabilities, straight through triage: committed, and only because
-        // BOTH propositions cleared their opposite threshold.
         let (v, d) = triage(Some(0.15), Some(0.79));
         assert_eq!(v, Triage::Working, "{d}");
     }
@@ -576,8 +551,6 @@ mod tests {
             "wake": {"deaf_ceiling_ms": 60000},
         });
         let v: serde_json::Value = serde_json::from_str(&evidence(&health)).expect("json");
-        // 27s against 60s = 45.0%. A raw comparison of 27 vs 60000 would read as
-        // 0.045% — a 1000x error in the direction that HIDES a real problem.
         assert_eq!(v["counters"]["event_age_pct_of_deaf_ceiling"], 45.0);
     }
 
@@ -592,11 +565,6 @@ mod tests {
             vec![Q_WEDGED, Q_WORKING],
             "two Nouls, in the order triage reads them"
         );
-        // The trap must be in the QUESTION as well as the evidence, because a model
-        // reads the question most closely. I first asserted on the exact phrase
-        // "not a fault" and it failed — the question says "do not read a low
-        // injectable count or a low restart count as a fault on its own", which is
-        // the same instruction. Asserting the SUBSTANCE, not my phrasing of it.
         let wedged_q = &p.questions[0].instructions;
         assert!(
             wedged_q.contains("injectable") && wedged_q.contains("restart"),

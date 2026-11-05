@@ -270,9 +270,6 @@ impl SubscriptionStore {
     }
 
     pub fn unsubscribe(&mut self, _actor: Actor, id: &str) -> Result<Subscription, Refusal> {
-        // Unsubscribe is self-service (own row) or operator; ownership
-        // binds in Phase 2 with service identities — until then any local
-        // actor may drop a row (loud: the drop is journaled by the caller).
         self.subs
             .remove(id)
             .map(Ok)
@@ -367,13 +364,11 @@ mod tests {
             .expect("local hc subscribe");
         assert_eq!(back.id, "s1");
         assert_eq!(store.list().len(), 1);
-        // Durable: reopen reads it back.
         let store2 = SubscriptionStore::open(&dir);
         assert_eq!(
             store2.get("s1").unwrap().identity,
             Identity::Pin("p".into())
         );
-        // Unsubscribe roundtrips.
         let dropped = store.unsubscribe(Actor::local_process(), "s1").unwrap();
         assert_eq!(dropped.id, "s1");
         assert!(store.list().is_empty());
@@ -392,7 +387,6 @@ mod tests {
             store.subscribe(Actor::local_process(), hook.clone(), "w"),
             Err(Refusal::OperatorOnly(_))
         ));
-        // Operator passes.
         assert!(store.subscribe(Actor::operator(), hook, "w").is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -410,7 +404,6 @@ mod tests {
         store
             .subscribe(Actor::local_process(), with_project, "w")
             .expect("subscribe");
-        // Legacy JSON (pre-project rows on disk) still loads as None.
         let sub_path = dir.join("doorbell").join("subscriptions.json");
         let raw = std::fs::read_to_string(&sub_path).expect("persisted");
         let mut legacy: serde_json::Value = serde_json::from_str(&raw).expect("persisted json");
@@ -444,7 +437,6 @@ mod tests {
             Err(Refusal::OperatorOnly(_))
         ));
         assert!(store.subscribe(Actor::operator(), x, "w").is_ok());
-        // Budget raise above default needs the operator too.
         let mut rich = sub();
         rich.id = "rich".into();
         rich.budget = Budget {

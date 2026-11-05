@@ -103,8 +103,6 @@ pub fn resolve_build_stamp(observed: Option<(u64, u64)>, now_unix: u64) -> Build
     };
     stamp.exe_mtime_unix = Some(mtime);
     stamp.exe_len = Some(len);
-    // A future mtime means clock skew or a touched file. Report no age rather
-    // than a wrapped-around u64 that would read as a decades-old build.
     stamp.age_s = now_unix.checked_sub(mtime);
     stamp
 }
@@ -245,18 +243,15 @@ mod tests {
         let rows: Vec<serde_json::Value> = (10u64..=12)
             .map(|s| serde_json::json!({"seq": s, "executed": {"stage": "decided"}}))
             .collect();
-        // Fresh consumer replays everything.
         let Replay::Events(all) = replay_range(&rows, Some(10), None) else {
             panic!("fresh replay must stream");
         };
         assert_eq!(all.len(), 3);
         assert_eq!(all[0].id, 10);
-        // Reconnect at 11 resumes gap-free from 12.
         let Replay::Events(tail) = replay_range(&rows, Some(10), Some(11)) else {
             panic!("reconnect must resume");
         };
         assert_eq!(tail.iter().map(|e| e.id).collect::<Vec<_>>(), vec![12]);
-        // Cursor predating retention says the first replayable seq.
         assert!(matches!(
             replay_range(&rows, Some(10), Some(5)),
             Replay::Gone {
@@ -283,7 +278,6 @@ mod tests {
     #[test]
     fn doorbell_health_build_stamp_names_the_running_build() {
         let now = 1_000_000u64;
-        // The exact incident shape: built 8.9h ago and still answering.
         let eight_nine_h = 32_040u64;
         let stamp = resolve_build_stamp(Some((now - eight_nine_h, 4096)), now);
         assert_eq!(stamp.age_s, Some(eight_nine_h), "age is reported");
@@ -293,7 +287,6 @@ mod tests {
             !stamp.version.is_empty(),
             "a stamp with no version names no build"
         );
-        // Serializes, so `/health` can actually carry it.
         let json = serde_json::to_string(&stamp).expect("the stamp serializes");
         assert!(json.contains("\"age_s\""), "age is in the payload: {json}");
     }
@@ -336,7 +329,6 @@ mod tests {
         let newer = resolve_build_stamp(Some((now - 60, 4096)), now);
         assert_eq!(older.version, newer.version, "same version constant");
         assert_ne!(older.age_s, newer.age_s, "the age is what separates them");
-        // Same-second rebuild of a DIFFERENT size is still separable.
         let resized = resolve_build_stamp(Some((now - 60, 8192)), now);
         assert_ne!(
             newer.exe_len, resized.exe_len,

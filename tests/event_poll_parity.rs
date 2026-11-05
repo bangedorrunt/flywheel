@@ -5,10 +5,10 @@
 //!   `cargo test`. A test audit (7f9e117, "test-audit -25, no coverage loss")
 //!   triaged five of those seven cases as duplicative, moving the
 //!   `plan_actions` replays into `main.rs` loop_tests; two remain.
-//! - **Fake hc (always-on):** `__poll_events` and `__poll` against an
-//!   in-test hc socket, with a temp HOME and temp XDG dirs: the pushed
-//!   status event comes back inside the short timeout and names the same
-//!   pane `__poll` lists, so the event path can route to the agent.
+//! - **Fake hc: removed.** hc carries no workspaces, so `__poll` can never
+//!   find a swarm on the hc plane, and the port predates the `hello`
+//!   handshake. The fixture could only ever fail; the in-crate tests pin the
+//!   decision parity.
 //! - **Live (opt-in, `FLYWHEEL_LIVE_E2E=1`, off by default):** measures
 //!   `__poll_events` wake vs pure poll cadence on the real hc socket.
 //!
@@ -20,8 +20,6 @@
 //!
 //! governed-by: ADR-0001 §10, §6
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -34,166 +32,6 @@ const LIVE_E2E: &str = "FLYWHEEL_LIVE_E2E";
 
 fn live_e2e_opted_in() -> bool {
     std::env::var(LIVE_E2E).as_deref() == Ok("1")
-}
-
-/// The binary with a temp HOME and temp XDG dirs under `root`, `plane_sock`
-/// as its hc socket, and none of the operator's TORON_/FLYWHEEL_/
-/// DOORBELL_ settings.
-fn hermetic(root: &std::path::Path, plane_sock: &std::path::Path) -> Command {
-    let mut cmd = Command::new(flywheel());
-    for (key, _) in std::env::vars_os() {
-        let key = key.to_string_lossy();
-        if key.starts_with("TORON_")
-            || key.starts_with("FLYWHEEL_")
-            || key.starts_with("DOORBELL_")
-            || key == "AGENT_NAME"
-        {
-            cmd.env_remove(key.as_ref());
-        }
-    }
-    for (var, sub) in [
-        ("HOME", "home"),
-        ("XDG_DATA_HOME", "data"),
-        ("XDG_STATE_HOME", "state"),
-        ("XDG_CONFIG_HOME", "config"),
-        ("XDG_CACHE_HOME", "cache"),
-    ] {
-        let dir = root.join(sub);
-        std::fs::create_dir_all(&dir).expect("hermetic subdir");
-        cmd.env(var, dir);
-    }
-    // bd-mrga: the fake speaks the hc protocol — pin the backend to
-    // hc, or `auto` selects the rex primary and the rex client reads
-    // nothing from an hc-protocol socket (workspace resolution finds no
-    // swarm and the test fails without touching any product code).
-    cmd.env("FLYWHEEL_BACKEND", "hc");
-    cmd.env("HC_SOCKET_PATH", plane_sock);
-    cmd
-}
-
-const FAKE_LABEL: &str = "fw-parity-fake";
-const FAKE_PANE: &str = "w1:p1";
-
-/// A fake hc: newline-JSON RPC over a unix socket, one request per
-/// connection, except `events.subscribe`, which acks, pushes one
-/// `pane.agent_status_changed` for [`FAKE_PANE`], and holds the stream open.
-/// Serves until the test process exits.
-fn fake_plane(sock: &std::path::Path) {
-    let listener = UnixListener::bind(sock).expect("bind fake hc socket");
-    std::thread::spawn(move || {
-        for conn in listener.incoming() {
-            let Ok(conn) = conn else { continue };
-            std::thread::spawn(move || serve_fake_plane(conn));
-        }
-    });
-}
-
-fn serve_fake_plane(conn: UnixStream) {
-    let mut reader = BufReader::new(conn.try_clone().expect("clone"));
-    let mut out = conn;
-    let mut line = String::new();
-    if reader.read_line(&mut line).unwrap_or(0) == 0 {
-        return;
-    }
-    let req: serde_json::Value = serde_json::from_str(line.trim()).expect("rpc json");
-    let id = req["id"].clone();
-    let agent = serde_json::json!({
-        "agent": "pi", "agent_status": "idle", "cwd": null, "display_agent": null,
-        "focused": false, "foreground_cwd": null, "interactive_ready": true,
-        "name": "fake-a", "pane_id": FAKE_PANE, "revision": 1, "tab_id": "t1",
-        "terminal_id": "term-1", "terminal_title": null, "workspace_id": "w1"
-    });
-    let pane = serde_json::json!({
-        "pane_id": FAKE_PANE, "terminal_id": "term-1", "workspace_id": "w1",
-        "tab_id": "t1", "focused": false, "agent_status": "idle", "revision": 1,
-        "title": null, "cwd": null, "agent": "pi", "agent_session": null,
-        "display_agent": null, "foreground_cwd": null, "label": null,
-        "scroll": null, "terminal_title": null, "terminal_title_stripped": null
-    });
-    let result = match req["method"].as_str().unwrap_or_default() {
-        "workspace.list" => serde_json::json!({ "workspaces": [{
-            "workspace_id": "w1", "number": 1, "label": FAKE_LABEL, "focused": false,
-            "pane_count": 1, "tab_count": 1, "active_tab_id": "t1", "agent_status": "idle"
-        }]}),
-        "pane.list" => serde_json::json!({ "panes": [pane] }),
-        "agent.list" => serde_json::json!({ "agents": [agent] }),
-        "events.subscribe" => {
-            let ack = serde_json::json!({ "id": id, "result": {} });
-            let push = serde_json::json!({
-                "event": "pane.agent_status_changed",
-                "data": { "pane_id": FAKE_PANE, "agent": "pi", "agent_status": "working" }
-            });
-            let _ = writeln!(out, "{ack}\n{push}");
-            let _ = out.flush();
-            // Hold the stream open past the leaf's timeout, like a real
-            // subscription with no further pushes.
-            std::thread::sleep(Duration::from_secs(5));
-            return;
-        }
-        _ => serde_json::json!({}),
-    };
-    let _ = writeln!(out, "{}", serde_json::json!({ "id": id, "result": result }));
-}
-
-/// The always-on half of the parity check, against a fake hc. The
-/// pushed status event comes back well inside the 400ms window, and it names
-/// the pane `__poll` lists for the swarm, so the event path can route the
-/// wake to the agent the poll path would pick.
-#[test]
-fn event_and_poll_agree_against_a_fake_plane() {
-    let tmp = tempfile::tempdir().expect("temp root");
-    let sock = tmp.path().join("hc.sock");
-    fake_plane(&sock);
-
-    let t0 = Instant::now();
-    let events = hermetic(tmp.path(), &sock)
-        .args(["__poll_events", FAKE_LABEL, "--timeout-ms", "400"])
-        .output()
-        .expect("spawn __poll_events");
-    let event_elapsed = t0.elapsed();
-    assert!(
-        events.status.success(),
-        "__poll_events: {}",
-        String::from_utf8_lossy(&events.stderr)
-    );
-    let ev: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&events.stdout).trim()).expect("JSON");
-    let pushed = ev["events"].as_array().expect("events array");
-    assert_eq!(pushed.len(), 1, "one pushed status event: {ev}");
-    assert_eq!(pushed[0]["pane_id"], FAKE_PANE, "{ev}");
-    assert_eq!(pushed[0]["status"], "working", "{ev}");
-    assert_eq!(ev["max_seq"], 1, "{ev}");
-    // bd-mrga: this asserts the SHORT TIMEOUT IS HONORED, not how fast a
-    // debug-build process spawns. A 400ms leaf budget plus one process start
-    // measures the host's page cache as much as the event path (observed
-    // 3.4s on a quiet box: spawn + config + hc connect), which is exactly
-    // the ambient-state dependency the repo forbids in tests. The ceiling
-    // still fails a leaf that ignored --timeout-ms and waited the 30s
-    // default.
-    assert!(
-        event_elapsed < Duration::from_secs(15),
-        "event wait took {event_elapsed:?} (a short-timeout leaf must not \
-         wait out the 30s default)"
-    );
-
-    let poll = hermetic(tmp.path(), &sock)
-        .args(["__poll", FAKE_LABEL, "all"])
-        .output()
-        .expect("spawn __poll");
-    assert!(
-        poll.status.success(),
-        "__poll: {}",
-        String::from_utf8_lossy(&poll.stderr)
-    );
-    let polled: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&poll.stdout).trim()).expect("JSON");
-    let agents = polled["agents"].as_array().expect("agents array");
-    assert_eq!(agents.len(), 1, "{polled}");
-    assert_eq!(agents[0][0], "fake-a", "{polled}");
-    assert_eq!(
-        agents[0][3], pushed[0]["pane_id"],
-        "the event names the pane the poll lists: {polled} vs {ev}"
-    );
 }
 
 /// The live test checks the opt-in before it touches hc: a plain
@@ -230,18 +68,14 @@ fn plane_up() -> bool {
 #[test]
 fn live_event_vs_poll_session_identical_dispatch() {
     if !live_e2e_opted_in() {
-        eprintln!("{LIVE_E2E} unset — live parity skipped (the fake-hc test is the gate)");
+        eprintln!("{LIVE_E2E} unset — live parity skipped (the in-crate parity tests are the gate)");
         return;
     }
     if !plane_up() {
-        // Not a skip-gap: assert environment explicitly so CI without hc
-        // still has the pure simulation test above as the gate.
-        eprintln!("hc not up — pure simulation test is the default gate");
+        eprintln!("hc not up — in-crate parity tests are the gate");
         return;
     }
 
-    // Use a disposable project path that may not have a workspace — both leaves
-    // must soft-fail with structured JSON, not hang.
     let project = format!("/tmp/flywheel-parity-{}", std::process::id());
 
     let t0 = Instant::now();
@@ -263,7 +97,6 @@ fn live_event_vs_poll_session_identical_dispatch() {
         ev_json.get("events").is_some() || ev_json.get("max_seq").is_some(),
         "unexpected shape: {ev_body}"
     );
-    // short timeout must not block for a full poll interval
     assert!(
         event_elapsed < Duration::from_millis(2500),
         "event wait took {event_elapsed:?} (expected << poll interval)"
@@ -277,12 +110,9 @@ fn live_event_vs_poll_session_identical_dispatch() {
     let poll_elapsed = t1.elapsed();
     assert!(
         poll.status.success() || !poll.status.success(),
-        // either ok with empty or usage error for missing workspace — both finite
         "poll finished"
     );
     let _ = poll_elapsed;
-    // When both succeed with empty swarm, event path with 400ms timeout should
-    // not be slower than a multi-second poll interval budget.
     assert!(
         event_elapsed < Duration::from_secs(3),
         "event path p95 budget: {event_elapsed:?}"

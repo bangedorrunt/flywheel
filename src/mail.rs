@@ -112,9 +112,9 @@ fn init_once<T: Send + Sync + 'static>(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(v) = cell.get() {
-        return Ok(v); // lost the race; the winner's value is the answer
+        return Ok(v);
     }
-    let built = build()?; // a failure returns HERE, leaving the cell empty
+    let built = build()?;
     let _ = cell.set(built);
     cell.get()
         .ok_or_else(|| "init_once: value lost to a concurrent build".to_string())
@@ -276,16 +276,11 @@ fn dir_holds_live_store(built: Option<&std::path::Path>, dir: &std::path::Path) 
 /// key it bound. Keys already landed under the shared `projects/<slug>/`
 /// tree; only the index forked. Unify it.
 pub fn mailbox_roots() -> (PathBuf, PathBuf) {
-    // `TORON_DATA_DIR` wins (blank counts as unset — flywheel's old trim
-    // semantics); `TORON_MCP_DATA_DIR` is the demo/test isolation alias;
-    // otherwise the durable D3 default via resolve_data_root.
     let toron_data_dir = std::env::var("TORON_DATA_DIR")
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .map(PathBuf::from);
-    // bd-enov: toron's shared index (`ToronPaths::index_path`), NOT a
-    // private flywheel mail store — the identity plane is one roster.
     let db_at = |root: &Path| root.join("index.sqlite");
     if toron_data_dir.is_none()
         && let Ok(dir) = std::env::var("TORON_MCP_DATA_DIR")
@@ -298,10 +293,6 @@ pub fn mailbox_roots() -> (PathBuf, PathBuf) {
         toron_data_dir,
         xdg_data_home: env_non_empty_os("XDG_DATA_HOME"),
         home: env_non_empty_os("HOME"),
-        // bd-fize: a cargo TEST binary, or a binary inside a cargo target dir
-        // (what a test spawns), resolves its sandbox instead of the
-        // operator's live store. The flywheel's caller takes toron's own
-        // ambient answer, or a test writes into the operator's index.
         sandbox: toron_core::config::DataRootEnv::from_ambient().sandbox,
     };
     let root = toron_core::config::resolve_data_root(&env);
@@ -378,11 +369,6 @@ pub fn pin_test_mail_root_once() {
     if PINNED.get().is_some() {
         return;
     }
-    // Same-thread re-entry: tests routinely hold lock_env ACROSS
-    // from_config — a plain lock() here deadlocks the suite. try-lock and
-    // mutate under it when free; when the caller already holds it, the
-    // caller's guard IS the serialization — mutate directly (idempotent,
-    // same per-pid value).
     let _guard = crate::config::ENV_LOCK.try_lock().ok();
     pin_test_mail_root_set();
     let _ = PINNED.set(());
@@ -493,16 +479,9 @@ mod bd_vhia_migrate_hint_tests {
 }
 
 async fn build_mailbox() -> anyhow::Result<toron_core::mailbox::Mailbox> {
-    // Record the roots this store is built from: every reader that probes the
-    // live store takes the same pair (BUILT_ROOTS).
     let (data_dir, db) = BUILT_ROOTS.get_or_init(mailbox_roots).clone();
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("create mail data dir {}", data_dir.display()))?;
-    // bd-enov: a legacy private store means this process used to fork the
-    // identity plane. Name it (non-destructively — the file is left in
-    // place for the operator); never migrate silently.
-    // bd-d65y: stderr noise trains operators to ignore real warnings —
-    // show only under FLYWHEEL_VERBOSE (documented in .env.example).
     let legacy = db.with_file_name("flywheel-mail.sqlite");
     if legacy.exists()
         && !std::env::var("FLYWHEEL_VERBOSE")
@@ -581,8 +560,6 @@ pub fn inbox_row_ack_overdue(row: &Value, now_us: i64, sla_secs: u64) -> bool {
     {
         return false;
     }
-    // Absent or null `read_ts_us` both mean "no receipt" — unread is the
-    // honest default when the projection omits the field.
     if row.get("read_ts_us").is_some_and(|v| !v.is_null()) {
         return false;
     }
@@ -710,14 +687,8 @@ impl Mail {
         match cfg.and_then(|c| c.url.as_deref()) {
             Some(url) if !url.is_empty() => Self::remote(cfg),
             _ => {
-                // bd-zncc: every test-path construction pins a per-process
-                // mail root FIRST — see pin_test_mail_root_once.
                 #[cfg(test)]
                 pin_test_mail_root_once();
-                // Eager shared-runtime + mailbox build (se2.1 Phase A / c3b.1):
-                // failures propagate as errors here — no panic on runtime or
-                // mailbox construction failure, and every op reuses the one
-                // pre-built runtime.
                 init_mailbox()?;
                 Ok(Some(Self {
                     name: cfg
@@ -742,7 +713,7 @@ impl Mail {
         let client = McpClient::new(
             &url,
             cfg.and_then(|c| c.token.clone()),
-            ServerKind::Toron, // this facade IS the toron transport (ADR-0003 V1)
+            ServerKind::Toron,
         )
         .map_err(|e| anyhow::anyhow!("agent-mail remote daemon {url}: {e:#}"))?;
         Ok(Some(Self {
@@ -755,7 +726,6 @@ impl Mail {
     fn call_remote(&self, tool: &str, args: Value) -> Result<Value> {
         match &self.backend {
             BackendKind::Remote(client) => {
-                // McpError (Transport|Tool) -> anyhow via the blanket From.
                 client.call_tool(tool, args).map_err(anyhow::Error::from)
             }
             BackendKind::InProcess => bail!("{tool} requires the remote-daemon backend"),
@@ -770,10 +740,9 @@ impl Mail {
                 Ok(report.to_json())
             }
             BackendKind::Remote(_) => {
-                // `project_key` is unused by the toron tool; empty string.
                 let mut v =
                     self.call_remote("health_check", crate::backend::wire::health_check_args())?;
-                v["transport"] = json!("http"); // distinguishing marker: remote mode
+                v["transport"] = json!("http");
                 Ok(v)
             }
         }
@@ -793,10 +762,6 @@ impl Mail {
         }
     }
 
-    // bd-7bvi: production callers land with the pin-public-plane wave
-    // (spawn/loop startup switches projects to swarm mode); today only
-    // tests exercise it — allow dead_code outside tests so the clippy
-    // gate stays green until the wave wires it.
     #[cfg_attr(not(test), allow(dead_code))]
     /// bd-pin-public-plane-s-easy.2: switch a project to `swarm` identity
     /// D3/D4; open mode passes names through and the slug alone is not a
@@ -832,8 +797,6 @@ impl Mail {
                 Ok(Value::Array(agents.iter().map(ToJson::to_json).collect()))
             }
             BackendKind::Remote(_) => {
-                // Daemon envelope onto the in-process bare-array shape; loud
-                // on unrecognized shape (never a silent empty roster).
                 let v = self.call_remote(
                     "list_agents",
                     crate::backend::wire::list_agents_args(project_key, active_within_days),
@@ -962,11 +925,6 @@ impl Mail {
         urgent_only: bool,
         limit: u32,
     ) -> Result<Value> {
-        // bd-mail-surface-drift-7r2o: the flag is honored on BOTH backends —
-        // id-set parity with `inbox_filtered(urgent_only=true)` / MCP
-        // fetch_inbox(urgent_only). The legacy surface ignored it entirely,
-        // so --urgent callers (and anything counting "urgent" off this dump)
-        // saw every row regardless of importance.
         match &self.backend {
             BackendKind::InProcess => {
                 let msgs = block_on(mailbox().fetch_inbox(&FetchInbox {
@@ -1012,10 +970,6 @@ impl Mail {
         filter: &MailInboxFilter,
     ) -> Result<Value> {
         let now_us = chrono::Utc::now().timestamp_micros();
-        // bd-zd2v: the literal `last` is the daemon-side cursor
-        // (read-then-bump, resolved by the toron projection) — not RFC3339,
-        // so it bypasses timestamp parsing AND Remote client-side filtering
-        // (the server applies the cursor; filtering here would be wrong).
         let is_last = filter.since_ts.as_deref() == Some("last");
         let since_us = if is_last {
             None
@@ -1028,10 +982,6 @@ impl Mail {
         };
         match &self.backend {
             BackendKind::InProcess => {
-                // bd-55nx.12: since_ts is applied ONCE by the toron
-                // projection (fetch_inbox strict-newer, equal-ts excluded).
-                // No second retain here — two RFC3339 parsers can diverge
-                // on fractional seconds / offsets at the boundary.
                 let msgs = block_on(mailbox().fetch_inbox(&FetchInbox {
                     project_slug: project_key.to_string(),
                     agent_name: agent_name.to_string(),
@@ -1069,12 +1019,6 @@ impl Mail {
                         filter.thread_id.as_deref(),
                     ),
                 )?;
-                // Same policy on the wire rows (InboxMessageOut carries
-                // `importance` + `created_ts_us`): filter client-side.
-                // bd-zd2v: the daemon answers `{"messages": [...]}` (object),
-                // not a bare array — accept both shapes (the bare-array arm
-                // keeps InProcess-shaped remotes byte-identical). Without
-                // this every Remote filtered read (incl. --unread) is [].
                 let rows_src: Vec<Value> = match &v {
                     Value::Array(a) => a.clone(),
                     v => v
@@ -1101,9 +1045,6 @@ impl Mail {
                             .unwrap_or(true),
                         None => true,
                     })
-                    // bd-harvest-thread-filter-yp9r: belt-and-braces client
-                    // filter for remote backends whose projection cannot push
-                    // the thread predicate (AM parity rows carry thread_id).
                     .filter(|row| match &filter.thread_id {
                         Some(t) => row
                             .get("thread_id")
@@ -1112,8 +1053,6 @@ impl Mail {
                             .unwrap_or(false),
                         None => true,
                     })
-                    // bd-mail-ack-sla-tracking: the ack-overdue post-filter
-                    // runs on the wire rows too (same predicate, same clock).
                     .filter(|row| {
                         !filter.ack_overdue_only
                             || inbox_row_ack_overdue(row, now_us, ACK_SLA_DEFAULT_SECS)
@@ -1133,16 +1072,10 @@ impl Mail {
     ) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
-                // toron ids are hex event ids — pass through verbatim.
                 let r = block_on(mailbox().mark_message_read(project_key, agent_name, message_id))?;
                 Ok(r.to_json())
             }
             BackendKind::Remote(_) => {
-                // The remote daemon is toron (`[mail.toron] url`): its
-                // message ids are hex event ids and its `mark_message_read`
-                // tool takes a String — pass the id through verbatim, never
-                // coerce it to a number (se2.2; the deleted AM backend owned
-                // the decimal-id edge).
                 self.call_remote(
                     "mark_message_read",
                     crate::backend::wire::mark_read_args(
@@ -1159,15 +1092,11 @@ impl Mail {
     pub fn ack(&self, project_key: &str, agent_name: &str, message_id: &str) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
-                // toron ids are hex event ids — pass through verbatim.
                 let r =
                     block_on(mailbox().acknowledge_message(project_key, agent_name, message_id))?;
                 Ok(r.to_json())
             }
             BackendKind::Remote(_) => {
-                // Same as mark_message_read above: the toron daemon's
-                // `acknowledge_message` takes the hex event id as a String —
-                // pass it through verbatim (se2.2).
                 self.call_remote(
                     "acknowledge_message",
                     crate::backend::wire::ack_args(project_key, agent_name, json!(message_id)),
@@ -1202,10 +1131,6 @@ impl Mail {
         let now_us = chrono::Utc::now().timestamp_micros();
         let rows: Vec<Value> = match &self.backend {
             BackendKind::InProcess => {
-                // Guard the "empty because unknown" trap: an unregistered
-                // agent has no receipts, so the read would return an empty set
-                // that LOOKS like "nothing overdue". Fail loudly instead —
-                // this is exactly the distinction the escalation gate needs.
                 let canonical = block_on(mailbox().canonical_project(project_key));
                 if block_on(mailbox().agent_pubkey_hex(&canonical, agent_name)).is_none() {
                     return Err(anyhow!(
@@ -1214,10 +1139,6 @@ impl Mail {
                          an unknown identity is not 'nothing overdue')"
                     ));
                 }
-                // The projection applies `unread_only` + `urgent_only` +
-                // `thread_id` itself (per-recipient read state, importance
-                // scope, thread bound) — the row post-filter below is the
-                // same predicate the remote half uses, so both halves agree.
                 let msgs = block_on(mailbox().fetch_inbox(&FetchInbox {
                     project_slug: project_key.to_string(),
                     agent_name: agent_name.to_string(),
@@ -1235,9 +1156,6 @@ impl Mail {
                     .collect()
             }
             BackendKind::Remote(_) => {
-                // The daemon has no ack-overdue tool or resource read; a
-                // remote caller must not be handed an unfiltered inbox that
-                // LOOKS like an overdue set (c3b.3's no-silent-no-op rule).
                 return Err(anyhow!(
                     "toron ack_overdue: no remote projection (the daemon exposes no ack-overdue \
                      tool; toron://views/ack-overdue is a sender-side view of the unread write \
@@ -1255,8 +1173,6 @@ impl Mail {
                     .unwrap_or(0);
                 if let Some(obj) = row.as_object_mut() {
                     obj.insert("age_secs".into(), json!(age_secs));
-                    // name the SLA that produced the row, so a reader can
-                    // never mistake a 0-second gate for the 30-min default.
                     obj.insert("sla_secs".into(), json!(sla_secs));
                 }
                 row
@@ -1266,7 +1182,7 @@ impl Mail {
     }
 
     /// `send_message`.
-    #[allow(clippy::too_many_arguments)] // mirrors the MailBackend::send trait surface
+    #[allow(clippy::too_many_arguments)]
     pub fn send(
         &self,
         project_key: &str,
@@ -1310,32 +1226,14 @@ impl Mail {
         corr: Option<&str>,
         bead: Option<&str>,
     ) -> Result<Value> {
-        // bd-pncn: `all` (the broadcast token) is expanded to the project's
-        // registered roster BEFORE the backend call — the toron surfaces
-        // (in-process mailbox + daemon tool) reject a literal "all"
-        // recipient. Zero registered agents is a clear error.
         let targets = self.expand_broadcast(project_key, to)?;
-        // bd-pin-npub-binding-ggym: a name whose binding diverges from the key
-        // its pane acts under is a silent loss — the send reports ok and the
-        // recipient reads nothing. The mailbox owns name resolution, so ask it
-        // (`whois`) and refuse on positive two-sided divergence; a missing side
-        // is not evidence and still routes. One query per named recipient.
         guard_targets(&targets, |name| self.whois(project_key, name).ok())?;
-        // ADR-0010 D8 (bd-d8e4): a corr-preserving resend stamps the ORIGINAL
-        // corr — toron's idempotent claim dedupes within TTL and the receipt
-        // stays corr-keyed. The remote wire surface does not carry extra_tags,
-        // so refuse rather than silently drop the corr (a dropped corr is a
-        // NEW corr = duplicate).
         if corr.is_some() && matches!(self.backend, BackendKind::Remote(_)) {
             bail!(
                 "mail resend requires the in-process toron mailbox (no [mail.toron] url) — \
                  the remote wire surface cannot carry a corr tag"
             );
         }
-        // bd-7qg6: same refuse-don't-drop rule for the structural bead tag —
-        // a dropped bead tag is a `[bd-###] done` subject that never fires the
-        // dispatch-guard hold (the exact theater D9 was cut to kill). Remote
-        // callers use `toron mail send --resolve-bead` directly.
         if bead.is_some_and(|b| !b.trim().is_empty())
             && matches!(self.backend, BackendKind::Remote(_))
         {
@@ -1370,7 +1268,6 @@ impl Mail {
             }
             _ => extra_tags,
         };
-        // ADR-0010 D9 (bd-l0fz): structural done-hold tag. Empty = absent.
         if let Some(b) = bead.filter(|s| !s.trim().is_empty()) {
             extra_tags.push(
                 toron_core::nostr::Tag::parse(["bead", b.trim()])
@@ -1391,7 +1288,6 @@ impl Mail {
                     extra_tags,
                     ..Default::default()
                 }))?;
-                // Echo wake in the JSON receipt so operators see non-null.
                 let mut v = result.to_json();
                 if let Some(w) = wake.filter(|s| !s.is_empty())
                     && let Some(obj) = v.as_object_mut()
@@ -1458,18 +1354,12 @@ impl Mail {
         body: &str,
         to: Option<&[String]>,
     ) -> Result<Value> {
-        // toron's reply_message REQUIRES explicit recipients (no AM-style
-        // "default to original sender") — resolve the parent's sender from
-        // the inbox when the caller did not pass `to` (the common case:
-        // `flywheel mail reply --message-id X --body Y`).
         let to: Option<Vec<String>> = match to {
             Some(t) if !t.is_empty() => Some(t.to_vec()),
             _ => self.parent_sender(project_key, message_id)?,
         };
         match &self.backend {
             BackendKind::InProcess => {
-                // toron: the id IS the thread anchor (hex event id or the
-                // free-form thread id — both flow through the `thread` tag).
                 let result = block_on(mailbox().reply_message(&SendMessage {
                     project_slug: project_key.to_string(),
                     sender_name: self.name.clone(),
@@ -1487,8 +1377,6 @@ impl Mail {
                     project_key,
                     &self.name,
                     &to.unwrap_or_default(),
-                    // c3b.5: reply subject populated from the parent (`Re: `);
-                    // was hardcoded `""` (unverified wire contract).
                     &self.parent_reply_subject(project_key, message_id)?,
                     body,
                     "thread_id",
@@ -1656,10 +1544,6 @@ impl Mail {
                         filter.ranking.as_deref(),
                     ),
                 )?;
-                // The toron daemon already returns the envelope
-                // (`{"result": [...], "next_cursor": ...}`); legacy
-                // agent-mail returned a bare array. Pass the envelope
-                // through when present, else wrap.
                 Ok(match &res {
                     Value::Object(m) if m.contains_key("result") => res,
                     _ => json!({ "result": res }),
@@ -1667,10 +1551,6 @@ impl Mail {
             }
         }
     }
-
-    // (The former `Mail::search_args` wrapper is gone: the live `search_messages`
-    // arm builds its args through `backend::wire::search_args` directly, and the
-    // wrapper's only other caller was the deleted HTTP client.)
 
     /// `file_reservation_paths`.
     pub fn reserve(
@@ -1820,10 +1700,6 @@ impl Mail {
                 }))
             }
             BackendKind::Remote(_) => {
-                // bd-locks-list-daemon-xetz: the daemon exposes the lease
-                // board via the additive read tool (toron-mcp
-                // `list_file_reservations`) — same shape as the in-process
-                // arm, so `mail locks list` works at both ends of the seam.
                 let v = self.call_remote(
                     "list_file_reservations",
                     serde_json::json!({
@@ -1886,11 +1762,6 @@ impl Mail {
                     "file_reservations": r.reservations.iter().map(|res| json!({
                         "id": res.id,
                         "path_pattern": res.path_pattern,
-                        // bd-evqs: the reason (owning bead id) rides through
-                        // the renew envelope so the loop can release
-                        // reservations whose bead is CLOSED — the renewal
-                        // storm fix needs the holder to know WHAT each lease
-                        // is for.
                         "reason": res.reason,
                         "old_expires_ts": "",
                         "new_expires_ts": res.expires_ts_us.map(|u| u.to_string()).unwrap_or_default(),
@@ -1907,8 +1778,6 @@ impl Mail {
                         paths,
                     ),
                 )?;
-                // Remap the tool's `reservations` array onto the in-process
-                // `file_reservations` envelope `list_own_reservations` reads.
                 let mut out = json!({ "renewed": res.get("renewed").cloned().unwrap_or(json!(0)) });
                 let fr = res
                     .get("reservations")
@@ -1919,9 +1788,6 @@ impl Mail {
                                 json!({
                                     "id": r.get("id").cloned().unwrap_or(json!(0)),
                                     "path_pattern": r.get("path_pattern").cloned().unwrap_or(json!("")),
-                                    // bd-evqs: keep the reason through the
-                                    // remap (the loop's closed-bead sweep
-                                    // reads it to release stale leases).
                                     "reason": r.get("reason").cloned().unwrap_or(json!("")),
                                     "old_expires_ts": "",
                                     "new_expires_ts": r.get("expires_ts_us")
@@ -2014,8 +1880,6 @@ impl Mail {
             ),
         }
     }
-
-    // ---- cross-project contact + products (bd-mail-cross-project-contact) ----
 
     /// `request_contact`.
     pub fn request_contact(
@@ -2210,8 +2074,6 @@ impl Mail {
         }
     }
 
-    // ---- build slots (bd-mail-build-slot-gating) ----
-
     /// `acquire_build_slot`.
     pub fn acquire_slot(
         &self,
@@ -2306,8 +2168,6 @@ impl Mail {
         }
     }
 
-    // ---- pane identity bridge (bd-mail-pane-identity-bridge, ADR-0001 A4) ----
-
     /// Write the per-pane identity file the agent-mail server reads for
     /// `resolve_pane_identity`: `<config>/agent-mail/identity/<project_hash>/
     /// <pane_id>` containing `<name>\n`. A filesystem op, not an HTTP call —
@@ -2357,7 +2217,6 @@ impl Mail {
                     "source": "pane-token",
                 });
             }
-            // pane missing or unstamped → file bridge
         }
         let path = canonical_identity_path(project_key, pane_id);
         match std::fs::read_to_string(&path) {
@@ -2374,10 +2233,6 @@ impl Mail {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Pane identity files (bd-mail-pane-identity-bridge, ADR-0001 A4)
-// ---------------------------------------------------------------------------
-
 /// c3b.7: is hc the ACTIVE multiplexer? Distinguishes "hc is the
 /// configured mux but the daemon is down" (a REAL failure the caller must
 /// see) from "the mux is not hc" (cleanup genuinely not applicable).
@@ -2388,8 +2243,6 @@ fn multiplexer_is_hc() -> bool {
     crate::config::Config::load()
         .map(|cfg| crate::backend::factory::resolve_backend_name(&cfg))
         .unwrap_or_else(|_| {
-            // Config unreadable (e.g. tests without a config file): env or
-            // the documented default.
             std::env::var("FLYWHEEL_BACKEND")
                 .ok()
                 .filter(|s| !s.is_empty())
@@ -2397,17 +2250,6 @@ fn multiplexer_is_hc() -> bool {
         })
         == "hc"
 }
-
-//
-// flywheel's bridge for hc panes: legacy pane backends wrote per-pane
-// identity files; hc terminals (`hc:t7`) never get one, so
-// `resolve_pane_identity` can't discover agents spawned by flywheel. The
-// bridge writes the same file agent-mail core would have: 12-hex-char SHA-1
-// of the canonicalized absolute project path as the directory name, the
-// sanitized pane id as the filename, the agent name as a single trimmed line.
-// All derivation + format details below were verified byte-for-byte against
-// the live agent-mail server on 2026-08-05 (probe file resolved with the
-// exact `identity_path` returned).
 
 /// Config base for identity files: `$XDG_CONFIG_HOME` when set, else
 /// `~/.config` — identical to agent-mail core's `config_base_dir()`, so the
@@ -2702,14 +2544,11 @@ mod tests {
             "the divergent name is refused first and an explicit npub is never queried"
         );
 
-        // Without the divergent recipient the same targets go through, and the
-        // npub target is still never queried.
         asked.borrow_mut().clear();
         let ok_targets = vec!["Someone".to_string(), "npub1qqqqqqqqqq".to_string()];
         guard_targets(&ok_targets, whois).expect("bound + npub route");
         assert_eq!(*asked.borrow(), vec!["Someone".to_string()]);
 
-        // A name the mailbox cannot answer for is not divergence.
         asked.borrow_mut().clear();
         guard_targets(&["Nobody".to_string()], whois).expect("absence routes");
         assert_eq!(*asked.borrow(), vec!["Nobody".to_string()]);
@@ -2815,23 +2654,16 @@ mod tests {
     /// wins; `TORON_MCP_DATA_DIR` stays the demo/test isolation alias.
     #[test]
     fn mailbox_roots_env_and_default() {
-        // Env mutation is process-global — serialize under the crate-wide
-        // env lock (193.2); siblings (factory FLYWHEEL_MAIL, config XDG)
-        // share the same lock.
         let _g = crate::config::lock_env();
         unsafe { std::env::set_var("TORON_DATA_DIR", "/tmp/flywheel-se2.1-durable") };
         unsafe { std::env::set_var("TORON_MCP_DATA_DIR", "/tmp/flywheel-se2.1-mcp") };
         unsafe { std::env::set_var("XDG_DATA_HOME", "/tmp/flywheel-se2.1-xdg") };
         let (data_dir, db) = mailbox_roots();
-        // bd-hdec: the mailbox data dir carries the canonical `projects/`
-        // segment (toron parity) while the index stays at the root.
         assert_eq!(
             data_dir,
             PathBuf::from("/tmp/flywheel-se2.1-durable/projects"),
             "canonical projects/ segment (bd-hdec)"
         );
-        // bd-enov: ONE index — the file toron's ToronPaths::index_path()
-        // resolves, never a private flywheel-mail.sqlite.
         assert_eq!(
             db,
             PathBuf::from("/tmp/flywheel-se2.1-durable/index.sqlite")
@@ -2867,14 +2699,8 @@ mod tests {
             "no pid-scoped sqlite"
         );
         unsafe { std::env::remove_var("XDG_DATA_HOME") };
-        // Non-scratch on purpose: /tmp/* counts as scratch (is_scratch),
-        // which would honour it as a fixture home. A fake operator home
-        // must live outside scratch for this assertion to mean anything.
         unsafe { std::env::set_var("HOME", "/home/flywheel-se2.1-home") };
         let (data_dir, _) = mailbox_roots();
-        // bd-fize: HOME is not an explicit pin — in a TEST process it must
-        // not resolve to a live-looking root. The temp root wins instead, so
-        // a test never writes identities into a real-looking store.
         assert!(
             !data_dir.starts_with("/home/flywheel-se2.1-home"),
             "bare HOME in a test process must not resolve under HOME: {data_dir:?}"
@@ -2885,8 +2711,6 @@ mod tests {
         );
         unsafe { std::env::remove_var("HOME") };
         let (data_dir, db) = mailbox_roots();
-        // Same with nothing set at all: the relative `toron-data` fallback
-        // is production-only; a test process gets temp, never relative.
         assert!(
             data_dir.starts_with(std::env::temp_dir()),
             "no env in a test process resolves to temp, never the relative fallback: {data_dir:?}"
@@ -2904,7 +2728,6 @@ mod tests {
     #[test]
     fn data_root_production_contract_is_pure() {
         use toron_core::config::{DataRootEnv, Sandbox, SandboxKind, resolve_data_root};
-        // An explicit pin wins even in a test process.
         let env = DataRootEnv {
             toron_data_dir: Some(PathBuf::from("/env/root")),
             xdg_data_home: None,
@@ -2916,7 +2739,6 @@ mod tests {
             }),
         };
         assert_eq!(resolve_data_root(&env), PathBuf::from("/env/root"));
-        // Production HOME fallback, unchanged.
         let env = DataRootEnv {
             toron_data_dir: None,
             xdg_data_home: None,
@@ -2927,7 +2749,6 @@ mod tests {
             resolve_data_root(&env),
             PathBuf::from("/home/alice/.local/share/toron")
         );
-        // Production no-env fallback, unchanged.
         let env = DataRootEnv::default();
         assert_eq!(resolve_data_root(&env), PathBuf::from("toron-data"));
     }
@@ -3022,8 +2843,6 @@ mod tests {
     /// pair with no delete path (suppression is derived from the board).
     #[test]
     fn yielded_pairs_reads_the_live_board() {
-        // Reads the shared mail root — serialize under the crate-wide env
-        // lock; sibling env tests swap TORON_*_DATA_DIR.
         let _g = crate::config::lock_env();
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let project = "yield-pairs-board";
@@ -3042,7 +2861,6 @@ mod tests {
         )
         .expect("RoseDune holds the lane");
 
-        // No marker yet: a live lease alone yields no pair.
         assert!(
             mail.yielded_pairs(project).expect("read").is_empty(),
             "a live lease is not a stand-down"
@@ -3062,7 +2880,6 @@ mod tests {
             "a yield naming a live holder is a peer pair"
         );
 
-        // A yield naming a holder who holds nothing is inert.
         block_on(mailbox().record_reservation_yield(
             project,
             "BlueLake",
@@ -3077,7 +2894,6 @@ mod tests {
             "an unresolvable holder claims nothing"
         );
 
-        // Release: the pair clears, so the loop resumes the bead again.
         mail.release_paths(project, "RoseDune", &["src/**".into()])
             .expect("release");
         assert!(
@@ -3091,8 +2907,6 @@ mod tests {
     /// project creation, no identity registration.
     #[test]
     fn list_active_boards_and_filters() {
-        // bd-0rzv: reads the shared mail root — serialize under the
-        // crate-wide env lock; sibling env tests swap TORON_*_DATA_DIR.
         let _g = crate::config::lock_env();
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let project = "locks-list-board";
@@ -3184,13 +2998,10 @@ mod tests {
     /// must overwrite the task — never preserve the stale bead id.
     #[test]
     fn register_upsert_clears_stale_task_on_reuse() {
-        // bd-0rzv: reads the shared mail root — serialize under the
-        // crate-wide env lock; sibling env tests swap TORON_*_DATA_DIR.
         let _g = crate::config::lock_env();
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let project = "upsert-stale-task";
         mail.ensure_project(project).expect("ensure");
-        // Prior session: the agent self-registered with a stale bead task.
         mail.register_fixture(
             project,
             "flywheel-proj-oc",
@@ -3199,9 +3010,6 @@ mod tests {
             "bd-qk9q implementer: stranded-bead reclaim fix",
         )
         .expect("prior session registration");
-        // Swarm start: the spawn profile upserts the canonical name with a
-        // fresh task stamp (S8.3/S8.4 — the same call register_spawned_agent
-        // makes).
         let profile = crate::spawn_agent_profile("flywheel-proj-oc", "opencode", project);
         block_on(mailbox().register_agent(project, &profile)).expect("upsert");
         let who = mail.whois(project, "flywheel-proj-oc").expect("whois");
@@ -3372,13 +3180,7 @@ mod tests {
     /// send_message round trips so the projection is the code under test.
     #[test]
     fn inbox_honors_urgent_flag_parity_with_mcp() {
-        // bd-0rzv: reads the shared mail root — serialize under the
-        // crate-wide env lock; sibling env tests swap TORON_*_DATA_DIR.
         let _g = crate::config::lock_env();
-        // bd-mail-surface-drift-7r2o: `inbox(urgent_only=true)` must return
-        // the SAME id set as `inbox_filtered(urgent_only=true)` — the flag
-        // is not decorative. The legacy surface ignored it entirely, so an
-        // --urgent caller counted every row in an unfiltered dump.
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let project = format!("drift-urgent-{}", std::process::id());
         mail.ensure_project(&project).expect("project");
@@ -3427,8 +3229,6 @@ mod tests {
 
     #[test]
     fn inbox_filtered_applies_urgent_and_since_on_toron() {
-        // bd-0rzv: reads the shared mail root — serialize under the
-        // crate-wide env lock; sibling env tests swap TORON_*_DATA_DIR.
         let _g = crate::config::lock_env();
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let project = format!("c3b3-filter-{}", std::process::id());
@@ -3437,8 +3237,6 @@ mod tests {
             .expect("sender registered");
         mail.register_fixture(&project, "FilterRecv", "opencode", "test", "seed")
             .expect("recipient registered");
-        // The facade sends AS its own identity (`mail.name` = "flywheel") —
-        // it must be registered too or send_message fails on the local key.
         mail.register_fixture(&project, &mail.name, "opencode", "test", "seed")
             .expect("facade identity registered");
         let recv = vec!["FilterRecv".to_string()];
@@ -3452,7 +3250,6 @@ mod tests {
         send("normal-note", "normal");
         send("low-note", "low");
 
-        // urgent_only: only high/urgent rows survive.
         let urgent = mail
             .inbox_filtered(
                 &project,
@@ -3480,7 +3277,6 @@ mod tests {
         assert!(subjects.contains(&"urgent-note"), "urgent present");
         assert!(subjects.contains(&"high-note"), "high present");
 
-        // since_ts: only rows strictly newer than the bound survive.
         let since = chrono::Utc::now()
             .checked_sub_signed(chrono::Duration::seconds(3600))
             .expect("1h ago")
@@ -3509,7 +3305,6 @@ mod tests {
             "all four sent within the last hour: {recent_subjects:?}"
         );
 
-        // since_ts in the future: nothing matches.
         let future = chrono::Utc::now()
             .checked_add_signed(chrono::Duration::seconds(3600))
             .expect("1h ahead")
@@ -3540,8 +3335,6 @@ mod tests {
     /// the thread, not a full-inbox drain.
     #[test]
     fn inbox_filtered_applies_thread_filter_on_toron() {
-        // bd-0rzv: reads the shared mail root — serialize under the
-        // crate-wide env lock; sibling env tests swap TORON_*_DATA_DIR.
         let _g = crate::config::lock_env();
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let project = format!("harvest-thread-{}", std::process::id());
@@ -3655,11 +3448,7 @@ mod tests {
     /// either reason. Ending on `busy-*` keeps the two answers distinct.
     #[test]
     fn a_thread_scoped_read_survives_a_limit_smaller_than_the_inbox() {
-        // Reads the shared mail root — serialize under the crate-wide env lock;
-        // sibling env tests swap TORON_*_DATA_DIR.
         let _g = crate::config::lock_env();
-        // Unique per run: a pid-only slug re-runs accumulate into the same
-        // project and the exact-count assertions below would drift.
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -3675,9 +3464,6 @@ mod tests {
             .expect("facade identity registered");
         let recv = vec!["LimitRecv".to_string()];
 
-        // Interleaved, and the last two sends are the OTHER thread. Distinct
-        // subjects: `collapse_duplicates` folds identical (sender, subject,
-        // body) rows.
         for (subject, thread) in [
             ("reply-a", "target-thread"),
             ("busy-a", "busy-thread"),
@@ -3707,9 +3493,6 @@ mod tests {
                 .collect()
         };
 
-        // Contract 1: the un-scoped window is the newest rows of the WHOLE
-        // inbox, which here are the last two sends — and they belong to the
-        // other thread.
         let unscoped = mail
             .inbox_filtered(
                 &project,
@@ -3727,8 +3510,6 @@ mod tests {
             "the store limit is a NEWEST-N window, not an oldest-N head"
         );
 
-        // Contract 2: the same limit, scoped, is the newest rows OF THE THREAD
-        // — a different answer, which is what proves the filter ran first.
         let scoped = mail
             .inbox_filtered(
                 &project,
@@ -3754,7 +3535,6 @@ mod tests {
     /// never a silent unfiltered inbox.
     #[test]
     fn inbox_filtered_ack_overdue_is_a_real_read() {
-        // bd-0rzv: reads the shared mail root — serialize under the env lock.
         let _g = crate::config::lock_env();
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let project = format!("c3b3-ackoverdue-{}", std::process::id());
@@ -3792,9 +3572,6 @@ mod tests {
             1,
             "the ack-required mail is in the plain inbox"
         );
-        // The row is unacked BUT younger than the 30-min SLA: the filter is a
-        // real predicate, not an unfiltered passthrough (the c3b.3 rule —
-        // never a silent no-op).
         let filtered = mail
             .inbox_filtered(
                 &project,
@@ -3852,8 +3629,6 @@ mod tests {
             sla_secs: Some(0),
             thread_id: Some("health-SlaRecv".into()),
         };
-        // Unacked ping → the gate reports exactly it, with its age + the SLA
-        // that produced the row (a 0-second gate must say so).
         let rows = mail
             .ack_overdue(&project, "SlaRecv", &gate)
             .expect("ack-overdue read");
@@ -3863,7 +3638,6 @@ mod tests {
         assert!(rows[0]["age_secs"].is_u64(), "age is reported");
         assert_eq!(rows[0]["thread_id"].as_str(), Some("health-SlaRecv"));
 
-        // The recipient acks → the read is empty (the handling fact).
         mail.ack(&project, "SlaRecv", &message_id)
             .expect("ack the ping");
         let after = mail
@@ -3874,7 +3648,6 @@ mod tests {
             "ack clears the row: {after}"
         );
 
-        // A sibling read narrowed to another thread sees nothing.
         let other_thread = mail
             .ack_overdue(
                 &project,
@@ -3938,10 +3711,6 @@ mod tests {
 
     #[test]
     fn inbox_filtered_since_applied_once_by_toron() {
-        // bd-55nx.12 RED: the InProcess arm must not re-filter since_ts —
-        // toron's fetch_inbox already applies it (strict-newer). Two
-        // RFC3339 parsers can diverge at the boundary.
-        // (needle split so this self-scan does not match its own source)
         let needle = ["created_ts_us >", " s"].concat();
         let src = include_str!("mail.rs");
         assert!(
@@ -3952,11 +3721,7 @@ mod tests {
 
     #[test]
     fn inbox_filtered_since_boundary_equal_ts_excluded() {
-        // bd-0rzv: reads the shared mail root — serialize under the
-        // crate-wide env lock; sibling env tests swap TORON_*_DATA_DIR.
         let _g = crate::config::lock_env();
-        // bd-55nx.12: a row stamped exactly at the bound is excluded once
-        // (toron uses strict-newer), never twice-wrong.
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let project = format!("since-bound-{}", std::process::id());
         mail.ensure_project(&project).expect("project");
@@ -4023,7 +3788,6 @@ mod tests {
     fn cleanup_pane_identities_plane_down_is_err() {
         let _g = crate::config::lock_env();
         unsafe { std::env::set_var("FLYWHEEL_BACKEND", "hc") };
-        // Point the hc socket at a dead path so connect fails fast.
         unsafe { std::env::set_var("HC_SOCKET_PATH", "/tmp/flywheel-c3b7-dead.sock") };
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let err = mail
@@ -4090,7 +3854,6 @@ mod tests {
             Some("DustySparrow".to_string()),
             "stamp beats the stale occupant name"
         );
-        // Degradation: dead socket → file bridge, file-miss shape, no error.
         let _g = crate::config::lock_env();
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
         unsafe { std::env::set_var("HC_SOCKET_PATH", "/tmp/flywheel-k6cw-dead.sock") };
@@ -4133,7 +3896,7 @@ mod cleanup_test_data_dir_tests {
     #[test]
     fn a_missing_dir_is_not_an_error() {
         let dir = std::env::temp_dir().join(format!("fw-cleanup-none-{}", uuid::Uuid::new_v4()));
-        cleanup_test_data_dir(&dir); // must not panic
+        cleanup_test_data_dir(&dir);
     }
 
     /// bd-gpaa: THE defect. `BUILT_ROOTS` holds the Mailbox DATA dir
@@ -4222,8 +3985,6 @@ mod init_once_tests {
     fn a_failed_build_is_retried_and_a_later_success_sticks() {
         static CELL: OnceLock<u32> = OnceLock::new();
         static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        // A fresh cell per test would need a `&'static`; statics in a test fn
-        // are per-test-binary, so each test names its own pair.
 
         let first = init_once(&CELL, &GATE, || Err("no such directory".to_string()));
         assert_eq!(
@@ -4397,7 +4158,6 @@ mod locks_list_tests {
         assert_eq!(board["count"], 1);
         assert_eq!(board["reservations"][0]["holder"], "BlueLake");
         assert_eq!(board["reservations"][0]["path"], "src/**");
-        // degenerate daemon reply: empty rows still a well-formed board
         let empty = remotes_to_board("x", json!({}));
         assert_eq!(empty["count"], 0);
         assert_eq!(
@@ -4433,10 +4193,8 @@ mod agents_list_tests {
         let envelope = json!({"agents": [{"name": "BlueLake", "npub": "abc"}]});
         let arr = remotes_to_agents(envelope).expect("envelope unwraps");
         assert_eq!(arr.as_array().expect("array").len(), 1);
-        // bare-array passthrough (in-process shape / newer daemon)
         let bare = json!([{"name": "BlueLake"}]);
         assert!(remotes_to_agents(bare).expect("passthrough").is_array());
-        // degenerate: loud error, never silent empty
         assert!(remotes_to_agents(json!({})).is_err());
         assert!(remotes_to_agents(json!({"agents": "nope"})).is_err());
     }

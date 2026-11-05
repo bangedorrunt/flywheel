@@ -85,8 +85,6 @@ pub fn split_topology(t: &str) -> (&str, bool) {
     if t == "join" {
         ("swarm", true)
     } else if t == "loop" {
-        // Loop is the work unit, not a mode. A stored "loop" session stays
-        // in this pane and does not spawn a crew.
         ("open", false)
     } else {
         (t, false)
@@ -251,8 +249,6 @@ pub fn missing_required_inputs(primitive: &str, objective: &str) -> Vec<&'static
 pub fn named_harness(objective: &str) -> Option<&'static str> {
     let lower = objective.to_ascii_lowercase();
     for word in lower.split(|c: char| !c.is_ascii_alphanumeric()) {
-        // No longest-first pass is needed: a word is already split, so `oc`
-        // can never shadow `opencode`. Resolution is exact, and fenced as such.
         if let Some(spec) = crate::harness_registry::spec(word) {
             return Some(spec.canonical);
         }
@@ -403,9 +399,6 @@ pub fn assemble(
         unique: unique_roles.len() as u32,
         cap,
     });
-    // bd-drlm: the menu is built from the same `n` the crew is packed to, so
-    // "varied by number of crews" is a function of the real budget rather than
-    // a separate guess.
     let harness_menu = catalog.map(|c| crate::crew_menu::harness_menu(c, n));
     let mut remove = Vec::new();
     for (from, to) in &packed.aliases {
@@ -428,17 +421,10 @@ pub fn assemble(
         argv.push("--crew".into());
         argv.push(n.to_string());
     }
-    // workflow run/compose preflight requires a project. The classifier
-    // builds argv without one, so the printed command died on "no project".
     splice_project(&mut argv, &world.project);
     splice_named_harness(&mut argv, objective);
 
     let mut missing = missing_required_inputs(decision.primitive, objective).to_vec();
-    // bd-compose-plumbing-zdzi: a compose token's declared inputs that this
-    // process can derive are bound into the argv it emits (`--inputs`); the
-    // underivable ones join `missing` below — a run is never emitted with a
-    // silently empty escalation target. Only a real compose argv binds (a
-    // join/arrive argv carries no `{{inputs.*}}` to resolve).
     let binds_compose = argv
         .windows(2)
         .any(|w| w[0] == "workflow" && w[1] == "compose");
@@ -470,8 +456,6 @@ pub fn assemble(
     let token = is_compose_token(decision.primitive).then(|| decision.primitive.to_string());
 
     // governed-by: bd-7lms — every decide family gets a visible alternative
-    // so no stack scenario (refactor, cron, coalition, debate, forensics,
-    // steer, joinable) falls off the briefing surface silently.
     let mut alternatives = vec![
         Alternative {
             topology: "open".into(),
@@ -542,9 +526,6 @@ pub fn assemble(
         alternatives,
         harness_menu,
         stale_build: None,
-        // bd-drlm: `assemble` is PURE and stays that way — no network, no clock.
-        // The Jev pass runs in the CALLER (cmd_briefing) and writes this line, so
-        // the ranking cannot leak into the pure core that derives the menu.
         harness_ranking: None,
         mode_text: mode_text(mode_of(&topology)).to_string(),
         questions: vec![
@@ -599,11 +580,9 @@ pub fn align_with_session_topology(b: &mut Briefing, session: &str, sticky_held:
     if session.is_empty() {
         return;
     }
-    // `join` is a swarm option: compare and set (topology, join) pairs.
     let (session_topology, session_join) = split_topology(session);
     if b.proposal.topology == session_topology && b.proposal.join == session_join {
         if sticky_held {
-            // Airtight print: never leave invent swarm primitive in why under open/loop hold.
             if b.proposal.why.contains("wave-swarm")
                 || b.proposal.why.contains("repair-until-verified")
                 || b.proposal.why.contains("beads-lifecycle")
@@ -628,7 +607,6 @@ pub fn align_with_session_topology(b: &mut Briefing, session: &str, sticky_held:
         q.default = session_topology.to_string();
     }
     let prior_why = if sticky_held {
-        // Do not echo invent swarm/join/loop primitive names into the print surface.
         format!("suppressed invent topology={classified}")
     } else {
         b.proposal.why.clone()
@@ -637,7 +615,6 @@ pub fn align_with_session_topology(b: &mut Briefing, session: &str, sticky_held:
         "session_topology={session}{} — aligned ({prior_why})",
         if sticky_held { " sticky-held" } else { "" },
     );
-    // ALL sticky-held cases — not only classified∈{swarm,join}.
     if sticky_held {
         rewrite_sticky_held_argv(b, session);
     }
@@ -658,10 +635,6 @@ fn is_invent_spawn_under_open(workflow: &str) -> bool {
 fn rewrite_sticky_held_argv(b: &mut Briefing, session: &str) {
     match session {
         "open" => {
-            // Every sticky-held open path is cleared. A pane workflow such as
-            // hillclimb is an invent spawn the same way a compose token is.
-            // An input refusal may already have emptied argv. That is still
-            // an invent vehicle and must not panic the door.
             debug_assert!(
                 is_invent_spawn_under_open(&b.proposal.workflow) || !b.proposal.workflow.is_empty(),
                 "sticky-held open expected a classified vehicle, got workflow={} argv={:?}",
@@ -687,7 +660,6 @@ fn rewrite_sticky_held_argv(b: &mut Briefing, session: &str) {
             }
         }
         "loop" => {
-            // Hold loop against invent swarm: loop vehicle only (no wave-swarm).
             b.proposal.workflow = "loop-work".into();
             b.proposal.token = None;
             b.proposal.argv = vec![
@@ -852,18 +824,11 @@ fn rebuild_argv_for_topology(b: &mut Briefing, topology: &str) {
                 "--crew".into(),
                 n.to_string(),
             ];
-            // bd-compose-plumbing-zdzi: the same declared-input binding the
-            // classify path applies — an explicit swarm flip must not drop the
-            // captain pin the token needs. Underivable = the explicit choice
-            // still dispatches, with the input surfaced as a question below.
             let underivable =
                 bind_declared_inputs(&mut argv, "wave-swarm", b.world.agent_pin.as_deref());
             b.proposal.argv = argv;
             b.proposal.why = "wave-swarm (operator topology=swarm)".into();
             if !underivable.is_empty() {
-                // Explicit operator choice: the body still dispatches, but the
-                // underivable input is surfaced the same way the classify path
-                // surfaces it — a named question, never a silent "".
                 b.proposal.why = format!(
                     "wave-swarm (operator topology=swarm) — Missing inputs: {}. Pass them via \
                      --inputs before --commit (captain_pin targets escalations).",
@@ -1001,7 +966,6 @@ mod tests {
                     "{objective}: no join alternative without a live fleet"
                 );
             }
-            // The join option is visible only when it is on.
             assert_eq!(
                 v["proposal"].get("join").is_some(),
                 b.proposal.join,
@@ -1014,7 +978,6 @@ mod tests {
                 }
             }
         }
-        // A joinable world offers the join workflow as a swarm alternative.
         let b = assemble("fix the login bug", &joinable(), &[], 5, None);
         assert!(
             b.alternatives
@@ -1025,8 +988,6 @@ mod tests {
 
     #[test]
     fn join_does_not_default_the_wave_swarm_roles_into_the_crew() {
-        // A swarm with no named roles defaults to the wave-swarm roles; a join
-        // arrives on an existing fleet and must not pick them up.
         let j = assemble("wave-swarm 3 crews", &joinable(), &[], 5, None);
         let s = assemble("wave-swarm 3 crews", &solo(), &[], 5, None);
         assert!(j.proposal.join && !s.proposal.join);
@@ -1050,7 +1011,6 @@ mod tests {
             v["proposal"].get("join").is_none(),
             "no join key on a non-join proposal: {v}"
         );
-        // And an old briefing JSON without the key still reads back (join=false).
         let back: Briefing = serde_json::from_value(v).unwrap();
         assert!(!back.proposal.join);
     }
@@ -1094,7 +1054,6 @@ mod tests {
         assert_eq!(b.proposal.argv[1], "arrive");
         let q = b.questions.iter().find(|q| q.id == "topology").unwrap();
         assert_eq!(q.default, "swarm");
-        // crew is not spliced into an arrive argv; a model slot is not either.
         apply_answers(&mut b, None, Some("3"), Some("@cheap")).unwrap();
         assert!(
             !b.proposal
@@ -1102,7 +1061,6 @@ mod tests {
                 .iter()
                 .any(|a| a == "--crew" || a.contains("=@cheap"))
         );
-        // Choosing swarm explicitly leaves the join option.
         apply_answers(&mut b, Some("swarm"), None, None).unwrap();
         assert_eq!(
             (b.proposal.topology.as_str(), b.proposal.join),
@@ -1110,14 +1068,12 @@ mod tests {
         );
         assert_eq!(b.proposal.workflow, "wave-swarm");
         assert_ne!(b.proposal.argv.get(1).map(String::as_str), Some("arrive"));
-        // open and loop clear it too.
         apply_answers(&mut b, Some("join"), None, None).unwrap();
         apply_answers(&mut b, Some("open"), None, None).unwrap();
         assert!(!b.proposal.join && b.proposal.topology == "open");
         apply_answers(&mut b, Some("join"), None, None).unwrap();
         apply_answers(&mut b, Some("loop"), None, None).unwrap();
         assert!(!b.proposal.join && b.proposal.topology == "open");
-        // Re-asking for what is already there changes nothing.
         let mut j = assemble(
             "wave-swarm 3 crews",
             &joinable(),
@@ -1141,11 +1097,9 @@ mod tests {
         );
         let q = b.questions.iter().find(|q| q.id == "topology").unwrap();
         assert_eq!(q.default, "swarm");
-        // Already aligned: nothing to do.
         let before = b.proposal.clone();
         align_with_session_topology(&mut b, "join", false);
         assert_eq!(b.proposal, before);
-        // A swarm session over a join proposal drops the option (the old label flip).
         let mut j = assemble(
             "wave-swarm 3 crews",
             &joinable(),
@@ -1276,8 +1230,6 @@ mod tests {
         assert_eq!(b.proposal.topology, "open");
     }
 
-    // ADR-0032 Spec 9 (bd-himk) RED: briefing reads decide's table — the
-    // babysit-bead divergence (decide open vs briefing swarm) dies.
     #[test]
     fn decide_router_briefing_reads_decide_topology() {
         let world = World {
@@ -1533,7 +1485,6 @@ mod tests {
                 b.proposal.argv
             );
             assert_eq!(b.proposal.crew_total, 0, "{label}");
-            // --commit path: empty argv ⇒ bail!("briefing commit: empty argv")
             assert!(
                 b.proposal.argv.len() < 2,
                 "{label}: commit gate treats len<2 as empty"
@@ -1654,7 +1605,6 @@ mod tests {
             b.proposal.argv
         );
 
-        // No derivable pin: the input is asked for, and nothing is dispatched.
         let world = World {
             agent_pin: None,
             ..world_empty()
@@ -1717,7 +1667,6 @@ mod tests {
     }
 
     // governed-by: bd-7lms — every decide topology + workflow family gets a
-    // briefing proposal with crew/model questions. One scenario, one path.
     fn has_crew_and_model_questions(b: &Briefing) -> bool {
         ["topology", "crew", "model"]
             .iter()
@@ -1860,7 +1809,6 @@ mod tests {
             5,
             None,
         );
-        // "diagnosed" contains "diagnose"? "diagnosed".contains("diagnose") is true.
         assert!(
             b.proposal
                 .argv

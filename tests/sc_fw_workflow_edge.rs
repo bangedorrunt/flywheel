@@ -108,7 +108,6 @@ fn workflow_run_resolves_the_project_tier() {
 fn workflow_read_doors_layer_the_project_tier() {
     let h = TieredProject::new();
 
-    // list: names the project workflow under --project, not without it.
     let bare = h.run_without_project(&["workflow", "list"]);
     assert!(
         bare.status.success(),
@@ -131,7 +130,6 @@ fn workflow_read_doors_layer_the_project_tier() {
         String::from_utf8_lossy(&listed.stdout)
     );
 
-    // show: resolves the project workflow under --project; bare fails loud.
     let shown = h.run(&["workflow", "show", "project-tier-demo"]);
     assert!(
         shown.status.success(),
@@ -144,8 +142,6 @@ fn workflow_read_doors_layer_the_project_tier() {
         "bare show must fail loud on a project-tier workflow"
     );
 
-    // lint: the project tier joins the lint set under --project (a project
-    // regression cannot ship unlinted); a broken project workflow fails it.
     let broken = h.project.join(".flywheel/workflows/broken-tier.yaml");
     std::fs::write(
         &broken,
@@ -166,7 +162,6 @@ fn workflow_read_doors_layer_the_project_tier() {
         String::from_utf8_lossy(&clean.stdout)
     );
 
-    // crew: previews the project workflow's crew under --project.
     let crewed = h.run(&["workflow", "crew", "project-tier-demo"]);
     assert!(
         crewed.status.success(),
@@ -223,8 +218,6 @@ steps:
         .await
         .expect("invoke returns run output");
 
-    // The step ran and produced output visible to the caller (the invoking
-    // orchestrator / `flywheel workflow run`).
     assert!(
         output.get("plan").is_some(),
         "invoked workflow produced step output: {output}"
@@ -243,8 +236,6 @@ async fn sc_fw_absorbed_legacy_workflow_round_trips_through_engine() {
     use std::sync::Mutex;
     use toron_workflow::schema::Step;
 
-    // Capture the dispatch payloads so we assert the legacy Send semantics
-    // (to/stage/msg) survive absorption, not just that the engine runs.
     let dispatches: Arc<Mutex<Vec<(String, toron_workflow::schema::DispatchSpec)>>> =
         Arc::new(Mutex::new(Vec::new()));
     let captured = dispatches.clone();
@@ -260,8 +251,6 @@ async fn sc_fw_absorbed_legacy_workflow_round_trips_through_engine() {
             Ok(serde_json::Value::Null)
         });
 
-    // The absorbed-legacy workflow shape (mirrors absorb_workflow_steps):
-    // send-0 -> DispatchJob{to,spec:{to,stage,msg}}, wait-0 -> Delay.
     let wf = Workflow {
         name: "legacy-send-wait".into(),
         description: Some("absorbed legacy workflows.toml workflow".into()),
@@ -277,8 +266,6 @@ async fn sc_fw_absorbed_legacy_workflow_round_trips_through_engine() {
                 build_slot: false,
                 action: Action::DispatchJob {
                     assignee: "pi".into(),
-                    // Legacy send-absorb shape: to/msg round-trip through
-                    // `extra`, stage is a named DispatchSpec field.
                     spec: serde_json::from_value(serde_json::json!({
                         "to": "pi",
                         "stage": "p6",
@@ -307,7 +294,6 @@ async fn sc_fw_absorbed_legacy_workflow_round_trips_through_engine() {
         .await
         .expect("invoke absorbed legacy workflow");
 
-    // send-0 produced a step output (engine advanced past both steps).
     assert!(
         output.get("send-0").is_some(),
         "send-0 step output: {output}"
@@ -317,8 +303,6 @@ async fn sc_fw_absorbed_legacy_workflow_round_trips_through_engine() {
         "wait-0 step output: {output}"
     );
 
-    // The legacy Send semantics survived absorption: one DispatchJob to pi
-    // carrying the p6 stage.
     let jobs = dispatches.lock().unwrap();
     assert_eq!(jobs.len(), 1, "one DispatchJob from the legacy Send step");
     let (assignee, spec) = &jobs[0];

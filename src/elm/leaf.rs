@@ -129,24 +129,14 @@ impl Program for LeafProgram {
 
     fn failure(failure: &Failure<String>) -> LeafMsg {
         match failure {
-            // The child's own typed failure.
             Failure::Fail(e) => LeafMsg::Failed { error: e.clone() },
-            // A defect is a bug, not an answer: it is recorded apart so a
-            // caller never reads it as the child having failed.
             Failure::Defect(d) => LeafMsg::Defected {
                 detail: format!("{d:?}"),
             },
-            // Cancellation is not a failure and must not settle as one.
             Failure::Interrupted => LeafMsg::Interrupted,
-            // The durable log refused the append, so the command never ran.
-            // That is neither the child's failure nor a defect: the run never
-            // happened, so it must not settle as a failed attempt.
             Failure::NotAppended(e) => LeafMsg::Defected {
                 detail: format!("the journal refused the append: {e:?}"),
             },
-            // The append may have landed, so this is neither success nor a
-            // clean failure. `LeafMsg` has no "may have run" state; a defect
-            // keeps it out of the success and failed-attempt counts.
             Failure::Unknown(e) => LeafMsg::Defected {
                 detail: format!(
                     "the journal's append outcome is unknown (the child may have run; reconcile before retrying): {e:?}"
@@ -471,7 +461,6 @@ mod tests {
         assert!(failed.model.done);
         assert_eq!(failed.model.error.as_deref(), Some("timeout"));
 
-        // A second outcome after done changes nothing: no double settle.
         let again = LeafProgram::update(
             &failed.model,
             &LeafMsg::Completed {
@@ -504,9 +493,8 @@ mod tests {
             Producer::new("leaf-test"),
         )
         .expect("boot runs init");
-        // Init planned the command; send nothing: the drain runs it.
         assert_eq!(loop_.model().key, "mail-done:bd-1");
-        drop(loop_); // Crash: no shutdown, no snapshot.
+        drop(loop_);
 
         let log: Arc<dyn DurableLog> = Arc::new(FileLog::open(&path).expect("reopen log"));
         let recovered = Loop::<LeafProgram, ScriptedLeaf>::recover(
@@ -516,9 +504,6 @@ mod tests {
             Producer::new("leaf-test"),
         )
         .expect("recover replays the journal");
-        // The init command was durable and already completed before the
-        // crash: recovery replays the journal without re-running it, and
-        // the checkpoint holds.
         assert!(recovered.in_flight().is_empty());
         assert_eq!(
             recovered.model().result,
@@ -548,9 +533,6 @@ mod tests {
 
     #[test]
     fn production_interpret_runs_the_child_and_parses() {
-        // The test harness binary answers `--help` with exit 0 and
-        // non-JSON stdout, exercising the real spawn plus the fallback
-        // parse without touching any loop state.
         let cmd = LeafCmd {
             key: "leaf-test:help".into(),
             argv: vec!["--help".into()],
@@ -599,7 +581,6 @@ mod tests {
             "cancellation must not settle as a typed failure"
         );
 
-        // The framework's own arms map to the same three messages.
         assert!(matches!(
             LeafProgram::failure(&Failure::Interrupted),
             LeafMsg::Interrupted
@@ -612,9 +593,6 @@ mod tests {
 
     #[test]
     fn run_leaf_on_drives_the_full_loop_without_a_journal_path() {
-        // End to end through `run_leaf_on`: boot, durable intent, real
-        // child, checkpointed outcome — over a memory log, so no state dir
-        // is touched.
         use toron_core::kernel::MemLog;
 
         let log: Arc<dyn DurableLog> = Arc::new(MemLog::new());
@@ -624,8 +602,6 @@ mod tests {
 
     #[test]
     fn run_leaf_journaled_at_truncates_on_success() {
-        // A clean run leaves no journal behind: crash residue is the only
-        // thing worth keeping, so hot paths cannot grow the file.
         let dir =
             std::env::temp_dir().join(format!("flywheel-leaf-journal-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch dir");
@@ -651,11 +627,6 @@ mod tests {
         );
     }
 }
-
-// ---------------------------------------------------------------------------
-// T4 close path (bd-5ouq): RED — LeafCmd must carry a per-leaf timeout
-// before loop_run_verify can leave ctx.run.
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod t4_close_tests {
@@ -711,7 +682,6 @@ mod t4_close_tests {
 
     #[test]
     fn timeout_field_survives_journal_round_trip() {
-        // Old journal rows predate the field: they must still parse.
         let old: LeafCmd = serde_json::from_str(r#"{"key":"k","argv":["a"]}"#).unwrap();
         assert_eq!(old.timeout_secs, None);
         let new = LeafCmd {

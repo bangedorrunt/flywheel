@@ -40,7 +40,6 @@ mod tests {
     #[test]
     fn a_freebuff_or_superlogical_pin_is_kept_when_plane_has_no_pane() {
         let none_live = live(&[]);
-        // A freebuff pin is invisible to hc on purpose — absence is not death.
         assert!(!pane_binding_may_clear(
             "freebuff",
             "hc",
@@ -53,14 +52,12 @@ mod tests {
             "w1:p1",
             Some(&none_live)
         ));
-        // A harness hc injects may clear once its pane is gone.
         assert!(pane_binding_may_clear(
             "opencode",
             "hc",
             "w1:p1",
             Some(&none_live)
         ));
-        // Unknown and empty harnesses keep their row.
         assert!(!pane_binding_may_clear(
             "claude",
             "hc",
@@ -68,9 +65,7 @@ mod tests {
             Some(&none_live)
         ));
         assert!(!pane_binding_may_clear("", "hc", "w1:p1", Some(&none_live)));
-        // Hc not answering clears nothing.
         assert!(!pane_binding_may_clear("opencode", "hc", "w1:p1", None));
-        // A live pane is never cleared, and only hc may clear at all.
         let present = live(&["w1:p1"]);
         assert!(!pane_binding_may_clear(
             "opencode",
@@ -84,7 +79,6 @@ mod tests {
             "w1:p1",
             Some(&none_live)
         ));
-        // An empty pane id names nothing, so it is not positive evidence.
         assert!(!pane_binding_may_clear(
             "opencode",
             "hc",

@@ -107,13 +107,11 @@ mod tests {
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("old.rs"), b"x").unwrap();
         std::fs::write(dir.join("notes.txt"), b"x").unwrap();
-        // Newest .rs must win over older files of any kind.
         let t0 = newest_mtime_under(&dir).expect("finds old.rs");
         std::thread::sleep(std::time::Duration::from_millis(1100));
         std::fs::write(dir.join("sub").join("new.rs"), b"x").unwrap();
         let t1 = newest_mtime_under(&dir).expect("finds new.rs");
         assert!(t1 >= t0, "newer file must not read older: {t0} -> {t1}");
-        // A tree with no .rs is Unknown, not epoch-zero.
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("only.txt"), b"x").unwrap();

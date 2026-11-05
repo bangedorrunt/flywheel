@@ -145,9 +145,6 @@ pub(crate) fn cmd_slot(cmd: &SlotCmd) -> Result<()> {
                      (aliases resolve on read; never write one). 'default' is a SQUAD name."
                 ),
             };
-            // Start from the ROUTING layer (compiled-in + user) so a partial
-            // `slot set` keeps the other fields, then write the WHOLE spec as
-            // the user overlay (D1: per-name whole-Spec).
             let routing = crate::models::ModelRegistry::load_routing()?;
             let mut spec = routing.slot(canonical).cloned().unwrap_or_default();
             if let Some(h) = harness {

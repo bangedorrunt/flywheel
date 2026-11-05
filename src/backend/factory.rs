@@ -99,8 +99,6 @@ impl ResolvedPlane {
 /// executable `rex` on PATH. Presence only: it never spawns rex, so a cheap
 /// probe is safe on every door.
 fn rex_cli_present(cfg: &Config) -> std::result::Result<std::path::PathBuf, String> {
-    // Prefer Config.rex_bin_dir (tests / explicit config) over process-global
-    // REX_BIN_DIR alone — avoids races when parallel tests mutate the env.
     if let Some(dir) = cfg.rex_bin_dir() {
         let path = dir.join("rex");
         if executable_file(&path) {
@@ -235,22 +233,10 @@ pub fn multiplexer_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> 
     match name.as_str() {
         #[cfg(feature = "backend-hc")]
         "hc" => hc_backend(cfg),
-        // superlogical: rex CLI (feature `backend-superlogical`). With the
-        // feature off, the arm is compiled out and the name falls through
-        // to `other` -> "not compiled in". subscribe, agent_wait, and
-        // agent_send_keys stay Unsupported and name the method.
         #[cfg(feature = "backend-superlogical")]
         "superlogical" => Ok(Box::new(crate::backend::superlogical::SuperlogicalBackend)),
-        // auto: rex primary on every door, regardless of `REX_SESSION`.
-        // hc is transport fallback only (Connect/Io/Timeout — a
-        // successful rex call never falls through). An hc server
-        // that is down at startup leaves a primary-only backend behind
-        // a loud warning instead of refusing the whole construction.
         #[cfg(feature = "backend-superlogical")]
         "auto" => {
-            // Rex primary on every door. No `REX_SESSION` gate here: a
-            // hosted bot, a cron run, and the doorbell have no `REX_SESSION`
-            // and still resolve rex. hc is transport fallback only.
             let primary: Box<dyn MultiplexerBackend> =
                 Box::new(crate::backend::superlogical::SuperlogicalBackend);
             #[cfg(feature = "backend-hc")]
@@ -281,9 +267,6 @@ pub fn multiplexer_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> 
 pub fn mail_backend(cfg: &Config) -> Result<Box<dyn MailSurface>> {
     let name = resolve_mail_name(cfg);
     match name.as_str() {
-        // FLYWHEEL_MAIL=toron -> the toron facade (`Mail::from_config`):
-        // embedded in-process by default; the `[mail.toron]` daemon when its
-        // url is set (ADR-0003 V2/V3).
         #[cfg(feature = "mail-toron")]
         "toron" => {
             let mail = Mail::from_config(Some(&cfg.toron_mail_config()))
@@ -338,8 +321,6 @@ fn backend_not_compiled_or_unknown(name: &str, _kind: &str, env_var: &str) -> Ba
 /// clippy-clean pattern: each feature contributes a cfg-gated slice; the vec
 /// concatenates them (no `push`-after-`Vec::new` lint).
 pub fn compiled_backends() -> Vec<&'static str> {
-    // `mut` is needed iff at least one backend feature is compiled in; in a
-    // fully stripped build no `extend` survives, so scope the allow to that.
     #[cfg_attr(
         not(any(
             feature = "backend-hc",
@@ -369,10 +350,6 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::config::lock_env;
-
-    // Env-var mutation is process-global: serialize under the crate-wide
-    // env lock (config::lock_env, 193.2) — a per-module lock would still
-    // race sibling modules' env-mutating tests.
 
     /// Defaults resolve to hc + toron when nothing is set (the build
     /// without the rex backend; with it, the default is auto).
@@ -523,7 +500,6 @@ mod tests {
             !backends.contains(&"agentmail"),
             "agentmail backend is deleted (bd-euav)"
         );
-        // superlogical is opt-in: present IFF its feature is on
         #[cfg(not(feature = "backend-superlogical"))]
         assert!(
             !backends.contains(&"superlogical"),
@@ -585,9 +561,6 @@ mod tests {
     #[cfg(feature = "mail-toron")]
     #[test]
     fn toron_backend_is_real_facade() {
-        // FLYWHEEL_MAIL=toron constructs the toron facade (Mail::from_config):
-        // name() is truthful, and health() delegates to the in-process mailbox
-        // (Ok), NOT an honest-Unsupported stub (pre-ADR-0003 behavior).
         let _g = lock_env();
         unsafe { std::env::set_var("FLYWHEEL_MAIL", "toron") };
         let cfg = Config::default();
@@ -613,8 +586,6 @@ mod tests {
         let cfg = Config::default();
         let b: Box<dyn MailSurface> = super::mail_backend(&cfg).expect("toron facade constructs");
         let arc: Arc<dyn MailSurface> = Arc::from(b);
-        // Methods are callable through `&Arc` (deref to `&dyn MailBackend`),
-        // proving no `&mut self` receiver remains.
         let name = arc.name();
         assert_eq!(name, "toron", "name() through &Arc");
         let agent = arc.agent_name();
@@ -678,7 +649,6 @@ mod spawn_gate_tests {
     #[cfg(feature = "backend-superlogical")]
     #[test]
     fn auto_without_a_rex_cli_resolves_to_the_hc_fallback() {
-        // RexBinGuard holds the crate-wide env lock; plane probe reads cfg.rex_bin_dir.
         let bin = crate::backend::superlogical::rex_cli::RexBinGuard::empty();
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
         let cfg = Config {
@@ -761,7 +731,6 @@ mod spawn_gate_tests {
     fn config_rex_bin_dir_outranks_a_poisoned_env() {
         let bin = crate::backend::superlogical::rex_cli::RexBinGuard::install("exit 0");
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
-        // Poison the env the old probe used; config must still see the binary.
         unsafe { std::env::remove_var("REX_BIN_DIR") };
         let cfg = Config {
             rex_bin_dir: Some(bin.dir_path().display().to_string()),

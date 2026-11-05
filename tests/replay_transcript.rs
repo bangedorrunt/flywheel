@@ -140,17 +140,12 @@ fn replay_transcript_drives_real_host() {
     assert_eq!(seeds, vec!["BlueRidge=idle", "LilacChapel=working"]);
     assert_eq!(watch.len(), 6, "six watch wire lines, got {watch:?}");
 
-    // Pane/wake half: the real tick fold decides; read the injects.
     let injects = run_doorbell_once(&seeds, &watch);
     let rows = injects.as_array().expect("injects array");
     let pins: Vec<&str> = rows
         .iter()
         .map(|r| r["pin"].as_str().expect("inject pin"))
         .collect();
-    // Both urgent rings address idle BlueRidge (plain + redacted) — the wake
-    // fired. The Ghost ring names a pin the fold never saw (no prompt: the
-    // wrong pane never answers) and the LilacChapel ring hits a working pin
-    // (queued, never injected: the pane never woke mid-work).
     assert_eq!(
         pins,
         vec!["BlueRidge", "BlueRidge"],
@@ -166,9 +161,6 @@ fn replay_transcript_drives_real_host() {
         );
     }
 
-    // Redaction half: the scrubbed frame keeps id/kind/tags; routing never
-    // reads the body. Structural check on the fixture, behavioral check above
-    // (second BlueRidge prompt came from the redacted ring).
     let redacted: serde_json::Value = serde_json::from_str(&watch[5]).expect("redacted line");
     assert_eq!(redacted["id"], "r9");
     assert_eq!(redacted["kind"], 9);
@@ -180,7 +172,6 @@ fn replay_transcript_drives_real_host() {
         "redaction must preserve the address tags, got {redacted}"
     );
 
-    // Toron-wire half: send→delivery→read→verdict through the real FSM.
     assert_eq!(toron.len(), 5, "five toron frames, got {toron:?}");
     let first = &toron[0];
     assert_eq!(first["op"], "send");

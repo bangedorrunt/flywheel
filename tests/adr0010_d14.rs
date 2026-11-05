@@ -20,7 +20,6 @@ fn adr0010_d14_guard_predicate_present() {
 
 #[test]
 fn adr0010_d14_crew_exempt_afk_satisfies() {
-    // Crew panes are exempt; a fresh identity-matched AFK beacon satisfies.
     assert!(
         MAIN.contains("is_crew"),
         "predicate must take a crew-exemption input"
@@ -33,8 +32,6 @@ fn adr0010_d14_crew_exempt_afk_satisfies() {
 
 #[test]
 fn adr0010_d14_hook_command_wired() {
-    // Hidden hook plumbing (like __dispatch-guard): vendor Stop hooks call
-    // it; nonzero exit blocks the turn-end.
     assert!(
         MAIN.contains("turn-guard") || MAIN.contains("turn_guard"),
         "turn-guard hook command must be wired"

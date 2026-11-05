@@ -130,8 +130,6 @@ pub fn decide(
     let mut tombstones = Vec::new();
 
     if known_panes.is_empty() {
-        // No evidence. Keep every row and do NOT touch the counters, so an outage
-        // cannot manufacture confirmations for panes that are perfectly alive.
         return Decision {
             fates: rows
                 .iter()
@@ -143,15 +141,12 @@ pub fn decide(
 
     for row in rows {
         let fate = if row.pane.is_empty() {
-            // Rule 2. The reaper being replaced pruned these.
             confirmations.remove(&row.pin);
             Fate::LabelRouted
         } else if known_panes.contains(&row.pane) {
-            // Rule 1.
             confirmations.remove(&row.pin);
             Fate::Alive
         } else {
-            // Rule 3.
             let seen = confirmations.entry(row.pin.clone()).or_insert(0);
             *seen = seen.saturating_add(1);
             if *seen >= required {
@@ -312,7 +307,6 @@ mod tests {
             "a returning pane must clear its count, not leave it armed: {c:?}"
         );
 
-        // And it takes a fresh three, not one, to prune it again.
         let d = decide(&rows(), &gone, &mut c, REQUIRED_CONFIRMATIONS);
         assert_eq!(d.fate_of("DoomedPin"), Some(Fate::Unconfirmed));
     }

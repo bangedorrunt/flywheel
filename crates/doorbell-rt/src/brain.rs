@@ -140,8 +140,6 @@ impl LivenessVerdict {
     /// The straggler note renders these labels verbatim.
     pub fn describe(&self) -> String {
         match self {
-            // Observation first, candidates second (bd-925m): the probe
-            // measures age + one delta — it never observes the mechanism.
             Self::Starved { age_ms } => format!(
                 "starved: no select wake for {age_ms}ms (>= {STARVATION_THRESHOLD_MS}ms) — unscheduled, or a >2s dispatch (which logs its own warn)"
             ),
@@ -267,8 +265,6 @@ impl<H: Host> Brain<H> {
         let mut hear = HearTracker::default();
         hear.seed_unanswered(store.load_unanswered(&cfg.workspace));
         let next_seq = store.last_seq(&cfg.workspace) + 1;
-        // Durable budgets (D4.5): refold grant rows so a restart resumes
-        // exact window state — a crash buys no extra prompts.
         let mut budgets = std::collections::BTreeMap::new();
         for row in &store.fold_workspace(&cfg.workspace).rows {
             let is_budget = row
@@ -304,9 +300,6 @@ impl<H: Host> Brain<H> {
                     .record_at(ts);
             }
         }
-        // Crash-resume (D4.6/E12): journaled-but-unconfirmed Prompt intents
-        // redeliver within the refolded budget; the resume row makes the
-        // redelivery visible instead of silent.
         let redelivered = count_journaled_prompts(&store, &cfg.workspace);
         let mut this = Self {
             cfg,
@@ -334,9 +327,6 @@ impl<H: Host> Brain<H> {
             liveness: std::sync::Arc::new(BrainLiveness::new()),
             died_bell: None,
         };
-        // bd-jcys: the resume row rides `journal()` like every other row, so it
-        // is sequenced, attributed to this subscriber, and cannot fail silently.
-        // It used to be a direct `append_journal` whose error went to `let _ =`.
         if redelivered > 0 {
             this.journal(
                 &serde_json::json!({"rt_kind": "Resume"}),
@@ -367,24 +357,16 @@ impl<H: Host> Brain<H> {
     }
 
     pub async fn run(mut self, mut rx: tokio::sync::mpsc::Receiver<BrainMsg>) -> RunReport {
-        // Digest time-flush: `maybe_flush_digest` was event-driven only,
-        // so a batch could sit past `digest_interval_secs` forever when no
-        // further event arrived (audit P1). The timer is a cheap no-op
-        // while no batch is pending (due_time gates on digest_since).
         let mut digest_tick = tokio::time::interval(std::time::Duration::from_secs(
             self.cfg.digest_interval_secs.max(1),
         ));
         digest_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // bd-burk: the exit-trace inputs. `dispatched` counts every message
-        // this Brain entered; `elapsed_ms` ages each step note (see ExitStep).
         let ws = self.cfg.workspace.clone();
         let started = tokio::time::Instant::now();
         let mut dispatched = 0usize;
         let elapsed_ms = || started.elapsed().as_millis();
         let died_bell = self.died_bell.clone();
         loop {
-            // bd-y40k: every select wake stamps the shared probe — the drain
-            // reads it at the deadline to settle churn-vs-starvation.
             self.liveness.touch();
             let died = async {
                 match &died_bell {
@@ -395,9 +377,6 @@ impl<H: Host> Brain<H> {
             tokio::select! {
                 biased;
                 _ = died => {
-                    // `wait` already consumed the flag. A ring during this
-                    // dispatch stays set and wins the next loop, still ahead
-                    // of whatever watches are queued.
                     let label = brain_msg_label(&BrainMsg::Died);
                     dispatched += 1;
                     let ws_d = ws.clone();
@@ -418,9 +397,6 @@ impl<H: Host> Brain<H> {
                         );
                         break;
                     }
-                    // bd-zzgb: name a dispatch that is holding the loop past
-                    // the warn bound — a queued Shutdown behind it is how a
-                    // Brain misses the 10s drain. Never cancelled.
                     let label = brain_msg_label(&msg);
                     dispatched += 1;
                     let ws_d = ws.clone();
@@ -433,8 +409,6 @@ impl<H: Host> Brain<H> {
                     .await;
                 }
                 _ = digest_tick.tick() => {
-                    // bd-burk coverage hole: this flush is NOT a dispatch, so
-                    // the dispatch warn never saw a Brain park here.
                     let ws_t = ws.clone();
                     run_dispatch_with_slow_warn(
                         "digest-flush",
@@ -450,13 +424,10 @@ impl<H: Host> Brain<H> {
                 }
             }
         }
-        // bd-burk: each exit step logs ON ENTRY — if this Brain never joins,
-        // doorbell.log's last line for it IS the step holding it.
         eprintln!(
             "{}",
             ExitStep::FlushDigest.note(&ws, dispatched, elapsed_ms())
         );
-        // Drain any pending digest batch before the sinks shut down.
         self.maybe_flush_digest().await;
         eprintln!(
             "{}",
@@ -469,8 +440,6 @@ impl<H: Host> Brain<H> {
                 ExitStep::JournalUndelivered.note(&ws, dispatched, elapsed_ms())
             );
             let pins: Vec<String> = undelivered.iter().map(|u| u.pin.clone()).collect();
-            // bd-jcys: through `journal()` — this is the last row a Brain
-            // writes, so one lost here is unrecoverable.
             self.journal(
                 &serde_json::json!({"rt_kind": "Shutdown"}),
                 &[],
@@ -495,7 +464,6 @@ impl<H: Host> Brain<H> {
             BrainMsg::Fact { summary } => self.on_fact(summary).await,
             BrainMsg::AckSlaTick { now } => self.on_ack_sla(now).await,
             BrainMsg::Presence { pin, state } => {
-                // Trusted internal edge; no journal (mirrors the live loop).
                 let effects = self.host.tick(&BrainMsg::Presence {
                     pin: pin.clone(),
                     state: state.clone(),
@@ -510,19 +478,12 @@ impl<H: Host> Brain<H> {
                     "degraded",
                     serde_json::json!({ "source": source, "reason": reason }),
                 );
-                // bd-jcys: through `journal()` — this row used to be
-                // unsequenced, unattributed, and silent on failure.
                 self.journal(
                     &serde_json::json!({"rt_kind": "Degraded", "source": source}),
                     &[],
                     serde_json::json!({"stage": "degraded", "reason": reason}),
                     &[],
                 );
-                // Supervision (audit P1): `sink:<name>` degradations are
-                // park events — attempt a Transient-policy restart with a
-                // fresh adapter and requeue its shed overflow (at-least-
-                // once). No factory or cap exhausted → shed to digest as
-                // before (never silent).
                 if let Some(sink) = source.strip_prefix("sink:") {
                     let now = self.host.now_unix();
                     if self.sinks.restart_sink(sink, now).await {
@@ -544,8 +505,6 @@ impl<H: Host> Brain<H> {
                         }
                     }
                 } else {
-                    // Non-sink degradation (bus-watch etc.): drain shed
-                    // overflow into the digest (F5, never silent).
                     for u in self.sinks.drain_shed_overflow().await {
                         self.stats.sheds += 1;
                         self.audit(
@@ -558,9 +517,6 @@ impl<H: Host> Brain<H> {
                 self.maybe_flush_digest().await;
             }
             BrainMsg::Delivered { pin } => {
-                // F5: hear keys off worker-confirmed delivery, not enqueue.
-                // Queued intents already counted stats.injects at enqueue;
-                // this receipt only stamps hear (deaf tracking).
                 self.hear.note_inject(
                     &pin,
                     self.host.pin_npub(&pin).as_deref(),
@@ -572,9 +528,6 @@ impl<H: Host> Brain<H> {
                 let _ = reply.send(match kind {
                     AskKind::Stats => AskReply::Stats(self.snapshot_stats()),
                     AskKind::Digest => {
-                        // The read empties the batch: reset the interval
-                        // clock too, or the next event-driven flush fires
-                        // immediately with only fresh lines (audit P1).
                         let digest = std::mem::take(&mut self.digest);
                         self.digest_since = None;
                         AskReply::Digest(digest)
@@ -586,14 +539,6 @@ impl<H: Host> Brain<H> {
     }
 
     async fn on_watch(&mut self, line: String) {
-        // Gap 1: plane-S cursor — skip old history on restart, persist
-        // early so a crash right after doesn't re-ring.
-        //
-        // The timestamp answers ONE question — is this history from before a
-        // restart? — and only a STRICTLY older second is unambiguous. Two
-        // events can share a second, so `<=` also ate the second wake of every
-        // busy second, indistinguishably from a redelivery. The id decides
-        // "same event"; the high-water only decides "before the restart".
         let id = watch_line_id(&line);
         let redelivered = id
             .as_deref()
@@ -601,11 +546,6 @@ impl<H: Host> Brain<H> {
         let us = doorbell_core::watch_created_at(&line).map(|c| (c as i64) * 1_000_000);
         let history = us.is_some_and(|us| us < self.wake.plane_s_cursor_us.unwrap_or(i64::MIN));
         if redelivered || history {
-            // bd-bpj1 (F3): the drop leaves a trace — a silent dedup is
-            // indistinguishable from a lost event on later inspection.
-            // Bounded two ways: presence heartbeats (kind 20001, never
-            // ring) stay silent, and only a suppression newer than every
-            // traced one earns a row (redeliveries repeat identically).
             *self
                 .stats
                 .rings_by_class
@@ -639,8 +579,6 @@ impl<H: Host> Brain<H> {
         }
         *self.stats.rings_by_class.entry("watch".into()).or_default() += 1;
         let effects = self.host.tick(&BrainMsg::Watch(line.clone()));
-        // bd-bk9t: a digest-bound wake (pane-less subscriber pin) carries no
-        // Prompt, so it must be absorbed here or this arm drops it.
         self.absorb_digests(&effects);
         let raw: Vec<(String, String)> = effects
             .iter()
@@ -676,8 +614,6 @@ impl<H: Host> Brain<H> {
             self.hear.note_heard_pubkey(&pk);
             self.persist_hear();
         }
-        // Decided-before-delivery: flush the journal BEFORE any Prompt
-        // intent reaches a sink (D4.2). Quiet lines do not fsync.
         if watch_journal_due(injects.len()) {
             self.flush_journal("watch");
         }
@@ -687,12 +623,6 @@ impl<H: Host> Brain<H> {
     }
 
     async fn on_status(&mut self, pin: String, status: String) {
-        // GS-039 ordering: capture the previous status BEFORE the tick —
-        // the host records the new status at tick time (FileHost inserts
-        // into its map, the reducer updates the model), so a post-tick
-        // `prev_status` read always sees the value we just wrote and the
-        // transition gate never fires (audit P1). The gate is advisory:
-        // an unknown pin still counts as transitioned.
         let from = self.host.prev_status(&pin).map(|f| f.to_ascii_lowercase());
         let effects = self.host.tick(&BrainMsg::PlaneStatus {
             pin: pin.clone(),
@@ -710,10 +640,6 @@ impl<H: Host> Brain<H> {
         );
         self.flush_journal("status");
         let delivered = self.deliver_prompts(injects).await;
-        // GS-039 P0-1 REAL observation: wake-worthy status transitions that
-        // show the agent woke (working) or settled after work
-        // (idle/done/blocked) advance last_wake — OR a pin that actually
-        // delivered. Static already-idle rows never ratchet liveness.
         let s = status.to_ascii_lowercase();
         let transitioned = match from.as_deref() {
             Some(f) => f != s.as_str(),
@@ -731,12 +657,6 @@ impl<H: Host> Brain<H> {
 
     async fn on_died(&mut self) {
         let effects = self.host.tick(&BrainMsg::Died);
-        // bd-watch-restart-metric-8dvf: `RestartWatch` means a restart
-        // HAPPENED. `restart_wake` is single-flight, so a burst of deaths
-        // collapses into one restart; journaling a restart row per death made
-        // `/health` count ~40x the truth (1,412 rows in one 300s window
-        // against 35 real watch cycles) and made `restarted: true` a lie for
-        // every coalesced death.
         let restarted = self.host.restart_wake();
         let decided: Vec<Effect> = if restarted {
             effects
@@ -746,13 +666,6 @@ impl<H: Host> Brain<H> {
                 .filter(|effect| !matches!(effect, Effect::RestartWatch))
                 .collect()
         };
-        // A death that decided nothing is a COUNT, not a row. Live 2026-09-28
-        // 04:32Z: one minute wrote 2,120 rows for 8 real restarts, 2,112 of
-        // them inert — 265 rows of noise per restart of truth, and a journal
-        // too swollen to measure the incident it was describing. Journal the
-        // inert ones at 1, 2, 4, 8 ... (cost log2(N), the row naming the deaths
-        // it stands for, so nothing is dropped). A real restart always gets its
-        // row and resets the count.
         if !restarted {
             self.inert_died += 1;
         }
@@ -805,15 +718,12 @@ impl<H: Host> Brain<H> {
         self.deliver(effects, "fact").await;
     }
     async fn on_sweep(&mut self, now: u64) {
-        // Live drains first (loop-top order): role binds, then facts.
         for (role, pin) in self.host.drain_role_bounds() {
             self.on_rolebound(role, pin).await;
         }
         for summary in self.host.drain_facts() {
             self.on_fact(summary).await;
         }
-        // Registry/index refresh + forwarder respawn; presence rows tick
-        // the trusted edge (heard = registry pin present after tick).
         for (pin, state) in self.host.sweep_maintenance() {
             let effects = self.host.tick(&BrainMsg::Presence {
                 pin: pin.clone(),
@@ -824,11 +734,6 @@ impl<H: Host> Brain<H> {
         }
         self.sweep_last = Some(now);
         let effects = self.host.tick(&BrainMsg::Sweep { now });
-        // F6: fetch only when tick asks (need_fetch arm) — was unconditional
-        // per-pin I/O every 1s sweep. bd-1i8c: the host decides HOW the
-        // fetch leaves this dispatch — a host that shells out DETACHES it
-        // and the rows re-enter as `InboxFetched` messages; the serial
-        // dispatch must never wait on a subprocess.
         if effects.iter().any(|e| matches!(e, Effect::FetchInbox)) {
             let targets = self.fetch_targets(now);
             let inline = self.host.fetch_inbox_detached(targets);
@@ -836,9 +741,6 @@ impl<H: Host> Brain<H> {
                 self.on_inbox_fetched(pin, rows).await;
             }
         }
-        // rv23 #3: a sweep whose only effect is the inbox fetch decided
-        // nothing, so it writes no journal row (it was ~1 row/s idle, and the
-        // journal is what `/health` folds). The beat itself is the stamp.
         if is_decision(&effects) {
             self.journal(
                 &serde_json::json!({"rt_kind": "Sweep"}),
@@ -858,8 +760,6 @@ impl<H: Host> Brain<H> {
     }
 
     async fn on_inbox_fetched(&mut self, pin: String, rows: Vec<serde_json::Value>) {
-        // Cursor-hold: never advance the high-water on unparseable rows —
-        // the batch re-sweeps (bd-7qg6: at-least-once, never at-most-once).
         let refs: Vec<&serde_json::Value> = rows.iter().collect();
         if let Some(hw) = doorbell_core::inbox_high_water_from_values(refs) {
             self.wake.since_by_pin.insert(pin.clone(), hw);
@@ -870,7 +770,6 @@ impl<H: Host> Brain<H> {
             pin: pin.clone(),
             rows,
         });
-        // rv23 #3: an empty fetch that decides nothing is not a row.
         if fetched || is_decision(&effects) {
             self.journal(
                 &serde_json::json!({"rt_kind": "InboxFetched", "pin": pin}),
@@ -882,21 +781,6 @@ impl<H: Host> Brain<H> {
         self.deliver(effects, "inbox").await;
     }
 
-    // F6: shared borrow — inbox fetch needs no &mut host (enables future
-    // off-loop pipe; today it at least stops excluding concurrent readers).
-    // bd-5d0v: a pin with no cursor backfills from the bounded redelivery
-    // floor, never the sweep's wall-clock now (strict-newer-than-now is
-    // empty forever and the cursor would never initialize — permanent
-    // plane-P deafness for fresh spawns and post-state-loss restarts).
-    // bd-bpj1 (F4): the floor derives from the sweep's `now`, never a fresh
-    // wall-clock read — the fetch window reproduces from the journaled Msg.
-    //
-    // bd-1i8c: this now hands the `(pin, since)` pairs to the host's
-    // OFF-LOOP lane instead of fetching inline. The brain is a
-    // single-serial writer: an inline fetch parked it for the whole scan
-    // (one CLI per pin, each with its own ceiling), so the wake channel
-    // filled and real wake lines were dropped. The rows re-enter as
-    // `BrainMsg::InboxFetched` — the pipe pattern this module documents.
     fn fetch_targets(&self, now_unix: u64) -> Vec<(String, String)> {
         let floor = doorbell_core::redelivery_floor_rfc3339(now_unix);
         let mut targets = Vec::new();
@@ -922,16 +806,9 @@ impl<H: Host> Brain<H> {
             &[],
         );
         if scan {
-            // bd-1i8c: the scan shells out and is minutes-scale, so the host
-            // DETACHES it — the overdue ids re-enter as `SlaFired`. The
-            // serial dispatch must never wait on a subprocess.
             let posts = self.host.scan_ack_sla_detached();
-            // Always fold it: an EMPTY list is news too — the backlog
-            // cleared, and the fold names that once (bd-adms).
             self.on_sla_fired(posts).await;
         }
-        // Live AckSla arm also sweeps the inbox when tick asks for it.
-        // F4: route fetched rows via on_inbox_fetched (was fire-and-drop).
         if effects.iter().any(|e| matches!(e, Effect::FetchInbox)) {
             let targets = self.fetch_targets(now);
             let inline = self.host.fetch_inbox_detached(targets);
@@ -942,14 +819,6 @@ impl<H: Host> Brain<H> {
         self.deliver(effects, "acksla").await;
     }
     async fn on_sla_fired(&mut self, posts: Vec<String>) {
-        // bd-adms: `toron ack-sla` re-reports every corr still past SLA, so
-        // an unchanged backlog re-fired the same wake + journal row every
-        // 60s (live: `SlaFired count: 89` ~1440×/day, which is exactly the
-        // noise that hides a genuine regression). Fire only on a CHANGE: new
-        // overdue ids (the signal), or none left.
-        //
-        // bd-1i8c: the dedupe lives HERE because the scan now answers
-        // DETACHED (off the dispatch) and lands as this message.
         let current: BTreeSet<String> = posts.iter().cloned().collect();
         if current == self.sla_seen {
             return;
@@ -972,14 +841,9 @@ impl<H: Host> Brain<H> {
             serde_json::json!({"stage": "executed"}),
             &self.pins_of(&effects),
         );
-        // bd-w98c residual: the hit list is now a real reducer Msg. When the
-        // tick answers FetchInbox (the ladder-registrar pipe, same shape as
-        // on_ack_sla's live arm), rows re-enter as InboxFetched so the
-        // InboxRows fold can register overdue corrs on the ladder.
         let fetch = effects.iter().any(|e| matches!(e, Effect::FetchInbox));
         self.deliver(effects, "sla").await;
         if fetch {
-            // bd-1i8c: detached like every other fetch.
             let targets = self.fetch_targets(self.host.now_unix());
             let inline = self.host.fetch_inbox_detached(targets);
             for (pin, rows) in inline {
@@ -992,9 +856,6 @@ impl<H: Host> Brain<H> {
     /// Audit/FactMiss/LoudMiss/Digest effects are recorded by the Host layer
     /// (single ownership); the journal row above already carries them as data.
     async fn deliver(&mut self, effects: Vec<Effect>, _stage: &str) -> Vec<String> {
-        // bd-bk9t: digest-bound wakes are not prompts. Fold them in first so
-        // a prompt-less arm (the pane-less case by construction) still
-        // reaches the batch instead of returning early and losing the wake.
         self.absorb_digests(&effects);
         let raw = self.prompts_of(&effects);
         if raw.is_empty() {
@@ -1069,8 +930,6 @@ impl<H: Host> Brain<H> {
             let sink = self.sink_for(&pin);
             match self.sinks.send(&sink, &pin, &line).await {
                 crate::sinks::SendOutcome::Queued => {
-                    // F5: queued, not delivered — count the accepted intent
-                    // for wake/journal purposes; hear stamps on Delivered.
                     self.stats.injects += 1;
                     queued.push(pin);
                 }
@@ -1114,13 +973,10 @@ impl<H: Host> Brain<H> {
         if !(due_len || due_time) {
             return;
         }
-        // One batched line per pin, earliest batch first (ordering refines
-        // with deadline metadata in Phase 2, bd-asr2.11).
         let mut by_pin: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (pin, line) in std::mem::take(&mut self.digest) {
             by_pin.entry(pin).or_default().push(line);
         }
-        // S3: deaf services name subscriber + attempts (corr binds in .11).
         for pin in self.hear.unanswered_pins() {
             if let Some(n) = self.deaf_attempts.get(&pin) {
                 by_pin.entry(pin.clone()).or_default().push(format!(
@@ -1136,14 +992,6 @@ impl<H: Host> Brain<H> {
         self.stats.digest_batches += 1;
         for (pin, lines) in by_pin {
             let sink = self.sink_for(&pin);
-            // bd-bk9t: a pin with no route has nowhere for a batch to land.
-            // The sink MISSES an unknown pin and still reports success, so
-            // shipping it would manufacture a `Delivered` receipt and a
-            // hear stamp for a wake nobody received — the same delivery lie
-            // the queue used to tell. The `Digest` journal row (with `why`)
-            // is the durable record; `doorbell digest` reads it.
-            // bd-8ulu: a pin whose subscription names a REGISTERED non-pane
-            // sink does have a route — the endpoint is the human.
             if !self.route_exists(&pin, &sink) {
                 continue;
             }
@@ -1186,12 +1034,6 @@ impl<H: Host> Brain<H> {
                 })
                 .collect::<Vec<_>>()
         );
-        // bd-5qyt: the seq is spent only by a row that EXISTS. Taking it first
-        // and discarding the error (`let _ = ...`) burned a seq per failed
-        // append and left a hole nothing could attribute — measured: 16 seqs
-        // gone from flywheel-opencode, contiguous on both sides, not covered by
-        // any retention record. A gap is evidence, so the fix NAMES the loss
-        // (below) rather than hiding it by moving the counter.
         let seq = self.next_seq;
         let written = self.store.append_journal_seq(
             &self.cfg.workspace,
@@ -1206,17 +1048,11 @@ impl<H: Host> Brain<H> {
             Ok(()) => self.next_seq += 1,
             Err(e) => {
                 self.journal_write_failed += 1;
-                // GS-039: refuse the silent drop. Nothing else in the process
-                // notices a failed append, and a dropped decision row is worse
-                // than a dropped prompt — the fold reads the journal as truth.
                 eprintln!(
                     "doorbell-rt: journal append FAILED on {} — refuse silent drop (GS-039), \
                      seq {seq} stays owed: {e:#}",
                     self.cfg.workspace
                 );
-                // Sampled like every other repeat here (1,2,3,5,9...): a full
-                // disk fails every tick, and the `failed` field keeps the
-                // repeat legible as one number instead of one row per tick.
                 if should_audit_count(self.journal_write_failed as usize - 1) {
                     self.audit(
                         AUDIT_JOURNAL_WRITE_FAILED,
@@ -1293,8 +1129,6 @@ impl<H: Host> Brain<H> {
              drop (GS-039), the decided row may not be durable: {e:#}",
             self.cfg.workspace
         );
-        // Sampled like the other repeat counters: a full disk fails every tick,
-        // and `failed` keeps the repeat legible as one number.
         if should_audit_count(self.journal_sync_failed as usize - 1) {
             self.audit(
                 AUDIT_JOURNAL_SYNC_FAILED,
@@ -1670,9 +1504,6 @@ mod tests {
             ),
             "recent wake + flat count across the probe = parked after one wake"
         );
-        // Review finding (effect/typesafe-ai, bd-925m): describe must state
-        // the OBSERVATION first and name every live candidate — the probe
-        // measures age + one 200ms delta, never the mechanism.
         assert!(
             LivenessVerdict::LostWake { age_ms: 80 }
                 .describe()
@@ -1826,7 +1657,6 @@ mod tests {
         sink.stall_ms = 12_000;
         brain.sinks.add_sink("hc", Box::new(sink));
         brain.sinks.send("hc", "p", "slow").await;
-        // Let the worker pop the intent so it sits inside the 12s send.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         tx.send(BrainMsg::Shutdown).await.expect("shutdown queues");
         let report = tokio::time::timeout(std::time::Duration::from_secs(8), brain.run(rx))
@@ -1868,7 +1698,6 @@ mod tests {
             (brain, rx, tx)
         };
         let (mut a, rx, tx) = mk();
-        // Endpoint down from the first send: nothing delivers, all park.
         let (mut sink, _sent) = MockSink::new();
         sink.fail_after = Some(0);
         a.sinks.add_sink("hc", Box::new(sink));
@@ -1900,7 +1729,6 @@ mod tests {
             "drain row journals the set: {journal}"
         );
         drop(report);
-        // Reboot on the same store: refold + resume row.
         let (b, _rx2, _tx2) = mk();
         let budget = b.budgets.get("p").expect("refolded budget row");
         assert_eq!(budget.prompts.len(), 3, "all three grants refolded");
@@ -1989,7 +1817,6 @@ mod tests {
     async fn sla_fired_fetch_answer_pipes_rows_back() {
         let (mut brain, _rx, _tx) = test_brain(
             "sla-pipe",
-            // tick 1: SlaFired → Audit + FetchInbox; tick 2: InboxFetched fold.
             vec![
                 vec![
                     Effect::Audit {
@@ -2003,8 +1830,6 @@ mod tests {
             ],
         );
         brain.host.pin_list = vec!["p".into()];
-        // No since_by_pin cursor: fetch_all_inbox backfills from the bounded
-        // redelivery floor (bd-5d0v), so the fixture key IS that floor.
         let floor = doorbell_core::redelivery_floor_rfc3339(brain.host.now);
         brain.host.inbox.insert(
             ("p".into(), floor),
@@ -2018,8 +1843,6 @@ mod tests {
                 posts: vec!["c-1".into()],
             })
             .await;
-        // The InboxFetched fold ticked through the host: one tick for
-        // SlaFired + one for InboxFetched.
         assert_eq!(
             brain.host.tick_log.len(),
             2,
@@ -2035,8 +1858,6 @@ mod tests {
 
     #[tokio::test]
     async fn sla_refire_is_a_delta_not_a_repeat() {
-        // `on_sla_fired` ticks again, so one AckSlaTick can consume two
-        // script entries; oversupply rather than count.
         let (mut brain, _rx, _tx) = test_brain(
             "sla-delta",
             (0..8).map(|_| vec![Effect::CheckAckSla]).collect(),
@@ -2044,13 +1865,10 @@ mod tests {
         let overdue = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         brain.host.sla = overdue(&["corr-1", "corr-2"]);
         brain.on_ack_sla(1_000).await;
-        // Same two ids: the noise case. Nothing new may fire.
         brain.host.sla = overdue(&["corr-1", "corr-2"]);
         brain.on_ack_sla(1_060).await;
-        // A third corr crosses the SLA: news.
         brain.host.sla = overdue(&["corr-1", "corr-2", "corr-3"]);
         brain.on_ack_sla(1_120).await;
-        // Backlog fully cleared: news too (one row, then silence).
         brain.host.sla = Vec::new();
         brain.on_ack_sla(1_180).await;
 
@@ -2068,8 +1886,6 @@ mod tests {
 
     #[tokio::test]
     async fn decided_before_delivery_write_ahead() {
-        // One watch → one prompt: the journal holds the intent even though
-        // no sink is registered (Absent is audited, intent journaled).
         let prompt = Effect::Prompt {
             pin: "p".into(),
             line: "[doorbell] test".into(),
@@ -2077,16 +1893,12 @@ mod tests {
         let (mut brain, _rx, _tx) = test_brain("decided", vec![vec![prompt]]);
         brain.dispatch(BrainMsg::Watch("{\"kind\":9}".into())).await;
         assert_eq!(brain.stats.injects, 0, "no sink registered");
-        // Intent was still journaled decided-before-delivery.
         let journal = std::fs::read_to_string(brain.store.journal_file("w")).unwrap();
         assert!(journal.contains("\"stage\":\"decided\""), "{journal}");
     }
 
     #[tokio::test]
     async fn watch_dedup_leaves_a_journal_trace() {
-        // bd-bpj1 (F3): a cursor-suppressed duplicate must read as
-        // suppressed on later inspection, never as lost — but identical
-        // redeliveries trace once (bounded sampling, O(1) state).
         let (mut brain, _rx, _tx) = test_brain("dedup", vec![vec![], vec![], vec![]]);
         brain
             .dispatch(BrainMsg::Watch("{\"kind\":9,\"created_at\":100}".into()))
@@ -2157,8 +1969,6 @@ mod tests {
             "nor may it drop WHY: {last}"
         );
 
-        // The retry the counter promises: unblocked, the SAME seq lands, so the
-        // journal has no hole to explain and nothing is owed.
         std::fs::remove_dir_all(&blocked).expect("unblock the journal path");
         brain.journal(&sweep, &[], serde_json::json!({}), &[]);
         assert_eq!(
@@ -2233,8 +2043,6 @@ mod tests {
     #[tokio::test]
     async fn a_failed_wake_save_is_named_in_the_audit() {
         let (mut brain, _rx, _tx) = test_brain("wake-save-fail", vec![vec![]]);
-        // A DIRECTORY where the wake state belongs: `private_write` opens
-        // EISDIR, so the save cannot land.
         std::fs::create_dir_all(brain.store.wake_file("w")).expect("block the wake state");
 
         brain
@@ -2300,7 +2108,6 @@ mod tests {
             "a shared second is not a reason to drop a wake: {lines:?}"
         );
 
-        // The same id again is a redelivery and must dedup, not re-ring.
         brain.dispatch(BrainMsg::Watch(line("aa"))).await;
         assert_eq!(
             sent.lock().expect("sent log").len(),
@@ -2321,8 +2128,6 @@ mod tests {
 
     #[tokio::test]
     async fn same_msg_log_same_effects_determinism() {
-        // Drive the REAL core reducer twice over one Msg log: byte-identical
-        // effect sequences (the Phase-1 parity property, host-side).
         use crate::host::CoreReducer;
         let log = [
             BrainMsg::Watch("{\"kind\":9,\"tags\":[[\"p\",\"x\"]]}".into()),
@@ -2359,8 +2164,6 @@ mod tests {
     }
     #[tokio::test]
     async fn hear_stamps_on_delivered_not_enqueue() {
-        // F5: enqueue is not delivery — hear stamps only on the worker's
-        // Delivered receipt (pending → expire → unanswered).
         let (mut brain, _rx, _tx) = test_brain("hear", vec![]);
         let (sink, _sent) = MockSink::new();
         brain.sinks.add_sink("hc", Box::new(sink));
@@ -2401,10 +2204,8 @@ mod tests {
             })
             .await;
         drop(tx);
-        // 3 pass the 5/30/3 gate; the 4th drops to the audit trail.
         assert_eq!(brain.stats.injects, 3);
         assert_eq!(brain.stats.drops, 1);
-        // The worker pumps asynchronously: poll until the queue drains.
         let sent_n = async {
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
@@ -2497,9 +2298,6 @@ mod tests {
             "the journal carries one RestartWatch row per ACTUAL restart; counting deaths \
              instead is the defect. got {rows} rows:\n{journal}"
         );
-        // The 49 coalesced deaths are counted, not journaled one row each: at
-        // 1, 2, 4, 8, 16, 32 that is 6 rows, and the last one has to own up to
-        // the deaths it stands for.
         let inert_rows = journal.matches("\"restarted\":false").count();
         assert!(
             inert_rows <= 8,
@@ -2541,8 +2339,6 @@ mod tests {
              log2({DEATHS}) = 12. One row per death is the amplifier that made a \
              2,120-row minute out of 8 restarts"
         );
-        // Not silent: the rows that ARE written carry the deaths they cover, so
-        // the true total is recoverable by summing instead of counting.
         let covered: usize = journal
             .lines()
             .filter_map(|l| l.split("\"coalesced_deaths\":").nth(1))
@@ -2553,7 +2349,7 @@ mod tests {
             .sum();
         assert!(
             covered >= DEATHS / 2,
-            "the rows must account for the deaths they stand for: {covered} of {DEATHS} 
+            "the rows must account for the deaths they stand for: {covered} of {DEATHS}
              (a geometric cap can undershoot by at most one doubling)"
         );
     }
@@ -2591,7 +2387,6 @@ mod tests {
             let brain = Brain::new(BrainConfig::new("w"), host, FileStore::new(&dir), sinks);
             (brain, rx, tx)
         };
-        // Pre-crash: three decided+delivered wakes fill the 5/30/3 window.
         let (mut a, _rx, _tx) = mk();
         let (sink, _sent) = MockSink::new();
         a.sinks.add_sink("hc", Box::new(sink));
@@ -2605,8 +2400,7 @@ mod tests {
         })
         .await;
         assert_eq!(a.stats.injects, 3);
-        drop(a); // abort: no shutdown drain, RAM state vanishes
-        // Resume on the same store: refold reproduces budget state exactly.
+        drop(a);
         let (mut b, _rx2, _tx2) = mk();
         let budget = b.budgets.get("p").expect("refolded budget row");
         assert_eq!(budget.prompts.len(), 3, "all three grants refolded");
@@ -2617,17 +2411,14 @@ mod tests {
             journal.contains("\"stage\":\"resume\"") && journal.contains("\"redelivered\":3"),
             "resume logs its redelivery set: {journal}"
         );
-        // Seq resumes monotonic past the crash.
         let before = b.store.last_seq("w");
         b.dispatch(BrainMsg::Fact {
             summary: "z".into(),
         })
         .await;
         assert!(b.store.last_seq("w") > before, "seq advances past resume");
-        // 0 further prompts in the window: the crash bought nothing.
         assert_eq!(b.stats.injects, 0, "window stays shut after restart");
         assert_eq!(b.stats.drops, 1, "fourth prompt drops loudly");
-        // No unjournaled delivery: every delivered line was journaled first.
         for line in ["m1", "m2", "m3"] {
             assert!(journal.contains(line), "delivered intent journaled: {line}");
         }
@@ -2638,8 +2429,6 @@ mod tests {
     /// stays monotonic and the sweep cadence re-stabilizes.
     #[tokio::test]
     async fn clock_jump_keeps_order_and_restabilizes() {
-        // rv23 #3: the mid-jump sweep must DECIDE something to be a row (an
-        // idle sweep no longer journals), so it carries one audit effect.
         let decided = vec![Effect::Audit {
             kind: "k".into(),
             pin: "p".into(),
@@ -2647,7 +2436,7 @@ mod tests {
         }];
         let (mut brain, _rx, _tx) = test_brain("clock", vec![vec![], decided, vec![]]);
         brain.dispatch(BrainMsg::Watch("{\"kind\":9}".into())).await;
-        brain.host.now = 1_000_000 + 86_400; // +1 day mid-run
+        brain.host.now = 1_000_000 + 86_400;
         brain
             .dispatch(BrainMsg::Sweep {
                 now: 1_000_000 + 86_400,
@@ -2697,14 +2486,12 @@ mod tests {
         let (sink, _sent) = MockSink::new();
         brain.sinks.add_sink("hc", Box::new(sink));
         brain.host.now = t;
-        // 3 grants fill the 5/30/3 window at T; the 4th drops.
         brain
             .dispatch(BrainMsg::Fact {
                 summary: "x".into(),
             })
             .await;
         assert_eq!((brain.stats.injects, brain.stats.drops), (3, 1));
-        // A real status transition stamps liveness at T.
         brain
             .dispatch(BrainMsg::PlaneStatus {
                 pin: "p".into(),
@@ -2713,8 +2500,6 @@ mod tests {
             .await;
         assert_eq!(brain.wake.last_wake_unix, Some(t), "liveness stamped at T");
 
-        // NTP steps the clock BACK one hour: no prompt may be granted and no
-        // stamp may rewind.
         brain.host.now = t - 3_600;
         brain
             .dispatch(BrainMsg::PlaneStatus {
@@ -2732,8 +2517,6 @@ mod tests {
             "the liveness ratchet refuses a behind stamp (bd-7qg6)"
         );
 
-        // ...then FORWARD two hours: the window has rolled, so the deadline
-        // state re-stabilizes and the next wake goes out.
         brain.host.now = t + 7_200;
         brain
             .dispatch(BrainMsg::PlaneStatus {
@@ -2749,7 +2532,6 @@ mod tests {
             .await;
         assert_eq!(brain.stats.injects, 4, "budget window rolled forward");
 
-        // Journal order is the seq counter's business, never the clock's.
         let raw = std::fs::read_to_string(brain.store.journal_file("w")).unwrap();
         let seqs: Vec<u64> = raw
             .lines()
@@ -2765,14 +2547,9 @@ mod tests {
 
     #[tokio::test]
     async fn cursorless_pin_sweeps_from_redelivery_floor() {
-        // bd-5d0v: a pin with no since_by_pin entry (fresh spawn, state
-        // loss) must backfill from the bounded floor. The old fallback
-        // fetched strictly-newer-than-sweep-now = empty forever, so the
-        // cursor never initialized and the pin stayed plane-P deaf on
-        // every future sweep too.
         let now = 1_700_000_000u64;
         let floor = doorbell_core::redelivery_floor_rfc3339(now);
-        let row_us = now as i64 * 1_000_000; // recent mail, inside the floor
+        let row_us = now as i64 * 1_000_000;
         let (mut brain, _rx, _tx) = test_brain("floor", vec![vec![Effect::FetchInbox], vec![]]);
         brain.host.now = now;
         brain.host.pin_list = vec!["p".into()];
@@ -2870,7 +2647,6 @@ mod tests {
         brain.cfg.digest_threshold = 1;
         let (sink, sent) = MockSink::new();
         brain.sinks.add_sink("hc", Box::new(sink));
-        // Inject, then sweep past the 120s hear window: pin goes deaf.
         brain.hear.note_inject("svc", None, 1_000_000);
         brain
             .dispatch(BrainMsg::Sweep {
@@ -2880,7 +2656,6 @@ mod tests {
         assert_eq!(brain.hear.unanswered_pins(), vec!["svc".to_string()]);
         brain.digest_push("svc".into(), "queued".into());
         brain.maybe_flush_digest().await;
-        // Poll the async worker for the batch.
         let body = async {
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
@@ -2922,14 +2697,11 @@ mod tests {
         brain
             .dispatch(BrainMsg::Watch("{\"kind\":9,\"created_at\":2}".into()))
             .await;
-        // The journal row names the skip, so a later `why` read is not a
-        // mystery about where the wake went.
         let journal = std::fs::read_to_string(brain.store.journal_file("w")).unwrap();
         assert!(
             journal.contains("\"why\":\"no_route\""),
             "the watch row must carry the digest reason: {journal}"
         );
-        // And the wake itself is in the batch for the human.
         let (tx, rx) = tokio::sync::oneshot::channel();
         brain
             .dispatch(BrainMsg::Ask {
@@ -2944,7 +2716,6 @@ mod tests {
             ),
             other => panic!("expected Digest reply, got {other:?}"),
         }
-        // A wake that reaches the digest is never a prompt intent.
         assert_eq!(brain.stats.injects, 0, "no prompt route exists");
     }
 
@@ -2962,7 +2733,7 @@ mod tests {
                 why: "no_route".into(),
             }]],
         );
-        brain.cfg.digest_threshold = 1; // force the flush during this arm
+        brain.cfg.digest_threshold = 1;
         let (sink, sent) = MockSink::new();
         brain.sinks.add_sink("hc", Box::new(sink));
         brain.host.unroutable.insert("OperatorPin".into());
@@ -2995,7 +2766,6 @@ mod tests {
         use crate::subscribe::*;
         let dir = std::env::temp_dir().join(format!("dbrt-human-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        // Operator subscribes the human (npub) on the hc sink.
         let mut store = SubscriptionStore::open(&dir);
         let sub = Subscription {
             id: "human-1".into(),
@@ -3010,7 +2780,6 @@ mod tests {
         let sub = store
             .subscribe(Actor::operator(), sub, "w")
             .expect("operator subscribes human");
-        // Brain bound to the subscription (tag + budget template).
         let (tx, _rx) = tokio::sync::mpsc::channel(crate::BRAIN_CAP);
         let mut host = MockHost::new(1_000_000);
         host.script = VecDeque::from(vec![vec![Effect::Prompt {
@@ -3026,7 +2795,6 @@ mod tests {
         brain.sinks.add_sink("hc", Box::new(sink));
         brain.dispatch(BrainMsg::Watch("{\"kind\":9}".into())).await;
         assert_eq!(brain.stats.injects, 1, "human wake delivers");
-        // Journal row carries the subscriber tag (why --subscriber replays).
         let journal = std::fs::read_to_string(brain.store.journal_file("w")).unwrap();
         assert!(
             journal.contains("\"subscriber\":\"npub:npub1human\""),
@@ -3037,14 +2805,8 @@ mod tests {
         let _ = sent;
     }
 
-    // ---- Audit regression tests (bd-0012 verify) ----
-
     #[tokio::test]
     async fn status_transition_gate_sees_pre_tick_status() {
-        // Audit P1: the wake-liveness ratchet must compare the PREVIOUS
-        // status. The old code read prev_status AFTER the tick (which
-        // records the new status), so `transitioned` was always false on
-        // real hosts and last_wake never advanced on benign transitions.
         let (mut brain, _rx, _tx) = test_brain("statusgate", vec![]);
         brain
             .dispatch(BrainMsg::PlaneStatus {
@@ -3064,7 +2826,6 @@ mod tests {
             second.is_some(),
             "working -> idle transition must ratchet last_wake (prev status = working)"
         );
-        // Same-status repeats never ratchet (static rows stay silent).
         brain
             .dispatch(BrainMsg::PlaneStatus {
                 pin: "p".into(),
@@ -3075,17 +2836,12 @@ mod tests {
             brain.wake.last_wake_unix, second,
             "already-idle repeats must not advance liveness"
         );
-        // The first dispatch (unknown -> working) transitioned too, but the
-        // clock is frozen in tests; what matters is that the benign
-        // working -> idle transition ratcheted at all (old code: never).
         assert!(first.is_none() || first == second);
         assert!(second.is_some());
     }
 
     #[tokio::test]
     async fn digest_ask_resets_interval_clock() {
-        // Audit P1: AskKind::Digest took the batch but left digest_since
-        // running — the next flush fired immediately with only fresh lines.
         let (mut brain, _rx, _tx) = test_brain("digestask", vec![]);
         brain.digest_push("p".into(), "[doorbell] one".into());
         assert!(brain.digest_since.is_some());
@@ -3108,9 +2864,6 @@ mod tests {
 
     #[tokio::test]
     async fn sink_degrade_restarts_and_requeues_with_factory() {
-        // Audit P1: supervision was unwired — a parked sink stayed dead
-        // until process restart. With a factory, Degraded must restart the
-        // sink and requeue its shed overflow (at-least-once).
         let (deg_tx, mut deg_rx) = tokio::sync::mpsc::channel::<BrainMsg>(16);
         let (mut brain, _rx, _tx2) = test_brain("sinkrestart", vec![]);
         brain.sinks = SinkManager::new(deg_tx);
@@ -3145,7 +2898,6 @@ mod tests {
                 })
             },
         );
-        // First intent fails at the endpoint → park; second sheds.
         brain
             .deliver_prompts(vec![("p".into(), "[doorbell] wake".into())])
             .await;
@@ -3158,14 +2910,10 @@ mod tests {
             ),
             "parked sink sheds"
         );
-        // The worker's Degraded lands on deg_rx; feed it through dispatch
-        // exactly as the run loop would.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         while let Ok(m) = deg_rx.try_recv() {
             brain.dispatch(m).await;
         }
-        // Restarted (fail=false) adapter must have delivered the requeued
-        // failed intent; the sink is unparked and pumping again.
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         assert!(
             n.load(std::sync::atomic::Ordering::SeqCst) >= 1,
@@ -3173,7 +2921,6 @@ mod tests {
             n.load(std::sync::atomic::Ordering::SeqCst)
         );
         assert!(!brain.sinks.parked("hc").await, "sink revived");
-        // And it accepts new intents again (no longer parked).
         assert!(
             matches!(
                 brain.sinks.send("hc", "p", "[doorbell] three").await,
@@ -3185,8 +2932,6 @@ mod tests {
 
     #[tokio::test]
     async fn sink_degrade_without_factory_sheds_to_digest() {
-        // No factory → restart refuses; shed overflow lands in the digest
-        // (never silent, the pre-supervision path).
         let (deg_tx, _deg_rx) = tokio::sync::mpsc::channel::<BrainMsg>(16);
         let (mut brain, _rx, _tx2) = test_brain("sinknofactory", vec![]);
         brain.sinks = SinkManager::new(deg_tx);
@@ -3207,11 +2952,6 @@ mod tests {
         assert!(brain.sinks.parked("hc").await, "no factory: stays parked");
     }
 }
-
-// ---- heard-or-deaf tracking (folded from hear.rs, bd-8zyj) ----
-//
-// Heard-or-deaf tracking — verbatim port of `src/doorbell.rs:574-666`.
-// A ring not heard within 120s goes unanswered (digest names it, S3).
 
 #[derive(Debug, Clone)]
 struct PendingRing {
@@ -3320,7 +3060,6 @@ mod hear_tests {
         assert!(h.unanswered_pins().is_empty());
         h.note_inject("q", Some("npub"), 100);
         assert_eq!(h.expire(100 + 120, 120), vec!["q".to_string()]);
-        // Late post by pubkey clears the deaf pin via remembered npub.
         h.note_heard_pubkey("NPUB-x");
         h.note_heard_pubkey("npub");
         assert!(h.unanswered_pins().is_empty());

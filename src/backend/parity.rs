@@ -58,8 +58,6 @@ mod tests {
         }
     }
 
-    // ---- error coercion: the path real transport errors take ----
-
     #[test]
     fn anyhow_error_coerces_to_other_preserving_message() {
         let err: BackendError = anyhow::anyhow!("socket refused").into();
@@ -85,8 +83,6 @@ mod tests {
             other => panic!("expected Other, got {other:?}"),
         }
     }
-
-    // ---- Unsupported honesty: defaults don't accidentally Ok ----
 
     /// A backend that overrides only `name()` inherits `Unsupported` for every
     /// operation. This is the open-to-extension contract (ADR-0002 §6): a new
@@ -115,16 +111,6 @@ mod tests {
         }
     }
 
-    // ---- delegation shape (structural parity guarantee) ----
-    //
-    // The wrappers in src/backend/{hc,toron}.rs are PURE DELEGATION:
-    // each method body is a single forward to the underlying Client/Mail
-    // method (+ error coercion via `?` or `.map_err(BackendError::from)`).
-    // There is no logic that could diverge from a direct call. This is
-    // verified by code review (the fn bodies are one line each); the tests
-    // above prove the error path; live round-trips (below, #[ignore]) prove
-    // the happy path against a real socket/HTTP once infra exists.
-
     /// review-fix F6: `agent_prompt_coded` maps a coded error to landing DATA
     /// (status XOR code), NOT a transport Err — so a backend-agnostic __send
     /// classifies identically to the concrete client. The pure mapping is the
@@ -132,7 +118,6 @@ mod tests {
     #[test]
     fn prompt_landing_maps_landed_status_and_coded_error() {
         use toron_core::backend::{AgentInfo, AgentStatus};
-        // landed: Ok(AgentInfo) → status Some, code None
         let ok = map_prompt_result(Ok(AgentInfo {
             agent: Some("pi".into()),
             agent_status: AgentStatus::Working,
@@ -155,7 +140,6 @@ mod tests {
         }));
         assert_eq!(ok.status, Some(AgentStatus::Working));
         assert_eq!(ok.code, None);
-        // coded error: Err(toron BackendError) → status None, code Some
         let err = map_prompt_result(Err(toron_core::backend::BackendError::new(
             toron_core::backend::error::BackendErrorCode::AgentPromptStalled,
             "x",
@@ -163,37 +147,6 @@ mod tests {
         assert_eq!(err.status, None);
         assert_eq!(err.code.as_deref(), Some("agent_prompt_stalled"));
     }
-
-    // =====================================================================
-    // Live JSON-shape smoke harness (ADR-0003 §4, bd-am5; bd-euav: toron
-    // only — the agentmail backend is deleted, so cross-backend parity is
-    // vacuous. The harness now drives the SAME toron method twice against
-    // the live toron daemon (127.0.0.1:18080), asserting the JSON shape
-    // contract (same top-level keys, same semantic fields) still holds.
-    //
-    // DOCUMENTED ALLOWLIST (id-type + DB-field differences, kept for the
-    // historical AM comparison they were written against):
-    // - `id`/`event_id`: AM message ids are `u64` sequence numbers; toron
-    //   uses hex event ids. Values never match; only the KEY is compared.
-    // - `sender` vs `from`: AM `fetch_inbox`/`search` emit `from` (the sender
-    //   display name); toron emits `sender` (the npub hex). Different keys,
-    //   both semantic "who sent this".
-    // - `created_ts` (AM, ISO) vs `created_ts_us` (toron, epoch µs): timestamp
-    //   representation differs; both are "when created".
-    // - AM extra DB columns absent on toron (`read_ts`, `kind`, `project_id`,
-    //   `sender_id`, `attachments`, `inception_ts`, `last_active_ts`,
-    //   `contact_policy`).
-    // - toron extra Nostr fields absent on AM (`npub`, `key_path`,
-    //   `profile_event_id`, `manifest_event_id`).
-    // - `health_check`: AM returns a rich health object (status/health_level/
-    //   pool stats/…); toron returns `{archive, bus}`. Both have a status-ish
-    //   field (`status`/`ok`); keys otherwise differ by design.
-    //
-    // The harness compares the TOP-LEVEL KEYS of the JSON each method returns,
-    // applying the allowlist above (normalized id keys + dropped backend-only
-    // DB fields). It does NOT compare values (ids, timestamps, npubs differ by
-    // design) — it proves the backend speaks the same semantic contract.
-    // =====================================================================
 
     /// Backend kinds the harness can drive (bd-euav: toron only).
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -219,37 +172,23 @@ mod tests {
     /// no counterpart on the other side.
     fn normalize_key(k: &str) -> Option<String> {
         match k {
-            // id-type allowlist: AM u64 vs toron hex → compare the KEY only
             "id" | "event_id" | "message_id" => Some("id".to_string()),
-            // sender naming: AM `from` (name) vs toron `sender` (npub)
             "from" | "sender" => Some("sender".to_string()),
-            // timestamp representation: ISO string vs epoch-µs number → same
-            // semantic (value type canonicalized to `ts` below)
             "created_ts" | "created_ts_us" => Some("created_ts".to_string()),
-            // AM-only DB columns (SQLite) — dropped
             "read_ts" | "kind" | "project_id" | "sender_id" | "attachments"
             | "inception_ts" | "last_active_ts" | "last_active_ts_us"
             | "contact_policy" | "database_url" | "storage_root" | "pool_utilization"
             | "semantic_readiness" | "http_host" | "http_port" | "queues"
             | "integrity" | "two_tier_indexing" | "verdicts" | "disk"
-            // AM-only delivery routing arrays (toron messages carry no cc/bcc)
             | "to" | "cc" | "bcc"
-            // AM `search_messages` result envelope fields (toron returns a
-            // bare `result` array; the diagnostics are server-state noise)
             | "guidance" | "suggestions" | "summary" | "diagnostics"
             | "degraded" | "fallback_mode" | "remediation_hints"
             | "search_index_reason" | "search_index_state"
-            // AM `ensure_project` returns the full project DB record; toron
-            // returns a minimal `{created, slug}` envelope. The DB-record
-            // fields below have no toron counterpart (ADR-0003 §4 DB-field
-            // allowlist) — the shared semantic field is `slug`.
             | "created_at" | "identity_mode_used" | "canonical_path"
             | "human_key" | "repo_root" | "git_common_dir" | "branch"
             | "worktree_name" | "core_ignorecase" | "normalized_remote"
             | "project_uid" | "discovery" | "created" => None,
-            // toron-only Nostr fields — dropped
             "npub" | "key_path" | "profile_event_id" | "manifest_event_id" => None,
-            // keep everything else as-is (semantic fields must match)
             other => Some(other.to_string()),
         }
     }
@@ -283,15 +222,9 @@ mod tests {
                         continue;
                     }
                     if let Some(nk) = normalize_key(k) {
-                        // id-type + timestamp-representation differences are
-                        // allowlisted: the VALUE TYPE is canonicalized so AM's
-                        // `id:num`/`created_ts:str` matches toron's
-                        // `id:str`/`created_ts:num` (ADR-0003 §4 allowlist).
                         let tag = match nk.as_str() {
                             "id" => "id",
                             "created_ts" => "ts",
-                            // AM search emits ack_required as num (0/1);
-                            // AM inbox + toron emit bool — same semantic
                             "ack_required" => "flag",
                             _ => type_tag(val),
                         };
@@ -358,9 +291,6 @@ mod tests {
                 }
                 #[cfg(not(feature = "mail-toron"))]
                 {
-                    // The live harness needs the toron backend compiled in; the
-                    // default build gates it behind `mail-toron` (the test is
-                    // #[ignore] + requires --all-features anyway — see below).
                     let _ = mail;
                     unreachable!("live parity requires --all-features (mail-toron)")
                 }
@@ -388,7 +318,6 @@ mod tests {
         let mut backends: Vec<(ParityKind, Box<dyn MailSurface>)> =
             kinds.iter().map(|k| (*k, live_backend(*k))).collect();
 
-        // health: both must report a status-ish field (allowlist-normalized).
         for (kind, b) in &mut backends {
             let h = run_mail(b.health()).unwrap_or_else(|e| panic!("{} health: {e}", kind.name()));
             let status = serde_json::to_value(&h).unwrap_or_default();
@@ -399,7 +328,6 @@ mod tests {
             );
         }
 
-        // ensure_project: same normalized key shape (slug/human_key/…).
         let mut ensured = Vec::new();
         for (kind, b) in &mut backends {
             let s = run_mail(b.ensure_project(project)).expect("ensure_project");
@@ -409,15 +337,10 @@ mod tests {
             "ensure_project",
             &ensured[0].1,
             &ensured[1].1,
-            &["id"], // AM's numeric project id; toron's envelope has none
+            &["id"],
             false,
         );
 
-        // register_agent: responses diverge BY DESIGN — AM echoes the full
-        // agent profile (model/program/task/attachments_policy/capabilities/…);
-        // toron returns the crypto identity envelope (npub/key_path/…). The
-        // documented shared semantic field is `name` (the identity). Assert
-        // both echo the same identity; the shape divergence is allowlisted.
         for (kind, b) in &mut backends {
             let profile = crate::backend::AgentProfile {
                 name: agent.to_string(),
@@ -436,7 +359,6 @@ mod tests {
             );
         }
 
-        // list_agents: both array of agent objects with same semantic keys.
         let mut agents = Vec::new();
         for (kind, b) in &mut backends {
             let a = run_mail(b.list_agents(project, None)).expect("list_agents");
@@ -444,7 +366,6 @@ mod tests {
         }
         assert_shape_parity("list_agents", &agents[0].1, &agents[1].1, &[], true);
 
-        // send + inbox round-trip: send to self, then fetch the inbox.
         for (_kind, b) in &mut backends {
             let _ = run_mail(b.send(&crate::backend::SendMail {
                 project: project.to_string(),
@@ -475,10 +396,6 @@ mod tests {
         }
         assert_shape_parity("inbox", &inboxes[0].1, &inboxes[1].1, &[], true);
 
-        // reply: reply to the just-sent message (its id comes from the inbox
-        // row), then assert both backends' replies landed. The reply subject
-        // contract (c3b.5) is `Re: <parent subject>` — the empty-subject
-        // hardcode is gone; the parent lookup runs against the project inbox.
         let reply_targets: Vec<(ParityKind, Vec<crate::backend::MailItem>)> = inboxes
             .iter()
             .map(|(kind, v)| {
@@ -509,7 +426,6 @@ mod tests {
             }))
             .unwrap_or_else(|e| panic!("{} reply: {e}", kind.name()));
         }
-        // both replies visible in the inbox (subject prefixed `Re: `).
         for (kind, b) in &mut backends {
             let items = run_mail(b.inbox(&InboxQuery {
                 project: project.to_string(),
@@ -530,10 +446,6 @@ mod tests {
             );
         }
 
-        // search: envelope-only parity. toron's projection is async (bus →
-        // unwrap-loop → sqlite), so poll the toron backend briefly until its
-        // result is non-empty before comparing shapes (bounded, 10s). The
-        // message element shape is already proven by the inbox parity above.
         let mut searches = Vec::new();
         for (kind, b) in &mut backends {
             let mut last = run_mail(b.search(&crate::backend::SearchQuery {
@@ -644,7 +556,6 @@ mod tests {
     #[test]
     fn shape_normalization_allowlist_is_not_vacuous() {
         use serde_json::json;
-        // AM shape: numeric id, `from` naming, string created_ts, AM-only cols.
         let am = json!({
             "id": 42,
             "from": "CoralFinch",
@@ -655,14 +566,12 @@ mod tests {
             "to": ["x"],
             "attachments": [],
         });
-        // toron shape: hex event_id, `sender` npub, epoch-µs number.
         let toron = json!({
             "event_id": "a1b2c3",
             "sender": "7f7ed685445ed08a1d90005c092480b33e8f5439d9fcb0689d45830b6f3707ea",
             "created_ts_us": 1786000000000000_i64,
         });
         assert_shape_parity("normalization", &am, &toron, &[], true);
-        // op-scoped extra_drop removes keys BOTH sides may omit.
         let am2 = json!({ "id": 1, "result": [] });
         let toron2 = json!({ "id": "hex", "result": [], "renewed": 0 });
         assert_shape_parity("extra_drop", &am2, &toron2, &["renewed"], false);

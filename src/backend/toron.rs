@@ -154,8 +154,6 @@ fn renew_result_from(v: Value) -> RenewResult {
                         .get("new_expires_ts")
                         .and_then(Value::as_str)
                         .and_then(|s| s.parse().ok()),
-                    // zfnx.11 epoch rides lease content, not the wire
-                    // shape — absent here reads as genesis 0.
                     epoch: r.get("epoch").and_then(Value::as_u64).unwrap_or(0),
                 })
                 .collect()
@@ -294,7 +292,6 @@ impl MailSurface for ToronMailBackend {
         };
         let limit = req.limit.unwrap_or(50) as u32;
         let v = run_facade(mail, move |m| m.search(&project, &query, limit, &filter)).await?;
-        // The facade envelope is `{"result": [...]}`.
         let arr = v.get("result").cloned().unwrap_or(v);
         into_typed(arr, "search")
     }
@@ -572,7 +569,6 @@ impl MailSurface for ToronMailBackend {
             extend_secs,
         );
         let v = run_facade(mail, move |m| m.renew_slot(&project, &agent, &slot, extend)).await?;
-        // The facade JSON for a no-op renew is `{...}` without a lease.
         if v.get("slot").is_none() && v.get("expires_ts_us").is_none() {
             return Ok(None);
         }
@@ -627,7 +623,6 @@ impl MailSurface for ToronMailBackend {
             m.search_product(&key_for_facade, &query, limit)
         })
         .await?;
-        // Envelope `{"result": [...]}` of `MailItem`-shaped rows (+ `project`).
         let arr = row_array(&v);
         arr.into_iter()
             .map(|m| {
@@ -657,8 +652,6 @@ impl MailSurface for ToronMailBackend {
             m.inbox_product(&key_for_facade, &agent, limit)
         })
         .await?;
-        // Envelope `{"messages": [...]}` / `{"result": [...]}` of
-        // `MailItem`-shaped rows (+ `project`).
         let arr = row_array(&v);
         arr.into_iter()
             .map(|m| {
@@ -831,8 +824,6 @@ mod tests {
             Some(1786200000000000),
             "new_expires_ts parses as i64, never unwrap_or(0)"
         );
-        // bd-evqs: the reason (owning bead id) must survive the envelope —
-        // the loop's closed-bead sweep reads it to release stale leases.
         assert_eq!(r.reservations[0].reason, "bd-oj9o");
     }
 

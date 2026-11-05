@@ -79,9 +79,6 @@ pub async fn append_spawn_facts(
     if ctx_gen.is_none() && role_gen.is_none() {
         return Ok(None);
     }
-    // ponytail: two spawns racing the first context both send gen 1. A
-    // StaleGen on the context means the other won; this claim still writes
-    // the role. A lost race is not retried inside the spawn.
     let claim = store
         .claim_epoch(&producer, &format!("spawn:{}", std::process::id()))
         .await

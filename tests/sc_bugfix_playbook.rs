@@ -41,7 +41,7 @@ fn extract_builtin_yaml(src: &str, name: &str) -> Option<String> {
         .iter()
         .filter_map(|(d, end)| rest.find(d).map(|pos| (pos, *end)))
         .min_by_key(|(pos, _)| *pos)?;
-    let body_start = open + delim.len() + 2; // r + hashes + opening quote
+    let body_start = open + delim.len() + 2;
     let end_marker = format!("\"{delim}");
     let body_end = rest[body_start..].find(&end_marker)? + body_start;
     Some(rest[body_start..body_end].to_string())
@@ -53,17 +53,14 @@ fn bug_fix_control_flow_orders_repro_tdd_fix_prove() {
     let wf = builtin_bug_fix();
     let graph = wf.graph.as_ref().expect("bug-fix is a graph");
 
-    // Needs edges intact (the DAG shape the wave scheduler walks) — Scenario B: repro -> fix -> prove
     assert_eq!(graph.nodes["fix"].needs, vec!["repro".to_string()]);
     assert_eq!(graph.nodes["prove"].needs, vec!["fix".to_string()]);
     assert!(graph.nodes["repro"].needs.is_empty(), "repro is the root");
-    // tdd no longer exists as a separate node — the repair loop handles RED→GREEN
     assert!(
         !graph.nodes.contains_key("tdd"),
         "tdd collapsed into repair recipe"
     );
 
-    // fix must be the repair-until-verified recipe
     match &graph.nodes["fix"].action {
         Action::CallWorkflow {
             workflow, inputs, ..
@@ -80,7 +77,6 @@ fn bug_fix_control_flow_orders_repro_tdd_fix_prove() {
         other => panic!("fix must be call_workflow repair-until-verified, got {other:?}"),
     }
 
-    // prove is @reviewer dispatch
     let Action::DispatchJob { spec, .. } = &graph.nodes["prove"].action else {
         panic!("prove is a dispatch_job");
     };
@@ -96,7 +92,6 @@ fn bug_fix_control_flow_orders_repro_tdd_fix_prove() {
 fn bug_fix_lint_gate_rejects_broken_repro_edge() {
     use toron_workflow::lint::lint_workflow;
 
-    // Broken: fix -> tdd, but tdd -> (nothing); repro is a detached node.
     let broken = toron_workflow::schema::parse_workflow(
         r#"
 name: bug-fix
@@ -137,7 +132,6 @@ graph:
         "lint must name the missing repro predecessor: {joined}"
     );
 
-    // The builtin's correct chain passes.
     let report = lint_workflow(&builtin_bug_fix());
     assert!(
         report.is_clean(),
@@ -215,21 +209,14 @@ fn bug_fix_cli_control_flow_reports_all_nodes() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json stdout");
-    // crew: scout (repro) + recipe coders/reviewers + reviewer (prove).
-    // GS-039 P0-3 (ADR-0011 D2): repair-until-verified ships an EXPLICIT
-    // crew coder:1 reviewer:1 — never auto-balloon to 3+3 — so the expanded
-    // run reports one member per role (sub-workflow roles take max).
     assert_eq!(v["crew"]["scout"], 1, "crew: {v}");
     assert_eq!(v["crew"]["coder"], 1, "crew: {v}");
     assert_eq!(v["crew"]["reviewer"], 1, "crew: {v}");
-    // repro, fix (recipe), prove dispatched (recording mode reports each node)
     let output = v["output"].as_object().expect("output object");
     for node in ["repro", "fix", "prove"] {
         assert!(output.contains_key(node), "{node} in CLI output: {v}");
     }
-    // repro and prove are dispatch_job; fix is the recipe (call_workflow expanded)
     assert_eq!(output["repro"]["action"], "dispatch_job", "repro action");
-    // fix output is the recipe's result — in recording mode it may be call_workflow or the child's result
     assert!(output["fix"].is_object(), "fix output present: {v}");
     assert_eq!(output["prove"]["action"], "dispatch_job", "prove action");
 }
@@ -263,8 +250,6 @@ fn cli_control_flow_ignores_a_corrupted_ambient_user_tier() {
 
     let prev = std::env::var_os("XDG_CONFIG_HOME");
     // SAFETY: guarded by `spawn_lock`, the only env mutation in this file, and
-    // restored below on every path (the assert! below can panic, so the guard
-    // `Drop` restores rather than relying on fallthrough).
     struct Restore(Option<std::ffi::OsString>);
     impl Drop for Restore {
         fn drop(&mut self) {

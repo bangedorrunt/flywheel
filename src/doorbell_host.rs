@@ -50,8 +50,6 @@ pub struct RtHost {
     /// the transport never regained a fast first retry.
     retry: std::sync::Arc<std::sync::Mutex<doorbell_rt::WatchRetry>>,
     authority: crate::authority::RuntimeAuthority,
-    // F7: cache the whois-backed index — rebuild at most every 60s or when
-    // the registry pin set changes (was every 1s sweep: N whois RPCs/sec).
     index_refreshed_at: u64,
     index_pins: Vec<String>,
     /// The one live wake-socket consumer. Shared with the restart task so a
@@ -74,9 +72,6 @@ pub struct RtHost {
     state_log: Option<crate::run_state_recorder::RunStateRecorder>,
     /// The writer thread draining `state_log`. Held so the handle is not
     /// dropped; the thread runs for the process lifetime.
-    // The field is never READ, and that is the point: holding the JoinHandle is
-    // what keeps the writer's result observable and prevents an accidental
-    // detach. The thread is intentionally not shut down per-host.
     #[allow(dead_code)]
     state_log_writer: Option<std::thread::JoinHandle<()>>,
     /// T3 (bd-ma3y): services for durable interpret, built once per process
@@ -100,18 +95,10 @@ fn wake_outcome_to_brain(
 ) {
     use doorbell_rt::wake_brain::Forwarded;
     use doorbell_rt::wake_sock::WakeOutcome;
-    // mcc9: Watch goes through the forwarder (backpressure on a full channel,
-    // then an exact-count drop + ONE death + cursor resume — never one death
-    // per line, never a silent shed). Stamp .event only once the brain has the
-    // line. Died rings the side bell so a full channel cannot hide restart.
     match out {
         WakeOutcome::Watch(l) => match fw.forward(l) {
             f if f.reached_brain() => {
                 doorbell_rt::watchbeat::touch_event(&config::state_dir(), workspace);
-                // A delivered event is the only trustworthy evidence the socket
-                // is live again, so it is the only thing that may reopen the
-                // backoff gate. A heartbeat proves the ticker ran, not that the
-                // transport delivers — bd-kz54's whole lesson.
                 if let Ok(mut r) = retry.lock() {
                     r.reset();
                 }
@@ -122,17 +109,13 @@ fn wake_outcome_to_brain(
                 retired.store(true, std::sync::atomic::Ordering::SeqCst);
                 doorbell_rt::msg::deliver_died(tx, Some(died_bell));
             }
-            // Counted by the forwarder; the consumer is already condemned.
             _ => {}
         },
         WakeOutcome::Heartbeat => {
             doorbell_rt::watchbeat::touch_heartbeat(&config::state_dir(), workspace);
         }
-        // toron#17: a counted, audited gap (the consumer wrote the row); the
-        // consumer is not dead and nothing reconnects.
         WakeOutcome::EventsLost { .. } => {
             fw.note_events_lost();
-            // Bindings are re-verified before any further ring.
             crate::inbox_host::signal_invalidate(toron_core::inbox_program::Invalidate::EventsLost);
         }
         WakeOutcome::Died => {
@@ -178,13 +161,9 @@ impl RtHost {
         if let Some(pin) = state::load_captain_alias(project) {
             model.roles.insert("captain".into(), pin);
         }
-        // GS-048: restore sticky-open topology across host restarts.
         if let Some(topo) = state::load_session_topology(project) {
             model.session_topology = Some(topo);
         }
-        // Same seeds as the old loop head (fail-loud on I/O, never skip).
-        // Host construction runs inside the embedded runtime; the receipt
-        // store lists via `block_on` on the shared mail runtime, so seed off it.
         crate::backend::run_mail_off_runtime_sync(|| -> anyhow::Result<()> {
             crate::durable::seed_workspace_from_active_loop(&mut model, project)?;
             crate::seed_roles_from_binds(&mut model, project)?;
@@ -192,22 +171,12 @@ impl RtHost {
             Ok(())
         })?;
         model.last_now = unix_now();
-        // bd-b2b3: opt-in. Recording a boundary per tick changes the
-        // dispatcher's storage and latency profile, so it is an explicit
-        // operator choice (FLYWHEEL_RUN_STATE_LOG=1) rather than a silent new
-        // default. `attach` returns None when no toron index is open, which is
-        // also visible rather than a silent no-op.
         let state_log = match std::env::var("FLYWHEEL_RUN_STATE_LOG") {
             Ok(v) if v.trim() == "1" || v.trim().eq_ignore_ascii_case("true") => {
                 crate::run_state_recorder::RunStateRecorder::attach(&format!("flywheel/{project}"))
             }
             _ => None,
         };
-        // bd-b2b3: the writer task is what makes an enqueued boundary durable.
-        // Without it the queue fills to PENDING_CAP and then refuses loudly
-        // forever, so the recorder is only ever constructed together with its
-        // writer. Computed BEFORE the struct literal because the literal moves
-        // `state_log`.
         let state_log_writer = state_log
             .clone()
             .map(crate::run_state_recorder::spawn_writer);
@@ -236,11 +205,6 @@ impl RtHost {
             wake_counters: doorbell_rt::wake_brain::counters_for(workspace),
             wake_resume: Arc::new(Mutex::new(None)),
             died_bell: doorbell_rt::DiedBell::new(),
-            // bd-b2b3: opt-in. Recording a boundary per tick changes the
-            // dispatcher's storage and latency profile, so it is an explicit
-            // operator choice (`FLYWHEEL_RUN_STATE_LOG=1`) rather than a silent
-            // new default. Returns None when no toron index is open, which is
-            // also visible rather than a silent no-op.
             state_log,
             state_log_writer,
             durable_services: durable_services(),
@@ -339,7 +303,6 @@ impl RtHost {
                     break;
                 }
                 Err(e) => {
-                    // hc rejects the whole request if any listed pane is gone.
                     eprintln!(
                         "flywheel doorbell: multiplex subscribe rejected ({e:#}) — refreshing pane list"
                     );
@@ -393,15 +356,6 @@ impl RtHost {
                         }
                     }
                     Ok(StreamOutcome::EventsLost) => {
-                        // A gap is a NOTICE, not a death: the subscription is
-                        // still good (the reader keeps reading), so the
-                        // coverage STAYS and the loop continues. Tearing the
-                        // subscription down here cost a socket per gap (the
-                        // daemon's socket count grew at the gap rate) and
-                        // re-armed a subscriber that starts BEHIND the ring,
-                        // so it was told `events_lost` again - one upstream
-                        // gap fanned out into a gap and a socket per
-                        // subscriber.
                         eprintln!(
                             "flywheel doorbell: events_lost — reconciling status via session.snapshot"
                         );
@@ -415,7 +369,6 @@ impl RtHost {
                         );
                     }
                     Ok(StreamOutcome::Closed) | Err(_) => {
-                        // Stream death: clear coverage so the next sweep re-arms.
                         clear_covered(&covered_shared, &clear_ids);
                         break;
                     }
@@ -473,8 +426,6 @@ fn reconcile_status_after_events_lost(
 fn agents_from_session_snapshot(
     snap: &serde_json::Value,
 ) -> Option<Vec<crate::hc_support::AgentInfo>> {
-    // Common shapes: { agents: [...] } or { panes: [...] } with agent fields,
-    // or nested under tabs. Prefer an agents array; else try panes.
     if let Some(arr) = snap.get("agents").and_then(|v| v.as_array()) {
         let parsed: Result<Vec<_>, _> = arr.iter().cloned().map(serde_json::from_value).collect();
         return parsed.ok();
@@ -491,8 +442,6 @@ fn build_index(cfg: &Config, project: &str) -> doorbell::SelfIndex {
         .iter()
         .filter_map(|e| e.mail_identity.clone())
         .collect();
-    // Mail whois runs `block_on` on the shared mail runtime; this is reached
-    // from the brain's runtime thread (host construction, maintenance sweep).
     crate::backend::run_mail_off_runtime_sync(|| crate::doorbell_self_index(cfg, project, &pins))
 }
 
@@ -523,9 +472,6 @@ impl Host for RtHost {
                 },
                 false,
             ),
-            // GS-048: material Fact (AUTHORITATIVE / goal change / explicit
-            // topology / …) enters Msg::MaterialContext so sticky-open and
-            // DecisionReady ride the Elm plane. Routine facts stay Prompt-only.
             BrainMsg::Fact { summary } => {
                 if let Some(reason) = workspace::material_context_reason(summary) {
                     (workspace::material_context_msg(summary, reason), false)
@@ -553,10 +499,6 @@ impl Host for RtHost {
                 },
                 false,
             ),
-            // bd-w98c residual: the scan's hit list IS a reducer Msg now —
-            // it audits the delta and asks for the inbox whose rows register
-            // the ladder. The wake itself still arrives via the watch path
-            // (toron emits real channel posts, exactly like the old loop).
             BrainMsg::SlaFired { posts } => (
                 workspace::Msg::SlaFired {
                     posts: posts.clone(),
@@ -568,12 +510,8 @@ impl Host for RtHost {
             | BrainMsg::Ask { .. }
             | BrainMsg::Shutdown => return Vec::new(),
         };
-        // The tick is the decider; the effect layer runs, then intents map.
         let (next, cmds) = workspace::tick(&self.model, &wmsg);
         self.model = next;
-        // GS-048: expand Reclassify → DecisionReady cmds so Prompt announces
-        // reach Effect::Prompt (nested handle would drop them). Live Snapshot
-        // from briefing world facts — never Snapshot::default() invent-green.
         let snap = crate::backend::run_mail_off_runtime_sync(|| {
             crate::live_decide_snapshot(&self.cfg, &self.project)
         });
@@ -595,8 +533,6 @@ impl Host for RtHost {
         if let Some(topo) = self.model.session_topology.as_deref() {
             let _ = crate::state::save_session_topology(&self.project, topo);
         }
-        // T3 arm 1 (bd-ma3y): Audit cmds run through the boot-built edge and
-        // fold quiet; the rt effect layer keeps the rest.
         let cmds = self.run_durable_audit(cmds);
         crate::handle_workspace_cmds(
             &mut self.model,
@@ -605,20 +541,6 @@ impl Host for RtHost {
             &self.cfg,
             drain_waits,
         );
-        // bd-b2b3: record the boundary HERE, AFTER the effect layer.
-        //
-        // This placement is load-bearing and easy to get wrong. `tick` is pure
-        // and returns at the fold boundary, but `handle_workspace_cmds` above
-        // MUTATES the model — so a snapshot taken when `tick` returned would
-        // record an incomplete model that cannot resume. The only correct point
-        // is after the effect layer has finished, because that is the state the
-        // NEXT tick will read.
-        //
-        // `enqueue`, not `record`: `Host::tick` is SYNCHRONOUS, so the store
-        // write cannot be awaited here. The boundary is serialized on this
-        // thread and handed to the bounded queue a writer task drains. A refusal
-        // is LOGGED, never swallowed: a silently skipped boundary would make a
-        // later replay look like it lost history for no reason.
         if let Some(recorder) = self.state_log.as_ref()
             && let Err(refusal) = recorder.enqueue(&self.model, &[])
         {
@@ -627,8 +549,6 @@ impl Host for RtHost {
         cmds.into_iter()
             .filter_map(|c| match c {
                 workspace::Cmd::Prompt { pin, line } => Some(Effect::Prompt { pin, line }),
-                // Pin is advisory: the brain fetches every known pin with
-                // per-pin cursors (cursor-safe), matching the old sweep arm.
                 workspace::Cmd::FetchInbox => Some(Effect::FetchInbox),
                 workspace::Cmd::CheckAckSla => Some(Effect::CheckAckSla),
                 workspace::Cmd::RestartWatch => Some(Effect::RestartWatch),
@@ -726,8 +646,6 @@ impl Host for RtHost {
     }
 
     fn sweep_maintenance(&mut self) -> Vec<(String, String)> {
-        // F7: cached index — registry pin-set change or 60s TTL triggers the
-        // whois-backed rebuild; steady-state sweeps skip N RPCs/sec.
         let pins_now: Vec<String> = self.registry_pins();
         let now = unix_now();
         if pins_now != self.index_pins || now.saturating_sub(self.index_refreshed_at) >= 60 {
@@ -736,11 +654,6 @@ impl Host for RtHost {
             self.index_refreshed_at = now;
         }
         self.cover_new_panes();
-        // Presence hear: presence.jsonl is the real projection for ephemeral
-        // 20001 (bus never stores it). Trust root stays the tick (Brain
-        // ticks Presence per row; hear derives after). The path is toron's
-        // canonical root-level projection (`mailbox_root` lift, bd-m5ym) —
-        // the projects-level file is never written and starves the map.
         let path = crate::mail::presence_path();
         let Ok(body) = std::fs::read_to_string(&path) else {
             return Vec::new();
@@ -771,20 +684,17 @@ impl Host for RtHost {
     /// honest about that. The counts on the daemon path come from `FileHost`,
     /// which does coalesce (bd-watch-restart-metric-8dvf).
     fn restart_wake(&mut self) -> bool {
-        // GS-007 never-deaf rule: burst in a task, gate across calls.
         let backoff = self.retry.lock().map(|mut r| r.record_fail()).unwrap_or(16);
         let tx = self.brain_tx.clone();
         let project = self.project.clone();
         let workspace = self.workspace.clone();
         let slot = self.wake_task.clone();
-        // Hoisted out of the 'static future so no borrow of `self` escapes.
         let retry = self.retry.clone();
         let counters = self.wake_counters.clone();
         let resume = self.wake_resume.clone();
         let died_bell = std::sync::Arc::clone(&self.died_bell);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(backoff)).await;
-            // Abort the predecessor first: one live consumer per host.
             if let Ok(mut g) = slot.lock()
                 && let Some((h, retire)) = g.take()
             {
@@ -794,7 +704,6 @@ impl Host for RtHost {
             let tx_g = tx.clone();
             let beat_workspace = workspace.clone();
             let retry = retry.clone();
-            // mcc9: resume where the brain last accepted a line.
             let resume_from = resume.lock().ok().and_then(|g| g.clone());
             if let Some(from) = &resume_from {
                 counters.note_resume();
@@ -844,8 +753,6 @@ impl Host for RtHost {
 
 impl RtHost {
     fn fetch_inbox_process(&self, pin: &str, since: &str) -> Option<Vec<serde_json::Value>> {
-        // In-process mail `block_on`s the shared mail runtime inside
-        // `inbox_filtered`; this is called from the brain's runtime thread.
         crate::backend::run_mail_off_runtime_sync(|| {
             let mail = crate::mail::Mail::from_config(Some(&self.cfg.toron_mail_config()))
                 .ok()
@@ -911,18 +818,9 @@ impl RtHost {
 
 pub fn run_embedded(cfg: &Config, project: &str, workspace: &str) -> anyhow::Result<()> {
     use anyhow::Context;
-    // F3/bd-ene2 D9 layer 1 — claim the single-writer lease for THIS
-    // workspace before starting (per-ws scope: a second workspace's loop
-    // is independent). Live lease held elsewhere for the same workspace
-    // means another loop runs: refuse, never double-run.
     let now = doorbell_rt::lease::unix_now();
     let lease = match doorbell_rt::lease::acquire_lease(&config::state_dir(), workspace, now) {
         Ok(l) => l,
-        // No-text holder (comms flag): serve never hosts, and an inbox host
-        // beside it cannot ring NIP-17 (head=0) — running one anyway hosts
-        // nothing, silently. A stale no-text lease never reaches here
-        // (acquire succeeds and the full loop runs, timer sweep included).
-        // A live one is a leftover: refuse LOUD so it gets cleared.
         Err(doorbell_rt::lease::LeaseDenied::Held(h))
             if crate::comms_send::enabled(cfg) && !doorbell_rt::lease::is_ringer(&h) =>
         {
@@ -955,7 +853,6 @@ pub fn run_embedded(cfg: &Config, project: &str, workspace: &str) -> anyhow::Res
         workspace,
         generation,
     ));
-    // Release our claim only (never drop a stranger's lease).
     doorbell_rt::lease::release_lease(&config::state_dir(), workspace, &lease);
     res
 }
@@ -973,13 +870,6 @@ async fn run_embedded_async(
     host.set_died_bell(std::sync::Arc::clone(&died_bell));
     host.set_generation(generation.clone());
     let mut sinks = SinkManager::new(tx.clone());
-    // Supervised registration (audit P1): fresh adapter + reconnect on a
-    // failed hc client park (Transient policy) instead of dying until
-    // process restart. The generation stamps the fresh adapter so a
-    // mid-run binary upgrade still self-retires it.
-    // Flag-off no longer types the brain line. The inbox host is the only
-    // pane writer, and only while comms is on. Operator waived the 2026-11-08
-    // hold on 2026-10-17.
     let mut _inbox_guard: Option<crate::inbox_host::InboxHost> = None;
     sinks.add_sink_with_factory("hc", Box::new(doorbell_rt::NoTextSink::new()), || {
         Box::new(doorbell_rt::NoTextSink::new())
@@ -991,9 +881,6 @@ async fn run_embedded_async(
         ));
     }
     let store = FileStore::new(config::state_dir());
-    // Watch source: in-process bus watch first (zero fork), wake-sock fallback.
-    // Both stamp the watchbeat (event/hb split, GS-062); the socket task goes
-    // through the host's slot so the restart path aborts its predecessor.
     let watch_slot = host.wake_task.clone();
     let bus_fw = wake_forwarder(
         &tx,
@@ -1001,8 +888,6 @@ async fn run_embedded_async(
         host.wake_counters.clone(),
         host.wake_resume.clone(),
     );
-    // `spawn_bus_watch` drives the shared mail runtime with `block_on`; run it
-    // off this runtime (backend::run_mail_off_runtime).
     let bus_armed = {
         let (cfg_b, project_b, workspace_b, tx_b) = (
             cfg.clone(),
@@ -1011,9 +896,6 @@ async fn run_embedded_async(
             tx.clone(),
         );
         let bus_bell = std::sync::Arc::clone(&died_bell);
-        // The inbox host's hint line: bus events wake its loop early (the
-        // tick still decides from the log). No host (comms off) means no
-        // hints — the brain path is unaffected.
         let inbox_hint = _inbox_guard.as_ref().map(|h| h.hint_sender());
         crate::backend::run_mail_off_runtime(move || {
             Ok(spawn_bus_watch(
@@ -1065,14 +947,11 @@ async fn run_embedded_async(
         }
     }
     host.cover_new_panes();
-    // Beats: 1s sweep, 60s ack-SLA (same cadences as the old loop).
     let sweep_tx = tx.clone();
     let sweep_ticker =
         doorbell_rt::interval_ticker("sweep", sweep_tx, Duration::from_secs(1), || {
             BrainMsg::Sweep { now: unix_now() }
         });
-    // F3/bd-ene2 D9 heartbeat — refresh our workspace lease every 30s so
-    // a crash goes stale within 90s and a wedged writer cannot hold it.
     let beat_ws = workspace.to_string();
     let _lease_beat = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(30));
@@ -1090,22 +969,13 @@ async fn run_embedded_async(
         doorbell_rt::interval_ticker("ack-sla", sla_tx, Duration::from_secs(60), || {
             BrainMsg::AckSlaTick { now: unix_now() }
         });
-    // Beads-ledger producer (bd-asr2.15, D7; ready-bead lane
-    // bd-ux-papercuts-t2u5): read-only WAL poll emitting Fact Msgs; default
-    // on, `beads_poller = false` opts out. Repo resolution is flywheel's own
-    // `project_dir` (absolute key = the repo, slug = workspace_root/<slug>) —
-    // never the process cwd, which says nothing about the project.
     let _beads_poller = cfg.doorbell_beads_poller().then(|| {
         let repo = crate::project_dir(&cfg, project);
         doorbell_rt::pollers::spawn_beads_poller(tx.clone(), repo)
     });
-    // One-shot watches. A thread, not a reducer: the clock stays outside tick.
     if crate::timer_watch::host_enabled(&cfg) {
         crate::timer_watch::spawn_sweep(project);
     }
-    // External re-ring driver (E9, bd-4gco, flag-gated): read-only
-    // foreign-close watch emitting Fact Msgs. Same-host only; the daemon
-    // host gains the same spawn when the Phase-3 Brain loop lands there.
     let _external_rering = (cfg.doorbell_cross_workspace()
         && !cfg.doorbell_external_projects().is_empty())
     .then(|| {
@@ -1120,11 +990,6 @@ async fn run_embedded_async(
     let pid_path = doorbell::pid_file(&config::state_dir(), workspace);
     let gen_path = doorbell::gen_file(&config::state_dir(), workspace);
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flywheel"));
-    // bd-gefp: the deliberate detach (process_group(0) in spawn_child) has no
-    // matching exit trigger, so a host whose workspace was closed outlives it.
-    // The workspace is the trigger, NOT the parent: every probe asks the
-    // SELECTED plane whether this workspace still resolves, and `Unreadable`
-    // is never an exit (a plane mid-restart must not kill a live host).
     let probe_cfg = cfg.clone();
     let probe_project = project.to_string();
     let probe_ws = workspace.to_string();
@@ -1155,9 +1020,6 @@ async fn run_embedded_async(
                 })
                 .await
                 .unwrap_or(doorbell::WorkspacePresence::Unreadable);
-                // Transient miss is not an exit: back off and re-list (bounded).
-                // Only a confirmed Gone feeds the streak; a Present/Unreadable
-                // re-list resets it. Exit stays with the shared streak fold.
                 if presence == doorbell::WorkspacePresence::Gone {
                     for _ in 0..2 {
                         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -1194,7 +1056,6 @@ async fn run_embedded_async(
     let report = brain.run(rx).await;
     drop(sweep_ticker);
     _lease_beat.abort();
-    // Reap the watcher on shutdown rather than orphaning it.
     if let Ok(mut g) = watch_slot.lock() {
         let _ = g.take();
     }
@@ -1219,8 +1080,6 @@ fn spawn_bus_watch(
         let _mail = crate::mail::Mail::from_config(Some(&cfg.toron_mail_config()))
             .ok()
             .flatten()?;
-        // Remote-daemon mail has no in-process mailbox (`mailbox()` panics
-        // there): no bus to watch, so the caller falls back to the wake socket.
         let mb = crate::mail::try_mailbox()?;
         let bus = crate::mail::block_on(async {
             Ok::<std::sync::Arc<dyn toron_core::bus::Bus>, anyhow::Error>(mb.bus().clone())
@@ -1242,21 +1101,13 @@ fn spawn_bus_watch(
                 .hashtag(project)
         };
         let mut sub = crate::mail::block_on(bus.subscribe_trusted(filter)).ok()?;
-        // GS062-ADV-4: stamp on hosting thread before nesting the reader.
         let mut stamps =
             doorbell_rt::watchbeat::spawn_stamp_threads(config::state_dir(), workspace.to_string());
         std::thread::spawn(move || {
-            // GS-062: mirror child watch — touch_event on each Event; stoppable
-            // 1s touch_heartbeat while the subscription lives (never conflate).
             loop {
                 let ev_opt = crate::mail::block_on(sub.next());
                 match ev_opt {
                     Some(toron_core::bus::SubscriptionEvent::Event(e)) => {
-                        // bd-inbox-bus-watch-hints-urgency-4wh6: the bus event
-                        // is an accelerator, never a source of truth. The
-                        // empty hint only wakes the inbox loop early; the tick
-                        // re-observes every recipient from the log, so a lost
-                        // hint (full channel) costs nothing.
                         if let Some(h) = &inbox_hint {
                             let _ = h.try_send(crate::inbox_host::Input::Hint(String::new()));
                         }
@@ -1270,12 +1121,6 @@ fn spawn_bus_watch(
                             "tags": tags,
                             "created_at": e.created_at.as_secs(),
                         });
-                        // mcc9: the forwarder backpressures this reader thread
-                        // on a full channel (a slow brain parks the sensor);
-                        // only a wedged/closed brain drops the line (counted)
-                        // and ends the watch with ONE Died — the wake-sock
-                        // replacement resumes from the last accepted cursor.
-                        // Stamp .event only once the brain has the line.
                         if let Ok(line) = serde_json::to_string(&v) {
                             if fw.forward(line).reached_brain() {
                                 stamps.on_event();
@@ -1370,23 +1215,11 @@ mod parity_tests {
     }
     #[test]
     fn embedded_vs_daemon_journal_parity() {
-        // Plain sync test: hosts construct on the main thread, OUTSIDE
-        // any runtime — mail::block_on panics nested inside one.
-        // Each side runs SEQUENTIALLY under its own XDG state tree with
-        // identical fixture files: sweep drains are destructive
-        // (files deleted after read), so concurrent sides race.
-        // Hermetic: NOTHING writes outside temp dirs. Live toron/hc
-        // CLIs may run read-only (whois/inbox/list on fixture pins fail
-        // empty); the toron transport is remote-refused (production uses
-        // remote sync HTTP; in-process block_ons inside a runtime).
         let _home = crate::config::test_state_home();
         let toron_dir = std::env::temp_dir().join(format!("parity-toron-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&toron_dir);
         std::fs::create_dir_all(&toron_dir).unwrap();
         // SAFETY: under ENV_LOCK via _home; restored below.
-        // bd-3dge: snapshot everything touched — dropping the MCP pin or
-        // the original data dir leaves later tests (and any toron CLI child
-        // they spawn) resolving the ambient/relative store (./toron-data).
         let prev_toron_data = std::env::var_os("TORON_DATA_DIR");
         let prev_toron_mcp = std::env::var_os("TORON_MCP_DATA_DIR");
         unsafe {
@@ -1400,8 +1233,6 @@ mod parity_tests {
         let ws = "pw";
         let key = crate::state::spawn_registry_key(&project);
         let role_key = crate::state::state_key(&project);
-        // Heard presence for both pins (freshness uses the real clock;
-        // both sides read the same file).
         let now = unix_now();
         std::fs::write(
             toron_dir.join("presence.jsonl"),
@@ -1413,7 +1244,6 @@ mod parity_tests {
         )
         .unwrap();
 
-        // Identical destructive inputs per side (drains delete after read).
         fn write_fixture(state: &std::path::Path, key: &str, role_key: &str) {
             let agents = state.join("agents");
             std::fs::create_dir_all(&agents).unwrap();
@@ -1443,15 +1273,12 @@ mod parity_tests {
         }
 
         // SAFETY: under ENV_LOCK; the guard restores nothing — XDG is
-        // removed by _home's Drop, TORON_* below.
         fn set_xdg(state: &std::path::Path) {
             unsafe {
                 std::env::set_var("XDG_STATE_HOME", state);
             }
         }
 
-        // One scripted Msg log; fixed payloads so only `ts`
-        // differs between runs. Built twice (BrainMsg is not Clone).
         let inbox_row =
             |ts: &str| serde_json::json!({"importance": "urgent", "created_ts": ts, "tags": []});
         let mk_script = || {
@@ -1496,9 +1323,6 @@ mod parity_tests {
                     summary: "deploy".into(),
                 },
                 BrainMsg::Sweep { now: 1_700_000_000 },
-                // NOTE: no AckSlaTick in the live run (the embedded scan
-                // block_ons inside a runtime); tick parity asserted above.
-                // Busy presence holds the next routine ring on both hosts...
                 BrainMsg::Presence {
                     pin: "PinA".into(),
                     state: "working".into(),
@@ -1508,14 +1332,12 @@ mod parity_tests {
                     status: "working".into(),
                 },
                 BrainMsg::Watch(watch(9, serde_json::json!([["p", "PinA"]]), "e4", 4)),
-                // ...while urgent breaks through on both.
                 BrainMsg::Watch(watch(
                     14,
                     serde_json::json!([["p", "PinA"], ["toron-kind", "request-release"]]),
                     "e5",
                     5,
                 )),
-                // Drain under busy presence: routine audits, urgent prompts.
                 BrainMsg::PlaneStatus {
                     pin: "PinA".into(),
                     status: "idle".into(),
@@ -1538,8 +1360,6 @@ mod parity_tests {
             handle.await.unwrap()
         }
 
-        // Remote (refused) toron transport, both sides: fast-fails to the
-        // hermetic CLI fallback (see module docs).
         fn remote_cfg() -> crate::config::Config {
             crate::config::Config {
                 mail: Some(crate::config::MailSections {
@@ -1552,7 +1372,6 @@ mod parity_tests {
             }
         }
 
-        // Side A: embedded host.
         let state_a = std::env::temp_dir().join(format!("parity-state-a-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&state_a);
         set_xdg(&state_a);
@@ -1562,7 +1381,6 @@ mod parity_tests {
         let (tx_a, rx_a) = tokio::sync::mpsc::channel(doorbell_rt::BRAIN_CAP);
         let rt_host = RtHost::new(remote_cfg(), &project, ws, tx_a.clone())
             .expect("rthost builds in sandbox");
-        // Tick-level AckSla parity on throwaways (scan excluded live).
         {
             use doorbell_rt::Host;
             let mut rt =
@@ -1593,7 +1411,6 @@ mod parity_tests {
         });
         drop(rt);
 
-        // Side B: daemon host (own state tree, same fixture content).
         let state_b = std::env::temp_dir().join(format!("parity-state-b-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&state_b);
         set_xdg(&state_b);
@@ -1622,7 +1439,6 @@ mod parity_tests {
         });
         drop(rt);
 
-        // Same scripted inputs → same delivery accounting.
         assert_eq!(rep_a.stats.injects, rep_b.stats.injects, "injects");
         assert_eq!(rep_a.stats.sheds, rep_b.stats.sheds, "sheds");
         assert_eq!(rep_a.stats.degraded, rep_b.stats.degraded, "degraded");
@@ -1630,7 +1446,6 @@ mod parity_tests {
             rep_a.stats.digest_batches, rep_b.stats.digest_batches,
             "digests"
         );
-        // Journal diff empty modulo ts: the bd-ene2 verify.
         let a = read_journal(&dir_a, ws);
         let b = read_journal(&dir_b, ws);
         assert_eq!(a.len(), b.len(), "journal row counts differ");
@@ -1657,8 +1472,6 @@ mod parity_tests {
 
     #[test]
     fn died_tick_parity() {
-        // RestartWatch effect agrees tick-level (dispatch would spawn
-        // watch children on both sides — covered by unit tests instead).
         let mut core = doorbell_rt::CoreReducer::default();
         let fx = core.tick_effects(&BrainMsg::Died);
         assert!(
@@ -1723,7 +1536,6 @@ mod inbox_flag_tests {
     #[test]
     fn no_text_holder_refuses_loud_instead_of_hosting_nothing() {
         let src = include_str!("doorbell_host.rs");
-        // Built without the literal so this absence check cannot match itself.
         let needle = ["fn run", "_inbox_only("].concat();
         assert!(
             !src.contains(&needle),
@@ -1773,7 +1585,6 @@ mod off_runtime_tests {
     #[test]
     fn host_mail_methods_do_not_nest_block_on_inside_a_runtime() {
         let _home = crate::config::test_state_home();
-        // In-process mail (no [mail.toron] url); built OUTSIDE any runtime.
         let _mail = crate::mail::Mail::from_config(None)
             .expect("in-process mail")
             .expect("some");
@@ -1781,14 +1592,9 @@ mod off_runtime_tests {
         let mut host = RtHost::new(Config::default(), "offrt-methods", "offrt", tx).expect("host");
         let rt = tokio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
-            // maintenance sweep -> build_index (whois)
             let _ = host.sweep_maintenance();
-            // ack-sla scan
             let _ = host.scan_ack_sla();
-            // inbox read (`last` skips the timestamp parse, so the in-process
-            // `inbox_filtered` `block_on` is actually reached)
             let _ = host.fetch_inbox_process("SomePin", "last");
-            // tick -> live_decide_snapshot
             let _ = host.tick(&BrainMsg::Watch(String::new()));
         });
     }
@@ -1842,7 +1648,6 @@ mod off_runtime_tests {
         let h = std::thread::spawn(move || run_embedded(&cfg, "offrt-embedded", ws));
         std::thread::sleep(Duration::from_secs(4));
         let died_early = h.is_finished();
-        // Stop the loop: it exits when its pid file goes away.
         let _ = std::fs::remove_file(doorbell::pid_file(&config::state_dir(), ws));
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         while !h.is_finished() && std::time::Instant::now() < deadline {
@@ -1855,22 +1660,6 @@ mod off_runtime_tests {
         );
     }
 }
-
-// ---------------------------------------------------------------------------
-// T3 durable interpret, arm 1: Audit (bd-ma3y).
-//
-// One executor arm moves from the host's Effect match into
-// DurableInterpret::interpret_in_env, backed by services the host builds
-// once per boot (RtHost::durable_services, built by durable_services_for).
-// Audit is first because it is observation-only: success and typed failure
-// both fold to the T2 sentinel, which emits nothing and touches no domain
-// state. Exact behavior is preserved: the edge writes the identical stderr
-// line handle_workspace_cmds writes today (src/main.rs, Cmd::Audit arm) —
-// twin noted here because the two cannot share code across the binary
-// boundary without moving the format. Next arms (Prompt with hc
-// handles, ...) add edged services to the same runtime. interpret()
-// without services fails typed, never drops.
-// ---------------------------------------------------------------------------
 
 use toron_core::kernel::{
     BuiltServices, Effect as FxEffect, Exit, Failure, Interpret, Layer, ManagedRuntime, Program,
@@ -2168,11 +1957,6 @@ mod durable_tests {
             &[("k".to_string(), "p".to_string(), "d".to_string())]
         );
         assert!(matches!(msg, Msg::DiagnoseFailed { .. }));
-        // The bell-fold fence forbids the default-model literal (production
-        // Facts must tick the live model), so fold against an inhabited one:
-        // stronger anyway — a quiet fold must preserve what it does not
-        // change. The message names __shadow_failure__, so the probe key is
-        // untouched by construction.
         let mut model = workspace::WorkspaceModel::default();
         model.swarm.heal_states.insert(
             "probe".into(),
@@ -2206,8 +1990,6 @@ mod durable_tests {
         assert_eq!(rec.ran.lock().unwrap().len(), 1);
         let msg = workspace::WorkspaceProgram::failure(&Failure::of_cause(cause));
         assert!(matches!(msg, Msg::DiagnoseFailed { ref name } if name == SHADOW_FAILURE_NAME));
-        // Same inhabited-model fold as above: the fence owns the literal,
-        // quietness is proven by preservation, not by an empty model.
         let mut model = workspace::WorkspaceModel::default();
         model.swarm.heal_states.insert(
             "probe".into(),
@@ -2261,7 +2043,6 @@ mod durable_tests {
         assert!(a.context().is_some());
     }
 
-    // bd-bm6v: Prompt (Brain-gated enqueue) + detached (fetch/scan) arms.
     fn quiet_preserves_model(msg: &Msg) {
         let mut model = workspace::WorkspaceModel::default();
         model.swarm.heal_states.insert(
@@ -2340,8 +2121,6 @@ mod durable_tests {
             panic!("bd-bm6v: FetchInbox with services must succeed immediately via DetachedEdge");
         };
         assert!(matches!(msg, Msg::DiagnoseFailed { .. }));
-        // Immediate success carries no rows: the pipe re-entry delivers them
-        // in a second step, so a duplicate landing stays safe (at-least-once).
         assert_eq!(
             detached_rec.ran.lock().unwrap().as_slice(),
             &["fetch_inbox".to_string()]
@@ -2409,8 +2188,6 @@ mod durable_tests {
 
     #[test]
     fn restart_and_factmiss_stay_on_the_live_path() {
-        // bd-bm6v §3: RestartWatch is host-side + journal-only; FactMiss keeps
-        // Effect::Audit. Neither moves to interpret.
         let (rt, _, prompt_rec, detached_rec) = services_with(false);
         for cmd in [
             workspace::Cmd::RestartWatch,

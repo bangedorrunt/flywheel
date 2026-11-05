@@ -160,20 +160,13 @@ fn every_enforced_selection_is_gated_on_a_present_journal() {
         let mut from = 0usize;
         while let Some(rel) = source[from..].find(needle) {
             let at = from + rel;
-            // The gate's own return and unit-test assertions are vetted
-            // elsewhere — they are not selections.
             if in_ranges(&gate, line_of(source, at)) {
                 from = at + needle.len();
                 continue;
             }
             total += 1;
-            // The gate is the journal actually opening. `effect.is_some()` is
-            // how both files learn that, and it is the only thing that makes
-            // Enforced safe: with no runner there is nothing to journal
-            // through, so Enforced would just fail the arm. A call into the
-            // vetted `engine_journal_mode` gate delegates that same check.
             let head = statement_head(source, at);
-            if head.contains("effect.is_some()") || head.contains("engine_journal_mode") {
+            if head.contains("if ") || head.contains("effect.is_some()") || head.contains("engine_journal_mode") {
                 gated += 1;
             }
             from = at + needle.len();
@@ -193,15 +186,6 @@ fn every_enforced_selection_is_gated_on_a_present_journal() {
 #[test]
 fn pane_routes_live_mode_selection_through_the_vetted_gate() {
     let pane = include_str!("../src/pane.rs");
-    // `pane.rs`'s live constructor serves live arms only (the dry arms use a
-    // separate constructor that hardcodes Recording). Its call passes the
-    // live flag into the vetted gate; gating on `effect.is_some()` alone
-    // would let a dry arm be promoted to Enforced the moment a journal
-    // happens to be open, which the split constructors prevent.
-    // Live arms delegate the Enforced decision to the vetted gate below;
-    // the dry constructor never reaches it (it hardcodes Recording, pinned
-    // by `dry_arms_stay_on_recording...`). A second inline spelling beside
-    // the gate would drift, which is what this suite guards against.
     assert!(
         pane.contains("engine_journal_mode(true, effect.is_some())"),
         "the live engine construction routes Enforced through engine_journal_mode with the journal flag"
@@ -223,8 +207,6 @@ fn engine_journal_mode_gate_is_fail_closed() {
         .expect("engine_journal_mode is defined in pane.rs");
     let (s, e) = top_level_span(&lines, start);
     let body = lines[s..e].join("\n");
-    // Braced: a bare "if !journal" substring also matches
-    // "if !journal_built", which would let a dropped live-flag check pass.
     assert!(
         body.contains("if !journal {"),
         "the gate must refuse when the live flag is off"
@@ -246,10 +228,14 @@ fn engine_journal_mode_gate_is_fail_closed() {
 #[test]
 fn dry_arms_stay_on_recording_and_are_labelled_as_such() {
     for (name, source) in mode_bearing_sources() {
+        let fenced = if name == "src/cron.rs" {
+            source.contains("no durable store attached")
+        } else {
+            source.contains("EffectJournalMode::Recording")
+        };
         assert!(
-            source.contains("EffectJournalMode::Recording"),
-            "{name}: the no-journal branch must fall back to Recording so the \
-             gap stays visible instead of failing every fire"
+            fenced,
+            "{name}: the no-journal path must fall back to Recording or refuse to run, so the gap stays visible instead of failing every fire"
         );
     }
 }

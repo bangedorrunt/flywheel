@@ -111,12 +111,9 @@ fn json(out: &Output) -> serde_json::Value {
 fn list_precedence_project_shadows_global_shadows_builtin() {
     let h = hermetic();
 
-    // global tier only: alpha (new) + weekly-review (shadows the built-in)
     write_global(&h, "alpha", "housekeeper", "30 3 * * 0");
     write_global(&h, "weekly-review", "housekeeper", "0 4 * * 0");
 
-    // no project tier: global wins over built-in; built-in shows only when
-    // no user tier defines it
     let v = json(&run(
         &h,
         &["cron", "list", "--json", "--project", "/nonexistent-proj"],
@@ -139,7 +136,6 @@ fn list_precedence_project_shadows_global_shadows_builtin() {
     );
     assert_eq!(by_name("weekly-review")["owner"], "housekeeper");
 
-    // project tier shadows global + built-in
     write_project(&h, "alpha", "scout", "0 2 * * 0");
     write_project(&h, "weekly-review", "scout", "0 4 * * 0");
     let v = json(&run(&h, &["cron", "list", "--json", &project_flag(&h)]));
@@ -165,13 +161,10 @@ fn list_precedence_project_shadows_global_shadows_builtin() {
     );
     assert_eq!(by_name("weekly-review")["owner"], "scout");
 
-    // bare built-in: no user tiers at all -> compiled-in weekly-review
     let v = json(&run(
         &h,
         &["cron", "list", "--json", "--project", "/nonexistent-proj2"],
     ));
-    // NOTE: global tier was written in this test — use a fresh hermetic env
-    // for the pure-builtin case instead.
     let _ = v;
     let h2 = hermetic();
     let v = json(&run(
@@ -362,7 +355,6 @@ fn remove_reveals_lower_tier() {
     assert_eq!(row["source"], "global", "project removal reveals global");
     assert_eq!(row["owner"], "housekeeper");
 
-    // remove the global too -> gone entirely
     let rm = run(
         &h,
         &["cron", "remove", "alpha", "--project", "/nonexistent-proj"],
@@ -381,7 +373,6 @@ fn remove_reveals_lower_tier() {
         "alpha removed"
     );
 
-    // removing a built-in fails
     let out = run(
         &h,
         &[
@@ -467,7 +458,6 @@ fn lint_accepts_valid_cron() {
 fn run_executes_spec_body() {
     let h = hermetic();
     write_global(&h, "alpha", "housekeeper", "30 3 * * 0");
-    // force pane mode so the runner records (delay step, no dispatch)
     let path = global_dir(&h).join("alpha.yaml");
     let mut raw = fs::read_to_string(&path).unwrap();
     raw = raw.replace("scope: host\n", "scope: host\nmode: pane\n");

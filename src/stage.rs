@@ -49,15 +49,6 @@
 use crate::crew_menu::HarnessMenu;
 use crate::judgment::{Answers, QuestionPack, Transport};
 
-// bd-51zr: this is a REGISTRY, and only one stage is registered so far
-// (`crew-fit`). The rest of the surface — `Inflight`, `Verdict`, the `Any` and
-// `Majority` rules, `verdict_of` — is exercised by tests and constructed by no
-// production path yet, because the second and third stages have not landed. That is
-// the same state `judgment::OfflineTransport` is in, and it carries the same
-// `cfg_attr`: the deny-path contract and its tests are the point, and the
-// production construction arrives with the stage that needs it. NOT a suppression
-// of a known defect: everything named here has a test that would fail if its
-// behaviour changed.
 #[cfg_attr(not(test), allow(dead_code))]
 /// Where a stage runs relative to the work it judges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,8 +248,6 @@ impl Stage {
 /// Combine child reports under one rule. All policy for a composed stage is here,
 /// in Rust, where it is testable without a model.
 fn combine(rule: Rule, reports: &[StageReport]) -> (Signal, String) {
-    // bd-utzj: carry each leaf's detail when it has one — id=signal pairs
-    // alone discard a Jev leaf verdict the moment combine() runs.
     let detail = reports
         .iter()
         .map(|r| {
@@ -296,10 +285,6 @@ fn combine(rule: Rule, reports: &[StageReport]) -> (Signal, String) {
             }
         }
         Rule::Majority => {
-            // Strict majority of the ANSWERED children. Unknown children abstain
-            // rather than counting as failures — a stage that could not answer has
-            // no opinion, and letting absences decide a majority would make an
-            // outage look like a verdict.
             let answered = holds + fails;
             if holds > fails {
                 Signal::Holds
@@ -308,7 +293,6 @@ fn combine(rule: Rule, reports: &[StageReport]) -> (Signal, String) {
             } else if answered == 0 {
                 Signal::Unknown
             } else {
-                // An exact tie is genuinely undecided.
                 Signal::Unknown
             }
         }
@@ -412,8 +396,6 @@ mod tests {
 
     #[test]
     fn a_read_that_would_panic_is_never_reached_when_the_transport_is_down() {
-        // The `read` closure is `unreachable!()`. If the runner ever called it
-        // before/without a successful ask, this test would abort rather than pass.
         let stage = Stage::Jev {
             id: "ask",
             placement: Placement::Inflight,
@@ -455,8 +437,6 @@ mod tests {
             signal: sig,
             detail: String::new(),
         };
-        // All: a failure dominates, but with no failure an Unknown must not become
-        // a Reject — that is the outage-masquerading-as-decision bug.
         assert_eq!(
             verdict_of(&[mk(Signal::Unknown, "a")], Placement::Preflight),
             Verdict::Unavailable
@@ -519,7 +499,6 @@ mod tests {
             signal: sig,
             detail: String::new(),
         };
-        // Two Holds, one Unknown: the Unknown must not become a Fails.
         let (sig, _) = combine(
             Rule::Majority,
             &[
@@ -529,13 +508,11 @@ mod tests {
             ],
         );
         assert_eq!(sig, Signal::Holds);
-        // An exact tie among answered stages is genuinely undecided.
         let (sig, _) = combine(
             Rule::Majority,
             &[mk(Signal::Holds, "a"), mk(Signal::Fails, "b")],
         );
         assert_eq!(sig, Signal::Unknown, "a tie is not a win");
-        // All Unknown: no opinion at all.
         let (sig, _) = combine(Rule::Majority, &[mk(Signal::Unknown, "a")]);
         assert_eq!(sig, Signal::Unknown);
     }

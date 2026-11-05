@@ -29,8 +29,6 @@ pub(crate) enum WorkCmd {
 }
 
 pub(crate) fn cmd_work(cfg: &Config, cmd: &WorkCmd) -> Result<()> {
-    // P4 / ADR-0016: cwd resolves once in HostAuthority and is validated
-    // before entering the process effect adapter.
     let cwd = crate::kernel::ProjectPath::parse(crate::authority::HostAuthority::resolve().cwd)
         .map_err(|error| anyhow::anyhow!("invalid project path: {error}"))?;
     let bv = crate::work::Bv::new(cwd.as_path().to_str().unwrap_or("."));
@@ -62,11 +60,6 @@ pub(crate) fn cmd_work(cfg: &Config, cmd: &WorkCmd) -> Result<()> {
 }
 
 fn cmd_work_check(cfg: &Config, project: Option<&str>) -> Result<()> {
-    // bd-bead-create-contract-lint-4tdd: creation-time contract check —
-    // the EXACT loop parsers over the ready set (typed verify presence +
-    // principles_block_reason via not_ready_reason), per-bead report with
-    // the corrected snippet. Non-zero exit when any bead is not
-    // dispatchable, so planner lanes can gate "beads created" on it.
     let dir = match project {
         Some(p) => crate::project_dir(cfg, p),
         None => std::env::current_dir()?,
@@ -82,13 +75,7 @@ fn cmd_work_check(cfg: &Config, project: Option<&str>) -> Result<()> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    // The loop's exact ready parse (array shape, the typed `verify` field
-    // br emits — same source of truth as the __ready leaf the durable loop
-    // consumes).
     let ready = crate::parse_ready_beads_json(&String::from_utf8_lossy(&out.stdout))?;
-    // The check runs the EXACT loop gate over each bead (verify presence +
-    // the principles check) — fetch descriptions per bead; the ready set
-    // is small.
     let mut issues: Vec<crate::durable::BeadContractIssue> = Vec::new();
     for b in &ready {
         let desc = bead_description(&dir, &b.id);

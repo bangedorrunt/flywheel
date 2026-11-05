@@ -180,7 +180,6 @@ impl Config {
         flywheel_state: Option<PathBuf>,
         hosts: Vec<(String, String)>,
     ) -> Result<Self> {
-        // bd-fpd5: XDG-first default; explicit flag wins, then env.
         let state_dir = state_dir
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(default_state_dir);
@@ -253,7 +252,6 @@ pub fn prune_dead_pid_files(state_dir: &std::path::Path) -> Vec<String> {
             continue;
         };
         let Ok(pid) = body.trim().parse::<i32>() else {
-            // Unparseable: cannot name a live process, so it is litter.
             if std::fs::remove_file(entry.path()).is_ok() {
                 removed.push(name);
             }
@@ -298,18 +296,10 @@ fn pid_is_alive(pid: i32) -> bool {
 /// write the pidfile, leaving a unit-started daemon "foreign" forever).
 #[cfg(unix)]
 pub fn claim_pid_file(path: &PathBuf, pid: u32) -> std::io::Result<()> {
-    // Keep the pidfile as a regular file. A relative symlink whose target is
-    // the PID string is dangling, so status/restart lose ownership of a
-    // healthy daemon immediately after serve claims it.
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, format!("{pid}\n"))?;
-    // bd-3uqz: the daemon has just proved it owns this state dir, which is the
-    // one moment at which "is anything else still running here?" has an answer.
-    // Pruned HERE rather than in `start` so a launchd-started daemon prunes too.
-    // Loudly, because a cleanup that cannot say what it removed is
-    // indistinguishable from data loss.
     if let Some(dir) = path.parent() {
         let removed = prune_dead_pid_files(dir);
         if !removed.is_empty() {
@@ -367,7 +357,7 @@ pub fn classify_owner(
     match (owner, pidfile_pid) {
         (Some(o), Some(p)) if o == p => OwnerVerdict::Managed(o),
         (Some(o), _) => OwnerVerdict::Unclaimed(o),
-        (None, _) => OwnerVerdict::Unknown, // protocol peer without an owner row: nothing to attest
+        (None, _) => OwnerVerdict::Unknown,
     }
 }
 
@@ -840,9 +830,6 @@ fn start_via_supervisor(cfg: &Config, unit: &std::path::Path) -> Result<Option<u
             match uid {
                 None => false,
                 Some(uid) => {
-                    // Reload semantics (bd-jvu7): a stale loaded definition
-                    // must be dropped, not kickstarted — kickstart restarts
-                    // the OLD def and file edits never reach the job.
                     match run_reload_plan(&reload_plan(&uid, unit)) {
                         Ok(()) => true,
                         Err(e) => {
@@ -873,8 +860,6 @@ fn start_via_supervisor(cfg: &Config, unit: &std::path::Path) -> Result<Option<u
     }
     if wait_for(|| health_probe(cfg).is_some(), START_TIMEOUT) {
         if let Some(pid) = health_owner_pid(cfg) {
-            // serve claims the pidfile itself after bind; this attests it
-            // even if the claim raced a previous owner.
             if read_pid(&cfg.pid_file()) != Some(pid) {
                 let _ = std::fs::write(cfg.pid_file(), format!("{pid}\n"));
             }
@@ -922,8 +907,6 @@ fn tail_lines(path: &std::path::Path, n: usize) -> Vec<String> {
     if file.read_to_end(&mut buf).is_err() {
         return Vec::new();
     }
-    // Filter is not ExactSize, so no rev().take(n).rev() chain: collect
-    // once and slice the end.
     let text = String::from_utf8_lossy(&buf);
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let start = lines.len().saturating_sub(n);
@@ -971,7 +954,6 @@ fn start_failure_brief(
 pub fn start(cfg: &Config) -> Result<()> {
     std::fs::create_dir_all(&cfg.state_dir)
         .with_context(|| format!("create state dir {}", cfg.state_dir.display()))?;
-    // Asking for it running IS the intent, adopt path included.
     clear_stop_intent(&cfg.state_dir);
     if let Some(pid) = try_adopt(cfg)? {
         println!(
@@ -982,11 +964,6 @@ pub fn start(cfg: &Config) -> Result<()> {
         return Ok(());
     }
     let exe = std::env::current_exe().context("current_exe")?;
-    // A busy port with no healthy peer is usually the previous daemon
-    // still draining. The check costs nothing when the port is clear
-    // (connect fails instantly); spawning into a busy port only produces a
-    // child that dies at the bind fence — the old "never answered
-    // /health" trap whose real cause was buried in the log.
     if !wait_for(
         || !tcp_endpoint_alive(cfg.port) || health_probe(cfg).is_some(),
         START_TIMEOUT,
@@ -1000,7 +977,6 @@ pub fn start(cfg: &Config) -> Result<()> {
                 warn_if_arm_diverges(cfg);
                 Ok(())
             }
-            // A Squatter verdict propagates through the `?` above.
             None => anyhow::bail!(
                 "{}",
                 start_failure_brief(
@@ -1024,11 +1000,6 @@ pub fn start(cfg: &Config) -> Result<()> {
         warn_if_arm_diverges(cfg);
         return Ok(());
     }
-    // Supervised start, but only when the installed unit renders
-    // byte-identically for THIS config (same binary/state/port/hosts).
-    // `stop` unloads the unit, so without this a `restart` silently ends
-    // as a detached child: no crash respawn, no autostart after reboot.
-    // A differing unit (test binary, temp state dir) is left untouched.
     if let Some(unit) = installed_unit_path()
         && let Ok(existing) = std::fs::read_to_string(&unit)
     {
@@ -1040,18 +1011,6 @@ pub fn start(cfg: &Config) -> Result<()> {
             &cfg.hosts,
             &toron_mcp_url(),
         );
-        // bd-u54l: compare the PARSED ARGV, not the file bytes.
-        //
-        // The old `existing == rendered` was a byte equality over a file an
-        // operator can hand-edit, so a whitespace-only divergence reported a
-        // mismatch and cost launchd supervision. That was not hypothetical: the
-        // installed unit used tab indentation while the template emits eight
-        // spaces, so `restart` said "starting detached" forever with every host
-        // correct. bd-jbz1 blamed the config; the config was fine.
-        // The plist's argv begins with the BINARY, so it belongs in the
-        // comparison: dropping it would make a unit pointing at a different
-        // binary compare EQUAL, and that mismatch is precisely the one that must
-        // still fall back to detached.
         let exe_path = exe.display().to_string();
         let mut want = vec![exe_path.clone()];
         want.extend(serve_args(
@@ -1061,12 +1020,6 @@ pub fn start(cfg: &Config) -> Result<()> {
             &cfg.hosts,
         ));
         let have = plist_program_args(&existing);
-        // A HOST-ONLY difference is not a mismatch of daemon: it is the arm state
-        // the operator just changed, and the unit is ours to re-render. Without
-        // this, `--unhost` from a supervised three-host setup produced a DETACHED
-        // daemon AND left a stale unit that would re-host all three on the next
-        // login — the decision would evaporate, which is the exact accident
-        // bd-u54l exists to remove.
         let hosts_only =
             have.len() != want.len() && strip_host_args(&have) == strip_host_args(&want);
         let matches = have == want;
@@ -1086,10 +1039,6 @@ pub fn start(cfg: &Config) -> Result<()> {
         if matches || hosts_only {
             match start_via_supervisor(cfg, &unit)? {
                 Some(pid) => {
-                    // bd-u54l: record what is now armed. Persisted HERE rather than
-                    // on every `start`, because the adopt path below returns Ok
-                    // without arming anything — persisting there would write down
-                    // a host set that the RUNNING daemon was not started with.
                     crate::armstate::persist(&cfg.state_dir, &cfg.hosts)
                         .context("persist armed hosts")?;
                     println!(
@@ -1131,23 +1080,15 @@ pub fn start(cfg: &Config) -> Result<()> {
         .stderr(err_log)
         .spawn()
         .context("spawn serve child")?;
-    // Claim the pid before detaching. If the claim fails, terminate the
-    // child instead of returning an error with an untracked daemon behind it.
     let pid = child.id();
     if let Err(error) = std::fs::write(cfg.pid_file(), format!("{pid}\n")) {
         let _ = child.kill();
         let _ = child.wait();
         return Err(error).with_context(|| format!("write pidfile {}", cfg.pid_file().display()));
     }
-    // Watch the child ITSELF while waiting for /health: serve dies fast
-    // and loudly on a conflict (bind fence, live lease) and its real
-    // reason is in the log tail — waiting out START_TIMEOUT for a corpse
-    // only ever produced the misleading "never answered /health".
     let deadline = std::time::Instant::now() + START_TIMEOUT;
     let boot = loop {
         let exited = child.try_wait().context("poll serve child")?;
-        // No health probe once the child is gone: a dead child must never
-        // be masked by a peer answering on this port.
         let health_answered = exited.is_none() && health_probe(cfg).is_some();
         let timed_out = std::time::Instant::now() >= deadline;
         if let Some(decision) = boot_probe(exited, health_answered, timed_out) {
@@ -1157,19 +1098,10 @@ pub fn start(cfg: &Config) -> Result<()> {
     };
     match boot {
         Boot::Healthy => {
-            // The probe answering is not enough: a stale orphan on this port
-            // answers too. The owner must be the child we just spawned — or a
-            // healthy protocol peer that beat us to the bind (a unit-started
-            // daemon before its first pidfile claim), which we adopt instead
-            // of failing: the operator's intent (a running daemon) holds.
             let pf = read_pid(&cfg.pid_file());
             match classify_owner(pf, health_probe(cfg).as_ref()) {
                 OwnerVerdict::Managed(p) if p == pid => {
-                    // Detached by disowning: never wait on it (reparented on unix).
                     std::mem::forget(child);
-                    // bd-u54l: the detached path is exactly where bd-jbz1 lost
-                    // supervision, so the armed set is recorded here too. A detached
-                    // daemon is the one an operator most needs `status` to explain.
                     crate::armstate::persist(&cfg.state_dir, &cfg.hosts)
                         .context("persist armed hosts")?;
                     println!("doorbell: started (pid {pid}, port {})", cfg.port);
@@ -1177,8 +1109,6 @@ pub fn start(cfg: &Config) -> Result<()> {
                 }
                 OwnerVerdict::Managed(p) | OwnerVerdict::Unclaimed(p) => {
                     if p != pid {
-                        // Another daemon won the bind race; do not leave our
-                        // losing child alive behind the adopted peer.
                         reap_failed_start(cfg, pid);
                     }
                     if pf != Some(p) {
@@ -1214,8 +1144,6 @@ pub fn start(cfg: &Config) -> Result<()> {
             }
         }
         Boot::Exited(status) => {
-            // Exit 0 usually means a healthy peer won the race — adopt it
-            // instead of failing the operator's intent.
             if let Some(peer) = try_adopt(cfg)? {
                 println!(
                     "doorbell: already running (pid {peer}, port {}) — adopted",
@@ -1258,7 +1186,6 @@ pub fn start(cfg: &Config) -> Result<()> {
 /// socket holders without --force (never clobbers a stranger's bind).
 pub fn stop(cfg: &Config, force: bool) -> Result<()> {
     let msg = stop_with_budgets(cfg, &mut PlatformSupervisor, force, STOP_GRACE, KILL_GRACE)?;
-    // Only a stop that actually landed records the intent.
     mark_stopped_by_operator(&cfg.state_dir);
     println!("{msg}");
     Ok(())
@@ -1352,8 +1279,6 @@ impl StopWorld for RealStop<'_> {
         if read_pid(&self.cfg.pid_file()) == Some(pid) {
             let _ = std::fs::remove_file(self.cfg.pid_file());
         }
-        // The caller proved the endpoint dead: what remains of the socket
-        // path is stale by definition.
         let _ = std::fs::remove_file(self.cfg.socket_path());
     }
     fn cleanup_stale(&mut self, path: &std::path::Path) {
@@ -1389,22 +1314,10 @@ fn stop_core<W: StopWorld>(
         world.cleanup_stale(socket);
         return Ok("doorbell: already stopped".to_string());
     };
-    // TERM first, unload second: serve needs its full drain budget, and
-    // launchd's bootout SIGKILLs at its 5s exit timeout — booting out
-    // first beheaded the drain and made healthy daemons look like
-    // SIGTERM-ignorers. bd-pf3b: on escalation the unload moves BEFORE
-    // the SIGKILL (still after the full grace): KeepAlive respawns an
-    // unclean exit sub-second, so kill-then-unload raced a respawn that
-    // grabbed the port ("stopped but still held"). The job is dropped
-    // first, so the unclean exit has nothing to respawn it.
     world.signal(pid, Sig::Term);
     let mut escalated = false;
     if !world.wait_dead(pid, grace) {
         eprintln!("doorbell: pid {pid} still alive after {grace:?} grace — sending SIGKILL");
-        // bd-yvte: the unload IS the respawn guard (bd-pf3b), so its failure
-        // can never be swallowed: retry once (launchd busy), then refuse the
-        // kill — SIGKILL into a loaded job respawns sub-second and the
-        // endpoint bail would misattribute our own respawn as a squatter.
         if let Err(first) = world.unload_supervisor() {
             eprintln!("doorbell: supervisor unload failed ({first}) — retrying once");
             if let Err(second) = world.unload_supervisor() {
@@ -1421,17 +1334,12 @@ fn stop_core<W: StopWorld>(
             );
         }
     } else {
-        // Clean exit: a 0-exit is not respawned (KeepAlive guards on
-        // unsuccessful exit), but a still-loaded definition goes stale on
-        // the next edit — loud, not fatal (bd-yvte: never silent).
         if let Err(e) = world.unload_supervisor() {
             eprintln!(
                 "doorbell: supervisor unload failed after clean exit ({e}) — run `doorbell install` to reload the definition"
             );
         }
     }
-    // The pid is gone; a live endpoint now belongs to a DIFFERENT process.
-    // Never report success for a port we no longer own.
     if world.tcp_alive(port) || world.uds_alive(socket) {
         anyhow::bail!(
             "doorbell: pid {pid} stopped but port {port} (or its socket) is still held by another process — identify it with lsof -nP -iTCP:{port} and stop it"
@@ -1506,10 +1414,6 @@ pub fn is_intentionally_stopped(state_dir: &Path) -> bool {
 pub fn status(cfg: &Config) -> Result<()> {
     let local_pid = managed(cfg);
     let health = health_probe(cfg);
-    // bd-enov (F17): a standby daemon with known workspaces is DEGRADED, not
-    // green — it delivers no rings/digest wakes and every wake path silently
-    // falls back to manual. Say so on stderr (the JSON stays intact and
-    // additive: `health.degraded` + `health.standby_hint`).
     if let Some(h) = &health
         && let Some(rows) = h.get("degraded").and_then(|d| d.as_array())
         && !rows.is_empty()
@@ -1522,9 +1426,6 @@ pub fn status(cfg: &Config) -> Result<()> {
     }
     let (alive, pid, pid_source) = status_liveness(local_pid, health.as_ref());
     let stopped_by_operator = is_intentionally_stopped(&cfg.state_dir);
-    // bd-gefp: the human verdict. A dead daemon serves NOTHING, so the read
-    // says so instead of leaving an arm line to imply otherwise. Stderr keeps
-    // stdout's JSON intact and additive.
     eprintln!(
         "{}",
         status_summary(alive, cfg.hosts.len(), stopped_by_operator)
@@ -1718,13 +1619,9 @@ pub fn render_autostart(
 ) -> String {
     #[cfg(target_os = "macos")]
     {
-        // One source for the argv: the template supplies the binary and `serve`,
-        // so drop the leading "serve" `serve_args` includes. Building this list
-        // independently is how the renderer and the comparison could disagree
-        // about what the daemon is.
         let args: Vec<String> = serve_args(state_dir, port, flywheel_state, hosts)
             .into_iter()
-            .skip(1) // `serve` comes from the template, not the arg list
+            .skip(1)
             .map(|a| format!("<string>{a}</string>"))
             .collect();
         include_str!("../units/com.doorbell.serve.plist")
@@ -1734,13 +1631,6 @@ pub fn render_autostart(
             .replace("DOORBELL_TORON_MCP_URL_VALUE", toron_mcp_url)
             .replace("DOORBELL_TORON_MCP_URL_KEY", "TORON_MCP_URL")
             .replace("DOORBELL_SERVE_ARGS", &args.join("\n        "))
-            // bd-24mm: launchd gives the job no HOME and a PATH without
-            // ~/.local/bin, so the daemon cannot resolve hc and its
-            // fail-closed boot gate (bd-fuql) refuses to host anything. The
-            // installer resolves both bins while HOME is still available and
-            // names them here; the daemon's env override wins verbatim. A bin
-            // that does not resolve is left out: the install must not invent
-            // a path, and the daemon then refuses loudly on its own terms.
             .replace(
                 "DOORBELL_TORON_BIN_KEY",
                 doorbell_rt::binpath::TORON_BIN_ENV,
@@ -1806,7 +1696,7 @@ fn reload_plan(uid: &str, unit: &std::path::Path) -> Vec<Vec<String>> {
 /// job is then left UNLOADED — so the daemon is DOWN and `StartInterval`
 /// cannot fire either, because the JOB is gone. The plan therefore waits for
 /// the label to disappear (bounded) and retries the post-bootout bootstrap.
-const SETTLE_POLLS: u32 = 50; // 50 × 100ms = 5s
+const SETTLE_POLLS: u32 = 50;
 const SETTLE_POLL_MS: u64 = 100;
 /// First try plus two retries: enough to cross a launchd settle, short enough
 /// that an operator with a genuinely bad unit is not left waiting.
@@ -1845,8 +1735,6 @@ fn run_reload_plan_with(
     plan: &[Vec<String>],
     exec: impl FnMut(&[String]) -> (bool, String),
 ) -> std::result::Result<(), String> {
-    // The live edge sleeps; tests inject a no-op clock (effect law: no real
-    // sleep in a unit test, no ambient clock in the fold).
     run_reload_plan_in(plan, exec, |ms| {
         std::thread::sleep(Duration::from_millis(ms))
     })
@@ -1906,7 +1794,6 @@ fn run_reload_plan_in(
                 errors.push(format!("{step}: {err}"));
                 continue;
             }
-            // bd-rhevm: the label must be GONE before the next bootstrap.
             let domain = cmd.get(2).cloned().unwrap_or_default();
             if !wait_until_unloaded(&mut exec, &mut sleep, &domain) {
                 let why = format!(
@@ -1917,7 +1804,7 @@ fn run_reload_plan_in(
                 errors.push(format!("bootout-settle: {why}"));
             }
             dropped = true;
-            continue; // never a blocker for the fresh-load arms
+            continue;
         }
         let (ok, err) = if step == "bootstrap" && dropped {
             bootstrap_with_retry(&mut exec, &mut sleep, cmd)
@@ -1957,13 +1844,8 @@ fn install_rendered(_cfg: &Config, body: &str) -> Result<()> {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "501".to_string());
-        let domain = format!("gui/{uid}/com.doorbell.serve"); // bd-jvu7: rewriting the file is not loading it. The old fallback
-        // (`kickstart -k`) restarted the LOADED definition, so a rewritten
-        // plist (e.g. the toron MCP env) never reached a running job.
+        let domain = format!("gui/{uid}/com.doorbell.serve");
         if let Err(e) = run_reload_plan(&reload_plan(&uid, &path)) {
-            // bd-rhevm: never exit with the job unloaded and a bare EIO. The
-            // operator must know the daemon is down AND how to bring it back —
-            // StartInterval cannot rescue this, the job itself is gone.
             eprintln!(
                 "doorbell: INSTALL FAILED — the job may now be UNLOADED, so the daemon is DOWN \
                  and StartInterval cannot fire (it re-runs a LOADED job; an unloaded one is gone)."
@@ -2050,14 +1932,10 @@ mod tests {
         let dir = scratch("pidprune");
         std::fs::create_dir_all(&dir).expect("mkdir");
 
-        // This process is definitionally alive, so its pid is the "do not touch" case.
         let live = std::process::id();
         std::fs::write(dir.join("12345"), format!("{live}\n")).expect("live pid file");
-        // A pid that cannot be running: 0 is never a valid pid.
         std::fs::write(dir.join("20783"), "0\n").expect("dead pid file");
-        // Unparseable contents are also not evidence of a live daemon.
         std::fs::write(dir.join("4883"), "not-a-pid\n").expect("garbage pid file");
-        // The authoritative pidfile must survive regardless.
         std::fs::write(dir.join("doorbell.pid"), format!("{}\n", live)).expect("real pidfile");
 
         let pruned = prune_dead_pid_files(&dir);
@@ -2103,9 +1981,6 @@ mod tests {
 
     #[test]
     fn default_state_ladder_prefers_explicit_env_then_xdg_then_home() {
-        // bd-fpd5: DOORBELL_STATE_DIR > XDG_STATE_HOME/doorbell >
-        // ~/.local/state/doorbell. Pure ladder (no env reads) so tests
-        // stay hermetic under parallel execution.
         let home = PathBuf::from("/home/u");
         assert_eq!(
             resolve_state_dir_default(
@@ -2127,7 +2002,6 @@ mod tests {
 
     #[test]
     fn default_state_ladder_ignores_empty_env() {
-        // Empty DOORBELL_STATE_DIR / XDG_STATE_HOME are unset, never "".
         assert_eq!(
             resolve_state_dir_default(
                 Some(PathBuf::from("")),
@@ -2140,7 +2014,6 @@ mod tests {
 
     #[test]
     fn legacy_platform_dir_is_data_dir_doorbell() {
-        // The pre-XDG default we migrate away from, when it exists.
         assert_eq!(
             legacy_platform_state_dir(),
             dirs::data_dir().map(|d| d.join("doorbell"))
@@ -2174,7 +2047,6 @@ mod tests {
             std::fs::read(new.join("doorbell-wake-w.json")).unwrap(),
             std::fs::read(old.join("doorbell-wake-w.json")).unwrap()
         );
-        // Second run is a no-op (migrate-once): new is populated now.
         assert!(
             maybe_migrate_to_default(&new, &old).unwrap().is_none(),
             "populated new dir must not re-migrate"
@@ -2184,7 +2056,6 @@ mod tests {
 
     #[test]
     fn migrate_once_skips_when_new_populated() {
-        // Refuse-overwrite is never even attempted: populated new wins.
         let base = tmp_lifecycle("mig-skip");
         let old = base.join("old");
         let new = base.join("new");
@@ -2219,18 +2090,15 @@ mod tests {
 
     #[test]
     fn parse_host_accepts_absolute_project_paths() {
-        // The scratch/harness shape: absolute project, bare workspace name.
         assert_eq!(
             parse_host("/tmp/scratch/proj/flywheel-proj").unwrap(),
             ("/tmp/scratch/proj".to_string(), "flywheel-proj".to_string()),
             "absolute project paths must be hostable"
         );
-        // Relative slug stays as before.
         assert_eq!(
             parse_host("dbell/flywheel-dbell").unwrap(),
             ("dbell".to_string(), "flywheel-dbell".to_string())
         );
-        // Root-anchored single segment is a legal project key.
         assert_eq!(
             parse_host("/proj/ws").unwrap(),
             ("/proj".to_string(), "ws".to_string())
@@ -2370,11 +2238,6 @@ mod tests {
             &hosts,
             "http://127.0.0.1:18080/mcp",
         );
-        // bd-m7yp: launchd's default soft maxfiles for a job is 256, and this
-        // daemon is a SERVER - it holds one descriptor per wake subscriber
-        // and one per hosted workspace. Measured: 257 descriptors against the
-        // 256 cap, so it could not open a socket and the wake brain could not
-        // reach a pane. The budget has to match the working set.
         assert!(
             body.contains("<key>LimitMaxFiles</key>"),
             "the unit must raise the fd budget: launchd's default is 256 and the daemon holds \
@@ -2389,7 +2252,6 @@ mod tests {
                 "the unit must carry {key}: launchd gives the job no HOME"
             );
         }
-        // The placeholder tokens must be resolved, not shipped verbatim.
         for token in [
             "DOORBELL_TORON_BIN_KEY",
             "DOORBELL_HC_BIN_KEY",
@@ -2398,8 +2260,6 @@ mod tests {
         ] {
             assert!(!body.contains(token), "{token} placeholder resolved");
         }
-        // A bin that resolves is named by its ABSOLUTE path: the daemon's
-        // env override wins verbatim, so a relative name would not help.
         if let Some(toron) = doorbell_rt::binpath::resolve_cli("toron") {
             assert!(
                 body.contains(&toron.display().to_string()),
@@ -2425,9 +2285,6 @@ mod tests {
         assert!(body.contains("/var/fw"), "flywheel state dir rendered");
         assert!(body.contains("proj/ws"), "--host pair rendered");
         assert!(!body.contains("DOORBELL_BIN"), "no placeholder survives");
-        // bd-y6gw: the env key resolves to the literal `DOORBELL_STATE_DIR`
-        // (a real env name), so absence is asserted on the _KEY/_VALUE
-        // placeholder tokens, not the resolved name.
         assert!(
             !body.contains("DOORBELL_STATE_DIR_VALUE"),
             "value placeholder resolved"
@@ -2448,7 +2305,6 @@ mod tests {
 
     #[test]
     fn render_empty_hosts_is_standby() {
-        // No --host = standby (bind + reads only), same as `start`.
         let body = render_autostart(
             "/opt/doorbell",
             "/var/dbll",
@@ -2664,13 +2520,11 @@ mod tests {
     fn status_liveness_comes_from_the_probe_not_the_callers_pid_file() {
         let health = serde_json::json!({ "owner": { "pid": 7765 } });
 
-        // Caller pointed at the daemon's own state dir: its pid file is here.
         let (alive, pid, source) = status_liveness(Some(7765), Some(&health));
         assert!(alive);
         assert_eq!(pid, Some(7765));
         assert_eq!(source, Some("pid_file"));
 
-        // Caller pointed somewhere else, which is what flywheel does.
         let (alive, pid, source) = status_liveness(None, Some(&health));
         assert!(
             alive,
@@ -2686,8 +2540,6 @@ mod tests {
 
     #[test]
     fn status_liveness_no_probe_means_not_alive_however_live_the_pid_file_looks() {
-        // A pid file naming a live process is attribution, not proof of
-        // service: we started something that is not answering.
         let (alive, pid, source) = status_liveness(Some(4242), None);
         assert!(!alive, "nothing answered, so nothing is alive");
         assert_eq!(
@@ -2699,8 +2551,6 @@ mod tests {
 
         assert_eq!(status_liveness(None, None), (false, None, None));
 
-        // A health body whose owner block carries no usable pid is still a
-        // live daemon; it just has no pid to name.
         let bare = serde_json::json!({ "mode": "hosted" });
         assert_eq!(status_liveness(None, Some(&bare)), (true, None, None));
     }
@@ -2719,13 +2569,11 @@ mod tests {
         pid
     }
 
-    // ---- restart-storm regressions (bd-xwgh round 2) ----
-
     #[cfg(unix)]
     #[test]
     fn stop_reports_clean_sigterm_exit() {
         let dir = tmp_lifecycle("stop-term");
-        let cfg = test_cfg(&dir, 0); // port 0: nothing can answer
+        let cfg = test_cfg(&dir, 0);
         let mut sleep = std::process::Command::new("sleep");
         sleep.arg("300");
         let pid = spawn_reaped(&mut sleep);
@@ -2739,8 +2587,6 @@ mod tests {
             Duration::from_secs(2),
         )
         .expect("SIGTERM-honouring pid must stop cleanly");
-        // The clean-exit arm asks the injected port, never the real
-        // launchctl/systemctl.
         assert_eq!(sup.prints, 1, "the stop consulted the injected supervisor");
         assert_eq!(sup.unloads, 0, "an unreadable unit is never unloaded");
         assert!(msg.contains("stopped (pid"), "plain message: {msg}");
@@ -2753,9 +2599,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stop_escalates_to_sigkill_when_sigterm_is_ignored() {
-        // `trap '' TERM` + exec: sleep inherits an ignored SIGTERM, so only
-        // SIGKILL can end it. A 400ms budget proves the escalation path
-        // without the real grace wait (budgets are injected, never ambient).
         let dir = tmp_lifecycle("stop-kill");
         let cfg = test_cfg(&dir, 0);
         let mut sh = std::process::Command::new("sh");
@@ -2780,8 +2623,6 @@ mod tests {
     #[test]
     fn stop_never_claims_success_when_the_port_survives() {
         let dir = tmp_lifecycle("stop-foreign");
-        // A holder that accepts and immediately drops, so the health probe
-        // fails fast instead of burning its 3s read timeout.
         let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = holder.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -2812,8 +2653,6 @@ mod tests {
     #[test]
     fn stop_target_falls_back_to_the_live_health_owner() {
         use std::io::{Read, Write};
-        // A pidfile-less daemon still identifies itself over /health —
-        // stop must signal THAT pid instead of refusing as "unmanaged".
         let dir = tmp_lifecycle("stop-owner");
         let mut decoy = std::process::Command::new("sleep")
             .arg("30")
@@ -2844,19 +2683,11 @@ mod tests {
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(20));
                     }
-                    // bd-fdg5: transient accept errors (EMFILE under fd
-                    // pressure, Interrupted) must not kill the fake server —
-                    // that turned suite parallelism into a permanent outage
-                    // the client could never recover from. The 10s deadline
-                    // above still bounds the loop.
                     Err(_) => std::thread::sleep(Duration::from_millis(50)),
                 }
             }
         });
         let cfg = test_cfg(&dir, port);
-        // bd-fdg5: the server thread has no readiness sync; under full-suite
-        // load its first accept can land after the client's windows. Bounded
-        // retry (not sleep-and-hope): same assertion, repeated to a deadline.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut got = None;
         while got.is_none() && std::time::Instant::now() < deadline {
@@ -2955,9 +2786,6 @@ mod tests {
 
     #[test]
     fn scratch_state_dirs_never_unload_the_real_unit() {
-        // A temp-dir `stop` (probe, test) must not boot out the loaded
-        // service for a state dir the unit does not serve, and a unit the
-        // guard cannot read or parse is never assumed to be ours.
         let real = std::path::Path::new("/Users/u/.local/state/doorbell");
         let scratch = std::path::Path::new("/tmp/dbcl-scratch");
 
@@ -2997,7 +2825,6 @@ mod tests {
             );
         }
 
-        // A prefix is not a match: /Users/u/.local/state/doorbell-2 is not ours.
         let mut sup = FakeSupervisor::printing(&launchd_print("/Users/u/.local/state/doorbell-2"));
         assert!(matches!(
             disable_supervisor_with(&mut sup, real),
@@ -3121,8 +2948,6 @@ mod tests {
         };
         let msg = w.stop(false).expect("clean stop");
         assert_eq!(msg, "doorbell: stopped (pid 9)");
-        // Load-bearing order: TERM is delivered BEFORE the supervisor
-        // unload (bootout-first beheaded the drain — the restart bug).
         let term = w.position("signal 9 Term");
         let unload = w.position("unload");
         assert!(term < unload, "TERM must precede unload: {:?}", w.actions);
@@ -3150,9 +2975,6 @@ mod tests {
         assert!(msg.contains("SIGKILL"), "{msg}");
         let kill = w.position("signal 9 Kill");
         let unload = w.position("unload");
-        // bd-pf3b flipped this ordering (respawn race): the job must be
-        // gone before the unclean exit — escalation_unloads_before_sigkill
-        // owns the full term < unload < kill contract.
         assert!(unload < kill, "unload before SIGKILL: {:?}", w.actions);
     }
 
@@ -3351,21 +3173,18 @@ mod tests {
 
     #[test]
     fn stop_core_unmanaged_arms_refuse_loudly_and_never_touch_a_stranger() {
-        // Busy port, no identifiable owner: refused without force…
         let mut busy = ScriptedStop {
             tcp: true,
             ..Default::default()
         };
         let err = busy.stop(false).expect_err("unmanaged holder");
         assert!(err.to_string().contains("unmanaged holder"));
-        // …same when only /health answers (no owner attestation)…
         let mut via_health = ScriptedStop {
             health: true,
             ..Default::default()
         };
         let err = via_health.stop(false).expect_err("unmanaged holder");
         assert!(err.to_string().contains("unmanaged holder"));
-        // …and --force still refuses, because it cannot identify a target.
         let mut busy_f = ScriptedStop {
             tcp: true,
             ..Default::default()
@@ -3375,7 +3194,6 @@ mod tests {
             err.to_string()
                 .contains("cannot kill what it cannot identify")
         );
-        // Nothing answers: idempotent already-stopped, stale state dropped.
         let mut idle = ScriptedStop::default();
         let msg = idle.stop(false).expect("already stopped");
         assert_eq!(msg, "doorbell: already stopped");
@@ -3389,8 +3207,6 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn installed_unit_path_is_the_launchd_agent() {
-        // Lockstep with install_rendered: drift here would silently turn
-        // every supervised start into a detached fallback.
         let path = installed_unit_path().expect("macOS has a unit path");
         assert_eq!(
             path.file_name().and_then(|n| n.to_str()),
@@ -3401,13 +3217,10 @@ mod tests {
 
     #[test]
     fn classify_owner_matrix() {
-        // Managed: health owner matches the live pidfile pid.
         assert_eq!(
             classify_owner(Some(42), Some(&health(42))),
             OwnerVerdict::Managed(42)
         );
-        // Unclaimed: healthy peer but no live pidfile claim (launchd daemon
-        // before its first claim, or a dead-pid pidfile).
         assert_eq!(
             classify_owner(None, Some(&health(42))),
             OwnerVerdict::Unclaimed(42)
@@ -3416,15 +3229,12 @@ mod tests {
             classify_owner(Some(999_999_999), Some(&health(42))),
             OwnerVerdict::Unclaimed(42)
         );
-        // Squatter: port answers without our protocol.
         let squatter = serde_json::json!({"hello": "world"});
         assert_eq!(
             classify_owner(None, Some(&squatter)),
             OwnerVerdict::Squatter
         );
-        // Unknown: nothing answers.
         assert_eq!(classify_owner(Some(42), None), OwnerVerdict::Unknown);
-        // Protocol peer without an owner row: nothing to attest.
         let no_owner = serde_json::json!({"protocol": doorbell_rt::api::PING.protocol});
         assert_eq!(classify_owner(None, Some(&no_owner)), OwnerVerdict::Unknown);
     }
@@ -3630,8 +3440,6 @@ mod reload_settle_tests {
         let mut steps = Vec::new();
         let res = run_reload_plan_with(&plan, |cmd| {
             steps.push(flat(cmd));
-            // The probe is the ONE step that answers "unloaded" — without this
-            // the fold would poll ten times and the count below would catch it.
             if cmd.get(1).map(String::as_str) == Some("print") {
                 (false, "Could not find service".into())
             } else {
@@ -3639,7 +3447,6 @@ mod reload_settle_tests {
             }
         });
         assert!(res.is_ok(), "{res:?}");
-        // bootout, one probe (unloaded), bootstrap.
         assert_eq!(steps.len(), 3, "{steps:?}");
     }
 }

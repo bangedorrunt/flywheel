@@ -196,9 +196,6 @@ pub(crate) enum WorkflowCmd {
         timeout: Option<u64>,
         /// GS-039 P0-3: NEVER silent-reap desks. Default OFF — pass
         /// `--retire-orphans` explicitly to close pre-existing workspaces.
-        // GS-040 B2: hidden `--no-retire-orphans` is a SEPARATE field linked
-        // via overrides_with — NOT dual-#[arg] on the same field (that
-        // dropped the positive flag; only --no-retire-orphans survived).
         #[arg(
             long = "retire-orphans",
             action = clap::ArgAction::SetTrue,

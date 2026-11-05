@@ -9,9 +9,6 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
-// ---------------------------------------------------------------------------
-// Model
-// ---------------------------------------------------------------------------
 
 /// Assignment receipt — durable row cached in Model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -24,16 +21,6 @@ pub struct Receipt {
     pub result_path: Option<String>,
 }
 
-// ---------------------------------------------------------------------------
-// Context handoff (bd-context-handoff-064d): coverage-ranged resume instead
-// of an ad-hoc brief.
-//
-// A handoff row records which runs a resumed pane already saw; respawn (and
-// the session-pickup resume brief — one primitive for both) sends only the
-// delta. A missing or stale row falls back to a full brief and says which
-// strategy it used. Pure: callers supply the run list, tick only stores.
-// ---------------------------------------------------------------------------
-
 /// Which resume shape a handoff produced. The default return is the delta,
 /// never a full transcript; FullBrief names itself when it fires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,7 +30,7 @@ pub enum HandoffStrategy {
 }
 
 /// One run the pane may have seen, oldest first. `seq` orders; `id` names.
-#[cfg_attr(not(test), allow(dead_code))] // test-proven API; the respawn/pickup wiring lane calls it next
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandoffRun {
     pub id: String,
@@ -75,7 +62,7 @@ pub fn handoff_key(project: &str, pin: &str, bead: &str) -> (String, String, Str
 }
 
 /// Stamp one handoff row: coverage `from_run..=to_run`, delta strategy.
-#[cfg_attr(not(test), allow(dead_code))] // test-proven API; the respawn/pickup wiring lane calls it next
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn record_handoff(
     project: &str,
     pin: &str,
@@ -104,7 +91,7 @@ pub fn record_handoff(
 ///   so a delta would risk skipping context.
 /// - Otherwise → runs after `from_run`, DeltaSinceLastSeen (possibly empty:
 ///   the pane is already current, so the resume sends nothing).
-#[cfg_attr(not(test), allow(dead_code))] // test-proven API; the respawn/pickup wiring lane calls it next
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn handoff_delta<'a>(
     row: Option<&HandoffRow>,
     runs: &'a [HandoffRun],
@@ -140,7 +127,7 @@ pub fn handoff_delta<'a>(
 /// One primitive for the respawn resume AND the session-pickup resume brief:
 /// renders which strategy fired and exactly which runs travel. The delta
 /// carries only unseen runs; the fallback names itself as a full brief.
-#[cfg_attr(not(test), allow(dead_code))] // test-proven API; the respawn/pickup wiring lane calls it next
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn resume_brief(row: Option<&HandoffRow>, runs: &[HandoffRun]) -> (String, HandoffStrategy) {
     let (unseen, strategy, reason) = handoff_delta(row, runs);
     let ids: Vec<&str> = unseen.iter().map(|r| r.id.as_str()).collect();
@@ -168,7 +155,7 @@ pub fn resume_brief(row: Option<&HandoffRow>, runs: &[HandoffRun]) -> (String, H
 
 /// Read the stored row for (project, pin, bead) and return the resume delta.
 /// Effect-layer entry point for respawn / session-pickup wiring.
-#[cfg_attr(not(test), allow(dead_code))] // test-proven API; the respawn/pickup wiring lane calls it next
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn resume_runs_for<'a>(
     model: &'a WorkspaceModel,
     project: &str,
@@ -186,11 +173,6 @@ pub fn resume_runs_for<'a>(
 /// never authority), "legacy" (pre-D3 snapshot), "endpoint" (death).
 /// Unknown is never promoted, never absorbs a wake, never prompts.
 /// Native hc idle is never trusted.
-// bd-b2b3-serialize: NOT `#[derive(Deserialize)]` here, deliberately. The
-// hand-written impl below accepts BOTH the pre-D3 flat unit string and the
-// current map form, landing unknown words as `Unknown` (never authority). A
-// derive would compile-conflict with it, and replacing it would drop
-// snapshot-format compatibility that a live dispatcher depends on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 pub enum Presence {
     #[default]
@@ -238,10 +220,6 @@ impl Presence {
     }
 }
 
-// Pre-D3 snapshots stored flat unit strings ("Working", "Idle", ...).
-// New verdicts serialize as maps ({"Busy":{"source":"..."}}). Accept
-// both so a snapshot written before D3 still loads; flat words land with
-// source "legacy", never authority.
 impl<'de> serde::Deserialize<'de> for Presence {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -332,16 +310,6 @@ pub struct Question {
     pub created_at: u64,
 }
 
-// ---------------------------------------------------------------------------
-// ADR-0010 D6 (bd-f14d): OPEN DECISIONS fold + RECORD DIVERGENCE.
-//
-// open_human IS the captain-hold cache (single store — no second table).
-// The fold below renders every open decision until an answer/--verdict
-// clears it (apply_human_decision is the only remover). Teardown, kill,
-// corr TTL, and wait expiry never closes a call: expiry PROMOTES
-// into open_human (re-surface, never drop). Divergence rows only report.
-// ---------------------------------------------------------------------------
-
 /// One open captain call, folded from the open_human cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenDecision {
@@ -367,8 +335,6 @@ pub fn open_decisions(model: &WorkspaceModel) -> Vec<OpenDecision> {
     rows
 }
 
-// Read-side divergence reporting is kept outside the live reducer. Re-export
-// the established names so snapshots and existing callers remain unchanged.
 pub use crate::workspace_reporting::{Divergence, DivergenceSpec};
 /// Single-home re-exports (bd-fuql): wake-state types + pure folds live in
 /// `doorbell_core::wake_core`; the tick borrows them through these names
@@ -377,8 +343,6 @@ pub use doorbell_core::wake_core::{
     DigestEntry, PresentedWake, ReringDecision, ReringEntry, digest_detail_truncate, render_digest,
 };
 
-// Divergence variants remain part of this source-level contract:
-// ClosedBeadOpenCorr, AnsweredCorrHeldBead, DoneWithoutLegalClose.
 /// Compatibility wrapper for the established workspace reporting seam. The
 /// projection implementation lives in `workspace_reporting`; this function
 /// keeps the source-level and call-level contract stable for snapshot readers.
@@ -471,17 +435,6 @@ impl WorkspaceModel {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ADR-0010 D5 (bd-65he): wake classification + afk digest.
-//
-// Pure predicates in workspace::tick: benign (zero prompts), routine
-// (journal+counter), captain-relevant (digest queue), urgent (immediate
-// prompt, 5/30/3 cap unchanged). Every Prompt counts as spent wake, so
-// non-urgent prompts queue as captain-relevant (visible) rather than
-// routine — routine ticks provably contain no Cmd::Prompt. Urgent
-// bypasses batching: it prompts now AND queues for the digest record.
-// ---------------------------------------------------------------------------
-
 /// Default digest batching interval (secs). Override with
 /// FLYWHEEL_DIGEST_SECS.
 pub const DIGEST_INTERVAL_DEFAULT_SECS: u64 = 300;
@@ -556,8 +509,6 @@ pub fn classify_cmd(cmd: &Cmd) -> WakeClass {
         | Cmd::Respawn { .. }
         | Cmd::Diagnose { .. } => WakeClass::CaptainRelevant,
         Cmd::Wait => WakeClass::Benign,
-        // A batch just emitted: captain-facing work, but never re-queued
-        // (the D5 loop skips Digest cmds so batches cannot self-feed).
         Cmd::Digest { .. } => WakeClass::CaptainRelevant,
         _ => WakeClass::Routine,
     }
@@ -634,18 +585,6 @@ pub const PENDING_WAIT_TTL_SECS: u64 = 3600;
 /// earliest deadline first, each with an Audit wait-timeout record.
 pub const PENDING_WAIT_CAP: usize = 512;
 
-// ---------------------------------------------------------------------------
-// ADR-0010 D1 (bd-w98c): re-ring ladder — the dispatcher wake budget.
-//
-// The toron message IS the delivery; the hc prompt is a doorbell.
-// An un-acked corr older than one grace window is due one re-ring per
-// window; after RING_MAX the wake escalates: Dead → respawn path,
-// Unknown → digest naming pin+corr+attempt count. This REPLACES the flat
-// 120s deaf-pane digest. Fire-and-forget and already-acked corrs skip
-// the ladder; --raw without an id rings once and never escalates.
-// Functional core (no I/O): tick advances entries, effect layer prompts.
-// ---------------------------------------------------------------------------
-
 /// Default grace window between re-rings (secs). Override with
 /// FLYWHEEL_DOORBELL_GRACE_SECS.
 pub const DOORBELL_GRACE_DEFAULT_SECS: u64 = 90;
@@ -698,13 +637,6 @@ fn inbox_row_ack_overdue(row: &serde_json::Value) -> bool {
         Some("high" | "urgent")
     )
 }
-
-// ---------------------------------------------------------------------------
-// Msg — one union covering mail / watch / status / heal / reclaim / receipt / role / human / presence
-//
-// Per-arm contract (ADR-0028 C): every variant states what it writes and
-// what it emits. Clock enters ONLY as a payload (Tick/AckSlaTick/Sweep).
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Msg {
@@ -854,18 +786,8 @@ pub enum Msg {
     },
 }
 
-// ---------------------------------------------------------------------------
-// Cmd — effects as data (DoorbellAction + LoopAction collapse into this)
-//
-// Per-arm contract (ADR-0028 C): Prompt gated by prompt_allowed; every
-// arm is applied by exactly one executor (dispatcher or swarm_loop) or
-// carries a bead deleting it. Content shapes: Publish is rumor-14,
-// WaitCorr carries a non-empty corr.
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Cmd {
-    // doorbell slice — data equivalents of DoorbellAction
     /// Inject iff prompt_allowed (E5 gate). Line always starts "[doorbell]".
     Prompt { pin: String, line: String },
     /// Effect runs the fetch; rows re-enter tick as InboxRows.
@@ -890,7 +812,6 @@ pub enum Cmd {
     /// the bounded DigestEntry details.
     Digest { entries: Vec<DigestEntry> },
 
-    // swarm slice — data equivalents of LoopAction
     /// Swarm send. Name is the hc pane, text the full prompt.
     Send { name: String, text: String },
     /// Swarm send. Records bead→pin binding for the spawn registry.
@@ -915,7 +836,6 @@ pub enum Cmd {
     /// Swarm send. Cooperative yield; no content.
     Wait,
 
-    // E2/E3 assignment + receipts
     /// Write-through of the assignment cache. Corr is always non-empty;
     /// receipt mirrors the Model row exactly.
     SqliteUpsert { corr: String, receipt: Receipt },
@@ -944,10 +864,6 @@ pub enum Cmd {
         input: serde_json::Value,
         corr: String,
     },
-    // DELETED by zfnx.4 (E1): WriteNcryptsec is gone — flywheel never
-    // writes ncryptsec secrets (keys belong to toron); a secret-writing
-    // Cmd beside rumor-14 would be an exfil path. Likewise the Subscribe
-    // Cmd is gone (55nx.7): claim-watch lives in swarm_loop, no second bus.
     /// Tick's hard-error signal. Why is always non-empty and names the
     /// contract broken (forge, malformed tags, unknown corr).
     LoudMiss { why: String },
@@ -993,10 +909,6 @@ impl Cmd {
             crate::doorbell_tick::DoorbellAction::Audit { kind, pin, detail } => {
                 Self::Audit { kind, pin, detail }
             }
-            // bd-bk9t: a pane-less pin's wake has no prompt route. In this
-            // path the digest IS the audit surface — `classify_cmd` reads
-            // every Audit as CaptainRelevant and queues it for the batch —
-            // so the wake lands in the digest with the reason on the row.
             crate::doorbell_tick::DoorbellAction::Digest { pin, line, why } => Self::Audit {
                 kind: "digest_bound".into(),
                 pin,
@@ -1031,11 +943,6 @@ impl Cmd {
                 terminal_name,
                 reason,
             },
-            // ADR-0010 D4/D12: the declared wait's human re-surface path. The
-            // Audit is the captain-relevant record `classify_cmd` queues for
-            // the digest, so a pause that nobody answers keeps surfacing
-            // instead of parking silently (detail text is the shared line, so
-            // every plane renders the resurface identically).
             crate::durable::LoopAction::PausedResurface {
                 name,
                 bead_id,
@@ -1133,11 +1040,9 @@ pub fn sticky_open_topology(
             return (e, false);
         }
     }
-    // Hold open against invent flips (loop|swarm|join|none) without explicit.
     if current == Some("open") && matches!(classified, "loop" | "swarm" | "join" | "none") {
         return ("open".into(), true);
     }
-    // Hold loop against swarm without explicit (docs: do not flip loop→swarm).
     if current == Some("loop") && classified == "swarm" {
         return ("loop".into(), true);
     }
@@ -1161,7 +1066,6 @@ pub fn parse_explicit_topology(text: &str) -> Option<String> {
     if t.contains("/join") || t.contains("topology=join") || t.contains("topology join") {
         return Some("join".into());
     }
-    // Bare "switch to swarm/loop/open/join" / "use swarm topology"
     for topo in ["swarm", "loop", "open", "join"] {
         let needles = [
             format!("switch to {topo}"),
@@ -1204,7 +1108,6 @@ pub fn material_context_reason(summary: &str) -> Option<&'static str> {
     if lower.contains("reclassify") || lower.contains("material context") {
         return Some("material-reclassify");
     }
-    // Goal-change markers from steer / operator pane text.
     if lower.contains("new objective")
         || lower.contains("objective change")
         || lower.contains("changed objective")
@@ -1302,7 +1205,6 @@ pub fn expand_reclassify_cmds(
                 reason,
                 effect_key,
             } => {
-                // USE the key — never match `_` (Cmd theater without journal).
                 let expected =
                     reclassify_effect_key(&goal, &reason, explicit_topology.as_deref(), &pin);
                 if effect_key != expected {
@@ -1332,13 +1234,6 @@ pub fn expand_reclassify_cmds(
                         continue;
                     }
                 };
-                // bd-n86n: W2 (ADR-0014, default off) host-side Jev enrichment.
-                // The pure table leaf is untouched; the adapter only annotates
-                // beside it and journals a JudgmentEffect child of this intent.
-                // Decide + prepare + POST run here, OUTSIDE the journal tx:
-                // commit holds the tx across its closure, so a blocking 5s
-                // POST inside would stall every concurrent journal writer.
-                // Flag off = byte-identical passthrough (no audit).
                 let (primitive, topology, argv, decide_reason) = decide(&intent.goal);
                 let plan = crate::judgment::prepare_post_with_authority(
                     crate::judgment::ExpandArgs {
@@ -1375,9 +1270,6 @@ pub fn expand_reclassify_cmds(
                     }
                     _ => None,
                 };
-                // Doorbell battery (bd-lpn6): second pack over inbound
-                // material in the same outside-tx window. Detections annotate
-                // routing only via finish_plan; table authority untouched.
                 let screen_posted = match &plan.stage {
                     crate::judgment::PostStage::Ready {
                         screen: Some(ask), ..
@@ -1409,12 +1301,7 @@ pub fn expand_reclassify_cmds(
                     explicit_topology: intent.explicit_topology.clone(),
                 };
                 let more = match crate::agent_ref::commit_reclassify(project, intent, |intent| {
-                    // Apply uses the journaled identity (goal + effect_key).
                     let _ = &intent.effect_key;
-                    // bd-n86n: decide + prepare + POST all ran OUTSIDE the tx
-                    // (below, before commit) — the closure holds the journal
-                    // tx, so it must never wait on network. Only merge+tick
-                    // run here: pure folds, no I/O. `enriched`/`ready` move in.
                     let (next, mut more) = tick(model, &ready);
                     *model = next;
                     if let Some((audit_pin, detail)) = enriched.audit {
@@ -1431,9 +1318,6 @@ pub fn expand_reclassify_cmds(
                             detail: detail.to_string(),
                         });
                     }
-                    // Miss ledger (bd-lpn6): one row per expand, keyed by the
-                    // parent effect key. Best-effort: a ledger failure warns
-                    // but never fails the dispatch it observes.
                     if let Err(e) = crate::judgment::miss_append(&crate::judgment::MissRow {
                         ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                         effect_key: intent.effect_key.clone(),
@@ -1469,18 +1353,9 @@ pub fn expand_reclassify_cmds(
 }
 
 fn filter_prompts(model: &WorkspaceModel, cmds: Vec<Cmd>) -> Vec<Cmd> {
-    // bd-7qg6: the old filter silently dropped every non-Idle Prompt — including
-    // URGENT wakes to Busy pins, which never reached the post-pass urgent
-    // bypass (classify-then-retain) and vanished without a digest trace. New
-    // rule: Idle prompts; Busy+urgent BREAKS THROUGH (ADR-0005 gap 5, E5 —
-    // urgency exists for working panes); everything else becomes an Audit so
-    // the wake stays digest-visible instead of vanishing. Unknown never
-    // prompts (invariant 9) and Dead stays Lane-1 drain territory — both audit.
     cmds.into_iter()
         .flat_map(|c| match c {
             Cmd::Prompt { pin, line } => {
-                // Idle prompts and Busy+urgent break-throughs deliver the SAME
-                // Cmd — one condition, not two identical branches.
                 if prompt_allowed(model, &pin)
                     || (is_urgent_line(&line)
                         && matches!(model.presence.get(&pin), Some(Presence::Busy { .. })))
@@ -1521,8 +1396,6 @@ fn apply_human_decision(next: &mut WorkspaceModel, cmds: &mut Vec<Cmd>, corr: &s
     }
 }
 
-// One positional per assignment field the mail row carries; grouping them would
-// only move the field list into a struct.
 #[allow(clippy::too_many_arguments)]
 fn apply_assignment(
     next: &mut WorkspaceModel,
@@ -1539,11 +1412,6 @@ fn apply_assignment(
     if corr.is_empty() {
         return;
     }
-    // ADR-0028 C: tag vocabulary is wake ∈ {tasked,standing}, audience ∈
-    // {human,agents}, priority ∈ {queue,interrupt} — mirrors the
-    // SendTags::parse hard-error on the send path. Absent tags arrive
-    // pre-defaulted to valid members; a present-but-unknown value is a
-    // malformed assignment → LoudMiss (tick's hard-error), no model write.
     if !matches!(wake.as_str(), "tasked" | "standing")
         || !matches!(audience.as_str(), "human" | "agents")
         || !matches!(priority.as_str(), "queue" | "interrupt")
@@ -1599,14 +1467,6 @@ fn apply_assignment(
         corr: corr.clone(),
         receipt,
     });
-    // bd-bdpx: the park deadline is stamped HERE from the tick clock
-    // (last_now), never wall-clock in the effect handler — replay reproduces
-    // it byte-identically from the Msg log. last_now==0 means no clock Msg
-    // has folded yet (pre-first-beat boot sliver or a bare Default in
-    // tests): the Cmd still emits, but no deadline is registered — the live
-    // dispatcher seeds last_now at construction so the sliver never happens
-    // there. Sweep-arm expiry + cap-eviction stay the deciders, each with an
-    // Audit wait-timeout record. Never silent drop.
     if next.last_now > 0 {
         next.wake.waits.insert(
             corr.clone(),
@@ -1645,18 +1505,10 @@ fn mint_human_question(
     });
 }
 
-// ---------------------------------------------------------------------------
-// Private slice reducers — the only place the two old ticks are called.
-// ---------------------------------------------------------------------------
-
 fn doorbell_slice(
     model: &crate::doorbell_tick::DoorbellModel,
     msg: crate::doorbell_tick::DoorbellMsg,
 ) -> (crate::doorbell_tick::DoorbellModel, Vec<Cmd>) {
-    // The doorbell's decision folds through the port (ADR-0018 §3 item 3):
-    // `doorbell_core::tick` stays the ONE implementation of the decision and
-    // the program owns the shape around it, so the live path and the
-    // program can never drift apart.
     let (next, cmds) = crate::elm::inbox::InboxProgram::fold(model, &msg);
     let cmds = cmds
         .into_iter()
@@ -1730,10 +1582,6 @@ pub fn tick_from_loop_msg(
     (wm.swarm, acts)
 }
 
-// ---------------------------------------------------------------------------
-// Entry: one tick
-// ---------------------------------------------------------------------------
-
 /// One entry: pure, total, deterministic, no I/O, no &mut.
 /// Clock enters ONLY as Msg payload (Tick{now} / AckSlaTick{now}).
 pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
@@ -1749,23 +1597,10 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             );
             next.doorbell = dm;
             cmds.extend(filter_prompts(&next, c));
-            // E2/E4/E6: 30013 role=, 20001 presence. Kind-9 is the ring, not
-            // the assignment vehicle — corr/wake ride rumor 14 / InboxRows.
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                // 20001 presence — ADR-0028 E5 trust rule: inject truth is
-                // the pin itself (line `pubkey` == pin's npub in
-                // `doorbell.index`) or the trusted `Msg::Presence` edge
-                // (dispatcher-internal, e.g. jsonl timeout path below).
-                // A 20001 line whose author is provably not the claimed pin
-                // is a forge: LoudMiss (+Audit), presence unchanged.
-                // Verification needs BOTH a known npub mapping AND a line
-                // pubkey; when either is absent forgery is unprovable so the
-                // claim is accepted (bootstrap + pre-npub tests). Missing
-                // key = Unknown; Unknown never prompts (see prompt_allowed).
                 if v.get("kind").and_then(serde_json::Value::as_u64) == Some(20001)
                     && let Some(content) = v.get("content").and_then(|c| c.as_str())
                 {
-                    // content is like "idle" or JSON with pin/state? For test, content is state, tags contain p tag for pin
                     let state = content.to_string();
                     let author = v
                         .get("pubkey")
@@ -1804,10 +1639,8 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                             }
                         }
                     } else {
-                        // Fallback: if no p tag, use pin from content? For test, just use a dummy
                     }
                 }
-                // 30013 role binding
                 if v.get("kind").and_then(serde_json::Value::as_u64) == Some(30013)
                     && let Some(tags) = v.get("tags").and_then(|t| t.as_array())
                 {
@@ -1856,8 +1689,6 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                             }
                         }
                     }
-                    // Kind-9 is the ring. Assignment enters from rumor 14 tags
-                    // (or InboxRows from FetchInbox). Never from mail-delivered.
                     let kind = v.get("kind").and_then(serde_json::Value::as_u64);
                     if kind == Some(14)
                         && let Some(c) = corr
@@ -1900,7 +1731,6 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             );
             next.doorbell = dm;
             cmds.extend(filter_prompts(&next, c));
-            // E2/E3: assignment from tagged rows (corr/wake/priority/audience/result_path)
             for row in rows {
                 let corr = row
                     .get("corr")
@@ -1942,12 +1772,6 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                     verdict,
                 );
             }
-            // ADR-0010 D1 (bd-w98c residual): ladder registration + ack fold
-            // from the inbox projection itself. An ack-overdue row (the
-            // scan's scope) registers/refreshes its corr on the ladder —
-            // window stamped from the tick clock (bd-bdpx rule), never
-            // wall-clock; a row already per-recipient read is the handling
-            // fact and marks the entry acked. Idempotent by corr.
             for row in rows {
                 let Some(corr) = row
                     .get("corr")
@@ -1958,8 +1782,6 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                     continue;
                 };
                 if row.get("read_ts_us").is_some_and(|v| !v.is_null()) {
-                    // The handling fact wins over the shape test: a read row
-                    // acks its corr (when tracked) and never registers.
                     if let Some(e) = next.wake.ladders.get_mut(&corr) {
                         e.acked = true;
                     }
@@ -2020,12 +1842,6 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             );
             next.doorbell = dm;
             cmds.extend(c);
-            // ADR-0010 D1 (bd-w98c): advance the re-ring ladder. One
-            // ring per grace window; past max rings Dead→respawn and
-            // Unknown→digest. Acked / fire-and-forget entries leave
-            // without a sound. Presence is read-only here; the enum
-            // itself stays Lane-2 (bd-s8bo) owned. The ladder entries live
-            // in `next.wake.ladders`.
             let corrs: Vec<String> = next.wake.ladders.keys().cloned().collect();
             for corr in corrs {
                 let Some(entry) = next.wake.ladders.get(&corr).cloned() else {
@@ -2084,11 +1900,6 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             }
         }
         Msg::SlaFired { posts } => {
-            // The scan's hit list is evidence, not a ring: the wake itself
-            // already traveled the watch path (toron emits kind-9
-            // ack-sla-expired per overdue post). Tick audits the delta and
-            // pulls the inbox so overdue corr rows re-enter as InboxRows —
-            // that arm is the ladder's registrar.
             cmds.push(Cmd::Audit {
                 kind: "ack-sla-hit".into(),
                 pin: "-".into(),
@@ -2098,11 +1909,6 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
         }
         Msg::Sweep { now } => {
             cmds.push(Cmd::FetchInbox);
-            // bd-zfnx.6: bound the wait cache on every sweep beat. Expired
-            // deadlines and over-cap earliest entries leave WITH an Audit
-            // wait-timeout record each — a timeout is observable, never a
-            // silent drop. Receipt arrival still wins via try_tick_receipt
-            // (effect side) before the next sweep.
             let mut gone: Vec<(String, &'static str)> = Vec::new();
             for (corr, deadline) in &next.wake.waits {
                 if *deadline <= *now {
@@ -2127,10 +1933,6 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 }
             }
             for (corr, why) in gone {
-                // D6 (bd-f14d): expiry PROMOTES into the open_human cache —
-                // re-surface, never drop. Silent cache insert (no Publish:
-                // promotion must not re-ring); the Audit below stays the
-                // observable record. Clears only via answer/--verdict.
                 if !next.open_human.contains_key(&corr) {
                     next.open_human.insert(
                         corr.clone(),
@@ -2233,19 +2035,12 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             cmds.extend(c);
         }
         Msg::Receipt { corr, receipt } => {
-            // ADR-0016: receipt correlation is a validated boundary value.
-            // Preserve the wire string unchanged on success; reject malformed
-            // input before it can create an unaddressable assignment or unpark
-            // the wrong waiter.
             if let Err(error) = crate::kernel::Corr::parse(corr.clone()) {
                 cmds.push(Cmd::LoudMiss {
                     why: format!("receipt corr invalid: {error}"),
                 });
             } else {
                 next.assignment.insert(corr.clone(), receipt.clone());
-                // bd-bpj1 (F1): the wait-list removal is owned here, not by the
-                // effect-layer drain — the full receipt transition (insert +
-                // unpark + upsert) reproduces from this one Msg on replay.
                 next.wake.waits.remove(corr);
                 cmds.push(Cmd::SqliteUpsert {
                     corr: corr.clone(),
@@ -2254,24 +2049,13 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             }
         }
         Msg::RoleBound { role, pin } => {
-            // E4 open-corr inheritance is LATE BINDING: assignment receipts
-            // are keyed by corr with no pin field, so every later Prompt
-            // resolves through `roles` at dispatch time — rebinding the role
-            // re-targets all open corrs by construction. Nothing to copy.
             next.roles.insert(role.clone(), pin.clone());
         }
         Msg::HandoffRecorded { row } => {
-            // bd-context-handoff-064d: sole writer of the handoffs map.
-            // Last writer wins; the resume reads it via `resume_runs_for`.
-            // Emits nothing — a stored row is not a delivery.
             let key = handoff_key(&row.project, &row.pin, &row.bead);
             next.handoffs.insert(key, row.clone());
         }
         Msg::Presence { pin, state } => {
-            // Trusted internal edge (dispatcher jsonl timeout path):
-            // no author check — the dispatcher is the trust root here. The
-            // identity itself is still validated before it can become a map
-            // key or prompt target.
             if let Err(error) = crate::kernel::AgentPin::parse(pin.clone()) {
                 cmds.push(Cmd::LoudMiss {
                     why: format!("presence pin invalid: {error}"),
@@ -2303,7 +2087,6 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             explicit_topology,
             reason,
         } => {
-            // Pure: schedule caller-applied effect. No decide I/O here.
             let pin = doorbell_core::fact_captain_pin(&next.roles).unwrap_or_default();
             let effect_key =
                 reclassify_effect_key(goal, reason, explicit_topology.as_deref(), &pin);
@@ -2337,16 +2120,12 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 explicit_topology.as_deref(),
             );
             next.session_topology = Some(final_topo.clone());
-            // Sticky-open airtight: never announce invent wave-swarm under open
-            // (or invent swarm under held loop) — `none: raw` / open|loop vehicle only.
             let vehicle = if sticky_held {
                 sticky_held_vehicle_announcement(primitive, &final_topo)
             } else {
                 vehicle_announcement(primitive, &final_topo)
             };
             next.last_vehicle = Some(vehicle.clone());
-            // Sticky-held announce must not name invent swarm primitive in
-            // the Prompt line (vehicle or reason) — audit keeps raw classify.
             let announce_reason = if sticky_held {
                 "session topology held (invent vehicle suppressed)"
             } else {
@@ -2354,8 +2133,6 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             };
             let line = reclassify_announce_line(&vehicle, announce_reason, sticky_held);
             if let Some(pin) = doorbell_core::fact_captain_pin(&next.roles) {
-                // Urgent reclassify announces break through Busy (same E5
-                // breakthrough as plane-P); Unknown/Dead stay Audit-only.
                 let busy = matches!(next.presence.get(&pin), Some(Presence::Busy { .. }));
                 if prompt_allowed(&next, &pin) || busy {
                     cmds.push(Cmd::Prompt {
@@ -2381,19 +2158,9 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
         }
     }
 
-    // ADR-0010 D2 (bd-8jlv): generation-bound wake ledger, one central
-    // post-pass so every Prompt site shares the semantics. (1) Re-present:
-    // pins prompted this tick re-emit their shown-but-unacked lines
-    // first (same bytes — a duplicate ring is never second work), gated
-    // by prompt_allowed like any wake. (2) Record: every emitted Prompt
-    // upserts shown[pin] by line at this generation. Fresh models
-    // carry no unacked entries, so silent ticks stay silent.
     let mut replays: Vec<Cmd> = Vec::new();
     for cmd in &cmds {
         if let Cmd::Prompt { pin, line } = cmd {
-            // bd-l72k: only urgent lines re-ring. Routine/captain prompts
-            // never deliver (stripped below), so they must never enter
-            // the ledger or resurrect as replays — digest/counters own them.
             if !is_urgent_line(line) {
                 continue;
             }
@@ -2420,9 +2187,6 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
     cmds.splice(0..0, replays);
     for cmd in &cmds {
         if let Cmd::Prompt { pin, line } = cmd {
-            // bd-l72k: the ledger records deliveries only. Non-urgent
-            // prompts are stripped below — recording them would grow
-            // shown lines that never deliver and re-ring forever.
             if !is_urgent_line(line) {
                 continue;
             }
@@ -2438,11 +2202,6 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
         }
     }
 
-    // ADR-0010 D5 (bd-65he): classify the tick, queue captain-relevant
-    // wakes for the afk digest, count every tick once. Digest cmds never
-    // re-queue themselves. Batch emits on now-bearing beats when the
-    // queue hits depth N or the interval lapses; urgent prompts bypass
-    // batching by construction (prompted immediately above).
     if let Some(now) = match msg {
         Msg::AckSlaTick { now } | Msg::Sweep { now, .. } | Msg::Tick { now } => Some(*now),
         _ => None,
@@ -2528,9 +2287,6 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
         .wake_counters
         .entry(tick_class.label().to_string())
         .or_insert(0) += 1;
-    // bd-l72k edge triage: non-urgent prompts never deliver (no LLM turn).
-    // Captain-relevant entries are already queued above; routine ticks are
-    // already counted above. Only urgent prompts reach the effect layer.
     cmds.retain(|c| !matches!(c, Cmd::Prompt { line, .. } if !is_urgent_line(line)));
     if let Some(now) = match msg {
         Msg::AckSlaTick { now } | Msg::Sweep { now, .. } | Msg::Tick { now } => Some(*now),
@@ -2625,7 +2381,6 @@ mod tests {
             vec!["r3", "r4"],
             "{reason}"
         );
-        // The same row read back through the model agrees (one primitive).
         let (model, cmds) = tick(&empty_model(), &Msg::HandoffRecorded { row });
         assert!(cmds.is_empty(), "record emits nothing");
         let (via_model, _, _) = resume_runs_for(&model, "p", "BlueRidge", "bd-1", &runs);
@@ -2633,12 +2388,10 @@ mod tests {
             via_model.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             vec!["r3", "r4"]
         );
-        // The brief renders the delta, never the seen prefix.
         let (brief, strategy) = resume_brief(model.handoffs.values().next(), &runs);
         assert_eq!(strategy, HandoffStrategy::DeltaSinceLastSeen);
         assert!(brief.contains("r3") && brief.contains("r4"), "{brief}");
         assert!(!brief.contains("r1,") && !brief.contains("r2,"), "{brief}");
-        // Already current: empty delta, still the delta strategy.
         let row = record_handoff("p", "BlueRidge", "bd-1", "r4", "r4", "/tmp/h.json");
         let (unseen, strategy, _) = handoff_delta(Some(&row), &runs);
         assert!(unseen.is_empty());
@@ -2671,7 +2424,6 @@ mod tests {
             id: "r9".into(),
             seq: 9,
         }];
-        // to_run unknown to the current run list: coverage unprovable.
         let row = record_handoff("p", "BlueRidge", "bd-1", "r1", "r4", "/tmp/h.json");
         let (unseen, strategy, _) = handoff_delta(Some(&row), &runs);
         assert_eq!(strategy, HandoffStrategy::FullBrief);
@@ -2724,8 +2476,6 @@ mod tests {
     fn ws_model_plane_status_is_inject_truth() {
         let mut m = empty_model();
         m.doorbell.index.insert_pin("BlueRidge".into(), None);
-        // D3: prompt needs an exact Idle verdict (presence authority);
-        // hc statuses remain evidence in doorbell.statuses.
         m.presence
             .insert("BlueRidge".into(), Presence::from_str("idle"));
         let (m, _) = tick(
@@ -2754,8 +2504,6 @@ mod tests {
                 status: "idle".into(),
             },
         );
-        // bd-l72k: the drain still fires from Model (queue empties), but
-        // the drained routine wake no longer delivers a prompt.
         assert!(
             !cmds2.iter().any(|c| matches!(c, Cmd::Prompt { .. })),
             "drained routine wakes spend zero prompts: {cmds2:?}"
@@ -2772,8 +2520,6 @@ mod tests {
     fn ws_model_tick_composes_doorbell_watchndjson() {
         let mut m = empty_model();
         m.doorbell.index.insert_pin("BlueRidge".into(), None);
-        // D3: hc idle alone never prompts (never trusted); the exact
-        // Idle verdict below is the authority that lets the Prompt through.
         m.presence
             .insert("BlueRidge".into(), Presence::from_str("idle"));
         m.doorbell
@@ -2781,7 +2527,6 @@ mod tests {
             .insert("BlueRidge".into(), "idle".into());
         let line = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["h","ch-1"]],"content":"@BlueRidge hi"}"#.to_string();
         let (next, cmds) = tick(&m, &Msg::WatchNdjson { line });
-        // bd-l72k: addressed kind-9 is routine — zero prompts, counters only.
         assert!(
             cmds.iter().all(|c| !matches!(c, Cmd::Prompt { .. })),
             "routine wakes spend zero prompts: {cmds:?}"
@@ -2880,8 +2625,6 @@ mod tests {
 
     #[test]
     fn ws_model_receipt_unparks_the_wait() {
-        // bd-bpj1 (F1): the receipt transition owns the wait-list removal —
-        // the effect-layer drain must have nothing left to do.
         let mut m = empty_model();
         m.wake.waits.insert("c".into(), 999);
         let (next, _) = tick(
@@ -2973,10 +2716,6 @@ mod tests {
 
     #[test]
     fn tick_clock_drives_swarm_queue() {
-        // bd-loop-goal-name-dispatch-eo4u: Tick pairs the queue head with a
-        // REAL agent — never the bead id / brief text as the target. With no
-        // agents it parks (queue intact, no misaddressed Send); with an idle
-        // agent the head dispatches under the agent's own name.
         let mut m = empty_model();
         m.swarm.queue.push("bd-1".into());
         let (parked, no_cmds) = tick(&m, &Msg::Tick { now: 1 });
@@ -3180,10 +2919,6 @@ mod tests {
 
     #[test]
     fn declared_pause_resurface_rides_the_captain_relevant_audit() {
-        // ADR-0010 D4/D12: the declared wait's human re-surface path is the
-        // Audit row — `classify_cmd` reads every Audit as CaptainRelevant, so
-        // it lands in the AFK digest (D6) and in the journal, and it is never
-        // silently dropped on the floor.
         let cmd = Cmd::from_loop(crate::durable::LoopAction::PausedResurface {
             name: "oc".into(),
             bead_id: "bd-1".into(),
@@ -3202,18 +2937,11 @@ mod tests {
             other => panic!("expected a captain-relevant Audit, got {other:?}"),
         }
         assert_eq!(classify_cmd(&cmd), WakeClass::CaptainRelevant);
-        // The Audit has no loop-action inverse: a replay of the journal must
-        // not synthesize a second resurface action from the row itself.
         assert!(cmd.to_loop_action().is_none());
     }
 
     #[test]
     fn wait_deadline_stamped_from_tick_clock_not_wall_clock() {
-        // bd-bdpx: the park deadline stamps from last_now inside tick, so
-        // replay reproduces it from the Msg log (the effect handler no longer
-        // reads wall-clock). With no clock folded yet the Cmd still emits
-        // but nothing registers — the live dispatcher seeds last_now at
-        // construction so the sliver never happens there.
         let row = || {
             serde_json::json!({
                 "corr": "C-W",
@@ -3263,8 +2991,6 @@ mod tests {
 
     #[test]
     fn wait_sweep_expires_and_caps_with_timeout_record() {
-        // bd-zfnx.6 RED: waits are bounded (TTL + cap). Expiry and
-        // cap-eviction REMOVE entries and record a timeout — never silent.
         let mut m = empty_model();
         let now = 1_000_000u64;
         m.wake.waits.insert("expired".into(), now - 1);
@@ -3312,22 +3038,17 @@ mod tests {
 
     #[test]
     fn deadline_holds_sorted_digest_and_overdue_escalation() {
-        // bd-2fxx RED: holds carry needed-by; digest renders
-        // earliest-deadline first; overdue auto-escalates on the wedge
-        // pattern (no new store: waits + digest + wedge alarm).
         let now = 1_000_000u64;
         let mut m = empty_model();
         m.wake.waits.insert("late".into(), now - 1);
         m.wake.waits.insert("soon".into(), now + 10);
         m.wake.waits.insert("later".into(), now + 100);
-        // Future-dated holds sort earliest-deadline first.
         let order: Vec<String> = sorted_holds(&m).iter().map(|(c, _)| c.clone()).collect();
         assert_eq!(
             order,
             vec!["late".to_string(), "soon".to_string(), "later".to_string()],
             "holds sort earliest needed-by first: {order:?}"
         );
-        // Overdue set is the wedge-pattern escalation signal.
         let overdue: Vec<String> = overdue_holds(&m, now)
             .iter()
             .map(|(c, _)| c.clone())
@@ -3337,8 +3058,6 @@ mod tests {
             vec!["late".to_string()],
             "only past needed-by escalates: {overdue:?}"
         );
-        // Past needed-by surfaces as escalation on the sweep beat:
-        // re-surfaced (never dropped) + wait-timeout audit record.
         let (next, cmds) = tick(&m, &Msg::Sweep { now });
         assert!(
             next.open_human.contains_key("late"),
@@ -3350,7 +3069,6 @@ mod tests {
             ),
             "overdue hold gets a timeout record: {cmds:?}"
         );
-        // Digest renders holds earliest-deadline first, overdue flagged.
         let text = render_digest_with_holds(&[], &sorted_holds(&m), now);
         let late_pos = text.find("late").expect("digest names overdue hold");
         let soon_pos = text.find("soon").expect("digest names holds");
@@ -3367,10 +3085,6 @@ mod tests {
 mod bell_fold_tests {
     #[test]
     fn bell_fold_no_dead_secret_or_subscribe_arms() {
-        // bd-zfnx.4 + bd-55nx.7 RED: no secret-writing arm, no dead
-        // Subscribe Cmd, no producer-less ClaimWatch. A deletion comment
-        // naming the removal is allowed; an arm (brace form) is not.
-        // (needles split so this self-scan does not match its own source)
         let src = include_str!("workspace.rs");
         let wn = ["WriteNcryptsec", " {"].concat();
         let sub = ["Cmd::Sub", "scribe"].concat();
@@ -3387,21 +3101,12 @@ mod bell_fold_tests {
             !src.contains(&cw),
             "RED (zfnx.4): the producer-less ClaimWatch Msg still present — delete it"
         );
-        // zfnx.5 superseded (GS-016): Invoke is back as the WIRED playbook
-        // vehicle — caller-applied, executor routes through cmd_workflow
-        // (playbook lint + resolution gate, engine.invoke + VerifySink
-        // downstream). Guards: schema_invoke_is_caller_applied (tick never
-        // emits) + main.rs invoke_arm_hands_off_to_durable_run_gate.
         assert!(
             src.contains("Invoke {"),
             "the wired Invoke vehicle must exist (GS-016 rewire)"
         );
         let main = include_str!("main.rs");
         assert!(
-            // `::` prefix so it cannot match the LEGITIMATE doorbell
-            // subscription CLI arm (bd-55nx.7 targets the deleted
-            // workspace Cmd variant, not the doorbell subscription verb).
-            // Needle is split so this self-scan does not match its own source.
             !main.contains(&["::Cmd::Sub", "scribe"].concat()),
             "RED (55nx.7): main.rs still matches the dead Subscribe Cmd — delete the no-op arm"
         );
@@ -3425,7 +3130,6 @@ mod bell_fold_tests {
     #[test]
     fn bell_fold_no_status_preinsert_before_plane_tick() {
         let src = include_str!("main.rs");
-        // pre-insert before PlaneStatus tick kills drain (tick must see from)
         let needle = "bell_model.statuses.insert(pin.clone(), to.clone())";
         let count = src.matches(needle).count();
         assert!(
@@ -3440,10 +3144,6 @@ mod bell_fold_tests {
 
     #[test]
     fn bell_fold_no_status_by_pin_side_map() {
-        // bd-asr2.5 topology: the refresh/sweep helpers are gone (their arms
-        // live in doorbell_host.rs + the rt Brain). The invariant survives:
-        // no status side map anywhere — Model.doorbell.statuses is the only
-        // hc-status map, written by tick alone.
         let src = include_str!("main.rs");
         assert!(
             !src.contains("fn doorbell_refresh_status("),
@@ -3476,7 +3176,6 @@ mod bell_fold_tests {
             !src.contains("let (_, tick_actions) = doorbell_tick::tick(&bell_model, &msg)"),
             "RED (bd-6b1y #8): main.rs WatchDied still discards model' (`let (_, tick_actions) = tick(...)` at 8055) — keep the returned model"
         );
-        // Must have keep: let (next_model, tick_actions) = ... ; bell_model = next_model;
         assert!(
             src.contains("WatchDied"),
             "src must contain WatchDied handling"
@@ -3487,12 +3186,10 @@ mod bell_fold_tests {
     fn bell_fold_once_calls_tick_not_second_reducer() {
         let main = include_str!("main.rs");
         let doorbell = include_str!("doorbell.rs");
-        // once_json should call workspace::tick, not apply_watch_line as live second reducer
         assert!(
             main.contains("workspace::tick"),
             "RED (bd-6b1y #9): main.rs must wire through workspace::tick"
         );
-        // doorbell.rs once_json must use workspace::tick after fix (bd-3wzl)
         assert!(
             doorbell.contains("workspace::tick"),
             "RED (bd-6b1y #9): doorbell.rs once_json must call workspace::tick, not apply_watch_line"
@@ -3515,8 +3212,6 @@ mod bell_fold_tests {
             dt.contains("Fact"),
             "RED (bd-6b1y #10): DoorbellMsg::Fact missing in doorbell-core"
         );
-        // Live path is the host binding now (bd-asr2.5): drain → tick →
-        // budget gate → sink, all around the live model.
         let host = include_str!("doorbell_host.rs");
         assert!(
             host.contains("BrainMsg::Fact") && host.contains("workspace::Msg::Fact"),
@@ -3551,7 +3246,6 @@ mod bell_fold_tests {
             !slice.contains("agent_prompt") && !slice.contains("Client::connect"),
             "captain_fact_inject must not hc-inject (Tick Law)"
         );
-        // adapter must not swallow Err into ()
         assert!(
             !src.contains("if let Err(e) = captain_fact_inject(&proj, ev)"),
             "RED (bd-6b1y #10): adapter still swallows Err into () at main.rs 10853-10860 — must propagate fact into Msg"
@@ -3562,18 +3256,15 @@ mod bell_fold_tests {
     fn bell_fold_fetch_inbox_emitted() {
         let dt = include_str!("../crates/doorbell-core/src/lib.rs");
         let main = include_str!("main.rs");
-        // FetchInbox must be emitted as real Cmd, rows re-enter as InboxRows
         assert!(
             dt.contains("FetchInbox"),
             "RED (bd-6b1y #13): FetchInbox variant missing"
         );
-        // Must have a constructor or usage in main.rs / workspace.rs
         let has_emit = main.contains("FetchInbox") || dt.contains("FetchInbox");
         assert!(
             has_emit,
             "RED (bd-6b1y #13): FetchInbox never emitted — must be a real Cmd whose rows re-enter as InboxRows"
         );
-        // workspace tick should handle InboxRows
         let ws = include_str!("workspace.rs");
         assert!(ws.contains("InboxRows"), "workspace must handle InboxRows");
     }
@@ -3586,7 +3277,6 @@ mod bell_fold_tests {
             doorbell.contains("doorbell-journal-") && doorbell.contains("journals"),
             "RED (bd-6b1y #11): doorbell.rs journal path must be state_dir/journals/doorbell-journal"
         );
-        // why must fold tick from Default, have --corr/--seq, not grep
         assert!(
             main.contains("fn cmd_doorbell_why"),
             "RED (bd-6b1y #11): fn cmd_doorbell_why not found"
@@ -3633,9 +3323,6 @@ mod bell_fold_tests {
     #[test]
     fn bell_fold_no_live_doorbell_tick_in_main() {
         let src = include_str!("main.rs");
-        // LIVE dispatcher must route through workspace::tick, not direct doorbell_tick::tick
-        // Count occurrences of doorbell_tick::tick in main.rs live paths (exclude tests via #cfg)
-        // Simple scan: any occurrence is forbidden — workspace.rs is the only caller of slice ticks
         let count = src.matches("doorbell_tick::tick").count();
         assert_eq!(
             count, 0,
@@ -3671,8 +3358,6 @@ mod loop_fold_tests {
     #[test]
     fn loop_fold_nudges_via_tick_msgs() {
         let durable = include_str!("durable.rs");
-        // Nudges are decisions that ride Msgs into tick (ClaimNudge/CloseNudge
-        // arms emit the Send actions); the loop folds them after the poll tick.
         assert!(
             durable.contains("LoopMsg::ClaimNudge") && durable.contains("LoopMsg::CloseNudge"),
             "RED (bd-gs8b #2): claim/close nudges must be tick Msgs, not loop-side Sends"
@@ -3682,7 +3367,6 @@ mod loop_fold_tests {
                 && durable.contains("crate::workspace::tick"),
             "nudge Msgs must be folded through workspace::tick after the poll tick"
         );
-        // The old silent-drop is banned forever.
         assert!(
             !durable.contains("let _ = watch_sends"),
             "nudge Sends must never be computed then discarded"
@@ -3692,7 +3376,6 @@ mod loop_fold_tests {
     #[test]
     fn loop_fold_no_heal_pre_seed() {
         let durable = include_str!("durable.rs");
-        // Reclaim is a Msg the live producer ticks; never extend after.
         assert!(
             !durable.contains("poll_actions.extend(reclaim_actions)"),
             "RED (bd-gs8b #3): reclaim still bypasses tick via poll_actions.extend(reclaim_actions)"
@@ -3701,7 +3384,6 @@ mod loop_fold_tests {
             durable.contains("crate::workspace::Msg::Reclaim") || durable.contains("Msg::Reclaim"),
             "live producer must construct Msg::Reclaim"
         );
-        // Check that tick is the only producer of actions (no pre-seed var)
         let has_preseed =
             durable.contains("let mut heal_actions") && durable.contains("actions = tick");
         assert!(
@@ -3713,12 +3395,6 @@ mod loop_fold_tests {
     #[test]
     fn loop_fold_no_diagnose_filter() {
         let durable = include_str!("durable.rs");
-        // bd-gs8b #4 narrowed (bd-ivno): the deleted shape filtered
-        // Diagnose actions post-tick. A file-wide conjunction of
-        // substrings cannot see its absence — `filter(|a|`,
-        // `pane_exited`, and `poll_actions` all still occur separately
-        // for legitimate reasons — so the fence fires only on a
-        // `.filter(` whose 8-line window mentions Diagnose.
         let lines: Vec<&str> = durable.lines().collect();
         let mut violators: Vec<usize> = Vec::new();
         for (i, line) in lines.iter().enumerate() {
@@ -3739,9 +3415,6 @@ mod loop_fold_tests {
     #[test]
     fn loop_fold_single_event_apply() {
         let durable = include_str!("durable.rs");
-        // Events apply EXACTLY ONCE inside the Tick arm (bd-p1ds): Model.states
-        // lives in the Model and pending_events are drained and applied there.
-        // No loop-side apply — single-apply invariant holds via tick.
         let tick_call = "apply_events_to_states(&mut next.states, &next.pending_events)";
         let loop_call = "apply_events_to_states(&mut states, &event_batch.events)";
         let tick_count = durable.matches(tick_call).count();
@@ -3763,10 +3436,7 @@ mod loop_fold_tests {
             state.contains("heal_states"),
             "RED (bd-gs8b #14): state.rs ActiveLoop missing heal_states — move onto ActiveLoop (crash-safe)"
         );
-        // Also check that durable.rs does not have loop-local heal_states map at 5672 after tick
         let durable = include_str!("durable.rs");
-        // The loop-local map `let mut heal_states: HashMap` should be gone or be on ActiveLoop
-        // We just check that state.rs has it; loop-local mutate at 7472 should be gone
         assert!(
             !durable.contains("apply_diagnose_outcome") || state.contains("heal_states"),
             "RED (bd-gs8b #14): apply_diagnose_outcome loop-local mutate still present"
@@ -3800,7 +3470,6 @@ mod loop_fold_tests {
     #[test]
     fn loop_fold_tick_is_clock_not_world_dump() {
         let durable = include_str!("durable.rs");
-        // LoopMsg::Tick should be clock, not world dump — check the enum definition slice
         let pos = durable.find("LoopMsg::Tick").unwrap_or(0);
         let slice = &durable[pos..std::cmp::min(durable.len(), pos + 800)];
         let has_world_dump =
@@ -3858,7 +3527,6 @@ mod assignment_tick_tests {
                 pin: "Tester".into(),
             },
         );
-        // standing + empty body -> NO Cmd to human pin, no result
         let has_human_prompt = cmds
             .iter()
             .any(|c| matches!(c, Cmd::Prompt{pin,..} if pin=="human" || pin=="captain"));
@@ -3894,7 +3562,6 @@ mod assignment_tick_tests {
                 pin: "Tester".into(),
             },
         );
-        // tasked + empty -> Cmd records result against corr with result_path
         assert!(
             next.assignment.contains_key("FM-GS-012"),
             "tasked empty must create assignment"
@@ -3919,7 +3586,6 @@ mod assignment_tick_tests {
     #[test]
     fn assignment_tick_default_tasked_priority_is_queue() {
         let m = empty_model();
-        // tasked without priority should default to queue, not interrupt
         let row = inbox_row("C1", "tasked", "hello", "agents", None, None);
         let (next, cmds) = tick(
             &m,
@@ -3930,7 +3596,6 @@ mod assignment_tick_tests {
         );
         let r = next.assignment.get("C1").expect("should create assignment");
         assert_ne!(r.wake, "interrupt");
-        // Should not be treated as interrupt
         let has_interrupt_err = cmds
             .iter()
             .any(|c| matches!(c, Cmd::LoudMiss{why} if why.contains("interrupt")));
@@ -3951,7 +3616,6 @@ mod assignment_tick_tests {
                 pin: "Tester".into(),
             },
         );
-        // interrupt onto human pin is hard error
         let has_err = cmds.iter().any(|c| matches!(c, Cmd::LoudMiss{why} if why.contains("interrupt") && why.contains("human")));
         assert!(
             has_err,
@@ -3962,8 +3626,6 @@ mod assignment_tick_tests {
     #[test]
     fn assignment_tick_audience_human_one_pin_only() {
         let m = empty_model();
-        // audience=human with corr that would fan-out to multiple pins is hard error
-        // Simulate by having row with audience human and a special marker for broadcast
         let mut row = inbox_row("C3", "tasked", "hello", "human", None, None);
         row["broadcast"] = serde_json::Value::Bool(true);
         let (_next, cmds) = tick(
@@ -4048,7 +3710,6 @@ mod assignment_tick_tests {
 
     #[test]
     fn assignment_tick_s1_tasked_survives() {
-        // S1 scenario: tasked mail survives walker death is via durable receipt, not journal
         let m = empty_model();
         let receipt = Receipt {
             state: "owed".into(),
@@ -4065,7 +3726,6 @@ mod assignment_tick_tests {
         );
         assert!(next.assignment.contains_key("FM-GS-012"));
         assert!(cmds.iter().any(|c| matches!(c, Cmd::SqliteUpsert { .. })));
-        // Simulate new process rebuilding cache from table (not journal) — assignment should be rebuildable
         let rebuilt = next.assignment.clone();
         assert_eq!(rebuilt.get("FM-GS-012"), Some(&receipt));
     }
@@ -4094,7 +3754,6 @@ mod role_model_tests {
             next.roles.get("wheelhouse").map(String::as_str),
             Some("DustySparrow")
         );
-        // rebind to new pin overwrites
         let (next2, _) = tick(
             &next,
             &Msg::RoleBound {
@@ -4111,7 +3770,6 @@ mod role_model_tests {
     #[test]
     fn role_model_corr_inheritance_on_rebind() {
         let m = empty_model();
-        // Initial bind wheelhouse -> OldPin and an open corr for that role
         let (m1, _) = tick(
             &m,
             &Msg::RoleBound {
@@ -4132,8 +3790,6 @@ mod role_model_tests {
                 receipt: receipt.clone(),
             },
         );
-        // Simulate that FM-1 is for wheelhouse (in real code, the corr's audience was role: wheelhouse)
-        // Now rebind wheelhouse -> NewPin
         let (m3, _) = tick(
             &m2,
             &Msg::RoleBound {
@@ -4141,15 +3797,11 @@ mod role_model_tests {
                 pin: "NewPin".into(),
             },
         );
-        // Assignment for FM-1 must survive rebind (keyed by corr)
         assert_eq!(m3.assignment.get("FM-1"), Some(&receipt));
-        // Roles map now points to NewPin
         assert_eq!(
             m3.roles.get("wheelhouse").map(String::as_str),
             Some("NewPin")
         );
-        // Delivery for that corr should now retarget to NewPin (checked via next publish)
-        // For now, ensure no assignment was lost
         assert!(m3.assignment.contains_key("FM-1"));
     }
 
@@ -4178,7 +3830,6 @@ mod role_model_tests {
     #[test]
     fn role_model_no_30015_and_no_auto_spawn() {
         let src = include_str!("workspace.rs");
-        // Check that no 30015 kind is actually used (not just mentioned in test)
         let bad = ["toron_kind(300", "15)"].concat();
         let bad2 = ["kind(300", "15)"].concat();
         assert!(
@@ -4189,10 +3840,8 @@ mod role_model_tests {
             !src.contains("auto_spawn") || src.contains("auto-spawn on role miss forbidden"),
             "auto-spawn on role miss forbidden"
         );
-        // Also check that mail to unknown role does not auto-spawn
         let m = empty_model();
         let row = serde_json::json!({"corr": "C1", "wake": "tasked", "body": "hi", "audience": "agents", "role": "wheelhouse"});
-        // No role bound, so mail to role should be loud miss, not spawn
         let (next, _cmds) = tick(
             &m,
             &Msg::InboxRows {
@@ -4200,13 +3849,11 @@ mod role_model_tests {
                 pin: "Tester".into(),
             },
         );
-        // Should not have created a role or spawned, just handled as normal assignment
         assert!(!next.roles.contains_key("wheelhouse"));
     }
 
     #[test]
     fn role_model_30013_role_tags_parsed() {
-        // Verify that 30013 role= tags are parsed (bd-lmcy)
         let line = r#"{"kind":30013,"tags":[["d","toron:TestAgent"],["role","wheelhouse"]],"content":"{}"}"#;
         let (next, _) = tick(&empty_model(), &Msg::WatchNdjson { line: line.into() });
         assert_eq!(
@@ -4223,7 +3870,6 @@ mod role_model_tests {
             src.contains("roles: BTreeMap"),
             "roles must be in WorkspaceModel"
         );
-        // Check that live resolution uses Model.roles, not file
         assert!(
             src.contains("Model.roles") || src.contains("next.roles"),
             "binding must live in Model"
@@ -4262,7 +3908,6 @@ mod presence_model_tests {
             },
         );
         assert_eq!(next2.presence.get("Ghost"), Some(&Presence::Unknown));
-        // Unknown should never be treated as idle for inject
         let has_idle = next2.presence.get("Ghost") == Some(&Presence::from_str("idle"));
         assert!(!has_idle, "unknown must stay unknown, never silently idle");
     }
@@ -4271,13 +3916,7 @@ mod presence_model_tests {
     fn presence_model_working_queues() {
         let mut m = empty_model();
         m.presence.insert("P".into(), Presence::from_str("working"));
-        // Simulate a watch wake for P when working — should queue, not prompt
-        // We test via InboxRows with a corr that would normally prompt, but presence is working
-        // For now, check that presence map correctly reports Working
         assert_eq!(m.presence.get("P"), Some(&Presence::from_str("working")));
-        // Inject should queue, not prompt — we test via tick's handling of InboxRows with presence working
-        // The tick should not produce Prompt for working (it would queue)
-        // For this unit test, we just verify the map
         let (next, _) = tick(
             &m,
             &Msg::Presence {
@@ -4290,9 +3929,6 @@ mod presence_model_tests {
 
     #[test]
     fn filter_prompts_busy_urgent_breaks_through_rest_audits() {
-        // bd-7qg6: Busy+urgent must break through (ADR-0005 gap 5, E5);
-        // everything non-injectable becomes a digest-visible Audit, never a
-        // silent drop; Unknown never prompts even when urgent.
         let mut m = empty_model();
         m.presence.insert("I".into(), Presence::from_str("idle"));
         m.presence.insert("B".into(), Presence::from_str("working"));
@@ -4372,12 +4008,10 @@ mod presence_model_tests {
     #[test]
     fn presence_model_inject_reads_model_not_plane() {
         let src = include_str!("workspace.rs");
-        // Inject should read presence in Model, not hc-only gossip
         assert!(
             src.contains("presence") && src.contains("Presence"),
             "inject must read presence in Model"
         );
-        // Check that should_inject logic is preserved (idle|done|blocked) and unknown queues
         let doorbell = include_str!("doorbell.rs");
         assert!(
             doorbell.contains("should_inject") || doorbell.contains("idle"),
@@ -4388,19 +4022,12 @@ mod presence_model_tests {
     #[test]
     fn presence_model_watch_filter_has_20001() {
         let src = include_str!("main.rs");
-        // Doorbell watch filter must include 20001
         assert!(
             src.contains("30013") && src.contains("20001"),
             "watch filter must include 30013 and 20001"
         );
     }
 
-    // ADR-0028 E5: 20001 trust rule — inject truth is the pin itself
-    // (line pubkey == pin's npub) or the trusted Msg::Presence edge.
-    // A 20001 line whose author is not the claimed pin is a forge:
-    // LoudMiss (+Audit), presence unchanged. Missing key = Unknown;
-    // Unknown never prompts (prompt_allowed falls back to hc
-    // "unknown" which should_inject rejects).
     #[test]
     fn presence_20001_forge_fails_loud() {
         let mut m = empty_model();
@@ -4448,8 +4075,6 @@ mod presence_model_tests {
     fn presence_unknown_pin_gets_no_prompt() {
         let mut m = empty_model();
         m.doorbell.index.insert_pin("GhostPin".into(), None);
-        // No presence entry (Unknown) and no hc status (unknown):
-        // a kind-9 mention must not prompt.
         let line = r#"{"kind":9,"id":"ab","tags":[["p","GhostPin"],["h","ch-1"]],"content":"@GhostPin hi"}"#;
         let (_, cmds) = tick(&m, &Msg::WatchNdjson { line: line.into() });
         assert!(
@@ -4485,12 +4110,10 @@ mod presence_model_tests {
                 "Unknown behaves as missing: hc={hc}"
             );
         }
-        // Known verdicts pass through with source intact.
         let idle = Presence::Idle {
             source: "presence".into(),
         };
         assert_eq!(verdict_for(Some(&idle), "idle", true), idle);
-        // Wire words and legacy snapshots.
         assert_eq!(
             Presence::from_str("blocked"),
             Presence::Busy {
@@ -4506,11 +4129,9 @@ mod presence_model_tests {
                 source: "legacy".into()
             }
         );
-        // Render tokens carry source.
         assert_eq!(busy_evidence.status_token(), "Busy(hc-evidence)");
         assert_eq!(idle.status_token(), "Idle(presence)");
         assert_eq!(Presence::Unknown.status_token(), "Unknown");
-        // Prompt gate: only exact Idle prompts.
         let mut m = empty_model();
         for (pin, presence, prompts) in [
             (
@@ -4562,7 +4183,6 @@ mod human_decision_tests {
                 created_at: 1,
             },
         );
-        // Second decision for same corr while one is still open should be rejected loudly (first removes, second is LoudMiss)
         let (m1, cmds1) = tick(
             &m,
             &Msg::HumanDecision {
@@ -4576,7 +4196,6 @@ mod human_decision_tests {
                 .iter()
                 .any(|c| matches!(c, Cmd::Audit{kind, ..} if kind=="human_decision"))
         );
-        // Now open_human is empty, second decision for same corr should be LoudMiss (no open)
         let (m2, cmds2) = tick(
             &m1,
             &Msg::HumanDecision {
@@ -4586,7 +4205,6 @@ mod human_decision_tests {
         );
         assert!(cmds2.iter().any(|c| matches!(c, Cmd::LoudMiss { .. })));
         assert!(m2.open_human.is_empty());
-        // While one is open, second concurrent decision should also be LoudMiss
         let mut m3 = empty_model();
         m3.open_human.insert(
             "FM-1".into(),
@@ -4596,8 +4214,6 @@ mod human_decision_tests {
                 created_at: 1,
             },
         );
-        // Try to insert another Question for same corr (should be prevented, but our tick currently allows it via direct insert)
-        // For now, test that HumanDecision for same corr when one is open after first is closed is LoudMiss
     }
 
     #[test]
@@ -4621,9 +4237,6 @@ mod human_decision_tests {
         assert!(!next.open_human.contains_key("C1"));
     }
 
-    // ADR-0028 E4: Publish carries corr (+ result_path) so the answer can
-    // return exactly that corr. No pre-seeded Model on this path — the
-    // question opens from a live InboxRows mint.
     #[test]
     fn human_decision_publish_carries_corr() {
         let m = empty_model();
@@ -4657,8 +4270,6 @@ mod human_decision_tests {
         assert_eq!(rp.as_deref(), Some("beads/br-1"));
     }
 
-    // E4 happy path over live-shaped rows, zero pre-seed: mint → tagged
-    // answer closes exactly one question → duplicate answer LoudMiss.
     #[test]
     fn human_decision_live_path_no_preseed() {
         let m = empty_model();
@@ -4715,8 +4326,6 @@ mod human_decision_tests {
         assert!(m3.open_human.is_empty());
     }
 
-    // Migration fallback (one release): a tag-less human mail whose body
-    // carries the verdict still closes while open_human holds the corr.
     #[test]
     fn human_decision_body_fallback_while_open() {
         let m = empty_model();
@@ -4756,11 +4365,7 @@ mod human_decision_tests {
 
     #[test]
     fn human_decision_question_publish() {
-        // Question should be published as Cmd::Publish with audience human, one rumor
-        // For now, we test that creating a human question via direct insert and then checking publish would be via Cmd
         let mut m = empty_model();
-        // Simulate tick that would create a question and publish
-        // We use a direct approach: insert question and check that publish would be audience human
         m.open_human.insert(
             "C2".into(),
             Question {
@@ -4770,9 +4375,6 @@ mod human_decision_tests {
             },
         );
         assert!(m.open_human.contains_key("C2"));
-        // The publish Cmd for human should be audience=human, one pin
-        // We check that our tick would emit Publish for human (via a synthetic Msg)
-        // For now, just verify the map
         assert_eq!(
             m.open_human.get("C2").map(|q| q.body.as_str()),
             Some("approve?")
@@ -4797,7 +4399,6 @@ mod human_decision_tests {
                 verdict: "approve".into(),
             },
         );
-        // Now FM-1 is closed, second decision should be LoudMiss
         let (_, cmds2) = tick(
             &m1,
             &Msg::HumanDecision {
@@ -4826,9 +4427,6 @@ mod human_decision_tests {
     #[test]
     fn human_decision_from_inbox_verdict_closes_open_question() {
         let m = empty_model();
-        // E4: happy path needs no test-only pre-seed — the question is
-        // minted by the live Publish path (audience=human InboxRow), then
-        // the correlated answer closes it.
         let ask = serde_json::json!({
             "corr": "C-LIVE",
             "body_md": "ship?",
@@ -4903,9 +4501,6 @@ mod human_decision_tests {
 
 #[cfg(test)]
 mod d6_open_decisions_tests {
-    // ADR-0010 D6 (bd-f14d): OPEN DECISIONS fold + RECORD DIVERGENCE +
-    // waitcorr promotion. Tick classification predicates and the
-    // Digest cmd are Lane 1 (bd-65he) — untouched here.
     use super::*;
     use crate::workspace_reporting::Divergence;
 
@@ -4971,14 +4566,12 @@ mod d6_open_decisions_tests {
                 .any(|c| matches!(c, Cmd::Audit { kind, .. } if kind == "wait-timeout")),
             "wait-timeout audit kept: {cmds:?}"
         );
-        // No Publish on promotion: re-surfacing must not re-ring.
         assert!(
             !cmds
                 .iter()
                 .any(|c| matches!(c, Cmd::Publish { corr, .. } if corr == "FM-W")),
             "promotion is silent: {cmds:?}"
         );
-        // Answer clears the promoted call.
         let (next2, _) = tick(
             &next,
             &Msg::HumanDecision {
@@ -4991,7 +4584,6 @@ mod d6_open_decisions_tests {
 
     #[test]
     fn d6_journal_fold_matches_live_tick() {
-        // Consumer helper must equal ticking the same msgs live.
         let msgs = vec![
             Msg::Presence {
                 pin: "P".into(),
@@ -5033,7 +4625,6 @@ mod d6_open_decisions_tests {
         assert!(text.contains("closed-bead/open-corr"), "{text}");
         assert!(text.contains("answered-corr/held-bead"), "{text}");
         assert!(text.contains("done-without-legal-close"), "{text}");
-        // Empty inputs: the check ran, nothing held.
         let empty = DivergenceSpec {
             open_corrs: &[],
             closed_beads: &[],
@@ -5048,7 +4639,6 @@ mod d6_open_decisions_tests {
 
 #[cfg(test)]
 mod cmd_schema_tests {
-    // ADR-0028 C: action-schema discipline at the Cmd/Msg boundary.
     use super::*;
 
     fn empty_model() -> WorkspaceModel {
@@ -5098,8 +4688,6 @@ mod cmd_schema_tests {
 
     #[test]
     fn schema_invoke_is_caller_applied_tick_never_emits() {
-        // ADR-0028 E1: Invoke is a caller-applied effect (like Prompt) —
-        // tick never emits it; the composing caller does (GS-016 rewire).
         let m = empty_model();
         let (_, cmds) = tick(
             &m,
@@ -5231,12 +4819,10 @@ mod adr0010_d1_tests {
         let max = doorbell_ring_max();
         let mut e = entry("P");
         for attempt in 0..max {
-            // Inside the window: nothing due.
             assert_eq!(
                 ladder_due(&e, e.window_start_unix + grace - 1, "other"),
                 ReringDecision::Pending
             );
-            // Window elapsed: ring once.
             assert_eq!(
                 ladder_due(&e, e.window_start_unix + grace, "other"),
                 ReringDecision::Ring { attempt }
@@ -5292,15 +4878,11 @@ mod adr0010_d1_tests {
             },
         );
         m.wake.ladders.insert("c-1".into(), entry("P"));
-        // Fresh entry: inside grace window, no re-ring (other beat
-        // cmds like CheckAckSla may still appear).
         let (_, cmds) = tick(&m, &Msg::AckSlaTick { now: 1 });
         assert!(
             !cmds.iter().any(|c| matches!(c, Cmd::Prompt { .. })),
             "fresh entry must not ring inside its window: {cmds:?}"
         );
-        // Past grace: exactly one re-ring prompt with the shrunk line
-        // (alongside the standing CheckAckSla + FetchInbox beat cmds).
         let (next, cmds) = tick(
             &m,
             &Msg::AckSlaTick {
@@ -5366,8 +4948,6 @@ mod adr0010_d1_tests {
         );
     }
 
-    // ---- bd-w98c residual: SlaFired hit list wires the ladder registrar ----
-
     fn overdue_row(corr: &str, id: &str, read: Option<i64>) -> serde_json::Value {
         serde_json::json!({
             "id": id,
@@ -5416,12 +4996,10 @@ mod adr0010_d1_tests {
                 rows: vec![
                     overdue_row("c-over", "id-1", None),
                     overdue_row("c-read", "id-2", Some(1_100)),
-                    // normal-importance ack-required mail is outside the scan scope
                     serde_json::json!({
                         "id": "id-3", "corr": "c-normal", "ack_required": true,
                         "importance": "normal", "read_ts_us": serde_json::Value::Null,
                     }),
-                    // no corr = nothing to key on
                     serde_json::json!({
                         "id": "id-4", "ack_required": true,
                         "importance": "urgent", "read_ts_us": serde_json::Value::Null,
@@ -5447,13 +5025,10 @@ mod adr0010_d1_tests {
             "outside the scan scope"
         );
         assert_eq!(next.wake.ladders.len(), 1, "no corr, no entry");
-        // The read row's corr only acks if it was ALREADY registered (no
-        // ghost entries from plain mail reads).
         assert!(
             !next.wake.ladders.contains_key("c-read"),
             "a read never registers"
         );
-        // Read fact: register first, then see it read -> acked.
         let (next2, _) = tick(
             &next,
             &Msg::InboxRows {
@@ -5469,8 +5044,6 @@ mod adr0010_d1_tests {
 
     #[test]
     fn adr0010_d1_registration_then_ladder_beat_rings_without_a_send() {
-        // The residual closed: an overdue corr seen ONLY on the wire (no
-        // same-process send) climbs the ladder on the next AckSlaTick beat.
         let m = WorkspaceModel {
             last_now: 100,
             ..Default::default()
@@ -5517,8 +5090,6 @@ mod adr0010_d1_tests {
             },
         );
         assert_eq!(m.wake.ladders["c-i"].attempts, 1, "one ring");
-        // Same row redelivered (at-least-once): no second ring, no reset of
-        // attempts; the window refreshes only per the ladder's own beat.
         let (m2, cmds) = tick(
             &m,
             &Msg::InboxRows {
@@ -5538,7 +5109,6 @@ mod adr0010_d1_tests {
 
     #[test]
     fn adr0010_d1_slafired_same_log_same_effects() {
-        // Tick Law: the new arm is a pure fold — same Msg log, same effects.
         let build = || {
             let m = WorkspaceModel {
                 last_now: 42,
@@ -5597,8 +5167,6 @@ mod adr0010_d2_tests {
     use super::*;
 
     fn fact(summary: &str) -> Msg {
-        // bd-l72k: the D2 ledger records deliveries only, and only urgent
-        // prompts deliver — so ledger tests drive urgent facts.
         Msg::Fact {
             summary: format!("plane-P urgent {summary}"),
         }
@@ -5606,8 +5174,6 @@ mod adr0010_d2_tests {
 
     #[test]
     fn adr0010_d2_represent_respects_prompt_gate() {
-        // Unacked entries for a non-promptable pin never force a prompt:
-        // the gate stays authoritative, the ledger just waits.
         let mut m = WorkspaceModel::default();
         m.presence.insert(
             "Q".into(),
@@ -5648,7 +5214,6 @@ mod adr0010_d5_tests {
                 source: "test".into(),
             },
         );
-        // The doorbell slice gates inject on its own status map.
         m.doorbell.statuses.insert(pin.into(), "idle".into());
         m.roles.insert("captain".into(), pin.into());
         m
@@ -5656,8 +5221,6 @@ mod adr0010_d5_tests {
 
     #[test]
     fn adr0010_d5_fixture_replay_afk_classes() {
-        // AFK fixture: chatter (benign), sla beats (routine), alias-less
-        // fact (captain-relevant miss), urgent inbox pull (urgent).
         let mut m = idle_captain("P");
         let chatter = r#"{"kind":9,"id":"z","tags":[["p","Nobody"],["h","ch"]],"content":"hi"}"#;
         let (m1, c1) = tick(
@@ -5677,7 +5240,6 @@ mod adr0010_d5_tests {
             !c2.iter().any(|c| matches!(c, Cmd::Prompt { .. })),
             "routine beats spend zero prompts: {c2:?}"
         );
-        // Alias-less fact (no captain role on a fresh model) is a miss.
         let mut m3 = WorkspaceModel::default();
         m3.presence.insert(
             "P".into(),
@@ -5701,7 +5263,6 @@ mod adr0010_d5_tests {
         );
         assert_eq!(m4.wake.digests.len(), 1, "miss queues for digest");
         assert_eq!(m4.wake.digests[0].kind, "fact-miss");
-        // Urgent inbox pull prompts immediately (bypasses batching).
         let (m5, c5) = tick(
             &m,
             &Msg::InboxRows {
@@ -5720,7 +5281,6 @@ mod adr0010_d5_tests {
     #[test]
     fn adr0010_d5_digest_batch_interval_and_threshold() {
         let mut m = WorkspaceModel::default();
-        // Two captain-relevant misses queue without emitting.
         for i in 0..2 {
             let (next, cmds) = tick(
                 &m,
@@ -5735,7 +5295,6 @@ mod adr0010_d5_tests {
             m = next;
         }
         assert_eq!(m.wake.digests.len(), 2);
-        // Interval lapse flushes exactly the queued set with ages.
         let (next, cmds) = tick(
             &m,
             &Msg::AckSlaTick {
@@ -5808,9 +5367,6 @@ mod adr0010_d5_tests {
 
     #[test]
     fn bd_z5ut_digest_never_dresses_epoch_zero_as_an_age() {
-        // A fold with no clock Msg records `at_unix == 0`. Subtracting it
-        // printed a raw epoch value labelled "s ago" (~56 years), which reads
-        // as a real measurement. It must say unknown instead.
         let entries = vec![DigestEntry {
             seq: 1,
             at_unix: 0,
@@ -5897,10 +5453,6 @@ mod adr0010_d5_tests {
         );
     }
 
-    // bd-l72k RED: edge triage — D5 predicates at the injection decision.
-    // Benign/routine advance markers with zero prompts; captain-relevant
-    // queue to the digest; urgent injects immediately.
-
     fn edge_model(pin: &str) -> WorkspaceModel {
         let mut m = idle_captain(pin);
         m.doorbell.index = crate::doorbell::SelfIndex::from_pins([pin.to_string()]);
@@ -5914,23 +5466,19 @@ mod adr0010_d5_tests {
     #[test]
     fn edge_triage_fixture_replay_zero_prompts_for_benign_routine() {
         let mut m = edge_model("BlueRidge");
-        // Benign: unaddressed room chatter (no p tag for self).
         let benign = edge_watch(9, "b1", r#"[["h","ch-1"]]"#, "room talk");
-        // Routine: addressed kind-9 chatter, no urgency.
         let routine = edge_watch(
             9,
             "r1",
             r#"[["p","BlueRidge"],["h","ch-1"]]"#,
             "@BlueRidge hi",
         );
-        // Captain: addressed job wake.
         let captain = edge_watch(
             43001,
             "c1",
             r#"[["p","BlueRidge"],["h","steer-x"]]"#,
             "job ready",
         );
-        // Urgent: request-release addressed to self.
         let urgent = edge_watch(
             14,
             "u1",
@@ -6035,7 +5583,6 @@ mod adr0010_d5_tests {
             m1.wake.digests
         );
         assert_eq!(m1.wake.digests[0].pin, "BlueRidge");
-        // Batch emits on a now-bearing beat past the interval; the queue drains.
         let (m2, cmds2) = tick(&m1, &Msg::Tick { now: 1_000_000 });
         assert!(
             cmds2
@@ -6101,7 +5648,6 @@ mod gs048_reclassify_tests {
         let (t, held) = sticky_open_topology(None, "swarm", None);
         assert_eq!(t, "swarm");
         assert!(!held);
-        // loop.md.tpl: do not flip loop→swarm without explicit request
         let (t, held) = sticky_open_topology(Some("loop"), "swarm", None);
         assert_eq!(t, "loop");
         assert!(held);
@@ -6191,7 +5737,6 @@ mod gs048_reclassify_tests {
             },
         );
         assert_eq!(next.session_topology.as_deref(), Some("open"));
-        // Sticky-open airtight: do not name invent wave-swarm under open.
         assert_eq!(next.last_vehicle.as_deref(), Some("none: raw"));
         let prompts: Vec<_> = cmds
             .iter()
@@ -6432,7 +5977,6 @@ mod gs048_reclassify_tests {
             "gs050-expand-test",
             &crate::authority::RuntimeAuthority::resolve(),
             &|goal| {
-                // Pure decide leaf — mirrors effect layer.
                 let d = crate::decide::decide(goal, &crate::decide::Snapshot::default());
                 (
                     d.primitive.to_string(),
@@ -6452,7 +5996,6 @@ mod gs048_reclassify_tests {
                 .any(|c| matches!(c, Cmd::Prompt { line, .. } if line.starts_with("[reclassify]"))),
             "expand must produce announce Prompt: {expanded:?}"
         );
-        // Sticky-open: open session without explicit topology stays open.
         assert_eq!(m.session_topology.as_deref(), Some("open"));
     }
 
@@ -6507,10 +6050,7 @@ mod gs048_reclassify_tests {
         let (m2, c2) = tick(&m, &msg);
         assert_eq!(c1, c2, "same source Msg must keep the same effect Cmds");
         assert_eq!(m1.seq, m2.seq);
-        let _ = line; // source bytes owned by caller; tick never consumes them
-        // Distinct source-action payload → distinct Cmd identity (not an
-        // `&Msg` tautology). Unaddressed kind-9 chatter may collapse to the
-        // same no-ring Cmds, so use MaterialContext goals as the witness.
+        let _ = line;
         let (_, ca) = tick(
             &m,
             &Msg::MaterialContext {
@@ -6582,7 +6122,6 @@ mod gs048_reclassify_tests {
             "effect_key prefix: {}",
             keys[0].4
         );
-        // Same identity fields + effect_key on both retries (pin included).
         let keys2: Vec<_> = cmds2
             .iter()
             .filter_map(|c| match c {
@@ -6644,11 +6183,10 @@ mod gs048_reclassify_tests {
             key1,
             reclassify_effect_key(&goal, "authoritative-objective", None, &reclass[0].2)
         );
-        // Effect layer: fold DecisionReady from a pure decide result.
         let ready = Msg::DecisionReady {
             goal: reclass[0].0.clone(),
             primitive: "babysit-bead".into(),
-            topology: "swarm".into(), // invent flip — sticky must hold open
+            topology: "swarm".into(),
             argv: vec![
                 "flywheel".into(),
                 "workflow".into(),
@@ -6670,7 +6208,6 @@ mod gs048_reclassify_tests {
                 .any(|c| matches!(c, Cmd::Prompt { line, .. } if line.contains("sticky-open held") || line.starts_with("[reclassify]"))),
             "DecisionReady must announce: {cmds_ready:?}"
         );
-        // Retry same source MaterialContext on post-effect model — identity.
         let (_m3, cmds3) = tick(&m2, &msg);
         let reclass3: Vec<_> = cmds3
             .iter()
@@ -6719,7 +6256,6 @@ mod gs048_reclassify_tests {
         let a = reclassify_effect_key("g", "r", None, "pin");
         let b = reclassify_effect_key("g", "r", Some(""), "pin");
         assert_ne!(a, b);
-        // Length-prefix also prevents boundary collisions (goal||reason).
         let c = reclassify_effect_key("ab", "c", None, "pin");
         let d = reclassify_effect_key("a", "bc", None, "pin");
         assert_ne!(c, d);
@@ -6768,7 +6304,6 @@ mod gs048_reclassify_tests {
                 "{state} missing: {log}"
             );
         }
-        // Retry same MaterialContext — same PK, attempt bumps.
         let mut m2 = idle_captain();
         let (_, cmds2) = tick(
             &m2,
@@ -6805,21 +6340,6 @@ mod gs048_reclassify_tests {
     }
 }
 
-// ---------------------------------------------------------------------------
-// T2 shadow Loop (bd-gwdh): WorkspaceProgram + ShadowDriver.
-//
-// The live fold as a framework Program: Model = WorkspaceModel,
-// Msg = workspace::Msg, Cmd = workspace::Cmd. update() IS tick, so the
-// fold stays correct by construction; the tests pin the agreement.
-// failure() names an outcome for every cause kind: all four land on a
-// DiagnoseFailed sentinel no real pane ever carries, which folds quiet
-// (no model change, no commands). ShadowInterpret completes every command
-// as that quiet message: shadow replays stored outcomes, never performs
-// effects. Production use is ShadowDriver::observe (pure fold + compare,
-// no I/O, no clock, no Loop); the one-line live hook is captain-placed
-// (doorbell.rs is held by a sibling lane) — residual on bd-gwdh.
-// ---------------------------------------------------------------------------
-
 use toron_core::kernel::{
     Boot, Cmd as CmdTrait, Durability, Effect, Failure, Interpret, Program, Update,
 };
@@ -6843,7 +6363,6 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 impl CmdTrait for Cmd {
     fn durability(&self) -> Durability {
         match self {
-            // Reads, signals, registrations, observations: journal nothing.
             Cmd::FetchInbox
             | Cmd::CheckAckSla
             | Cmd::RestartWatch
@@ -6852,12 +6371,9 @@ impl CmdTrait for Cmd {
             | Cmd::WaitCorr { .. }
             | Cmd::Wait
             | Cmd::LoudMiss { .. } => Durability::Ephemeral,
-            // Delivered batch: durable under its content identity. T3 assigns
-            // executor-owned keys per arm; shadow only needs stability.
             Cmd::Digest { entries } => Durability::Durable {
                 key: format!("digest:{:x}", fnv1a64(format!("{entries:?}").as_bytes())),
             },
-            // Sends/dispatches: durable intent keyed by (kind, identity).
             Cmd::Prompt { pin, line } => Durability::Durable {
                 key: format!("prompt:{pin}:{:x}", fnv1a64(line.as_bytes())),
             },
@@ -6936,8 +6452,6 @@ impl Program for WorkspaceProgram {
 
 /// Shadow interpreter: completes every command as the quiet sentinel.
 /// Outcomes are replayed, never performed — no services, no I/O.
-// T2 shadow surface: the loop half is test-proven; the production hook is
-// the residual named above.
 #[cfg_attr(not(test), allow(dead_code))]
 pub struct ShadowInterpret;
 
@@ -7267,7 +6781,7 @@ mod shadow_tests {
             loop_.send(msg.clone()).expect("send folds");
         }
         assert!(path.exists(), "the journal reached disk");
-        drop(loop_); // Crash: no shutdown, no snapshot.
+        drop(loop_);
 
         let rt = test_runtime();
         let log: Arc<dyn DurableLog> = Arc::new(FileLog::open(&path).expect("reopen log"));
@@ -7285,8 +6799,6 @@ mod shadow_tests {
         for msg in &msgs {
             let (m, cmds) = tick(&live, msg);
             live = m;
-            // The loop journals interpreter follow-ups too, so the live
-            // model must fold them to match what recover replays.
             for _ in &cmds {
                 let (m2, follow) = tick(&live, &sentinel);
                 assert!(follow.is_empty());
@@ -7315,7 +6827,6 @@ mod shadow_tests {
             model = next;
             let _ = i;
         }
-        // Second pass over the evolved model: divergence must stay zero.
         for msg in msg_battery() {
             let (next, cmds) = tick(&model, &msg);
             assert!(

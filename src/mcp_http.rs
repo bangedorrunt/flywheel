@@ -217,7 +217,6 @@ impl McpClient {
                 .unwrap_or("tool error (no detail)");
             bail!("{label} {name} failed: {text}");
         }
-        // SEP-2106 structured content, when the server emits it.
         if let Some(sc) = result.get("structuredContent") {
             return Ok(sc.clone());
         }
@@ -237,7 +236,6 @@ impl McpClient {
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // `_meta` is required INSIDE params for 2026-07-28 (SEP-2575).
         let mut map = params.as_object().cloned().unwrap_or_default();
         map.insert(
             "_meta".into(),
@@ -326,17 +324,15 @@ mod tests {
                 let Ok(mut s) = stream else { continue };
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 4096];
-                // Read until headers end AND the advertised body is complete.
                 loop {
                     match s.read(&mut chunk) {
-                        Ok(0) => break, // peer closed: respond with what we have
+                        Ok(0) => break,
                         Ok(n) => buf.extend_from_slice(&chunk[..n]),
                         Err(_) => break,
                     }
                     let head_done = buf.windows(4).any(|w| w == b"\r\n\r\n");
                     if head_done {
                         match content_length(&buf) {
-                            // Body complete once we have Content-Length bytes.
                             Some(need) => {
                                 let head_end =
                                     buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
@@ -344,8 +340,6 @@ mod tests {
                                     break;
                                 }
                             }
-                            // Headers done, no length header (ureq always sends
-                            // Content-Length for JSON) — don't spin.
                             None => break,
                         }
                     }
@@ -381,9 +375,6 @@ mod tests {
 
     #[test]
     fn initialize_http_error_stays_tool_not_transport() {
-        // A server that RESPONDS to the handshake with HTTP 400 is reachable —
-        // it rejected the request. Must classify as Tool (ADR-0003 V4), never
-        // as Transport ("server not reachable").
         let base = serve_raw(|_| {
             http(
                 "400 Bad Request",
@@ -405,7 +396,6 @@ mod tests {
 
     #[test]
     fn refused_connection_is_transport() {
-        // Bind, grab the port, drop the listener → connection refused.
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -433,7 +423,6 @@ mod tests {
                 let mut s = stream;
                 let mut buf = [0u8; 4096];
                 let _ = s.read(&mut buf);
-                // Hold the socket open without ever writing a response.
                 kept.lock().unwrap().push(s);
             }
         });
@@ -457,8 +446,6 @@ mod tests {
             let r = client.call_tool("health_check", json!({}));
             let _ = tx.send((r, started.elapsed()));
         });
-        // The suite itself stays time-boxed even on RED: a regression back to
-        // an unbounded wait fails this assert instead of hanging cargo test.
         let (res, elapsed) = rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("call_tool must return on a wedged server within 5s (bd-gtqe)");
@@ -474,9 +461,6 @@ mod tests {
 
     #[test]
     fn healthy_server_handshakes_once_then_calls_tool() {
-        // Full happy path: initialize 200 → tools/call 200 with a text
-        // ContentBlock carrying the structured JSON. The initialized
-        // OnceLock must make the handshake run exactly once.
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
         let inits = Arc::new(AtomicUsize::new(0));
@@ -501,7 +485,6 @@ mod tests {
             .call_tool("health_check", json!({}))
             .expect("tool call succeeds");
         assert_eq!(out["ok"], true, "structured result parsed: {out}");
-        // Second call must NOT re-handshake (OnceLock).
         let out2 = client
             .call_tool("health_check", json!({}))
             .expect("second tool call succeeds");

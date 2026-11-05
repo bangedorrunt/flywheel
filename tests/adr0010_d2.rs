@@ -23,9 +23,6 @@ fn adr0010_d2_wake_ack_variant_is_retired() {
 /// presentation seq; ack watermark per pin.
 #[test]
 fn adr0010_d2_presented_and_watermark_state_present() {
-    // 7d36bf8 moved the presented-wake table into `WakeModel`
-    // (`wake_core`'s `shown`); workspace.rs keeps the ack watermark and
-    // re-presents through `PresentedWake`.
     assert!(
         WORKSPACE.contains("PresentedWake") && WORKSPACE.contains("wake_acked"),
         "D2 (bd-8jlv): WorkspaceModel must track presented wakes + ack watermark per pin"

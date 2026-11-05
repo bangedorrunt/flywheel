@@ -105,7 +105,6 @@ pub fn resolve(persisted: &[Host], argv: &[Host], unhost: bool) -> Resolution {
         (true, true) => HostSource::None,
         (true, false) => HostSource::Argv,
         (false, false) => HostSource::Merged,
-        // argv empty and persisted empty is already covered above.
         (false, true) => HostSource::Persisted,
     };
     Resolution { hosts, source }
@@ -317,7 +316,6 @@ mod tests {
             msg.contains("CORRUPT"),
             "the error must name the condition: {msg}"
         );
-        // A missing file is different: that is a first arm, not corruption.
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
             load(&dir).expect("missing reads as empty"),
@@ -337,14 +335,11 @@ mod tests {
         ];
         persist(&dir, &want).expect("persist");
         assert_eq!(load(&dir).expect("load"), want);
-        // Rewriting to a shorter set must not leave the old entries behind — a
-        // failed truncate would resurrect hosts the operator just unhosted.
         persist(&dir, &want[..1]).expect("re-persist");
         assert_eq!(
             load(&dir).expect("reload"),
             vec![h("flywheel", "flywheel-flywheel")]
         );
-        // No temp file left behind by the atomic replace.
         assert!(
             !path_exists(&dir.join("hosts.json.tmp")),
             "the temp file must be renamed, not left"

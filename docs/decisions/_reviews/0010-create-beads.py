@@ -11,7 +11,6 @@ from pathlib import Path
 ACTOR = "KeenAuditor"
 VERIFY_BIN = "mbx +nightly-aarch64-apple-darwin test"
 
-# child depends on parent (child blocked until parent closes)
 DEPS: list[tuple[str, str]] = [
     ("d1", "d0"),
     ("d2", "d0"),
@@ -34,10 +33,8 @@ DEPS: list[tuple[str, str]] = [
     ("d15", "d6"),
 ]
 
-
 def desc(body: str) -> str:
     return body.strip() + "\n"
-
 
 BEADS: list[dict] = [
     {
@@ -495,7 +492,6 @@ test -f ../beads/docs/decisions/0005-scout-ship-deliverable-and-captain-hold.md 
     },
 ]
 
-
 def run(argv: list[str]) -> dict | str:
     p = subprocess.run(argv, check=True, capture_output=True, text=True)
     out = p.stdout.strip()
@@ -503,7 +499,6 @@ def run(argv: list[str]) -> dict | str:
         return json.loads(out)
     except json.JSONDecodeError:
         return out
-
 
 def create(bead: dict) -> str:
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as fh:
@@ -546,7 +541,6 @@ def create(bead: dict) -> str:
     print(f"created {bead['key']} -> {bid}", file=sys.stderr)
     return bid
 
-
 def main() -> int:
     ids: dict[str, str] = {}
     for bead in BEADS:
@@ -557,7 +551,6 @@ def main() -> int:
     Path("docs/decisions/_reviews/0010-bead-ids.json").write_text(json.dumps(ids, indent=2) + "\n")
     print(json.dumps(ids, indent=2))
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -103,7 +103,6 @@ pub fn open_fd_count() -> Option<usize> {
 fn macos_fd_count() -> Option<usize> {
     let elem = std::mem::size_of::<libc::proc_fdinfo>();
     // SAFETY: buffer is a live Vec of the passed size; proc_pidinfo writes at
-    // most buffersize bytes. n < 0 is failure; n == size may be truncation.
     let mut size = 1024 * elem;
     for _ in 0..4 {
         let mut buf = vec![0u8; size];
@@ -244,8 +243,6 @@ pub fn frame_action(line: &str) -> Result<FrameAction, String> {
         return Ok(FrameAction::Shed(from.to_string()));
     }
     if let Some(b) = v.get("events_lost") {
-        // A gap frame is a loss signal even when malformed: count it with
-        // `unknown` rather than dropping it into the unknown-frame audit.
         let field = |name: &str| {
             b.get(name)
                 .and_then(|c| c.as_str())
@@ -337,8 +334,6 @@ pub fn spawn_wake_task(
     on_event: impl Fn(WakeOutcome) + Send + 'static,
 ) -> tokio::task::AbortHandle {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WakeOutcome>();
-    // Cloned BEFORE `opts` moves into the worker, because the monitor thread below
-    // is the only one that needs to know whether this consumer was retired.
     let retired = opts.retire_flag();
     let audit = std::sync::Arc::new(on_audit);
     let worker_audit = audit.clone();
@@ -354,29 +349,14 @@ pub fn spawn_wake_task(
                 terminal = true;
             }
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_event(out))).is_err() {
-                // bd-gdfe: a panicking forwarder must not strand the chain —
-                // fall through to the inferred terminal below.
                 eprintln!("doorbell: wake outcome forwarder panicked; inferring Died (bd-gdfe)");
                 break;
             }
-            // A condemned forwarder sets this on the first death. Stop taking
-            // lines now. The replacement resumes from the last accepted cursor.
-            // Waiting until abort-after-backoff lets the firehose shed for the
-            // whole sleep (measured: forwarded frozen, dropped past 90k).
             if retired.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
             }
         }
-        // A RETIRED consumer is not a lost consumer. It was replaced on purpose,
-        // the replacement is already armed, and forwarding a synthetic `Died` here
-        // would both misreport a healthy restart AND advance the backoff that the
-        // restart was supposed to reset. Silence is correct here; the audit row and
-        // the inferred outcome are for consumers that vanish on their own.
         if !terminal && !retired.load(std::sync::atomic::Ordering::SeqCst) {
-            // bd-gdfe: the worker ended (panic, abort, unwind) with NO
-            // terminal outcome. Journal the loss, then forward exactly one
-            // Died so the brain re-arms — a consumer may never vanish
-            // silently: that was the permanent wake-blind gap.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 audit(
                     AUDIT_WAKE_DROPPED,
@@ -398,9 +378,6 @@ async fn run_wake_loop(
     tx: &tokio::sync::mpsc::UnboundedSender<WakeOutcome>,
     audit: &std::sync::Arc<impl Fn(&str, serde_json::Value) + Send + Sync>,
 ) {
-    // False means the std consumer is gone or already retired. Stop reading.
-    // A dropped receiver used to be ignored, so the socket kept filling an
-    // unbounded channel nobody drained.
     let send = |out: WakeOutcome| -> bool {
         if opts.retired.load(std::sync::atomic::Ordering::SeqCst) {
             return false;
@@ -408,8 +385,6 @@ async fn run_wake_loop(
         tx.send(out).is_ok()
     };
     let mut cursor: Option<String> = opts.resume_from.clone();
-    // Resyncs this loop has performed. Counted across reconnects so the audit
-    // rows read as a rate (1, 2, 3 ...) rather than N unrelated blips.
     let mut resyncs: u64 = 0;
     let mut lost_frames: u64 = 0;
     loop {
@@ -424,10 +399,6 @@ async fn run_wake_loop(
         {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                // bd-68q2: this was one wildcard arm, so EMFILE (WE are out of
-                // fds — reconnecting is futile until they drop) read as
-                // "sidecar absent" and restarted into a wall. Name the wall,
-                // census the fds, keep the restart (never-deaf).
                 let emfile = is_fd_exhaustion(&e);
                 audit(
                     if emfile {
@@ -472,9 +443,6 @@ async fn run_wake_loop(
             .await
             .is_err()
         {
-            // bd-kz54: this path used to return Died with NO audit row, so a
-            // handshake that could not be written looked identical to a quiet
-            // bus in the journal.
             audit(
                 AUDIT_SOCK_HANDSHAKE,
                 serde_json::json!({
@@ -488,12 +456,6 @@ async fn run_wake_loop(
             return;
         }
         let mut lines = BufReader::new(rd).lines();
-        // bd-kz54: name WHY the stream ended. These three were one wildcard
-        // arm, so EOF, a read error, and a legitimately QUIET bus all produced a
-        // bare Died with no record — which is how a restart loop could run for
-        // hours naming nothing. The distinction matters: AUDIT_SOCK_ABSENT
-        // already says "absent, not a quiet bus", and deaf-silence is the case
-        // that is genuinely NOT a dead socket.
         let mut cause = String::from("eof: sidecar closed the stream");
         let exit = loop {
             match tokio::time::timeout(opts.idle_timeout, lines.next_line()).await {
@@ -510,8 +472,6 @@ async fn run_wake_loop(
                     }
                     Ok(FrameAction::Eose) => {}
                     Ok(FrameAction::EventsLost { from, through }) => {
-                        // Not a reconnect: the sidecar keeps serving what it
-                        // still stores. Surface the gap, count it, go on.
                         lost_frames += 1;
                         audit(
                             AUDIT_SOCK_EVENTS_LOST,
@@ -527,9 +487,6 @@ async fn run_wake_loop(
                         }
                     }
                     Ok(FrameAction::Shed(from)) => {
-                        // Lossless, not silent: the cursor makes the resync
-                        // correct, this row makes it visible, and the floor at
-                        // the top of the loop keeps it from spinning.
                         resyncs += 1;
                         audit(
                             AUDIT_SOCK_SHED,
@@ -540,13 +497,13 @@ async fn run_wake_loop(
                             }),
                         );
                         cursor = Some(from);
-                        break true; // transparent reconnect, lossless via cursor
+                        break true;
                     }
                     Err(detail) => {
                         audit(AUDIT_SOCK_FRAME, serde_json::json!({ "detail": detail }));
                     }
                 },
-                Ok(Ok(None)) => break false, // cause already names eof
+                Ok(Ok(None)) => break false,
                 Ok(Err(e)) => {
                     cause = format!("read error: {e}");
                     break false;
@@ -611,9 +568,6 @@ mod tests {
     #[test]
     fn open_fd_count_moves_with_real_opens() {
         let before = super::open_fd_count().expect("census must read here");
-        // Hold 8 with margin: parallel tests churn fds, so one measurement
-        // can catch a net concurrent close (measured live: 45 -> 47 with 3
-        // held). Retry bounded; closes are transient.
         let held: Vec<std::fs::File> = (0..8)
             .map(|_| std::fs::File::open("/dev/null").unwrap())
             .collect();
@@ -636,7 +590,6 @@ mod tests {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn open_fd_count_is_honestly_absent_elsewhere() {
-        // No assert on Some: the contract is Option, callers render null.
         let _ = super::open_fd_count();
     }
 
@@ -660,16 +613,6 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        // `spawn_wake_task` calls `tokio::spawn`, so it needs a runtime. A
-        // multi-thread one, because the abort below targets a task that has to be
-        // scheduled at least once for the abort to be a RETIREMENT rather than a
-        // cancellation-before-start.
-        // The consumer must be ALIVE and healthy when the abort lands, or the test
-        // measures the wrong thing. My first version pointed at a socket that did
-        // not exist, so the worker reported ITSELF (absent socket -> Died) before
-        // the abort mattered and the flag appeared to do nothing.
-        //
-        // So: bind a real socket, complete the handshake, and only then retire.
         fn run_one(retire: bool) -> (usize, usize) {
             use std::io::Write as _;
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -694,7 +637,6 @@ mod tests {
                 kinds: vec![1u16],
                 project: Some("demo".into()),
                 handshake_timeout: Duration::from_millis(500),
-                // Long enough that idle is never what ends it; only the abort can.
                 idle_timeout: Duration::from_secs(30),
                 resync_floor: Duration::from_millis(50),
                 retired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -702,13 +644,11 @@ mod tests {
             };
             let flag = opts.retire_flag();
 
-            // The server side: accept once, complete the handshake, then hold.
             let server = std::thread::spawn(move || {
                 if let Ok((mut sock, _)) = listener.accept() {
                     let _ = sock.write_all(b"{\"heartbeat\":{\"ts_ms\":5}}\n");
                     let _ = sock.write_all(b"{\"eose\":{\"cursor\":\"1\"}}\n");
                     let _ = sock.flush();
-                    // Hold the connection open until the consumer is gone.
                     std::thread::sleep(Duration::from_millis(1500));
                     let _ = sock.shutdown(std::net::Shutdown::Both);
                 }
@@ -721,23 +661,15 @@ mod tests {
                         a.fetch_add(1, Ordering::SeqCst);
                     },
                     move |out| {
-                        // ONLY a forwarded Died. Counting every outcome made a
-                        // healthy handshake frame read as a death, which is how the
-                        // first two versions of this fence failed for the wrong
-                        // reason.
                         if matches!(out, WakeOutcome::Died) {
                             d.fetch_add(1, Ordering::SeqCst);
                         }
                     },
                 );
-                // Let the handshake land so the consumer is genuinely healthy.
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 if retire {
                     flag.store(true, Ordering::SeqCst);
                 }
-                // Abort is how a replacement retires a predecessor. Both arms do the
-                // SAME thing to the task; only the flag differs, so anything the two
-                // disagree about is the flag's doing.
                 handle.abort();
                 for _ in 0..300 {
                     if !retire && audits.load(Ordering::SeqCst) > 0 {
@@ -775,8 +707,6 @@ mod tests {
 
     #[test]
     fn watch_line_golden_matches_toron_construction() {
-        // Same inputs as toron-cli wake_sock's sample + file_host watch_line:
-        // the exact expected string pins byte-identity across transports.
         let line = format_watch_line(
             9,
             "e1",
@@ -791,7 +721,6 @@ mod tests {
         })
         .to_string();
         assert_eq!(line, expect);
-        // And the file_host test helper builds the same shape.
         let helper = serde_json::json!({
             "kind": 9, "id": "e1", "pubkey": "ab",
             "tags": [["p", "PinA"]], "content": "hello", "created_at": 1
@@ -802,8 +731,6 @@ mod tests {
 
     #[test]
     fn frame_vectors_roundtrip_like_server() {
-        // Wire vectors identical to toron-core WakeFrame::encode_line, except
-        // Event carries the binding SockEvent shape both sides agree on.
         match frame_action(
             r#"{"event":{"kind":9,"id":"e","pubkey":"p","content":"c","tags":[],"created_at":3}}"#,
         )
@@ -885,10 +812,9 @@ mod tests {
                     return;
                 };
                 let mut buf = vec![0u8; 1024];
-                let _ = s.read(&mut buf).await; // subscribe line
+                let _ = s.read(&mut buf).await;
                 let line = format!("{{\"shed\":{{\"resync_from\":\"resync-{i}\"}}}}\n");
                 let _ = s.write_all(line.as_bytes()).await;
-                // Close: the shed arm reconnects on its own, it does not need EOF.
             }
         });
         let floor = Duration::from_millis(60);
@@ -970,17 +896,14 @@ mod tests {
             }
             other => panic!("expected EventsLost, got {other:?}"),
         }
-        // `unknown` (the sidecar no longer knows our cursor) passes through.
         assert!(matches!(
             frame_action(r#"{"events_lost":{"from":"1:ab","through":"unknown"}}"#),
             Ok(FrameAction::EventsLost { through, .. }) if through == "unknown"
         ));
-        // A malformed gap frame is still a loss, counted as `unknown`.
         assert!(matches!(
             frame_action(r#"{"events_lost":{}}"#),
             Ok(FrameAction::EventsLost { from, through }) if from == "unknown" && through == "unknown"
         ));
-        // A genuinely unknown frame is still the loud error.
         assert!(frame_action(r#"{"mystery":{}}"#).is_err());
     }
 
@@ -1070,7 +993,7 @@ mod tests {
             };
             let mut buf = vec![0u8; 1024];
             use tokio::io::AsyncReadExt;
-            let _ = s.read(&mut buf).await; // subscribe line
+            let _ = s.read(&mut buf).await;
             for line in [
                 "{\"event\":{\"kind\":9,\"id\":\"e1\",\"pubkey\":\"ab\",\"content\":\"hi\",\"tags\":[[\"p\",\"PinA\"]],\"created_at\":11}}\n",
                 "{\"heartbeat\":{\"ts_ms\":5}}\n",
@@ -1078,7 +1001,6 @@ mod tests {
             ] {
                 let _ = s.write_all(line.as_bytes()).await;
             }
-            // EOF: drop serves Died.
         });
         let opts = WakeOpts {
             sock_path: path.clone(),
@@ -1130,14 +1052,12 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("bus.sock");
 
-        // A sidecar that accepts the subscription and then says nothing, ever.
         let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
         std::thread::spawn(move || {
             for mut s in listener.incoming().take(2).flatten() {
                 use std::io::Read;
                 let mut buf = [0u8; 512];
-                let _ = s.read(&mut buf); // consume the subscribe line
-                // then hold the connection open, silent
+                let _ = s.read(&mut buf);
                 std::thread::sleep(std::time::Duration::from_millis(1500));
             }
         });
@@ -1217,7 +1137,6 @@ mod tests {
         let audit_calls = calls.clone();
         let audit_rows = rows.clone();
         let audit = move |kind: &str, _v: serde_json::Value| {
-            // The FIRST audit runs inside the worker: defect it like reality.
             if audit_calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 panic!("scripted worker defect");
             }
@@ -1265,7 +1184,7 @@ mod tests {
                     .await
                     .expect("read")
                     .expect("subscribe line");
-                let _ = wr.write_all(b"").await; // then EOF ends the consumer
+                let _ = wr.write_all(b"").await;
                 serde_json::from_str::<serde_json::Value>(&sub).expect("subscribe json")
             });
             let mut opts = WakeOpts::new(path.clone(), vec![9], Some("demo".into()));

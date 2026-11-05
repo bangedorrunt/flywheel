@@ -40,8 +40,6 @@ fn adr0010_d12_ttls_in_structure() {
 
 #[test]
 fn adr0010_d12_gate_stage_uses_the_bounded_projection() {
-    // The wave-gate grounding read must route through the projection, not a
-    // bare corpus rg.
     assert!(
         STAGES.contains("__gate-learnings") || STAGES.contains("gate-learnings"),
         "wave-gate stage references the bounded projection command"
@@ -54,7 +52,6 @@ fn adr0010_d12_gate_stage_uses_the_bounded_projection() {
 
 #[test]
 fn adr0010_d12_ce_sweep_backfills_and_archives() {
-    // Migration: backfill tier:aging + reinforced:today; archive never delete.
     for needle in ["tier: aging", "reinforced:", "archive", "expires:"] {
         assert!(
             WORKFLOWS.contains(needle),
@@ -73,8 +70,6 @@ fn adr0010_d12_ce_compound_stamps_tier_and_reinforced() {
 
 #[test]
 fn bd_21og_ce_compound_depth_lightweight_or_full_default_full() {
-    // R1: depth input (lightweight|full, default full) rides the workflow;
-    // the task interpolates it. Backward compatible: default fills the slot.
     for needle in ["- name: depth", "lightweight", "{{inputs.depth}}"] {
         assert!(
             WORKFLOWS.contains(needle),

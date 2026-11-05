@@ -185,10 +185,6 @@ pub const TABLE: &[HarnessCaps] = &[
         structured_question: Capability::unsupported(Fallback::Explicit),
         mcp: Capability::unsupported(Fallback::Explicit),
     },
-    // Kinds `pane_write::Harness::from_kind` already maps. They are hc
-    // panes like any other, so they need a row: a kind with no row would be
-    // read as unrecorded, and an unrecorded kind is not a claim about the
-    // pane.
     HarnessCaps {
         harness: "claude",
         hook: None,
@@ -211,9 +207,6 @@ pub const TABLE: &[HarnessCaps] = &[
         structured_question: Capability::unsupported(Fallback::Explicit),
         mcp: Capability::unsupported(Fallback::Explicit),
     },
-    // The live fixture harness. Not a product people run. `verified_by`
-    // names the test that drives it; a real harness stays `none` until its
-    // own fixture does the same.
     HarnessCaps {
         harness: "fake",
         hook: Some("pre_tool_use"),
@@ -270,10 +263,6 @@ pub fn row(kind: &str) -> Option<&'static HarnessCaps> {
         _ => return None,
     };
     let found = TABLE.iter().find(|r| r.harness == name);
-    // The table's invariants (witness per supported claim, fallback per
-    // refusal) hold in debug builds, at lookup, so a bad row cannot ship
-    // silently. Release builds skip the check; the tests above also walk the
-    // whole table.
     debug_assert!(
         found.is_none_or(|r| r.check().is_ok()),
         "the capability table's invariants hold in debug builds"
@@ -637,9 +626,6 @@ mod tests {
             "the verified hook door keeps the ring and skips Interrupt"
         );
 
-        // bd-9tkm: no row is not a door verdict. Legacy registry entries carry
-        // no harness field at all, and an unmapped kind is still a pane the
-        // sink types into; refusing them went dark on working wakes.
         for unrecorded in ["", "widget", "future-harness"] {
             assert_eq!(
                 wake_route(unrecorded, false),

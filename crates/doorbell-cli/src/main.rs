@@ -35,10 +35,6 @@ struct Cli {
     /// is also exactly what a bug does — bd-jbz1 reached it four times by typing
     /// `doorbell restart`. An explicit verb makes "no wakes are delivered" a state
     /// someone chose, recorded in hosts.json, and reportable by `doorbell status`.
-    // global, so it reads as `doorbell restart --unhost` and not only
-    // `doorbell --unhost restart` — matching --host, which is how every operator
-    // will type it. A flag that only works in one position is a flag that gets
-    // typed wrong.
     #[arg(long, global = true)]
     unhost: bool,
 }
@@ -96,34 +92,13 @@ async fn main() -> anyhow::Result<()> {
     let cfg =
         lifecycle::Config::resolve_full(cli.state_dir, cli.port, cli.flywheel_state_dir, hosts)?;
 
-    // bd-u54l: `effective_hosts = persisted merged-under argv`, NEVER argv alone.
-    //
-    // This is the fix for bd-jbz1 and it has to happen HERE, before start/restart,
-    // because `start` renders the expected launchd unit from `cfg.hosts` and
-    // compares it to the installed one. With an empty argv that comparison
-    // mismatched a unit carrying three hosts, and the fallback was "starting
-    // detached" using the SAME hostless config: no wakes AND no supervision, while
-    // `restart` printed "started" and exited 0.
-    //
-    // Resolving here rather than inside `start` is deliberate: `restart` calls
-    // `start(cfg)` with the same config, so one resolution fixes both verbs.
     let persisted = armstate::load(&cfg.state_dir)?;
     let arm = armstate::resolve(&persisted, &cfg.hosts, cli.unhost);
     let mut cfg = cfg;
     cfg.hosts = arm.hosts.clone();
-    // bd-gefp: the armed line is an ARM transcript, so only an arm verb may
-    // print it. It used to be unconditional, which made `doorbell status`
-    // print "armed on ... (3 from persisted state)" directly above
-    // `"alive": false` — a lie about liveness in the one command an operator
-    // reads to find out whether anything is being served.
 
-    // bd-fpd5: migrate-once off the legacy platform dir into the XDG
-    // default. Explicit --state-dir / DOORBELL_STATE_DIR means
-    // user-managed: never touch, migrate manually instead.
     if using_default_dir && let Some(old) = lifecycle::legacy_platform_state_dir() {
         match lifecycle::maybe_migrate_to_default(&cfg.state_dir, &old) {
-            // Silent when nothing actually moved: an EMPTY legacy dir would
-            // otherwise re-print this line on every doorbell command.
             Ok(Some(copied)) if !copied.is_empty() => eprintln!(
                 "doorbell: migrated {} file(s) from {} (one-time XDG move)",
                 copied.len(),
@@ -146,13 +121,6 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Status => lifecycle::status(&cfg),
         Cmd::Install => lifecycle::install(&cfg),
         Cmd::Serve | Cmd::InternalServe => {
-            // A daemon must exit the moment its shutdown completes: the
-            // tokio runtime drop waits on in-flight blocking tasks
-            // (health refresh, CLI probes), which kept this process alive
-            // past stop's 20s grace AFTER "shutting down" was already
-            // printed — the false SIGKILL escalation of 16:48. finish()
-            // already released the pidfile and leases, so nothing else
-            // needs to run; an Err still exits non-zero.
             match serve::run(&cfg).await {
                 Ok(()) => std::process::exit(0),
                 Err(e) => {

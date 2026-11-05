@@ -55,10 +55,6 @@ pub struct HarnessMenu {
     pub registered_unconfigured: Vec<String>,
 }
 
-// bd-drlm: the menu is read by people and by Jev. These three are the reading
-// half — the ranker's inputs and the floor it re-applies — and they have no
-// caller until the Jev pass is wired in. Kept because a menu nobody can read
-// back is the thing this module exists to prevent.
 #[allow(dead_code)]
 impl HarnessMenu {
     /// The leading harnesses, in rank order.
@@ -106,9 +102,6 @@ pub const fn diversity_floor(crew: u32) -> usize {
 pub fn harness_menu(catalog: &ProfileCatalog, crew: u32) -> HarnessMenu {
     let mut by_harness: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (name, profile) in &catalog.profiles {
-        // An empty harness means "inherit", so it names nothing to offer. A
-        // profile that pins a harness nobody can spawn is still listed: hiding
-        // it would be the menu lying, and this is a menu for an operator.
         let raw = profile.harness.as_str();
         if raw.is_empty() {
             continue;
@@ -148,9 +141,6 @@ pub fn harness_menu(catalog: &ProfileCatalog, crew: u32) -> HarnessMenu {
                         if roles.len() == 1 { "" } else { "s" }
                     ),
                 },
-                // A profile can name a harness the registry has never heard of:
-                // config may add one with no code change. The menu must still
-                // offer it, and must not invent a tier for it.
                 None => format!(
                     "configured but UNREGISTERED ({} role{}); no tier, so no model is substituted",
                     roles.len(),
@@ -221,9 +211,6 @@ pub(crate) fn enforce_diversity_floor(options: &mut Vec<HarnessOption>, crew: u3
     if options.len() <= floor {
         return;
     }
-    // Take the best harness that is NOT already leading, and move it up to the
-    // floor-th slot. Doing it by value rather than by index keeps this stable
-    // when the sort above reshuffles equal-role entries.
     let Some(diverse) = options
         .iter()
         .find(|o| o.harness != options[0].harness)
@@ -232,9 +219,6 @@ pub(crate) fn enforce_diversity_floor(options: &mut Vec<HarnessOption>, crew: u3
         return;
     };
     if let Some(idx) = options.iter().position(|o| o.harness == diverse) {
-        // Move the ACTUAL option. Cloning a neighbour and renaming it would
-        // fabricate an entry — an invented role list on a real harness name,
-        // which is precisely the kind of menu that lies to an operator.
         let moved = options.remove(idx);
         let at = floor.min(options.len());
         options.insert(at, moved);
@@ -306,8 +290,6 @@ mod tests {
             &catalog(&[("a", "oc"), ("b", "gk"), ("c", "pi"), ("d", "omp")]),
             2,
         );
-        // bd-47fu: omp is dropped, and `fx` is not in this catalog, so the
-        // menu is right not to offer it. The list IS the configured set.
         for h in ["opencode", "grok", "pi"] {
             assert!(m.offers(h), "{h} is configured and must be offered");
         }
@@ -326,7 +308,6 @@ mod tests {
     /// lenses must not lead with one harness wearing every hat.
     #[test]
     fn a_large_crew_leads_with_distinct_harnesses() {
-        // opencode carries 3 roles, pi 1: the naive rank is all-opencode.
         let c = catalog(&[
             ("coder", "opencode"),
             ("reviewer", "opencode"),

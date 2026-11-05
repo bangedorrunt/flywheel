@@ -248,7 +248,6 @@ mod tests {
             BackendErrorCode::Unsupported,
             BackendErrorCode::Other("rejected".into()),
         ] {
-            // The fallback answers if called; the primary's verdict must win.
             let backend = FallbackBackend::new(
                 Box::new(Scripted::fail(code.clone())),
                 Some(Box::new(Scripted {

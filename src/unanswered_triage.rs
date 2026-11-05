@@ -122,22 +122,7 @@ pub fn triage(mail_only: Option<f64>, dead: Option<f64>) -> (Triage, String) {
             format!("not triaged: no answer (mail_only={mail_only:?} dead={dead:?})"),
         );
     };
-    // Name both numbers in EVERY branch. A triage whose detail says only "unknown"
-    // is indistinguishable from a stage that never ran, which is the failure the
-    // stage registry's `detail` field exists to prevent.
-    // Name both numbers in EVERY branch. A triage whose detail says only "unknown"
-    // is indistinguishable from a stage that never ran, which is the failure the
-    // stage registry's `detail` field exists to prevent.
     let nums = format!("mail_only={m:.2} dead={d:.2}");
-    // Written as straight-line guards rather than a match on a tuple of booleans:
-    // an earlier version derived `band(x) = confident(x)` and then matched on its
-    // NEGATION, so every confident answer landed in the escalate branch. The
-    // asymmetry between "above YES" and "below NO" is the whole rule, and it reads
-    // wrong the moment it is inverted behind a helper.
-    //
-    // Dead requires BOTH: confidently gone AND confidently not-by-design. One
-    // confident signal is never enough, because a pin that might be mail-only is
-    // never a corpse however dead it looks.
     if d > YES_DEAD && m < NO {
         return (
             Triage::Dead,
@@ -150,9 +135,6 @@ pub fn triage(mail_only: Option<f64>, dead: Option<f64>) -> (Triage, String) {
             format!("{nums} — confidently mail-only by design, and not dead"),
         );
     }
-    // Both confident YES is NOT a tie to break. The two propositions are not a
-    // partition — a pin can be mail-only AND look dead — so this is a genuine
-    // ambiguity and Unknown is the honest answer, with the reason named.
     if m > YES_MAIL_ONLY && d > YES_DEAD {
         return (
             Triage::Unknown,
@@ -322,24 +304,11 @@ pub fn unanswered_triage_stage() -> Stage {
                 id: "unanswered:non-empty",
                 placement: Placement::Preflight,
                 check: |ctx: &StageCtx| {
-                    // Three outcomes, not two. A MALFORMED objective is not the same
-                    // as an empty one, and lumping them together is how a bug becomes
-                    // a shrug: `from_str(..).ok()` turns unparseable evidence into
-                    // "zero pins", which reads as a clean refusal rather than as
-                    // evidence code failed to build. Jev is an enhancement, never a
-                    // dependency, so refusing is always safe — but it must be
-                    // REFUSING for the stated reason.
                     match serde_json::from_str::<serde_json::Value>(ctx.objective) {
                         Err(e) => (
                             Signal::Fails,
                             format!("evidence is not JSON ({e}), so no request is spent"),
                         ),
-                        // The objective NESTS the evidence row under `pin`, so a
-                        // top-level null check always passed and this stage could
-                        // never refuse anything. Look INSIDE the row for a
-                        // non-empty pin — the restructure that added liveness moved
-                        // the subject one level down and silently disabled the
-                        // cheap check.
                         Ok(v) => {
                             let named = v
                                 .get("pin")
@@ -374,13 +343,6 @@ pub fn unanswered_triage_stage() -> Stage {
                         _ => None,
                     };
                     let (verdict, detail) = triage(pick(Q_MAIL_ONLY), pick(Q_DEAD));
-                    // `Holds` means "the triage produced a usable label". `Unknown`
-                    // is ALSO Holds, deliberately: an escalation is a successful
-                    // triage, and the stage must not report a shrug as a failure —
-                    // a `Fails` here would read downstream as "do not prune", which
-                    // happens to be the safe direction by accident rather than by
-                    // design. The LABEL is the payload; the deterministic caller
-                    // decides what a label may cause.
                     (Signal::Holds, format!("{}: {detail}", verdict.as_str()))
                 },
             },
@@ -416,10 +378,6 @@ pub fn run(
     now_unix: u64,
     toron_bin: &str,
 ) -> anyhow::Result<serde_json::Value> {
-    // The `.unanswered` files live under the FLYWHEEL state dir, not the doorbell
-    // state dir: `$XDG_STATE_HOME/flywheel/doorbell/<workspace>.unanswered`. I
-    // looked in the doorbell dir first and got "No such file or directory", which
-    // is a useful failure and still a wrong default.
     let dir = state_dir.join("doorbell");
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
         .map_err(|e| anyhow::anyhow!("read {}: {e}", dir.display()))?
@@ -433,18 +391,6 @@ pub fn run(
         .collect();
     files.sort();
 
-    // The workspace -> project map, read from the doorbell's OWN armed host set
-    // rather than guessed. The `.unanswered` file is named by WORKSPACE
-    // (`flywheel-toron.unanswered`) and says nothing about the project, and the
-    // project decides the npub: `whois flywheel EmberOtter` and
-    // `whois toron EmberOtter` return two different keys for the same pin. A
-    // guessed project would read a different agent's activity and report it as
-    // this pin's liveness.
-    // hosts.json is in the DOORBELL state dir, not the flywheel one. I read
-    // `flywheel/hosts.json` first — which does not exist, so the map was silently
-    // EMPTY and every pin read `unmeasured`. That is the third time in this
-    // session a wrong base directory produced a plausible empty result rather than
-    // an error, which is the reason both directories are now explicit parameters.
     let project_of = read_host_projects(&doorbell_state_dir.join("hosts.json"));
 
     let mut workspaces = Vec::new();
@@ -470,8 +416,6 @@ pub fn run(
         pins_total += pins.len();
         let mut rows = Vec::new();
         for pin in &pins {
-            // The evidence is what CODE knows. Jev is only asked to read the
-            // semantics; an absent pane is stated as absence, never as death.
             let liveness = liveness_from_whois(
                 project_of.get(&workspace).map(String::as_str),
                 pin,
@@ -490,15 +434,6 @@ pub fn run(
                 continue;
             }
             let objective = evidence_objective_with_liveness(&row);
-            // Drive the stage's OWN CHILDREN rather than the Compose wrapper, and
-            // ask ONCE.
-            //
-            // `Compose::run` renders a summary ("preflight=Holds, noul=Holds"), so
-            // the label the Jev child produced does not survive composition. My
-            // first version ran the Compose and then asked AGAIN to recover the
-            // numbers — 32 requests for a 16-pin backlog, and a second call that
-            // could disagree with the first. Running the cheap preflight and the
-            // Jev child directly keeps every fence AND spends one request.
             let mut menu = crate::crew_menu::HarnessMenu {
                 crew: 1,
                 options: Vec::new(),
@@ -528,15 +463,9 @@ pub fn run(
             let (triage_verdict, detail) = match jev.run(&mut ctx, transport) {
                 r if r.signal == Signal::Unknown => (
                     Triage::Unknown,
-                    // The child's detail is "unknown: no answer (...)" on a declined
-                    // or unreachable ask, which is exactly the report to keep.
                     r.detail,
                 ),
                 r => {
-                    // The child prefixes its detail with the label, so the label is
-                    // recoverable without a second request. The format is pinned by
-                    // a test, because a silent change here would make every pin read
-                    // as "unknown" while still spending the request.
                     let label = r
                         .detail
                         .split_once(':')
@@ -561,8 +490,6 @@ pub fn run(
                     other => serde_json::Value::String(other.as_str().to_string()),
                 },
                 "triage": triage_verdict.as_str(),
-                // `Unknown` means the judgment did not happen, which is what
-                // `asked` must report — not merely that the label is null.
                 "asked": triage_verdict != Triage::Unknown || !detail.starts_with("not triaged"),
                 "detail": detail,
             }));
@@ -575,8 +502,6 @@ pub fn run(
         }));
     }
 
-    // Computed here rather than inside the `json!` macro: a macro invocation
-    // takes expressions, not statements, and a `for` loop in one is a syntax error.
     let unresolvable = files
         .iter()
         .filter_map(|f| f.file_name().and_then(|x| x.to_str()))
@@ -585,7 +510,6 @@ pub fn run(
 
     Ok(serde_json::json!({
         "verdict": "unanswered-triage.v1",
-        // Stated so nobody reads this output as permission to prune.
         "wrote_anything": false,
         "dry_run": dry_run,
         "scanned_dir": dir.display().to_string(),
@@ -594,8 +518,6 @@ pub fn run(
         "workspaces_scanned": workspaces.len(),
         "pins_total": pins_total,
         "pins_unmeasured": unmeasured,
-        // Named so a wall of `unknown` is legible as a missing INSTRUMENT rather
-        // than as sixteen inconclusive model opinions.
         "instrument_gap": if unmeasured == 0 {
             serde_json::Value::Null
         } else {
@@ -609,10 +531,6 @@ pub fn run(
         "workspaces": workspaces,
     }))
 }
-
-// ---------------------------------------------------------------------------
-// Liveness: the instrument, and its absence
-// ---------------------------------------------------------------------------
 
 /// bd-3uqz: what the doorbell can actually PROVE about a pin, before any judgment.
 ///
@@ -702,9 +620,6 @@ pub fn liveness_from_whois(project: Option<&str>, pin: &str, toron_bin: &str) ->
         .and_then(serde_json::Value::as_u64)
     {
         Some(us) => Liveness::Active {
-            // A zero stamp means "never seen", which is UNMEASURED, not "active at
-            // the epoch" — reading it as the latter would make a never-seen pin look
-            // maximally dead, which is precisely the error being fenced.
             last_active_unix: if us == 0 {
                 return Liveness::Unmeasured;
             } else {
@@ -775,8 +690,6 @@ mod liveness_tests {
             last_active_unix: 900,
         };
         assert_eq!(live.age_s(1_000), Some(100));
-        // A clock that went backwards must not produce a huge age, which would read
-        // as "dead for a very long time" — the worst possible direction to be wrong.
         assert_eq!(live.age_s(800), Some(0), "saturating, not wrapping");
         assert_eq!(live.as_str(), "measured");
         let row = evidence_with_liveness("Pin", "ws.unanswered", live, 1_000);
@@ -820,7 +733,6 @@ mod liveness_tests {
             Liveness::Unmeasured,
             "with no project the lookup must not run at all"
         );
-        // And a missing binary is unmeasured, not a panic.
         assert_eq!(
             liveness_from_whois(Some("flywheel"), "EmberOtter", "definitely-not-a-binary"),
             Liveness::Unmeasured
@@ -921,11 +833,8 @@ mod tests {
             d.contains("band"),
             "and the reason is the band, not silence: {d}"
         );
-        // And the symmetric case: mail_only confident, dead a shrug. Same rule,
-        // other side — and again the shrug has to be IN the band, not merely low.
         let (v2, d2) = triage(Some(0.90), Some(0.45));
         assert_eq!(v2, Triage::Unknown, "{d2}");
-        // A confident LOW on the other proposition is NOT a shrug and does commit.
         let (v3, d3) = triage(Some(0.90), Some(0.10));
         assert_eq!(v3, Triage::MailOnlyByDesign, "{d3}");
     }
@@ -1002,8 +911,6 @@ mod tests {
         );
         let ids: Vec<&str> = pack.questions.iter().map(|q| q.id.as_str()).collect();
         assert_eq!(ids, vec![Q_MAIL_ONLY, Q_DEAD]);
-        // The boundary has to be in the text, because the local `criteria` is a
-        // Vec<String> and the docs' {true,false} shape does not exist here.
         let dead = &pack.questions[1].instructions;
         assert!(
             dead.contains("not evidence of death"),
@@ -1017,8 +924,6 @@ mod tests {
         let obj = evidence_objective_with_liveness(&row);
         let v: serde_json::Value = serde_json::from_str(&obj).expect("valid JSON");
         assert!(v["pin"].is_object(), "the subject is ONE pin: {v}");
-        // The note is an ARRAY of sentences, not one string: the two rules are
-        // independent claims and a reader must be able to see them separately.
         let blob = v["note"]
             .as_array()
             .expect("note is an array of sentences")
@@ -1124,10 +1029,6 @@ mod tests {
                 objective: &obj,
                 menu: &mut menu,
             };
-            // The COMPOSED report renders a summary ("child=Holds, child=Holds"), so
-            // the label is asserted on the JEV CHILD, which is where `read` actually
-            // puts it. Reaching into the Compose is deliberate: the label is the
-            // payload of this whole stage and nothing else exposes it.
             let stage = unanswered_triage_stage();
             let Stage::Compose { stages, .. } = &stage else {
                 panic!("the triage must stay a Compose so the cheap check runs first");
@@ -1149,7 +1050,6 @@ mod tests {
                 want.as_str(),
                 report.detail
             );
-            // The numbers must ride along: a label with no numbers is not auditable.
             assert!(
                 report.detail.contains(&format!("{m:.2}"))
                     && report.detail.contains(&format!("{d:.2}")),
@@ -1176,8 +1076,6 @@ mod tests {
             api_key: key,
             url: SYSTEMONE_URL.to_string(),
         };
-        // Two deliberately CONTRASTED cases, because a pack that returns the same
-        // number for both has measured nothing.
         let cases: Vec<(&str, serde_json::Value)> = vec![
             (
                 "a pin on a harness hc cannot inject, still posting to the room",
@@ -1250,8 +1148,6 @@ mod tests {
             fn ask(&self, _s: &StateSlice, pack: &QuestionPack) -> Result<Answers, JevError> {
                 let mut by_question = std::collections::BTreeMap::new();
                 for q in &pack.questions {
-                    // A Choice where a Noul was asked: the shape is wrong, and the
-                    // only safe reading is that we do not have the number.
                     by_question.insert(
                         q.id.clone(),
                         Answer::Choice(ChoiceAnswer {
@@ -1297,17 +1193,14 @@ mod tests {
     ///    off-by-one here is the difference between labelling a pin and escalating.
     #[test]
     fn the_threshold_boundaries_are_strict_in_both_directions() {
-        // Exactly on YES is not "confidently dead".
         let (v, d) = triage(Some(0.05), Some(YES_DEAD));
         assert_eq!(
             v,
             Triage::Unknown,
             "dead={YES_DEAD} is the boundary, not a yes: {d}"
         );
-        // Exactly on NO is not "confidently not-by-design".
         let (v2, d2) = triage(Some(NO), Some(0.95));
         assert_eq!(v2, Triage::Unknown, "mail_only={NO} is the boundary: {d2}");
-        // A hair past each one does commit.
         let (v3, _) = triage(Some(0.05), Some(YES_DEAD + 0.001));
         assert_eq!(v3, Triage::Dead);
         let (v4, _) = triage(Some(NO - 0.001), Some(0.95));
@@ -1341,7 +1234,6 @@ mod tests {
                 "the question must NAME its subject, or the model is judging a set: {:?}",
                 pack.questions[0].instructions
             );
-            // And the subject is a single `pin`, never a `pins` array.
             let v: serde_json::Value = serde_json::from_str(&obj).expect("json");
             assert!(v["pin"].is_object() && v.get("pins").is_none(), "{v}");
         }
@@ -1353,19 +1245,10 @@ mod tests {
     /// gone and the cheap label has silently become as expensive as the risky one.
     #[test]
     fn the_two_labels_have_different_bars_and_the_reasoning_is_recorded() {
-        // A `const` assertion, not a runtime one: clippy is right that a `#[test]`
-        // comparing two consts is a value known at compile time, and this project
-        // already converts those (bd-3uqz, toron). The pairing assertion below
-        // covers the runtime behaviour.
-        // `mail_only` above ITS bar and `dead` confidently low is the label. My
-        // first version used dead=0.74 — merely under the dead BAR, which is not
-        // "confidently not dead" and correctly does not commit.
         let (v, d) = triage(Some(0.74), Some(0.10));
         assert_eq!(v, Triage::MailOnlyByDesign, "{d}");
-        // And dead=0.74, in the gap between the two bars, still escalates.
         let (vg, dg) = triage(Some(0.74), Some(0.74));
         assert_eq!(vg, Triage::Unknown, "the gap is not a yes: {dg}");
-        // And a `dead` at the same value stays far from committed.
         let (v2, d2) = triage(Some(0.10), Some(0.74));
         assert_eq!(v2, Triage::Unknown, "dead must not move for this: {d2}");
     }
@@ -1384,8 +1267,6 @@ mod tests {
         let Stage::Compose { stages, .. } = &stage else {
             panic!("compose");
         };
-        // On the CHILD, for the same reason as the label test: `Compose` renders a
-        // summary and the reason lives in the child that produced it.
         let preflight = stages
             .iter()
             .find(|s| matches!(s, Stage::Code { id, .. } if *id == "unanswered:non-empty"))

@@ -38,8 +38,6 @@ fn flywheel() -> &'static str {
     env!("CARGO_BIN_EXE_flywheel")
 }
 
-// ---- hermetic scratch harness -------------------------------------------------
-
 /// Scratch project dir + isolated mailbox + isolated config. Absolute path
 /// (the close-detect leaves take the project dir as the project key; the
 /// repo's tmp-hygiene gate requires absolute scratch paths).
@@ -63,10 +61,6 @@ impl Scratch {
         };
         std::fs::create_dir_all(&s.dir).unwrap();
         std::fs::create_dir_all(&s.cfg).unwrap();
-        // Minimal config: embedded in-process toron (NO [mail.toron] url →
-        // `Mail::from_config` picks the in-process mailbox), identity
-        // e2e-planner. XDG_CONFIG_HOME points here; the real machine config
-        // (remote daemon at :18080) is never touched.
         std::fs::write(
             s.cfg.join("config.toml"),
             "[backend]\nmultiplexer = \"hc\"\nmail = \"toron\"\n\n[agent_mail]\nname = \"e2e-planner\"\n",
@@ -199,9 +193,6 @@ fn scratch_bead(
         )
         .unwrap();
     }
-    // bd-3566 (beads_rust-wave5-flywheel-parser-strip-dkpvi): set the TYPED
-    // verify field — description fences no longer make a bead ready under
-    // the schema-v18 predicate.
     let created = br_json(
         &dir,
         &[
@@ -232,8 +223,6 @@ fn scratch_bead(
     } else {
         String::new()
     };
-    // The reopen mail goes to the bead's planner (`created_by`); the sender
-    // is the config identity. Register both so the real send path succeeds.
     let created_by = created["created_by"]
         .as_str()
         .unwrap_or("bangedorrunt")
@@ -338,8 +327,6 @@ fn close_operator_bypass(dir: &Path, bead_id: &str) {
     );
 }
 
-// ---- the close-detect tick, driven through the real leaves ----------------
-
 /// RED no-commit: worker closes with no gate row and no commit carrying the
 /// id. The tick must reopen the bead and mail exactly ONCE per (bead, sha).
 #[test]
@@ -373,18 +360,12 @@ fn unverified_close_without_commit_reopens_once_and_mails_once() {
     s.register("e2e-planner");
     s.register(&created_by);
 
-    // worker closes — no gate row, no commit carrying the id (the repo has
-    // NO commits at all, so `git log --all --grep=<id>` finds nothing).
-    // schema-18 br would refuse this close outright; the operator bypass
-    // manufactures the illegal state the loop floor must catch.
     close_operator_bypass(&dir, &bead_id);
     assert_eq!(bead_status(&dir, &bead_id), "closed");
 
-    // tick part 1: close-check -> no-commit
     let cc = s.flywheel_json(&["__close-check", dir.to_str().unwrap(), &bead_id]);
     assert_eq!(cc["status"], "no-commit", "close-check: {cc}");
 
-    // tick part 2: reopen -> br status back to open + exactly one mail
     let r1 = s.flywheel_json(&["__reopen-bead", dir.to_str().unwrap(), &bead_id, ""]);
     assert_eq!(r1["ok"], true, "reopen 1: {r1}");
     assert_eq!(r1["reopened"], true, "reopen 1: {r1}");
@@ -394,7 +375,6 @@ fn unverified_close_without_commit_reopens_once_and_mails_once() {
         "bead must be back open"
     );
 
-    // dedup: a second tick must NOT re-mail (marker keyed "nocommit")
     let r2 = s.flywheel_json(&["__reopen-bead", dir.to_str().unwrap(), &bead_id, ""]);
     assert_eq!(r2["already_processed"], true, "reopen 2: {r2}");
     assert_eq!(r2["reopened"], false, "reopen 2: {r2}");
@@ -424,9 +404,6 @@ fn unverified_close_without_commit_reopens_once_and_mails_once() {
 fn close_with_commit_but_no_gate_row_reopens() {
     let (s, bead_id, sha) = scratch_bead("nee7-missing", "test -f README.md", true, false);
     let dir = s.dir.clone();
-    // schema-18 fail-closed br refuses a no-gate-row close outright; the
-    // operator bypass manufactures the missing-verdict state whose
-    // loop-side reopen floor this test verifies.
     close_operator_bypass(&dir, &bead_id);
 
     let cc = s.flywheel_json(&["__close-check", dir.to_str().unwrap(), &bead_id]);
@@ -442,7 +419,6 @@ fn close_with_commit_but_no_gate_row_reopens() {
     assert_eq!(r["reopened"], true, "reopen: {r}");
     assert_eq!(bead_status(&dir, &bead_id), "open");
 
-    // the marker is keyed by the derived sha
     assert!(
         dir.join(".flywheel/reopened")
             .join(format!("{bead_id}-{sha}.reopened"))
@@ -467,17 +443,6 @@ fn legal_close_with_commit_and_gate_row_stays_closed() {
     let (s, bead_id, sha) = scratch_bead("nee7-legal", "test -f README.md", true, true);
     let dir = s.dir.clone();
 
-    // worker closes first — the loop records the verdict AFTER the close
-    // (the close-detect tick runs on a closed bead). `br gate report` is
-    // exactly what the armed `report_pass` invokes: the note is
-    // command-shaped (sha receipt exit tail cmd, cmd last since a verify
-    // command contains spaces) and the tail file holds this run's VERIFY
-    // evidence (a bare `test -f` prints nothing, so the file records the
-    // command and its real exit status — the bd-3unc rule needs a
-    // non-empty tail, not stdout specifically). A sha-only note is unbound
-    // and the close-check reads it as missing. The policy's `closed ->
-    // closed` gated self-transition is what makes post-close recording
-    // legal.
     close(&dir, &bead_id, &sha);
     std::fs::write(dir.join("README.md"), "# scratch\n").unwrap();
     let verify_out = run(&dir, "test", &["-f", "README.md"]);
@@ -517,8 +482,6 @@ fn legal_close_with_commit_and_gate_row_stays_closed() {
         "br gate report",
     );
 
-    // two consecutive ticks: both legal, bead stays closed, zero reopen
-    // artifacts (the claim-watch legal path releases without reopening)
     for _ in 0..2 {
         let cc = s.flywheel_json(&["__close-check", dir.to_str().unwrap(), &bead_id]);
         assert_eq!(cc["status"], "legal", "close-check: {cc}");

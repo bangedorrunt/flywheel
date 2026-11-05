@@ -219,8 +219,6 @@ pub fn run_cli(bin: &str, args: &[&str], timeout_secs: u64) -> Option<std::proce
     };
     match status {
         Some(status) => {
-            // The child is reaped and its write ends are closed, so both
-            // readers see EOF. This join is what actually delivers the bytes.
             let stdout = out_reader.join().unwrap_or_default();
             let stderr = err_reader.join().unwrap_or_default();
             Some(std::process::Output {
@@ -232,8 +230,6 @@ pub fn run_cli(bin: &str, args: &[&str], timeout_secs: u64) -> Option<std::proce
         None => {
             let _ = child.kill();
             let _ = child.wait();
-            // Detach: nobody is reading these, and joining would wait on
-            // whatever else inherited the pipe.
             drop(out_reader);
             drop(err_reader);
             None
@@ -371,10 +367,6 @@ fn scan_ack_sla_rows(
     };
     if !out.status.success() {
         let error = String::from_utf8_lossy(&out.stderr).to_string();
-        // bd-r39p: name the skew here too. This arm opens the SAME shared
-        // store as the inbox arm, so it refuses for the same reason, but it
-        // wrote `ack_sla_error` and the fault was invisible under a probe
-        // keyed on the inbox kind.
         FileHost::append_audit_row(
             state_dir,
             workspace,
@@ -447,13 +439,6 @@ pub fn ensure_daemon_gen(flywheel_state: &Path, workspace: &str) {
         .join("doorbell")
         .join(format!("{workspace}.daemon.gen"));
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("doorbell"));
-    // Refresh when the RUNNING binary no longer matches the record, not
-    // only when the file is missing. The gen gate exists to retire a
-    // watcher whose binary changed UNDER it mid-run; a daemon started
-    // AFTER a binary upgrade must re-arm against its own (new) exe —
-    // keeping the stale record made `inject_allowed` permanently false,
-    // so every budget-granted prompt was silently eaten (grants journaled,
-    // zero panes touched).
     if path.is_file()
         && let Ok(raw) = std::fs::read(&path)
         && let Ok(record) = serde_json::from_slice::<GenRecord>(&raw)
@@ -589,11 +574,6 @@ pub fn resolve_registry_file(
         })
         .collect();
     hits.sort();
-    // bd-ztek: several hashed files routinely exist for one project slug
-    // (absolute vs relative spellings hash differently, each holding a
-    // different spawn's pins). First-sorted silently swept a stale fleet's
-    // pins. Prefer the most recently modified file — the live spawn writes
-    // its registry at spawn — with name order only breaking mtime ties.
     hits.sort_by(|a, b| {
         let mtime = |p: &PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
         mtime(b).cmp(&mtime(a)).then_with(|| a.cmp(b))
@@ -799,15 +779,6 @@ struct StaleReap {
     reaped: Vec<String>,
 }
 
-// bd-3uqz: STALE_PANE_GRACE_SECS is GONE, deliberately rather than left as a dead
-// constant. It was a wall-clock window standing in for "we have seen this
-// repeatedly", and it was wrong in both directions: one hc outage outlasting the
-// window pruned a live fleet, and a pane that died and returned inside the window
-// was never pruned. The evidence is now
-// `registry_prune::REQUIRED_CONFIRMATIONS` consecutive observations, and leaving a
-// named 120s grace behind would invite the next reader to think time still decides
-// something here.
-
 /// bd-3vr9: a presence verdict older than this yields to live hc
 /// status. Presence rows arrive only on agent publish; hook-less panes
 /// keep stale words for hours.
@@ -848,12 +819,6 @@ pub fn injection_picture(
 ) -> InjectionPicture {
     let (rows, _) = read_registry_rows(flywheel_state, project, override_path);
     let statuses = plane_agent_statuses(plane_bin);
-    // bd-2i96 G4: `pins` tracks the sweep set, not the raw registry.
-    // Reaped/stale pins (pane absent from `hc terminal list`) leave the
-    // sweep via reap_stale_registry_pins; counting them here reported a
-    // fleet that costs no fetches and can land no wake. The fault stays
-    // visible in `panes_missing`. Empty pane set = hc did not answer
-    // (same guard as the reaper): no evidence, keep all rows.
     let panes = plane_pane_ids(plane_bin);
     let mut picture = InjectionPicture::default();
     let plane_answered = !panes.is_empty();
@@ -1150,13 +1115,6 @@ impl FileHost {
         );
         match ambiguous_file {
             Some(chosen) => {
-                // ONE row per outage, not one per sweep. The registry is never
-                // garbage-collected, so a standing ambiguity can run for days:
-                // 36 sweeps a minute named the same file and wrote ~52k rows a
-                // day, which is how the loudest line in the journal becomes the
-                // one readers skip. bd-ztek still keeps the name, because
-                // first-sorted used to sweep a stale fleet's pins with no trace
-                // of which file won.
                 if self.registry_ambiguous_reported.as_deref() != Some(chosen.as_str()) {
                     self.registry_ambiguous_reported = Some(chosen.clone());
                     self.pending_audit = Some((
@@ -1165,8 +1123,6 @@ impl FileHost {
                     ));
                 }
             }
-            // Cleared: a later ambiguity is a NEW outage and must be audited
-            // again, or dedupe would silence the second incident entirely.
             None => self.registry_ambiguous_reported = None,
         }
         rows
@@ -1245,21 +1201,6 @@ impl FileHost {
     /// `panes_missing` after it stops costing a fetch per tick.
     fn reap_stale_registry_pins(&mut self, rows: &[RegistryRow], now: u64) -> StaleReap {
         let known = plane_pane_ids(&self.cfg.plane_bin);
-        // bd-3uqz: the DECISION is `registry_prune::decide`, which is pure and
-        // fenced. This function is only the plumbing — hc's answer in, the audit
-        // and the index out. The two rules that matter live in the pure module
-        // because they are the ones that were wrong HERE:
-        //
-        //  - a row whose pane is EMPTY resolves by LABEL and is never pruned. The
-        //    old test was `!pane.is_empty() && known.contains(pane)`, so an empty
-        //    pane never matched "alive" and fell through to the reap branch —
-        //    deleting exactly the legacy rows `prompt_hop_keeps_the_label_when_the_
-        //    row_has_no_pane` exists to support. No test covered the intersection.
-        //  - an EMPTY pane list from hc is NO EVIDENCE: nothing is pruned and
-        //    nothing is COUNTED, so an outage cannot manufacture confirmations for
-        //    panes that are alive. Live, 13 of 20 rows (65%) had a pane hc did
-        //    not list, so absence-based pruning would wipe two thirds of the table
-        //    on its first sweep — during an outage, when it matters most.
         let decision_rows: Vec<crate::registry_prune::Row> = rows
             .iter()
             .map(|(pin, pane, _)| crate::registry_prune::Row {
@@ -1277,8 +1218,6 @@ impl FileHost {
             self.tombstones.insert(t.pin.clone(), t.clone());
         }
 
-        // Reporting only: when did this pin first go missing. The decision above
-        // deliberately does not consult the clock.
         for (pin, pane, _) in rows {
             if pane.is_empty() || known.contains(pane) {
                 self.stale_panes.remove(pin);
@@ -1315,9 +1254,6 @@ impl FileHost {
                         "pin": pin,
                         "pane": pane,
                         "workspace": self.cfg.workspace,
-                        // bd-3uqz: the evidence is a COUNT of consecutive sweeps, not
-                        // elapsed time. Reporting `grace_s` here would have kept
-                        // describing a rule that no longer exists.
                         "absent_confirmations": t.map_or(
                             crate::registry_prune::REQUIRED_CONFIRMATIONS,
                             |t| t.confirmations),
@@ -1345,11 +1281,6 @@ impl FileHost {
     /// lapses (mirrors the embedded 60s rule; whois failures keep None).
     fn refresh_index(&mut self) {
         let rows = self.registry_rows();
-        // bd-hv2j: refuse (loudly) to adopt a workspace whose rows all live
-        // on another plane than this host's roster view. Cross-plane rows
-        // can never route, so they stay unroutable and their wakes digest
-        // as `plane_mismatch`, never a `no_route` that blames the mail.
-        // Read-only: no pane writes, no registry mutation.
         let selected = selected_plane();
         let row_panes: Vec<&str> = rows.iter().map(|(_, pane, _)| pane.as_str()).collect();
         let mismatch = doorbell_core::wake_core::plane_mismatch_reason(selected, &row_panes);
@@ -1373,14 +1304,7 @@ impl FileHost {
         }
         self.plane_mismatch_reason = mismatch;
         let mut pins: Vec<String> = rows.iter().map(|(p, _, _)| p.clone()).collect();
-        // bd-bk9t: a subscribed pin with no registry row has no pane and no
-        // target, so its status can never leave "unknown" and no queue drain
-        // can ever fire. Marked here so `route_or_queue` digests its wakes
-        // instead of parking them in a queue that only dies with the process.
         let mut unroutable: Vec<String> = Vec::new();
-        // bd-cak3: union subscribed identities. Registry order is preserved
-        // so spawned pins keep their existing order; subscribed-only pins
-        // append deduped, and the whois loop below resolves their npubs too.
         for pin in self.subscription_pins() {
             if !pins.contains(&pin) {
                 pins.push(pin.clone());
@@ -1388,29 +1312,18 @@ impl FileHost {
             }
         }
         let now = Self::now_unix();
-        // Compared against the RAW view: reaped pins stay in `pins` here, so
-        // the guard does not thrash once a stale fleet is filtered out
-        // (bd-adms).
         if pins == self.index_pins_raw
             && unroutable == self.unroutable_pins
             && now.saturating_sub(self.index_refreshed_at) < INDEX_TTL_SECS
         {
             return;
         }
-        // bd-adms: drop registry pins whose pane hc no longer has, and
-        // treat a vanished pane like a subscription-only pin — no pane, no
-        // route, so its wake digests instead of parking in a queue nothing
-        // can drain.
         let reap = self.reap_stale_registry_pins(&rows, now);
         for pin in reap.vanished {
             if !unroutable.contains(&pin) {
                 unroutable.push(pin);
             }
         }
-        // bd-hv2j: refused-adoption rows are never targets. Their panes live
-        // on another plane, so no roster will ever name them; forcing them
-        // unroutable now (instead of after the stale-grace window) keeps the
-        // digest honest from the first sweep.
         if self.plane_mismatch_reason.is_some() {
             for (pin, pane, _) in &rows {
                 let cross = doorbell_core::wake_core::pane_plane(pane)
@@ -1433,17 +1346,8 @@ impl FileHost {
         if let Ok(mut targets) = self.targets.lock() {
             targets.clear();
             targets.extend(reap.live.iter().map(|(pin, pane, name)| {
-                // bd-523f: the value is an hc PROMPT TARGET, not a name —
-                // the sink passes it to `agent prompt` verbatim, and only the
-                // pane id resolves for an operator pane.
                 (pin.clone(), prompt_target(pane, name).to_string())
             }));
-            // bd-3vr9: union hc-known captain panes (same resolver, no
-            // second table). A subscribed pin whose pane was never spawned
-            // carries its pin in the hc `toron_pin` token; bind it so
-            // has_route holds and the wake prompts instead of digesting
-            // forever. Vanished panes drop out on the next refresh because
-            // the roster no longer names them.
             let routed: std::collections::HashSet<String> = targets.keys().cloned().collect();
             let ops =
                 captain_pane_targets(&plane_agent_roster(&self.cfg.plane_bin), &pins, &routed);
@@ -1477,12 +1381,6 @@ impl FileHost {
                 self.npubs.insert(pin.clone(), npub);
             }
         }
-        // bd-yhi8r: a sweep that changed routing state is a decision worth
-        // one journal row — the brain journals when tick effects decide, and
-        // the pending-audit channel is how a state transition becomes one.
-        // Steady idle stays silent (rv23 #3); boot adoption, vanish, and
-        // reap transitions journal exactly once, which is what the daemon
-        // smoke folds to prove the hosted loop sweeps.
         if self.pending_audit.is_none()
             && (pins != self.index_pins_raw || unroutable != self.unroutable_pins)
         {
@@ -1495,12 +1393,6 @@ impl FileHost {
                 }),
             ));
         }
-        // bd-yhi8r: a sweep that changed routing state is a decision worth
-        // one journal row — the brain journals when tick effects decide, and
-        // the pending-audit channel is how a state transition becomes one.
-        // Steady idle stays silent (rv23 #3); boot adoption, vanish, and
-        // reap transitions journal exactly once, which is what the daemon
-        // smoke folds to prove the hosted loop sweeps.
         if self.pending_audit.is_none()
             && (pins != self.index_pins_raw || unroutable != self.unroutable_pins)
         {
@@ -1513,12 +1405,6 @@ impl FileHost {
                 }),
             ));
         }
-        // bd-yhi8r: a sweep that changed routing state is a decision worth
-        // one journal row — the brain journals when tick effects decide, and
-        // the pending-audit channel is how a state transition becomes one.
-        // Steady idle stays silent (rv23 #3); boot adoption, vanish, and
-        // reap transitions journal exactly once, which is what the daemon
-        // smoke folds to prove the hosted loop sweeps.
         if self.pending_audit.is_none()
             && (pins != self.index_pins_raw || unroutable != self.unroutable_pins)
         {
@@ -1706,23 +1592,9 @@ impl FileHost {
         if let (Some(obj), serde_json::Value::Object(map)) = (entry.as_object_mut(), detail) {
             obj.extend(map);
         }
-        // bd-jcys: ONE audit append. This was a second implementation that
-        // discarded both the mkdir and the write (`let _ =` inside `if let Ok`),
-        // so a wake-sock row — the EVIDENCE channel — could vanish with no
-        // trace. `FileStore::append_audit` is the single owner: owner-only dir
-        // and file, and it warns on every failure as well as returning the
-        // error. This caller holds no `&self` (that is why the free function
-        // exists at all), so it wraps the same root in a throwaway store
-        // instead of carrying a second copy of the writer.
         let store = FileStore::new(state_dir.to_path_buf());
         let path = store.audit_file(workspace);
-        // Deliberate fire-and-forget: append_audit eprintln!s the cause on
-        // every failure path AND counts it (crate::store::audit_write_failures),
-        // so no caller can silently drop a journal write anymore.
         let _ = store.append_audit(workspace, entry);
-        // bd-lorot: the audit log had NO rotation while the journal had a full
-        // retention discipline. See rotate_audit_if_oversized for why that is
-        // backwards: the audit log is the high-volume one.
         rotate_audit_if_oversized(&path);
     }
 
@@ -1735,19 +1607,7 @@ impl FileHost {
             .into_iter()
             .flat_map(|e| match e {
                 // governed-by: bd-fuql — ONE routing decide: presence ×
-                // urgency × route × budget composes in doorbell_core.
-                // Staged seam: this path resolves route+budget upstream
-                // (SelfIndex-gated targets; Brain-owned budgets), so both
-                // read true here and the vocabulary swaps with zero
-                // behavior drift (parity tests prove it). Threading the
-                // real budget signal (Queue) is the follow-up.
                 Effect::Prompt { pin, line } => {
-                    // bd-3vr9: live hc status outranks a stale presence
-                    // row — but ONLY for captain-pane-unioned pins, whose
-                    // panes run no presence hooks (self-report goes stale
-                    // forever). Spawned crews keep the presence contract
-                    // (bd-v8vi): fresh self-report wins transient races,
-                    // absent presence holds.
                     let now = Self::now_unix();
                     let presence_stale = self
                         .presence_ts
@@ -1775,8 +1635,6 @@ impl FileHost {
                         budget_allows: true,
                     };
                     // governed-by: bd-0nem — single fold through the fenced
-                    // kernel (was a direct free-fn call; same decision,
-                    // journal-shaped effects).
                     let (_, effects) = doorbell_core::wake_core::tick(
                         &doorbell_core::wake_core::WakeModel::default(),
                         &doorbell_core::wake_core::WakeMsg::Route { input },
@@ -1786,16 +1644,11 @@ impl FileHost {
                         _ => None,
                     });
                     // governed-by: bd-zawk — same typed gate as the hc
-                    // path: Busy+urgent breaks through, everything else digests.
                     match decision {
                         Some(decision) => match decision {
                             doorbell_core::wake_core::GateDecision::Inject { pin, line } => {
                                 vec![Effect::Prompt { pin, line }]
                             }
-                            // bd-v8vi: a held-for-digest wake must actually
-                            // digest — the Audit alone left BrightDog urgents
-                            // visible nowhere (no Digest, no last_wake). Both
-                            // rows journal; absorb_digests delivers the Digest.
                             doorbell_core::wake_core::GateDecision::Digest { pin, reason } => {
                                 vec![
                                     Effect::Audit {
@@ -1812,9 +1665,6 @@ impl FileHost {
                                     },
                                 ]
                             }
-                            // Unreachable at this seam (budget/route read true
-                            // above): degrade LOUD to digest, never silent drop
-                            // and never an unbudgeted prompt.
                             doorbell_core::wake_core::GateDecision::Queue { wake } => vec![
                                 Effect::Audit {
                                     kind: "prompt_filtered".into(),
@@ -1852,8 +1702,6 @@ impl FileHost {
             .into_iter()
             .map(|a| match a {
                 doorbell_core::DoorbellAction::Prompt { pin, line } => Effect::Prompt { pin, line },
-                // Signal only: the brain fetches every known pin with
-                // per-pin cursors (mirrors the embedded mapping).
                 doorbell_core::DoorbellAction::FetchInbox => Effect::FetchInbox,
                 doorbell_core::DoorbellAction::CheckAckSla => Effect::CheckAckSla,
                 doorbell_core::DoorbellAction::RestartWatch => Effect::RestartWatch,
@@ -1868,8 +1716,6 @@ impl FileHost {
                     detail: serde_json::json!(detail),
                 },
                 doorbell_core::DoorbellAction::Digest { pin, line, why } => {
-                    // bd-hv2j: a cross-plane unroutable pin digests as
-                    // `plane_mismatch`, never a `no_route` that blames the mail.
                     let why = if why == "no_route" {
                         self.plane_mismatch_reason.clone().unwrap_or(why)
                     } else {
@@ -1884,8 +1730,6 @@ impl FileHost {
 
 impl Host for FileHost {
     fn tick(&mut self, msg: &BrainMsg) -> Vec<Effect> {
-        // Live errors surface as one Audit effect on the next tick
-        // (never silent; never more than one per error).
         let mut pre = Vec::new();
         if let Some((kind, detail)) = self.pending_audit.take() {
             pre.push(Effect::Audit {
@@ -1925,9 +1769,6 @@ impl Host for FileHost {
             }
             BrainMsg::Sweep { .. } => vec![Effect::FetchInbox],
             BrainMsg::RoleBound { role, pin } => {
-                // Mirrors the workspace arm: binds assignment routing only,
-                // never the doorbell index — zero classification effect on
-                // either host. The bind itself is state the Fact arm reads.
                 self.roles.insert(role.clone(), pin.clone());
                 Vec::new()
             }
@@ -1939,12 +1780,6 @@ impl Host for FileHost {
                     },
                 );
                 self.reducer.model = next;
-                // bd-ztek: promote a captain fact to a Prompt exactly like
-                // the embedded workspace arm — precedence + line shape come
-                // from the shared core helpers (bd-z5ou), only the Idle
-                // read is host-side. Without this every daemon-side fact —
-                // including `inject` — degraded to fact_miss even with a
-                // bound captain.
                 if let Some(pin) = doorbell_core::fact_captain_pin(&self.roles)
                     && self.presence.get(&pin) == Some(&PresenceVerdict::Idle)
                 {
@@ -1965,7 +1800,6 @@ impl Host for FileHost {
                 self.normalize(actions)
             }
             BrainMsg::Presence { pin, state } => {
-                // Direct insert (mirrors the workspace tick arm).
                 self.presence
                     .insert(pin.clone(), doorbell_core::parse_presence_word(state));
                 self.presence_ts.insert(pin.clone(), Self::now_unix());
@@ -1982,10 +1816,6 @@ impl Host for FileHost {
                 self.reducer.model = next;
                 self.normalize(actions)
             }
-            // bd-w98c residual: same decision as the embedded host — the hit
-            // list audits (LoudMiss-free data audit) + asks for the inbox so
-            // overdue rows can re-enter. Both hosts answer FetchInbox so the
-            // parity assertion on AckSlaTick stays an honest mirror.
             BrainMsg::SlaFired { posts } => vec![
                 Effect::Audit {
                     kind: "ack-sla-hit".into(),
@@ -2042,8 +1872,6 @@ impl Host for FileHost {
         let state_dir = self.cfg.flywheel_state.clone();
         let workspace = self.cfg.workspace.clone();
         let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
-            // No runtime (a sync caller): fetch inline rather than drop the
-            // rows — the cursor holds, so the next sweep re-fetches.
             for (pin, since) in pins {
                 let rows = fetch_inbox_rows(&bin, &project, &state_dir, &workspace, &pin, &since);
                 let _ = tx.try_send(BrainMsg::InboxFetched { pin, rows });
@@ -2053,9 +1881,6 @@ impl Host for FileHost {
         handle.spawn_blocking(move || {
             for (pin, since) in pins {
                 let rows = fetch_inbox_rows(&bin, &project, &state_dir, &workspace, &pin, &since);
-                // try_send: a full brain channel drops the batch, and the
-                // cursor only advances on delivery — so the next sweep
-                // re-fetches it (at-least-once, never at-most-once).
                 if tx.try_send(BrainMsg::InboxFetched { pin, rows }).is_err() {
                     break;
                 }
@@ -2091,13 +1916,6 @@ impl Host for FileHost {
     }
 
     fn scan_ack_sla(&mut self) -> Vec<String> {
-        // bd-0zcr.2 G1 closed: the `toron ack-sla` verb scans + publishes
-        // overdue ack wakes; the daemon relays the expired ids it returns
-        // and never invents overdue posts. Failures audit LOUD and yield
-        // empty — the same at-least-once rule as `fetch_inbox`.
-        //
-        // bd-1i8c: the scan's deadline is its OWN (minutes-scale), not the
-        // shared per-call ceiling that killed it every minute.
         scan_ack_sla_rows(
             &self.cfg.toron_bin,
             &self.cfg.project,
@@ -2110,21 +1928,11 @@ impl Host for FileHost {
     /// coalesced into one already pending — the brain journals a restart row
     /// only for `true` (bd-watch-restart-metric-8dvf).
     fn restart_wake(&mut self) -> bool {
-        // SINGLE-FLIGHT, before anything else. A burst of `Died` collapses to
-        // one scheduled restart. Without this the backoff spaces nothing: every
-        // death brings its own timer, and they all fire together after the
-        // sleep — which is exactly how 1,613 connects landed in one second.
         use std::sync::atomic::Ordering;
         if self.restart_pending.swap(true, Ordering::SeqCst) {
             return false;
         }
-        // The 16s cap is deliberate (GS-007 never-deaf: probing forever beats
-        // going wake-blind), so the loop itself is not the bug. What was broken
-        // is that the gate never opened again — see the `retry` field.
         let backoff = self.retry.lock().map(|mut r| r.record_fail()).unwrap_or(16);
-        // bd-68q2: sample a digest naming the live rate, the fd census, and
-        // the backoff — one row per power-of-two fails, decided by fails, not
-        // by wall clock, so a storm reads as a rate in the audit log.
         let fails = self.retry.lock().map(|r| r.fails()).unwrap_or(0);
         if should_audit_count(fails as usize) {
             Self::append_audit_row(
@@ -2139,16 +1947,9 @@ impl Host for FileHost {
         let project = self.cfg.project.clone();
         let fw_state = self.cfg.flywheel_state.clone();
         let workspace = self.cfg.workspace.clone();
-        // Host-wide, so a storm across consumers reads as one rate. Hoisted for
-        // the same 'static reason as the clones above.
         let died_relayed = self.died_relayed.clone();
-        // One live consumer per host, never a litter. The slot aborts the
-        // previous task before the replacement subscribes.
         let slot = self.wake_task.clone();
-        // Hoisted OUT of the spawned future: the future is 'static, so reading
-        // a field off `&mut self` inside it would let the borrow escape.
         let retry = self.retry.clone();
-        // Hoisted out of the 'static future so no borrow of `self` escapes.
         let pending = self.restart_pending.clone();
         let absent = self.absent_rows.clone();
         let wake_counters = self.wake_counters.clone();
@@ -2156,21 +1957,11 @@ impl Host for FileHost {
         let wake_wait = self.cfg.wake_brain_wait;
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-            // The slot frees the moment we are about to ACT, so the next death
-            // schedules its own restart instead of being dropped. Clearing it
-            // after the sleep is what makes this a rate limit rather than a
-            // one-shot: during the sleep deaths coalesce, after it they queue.
             pending.store(false, std::sync::atomic::Ordering::SeqCst);
             let Some(tx) = tx else { return };
             if let Ok(mut g) = slot.lock()
                 && let Some((h, retire)) = g.take()
             {
-                // bd-v7uu: mark the predecessor RETIRED before aborting it. An
-                // abort closes the channel with no terminal outcome, which the
-                // consumer's monitor cannot otherwise distinguish from a crash — so
-                // every intentional restart logged `wake_consumer_dropped` and
-                // forwarded a synthetic `Died` that advanced the retry backoff. The
-                // recovery was counting itself as a failure.
                 retire.store(true, std::sync::atomic::Ordering::SeqCst);
                 h.abort();
             }
@@ -2179,9 +1970,6 @@ impl Host for FileHost {
                 crate::wake_sock::parse_kinds(WATCH_KINDS),
                 Some(project),
             );
-            // mcc9: resume where the brain last accepted a line, so whatever
-            // the predecessor dropped is replayed rather than lost — and a
-            // restart no longer re-floods the channel with the whole history.
             opts.resume_from = wake_resume.lock().ok().and_then(|g| g.clone());
             if let Some(from) = &opts.resume_from {
                 wake_counters.note_resume();
@@ -2194,16 +1982,10 @@ impl Host for FileHost {
             }
             let audit_state = fw_state.clone();
             let audit_workspace = workspace.clone();
-            // `audit_state`/`audit_workspace` are moved into the on_audit
-            // closure below, so the outcome arm keeps its own handles for the
-            // drop audit. Without an audit there, a full channel was invisible.
             let full_state = fw_state.clone();
             let full_workspace = workspace.clone();
             let beat_state = fw_state.clone();
             let beat_workspace = workspace.clone();
-            // mcc9: ONE forwarder per consumer under the documented policy
-            // (backpressure, then exact-count drop + one death + cursor
-            // resume). The counters and the resume cursor are host-wide.
             let forwarder = {
                 let (st, ws) = (full_state.clone(), full_workspace.clone());
                 crate::wake_brain::WatchForwarder::new(
@@ -2220,8 +2002,6 @@ impl Host for FileHost {
                     &full_workspace,
                 ))
             };
-            // `retry` is hoisted before the spawn; re-reading `self` here would
-            // let the borrow escape the 'static future.
             let absent_rows = absent.clone();
             let absent_for_audit = absent.clone();
             let retire = opts.retire_flag();
@@ -2229,13 +2009,6 @@ impl Host for FileHost {
             let handle = crate::wake_sock::spawn_wake_task(
                 opts,
                 move |kind, detail| {
-                    // bd-lorot: ONE row per outage for a repeated absence.
-                    // Measured live before this: 1,613 identical
-                    // `wake_sock_absent` rows in ONE second = 169 KB/s, which
-                    // tripped the 5 MiB rotation into rewriting the file
-                    // continuously. The cause is worth recording once; the same
-                    // cause 1,613 times is a spin loop, and one a peer service
-                    // can induce is a denial-of-service surface.
                     if kind == crate::wake_sock::AUDIT_SOCK_ABSENT
                         && absent_for_audit.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0
                     {
@@ -2245,55 +2018,28 @@ impl Host for FileHost {
                 },
                 move |out| {
                     use crate::wake_sock::WakeOutcome;
-                    // mcc9: Watch goes through the forwarder (backpressure on a
-                    // full channel, never a silent shed); stamp .event only
-                    // once the brain has the line. Died rings the side bell so a
-                    // full channel cannot hide the restart behind the backlog.
                     match out {
                         WakeOutcome::Watch(l) => match forwarder.forward(l) {
                             f if f.reached_brain() => {
                                 crate::watchbeat::touch_event(&beat_state, &beat_workspace);
-                                // A delivered event is the only trustworthy
-                                // evidence the socket is live again, so it is
-                                // what reopens the gate. Nothing else may:
-                                // a heartbeat proves the ticker ran, not that
-                                // the transport delivers.
                                 if let Ok(mut r) = retry.lock() {
                                     r.reset();
                                 }
-                                // The outage is over, so the NEXT absence must be
-                                // audited again rather than swallowed by a counter
-                                // the last outage left high.
                                 absent_rows.fetch_and(0, std::sync::atomic::Ordering::SeqCst);
                             }
                             crate::wake_brain::Forwarded::Dropped {
                                 report_death: true, ..
                             } => {
-                                // ONE death for this consumer so it is
-                                // replaced; the replacement resumes from the
-                                // last accepted line, replaying the drops.
-                                // Retire now, before the backoff sleep. The
-                                // std consumer stops taking lines; abort still
-                                // waits until the replacement is about to arm.
                                 retire_now.store(true, std::sync::atomic::Ordering::SeqCst);
                                 crate::msg::deliver_died(&tx, died_bell.as_deref());
                             }
-                            // Counted by the forwarder; the consumer is
-                            // already condemned.
                             _ => {}
                         },
                         WakeOutcome::Heartbeat => {
                             crate::watchbeat::touch_heartbeat(&beat_state, &beat_workspace);
                         }
-                        // toron#17: a counted, audited gap (the consumer wrote
-                        // the row); the consumer is not dead.
                         WakeOutcome::EventsLost { .. } => forwarder.note_events_lost(),
                         WakeOutcome::Died => {
-                            // The relay is where a death storm was previously
-                            // invisible, so it is where the rate gets named.
-                            // Delivery stays unconditional: the restart depends
-                            // on the death arriving, so only the audit is
-                            // sampled, never the relay.
                             let prior =
                                 died_relayed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             if let DiedRelayAction::RelayAndAudit(relayed) =
@@ -2324,7 +2070,6 @@ impl Host for FileHost {
 
     fn inject_allowed(&self, _pin: &str) -> bool {
         match &self.generation {
-            // Daemon-keyed generation: stale binary refuses wakes.
             Some(record) => !gen_stale(record, &self.daemon_exe),
             None => true,
         }
@@ -2360,8 +2105,6 @@ impl Host for FileHost {
 
     fn sweep_maintenance(&mut self) -> Vec<(String, String)> {
         self.refresh_index();
-        // Status poll: diff the hc list against last-known and tell
-        // changes back as PlaneStatus (forwarder topology, poll transport).
         let current = self.poll_plane();
         let mut changed: Vec<(String, String)> = current
             .iter()
@@ -2369,31 +2112,16 @@ impl Host for FileHost {
             .map(|(p, s)| (p.clone(), s.clone()))
             .collect();
         changed.sort();
-        // Presence rows tick the trusted edge (same file + freshness rule
-        // as the embedded projection).
         let now = Self::now_unix();
         let rows = self.presence_rows(&self.index_pins, now);
         if let Some(tx) = &self.tx {
             for (pin, status) in &changed {
-                // `try_send`, never `blocking_send`: the daemon-hosted Brain
-                // drives the Host from inside its own tokio runtime, where
-                // `blocking_send` panics ("Cannot block the current thread
-                // from within a runtime") — on the first status change the
-                // sweep task died and the hosted workspace went ring-deaf
-                // while /health kept reporting `mode=hosted`. A full channel
-                // drops the update, which is what the ignored result already
-                // meant.
                 match tx.try_send(BrainMsg::PlaneStatus {
                     pin: pin.clone(),
                     status: status.clone(),
                 }) {
                     Ok(()) => {}
                     Err(e) => {
-                        // Self-healing: self.hc advances only on receipt
-                        // (the BrainMsg::PlaneStatus arm), so a dropped update
-                        // is recomputed as changed next sweep — delay, not
-                        // loss. Count every drop and audit sampled, the same
-                        // repeat-is-a-count shape as wake_brain_full.
                         let closed = matches!(e, tokio::sync::mpsc::error::TrySendError::Closed(_));
                         let prior = self
                             .plane_dropped
@@ -2471,8 +2199,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let script = dir.join("loud.sh");
-        // 4 x 64 KiB on stdout (three pipe-buffer loads past the first) and a
-        // tail on stderr, so the test proves BOTH pipes drained, not just one.
         std::fs::write(
             &script,
             "#!/bin/sh\ndd if=/dev/zero bs=65536 count=4 2>/dev/null\necho marker-on-stderr >&2\n",
@@ -2607,7 +2333,6 @@ mod tests {
             body.contains(TORON_STORE_SKEW_MARKER),
             "and the row carries the marker, so a kind-independent probe finds it: {body}"
         );
-        // A different refusal keeps its own kind: this arm is not a skew oracle.
         std::fs::write(&script, "#!/bin/sh\necho 'no such flag' >&2\nexit 2\n").expect("script");
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2652,12 +2377,9 @@ mod tests {
             ("w6:p3".into(), "idle".into(), Some("Stranger".into())),
         ];
         let want = vec!["BrightBadger".to_string(), "Gone".to_string()];
-        // Already registry-routed: token must not double-bind.
         let routed: std::collections::HashSet<String> =
             ["BrightBadger".to_string()].into_iter().collect();
         assert!(captain_pane_targets(&roster, &want, &routed).is_empty());
-        // Unwanted pins and the token-less pane never route: Gone stays
-        // digest-bound, never queued into a table that cannot drain it.
         let empty: std::collections::HashSet<String> = Default::default();
         assert!(captain_pane_targets(&roster, &["Gone".to_string()], &empty).is_empty());
     }
@@ -2833,8 +2555,6 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        // `hc terminal list` knows only w9:p1; `agent list` keeps w9:p1 idle so
-        // the live pin stays injectable.
         let script = dir.join("hc");
         std::fs::write(
             &script,
@@ -2858,14 +2578,6 @@ mod tests {
             vec!["LivePin".to_string(), "DeadPin".to_string()],
             "the first sighting of a vanished pane is not evidence"
         );
-        // bd-3uqz: drive CONSECUTIVE SWEEPS, not a clock. The index is TTL-gated,
-        // so each pass has to age out before the next one is a real observation.
-        //
-        // The refresh_index() above was ALREADY the first sighting, so
-        // REQUIRED_CONFIRMATIONS - 1 more are needed. Written as a decrement so the
-        // arithmetic cannot drift: my first conversion looped the full count and
-        // pruned one sweep early, because the initial refresh was silently the
-        // first observation.
         let mut needed = crate::registry_prune::REQUIRED_CONFIRMATIONS - 1;
         while needed > 0 {
             let birth = FileHost::now_unix();
@@ -2975,7 +2687,6 @@ mod tests {
             serde_json::to_string(&entries()).unwrap(),
         )
         .unwrap();
-        // pane-b is dead: absent from both the pane list and the agents.
         let script = dir.join("hc-stale");
         std::fs::write(
             &script,
@@ -3028,9 +2739,6 @@ mod tests {
         let new = dir.join("agents").join("proj-22222222.json");
         std::fs::write(&old, "[]").unwrap();
         std::fs::write(&new, "[]").unwrap();
-        // bd-ztek: freshest-mtime wins (the live spawn writes at spawn),
-        // not first-sorted — pin the mtimes explicitly, never rely on
-        // write order (coarse filesystems tie).
         let t0 = SystemTime::now();
         std::fs::File::options()
             .write(true)
@@ -3052,15 +2760,9 @@ mod tests {
 
     #[test]
     fn resolve_absolute_path_project_finds_hashed_registry() {
-        // The daemon-hosting shape (bd-*: parse_host rsplit): flywheel spawn
-        // writes `proj-{8hex}.json` (state::state_key hash of the absolute
-        // path); the daemon passes the same absolute string as `project`.
-        // Matching the RAW string (slashes never appear in a filename) made
-        // every absolute-path project's registry invisible — zero pins, no
-        // npub resolution, every wake classified to zero targets.
         let dir = tmp_state("abs");
         let abs = "/tmp/scratch/proj";
-        let expected = registry_key(abs); // "proj-{8hex}"
+        let expected = registry_key(abs);
         std::fs::write(dir.join("agents").join(format!("{expected}.json")), "[]").unwrap();
         let (path, ambiguous) = resolve_registry_file(&dir, abs, None);
         assert!(!ambiguous, "single hash candidate is unambiguous");
@@ -3120,8 +2822,6 @@ mod tests {
             Some("OperatorPin"),
             "a subscribed pin must be addressable (classifier self-index)"
         );
-        // ...but never a FABRICATED route: a pane-less identity must not be
-        // handed a prompt target the sink cannot deliver to.
         assert!(
             !host.panes.values().any(|p| p == "OperatorPin"),
             "no pane is invented for a subscribed pin"
@@ -3134,15 +2834,11 @@ mod tests {
                 .contains_key("OperatorPin"),
             "no hc target is invented for a subscribed pin"
         );
-        // bd-bk9t: and because there is no route, the index marks it
-        // unrouteable so its wakes are digest-bound instead of parked in a
-        // queue no status transition can ever drain.
         assert!(
             host.reducer.model.unroutable.contains("OperatorPin"),
             "a pane-less subscribed pin must be marked unroutable: {:?}",
             host.reducer.model.unroutable
         );
-        // A spawned pin with a pane keeps its route.
         assert!(
             !host.reducer.model.unroutable.is_empty()
                 && !host.reducer.model.unroutable.contains("PinA"),
@@ -3249,13 +2945,10 @@ mod tests {
     fn presence_filter_idle_keeps_busy_urgent_breaks_through() {
         let (mut host, _dir) = host_with_registry("t2", entries());
         host.refresh_index();
-        // Idle presence: routine channel ring prompts.
         host.tick(&BrainMsg::Presence {
             pin: "PinA".into(),
             state: "idle".into(),
         });
-        // No status known -> "unknown" status -> core QUEUES (not prompt).
-        // Set status idle first via PlaneStatus (drain of empty queue).
         host.tick(&BrainMsg::PlaneStatus {
             pin: "PinA".into(),
             status: "idle".into(),
@@ -3266,7 +2959,6 @@ mod tests {
                 .any(|e| matches!(e, Effect::Prompt { pin, .. } if pin == "PinA")),
             "idle presence + idle status prompts: {fx:?}"
         );
-        // Busy presence + routine line -> prompt_filtered Audit.
         host.tick(&BrainMsg::Presence {
             pin: "PinA".into(),
             state: "working".into(),
@@ -3281,16 +2973,12 @@ mod tests {
 
     #[test]
     fn unknown_presence_urgent_actually_digests() {
-        // bd-v8vi (BrightDog): idle-in-hc but presence-Unknown — the
-        // filter held the urgent "for digest" and digested nothing
-        // (audit only). The Digest intent must be emitted, not just audited.
         let (mut host, _dir) = host_with_registry("t-unk", entries());
         host.refresh_index();
         host.tick(&BrainMsg::PlaneStatus {
             pin: "PinA".into(),
             status: "idle".into(),
         });
-        // No Presence tick: verdict stays Unknown.
         let rows = vec![serde_json::json!({"importance": "urgent", "body": "x"})];
         let fx = host.tick(&BrainMsg::InboxFetched {
             pin: "PinA".into(),
@@ -3312,11 +3000,6 @@ mod tests {
 
     #[test]
     fn ensure_daemon_gen_refreshes_stale_record() {
-        // Regression: the gen file is write-once-if-missing, so a daemon
-        // started after a binary upgrade kept the OLD record. gen_stale()
-        // then refused every inject forever — budget-granted prompts were
-        // journaled and silently dropped (zero panes touched). A restart
-        // against a NEW binary must re-arm to the new identity.
         let dir = tmp_state("gen");
         std::fs::create_dir_all(dir.join("doorbell")).unwrap();
         let path = dir.join("doorbell").join("w.daemon.gen");
@@ -3334,7 +3017,6 @@ mod tests {
             raw["binary_hash"], "deadbeefdeadbeefdeadbeefdeadbeef",
             "stale daemon gen must refresh to the running binary identity"
         );
-        // A matching record is kept (idempotent, preserves started_unix).
         ensure_daemon_gen(&dir, "w");
         let again: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -3354,7 +3036,6 @@ mod tests {
             pin: "PinA".into(),
             state: "working".into(),
         });
-        // Urgent line shape carries a "request-release" marker.
         let line = serde_json::json!({
             "kind": 14, "id": "e9", "pubkey": "ab",
             "tags": [["p", "PinA"], ["toron-kind", "request-release"]],
@@ -3377,7 +3058,6 @@ mod tests {
     fn live_plane_status_outranks_stale_presence() {
         let (mut host, _dir) = host_with_registry("t-hc", entries());
         host.refresh_index();
-        // Simulate the captain-pane union: PinA routed by token, not registry.
         host.captain_routed_pins.push("PinA".into());
         let line = |id: &str, ts: u64| {
             serde_json::json!({"kind": 9, "id": id, "pubkey": "ab",
@@ -3389,8 +3069,6 @@ mod tests {
             pin: "PinA".into(),
             state: "working".into(),
         });
-        // Age the self-report past the freshness window: supervisor truth
-        // must win from here on.
         host.presence_ts.insert("PinA".into(), 0);
         host.tick(&BrainMsg::PlaneStatus {
             pin: "PinA".into(),
@@ -3429,7 +3107,6 @@ mod tests {
         let (mut host, _dir) = host_with_registry("t4", entries());
         let fx = host.tick(&BrainMsg::AckSlaTick { now: 1_000 });
         assert!(fx.iter().any(|e| matches!(e, Effect::CheckAckSla)));
-        // Signal only: the brain fetches per-pin cursors (embedded shape).
         assert!(fx.iter().any(|e| matches!(e, Effect::FetchInbox)));
         let fx = host.tick(&BrainMsg::Sweep { now: 1 });
         assert_eq!(fx.len(), 1);
@@ -3440,9 +3117,6 @@ mod tests {
     fn role_bound_is_classification_neutral() {
         let (mut host, _dir) = host_with_registry("t5", entries());
         host.refresh_index();
-        // bd-yhi8r: production drains a refresh's routing-change audit on
-        // the sweep tick that follows maintenance, so flush through Sweep
-        // here — RoleBound itself must still add nothing.
         let drained = host.tick(&BrainMsg::Sweep { now: 1 });
         assert!(
             drained.iter().any(
@@ -3459,9 +3133,6 @@ mod tests {
 
     #[test]
     fn fact_promotes_to_captain_over_idle_presence() {
-        // bd-ztek: daemon-side facts (including inject) must ring a bound
-        // idle captain exactly like the embedded workspace arm — no more
-        // unconditional fact_miss.
         let (mut host, _dir) = host_with_registry("t-fact", entries());
         host.refresh_index();
         host.tick(&BrainMsg::RoleBound {
@@ -3487,11 +3158,6 @@ mod tests {
 
     #[test]
     fn ready_bead_fact_wakes_idle_managed_pane() {
-        // bd-ux-papercuts-t2u5 acceptance: a ready-bead appearance detected by
-        // the beads poller must reach an idle managed pane through the daemon
-        // host — the supervisor no longer has to poll the board by hand. The
-        // summary comes from the real sensor, so a poller that stops emitting
-        // `ready` fails this test too.
         let fresh = crate::pollers::Snapshot::default();
         let (snap, _) = crate::pollers::detect_changes(&fresh, &[], &[], "t0");
         let issue = crate::pollers::IssueRow {
@@ -3526,7 +3192,6 @@ mod tests {
 
     #[test]
     fn fact_without_captain_stays_fact_miss() {
-        // No bind (or non-idle presence): the loud miss survives.
         let (mut host, _dir) = host_with_registry("t-fact-miss", entries());
         host.refresh_index();
         let fx = host.tick(&BrainMsg::Fact {
@@ -3556,7 +3221,6 @@ mod tests {
             "\"fact one\"\n",
         )
         .unwrap();
-        // role key for a bare slug is the slug itself.
         let bounds = host.drain_role_bounds();
         assert_eq!(bounds, vec![("coder".to_string(), "PinA".to_string())]);
         assert!(!dir.join("roles").join("proj-pending.jsonl").exists());
@@ -3587,9 +3251,6 @@ mod tests {
             ),
             "inbox_error"
         );
-        // bd-xkte: the store is AHEAD of the binary the daemon shells, so
-        // every fetch refuses. The pin is fine and the fetch path is fine;
-        // the reason is actionable and must not dissolve into `inbox_error`.
         assert_eq!(
             super::inbox_fail_kind(
                 "toron: error: migrate: migration 14 is applied in \
@@ -3665,7 +3326,6 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let mut host = FileHost::new(cfg).with_tx(tx);
         host.refresh_index();
-        // Same context the daemon's Brain calls it in.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -3731,7 +3391,6 @@ mod tests {
         cfg.toron_bin = "true".into();
         cfg.plane_bin = script.to_string_lossy().into_owned();
         cfg.registry_file = Some(dir.join("agents").join("proj.json"));
-        // Capacity 1, prefilled: every PlaneStatus send goes Full.
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         tx.try_send(BrainMsg::Died).unwrap();
         let mut host = FileHost::new(cfg).with_tx(tx);
@@ -3750,7 +3409,6 @@ mod tests {
             4,
             "every Full send must be counted"
         );
-        // The filler never left: nothing the sweep sent got through.
         assert!(matches!(rx.try_recv(), Ok(BrainMsg::Died)));
         let body = std::fs::read_to_string(dir.join("doorbell").join("w.audit.jsonl")).unwrap();
         let rows = body.matches(AUDIT_PLANE_FULL).count();
@@ -3838,7 +3496,6 @@ mod tests {
     /// never reach it.
     #[test]
     fn inbox_fail_kind_matches_the_machine_marker() {
-        // Marker present, the sentence reworded: only the declared code counts.
         assert_eq!(
             super::inbox_fail_kind(
                 "toron: error: migrate: this store is newer than the binary \
@@ -3847,7 +3504,6 @@ mod tests {
             "inbox_store_skew",
             "the declared marker alone must classify, or the structural path is untested"
         );
-        // Marker absent: an installed toron older than the marker still counts.
         assert_eq!(
             super::inbox_fail_kind(
                 "toron: error: migrate: migration 14 is applied in /s/index.sqlite but this \
@@ -3856,7 +3512,6 @@ mod tests {
             "inbox_store_skew",
             "an older shelled toron still has to classify"
         );
-        // Neither: an ordinary path failure must not reach the class.
         assert_eq!(
             super::inbox_fail_kind(
                 "toron: error: daemon connect (is `toron serve --mcp-http` running?)"
@@ -3876,7 +3531,6 @@ mod tests {
         ensure_daemon_gen(&dir, "w");
         let host2 = FileHost::new(FileHostConfig::new(dir.clone(), "proj", "w"));
         assert!(host2.inject_allowed("PinA"), "matching gen allows");
-        // Corrupt the record: stale binary refuses wakes.
         let path = dir.join("doorbell").join("w.daemon.gen");
         let mut rec: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -4003,10 +3657,6 @@ mod tests {
         host.tx = Some(tokio::sync::mpsc::channel(64).0);
 
         rt.block_on(async {
-            // bd-watch-restart-metric-8dvf: the gate's own answer IS the
-            // honest metric (the brain journals a restart row only for `true`).
-            // One death restarted; the other 50 coalesced and must report that
-            // they did not, or the journal counts deaths.
             let mut took_the_slot = 0;
             if host.restart_wake() {
                 took_the_slot += 1;
@@ -4016,8 +3666,6 @@ mod tests {
                     took_the_slot += 1;
                 }
             }
-            // Let the single scheduled task reach its sleep; the burst is
-            // coalesced during the sleep, which is the window that matters.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             assert_eq!(
                 took_the_slot, 1,
@@ -4054,8 +3702,6 @@ mod tests {
 
         rt.block_on(async {
             host.restart_wake();
-            // The first backoff is 1s, so wait past it: the flag clears as the
-            // task wakes, and the NEXT death must be schedulable again.
             tokio::time::sleep(std::time::Duration::from_millis(1_400)).await;
             host.restart_wake();
         });
@@ -4071,24 +3717,6 @@ mod tests {
     }
 }
 
-// ---------------------------------------------------------------------------
-// bd-lorot: bounded audit log.
-//
-// The journal has a full retention discipline (512 KiB rotate gate,
-// RETENTION_LINES 5000, RETENTION_GENS 4, RETENTION_BYTES 5 MiB) and the AUDIT
-// log had NONE — it was a bare `OpenOptions::append` + `writeln!`. That is
-// exactly backwards: the audit log records every PER-ATTEMPT failure, so it is
-// the high-volume file, and it is what a repeating fault writes to. Measured
-// live (bd-kz54): one stale-socket respawn loop grew `flywheel-toron` to 14 GB
-// and the whole doorbell state dir to 26 GB — 65.5 M rows of one identical
-// failure, none of which said anything the first row did not.
-//
-// The journal is allowed to keep generations because it is the run record. The
-// audit log is diagnostics, so it is capped in place: keep the newest rows,
-// drop the rest. Retention is by BYTES as well as rows, because a pathological
-// row (a long error string) can blow a row budget on its own.
-// ---------------------------------------------------------------------------
-
 /// Hard cap on one workspace's audit log.
 pub const AUDIT_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
@@ -4096,9 +3724,6 @@ pub const AUDIT_MAX_BYTES: u64 = 5 * 1024 * 1024;
 /// age out on the same scale.
 pub const AUDIT_KEEP_LINES: usize = 4000;
 
-// bd-iyq5: a fence, not a test. Both sides are compile-time constants, so a
-// runtime assertion checked nothing a build would not — a keep-count of zero, or
-// one too big to fit the cap, must stop the BUILD rather than a test run.
 const _: () = {
     assert!(
         AUDIT_KEEP_LINES > 0,
@@ -4153,7 +3778,6 @@ pub fn rotate_audit_if_oversized(path: &Path) {
     if f.read_to_string(&mut buf).is_err() {
         return;
     }
-    // The seek almost certainly landed mid-row; drop through the first newline.
     let body = match buf.find('\n') {
         Some(i) => &buf[i + 1..],
         None => buf.as_str(),
@@ -4261,9 +3885,4 @@ mod audit_rotation_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // The keep-count fence moved to a `const` assertion beside the constants
-    // (bd-iyq5). Both sides were compile-time constants, so a `#[test]` that
-    // asserted them checked nothing a build would not — and clippy was right to
-    // say so. The fence survives; it just fails the BUILD now instead of a test
-    // run.
 }

@@ -68,10 +68,6 @@ pub fn resolve_cli_in(
 ) -> Option<PathBuf> {
     if let Some(paths) = path_env {
         for dir in std::env::split_paths(paths) {
-            // Interactive PATH lists mise shims first. A shim is a dispatcher
-            // (symlink to `mise`) that dies under launchd with "No version is
-            // set". Skip it here so the real cargo/local bin still wins; the
-            // shim remains the last-resort search below (bd-gpj0).
             if is_mise_shim_dir(&dir) {
                 continue;
             }

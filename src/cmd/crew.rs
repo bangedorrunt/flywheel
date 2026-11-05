@@ -42,20 +42,14 @@ pub(crate) enum ControlVerbCmd {
     Relaunch,
 }
 
-// ---- crew control (ADR-0010 D7) ----
-
 /// `flywheel crew` — preview + lifecycle control plane. Preview mirrors the
 /// `workflow crew <name>` report; control has NO arbitrary-text entry point
 /// (interrupt|exit|relaunch are the whole surface).
 pub(crate) fn cmd_crew(cfg: &Config, cmd: &CrewCmd) -> Result<()> {
     match cmd {
         CrewCmd::Preview { name } => {
-            // bd-xmq5: shared merge — the project tier now participates
-            // in crew preview like every other resolution path.
             let project_root = crate::project_dir(cfg, "flywheel");
             let all = crate::workflow_catalog::all_workflows_merged(Some(&project_root))?;
-            // P5: typed pick — exact, then unique prefix; unknown/ambiguous
-            // fail loud (nonzero exit), never a silent default.
             let picked = crate::workflow_catalog::pick_workflow(&all, name.as_str())
                 .map_err(|e| anyhow!("{e}"))?;
             let wf = &picked.0;
@@ -136,14 +130,9 @@ fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCm
             );
         }
         ControlVerbCmd::Exit => {
-            // terminal.kill — the agent goes with the terminal. Exit deliberately
-            // touches NOTHING else: reservations (toron leases) and dirty
-            // worktree files are preserved (control::EXIT_POSTCONDITION).
             c.terminal_kill(&a.pane_id)
                 .map(|_| ())
                 .with_context(|| format!("terminal.kill for {name} ({})", a.pane_id))?;
-            // Drop the finished record too: `hc ls --all` and the name space
-            // should not carry an exited crew member for the rest of the day.
             let _ = c.terminal_rm(&a.pane_id);
             println!(
                 "exited {name} ({}) — reservations + dirty files preserved",
@@ -170,24 +159,15 @@ fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCm
                 .get(profile)
                 .ok_or_else(|| anyhow!("unknown profile '{profile}' (flywheel profile list)"))?;
             let kind = old.harness.clone().unwrap_or_else(|| p.harness.clone());
-            // bd-crlx: the PLAN form, not the argv-only view. A harness whose
-            // interactive entrypoint has no model flag (opencode's root
-            // command) delivers its pin through the pane env, and this relaunch
-            // creates a fresh pane — so it must resolve before the env map is
-            // built, exactly as the spawn and crew paths do.
             let plan = crate::profile_launch_plan(&kind, p, None)?;
             let args = plan.args.clone();
 
-            // Journaled transaction: checkpoint → stop → launch → commit/rollback.
             crate::control::save_relaunch_journal(project, &old)?;
             c.terminal_kill(&a.pane_id)
                 .map(|_| ())
                 .with_context(|| format!("stop old terminal for {name} ({})", a.pane_id))?;
-            // The old record is done; the relaunch creates a fresh pane, so
-            // leaving a finished twin behind only confuses `ls --all`.
             let _ = c.terminal_rm(&a.pane_id);
 
-            // Fresh pane from the workspace root (same env contract as add).
             let panes = c.pane_list()?;
             let root = panes
                 .first()
@@ -225,8 +205,6 @@ fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCm
                         &name,
                         Duration::from_secs(15),
                     );
-                    // Published record wins even when the agent is unconfirmed
-                    // (relaunch_decide already committed on launch Ok).
                     let mut entries = crate::state::load_spawn_registry(project);
                     if let Some(e) = entries
                         .iter_mut()

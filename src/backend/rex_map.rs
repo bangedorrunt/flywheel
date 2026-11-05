@@ -6,8 +6,6 @@
 //!
 //! governed-by: ADR-0002
 
-// The mappers are the landing surface for the Rex adapter; nothing wires them
-// yet, and this is a bin crate where `pub` does not exempt dead code.
 #![allow(dead_code)]
 
 use serde_json::Value;
@@ -89,9 +87,6 @@ pub fn status_from_records(records_json: &str) -> AgentStatus {
 /// grammar, so an id outside the OSC id grammar drops the record, same as
 /// a malformed raw string. A discarded report changes nothing.
 fn apply_record(board: &mut Board, order: &mut Vec<String>, item: &Value) {
-    // ponytail: an object record is rendered as an OSC report so `osc7501`
-    // stays the only parser. The empty id is omitted: `id=` with no value
-    // is rejected by the parser and would lose the record.
     let raw;
     let text = match item {
         Value::String(text) => text.as_str(),
@@ -134,14 +129,12 @@ mod tests {
 
     #[test]
     fn osc_error_is_not_done() {
-        // The whole point of bd-i328: a failed program is Unknown.
         let failed = serde_json::json!([osc("state=error:app=freebuff")]).to_string();
         let status = status_from_records(&failed);
         assert_eq!(status, AgentStatus::Unknown);
         assert_ne!(status, AgentStatus::Done);
         assert_ne!(status, AgentStatus::Idle);
 
-        // An object record reads the same way, and error still is not done.
         assert_eq!(
             status_from_records(r#"[{"state":"error","app":"freebuff"}]"#),
             AgentStatus::Unknown
@@ -167,7 +160,6 @@ mod tests {
 
     #[test]
     fn blocked_child_outranks_a_working_root() {
-        // Attention: a blocked child beats a working root.
         let records = serde_json::json!([
             osc("state=working:app=deploy"),
             osc("state=blocked:id=eu-west:kind=permission"),
@@ -175,7 +167,6 @@ mod tests {
         .to_string();
         assert_eq!(status_from_records(&records), AgentStatus::Blocked);
 
-        // No root: a blocked child still blocks the terminal.
         let child_only = serde_json::json!([
             osc("state=working:id=us-east"),
             osc("state=blocked:id=eu-west"),
@@ -183,7 +174,6 @@ mod tests {
         .to_string();
         assert_eq!(status_from_records(&child_only), AgentStatus::Blocked);
 
-        // Clear is not a stored status: it drops the record it names.
         let cleared = serde_json::json!([
             osc("state=blocked:id=eu-west"),
             osc("state=clear:id=eu-west"),

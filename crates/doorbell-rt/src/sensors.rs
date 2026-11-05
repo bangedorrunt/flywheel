@@ -111,8 +111,6 @@ where
     let handle = tokio::spawn(async move {
         while let Some(item) = input.recv().await {
             if let Some(msg) = map(item) {
-                // `send().await` = natural backpressure: a slow brain parks
-                // this sensor instead of dropping silently.
                 if tx.send(msg).await.is_err() {
                     break;
                 }
@@ -142,7 +140,6 @@ mod tests {
         prod_tx.send("{\"kind\":9}".into()).await.unwrap();
         assert!(matches!(brain_rx.recv().await, Some(BrainMsg::Watch(_))));
         drop(prod_tx);
-        // Producer close lands as Degraded, tagged with the source.
         let mut saw_degraded = false;
         while let Some(m) = brain_rx.recv().await {
             if let BrainMsg::Degraded { source, .. } = m {
@@ -157,8 +154,6 @@ mod tests {
 
     #[tokio::test]
     async fn backpressure_parks_sender_never_drops() {
-        // Bounded brain inbox (cap 1): a slow brain parks the sensor;
-        // nothing is silently dropped — both sends eventually land.
         let (brain_tx, mut brain_rx) = mpsc::channel(1);
         let (prod_tx, prod_rx) = mpsc::channel(4);
         let _h = bridge("slow", brain_tx, prod_rx, |i: u8| {
@@ -168,8 +163,6 @@ mod tests {
         });
         prod_tx.send(1).await.unwrap();
         prod_tx.send(2).await.unwrap();
-        // Hold the first message without consuming: the bridge parks on the
-        // second send instead of dropping it.
         let first = tokio::time::timeout(std::time::Duration::from_secs(2), brain_rx.recv())
             .await
             .expect("first lands")

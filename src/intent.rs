@@ -143,7 +143,7 @@ pub fn detect_overlaps(intents: &[IntentView]) -> Vec<Overlap> {
     for (i, a) in intents.iter().enumerate() {
         for b in intents.iter().skip(i + 1) {
             if a.agent == b.agent {
-                continue; // same declarer — not an inter-crew overlap
+                continue;
             }
             if !overlaps(&a.path, &b.path) {
                 continue;
@@ -168,9 +168,7 @@ pub fn propose_split(a: &IntentView, b: &IntentView) -> SplitProposal {
     let paths = [a.path.clone(), b.path.clone()];
     let mut assignment = BTreeMap::new();
 
-    // Rule 3: MERGE — identical (or symmetric-glob-equivalent) path sets.
     if a.path == b.path {
-        // First declarer holds the merged set; the second stands down.
         assignment.insert(agents[0].clone(), a.path.clone());
         let rationale = format!(
             "identical path sets ({}) — {} holds the merged set, {} stands down",
@@ -188,8 +186,6 @@ pub fn propose_split(a: &IntentView, b: &IntentView) -> SplitProposal {
         };
     }
 
-    // Rule 2: SEQUENCE — strict containment: one intent's glob covers the
-    // other's. The covering crew finishes first, then the covered one.
     if glob_covers(&a.path, &b.path) || glob_covers(&b.path, &a.path) {
         let (first, second) = if glob_covers(&a.path, &b.path) {
             (a, b)
@@ -212,8 +208,6 @@ pub fn propose_split(a: &IntentView, b: &IntentView) -> SplitProposal {
         };
     }
 
-    // Rule 1: SPLIT BY DIRECTORY — common parent dir → each crew takes its
-    // own subpath (the shared boundary is the split line).
     if let Some(parent) = common_parent(&a.path, &b.path) {
         assignment.insert(agents[0].clone(), a.path.clone());
         assignment.insert(agents[1].clone(), b.path.clone());
@@ -234,7 +228,6 @@ pub fn propose_split(a: &IntentView, b: &IntentView) -> SplitProposal {
         };
     }
 
-    // No deterministic rule — the LLM planner arm (P10.1 headless run).
     SplitProposal {
         tier: "llm".into(),
         kind: ProposalKind::EscalateToPlanner,
@@ -261,7 +254,7 @@ pub fn run_detector(
     };
     for o in &overlaps {
         if !o.non_trivial {
-            continue; // trivial overlap: reported, never coalesced
+            continue;
         }
         let a = IntentView {
             agent: o.a.clone(),
@@ -274,7 +267,6 @@ pub fn run_detector(
             reason: String::new(),
         };
         report.proposals.push(propose_split(&a, &b));
-        // Auto-coalesce gate: non-trivial source + NEITHER crew affiliated.
         if !in_coalition(&o.a) && !in_coalition(&o.b) {
             report.auto_coalesce.push(o.clone());
         }
@@ -291,7 +283,6 @@ fn glob_covers(outer: &str, inner: &str) -> bool {
     }
     let a = outer.trim_end_matches('/');
     let b = inner.trim_end_matches('/');
-    // `src/**` covers `src/foo.rs`; `src/` covers `src/foo.rs`.
     if let Some(stripped) = a.strip_suffix("**") {
         let dir = stripped.trim_end_matches('/');
         return b.starts_with(&format!("{dir}/")) || b.starts_with(dir);
@@ -362,7 +353,7 @@ mod tests {
         let board = vec![
             iv("oc", "src/**"),
             iv("pi", "src/foo.rs"),
-            iv("oc", "docs/guide.md"), // same declarer — not a pair with itself
+            iv("oc", "docs/guide.md"),
         ];
         let overlaps = detect_overlaps(&board);
         assert_eq!(overlaps.len(), 1);
@@ -439,7 +430,6 @@ mod tests {
             1,
             "unaffiliated non-trivial pair"
         );
-        // One crew already affiliated → no auto-coalesce.
         let report2 = run_detector(&board, &|a| a == "oc");
         assert!(
             report2.auto_coalesce.is_empty(),
@@ -499,7 +489,6 @@ mod tests {
             "{:?}",
             report.proposals
         );
-        // gk's README overlap is trivial — not in the coalesce set.
         assert!(
             report.auto_coalesce.iter().all(|o| o.non_trivial),
             "coalesce set is non-trivial only: {:?}",

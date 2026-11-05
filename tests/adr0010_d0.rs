@@ -39,7 +39,6 @@ fn adr0010_d0_one_live_workspace_model() {
 fn check_file(name: &str, src: &str) {
     let needle = "WorkspaceModel::default()";
     let lines: Vec<&str> = src.lines().collect();
-    // current fn name + whether it is a #[test] fn, tracked as we scan
     let mut cur_fn = "<top>".to_string();
     let mut cur_test = false;
     for (idx, line) in lines.iter().enumerate() {
@@ -54,16 +53,6 @@ fn check_file(name: &str, src: &str) {
         if !line.contains(needle) {
             continue;
         }
-        // Replay folds (pure tick over journal + local render, no dispatcher,
-        // no binds, no writes) are not live owners: cmd_doorbell_why,
-        // cmd_doorbell_afk (bd-65he reverify: read-only digest render).
-        // Throwaway folds (GS-048 reclassify, bd-dv22): one synthetic
-        // MaterialContext tick over a Default-seeded model, rendered to
-        // stderr, model dropped. No dispatcher, no binds, no sends, no
-        // presence publish — the single scalar `save_session_topology`
-        // write converges with the live path (same file, same value
-        // domain) and is required for loop-less sticky-open; it produces
-        // no wake and owns nothing. Proven structurally below.
         let allowed = cur_test
             || cur_fn == "tick_loop_owner"
             || (name == "main.rs" && cur_fn == "cmd_internal_doorbell")

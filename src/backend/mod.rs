@@ -24,12 +24,8 @@
 //! Real impls override what they support (ADR-0002 §6 — open-to-extension).
 
 pub mod factory;
-// bd-mknvb: the plane that will actually serve, and why — one derivation for
-// the spawn arm, `backend list`, preflight, and the parity e2e.
 pub use factory::{Plane, resolve_plane};
 
-// The primary/fallback pair is constructed only by the superlogical "auto"
-// arm, so the module is compiled with that backend.
 #[cfg(feature = "backend-superlogical")]
 pub mod fallback;
 #[cfg(test)]
@@ -52,11 +48,6 @@ pub use toron_core::backend::Backend as MultiplexerBackend;
 #[cfg(test)]
 pub use toron_core::backend::PromptLanding;
 
-// ===========================================================================
-// Mail coordination surface (ADR-0007 D2 / R1, se2.3) — RE-EXPORTED from
-// toron-core, never redefined here. The local `MailBackend` trait was
-// deleted with se2.3; flywheel consumes `MailSurface` and its typed DTOs.
-// ===========================================================================
 #[allow(unused_imports)]
 pub use toron_core::index::slots::{BuildSlot, GrantedSlot, SlotConflict};
 #[allow(unused_imports)]
@@ -85,10 +76,6 @@ pub use toron_core::mailbox::surface::{
 #[allow(unused_imports)]
 pub use toron_core::mailbox::{AgentProfile, RegisteredAgent, WhoIs};
 
-// Factory entry points — consumers (the durable-loop leaf handlers in main.rs)
-// call `backend::multiplexer_backend(&cfg)` / `backend::mail_backend(&cfg)`;
-// `flywheel backend list/status` (bd-cli-backend-subcommand) uses the resolve_
-// and compiled_backends helpers.
 pub use factory::{
     compiled_backends, mail_backend, multiplexer_backend, resolve_backend_name, resolve_mail_name,
 };
@@ -273,11 +260,6 @@ mod off_runtime_tests {
 
 #[cfg(test)]
 mod trait_contract_tests {
-    // The unified `MultiplexerBackend` (= toron-core `Backend`) is proven
-    // object-safe + Unsupported-open by toron-core's own tests; `MailSurface`
-    // (= toron-core `mailbox::surface::MailSurface`) likewise. Here we keep
-    // the flywheel-side contract checks (factory constructability + re-export
-    // dyn-compile).
 
     use super::MultiplexerBackend;
 

@@ -12,7 +12,6 @@ fn adr0010_d15_worker_never_self_answers() {
     for needle in ["ask-user", "never answer", "self-answer"] {
         assert!(TPL.contains(needle), "peer-aware template missing {needle}");
     }
-    // Both stage bodies carry the policy (2 occurrences in stages.rs).
     let hits = STAGES.matches("ask-user").count();
     assert!(
         hits >= 2,
@@ -22,8 +21,6 @@ fn adr0010_d15_worker_never_self_answers() {
 
 #[test]
 fn adr0010_d15_restore_vs_expand_routing() {
-    // Restorations auto-decide; expansions escalate with five elements and
-    // park in OPEN DECISIONS via Publish corr + WaitCorr.
     for needle in [
         "restoration",
         "expansion",
@@ -42,8 +39,6 @@ fn adr0010_d15_restore_vs_expand_routing() {
 
 #[test]
 fn adr0010_d15_self_close_stays_loudmiss() {
-    // Worker-side auto-close of an ask-user finding is a LoudMiss —
-    // the existing tick rule (unknown corr) that D15 closes through.
     assert!(
         WORKSPACE.contains("HumanDecision for unknown corr"),
         "tick must LoudMiss answers to unknown corrs"

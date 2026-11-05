@@ -148,7 +148,6 @@ mod tests {
     fn write_then_find_roundtrips() {
         let _g = crate::config::lock_env();
         let dir = std::env::temp_dir().join(format!("fw-runlog-{}", uuid::Uuid::new_v4()));
-        // env mutation is unsafe in edition 2024 (matches stages.rs tests)
         unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
         let entry = sample_entry("hl-1");
         write_run(&entry).expect("write");
@@ -162,7 +161,6 @@ mod tests {
     fn cron_attribution_roundtrips() {
         let _g = crate::config::lock_env();
         let dir = std::env::temp_dir().join(format!("fw-runlog-{}", uuid::Uuid::new_v4()));
-        // env mutation is unsafe in edition 2024 (matches stages.rs tests)
         unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
         let mut entry = sample_entry("hl-cron-1");
         entry.cron = Some("weekly-x".into());
@@ -178,7 +176,6 @@ mod tests {
     fn read_runs_lists_all_entries_newest_first() {
         let _g = crate::config::lock_env();
         let dir = std::env::temp_dir().join(format!("fw-runlog-{}", uuid::Uuid::new_v4()));
-        // env mutation is unsafe in edition 2024 (matches stages.rs tests)
         unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
         let mut old = sample_entry("hl-a");
         old.ts = "2026-08-09T09:00:00Z".into();
@@ -197,7 +194,6 @@ mod tests {
     fn find_returns_none_for_unknown() {
         let _g = crate::config::lock_env();
         let dir = std::env::temp_dir().join(format!("fw-runlog-{}", uuid::Uuid::new_v4()));
-        // env mutation is unsafe in edition 2024 (matches stages.rs tests)
         unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
         assert!(find_run("nope").is_none());
     }
@@ -208,7 +204,6 @@ mod tests {
     fn failures_since_respects_cutoff_and_keeps_error() {
         let _g = crate::config::lock_env();
         let dir = std::env::temp_dir().join(format!("fw-runlog-{}", uuid::Uuid::new_v4()));
-        // env mutation is unsafe in edition 2024 (matches stages.rs tests)
         unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
         let mut fail_old = sample_entry("hl-fail-old");
         fail_old.ts = "2026-08-09T08:00:00Z".into();

@@ -39,10 +39,6 @@ pub fn kernel_millis(d: std::time::Duration) -> toron_core::kernel::Duration {
     toron_core::kernel::Duration::from_millis(d.as_millis().min(u64::MAX as u128) as u64)
 }
 
-// The shared journal executor owns the pool construction
-// (`effect_journal`, 4 workers and a 4096 bound pinned by its own test);
-// this module keeps no second constructor beside it.
-
 /// The classifier as a framework `Program`: the model is the briefing
 /// snapshot, a `Classify` message folds into one `DecideCmd`, and the
 /// outcome comes back as `Classified`. Nothing here reads the clock, the
@@ -104,9 +100,6 @@ impl Program for DecideProgram {
     }
 
     fn failure(_failure: &Failure<String>) -> DecideMsg {
-        // No outcome is dropped: a non-success outcome re-enters the fold as
-        // a fresh classification of the empty target (the default row),
-        // which always terminates in one `Classified`.
         DecideMsg::Classify {
             target: String::new(),
         }
@@ -165,7 +158,6 @@ mod tests {
 
     #[test]
     fn dropped_command_value_performs_no_io() {
-        // Building the fold output must not run it: drop without running.
         let out = DecideProgram::update(
             &Snapshot::default(),
             &DecideMsg::Classify {
@@ -260,7 +252,7 @@ mod tests {
             })
             .expect("send folds");
         assert!(path.exists(), "the journal reached disk");
-        drop(loop_); // Crash: no shutdown, no snapshot.
+        drop(loop_);
 
         let rt = test_runtime();
         let log: Arc<dyn DurableLog> = Arc::new(FileLog::open(&path).expect("reopen log"));
@@ -288,13 +280,9 @@ mod tests {
         )
         .expect("boot runs init");
 
-        // Init is quiet: the default snapshot, no commands.
         assert_eq!(loop_.model(), &Snapshot::default());
         assert!(loop_.in_flight().is_empty());
 
-        // One Classify folds to one command, the interpreter completes it as
-        // Classified, and the fold settles quiet: model unchanged, nothing
-        // left in flight, and the run agrees with `decide`.
         loop_
             .send(DecideMsg::Classify {
                 target: "loop work".into(),

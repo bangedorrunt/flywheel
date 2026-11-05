@@ -75,7 +75,6 @@ where
         "unknown" => Ok(ClaimSupportStatus::Unknown),
         "unsupported" => Ok(ClaimSupportStatus::Unsupported),
         "worker_asserted" => Ok(ClaimSupportStatus::WorkerAsserted),
-        // Worker JSON may claim this status, but cannot admit itself.
         "independently_supported" => Ok(ClaimSupportStatus::WorkerAsserted),
         _ => Err(serde::de::Error::unknown_variant(
             &s,
@@ -122,14 +121,10 @@ pub struct ArtifactRecord {
     pub pin: String,
 }
 
-// `new`/`admit`/`is_admitted` are reached only from tests in this binary
-// (`admit` is the embedding's VERIFY-sink action, driven through the sink
-// surface), so gate the impl with its callers rather than shipping dead code.
 #[cfg(test)]
 impl ArtifactRecord {
     /// Create a new record, computing sha256 from the file at `path`.
     /// Returns an error if the file cannot be read.
-    // One positional per recorded field; the record IS the field list.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         path: PathBuf,
@@ -145,8 +140,6 @@ impl ArtifactRecord {
         pin: String,
     ) -> anyhow::Result<Self> {
         let sha256 = compute_sha256(&path)?;
-        // Enforce grounding: if path+sha256 present, grounding should be Cited/Grounded, not Ungrounded
-        // But we allow the caller to set it; the stitcher will flag Ungrounded loudly.
         let claim_support_status = match claim_support_status {
             ClaimSupportStatus::IndependentlySupported => ClaimSupportStatus::WorkerAsserted,
             other => other,
@@ -611,10 +604,6 @@ fn stitch_artifacts_in(
                 let content = std::fs::read_to_string(&path)?;
                 match serde_json::from_str::<ArtifactRecord>(&content) {
                     Ok(rec) => records.push(rec),
-                    // Not every json in a run dir is a typed artifact: the
-                    // composed path stores the run's outcome as terminal.json.
-                    // Read it as plain JSON so stitch names what it found
-                    // instead of dying on a serde field error (bd-mdp9).
                     Err(not_artifact) => match serde_json::from_str(&content) {
                         Ok(value) => non_artifacts.push(NonArtifactRecord {
                             file: path
@@ -634,8 +623,6 @@ fn stitch_artifacts_in(
     }
     records.sort_by(|a, b| a.node_id.cmp(&b.node_id));
     non_artifacts.sort_by(|a, b| a.file.cmp(&b.file));
-    // The same root as the records above: reading evidence from the ambient
-    // root here would stitch a different tree than the one being stitched.
     let evaluations = read_evaluation_evidence_in(root, project, run_id)?;
 
     let stitched_path = base.join("stitched.md");
@@ -927,11 +914,6 @@ mod tests {
 
     #[test]
     fn evaluation_evidence_rejects_tampering_and_round_trips_through_state() {
-        // One injected data root for write, read and stitch. The TempDir is
-        // the cleanup: it is removed on drop, so a failing assertion leaves
-        // nothing behind, and nothing lands under the operator's
-        // `dirs::data_local_dir()` (this test used to write there and clean
-        // up only when it passed).
         let xdg = xdg_root();
         let root = xdg.path();
         let project = format!("evaluation-test-{}", uuid::Uuid::new_v4());
@@ -1068,12 +1050,8 @@ mod tests {
 
     #[test]
     fn artifacts_cli_list_and_stitch() {
-        // Simulates `flywheel artifacts <run_id> [--json]` + `stitch`
         let project = format!("artifacts-cli-test-{}", uuid::Uuid::new_v4());
         let run_id = "run-artifacts-cli-1";
-        // bd-ww75: injected data root, same reason as the other stitch tests —
-        // the ambient XDG root is mutable by other tests in this binary, and this
-        // module is #![forbid(unsafe_code)] so it cannot pin the env itself.
         let xdg = xdg_root();
         let base = xdg
             .path()
@@ -1120,7 +1098,6 @@ mod tests {
     #[test]
     fn artifacts_cli_stitch_exists_at_expected_path() {
         assert!(PathBuf::from("src/artifact.rs").exists());
-        // Verify the function exists and is callable (compile check)
         let _ = stitch_artifacts as fn(&str, &str) -> anyhow::Result<PathBuf>;
     }
 
@@ -1129,13 +1106,6 @@ mod tests {
     /// Stitch must report the outcome instead of dying on a serde field error.
     #[test]
     fn stitch_reports_a_terminal_only_run_instead_of_a_serde_error() {
-        // bd-ww75: an INJECTED data root, not the ambient one. This test used
-        // to resolve `dirs::data_local_dir()` at call time while other tests in
-        // this binary mutate XDG_DATA_HOME, so the read could land under a
-        // different root than the fixture was written to — it passed alone and
-        // failed in a full suite run. This module is #![forbid(unsafe_code)],
-        // so pinning the env here is not even an option; injection is both the
-        // only route and the better one.
         let xdg = xdg_root();
         let project = format!("artifacts-terminal-test-{}", uuid::Uuid::new_v4());
         let _cleanup = ProjectCleanup(project.clone());
@@ -1147,7 +1117,6 @@ mod tests {
             .join("artifacts")
             .join(run_id);
         std::fs::create_dir_all(&base).unwrap();
-        // The exact shape write_terminal_artifact stores, ANSI escapes included.
         std::fs::write(
             base.join("terminal.json"),
             r#"{
@@ -1181,7 +1150,6 @@ mod tests {
     /// records list as before, the outcome in its own section.
     #[test]
     fn stitch_keeps_typed_records_alongside_a_terminal_outcome() {
-        // bd-ww75: same injected root as the terminal-only test above.
         let xdg = xdg_root();
         let project = format!("artifacts-mixed-test-{}", uuid::Uuid::new_v4());
         let _cleanup = ProjectCleanup(project.clone());

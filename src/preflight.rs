@@ -17,8 +17,6 @@ use crate::config::Config;
 use crate::hc_support::{Client, WorktreeInfo};
 use crate::mail::Mail;
 
-// ─── types ───────────────────────────────────────────────────────────────────
-
 /// One check result.
 #[derive(Debug, Clone)]
 pub struct Check {
@@ -175,40 +173,23 @@ impl Mode {
     }
 }
 
-// ─── runner ──────────────────────────────────────────────────────────────────
-
 /// Run preflight checks. Returns ALL results (does not short-circuit — an
 /// agent sees every failure, not just the first).
 pub fn run(cfg: &Config, mode: Mode, project: Option<&str>) -> Vec<Check> {
     let mut checks = Vec::new();
 
-    // 1. pane plane alive (cheapest meaningful check) — skipped for modes
-    //    that never touch panes (cron is store-side only). Asks the SELECTED
-    //    backend, never a hardcoded hc socket: rex answering is PASS with
-    //    hc absent; hc answering is PASS (the fallback works).
     if mode.needs_project || mode.needs_beads || mode.needs_mail {
         checks.push(check_pane_plane(cfg));
     }
 
-    // 2. durable engine store answers (park + wake). The old vendor health
-    //    check was replaced by the capability probe (bd-flywheel-probe-qjay);
-    //    the store is local sqlite.
     checks.push(check_engine());
 
-    // 2b. doorbell daemon (durability ask; supersedes bd-0gmw's advisory
-    //     SKIP): a configured [doorbell] url makes the loop DEFER to that
-    //     daemon, so "configured but not serving" is an OUTAGE and fails
-    //     loud with the reason, the unit, the port, and the remedy. No
-    //     section means embedded mode — an honest SKIP.
     checks.push(check_doorbell(cfg));
 
-    // 3. br binary on PATH — only bead-driven modes (matches the Mode doc:
-    //    "Cron (headless): needs the engine store only")
     if mode.needs_beads {
         checks.push(check_br());
     }
 
-    // 4. project directory exists
     if mode.needs_project {
         if let Some(p) = project {
             checks.push(check_project_dir(cfg, p));
@@ -217,17 +198,12 @@ pub fn run(cfg: &Config, mode: Mode, project: Option<&str>) -> Vec<Check> {
         }
     }
 
-    // 4b. bd-uona: the panes this project allocated can still host an agent.
-    //     A plane ping alone cannot see a reaped crew workspace, so a reaped
-    //     workspace once read PASS while every dispatched agent died on the
-    //     readiness wait.
     if mode.needs_project
         && let Some(p) = project
     {
         checks.push(check_pane_materializable(cfg, p));
     }
 
-    // 5. .beads/ exists (--work mode only)
     if mode.needs_beads {
         if let Some(p) = project {
             checks.push(check_beads(cfg, p));
@@ -239,18 +215,12 @@ pub fn run(cfg: &Config, mode: Mode, project: Option<&str>) -> Vec<Check> {
         }
     }
 
-    // 6. operator key (for toron-privileged ops)
     checks.push(check_operator_key());
 
-    // 7. toron mail health
     if mode.needs_mail {
         checks.push(check_mail(cfg));
     }
 
-    // 8. ADR-0019 Spec 3.3: no extra linked worktree in the project
-    //    workspace (loop run / workflow run --execute). `--allow-worktree`
-    //    is the operator-only opt-out (refused without an operator key,
-    //    logged at the call site).
     if mode.needs_worktree {
         if mode.allow_worktree {
             if worktree_optout_legal(mode.allow_worktree, operator_key_configured()) {
@@ -274,15 +244,10 @@ pub fn run(cfg: &Config, mode: Mode, project: Option<&str>) -> Vec<Check> {
         }
     }
 
-    // 9. ADR-0019 Spec 2: standing orders exist for the dispatched agent —
-    //    global (generated on first run) or the project fence.
     if mode.needs_standing_orders {
         checks.push(check_standing_orders(cfg, project));
     }
 
-    // 10. ADR-0019 Spec 6 (`subtract-before-you-add`): a playbook run must
-    //     not create *V2* / *_improved* / *_enhanced* new files (the repo
-    //     no-proliferation convention, now enforced at preflight).
     if mode.needs_playbook_files {
         if let Some(p) = project {
             checks.push(check_playbook_files(cfg, p));
@@ -359,8 +324,6 @@ pub fn to_json(checks: &[Check]) -> Value {
         }).collect::<Vec<_>>(),
     })
 }
-
-// ─── individual checks (cheapest first) ──────────────────────────────────────
 
 /// The pane-plane check asks the SELECTED backend (`multiplexer_backend`
 /// plus a real `agent_list`), never a hardcoded hc socket: rex answering
@@ -448,12 +411,6 @@ fn check_br() -> Check {
 }
 
 fn check_project_dir(cfg: &Config, project: &str) -> Check {
-    // bd-adr22-loop-preflight: resolve through project_dir (slug keys join
-    // the workspace root; absolute paths pass through). The literal
-    // Path::new(project) form broke BOTH spellings: a slug arg only passed
-    // when cwd happened to contain it, and an absolute-path arg then failed
-    // the slug-keyed swarm lookup (worktree check) — the two checks
-    // demanded different keys.
     let dir = crate::project_dir(cfg, project);
     if dir.exists() {
         Check::pass("project-dir")
@@ -461,8 +418,6 @@ fn check_project_dir(cfg: &Config, project: &str) -> Check {
         Check::fail("project-dir", format!("{project} does not exist"))
     }
 }
-
-// ─── pane materialization (bd-uona) ──────────────────────────────────────────
 
 /// A registry PIN is an entry that CLAIMED a pane at spawn — a bound
 /// `mail_identity`. A legacy name-only row binds a name to a pane id without
@@ -517,8 +472,6 @@ fn check_pane_materializable(cfg: &Config, project: &str) -> Check {
             "no registry pins — nothing allocated to host",
         );
     }
-    // The SELECTED pane plane, never a hardcoded hc socket: rex answers
-    // with hc absent, hc answers through the fallback.
     let backend = match crate::backend::multiplexer_backend(cfg) {
         Ok(b) => b,
         Err(e) => {
@@ -538,8 +491,6 @@ fn check_pane_materializable(cfg: &Config, project: &str) -> Check {
     if pane_materializable(pins.len(), hosted) {
         return Check::pass("pane-materializable");
     }
-    // The plane hosts none of the allocated panes: name the plane that was
-    // asked (rex primary, hc fallback) rather than an hc workspace id.
     let via = backend.name();
     Check::fail(
         "pane-materializable",
@@ -698,7 +649,6 @@ pub fn is_forbidden_filename(name: &str) -> bool {
     if lower.contains("v2") {
         return true;
     }
-    // version suffix `v<digits>` at the end of the stem (foo_v3, fooV4)
     if let Some(stem) = Path::new(name).file_stem() {
         let s = stem.to_string_lossy().to_ascii_lowercase();
         let stripped = s.trim_end_matches(|c: char| c.is_ascii_digit());
@@ -726,8 +676,6 @@ pub fn scan_new_forbidden_files(dir: &Path) -> Vec<String> {
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|line| {
-            // porcelain: `XY path` — X = index status, Y = worktree status.
-            // New files are `??` (untracked) or index `A` (staged add).
             let code = line.get(..2).unwrap_or("");
             let is_new = code == "??" || code.starts_with('A');
             if !is_new {
@@ -735,7 +683,7 @@ pub fn scan_new_forbidden_files(dir: &Path) -> Vec<String> {
             }
             let path = line.get(3..).unwrap_or("").trim();
             if path.is_empty() || path.starts_with('"') {
-                return None; // quoted paths (spaces) — out of scope for the scan
+                return None;
             }
             is_forbidden_filename(path).then(|| path.to_string())
         })
@@ -766,7 +714,6 @@ pub fn check_standing_orders_at(global: &Path, fence: Option<&Path>) -> Check {
     if fence.is_some_and(std::path::Path::exists) {
         return Check::pass("standing-orders");
     }
-    // first run: generate the global, then require it present
     match crate::standing_orders::regen_global(global) {
         Ok(()) => Check::pass("standing-orders"),
         Err(e) => Check::fail(
@@ -817,27 +764,15 @@ fn env_nonempty_trimmed(name: &str) -> bool {
 }
 
 pub fn check_provider_funded(provider: &str, profile: &str) -> Check {
-    // GS-037 P0-4: louder provider preflight for opencode-go — name the env
-    // vars (never values). Fail-closed when neither key has a non-empty
-    // trimmed value; empty/whitespace exports must NOT invent commercial PASS.
     if provider.eq_ignore_ascii_case("opencode-go") || provider.eq_ignore_ascii_case("opencode") {
-        // GS-040 PF-EMPTY-KEY-PASS: var_os().is_some() is insufficient —
-        // `export OPENCODE_API_KEY=` must not Pass.
         let api = env_nonempty_trimmed("OPENCODE_API_KEY");
         let go = env_nonempty_trimmed("OPENCODE_GO_API_KEY");
         if !api && !go {
-            // GS-039 P2: refuse fail-open commercially — missing/empty keys
-            // are a hard fail (not SKIP theater). Export OPENCODE_GO_API_KEY
-            // (primary) or OPENCODE_API_KEY before funded spawn.
             return Check::fail(
                 "provider-funded",
                 "opencode-go/opencode: neither OPENCODE_API_KEY nor OPENCODE_GO_API_KEY is set — refuse fail-open (GS-039 P2). Export one (flywheel aliases GO→API into pane env).",
             );
         }
-        // GS-040 PF-GO-ONLY-SKIP: documented primary path is OPENCODE_GO_API_KEY
-        // alone (alias GO→API into pane env at spawn). GO-only with a non-empty
-        // trimmed key is commercial PASS — not Skip theater. API-only / both
-        // also PASS.
         return Check::pass("provider-funded");
     }
     let env_key = format!("FLYWHEEL_FUNDED_BALANCE_{}", provider.to_ascii_uppercase());
@@ -871,9 +806,6 @@ fn provider_funded_checks(_cfg: &Config, project: Option<&str>) -> Vec<Check> {
     use std::collections::BTreeSet;
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut providers: Vec<(String, String)> = Vec::new();
-    // GS-040 PF-SLOT-RESOLVE-OK-SWALLOW: load routing once. If any profile
-    // needs @slot resolve and routing is corrupt, fail-loud — never .ok()-
-    // swallow into silent "no funded endpoint" SKIP (fail-open invent-green).
     let needs_slot = catalog
         .profiles
         .values()
@@ -891,14 +823,8 @@ fn provider_funded_checks(_cfg: &Config, project: Option<&str>) -> Vec<Check> {
         Err(_) => None,
     };
     for (name, profile) in &catalog.profiles {
-        // GS-040: default profiles pin provider in the model id
-        // (`opencode-go/muse-…`) while `profile.provider` stays empty
-        // (ADR-0007). Derive provider from model prefix when unset so
-        // funded-key checks actually run instead of SKIP theater.
         let mut prov = profile.provider.trim().to_string();
         if prov.is_empty() {
-            // Resolve @slot aliases (coder → @standard → opencode-go/muse-…)
-            // then take the provider/ half of the composite model id.
             let model_id = if profile.model.starts_with('@') {
                 match routing
                     .as_ref()
@@ -906,8 +832,6 @@ fn provider_funded_checks(_cfg: &Config, project: Option<&str>) -> Vec<Check> {
                 {
                     Some(m) => m,
                     None => {
-                        // GS-040: @slot present but unresolved — fail-loud,
-                        // never silent SKIP "no funded endpoint".
                         return vec![Check::fail(
                             "provider-funded",
                             format!(
@@ -955,8 +879,6 @@ pub fn check_loop_identity(_cfg: &Config, project: Option<&str>) -> Check {
         )
     }
 }
-
-// ─── tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -1154,8 +1076,6 @@ mod tests {
         assert!(!out.contains("failed"));
     }
 
-    // ---- bd-w3-preflight-m15j: standing orders + playbook file scan ----
-
     /// The no-proliferation patterns: *V2* (case-insensitive), version
     /// suffix v[0-9]+, *_improved*, *_enhanced*.
     #[test]
@@ -1173,7 +1093,6 @@ mod tests {
         ] {
             assert!(is_forbidden_filename(bad), "{bad} must be rejected");
         }
-        // negative cases — normal new files pass
         for good in [
             "main.rs",
             "auth.rs",
@@ -1218,7 +1137,6 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("so-unwritable-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // a FILE where the config dir should be -> create_dir_all/write fails
         let blocker = dir.join("config");
         std::fs::write(&blocker, "not a dir").unwrap();
         let global = blocker.join("standing-orders.md");
@@ -1273,8 +1191,6 @@ mod tests {
 
     #[test]
     fn provider_funded_no_endpoint_is_skip_with_honest_reason() {
-        // Serialize env + clear balance override so a parallel zero-balance
-        // test (or ambient FLYWHEEL_FUNDED_BALANCE_ZAI) cannot invent Fail.
         let _g = crate::config::lock_env();
         unsafe { std::env::remove_var("FLYWHEEL_FUNDED_BALANCE_ZAI") };
         let c = check_provider_funded("zai", "coder");
@@ -1286,7 +1202,6 @@ mod tests {
 
     #[test]
     fn gs040_opencode_keys_present_passes() {
-        // Behavioral: non-empty API key → Pass (never print key values).
         let _g = crate::config::lock_env();
         let prev_api = std::env::var_os("OPENCODE_API_KEY");
         let prev_go = std::env::var_os("OPENCODE_GO_API_KEY");
@@ -1314,7 +1229,6 @@ mod tests {
 
     #[test]
     fn gs040_empty_opencode_api_key_must_not_pass() {
-        // PF-EMPTY-KEY-PASS: empty / whitespace export must NOT invent Pass.
         let _g = crate::config::lock_env();
         let prev_api = std::env::var_os("OPENCODE_API_KEY");
         let prev_go = std::env::var_os("OPENCODE_GO_API_KEY");
@@ -1349,7 +1263,6 @@ mod tests {
 
     #[test]
     fn gs040_go_only_nonempty_must_pass() {
-        // PF-GO-ONLY-SKIP: OPENCODE_GO_API_KEY alone (primary path) → Pass.
         let _g = crate::config::lock_env();
         let prev_api = std::env::var_os("OPENCODE_API_KEY");
         let prev_go = std::env::var_os("OPENCODE_GO_API_KEY");
@@ -1377,8 +1290,6 @@ mod tests {
 
     #[test]
     fn gs040_slot_resolve_does_not_ok_swallow_routing() {
-        // PF-SLOT-RESOLVE-OK-SWALLOW: no load_routing().ok() swallow; fail-loud
-        // when @slot cannot resolve.
         let src = include_str!("preflight.rs");
         let start = src
             .find("fn provider_funded_checks")
@@ -1389,7 +1300,6 @@ mod tests {
                 && !body.contains("load_routing()\n                    .ok()"),
             "provider_funded_checks must not .ok()-swallow load_routing Err"
         );
-        // Also reject the chained form used before the fix.
         assert!(
             !body.contains(
                 "load_routing()\n                    .ok()\n                    .and_then"
@@ -1476,17 +1386,14 @@ mod tests {
             .output()
             .expect("git init");
         assert!(init.status.success(), "git init");
-        // normal new file -> passes
         std::fs::write(dir.join("auth.rs"), "// ok\n").unwrap();
         assert!(
             scan_new_forbidden_files(&dir).is_empty(),
             "normal new file passes the scan"
         );
-        // fooV2.rs -> fails, naming the file
         std::fs::write(dir.join("fooV2.rs"), "// v2\n").unwrap();
         let bad = scan_new_forbidden_files(&dir);
         assert_eq!(bad, vec!["fooV2.rs".to_string()], "rejects the V2 file");
-        // staged add also flagged (git add)
         let add = std::process::Command::new("git")
             .args(["add", "fooV2.rs"])
             .current_dir(&dir)
@@ -1500,8 +1407,6 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    // ---- bd-uona: the compose door and the pane it materializes ----
 
     /// bd-uona (1): `workflow compose --run` ALLOCATES hc terminals, so it must
     /// sit behind the same preflight gate as an executing run. It was the one
@@ -1559,25 +1464,19 @@ mod tests {
     /// hosted is the only failing shape.
     #[test]
     fn preflight_gate_pane_materializable_fails_only_on_zero_hosted_pins() {
-        // The live failure: 12 pins, hc hosts none of them.
         assert!(
             !pane_materializable(12, 0),
             "pins with zero hosted panes is dispatch-impossible and must fail"
         );
-        // The healthy fleet caught mid-work: every pane busy is HEALTHY, a
-        // durable queue holds the wake. One hosted pane clears the gate.
         assert!(
             pane_materializable(12, 1),
             "one hosted pin is materializable — a busy fleet is not a failure"
         );
         assert!(pane_materializable(12, 12), "the whole fleet is up");
-        // Partial reaping: one of three survived — dispatch can still land.
         assert!(
             pane_materializable(3, 1),
             "a partially reaped fleet can still host a dispatch"
         );
-        // Nothing allocated: there is no pane to materialize, so the check
-        // has no evidence to fail on (the caller SKIPs, it does not FAIL).
         assert!(
             pane_materializable(0, 0),
             "no pins means no claim, not a broken claim"
@@ -1634,8 +1533,6 @@ esac
     #[cfg(feature = "backend-superlogical")]
     #[test]
     fn pane_plane_passes_over_fake_rex_with_plane_absent() {
-        // The guard holds the env lock, so the FLYWHEEL_BACKEND mutation
-        // below is serialized with every other env-mutating test.
         let _guard = crate::backend::superlogical::RexBinGuard::install(PANE_HC_FAKE_REX);
         unsafe { std::env::set_var("FLYWHEEL_BACKEND", "superlogical") };
         let cfg = crate::config::Config::default();
@@ -1669,8 +1566,6 @@ esac
     fn pane_materializable_reads_the_selected_plane_not_a_plane_socket() {
         let _guard = crate::backend::superlogical::RexBinGuard::install(PANE_HC_FAKE_REX);
         unsafe { std::env::set_var("FLYWHEEL_BACKEND", "superlogical") };
-        // Hermetic XDG state comes with the guard: the registry below lands
-        // in a temp dir, never the operator's real state.
         let project = "pane-plane-materializable-probe";
         let registry = vec![crate::state::SpawnEntry::with_mail_identity(
             "block:fake-1",

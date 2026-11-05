@@ -125,7 +125,6 @@ mod adv5_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn died_delivered_under_full_channel() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<BrainMsg>(1);
-        // Fill: next try_send Watch / Died would be Full.
         tx.try_send(BrainMsg::Watch("fill".into())).expect("fill");
         assert!(
             tx.try_send(BrainMsg::Watch("x".into())).is_err(),
@@ -138,12 +137,9 @@ mod adv5_tests {
 
         let tx_b = tx.clone();
         let join = std::thread::spawn(move || {
-            // Mirror watch-reader fail path: stop would run first in prod;
-            // here we only assert Died delivery.
             deliver_died_blocking(&tx_b);
         });
 
-        // Drain filler so blocking_send can complete.
         match rx.recv().await {
             Some(BrainMsg::Watch(_)) => {}
             other => panic!("expected filler Watch, got {other:?}"),
@@ -173,12 +169,10 @@ mod adv5_tests {
         tx.try_send(BrainMsg::Watch("fill".into())).unwrap();
 
         let mut stamps = crate::watchbeat::spawn_stamp_threads(dir.clone(), ws.into());
-        // Simulate reader: try_send fails → do NOT on_event; stop + Died.
         let line = "watch-line".to_string();
         match tx.try_send(BrainMsg::Watch(line)) {
             Ok(()) => panic!("expected Full"),
             Err(_) => {
-                // Correct path: no stamps.on_event() here.
                 stamps.stop();
             }
         }
@@ -186,13 +180,10 @@ mod adv5_tests {
             crate::watchbeat::last_event_ms(&dir, ws).is_none(),
             ".event must stay absent when Watch enqueue failed"
         );
-        // Contrast: had we stamped before the failed send, .event would exist.
-        // (document the failing-path contract without mutating stamps above.)
 
-        // Died delivery off the runtime thread (blocking_send).
         let tx_b = tx.clone();
         let join = std::thread::spawn(move || deliver_died_blocking(&tx_b));
-        let _ = rx.recv().await; // filler
+        let _ = rx.recv().await;
         assert!(matches!(rx.recv().await, Some(BrainMsg::Died)));
         join.join().expect("deliver thread");
         let _ = std::fs::remove_dir_all(&dir);

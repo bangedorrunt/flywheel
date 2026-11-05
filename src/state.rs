@@ -267,16 +267,6 @@ fn sidecar_file(project: &str) -> PathBuf {
     loops_dir().join(format!("{}.json", state_key(project)))
 }
 
-// ---- bd-registry-key-split-b65y: one registry file per physical project ----
-//
-// Callers pass EITHER spelling of a project — bare name ("toron", from CLI
-// flags) or absolute path ("/Users/x/toron", from `project_dir_str`) — and
-// the old verbatim-vs-slug split put them in two files, so a wrong-form
-// reader silently saw an empty registry. Canonical rule mirrors
-// main::project_dir: relative names resolve under the workspace root; a
-// key is derived only when that resolved directory actually EXISTS, so
-// test fixtures and virtual labels keep today's verbatim keys.
-
 static REGISTRY_ROOT_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
 fn effective_registry_root() -> PathBuf {
@@ -306,8 +296,6 @@ pub fn spawn_registry_key_with(root: &Path, project: &str) -> String {
         root.join(project)
     };
     if resolved.is_dir() {
-        // The path string itself feeds state_key — byte-stable with every
-        // slug file an absolute-path caller ever wrote.
         state_key(&resolved.to_string_lossy())
     } else {
         state_key(project)
@@ -686,7 +674,7 @@ pub fn remove_expected_reply(project: &str, agent: &str, thread: &str) -> Result
     let before = entries.len();
     entries.retain(|e| !(e.agent == agent && e.thread == thread));
     if entries.len() == before {
-        return Ok(()); // nothing to do
+        return Ok(());
     }
     save_expected_replies(project, &entries)
 }
@@ -720,8 +708,6 @@ fn fold_legacy_alias(
             merged.push(row);
         }
     }
-    // Durable convergence: canonical now carries everything; delete the
-    // alias so it cannot resurrect the split.
     let _ = std::fs::write(
         agents_dir().join(format!("{canonical_key}.json")),
         serde_json::to_string_pretty(&merged).unwrap_or_else(|_| "[]".into()),
@@ -775,14 +761,6 @@ pub fn load_spawn_registry(project: &str) -> Vec<SpawnEntry> {
     if !merged.is_empty() {
         return dedupe_spawn_entries(merged);
     }
-    // bd-enov (F12): the state-dir registry reads EMPTY — a lost/rebuilt state
-    // dir or a `close` that cleared it — while the project-local mirror
-    // (`.flywheel/agent-names.json`) still holds the pane→pin bindings the
-    // panes POST with. Without this fallback `--to <pin>` cannot resolve a
-    // LIVE crew pane and the miss reads as "no agents match", sending the
-    // operator back to hc slugs (`crew-<run>-<role>`) — the exact F12
-    // regression. The mirror lives INSIDE the project, so it survives the
-    // state loss that is the whole reason it exists.
     load_agent_names(&project_dir_hint(project))
 }
 
@@ -898,7 +876,6 @@ pub fn save_captain_alias(project: &str, pin: &str) -> Result<()> {
 pub fn clear_captain_alias_file(project: &str) {
     let path = captain_alias_file(project);
     let _ = std::fs::remove_file(&path);
-    // best-effort: also remove empty dir
 }
 
 pub fn is_captain_alias_cleared(project: &str) -> bool {
@@ -995,11 +972,6 @@ pub fn resolve_captain_target(project: &str, to: &str) -> Result<String> {
     Ok(to.to_string())
 }
 
-// ---- Msg journal (ADR-0025 Spec 3 Wave 3) ----
-// Every LoopMsg driven into tick is journaled (kind + payload) as JSONL
-// under the flywheel state dir. The journal is display for `loop why`
-// and replay source for `loop replay` (identical actions asserted).
-
 pub fn loop_journal_file(project: &str) -> PathBuf {
     state_dir()
         .join("journals")
@@ -1034,9 +1006,6 @@ pub fn journal_loop_msg(
         .append(true)
         .open(&path)?;
     writeln!(f, "{}", serde_json::to_string(&entry)?)?;
-    // Bounded retention: if the journal exceeds 5 MiB, keep the last 5k
-    // lines (approx 1 MiB of recent history). `loop why` needs history but
-    // not unbounded growth — a runaway loop must not fill the disk.
     if let Ok(meta) = std::fs::metadata(&path)
         && meta.len() > 5 * 1024 * 1024
         && let Ok(raw) = std::fs::read_to_string(&path)
@@ -1075,16 +1044,10 @@ fn ensure_loops_migrated() -> Result<()> {
     }
     let raw = std::fs::read_to_string(&legacy)?;
     let (prior_schema, map) = parse_loops_registry(&raw);
-    // Distinguish "no content" (valid JSON object, zero loop entries) from
-    // "corrupt" (parse failure or non-object): only absence is lossless to
-    // delete. Corrupt files keep the rename-backup path below.
     let parses_as_object = serde_json::from_str::<serde_json::Value>(&raw)
         .map(|v| v.is_object())
         .unwrap_or(false);
     if map.is_empty() && parses_as_object {
-        // Empty legacy registry (e.g. `{}` or `{"schema":2}` after a clean
-        // shutdown): nothing to preserve — delete it so repeat migrations
-        // stop littering loops.json.migrated-* files (bd-fw-loop-status-stale-hjn).
         match std::fs::remove_file(&legacy) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1093,8 +1056,6 @@ fn ensure_loops_migrated() -> Result<()> {
         return Ok(());
     }
     if prior_schema < LOOPS_SCHEMA_VERSION {
-        // Genuine v1 content (not absence — absence returns above): keep the
-        // audit signal, now reworded for the sidecar split (l4s.2).
         eprintln!(
             "flywheel: migrating loops.json v{prior_schema} → v{LOOPS_SCHEMA_VERSION} (split into per-project sidecars)"
         );
@@ -1118,10 +1079,6 @@ fn ensure_loops_migrated() -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    // Sweep stale migration backups (litter fix): the sidecars hold the
-    // content, so the NEWEST .migrated-* marker is the single recoverable
-    // backup; older ones are duplicates of the same legacy file. Names are
-    // epoch seconds — fixed width, so lexicographic order is chronological.
     if let Ok(rd) = std::fs::read_dir(legacy.parent().expect("legacy path has a parent dir")) {
         let mut markers: Vec<PathBuf> = rd
             .filter_map(std::result::Result::ok)
@@ -1132,8 +1089,6 @@ fn ensure_loops_migrated() -> Result<()> {
                     .unwrap_or(false)
             })
             .collect();
-        // newest = largest epoch suffix; parse numerically (not lexicographic —
-        // timestamps are not fixed-width across eras).
         markers.sort_by_key(|p| {
             p.file_name()
                 .map(|n| {
@@ -1168,7 +1123,7 @@ pub fn load_loops_registry() -> Result<(u32, BTreeMap<String, ActiveLoop>)> {
         let entry = entry?;
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue; // skips *.json.tmp writers mid-flight
+            continue;
         }
         let Some(project) = path.file_stem().and_then(|s| s.to_str()).map(String::from) else {
             continue;
@@ -1203,7 +1158,7 @@ pub fn parse_loops_registry(raw: &str) -> (u32, BTreeMap<String, ActiveLoop>) {
         .get(LOOPS_SCHEMA_KEY)
         .and_then(serde_json::Value::as_u64)
         .map(|n| n as u32)
-        .unwrap_or(1); // missing schema → v1
+        .unwrap_or(1);
 
     let mut loops = BTreeMap::new();
     for (k, v) in obj {
@@ -1328,7 +1283,7 @@ pub fn xproj_seen_unmark(project: &str, message_id: &str) -> Result<()> {
     let raw = std::fs::read_to_string(&path)?;
     let remaining: Vec<&str> = raw.lines().filter(|l| l.trim() != message_id).collect();
     if remaining.len() == raw.lines().count() {
-        return Ok(()); // not marked — nothing to do
+        return Ok(());
     }
     crate::fs_util::atomic_write(&path, remaining.join("\n").as_bytes())
 }
@@ -1391,8 +1346,8 @@ mod reserved_log_sweep_tests {
             "flywheel.jsonl".to_string(),
             "miss-ledger.jsonl".to_string(),
             "bd-cvv9-test.jsonl".to_string(),
-            "notalog.txt".to_string(),    // no .jsonl suffix
-            "flywheel.jsonl".to_string(), // duplicate
+            "notalog.txt".to_string(),
+            "flywheel.jsonl".to_string(),
         ];
         let got = project_log_names(names);
         assert_eq!(
@@ -1442,15 +1397,6 @@ mod reserved_log_sweep_tests {
 pub fn project_checkpoint_dir(project: &str) -> PathBuf {
     state_dir().join("checkpoints").join(state_key(project))
 }
-
-// ---- last-sent registry (bd-last-sent-registry) ----
-//
-// Per-project sidecar (NOT the shared loops.json — that file is written by
-// any loop on any project; a per-project file keeps writers disjoint and
-// atomic-write races impossible). Records what the `__send` leaf actually
-// delivered, so a crash between hc's landing and the effect checkpoint
-// can be deduplicated on resume (bd-resume-dedup). Single-writer per project
-// (the loop; `promise_pending` guards against concurrent loops).
 
 /// One delivered (or attempted) prompt send.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1515,16 +1461,6 @@ pub fn save_last_sent(project: &str, records: &[SentRecord]) -> Result<()> {
     Ok(())
 }
 
-// ---- state file lock (bd-state-cas-fpwq) ----
-//
-// The map writers below used to do load -> mutate -> write -> rename with no
-// mutual exclusion. Two writers (a loop pass and a captain `send`, say) each
-// load the same snapshot and the second rename wins: the first writer's key is
-// gone and nothing reported an error. A sibling `<file>.lock` created with
-// `create_new` makes the whole read-modify-write atomic. A lock older than
-// `STALE_LOCK` is litter from a crashed writer, so it is stolen rather than
-// wedging the file forever.
-
 /// Total wall-clock wait before a blocked writer gives up. Small on purpose:
 /// bookkeeping must never stall a loop pass for long.
 ///
@@ -1576,7 +1512,6 @@ impl StateLock {
         if let Some(parent) = lock.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Two steals at most: a third crash inside 10s is not a lock problem.
         for _ in 0..3 {
             match std::fs::OpenOptions::new()
                 .write(true)
@@ -1593,8 +1528,6 @@ impl StateLock {
                             .unwrap_or_default()
                     );
                     if let Err(e) = std::io::Write::write_all(&mut file, token.as_bytes()) {
-                        // The token is the ownership proof: a lock we cannot
-                        // stamp is a lock we do not own.
                         let _ = std::fs::remove_file(&lock);
                         return Err(e.into());
                     }
@@ -1623,8 +1556,6 @@ impl StateLock {
 
 impl Drop for StateLock {
     fn drop(&mut self) {
-        // bd-0gup: only remove the path while it is STILL ours — a lock that
-        // was taken under us belongs to somebody else now.
         if self.still_ours() {
             let _ = std::fs::remove_file(&self.path);
         }
@@ -1646,12 +1577,6 @@ pub(crate) fn update_locked<T: Default + Serialize + serde::de::DeserializeOwned
     path: &Path,
     op: impl FnOnce(&mut T),
 ) -> Result<()> {
-    // rv23 #5: writers in THIS process queue on a per-file mutex first, so the
-    // lock-file poll below only ever races other processes. Without it, eight
-    // threads polling one lock file starve each other: a waiter that backs off
-    // loses every round to the thread that just released and re-acquires at
-    // once (measured: 266 of 320 runs failed under a 32-way load). The mutex
-    // holder's own wait is bounded by LOCK_WAIT, so the queue is bounded too.
     let file_mutex = in_process_lock(path);
     let _in_process = file_mutex.lock().unwrap_or_else(|p| p.into_inner());
     let started = std::time::Instant::now();
@@ -1663,11 +1588,6 @@ pub(crate) fn update_locked<T: Default + Serialize + serde::de::DeserializeOwned
                 .and_then(|raw| serde_json::from_str(&raw).ok())
                 .unwrap_or_default();
             op(&mut value);
-            // bd-0gup: VERIFY the lock is still ours before writing. The
-            // stale-steal is not atomic with the metadata read, so a lock can
-            // be taken under us while we hold it; writing then would clobber
-            // the new owner's state. A writer that lost the lock errors out
-            // instead — the same rule the lock wait already follows.
             if !guard.still_ours() {
                 bail!(
                     "state file {} lost its lock to another writer (the lock was taken under us) — refusing to clobber it",
@@ -1754,18 +1674,10 @@ pub fn load_pane_starvation(project: &str) -> BTreeMap<String, u32> {
 /// callers log and continue on error.
 pub fn record_pane_starvation(project: &str, starved: &BTreeMap<String, u32>) -> Result<()> {
     let path = pane_starvation_file(project);
-    // bd-722a: write it under the shared state lock, like its sibling
-    // `record_resume`. The old code wrote a FIXED temp path with no lock, so
-    // two concurrent passes interleaved their bytes into one file and
-    // `load_pane_starvation` read the wreckage as an EMPTY map — the counter
-    // reset. `update_locked` takes the lock and names the temp file per
-    // process, so the rename is atomic against the other writer.
     update_locked(&path, |map: &mut BTreeMap<String, u32>| {
         *map = starved.clone();
     })
 }
-
-// ---- bd-work-attempts-m5x6: durable work-attempt store ----
 
 /// Bound on the per-project attempt registry. Generations accumulate per
 /// bead (superseded rows stay readable), so the cap is generous — and like
@@ -1796,10 +1708,6 @@ pub fn load_work_attempts(project: &str) -> Vec<crate::durable::WorkAttempt> {
 /// accumulate — a supersede writes the marked old row AND the replacement,
 /// so both stay readable. Best-effort by contract: callers log and continue
 /// on error.
-//
-// bd-work-attempts-m5x6: no call site yet — the loop records through
-// `record_attempt_resume`; this is the general write a steer supersede will
-// use. `expect` fails once one is wired.
 #[cfg_attr(
     not(test),
     expect(
@@ -1859,10 +1767,6 @@ pub fn record_attempt_resume(
                 .filter(|a| a.bead_id == bead && a.pane == pane)
                 .max_by_key(|a| a.generation)
             {
-                // Refresh the live generation: same work, new evidence. A
-                // superseded row is never refreshed — its replacement owns
-                // the bead (defensive: max generation is live by
-                // construction, but a corrupt file could disagree).
                 if live.status != WorkAttemptStatus::Superseded {
                     live.updated_us = now_us;
                     if corr.is_some() {
@@ -1902,8 +1806,6 @@ pub fn trim_last_sent(records: &mut Vec<SentRecord>) {
         records.drain(0..drop);
     }
 }
-
-// ---- loop process registry (bd-fw-stale-loop-processes-gac) ----
 
 /// One entry in the live-loop pid registry (`loop-pids.json`). The registry
 /// exists so a second `flywheel loop run <project>` refuses to start while a live
@@ -2397,7 +2299,6 @@ mod loops_schema_v2_tests {
         assert!(a.event_cursor.is_none());
         assert!(a.escalation.is_empty());
         assert!(a.respawn.is_empty());
-        // base params intact
         assert_eq!(a.params["project"], "/tmp/proj-a");
     }
 
@@ -2407,7 +2308,6 @@ mod loops_schema_v2_tests {
         assert_eq!(schema, 1);
 
         let body = serialize_loops_registry(&map).unwrap();
-        // written body is always current schema version (v3 after mail_health)
         let written: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(written["schema"], LOOPS_SCHEMA_VERSION);
 
@@ -2420,7 +2320,6 @@ mod loops_schema_v2_tests {
         assert_eq!(a1.id, a2.id);
         assert_eq!(a1.params, a2.params);
         assert_eq!(a1.created, a2.created);
-        // fresh control fields after v1→v2
         assert!(a2.event_cursor.is_none());
         assert!(a2.escalation.is_empty());
         assert!(a2.respawn.is_empty());
@@ -2432,7 +2331,7 @@ mod loops_schema_v2_tests {
         escalation.insert(
             "AgentOne".into(),
             EscalationState {
-                first_blocked_ts: 1_700_000_000_000_000, // µs, ctx.now-shaped
+                first_blocked_ts: 1_700_000_000_000_000,
                 ping_count: 2,
                 last_ping_tier: None,
                 last_tail: "stuck on cargo".into(),
@@ -2486,8 +2385,6 @@ mod loops_schema_v2_tests {
 
     #[test]
     fn forward_tolerance_v1_shaped_struct_ignores_v2_fields() {
-        // A v1-shaped deserializer (only base fields) must still load a v2
-        // entry — serde ignores unknown fields without deny_unknown_fields.
         #[derive(Debug, Deserialize)]
         struct ActiveLoopV1 {
             id: String,
@@ -2548,7 +2445,7 @@ mod loops_schema_v2_tests {
         mh.record_failure(300);
         assert_eq!(mh.consecutive_failures, 3);
         assert!(mh.should_escalate(3));
-        assert!(!mh.should_escalate(0)); // 0 disables
+        assert!(!mh.should_escalate(0));
         mh.record_success(400);
         assert_eq!(mh.consecutive_failures, 0);
         assert_eq!(mh.last_ok_ts, 400);
@@ -2569,7 +2466,6 @@ mod loops_schema_v2_tests {
 
     #[test]
     fn mail_health_v3_roundtrip_and_v2_backcompat() {
-        // v3 round-trip
         let mut al = ActiveLoop::new("swarm-loop:/tmp/p", json!({}), "now");
         al.mail_health = MailHealth {
             consecutive_failures: 2,
@@ -2585,7 +2481,6 @@ mod loops_schema_v2_tests {
         assert_eq!(got.mail_health.consecutive_failures, 2);
         assert_eq!(got.mail_health.last_ok_ts, 999);
         assert!(got.mail_degraded);
-        // v2 back-compat: old JSON without mail_health should load with defaults
         let v2_body = json!({
             "schema": 2,
             "/tmp/q": {
@@ -2624,7 +2519,6 @@ mod loops_schema_v2_tests {
 
     #[test]
     fn mail_health_loop_start_errors_without_key() {
-        // Loop-identity fail-loud: without a usable key, preflight and swarm_loop start should Fail
         let _g = crate::config::lock_env();
         unsafe { std::env::remove_var("TORON_OPERATOR_KEY") };
         let home =
@@ -2701,7 +2595,6 @@ mod tests {
         let _g = crate::config::test_state_home();
         let project = "starvation-locked";
         let path = pane_starvation_file(project);
-        // Another writer holds the lock (a fresh lock file is not stale).
         let lock = lock_path(&path);
         if let Some(parent) = lock.parent() {
             std::fs::create_dir_all(parent).unwrap();
@@ -2741,7 +2634,6 @@ mod tests {
             tail.last().unwrap().contains("\"n\":999"),
             "the newest line must be last: {tail:?}"
         );
-        // A byte window smaller than the file still yields whole lines only.
         let windowed = read_tail_lines(&path, 10, 64).expect("windowed tail");
         assert!(
             windowed
@@ -2768,7 +2660,6 @@ mod tests {
         let guard = StateLock::try_acquire(&path)
             .expect("acquire")
             .expect("free lock");
-        // Someone else took the lock: the path now names a DIFFERENT file.
         let lock = lock_path(&path);
         std::fs::remove_file(&lock).unwrap();
         std::fs::write(&lock, b"someone-else").unwrap();
@@ -2795,7 +2686,6 @@ mod tests {
         let path = dir.join("counter.json");
         let err = update_locked(&path, |v: &mut u64| {
             *v += 1;
-            // Another writer takes the lock under us, mid-update.
             std::fs::write(lock_path(&path), b"another-owner").unwrap();
         })
         .expect_err("a writer that lost its lock must not write");
@@ -2826,8 +2716,8 @@ mod tests {
             let entries = vec![
                 entry("flywheel-flywheel-oc", Some("FoggyDesert")),
                 entry("flywheel-flywheel-omp", Some("NobleMoose")),
-                entry("flywheel-flywheel-oc2", Some("FoggyDesert")), // dup identity
-                entry("legacy-no-id", None),                         // falls back to name
+                entry("flywheel-flywheel-oc2", Some("FoggyDesert")),
+                entry("legacy-no-id", None),
             ];
             let out = crew_recipients(&entries, Some("FoggyDesert"));
             assert_eq!(
@@ -2964,9 +2854,6 @@ mod tests {
     #[test]
     fn civil_from_unix_leap_boundary() {
         assert_eq!(civil_from_unix(951_782_400), (2000, 2, 29, 0, 0, 0));
-        // u64::MAX as i64 == -1 → 1969-12-31T23:59:59Z (the cast is intended:
-        // civil time of the pre-epoch second; callers never pass it, but the
-        // conversion must not panic)
         assert_eq!(civil_from_unix(u64::MAX), (1969, 12, 31, 23, 59, 59));
     }
 
@@ -2975,7 +2862,6 @@ mod tests {
         let iso = now_iso();
         assert!(iso.len() == 20 && iso.ends_with('Z'), "iso = {iso}");
         assert_eq!(iso.chars().nth(10), Some('T'));
-        // compact ts has millisecond resolution: same second, different ms → different filenames
         assert_ne!(compact_ts(1_700_000_000, 1), compact_ts(1_700_000_000, 2));
         assert_eq!(compact_ts(1_700_000_000, 42), "20231114-221320042");
     }
@@ -2992,7 +2878,6 @@ mod tests {
 
     #[test]
     fn analytics_counts() {
-        // construct entries manually
         let a = Analytics {
             sends: 3,
             checkpoints: 1,
@@ -3032,11 +2917,6 @@ mod tests {
         assert_eq!(*a.by_day.values().next().unwrap(), 10);
         assert!(a.first_event.is_some(), "first event recorded");
         assert!(a.last_event.is_some(), "last event recorded");
-        // bd-e81g: ten rapid writes normally share one ts (second
-        // resolution), but under a loaded suite they can straddle a second
-        // boundary and the strict equality below flakes. Pin the
-        // resolution, not the wall clock: first <= last, at most one
-        // second apart.
         let t0 = chrono::DateTime::parse_from_rfc3339(a.first_event.as_deref().unwrap())
             .expect("first ts parses")
             .timestamp();
@@ -3048,7 +2928,6 @@ mod tests {
             "same-or-adjacent second: {t0} vs {t1}"
         );
 
-        // read_log round-trip: every written entry comes back.
         let entries = read_log(&project).unwrap();
         assert_eq!(entries.len(), 10);
         assert_eq!(entries[0].kind, EventKind::Send);
@@ -3081,8 +2960,6 @@ mod tests {
         assert_ne!(p1, p2, "ms-resolution names never collide");
         let list = list_checkpoints(&project).unwrap();
         assert_eq!(list.len(), 2);
-        // Equal-second saves share `ts`, so sort order is not guaranteed —
-        // assert the SET of messages + per-entry fields.
         let mut msgs: Vec<&str> = list.iter().map(|c| c.message.as_str()).collect();
         msgs.sort_unstable();
         assert_eq!(msgs, vec!["first snapshot", "second snapshot"]);
@@ -3116,13 +2993,9 @@ mod last_sent_tests {
 
     #[test]
     fn fnv1a64_is_stable_and_distinct() {
-        // same input, same value — byte-identical across processes/releases
         assert_eq!(fnv1a64("prompt A"), fnv1a64("prompt A"));
         assert_eq!(fnv1a64(""), fnv1a64(""));
-        // known vector (FNV-1a 64 offset basis + prime applied to "a")
-        // 0xaf63dc4c8601ec8c is the canonical FNV-1a 64 of the byte 'a'
         assert_eq!(fnv1a64("a"), 0xaf63dc4c8601ec8c);
-        // distinct inputs must not collide trivially
         assert_ne!(fnv1a64("prompt A"), fnv1a64("prompt B"));
     }
 
@@ -3131,7 +3004,6 @@ mod last_sent_tests {
         let mut v: Vec<SentRecord> = (0..60).map(|i| rec("a", i, "inv", true, false)).collect();
         trim_last_sent(&mut v);
         assert_eq!(v.len(), 50);
-        // FIFO: the oldest (0..10) dropped, the newest (10..60) kept
         assert_eq!(v[0].text_hash, 10);
         assert_eq!(v[49].text_hash, 59);
     }
@@ -3145,14 +3017,10 @@ mod last_sent_tests {
 
     #[test]
     fn load_save_roundtrip() {
-        let _g = crate::config::test_state_home(); // 193.2: never touch the real state dir
+        let _g = crate::config::test_state_home();
         let dir =
             std::env::temp_dir().join(format!("flywheel-lastsent-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        // the state dir is fixed by state_dir(); we test through the real file
-        // path machinery by temporarily pointing LAST_SENT at a temp dir —
-        // instead, exercise record_sent/load_last_sent against a fake project
-        // name that collides with nothing, then clean the file up.
         let project = "__test_roundtrip__";
         let _ = std::fs::remove_file(last_sent_file(project));
         record_sent(project, rec("a", 1, "inv1", true, false)).unwrap();
@@ -3226,8 +3094,6 @@ mod last_sent_tests {
 
     #[test]
     fn run_log_classifies_pending_failed_and_owner() {
-        // Mirrors the P6.3 digest semantics: run-kind entries classify as
-        // pending / failed and carry an owner, non-run kinds are ignored.
         let entries = [
             LogEntry {
                 ts: "2026-08-08T01:00:00Z".into(),
@@ -3247,7 +3113,6 @@ mod last_sent_tests {
                 project: "demo".into(),
                 data: serde_json::json!({ "loop": "nightly", "status": "failed" }),
             },
-            // non-run kind: not a run
             LogEntry {
                 ts: "2026-08-08T01:15:00Z".into(),
                 kind: EventKind::Send,
@@ -3290,7 +3155,6 @@ mod last_sent_tests {
             .count();
         assert_eq!(failed, 1, "failed loop classified");
 
-        // Owner extraction: workflow / pipeline / loop payload field.
         let owners: Vec<&str> = runs
             .iter()
             .map(|e| {
@@ -3315,9 +3179,6 @@ mod loops_sidecar_tests {
     use serde_json::json;
 
     fn loops_test_guard() -> crate::config::TestStateHome {
-        // 193.2: hermetic XDG_STATE_HOME (holds the crate-wide env lock) —
-        // the REAL state dir is shared with production loops; a leftover
-        // fixture there re-triggers the sidecar migration mid-suite.
         crate::config::test_state_home()
     }
 
@@ -3359,17 +3220,14 @@ mod loops_sidecar_tests {
         let p1 = test_project("mig-a");
         let p2 = test_project("mig-b");
         let legacy = loops_file();
-        // snapshot pre-test state (restore at the end)
         let pre_legacy = std::fs::read_to_string(&legacy).ok();
         let pre_markers = loops_dir_markers();
-        // fixture: legacy shared v2 file with 2 projects
         let mut map = BTreeMap::new();
         map.insert(p1.clone(), make_loop(&p1, 1));
         map.insert(p2.clone(), make_loop(&p2, 2));
         let body = serialize_loops_registry(&map).unwrap();
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         std::fs::write(&legacy, body).unwrap();
-        // migrate via read
         let (_schema, loaded) = load_loops_registry().unwrap();
         assert_eq!(
             loaded
@@ -3393,7 +3251,6 @@ mod loops_sidecar_tests {
             2,
             "p2 survives migration"
         );
-        // legacy renamed + sidecars written
         assert!(!legacy.exists(), "legacy shared file renamed away");
         assert!(sidecar_file(&p1).exists(), "p1 sidecar written");
         assert!(sidecar_file(&p2).exists(), "p2 sidecar written");
@@ -3401,7 +3258,6 @@ mod loops_sidecar_tests {
             .into_iter()
             .any(|n| !pre_markers.contains(&n));
         assert!(new_marker, "loops.json.migrated-<ts> marker created");
-        // restore: my sidecars + my marker go; legacy returns to prior state
         for p in [&p1, &p2] {
             let _ = std::fs::remove_file(sidecar_file(p));
             let _ = std::fs::remove_file(sidecar_file(p).with_extension("json.tmp"));
@@ -3430,7 +3286,6 @@ mod loops_sidecar_tests {
         let pre_markers = loops_dir_markers();
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         std::fs::write(&legacy, "{\"schema\":2}").unwrap();
-        // migrate via read
         let (_schema, loaded) = load_loops_registry().unwrap();
         assert!(loaded.is_empty());
         assert!(!legacy.exists(), "empty legacy deleted, not renamed");
@@ -3439,7 +3294,6 @@ mod loops_sidecar_tests {
             pre_markers,
             "no new .migrated-* marker for empty content"
         );
-        // corrupt content is NOT deleted (keeps the recoverable rename path)
         std::fs::write(&legacy, "{not json").unwrap();
         let (_schema, loaded) = load_loops_registry().unwrap();
         assert!(loaded.is_empty());
@@ -3451,7 +3305,6 @@ mod loops_sidecar_tests {
             .into_iter()
             .any(|n| !pre_markers.contains(&n));
         assert!(new_marker, "corrupt legacy keeps a .migrated-* marker");
-        // restore
         for n in loops_dir_markers() {
             if !pre_markers.contains(&n) {
                 let _ = std::fs::remove_file(loops_file().parent().unwrap().join(&n));
@@ -3475,7 +3328,6 @@ mod loops_sidecar_tests {
         let pre_legacy = std::fs::read_to_string(&legacy).ok();
         let pre_markers = loops_dir_markers();
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        // seed old litter + a legacy file with real content
         for ts in [1000u64, 2000, 3000] {
             std::fs::write(
                 legacy.with_file_name(format!("loops.json.migrated-{ts}")),
@@ -3488,7 +3340,6 @@ mod loops_sidecar_tests {
         std::fs::write(&legacy, serialize_loops_registry(&map).unwrap()).unwrap();
         let (_schema, loaded) = load_loops_registry().unwrap();
         assert_eq!(loaded.len(), 1, "content migrated");
-        // exactly ONE marker remains (the newest = the one just created)
         let markers = loops_dir_markers();
         assert_eq!(
             markers.len(),
@@ -3507,7 +3358,6 @@ mod loops_sidecar_tests {
                 && !new_markers[0].contains("migrated-3000"),
             "seeded old litter gone: {new_markers:?}"
         );
-        // restore
         let _ = std::fs::remove_file(sidecar_file(&p1));
         let _ = std::fs::remove_file(sidecar_file(&p1).with_extension("json.tmp"));
         for n in loops_dir_markers() {
@@ -3571,14 +3421,12 @@ mod loops_sidecar_tests {
         let entries = vec![mk("oc", "t1"), mk("oc", "t2"), mk("pi", "t1")];
         save_expected_replies(&p, &entries).unwrap();
         assert_eq!(load_expected_replies(&p), entries);
-        // remove one (agent, thread) pair only
         remove_expected_reply(&p, "oc", "t1").unwrap();
         let left = load_expected_replies(&p);
         assert_eq!(left.len(), 2);
         assert!(!left.iter().any(|e| e.agent == "oc" && e.thread == "t1"));
         assert!(left.iter().any(|e| e.agent == "oc" && e.thread == "t2"));
         assert!(left.iter().any(|e| e.agent == "pi" && e.thread == "t1"));
-        // missing file → empty; corrupt → empty
         assert_eq!(
             load_expected_replies("l4s1-no-such-project"),
             [] as [ExpectedReply; 0]
@@ -3586,7 +3434,6 @@ mod loops_sidecar_tests {
         let path = expected_reply_file(&p);
         std::fs::write(&path, "{not json").unwrap();
         assert_eq!(load_expected_replies(&p), [] as [ExpectedReply; 0]);
-        // cleanup
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("json.tmp"));
     }
@@ -3654,10 +3501,8 @@ mod loops_sidecar_tests {
         ];
         save_spawn_registry(&p, &entries).unwrap();
         assert_eq!(load_spawn_registry(&p), entries);
-        // overwrite atomically
         save_spawn_registry(&p, &entries[..1]).unwrap();
         assert_eq!(load_spawn_registry(&p), entries[..1]);
-        // missing → empty; corrupt → empty
         assert_eq!(
             load_spawn_registry("l4s1-no-such-project"),
             [] as [SpawnEntry; 0]
@@ -3665,12 +3510,9 @@ mod loops_sidecar_tests {
         let path = spawn_registry_file(&p);
         std::fs::write(&path, "{not json").unwrap();
         assert_eq!(load_spawn_registry(&p), [] as [SpawnEntry; 0]);
-        // cleanup
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("json.tmp"));
     }
-
-    // ---- bd-registry-key-split-b65y: one registry file per physical project ----
 
     #[test]
     fn registry_key_converges_name_and_path_of_one_dir() {
@@ -3680,8 +3522,6 @@ mod loops_sidecar_tests {
         let by_name = spawn_registry_key_with(&root, "regsplit-proj");
         let by_path = spawn_registry_key_with(&root, &proj.to_string_lossy());
         assert_eq!(by_name, by_path, "one dir must hash to one key");
-        // scratch dirs sharing a base name stay distinct (the reason the
-        // slug hash exists at all)
         let nested = root.join("nested");
         std::fs::create_dir_all(nested.join("regsplit-proj")).unwrap();
         assert_ne!(
@@ -3689,7 +3529,6 @@ mod loops_sidecar_tests {
             by_name,
             "distinct dirs must stay distinct"
         );
-        // fictional projects keep the verbatim legacy key
         assert_eq!(spawn_registry_key_with(&root, "no-such-dir"), "no-such-dir");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3729,8 +3568,6 @@ mod loops_sidecar_tests {
         std::fs::create_dir_all(&abs).unwrap();
         let _override = set_registry_root_override(root.clone());
 
-        // Pre-fix writer: verbatim-name file holding the pinned entry
-        // (the host evidence shape: toron.json with flywheel-toron-oc3).
         let pinned = vec![SpawnEntry::legacy("wF:p9", "flywheel-toron-oc3")];
         std::fs::create_dir_all(agents_dir()).unwrap();
         let legacy_path = agents_dir().join(format!("{}.json", state_key("regsplit-fold")));
@@ -3745,7 +3582,6 @@ mod loops_sidecar_tests {
             !legacy_path.exists(),
             "fold must migrate the alias away — two live spellings is the defect"
         );
-        // convergence is durable: the canonical file now carries the rows
         assert_eq!(load_spawn_registry(&abs.to_string_lossy()), pinned);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3765,11 +3601,9 @@ mod loops_sidecar_tests {
         assert!(agent_names_file(&dir).ends_with(".flywheel/agent-names.json"));
         assert!(agent_names_file(&dir).starts_with(&dir));
         assert_eq!(load_agent_names(&dir), entries);
-        // missing → empty
         let empty_dir =
             std::env::temp_dir().join(format!("fw-agent-names-none-{}", std::process::id()));
         assert_eq!(load_agent_names(&empty_dir), [] as [SpawnEntry; 0]);
-        // cleanup
         let _ = std::fs::remove_file(agent_names_file(&dir));
         let _ = std::fs::remove_file(dir.join(".flywheel").join("agent-names.json.tmp"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3788,7 +3622,6 @@ mod loops_sidecar_tests {
         std::fs::create_dir_all(&proj).unwrap();
         let key = proj.to_string_lossy().into_owned();
 
-        // Mirror holds the crew pins the panes post with; state registry empty.
         let mirror = vec![
             SpawnEntry::with_mail_identity("w13:p5", "crew-x-coder", "SwiftBadger"),
             SpawnEntry::with_mail_identity("w13:p8", "crew-x-reviewer", "BrightCoast"),
@@ -3800,7 +3633,6 @@ mod loops_sidecar_tests {
             "empty state registry must fall back to the project-local mirror"
         );
 
-        // A live state registry wins; the mirror does not leak stale rows in.
         let live = vec![SpawnEntry::with_mail_identity(
             "w14:p1",
             "flywheel-proj-coder",
@@ -3847,8 +3679,6 @@ mod loops_sidecar_tests {
             raw.contains("skills_injected"),
             "skills_injected column serialized (bd-eign.10): {raw}"
         );
-        // a P10.3-style file WITHOUT the harness column (pre-bd-lvyi) still
-        // deserializes — harness: None
         std::fs::write(
             &legacy_path,
             r#"[{"pane_id":"w8:p1","name":"crew-wf-planner-1","profile":"planner"}]"#,
@@ -3886,7 +3716,6 @@ mod loops_sidecar_tests {
         );
         assert!(loaded.iter().all(|e| e.profile.is_none()));
         assert!(loaded.iter().all(|e| e.harness.is_none()));
-        // cleanup
         let _ = std::fs::remove_file(&legacy_path);
         let _ = std::fs::remove_file(legacy_path.with_extension("json.tmp"));
     }
@@ -3910,8 +3739,6 @@ mod loops_sidecar_tests {
         );
         assert_eq!(load_spawn_registry(&p), vec![e], "provenance round-trips");
 
-        // A row with no resolved route serializes NEITHER column — absence is
-        // the honest encoding (never a placeholder hash for "no attach").
         let bare = SpawnEntry::profiled("w2B:p2", "crew-wf-coder-1", "coder", "omp", None);
         save_spawn_registry(&p, std::slice::from_ref(&bare)).unwrap();
         let raw = std::fs::read_to_string(spawn_registry_file(&p)).unwrap();
@@ -3937,8 +3764,6 @@ mod loops_sidecar_tests {
         save_spawn_registry(&p, &entries).unwrap();
         assert_eq!(load_spawn_registry(&p), entries, "identity pin round-trips");
 
-        // A pre-bd-627z.4 file (pane+name+profile only) still loads —
-        // mail_identity: None → assign falls back to the hash mapping.
         let path = spawn_registry_file(&p);
         std::fs::write(
             &path,
@@ -3969,7 +3794,6 @@ mod loops_sidecar_tests {
         save_loop_pids(&pids).unwrap();
         let loaded = load_loop_pids();
         assert_eq!(loaded.get(&p), Some(&e));
-        // unregister removes only matching pid
         unregister_loop(&p, 9999);
         assert_eq!(
             load_loop_pids().get(&p),
@@ -3986,21 +3810,15 @@ mod loops_sidecar_tests {
     fn loop_pid_registry_live_guard() {
         let _g = loops_test_guard();
         let p = test_project("pid-live");
-        // no prior entry → registers cleanly
         assert!(register_loop(&p, "inv-1", false).unwrap().is_none());
         let registered = load_loop_pids().get(&p).unwrap().clone();
         assert_eq!(registered.pid, std::process::id());
-        // the registry's own pid is alive → a second registration refuses
         let prev = register_loop(&p, "inv-2", false)
             .unwrap()
             .expect("live owner");
         assert_eq!(prev.pid, std::process::id());
-        // cleanup the self entry before the takeover case
         unregister_loop(&p, std::process::id());
 
-        // force takeover TERMINATES the previous live process (bd-bvwf.4) —
-        // a takeover must never leave two loops on one project. A real child
-        // stands in for the stale loop (never the test process itself).
         let mut child = std::process::Command::new("sleep")
             .arg("60")
             .spawn()
@@ -4023,7 +3841,6 @@ mod loops_sidecar_tests {
             "--force terminates the old loop process"
         );
         assert_eq!(load_loop_pids().get(&p).unwrap().invocation, "inv-3");
-        // cleanup
         let _ = child.wait();
         unregister_loop(&p, std::process::id());
     }
@@ -4035,15 +3852,12 @@ mod loops_sidecar_tests {
     fn ensure_loop_owner_guards_takeover() {
         let _g = loops_test_guard();
         let p = test_project("pid-owner");
-        // own pid → owner
         register_loop(&p, "inv-1", false).unwrap();
         assert!(ensure_loop_owner(&p).is_ok(), "own entry passes");
         unregister_loop(&p, std::process::id());
 
-        // no entry → refuse (never run unowned — the registry is the guard)
         assert!(ensure_loop_owner(&p).is_err(), "no entry refuses");
 
-        // a foreign live pid owns it → refuse (a newer process took over)
         let mut child = std::process::Command::new("sleep")
             .arg("60")
             .spawn()
@@ -4060,7 +3874,6 @@ mod loops_sidecar_tests {
         );
         save_loop_pids(&pids).unwrap();
         assert!(ensure_loop_owner(&p).is_err(), "foreign live owner refuses");
-        // cleanup
         unregister_loop(&p, child_pid);
         let _ = std::process::Command::new("kill")
             .args(["-KILL", &child_pid.to_string()])
@@ -4115,7 +3928,7 @@ mod loops_sidecar_tests {
         assert!(sidecar_file(&p).exists());
         remove_active_loop(&p).unwrap();
         assert!(!sidecar_file(&p).exists());
-        remove_active_loop(&p).unwrap(); // idempotent
+        remove_active_loop(&p).unwrap();
     }
 
     /// cg6.3: the xproj seen-marker dedups one message id — mark is
@@ -4130,7 +3943,7 @@ mod loops_sidecar_tests {
         assert!(!xproj_seen_contains(&project, id).unwrap());
         xproj_seen_mark(&project, id).unwrap();
         assert!(xproj_seen_contains(&project, id).unwrap());
-        xproj_seen_mark(&project, id).unwrap(); // idempotent re-mark
+        xproj_seen_mark(&project, id).unwrap();
         xproj_seen_mark(&project, "second-msg-2").unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         assert_eq!(raw.lines().count(), 2, "no duplicate marker lines");
@@ -4160,14 +3973,11 @@ mod loops_sidecar_tests {
             "siblings kept"
         );
 
-        // no-op paths: unmarked id, and a missing file.
         xproj_seen_unmark(&project, "msg-b").unwrap();
         xproj_seen_unmark(&project, "never-marked").unwrap();
         let _ = std::fs::remove_file(&path);
-        xproj_seen_unmark(&project, "msg-a").unwrap(); // missing file → Ok
+        xproj_seen_unmark(&project, "msg-a").unwrap();
     }
-
-    // ---- l4s.2: read failures propagate, never clobber ----
 
     /// A read failure on the registry aborts the save with an error and the
     /// on-disk state is untouched (crash > corrupt). Simulated by making the
@@ -4177,10 +3987,8 @@ mod loops_sidecar_tests {
         let _g = loops_test_guard();
         let p = test_project("unreadable");
         let legacy = loops_file();
-        // snapshot + park any real legacy file
         let pre_legacy = std::fs::read_to_string(&legacy).ok();
         let _ = std::fs::remove_file(&legacy);
-        // a directory at the legacy path is unreadable as a file
         std::fs::create_dir_all(&legacy).unwrap();
         let err = save_active_loop(&p, &make_loop(&p, 3)).unwrap_err();
         assert!(
@@ -4191,7 +3999,6 @@ mod loops_sidecar_tests {
             "save aborts: {err:#}"
         );
         assert!(legacy.is_dir(), "unreadable path left untouched");
-        // restore
         std::fs::remove_dir_all(&legacy).unwrap();
         if let Some(bytes) = pre_legacy {
             std::fs::write(&legacy, bytes).unwrap();
@@ -4208,7 +4015,6 @@ mod loops_sidecar_tests {
         let legacy = loops_file();
         let pre_legacy = std::fs::read_to_string(&legacy).ok();
         let _ = std::fs::remove_file(&legacy);
-        // fresh registry: save must succeed
         save_active_loop(&p, &make_loop(&p, 5)).unwrap();
         assert_eq!(
             load_active_loop(&p)
@@ -4221,7 +4027,6 @@ mod loops_sidecar_tests {
             5
         );
         if let Some(bytes) = pre_legacy {
-            // restore the real legacy (it will re-split on next access)
             let _ = std::fs::remove_file(&legacy);
             std::fs::write(&legacy, bytes).unwrap();
         }
@@ -4235,10 +4040,9 @@ mod loops_sidecar_tests {
         let _g = loops_test_guard();
         let p = test_project("v1");
         let legacy = loops_file();
-        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap(); // hermetic dir starts empty
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         let pre_legacy = std::fs::read_to_string(&legacy).ok();
         let pre_markers = loops_dir_markers();
-        // minimal v1 fixture: flat project map, no schema key
         let fixture = json!({
             p.clone(): {
                 "id": format!("swarm-loop:{p}:1"),
@@ -4248,7 +4052,6 @@ mod loops_sidecar_tests {
         })
         .to_string();
         std::fs::write(&legacy, fixture).unwrap();
-        // read triggers the split; the v1 entry gains defaulted control fields
         let (_schema, loaded) = load_loops_registry().unwrap();
         assert_eq!(loaded.get(&p).unwrap().id, format!("swarm-loop:{p}:1"));
         assert!(sidecar_file(&p).exists());
@@ -4256,7 +4059,6 @@ mod loops_sidecar_tests {
             .into_iter()
             .any(|n| !pre_markers.contains(&n));
         assert!(new_marker, "legacy renamed after v1 migration");
-        // restore
         let _ = std::fs::remove_file(sidecar_file(&p));
         for n in loops_dir_markers() {
             if !pre_markers.contains(&n) {
@@ -4270,8 +4072,6 @@ mod loops_sidecar_tests {
             }
         }
     }
-
-    // ---- bd-work-attempts-m5x6: durable work-attempt persistence ----
 
     /// Attempts persist per project beside the resume window: record/upsert
     /// round-trips, generations accumulate under the same bead, and a
@@ -4346,7 +4146,6 @@ mod loops_sidecar_tests {
         assert_eq!(a1b.effect_key.as_deref(), Some("ek-1"));
         let key1 = attempt_resume_key("bd-r", "PaneA", 1);
         assert_eq!(key1, "bd-r\u{1f}PaneA\u{1f}1");
-        // Steer: mark superseded, record the replacement, resume again.
         let live = crate::durable::live_attempt_for_bead(&load_work_attempts(&project), "bd-r")
             .unwrap()
             .clone();

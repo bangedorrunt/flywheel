@@ -19,7 +19,6 @@ const TORON_ROBOT: &str = include_str!("../../toron/crates/toron-cli/src/robot.r
 const MAIN: &str = include_str!("../src/main.rs");
 const SURFACE: &str = include_str!("../../toron/crates/toron-core/src/mailbox/surface.rs");
 
-// (1) Structural cutover: subject-substring matching is DELETED, not shimmed.
 #[test]
 fn adr0010_d9_subject_done_deleted_no_dual_match() {
     assert!(
@@ -44,8 +43,6 @@ fn adr0010_d9_classify_takes_the_bead_tag() {
     );
 }
 
-// (2) toron send-tags vocabulary: `bead=<id>` is typed (non-empty) and rides
-// the rumor; the CLI flag stamps it.
 #[test]
 fn adr0010_d9_send_tags_vocabulary_has_bead() {
     assert!(
@@ -66,8 +63,6 @@ fn adr0010_d9_send_tags_vocabulary_has_bead() {
     );
 }
 
-// (3) Projection: the rumor's bead tag reaches inbox rows; the surface
-// MailItem carries it to the guard scan.
 #[test]
 fn adr0010_d9_inbox_projection_carries_bead() {
     assert!(
@@ -84,8 +79,6 @@ fn adr0010_d9_inbox_projection_carries_bead() {
     );
 }
 
-// (4) Runtime AC, end-to-end over a real mailbox:
-// tag present + arbitrary subject → Done; tag absent + `] done` → None.
 #[tokio::test]
 async fn adr0010_d9_bead_tag_is_the_hold_subject_is_decoration() {
     use std::sync::Arc;
@@ -140,12 +133,10 @@ async fn adr0010_d9_bead_tag_is_the_hold_subject_is_decoration() {
         }
     };
 
-    // Tag present + ARBITRARY subject → the hold fires (bead projects).
     mailbox
         .send_message(&send("shipped and verified", Some("bd-l0fz")))
         .await
         .expect("tagged send");
-    // Tag absent + `] done` subject → the hold does NOT fire.
     mailbox
         .send_message(&send("[bd-l0fz] done", None))
         .await

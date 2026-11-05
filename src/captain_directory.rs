@@ -6,20 +6,20 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-#[cfg_attr(not(test), allow(dead_code))] // contract number registry (ADR-0019 Configuration): pinned by tests + verify-0019.sh
+#[cfg_attr(not(test), allow(dead_code))]
 pub const PULL_FRESH_MS: i64 = 120_000;
-#[cfg_attr(not(test), allow(dead_code))] // contract number registry (ADR-0019 Configuration): pinned by tests + verify-0019.sh
+#[cfg_attr(not(test), allow(dead_code))]
 pub const LOOP_LIMIT: usize = 12;
-#[cfg_attr(not(test), allow(dead_code))] // contract number registry (ADR-0019 Configuration): pinned by tests + verify-0019.sh
+#[cfg_attr(not(test), allow(dead_code))]
 pub const LOOP_WINDOW_MS: i64 = 600_000;
-#[cfg_attr(not(test), allow(dead_code))] // contract number registry (ADR-0019 Configuration): pinned by tests + verify-0019.sh
+#[cfg_attr(not(test), allow(dead_code))]
 pub const IN_FLIGHT_TTL_SECS: u64 = 90;
-#[cfg_attr(not(test), allow(dead_code))] // contract number registry (ADR-0019 Configuration): pinned by tests + verify-0019.sh
+#[cfg_attr(not(test), allow(dead_code))]
 pub const SESSION_FORGET_MS: i64 = 86_400_000;
-#[cfg_attr(not(test), allow(dead_code))] // contract number registry (ADR-0019 Configuration): pinned by tests + verify-0019.sh
+#[cfg_attr(not(test), allow(dead_code))]
 pub const SESSION_START_GRACE_MS: i64 = 7_200_000;
 pub const APPROVAL_WAIT_MS: i64 = 600_000;
-#[cfg_attr(not(test), allow(dead_code))] // contract number registry (ADR-0019 Configuration): pinned by tests + verify-0019.sh
+#[cfg_attr(not(test), allow(dead_code))]
 pub const DOING_MAX_CHARS: usize = 200;
 
 /// D3 delivery tier. First-match-wins in [`tier_of`].
@@ -70,7 +70,7 @@ pub fn tier_of(s: &TierSnapshot) -> Tier {
 }
 
 /// D2: pull freshness from the durable reader cursor. Pure over args.
-#[cfg_attr(not(test), allow(dead_code))] // contract pure fn: pinned by tests; the arrive loader wires it when a per-npub cursor store exists
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn pull_fresh(last_cursor_advance_ms: Option<i64>, now_ms: i64) -> bool {
     match last_cursor_advance_ms {
         Some(last) => now_ms.saturating_sub(last) <= PULL_FRESH_MS,
@@ -80,7 +80,7 @@ pub fn pull_fresh(last_cursor_advance_ms: Option<i64>, now_ms: i64) -> bool {
 
 /// D2: cursor is keyed by reader npub. A lookup by `hosted:<pin>` or
 /// `block:<id>` must read stale, never `0`-as-fresh.
-#[cfg_attr(not(test), allow(dead_code))] // contract pure fn: pinned by tests; npub-keyed cursor reads only
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn cursor_advance_for_npub(cursor: &BTreeMap<String, i64>, reader: &str) -> Option<i64> {
     if reader.starts_with("hosted:") || reader.starts_with("block:") {
         return None;
@@ -93,7 +93,6 @@ pub fn cursor_advance_for_npub(cursor: &BTreeMap<String, i64>, reader: &str) -> 
 pub enum Delivery {
     Queued,
     Woke,
-    // Annotations, never settle words: no constructor builds these (pinned by test).
     #[cfg_attr(not(test), allow(dead_code))]
     Read,
     Unknown,
@@ -236,7 +235,7 @@ pub fn session_key(
 
 /// D6: forget a non-kept key only when unread==0, past the window, and past
 /// the start grace. Kept keys (`hosted:<pin>`, bound captain) never forget.
-#[cfg_attr(not(test), allow(dead_code))] // contract pure fn: pinned by tests; the forget scheduler calls it, not this ship
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn should_forget(
     last_seen_ms: i64,
     now_ms: i64,
@@ -254,11 +253,9 @@ pub fn should_forget(
 }
 
 /// D7: store at most 200 chars; team-invite URLs become `(link)`.
-#[cfg_attr(not(test), allow(dead_code))] // contract pure fn: pinned by tests; doing writers truncate at the edge
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn truncate_doing(line: &str) -> String {
     let mut s = line.to_string();
-    // Minimal invite-URL scrub: replace https? invite links with (link).
-    // Keep it dependency-free: scan whitespace-separated tokens.
     let tokens: Vec<String> = s
         .split_whitespace()
         .map(|t| {
@@ -354,7 +351,6 @@ pub fn resolve_address(
             .cloned();
         return hit.ok_or(AddressError::NoAssignee);
     }
-    // Bare pin: newest session, ambiguous when 2+ live rows share the pin.
     if !snap.arrived_pins.contains(to) && newest_for_pin(&snap.sessions, to).is_empty() {
         return Err(AddressError::Unarrived);
     }
@@ -414,14 +410,12 @@ mod tests {
         assert_eq!(SESSION_START_GRACE_MS, 7_200_000);
         assert_eq!(APPROVAL_WAIT_MS, 600_000);
         assert_eq!(DOING_MAX_CHARS, 200);
-        // One behavior bound through the constant, not a copied literal.
         assert!(pull_fresh(Some(0), PULL_FRESH_MS));
         assert!(!pull_fresh(Some(0), PULL_FRESH_MS + 1));
     }
 
     #[test]
     fn tier_push_beats_plane_absence() {
-        // Empty hc listing with a live block: still push.
         let s = snap_tier(true, true, false, false, true, false, true, true, false);
         assert_eq!(tier_of(&s), Tier::Push);
     }
@@ -453,7 +447,6 @@ mod tests {
             positive_no_receiver: true,
         };
         assert_eq!(tier_of(&s), Tier::None);
-        // Absent pin alone without the full triple is not none.
         let s2 = snap_tier(false, false, false, false, false, false, false, true, false);
         assert_ne!(tier_of(&s2), Tier::None);
     }
@@ -462,10 +455,8 @@ mod tests {
     fn tier_turn_needs_hook_and_verified() {
         let s = snap_tier(false, false, true, true, true, false, true, true, false);
         assert_eq!(tier_of(&s), Tier::Turn);
-        // Grok row today: hook None -> never turn.
         let grok = snap_tier(false, false, false, false, true, false, true, true, false);
         assert_ne!(tier_of(&grok), Tier::Turn);
-        // Hook without verified bit is not turn.
         let half = snap_tier(false, false, true, false, true, false, true, true, false);
         assert_ne!(tier_of(&half), Tier::Turn);
     }
@@ -474,7 +465,6 @@ mod tests {
     fn pull_fresh_only_from_npub_cursor() {
         let mut cursor = BTreeMap::new();
         cursor.insert("npub1abc".to_string(), 1_000);
-        // npub lookup reads the row.
         assert_eq!(cursor_advance_for_npub(&cursor, "npub1abc"), Some(1_000));
         assert!(pull_fresh(
             cursor_advance_for_npub(&cursor, "npub1abc"),
@@ -484,7 +474,6 @@ mod tests {
             cursor_advance_for_npub(&cursor, "npub1abc"),
             1_000 + 120_001
         ));
-        // Hosted/block keys must read stale even when a row exists.
         cursor.insert("hosted:Pin".to_string(), 2_000);
         cursor.insert("block:abc".to_string(), 2_000);
         assert_eq!(cursor_advance_for_npub(&cursor, "hosted:Pin"), None);
@@ -493,7 +482,6 @@ mod tests {
             cursor_advance_for_npub(&cursor, "hosted:Pin"),
             2_000
         ));
-        // Unresolvable npub reads stale, never 0-as-fresh.
         assert_eq!(cursor_advance_for_npub(&cursor, "npub1missing"), None);
         assert!(!pull_fresh(None, 5_000));
     }
@@ -528,8 +516,6 @@ mod tests {
             delivery_of(AppendState::Refused, Tier::Push, Some(true)),
             Delivery::Denied
         );
-        // The word follows the attempt outcome, not the tier: ok → woke on
-        // any tier (verification: unknown tier + ok → woke).
         assert_eq!(
             delivery_of(AppendState::Appended, Tier::Unknown, Some(true)),
             Delivery::Woke
@@ -538,9 +524,6 @@ mod tests {
             delivery_of(AppendState::Appended, Tier::Pull, Some(true)),
             Delivery::Woke
         );
-        // `read` and `expired` are annotations, never a settle word: no
-        // input triple constructs them. The explicit construction below is
-        // the use the dead-code lint counts; the loop above is the guarantee.
         let _ = (Delivery::Read, Delivery::Expired);
         for append in [
             AppendState::Appended,
@@ -584,7 +567,6 @@ mod tests {
             unread: 0,
             doing: None,
         });
-        // Group fan-out refused even for the bound captain.
         assert_eq!(
             resolve_address(&snap, "*", "Cap"),
             Err(AddressError::GroupRefused)
@@ -593,7 +575,6 @@ mod tests {
             resolve_address(&snap, "repo:flywheel", "Cap"),
             Err(AddressError::GroupRefused)
         );
-        // Bead with no assignee.
         assert_eq!(
             resolve_address(&snap, "bead:bd-1", "Cap"),
             Err(AddressError::NoAssignee)
@@ -677,13 +658,11 @@ mod tests {
             AddressError::Ambiguous(keys) => assert_eq!(keys.len(), 2),
             _ => panic!("expected ambiguous"),
         }
-        // Explicit key disambiguates.
         assert!(resolve_address(&snap, "Duo@block:d1", "Sender").is_ok());
         assert_eq!(
             resolve_address(&snap, "Ghost", "Sender"),
             Err(AddressError::TierNone)
         );
-        // Sender or target never arrived.
         assert_eq!(
             resolve_address(&snap, "Solo", "Stranger"),
             Err(AddressError::Unarrived)
@@ -760,7 +739,6 @@ mod tests {
             session_key(false, "P", None, None, None, Some("w1:p2"), true),
             "pane:w1:p2"
         );
-        // Rex block is never stored under an hc key.
         assert!(
             session_key(false, "P", None, None, Some("b1"), Some("w1:p2"), false)
                 .starts_with("block:")
@@ -769,13 +747,9 @@ mod tests {
 
     #[test]
     fn forget_needs_zero_unread_window_and_grace() {
-        // Kept keys never forget.
         assert!(!should_forget(0, SESSION_FORGET_MS + 10, 0, true, 0));
-        // Unread mail blocks forget.
         assert!(!should_forget(0, SESSION_FORGET_MS + 10, 1, false, 0));
-        // Start grace blocks forget.
         assert!(!should_forget(0, SESSION_START_GRACE_MS - 1, 0, false, 0));
-        // Past window + grace + zero unread forgets.
         assert!(should_forget(
             0,
             SESSION_FORGET_MS + SESSION_START_GRACE_MS + 1,

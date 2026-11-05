@@ -8,9 +8,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct HostAuthority {
-    // No live reader since the hc integration surface went away (hc 0.1.16
-    // has no `integration install` to mkdir for); kept as resolved-once
-    // authority with test pins rather than re-reading HOME per call site.
     #[allow(dead_code)]
     pub home: String,
     pub cwd: std::path::PathBuf,
@@ -315,17 +312,12 @@ mod tests {
              mean the injected clock is being ignored and ambient time is winning"
         );
 
-        // Agreement between the two readings off the same authority: a
-        // DateTime that disagreed with the clock it came from would mean the
-        // conversion silently substituted a different source.
         assert_eq!(
             a.timestamp() as u64,
             early.now_unix(),
             "now_datetime and now_unix must read the SAME clock"
         );
 
-        // And it must be the real calendar, not a synthetic counter: this
-        // instant is 2001-09-09T01:46:40Z.
         assert_eq!(
             a.to_rfc3339(),
             "2001-09-09T01:46:40+00:00",

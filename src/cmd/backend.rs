@@ -39,15 +39,9 @@ pub(crate) fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
             let active_mail = crate::backend::resolve_mail_name(cfg);
             let compiled = crate::backend::compiled_backends();
             let mut rows: Vec<Value> = Vec::new();
-            // multiplexers
-            // Ready only when this binary was built with the rex backend.
-            // A default build still lists the name so the env contract is
-            // visible, and marks it stub because the feature is off.
             for (name, stub) in [
                 ("hc", false),
                 ("superlogical", cfg!(not(feature = "backend-superlogical"))),
-                // auto is a selection mode, not a compiled backend: ready
-                // when both sides are compiled in.
                 (
                     "auto",
                     !(cfg!(feature = "backend-hc") && cfg!(feature = "backend-superlogical")),
@@ -61,7 +55,6 @@ pub(crate) fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
                     "compiled_feature": compiled.contains(&name),
                 }));
             }
-            // mail: toron is the only backend (bd-euav)
             {
                 let (name, stub) = ("toron", false);
                 rows.push(json!({
@@ -75,9 +68,6 @@ pub(crate) fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
             let resolved = crate::backend::resolve_plane(cfg);
             print_json(&json!({
                 "backends": rows,
-                // bd-mknvb: the plane that will ACTUALLY serve, with the
-                // reason. `active` above is the CONFIGURED name — a door that
-                // asks "who answers?" reads this, never the name.
                 "resolved": {
                     "configured": resolved.configured,
                     "plane": resolved.plane.name(),
@@ -90,8 +80,6 @@ pub(crate) fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
         BackendCmd::Status => {
             let mux = crate::backend::resolve_backend_name(cfg);
             let mail = crate::backend::resolve_mail_name(cfg);
-            // config source: env overrides config field over default. Report
-            // which layer selected the active name (env/.env/config/default).
             let mux_source = if std::env::var_os("FLYWHEEL_BACKEND").is_some_and(|v| !v.is_empty())
             {
                 "env"
@@ -117,9 +105,6 @@ pub(crate) fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
             } else {
                 "default"
             };
-            // health: multiplexer = socket reachable; mail = the selected
-            // backend's health() (agentmail → AM health_check; toron → toron
-            // facade health; not-compiled → false).
             let mux_health = crate::backend::multiplexer_backend(cfg)
                 .map(|b| b.agent_list().is_ok())
                 .unwrap_or(false);
@@ -149,10 +134,6 @@ pub(crate) fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
                 "mail" => bc.mail = name.clone(),
                 other => bail!("unknown backend kind: {other} (multiplexer|mail)"),
             }
-            // A `BackendConfig::default()` has empty fields; when the user sets
-            // one kind, initialize the OTHER to the currently-resolved default
-            // so the written config never contains empty strings (which would
-            // deserialize as unset — harmless, but sloppy).
             if bc.multiplexer.is_empty() {
                 bc.multiplexer = crate::backend::resolve_backend_name(cfg);
             }

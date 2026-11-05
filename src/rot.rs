@@ -119,7 +119,6 @@ mod tests {
 
     #[test]
     fn advise_never_restarts() {
-        // advise_at=40: failure_spiral 4 × 10 = 40. Repetition alone is 30 = Healthy.
         let ev = RotEvents {
             failure_spiral: 4,
             ..RotEvents::default()

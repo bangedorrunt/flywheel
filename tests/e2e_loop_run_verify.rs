@@ -59,7 +59,6 @@ impl Scratch {
         };
         std::fs::create_dir_all(&s.dir).unwrap();
         std::fs::create_dir_all(&s.cfg).unwrap();
-        // Embedded in-process toron (NO [mail.toron] url) + test identity.
         std::fs::write(
             s.cfg.join("config.toml"),
             "[backend]\nmultiplexer = \"hc\"\nmail = \"toron\"\n\n[agent_mail]\nname = \"e2e-planner\"\n",
@@ -169,7 +168,6 @@ fn git(cwd: &Path, args: &[&str]) {
 
 fn bead_status(dir: &Path, bead_id: &str) -> String {
     let v = br_json(dir, &["show", bead_id, "--json"]);
-    // br show --json: bare object (newer br) or 1-elem array (older).
     let bead = match &v {
         serde_json::Value::Array(items) => items.first().cloned().unwrap_or_default(),
         obj @ serde_json::Value::Object(_) => obj.clone(),
@@ -191,8 +189,6 @@ fn scratch_runnable_bead(tag: &str, verify: &str) -> (Scratch, String, String) {
         "workflow:\n  transitions:\n    open:\n      - closed\n    closed:\n      - closed\n  gates:\n    open -> closed:\n      require_all:\n        - command-verified\n    closed -> closed:\n      require_all:\n        - command-verified\n",
     )
     .unwrap();
-    // bd-3566 (beads_rust-wave5-flywheel-parser-strip-dkpvi): TYPED verify
-    // field — description fences no longer make a bead ready.
     let created = br_json(
         &dir,
         &[
@@ -294,18 +290,13 @@ fn loop_run_verify_cheap_band_executes_and_legal_close_stays_closed() {
     let (s, bead_id, sha) = scratch_runnable_bead("vsca-pos", "test -f README.md");
     let dir = s.dir.clone();
 
-    // worker commits (SHA rule) + closes without a verdict
     close(&dir, &bead_id, &sha);
     assert_eq!(bead_status(&dir, &bead_id), "closed");
 
-    // tick part 1: close-check -> missing (loop-runnable VERIFY, no row)
     let cc = s.flywheel_json(&["__close-check", dir.to_str().unwrap(), &bead_id]);
     assert_eq!(cc["status"], "missing", "close-check: {cc}");
     assert_eq!(cc["sha"], sha, "sha derived from the bead's commit");
 
-    // tick part 2: loop-run VERIFY — classify + execute + timeout bound.
-    // The raw stdout is kept: it becomes the receipt body the gate row's
-    // tail= points at, exactly as report_pass files the executor output.
     let lr_out = s.flywheel(&[
         "__loop-run-verify",
         dir.to_str().unwrap(),
@@ -328,13 +319,8 @@ fn loop_run_verify_cheap_band_executes_and_legal_close_stays_closed() {
     assert_eq!(lr["verify"], "test -f README.md", "echo the VERIFY: {lr}");
     assert_eq!(lr["dir"], dir.to_str().unwrap(), "runs in the repo dir");
 
-    // the armed loop records command-verified (this is the exact br command
-    // `report_pass` runs, receipt file included); the receipt filename is
-    // the sha-bound machine receipt path
     record_command_verified(&dir, &bead_id, &sha, "test -f README.md", &lr_out.stdout);
 
-    // tick part 3: close-check -> legal -> bead STAYS closed, no reopen
-    // artifacts (the loop's legal branch removes grace + never reopens)
     for _ in 0..2 {
         let legal = s.flywheel_json(&["__close-check", dir.to_str().unwrap(), &bead_id]);
         assert_eq!(legal["status"], "legal", "close-check: {legal}");
@@ -358,7 +344,6 @@ fn loop_run_verify_failure_marks_failed_head_and_reopens() {
     let dir = s.dir.clone();
     close(&dir, &bead_id, &sha);
 
-    // tick: close-check -> missing, then loop-run VERIFY -> non-zero exit
     let cc = s.flywheel_json(&["__close-check", dir.to_str().unwrap(), &bead_id]);
     assert_eq!(cc["status"], "missing", "close-check: {cc}");
     let lr = s.flywheel_json(&[
@@ -371,7 +356,6 @@ fn loop_run_verify_failure_marks_failed_head_and_reopens() {
     assert_eq!(lr["band"], "loop-runnable", "classify loop-runnable: {lr}");
     assert_eq!(lr["exit"], 1, "failing VERIFY must exit non-zero: {lr}");
 
-    // failed-head marker: never re-verify the same broken head
     let marker = dir
         .join(".flywheel/loop-run-verify-failed")
         .join(format!("{bead_id}-{sha}"));
@@ -381,7 +365,6 @@ fn loop_run_verify_failure_marks_failed_head_and_reopens() {
         marker.display()
     );
 
-    // a re-run must report skipped, not re-execute
     let again = s.flywheel_json(&[
         "__loop-run-verify",
         dir.to_str().unwrap(),
@@ -394,8 +377,6 @@ fn loop_run_verify_failure_marks_failed_head_and_reopens() {
         "never re-verify broken head: {again}"
     );
 
-    // the reopen side (what the loop's tick does after a failed verify):
-    // bead back to open, one mail keyed by the sha
     let r = s.flywheel_json(&["__reopen-bead", dir.to_str().unwrap(), &bead_id, &sha]);
     assert_eq!(r["ok"], true, "reopen: {r}");
     assert_eq!(r["reopened"], true, "reopen: {r}");

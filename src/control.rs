@@ -197,9 +197,6 @@ mod tests {
         SpawnEntry::with_mail_identity("w1:p2", "flywheel-demo-oc2", "AmberFox")
     }
 
-    // ADR-0010 D7 (bd-w5fn) AC: marker round-trips through an hc prompt (byte-checked) — the
-    // body must survive prefixing + stripping byte-identical, including
-    // newlines and a body that itself contains the tag.
     #[test]
     fn adr0010_d7_op_marker_roundtrips_byte_identical() {
         let body = "relaunch-2-1979\nsecond line \u{2063}FLYWHEEL_OP: not a marker\n";
@@ -207,7 +204,6 @@ mod tests {
         assert!(sent.starts_with(OP_MARKER), "prompt must start with U+2063");
         assert!(is_op_prompt(&sent));
         assert_eq!(strip_op_marker(&sent), body);
-        // byte identity: body appears verbatim after the marker+tag
         let want = format!("{OP_MARKER}{OP_TAG}{body}");
         assert_eq!(sent.as_bytes(), want.as_bytes());
     }
@@ -221,7 +217,6 @@ mod tests {
         );
     }
 
-    // AC: interrupt postconditions — Escape only, confirmation capability-gated.
     #[test]
     fn adr0010_d7_interrupt_is_escape_and_confirms_only_at_idle() {
         use crate::hc_support::AgentStatus;
@@ -235,7 +230,6 @@ mod tests {
         }
     }
 
-    // AC: exit postcondition — agent gone, reservations + dirty preserved.
     #[test]
     fn adr0010_d7_exit_postcondition_preserves_reservations_and_dirty() {
         assert_eq!(
@@ -248,9 +242,6 @@ mod tests {
         );
     }
 
-    // AC: relaunch-fail-after-stop restores the prior durable record — the
-    // decision rolls back on launch failure only; a published-but-unconfirmed
-    // agent keeps the new record.
     #[test]
     fn adr0010_d7_relaunch_rolls_back_only_on_launch_failure() {
         assert_eq!(relaunch_decide(false), RelaunchAction::Rollback);
@@ -267,17 +258,8 @@ mod tests {
         assert!(incarnation_token(&relaunched, 1_700_000_000).starts_with("relaunch-2-"));
     }
 
-    // AC: journal rollback restores the checkpointed row.
     #[test]
     fn adr0010_d7_journal_rollback_restores_prior_record() {
-        // bd-envlock: the crate env guard, not a hand-rolled tempdir. The old
-        // `tempfile::tempdir()` + `set_var` was dropped at end of test, so for
-        // the rest of the PROCESS `XDG_STATE_HOME` pointed at a directory that
-        // no longer existed, and this test held no lock while doing it. Any
-        // concurrent or later test writing state artifacts then failed on a
-        // missing directory, which reads as a random flake rather than a test
-        // bug. `test_state_home()` locks AND unsets the var plus removes the
-        // dir on drop, so the next test inherits the real state home.
         let _home = crate::config::test_state_home();
         let project = "demo";
         let old = entry();
@@ -292,7 +274,6 @@ mod tests {
             incarnation: 1,
             ..old.clone()
         }];
-        // simulate the mid-relaunch durable write
         crate::state::save_spawn_registry(project, &current).unwrap();
         rollback_relaunch(project, &journal).unwrap();
         current = crate::state::load_spawn_registry(project);

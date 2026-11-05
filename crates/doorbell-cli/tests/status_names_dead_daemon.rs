@@ -11,10 +11,6 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn scratch() -> PathBuf {
-    // `SystemTime::now()` has microsecond resolution on macOS, so two parallel
-    // tests could mint the SAME root (same pid, same nanos) — and then one
-    // test's `stopped-by-operator` marker made the other read STOPPED. The
-    // clean-export suite caught it; a counter makes the root unique per call.
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
@@ -35,7 +31,6 @@ fn status_of_a_dead_daemon_says_down_and_never_armed() {
     for d in [&home, &state] {
         std::fs::create_dir_all(d).unwrap();
     }
-    // No pid file, and a port nothing listens on: the daemon is DOWN.
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -68,13 +63,10 @@ fn status_of_a_dead_daemon_says_down_and_never_armed() {
         stderr.contains("daemon DOWN"),
         "a dead daemon must read as DOWN, got stderr: {stderr}"
     );
-    // `armstate::announce` prints on STDOUT, so a stdout-only JSON check would
-    // let the arm line back in unseen — both streams are asserted.
     assert!(
         !stdout.contains("armed on") && !stderr.contains("armed on"),
         "a status READ must never print the arm transcript, got stdout: {stdout} stderr: {stderr}"
     );
-    // The JSON on stdout stays machine-readable and carries the same verdict.
     assert!(stdout.contains("\"alive\":false"), "stdout: {stdout}");
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -20,8 +20,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::config_dir;
 
-// (p-code aliases retired by ADR-0009 — semantic names only.)
-
 /// Registry tier (ADR-0022 §3.8). Override precedence follows the Ord order:
 /// project wins over user, user over repo data, repo data over the compiled
 /// seed (`seed < repo < user < project`).
@@ -216,7 +214,6 @@ impl StageLibrary {
                 "fresh-eyes-explore",
                 "I want you to sort of randomly explore the code files in this project, choosing code files to deeply investigate and understand and trace their functionality and execution flows through the related code files which they import or which are imported by. Once you understand the purpose of the code in the larger context of the workflows, I want you to do a super careful, methodical, and critical check with \"fresh eyes\" to find any obvious bugs, problems, errors, issues, silly mistakes, etc. and then systematically and meticulously and intelligently correct them. Be sure to comply with ALL rules in AGENTS dot md.",
             ),
-            // ---- ADR-0009 compound-engineering loop stages (ce- family) ----
             (
                 "ce-brainstorm",
                 "Sharpen a rough objective into REQUIREMENTS before any bead exists (ADR-0009 ce-brainstorm). Ask ONE question at a time, and only questions whose answer changes the artifact — a decision the owner must make, never something the repo can answer. Ground first: read AGENTS.md, the relevant ADRs, and `rg -il \"<objective keywords>\" docs/learnings/` — a prior learning that touches this area carries its constraints in. The output is REQUIREMENTS-ONLY (never implementation): one unified statement of what this must be, explicit non-goals, open questions each naming the decision it blocks, and a data-shape note (what exists to work with). A requirement you cannot test is a wish — every acceptance names its evidence. Post the artifact to the steer channel; reply with ONLY a JSON object {\"target\": \"...\", \"non_goals\": [\"...\"], \"open_questions\": [\"...\"], \"data_shape\": \"...\"}.",
@@ -273,10 +270,6 @@ impl StageLibrary {
                 "spawn-crew",
                 "Deep-triage step 3: spawn the assigned crew for the prioritized backlog — `flywheel spawn <project> --recipe <squad>` (or the explicit counts) and hand each owner their assigned items. Confirm the panes are up and the crew is ready before finishing.",
             ),
-            // ---- ADR-0019 playbook stages (bd-h9xn): the discipline text is
-            // extracted from the playbooks' inline task: strings — the stage
-            // carries the shared discipline, the workflow's `plan:` carries
-            // per-run interpolation.
             (
                 "repro-baseline",
                 "Run or write the repro for the reported symptom. ACCEPTANCE: the command exits non-zero (or visibly shows the bug). Record the exact failing output as the baseline.",
@@ -313,10 +306,6 @@ impl StageLibrary {
                 "resume-pickup",
                 "Session pickup (ADR-0019): read .flywheel/agent-state/, `br list --status in_progress --json` for stranded beads, ledger gaps, and the last-sent registry; respawn context-exhausted panes; resume briefs for stranded in_progress beads. Idempotent: a done pickup finds nothing to do. Keep SUMMARIES in your report, not raw dumps (guard-the-context-window).",
             ),
-            // ---- ADR-0006 D3 wave-swarm compose-token stages (bd-wave-swarm-
-            // recipe-wsot): one stage per composed phase; ADR-0009 adds the
-            // grounding read, the escalation lesson line, and the residual
-            // gate.
             (
                 "wave-gate",
                 "Wave gate (ADR-0006 D3): run `flywheel preflight --mode workflow --project <this project slug>` — a failed check STOPS the wave. bd-mvy4: the `--project` is REQUIRED, not a nicety: `worktree` and `playbook-files` are project-scoped checks and both FAIL when no project is given, so omitting it made the gate hold every wave while naming a blocker that was the gate's own omission (post `[gate] blocked: <check>` to the steer channel; never fix infra yourself mid-gate). Then scope the ready set for this wave: `br ready --json` is already wave-gated by br itself, and the TYPED `wave` field is the authority (bd-wave-gate-typed-authority-27et) — select rows whose typed `wave` == N, falling back to the legacy `wave-N` label only when the typed field is null — and if ANY bead with an earlier wave-M (M<N) is open or in_progress, post `[gate] held: <bead ids>` and STOP (waves run in order, never around them). GROUNDING READ (ADR-0009, bounded by ADR-0010 D12): `flywheel __gate-learnings --budget ${FLYWHEEL_GATE_BUDGET:-4000}` — a budgeted projection of docs/learnings (top-N by reinforcement recency within ~4k tokens; pinned never decays, aging 30d / perishable 7d unreinforced decays OUT of the projection). Optional `--wiki/--memory` lane files (chiebukuro exports) join the SAME 4k pool — the budget is shared across lanes, never per-lane. Read ONLY the projected paths — frontmatter + rg context, under the budget; matching entries become the wave's carried constraints. BINDING CONTRACT (bd-wave-swarm-graduation-fix-98io — GATE output is the DISPATCH input): `mkdir -p .flywheel/wave` then write `.flywheel/wave/<wave-label>-ready.json` containing EXACTLY {\"wave_label\": \"<label>\", \"held\": <bool>, \"blockers\": [\"<bead-id>\"], \"in_flight\": [\"<bead-id>\"], \"ready\": [{\"id\": \"<bead-id>\", \"title\": \"...\", \"verify\": \"<VERIFY command>\", \"priority\": <n>}]} plus, when the grounding read matched, \"learnings\": [\"docs/learnings/<...>\"]. Reply with ONLY that JSON object. Never dispatch, never adjudicate — gate, write the artifact, report. bd-mvy4 DEFECT 3 (refined, bd-wave-gate-typed-authority-27et): an EMPTY `ready` with NO bead of this wave in flight is a LOUD FAILURE, not a green wave — post `[gate] blocked: wave <label> matched zero beads` and STOP; an EMPTY `ready` WITH in-flight beads is `held: false` + `in_flight` — the wave is WORK IN FLIGHT (a crew is closing it), so report it and write the marker, never a held/empty wave. A run that dispatches nothing must never report success; that is the false-green this gate exists to prevent.",
@@ -350,20 +339,16 @@ impl StageLibrary {
                 },
             );
         }
-        // Seed role affinities (§3.8 stage-first compose).
         for (name, role) in SEED_AFFINITY {
             if let Some(stage) = stages.get_mut(*name) {
                 stage.role = Some(role.to_string());
             }
         }
-        // Seed phase metadata for the ce- loop (ADR-0009).
         for (name, phase) in SEED_PHASE {
             if let Some(stage) = stages.get_mut(*name) {
                 stage.phase = Some(phase.to_string());
             }
         }
-        // bd-ceiling-report-template-vz8a: append the ONE ceiling shape to the
-        // stages that hit or carry a ceiling report.
         for name in CEILING_TEMPLATE_STAGES {
             if let Some(stage) = stages.get_mut(*name) {
                 stage.prompt.push_str("\n\n");
@@ -680,13 +665,8 @@ pub fn render_stage(
     for (k, v) in params {
         let slot = format!("{{{{{k}}}}}");
         if prompt.contains(&slot) {
-            // verbatim: values are prompt text, never interpreted
             out = out.replace(&slot, v);
         } else if k != "task_id" {
-            // A param with no slot would vanish silently (hollow-dispatch
-            // class): warn loud, keep rendering. Never a hard error.
-            // `task_id` is exempt: the send machinery consumes it for thread
-            // routing, so the template need not carry its slot.
             eprintln!(
                 "flywheel: warn: --param {k} matches no {{{{{k}}}}} slot in stage — value ignored"
             );
@@ -694,8 +674,6 @@ pub fn render_stage(
     }
     Ok(out)
 }
-
-// ---- learnings tier/reinforced + bounded GATE projection (ADR-0010 D12) ----
 
 /// Learning corpus decay model (bd-fmya). Frontmatter carries
 /// `tier: pinned|aging|perishable` + `reinforced: YYYY-MM-DD` (perishable
@@ -869,7 +847,6 @@ pub mod learning {
                     .is_some_and(|age| age <= PERISHABLE_TTL_DAYS),
             })
             .collect();
-        // newest reinforcement first; never-reinforced (pinned only) last.
         eligible.sort_by(|a, b| b.reinforced.as_deref().cmp(&a.reinforced.as_deref()));
         let mut out = Vec::new();
         let mut spent = 0usize;
@@ -887,7 +864,6 @@ pub mod learning {
 #[cfg(test)]
 mod adr0010_d12_tests {
     // governed-by: ADR-0010 D12 (bd-fmya) — learnings tier/reinforced +
-    // bounded GATE projection.
     use super::learning::{
         LearningEntry, LearningLane, LearningTier, gate_projection, parse_lane_entries,
         parse_learning_frontmatter,
@@ -981,7 +957,6 @@ mod adr0010_d12_tests {
         assert_eq!(skipped_all, 1);
     }
 
-    // AC: GATE output bounded under budget with 50 seeded learnings.
     #[test]
     fn adr0010_d12_projection_bounded_under_budget_with_50_seeded() {
         let today = d("2026-09-07");
@@ -995,18 +970,14 @@ mod adr0010_d12_tests {
                 )
             })
             .collect();
-        // budget fits 5 entries only
         let out = gate_projection(&entries, today, 500);
         assert_eq!(out.len(), 5, "projection stops at the budget");
-        // newest-reinforced-first ranking: all fresh here, so stable order
         assert!(
             out.iter()
                 .all(|e| e.reinforced.as_deref() == Some("2026-09-07"))
         );
     }
 
-    // AC: un-reinforced 40d aging entry absent from projection, present in
-    // corpus.
     #[test]
     fn adr0010_d12_unreinforced_40d_aging_entry_absent_from_projection() {
         let today = d("2026-09-07");
@@ -1016,7 +987,7 @@ mod adr0010_d12_tests {
                 LearningTier::Aging,
                 Some("2026-07-29"),
                 100,
-            ), // 40d
+            ),
             entry(
                 "docs/learnings/k/fresh.md",
                 LearningTier::Aging,
@@ -1030,7 +1001,6 @@ mod adr0010_d12_tests {
             "40d aging decays out"
         );
         assert!(out.iter().any(|e| e.path.contains("fresh")));
-        // corpus unchanged (projection never deletes)
         assert_eq!(entries.len(), 2);
     }
 
@@ -1038,23 +1008,19 @@ mod adr0010_d12_tests {
     fn adr0010_d12_tier_matrix() {
         let today = d("2026-09-07");
         let entries = vec![
-            // pinned survives no reinforced stamp at all
             entry("docs/learnings/k/pin.md", LearningTier::Pinned, None, 100),
-            // aging exactly at the 30d TTL: still in (<= 30d)
             entry(
                 "docs/learnings/k/edge30.md",
                 LearningTier::Aging,
                 Some("2026-08-08"),
                 100,
             ),
-            // perishable fresh (<= 7d): in
             entry(
                 "docs/learnings/k/perish-fresh.md",
                 LearningTier::Perishable,
                 Some("2026-09-03"),
                 100,
             ),
-            // perishable stale (> 7d): out
             entry(
                 "docs/learnings/k/perish-old.md",
                 LearningTier::Perishable,
@@ -1068,23 +1034,19 @@ mod adr0010_d12_tests {
         assert!(paths.contains(&"docs/learnings/k/edge30.md"));
         assert!(paths.contains(&"docs/learnings/k/perish-fresh.md"));
         assert!(!paths.contains(&"docs/learnings/k/perish-old.md"));
-        // ranking: newest reinforced first (pinned-with-no-stamp last)
         assert_eq!(paths[0], "docs/learnings/k/perish-fresh.md");
     }
 
-    // frontmatter parse: tier + reinforced (+ expires for perishable docs)
     #[test]
     fn adr0010_d12_frontmatter_parse() {
         let fm = "---\ntrack: bug\ntier: aging\nreinforced: 2026-09-07\n---\n# body";
         let (tier, reinforced) = parse_learning_frontmatter(fm).expect("parses");
         assert_eq!(tier, LearningTier::Aging);
         assert_eq!(reinforced, Some("2026-09-07".to_string()));
-        // legacy entries (no tier/reinforced): unknown tier, no stamp
         let fm2 = "---\ntrack: bug\n---\n# body";
         let (tier2, r2) = parse_learning_frontmatter(fm2).expect("parses");
-        assert_eq!(tier2, LearningTier::Aging); // migration default
+        assert_eq!(tier2, LearningTier::Aging);
         assert_eq!(r2, None);
-        // no frontmatter at all
         assert!(parse_learning_frontmatter("# just a doc").is_none());
     }
 
@@ -1099,8 +1061,6 @@ mod adr0010_d12_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---- ADR-0006 D1: parameterized stage payloads (bd-stage-params-pqo9) ----
 
     /// The reserved D1 payload slots (ADR-0006 §3 D1). `bead` is
     /// production-consumed (cmd_send headers every dispatch with it);
@@ -1253,8 +1213,6 @@ mod tests {
     /// legitimately differs and `load()` would flake on machines holding one.
     #[test]
     fn ceiling_template_renders() {
-        // Every section the captain's amendment close reads must be in the
-        // template, or the close goes back to per-report interpretation.
         for needle in [
             "status: CEILING",
             "done:",
@@ -1270,8 +1228,6 @@ mod tests {
                 "ceiling template must carry {needle:?}: {CEILING_REPORT_TEMPLATE}"
             );
         }
-        // The template reaches the stages that render and consume it, from
-        // the one source — a stage missing it renders the old free-form report.
         let lib = StageLibrary::compiled_in();
         for stage in CEILING_TEMPLATE_STAGES {
             let prompt = lib
@@ -1480,7 +1436,6 @@ mod tests {
     /// semantic name).
     #[test]
     fn user_override_replaces_prompt() {
-        // XDG_CONFIG_HOME mutation is process-global — serialize (193.2).
         let _g = crate::config::lock_env();
         let lib = StageLibrary::compiled_in();
         let old = lib.resolve("ce-execute").unwrap().to_string();
@@ -1493,14 +1448,11 @@ mod tests {
             "[stages.ce-execute]\nname = \"ce-execute\"\nprompt = \"MY OVERRIDE PROMPT\"\n",
         )
         .unwrap();
-        // Rebuild with the override applied.
         let lib2 = StageLibrary::load().unwrap();
         assert_eq!(lib2.resolve("ce-execute"), Some("MY OVERRIDE PROMPT"));
         assert_ne!(old, "MY OVERRIDE PROMPT");
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    // ---- ADR-0022 W6 (bd-adr22-w6-stage-registry-0jgr) ----
 
     /// W6: seed role affinities exist so stage-first compose can dispatch
     /// the §3.8 example parts without extra declaration.
@@ -1540,11 +1492,9 @@ mod tests {
             StageLibrary::load_layered(Some(&dir.join("proj/.flywheel/stages.toml"))).unwrap();
         assert_eq!(lib.resolve("w6-layered"), Some("PROJECT TIER"));
         assert_eq!(lib.tier_of("w6-layered"), Some(Tier::Project));
-        // Without the project file, the user tier still resolves.
         let lib_user_only = StageLibrary::load().unwrap();
         assert_eq!(lib_user_only.resolve("w6-layered"), Some("USER TIER"));
         assert_eq!(lib_user_only.tier_of("w6-layered"), Some(Tier::User));
-        // Seed tag on an untouched compiled entry.
         assert_eq!(lib.tier_of("ce-execute"), Some(Tier::Seed));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1554,12 +1504,10 @@ mod tests {
     #[test]
     fn cfgv_stage_override_field_level_merge() {
         let mut lib = StageLibrary::compiled_in();
-        // Seed ce-execute carries role + phase (SEED_AFFINITY/SEED_PHASE).
         assert_eq!(
             lib.get_stage("ce-execute").unwrap().role.as_deref(),
             Some("coder")
         );
-        // User tier overrides ONLY the prompt: role/phase inherit.
         lib.apply_toml(
             "[stages.ce-execute]\nname = \"ce-execute\"\nprompt = \"USER PROMPT\"\n",
             Tier::User,
@@ -1578,7 +1526,6 @@ mod tests {
             Some(Tier::User),
             "tier tag reports the top tier"
         );
-        // Re-declaring a field replaces it (later tier wins per-field).
         lib.apply_toml(
             "[stages.ce-execute]\nname = \"ce-execute\"\nprompt = \"P2\"\nrole = \"reviewer\"\nparams = [\"bead\"]\n",
             Tier::Project,
@@ -1592,7 +1539,6 @@ mod tests {
             Some("implement"),
             "undeclared phase still inherits"
         );
-        // An unknown name in a tier is a fresh record, not a merge.
         lib.apply_toml(
             "[stages.fresh]\nname = \"fresh\"\nprompt = \"ONLY\"\n",
             Tier::User,
@@ -1654,7 +1600,6 @@ mod tests {
             lint_stage(&good, &valid_roles).is_empty(),
             "well-formed stage lints clean"
         );
-        // ADR-0009: `compound` is valid phase vocabulary.
         let mut compound = scaffold("w6-compound");
         compound.role = Some("housekeeper".to_string());
         compound.phase = Some("compound".to_string());
@@ -1749,10 +1694,6 @@ mod bd_mvy4_wave_gate {
     /// deleting the flag must fail this test.
     #[test]
     fn the_wave_gate_passes_project_to_preflight() {
-        // compiled_in(), NOT load(): `load` layers the user tier over this, and
-        // a stale user copy shadows the prompt under test. That shadowing is
-        // bd-3o5t's mechanism and has its own bead; here we pin the source of
-        // truth that this change edits.
         let lib = crate::stages::StageLibrary::compiled_in();
         let prompt = lib
             .get_stage("wave-gate")

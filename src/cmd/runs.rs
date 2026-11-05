@@ -138,9 +138,6 @@ pub(crate) fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
     match cmd {
         RunsCmd::List { json } => {
             let mut runs = all_run_entries()?;
-            // Headless run logs (ADR-0010 Spec E, P10.1/P10.4): the leaf
-            // writes runs/<run_id>.jsonl — list them alongside the state-log
-            // runs so cron outcomes surface in the same dashboard.
             for hl in crate::run_log::read_runs() {
                 runs.push((
                     hl.run_id.clone(),
@@ -154,9 +151,6 @@ pub(crate) fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
                             "model": hl.model,
                             "cron": hl.cron,
                             "workflow": hl.workflow,
-                            // ADR-0022 W4: surface the W2 phase fields in the
-                            // runs dashboard — per-phase cycle time needs the
-                            // column to exist first.
                             "phase": hl.phase,
                             "phase_degraded": hl.phase_degraded,
                         }),
@@ -173,8 +167,6 @@ pub(crate) fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
                 .map(|(project, e)| crate::run_list_row(project, e))
                 .collect();
             if *json {
-                // bd-cron-run-no-live-u9tg: one JSON array for drivers —
-                // jq-able (.[0].status) instead of per-line pretty objects.
                 print_json(&Value::Array(rows.clone()));
                 return Ok(());
             }
@@ -209,8 +201,6 @@ pub(crate) fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
                 }));
                 return Ok(());
             }
-            // Headless run-log fallback (ADR-0010 Spec E, P10.1): headless
-            // runs live in `runs/<run_id>.jsonl`, not the state log.
             if let Some(entry) = crate::run_log::find_run(id) {
                 print_json(&json!({
                     "run_id": entry.run_id,
@@ -324,9 +314,6 @@ pub(crate) fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
                 .filter(|(_, n)| **n > *broken_after)
                 .map(|(owner, n)| json!({ "owner": owner, "failures": n }))
                 .collect();
-            // Headless run logs (ADR-0010 Spec E, P10.1): failures since the
-            // cutoff are aggregated separately — they live in `runs/`, not
-            // the state log.
             let headless_failed: Vec<Value> = crate::run_log::failures_since(cutoff.as_deref())
                 .into_iter()
                 .map(|e| {

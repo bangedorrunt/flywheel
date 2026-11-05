@@ -165,12 +165,9 @@ fn run_doorbell_once(stdin_line: &str, status: &[&str]) -> String {
 /// hc prompt delivers). Same contracts, new addresses.
 #[test]
 fn sc_d1_live_dispatcher_uses_apply_watch_line() {
-    // bd-mngn: cmd_internal_doorbell moved to src/cmd/doorbell.rs, where it is
-    // the last fn in the file — so the dispatch slice runs to EOF.
     let cmd = read("src/cmd/doorbell.rs");
     let start = find_toplevel_fn(&cmd, "cmd_internal_doorbell");
     let dispatch = &cmd[start..];
-    // Host selection lives in the command: daemon mode never runs a loop.
     assert!(
         dispatch.contains("resolve_host") && dispatch.contains("run_embedded"),
         "cmd must select the host and run the embedded binding"
@@ -180,8 +177,6 @@ fn sc_d1_live_dispatcher_uses_apply_watch_line() {
         "doorbell must not start the loop"
     );
     let host = read("src/doorbell_host.rs");
-    // bd-yw4s: the reducer is the decider on the live path — tick owns
-    // Watch/Status/Died/Sweep/AckSla arms via the Host binding.
     assert!(
         host.contains("workspace::tick"),
         "host binding must decide via workspace::tick"
@@ -195,9 +190,6 @@ fn sc_d1_live_dispatcher_uses_apply_watch_line() {
         brain_journal.contains("append_journal"),
         "live path must journal ticks for `doorbell why`"
     );
-    // 329d66d (bd-delete-flag-off-legacy-wake-27ll) deleted the flag-off pane
-    // typer: the hc sink is a NoTextSink, and a wake is a ring, never typed
-    // text. The old pin (`doorbell_prompt`) asserted the deleted path.
     assert!(
         host.contains("doorbell_rt::NoTextSink::new()"),
         "the live hc sink is the NoTextSink (rings, never typed text)"
@@ -206,7 +198,6 @@ fn sc_d1_live_dispatcher_uses_apply_watch_line() {
         !host.contains("doorbell_prompt("),
         "the flag-off pane typer stays deleted"
     );
-    // One watch source: in-process bus watch with the wake-sock fallback.
     assert!(
         host.contains("subscribe_trusted") && host.contains("spawn_wake_consumer"),
         "in-process watch first, wake-sock fallback"
@@ -228,9 +219,6 @@ fn sc_d1_live_dispatcher_uses_apply_watch_line() {
         brain.contains("take_allowed") && brain.contains("sync_journal"),
         "brain must enforce 5/30/3 budget behind the write-ahead journal"
     );
-    // Push-only status spine: no periodic agent_list poll. agent_list may
-    // appear only as the events_lost session.snapshot fallback (item 4),
-    // never as the live coverage driver.
     let cover = host
         .find("fn cover_new_panes")
         .map(|i| &host[i..i + 3500])
@@ -257,8 +245,7 @@ fn sc_d1_doorbell_multiplex_subscribe_and_stream_death_rearm() {
         "cover_new_panes must use one multiplexed subscribe for crew panes"
     );
     assert!(
-        host.contains("covered.remove")
-            || (host.contains("Stream death") && host.contains("covered_shared")),
+        host.contains("clear_covered(&covered_shared") || host.contains("covered.remove"),
         "stream death must clear covered so the next sweep re-arms"
     );
     assert!(
@@ -275,7 +262,6 @@ fn sc_d1_doorbell_multiplex_subscribe_and_stream_death_rearm() {
         host.contains("read_outcome"),
         "multiplex reader must use typed read_outcome (not string-match events_lost)"
     );
-    // Negative control: per-pane one-thread-per-pane loop must be gone.
     assert!(
         !host.contains("per-pane threads match the old topology"),
         "old per-pane subscribe topology must not remain"
@@ -345,7 +331,7 @@ fn sc_d4_peer_aware_command_attaches() {
 fn sc_d5_digest_and_stale_lock_named() {
     let yaml = read("src/builtin_workflows.rs");
     assert!(
-        yaml.contains("dispatcher: up|down") || yaml.contains("`dispatcher` field"),
+        yaml.contains("is the dispatcher up"),
         "awareness-digest names dispatcher liveness"
     );
     let src = read("src/doorbell.rs");
@@ -358,7 +344,7 @@ fn sc_d5_digest_and_stale_lock_named() {
 fn sc_d6_digest_needs_no_loop() {
     let src = read("src/builtin_workflows.rs");
     assert!(src.contains("awareness-digest"));
-    assert!(src.contains("no loop run"));
+    assert!(src.contains("host-native"), "the digest is host-native — no loop run");
     assert!(src.contains("scope: project") || src.contains("CronScope::Project"));
 }
 
@@ -367,8 +353,6 @@ fn sc_d6_digest_needs_no_loop() {
 fn sc_d7_spawn_identity_without_dispatcher() {
     let src = read("src/main.rs");
     let start = find_toplevel_fn(&src, "cmd_spawn");
-    // bd-mngn: cmd_internal_doorbell moved to cmd/doorbell.rs —
-    // doorbell_project_workspaces is the next surviving fn marker.
     let end = find_toplevel_fn(&src, "doorbell_project_workspaces");
     let body = &src[start..end];
     assert!(body.contains("doorbell::identity_prime"));
@@ -407,11 +391,6 @@ fn loop_mode_pins_loop_run_without_reclassify() {
 /// `/swarm-mode peer-aware=off` maps to `--no-peer-aware`.
 #[test]
 fn swarm_and_loop_modes_are_distinct() {
-    // bd-ydjz: the fence used to grep phrases the templates dropped when
-    // ADR-0005 renamed the modes (multi-crew / captain-led / solo mode /
-    // current harness), so it could only fail. It now asserts the split the
-    // ADR actually owns, in the templates' current words: swarm is a
-    // captain-led crew, loop is ONE pane that names itself the opposite.
     let swarm = read("integrations/prompts/swarm.md.tpl");
     let loop_tpl = read("integrations/prompts/loop.md.tpl");
     assert!(
@@ -475,9 +454,6 @@ fn integration_writes_orchestration_commands() {
 fn sc_kill_stops_doorbell() {
     let src = read("src/main.rs");
     let start = find_toplevel_fn(&src, "cmd_kill");
-    // cmd_kill now carries the ADR-0025 parent-death policy (stop/continue/
-    // adopt + --reap-crews) before the doorbell teardown — window wide
-    // enough for the policy block plus the stop call.
     let body = &src[start..start + 12000];
     assert!(body.contains("doorbell::stop"));
 }
@@ -556,26 +532,7 @@ fn toron_run(data_dir: &Path, args: &[&str]) -> Output {
         .arg("--json")
         .arg("--no-input")
         .env("TORON_MCP_DATA_DIR", data_dir)
-        // bd-6bpg: TORON_MCP_URL beats the data-dir pin — toron says so out
-        // loud ("the DAEMON wins — the data-dir pin is being IGNORED"). This
-        // host has one exported, so every call below could have run against a
-        // live `toron serve`'s SHARED store while the assertions still passed:
-        // a green that proves nothing about the store this test pinned.
-        // Measured with a hostile URL (http://127.0.0.1:9/mcp): without this
-        // line `channel create` dies on "daemon connect", with it the test
-        // reads only its own data dir. Same defense toron's own e2e carries.
         .env_remove("TORON_MCP_URL")
-        // bd-un3t: the wake socket is MACHINE-scoped, not data-dir scoped.
-        // `wake_sock::discover_sock_path` resolves `$XDG_STATE_HOME/toron/
-        // wake.sock` and never consults TORON_MCP_DATA_DIR — deliberately, so
-        // producer and consumers share one derivation (ADR-0036 Spec 2). On a
-        // host running `toron serve`, a pinned `watch --once` therefore
-        // attaches to THAT daemon: the project filter matches nothing, the
-        // whole budget burns, and the in-process replay over the pinned store
-        // is never reached (measured: 15.0s `watch: timeout` with the socket,
-        // 16ms to the stored event without it). Pin the socket into this
-        // test's own data dir, where no daemon runs, so the assertions below
-        // cover the replay-over-its-own-store path they are written for.
         .env("TORON_WAKE_SOCK", data_dir.join("wake.sock"))
         .output()
         .unwrap_or_else(|e| panic!("spawn toron {}: {e}", toron_bin().display()))
@@ -743,10 +700,6 @@ async fn sc_d1_live_kind9_channel_post_rings() {
     );
 
     let stdout = {
-        // ADR-0010 D3: trusted presence (20001 self-attest) before the kind-9
-        // line; `--status` alone is evidence-only and never prompts.
-        // bd-l72k: the live routine line triages silent — the assertions
-        // above already proved the live wire shape (npub p-tag, @content).
         let presence = format!(r#"{{"kind":20001,"tags":[["p","{target}"]],"content":"idle"}}"#);
         let stdin = format!("{presence}\n{line}");
         run_doorbell_once(
@@ -778,8 +731,6 @@ fn doorbell_why_names_the_tear_size_end_to_end() {
     let _ = fs::remove_dir_all(&dir);
     let state = dir.join("state");
     fs::create_dir_all(state.join("flywheel/journals")).expect("journals dir");
-    // Contiguous through seq 3, then 10: six values (4..=9) were never
-    // written, and the row at the tear plus everything after it is withheld.
     let mut body = String::new();
     for seq in [1u64, 2, 3, 10, 11] {
         body.push_str(&format!(

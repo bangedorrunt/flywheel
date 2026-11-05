@@ -336,7 +336,6 @@ pub(crate) struct SenderTurn {
 
 impl Drop for SenderTurn {
     fn drop(&mut self) {
-        // Closing the fd releases the flock; unlocking first says so.
         let _ = self.file.unlock();
     }
 }
@@ -427,29 +426,13 @@ pub async fn append_task(
     let dir = comms_dir(state_dir, sender);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let run = run_id();
-    // One sender, one turn (bd-or1zt), held for the WHOLE send: the
-    // recovery, every local epoch claim, and every append the claim fences
-    // are one critical section. Across processes, not just tasks.
     let _turn = take_sender_turn(state_dir, sender).await?;
     let body = serde_json::to_value(task)?;
 
-    // 1. Reconcile whatever a crashed earlier run journaled (toron's
-    //    mail.append recovery): present -> settled, absent -> appended with
-    //    the SAME triple.
-    //
-    //    The recovery runs inside the sender's turn (bd-3s2q). The outbox
-    //    CLAIMS a journal epoch, and a claim fences every lower epoch at once,
-    //    so a recovery outside the turn fenced a live peer's in-flight
-    //    append: "stale epoch for producer <npub>#journal: sent 12, current
-    //    13". One sender, one turn: the claim and the appends it fences are
-    //    the same critical section, so a run's own epoch is never fenced by a
-    //    peer that is still writing under it.
     outbox::send_and_recover(store.clone(), sender.to_string(), Vec::new())
         .await
         .map_err(|e| anyhow!("recover sender intents: {e}"))?;
 
-    // (msg key, state, offset) once a recipient is settled; `last_why` keeps
-    // the latest refusal for a recipient still pending.
     type Done = (String, String, Option<u64>);
     let mut done: Vec<Option<Done>> = vec![None; recipients.len()];
     let mut last_why: Vec<Option<(String, String)>> = vec![None; recipients.len()];
@@ -463,18 +446,12 @@ pub async fn append_task(
             break;
         }
         if round > 0 {
-            // Fenced by a concurrent sender of this npub (another process,
-            // or the toron journal-epoch race): back off with jitter, then
-            // re-plan.
             tokio::time::sleep(std::time::Duration::from_millis(backoff_ms(
                 round,
                 random_draw(),
             )))
             .await;
         }
-        // Claim-to-settle is one critical section per sender, held by the
-        // turn taken at the top of this function.
-        // 2. Plan each pending recipient from its intent record and the log.
         let store_epoch = store.producer_epoch(sender).await?;
         let mut resend: Vec<(usize, Envelope)> = Vec::new();
         let mut mint: Vec<usize> = Vec::new();
@@ -488,7 +465,6 @@ pub async fn append_task(
             if let Some(env) = &recorded
                 && (env.body != body || env.context.0 != context)
             {
-                // The same task id with a different brief is not a retry.
                 return Err(SendError::PayloadConflict {
                     msg_key: env.msg.key(),
                 }
@@ -501,12 +477,6 @@ pub async fn append_task(
             match plan_send(recorded, offset, store_epoch) {
                 SendPlan::AlreadyAppended { env, offset } => {
                     match verify_recorded(store, &env).await {
-                        // A concurrent writer minted the same (producer, epoch,
-                        // seq) for a DIFFERENT task: the id is theirs and this
-                        // intent never landed. The task-id reuse check above
-                        // already ran on this run's own recorded brief, so this
-                        // is a lost race: drop the intent and let the next
-                        // round mint a fresh triple.
                         Err(e) if is_payload_conflict(&e.to_string()) => {
                             let _ = std::fs::remove_file(&paths[i]);
                             last_why[i] =
@@ -524,16 +494,9 @@ pub async fn append_task(
             }
         }
 
-        // 3a. Resends first, under their recorded epochs, lower epoch first
-        //     (the log fences an epoch below its current one). Resending
-        //     BEFORE claiming keeps the claim from fencing them.
         resend.sort_by_key(|(_, e)| (e.msg.epoch, e.msg.seq));
-        // 3b. Mint under an epoch claimed from the log; record each intent
-        //     BEFORE the send (the record is what makes a retry re-send the
-        //     same msg id). An unused epoch is simply skipped.
         let mut fresh: Vec<(usize, Envelope)> = Vec::new();
         if !mint.is_empty() {
-            // Resends settle before the claim fences their epochs.
             settle_batch(store, sender, &resend, &paths, &mut done, &mut last_why).await?;
             let claim = store
                 .claim_epoch(sender, &run)
@@ -575,8 +538,6 @@ pub async fn append_task(
                 state,
                 offset,
                 wake: String::new(),
-                // Stamped by stamp_delivery() once the wake arms ran; empty
-                // here means unstamped, never a delivery claim.
                 delivery: String::new(),
             }
         })
@@ -612,9 +573,6 @@ async fn settle_batch(
         let key = env.msg.key();
         match report.sent.get(&key) {
             Some(SendState::Refused(why)) if is_payload_conflict(why) => {
-                // The triple is held by another writer's content, so this
-                // append never landed. Drop the intent: the next round mints
-                // a fresh triple instead of failing the step.
                 let _ = std::fs::remove_file(&paths[*i]);
                 last_why[*i] = Some((key, why.clone()));
             }
@@ -625,11 +583,6 @@ async fn settle_batch(
             Some(SendState::Settled(o)) => {
                 done[*i] = Some((key, "appended".into(), Some(*o)));
             }
-            // In flight / unknown / not reported: the append may not have
-            // run (the journal refused the intent under a racing sender).
-            // Ask the log, never guess: present -> settled; absent -> the
-            // intent record stays and the next round re-sends the SAME msg
-            // id (the log dedupes by triple) or mints if it was fenced.
             Some(_) | None => match store.lookup(&env.msg).await? {
                 Some(o) => done[*i] = Some((key, "appended".into(), Some(o))),
                 None => last_why[*i] = Some((key, "append not confirmed".into())),
@@ -749,13 +702,10 @@ pub fn send(cfg: &Config, req: Request<'_>) -> Result<Vec<SentRow>> {
         }
         .into());
     }
-    // Parse everything before any I/O: a bad token sends nothing.
     let parsed: Vec<Address> = tokens
         .iter()
         .map(|t| parse_address(t))
         .collect::<Result<_, _>>()?;
-    // ADR-0019 D12: an address naming another project is refused before
-    // any I/O — mail never parks cross-project.
     if let Some(refusal) = cross_project_refusal(req.project, &tokens, &parsed) {
         return Err(refusal.into());
     }
@@ -764,8 +714,6 @@ pub fn send(cfg: &Config, req: Request<'_>) -> Result<Vec<SentRow>> {
     let mb = crate::mail::mailbox();
     let project = req.project.to_string();
     let (sender, recipients) = crate::mail::block_on(async {
-        // ADR-0019 D12: a sender that does not resolve in this project has
-        // not arrived in it — refused with `unarrived`, not retried.
         let sender = resolve(mb, &project, &sender_tok)
             .await
             .map_err(|e| match e {
@@ -791,11 +739,6 @@ pub fn send(cfg: &Config, req: Request<'_>) -> Result<Vec<SentRow>> {
         req.task_id,
         &req.task,
     ))?;
-    // Wake: the constant line only, to the recipient's pane. Off hc the
-    // typer and the target resolution follow the selected backend (same
-    // constant line, same no-host-rings rule); hc keeps the path below.
-    // (Feature-gated: without the rex backend this selection cannot ring
-    // anywhere else, so the hc path below stays the behavior.)
     #[cfg(feature = "backend-superlogical")]
     if crate::backend::resolve_backend_name(cfg) != "hc" {
         for (row, addr) in rows.iter_mut().zip(parsed.iter()) {
@@ -815,9 +758,6 @@ pub fn send(cfg: &Config, req: Request<'_>) -> Result<Vec<SentRow>> {
             (Err(e), _) => format!("skipped: hc unavailable ({e})"),
             (Ok(c), Some(pin)) => match wake_target(c, &project, pin) {
                 Err(e) => format!("no-pane ({e:#})"),
-                // The doorbell's inbox host rings level-triggered with the ring
-                // budget and the deaf escalation. A sender ring on top of it
-                // would be a second, unbudgeted writer for the same mail.
                 Ok(target) => {
                     let ws = crate::find_workspace_info(c, &project).ok();
                     if doorbell_owner(&project, ws.as_ref()).is_some() {
@@ -887,10 +827,6 @@ fn doorbell_owner_in(
     workspace: Option<&str>,
     now: u64,
 ) -> Option<u32> {
-    // A lease counts only if its holder RINGS: a daemon host under the comms
-    // flag holds the workspace lease but types nothing (kind `no-text`), so
-    // deferring to it left the workspace silent. The inbox host's own lease
-    // (`inbox-<ws>`) is the ringer there (follow-up a).
     let inbox = workspace.map(crate::doorbell::inbox_owner_key);
     doorbell_rt::lease::live_leases(state_dir, now)
         .into_iter()
@@ -904,8 +840,6 @@ fn doorbell_owner_in(
 /// Pure: the wake target pane for a pin from a backend listing. Mirrors
 /// `wake_target`'s exactly-one-or-typed-error contract: a pin names its
 /// block label (set by spawn/rename) or its agent name, never a substring.
-// Shared with the default send path's rex arm (`resolve_send_targets_dyn`),
-// which needs the same rule, not a copy.
 #[cfg(feature = "backend-superlogical")]
 pub(crate) fn backend_wake_target(agents: &[AgentInfo], pin: &str) -> Result<String, String> {
     let mut hits = agents
@@ -985,8 +919,6 @@ fn append_of(state: &str) -> crate::captain_directory::AppendState {
     } else if state == "already-appended" {
         AppendState::AlreadyAppended
     } else {
-        // Anything else (unknown, empty) reads as no-append; `refused`
-        // never reaches here (append_of_row maps it first).
         AppendState::Unknown
     }
 }
@@ -1017,10 +949,8 @@ fn wake_facts(wake: &str) -> (bool, bool, Option<bool>) {
     } else if wake.starts_with("no-pane") || wake.starts_with("skipped:") {
         (false, false, None)
     } else if wake.starts_with("no ") && wake.contains("door for harness") {
-        // Skip note: the target resolved, but the harness door is closed.
         (true, false, None)
     } else {
-        // Anything unrecognized: claim nothing — never invent `woke`.
         (false, false, None)
     }
 }
@@ -1055,7 +985,6 @@ fn tier_of_recipient(
         pin_registered: entry.is_some(),
         location_hosted,
         has_block: live,
-        // Rows exist only when comms is on (send() refuses otherwise).
         inbox_enabled: true,
         rex_degraded: false,
         positive_no_receiver: false,
@@ -1069,7 +998,6 @@ fn stamp_delivery(project: &str, rows: &mut [SentRow], pins: &[Option<&str>]) {
     use crate::captain_directory::delivery_of;
     for (row, pin) in rows.iter_mut().zip(pins.iter()) {
         let (live, prompt_supported, prompt) = wake_facts(&row.wake);
-        // A degraded read (backend unavailable) is Unknown, never None.
         let tier = if row.wake.starts_with("skipped:") {
             crate::captain_directory::Tier::Unknown
         } else {
@@ -1121,8 +1049,6 @@ pub fn loop_send(
     text: &str,
     task_id: &str,
 ) -> Result<Value> {
-    // The loop names its target by hc agent name; the inbox is keyed by
-    // the pane's mail pin (spawn registry), so map name -> pin first.
     let registry = crate::state::load_spawn_registry(project);
     let pin = crate::registry_entry_for_token(&registry, project, name)
         .and_then(|e| e.mail_identity.clone())
@@ -1160,7 +1086,6 @@ mod tests {
                 assert!((1..=25 * round as u64 + 1).contains(&ms), "{ms} @ {round}");
                 seen.insert(ms);
             }
-            // Contenders must be able to land on different delays.
             assert!(seen.len() > 1);
         }
         assert_ne!(random_draw(), random_draw());
@@ -1170,10 +1095,6 @@ mod tests {
     async fn one_sender_one_turn_distinct_senders_distinct_locks() {
         let dir = tempfile::tempdir().unwrap();
         let held = take_sender_turn(dir.path(), A).await.unwrap();
-        // A SECOND open of the same path is the peer `__send` process's
-        // shape: flock is per file description, so it waits while ours is
-        // held. A process-local mutex would let it through — which is the
-        // defect bd-or1zt measured.
         std::fs::create_dir_all(sender_turn_path(dir.path(), A).parent().unwrap()).unwrap();
         let peer = std::fs::OpenOptions::new()
             .create(true)
@@ -1261,9 +1182,7 @@ mod tests {
         assert_eq!(env.to, Recipient::Npub(B.into()));
         assert_eq!(env.contract, ContractId::new("task", 1));
         assert_eq!(env.msg.key(), format!("{A}:3:0"));
-        // A pin name in `to` is refused by the envelope itself.
         assert!(task_envelope(A, "AmberFixture", msg(3, 0), "c", "t", &task()).is_err());
-        // An empty brief is not a task.
         let empty = TaskV1 {
             brief: " ".into(),
             ..task()
@@ -1289,7 +1208,6 @@ mod tests {
             plan_send(Some(env.clone()), None, None),
             SendPlan::Resend(env.clone())
         );
-        // Stale: the log moved past its epoch, so it never landed: mint.
         assert_eq!(plan_send(Some(env), None, Some(3)), SendPlan::Mint);
         assert_eq!(plan_send(None, None, Some(3)), SendPlan::Mint);
         assert_eq!(intent_key("t", B), intent_key("t", B));
@@ -1316,8 +1234,6 @@ mod tests {
             );
         }
     }
-
-    // ---- the effect against the real store (in-memory sqlite) ----
 
     async fn mem_store() -> InboxStore {
         let dir = tempfile::tempdir().unwrap().keep();
@@ -1362,8 +1278,6 @@ mod tests {
         assert_eq!(first[0].state, "appended");
         let head = rows_for(&store, B).await;
         assert!(head > 0);
-        // Retry of the same task (e.g. after a crash): the recorded msg id is
-        // found in the log; no second row.
         let again = append_task(&store, dir.path(), A, &rcpt, "c", "t-1", &task())
             .await
             .unwrap();
@@ -1371,7 +1285,6 @@ mod tests {
         assert_eq!(again[0].msg_id, first[0].msg_id);
         assert_eq!(again[0].offset, first[0].offset);
         assert_eq!(rows_for(&store, B).await, head, "exactly one envelope");
-        // A different task is a different message, under a fresh epoch.
         let other = append_task(&store, dir.path(), A, &rcpt, "c", "t-2", &task())
             .await
             .unwrap();
@@ -1388,9 +1301,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first[0].state, "appended");
-        // A concurrent writer planned the SAME (producer, epoch, seq) for a
-        // different task and landed first. Its content is not ours, so the
-        // recorded intent for t-2 can only be re-planned, never replayed.
         let taken = MsgId::parse_key(&first[0].msg_id).expect("a msg key");
         let loser = task_envelope(A, B, taken, "c", "t-2", &task()).unwrap();
         let path = dir
@@ -1426,7 +1336,6 @@ mod tests {
             head > 0 && cursor == 0,
             "unread mail: head {head} > cursor 0"
         );
-        // The agent runs `toron next`: the cursor commits to the head.
         let got = store.next(B, None, false).await.unwrap();
         assert_eq!(got.items.len(), 1);
         let (head2, cursor2) = crate::inbox_ports::head_and_cursor(&store, B).await;
@@ -1435,7 +1344,6 @@ mod tests {
             (head, head),
             "the ack is seen: cursor == head"
         );
-        // The wrong key (the log's name) never sees it: the bug this pins.
         assert_eq!(
             store
                 .cursor(B, toron_core::inbox::INBOX_STREAM)
@@ -1454,14 +1362,11 @@ mod tests {
         let lease = doorbell_rt::lease::acquire_lease(dir.path(), "proj", now).unwrap();
         assert_eq!(lease.pid, me);
         assert_eq!(doorbell_owner_in(dir.path(), "proj", None, now), Some(me));
-        // Another project's owner is not this project's writer.
         assert_eq!(doorbell_owner_in(dir.path(), "other", None, now), None);
-        // The workspace name (a label that differs from the project) counts.
         assert_eq!(
             doorbell_owner_in(dir.path(), "x", Some("proj"), now),
             Some(me)
         );
-        // A wedged heartbeat is no owner: the sender falls back to ringing.
         assert_eq!(
             doorbell_owner_in(dir.path(), "proj", None, now + 1000),
             None
@@ -1476,7 +1381,6 @@ mod tests {
         use doorbell_rt::lease::{KIND_NO_TEXT, acquire_lease_kind, inbox_lease_key};
         let dir = tempfile::tempdir().unwrap();
         let now = doorbell_rt::lease::unix_now();
-        // The daemon (a live process: this one) holds the workspace, typing nothing.
         let held = acquire_lease_kind(dir.path(), "proj", now, Some(KIND_NO_TEXT)).unwrap();
         assert_eq!(held.pid, std::process::id(), "the holder is alive");
         assert_eq!(
@@ -1484,13 +1388,11 @@ mod tests {
             None,
             "sender rings itself"
         );
-        // The inbox host comes up beside it: now there IS a ringer to defer to.
         acquire_lease_kind(dir.path(), &inbox_lease_key("proj"), now, None).unwrap();
         assert_eq!(
             doorbell_owner_in(dir.path(), "proj", Some("proj"), now),
             Some(std::process::id())
         );
-        // A different workspace's inbox lease is not this one's.
         assert_eq!(
             doorbell_owner_in(dir.path(), "other", Some("other"), now),
             None
@@ -1517,7 +1419,6 @@ mod tests {
         let now = doorbell_rt::lease::unix_now();
         let ws = plane_ws("w1", "flywheel-proj");
         assert_eq!(owner_of_workspace(dir.path(), "proj", Some(&ws), now), None);
-        // Exactly what `run_inbox_only(cfg, "proj", "flywheel-proj")` leases.
         doorbell_rt::lease::acquire_lease(
             dir.path(),
             &crate::doorbell::inbox_owner_key("flywheel-proj"),
@@ -1529,7 +1430,6 @@ mod tests {
             Some(std::process::id()),
             "the sender must defer to the live inbox host: one wake per send"
         );
-        // Another workspace's host is not this one's, even with the same id.
         let other = plane_ws("w1", "flywheel-other");
         assert_eq!(
             owner_of_workspace(dir.path(), "other", Some(&other), now),
@@ -1541,8 +1441,6 @@ mod tests {
     async fn a_recorded_intent_that_never_landed_is_sent_with_the_same_msg_id() {
         let store = mem_store().await;
         let dir = tempfile::tempdir().unwrap();
-        // Simulate a crash after flywheel recorded the intent, before any
-        // append: the record exists, the log does not have it.
         let claim = store.claim_epoch(A, "crashed-run").await.unwrap();
         assert_eq!(claim.epoch, 0);
         let env = task_envelope(A, B, msg(0, 0), "c", "t-9", &task()).unwrap();
@@ -1619,8 +1517,6 @@ mod tests {
     async fn concurrent_runs_never_share_an_epoch() {
         let store = mem_store().await;
         let rcpt = vec![("Birch".to_string(), B.to_string())];
-        // bd-or1zt: one state dir (the outbox root is per USER, not per run),
-        // so the three contenders take the same turn and claim in sequence.
         let d = tempfile::tempdir().unwrap();
         let t = task();
         let (r1, r2, r3) = tokio::join!(
@@ -1745,8 +1641,6 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
-        // bd-or1zt: the turn IS the lock file (`.turn.lock`, an flock, never
-        // an epoch record); the only other file is the intent.
         assert_eq!(
             names,
             vec![
@@ -1754,7 +1648,6 @@ mod tests {
                 format!("{}.json", intent_key("t-1", B))
             ]
         );
-        // The claim is what the log now says the epoch is.
         assert_eq!(store.producer_epoch(A).await.unwrap(), Some(0));
     }
 
@@ -1767,7 +1660,6 @@ mod tests {
         let env = task_envelope(A, B, msg(0, 0), "c", "t-f", &task()).unwrap();
         let path = comms_dir(dir.path(), A).join(format!("{}.json", intent_key("t-f", B)));
         write_atomic(&path, serde_json::to_string(&env).unwrap().as_bytes()).unwrap();
-        // Another run claims a newer epoch: the recorded one can never land.
         let other = store.claim_epoch(A, "other-run").await.unwrap();
         assert_eq!(other.epoch, 1);
         let rcpt = vec![("Birch".to_string(), B.to_string())];
@@ -1791,13 +1683,9 @@ mod tests {
     async fn different_content_under_a_recorded_triple_is_reminted_never_replayed() {
         let store = mem_store().await;
         let dir = tempfile::tempdir().unwrap();
-        // The log already holds DIFFERENT content under (A, 0, 0)...
         let other_task = task_from_text("Another brief entirely", None, vec![]);
         let held = task_envelope(A, B, msg(0, 0), "c", "t-held", &other_task).unwrap();
         store.append_envelope(&held).await.unwrap();
-        // ...and flywheel's intent record for t-x points at that same triple.
-        // The id is the other task's, so t-x never landed: re-mint, never
-        // replay the taken id and never fail the step.
         let mine = task_envelope(A, B, msg(0, 0), "c", "t-x", &task()).unwrap();
         let path = comms_dir(dir.path(), A).join(format!("{}.json", intent_key("t-x", B)));
         write_atomic(&path, serde_json::to_string(&mine).unwrap().as_bytes()).unwrap();
@@ -1843,7 +1731,6 @@ mod tests {
         let b = task_envelope(A, B, msg(0, 0), "c", "t-2", &task()).unwrap();
         let typed = store.append_envelope(&b).await.unwrap_err();
         assert!(matches!(typed, InboxError::PayloadConflict { .. }));
-        // The kernel-facing entry (what mail.append uses) carries it as text.
         let kernel = store
             .append_json(
                 toron_core::inbox::INBOX_STREAM,
@@ -1979,15 +1866,10 @@ mod tests {
         ];
         let pins = vec![None, None, None, None];
         stamp_delivery("no-such-project", &mut rows, &pins);
-        // No registry rows: unregistered pins read Unknown tier. Rung still
-        // means the prompt returned ok — that is `woke` on unknown tier.
         assert_eq!(rows[0].delivery, "woke");
-        // Accepted by toron, never shown: queued. The wake line alone would
-        // call this delivered; the word says otherwise.
         assert_eq!(rows[1].delivery, "queued");
         assert!(!rows[1].wake.contains("rung"));
         assert_eq!(rows[2].delivery, "queued");
-        // Refusals carry the code, never a delivery word.
         assert_eq!(rows[3].delivery, "denied");
     }
 }

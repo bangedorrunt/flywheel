@@ -102,7 +102,6 @@ pub fn seed_user_catalog_with(
             .iter()
             .any(|r| r.kind == kind && r.name == name && r.status == "stale")
     };
-    // `All` replaces a builtin-named copy whether or not drift calls it stale.
     let may_replace = |kind: &str, name: &str| match scope {
         OverwriteScope::None => false,
         OverwriteScope::Stale => is_stale(kind, name),
@@ -116,12 +115,6 @@ pub fn seed_user_catalog_with(
             if !dry_run {
                 std::fs::create_dir_all(&workflow_dir)
                     .with_context(|| format!("create {}", workflow_dir.display()))?;
-                // bd-3o5t: write the compiled-in SOURCE TEXT. Going through
-                // `serde_yaml::to_string(&Workflow)` is lossy — `CrewSpec` is
-                // `#[serde(untagged)]` with a unit `Auto` variant, so serde
-                // emits `crew: null` and the copy lost its crew. The user tier
-                // wins over the builtin, so that silently made crew workflows
-                // headless.
                 std::fs::write(&path, yaml).with_context(|| format!("write {}", path.display()))?;
             }
             report.created_workflows.push(name.to_string());
@@ -171,8 +164,6 @@ pub fn seed_user_catalog_with(
             }
             report.created_stages.push(name.to_string());
         } else if legacy.stages.contains_key(name) {
-            // An authored aggregate entry remains authoritative; do not shadow
-            // it with a generated per-entry copy.
             report.kept_stages.push(name.to_string());
         } else {
             if !dry_run {
@@ -332,36 +323,12 @@ pub fn catalog_drift(config_root: &Path) -> Result<Vec<CatalogEntryStatus>> {
     let user_workflows = load_user_workflows(config_root)?;
     let mut rows = Vec::new();
     for (name, builtin) in &builtins {
-        // bd-3o5t: compare against the compiled-in SOURCE TEXT, the same bytes
-        // seed now writes. Comparing against a re-serialization made drift and
-        // seed agree with each other while both disagreed with the catalog, so
-        // a crew-stripped copy read as `current`. `current` now means exactly
-        // one thing: this file is the builtin's text, unmodified.
         let builtin_yaml =
             crate::builtin_workflows::builtin_workflow_yaml(name).map(str::to_string);
         let status = match user_workflows.get(name) {
             None => "missing",
-            // bd-3o5t: the two tiers are compared two different ways ON PURPOSE.
-            // A `.yaml` copy is a verbatim dump of the builtin's source text, so
-            // byte equality is the right test and catches a hand-edit. A `.toml`
-            // copy is a re-encoding, so its text can never match the YAML dump;
-            // comparing it byte-wise would mark every TOML copy `stale` forever.
-            // For TOML the honest test is semantic: does it parse to the same
-            // Workflow the builtin parses to? That is the same notion the stage
-            // branch below already used, and it is the one that actually
-            // detects a dropped crew.
             Some((user, source, is_toml))
                 if if *is_toml {
-                    // Compared through `Debug`, NOT through serde.
-                    // `CrewSpec` is `#[serde(untagged)]` with a unit `Auto`
-                    // variant, and serde emits `null` for a unit variant in an
-                    // untagged enum — so a serde round-trip reports a real
-                    // `crew: auto` as `crew: null`, and a copy that genuinely
-                    // lost its crew as identical to one that kept it. `Debug`
-                    // prints the actual typed value, so the comparison sees the
-                    // crew. (`Workflow` has no `PartialEq`; deriving one would
-                    // mean editing toron-workflow's schema, and the YAML branch
-                    // above is the one seed actually uses.)
                     format!("{user:?}") == format!("{builtin:?}")
                 } else {
                     builtin_yaml
@@ -455,8 +422,6 @@ pub fn all_workflows_merged(
         None => WorkflowCatalog::load()?,
     };
     for (name, wf) in cat.workflows {
-        // Catalog (user or project tier) wins over a same-named builtin —
-        // the catalog is the home; built-ins are zero-config defaults.
         out.insert(name, (wf, "catalog"));
     }
     Ok(out)
@@ -487,8 +452,6 @@ pub fn pick_workflow(
     merged: &BTreeMap<String, ResolvedWorkflow>,
     name: &str,
 ) -> Result<ResolvedWorkflow, CatalogError> {
-    // ADR-0016: catalog identifiers are validated at the boundary while
-    // preserving prefix lookup semantics and the original error text.
     if crate::kernel::WorkflowName::parse(name.to_string()).is_err() {
         return Err(CatalogError::Unknown(name.into()));
     }
@@ -659,7 +622,6 @@ impl WorkflowCatalog {
     /// YAML are overwritten by the canonical file (canonical is the home);
     /// a mapping note records the shadowed legacy entry.
     fn absorb(&mut self, config_root: &Path) -> Result<()> {
-        // Legacy workflows.toml
         let wf_path = config_root.join("workflows.toml");
         if wf_path.exists() {
             let raw = std::fs::read_to_string(&wf_path)
@@ -681,7 +643,6 @@ impl WorkflowCatalog {
             }
         }
 
-        // Legacy pipelines.toml
         let pipe_path = config_root.join("pipelines.toml");
         if pipe_path.exists() {
             let raw = std::fs::read_to_string(&pipe_path)
@@ -716,11 +677,6 @@ fn absorb_workflow_steps(name: &str, steps: &[LegacyStep]) -> (Workflow, Vec<Map
         let source = format!("workflows.toml:{name}:{i}");
         match step {
             LegacyStep::Send { to, stage, msg } => {
-                // Send{to,stage,msg} -> dispatch_job. The stage prompt / raw
-                // message is carried in the spec so the injected ActionRunner
-                // (the hc-direct surface) preserves semantics. `stage` is
-                // a contract field; the legacy `to`/`msg` pair rides in
-                // `extra` (bd-dispatch-spec-untyped-0iud).
                 let spec = toron_workflow::schema::DispatchSpec {
                     stage: stage.clone(),
                     extra: [
@@ -749,9 +705,6 @@ fn absorb_workflow_steps(name: &str, steps: &[LegacyStep]) -> (Workflow, Vec<Map
                 });
             }
             LegacyStep::Wait { until, timeout_ms } => {
-                // Wait{until} -> the engine's spawn-await binding is a P4
-                // subsystem. Until then a delay shell keeps the run advancing;
-                // flagged, never dropped.
                 notes.push(MappingNote {
                     source: source.clone(),
                     legacy: format!("wait {until}"),
@@ -764,10 +717,6 @@ fn absorb_workflow_steps(name: &str, steps: &[LegacyStep]) -> (Workflow, Vec<Map
                     on_error: Default::default(),
                     build_slot: false,
                     action: Action::Delay {
-                        // Round UP (is1.5): integer division truncates a
-                        // sub-second wait to 0s — a silent no-op. 500ms → 1s
-                        // keeps the effective wait; only a 0/absent timeout
-                        // maps to 0.
                         secs: timeout_ms.map(|ms| ms.div_ceil(1000)).unwrap_or(0),
                     },
                 });
@@ -917,8 +866,6 @@ until = "ready"
 timeout_ms = 500
 "#,
         );
-        // absorb directly (self-contained): the step shapes parse from a
-        // legacy file written above.
         let raw = std::fs::read_to_string(dir.join("workflows.toml")).unwrap();
         let legacy: LegacyWorkflows = toml::from_str(&raw).unwrap();
         let steps = legacy.workflows.get("sub-second").unwrap();
@@ -929,7 +876,6 @@ timeout_ms = 500
             }
             other => panic!("wait absorbed to Delay, got {other:?}"),
         }
-        // exact-second and absent-timeout boundaries.
         let steps2 = vec![LegacyStep::Wait {
             until: "x".into(),
             timeout_ms: Some(1500),
@@ -1113,8 +1059,6 @@ msg = "legacy triage"
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ---- ADR-0022 W6 (bd-adr22-w6-stage-registry-0jgr) ----
-
     /// W6 test helper: a minimal lint-clean workflow (send_dm steps).
     fn w6_wf(name: &str, description: &str) -> Workflow {
         Workflow {
@@ -1153,7 +1097,6 @@ msg = "legacy triage"
     #[test]
     fn w6_keep_after_green_resolves_in_project_tier() {
         let dir = config_root("w6keep");
-        // User tier already has a same-name entry (older shape)…
         write(
             &dir.join("workflows/w6-kept.yaml"),
             "name: w6-kept\ntrigger:\n  type: webhook\nsteps:\n  - name: old\n    action: send_dm\n    to: pi\n    body: x\n",
@@ -1324,7 +1267,6 @@ mod bd_3o5t_seed_fidelity {
             if builtin.crew.is_none() {
                 continue;
             }
-            // Exactly what seed writes.
             let seeded: Workflow = parse_workflow(yaml)
                 .unwrap_or_else(|e| panic!("{name}: seeded text does not parse: {e}"));
             assert!(
@@ -1386,7 +1328,6 @@ mod bd_3o5t_drift_truth {
         let root = std::env::temp_dir().join(format!("drift-3o5t-{}", std::process::id()));
         let wf_dir = root.join("workflows");
         std::fs::create_dir_all(&wf_dir).expect("mkdir");
-        // The exact divergence: crew present on the builtin, null in the copy.
         std::fs::write(
             wf_dir.join("bug-fix.yaml"),
             "name: bug-fix\ncrew: null\nsteps: []\n",
@@ -1415,7 +1356,6 @@ mod bd_3o5t_drift_truth {
         let root = std::env::temp_dir().join(format!("drift-ok-{}", std::process::id()));
         let wf_dir = root.join("workflows");
         std::fs::create_dir_all(&wf_dir).expect("mkdir");
-        // Faithful == the builtin's own source text, byte for byte.
         let faithful = crate::builtin_workflows::builtin_workflow_yaml("bug-fix")
             .expect("bug-fix is a builtin");
         std::fs::write(wf_dir.join("bug-fix.yaml"), faithful).expect("write");
@@ -1471,8 +1411,6 @@ mod bd_sync_overwrite {
     fn overwrite_stale_repairs_a_stale_copy_and_leaves_others() {
         let r = root("stale");
         std::fs::write(r.join("workflows/bug-fix.yaml"), BUGFIX).expect("write");
-        // An authored file whose name is NOT a builtin: never touched, at any
-        // scope, because it is not a builtin copy.
         std::fs::write(r.join("workflows/my-own.yaml"), "name: my-own\n").expect("write");
 
         let rep = seed_user_catalog_with(&r, OverwriteScope::Stale, false).expect("seed");
@@ -1578,7 +1516,6 @@ mod bd_mvy4_stage_drift {
         let real = compiled
             .get_stage("wave-gate")
             .expect("wave-gate is compiled in");
-        // A faithful copy of the compiled-in stage must be `current`.
         std::fs::write(
             dir.join("wave-gate.toml"),
             crate::stages::render_stage_entry(real).expect("render"),
@@ -1594,7 +1531,6 @@ mod bd_mvy4_stage_drift {
             "a faithful copy must read as current, or drift is useless in the other direction"
         );
 
-        // Now diverge ONLY the prompt, the way a stale seed copy does.
         let mut diverged = real.clone();
         diverged.prompt = format!("{} --but-diverged", diverged.prompt);
         std::fs::write(

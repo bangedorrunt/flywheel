@@ -14,7 +14,6 @@ pub const MARKER: &str = "[redacted]";
 pub const CLIP: usize = 200;
 
 const PATTERNS: &[&str] = &[
-    // user:password@ before the other shapes, so a token inside a URL is one cut.
     r"[A-Za-z][A-Za-z0-9+.-]*://[^[:space:]/@]+:[^[:space:]/@]+@",
     r"[Bb]earer[[:space:]]+[^[:space:]]+",
     r"[Tt]oken=[^[:space:]&]+",

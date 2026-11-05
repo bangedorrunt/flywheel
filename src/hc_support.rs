@@ -108,9 +108,6 @@ pub fn plane_launch_env(
         env.insert("AGENT_NAME".to_string(), pin.to_string());
         env.insert("FLYWHEEL_MAIL_AS".to_string(), pin.to_string());
     }
-    // GS-037 P0-4: Captain secret name OPENCODE_GO_API_KEY must reach panes as
-    // OPENCODE_API_KEY (pi/opencode-go catalog). Alias when GO is set and API
-    // unset — never log the value.
     apply_opencode_go_api_key_alias(&mut env);
     env
 }
@@ -129,7 +126,6 @@ pub fn apply_opencode_go_api_key_alias(env: &mut std::collections::BTreeMap<Stri
         && !v.is_empty()
     {
         env.insert("OPENCODE_API_KEY".to_string(), v);
-        // Also keep the GO name so auth.json `$OPENCODE_GO_API_KEY` refs work.
         if !env.contains_key("OPENCODE_GO_API_KEY")
             && let Ok(go) = std::env::var("OPENCODE_GO_API_KEY")
         {
@@ -165,8 +161,6 @@ pub fn apply_opencode_model_pin(
     env: &mut std::collections::BTreeMap<String, String>,
     model: &str,
 ) -> anyhow::Result<()> {
-    // opencode's model reference grammar: provider ends at the first `/`,
-    // model may contain `/`, neither may contain `#` in this position.
     if crate::models::split_key(model).0.is_empty() {
         anyhow::bail!(
             "opencode model pin {model:?} is not in provider/model form — opencode drops \
@@ -384,13 +378,6 @@ pub fn resolve_workspace_id(
     if matches.len() == 1 {
         return matches[0].workspace_id.clone();
     }
-    // bd-ws-resolution (2026-08-17): prefer the flywheel-OWNED workspace
-    // LABEL over a foreign workspace sharing the bare project label — hc
-    // reports no names for omp panes, so the agent-name scan below found
-    // nothing and dispatch fell to list order, targeting a foreign
-    // workspace with zero flywheel agents ("no agents in workspace w37").
-    // spawn names its own workspaces `flywheel-<base>`; the exact label
-    // (or its hyphen-prefixed supersets) is the deterministic tie-breaker.
     let owned = prefix.trim_end_matches('-');
     let owned_prefix = format!("{owned}-");
     for ws in matches {
@@ -446,16 +433,11 @@ pub fn resolve_workspace_from_registry(
     best.map(|(_, id)| id.to_string())
 }
 
-// ---------------------------------------------------------------------------
-// flywheel-local wire types (deleted `src/hc.rs` — verbatim). toron-core
-// models the client, not the per-event payload shapes flywheel routes on.
-// ---------------------------------------------------------------------------
-
 /// push notification payload wrapper (`kind` names the producer, `data`
 /// is the typed payload). Built at the toron-core `BackendEvent` edge by
 /// `push_from_backend` — the bin matches on the typed `data` variant.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // bin matches on the typed `data` variant; `kind` is informational
+#[allow(dead_code)]
 pub struct PushEvent {
     pub kind: TerminalEventKind,
     pub data: TerminalEventData,
@@ -471,15 +453,6 @@ pub enum TerminalEventKind {
     PaneAgentStatusChangedSub,
     PaneExited,
 }
-
-// ---- typed push payloads ----
-//
-// Only what the doorbell + watch loop route on (status + exit). hc 0.1.16
-// has no workspace/tab/worktree event surface, so the pre-hc payload
-// structs are deleted — `push_from_backend` builds these two from
-// toron-core's `BackendEvent`, nothing parses wire payloads here.
-// `WorktreeInfo` below is not an event payload: it is the flywheel-shaped
-// worktree record the (empty-on-hc) `worktree_list` returns.
 
 /// flywheel-shaped worktree record. toron-core's `WorktreeInfo` models the
 #[derive(Debug, Clone, Deserialize)]
@@ -510,8 +483,6 @@ pub struct PaneExited {
 /// push; the bare variant is what the watch loop's `match` names — both
 /// carry this payload).
 #[derive(Debug, Clone, Deserialize)]
-// Wire-shaped payload: the bin routes on pane_id + agent_status; the other
-// fields must still deserialize (never invent defaults for them).
 #[allow(dead_code)]
 pub struct PaneAgentStatusChanged {
     pub pane_id: String,
@@ -530,9 +501,6 @@ pub struct PaneAgentStatusChanged {
 /// `PaneAgentStatusChanged` variant is what the watch loop + doorbell match
 /// arms name (the subscription push lands as `..Sub` with the same payload).
 #[derive(Debug, Clone)]
-// The bare StatusChanged variant is match-named but never constructed here
-// (its push arrives as ..Sub); Exited's payload is routed, never read.
-// The Pane prefix mirrors the toron BackendEvent names the pushes map from.
 #[allow(dead_code, clippy::enum_variant_names)]
 pub enum TerminalEventData {
     PaneAgentStatusChanged(PaneAgentStatusChanged),
@@ -635,8 +603,6 @@ pub fn parse_wait_for_output_result(
     match reason {
         "output" => Ok(PaneWaitResult {
             pane_id,
-            // The wait result names no line — the text comes from the
-            // read-back below, so there is no single matched line to name.
             matched_line: None,
             read: res
                 .get("read")
@@ -658,12 +624,6 @@ pub fn parse_wait_for_output_result(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Pure-delegation client helpers (methods flywheel used that toron-core's
-// `Client` does not expose). Each forwards to the toron-core `Client`'s raw
-// `call` / `call_coded` — zero protocol logic here.
-// ---------------------------------------------------------------------------
-
 /// A new shell terminal via `terminal.run` (hc has no splits, only
 /// top-level terminals; `direction` is ignored). No `argv`: the server runs
 /// its own shell. `parent` keeps the tree so the workspace shell owns its
@@ -676,30 +636,21 @@ pub fn pane_split(
     cwd: Option<&str>,
     env: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<PaneInfo> {
-    let _ = direction; // hc has no splits — every pane is a top-level terminal
+    let _ = direction;
     let mut params = serde_json::Map::new();
     params.insert(
         "parent".into(),
         serde_json::json!(toron_core::backend::hc::strip_id_prefix(pane_id)),
     );
-    // Crew panes are independent peers: a child ends with its parent unless
-    // outlived, and the chain parent here is just the previous pane — one
-    // crew member exiting must never kill the rest. Keep the lineage
-    // (parent) without the lifecycle coupling (outlive_parent).
     if let Some(cwd) = cwd {
         params.insert("cwd".into(), serde_json::json!(cwd));
     }
     if let Some(env) = env {
-        // ADR-0010 D13: every split pane is a CREW pane (the captain
-        // rides the root pane's workspace-level env). Stamp the role so the
-        // subagent-guard fence exempts crew: the deny list must disarm
-        // nobody it does not own. Caller-supplied wins on collision.
         let mut env = env.clone();
         env.entry("FLYWHEEL_ROLE".to_string())
             .or_insert_with(|| "crew".to_string());
         params.insert("env".into(), serde_json::json!(env));
     }
-    // No argv: hc runs its own shell for an argv-less terminal.run.
     params.insert("outlive_parent".into(), serde_json::json!(true));
     let res: toron_core::backend::hc::Terminal =
         serde_json::from_value(c.call("terminal.run", serde_json::Value::Object(params))?)
@@ -725,9 +676,6 @@ pub fn pane_wait_output(
     timeout_ms: Option<u64>,
 ) -> std::result::Result<PaneWaitResult, PlaneError> {
     let params = wait_for_output_params(pane_id, mode, pattern, timeout_ms)?;
-    // hc only matches output printed AFTER the wait starts, so a pattern
-    // already on screen would wait out the timeout. The old herdr wait read
-    // the recent buffer first; do the same.
     let seen = pane_recent_text(c, pane_id).unwrap_or_default();
     if seen.contains(pattern) {
         return Ok(PaneWaitResult {
@@ -738,8 +686,6 @@ pub fn pane_wait_output(
     }
     let res = c.call("terminal.wait", params).map_err(to_plane_error)?;
     let mut hit = parse_wait_for_output_result(&res)?;
-    // The wait result carries no snapshot text — read it back so `read` is
-    // the matched terminal's text, as the old envelope provided.
     if hit.read.is_empty() {
         hit.read = pane_recent_text(c, pane_id).unwrap_or_default();
     }
@@ -792,7 +738,6 @@ pub fn wait_shell_prompt(c: &Client, pane_id: &str, timeout: Duration) -> bool {
 /// reads the same tail the shell-readiness gate does, so the two can never
 /// disagree about what a pane is showing.
 pub(crate) fn pane_recent_text(c: &Client, pane_id: &str) -> Result<String> {
-    // terminal.read strips the hc: prefix itself; the result IS ReadResult.
     let res = c.terminal_read(pane_id, 30).map_err(|e| anyhow!("{e}"))?;
     Ok(res
         .get("text")
@@ -811,14 +756,11 @@ fn shell_prompt_rendered(text: &str) -> bool {
     match last {
         Some(line) => {
             let t = line.trim();
-            // Common prompt sigils (zsh ❯ / % / $, bash $, root #, fish >,
-            // oh-my-zsh ➜) — leading (➜  ~) or trailing (❯).
             if t.starts_with(['❯', '➜', '%', '$', '#', '>', '»', '›', 'λ'])
                 || t.ends_with(['❯', '➜', '%', '$', '#', '>', '»', '›', 'λ'])
             {
                 return true;
             }
-            // user@host:path / user@host dir style prompts.
             t.contains('@') && (t.contains(':') || t.contains('~') || t.contains('/'))
         }
         None => false,
@@ -833,10 +775,6 @@ fn shell_prompt_rendered(text: &str) -> bool {
 pub fn worktree_list(_c: &Client, _workspace_id: Option<&str>) -> Result<Vec<WorktreeInfo>> {
     Ok(Vec::new())
 }
-
-// ---------------------------------------------------------------------------
-// Process liveness probe (bd-1np): `terminal.get` foreground.
-// ---------------------------------------------------------------------------
 
 /// One foreground process in a pane (from `terminal.get` `foreground`).
 ///
@@ -919,8 +857,6 @@ pub fn kind_process_names(kind: &str) -> &'static [&'static str] {
         "opencode" => &["opencode"],
         "pi" => &["pi", "gemini"],
         "grok" => &["grok", "grok-build"],
-        // unknown kind — no process-name mapping; the caller must treat the
-        // probe as inconclusive rather than false-negative "healthy".
         _ => &[],
     }
 }
@@ -1016,10 +952,6 @@ pub fn wait_agent_foreground(
     false
 }
 
-// ---------------------------------------------------------------------------
-// Responsiveness probe (bd-a8i): `state_change_seq` over `agent.list`.
-// ---------------------------------------------------------------------------
-
 /// Responsiveness verdict for a live-but-possibly-frozen agent (bd-a8i).
 ///
 /// `pane_agent_alive` proves the process exists and owns the foreground
@@ -1086,11 +1018,7 @@ pub fn probe_agent_responsiveness(c: &Client, pane_id: &str, window: Duration) -
     responsiveness_verdict(old_seq, new_seq, window.as_secs(), idle)
 }
 
-// ---------------------------------------------------------------------------
-// Subscription stream adapter.
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::large_enum_variant)] // Event carries the typed push payload by design
+#[allow(clippy::large_enum_variant)]
 enum StreamItem {
     Event(PushEvent),
     Closed,
@@ -1128,13 +1056,9 @@ pub struct EventStream {
 /// unregistered panes (which fell back to pin=pane_id and injected phantom
 /// pins). An empty subscription list means all panes (current behavior).
 pub fn subscribe(c: &Client, subscriptions: &[Subscription]) -> Result<EventStream> {
-    // hc uses subscribe_terminals; map BackendEvent into the flywheel PushEvent
-    // shape the doorbell still matches on.
     let (_snapshot, mut inner) = c
         .subscribe_terminals(None)
         .map_err(|e| anyhow!("hc subscribe_terminals failed: {e}"))?;
-    // Pane-id allow-set for the mapping edge: stripped bare addresses, so
-    // `hc:t7` and `t7` spellings meet. Empty = subscribe to everything.
     let allowed: std::collections::HashSet<String> = subscriptions
         .iter()
         .map(|s| toron_core::backend::hc::strip_id_prefix(&s.pane_id).to_string())
@@ -1152,8 +1076,6 @@ fn push_from_backend(
     allowed: &std::collections::HashSet<String>,
 ) -> Option<PushEvent> {
     use toron_core::backend::types::BackendEvent;
-    // Mapping-edge filter (steering 6): drop pushes for panes outside the
-    // subscription set. Empty set = all panes.
     let pane_in_scope = |pane: &toron_core::backend::types::PaneId| {
         allowed.is_empty()
             || allowed.contains(toron_core::backend::hc::strip_id_prefix(pane.as_str()))
@@ -1193,10 +1115,6 @@ fn push_from_backend(
                 }),
             })
         }
-        // Dropped at the edge: no consumer routes on detected/gap/unknown
-        // (the watch loop + doorbell ignore them via wildcard arms), so
-        // dropping here changes no behavior — and keeps the push surface
-        // to the two routed kinds.
         BackendEvent::AgentDetected { .. } | BackendEvent::EventsLost | BackendEvent::Raw(_) => {
             None
         }
@@ -1362,7 +1280,6 @@ mod events_lost_tests {
                 status: AgentStatus::Idle,
             }
         }
-        // Filtered: only hc:t8 arrives.
         let (tx, rx) = std::sync::mpsc::channel::<StreamItem>();
         let allowed: HashSet<String> = ["t8".to_string()].into_iter().collect();
         let mut calls = 0u32;
@@ -1389,7 +1306,6 @@ mod events_lost_tests {
             })
             .collect();
         assert_eq!(panes, vec!["hc:t8".to_string()]);
-        // Empty set = all panes.
         let (tx, rx) = std::sync::mpsc::channel::<StreamItem>();
         let allowed = HashSet::new();
         let mut calls = 0u32;
@@ -1449,7 +1365,6 @@ mod process_liveness_tests {
     #[test]
     fn pane_agent_alive_rows() {
         let cases: [(&str, &str, PaneProcessInfo, Option<bool>); 9] = [
-            // Live agent: the agent binary leads the foreground group (pid == fgpgid).
             (
                 "live_opencode_classified_alive",
                 "opencode",
@@ -1460,17 +1375,12 @@ mod process_liveness_tests {
                 ),
                 Some(true),
             ),
-            // Dead process: pane exists but the shell owns the foreground — the
-            // exact bd-1np false-negative shape (pane present, process gone).
             (
                 "dead_process_shell_foreground_classified_dead",
                 "opencode",
                 info(Some(50), Some(50), vec![proc("zsh", 50)]),
                 Some(false),
             ),
-            // Dead process with orphaned children still listed (MCP servers
-            // linger after the agent died): no agent binary, foreground not
-            // shell-owned.
             (
                 "dead_process_orphan_children_classified_dead",
                 "opencode",
@@ -1481,40 +1391,30 @@ mod process_liveness_tests {
                 ),
                 Some(false),
             ),
-            // Empty foreground list: nothing running.
             (
                 "empty_foreground_classified_dead",
                 "opencode",
                 info(Some(50), Some(50), vec![]),
                 Some(false),
             ),
-            // Unknown kind with no other signal: inconclusive, never "healthy".
             (
                 "unknown_kind_inconclusive",
                 "mystery-kind",
                 info(Some(200), Some(50), vec![proc("mystery-agent", 200)]),
                 None,
             ),
-            // Unknown kind but shell owns the foreground: still provably dead.
             (
                 "unknown_kind_shell_foreground_dead",
                 "mystery-kind",
                 info(Some(50), Some(50), vec![proc("zsh", 50)]),
                 Some(false),
             ),
-            // Kind aliases: grok's binary can be grok-build.
             (
                 "kind_alias_matches",
                 "grok",
                 info(Some(300), Some(50), vec![proc("grok-build", 300)]),
                 Some(true),
             ),
-            // bd-oc-launch-chdir-enoent-1l30: npm/mise-installed CLIs bin
-            // opencode as `opencode.exe` (measured live 2026-10-07: mise
-            // npm-opencode-cli 2.0.24, process name `opencode.exe`), so an
-            // exact-name match read every LIVE oc pane as a dead shell —
-            // `add --oc 1` bailed "agent process gone" while the TUI sat
-            // interactive in the pane.
             (
                 "live_opencode_npm_exe_suffix_classified_alive",
                 "opencode",
@@ -1525,7 +1425,6 @@ mod process_liveness_tests {
                 ),
                 Some(true),
             ),
-            // Argv0-only match (name may be a comm name like python3.14t).
             (
                 "argv0_match_counts",
                 "opencode",
@@ -1709,8 +1608,6 @@ mod responsiveness_tests {
     #[test]
     fn responsiveness_verdict_rows() {
         let cases: [(&str, u64, u64, u64, bool, Responsiveness); 7] = [
-            // Seq advanced across the window: state changed, so the agent is
-            // responsive whatever the idle status or window length.
             (
                 "advanced_seq_responsive_3s",
                 10,
@@ -1735,8 +1632,6 @@ mod responsiveness_tests {
                 false,
                 Responsiveness::Responsive,
             ),
-            // The bd-a8i shape: seq frozen + Idle across a full window — alive
-            // as a PID, unresponsive to input, needs respawn.
             (
                 "frozen_seq_idle_unresponsive",
                 10,
@@ -1745,9 +1640,6 @@ mod responsiveness_tests {
                 true,
                 Responsiveness::Unresponsive,
             ),
-            // Frozen seq but the agent reports non-idle: Working/Blocked agents
-            // may legitimately hold the counter — never respawn on ambiguous
-            // evidence.
             (
                 "frozen_seq_busy_inconclusive",
                 10,
@@ -1756,8 +1648,6 @@ mod responsiveness_tests {
                 false,
                 Responsiveness::Inconclusive,
             ),
-            // Sub-second window: not enough time to observe a change — a frozen
-            // agent must not be declared from a near-zero window.
             (
                 "zero_window_inconclusive",
                 10,
@@ -1766,8 +1656,6 @@ mod responsiveness_tests {
                 true,
                 Responsiveness::Inconclusive,
             ),
-            // Seq regression: the per-pane counter is monotonic; a regression
-            // means the samples are unreliable, so the verdict is inconclusive.
             (
                 "regressed_seq_inconclusive",
                 10,
@@ -1786,14 +1674,6 @@ mod responsiveness_tests {
         }
     }
 }
-
-// ---- bd-eign.5: structured opencode session output ----
-//
-// `flywheel output` reads an agent's ACTUAL session from the opencode
-// structured store (SQLite, `~/.local/share/opencode/opencode.db`) instead of
-// TUI scrollback cells — the alternate screen renders garbled artifacts even
-// after sanitize_pane_text. Parts carry text/tool/reasoning payloads with the
-// real tool inputs and outputs.
 
 use std::path::{Path, PathBuf};
 
@@ -1824,8 +1704,6 @@ fn sqlite_json(db: &Path, sql: &str) -> Result<Value> {
         .output()
         .with_context(|| format!("run sqlite3 against {}", db.display()))?;
     if !out.status.success() {
-        // bd-5t31z: name the store, or a schema drift reads as sqlite's
-        // argument parse error and looks like a broken command line.
         bail!(
             "sqlite3 query failed on {}: {}",
             db.display(),
@@ -1858,8 +1736,6 @@ fn cap(s: &str, max: usize) -> String {
 /// the key observability win over scrollback.
 fn summarize_tool_state(state: &Value) -> Value {
     let status = state.get("status").and_then(Value::as_str).unwrap_or("?");
-    // v2 tool inputs are OBJECTS (`{"command": "..."}`), so the JSON form is
-    // capped too — an uncapped `to_string` defeated the cap entirely.
     let input = state
         .get("input")
         .map(|v| {
@@ -1906,9 +1782,6 @@ fn summarize_part_value(v: &Value) -> Option<Value> {
             .map(|t| json!({"kind": "reasoning", "text": cap(t, 2000)})),
         "tool" => Some(json!({
             "kind": "tool",
-            // opencode v2 names the tool `name`; v1 used `tool`. Accept both
-            // (a `?` here is the difference between an observability win and
-            // a wall of anonymous tool rows).
             "tool": v
                 .get("name")
                 .or_else(|| v.get("tool"))
@@ -1997,10 +1870,6 @@ pub fn read_session_log(
             db.display()
         );
     }
-    // bd-5t31z: a drifted schema must fail as a typed platform fact naming the
-    // store, never as sqlite's "Parse error in 3rd command line argument".
-    // Two layouts are spoken: v1 (`session`+`part`) and opencode v2
-    // (`session_v2`+`session_message`, parts nested in `data.content[]`).
     let schema = session_schema_from_tables(&session_tables(&db)?);
     if let SessionSchema::Drift { present } = &schema {
         bail!("{}", session_store_drift_error(&db, present));
@@ -2059,10 +1928,6 @@ pub fn read_session_log(
                 .collect()
         }
         SessionSchema::V2 => {
-            // One row per MESSAGE; the parts are nested in `data.content[]`.
-            // `seq` is the session's monotonic order (the measured store has
-            // 8444 messages and 0 `session_part` rows, so reading the part
-            // table would silently return nothing).
             let msg_sql = format!(
                 "SELECT data FROM session_message WHERE session_id='{}' ORDER BY seq LIMIT {}",
                 sq(&sid),
@@ -2112,8 +1977,6 @@ mod session_schema_tests {
     /// message assertions red.
     #[test]
     fn output_reports_a_missing_session_table() {
-        // The measured DRIFT shape: a v2 store whose message table is missing
-        // (the part table alone cannot carry content).
         let drifted = vec!["session_part".to_string(), "session_v2".to_string()];
         assert_eq!(
             session_schema_from_tables(&drifted),
@@ -2123,15 +1986,12 @@ mod session_schema_tests {
         );
         let v1 = vec!["part".to_string(), "session".to_string()];
         assert_eq!(session_schema_from_tables(&v1), SessionSchema::V1);
-        // opencode v2: `session_v2` + `session_message` (the parts are nested
-        // in the message data; the part TABLE is present but empty).
         let v2_schema = vec![
             "session_v2".to_string(),
             "session_message".to_string(),
             "session_part".to_string(),
         ];
         assert_eq!(session_schema_from_tables(&v2_schema), SessionSchema::V2);
-        // Half a v1 store is drift too: `session` alone still queries `part`.
         assert!(matches!(
             session_schema_from_tables(&["session".to_string()]),
             SessionSchema::Drift { .. }
@@ -2149,7 +2009,6 @@ mod session_schema_tests {
         assert!(created.success(), "fixture store created");
 
         // SAFETY: OPENCODE_DB has exactly one reader (this module) and no
-        // other test in this binary touches it.
         unsafe { std::env::set_var("OPENCODE_DB", &db) };
         let err = read_session_log("/nonexistent-dir", None, None, 10)
             .expect_err("a drifted store must fail, never read as an empty session");
@@ -2175,9 +2034,6 @@ mod session_schema_tests {
             "sqlite's argument noise must not be the diagnosis: {msg}"
         );
 
-        // The SAME function reads the mapped v2 layout: the round that made
-        // the drift loud must not be the round that leaves the data unread
-        // (opencode's measured store: 8444 session_message rows, 0 parts).
         let db2 = dir.join("opencode-v2.db");
         let _ = std::fs::remove_file(&db2);
         let msg1 = json!({
@@ -2197,7 +2053,6 @@ mod session_schema_tests {
             ]
         })
         .to_string();
-        // One quote helper: the payloads are single-quoted SQL literals.
         let q = |s: &str| s.replace('\'', "''");
         let sql = format!(
             "CREATE TABLE session_v2 (id text PRIMARY KEY, title text, agent text, \
@@ -2218,7 +2073,6 @@ mod session_schema_tests {
             .expect("sqlite3 must be installed — the reader shells it too");
         assert!(created.success(), "v2 fixture store created");
         // SAFETY: same single-reader invariant as above; this function is the
-        // only place that touches OPENCODE_DB.
         unsafe { std::env::set_var("OPENCODE_DB", &db2) };
         let got = read_session_log("/tmp/v2proj", None, None, 10).expect("v2 store reads");
         unsafe { std::env::remove_var("OPENCODE_DB") };
@@ -2320,8 +2174,6 @@ fn opencode_tail_parts(parts: &[Value], n: usize) -> Vec<Value> {
                 .and_then(Value::as_str)
                 .unwrap_or("");
             json!({
-                // opencode parts carry no per-row timestamp in the summary
-                // shape; null reads "not recorded", never a fabricated now.
                 "ts": Value::Null,
                 "kind": "tool",
                 "tool": p.get("tool").and_then(Value::as_str).unwrap_or("?"),
@@ -2356,8 +2208,6 @@ pub fn read_agent_session_tail(session: &AgentSessionInfo, n: usize) -> Result<V
                     db.display()
                 );
             }
-            // Overscan: text/reasoning parts are dropped below, so fetch more
-            // than n rows (bounded) before filtering to the newest tool calls.
             let limit = n.saturating_mul(8).clamp(1, 400);
             let raw = sqlite_json(
                 &db,
@@ -2374,7 +2224,7 @@ pub fn read_agent_session_tail(session: &AgentSessionInfo, n: usize) -> Result<V
                 .iter()
                 .filter_map(|row| row["data"].as_str().and_then(summarize_part))
                 .collect();
-            parts.reverse(); // SQL walked newest-first
+            parts.reverse();
             opencode_tail_parts(&parts, n)
         }
     };
@@ -2434,7 +2284,6 @@ pub fn alt_screen_read_ladder(
         Err(e) if e.code() == &BackendErrorCode::AgentNotIdle => {}
         Err(e) => return Err(e),
     }
-    // agent_not_idle: bounded wait + single retry
     match ops.wait_idle() {
         Ok(true) => {
             if let Ok(t) = ops.read(RECENT_UNWRAPPED_SOURCE) {
@@ -2446,11 +2295,9 @@ pub fn alt_screen_read_ladder(
             eprintln!("flywheel: alt-screen wait-for-idle failed: {e:#}");
         }
     }
-    // still unavailable → visible buffer
     if let Ok(t) = ops.read("visible") {
         return Ok(t);
     }
-    // last resort: ask the agent to write its output to a temp file
     ops.file_fallback()
 }
 
@@ -2985,7 +2832,6 @@ mod shell_prompt_tests {
     fn empty_or_booting_shell_is_not_ready() {
         assert!(!shell_prompt_rendered(""));
         assert!(!shell_prompt_rendered("   \n  \n"));
-        // Startup noise without a rendered prompt.
         assert!(!shell_prompt_rendered(
             "Last login: Mon Aug 18 04:24:39 on ttys001\n"
         ));
@@ -2996,7 +2842,6 @@ mod shell_prompt_tests {
 
     #[test]
     fn rendered_prompt_sigils_are_ready() {
-        // zsh default + p10k-style, bash, root, fish.
         for prompt in [
             "❯",
             "❯ ",
@@ -3041,7 +2886,6 @@ mod shell_prompt_tests {
         };
         let foreign = mk("w37", "toron");
         let owned = mk("w70", "flywheel-toron");
-        // No agent names at all (omp panes) — the label must break the tie.
         let no_agents: Vec<AgentInfo> = Vec::new();
         assert_eq!(
             super::resolve_workspace_id(
@@ -3052,7 +2896,6 @@ mod shell_prompt_tests {
             "w70",
             "owned label wins over list order"
         );
-        // A foreign FIRST in list order still loses.
         assert_eq!(
             super::resolve_workspace_id(
                 &[foreign.clone(), owned.clone()],
@@ -3061,7 +2904,6 @@ mod shell_prompt_tests {
             ),
             "w70"
         );
-        // Single match: unchanged behavior.
         assert_eq!(
             super::resolve_workspace_id(
                 std::slice::from_ref(&foreign),
@@ -3110,8 +2952,6 @@ mod shell_prompt_tests {
             terminal_title: Some(String::new()),
             workspace_id: ws.into(),
         };
-        // The stale room comes FIRST in list order and carries the bare
-        // project label; the live crew sits in a room labelled by the spawn.
         let stale = mk("w23", "toron");
         let live = mk("w7W", "elm-comms-kernel");
         let agents = vec![mk_agent("w7W", "w7W:p1", "blueridge")];
@@ -3124,16 +2964,12 @@ mod shell_prompt_tests {
             "the registered pane names the live room, not the stale one"
         );
 
-        // INVERTED: without the registry the tie falls to list order and the
-        // stale room wins — which is exactly the bug.
         assert_eq!(
             super::resolve_workspace_id(&[stale.clone(), live.clone()], &agents, "flywheel-toron-"),
             "w23",
             "the prefix scan cannot see a pin-named crew, so list order wins"
         );
 
-        // No registered pane: the helper declines and the caller's existing
-        // resolution stands.
         assert_eq!(
             super::resolve_workspace_from_registry(&[stale.clone(), live.clone()], &agents, &[]),
             None
@@ -3210,8 +3046,6 @@ mod shell_gate_e2e {
     fn real_pane_reaches_a_detected_prompt() {
         let cfg = crate::Config::load().expect("config");
         let c = Client::connect(Some(&cfg.socket_path())).expect("hc connect");
-        // hc has no workspaces: the "workspace" is a shell terminal whose
-        // address is the workspace id; the split pane is its child.
         let (ws, root) = c
             .workspace_create(Some("/tmp"), Some("flywheel-shell-gate-e2e"), false, None)
             .expect("workspace_create");
@@ -3236,7 +3070,6 @@ mod shell_gate_e2e {
         let _ = c.workspace_close(&ws_id, true);
         let _ = c.terminal_kill(&pane);
 
-        // The artifact: what the gate saw, on a real pane.
         println!("gate: ready={ready} elapsed={elapsed:?} matched_on={matched_on:?}");
         assert!(ready, "gate never detected a prompt on a real pane in 15s");
         assert!(
@@ -3277,8 +3110,6 @@ mod wait_output_live {
         c.pane_run(&pane, "printf 'WAIT-OUTPUT-NEEDLE\\n'; sleep 30")
             .expect("run");
 
-        // The needle must be on screen BEFORE the measured call, or the
-        // read-first path is not the one being tested.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut visible = false;
         while std::time::Instant::now() < deadline {
@@ -3490,8 +3321,6 @@ impl Client {
         if let Some(cwd) = cwd {
             params.insert("cwd".into(), json!(cwd));
         }
-        // ADR-0010 D13: the workspace shell is a CREW shell, same stamp as
-        // every split pane (the agents it spawns inherit this env).
         let mut owned = env.cloned().unwrap_or_default();
         owned
             .entry("FLYWHEEL_ROLE".to_string())
@@ -3500,10 +3329,6 @@ impl Client {
         if let Some(label) = label {
             params.insert("labels".into(), json!({ WORKSPACE_LABEL_KEY: label }));
         }
-        // No argv: hc runs its own shell for an argv-less terminal.run.
-        // The root shell is a peer, not a child: no_parent so no death
-        // couples it to whatever terminal started the spawn (usually none —
-        // the CLI runs outside hc — but explicit beats default here).
         params.insert("no_parent".into(), serde_json::json!(true));
         let res: toron_core::backend::hc::Terminal = serde_json::from_value(
             self.call("terminal.run", Value::Object(params))
@@ -3572,7 +3397,7 @@ impl Client {
         _timeout_ms: u64,
         args: &[String],
     ) -> Result<AgentInfo, BackendError> {
-        let _ = name; // the pane keeps its address; the pin rides toron_pin via agent_rename
+        let _ = name;
         let line = crate::recipe_launch_command(kind, args);
         self.terminal_send(pane_id, &line, None)?;
         self.agent_get(pane_id)
@@ -3604,7 +3429,6 @@ impl Client {
         text: &str,
         wait: Option<WaitOptions>,
     ) -> Result<AgentInfo, BackendError> {
-        // Prefer terminal.send on hc; fall back to agent.prompt RPC if present.
         let timeout = wait.as_ref().and_then(|w| w.timeout_ms);
         let _ = self.terminal_send(target, text, timeout)?;
         self.agent_get(target)
@@ -3663,7 +3487,6 @@ impl Client {
         _project: &str,
         _npub: &str,
     ) -> Result<Value, BackendError> {
-        // hc stamps labels at terminal.run; best-effort no-op for mail identity.
         Ok(json!({ "ok": true }))
     }
     pub fn ping(&self) -> Result<Value, BackendError> {
@@ -3710,9 +3533,6 @@ mod hc_method_witness_tests {
         }
         let mut out = Vec::new();
         for line in src.lines() {
-            // Doc/prose mentions (including this module's own docs) are not
-            // calls — a commented-out call is a deleted call, which is the
-            // desired direction, so comment lines carry no witness weight.
             if line.trim_start().starts_with("//") {
                 continue;
             }
@@ -3741,9 +3561,6 @@ mod hc_method_witness_tests {
 
     #[test]
     fn scanner_ignores_its_own_source_line() {
-        // The scanner's own `.find(".call(\"")` line contains the pattern
-        // but no method token — it must yield nothing, or the witness
-        // fails on itself (finding 5).
         let own = r#"let next = rest.find(".call(\"").map(|p| (p, ".call(\"".len()));"#;
         assert_eq!(rpc_literals(own), Vec::<String>::new());
         assert_eq!(
@@ -3774,9 +3591,6 @@ mod hc_method_witness_tests {
         );
         for (name, src, must_find) in [
             ("hc_support.rs", HC_SUPPORT_SRC, true),
-            // crew.rs currently makes no raw calls (both pane.close sites
-            // became typed terminal_kill) — vacuous pass is correct there;
-            // the assert still guards a reintroduced raw literal.
             ("cmd/crew.rs", CREW_SRC, false),
         ] {
             let literals = rpc_literals(src);

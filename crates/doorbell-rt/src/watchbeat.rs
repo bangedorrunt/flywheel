@@ -92,13 +92,10 @@ pub fn spawn_heartbeat_ticker(
     workspace: String,
 ) -> std::sync::mpsc::Sender<()> {
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
-    // Close NeverStamped on the *calling* thread before spawn — a post-spawn
-    // touch still races /health with thread scheduling delay.
     touch_heartbeat(&state_dir, &workspace);
     std::thread::spawn(move || {
         loop {
             match stop_rx.recv_timeout(STAMP_INTERVAL) {
-                // An explicit stop.
                 Ok(()) => break,
                 Err(e) => {
                     if !ticker_keeps_running(&e) {
@@ -284,7 +281,6 @@ mod tests {
         let mut last = None;
         assert!(touch_event_throttled(&d, "w", &mut last));
         assert!(last_event_ms(&d, "w").is_some());
-        // Immediate second call must not rewrite (still Some last).
         assert!(!touch_event_throttled(&d, "w", &mut last));
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -293,7 +289,6 @@ mod tests {
     fn spawn_heartbeat_ticker_stamps_immediately() {
         let d = dir("hb-immediate");
         let stop = spawn_heartbeat_ticker(d.clone(), "w".into());
-        // Calling-thread touch: stamp must exist before spawn returns (no poll).
         assert!(
             last_heartbeat_ms(&d, "w").is_some(),
             "touch_heartbeat before std::thread::spawn must close NeverStamped gap"
@@ -319,8 +314,6 @@ mod bd_lmtu_heartbeat_tests {
         let ws = "wstamp";
 
         let tx = spawn_heartbeat_ticker(dir.clone(), ws.into());
-        // `spawn` touches once on the CALLING thread, so the file must exist
-        // before we even wait for a tick.
         let hb = super::path(&dir, ws);
         assert!(hb.exists(), "spawn must stamp synchronously on the caller");
 
@@ -352,7 +345,6 @@ mod bd_lmtu_heartbeat_tests {
         assert!(hb.exists(), "stamped while held");
 
         drop(tx);
-        // Give a live ticker time to tick again; a dead one cannot.
         std::thread::sleep(STAMP_INTERVAL + std::time::Duration::from_millis(600));
         let after_drop = std::fs::read_to_string(&hb).expect("stamp body");
         std::thread::sleep(STAMP_INTERVAL + std::time::Duration::from_millis(600));
@@ -385,11 +377,6 @@ mod bd_lmtu_heartbeat_tests {
             .rfind("let task = tokio::spawn(async move {")
             .expect("hosted loop task opener");
         let body = &serve[task_start..child];
-        // Match the CALL, not the bare identifier. The first version of this
-        // assertion used `contains("spawn_heartbeat_ticker")` and PASSED against a
-        // build with the call deleted — because the explanatory comment beside the
-        // call site names the same function, so the test was matching its own
-        // documentation. Pin the qualified call, with its paren.
         assert!(
             body.contains("watchbeat::spawn_heartbeat_ticker("),
             "the hosted loop must CALL watchbeat::spawn_heartbeat_ticker( before its child; \

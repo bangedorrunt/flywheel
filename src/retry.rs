@@ -48,7 +48,6 @@ pub fn host_draw() -> f64 {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos()),
     );
-    // 53 bits keep the [0, 1) mapping exact in f64.
     (h.finish() >> 11) as f64 / (1u64 << 53) as f64
 }
 
@@ -74,8 +73,6 @@ impl RetryPolicy {
         } else {
             0.0
         };
-        // f64 math: `(ceiling - floor) * draw as u128` would truncate the draw
-        // to 0 or 1 and collapse the whole window to the floor.
         Duration::from_millis((floor as f64 + (ceiling - floor) as f64 * draw) as u64)
     }
 

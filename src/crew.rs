@@ -110,12 +110,6 @@ fn role_uses(action: &Action, inputs: &BTreeMap<String, String>, out: &mut Vec<S
                 }
             }
         }
-        // bd-q2gw: a `parallel` nested in a control-flow arm is still a
-        // fan-out. `Branch` arms are exclusive, so the honest number is the
-        // WORST arm, not their sum — a `parallel` in `then` and a different
-        // role in `else` never need two panes at once. Retry/Foreach/Loop
-        // bodies are not concurrent with anything, so they contribute their
-        // own roles at their own width.
         Action::Branch {
             then, else_steps, ..
         } => {
@@ -176,8 +170,6 @@ fn resolve_over(over: &str, inputs: &BTreeMap<String, String>) -> u32 {
 /// Pure — no registry, no panes, no hc. The catalog-level test is what
 /// makes it worth having.
 pub fn crew_demand(wf: &Workflow) -> CrewDemand {
-    // Declared input defaults, so a templated `over: "{{inputs.reviewers}}"`
-    // resolves to the width the engine will really run (bd-q2gw).
     let inputs: BTreeMap<String, String> = wf
         .inputs
         .iter()
@@ -195,9 +187,6 @@ pub fn crew_demand(wf: &Workflow) -> CrewDemand {
         })
         .collect();
 
-    // (node, needs, roles, seed wave). `steps:` is strictly ordered, so each
-    // step is its own wave — two steps reusing a role there is sequential
-    // reuse, not concurrency, and must never be flagged.
     let nodes: Vec<(String, Vec<String>, Vec<String>, u32)> = match &wf.graph {
         Some(g) => g
             .nodes
@@ -225,10 +214,6 @@ pub fn crew_demand(wf: &Workflow) -> CrewDemand {
             .collect(),
     };
 
-    // Longest-path layering: a node's wave is one past its deepest dependency,
-    // so a node shares a wave with its peers and never with its ancestors. A
-    // `steps:` seed already separates them, and a step declares no `needs`, so
-    // the layering leaves the seed untouched.
     let mut wave: BTreeMap<&str, u32> = BTreeMap::new();
     let mut pending: Vec<&(String, Vec<String>, Vec<String>, u32)> = nodes.iter().collect();
     let mut guard = nodes.len() + 1;
@@ -252,8 +237,6 @@ pub fn crew_demand(wf: &Workflow) -> CrewDemand {
     }
 
     let mut per_wave: BTreeMap<u32, BTreeMap<&str, usize>> = BTreeMap::new();
-    // A role's copy count is its busiest single wave, NOT its total uses:
-    // sequential reuse is free, so a role used 3 times in a chain needs 1 pane.
     let mut shape: BTreeMap<String, u32> = BTreeMap::new();
     for (name, _, roles, seed) in &nodes {
         let w = wave.get(name.as_str()).copied().unwrap_or(*seed);
@@ -400,8 +383,6 @@ fn sort_roles(roles: &mut [String]) {
 
 /// Pack unique roles into total N (ADR-0011 D2). Fails closed when N > max.
 pub fn pack_crew(unique: &[String], n: u32, max: u32) -> Result<PackedCrew, String> {
-    // Every role gets exactly one pane — the pre-bd-0s0y shape, kept as the
-    // general entry point so its callers and tests are unchanged.
     let counts: BTreeMap<String, u32> = unique
         .iter()
         .map(|r| r.trim_start_matches('@').to_string())
@@ -463,8 +444,6 @@ pub fn pack_crew_shape(
     let mut members: BTreeMap<String, u32> = counts.clone();
     let mut aliases = BTreeMap::new();
 
-    // Fold single-copy roles, last first, until the crew fits the budget.
-    // A role that needs more than one pane is never a fold candidate.
     let mut total: u32 = members.values().sum();
     while total > n {
         let mut ordered = roles.clone();
@@ -492,7 +471,6 @@ pub fn pack_crew_shape(
              one pane per copy). Lower the fan-out or raise FLYWHEEL_CREW_MAX."
         ));
     }
-    // Spare capacity goes to the worker, as before.
     if n > total {
         let extra = n - total;
         let worker = if members.contains_key("coder") {
@@ -513,13 +491,7 @@ pub fn pack_crew_shape(
 
 /// Pack an inferred unique-role plan with a request.
 pub fn pack_inferred(inferred: &CrewPlan, req: &CrewFlag, max: u32) -> Result<PackedCrew, String> {
-    // bd-0s0y: the inferred plan already carries per-role COPY counts
-    // (crew_demand raises them), so pack the counts. Passing only the keys —
-    // the old behavior — silently reset every role to one pane, which is how a
-    // `parallel over: 3` role ended up sharing one agent with its own copies.
     let unique: Vec<String> = inferred.members.keys().cloned().collect();
-    // bd-0s0y: the budget a default crew gets is what the workflow NEEDS —
-    // the sum of its per-role copy counts — not the number of distinct roles.
     let needed: u32 = inferred.members.values().sum();
     match req {
         CrewFlag::Default | CrewFlag::Named(_) => {
@@ -809,23 +781,15 @@ pub enum ComposePart {
 pub fn parse_compose_part(token: &str) -> Result<ComposePart, String> {
     let t = token.trim();
     let Some((kind, value)) = t.split_once(':') else {
-        // ADR-0006 D3 + ADR-0008 §6.7: a compose token (`wave-swarm`,
-        // `repair-until-verified`, `beads-lifecycle`) is checked BEFORE the — a compose-token name
-        // shadows any stage literally named the same (tokens are crate-reserved).
         if t.split(':').count() == 1 && crate::builtin_workflows::is_compose_token(t) {
             return Ok(ComposePart::Recipe {
                 name: t.to_string(),
             });
         }
-        // §3.8 stage-first: a bare stage name is a valid part.
         let stage = t.trim();
         if stage.is_empty() {
             return Err(compose_part_error(token, "empty stage name"));
         }
-        // Fail closed (§3.6 envelope #1): a colon-less token SHAPED like a
-        // T1 control form — a lone keyword or `retry(n)` with no inner part
-        // — is a malformed structured form, never a stage literally named
-        // like one. Keywords shadow stage names the way phases shadow roles.
         if matches!(stage, "each" | "when" | "parallel" | "retry") || stage.starts_with("retry(") {
             return Err(compose_part_error(
                 token,
@@ -898,9 +862,6 @@ pub fn parse_compose_part(token: &str) -> Result<ComposePart, String> {
                 )),
             }
         }
-        // §3.6 T1 structured forms: `each:` / `parallel:` take <over> +
-        // inner part; `when:` takes a guard + inner part. Strict — missing
-        // or malformed pieces are parse errors, never silently dropped.
         form @ ("each" | "parallel" | "when") => {
             let (param, rest) = value.split_once(':').ok_or_else(|| {
                 format!(
@@ -936,9 +897,6 @@ pub fn parse_compose_part(token: &str) -> Result<ComposePart, String> {
                 }),
             }
         }
-        // `retry(n):<part>` — the count rides the keyword, so the value is
-        // the inner part directly. `retry` without `(n)` is an error (a role
-        // named e.g. `retry-team` still parses as a dispatch role).
         kind if kind == "retry" || kind.starts_with("retry(") => {
             let attempts = if kind == "retry" {
                 None
@@ -1060,19 +1018,10 @@ pub fn compose_workflow_with_resolvers(
         .unwrap_or_default();
     let mut extra_inputs: Vec<InputDecl> = Vec::new();
     let mut ordinal = 0u32;
-    // GS-039 P0-3: preserve Explicit crew from compose-token recipes
-    // (repair-until-verified declares coder:1+reviewer:1). Forcing Auto here
-    // used to balloon dry-run/plan to coder:3+reviewer:3 from 3 repair + 3
-    // evaluate graph nodes. Auto recipes / non-recipe parts still force Auto.
     let mut explicit_from_recipes: Option<BTreeMap<String, u32>> = None;
     let mut recipe_requested_auto = false;
     let mut non_recipe_parts = false;
     for part in parts {
-        // ADR-0006 D3 + ADR-0008 §6.7: a compose token expands to its
-        // compiled-in steps (or graph nodes) right where it sits; its declared inputs merge into the
-        // composed workflow so the token's template refs lint clean.
-        // The builtin's own on_error (e.g. bug-fix fail_run) is preserved
-        // verbatim; bare non-token parts are FailRun via build_part_step (bd-gs005).
         if let ComposePart::Recipe { name } = part {
             let expanded = recipe_resolver(name).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -1098,7 +1047,6 @@ pub fn compose_workflow_with_resolvers(
                     extra_inputs.push(input);
                 }
             }
-            // Preserve the builtin's own step on_error verbatim.
             steps.extend(expanded.steps.clone());
             if let Some(g) = expanded.graph {
                 for (k, v) in g.nodes {
@@ -1189,8 +1137,6 @@ pub fn resolve_steer_channel(wf: &Workflow, inputs: &serde_json::Value) -> Resul
     if let Some(name) = default {
         return Ok(Some(name.to_string()));
     }
-    // bail! formats its literal: the doubled braces below print as the JSON
-    // object an operator can paste after --inputs.
     anyhow::bail!(
         "the workflow's steer_channel input cannot be resolved — declare a default or pass \
          --inputs '{{\"steer_channel\":\"<name>\"}}'; join-before-post: every spawned pin must \
@@ -1223,16 +1169,12 @@ fn build_part_step(
         let base = |name: String, action: Action| Step {
             name: Some(name),
             guard: None,
-            // bd-gs005: composed bare parts default fail_run — a red part
-            // must fail the run visibly, not sail through as Continue
-            // (first-prompt trust; builtins already carry their own).
             on_error: StepOnError::FailRun,
             build_slot: false,
             action,
         };
         Ok(match part {
             ComposePart::Dispatch { role, stage } => {
-                // deterministic unique names across repeated roles
                 base(
                     format!("{}-{ordinal}", slugify(&format!("{role}-{stage}"))),
                     Action::DispatchJob {
@@ -1277,9 +1219,6 @@ fn build_part_step(
                 format!("part-{ordinal}"),
                 Action::CallWorkflow {
                     workflow: sub.clone(),
-                    // `goal` is the compose objective. The engine also copies
-                    // the parent run's inputs under this object, so a child
-                    // that needs `verify` or `symptom` receives them.
                     inputs: serde_json::json!({ "goal": objective, "objective": objective }),
                 },
             ),
@@ -1311,18 +1250,12 @@ fn build_part_step(
                     },
                 )
             }
-            // A control form directly inside another control form wraps a
-            // synthetic dispatch-less leaf — unreachable via the parser
-            // (inner is always re-parsed to a concrete part), so treat it as
-            // a hard error instead of inventing a shape.
             other => anyhow::bail!("compose part: unexpected nested form {other:?}"),
         })
     }
     let wrapper = |action: Action| Step {
         name: Some(format!("part-{ordinal}")),
         guard: None,
-        // A failed when/each/retry/parallel is a failed run. Continue here
-        // stored `{ok:false}` and the linear runner treated that as success.
         on_error: StepOnError::FailRun,
         build_slot: false,
         action,
@@ -1349,8 +1282,6 @@ fn build_part_step(
             backoff_secs: 0,
             step: Box::new(leaf(inner, ordinal, objective, affinity)?),
         })),
-        // ADR-0006 D3: a compose token is multi-step — it never reaches the
-        // one-step builder; compose_workflow_with expands it inline.
         ComposePart::Recipe { name } => {
             anyhow::bail!("compose part: compose token `{name}` must expand in the assemble loop")
         }
@@ -1519,11 +1450,6 @@ pub fn render_dry_run(
                 guard: guard.map(str::to_string),
                 fanout: scope_fanout,
             }),
-            // bd-cvv9 (§8 W3): a RESOLVABLE call_workflow link expands into
-            // its linked steps (nested path), so chain built-ins like `ship`
-            // render their full 5-link graph with phase tags. Unresolvable
-            // links keep the flat leaf; depth-capped against self-referential
-            // catalogs.
             Action::CallWorkflow { workflow, .. } if depth < 8 => match resolver(workflow) {
                 Some(linked) => {
                     collect(
@@ -1696,9 +1622,6 @@ pub fn parse_planner_workflow(response: &str, name: &str) -> Result<Workflow, St
     let yaml = normalize_planner_inputs_map(&yaml)?;
     let mut wf = toron_workflow::schema::parse_workflow(&yaml)
         .map_err(|e| format!("planner-authored YAML does not parse as a workflow: {e}"))?;
-    // The run's composed name is decided by the caller (composed-<ts>); the
-    // authored doc's own name is discarded so lint + preview + run_id all
-    // key on one identity.
     wf.name = name.to_string();
     Ok(wf)
 }
@@ -1768,7 +1691,6 @@ fn extract_fenced_yaml(response: &str) -> Option<String> {
 pub fn plan_crew_with(workflow: &Workflow, resolve: &dyn Fn(&str) -> Option<Workflow>) -> CrewPlan {
     match &workflow.crew {
         Some(CrewSpec::Explicit(map)) => CrewPlan {
-            // ADR-0011 D2: YAML counts are a role inventory, not a spawn lock.
             members: map.keys().cloned().map(|k| (k, 1u32)).collect(),
         },
         Some(CrewSpec::Auto) => {
@@ -1791,8 +1713,6 @@ fn infer_auto(
     let mut counts: BTreeMap<String, u32> = BTreeMap::new();
 
     fn bump_role(role: &str, counts: &mut BTreeMap<String, u32>) {
-        // bd-adv4: the profile-pick input template names the implement
-        // profile decided at invoke time — it always seats a coder.
         if role.trim() == "{{inputs.coder_profile}}" {
             counts.entry("coder".to_string()).or_insert(1);
             return;
@@ -1803,9 +1723,6 @@ fn infer_auto(
     }
     fn bump_fanout(over: &str, counts: &mut BTreeMap<String, u32>) {
         if let Some(role) = over.trim().strip_prefix("@crew.") {
-            // A fan-out step needs at least one member per role; parallel
-            // over the whole role means count >= 1 (the orchestrator may
-            // raise it).
             counts.entry(role.to_string()).or_insert(1);
         }
     }
@@ -1821,9 +1738,6 @@ fn infer_auto(
                     bump_role(role, counts);
                 }
             }
-            // bd-t86p: the composed sub-workflow's roles belong to the crew.
-            // Guard against cycles (visited) so goal → plan → … → goal cannot
-            // recurse forever.
             Action::CallWorkflow { workflow, .. } => {
                 if visited.insert(workflow.clone())
                     && let Some(sub) = resolve(workflow)
@@ -1866,10 +1780,6 @@ fn infer_auto(
         }
     }
 
-    // bd-0s0y: the scan above SEES roles and seats one pane each, which is
-    // right for a sequential chain and wrong for a role dispatched
-    // concurrently. crew_demand adds the per-role copy count for the busiest
-    // wave; merged with max so a child's demand and this document's both hold.
     for (role, copies) in crew_demand(workflow).crew_shape {
         let slot = counts.entry(role).or_insert(1);
         *slot = (*slot).max(copies);
@@ -1939,8 +1849,6 @@ pub fn compose_workflow_with(
         base,
         parts,
         affinity,
-        // Test/default arm: compiled-in tokens only (bd-qd87 keeps the
-        // production surface catalog-first).
         &|n| crate::builtin_workflows::builtin_recipe(n),
     )
 }
@@ -1974,8 +1882,6 @@ mod tests {
             err.to_string().contains("wall-clock budget"),
             "error names the cap: {err:#}"
         );
-        // Control: the same helper under a generous cap completes normally —
-        // the bound is a budget, not a blanket failure.
         let fast: toron_workflow::engine::EffectRunner =
             std::sync::Arc::new(|_inv: &toron_workflow::engine::ActionInvocation| {
                 Ok(serde_json::json!({ "ok": true }))
@@ -2146,13 +2052,9 @@ steps:
             "b" => Some(b.clone()),
             _ => None,
         };
-        // Would stack-overflow without the visited guard; must terminate with
-        // the leaf role found exactly once.
         let plan = plan_crew_with(&wf, &resolve);
         assert_eq!(plan.members.get("coder"), Some(&1), "{:?}", plan.members);
     }
-
-    // ---- bd-8xca: runtime composition (deterministic arm) ----
 
     /// Parse: `role:stage` → dispatch; `workflow:name` → call_workflow;
     /// malformed tokens error. (bd-8xca + §3.8 stage-first.)
@@ -2195,8 +2097,6 @@ steps:
                 stage: "code-review".into(),
             }
         );
-        // A role named like a phase is shadowed by the phase grammar — the
-        // explicit form for a stage under a @reviewer ROLE is reviewer:stage.
         assert_eq!(
             parse_compose_part("plan:decompose-beads").unwrap(),
             ComposePart::PhaseStage {
@@ -2204,8 +2104,6 @@ steps:
                 stage: "decompose-beads".into(),
             }
         );
-        // Explicit tags remove the role/phase vocabulary collision without
-        // removing the compact legacy forms.
         assert_eq!(
             parse_compose_part("stage:ce-execute").unwrap(),
             ComposePart::StageFirst {
@@ -2258,13 +2156,11 @@ steps:
             })
             .collect();
         assert_eq!(roles, vec![Some("@scout"), Some("@coder")], "{roles:?}");
-        // The phase rides the spec (W2 contract).
         let phased = match &wf.steps[1].action {
             Action::DispatchJob { spec, .. } => spec.phase.clone(),
             _ => None,
         };
         assert_eq!(phased.as_deref(), Some("implement"));
-        // No affinity → hard error with remedy.
         let bare = vec![ComposePart::StageFirst {
             stage: "no-affinity-stage".into(),
         }];
@@ -2304,7 +2200,6 @@ steps:
             &wf.steps[1].action,
             Action::CallWorkflow { workflow, .. } if workflow == "weekly-review"
         ));
-        // bd-gs005: bare parts default FailRun — a red part must fail the run.
         assert_eq!(
             wf.steps[0].on_error,
             StepOnError::FailRun,
@@ -2315,15 +2210,12 @@ steps:
             StepOnError::FailRun,
             "bare call_workflow is FailRun"
         );
-        // The compose gate: lint clean.
         let report = toron_workflow::lint_workflow(&wf);
         assert!(
             report.is_clean(),
             "composed workflow must lint clean: {:?}",
             report.issues
         );
-        // crew:auto infers the fleet from the parts (scout + weekly-review's
-        // oracle/scout fan-out).
         let plan = plan_crew_with(&wf, &|_| None);
         assert!(plan.members.contains_key("scout"), "{:?}", plan.members);
     }
@@ -2359,8 +2251,6 @@ steps:
         ));
     }
 
-    // ---- bd-adr22-t1-grammar-residual-zjk0: §3.6 Tier-1 grammar + envelope ----
-
     /// T1 grammar: `each:` / `when:` / `retry(n)` / `parallel:` cover the rest
     /// of the Action vocabulary; the inner part nests recursively (a control
     /// form wraps ANY part, including another control form).
@@ -2376,7 +2266,6 @@ steps:
                 }),
             }
         );
-        // Bare-name inner parts nest too (stage-first composes with T1).
         assert_eq!(
             parse_compose_part("each:items:fresh-eyes-explore").unwrap(),
             ComposePart::Each {
@@ -2429,16 +2318,16 @@ steps:
     #[test]
     fn t1_parse_grammar_errors_fail_closed() {
         for bad in [
-            "each:items",       // missing inner part
-            "each::stage",      // empty over
-            "each:items:",      // empty inner
-            "when:guard-only",  // missing inner part
-            "when::reviewer:r", // empty guard
-            "retry:s:stage",    // retry without (n)
-            "retry(n):s:stage", // non-numeric n
-            "retry(0):s:stage", // zero attempts
-            "retry(2)",         // missing inner part
-            "parallel:@crew.c", // missing inner part
+            "each:items",
+            "each::stage",
+            "each:items:",
+            "when:guard-only",
+            "when::reviewer:r",
+            "retry:s:stage",
+            "retry(n):s:stage",
+            "retry(0):s:stage",
+            "retry(2)",
+            "parallel:@crew.c",
         ] {
             assert!(
                 parse_compose_part(bad).is_err(),
@@ -2503,17 +2392,6 @@ steps:
                         Action::DispatchJob { spec, .. }
                             if spec.profile.as_deref() == Some("@coder"))
         ));
-        // Outer wrappers are FailRun; inner leaves are FailRun (bd-gs005).
-        //
-        // ADAPTED to toron-workflow 17b2eb4 ("make loop, failure, and guards
-        // composable"). That commit made a step fail on `ok:false` OR
-        // `status:failed`, so a wrapper left at `Continue` no longer stored a
-        // red part as a harmless `{ok:false}` — the run failed anyway, just
-        // without the deterministic `failed_step`. The compose builder's own
-        // comment now says exactly that ("Continue here stored {ok:false} and
-        // the linear runner treated that as success"), so FailRun on the
-        // wrapper is the correct spelling and this assertion was the stale
-        // half of that change.
         for step in &wf.steps {
             assert_eq!(
                 step.on_error,
@@ -2546,8 +2424,6 @@ steps:
         use toron_workflow::schema::Action;
         let lib = crate::stages::StageLibrary::compiled_in();
         let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
-        // A user-tier override of `wave-swarm`: one dispatch_job step
-        // (same step shape as the builtin's YAML dialect).
         let override_wf = crate::crew::workflow_from_yaml(
             r#"
 name: wave-swarm
@@ -2591,7 +2467,6 @@ steps:
             "the override's own step ran: {:?}",
             wf.steps[0].action.type_name()
         );
-        // No override in the resolver: builtin expands as before.
         let wf_builtin = compose_workflow_with_resolvers(
             "composed-builtin",
             "obj",
@@ -2671,9 +2546,6 @@ steps:
             "SIGNOFF last, captain-only: {:?}",
             wf.steps[12].action.type_name()
         );
-        // bd-compose-stage-sequencing-zgi9: every gated stage pair has an
-        // artifact-await between them — Retry(Verify test -f <marker>) with
-        // a per-step budget ≥ 1h and a loud in-flight exhaustion message.
         for (idx, marker) in [
             (1, "gate"),
             (3, "dispatch"),
@@ -2740,8 +2612,6 @@ steps:
         let part = parse_compose_part("wave-swarm").expect("compose token parses");
         let wf = compose_workflow_with("seq", "obj", None, &[part], &affinity).unwrap();
 
-        // (stage step, await step, marker stem). Indices are composed
-        // positions; every stage below appears in the expansion test too.
         let pairs: [(&str, usize, usize, &str); 5] = [
             ("gate", 0, 1, "gate"),
             ("dispatch", 2, 3, "dispatch"),
@@ -2762,7 +2632,6 @@ steps:
                 Some(expected_await.as_str()),
                 "step {ai} awaits {stage_name}"
             );
-            // The stage's task tells its agent to write the completion marker.
             let Action::DispatchJob { spec, .. } = &wf.steps[si].action else {
                 panic!(
                     "{stage_name} must be a dispatch_job: {:?}",
@@ -2778,7 +2647,6 @@ steps:
                 task.contains(&marker_path),
                 "{stage_name}'s task must instruct writing {marker_path}: {task}"
             );
-            // The await waits on that same marker (writer/waiter agreement).
             let Action::Retry {
                 max_attempts,
                 backoff_secs,
@@ -2793,26 +2661,14 @@ steps:
             let Action::Verify { command } = &step.action else {
                 panic!("await_{stage_name} must wrap a verify");
             };
-            // The PROBE must be the marker path, not merely a mention of it:
-            // the same command also carries a failure message naming the
-            // marker, so `contains` would pass even if the probe checked a
-            // different file (mutation-proven). Pin the `test -f` argument.
             assert!(
                 command.starts_with(&format!("test -f {marker_path} ||")),
                 "await_{stage_name} must probe {marker_path}: {command}"
             );
-            // A wave still in flight must surface: the exhaustion message
-            // names the wait and asks the operator to extend.
             assert!(
                 command.contains("wave in flight"),
                 "await_{stage_name} fails loud when the wave is in flight: {command}"
             );
-            // The message must name the extension point WITHOUT the literal
-            // `--timeout`: that string trips the journal's Ambiguous
-            // classifier (it contains "timeout"), which journals the first
-            // miss as unknown instead of failed — and a retry that never
-            // re-observes parks the run forever (bd-mszc). "outer bound"
-            // names the same --timeout / FLYWHEEL_COMPOSE_MAX_SECONDS knob.
             assert!(
                 command.contains("outer bound"),
                 "await_{stage_name} names the extension point (outer bound): {command}"
@@ -2821,7 +2677,6 @@ steps:
                 !command.contains("--timeout"),
                 "await_{stage_name} must not spell --timeout: the classifier reads it as ambiguity: {command}"
             );
-            // Per-step, not one total: the retry budget is this step's own bound.
             assert!(
                 u64::from(*max_attempts) * *backoff_secs >= 3600,
                 "await_{stage_name} waits at least an hour before giving up: {max_attempts} x {backoff_secs}s"
@@ -2842,8 +2697,6 @@ steps:
         let part = parse_compose_part("wave-swarm").expect("compose token parses");
         let wf = compose_workflow_with("chan", "obj", None, &[part], &affinity).unwrap();
 
-        // The declared default (`adr0006-steer`) is what the run renders, so
-        // it is what compose must ensure and join every spawned pin into.
         assert_eq!(
             resolve_steer_channel(&wf, &serde_json::json!({}))
                 .unwrap()
@@ -2851,7 +2704,6 @@ steps:
             Some("adr0006-steer"),
             "the declared default is the channel the run renders"
         );
-        // A provided --inputs value wins, exactly as the strict renderer uses it.
         assert_eq!(
             resolve_steer_channel(
                 &wf,
@@ -2861,21 +2713,18 @@ steps:
             .as_deref(),
             Some("elm-effect-steer")
         );
-        // A blank provided value counts as unset — never a nameless room.
         assert_eq!(
             resolve_steer_channel(&wf, &serde_json::json!({"steer_channel": "  "}))
                 .unwrap()
                 .as_deref(),
             Some("adr0006-steer")
         );
-        // No declared channel: nothing to ensure (compose invents no room).
         let bare_part = parse_compose_part("coder:ce-execute").unwrap();
         let bare = compose_workflow_with("bare", "obj", None, &[bare_part], &affinity).unwrap();
         assert_eq!(
             resolve_steer_channel(&bare, &serde_json::json!({})).unwrap(),
             None
         );
-        // Declared but unresolvable: refuse NOW, not mid-run with panes up.
         let mut declared = wf.clone();
         for input in &mut declared.inputs {
             if input.name == "steer_channel" {
@@ -2909,10 +2758,7 @@ steps:
         );
     }
 
-    // ---- ADR-0008 §10.C (bd-adr0008-expand-tests-7ui6) ----
     // beads-lifecycle expand-path coverage: graph-form token parses,
-    // expands to its 16-node graph lint-clean, mixes with plain parts,
-    // stays within budget caps; thin `beads` stays ordinary.
     #[test]
     fn beads_lifecycle_compose_token_parses_and_expands_graph_lint_clean() {
         use toron_workflow::schema::Action;
@@ -3105,14 +2951,12 @@ steps:
     #[test]
     fn budget_caps_fail_closed() {
         use toron_workflow::schema::{Action, Step};
-        // Over-cap dispatch leaves refuse.
         let parts: Vec<ComposePart> = (0..=(MAX_COMPOSED_DISPATCHES as u32))
             .map(|i| parse_compose_part(&format!("r{i}:stage{i}")).unwrap())
             .collect();
         let wf = compose_workflow("composed-cap", "obj", None, &parts).unwrap();
         let err = enforce_budget_caps(&wf).expect_err("over-cap dispatches must fail closed");
         assert!(err.to_string().contains("dispatch"), "{err}");
-        // A too-deep composite chain refuses regardless of leaf count.
         let leaf = Step {
             name: Some("leaf".into()),
             guard: None,
@@ -3283,9 +3127,7 @@ steps:
             2,
             "@crew.coder -> extra budget lands on coder"
         );
-        // Elastic N stays N.
         assert_eq!(plan.fanout_count("4"), 4);
-        // Unknown crew role → 1 (safe default).
         assert_eq!(plan.fanout_count("@crew.ghost"), 1);
     }
 
@@ -3365,15 +3207,14 @@ steps:
         assert_eq!(
             overs,
             vec![
-                "2".to_string(), // @crew.coder -> 2
-                "4".to_string(), // elastic N untouched
-                "1".to_string(), // @crew.reviewer -> 1 (nested retry)
-                "2".to_string(), // @crew.coder (branch then)
-                "1".to_string(), // @crew.ghost -> 1 (safe default)
+                "2".to_string(),
+                "4".to_string(),
+                "1".to_string(),
+                "2".to_string(),
+                "1".to_string(),
             ],
             "all @crew refs substituted, elastic N preserved: {overs:?}"
         );
-        // The ORIGINAL workflow is untouched (resolve is a pure rewrite).
         let mut orig = Vec::new();
         for step in &wf.steps {
             parallel_overs(step, &mut orig);
@@ -3414,7 +3255,6 @@ graph:
             Action::Parallel { over, .. } => assert_eq!(over, "3"),
             other => panic!("build should stay parallel, got {other:?}"),
         }
-        // A graph WITHOUT the fan-out ref resolves to the same shape.
         let bare = parse_workflow(
             r#"
 name: ship
@@ -3537,7 +3377,6 @@ steps:
                 },
             }],
         );
-        // Foreach + Retry (the other recursion arms).
         let wf2 = mk(
             "nested2",
             vec![
@@ -3571,8 +3410,6 @@ steps:
         assert_eq!(plan2.members.get("coder"), Some(&1), "{:?}", plan2.members);
         assert_eq!(plan2.members.get("scout"), Some(&1), "{:?}", plan2.members);
     }
-
-    // ---- bd-u4cu: workflow compose --agent (planner arm) ----
 
     /// The planner's authoring prompt carries the target + the catalog
     /// (workflows, profiles, stages) the authored YAML may reference.
@@ -3638,7 +3475,6 @@ steps:
         assert!(parse_planner_workflow("this is not yaml: [", "composed-x").is_err());
         assert!(parse_planner_workflow("", "composed-x").is_err());
         assert!(parse_planner_workflow("   \n\t\n", "composed-x").is_err());
-        // Valid YAML that is NOT a workflow (no name) is rejected too.
         assert!(parse_planner_workflow("foo: bar\nbaz: 1\n", "composed-x").is_err());
     }
 
@@ -3657,7 +3493,6 @@ steps:
     #[tokio::test]
     async fn bare_dispatch_red_fails_composed_workflow_not_silent_green() {
         use toron_workflow::schema::StepOnError;
-        // Single bare dispatch part via compose.
         let part = parse_compose_part("coder:systematic-execute").unwrap();
         let wf = compose_workflow("composed-bare-red", "fix the bug", None, &[part]).unwrap();
         assert_eq!(wf.steps.len(), 1);
@@ -3666,7 +3501,6 @@ steps:
             StepOnError::FailRun,
             "bare dispatch is FailRun"
         );
-        // Runner that fails the dispatch step (red).
         let runner: toron_workflow::engine::EffectRunner = std::sync::Arc::new(
             |inv: &toron_workflow::engine::ActionInvocation| {
                 if matches!(
@@ -3702,7 +3536,6 @@ steps:
             out["failed_step"].as_str().unwrap().contains("coder"),
             "{out}"
         );
-        // Green control: same workflow with ok runner succeeds.
         let ok_runner: toron_workflow::engine::EffectRunner =
             std::sync::Arc::new(|_inv: &toron_workflow::engine::ActionInvocation| {
                 Ok(serde_json::json!({ "ok": true }))
@@ -3736,8 +3569,6 @@ steps:
     async fn compose_dispatch_plus_verify_red_fails_and_sink_not_missing() {
         use std::sync::{Arc, Mutex};
         use toron_workflow::schema::StepOnError;
-        // Compose one bare dispatch, then append a verify step (the pattern
-        // `compose --run` produces when a verify stage is included).
         let part = parse_compose_part("coder:systematic-execute").unwrap();
         let mut wf = compose_workflow("composed-verify", "harden the loop", None, &[part]).unwrap();
         assert_eq!(wf.steps[0].on_error, StepOnError::FailRun);
@@ -3750,7 +3581,6 @@ steps:
                 command: "cargo test --lib".into(),
             },
         });
-        // Runner succeeds on dispatch; verify outcome comes from the sink.
         let runner: toron_workflow::engine::EffectRunner =
             Arc::new(|inv: &toron_workflow::engine::ActionInvocation| {
                 if matches!(inv.action, Action::Verify { .. }) {
@@ -3765,7 +3595,6 @@ steps:
             });
         let engine =
             toron_workflow::WorkflowEngine::local_with_effect_runner(Some(runner)).expect("engine");
-        // Attach a RED verify sink (simulates `cargo test` failing).
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_c = seen.clone();
         let sink = toron_workflow::engine::VerifySink::default();
@@ -3818,7 +3647,6 @@ steps:
                 })
             }));
         *engine2.verify_sink().0.lock().unwrap() = sink2.0.lock().unwrap().clone();
-        // Need fresh workflow (steps cloned) — verify sink green path.
         let mut wf_green = compose_workflow(
             "composed-verify-green",
             "harden the loop",
@@ -3845,8 +3673,6 @@ steps:
         );
         assert_eq!(out2["verify-1"]["ok"], true, "green verify ok: {out2}");
     }
-
-    // ---- ADR-0011 D2: unique-role pack into total N ----
 
     #[test]
     fn parse_crew_flag_integer_is_total() {
@@ -3962,9 +3788,6 @@ steps:
                         out.push(p.trim_start_matches('@').to_string());
                     }
                 }
-                // bd-8c5h: a fan-out or a branch arm is still a dispatch site.
-                // Walking only the top level would miss a folded role nested in
-                // one — which is the half of the document nobody checked.
                 Action::Parallel { each, .. } | Action::Foreach { each, .. } => {
                     walk(&each.action, out)
                 }
@@ -4015,10 +3838,6 @@ steps:
         let goal = catalog.get("goal").expect("goal builtin");
         let child = catalog.get("ce-brainstorm").expect("ce-brainstorm builtin");
 
-        // Precondition 1: the parent dispatches roles, but NOT the folded one.
-        // That is the whole gap — a rewrite of the parent can only ever reach
-        // what the parent dispatches, so a role only the child dispatches is
-        // unreachable no matter how many times the parent is rewritten.
         let parent_roles = dispatch_profiles(goal);
         assert!(
             !parent_roles.is_empty(),
@@ -4028,7 +3847,6 @@ steps:
             !parent_roles.contains(&"oracle".to_string()),
             "goal now dispatches @oracle itself, so the child gap is gone: {parent_roles:?}"
         );
-        // Precondition 2: the child is the one that dispatches the folded role.
         assert!(
             dispatch_profiles(child).contains(&"oracle".to_string()),
             "ce-brainstorm no longer dispatches @oracle: {:?}",
@@ -4038,9 +3856,6 @@ steps:
         let aliases: BTreeMap<String, String> =
             BTreeMap::from([("oracle".to_string(), "coder".to_string())]);
 
-        // The bug, as an assertion: the existing rewrite cannot touch a role
-        // the parent never dispatches, so rewriting the parent changes nothing
-        // and @oracle survives in the child untouched.
         let rewritten_parent = apply_role_aliases(goal, &aliases);
         let parent_after = dispatch_profiles(&rewritten_parent);
         assert_eq!(
@@ -4049,8 +3864,6 @@ steps:
              that would mean the gap closed some other way: {parent_roles:?} vs {parent_after:?}"
         );
 
-        // The fix: the fold rides the resolver, so the child is rewritten
-        // before the engine ever sees it.
         let raw = std::sync::Arc::new(child.clone());
         let base: toron_workflow::WorkflowResolver = std::sync::Arc::new(move |name: &str| {
             (name == "ce-brainstorm").then(|| (*raw).clone())
@@ -4067,8 +3880,6 @@ steps:
             after.contains(&"coder".to_string()),
             "the host role is missing from the rewritten child: {after:?}"
         );
-        // A fold rewrites ONE role, not the document: an unfurled role in the
-        // same child must survive.
         assert!(
             after.contains(&"reviewer".to_string()),
             "an unfurled role was rewritten too: {after:?}"
@@ -4128,8 +3939,6 @@ steps:
         assert_eq!(packed.aliases.len(), 1);
     }
 
-    // ---- bd-0s0y: crew demand / self-collision ----
-
     fn wf_from(yaml: &str) -> Workflow {
         toron_workflow::schema::parse_workflow(yaml).expect("yaml parses")
     }
@@ -4182,8 +3991,6 @@ steps:
     /// which is the original defect.
     #[test]
     fn a_shape_over_the_cap_fails_loud_and_never_folds_a_multi_copy_role() {
-        // 3 oracles + 3 planners = 6 > cap 5. Every role is multi-copy, so
-        // there is nothing safe to fold.
         let shape: BTreeMap<String, u32> = [("oracle", 3u32), ("planner", 3u32)]
             .into_iter()
             .map(|(k, v)| (k.to_string(), v))
@@ -4195,9 +4002,6 @@ steps:
             "the error must state the shortfall: {err}"
         );
 
-        // With foldable roles it packs by folding ONLY single-copy ones: 6
-        // panes of demand, budget/cap 5, and the surplus comes out of `scout`
-        // (and then `reviewer`) — never out of the 3-way oracle.
         let shape: BTreeMap<String, u32> = [
             ("oracle", 3u32),
             ("planner", 1u32),
@@ -4344,9 +4148,6 @@ graph:
             if d.crew_total == 0 {
                 continue;
             }
-            // Two budgets on purpose: the natural one (shape fits, no fold) and
-            // a fold-forcing one (one pane short, so single-copy roles fold and
-            // a multi-copy role must survive intact).
             let budgets = [
                 d.crew_total.min(DEFAULT_CREW_MAX),
                 d.crew_total.saturating_sub(1).max(1),
@@ -4366,10 +4167,6 @@ graph:
                             }
                         }
                     }
-                    // At the NATURAL budget an Err means the shape is over the
-                    // cap with nothing left to fold — a real defect. At the
-                    // SHORT budget folding is the point, so an Err there is
-                    // expected and must not be reported.
                     Err(e) if i == 0 => broken.push(format!("{name}: {e}")),
                     Err(_) => {}
                 }
@@ -4474,7 +4271,6 @@ steps:
     fn goal_fits_five_panes_with_three_way_divergence() {
         let catalog = crate::builtin_workflows::builtin_workflows();
 
-        // The chain itself: 3 dispatch sites on 3 distinct roles, sequential.
         let goal = catalog.get("goal").expect("goal builtin");
         assert_eq!(
             crew_demand(goal).required_panes,
@@ -4482,7 +4278,6 @@ steps:
             "goal's own steps are sequential"
         );
 
-        // The child that actually costs panes, and it must be clean.
         let cb = catalog.get("ce-brainstorm").expect("ce-brainstorm builtin");
         let d = crew_demand(cb);
         assert!(
@@ -4494,7 +4289,6 @@ steps:
             "three independent divergers, three panes"
         );
 
-        // Divergence is preserved, not traded away: three distinct lenses.
         let lenses: Vec<String> = ["diverge_oracle", "diverge_structure", "diverge_risk"]
             .into_iter()
             .filter(|n| cb.graph.as_ref().is_some_and(|g| g.nodes.contains_key(*n)))
@@ -4506,8 +4300,6 @@ steps:
             "the fan-out is still 3-way, just spread across roles: {lenses:?}"
         );
 
-        // The union of roles across goal's whole call graph is the crew it
-        // needs, and it is 5 — the cap, not over it.
         let mut roles: std::collections::BTreeSet<String> = Default::default();
         for wf_name in ["goal", "ce-brainstorm", "phase-plan", "beads"] {
             let wf = catalog.get(wf_name).expect("workflow in goal's call graph");

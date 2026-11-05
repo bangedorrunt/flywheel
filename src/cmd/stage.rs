@@ -61,9 +61,6 @@ pub(crate) enum StageCmd {
 
 /// `flywheel stage list`: the stage library surface (ADR-0005 P3.3).
 pub(crate) fn cmd_stage(cfg: &Config, cmd: &StageCmd) -> Result<()> {
-    // The project tier lives in the default project's workspace dir
-    // (<workspace-root>/flywheel/.flywheel/stages.toml) — the same project
-    // `workflow compose` defaults to.
     let project_stages = crate::project_dir(cfg, "flywheel").join(".flywheel/stages.toml");
     match cmd {
         StageCmd::List {
@@ -152,9 +149,6 @@ pub(crate) fn cmd_stage(cfg: &Config, cmd: &StageCmd) -> Result<()> {
                     path.display()
                 );
             }
-            // Back up first. This deletes a file the operator may have edited,
-            // and the compiled-in stage showing through afterwards is not
-            // obviously the state they wanted.
             let bak = path.with_extension("toml.bak");
             std::fs::copy(&path, &bak)
                 .map_err(|e| anyhow::anyhow!("backup {}: {e}", bak.display()))?;
@@ -218,8 +212,6 @@ pub(crate) fn cmd_stage(cfg: &Config, cmd: &StageCmd) -> Result<()> {
                     Ok(())
                 }
                 "repo" => {
-                    // §3.8 evidence bar: >=2 successful runs (distinct
-                    // objectives) + a review bead, then land as DATA.
                     crate::promote_to_repo(
                         name,
                         evidence,

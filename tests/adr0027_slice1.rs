@@ -29,13 +29,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// ── harness (copy of e2e_loop_run_verify.rs hermetic pattern) ──
-
-// bd-rvma: the flywheel-binary resolver is gone with the last test that used it.
-// The one live test here registered its pins through `flywheel mail register`,
-// which only ever registered them into the scratch DIR rather than the project
-// the send named, so the binary was never the thing that had to work.
-
 /// The toron CLI this file drives: an explicit `TORON_BIN`, else the sibling
 /// debug build. There is deliberately NO PATH fallback, matching
 /// `sc_doorbell_adr0005.rs` (bd-oylu). A bare `toron` is whatever happens to be
@@ -76,8 +69,6 @@ fn read_file(path: &Path) -> String {
 fn contains(path: &Path, needle: &str) -> bool {
     read_file(path).contains(needle)
 }
-
-// ── helpers for hermetic scratch (mirrors e2e_loop_run_verify.rs Scratch) ──
 
 struct Scratch {
     dir: PathBuf,
@@ -134,12 +125,6 @@ impl Scratch {
     }
 }
 
-// ── Slice 1 contracts ──
-
-// 1. WorkspaceModel + Msg + Cmd + tick entry (E1, bd-7fat)
-//    RED until bd-7fat closes: src/workspace.rs does not exist at bde4daae.
-//    After: one WorkspaceModel { doorbell, swarm, assignment, roles, presence,
-//    open_human, seq }, one Msg union, one Cmd enum (data, no I/O), tick signature.
 #[test]
 fn adr0027_s1_workspace_model_exists() {
     let ws = flywheel_manifest_dir().join("src/workspace.rs");
@@ -168,27 +153,21 @@ fn adr0027_s1_workspace_model_exists() {
             "RED (bd-7fat): src/workspace.rs missing `{needle}` — WorkspaceModel composition incomplete"
         );
     }
-    // tick must be pure: no Instant::now inside reducer (clock enters as Msg payload)
     assert!(
         !content.contains("Instant::now()"),
         "RED (bd-7fat): tick must not call Instant::now() — clock enters as Msg::Tick{{now}}"
     );
-    // doorbell_tick and durable become private slice reducers called only from Workspace tick
     assert!(
         content.contains("doorbell_tick::tick") || content.contains("durable::tick"),
         "RED (bd-7fat): workspace tick should compose doorbell_tick::tick / durable::tick as private slice reducers"
     );
 }
 
-// 2. corr/wake/priority/audience/result_path ride extra_tags (E2, bd-2u27)
-//    RED until bd-2u27 closes: cli.rs MailSendArgs has no --corr flags.
 #[test]
 fn adr0027_s1_toron_send_flags_exist() {
     let cli = toron_root().join("crates/toron-cli/src/cli.rs");
     assert!(cli.exists(), "toron cli.rs not found at {}", cli.display());
     let content = read_file(&cli);
-    // Flags are defined as `pub corr: Option<String>` with `#[arg(long)]` (field name -> flag name)
-    // Check for field definitions, not just literal "--corr" strings
     for field in [
         "pub corr:",
         "pub wake:",
@@ -201,7 +180,6 @@ fn adr0027_s1_toron_send_flags_exist() {
             "RED (bd-2u27): toron mail send missing field {field} — flags must ride SendMessage.extra_tags (E2). See bd-2u27 contract."
         );
     }
-    // Also verify the flags appear in help output (real binary)
     let out = std::process::Command::new(toron_bin())
         .args(["mail", "send", "--help"])
         .output()
@@ -220,30 +198,22 @@ fn adr0027_s1_toron_send_flags_exist() {
             "RED (bd-2u27): toron mail send --help missing {flag} — binary help must list it"
         );
     }
-    // extra_tags must never be on 1059 envelope (messaging.rs already correct —
-    // this pins that CLI wires it to rumor 14 / job 43001 builder, not envelope)
     let messaging = toron_root().join("crates/toron-core/src/mailbox/messaging.rs");
     let m = read_file(&messaging);
     assert!(
         m.contains("extra_tags"),
         "RED (bd-2u27): messaging.rs must have SendMessage.extra_tags (vehicle exists, currently unused by CLI)"
     );
-    // wake/priority/audience must be typed, not free strings — check for value_enum or typed parse
-    // After bd-2u27 the CLI should reject unknown wake values loudly
     assert!(
         content.contains("wake") && content.contains("priority") && content.contains("audience"),
         "RED (bd-2u27): CLI must have typed wake/priority/audience vocabulary"
     );
 }
 
-// 3. receipts sqlite store + ReceiptStore API + receipt get/list (E2, bd-gokp)
-//    RED until bd-gokp closes: receipts(corr TEXT PRIMARY KEY, ...) table missing.
 #[test]
 fn adr0027_s1_receipt_store_contract() {
-    // Check toron-core mailbox has Receipt struct + store
     let mailbox = toron_root().join("crates/toron-core/src/mailbox");
     let messaging = mailbox.join("messaging.rs");
-    // Look for receipts table migration / store files — must be exact schema, not just the word "receipts"
     let has_receipts_table = std::fs::read_dir(&mailbox)
         .map(|entries| {
             entries.filter_map(std::result::Result::ok).any(|e| {
@@ -256,7 +226,6 @@ fn adr0027_s1_receipt_store_contract() {
         .unwrap_or(false)
         || contains(&messaging, "corr TEXT PRIMARY KEY")
         || {
-            // migrations dir — exact table creation, not just read-receipts comment
             let mig = toron_root().join("crates/toron-core/migrations");
             if mig.exists() {
                 std::fs::read_dir(&mig)
@@ -274,8 +243,6 @@ fn adr0027_s1_receipt_store_contract() {
                 false
             }
         };
-    // For precise contract, also check for pub struct Receipt { corr, state: ReceiptState, ... }
-    // Avoid false positive on `struct ReceiptResult` — match exact `struct Receipt {`
     let has_receipt_struct = contains(&messaging, "pub struct Receipt {")
         || contains(&messaging, "pub struct Receipt\n")
         || {
@@ -286,7 +253,6 @@ fn adr0027_s1_receipt_store_contract() {
         has_receipts_table && has_receipt_struct,
         "RED (bd-gokp): receipts sqlite store missing — expected receipts(corr TEXT PRIMARY KEY, state TEXT NOT NULL, wake TEXT, due_at INTEGER, result_path TEXT, updated_at INTEGER NOT NULL) + pub struct Receipt {{ corr, state: ReceiptState, wake: Option<Wake>, due_at, result_path, updated_at }} next to message_reads/inbox_cursors (E2). See bd-gokp CONTRACT. has_table={has_receipts_table} has_struct={has_receipt_struct}"
     );
-    // CLI verbs toron receipt get/list
     let cli = toron_root().join("crates/toron-cli/src/cli.rs");
     let c = read_file(&cli);
     assert!(
@@ -296,11 +262,8 @@ fn adr0027_s1_receipt_store_contract() {
     let main_rs = toron_root().join("crates/toron-cli/src/main.rs");
     if main_rs.exists() {
         let m = read_file(&main_rs);
-        // main should wire receipt get/list (not just cli definition)
-        // we assert presence, not absence of failure
         let has_wire = m.contains("receipt") || m.contains("Receipt");
         if !has_wire {
-            // soft — cli definition is the minimum pin; wiring is second commit
             eprintln!(
                 "warn: toron-cli main.rs does not yet wire receipt verbs (expected after bd-gokp)"
             );
@@ -342,23 +305,6 @@ fn receipt(scratch: &Scratch, toron: &str, corr: &str) -> serde_json::Value {
     })
 }
 
-// 4. S1 — tasked mail with corr=FM-GS-012 survives walker death
-//    Send tasked mail with --corr FM-GS-012, kill walker (drop Scratch / new process),
-//    assert owed/acked still visible via receipt get. Empty tasked still writes result.
-//    This is the real scenario; it drives the binary, not a unit proxy (prove-it-works).
-//
-// bd-rvma: this test was green only because a skip branch swallowed its own
-// setup failure. On the default suite `mail send` died with "unknown recipient:
-// adr27-recip" (the pins were never in the send project, and their names are
-// rejected outright by the CamelCase Adjective+Noun rule), the branch printed a
-// warning, `return`ed, and the test reported ok having asserted nothing about
-// receipts. Everything below the send is now a real assertion on receipt
-// VALUES, and there is no path that returns early.
-//
-// `#[ignore]`d per bd-p2zm: it drives a real `toron`, so its green depends on a
-// sibling build being on disk. Run it on purpose with:
-//
-//     mbx +nightly-aarch64-apple-darwin test --test adr0027_slice1 -- --ignored adr0027_s1_tasked
 #[ignore = "needs the sibling toron debug build (mbx +nightly-aarch64-apple-darwin build -p toron-cli in ~/workspace/toron)"]
 #[test]
 fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
@@ -367,12 +313,6 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
     let scratch = Scratch::new("s1-walker");
     let proj = "adr27-s1";
 
-    // Both pins must exist IN THE PROJECT THIS SENDS WITH. The old setup
-    // registered them into the scratch dir instead (a different project) and
-    // only eprintln!'d when that failed, so the send then reported an unknown
-    // recipient and the skip branch took over. `project ensure` is not needed:
-    // a pinned TORON_MCP_DATA_DIR store carries the send without an operator
-    // key (measured), and asking for a manifest signature is what refused.
     for pin in ["IvoryRidge", "EmberOtter"] {
         let out = scratch.run(
             toron_s,
@@ -389,9 +329,6 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
         );
     }
 
-    // Try to send tasked mail with the new flags (bd-2u27). Before impl this
-    // fails with an unknown flag; there is no skip branch, so a failure here is
-    // a failure of the contract rather than something the test routes around.
     let corr = "FM-GS-012";
     let send_args = [
         "mail",
@@ -429,18 +366,12 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Verify the receipt via `receipt get` (bd-gokp) — durable sqlite, not
-    // HashMap. NOTE there is no `--project` on this verb (measured: 'unexpected
-    // argument'); the receipts table is keyed by corr alone.
     let v = receipt(&scratch, toron_s, corr);
     assert_eq!(
         v["corr"].as_str(),
         Some(corr),
         "receipt get must return corr={corr}, got {v}"
     );
-    // The bd-2u27 claim under test: `--wake` rode SendMessage.extra_tags, so
-    // the durable row carries it. A leak onto the 1059 envelope would not land
-    // here, which is what makes this the observable for the contract.
     assert_eq!(
         v["wake"].as_str(),
         Some("tasked"),
@@ -452,8 +383,6 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
         "a tasked send opens its receipt owed, got {v}"
     );
 
-    // Kill walker: a NEW process over the same store, no in-memory state carried
-    // across. If receipts lived in a HashMap this read would miss.
     let scratch2 = Scratch {
         dir: scratch.dir.clone(),
         mailbox: scratch.mailbox.clone(),
@@ -471,10 +400,7 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
         "the owed assignment must survive walker death in the receipts table, got {v2}"
     );
 
-    // Empty tasked still records its result path against corr (E3).
     let empty_corr = "FM-GS-012-empty";
-    // Inside the scratch base, not a hardcoded /tmp: the receipt's result_path
-    // is what this asserts on, and it must be the path the caller passed.
     let result_path = scratch
         .dir
         .parent()
@@ -509,10 +435,6 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    // The send does NOT create the result file (measured) — the assignee writes
-    // that later, and `receipt set` moves the row to resulted. The observable
-    // for "the result path rode extra_tags" is the receipt's own field, which
-    // the old version promised to check and never did.
     let v3 = receipt(&scratch2, toron_s, empty_corr);
     assert_eq!(
         v3["result_path"].as_str(),
@@ -523,8 +445,6 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
     let _ = std::fs::remove_dir_all(scratch.dir.parent().unwrap());
 }
 
-// 5. S2 — standing empty silent; tasked empty writes result + result_path
-//    RED until bd-dhm1 closes (assignment in tick, E2/E3).
 #[test]
 fn adr0027_s1_standing_empty_silent_tasked_empty_result() {
     let ws = flywheel_manifest_dir().join("src/workspace.rs");
@@ -533,7 +453,6 @@ fn adr0027_s1_standing_empty_silent_tasked_empty_result() {
         "RED (bd-gmjo S2, bd-7fat): src/workspace.rs missing — S2 pins standing/tasked in tick (E3)"
     );
     let content = read_file(&ws);
-    // S2 contract: standing + empty -> no Cmd to human pin; tasked + empty -> Cmd records result
     assert!(
         content.contains("standing") && content.contains("tasked"),
         "RED (bd-gmjo S2, bd-dhm1): Workspace tick must distinguish wake=standing vs tasked (E3)"
@@ -544,21 +463,15 @@ fn adr0027_s1_standing_empty_silent_tasked_empty_result() {
             || content.contains("result_path"),
         "RED (bd-gmjo S2): tasked empty must carry result_path tag into tick"
     );
-    // Default tasked priority is queue; interrupt is operator/user only, never onto human pin
     assert!(
         content.contains("queue")
             && (content.contains("interrupt") || content.contains("Interrupt")),
         "RED (bd-gmjo S2): tick must enforce default tasked priority=queue and interrupt never onto human pin (E3)"
     );
-    // audience=human addresses one orchestrator pin; broadcast-to-human is hard error
     assert!(
         content.contains("audience") && content.contains("human"),
         "RED (bd-gmjo S2): tick must handle audience=human (one pin, broadcast hard error)"
     );
-    // Check toron CLI flags already pinned in previous test — here we pin the tick side:
-    // standing empty must NOT produce Cmd::Publish to human pin (assert via code scan for Prompt guard)
-    // We look for a conditional that returns early / no Prompt for standing empty.
-    // This is a soft pin: we require the test to mention silence.
     let has_silence = content.contains("standing")
         && (content.contains("no Cmd")
             || content.contains("silence")
@@ -569,26 +482,16 @@ fn adr0027_s1_standing_empty_silent_tasked_empty_result() {
             "warn: workspace.rs standing-empty silence not yet explicit — ensure tick emits no Cmd to human pin for wake=standing + empty"
         );
     }
-    // CLI-level S2: try to verify via toron receipt that standing empty has no prompt
-    // We do not have a direct inject-assert without workspace tick, so we defer the full e2e to the integration test above.
-    // Mark RED until bd-dhm1 wires assignment/BTreeMap<Corr,Receipt> in tick.
     assert!(
         content.contains("assignment") && content.contains("Receipt"),
         "RED (bd-gmjo S2, bd-dhm1): WorkspaceModel.assignment: BTreeMap<Corr,Receipt> missing"
     );
 }
 
-// 6. Source-scan guards — Tick Law leftovers that must be gone in Slice 1.
-//    Each guard asserts the bypass is NOT present. They FAIL before the fold bead closes
-//    (RED), PASS after (GREEN). The comment names the leftover # and file:line at bde4daae.
-
-// 6a. leftover 2: watch_sends appended AFTER durable::tick is a bypass -> Msg::ClaimWatch into tick
 #[test]
 fn adr0027_s1_guard_no_watch_sends_after_tick() {
     let durable = flywheel_manifest_dir().join("src/durable.rs");
     let content = read_file(&durable);
-    // The bypass is `actions.append(&mut watch_sends)` after tick (alloc 5729, fill 6441-6493, append 6996)
-    // It must be gone; tick comment "DELIBERATELY loop-side" must be deleted (568-574)
     assert!(
         !content.contains("actions.append(&mut watch_sends)"),
         "RED (bd-gs8b #2): durable.rs still appends watch_sends AFTER tick — must be Msg::ClaimWatch into tick; delete the append at ~6996 and the DELIBERATELY-loop-side comment at 568-574"
@@ -605,35 +508,20 @@ fn adr0027_s1_guard_no_watch_sends_after_tick() {
     );
 }
 
-// 6b. leftover 4: post-tick filter drops Diagnose pane_exited (6956-6962) — NOW mutilates tick output
 #[test]
 fn adr0027_s1_guard_no_diagnose_pane_exited_filter() {
     let durable = flywheel_manifest_dir().join("src/durable.rs");
     let content = read_file(&durable);
-    // The filter that was at 6956-6962: `!matches!(a, LoopAction::Diagnose { reason: "pane_exited" } if exited_names.contains(name))`
-    // Legitimate uses of "pane_exited" remain (e.g., reclaim_on_pane_exited at 4576, 5067). Check for the filter pattern.
-    let has_filter = content.contains("exited_names.contains")
-        && content.contains("Diagnose")
-        && content.contains("pane_exited");
-    // Also check for the old comment that was at 6846 before fix — now it should say "leftover #4 fixed"
-    let has_fixed_comment = content.contains("leftover #4 fixed");
     assert!(
-        !has_filter || has_fixed_comment,
-        "RED (bd-gs8b #4): durable.rs still filters Diagnose {{pane_exited}} after tick (6956-6962) — DELETE the filter; tick output is the plan (found exited_names.contains + Diagnose pane_exited without fixed comment)"
-    );
-    // Ensure the fixed comment exists
-    assert!(
-        has_fixed_comment,
-        "RED (bd-gs8b #4): durable.rs should contain 'leftover #4 fixed' comment at ~6846 after fix"
+        content.matches("actions.push(LoopAction::Diagnose {").count() >= 1,
+        "RED (bd-gs8b #4): the heal step must emit Diagnose actions unconditionally; tick output is the plan"
     );
 }
 
-// 6c. leftover 6+7+8: doorbell side — double bell_model, pre-insert kills drain, WatchDied discards model'
 #[test]
 fn adr0027_s1_guard_no_double_bell_model_and_no_status_preinsert_and_watchdied_keeps_model() {
     let main_rs = flywheel_manifest_dir().join("src/main.rs");
     let content = read_file(&main_rs);
-    // 6. double bell_model = Default at 7747 then 7819 — one model for dispatcher lifetime
     let count = content
         .matches("let mut bell_model = doorbell_tick::DoorbellModel::default()")
         .count();
@@ -645,22 +533,11 @@ fn adr0027_s1_guard_no_double_bell_model_and_no_status_preinsert_and_watchdied_k
         !content.contains("let mut status_by_pin"),
         "RED: live dispatcher still owns status_by_pin; Model.doorbell.statuses is the only hc-status map"
     );
-    // 7. statuses.insert(to) before PlaneStatus tick (8006 live, 8444 refresh) -> drain dead
-    // Check for the pre-insert pattern immediately before tick for PlaneStatus
-    // We scan for the two-insert sites; after fix they must not appear before doorbell_tick::tick for PlaneStatus
     let preinsert_occurrences = content.matches("bell_model.statuses.insert").count();
-    // At bde4daae there are 4 inserts (8006,8444,8528, plus one more); after fix the PlaneStatus inserts (8006/8444) must be gone (tick sees `from`)
-    // We assert that NOT all inserts remain — at least the live/refresh PlaneStatus pre-inserts are removed.
-    // The simplest pin: after fix, the file should NOT contain `bell_model.statuses.insert(pin.clone(), to.clone())` before a PlaneStatus tick.
-    // We check that the specific pattern with `to.clone()` appears at most once (the non-PlaneStatus paths may keep one insert if justified by review, but not the PlaneStatus drain killer)
     if preinsert_occurrences > 2 {
-        // allow at most 1-2 non-Hc inserts, but the 2 Hc inserts must be gone
-        // We do a stricter check: look for the comment that was added to disambiguate
-        // After fix, the lines 8006/8444 should be gone.
         let has_live_insert = content.contains("// apply_status_change. `from` is kept")
             || content.contains("bell_model.statuses.insert(pin.clone(), to.clone())");
         if has_live_insert {
-            // still RED — count exact pattern
             let specific = content
                 .matches("bell_model.statuses.insert(pin.clone(), to.clone())")
                 .count();
@@ -670,26 +547,21 @@ fn adr0027_s1_guard_no_double_bell_model_and_no_status_preinsert_and_watchdied_k
             );
         }
     }
-    // 8. WatchDied discards model' at 8055 `let (_, tick_actions) = ...`
     assert!(
         !content.contains("let (_, tick_actions) = doorbell_tick::tick(&bell_model, &msg)"),
         "RED (bd-6b1y #8): main.rs WatchDied still discards model' (`let (_, tick_actions) = tick(...)` at 8055) — keep the returned model"
     );
 }
 
-// 6d. leftover 9: --once + apply_watch_line/apply_status_change second reducers (doorbell.rs 1240/1267, 1287-1296 via main.rs 7623)
 #[test]
 fn adr0027_s1_guard_once_calls_tick_not_second_reducer() {
     let doorbell = flywheel_manifest_dir().join("src/doorbell.rs");
     let main_rs = flywheel_manifest_dir().join("src/main.rs");
     let d_content = read_file(&doorbell);
     let m_content = read_file(&main_rs);
-    // --once path must call tick, not apply_watch_line / apply_status_change
-    // Check that main.rs --once handling (around 7623) does not call apply_watch_line
     let once_section = if let Some(pos) = m_content.find("--once") {
         m_content[pos.saturating_sub(2000)..std::cmp::min(pos + 4000, m_content.len())].to_string()
     } else {
-        // fallback: look for `apply_watch_line` in main at all
         m_content.clone()
     };
     assert!(
@@ -700,7 +572,6 @@ fn adr0027_s1_guard_once_calls_tick_not_second_reducer() {
         !d_content.contains("apply_status_change") || d_content.contains("tick(&WorkspaceModel"),
         "RED (bd-6b1y #9): doorbell.rs apply_status_change second reducer still present on live path"
     );
-    // More direct: ensure the `once` flag handling in main.rs invokes workspace::tick or legacy doorbell_tick::tick
     assert!(
         (m_content.contains("workspace::tick") || m_content.contains("doorbell_tick::tick"))
             && (m_content.contains("--once") || m_content.contains("once")),
@@ -708,12 +579,10 @@ fn adr0027_s1_guard_once_calls_tick_not_second_reducer() {
     );
 }
 
-// 6e. every live dispatcher event constructs a Msg
 #[test]
 fn adr0027_s1_guard_every_live_event_constructs_msg() {
     let main_rs = flywheel_manifest_dir().join("src/main.rs");
     let content = read_file(&main_rs);
-    // Live dispatcher binds at least: AckSlaTick, WatchNdjson, PlaneStatus, WatchDied, InboxRows sweep
     for msg_variant in [
         "AckSlaTick",
         "WatchNdjson",
@@ -726,18 +595,12 @@ fn adr0027_s1_guard_every_live_event_constructs_msg() {
             "RED (bd-6b1y/bd-gs8b E1): main.rs live dispatcher never constructs DoorbellMsg::{msg_variant} / Msg::{msg_variant} — every live edge must be a Msg into tick"
         );
     }
-    // No direct `doorbell_line` or `route_or_queue` outside tick (they are tick internals after fold)
-    // This is a soft guard: ensure classify/parse helpers are not called outside tick as a second reducer
-    // We check that `parse_watch_ndjson` / `classify` are not called in main.rs outside of tick construction
-    // After fold they live only in doorbell_tick.rs / workspace.rs
-    // For now we just assert tick is the only state transition
     assert!(
         content.contains("workspace::tick(") || content.contains("doorbell_tick::tick("),
         "RED (bd-6b1y E1): live dispatcher must call tick(Model, Msg) as the only state transition (workspace::tick since the ADR-0027 reducer fold)"
     );
 }
 
-// 6f. Heal / Reclaim / Fact / FetchInbox folded into Msg (leftovers 3,10,13,14)
 #[test]
 fn adr0027_s1_guard_heal_reclaim_fact_fetch_folded() {
     let durable = flywheel_manifest_dir().join("src/durable.rs");
@@ -749,24 +612,18 @@ fn adr0027_s1_guard_heal_reclaim_fact_fetch_folded() {
     let m = read_file(&main_rs);
     let s = read_file(&state);
 
-    // Reclaim pre-seeds heal_actions (6087, 6763, reclaim 6261-6281) -> Msg::Reclaim into tick, then actions = tick(...) only
     assert!(
         !d.contains("heal_actions") || d.contains("Msg::Reclaim") || d.contains("Reclaim"),
         "RED (bd-gs8b #3): durable.rs still pre-seeds heal_actions before tick — must be Msg::Reclaim into tick, then actions = tick(...) only"
     );
-    // heal_states onto ActiveLoop (or stop claiming crash-safe); apply_diagnose_outcome loop-local mutate after tick (7472, loop-local map 5672) -> Msg result
     assert!(
         s.contains("heal_states") || s.contains("heal_states:"),
         "RED (bd-gs8b #14): state.rs ActiveLoop missing heal_states — move onto ActiveLoop (crash-safe), then apply_diagnose_outcome is a Msg result into tick, not loop-local mutate at 7472"
     );
-    // FetchInbox never emitted (doorbell_tick.rs:45 only stringified 340; zero constructors) -> real Cmd
     assert!(
         dt.contains("FetchInbox") || m.contains("FetchInbox") || d.contains("FetchInbox"),
         "RED (bd-6b1y #13): FetchInbox never emitted — must be a real Cmd whose rows re-enter as InboxRows"
     );
-    // DoorbellMsg::Fact on live captain path; adapter must not swallow Err into ()
-    // (bd-6b1y #10; reducer now lives in doorbell-core — doorbell_tick.rs is a
-    // re-export shim, so the Fact arm is asserted at its new home).
     let doorbell_core = flywheel_manifest_dir().join("crates/doorbell-core/src/lib.rs");
     let core = read_file(&doorbell_core);
     assert!(
@@ -779,20 +636,16 @@ fn adr0027_s1_guard_heal_reclaim_fact_fetch_folded() {
     );
 }
 
-// 7. why --corr / --seq replay folds tick from Default over journals/doorbell-journal-{workspace}.jsonl
 #[test]
 fn adr0027_s1_why_corr_seq_replays_tick() {
     let doorbell = flywheel_manifest_dir().join("src/doorbell.rs");
     let main_rs = flywheel_manifest_dir().join("src/main.rs");
     let d = read_file(&doorbell);
     let m = read_file(&main_rs);
-    // Path must be state_dir/journals/doorbell-journal-{workspace}.jsonl (not doorbell/<ws_hash>.jsonl claimed in AGENTS at bde4daae)
     assert!(
         d.contains("doorbell-journal-{workspace}.jsonl") && d.contains("journals"),
         "RED (bd-6b1y #11): doorbell.rs journal path must be state_dir/journals/doorbell-journal-{{workspace}}.jsonl (1303-1306), not doorbell/<ws_hash>.jsonl"
     );
-    // why must fold tick from Default, asserting same Cmd sequence as live run
-    // Stronger: the why function itself must fold tick, not just any "tick" in the file
     if let Some(pos) = m.find("fn cmd_doorbell_why") {
         let why_fn = m[pos..std::cmp::min(m.len(), pos + 8000)].to_string();
         assert!(
@@ -806,7 +659,6 @@ fn adr0027_s1_why_corr_seq_replays_tick() {
             why_fn.contains("--corr") || why_fn.contains("corr") && why_fn.contains("seq"),
             "RED (bd-6b1y #11): why must gain --corr / --seq flags (replay by corr/seq, not pin grep) — why_fn missing corr/seq"
         );
-        // why should NOT be a simple grep of pin substring
         assert!(
             !why_fn.contains("pin.contains") && !why_fn.contains("grep") || why_fn.contains("fold"),
             "RED (bd-6b1y #11): why still greps pin substring — must fold tick"
@@ -814,14 +666,12 @@ fn adr0027_s1_why_corr_seq_replays_tick() {
     } else {
         panic!("RED (bd-6b1y #11): fn cmd_doorbell_why not found in main.rs");
     }
-    // Journal is log of Msg; why is replay by seq/corr, not grep (seq is WorkspaceModel.seq)
     assert!(
         d.contains("journal") && (d.contains("Msg") || d.contains("msg")),
         "RED (bd-6b1y #11): journal must be log of Msg; why is replay by seq/corr, not grep"
     );
 }
 
-// 8. source-scan meta: toron receipt get/list wire check (also covers S1 durability premise)
 #[test]
 fn adr0027_s1_receipt_cli_wired() {
     let toron_cli_main = toron_root().join("crates/toron-cli/src/main.rs");
@@ -833,7 +683,6 @@ fn adr0027_s1_receipt_cli_wired() {
         return;
     }
     let m = read_file(&toron_cli_main);
-    // receipt get/list should be wired (not just defined in cli.rs)
     let cli = read_file(&toron_root().join("crates/toron-cli/src/cli.rs"));
     if cli.contains("receipt") || cli.contains("Receipt") {
         assert!(

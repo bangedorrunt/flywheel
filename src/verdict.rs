@@ -1,11 +1,4 @@
 // governed-by: ADR-0019
-// Wave-1 verdict spine (ADR-0019 Spec 1, amended 2026-08-15): the pure types
-// and the legal-close matrix. No IO in this module by design (bd-w1-types-vbez).
-// The br-gate verdict store, receipts helper, and loop-only reporter guard
-// land in bd-w1-gate-store-h2ur on top of these types.
-//
-// The pub items here are the wave-1 spine: consumers (br gate wrappers, the
-// `flywheel ledger` CLI, the loop close-detect path) land in the next beads.
 
 use std::path::PathBuf;
 
@@ -255,11 +248,9 @@ fn is_heavy_marker(arg: &str) -> bool {
 /// matrices and unbounded shells are time bombs — non-runnable band.
 fn estimated_cheap(exec: &str, args: &[String]) -> bool {
     match exec {
-        // cargo: a TARGETED test run (`-p <pkg>` and/or a test filter after
-        // `test`); never the whole workspace matrix or a bare `cargo test`.
         "cargo" => {
             let Some(test_pos) = args.iter().position(|a| a == "test") else {
-                return false; // cargo without `test` is not a verification
+                return false;
             };
             !args.iter().any(|a| is_heavy_marker(a))
                 && (args[test_pos + 1..]
@@ -267,14 +258,8 @@ fn estimated_cheap(exec: &str, args: &[String]) -> bool {
                     .any(|a| a == "-p" || a.starts_with("-p") || a.starts_with("--package"))
                     || args[test_pos + 1..].iter().any(|a| !a.starts_with('-')))
         }
-        // pytest / test runners / python: targeted by default — reject the
-        // known-heavy markers.
         "pytest" | "test" | "python" | "python3" => !args.iter().any(|a| is_heavy_marker(a)),
-        // Bounded shell: must carry an explicit `timeout` bound (quoted
-        // args split on whitespace, so match the token as a substring).
         "sh" | "bash" => args.iter().any(|a| a.contains("timeout")),
-        // An explicit `timeout` wrapper is loop-runnable by definition (the
-        // bound is the caller's call).
         "timeout" => true,
         _ => false,
     }
@@ -296,52 +281,31 @@ fn estimated_cheap(exec: &str, args: &[String]) -> bool {
 /// kind without a `legal_close` case does not compile.
 pub fn legal_close(verdict: &Verdict, bead: &BeadUnit, ac: AcShape) -> bool {
     let runnable = verify_is_loop_runnable(&bead.verify);
-    // Exhaustive over VerdictKind, no wildcard: a new kind without a
-    // legal_close case does not compile (acceptance gate, bd-w1-types-vbez).
     match verdict.kind {
-        // Row 1 — cheap band: loop-run CommandVerified ONLY.
         VerdictKind::CommandVerified => {
             ac == AcShape::Checkable
                 && bead.priority >= 2
                 && bead.blast == Blast::Normal
                 && runnable
         }
-        // Row 2 — non-runnable band: WorkerReceipt (+ two-tick grace),
-        // TriageVerified (reviewed record evidence), or an independent
-        // unit/live verification.
         VerdictKind::WorkerReceipt | VerdictKind::TriageVerified => {
             ac == AcShape::Checkable
                 && bead.priority >= 2
                 && bead.blast == Blast::Normal
                 && !runnable
         }
-        // Row 2b — ordered close: a human attester (recorded as provider) is
-        // the independent verifier at P0/P1, where no command can verify.
         VerdictKind::OperatorDirected => {
             ac == AcShape::Checkable && bead.priority <= 1 && bead.blast == Blast::Normal
         }
-        // Rows 2+3 — independent verification closes the non-runnable band
-        // (P>=2, Normal, VERIFY not loop-runnable) as well as P0/P1 / High
-        // blast. Illegal in the cheap band, where CommandVerified is
-        // exclusive (ancestor table: toron ADR-0019 Spec 1;
-        // bd-legal-close-row2-reconcile-2m34).
         VerdictKind::UnitTestVerified | VerdictKind::LiveVerified => {
             ac == AcShape::Checkable
                 && ((bead.priority <= 1 || bead.blast == Blast::High)
                     || (bead.priority >= 2 && bead.blast == Blast::Normal && !runnable))
         }
-        // Row 4 — judgment AC: ReviewerSigned only. Recording any other kind
-        // for a judgment bead is a false verdict.
         VerdictKind::ReviewerSigned => ac == AcShape::Judgment,
-        // Row 5 — never a pass.
         VerdictKind::VerifierBlocked | VerdictKind::VerifierFailed => false,
     }
 }
-
-// ============================================================================
-// br-gate verdict store + receipts (ADR-0019 Spec 1; bd-w1-gate-store-h2ur)
-// The types and the matrix above stay pure; IO lives in this section.
-// ============================================================================
 
 use std::path::Path;
 use std::process::Command as StdCommand;
@@ -435,14 +399,6 @@ pub fn report_pass(cwd: &Path, verdict: &Verdict) -> anyhow::Result<()> {
         );
     }
     let gate = verdict.kind.gate_name();
-    // bd-3unc: for the three command-verified kinds the note is
-    // command-shaped — `sha=<sha> receipt=<path> exit=0 tail=<path>
-    // cmd=<verify command>`. `cmd` rides last: the note parses as a leading
-    // run of `key=value` pairs and a verify command contains spaces, so
-    // anything after it would never parse. The legality rule
-    // (`ledger_check`) only needs it non-empty; the proof is `exit=0` plus
-    // a `tail=` file that exists and is non-empty. The other kinds keep the
-    // old shape and stay on the sha= rule alone.
     let note = match verdict.kind {
         VerdictKind::CommandVerified
         | VerdictKind::UnitTestVerified
@@ -589,12 +545,6 @@ fn rank_binding<'a>(parsed: &'a [(String, bool, bool)], candidates: &[&'a str]) 
 }
 
 pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
-    // The subject rides along so the ranking is decided from ONE git call.
-    // bd-ozpj: the grep is CASE-INSENSITIVE, like beads' own
-    // `sha_message_cites_bead`. The case-sensitive grep made a commit that
-    // cites BD-2QU9 invisible to this rule while closing legally in beads —
-    // and a closed bead cannot be re-gated, so the ledger check was stuck
-    // clean-false with no way out.
     let out = StdCommand::new("git")
         .args([
             "log",
@@ -625,10 +575,6 @@ pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
                     sha.to_string(),
                     lower.contains(&wanted),
                     // bd-pi4p: structural citation `[bd-xxxx]` outranks a bare
-                    // prose mention, so a later sentence can no longer steal the
-                    // binding from the commit that cites it. bd-ozpj: the
-                    // ranking reads the subject case-insensitively, like the
-                    // grep that found it.
                     lower.contains(&format!("[{wanted}]")),
                 )
             }
@@ -641,11 +587,6 @@ pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
              close is illegal regardless of verdicts"
         );
     }
-    // An EMPTY commit is not a candidate: it changes no files, so it cannot
-    // contain the work. It satisfies the message grep and nothing else, and
-    // `commit_is_bookkeeping_only` answers "not bookkeeping" for it, so on its
-    // own it used to be handed out as the bound revision — a LEGAL close for a
-    // commit that proves nothing. Refuse instead of certifying.
     let candidates: Vec<&str> = parsed
         .iter()
         .map(|(sha, _, _)| sha.as_str())
@@ -657,20 +598,7 @@ pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
              so none of them can prove it — close against the commit that carries the work"
         );
     }
-    // Ranked (bd-pi4p tiers): bracketed-subject citations first, bare
-    // subject mentions next, body-only fallback last — newest-first inside
     // each tier. Every close this crew ships cites `[bd-xxxx]` in the
-    // subject, so tier 1 resolves exactly as before; only prose thieves
-    // move down.
-    //
-    // The bookkeeping-only commits are dropped BEFORE the ranking, not after
-    // it: the ranking returns only the strongest citation tier,
-    // so a bookkeeping commit that cites the id in its SUBJECT - which is
-    // exactly what `chore(beads): close <id>` does - used to hide the work
-    // commit that cites it in its BODY. The bound revision then became the
-    // ceremony's own bookkeeping commit: a LEGAL close that proves nothing,
-    // because that commit carries no work. Measured on the toron repo:
-    // two beads were both bound to a `chore(beads)` commit.
     let mut work_candidates: Vec<&str> = Vec::new();
     let mut bookkeeping_candidates: Vec<&str> = Vec::new();
     for sha in &candidates {
@@ -681,9 +609,6 @@ pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
         }
     }
     if work_candidates.is_empty() {
-        // Every candidate is bookkeeping-only: the id is still attributable
-        // and "no commit carries the id" would be a lie that reopens a legal
-        // close. Bind the strongest citation among them.
         let ranked = rank_binding(&parsed, &bookkeeping_candidates);
         return Ok(ranked
             .first()
@@ -737,7 +662,7 @@ fn commit_changes_nothing(cwd: &Path, sha: &str) -> anyhow::Result<bool> {
 /// caller supplies them (the loop derives blast from reservation overlap + AC
 /// shape at ready-parse).
 pub fn bead_from_br_show(cwd: &Path, bead_id: &str) -> anyhow::Result<BeadUnit> {
-    load_bead(cwd, bead_id, /* require_verify */ true)
+    load_bead(cwd, bead_id,  true)
 }
 
 /// Close-crediting loader: identical to [`bead_from_br_show`] except that a
@@ -754,7 +679,7 @@ pub fn bead_from_br_show(cwd: &Path, bead_id: &str) -> anyhow::Result<BeadUnit> 
 /// false, so the bead lands in the non-runnable band where the legal-close
 /// table admits only record/independent proofs — never `CommandVerified`.
 pub fn bead_from_br_show_for_close(cwd: &Path, bead_id: &str) -> anyhow::Result<BeadUnit> {
-    load_bead(cwd, bead_id, /* require_verify */ false)
+    load_bead(cwd, bead_id,  false)
 }
 
 fn load_bead(cwd: &Path, bead_id: &str, require_verify: bool) -> anyhow::Result<BeadUnit> {
@@ -767,10 +692,6 @@ fn load_bead(cwd: &Path, bead_id: &str, require_verify: bool) -> anyhow::Result<
     }
     let stdout = run_br(cwd, &["show", bead_id, "--json"])?;
     let v: serde_json::Value = serde_json::from_str(stdout.trim())?;
-    // br show <id> --json historically returned a one-element array; current
-    // br returns the object directly. Accept both shapes (bd-repair-red-tests:
-    // the array expectation made EVERY close_check fail to deserialize and
-    // reopen legally-closed beads).
     let row_val = if v.is_array() {
         v.get(0).cloned().unwrap_or(serde_json::Value::Null)
     } else {
@@ -916,9 +837,7 @@ mod note_binding_tests {
         let a = "a".repeat(40);
         let b = "b".repeat(40);
         let note = format!("supersedes sha={a} because the new work is at sha={b}");
-        // The old behavior: the first prose mention wins and binds.
         assert_eq!(unanchored(&note), Some(a.as_str()));
-        // The fixed behavior refuses it.
         assert_eq!(note_binding(&note), NoteBinding::NoLeadingBinding);
         assert!(!note_has_sha(&note, &a));
     }
@@ -932,10 +851,7 @@ mod note_binding_tests {
         }
         let sha = "c".repeat(40);
         let note = format!("sha={sha},");
-        // Without the length/hex check the comma rides along and matches a
-        // prefix comparison, which is exactly the silent mis-bind.
         assert_eq!(unvalidated(&note), Some(format!("{sha},").as_str()));
-        // The real validator rejects it.
         assert!(matches!(note_binding(&note), NoteBinding::MalformedSha(_)));
         assert!(!note_has_sha(&note, &sha));
     }
@@ -958,22 +874,18 @@ mod note_binding_tests {
     #[test]
     fn note_binding_accepts_proved_prefixed_and_semicolon_shas() {
         let sha = "f".repeat(40);
-        // Preceded by task= and verdict= (Phase 5 proved format)
         let note = format!("task=task-123 verdict=verdict-456 sha={sha}");
         assert_eq!(note_binding(&note), NoteBinding::Bound(sha.clone()));
         assert!(note_has_sha(&note, &sha));
 
-        // Trailing semicolon is stripped
         let note_semi = format!("sha={sha};");
         assert_eq!(note_binding(&note_semi), NoteBinding::Bound(sha.clone()));
         assert!(note_has_sha(&note_semi, &sha));
 
-        // Both: Phase 5 proved format with trailing semicolon
         let note_both = format!("task=t1 verdict=v1 sha={sha}; receipt=/tmp/r.txt");
         assert_eq!(note_binding(&note_both), NoteBinding::Bound(sha.clone()));
         assert!(note_has_sha(&note_both, &sha));
 
-        // note_proved strips trailing semicolons
         assert_eq!(
             note_proved("task=task-1; verdict=verdict-2;"),
             Some(("task-1".to_string(), "verdict-2".to_string()))
@@ -1124,15 +1036,12 @@ pub fn check_close_reason(reason: &str) -> CloseReasonCheck {
         Some(i) => (&reason[i + "PRINCIPLES".len()..], &reason[..i]),
         None => ("", reason),
     };
-    // Clauses are newline- or semicolon-separated citation candidates.
     for clause in principles_text.split(['\n', ';']) {
         let clause = clause.trim().trim_start_matches(':').trim();
         if clause.is_empty() {
             continue;
         }
         if !clause.contains('—') && !clause.contains("—") {
-            // No separator at all: not a citation; the decoration scan below
-            // decides whether registry names were dropped in prose.
             continue;
         }
         let Some((name, decision)) = clause
@@ -1162,8 +1071,6 @@ pub fn check_close_reason(reason: &str) -> CloseReasonCheck {
             out.citations.len()
         ));
     }
-    // Decoration scan: registry names dropped in prose outside the
-    // PRINCIPLES section are cargo-cult mentions, not citations.
     for p in crate::principles::PRINCIPLES {
         if prose.contains(p.name) {
             out.lint_warnings.push(format!(
@@ -1185,8 +1092,6 @@ pub fn verify_close_reason(reason: &str) -> Result<(), String> {
     if !c.verify_tail_present {
         return Err("close reason carries no VERIFY tail (what was actually run)".to_string());
     }
-    // A bare name with an em-dash but NO decision clause is named first —
-    // it is a citation attempt, not an absence.
     if let Some(w) = c
         .lint_warnings
         .iter()
@@ -1218,24 +1123,15 @@ pub fn ledger_check(cwd: &Path, bead: &BeadUnit, ac: AcShape, sha: &str) -> anyh
         let Some(kind) = VerdictKind::from_gate_name(&row.gate) else {
             continue;
         };
-        // Blocked/Failed are loop state, never gate rows; if a row somehow
-        // carries them it is not a pass verdict.
         if matches!(
             kind,
             VerdictKind::VerifierBlocked | VerdictKind::VerifierFailed
         ) {
             continue;
         }
-        // The verdict must bind to this SHA (SHA rule): the note carries
-        // `sha=<sha>`. A Phase 5 `task=` `verdict=` pair is a separate hit
-        // (`ledger_proved`); it does not satisfy the SHA rule.
         if !row.note.as_deref().is_some_and(|n| note_has_sha(n, sha)) {
             continue;
         }
-        // bd-3unc: a command-shaped pass note carries the test tail. For the
-        // three command-verified kinds `sha=` alone is not legal: the note
-        // must also carry a non-empty `cmd=`, `exit=0`, and a `tail=` file
-        // that exists and is non-empty. The other kinds skip this.
         if matches!(
             kind,
             VerdictKind::CommandVerified
@@ -1353,9 +1249,6 @@ pub fn write_receipt(
     if content.trim().is_empty() {
         anyhow::bail!("receipt refuses empty content");
     }
-    // Anti-forgery (ADR-0019 Spec 1): command-verified receipts are written
-    // by the LOOP only — a lying worker cannot forge what it does not write.
-    // The worker helper refuses this kind outright.
     if matches!(kind, VerdictKind::CommandVerified) {
         anyhow::bail!(
             "command-verified receipts are written by the LOOP only (anti-forgery, ADR-0019 Spec 1): workers never write this kind"
@@ -1415,9 +1308,6 @@ pub enum CloseCheck {
 pub fn close_check(cwd: &Path, bead_id: &str) -> anyhow::Result<CloseCheck> {
     let sha = match derive_head_sha(cwd, bead_id) {
         Ok(s) => s,
-        // "SHA rule: no commit carries the bead id" — the close is illegal.
-        // Anything else (git missing, git log failure) is an environment
-        // error and must propagate, never masquerade as a verdict.
         Err(e) => {
             if format!("{e:#}").contains("SHA rule") {
                 return Ok(CloseCheck::NoCommit);
@@ -1425,8 +1315,6 @@ pub fn close_check(cwd: &Path, bead_id: &str) -> anyhow::Result<CloseCheck> {
             return Err(e);
         }
     };
-    // A closed bead without a legal VERIFY fence has no receipt path either —
-    // fail closed: reopen it (the fence is required before dispatch).
     let bead = match bead_from_br_show(cwd, bead_id) {
         Ok(b) => b,
         Err(_) => {
@@ -1439,8 +1327,6 @@ pub fn close_check(cwd: &Path, bead_id: &str) -> anyhow::Result<CloseCheck> {
     if ledger_check(cwd, &bead, AcShape::Checkable, &sha)? {
         return Ok(CloseCheck::Legal { sha });
     }
-    // Is WorkerReceipt a legal close for this bead? (priority >= 2, Normal
-    // blast, VERIFY not loop-runnable — row 2 of the legal-close table).
     let receipt = Verdict {
         kind: VerdictKind::WorkerReceipt,
         bead_id: bead_id.to_string(),
@@ -1582,24 +1468,13 @@ mod tests {
         use Blast::{High, Normal};
         use VerdictKind::*;
         match kind {
-            // Row 4 — judgment AC: ReviewerSigned only, regardless of
-            // priority / blast / runnability.
             ReviewerSigned => ac == Judgment,
-            // Row 5 — never a pass.
             VerifierBlocked | VerifierFailed => false,
-            // Row 1 — cheap band: CommandVerified (loop-run) ONLY.
             CommandVerified => ac == Checkable && priority >= 2 && blast == Normal && runnable,
-            // Row 2 — non-runnable band: WorkerReceipt, TriageVerified, or
-            // unit/live verified.
             WorkerReceipt | TriageVerified => {
                 ac == Checkable && priority >= 2 && blast == Normal && !runnable
             }
-            // Row 2b — ordered close: a named human attester is the
-            // independent verifier at P0/P1 where no command can verify.
             OperatorDirected => ac == Checkable && priority <= 1 && blast == Normal,
-            // Row 3 — P0/P1 or High blast: independent verification only
-            // (row 2's non-runnable band also admits unit/live — bd-legal-
-            // close-row2-reconcile-2m34).
             UnitTestVerified | LiveVerified => {
                 ac == Checkable
                     && ((priority <= 1 || blast == High)
@@ -1634,20 +1509,16 @@ mod tests {
 
     #[test]
     fn worker_receipt_illegal_on_loop_runnable_verify() {
-        // Row 2 vs Row 1: WorkerReceipt on a loop-runnable VERIFY is a
-        // forged-proof path — must be illegal.
-        let bead = bead(3, Blast::Normal, /* runnable */ true);
+        let bead = bead(3, Blast::Normal,  true);
         let v = verdict(VerdictKind::WorkerReceipt);
         assert!(!legal_close(&v, &bead, AcShape::Checkable));
     }
 
     #[test]
     fn command_verified_illegal_outside_cheap_band() {
-        // P0 bead (needs independent verification) with a loop-runnable VERIFY.
         let p0_bead = bead(0, Blast::Normal, true);
         let v = verdict(VerdictKind::CommandVerified);
         assert!(!legal_close(&v, &p0_bead, AcShape::Checkable));
-        // High blast (overlap, checkable AC) also excludes the loop's own run.
         let high_blast_bead = bead(3, Blast::High, true);
         let v = verdict(VerdictKind::CommandVerified);
         assert!(!legal_close(&v, &high_blast_bead, AcShape::Checkable));
@@ -1655,7 +1526,6 @@ mod tests {
 
     #[test]
     fn judgment_ac_closes_only_with_reviewer_signed() {
-        // Recording unit-test-verified for a judgment bead is a FALSE verdict.
         for kind in VerdictKind::ALL {
             let bead = bead(1, Blast::of(false, AcShape::Judgment), true);
             let v = verdict(kind);
@@ -1687,9 +1557,6 @@ mod tests {
 
     #[test]
     fn cheap_band_is_loop_run_only() {
-        // p>=2 + Normal + runnable: only CommandVerified closes it. An
-        // independent verifier rerunning one cheap command is ceremony
-        // (ADR-0019 Spec 4).
         let bead = bead(3, Blast::Normal, true);
         for kind in VerdictKind::ALL {
             let v = verdict(kind);
@@ -1697,8 +1564,6 @@ mod tests {
             assert_eq!(legal_close(&v, &bead, AcShape::Checkable), want);
         }
     }
-
-    // ---- bd-w1-loop-run-verify-mbbe: loop-runnable classifier ----
 
     /// One row per input of the loop-runnable allowlist predicate. Targeted,
     /// allowlisted checks (incl. a bounded `timeout` wrapper) pass;
@@ -1808,8 +1673,6 @@ mod tests {
         assert_ne!(n, AgentName::new("flywheel-toron-coder2"));
     }
 
-    // ---- bd-w1-gate-store-h2ur: br gate store + receipts + loop guard ----
-
     /// Scratch workspace: git repo + br tracker + gate policy (spike shape,
     /// GreenStork 2026-08-16) + one P3 issue with a `## VERIFY` fence + a
     /// commit whose message carries the bead id (SHA rule). Returns
@@ -1846,12 +1709,6 @@ mod tests {
             "workflow:\n  transitions:\n    open:\n      - closed\n  gates:\n    open -> closed:\n      require_all:\n        - command-verified\n",
         )
         .unwrap();
-        // No VERIFY (triage/dupe shape): fail-closed `br create` refuses
-        // without --verify at every priority, so use the sanctioned
-        // no-verify path `br q` (quick capture, not dispatchable until
-        // verify is added) — NOT -p 4 (verify is still required there)
-        // and NOT a weakened assertion. P3 + empty VERIFY preserved.
-        // (`br q` takes a bare title + -p/-d only: no --title/--slug.)
         let mut args: Vec<&str> = match verify {
             Some(_) => vec![
                 "create",
@@ -1977,8 +1834,6 @@ mod tests {
     /// (worker-invoked report blocked, loop path accepted).
     #[test]
     fn loop_only_reporter_guard_blocks_workers_then_loop_roundtrips() {
-        // Arming is process-global — serialize with other arming tests and
-        // reset the flag (it persists once armed).
         let _lock = crate::verdict::lock_loop_reporter();
         crate::verdict::test_reset_loop_reporter();
         let (dir, bead_id) = scratch_workspace("gate-roundtrip");
@@ -1995,21 +1850,14 @@ mod tests {
             receipt_path: dir.join(".flywheel/receipts/x.txt"),
             verify_cmd: bead.verify.clone(),
         };
-        // worker path: the loop reporter is unarmed -> rejected.
         let err = report_pass(&dir, &v).unwrap_err();
         assert!(err.to_string().contains("loop-only"), "{err}");
-        // Anti-forgery (bd-w1-loop-run-verify-mbbe): the machine receipt for
-        // the loop-run band is written by the LOOP only — refused while
-        // unarmed (a worker cannot forge what it does not write).
         let err = write_command_verified_receipt(&dir, &bead_id, &sha, "ok\n").unwrap_err();
         assert!(
             err.to_string().contains("LOOP only"),
             "unarmed loop writer must refuse: {err}"
         );
-        // loop path: armed -> recorded as a PASS gate row.
         arm_loop_reporter();
-        // bd-3unc: the command-shaped note needs a real tail file — the
-        // receipt the proof check reads.
         std::fs::create_dir_all(dir.join(".flywheel/receipts")).unwrap();
         std::fs::write(dir.join(".flywheel/receipts/x.txt"), "cargo test ... ok\n").unwrap();
         report_pass(&dir, &v).unwrap();
@@ -2031,7 +1879,6 @@ mod tests {
             "command-verified rows are command-shaped: {}",
             list.history[0].note.as_deref().unwrap_or("")
         );
-        // ledger check: legal for the current SHA, not for a wrong SHA.
         assert!(ledger_check(&dir, &bead, AcShape::Checkable, &sha).unwrap());
         assert!(
             !ledger_check(
@@ -2042,8 +1889,6 @@ mod tests {
             )
             .unwrap()
         );
-        // Anti-forgery (armed path): the loop's machine receipt writes the
-        // exact filename once armed.
         let path =
             write_command_verified_receipt(&dir, &bead_id, &sha, "cargo test ... ok\n").unwrap();
         assert_eq!(
@@ -2061,8 +1906,6 @@ mod tests {
     /// reviewer-signed note with only sha= stays legal; exit=1 is not legal.
     #[test]
     fn a_command_verified_note_without_a_tail_is_not_legal() {
-        // `report_pass` always writes the full command-shaped note, so the
-        // negative cases below go through `br` directly with crafted notes.
         fn report_note(dir: &Path, bead_id: &str, gate: &str, note: &str) {
             let out = StdCommand::new("br")
                 .args([
@@ -2087,13 +1930,8 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
-        // One scratch workspace per case: ledger_check is true when ANY row
-        // is legal, so the illegal cases need a bead of their own.
         let pid = std::process::id();
 
-        // Case 1: command-verified with a sha= bind but no command proof.
-        // A prose file in /tmp with no tail= token does not count, so one
-        // is planted on purpose.
         let (dir, bead_id) = scratch_workspace("cmd-note-no-tail");
         let sha = derive_head_sha(&dir, &bead_id).unwrap();
         let bead = bead_from_br_show(&dir, &bead_id).unwrap();
@@ -2112,8 +1950,6 @@ mod tests {
         let _ = std::fs::remove_file(&prose);
         let _ = std::fs::remove_dir_all(&dir);
 
-        // Case 2: the same shape plus cmd, exit=0, and a real non-empty
-        // tail file — legal.
         let (dir, bead_id) = scratch_workspace("cmd-note-full");
         let sha = derive_head_sha(&dir, &bead_id).unwrap();
         let bead = bead_from_br_show(&dir, &bead_id).unwrap();
@@ -2136,9 +1972,6 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
 
-        // Case 3: reviewer-signed stays on the sha= rule alone. The
-        // scratch policy requires command-verified, so this bead gets a
-        // reviewer-shaped one (`br` validates the gate against it).
         let (dir, bead_id) = scratch_workspace("cmd-note-reviewer");
         std::fs::write(
             dir.join(".beads/policy.yaml"),
@@ -2154,7 +1987,6 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
 
-        // Case 4: exit=1 is not legal, tail file or not.
         let (dir, bead_id) = scratch_workspace("cmd-note-exit1");
         let sha = derive_head_sha(&dir, &bead_id).unwrap();
         let bead = bead_from_br_show(&dir, &bead_id).unwrap();
@@ -2228,8 +2060,6 @@ mod tests {
         assert_eq!(VerdictKind::from_gate_name(""), None);
     }
 
-    // ---- bd-tfxv: one gate-name authority across br + flywheel ----
-
     /// Every gate name br's own transition policy enumerates
     /// (`beads::close_policy::ADR0019_VERDICT_GATE_NAMES`, literal copy) must
     /// parse into a flywheel `VerdictKind`. Before bd-tfxv, `operator-directed`
@@ -2264,11 +2094,8 @@ mod tests {
     #[test]
     fn triage_bead_without_verify_credits_a_triage_verified_row() {
         let (dir, bead_id) = scratch_workspace_with_verify("triage-close", None);
-        // Dispatch still refuses: no VERIFY, nothing to run, do not dispatch.
         let err = bead_from_br_show(&dir, &bead_id).unwrap_err();
         assert!(err.to_string().contains("refuse to dispatch"), "{err}");
-        // Close crediting loads it, and the empty VERIFY lands in the
-        // non-runnable band (nothing could have been run).
         let bead = bead_from_br_show_for_close(&dir, &bead_id).unwrap();
         assert_eq!(bead.priority, 3);
         assert_eq!(bead.verify, "");
@@ -2290,7 +2117,6 @@ mod tests {
                 "gate {gate:?} should credit a triage bead"
             );
         }
-        // Nothing could have been run, so a loop-run proof is a false verdict.
         assert!(!legal_close(
             &v(VerdictKind::CommandVerified),
             &bead,
@@ -2304,10 +2130,7 @@ mod tests {
     /// shape br told the operator was legal.
     #[test]
     fn ledger_check_credits_the_rows_br_names_for_a_p3_script_verify() {
-        // bd-tfxv's live shape: P3, Normal blast, checkable AC, VERIFY is a
-        // committed bash script (non-runnable: `sh`/`bash` demands an explicit
-        // `timeout` token). br named exactly these gates as legal.
-        let bead = bead(3, Blast::Normal, /* runnable */ false);
+        let bead = bead(3, Blast::Normal,  false);
         for gate in ["worker-receipt", "triage-verified", "unit-test-verified"] {
             let kind = VerdictKind::from_gate_name(gate)
                 .unwrap_or_else(|| panic!("br gate {gate:?} unparseable"));
@@ -2320,22 +2143,16 @@ mod tests {
 
     #[test]
     fn triage_verified_closes_the_non_runnable_band_only() {
-        // Row 2, alongside WorkerReceipt: p>=2 + Normal + VERIFY not runnable.
         let non_runnable = bead(3, Blast::Normal, false);
         let v = verdict(VerdictKind::TriageVerified);
         assert!(legal_close(&v, &non_runnable, AcShape::Checkable));
-        // Illegal in the cheap band: a loop-run command existed, so a
-        // record-review is the wrong proof (ADR-0019 Spec 1 row 1).
         let cheap = bead(3, Blast::Normal, true);
         assert!(!legal_close(&v, &cheap, AcShape::Checkable));
-        // Judgment AC: ReviewerSigned only.
         assert!(!legal_close(&v, &non_runnable, AcShape::Judgment));
     }
 
     #[test]
     fn operator_directed_closes_p0_p1_normal_only() {
-        // Row 2b: a named human attester is the independent verifier where no
-        // command can satisfy the close (P0/P1, Normal blast, checkable AC).
         let v = verdict(VerdictKind::OperatorDirected);
         for priority in [0u8, 1] {
             assert!(legal_close(
@@ -2344,19 +2161,16 @@ mod tests {
                 AcShape::Checkable
             ));
         }
-        // Not a P>=2 bead (the loop/verifier bands own those).
         assert!(!legal_close(
             &v,
             &bead(3, Blast::Normal, false),
             AcShape::Checkable
         ));
-        // Not High blast (row 3: independent verification only).
         assert!(!legal_close(
             &v,
             &bead(0, Blast::High, false),
             AcShape::Checkable
         ));
-        // Not judgment AC (row 4: ReviewerSigned only).
         assert!(!legal_close(
             &v,
             &bead(0, Blast::Normal, false),
@@ -2366,8 +2180,6 @@ mod tests {
 
     #[test]
     fn note_key_value_tokens_parse_sha_and_receipt() {
-        // bd-0z00: a binding is a FULL 40-hex object name, not a short
-        // prefix, so this note uses a real-shaped sha.
         let sha = "d".repeat(40);
         let note = format!("sha={sha} receipt=/tmp/r.txt");
         assert!(note_has_sha(&note, &sha));
@@ -2386,10 +2198,7 @@ mod tests {
     fn note_has_sha_anchors_to_the_note_start_not_a_prose_mention() {
         let a = "a".repeat(40);
         let b = "b".repeat(40);
-        // The prose mentions A first; B is the revision actually under test.
         let note = format!("supersedes sha={a} because the new work is at sha={b}");
-        // RED today: `note_token` scans the whole prose and returns A, so
-        // this wrongly binds and legalizes a verdict about revision A.
         assert!(
             !note_has_sha(&note, &a),
             "a prose mention must never bind a revision"
@@ -2399,8 +2208,6 @@ mod tests {
             "a later prose mention must not bind either"
         );
         assert_eq!(note_binding(&note), NoteBinding::NoLeadingBinding);
-        // The reason NAMES both competing tokens, so the author can see that
-        // the note carried a sha and that it was not in the binding position.
         let why = note_binding_reason(&note, &b).expect("an unbound note has a reason");
         assert!(why.contains(&a), "names the first candidate: {why}");
         assert!(why.contains(&b), "names the second candidate: {why}");
@@ -2420,14 +2227,11 @@ mod tests {
             note_binding(&note),
             NoteBinding::MalformedSha(format!("{sha},"))
         );
-        // The reason names the offending token verbatim, comma included.
         let why = note_binding_reason(&note, &sha).expect("an unbound note has a reason");
         assert!(
             why.contains(&format!("sha={sha},")),
             "names the comma-bearing token: {why}"
         );
-        // The well-formed sibling still binds, so the strictness is scoped
-        // to the malformed value and not to notes in general.
         assert!(note_has_sha(&format!("sha={sha} receipt=/tmp/r.txt"), &sha));
     }
 
@@ -2437,12 +2241,10 @@ mod tests {
     fn note_binding_reason_reports_a_bound_but_different_revision() {
         let a = "a".repeat(40);
         let b = "b".repeat(40);
-        // Well-formed, leads with sha=, but binds A while B is under test.
         let note = format!("sha={a} receipt=/tmp/r.txt");
         assert!(!note_has_sha(&note, &b));
         let why = note_binding_reason(&note, &b).expect("a reason is reported");
         assert!(why.contains(&a), "names the bound revision: {why}");
-        // A binding note has no reason to give.
         assert_eq!(note_binding_reason(&note, &a), None);
     }
 
@@ -2463,8 +2265,6 @@ mod tests {
         );
     }
 
-    // ---- bd-w1-sha-xyhd: SHA invariant at close-detect ----
-
     /// Stage everything and commit `msg` in `dir`.
     /// bd-y98h: a later commit that only MENTIONS the id in its BODY must not
     /// steal the bound revision from the work commit that carries it in its
@@ -2484,11 +2284,9 @@ mod tests {
     #[test]
     fn derive_head_sha_prefers_the_subject_and_ignores_a_body_mention() {
         let (dir, bead_id) = scratch_workspace("sha-subject-wins");
-        // The work commit: the id rides the SUBJECT, as every real one does.
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/fix.rs"), "// fix\n").unwrap();
         let work = derive_head_sha(&dir, &bead_id).unwrap();
-        // A later lane's commit that only MENTIONS the id, in prose, in the body.
         std::fs::write(dir.join("src/other.rs"), "// other lane\n").unwrap();
         commit_all(
             &dir,
@@ -2574,15 +2372,12 @@ mod tests {
             .expect("git init");
         assert!(init.status.success(), "git init");
         let bead_id = "bead-fixture-body";
-        // The WORK commit: the id rides the BODY, as a lane that forgot the
-        // subject writes it.
         std::fs::write(dir.join("work.txt"), "work\n").unwrap();
         commit_all(
             &dir,
             &format!("fix(engine): the change\n\nBead: {bead_id}\n"),
         );
         let work = head_sha(&dir);
-        // The ceremony's bookkeeping commit: the id rides the SUBJECT.
         std::fs::write(
             dir.join(".beads/gates.jsonl"),
             "{\"gate\":\"command-verified\",\"passed\":true}\n",
@@ -2598,8 +2393,6 @@ mod tests {
         );
     }
 
-    // ---- harden the SHA binding against bookkeeping-only commits ----
-
     /// The ceremony's own trap, as a fixture: `br gate report` + `br close`
     /// land in a BOOKKEEPING commit (`.beads/*`) that cites the bead id, and
     /// it is newer than the work commit — so the newest `--grep` match is no
@@ -2610,8 +2403,6 @@ mod tests {
     fn derive_head_sha_ignores_bookkeeping_only_commits() {
         let (dir, bead_id) = scratch_workspace("sha-bookkeeping");
         let work = derive_head_sha(&dir, &bead_id).unwrap();
-        // The ceremony: a bookkeeping commit that DOES cite the bead id (the
-        // exact shape that read clean-false on a landed bead).
         std::fs::write(
             dir.join(".beads/gates.jsonl"),
             "{\"gate\":\"command-verified\",\"passed\":true}\n",
@@ -2712,7 +2503,6 @@ mod tests {
     fn derive_head_sha_resolves_own_commit_when_head_moved() {
         let (dir, bead_id) = scratch_workspace("sha-head-moved");
         let own = derive_head_sha(&dir, &bead_id).unwrap();
-        // a sibling lands on top with NO bead id in its message
         std::fs::write(dir.join("sibling.txt"), "sibling\n").unwrap();
         let add = StdCommand::new("git")
             .args(["add", "-A"])
@@ -2735,7 +2525,6 @@ mod tests {
             .output()
             .expect("git commit");
         assert!(cm.status.success(), "sibling commit");
-        // HEAD moved past the bead's commit
         let rp = format!("rev-{}", "parse");
         let head = StdCommand::new("git")
             .args([rp.as_str(), "HEAD"])
@@ -2744,7 +2533,6 @@ mod tests {
             .expect("resolve current HEAD sha");
         let head_sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
         assert_ne!(own, head_sha, "HEAD moved past the bead commit");
-        // the derived sha still resolves to the bead's OWN commit
         assert_eq!(
             derive_head_sha(&dir, &bead_id).unwrap(),
             own,
@@ -2772,8 +2560,6 @@ mod tests {
         }
     }
 
-    // ---- bd-w1-reopen-f6tw: close-detect reopen decision ----
-
     /// THE RED-THEN-GREEN FIXTURE: a worker closes with no gate row -> the
     /// close-detect check says MISSING -> the loop reopens -> the bead is
     /// back in `br ready`. (The reopen + mail side lives in the loop's
@@ -2781,7 +2567,6 @@ mod tests {
     #[test]
     fn close_check_reopens_when_worker_closes_without_gate_row() {
         let (dir, bead_id) = scratch_workspace("reopen-red-green");
-        // schema-18 fail-closed br requires the bead-carrying commit's sha.
         let sha = derive_head_sha(&dir, &bead_id).unwrap();
         let cm = StdCommand::new("br")
             .args([
@@ -2821,7 +2606,6 @@ mod tests {
         let (dir, bead_id) = scratch_workspace("reopen-legal");
         let sha = derive_head_sha(&dir, &bead_id).unwrap();
         let bead = bead_from_br_show(&dir, &bead_id).unwrap();
-        // bd-3unc: the gate row binds the sha AND carries the command proof.
         let tail = dir.join("tail.txt");
         std::fs::write(&tail, "test result: ok\n").unwrap();
         let gate = StdCommand::new("br")
@@ -2887,7 +2671,6 @@ mod tests {
             .output()
             .expect("br close");
         assert!(cm.status.success(), "br close: {cm:?}");
-        // strip the only ref: git log --all now finds no commit
         let strip = StdCommand::new("git")
             .args(["update-ref", "-d", "HEAD"])
             .current_dir(&dir)
@@ -2907,7 +2690,6 @@ mod tests {
     #[test]
     fn close_check_grants_receipt_grace_when_worker_receipt_is_legal() {
         let (dir, _bead1) = scratch_workspace("reopen-grace");
-        // a second bead whose VERIFY is NOT loop-runnable (shell composition)
         let created = StdCommand::new("br")
             .args([
                 "create",
@@ -3048,7 +2830,6 @@ stage/workflow/repo; encode-lessons-in-structure — the contract becomes data."
             "decoration warning present: {:?}",
             c.lint_warnings
         );
-        // The advisory stance: nothing in the check is a hard error yet.
         assert!(!c.is_hard_fail());
     }
 
@@ -3058,8 +2839,6 @@ stage/workflow/repo; encode-lessons-in-structure — the contract becomes data."
         let c = check_close_reason("closed, all good");
         assert!(!c.verify_tail_present);
     }
-
-    // ---- ADR-0006 D3: the wave-swarm VERIFY stage's HARD gate -------------
 
     /// A legal close reason passes the hard gate.
     #[test]

@@ -325,12 +325,6 @@ impl FlywheelPorts {
     ) -> (PaneState, Option<Bind>) {
         match panes.iter().find(|p| p.pane_id == pane_id) {
             Some(p) => {
-                // Stamped panes verify through tokens on every backend; an
-                // unstamped pane verifies through the rex label binding off
-                // hc, and stays unverified on hc exactly as before.
-                // `host_session` is the session id the host serves (resolved
-                // from its label); empty resolves against nothing, so an
-                // unresolvable host verifies nothing.
                 let bind = if backend_name != "hc" && !p.tokens.contains_key(TOKEN_PIN) {
                     let by_label = verify_rex_binding(p, host_session, pin, npub);
                     if by_label.verified {
@@ -340,8 +334,6 @@ impl FlywheelPorts {
                             .as_deref()
                             .is_some_and(|label| label != pin && looks_like_pin(label))
                     {
-                        // Same pin, wrong session, or a label that names a
-                        // different pin: do not promote it to a block binding.
                         by_label
                     } else if is_rex_block(&p.pane_id) {
                         verify_rex_block(p, pin, npub)
@@ -359,8 +351,6 @@ impl FlywheelPorts {
     }
 
     fn pin_of_npub(&self, npub: &str) -> String {
-        // A roster miss is not a pin: empty finds no registry row, so
-        // reverify returns None instead of comparing an invented name.
         self.npubs
             .iter()
             .find(|(_, n)| n.as_str() == npub)
@@ -573,8 +563,6 @@ pub(crate) fn ring_wake(
         WakeRoute::NoDoor(no_door) => return Ok(RingDone::NoDoor(no_door)),
     };
     let normal = crate::pane_write::wake_line(Wm(wm), U::Normal);
-    // The fold names the line; the sink renders it. They must agree, or
-    // something other than the wake line is about to reach a pane.
     if normal != line {
         return Err("fold line differs from the pane sink's wake line".into());
     }
@@ -613,9 +601,6 @@ impl Ports for FlywheelPorts {
     fn observe(&mut self) -> Observation {
         self.urgencies.clear();
         let registry = crate::state::load_spawn_registry(&self.project);
-        // The selected backend lists panes; hc keeps the direct client
-        // path. `up` tracks the selected backend's reachability (the field
-        // keeps its name; the fold bumps the generation fence on any flap).
         let selected = crate::backend::resolve_backend_name(&self.cfg);
         let (panes, up, host_session) = if selected == "hc" {
             let client = self.client();
@@ -624,15 +609,8 @@ impl Ports for FlywheelPorts {
                 .as_ref()
                 .and_then(|c| c.pane_list().ok())
                 .unwrap_or_default();
-            // Token verification needs no session id.
             (panes, up, String::new())
         } else {
-            // Non-hc backends: agent rows (classified status included),
-            // projected onto the pane shape, plus the host's own session id
-            // (resolved label→id; labels collide across sessions, ids do
-            // not). `pane_list` leaves status Unknown by construction, which
-            // would silence every ring. A backend that answers neither reads
-            // as down.
             match crate::backend::multiplexer_backend(&self.cfg).ok() {
                 Some(b) => {
                     let host_session = Self::host_session_for(&*b, &self.workspace);
@@ -708,8 +686,6 @@ impl Ports for FlywheelPorts {
                 .ok()?
                 .into_iter()
                 .find(|p| p.pane_id == e.pane_id)?;
-            // Agent rows carry no stamped tokens; rex bindings verify
-            // through the label path.
             let pane = Self::agent_to_pane(&p);
             let host_session = Self::host_session_for(&*backend, &self.workspace);
             let (_, bind) = Self::pane_observation(
@@ -745,15 +721,8 @@ impl Ports for FlywheelPorts {
             .find(|e| e.pane_id == pane_id)
             .and_then(|e| e.harness)
             .unwrap_or_default();
-        // The harness record decides whether there is a door at all. An
-        // unknown kind has none: the ring fails loudly naming mail rather
-        // than typing at a pane that cannot be poked.
         let route =
             crate::harness_caps::wake_route(&kind, crate::harness_caps::installed_from_env());
-        // The pane id picks the typer. A `block:` id is Rex even when this
-        // process has no `REX_SESSION` (the doorbell child often does not).
-        // An hc pane id stays on hc. An empty `REX_BLOCK` at arrive is
-        // what left an hc id here.
         if !is_rex_block(pane_id) {
             let client = self.client().ok_or("hc unreachable")?;
             return match ring_wake(
@@ -805,7 +774,6 @@ impl Ports for FlywheelPorts {
         if let Some(dir) = path.parent() {
             crate::private_fs::create_private_dir_all(dir).map_err(|e| e.to_string())?;
         }
-        // Write-then-rename: a crash leaves the old file or the new, never half.
         crate::private_fs::write_private_atomic(
             &path,
             &serde_json::to_vec(budget).map_err(|e| e.to_string())?,
@@ -856,8 +824,6 @@ impl Ports for FlywheelPorts {
         }
         let who = self.pin_of_npub(npub);
         let text = deaf_text(&who, wm, cause);
-        // The loud, unconditional leg: the captain surface hc offers us
-        // is a pane, and that is the inbox wake; this line is for the log.
         eprintln!("flywheel inbox: CAPTAIN: {text}");
         let Some(cap) = crate::state::load_captain_alias(&self.project) else {
             return self.fact(
@@ -865,9 +831,6 @@ impl Ports for FlywheelPorts {
                 json!({"kind": "notified", "to": null, "role": "captain"}),
             );
         };
-        // rv23 #6: a deaf recipient is a captain decision, so the notice is
-        // `escalate@1` (Control), not a `notify@1` the captain may never act
-        // on. The supervisor's deaf notice stays `notify@1`.
         self.escalate_pin(&cap, &text, &key)?;
         self.fact(
             &key,
@@ -891,9 +854,6 @@ mod tests {
 
     #[test]
     fn pin_of_npub_miss_returns_empty_not_hex() {
-        // A missing roster entry is not a pin: reverify finds no
-        // registry row for "" and returns None instead of comparing
-        // an invented 8-hex name against real pins.
         let cfg = crate::config::Config::default();
         let mut ports = FlywheelPorts::new(&cfg, "proj", "ws");
         ports
@@ -986,7 +946,6 @@ mod tests {
             json!({"text": "priority: urgent and op != resume"}),
             false,
         );
-        // Priority is the field. `op` and the notice text are not.
         assert_eq!(urgency_of_envelope(&urgent), Urgency::Urgent);
         assert_eq!(urgency_of_envelope(&normal), Urgency::Normal);
         assert_eq!(urgency_of_envelope(&notify), Urgency::Normal);
@@ -1095,8 +1054,6 @@ mod tests {
     /// a normal steer lands behind it, and turns normal once it is read.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unread_steer_stays_urgent_behind_later_mail_and_is_normal_once_read() {
-        // rv23 #6 (toron F7): with no lead row only the operator may steer,
-        // so the steering key `A` is the store's operator.
         let store = mem_store().await.with_operator(A.to_string());
         let steer = stored(
             0,
@@ -1132,10 +1089,8 @@ mod tests {
         normal.validate().unwrap();
         store.append_envelope(&normal).await.unwrap();
         assert_eq!(urgency_now(&store).await.0, Urgency::Urgent);
-        // B reads everything: nothing is pending.
         store.next(B, None, false).await.unwrap();
         assert_eq!(urgency_now(&store).await, (Urgency::Normal, false));
-        // New mail behind the read steer: unread, but not urgent.
         let later = stored(
             3,
             Class::Notify,
@@ -1167,7 +1122,6 @@ mod tests {
         steer.validate().unwrap();
         store.append_envelope(&steer).await.unwrap();
         assert_eq!(urgency_now(&store).await, (Urgency::Urgent, true));
-        // Another recipient's newer row does not change B's answer.
         let mut other = steer.clone();
         other.msg.seq = 1;
         other.to = Recipient::Npub("cc".repeat(32));
@@ -1254,7 +1208,6 @@ mod tests {
     }
 
     fn listed_block(id: &str, session: &str, label: &str) -> crate::hc_support::PaneInfo {
-        // A rex block: creator-set label, no stamped tokens.
         let mut pane = listed_pane(id, AgentStatus::Idle, label, "npub1x");
         pane.workspace_id = session.to_string();
         pane.label = Some(label.to_string());
@@ -1279,7 +1232,6 @@ mod tests {
         assert_eq!(state, PaneState::Idle);
         assert!(bind.is_some_and(|b| b.verified && b.verified_by == "rex-label"));
 
-        // Wrong session: same label, different session, not verified.
         let (state, bind) = FlywheelPorts::pane_observation(
             &panes,
             "block:fake-1",
@@ -1292,7 +1244,6 @@ mod tests {
         assert_eq!(state, PaneState::Idle);
         assert!(bind.is_some_and(|b| !b.verified));
 
-        // Wrong label: the block answers to another pin.
         let other = vec![listed_block("block:fake-1", "session:fake-1", "SomeOther")];
         let (_, bind) = FlywheelPorts::pane_observation(
             &other,
@@ -1305,8 +1256,6 @@ mod tests {
         );
         assert!(bind.is_some_and(|b| !b.verified));
 
-        // A stamped block verifies through tokens on every backend,
-        // including rex.
         let stamped = vec![listed_pane("block:fake-1", AgentStatus::Working, pin, npub)];
         let (_, bind) = FlywheelPorts::pane_observation(
             &stamped,
@@ -1319,8 +1268,6 @@ mod tests {
         );
         assert!(bind.is_some_and(|b| b.verified && b.verified_by == "report_metadata"));
 
-        // Unresolvable host session: ids never match across backends, so an
-        // empty session id verifies nothing (fail closed, never a label).
         let (_, bind) = FlywheelPorts::pane_observation(
             &panes,
             "block:fake-1",
@@ -1332,9 +1279,6 @@ mod tests {
         );
         assert!(bind.is_some_and(|b| !b.verified));
 
-        // Operator terminal: label is Rex's own name, session is not the
-        // project workspace. The registry pane id is the binding arrive
-        // wrote from REX_BLOCK.
         let shell = vec![listed_block(
             "block:01a170b3",
             "session:fading-summit",

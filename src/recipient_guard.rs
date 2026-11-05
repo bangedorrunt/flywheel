@@ -52,7 +52,6 @@ pub fn binding_from_whois(whois: Option<&Value>) -> Binding {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if npub.is_empty() || pane_npub.is_empty() {
-        // One side is not evidence, but the mailbox's own flag still is.
         return if flagged {
             Binding::Divergent {
                 name_npub: npub.to_string(),
@@ -150,7 +149,6 @@ mod tests {
             "names the repair: {refusal}"
         );
 
-        // Both sides known and equal: the name is a safe address.
         let same = json!({ "npub": "aa11", "pane_npub": "aa11", "identity_divergent": false });
         let bound = binding_from_whois(Some(&same));
         assert_eq!(
@@ -161,7 +159,6 @@ mod tests {
         );
         assert!(guard_recipient("Someone", &bound).is_ok());
 
-        // Absence is not evidence: no row, a half row, no pane stamp.
         assert!(guard_recipient("Nobody", &binding_from_whois(None)).is_ok());
         let half = json!({ "npub": "aa11", "identity_divergent": false });
         assert_eq!(binding_from_whois(Some(&half)), Binding::Unknown);
@@ -169,13 +166,11 @@ mod tests {
         let no_pane = json!({ "npub": "aa11" });
         assert!(guard_recipient("Nobody", &binding_from_whois(Some(&no_pane))).is_ok());
 
-        // An explicit npub is the repair, never a refusal.
         let still_divergent = binding_from_whois(Some(&live));
         assert!(guard_recipient("npub1qqqqqq", &still_divergent).is_ok());
         assert!(is_explicit_npub("npub1abc"));
         assert!(!is_explicit_npub("Buffy"));
 
-        // The guard agrees with the flag the mailbox sets.
         assert!(divergent("aa", "bb"));
         assert!(!divergent("aa", "aa"));
         assert!(!divergent("", "bb"), "a missing side is not divergence");

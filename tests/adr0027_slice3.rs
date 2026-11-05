@@ -7,9 +7,6 @@ use std::process::Command;
 
 #[test]
 fn adr0027_s3_s4_one_open_per_corr_no_token_second_rejected() {
-    // S4: one open decision per corr; mailbox mints no token; second HumanDecision same corr rejected
-    // This test drives the flywheel binary via `cargo test` for human_decision, but for S4 we need to check the Model
-    // For now, we check the workspace tick directly
     let ws = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/workspace.rs");
     let content = std::fs::read_to_string(&ws).expect("read workspace.rs");
     assert!(
@@ -20,9 +17,6 @@ fn adr0027_s3_s4_one_open_per_corr_no_token_second_rejected() {
         content.contains("HumanDecision"),
         "S4: Msg::HumanDecision must exist"
     );
-    // Check that second decision for same corr is LoudMiss (one-per-corr)
-    // This is already covered by human_decision tests, but we pin it here as S4 acceptance
-    // Run the human_decision fence
     let out = Command::new("cargo")
         .args([
             "test",
@@ -41,7 +35,6 @@ fn adr0027_s3_s4_one_open_per_corr_no_token_second_rejected() {
         out.status.success(),
         "S4 human_decision fence must pass (one-per-corr): stdout={stdout} stderr={stderr}"
     );
-    // Fail-if: card/token minted
     assert!(
         !content.contains("UI card") && !content.contains("widget"),
         "S4 fail-if: mailbox must not mint card/token"
@@ -50,12 +43,8 @@ fn adr0027_s3_s4_one_open_per_corr_no_token_second_rejected() {
 
 #[test]
 fn adr0027_s3_invariant10_tripwire_denied() {
-    // Invariant 10: secrets never in a rumor — tripwire result shape is denied (or LoudMiss as denied)
     let ws = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/workspace.rs");
     let content = std::fs::read_to_string(&ws).expect("read workspace.rs");
-    // GS-016: the WriteNcryptsec arm is DELETED (zfnx.4) — the honest
-    // tripwire asserts the arm's absence (no secret-writing Cmd beside
-    // rumor-14), not a comment substring. Denied/LoudMiss shape stays.
     assert!(
         !content.contains("Cmd::WriteNcryptsec"),
         "S4: no secret-writing Cmd may exist beside rumor-14 (zfnx.4 deletion is contract)"

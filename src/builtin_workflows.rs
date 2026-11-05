@@ -530,7 +530,6 @@ graph:
       on_error: fail_run
 "#,
     ),
-    // ---- ADR-0009 compound-engineering workflows ----
     (
         "ce-compound",
         r#"
@@ -630,7 +629,6 @@ graph:
       needs: [scout-fanout]
 "#,
     ),
-    // ---- ADR-0019 Spec 7.2 fix-path playbooks (bd-w2-fix-path-7gd5) ----
     (
         "bug-fix",
         r#"
@@ -765,7 +763,6 @@ steps:
     on_error: fail_run
 "#,
     ),
-    // ---- ADR-0019 Spec 7.2 measured-improvement playbooks (bd-w2-perf-to27) ----
     (
         "perf",
         r#"
@@ -1165,10 +1162,6 @@ steps:
     on_error: fail_run
 "#,
     ),
-    // ---- ADR-0006 D3 wave-swarm compose token (bd-wave-swarm-recipe-wsot),
-    // compounded by ADR-0009: REVIEW (ce-review — evidence-gated findings
-    // between OBSERVE and VERIFY) and COMPOUND (ce-compound, on_error:
-    // continue, after VERIFY). Bounded by FLYWHEEL_COMPOSE_MAX_SECONDS.
     (
         "wave-swarm",
         r#"
@@ -1365,17 +1358,6 @@ steps:
         on_error: continue
 "#,
     ),
-    // ---- ADR-0008 §6.7 beads-lifecycle compose token (bd-adr0008-token-yaml-kimg) ------
-    // The beads authoring lifecycle: grill → create → review1 → review2 →
-    // integrate → implement → verify → outer SIGNOFF. inputs.until
-    // early-exits SUCCESS after any phase (GraphNode guard: fields on
-    // trigger_until — run_branch evaluates ONLY trigger_*/steps_*
-    // variables, so `{{inputs.*}}` templates in guards degrade to '0' and
-    // never fire; bd-adr0008-guard-fix-16fl); gate_before_implement adds
-    // one OUTER approval between integrate and implement (a guarded
-    // request_approval node — never a nested one).
-    // Nests ordinary builtins via call_workflow; hands off to wave-swarm
-    // for execution, never merges it.
     (
         "beads-lifecycle",
         r#"
@@ -1491,7 +1473,6 @@ graph:
       message: "Beads lifecycle signoff (captain-only) for {{inputs.objective}} [{{inputs.project}}]: review the verify evidence on {{inputs.steer_channel}}; approve closes, reject reopens."
 "#,
     ),
-    // ---- ADR-0019 Spec 7.2 reflect (wave 6, bd-w6-reflect-8gp5) ----
     (
         "reflect",
         r#"
@@ -1588,8 +1569,6 @@ pub fn builtin_workflows() -> BTreeMap<String, Workflow> {
                 map.insert(name.to_string(), wf);
             }
             Err(e) => {
-                // A built-in that fails to parse is a crate bug — surface it
-                // loudly rather than silently dropping the workflow.
                 panic!("built-in workflow {name} failed to parse: {e}");
             }
         }
@@ -1903,7 +1882,6 @@ mod tests {
                 report.issues
             );
         }
-        // phase tags land on the dispatch specs
         assert_eq!(
             dispatch_phase(&wfs["phase-resolve"], "phase-resolve"),
             Some("resolve".to_string())
@@ -1920,7 +1898,6 @@ mod tests {
             dispatch_phase(&wfs["phase-verify"], "phase-verify"),
             Some("verify".to_string())
         );
-        // review's dispatch lives inside the parallel fanout
         let review = &wfs["phase-review"];
         let fan = review
             .steps
@@ -1962,8 +1939,6 @@ mod tests {
         let resolver = |sub: &str| builtin_workflows().get(sub).cloned();
         let rendered = crate::crew::render_dry_run(ship, &resolver);
         let steps = rendered["steps"].as_array().expect("dry-run steps");
-        // The links EXPAND: each call_workflow renders its nested dispatch
-        // with its phase tag, in chain order (resolve→…→verify).
         let phases: Vec<&str> = steps.iter().filter_map(|s| s["phase"].as_str()).collect();
         assert_eq!(
             phases,
@@ -1986,7 +1961,6 @@ mod tests {
     fn review_trio_shapes() {
         use toron_workflow::schema::Action;
         let wfs = builtin_workflows();
-        // interrogate: reviewers default "2".
         let inter = &wfs["interrogate"];
         let default = inter
             .inputs
@@ -2006,7 +1980,6 @@ mod tests {
             matches!(briefs.action, Action::Parallel { .. }),
             "briefs is a parallel fanout"
         );
-        // forensics: a @scout diagnose node.
         let fore = &wfs["forensics"];
         let diagnose = fore
             .graph
@@ -2019,7 +1992,6 @@ mod tests {
             matches!(diagnose.action, Action::DispatchJob { .. }),
             "diagnose is a dispatch"
         );
-        // figure-it-out: routed via decide to compose --agent, not a builtin YAML
         assert!(
             !wfs.contains_key("figure-it-out"),
             "figure-it-out is decide-routed, not a builtin YAML"
@@ -2055,8 +2027,6 @@ mod tests {
         }
     }
 
-    // ---- ADR-0019 Spec 7.2: operations playbooks (bd-w2-ops-szky) ----
-
     /// The five operations playbooks are builtins; each cites its principles
     /// and is crew: auto; autonomous-work documents the decide target.
     #[test]
@@ -2074,7 +2044,6 @@ mod tests {
             assert!(!wf.principles.is_empty(), "{name} cites principles");
             assert_eq!(wf.crew, Some(CrewSpec::Auto), "{name} is crew: auto");
         }
-        // autonomous-work documents the decide target in the description.
         assert!(
             wfs["autonomous-work"]
                 .description
@@ -2202,7 +2171,6 @@ mod tests {
         use toron_workflow::schema::Action;
         let wfs = builtin_workflows();
 
-        // goal-direct: no call to the `beads` workflow (the tracker).
         let direct = &wfs["goal-direct"];
         let step_names: Vec<&str> = direct
             .steps
@@ -2223,7 +2191,6 @@ mod tests {
             }
         }
 
-        // plan-direct: the decompose dispatch, NO request_approval gate.
         let plan_direct = &wfs["plan-direct"];
         assert!(
             plan_direct
@@ -2233,9 +2200,6 @@ mod tests {
             "plan-direct must not carry the plan approval gate"
         );
     }
-
-    // ---- bd-2pcq Tier B: composition invariants (STEER-COMPOSE /
-    //      WORKFLOW-COMPOSE) ----
 
     /// STEER-COMPOSE (bd-2pcq #7): the goal workflows' arm selection is
     /// structural — goal = bead-tracked chain (brainstorm → plan → beads),
@@ -2249,7 +2213,6 @@ mod tests {
         let goal = &wfs["goal"];
         let direct = &wfs["goal-direct"];
 
-        // Tracked arm: the chain includes the beads (tracker) step.
         let goal_calls: Vec<&str> = goal
             .steps
             .iter()
@@ -2262,7 +2225,6 @@ mod tests {
             goal_calls.contains(&"beads"),
             "tracked arm chains the tracker: {goal_calls:?}"
         );
-        // Direct arm: NEVER calls beads.
         let direct_calls: Vec<&str> = direct
             .steps
             .iter()
@@ -2275,8 +2237,6 @@ mod tests {
             !direct_calls.contains(&"beads"),
             "direct arm must not chain the tracker: {direct_calls:?}"
         );
-        // Both arms declare crew: auto (the steer surface composes the crew
-        // strategy at invoke: auto | <squad>).
         assert_eq!(goal.crew, Some(CrewSpec::Auto));
         assert_eq!(direct.crew, Some(CrewSpec::Auto));
     }
@@ -2292,10 +2252,6 @@ mod tests {
     #[test]
     fn goal_render_supplies_phase_plan_data_shape() {
         let wfs = builtin_workflows();
-        // ROOT fix: phase-plan defaults data_shape to empty, so EVERY caller
-        // (goal, ship, the beads-lifecycle graph at line ~1404 that passes
-        // only goal) renders its task clean — no literal
-        // {{inputs.data_shape}} can leak into step outputs.
         let phase_plan = &wfs["phase-plan"];
         let shape = phase_plan
             .inputs
@@ -2354,7 +2310,6 @@ mod tests {
                 }
             }
         }
-        // The direct arm's plan companion is gate-free AND resolves.
         assert!(
             wfs.contains_key("plan-direct"),
             "plan-direct built-in present"
@@ -2442,12 +2397,6 @@ mod tests {
                     }
                 }
                 Action::Foreach { each, .. } => scan_action(&each.action, name, found),
-                // toron-workflow 17b2eb4 added Action::Loop. Without this arm a
-                // dispatch nested in a loop body is INVISIBLE to this walker, so
-                // a stage-ref dispatch inside a loop silently escapes the
-                // invariant this scan exists to enforce. hillclimb is exactly
-                // that shape: one `loop` step whose body holds the stage-ref
-                // dispatch_job, so the scan under-counted by one.
                 Action::Loop { body, .. } => {
                     for st in body.iter() {
                         scan_action(&st.action, name, found);
@@ -2538,12 +2487,6 @@ mod tests {
                     }
                 }
                 Action::Foreach { each, .. } => scan_action(&each.action, name, checked),
-                // toron-workflow 17b2eb4 added Action::Loop. Without this arm a
-                // dispatch nested in a loop body is INVISIBLE to this walker, so
-                // a stage-ref dispatch inside a loop silently escapes the
-                // invariant this scan exists to enforce. hillclimb is exactly
-                // that shape: one `loop` step whose body holds the stage-ref
-                // dispatch_job, so the scan under-counted by one.
                 Action::Loop { body, .. } => {
                     for st in body.iter() {
                         scan_action(&st.action, name, checked);
@@ -2567,11 +2510,8 @@ mod tests {
             checked >= 10,
             "expected >=10 stage-ref dispatches, saw {checked}"
         );
-        // ADR-0024 Scenario B: bug-fix routes the fix path through
-        // repair-until-verified (repro stays fail_run, prove stays @reviewer).
         let bug_fix = &wfs["bug-fix"];
         let g = bug_fix.graph.as_ref().expect("bug-fix is a graph");
-        // repro stays dispatch_job (inline task)
         let repro = &g.nodes["repro"];
         assert!(
             matches!(repro.action, Action::DispatchJob { .. }),
@@ -2585,7 +2525,6 @@ mod tests {
                 "repro fail_run"
             );
         }
-        // fix path uses the recipe (call_workflow repair-until-verified)
         let fix = &g.nodes["fix"];
         match &fix.action {
             Action::CallWorkflow {
@@ -2609,7 +2548,6 @@ mod tests {
             toron_workflow::schema::StepOnError::FailRun,
             "fix fail_run"
         );
-        // prove stays @reviewer dispatch
         let prove = &g.nodes["prove"];
         assert!(
             matches!(prove.action, Action::DispatchJob { .. }),
@@ -2633,7 +2571,6 @@ mod tests {
         assert!(g.nodes.contains_key("repro"), "repro present");
         assert!(g.nodes.contains_key("fix"), "fix present");
         assert!(g.nodes.contains_key("prove"), "prove present");
-        // fix is the recipe
         match &g.nodes["fix"].action {
             Action::CallWorkflow {
                 workflow, inputs, ..
@@ -2654,7 +2591,6 @@ mod tests {
             }
             other => panic!("fix must be call_workflow: {other:?}"),
         }
-        // lint clean
         let report = toron_workflow::lint_workflow(bug);
         assert!(
             report.is_clean(),
@@ -2713,7 +2649,6 @@ mod tests {
         use toron_workflow::schema::{Action, Trigger};
         let wfs = builtin_workflows();
         let wr = &wfs["weekly-review"];
-        // schedule trigger, project scope, owner oracle
         match &wr.trigger {
             Some(Trigger::Schedule { cron, owner, scope }) => {
                 assert_eq!(cron, "0 4 * * 0");
@@ -2722,14 +2657,12 @@ mod tests {
             }
             other => panic!("weekly-review must be schedule-triggered: {other:?}"),
         }
-        // graph: scout-fanout (parallel @scout) -> oracle (@oracle, needs scouts)
         let g = wr.graph.as_ref().expect("graph present");
         let fanout = &g.nodes["scout-fanout"];
         assert!(matches!(fanout.action, Action::Parallel { .. }));
         let oracle = &g.nodes["oracle"];
         assert!(matches!(oracle.action, Action::DispatchJob { .. }));
         assert!(oracle.needs.contains(&"scout-fanout".to_string()));
-        // the oracle's task templates the scout outputs (the synthesis input)
         let Action::DispatchJob { spec, .. } = &oracle.action else {
             unreachable!()
         };
@@ -2767,14 +2700,11 @@ mod tests {
                     .find(|i: &&InputDecl| i.name == n)
                     .unwrap_or_else(|| panic!("{name} input {n}"))
             };
-            // n: default 2 (min 2 — n=1 fails lint, lands with w2-lints).
             assert_eq!(input("n").default.as_ref(), Some(&serde_json::json!(2)));
-            // mode: default sketch.
             assert_eq!(
                 input("mode").default.as_ref(),
                 Some(&serde_json::json!("sketch"))
             );
-            // arena declares the selection rule UP FRONT (first-pass | rank-all | best-of).
             if name == "arena" {
                 assert!(
                     input("selection").default.is_none(),
@@ -2793,7 +2723,6 @@ mod tests {
         let wfs = builtin_workflows();
         let proto = &wfs["prototype"];
         let g = proto.graph.as_ref().expect("graph present");
-        // arms node is a branch (mode switch)
         let arms = &g.nodes["arms"];
         let Action::Branch {
             if_guard,
@@ -2807,7 +2736,6 @@ mod tests {
             if_guard.contains("compile"),
             "compile branch guard: {if_guard}"
         );
-        // compile arm: foreach over {{inputs.arms}}, build_slot declared
         assert_eq!(then.len(), 1, "one compile arm step");
         assert!(
             matches!(then[0].action, Action::Foreach { .. }),
@@ -2817,7 +2745,6 @@ mod tests {
             then[0].build_slot,
             "compile arm serializes on the build slot"
         );
-        // sketch arm: parallel over {{inputs.n}}, no build slot
         assert_eq!(else_steps.len(), 1, "one sketch arm step");
         assert!(
             matches!(&else_steps[0].action, Action::Parallel { over, .. } if over == "{{inputs.n}}"),
@@ -2827,8 +2754,6 @@ mod tests {
             !else_steps[0].build_slot,
             "sketch arms write text only, no slot"
         );
-        // judge: @oracle needs arms — the judge discipline is the judge-arms
-        // stage (bd-h9xn extraction); the plan carries the per-run question.
         let judge = &g.nodes["judge"];
         assert!(judge.needs.contains(&"arms".to_string()));
         let Action::DispatchJob { spec, .. } = &judge.action else {
@@ -2844,8 +2769,6 @@ mod tests {
             plan.contains("Prototype arms"),
             "plan names the arms: {plan}"
         );
-        // The arms consumer lives in the stage discipline (extraction proof:
-        // the stage prompt still reaches the arms envelope).
         let lib = crate::stages::StageLibrary::compiled_in();
         let stage_prompt = lib.resolve("judge-arms").expect("judge-arms resolves");
         assert!(
@@ -2911,8 +2834,6 @@ mod tests {
                     panic!("{name}: arm each is a dispatch_job");
                 };
                 let task = spec.task.as_deref().expect("{name} arm dispatch task");
-                // the ban is EXPLICIT (no worktree) and no creation
-                // instruction exists (no `git worktree` command text)
                 assert!(
                     task.contains("worktree"),
                     "{name} arm bans worktrees explicitly: {task}"
@@ -2947,8 +2868,6 @@ mod tests {
         use toron_workflow::schema::Action;
         let wfs = builtin_workflows();
 
-        // ce-brainstorm: three concurrent divergers, and they must be three
-        // DIFFERENT roles or they are three sends at one agent.
         let cb = crew::crew_demand(&wfs["ce-brainstorm"]);
         assert_eq!(
             cb.required_panes, 3,
@@ -2959,7 +2878,6 @@ mod tests {
             "brainstorm's divergers must not share a role: {cb:?}"
         );
 
-        // debate: unchanged, a literal parallel over 2.
         let g = wfs["debate"]
             .graph
             .as_ref()
@@ -3026,10 +2944,6 @@ mod tests {
     fn fanout_outputs_reach_reducers() {
         use toron_workflow::schema::Action;
         let wfs = builtin_workflows();
-        // (workflow, reducer node, tokens the reducer must consume). bd-0s0y:
-        // ce-brainstorm's reduce consumes THREE named diverger outputs now,
-        // because the fan-out is three named nodes rather than one parallel
-        // step's array.
         for (name, node, tokens) in [
             (
                 "ce-brainstorm",
@@ -3081,10 +2995,6 @@ mod tests {
                     }
                 }
                 Action::Foreach { each, .. } => scan_action(&each.action, wf, dead),
-                // toron-workflow 17b2eb4 added Action::Loop. Without this arm a
-                // dispatch nested in a loop body is INVISIBLE to this walker, so
-                // a stage-ref dispatch inside a loop would silently escape the
-                // invariant this scan exists to enforce.
                 Action::Loop { body, .. } => {
                     for st in body.iter() {
                         scan_action(&st.action, wf, dead);
@@ -3266,8 +3176,6 @@ mod tests {
     #[test]
     fn wave_swarm_awaits_name_no_ambiguity_signal() {
         use toron_workflow::schema::Action;
-        // Keep in sync with boundary.rs AMBIGUOUS (conservative substring
-        // match there; exact containment here).
         const SIGNALS: &[&str] = &[
             "timeout",
             "timed out",
@@ -3301,8 +3209,6 @@ mod tests {
             };
             awaits.push((s.name.clone().unwrap_or_default(), command.clone()));
         }
-        // Five gated phases; fewer means an await lost its fence (or this
-        // test lost its coverage) — either way, loud.
         assert_eq!(
             awaits.len(),
             5,
@@ -3423,7 +3329,6 @@ mod tests {
         let wfs = builtin_workflows();
         let ca = &wfs["captain-audit"];
 
-        // crew: auto + lint clean (the run gate).
         assert_eq!(ca.crew, Some(CrewSpec::Auto), "captain-audit is crew: auto");
         let report = toron_workflow::lint_workflow(ca);
         assert!(
@@ -3432,12 +3337,9 @@ mod tests {
             report.issues
         );
 
-        // inputs: topic, scope, report_path.
         let inputs: Vec<&str> = ca.inputs.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(inputs, vec!["topic", "scope", "report_path"]);
 
-        // graph chain: gather (@scout) → synthesize (@oracle, needs gather)
-        // → challenge (@reviewer, needs synthesize, opencode harness).
         let g = ca.graph.as_ref().expect("captain-audit has a graph");
         let gather = &g.nodes["gather"];
         let Action::DispatchJob { spec, .. } = &gather.action else {
@@ -3464,8 +3366,6 @@ mod tests {
         assert!(challenge.needs.contains(&"synthesize".to_string()));
         assert_eq!(challenge.on_error, StepOnError::FailRun);
 
-        // every prompt is ANALYSIS ONLY, no beads, no repo edits; the
-        // report is written to {{inputs.report_path}}.
         let yaml = BUILTIN_WORKFLOWS_YAML
             .iter()
             .find(|(n, _)| *n == "captain-audit")
@@ -3499,8 +3399,6 @@ mod tests {
         }
     }
 
-    // ---- ADR-0019 Spec 7.2 fix-path playbooks (bd-w2-fix-path-7gd5) ----
-
     /// The three fix-path playbooks are compiled-in, crew:auto, and declare
     /// their inputs.
     #[test]
@@ -3515,7 +3413,6 @@ mod tests {
                 "{name} declares inputs: {input_names:?}"
             );
         }
-        // the exact input contracts
         let bug = &wfs["bug-fix"];
         assert_eq!(
             bug.inputs
@@ -3570,13 +3467,11 @@ mod tests {
             !graph.nodes.contains_key("tdd"),
             "tdd collapsed into repair loop"
         );
-        // the reviewer prove node carries the opencode harness override
         let Action::DispatchJob { spec, .. } = &graph.nodes["prove"].action else {
             panic!("prove is a dispatch_job");
         };
         assert_eq!(spec.profile.as_deref(), Some("@reviewer"));
         assert_eq!(spec.harness.as_deref(), Some("opencode"));
-        // fix is the repair recipe
         let Action::CallWorkflow {
             workflow, inputs, ..
         } = &graph.nodes["fix"].action
@@ -3708,8 +3603,6 @@ mod tests {
         }
     }
 
-    // ---- ADR-0019 Spec 7.2 measured-improvement playbooks (bd-w2-perf-to27) ----
-
     /// perf + hillclimb are compiled-in, crew:auto, with the exact input
     /// contracts (metric/baseline_cmd/budget and metric/target/max_iters).
     #[test]
@@ -3802,8 +3695,6 @@ mod tests {
             panic!("climb is a loop");
         };
         assert_eq!(max, "{{inputs.max_iters}}");
-        // Dispatch `ok` means the attempt ran. The stop bit is the reply's
-        // `improved` field, published onto the step from the response JSON.
         assert_eq!(until.as_deref(), Some("steps_iteration_improved == true"));
         let step = body
             .iter()
@@ -3813,8 +3704,6 @@ mod tests {
         let Action::DispatchJob { spec, .. } = &step.action else {
             panic!("each attempt is a dispatch_job");
         };
-        // The keep/discard discipline is the measure-keep-or-discard stage
-        // (bd-h9xn extraction); the plan carries the iteration specifics.
         assert_eq!(
             spec.stage.as_deref(),
             Some("measure-keep-or-discard"),
@@ -3865,8 +3754,6 @@ mod tests {
         }
     }
 
-    // ---- ADR-0019 Spec 7.2 reflect (wave 6, bd-w6-reflect-8gp5) ----
-
     /// reflect is compiled-in, crew:auto, with the scan → emit → prune
     /// chain and the encode-lessons-in-structure principle tag.
     #[test]
@@ -3911,7 +3798,6 @@ mod tests {
             .find(|(n, _)| *n == "reflect")
             .map(|(_, y)| *y)
             .unwrap();
-        // the emit step: for EACH duplicate -> ONE bead
         assert!(
             yaml.contains("For EACH duplicated instruction"),
             "scans every duplicate"
@@ -3921,13 +3807,11 @@ mod tests {
             yaml.contains("Two restatements of the same instruction = ONE hook bead"),
             "two restatements -> ONE bead (never two)"
         );
-        // the hook is a STRUCTURAL line, never an AGENTS.md paragraph
         assert!(yaml.contains("a lint rule, a preflight check, or a principle-registry line"));
         assert!(
             yaml.contains("NEVER an AGENTS.md paragraph"),
             "nothing appended to AGENTS.md"
         );
-        // both reminders deleted — from the PROJECT layer only
         assert!(
             yaml.contains("Delete the superseded standing-order lines"),
             "prune deletes the superseded reminders"
@@ -3958,9 +3842,6 @@ mod tests {
         );
     }
 
-    // ---- ADR-0008 §10.C (bd-adr0008-token-yaml-kimg): beads-lifecycle ----
-    // The third compose token: grill → signoff beads lifecycle with
-    // inputs.until early-exit + gate_before_implement outer gate.
     #[test]
     fn beads_lifecycle_is_compose_token_and_beads_is_not() {
         assert!(
@@ -3987,7 +3868,6 @@ mod tests {
             "beads-lifecycle must lint clean: {:?}",
             report.issues
         );
-        // until input declared with default signoff.
         let until = wf
             .inputs
             .iter()
@@ -3998,7 +3878,6 @@ mod tests {
             Some(serde_json::Value::String("signoff".to_string())),
             "until defaults to signoff"
         );
-        // Phase nodes in ordinal order grill → signoff.
         let graph = wf.graph.as_ref().expect("beads-lifecycle is a graph");
         let phase_order = [
             "grill",
@@ -4017,9 +3896,6 @@ mod tests {
                 "phase node {phase} present"
             );
         }
-        // Two RequestApproval actions max: signoff (unconditional, outer)
-        // + the OPTIONAL gate_before_implement outer gate (a guarded node,
-        // skipped unless enabled). Never a NESTED approval.
         fn count_approvals(action: &Action) -> usize {
             let mut n = usize::from(matches!(action, Action::RequestApproval { .. }));
             if let Action::Branch {
@@ -4091,8 +3967,6 @@ mod tests {
                 "node {name} guard must reference engine variables: {guard}"
             );
         }
-        // No inert branch semaphores: a Branch with empty then AND empty
-        // else cannot exit anything downstream of a needs edge.
         fn has_empty_branch(action: &Action) -> bool {
             match action {
                 Action::Branch {
@@ -4168,8 +4042,6 @@ mod tests {
             let want: Vec<&str> = phases[..=ord(u)].to_vec();
             assert_eq!(ran, want, "until={u} runs exactly grill..={u}");
         }
-        // The optional outer gate fires only when enabled AND the run has
-        // not early-exited at or before integrate.
         let gate = &graph.nodes["gate-before-implement"];
         let g = gate.guard.as_deref().expect("gate guard");
         for (u, gate_in, expect) in [

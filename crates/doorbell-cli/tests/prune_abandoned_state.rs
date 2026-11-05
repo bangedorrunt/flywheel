@@ -37,9 +37,6 @@ fn age(path: &Path, secs: u64, now: u64) {
 }
 
 fn lease(pid: u32, heartbeat: u64) -> String {
-    // The staleness predicate is boot + start-stamp keyed since
-    // bd-lease-boot-identity-tm6cg: a fixture with boot_id="test" would read
-    // stale on every host and turn "live lease protects its logs" into a lie.
     let boot = doorbell_rt::lease::boot_id();
     let start = doorbell_rt::lease::process_start_unix(pid).unwrap_or(heartbeat);
     format!(
@@ -70,14 +67,12 @@ fn daemon_prunes_abandoned_state_and_names_every_family() {
         .as_secs();
     const OLD: u64 = 30 * 24 * 60 * 60;
 
-    // A workspace whose host died long ago.
     write(&doorbell.join("gone.pid"), "999999\n");
     write(&doorbell.join("gone.gen"), "{}");
     write(&doorbell.join("gone.project"), "p");
     write(&doorbell.join("gone.audit.jsonl"), &"x".repeat(1024));
     write(&doorbell.join("owner-gone.json"), &lease(999999, now - OLD));
 
-    // A workspace with a LIVE host that this daemon does not host.
     let mut sleeper = Command::new("sleep")
         .arg("60")
         .stdout(Stdio::null())
@@ -93,8 +88,6 @@ fn daemon_prunes_abandoned_state_and_names_every_family() {
         &lease(live_pid, now),
     );
 
-    // Everything is OLD except the live lease: the live sidecars are aged too,
-    // so only the PID can protect them.
     for f in [
         "gone.pid",
         "gone.gen",
@@ -124,12 +117,10 @@ fn daemon_prunes_abandoned_state_and_names_every_family() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn daemon");
-    // The rotate/prune tick fires its FIRST tick immediately; 5s is margin.
     std::thread::sleep(Duration::from_secs(5));
     let _ = child.kill();
     let out = child.wait_with_output().expect("wait daemon");
     let _ = sleeper.kill();
-    // Clippy: a spawned child must be reaped, not just signalled.
     let _ = sleeper.wait();
     let log = format!(
         "{}{}",

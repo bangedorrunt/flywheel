@@ -64,13 +64,10 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
             .with_context(|| format!("sync temp {}", tmp.display()))?;
         std::fs::rename(&tmp, path)
             .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
-        // P6: poll-probe the renamed path (2s cap, 50ms step) — a slow
-        // network fs surfaces here instead of as a torn read downstream.
         let _ = wait_for_visible(path);
         Ok(())
     })();
     if res.is_err() {
-        // Best-effort cleanup of the temp file on failure.
         let _ = std::fs::remove_file(&tmp);
     }
     res
@@ -105,8 +102,6 @@ mod tests {
 
     #[test]
     fn atomic_write_failure_leaves_no_partial_destination() {
-        // Parent is a FILE → create_dir_all fails → error, and the temp is
-        // cleaned up.
         let dir = std::env::temp_dir().join(format!("flywheel-atomic-fail-{}", std::process::id()));
         std::fs::write(&dir, b"not-a-dir").unwrap();
         let path = dir.join("x.toml");

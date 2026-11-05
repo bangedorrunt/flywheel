@@ -66,13 +66,10 @@ pub fn classify(
         }
     }
 
-    // Never stamped: never observed ≠ deaf.
     if last_event_ms.is_none() && last_heartbeat_ms.is_none() {
         return PipeHealth::NeverStamped;
     }
 
-    // Deaf: measured last-frame age from present stamps only. Ceiling is the
-    // Live/Quiet threshold above — never a stand-in timestamp when unstamped.
     let silent_for_ms = match (last_event_ms, last_heartbeat_ms) {
         (Some(ev), None) => now_ms.saturating_sub(ev),
         (None, Some(hb)) => now_ms.saturating_sub(hb),
@@ -168,7 +165,6 @@ pub fn classify_worst_of_stamps<L>(
         let h = classify(now_ms, ev, hb, deaf_ceiling_ms);
         let replace = match &best {
             None => true,
-            // Strictly worse replaces; equal severity keeps first (stable).
             Some((w, _, _, _)) => pipe_severity(h) > pipe_severity(*w),
         };
         if replace {
@@ -236,7 +232,6 @@ mod tests {
 
     #[test]
     fn order_hosted_alive_first_by_slug_not_full_key() {
-        // project/workspace keys: alpha slug must win over project alpha.
         let got = order_hosted_alive_first_by(
             vec!["zzz/alpha".into(), "aaa/beta".into()],
             Vec::new(),
@@ -284,7 +279,6 @@ mod tests {
 
     #[test]
     fn never_stamped_is_unknown_not_deaf() {
-        // both None — never observed ≠ Deaf (watchbeat honesty)
         let h = classify(0, None, None, 60_000);
         assert_eq!(h, PipeHealth::NeverStamped);
         let h = classify(1_000, None, None, 60_000);
@@ -293,7 +287,6 @@ mod tests {
 
     #[test]
     fn stale_event_without_heartbeat_uses_event_age() {
-        // last_heartbeat None + stale event: measured age, not ceiling stand-in
         let h = classify(200_000, Some(100_000), None, 60_000);
         assert_eq!(
             h,
@@ -305,7 +298,6 @@ mod tests {
 
     #[test]
     fn both_stale_silent_for_is_min_frame_age() {
-        // event more recent than hb, both past ceiling → min age = event age
         let h = classify(200_000, Some(120_000), Some(100_000), 60_000);
         assert_eq!(
             h,
@@ -317,8 +309,6 @@ mod tests {
 
     #[test]
     fn event_only_param_does_not_treat_hb_as_event() {
-        // Passing hb-only via last_heartbeat keeps Quiet; last_event stays None.
-        // Callers must not collapse max(event,hb) into last_event_ms.
         let h = classify(100_000, None, Some(95_000), 60_000);
         assert_eq!(
             h,
@@ -326,8 +316,6 @@ mod tests {
                 last_heartbeat_ms: 95_000
             }
         );
-        // If a caller wrongly stuffed hb into last_event_ms, they'd get Live —
-        // document via this contrast that Quiet is the honest shape.
         let collapsed = classify(100_000, Some(95_000), Some(95_000), 60_000);
         assert_eq!(
             collapsed,
@@ -370,12 +358,11 @@ mod tests {
 
     #[test]
     fn worst_of_deaf_plus_live_is_deaf() {
-        // Multi-hosted: one Deaf + one Live → wake=Deaf (not Live/primary).
         let now = 200_000u64;
         let ceiling = 60_000u64;
         let stamps = [
-            (None, Some(100_000u64)),             // Deaf (hb age 100s)
-            (Some(199_000u64), Some(198_000u64)), // Live
+            (None, Some(100_000u64)),
+            (Some(199_000u64), Some(198_000u64)),
         ];
         let h = classify_worst_of(now, stamps, ceiling);
         assert_eq!(
@@ -392,8 +379,8 @@ mod tests {
         let now = 50_000u64;
         let ceiling = 60_000u64;
         let stamps = [
-            (None, None),                       // NeverStamped
-            (Some(49_000u64), Some(48_000u64)), // Live
+            (None, None),
+            (Some(49_000u64), Some(48_000u64)),
         ];
         assert_eq!(
             classify_worst_of(now, stamps, ceiling),
@@ -412,13 +399,12 @@ mod tests {
 
     #[test]
     fn worst_of_does_not_max_merge_stamps_into_live() {
-        // Max-merging stamps would yield Live; worst-of must stay Deaf.
         let now = 200_000u64;
         let h = classify_worst_of(
             now,
             [
-                (Some(100_000u64), None),             // Deaf
-                (Some(199_000u64), Some(198_000u64)), // Live
+                (Some(100_000u64), None),
+                (Some(199_000u64), Some(198_000u64)),
             ],
             60_000,
         );
@@ -427,15 +413,13 @@ mod tests {
 
     #[test]
     fn worst_of_stamps_winner_label_matches_stamps() {
-        // Multi-ws: first-alive Live must not become wake.workspace when
-        // worst-of picks a later Deaf — label + stamps stay coherent.
         let now = 200_000u64;
         let ceiling = 60_000u64;
         let (pipe, winner, ev, hb) = classify_worst_of_stamps(
             now,
             [
-                ("live-ws", Some(199_000u64), Some(198_000u64)), // Live
-                ("deaf-ws", None, Some(100_000u64)),             // Deaf
+                ("live-ws", Some(199_000u64), Some(198_000u64)),
+                ("deaf-ws", None, Some(100_000u64)),
             ],
             ceiling,
         );

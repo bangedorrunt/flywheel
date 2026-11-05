@@ -12,18 +12,9 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 
-// ADR-0012 Phase 0: pure core lives in `doorbell-core`; this module re-exports
-// it (single source) and keeps the effect layer (pid files, supervision,
-// journal, inject). No signature changes in the move.
 pub use doorbell_core::{SelfIndex, WakeState, note_wake, parse_status_pair};
-// `PinBudget` is consumed live only by the `serve` emit-rate limiter (and by
-// this module's tests), so the re-export is gated to those two builds — the
-// lean backend-only lane would otherwise carry an unused import.
 #[cfg(any(test, feature = "serve"))]
 pub use doorbell_core::PinBudget;
-// The rest of doorbell-core's surface is exercised only by this module's own
-// tests (plus the `#[cfg(test)]` `fanout_now` reference implementation), so the
-// re-export is test-gated — in the bin build it would be unused.
 #[cfg(test)]
 pub use doorbell_core::{
     DoorbellQueue, EventClass, RingInput, UNANSWERED_SECS, classify, doorbell_line,
@@ -53,8 +44,6 @@ pub fn pid_file(state_dir: &Path, workspace: &str) -> PathBuf {
 pub fn dispatcher_status_line(state_dir: &Path, workspace: &str) -> String {
     match inspect_lock(&pid_file(state_dir, workspace)) {
         LockAction::Attach { pid } => format!("dispatcher: up pid={pid}"),
-        // inspect_lock is generation-blind; Superseded only arises from
-        // inspect_lock_generation, but stay exhaustive and truthful.
         LockAction::Superseded { pid } => format!("dispatcher: up pid={pid} superseded"),
         LockAction::Reloaded { stale } => format!("dispatcher: down stale={stale}"),
         LockAction::Start => "dispatcher: down".into(),
@@ -126,12 +115,6 @@ pub fn identity_prime(name: &str, mail_identity: &str) -> String {
     )
 }
 
-// `PinBudget` (the per-pin 5/30/3 rolling budget, D1 item 2) is pure core and
-// lives in `doorbell-core` — re-exported above with the rest of the core
-// surface (ADR-0012 Phase 0: ONE implementation). The plane-P copy that lived
-// here carried a never-read `started_unix` and a wall-clock `record()` wrapper;
-// both are gone, and callers pass `now` explicitly per the Tick Law.
-
 pub fn read_pid(path: &Path) -> Option<u32> {
     let raw = fs::read_to_string(path).ok()?;
     raw.trim().parse().ok()
@@ -152,9 +135,6 @@ pub fn pid_alive(pid: u32) -> bool {
     if pid <= 1 {
         return false;
     }
-    // Silence both streams: a dead pid is the common answer, and a reporting
-    // command that probes a hundred of them must not spew `kill: no such
-    // process` per row (doorbell-rt and doorbell-cli already do this).
     Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stdout(Stdio::null())
@@ -220,7 +200,6 @@ impl WatcherGen {
     pub fn stale(&self, exe: &Path) -> bool {
         match binary_identity(exe) {
             Some((mtime, len)) => {
-                // Prefer hash when we have it (strong), fallback to mtime+len for old gens.
                 if !self.binary_hash.is_empty() {
                     match binary_hash(exe) {
                         Some(h) => !self.hash_matches(&h),
@@ -353,7 +332,7 @@ pub fn inspect_lock(path: &Path) -> LockAction {
 /// `current_identity`; anything alive otherwise is
 /// [`LockAction::Superseded`]. Hash-aware: when the recorded gen carries a
 /// hash, the on-disk binary hash must match too (same-second rebuild guard).
-#[cfg_attr(not(test), allow(dead_code))] // exe-less callers: mtime+len only (see the hash-aware door)
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn inspect_lock_generation(
     path: &Path,
     gen_path: &Path,
@@ -369,10 +348,6 @@ pub fn inspect_lock_generation(
                 let hash_ok = if record.binary_hash.is_empty() {
                     true
                 } else {
-                    // Need to check hash against current binary; gen_path's workspace
-                    // dir is sibling of pid file, but we don't have exe path here.
-                    // Fallback: if we have a gen without exe, rely on mtime only.
-                    // A caller holding the exe uses the hash-aware door below.
                     true
                 };
                 if mtime_ok && hash_ok {
@@ -634,8 +609,6 @@ pub fn cron_tick_wake_in(state_dir: &Path, project: &str, summary: &str) {
         serde_json::json!({ "stage": "cron_tick", "summary": summary, "workspace": project, "corr": None::<String> }),
         None,
     );
-    // Same state dir as the journal row (the caller passes
-    // `config::state_dir()`), so a test's temp dir holds the whole wake.
     if let Err(e) = crate::append_pending_fact(state_dir, project, summary) {
         eprintln!("flywheel: cron doorbell sink: pending queue failed: {e:#}");
     }
@@ -692,9 +665,6 @@ pub fn service_emit_wake_in(state_dir: &Path, project: &str, service: &str, to: 
         serde_json::json!({ "stage": "emit", "service": service, "to": to, "workspace": project, "corr": None::<String> }),
         None,
     );
-    // Same state dir as the journal row (the emit route passes
-    // `config::state_dir()`). emit_wake_journals_service_row used to append
-    // `"emit ci -> captain"` to the operator's real `facts/proj-pending.jsonl`.
     if let Err(e) = crate::append_pending_fact(state_dir, project, &summary) {
         eprintln!("flywheel: service emit: pending queue failed: {e:#}");
     }
@@ -727,13 +697,6 @@ pub fn inject_wake_in(
     line: &str,
     now_unix: u64,
 ) -> Result<String, InjectDeny> {
-    // Same-second ratchet: scan the scope journal tail for an identical
-    // pin+line stamped this same second.
-    //
-    // bd-722a: the journal is rotation-bounded (4,000 lines) and the ratchet
-    // only ever looks at the LAST 32 rows, but the old code read the WHOLE
-    // file to find them. The tail is seeked to (the same shape as
-    // `rotate_audit_if_oversized`), so the read is bounded by bytes.
     let journal_path = doorbell_rt::FileStore::new(state_dir).journal_file(workspace);
     let journal_tail =
         crate::state::read_tail_lines(&journal_path, 32, 256 * 1024).unwrap_or_default();
@@ -761,25 +724,11 @@ pub fn inject_wake_in(
             }
         }
     }
-    // bd-0gup: the budget is a LOCKED read-modify-write with an ATOMIC
-    // write. The old code did an unlocked load -> check -> `std::fs::write`
-    // (truncating in place): two injectors could both pass `len >= 3`, and
-    // a crash mid-write left a truncated file that `inject_budget_load`
-    // reads as EMPTY — the budget reset. The write now goes through the
-    // shared locked update (temp file + rename), and the CHECK and the
-    // CHARGE happen under ONE lock.
-    //
-    // The effect (the journal append) happens INSIDE that lock, BEFORE the
-    // charge: a failed inject must not consume a slot.
     let budget_path = inject_budget_path(state_dir, project);
     let summary = format!("inject {pin}: {line}");
     let msg = crate::workspace::Msg::Fact {
         summary: summary.clone(),
     };
-    // The pin goes in the envelope attribution, not only in the summary text:
-    // a Fact row carries no pin field, so `doorbell why <pin>` (which reads
-    // `entry.pins` and Prompt/Audit cmds) could never attribute an injected
-    // row to its pin — the operator console door was unexplainable.
     let mut denied = false;
     crate::state::update_locked(
         &budget_path,
@@ -804,7 +753,6 @@ pub fn inject_wake_in(
                 }),
                 Some(&[pin.to_string()]),
             );
-            // Charged AFTER the effect: a failed inject costs no slot.
             stamps.push(now_unix);
         },
     )
@@ -812,10 +760,6 @@ pub fn inject_wake_in(
     if denied {
         return Err(InjectDeny::Budget);
     }
-    // The pending wake goes under the SAME state dir as the journal and the
-    // budget. The CLI passes `config::state_dir()`, so production is
-    // unchanged; a test's temp dir now holds the whole inject instead of
-    // the operator's real `facts/<project>-pending.jsonl`.
     let _ = crate::append_pending_fact(state_dir, project, &summary);
     Ok(summary)
 }
@@ -827,10 +771,6 @@ fn spawn_child(
     path: &Path,
     gen_path: &Path,
 ) -> Result<()> {
-    // bd-durable-doorbell-lngf: record which project owns this workspace —
-    // the supervisor reads the sidecar to re-spawn the right
-    // `__doorbell --project <p>` after a crash (the pid/gen files alone
-    // don't carry it).
     if let Some(parent) = gen_path.parent() {
         let _ = fs::write(parent.join(format!("{workspace}.project")), project);
     }
@@ -848,9 +788,6 @@ fn spawn_child(
         .spawn()
         .with_context(|| format!("spawn doorbell for {workspace}"))?;
     write_pid(path, child.id())?;
-    // Generation stamp at spawn (bd-stale-doorbell-wake-0fic): the tick
-    // loop compares this record against `exe` every second and retires the
-    // watcher when the binary changes underneath it.
     if let Some(record) = WatcherGen::capture(exe, unix_now()) {
         let _ = write_gen(gen_path, &record);
     }
@@ -867,15 +804,7 @@ pub fn ensure_running(
     workspace: &str,
     project: &str,
 ) -> Result<LockAction> {
-    // D9 layer 3 (bd-asr2.5): a healthy daemon owns wake — attach as its
-    // client, never spawn a local loop (no double prompts). Subscription
-    // registration via API lands in bd-asr2.8; until then this is a loud
-    // attach with no local writer. Stop local dispatchers before enabling
-    // the daemon host (`flywheel kill`), else both ring (Phase 3 ends this).
     let loaded = crate::config::Config::load().ok();
-    // Comms flag: the pane writer is the inbox host inside THIS loop (wake
-    // line, real watermark). A daemon host does not run it, so deferring to
-    // one would leave the workspace with no writer: run the local loop.
     let comms_on = match &loaded {
         Some(c) => crate::comms_send::enabled(c),
         None => toron_core::inbox::enabled(),
@@ -886,11 +815,6 @@ pub fn ensure_running(
         );
     }
     let cfg_url = loaded.and_then(|c| c.doorbell_url());
-    // bd-0gmw: a configured daemon that is down gets one pidfile-mode
-    // bring-up attempt (never launchctl bootstrap — persistence stays
-    // opt-in via `doorbell install`) before host resolution degrades us.
-    // Attached/Started → resolve_host below sees /health and defers;
-    // Degraded → fall through, embedded as today.
     if !comms_on
         && cfg_url.is_some()
         && let crate::daemon::DoorbellEnsure::Degraded { hint } =
@@ -911,8 +835,6 @@ pub fn ensure_running(
     }
     let path = pid_file(state_dir, workspace);
     let gen_path = gen_file(state_dir, workspace);
-    // Hash-aware: this caller holds `exe`, so the sha1 short-circuit of gap 10
-    // applies (mtime+len alone cannot tell a same-second rebuild apart).
     let action = inspect_lock_generation_with_hash(
         &path,
         &gen_path,
@@ -984,8 +906,6 @@ pub fn resolve_host(
     use doorbell_rt::lease::{deference_decision, live_leases};
     const DEFAULT_URL: &str = "http://127.0.0.1:18980";
     let now = doorbell_rt::lease::unix_now();
-    // Per-workspace lease probe: leases are per workspace (bd-ene2), so a
-    // live lease on another workspace must never refuse THIS one.
     let probe = target.and_then(|(_, ws)| {
         live_leases(state_dir, now)
             .into_iter()
@@ -993,8 +913,6 @@ pub fn resolve_host(
             .map(|(_, lease)| lease)
     });
     let resolve_at = |url: &str, configured: bool| -> DoorbellHost {
-        // bd-2zqk: keep the failure so the warning can name the real cause.
-        // A busy-but-alive daemon must not be reported as unreachable.
         let (health, health_err) = match daemon_health_probe(url) {
             Ok(v) => (Some(v), None),
             Err(e) => (None, Some(e)),
@@ -1004,8 +922,6 @@ pub fn resolve_host(
             (Some(_), None) => true,
             (None, _) => false,
         };
-        // Up but not hosting us is a real, common state (standby daemon,
-        // or a daemon armed for other workspaces). Name it and run local.
         if let (Some(v), Some((p, w))) = (&health, target)
             && !daemon_hosts(v, p, w)
         {
@@ -1020,16 +936,11 @@ pub fn resolve_host(
             },
             doorbell_rt::lease::Deference::TakeLease => {
                 if configured && health.is_none() {
-                    // bd-2zqk: say WHICH failure. "unreachable" plus "start a
-                    // daemon" was actively wrong for the two cases that matter
-                    // most — a busy daemon and a version mismatch — because the
-                    // daemon was already running.
                     let cause = health_err.map_or("unknown", |e| e.reason());
                     let remediation = match health_err {
                         Some(HealthProbeFailure::NotListening) | None => {
                             "remediation: doorbell start | doorbell install | flywheel daemon start"
                         }
-                        // Already listening: starting another daemon is wrong.
                         Some(_) => "no restart needed; re-probe, or check the daemon's version",
                     };
                     eprintln!(
@@ -1151,8 +1062,6 @@ pub fn daemon_health_probe(url: &str) -> Result<serde_json::Value, HealthProbeFa
     )
     .map_err(|_| HealthProbeFailure::NotListening)?;
     let mut raw = String::new();
-    // A read timeout here means the daemon IS there and busy. That is the whole
-    // point of the distinction: it must never be reported as unreachable.
     stream
         .read_to_string(&mut raw)
         .map_err(|_| HealthProbeFailure::ReadTimedOut)?;
@@ -1189,10 +1098,6 @@ pub fn fanout_now(
     out
 }
 
-// bd-drub: the heard-or-deaf tracker lives in ONE place now —
-// `doorbell_rt::HearTracker` (byte-identical to the struct + impl that stood
-// here). Only the tests still reach it through this path, so the re-export is
-// test-gated: in the bin build it would be an unused import.
 #[cfg(test)]
 pub use doorbell_rt::HearTracker;
 
@@ -1234,16 +1139,6 @@ pub fn save_wake_state(path: &Path, st: &WakeState) -> Result<()> {
     fs::write(path, json)?;
     Ok(())
 }
-
-// ---- bd-durable-doorbell-lngf: local supervisor --------------
-// The lazily-healed watcher is the LOW-LATENCY push path; the
-// schedule is the GUARANTEED path: the host server fires the supervisor
-// tick every minute whether or not any human touches flywheel. A tick that
-// lands while no worker is connected stays queued server-side and executes
-// at-least-once as soon as any flywheel process with this function
-// registered comes alive (the `[doorbell]` line keeps redelivery
-// idempotent). Server unreachable → the lazy fallback covers every
-// interactive invocation (subtract-before-you-add: no new daemon).
 
 /// Sidecar: which project owns a workspace dispatcher (written by
 /// `spawn_child`; the pid/gen files alone don't carry it).
@@ -1336,10 +1231,6 @@ pub fn audit_append(state_dir: &Path, workspace: &str, entry: serde_json::Value)
         line.push('\n');
         let _ = f.write_all(line.as_bytes());
     }
-    // This writer is the one that stays live for hours inside a dispatcher, so
-    // the file is the one that grows without end. Reuse the doorbell-rt tail
-    // rotation (5 MB / 4k lines) instead of trusting the append path to be
-    // bounded; before this, a single workspace audit file reached 17 MB.
     doorbell_rt::file_host::rotate_audit_if_oversized(&path);
 }
 
@@ -1387,8 +1278,6 @@ pub fn dead_audit_files(
             continue;
         };
         let path = entry.path();
-        // A dispatcher that still holds its pid owns the file, however old it
-        // looks; only a dead or absent pid makes the workspace a candidate.
         if read_pid(&pid_file(state_dir, workspace)).is_some_and(&alive) {
             continue;
         }
@@ -1407,9 +1296,6 @@ pub fn dead_audit_files(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        // gc/one-rule (bd-io2ws): the verdict is the SAME pure decision the
-        // daemon's hourly prune uses. This door keeps its own horizon (an
-        // operator may ask for 30 days) and its own listing.
         let project_gone = read_project_sidecar(state_dir, workspace)
             .is_some_and(|p| Path::new(&p).is_absolute() && !Path::new(&p).exists());
         let Some(abandon) = doorbell_rt::store::audit_abandon_reason(
@@ -1436,11 +1322,6 @@ pub fn dead_audit_files(
     out
 }
 
-// Pins addressed by this watch line: `p`/`assignee` (pin or npub) plus
-// kind-9 `@pin` in content (live posts do both; `p` is npub).
-
-// Second reducers deleted per bd-3wzl.
-// Live dispatcher now routes every watch/status edge through `workspace::tick` (tick(&WorkspaceModel, &Msg)).
 /// Tests below port the same scenarios to `workspace::tick` (see `sc_d1_*`).
 /// hc-mock: stdin watch lines + pin statuses → JSON injects via tick (no second reducer).
 pub fn once_json(stdin: &str, status_by_pin: &BTreeMap<String, String>) -> String {
@@ -1472,8 +1353,6 @@ pub fn once_json(stdin: &str, status_by_pin: &BTreeMap<String, String>) -> Strin
     }
     serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into())
 }
-
-// ---- bd-yw4s: doorbell journal — the `doorbell why` trust surface --------
 
 /// Workspace-tick journal entry writer. `pins` is the inject-relevant pin set
 /// (bd-z54w honesty contract): the fold restores the SelfIndex from it so
@@ -1856,14 +1735,6 @@ pub enum CrossScopeDeny {
     Store(doorbell_rt::subscribe::Refusal),
 }
 
-// A test-only external-unblock sweep used to live here, with its own
-// `br`-shaped command seam and `parse_external_corr` copy. It is deleted: the
-// live path is `doorbell_rt::pollers::spawn_external_rering` (called from
-// `src/doorbell_host.rs`), whose `detect_external_closed` covers the same corr
-// parse plus fire-once, and which refuses ids containing a quote. The copy
-// also resolved the hold itself — a job the live poller deliberately leaves to
-// the waiter — so keeping it risked two answers to one question.
-
 #[cfg(test)]
 pub fn journal_append(
     state_dir: &Path,
@@ -1892,9 +1763,6 @@ pub fn journal_append(
     {
         let _ = writeln!(f, "{entry}");
     }
-    // F8: no second retention impl here — rotation plus audit lives in
-    // doorbell-rt FileStore (RETENTION_LINES/BYTES). Legacy silent head-trim
-    // deleted; live path uses journal_append_workspace via the store.
 }
 
 /// One journaled tick: the Msg in, the Actions out, what the effect layer
@@ -1994,8 +1862,6 @@ mod tests {
             let dir = dir.clone();
             let ok = ok.clone();
             handles.push(std::thread::spawn(move || {
-                // A distinct line per thread, so the same-second ratchet is
-                // not what refuses the extra injects.
                 if super::inject_wake_in(
                     &dir,
                     "proj",
@@ -2035,14 +1901,12 @@ mod tests {
             matches!(host_for(false, daemon), DoorbellHost::Proxy { .. }),
             "flag off: deference to a healthy daemon host, unchanged"
         );
-        // The resolver is not even asked under the flag.
         let mut asked = false;
         let _ = host_for(true, || {
             asked = true;
             DoorbellHost::Embedded
         });
         assert!(!asked);
-        // And the command path goes through it.
         let cmd = include_str!("cmd/doorbell.rs");
         assert!(cmd.contains("crate::doorbell::host_for(comms_on"));
     }
@@ -2177,7 +2041,6 @@ mod tests {
     #[test]
     fn sc_d3_queue_coalesces_per_class() {
         let mut q = DoorbellQueue::default();
-        // Same hint coalesces (per-channel key, same Pull)
         q.push(EventClass::Channel, doorbell_line(EventClass::Channel, "a"));
         q.push(EventClass::Channel, doorbell_line(EventClass::Channel, "a"));
         q.push(EventClass::Job, doorbell_line(EventClass::Job, "j"));
@@ -2190,7 +2053,6 @@ mod tests {
             "line is a doorbell, got {}",
             drained[0].1
         );
-        // Different channels keep both lines (gap 6 fix: per-channel)
         let mut q2 = DoorbellQueue::default();
         q2.push(
             EventClass::Channel,
@@ -2266,10 +2128,6 @@ mod tests {
 
     #[test]
     fn sc_d1_kind9_at_pin_is_routine_without_prompt_when_idle() {
-        // bd-l72k supersedes the old inject: addressed kind-9 still routes
-        // at the edge (doorbell::classify unchanged) but workspace triage
-        // demotes it to routine — zero prompts, counters only.
-        // Ported to workspace::tick per bd-3wzl — no second reducer
         let mut model = crate::workspace::WorkspaceModel::default();
         model
             .doorbell
@@ -2280,8 +2138,6 @@ mod tests {
             .statuses
             .insert("LilacChapel".into(), "idle".into());
         model.doorbell.index = SelfIndex::from_pins(["BlueRidge", "LilacChapel"]);
-        // D3 (bd-s8bo): hc idle is evidence, never authority — the exact
-        // Idle verdict below is what lets the Prompt through the gate.
         model.presence.insert(
             "BlueRidge".into(),
             crate::workspace::Presence::from_str("idle"),
@@ -2325,10 +2181,6 @@ mod tests {
         let mut status = BTreeMap::new();
         status.insert("BlueRidge".into(), "idle".into());
         status.insert("LilacChapel".into(), "idle".into());
-        // D3 (bd-s8bo): the once/debug path carries no presence authority,
-        // so hc-only idle stays silent for every pin — mentioned or not.
-        // Mention routing with authority is covered at tick level by
-        // sc_d1_kind9_at_pin_injects_when_idle.
         let json = once_json(kind9_at_blueridge(), &status);
         assert_eq!(
             json, "[]",
@@ -2338,18 +2190,12 @@ mod tests {
 
     #[test]
     fn once_json_seeds_statuses_via_plane_tick() {
-        // bd-adr0027-proven-leftovers-55nx.10 RED: statuses must enter via
-        // Msg::PlaneStatus ticks, never via direct map assign. (Needle is
-        // split so this source-scan does not match its own literal.)
         let src = include_str!("doorbell.rs");
         let needle = ["model.doorbell.statuses ", "= status_by_pin"].concat();
         assert!(
             !src.contains(&needle),
             "RED: once_json still map-assigns statuses; tick Msg::PlaneStatus instead"
         );
-        // Behavioral: working pin must queue (no prompt). D3 (bd-s8bo):
-        // hc idle alone never prompts (never trusted) — the once/debug
-        // path carries no presence authority, so idle stays silent too.
         let mut working = BTreeMap::new();
         working.insert("BlueRidge".into(), "working".into());
         let json = once_json(kind9_at_blueridge(), &working);
@@ -2365,8 +2211,6 @@ mod tests {
 
     #[test]
     fn s_proof_why_producer_journal_path() {
-        // zfnx.9 producer contract: journal path is
-        // state_dir/journals/doorbell-journal-{workspace}.jsonl.
         let dir = std::env::temp_dir().join(format!("fw-sproof-path-{}", std::process::id()));
         let path = journal_file(&dir, "ws1");
         assert_eq!(
@@ -2397,11 +2241,7 @@ mod tests {
             )
             .unwrap();
         }
-        // A dispatcher whose label is not the canonical one still belongs to
-        // the project its sidecar names.
         std::fs::write(dir.join("doorbell").join("adrx1.project"), "beads").unwrap();
-        // A project with only an unanswered file (no journal yet) is claimed
-        // by the canonical label: that file is created before the first wake.
         std::fs::write(
             dir.join("doorbell")
                 .join("flywheel-elm-effect-rs.unanswered"),
@@ -2429,9 +2269,6 @@ mod tests {
 
     #[test]
     fn s_proof_why_fold_reproduces_cmds() {
-        // zfnx.9: fold tick from Default over journal entries reproduces the
-        // recorded Vec<Cmd> — the why trust surface. Uses an index-free
-        // Receipt msg so the fold is exact (see gap note below).
         let dir = std::env::temp_dir().join(format!("fw-sproof-cmds-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let msg = crate::workspace::Msg::Receipt {
@@ -2478,8 +2315,6 @@ mod tests {
 
     #[test]
     fn s_proof_why_fold_reproduces_prompt_with_pins() {
-        // zfnx.9 + bd-z54w: exact Vec<Cmd> reproduction INCLUDING a Prompt —
-        // the journaled pin set restores the fold index deterministically.
         let dir = std::env::temp_dir().join(format!("fw-sproof-prompt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let pins = vec!["BlueRidge".to_string()];
@@ -2493,8 +2328,6 @@ mod tests {
         };
         let (seeded, _) = crate::workspace::tick(&model, &idle);
         model = seeded;
-        // D3 (bd-s8bo): the Prompt needs presence authority; journal the
-        // Presence msg so the replay fold reproduces it exactly.
         let presence = crate::workspace::Msg::Presence {
             pin: "BlueRidge".into(),
             state: "idle".into(),
@@ -2502,9 +2335,6 @@ mod tests {
         let (seeded, _) = crate::workspace::tick(&model, &presence);
         model = seeded;
         let msg = crate::workspace::Msg::WatchNdjson {
-            // bd-l72k: only urgent lines deliver prompts — seed the
-            // round-trip with an urgent wake so the fold still proves
-            // Prompt reproduction (routine wakes are silent by design).
             line: r#"{"kind":14,"id":"u1","tags":[["p","BlueRidge"],["toron-kind","request-release"]],"content":"release?"}"#.to_string(),
         };
         let (next, cmds) = crate::workspace::tick(&model, &msg);
@@ -2531,8 +2361,6 @@ mod tests {
         let mut folded = crate::workspace::WorkspaceModel::default();
         for (workspace, entry) in &entries {
             assert_eq!(workspace, "ws1");
-            // Same seeding rule as cmd_doorbell_why: pins restore the index,
-            // missing pins keep Unknown semantics.
             if let Some(ps) = entry.get("pins").and_then(|p| p.as_array()) {
                 for pin in ps.iter().filter_map(|v| v.as_str()) {
                     folded.doorbell.index.insert_pin(pin.to_string(), None);
@@ -2554,10 +2382,6 @@ mod tests {
 
     #[test]
     fn edge_triage_journal_roundtrip_full_cycle() {
-        // bd-l72k E2E (pure level): fixture journal (benign + routine +
-        // captain + urgent) through file round-trip, refolded from Default
-        // with pins restoring the index — markers advance, the digest
-        // drains the captain set, only the urgent row injects.
         use crate::workspace::{Cmd, Msg, WorkspaceModel};
         let dir = std::env::temp_dir().join(format!("fw-edge-journal-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2621,7 +2445,6 @@ mod tests {
             "urgent row recorded once: {:?}",
             model.wake.digests
         );
-        // Refold from Default: every recorded Cmd sequence reproduces.
         let entries = journal_read_all(&dir);
         assert_eq!(entries.len(), 6, "presence+idle+4 rows round-trip");
         let mut folded = WorkspaceModel::default();
@@ -2657,7 +2480,6 @@ mod tests {
             "markers advance on refold: {:?}",
             folded.wake_counters
         );
-        // Digest drains on a now-bearing beat.
         let (drained, cmds) = crate::workspace::tick(&folded, &Msg::Tick { now: 1_000_000 });
         assert!(
             cmds.iter().any(|c| matches!(c, Cmd::Digest { .. })),
@@ -2673,9 +2495,6 @@ mod tests {
     #[test]
     #[ignore = "bd-l72k LIVE probe: needs live toron daemon + flywheel project + TurquoiseSparrow pin"]
     fn edge_triage_live_probe_urgent_only_injects() {
-        // bd-l72k AC(2): a live pin receiving benign room noise plus one
-        // urgent mail shows only the urgent injection through
-        // workspace::tick. Run explicitly; never in CI.
         use std::process::Command;
         let proj = "flywheel";
         let pin = "TurquoiseSparrow";
@@ -2696,7 +2515,6 @@ mod tests {
             );
             String::from_utf8_lossy(&out.stdout).to_string()
         };
-        // Benign room noise on a scratch channel (create/join idempotent).
         run(&[
             "channel",
             "create",
@@ -2728,7 +2546,6 @@ mod tests {
             "--body",
             &format!("benign noise {marker}"),
         ]);
-        // One urgent plane-P mail to self.
         run(&[
             "mail",
             "send",
@@ -2745,7 +2562,6 @@ mod tests {
             "--importance",
             "urgent",
         ]);
-        // Capture the benign line live off the bus.
         let mut benign_line = None;
         for _ in 0..3 {
             let out = run(&[
@@ -2776,7 +2592,6 @@ mod tests {
             }
         }
         let benign_line = benign_line.expect("live probe must observe its benign post");
-        // Pull the urgent row live from the inbox.
         let mut urgent_row: Option<serde_json::Value> = None;
         for _ in 0..5 {
             let out = Command::new("flywheel")
@@ -2805,7 +2620,6 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
         let urgent_row = urgent_row.expect("live probe must observe its urgent mail");
-        // Both through the triage tick with presence authority.
         let mut model = crate::workspace::WorkspaceModel::default();
         model.doorbell.index = SelfIndex::from_pins([pin.to_string()]);
         model
@@ -2850,8 +2664,6 @@ mod tests {
 
     #[test]
     fn s_proof_why_fold_without_pins_never_invents_idle() {
-        // Entries lacking pins (pre-field journals) fold with Unknown-presence
-        // semantics: a kind-9 mention for an unknown pin stays silent.
         let mut folded = crate::workspace::WorkspaceModel::default();
         let m = crate::workspace::Msg::WatchNdjson {
             line: kind9_at_blueridge().to_string(),
@@ -2867,7 +2679,6 @@ mod tests {
 
     #[test]
     fn sc_d3_working_queues_then_drains_on_idle() {
-        // Ported to workspace::tick per bd-3wzl
         let mut model = crate::workspace::WorkspaceModel::default();
         model
             .doorbell
@@ -2889,8 +2700,6 @@ mod tests {
             .collect();
         assert!(prompts.is_empty(), "working pin must not inject");
         assert_eq!(next.doorbell.queues.get("BlueRidge").map(Vec::len), Some(1));
-        // D3 (bd-s8bo): the drain needs presence authority; hc idle
-        // alone stays Unknown and silent.
         let mut next = next;
         next.presence.insert(
             "BlueRidge".into(),
@@ -2926,11 +2735,6 @@ mod tests {
 
     #[test]
     fn sc_d1_kind9_npub_p_tag_rings_pin() {
-        // bd-l72k: plain kind-9 no longer delivers, so npub resolution is
-        // proven through an urgent (ack-sla-expired) line — the resolution
-        // mechanism (SelfIndex npub lookup) is identical. (bd-v8vi:
-        // mail-delivered now rings routine, so it can no longer serve as
-        // the urgent vehicle here.)
         let npub = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
         let line = format!(
             r#"{{"kind":9,"id":"ab","tags":[["p","{npub}"],["toron-kind","ack-sla-expired"],["h","steer-x"]],"content":"sealed"}}"#
@@ -2948,7 +2752,6 @@ mod tests {
             .statuses
             .insert("LilacChapel".into(), "idle".into());
         model.doorbell.index = index;
-        // D3 (bd-s8bo): exact Idle verdict required; hc idle alone is evidence.
         model.presence.insert(
             "BlueRidge".into(),
             crate::workspace::Presence::from_str("idle"),
@@ -2973,8 +2776,6 @@ mod tests {
 
     #[test]
     fn sc_d1_kind9_at_pin_in_content_rings_without_pin_p_tag() {
-        // bd-l72k: content-@mention routing is proven at the routing seam
-        // (watch_targets) — plain kind-9 ticks no longer deliver prompts.
         let npub = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
         let line = format!(
             r#"{{"kind":9,"id":"ab","tags":[["p","{npub}"],["h","steer-x"]],"content":"@BlueRidge take the repro"}}"#
@@ -2985,12 +2786,10 @@ mod tests {
             .statuses
             .insert("BlueRidge".into(), "idle".into());
         model.doorbell.index = SelfIndex::from_pins(["BlueRidge"]);
-        // D3 (bd-s8bo): exact Idle verdict required; hc idle alone is evidence.
         model.presence.insert(
             "BlueRidge".into(),
             crate::workspace::Presence::from_str("idle"),
         );
-        // also insert npub mapping so p-tag resolves but content also rings
         model
             .doorbell
             .index
@@ -3019,15 +2818,9 @@ mod tests {
 
     #[test]
     fn plane_p_urgent_injects_when_idle() {
-        // bd-adr0027-proven-leftovers-55nx.2: ported from the deleted
-        // apply_inbox_json second reducer to the live path —
-        // workspace::tick + Msg::InboxRows. Statuses enter as PlaneStatus
-        // Msgs, never a side map.
         use crate::workspace::{Msg, WorkspaceModel};
         let mut model = WorkspaceModel::default();
         model.doorbell.index.insert_pin("BlueRidge".into(), None);
-        // D3 (bd-s8bo): urgent still needs an exact Idle verdict; hc
-        // idle alone stays Unknown and silent.
         model.presence.insert(
             "BlueRidge".into(),
             crate::workspace::Presence::from_str("idle"),
@@ -3069,7 +2862,6 @@ mod tests {
 
     #[test]
     fn inbox_high_water_reads_created_ts_us_from_live_json() {
-        // Live ToJson emits created_ts_us (i64 micros), not created_ts RFC3339.
         let us = chrono::DateTime::parse_from_rfc3339("2026-08-20T00:00:02Z")
             .unwrap()
             .timestamp_micros();
@@ -3098,21 +2890,18 @@ mod tests {
     fn budget_rolls_after_window() {
         let mut budgets = BTreeMap::new();
         budgets.insert("BlueRidge".into(), PinBudget::new(1, 1, 0));
-        // First prompt at t=0 consumes the single token
         let out = take_allowed(
             vec![("BlueRidge".into(), "[doorbell] a".into())],
             &mut budgets,
             0,
         );
         assert_eq!(out.len(), 1);
-        // Second prompt at t=10 still within window → blocked
         let out = take_allowed(
             vec![("BlueRidge".into(), "[doorbell] b".into())],
             &mut budgets,
             10,
         );
         assert!(out.is_empty(), "still within 1m window");
-        // After 70s (1m+ window) the bucket refills → allowed again
         let out = take_allowed(
             vec![("BlueRidge".into(), "[doorbell] c".into())],
             &mut budgets,
@@ -3156,7 +2945,6 @@ mod tests {
         assert_eq!(dispatcher_token(&dir, "w1"), "down");
         write_pid(&pid_file(&dir, "w1"), std::process::id()).expect("live");
         assert_eq!(dispatcher_token(&dir, "w1"), "up");
-        // Don't stop() while the pid file names this test process.
         clear_pid(&pid_file(&dir, "w1"));
         assert_eq!(dispatcher_token(&dir, "w1"), "absent");
         let _ = std::fs::remove_dir_all(&dir);
@@ -3278,8 +3066,6 @@ mod tests {
         assert_eq!(watch_pubkey(line).as_deref(), Some("aabbcc"));
     }
 
-    // ---- bd-stale-doorbell-wake-0fic: watcher generation / self-retire ----
-
     fn scratch(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("fw-gen-{name}-{}", std::process::id()));
         let _ = fs::create_dir_all(d.join("doorbell"));
@@ -3309,7 +3095,6 @@ mod tests {
         let record = WatcherGen::capture(&exe, 100).expect("capture");
         assert!(!record.stale(&exe), "unchanged binary is live");
         assert!(inject_allowed(&record, &exe));
-        // Rebuild: different length (and near-certainly mtime).
         fs::write(&exe, b"v2-longer").expect("rebuild");
         assert!(record.stale(&exe), "changed binary must read stale");
         assert!(
@@ -3455,8 +3240,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ---- bd-durable-doorbell-lngf: durable wake state + heal scope --------
-
     /// Wake state round-trips through disk: since_by_pin high-waters + the
     /// last-wake stamp survive a dispatcher crash (at-least-once redelivery
     /// reads the same file on restart).
@@ -3538,7 +3321,6 @@ mod tests {
 
     #[test]
     fn gs006_mail_delivered_kind9_is_mail_not_channel() {
-        // NIP-17 gift-wrap wake: kind 9 + toron-kind=mail-delivered must pull mail, not channel.
         let line = r#"{"kind":9,"id":"aa","tags":[["p","BlueRidge"],["t","flywheel"],["toron-kind","mail-delivered"],["h","thread-123"]],"content":"sealed"}"#;
         let (class, hint) = parse_watch_ndjson(line, &SelfIndex::from_pins(["BlueRidge"]))
             .expect("mail-delivered must ring");
@@ -3571,22 +3353,18 @@ mod tests {
             "BrightBadger".into(),
             Some("699d97318e69efb667767a917972bebf396d63a10bd6d68bec01e698a903b746".into()),
         );
-        // Exact shape of a verified live post (event 17baed1e).
         let line = r#"{"kind":9,"id":"17baed1e20b74f424c1c2117bdf7b0b334d928bec923b7194c46cf33116b8b49","tags":[["h","steer-flywheel"],["t","flywheel"],["p","699d97318e69efb667767a917972bebf396d63a10bd6d68bec01e698a903b746"]],"content":"@BrightBadger wake probe4 bd-pe5o"}"#;
         let (class, _) = parse_watch_ndjson(line, &index).expect("mention post must ring");
         assert_eq!(class, EventClass::Channel);
-        // Content-only path (no p tag): @mention in the body still addresses.
         let bare = r#"{"kind":9,"id":"cc","tags":[["h","steer-flywheel"],["t","flywheel"]],"content":"@BrightBadger ping"}"#;
         let (class, _) = parse_watch_ndjson(bare, &index).expect("@mention must ring");
         assert_eq!(class, EventClass::Channel);
-        // Unknown pin, no mention: room chatter stays silent.
         let chatter = r#"{"kind":9,"id":"dd","tags":[["h","steer-flywheel"],["t","flywheel"]],"content":"hello room"}"#;
         assert!(parse_watch_ndjson(chatter, &index).is_none());
     }
 
     #[test]
     fn gs006_kind39002_join_leave_rings_when_addressed() {
-        // 39002 join/leave: when p-tag addresses self, doorbell must ring (subscribe + classify).
         let line = r#"{"kind":39002,"id":"bb","tags":[["p","BlueRidge"],["t","flywheel"]],"content":"join"}"#;
         let (class, _) = parse_watch_ndjson(line, &SelfIndex::from_pins(["BlueRidge"]))
             .expect("39002 must ring when addressed");
@@ -3626,7 +3404,6 @@ mod tests {
             &actions,
             serde_json::json!({"stage":"drain"}),
         );
-        // corrupt line must be skipped, not fatal
         let path = journal_file(&dir, "w1");
         use std::io::Write as _;
         let mut f = std::fs::OpenOptions::new()
@@ -3662,8 +3439,6 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dblwhy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(dir.join("journals"));
-        // Contiguous through 3, then 10: six values (4..=9) never written, and
-        // the row AT the tear plus everything after it is unreachable from here.
         let mut body = String::new();
         for seq in [1u64, 2, 3, 10, 11] {
             body.push_str(&format!(
@@ -3693,13 +3468,10 @@ mod tests {
 
     #[test]
     fn journal_v1_v2_fold_and_v3_refusal() {
-        // v1 (legacy, no seq) and v2 (subscriber + budget rows) both fold;
-        // v3+ refuses loudly (bd-asr2.9 D4.1).
         assert!(journal_version_accepted(&serde_json::json!({})));
         assert!(journal_version_accepted(&serde_json::json!({"v": 1})));
         assert!(journal_version_accepted(&serde_json::json!({"v": 2})));
         assert!(!journal_version_accepted(&serde_json::json!({"v": 3})));
-        // Mixed v1+v2 lines fold together through the store.
         let dir = std::env::temp_dir().join(format!("dbll-v12-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = doorbell_rt::FileStore::new(&dir);
@@ -3720,7 +3492,6 @@ mod tests {
 
     #[test]
     fn roster_scoped_rows_and_render() {
-        // E2 shape: P's digest carries Q's row (scope-bound roster).
         let pins = vec![
             ("P".to_string(), "pi".to_string()),
             ("Q".to_string(), "pi".to_string()),
@@ -3732,11 +3503,9 @@ mod tests {
         beads.insert("Q".to_string(), "bd-1".to_string());
         let rows = build_roster(&pins, &roles, &presence, &beads, 1000);
         assert_eq!(rows.len(), 2);
-        // P (no presence): unknown, never invent-green.
         assert_eq!(rows[0].state, "unknown");
         assert_eq!(rows[0].recency_secs, None);
         assert_eq!(rows[0].role, "");
-        // Q carries everything the digest needs.
         assert_eq!(rows[1].role, "coder");
         assert_eq!(rows[1].state, "working");
         assert_eq!(rows[1].recency_secs, Some(100));
@@ -3748,7 +3517,6 @@ mod tests {
 
     #[test]
     fn nearby_join_keeps_unbound_panes_and_holds() {
-        // BoardAgent had no registry pin — nearby must still list the pane.
         let registry = vec![(
             "QuietHeron".to_string(),
             "wP:p2".to_string(),
@@ -3840,8 +3608,6 @@ mod tests {
 
     #[test]
     fn cron_tick_wake_journals_fact_row() {
-        // bd-asr2.16: the sink writes a fact_pending journal row (plus a
-        // dispatcher pending-fact entry — same helper production arms use).
         let dir = std::env::temp_dir().join(format!("dbll-cron-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let msg = crate::workspace::Msg::Fact {
@@ -3865,9 +3631,6 @@ mod tests {
 
     #[test]
     fn cron_sink_flag_off_writes_nothing() {
-        // bd-asr2.16: without the flag, tick completion is a silent no-op.
-        // Hermetic home. The compiled default is on, so this file sets the
-        // opt-out. The gate must return before any write path.
         let _home = crate::config::test_state_home();
         let cfg_dir = crate::config::config_dir();
         std::fs::create_dir_all(&cfg_dir).expect("cfg dir");
@@ -3909,7 +3672,6 @@ mod tests {
 
     #[test]
     fn emit_authorize_matrix() {
-        // bd-asr2.17: ok / unknown service / bad token / scope deny.
         let m = emit_services();
         assert_eq!(authorize_emit(&m, "ci", "tok-ci-1", "captain"), Ok(6));
         assert_eq!(
@@ -3928,7 +3690,6 @@ mod tests {
 
     #[test]
     fn emit_revoked_service_refused() {
-        // bd-asr2.17: revocation = entry deleted -> UnknownService.
         let mut m = emit_services();
         m.remove("ci");
         assert_eq!(
@@ -3939,7 +3700,6 @@ mod tests {
 
     #[test]
     fn emit_wake_journals_service_row() {
-        // bd-asr2.17: admitted emit leaves a stage=emit Fact row.
         let tmp = tempfile::tempdir().expect("state dir");
         let dir = tmp.path().to_path_buf();
         service_emit_wake_in(&dir, "proj", "ci", "captain");
@@ -3979,7 +3739,6 @@ mod tests {
 
     #[test]
     fn cross_widen_many_deduped() {
-        // bd-asr2.18: explicit extra workspace -> Scope::Many, deduped.
         let dir = std::env::temp_dir().join(format!("dbll-xw-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         seed_home_sub(&dir, "wA", "P");
@@ -3993,7 +3752,6 @@ mod tests {
 
     #[test]
     fn cross_widen_refusals() {
-        // bd-asr2.18: flag off / non-operator / missing sub refuse.
         let dir = std::env::temp_dir().join(format!("dbll-xwref-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         seed_home_sub(&dir, "wA", "P");
@@ -4014,10 +3772,6 @@ mod tests {
 
     #[test]
     fn inject_journals_row_and_queues_wake() {
-        // D8/bd-woha: console inject lands a stage=inject Fact row in the
-        // named scope journal plus one pending wake. Journal, budget and
-        // pending queue all live in the temp state dir; the operator's real
-        // `facts/` is never touched (it used to be written, then removed).
         let tmp = tempfile::tempdir().expect("state dir");
         let dir = tmp.path().to_path_buf();
         let proj = "inject-probe";
@@ -4041,7 +3795,6 @@ mod tests {
 
     #[test]
     fn inject_ratchet_refuses_same_second_dup() {
-        // D8: identical pin+line within one unix second refuses.
         let tmp = tempfile::tempdir().expect("state dir");
         let dir = tmp.path().to_path_buf();
         let proj = "inject-probe-r";
@@ -4050,13 +3803,11 @@ mod tests {
             inject_wake_in(&dir, proj, "manual", "P", "hello", 1_700_000),
             Err(InjectDeny::Ratchet)
         );
-        // Next second: admitted (budget still has room).
         inject_wake_in(&dir, proj, "manual", "P", "hello", 1_700_001).expect("next second");
     }
 
     #[test]
     fn inject_budget_denies_fourth_in_window() {
-        // D8: 3 per 1800s rolling; the 4th refuses, spend is persisted.
         let tmp = tempfile::tempdir().expect("state dir");
         let dir = tmp.path().to_path_buf();
         let proj = "inject-probe-b";
@@ -4075,7 +3826,6 @@ mod tests {
             inject_wake_in(&dir, proj, "manual", "P", "m3", 1_700_030),
             Err(InjectDeny::Budget)
         );
-        // Window rolls: t+1801 admits again.
         inject_wake_in(&dir, proj, "manual", "P", "later", 1_700_000 + 1801).expect("rolled");
     }
 
@@ -4087,7 +3837,6 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dbll-audit-dead-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // Bind-drop: guaranteed RST, no timing flake.
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
         drop(l);
@@ -4150,12 +3899,7 @@ mod bd_2zqk_health_probe_tests {
     /// budget back under the tail.
     #[test]
     fn the_probe_budget_clears_the_measured_daemon_tail() {
-        let measured_tail_ms: u64 = 506; // observed max latency of /health
-        // 3x the observed tail is the margin. Not 4x: this sits on the session
-        // door, so the worst case has to stay bounded for an operator waiting on
-        // `arrive`, and 2s already clears every latency we have actually
-        // measured. Do not shrink it, and do not inflate the production timeout
-        // just to satisfy a threshold — raise the bar here only with evidence.
+        let measured_tail_ms: u64 = 506;
         assert!(
             HEALTH_READ_TIMEOUT_MS >= 3 * measured_tail_ms,
             "read budget {HEALTH_READ_TIMEOUT_MS}ms must clear 3x the measured {measured_tail_ms}ms \
@@ -4209,7 +3953,6 @@ mod bd_2zqk_health_probe_tests {
     #[test]
     fn a_dead_port_reports_not_listening_promptly() {
         let started = std::time::Instant::now();
-        // Port 1 is reserved and nothing listens on it.
         let err = daemon_health_probe("http://127.0.0.1:1").expect_err("must fail");
         assert_eq!(err, HealthProbeFailure::NotListening);
         assert!(
@@ -4325,14 +4068,12 @@ mod audit_gc_tests {
         let now = SystemTime::now();
         let now_secs = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
 
-        // 1. Vanished absolute project path, FRESH file.
         write_audit(dir.path(), "project-gone");
         std::fs::write(
             project_sidecar(dir.path(), "project-gone"),
             "/tmp/gone-forever-io2ws",
         )
         .unwrap();
-        // 2. Bare project name, idle 40 days.
         write_audit(dir.path(), "idle");
         std::fs::write(project_sidecar(dir.path(), "idle"), "idle").unwrap();
         let old = now - Duration::from_secs(40 * 86_400);
@@ -4340,7 +4081,6 @@ mod audit_gc_tests {
             .unwrap()
             .set_modified(old)
             .unwrap();
-        // 3. Young, no sidecar.
         write_audit(dir.path(), "young");
 
         let found = dead_audit_files(dir.path(), 30, now, |_| false);
@@ -4441,7 +4181,6 @@ mod bd_gefp_host_exit_tests {
         let ws = "flywheel-scratch-100927";
         let mut seen = 0u32;
 
-        // Present and Unreadable are both "keep running".
         assert_eq!(
             host_exit_check(&dir, ws, &mut seen, WorkspacePresence::Present),
             None
@@ -4456,7 +4195,6 @@ mod bd_gefp_host_exit_tests {
             None,
             "one Gone is a plane hiccup, not an exit"
         );
-        // A present read resets the streak: absence must be CONSECUTIVE.
         assert_eq!(
             host_exit_check(&dir, ws, &mut seen, WorkspacePresence::Present),
             None
@@ -4474,7 +4212,6 @@ mod bd_gefp_host_exit_tests {
             .expect("WORKSPACE_GONE_STREAK consecutive Gone reads retire the host");
         assert_eq!(reason, "workspace-gone");
 
-        // It journaled WHY, in the audit channel for this workspace.
         let store = doorbell_rt::FileStore::new(dir.clone());
         let audit = std::fs::read_to_string(store.audit_file(ws))
             .expect("the exit reason must be journaled, not just printed");
@@ -4506,8 +4243,6 @@ mod bd_gefp_host_exit_tests {
         let dir = scratch("scripted");
         let ws = "flywheel-scratch-scripted";
         let mut seen = 0u32;
-        // Script: Gone, Unreadable, Gone, Gone, Present, Gone, Gone, Gone.
-        // Only the final three consecutive Gone retire.
         let script = [
             WorkspacePresence::Gone,
             WorkspacePresence::Unreadable,
@@ -4535,7 +4270,6 @@ mod bd_gefp_host_exit_tests {
     /// eprintln) must not stay green.
     #[test]
     fn the_liveness_poll_calls_the_shared_exit_check() {
-        // Whitespace-collapsed so a reformat cannot make this vacuous.
         let src = include_str!("doorbell_host.rs")
             .split_whitespace()
             .collect::<Vec<_>>()

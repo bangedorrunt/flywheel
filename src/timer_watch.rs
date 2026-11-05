@@ -239,7 +239,6 @@ pub fn arm(
     if read_json::<Watch>(&path)?.is_some() {
         return Err(format!("timer {id} is already armed"));
     }
-    // A settled watch was pruned to done/; its intents still name the id.
     if done_path(root, project, id).exists() {
         return Err(format!("timer {id} is already settled"));
     }
@@ -320,8 +319,6 @@ pub fn sweep_at(
         let mut w = match serde_json::from_slice::<Watch>(&bytes) {
             Ok(w) => w,
             Err(e) => {
-                // Writes are tmp + rename, so a file that does not parse is
-                // not a half-written one. Move it aside and name it once.
                 let moved = move_to(&path, &bad_path(root, project, name));
                 errs.push(match moved {
                     Ok(()) => format!("{name}: {e} (moved to bad/)"),
@@ -331,7 +328,6 @@ pub fn sweep_at(
             }
         };
         if w.settled.is_some() {
-            // Settled before this sweep (or before pruning existed).
             if let Err(e) = move_to(&path, &done_path(root, project, &w.id)) {
                 errs.push(format!("{}: prune: {e}", w.id));
             }
@@ -386,8 +382,6 @@ fn fire_one(
         return Ok(true);
     }
     if !exec_allowed {
-        // The intent is the journal. A failed write leaves the watch open
-        // and sends nothing.
         intent.suppressed = true;
         write_json(&path, &intent)?;
         let line = format!("suppressed timer ring {key}: FLYWHEEL_ALLOW_EXEC=0");
@@ -401,9 +395,6 @@ fn fire_one(
         return Ok(true);
     }
     if intent.envelope.is_none() {
-        // Key first, then the envelope, both before append. A crash after
-        // `prepare` and before this write mints an epoch that never lands;
-        // the retry claims another. The append itself is never first.
         if !path.exists() {
             write_json(&path, &intent)?;
         }
@@ -761,10 +752,6 @@ mod tests {
             fail_appends: 0,
             epoch: 0,
         };
-        // early is before the deadline, late is after, bad is failed.
-        // One sweep sees all three. Drive them at different clocks via decide's inputs
-        // by sweeping twice: first at 100 (early=met, late=met because deadline==now, bad=failed).
-        // Split late onto its own dir clock by sweeping late after moving... simpler: two roots.
         assert_eq!(sweep_at(d.path(), "p", 100, true, &mut rec).unwrap(), 3);
         let texts: Vec<_> = rec
             .appended
@@ -848,7 +835,6 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let dir = d.path().join("timer").join("p");
         std::fs::create_dir_all(&dir).unwrap();
-        // Sorts before and after the good one, so either order is covered.
         std::fs::write(dir.join("a-bad.json"), b"{not json").unwrap();
         arm(d.path(), "p", "m1", "Buffy", 10, false).unwrap();
         std::fs::write(dir.join("z-bad.json"), b"[]").unwrap();
@@ -888,7 +874,6 @@ mod tests {
                 .unwrap_err()
                 .contains("already settled")
         );
-        // A settled file from before pruning: moved, nothing sent.
         let old = Watch {
             id: "old".into(),
             project: "p".into(),

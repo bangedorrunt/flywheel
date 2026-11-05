@@ -17,8 +17,6 @@ use toron_core::mailbox::{Corr, Receipt};
 
 const MESSAGING: &str = include_str!("../../toron/crates/toron-core/src/mailbox/messaging.rs");
 const MAIN: &str = include_str!("../src/main.rs");
-// The mail dispatcher (MailCmd + cmd_mail) migrated out of main.rs into
-// src/cmd/mail.rs (bd-hj3v), so the resend assertions read that module.
 const CMD_MAIL: &str = include_str!("../src/cmd/mail.rs");
 
 async fn test_store(tag: &str) -> (ReceiptStore, tempfile::TempDir) {
@@ -31,7 +29,6 @@ async fn test_store(tag: &str) -> (ReceiptStore, tempfile::TempDir) {
     (ReceiptStore::new(pool), dir)
 }
 
-// (1) D8 degraded state: typed, persisted, and monotonic.
 #[tokio::test]
 async fn adr0010_d8_degraded_state_roundtrip_and_guards() {
     let (store, _dir) = test_store("degraded").await;
@@ -51,7 +48,6 @@ async fn adr0010_d8_degraded_state_roundtrip_and_guards() {
         updated_at,
     };
 
-    // Roundtrip through sqlite.
     store
         .upsert(&base(ReceiptState::Degraded, 1))
         .await
@@ -59,7 +55,6 @@ async fn adr0010_d8_degraded_state_roundtrip_and_guards() {
     let got = store.get("C-8").await.expect("get").expect("found");
     assert_eq!(got.state, ReceiptState::Degraded);
 
-    // Degraded never downgrades to owed (never re-owes → never re-invites resend).
     store
         .upsert(&base(ReceiptState::Owed, 2))
         .await
@@ -70,7 +65,6 @@ async fn adr0010_d8_degraded_state_roundtrip_and_guards() {
         "degraded must not be dragged back to owed"
     );
 
-    // Resulted still wins over degraded (recovery path).
     store
         .set_resulted(
             &Corr::from_str("C-8").expect("corr"),
@@ -84,7 +78,6 @@ async fn adr0010_d8_degraded_state_roundtrip_and_guards() {
         ReceiptState::Resulted
     );
 
-    // Acked never downgrades to degraded (an ack is strictly more information).
     store
         .upsert(&Receipt {
             corr: "C-9".into(),
@@ -114,8 +107,6 @@ async fn adr0010_d8_degraded_state_roundtrip_and_guards() {
     );
 }
 
-// (2) The printed resend command is corr-preserving; the degraded note never
-// invites a resend.
 #[test]
 fn adr0010_d8_resend_guidance_names_corr_preserving_resend() {
     let g = resend_guidance(Some("C-1"));
@@ -151,20 +142,15 @@ fn adr0010_d8_degraded_note_never_invites_resend() {
     );
 }
 
-// (3) Wiring: the transport-unknown arm in send_message prints the resend
-// guidance (and rings the wake anyway — duplicate over silence); the
-// bookkeeping-failure arm records Degraded + the no-resend note.
 #[test]
 fn adr0010_d8_transport_unknown_arm_prints_resend_and_rings_wake() {
     assert!(
         MESSAGING.contains("resend_guidance"),
         "D8: send_message transport-unknown arm must print resend_guidance(corr)"
     );
-    // Duplicate over silence: the wake ring must not be skipped when the
-    // wrap may not have landed (D2 makes the duplicate safe).
     assert!(
-        MESSAGING.contains("duplicate over silence"),
-        "D8: the transport-unknown arm must document ringing the wake anyway (duplicate over silence)"
+        MESSAGING.matches("crate::mailbox::receipts::resend_guidance(").count() >= 2,
+        "D8: transport-unknown arms (publish failed) must both print resend_guidance(corr)"
     );
 }
 
@@ -180,8 +166,6 @@ fn adr0010_d8_bookkeeping_failure_records_degraded() {
     );
 }
 
-// (4) Flywheel sweep-side consumption: the receipts bridge maps `degraded`
-// (today it silently drops unknown states — the exact silence D8 forbids).
 #[test]
 fn adr0010_d8_upsert_workspace_receipt_maps_degraded() {
     assert!(
@@ -190,8 +174,6 @@ fn adr0010_d8_upsert_workspace_receipt_maps_degraded() {
     );
 }
 
-// (5) CLI error path: `flywheel mail resend --corr <c>` exists and refuses
-// the states where a resend would duplicate.
 #[test]
 fn adr0010_d8_mail_resend_command_refuses_duplicate_shaped_states() {
     assert!(
@@ -204,9 +186,6 @@ fn adr0010_d8_mail_resend_command_refuses_duplicate_shaped_states() {
     );
 }
 
-// (6) Runtime triad, producer side: corr-keyed send is idempotent — an
-// identical re-send is the Duplicate path (no new event, no second wake,
-// receipt untouched), so a duplicate wake through D2 is a no-op.
 #[tokio::test]
 async fn adr0010_d8_corr_send_duplicate_is_noop_and_receipt_survives() {
     use std::sync::Arc;
@@ -260,13 +239,10 @@ async fn adr0010_d8_corr_send_duplicate_is_noop_and_receipt_survives() {
     let first = mailbox.send_message(&msg()).await.expect("first send");
     assert_eq!(first.count, 1, "one delivery");
 
-    // Receipt recorded owed, corr-keyed.
     let store = mailbox.receipt_store().expect("receipt store");
     let r = store.get("FM-D8").await.expect("get").expect("receipt");
     assert_eq!(r.state, ReceiptState::Owed);
 
-    // Identical re-send (the crash-resume path): idempotent claim replays the
-    // FIRST delivery set — no new event, no second wake, receipt untouched.
     let second = mailbox.send_message(&msg()).await.expect("re-send");
     assert_eq!(second.count, 1, "duplicate replays, does not re-emit");
     assert_eq!(
@@ -284,7 +260,6 @@ async fn adr0010_d8_corr_send_duplicate_is_noop_and_receipt_survives() {
         "receipt state untouched by the duplicate"
     );
 
-    // Resulted is terminal even against a re-send's owed upsert.
     store
         .set_resulted(&Corr::from_str("FM-D8").expect("corr"), None, i64::MAX)
         .await

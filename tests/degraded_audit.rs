@@ -13,6 +13,8 @@ const DAEMON: &str = include_str!("../src/daemon.rs");
 const MAIN: &str = include_str!("../src/main.rs");
 const PANE: &str = include_str!("../src/pane.rs");
 const AGENTS: &str = include_str!("../AGENTS.md");
+const ORCHESTRATION: &str = include_str!("../docs/agent-instructions/orchestration.md");
+const CHANGELOG: &str = include_str!("../CHANGELOG.md");
 
 /// The survey ledger: (marker, disposition, fires-when). A marker removed
 /// from the code without updating this ledger fails here first.
@@ -67,7 +69,7 @@ fn degraded_audit_ledger_markers_present_in_code_or_docs() {
             "Recover operator" => "Recover { project",
             _ => unreachable!("ledger marker without a probe: {marker}"),
         };
-        let haystacks = [DOORBELL, DAEMON, MAIN, PANE, AGENTS];
+        let haystacks = [DOORBELL, DAEMON, MAIN, PANE, AGENTS, ORCHESTRATION, CHANGELOG];
         assert!(
             haystacks.iter().any(|h| h.contains(needle)),
             "{disposition} marker vanished without proof: {marker} (fires: {fires})"
@@ -77,9 +79,6 @@ fn degraded_audit_ledger_markers_present_in_code_or_docs() {
 
 #[test]
 fn degraded_audit_no_deletion_without_proof() {
-    // The ledger IS the proof registry: 7 rows, each with a disposition
-    // and a firing condition. An empty ledger (or a row without a
-    // condition) means the survey was skipped, not completed.
     assert_eq!(LEDGER.len(), 7, "survey covers all 7 markers");
     for (marker, disposition, fires) in LEDGER {
         assert!(

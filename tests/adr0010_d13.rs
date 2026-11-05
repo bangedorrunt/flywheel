@@ -57,8 +57,6 @@ fn adr0010_d13_observe_stop_and_todo_allowlist() {
 
 #[test]
 fn adr0010_d13_crew_exemption_env_marker_at_pane_split() {
-    // Crew panes are exempt: every terminal.run pane carries FLYWHEEL_ROLE=crew
-    // (the captain rides the root workspace env → enforced by default).
     assert!(
         SHIM.contains("FLYWHEEL_ROLE"),
         "pane.split env must carry the crew role marker"
@@ -81,9 +79,6 @@ fn adr0010_d13_template_standing_orders_are_defense_in_depth() {
 
 #[test]
 fn adr0010_d13_no_tracked_claude_only_deny_list() {
-    // NON-GOAL: no deny list in tracked settings that would disarm crewmates
-    // (a global settings deny applies to crew panes too). The fence is the
-    // role-aware matcher, nothing shipped into a harness settings file.
     assert!(
         !MAIN.contains(".claude/settings"),
         "no Claude settings deny list may ship from this bead"

@@ -162,20 +162,15 @@ pub fn detect_changes(
                 } else if old.updated_at != issue.updated_at {
                     delta.touched.push(issue.id.clone());
                 }
-                // A bead that was blocked and is now open+unblocked BECAME
-                // ready. One transition, one fact: a ready appearance
-                // outranks the weaker `updated` touch.
                 if prev.primed && ready_now && old.blocked && old.status == issue.status {
                     delta.ready_appeared.push(issue.id.clone());
                     delta.touched.retain(|t| t != &issue.id);
                 }
             }
-            // New row: a fresh open+unblocked bead is a ready appearance.
             None => {
                 if prev.primed && ready_now {
                     delta.ready_appeared.push(issue.id.clone());
                 }
-                // First pass (`!primed`) stays silent: it is the baseline.
             }
         }
         next.issues.insert(
@@ -240,15 +235,8 @@ fn readonly_query(db_path: &Path, sql: &str) -> Option<String> {
     );
     let mut cmd = std::process::Command::new(READONLY_ARGV0);
     if wal_sidecar(db_path).exists() {
-        // Live (or un-recovered) WAL: read through it plainly. A plain
-        // read-only open still works because a writer's -shm exists.
         cmd.arg("--readonly").arg(db_path);
     } else {
-        // Cleanly closed WAL db: the wal is gone, so every committed page
-        // lives in the main file, and `--readonly` cannot open it at all
-        // (SQLite may not create the missing -shm — found live 2026-10-04).
-        // immutable=1 reads exactly this state; it would read STALE with a
-        // wal present, which is why it is gated on the sidecar above.
         cmd.arg(format!(
             "file:{}?immutable=1",
             uri_escape(&db_path.to_string_lossy())
@@ -306,7 +294,6 @@ pub fn spawn_beads_poller(
             snapshot = next;
             for summary in delta.fact_summaries() {
                 if tx.send(crate::BrainMsg::Fact { summary }).await.is_err() {
-                    // Brain gone: report the edge death loudly, then exit.
                     let _ = tx
                         .send(crate::BrainMsg::Degraded {
                             source: task_name.clone(),
@@ -450,10 +437,8 @@ mod tests {
             corr: "c1".into(),
             expires_at: Some("2026-09-10T03:00:00Z".into()),
         }];
-        // Before expiry: silent.
         let (snap, d0) = detect_changes(&prev, &holds, &[], "2026-09-10T02:59:00Z");
         assert!(d0.is_empty());
-        // After expiry: exactly one Fact.
         let (_snap2, d1) = detect_changes(&snap, &holds, &[], "2026-09-10T03:00:30Z");
         assert_eq!(
             d1.expired_holds,
@@ -463,7 +448,6 @@ mod tests {
             d1.fact_summaries(),
             vec!["hold expired: bd-9x (corr c1)".to_string()]
         );
-        // Next pass: no re-fire (already expired in snapshot).
         let (_snap3, d2) = detect_changes(&_snap2, &holds, &[], "2026-09-10T03:01:00Z");
         assert!(d2.expired_holds.is_empty(), "expiry fires once");
     }
@@ -509,7 +493,6 @@ mod tests {
             vec!["bd-b".to_string()],
             "a fresh open+unblocked row is a ready appearance"
         );
-        // Second pass with only a timestamp bump: touch, not flip.
         let issues2 = vec![IssueRow {
             id: "bd-a".into(),
             status: "closed".into(),
@@ -530,9 +513,6 @@ mod tests {
         }
     }
 
-    // bd-ux-papercuts-t2u5: the ready-bead sensor. The first pass is a
-    // baseline (no restart spam); afterwards a new open+unblocked bead is
-    // exactly one `bead <id> ready` fact, and it never re-fires.
     #[test]
     fn ready_appearance_after_prime_fires_once() {
         let seed = vec![issue("bd-old", "closed", "t0", false)];
@@ -546,12 +526,10 @@ mod tests {
         let (snap2, d1) = detect_changes(&snap, &[], &board, "t2");
         assert_eq!(d1.ready_appeared, vec!["bd-new".to_string()]);
         assert_eq!(d1.fact_summaries(), vec!["bead bd-new ready".to_string()]);
-        // Same board next pass: silence — an appearance is a transition.
         let (_snap3, d2) = detect_changes(&snap2, &[], &board, "t3");
         assert!(d2.is_empty(), "appearance fires once: {d2:?}");
     }
 
-    // A bead that appears BLOCKED is not ready; the moment it unblocks it is.
     #[test]
     fn blocked_bead_is_silent_until_unblocked() {
         let (snap, _) = detect_changes(&Snapshot::default(), &[], &[], "t0");
@@ -565,7 +543,6 @@ mod tests {
         assert_eq!(d2.fact_summaries(), vec!["bead bd-x ready".to_string()]);
     }
 
-    // The first pass over an existing board must not announce it as new.
     #[test]
     fn prime_pass_does_not_announce_existing_board() {
         let board = vec![
@@ -606,11 +583,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // bd-ux-papercuts-t2u5, found live: a cleanly closed br leaves a WAL db
-    // with NO -shm, and SQLite refuses a read-only open of exactly that state
-    // ("unable to open database file") — every quiet project skipped every
-    // pass. The poller must read it via immutable=1, and must not
-    // materialize sidecars doing it.
     #[test]
     fn readonly_query_reads_cleanly_closed_wal_db() {
         let base = std::env::temp_dir().join(format!("dbll-walro-{}", std::process::id()));
@@ -623,9 +595,6 @@ mod tests {
             .status()
             .expect("sqlite3 CLI builds the fixture");
         assert!(st.success(), "fixture setup failed");
-        // The raw CLI leaves a size-0 -wal/-shm pair; br removes both on
-        // clean close, so the sidecar-free db is the state a quiet project
-        // actually sits in (that live state is what the daemon failed on).
         let wal = wal_sidecar(&db);
         let _ = std::fs::remove_file(&wal);
         let _ = std::fs::remove_file(db.with_file_name("beads.db-shm"));
@@ -681,7 +650,6 @@ mod tests {
             "re-ring names foreign close"
         );
         assert!(out[0].contains("bd-a"), "re-ring names the waiter");
-        // Second pass: rung, silent.
         let out2 = detect_external_closed(&holds, &status_of, &mut rung);
         assert!(out2.is_empty(), "fires once");
     }
@@ -706,9 +674,6 @@ mod tests {
 
     #[tokio::test]
     async fn e9_foreign_close_rerings_within_one_pass() {
-        // E9 live at sensor level: real sqlite ledgers, real 5s loop, no
-        // swarm. Foreign bd-1 flips open -> closed mid-run; exactly one
-        // Fact must arrive within ~2 passes.
         let base = std::env::temp_dir().join(format!("dbll-e9-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let own = base.join("own");
@@ -721,11 +686,9 @@ mod tests {
         mk_beads_db(&fp, "", "INSERT INTO issues VALUES('bd-1','open','t0');");
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let _sensor = spawn_external_rering(tx, own.clone(), vec![("fp".to_string(), fp.clone())]);
-        // Pass 1 (foreign open): silence for one full cadence.
         let quiet =
             tokio::time::timeout(std::time::Duration::from_secs(RERING_SECS + 2), rx.recv()).await;
         assert!(quiet.is_err(), "no wake while foreign is open");
-        // Foreign closes legally mid-run.
         let fdb = fp.join(".beads").join("beads.db");
         let st = std::process::Command::new("sqlite3")
             .arg(&fdb)
@@ -733,7 +696,6 @@ mod tests {
             .status()
             .unwrap();
         assert!(st.success());
-        // One wake within ~2 passes of the close.
         let got = tokio::time::timeout(
             std::time::Duration::from_secs(2 * RERING_SECS + 3),
             rx.recv(),
@@ -756,8 +718,6 @@ mod tests {
 
     #[tokio::test]
     async fn e10_hold_expiry_wakes_with_zero_swarm() {
-        // E10/S1 live at sensor level: real sqlite ledger with an already-
-        // expired hold, real 30s loop, no swarm. One Fact within ~one pass.
         let base = std::env::temp_dir().join(format!("dbll-e10-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let own = base.join("own");

@@ -63,8 +63,6 @@ pub(crate) fn cmd_history(project: &str) -> Result<()> {
         println!("no checkpoints for {project}");
         return Ok(());
     }
-    // newest first, so the displayed index matches `changes --since N`
-    // (0 = latest) — history's [i] and changes' --since agree
     for (i, cp) in cps.iter().rev().enumerate() {
         println!(
             "[{}] {}  {}  {}",
@@ -83,7 +81,6 @@ pub(crate) fn cmd_changes(cfg: &Config, project: &str, since: usize) -> Result<(
         bail!("no checkpoint at index {since} (have {})", cps.len());
     };
     println!("baseline: {} — {}", dim(&base.ts), base.message);
-    // current state
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let ws_id = crate::find_workspace(&mut c, project)?;
     let agents = c

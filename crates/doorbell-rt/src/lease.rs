@@ -313,7 +313,6 @@ pub fn refresh_lease(
 }
 
 pub fn release_lease(state_dir: &Path, workspace: &str, lease: &OwnerLease) {
-    // Only release our own claim (pid + boot match); never drop a stranger.
     match read_lease(state_dir, workspace) {
         Some(cur)
             if cur.pid == lease.pid
@@ -384,7 +383,6 @@ mod tests {
         assert_eq!(read.kind.as_deref(), Some(KIND_NO_TEXT));
         assert!(!is_ringer(&read));
         release_lease(&d, "w", &held);
-        // A lease written before `kind` existed has no such field: a ringer.
         std::fs::create_dir_all(d.join("doorbell")).unwrap();
         std::fs::write(
             owner_file(&d, "w"),
@@ -393,7 +391,6 @@ mod tests {
         .unwrap();
         let legacy = read_lease(&d, "w").unwrap();
         assert!(legacy.kind.is_none() && is_ringer(&legacy));
-        // The plain acquire writes no kind at all.
         release_lease(&d, "w", &legacy);
         let _ = std::fs::remove_file(owner_file(&d, "w"));
         let plain = acquire_lease(&d, "w", now).unwrap();
@@ -417,17 +414,13 @@ mod tests {
         let d = dir("cycle");
         let now = unix_now();
         let mut lease = acquire_lease(&d, "w", now).expect("first acquire");
-        // Second acquire while live refuses.
         assert!(matches!(
             acquire_lease(&d, "w", now),
             Err(LeaseDenied::Held(_))
         ));
-        // A second workspace is independent (bd-ene2 per-ws scope).
         assert!(acquire_lease(&d, "x", now).is_ok());
-        // Heartbeat refreshes.
         assert!(refresh_lease(&d, "w", &mut lease, now + 10));
         assert_eq!(read_lease(&d, "w").unwrap().heartbeat_unix, now + 10);
-        // Dead-pid lease is stale: takeover succeeds.
         let mut dead = lease.clone();
         dead.pid = 999_999_999;
         dead.heartbeat_unix = now;
@@ -435,10 +428,8 @@ mod tests {
         assert!(lease_stale(&dead, now + 1));
         let next = acquire_lease(&d, "w", now + 1).expect("stale takeover");
         assert_eq!(next.pid, std::process::id());
-        // Release drops our own claim only.
         release_lease(&d, "w", &next);
         assert!(read_lease(&d, "w").is_none());
-        // live_leases sees the surviving workspace claim only.
         assert_eq!(live_leases(&d, now + 10).len(), 1);
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -473,7 +464,6 @@ mod tests {
             heartbeat_unix: now - LEASE_STALE_SECS - 1,
             ..live
         };
-        // Live pid but stuck heartbeat still counts stale (wedged writer).
         assert!(lease_stale(&stale, now));
     }
 
@@ -501,34 +491,29 @@ mod tests {
             pid_start: Some(my_start),
         };
         assert!(!lease_stale_pure(&live, now, &live_inputs));
-        // Dead pid is stale even with a fresh heartbeat.
         let dead_inputs = LeaseInputs {
             current_boot: &boot,
             pid_alive: false,
             pid_start: None,
         };
         assert!(lease_stale_pure(&live, now, &dead_inputs));
-        // Reused pid with a different start stamp is stale now.
         let reused_inputs = LeaseInputs {
             current_boot: &boot,
             pid_alive: true,
             pid_start: Some(my_start.wrapping_add(3600)),
         };
         assert!(lease_stale_pure(&live, now, &reused_inputs));
-        // A different boot is stale now, even when everything else matches.
         let other_inputs = LeaseInputs {
             current_boot: "boot-0",
             pid_alive: true,
             pid_start: Some(my_start),
         };
         assert!(lease_stale_pure(&live, now, &other_inputs));
-        // Legacy file without a start stamp reads stale immediately.
         let legacy = OwnerLease {
             process_start_unix: 0,
             ..live.clone()
         };
         assert!(lease_stale_pure(&legacy, now, &live_inputs));
-        // The edge wrapper agrees for the live holder.
         assert!(!lease_stale(&live, now));
     }
 
@@ -544,7 +529,6 @@ mod tests {
             pid_alive: true,
             pid_start: None,
         };
-        // Stale heartbeat: stale even for a live pid with no start stamp.
         let old = OwnerLease {
             pid: std::process::id(),
             boot_id: boot.clone(),
@@ -555,7 +539,6 @@ mod tests {
             kind: None,
         };
         assert!(lease_stale_pure(&old, now, &no_start));
-        // Boot mismatch on a fresh heartbeat: stale, still no start stamp.
         let fresh = OwnerLease {
             heartbeat_unix: now,
             started_unix: now,
@@ -567,8 +550,6 @@ mod tests {
             pid_start: None,
         };
         assert!(lease_stale_pure(&fresh, now, &other_boot));
-        // Same inputs, matching boot, fresh heartbeat: not stale — the
-        // expensive checks are the only ones left to run.
         assert!(!lease_stale_pure(&fresh, now, &no_start));
     }
 }

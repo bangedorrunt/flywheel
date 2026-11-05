@@ -198,8 +198,6 @@ fn decide_plain_mode_prints_contract_lines() {
     assert!(lines[1].contains("read-only"));
     assert!(lines[2].starts_with("flywheel workflow run captain-audit"));
     assert_eq!(lines[3], "topology open");
-    // bd-2o1v: the routed workflow names its default profile; a row that
-    // dispatches to no role prints the explicit `-`, never a blank line.
     assert_eq!(lines[4], "role -", "role line must be explicit: {s}");
 }
 
@@ -224,9 +222,6 @@ fn decide_rejects_unknown_flag_usage_error() {
 
 #[test]
 fn decide_json_never_dispatches() {
-    // The JSON contract must never grow a side-effect field: argv is the
-    // ONLY actionable output, and stdout is pure JSON (no logs on stderr
-    // path pollution).
     let h = hermetic();
     let out = run(&h, &["decide", "implement the parser", "--json"]);
     assert!(out.status.success());
@@ -238,14 +233,10 @@ fn decide_json_never_dispatches() {
         .map(String::as_str)
         .collect();
     keys.sort_unstable();
-    // bd-2o1v added the `role` metadata field. The key set is pinned exactly
-    // so any future addition is a deliberate edit here, not a silent drift.
     assert_eq!(
         keys,
         vec!["argv", "primitive", "reason", "role", "topology"]
     );
-    // The intent of this gate: no field may name an effect. `argv` is the
-    // only actionable output; everything else is inert metadata.
     for forbidden in [
         "dispatch",
         "dispatch_job",

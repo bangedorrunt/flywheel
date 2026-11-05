@@ -30,13 +30,10 @@ fn adr0010_d6_divergence_never_closes() {
 
 #[test]
 fn adr0010_d6_pending_wait_promotes_and_only_answer_clears() {
-    // Expiry re-surfaces into open_human (promote, never drop) alongside
-    // the existing wait-timeout audit.
     assert!(
         WORKSPACE.contains("pending-wait expired") || WORKSPACE.contains("re-surface"),
         "sweep expiry must promote into open_human"
     );
-    // The only remover of open_human entries is the answer path.
     let removers = WORKSPACE.matches("open_human.remove").count();
     assert_eq!(
         removers, 1,

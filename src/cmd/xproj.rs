@@ -83,13 +83,6 @@ pub(crate) fn cmd_xproj(cfg: &Config, cmd: &XprojCmd) -> Result<()> {
             let ts = crate::state::now_iso().replace(['-', ':'], "");
             let thread = format!("xproj-{recipe}-{ts}");
             let subject = format!("[xproj] run {workers}-worker swarm recipe={recipe}");
-            // review-fix F3: `send_message` has NO to_project param — agent-mail
-            // delivers by recipient NAME across projects once the contact link is
-            // approved (see `xproj request --to-project` for the handshake; the
-            // receiver's loop polls ITS OWN project inbox via __xproj-inbox).
-            // `to_project` is therefore routing CONTEXT, not a delivery target:
-            // validate the path, carry it in the body so the receiver + logs have
-            // full context, and surface it in the JSON. Never silently drop it.
             let to_project_validated: Option<String> = if to_project.is_empty() {
                 None
             } else {

@@ -109,13 +109,11 @@ pub fn redact_value(v: &str) -> String {
 pub enum ActionClass {
     /// Anything that could move topology or dispatch work.
     #[cfg_attr(not(test), allow(dead_code))]
-    // ADR-0014 I1: mail-guardrails + workflow-family surfaces (not yet wired)
     TopologyAdjacent,
     /// Honesty-path gates (reclassify merge, verify verdicts).
     HonestyGate,
     /// Announcements, digests, FYI prompts.
     #[cfg_attr(not(test), allow(dead_code))]
-    // ADR-0014 I1/I4: announce-only fallback surface (contract + tests; host wiring pending)
     AnnounceOnly,
 }
 
@@ -155,10 +153,6 @@ impl Thresholds {
 pub fn escalate_required(conf: f64, class: ActionClass, t: &Thresholds) -> bool {
     !conf.is_finite() || conf < t.bound(class)
 }
-
-// ---------------------------------------------------------------------------
-// Question packs (pure data)
-// ---------------------------------------------------------------------------
 
 /// One typed question inside a pack. `criteria` defines the possible
 /// answers (per-option descriptions for Choice/Score, guidance lines for
@@ -225,11 +219,6 @@ impl QuestionPack {
             if q.kind == QuestionKind::Choice && q.options.len() < 2 {
                 return Err(format!("choice question {} needs >= 2 options", q.id));
             }
-            // bd-drlm: a Score's levels are its ordered `criteria`, per the API.
-            // Validating against `options` is what let this repo ship a pack whose
-            // levels went nowhere the service reads, so the failure surfaced as a
-            // 422 at request time with nothing pointing at the pack. Fail at LOAD,
-            // and name the field, because `options` is the field people reach for.
             if q.kind == QuestionKind::Score && q.criteria.len() < 2 {
                 return Err(format!(
                     "score question {} needs >= 2 levels in `criteria` (a Score's \
@@ -240,8 +229,6 @@ impl QuestionPack {
                     q.options.len()
                 ));
             }
-            // Choice descriptions, when present, align with its options 1:1. A
-            // Score has no options to align: its criteria ARE the levels.
             if q.kind == QuestionKind::Choice
                 && !q.criteria.is_empty()
                 && q.criteria.len() != q.options.len()
@@ -262,10 +249,6 @@ impl QuestionPack {
         Self::parse_yaml(&text)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Answers + confidence (code-side math only)
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ChoiceAnswer {
@@ -351,13 +334,6 @@ fn fin(x: f64) -> f64 {
 /// margin-from-midpoint. Computed in code — never model-side Noul↔Choice
 /// arithmetic (jev-1.13 jaggedness).
 pub fn confidence_of(a: &Answer) -> f64 {
-    // bd-drlm: Choice and Score carry the service's OWN confidence on the wire, and
-    // it is authoritative. This used to recompute it from the distribution, which is
-    // a second definition of a number the service already defined -- and on the
-    // recorded live Score answer the two disagree materially (wire 0.55, local
-    // formula 0.70). A threshold keyed on the local one silently stops meaning what
-    // its name says. The derivations below are now FALLBACKS for a server that
-    // omits the field, not the primary path.
     if let Answer::Choice(c) = a
         && c.confidence.is_finite()
         && c.confidence > 0.0
@@ -388,8 +364,6 @@ pub fn confidence_of(a: &Answer) -> f64 {
             if s.levels < 2 {
                 return 0.0;
             }
-            // Fallback only (the wire value wins above). Uses the float position,
-            // so it no longer quantises a graded answer into a level index.
             let norm = fin(s.position / (s.levels - 1) as f64);
             (2.0 * (norm - 0.5).abs()).clamp(0.0, 1.0)
         }
@@ -414,10 +388,6 @@ pub fn pack_confidence(answers: &Answers) -> f64 {
         .fold(f64::INFINITY, f64::min)
         .clamp(0.0, 1.0)
 }
-
-// ---------------------------------------------------------------------------
-// State slices (code-side filter before any POST)
-// ---------------------------------------------------------------------------
 
 /// Ephemeral redacted slice. `truncated` marks head-cut at the byte cap.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -523,10 +493,6 @@ pub fn build_state_slice(fields: BTreeMap<String, String>) -> StateSlice {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Transports
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JevError {
     /// No key, timeout, outage — deny shapes.
@@ -569,7 +535,7 @@ pub trait Transport {
 }
 
 /// Always-deny transport: offline table for tests and keyless hosts.
-#[cfg_attr(not(test), allow(dead_code))] // ADR-0014 I4: deny-path contract + tests; host uses UreqTransport
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct OfflineTransport;
 
 impl Transport for OfflineTransport {
@@ -653,10 +619,6 @@ impl Transport for UreqTransport {
 pub fn question_wire_shape(q: &QuestionDef) -> serde_json::Value {
     let (kind, criteria) = match q.kind {
         QuestionKind::Choice => {
-            // Pair each option with its description by position. A pack that gives
-            // fewer descriptions than options still yields a complete map, because
-            // an option with no description is a real option — dropping it would
-            // silently shrink the closed set the answer is validated against.
             let map: serde_json::Map<String, serde_json::Value> = q
                 .options
                 .iter()
@@ -682,9 +644,6 @@ pub fn question_wire_shape(q: &QuestionDef) -> serde_json::Value {
             ),
         ),
         QuestionKind::Noul => {
-            // Optional. Only send it when the pack actually described the two
-            // outcomes; an empty object would claim the author said something
-            // about yes and no when they said nothing.
             let map: serde_json::Map<String, serde_json::Value> =
                 match (q.criteria.first(), q.criteria.get(1)) {
                     (Some(yes), Some(no)) => [
@@ -695,10 +654,6 @@ pub fn question_wire_shape(q: &QuestionDef) -> serde_json::Value {
                     .collect(),
                     _ => serde_json::Map::new(),
                 };
-            // No `if` here on purpose: an earlier version tested `map.is_empty()`
-            // and returned the same value on both arms, which is how a Noul ended
-            // up with a branch that read as a decision and decided nothing. The
-            // real decision is the one below, which omits an empty object entirely.
             ("noul", serde_json::Value::Object(map))
         }
     };
@@ -777,8 +732,6 @@ pub fn parse_systemone_response(
                 })
             }
             QuestionKind::Score => {
-                // v1 sends a FLOAT position plus the legend; there is no `level`
-                // index, and the levels are the pack's `criteria`.
                 let position = raw
                     .get("score")
                     .and_then(|s| s.as_f64())
@@ -793,9 +746,6 @@ pub fn parse_systemone_response(
                         q.id, levels
                     )));
                 }
-                // The service constrains the answer to the levels it was given.
-                // A position outside that span is not a value to clamp — it means
-                // the pack and the answer disagree, and clamping would hide it.
                 if position < -1e-9 || position > (levels - 1) as f64 + 1e-9 {
                     return Err(JevError::Malformed(format!(
                         "{}.score {position} outside 0..={}",
@@ -837,17 +787,12 @@ pub fn parse_systemone_response(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Adapter outcome + surfaces (offline policy I4)
-// ---------------------------------------------------------------------------
-
 /// Which surface is being enriched. Honesty path refuses on deny; only
 /// announce-only surfaces may fall back to the table (journaled loudly).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Surface {
     Honesty,
     #[cfg_attr(not(test), allow(dead_code))]
-    // ADR-0014 I4: announce-only fallback surface (contract + tests; host wiring pending)
     AnnounceOnly,
 }
 
@@ -876,10 +821,6 @@ impl<T: Transport> JudgmentAdapter<T> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// JudgmentEffect (journal child I2)
-// ---------------------------------------------------------------------------
-
 /// Journal child of the ReclassifyIntent effect key — one logical reclassify,
 /// one parent intent (L3). Emitted as `Cmd::Audit kind=judgment`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -898,10 +839,6 @@ pub struct JudgmentEffect {
     #[serde(default)]
     pub latency_ms: u64,
 }
-
-// ---------------------------------------------------------------------------
-// Merge (table wins I3)
-// ---------------------------------------------------------------------------
 
 /// Table leaf output entering the merge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1017,10 +954,6 @@ pub fn merge(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Flag + W2 host entry point
-// ---------------------------------------------------------------------------
-
 /// Gate for the W2 enricher (bd-0glq; P7 operator order: Jev on by default).
 /// - Explicit `0`/`false`/`no` (or any other set non-truthy value) → `Off`:
 ///   operator override, byte-identical passthrough, no marker.
@@ -1049,9 +982,6 @@ pub fn jev_gate() -> JevGate {
         },
     }
 }
-
-// W2 host entry point.
-// ---------------------------------------------------------------------------
 
 const PACK_DIR_REL: &str = ".flywheel/judgment-packs";
 const PACK_SUFFIX: &str = ".yaml";
@@ -1104,8 +1034,6 @@ pub fn find_pack_for(project: &str, id: &str) -> Result<QuestionPack, String> {
         dirs.push(dir.join(PACK_DIR_REL));
         cursor = dir.parent().map(|q| q.to_path_buf());
     }
-    // P3: pack loads ride a (dir, id) cache with mtime invalidation —
-    // repeat reclassifies in one process skip re-read + re-parse.
     static PACK_CACHE: std::sync::OnceLock<std::sync::Mutex<PackCache>> =
         std::sync::OnceLock::new();
     let mut tried: Vec<std::path::PathBuf> = Vec::new();
@@ -1356,9 +1284,6 @@ fn prepare_post_with_authority_and_gate(
     slice_fields.insert("table_primitive".to_string(), a.table_primitive.clone());
     slice_fields.insert("table_topology".to_string(), a.table_topology.clone());
     let slice = build_state_slice(slice_fields);
-    // Doorbell battery (bd-lpn6): screen inbound material with a second
-    // pack in the same outside-tx window. A missing screen pack skips the
-    // battery loudly without touching the reclassify verdict (auxiliary).
     let screen = match find_pack_for(&a.project, "doorbell-screen") {
         Ok(screen_pack) => {
             let mut screen_fields = BTreeMap::new();
@@ -1474,9 +1399,6 @@ pub fn finish_plan(
             transport: _,
             screen,
         } => {
-            // (answers, deny, fallback_flag, latency). Honesty never falls
-            // back, but the arm is defensive rather than unreachable: a
-            // fallback here still escalates.
             let (answers_opt, deny_opt, fallback_flag, latency_ms) = match posted {
                 Some((AdapterOutcome::Answered(a), ms)) => (Some(a), None, false, ms),
                 Some((AdapterOutcome::Refused(e), ms)) => (
@@ -1531,9 +1453,6 @@ pub fn finish_plan(
                 latency_ms,
                 deny_opt.as_deref(),
             );
-            // Doorbell battery fold (bd-lpn6): detections ride the reason +
-            // escalate flag (routing only); the table primitive/topology above
-            // are untouched. The battery gets its own audit row.
             let (screen_parts, screen_escalate, screen_summary, screen_effect) =
                 fold_screen(screen.as_ref(), screen_posted, &parent_effect_key);
             if !screen_parts.is_empty() {
@@ -1656,14 +1575,6 @@ fn fold_screen(
     };
     (parts, escalate, Some(summary), Some(effect))
 }
-
-// ---------------------------------------------------------------------------
-// Miss ledger (bd-lpn6): every reclassify expand appends one row keyed by
-// the parent effect key; resolutions land later via `miss_resolve`
-// (none-path advisory confirm/deny, raw, compose). `miss needle mining`
-// reads the unresolved none-rows grouped by normalized goal — new routing
-// needles come from recurring misses, never from guesses.
-// ---------------------------------------------------------------------------
 
 /// Screen-battery outcome summary for the ledger row (bd-lpn6). Scores live
 /// in the kind=judgment audit; the row keeps the advisory + peak detection.
@@ -1991,8 +1902,6 @@ pub fn fold_annotate(surface: AnnotateSurface, answers: &Answers, pack: &Questio
             format!("annotate profile: fit={level} ({lv_conf:.2})")
         }
         AnnotateSurface::TierPick => {
-            // bd-vlvn: reasoning_depth is a Score — the level indexes the
-            // pack's ordered options, mirroring the reviewer-rank arm.
             let depth = answers
                 .by_question
                 .get("reasoning_depth")
@@ -2370,10 +2279,6 @@ mod tests {
     fn the_request_shape_is_per_kind_and_never_carries_options() {
         use super::question_wire_shape;
 
-        // Choice: criteria is a MAP keyed by every option. A pack that supplies
-        // fewer descriptions than options must still emit the full key set —
-        // dropping an option would shrink the closed set the answer is checked
-        // against, and a missing option is a real option.
         let choice = QuestionDef {
             id: "which".into(),
             kind: QuestionKind::Choice,
@@ -2395,7 +2300,6 @@ mod tests {
             "an undescribed option is named, not dropped"
         );
 
-        // Score: criteria is an ORDERED ARRAY of the pack's levels.
         let score = QuestionDef {
             id: "fit".into(),
             kind: QuestionKind::Score,
@@ -2412,8 +2316,6 @@ mod tests {
         assert_eq!(arr[0], "routine");
         assert_eq!(arr[2], "immediate");
 
-        // Noul: criteria is OMITTED when the pack said nothing about yes/no, and
-        // is a true/false OBJECT when it did. An array is neither.
         let bare = QuestionDef {
             id: "blocked".into(),
             kind: QuestionKind::Noul,
@@ -2439,9 +2341,6 @@ mod tests {
         assert_eq!(crit["true"], "a build is failing");
         assert_eq!(crit["false"], "nothing is failing");
 
-        // THE DRIFT GUARD. `options` is a code-side convenience; putting it on the
-        // wire is how a second copy of the option list appeared in the request and
-        // could disagree with the pack it came from.
         for q in [&choice, &score, &bare, &described] {
             let w = question_wire_shape(q);
             assert!(
@@ -2505,7 +2404,6 @@ mod tests {
              failed as Malformed",
         );
 
-        // Score: the wire sends a FLOAT position between levels, not an index.
         let Answer::Score(s) = &answers.by_question["fit_opencode"] else {
             panic!("fit_opencode must be a Score");
         };
@@ -2524,7 +2422,6 @@ mod tests {
             s.confidence
         );
 
-        // Noul: the field is `noul`, and there is NO separate confidence.
         let Answer::Noul(n) = &answers.by_question["is_blocking"] else {
             panic!("is_blocking must be a Noul");
         };
@@ -2534,7 +2431,6 @@ mod tests {
             n.p_yes
         );
 
-        // Choice: the distribution key is `probabilities`, not `probs`.
         let Answer::Choice(c) = &answers.by_question["which_kind"] else {
             panic!("which_kind must be a Choice");
         };
@@ -2606,8 +2502,6 @@ mod tests {
         "reclassify:abc123".into()
     }
 
-    // --- confidence ---
-
     #[test]
     fn choice_confidence_is_top1_minus_top2_margin() {
         assert!((confidence_of(&choice_probs(0.7, 0.2)) - 0.5).abs() < 1e-9);
@@ -2653,8 +2547,6 @@ mod tests {
         assert!(!escalate_required(0.60, ActionClass::AnnounceOnly, &t));
     }
 
-    // --- packs ---
-
     const PACK_YAML: &str = r#"
 id: reclassify
 version: 1
@@ -2684,8 +2576,6 @@ questions:
 
     #[test]
     fn shipped_pack_file_parses_and_pins_model() {
-        // .flywheel/ is gitignored (machine state): the pack ships in the
-        // working tree, not in git. Skip gracefully where absent (CI).
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(".flywheel/judgment-packs/reclassify.v1.yaml");
         if !path.is_file() {
@@ -2710,8 +2600,6 @@ questions:
             eprintln!("skip: packs dir absent (untracked .flywheel)");
             return;
         }
-        // <id>.vN.yaml — test the highest N per id (the loader's live pick;
-        // older versions stay on disk for audit).
         let mut best: std::collections::BTreeMap<String, (u32, std::path::PathBuf)> =
             std::collections::BTreeMap::new();
         let mut entries: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
@@ -2741,18 +2629,11 @@ questions:
             assert_eq!(p.model, JEV_MODEL_PIN, "{name} pins the model");
             for q in &p.questions {
                 match q.kind {
-                    // A Choice's closed set is `options`; its criteria are the
-                    // 1:1 descriptions the service reads.
                     QuestionKind::Choice => assert!(
                         q.options.len() >= 2,
                         "{name}/{qid}: a choice needs >= 2 options",
                         qid = q.id
                     ),
-                    // bd-drlm: a Score's levels are its ordered `criteria`. This
-                    // assertion used to require criteria.len() == options.len()
-                    // for BOTH kinds, which is what let every shipped pack put its
-                    // Score levels in `options` -- a field the service never reads
-                    // for a Score, so the question had no levels to answer over.
                     QuestionKind::Score => assert!(
                         q.criteria.len() >= 2,
                         "{name}/{qid}: a score needs >= 2 levels in criteria, has {} \
@@ -2813,8 +2694,6 @@ questions:
         }
     }
 
-    // --- slices ---
-
     #[test]
     fn slice_redacts_pii_keys() {
         let fields = BTreeMap::from([
@@ -2838,8 +2717,6 @@ questions:
         let len = serde_json::to_string(&s.fields).unwrap().len();
         assert!(len <= STATE_SLICE_CAP_BYTES);
     }
-
-    // --- surfaces ---
 
     #[test]
     fn honesty_surface_refuses_on_deny() {
@@ -2868,8 +2745,6 @@ questions:
             AdapterOutcome::FallbackTable(_)
         ));
     }
-
-    // --- merge ---
 
     #[test]
     fn merge_table_wins_on_primitive_and_topology() {
@@ -3048,18 +2923,10 @@ questions:
         assert!(!m.escalate);
     }
 
-    // --- response parse ---
-
     #[test]
     fn parse_response_reads_typed_answers() {
         let pack = QuestionPack::parse_yaml(PACK_YAML).unwrap();
         let v = serde_json::json!({
-            // bd-drlm: this fixture used to be `probs` / `level: 1` / `p_yes` --
-            // a wire shape the service NEVER sends, invented to match the parser.
-            // It therefore passed while every live call failed as Malformed, which
-            // is the worst kind of test: it confirmed the code agreed with itself.
-            // The shape here is the documented v1 one, and the recorded live
-            // response above is the one that actually came back.
             "answers": {
                 "intent": {
                     "type": "choice",
@@ -3092,12 +2959,9 @@ questions:
         assert!(parse_systemone_response(&v, &pack).is_err());
     }
 
-    // --- flag ---
-
     #[test]
     fn flag_defaults_off() {
         let _env = crate::config::lock_env();
-        // Edition 2024: env mutation is unsafe (single-threaded test, sound).
         unsafe { env::remove_var(FLAG_ENV) };
         unsafe { env::remove_var(API_KEY_ENV) };
         assert_eq!(jev_gate(), JevGate::Unconfigured);
@@ -3120,8 +2984,6 @@ questions:
         assert_eq!(jev_gate(), JevGate::Off);
         unsafe { env::remove_var(FLAG_ENV) };
     }
-
-    // --- review blockers (PearlTern fresh-eyes) ---
 
     fn empty_answers() -> Answers {
         Answers {
@@ -3158,7 +3020,6 @@ questions:
     #[test]
     fn b3_response_validation_refuses_bad_shapes() {
         let pack = QuestionPack::parse_yaml(PACK_YAML).unwrap();
-        // choice outside pack options
         let v = serde_json::json!({
             "answers": {
                 "intent": {"choice": "teleport", "probs": {"teleport": 1.0}},
@@ -3167,7 +3028,6 @@ questions:
             }
         });
         assert!(parse_systemone_response(&v, &pack).is_err());
-        // probs sum != 1
         let v = serde_json::json!({
             "answers": {
                 "intent": {"choice": "loop", "probs": {"loop": 0.5, "swarm": 0.1, "open": 0.1}},
@@ -3176,7 +3036,6 @@ questions:
             }
         });
         assert!(parse_systemone_response(&v, &pack).is_err());
-        // level out of range
         let v = serde_json::json!({
             "answers": {
                 "intent": {"choice": "loop", "probs": {"loop": 0.8, "swarm": 0.1, "open": 0.1}},
@@ -3322,11 +3181,6 @@ questions:
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    // Superseded by prepare_flag_off_is_passthrough_without_audit (bd-n86n
-    // three-phase path); removed with maybe_enrich.
-
-    // --- bd-lpn6: miss ledger ---
-
     fn miss_row(key: &str, goal: &str, prim: &str) -> MissRow {
         MissRow {
             ts: "2026-09-19T00:00:00Z".into(),
@@ -3385,8 +3239,6 @@ questions:
         assert_eq!(c.len(), 2, "only unresolved none-rows group: {c:?}");
         assert_eq!(c[0], ("ship the onboarding".to_string(), 2));
     }
-
-    // --- bd-lpn6: doorbell battery ---
 
     const SCREEN_YAML: &str = r#"
 id: doorbell-screen
@@ -3493,8 +3345,6 @@ questions:
         );
     }
 
-    // --- bd-lpn6: prescreen + annotators ---
-
     fn prescreen_answers(shape: &str, destructive_p: f64) -> Answers {
         Answers {
             model_id: JEV_MODEL_PIN.into(),
@@ -3536,8 +3386,6 @@ questions:
     fn prescreen_and_annotate_deny_without_key() {
         let _env = crate::config::lock_env();
         unsafe { env::remove_var(API_KEY_ENV) };
-        // Packs resolve via ancestor walk from the repo; the failure under
-        // test is the missing key, not discovery.
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .to_string_lossy()
             .into_owned();
@@ -3808,7 +3656,6 @@ questions:
             for q in &pack.questions {
                 let level = self.levels.get(&q.id).copied().unwrap_or(1);
                 if !matches!(q.kind, QuestionKind::Score) {
-                    // harness_coupling Choice: sharp open (conf 0.9).
                     by_question.insert(
                         q.id.clone(),
                         Answer::Choice(ChoiceAnswer {
@@ -3826,7 +3673,6 @@ questions:
                     q.id.clone(),
                     Answer::Score(ScoreAnswer {
                         position: level as f64,
-                        // bd-drlm: a Score's levels are its ordered `criteria`.
                         levels: q.criteria.len().max(2),
                         confidence: 0.0,
                     }),
@@ -3889,7 +3735,6 @@ questions:
             ("coder".to_string(), "write/fix code".to_string()),
             ("rust-coder".to_string(), "Rust code".to_string()),
         ];
-        // Sample 1: strong rust-coder for a borrow-checker objective.
         let strong = CannedBatch {
             levels: BTreeMap::from([
                 ("profile_fit__coder".into(), 1),
@@ -3906,7 +3751,6 @@ questions:
             .expect("answered"),
             Some("@rust-coder".to_string())
         );
-        // Sample 2: every candidate merely adequate — reject ALL.
         let weak = CannedBatch {
             levels: BTreeMap::from([
                 ("profile_fit__coder".into(), 1),
@@ -3919,7 +3763,6 @@ questions:
             None,
             "adequate everywhere carries no confidence — nothing, not even the table"
         );
-        // Deny keeps the table: Err, never a fabricated suggestion.
         assert!(
             live_profile_suggestion(&OfflineTransport, &pack, "fix the flake", &cands).is_err()
         );
@@ -3935,7 +3778,6 @@ questions:
     #[test]
     fn jev_live_tier_suggestion_maps_edges_only() {
         let pack = tier_pick_pack_for_live();
-        // frontier → @premium (depth conf 1.0, coupling conf 0.9).
         let frontier = CannedBatch {
             levels: BTreeMap::from([("reasoning_depth".into(), 2)]),
         };
@@ -3944,7 +3786,6 @@ questions:
                 .expect("answered"),
             Some("@premium".to_string())
         );
-        // routine → @cheap.
         let routine = CannedBatch {
             levels: BTreeMap::from([("reasoning_depth".into(), 0)]),
         };
@@ -3952,7 +3793,6 @@ questions:
             live_tier_suggestion(&routine, &pack, "fix the typo").expect("answered"),
             Some("@cheap".to_string())
         );
-        // substantial (level 1, conf 0) → gate rejects → None.
         let middle = CannedBatch {
             levels: BTreeMap::from([("reasoning_depth".into(), 1)]),
         };
@@ -4027,14 +3867,11 @@ questions:
             suggest_profile_pick("sharpen the objective into beads"),
             "@coder"
         );
-        // Substring caution: bare "nodes"/"assets" must not cue ts-coder.
         assert_eq!(
             suggest_profile_pick("drain the nodes and rotate assets"),
             "@coder"
         );
     }
-
-    // --- bd-n86n: POST outside the journal tx ---
 
     fn expand_args(project: &str) -> ExpandArgs {
         ExpandArgs {
@@ -4207,17 +4044,12 @@ questions:
                 screen: None,
             },
         };
-        // Programming error (POST skipped): fail-closed deny, never quiet merge.
         let out = finish_plan(plan, None, None);
         assert!(out.audit.is_some());
         let reason = out.reason;
         assert!(reason.contains("jev"), "deny attaches advisory: {reason}");
     }
 }
-
-// ---------------------------------------------------------------------------
-// pack sync — the missing half of `workflow seed`
-// ---------------------------------------------------------------------------
 
 /// How much of the user-tier pack set `judgment pack seed` may replace.
 ///
@@ -4350,15 +4182,12 @@ pub fn pack_drift(user_dir: &Path, project_dir: &Path) -> Vec<PackDriftRow> {
             let status = match (&user, &project) {
                 (None, Some(_)) => "missing",
                 (Some(_), None) => "user-only",
-                // Both tiers claim the id but neither has a readable file:
-                // report it rather than panicking on an unhandled pair.
                 (None, None) => "unreadable",
                 (Some(u), Some(p)) => {
                     let same = std::fs::read(u).ok() == std::fs::read(p).ok();
                     if same {
                         "identical"
                     } else if uv > pv {
-                        // The user tier is ahead; replacing would downgrade.
                         "newer-user"
                     } else {
                         "stale"
@@ -4412,10 +4241,6 @@ pub fn pack_seed(
             PackOverwrite::Stale => row.status == "stale",
             PackOverwrite::All => dst.exists(),
         };
-        // The dst EXISTING is the whole question. My first cut branched on
-        // `replace` alone, so a DIVERGED pack at the default scope fell into the
-        // copy branch and overwrote the operator's file anyway — the exact
-        // clobber this command exists to prevent. Branch on what is on disk.
         if dst.exists() {
             if !replace {
                 rep.kept.push(row.id);
@@ -4575,7 +4400,6 @@ pub fn seed_default_packs_with(
         let replace = match scope {
             PackOverwrite::None => false,
             PackOverwrite::Stale => status == "stale",
-            // File exists. `All` restores every shipped name, even a current one.
             PackOverwrite::All => true,
         };
         if !replace {
@@ -4590,8 +4414,6 @@ pub fn seed_default_packs_with(
         if let Ok(prev) = std::fs::read(&dst) {
             std::fs::write(&bak, prev)?;
         }
-        // Write beside the file, then rename. A failed write must not
-        // truncate the pack the backup was taken from.
         write_pack_file(&dst, body)?;
         rep.overwritten.push((*name).to_string());
     }
@@ -4687,7 +4509,6 @@ mod bd_pack_sync {
         let r = root("promote");
         let proj = r.join("project/.flywheel/judgment-packs");
         std::fs::write(proj.join("reclassify.v1.yaml"), PACK).expect("write proj pack");
-        // A user-tier pack the project also has — must be left alone.
         std::fs::write(
             r.join("judgment-packs/reclassify.v1.yaml"),
             "name: reclassify\nversion: 1\nquestions: []\n# LOCAL\n",

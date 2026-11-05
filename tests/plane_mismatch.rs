@@ -23,7 +23,6 @@ fn unroutable_input() -> RouteInput {
 
 #[test]
 fn plane_mismatch_is_not_no_route() {
-    // Shape classification: `block:` ids are rex, `<ws>:p<N>` ids are hc.
     assert_eq!(
         pane_plane("block:01a17136-a780-714f-9211-b78766ffd515"),
         Some(PanePlane::Rex)
@@ -32,7 +31,6 @@ fn plane_mismatch_is_not_no_route() {
     assert_eq!(pane_plane("flywheel-flywheel-pi2"), None);
     assert_eq!(pane_plane(""), None);
 
-    // The incident shape: hc-selected host, registry rows all rex.
     let rex_rows = ["block:aaa", "block:bbb"];
     let reason = plane_mismatch_reason(PanePlane::Hc, &rex_rows);
     let reason = reason.expect("all-rex rows under an hc view must mismatch");
@@ -49,7 +47,6 @@ fn plane_mismatch_is_not_no_route() {
         "host must refuse a workspace living wholly on another plane"
     );
 
-    // Routed through the decide: mismatch digests as plane_mismatch.
     let d = route_wake_with_plane(&unroutable_input(), PanePlane::Hc, &rex_rows);
     match d {
         doorbell_core::wake_core::GateDecision::Digest { reason, .. } => {
@@ -62,7 +59,6 @@ fn plane_mismatch_is_not_no_route() {
         other => panic!("unroutable wake digests, got: {other:?}"),
     }
 
-    // Matching rows: a truly pane-less pin still digests as no-route.
     let plane_rows = ["w5H:p3"];
     assert_eq!(plane_mismatch_reason(PanePlane::Hc, &plane_rows), None);
     assert!(!workspace_adopt_refused(PanePlane::Hc, &plane_rows));
@@ -77,6 +73,5 @@ fn plane_mismatch_is_not_no_route() {
         other => panic!("unroutable wake digests, got: {other:?}"),
     }
 
-    // Empty row set: nothing to mismatch against, old fate stands.
     assert_eq!(plane_mismatch_reason(PanePlane::Hc, &[]), None);
 }

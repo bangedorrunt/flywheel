@@ -33,21 +33,14 @@ async fn host_workspace(
     let mut fcfg = FileHostConfig::new(fw_state.clone(), project.clone(), workspace.clone());
     fcfg.toron_bin = bins.toron.clone();
     fcfg.plane_bin = bins.hc.clone();
-    // mcc9: the backpressure window is host policy, read once here.
     fcfg.wake_brain_wait = doorbell_rt::wake_brain::wait_from_env(
         std::env::var(doorbell_rt::wake_brain::WAIT_ENV)
             .ok()
             .as_deref(),
     );
     let mut host = FileHost::new(fcfg).with_tx(tx.clone());
-    // Daemon-keyed generation: first run captures the doorbell binary
-    // identity so a mid-run upgrade retires the loop instead of waking
-    // stale (same rule as the embedded WatcherGen gate, daemon-keyed).
     doorbell_rt::ensure_daemon_gen(&fw_state, &workspace);
     let mut sinks = SinkManager::new(tx.clone());
-    // Flag-off no longer types the brain line (operator waived 2026-11-08
-    // on 2026-10-17). The flywheel inbox host is the only pane writer, and
-    // only while comms is on.
     if doorbell_rt::comms_inbox_env() {
         eprintln!(
             "doorbell serve: {project}/{workspace} — comms flag on: pane writes belong to the flywheel inbox host; this host types nothing"
@@ -60,12 +53,6 @@ async fn host_workspace(
     sinks.add_sink_with_factory("hc", Box::new(doorbell_rt::NoTextSink::new()), || {
         Box::new(doorbell_rt::NoTextSink::new())
     });
-    // bd-8ulu: a durable human wake with zero swarm needs somewhere to land.
-    // The pane registry is not an option for a human pin, so register the
-    // webhook adapters this workspace's rows justify — one per distinct
-    // endpoint, allowlist-gated. A row that cannot be honoured registers
-    // nothing and is named LOUDLY here: silence would look like a delivered
-    // wake while the digest quietly absorbs it.
     let allowlist = doorbell_rt::sinks::EgressAllowlist::from_env();
     let (hook_regs, refused) = webhook_registrations(
         &doorbell_rt::subscribe::SubscriptionStore::open(&fw_state).list(),
@@ -92,14 +79,9 @@ async fn host_workspace(
         }
     }
     let store = FileStore::new(fw_state);
-    // Death is a side bell, not another item on the watch channel. The
-    // consumer rings it; the brain selects it ahead of the backlog.
     let died_bell = doorbell_rt::DiedBell::new();
     host = host.with_died_bell(std::sync::Arc::clone(&died_bell));
-    // Wake-sock consumer (the in-process bus needs toron-core, which the
-    // lean daemon never links). Backoff + retry gate live in the host.
     host.restart_wake();
-    // Beats: 1s sweep, 60s ack-SLA (same cadences as embedded).
     let sweep_ticker = doorbell_rt::interval_ticker(
         "sweep",
         tx.clone(),
@@ -116,12 +98,6 @@ async fn host_workspace(
             now: doorbell_rt::lease::unix_now(),
         },
     );
-    // Ready-bead sensor (bd-ux-papercuts-t2u5): the embedded flywheel host
-    // runs the beads poller, so the daemon must too — the daemon hosts the
-    // live loops, and without this lane a ready bead never rings a paned
-    // supervisor. Repo resolution: an absolute project key IS the repo
-    // (flywheel's shape); a slug resolves under the default workspace root
-    // `~/workspace`. No board → the lane is off for this host, said LOUDLY.
     let beads_root = dirs::home_dir().map(|h| h.join("workspace"));
     let _beads_poller = match beads_root
         .as_deref()
@@ -379,9 +355,6 @@ fn subscribed_keys(subs: &[doorbell_rt::subscribe::Subscription]) -> Vec<String>
         let Some(project) = &sub.project else {
             continue;
         };
-        // `.` / `..` / blank are cwd aliases, not slugs. Auto-hosting them
-        // sweeps unregistered pins (Buffy on project `.`) and the resulting
-        // inbox_error paints the whole daemon fetch-path-down (bd-gpj0.1).
         if !hostable_project(project) {
             continue;
         }
@@ -512,7 +485,7 @@ fn row_workspace_live(
     live: &std::collections::BTreeSet<String>,
 ) -> bool {
     let Some(ws) = row_workspace(sub) else {
-        return true; // no scope names no host: nothing to prune
+        return true;
     };
     if live.contains(&ws) {
         return true;
@@ -737,12 +710,6 @@ async fn drain_loops(entries: &mut [LoopEntry], budget: std::time::Duration) -> 
                 .map(|e| e.key.clone())
                 .collect();
             let remaining = stragglers.len();
-            // bd-y40k verdicts, bd-pf3b timing: sample EVERY straggler first
-            // (age + wake count at the deadline), then ONE shared window —
-            // a serial sleep per key stacked N×200ms onto the drain and
-            // pushed total shutdown past stop's grace under load. Growth is
-            // read across the single window; age is the deadline-age (the
-            // honest "last wake N ms before the probe").
             let mut samples: Vec<(
                 String,
                 std::sync::Arc<doorbell_rt::brain::BrainLiveness>,
@@ -792,7 +759,6 @@ fn straggler_note(report: &DrainReport) -> Option<String> {
         DRAIN_BUDGET.as_secs(),
         report.stragglers.join(", ")
     );
-    // bd-y40k: the mechanism, named per key — starved / churning / lost-wake.
     for (key, verdict) in &report.verdicts {
         note.push_str(&format!("\n  {key}: {verdict}"));
     }
@@ -808,7 +774,6 @@ fn daemon_lease_kind() -> Option<&'static str> {
 
 fn daemon_lease_kind_for(comms_flag_on: bool) -> Option<&'static str> {
     let _ = comms_flag_on;
-    // Both flags type nothing. A flag-off daemon must not look like the ringer.
     Some(doorbell_rt::lease::KIND_NO_TEXT)
 }
 
@@ -835,9 +800,6 @@ fn deadman_fired(now: u64, anchor: u64) -> bool {
 pub async fn run(cfg: &Config) -> Result<()> {
     use doorbell_rt::lease;
     let now = lease::unix_now();
-    // Durable: start the beat + its deadman before any await. The beat is
-    // touched by a tokio task and read by a plain thread, so neither can hide
-    // the other's stall.
     {
         use std::sync::atomic::{AtomicU64, Ordering};
         let beat = std::sync::Arc::new(AtomicU64::new(now));
@@ -868,22 +830,7 @@ pub async fn run(cfg: &Config) -> Result<()> {
             }
         });
     }
-    // The daemon never hosts a workspace: it has no pane typer in any mode,
-    // and a host that cannot type still takes the lease as `no-text`, which
-    // makes the per-workspace loop defer or refuse — the deafness this split
-    // exists to prevent. The loops own the lease, the brain, and the typing;
-    // this process owns /health and reads. `--host` stays accepted and
-    // persisted (hosts.json is the arm list a future typer would use).
     let spawn_hosts: Vec<(String, String)> = Vec::new();
-    // D9 layer 1 first, per workspace: a live lease means another writer
-    // runs there — refuse before touching its socket (never clobber a
-    // stranger's bind). Leases live in the FLYWHEEL state dir, shared
-    // with embedded loops, so either side excludes the other per ws.
-    //
-    // Scoped to `spawn_hosts`: with no daemon typer the armed list is a read
-    // list, and the per-workspace loops hold those leases by design. Checking
-    // (or claiming, below) `cfg.hosts` would refuse to start beside them and
-    // then re-deafen every armed workspace with a `no-text` lease.
     for (project, workspace) in &spawn_hosts {
         if let Some(cur) = lease::read_lease(&cfg.flywheel_state, workspace)
             && !lease::lease_stale(&cur, now)
@@ -899,11 +846,6 @@ pub async fn run(cfg: &Config) -> Result<()> {
     let tcp = match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", cfg.port)).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            // D9 layer 2, conflict-class: EVERY arm exits 0 so the unit's
-            // KeepAlive{SuccessfulExit=false} never respawn-wars against a
-            // holder that will not move. The old exit-1 "squatter" bail is
-            // what produced runs=69 / watch_restart_loop whenever a
-            // mid-shutdown doorbell merely failed to answer in time.
             match classify_port_holder(peer_health(cfg).await.as_ref()) {
                 PortHolder::Peer => eprintln!(
                     "doorbell serve: healthy doorbell peer on {}, exiting 0",
@@ -925,9 +867,6 @@ pub async fn run(cfg: &Config) -> Result<()> {
         }
         Err(e) => return Err(e).with_context(|| format!("bind 127.0.0.1:{}", cfg.port)),
     };
-    // Claim one writer lease per hosted workspace before serving. Empty in
-    // practice: `spawn_hosts` is empty because this process types nothing;
-    // the per-workspace loops own their leases.
     let owned: Shared<Vec<(String, doorbell_rt::lease::OwnerLease)>> =
         std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
     for (_, workspace) in &spawn_hosts {
@@ -961,10 +900,6 @@ pub async fn run(cfg: &Config) -> Result<()> {
     }
     let uds = tokio::net::UnixListener::bind(&sock_path)
         .with_context(|| format!("bind {}", sock_path.display()))?;
-    // Pidfile claim lives with the bind owner (bd-start-adopt): `serve`
-    // claims it once both binds succeed, so a launchd/systemd-started
-    // daemon is pidfile-managed identically to a `start` child and
-    // `doorbell start` adopts instead of dying on a foreign-owner fence.
     if let Err(e) = crate::lifecycle::claim_pid_file(&cfg.pid_file(), std::process::id()) {
         eprintln!(
             "doorbell serve: pidfile claim failed ({}): {e}; continuing unclaimed",
@@ -973,11 +908,6 @@ pub async fn run(cfg: &Config) -> Result<()> {
     }
     let started = std::time::Instant::now();
     let log_path = cfg.log_file();
-    // Precondition, named loudly: the daemon execs `toron` (bus watch +
-    // inbox fetch) and `hc` (prompt sink). Under launchd/systemd neither
-    // is on PATH; resolving them here to a real absolute path is what keeps
-    // the ring alive, and the miss is stated once instead of being inferred
-    // from a wake that never arrives.
     let bins = resolved_bins();
     eprintln!(
         "doorbell serve: cli toron={} (resolved={}) hc={} (resolved={})",
@@ -990,22 +920,7 @@ pub async fn run(cfg: &Config) -> Result<()> {
              delivered; set DOORBELL_TORON_BIN / DOORBELL_HC_BIN or install the binaries"
         );
     }
-    // bd-2o1v: `hosted` starts EMPTY — `spawn_host_loop` is the sole writer,
-    // so the list names only loops that actually exist (a pre-populated
-    // list made the idempotency guard skip every boot host: health showed
-    // hosted strings with no Brain behind them, zero sweeps, clean exit).
     let hosted: Hosts = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-    // The daemon never hosts a workspace. It has no pane typer in ANY mode
-    // (`host_workspace` installs a NoTextSink; the legacy typer is gone), and
-    // a host that cannot type still takes the workspace lease as `no-text`,
-    // so the per-workspace `flywheel __doorbell` loop defers to it as an
-    // inbox-only writer. That writer polls the comms inbox_log (head=0 for
-    // NIP-17 mail), while the mail wake path is the loop's own brain + bus
-    // watch — so every daemon-hosted workspace is deaf. The loops own the
-    // lease, the brain, and the typing; this process owns /health and reads.
-    //
-    // `--host` stays accepted and persisted (hosts.json is the arm list a
-    // future typer would use), it just no longer spawns a loop.
     eprintln!(
         "doorbell serve: up on 127.0.0.1:{} + {} (standby: per-workspace loops host and type; \
          {} armed for reads)",
@@ -1013,24 +928,16 @@ pub async fn run(cfg: &Config) -> Result<()> {
         sock_path.display(),
         cfg.hosts.len()
     );
-    // The cache is created before workers so a worker supervisor can
-    // invalidate /health in the same task turn that removes a dead host.
     let health: Shared<CachedHealth> = std::sync::Arc::new(parking_lot::Mutex::new(CachedHealth {
         body: String::new(),
         computed_at: std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(3600))
             .unwrap_or(std::time::Instant::now()),
     }));
-    // Host loops: one Brain per configured workspace. Supervisors own the
-    // JoinHandles, remove dead workers from `hosted`, release their lease,
-    // and invalidate the health snapshot before the next probe can advertise
-    // a worker that no longer exists.
     let loops: Loops = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
     for (project, workspace) in &spawn_hosts {
         spawn_host_loop(cfg, &hosted, &loops, &owned, &health, project, workspace);
     }
-    // bd-lorot: the workspaces this daemon actually hosts, captured BEFORE the
-    // tick moves `cfg`. The prune may only touch workspaces outside this set.
     let prune_hosted: std::collections::BTreeSet<String> =
         spawn_hosts.iter().map(|(_, ws)| ws.clone()).collect();
     let prune_state = cfg.flywheel_state.clone();
@@ -1039,22 +946,11 @@ pub async fn run(cfg: &Config) -> Result<()> {
         loop {
             tick.tick().await;
             copy_truncate_over(&log_path, LOGROTATE_BYTES);
-            // bd-lorot: journals are one file per workspace the plane has EVER
-            // served and nothing removed them, so known_workspaces only grew —
-            // 913 files / 20 MB measured, and it is the input to the standby
-            // wake-blind signal. Prune the ones this daemon does not host AND
-            // has not touched for a week; a just-spawned crew is never a
-            // candidate, so a live workspace's journal cannot be deleted.
             let store = doorbell_rt::FileStore::new(prune_state.clone());
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            // gc/live: a workspace with a LIVE LEASE is alive even when this
-            // daemon does not host it (the comms-on local loop is its writer),
-            // so "hosted by me" alone is too narrow: it could delete an
-            // idle-but-live crew's only wake history. Hosted rows stay in
-            // unconditionally; leases widen the protected set.
             let live = prune_live_set(
                 &prune_hosted,
                 doorbell_rt::lease::live_leases(&prune_state, now)
@@ -1068,8 +964,6 @@ pub async fn run(cfg: &Config) -> Result<()> {
                 || report.sidecars_removed > 0
                 || report.leases_removed > 0
             {
-                // Never delete silently: every family the prune can remove is
-                // named, so a reader of the log can tell a janitor from a bug.
                 eprintln!(
                     "doorbell: pruned {} journal + {} audit + {} sidecar + {} lease file(s) for abandoned workspaces, freed {} byte(s) ({} left: too young)",
                     report.journals_removed,
@@ -1088,9 +982,6 @@ pub async fn run(cfg: &Config) -> Result<()> {
         hosted: hosted.clone(),
         health: health.clone(),
     };
-    // bd-o86s: the /health snapshot tick. Recomputes the body on its own
-    // cadence so request handlers never pay the shells-and-greps cost.
-    // Initial compute happens inline once (cold start), then every TTL.
     {
         let app = app.clone();
         refresh_health_snapshot(&app);
@@ -1102,8 +993,6 @@ pub async fn run(cfg: &Config) -> Result<()> {
                 tokio::time::interval(std::time::Duration::from_secs(HEALTH_CACHE_TTL_SECS));
             loop {
                 tick.tick().await;
-                // Compute off the request path; a slow compute only delays
-                // the NEXT snapshot, never a served request.
                 let app = app.clone();
                 tokio::task::spawn_blocking(move || refresh_health_snapshot(&app))
                     .await
@@ -1111,9 +1000,6 @@ pub async fn run(cfg: &Config) -> Result<()> {
             }
         })
     };
-    // Detached supervision: the tick aborts with the serve task group; the
-    // handle is dropped (not awaited) on purpose — awaiting it here would
-    // block the accept loop.
     drop(health_tick);
     let connections = std::sync::Arc::new(tokio::sync::Semaphore::new(CONNECTION_LIMIT));
     let tcp_listener = &tcp;
@@ -1152,9 +1038,6 @@ pub async fn run(cfg: &Config) -> Result<()> {
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
     };
-    // D9 layer 1 upkeep: heartbeat every 30s per held lease. Dynamic hosts
-    // (bd-2o1v auto-host) add leases to the same shared set, so they are
-    // heartbeated identically to boot-time hosts.
     let hb_state = cfg.flywheel_state.clone();
     let hb_owned = owned.clone();
     let heartbeat = tokio::spawn(async move {
@@ -1169,10 +1052,6 @@ pub async fn run(cfg: &Config) -> Result<()> {
             }
         }
     });
-    // bd-2o1v reconcile: subscriptions are the hosting truth. Every 60s the
-    // daemon hosts every subscribed (project, workspace) it can name
-    // (lease-fenced — never steal a live writer) and reaps spawn-scoped
-    // rows whose workspace went silent for a week.
     let reconcile = std::sync::Arc::new(tokio::spawn({
         let cfg = cfg.clone();
         let hosted = hosted.clone();
@@ -1197,8 +1076,6 @@ pub async fn run(cfg: &Config) -> Result<()> {
             doorbell_rt::lease::release_lease(&cfg.flywheel_state, ws, l);
         }
     };
-    // Graceful shutdown on Ctrl-C and SIGTERM (`doorbell stop` sends
-    // TERM: drain sinks, journal undelivered intents, release leases).
     #[cfg(unix)]
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("SIGTERM listener");
@@ -1218,13 +1095,6 @@ pub async fn run(cfg: &Config) -> Result<()> {
         r = serve_uds => Some(r),
         _ = shutdown => None,
     };
-    // Free the endpoints FIRST on SIGTERM: `tcp`/`uds` are owned here, so
-    // dropping the accept futures above does NOT close the listeners — a
-    // listener whose accept loop is gone still accepts into the backlog
-    // without ever answering, every probe then times out, and the dying
-    // daemon is misread as a "non-doorbell squatter" (the restart-storm
-    // root cause). Shutdown is therefore: listeners closed, drain bounded,
-    // leases released, exit.
     drop(tcp);
     drop(uds);
     match accepting {
@@ -1233,8 +1103,6 @@ pub async fn run(cfg: &Config) -> Result<()> {
             r
         }
         None => {
-            // Shutdown travels as a message (ticker + forwarder senders
-            // stay open until their tasks end with the brain).
             eprintln!("doorbell serve: shutdown signal received, draining loops");
             let retiring = std::mem::take(&mut *hosted.lock());
             for (key, why) in send_shutdowns(&retiring, SEND_BUDGET).await {
@@ -1249,14 +1117,6 @@ pub async fn run(cfg: &Config) -> Result<()> {
             eprintln!("doorbell serve: shutdown sent, joining loops");
             drop(retiring);
             let mut entries = std::mem::take(&mut *loops.lock());
-            // Bounded drain: SIGTERM must always finish inside stop's 20s
-            // grace (drain 10s + probe window + exit allowance, bd-pf3b). Joins race the budget CONCURRENTLY (bd-zzgb): the old
-            // head-of-line await meant one hung Brain stalled the scan and
-            // the note claimed every loop missed the deadline even when the
-            // ones behind it had already exited. At the deadline the stragglers
-            // are named loudly, then the process exits (their handles drop here;
-            // the tasks detach — bd-nuf2: intents were journaled pre-delivery,
-            // resume redelivers).
             let report = drain_loops(&mut entries, DRAIN_BUDGET).await;
             eprintln!(
                 "{}",
@@ -1290,18 +1150,10 @@ fn spawn_host_loop(
     project: &str,
     workspace: &str,
 ) {
-    // Idempotent: two callers (boot config + reconcile auto-host) may race
-    // the same pair — a second Brain on one workspace double-rings. Check
-    // before pushing anything, so an early return leaves no orphan tx.
     let key = format!("{project}/{workspace}");
     if hosted.lock().iter().any(|h| h.key == key) {
         return;
     }
-    // bd-fuql: fail-closed boot gate — hosting with an unresolvable toron
-    // or terminal CLI is a deaf plane (/health would merely decorate it with
-    // cli_unresolved while no wake can land). Refuse here: both boot config
-    // and reconcile auto-host funnel through this fn. The operator pins
-    // real bins via DOORBELL_TORON_BIN / DOORBELL_HC_BIN.
     let early_bins = resolved_bins();
     if !bins_allow_hosting(early_bins.toron_resolved, early_bins.hc_resolved) {
         let mut missing = Vec::new();
@@ -1327,10 +1179,6 @@ fn spawn_host_loop(
         release_owned_lease(&cfg.flywheel_state, owned, workspace);
         return;
     }
-    // bd-ba8t: say out loud whether this workspace's wakes have anywhere to
-    // land. Silence here is exactly how a hosted-but-deaf plane looks healthy.
-    // Two `hc agent list` shells per host is acceptable at boot; /health
-    // recomputes it live for readers.
     let inj = doorbell_rt::file_host::injection_picture(
         &cfg.flywheel_state,
         project,
@@ -1362,38 +1210,15 @@ fn spawn_host_loop(
     let supervised_hosted = hosted.clone();
     let supervised_owned = owned.clone();
     let supervised_health = health.clone();
-    // bd-y40k: ONE probe per loop, shared by the brain's touches (inside
-    // the task) and the drain's deadline read (from the table entry).
     let liveness = std::sync::Arc::new(doorbell_rt::brain::BrainLiveness::new());
     let supervised_liveness = liveness.clone();
-    // Register before spawning: a very fast startup failure must not win a
-    // race against registration and leave a stale hosted row behind.
     hosted.lock().push(HostedLoop {
         key: key.clone(),
         tx: tx.clone(),
     });
     let task = tokio::spawn(async move {
-        // bd-lmtu: START THE HEARTBEAT. `spawn_heartbeat_ticker` had NO caller
-        // anywhere outside its own module, so the 1s ticker was dead code: `.hb`
-        // was only ever touched incidentally by the wake-outcome arm in
-        // file_host, which is why the live state files were 596s and 57540s old
-        // rather than ~1s, and why `/health` reported
-        // `wake.pipe.class: "NeverStamped"` with `last_heartbeat_ms: null` for
-        // every workspace.
-        //
-        // That matters because the heartbeat is what lets wake-liveness tell a
-        // QUIET host from a DEAF one. With no stamp there is nothing to classify
-        // against, so liveness degrades to NeverStamped and a wake cannot be
-        // shown to have landed.
-        //
-        // Lifespan is the loop's: `_hb` is a Sender whose Drop ends the ticker
-        // thread, and an async block's locals are dropped on normal return AND
-        // on abort — so the ticker cannot outlive the hosted loop, and a retired
-        // loop (bd-mk60) stops stamping.
         let _hb =
             doorbell_rt::watchbeat::spawn_heartbeat_ticker(supervised_state.clone(), w.clone());
-        // Await a child task so panic/abort is also a supervised completion:
-        // the outer task still removes the hosted row and releases its lease.
         let child = tokio::spawn(host_workspace(fw, p, w, loop_tx, rx, supervised_liveness));
         let report = match child.await {
             Ok(report) => report,
@@ -1420,9 +1245,6 @@ fn spawn_host_loop(
         task,
         liveness: Some(liveness),
     });
-    // The table keeps its OWN sender: the loop's clones live inside the task,
-    // so this handle is the only one reconcile can address. `try_send` on it
-    // is how a retiring loop is told to drain (bd-mk60).
 }
 /// auto-host of every nameable subscribed (project, workspace).
 fn reconcile_once(
@@ -1436,9 +1258,6 @@ fn reconcile_once(
     use doorbell_rt::lease;
     use doorbell_rt::subscribe::{Actor, SubscriptionStore};
     let mut store = SubscriptionStore::open(&cfg.flywheel_state);
-    // bd-oub3: hc enumerates the live workspaces, so a row whose workspace
-    // is gone is dead whatever its id and however old its journal. When hc
-    // does not answer there is no evidence, and the journal age decides.
     let live = plane_workspace_labels(&resolved_bins().hc);
     let reason = if live.is_some() {
         "workspace gone from hc".to_string()
@@ -1459,26 +1278,9 @@ fn reconcile_once(
         }
     }
     let _now = lease::unix_now();
-    // Bind the work list BEFORE looping: the `hosted` guard must not be
-    // held across the loop body — `spawn_host_loop` locks it again and
-    // parking_lot mutexes are not reentrant (self-deadlock wedged the
-    // whole runtime: every handler parked in lock_slow behind /health).
     let subs = store.list();
-    // Bind the key snapshot to a LOCAL: `&hosted_keys(&hosted.lock())` as a
-    // call argument keeps the guard alive until the end of the call
-    // statement, and `retire_unsubscribed` locks `hosted` again — parking_lot
-    // mutexes are not reentrant, so the inline form self-deadlocks the
-    // reconcile task forever (and every /health handler behind it).
-    // Auto-hosting is gone with the daemon typer: a host here would take
-    // the workspace lease as `no-text`, and the per-workspace loop that CAN
-    // type would defer to it (or refuse) — the deafness this whole split
-    // exists to prevent. The subscribed set still drives reap/retire below.
     let _unhosted = unhosted_subscribed(&subs, &hosted_keys(&hosted.lock()));
     let _ = (owned, health, cfg);
-    // bd-mk60: retire what this tick did not justify. Runs AFTER the auto-host
-    // pass so a pair that is still subscribed is already hosted — and that
-    // ordering is what makes the retire rule safe: an auto-hosted key is in
-    // `subscribed_keys(subs)`, so it can never be retired on the same tick.
     let hosted_now = hosted_keys(&hosted.lock());
     retire_unsubscribed(cfg, hosted, owned, health, &subs, &hosted_now);
 }
@@ -1529,8 +1331,6 @@ fn retire_unsubscribed(
             "doorbell serve: retiring {} (no subscription references it)",
             l.key
         );
-        // Not `try_send`: a full channel must not silently keep the loop
-        // alive. Spawn the send so reconcile never blocks on a busy brain.
         let tx = l.tx.clone();
         tokio::spawn(async move {
             let _ = tx.send(doorbell_rt::BrainMsg::Shutdown).await;
@@ -1797,7 +1597,6 @@ async fn handle_uds<S>(mut stream: S)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    // UDS accepts exact verbs only; arbitrary text is never a liveness reply.
     let Ok(req) = read_uds_request(&mut stream).await else {
         return;
     };
@@ -1892,7 +1691,6 @@ fn hosted_subscribers(fw_state: &std::path::Path, hosted: &[String]) -> usize {
 /// GS-062: `watch.last_event_age_s` is **event-only** — under Quiet wake
 /// (heartbeats alive, no lines) this is `null`/stale while `wake.class=Quiet`.
 fn hosted_watch_age(fw_state: &std::path::Path, hosted: &[String]) -> Option<u64> {
-    // GS-062: last_event_age_s from the **event** stamp (not hb).
     hosted
         .iter()
         .filter_map(|h| hosted_workspace(h))
@@ -1913,9 +1711,6 @@ fn hosted_wake_pipe(fw_state: &std::path::Path, hosted: &[String]) -> serde_json
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let workspaces: Vec<&str> = hosted.iter().filter_map(|h| hosted_workspace(h)).collect();
-    // Worst-of over every hosted workspace (ask-user F). Never max-merge
-    // stamps then classify once (Live would mask Deaf). Winner label becomes
-    // wake.workspace so stamps match the class (not first-alive).
     let stamps: Vec<(&str, Option<u64>, Option<u64>)> = workspaces
         .iter()
         .map(|ws| {
@@ -1950,8 +1745,6 @@ fn hosted_sweep_age(fw_state: &std::path::Path, hosted: &[String]) -> (Option<u6
         let Some(ws) = hosted_workspace(hw) else {
             continue;
         };
-        // rv23 #3: the sweep stamp is the beat (a no-op sweep writes no
-        // journal row); the journal's mtime is the fallback.
         let store = doorbell_rt::FileStore::new(fw_state);
         let journal = fw_state
             .join("journals")
@@ -1982,8 +1775,6 @@ fn hosted_sweep_age(fw_state: &std::path::Path, hosted: &[String]) -> (Option<u6
 /// artifact under test.
 pub(super) fn running_build_stamp(now_unix: u64) -> doorbell_rt::api::BuildStamp {
     let Ok(exe) = std::env::current_exe() else {
-        // Cannot name the exe: the compiled-in version still stands, and the
-        // observed fields stay absent rather than reporting a fake zero.
         return doorbell_rt::api::resolve_build_stamp(None, now_unix);
     };
     let observed = std::fs::metadata(&exe).ok().and_then(|md| {
@@ -1996,8 +1787,6 @@ pub(super) fn running_build_stamp(now_unix: u64) -> doorbell_rt::api::BuildStamp
         Some((mtime, md.len()))
     });
     let mut stamp = doorbell_rt::api::resolve_build_stamp(observed, now_unix);
-    // Set the path AFTER resolving: the resolver owns the observed fields, and
-    // reading `current_exe` is the only step that can fail.
     stamp.exe = Some(exe.display().to_string());
     stamp
 }
@@ -2030,8 +1819,6 @@ pub(super) fn is_build_behind_source(
 ) -> bool {
     match (exe_mtime, newest_source_mtime) {
         (Some(exe), Some(src)) => src > exe,
-        // No exe stamp, or no source to compare against: unanswerable, and an
-        // unanswerable check must not read as a fault.
         _ => false,
     }
 }
@@ -2045,8 +1832,6 @@ fn newest_doorbell_source_mtime() -> Option<u64> {
         .parent()
         .and_then(std::path::Path::parent)?;
     let mut newest: Option<u64> = None;
-    // A work-list rather than a recursive closure: recursion needs a named fn,
-    // and this stays a plain loop with no helper to unit test separately.
     let mut stack: Vec<std::path::PathBuf> = ["doorbell-cli", "doorbell-rt"]
         .iter()
         .map(|d| root.join("crates").join(d).join("src"))
@@ -2110,39 +1895,14 @@ pub(super) fn standby_blind_to_wakes(hosted: usize, known_workspaces: usize) -> 
 }
 
 fn health_body(app: &AppState) -> String {
-    // bd-2o1v: hosting is dynamic — snapshot under the lock once.
-    // GS-062: alive-first + alphabetical slug (not insertion order).
     let hosted = hosted_keys_for_health(&app.hosted.lock());
-    // D4.4: a torn journal tail degrades loudly here (bd-asr2.4).
     let store = doorbell_rt::FileStore::new(&app.fw_state);
     let mut degraded = Vec::new();
-    // bd-lorot: scoped to what we HOST. Scanning every journal let an abandoned
-    // workspace hold `degraded` red forever.
     let hosted_ws: Vec<&str> = hosted.iter().filter_map(|h| hosted_workspace(h)).collect();
-    // One fold, not two: the detailed probe answers the boolean AND the numbers.
     let tears = store.torn_tails_among(&hosted_ws);
     if !tears.is_empty() {
         degraded.push("journal_torn_tail".to_string());
     }
-    // bd-3uqz item E: `journal.seq_holes` — the condition that was REAL
-    // (flywheel-chiebukuro at 61.7%, 7962 sequence numbers burned for 4939
-    // events) and had no field, so the only way to see it was a forensic script
-    // counting rows in Python.
-    //
-    // ABSENT rather than zero when nothing is wrong, which is the whole contract
-    // for a health field. A workspace at 0.0% holes and a workspace with nothing
-    // sequenced would otherwise read identically, and one of those is UNMEASURED.
-    // `holes_pct` is None for a window with no seq, and a clean workspace is not
-    // listed at all. Worst first, so the top entry is the one to read.
-    //
-    // A CONTINUOUS retention drop is deliberately not a hole: `rotate` discards a
-    // contiguous range, so a rotated workspace stays dense. That is what stops
-    // every rotated workspace from reading like a burn.
-    //
-    // Deliberately NOT pushed into `degraded`. A field that fires on a healthy
-    // path is worse than no field, and 61.7% was a bug already fixed in ad128f1 —
-    // the point here is VISIBILITY of a recurrence, not a new red light for a
-    // condition that is already healed.
     let mut seq_holes: Vec<serde_json::Value> = hosted_ws
         .iter()
         .filter_map(|ws| {
@@ -2156,8 +1916,6 @@ fn health_body(app: &AppState) -> String {
                     "rows": h.rows,
                     "seq_from": h.seq_from,
                     "seq_to": h.seq_to,
-                    // Named apart from holes: a replayed write and a burned number
-                    // look identical in a ratio and are different defects.
                     "duplicates": h.duplicates,
                 })
             })
@@ -2169,21 +1927,8 @@ fn health_body(app: &AppState) -> String {
             .unwrap_or(0.0)
             .total_cmp(&a["holes_pct"].as_f64().unwrap_or(0.0))
     });
-    // Under comms the daemon genuinely holds no workspace, whatever the
-    // persisted arm list says: the per-workspace loops host.
     let mode = "standby";
-    // bd-enov (F17): standby is NOT green when known workspaces exist. A daemon
-    // that adopted without `--host` (plain `doorbell start`) reports
-    // mode=standby and delivers no rings, no inbox-digest wakes, no ack-SLA
-    // nudges — every wake path degrades to manual and NOTHING notices. Mark it
-    // degraded and name the arming verb so `arrive`/`briefing`/`status` see it.
     let known_workspaces = known_journal_workspaces(&app.fw_state);
-    // Under the comms flag this daemon is SUPPOSED to hold nothing: the
-    // per-workspace `flywheel __doorbell` loop owns the workspace lease and
-    // its brain + bus watch types the pane. Calling that standby "blind" made
-    // every operator read DEGRADED for a healthy split.
-    // No daemon typer exists, so a standby daemon is never "blind" to wakes:
-    // the per-workspace loops deliver them.
     let daemon_types = false;
     let wake_blind =
         daemon_types && standby_blind_to_wakes(hosted.len(), known_workspaces.len());
@@ -2192,28 +1937,13 @@ fn health_body(app: &AppState) -> String {
     }
     let (sweep_age, max_seq) = hosted_sweep_age(&app.fw_state, &hosted);
     let watch_age = hosted_watch_age(&app.fw_state, &hosted);
-    // ASK-USER E: Quiet/Live/Deaf via wake_liveness on hosted AppState keys.
     let wake = hosted_wake_pipe(&app.fw_state, &hosted);
-    // D2/P3: the daemon's own edges degrade loudly. Two facts that were
-    // live-invisible: every inbox fetch failing (`inbox_error` audits) and a
-    // watch child that dies far faster than its idle-exit cadence
-    // (`RestartWatch` rows). Both are read back from the ground-truth
-    // surfaces rather than tracked in RAM, so they survive a restart.
     let bins = resolved_bins();
     if !bins.toron_resolved || !bins.hc_resolved {
         degraded.push("cli_unresolved".to_string());
     }
     let now = doorbell_rt::lease::unix_now();
-    // bd-k0p7: name the build that is ANSWERING, next to `core_v`. Without
-    // this a stale installed binary is indistinguishable from a fresh one:
-    // a committed doorbell-cli fix sat unrun for 11h because flywheel was
-    // rebuilt and doorbell was not, and only an 8.9h-old stamp file gave it
-    // away. The stamp is measured from the running exe, not the source tree.
     let build = running_build_stamp(now);
-    // bd-k0p7: a build old enough to be suspect is DEGRADED, not merely
-    // reported. The 11h incident is the reason this is not advisory: an
-    // operator reading /health needs the daemon to say so, not to make the
-    // subtraction themselves.
     let exe_mtime = std::env::current_exe()
         .ok()
         .and_then(|p| std::fs::metadata(p).ok())
@@ -2241,42 +1971,13 @@ fn health_body(app: &AppState) -> String {
             )
         })
         .collect();
-    // Path-down only when EVERY hosted workspace has a fresh inbox_error.
-    // One pin timeout (or one leftover Buffy host) is a local miss, not a
-    // dead fetch path (bd-gpj0.4). The 2026-09-13 outage was every fetch.
     if inbox_path_down(&ages, PROBE_FRESH_SECS) {
         degraded.push("inbox_fetch_failing".to_string());
     }
-    // bd-xkte: a toron store AHEAD of the binary the daemon shells refuses
-    // every fetch, and the probe above structurally cannot name it — the store
-    // is shared, so "every hosted workspace has a fresh path-error" is a shape
-    // this fault never takes. ONE workspace is proof here, because the row
-    // names a store, not a workspace. Live 2026-09-28: every fetch refused and
-    // `/health` still read `degraded: []`.
-    //
-    // bd-r39p: and it keys on the marker in the refusal TEXT, not on a row
-    // kind. Keyed on the kind it could only ever see `inbox_store_skew`, which
-    // is written by one arm — while the arm that actually failed live was
-    // `scan_ack_sla`, refused by the same shared store at the same moment under
-    // `ack_sla_error`. The store does not care which caller asked, so neither
-    // does the probe.
     let skew_ages: Vec<Option<u64>> = audits.iter().map(|p| store_skew_age(p, now)).collect();
     if any_fresh(&skew_ages, PROBE_FRESH_SECS) {
         degraded.push("inbox_store_skew".to_string());
     }
-    // bd-sfvq: the audit files' own readability. Every other probe here
-    // substring-matches raw text, so a row that is not JSON is invisible to ALL
-    // of them at once — and `ts_of` cannot date it either, so it cannot even be
-    // reported as stale. Measured 2026-09-28: 513 unreadable rows in one
-    // workspace, while `/health` reported `torn_tails: null` (which is about the
-    // JOURNAL, a different file).
-    //
-    // Degrade only on a tear that is HAPPENING. A torn row cannot be dated (the
-    // splice mangles the quote before its `ts`), so the probe bounds it from
-    // below with the last datable row in FRONT of it. Gating on the newest row
-    // instead would say "live" whenever the FILE is being written, which is
-    // always on a healthy daemon, and the 513 historical rows would pin
-    // `degraded` red forever.
     let mut audit_tears: Vec<serde_json::Value> = Vec::new();
     let mut tearing_now = false;
     for (ws, path) in ws_names.iter().zip(audits.iter()) {
@@ -2294,9 +1995,6 @@ fn health_body(app: &AppState) -> String {
             "workspace": ws,
             "torn": tear.torn,
             "scanned": tear.scanned,
-            // The tear happened AT OR AFTER this row. null = the torn lines are
-            // at the head of the window with nothing datable in front of them,
-            // which is UNMEASURED, not fresh.
             "tear_after_age_s": tear_after_age,
             "newest_row_age_s": tear.newest_row.map(|ts| now.saturating_sub(ts)),
         }));
@@ -2314,10 +2012,6 @@ fn health_body(app: &AppState) -> String {
         .iter()
         .map(|w| workspace_journal_path(&app.fw_state, w))
         .collect();
-    // bd-watch-restart-metric-8dvf: the brain journals one `RestartWatch` row
-    // per ACTUAL restart (not per `Died` message), so this count is the thing
-    // the flag's name says. It is also reported as a rate: a burst is legible
-    // as N/min, where the bare threshold only says "crossed".
     let restarts = doorbell_rt::tailprobe::count_matches_within_across(
         journals.iter().map(std::path::PathBuf::as_path),
         "RestartWatch",
@@ -2328,20 +2022,11 @@ fn health_body(app: &AppState) -> String {
     if restarts > restart_budget {
         degraded.push("watch_restart_loop".to_string());
     }
-    // bd-ba8t: the prompt hop needs an INJECTABLE pane, and that precondition
-    // used to be invisible — a hosted daemon with zero hc agents read
-    // `degraded: []` while no wake could ever land (gs-044's hard part).
     let inj = hosted_injection(&app.fw_state, &hosted, &bins.hc);
-    // Under the comms flag the daemon types nothing: the per-workspace loops
-    // own the prompt hop, so "this daemon has no injectable pane" is the
-    // correct split, not a fault.
     let no_prompt_hop = daemon_types && prompt_hop_degraded(hosted.len(), &inj);
     if no_prompt_hop {
         degraded.push("no_injectable_panes".to_string());
     }
-    // mcc9: the wake → brain hop's exact counters, per hosted workspace. A
-    // digest that says "N queued" while lines never reached the brain was the
-    // silent failure; a FRESH drop degrades loudly, a historical one is shown.
     let wake_brain_rows: Vec<(String, Option<doorbell_rt::wake_brain::WakeBrainSnapshot>)> =
         ws_names
             .iter()
@@ -2360,9 +2045,6 @@ fn health_body(app: &AppState) -> String {
     let mailbox_root = doorbell_rt::toron_data_root(None);
     let presence_age =
         doorbell_rt::watchbeat::file_age_secs(&doorbell_rt::presence_path(&mailbox_root));
-    // bd-health-loop-hosted-b98hy: the daemon hosts nothing under comms, so
-    // /health.hosted is [] while per-workspace loops hold live leases. Name
-    // them here (standby semantics unchanged: `mode` still reads the daemon).
     let lease_hosted = lease_hosted_for_health(
         &hosted,
         &doorbell_rt::lease::live_leases(&app.fw_state, doorbell_rt::lease::unix_now())
@@ -2378,14 +2060,7 @@ fn health_body(app: &AppState) -> String {
         "mode": mode,
         "hosted": hosted,
         "lease_hosted": lease_hosted,
-        // bd-k0p7: the build identity of the RUNNING binary. `core_v` is a
-        // compiled-in constant every build shares, so on its own it cannot
-        // tell a stale installed binary from a fresh one; this names the build
-        // that is actually answering.
         "build": build,
-        // The CLIs actually exec'd. An operator reading `/health` after a
-        // silent ring can see the resolved paths instead of guessing which
-        // `toron`/`hc` a launchd daemon found.
         "binaries": {
             "toron": bins.toron,
             "hc": bins.hc,
@@ -2394,15 +2069,9 @@ fn health_body(app: &AppState) -> String {
                 "hc": bins.hc_resolved,
             },
         },
-        // last_event_age_s is .event-only (GS-062 split; not hb). Quiet wake
-        // (hb live, no bus lines) → null/stale here while wake.class=Quiet.
-        // None also covers never-seen events (wrong bus or dead child).
         "watch": {
             "state": if hosted.is_empty() { "standby" } else { "hosted" },
             "last_event_age_s": watch_age,
-            // bd-watch-restart-metric-8dvf: the measured rate next to the
-            // budget it is compared against, so an operator reads "23.4/min
-            // against a 1.2/min budget" instead of only "watch_restart_loop".
             "restarts": restarts,
             "restart_window_s": WATCH_WINDOW_SECS,
             "restart_budget_per_window": restart_budget,
@@ -2410,34 +2079,16 @@ fn health_body(app: &AppState) -> String {
                 * 100.0)
                 .round()
                 / 100.0,
-            // bd-68q2: process fd census next to the restart rate — the two
-            // numbers that together say "restart storm" vs "fd wall". Null
-            // where unreadable; the EMFILE rows carry the same number at failure.
             "open_fds": doorbell_rt::wake_sock::open_fd_count(),
         },
-        // GS-062 ASK-USER E: wake_liveness Quiet/Live/Deaf (same shape as
-        // flywheel serve /health). Keys come from AppState.hosted.
         "wake": wake,
-        // mcc9: `dropped` / `wake_brain_full` (+ backpressured, resumed) —
-        // exact, cumulative since the host armed. `doorbell status` prints
-        // this body, so the counts are where an operator already looks.
         "wake_brain": wake_brain,
         "sweep": {"last_age_s": sweep_age},
-        // Measured, not hardcoded: the literal `0` here read as "no wake
-        // subscriptions" even on a fully hosted daemon mid-ring, and sent
-        // operators hunting the wrong fault.
         "subscribers": hosted_subscribers(&app.fw_state, &hosted),
-        // The mailbox this daemon actually watches. A daemon on a different
-        // toron root than the pins' bus is deaf; presence_age_s (None = no
-        // projection ever written at the canonical root-level path) makes
-        // that comparable in one read.
         "mailbox": {
             "toron_data_dir": mailbox_root.display().to_string(),
             "presence_age_s": presence_age,
         },
-        // bd-ba8t: can a wake land here at all? `prompt_hop` is a word, not a
-        // number to interpret: `no_pane_in_plane` means every registry pin's
-        // pane is unknown to hc, so wakes queue/digest and never inject.
         "injection": {
             "pins": inj.pins,
             "panes_seen": inj.panes_seen,
@@ -2446,11 +2097,6 @@ fn health_body(app: &AppState) -> String {
             "prompt_hop": if no_prompt_hop { "no_pane_in_plane" } else { "ok" },
         },
         "degraded": degraded,
-        // bd-5qyt: the tear's SIZE rides beside the flag. `journal_torn_tail`
-        // alone reads the same for a 16-row hole and a 5,175-row one, and this
-        // body is what `doorbell status` prints verbatim. Explicit `null` (not
-        // an empty array) when nothing is torn — the `standby_hint` shape, so
-        // "nothing is torn" never arrives looking like "torn, but tiny".
         "torn_tails": if tears.is_empty() {
             serde_json::Value::Null
         } else {
@@ -2472,10 +2118,6 @@ fn health_body(app: &AppState) -> String {
                     .collect(),
             )
         },
-        // bd-sfvq: unreadable AUDIT rows, beside the journal's torn tails rather
-        // than inside them, because they are a different file and a different
-        // fault. `null` when every hosted audit is clean, so "nothing is torn"
-        // cannot arrive looking like "torn, but zero".
         "audit_torn_rows": if audit_tears.is_empty() {
             serde_json::Value::Null
         } else {
@@ -2494,9 +2136,6 @@ fn health_body(app: &AppState) -> String {
         "journal": {
             "seq": max_seq,
             "lag_lines": 0,
-            // `null`, not `[]`, when nothing burned — the torn_tails shape, so
-            // "no workspace burned a seq" never arrives looking like a report of
-            // zero burned sequences.
             "seq_holes": if seq_holes.is_empty() {
                 serde_json::Value::Null
             } else {
@@ -2546,8 +2185,6 @@ pub(super) fn wake_brain_health(
             "backpressured": total.backpressured,
             "forwarded": total.forwarded,
             "resumed": total.resumed,
-            // toron#17: gap frames from the wake sidecar (cap eviction
-            // upstream). Non-zero means events were lost, not delayed.
             "events_lost": total.events_lost,
             "last_drop_age_s": total.last_drop_unix.map(|t| now.saturating_sub(t)),
             "policy": format!(
@@ -2597,7 +2234,6 @@ fn events_body(state_dir: &std::path::Path, since: Option<u64>) -> String {
             }
             Replay::Gone { .. } => {}
         }
-        // Retention honesty per workspace (same rule as `why`).
         if let (Some(q), Some(first)) = (since, fold.first_seq)
             && q < first.saturating_sub(1)
         {
@@ -2628,8 +2264,6 @@ fn events_body(state_dir: &std::path::Path, since: Option<u64>) -> String {
 /// flywheel state dir; per-loop runtime counters stay in RunReports).
 fn stats_body(app: &AppState) -> String {
     let hosted = hosted_keys(&app.hosted.lock());
-    // bd-lorot: hoisted because `hosted` is MOVED into the json body below,
-    // and the torn-tail check must be scoped to what we host.
     let hosted_ws: Vec<&str> = hosted.iter().filter_map(|h| hosted_workspace(h)).collect();
     let store = doorbell_rt::FileStore::new(&app.fw_state);
     let mut journal_rows = 0u64;
@@ -2665,8 +2299,6 @@ fn stats_body(app: &AppState) -> String {
             .map(|(ws, _)| ws)
             .collect::<Vec<_>>(),
         ),
-        // bd-k0p7: same stamp on the compact body, so neither /health shape
-        // can be the one that hides a stale build.
         "build": running_build_stamp(doorbell_rt::lease::unix_now()),
         "workspaces": workspaces,
         "journal_rows": journal_rows,
@@ -2795,16 +2427,6 @@ mod tests {
             !stamp.version.is_empty(),
             "a stamp with no version names no build: {stamp:?}"
         );
-        // Assert the IO half is WIRED and SELF-CONSISTENT, not that the binary
-        // is fresh. The first version of this test asserted `age < 3600` on the
-        // reasoning that "this test binary was linked seconds ago" — which is
-        // true only on a cold build. On a warm cargo cache the binary is hours
-        // old and the test went red (observed: 8037s) with nothing wrong in the
-        // code. A test that passes only when the build cache is cold is not
-        // hermetic; it is the same class as a test that reads ambient state.
-        //
-        // What actually needs proving is that the reported numbers describe the
-        // SAME file the test can see. So read that file and compare.
         let exe = stamp.exe.clone().expect("stamp names an exe");
         let meta = std::fs::metadata(&exe)
             .unwrap_or_else(|e| panic!("the named exe must exist and be readable: {exe}: {e}"));
@@ -2844,25 +2466,18 @@ mod tests {
     fn stale_build_compares_source_not_the_clock() {
         use super::is_build_behind_source;
 
-        // The shape that made this field exist: a committed fix sat unrun. Its
-        // source IS newer than the exe, so it is still caught.
         assert!(
             is_build_behind_source(Some(1_000_000 - 39_600), Some(1_000_000)),
             "source newer than the exe IS a real staleness and must stay degraded"
         );
 
-        // The false positive this replaces: a long-running daemon with NO newer
-        // source. Under the old age rule this was degraded; it is not now.
         assert!(
             !is_build_behind_source(Some(1_000_000 - 39_600), Some(1_000_000 - 39_601)),
             "an 11h-old build with no source delta is UP TO DATE and must not degrade"
         );
 
-        // Source exactly equal to the exe is not "behind".
         assert!(!is_build_behind_source(Some(1_000_000), Some(1_000_000)));
 
-        // Unanswerable is not a fault: an unreadable exe, and a deployed binary
-        // with no source tree beside it, must both stay quiet rather than cry wolf.
         assert!(!is_build_behind_source(None, Some(1_000_000)));
         assert!(!is_build_behind_source(Some(1_000_000), None));
         assert!(!is_build_behind_source(None, None));
@@ -2891,10 +2506,8 @@ mod tests {
             !unknown.age_s.is_some_and(|a| a > LEGACY_BUILD_STALE_SECS),
             "unknown must not read as stale"
         );
-        // And a build inside the window is fresh.
         let fresh = doorbell_rt::api::resolve_build_stamp(Some((1_000_000 - 60, 1)), 1_000_000);
         assert!(!fresh.age_s.is_some_and(|a| a > LEGACY_BUILD_STALE_SECS));
-        // The 11h incident shape IS stale.
         let stale = doorbell_rt::api::resolve_build_stamp(Some((1_000_000 - 39_600, 1)), 1_000_000);
         assert!(stale.age_s.is_some_and(|a| a > LEGACY_BUILD_STALE_SECS));
     }
@@ -3053,7 +2666,6 @@ mod tests {
     /// regression test above it for the case where only the first is blocked.
     #[tokio::test(start_paused = true)]
     async fn send_shutdowns_bounds_the_send_phase_and_names_every_unsent_key() {
-        // Capacity 1, pre-filled: the next send parks until the budget fires.
         let (blocked_tx, _blocked_rx) = tokio::sync::mpsc::channel(1);
         blocked_tx
             .try_send(doorbell_rt::BrainMsg::Shutdown)
@@ -3281,7 +2893,6 @@ mod tests {
         let ts = chrono::DateTime::from_timestamp(doorbell_rt::lease::unix_now() as i64 - 5, 0)
             .expect("now in range")
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        // Two hosted workspaces, the fault on ONE of them.
         std::fs::write(
             dir.join("doorbell/ws-a.audit.jsonl"),
             format!("{{\"ts\":\"{ts}\",\"kind\":\"inbox_store_skew\",\"workspace\":\"ws-a\"}}\n"),
@@ -3305,7 +2916,6 @@ mod tests {
             body.contains("inbox_store_skew"),
             "one workspace's fresh skew row is proof the store is unopenable: {body}"
         );
-        // The same shape under the generic kind must stay quiet.
         std::fs::write(
             dir.join("doorbell/ws-a.audit.jsonl"),
             format!("{{\"ts\":\"{ts}\",\"kind\":\"inbox_error\",\"workspace\":\"ws-a\"}}\n"),
@@ -3343,8 +2953,6 @@ mod tests {
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let refusal = "toron refuses this store: migration 14 is ahead of the \
                        binary, which resolves at most 13 [toron-error=store_skew]";
-        // The kind is ack_sla_error: the arm that actually failed. Under the
-        // kind-keyed probe this row was invisible, and the skew with it.
         std::fs::write(
             dir.join("doorbell/ws-a.audit.jsonl"),
             format!("{{\"ts\":\"{ts}\",\"kind\":\"ack_sla_error\",\"error\":\"{refusal}\"}}\n"),
@@ -3368,7 +2976,6 @@ mod tests {
             body.contains("inbox_store_skew"),
             "a refusal carrying the marker degrades the daemon whatever kind wrote it: {body}"
         );
-        // A stale marker is history, not a live fault.
         let old = chrono::DateTime::from_timestamp(doorbell_rt::lease::unix_now() as i64 - 4000, 0)
             .expect("old in range")
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -3401,10 +3008,6 @@ mod tests {
     #[test]
     fn health_counts_unreadable_audit_rows_and_only_degrades_on_a_live_tear() {
         use super::{AppState, CachedHealth, health_body};
-        // Named for THIS test alone. The pid suffix is shared by every test in
-        // this binary, so a name reused from another test is a race between two
-        // fixtures that each `remove_dir_all` the same directory — which is how
-        // this test passed alone and failed 6 times in 6 in the full suite.
         let dir = std::env::temp_dir().join(format!("db-health-audittear-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("doorbell")).expect("mkdir audit");
@@ -3421,11 +3024,6 @@ mod tests {
             })),
         };
         let audit = dir.join("doorbell/ws-a.audit.jsonl");
-        // Both stamps captured ONCE, up front, and every phase writes a whole
-        // file from them. Deriving the aged fixture by string-replacing the
-        // fresh one silently no-ops the moment the test crosses a second
-        // boundary, which is a test that passes on a fast machine and fails on a
-        // loaded one -- the exact shape of a flake nobody can reproduce.
         let fresh = chrono::DateTime::from_timestamp(doorbell_rt::lease::unix_now() as i64, 0)
             .expect("in range")
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -3433,15 +3031,8 @@ mod tests {
             chrono::DateTime::from_timestamp(doorbell_rt::lease::unix_now() as i64 - 4000, 0)
                 .expect("in range")
                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        // Two spliced rows (what concurrent appenders produce), with GOOD rows
-        // in front of them, which is the only shape a real file has: the probe
-        // bounds a tear by the last datable row before it, so a fixture that
-        // opens with the tear would test nothing about the bound.
         let spliced = r#"{"kind":"wake_sock_absent","reason":"x"{"kind":"y","ts":"#;
         let good = |t: &str| format!("{{\"ts\":\"{t}\",\"kind\":\"ok\",\"workspace\":\"ws-a\"}}\n");
-        // Each splice needs its own newline: the constant has none, so without
-        // one the two of them land on the SAME line and the file carries one
-        // torn row where the test claims two.
         let torn_with = |t: &str| format!("{}{}\n{}\n{}", good(t), spliced, spliced, good(t));
         std::fs::write(&audit, torn_with(&fresh)).expect("write audit");
         let body = health_body(&app);
@@ -3463,9 +3054,6 @@ mod tests {
                 .is_some_and(|d| d.iter().any(|x| x == "audit_rows_torn")),
             "a tear under rows written seconds ago is happening now: {body}"
         );
-        // The same tear, with the row IN FRONT of it old: reported, NOT
-        // degraded. The rows after it stay fresh on purpose — a gate that keyed
-        // on the newest row would still call this live, which is the bug.
         std::fs::write(&audit, torn_with(&aged)).expect("rewrite audit");
         let body = health_body(&app);
         let v: serde_json::Value = serde_json::from_str(&body).expect("health json");
@@ -3486,8 +3074,6 @@ mod tests {
             "a tear nobody is appending to any more is not a live fault, even \
              though this file is still being written: {body}"
         );
-        // A clean file reports null, not zero: absent is UNMEASURED, which is
-        // not the same claim.
         std::fs::write(&audit, good(&fresh)).expect("clean");
         let body = health_body(&app);
         let v: serde_json::Value = serde_json::from_str(&body).expect("health json");
@@ -3515,7 +3101,6 @@ mod tests {
             "{{\"ts\":\"{ts}\",\"kind\":\"ok\",\"pad\":\"{}\"}}\n",
             "p".repeat(200)
         );
-        // Comfortably past MAX_TAIL_BYTES so the window must start mid-file.
         let whole: String = std::iter::repeat_n(row.as_str(), 2000).collect();
         std::fs::write(&path, &whole).expect("write big");
         assert!(
@@ -3525,10 +3110,6 @@ mod tests {
         let tear = doorbell_rt::tailprobe::audit_tear(&path).expect("readable");
         assert_eq!(tear.torn, 0, "a healthy big audit tears nowhere: {tear:?}");
         assert!(tear.scanned > 0, "and rows were really read: {tear:?}");
-        // A real splice inside the same size file is still caught — spliced into
-        // the LAST row, because the probe reads the tail and a splice planted
-        // in the head is outside what it can see (that is the point of a bounded
-        // read, and this test must not confuse a bounded read with a blind one).
         let (head, tail) = whole
             .rsplit_once(&format!("{{\"ts\":\"{ts}\""))
             .expect("many rows");
@@ -3572,7 +3153,6 @@ mod tests {
 
     #[test]
     fn hosted_keys_for_health_orders_by_workspace_slug() {
-        // Insertion order: beta then alpha; health order must be alpha first.
         let hosts = vec![host_for_test("zzz/beta"), host_for_test("aaa/alpha")];
         let keys = super::hosted_keys(&hosts);
         assert_eq!(
@@ -3589,9 +3169,6 @@ mod tests {
 
     #[test]
     fn lease_hosted_names_live_loops_the_daemon_does_not() {
-        // Daemon keys are project/workspace; leases are bare workspace names.
-        // Covered leases stay out (deduped by workspace half), the rest are
-        // named sorted: standby keeps its semantics, blindness ends.
         let daemon = vec!["flywheel/flywheel".to_string()];
         let leases = vec!["toron".to_string(), "flywheel".to_string()];
         assert_eq!(
@@ -3651,12 +3228,11 @@ mod tests {
 
     #[test]
     fn hosted_wake_pipe_worst_of_deaf_plus_live() {
-        // Stamp-pair unit (mtime backdate not required): Deaf + Live → Deaf.
         let pipe = doorbell_rt::wake_liveness::classify_worst_of(
             200_000,
             [
-                (None, Some(100_000u64)),             // Deaf
-                (Some(199_000u64), Some(198_000u64)), // Live
+                (None, Some(100_000u64)),
+                (Some(199_000u64), Some(198_000u64)),
             ],
             doorbell_rt::wake_liveness::DEFAULT_DEAF_CEILING_MS,
         );
@@ -3671,8 +3247,6 @@ mod tests {
 
     #[test]
     fn hosted_wake_pipe_worst_workspace_label_matches_stamps() {
-        // Winner label from classify_worst_of_stamps must be the Deaf ws, not
-        // first-alive Live — same contract hosted_wake_pipe uses for workspace.
         let (pipe, winner, ev, hb) = doorbell_rt::wake_liveness::classify_worst_of_stamps(
             200_000,
             [
@@ -3707,13 +3281,11 @@ mod tests {
             vec!["proj/gone".to_string()],
             "only the unsubscribed, non-boot host retires"
         );
-        // Nothing subscribed and nothing boot-configured: every loop retires.
         assert_eq!(
             super::retire_keys(&hosted, &[], &[]).len(),
             3,
             "an empty subscription set retires every non-boot host"
         );
-        // A boot host is never retired on its own account.
         assert!(super::retire_keys(&boot, &boot, &[]).is_empty());
     }
 
@@ -3768,8 +3340,6 @@ mod tests {
         let live = super::subscribed_keys(&[named]);
         assert_eq!(live, vec!["proj/w".to_string()]);
         let hosted = vec!["proj/w".to_string(), "proj/orphan".to_string()];
-        // Even with no boot config, the subscribed key survives and the
-        // orphan does not — the two rules read one set.
         assert_eq!(
             super::retire_keys(&hosted, &[], &live),
             vec!["proj/orphan".to_string()]
@@ -3906,7 +3476,6 @@ mod tests {
             row("cli-arrival-p", "flywheel-proj-live", "proj-live"),
             row("cli-arrival-dead-p", "flywheel-proj-dead", "proj-dead"),
         ];
-        // A FRESH journal everywhere: age must not decide anything.
         let aged = |_ws: &str| Some(0);
         let mut reaped = reap_candidates(&rows, Some(&live), aged);
         reaped.sort();
@@ -3996,8 +3565,6 @@ mod tests {
                 .into_iter()
                 .collect::<std::collections::BTreeSet<String>>()
         );
-        // An answer that is not hc's shape is NO EVIDENCE, never an empty
-        // set that would read as "every workspace is gone".
         assert!(
             plane_workspace_labels("/nonexistent-hc-binary").is_none(),
             "an hc that cannot be run reports no evidence"
@@ -4043,13 +3610,9 @@ mod tests {
         );
         assert!(refused.is_empty(), "{refused:?}");
 
-        // Two rows, same endpoint -> ONE adapter (a second would be a
-        // duplicate worker for the same socket).
         let (regs, _) = super::webhook_registrations(&[named.clone(), named.clone()], "w", &allow);
         assert_eq!(regs.len(), 1, "distinct endpoints, not distinct rows");
 
-        // Two rows, two endpoints -> TWO adapters (that is the point of
-        // per-subscription routing).
         let other = row(
             "b",
             SinkKind::Webhook,
@@ -4059,14 +3622,12 @@ mod tests {
         let (regs, _) = super::webhook_registrations(&[named.clone(), other], "w", &allow);
         assert_eq!(regs.len(), 2, "per-subscription endpoints stay separate");
 
-        // A webhook row with no URL: refuse LOUDLY, register nothing.
         let bare = row("c", SinkKind::Webhook, None, "w");
         let (regs, refused) = super::webhook_registrations(&[bare], "w", &allow);
         assert!(regs.is_empty(), "no URL means no adapter: {regs:?}");
         assert_eq!(refused.len(), 1, "and it must be named: {refused:?}");
         assert!(refused[0].contains("--url"), "{refused:?}");
 
-        // An off-allowlist endpoint: refused (D6 egress), nothing registered.
         let evil = row(
             "d",
             SinkKind::Webhook,
@@ -4081,8 +3642,6 @@ mod tests {
             "the refusal names the operator knob: {refused:?}"
         );
 
-        // Another workspace's rows are not this host's business, and a
-        // hc row never becomes a webhook adapter.
         let elsewhere = row(
             "e",
             SinkKind::Webhook,
@@ -4117,8 +3676,6 @@ mod tests {
             ),
         )
         .expect("write audit");
-        // Thrash = a restart every 16s (the live failure), not one routine
-        // idle-exit restart: the probe must count, not sample recency.
         let mut journal = String::new();
         for off in (0..=288).step_by(16) {
             let stamp =
@@ -4154,10 +3711,6 @@ mod tests {
             body.contains("watch_restart_loop"),
             "watch thrash must be named in degraded: {body}"
         );
-        // bd-watch-restart-metric-8dvf: 19 rows inside the 300s window is 3.8
-        // restarts/min against a 6-per-window budget. Both numbers ride in the
-        // payload, so a burst is legible as a rate rather than only as a
-        // crossed flag.
         assert!(
             body.contains("\"restarts\":19") && body.contains("\"restart_rate_per_min\":3.8"),
             "the measured rate must be readable next to the flag: {body}"
@@ -4231,8 +3784,6 @@ mod tests {
             body.contains("\"scanned\":2"),
             "both hosted workspaces are scanned, so absence means clean, not unread: {body}"
         );
-        // The pre-existing journal keys survive: this field is ADDITIVE and must
-        // not have displaced them via a duplicate key in one json!() object.
         assert!(
             body.contains("\"lag_lines\":0"),
             "the existing journal keys must survive the merge: {body}"
@@ -4294,8 +3845,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("doorbell")).expect("mkdir audit");
         std::fs::create_dir_all(dir.join("journals")).expect("mkdir journal");
-        // Sweeps contiguous through seq 3, then seq 10: six values (4..=9) gone,
-        // and the two rows after the hole are what the fold withholds.
         let mut journal = String::new();
         for seq in [1, 2, 3, 10, 11] {
             journal.push_str(&format!(
@@ -4319,13 +3868,10 @@ mod tests {
             })),
         };
         let body = health_body(&app);
-        // The flag itself is unchanged: still degraded, still the pinned name.
         assert!(
             body.contains("journal_torn_tail"),
             "a real tear still degrades with the ADR-0012 token: {body}"
         );
-        // And now the numbers that make it readable: which workspace, how many
-        // seqs, which range, and how much history the fold cannot reach.
         assert!(
             body.contains("\"workspace\":\"flywheel-flywheel\"")
                 && body.contains("\"missing_seqs\":6")
@@ -4334,8 +3880,6 @@ mod tests {
                 && body.contains("\"rows_withheld\":2"),
             "the tear must arrive with its size, range and withheld rows: {body}"
         );
-        // A healthy workspace must NOT grow the key: an always-present empty
-        // array reads as a field that means nothing.
         std::fs::write(
             dir.join("journals/doorbell-journal-flywheel-flywheel.jsonl"),
             "{\"v\":2,\"seq\":1,\"actions\":[],\"executed\":{}}\n",
@@ -4509,9 +4053,6 @@ mod tests {
             })),
         };
         assert_eq!(cached_health_body(&app), "CANNED");
-        // A STALE snapshot must still be served as-is: recomputing inline runs
-        // hc/toron subprocesses, and one loaded host made /health exceed any
-        // client budget while the daemon was healthy (measured live 2026-10-31).
         app.health.lock().computed_at = Instant::now()
             .checked_sub(std::time::Duration::from_secs(3_600))
             .unwrap_or_else(Instant::now);

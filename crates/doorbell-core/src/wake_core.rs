@@ -430,9 +430,6 @@ pub fn digest_bead_ids(entries: &[DigestEntry]) -> Vec<String> {
 pub fn render_digest(entries: &[DigestEntry], now: u64) -> String {
     let mut out = format!("doorbell afk digest ({} items)\n", entries.len());
     for e in entries {
-        // bd-z5ut: `at_unix == 0` means "recorded before any clock Msg in this
-        // fold", NOT "56 years ago". Subtracting it printed a raw epoch value
-        // dressed as a duration, which is worse than admitting the unknown.
         let age = match e.at_unix {
             0 => "age unknown".to_string(),
             t => format!("{}s ago", now.saturating_sub(t)),
@@ -628,8 +625,6 @@ pub fn tick(model: &WakeModel, msg: &WakeMsg) -> (WakeModel, Vec<WakeEffect>) {
             next = t;
             vec![WakeEffect::FloodVerdict { gate }]
         }
-        // Guard for this arm: Guard::and(Guard::HasRoute, Guard::BudgetAllows)
-        // (recorded in machine_config); the behavior owner is route_wake.
         WakeMsg::Route { input } => {
             vec![WakeEffect::Routed {
                 decision: route_wake(input),
@@ -877,7 +872,6 @@ mod wake_core_tests_bd_0nem {
         let (m2, e2) = run();
         assert_eq!(m1, m2, "models identical");
         assert_eq!(e1, e2, "effects identical");
-        // Spot-check the scripted outcomes: pause, inject, settle, note.
         assert!(matches!(e1[0], WakeEffect::FloodVerdict { .. }));
         assert!(matches!(
             e1[1],

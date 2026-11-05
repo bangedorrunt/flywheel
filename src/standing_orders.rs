@@ -1,15 +1,4 @@
 // governed-by: ADR-0019
-// Wave-3 standing-orders generator (bd-w3-standing-orders-admu, ADR-0019
-// Spec 2): the GLOBAL standing orders are GENERATED from the principle
-// registry + the wave-1 criticals — numbered lines, one constraint each,
-// names only (never pasted leaves). Project fences at
-// `<project>/.flywheel/standing-orders.md` are AUTHORED and are preserved
-// byte-identical on every regenerate (the layering guarantee: regen writes
-// ONLY the global path). The brief's STANDING field references the paths
-// (w1-brief contract); nothing is ever pasted into a dispatch.
-//
-// CLI wiring (`flywheel standing-orders regen`) lands in main.rs after the
-// principle-registry CLI (bd-w3-registry-cli-21qb) — see the channel note.
 
 use crate::principles::PRINCIPLE_NAMES;
 
@@ -122,7 +111,6 @@ mod tests {
                 "principle {name} has its own line"
             );
         }
-        // names only: the leaf texts are NOT in the file
         assert!(!text.contains("minimize-reader-load —"), "no leaf text");
     }
 
@@ -139,11 +127,9 @@ mod tests {
         let authored =
             "# PROJECT FENCES — hand-authored, never clobbered.\n1. this project requires X\n";
         std::fs::write(&fence, authored).unwrap();
-        // record mtime + content
         let before_meta = std::fs::metadata(&fence).unwrap();
         let before_modified = before_meta.modified().unwrap();
         let global = dir.join("config").join("standing-orders.md");
-        // regen (twice — regen is idempotent and never touches the fence)
         regen_global(&global).unwrap();
         regen_global(&global).unwrap();
         assert_eq!(
@@ -157,7 +143,6 @@ mod tests {
             after_meta.modified().unwrap(),
             "fence not even touched (mtime unchanged)"
         );
-        // the global was (re)generated with the full content
         let g = std::fs::read_to_string(&global).unwrap();
         assert!(g.contains("claim before work"), "global regenerated");
         assert!(g.contains("prove-it-works"), "principle names present");

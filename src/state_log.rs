@@ -67,9 +67,6 @@ pub fn model_json<T: Serialize>(model: &T) -> anyhow::Result<String> {
     Ok(serde_json::to_string(model)?)
 }
 
-// bd-4dpq remaining slice: the decode half has no production caller until the
-// replay/fork verbs land. Tested and fail-closed; allow-listed rather than
-// deleted, because a write-only checkpoint log is not a feature.
 #[allow(dead_code)]
 /// Decode a model from the log's payload form. Pure, and FAIL-CLOSED: an
 /// unparseable payload is an error, never a default.
@@ -110,8 +107,6 @@ pub fn model_from_boundary<M: DeserializeOwned>(payload: &str) -> anyhow::Result
 }
 
 /// The stored effect keys of a boundary, for the resume path.
-// bd-4dpq remaining slice: the replay/fork verbs consume this. Tested; see the
-// note on `model_from_json`.
 #[allow(dead_code)]
 pub fn effect_keys_from_boundary(payload: &str) -> anyhow::Result<Vec<String>> {
     let wrapper: BoundaryWrapper<serde_json::Value> = serde_json::from_str(payload)?;
@@ -121,8 +116,6 @@ pub fn effect_keys_from_boundary(payload: &str) -> anyhow::Result<Vec<String>> {
 #[derive(serde::Deserialize)]
 struct BoundaryWrapper<M> {
     model: M,
-    // Read by `effect_keys_from_boundary`, which is allow-listed as the
-    // remaining slice's seam rather than deleted.
     #[serde(default)]
     #[allow(dead_code)]
     effect_keys: Vec<String>,
@@ -201,8 +194,6 @@ mod tests {
         m.swarm.heal_states.clear();
         m
     }
-
-    // --- the load-bearing property -------------------------------------------
 
     #[test]
     fn populated_model_round_trips_exactly() {
@@ -290,8 +281,6 @@ mod tests {
             vec![1_700_000_700],
             "budgets incl. its rolling prompt window"
         );
-        // SelfIndex's maps are PRIVATE, so prove the index round-tripped by
-        // behaviour rather than by field access.
         assert_eq!(
             back.doorbell.index.npub("BrashOtter"),
             Some("d335c51c"),
@@ -319,8 +308,6 @@ mod tests {
         );
     }
 
-    // --- the Tick Law is unaffected ------------------------------------------
-
     /// Serializing the model must not have changed the fold. Same log, same model,
     /// same command list — asserted directly rather than inferred.
     #[test]
@@ -334,7 +321,6 @@ mod tests {
         };
 
         let (a, ca) = crate::workspace::tick(&model, &msg);
-        // Round-tripping the model first must not change the outcome.
         let json = model_json(&model).expect("serialize");
         let model2: WorkspaceModel = model_from_json(&json).expect("deserialize");
         let (b, cb) = crate::workspace::tick(&model2, &msg);
@@ -345,7 +331,6 @@ mod tests {
             format!("{cb:?}"),
             "same log, same command list"
         );
-        // And a serialize/deserialize cycle in the middle is a no-op for identity.
         assert_eq!(
             model2, model,
             "the round trip is the identity on this model"

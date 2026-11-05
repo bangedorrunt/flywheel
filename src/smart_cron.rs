@@ -323,7 +323,6 @@ mod tests {
         .expect("deployed docker-upgrade.yaml readable");
 
         let wf = parse_workflow(&yaml).expect("deployed yaml parses");
-        // every health-gate step is a shell verify with on_error: fail_run
         let mut probe_count = 0;
         for step in &wf.steps {
             if let Action::Verify { command } = &step.action {
@@ -341,7 +340,6 @@ mod tests {
             }
         }
         assert_eq!(probe_count, 5, "five saga health-gates");
-        // the schedule + policy are set (owner housekeeper, bead on failure)
         match &wf.trigger {
             Some(toron_workflow::schema::Trigger::Schedule { owner, scope, .. }) => {
                 assert_eq!(owner.as_deref(), Some("housekeeper"));

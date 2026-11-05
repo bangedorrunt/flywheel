@@ -98,9 +98,6 @@ pub fn apply_scores(menu: &mut HarnessMenu, scores: &[FitScore]) -> Ranking {
         return Ranking::Declined { why };
     }
 
-    // The pre-pass order, so "moved" and the stable tiebreak both have a
-    // reference. Index is the tiebreak: equal scores keep their prior relative
-    // order, so Jev is a perturbation of a known-good order and never a reshuffle.
     let before: Vec<String> = menu.options.iter().map(|o| o.harness.clone()).collect();
     let prior: HashMap<&str, usize> = before
         .iter()
@@ -116,19 +113,12 @@ pub fn apply_scores(menu: &mut HarnessMenu, scores: &[FitScore]) -> Ranking {
         let sb = usable
             .get(b.harness.as_str())
             .map_or(f64::NEG_INFINITY, |s| s.score);
-        // Options Jev said nothing useful about keep their place at the END of the
-        // ranking rather than inheriting a fabricated score: -inf sorts them last,
-        // and the index tiebreak keeps them in prior order among themselves.
         sb.partial_cmp(&sa)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| ia.cmp(ib))
     });
 
     let after: Vec<HarnessOption> = opts.into_iter().map(|(_, o)| o).collect();
-    // A harness "moved" if its NEW index differs from its prior one. This first
-    // compared the prior index against itself, reached by two equivalent paths, so
-    // `moved` was structurally always 0 and every confident pass reported "Jev
-    // agreed" -- a green that would have hidden a working reordering entirely.
     let moved = after
         .iter()
         .enumerate()
@@ -136,8 +126,6 @@ pub fn apply_scores(menu: &mut HarnessMenu, scores: &[FitScore]) -> Ranking {
         .count();
 
     menu.options = after;
-    // The diversity floor is a property of the SET and the crew size, so it is
-    // re-established here rather than trusted to survive a reorder.
     menu.reapply_diversity_floor();
 
     if moved == 0 {
@@ -243,23 +231,11 @@ pub fn crew_fit_stage() -> crate::stage::Stage {
                 placement: Placement::Preflight,
                 pack: |ctx: &StageCtx| fit_pack(ctx.objective, &ctx.menu.options),
                 read: |answers: &Answers, ctx: &mut StageCtx| {
-                    // Same borrow order as everywhere else: score against the roster
-                    // first, then take the mutable borrow to apply.
                     let scores = scores_from_answers(&ctx.menu.options, answers);
                     match apply_scores(ctx.menu, &scores) {
                         Ranking::Reordered { moved } => {
                             (Signal::Holds, format!("reordered {moved} option(s)"))
                         }
-                        // A DECLINE is not a failure, and this is the live bug that
-                        // proved it. The first cut mapped `Declined` to
-                        // `Signal::Fails`, and the live briefing duly reported
-                        //     jev declined: menu-contested=Holds, crew-fit:rank=Fails
-                        // Under `Rule::All` one `Fails` makes the parent `Fails`, and
-                        // `verdict_of` turns that into `Verdict::Reject`. Nothing
-                        // gates on it today so nothing broke — but the moment
-                        // anything does, a shrug would become a DISPATCH REFUSAL.
-                        // A shrug is "no signal", which is exactly what `Unknown`
-                        // means, so that is what it maps to.
                         Ranking::Declined { why } => (Signal::Unknown, why),
                     }
                 },
@@ -292,8 +268,6 @@ pub fn rank_menu_with<T: Transport>(
     menu: &mut HarnessMenu,
     transport: &T,
 ) -> Ranking {
-    // One option is not a ranking. Asking the model to score a single harness
-    // spends a network round trip to learn something already known.
     if menu.options.len() < 2 {
         return Ranking::Declined {
             why: format!(
@@ -305,10 +279,6 @@ pub fn rank_menu_with<T: Transport>(
     let pack = fit_pack(objective, &menu.options);
     let slice = crate::judgment::build_state_slice(fit_state(objective));
     match transport.ask(&slice, &pack) {
-        // Scores are computed BEFORE the mutable borrow: `apply_scores` takes
-        // `&mut menu`, and the roster it scored against IS `menu.options`. The
-        // borrow checker is what keeps those two in step, so the coupling lives
-        // in the order of these statements rather than in a comment.
         Ok(answers) => {
             let scores = scores_from_answers(&menu.options, &answers);
             apply_scores(menu, &scores)
@@ -547,7 +517,6 @@ mod tests {
             2,
             vec![opt("opencode", &["coder"]), opt("pi", &["planner"])],
         );
-        // A shrug through the stage: both candidates answered below the floor.
         let t = Scripted::ok(answers(&[("fit_0", 3.0, 0.01), ("fit_1", 0.0, 0.01)]));
         let mut c = crate::stage::StageCtx {
             objective: "a hard refactor",
@@ -630,9 +599,6 @@ mod tests {
         );
         assert!(matches!(out, Ranking::Reordered { .. }), "{out:?}");
         let ranked = m.ranked();
-        // opencode holds the top score (2.9). The deterministic order was by ROLE
-        // COUNT, which put pi (2 roles) first -- so this assertion is about the
-        // order having changed at all, not about a particular winner.
         assert_eq!(ranked[0], "opencode", "the top score leads: {ranked:?}");
         assert_eq!(
             ranked,
@@ -733,9 +699,6 @@ mod tests {
             crate::crew_menu::rank_public_for_test(&mut m.options, m.crew);
             m
         };
-        // opencode carries every role, so the deterministic rank has to promote a
-        // second distinct harness; and the model TIES the top two, so the prior
-        // order decides.
         let scores = vec![
             score("opencode", 2.0, 0.99),
             score("pi", 2.0, 0.99),
@@ -747,8 +710,6 @@ mod tests {
         let out = apply_scores(&mut a, &scores);
         let first: Vec<String> = a.options.iter().map(|o| o.harness.clone()).collect();
 
-        // Same input, same output. A ranker whose tiebreak is unstable would make a
-        // crew's composition depend on scheduling.
         let mut b = build();
         let _ = apply_scores(&mut b, &scores);
         let second: Vec<String> = b.options.iter().map(|o| o.harness.clone()).collect();
