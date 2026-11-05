@@ -13,7 +13,6 @@
 
 #![cfg_attr(not(feature = "serve"), allow(dead_code))]
 
-mod adr0016_invariants;
 mod agent_ref;
 mod agentstate;
 #[cfg_attr(not(test), allow(dead_code))]
