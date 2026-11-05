@@ -324,6 +324,7 @@ mod tests {
 
         let wf = parse_workflow(&yaml).expect("deployed yaml parses");
         let mut probe_count = 0;
+        let mut gates: Vec<&str> = Vec::new();
         for step in &wf.steps {
             if let Action::Verify { command } = &step.action {
                 assert_eq!(
@@ -337,9 +338,26 @@ mod tests {
                     "probe targets a host port or the engine store: {command}"
                 );
                 probe_count += 1;
+                gates.push(step.name.as_deref().unwrap_or("probe"));
             }
         }
         assert_eq!(probe_count, 5, "five saga health-gates");
+        for gate in [
+            "gate-aiostreams",
+            "gate-engine-store",
+            "gate-honcho",
+            "gate-pihole",
+            "gate-dnscrypt",
+        ] {
+            assert!(
+                gates.contains(&gate),
+                "missing deployed gate {gate}: {gates:?}"
+            );
+        }
+        assert!(
+            !yaml.contains(":8001"),
+            "no gate may target the removed vendor port"
+        );
         match &wf.trigger {
             Some(toron_workflow::schema::Trigger::Schedule { owner, scope, .. }) => {
                 assert_eq!(owner.as_deref(), Some("housekeeper"));

@@ -31,7 +31,8 @@ use toron_workflow::engine::leaf::LeafSeams;
 use toron_workflow::engine::linear_step::{
     GraphNodeStep, LinearStep, run_graph_node_step, run_linear_step,
 };
-use toron_workflow::engine::spawn::{SpawnLauncher, SpawnSpec};
+use toron_workflow::engine::ProfileResolver;
+use toron_workflow::engine::spawn::{SpawnLauncher, SpawnSeams, SpawnSpec};
 use toron_workflow::schema::Workflow;
 
 type EngineStore = ToronEngineStore;
@@ -46,6 +47,9 @@ pub struct BodySeams {
     pub leaf: LeafSeams,
     /// Starts a spawn child. `None` = the body refuses a spawn shape.
     pub launcher: Option<SpawnLauncher>,
+    /// Profile name -> resolved profile for a `spawn` step. `None` leaves the
+    /// step's old unknown-profile value in place (never a run failure).
+    pub spawn_resolver: Option<ProfileResolver>,
     /// Resolves a `call_workflow` callee by name. `None` = refuse the shape.
     pub resolve_child: Option<WorkflowLookup>,
 }
@@ -194,9 +198,13 @@ async fn drive_linear(
     let wf = workflow.clone();
     let rid = run_id.to_string();
     let trig = trigger.clone();
+    let spawn_seams = SpawnSeams {
+        resolver: seams.spawn_resolver.clone(),
+        launcher: seams.launcher.clone(),
+    };
     let opened = tokio::task::spawn_blocking(move || {
         let engine = OurEngine::with_journal(engine_store, journal);
-        DurableRun::open(engine, state, rid, wf, trig, unix_ms())
+        DurableRun::open_with_seams(engine, state, rid, wf, trig, unix_ms(), &spawn_seams)
     })
     .await;
     let (mut run, mut effects) = match opened {
@@ -277,6 +285,16 @@ async fn drive_linear(
                     }
                 }
                 RunEffect::ParkUntil { until_ms, .. } => {
+                    // A spawn emits StartSpawn and its deadline park together.
+                    // The launcher has already settled that park, so honoring
+                    // the stale deadline would sleep until a wake that is no
+                    // longer the run's phase.
+                    if !matches!(
+                        &run.model().phase,
+                        toron_workflow::engine::durable::RunPhase::Parked { .. }
+                    ) {
+                        continue;
+                    }
                     let now = unix_ms();
                     if until_ms > now {
                         tokio::time::sleep(std::time::Duration::from_millis(until_ms - now)).await;
@@ -578,6 +596,8 @@ fn digest(workflow: &Workflow) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// bd-36cbt: a timed-out in-flight run moves InFlight -> Unknown ->
     /// ReconcilePending -> Settled through expire_lease + reconcile over
     /// ToronEngineStore + ToronJournal.
@@ -650,6 +670,93 @@ mod tests {
             engine.query(key).expect("query settled").phase,
             RunPhase::Settled,
             "run settled after reconcile"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// bd-flywheel-host-run-ofcw witness: a spawn step launches through the
+    /// injected launcher exactly once, settles its park, and a second drive
+    /// with the same run id re-attaches to the persisted model instead of
+    /// launching a second child.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_step_launches_once_through_the_launcher_seam() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use toron_core::index::schema;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let db = std::env::temp_dir().join(format!(
+            "fw-durable-spawn-{}-{nanos}.sqlite",
+            std::process::id()
+        ));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let store = toron_core::index::workflow_effects::WorkflowEffectStore::new(pool);
+
+        let wf = toron_workflow::schema::parse_workflow(
+            "name: spawn-body\nsteps:\n  - name: launch\n    action: spawn\n    profile: \"@housekeeper\"\n    workflow: child\n    await: true\n    no_claim_timeout: 600\n",
+        )
+        .expect("parse spawn workflow");
+
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let launcher: SpawnLauncher = std::sync::Arc::new(move |spec| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                assert!(spec.await_, "the spawn parks");
+                assert_eq!(spec.workflow_ref.as_deref(), Some("child"));
+                Ok(serde_json::json!({ "ok": true, "spawn_key": spec.spawn_key }))
+            })
+        });
+        let seams = BodySeams {
+            leaf: LeafSeams {
+                async_runner: None,
+                sync_runner: None,
+                verify_sink: toron_workflow::engine::VerifySink::default(),
+                journal_mode: toron_workflow::engine::EffectJournalMode::Recording,
+            },
+            launcher: Some(launcher),
+            spawn_resolver: Some(std::sync::Arc::new(|profile: &str| {
+                (profile == "@housekeeper").then(|| {
+                    serde_json::json!({
+                        "npub": "",
+                        "spec": { "harness": "pi" }
+                    })
+                })
+            })),
+            resolve_child: None,
+        };
+
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            drive(&store, "spawn-body-1", &wf, serde_json::json!({}), &seams),
+        )
+        .await
+        .expect("a settled spawn must not sleep out its deadline park");
+        assert!(
+            matches!(first, BodyOutcome::Completed(_)),
+            "a spawn body completes after the launcher settles it"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one launch");
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            drive(&store, "spawn-body-1", &wf, serde_json::json!({}), &seams),
+        )
+        .await
+        .expect("re-drive must re-attach without sleeping out a stale park");
+        assert!(
+            matches!(second, BodyOutcome::Completed(_)),
+            "re-drive re-attaches to the terminal model"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a settled spawn is never relaunched"
         );
         let _ = std::fs::remove_file(&db);
     }
