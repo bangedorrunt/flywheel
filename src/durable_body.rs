@@ -27,7 +27,7 @@ use toron_core::journal::{JournalDb, ToronJournal};
 use toron_core::kernel::OurEngine;
 use toron_workflow::engine::ProfileResolver;
 use toron_workflow::engine::durable::{GraphEffect, RunEffect, needs_graph_model};
-use toron_workflow::engine::durable_host::{DurableGraphRun, DurableRun, HostError};
+use toron_workflow::engine::durable_host::{ChildSeams, DurableGraphRun, DurableRun, HostError};
 use toron_workflow::engine::leaf::LeafSeams;
 use toron_workflow::engine::linear_step::{
     GraphNodeStep, LinearStep, run_graph_node_step, run_linear_step,
@@ -338,9 +338,12 @@ async fn drive_graph(
     let wf = workflow.clone();
     let rid = run_id.to_string();
     let trig = trigger.clone();
+    let children = ChildSeams {
+        resolver: seams.resolve_child.clone(),
+    };
     let opened = tokio::task::spawn_blocking(move || {
         let engine = OurEngine::with_journal(engine_store, journal);
-        DurableGraphRun::open(engine, state, rid, wf, trig, unix_ms())
+        DurableGraphRun::open_with_children(engine, state, rid, wf, trig, unix_ms(), &children)
     })
     .await;
     let (mut run, mut effects) = match opened {
@@ -757,6 +760,75 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "a settled spawn is never relaunched"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// bd-5cnw7 witness: a graph body with a static `call_workflow` opens only
+    /// when `BodySeams::resolve_child` reaches the graph's child seams, then
+    /// drives the child to a terminal value and joins it into the parent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graph_child_call_resolves_through_the_child_seam() {
+        use toron_core::index::schema;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let db = std::env::temp_dir().join(format!(
+            "fw-durable-child-{}-{nanos}.sqlite",
+            std::process::id()
+        ));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let store = toron_core::index::workflow_effects::WorkflowEffectStore::new(pool);
+
+        let parent = toron_workflow::schema::parse_workflow(
+            "name: parent\nsteps:\n  - name: call\n    action: call_workflow\n    workflow: child\n    inputs: {}\n",
+        )
+        .expect("parse parent");
+        let child = toron_workflow::schema::parse_workflow(
+            "name: child\nsteps:\n  - name: check\n    action: verify\n    command: \"true\"\n",
+        )
+        .expect("parse child");
+
+        let seams = BodySeams {
+            leaf: LeafSeams {
+                async_runner: None,
+                sync_runner: None,
+                verify_sink: real_verify_sink(),
+                journal_mode: toron_workflow::engine::EffectJournalMode::Recording,
+            },
+            launcher: None,
+            spawn_resolver: None,
+            resolve_child: Some(Arc::new(move |name: &str| {
+                (name == "child").then(|| child.clone())
+            })),
+        };
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            drive(
+                &store,
+                "graph-child-1",
+                &parent,
+                serde_json::json!({}),
+                &seams,
+            ),
+        )
+        .await
+        .expect("a resolved child graph must not hang");
+        let output = match outcome {
+            BodyOutcome::Completed(output) => output,
+            BodyOutcome::Failed { error, step } => {
+                panic!("a resolved child graph must complete: {error} (step {step:?})")
+            }
+        };
+        assert_eq!(
+            output["call"]["steps"]["check"]["ok"], true,
+            "the child verify ran and its terminal joined: {output}"
         );
         let _ = std::fs::remove_file(&db);
     }
