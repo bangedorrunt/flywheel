@@ -843,8 +843,8 @@ pub mod rex_map {
     /// Working, a shell is at a prompt. Explicit records always win over
     /// this — callers only reach it on an empty board.
     pub fn process_status(view: &ProcessView) -> AgentStatus {
-        match crate::pane_write::Harness::from_kind(&view.foreground) {
-            crate::pane_write::Harness::Other => {
+        match toron_core::harness::Harness::from_kind(&view.foreground) {
+            toron_core::harness::Harness::Other => {
                 if SHELLS.contains(&view.foreground.as_str()) {
                     AgentStatus::Idle
                 } else {
