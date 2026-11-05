@@ -1686,15 +1686,15 @@ pub fn pane_dispatch(
                     .arg("--confirm")
                     .arg("--profile")
                     .arg(&send_profile);
-                let output = match crate::proc::run_bounded(&mut cmd, dispatch_attempt_timeout()) {
+                let output = match toron_core::proc::run_bounded(&mut cmd, dispatch_attempt_timeout()) {
                     Ok(output) => output,
-                    Err(crate::proc::ProcError::Timeout { .. }) => {
+                    Err(toron_core::proc::ProcError::Timeout { .. }) => {
                         return Effect::die(Defect::new(format!(
                             "__send for @{send_profile} ({send_agent}) exceeded the attempt timeout ({:?}) - the child never exited",
                             dispatch_attempt_timeout()
                         )));
                     }
-                    Err(crate::proc::ProcError::Io(e)) => {
+                    Err(toron_core::proc::ProcError::Io(e)) => {
                         return Effect::die(Defect::new(format!(
                             "__send for @{send_profile} ({send_agent}) failed: {e}"
                         )));

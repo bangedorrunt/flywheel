@@ -1815,14 +1815,14 @@ pub(crate) async fn run_leaf_cmd_bounded(
     watchdog: std::time::Duration,
 ) -> anyhow::Result<std::process::Output> {
     tokio::task::spawn_blocking(move || {
-        crate::proc::run_bounded(&mut cmd, watchdog).map_err(|e| match e {
-            crate::proc::ProcError::Timeout { pid } => std::io::Error::new(
+        toron_core::proc::run_bounded(&mut cmd, watchdog).map_err(|e| match e {
+            toron_core::proc::ProcError::Timeout { pid } => std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!(
                     "{label} leaf exceeded {watchdog:?} — process group {pid} killed (watchdog; a hung leaf must never park the loop, and its children must not orphan)"
                 ),
             ),
-            crate::proc::ProcError::Io(e) => e,
+            toron_core::proc::ProcError::Io(e) => e,
         })
     })
     .await

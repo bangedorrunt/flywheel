@@ -19,7 +19,7 @@ use std::time::Duration;
 use serde_json::Value;
 use toron_core::backend::{BackendError, BackendErrorCode, BackendEvent};
 
-use crate::proc::{ProcError, run_bounded};
+use toron_core::proc::{ProcError, run_bounded};
 
 /// Wall bound around rex's own `--timeout 10s`, so a rex-side timeout can
 /// exit before we kill the process group.

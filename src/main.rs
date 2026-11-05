@@ -62,7 +62,6 @@ mod init_scaffold;
 mod intent;
 mod lead_claim;
 mod private_fs;
-mod proc;
 mod pull_fresh_poller;
 mod recipient_guard;
 mod redact;
