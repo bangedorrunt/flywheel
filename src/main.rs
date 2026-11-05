@@ -10218,7 +10218,7 @@ fn poll_child_exit(
     for _ in 0..10_000 {
         match stream.read_event() {
             Ok(Some(toron_core::backend::BackendEvent::Raw(line))) => {
-                if let Some((block, code)) = crate::backend::superlogical::child_exit_code(&line)
+                if let Some((block, code)) = toron_core::backend::superlogical::child_exit_code(&line)
                     && block == pane
                 {
                     return Some(code);
@@ -10464,7 +10464,7 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
         .first()
         .map(|p| p.pane_id.clone())
         .ok_or_else(|| anyhow!("rex: workspace {} has no panes", ws.workspace_id))?;
-    let mut exit_stream = crate::backend::superlogical::subscribe_session(&ws.workspace_id).ok();
+    let mut exit_stream = toron_core::backend::superlogical::subscribe_session(&ws.workspace_id).ok();
     if let Some(stream) = exit_stream.as_mut() {
         let _ = stream.set_read_timeout(Some(Duration::from_millis(2_000)));
         let live = matches!(stream.read_event(), Ok(Some(_)));
@@ -10562,7 +10562,7 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
             }
             let command = crate::pane::rex_env_command(&pane_env, &kind, &agent_args);
             let pane_id = if first {
-                crate::backend::superlogical::create_agent_block(
+                toron_core::backend::superlogical::create_agent_block(
                     &ws.workspace_id,
                     identity,
                     Some(&cwd),
@@ -10570,7 +10570,7 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
                 )
                 .map_err(|e| anyhow!("spawn: rex run for {name} (pin {identity}): {e:#}"))?
             } else {
-                crate::backend::superlogical::create_split_block(
+                toron_core::backend::superlogical::create_split_block(
                     &ws.workspace_id,
                     &prev,
                     "below",
@@ -25365,7 +25365,7 @@ esac
     #[cfg(feature = "backend-superlogical")]
     #[test]
     fn rex_send_resolves_pin_and_prompts_once_on_the_rex_target() {
-        let guard = crate::backend::superlogical::RexBinGuard::install(REX_SEND_FAKE_REX);
+        let guard = crate::backend::rex_test_guard::RexBinGuard::install(REX_SEND_FAKE_REX);
         unsafe { std::env::set_var("FLYWHEEL_BACKEND", "superlogical") };
         let cfg = crate::config::Config::default();
         let out = cmd_send_rex(
@@ -25455,7 +25455,7 @@ esac
             r#"{"blocks":[{"block_id":"block:fake-1","window_id":"window:fake-1","label":"NeatHeron","creator_name":"com.superlogical.terminal"}]}"#,
             r#"{"blocks":[{"block_id":"block:fake-1","window_id":"window:fake-1","label":"NeatHeron"},{"block_id":"block:fake-2","window_id":"window:fake-1","label":"NeatHeron"}]}"#,
         );
-        let guard = crate::backend::superlogical::RexBinGuard::install(&script);
+        let guard = crate::backend::rex_test_guard::RexBinGuard::install(&script);
         unsafe { std::env::set_var("FLYWHEEL_BACKEND", "superlogical") };
         let cfg = crate::config::Config::default();
         let err = cmd_send_rex(

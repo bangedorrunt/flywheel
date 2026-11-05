@@ -234,11 +234,11 @@ pub fn multiplexer_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> 
         #[cfg(feature = "backend-hc")]
         "hc" => hc_backend(cfg),
         #[cfg(feature = "backend-superlogical")]
-        "superlogical" => Ok(Box::new(crate::backend::superlogical::SuperlogicalBackend)),
+        "superlogical" => Ok(Box::new(toron_core::backend::superlogical::SuperlogicalBackend)),
         #[cfg(feature = "backend-superlogical")]
         "auto" => {
             let primary: Box<dyn MultiplexerBackend> =
-                Box::new(crate::backend::superlogical::SuperlogicalBackend);
+                Box::new(toron_core::backend::superlogical::SuperlogicalBackend);
             #[cfg(feature = "backend-hc")]
             let fallback: Option<Box<dyn MultiplexerBackend>> =
                 match toron_core::backend::hc::HcBackend::connect(Some(&cfg.socket_path())) {
@@ -534,7 +534,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("empty rex dir");
         let prev = std::env::var_os("REX_BIN_DIR");
         unsafe { std::env::set_var("REX_BIN_DIR", dir.path()) };
-        let b = crate::backend::superlogical::SuperlogicalBackend;
+        let b = toron_core::backend::superlogical::SuperlogicalBackend;
         assert_eq!(b.name(), "superlogical");
         let m: Box<dyn MultiplexerBackend> = Box::new(b);
         let err = match m.subscribe(&[]) {
@@ -649,7 +649,7 @@ mod spawn_gate_tests {
     #[cfg(feature = "backend-superlogical")]
     #[test]
     fn auto_without_a_rex_cli_resolves_to_the_hc_fallback() {
-        let bin = crate::backend::superlogical::rex_cli::RexBinGuard::empty();
+        let bin = crate::backend::rex_test_guard::RexBinGuard::empty();
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
         let cfg = Config {
             rex_bin_dir: Some(bin.dir_path().display().to_string()),
@@ -674,7 +674,7 @@ mod spawn_gate_tests {
     #[cfg(feature = "backend-superlogical")]
     #[test]
     fn auto_with_a_rex_cli_resolves_to_rex() {
-        let bin = crate::backend::superlogical::rex_cli::RexBinGuard::install("exit 0");
+        let bin = crate::backend::rex_test_guard::RexBinGuard::install("exit 0");
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
         let cfg = Config {
             rex_bin_dir: Some(bin.dir_path().display().to_string()),
@@ -696,7 +696,7 @@ mod spawn_gate_tests {
     #[cfg(feature = "backend-superlogical")]
     #[test]
     fn an_explicit_rex_pin_never_reports_a_fallback() {
-        let bin = crate::backend::superlogical::rex_cli::RexBinGuard::empty();
+        let bin = crate::backend::rex_test_guard::RexBinGuard::empty();
         unsafe { std::env::set_var("FLYWHEEL_BACKEND", "superlogical") };
         let cfg = Config {
             rex_bin_dir: Some(bin.dir_path().display().to_string()),
@@ -729,7 +729,7 @@ mod spawn_gate_tests {
     #[cfg(feature = "backend-superlogical")]
     #[test]
     fn config_rex_bin_dir_outranks_a_poisoned_env() {
-        let bin = crate::backend::superlogical::rex_cli::RexBinGuard::install("exit 0");
+        let bin = crate::backend::rex_test_guard::RexBinGuard::install("exit 0");
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
         unsafe { std::env::remove_var("REX_BIN_DIR") };
         let cfg = Config {

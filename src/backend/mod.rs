@@ -30,9 +30,8 @@ pub use factory::{Plane, resolve_plane};
 pub mod fallback;
 #[cfg(test)]
 mod parity;
-#[cfg(feature = "backend-superlogical")]
-#[cfg(feature = "backend-superlogical")]
-pub mod superlogical;
+#[cfg(test)]
+pub mod rex_test_guard;
 #[cfg(feature = "mail-toron")]
 pub mod toron;
 pub mod wire;
