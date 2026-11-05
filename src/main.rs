@@ -9381,7 +9381,7 @@ projects available: {}",
         bail!("{msg}");
     }
     let plane = crate::backend::resolve_plane(cfg);
-    crate::backend::factory::require_mux_for_spawn(&plane.configured)?;
+    crate::backend::factory::require_mux_for_spawn(plane.configured.as_str())?;
     if plane.plane == crate::backend::Plane::Rex {
         #[cfg(feature = "backend-superlogical")]
         {

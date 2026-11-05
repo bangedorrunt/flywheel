@@ -29,9 +29,12 @@ Live ignored tests need a multiplexer + mail (see Test sandbox).
 
 ## Pane plane (rex default, hc fallback)
 
-`FLYWHEEL_BACKEND` / `[backend] multiplexer` ∈ `{auto,superlogical,hc}`;
-default is rex-primary with hc fallback. Every door reads one resolution
-(`resolve_plane`). Detail: `docs/agent-instructions/backends.md`.
+`FLYWHEEL_BACKEND` / `[backend] multiplexer` ∈ `{auto,rex,superlogical,hc}`;
+default is rex-primary with hc fallback. Every door reads ONE resolution from
+`toron_core::backend::plane` (`resolve` pure, `connect` the only construction
+site); flywheel supplies only its configured name + hc socket. A write replays
+on hc only for `Connect` — a timeout may already have committed. Detail:
+`docs/agent-instructions/backends.md`.
 
 - Discover the connected rex server: `rex api list`, `rex api describe
   <method>`, `rex api call …`.

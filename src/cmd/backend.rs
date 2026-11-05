@@ -38,20 +38,17 @@ pub(crate) fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
             let active_mux = crate::backend::resolve_backend_name(cfg);
             let active_mail = crate::backend::resolve_mail_name(cfg);
             let compiled = crate::backend::compiled_backends();
+            let configured = crate::backend::PlaneChoice::parse(&active_mux);
+            let resolved = crate::backend::resolve_plane(cfg);
             let mut rows: Vec<Value> = Vec::new();
-            for (name, stub) in [
-                ("hc", false),
-                ("superlogical", cfg!(not(feature = "backend-superlogical"))),
-                (
-                    "auto",
-                    !(cfg!(feature = "backend-hc") && cfg!(feature = "backend-superlogical")),
-                ),
-            ] {
+            // Both planes live in toron-core and are always ready; `auto` is a
+            // name, not a third backend.
+            for name in ["auto", "rex", "hc", "superlogical"] {
                 rows.push(json!({
                     "name": name,
                     "kind": "multiplexer",
-                    "status": if stub { "stub" } else { "ready" },
-                    "active": active_mux == name,
+                    "status": "ready",
+                    "active": configured.as_str() == name,
                     "compiled_feature": compiled.contains(&name),
                 }));
             }
@@ -65,11 +62,10 @@ pub(crate) fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
                     "compiled_feature": compiled.contains(&name),
                 }));
             }
-            let resolved = crate::backend::resolve_plane(cfg);
             print_json(&json!({
                 "backends": rows,
                 "resolved": {
-                    "configured": resolved.configured,
+                    "configured": resolved.configured.as_str(),
                     "plane": resolved.plane.name(),
                     "rex_reachable": resolved.rex_reachable,
                     "fallback": resolved.is_fallback(),

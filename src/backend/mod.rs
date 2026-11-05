@@ -24,10 +24,8 @@
 //! Real impls override what they support (ADR-0002 §6 — open-to-extension).
 
 pub mod factory;
-pub use factory::{Plane, resolve_plane};
+pub use factory::{Plane, PlaneChoice, resolve_plane};
 
-#[cfg(feature = "backend-superlogical")]
-pub mod fallback;
 #[cfg(test)]
 mod parity;
 #[cfg(test)]

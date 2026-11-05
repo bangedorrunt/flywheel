@@ -2240,15 +2240,11 @@ impl Mail {
 /// multiplexer` config > default (`hc`). Config load is best-effort —
 /// no config file means the default applies.
 fn multiplexer_is_hc() -> bool {
-    crate::config::Config::load()
-        .map(|cfg| crate::backend::factory::resolve_backend_name(&cfg))
-        .unwrap_or_else(|_| {
-            std::env::var("FLYWHEEL_BACKEND")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| crate::backend::factory::DEFAULT_BACKEND.to_string())
-        })
-        == "hc"
+    // Ask the shared resolver, not the configured string: `auto` on a host
+    // with no rex CLI really does serve hc, so cleanup applies. Loading a
+    // config is best-effort; `resolve_backend_name` still reads the env.
+    let cfg = crate::config::Config::load().unwrap_or_default();
+    crate::backend::resolve_plane(&cfg).plane == crate::backend::Plane::Hc
 }
 
 /// Config base for identity files: `$XDG_CONFIG_HOME` when set, else
