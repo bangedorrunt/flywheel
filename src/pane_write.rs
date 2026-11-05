@@ -119,7 +119,7 @@ pub trait PaneTyper {
 }
 
 /// hc as the pane boundary.
-pub struct HcPanes<'a>(pub &'a crate::hc_support::Client);
+pub struct HcPanes<'a>(pub &'a crate::hc::Client);
 
 impl PaneTyper for HcPanes<'_> {
     fn prompt(&self, target: &str, line: &str) -> anyhow::Result<()> {
@@ -178,7 +178,7 @@ impl PaneTyper for RexPanes<'_> {
 /// `pane.send_text` + settle + Enter (retried; Enter alone is retried once the
 /// text has landed, the text is never re-typed). Same boot semantics as the
 /// legacy prime, but reachable only with a closed [`PaneWrite`].
-pub struct BootPanes<'a>(pub &'a crate::hc_support::Client);
+pub struct BootPanes<'a>(pub &'a crate::hc::Client);
 
 impl PaneTyper for BootPanes<'_> {
     fn prompt(&self, target: &str, line: &str) -> anyhow::Result<()> {
@@ -223,7 +223,7 @@ impl PaneTyper for BootPanes<'_> {
 /// constant into a fresh pane. Best-effort like the legacy prime (a failed
 /// bootstrap warns, never fails the spawn); returns whether it landed.
 pub fn launch_bootstrap_into(
-    c: &crate::hc_support::Client,
+    c: &crate::hc::Client,
     pane_id: &str,
     harness: Harness,
 ) -> bool {
@@ -274,7 +274,7 @@ pub(crate) const LEGACY_PANE_TEXT_SITES: &[(&str, usize)] = &[
 ];
 
 /// Transport-implementation calls (bd-pane-fence-hc-jwq4s): the two
-/// `.agent_prompt_coded(` sites in `src/hc_support.rs` ARE the PaneWrite
+/// `.agent_prompt_coded(` sites in `src/hc.rs` ARE the PaneWrite
 /// door's backend, not bypasses. `Client::agent_prompt` (which the sink's
 /// `HcPanes` typer calls) delegates to `Client::agent_prompt_coded`, the
 /// single method that reaches the wire; the alt-screen read fallback prompts
@@ -282,7 +282,7 @@ pub(crate) const LEGACY_PANE_TEXT_SITES: &[(&str, usize)] = &[
 /// `PaneWrite` shapes cannot represent it. Counted separately with the same
 /// shrink-only rule, so any third site still fails the fence.
 #[cfg(test)]
-pub(crate) const TRANSPORT_IMPL_SITES: &[(&str, usize)] = &[("src/hc_support.rs", 2)];
+pub(crate) const TRANSPORT_IMPL_SITES: &[(&str, usize)] = &[("src/hc.rs", 2)];
 
 /// The file allowed to type into panes.
 #[cfg(test)]
@@ -450,12 +450,12 @@ mod tests {
 
     /// The transport exception covers exactly the two documented sites:
     /// the sink-called delegation and the read-path fallback, both behind
-    /// the `PaneTyper` boundary. Any other pane-text call in hc_support
+    /// the `PaneTyper` boundary. Any other pane-text call in hc
     /// fails the count below.
     #[test]
     fn transport_sink_sites_are_exactly_the_documented_two() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let src = std::fs::read_to_string(root.join("src/hc_support.rs"))
+        let src = std::fs::read_to_string(root.join("src/hc.rs"))
             .unwrap_or_default();
         assert!(
             src.contains("self.agent_prompt_coded(target, text, wait)"),
@@ -468,7 +468,7 @@ mod tests {
         assert_eq!(
             pane_text_calls(&src),
             2,
-            "hc_support holds exactly the two transport sites"
+            "hc holds exactly the two transport sites"
         );
     }
 

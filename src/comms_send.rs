@@ -751,7 +751,7 @@ pub fn send(cfg: &Config, req: Request<'_>) -> Result<Vec<SentRow>> {
         stamp_delivery(&project, &mut rows, &pins);
         return Ok(rows);
     }
-    let mut hc = crate::hc_support::Client::connect(Some(&cfg.socket_path()));
+    let mut hc = crate::hc::Client::connect(Some(&cfg.socket_path()));
     for (row, addr) in rows.iter_mut().zip(parsed.iter()) {
         row.wake = match (&mut hc, addr.pin()) {
             (_, None) => "no-pane (npub address; Phase 3 rings by binding)".into(),
@@ -795,7 +795,7 @@ pub fn send(cfg: &Config, req: Request<'_>) -> Result<Vec<SentRow>> {
 /// is hosting, so the sender's own ring is the only wake there is.
 pub fn doorbell_owner(
     project: &str,
-    workspace: Option<&crate::hc_support::WorkspaceInfo>,
+    workspace: Option<&crate::hc::WorkspaceInfo>,
 ) -> Option<u32> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -808,7 +808,7 @@ pub fn doorbell_owner(
 fn owner_of_workspace(
     state_dir: &std::path::Path,
     project: &str,
-    workspace: Option<&crate::hc_support::WorkspaceInfo>,
+    workspace: Option<&crate::hc::WorkspaceInfo>,
     now: u64,
 ) -> Option<u32> {
     doorbell_owner_in(state_dir, project, workspace.map(host_key), now)
@@ -817,7 +817,7 @@ fn owner_of_workspace(
 /// A doorbell host runs as `__doorbell --workspace <label>`: its pid file,
 /// owner lease and inbox lease ([`crate::doorbell::inbox_owner_key`]) all
 /// carry the hc workspace LABEL (prod: `owner-inbox-flywheel-flywheel.json`).
-fn host_key(ws: &crate::hc_support::WorkspaceInfo) -> &str {
+fn host_key(ws: &crate::hc::WorkspaceInfo) -> &str {
     &ws.label
 }
 
@@ -893,7 +893,7 @@ fn wake_via_backend(
     }
 }
 
-fn wake_target(c: &mut crate::hc_support::Client, project: &str, pin: &str) -> Result<String> {
+fn wake_target(c: &mut crate::hc::Client, project: &str, pin: &str) -> Result<String> {
     let ws = crate::find_workspace(c, project)?;
     let agents = crate::resolve_agents(c, &ws, project, pin)?;
     match agents.as_slice() {
@@ -1399,7 +1399,7 @@ mod tests {
         );
     }
 
-    fn plane_ws(id: &str, label: &str) -> crate::hc_support::WorkspaceInfo {
+    fn plane_ws(id: &str, label: &str) -> crate::hc::WorkspaceInfo {
         serde_json::from_value(json!({
             "workspace_id": id, "number": 1, "label": label, "focused": false,
             "pane_count": 1, "tab_count": 1, "active_tab_id": "t1", "agent_status": "idle"

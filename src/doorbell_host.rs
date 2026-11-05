@@ -9,7 +9,7 @@
 //! (removed); behavioral deltas are marked DELTA with their reason.
 
 use crate::config::Config;
-use crate::hc_support::{Client, StreamOutcome, Subscription};
+use crate::hc::{Client, StreamOutcome, Subscription};
 use crate::{config, doorbell, state, workspace};
 use doorbell_rt::{BrainMsg, Effect, FileStore, Host};
 use std::collections::{HashMap, HashSet};
@@ -297,7 +297,7 @@ impl RtHost {
                 return;
             };
             let subs = Subscription::agent_status_changed_many(attempt_ids.iter().cloned());
-            match crate::hc_support::subscribe(&sub_client, &subs) {
+            match crate::hc::subscribe(&sub_client, &subs) {
                 Ok(s) => {
                     stream = Some(s);
                     break;
@@ -335,10 +335,10 @@ impl RtHost {
                 match stream.read_outcome() {
                     Ok(StreamOutcome::Event(ev)) => {
                         let ev = *ev;
-                        if let crate::hc_support::TerminalEventData::PaneAgentStatusChanged(
+                        if let crate::hc::TerminalEventData::PaneAgentStatusChanged(
                             change,
                         )
-                        | crate::hc_support::TerminalEventData::PaneAgentStatusChangedSub(
+                        | crate::hc::TerminalEventData::PaneAgentStatusChangedSub(
                             change,
                         ) = ev.data
                         {
@@ -425,7 +425,7 @@ fn reconcile_status_after_events_lost(
 /// Pull AgentInfo rows out of a session.snapshot payload when present.
 fn agents_from_session_snapshot(
     snap: &serde_json::Value,
-) -> Option<Vec<crate::hc_support::AgentInfo>> {
+) -> Option<Vec<crate::hc::AgentInfo>> {
     if let Some(arr) = snap.get("agents").and_then(|v| v.as_array()) {
         let parsed: Result<Vec<_>, _> = arr.iter().cloned().map(serde_json::from_value).collect();
         return parsed.ok();

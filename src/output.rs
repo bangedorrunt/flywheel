@@ -6,7 +6,7 @@
 
 use std::io::IsTerminal;
 
-use crate::hc_support::AgentStatus;
+use crate::hc::AgentStatus;
 
 /// Whether ANSI color should be emitted for the given stream.
 pub fn color_enabled() -> bool {
