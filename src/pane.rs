@@ -42,7 +42,7 @@ use crate::elm::{
 use crate::backend::MultiplexerBackend;
 use crate::config::Config;
 use crate::crew::CrewPlan;
-use crate::hc_support::{AgentStatus, Client};
+use crate::hc::{AgentStatus, Client};
 use crate::models::{FallbackRoute, ModelRegistry};
 use crate::profile::ProfileCatalog;
 use crate::state::SpawnEntry;
@@ -1181,7 +1181,7 @@ fn spawn_crew_into(
                                 let root = pane_ids.first().cloned().ok_or_else(|| {
                                     anyhow!("pane crew: no root pane in workspace {ws_id}")
                                 })?;
-                                let split = crate::hc_support::pane_split(
+                                let split = crate::hc::pane_split(
                                     c,
                                     &root,
                                     "down",
@@ -1193,7 +1193,7 @@ fn spawn_crew_into(
                         }
                     }
                     Some(p) => {
-                        let split = crate::hc_support::pane_split(
+                        let split = crate::hc::pane_split(
                             c,
                             p,
                             "down",
@@ -1203,7 +1203,7 @@ fn spawn_crew_into(
                         split.pane_id
                     }
                 };
-                if !crate::hc_support::wait_shell_prompt(c, &pane_id, Duration::from_secs(15)) {
+                if !crate::hc::wait_shell_prompt(c, &pane_id, Duration::from_secs(15)) {
                     return Err(shell_gate_refusal(&name, &pane_id));
                 }
                 let agent =
@@ -2130,9 +2130,9 @@ pub(crate) fn pane_env_for_launch(
     mail_identity: Option<&str>,
     env_model_pin: Option<&str>,
 ) -> Result<std::collections::BTreeMap<String, String>> {
-    let mut env = crate::hc_support::plane_launch_env(cfg, mail_identity);
+    let mut env = crate::hc::plane_launch_env(cfg, mail_identity);
     if let Some(model) = env_model_pin {
-        crate::hc_support::apply_opencode_model_pin(&mut env, model)?;
+        crate::hc::apply_opencode_model_pin(&mut env, model)?;
     }
     Ok(env)
 }
@@ -2599,7 +2599,7 @@ pub fn launch_spawn_job(
         let mail_identity = crate::pinned_mail_identity(cfg, project, &name, &plan.harness);
         let pane_env =
             pane_env_for_launch(cfg, mail_identity.as_deref(), plan.env_model_pin.as_deref())?;
-        let split = crate::hc_support::pane_split(
+        let split = crate::hc::pane_split(
             &c,
             &prev,
             "down",
@@ -5403,7 +5403,7 @@ mod bd_d7zu_shell_gate_tests {
 mod rex_door_tests {
     use super::{rex_door_selected, rex_env_command, rex_shell_ready, wait_rex_shell_ready};
     use crate::backend::MultiplexerBackend;
-    use crate::hc_support::{AgentInfo, AgentStatus, BackendError};
+    use crate::hc::{AgentInfo, AgentStatus, BackendError};
     use std::collections::BTreeMap;
     use std::time::Duration;
 

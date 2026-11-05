@@ -52,7 +52,7 @@ mod failure;
 mod fs_util;
 mod harness_caps;
 mod harness_registry;
-mod hc_support;
+mod hc;
 mod headless;
 mod health_page;
 mod inbox_host;
@@ -150,7 +150,7 @@ use cmd::{
     cmd_stage, cmd_standing_orders, cmd_timeline, cmd_toron, cmd_work, cmd_worktree, cmd_xproj,
 };
 use config::{Config, Recipe, WorkflowStep};
-use hc_support::{
+use hc::{
     AgentInfo, AgentStatus, Client, SendVerdict, Subscription, WaitOptions, alt_screen_read_ladder,
     classify_send_result, sanitize_pane_text,
 };
@@ -2287,17 +2287,17 @@ pub(crate) fn find_workspace(c: &mut Client, project: &str) -> Result<String> {
 pub(crate) fn find_workspace_info(
     c: &mut Client,
     project: &str,
-) -> Result<hc_support::WorkspaceInfo> {
+) -> Result<hc::WorkspaceInfo> {
     let meta = state::load_spawn_meta(project);
     let aliases = workspace_label_aliases(project, meta.as_deref());
     let ws_list = c.workspace_list()?;
-    let exact: Vec<hc_support::WorkspaceInfo> = ws_list
+    let exact: Vec<hc::WorkspaceInfo> = ws_list
         .iter()
         .filter(|ws| aliases.iter().any(|a| a == &ws.label))
         .cloned()
         .collect();
     let exact_match = !exact.is_empty();
-    let mut matches: Vec<hc_support::WorkspaceInfo> = if exact_match {
+    let mut matches: Vec<hc::WorkspaceInfo> = if exact_match {
         exact
     } else {
         ws_list
@@ -2320,11 +2320,11 @@ pub(crate) fn find_workspace_info(
         let prefix = format!("flywheel-{}-", project_base(project));
         let agents = c.agent_list()?;
         if let Some(ws) =
-            hc_support::resolve_workspace_from_registry(&matches, &agents, &registry_panes(project))
+            hc::resolve_workspace_from_registry(&matches, &agents, &registry_panes(project))
         {
             return Ok(pick_workspace(matches, &ws));
         }
-        let id = hc_support::resolve_workspace_id(&matches, &agents, &prefix);
+        let id = hc::resolve_workspace_id(&matches, &agents, &prefix);
         return Ok(pick_workspace(matches, &id));
     }
     Ok(matches.swap_remove(0))
@@ -2332,9 +2332,9 @@ pub(crate) fn find_workspace_info(
 
 /// The entry with workspace id `id` (one of `matches` by construction).
 fn pick_workspace(
-    mut matches: Vec<hc_support::WorkspaceInfo>,
+    mut matches: Vec<hc::WorkspaceInfo>,
     id: &str,
-) -> hc_support::WorkspaceInfo {
+) -> hc::WorkspaceInfo {
     let i = matches
         .iter()
         .position(|w| w.workspace_id == id)
@@ -2425,13 +2425,13 @@ pub(crate) fn find_workspace_dyn(
     let meta = state::load_spawn_meta(project);
     let aliases = workspace_label_aliases(project, meta.as_deref());
     let ws_list = backend.workspace_list()?;
-    let exact: Vec<hc_support::WorkspaceInfo> = ws_list
+    let exact: Vec<hc::WorkspaceInfo> = ws_list
         .iter()
         .filter(|ws| aliases.iter().any(|a| a == &ws.label))
         .cloned()
         .collect();
     let exact_match = !exact.is_empty();
-    let matches: Vec<hc_support::WorkspaceInfo> = if exact_match {
+    let matches: Vec<hc::WorkspaceInfo> = if exact_match {
         exact
     } else {
         ws_list
@@ -2484,9 +2484,9 @@ pub(crate) fn find_workspace_dyn(
 pub(crate) fn find_workspaces_dyn(
     backend: &dyn backend::MultiplexerBackend,
     project: &str,
-) -> Result<Vec<hc_support::WorkspaceInfo>> {
+) -> Result<Vec<hc::WorkspaceInfo>> {
     let meta = state::load_spawn_meta(project);
-    let matches: Vec<hc_support::WorkspaceInfo> = backend
+    let matches: Vec<hc::WorkspaceInfo> = backend
         .workspace_list()?
         .into_iter()
         .filter(|ws| workspace_label_is_owned(project, &ws.label, meta.as_deref()))
@@ -2853,9 +2853,9 @@ fn registry_entry_for_token<'a>(
 /// bd-a2bw: hc `launch_pending` is stale when the pane is already
 /// input-ready (omp at `π >` with a session, status idle/working/blocked/
 /// done). Spawn/send must not treat that as still-booting.
-/// GS-049: shared with `snapshot::assemble` via `hc_support::agent_still_booting`.
+/// GS-049: shared with `snapshot::assemble` via `hc::agent_still_booting`.
 fn is_still_booting(a: &AgentInfo) -> bool {
-    hc_support::agent_still_booting(a)
+    hc::agent_still_booting(a)
 }
 
 /// Log an event with a compact payload.
@@ -2874,7 +2874,7 @@ fn main() {
         print_json(&json!({
             "tool": "flywheel",
             "version": VERSION,
-            "backend": format!("hc (socket protocol v{})", hc_support::HDR_PROTOCOL),
+            "backend": format!("hc (socket protocol v{})", hc::HDR_PROTOCOL),
             "upstream_parity": upstream_parity::robot_summary(),
             "commands": [
                 "init spawn add list status decide rebind recover",
@@ -4305,7 +4305,7 @@ pub(crate) struct ProfileLaunchPlan {
     pub model: String,
     /// `Some(model)` when the harness's interactive entrypoint has no model
     /// flag, so the pin must ALSO travel via pane env
-    /// (`hc_support::apply_opencode_model_pin`).
+    /// (`hc::apply_opencode_model_pin`).
     pub env_model_pin: Option<String>,
 }
 
@@ -4365,7 +4365,7 @@ pub(crate) fn profile_launch_args(
         anyhow::bail!(
             "harness {harness:?} takes no model flag on its interactive entrypoint, so the \
              model {m:?} cannot be delivered as argv — resolve the plan and pin it via pane \
-             env (hc_support::apply_opencode_model_pin) instead of using the argv-only view"
+             env (hc::apply_opencode_model_pin) instead of using the argv-only view"
         );
     }
     Ok(plan.args)
@@ -4461,8 +4461,8 @@ enum WorkspaceOrigin {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WorkspaceSplit {
-    pub owned: Vec<hc_support::WorkspaceInfo>,
-    pub foreign: Vec<hc_support::WorkspaceInfo>,
+    pub owned: Vec<hc::WorkspaceInfo>,
+    pub foreign: Vec<hc::WorkspaceInfo>,
 }
 
 /// bd-627z.3: classify one workspace by origin. `None` = unrelated (skip).
@@ -4470,8 +4470,8 @@ pub(crate) struct WorkspaceSplit {
 /// base-labeled workspace is still a flywheel workspace).
 fn classify_workspace_origin(
     project: &str,
-    ws: &hc_support::WorkspaceInfo,
-    agents: &[hc_support::AgentInfo],
+    ws: &hc::WorkspaceInfo,
+    agents: &[hc::AgentInfo],
     spawn_label: Option<&str>,
 ) -> Option<WorkspaceOrigin> {
     let base = project_base(project);
@@ -4500,8 +4500,8 @@ fn classify_workspace_origin(
 /// bd-627z.3: pure partition of the workspace list into owned/foreign.
 fn partition_workspaces(
     project: &str,
-    ws_list: Vec<hc_support::WorkspaceInfo>,
-    agents: &[hc_support::AgentInfo],
+    ws_list: Vec<hc::WorkspaceInfo>,
+    agents: &[hc::AgentInfo],
     spawn_label: Option<&str>,
 ) -> WorkspaceSplit {
     let mut split = WorkspaceSplit::default();
@@ -4534,14 +4534,14 @@ pub(crate) fn project_workspaces(c: &mut Client, project: &str) -> Result<Worksp
 /// flywheel-toron). Refuses when no owned workspace exists (spawn first).
 fn add_target_from_split(
     split: &WorkspaceSplit,
-    agents: &[hc_support::AgentInfo],
+    agents: &[hc::AgentInfo],
     project: &str,
 ) -> Result<String> {
     if split.owned.is_empty() {
         bail!("no flywheel-owned swarm for {project} (run: flywheel spawn {project})")
     }
     let prefix = format!("flywheel-{}-", project_base(project));
-    Ok(hc_support::resolve_workspace_id(
+    Ok(hc::resolve_workspace_id(
         &split.owned,
         agents,
         &prefix,
@@ -5136,7 +5136,7 @@ mod profile_run_spawn_tests {
     #[test]
     fn resolved_spec_workspace_returns_pane_id() {
         use crate::backend::MultiplexerBackend;
-        use crate::hc_support::{PaneInfo, WorkspaceInfo};
+        use crate::hc::{PaneInfo, WorkspaceInfo};
         use toron_core::backend::types::AgentStatus;
 
         struct MockMux {
@@ -5296,7 +5296,7 @@ mod internal_respawn_tests {
     use super::*;
     use crate::backend::MultiplexerBackend;
     use crate::config::lock_env;
-    use crate::hc_support::{PaneInfo, WorkspaceInfo};
+    use crate::hc::{PaneInfo, WorkspaceInfo};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -5635,7 +5635,7 @@ mod steer_safety_tests {
 
     #[test]
     fn working_agent_names_only_working() {
-        use crate::hc_support::{AgentInfo, AgentStatus};
+        use crate::hc::{AgentInfo, AgentStatus};
         fn agent(name: &str, status: AgentStatus) -> AgentInfo {
             AgentInfo {
                 agent: None,
@@ -5978,7 +5978,7 @@ mod steer_engine_tests {
 #[cfg(test)]
 mod workspace_origin_tests {
     use super::*;
-    use crate::hc_support::{AgentInfo, WorkspaceInfo};
+    use crate::hc::{AgentInfo, WorkspaceInfo};
 
     fn ws(id: &str, label: &str, panes: u64) -> WorkspaceInfo {
         WorkspaceInfo {
@@ -6752,7 +6752,7 @@ mod adr0013_spawn_effect_tests {
             .find("AgentEffectGuard::begin")
             .expect("cmd_add must journal the add intent");
         let dispatch = add
-            .find("hc_support::pane_split(")
+            .find("hc::pane_split(")
             .expect("cmd_add must split panes");
         assert!(
             gate < guard,
@@ -8308,15 +8308,15 @@ const LIFECYCLE_AUTHORITY_KINDS: &[&str] = &[
 fn preflight_kind_integration(
     c: &mut Client,
     kind: &str,
-    statuses: &HashMap<String, hc_support::IntegrationStatus>,
+    statuses: &HashMap<String, hc::IntegrationStatus>,
 ) {
-    if hc_support::integration_target(kind).is_none() {
+    if hc::integration_target(kind).is_none() {
         return;
     }
     let st = statuses
         .get(kind)
         .cloned()
-        .unwrap_or_else(hc_support::IntegrationStatus::not_installed);
+        .unwrap_or_else(hc::IntegrationStatus::not_installed);
     if st.installed && st.current {
         return;
     }
@@ -8327,7 +8327,7 @@ fn preflight_kind_integration(
         };
         eprintln!("flywheel: warn: {kind} hc integration {detail} — refreshing");
     }
-    match hc_support::integration_install_socket(c, kind) {
+    match hc::integration_install_socket(c, kind) {
         Ok(messages) => {
             eprintln!(
                 "flywheel: hc integration {kind} installed via socket{}",
@@ -8370,8 +8370,8 @@ fn warn_integration_install_failed(kind: &str, hook_authority: bool, e: &anyhow:
 /// kinds share. hc 0.1.16 has no integration surface, so the map is always
 /// empty (every kind reads not-installed → install attempt → loud warning,
 /// never a spawn failure).
-fn read_integration_statuses() -> HashMap<String, hc_support::IntegrationStatus> {
-    match hc_support::integration_status_all() {
+fn read_integration_statuses() -> HashMap<String, hc::IntegrationStatus> {
+    match hc::integration_status_all() {
         Ok(v) => v.into_iter().collect(),
         Err(e) => {
             eprintln!(
@@ -8385,7 +8385,7 @@ fn read_integration_statuses() -> HashMap<String, hc_support::IntegrationStatus>
 
 /// H3: one `kind: <state>` line for the status/deps surfaces
 /// (kind -> installed/current/version), painted by state.
-fn integration_status_line(kind: &str, st: &hc_support::IntegrationStatus) -> String {
+fn integration_status_line(kind: &str, st: &hc::IntegrationStatus) -> String {
     let label = if st.installed && st.current {
         format!("current ({})", st.version.as_deref().unwrap_or("?"))
     } else if st.installed {
@@ -8499,7 +8499,7 @@ fn stale_rename_label(name: &str, attempts: u32) -> String {
 /// ADR-0003 discipline: classify on the machine code, never the message text.
 /// `agent_name_taken` is hc's wire code passed through as
 /// `BackendErrorCode::Other` — the one check every start door shares.
-fn is_taken_name_error(e: &hc_support::BackendError) -> bool {
+fn is_taken_name_error(e: &hc::BackendError) -> bool {
     e.code().as_str() == "agent_name_taken"
 }
 
@@ -8541,7 +8541,7 @@ enum StartAttempt {
     Started,
     /// Refused for a reason that is NOT `agent_name_taken` — the caller's own
     /// error policy (logging, classification, retry) still applies.
-    NotTaken(hc_support::BackendError),
+    NotTaken(hc::BackendError),
     /// The name is taken and the recovery may not (or could not) free it —
     /// fail loud NOW; keeping the name costs the retry budget and clears
     /// nothing.
@@ -8558,7 +8558,7 @@ trait TakenNameOps {
         kind: &str,
         pane_id: &str,
         args: &[String],
-    ) -> std::result::Result<AgentInfo, hc_support::BackendError>;
+    ) -> std::result::Result<AgentInfo, hc::BackendError>;
     /// Name the pane's OWN binding currently holds. An unreadable list reads
     /// as `None` — the safe side, because `None` never authorizes a rename.
     fn pane_binding(&mut self, pane_id: &str) -> Option<String>;
@@ -8569,13 +8569,13 @@ trait TakenNameOps {
         &mut self,
         pane_id: &str,
         label: &str,
-    ) -> std::result::Result<(), hc_support::BackendError>;
+    ) -> std::result::Result<(), hc::BackendError>;
 }
 
 /// The concrete-client implementation (spawn's dead-shell re-launch, both
 /// retry loops, the crew / rate-limit hops).
 struct ConcreteTakenOps<'a> {
-    c: &'a hc_support::Client,
+    c: &'a hc::Client,
 }
 
 impl TakenNameOps for ConcreteTakenOps<'_> {
@@ -8585,7 +8585,7 @@ impl TakenNameOps for ConcreteTakenOps<'_> {
         kind: &str,
         pane_id: &str,
         args: &[String],
-    ) -> std::result::Result<AgentInfo, hc_support::BackendError> {
+    ) -> std::result::Result<AgentInfo, hc::BackendError> {
         self.c.agent_start(name, kind, pane_id, 45_000, args)
     }
     fn pane_binding(&mut self, pane_id: &str) -> Option<String> {
@@ -8608,7 +8608,7 @@ impl TakenNameOps for ConcreteTakenOps<'_> {
         &mut self,
         pane_id: &str,
         label: &str,
-    ) -> std::result::Result<(), hc_support::BackendError> {
+    ) -> std::result::Result<(), hc::BackendError> {
         self.c.agent_rename(pane_id, label).map(|_| ())
     }
 }
@@ -8626,7 +8626,7 @@ impl TakenNameOps for DynTakenOps<'_> {
         kind: &str,
         pane_id: &str,
         args: &[String],
-    ) -> std::result::Result<AgentInfo, hc_support::BackendError> {
+    ) -> std::result::Result<AgentInfo, hc::BackendError> {
         self.backend.agent_start(name, kind, pane_id, args)
     }
     fn pane_binding(&mut self, pane_id: &str) -> Option<String> {
@@ -8649,7 +8649,7 @@ impl TakenNameOps for DynTakenOps<'_> {
         &mut self,
         pane_id: &str,
         label: &str,
-    ) -> std::result::Result<(), hc_support::BackendError> {
+    ) -> std::result::Result<(), hc::BackendError> {
         self.backend.agent_rename(pane_id, Some(label))
     }
 }
@@ -9194,8 +9194,8 @@ fn verify_or_respawn_pane(
         let grace = std::time::Instant::now() + Duration::from_secs(20);
         let mut live = false;
         while std::time::Instant::now() < grace && std::time::Instant::now() < deadline {
-            let verdict = hc_support::pane_process_info(c, pane_id)
-                .map(|pi| hc_support::pane_agent_alive(&pi, kind))
+            let verdict = hc::pane_process_info(c, pane_id)
+                .map(|pi| hc::pane_agent_alive(&pi, kind))
                 .unwrap_or(None);
             if verdict == Some(true) {
                 live = true;
@@ -9223,8 +9223,8 @@ fn verify_or_respawn_pane(
         eprintln!(
             "flywheel: {name} ({pane_id}) is a shell-fallback pane (no live agent process, bd-spawn-omp-boot-reliability-3h06) — re-launching (attempt {attempts})"
         );
-        if let Some(pi) = hc_support::pane_process_info(c, pane_id).ok()
-            && hc_support::pane_agent_alive(&pi, kind) == Some(false)
+        if let Some(pi) = hc::pane_process_info(c, pane_id).ok()
+            && hc::pane_agent_alive(&pi, kind) == Some(false)
         {
             let _ = c.pane_send_input(pane_id, &["CTRL_C"]);
             std::thread::sleep(Duration::from_millis(500));
@@ -9239,7 +9239,7 @@ fn verify_or_respawn_pane(
             }
             StartAttempt::Refused(e) => return Err(e),
         }
-        let _ = hc_support::wait_agent_foreground(c, pane_id, kind, name, Duration::from_secs(15));
+        let _ = hc::wait_agent_foreground(c, pane_id, kind, name, Duration::from_secs(15));
         if prime {
             prime_bootstrap(c, pane_id, kind);
         }
@@ -9537,8 +9537,8 @@ projects available: {}",
     }
     let all_agents = c.agent_list()?;
     let mut probe = Client::connect(Some(&cfg.socket_path())).ok();
-    let mut dead_owned: Vec<hc_support::WorkspaceInfo> = Vec::new();
-    let mut live_owned: Vec<hc_support::WorkspaceInfo> = Vec::new();
+    let mut dead_owned: Vec<hc::WorkspaceInfo> = Vec::new();
+    let mut live_owned: Vec<hc::WorkspaceInfo> = Vec::new();
     for ws in &split.owned {
         let ws_agents: Vec<_> = all_agents
             .iter()
@@ -9650,13 +9650,13 @@ projects available: {}",
         }
         None => None,
     };
-    let mut plane_env = hc_support::plane_launch_env(cfg, first_pin.as_deref());
+    let mut plane_env = hc::plane_launch_env(cfg, first_pin.as_deref());
     if let Some(m) = first_plan
         .as_ref()
         .and_then(|p| p.env_model_pin.clone())
         .or_else(|| first_bare.as_ref().and_then(|(_, pin)| pin.clone()))
     {
-        hc_support::apply_opencode_model_pin(&mut plane_env, &m)?;
+        hc::apply_opencode_model_pin(&mut plane_env, &m)?;
     }
     let spawn_effect = match request_key {
         Some(_) => agent_ref::AgentEffectGuard::begin_with(
@@ -9764,15 +9764,15 @@ projects available: {}",
                     (args, None, env_pin)
                 }
             };
-            let mut pane_env = hc_support::plane_launch_env(cfg, mail_identity.as_deref());
+            let mut pane_env = hc::plane_launch_env(cfg, mail_identity.as_deref());
             if let Some(m) = &env_model_pin {
-                hc_support::apply_opencode_model_pin(&mut pane_env, m)?;
+                hc::apply_opencode_model_pin(&mut pane_env, m)?;
             }
             let pane_id = if first {
                 first = false;
                 prev.clone()
             } else {
-                let p = hc_support::pane_split(
+                let p = hc::pane_split(
                     &c,
                     &prev,
                     "down",
@@ -9805,7 +9805,7 @@ projects available: {}",
             if needs_in_arg_prime(&kind) && !has_peer_prime {
                 agent_args.push(boot_prime_line().to_string());
             }
-            let shell_ready = hc_support::wait_shell_prompt(&c, &pane_id, Duration::from_secs(15));
+            let shell_ready = hc::wait_shell_prompt(&c, &pane_id, Duration::from_secs(15));
             if !shell_ready {
                 eprintln!(
                     "flywheel: warn: shell for {name} ({pane_id}) did not render a prompt \
@@ -9820,7 +9820,7 @@ projects available: {}",
                 &agent_args,
                 item.profile.as_deref(),
             )?;
-            let ready = hc_support::wait_agent_foreground(
+            let ready = hc::wait_agent_foreground(
                 &c,
                 &pane_id,
                 &kind,
@@ -10078,9 +10078,9 @@ the panes may still be live in hc; `--no-verify` skips this check in scripts"
             std::thread::sleep(Duration::from_secs(2));
         }
         let dead = dead_panes(&booted, |pane_id, kind| {
-            hc_support::pane_process_info(&c, pane_id)
+            hc::pane_process_info(&c, pane_id)
                 .ok()
-                .and_then(|pi| hc_support::pane_agent_alive(&pi, kind))
+                .and_then(|pi| hc::pane_agent_alive(&pi, kind))
         });
         if !dead.is_empty() {
             let list = dead
@@ -10588,8 +10588,8 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
                 None => match backend.agent_wait(
                     &pane_id,
                     &[
-                        hc_support::AgentStatus::Idle,
-                        hc_support::AgentStatus::Working,
+                        hc::AgentStatus::Idle,
+                        hc::AgentStatus::Working,
                     ],
                     Some(90_000),
                 ) {
@@ -13192,7 +13192,7 @@ mod peer_encoding_tests {
             _kind: &str,
             _pane_id: &str,
             _args: &[String],
-        ) -> Result<crate::hc_support::AgentInfo, crate::hc_support::BackendError> {
+        ) -> Result<crate::hc::AgentInfo, crate::hc::BackendError> {
             panic!("agent.start must never be reached with a poisoned arg")
         }
     }
@@ -14848,7 +14848,7 @@ fn cmd_add_rex(
             if needs_in_arg_prime(&kind) {
                 add_args.push(boot_prime_line().to_string());
             }
-            let pane_env = hc_support::plane_launch_env(cfg, mail_identity.as_deref());
+            let pane_env = hc::plane_launch_env(cfg, mail_identity.as_deref());
             let cwd = utf8_path(&dir, "workspace dir")?;
             let split_pane = backend
                 .pane_split(&prev, "down", Some(&cwd))
@@ -14864,8 +14864,8 @@ fn cmd_add_rex(
             if let Err(e) = backend.agent_wait(
                 &prev,
                 &[
-                    hc_support::AgentStatus::Idle,
-                    hc_support::AgentStatus::Working,
+                    hc::AgentStatus::Idle,
+                    hc::AgentStatus::Working,
                 ],
                 Some(90_000),
             ) {
@@ -15007,8 +15007,8 @@ fn cmd_add(
             if mail_identity.is_none() {
                 refuse_unpinned_spawn(&name, None, backend::mail_backend(cfg).is_ok())?;
             }
-            let pane_env = hc_support::plane_launch_env(cfg, mail_identity.as_deref());
-            let p = hc_support::pane_split(
+            let pane_env = hc::plane_launch_env(cfg, mail_identity.as_deref());
+            let p = hc::pane_split(
                 &c,
                 &prev,
                 "down",
@@ -15020,7 +15020,7 @@ fn cmd_add(
             if needs_in_arg_prime(&kind) {
                 add_args.push(boot_prime_line().to_string());
             }
-            let shell_ready = hc_support::wait_shell_prompt(&c, &prev, Duration::from_secs(15));
+            let shell_ready = hc::wait_shell_prompt(&c, &prev, Duration::from_secs(15));
             if !shell_ready {
                 eprintln!(
                     "flywheel: warn: shell for {name} ({prev}) did not render a prompt \
@@ -15034,10 +15034,10 @@ fn cmd_add(
                     )
                 })?;
             let foreground =
-                hc_support::wait_agent_foreground(&c, &prev, &kind, &name, Duration::from_secs(15));
+                hc::wait_agent_foreground(&c, &prev, &kind, &name, Duration::from_secs(15));
             if !foreground {
-                match hc_support::pane_process_info(&c, &prev)
-                    .map(|pi| hc_support::pane_agent_alive(&pi, &kind))
+                match hc::pane_process_info(&c, &prev)
+                    .map(|pi| hc::pane_agent_alive(&pi, &kind))
                 {
                     Ok(Some(false)) => bail!(
                         "add {name}: agent process gone on {prev} — undriven shell left behind; close it with `hc terminal close {prev}`"
@@ -15122,7 +15122,7 @@ fn cmd_list(cfg: &Config, all: bool) -> Result<()> {
             if let Some(ags) = r["agents"].as_array() {
                 for a in ags {
                     let st = a["status"].as_str().unwrap_or("unknown");
-                    let st = hc_support::parse_agent_status(st)
+                    let st = hc::parse_agent_status(st)
                         .map(status_paint)
                         .unwrap_or_else(|_| dim(st));
                     println!(
@@ -16550,7 +16550,7 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     let Some(project) = project else {
         return cmd_list(cfg, false);
     };
-    let (ws_id, agents, dead): (String, Vec<hc_support::AgentInfo>, Vec<(String, String)>) =
+    let (ws_id, agents, dead): (String, Vec<hc::AgentInfo>, Vec<(String, String)>) =
         if crate::pane::rex_door_selected(cfg) {
             let backend = crate::backend::factory::multiplexer_backend(cfg)?;
             let ws_id = find_workspace_dyn(&*backend, project)?;
@@ -16649,17 +16649,17 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
         })
         .collect();
     let integration_statuses = read_integration_statuses();
-    let integrations: BTreeMap<String, hc_support::IntegrationStatus> = agents
+    let integrations: BTreeMap<String, hc::IntegrationStatus> = agents
         .iter()
         .filter_map(|a| a.agent.as_deref())
-        .filter(|k| hc_support::integration_target(k).is_some())
+        .filter(|k| hc::integration_target(k).is_some())
         .collect::<HashSet<_>>()
         .into_iter()
         .map(|k| {
             let st = integration_statuses
                 .get(k)
                 .cloned()
-                .unwrap_or_else(hc_support::IntegrationStatus::not_installed);
+                .unwrap_or_else(hc::IntegrationStatus::not_installed);
             (k.to_string(), st)
         })
         .collect();
@@ -16688,7 +16688,7 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     if std::io::stdout().is_terminal() {
         for r in &rows {
             let st = r["status"].as_str().unwrap_or("unknown");
-            let st = hc_support::parse_agent_status(st)
+            let st = hc::parse_agent_status(st)
                 .map(status_paint)
                 .unwrap_or_else(|_| dim(st));
             println!(
@@ -17163,14 +17163,14 @@ const RESPONSIVENESS_WINDOW: Duration = Duration::from_secs(3);
 /// inconclusive (the caller falls back to legacy pane-existence
 /// classification — never a confident "healthy").
 fn probe_agent_liveness(
-    probe: &mut Option<hc_support::Client>,
+    probe: &mut Option<hc::Client>,
     pane_id: &str,
     kind: &str,
     name: &str,
 ) -> Option<bool> {
     let c = probe.as_mut()?;
-    match hc_support::pane_process_info(c, pane_id) {
-        Ok(pi) => hc_support::pane_agent_alive(&pi, kind),
+    match hc::pane_process_info(c, pane_id) {
+        Ok(pi) => hc::pane_agent_alive(&pi, kind),
         Err(e) => {
             eprintln!("flywheel: recover liveness probe for {name} failed: {e:#}");
             None
@@ -17246,14 +17246,14 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
                     },
                     Some(true) => {
                         let verdict = probe.as_mut().map(|c| {
-                            hc_support::probe_agent_responsiveness(
+                            hc::probe_agent_responsiveness(
                                 c,
                                 pane_id,
                                 RESPONSIVENESS_WINDOW,
                             )
                         });
                         match verdict {
-                            Some(hc_support::Responsiveness::Unresponsive) => {
+                            Some(hc::Responsiveness::Unresponsive) => {
                                 RecoverDecision::Respawn {
                                     reason: "unresponsive",
                                 }
@@ -17712,7 +17712,7 @@ fn cmd_send_rex(
             println!(
                 "{} {}",
                 dim(agent_target(a)),
-                status_paint(hc_support::parse_agent_status(shown).unwrap_or(AgentStatus::Unknown))
+                status_paint(hc::parse_agent_status(shown).unwrap_or(AgentStatus::Unknown))
             );
         }
     }
@@ -18088,7 +18088,7 @@ fn cmd_send(
                 "{} {}",
                 dim(agent_target(a)),
                 status_paint(
-                    hc_support::parse_agent_status(status).unwrap_or(AgentStatus::Unknown)
+                    hc::parse_agent_status(status).unwrap_or(AgentStatus::Unknown)
                 )
             );
         }
@@ -19535,7 +19535,7 @@ fn cmd_interrupt(
         let targets = resolve_send_targets_dyn(&in_ws, &registry, project, to)?;
         for a in &targets {
             let prior =
-                hc_support::parse_agent_status(a.agent_status.as_str()).unwrap_or(AgentStatus::Unknown);
+                hc::parse_agent_status(a.agent_status.as_str()).unwrap_or(AgentStatus::Unknown);
             interrupt_guard_working(prior, force)?;
         }
         let is_kill = kill_key(&keys).is_some();
@@ -19566,7 +19566,7 @@ fn cmd_interrupt(
     let targets = resolve_agents(&mut c, &ws_id, project, to)?;
     for a in &targets {
         let prior =
-            hc_support::parse_agent_status(a.agent_status.as_str()).unwrap_or(AgentStatus::Unknown);
+            hc::parse_agent_status(a.agent_status.as_str()).unwrap_or(AgentStatus::Unknown);
         interrupt_guard_working(prior, force)?;
     }
     let is_kill = kill_key(&keys).is_some();
@@ -19603,7 +19603,7 @@ fn client_read_with_fallback(
     source: &str,
     lines: Option<u32>,
 ) -> Result<String> {
-    let mut ops = hc_support::ClientAltScreenRead::new(c, target, lines);
+    let mut ops = hc::ClientAltScreenRead::new(c, target, lines);
     let raw = alt_screen_read_ladder(&mut ops, source)
         .map_err(|e| anyhow!("{target}: alt-screen read failed: {e:#}"))?;
     Ok(sanitize_pane_text(&raw))
@@ -19676,7 +19676,7 @@ fn watch_name_for_pane<'a>(targets: &'a [(String, String)], pane_id: &str) -> Op
 }
 
 /// `flywheel output`: read an agent's session from the opencode structured
-/// store (bd-eign.5). Logic lives in hc_support::read_session_log; this is a
+/// store (bd-eign.5). Logic lives in hc::read_session_log; this is a
 /// thin runtime + render stub.
 fn cmd_output(
     cfg: &Config,
@@ -19687,7 +19687,7 @@ fn cmd_output(
 ) -> Result<()> {
     check_project_spelling(project, "output")?;
     let dir = project_dir_str(cfg, project)?;
-    let log = hc_support::read_session_log(&dir, role, session, limit)?;
+    let log = hc::read_session_log(&dir, role, session, limit)?;
     print_json(&log);
     Ok(())
 }
@@ -19701,7 +19701,7 @@ fn cmd_watch(
 ) -> Result<()> {
     check_project_spelling(project, "watch")?;
     let until_status: Option<AgentStatus> =
-        until.map(hc_support::parse_agent_status).transpose()?;
+        until.map(hc::parse_agent_status).transpose()?;
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     if std::io::stdout().is_terminal() {
         let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
@@ -19733,7 +19733,7 @@ fn cmd_watch(
         .iter()
         .map(|p| Subscription::agent_status_changed(p.pane_id.clone()))
         .collect();
-    let mut stream = match hc_support::subscribe(&c, &subs) {
+    let mut stream = match hc::subscribe(&c, &subs) {
         Ok(s) => Some(s),
         Err(e) => {
             eprintln!("flywheel: WARNING subscription failed ({e:#}); polling fallback");
@@ -19760,8 +19760,8 @@ fn cmd_watch(
             match s.read_event() {
                 Ok(Some(ev)) => {
                     match ev.data {
-                        hc_support::TerminalEventData::PaneAgentStatusChanged(change)
-                        | hc_support::TerminalEventData::PaneAgentStatusChangedSub(change) => {
+                        hc::TerminalEventData::PaneAgentStatusChanged(change)
+                        | hc::TerminalEventData::PaneAgentStatusChangedSub(change) => {
                             let Some(name) = watch_name_for_pane(&watch_targets, &change.pane_id)
                             else {
                                 continue;
@@ -19849,7 +19849,7 @@ fn cmd_attach(cfg: &Config, project: &str, to: &str) -> Result<()> {
 fn working_agent_names(agents: &[AgentInfo]) -> Vec<String> {
     agents
         .iter()
-        .filter(|a| a.agent_status == hc_support::AgentStatus::Working)
+        .filter(|a| a.agent_status == hc::AgentStatus::Working)
         .map(|a| a.name.clone().unwrap_or_else(|| a.pane_id.clone()))
         .collect()
 }
@@ -22525,7 +22525,7 @@ fn run_workflow(cfg: &Config, project: &str, name: &str) -> Result<()> {
                 }
             }
             WorkflowStep::Wait { until, timeout_ms } => {
-                let st = hc_support::parse_agent_status(until)?;
+                let st = hc::parse_agent_status(until)?;
                 let targets = resolve_agents(&mut c, &ws_id, project, "all")?;
                 for a in &targets {
                     c.agent_wait(
@@ -23058,10 +23058,10 @@ fn probe_pane_wedges(
             continue;
         };
         let kind = a.agent.as_deref().unwrap_or("");
-        let alive = hc_support::pane_process_info(&c, &e.pane_id)
+        let alive = hc::pane_process_info(&c, &e.pane_id)
             .ok()
-            .and_then(|info| hc_support::pane_agent_alive(&info, kind));
-        let tail = hc_support::pane_recent_text(&c, &e.pane_id).ok();
+            .and_then(|info| hc::pane_agent_alive(&info, kind));
+        let tail = hc::pane_recent_text(&c, &e.pane_id).ok();
         let action = durable::pane_wedge_action(
             &durable::PaneWedgeInputs {
                 pin,
@@ -25526,7 +25526,7 @@ esac
             "no hc client on the rex arm"
         );
         assert!(
-            !rex.contains("hc_support::Client"),
+            !rex.contains("hc::Client"),
             "no hc client type on the rex arm"
         );
     }
@@ -26787,23 +26787,23 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .and_then(|o| hc_support::parse_protocol(&String::from_utf8_lossy(&o.stdout)))
+        .and_then(|o| hc::parse_protocol(&String::from_utf8_lossy(&o.stdout)))
     {
-        match protocol_check(p, u64::from(hc_support::HDR_PROTOCOL)) {
+        match protocol_check(p, u64::from(hc::HDR_PROTOCOL)) {
             ProtocolCheck::Match => println!(
                 "hc protocol: {} (verified {})",
                 paint_ok(&p.to_string()),
-                hc_support::HDR_PROTOCOL
+                hc::HDR_PROTOCOL
             ),
             ProtocolCheck::Newer => {
                 println!(
                     "hc protocol: {} (verified {})",
                     crate::output::warn(&p.to_string()),
-                    hc_support::HDR_PROTOCOL
+                    hc::HDR_PROTOCOL
                 );
                 eprintln!(
                     "flywheel: INFO hc protocol {p} > verified {} — forward-compatible (client ignores what it doesn't know), but flywheel may not use new features; rebuild against the newer schema when ready",
-                    hc_support::HDR_PROTOCOL
+                    hc::HDR_PROTOCOL
                 );
             }
             ProtocolCheck::Older => {
@@ -26811,11 +26811,11 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
                 println!(
                     "hc protocol: {} (verified {})",
                     crate::output::error(&p.to_string()),
-                    hc_support::HDR_PROTOCOL
+                    hc::HDR_PROTOCOL
                 );
                 eprintln!(
                     "flywheel: ERROR hc protocol {p} < verified {} — server too old, our requests may be rejected; upgrade hc or rebuild flywheel against the pinned schema",
-                    hc_support::HDR_PROTOCOL
+                    hc::HDR_PROTOCOL
                 );
             }
         }
@@ -26823,7 +26823,7 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
         println!(
             "hc protocol: {} (verified {})",
             crate::output::warn("unknown"),
-            hc_support::HDR_PROTOCOL
+            hc::HDR_PROTOCOL
         );
         eprintln!(
             "flywheel: WARNING cannot read an hc protocol number from `hc schema --json` \
@@ -26832,7 +26832,7 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
         );
     }
 
-    match hc_support::integration_status_all() {
+    match hc::integration_status_all() {
         Ok(list) => {
             println!("hc integrations:");
             for (kind, st) in list {
@@ -32302,9 +32302,9 @@ fn settle_agent(mux: &dyn backend::MultiplexerBackend, agent: &str) -> Result<()
     mux.agent_wait(
         agent,
         &[
-            crate::hc_support::AgentStatus::Done,
-            crate::hc_support::AgentStatus::Idle,
-            crate::hc_support::AgentStatus::Blocked,
+            crate::hc::AgentStatus::Done,
+            crate::hc::AgentStatus::Idle,
+            crate::hc::AgentStatus::Blocked,
         ],
         Some(1_800_000),
     )
@@ -32779,7 +32779,7 @@ fn is_first_dispatch(skills_injected: bool) -> bool {
 /// missing (fresh pane still binding) or still booting. Anything else
 /// proceeds straight to the normal send path.
 fn should_gate_first_dispatch(first: bool, agent: Option<&AgentInfo>) -> bool {
-    first && agent.is_none_or(crate::hc_support::agent_still_booting)
+    first && agent.is_none_or(crate::hc::agent_still_booting)
 }
 
 /// bd-83as: have this agent's skills been injected yet (spawn registry)?
@@ -32814,7 +32814,7 @@ where
         if let Some(a) = agents
             .iter()
             .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name))
-            && !crate::hc_support::agent_still_booting(a)
+            && !crate::hc::agent_still_booting(a)
         {
             return Ok(a.clone());
         }
@@ -33150,7 +33150,7 @@ fn log_engine_dispatch(
 /// the caller-provided, workspace-filtered agent list) maps to its pane; a
 /// target containing `:` is treated as a raw pane id; anything else is
 /// unknown. Pure — no lookup logic duplicated from `__send`.
-fn resolve_pane_id(agents: &[hc_support::AgentInfo], target: &str) -> Option<String> {
+fn resolve_pane_id(agents: &[hc::AgentInfo], target: &str) -> Option<String> {
     if let Some(a) = agents.iter().find(|a| a.name.as_deref() == Some(target)) {
         return Some(a.pane_id.clone());
     }
@@ -33203,7 +33203,7 @@ fn cmd_internal_wait_output(
         eprintln!("flywheel: target {target} not found in {project}");
         std::process::exit(1);
     };
-    match hc_support::pane_wait_output(&c, &pane_id, wait_output_mode(regex), pattern, timeout_ms) {
+    match hc::pane_wait_output(&c, &pane_id, wait_output_mode(regex), pattern, timeout_ms) {
         Ok(r) => {
             print_json(&wait_output_json(
                 true,
@@ -33409,8 +33409,8 @@ fn cmd_internal_read(cfg: &Config, project: &str, name: &str) -> Result<()> {
         .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name))
         .ok_or_else(|| anyhow!("agent {name} not found in {project}"))?;
     let target = agent_target(&agent).to_string();
-    let mut ops = hc_support::BackendAltScreenRead::new(&*backend, &target, 60);
-    let text = match alt_screen_read_ladder(&mut ops, hc_support::RECENT_UNWRAPPED_SOURCE) {
+    let mut ops = hc::BackendAltScreenRead::new(&*backend, &target, 60);
+    let text = match alt_screen_read_ladder(&mut ops, hc::RECENT_UNWRAPPED_SOURCE) {
         Ok(t) => t,
         Err(e) => return Err(anyhow!("{target}: alt-screen read failed: {e:#}")),
     };
@@ -36736,8 +36736,8 @@ fn cmd_internal_diagnose(cfg: &Config, project: &str, name: &str, reason: &str) 
             return Ok(());
         }
     };
-    let mut ops = hc_support::BackendAltScreenRead::new(&*backend, name, 80);
-    match alt_screen_read_ladder(&mut ops, hc_support::RECENT_UNWRAPPED_SOURCE) {
+    let mut ops = hc::BackendAltScreenRead::new(&*backend, name, 80);
+    match alt_screen_read_ladder(&mut ops, hc::RECENT_UNWRAPPED_SOURCE) {
         Ok(v) => {
             tail = v;
             if tail.len() > 4000 {
@@ -37564,7 +37564,7 @@ fn cmd_serve(_cfg: &Config, _port: u16) -> Result<()> {
 #[cfg(test)]
 mod wait_output_tests {
     use super::*;
-    use crate::hc_support::{AgentInfo, PaneWaitResult};
+    use crate::hc::{AgentInfo, PaneWaitResult};
 
     fn agent(name: Option<&str>, pane: &str) -> AgentInfo {
         AgentInfo {
@@ -39211,7 +39211,7 @@ steps:
 #[cfg(test)]
 mod bd_bvwf1_orphan_workspaces {
     use super::{WorkspaceOrigin, classify_workspace_origin, partition_workspaces};
-    use crate::hc_support::{AgentInfo, WorkspaceInfo};
+    use crate::hc::{AgentInfo, WorkspaceInfo};
 
     fn ws(id: &str, label: &str) -> WorkspaceInfo {
         serde_json::from_value(serde_json::json!({

@@ -171,11 +171,11 @@ impl From<anyhow::Error> for BackendError {
     }
 }
 
-impl From<crate::hc_support::PlaneError> for BackendError {
+impl From<crate::hc::PlaneError> for BackendError {
     /// Preserve hc's typed error code as an `Other` with a lossless
     /// anyhow context. (Backend callers handle `BackendError::Unsupported`;
     /// transport errors stay opaque in `Other`.)
-    fn from(e: crate::hc_support::PlaneError) -> Self {
+    fn from(e: crate::hc::PlaneError) -> Self {
         Self::Other(anyhow::anyhow!("hc error {}: {}", e.code, e.message))
     }
 }

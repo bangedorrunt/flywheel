@@ -12,7 +12,7 @@ use clap::Subcommand;
 use serde_json::{Value, json};
 
 use crate::config::Config;
-use crate::hc_support::Client;
+use crate::hc::Client;
 use crate::output::print_json;
 
 #[derive(Subcommand)]
@@ -49,10 +49,10 @@ pub(crate) fn cmd_agent(cfg: &Config, cmd: &AgentCmd) -> Result<()> {
 /// name-vs-identity ladder `status` uses, so a numbered terminal name (oc2/pi2)
 /// still resolves to its pin. Pure over its inputs.
 fn pin_pane<'a>(
-    panes: &'a [crate::hc_support::PaneInfo],
+    panes: &'a [crate::hc::PaneInfo],
     registry: &[crate::state::SpawnEntry],
     pin: &str,
-) -> Option<&'a crate::hc_support::PaneInfo> {
+) -> Option<&'a crate::hc::PaneInfo> {
     if let Some(pane) = panes.iter().find(|p| {
         p.tokens.get("toron_pin").and_then(Value::as_str) == Some(pin)
             || p.display_agent.as_deref() == Some(pin)
@@ -120,7 +120,7 @@ fn cmd_agent_tail(
             pane.pane_id
         );
     };
-    let tail = crate::hc_support::read_agent_session_tail(session, n)?;
+    let tail = crate::hc::read_agent_session_tail(session, n)?;
     if json_out || !std::io::stdout().is_terminal() {
         print_json(&json!({
             "pin": pin,

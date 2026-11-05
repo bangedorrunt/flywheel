@@ -5,7 +5,7 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 use crate::config::Config;
-use crate::hc_support::{AgentStatus, Client};
+use crate::hc::{AgentStatus, Client};
 use crate::output::{dim, kind_paint, print_json, status_paint};
 use crate::state::EventKind;
 
@@ -101,7 +101,7 @@ pub(crate) fn cmd_changes(cfg: &Config, project: &str, since: usize) -> Result<(
                 dim(a.name.as_deref().unwrap_or("?")),
                 dim(prev_st),
                 status_paint(
-                    crate::hc_support::parse_agent_status(now_st).unwrap_or(AgentStatus::Unknown)
+                    crate::hc::parse_agent_status(now_st).unwrap_or(AgentStatus::Unknown)
                 )
             );
         }

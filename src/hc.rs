@@ -209,7 +209,7 @@ pub fn parse_protocol(raw: &str) -> Option<u64> {
         .and_then(|v| v.get("protocol").and_then(Value::as_u64))
 }
 
-/// A harness kind's integration install state. hc 0.1.16 exposes no
+/// A harness kind's integration install state. hc 0.1.18 (tested) exposes no
 /// integration surface, so every live status is `not_installed` — the H3
 /// preflight warns (with the manual remedy) and never fails the spawn.
 /// `flywheel status` / `flywheel deps` surface this state per kind.
@@ -245,7 +245,7 @@ impl IntegrationStatus {
 }
 
 /// Harness kinds flywheel can spawn that historically shipped an hc
-/// integration (pre-0.1.16 `hc integration install` surface). Flywheel
+/// integration (pre-0.1.18 `hc integration install` surface). Flywheel
 /// custom kinds without one are NOT in this list — preflight skips them
 /// (nothing to install, nothing to report).
 pub const INTEGRATION_KINDS: &[&str] = &[
@@ -276,7 +276,7 @@ pub fn integration_target(kind: &str) -> Option<&'static str> {
     INTEGRATION_KINDS.iter().copied().find(|k| *k == kind)
 }
 
-/// hc 0.1.16 exposes no integration surface (verified: `hc --help` has no
+/// hc 0.1.18 (tested) exposes no integration surface (verified: `hc --help` has no
 /// `integration` subcommand and the schema lists no `integration.*` method),
 /// so there is nothing to report — every kind reads `not_installed` and the
 /// H3 preflight warns with the manual remedy. The map shape is kept (not
@@ -284,12 +284,12 @@ pub fn integration_target(kind: &str) -> Option<&'static str> {
 /// the degraded preflight visible instead of silently green.
 pub fn integration_status_all() -> Result<Vec<(String, IntegrationStatus)>> {
     eprintln!(
-        "flywheel: note: hc 0.1.16 has no integration surface — integration preflight degraded (all kinds read not-installed)"
+        "flywheel: note: hc 0.1.18 (tested) has no integration surface — integration preflight degraded (all kinds read not-installed)"
     );
     Ok(Vec::new())
 }
 
-/// Install a kind's hc integration: hc 0.1.16 has none (no `integration`
+/// Install a kind's hc integration: hc 0.1.18 (tested) has none (no `integration`
 /// subcommand, no `integration.*` method), so this always fails loud with
 /// the manual remedy. The CALLER (H3 preflight) warns and never fails the
 /// spawn — do not invent a CLI subcommand here.
@@ -297,7 +297,7 @@ pub fn integration_install_socket(_c: &Client, kind: &str) -> Result<Vec<String>
     let _ = integration_target(kind)
         .ok_or_else(|| anyhow!("kind {kind} has no hc integration target"))?;
     bail!(
-        "hc 0.1.16 exposes no integration install for {kind} — lifecycle-state reporting runs \
+        "hc 0.1.18 (tested) exposes no integration install for {kind} — lifecycle-state reporting runs \
          on process-based heuristics until the harness reports on its own"
     )
 }
@@ -443,7 +443,7 @@ pub struct PushEvent {
     pub data: TerminalEventData,
 }
 
-/// The live push kinds: hc 0.1.16 has no pane/workspace hierarchy and no
+/// The live push kinds: hc 0.1.18 (tested) has no pane/workspace hierarchy and no
 /// snake_case server events — toron-core's `BackendEvent` is the whole
 /// push surface, and only status + exit carry routing facts. Anything else
 /// a future backend emits is dropped at `push_from_backend` (the consumers
@@ -712,6 +712,50 @@ pub fn pane_wait_output(
 /// canonical line limit). Poll every 250ms until the prompt appears (→
 /// `Ok(true)`), the probe errors continuously, or `timeout` elapses (→
 /// `Ok(false)` — the caller warns; the old race is the fallback).
+/// hc 0.1.18 feature wrappers — additive only. All reachable via
+/// `Client::call`/`call_coded`; these are convenience entry points so future
+/// integration code doesn't re-derive params. Full method inventory (32):
+/// hello, server.status, server.stop, server.restart, terminal.run,
+/// templates.list, terminal.list, terminal.get, terminal.kill, terminal.rm,
+/// terminal.keep, terminal.label, terminal.read, terminal.attach,
+/// terminal.send, terminal.wait, terminal.keys, terminal.interrupt,
+/// terminal.put, machine.exec, file.read, file.write, file.edit, doc.get,
+/// doc.set, events.subscribe, machine.add, machine.list, machine.connect,
+/// machine.rename, machine.rm, rpc.discover. Wrapped below: interrupt, keep,
+/// put, templates_list, server_status. The rest are invoked through
+/// `Client::call` where needed (machine/file/doc/attach) — no wrapper yet
+/// to avoid speculative surface.
+pub fn terminal_interrupt(c: &Client, terminal: &str, timeout_ms: Option<u64>) -> Result<Value, BackendError> {
+    let mut params = serde_json::json!({ "terminal": toron_core::backend::hc::strip_id_prefix(terminal) });
+    if let Some(ms) = timeout_ms {
+        params["timeout"] = serde_json::json!(ms as f64 / 1000.0);
+    }
+    c.call("terminal.interrupt", params)
+}
+
+pub fn terminal_keep(c: &Client, terminal: &str, keep: bool) -> Result<Value, BackendError> {
+    c.call("terminal.keep", serde_json::json!({
+        "terminal": toron_core::backend::hc::strip_id_prefix(terminal),
+        "keep": keep,
+    }))
+}
+
+pub fn terminal_put(c: &Client, terminal: &str, name: &str, data: &str) -> Result<Value, BackendError> {
+    c.call("terminal.put", serde_json::json!({
+        "terminal": toron_core::backend::hc::strip_id_prefix(terminal),
+        "name": name,
+        "data": data,
+    }))
+}
+
+pub fn templates_list(c: &Client) -> Result<Value, BackendError> {
+    c.call("templates.list", serde_json::json!({}))
+}
+
+pub fn server_status(c: &Client) -> Result<Value, BackendError> {
+    c.call("server.status", serde_json::json!({}))
+}
+
 pub fn wait_shell_prompt(c: &Client, pane_id: &str, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     let mut last_err: Option<String> = None;
@@ -767,7 +811,7 @@ fn shell_prompt_rendered(text: &str) -> bool {
     }
 }
 
-/// `worktree.list` — hc 0.1.16 exposes no worktree method, and a terminal
+/// `worktree.list` — hc 0.1.18 (tested) exposes no worktree method, and a terminal
 /// backend has no linked-worktree concept, so the honest answer is empty:
 /// the preflight's `linked_worktrees` filter stays green and `flywheel
 /// worktree list` prints "no worktrees". (The `worktree_create` /
@@ -2786,7 +2830,7 @@ mod pi_tail_tests {
 }
 
 /// H3 (bd-harness-integration-preflight): install-target mapping for the
-/// harness kinds. hc 0.1.16 exposes no integration surface, so the status
+/// harness kinds. hc 0.1.18 (tested) exposes no integration surface, so the status
 /// parsers are deleted (nothing to parse) and every live status is
 /// `not_installed` — the gate is `cargo test -p flywheel integration_status`.
 #[cfg(test)]
@@ -2872,7 +2916,7 @@ mod shell_prompt_tests {
     /// workspace: "no agents in workspace w37").
     #[test]
     fn resolve_workspace_id_prefers_owned_label_over_foreign() {
-        use crate::hc_support::{AgentInfo, AgentStatus, WorkspaceInfo};
+        use crate::hc::{AgentInfo, AgentStatus, WorkspaceInfo};
         let mk = |id: &str, label: &str| WorkspaceInfo {
             workspace_id: id.into(),
             number: 0,
@@ -2920,7 +2964,7 @@ mod shell_prompt_tests {
     /// label. The registry's panes are the truth.
     #[test]
     fn a_crew_named_by_its_pin_resolves_to_its_registered_workspace() {
-        use crate::hc_support::{AgentInfo, AgentStatus, WorkspaceInfo};
+        use crate::hc::{AgentInfo, AgentStatus, WorkspaceInfo};
         let mk = |id: &str, label: &str| WorkspaceInfo {
             workspace_id: id.into(),
             number: 0,
@@ -3495,18 +3539,18 @@ impl Client {
     }
 }
 
-/// Migration witness (hc 0.1.16 port): every raw RPC literal in
-/// `src/hc_support.rs` + `src/cmd/crew.rs` must name a method the hc schema
+/// Migration witness (hc 0.1.18 (tested) port): every raw RPC literal in
+/// `src/hc.rs` + `src/cmd/crew.rs` must name a method the hc schema
 /// fixture lists. A pre-hc literal (`pane.split`, `agent.rename`, …)
 /// reintroduced here fails this test instead of failing at runtime behind
 /// a typed `missing_method`. Cheap + deterministic: two `include_str!`s
 /// and the checked-in fixture, no daemon, no network.
 #[cfg(test)]
 mod hc_method_witness_tests {
-    /// Fixture: the authoritative 0.1.16 method list (toron branch).
+    /// Fixture: the authoritative 0.1.18 method list (toron branch).
     const SCHEMA: &str =
-        include_str!("../../toron/crates/toron-core/tests/fixtures/hc-schema-0.1.16.json");
-    const HC_SUPPORT_SRC: &str = include_str!("hc_support.rs");
+        include_str!("../../toron/crates/toron-core/tests/fixtures/hc-schema.json");
+    const HC_SUPPORT_SRC: &str = include_str!("hc.rs");
     const CREW_SRC: &str = include_str!("cmd/crew.rs");
 
     /// Raw RPC literals: the method string of each `.call("…")` /
@@ -3590,7 +3634,7 @@ mod hc_method_witness_tests {
             "fixture must list terminal.run (sanity — wrong fixture?)"
         );
         for (name, src, must_find) in [
-            ("hc_support.rs", HC_SUPPORT_SRC, true),
+            ("hc.rs", HC_SUPPORT_SRC, true),
             ("cmd/crew.rs", CREW_SRC, false),
         ] {
             let literals = rpc_literals(src);
@@ -3601,7 +3645,7 @@ mod hc_method_witness_tests {
             for method in literals {
                 assert!(
                     methods.contains(&method),
-                    "{name}: raw RPC {method:?} is not an hc 0.1.16 schema method — port it or delete it"
+                    "{name}: raw RPC {method:?} is not an hc 0.1.18 (tested) schema method — port it or delete it"
                 );
             }
         }

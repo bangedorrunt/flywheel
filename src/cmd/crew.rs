@@ -5,7 +5,7 @@ use clap::Subcommand;
 use serde_json::{Value, json};
 
 use crate::config::Config;
-use crate::hc_support::Client;
+use crate::hc::Client;
 use crate::output::print_json;
 use crate::state::EventKind;
 use std::time::Duration;
@@ -113,8 +113,8 @@ fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCm
         .unwrap_or_else(|| crate::agent_target(a).to_string());
     match *verb {
         ControlVerbCmd::Interrupt => {
-            let status = crate::hc_support::parse_agent_status(a.agent_status.as_str())
-                .unwrap_or(crate::hc_support::AgentStatus::Unknown);
+            let status = crate::hc::parse_agent_status(a.agent_status.as_str())
+                .unwrap_or(crate::hc::AgentStatus::Unknown);
             let plan = crate::control::interrupt_plan(status);
             c.agent_send_keys(crate::agent_target(a), plan.keys)?;
             let verdict = if plan.confirmed {
@@ -173,12 +173,12 @@ fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCm
                 .first()
                 .ok_or_else(|| anyhow!("workspace {ws_id} has no panes"))?;
             let mail_identity = old.mail_identity.clone();
-            let mut pane_env = crate::hc_support::plane_launch_env(cfg, mail_identity.as_deref());
+            let mut pane_env = crate::hc::plane_launch_env(cfg, mail_identity.as_deref());
             if let Some(m) = &plan.env_model_pin {
-                crate::hc_support::apply_opencode_model_pin(&mut pane_env, m)?;
+                crate::hc::apply_opencode_model_pin(&mut pane_env, m)?;
             }
             let dir = crate::project_dir(cfg, project);
-            let new_pane = crate::hc_support::pane_split(
+            let new_pane = crate::hc::pane_split(
                 &c,
                 &root.pane_id,
                 "down",
@@ -187,7 +187,7 @@ fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCm
             )?;
             let pane_id = new_pane.pane_id.clone();
             let shell_ready =
-                crate::hc_support::wait_shell_prompt(&c, &pane_id, Duration::from_secs(15));
+                crate::hc::wait_shell_prompt(&c, &pane_id, Duration::from_secs(15));
             if !shell_ready {
                 eprintln!(
                     "flywheel: warn: shell for {name} ({pane_id}) did not render a prompt \
@@ -198,7 +198,7 @@ fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCm
             match crate::control::relaunch_decide(launch.is_ok()) {
                 crate::control::RelaunchAction::Commit => {
                     let _ = launch.with_context(|| format!("launch {name} ({kind})"))?;
-                    let _ = crate::hc_support::wait_agent_foreground(
+                    let _ = crate::hc::wait_agent_foreground(
                         &c,
                         &pane_id,
                         &kind,

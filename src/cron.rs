@@ -1062,7 +1062,14 @@ pub async fn start_loops(cfg: &crate::config::Config, project: Option<&str>) -> 
     }
 
     let store = crate::effect_journal::journal_store();
-    let mut plan = partition_cron_work(&manager, &registrations, &rows, store.is_some())?;
+    let spawn_capable = store.is_some() && project.is_some();
+    let mut plan = partition_cron_work(
+        &manager,
+        &registrations,
+        &rows,
+        store.is_some(),
+        spawn_capable,
+    )?;
     for note in &plan.refused {
         eprintln!("cron {note}");
     }
@@ -1169,6 +1176,7 @@ fn partition_cron_work(
     registrations: &[toron_workflow::CronRegistration],
     rows: &[CronRow],
     has_store: bool,
+    spawn_capable: bool,
 ) -> Result<CronPlan> {
     let mut plan = CronPlan {
         durable: Vec::new(),
@@ -1191,7 +1199,7 @@ fn partition_cron_work(
             on_repeat: policy.map(|p| p.on_repeat_failure).unwrap_or_default(),
             repeat_threshold: policy.map(|p| p.repeat_threshold).unwrap_or(3),
         };
-        match refusal_reason(&body.workflow, has_store) {
+        match refusal_reason(&body.workflow, has_store, spawn_capable) {
             None => plan.durable.push(body),
             Some(reason) => {
                 plan.refused.push(format!(
@@ -1220,7 +1228,7 @@ fn partition_cron_work(
             on_repeat: policy.map(|p| p.on_repeat_failure).unwrap_or_default(),
             repeat_threshold: policy.map(|p| p.repeat_threshold).unwrap_or(3),
         };
-        match refusal_reason(&body.workflow, has_store) {
+        match refusal_reason(&body.workflow, has_store, spawn_capable) {
             None => plan.durable.push(body),
             Some(reason) => {
                 plan.refused.push(format!(
@@ -1256,7 +1264,7 @@ fn unowned_registrations<'a>(
 /// Why one body cannot run on the durable host: no store, an approval park
 /// with no resolution loop on this path, or the router's shape refusal.
 /// `None` admits the body.
-fn refusal_reason(workflow: &Workflow, has_store: bool) -> Option<String> {
+fn refusal_reason(workflow: &Workflow, has_store: bool, spawn_capable: bool) -> Option<String> {
     if !has_store {
         return Some("no durable store attached".to_string());
     }
@@ -1266,13 +1274,15 @@ fn refusal_reason(workflow: &Workflow, has_store: bool) -> Option<String> {
                 .to_string(),
         );
     }
-    if body_has_spawn(workflow) {
+    if body_has_spawn(workflow) && !spawn_capable {
         return Some(
-            "spawn needs a launcher; a cron body has none, so it stays on the legacy driver"
+            "spawn needs a launcher; this cron host has no project workspace to start a child in"
                 .to_string(),
         );
     }
-    if let Err(reason) = toron_mcp::workflow_host::durable_route(workflow, has_store, false) {
+    if let Err(reason) =
+        toron_mcp::workflow_host::durable_route(workflow, has_store, spawn_capable)
+    {
         return Some(reason);
     }
     None
@@ -1416,6 +1426,7 @@ async fn run_elm_cron_host(
     }
     let consecutive: std::sync::Arc<tokio::sync::Mutex<std::collections::BTreeMap<String, u32>>> =
         Default::default();
+    let spawn_ctx = project.clone().map(|project| (cfg.clone(), project));
     loop {
         let now_ms = unix_ms();
         let joined = tokio::task::spawn_blocking(move || {
@@ -1497,8 +1508,9 @@ async fn run_elm_cron_host(
             let store = store.clone();
             let consecutive = consecutive.clone();
             let project = project.clone();
+            let spawn_ctx = spawn_ctx.clone();
             tokio::spawn(async move {
-                let outcome = drive_cron_body(&store, &body, &fire).await;
+                let outcome = drive_cron_body(&store, &body, &fire, spawn_ctx).await;
                 settle_cron_fire(&body, &fire, outcome, &consecutive, project.as_deref()).await;
             });
         }
@@ -1541,6 +1553,7 @@ async fn drive_cron_body(
     store: &toron_core::index::workflow_effects::WorkflowEffectStore,
     body: &CronBody,
     fire: &CronFire,
+    spawn_ctx: Option<(crate::config::Config, String)>,
 ) -> CronBodyOutcome {
     let trigger = serde_json::json!({
         "type": "schedule",
@@ -1551,6 +1564,9 @@ async fn drive_cron_body(
     });
     let journal_mode = crate::pane::engine_journal_mode(true, true)
         .unwrap_or(EffectJournalMode::Enforced);
+    let launcher = spawn_ctx.as_ref().map(|(cfg, project)| {
+        cron_spawn_launcher(cfg.clone(), project.clone(), body.display.clone())
+    });
     let seams = crate::durable_body::BodySeams {
         leaf: LeafSeams {
             async_runner: None,
@@ -1558,7 +1574,8 @@ async fn drive_cron_body(
             verify_sink: crate::durable_body::real_verify_sink(),
             journal_mode,
         },
-        launcher: None,
+        launcher,
+        spawn_resolver: Some(crate::profile::ProfileCatalog::catalog_profile_resolver()),
         resolve_child: Some(std::sync::Arc::new(
             crate::workflow_catalog::subworkflow_resolver(None),
         )),
@@ -1579,6 +1596,39 @@ async fn drive_cron_body(
             failed_step: step,
         },
     }
+}
+
+/// The real pane launcher for a cron spawn step (bd-flywheel-host-run-ofcw).
+///
+/// Builds the launch plan from the durable spec, resolves the project's
+/// workspace, and starts the child through the same pane door the workflow
+/// drainer uses. A failure is a `SpawnFailed` feed, bounded by the model's
+/// park deadline — never a hang and never a silent skip.
+fn cron_spawn_launcher(
+    cfg: crate::config::Config,
+    project: String,
+    wf_name: String,
+) -> toron_workflow::engine::spawn::SpawnLauncher {
+    std::sync::Arc::new(move |spec: toron_workflow::engine::spawn::SpawnSpec| {
+        let cfg = cfg.clone();
+        let project = project.clone();
+        let wf_name = wf_name.clone();
+        Box::pin(async move {
+            let catalog = crate::profile::ProfileCatalog::load().unwrap_or_default();
+            let mut value = serde_json::to_value(&spec)?;
+            if let Some(child) = &spec.workflow_ref {
+                value["workflow"] = serde_json::json!(child);
+            }
+            let plan = crate::pane::spawn_launch_plan(&spec.spawn_key, &value, &catalog)?;
+            tokio::task::spawn_blocking(move || {
+                let mut client = crate::hc::Client::connect(Some(&cfg.socket_path()))?;
+                let ws_id = crate::find_workspace(&mut client, &project)?;
+                crate::pane::launch_spawn_job(&cfg, &project, &wf_name, &ws_id, &plan)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("cron spawn launch task failed: {e}"))?
+        })
+    })
 }
 
 /// Settle one finished fire: failure policy (same bead/log shapes as the
@@ -2896,13 +2946,16 @@ owner = "housekeeper"
             body: "y".into(),
             project: None,
         })]);
-        assert!(refusal_reason(&linear, true).is_none());
-        assert!(refusal_reason(&linear, false).is_some(), "no store refuses");
+        assert!(refusal_reason(&linear, true, false).is_none());
+        assert!(
+            refusal_reason(&linear, false, false).is_some(),
+            "no store refuses"
+        );
         let mut approval = linear.clone();
         approval.steps[0].action = Action::RequestApproval {
             message: "m".into(),
         };
-        let reason = refusal_reason(&approval, true).expect("approval refuses");
+        let reason = refusal_reason(&approval, true, false).expect("approval refuses");
         assert!(reason.contains("resolution loop"), "{reason}");
         let mut call = linear.clone();
         call.steps[0].action = Action::CallWorkflow {
@@ -2910,8 +2963,26 @@ owner = "housekeeper"
             inputs: serde_json::json!({}),
         };
         assert!(
-            refusal_reason(&call, true).is_none(),
+            refusal_reason(&call, true, false).is_none(),
             "call_workflow is durable when the host has a child resolver"
+        );
+        let mut spawn = linear.clone();
+        spawn.steps[0].action = Action::Spawn {
+            profile: "@x".into(),
+            harness: None,
+            workflow: None,
+            await_: true,
+            no_claim_timeout: 600,
+            context: None,
+        };
+        assert!(
+            refusal_reason(&spawn, true, false)
+                .expect("no launcher refuses spawn")
+                .contains("launcher")
+        );
+        assert!(
+            refusal_reason(&spawn, true, true).is_none(),
+            "a wired launcher admits spawn"
         );
         let mut graph = linear.clone();
         graph.steps.clear();
@@ -2936,7 +3007,7 @@ owner = "housekeeper"
             .into_iter()
             .collect(),
         });
-        let reason = refusal_reason(&graph, true).expect("spawn graph refuses");
+        let reason = refusal_reason(&graph, true, false).expect("spawn graph refuses");
         assert!(reason.contains("spawn"), "{reason}");
     }
 
@@ -3015,7 +3086,7 @@ owner = "housekeeper"
             project: None,
         })]));
         let fire = elm_tick_once(&store, &body.elm_id, &body.schedule).await;
-        let outcome = drive_cron_body(&store, &body, &fire).await;
+        let outcome = drive_cron_body(&store, &body, &fire, None).await;
         assert!(
             matches!(outcome, CronBodyOutcome::Completed(_)),
             "completes"
@@ -3052,7 +3123,7 @@ owner = "housekeeper"
         });
         let body = cron_test_body(workflow);
         let fire = elm_tick_once(&store, &body.elm_id, &body.schedule).await;
-        let outcome = drive_cron_body(&store, &body, &fire).await;
+        let outcome = drive_cron_body(&store, &body, &fire, None).await;
         match outcome {
             CronBodyOutcome::Completed(output) => {
                 for node in ["a", "b", "c", "d"] {
