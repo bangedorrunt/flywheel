@@ -1224,7 +1224,8 @@ fn refusal_reason(workflow: &Workflow, has_store: bool, spawn_capable: bool) -> 
                 .to_string(),
         );
     }
-    if let Err(reason) = toron_mcp::workflow_host::durable_route(workflow, has_store, spawn_capable)
+    if let Err(reason) =
+        toron_workflow::engine::dispatch::durable_route(workflow, has_store, spawn_capable)
     {
         return Some(reason);
     }

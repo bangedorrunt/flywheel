@@ -38,18 +38,17 @@ toml = "0.8"
 regex-lite = "0.1"
 ureq = { version = "2", features = ["json"] }
 # In-process toron integration (ADR-0003 Decision 3A, bd-o8j.1): flywheel
-# embeds toron-core's mailbox + toron-mcp's server surface with zero IPC.
+# embeds toron-core's mailbox + toron-workflow's engine with zero IPC.
 # se2.3: deps re-pointed from the stale toron-head snapshot to the live
 # workspace — the MailSurface extension (R1 + se2.3) lives on main.
 toron-core = { path = "../toron/crates/toron-core" }
-toron-mcp = { path = "../toron/crates/toron-mcp" }
 # The unified durable workflow engine (ADR-0005 Spec 2, P3.1): flywheel routes
 # ALL workflow execution through toron-workflow's WorkflowEngine. This is the
 # cargo edge the tier diagram always implied but no Cargo.toml wired.
 toron-workflow = { path = "../toron/crates/toron-workflow" }
 async-trait = "0.1"
 cron = "0.17.0"
-chrono = "0.4.45"
+chrono = { version = "0.4.45", features = ["serde"] }
 # ADR-0007 D4: catalog ratatui hub + TTY multi-select.
 ratatui = "0.29"
 crossterm = "0.28"

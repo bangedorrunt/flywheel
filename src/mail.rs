@@ -35,12 +35,12 @@ use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
 use tokio::runtime::Runtime;
 
+use toron_core::json::ToJson;
 use toron_core::mailbox::{
     ContactPolicy, FetchInbox, ListAgentsOptions, RequestContact, RespondContact, SearchMessages,
     SendMessage, overlaps,
 };
 use toron_core::nostr::identity::AgentProfile;
-use toron_mcp::ToJson;
 
 use crate::config::MailConfig;
 use crate::mcp_http::{McpClient, ServerKind};
@@ -53,7 +53,7 @@ use crate::mcp_http::{McpClient, ServerKind};
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 /// The single shared in-process mailbox every `Mail` instance operates on
-/// (ADR-0003 Decision 3A). Mirrors `toron_mcp::demo_mailbox` (InProcessBus +
+/// (ADR-0003 Decision 3A). Mirrors the in-process demo mailbox (InProcessBus +
 /// SQLite index) but WITH an operator key, so write paths (`ensure_project`,
 /// send, register) work — the demo mailbox is operator-less and would reject
 /// every `ensure_project` on first use. Root dirs follow the durable D3
@@ -322,7 +322,7 @@ pub(crate) fn built_mailbox_roots() -> (PathBuf, PathBuf) {
 
 /// bd-hdec: the Mailbox data dir is the DURABLE ROOT'S `projects/` segment
 /// (`{root}/projects/`), matching toron's MCP/CLI/bootstrap exactly
-/// (toron-mcp passes `ToronPaths::projects_dir()` as the Mailbox data dir).
+/// (the daemon passes `ToronPaths::projects_dir()` as the Mailbox data dir).
 /// The shim previously passed the bare root, so flywheel-minted keys landed
 /// at `{root}/{slug}/agents/...` — a legacy path-slug layout toron's whois
 /// never resolves, and the documented `mail register` + whois flow minted

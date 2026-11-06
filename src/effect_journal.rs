@@ -9,7 +9,7 @@
 //! attempt with a fencing token → invoke the provider **once** → settle (or
 //! fail, or record `unknown`).
 //!
-//! The dispatch algorithm itself is not reimplemented: it is toron-mcp's
+//! The dispatch algorithm itself is not reimplemented: it is toron-workflow's
 //! [`EffectDispatcher`] over toron-core's [`WorkflowEffectStore`], so the host
 //! and the CLI share one journal implementation and one reconciliation policy
 //! ([`toron_workflow::engine::plan_attempt`]).
@@ -29,7 +29,7 @@ use toron_core::index::workflow_effects::{
 use toron_core::kernel::{Executor, TokioExecutor};
 use toron_core::mailbox::SendMessage;
 use toron_core::nostr::Tag;
-use toron_mcp::workflow_host::{DispatchRequest, EffectDispatcher};
+use toron_workflow::engine::dispatch::{DispatchRequest, EffectDispatcher};
 use toron_workflow::engine::{
     ActionInvocation, ActionPartition, EffectRunner, ProviderCapability, ProviderErrorClass,
     ProviderOutcome, RunJournal, RunPhase, RunTransition, capability_for_action_type,
@@ -346,7 +346,7 @@ fn dispatch_once(
     dispatcher: &EffectDispatcher,
     inv: &ActionInvocation,
     provider: Box<dyn FnOnce() -> ProviderOutcome + Send>,
-) -> Result<toron_mcp::workflow_host::DispatchResult> {
+) -> Result<toron_workflow::engine::dispatch::DispatchResult> {
     let req = dispatch_request(inv);
     let dispatcher = dispatcher.clone();
     submit_journal_wait(async move {
@@ -747,7 +747,7 @@ fn dispatch_request(inv: &ActionInvocation) -> DispatchRequest {
 /// Project a journaled dispatch result back onto the leaf's `{ok,…}` shape:
 /// only `settled` reads as success; every other state names itself, so an
 /// unproven effect can never masquerade as a completed step.
-fn fenced_outcome(result: Result<toron_mcp::workflow_host::DispatchResult>) -> Value {
+fn fenced_outcome(result: Result<toron_workflow::engine::dispatch::DispatchResult>) -> Value {
     match result {
         Ok(res) if res.state == EffectState::Settled => res.outcome,
         Ok(res) => {
@@ -1011,7 +1011,7 @@ mod tests {
     /// fallback reads flat .error and prints bare "step failed".
     #[test]
     fn fenced_failed_shape_always_carries_top_level_error() {
-        use toron_mcp::workflow_host::DispatchResult;
+        use toron_workflow::engine::dispatch::DispatchResult;
         let failed = DispatchResult {
             effect_key: "k1".to_string(),
             attempt: 1,

@@ -12097,10 +12097,7 @@ mod tests {
         assert!(always_serialize_held(&held), ".flywheel/** serializes");
         let held = vec![(".beads/issues.jsonl".to_string(), "bd-a".to_string())];
         assert!(always_serialize_held(&held), ".beads/** serializes");
-        let held = vec![(
-            "docs/catalog/toron-mcp.json".to_string(),
-            "bd-a".to_string(),
-        )];
+        let held = vec![("docs/catalog/x.json".to_string(), "bd-a".to_string())];
         assert!(always_serialize_held(&held), "docs/catalog/** serializes");
         let held = vec![("src/durable.rs".to_string(), "bd-a".to_string())];
         assert!(

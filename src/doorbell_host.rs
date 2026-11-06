@@ -1213,7 +1213,7 @@ mod parity_tests {
         std::fs::create_dir_all(&toron_dir).unwrap();
         // SAFETY: under ENV_LOCK via _home; restored below.
         let prev_toron_data = std::env::var_os("TORON_DATA_DIR");
-        let prev_toron_mcp = std::env::var_os("TORON_MCP_DATA_DIR");
+        let prev_mcp_data_dir = std::env::var_os("TORON_MCP_DATA_DIR");
         unsafe {
             std::env::set_var("TORON_DATA_DIR", &toron_dir);
             std::env::remove_var("TORON_MCP_DATA_DIR");
@@ -1449,7 +1449,7 @@ mod parity_tests {
                 Some(v) => std::env::set_var("TORON_DATA_DIR", v),
                 None => std::env::remove_var("TORON_DATA_DIR"),
             }
-            match prev_toron_mcp {
+            match prev_mcp_data_dir {
                 Some(v) => std::env::set_var("TORON_MCP_DATA_DIR", v),
                 None => std::env::remove_var("TORON_MCP_DATA_DIR"),
             }

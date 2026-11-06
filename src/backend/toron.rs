@@ -10,7 +10,7 @@
 //! `MailBackend` trait was deleted with se2.3 — toron implements
 //! the ONE trait from toron-core. Value→DTO conversion happens
 //! here at the facade edge: the facade's JSON is the AM-parity wire shape
-//! (`toron_mcp::ToJson`), and every surface DTO derives `Deserialize`, so the
+//! (`toron_core::json::ToJson`), and every surface DTO derives `Deserialize`, so the
 //! conversion is `serde_json::from_value` except where the envelope differs
 //! (send receipt, renew) — mapped explicitly, never with silent defaults.
 //!
