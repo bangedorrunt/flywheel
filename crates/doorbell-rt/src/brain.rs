@@ -780,8 +780,15 @@ impl<H: Host> Brain<H> {
         let decided = effects
             .iter()
             .any(|e| matches!(e, Effect::Prompt { .. } | Effect::Digest { .. }));
+        // A queued wake is HELD by the fold (drained on the next idle
+        // status): that is a decision, and holding the cursor here made the
+        // sweep re-fetch the same rows every few seconds (observed live as a
+        // 3s toron-CLI hot loop). Advance once the line is queued.
+        let queued = effects
+            .iter()
+            .any(|e| matches!(e, Effect::Audit { kind, .. } if kind == "queued"));
         if let Some(hw) = hw
-            && (wake_rows == 0 || decided)
+            && (wake_rows == 0 || decided || queued)
         {
             self.wake.since_by_pin.insert(pin.clone(), hw);
             self.flush_wake("inbox-cursor");

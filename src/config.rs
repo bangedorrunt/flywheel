@@ -188,14 +188,12 @@ pub fn test_state_home() -> TestStateHome {
     // its test; resolving it later is Os NotFound. Hermetic per guard.
     let prev_br_bin = std::env::var_os("FLYWHEEL_BR_BIN");
     let prev_path = std::env::var_os("PATH");
-    // Hermetic mail store: clearing TORON_DATA_DIR made an unconfigured test
-    // fall back to the OPERATOR store (a real pin collision proved it). Point
-    // every guard holder at its own throw-away root instead.
-    let toron_dir = dir.join("toron");
-    std::fs::create_dir_all(&toron_dir).expect("create test toron root");
     // A leaked store root from a sibling must not redirect this test.
+    // NOTE: the in-process mailbox is a process-global OnceLock; a per-guard
+    // root would delete its store between tests. Tests that need isolation
+    // set TORON_DATA_DIR themselves before the singleton initializes.
     unsafe {
-        std::env::set_var("TORON_DATA_DIR", &toron_dir);
+        std::env::remove_var("TORON_DATA_DIR");
         std::env::remove_var("TORON_MCP_DATA_DIR");
         std::env::remove_var("FLYWHEEL_BR_BIN");
         std::env::set_var("XDG_STATE_HOME", &dir);
