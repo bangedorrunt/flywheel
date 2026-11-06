@@ -19473,6 +19473,9 @@ fn cmd_interrupt(
             "--keys {k} TERMINATES the agent process (pane drops to a shell and the session binding is lost). Prefer the default Escape, which cancels the current tool call and returns to the prompt. Pass --force to send {k} deliberately."
         );
     }
+    // Rex branch needs the superlogical resolver; without the feature the hc
+    // path below handles everything (same pattern as `cmd_view`).
+    #[cfg(feature = "backend-superlogical")]
     if crate::pane::rex_door_selected(cfg) {
         let backend = backend::multiplexer_backend(cfg)?;
         let workspaces = find_workspaces_dyn(&*backend, project)?;

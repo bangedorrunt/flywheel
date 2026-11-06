@@ -1513,6 +1513,10 @@ mod tests {
     /// The production sender really delivers through the in-process toron
     /// mailbox — the plane `corr` requires.
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "ENV_LOCK serializes process-wide env for this test; the guard intentionally spans the awaited send"
+    )]
     async fn in_process_mailbox_sender_delivers_a_workflow_message() {
         let _env = crate::config::ENV_LOCK
             .lock()

@@ -110,10 +110,10 @@ where
     let task_name = name.clone();
     let handle = tokio::spawn(async move {
         while let Some(item) = input.recv().await {
-            if let Some(msg) = map(item) {
-                if tx.send(msg).await.is_err() {
-                    break;
-                }
+            if let Some(msg) = map(item)
+                && tx.send(msg).await.is_err()
+            {
+                break;
             }
         }
         let _ = tx
