@@ -66,7 +66,7 @@ fn degraded_audit_ledger_markers_present_in_code_or_docs() {
             "bypassed-no-effect-runner" => "bypassed-no-effect-runner",
             "bypassed-sink-uncovered" => "bypassed-sink-uncovered",
             "unroutable pin Digest" => "Digest",
-            "Recover operator" => "Recover { project",
+            "Recover operator" => "fn cmd_recover",
             _ => unreachable!("ledger marker without a probe: {marker}"),
         };
         let haystacks = [
