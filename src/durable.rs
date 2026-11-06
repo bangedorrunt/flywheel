@@ -751,27 +751,28 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
                     reason: format!("drain_expired bead {bead_id} defer {defers}"),
                 });
             }
-            if !next.mail_degraded && !next.queue.is_empty() {
-                if let Some(i) = next.states.iter().position(|s| {
+            if !next.mail_degraded
+                && !next.queue.is_empty()
+                && let Some(i) = next.states.iter().position(|s| {
                     matches!(s.status.as_str(), "idle" | "done")
                         && !next.dispatch_pending.contains(&s.name)
-                }) {
-                    let brief = next.queue.remove(0);
-                    let agent = next.states[i].name.clone();
-                    let pin = next.states[i]
-                        .mail_identity
-                        .clone()
-                        .unwrap_or_else(|| agent.clone());
-                    let text = brief.replace("{AGENT_NAME}", &pin);
-                    if let Some(bead_id) = bead_id_from_prompt(&text) {
-                        actions.push(LoopAction::PinStamp {
-                            bead_id: bead_id.to_string(),
-                            pin,
-                        });
-                    }
-                    next.dispatch_pending.insert(agent.clone());
-                    actions.push(LoopAction::Send { name: agent, text });
+                })
+            {
+                let brief = next.queue.remove(0);
+                let agent = next.states[i].name.clone();
+                let pin = next.states[i]
+                    .mail_identity
+                    .clone()
+                    .unwrap_or_else(|| agent.clone());
+                let text = brief.replace("{AGENT_NAME}", &pin);
+                if let Some(bead_id) = bead_id_from_prompt(&text) {
+                    actions.push(LoopAction::PinStamp {
+                        bead_id: bead_id.to_string(),
+                        pin,
+                    });
                 }
+                next.dispatch_pending.insert(agent.clone());
+                actions.push(LoopAction::Send { name: agent, text });
             }
         }
         LoopMsg::Hc(pe) => {
@@ -7695,8 +7696,7 @@ async fn swarm_loop(
                     })
                     .await;
                     match diag {
-                        Ok(_) => {
-                        }
+                        Ok(_) => {}
                         Err(e) => {
                             let extra = tick_loop_owner(
                                 &mut swarm,
@@ -9261,11 +9261,7 @@ mod tests {
     /// No wave labels anywhere → no gating (identity).
     #[test]
     fn wave_gate_no_labels_no_gating() {
-        let ready = vec![
-            rb("bd-a", None),
-            rb("bd-b", None),
-            rb_wave("bd-c", 3),
-        ];
+        let ready = vec![rb("bd-a", None), rb("bd-b", None), rb_wave("bd-c", 3)];
         let inprog: Vec<ReadyBead> = Vec::new();
         let held = wave_gate_held(&ready, &inprog);
         assert!(held.is_empty(), "{held:?}");

@@ -1345,9 +1345,11 @@ impl FileHost {
             .collect();
         if let Ok(mut targets) = self.targets.lock() {
             targets.clear();
-            targets.extend(reap.live.iter().map(|(pin, pane, name)| {
-                (pin.clone(), prompt_target(pane, name).to_string())
-            }));
+            targets.extend(
+                reap.live
+                    .iter()
+                    .map(|(pin, pane, name)| (pin.clone(), prompt_target(pane, name).to_string())),
+            );
             let routed: std::collections::HashSet<String> = targets.keys().cloned().collect();
             let ops =
                 captain_pane_targets(&plane_agent_roster(&self.cfg.plane_bin), &pins, &routed);
@@ -3884,5 +3886,4 @@ mod audit_rotation_tests {
         assert_eq!(std::fs::read_to_string(&path).expect("read"), body);
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 }

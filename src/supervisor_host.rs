@@ -5106,8 +5106,7 @@ mod tests {
             host: "test".into(),
             started_unix: now,
             heartbeat_unix: now,
-            process_start_unix: doorbell_rt::lease::process_start_unix(sleeper.id())
-                .unwrap_or(now),
+            process_start_unix: doorbell_rt::lease::process_start_unix(sleeper.id()).unwrap_or(now),
             kind: None,
         };
         std::fs::write(&path, serde_json::to_string(&lease).unwrap()).unwrap();

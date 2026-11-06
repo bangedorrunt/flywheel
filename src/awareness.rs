@@ -82,9 +82,21 @@ pub fn facts(cfg: &crate::config::Config, project: &str) -> Result<Facts> {
     let snap = crate::snapshot::assemble(cfg, project, &ws_label, unix_secs());
 
     let agents = snap.pins.len();
-    let busy = snap.pins.iter().filter(|p| p.verdict.starts_with("Busy")).count();
-    let idle = snap.pins.iter().filter(|p| p.verdict.starts_with("Idle")).count();
-    let dead = snap.pins.iter().filter(|p| p.verdict.starts_with("Dead")).count();
+    let busy = snap
+        .pins
+        .iter()
+        .filter(|p| p.verdict.starts_with("Busy"))
+        .count();
+    let idle = snap
+        .pins
+        .iter()
+        .filter(|p| p.verdict.starts_with("Idle"))
+        .count();
+    let dead = snap
+        .pins
+        .iter()
+        .filter(|p| p.verdict.starts_with("Dead"))
+        .count();
     let unknown = agents.saturating_sub(busy + idle + dead);
     let unanswered =
         crate::doorbell::read_unanswered(&crate::doorbell::unanswered_file(&state_dir, &ws_label));
@@ -93,7 +105,10 @@ pub fn facts(cfg: &crate::config::Config, project: &str) -> Result<Facts> {
 
     let mut conflicts = Vec::new();
     if agents > 0 && snap.dispatcher != "up" {
-        conflicts.push(format!("dispatcher {} with {agents} pane(s)", snap.dispatcher));
+        conflicts.push(format!(
+            "dispatcher {} with {agents} pane(s)",
+            snap.dispatcher
+        ));
     }
     if !unanswered.is_empty() {
         conflicts.push(format!("unanswered doorbell: {}", unanswered.join(",")));
@@ -133,7 +148,10 @@ fn overlaps(pins: &[crate::snapshot::PinRow]) -> Vec<(String, Vec<String>)> {
     let mut by_path: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
     for pin in pins {
         for path in &pin.reservations {
-            by_path.entry(path.as_str()).or_default().push(pin.pin.as_str());
+            by_path
+                .entry(path.as_str())
+                .or_default()
+                .push(pin.pin.as_str());
         }
     }
     by_path
@@ -141,7 +159,10 @@ fn overlaps(pins: &[crate::snapshot::PinRow]) -> Vec<(String, Vec<String>)> {
         .filter(|(_, holders)| holders.len() > 1)
         .map(|(path, mut holders)| {
             holders.sort_unstable();
-            (path.to_string(), holders.into_iter().map(String::from).collect())
+            (
+                path.to_string(),
+                holders.into_iter().map(String::from).collect(),
+            )
         })
         .collect()
 }
@@ -221,11 +242,7 @@ pub async fn tick(cfg: &crate::config::Config, project: &str) -> Result<Option<S
 
 /// File the escalation bead. The beads poller rings an idle captain on a ready
 /// bead, so this is the one wake path that costs no tokens.
-async fn file_conflict(
-    project: &str,
-    line: &str,
-    conflicts: &[String],
-) -> Result<Option<String>> {
+async fn file_conflict(project: &str, line: &str, conflicts: &[String]) -> Result<Option<String>> {
     use std::process::Command;
     let title = format!("awareness: {} in {project}", conflicts.join("; "));
     let description = format!(
@@ -281,7 +298,10 @@ async fn file_conflict(
                 .map(String::from)
         });
     if id.is_none() {
-        eprintln!("cron {NAME}: br create answered without an id: {}", raw.trim());
+        eprintln!(
+            "cron {NAME}: br create answered without an id: {}",
+            raw.trim()
+        );
     }
     Ok(id)
 }
@@ -334,7 +354,10 @@ mod tests {
     #[test]
     fn unchanged_facts_stay_silent() {
         let facts = facts_of("awareness p · dispatcher: up", &[], true);
-        assert_eq!(decide(&facts, &Remembered::default()), Action::Log(facts.line.clone()));
+        assert_eq!(
+            decide(&facts, &Remembered::default()),
+            Action::Log(facts.line.clone())
+        );
         let remembered = Remembered {
             line: "a previous clock reading".into(),
             fingerprint: facts.fingerprint.clone(),
@@ -371,7 +394,11 @@ mod tests {
     /// not file a second bead, and a line change alone is only a log entry.
     #[test]
     fn a_conflict_escalates_once_per_episode() {
-        let facts = facts_of("awareness p · doorbell: unanswered pin=X", &["unanswered doorbell: X"], true);
+        let facts = facts_of(
+            "awareness p · doorbell: unanswered pin=X",
+            &["unanswered doorbell: X"],
+            true,
+        );
         let Action::Escalate { signature, .. } = decide(&facts, &Remembered::default()) else {
             panic!("first sighting must escalate");
         };
@@ -388,7 +415,10 @@ mod tests {
             &["unanswered doorbell: X", "dispatcher down with 2 pane(s)"],
             true,
         );
-        assert!(matches!(decide(&worse, &remembered), Action::Escalate { .. }));
+        assert!(matches!(
+            decide(&worse, &remembered),
+            Action::Escalate { .. }
+        ));
     }
 
     /// A swarm that disappears is an escalation, not "idle host, say nothing".
@@ -433,11 +463,17 @@ mod tests {
             bead: None,
             reservations: paths.iter().map(|p| p.to_string()).collect(),
         };
-        let pins = vec![pin("A", &["src/lib.rs"]), pin("B", &["src/lib.rs", "docs/"])];
+        let pins = vec![
+            pin("A", &["src/lib.rs"]),
+            pin("B", &["src/lib.rs", "docs/"]),
+        ];
         let overlap = overlaps(&pins);
         assert_eq!(
             overlap,
-            vec![("src/lib.rs".to_string(), vec!["A".to_string(), "B".to_string()])]
+            vec![(
+                "src/lib.rs".to_string(),
+                vec!["A".to_string(), "B".to_string()]
+            )]
         );
         assert!(overlaps(&pins[..1]).is_empty());
     }

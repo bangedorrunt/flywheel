@@ -319,7 +319,8 @@ pub fn release_lease(state_dir: &Path, workspace: &str, lease: &OwnerLease) {
                 && cur.boot_id == lease.boot_id
                 && (cur.process_start_unix == 0
                     || lease.process_start_unix == 0
-                    || cur.process_start_unix == lease.process_start_unix) => {
+                    || cur.process_start_unix == lease.process_start_unix) =>
+        {
             let _ = std::fs::remove_file(owner_file(state_dir, workspace));
         }
         _ => {}
@@ -448,8 +449,7 @@ mod tests {
             host: host_name(),
             started_unix: now,
             heartbeat_unix: now,
-            process_start_unix: process_start_unix(std::process::id())
-                .unwrap_or(now),
+            process_start_unix: process_start_unix(std::process::id()).unwrap_or(now),
             kind: None,
         };
         assert_eq!(

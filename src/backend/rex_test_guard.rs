@@ -21,23 +21,16 @@ impl RexBinGuard {
         write_exec(&bin, &script);
         let prev = std::env::var_os("REX_BIN_DIR");
         unsafe { std::env::set_var("REX_BIN_DIR", dir.path()) };
-        Self { _dir: dir, log, prev, _lock }
-    }
-
-    pub fn empty() -> Self {
-        let _lock = REX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = tempfile::tempdir().expect("tempdir");
-        let prev = std::env::var_os("REX_BIN_DIR");
-        unsafe { std::env::set_var("REX_BIN_DIR", dir.path()) };
-        Self { _dir: dir, log: std::path::PathBuf::new(), prev, _lock }
+        Self {
+            _dir: dir,
+            log,
+            prev,
+            _lock,
+        }
     }
 
     pub fn log_text(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
-    }
-
-    pub fn dir_path(&self) -> &std::path::Path {
-        self._dir.path()
     }
 }
 

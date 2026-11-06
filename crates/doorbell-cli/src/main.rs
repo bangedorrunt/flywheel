@@ -120,15 +120,13 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Status => lifecycle::status(&cfg),
         Cmd::Install => lifecycle::install(&cfg),
-        Cmd::Serve | Cmd::InternalServe => {
-            match serve::run(&cfg).await {
-                Ok(()) => std::process::exit(0),
-                Err(e) => {
-                    eprintln!("Error: {e:#}");
-                    std::process::exit(1);
-                }
+        Cmd::Serve | Cmd::InternalServe => match serve::run(&cfg).await {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("Error: {e:#}");
+                std::process::exit(1);
             }
-        }
+        },
         Cmd::Migrate { from } => {
             let copied = migrate::migrate(&from, &cfg.state_dir)?;
             println!("{}", serde_json::json!({"migrated": copied}));

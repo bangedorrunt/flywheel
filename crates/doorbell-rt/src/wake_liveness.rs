@@ -378,10 +378,7 @@ mod tests {
     fn worst_of_never_stamped_wins_over_live() {
         let now = 50_000u64;
         let ceiling = 60_000u64;
-        let stamps = [
-            (None, None),
-            (Some(49_000u64), Some(48_000u64)),
-        ];
+        let stamps = [(None, None), (Some(49_000u64), Some(48_000u64))];
         assert_eq!(
             classify_worst_of(now, stamps, ceiling),
             PipeHealth::NeverStamped

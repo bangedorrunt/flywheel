@@ -363,11 +363,9 @@ mod tests {
     #[test]
     fn the_registry_holds_exactly_the_named_harnesses() {
         let got: BTreeSet<&str> = REGISTRY.iter().map(|s| s.canonical).collect();
-        let want: BTreeSet<&str> = [
-            "opencode", "pi", "grok", "codex", "claude", "fx",
-        ]
-        .into_iter()
-        .collect();
+        let want: BTreeSet<&str> = ["opencode", "pi", "grok", "codex", "claude", "fx"]
+            .into_iter()
+            .collect();
         assert_eq!(got, want);
     }
 }

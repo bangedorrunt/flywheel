@@ -166,7 +166,10 @@ fn every_enforced_selection_is_gated_on_a_present_journal() {
             }
             total += 1;
             let head = statement_head(source, at);
-            if head.contains("if ") || head.contains("effect.is_some()") || head.contains("engine_journal_mode") {
+            if head.contains("if ")
+                || head.contains("effect.is_some()")
+                || head.contains("engine_journal_mode")
+            {
                 gated += 1;
             }
             from = at + needle.len();

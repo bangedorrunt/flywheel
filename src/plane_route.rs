@@ -21,12 +21,12 @@ fn is_secret_pattern(body: &str) -> bool {
     {
         return true;
     }
-    if lower.contains("-----begin") && lower.contains("private key") {
-        if let (Some(b), Some(p)) = (lower.find("-----begin"), lower.find("private key"))
-            && b < p
-        {
-            return true;
-        }
+    if lower.contains("-----begin")
+        && lower.contains("private key")
+        && let (Some(b), Some(p)) = (lower.find("-----begin"), lower.find("private key"))
+        && b < p
+    {
+        return true;
     }
     false
 }

@@ -793,10 +793,7 @@ pub fn send(cfg: &Config, req: Request<'_>) -> Result<Vec<SentRow>> {
 /// A live doorbell owner for this project's workspace (embedded or daemon
 /// host), by its lease: the writer that rings with a budget. `None` = nobody
 /// is hosting, so the sender's own ring is the only wake there is.
-pub fn doorbell_owner(
-    project: &str,
-    workspace: Option<&crate::hc::WorkspaceInfo>,
-) -> Option<u32> {
+pub fn doorbell_owner(project: &str, workspace: Option<&crate::hc::WorkspaceInfo>) -> Option<u32> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());

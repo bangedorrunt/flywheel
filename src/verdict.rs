@@ -662,7 +662,7 @@ fn commit_changes_nothing(cwd: &Path, sha: &str) -> anyhow::Result<bool> {
 /// caller supplies them (the loop derives blast from reservation overlap + AC
 /// shape at ready-parse).
 pub fn bead_from_br_show(cwd: &Path, bead_id: &str) -> anyhow::Result<BeadUnit> {
-    load_bead(cwd, bead_id,  true)
+    load_bead(cwd, bead_id, true)
 }
 
 /// Close-crediting loader: identical to [`bead_from_br_show`] except that a
@@ -679,7 +679,7 @@ pub fn bead_from_br_show(cwd: &Path, bead_id: &str) -> anyhow::Result<BeadUnit> 
 /// false, so the bead lands in the non-runnable band where the legal-close
 /// table admits only record/independent proofs — never `CommandVerified`.
 pub fn bead_from_br_show_for_close(cwd: &Path, bead_id: &str) -> anyhow::Result<BeadUnit> {
-    load_bead(cwd, bead_id,  false)
+    load_bead(cwd, bead_id, false)
 }
 
 fn load_bead(cwd: &Path, bead_id: &str, require_verify: bool) -> anyhow::Result<BeadUnit> {
@@ -1509,7 +1509,7 @@ mod tests {
 
     #[test]
     fn worker_receipt_illegal_on_loop_runnable_verify() {
-        let bead = bead(3, Blast::Normal,  true);
+        let bead = bead(3, Blast::Normal, true);
         let v = verdict(VerdictKind::WorkerReceipt);
         assert!(!legal_close(&v, &bead, AcShape::Checkable));
     }
@@ -2130,7 +2130,7 @@ mod tests {
     /// shape br told the operator was legal.
     #[test]
     fn ledger_check_credits_the_rows_br_names_for_a_p3_script_verify() {
-        let bead = bead(3, Blast::Normal,  false);
+        let bead = bead(3, Blast::Normal, false);
         for gate in ["worker-receipt", "triage-verified", "unit-test-verified"] {
             let kind = VerdictKind::from_gate_name(gate)
                 .unwrap_or_else(|| panic!("br gate {gate:?} unparseable"));

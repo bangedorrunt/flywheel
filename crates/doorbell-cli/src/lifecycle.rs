@@ -829,15 +829,13 @@ fn start_via_supervisor(cfg: &Config, unit: &std::path::Path) -> Result<Option<u
                 .filter(|s| !s.is_empty());
             match uid {
                 None => false,
-                Some(uid) => {
-                    match run_reload_plan(&reload_plan(&uid, unit)) {
-                        Ok(()) => true,
-                        Err(e) => {
-                            eprintln!("doorbell: {e}");
-                            false
-                        }
+                Some(uid) => match run_reload_plan(&reload_plan(&uid, unit)) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        eprintln!("doorbell: {e}");
+                        false
                     }
-                }
+                },
             }
         }
         #[cfg(target_os = "linux")]

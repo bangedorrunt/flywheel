@@ -344,7 +344,10 @@ fn sc_d5_digest_and_stale_lock_named() {
 fn sc_d6_digest_needs_no_loop() {
     let src = read("src/builtin_workflows.rs");
     assert!(src.contains("awareness-digest"));
-    assert!(src.contains("host-native"), "the digest is host-native — no loop run");
+    assert!(
+        src.contains("host-native"),
+        "the digest is host-native — no loop run"
+    );
     assert!(src.contains("scope: project") || src.contains("CronScope::Project"));
 }
 

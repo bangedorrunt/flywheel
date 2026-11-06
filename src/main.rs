@@ -59,27 +59,12 @@ mod inbox_ports;
 mod ingress;
 mod init_scaffold;
 mod intent;
-mod lead_claim;
-mod private_fs;
-mod pull_fresh_poller;
-mod recipient_guard;
-mod redact;
-mod request_receipts;
-mod spawn_facts;
-mod stale_check;
-mod steer_delta;
-mod stuck_vs_busy;
-mod supervisor_hints;
-mod supervisor_host;
-mod supervisor_program;
-mod timer_watch;
-mod unanswered_triage;
 #[allow(dead_code)]
 mod jev_rank;
 mod judgment;
-mod stage;
 #[allow(dead_code)]
 mod kernel;
+mod lead_claim;
 mod mail;
 mod mcp_http;
 mod models;
@@ -92,7 +77,12 @@ mod phase_contracts;
 mod plane_route;
 mod preflight;
 mod principles;
+mod private_fs;
 mod profile;
+mod pull_fresh_poller;
+mod recipient_guard;
+mod redact;
+mod request_receipts;
 mod retry;
 mod rot;
 mod run_log;
@@ -100,12 +90,24 @@ mod run_state_recorder;
 mod signoff;
 mod snapshot;
 mod snapshot_reporting;
+mod spawn_facts;
+mod stage;
 mod stages;
+mod stale_check;
 mod standing_orders;
 mod state;
 mod state_log;
 mod steer_brief;
+mod steer_delta;
+mod stuck_vs_busy;
+mod supervisor_hints;
+mod supervisor_host;
+mod supervisor_program;
+#[cfg(test)]
+mod test_env_contract;
+mod timer_watch;
 mod toron_embed;
+mod unanswered_triage;
 mod upstream_parity;
 mod verdict;
 mod wake_liveness;
@@ -115,8 +117,6 @@ mod workspace;
 mod workspace_policy;
 mod workspace_reporting;
 mod write_liveness;
-#[cfg(test)]
-mod test_env_contract;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::IsTerminal;
@@ -2281,10 +2281,7 @@ pub(crate) fn find_workspace(c: &mut Client, project: &str) -> Result<String> {
 
 /// [`find_workspace`]'s pick, whole: the sender needs its LABEL, which is
 /// what a doorbell host is keyed by (`crate::doorbell::inbox_owner_key`).
-pub(crate) fn find_workspace_info(
-    c: &mut Client,
-    project: &str,
-) -> Result<hc::WorkspaceInfo> {
+pub(crate) fn find_workspace_info(c: &mut Client, project: &str) -> Result<hc::WorkspaceInfo> {
     let meta = state::load_spawn_meta(project);
     let aliases = workspace_label_aliases(project, meta.as_deref());
     let ws_list = c.workspace_list()?;
@@ -2328,10 +2325,7 @@ pub(crate) fn find_workspace_info(
 }
 
 /// The entry with workspace id `id` (one of `matches` by construction).
-fn pick_workspace(
-    mut matches: Vec<hc::WorkspaceInfo>,
-    id: &str,
-) -> hc::WorkspaceInfo {
+fn pick_workspace(mut matches: Vec<hc::WorkspaceInfo>, id: &str) -> hc::WorkspaceInfo {
     let i = matches
         .iter()
         .position(|w| w.workspace_id == id)
@@ -4538,11 +4532,7 @@ fn add_target_from_split(
         bail!("no flywheel-owned swarm for {project} (run: flywheel spawn {project})")
     }
     let prefix = format!("flywheel-{}-", project_base(project));
-    Ok(hc::resolve_workspace_id(
-        &split.owned,
-        agents,
-        &prefix,
-    ))
+    Ok(hc::resolve_workspace_id(&split.owned, agents, &prefix))
 }
 
 fn add_target_workspace(c: &mut Client, project: &str) -> Result<String> {
@@ -5900,9 +5890,8 @@ mod steer_engine_tests {
         let wf = builtins
             .remove("goal-direct")
             .expect("goal-direct builtin workflow");
-        let workflow_resolver: toron_workflow::WorkflowResolver = Arc::new(|sub: &str| {
-            workflow_catalog::subworkflow_resolver(None)(sub)
-        });
+        let workflow_resolver: toron_workflow::WorkflowResolver =
+            Arc::new(|sub: &str| workflow_catalog::subworkflow_resolver(None)(sub));
         let crew_plan = crew::plan_crew_with(&wf, &|sub| workflow_resolver(sub));
         let invoke_wf = crew::resolve_crew_fanouts(&wf, &crew_plan);
         let runner: toron_workflow::engine::EffectRunner =
@@ -9817,13 +9806,8 @@ projects available: {}",
                 &agent_args,
                 item.profile.as_deref(),
             )?;
-            let ready = hc::wait_agent_foreground(
-                &c,
-                &pane_id,
-                &kind,
-                &name,
-                Duration::from_secs(15),
-            );
+            let ready =
+                hc::wait_agent_foreground(&c, &pane_id, &kind, &name, Duration::from_secs(15));
             if !ready {
                 eprintln!(
                     "flywheel: warn: {name} not foreground within 15s of spawn — the boot window race (bd-eign.6) still applies; prompts dispatched before the TUI is up may be lost"
@@ -10027,16 +10011,16 @@ the panes may still be live in hc; `--no-verify` skips this check in scripts"
         let still_unbound: Vec<String> = registry
             .iter()
             .filter(|e| !e.pane_id.is_empty())
-            .filter(|e| {
-                match agents_after.iter().find(|a| a.pane_id == e.pane_id) {
+            .filter(
+                |e| match agents_after.iter().find(|a| a.pane_id == e.pane_id) {
                     None => true,
                     Some(a) => {
                         let want = routable(e);
                         a.name.as_deref().is_none_or(|n| n.is_empty())
                             || a.name.as_deref() != Some(want.as_str())
                     }
-                }
-            })
+                },
+            )
             .map(|e| {
                 let seen = agents_after
                     .iter()
@@ -10216,7 +10200,8 @@ fn poll_child_exit(
     for _ in 0..10_000 {
         match stream.read_event() {
             Ok(Some(toron_core::backend::BackendEvent::Raw(line))) => {
-                if let Some((block, code)) = toron_core::backend::superlogical::child_exit_code(&line)
+                if let Some((block, code)) =
+                    toron_core::backend::superlogical::child_exit_code(&line)
                     && block == pane
                 {
                     return Some(code);
@@ -10462,7 +10447,8 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
         .first()
         .map(|p| p.pane_id.clone())
         .ok_or_else(|| anyhow!("rex: workspace {} has no panes", ws.workspace_id))?;
-    let mut exit_stream = toron_core::backend::superlogical::subscribe_session(&ws.workspace_id).ok();
+    let mut exit_stream =
+        toron_core::backend::superlogical::subscribe_session(&ws.workspace_id).ok();
     if let Some(stream) = exit_stream.as_mut() {
         let _ = stream.set_read_timeout(Some(Duration::from_millis(2_000)));
         let live = matches!(stream.read_event(), Ok(Some(_)));
@@ -10584,10 +10570,7 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
                 Some(code) => exited_status(&name, &pane_id, code),
                 None => match backend.agent_wait(
                     &pane_id,
-                    &[
-                        hc::AgentStatus::Idle,
-                        hc::AgentStatus::Working,
-                    ],
+                    &[hc::AgentStatus::Idle, hc::AgentStatus::Working],
                     Some(90_000),
                 ) {
                     Ok(a) => a.agent_status.as_str().to_string(),
@@ -12078,8 +12061,7 @@ fn handle_workspace_cmds(
             workspace::Cmd::FetchInbox => {
                 fetch_inbox = true;
             }
-            workspace::Cmd::WaitCorr { .. } => {
-            }
+            workspace::Cmd::WaitCorr { .. } => {}
             workspace::Cmd::Publish {
                 kind,
                 content,
@@ -12125,8 +12107,7 @@ fn handle_workspace_cmds(
             }
             workspace::Cmd::Prompt { .. }
             | workspace::Cmd::CheckAckSla
-            | workspace::Cmd::RestartWatch => {
-            }
+            | workspace::Cmd::RestartWatch => {}
             workspace::Cmd::Audit { kind, pin, detail } => {
                 eprintln!("flywheel: [Audit {kind}] {pin}: {detail}");
             }
@@ -12146,8 +12127,7 @@ fn handle_workspace_cmds(
             | workspace::Cmd::Diagnose { .. }
             | workspace::Cmd::Respawn { .. }
             | workspace::Cmd::Reclaim { .. }
-            | workspace::Cmd::Wait => {
-            }
+            | workspace::Cmd::Wait => {}
             workspace::Cmd::RebindBinding {
                 pin,
                 profile_name,
@@ -14860,10 +14840,7 @@ fn cmd_add_rex(
             }
             if let Err(e) = backend.agent_wait(
                 &prev,
-                &[
-                    hc::AgentStatus::Idle,
-                    hc::AgentStatus::Working,
-                ],
+                &[hc::AgentStatus::Idle, hc::AgentStatus::Working],
                 Some(90_000),
             ) {
                 eprintln!("flywheel: warn: {name} not ready within 90s of add: {e:#}");
@@ -14871,10 +14848,7 @@ fn cmd_add_rex(
             if settle_secs > 0 {
                 std::thread::sleep(Duration::from_secs(settle_secs));
             }
-            if let Err(e) = backend.pane_run(
-                &prev,
-                &doorbell::identity_prime(&name, identity),
-            ) {
+            if let Err(e) = backend.pane_run(&prev, &doorbell::identity_prime(&name, identity)) {
                 eprintln!("flywheel: warn: rex prime for {name} ({prev}) failed: {e:#}");
             }
             bind_pane_mail_identity(cfg, project, &name, &prev, mail_identity.as_deref());
@@ -15033,9 +15007,7 @@ fn cmd_add(
             let foreground =
                 hc::wait_agent_foreground(&c, &prev, &kind, &name, Duration::from_secs(15));
             if !foreground {
-                match hc::pane_process_info(&c, &prev)
-                    .map(|pi| hc::pane_agent_alive(&pi, &kind))
-                {
+                match hc::pane_process_info(&c, &prev).map(|pi| hc::pane_agent_alive(&pi, &kind)) {
                     Ok(Some(false)) => bail!(
                         "add {name}: agent process gone on {prev} — undriven shell left behind; close it with `hc terminal close {prev}`"
                     ),
@@ -17236,34 +17208,24 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
             .iter()
             .find(|a| a.pane_id == *pane_id && a.workspace_id == ws_id);
         let decision = match binding_state(name, live.map(|a| a.name.as_deref())) {
-            BindingState::Intact => {
-                match probe_agent_liveness(&mut probe, pane_id, kind, &hname) {
-                    Some(false) => RecoverDecision::Respawn {
-                        reason: "process-dead",
-                    },
-                    Some(true) => {
-                        let verdict = probe.as_mut().map(|c| {
-                            hc::probe_agent_responsiveness(
-                                c,
-                                pane_id,
-                                RESPONSIVENESS_WINDOW,
-                            )
-                        });
-                        match verdict {
-                            Some(hc::Responsiveness::Unresponsive) => {
-                                RecoverDecision::Respawn {
-                                    reason: "unresponsive",
-                                }
-                            }
-                            _ => RecoverDecision::Healthy,
-                        }
+            BindingState::Intact => match probe_agent_liveness(&mut probe, pane_id, kind, &hname) {
+                Some(false) => RecoverDecision::Respawn {
+                    reason: "process-dead",
+                },
+                Some(true) => {
+                    let verdict = probe
+                        .as_mut()
+                        .map(|c| hc::probe_agent_responsiveness(c, pane_id, RESPONSIVENESS_WINDOW));
+                    match verdict {
+                        Some(hc::Responsiveness::Unresponsive) => RecoverDecision::Respawn {
+                            reason: "unresponsive",
+                        },
+                        _ => RecoverDecision::Healthy,
                     }
-                    None => RecoverDecision::Healthy,
                 }
-            }
-            BindingState::Lost { was } => {
-                RecoverDecision::Rebind { was }
-            }
+                None => RecoverDecision::Healthy,
+            },
+            BindingState::Lost { was } => RecoverDecision::Rebind { was },
             BindingState::Gone => RecoverDecision::Respawn {
                 reason: "agent-gone",
             },
@@ -18084,9 +18046,7 @@ fn cmd_send(
             println!(
                 "{} {}",
                 dim(agent_target(a)),
-                status_paint(
-                    hc::parse_agent_status(status).unwrap_or(AgentStatus::Unknown)
-                )
+                status_paint(hc::parse_agent_status(status).unwrap_or(AgentStatus::Unknown))
             );
         }
         results.push(send_result_row(
@@ -18166,8 +18126,8 @@ fn cmd_send(
             );
         }
         match (before_unix, after.last_wake_unix) {
-            (None, Some(_)) => {  }
-            (Some(b), Some(a)) if a > b => {  }
+            (None, Some(_)) => {}
+            (Some(b), Some(a)) if a > b => {}
             (Some(b), Some(a)) if a == b => {
                 bail!(
                     "send --wait landed:true but doorbell last_wake did not advance (still {a}) — independent wake receipt missing (GS-037 P0-C). Wake stamp must come from doorbell/agent wake observation, not cmd_send."
@@ -18655,12 +18615,10 @@ fn probe_prompt_after_stall(
     let needle = prompt_presence_needle(send_text);
     let read = match c.agent_read(target, "screen", Some(120)) {
         Ok(content) => Some(!needle.is_empty() && content.contains(&needle)),
-        Err(_) => {
-            match c.agent_read(target, "output", Some(80)) {
-                Ok(content) => Some(!needle.is_empty() && content.contains(&needle)),
-                Err(_) => None,
-            }
-        }
+        Err(_) => match c.agent_read(target, "output", Some(80)) {
+            Ok(content) => Some(!needle.is_empty() && content.contains(&needle)),
+            Err(_) => None,
+        },
     };
     let seq_advanced = c.agent_list().ok().and_then(|list| {
         list.into_iter()
@@ -19562,8 +19520,7 @@ fn cmd_interrupt(
     let ws_id = find_workspace(&mut c, project)?;
     let targets = resolve_agents(&mut c, &ws_id, project, to)?;
     for a in &targets {
-        let prior =
-            hc::parse_agent_status(a.agent_status.as_str()).unwrap_or(AgentStatus::Unknown);
+        let prior = hc::parse_agent_status(a.agent_status.as_str()).unwrap_or(AgentStatus::Unknown);
         interrupt_guard_working(prior, force)?;
     }
     let is_kill = kill_key(&keys).is_some();
@@ -19697,8 +19654,7 @@ fn cmd_watch(
     timeout_ms: Option<u64>,
 ) -> Result<()> {
     check_project_spelling(project, "watch")?;
-    let until_status: Option<AgentStatus> =
-        until.map(hc::parse_agent_status).transpose()?;
+    let until_status: Option<AgentStatus> = until.map(hc::parse_agent_status).transpose()?;
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     if std::io::stdout().is_terminal() {
         let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
@@ -19755,27 +19711,25 @@ fn cmd_watch(
         }
         if let Some(s) = stream.as_mut() {
             match s.read_event() {
-                Ok(Some(ev)) => {
-                    match ev.data {
-                        hc::TerminalEventData::PaneAgentStatusChanged(change)
-                        | hc::TerminalEventData::PaneAgentStatusChangedSub(change) => {
-                            let Some(name) = watch_name_for_pane(&watch_targets, &change.pane_id)
-                            else {
-                                continue;
-                            };
-                            if std::io::stdout().is_terminal() {
-                                println!("{} {}", dim(name), status_paint(change.agent_status));
-                            }
-                            if let Some(u) = until_status
-                                && change.agent_status == u
-                                && all_matching(&mut c, &watch_names, u)?
-                            {
-                                return Ok(());
-                            }
+                Ok(Some(ev)) => match ev.data {
+                    hc::TerminalEventData::PaneAgentStatusChanged(change)
+                    | hc::TerminalEventData::PaneAgentStatusChangedSub(change) => {
+                        let Some(name) = watch_name_for_pane(&watch_targets, &change.pane_id)
+                        else {
+                            continue;
+                        };
+                        if std::io::stdout().is_terminal() {
+                            println!("{} {}", dim(name), status_paint(change.agent_status));
                         }
-                        _ => {}
+                        if let Some(u) = until_status
+                            && change.agent_status == u
+                            && all_matching(&mut c, &watch_names, u)?
+                        {
+                            return Ok(());
+                        }
                     }
-                }
+                    _ => {}
+                },
                 Ok(None) => bail!("hc socket closed"),
                 Err(_) => {
                     std::thread::sleep(Duration::from_millis(1000));
@@ -31259,9 +31213,8 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
             let wf = toron_workflow::cron::spec_tick_workflow(&spec);
             let rt = tokio::runtime::Runtime::new()?;
             let run_id = format!("cron-run-{}", state::now_iso());
-            let workflow_resolver: toron_workflow::WorkflowResolver = Arc::new(|name: &str| {
-                workflow_catalog::subworkflow_resolver(None)(name)
-            });
+            let workflow_resolver: toron_workflow::WorkflowResolver =
+                Arc::new(|name: &str| workflow_catalog::subworkflow_resolver(None)(name));
             let profile_resolver = profile::ProfileCatalog::catalog_profile_resolver();
             if *live {
                 let runner = cron::spec_runner(&spec);
@@ -32964,13 +32917,11 @@ fn cmd_internal_send(
         .agent_list()?
         .into_iter()
         .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name));
-    if agent.is_none() {
-        if rebind_from_registry(&*backend, project, name, &ws_id)? {
-            agent = backend
-                .agent_list()?
-                .into_iter()
-                .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name));
-        }
+    if agent.is_none() && rebind_from_registry(&*backend, project, name, &ws_id)? {
+        agent = backend
+            .agent_list()?
+            .into_iter()
+            .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name));
     }
     let first = is_first_dispatch(skills_injected_for(project, name));
     let agent = if should_gate_first_dispatch(first, agent.as_ref()) {
@@ -33802,35 +33753,33 @@ fn cmd_internal_run_headless(
                 }
             }
         }
-        if !hopped {
-            if let Some(route) = registry.fallback_route(&model_id, harness) {
-                let intent = pane::model_fallback_intent(
-                    "flywheel",
-                    profile_name,
-                    profile_name,
-                    &model_id,
-                    harness,
-                    &route,
-                    err_ev.clone(),
-                );
-                eprintln!(
-                    "flywheel: @{profile_name} rate-limited on {model_id} (429) — registry ModelEntry.fallback hop to {}",
-                    route.model_id
-                );
-                match agent_ref::commit_rebind("flywheel", intent, |_| {
-                    run_once(
-                        &route.harness,
-                        &route.model_id,
-                        &route.model,
-                        &profile.effort,
-                    )
-                }) {
-                    Ok(fb) => {
-                        attempt = fb;
-                        retried_fallback = true;
-                    }
-                    Err(e) => eprintln!("flywheel: fallback run {} failed: {e:#}", route.model_id),
+        if !hopped && let Some(route) = registry.fallback_route(&model_id, harness) {
+            let intent = pane::model_fallback_intent(
+                "flywheel",
+                profile_name,
+                profile_name,
+                &model_id,
+                harness,
+                &route,
+                err_ev.clone(),
+            );
+            eprintln!(
+                "flywheel: @{profile_name} rate-limited on {model_id} (429) — registry ModelEntry.fallback hop to {}",
+                route.model_id
+            );
+            match agent_ref::commit_rebind("flywheel", intent, |_| {
+                run_once(
+                    &route.harness,
+                    &route.model_id,
+                    &route.model,
+                    &profile.effort,
+                )
+            }) {
+                Ok(fb) => {
+                    attempt = fb;
+                    retried_fallback = true;
                 }
+                Err(e) => eprintln!("flywheel: fallback run {} failed: {e:#}", route.model_id),
             }
         }
     }
@@ -39871,16 +39820,14 @@ fn import_source_key(data_dir: &std::path::Path, from_slug: &str, name: &str) ->
         .join("agents")
         .join(name)
         .join("key.ncryptsec");
-    p.is_file()
-        .then_some(p)
-        .or_else(|| {
-            let legacy = legacy_root_from_mailbox(data_dir)
-                .join(from_slug)
-                .join("agents")
-                .join(name)
-                .join("key.ncryptsec");
-            legacy.is_file().then_some(legacy)
-        })
+    p.is_file().then_some(p).or_else(|| {
+        let legacy = legacy_root_from_mailbox(data_dir)
+            .join(from_slug)
+            .join("agents")
+            .join(name)
+            .join("key.ncryptsec");
+        legacy.is_file().then_some(legacy)
+    })
 }
 
 /// The durable root one level above the mailbox data dir (strip the

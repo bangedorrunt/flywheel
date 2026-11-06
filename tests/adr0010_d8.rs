@@ -149,7 +149,10 @@ fn adr0010_d8_transport_unknown_arm_prints_resend_and_rings_wake() {
         "D8: send_message transport-unknown arm must print resend_guidance(corr)"
     );
     assert!(
-        MESSAGING.matches("crate::mailbox::receipts::resend_guidance(").count() >= 2,
+        MESSAGING
+            .matches("crate::mailbox::receipts::resend_guidance(")
+            .count()
+            >= 2,
         "D8: transport-unknown arms (publish failed) must both print resend_guidance(corr)"
     );
 }

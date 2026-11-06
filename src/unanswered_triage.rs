@@ -303,32 +303,28 @@ pub fn unanswered_triage_stage() -> Stage {
             Stage::Code {
                 id: "unanswered:non-empty",
                 placement: Placement::Preflight,
-                check: |ctx: &StageCtx| {
-                    match serde_json::from_str::<serde_json::Value>(ctx.objective) {
-                        Err(e) => (
-                            Signal::Fails,
-                            format!("evidence is not JSON ({e}), so no request is spent"),
-                        ),
-                        Ok(v) => {
-                            let named = v
-                                .get("pin")
-                                .and_then(|row| row.get("pin"))
-                                .and_then(serde_json::Value::as_str)
-                                .filter(|p| !p.trim().is_empty());
-                            match named {
-                                None => (
-                                    Signal::Fails,
-                                    "no pin named in the evidence, so no request is spent"
-                                        .to_string(),
-                                ),
-                                Some(pin) => (
-                                    Signal::Holds,
-                                    format!(
-                                        "1 pin to triage: {}",
-                                        crate::judgment::cap_str(pin, 60)
-                                    ),
-                                ),
-                            }
+                check: |ctx: &StageCtx| match serde_json::from_str::<serde_json::Value>(
+                    ctx.objective,
+                ) {
+                    Err(e) => (
+                        Signal::Fails,
+                        format!("evidence is not JSON ({e}), so no request is spent"),
+                    ),
+                    Ok(v) => {
+                        let named = v
+                            .get("pin")
+                            .and_then(|row| row.get("pin"))
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|p| !p.trim().is_empty());
+                        match named {
+                            None => (
+                                Signal::Fails,
+                                "no pin named in the evidence, so no request is spent".to_string(),
+                            ),
+                            Some(pin) => (
+                                Signal::Holds,
+                                format!("1 pin to triage: {}", crate::judgment::cap_str(pin, 60)),
+                            ),
                         }
                     }
                 },
@@ -461,10 +457,7 @@ pub fn run(
                 .find(|c| matches!(c, Stage::Jev { id, .. } if *id == "unanswered-triage:noul"))
                 .expect("the Jev child");
             let (triage_verdict, detail) = match jev.run(&mut ctx, transport) {
-                r if r.signal == Signal::Unknown => (
-                    Triage::Unknown,
-                    r.detail,
-                ),
+                r if r.signal == Signal::Unknown => (Triage::Unknown, r.detail),
                 r => {
                     let label = r
                         .detail

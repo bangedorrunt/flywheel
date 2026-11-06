@@ -211,14 +211,12 @@ pub(crate) fn cmd_stage(cfg: &Config, cmd: &StageCmd) -> Result<()> {
                     println!("promoted {name} → user tier ({})", dest.display());
                     Ok(())
                 }
-                "repo" => {
-                    crate::promote_to_repo(
-                        name,
-                        evidence,
-                        review_bead.as_deref(),
-                        repo_dir.as_deref(),
-                    )
-                }
+                "repo" => crate::promote_to_repo(
+                    name,
+                    evidence,
+                    review_bead.as_deref(),
+                    repo_dir.as_deref(),
+                ),
                 other => bail!("unknown promote target {other:?} (user | repo)"),
             }
         }

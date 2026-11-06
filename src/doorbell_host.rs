@@ -335,12 +335,9 @@ impl RtHost {
                 match stream.read_outcome() {
                     Ok(StreamOutcome::Event(ev)) => {
                         let ev = *ev;
-                        if let crate::hc::TerminalEventData::PaneAgentStatusChanged(
-                            change,
-                        )
-                        | crate::hc::TerminalEventData::PaneAgentStatusChangedSub(
-                            change,
-                        ) = ev.data
+                        if let crate::hc::TerminalEventData::PaneAgentStatusChanged(change)
+                        | crate::hc::TerminalEventData::PaneAgentStatusChangedSub(change) =
+                            ev.data
                         {
                             let pin = pin_by_pane
                                 .get(&change.pane_id)
@@ -423,9 +420,7 @@ fn reconcile_status_after_events_lost(
 }
 
 /// Pull AgentInfo rows out of a session.snapshot payload when present.
-fn agents_from_session_snapshot(
-    snap: &serde_json::Value,
-) -> Option<Vec<crate::hc::AgentInfo>> {
+fn agents_from_session_snapshot(snap: &serde_json::Value) -> Option<Vec<crate::hc::AgentInfo>> {
     if let Some(arr) = snap.get("agents").and_then(|v| v.as_array()) {
         let parsed: Result<Vec<_>, _> = arr.iter().cloned().map(serde_json::from_value).collect();
         return parsed.ok();
@@ -1023,11 +1018,8 @@ async fn run_embedded_async(
                 if presence == doorbell::WorkspacePresence::Gone {
                     for _ in 0..2 {
                         tokio::time::sleep(Duration::from_secs(5)).await;
-                        let (cfg_q, project_q, ws_q) = (
-                            probe_cfg.clone(),
-                            probe_project.clone(),
-                            probe_ws.clone(),
-                        );
+                        let (cfg_q, project_q, ws_q) =
+                            (probe_cfg.clone(), probe_project.clone(), probe_ws.clone());
                         let relist = tokio::task::spawn_blocking(move || {
                             doorbell::probe_workspace_presence(&cfg_q, &project_q, &ws_q)
                         })

@@ -100,9 +100,7 @@ pub(crate) fn cmd_changes(cfg: &Config, project: &str, since: usize) -> Result<(
                 "{}  {} → {}",
                 dim(a.name.as_deref().unwrap_or("?")),
                 dim(prev_st),
-                status_paint(
-                    crate::hc::parse_agent_status(now_st).unwrap_or(AgentStatus::Unknown)
-                )
+                status_paint(crate::hc::parse_agent_status(now_st).unwrap_or(AgentStatus::Unknown))
             );
         }
     }

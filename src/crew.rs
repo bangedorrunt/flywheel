@@ -1174,21 +1174,19 @@ fn build_part_step(
             action,
         };
         Ok(match part {
-            ComposePart::Dispatch { role, stage } => {
-                base(
-                    format!("{}-{ordinal}", slugify(&format!("{role}-{stage}"))),
-                    Action::DispatchJob {
-                        assignee: "x".to_string(),
-                        spec: toron_workflow::schema::DispatchSpec {
-                            profile: Some(format!("@{role}")),
-                            stage: Some(stage.clone()),
-                            task: Some(objective.to_string()),
-                            ..Default::default()
-                        },
-                        channel: None,
+            ComposePart::Dispatch { role, stage } => base(
+                format!("{}-{ordinal}", slugify(&format!("{role}-{stage}"))),
+                Action::DispatchJob {
+                    assignee: "x".to_string(),
+                    spec: toron_workflow::schema::DispatchSpec {
+                        profile: Some(format!("@{role}")),
+                        stage: Some(stage.clone()),
+                        task: Some(objective.to_string()),
+                        ..Default::default()
                     },
-                )
-            }
+                    channel: None,
+                },
+            ),
             ComposePart::StageFirst { stage } | ComposePart::PhaseStage { stage, phase: _ } => {
                 let phase = match part {
                     ComposePart::PhaseStage { phase, .. } => Some(phase.clone()),
@@ -1843,14 +1841,9 @@ pub fn compose_workflow_with(
     parts: &[ComposePart],
     affinity: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Workflow> {
-    compose_workflow_with_resolvers(
-        name,
-        objective,
-        base,
-        parts,
-        affinity,
-        &|n| crate::builtin_workflows::builtin_recipe(n),
-    )
+    compose_workflow_with_resolvers(name, objective, base, parts, affinity, &|n| {
+        crate::builtin_workflows::builtin_recipe(n)
+    })
 }
 
 #[cfg(test)]

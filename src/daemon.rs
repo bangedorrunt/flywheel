@@ -454,11 +454,7 @@ pub const CRON_LABEL: &str = "dev.flywheel.cron";
 /// Install + start the cron host. `working_dir` becomes the unit's cwd, so the
 /// project tier (`<project>/.flywheel/crons`) and `br create` resolve exactly
 /// as an interactive `flywheel cron start` from that directory does.
-pub fn start_cron(
-    state: &Path,
-    working_dir: &Path,
-    project: Option<&str>,
-) -> anyhow::Result<()> {
+pub fn start_cron(state: &Path, working_dir: &Path, project: Option<&str>) -> anyhow::Result<()> {
     if cron_running() {
         println!("{CRON_LABEL} already running (supervised)");
         return Ok(());
@@ -882,7 +878,11 @@ mod tests {
         let serve = plist_xml(
             DAEMON_LABEL,
             Path::new("/opt/bin/flywheel"),
-            &["serve".to_string(), "--port".to_string(), "8787".to_string()],
+            &[
+                "serve".to_string(),
+                "--port".to_string(),
+                "8787".to_string(),
+            ],
             None,
             Path::new("/state/serve.out.log"),
             Path::new("/state/serve.err.log"),
@@ -961,7 +961,11 @@ mod tests {
         let xml = plist_xml(
             "dev.flywheel.daemon",
             Path::new("/usr/local/bin/flywheel"),
-            &["serve".to_string(), "--port".to_string(), SERVE_PORT_DEFAULT.to_string()],
+            &[
+                "serve".to_string(),
+                "--port".to_string(),
+                SERVE_PORT_DEFAULT.to_string(),
+            ],
             None,
             Path::new("/tmp/out.log"),
             Path::new("/tmp/err.log"),

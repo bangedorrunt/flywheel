@@ -12,7 +12,6 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 
-pub use doorbell_core::{SelfIndex, WakeState, note_wake, parse_status_pair};
 #[cfg(any(test, feature = "serve"))]
 pub use doorbell_core::PinBudget;
 #[cfg(test)]
@@ -21,6 +20,7 @@ pub use doorbell_core::{
     inbox_high_water, is_drain_transition, parse_inbox_item, parse_rfc3339_micros,
     parse_watch_ndjson, should_inject, watch_pubkey, watch_targets,
 };
+pub use doorbell_core::{SelfIndex, WakeState, note_wake, parse_status_pair};
 
 /// The ONE inbox-lease key for a doorbell host (rv23 S1/S2).
 ///
@@ -345,11 +345,11 @@ pub fn inspect_lock_generation(
         Some(pid) => match (read_gen(gen_path), current_identity) {
             (Some(record), Some((mtime, len))) => {
                 let mtime_ok = record.matches(mtime, len);
-                let hash_ok = if record.binary_hash.is_empty() {
-                    true
-                } else {
-                    true
-                };
+                // No hash input on this path (cf. `inspect_lock_generation_with_hash`):
+                // an empty hash means nothing to check, a carried-but-unverifiable
+                // hash never attaches (fail-closed, same as `with_hash` with no
+                // current hash). Empty-hash callers (pre-hash watchers) are unaffected.
+                let hash_ok = record.binary_hash.is_empty();
                 if mtime_ok && hash_ok {
                     LockAction::Attach { pid }
                 } else {
@@ -3865,10 +3865,8 @@ mod tests {
             host: "audit".into(),
             started_unix: now,
             heartbeat_unix: now,
-            process_start_unix: doorbell_rt::lease::process_start_unix(
-                std::process::id(),
-            )
-            .unwrap_or(now),
+            process_start_unix: doorbell_rt::lease::process_start_unix(std::process::id())
+                .unwrap_or(now),
             kind: None,
         };
         std::fs::write(
@@ -4259,8 +4257,7 @@ mod bd_gefp_host_exit_tests {
             .expect("three consecutive Gone retire");
         assert_eq!(reason, "workspace-gone");
         let store = doorbell_rt::FileStore::new(dir.clone());
-        let audit = std::fs::read_to_string(store.audit_file(ws))
-            .expect("exit must journal");
+        let audit = std::fs::read_to_string(store.audit_file(ws)).expect("exit must journal");
         assert!(audit.contains("\"streak\":3"), "audit: {audit}");
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -68,7 +68,9 @@ fn plane_up() -> bool {
 #[test]
 fn live_event_vs_poll_session_identical_dispatch() {
     if !live_e2e_opted_in() {
-        eprintln!("{LIVE_E2E} unset — live parity skipped (the in-crate parity tests are the gate)");
+        eprintln!(
+            "{LIVE_E2E} unset — live parity skipped (the in-crate parity tests are the gate)"
+        );
         return;
     }
     if !plane_up() {

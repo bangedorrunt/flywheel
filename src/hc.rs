@@ -462,7 +462,6 @@ pub struct WorktreeInfo {
 
 /// A terminal ended. Built from toron-core's `BackendEvent::PaneExited` —
 /// the only exit signal the doorbell routes on.
-
 // serde wire shape: the exit signal is routed by pane, not by these ids.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]

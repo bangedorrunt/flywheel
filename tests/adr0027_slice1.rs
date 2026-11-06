@@ -513,7 +513,10 @@ fn adr0027_s1_guard_no_diagnose_pane_exited_filter() {
     let durable = flywheel_manifest_dir().join("src/durable.rs");
     let content = read_file(&durable);
     assert!(
-        content.matches("actions.push(LoopAction::Diagnose {").count() >= 1,
+        content
+            .matches("actions.push(LoopAction::Diagnose {")
+            .count()
+            >= 1,
         "RED (bd-gs8b #4): the heal step must emit Diagnose actions unconditionally; tick output is the plan"
     );
 }

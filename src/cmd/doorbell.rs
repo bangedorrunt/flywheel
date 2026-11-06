@@ -767,8 +767,7 @@ pub(crate) fn cmd_doorbell_re_inject(cfg: &Config, project: &str) -> Result<()> 
         };
         let mut lines = vec![crate::doorbell::identity_prime(&e.name, identity)];
         lines.push(crate::peer_prompt_template(
-            peer_tpl, &e.name, identity,
-            5, 30, 3,
+            peer_tpl, &e.name, identity, 5, 30, 3,
         ));
         for line in lines {
             c.agent_prompt(&e.pane_id, &line, None).map_err(|err| {

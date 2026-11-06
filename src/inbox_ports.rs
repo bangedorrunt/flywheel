@@ -327,9 +327,10 @@ impl FlywheelPorts {
             Some(p) => {
                 let bind = if backend_name != "hc" && !p.tokens.contains_key(TOKEN_PIN) {
                     let by_label = verify_rex_binding(p, host_session, pin, npub);
-                    if by_label.verified {
-                        by_label
-                    } else if p.label.as_deref() == Some(pin)
+                    // Verified, or the pane label already names this pin (or a pin-like
+                    // label): trust the label binding and skip rex-block re-verification.
+                    if by_label.verified
+                        || p.label.as_deref() == Some(pin)
                         || p.label
                             .as_deref()
                             .is_some_and(|label| label != pin && looks_like_pin(label))
@@ -1142,12 +1143,7 @@ mod tests {
         }
     }
 
-    fn listed_pane(
-        id: &str,
-        status: AgentStatus,
-        pin: &str,
-        npub: &str,
-    ) -> crate::hc::PaneInfo {
+    fn listed_pane(id: &str, status: AgentStatus, pin: &str, npub: &str) -> crate::hc::PaneInfo {
         crate::hc::PaneInfo {
             pane_id: id.to_string(),
             terminal_id: String::new(),

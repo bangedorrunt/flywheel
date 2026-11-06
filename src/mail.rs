@@ -710,12 +710,8 @@ impl Mail {
         let Some(url) = cfg.and_then(|c| c.url.clone()) else {
             return Ok(None);
         };
-        let client = McpClient::new(
-            &url,
-            cfg.and_then(|c| c.token.clone()),
-            ServerKind::Toron,
-        )
-        .map_err(|e| anyhow::anyhow!("agent-mail remote daemon {url}: {e:#}"))?;
+        let client = McpClient::new(&url, cfg.and_then(|c| c.token.clone()), ServerKind::Toron)
+            .map_err(|e| anyhow::anyhow!("agent-mail remote daemon {url}: {e:#}"))?;
         Ok(Some(Self {
             name,
             backend: BackendKind::Remote(client),
@@ -1075,16 +1071,10 @@ impl Mail {
                 let r = block_on(mailbox().mark_message_read(project_key, agent_name, message_id))?;
                 Ok(r.to_json())
             }
-            BackendKind::Remote(_) => {
-                self.call_remote(
-                    "mark_message_read",
-                    crate::backend::wire::mark_read_args(
-                        project_key,
-                        agent_name,
-                        json!(message_id),
-                    ),
-                )
-            }
+            BackendKind::Remote(_) => self.call_remote(
+                "mark_message_read",
+                crate::backend::wire::mark_read_args(project_key, agent_name, json!(message_id)),
+            ),
         }
     }
 
@@ -1096,12 +1086,10 @@ impl Mail {
                     block_on(mailbox().acknowledge_message(project_key, agent_name, message_id))?;
                 Ok(r.to_json())
             }
-            BackendKind::Remote(_) => {
-                self.call_remote(
-                    "acknowledge_message",
-                    crate::backend::wire::ack_args(project_key, agent_name, json!(message_id)),
-                )
-            }
+            BackendKind::Remote(_) => self.call_remote(
+                "acknowledge_message",
+                crate::backend::wire::ack_args(project_key, agent_name, json!(message_id)),
+            ),
         }
     }
 

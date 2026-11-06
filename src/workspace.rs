@@ -1651,7 +1651,6 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                                 }
                             }
                         }
-                    } else {
                     }
                 }
                 if v.get("kind").and_then(serde_json::Value::as_u64) == Some(30013)

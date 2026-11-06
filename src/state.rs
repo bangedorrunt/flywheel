@@ -1819,21 +1819,20 @@ pub fn record_attempt_resume(
                 .iter_mut()
                 .filter(|a| a.bead_id == bead && a.pane == pane)
                 .max_by_key(|a| a.generation)
+                && live.status != WorkAttemptStatus::Superseded
             {
-                if live.status != WorkAttemptStatus::Superseded {
-                    live.updated_us = now_us;
-                    if corr.is_some() {
-                        live.corr = corr.map(str::to_string);
-                    }
-                    if effect_key.is_some() {
-                        live.effect_key = effect_key.map(str::to_string);
-                    }
-                    if matches!(live.status, WorkAttemptStatus::Queued) {
-                        live.status = WorkAttemptStatus::Running;
-                    }
-                    recorded = live.clone();
-                    return;
+                live.updated_us = now_us;
+                if corr.is_some() {
+                    live.corr = corr.map(str::to_string);
                 }
+                if effect_key.is_some() {
+                    live.effect_key = effect_key.map(str::to_string);
+                }
+                if matches!(live.status, WorkAttemptStatus::Queued) {
+                    live.status = WorkAttemptStatus::Running;
+                }
+                recorded = live.clone();
+                return;
             }
             recorded.generation = attempts
                 .iter()

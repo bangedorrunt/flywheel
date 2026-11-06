@@ -180,9 +180,27 @@ pub async fn drive_in_scope(
     let handle = tokio::runtime::Handle::current();
     let graph = needs_graph_model(workflow);
     if graph {
-        drive_graph(store, &handle, run_id, workflow, trigger, seams, journal_scope).await
+        drive_graph(
+            store,
+            &handle,
+            run_id,
+            workflow,
+            trigger,
+            seams,
+            journal_scope,
+        )
+        .await
     } else {
-        drive_linear(store, &handle, run_id, workflow, trigger, seams, journal_scope).await
+        drive_linear(
+            store,
+            &handle,
+            run_id,
+            workflow,
+            trigger,
+            seams,
+            journal_scope,
+        )
+        .await
     }
 }
 
@@ -615,9 +633,7 @@ mod tests {
         use toron_core::index::durable_engine::ToronEngineStore;
         use toron_core::index::schema;
         use toron_core::journal::{JournalDb, ToronJournal};
-        use toron_core::kernel::{
-            DurableEngine, EffectState, OurEngine, RunPhase, StartOutcome,
-        };
+        use toron_core::kernel::{DurableEngine, EffectState, OurEngine, RunPhase, StartOutcome};
 
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -649,9 +665,7 @@ mod tests {
             RunPhase::Running,
             "fresh start is Running (InFlight)"
         );
-        engine
-            .park_until(key, 1_000, 60, 0, None)
-            .expect("park");
+        engine.park_until(key, 1_000, 60, 0, None).expect("park");
         let expired = engine
             .expire_lease(key, 0)
             .expect("expire")
@@ -670,11 +684,7 @@ mod tests {
             .reconcile(key, expired.generation, EffectState::Settled)
             .expect("reconcile")
             .expect("reconcile must return a row after expire");
-        assert_eq!(
-            settled.state,
-            EffectState::Settled,
-            "reconciled to Settled"
-        );
+        assert_eq!(settled.state, EffectState::Settled, "reconciled to Settled");
         assert_eq!(
             engine.query(key).expect("query settled").phase,
             RunPhase::Settled,

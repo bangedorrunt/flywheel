@@ -285,14 +285,14 @@ fn combine(rule: Rule, reports: &[StageReport]) -> (Signal, String) {
             }
         }
         Rule::Majority => {
-            let answered = holds + fails;
             if holds > fails {
                 Signal::Holds
             } else if fails > holds {
                 Signal::Fails
-            } else if answered == 0 {
-                Signal::Unknown
             } else {
+                // No majority either way: a tie with votes and no votes at all
+                // both correctly yield Unknown (the `answered == 0` split was
+                // redundant — both arms returned Unknown).
                 Signal::Unknown
             }
         }

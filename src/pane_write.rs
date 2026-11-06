@@ -222,11 +222,7 @@ impl PaneTyper for BootPanes<'_> {
 /// Spawn-time bootstrap: type the per-harness [`PaneWrite::LaunchBootstrap`]
 /// constant into a fresh pane. Best-effort like the legacy prime (a failed
 /// bootstrap warns, never fails the spawn); returns whether it landed.
-pub fn launch_bootstrap_into(
-    c: &crate::hc::Client,
-    pane_id: &str,
-    harness: Harness,
-) -> bool {
+pub fn launch_bootstrap_into(c: &crate::hc::Client, pane_id: &str, harness: Harness) -> bool {
     match write(
         &BootPanes(c),
         pane_id,
@@ -268,10 +264,8 @@ pub(crate) const PANE_TEXT_CALLS: &[&str] = &[
 /// 2026-11-08 (build-plan §12.4). A new site anywhere else fails
 /// `only_the_sink_types_into_panes`.
 #[cfg(test)]
-pub(crate) const LEGACY_PANE_TEXT_SITES: &[(&str, usize)] = &[
-    ("src/cmd/doorbell.rs", 1),
-    ("src/main.rs", 8),
-];
+pub(crate) const LEGACY_PANE_TEXT_SITES: &[(&str, usize)] =
+    &[("src/cmd/doorbell.rs", 1), ("src/main.rs", 8)];
 
 /// Transport-implementation calls (bd-pane-fence-hc-jwq4s): the two
 /// `.agent_prompt_coded(` sites in `src/hc.rs` ARE the PaneWrite
@@ -455,8 +449,7 @@ mod tests {
     #[test]
     fn transport_sink_sites_are_exactly_the_documented_two() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let src = std::fs::read_to_string(root.join("src/hc.rs"))
-            .unwrap_or_default();
+        let src = std::fs::read_to_string(root.join("src/hc.rs")).unwrap_or_default();
         assert!(
             src.contains("self.agent_prompt_coded(target, text, wait)"),
             "the sink-called delegation must stay the documented line"

@@ -1686,7 +1686,10 @@ pub fn pane_dispatch(
                     .arg("--confirm")
                     .arg("--profile")
                     .arg(&send_profile);
-                let output = match toron_core::proc::run_bounded(&mut cmd, dispatch_attempt_timeout()) {
+                let output = match toron_core::proc::run_bounded(
+                    &mut cmd,
+                    dispatch_attempt_timeout(),
+                ) {
                     Ok(output) => output,
                     Err(toron_core::proc::ProcError::Timeout { .. }) => {
                         return Effect::die(Defect::new(format!(
@@ -1949,12 +1952,10 @@ fn map_dispatch_cause(cause: Cause<RemoteError<String>>) -> DispatchErr {
         Some(RemoteError::AttemptTimeout) => {
             DispatchErr::Fatal("the dispatch attempt exceeded its timeout".to_string())
         }
-        Some(RemoteError::BulkheadFull) => {
-            DispatchErr::Fatal(
-                "the dispatch bulkhead admitted no permit in time — the shared stack is saturated"
-                    .to_string(),
-            )
-        }
+        Some(RemoteError::BulkheadFull) => DispatchErr::Fatal(
+            "the dispatch bulkhead admitted no permit in time — the shared stack is saturated"
+                .to_string(),
+        ),
         Some(RemoteError::Filtered) => DispatchErr::Fatal("the dispatch was filtered".to_string()),
         None => DispatchErr::Fatal("the dispatch failed with no cause".to_string()),
     }

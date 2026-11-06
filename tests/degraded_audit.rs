@@ -69,7 +69,15 @@ fn degraded_audit_ledger_markers_present_in_code_or_docs() {
             "Recover operator" => "Recover { project",
             _ => unreachable!("ledger marker without a probe: {marker}"),
         };
-        let haystacks = [DOORBELL, DAEMON, MAIN, PANE, AGENTS, ORCHESTRATION, CHANGELOG];
+        let haystacks = [
+            DOORBELL,
+            DAEMON,
+            MAIN,
+            PANE,
+            AGENTS,
+            ORCHESTRATION,
+            CHANGELOG,
+        ];
         assert!(
             haystacks.iter().any(|h| h.contains(needle)),
             "{disposition} marker vanished without proof: {marker} (fires: {fires})"

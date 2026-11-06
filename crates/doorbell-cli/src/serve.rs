@@ -1930,8 +1930,7 @@ fn health_body(app: &AppState) -> String {
     let mode = "standby";
     let known_workspaces = known_journal_workspaces(&app.fw_state);
     let daemon_types = false;
-    let wake_blind =
-        daemon_types && standby_blind_to_wakes(hosted.len(), known_workspaces.len());
+    let wake_blind = daemon_types && standby_blind_to_wakes(hosted.len(), known_workspaces.len());
     if wake_blind {
         degraded.push("standby_with_known_workspaces".to_string());
     }

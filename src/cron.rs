@@ -1253,8 +1253,7 @@ fn unowned_registrations<'a>(
     rows: &[CronRow],
     registrations: &'a [toron_workflow::CronRegistration],
 ) -> Vec<&'a toron_workflow::CronRegistration> {
-    let owned: std::collections::BTreeSet<&str> =
-        rows.iter().map(|row| row.name()).collect();
+    let owned: std::collections::BTreeSet<&str> = rows.iter().map(|row| row.name()).collect();
     registrations
         .iter()
         .filter(|reg| reg.enabled && !owned.contains(reg.name.as_str()))
@@ -1280,8 +1279,7 @@ fn refusal_reason(workflow: &Workflow, has_store: bool, spawn_capable: bool) -> 
                 .to_string(),
         );
     }
-    if let Err(reason) =
-        toron_mcp::workflow_host::durable_route(workflow, has_store, spawn_capable)
+    if let Err(reason) = toron_mcp::workflow_host::durable_route(workflow, has_store, spawn_capable)
     {
         return Some(reason);
     }
@@ -1470,8 +1468,14 @@ async fn run_elm_cron_host(
                         }
                         Err(e) => eprintln!("cron doorbell-supervisor: heal failed: {e}"),
                     }
-                    settle_native_run(engine_store, journal, key, healed.is_ok(), crate::doorbell::SUPERVISOR_NAME)
-                        .await;
+                    settle_native_run(
+                        engine_store,
+                        journal,
+                        key,
+                        healed.is_ok(),
+                        crate::doorbell::SUPERVISOR_NAME,
+                    )
+                    .await;
                 });
                 continue;
             }
@@ -1562,8 +1566,8 @@ async fn drive_cron_body(
         "owner": body.owner,
         "scope": body.scope,
     });
-    let journal_mode = crate::pane::engine_journal_mode(true, true)
-        .unwrap_or(EffectJournalMode::Enforced);
+    let journal_mode =
+        crate::pane::engine_journal_mode(true, true).unwrap_or(EffectJournalMode::Enforced);
     let launcher = spawn_ctx.as_ref().map(|(cfg, project)| {
         cron_spawn_launcher(cfg.clone(), project.clone(), body.display.clone())
     });
