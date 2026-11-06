@@ -27,10 +27,10 @@ use crate::hc::{AgentStatus, Client};
 use crate::inbox_host::{Bind, Observation, Ports, Seen};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use toron_plane::backend::types::{TOKEN_NPUB, TOKEN_PIN};
 use toron_core::inbox::InboxStore;
 use toron_core::inbox_program::DeafCause;
 use toron_core::wake::{PaneState, Urgency};
+use toron_plane::backend::types::{TOKEN_NPUB, TOKEN_PIN};
 
 /// How a verified binding is named in the `bind` fact.
 pub const VERIFIED_BY: &str = "report_metadata";
