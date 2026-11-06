@@ -203,6 +203,15 @@ Live matrix (all against the installed binaries):
 Also improved while steering: host stderr now lands in
 `doorbell/<ws>.{out,err}.log` (was `/dev/null`), `crew control` resolves through
 the selected plane on rex, a busy `send` names the queued mail door, duplicate
-registry rows no longer double the inbox fetch, the wake hint points at
-`toron next` (per-message delivery), and the test env guard restores
+registry rows no longer double the inbox fetch, and the test env guard restores
 `FLYWHEEL_BR_BIN`/`PATH` so br/git suites stop racing.
+
+**Envelope-log residual (found while completing collab):** `toron next` returned
+`items: []` for readers whose inbox projection still holds unread mail
+(WindyCreek: 3 unread, `next` empty; AmberHarbor likewise). The `mail inbox
+--since last` door works but is a high-water cursor: one pull that returns
+several messages advances past all of them, so an agent that answers one thread
+can silently skip the rest (observed: the collab ask became invisible). The
+per-message `next` door is the right fix once the envelope log is ingested;
+until then the wake hint stays on `mail inbox`. Collab should also re-ring via
+the `expected_replies` registry instead of relying on the agent's pull.
