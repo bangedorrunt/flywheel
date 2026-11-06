@@ -1,0 +1,7 @@
+bead: bd-registry-strict-mutating-e5ko3
+sha: 57d5a96b93ce72402879265e97278ae9f454e75b
+bead-verify: rg load_spawn_registry_strict src/main.rs src/pane.rs src/supervisor_host.rs => hits in all three, exit 0
+gate: bash scripts/verify-clippy.sh exit 0 (fmt + clippy + check)
+tests: tripwire mutating_doors 1/1; refuses_corrupt 2/2; send_resolve 3/3 (filter); merge_for_mutation 1/1; registry sweep 91/91; spawn/supervisor/send sweep 414/414
+mutation: kill-guard removal reddens tripwire (exit 101, rebuilt); revert greens (ran twice)
+report: .flywheel/reports/final-registry-strict.md
