@@ -22,19 +22,18 @@ a bug, not a divergence — file a bead.
    cursor + Delivered in one transaction; `--peek` commits neither). Use the
    plane-P read for polling; use `next` when you need the envelope semantics.
 
-3. **Wake: `bus/wake` + `wake_sock` have live callers; the "wave 3 deletes"
-   comment is stale.** Live callers: `flywheel/src/doorbell_host.rs`,
-   `flywheel/src/main.rs`, `toron/crates/toron-cli/src/{main,plane,wake_sock}.rs`,
+3. **Wake: `bus/wake` + `wake_sock` are KEEP (live callers).** Live callers:
+   `flywheel/src/doorbell_host.rs`, `flywheel/src/main.rs`,
+   `toron/crates/toron-cli/src/{main,plane,wake_sock}.rs`,
    `toron/crates/toron-core/src/bus/wake.rs`, e2e `sc32_watch_once` (governor:
-   the callers themselves). The "wave 3 deletes" marker
-   (`toron/crates/toron-cli/src/wake_sock.rs:7`) predates them. Decision pending
-   in open bead `bd-wake-decommission-dsd8` (toron tracker): KEEP (delete the
-   stale comment, document the live contract) or DECOMMISSION (migrate
-   `watch --live` + MCP sidecar to the doorbell first). Do not silently delete
-   under a live caller.
+   the callers themselves). Decision: **KEEP** (`bd-wake-decommission-dsd8`,
+   closed 2026-11-06); the stale "wave 3 deletes" marker is removed and the
+   live contract is `watch --live` consuming the MCP serve's
+   `start_wake_sidecar`. DECOMMISSION would require migrating both to the
+   doorbell first. Never silently delete under a live caller.
 
 4. **Backend default is rex-first, not hc.** Any prose naming hc as the default
    or only pane plane is stale (governor: toron ADR-0045 —
    `toron/docs/decisions/0045-rex-first-pane-plane-with-hc-transport-fallback.md`;
-   resolver `toron_core::backend::plane`). `auto` = rex when the CLI is present,
+   resolver `toron_plane::backend::plane`). `auto` = rex when the CLI is present,
    hc otherwise, reason recorded; an explicit `rex` pin never falls back.
