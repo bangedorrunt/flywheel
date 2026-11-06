@@ -9253,6 +9253,9 @@ fn dead_panes(
 /// it; spawn's inline copy was the only one — the divergence this bead
 /// records). Best-effort by contract: each failure warns with the exact
 /// remedy and a failed join never fails the run.
+/// Channel ensure+join via the toron CLI (bd-wave2 residual): needs a
+/// toron-core channel surface (create/join with key resolution + bus
+/// publish); no facade equivalent exists yet.
 fn ensure_and_join_channels(project: &str, channels: &[String], pins: &[String]) {
     if channels.is_empty() {
         return;
@@ -10086,67 +10089,17 @@ the panes may still be live in hc; `--no-verify` skips this check in scripts"
         .to_str()
         .map(str::to_string)
         .unwrap_or_else(|| project.to_string());
-    for e in &registry {
-        if let Some(pin) = &e.mail_identity {
-            let mut presence_effect = match agent_ref::AgentEffectGuard::begin(
-                project,
-                pin,
-                agent_ref::AgentPhase::Presence,
-            ) {
-                Ok(g) => Some(g),
-                Err(err) => {
-                    eprintln!("flywheel: warn: cannot journal presence intent for {pin}: {err:#}");
-                    None
-                }
-            };
-            let mut failure: Option<String> = None;
-            let mut attempt = 0;
-            loop {
-                attempt += 1;
-                let status = Command::new("toron")
-                    .args([
-                        "presence",
-                        "publish",
-                        "--as",
-                        pin,
-                        "--state",
-                        "working",
-                        "--project",
-                        &presence_project,
-                    ])
-                    .output();
-                match status {
-                    Ok(o) if o.status.success() => break,
-                    Ok(o) => {
-                        let err = String::from_utf8_lossy(&o.stderr);
-                        let unknown = err.to_ascii_lowercase().contains("unknown agent");
-                        if unknown && attempt < 3 {
-                            std::thread::sleep(Duration::from_millis(200 * attempt as u64));
-                            continue;
-                        }
-                        eprintln!(
-                            "flywheel: presence publish failed for {pin}: {}",
-                            err.trim()
-                        );
-                        failure =
-                            Some(format!("presence publish failed for {pin}: {}", err.trim()));
-                        break;
-                    }
-                    Err(e) => {
-                        eprintln!("flywheel: presence publish failed for {pin}: {e}");
-                        failure = Some(format!("presence publish failed for {pin}: {e}"));
-                        break;
-                    }
-                }
-            }
-            if let Some(g) = presence_effect.take() {
-                match failure {
-                    Some(ev) => g.mark_unknown(Some(&ev)),
-                    None => g.settle(Some("presence=working published")),
-                }
-            }
-        }
-    }
+    let (presence_mail, presence_mail_err) = match crate::mail_or_die(cfg) {
+        Ok(m) => (Some(m), String::new()),
+        Err(e) => (None, format!("{e:#}")),
+    };
+    publish_presence_for_registry(
+        presence_mail.as_ref(),
+        &presence_mail_err,
+        &presence_project,
+        project,
+        &registry,
+    );
 
     if !opts.join_channels.is_empty() {
         let pins: Vec<String> = registry
@@ -10803,67 +10756,17 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
         .to_str()
         .map(str::to_string)
         .unwrap_or_else(|| project.to_string());
-    for e in &registry {
-        if let Some(pin) = &e.mail_identity {
-            let mut presence_effect = match agent_ref::AgentEffectGuard::begin(
-                project,
-                pin,
-                agent_ref::AgentPhase::Presence,
-            ) {
-                Ok(g) => Some(g),
-                Err(err) => {
-                    eprintln!("flywheel: warn: cannot journal presence intent for {pin}: {err:#}");
-                    None
-                }
-            };
-            let mut failure: Option<String> = None;
-            let mut attempt = 0;
-            loop {
-                attempt += 1;
-                let status = Command::new("toron")
-                    .args([
-                        "presence",
-                        "publish",
-                        "--as",
-                        pin,
-                        "--state",
-                        "working",
-                        "--project",
-                        &presence_project,
-                    ])
-                    .output();
-                match status {
-                    Ok(o) if o.status.success() => break,
-                    Ok(o) => {
-                        let err = String::from_utf8_lossy(&o.stderr);
-                        let unknown = err.to_ascii_lowercase().contains("unknown agent");
-                        if unknown && attempt < 3 {
-                            std::thread::sleep(Duration::from_millis(200 * attempt as u64));
-                            continue;
-                        }
-                        eprintln!(
-                            "flywheel: presence publish failed for {pin}: {}",
-                            err.trim()
-                        );
-                        failure =
-                            Some(format!("presence publish failed for {pin}: {}", err.trim()));
-                        break;
-                    }
-                    Err(e) => {
-                        eprintln!("flywheel: presence publish failed for {pin}: {e}");
-                        failure = Some(format!("presence publish failed for {pin}: {e}"));
-                        break;
-                    }
-                }
-            }
-            if let Some(g) = presence_effect.take() {
-                match failure {
-                    Some(ev) => g.mark_unknown(Some(&ev)),
-                    None => g.settle(Some("presence=working published")),
-                }
-            }
-        }
-    }
+    let (presence_mail, presence_mail_err) = match crate::mail_or_die(cfg) {
+        Ok(m) => (Some(m), String::new()),
+        Err(e) => (None, format!("{e:#}")),
+    };
+    publish_presence_for_registry(
+        presence_mail.as_ref(),
+        &presence_mail_err,
+        &presence_project,
+        project,
+        &registry,
+    );
 
     if !opts.join_channels.is_empty() {
         let pins: Vec<String> = registry
@@ -15995,7 +15898,7 @@ fn warn_uncommitted_decision_docs(cfg: &Config, project: &str) {
 /// GS-030 no-bind-invisible gap — binds publish on the next sweep seed),
 /// best-effort wire publish via the existing `toron role pin` CLI.
 /// Best-effort throughout: never fails arrival.
-fn arrival_triple(project: &str, pin: &str) {
+fn arrival_triple(cfg: &Config, project: &str, pin: &str) {
     let profile = state::load_spawn_registry(project)
         .into_iter()
         .find(|e| e.mail_identity.as_deref() == Some(pin))
@@ -16011,13 +15914,85 @@ fn arrival_triple(project: &str, pin: &str) {
             return;
         }
     }
-    match std::process::Command::new("toron")
-        .args(["role", "pin", &role, pin, "--project", project])
-        .status()
-    {
-        Ok(s) if s.success() => {}
-        Ok(s) => eprintln!("flywheel: arrival triple: toron role pin exited {s}"),
+    let mail = match crate::mail_or_die(cfg) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("flywheel: arrival triple: toron role pin failed: {e:#}");
+            return;
+        }
+    };
+    match mail.pin_role_alias(project, &role, pin) {
+        Ok(_) => {}
         Err(e) => eprintln!("flywheel: arrival triple: toron role pin failed: {e:#}"),
+    }
+}
+
+/// Publish `working` presence for every registry pin, in-process.
+/// Shared by the hc/rex spawn arms: same retry contract as the retired
+/// `toron presence publish` subprocess (retry-3 on unknown-agent while a
+/// concurrent registration lands, warn-and-record otherwise). A mail-build
+/// failure reads like the old spawn failure, per pin.
+fn publish_presence_for_registry(
+    mail: Option<&crate::mail::Mail>,
+    mail_err: &str,
+    presence_project: &str,
+    project: &str,
+    registry: &[state::SpawnEntry],
+) {
+    for e in registry {
+        if let Some(pin) = &e.mail_identity {
+            let mut presence_effect = match agent_ref::AgentEffectGuard::begin(
+                project,
+                pin,
+                agent_ref::AgentPhase::Presence,
+            ) {
+                Ok(g) => Some(g),
+                Err(err) => {
+                    eprintln!("flywheel: warn: cannot journal presence intent for {pin}: {err:#}");
+                    None
+                }
+            };
+            let mut failure: Option<String> = None;
+            match mail {
+                None => {
+                    let msg = mail_err.trim().to_string();
+                    eprintln!("flywheel: presence publish failed for {pin}: {msg}");
+                    failure = Some(format!("presence publish failed for {pin}: {msg}"));
+                }
+                Some(m) => {
+                    let mut attempt = 0;
+                    loop {
+                        attempt += 1;
+                        match m.presence_publish(presence_project, pin, "working") {
+                            Ok(()) => break,
+                            Err(e) => {
+                                let msg = format!("{e:#}");
+                                let unknown = msg.to_ascii_lowercase().contains("unknown agent");
+                                if unknown && attempt < 3 {
+                                    std::thread::sleep(Duration::from_millis(200 * attempt as u64));
+                                    continue;
+                                }
+                                eprintln!(
+                                    "flywheel: presence publish failed for {pin}: {}",
+                                    msg.trim()
+                                );
+                                failure = Some(format!(
+                                    "presence publish failed for {pin}: {}",
+                                    msg.trim()
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(g) = presence_effect.take() {
+                match failure {
+                    Some(ev) => g.mark_unknown(Some(&ev)),
+                    None => g.settle(Some("presence=working published")),
+                }
+            }
+        }
     }
 }
 
@@ -16217,29 +16192,28 @@ fn cmd_arrive(
             }
             Err(e) => eprintln!("flywheel: arrive register skipped: {e:#}"),
         }
-        let st = std::process::Command::new("toron")
-            .args([
-                "presence",
-                "publish",
-                "--project",
-                project,
-                "--as",
-                agent,
-                "--state",
-                "working",
-            ])
-            .status();
-        match st {
-            Ok(s) if s.success() => eprintln!("presence working as {agent}"),
-            Ok(s) => eprintln!("flywheel: presence publish exited {s}"),
-            Err(e) => eprintln!("flywheel: presence publish failed: {e:#}"),
+        let published = match crate::mail_or_die(cfg) {
+            Ok(m) => match m.presence_publish(project, agent, "working") {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("flywheel: presence publish failed: {e:#}");
+                    false
+                }
+            },
+            Err(e) => {
+                eprintln!("flywheel: presence publish failed: {e:#}");
+                false
+            }
+        };
+        if published {
+            eprintln!("presence working as {agent}");
         }
         arrive_maybe_bind_pane(cfg, project, agent);
     }
     if cfg.doorbell_arrival_triple()
         && let Some(agent) = as_agent
     {
-        arrival_triple(project, agent);
+        arrival_triple(cfg, project, agent);
     }
     let arriver = as_agent.unwrap_or("");
     let (holder, whois_stale) = lookup_captain_holder(project);
@@ -16261,6 +16235,7 @@ fn cmd_arrive(
         if let captain_slot::CaptainAction::Claim { pin, .. }
         | captain_slot::CaptainAction::Override { pin } = action
         {
+            // bd-wave2 residual: captain alias set has no facade equivalent yet.
             let status = std::process::Command::new("toron")
                 .args(["contact", "captain", "--project", project, "--pin", &pin])
                 .status();
@@ -16308,17 +16283,13 @@ fn cmd_arrive(
     Ok(())
 }
 fn lookup_captain_holder(project: &str) -> (Option<String>, bool) {
-    let out = std::process::Command::new("toron")
-        .args(["mail", "whois", project, "captain", "--json"])
-        .output();
-    let Ok(out) = out else {
-        return (None, true);
+    let mail = match crate::mail::Mail::from_config(None) {
+        Ok(Some(m)) => m,
+        _ => return (None, true),
     };
-    if !out.status.success() {
-        return (None, true);
-    }
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
-        return (None, true);
+    let v = match mail.whois(project, "captain") {
+        Ok(v) => v,
+        Err(_) => return (None, true),
     };
     let name = v
         .get("name")
@@ -16336,19 +16307,11 @@ fn lookup_captain_holder(project: &str) -> (Option<String>, bool) {
 /// list` already drops heartbeats older than toron's TTL, so a name hit here
 /// IS a live signal. Missing CLI / bad JSON / non-zero exit → false.
 fn captain_presence_live(project: &str, pin: &str) -> bool {
-    let out = std::process::Command::new("toron")
-        .args(["presence", "list", "--project", project, "--json"])
-        .output();
-    let Ok(out) = out else {
-        return false;
+    let rows = match crate::mail::Mail::from_config(None) {
+        Ok(Some(m)) => m.presence_list(project).unwrap_or_default(),
+        _ => return false,
     };
-    if !out.status.success() {
-        return false;
-    }
-    let Ok(rows) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
-        return false;
-    };
-    presence_names(&rows).contains(pin)
+    presence_names(&serde_json::Value::Array(rows)).contains(pin)
 }
 
 /// bd-8pis: pin names in a `toron presence list --json` payload.
@@ -16365,32 +16328,18 @@ fn presence_names(rows: &serde_json::Value) -> HashSet<String> {
 /// bd-8pis: pins with a presence row in `project` (heartbeats, any state).
 /// Best-effort: toron failure reads as nobody-heartbeating, never an error.
 fn presence_pins(project: &str) -> HashSet<String> {
-    let out = std::process::Command::new("toron")
-        .args(["presence", "list", "--project", project, "--json"])
-        .output();
-    let Ok(out) = out else {
-        return HashSet::new();
+    let rows = match crate::mail::Mail::from_config(None) {
+        Ok(Some(m)) => m.presence_list(project).unwrap_or_default(),
+        _ => return HashSet::new(),
     };
-    if !out.status.success() {
-        return HashSet::new();
-    }
-    let Ok(rows) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
-        return HashSet::new();
-    };
-    presence_names(&rows)
+    presence_names(&serde_json::Value::Array(rows))
 }
 
 /// bd-8pis: the hc pane bound to `pin` (toron whois `pane_id`), if any.
 /// Best-effort: whois failure reads as unbound (the caller warns).
 fn whois_pane_id(project: &str, pin: &str) -> Option<String> {
-    let out = std::process::Command::new("toron")
-        .args(["mail", "whois", project, pin, "--json"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let mail = crate::mail::Mail::from_config(None).ok()??;
+    let v = mail.whois(project, pin).ok()?;
     v.get("pane_id")
         .and_then(|p| p.as_str())
         .filter(|s| !s.is_empty())
@@ -26357,6 +26306,8 @@ fn pretty_path(p: &std::path::Path) -> String {
 }
 
 /// Spawn `toron serve --mcp-http <port>` as a detached background daemon.
+/// Kept as a process spawn by design (bd-wave2): an external server process
+/// has no in-process equivalent.
 /// Requires the toron binary on PATH; propagates TORON_OPERATOR_KEY +
 /// TORON_KEY_PASSPHRASE from the current env.
 fn boot_toron_server(port: u16) -> Result<()> {
@@ -34140,27 +34091,10 @@ fn cmd_internal_mail_digest(cfg: &Config, project: &str, agent: &str) -> Result<
 /// --assignee <pin>` CLI; zero on any failure (best-effort — the loop
 /// retries next poll).
 fn plane_s_open_jobs_for(project: &str, identity: &str) -> usize {
-    let out = match std::process::Command::new("toron")
-        .args([
-            "job",
-            "list",
-            "--project",
-            project,
-            "--state",
-            "open",
-            "--assignee",
-            identity,
-            "--json",
-        ])
-        .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return 0,
-    };
-    serde_json::from_slice::<serde_json::Value>(&out.stdout)
-        .ok()
-        .and_then(|v| v.as_array().map(std::vec::Vec::len))
-        .unwrap_or(0)
+    match crate::mail::Mail::from_config(None) {
+        Ok(Some(m)) => m.open_jobs_for(project, identity).unwrap_or(0),
+        _ => 0,
+    }
 }
 
 /// bd-a7j: newest (message id, sender) in a thread from a sender —
@@ -34633,6 +34567,9 @@ fn cmd_internal_dispatch_guard(cfg: &Config, project: &str, bead: &str) -> Resul
 /// thread-scoped by construction. Soft-fail empty on every error (CLI
 /// missing, room absent, membership refused): a channel read must never
 /// block or spam a dispatch scan — the mail scan stays the primary channel.
+/// Channel guard signals via the toron CLI (bd-wave2 residual): channel
+/// read needs a toron-core channel surface (rebuild + membership read);
+/// no facade equivalent exists yet.
 fn channel_guard_signals(project_key: &str, bead: &str, identity: &str) -> Vec<Value> {
     let mut out = Vec::new();
     let rooms = [
@@ -36463,45 +36400,11 @@ fn tail_of(s: &str) -> String {
 /// under the build slot"). Advisory — a slot failure must never block the
 /// loop (the always-serialize gate already serializes cargo dispatch).
 ///
-/// bd-em85: toron's slot/inbox surface takes `--as`, never `--agent`
-/// (flywheel shelled `--agent` and every acquire/release/inbox-fallback
-/// failed loud). The argv builders below keep the flag pin-able by test.
-fn slot_acquire_argv(project: &str, agent: &str) -> Vec<String> {
-    [
-        "slot",
-        "acquire",
-        "--project",
-        project,
-        "--as",
-        agent,
-        "--slot",
-        "cargo",
-        "--exclusive",
-        "--json",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
-}
-
-fn slot_release_argv(project: &str, agent: &str) -> Vec<String> {
-    [
-        "slot",
-        "release",
-        "--project",
-        project,
-        "--as",
-        agent,
-        "--slot",
-        "cargo",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
-}
-
-/// argv for the `toron mail inbox` CLI fallback (in-process mailbox
-/// unavailable). Same `--as` contract as the slot builders above.
+/// bd-em85: toron's inbox surface takes `--as`, never `--agent`
+/// (flywheel shelled `--agent` and every inbox-fallback failed loud).
+/// The argv builder below keeps the flag pin-able by test. The fallback
+/// itself stays a subprocess: it runs only when the embedded path has
+/// already failed, so routing it through the facade would recurse.
 fn mail_inbox_fallback_argv(pin: &str, project: &str, since: &str) -> Vec<String> {
     [
         "mail",
@@ -36526,15 +36429,13 @@ fn acquire_cargo_slot(cfg: &Config, project: &str) {
         .as_ref()
         .and_then(|m| m.name.clone())
         .unwrap_or_else(|| "flywheel-toron-loop1".to_string());
-    if let Ok(out) = std::process::Command::new("toron")
-        .args(slot_acquire_argv(project, &agent))
-        .output()
-        && !out.status.success()
+    let ttl = toron_core::bus::DEFAULT_ENVELOPE_TTL_SECS;
+    match crate::mail_or_die(cfg).and_then(|m| m.acquire_slot(project, &agent, "cargo", true, ttl))
     {
-        eprintln!(
-            "flywheel: loop-run-verify cargo slot acquire failed (continuing): {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("flywheel: loop-run-verify cargo slot acquire failed (continuing): {e:#}")
+        }
     }
 }
 
@@ -36544,9 +36445,9 @@ fn release_cargo_slot(cfg: &Config, project: &str) {
         .as_ref()
         .and_then(|m| m.name.clone())
         .unwrap_or_else(|| "flywheel-toron-loop1".to_string());
-    let _ = std::process::Command::new("toron")
-        .args(slot_release_argv(project, &agent))
-        .output();
+    if let Ok(m) = crate::mail_or_die(cfg) {
+        let _ = m.release_slot(project, &agent, "cargo");
+    }
 }
 
 /// The unverified-close mail: thread = the bead id, subject `[<id>]
@@ -37307,28 +37208,27 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
         if policy.violation(msg).is_some() {
             return Err(StatusCode::FORBIDDEN);
         }
-        let out = std::process::Command::new("toron")
-            .args([
-                "mail",
-                "send",
-                "--project",
-                project,
-                "--as",
-                service,
-                "--to",
-                to,
-                "--wake",
-                "tasked",
-                "--subject",
-                subject,
-                "--body",
-                msg,
-            ])
-            .output()
-            .map_err(|_| StatusCode::BAD_GATEWAY)?;
-        if !out.status.success() {
-            return Err(StatusCode::BAD_GATEWAY);
-        }
+        let project_s = project.to_string();
+        let service_s = service.to_string();
+        let to_s = to.to_string();
+        let subject_s = subject.to_string();
+        let msg_s = msg.to_string();
+        let cfg = st.cfg.clone();
+        crate::backend::run_mail_off_runtime(move || {
+            let mail = crate::mail_or_die(&cfg)?.with_name(service_s);
+            mail.send(
+                &project_s,
+                &[to_s],
+                &subject_s,
+                &msg_s,
+                "normal",
+                false,
+                None,
+            )?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
         crate::doorbell::service_emit_wake_in(&config::state_dir(), project, service, to);
         Ok(json!({ "ok": true, "service": service, "to": to }).to_string())
     }
@@ -38060,39 +37960,18 @@ mod integration_tests {
         assert!(render_orchestration_prompt("opencode", "bogus-cmd", "0.1.0", "ts").is_err());
     }
 
-    /// bd-em85: flywheel shells `toron slot/inbox` — toron's surface takes
-    /// `--as`, never `--agent`. Pin the flag on all three argv builders so
-    /// a renamed flag fails here, not as a silent advisory miss in prod.
+    /// bd-em85: flywheel shelled `toron mail inbox` with the wrong flag once;
+    /// the fallback builder keeps `--as` (never `--agent`) pin-able by test.
     #[test]
     fn toron_shell_argv_uses_as_never_agent() {
-        for argv in [
-            slot_acquire_argv("flywheel", "DustySparrow"),
-            slot_release_argv("flywheel", "DustySparrow"),
-            mail_inbox_fallback_argv("DustySparrow", "flywheel", "2026-09-06T00:00:00Z"),
-        ] {
-            assert!(
-                argv.contains(&"--as".to_string()),
-                "toron argv must carry --as: {argv:?}"
-            );
-            assert!(
-                !argv.contains(&"--agent".to_string()),
-                "toron has no --agent flag: {argv:?}"
-            );
-        }
-        assert_eq!(
-            slot_acquire_argv("p", "a"),
-            vec![
-                "slot",
-                "acquire",
-                "--project",
-                "p",
-                "--as",
-                "a",
-                "--slot",
-                "cargo",
-                "--exclusive",
-                "--json"
-            ],
+        let argv = mail_inbox_fallback_argv("DustySparrow", "flywheel", "2026-09-06T00:00:00Z");
+        assert!(
+            argv.contains(&"--as".to_string()),
+            "toron argv must carry --as: {argv:?}"
+        );
+        assert!(
+            !argv.contains(&"--agent".to_string()),
+            "toron has no --agent flag: {argv:?}"
         );
     }
 

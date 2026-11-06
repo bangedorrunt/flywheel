@@ -264,6 +264,9 @@ pub(crate) fn cmd_doorbell_introduce(
     Ok(())
 }
 
+/// Passthrough to the toron CLI for introduce steps (contact request,
+/// channel create). Kept as a subprocess by design (bd-wave2): routing the
+/// contact verb alone would split one atomic introduce across two transports.
 fn run_introduce_toron(argv: &[String]) -> Result<String> {
     let out = std::process::Command::new("toron").args(argv).output()?;
     let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -316,7 +319,7 @@ pub(crate) fn cmd_doorbell_roster(cfg: &Config, project: &str, json: bool) -> Re
         })
         .collect();
     let hc = nearby_plane_agents(cfg);
-    let leases = nearby_leases(project);
+    let leases = nearby_leases(cfg, project);
     let rows = crate::doorbell::join_nearby(&reg, &hc, &leases);
     if json {
         crate::output::print_json(&serde_json::to_value(&rows).unwrap_or_default());
@@ -349,14 +352,15 @@ fn nearby_plane_agents(cfg: &Config) -> Vec<(String, String, String)> {
         .collect()
 }
 
-fn nearby_leases(project: &str) -> Vec<(String, String)> {
-    let out = std::process::Command::new("toron")
-        .args(["reserve", "list", "--project", project, "--json"])
-        .output();
-    let Ok(out) = out else {
-        return Vec::new();
+fn nearby_leases(cfg: &Config, project: &str) -> Vec<(String, String)> {
+    let mail = match crate::mail_or_die(cfg) {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
     };
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    let v = match mail.list_active(project, None, None) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
     v.get("reservations")
         .and_then(|r| r.as_array())
         .cloned()

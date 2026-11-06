@@ -882,6 +882,225 @@ impl Mail {
         }
     }
 
+    /// Canonical presence state word (mirrors toron CLI `state_str`).
+    fn presence_state_str(state: &toron_core::nostr::presence::PresenceState) -> &'static str {
+        use toron_core::nostr::presence::PresenceState;
+        match state {
+            PresenceState::Idle => "idle",
+            PresenceState::Working => "working",
+            PresenceState::Blocked => "blocked",
+            PresenceState::Done => "done",
+            PresenceState::Unknown => "unknown",
+        }
+    }
+
+    /// Mirror of toron CLI `resolve_agent` (plane.rs): whois the pin, then
+    /// load its local ncryptsec. Same hardcoded dev passphrase as the CLI —
+    /// identical keys or identical failure.
+    fn resolve_agent_keys(
+        mailbox: &toron_core::mailbox::Mailbox,
+        project: &str,
+        name: &str,
+    ) -> Result<toron_core::nostr::Keys> {
+        let whois = block_on(mailbox.whois(project, name))
+            .map_err(|_| anyhow!("unknown agent name: {name} for project {project}"))?;
+        let canonical = block_on(mailbox.canonical_project(project));
+        let path = toron_core::mailbox::aliases::project_root(mailbox.data_dir(), &canonical)
+            .join("agents")
+            .join(&whois.name)
+            .join("key.ncryptsec");
+        toron_core::keys::load_encrypted_key(&path, "toron-dev").map_err(|e| {
+            anyhow!(
+                "agent {} has no usable local key at {} ({e})",
+                whois.name,
+                path.display()
+            )
+        })
+    }
+
+    /// `presence publish` (mirrors `toron presence publish --as/--state/--project`):
+    /// sign a kind-20001 heartbeat, publish it on the bus, and append the
+    /// projection row. Remote has no presence MCP op → fail loud naming the CLI.
+    pub fn presence_publish(&self, project_key: &str, pin: &str, state: &str) -> Result<()> {
+        match &self.backend {
+            BackendKind::InProcess => {
+                use toron_core::nostr::presence::{
+                    PresencePayload, PresenceState, build_presence_event,
+                };
+                let mb = mailbox();
+                let keys = Self::resolve_agent_keys(mb, project_key, pin)?;
+                let state = match state {
+                    "idle" => PresenceState::Idle,
+                    "working" => PresenceState::Working,
+                    "blocked" => PresenceState::Blocked,
+                    "done" => PresenceState::Done,
+                    other => anyhow::bail!(
+                        "unknown presence state {other:?} (want idle|working|blocked|done)"
+                    ),
+                };
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+                let ts = now.map(|d| d.as_secs()).unwrap_or(0);
+                let payload = PresencePayload {
+                    state,
+                    status: None,
+                    ts,
+                };
+                let ev =
+                    build_presence_event(&keys, &payload, toron_core::nostr::Timestamp::from(ts))?;
+                block_on(mb.bus().publish(ev))?;
+                let whois = block_on(mb.whois(project_key, pin))?;
+                let line = serde_json::json!({
+                    "name": whois.name,
+                    "npub": keys.public_key().to_hex(),
+                    "state": Self::presence_state_str(&payload.state),
+                    "status": payload.status,
+                    "ts": payload.ts,
+                    "project": project_key,
+                });
+                let path = toron_core::config::mailbox_root(mb.data_dir()).join("presence.jsonl");
+                toron_core::jsonl::append_row(&path, &line)?;
+                Ok(())
+            }
+            BackendKind::Remote(_) => anyhow::bail!(
+                "presence publish failed (remote mailbox): run `toron presence publish --as {pin} --state {state} --project {project_key}` (no remote presence MCP op; refusing a silent skip)"
+            ),
+        }
+    }
+
+    /// `presence list` (mirrors `toron presence list --project --json`): last
+    /// heartbeat per npub inside the TTL, newest wins. Remote has no presence
+    /// MCP op → fail loud naming the CLI.
+    pub fn presence_list(&self, project_key: &str) -> Result<Vec<Value>> {
+        match &self.backend {
+            BackendKind::InProcess => {
+                // Mirror of toron CLI `read_presence` (60s default TTL, overridable).
+                let ttl: u64 = std::env::var("TORON_PRESENCE_TTL_SECS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(60);
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let path =
+                    toron_core::config::mailbox_root(mailbox().data_dir()).join("presence.jsonl");
+                let Ok(body) = std::fs::read_to_string(&path) else {
+                    return Ok(vec![]);
+                };
+                let mut by_npub: std::collections::HashMap<String, Value> =
+                    std::collections::HashMap::new();
+                for line in body.lines() {
+                    let Ok(v) = serde_json::from_str::<Value>(line) else {
+                        continue;
+                    };
+                    if v.get("project").and_then(|p| p.as_str()) != Some(project_key) {
+                        continue;
+                    }
+                    let npub = v.get("npub").and_then(|n| n.as_str()).unwrap_or("");
+                    if npub.is_empty() {
+                        continue;
+                    }
+                    let ts = v.get("ts").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                    if now_secs.saturating_sub(ts) > ttl {
+                        continue;
+                    }
+                    let newer = by_npub
+                        .get(npub)
+                        .and_then(|old| old.get("ts").and_then(serde_json::Value::as_u64))
+                        .map(|old_ts| ts >= old_ts)
+                        .unwrap_or(true);
+                    if newer {
+                        by_npub.insert(npub.to_string(), v);
+                    }
+                }
+                Ok(by_npub.into_values().collect())
+            }
+            BackendKind::Remote(_) => anyhow::bail!(
+                "presence list failed (remote mailbox): run `toron presence list --project {project_key} --json` (no remote presence MCP op; refusing a silent skip)"
+            ),
+        }
+    }
+
+    /// Count OPEN kind-43001 jobs assigned to `assignee` (mirrors
+    /// `toron job list --state open --assignee`). No toron-core equivalent
+    /// exists, so the filter folds job events in-process via
+    /// `toron_workflow::jobs::job_state` (request → terminal-or-claim
+    /// decides; no arrival tracking needed to recognise Open). Remote has no
+    /// job MCP op → fail loud naming the CLI.
+    pub fn open_jobs_for(&self, project_key: &str, assignee: &str) -> Result<usize> {
+        match &self.backend {
+            BackendKind::InProcess => {
+                block_on(Self::count_open_jobs(mailbox(), project_key, assignee))
+            }
+            BackendKind::Remote(_) => anyhow::bail!(
+                "job list failed (remote mailbox): run `toron job list --state open --assignee {assignee} --project {project_key}` (no remote job MCP op; refusing a silent 0)"
+            ),
+        }
+    }
+
+    async fn count_open_jobs(
+        mailbox: &toron_core::mailbox::Mailbox,
+        project: &str,
+        assignee: &str,
+    ) -> anyhow::Result<usize> {
+        use toron_core::nostr::kinds::{
+            JOB_ACCEPTED, JOB_CANCEL, JOB_ERROR, JOB_PROGRESS, JOB_REQUEST, JOB_RESULT, toron_kind,
+        };
+        use toron_workflow::jobs::{JobRequest, job_state};
+        let filter = toron_core::nostr::Filter::new().kinds([
+            toron_kind(JOB_REQUEST),
+            toron_kind(JOB_ACCEPTED),
+            toron_kind(JOB_PROGRESS),
+            toron_kind(JOB_RESULT),
+            toron_kind(JOB_CANCEL),
+            toron_kind(JOB_ERROR),
+        ]);
+        let events = toron_core::mailbox::collect_replay(mailbox.bus().as_ref(), filter).await?;
+        let in_project = |ev: &toron_core::nostr::Event| {
+            ev.tags
+                .iter()
+                .find_map(|t| {
+                    if t.kind() == "t" {
+                        let c = t.content()?;
+                        if c.starts_with("toron:") {
+                            return None;
+                        }
+                        Some(c)
+                    } else {
+                        None
+                    }
+                })
+                .is_none_or(|slug| slug == project)
+        };
+        let mut open = 0;
+        for ev in events.iter().filter(|ev| ev.kind.as_u16() == JOB_REQUEST) {
+            if !in_project(ev) {
+                continue;
+            }
+            let has: Option<String> = ev
+                .tags
+                .iter()
+                .find(|t| t.kind() == "assignee")
+                .and_then(|t| t.content())
+                .map(str::to_string)
+                .or_else(|| {
+                    serde_json::from_str::<JobRequest>(&ev.content)
+                        .ok()
+                        .and_then(|r| r.assignee)
+                });
+            if has.as_deref() != Some(assignee) {
+                continue;
+            }
+            if matches!(
+                job_state(ev.id, &events),
+                toron_workflow::jobs::JobState::Open
+            ) {
+                open += 1;
+            }
+        }
+        Ok(open)
+    }
+
     /// `register_agent` (upsert on the agent's key).
     pub fn register_agent(
         &self,
@@ -4232,6 +4451,117 @@ mod agents_list_tests {
             who.get("name").and_then(|n| n.as_str()),
             Some("QuietAnvil"),
             "register+whois resolve against one shared root: {who}"
+        );
+        unsafe { std::env::remove_var("TORON_DATA_DIR") };
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// Wave-2 mail-door tests: the in-process replacements for the retired
+/// `toron presence …` / `toron role pin …` / `toron job list …` subprocesses.
+/// Each runs on a per-test temp TORON_DATA_DIR (never the shared root).
+#[cfg(test)]
+mod mail_door_tests {
+    use super::*;
+
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "fw-maildoor-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        unsafe { std::env::set_var("TORON_DATA_DIR", &root) };
+        root
+    }
+
+    fn temp_mail() -> Mail {
+        Mail::from_config(None)
+            .expect("in-process mail ok")
+            .expect("Some (embedded backend)")
+    }
+
+    #[test]
+    fn presence_publish_then_list_shows_heartbeat() {
+        let _g = crate::config::lock_env();
+        let root = temp_root("presence");
+        let mail = temp_mail();
+        mail.register_agent("presence-proj", "PresenceProbe", "test-harness", "m", "t")
+            .expect("register");
+        mail.presence_publish("presence-proj", "PresenceProbe", "working")
+            .expect("publish");
+        let rows = mail.presence_list("presence-proj").expect("list");
+        assert!(
+            rows.iter().any(
+                |r| r.get("name").and_then(|n| n.as_str()) == Some("PresenceProbe")
+                    && r.get("state").and_then(|s| s.as_str()) == Some("working")
+            ),
+            "published heartbeat is listed: {rows:?}"
+        );
+        assert!(
+            mail.presence_publish("presence-proj", "NobodyHere", "working")
+                .is_err(),
+            "unknown pin fails loud, never a silent no-op"
+        );
+        assert!(
+            mail.presence_publish("presence-proj", "PresenceProbe", "napping")
+                .is_err()
+        );
+        unsafe { std::env::remove_var("TORON_DATA_DIR") };
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn role_pin_alias_binds_and_clears() {
+        let _g = crate::config::lock_env();
+        let root = temp_root("rolepin");
+        let mail = temp_mail();
+        mail.register_agent("rolepin-proj", "RolePinProbe", "test-harness", "m", "t")
+            .expect("register");
+        let name = mail
+            .pin_role_alias("rolepin-proj", "tester", "RolePinProbe")
+            .expect("pin");
+        assert_eq!(name, "RolePinProbe");
+        assert!(
+            mail.pin_role_alias("rolepin-proj", "tester", "NobodyHere")
+                .is_err(),
+            "unregistered pin refuses the bind"
+        );
+        assert!(mail.clear_role_alias("rolepin-proj", "tester").is_ok());
+        unsafe { std::env::remove_var("TORON_DATA_DIR") };
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_jobs_for_counts_assigned_open_requests() {
+        use toron_core::nostr::{Keys, Timestamp};
+        use toron_workflow::jobs::{JobRequest, build_job_request};
+        let _g = crate::config::lock_env();
+        let root = temp_root("jobs");
+        let mail = temp_mail();
+        let assignee = format!("JobCountProbe-{}", std::process::id());
+        let keys = Keys::generate();
+        let payload = JobRequest {
+            title: "count me".into(),
+            spec: serde_json::json!({}),
+            assignee: Some(assignee.clone()),
+        };
+        let parent = toron_core::nostr::EventId::from_byte_array([0u8; 32]);
+        let ev =
+            build_job_request(&keys, parent, &payload, Timestamp::now()).expect("build request");
+        block_on(mailbox().bus().publish(ev)).expect("publish");
+        assert_eq!(
+            mail.open_jobs_for("jobs-proj", &assignee).expect("count"),
+            1,
+            "one open request for the assignee"
+        );
+        assert_eq!(
+            mail.open_jobs_for("jobs-proj", "NobodyElse")
+                .expect("count"),
+            0,
+            "nobody else has open jobs"
         );
         unsafe { std::env::remove_var("TORON_DATA_DIR") };
         let _ = std::fs::remove_dir_all(&root);
