@@ -8,6 +8,9 @@
 //! One implementation: every arm below mirrors `cmd_internal_doorbell`
 //! (removed); behavioral deltas are marked DELTA with their reason.
 
+#[path = "reservation_digest.rs"]
+mod reservation_digest;
+
 use crate::config::Config;
 use crate::hc::{Client, StreamOutcome, Subscription};
 use crate::{config, doorbell, state, workspace};
@@ -48,6 +51,11 @@ pub struct RtHost {
     /// directly, and ongoing status changes ride a dedicated poll thread so
     /// no blocking plane call ever runs inside the brain's async tick.
     presence_armed: bool,
+    /// Advisory reservation-conflict digest (bd-coordination-awareness):
+    /// one notice per overlap episode, pushed to the holders and the captain.
+    conflict_seen: std::collections::BTreeSet<String>,
+    conflict_checked_at: u64,
+    pending_conflict_prompts: Vec<(String, String)>,
     /// Shared with the delivery path. bd-kz54 follow-up: `WatchRetry::reset()`
     /// had exactly one caller in the whole tree — its own unit test — so four
     /// failures anywhere in a host's life latched the 16s gate permanently and
@@ -202,6 +210,9 @@ impl RtHost {
             brain_tx,
             covered_panes: Arc::new(Mutex::new(HashSet::new())),
             presence_armed: false,
+            conflict_seen: std::collections::BTreeSet::new(),
+            conflict_checked_at: 0,
+            pending_conflict_prompts: Vec::new(),
             retry: std::sync::Arc::new(std::sync::Mutex::new(doorbell_rt::WatchRetry::default())),
             authority: crate::authority::RuntimeAuthority::resolve(),
             index_refreshed_at: now,
@@ -368,6 +379,59 @@ impl RtHost {
                 }
             }
         });
+    }
+
+    /// Advisory reservation-conflict digest: read the same board the reserve
+    /// CLI exposes; on the FIRST sweep an overlap episode appears, queue one
+    /// prompt per holder and one captain fact, and audit the episode. It is
+    /// advisory by design: it never blocks a write, and the 180 s lease
+    /// heartbeat frees a dead holder on its own.
+    fn check_reservation_conflicts(&mut self, now_unix: u64) {
+        let Ok(key) = crate::project_dir_str(&self.cfg, &self.project) else {
+            return;
+        };
+        let Some(mailbox) = crate::mail::try_mailbox() else {
+            return;
+        };
+        let rows = crate::backend::run_mail_off_runtime_sync(|| {
+            crate::mail::block_on(mailbox.active_reservations(&key))
+        });
+        let Ok(rows) = rows else {
+            return;
+        };
+        let now_us = i64::try_from(now_unix)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1_000_000);
+        let conflicts = reservation_digest::live_conflicts(&rows, now_us);
+        let current: std::collections::BTreeSet<String> =
+            conflicts.iter().map(|c| c.key.clone()).collect();
+        for conflict in &conflicts {
+            if !self.conflict_seen.insert(conflict.key.clone()) {
+                continue;
+            }
+            for holder in [&conflict.holder_a, &conflict.holder_b] {
+                self.pending_conflict_prompts
+                    .push((holder.clone(), conflict.line_for(holder)));
+            }
+            let summary = format!(
+                "[reserve] {} and {} hold overlapping exclusive leases ({} / {}) — advisory: re-plan or request-release; leases self-free in 180 s",
+                conflict.holder_a, conflict.holder_b, conflict.path_a, conflict.path_b
+            );
+            let _ = self.brain_tx.try_send(BrainMsg::Fact {
+                summary: summary.clone(),
+            });
+            doorbell::audit_append(
+                &config::state_dir(),
+                &self.workspace,
+                serde_json::json!({
+                    "kind": "reservation_conflict",
+                    "holders": [conflict.holder_a, conflict.holder_b],
+                    "paths": [conflict.path_a, conflict.path_b],
+                }),
+            );
+        }
+        // Episode reset: an overlap that clears may ring again if it recurs.
+        self.conflict_seen = current;
     }
 
     /// Map backend agent rows onto PlaneStatus sends (wave17-b: the SAME
@@ -702,7 +766,8 @@ impl Host for RtHost {
         {
             eprintln!("flywheel: run-state boundary not recorded: {refusal}");
         }
-        cmds.into_iter()
+        let mut effects: Vec<Effect> = cmds
+            .into_iter()
             .filter_map(|c| match c {
                 workspace::Cmd::Prompt { pin, line } => Some(Effect::Prompt { pin, line }),
                 workspace::Cmd::FetchInbox => Some(Effect::FetchInbox),
@@ -720,7 +785,15 @@ impl Host for RtHost {
                 }),
                 _ => None,
             })
-            .collect()
+            .collect();
+        if matches!(msg, BrainMsg::Sweep { .. }) {
+            effects.extend(
+                self.pending_conflict_prompts
+                    .drain(..)
+                    .map(|(pin, line)| Effect::Prompt { pin, line }),
+            );
+        }
+        effects
     }
 
     fn now_unix(&self) -> u64 {
@@ -815,6 +888,10 @@ impl Host for RtHost {
             self.index_refreshed_at = now;
         }
         self.cover_new_panes();
+        if now.saturating_sub(self.conflict_checked_at) >= 30 {
+            self.conflict_checked_at = now;
+            self.check_reservation_conflicts(now);
+        }
         let path = crate::mail::presence_path();
         let Ok(body) = std::fs::read_to_string(&path) else {
             return Vec::new();

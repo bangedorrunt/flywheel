@@ -202,3 +202,32 @@ flowchart TB
 - **Effect actor:** applies Cmd; journals effects; feeds DecisionReady / receipts back as Msg.
 - **Beads:** work graph / close ceremony — not a second control plane.
 - **REJECT:** Redis / AgentServer / OTP / dual peer-aware SoT as reclassify substrate.
+
+## Crew coordination (one board, 180 s heartbeats)
+
+Reservations are the native conflict surface, not a lock service. The one
+board is the captain's project, even for a sibling repo: reserve
+`toron/crates/...` or `flywheel/src/...` under that project so every lane
+sees the same rows.
+
+- **Before an edit:** `toron reserve conflicts --project <p> --as <pin>
+  --paths '<glob>' --json`. `conflict_free: false` names the holder and the
+  bead; re-plan or split the file set. It is a read, never a wait.
+- **The lease is a heartbeat:** `reserve acquire --ttl-secs` defaults to
+  **180 s**, and the loop renews it. A crashed or idle lane self-frees in
+  under three minutes; `release-by-reason <bead>` / `sweep` at close is
+  hygiene, not the backstop.
+- **Narrow globs only.** `src/**` manufactures symmetric-fnmatch false
+  conflicts; reserve the files you will write.
+- **Peer-first.** Mail the holder, or `flywheel collab` for a direct ask.
+  Escalate to the captain only when the holder is silent or a shared build
+  breaks (name the file and the error in the same message).
+- **Push digest (advisory).** The embedded doorbell host reads the active
+  board every 30 s; on the first sweep an exclusive overlap between two
+  holders appears it types one advisory line to each holder and sends the
+  captain a fact, then stays quiet until the episode clears. It never blocks
+  a write.
+- **The real serializer is a shared crate.** A lane editing `toron-core`
+  (behind flywheel's path dep) blocks every flywheel lane's verify. Land
+  compile-green slices, announce red immediately, and sequence that lane
+  first when planning a wave.

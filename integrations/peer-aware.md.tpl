@@ -18,7 +18,7 @@ CONTROL-PLANE MARKER: prompts prefixed with U+2063 + `FLYWHEEL_OP:` are lifecycl
 PUBLIC ADDRESS: {mail_identity}
 INTERNAL PANE HANDLE: {name}
 
-Use PUBLIC ADDRESS for toron, mail, presence, reservations, guards, and `flywheel --to`. Never the pane handle.
+Before editing, run `toron reserve conflicts --project <p> --as "$AGENT_NAME" --paths '<glob>' --json`; a conflict means re-plan or `with-lease` one file, never a wait. Leases are 180 s heartbeats (the loop renews); release with `toron reserve release-by-reason <bead>` at close. Peer-first on overlap: mail the holder or `flywheel collab`; escalate when silent or a shared build breaks. Use PUBLIC ADDRESS for toron, mail, presence, reservations, guards, and `flywheel --to`. Never the pane handle.
 
 BOOT: join lane channels first (`toron channel join <channel> --project <project> --as {mail_identity}`, idempotent; a non-member post FAILS LOUDLY). Publish `toron presence publish --as {mail_identity} --state idle`.
 
