@@ -1835,14 +1835,14 @@ mod loop_run_verify_tests {
 #[cfg(test)]
 mod loop_tests {
     use super::*;
+    use crate::cmd::internal::{first_routable, planner_recipient_chain, send_not_ready_mail};
     use crate::cmd::send::bare_short_group_matches;
     use crate::cmd::status::progress_waves;
     use crate::{
-        WantToken, agent_name_n, agent_ordinal, doorbell_uncovered_panes, first_routable,
-        free_spawn_ordinal, kill_key, name_matches_want, planner_recipient_chain,
-        registered_orchestrator, reopen_unverified_close, resolve_send_targets_dyn, send_done_mail,
-        send_not_ready_mail, send_unverified_close_mail, slugify_label, spawn_agent_profile,
-        watch_name_for_pane,
+        WantToken, agent_name_n, agent_ordinal, doorbell_uncovered_panes, free_spawn_ordinal,
+        kill_key, name_matches_want, registered_orchestrator, reopen_unverified_close,
+        resolve_send_targets_dyn, send_done_mail, send_unverified_close_mail, slugify_label,
+        spawn_agent_profile, watch_name_for_pane,
     };
 
     /// bd-8hv0: the sweep must re-subscribe only panes the push
