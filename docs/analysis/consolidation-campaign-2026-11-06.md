@@ -29,8 +29,17 @@ close ceremony commit exists; the verdict row was not re-read for that bead.
 | 8 | toron | wake KEEP decision | `57c27ae` | bd-wake-decommission-dsd8, LEGAL |
 | 9 | C (toron) | doctor judges live daemon, exit 3 | `236422f` | bd-wave9-doctor-freshness-exmk, LEGAL |
 | 10 | C (docs) | plane-split docs truth | `b61bc4f8` + `f27fc9c` | bd-wave10-plane-docs-uhmfi, LEGAL |
-| 11 | A/B | snapshot producer / always-on host | — | bd-wave11-snapshot-mndgf, bd-wave11-doorbell-host-yiilt — OPEN |
-| 12 | A | heal full flywheel suite | — | bd-wave12-heal-suite-3r4q3 — OPEN |
+| 11 | A | one snapshot producer | — | bd-wave11-snapshot-mndgf — IN PROGRESS |
+| 11 | B | always-on doorbell host | `14e49c4` | bd-wave11-doorbell-host-yiilt, LEGAL |
+| 12 | D (flywheel) | parse-or-refuse FLYWHEEL_* knobs | `c9dc22f3` | bd-wave12-config-strict-n9hcs, LEGAL (amendment close at heal) |
+| 12 | A | heal full flywheel suite | `d8094222` | bd-wave12-heal-suite-3r4q3, LEGAL (unit-test-verified) |
+| 13 | toron | default discovery store identity | `6077811` | bd-wave13-discovery-isolation-zt1z, closed |
+| 14 | toron | with-lease non-git zero-match | `e6ad5f5` | bd-wave14-withlease-nongit-2s0o, closed |
+| 14 | toron | comms-flag / backend-ADR-0045 tests | `2fe0f25` / `cc3152f` | both closed |
+| 15 | toron | doorbell host PATH + restart | — | bd-wave15-doorbell-live-2c6jf, closed |
+| 16 | C | presence fold + RunEnv bead | — | bd-presence-runenv-snapshot-fe4bh, OPEN (filed by this refresh) |
+| 12 | C | campaign report (this page) | — | bd-wave12-campaign-report-g96kz, OPEN (this bead) |
+| 16 | C | campaign refresh (this update) | — | bd-wave16-report-refresh-j228e, OPEN (this bead) |
 
 Earlier lane-C groundwork (close-commits in log, reports linked below):
 docs truth sync (`79b0e4a9`/`0936ab7`), skills residuals + core rewrite
@@ -49,10 +58,13 @@ Lane reports (all exist at report time):
 `../../.flywheel/reports/wave5-dep-drop.md`,
 `../../.flywheel/reports/wave8-skills-audit.md`,
 `../../.flywheel/reports/wave8-disproofs.md`,
-`../../.flywheel/reports/wave10-plane-docs.md`.
+`../../.flywheel/reports/wave10-plane-docs.md`,
+`../../.flywheel/reports/wave11-doorbell-host.md`,
+`../../.flywheel/reports/wave12-config-strict.md`.
 Toron-side receipts/reports live under `../../../toron/.flywheel/reports/`
 (`wave5-tojson.md`, `wave6-plane-port.md`, `wave7-config-strict.md`,
-`wave7-plane-crate.md`, `wave9-doctor-freshness.md`).
+`wave7-plane-crate.md`, `wave9-doctor-freshness.md`,
+`wave14-withlease-nongit.md`, `wave13-discovery-isolation.md`).
 Disproofs: [consolidation-disproofs.md](consolidation-disproofs.md).
 Divergences: [../known-divergences.md](../known-divergences.md).
 Vocabulary: [../vocabulary.md](../vocabulary.md).
@@ -66,33 +78,42 @@ candidates DISPROVED as duplicates (documented KEEPs); no follow-up beads.
 
 ## 4. Remaining live gaps, exactly
 
-- **Always-on doorbell host** — push wake dies with the spawn process; pull
-  `captain watch` works. Bead: `bd-wave11-doorbell-host-yiilt` (OPEN).
-- **One snapshot producer** — `status`/`progress`/`snapshot`/robot doors
-  still read independently. Bead: `bd-wave11-snapshot-mndgf` (OPEN).
-- **Presence fold / RunEnv** — no bead filed; confirm with the captain
-  whether they ride the snapshot bead or need their own.
+- **Always-on doorbell host** — DONE (`bd-wave11-doorbell-host-yiilt`,
+  LEGAL at `14e49c4`): `flywheel daemon start` installs one supervised
+  host per armed workspace; live `/health` shows 2 hosted leases,
+  12 subscribers, `degraded: []` (observed at refresh time).
+- **One snapshot producer** — still open: `status`/`progress`/`snapshot`/
+  robot doors still read independently. Bead: `bd-wave11-snapshot-mndgf`
+  (IN PROGRESS).
+- **Presence fold / RunEnv** — bead filed by this refresh:
+  `bd-presence-runenv-snapshot-fe4bh` (OPEN): decide whether they ride the
+  snapshot bead or need their own shape.
+- **Doorbell host PATH + restart** — DONE (`bd-wave15-doorbell-live-2c6jf`,
+  closed).
 - **Installed-binary + daemon freshness ritual** — operator procedure, no
   bead: `mbx +nightly-aarch64-apple-darwin install --path . --force`
   (+ doorbell-cli), codesign if macOS kills the signature, `toron daemon
-  restart`; `toron doctor --check` exits 3 while stale (live-proven wave9).
-- **Full flywheel suite green** — blocked on the red tree; bead:
-  `bd-wave12-heal-suite-3r4q3` (OPEN).
+  restart`; `toron doctor --check` exits 3 while stale (live-proven wave9;
+  this refresh re-observed exit 3 with the remedy on the live daemon).
+- **Full flywheel suite green** — DONE (`bd-wave12-heal-suite-3r4q3`,
+  LEGAL at `d8094222`): gate `verify-clippy.sh` exit 0 re-observed by
+  this refresh.
 
 ## 5. Final verification matrix (real numbers; not-run marked)
 
 | Check | Result | Basis |
 |---|---|---|
-| toron-core lib | 917 passed + 1 failed (pre-existing parallel-load flake in `test_default_lease_ttl…`, passes solo; file owned by another lane) | `mbx test -p toron-core --lib`, wave9 |
-| toron-cli full | 174 passed + 1 failed at wave7-strict; the 1 (stale hc-default) since fixed, `cli_framework` 7/7 | runs wave7-strict + wave8 lane-D |
-| toron-plane / mcp / cli-bins / workflow | 77 / 120 / 145 / 271, all green | runs wave7 |
-| config_strict / doctor filter / doctor_freshness / serve_build | 5/5, 23 suites ok, 2/2, 11/11 | runs wave7-strict + wave9 |
-| full toron workspace single run | not run | per-crate numbers above instead |
-| full flywheel suite | not green at HEAD (eviction WIP red tree) | pending bd-wave12-heal-suite-3r4q3 |
-| clean-export (`git archive HEAD` build) | not run | pending |
-| installs | flywheel 0.10.1, toron 1.6.1, doorbell 0.3.0, hc 0.1.18 | `--version`, observed 2026-11-06 |
-| doorbell `/health` | reachable, `degraded: []`, binaries named | `curl 127.0.0.1:18980/health`, observed |
-| `toron doctor --check` | exit 3 on the stale live daemon, remedy named | observed wave9 (daemon_build green while stale — the trap, now caught) |
+| flywheel bin tests | 2710 listed (heal lane counted 2702 at close; +8 landed since) | `--bin flywheel -- --list`, refresh run |
+| flywheel full suite | green per heal close (unit-test-verified LEGAL at `d8094222`); gate exit 0 re-observed | heal bead + `verify-clippy.sh`, refresh run; full re-run not done by this lane |
+| flywheel integration targets | 35 files; green per the same heal verdict | heal bead; not re-run by this lane |
+| toron workspace suite | 2111 passed, 0 failed, 10 ignored (119 result lines) | `mbx test --workspace`, refresh run (ambient env; a `TORON_UNDER_TEST` override was found to break one sandbox test and removed) |
+| toron lease-TTL flake | not present this run; seen twice on earlier parallel runs (180±5s window vs KDF contention), passes solo | runs wave9 + refresh |
+| toron clean-export | check exit 0 in `git archive HEAD` + sibling-HEAD layout | refresh run (sibling `elm-effect-rs` is a path dep; `2d3c81f` clean; test-in-export not run) |
+| toron per-crate (earlier) | plane 77, mcp 120, cli-bins 145, workflow 271, core lib 914, cli full 174+1OT (the 1 since fixed) | runs wave7-strict |
+| config_strict / doctor legs | 5/5 + 23 suites ok (wave7); doctor_freshness 2/2, serve_build 11/11 (wave9) | prior lane-C runs |
+| installs | flywheel 0.10.1, toron 1.6.1, doorbell 0.3.0, hc 0.1.18 | `--version`, refresh run |
+| doorbell `/health` | `lease_hosted` 2 leases, `subscribers` 12, `degraded` `[]`, mode standby | `curl 127.0.0.1:18980/health`, refresh run |
+| `toron doctor --check` | exit 3 on the live daemon with remedy (`daemon_build` green while stale) | refresh run (re-observed; first proven wave9) |
 
 ## 6. What changed for the agent
 
@@ -114,3 +135,9 @@ candidates DISPROVED as duplicates (documented KEEPs); no follow-up beads.
   `flywheel watch` is hc terminal status.
 - **Freshness ritual**: installed binary + daemon judged separately;
   `doctor --check` fails stale with reinstall+restart remedy.
+- **Strict config both halves**: garbage `TORON_*` and `FLYWHEEL_*` exit
+  nonzero naming accepted forms (wave7-strict + wave12-config-strict,
+  the latter LEGAL at the heal commit).
+- **Supervised doorbell host**: `daemon start` installs one host per armed
+  workspace (wave11 report); `/health` currently shows 2 hosted leases,
+  12 subscribers, `degraded: []`.
