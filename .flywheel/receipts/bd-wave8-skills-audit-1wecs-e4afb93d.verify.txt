@@ -1,0 +1,4 @@
+bead: bd-wave8-skills-audit-1wecs
+flywheel-sha: e4afb93d (tree red on wave5-a WIP; binary truth via 18:54 last-green build + HEAD source)
+toron-sha: 5cd390a (binary rebuilt 22:00, current)
+BEAD_VERIFY_GREEN
