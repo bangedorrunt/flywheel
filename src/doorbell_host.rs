@@ -256,9 +256,12 @@ impl RtHost {
     }
 
     fn registry_pins(&self) -> Vec<String> {
+        // Deduped: duplicate rows for one pane must not double the fetch.
         state::load_spawn_registry(&self.project)
             .iter()
             .filter_map(|e| e.mail_identity.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .collect()
     }
 
@@ -792,9 +795,14 @@ impl Host for RtHost {
                 unpinned.join(", ")
             );
         }
+        // One pin per identity: `flywheel add` can leave a kind-name row and
+        // the pin row for the SAME pane, which doubled every inbox fetch for
+        // that pin (and its prompts) each cycle. BTreeSet keeps it sorted.
         registry
             .iter()
             .filter_map(|e| e.mail_identity.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .collect()
     }
 
