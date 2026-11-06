@@ -133,6 +133,7 @@ pub struct TestStateHome {
     prev_toron_data: Option<std::ffi::OsString>,
     prev_toron_mcp_data: Option<std::ffi::OsString>,
     prev_br_bin: Option<std::ffi::OsString>,
+    prev_path: Option<std::ffi::OsString>,
 }
 
 #[cfg(test)]
@@ -146,6 +147,7 @@ impl Drop for TestStateHome {
         restore_env("TORON_DATA_DIR", self.prev_toron_data.take());
         restore_env("TORON_MCP_DATA_DIR", self.prev_toron_mcp_data.take());
         restore_env("FLYWHEEL_BR_BIN", self.prev_br_bin.take());
+        restore_env("PATH", self.prev_path.take());
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -185,9 +187,15 @@ pub fn test_state_home() -> TestStateHome {
     // A pinned br binary from a sibling points at a temp stub that dies with
     // its test; resolving it later is Os NotFound. Hermetic per guard.
     let prev_br_bin = std::env::var_os("FLYWHEEL_BR_BIN");
+    let prev_path = std::env::var_os("PATH");
+    // Hermetic mail store: clearing TORON_DATA_DIR made an unconfigured test
+    // fall back to the OPERATOR store (a real pin collision proved it). Point
+    // every guard holder at its own throw-away root instead.
+    let toron_dir = dir.join("toron");
+    std::fs::create_dir_all(&toron_dir).expect("create test toron root");
     // A leaked store root from a sibling must not redirect this test.
     unsafe {
-        std::env::remove_var("TORON_DATA_DIR");
+        std::env::set_var("TORON_DATA_DIR", &toron_dir);
         std::env::remove_var("TORON_MCP_DATA_DIR");
         std::env::remove_var("FLYWHEEL_BR_BIN");
         std::env::set_var("XDG_STATE_HOME", &dir);
@@ -200,6 +208,7 @@ pub fn test_state_home() -> TestStateHome {
         prev_toron_data,
         prev_toron_mcp_data,
         prev_br_bin,
+        prev_path,
     }
 }
 
@@ -1443,6 +1452,7 @@ daily = [
                     prev_toron_data: std::env::var_os("TORON_DATA_DIR"),
                     prev_toron_mcp_data: std::env::var_os("TORON_MCP_DATA_DIR"),
                     prev_br_bin: std::env::var_os("FLYWHEEL_BR_BIN"),
+                    prev_path: std::env::var_os("PATH"),
                 };
                 assert_eq!(
                     std::env::var_os("XDG_STATE_HOME").as_deref(),

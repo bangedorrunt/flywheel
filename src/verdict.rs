@@ -2465,6 +2465,9 @@ mod tests {
     /// reopen leaf; the DECISION is this function.)
     #[test]
     fn close_check_reopens_when_worker_closes_without_gate_row() {
+        // br resolution reads FLYWHEEL_BR_BIN: serialize with the tests that
+        // pin it (a concurrent pinned stub is Os NotFound here).
+        let _g = crate::config::lock_env();
         let (dir, bead_id) = scratch_workspace("reopen-red-green");
         let sha = derive_head_sha(&dir, &bead_id).unwrap();
         crate::br::run_br(
