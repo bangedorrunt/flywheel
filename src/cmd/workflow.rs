@@ -2022,3 +2022,146 @@ pub(crate) fn lint_flywheel_tier(
     }
     blocking
 }
+
+/// --- moved-in test mod (bd-wave5-main-eviction-d5hht) ---
+#[cfg(test)]
+mod workflow_cli_lint_tests {
+    use super::*;
+    use toron_workflow::schema::parse_workflow;
+
+    /// The flywheel-tier lint fails closed on an unresolved `@profile`
+    /// (the bead's fail-stop contract).
+    #[test]
+    fn lint_rejects_unresolved_profile() {
+        let wf = parse_workflow(
+            r#"
+name: t
+trigger:
+  type: webhook
+inputs:
+  - name: goal
+steps:
+  - name: a
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@doesnotexist" }
+"#,
+        )
+        .expect("parse");
+        let blocking = lint_flywheel_tier("t", &wf, None);
+        assert!(blocking > 0, "unresolved profile must be a blocking issue");
+    }
+
+    /// An unresolved `stage:` alias fails closed.
+    #[test]
+    fn lint_rejects_unresolved_stage() {
+        let wf = parse_workflow(
+            r#"
+name: t
+trigger:
+  type: webhook
+inputs:
+  - name: goal
+steps:
+  - name: a
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@planner", stage: "not-a-real-stage" }
+"#,
+        )
+        .expect("parse");
+        let blocking = lint_flywheel_tier("t", &wf, None);
+        assert!(blocking > 0, "unresolved stage must be a blocking issue");
+    }
+
+    /// A `{{inputs.x}}` ref with no matching `inputs:` declaration fails closed.
+    #[test]
+    fn lint_rejects_undeclared_input_ref() {
+        let wf = parse_workflow(
+            r#"
+name: t
+trigger:
+  type: webhook
+inputs:
+  - name: goal
+steps:
+  - name: a
+    action: send_dm
+    to: x
+    body: "{{inputs.ghost}}"
+"#,
+        )
+        .expect("parse");
+        let blocking = lint_flywheel_tier("t", &wf, None);
+        assert!(
+            blocking > 0,
+            "undeclared input ref must be a blocking issue"
+        );
+    }
+
+    /// A nested ref into a declared OBJECT input (`{{inputs.bundle.run_id}}`)
+    /// resolves against the declared root and lints clean — the engine drills
+    /// into the object at runtime (bd-p4-migrate-sagas-7rmo design needs it).
+    #[test]
+    fn lint_accepts_nested_ref_into_declared_object_input() {
+        let wf = parse_workflow(
+            r#"
+name: t
+trigger:
+  type: webhook
+inputs:
+  - name: bundle
+steps:
+  - name: a
+    action: send_dm
+    to: x
+    body: "{{inputs.bundle.run_id}} {{inputs.bundle.workflow}}"
+"#,
+        )
+        .expect("parse");
+        let blocking = lint_flywheel_tier("t", &wf, None);
+        assert_eq!(blocking, 0, "nested ref into declared root must lint clean");
+    }
+
+    /// A clean workflow passes the flywheel tier (no blocking issues).
+    #[test]
+    fn lint_clean_workflow_passes() {
+        let wf = parse_workflow(
+            r#"
+name: t
+trigger:
+  type: webhook
+inputs:
+  - name: goal
+steps:
+  - name: a
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@planner", stage: "ce-execute" }
+"#,
+        )
+        .expect("parse");
+        let blocking = lint_flywheel_tier("t", &wf, None);
+        assert_eq!(blocking, 0, "clean workflow must lint clean");
+    }
+
+    /// The CI gate (bead contract: lint over EVERY built-in on every change):
+    /// every compiled-in workflow passes the FULL gate — engine tier
+    /// (lint_workflow) + flywheel tier (profile/stage/inputs resolution).
+    #[test]
+    fn every_builtin_passes_full_lint_gate() {
+        for (name, wf) in builtin_workflows::builtin_workflows() {
+            let engine = toron_workflow::lint_workflow(&wf);
+            assert!(
+                engine.is_clean(),
+                "built-in {name} fails engine lint: {:?}",
+                engine.issues
+            );
+            let tier = lint_flywheel_tier(&name, &wf, None);
+            assert_eq!(
+                tier, 0,
+                "built-in {name} fails flywheel-tier lint (profile/stage/inputs)"
+            );
+        }
+    }
+}

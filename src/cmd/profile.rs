@@ -593,3 +593,157 @@ pub(crate) fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
     }
     Ok(())
 }
+
+/// --- moved-in test mod (bd-wave5-main-eviction-d5hht) ---
+#[cfg(test)]
+mod profile_cli_tests {
+    use super::*;
+    use crate::is_builtin_profile;
+    #[test]
+    fn is_builtin_profile_classifies_the_six() {
+        for name in [
+            "oracle",
+            "planner",
+            "reviewer",
+            "coder",
+            "scout",
+            "housekeeper",
+        ] {
+            assert!(is_builtin_profile(name), "{name} is a built-in");
+        }
+        assert!(!is_builtin_profile("mybot"));
+        assert!(!is_builtin_profile(""));
+    }
+
+    /// bd-2nib: the builtin set must track compiled_in_defaults exactly —
+    /// a hardcoded name list drifted and missed `pa`, so profile
+    /// create/remove baked the pa compiled-in into the user's
+    /// profiles.toml (the merged-catalog leak).
+    #[test]
+    fn is_builtin_profile_tracks_compiled_in_defaults() {
+        assert!(
+            !is_builtin_profile("pa"),
+            "pa is a harness recipe, not a compiled-in profile (ADR-0007 D2)"
+        );
+        for name in profile::compiled_in_defaults().keys() {
+            assert!(
+                is_builtin_profile(name),
+                "every compiled-in profile is builtin: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_catalog_lists_nine_builtins() {
+        let cat = profile::ProfileCatalog::load_from(None).expect("defaults");
+        assert_eq!(cat.names().len(), 9, "9 job profiles (ADR-0007 D2)");
+        for name in [
+            "oracle",
+            "planner",
+            "reviewer",
+            "coder",
+            "rust-coder",
+            "ts-coder",
+            "zig-coder",
+            "scout",
+            "housekeeper",
+        ] {
+            let p = cat.get(name).expect(name);
+            assert!(p.behavior.len() > 200, "{name} preamble missing");
+        }
+    }
+
+    /// Project-scope resolution of an UNREGISTERED profile falls back to
+    /// host-scope (operator npub) — the same effective behavior as
+    /// `spawn --profile`. Registration stays the strict path for workflow
+    /// runs that sign as project agents (engine resolution, untouched).
+    #[test]
+    fn squad_resolve_unregistered_profile_falls_back_host_scope() {
+        let cat = profile::ProfileCatalog::load_from(None).expect("defaults");
+        let (r, fell_back) = resolve_squad_member(&cat, "coder", Some("demo"), "npub-operator")
+            .expect("fallback resolves host-scope");
+        assert!(fell_back, "unregistered profile must fall back");
+        assert_eq!(r.npub, "npub-operator");
+        assert!(matches!(r.signing, profile::SigningContext::Operator(_)));
+    }
+
+    /// No project flag → host-scope resolve directly, no fallback signal.
+    #[test]
+    fn squad_resolve_host_scope_without_project_no_fallback() {
+        let cat = profile::ProfileCatalog::load_from(None).expect("defaults");
+        let (r, fell_back) =
+            resolve_squad_member(&cat, "coder", None, "npub-operator").expect("host-scope resolve");
+        assert!(!fell_back, "no project -> no fallback path");
+        assert_eq!(r.npub, "npub-operator");
+        assert!(matches!(r.signing, profile::SigningContext::Operator(_)));
+    }
+
+    /// Unknown profile still fails fast in both scopes (never a silent
+    /// fallback for a typo).
+    #[test]
+    fn squad_resolve_unknown_profile_fails_fast() {
+        let cat = profile::ProfileCatalog::load_from(None).expect("defaults");
+        let err = resolve_squad_member(&cat, "ghost", Some("demo"), "npub-operator").unwrap_err();
+        assert!(err.to_string().contains("unknown profile"), "{err}");
+        let err = resolve_squad_member(&cat, "ghost", None, "npub-operator").unwrap_err();
+        assert!(err.to_string().contains("unknown profile"), "{err}");
+    }
+
+    #[test]
+    fn profile_run_resolves_host_scope_and_spec() {
+        let cat = profile::ProfileCatalog::load_from(None).expect("defaults");
+        let r = cat
+            .resolve("housekeeper", None, "npub-op", &|_, _| None)
+            .expect("resolve");
+        assert_eq!(r.spec.harness, "pi");
+        assert_eq!(r.spec.model, "opencode-go/muse-spark-1.3-contributor");
+        assert_eq!(r.spec.backend, "hc");
+        assert_eq!(
+            r.signing,
+            profile::SigningContext::Operator("npub-op".into())
+        );
+    }
+
+    #[test]
+    fn squad_show_resolves_recipe_alias_to_members() {
+        let r = config::Recipe {
+            oc: Some(2),
+            pi: Some(1),
+            gk: None,
+            extra: Default::default(),
+        };
+        let squad = profile::Squad::from_recipe(&r);
+        let members = squad.members();
+        assert_eq!(members, vec![("oc", 2), ("pi", 1)]);
+    }
+
+    #[test]
+    fn squad_list_lists_builtin_profiles_as_singles() {
+        let cat = profile::ProfileCatalog::load_from(None).expect("defaults");
+        let recipes = config::Recipes::default().recipes;
+        let names: Vec<String> = cat.names();
+        for name in &names {
+            assert!(
+                !recipes.contains_key(name),
+                "no user recipe named {name} in a fresh install"
+            );
+        }
+        assert_eq!(names.len(), 9, "9 job profiles (ADR-0007 D2)");
+    }
+
+    #[test]
+    fn snapshot_runs_returns_well_formed_entries() {
+        let runs = snapshot_runs();
+        for r in &runs {
+            assert!(r.get("id").and_then(Value::as_str).is_some(), "id");
+            assert!(
+                r.get("project").and_then(Value::as_str).is_some(),
+                "project"
+            );
+            assert!(r.get("kind").and_then(Value::as_str).is_some(), "kind");
+            assert!(r.get("owner").and_then(Value::as_str).is_some(), "owner");
+            assert!(r.get("state").and_then(Value::as_str).is_some(), "state");
+            assert!(r.get("ts").and_then(Value::as_str).is_some(), "ts");
+        }
+    }
+}

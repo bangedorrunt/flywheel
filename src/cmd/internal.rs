@@ -4389,3 +4389,341 @@ fn load_closed_bead_ids(cfg: &Config, project: &str) -> Result<std::collections:
     }
     Ok(closed)
 }
+
+/// --- internal batch 4: moved-in test mods (bd-wave5-main-eviction-d5hht) ---
+#[cfg(test)]
+mod wait_output_tests {
+    use super::*;
+    use crate::hc::{AgentInfo, PaneWaitResult};
+
+    fn agent(name: Option<&str>, pane: &str) -> AgentInfo {
+        AgentInfo {
+            agent: Some("opencode".into()),
+            agent_status: AgentStatus::Idle,
+            cwd: Some("/proj".into()),
+            display_agent: None,
+            focused: false,
+            foreground_cwd: None,
+            interactive_ready: true,
+            launch_pending: false,
+            name: name.map(String::from),
+            pane_id: pane.to_string(),
+            revision: 1,
+            state_change_seq: 0,
+            completion_seq: None,
+            state_labels: serde_json::Map::new(),
+            tab_id: "t1".into(),
+            terminal_id: "term_1".into(),
+            terminal_title: None,
+            workspace_id: "w1".into(),
+        }
+    }
+
+    #[test]
+    fn resolve_pane_id_resolves_names_and_raw_ids() {
+        let agents = vec![agent(Some("flywheel-x-oc"), "w1:p1")];
+        assert_eq!(
+            resolve_pane_id(&agents, "flywheel-x-oc"),
+            Some("w1:p1".to_string()),
+            "agent display name maps to its pane"
+        );
+        assert_eq!(
+            resolve_pane_id(&agents, "w2:p3"),
+            Some("w2:p3".to_string()),
+            "a raw pane id passes through"
+        );
+    }
+
+    #[test]
+    fn resolve_pane_id_unknown_target_is_none() {
+        let agents = vec![agent(Some("flywheel-x-oc"), "w1:p1")];
+        assert_eq!(resolve_pane_id(&agents, "no-such-agent"), None);
+        assert_eq!(resolve_pane_id(&agents, ""), None);
+    }
+
+    #[test]
+    fn wait_output_mode_maps_regex_flag() {
+        assert_eq!(wait_output_mode(true), "regex");
+        assert_eq!(wait_output_mode(false), "match");
+    }
+
+    #[test]
+    fn wait_output_json_shape() {
+        let hit = wait_output_json(true, Some("tests passed"), "w1:p1");
+        assert_eq!(hit["matched"], true);
+        assert_eq!(hit["matched_line"], "tests passed");
+        assert_eq!(hit["pane_id"], "w1:p1");
+        let miss = wait_output_json(false, None, "w1:p1");
+        assert_eq!(miss["matched"], false);
+        assert_eq!(miss["matched_line"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn pane_wait_result_json_uses_leaf_shape() {
+        let r = PaneWaitResult {
+            pane_id: "w1:p1".into(),
+            matched_line: Some("ready".into()),
+            read: String::new(),
+        };
+        let v = wait_output_json(true, r.matched_line.as_deref(), &r.pane_id);
+        assert_eq!(v["matched_line"], "ready");
+    }
+}
+#[cfg(test)]
+mod headless_retry_tests {
+    use super::*;
+
+    fn outcome_with_error(err: Option<&str>) -> headless::HarnessOutcome {
+        headless::HarnessOutcome {
+            response: String::new(),
+            tokens_in: 0,
+            tokens_out: 0,
+            status: if err.is_some() {
+                "fail".into()
+            } else {
+                "success".into()
+            },
+            model: String::new(),
+            duration_ms: 0,
+            exit_code: i32::from(err.is_some()),
+            error: err.map(str::to_string),
+        }
+    }
+
+    /// bd-42fs: HTTP 429 (in the harness error stream or stderr) is the
+    /// retry-on-429 trigger; other errors are not.
+    #[test]
+    fn rate_limit_predicate_classifies_429() {
+        assert!(is_rate_limited(&outcome_with_error(Some(
+            "Error: 429 Too Many Requests"
+        ))));
+        assert!(is_rate_limited(&outcome_with_error(Some(
+            "rate limit exceeded"
+        ))));
+        assert!(is_rate_limited(&outcome_with_error(Some("RATE LIMIT"))));
+        assert!(is_rate_limited(&outcome_with_error(Some(
+            "{\"error\":{\"code\":429}}"
+        ))));
+        assert!(!is_rate_limited(&outcome_with_error(Some(
+            "model not found"
+        ))));
+        assert!(!is_rate_limited(&outcome_with_error(Some(
+            "401 unauthorized"
+        ))));
+        assert!(!is_rate_limited(&outcome_with_error(None)));
+    }
+
+    /// bd-42fs: the oracle's fallback chain resolves — glm-5.2 (zai) with a
+    /// 429 retries on grok-4.5 (the registry fallback), injected for the
+    /// grok harness (bare id).
+    #[test]
+    fn oracle_fallback_resolves_via_registry() {
+        let _g = crate::config::lock_env();
+        let mut reg = models::ModelRegistry::default();
+        reg.models.insert(
+            "zai/glm-5.2".into(),
+            models::ModelEntry {
+                cost_in_per_mtok: 0.0,
+                cost_out_per_mtok: 0.0,
+                caps: vec![],
+                fallback: Some("grok/grok-4.5".into()),
+                effort: Some("max".into()),
+                tier: None,
+            },
+        );
+        reg.models.insert(
+            "grok/grok-4.5".into(),
+            models::ModelEntry {
+                cost_in_per_mtok: 0.0,
+                cost_out_per_mtok: 0.0,
+                caps: vec![],
+                fallback: None,
+                effort: Some("max".into()),
+                tier: None,
+            },
+        );
+        let fb = reg
+            .get("glm-5.2")
+            .and_then(|e| e.fallback.clone())
+            .expect("fallback declared");
+        assert_eq!(fb, "grok/grok-4.5");
+        assert_eq!(
+            reg.resolve(&fb, "grok"),
+            "grok-4.5",
+            "grok takes the bare model id"
+        );
+        assert_eq!(
+            reg.resolve(&fb, "omp"),
+            "grok/grok-4.5",
+            "omp prefixes the provider"
+        );
+        let no_fb = reg.get("grok-4.5").and_then(|e| e.fallback.clone());
+        assert!(no_fb.is_none());
+    }
+}
+#[cfg(test)]
+mod is_rate_limited_tests {
+    use super::*;
+
+    /// The one genuinely headless-local pin in this module: the 429 detector
+    /// over a `HarnessOutcome`, which no other call site has. The classify rows
+    /// this module used to carry live in the single `failure.rs` table now —
+    /// cron, pane, and headless all ran the same `classify(err, None, None)`,
+    /// so a module-local copy pinned nothing about the module.
+    #[test]
+    fn is_rate_limited_detects_429() {
+        let outcome = crate::headless::HarnessOutcome {
+            response: String::new(),
+            tokens_in: 0,
+            tokens_out: 0,
+            status: "fail".to_string(),
+            model: String::new(),
+            duration_ms: 0,
+            exit_code: 1,
+            error: Some("429 Too Many Requests".to_string()),
+        };
+        assert!(is_rate_limited(&outcome));
+    }
+}
+#[cfg(test)]
+mod verify_sink_tests {
+    use super::*;
+    use toron_workflow::engine::VerifyRequest;
+
+    #[test]
+    fn verify_sink_returns_ok_on_success() {
+        let dir = std::env::temp_dir().join(format!("fw-vs-ok-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg = Config::default();
+        let sink = make_verify_sink(cfg, dir.to_string_lossy().to_string());
+        let req = VerifyRequest {
+            command: "echo ok".to_string(),
+        };
+        let guard = sink.0.lock().unwrap();
+        if let Some(f) = guard.as_ref() {
+            let res = f(&req).expect("verify sink ok");
+            assert!(res.ok, "error={:?}", res.error);
+            assert!(res.stdout_path.is_some() || res.error.is_none());
+        } else {
+            assert!(guard.is_none());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn verify_sink_missing_returns_error() {
+        let engine = toron_workflow::WorkflowEngine::local().expect("engine");
+        let wf = toron_workflow::schema::parse_workflow(
+            r#"name: t
+graph:
+  nodes:
+    v: { action: verify, command: "cargo test" }
+"#,
+        )
+        .expect("parse verify");
+        let out = engine
+            .run(
+                "verify-missing-test",
+                toron_workflow::engine::RunInput {
+                    run_id: None,
+                    workflow: wf,
+                    trigger: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("run");
+        assert_eq!(out["v"]["ok"], false);
+        assert!(
+            out["v"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("verify sink missing")
+        );
+    }
+
+    #[test]
+    fn verify_sink_workflow_receipt_never_command_verified() {
+        let dir = std::env::temp_dir().join(format!("fw-verify-receipt-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let content = "workflow verify output";
+        let path = crate::verdict::write_receipt(
+            &dir,
+            "bd-verify-test",
+            "sha-123",
+            crate::verdict::VerdictKind::WorkerReceipt,
+            content,
+        )
+        .expect("write workflow receipt");
+        assert!(path.to_string_lossy().contains("bd-verify-test"));
+        let err = crate::verdict::write_receipt(
+            &dir,
+            "bd-verify-test",
+            "sha-123",
+            crate::verdict::VerdictKind::CommandVerified,
+            content,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("command-verified"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_sink_exec_failing_command_returns_false_with_exit() {
+        let dir = std::env::temp_dir().join(format!("fw-vs-fail-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg = Config::default();
+        let sink = make_verify_sink(cfg, dir.to_string_lossy().to_string());
+        let req = VerifyRequest {
+            command: "false".to_string(),
+        };
+        let guard = sink.0.lock().unwrap();
+        let f = guard.as_ref().expect("sink");
+        let res = f(&req).expect("verify sink");
+        assert!(!res.ok);
+        assert!(res.exit != 0);
+        assert!(res.stdout_path.is_none());
+        assert!(res.error.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_sink_exec_writes_workflow_receipt_on_success() {
+        let dir = std::env::temp_dir().join(format!("fw-vs-rcpt-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg = Config::default();
+        let sink = make_verify_sink(cfg, dir.to_string_lossy().to_string());
+        let req = VerifyRequest {
+            command: "echo workflow-ok".to_string(),
+        };
+        let guard = sink.0.lock().unwrap();
+        let f = guard.as_ref().expect("sink");
+        let res = f(&req).expect("verify sink");
+        assert!(res.ok, "error={:?}", res.error);
+        assert_eq!(res.exit, 0);
+        let path = res.stdout_path.expect("receipt path");
+        assert!(path.contains("verify-sink"));
+        assert!(path.contains("workflow-sha"));
+        assert!(path.ends_with(".worker-receipt.txt"));
+        let content = std::fs::read_to_string(&path).expect("receipt file");
+        assert!(content.contains("workflow-ok") || content.contains("verify ok"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_sink_exec_slot_acquisition_still_happens() {
+        let dir = std::env::temp_dir().join(format!("fw-vs-slot-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg = Config::default();
+        let sink = make_verify_sink(cfg, dir.to_string_lossy().to_string());
+        let req = VerifyRequest {
+            command: "cargo --version".to_string(),
+        };
+        let guard = sink.0.lock().unwrap();
+        let f = guard.as_ref().expect("sink");
+        let res = f(&req).expect("verify sink");
+        assert!(res.ok, "error={:?}", res.error);
+        assert_eq!(res.exit, 0);
+        assert!(res.stdout_path.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

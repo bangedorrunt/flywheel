@@ -2540,3 +2540,41 @@ mod why_resume_tests {
         );
     }
 }
+
+/// --- moved-in test mod (bd-wave5-main-eviction-d5hht) ---
+#[cfg(test)]
+mod single_writer_tests {
+    #[test]
+    fn option_a_doorbell_seeds_swarm_resume() {
+        let host = include_str!("../doorbell_host.rs");
+        assert!(
+            host.contains("seed_workspace_from_active_loop"),
+            "Option A: doorbell must seed swarm from ActiveLoop onto the one Model"
+        );
+        assert!(
+            host.contains("seed_roles_from_binds"),
+            "Option A / B8: doorbell must seed roles from the RoleBound snapshot"
+        );
+        assert!(
+            host.contains("WorkspaceModel::from_environment()"),
+            "doorbell remains the one live WorkspaceModel with host-resolved policy"
+        );
+    }
+
+    #[test]
+    fn option_a_speech_rejects_dual_as_end_state() {
+        let ws = include_str!("../workspace.rs");
+        assert!(
+            !ws.contains("This is the end-state, not a halfway merge"),
+            "Option A: Dual-as-end-state speech must not remain"
+        );
+        assert!(
+            !ws.contains("One RAM is impossible"),
+            "Option A: 'One RAM is impossible' contradicts ADR-0027"
+        );
+        assert!(
+            ws.contains("The end-state is one RAM owner"),
+            "Option A: speech must name one RAM owner as the end-state"
+        );
+    }
+}
