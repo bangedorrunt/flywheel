@@ -173,6 +173,7 @@ Live matrix (all against the installed binaries):
 | hc workspace lookup | after `HcBackend::workspace_list` groups terminals by root and the basename-slug alias, `FLYWHEEL_BACKEND=hc flywheel status <scratch>` resolves `workspace_id: hc:t1r` |
 | hc steering | `FLYWHEEL_BACKEND=hc flywheel send … --to GentleStream --fire-and-forget` typed the prompt into the hc pane (`hc read` showed it) and the peer replied `hc-ok`; the fix prompts by pane address because hc's `AgentInfo.name` is a label-stamped mail name, not a terminal name |
 | flywheel clean export | `git archive HEAD` + sibling `toron`/`elm-effect-rs` symlinks → 2714 bin tests passed, 0 failed; **36** `test result: ok` targets, **0** failed (HEAD `68ec3bb4`) |
+| toron clean export | `git archive HEAD` + `elm-effect-rs` sibling → 917+ core tests passed; `cli_robot` **48/49**, one load flake (`reserve_with_lease_scoped_command_releases_on_signal`: the child did not write "started" inside the 520s parallel run) — re-run in the same export passes 1/1 in 20.9s |
 
 ### Residuals found by this pass (exact)
 
