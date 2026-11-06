@@ -27,8 +27,7 @@
 //! | pipeline (chain) | workflow of `call_workflow` steps (closed action, engine sub-run) | YES |
 //!
 //! `WorkflowEngine::invoke` is the single execution door: flywheel's legacy
-//! `run_workflow`/`run_pipeline` become thin callers of it (main.rs wiring is
-//! coordinated with the P1 lane — see AGENT notes).
+//! `run_workflow` is a thin caller of it.
 //!
 //! governed-by: ADR-0005 Spec 2, P3.2
 

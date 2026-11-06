@@ -26,7 +26,6 @@ mod builtin_workflows;
 mod captain_directory;
 mod captain_slot;
 mod catalog_tui;
-mod cli_args;
 mod cmd;
 mod coalition;
 mod comms_send;
@@ -106,7 +105,6 @@ mod supervisor_program;
 #[cfg(test)]
 mod test_env_contract;
 mod timer_watch;
-mod toron_embed;
 mod unanswered_triage;
 mod upstream_parity;
 mod verdict;
@@ -125,8 +123,6 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cli_args::rewrite_legacy_loop_args;
-
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -135,16 +131,16 @@ use serde_json::{Value, json};
 #[cfg(feature = "serve")]
 use cmd::DaemonCmd;
 use cmd::{
-    AgentCmd, ArtifactsCmd, AssetCmd, BackendCmd, CaptainCmd, CheckpointCmd, CoalitionCmd,
-    ConfigCmd, CrewCmd, CronCmd, DoorbellCmd, JudgmentCmd, LedgerCmd, LoopCmd, MailCmd, ModelCmd,
-    PolicyCmd, PrinciplesCmd, ProfileCmd, RunsCmd, SlotCmd, SquadCmd, StageCmd, StandingOrdersCmd,
-    ToronCmd, ToronMailCmd, WorkCmd, WorkflowCmd, WorktreeCmd, XprojCmd, cmd_agent, cmd_analytics,
-    cmd_asset, cmd_audit, cmd_backend, cmd_captain, cmd_changes, cmd_checkpoint, cmd_config,
-    cmd_crew, cmd_doorbell_digest, cmd_doorbell_gc, cmd_doorbell_inject, cmd_doorbell_introduce,
-    cmd_doorbell_re_inject, cmd_doorbell_roster, cmd_doorbell_start, cmd_doorbell_status,
-    cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_history, cmd_internal_doorbell, cmd_judgment,
-    cmd_ledger, cmd_mail, cmd_models, cmd_policy, cmd_principles, cmd_resume, cmd_runs, cmd_slot,
-    cmd_stage, cmd_standing_orders, cmd_timeline, cmd_toron, cmd_work, cmd_worktree, cmd_xproj,
+    AgentCmd, ArtifactsCmd, BackendCmd, CaptainCmd, CheckpointCmd, CoalitionCmd, ConfigCmd,
+    CrewCmd, CronCmd, DoorbellCmd, JudgmentCmd, LedgerCmd, LoopCmd, MailCmd, ModelCmd, PolicyCmd,
+    PrinciplesCmd, ProfileCmd, RunsCmd, SlotCmd, SquadCmd, StageCmd, StandingOrdersCmd, WorkCmd,
+    WorkflowCmd, WorktreeCmd, XprojCmd, cmd_agent, cmd_analytics, cmd_audit, cmd_backend,
+    cmd_captain, cmd_changes, cmd_checkpoint, cmd_config, cmd_crew, cmd_doorbell_digest,
+    cmd_doorbell_gc, cmd_doorbell_inject, cmd_doorbell_introduce, cmd_doorbell_re_inject,
+    cmd_doorbell_roster, cmd_doorbell_start, cmd_doorbell_status, cmd_doorbell_stop,
+    cmd_doorbell_subscribe, cmd_history, cmd_internal_doorbell, cmd_judgment, cmd_ledger, cmd_mail,
+    cmd_models, cmd_policy, cmd_principles, cmd_resume, cmd_runs, cmd_slot, cmd_stage,
+    cmd_standing_orders, cmd_timeline, cmd_work, cmd_worktree, cmd_xproj,
 };
 use config::{Config, Recipe, WorkflowStep};
 use hc::{
@@ -1231,11 +1227,9 @@ enum Commands {
     /// idle/finished agents, report blockers. Exits 0 when the queue is drained
     /// and the swarm settles. Runs as a durable engine-backed workflow by default —
     /// crashes resume via `flywheel loop-mode run <project>` (same invocation
-    /// id). For back-compat, the bare legacy form `flywheel loop <project>`
-    /// (alias) is rewritten to `loop-mode run <project>` before parsing (see
-    /// `rewrite_legacy_loop_args`). Renamed from `loop` to avoid harness
-    /// built-in conflicts (bd-loop-mode-rename-0tqy).
-    #[command(name = "loop-mode", visible_alias = "loop")]
+    /// id). Renamed from `loop` to avoid harness built-in conflicts
+    /// (bd-loop-mode-rename-0tqy).
+    #[command(name = "loop-mode")]
     LoopMode {
         #[command(subcommand)]
         cmd: LoopCmd,
@@ -1331,6 +1325,32 @@ enum Commands {
         #[command(subcommand)]
         cmd: MailCmd,
     },
+    /// Auto-wire the toron MCP server into the agent MCP configs
+    /// (opencode ~/.config/opencode/opencode.json, pi ~/.pi/agent/mcp.json,
+    /// grok ~/.grok/config.toml). Idempotent — re-running only updates the
+    /// toron entry, never clobbers other servers. (Moved here from the retired
+    /// `flywheel toron` demo surface; same args and behavior.)
+    #[command(name = "setup-mcp")]
+    SetupMcp {
+        /// toron MCP server URL (default http://127.0.0.1:18080/mcp)
+        #[arg(long)]
+        url: Option<String>,
+        /// which agents to wire: opencode,pi,grok (comma-sep; default all)
+        #[arg(long, default_value = "opencode,pi,grok")]
+        agents: String,
+        /// also boot a toron serve --mcp-http <port> daemon (needs the toron
+        /// binary on PATH and TORON_OPERATOR_KEY / TORON_KEY_PASSPHRASE set)
+        #[arg(long, default_value_t = 0)]
+        boot_port: u16,
+        /// print what would change without touching any file
+        #[arg(long)]
+        dry_run: bool,
+        /// also point flywheel's OWN mail backend at the same toron URL
+        /// (writes `[mail.toron] url` in the flywheel config.toml, so flywheel
+        /// + all agents share one mailbox)
+        #[arg(long)]
+        flywheel: bool,
+    },
     /// ask a peer a question over mail and wait for the in-thread reply
     /// (the real-time collab primitive: send urgent + block for the answer)
     Collab {
@@ -1386,26 +1406,6 @@ enum Commands {
     },
     /// Aggregate counters over the event log
     Analytics { project: String },
-    /// Spawn squads (legacy name: recipes) — prefer `flywheel squad`
-    Recipes {
-        #[command(subcommand)]
-        cmd: AssetCmd,
-    },
-    /// Named prompt sequences (daily loop etc.)
-    Workflows {
-        #[command(subcommand)]
-        cmd: AssetCmd,
-    },
-    /// Ordered multi-workflow runs
-    Pipeline {
-        #[command(subcommand)]
-        cmd: AssetCmd,
-    },
-    /// Templates (legacy alias of the squad surface)
-    Template {
-        #[command(subcommand)]
-        cmd: AssetCmd,
-    },
     /// Stage prompts (ADR-0005 P3.3): list semantic names + p-code aliases
     Stage {
         #[command(subcommand)]
@@ -1470,7 +1470,7 @@ enum Commands {
     /// Vocabulary: say "squad" here. A compose token (`wave-swarm`,
     /// `repair-until-verified`, `beads-lifecycle`) is a bare `--parts` name on
     /// `workflow compose … --parts <token> --run` — not a squad.
-    /// `recipes`/`template` stay as legacy aliases of this surface.
+    /// `recipes`/`template` were removed; say "squad" here.
     Squad {
         #[command(subcommand)]
         cmd: SquadCmd,
@@ -1631,11 +1631,6 @@ enum Commands {
     Serve {
         #[arg(long, default_value_t = crate::daemon::SERVE_PORT_DEFAULT)]
         port: u16,
-    },
-    /// In-process toron mailbox/MCP integration (ADR-0003 Decision 3A, bd-o8j.1)
-    Toron {
-        #[command(subcommand)]
-        cmd: ToronCmd,
     },
     /// Preflight: verify all prerequisites for a fleet operation before
     /// dispatching. Catches environment/dependency failures in <1s instead
@@ -2858,8 +2853,7 @@ fn log(project: &str, kind: EventKind, data: Value) {
 
 fn main() {
     let raw: Vec<String> = std::env::args().collect();
-    let rewritten = rewrite_legacy_loop_args(&raw);
-    let cli = Cli::parse_from(&rewritten);
+    let cli = Cli::parse_from(&raw);
 
     if cli.robot_capabilities {
         print_json(&json!({
@@ -2874,7 +2868,7 @@ fn main() {
             "captain watch <project> [--interval N] [--json] [--as <pin>] [--stall --stall-minutes N] [--preflight --preflight-mode steer|loop|workflow|cron] (bd-captain-watch-poll-exit-bbwm: harness resume on the captain inbox. The push is escalate@1 mail from the supervisor. This command blocks on that inbox's water and exits with a preview when strictly-newer mail lands; --stall also exits 0 when every bead is closed, or exits 3 when no pane is working and no commit landed for the threshold with work remaining; an unreadable fleet never alarms; --preflight adds an arm that exits 4 with the FIRST failing check and its remedy line, checked at arm time and each poll. One shot: re-arm after each resume)",
             "captain directory <project> [--json] (ADR-0019 D2/D4: read-only sessions, tiers, and per-pin addressability — ok <key> or err <code> — from the pure directory projection over an explicitly selected rex backend; never auto/hc on this path)",
             "captain approve <project> --request-key <key> --decision approve|deny [--note <text>] --as <operator-pin> (ADR-0019 D10: verify the operator via whois, mail the asker the 4-line body, fetch-back verify, rehash the payload, run it or settle denied; missing row, self-approval, or unverified sender is approval_mismatch, never a dispatch)",
-            "loop-mode (alias: loop) run (--resume replays a killed run's checkpoints; default is FRESH) / supervise (child-process --once pass cadence, stops after 3 consecutive failures; a dead-stop probe each pass emits ONE loud escalation + one captain page when no pane is working and no commit landed for --stall-minutes, default 45, with work remaining — a recovering fleet clears it without a second; bd-pane-wedge-detect-respawn-pnyi: a per-pane wedge probe reads each registered pin's pane tail + process liveness and pages ONCE per wedge naming the pin, the pane, and the parked error line, cleared when a commit lands — hc exposes no CPU counter, so zero-CPU is read as its observable equivalent, process still alive + nothing moved) / status/list/prune/doctor/replay/why work assign collab xproj mail toron steer ledger principles artifacts judgment",
+            "loop-mode run (--resume replays a killed run's checkpoints; default is FRESH) / supervise (child-process --once pass cadence, stops after 3 consecutive failures; a dead-stop probe each pass emits ONE loud escalation + one captain page when no pane is working and no commit landed for --stall-minutes, default 45, with work remaining — a recovering fleet clears it without a second; bd-pane-wedge-detect-respawn-pnyi: a per-pane wedge probe reads each registered pin's pane tail + process liveness and pages ONCE per wedge naming the pin, the pane, and the parked error line, cleared when a commit lands — hc exposes no CPU counter, so zero-CPU is read as its observable equivalent, process still alive + nothing moved) / status/list/prune/doctor/replay/why work assign collab xproj mail steer ledger principles artifacts judgment",
                 "artifacts <run_id> [--json] + artifacts stitch <run_id> (state-dir per-run records, stitch_artifacts at artifact.rs:233)",
                 "upstream parity (embedded in --robot-capabilities; offline manifest: docs/upstream-parity.toml)",
             "doorbell status/start/stop/re-inject/afk/why/roster/introduce (supervised pane-wake layer: lazy-heal + persisted wake state; afk batches captain-relevant wakes; roster is nearby panes+pins+reservations; introduce is contact+channel+subscribe)",
@@ -3407,6 +3401,13 @@ fn main() {
             msg,
         }) => cmd_assign(&cfg, project, to, beads, msg.as_deref()),
         Some(Commands::Mail { cmd }) => cmd_mail(&cfg, cmd),
+        Some(Commands::SetupMcp {
+            url,
+            agents,
+            boot_port,
+            dry_run,
+            flywheel,
+        }) => toron_setup_mcp(url.as_deref(), agents, *boot_port, *dry_run, *flywheel),
         Some(Commands::Collab {
             project,
             to,
@@ -3432,10 +3433,6 @@ fn main() {
         Some(Commands::Changes { project, since }) => cmd_changes(&cfg, project, *since),
         Some(Commands::Resume { project, recipe }) => cmd_resume(&cfg, project, recipe.as_deref()),
         Some(Commands::Analytics { project }) => cmd_analytics(project),
-        Some(Commands::Recipes { cmd }) => cmd_asset(&cfg, "recipes", cmd),
-        Some(Commands::Workflows { cmd }) => cmd_asset(&cfg, "workflows", cmd),
-        Some(Commands::Pipeline { cmd }) => cmd_asset(&cfg, "pipeline", cmd),
-        Some(Commands::Template { cmd }) => cmd_asset(&cfg, "template", cmd),
         Some(Commands::Stage { cmd }) => cmd_stage(&cfg, cmd),
         Some(Commands::Ensemble {
             project,
@@ -3559,7 +3556,6 @@ fn main() {
         #[cfg(feature = "serve")]
         Some(Commands::Daemon { cmd }) => cmd_daemon(&cfg, cmd),
         Some(Commands::Serve { port }) => cmd_serve(&cfg, *port),
-        Some(Commands::Toron { cmd }) => cmd_toron(&cfg, cmd),
         Some(Commands::Preflight {
             mode,
             project,
@@ -22514,25 +22510,6 @@ fn step_label(step: &WorkflowStep) -> String {
     }
 }
 
-fn run_pipeline(cfg: &Config, project: &str, name: &str) -> Result<()> {
-    let pipelines = config::Pipelines::load()?;
-    let steps = pipelines
-        .pipelines
-        .get(name)
-        .ok_or_else(|| anyhow!("pipeline not found: {name} (flywheel pipeline list)"))?;
-    let workflows = config::Workflows::load()?;
-    for (i, wf) in steps.iter().enumerate() {
-        if !workflows.workflows.contains_key(wf) {
-            bail!("pipeline {name} step {}: workflow {wf:?} not found", i + 1);
-        }
-        println!("[{}/{}] workflow {}", i + 1, steps.len(), dim(wf));
-        run_workflow(cfg, project, wf)?;
-    }
-    log(project, EventKind::Pipeline, json!({ "pipeline": name }));
-    println!("pipeline {name} complete");
-    Ok(())
-}
-
 fn cmd_ensemble(cfg: &Config, project: &str, recipe: &str, workflow: &str) -> Result<()> {
     cmd_spawn(
         cfg,
@@ -24476,54 +24453,6 @@ mod loop_tests {
         );
     }
 
-    /// bd-loop-mode-rename-0tqy: the clap subcommand is `loop-mode` with a
-    /// back-compat visible alias `loop` — harness built-in `loop` conflicts
-    /// with the old name, so the primary name moves and scripts keep working.
-    #[test]
-    fn loop_subcommand_is_loop_mode_with_loop_alias() {
-        use clap::CommandFactory;
-        let handle = std::thread::Builder::new()
-            .stack_size(256 * 1024 * 1024)
-            .spawn(move || {
-                let cmd = Cli::command();
-                let lm = cmd
-                    .find_subcommand("loop-mode")
-                    .expect("loop-mode subcommand exists");
-                assert!(
-                    lm.get_visible_aliases().any(|a| a == "loop"),
-                    "visible alias 'loop' keeps existing scripts working"
-                );
-                assert!(
-                    !cmd.get_subcommands().any(|s| s.get_name() == "loop"),
-                    "'loop' must be an alias, never the primary name"
-                );
-            })
-            .expect("spawn briefing probe");
-        handle.join().expect("probe thread");
-    }
-
-    /// bd-loop-mode-rename-0tqy: the legacy bare form (`flywheel loop <proj>`
-    /// → `run`) rewrites under BOTH names.
-    #[test]
-    fn rewrite_legacy_loop_args_handles_loop_mode_name() {
-        let args = vec![
-            "flywheel".to_string(),
-            "loop-mode".to_string(),
-            "toron".to_string(),
-        ];
-        assert_eq!(
-            rewrite_legacy_loop_args(&args),
-            vec!["flywheel", "loop-mode", "run", "toron"]
-        );
-        let explicit = vec![
-            "flywheel".to_string(),
-            "loop-mode".to_string(),
-            "run".to_string(),
-            "toron".to_string(),
-        ];
-        assert_eq!(rewrite_legacy_loop_args(&explicit), explicit);
-    }
-
     fn st(name: &str, s: AgentStatus) -> durable::AgentState {
         durable::AgentState {
             name: name.to_string(),
@@ -25509,48 +25438,6 @@ esac
         assert!(!changed, "already a slug");
         let (s, _) = slugify_label("!!!");
         assert_eq!(s, "", "no alphanumerics -> empty (caller rejects)");
-    }
-
-    #[test]
-    fn legacy_loop_project_rewritten_to_run() {
-        let args = vec![
-            "flywheel".to_string(),
-            "loop".to_string(),
-            "toron".to_string(),
-            "--work".to_string(),
-        ];
-        let out = rewrite_legacy_loop_args(&args);
-        assert_eq!(out, vec!["flywheel", "loop", "run", "toron", "--work"]);
-    }
-
-    #[test]
-    fn legacy_loop_help_keeps_parent_context() {
-        let args = vec![
-            "flywheel".to_string(),
-            "loop".to_string(),
-            "--help".to_string(),
-        ];
-        assert_eq!(rewrite_legacy_loop_args(&args), args);
-        let args = vec!["flywheel".to_string(), "loop".to_string(), "-h".to_string()];
-        assert_eq!(rewrite_legacy_loop_args(&args), args);
-    }
-
-    #[test]
-    fn canonical_loop_subcommands_untouched() {
-        for sub in ["run", "status", "list", "prune"] {
-            let args = vec!["flywheel".to_string(), "loop".to_string(), sub.to_string()];
-            assert_eq!(rewrite_legacy_loop_args(&args), args, "{sub}");
-        }
-    }
-
-    #[test]
-    fn non_loop_commands_untouched() {
-        let args = vec![
-            "flywheel".to_string(),
-            "send".to_string(),
-            "toron".to_string(),
-        ];
-        assert_eq!(rewrite_legacy_loop_args(&args), args);
     }
 
     #[test]
@@ -26557,6 +26444,25 @@ fn setup_flywheel_backend(url: &str, dry: bool) -> Result<String> {
     }
     std::fs::write(&path, lines.join("\n") + "\n")?;
     Ok(format!("flywheel backend {action}"))
+}
+
+#[cfg(test)]
+mod setup_mcp_tests {
+    use super::*;
+
+    /// `flywheel setup-mcp --dry-run` wires nothing: all three agent upserts
+    /// run in observation mode, no boot, no flywheel config write.
+    #[test]
+    fn setup_mcp_dry_run_reports_without_writing() {
+        toron_setup_mcp(
+            Some("http://127.0.0.1:18080/mcp"),
+            "opencode,pi,grok",
+            0,
+            true,
+            false,
+        )
+        .expect("dry run never fails");
+    }
 }
 
 #[cfg(test)]

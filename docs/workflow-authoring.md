@@ -87,8 +87,8 @@ loud WARNING naming the downgrade; it bails only when no role pane exists either
 
 ## 2. Recipes / Squads — a group of profiles
 
-A **squad** is a named `{profile: count}` map. The legacy `Recipe{oc,pi,gk}` is a squad alias
-(`flywheel recipes list` still works).
+A **squad** is a named `{profile: count}` map. Legacy `Recipe{oc,pi,gk}` names
+resolve through squads (`flywheel squad list` shows recipes.toml aliases too).
 
 ```bash
 # List compiled-in + recipes.toml aliases

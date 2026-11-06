@@ -406,7 +406,7 @@ fn loop_dispatch_surface_has_zero_worktree_creates() {
 #[test]
 fn allow_worktree_flag_is_exposed_on_run_surfaces() {
     for sub in [
-        vec!["loop", "run", "--help"],
+        vec!["loop-mode", "run", "--help"],
         vec!["workflow", "run", "--execute", "--help"],
     ] {
         let out = Command::new(flywheel())
@@ -494,7 +494,14 @@ fn linked_worktree_gates_loop_run_until_operator_optout() {
     let ws = plane_workspace_create(&label, &project);
 
     let out = Command::new(flywheel())
-        .args(["loop", "run", &project, "--once", "--timeout-ms", "8000"])
+        .args([
+            "loop-mode",
+            "run",
+            &project,
+            "--once",
+            "--timeout-ms",
+            "8000",
+        ])
         .output()
         .expect("loop run without optout");
     assert!(
@@ -514,7 +521,7 @@ fn linked_worktree_gates_loop_run_until_operator_optout() {
 
     let out = Command::new(flywheel())
         .args([
-            "loop",
+            "loop-mode",
             "run",
             &project,
             "--once",

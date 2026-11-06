@@ -3,7 +3,6 @@
 
 pub(crate) mod agent;
 pub(crate) mod artifacts;
-pub(crate) mod asset;
 pub(crate) mod backend;
 pub(crate) mod captain;
 pub(crate) mod checkpoint;
@@ -28,7 +27,6 @@ pub(crate) mod slot;
 pub(crate) mod squad;
 pub(crate) mod stage;
 pub(crate) mod standing_orders;
-pub(crate) mod toron;
 pub(crate) mod work;
 pub(crate) mod workflow;
 pub(crate) mod worktree;
@@ -36,7 +34,6 @@ pub(crate) mod xproj;
 
 pub(crate) use agent::{AgentCmd, cmd_agent};
 pub(crate) use artifacts::ArtifactsCmd;
-pub(crate) use asset::{AssetCmd, cmd_asset};
 pub(crate) use backend::{BackendCmd, cmd_backend};
 pub(crate) use captain::{CaptainCmd, cmd_captain};
 pub(crate) use checkpoint::{CheckpointCmd, cmd_checkpoint};
@@ -67,7 +64,6 @@ pub(crate) use slot::{SlotCmd, cmd_slot};
 pub(crate) use squad::SquadCmd;
 pub(crate) use stage::{StageCmd, cmd_stage};
 pub(crate) use standing_orders::{StandingOrdersCmd, cmd_standing_orders};
-pub(crate) use toron::{ToronCmd, ToronMailCmd, cmd_toron};
 pub(crate) use work::{WorkCmd, cmd_work};
 pub(crate) use workflow::WorkflowCmd;
 pub(crate) use worktree::{WorktreeCmd, cmd_worktree};

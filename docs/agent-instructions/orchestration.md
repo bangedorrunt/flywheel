@@ -6,7 +6,7 @@ Authoring: [docs/workflow-authoring.md](../workflow-authoring.md).
 | Noun | Command |
 |------|---------|
 | profile | `flywheel profile {list,show,create,edit,run,remove}` — 6 built-ins (oracle/planner/reviewer/coder/scout/housekeeper) |
-| squad | `flywheel squad {list,show,spawn,remove}` (`recipes list` alias) |
+| squad | `flywheel squad {list,show,spawn,remove}` |
 | workflow | `flywheel workflow {list,show,lint,run,new,history,crew,compose,remove,seed,drift}` — catalog reads and runs take `--project` where applicable and resolve built-ins < user < project tiers; `seed` and `drift` inspect the user tier |
 | cron | `flywheel cron {lint,run,list,show,pause,resume,status,history,start,remove}` — distinct YAML type |
 | model | `flywheel model {list,show,add,remove}` |
@@ -80,8 +80,8 @@ A **stage** is one prompt (`send --stage`). The verify-phase `ce-evaluate`
 stage is advisory and structured; the following host `VerifySink` owns the
 verdict. A **compose token** (`wave-swarm`, `repair-until-verified`) expands to a compiled-in
 workflow when used as a bare `--parts` name. A **profile** is role →
-harness/model; `crew: auto` counts `@roles`. `flywheel squad` /
-`recipes list` is a group of profiles (spawn shape) — say "squad," not
+harness/model; `crew: auto` counts `@roles`. `flywheel squad`
+is a group of profiles (spawn shape) — say "squad," not
 "compose token."
 
 **What a compose token is:** a bare name legal in

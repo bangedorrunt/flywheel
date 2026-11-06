@@ -29,7 +29,7 @@ These five nouns are not interchangeable.
 | **profile** | A role template: harness + model + behavior + skills. `spawn --profile coder`. `crew: auto` counts the `@roles` the workflow named. | Not what makes a compose token. N panes = how many roles were named, each with that profile's default harness. |
 | **topology** | How work is supervised: loop / swarm / open. | Not Workflow YAML. "Loop workflow" is forbidden speech. |
 
-`flywheel squad` / `recipes list` is a group of profiles (spawn shape). That is a different use of the word recipe.
+`flywheel squad` is a group of profiles (spawn shape). That is a different use of the word recipe.
 
 ## Install
 
@@ -131,8 +131,8 @@ VERIFY. The planner is a total reducer — `tick(&LoopModel, &LoopMsg) →
 (LoopModel, Vec<LoopAction>)` — pure, journal-backed, and replayable:
 
 ```bash
-flywheel loop replay <project>   # re-drive recorded facts, assert identical actions
-flywheel loop why <seq>          # inspect one decision: msg → state delta → actions
+flywheel loop-mode replay <project>   # re-drive recorded facts, assert identical actions
+flywheel loop-mode why <seq>          # inspect one decision: msg → state delta → actions
 ```
 
 Facts that drive the reducer:
@@ -302,9 +302,9 @@ Poll cadence: `--interval N` (default 300) settled; `--interval-active N`
 (default 30, floor 5) while anyone works or right after a dispatch. Blocked
 alerts land within one active interval.
 
-## Command map (legacy aliases)
+## Command map
 
-`flywheel loop run` still works as an alias for `loop-mode run`. Stages
+Stages
 resolve by semantic name only (`fresh-eyes-explore`, `ce-execute` — p-codes
 retired, ADR-0009). `send --stage NAME --param k=v` substitutes template
 slots; a missing required slot exits naming it.

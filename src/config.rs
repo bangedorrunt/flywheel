@@ -874,24 +874,6 @@ impl Workflows {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Pipelines {
-    #[serde(flatten)]
-    pub pipelines: BTreeMap<String, Vec<String>>,
-}
-
-impl Pipelines {
-    pub fn load() -> Result<Self> {
-        let path = config_dir().join("pipelines.toml");
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let raw =
-            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))
-    }
-}
-
 // ---- policy (safety) ----
 
 /// Destructive-command guard: deny patterns checked against send messages.

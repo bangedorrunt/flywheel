@@ -467,7 +467,7 @@ fn captain_triggers_spawn_loop_and_integration_exist() {
     let exe = flywheel();
     for (args, needle) in [
         (["spawn", "--help"].as_slice(), "profile"),
-        (["loop", "--help"].as_slice(), "work"),
+        (["loop-mode", "--help"].as_slice(), "work"),
         (["integration", "--help"].as_slice(), "kind"),
     ] {
         let out = Command::new(exe).args(args).output().expect("help");

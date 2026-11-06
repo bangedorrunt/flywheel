@@ -412,7 +412,7 @@ flywheel runs list | show <id> | digest
 flywheel arrive <project> --as <pin>
 flywheel briefing "<goal>" --project <p> --json   # decide is the leaf inside
 flywheel steer "<objective>" [--direct]
-flywheel loop run <project> --work
+flywheel loop-mode run <project> --work
 ```
 
 SHIPPED: `phase:` in specs; `stage {list,show,new,lint,promote}` + stage-first parts;

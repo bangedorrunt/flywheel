@@ -6,9 +6,7 @@ use clap::Subcommand;
 /// restructure): `run` (default), `status`, `list`, `prune`.
 #[derive(Subcommand)]
 pub(crate) enum LoopCmd {
-    /// Run the monitoring loop for a project (default subcommand — the bare
-    /// legacy form `flywheel loop <project>` is rewritten to this before
-    /// parsing, so both spellings work).
+    /// Run the monitoring loop for a project.
     Run {
         project: String,
         /// poll interval in seconds (default 300 = 5 min); the SETTLED/base
