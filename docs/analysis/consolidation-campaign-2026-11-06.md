@@ -171,6 +171,8 @@ Live matrix (all against the installed binaries):
 | doorbell host | supervised host runs `~/.cargo/bin/flywheel __doorbell`; `doorbell/<ws>.gen` hash == installed binary; `/health.degraded == []` |
 | hc plane wake | `FLYWHEEL_BACKEND=hc flywheel spawn <scratch> --pi 1` → pane `t1p`; a high mail to the pin made the hc pane print `[doorbell] plane-P urgent. Pull: toron next` (typed through the hc backend) |
 | hc workspace lookup | after `HcBackend::workspace_list` groups terminals by root and the basename-slug alias, `FLYWHEEL_BACKEND=hc flywheel status <scratch>` resolves `workspace_id: hc:t1r` |
+| hc steering | `FLYWHEEL_BACKEND=hc flywheel send … --to GentleStream --fire-and-forget` typed the prompt into the hc pane (`hc read` showed it) and the peer replied `hc-ok`; the fix prompts by pane address because hc's `AgentInfo.name` is a label-stamped mail name, not a terminal name |
+| flywheel clean export | `git archive HEAD` + sibling `toron`/`elm-effect-rs` symlinks → 2714 bin tests passed, 0 failed; **36** `test result: ok` targets, **0** failed (HEAD `68ec3bb4`) |
 
 ### Residuals found by this pass (exact)
 
