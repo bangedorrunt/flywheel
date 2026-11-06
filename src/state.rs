@@ -682,25 +682,23 @@ pub fn remove_expected_reply(project: &str, agent: &str, thread: &str) -> Result
 /// REMOVES the alias so both spellings can never diverge again. Rows are
 /// never dropped while a pane binding is only known to one side — losing a
 /// pinned mail identity is the exact failure this bead exists to kill.
-fn fold_legacy_alias(
-    project: &str,
-    canonical_key: &str,
-    current: Vec<SpawnEntry>,
-) -> Vec<SpawnEntry> {
-    let legacy_key = state_key(project);
-    if legacy_key == canonical_key {
-        return current;
+fn fold_alias_file(canonical_key: &str, alias_key: &str, merged: &mut Vec<SpawnEntry>) -> bool {
+    if alias_key == canonical_key {
+        return false;
     }
-    let legacy_path = agents_dir().join(format!("{}.json", legacy_key));
-    let Ok(raw) = std::fs::read_to_string(&legacy_path) else {
-        return current;
+    let alias_path = agents_dir().join(format!("{}.json", alias_key));
+    let Ok(raw) = std::fs::read_to_string(&alias_path) else {
+        return false;
     };
-    let legacy_rows: Vec<SpawnEntry> = parse_spawn_registry_lenient(&legacy_path, &raw);
-    let seen: std::collections::HashSet<String> =
-        current.iter().map(|e| e.pane_id.clone()).collect();
-    let mut merged = current;
-    for row in legacy_rows {
-        if !seen.contains(&row.pane_id) {
+    let rows: Vec<SpawnEntry> = parse_spawn_registry_lenient(&alias_path, &raw);
+    if rows.is_empty() {
+        let _ = std::fs::remove_file(&alias_path);
+        return true;
+    }
+    let mut seen: std::collections::HashSet<String> =
+        merged.iter().map(|e| e.pane_id.clone()).collect();
+    for row in rows {
+        if seen.insert(row.pane_id.clone()) {
             merged.push(row);
         }
     }
@@ -710,8 +708,44 @@ fn fold_legacy_alias(
             .unwrap_or_else(|_| "[]".into())
             .as_bytes(),
     );
-    let _ = std::fs::remove_file(&legacy_path);
+    let _ = std::fs::remove_file(&alias_path);
+    true
+}
+
+fn fold_legacy_alias(
+    project: &str,
+    canonical_key: &str,
+    current: Vec<SpawnEntry>,
+) -> Vec<SpawnEntry> {
+    // bd-hc-registry-recover-ywypf: ONE key per project. Writers once
+    // resolved bare names to absolute dirs before keying, leaving a scoped
+    // `<base>-<hash>.json` orphan beside the plain `<project>.json`.
+    // Fold every known alias spelling into canonical (pane_id-keyed,
+    // canonical wins on conflict) and remove the alias so two live
+    // spellings can never diverge again.
+    let mut merged = current;
+    let legacy_key = state_key(project);
+    fold_alias_file(canonical_key, &legacy_key, &mut merged);
+    // Scoped alias from the absolute dir spelling (the old writer's key).
+    let scoped_abs = project_dir_hint(project).to_string_lossy().into_owned();
+    let scoped_key = state_key(&scoped_abs);
+    if scoped_key != legacy_key {
+        fold_alias_file(canonical_key, &scoped_key, &mut merged);
+    }
+    // Dedupe by pane: one row per pane, last wins is handled by callers;
+    // here collapse exact duplicates so a double-written pane never
+    // yields two rows for one pane after a fold.
+    let mut last_pane: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for (i, e) in merged.iter().enumerate() {
+        last_pane.insert(e.pane_id.clone(), i);
+    }
     merged
+        .into_iter()
+        .enumerate()
+        .filter(|(i, e)| last_pane.get(&e.pane_id) == Some(i))
+        .map(|(_, e)| e)
+        .collect()
 }
 
 /// Atomically persist the project's pane→name registry.
@@ -3603,6 +3637,47 @@ mod loops_sidecar_tests {
         );
         let path = spawn_registry_file(&p);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// bd-hc-registry-recover-ywypf: ONE key per project — duplicate pane
+    /// rows collapse to one, and a scoped `<base>-<hash>` orphan folds into
+    /// canonical on load (single live file after).
+    #[test]
+    fn registry_single_key_duplicate_collapse() {
+        let _g = loops_test_guard();
+        let p = test_project("reg-single-key");
+        let dup = vec![
+            SpawnEntry::legacy("wX:p1", "flywheel-reg-single-oc"),
+            SpawnEntry::legacy("wX:p1", "flywheel-reg-single-oc"),
+        ];
+        save_spawn_registry(&p, &dup).unwrap();
+        let loaded = load_spawn_registry(&p);
+        assert_eq!(
+            loaded.len(),
+            1,
+            "two rows for one pane must collapse to one, got {loaded:?}"
+        );
+        assert_eq!(loaded[0].pane_id, "wX:p1");
+        // Scoped orphan (old absolute-path writer key) folds into canonical.
+        let scoped_abs = project_dir_hint(&p).to_string_lossy().into_owned();
+        let scoped_key = state_key(&scoped_abs);
+        let canonical_key = spawn_registry_key(&p);
+        if scoped_key != canonical_key {
+            let scoped_path = agents_dir().join(format!("{scoped_key}.json"));
+            std::fs::create_dir_all(agents_dir()).unwrap();
+            let orphan = vec![SpawnEntry::legacy("wX:p9", "flywheel-reg-single-pi")];
+            std::fs::write(&scoped_path, serde_json::to_string(&orphan).unwrap()).unwrap();
+            let folded = load_spawn_registry(&p);
+            assert!(
+                folded.iter().any(|e| e.pane_id == "wX:p9"),
+                "scoped orphan must fold into canonical, got {folded:?}"
+            );
+            assert!(
+                !scoped_path.exists(),
+                "fold must remove the alias — two live spellings is the defect"
+            );
+        }
+        let _ = std::fs::remove_file(spawn_registry_file(&p));
     }
 
     #[test]

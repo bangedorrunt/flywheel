@@ -1024,7 +1024,14 @@ enum Commands {
     /// registered agent, restore the name binding if the pane survived, or
     /// respawn the agent if it died. The durable loop self-heals on its own;
     /// this is the CLI supervision counterpart.
-    Recover { project: String },
+    /// bd-hc-registry-recover-ywypf: never respawn the captain pin by default
+    /// (a duplicate idle captain pane was created); pass --include-captain
+    /// for the deliberate case.
+    Recover {
+        project: String,
+        #[arg(long)]
+        include_captain: bool,
+    },
     /// Send a prompt to one or more agents (with optional wait)
     Send {
         project: String,
@@ -2404,13 +2411,47 @@ fn resolve_agents(c: &mut Client, ws_id: &str, project: &str, to: &str) -> Resul
 /// (they're hc-specific and don't need backend-agnosticism yet — migrating
 /// them is churn with no payoff until superlogical ships). The two overloads
 /// share the helper bodies via macros-free duplication (small, narrow).
+/// bd-hc-registry-recover-ywypf: hc applies terminal labels asynchronously —
+/// a `workspace_list` snapshot right after spawn can carry empty labels, so
+/// an immediate "no swarm" is a race, not a fact. Refresh once after a
+/// short settle before concluding the swarm is absent.
+/// bd-hc-registry-recover-ywypf: pure decision for the async-label retry —
+/// retry only when the snapshot carries no labels at all (fresh spawn
+/// window), never on a populated list. Pure for testability; the sleep
+/// stays in the caller.
+fn should_retry_workspace_labels(first: &[hc::WorkspaceInfo]) -> bool {
+    !first.iter().any(|ws| !ws.label.is_empty())
+}
+
+fn workspace_list_settled(
+    backend: &dyn backend::MultiplexerBackend,
+) -> Result<Vec<hc::WorkspaceInfo>> {
+    let first = backend.workspace_list()?;
+    if !should_retry_workspace_labels(&first) {
+        return Ok(first);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(750));
+    Ok(backend.workspace_list()?)
+}
+
+/// bd-hc-registry-recover-ywypf: pure captain-pin match — mail identity,
+/// registry name, or terminal-mail spelling. Pure for testability.
+fn is_captain_entry(entry: &state::SpawnEntry, captain_pin: Option<&str>) -> bool {
+    let Some(pin) = captain_pin else {
+        return false;
+    };
+    entry.mail_identity.as_deref() == Some(pin)
+        || entry.name == *pin
+        || terminal_mail_name(&entry.name) == pin
+}
+
 pub(crate) fn find_workspace_dyn(
     backend: &dyn backend::MultiplexerBackend,
     project: &str,
 ) -> Result<String> {
     let meta = state::load_spawn_meta(project);
     let aliases = workspace_label_aliases(project, meta.as_deref());
-    let ws_list = backend.workspace_list()?;
+    let ws_list = workspace_list_settled(backend)?;
     let exact: Vec<hc::WorkspaceInfo> = ws_list
         .iter()
         .filter(|ws| aliases.iter().any(|a| a == &ws.label))
@@ -2472,8 +2513,7 @@ pub(crate) fn find_workspaces_dyn(
     project: &str,
 ) -> Result<Vec<hc::WorkspaceInfo>> {
     let meta = state::load_spawn_meta(project);
-    let matches: Vec<hc::WorkspaceInfo> = backend
-        .workspace_list()?
+    let matches: Vec<hc::WorkspaceInfo> = workspace_list_settled(backend)?
         .into_iter()
         .filter(|ws| workspace_label_is_owned(project, &ws.label, meta.as_deref()))
         .collect();
@@ -3106,7 +3146,10 @@ fn main() {
             harness.as_deref(),
             note.as_deref(),
         ),
-        Some(Commands::Recover { project }) => cmd_recover(&cfg, project),
+        Some(Commands::Recover {
+            project,
+            include_captain,
+        }) => cmd_recover(&cfg, project, *include_captain),
         Some(Commands::Send {
             project,
             msg,
@@ -8312,6 +8355,53 @@ mod terminal_agent_name_tests {
     }
 }
 
+/// bd-hc-registry-recover-ywypf: label-missing retry + captain skip.
+#[cfg(test)]
+mod hc_registry_recover_tests {
+    use super::{is_captain_entry, should_retry_workspace_labels};
+    use crate::state::SpawnEntry;
+
+    fn ws(label: &str) -> crate::hc::WorkspaceInfo {
+        crate::hc::WorkspaceInfo {
+            workspace_id: "w1".to_string(),
+            number: 1,
+            label: label.to_string(),
+            focused: false,
+            pane_count: 1,
+            tab_count: 1,
+            active_tab_id: "t1".to_string(),
+            agent_status: crate::hc::AgentStatus::Idle,
+            cwd: None,
+        }
+    }
+
+    /// Retry only on the all-empty-labels window (fresh spawn race).
+    #[test]
+    fn recover_label_retry_settles_transient_miss() {
+        assert!(should_retry_workspace_labels(&[]));
+        assert!(should_retry_workspace_labels(&[ws(""), ws("")]));
+        assert!(!should_retry_workspace_labels(&[
+            ws(""),
+            ws("flywheel-foo")
+        ]));
+        assert!(!should_retry_workspace_labels(&[ws("flywheel-foo")]));
+    }
+
+    /// Captain pin matches by mail identity, registry name, or terminal
+    /// spelling; otherwise it is a crew row. Never respawn by default.
+    #[test]
+    fn recover_captain_skip_by_default() {
+        let captain = "AmberHarbor";
+        let by_identity = SpawnEntry::with_mail_identity("w1:p1", "flywheel-foo-oc", captain);
+        assert!(is_captain_entry(&by_identity, Some(captain)));
+        let by_name = SpawnEntry::legacy("w1:p2", captain);
+        assert!(is_captain_entry(&by_name, Some(captain)));
+        let crew = SpawnEntry::with_mail_identity("w1:p3", "flywheel-foo-oc", "TanLion");
+        assert!(!is_captain_entry(&crew, Some(captain)));
+        assert!(!is_captain_entry(&crew, None));
+    }
+}
+
 /// The legacy whitelist pair for a hash: ADJECTIVES[h % 75] +
 /// NOUNS[(h >> 32) % 132], PascalCase. This is the pair shape agent-mail
 /// validates (bd-odc) — the "legacy generator" the captain's adj+noun pins
@@ -10327,7 +10417,10 @@ enum RecoverDecision<'a> {
 /// the foreground-group check. Alive agents are additionally probed for
 /// responsiveness (state_change_seq advancing across a window); a frozen +
 /// idle agent is respawned, not classified healthy.
-fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
+fn cmd_recover(cfg: &Config, project: &str, include_captain: bool) -> Result<()> {
+    // bd-hc-registry-recover-ywypf: never respawn the captain pin by default
+    // (a duplicate idle captain pane was created). Skip captain rows unless
+    // --include-captain is passed for the deliberate case; report the skip.
     check_project_spelling(project, "recover")?;
     let backend = backend::multiplexer_backend(cfg)?;
     let ws_id = find_workspace_dyn(&*backend, project)?;
@@ -10358,7 +10451,25 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
             .is_none_or(|ps| ps.iter().any(|p| p.pane_id == id))
     };
     let mut moved: Vec<(String, String)> = Vec::new();
+    // bd-hc-registry-recover-ywypf: captain pin is the operator identity
+    // (cfg agent_mail.name) or the saved captain alias; never respawn it by
+    // default — a duplicate idle captain pane was created. --include-captain
+    // opts into the deliberate case.
+    let captain_pin: Option<String> = cfg
+        .agent_mail
+        .as_ref()
+        .and_then(|m| m.name.clone())
+        .or_else(|| state::load_captain_alias(project));
+    let mut skipped_captain: Vec<String> = Vec::new();
     for entry in &entries {
+        if !include_captain && is_captain_entry(entry, captain_pin.as_deref()) {
+            skipped_captain.push(entry.name.clone());
+            eprintln!(
+                "flywheel: recover {project}: skipping captain pin {} (pass --include-captain to respawn)",
+                entry.name
+            );
+            continue;
+        }
         let (pane_id, name) = (&entry.pane_id, &entry.name);
         let hname = terminal_agent_name(name);
         let kind = recover_probe_kind(entry, &kinds);
@@ -10456,6 +10567,8 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
         "healthy": healthy,
         "recovered": recovered.len(),
         "details": recovered,
+        "skipped_captain": skipped_captain.len(),
+        "skipped_captain_names": skipped_captain,
     }));
     let exe = std::env::current_exe()?;
     ensure_doorbell_supervisor();
@@ -14848,7 +14961,11 @@ fn cmd_loop(
                 }
                 durable::LoopAction::Send { name, text }
                 | durable::LoopAction::DispatchImmediate { name, text } => {
-                    let agent_profile = state::load_spawn_registry(&project_dir_str(cfg, project)?)
+                    // bd-hc-registry-recover-ywypf: ONE key per project — read
+                    // the registry under the bare project spelling, never the
+                    // absolute dir (which hashes to `<base>-<hash>` and splits
+                    // the fleet from writers using the bare key).
+                    let agent_profile = state::load_spawn_registry(project)
                         .into_iter()
                         .find(|e| e.name == *name)
                         .and_then(|e| e.profile)
@@ -17209,27 +17326,27 @@ fn prime_profile_identity(
 /// and `squad spawn` so `__send --profile` and loop conditioning resolve
 /// the agent's profile (bd-gsvn.1). Best-effort — a registry failure is not
 /// a spawn failure (cmd_spawn precedent).
-pub(crate) fn record_spawn_entry(cfg: &Config, project: &str, entry: state::SpawnEntry) {
-    let key = match project_dir_str(cfg, project) {
-        Ok(k) => k,
-        Err(e) => {
-            eprintln!("flywheel: cannot record spawn entry for {project}: {e:#}");
-            return;
-        }
-    };
+pub(crate) fn record_spawn_entry(_cfg: &Config, project: &str, entry: state::SpawnEntry) {
+    // bd-hc-registry-recover-ywypf: ONE key per project. The registry key
+    // derives from `project` as passed (bare or absolute as the caller
+    // spelled it); resolving to an absolute dir first hashed to
+    // `<base>-<hash>` while readers used the bare spelling, splitting one
+    // pane across two files. Never resolve here — `spawn_registry_key`
+    // already converges bare/abs spellings of one dir.
+    let key = project;
     // A mutating door must not treat a corrupt fleet as empty: refuse the
     // write (loud, naming the path) instead of paving the file with one row.
-    let current = match state::load_spawn_registry_strict(&key) {
+    let current = match state::load_spawn_registry_strict(key) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("flywheel: REFUSING to record spawn entry for {project}: {e}");
             return;
         }
     };
-    let mut registry = state::merge_registry_for_mutation(&key, current);
+    let mut registry = state::merge_registry_for_mutation(key, current);
     registry.retain(|e| e.name != entry.name);
     registry.push(entry);
-    if let Err(e) = state::save_spawn_registry(&key, &registry) {
+    if let Err(e) = state::save_spawn_registry(key, &registry) {
         eprintln!("flywheel: cannot save spawn registry: {e:#}");
     }
 }
