@@ -2,6 +2,32 @@
 
 use clap::Subcommand;
 
+use anyhow::{Result, anyhow, bail};
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+
+use crate::config::Config;
+use crate::output::print_json;
+use crate::{
+    ProfilesFile, bind_pane_mail_identity, bind_spawn_role, is_builtin_profile,
+    pinned_mail_identity, prime_profile_identity, profile_launch_args, profile_workflow_invoke,
+    record_spawn_entry, refuse_unpinned_spawn, resolved_spec_workspace,
+};
+use crate::{backend, config, models, profile};
+
+use anyhow::{Result, anyhow, bail};
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+
+use crate::config::Config;
+use crate::output::print_json;
+use crate::{
+    ProfilesFile, bind_pane_mail_identity, bind_spawn_role, is_builtin_profile,
+    pinned_mail_identity, prime_profile_identity, profile_launch_args, profile_workflow_invoke,
+    record_spawn_entry, refuse_unpinned_spawn, resolved_spec_workspace,
+};
+use crate::{backend, config, models, profile};
+
 /// `flywheel profile` subcommands (ADR-0005 Spec 1/1b) — the agent catalog.
 /// `list`/`show` are read-only; `create`/`edit` write `profiles.toml`; `run`
 /// resolves `@name` → `Backend::spawn` (host scope, operator identity) and
@@ -184,4 +210,386 @@ pub(crate) enum ProfileCmd {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+/// `flywheel profile` — the agent profile catalog (ADR-0005 Spec 1/1b).
+///
+/// `list` shows compiled-in defaults + local `profiles.toml` entries; `show`
+/// prints the full profile (behavior preamble + skills); `create`/`edit`
+/// write `~/.config/flywheel/profiles.toml`; `run @name` resolves the profile
+/// (host scope, operator identity) and spawns the agent via the configured
+/// multiplexer backend, optionally invoking a workflow after spawn.
+///
+/// governed-by: ADR-0005 (bd-p2-cli-wn8)
+/// Dispatched from `main()`; moved from crate root (bd-wave5-main-eviction-d5hht).
+pub(crate) fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
+    use profile::{Profile, ProfileCatalog};
+
+    match cmd {
+        ProfileCmd::List => {
+            let cat = ProfileCatalog::load()?;
+            let mut rows: Vec<Value> = Vec::new();
+            for name in cat.names() {
+                let p = cat.get(&name).expect("names from catalog");
+                rows.push(json!({
+                    "name": name,
+                    "harness": p.harness,
+                    "model": p.model,
+                    "effort": p.effort,
+                    "smol": p.smol,
+                    "slow": p.slow,
+                    "plan": p.plan,
+                    "role": p.role,
+                    "backend": cat.backend(&name),
+                    "default_workflow": p.default_workflow,
+                    "builtin": is_builtin_profile(&name),
+                    "fallback": p.fallback,
+                    "model_fallback": p.model_fallback,
+                }));
+            }
+            print_json(&json!({ "profiles": rows }));
+        }
+        ProfileCmd::Show { name, json } => {
+            let cat = ProfileCatalog::load()?;
+            let p = cat
+                .get(name)
+                .ok_or_else(|| anyhow!("unknown profile '@{name}' (flywheel profile list)"))?;
+            if *json {
+                let resolved = models::ModelRegistry::load_routing().ok().and_then(|r| {
+                    r.resolve_profile_route_full(&p.harness, &p.model, &p.model_fallback)
+                        .ok()
+                        .map(|(h, m, route)| {
+                            json!({
+                                "harness": h, "model": m, "route": route,
+                            })
+                        })
+                });
+                print_json(&json!({
+                    "name": name,
+                    "harness": p.harness,
+                    "model": p.model,
+                    "fallback": p.fallback,
+                    "model_fallback": p.model_fallback,
+                    "resolved": resolved,
+                    "effort": p.effort,
+                    "smol": p.smol,
+                    "slow": p.slow,
+                    "plan": p.plan,
+                    "role": p.role,
+                    "backend": cat.backend(name),
+                    "default_workflow": p.default_workflow,
+                    "behavior": p.behavior,
+                    "task_hint": p.task_hint,
+                    "skills": p.skills,
+                }));
+                return Ok(());
+            }
+            print_json(&json!({
+                "name": name,
+                "harness": p.harness,
+                "fallback": p.fallback,
+                "model_fallback": p.model_fallback,
+                "effort": p.effort,
+                "smol": p.smol,
+                "slow": p.slow,
+                "plan": p.plan,
+                "role": p.role,
+                "backend": cat.backend(name),
+                "default_workflow": p.default_workflow,
+                "behavior": p.behavior,
+                "task_hint": p.task_hint,
+                "skills": p.skills,
+            }));
+        }
+        ProfileCmd::Create {
+            name,
+            harness,
+            model,
+            role,
+            behavior,
+            task_hint,
+            backend,
+            default_workflow,
+            effort,
+            smol,
+            slow,
+            plan,
+        }
+        | ProfileCmd::Edit {
+            name,
+            harness,
+            model,
+            role,
+            behavior,
+            task_hint,
+            backend,
+            default_workflow,
+            effort,
+            smol,
+            slow,
+            plan,
+        } => {
+            let path = config::config_dir().join("profiles.toml");
+            let cat = ProfileCatalog::load()?;
+            let base = cat.get(name).cloned().unwrap_or_default();
+            let mut merged = Profile {
+                harness: harness.clone().unwrap_or(base.harness),
+                model: model.clone().unwrap_or(base.model),
+                effort: effort.clone().unwrap_or(base.effort),
+                smol: smol.clone().unwrap_or(base.smol),
+                slow: slow.clone().unwrap_or(base.slow),
+                plan: plan.clone().unwrap_or(base.plan),
+                role: role.clone().unwrap_or(base.role),
+                behavior: behavior.clone().unwrap_or(base.behavior),
+                task_hint: task_hint.clone().unwrap_or(base.task_hint),
+                backend: backend.clone().unwrap_or(base.backend),
+                default_workflow: default_workflow.clone().unwrap_or(base.default_workflow),
+                skills: base.skills,
+                provider: base.provider,
+                fallback: base.fallback,
+                when: base.when,
+                model_fallback: base.model_fallback,
+            };
+            if merged.model.is_empty() {
+                bail!("profile {name} needs --model (id or @cheap/@standard/@premium)");
+            }
+            if merged.harness.is_empty() && models::slot_alias(&merged.model).is_none() {
+                bail!(
+                    "profile {name} needs --harness, or a slot alias (@cheap/@standard/@premium)"
+                );
+            }
+            if !merged.harness.is_empty() {
+                match cat.canonical_harness(&merged.harness) {
+                    Some(kind) => merged.harness = kind,
+                    None => bail!(
+                        "profile {name}: unknown harness {:?} — spawnable harnesses: {} \
+                         (short aliases oc/gk are normalized). For a custom harness add \
+                         `[harness.{}] spawn_cmd = \"...\"` to profiles.toml.",
+                        merged.harness,
+                        cat.known_harnesses().join(", "),
+                        merged.harness
+                    ),
+                }
+            }
+            let mut on_disk: BTreeMap<String, profile::Profile> =
+                profile::ProfileCatalog::load_user_file(Some(&path));
+            on_disk.insert(name.clone(), merged);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let raw = toml::to_string_pretty(&ProfilesFile { profiles: on_disk })?;
+            std::fs::write(&path, raw)?;
+            println!("wrote {} [profiles.{name}]", path.display());
+        }
+        ProfileCmd::Run {
+            name,
+            workflow,
+            inputs,
+        } => {
+            let cat = ProfileCatalog::load()?;
+            let _inputs: Value = match inputs {
+                Some(s) if !s.is_empty() => {
+                    serde_json::from_str(s).map_err(|e| anyhow!("--inputs must be JSON: {e}"))?
+                }
+                _ => json!({}),
+            };
+            let operator_npub =
+                std::env::var("TORON_OPERATOR_NPUB").unwrap_or_else(|_| "operator".to_string());
+            let resolved = cat.resolve(name, None, &operator_npub, &|_, _| None)?;
+            let spec = &resolved.spec;
+
+            let backend = backend::multiplexer_backend(cfg)?;
+            let agent_name = format!("profile-{name}");
+            let profile = cat.get(name).expect("resolve validated the profile above");
+            let args = profile_launch_args(&spec.harness, profile, None)?;
+            let workspace = resolved_spec_workspace(cfg, backend.as_ref(), &spec.harness)?;
+            let host_project = "flywheel";
+            let mail_identity = pinned_mail_identity(cfg, host_project, &agent_name, &spec.harness);
+            if mail_identity.is_none() {
+                refuse_unpinned_spawn(&agent_name, Some(name), backend::mail_backend(cfg).is_ok())?;
+            }
+            let info = backend.agent_start(&agent_name, &spec.harness, &workspace, &args)?;
+            println!(
+                "profile {name} spawned: agent={} pane={} backend={}",
+                info.name.as_deref().unwrap_or(&agent_name),
+                info.pane_id,
+                spec.backend
+            );
+            if let Some(ref pin) = mail_identity {
+                prime_profile_identity(backend.as_ref(), &info.pane_id, &agent_name, pin);
+                bind_pane_mail_identity(cfg, host_project, &agent_name, &info.pane_id, Some(pin));
+            }
+            bind_spawn_role(
+                cfg,
+                host_project,
+                Some(name),
+                name,
+                mail_identity.as_deref(),
+            )?;
+            record_spawn_entry(
+                cfg,
+                host_project,
+                state::SpawnEntry::profiled(
+                    &info.pane_id,
+                    &agent_name,
+                    name,
+                    &spec.harness,
+                    mail_identity,
+                ),
+            );
+            if let Some(wf) = workflow {
+                let invoke = profile_workflow_invoke(
+                    wf.as_str(),
+                    inputs.as_deref(),
+                    workspace.as_str(),
+                    host_project,
+                );
+                cmd_workflow(cfg, &invoke)?;
+            }
+        }
+        ProfileCmd::Remove { name } => {
+            if is_builtin_profile(name) {
+                bail!(
+                    "cannot remove built-in profile {name:?} — override it via `flywheel profile create {name} ...` instead"
+                );
+            }
+            let path = config::config_dir().join("profiles.toml");
+            let cat = ProfileCatalog::load()?;
+            if cat.get(name).is_none() {
+                bail!("no profile named {name:?}");
+            }
+            let mut on_disk: BTreeMap<String, profile::Profile> =
+                profile::ProfileCatalog::load_user_file(Some(&path));
+            on_disk.remove(name);
+            if on_disk.is_empty() {
+                let _ = std::fs::remove_file(&path);
+            } else {
+                let raw = toml::to_string_pretty(&ProfilesFile { profiles: on_disk })?;
+                std::fs::write(&path, raw)?;
+            }
+            println!("removed profile {name}");
+        }
+        ProfileCmd::Set {
+            name,
+            model,
+            provider,
+            slot,
+            model_fallback,
+            fallback,
+            harness,
+            effort,
+            smol,
+            slow,
+            plan,
+            skills,
+            dry_run,
+        } => {
+            use models::slot_alias;
+            let path = config::config_dir().join("profiles.toml");
+            let cat = ProfileCatalog::load()?;
+            if cat.get(name).is_none() {
+                bail!("no profile named {name:?} (flywheel profile list)");
+            }
+            let base = cat.get(name).cloned().unwrap_or_default();
+            let model = match slot {
+                Some(s) => Some(format!("@{}", s.trim_start_matches('@'))),
+                None => model.clone(),
+            };
+            let merged = Profile {
+                model: model.unwrap_or(base.model),
+                provider: provider.clone().unwrap_or(base.provider),
+                model_fallback: if model_fallback.is_empty() {
+                    base.model_fallback
+                } else {
+                    model_fallback.clone()
+                },
+                fallback: if fallback.is_empty() {
+                    base.fallback
+                } else {
+                    fallback.clone()
+                },
+                harness: harness.clone().unwrap_or(base.harness),
+                effort: effort.clone().unwrap_or(base.effort),
+                smol: smol.clone().unwrap_or(base.smol),
+                slow: slow.clone().unwrap_or(base.slow),
+                plan: plan.clone().unwrap_or(base.plan),
+                skills: if skills.is_empty() {
+                    base.skills
+                } else {
+                    skills.clone()
+                },
+                ..base
+            };
+            if merged.model.is_empty() {
+                bail!("profile {name} needs --model (id or @cheap/@standard/@premium)");
+            }
+            if merged.harness.is_empty() && slot_alias(&merged.model).is_none() {
+                bail!(
+                    "profile {name} needs --harness, or a slot alias (@cheap/@standard/@premium)"
+                );
+            }
+            let mut on_disk: BTreeMap<String, profile::Profile> =
+                profile::ProfileCatalog::load_user_file(Some(&path));
+            on_disk.insert(name.clone(), merged.clone());
+            if *dry_run {
+                print_json(&serde_json::to_value(&merged)?);
+                return Ok(());
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let raw = toml::to_string_pretty(&ProfilesFile { profiles: on_disk })?;
+            std::fs::write(&path, raw)?;
+            println!("wrote {} [profiles.{name}]", path.display());
+        }
+        ProfileCmd::Export { name, out } => {
+            let cat = ProfileCatalog::load()?;
+            let profile = cat
+                .get(name)
+                .with_context(|| format!("no profile named {name:?} (flywheel profile list)"))?;
+            let doc = profile::profile_to_portable(name, profile);
+            let rendered = serde_json::to_string_pretty(&doc)?;
+            match out {
+                Some(out_path) => {
+                    std::fs::write(out_path, rendered + "\n")?;
+                    println!("exported profile {name} -> {out_path}");
+                }
+                None => println!("{rendered}"),
+            }
+        }
+        ProfileCmd::Import {
+            path,
+            name,
+            dry_run,
+        } => {
+            let raw = if path == "-" {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin().read_to_string(&mut buf)?;
+                buf
+            } else {
+                std::fs::read_to_string(path)?
+            };
+            let doc: serde_json::Value = serde_json::from_str(raw.trim())?;
+            let (doc_name, imported) = profile::profile_from_portable(&doc)?;
+            let target = name.clone().unwrap_or(doc_name);
+            if *dry_run {
+                let mut one: BTreeMap<String, profile::Profile> = BTreeMap::new();
+                one.insert(target.clone(), imported);
+                print_json(&serde_json::to_value(&one)?);
+                return Ok(());
+            }
+            let file_path = config::config_dir().join("profiles.toml");
+            let mut on_disk: BTreeMap<String, profile::Profile> =
+                profile::ProfileCatalog::load_user_file(Some(&file_path));
+            on_disk.insert(target.clone(), imported);
+            if let Some(parent) = file_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let raw_toml = toml::to_string_pretty(&ProfilesFile { profiles: on_disk })?;
+            std::fs::write(&file_path, raw_toml)?;
+            println!("imported profile {target} -> {}", file_path.display());
+        }
+    }
+    Ok(())
 }

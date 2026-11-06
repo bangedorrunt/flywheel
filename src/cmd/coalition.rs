@@ -2,6 +2,13 @@
 
 use clap::Subcommand;
 
+use anyhow::{Result, anyhow, bail};
+use serde_json::json;
+use std::collections::BTreeMap;
+
+use crate::output::print_json;
+use crate::{config, profile};
+
 /// Coalition commands (ADR-0011 Spec 1, P11.3a): the steer surface + manual
 /// collab. A coalition = NIP-29 channel + goal workflow run + manifest.
 /// Manual collab reuses P11.2 (soft-conflict freeze + request-release) — no
@@ -307,4 +314,583 @@ pub(crate) enum CoalitionCmd {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// `flywheel coalition ...` (ADR-0011 Spec 1, P11.3a): the steer surface +
+/// manual collab baseline. All collab ops are membership-gated; P11.2's
+/// soft-conflict freeze + request-release ladder are the manual resolution
+/// path (the auto-proposer is P11.3b).
+/// Dispatched from `main()`; moved from crate root (bd-wave5-main-eviction-d5hht).
+pub(crate) fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
+    use coalition::CoalitionStore;
+    use toron_core::mailbox::{ReleaseAsk, ReleaseDecision};
+
+    /// Resolve a crew spec to member profile names (same rule as
+    /// `workflow run --crew`): recipes.toml squad, else a single profile.
+    /// Comma-separated crews (bd-hkw5.3): multiple squads/profiles — the
+    /// cross-project coalition's crews from different repos.
+    fn squad_members(crews: &str) -> Result<Vec<String>> {
+        let mut out: Vec<String> = Vec::new();
+        for crew in crews.split(',').map(str::trim).filter(|c| !c.is_empty()) {
+            let cat = profile::ProfileCatalog::load()?;
+            let recipes = config::Recipes::load()?.recipes;
+            let counts = profile::resolve_squad(crew, &recipes, cat.get(crew).is_some())
+                .ok_or_else(|| anyhow!("unknown squad {crew:?} (flywheel squad list)"))?
+                .counts;
+            for m in counts.keys() {
+                if !out.contains(m) {
+                    out.push(m.clone());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn coalitions_root() -> std::path::PathBuf {
+        config::state_dir().join("coalitions")
+    }
+
+    fn parse_ask(s: &str) -> Result<ReleaseAsk> {
+        if s == "release" {
+            Ok(ReleaseAsk::Release)
+        } else if let Some(secs) = s.strip_prefix("defer:") {
+            Ok(ReleaseAsk::Defer {
+                defer_secs: secs
+                    .parse()
+                    .map_err(|e| anyhow!("--ask defer:<secs> parse: {e}"))?,
+            })
+        } else {
+            bail!("--ask must be `release` or `defer:<secs>`, got {s:?}")
+        }
+    }
+
+    fn parse_decision(s: &str) -> Result<ReleaseDecision> {
+        if s == "agreed" {
+            Ok(ReleaseDecision::Agreed)
+        } else if s == "denied" {
+            Ok(ReleaseDecision::Denied)
+        } else if let Some(secs) = s.strip_prefix("deferred:") {
+            Ok(ReleaseDecision::Deferred {
+                defer_secs: secs
+                    .parse()
+                    .map_err(|e| anyhow!("--decision deferred:<secs> parse: {e}"))?,
+            })
+        } else {
+            bail!("--decision must be agreed|denied|deferred:<secs>, got {s:?}")
+        }
+    }
+
+    match cmd {
+        CoalitionCmd::Register {
+            name,
+            project,
+            json,
+        } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            store.register_agent(name)?;
+            if *json {
+                print_json(&json!({ "registered": name, "project": project }));
+            } else {
+                println!("registered agent {name} in project {project}");
+            }
+            Ok(())
+        }
+        CoalitionCmd::Form {
+            goal,
+            crews,
+            as_agent,
+            member_project,
+            project,
+            beads,
+            tracker,
+            json,
+        } => {
+            let members = squad_members(crews)?;
+            let member_projects: BTreeMap<String, String> = member_project
+                .iter()
+                .map(|kv| {
+                    let (member, proj) = kv.split_once('=').ok_or_else(|| {
+                        anyhow!("--member-project expects <member>=<project>, got {kv:?}")
+                    })?;
+                    if member.is_empty() || proj.is_empty() {
+                        return Err(anyhow!(
+                            "--member-project expects <member>=<project>, got {kv:?}"
+                        ));
+                    }
+                    if !members.contains(&member.to_string()) {
+                        return Err(anyhow!(
+                            "--member-project member {member} is not in crew {crews:?}"
+                        ));
+                    }
+                    Ok((member.to_string(), proj.to_string()))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?;
+            let beads: Vec<String> = beads
+                .as_deref()
+                .map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            let m = store.form(
+                goal,
+                as_agent,
+                &members,
+                &member_projects,
+                &beads,
+                tracker.as_deref(),
+            )?;
+            if *json {
+                print_json(&serde_json::to_value(&m)?);
+            } else {
+                println!(
+                    "coalition {} formed: goal {}, {} member(s), channel {} + run {}",
+                    m.id,
+                    m.goal,
+                    m.members.len(),
+                    m.channel_id,
+                    m.run_id
+                );
+                if !m.member_projects.is_empty() {
+                    for (member, proj) in &m.member_projects {
+                        println!("  {member} -> project {proj}");
+                    }
+                }
+            }
+            Ok(())
+        }
+        CoalitionCmd::Status {
+            id,
+            project,
+            json,
+            digest,
+        } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            let st = store.status(id)?;
+            if *json {
+                print_json(&serde_json::to_value(&st)?);
+            } else if *digest {
+                println!(
+                    "coalition {} [{}] goal {} captain {}",
+                    st.id, st.status, st.goal, st.captain
+                );
+                let mut by_member: std::collections::BTreeMap<String, (usize, usize, usize)> =
+                    std::collections::BTreeMap::new();
+                for i in &st.intents {
+                    by_member.entry(i.agent_name.clone()).or_default().0 += 1;
+                }
+                for r in &st.reservations {
+                    by_member.entry(r.agent_name.clone()).or_default().1 += 1;
+                }
+                for f in &st.frozen {
+                    by_member.entry(f.agent.clone()).or_default().2 += 1;
+                }
+                for m in &st.members {
+                    let (intents, held, frozen) = by_member.get(m).copied().unwrap_or((0, 0, 0));
+                    println!(
+                        "  {} [{}] intents {} held {} frozen {}",
+                        m,
+                        st.roles.get(m).map(String::as_str).unwrap_or("member"),
+                        intents,
+                        held,
+                        frozen
+                    );
+                }
+                println!(
+                    "  negotiations: {} | channel events: {} | run: {}",
+                    st.negotiations.len(),
+                    st.channel.events.len(),
+                    st.run
+                        .as_ref()
+                        .map(|r| r.status.as_str())
+                        .unwrap_or("unknown")
+                );
+                for n in &st.negotiations {
+                    println!(
+                        "    {} -> {}: {} ({})",
+                        n.requester, n.holder, n.path, n.status
+                    );
+                }
+            } else {
+                println!(
+                    "coalition {} [{}] goal {} captain {}",
+                    st.id, st.status, st.goal, st.captain
+                );
+                println!(
+                    "  run: {} ({})",
+                    st.run_id,
+                    st.run
+                        .as_ref()
+                        .map(|r| r.status.as_str())
+                        .unwrap_or("unknown")
+                );
+                for (member, proj) in &st.member_projects {
+                    println!("  {member} -> project {proj}");
+                }
+                println!(
+                    "  channel: {} ({} event(s) on bus)",
+                    st.channel.channel_id,
+                    st.channel.events.len()
+                );
+                println!(
+                    "  intents: {} | reservations: {} | frozen: {} | negotiations: {}",
+                    st.intents.len(),
+                    st.reservations.len(),
+                    st.frozen.len(),
+                    st.negotiations.len()
+                );
+                for i in &st.intents {
+                    let ttl = i
+                        .expires_ts_us
+                        .map(|t| t.to_string())
+                        .unwrap_or_else(|| "none".into());
+                    println!(
+                        "    intent {}: {} @ {} (ttl {}s, expires {})",
+                        i.agent_name, i.path_pattern, i.reason, i.ttl_secs, ttl
+                    );
+                }
+                for r in &st.reservations {
+                    println!(
+                        "    held {}: {} (expires {})",
+                        r.agent_name,
+                        r.path_pattern,
+                        r.expires_ts_us
+                            .map(|t| t.to_string())
+                            .unwrap_or_else(|| "none".into())
+                    );
+                }
+                for f in &st.frozen {
+                    println!(
+                        "    FROZEN {}: {} (overlaps {})",
+                        f.agent,
+                        f.path,
+                        f.holders.join(", ")
+                    );
+                }
+                for n in &st.negotiations {
+                    println!(
+                        "    negotiate {} -> {}: {} ({})",
+                        n.requester, n.holder, n.path, n.status
+                    );
+                }
+                for b in &st.beads {
+                    println!("    bead {}: {}", b.id, b.status);
+                }
+            }
+            Ok(())
+        }
+        CoalitionCmd::Intent {
+            id,
+            paths,
+            as_agent,
+            reason,
+            ttl,
+            project,
+            json,
+        } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            let res = store.declare_intent(id, as_agent, paths, reason.as_deref(), *ttl)?;
+            if *json {
+                print_json(&serde_json::to_value(&res)?);
+            } else {
+                println!(
+                    "intent declared: {} path(s) by {as_agent}",
+                    res.declared.len()
+                );
+            }
+            Ok(())
+        }
+        CoalitionCmd::Reserve {
+            id,
+            paths,
+            as_agent,
+            ttl,
+            exclusive,
+            reason,
+            project,
+            json,
+        } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            let res = store.reserve(id, as_agent, paths, *ttl, *exclusive, reason.as_deref())?;
+            if *json {
+                print_json(&serde_json::to_value(&res)?);
+            } else {
+                println!(
+                    "reserve: {} granted, {} hard conflict(s), {} SOFT conflict(s) (freeze)",
+                    res.granted.len(),
+                    res.conflicts.len(),
+                    res.soft_conflicts.len()
+                );
+            }
+            Ok(())
+        }
+        CoalitionCmd::NegotiateRequest {
+            id,
+            as_agent,
+            target,
+            reservation_id,
+            ask,
+            note,
+            project,
+            json,
+        } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            let res = store.negotiate_request(
+                id,
+                as_agent,
+                target,
+                reservation_id,
+                parse_ask(ask)?,
+                note.as_deref(),
+            )?;
+            if *json {
+                print_json(&serde_json::to_value(&res)?);
+            } else {
+                println!(
+                    "request-release sent to {} for {} (message {})",
+                    res.holder, res.path_pattern, res.message_id
+                );
+            }
+            Ok(())
+        }
+        CoalitionCmd::NegotiateRespond {
+            id,
+            as_agent,
+            request_message,
+            decision,
+            note,
+            project,
+            json,
+        } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            let res = store.negotiate_respond(
+                id,
+                as_agent,
+                request_message,
+                parse_decision(decision)?,
+                note.as_deref(),
+            )?;
+            if *json {
+                print_json(&json!({
+                    "deliveries": res.deliveries.iter().map(|d| json!({
+                        "recipient": d.payload.recipient,
+                        "event_id": d.payload.event_id,
+                    })).collect::<Vec<_>>(),
+                    "count": res.count,
+                }));
+            } else {
+                println!(
+                    "response delivered to {} recipient(s)",
+                    res.deliveries.len()
+                );
+            }
+            Ok(())
+        }
+        CoalitionCmd::NegotiateStatus {
+            id,
+            as_agent,
+            request_message,
+            window,
+            project,
+            json,
+        } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            let st = store.negotiate_status(id, as_agent, request_message, *window)?;
+            if *json {
+                print_json(&serde_json::to_value(&st)?);
+            } else {
+                println!("{st:?}");
+            }
+            Ok(())
+        }
+        CoalitionCmd::NegotiateEscalate {
+            id,
+            as_agent,
+            request_message,
+            note,
+            project,
+            json,
+        } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            store.negotiate_escalate(id, as_agent, request_message, note.as_deref())?;
+            if *json {
+                print_json(&json!({ "escalated": true }));
+            } else {
+                println!("request {request_message} escalated to the captain");
+            }
+            Ok(())
+        }
+        CoalitionCmd::Join {
+            id,
+            as_agent,
+            member_project,
+            project,
+            json,
+        } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            let m = store.join(id, as_agent, member_project.as_deref())?;
+            eprintln!(
+                "JOINING — not spawning  coalition={} members={}",
+                m.id,
+                m.members.len()
+            );
+            if *json {
+                print_json(&serde_json::to_value(&m)?);
+            } else {
+                println!("joined {} as {as_agent} members {}", m.id, m.members.len());
+            }
+            Ok(())
+        }
+        CoalitionCmd::Leave {
+            id,
+            as_agent,
+            project,
+            json,
+        } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            let m = store.leave(id, as_agent)?;
+            if *json {
+                print_json(&serde_json::to_value(&m)?);
+            } else {
+                println!("left {} as {as_agent} members {}", m.id, m.members.len());
+            }
+            Ok(())
+        }
+        CoalitionCmd::List { project, json } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            let list = store.list()?;
+            if *json {
+                print_json(&serde_json::to_value(&list)?);
+            } else {
+                for m in &list {
+                    println!(
+                        "{} [{}] goal {} members {}",
+                        m.id,
+                        m.status,
+                        m.goal,
+                        m.members.len()
+                    );
+                }
+            }
+            Ok(())
+        }
+        CoalitionCmd::Detect { project, json } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            let report = store.detect()?;
+            if *json {
+                print_json(&serde_json::to_value(&report)?);
+            } else {
+                if report.overlaps.is_empty() {
+                    println!("no intent overlaps on the board");
+                }
+                for o in &report.overlaps {
+                    let tag = if o.non_trivial { "source" } else { "trivial" };
+                    println!("overlap: {} <-> {} ({tag})", o.a, o.b);
+                    println!("  {} : {}", o.a, o.path_a);
+                    println!("  {} : {}", o.b, o.path_b);
+                }
+                for p in &report.proposals {
+                    println!(
+                        "proposal [{tier}/{kind}]: {} <-> {} — {}",
+                        p.agents[0],
+                        p.agents[1],
+                        p.rationale,
+                        tier = p.tier,
+                        kind = serde_json::to_string(&p.kind)
+                            .unwrap_or_default()
+                            .trim_matches('"')
+                    );
+                }
+                for c in &report.auto_coalesce {
+                    println!(
+                        "auto-coalesce candidate: {} <-> {} (non-trivial source)",
+                        c.a, c.b
+                    );
+                }
+            }
+            Ok(())
+        }
+        CoalitionCmd::AutoCoalesce {
+            goal,
+            as_agent,
+            project,
+            json,
+        } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            let report = store.detect()?;
+            if report.auto_coalesce.is_empty() {
+                if *json {
+                    print_json(&json!({ "formed": [] }));
+                } else {
+                    println!("no auto-coalesce candidates (no non-trivial unaffiliated overlap)");
+                }
+                return Ok(());
+            }
+            let formed = store.auto_coalesce(goal, as_agent, &report)?;
+            if *json {
+                print_json(&serde_json::to_value(&formed)?);
+            } else {
+                for m in &formed {
+                    println!(
+                        "formed coalition {} (goal {goal}, members {})",
+                        m.id,
+                        m.members.join(", ")
+                    );
+                }
+            }
+            Ok(())
+        }
+        CoalitionCmd::Disband {
+            id,
+            beads_closed,
+            reason,
+            tracker,
+            project,
+            json,
+        } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            store.disband(id, *beads_closed, reason.as_deref(), tracker.as_deref())?;
+            if *json {
+                print_json(&json!({ "disbanded": id }));
+            } else {
+                println!("coalition {id} disbanded");
+            }
+            Ok(())
+        }
+        CoalitionCmd::Leaf {
+            id,
+            as_agent,
+            profile,
+            scope,
+            harness,
+            project,
+            json,
+        } => {
+            let store = CoalitionStore::open(project, coalitions_root())?;
+            let leaf = store.dispatch_leaf(id, as_agent, profile, scope, harness.as_deref())?;
+            if *json {
+                print_json(&serde_json::to_value(&leaf)?);
+            } else {
+                println!(
+                    "leaf @{} run {} [{}] {} tok={}+{} {}ms (result posted to coalition {})",
+                    leaf.profile,
+                    leaf.run_id,
+                    leaf.status,
+                    leaf.model,
+                    leaf.tokens_in,
+                    leaf.tokens_out,
+                    leaf.duration_ms,
+                    id
+                );
+                if let Some(e) = &leaf.error {
+                    eprintln!("leaf error: {e}");
+                }
+            }
+            Ok(())
+        }
+    }
 }
