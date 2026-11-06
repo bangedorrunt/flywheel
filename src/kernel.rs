@@ -24,10 +24,6 @@ macro_rules! validated_text {
                 }
                 Ok(Self(value))
             }
-
-            pub(crate) fn as_str(&self) -> &str {
-                &self.0
-            }
         }
     };
 }
@@ -35,7 +31,6 @@ macro_rules! validated_text {
 validated_text!(Corr, "correlation id");
 validated_text!(AgentPin, "agent pin");
 validated_text!(WorkflowName, "workflow name");
-validated_text!(EffectKey, "effect key");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectPath(PathBuf);
@@ -62,39 +57,16 @@ impl ProjectPath {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PresenceSource {
-    Unknown,
-    Presence,
-    PlaneEvidence,
-    Endpoint,
-    Legacy,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Presence {
-    Unknown,
-    Busy(PresenceSource),
-    Idle(PresenceSource),
-    Dead(PresenceSource),
-}
-
-impl Presence {
-    pub(crate) fn is_promptable(self) -> bool {
-        matches!(self, Self::Idle(PresenceSource::Presence))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Vehicle {
-    Open,
-    Loop,
-    Swarm,
-    Join,
-    None,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Staged pipeline vocabulary (wave9): `Input` is constructed today
+/// (pane drainer); the rest land as failure stages wire up. Pinned by
+/// `every_action_stage_spells_itself` so the set cannot rot silently.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "staged: failure::classify_with_action_stage is the first consumer; variants land as stages wire up"
+    )
+)]
 pub(crate) enum ActionStage {
     Normalize,
     Input,
@@ -105,6 +77,8 @@ pub(crate) enum ActionStage {
 }
 
 impl ActionStage {
+    /// Wire spelling (live: `failure::classify_with_action_stage` maps the
+    /// typed stage back onto the stable string field).
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Normalize => "normalize",
@@ -115,97 +89,6 @@ impl ActionStage {
             Self::Park => "park",
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RunStatus {
-    Planned,
-    Running,
-    Suspended,
-    Succeeded,
-    Failed,
-    Unknown,
-}
-
-impl RunStatus {
-    pub(crate) fn is_terminal(self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DeliveryState {
-    Prepared,
-    Claimed,
-    Running,
-    Accepted,
-    Delivered,
-    Shed,
-    Failed,
-    Unknown,
-}
-
-impl DeliveryState {
-    pub(crate) fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            Self::Delivered | Self::Shed | Self::Failed | Self::Unknown
-        )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum DeliveryTransitionError {
-    TerminalRegression {
-        from: DeliveryState,
-        to: DeliveryState,
-    },
-    Illegal {
-        from: DeliveryState,
-        to: DeliveryState,
-    },
-}
-
-/// Pure effect lifecycle transition. Terminal outcomes never move backwards,
-/// and a provider cannot report delivery before the intent was claimed/running.
-pub(crate) fn advance_delivery(
-    from: DeliveryState,
-    to: DeliveryState,
-) -> Result<DeliveryState, DeliveryTransitionError> {
-    if from.is_terminal() {
-        return if from == to {
-            Ok(from)
-        } else {
-            Err(DeliveryTransitionError::TerminalRegression { from, to })
-        };
-    }
-    let legal = matches!(
-        (from, to),
-        (DeliveryState::Prepared, DeliveryState::Claimed)
-            | (DeliveryState::Claimed, DeliveryState::Running)
-            | (DeliveryState::Running, DeliveryState::Accepted)
-            | (DeliveryState::Running, DeliveryState::Delivered)
-            | (DeliveryState::Running, DeliveryState::Shed)
-            | (DeliveryState::Running, DeliveryState::Failed)
-            | (DeliveryState::Running, DeliveryState::Unknown)
-            | (DeliveryState::Accepted, DeliveryState::Delivered)
-            | (DeliveryState::Accepted, DeliveryState::Shed)
-            | (DeliveryState::Accepted, DeliveryState::Unknown)
-    );
-    if legal {
-        Ok(to)
-    } else {
-        Err(DeliveryTransitionError::Illegal { from, to })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SinkResult {
-    Accepted { delivery_id: String },
-    Delivered { delivery_id: String },
-    Shed { reason: String },
-    Unavailable { retry_after_secs: Option<u64> },
-    Unknown { evidence: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,7 +116,7 @@ mod tests {
     fn validated_identifiers_reject_empty_and_control_values() {
         assert!(Corr::parse("").is_err());
         assert!(AgentPin::parse("pin\n").is_err());
-        assert_eq!(WorkflowName::parse("ship").unwrap().as_str(), "ship");
+        assert!(WorkflowName::parse("ship").is_ok());
     }
 
     #[test]
@@ -247,35 +130,18 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_terminal_predicates_are_explicit() {
-        assert!(RunStatus::Succeeded.is_terminal());
-        assert!(!RunStatus::Running.is_terminal());
-        assert!(DeliveryState::Unknown.is_terminal());
-        assert!(!DeliveryState::Accepted.is_terminal());
-        assert_eq!(ActionStage::Effect.as_str(), "effect");
-    }
-
-    #[test]
-    fn delivery_lifecycle_rejects_unclaimed_delivery_and_terminal_regression() {
-        assert!(advance_delivery(DeliveryState::Prepared, DeliveryState::Delivered).is_err());
+    fn every_action_stage_spells_itself() {
         assert_eq!(
-            advance_delivery(DeliveryState::Running, DeliveryState::Delivered).unwrap(),
-            DeliveryState::Delivered
+            [
+                ActionStage::Normalize,
+                ActionStage::Input,
+                ActionStage::Execute,
+                ActionStage::Output,
+                ActionStage::Effect,
+                ActionStage::Park,
+            ]
+            .map(ActionStage::as_str),
+            ["normalize", "input", "execute", "output", "effect", "park"]
         );
-        assert!(matches!(
-            advance_delivery(DeliveryState::Delivered, DeliveryState::Running),
-            Err(DeliveryTransitionError::TerminalRegression { .. })
-        ));
-        assert_eq!(
-            advance_delivery(DeliveryState::Delivered, DeliveryState::Delivered).unwrap(),
-            DeliveryState::Delivered
-        );
-    }
-
-    #[test]
-    fn only_authoritative_idle_presence_is_promptable() {
-        assert!(Presence::Idle(PresenceSource::Presence).is_promptable());
-        assert!(!Presence::Idle(PresenceSource::PlaneEvidence).is_promptable());
-        assert!(!Presence::Unknown.is_promptable());
     }
 }

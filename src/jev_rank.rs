@@ -263,6 +263,16 @@ pub fn crew_fit_stage() -> crate::stage::Stage {
 /// Generic over [`Transport`] precisely so the failure paths are testable: the
 /// "offline" case is the one that matters most and the one a real network makes
 /// hardest to reach on demand.
+///
+/// Staged entry (wave9): the crew stage path is wired; this direct-Jev entry
+/// has no non-test caller yet. Pinned by tests so it cannot rot while staged.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "staged: direct-Jev rank entry; the crew stage path is wired first"
+    )
+)]
 pub fn rank_menu_with<T: Transport>(
     objective: &str,
     menu: &mut HarnessMenu,
