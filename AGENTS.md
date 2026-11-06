@@ -81,7 +81,8 @@ pass.
   pass verbatim. Toron guard uses the same two rungs.
 - **Bead create/close.** Create needs `-d`, `--verify` (P≤2 `--principle`).
   Close = `br gate report` then `br close` (br skill).
-  `flywheel ledger check` requires `sha=<40-hex>` in the gate note.
+  `flywheel ledger check` needs a bound verdict — `sha=<40-hex>` (fallback) or
+  `task=`/`verdict=` (proved); br skill ceremony is SoT.
 - **Tracker.** Agents use `br --json` / `--robot-*`. Bare `br` is the human TUI.
 - **TDD. No script-based code edits. No file deletion without permission.**
 - **Engineering principles.** `flywheel principles list`; cite the name that
