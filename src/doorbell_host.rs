@@ -858,9 +858,12 @@ async fn run_embedded_async(
     workspace: &str,
     generation: Option<doorbell::WatcherGen>,
 ) -> anyhow::Result<()> {
-    use doorbell_rt::{Brain, BrainConfig, SinkManager};
-    let (tx, rx) = tokio::sync::mpsc::channel(doorbell_rt::BRAIN_CAP);
-    let died_bell = doorbell_rt::DiedBell::new();
+    use doorbell_rt::SinkManager;
+    // wave7-a2: the loop (channel, tickers, beads, brain drive) is the one
+    // runner; this entry point only configures in-process transport/sinks.
+    let mut runner = doorbell_rt::HostRunner::start(doorbell_rt::RunnerConfig::standard(workspace));
+    let tx = runner.sender();
+    let died_bell = runner.died_bell();
     let mut host = RtHost::new(cfg.clone(), project, workspace, tx.clone())?;
     host.set_died_bell(std::sync::Arc::clone(&died_bell));
     host.set_generation(generation.clone());
@@ -942,11 +945,10 @@ async fn run_embedded_async(
         }
     }
     host.cover_new_panes();
-    let sweep_tx = tx.clone();
-    let sweep_ticker =
-        doorbell_rt::interval_ticker("sweep", sweep_tx, Duration::from_secs(1), || {
-            BrainMsg::Sweep { now: unix_now() }
-        });
+    if cfg.doorbell_beads_poller() {
+        let repo = crate::project_dir(&cfg, project);
+        runner.spawn_beads_poller(repo);
+    }
     let beat_ws = workspace.to_string();
     let _lease_beat = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(30));
@@ -959,15 +961,7 @@ async fn run_embedded_async(
             }
         }
     });
-    let sla_tx = tx.clone();
-    let _sla_ticker =
-        doorbell_rt::interval_ticker("ack-sla", sla_tx, Duration::from_secs(60), || {
-            BrainMsg::AckSlaTick { now: unix_now() }
-        });
-    let _beads_poller = cfg.doorbell_beads_poller().then(|| {
-        let repo = crate::project_dir(&cfg, project);
-        doorbell_rt::pollers::spawn_beads_poller(tx.clone(), repo)
-    });
+    // (sweep + ack-sla tickers and the beads poller live in the runner now.)
     if crate::timer_watch::host_enabled(&cfg) {
         crate::timer_watch::spawn_sweep(project);
     }
@@ -1043,10 +1037,10 @@ async fn run_embedded_async(
         }
         let _ = shutdown_tx.send(BrainMsg::Shutdown).await;
     });
-    let brain =
-        Brain::new(BrainConfig::new(workspace), host, store, sinks).with_died_bell(died_bell);
-    let report = brain.run(rx).await;
-    drop(sweep_ticker);
+    // wave7-a2: the one runner drives the brain; producers above only send.
+    let report = runner
+        .drive(host, sinks, store, std::future::pending())
+        .await;
     _lease_beat.abort();
     if let Ok(mut g) = watch_slot.lock() {
         let _ = g.take();

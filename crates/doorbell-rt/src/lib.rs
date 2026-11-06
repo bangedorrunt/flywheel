@@ -17,6 +17,7 @@ pub mod msg;
 pub mod policy;
 pub mod pollers;
 pub mod registry_prune;
+pub mod runner;
 pub mod sensors;
 pub mod sinks;
 pub mod store;
@@ -40,6 +41,7 @@ pub use host::{CoreReducer, Effect, Host, MockHost};
 pub use lease::{Deference, OwnerLease, acquire_lease, deference_decision, lease_stale};
 pub use msg::{AskKind, AskReply, BrainMsg, DiedBell, deliver_died, deliver_died_blocking};
 pub use policy::{RestartPolicy, WatchRetry};
+pub use runner::{ACK_SLA_SECS, HostRunner, RunnerConfig, SWEEP_SECS};
 pub use sensors::{SensorHandle, bridge, interval_ticker, supervise};
 pub use sinks::{
     MockSink, NoTextSink, PromptSink, SendOutcome, SinkManager, Undelivered, comms_inbox_env,

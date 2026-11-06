@@ -28,8 +28,17 @@ async fn host_workspace(
     liveness: std::sync::Arc<doorbell_rt::brain::BrainLiveness>,
 ) -> doorbell_rt::RunReport {
     use doorbell_rt::FileStore;
-    use doorbell_rt::{Brain, BrainConfig, FileHost, FileHostConfig, Host, SinkManager};
+    use doorbell_rt::{FileHost, FileHostConfig, Host, HostRunner, RunnerConfig, SinkManager};
     let bins = resolved_bins();
+    // wave7-a2: the loop (channel, tickers, beads, brain drive) is the one
+    // runner; this entry point only configures transport (webhooks below)
+    // and adopts the caller's channel so serve shutdown still injects here.
+    let mut runner = HostRunner::adopt(
+        tx,
+        rx,
+        RunnerConfig::standard(&workspace).with_liveness(liveness),
+    );
+    let tx = runner.sender();
     let mut fcfg = FileHostConfig::new(fw_state.clone(), project.clone(), workspace.clone());
     fcfg.toron_bin = bins.toron.clone();
     fcfg.plane_bin = bins.hc.clone();
@@ -79,43 +88,23 @@ async fn host_workspace(
         }
     }
     let store = FileStore::new(fw_state);
-    let died_bell = doorbell_rt::DiedBell::new();
-    host = host.with_died_bell(std::sync::Arc::clone(&died_bell));
+    host = host.with_died_bell(runner.died_bell());
     host.restart_wake();
-    let sweep_ticker = doorbell_rt::interval_ticker(
-        "sweep",
-        tx.clone(),
-        std::time::Duration::from_secs(1),
-        || doorbell_rt::BrainMsg::Sweep {
-            now: doorbell_rt::lease::unix_now(),
-        },
-    );
-    let _sla_ticker = doorbell_rt::interval_ticker(
-        "ack-sla",
-        tx.clone(),
-        std::time::Duration::from_secs(60),
-        || doorbell_rt::BrainMsg::AckSlaTick {
-            now: doorbell_rt::lease::unix_now(),
-        },
-    );
     let beads_root = dirs::home_dir().map(|h| h.join("workspace"));
-    let _beads_poller = match beads_root
+    match beads_root
         .as_deref()
         .and_then(|root| doorbell_rt::pollers::beads_repo_for(&project, root))
     {
-        Some(repo) => Some(doorbell_rt::pollers::spawn_beads_poller(tx.clone(), repo)),
+        Some(repo) => runner.spawn_beads_poller(repo),
         None => {
             eprintln!(
                 "doorbell serve: {project}/{workspace} — beads poller off (no .beads board at an absolute project key or ~/workspace/<project>)"
             );
-            None
         }
     };
-    let brain = Brain::new(BrainConfig::new(&workspace), host, store, sinks)
-        .with_liveness(liveness)
-        .with_died_bell(died_bell);
-    let report = brain.run(rx).await;
-    drop(sweep_ticker);
+    let report = runner
+        .drive(host, sinks, store, std::future::pending())
+        .await;
     eprintln!(
         "doorbell serve: hosted loop {project}/{workspace} exited (injects={} sheds={} degraded={})",
         report.stats.injects, report.stats.sheds, report.stats.degraded
