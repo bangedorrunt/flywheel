@@ -132,6 +132,7 @@ pub struct TestStateHome {
     prev_home: Option<std::ffi::OsString>,
     prev_toron_data: Option<std::ffi::OsString>,
     prev_toron_mcp_data: Option<std::ffi::OsString>,
+    prev_br_bin: Option<std::ffi::OsString>,
 }
 
 #[cfg(test)]
@@ -144,6 +145,7 @@ impl Drop for TestStateHome {
         restore_env("HOME", self.prev_home.take());
         restore_env("TORON_DATA_DIR", self.prev_toron_data.take());
         restore_env("TORON_MCP_DATA_DIR", self.prev_toron_mcp_data.take());
+        restore_env("FLYWHEEL_BR_BIN", self.prev_br_bin.take());
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -180,10 +182,14 @@ pub fn test_state_home() -> TestStateHome {
     let prev_home = std::env::var_os("HOME");
     let prev_toron_data = std::env::var_os("TORON_DATA_DIR");
     let prev_toron_mcp_data = std::env::var_os("TORON_MCP_DATA_DIR");
+    // A pinned br binary from a sibling points at a temp stub that dies with
+    // its test; resolving it later is Os NotFound. Hermetic per guard.
+    let prev_br_bin = std::env::var_os("FLYWHEEL_BR_BIN");
     // A leaked store root from a sibling must not redirect this test.
     unsafe {
         std::env::remove_var("TORON_DATA_DIR");
         std::env::remove_var("TORON_MCP_DATA_DIR");
+        std::env::remove_var("FLYWHEEL_BR_BIN");
         std::env::set_var("XDG_STATE_HOME", &dir);
     }
     TestStateHome {
@@ -193,6 +199,7 @@ pub fn test_state_home() -> TestStateHome {
         prev_home,
         prev_toron_data,
         prev_toron_mcp_data,
+        prev_br_bin,
     }
 }
 
@@ -1435,6 +1442,7 @@ daily = [
                     prev_home: std::env::var_os("HOME"),
                     prev_toron_data: std::env::var_os("TORON_DATA_DIR"),
                     prev_toron_mcp_data: std::env::var_os("TORON_MCP_DATA_DIR"),
+                    prev_br_bin: std::env::var_os("FLYWHEEL_BR_BIN"),
                 };
                 assert_eq!(
                     std::env::var_os("XDG_STATE_HOME").as_deref(),
