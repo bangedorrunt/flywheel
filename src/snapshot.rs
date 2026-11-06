@@ -11,6 +11,12 @@
 
 use std::path::PathBuf;
 
+use anyhow::Result;
+use serde_json::{Value, json};
+
+use crate::config::Config;
+use crate::hc::Client;
+
 /// Versioned schema id. Robot JSON validates on this + the top-level keys.
 pub const SNAPSHOT_SCHEMA: &str = "flywheel-snapshot.v1";
 
@@ -660,6 +666,160 @@ pub fn render_helm(snap: &Snapshot, now: u64) -> String {
     }
     out.push('\n');
     out
+}
+
+pub(crate) fn robot_snapshot(cfg: &Config) -> Result<Value> {
+    if crate::pane::rex_door_selected(cfg) {
+        let backend = crate::backend::multiplexer_backend(cfg)?;
+        let workspaces = backend.workspace_list()?;
+        let agents = backend.agent_list()?;
+        let fly: Vec<Value> = workspaces
+            .iter()
+            .filter(|w| w.label.starts_with("flywheel-"))
+            .map(|w| {
+                let ws_agents: Vec<Value> = agents
+                    .iter()
+                    .filter(|a| a.workspace_id == w.workspace_id)
+                    .map(|a| {
+                        json!({
+                            "name": a.name, "kind": a.agent, "status": a.agent_status.as_str(),
+                            "pane_id": a.pane_id, "cwd": a.cwd, "interactive_ready": a.interactive_ready
+                        })
+                    })
+                    .collect();
+                json!({
+                    "workspace_id": w.workspace_id,
+                    "label": w.label,
+                    "cwd": w.cwd,
+                    "pane_count": w.pane_count,
+                    "agents": ws_agents
+                })
+            })
+            .collect();
+        let runs: Vec<Value> = snapshot_runs();
+        return Ok(json!({
+            "tool": "flywheel",
+            "version": crate::VERSION,
+            "ts": crate::state::now_iso(),
+            "workspaces": fly,
+            "runs": runs,
+            "agents": agents.iter().map(|a| json!({
+                "name": a.name, "kind": a.agent, "status": a.agent_status.as_str(),
+                "workspace_id": a.workspace_id, "pane_id": a.pane_id
+            })).collect::<Vec<_>>()
+        }));
+    }
+    let c = Client::connect(Some(&cfg.socket_path()))?;
+    let workspaces = c.workspace_list()?;
+    let agents = c.agent_list()?;
+    let fly: Vec<Value> = workspaces
+        .iter()
+        .filter(|w| w.label.starts_with("flywheel-"))
+        .map(|w| {
+            let ws_agents: Vec<Value> = agents
+                .iter()
+                .filter(|a| a.workspace_id == w.workspace_id)
+                .map(|a| {
+                    json!({
+                        "name": a.name, "kind": a.agent, "status": a.agent_status.as_str(),
+                        "pane_id": a.pane_id, "cwd": a.cwd, "interactive_ready": a.interactive_ready
+                    })
+                })
+                .collect();
+            json!({
+                "workspace_id": w.workspace_id,
+                "label": w.label,
+                "cwd": w.cwd,
+                "pane_count": w.pane_count,
+                "agents": ws_agents
+            })
+        })
+        .collect();
+    let runs: Vec<Value> = snapshot_runs();
+    Ok(json!({
+        "tool": "flywheel",
+        "version": crate::VERSION,
+        "ts": crate::state::now_iso(),
+        "workspaces": fly,
+        "runs": runs,
+        "agents": agents.iter().map(|a| json!({
+            "name": a.name, "kind": a.agent, "status": a.agent_status.as_str(),
+            "workspace_id": a.workspace_id, "pane_id": a.pane_id
+        })).collect::<Vec<_>>()
+    }))
+}
+
+/// Run list for the robot snapshot (P6.4) — workflow/pipeline/loop entries
+/// from the per-project logs, newest first, with state + owner + run-id.
+/// Independent of the `runs` CLI so the snapshot has no subcommand coupling.
+fn snapshot_runs() -> Vec<Value> {
+    use crate::state::EventKind;
+    let mut entries = Vec::new();
+    for project in crate::state::project_logs() {
+        let Ok(rows) = crate::state::read_log(&project) else {
+            continue;
+        };
+        for entry in rows {
+            if matches!(
+                entry.kind,
+                EventKind::Workflow | EventKind::Pipeline | EventKind::Loop
+            ) {
+                entries.push((project.clone(), entry));
+            }
+        }
+    }
+
+    latest_run_entries(entries)
+        .into_iter()
+        .map(|(project, entry)| {
+            let run_kind = crate::run_row_kind(&project, &entry);
+            let owner = ["workflow", "pipeline", "loop", "agent"]
+                .iter()
+                .find_map(|key| {
+                    entry
+                        .data
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                })
+                .unwrap_or_default();
+            json!({
+                "id": format!("{project}:{}", entry.ts),
+                "project": project,
+                "kind": run_kind,
+                "owner": owner,
+                "run_id": entry.data.get("run_id").cloned().unwrap_or(Value::Null),
+                "state": crate::history_row_status(&entry.data),
+                "ts": entry.ts,
+            })
+        })
+        .collect()
+}
+
+/// Reconcile lifecycle transitions to the latest outcome for each logical run.
+///
+/// A start row and its later terminal row share `run_id`; treating both as
+/// current makes a completed run look stuck. Annotation rows are not outcomes
+/// and rows without a `run_id` cannot be safely correlated, so both remain
+/// visible. This is deliberately a read projection: it never edits history or
+/// turns an unresolved run into a guessed terminal state.
+pub(crate) fn latest_run_entries(
+    mut entries: Vec<(String, crate::state::LogEntry)>,
+) -> Vec<(String, crate::state::LogEntry)> {
+    entries.sort_by(|a, b| b.1.ts.cmp(&a.1.ts));
+    let mut seen = std::collections::BTreeSet::new();
+    entries
+        .into_iter()
+        .filter(|(project, entry)| {
+            if crate::is_annotation_row(entry) {
+                return true;
+            }
+            let Some(run_id) = entry.data.get("run_id").and_then(Value::as_str) else {
+                return true;
+            };
+            seen.insert((project.clone(), run_id.to_string()))
+        })
+        .collect()
 }
 
 /// Top-level keys the robot JSON must carry (schema validation).

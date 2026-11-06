@@ -2071,9 +2071,9 @@ impl Mail {
                         "note": "active multiplexer is not hc; pane identity cleanup not applicable",
                     }));
                 }
-                match toron_core::backend::hc::HcBackend::connect(None) {
-                    Ok(backend) => {
-                        let pruned = mailbox().cleanup_pane_identities(&backend)?;
+                match toron_core::plane_port::LivePanePlane::connect_default() {
+                    Ok(plane) => {
+                        let pruned = mailbox().cleanup_pane_identities(&plane)?;
                         Ok(json!({ "pruned": pruned }))
                     }
                     Err(e) => Err(anyhow!(
