@@ -29,15 +29,16 @@ close ceremony commit exists; the verdict row was not re-read for that bead.
 | 8 | toron | wake KEEP decision | `57c27ae` | bd-wake-decommission-dsd8, LEGAL |
 | 9 | C (toron) | doctor judges live daemon, exit 3 | `236422f` | bd-wave9-doctor-freshness-exmk, LEGAL |
 | 10 | C (docs) | plane-split docs truth | `b61bc4f8` + `f27fc9c` | bd-wave10-plane-docs-uhmfi, LEGAL |
-| 11 | A | one snapshot producer | — | bd-wave11-snapshot-mndgf — IN PROGRESS |
+| 11 | A | one snapshot producer | `efb72963` | bd-wave11-snapshot-mndgf, LEGAL (unit-test-verified) |
 | 11 | B | always-on doorbell host | `14e49c4` | bd-wave11-doorbell-host-yiilt, LEGAL |
 | 12 | D (flywheel) | parse-or-refuse FLYWHEEL_* knobs | `c9dc22f3` | bd-wave12-config-strict-n9hcs, LEGAL (amendment close at heal) |
 | 12 | A | heal full flywheel suite | `d8094222` | bd-wave12-heal-suite-3r4q3, LEGAL (unit-test-verified) |
 | 13 | toron | default discovery store identity | `6077811` | bd-wave13-discovery-isolation-zt1z, closed |
 | 14 | toron | with-lease non-git zero-match | `e6ad5f5` | bd-wave14-withlease-nongit-2s0o, closed |
 | 14 | toron | comms-flag / backend-ADR-0045 tests | `2fe0f25` / `cc3152f` | both closed |
-| 15 | toron | doorbell host PATH + restart | — | bd-wave15-doorbell-live-2c6jf, closed |
-| 16 | C | presence fold + RunEnv bead | — | bd-presence-runenv-snapshot-fe4bh, OPEN (filed by this refresh) |
+| 15 | toron | doorbell host PATH + restart | `07444d67` + `98bf6be7` | bd-wave15-doorbell-live-2c6jf, closed |
+| 16 | C | presence fold + RunEnv bead | `630c79c8` | bd-presence-runenv-snapshot-fe4bh, closed (decision record) |
+| 17 | B | push wake end-to-end on rex | `0420fd0f` | bd-wave17-presence-producer-yjfol, LEGAL (unit-test-verified + live wake) |
 | 12 | C | campaign report (this page) | — | bd-wave12-campaign-report-g96kz, OPEN (this bead) |
 | 16 | C | campaign refresh (this update) | — | bd-wave16-report-refresh-j228e, OPEN (this bead) |
 
@@ -82,14 +83,21 @@ candidates DISPROVED as duplicates (documented KEEPs); no follow-up beads.
   LEGAL at `14e49c4`): `flywheel daemon start` installs one supervised
   host per armed workspace; live `/health` shows 2 hosted leases,
   12 subscribers, `degraded: []` (observed at refresh time).
-- **One snapshot producer** — still open: `status`/`progress`/`snapshot`/
-  robot doors still read independently. Bead: `bd-wave11-snapshot-mndgf`
-  (IN PROGRESS).
-- **Presence fold / RunEnv** — split decided (wave16 follow-up on
-  `bd-presence-runenv-snapshot-fe4bh`): the live presence producer is its
-  own bug, `bd-wave17-presence-producer-yjfol` (rex PlaneStatus → doorbell
-  model); RunEnv + FleetContext ride SnapshotV1 when
-  `bd-wave11-snapshot-mndgf` lands. This bead closes on the decision record.
+- **One snapshot producer** — DONE (`bd-wave11-snapshot-mndgf`, LEGAL at
+  `efb72963`): one `snapshot::assemble`; `status`/`progress`/`snapshot`/
+  `helm`/`snapshot_reporting` are pure projections; fixture
+  `tests/adr0010_d10.rs` proves the doors agree. Residuals (robot/serve keep
+  their GLOBAL fleet shape rather than a per-project read, and `status`
+  keeps its doorbell/facts/integrations extras) are named in
+  `.flywheel/reports/wave11-snapshot.md`.
+- **Presence fold / push wake** — DONE (`bd-wave17-presence-producer-yjfol`,
+  LEGAL at `0420fd0f`): rex `PlaneStatus` seeds the host model directly and
+  rides one 3s poll thread; `Msg::PlaneStatus` folds into the prompt gate's
+  presence map; the per-pin inbox cursor no longer advances past an
+  undecided wake; `PlanePromptSink` types through the selected plane. Live:
+  an idle rex pane showed the typed `[doorbell] plane-P urgent` line with
+  no spawn process alive. RunEnv + FleetContext remain a docs-level
+  decision (`bd-presence-runenv-snapshot-fe4bh`, closed) riding SnapshotV1.
 - **Doorbell host PATH + restart** — DONE (`bd-wave15-doorbell-live-2c6jf`,
   closed).
 - **Installed-binary + daemon freshness ritual** — operator procedure, no
