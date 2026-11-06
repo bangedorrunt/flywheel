@@ -3,7 +3,9 @@
 //! behavioral tests live in src/main.rs unit tests.
 //! Test names: adr0010_d14_* — filtered by `mbx +nightly-aarch64-apple-darwin test adr0010_d14`.
 
-const MAIN: &str = include_str!("../src/main.rs");
+mod support;
+
+static MAIN: std::sync::LazyLock<String> = std::sync::LazyLock::new(support::crate_source);
 
 #[test]
 fn adr0010_d14_guard_predicate_present() {

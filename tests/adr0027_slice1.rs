@@ -29,6 +29,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod support;
+
 /// The toron CLI this file drives: an explicit `TORON_BIN`, else the sibling
 /// debug build. There is deliberately NO PATH fallback, matching
 /// `sc_doorbell_adr0005.rs` (bd-oylu). A bare `toron` is whatever happens to be
@@ -584,8 +586,9 @@ fn adr0027_s1_guard_once_calls_tick_not_second_reducer() {
 
 #[test]
 fn adr0027_s1_guard_every_live_event_constructs_msg() {
-    let main_rs = flywheel_manifest_dir().join("src/main.rs");
-    let content = read_file(&main_rs);
+    // Whole-crate source: the live dispatcher moved to cmd/*; the Msg
+    // constructors may live beside the fold (workspace.rs) or the host.
+    let content = support::crate_source();
     for msg_variant in [
         "AckSlaTick",
         "WatchNdjson",
@@ -612,7 +615,9 @@ fn adr0027_s1_guard_heal_reclaim_fact_fetch_folded() {
     let state = flywheel_manifest_dir().join("src/state.rs");
     let d = read_file(&durable);
     let dt = read_file(&doorbell_tick);
-    let m = read_file(&main_rs);
+    let main = read_file(&main_rs);
+    // The live dispatcher moved to cmd/*; positives search the crate.
+    let m = support::crate_source();
     let s = read_file(&state);
 
     assert!(
@@ -634,7 +639,7 @@ fn adr0027_s1_guard_heal_reclaim_fact_fetch_folded() {
         "RED (bd-6b1y #10): DoorbellMsg::Fact not on live path — captain_fact_inject + adapter must not swallow Err"
     );
     assert!(
-        !m.contains("swallows") && !m.contains("Err(())") || !m.contains("10853"),
+        !main.contains("swallows") && !main.contains("Err(())") || !main.contains("10853"),
         "RED (bd-6b1y #10): adapter still swallows Err into () at main.rs 10853-10860 — must propagate fact into Msg"
     );
 }
@@ -642,9 +647,9 @@ fn adr0027_s1_guard_heal_reclaim_fact_fetch_folded() {
 #[test]
 fn adr0027_s1_why_corr_seq_replays_tick() {
     let doorbell = flywheel_manifest_dir().join("src/doorbell.rs");
-    let main_rs = flywheel_manifest_dir().join("src/main.rs");
     let d = read_file(&doorbell);
-    let m = read_file(&main_rs);
+    // cmd_doorbell_why moved to cmd/doorbell.rs; search the crate.
+    let m = support::crate_source();
     assert!(
         d.contains("doorbell-journal-{workspace}.jsonl") && d.contains("journals"),
         "RED (bd-6b1y #11): doorbell.rs journal path must be state_dir/journals/doorbell-journal-{{workspace}}.jsonl (1303-1306), not doorbell/<ws_hash>.jsonl"

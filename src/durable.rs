@@ -13791,7 +13791,7 @@ mod tests {
             loop_path.contains("\"__release-bead-locks\""),
             "the leaf must call the __release-bead-locks door"
         );
-        let main_src = include_str!("main.rs");
+        let main_src = crate::test_source::crate_source();
         let handler = main_src
             .split("fn cmd_internal_release_bead_locks")
             .nth(1)
@@ -13841,7 +13841,7 @@ mod tests {
                 "durable.rs (the loop core) must not touch hc directly: found {denied:?}"
             );
         }
-        let main_src = include_str!("main.rs");
+        let main_src = crate::test_source::crate_source();
         let collect = main_src
             .split("fn collect_poll_events")
             .nth(1)
@@ -15817,7 +15817,13 @@ mod mail_health_tests {
         let _home = crate::config::test_state_home();
         let cfg_home = std::env::temp_dir().join(format!("fw-reclaim-cfg-{}", std::process::id()));
         std::fs::create_dir_all(cfg_home.join("flywheel")).expect("temp XDG config dir");
-        std::fs::write(cfg_home.join("flywheel/config.toml"), "").expect("empty config");
+        // Unique mail identity: the test store is shared across projects, and
+        // ADR-0037 forbids reusing one pin across projects.
+        std::fs::write(
+            cfg_home.join("flywheel/config.toml"),
+            "[agent_mail]\nname = \"LoopReclaimPin\"\n",
+        )
+        .expect("config");
         let prev_cfg_home = std::env::var_os("XDG_CONFIG_HOME");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_home) };
 
@@ -15832,7 +15838,7 @@ mod mail_health_tests {
                 .expect("ensure project");
             crate::backend::run_mail(mail.register_agent(
                 &key,
-                &crate::spawn_agent_profile("flywheel", "flywheel", &project),
+                &crate::spawn_agent_profile("LoopReclaimPin", "flywheel", &project),
             ))
             .map(|_| ())
             .expect("register agent");
@@ -17109,6 +17115,8 @@ mod t4_close_tests {
 
     #[test]
     fn unarmed_record_refuses_forgery() {
+        let _lock = crate::verdict::lock_loop_reporter();
+        crate::verdict::test_reset_loop_reporter();
         let dir = scratch("unarmed");
         let v = runnable(&dir);
         let err = settle_loop_verify_output(&v, "proj", "bd-x", "abc", false, at(), || Ok(true))

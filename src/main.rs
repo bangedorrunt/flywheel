@@ -107,6 +107,8 @@ mod supervisor_host;
 mod supervisor_program;
 #[cfg(test)]
 mod test_env_contract;
+#[cfg(test)]
+mod test_source;
 mod timer_watch;
 mod unanswered_triage;
 mod upstream_parity;
@@ -5253,7 +5255,7 @@ mod bd2o1v_reset_tests {
     /// vacuous skills/behavior-emptiness heuristic.
     #[test]
     fn profile_projections_surface_fallback_and_real_builtin() {
-        let src = include_str!("main.rs");
+        let src = include_str!("cmd/profile.rs");
         let show = {
             let start = src
                 .rfind("ProfileCmd::Show { name, json } => {")
@@ -5492,9 +5494,9 @@ mod spawn_boot_reliability_tests {
     /// GS-037: send receipt honesty + wake observe-only + presence + compose retire.
     #[test]
     fn gs037_send_wake_presence_folds_present() {
-        let src = include_str!("main.rs");
-        let send = crate::tripwire::find_fn(src, "cmd_send");
-        let send_end = crate::tripwire::find_fn(src, "stall_step");
+        let src = crate::test_source::crate_source();
+        let send = crate::tripwire::find_fn(&src, "cmd_send");
+        let send_end = crate::tripwire::find_fn(&src, "stall_step");
         let send_body = &src[send..send_end];
         assert!(
             send_body.contains("fire_and_forget")
@@ -5530,8 +5532,8 @@ mod spawn_boot_reliability_tests {
                 && !giveup_slice.contains("break agent"),
             "GiveUp must return Err(stall_giveup_error), never break agent into landed"
         );
-        let persist = crate::tripwire::find_fn(src, "doorbell_note_observed_wake");
-        let persist_end = crate::tripwire::find_fn(src, "upsert_workspace_receipt");
+        let persist = crate::tripwire::find_fn(&src, "doorbell_note_observed_wake");
+        let persist_end = crate::tripwire::find_fn(&src, "upsert_workspace_receipt");
         let persist_body = &src[persist..persist_end];
         assert!(
             persist_body.contains("-> Result<()>")
@@ -5539,7 +5541,7 @@ mod spawn_boot_reliability_tests {
                 && !persist_body.contains("let _ = doorbell::save_wake_state"),
             "doorbell_note_observed_wake must fail-loud on save (no let _ =)"
         );
-        let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
+        let spawn = crate::tripwire::find_fn(&src, "cmd_spawn");
         let spawn_end = src[spawn..]
             .find("\nfn ")
             .map_or(spawn + 40000, |i| spawn + i);
@@ -5975,7 +5977,7 @@ mod spawn_boot_reliability_tests {
             !brain_rt.contains("injects.first()"),
             "Status arm must not invent-green from planned injects"
         );
-        let src = include_str!("main.rs");
+        let src = crate::test_source::crate_source();
         assert!(
             include_str!("cmd/doorbell.rs").contains("doorbell_note_observed_wake"),
             "GS-039 P0-1 wake observation helper must be present"
@@ -5990,8 +5992,8 @@ mod spawn_boot_reliability_tests {
             !src.contains(&invent_a) && !src.contains(&invent_b),
             "P0-1 must NOT stamp last_wake from planned injects (no invent-green or_else+injects.first)"
         );
-        let send = crate::tripwire::find_fn(src, "cmd_send");
-        let send_end = crate::tripwire::find_fn(src, "stall_step");
+        let send = crate::tripwire::find_fn(&src, "cmd_send");
+        let send_end = crate::tripwire::find_fn(&src, "stall_step");
         let send_body = &src[send..send_end];
         assert!(
             send_body.contains("doorbell_note_observed_wake(")
@@ -6033,8 +6035,8 @@ mod spawn_boot_reliability_tests {
                 "flush_wake must print {needle:?} so a lost wake save is loud and names its arm"
             );
         }
-        let note = crate::tripwire::find_fn(src, "doorbell_note_observed_wake");
-        let note_end = crate::tripwire::find_fn(src, "upsert_workspace_receipt");
+        let note = crate::tripwire::find_fn(&src, "doorbell_note_observed_wake");
+        let note_end = crate::tripwire::find_fn(&src, "upsert_workspace_receipt");
         let note_body = &src[note..note_end];
         let ratchet = format!("{}{}", "prev.", "saturating_add(1)");
         assert!(
@@ -6178,7 +6180,7 @@ mod spawn_boot_reliability_tests {
     /// wake state feeds at-least-once redelivery.
     #[test]
     fn doorbell_layer_is_supervised_observable_durable() {
-        let src = include_str!("main.rs");
+        let src = crate::test_source::crate_source();
         let surface = include_str!("cmd/doorbell.rs");
         assert!(
             surface.contains("enum DoorbellCmd"),
@@ -6192,15 +6194,15 @@ mod spawn_boot_reliability_tests {
         ] {
             assert!(src.contains(needle), "{needle} wired into the surface");
         }
-        let recover = crate::tripwire::find_fn(src, "cmd_recover");
-        let recover_end = crate::tripwire::find_fn(src, "rebind_from_registry");
+        let recover = crate::tripwire::find_fn(&src, "cmd_recover");
+        let recover_end = crate::tripwire::find_fn(&src, "rebind_from_registry");
         let recover_body = &src[recover..recover_end];
         assert!(
             recover_body.contains("doorbell::ensure_running"),
             "recover must heal dead dispatchers"
         );
-        let status = crate::tripwire::find_fn(src, "cmd_status");
-        let status_end = crate::tripwire::find_fn(src, "cmd_binding_rebind");
+        let status = crate::tripwire::find_fn(&src, "cmd_status");
+        let status_end = crate::tripwire::find_fn(&src, "cmd_binding_rebind");
         let status_body = &src[status..status_end];
         assert!(
             status_body.contains("doorbell::ensure_running") && status_body.contains("wake_state"),
@@ -10557,8 +10559,8 @@ mod bd_4pxy_tests {
     /// retries Enter only, and try_send_text_delivery returns the real bool.
     #[test]
     fn prime_and_try_send_delivery_honesty_tripwire() {
-        let src = include_str!("main.rs");
-        let prime = crate::tripwire::find_fn(src, "prime_line_via_send_text");
+        let src = crate::test_source::crate_source();
+        let prime = crate::tripwire::find_fn(&src, "prime_line_via_send_text");
         let prime_body = &src[prime..prime + 2800];
         assert!(
             prime_body.contains("agent_prompt(pane_id, line, None)")
@@ -10567,8 +10569,8 @@ mod bd_4pxy_tests {
                 && prime_body.contains("-> bool"),
             "prime_line_via_send_text must prefer agent.prompt, settle, Enter-only retry, return bool"
         );
-        let try_fn = crate::tripwire::find_fn(src, "try_send_text_delivery");
-        let try_end = crate::tripwire::find_fn(src, "status_label");
+        let try_fn = crate::tripwire::find_fn(&src, "try_send_text_delivery");
+        let try_end = crate::tripwire::find_fn(&src, "status_label");
         let try_body = &src[try_fn..try_end];
         assert!(
             try_body.contains("prime_line_via_send_text(c, pane_id, text)"),
@@ -11136,9 +11138,9 @@ mod send_stall_recovery_tests {
     /// Tripwire: first-stall path must read-before-retry, not blind sleep.
     #[test]
     fn send_stall_retry_reads_before_resend_tripwire() {
-        let src = include_str!("main.rs");
-        let send = crate::tripwire::find_fn(src, "cmd_send");
-        let send_end = crate::tripwire::find_fn(src, "stall_step");
+        let src = crate::test_source::crate_source();
+        let send = crate::tripwire::find_fn(&src, "cmd_send");
+        let send_end = crate::tripwire::find_fn(&src, "stall_step");
         let send_body = &src[send..send_end];
         assert!(
             send_body.contains("probe_prompt_after_stall")
@@ -12779,10 +12781,11 @@ mod wake_identity_tests {
             src.contains("refuse_unpinned_spawn(&agent_name, Some(name),"),
             "NEW-L8: profile spawn must bind + fail-closed"
         );
-        let profile_mark = src
+        let psrc = include_str!("cmd/profile.rs");
+        let profile_mark = psrc
             .find("let agent_name = format!(\"profile-{name}\")")
             .expect("profile agent_name");
-        let profile_slice = &src[profile_mark..src.len().min(profile_mark + 1200)];
+        let profile_slice = &psrc[profile_mark..psrc.len().min(profile_mark + 1200)];
         let p_refuse = profile_slice
             .find("refuse_unpinned_spawn")
             .expect("profile refuse");
@@ -12793,10 +12796,11 @@ mod wake_identity_tests {
             p_refuse < p_start,
             "NEW-L8: profile refuse_unpinned must run BEFORE agent_start"
         );
-        let squad_mark = src
+        let qsrc = include_str!("cmd/squad.rs");
+        let squad_mark = qsrc
             .find("let agent_name = format!(\"squad-{name}-{profile_name}-{}\"")
             .expect("squad agent_name");
-        let squad_slice = &src[squad_mark..src.len().min(squad_mark + 1400)];
+        let squad_slice = &qsrc[squad_mark..qsrc.len().min(squad_mark + 1400)];
         let s_refuse = squad_slice
             .find("refuse_unpinned_spawn")
             .expect("squad refuse");
@@ -12807,8 +12811,8 @@ mod wake_identity_tests {
             s_refuse < s_start,
             "NEW-L8: squad refuse_unpinned must run BEFORE agent_start"
         );
-        let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
-        let spawn_fn = &src[spawn..src.len().min(spawn + 55_000)];
+        let csrc = crate::test_source::crate_source();
+        let spawn_fn = crate::test_source::slice_from(&csrc, "pub(crate) fn cmd_spawn(", 55_000);
         let sp_refuse = spawn_fn
             .find("refuse_unpinned_spawn")
             .expect("cmd_spawn refuse_unpinned");
@@ -15178,33 +15182,42 @@ fn toron_setup_mcp(
     flywheel: bool,
 ) -> Result<()> {
     let url = url.unwrap_or("http://127.0.0.1:18080/mcp");
-    let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME unset"))?;
-    let home = std::path::Path::new(&home);
+    // A dry run reports; it must not fail because the environment is partial.
+    let home = match std::env::var("HOME") {
+        Ok(h) => Some(std::path::PathBuf::from(h)),
+        Err(_) if dry_run => None,
+        Err(_) => anyhow::bail!("HOME unset"),
+    };
     let mut changed: Vec<String> = Vec::new();
+    if home.is_none() {
+        println!("(--dry-run) HOME unset — would skip agent configs");
+    }
 
-    for kind in agents.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let kind = match kind {
-            "oc" => "opencode",
-            "gk" => "grok",
-            other => other,
-        };
-        match kind {
-            "opencode" => {
-                let p = home.join(".config/opencode/opencode.json");
-                changed.push(upsert_opencode_toron(&p, url, dry_run)?);
-            }
-            "pi" => {
-                let p = home.join(".pi/agent/mcp.json");
-                changed.push(upsert_pi_toron(&p, url, dry_run)?);
-            }
-            "grok" => {
-                let p = home.join(".grok/config.toml");
-                changed.push(upsert_grok_toron(&p, url, dry_run)?);
-            }
-            other => {
-                eprintln!(
-                    "flywheel: unknown agent kind '{other}' — use opencode,pi,grok (shorts oc,pi,gk)"
-                );
+    if let Some(home) = home.as_deref() {
+        for kind in agents.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let kind = match kind {
+                "oc" => "opencode",
+                "gk" => "grok",
+                other => other,
+            };
+            match kind {
+                "opencode" => {
+                    let p = home.join(".config/opencode/opencode.json");
+                    changed.push(upsert_opencode_toron(&p, url, dry_run)?);
+                }
+                "pi" => {
+                    let p = home.join(".pi/agent/mcp.json");
+                    changed.push(upsert_pi_toron(&p, url, dry_run)?);
+                }
+                "grok" => {
+                    let p = home.join(".grok/config.toml");
+                    changed.push(upsert_grok_toron(&p, url, dry_run)?);
+                }
+                other => {
+                    eprintln!(
+                        "flywheel: unknown agent kind '{other}' — use opencode,pi,grok (shorts oc,pi,gk)"
+                    );
+                }
             }
         }
     }
@@ -15463,6 +15476,7 @@ mod setup_mcp_tests {
     /// run in observation mode, no boot, no flywheel config write.
     #[test]
     fn setup_mcp_dry_run_reports_without_writing() {
+        let _guard = crate::config::lock_env();
         toron_setup_mcp(
             Some("http://127.0.0.1:18080/mcp"),
             "opencode,pi,grok",

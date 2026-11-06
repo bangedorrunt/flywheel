@@ -10,7 +10,9 @@
 //! in src/main.rs (mod adr0010_d13_tests).
 //! Test names: adr0010_d13_* — filtered by `mbx +nightly-aarch64-apple-darwin test adr0010_d13`.
 
-const MAIN: &str = include_str!("../src/main.rs");
+mod support;
+
+static MAIN: std::sync::LazyLock<String> = std::sync::LazyLock::new(support::crate_source);
 const SHIM: &str = include_str!("../src/hc.rs");
 const SWARM: &str = include_str!("../integrations/prompts/swarm.md.tpl");
 const LOOP: &str = include_str!("../integrations/prompts/loop.md.tpl");

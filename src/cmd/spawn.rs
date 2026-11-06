@@ -62,7 +62,7 @@ pub(crate) fn cmd_add_rex(
     crate::check_project_spelling(project, "add")?;
     let plan = crate::recipe_counts(None, counts, kinds)?;
     let request_key = request_key.map(str::trim).filter(|k| !k.is_empty());
-    let add_base = format!("{}-add", crate::swarm_label(project));
+    let add_base = format!("{}-add", swarm_label(project));
     let add_subject = match request_key {
         Some(key) => crate::request_receipts::label_for_request_key(&add_base, key),
         None => crate::slugify_label(&add_base).0,
@@ -246,7 +246,7 @@ pub(crate) fn cmd_add(
     }
     let plan = crate::recipe_counts(None, counts, kinds)?;
     let request_key = request_key.map(str::trim).filter(|k| !k.is_empty());
-    let add_base = format!("{}-add", crate::swarm_label(project));
+    let add_base = format!("{}-add", swarm_label(project));
     let add_subject = match request_key {
         Some(key) => crate::request_receipts::label_for_request_key(&add_base, key),
         None => crate::slugify_label(&add_base).0,
@@ -395,7 +395,7 @@ pub(crate) fn cmd_add(
                         mail_identity.as_deref().unwrap_or(&name),
                     ),
                 );
-                crate::prime_bootstrap(&mut c, &prev, &kind);
+                prime_bootstrap(&mut c, &prev, &kind);
             }
             crate::bind_pane_mail_identity(
                 cfg,
@@ -3524,7 +3524,7 @@ mod workspace_origin_tests {
         );
         let text = pane_write::launch_bootstrap(Harness::Pi);
         assert!(text.contains("toron next") && !text.contains("READY"));
-        let src = concat!(include_str!("../main.rs"), include_str!("spawn.rs"));
+        let src = crate::test_source::crate_source();
         let call_lines = |p: &str| {
             src.lines()
                 .filter(|l| l.trim_start().starts_with(p))
@@ -3553,7 +3553,7 @@ mod workspace_origin_tests {
 
     #[test]
     fn add_prime_wired_into_add_path() {
-        let src = include_str!("../main.rs");
+        let src = crate::test_source::crate_source();
         let add = src.find("fn cmd_add(").expect("cmd_add present in main.rs");
         let add_body = &src[add..];
         let prime_fn = src
@@ -3582,7 +3582,7 @@ mod workspace_origin_tests {
 
     #[test]
     fn add_mints_mail_identity_and_writes_agent_names() {
-        let src = include_str!("../main.rs");
+        let src = crate::test_source::crate_source();
         let add = src.find("fn cmd_add(").expect("cmd_add present in main.rs");
         let add_body = &src[add..];
         assert!(
@@ -3597,9 +3597,9 @@ mod workspace_origin_tests {
 
     #[test]
     fn add_never_passes_launch_text_as_agent_start_args() {
-        let src = include_str!("../main.rs");
-        let add = crate::tripwire::find_fn(src, "cmd_add");
-        let add_end = crate::tripwire::find_fn(src, "cmd_list");
+        let src = crate::test_source::crate_source();
+        let add = crate::tripwire::find_fn(&src, "cmd_add");
+        let add_end = crate::tripwire::find_fn(&src, "preflight_gate");
         let add_body = &src[add..add_end];
         assert!(
             !add_body.contains("add_args.push(doorbell::identity_prime"),
@@ -3629,7 +3629,7 @@ mod adr0013_spawn_effect_tests {
     /// Slice one top-level function body. Both needles carry a real newline so
     /// they can only match real code — never a test literal, which spells the
     /// newline as an escape and so contains no newline character.
-    fn body_of(src: &'static str, start_needle: &str, end_needle: &str) -> &'static str {
+    fn body_of<'a>(src: &'a str, start_needle: &str, end_needle: &str) -> &'a str {
         let start = src
             .find(start_needle)
             .unwrap_or_else(|| panic!("expected {start_needle:?}"));
@@ -3644,8 +3644,8 @@ mod adr0013_spawn_effect_tests {
     /// I4: the spawn intent is committed before the workspace dispatch.
     #[test]
     fn spawn_journals_intent_before_dispatch() {
-        let src = include_str!("spawn.rs");
-        let spawn = body_of(src, "pub(crate) fn cmd_spawn(", "\nfn poll_child_exit(");
+        let src = crate::test_source::crate_source();
+        let spawn = body_of(&src, "pub(crate) fn cmd_spawn(", "\nfn poll_child_exit(");
         let intent = spawn
             .find("AgentEffectGuard::begin(project, &label, agent_ref::AgentPhase::Spawn)")
             .expect("cmd_spawn must journal the spawn intent");
@@ -3665,8 +3665,8 @@ mod adr0013_spawn_effect_tests {
     /// refuses instead of racing one.
     #[test]
     fn the_spawn_receipt_gate_precedes_dispatch() {
-        let src = include_str!("spawn.rs");
-        let spawn = body_of(src, "pub(crate) fn cmd_spawn(", "\nfn poll_child_exit(");
+        let src = crate::test_source::crate_source();
+        let spawn = body_of(&src, "pub(crate) fn cmd_spawn(", "\nfn poll_child_exit(");
         let gate = spawn
             .find("request_receipts::spawn_gate(")
             .expect("cmd_spawn must consult the request-key receipt");
@@ -3877,8 +3877,8 @@ mod adr0013_spawn_effect_tests {
     /// I5: Settled needs apply evidence; `--no-verify` journals Unknown.
     #[test]
     fn spawn_never_settles_without_apply_evidence() {
-        let src = include_str!("spawn.rs");
-        let spawn = body_of(src, "pub(crate) fn cmd_spawn(", "\nfn poll_child_exit(");
+        let src = crate::test_source::crate_source();
+        let spawn = body_of(&src, "pub(crate) fn cmd_spawn(", "\nfn poll_child_exit(");
         let unknown = spawn
             .find("spawn_effect.mark_unknown(Some(\"--no-verify")
             .expect("--no-verify must journal Unknown, not Settled");
@@ -3901,8 +3901,8 @@ mod adr0013_spawn_effect_tests {
     /// never re-derives a second, possibly-divergent route.
     #[test]
     fn spawn_ledger_records_model_pin_and_skills_digest() {
-        let src = include_str!("spawn.rs");
-        let spawn = body_of(src, "pub(crate) fn cmd_spawn(", "\nfn poll_child_exit(");
+        let src = crate::test_source::crate_source();
+        let spawn = body_of(&src, "pub(crate) fn cmd_spawn(", "\nfn poll_child_exit(");
         assert!(
             spawn.contains("profile_launch_plan(&kind, p, None)"),
             "cmd_spawn must resolve argv + pin in ONE call (P1-7)"
@@ -3965,8 +3965,8 @@ mod adr0013_spawn_effect_tests {
     /// I6: the wake read is its own observation row, separate from spawn.
     #[test]
     fn wake_observation_is_separate_journal_evidence() {
-        let src = include_str!("spawn.rs");
-        let spawn = body_of(src, "pub(crate) fn cmd_spawn(", "\nfn poll_child_exit(");
+        let src = crate::test_source::crate_source();
+        let spawn = body_of(&src, "pub(crate) fn cmd_spawn(", "\nfn poll_child_exit(");
         let obs = &spawn[spawn
             .find("agent_ref::AgentEffect {")
             .expect("cmd_spawn must journal the wake observation")..];
@@ -4025,17 +4025,21 @@ mod adr0013_spawn_effect_tests {
     }
 
     /// D9: the per-pin presence publish journals intent before the invoke and
-    /// a terminal row from the observed outcome.
+    /// a terminal row from the observed outcome. Scoped to the owning
+    /// function (`publish_presence_for_registry`): the presence code never
+    /// lived inline in `cmd_spawn` — the old slice only caught it through an
+    /// EOF-fallback accident.
     #[test]
     fn presence_journals_per_pin_effect() {
-        let src = include_str!("spawn.rs");
-        let spawn = body_of(src, "pub(crate) fn cmd_spawn(", "\nfn poll_child_exit(");
+        let src = crate::test_source::crate_source();
+        let start = crate::test_source::find_close(&src, "fn publish_presence_for_registry(");
+        let spawn = body_of(&src[start..], "fn publish_presence_for_registry(", "\nfn ");
         let intent = spawn
             .find("agent_ref::AgentPhase::Presence")
             .expect("presence publish must journal its intent");
         let invoke = spawn
-            .find("Command::new(\"toron\")")
-            .expect("presence publish invokes toron");
+            .find("m.presence_publish(")
+            .expect("presence publish invokes the mail surface");
         assert!(
             intent < invoke,
             "I4: presence intent must precede the publish invoke"

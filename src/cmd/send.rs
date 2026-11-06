@@ -16,7 +16,9 @@ use crate::config::Config;
 use crate::hc::SendVerdict;
 use crate::hc::{AgentInfo, AgentStatus, Client, WaitOptions};
 use crate::output::{dim, print_json, status_paint};
-use crate::{agent_ref, backend, comms_send, durable, failure, profile, state};
+use crate::{
+    agent_ref, backend, comms_send, durable, failure, prime_line_via_send_text, profile, state,
+};
 
 /// `flywheel send --via-inbox` (ADR-0041, build-plan §5): the brief goes to
 /// each recipient's comms inbox as ONE `task@1` envelope through toron's
@@ -1310,7 +1312,7 @@ fn try_send_text_delivery(
     eprintln!(
         "flywheel: {name} ({pane_id}) is a recipe-harness pane (kind {kind}) — delivering via pane.send_text"
     );
-    crate::prime_line_via_send_text(c, pane_id, text)
+    prime_line_via_send_text(c, pane_id, text)
 }
 
 /// bd-4pxy: a launch_pending agent is NOT idle — it is still booting

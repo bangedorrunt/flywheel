@@ -5,7 +5,9 @@
 //! Behavior tests for the pure core live in src/snapshot.rs #[cfg(test)]
 //! (same filter); this file pins the source contract.
 
-const MAIN: &str = include_str!("../src/main.rs");
+mod support;
+
+static MAIN: std::sync::LazyLock<String> = std::sync::LazyLock::new(support::crate_source);
 
 /// D10 snapshot contract: versioned schema assembled once, consumed by
 /// status / view / watch / steer_brief.

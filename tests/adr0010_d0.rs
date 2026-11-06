@@ -6,7 +6,33 @@
 //! Test names: adr0010_d0_* — filtered by `mbx +nightly-aarch64-apple-darwin test adr0010_d0`.
 
 const DURABLE: &str = include_str!("../src/durable.rs");
-const MAIN: &str = include_str!("../src/main.rs");
+
+/// "main.rs" as it exists after the cmd/ eviction: main.rs plus every
+/// src/cmd/*.rs file. The eviction moved handler bodies there, so a tripwire
+/// that used to grep main.rs must see their new home, but it must NOT pull in
+/// unrelated modules (workspace.rs, durable.rs) and change the per-file rules.
+fn crate_source() -> String {
+    fn visit(dir: &std::path::Path, out: &mut String) {
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .expect("src readable")
+            .map(|e| e.expect("dir entry").path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                visit(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push_str(&std::fs::read_to_string(&path).expect("read src"));
+                out.push('\n');
+            }
+        }
+    }
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut out = std::fs::read_to_string(src.join("main.rs")).expect("main.rs");
+    out.push('\n');
+    visit(&src.join("cmd"), &mut out);
+    out
+}
 
 /// D0 producer deletion: no durable `poll_mail_digests` definition and no
 /// leaf registration. A registered leaf is an available Msg producer even
@@ -33,7 +59,7 @@ fn adr0010_d0_digest_producer_deleted() {
 #[test]
 fn adr0010_d0_one_live_workspace_model() {
     check_file("durable.rs", DURABLE);
-    check_file("main.rs", MAIN);
+    check_file("main.rs", &crate_source());
 }
 
 fn check_file(name: &str, src: &str) {
@@ -71,10 +97,13 @@ fn check_file(name: &str, src: &str) {
 
 /// Name the function defined by a trimmed line, if it defines one.
 fn fn_def_name(t: &str) -> Option<String> {
+    let t = t
+        .strip_prefix("pub(crate) ")
+        .or_else(|| t.strip_prefix("pub(super) "))
+        .or_else(|| t.strip_prefix("pub "))
+        .unwrap_or(t);
     let rest = t
-        .strip_prefix("pub async fn ")
-        .or_else(|| t.strip_prefix("async fn "))
-        .or_else(|| t.strip_prefix("pub fn "))
+        .strip_prefix("async fn ")
         .or_else(|| t.strip_prefix("fn "))?;
     Some(rest.chars().take_while(|c| *c != '(').collect())
 }
@@ -89,7 +118,7 @@ fn fn_def_name(t: &str) -> Option<String> {
 #[test]
 fn adr0010_d0_throwaway_folds_never_dispatch() {
     for name in ["cmd_doorbell_why", "cmd_doorbell_afk", "cmd_reclassify"] {
-        let body = fn_body(MAIN, name);
+        let body = fn_body(&crate_source(), name);
         for forbidden in [
             "handle_workspace_cmds",
             "agent.prompt(",

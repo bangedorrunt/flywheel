@@ -129,6 +129,9 @@ pub struct TestStateHome {
     _env: std::sync::MutexGuard<'static, ()>,
     dir: PathBuf,
     prev: Option<std::ffi::OsString>,
+    prev_home: Option<std::ffi::OsString>,
+    prev_toron_data: Option<std::ffi::OsString>,
+    prev_toron_mcp_data: Option<std::ffi::OsString>,
 }
 
 #[cfg(test)]
@@ -138,11 +141,27 @@ impl Drop for TestStateHome {
             Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
             None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
         }
+        restore_env("HOME", self.prev_home.take());
+        restore_env("TORON_DATA_DIR", self.prev_toron_data.take());
+        restore_env("TORON_MCP_DATA_DIR", self.prev_toron_mcp_data.take());
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
+#[cfg(test)]
+fn restore_env(name: &str, prev: Option<std::ffi::OsString>) {
+    match prev {
+        Some(v) => unsafe { std::env::set_var(name, v) },
+        None => unsafe { std::env::remove_var(name) },
+    }
+}
+
 /// Begin a hermetic state-dir test (see [`TestStateHome`]).
+///
+/// The guard also snapshots HOME / TORON_DATA_DIR / TORON_MCP_DATA_DIR and
+/// clears the two toron roots for its lifetime: a sibling that leaks a store
+/// root must not redirect this test, and a sibling that unsets HOME must not
+/// outlive its guard. Roots set inside the guard are restored on drop.
 #[cfg(test)]
 pub fn test_state_home() -> TestStateHome {
     let _env = ENV_LOCK
@@ -158,8 +177,23 @@ pub fn test_state_home() -> TestStateHome {
     ));
     std::fs::create_dir_all(&dir).expect("create test state home");
     let prev = std::env::var_os("XDG_STATE_HOME");
-    unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
-    TestStateHome { _env, dir, prev }
+    let prev_home = std::env::var_os("HOME");
+    let prev_toron_data = std::env::var_os("TORON_DATA_DIR");
+    let prev_toron_mcp_data = std::env::var_os("TORON_MCP_DATA_DIR");
+    // A leaked store root from a sibling must not redirect this test.
+    unsafe {
+        std::env::remove_var("TORON_DATA_DIR");
+        std::env::remove_var("TORON_MCP_DATA_DIR");
+        std::env::set_var("XDG_STATE_HOME", &dir);
+    }
+    TestStateHome {
+        _env,
+        dir,
+        prev,
+        prev_home,
+        prev_toron_data,
+        prev_toron_mcp_data,
+    }
 }
 
 pub const DEFAULT_TIMEOUT_MS: u64 = 1_800_000;
@@ -1398,6 +1432,9 @@ daily = [
                     _env: _g,
                     dir: ours.clone(),
                     prev: Some(sentinel.clone().into_os_string()),
+                    prev_home: std::env::var_os("HOME"),
+                    prev_toron_data: std::env::var_os("TORON_DATA_DIR"),
+                    prev_toron_mcp_data: std::env::var_os("TORON_MCP_DATA_DIR"),
                 };
                 assert_eq!(
                     std::env::var_os("XDG_STATE_HOME").as_deref(),
@@ -1615,6 +1652,9 @@ daily = [
         let _g = lock_env();
         let home = std::env::temp_dir().join(format!("flywheel-to-home-{}", std::process::id()));
         let xdg = std::env::temp_dir().join(format!("flywheel-to-xdg-{}", std::process::id()));
+        let prev_home = std::env::var_os("HOME");
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_timeout = std::env::var_os("FLYWHEEL_TIMEOUT");
         unsafe { std::env::set_var("HOME", &home) };
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
         unsafe { std::env::set_var("FLYWHEEL_TIMEOUT", "abc") };
@@ -1626,9 +1666,18 @@ daily = [
         unsafe { std::env::set_var("FLYWHEEL_TIMEOUT", "30000") };
         let cfg = Config::load().expect("valid timeout parses");
         assert_eq!(cfg.default_timeout_ms, Some(30000));
-        unsafe { std::env::remove_var("FLYWHEEL_TIMEOUT") };
-        unsafe { std::env::remove_var("HOME") };
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        match prev_timeout {
+            Some(v) => unsafe { std::env::set_var("FLYWHEEL_TIMEOUT", v) },
+            None => unsafe { std::env::remove_var("FLYWHEEL_TIMEOUT") },
+        }
+        match prev_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match prev_xdg {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
     }
 
     /// 193.2: `state_dir()` honors `XDG_STATE_HOME` first (hermetic state
@@ -1636,6 +1685,7 @@ daily = [
     #[test]
     fn state_dir_honors_xdg_state_home() {
         let _g = lock_env();
+        let prev_xdg_state = std::env::var_os("XDG_STATE_HOME");
         unsafe { std::env::remove_var("XDG_STATE_HOME") };
         unsafe { std::env::set_var("XDG_STATE_HOME", "/tmp/fw-state-xdg") };
         assert_eq!(
@@ -1643,7 +1693,10 @@ daily = [
             PathBuf::from("/tmp/fw-state-xdg/flywheel"),
             "XDG_STATE_HOME wins over dirs::state_dir()"
         );
-        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        match prev_xdg_state {
+            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        }
     }
     /// bd-y6gw: without XDG the fallback is ~/.local/state (matching
     /// daemon::default_state_dir), never dirs::state_dir() — one tree for
@@ -1651,6 +1704,8 @@ daily = [
     #[test]
     fn state_dir_falls_back_to_dotlocal_not_appsupport() {
         let _g = lock_env();
+        let prev_xdg_state = std::env::var_os("XDG_STATE_HOME");
+        let prev_home = std::env::var_os("HOME");
         unsafe { std::env::remove_var("XDG_STATE_HOME") };
         let home = std::env::temp_dir().join(format!("fw-home-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
@@ -1660,7 +1715,14 @@ daily = [
             home.join(".local/state/flywheel"),
             "no XDG -> ~/.local/state, same tree the daemon uses"
         );
-        unsafe { std::env::remove_var("HOME") };
+        match prev_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match prev_xdg_state {
+            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        }
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1675,6 +1737,8 @@ daily = [
         let xdg = std::env::temp_dir().join(format!("flywheel-xdg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&xdg);
+        let prev_home = std::env::var_os("HOME");
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
         unsafe { std::env::set_var("HOME", &home) };
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
         let legacy_dir = home.join("Library/Application Support/flywheel");
@@ -1699,8 +1763,14 @@ daily = [
         );
         let copied = std::fs::read_to_string(&xdg_file).unwrap();
         assert!(copied.contains("Orchid"), "copied body intact");
-        unsafe { std::env::remove_var("HOME") };
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        match prev_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match prev_xdg {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
     }
 
     /// XDG beats legacy when both exist (precedence XDG > legacy > default).
@@ -1713,6 +1783,8 @@ daily = [
         let xdg = std::env::temp_dir().join(format!("flywheel-pref-xdg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&xdg);
+        let prev_home = std::env::var_os("HOME");
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
         unsafe { std::env::set_var("HOME", &home) };
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
         std::fs::create_dir_all(home.join("Library/Application Support/flywheel")).unwrap();
@@ -1734,8 +1806,14 @@ daily = [
             Some("Xdg"),
             "XDG wins over legacy"
         );
-        unsafe { std::env::remove_var("HOME") };
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        match prev_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match prev_xdg {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
     }
 
     #[test]

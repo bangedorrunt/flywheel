@@ -1414,7 +1414,7 @@ mod reserved_log_sweep_tests {
     /// single enumeration as the only way a log sweep reaches the state dir.
     #[test]
     fn log_sweeps_go_through_the_shared_enumeration() {
-        let src = include_str!("main.rs");
+        let src = crate::test_source::crate_source();
         let history = src
             .split("WorkflowCmd::History { name } => {")
             .nth(1)

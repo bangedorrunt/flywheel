@@ -97,7 +97,19 @@ fn role_uses(action: &Action, inputs: &BTreeMap<String, String>, out: &mut Vec<S
     match action {
         Action::DispatchJob { spec, .. } => {
             if let Some(p) = spec.profile.as_deref() {
-                out.push(p.trim_start_matches('@').to_string());
+                // Resolve a declared input default before treating a profile as
+                // a role; an unresolved placeholder is not a role and must not
+                // seat a pane (bd-mb0z / repair-until-verified coder_profile).
+                let resolved = p
+                    .trim()
+                    .strip_prefix("{{inputs.")
+                    .and_then(|rest| rest.strip_suffix("}}"))
+                    .map(|name| inputs.get(name.trim()).cloned().unwrap_or_default())
+                    .unwrap_or_else(|| p.to_string());
+                let role = resolved.trim().trim_start_matches('@').trim();
+                if !role.is_empty() && !role.contains("{{") {
+                    out.push(role.to_string());
+                }
             }
         }
         Action::Parallel { over, each } => {

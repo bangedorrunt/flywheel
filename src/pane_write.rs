@@ -262,10 +262,17 @@ pub(crate) const PANE_TEXT_CALLS: &[&str] = &[
 /// Legacy call sites that still type text, frozen at their Phase 2 count.
 /// This list may only shrink: the legacy payload path is deleted by
 /// 2026-11-08 (build-plan §12.4). A new site anywhere else fails
-/// `only_the_sink_types_into_panes`.
+/// `only_the_sink_types_into_panes`. The wave5 cmd/ eviction re-homed two
+/// main.rs sites without changing the total (6+1+1+1 = 9): cmd_send's
+/// delivery prompt lives in cmd/send.rs, cmd_mail's identity prime in
+/// cmd/mail.rs. Counts follow the code; the total never grows.
 #[cfg(test)]
-pub(crate) const LEGACY_PANE_TEXT_SITES: &[(&str, usize)] =
-    &[("src/cmd/doorbell.rs", 1), ("src/main.rs", 8)];
+pub(crate) const LEGACY_PANE_TEXT_SITES: &[(&str, usize)] = &[
+    ("src/cmd/doorbell.rs", 1),
+    ("src/cmd/mail.rs", 1),
+    ("src/cmd/send.rs", 1),
+    ("src/main.rs", 6),
+];
 
 /// Transport-implementation calls (bd-pane-fence-hc-jwq4s): the two
 /// `.agent_prompt_coded(` sites in `src/hc.rs` ARE the PaneWrite

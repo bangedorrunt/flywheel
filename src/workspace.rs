@@ -3237,14 +3237,33 @@ mod bell_fold_tests {
 
     #[test]
     fn bell_fold_watchdied_keeps_model() {
-        let src = include_str!("main.rs");
+        // Scoped to the bell fold: the WatchDied arm must keep the returned
+        // model. A crate-wide `!contains` of the old discard line self-matches
+        // the test's own needle now that tests live in-corpus.
+        let src = crate::test_source::crate_source();
+        let start =
+            crate::test_source::find_close(&src, "pub fn tick(model: &WorkspaceModel, msg: &Msg)");
+        let rest = &src[start..];
+        let end = rest
+            .find("\npub fn ")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let tick_body = &src[start..end];
+        let arm = tick_body
+            .find("Msg::WatchDied =>")
+            .expect("WatchDied arm exists");
+        let arm_end = tick_body[arm..]
+            .find("\n        Msg::")
+            .map(|i| arm + i)
+            .unwrap_or(tick_body.len());
+        let arm_body = &tick_body[arm..arm_end];
         assert!(
-            !src.contains("let (_, tick_actions) = doorbell_tick::tick(&bell_model, &msg)"),
-            "RED (bd-6b1y #8): main.rs WatchDied still discards model' (`let (_, tick_actions) = tick(...)` at 8055) — keep the returned model"
+            !arm_body.contains("let (_, "),
+            "RED (bd-6b1y #8): WatchDied must keep the returned model, never `let (_, ...)`-discard it"
         );
         assert!(
-            src.contains("WatchDied"),
-            "src must contain WatchDied handling"
+            arm_body.contains("next.doorbell = dm"),
+            "WatchDied must write the ticked model back"
         );
     }
 
@@ -4089,7 +4108,7 @@ mod presence_model_tests {
 
     #[test]
     fn presence_model_watch_filter_has_20001() {
-        let src = include_str!("main.rs");
+        let src = include_str!("cmd/doorbell.rs");
         assert!(
             src.contains("30013") && src.contains("20001"),
             "watch filter must include 30013 and 20001"

@@ -16,7 +16,9 @@ const DURABLE: &str = include_str!("../src/durable.rs");
 const MESSAGING: &str = include_str!("../../toron/crates/toron-core/src/mailbox/messaging.rs");
 const TORON_CLI: &str = include_str!("../../toron/crates/toron-cli/src/cli.rs");
 const TORON_ROBOT: &str = include_str!("../../toron/crates/toron-cli/src/robot.rs");
-const MAIN: &str = include_str!("../src/main.rs");
+mod support;
+
+static MAIN: std::sync::LazyLock<String> = std::sync::LazyLock::new(support::crate_source);
 const SURFACE: &str = include_str!("../../toron/crates/toron-core/src/mailbox/surface.rs");
 
 #[test]

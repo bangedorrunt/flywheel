@@ -6,9 +6,33 @@
 //! #[cfg(test)] mod (same filter); this file pins the source contract.
 
 const WORKSPACE: &str = include_str!("../src/workspace.rs");
-const MAIN: &str = include_str!("../src/main.rs");
 const TPL: &str = include_str!("../integrations/peer-aware.md.tpl");
 const DOORBELL: &str = include_str!("../src/doorbell.rs");
+
+/// main.rs plus the cmd/* bodies it was split into (the eviction moved
+/// cmd_send there; a source contract that used to grep main.rs must follow).
+fn main_plus_cmd() -> String {
+    fn visit(dir: &std::path::Path, out: &mut String) {
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .expect("src readable")
+            .map(|e| e.expect("dir entry").path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                visit(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push_str(&std::fs::read_to_string(&path).expect("read src"));
+                out.push('\n');
+            }
+        }
+    }
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut out = std::fs::read_to_string(src.join("main.rs")).expect("main.rs");
+    out.push('\n');
+    visit(&src.join("cmd"), &mut out);
+    out
+}
 
 /// D1 ladder knobs: grace 90s, max 3 rings — then Dead→respawn, Unknown→digest.
 #[test]
@@ -38,8 +62,9 @@ fn adr0010_d1_doorbell_line_ctor_present() {
         WORKSPACE.contains("unacked for"),
         "D1 (bd-w98c): doorbell line must render `[doorbell] inbox: <n> unacked for <pin>; latest corr=<c>; read + ack`"
     );
+    let main = main_plus_cmd();
     assert!(
-        MAIN.contains("delivery_id_of") && MAIN.contains("delivery_id"),
+        main.contains("delivery_id_of") && main.contains("delivery_id"),
         "D1 (bd-w98c): cmd_send must bind --fire-and-forget <id> to the delivery record (ladder skip key)"
     );
 }
@@ -48,8 +73,9 @@ fn adr0010_d1_doorbell_line_ctor_present() {
 /// id; re-enqueue idempotent; acked corrs skip the ladder.
 #[test]
 fn adr0010_d1_fire_and_forget_id_bound_to_ladder() {
+    let main = main_plus_cmd();
     assert!(
-        MAIN.contains("delivery-id") || MAIN.contains("delivery_id"),
+        main.contains("delivery-id") || main.contains("delivery_id"),
         "D1 (bd-w98c): --fire-and-forget must accept a caller-supplied <delivery-id>"
     );
     assert!(

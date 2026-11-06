@@ -16,7 +16,9 @@ use toron_core::mailbox::send_tags::Wake;
 use toron_core::mailbox::{Corr, Receipt};
 
 const MESSAGING: &str = include_str!("../../toron/crates/toron-core/src/mailbox/messaging.rs");
-const MAIN: &str = include_str!("../src/main.rs");
+mod support;
+
+static MAIN: std::sync::LazyLock<String> = std::sync::LazyLock::new(support::crate_source);
 const CMD_MAIL: &str = include_str!("../src/cmd/mail.rs");
 
 async fn test_store(tag: &str) -> (ReceiptStore, tempfile::TempDir) {

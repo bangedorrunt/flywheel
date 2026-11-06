@@ -4119,30 +4119,37 @@ pub(crate) fn mail_inbox_fallback_argv(pin: &str, project: &str, since: &str) ->
 }
 
 fn acquire_cargo_slot(cfg: &Config, project: &str) {
-    let agent = cfg
-        .agent_mail
-        .as_ref()
-        .and_then(|m| m.name.clone())
-        .unwrap_or_else(|| "flywheel-toron-loop1".to_string());
-    let ttl = toron_core::bus::DEFAULT_ENVELOPE_TTL_SECS;
-    match crate::mail_or_die(cfg).and_then(|m| m.acquire_slot(project, &agent, "cargo", true, ttl))
-    {
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("flywheel: loop-run-verify cargo slot acquire failed (continuing): {e:#}")
+    // The workflow/loop path can call this from a tokio worker; the sync mail
+    // bridge must run off that runtime (bd-swarm-loop-durable-panic-atlo).
+    crate::backend::run_mail_off_runtime_sync(|| {
+        let agent = cfg
+            .agent_mail
+            .as_ref()
+            .and_then(|m| m.name.clone())
+            .unwrap_or_else(|| "flywheel-toron-loop1".to_string());
+        let ttl = toron_core::bus::DEFAULT_ENVELOPE_TTL_SECS;
+        match crate::mail_or_die(cfg)
+            .and_then(|m| m.acquire_slot(project, &agent, "cargo", true, ttl))
+        {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("flywheel: loop-run-verify cargo slot acquire failed (continuing): {e:#}")
+            }
         }
-    }
+    })
 }
 
 fn release_cargo_slot(cfg: &Config, project: &str) {
-    let agent = cfg
-        .agent_mail
-        .as_ref()
-        .and_then(|m| m.name.clone())
-        .unwrap_or_else(|| "flywheel-toron-loop1".to_string());
-    if let Ok(m) = crate::mail_or_die(cfg) {
-        let _ = m.release_slot(project, &agent, "cargo");
-    }
+    crate::backend::run_mail_off_runtime_sync(|| {
+        let agent = cfg
+            .agent_mail
+            .as_ref()
+            .and_then(|m| m.name.clone())
+            .unwrap_or_else(|| "flywheel-toron-loop1".to_string());
+        if let Ok(m) = crate::mail_or_die(cfg) {
+            let _ = m.release_slot(project, &agent, "cargo");
+        }
+    })
 }
 
 /// The unverified-close mail: thread = the bead id, subject `[<id>]

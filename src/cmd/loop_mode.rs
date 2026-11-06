@@ -1339,10 +1339,10 @@ esac
     fn rex_send_arm_constructs_no_plane_client() {
         let src = include_str!("send.rs");
         let send = src
-            .split_once("\nfn cmd_send(")
+            .split_once("\npub(crate) fn cmd_send(")
             .expect("cmd_send exists")
             .1
-            .split_once("\nfn mint_task_id()")
+            .split_once("\npub(crate) fn mint_task_id()")
             .expect("cmd_send ends before mint_task_id")
             .0;
         assert!(
@@ -1354,10 +1354,10 @@ esac
             "the route is by backend name, never REX_SESSION"
         );
         let rex = src
-            .split_once("\nfn cmd_send_rex(")
+            .split_once("\npub(crate) fn cmd_send_rex(")
             .expect("cmd_send_rex exists")
             .1
-            .split_once("\nfn cmd_send(")
+            .split_once("\npub(crate) fn cmd_send(")
             .expect("cmd_send_rex ends at cmd_send")
             .0;
         assert!(

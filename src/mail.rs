@@ -2074,8 +2074,14 @@ impl Mail {
                         "note": "active multiplexer is not hc; pane identity cleanup not applicable",
                     }));
                 }
-                match toron_plane::LivePanePlane::connect_default() {
-                    Ok(plane) => {
+                // hc-specific cleanup must ride the hc plane it checked above:
+                // connect_default() re-resolves via TORON_BACKEND and can land
+                // on rex (which succeeds without touching the dead socket),
+                // silently cleaning the wrong plane. Explicit hc connect keeps
+                // the hc-down outage loud (c3b.7). HC_SOCKET_PATH honored.
+                match toron_plane::backend::hc::HcBackend::connect(None) {
+                    Ok(hc) => {
+                        let plane = toron_plane::LivePanePlane::wrap(Box::new(hc));
                         let pruned = mailbox().cleanup_pane_identities(&plane)?;
                         Ok(json!({ "pruned": pruned }))
                     }

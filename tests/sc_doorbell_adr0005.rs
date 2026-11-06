@@ -354,10 +354,9 @@ fn sc_d6_digest_needs_no_loop() {
 /// SC-D7: spawn source injects identity_prime and skips dispatcher.
 #[test]
 fn sc_d7_spawn_identity_without_dispatcher() {
-    let src = read("src/main.rs");
+    let src = read("src/cmd/spawn.rs");
     let start = find_toplevel_fn(&src, "cmd_spawn");
-    let end = find_toplevel_fn(&src, "doorbell_project_workspaces");
-    let body = &src[start..end];
+    let body = &src[start..];
     assert!(body.contains("doorbell::identity_prime"));
     assert!(body.contains("if peer_aware"));
     assert!(body.contains("doorbell::ensure_running"));
