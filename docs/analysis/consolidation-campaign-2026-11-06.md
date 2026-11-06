@@ -151,3 +151,58 @@ candidates DISPROVED as duplicates (documented KEEPs); no follow-up beads.
 - **Supervised doorbell host**: `daemon start` installs one host per armed
   workspace (wave11 report); `/health` currently shows 2 hosted leases,
   12 subscribers, `degraded: []`.
+
+## 7. Installed-binary verification (2026-11-07)
+
+Fresh binaries, installed from the committed HEADs (not `target/debug`):
+
+- `~/.cargo/bin/flywheel` 0.10.1 @ `c58a024d` (includes the push-wake,
+  strict-registry, snapshot, steering-friction and hc-alias commits)
+- `~/.cargo/bin/toron` 1.6.1 @ `456245d` (`toron doctor --check` exit 0,
+  daemon build newer than source)
+- `~/.cargo/bin/doorbell` 0.3.0
+
+Live matrix (all against the installed binaries):
+
+| Surface | Evidence |
+|---|---|
+| rex wake | `[installed-probe] wake` mail → journal `InboxFetched SwiftBay` with a `Prompt` action at 2026-11-06T18:25:04Z; the idle pane showed `[doorbell] plane-P urgent. Pull: toron next` with no spawn process alive |
+| peer-to-peer (collab) | `flywheel collab --to WindyCreek` → thread `collab-20261106T190020015-18036` has 2 messages (ask + `re:`) — the peer read via `toron next` and replied in-thread |
+| doorbell host | supervised host runs `~/.cargo/bin/flywheel __doorbell`; `doorbell/<ws>.gen` hash == installed binary; `/health.degraded == []` |
+| hc plane wake | `FLYWHEEL_BACKEND=hc flywheel spawn <scratch> --pi 1` → pane `t1p`; a high mail to the pin made the hc pane print `[doorbell] plane-P urgent. Pull: toron next` (typed through the hc backend) |
+| hc workspace lookup | after `HcBackend::workspace_list` groups terminals by root and the basename-slug alias, `FLYWHEEL_BACKEND=hc flywheel status <scratch>` resolves `workspace_id: hc:t1r` |
+
+### Residuals found by this pass (exact)
+
+1. **hc send-by-pin** — `FLYWHEEL_BACKEND=hc flywheel send … --to <pin>` answers
+   `no terminal "<pin>"`: hc spawn writes a workspace-scoped registry key
+   (`<project>-<hash>.json`) while the send resolver reads the project key, and
+   the hc pane's `name` is null (the pin lives in labels). One registry key per
+   project (or a labels-based resolver) is the fix; `status` and the hc wake
+   already work.
+2. **hc labels are applied asynchronously** — one `hc ls` snapshot right after
+   spawn showed `labels: null`; a later read showed `flywheel_workspace` /
+   `toron_pin`. A resolver must tolerate the missing-label window.
+3. **Wake cursor is at-least-once** — the per-pin cursor advances on
+   Prompt/Digest/queued. A wake row the fold cannot decide is re-fetched until
+   the pin is routable (deliberate: no mail is eaten; observed once as a refetch
+   before the queued case was counted as a decision).
+4. **Two supervision paths** — `flywheel daemon start` installs launchd host
+   units while `flywheel cron start` heals detached children; the lease keeps
+   exactly one host, but they "Supersede" each other on restart. Pick one owner.
+5. **`recover` respawns the captain pin** — a dead registry row for the
+   operator's own pin produced a duplicate idle `AmberHarbor` pane. Needs an
+   operator policy (skip / `--include-captain`).
+6. **Snapshot robot/serve** keep their global fleet shape (per-project
+   `assemble` cannot serve them without a second read); RunEnv/FleetContext stay
+   a docs-level decision.
+7. **Ledger ceremony** — `br close --commit-sha` alone is not a legal verdict;
+   the gate note must carry `task=<id> verdict=<gate>` (or a leading `sha=`).
+   Captain re-close fixed three lanes this session.
+
+Also improved while steering: host stderr now lands in
+`doorbell/<ws>.{out,err}.log` (was `/dev/null`), `crew control` resolves through
+the selected plane on rex, a busy `send` names the queued mail door, duplicate
+registry rows no longer double the inbox fetch, the wake hint points at
+`toron next` (per-message delivery), and the test env guard restores
+`FLYWHEEL_BR_BIN`/`PATH` so br/git suites stop racing.
