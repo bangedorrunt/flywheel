@@ -7,6 +7,8 @@ use serde_json::{Value, json};
 
 use crate::config::Config;
 use crate::output::print_json;
+use crate::profile::ProfileCatalog;
+use crate::state;
 use crate::{backend, config, profile};
 use crate::{
     bind_pane_mail_identity, bind_spawn_role, pinned_mail_identity, prime_profile_identity,
@@ -61,7 +63,7 @@ pub(crate) enum SquadCmd {
 /// with "not registered in project" falls back to host-scope (operator
 /// npub) — profiles are host-scoped in practice; `spawn --profile` resolves
 /// the same way. Returns `(resolved, fell_back)`.
-fn resolve_squad_member(
+pub(crate) fn resolve_squad_member(
     cat: &ProfileCatalog,
     name: &str,
     project: Option<&str>,

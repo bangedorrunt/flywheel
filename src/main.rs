@@ -122,6 +122,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -151,61 +152,57 @@ use cmd::{
         cmd_doorbell_afk, cmd_doorbell_subscriptions, cmd_doorbell_unsubscribe, cmd_doorbell_why,
     },
     internal::{
-        SendOptions, cmd_internal_ack_overdue, cmd_internal_check_reply, cmd_internal_close_check,
-        cmd_internal_compose_inbox, cmd_internal_context_inbox, cmd_internal_diagnose,
-        cmd_internal_dispatch_guard, cmd_internal_gate_learnings, cmd_internal_inprogress,
-        cmd_internal_kind, cmd_internal_loop_run_verify, cmd_internal_mail_blocked,
-        cmd_internal_mail_digest, cmd_internal_mail_done, cmd_internal_mail_not_ready,
-        cmd_internal_pin_stamp, cmd_internal_poll, cmd_internal_poll_events, cmd_internal_profile,
-        cmd_internal_read, cmd_internal_ready, cmd_internal_reclaim_stranded,
-        cmd_internal_release_bead_locks, cmd_internal_remind_reply, cmd_internal_renew_leases,
-        cmd_internal_reopen_bead, cmd_internal_reservation_board, cmd_internal_respawn,
-        cmd_internal_run_headless, cmd_internal_send, cmd_internal_turn_guard,
+        SendOptions, VerifyDispatchOpts, cmd_gate_learnings, cmd_internal_ack_overdue,
+        cmd_internal_check_reply, cmd_internal_close_check, cmd_internal_compose_inbox,
+        cmd_internal_context_inbox, cmd_internal_diagnose, cmd_internal_dispatch_guard,
+        cmd_internal_inprogress, cmd_internal_kind, cmd_internal_loop_run_verify,
+        cmd_internal_mail_blocked, cmd_internal_mail_digest, cmd_internal_mail_done,
+        cmd_internal_mail_not_ready, cmd_internal_pin_stamp, cmd_internal_poll,
+        cmd_internal_poll_events, cmd_internal_profile, cmd_internal_read, cmd_internal_ready,
+        cmd_internal_reclaim_stranded, cmd_internal_release_bead_locks, cmd_internal_remind_reply,
+        cmd_internal_renew_leases, cmd_internal_reopen_bead, cmd_internal_reservation_board,
+        cmd_internal_respawn, cmd_internal_run_headless, cmd_internal_send,
         cmd_internal_verify_dispatch, cmd_internal_wait_output, cmd_internal_xproj_inbox,
-        cmd_internal_xproj_spawn, cmd_subagent_guard, format_send_failure,
+        cmd_internal_xproj_spawn, cmd_subagent_guard, cmd_turn_guard, default_gate_budget,
+        format_send_failure,
     },
     mail::{
-        cmd_collab, cmd_ensemble, mail_as, mail_or_die, newest_urgent, repo_evidence_verified,
-        resolve_mail_actor_roster, wake_identity_pin, wake_urgent,
+        cmd_collab, cmd_ensemble, mail_as, mail_or_die, repo_evidence_verified,
+        resolve_mail_actor_roster,
     },
     profile::cmd_profile,
-    send::{
-        ComposeRunLifecycle, cmd_send, cmd_send_via_inbox, interrupt_guard_working,
-        is_agent_not_ready, launch_pending_error, mint_task_id, not_ready_retry_target,
-        running_run_row_exists, status_label,
-    },
+    send::{cmd_send, cmd_send_via_inbox, interrupt_guard_working, mint_task_id, status_label},
     spawn::{
-        cmd_spawn, cmd_spawn_rex, doorbell_project_workspaces, ensure_doorbell_supervisor,
-        proxy_doorbell_verb,
+        cmd_add, cmd_preflight, cmd_spawn, cmd_steer, doorbell_project_workspaces,
+        ensure_doorbell_supervisor, preflight_gate,
     },
-    squad::{cmd_squad, resolve_squad_member},
+    squad::cmd_squad,
+    status::{cmd_helm, cmd_progress, cmd_snapshot, cmd_status},
     workflow::cmd_workflow,
 };
 #[cfg(test)]
 use cmd::{
     internal::{
-        bead_id_from_reason, delegation_deny, is_rate_limited, parse_leaf_output, resolve_pane_id,
-        respawn_launch_args, respawn_with_backend, skill_injection_prefix, skills_injected_for,
-        subagent_guard_decision, wait_output_json, wait_output_mode,
+        bead_id_from_reason, delegation_deny, parse_leaf_output, skills_injected_for,
+        subagent_guard_decision,
     },
-    mail::mail_project,
+    mail::{mail_project, newest_urgent, wake_identity_pin, wake_urgent},
     send::{
-        StallProbe, StallStep, bare_short_group_matches, classify_stall_probe,
-        prompt_presence_needle, stall_giveup_error, stall_may_resend, stall_step,
+        StallProbe, StallStep, classify_stall_probe, is_agent_not_ready, launch_pending_error,
+        not_ready_retry_target, prompt_presence_needle, stall_giveup_error, stall_may_resend,
+        stall_step,
     },
-    spawn::{cmd_add, cmd_add_rex, cmd_preflight, cmd_steer},
-    status::{cmd_helm, cmd_progress, cmd_snapshot, cmd_status},
     workflow::lint_flywheel_tier,
 };
 use config::{Config, Recipe, WorkflowStep};
 use hc::{
-    AgentInfo, AgentStatus, Client, SendVerdict, Subscription, WaitOptions, alt_screen_read_ladder,
-    classify_send_result, sanitize_pane_text,
+    AgentInfo, AgentStatus, Client, Subscription, alt_screen_read_ladder, sanitize_pane_text,
 };
 use output::{die, dim, error, kind_paint, ok as paint_ok, print_json, status_paint};
 use profile::ProfileCatalog;
+use snapshot::robot_snapshot;
 use state::{EventKind, log_event};
-use toron_core::backend::error::BackendErrorCode;
+use toron_plane::backend::error::BackendErrorCode;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -6282,7 +6279,7 @@ fn prime_via_send_text(c: &mut Client, pane_id: &str) {
 fn comms_inbox_on() -> bool {
     match Config::load() {
         Ok(c) => comms_send::enabled(&c),
-        Err(_) => toron_core::inbox::enabled(),
+        Err(_) => toron_core::inbox::try_enabled_with(None).unwrap_or(true),
     }
 }
 
@@ -6862,7 +6859,6 @@ fn start_agent_with_taken_name_clear(
 /// bd-s91y (GS-037 P0-3): the shared taken-name recovery. `cmd_recover`'s
 /// respawn arm used to burn 30 x 3s on a name it could have freed — or must
 /// refuse — in one read.
-
 /// bd-spawn-omp-boot-reliability-3h06: post-boot dead-shell verification for
 /// one spawned pane — assert the LIVE agent process (`pane_agent_alive`),
 /// never the hc `launch_pending` flag. A pane can leave the launch window
@@ -7992,24 +7988,24 @@ pub(crate) fn bind_pane_mail_identity(
             eprintln!("flywheel: mail write_pane_identity failed for {name} on {pane_id}: {e}");
         }
         if pane_takes_hc_stamp(pane_id) {
-            match toron_core::backend::hc::HcBackend::connect(None) {
+            match toron_plane::backend::hc::HcBackend::connect(None) {
                 Ok(backend) => {
                     let npub = backend::run_mail(mail.whois(&key, pin))
                         .map(|w| w.npub)
                         .unwrap_or_default();
                     let mut labels = std::collections::BTreeMap::from([
                         (
-                            toron_core::backend::types::TOKEN_PIN.to_string(),
+                            toron_plane::backend::types::TOKEN_PIN.to_string(),
                             pin.to_string(),
                         ),
                         (
-                            toron_core::backend::types::TOKEN_PROJECT.to_string(),
+                            toron_plane::backend::types::TOKEN_PROJECT.to_string(),
                             project.to_string(),
                         ),
                     ]);
                     if !npub.is_empty() {
                         labels.insert(
-                            toron_core::backend::types::TOKEN_NPUB.to_string(),
+                            toron_plane::backend::types::TOKEN_NPUB.to_string(),
                             npub.clone(),
                         );
                     }
@@ -16058,10 +16054,11 @@ mod runs_status_tests {
 #[cfg(test)]
 mod run_ledger_truth_tests {
     use super::{
-        history_row_status, is_annotation_row, latest_run_entries, loop_monitor_notice,
-        parse_leaf_output, plan_warning_notice, run_list_row, run_terminal_status,
-        stage_prompt_for_project,
+        history_row_status, is_annotation_row, loop_monitor_notice, parse_leaf_output,
+        plan_warning_notice, run_list_row, run_terminal_status, stage_prompt_for_project,
     };
+    use crate::cmd::send::ComposeRunLifecycle;
+    use crate::snapshot::latest_run_entries;
     use crate::state::{EventKind, LogEntry};
     use serde_json::json;
 
@@ -16206,8 +16203,7 @@ mod run_ledger_truth_tests {
         let _g = crate::config::test_state_home();
         let project = format!("compose-lifecycle-test-{}", std::process::id());
         let run_id = "compose-run-1";
-        let lifecycle =
-            crate::ComposeRunLifecycle::start(&project, "compose-test", run_id, json!([]));
+        let lifecycle = ComposeRunLifecycle::start(&project, "compose-test", run_id, json!([]));
         drop(lifecycle);
 
         let events = crate::state::read_log(&project).expect("compose lifecycle log");
@@ -16286,7 +16282,7 @@ mod run_ledger_truth_tests {
             EventKind::Workflow,
             json!({ "workflow": "w" }),
         );
-        let rows = super::snapshot_runs();
+        let rows = crate::snapshot::snapshot_runs();
         let row = rows
             .iter()
             .find(|r| r["project"] == json!("demo-honest-snapshot"))
@@ -16418,7 +16414,7 @@ mod run_ledger_truth_tests {
             EventKind::Workflow,
             json!({ "workflow": "ship", "phase_gate": true, "gate_ok": true }),
         );
-        let rows = super::snapshot_runs();
+        let rows = crate::snapshot::snapshot_runs();
         let row = rows
             .iter()
             .find(|r| r["project"] == json!("demo-honest-gate"))
@@ -17829,6 +17825,10 @@ fn cmd_serve(_cfg: &Config, _port: u16) -> Result<()> {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+    use crate::cmd::internal::mail_inbox_fallback_argv;
+    use crate::cmd::workflow::{
+        workflow_hybrid_fields, workflow_list_brief_rows, workflow_list_full_rows,
+    };
 
     /// Regen writes only *-mode.md and deletes leftover /beads-* / /workflow-*.
     #[test]
@@ -19374,7 +19374,6 @@ mod ingress_wiring_tests {
 /// GS-033 Option A tripwires: doorbell is the one RAM owner and must seed
 /// swarm resume. Dual-as-end-state speech is forbidden. Needles split so
 /// these self-scans do not match their own source.
-
 #[cfg(test)]
 mod adr0010_d13_tests {
     // governed-by: ADR-0010 D13 (bd-eo39) — captain/steer subagent-guard.

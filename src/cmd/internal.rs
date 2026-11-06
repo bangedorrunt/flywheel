@@ -1,21 +1,37 @@
 //! `flywheel internal …` leaves (split from `main.rs`, bd-wave5-main-eviction-d5hht).
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use serde::Deserialize;
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
+use crate::cmd::doorbell::doorbell_now_unix;
+use crate::cmd::mail::{mail_or_die, newest_urgent, wake_identity_pin, wake_urgent};
+use crate::cmd::send::{is_agent_not_ready, mint_task_id, not_ready_retry_target};
+use crate::cmd::spawn::cmd_spawn;
 use crate::config::Config;
 use crate::hc::{
-    AgentInfo, AgentStatus, Client, SendVerdict, Subscription, alt_screen_read_ladder,
+    AgentInfo, AgentStatus, Client, SendVerdict, Subscription, WaitOptions, alt_screen_read_ladder,
+    classify_send_result,
 };
-use crate::output::print_json;
+use crate::output::{kind_paint, print_json};
+use crate::state::EventKind;
 use crate::{
-    agent_target, comms_send, durable, find_workspace, find_workspace_dyn, headless,
-    load_inprogress_beads, load_ready_beads, profile, profile_launch_args, project_dir,
-    project_dir_str, rebind_from_registry, resolve_agents_dyn, run_log, start_agent_with_retry_dyn,
-    state, terminal_mail_name, utf8_path,
+    AgentCounts, SpawnOpts, XprojInboxItem, agent_target, comms_send,
+    extract_context_limit_from_inbox, extract_xproj_from_inbox, find_workspace, find_workspace_dyn,
+    headless, load_inprogress_beads, load_ready_beads, log, mail_send, newest_in_thread,
+    orchestrator_mail_name, plan_warning_notice, profile, profile_launch_args, project_dir,
+    project_dir_str, rebind_from_registry, reroute_next_profile, resolve_agents_dyn,
+    resolve_mail_target, resolve_mail_target_registry, resolve_role_flag, run_log, stage_prompt,
+    stage_prompt_for_project, start_agent_with_retry_dyn, stderr_is_only_warnings, swarm_label,
+    terminal_mail_name, utf8_path,
 };
-use crate::{backend, hc};
+use crate::{
+    agent_ref, agentstate, backend, config, doorbell, durable, failure, hc, models, pane,
+    phase_chain, stages, state, verdict,
+};
 /// internal leaf: JSON batch of push events collected within `timeout_ms`.
 ///
 /// governed-by: ADR-0001 (A2 event stream) + ADR-0002 (backend factory).
@@ -150,10 +166,10 @@ struct StatusEventItem {
 /// `BackendEvent` (ADR-0005 P1); the wire event_type strings are preserved so
 /// downstream consumers see the same names as before the trait unification.
 fn summarize_status_event(
-    ev: &toron_core::backend::BackendEvent,
+    ev: &toron_plane::backend::BackendEvent,
     seq: &mut u64,
 ) -> Option<StatusEventItem> {
-    use toron_core::backend::BackendEvent::{
+    use toron_plane::backend::BackendEvent::{
         AgentDetected, AgentStatusChanged, EventsLost, PaneExited, Raw,
     };
     let (event_type, pane_id, agent, status) = match ev {
@@ -285,14 +301,14 @@ pub(crate) fn skill_injection_prefix(
 /// consulted: terminal names are stable across respawns, so a landed record
 /// would silence the gate forever after the first send. Later dispatches
 /// (injected lane) skip the gate entirely.
-fn is_first_dispatch(skills_injected: bool) -> bool {
+pub(crate) fn is_first_dispatch(skills_injected: bool) -> bool {
     !skills_injected
 }
 
 /// bd-mcax: gate decision — a first dispatch gates when the agent row is
 /// missing (fresh pane still binding) or still booting. Anything else
 /// proceeds straight to the normal send path.
-fn should_gate_first_dispatch(first: bool, agent: Option<&AgentInfo>) -> bool {
+pub(crate) fn should_gate_first_dispatch(first: bool, agent: Option<&AgentInfo>) -> bool {
     first && agent.is_none_or(crate::hc::agent_still_booting)
 }
 
@@ -311,7 +327,7 @@ pub(crate) fn skills_injected_for(project: &str, name: &str) -> bool {
 /// unit tests feed scripted boot sequences, production passes the live
 /// backend list). Returns the fresh row once the pane stops booting; past
 /// the deadline it fails typed, never hangs, never a bare ok:false downstream.
-fn await_agent_ready<F>(
+pub(crate) fn await_agent_ready<F>(
     mut list_agents: F,
     name: &str,
     ws_id: &str,
@@ -583,7 +599,7 @@ pub(crate) fn format_send_failure(
 /// have started — so it emits `landed: null` + `ambiguous: true`, never a
 /// definitive false that green completions would carry as a miss. Stalled and
 /// coded errors ARE definitive non-landings and keep `landed: false`.
-fn confirm_send_json(name: &str, verdict: SendVerdict) -> Value {
+pub(crate) fn confirm_send_json(name: &str, verdict: SendVerdict) -> Value {
     match verdict {
         SendVerdict::Landed(st) => json!({
             "ok": true, "name": name, "landed": true,
@@ -1692,20 +1708,6 @@ steps:
 }
 
 /// --- internal batch 2: inbox guards, loop-mail leaves (bd-wave5-main-eviction-d5hht) ---
-use anyhow::{Result, anyhow, bail};
-use serde_json::{Value, json};
-use std::path::Path;
-
-use crate::cmd::spawn::cmd_spawn;
-use crate::config::Config;
-use crate::output::print_json;
-use crate::state::EventKind;
-use crate::{
-    AgentCounts, SpawnOpts, XprojInboxItem, extract_context_limit_from_inbox,
-    extract_xproj_from_inbox, log, mail_send, mail_whois_ok, newest_in_thread, project_dir,
-    project_dir_str, resolve_mail_target, resolve_mail_target_registry, swarm_label,
-};
-use crate::{backend, doorbell, durable, stages, state, verdict};
 /// internal leaf: scan orchestrator inbox for `[xproj]` swarm requests.
 /// Soft-fail: missing mail → empty list. Output: `{ "items": [ XprojInboxItem ] }`.
 /// internal leaf: mail digest for ONE agent (loop-side wake signal).
@@ -2000,7 +2002,7 @@ pub(crate) fn cmd_subagent_guard(tool: &str, role: Option<&str>) -> Result<()> {
     }
 }
 
-fn default_gate_budget() -> usize {
+pub(crate) fn default_gate_budget() -> usize {
     std::env::var("FLYWHEEL_GATE_BUDGET")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -2952,7 +2954,11 @@ pub(crate) fn cmd_internal_mail_not_ready(
 /// default). Each entry is only a CANDIDATE — callers must re-check
 /// routability, because `br` derives `created_by` from `$USER` and an OS
 /// username is never a registered mail identity.
-fn planner_recipient_chain(project_dir: &str, bead_id: &str, fallback: &str) -> Vec<String> {
+pub(crate) fn planner_recipient_chain(
+    project_dir: &str,
+    bead_id: &str,
+    fallback: &str,
+) -> Vec<String> {
     let mut chain = Vec::new();
     if let Ok(bead) = crate::br::Bead::show(Some(Path::new(project_dir)), bead_id)
         && let Some(created_by) = bead.created_by.as_deref().filter(|s| !s.is_empty())
@@ -2973,7 +2979,7 @@ fn planner_recipient_chain(project_dir: &str, bead_id: &str, fallback: &str) -> 
 ///
 /// Takes `AsRef<str>` so callers can pass `&[String]`, `&Vec<String>`, or a
 /// literal `["a", "b"]` without an intermediate mapping.
-fn first_routable<S: AsRef<str>>(
+pub(crate) fn first_routable<S: AsRef<str>>(
     chain: impl IntoIterator<Item = S>,
     mut resolves: impl FnMut(&str) -> bool,
 ) -> Option<String> {
@@ -3246,7 +3252,7 @@ mod loop_mail_tests {
 /// stays on the bead's thread (ADR-0019 Spec 0). Separated from the leaf
 /// command so the "planner mailed" acceptance is testable with a real
 /// in-process toron facade.
-fn send_not_ready_mail(
+pub(crate) fn send_not_ready_mail(
     mail: &dyn backend::MailSurface,
     key: &str,
     bead_id: &str,
@@ -3267,14 +3273,6 @@ fn send_not_ready_mail(
 }
 
 /// --- internal batch 3: done/verify/loop-run leaves (bd-wave5-main-eviction-d5hht) ---
-use anyhow::{Result, anyhow};
-use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
-
-use crate::config::Config;
-use crate::output::print_json;
-use crate::{backend, durable, verdict};
-use crate::{project_dir, project_dir_str};
 /// The programmatic done-mail leaf (2026-08-18): the LOOP mails the captain
 /// the close-reason REPORT on `thread_id=<bead_id>` when a watched bead
 /// closes with a legal verdict. Recipient: the bead's `created_by` when it
@@ -3360,7 +3358,10 @@ fn mail_whois_ok(mail: &dyn backend::MailSurface, key: &str, name: &str) -> bool
 
 /// The project's registered orchestrator agent (program == "flywheel") —
 /// the captain/operator identity (e.g. CoralFinch), when present.
-fn registered_orchestrator(mail: &dyn backend::MailSurface, key: &str) -> Option<String> {
+pub(crate) fn registered_orchestrator(
+    mail: &dyn backend::MailSurface,
+    key: &str,
+) -> Option<String> {
     let agents = backend::run_mail(mail.list_agents(key, None)).ok()?;
     agents.iter().find_map(|a| {
         let program = a.program.as_deref().unwrap_or("");
@@ -3372,7 +3373,7 @@ fn registered_orchestrator(mail: &dyn backend::MailSurface, key: &str) -> Option
 /// The done-mail itself: thread = the bead id, body = the close-reason
 /// REPORT (status/sha/verdict/verify-tail live in it) — the captain's copy
 /// of the report the agent put in the close reason.
-fn send_done_mail(
+pub(crate) fn send_done_mail(
     mail: &dyn backend::MailSurface,
     key: &str,
     bead_id: &str,
@@ -3451,12 +3452,12 @@ pub(crate) fn cmd_internal_pin_stamp(
 /// positional args — the trailing five are one option group). `dir` lets
 /// tests point at a scratch project dir; production callers pass None.
 #[derive(Debug, Clone, Default)]
-struct VerifyDispatchOpts {
-    worker_model: Option<String>,
-    candidates: Option<String>,
-    blast: String,
-    ac: String,
-    dir: Option<PathBuf>,
+pub(crate) struct VerifyDispatchOpts {
+    pub(crate) worker_model: Option<String>,
+    pub(crate) candidates: Option<String>,
+    pub(crate) blast: String,
+    pub(crate) ac: String,
+    pub(crate) dir: Option<PathBuf>,
 }
 
 /// internal leaf: verifier-dispatch (ADR-0019 Spec 4,
@@ -3720,7 +3721,7 @@ pub(crate) fn cmd_internal_reopen_bead(
 /// successful mail (removed on failure so a retry re-mails) — the storm
 /// guard holds across repeated ticks and loop invocations. Returns the
 /// outcome JSON for the leaf / tests.
-fn reopen_unverified_close(
+pub(crate) fn reopen_unverified_close(
     key: &str,
     bead_id: &str,
     sha: &str,
@@ -3786,15 +3787,15 @@ fn reopen_unverified_close(
 /// The executor's outcome — what the leaf turns into the machine receipt +
 /// gate row (recorded) or the failed-head marker + reopen.
 #[derive(Debug, Clone)]
-struct LoopRunOutcome {
-    band: String,
-    dir: PathBuf,
-    sha: String,
-    exit: i32,
-    timed_out: bool,
-    skipped: bool,
-    verify: String,
-    output_tail: String,
+pub(crate) struct LoopRunOutcome {
+    pub(crate) band: String,
+    pub(crate) dir: PathBuf,
+    pub(crate) sha: String,
+    pub(crate) exit: i32,
+    pub(crate) timed_out: bool,
+    pub(crate) skipped: bool,
+    pub(crate) verify: String,
+    pub(crate) output_tail: String,
 }
 
 pub(crate) fn cmd_internal_loop_run_verify(
@@ -3848,7 +3849,7 @@ pub(crate) fn cmd_internal_loop_run_verify(
 /// verify command to this sink, which reuses `loop_run_verify_exec`'s exec path
 /// (slot held, TIMEBOX, receipt via `write_receipt`) so no second verify path
 /// exists. Attached on every `compose --run` / `workflow run --execute` arm.
-fn make_verify_sink(cfg: Config, project: String) -> toron_workflow::engine::VerifySink {
+pub(crate) fn make_verify_sink(cfg: Config, project: String) -> toron_workflow::engine::VerifySink {
     let sink = toron_workflow::engine::VerifySink::default();
     let cfg_clone = cfg.clone();
     let project_clone = project.clone();
@@ -3922,7 +3923,7 @@ fn make_verify_sink(cfg: Config, project: String) -> toron_workflow::engine::Ver
 /// under the build slot), writing a failed-head marker on non-zero exit or
 /// timeout (the loop NEVER re-verifies the same broken head). Pure-ish: the
 /// only side effects are the failed-head marker + the build-slot hold.
-fn loop_run_verify_exec(
+pub(crate) fn loop_run_verify_exec(
     cfg: &Config,
     project: &str,
     bead_id: &str,
@@ -4022,7 +4023,7 @@ fn loop_run_verify_exec(
 /// the pipes are drained concurrently so a verbose test never deadlocks on
 /// the pipe buffer. Returns `Ok((exit_code, tail))` or `Err(tail)` when the
 /// deadline hit (the child was killed).
-fn run_verify_with_timeout(
+pub(crate) fn run_verify_with_timeout(
     verify: &str,
     timeout_secs: u64,
     cwd: &Path,
@@ -4084,7 +4085,7 @@ fn run_verify_with_timeout(
 }
 
 /// Last ~4 KiB of captured output (receipts stay small).
-fn tail_of(s: &str) -> String {
+pub(crate) fn tail_of(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let start = chars.len().saturating_sub(4096);
     chars[start..].iter().collect()
@@ -4099,7 +4100,7 @@ fn tail_of(s: &str) -> String {
 /// The argv builder below keeps the flag pin-able by test. The fallback
 /// itself stays a subprocess: it runs only when the embedded path has
 /// already failed, so routing it through the facade would recurse.
-fn mail_inbox_fallback_argv(pin: &str, project: &str, since: &str) -> Vec<String> {
+pub(crate) fn mail_inbox_fallback_argv(pin: &str, project: &str, since: &str) -> Vec<String> {
     [
         "mail",
         "inbox",
@@ -4147,7 +4148,7 @@ fn release_cargo_slot(cfg: &Config, project: &str) {
 /// The unverified-close mail: thread = the bead id, subject `[<id>]
 /// unverified close reopened` (ADR-0019 Spec 0). Body names what is
 /// missing (a verdict row for the derived sha, or the commit itself).
-fn send_unverified_close_mail(
+pub(crate) fn send_unverified_close_mail(
     mail: &dyn backend::MailSurface,
     key: &str,
     bead_id: &str,

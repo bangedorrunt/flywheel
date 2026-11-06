@@ -8,10 +8,11 @@ use clap::Subcommand;
 
 #[cfg(test)]
 use crate::budget_effect;
+use crate::cmd::workflow::{WorkflowCmd, cmd_workflow};
 use crate::config::Config;
 use crate::{
     backend, cmd_binding_rebind, config, doorbell, doorbell_tick, live_decide_snapshot,
-    project_dir_str, state, workspace,
+    project_dir_str, snapshot, state, workspace,
 };
 
 /// Subcommands of `flywheel doorbell` (bd-durable-doorbell-lngf): the
@@ -710,14 +711,14 @@ pub(crate) fn cmd_doorbell_digest(
                     })
                     .unwrap_or_default()
             });
-        let detail = crate::digest_action_entries(entry)
+        let detail = digest_action_entries(entry)
             .into_iter()
             .map(|(_, line, _)| line)
             .collect::<Vec<_>>()
             .join(" | ");
         rows.push((ws.clone(), ts, stage, who, detail));
     }
-    let roster = crate::digest_roster_lines(cfg, project, crate::doorbell_now_unix());
+    let roster = digest_roster_lines(cfg, project, doorbell_now_unix());
     if format == "json" {
         println!(
             "{}",
@@ -1317,7 +1318,7 @@ pub(crate) fn cmd_doorbell_afk(cfg: &Config, project: &str, limit: usize) -> Res
 
 /// Scope-bound roster lines for digests (bd-asr2.14, D5/E2). Empty unless
 /// the arrival-triple flag opts in — flag-off output stays byte-identical.
-fn digest_roster_lines(cfg: &Config, project: &str, now: u64) -> Vec<String> {
+pub(crate) fn digest_roster_lines(cfg: &Config, project: &str, now: u64) -> Vec<String> {
     if !cfg.doorbell_arrival_triple() {
         return Vec::new();
     }
@@ -1568,7 +1569,7 @@ pub(crate) fn normalize_action_shapes(actions: &mut serde_json::Value) {
 /// the embedded fold (`workspace::tick` has no `InboxFetched` arm, which is
 /// bd-c9jw), so without reading the rows the captain's batch surface missed
 /// exactly the wake that had just arrived.
-fn digest_action_entries(entry: &serde_json::Value) -> Vec<(String, String, String)> {
+pub(crate) fn digest_action_entries(entry: &serde_json::Value) -> Vec<(String, String, String)> {
     entry
         .get("actions")
         .and_then(|a| a.as_array())
@@ -1709,7 +1710,7 @@ mod timeout_presence_tests {
             host.contains("presence.jsonl") && host.contains("Msg::Presence"),
             "RED (55nx.5): sweep must project presence.jsonl rows into tick Msg::Presence"
         );
-        let brain = include_str!("../crates/doorbell-rt/src/brain.rs");
+        let brain = include_str!("../../crates/doorbell-rt/src/brain.rs");
         assert!(
             brain.contains("sweep_maintenance") && brain.contains("BrainMsg::Presence"),
             "RED (55nx.5): brain must tick Presence rows every sweep, not hear-only"
@@ -1758,7 +1759,7 @@ mod timeout_presence_tests {
 /// Latest row per name wins; only rows <30s old are fresh. State comes from the
 /// row's `state` field (the Kind 20001 projection); rows without one default to
 /// `unknown`, which never prompts.
-fn timeout_presence_rows(body: &str, now: u64) -> Vec<(String, String)> {
+pub(crate) fn timeout_presence_rows(body: &str, now: u64) -> Vec<(String, String)> {
     let mut latest: std::collections::BTreeMap<String, (u64, String)> =
         std::collections::BTreeMap::new();
     for line in body.lines() {
@@ -1803,7 +1804,7 @@ const DOORBELL_WATCH_KINDS: &str = "9,14,20001,30013,43001,30031,39002";
 /// at the call site (mapping byte-identical by the doorbell-rt golden test).
 /// GS062-ADV-5 semantics (try_send Watch / Died blocking / stamp-after-Ok)
 /// live in the call-site mapper (`wake_outcome_to_brain` / FileHost restart).
-fn spawn_wake_consumer<F>(
+pub(crate) fn spawn_wake_consumer<F>(
     project: &str,
     workspace: &str,
     state_dir: &std::path::Path,
@@ -1843,7 +1844,11 @@ where
 }
 
 /// Pins plus npubs so live kind-9 `p` tags (hex) resolve to the pin.
-fn doorbell_self_index(cfg: &Config, project: &str, pins: &[String]) -> doorbell::SelfIndex {
+pub(crate) fn doorbell_self_index(
+    cfg: &Config,
+    project: &str,
+    pins: &[String],
+) -> doorbell::SelfIndex {
     let mut index = doorbell::SelfIndex::from_pins(pins.iter().cloned());
     let Ok(key) = project_dir_str(cfg, project) else {
         return index;

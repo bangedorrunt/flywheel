@@ -549,7 +549,7 @@ fn cmd_pull_fresh_tick(project: &str, pin: &str) -> Result<()> {
 /// the same question with a loud, actionable refusal.
 #[cfg(feature = "backend-superlogical")]
 fn cmd_captain_directory(cfg: &Config, project: &str, json_out: bool) -> Result<()> {
-    let backend = toron_core::backend::superlogical::SuperlogicalBackend;
+    let backend = toron_plane::backend::superlogical::SuperlogicalBackend;
     let ws_id = crate::find_workspace_dyn(&backend, project)?;
     let agents = backend
         .agent_list()

@@ -7,8 +7,10 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
-use toron_core::backend::{BackendError, error::BackendErrorCode};
+use toron_plane::backend::{BackendError, error::BackendErrorCode};
 
+use crate::cmd::doorbell::doorbell_note_observed_wake;
+use crate::cmd::internal::skill_injection_prefix;
 use crate::config::Config;
 #[cfg(test)]
 use crate::hc::SendVerdict;
@@ -706,7 +708,7 @@ pub(crate) fn cmd_send(
                     }
                 });
             if let Some(pin) = pin
-                && let Err(e) = crate::doorbell_note_observed_wake(&ws_label, &pin)
+                && let Err(e) = doorbell_note_observed_wake(&ws_label, &pin)
             {
                 eprintln!(
                     "flywheel: observed-wake stamp FAILED after send --wait land for pin={pin}: {e:#} — refuse silent drop (GS-039 P0-1)"
@@ -1413,7 +1415,7 @@ pub(crate) fn condition_send_target(
     };
     let mut send_base = text.to_string();
     let mut skills_injected = false;
-    if let Some(prefix) = crate::skill_injection_prefix(entry, &profile_obj.skills) {
+    if let Some(prefix) = skill_injection_prefix(entry, &profile_obj.skills) {
         send_base = format!("{prefix}{send_base}");
         entry.skills_injected = true;
         skills_injected = true;
@@ -1630,7 +1632,7 @@ mod send_result_row_tests {
     /// `landed: false`, and the run still completed green — the flag lied.
     #[test]
     fn confirm_send_json_timeout_is_ambiguous_not_false() {
-        let v = crate::confirm_send_json("reviewer-1", SendVerdict::TimedOut);
+        let v = crate::cmd::internal::confirm_send_json("reviewer-1", SendVerdict::TimedOut);
         assert_eq!(v["reason"], "timeout");
         assert!(
             v["landed"].is_null(),
@@ -1650,17 +1652,23 @@ mod send_result_row_tests {
     /// wire shape — only the timeout flag was dishonest.
     #[test]
     fn confirm_send_json_landed_and_stalled_unchanged() {
-        let landed = crate::confirm_send_json("a", SendVerdict::Landed(Some(AgentStatus::Working)));
+        let landed = crate::cmd::internal::confirm_send_json(
+            "a",
+            SendVerdict::Landed(Some(AgentStatus::Working)),
+        );
         assert_eq!(landed["landed"], true);
         assert_eq!(landed["status"], "working");
         assert_eq!(landed["reason"], "landed");
-        let stalled = crate::confirm_send_json("a", SendVerdict::Stalled);
+        let stalled = crate::cmd::internal::confirm_send_json("a", SendVerdict::Stalled);
         assert_eq!(
             stalled["landed"], false,
             "stall IS a definitive non-landing"
         );
         assert_eq!(stalled["reason"], "stalled");
-        let coded = crate::confirm_send_json("a", SendVerdict::Coded("agent_not_found".into()));
+        let coded = crate::cmd::internal::confirm_send_json(
+            "a",
+            SendVerdict::Coded("agent_not_found".into()),
+        );
         assert_eq!(coded["landed"], false);
         assert_eq!(coded["reason"], "error:agent_not_found");
     }
@@ -1735,8 +1743,8 @@ mod first_dispatch_gate_tests {
     /// stable across respawns, so a landed record would mute it forever.
     #[test]
     fn first_dispatch_predicate() {
-        assert!(crate::is_first_dispatch(false));
-        assert!(!crate::is_first_dispatch(true));
+        assert!(crate::cmd::internal::is_first_dispatch(false));
+        assert!(!crate::cmd::internal::is_first_dispatch(true));
     }
 
     /// bd-mcax (red first): the gate decision — first dispatch gates when
@@ -1744,17 +1752,19 @@ mod first_dispatch_gate_tests {
     /// Later dispatches, and found-and-ready agents, never gate.
     #[test]
     fn gate_decision_covers_missing_and_booting() {
-        assert!(crate::should_gate_first_dispatch(true, None));
-        assert!(crate::should_gate_first_dispatch(
+        assert!(crate::cmd::internal::should_gate_first_dispatch(true, None));
+        assert!(crate::cmd::internal::should_gate_first_dispatch(
             true,
             Some(&agent_row(true))
         ));
-        assert!(!crate::should_gate_first_dispatch(
+        assert!(!crate::cmd::internal::should_gate_first_dispatch(
             true,
             Some(&agent_row(false))
         ));
-        assert!(!crate::should_gate_first_dispatch(false, None));
-        assert!(!crate::should_gate_first_dispatch(
+        assert!(!crate::cmd::internal::should_gate_first_dispatch(
+            false, None
+        ));
+        assert!(!crate::cmd::internal::should_gate_first_dispatch(
             false,
             Some(&agent_row(true))
         ));
@@ -1766,7 +1776,7 @@ mod first_dispatch_gate_tests {
     fn missing_then_present_proceeds() {
         let script = [vec![], vec![], vec![agent_row(false)]];
         let calls = std::cell::Cell::new(0);
-        let out = crate::await_agent_ready(
+        let out = crate::cmd::internal::await_agent_ready(
             || {
                 let i = calls.get();
                 calls.set(i + 1);
@@ -1791,7 +1801,7 @@ mod first_dispatch_gate_tests {
             vec![agent_row(false)],
         ];
         let calls = std::cell::Cell::new(0);
-        let out = crate::await_agent_ready(
+        let out = crate::cmd::internal::await_agent_ready(
             || {
                 let i = calls.get();
                 calls.set(i + 1);
@@ -1810,7 +1820,7 @@ mod first_dispatch_gate_tests {
     /// inside the bound — never hangs, never a bare ok:false downstream.
     #[test]
     fn boot_timeout_is_typed() {
-        let err = crate::await_agent_ready(
+        let err = crate::cmd::internal::await_agent_ready(
             || Ok(vec![agent_row(true)]),
             "crew-x-planner",
             "w9",
@@ -1824,8 +1834,8 @@ mod first_dispatch_gate_tests {
 #[cfg(test)]
 mod send_receipt {
     use super::{wait_failure_error, wait_failure_row};
-    use toron_core::backend::BackendError;
-    use toron_core::backend::error::BackendErrorCode;
+    use toron_plane::backend::BackendError;
+    use toron_plane::backend::error::BackendErrorCode;
 
     /// bd-8vci: a --wait timeout/stall row is deliberately AMBIGUOUS —
     /// receipt:false, NO `landed` key (the prompt may have started), and the

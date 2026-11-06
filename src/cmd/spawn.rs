@@ -2,19 +2,42 @@
 //! `main.rs`, bd-wave5). Crew creation lives here; the send verbs live in
 //! [`super::send`].
 
+use std::collections::{BTreeMap, HashSet};
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
+#[cfg(test)]
+use crate::cmd::internal::skill_injection_prefix;
+use crate::cmd::send::launch_pending_error;
 use crate::config::Config;
-use crate::hc::AgentInfo;
-use crate::output::{kind_paint, print_json};
+use crate::hc::{AgentInfo, Client};
+use crate::output::{dim, kind_paint, print_json};
+#[cfg(test)]
+use crate::pane_write;
+#[cfg(feature = "backend-superlogical")]
+use crate::partition_workspaces;
+use crate::state::EventKind;
+#[cfg(test)]
+use crate::uncommitted_decision_docs;
 use crate::{
-    SpawnOpts, check_project_spelling, project_dir, recipe_counts, slugify_label,
-    spawn_items_from_plan, swarm_label,
+    ProfileLaunchPlan, SpawnOpts, agent_name_n, bare_model_launch, bind_pane_mail_identity,
+    bind_spawn_role, boot_prime_line, check_project_spelling, cmd_arrive, comms_inbox_on,
+    dead_panes, ensure_and_join_channels, free_spawn_ordinal, is_still_booting, log,
+    needs_in_arg_prime, note_role_bind_result, pane_takes_hc_stamp, peer_prompt_template,
+    pinned_mail_identity, preflight_kind_integration, prime_bootstrap, prime_line_via_send_text,
+    probe_agent_liveness, profile_launch_plan, project_dir, project_workspaces,
+    publish_presence_for_registry, read_integration_statuses, recipe_counts, refuse_unpinned_spawn,
+    slugify_label, spawn_item_kind, spawn_items_from_plan, spawn_join_notice, spawn_model_rows,
+    start_agent_with_retry_profile, swarm_label, utf8_path, verify_or_respawn_pane,
 };
-use crate::{agent_ref, backend, config, doorbell, profile, request_receipts, state};
+use crate::{
+    agent_ref, backend, captain_directory, config, doorbell, hc, models, pane, profile,
+    request_receipts, state,
+};
 
 /// bd-add-plane-dnzz: rex-plane add. The hc arm below builds an
 /// `hc::Client` and its workspace list, so a rex-plane swarm is invisible
@@ -400,7 +423,7 @@ pub(crate) fn cmd_add(
     Ok(())
 }
 
-fn preflight_gate(
+pub(crate) fn preflight_gate(
     cfg: &Config,
     skip: bool,
     mode: crate::preflight::Mode,
@@ -447,6 +470,7 @@ pub(crate) fn cmd_preflight(
 /// `approval_expired` and mail the asker. A denied key replays
 /// `approval_denied` and never dispatches. Returns true when the steer is
 /// fully answered here; false means the normal gate path continues.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_steer_hosted_park(
     project_owned: &str,
     pin: &str,
@@ -1576,15 +1600,15 @@ the panes may still be live in hc; `--no-verify` skips this check in scripts"
 /// never success.
 #[cfg(feature = "backend-superlogical")]
 fn poll_child_exit(
-    stream: Option<&mut Box<dyn toron_core::backend::EventStream>>,
+    stream: Option<&mut Box<dyn toron_plane::backend::EventStream>>,
     pane: &str,
 ) -> Option<i32> {
     let stream = stream?;
     for _ in 0..10_000 {
         match stream.read_event() {
-            Ok(Some(toron_core::backend::BackendEvent::Raw(line))) => {
+            Ok(Some(toron_plane::backend::BackendEvent::Raw(line))) => {
                 if let Some((block, code)) =
-                    toron_core::backend::superlogical::child_exit_code(&line)
+                    toron_plane::backend::superlogical::child_exit_code(&line)
                     && block == pane
                 {
                     return Some(code);
@@ -1832,7 +1856,7 @@ pub(crate) fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Res
         .map(|p| p.pane_id.clone())
         .ok_or_else(|| anyhow!("rex: workspace {} has no panes", ws.workspace_id))?;
     let mut exit_stream =
-        toron_core::backend::superlogical::subscribe_session(&ws.workspace_id).ok();
+        toron_plane::backend::superlogical::subscribe_session(&ws.workspace_id).ok();
     if let Some(stream) = exit_stream.as_mut() {
         let _ = stream.set_read_timeout(Some(Duration::from_millis(2_000)));
         let live = matches!(stream.read_event(), Ok(Some(_)));
@@ -1930,7 +1954,7 @@ pub(crate) fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Res
             }
             let command = crate::pane::rex_env_command(&pane_env, &kind, &agent_args);
             let pane_id = if first {
-                toron_core::backend::superlogical::create_agent_block(
+                toron_plane::backend::superlogical::create_agent_block(
                     &ws.workspace_id,
                     identity,
                     Some(&cwd),
@@ -1938,7 +1962,7 @@ pub(crate) fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Res
                 )
                 .map_err(|e| anyhow!("spawn: rex run for {name} (pin {identity}): {e:#}"))?
             } else {
-                toron_core::backend::superlogical::create_split_block(
+                toron_plane::backend::superlogical::create_split_block(
                     &ws.workspace_id,
                     &prev,
                     "below",
@@ -2840,7 +2864,6 @@ mod spawn_profile_plan_tests {
 mod profile_run_spawn_tests {
     use super::*;
     use crate::config::lock_env;
-    use crate::hc::AgentStatus;
     use crate::{
         profile_launch_args, project_dir_str, record_spawn_entry, resolved_spec_workspace,
     };
@@ -2896,7 +2919,7 @@ mod profile_run_spawn_tests {
     fn resolved_spec_workspace_returns_pane_id() {
         use crate::backend::MultiplexerBackend;
         use crate::hc::{PaneInfo, WorkspaceInfo};
-        use toron_core::backend::types::AgentStatus;
+        use toron_plane::backend::types::AgentStatus;
 
         struct MockMux {
             ws: Vec<WorkspaceInfo>,
@@ -2908,13 +2931,13 @@ mod profile_run_spawn_tests {
             }
             fn workspace_list(
                 &self,
-            ) -> Result<Vec<WorkspaceInfo>, toron_core::backend::BackendError> {
+            ) -> Result<Vec<WorkspaceInfo>, toron_plane::backend::BackendError> {
                 Ok(self.ws.clone())
             }
             fn workspace_create(
                 &self,
                 _label: Option<&str>,
-            ) -> Result<WorkspaceInfo, toron_core::backend::BackendError> {
+            ) -> Result<WorkspaceInfo, toron_plane::backend::BackendError> {
                 let id = "ws-1".to_string();
                 Ok(WorkspaceInfo {
                     workspace_id: id,
@@ -2931,7 +2954,7 @@ mod profile_run_spawn_tests {
             fn pane_list(
                 &self,
                 workspace_id: Option<&str>,
-            ) -> Result<Vec<PaneInfo>, toron_core::backend::BackendError> {
+            ) -> Result<Vec<PaneInfo>, toron_plane::backend::BackendError> {
                 let ws = workspace_id.unwrap_or_default();
                 Ok(self
                     .panes
@@ -3180,13 +3203,13 @@ mod internal_respawn_tests {
         fn name(&self) -> &'static str {
             "mock-mux"
         }
-        fn workspace_list(&self) -> Result<Vec<WorkspaceInfo>, toron_core::backend::BackendError> {
+        fn workspace_list(&self) -> Result<Vec<WorkspaceInfo>, toron_plane::backend::BackendError> {
             Ok(vec![workspace(&self.ws_label)])
         }
         fn pane_list(
             &self,
             _workspace_id: Option<&str>,
-        ) -> Result<Vec<PaneInfo>, toron_core::backend::BackendError> {
+        ) -> Result<Vec<PaneInfo>, toron_plane::backend::BackendError> {
             Ok(self
                 .agents
                 .lock()
@@ -3200,15 +3223,15 @@ mod internal_respawn_tests {
             _parent_pane_id: &str,
             _direction: &str,
             _cwd: Option<&str>,
-        ) -> Result<PaneInfo, toron_core::backend::BackendError> {
+        ) -> Result<PaneInfo, toron_plane::backend::BackendError> {
             self.splits.fetch_add(1, Ordering::SeqCst);
             Ok(pane("wA", 2))
         }
-        fn pane_close(&self, _pane_id: &str) -> Result<(), toron_core::backend::BackendError> {
+        fn pane_close(&self, _pane_id: &str) -> Result<(), toron_plane::backend::BackendError> {
             self.closes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        fn agent_list(&self) -> Result<Vec<AgentInfo>, toron_core::backend::BackendError> {
+        fn agent_list(&self) -> Result<Vec<AgentInfo>, toron_plane::backend::BackendError> {
             Ok(self.agents.lock().expect("mock agents lock").clone())
         }
         fn agent_start(
@@ -3217,7 +3240,7 @@ mod internal_respawn_tests {
             kind: &str,
             pane_id: &str,
             args: &[String],
-        ) -> Result<AgentInfo, toron_core::backend::BackendError> {
+        ) -> Result<AgentInfo, toron_plane::backend::BackendError> {
             self.started.lock().expect("mock started lock").push((
                 name.into(),
                 kind.into(),
@@ -3232,7 +3255,7 @@ mod internal_respawn_tests {
             &self,
             _target: &str,
             _new_name: Option<&str>,
-        ) -> Result<(), toron_core::backend::BackendError> {
+        ) -> Result<(), toron_plane::backend::BackendError> {
             Ok(())
         }
     }
@@ -3307,7 +3330,7 @@ mod internal_respawn_tests {
 #[cfg(test)]
 mod workspace_origin_tests {
     use super::*;
-    use crate::hc::{AgentInfo, WorkspaceInfo};
+    use crate::hc::{AgentInfo, AgentStatus, WorkspaceInfo};
     use crate::{
         PrimeChoice, WorkspaceOrigin, add_target_from_split, classify_workspace_origin,
         partition_workspaces, prime_choice,
@@ -3484,7 +3507,7 @@ mod workspace_origin_tests {
 
     #[test]
     fn spawn_prime_is_launch_bootstrap_under_the_flag_and_ready_check_without() {
-        use pane_write::Harness;
+        use crate::pane_write::Harness;
         assert_eq!(prime_choice(false, "pi"), PrimeChoice::LegacyReady);
         assert_eq!(prime_choice(false, "claude"), PrimeChoice::LegacyReady);
         assert_eq!(
@@ -4027,7 +4050,6 @@ mod adr0013_spawn_effect_tests {
 #[cfg(test)]
 mod taken_name_recovery_tests {
     use super::*;
-    use crate::backend::BackendError;
     use crate::backend::MultiplexerBackend;
     use crate::hc::AgentStatus;
     use crate::{
@@ -4036,8 +4058,8 @@ mod taken_name_recovery_tests {
     };
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use toron_core::backend::BackendError;
-    use toron_core::backend::error::BackendErrorCode;
+    use toron_plane::backend::BackendError;
+    use toron_plane::backend::error::BackendErrorCode;
 
     /// The error an hc name collision really surfaces as: the wire code
     /// (no typed variant) plus the name in the message.

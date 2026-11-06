@@ -807,7 +807,7 @@ pub fn ensure_running(
     let loaded = crate::config::Config::load().ok();
     let comms_on = match &loaded {
         Some(c) => crate::comms_send::enabled(c),
-        None => toron_core::inbox::enabled(),
+        None => toron_core::inbox::try_enabled_with(None).unwrap_or(true),
     };
     if comms_on {
         eprintln!(

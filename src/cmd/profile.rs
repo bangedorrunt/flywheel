@@ -2,25 +2,14 @@
 
 use clap::Subcommand;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
+use crate::cmd::workflow::cmd_workflow;
 use crate::config::Config;
 use crate::output::print_json;
-use crate::{
-    ProfilesFile, bind_pane_mail_identity, bind_spawn_role, is_builtin_profile,
-    pinned_mail_identity, prime_profile_identity, profile_launch_args, profile_workflow_invoke,
-    record_spawn_entry, refuse_unpinned_spawn, resolved_spec_workspace,
-};
-use crate::{backend, config, models, profile};
-
-use anyhow::{Result, anyhow, bail};
-use serde_json::{Value, json};
-use std::collections::BTreeMap;
-
-use crate::config::Config;
-use crate::output::print_json;
+use crate::state;
 use crate::{
     ProfilesFile, bind_pane_mail_identity, bind_spawn_role, is_builtin_profile,
     pinned_mail_identity, prime_profile_identity, profile_launch_args, profile_workflow_invoke,
@@ -598,7 +587,9 @@ pub(crate) fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
 #[cfg(test)]
 mod profile_cli_tests {
     use super::*;
+    use crate::cmd::squad::resolve_squad_member;
     use crate::is_builtin_profile;
+    use crate::snapshot::snapshot_runs;
     #[test]
     fn is_builtin_profile_classifies_the_six() {
         for name in [

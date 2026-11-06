@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow, bail};
 use clap::Subcommand;
 
+use crate::cmd::internal::{run_verify_with_timeout, tail_of};
 use crate::config::Config;
 
 #[derive(Subcommand)]
@@ -146,7 +147,7 @@ pub(crate) fn cmd_ledger(_cfg: &Config, cmd: &LedgerCmd) -> Result<()> {
                 if crate::is_cargo_test_verify(&verify) {
                     let timeout = crate::verdict::bead_timebox_secs(&cwd, bead_id, 120);
                     let timeout = timeout.min(300);
-                    match crate::run_verify_with_timeout(&verify, timeout, &cwd) {
+                    match run_verify_with_timeout(&verify, timeout, &cwd) {
                         Ok((exit, output)) => {
                             let (passed, filtered) = crate::parse_cargo_test_counts(&output);
                             if exit != 0 {
@@ -171,7 +172,7 @@ pub(crate) fn cmd_ledger(_cfg: &Config, cmd: &LedgerCmd) -> Result<()> {
                                         filtered
                                             .map(|n| n.to_string())
                                             .unwrap_or_else(|| "unknown".into()),
-                                        crate::tail_of(&output)
+                                        tail_of(&output)
                                     ),
                                 );
                                 if effective_strict {

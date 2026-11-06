@@ -167,7 +167,7 @@ impl RtHost {
         crate::backend::run_mail_off_runtime_sync(|| -> anyhow::Result<()> {
             crate::durable::seed_workspace_from_active_loop(&mut model, project)?;
             crate::seed_roles_from_binds(&mut model, project)?;
-            crate::rebuild_assignment_from_receipts(&mut model);
+            crate::cmd::doorbell::rebuild_assignment_from_receipts(&mut model);
             Ok(())
         })?;
         model.last_now = unix_now();
@@ -437,7 +437,9 @@ fn build_index(cfg: &Config, project: &str) -> doorbell::SelfIndex {
         .iter()
         .filter_map(|e| e.mail_identity.clone())
         .collect();
-    crate::backend::run_mail_off_runtime_sync(|| crate::doorbell_self_index(cfg, project, &pins))
+    crate::backend::run_mail_off_runtime_sync(|| {
+        crate::cmd::doorbell::doorbell_self_index(cfg, project, &pins)
+    })
 }
 
 fn unix_now() -> u64 {
@@ -529,7 +531,7 @@ impl Host for RtHost {
             let _ = crate::state::save_session_topology(&self.project, topo);
         }
         let cmds = self.run_durable_audit(cmds);
-        crate::handle_workspace_cmds(
+        crate::cmd::doorbell::handle_workspace_cmds(
             &mut self.model,
             &cmds,
             &self.project,
@@ -654,7 +656,7 @@ impl Host for RtHost {
             return Vec::new();
         };
         let pins: Vec<String> = self.registry_pins();
-        crate::timeout_presence_rows(&body, unix_now())
+        crate::cmd::doorbell::timeout_presence_rows(&body, unix_now())
             .into_iter()
             .filter(|(pin, _)| pins.contains(pin))
             .collect()
@@ -715,7 +717,7 @@ impl Host for RtHost {
             let retired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let retired_cb = std::sync::Arc::clone(&retired);
             let wake_bell = std::sync::Arc::clone(&died_bell);
-            let handle = crate::spawn_wake_consumer(
+            let handle = crate::cmd::doorbell::spawn_wake_consumer(
                 &project,
                 &workspace,
                 &config::state_dir(),
@@ -765,7 +767,11 @@ impl RtHost {
 
     fn fetch_inbox_cli(&self, pin: &str, since: &str) -> Vec<serde_json::Value> {
         let output = std::process::Command::new("toron")
-            .args(crate::mail_inbox_fallback_argv(pin, &self.project, since))
+            .args(crate::cmd::internal::mail_inbox_fallback_argv(
+                pin,
+                &self.project,
+                since,
+            ))
             .output();
         let Ok(output) = output else {
             doorbell::audit_append(
@@ -922,7 +928,7 @@ async fn run_embedded_async(
         let retired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let retired_cb = std::sync::Arc::clone(&retired);
         let wake_bell = std::sync::Arc::clone(&died_bell);
-        let handle = crate::spawn_wake_consumer(
+        let handle = crate::cmd::doorbell::spawn_wake_consumer(
             &project,
             workspace,
             &config::state_dir(),

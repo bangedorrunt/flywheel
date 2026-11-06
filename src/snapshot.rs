@@ -752,7 +752,7 @@ pub(crate) fn robot_snapshot(cfg: &Config) -> Result<Value> {
 /// Run list for the robot snapshot (P6.4) — workflow/pipeline/loop entries
 /// from the per-project logs, newest first, with state + owner + run-id.
 /// Independent of the `runs` CLI so the snapshot has no subcommand coupling.
-fn snapshot_runs() -> Vec<Value> {
+pub(crate) fn snapshot_runs() -> Vec<Value> {
     use crate::state::EventKind;
     let mut entries = Vec::new();
     for project in crate::state::project_logs() {

@@ -1,10 +1,12 @@
 //! `flywheel debate` + `flywheel plan-review` verbs (split from `main.rs`, bd-wave5-main-eviction-d5hht).
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 
 use crate::backend;
 use crate::config::Config;
-use crate::{harvest_latest, mail_send, project_dir_str, resolve_mail_target_registry};
+use crate::{
+    harvest_latest, mail_send, project_dir_str, resolve_agent_default, resolve_mail_target_registry,
+};
 /// `flywheel debate <proposition> [--rounds N] [--agent-a ..] [--agent-b ..]
 /// [--judge ..]` — N-round A/B debate + judge (ADR-0001 §9.1).
 ///
@@ -570,6 +572,7 @@ fn settle_agent(mux: &dyn backend::MultiplexerBackend, agent: &str) -> Result<()
 /// argument / the APPROVE|CHANGES: token), not the subject line.
 ///
 /// governed-by: ADR-0001 §9.1/§9.2 (bd-review-fix-epic-m0b.1)
+#[cfg(test)]
 pub fn extract_latest_body(v: &serde_json::Value) -> Option<String> {
     v.get("result")
         .and_then(serde_json::Value::as_array)

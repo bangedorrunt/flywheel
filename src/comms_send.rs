@@ -39,8 +39,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use serde_json::{Value, json};
-#[cfg(any(test, feature = "backend-superlogical"))]
-use toron_plane::backend::AgentInfo;
 use toron_core::contracts::task_v1::TaskV1;
 use toron_core::delivery::Reject;
 use toron_core::envelope::{
@@ -48,6 +46,8 @@ use toron_core::envelope::{
 };
 use toron_core::inbox::{InboxError, InboxStore};
 use toron_core::outbox::{self, SendState};
+#[cfg(any(test, feature = "backend-superlogical"))]
+use toron_plane::backend::AgentInfo;
 
 use crate::config::Config;
 use crate::pane_write::{PaneTyper, PaneWrite, Urgency, Wm};
@@ -56,7 +56,8 @@ use crate::pane_write::{PaneTyper, PaneWrite, Urgency, Wm};
 /// `inbox_log = false` opts out. A set `TORON_COMMS_INBOX` wins:
 /// `1|true|on` on, `0|false|off` and any other value off.
 pub fn enabled(cfg: &Config) -> bool {
-    toron_core::inbox::enabled_with(cfg.comms.as_ref().and_then(|c| c.inbox_log))
+    toron_core::inbox::try_enabled_with(cfg.comms.as_ref().and_then(|c| c.inbox_log))
+        .unwrap_or(false)
 }
 
 /// Typed send failures. Every one of them means: nothing was appended.

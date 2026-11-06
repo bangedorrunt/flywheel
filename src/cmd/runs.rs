@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 
 use crate::config::Config;
 use crate::output::print_json;
+use crate::snapshot::latest_run_entries;
 
 /// Runs view (ADR-0005 P6.3): the captain's daily dashboard over workflow /
 /// pipeline / loop runs recorded in the project log.
@@ -69,7 +70,7 @@ pub(crate) fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
             }
         }
         out.sort_by(|a, b| b.1.ts.cmp(&a.1.ts));
-        Ok(crate::latest_run_entries(out))
+        Ok(latest_run_entries(out))
     }
 
     /// A run is pending when its payload carries a suspend/park marker.

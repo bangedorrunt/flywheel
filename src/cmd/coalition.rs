@@ -322,7 +322,7 @@ pub(crate) enum CoalitionCmd {
 /// path (the auto-proposer is P11.3b).
 /// Dispatched from `main()`; moved from crate root (bd-wave5-main-eviction-d5hht).
 pub(crate) fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
-    use coalition::CoalitionStore;
+    use crate::coalition::CoalitionStore;
     use toron_core::mailbox::{ReleaseAsk, ReleaseDecision};
 
     /// Resolve a crew spec to member profile names (same rule as

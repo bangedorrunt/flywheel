@@ -3,6 +3,7 @@
 //! read — no second snapshot shape here.
 
 use std::collections::{BTreeMap, HashSet};
+use std::io::IsTerminal;
 
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};

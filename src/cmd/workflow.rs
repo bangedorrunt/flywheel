@@ -5,19 +5,23 @@ use clap::Subcommand;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::cmd::internal::{headless_dispatch, headless_spawn_gate, make_verify_sink};
+use crate::cmd::mail::{mail_or_die, repo_evidence_verified};
+use crate::cmd::send::{ComposeRunLifecycle, running_run_row_exists};
 use crate::config::Config;
 use crate::hc::Client;
 use crate::output::print_json;
 use crate::state::EventKind;
 use crate::{
-    briefing_enabled, builtin_workflows, config, crew, decide, enrich_suggestions_live,
-    ensure_project_opt, identity, log, output, output_action_stage, packed_from_flag, pane,
-    planner_author_response, profile, project_dir, project_door_opt, run_terminal_status, stages,
-    state, steer_brief, workflow_briefing_context, workflow_catalog, write_terminal_artifact,
+    briefing_enabled, config, crew, cron, enrich_suggestions_live, ensure_and_join_channels,
+    ensure_project_opt, history_row_status, log, operator_pin, output, output_action_stage,
+    packed_from_flag, pane, phase_chain, planner_author_response, profile, project_dir,
+    project_dir_str, project_door_opt, run_row_kind, run_terminal_status, stages, state,
+    steer_brief, workflow_briefing_context, workflow_catalog, write_terminal_artifact,
 };
 
 /// Unified workflow commands (ADR-0005 Spec 5 / P3.7). `lint` is the
@@ -402,7 +406,7 @@ fn cmd_workflow_evaluate(
 /// Shared hybrid selection fields for one workflow name.
 /// Used by brief + full list projections so family/selection/run/compose_token
 /// cannot drift between `--brief` and bare `list --json`.
-fn workflow_hybrid_fields(name: &str) -> (String, &'static str, &'static str, bool) {
+pub(crate) fn workflow_hybrid_fields(name: &str) -> (String, &'static str, &'static str, bool) {
     let compose_token = crate::builtin_workflows::is_compose_token(name);
     let run = if compose_token {
         format!("workflow compose \"<objective>\" --parts {name} --run")
@@ -417,7 +421,7 @@ fn workflow_hybrid_fields(name: &str) -> (String, &'static str, &'static str, bo
 /// GS-052: live `--brief` projection used by [`cmd_workflow`].
 /// ONE hybrid contract = name / family / selection / run / topology / compose_token
 /// (not a local test mirror; no competing brief path).
-fn workflow_list_brief_rows(
+pub(crate) fn workflow_list_brief_rows(
     all: &std::collections::BTreeMap<String, (toron_workflow::schema::Workflow, &'static str)>,
 ) -> Vec<serde_json::Value> {
     let mut rows: Vec<serde_json::Value> = Vec::new();
@@ -438,7 +442,7 @@ fn workflow_list_brief_rows(
 /// Live bare `workflow list --json` projection used by [`cmd_workflow`].
 /// Same hybrid fields as brief via [`workflow_hybrid_fields`], plus full-row
 /// description/trigger/source/crew/inputs/decide_trigger (no topology).
-fn workflow_list_full_rows(
+pub(crate) fn workflow_list_full_rows(
     all: &std::collections::BTreeMap<String, (toron_workflow::schema::Workflow, &'static str)>,
 ) -> Vec<serde_json::Value> {
     use toron_workflow::schema::CrewSpec;
@@ -2027,6 +2031,7 @@ pub(crate) fn lint_flywheel_tier(
 #[cfg(test)]
 mod workflow_cli_lint_tests {
     use super::*;
+    use crate::builtin_workflows;
     use toron_workflow::schema::parse_workflow;
 
     /// The flywheel-tier lint fails closed on an unresolved `@profile`
