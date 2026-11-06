@@ -47,7 +47,7 @@ pub struct RtHost {
     /// One rex presence poller per host (wave17-b): the boot seed is applied
     /// directly, and ongoing status changes ride a dedicated poll thread so
     /// no blocking plane call ever runs inside the brain's async tick.
-    presence_armed: Arc<std::sync::atomic::AtomicBool>,
+    presence_armed: bool,
     /// Shared with the delivery path. bd-kz54 follow-up: `WatchRetry::reset()`
     /// had exactly one caller in the whole tree — its own unit test — so four
     /// failures anywhere in a host's life latched the 16s gate permanently and
@@ -201,7 +201,7 @@ impl RtHost {
             exe_path,
             brain_tx,
             covered_panes: Arc::new(Mutex::new(HashSet::new())),
-            presence_armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            presence_armed: false,
             retry: std::sync::Arc::new(std::sync::Mutex::new(doorbell_rt::WatchRetry::default())),
             authority: crate::authority::RuntimeAuthority::resolve(),
             index_refreshed_at: now,
@@ -281,10 +281,7 @@ impl RtHost {
         if pane_ids.is_empty() {
             return;
         }
-        if self
-            .presence_armed
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        if self.presence_armed {
             return;
         }
         let pin_by_pane: HashMap<String, String> = pane_ids.iter().cloned().collect();
@@ -339,10 +336,10 @@ impl RtHost {
         // one dead pane id, and calling the plane from the sweep path stalled
         // the brain; a 3s agent_list poll is bounded, cheap, and reconnects
         // by construction.
-        self.presence_armed
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.presence_armed = true;
         let tx = self.brain_tx.clone();
         let cfg = self.cfg.clone();
+        let project = self.project.clone();
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_secs(3));
@@ -352,6 +349,14 @@ impl RtHost {
                 let Ok(agents) = backend.agent_list() else {
                     continue;
                 };
+                // Re-read the registry every cycle: `flywheel add` panes are
+                // only in the registry after the host started, and a map
+                // frozen at boot would leave them on the old unknown path.
+                let pin_by_pane: HashMap<String, String> = state::load_spawn_registry(&project)
+                    .iter()
+                    .filter(|e| !e.pane_id.is_empty())
+                    .filter_map(|e| e.mail_identity.clone().map(|pin| (e.pane_id.clone(), pin)))
+                    .collect();
                 let (updates, _) = RtHost::presence_updates_for(&agents, &pin_by_pane);
                 for msg in updates {
                     if tx.blocking_send(msg).is_err() {

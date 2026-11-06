@@ -1828,8 +1828,13 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             // it (done/idle -> Idle, working/blocked -> Busy, anything else
             // -> Unknown). Without this a rex host saw every wake as
             // "non-injectable presence" and filtered every prompt to Audit.
-            next.presence
-                .insert(pin.clone(), Presence::from_str(status));
+            // A confirmed Dead pane is never resurrected by a shell status:
+            // the pane can still report idle at a prompt while its agent is
+            // gone, and a prompt into that shell is a lost wake.
+            if !matches!(next.presence.get(pin), Some(Presence::Dead { .. })) {
+                next.presence
+                    .insert(pin.clone(), Presence::from_str(status));
+            }
             cmds.extend(filter_prompts(&next, c));
         }
         Msg::Fact { summary } => {
