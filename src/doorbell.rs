@@ -2831,7 +2831,7 @@ mod tests {
         let raw = r#"{"importance":"high","tags":[["toron-kind","request-release"]],"created_ts":"2026-08-20T00:00:01Z"}"#;
         let (class, hint) = parse_inbox_item(&serde_json::from_str(raw).unwrap()).expect("ring");
         assert_eq!(class, EventClass::RequestRelease);
-        assert!(hint.contains("inbox --since"));
+        assert!(hint.contains("toron next"), "per-message door, got {hint}");
     }
 
     #[test]
@@ -2876,7 +2876,7 @@ mod tests {
             .collect();
         assert_eq!(prompts.len(), 1);
         assert!(prompts[0].1.contains("[doorbell]"));
-        assert!(prompts[0].1.contains("inbox --since"));
+        assert!(prompts[0].1.contains("toron next"));
         let raw = r#"{"messages":[{"importance":"urgent","created_ts":"2026-08-20T00:00:02Z"}]}"#;
         assert_eq!(
             inbox_high_water(raw).as_deref(),
@@ -3359,8 +3359,8 @@ mod tests {
             "mail-delivered is routine inbox-pull, urgency comes from the fold"
         );
         assert!(
-            hint.contains("toron mail inbox"),
-            "hint must be mail inbox, got {hint}"
+            hint.contains("toron next"),
+            "hint must be the per-message door, got {hint}"
         );
     }
 
