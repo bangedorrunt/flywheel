@@ -238,3 +238,20 @@ Coordination protocol shipped in the same wave: crew/captain skills
 `peer-aware` template, `docs/agent-instructions/orchestration.md`, and
 `docs/analysis/coordination-awareness-2026-11-07.md` (leases are 180 s
 heartbeats; the crate-wide gate, not a lease, is the serializer).
+
+### Final verification (freshly installed binaries)
+
+- Clean export at `dab88685`: `EXIT=0`, **2721** bin tests passed, 36 test
+  targets ok, 0 failed.
+- Clean export at the final HEAD `0fff560f`: `EXIT=0`, **2722** bin tests
+  passed, 36 targets ok, 0 failed (the extra test is the seeded-ring hear
+  proof).
+- Reinstalled and re-signed `flywheel` and `toron`; restarted the toron
+  daemon and the one host owner per workspace.
+- Live on the installed binary: rex wake typed
+  `[doorbell] plane-P urgent. Pull: toron next`; hc pane replied `hc-ok`;
+  `/health` `degraded []`; `toron next` returns the live straggler set and
+  an ack removes one; `reserve acquire --exclusive` refuses the second
+  overlapping holder.
+- Live hear fix (`0fff560f`): an answering agent now clears the unanswered
+  ring, and it stays clear past the 120 s expiry.
