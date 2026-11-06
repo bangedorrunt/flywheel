@@ -85,9 +85,11 @@ candidates DISPROVED as duplicates (documented KEEPs); no follow-up beads.
 - **One snapshot producer** — still open: `status`/`progress`/`snapshot`/
   robot doors still read independently. Bead: `bd-wave11-snapshot-mndgf`
   (IN PROGRESS).
-- **Presence fold / RunEnv** — bead filed by this refresh:
-  `bd-presence-runenv-snapshot-fe4bh` (OPEN): decide whether they ride the
-  snapshot bead or need their own shape.
+- **Presence fold / RunEnv** — split decided (wave16 follow-up on
+  `bd-presence-runenv-snapshot-fe4bh`): the live presence producer is its
+  own bug, `bd-wave17-presence-producer-yjfol` (rex PlaneStatus → doorbell
+  model); RunEnv + FleetContext ride SnapshotV1 when
+  `bd-wave11-snapshot-mndgf` lands. This bead closes on the decision record.
 - **Doorbell host PATH + restart** — DONE (`bd-wave15-doorbell-live-2c6jf`,
   closed).
 - **Installed-binary + daemon freshness ritual** — operator procedure, no
