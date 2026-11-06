@@ -1395,7 +1395,7 @@ pub(crate) fn cmd_loop(
                         let code = out.status.code().unwrap_or(-1);
                         eprintln!(
                             "{}",
-                            crate::cmd::send::format_send_failure(
+                            crate::cmd::internal::format_send_failure(
                                 name,
                                 raw.trim(),
                                 err_bytes.trim(),

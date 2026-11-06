@@ -14,6 +14,7 @@ pub(crate) mod cron;
 pub(crate) mod daemon;
 pub(crate) mod doorbell;
 pub(crate) mod history;
+pub(crate) mod internal;
 pub(crate) mod judgment;
 pub(crate) mod ledger;
 pub(crate) mod loop_mode;
