@@ -1577,6 +1577,48 @@ pub struct HostCfg {
 impl HostCfg {
     /// Read `FLYWHEEL_SUPERVISOR_{TICK_MS,ACK_MS,LEASE_MS,PASSES,STRATEGY,HINTS}`
     /// and `FLYWHEEL_SUPERVISOR_CLOCK_SCALE` (fixtures only; 1 is production).
+    /// Parse-or-refuse (wave12-d): a set-but-garbage knob is a [`ConfigError`]
+    /// naming the accepted forms, never a silent default. `None` keeps the
+    /// documented default for that knob.
+    pub fn try_from_env() -> Result<Self, crate::config::ConfigError> {
+        use crate::config::{ConfigError, parse_u64};
+        let num = |k: &'static str| {
+            parse_u64(k).map_err(|e| ConfigError {
+                name: e.name,
+                value: e.value,
+                accepted: "a non-negative integer (ms)",
+            })
+        };
+        let strategy = crate::config::parse_enum(
+            "FLYWHEEL_SUPERVISOR_STRATEGY",
+            "one_for_one|rest_for_one|one_for_all",
+            crate::supervisor_program::Strategy::parse,
+        )?;
+        let join = crate::config::parse_enum(
+            "FLYWHEEL_SUPERVISOR_JOIN",
+            "all|quorum:N|first:N (N >= 1)",
+            crate::supervisor_program::Join::parse,
+        )?;
+        Ok(Self {
+            tick_ms: num("FLYWHEEL_SUPERVISOR_TICK_MS")?.unwrap_or(1_000).max(10),
+            ack_ms: num("FLYWHEEL_SUPERVISOR_ACK_MS")?,
+            lease_ms: num("FLYWHEEL_SUPERVISOR_LEASE_MS")?,
+            // Total functions by contract (`off` disables, anything else
+            // enables — native-ux inventory): no garbage class, left as-is.
+            passes: std::env::var("FLYWHEEL_SUPERVISOR_PASSES").map_or(true, |v| v != "off"),
+            strategy,
+            hints: std::env::var("FLYWHEEL_SUPERVISOR_HINTS").map_or(true, |v| v != "off"),
+            clock_scale: num("FLYWHEEL_SUPERVISOR_CLOCK_SCALE")?
+                .filter(|n| *n >= 1)
+                .unwrap_or(1),
+            join,
+            max_wall_ms: num("FLYWHEEL_SUPERVISOR_MAX_WALL_MS")?,
+        })
+    }
+
+    /// Non-strict read for tests (fixtures set valid values or unset).
+    /// Production callers use [`HostCfg::try_from_env`].
+    #[cfg(test)]
     pub fn from_env() -> Self {
         let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok());
         Self {
@@ -1757,6 +1799,7 @@ fn run_bounded_on(
     }
 }
 
+#[cfg(test)]
 fn clock_scale() -> u64 {
     std::env::var("FLYWHEEL_SUPERVISOR_CLOCK_SCALE")
         .ok()
@@ -1913,7 +1956,7 @@ pub fn run_supervise(
     {
         bail!("--context must be letters, digits, '-' or '_'");
     }
-    let hc = HostCfg::from_env();
+    let hc = HostCfg::try_from_env()?;
     let dir = CtxPaths::default_dir();
     let paths = match context {
         Some(c) => CtxPaths::with_context(&dir, project, c),

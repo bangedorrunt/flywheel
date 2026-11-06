@@ -525,23 +525,25 @@ impl Default for HostCfg {
 
 impl HostCfg {
     /// Read `FLYWHEEL_INBOX_TICK_MS` and `FLYWHEEL_INBOX_CLOCK_SCALE`.
-    pub fn from_env() -> Self {
+    /// Parse-or-refuse (wave12-d): a set-but-garbage (or zero) value is a
+    /// [`ConfigError`](crate::config::ConfigError) naming the accepted
+    /// forms, never a silent default. `None` keeps the documented default.
+    pub fn try_from_env() -> Result<Self, crate::config::ConfigError> {
+        use crate::config::parse_enum;
+        let tick_ms = parse_enum("FLYWHEEL_INBOX_TICK_MS", "an integer > 0 (ms)", |v| {
+            v.trim().parse::<u64>().ok().filter(|ms| *ms > 0)
+        })?;
+        let clock_scale = parse_enum("FLYWHEEL_INBOX_CLOCK_SCALE", "an integer > 0", |v| {
+            v.trim().parse::<u64>().ok().filter(|s| *s > 0)
+        })?;
         let mut c = Self::default();
-        if let Some(ms) = std::env::var("FLYWHEEL_INBOX_TICK_MS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|ms| *ms > 0)
-        {
+        if let Some(ms) = tick_ms {
             c.tick = Duration::from_millis(ms);
         }
-        if let Some(s) = std::env::var("FLYWHEEL_INBOX_CLOCK_SCALE")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|s| *s > 0)
-        {
+        if let Some(s) = clock_scale {
             c.clock_scale = s;
         }
-        c
+        Ok(c)
     }
 }
 

@@ -19,6 +19,79 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+/// A `FLYWHEEL_*` knob that refused to parse (wave12-d): the name, what was
+/// set, and the accepted forms. Unknown is an error, never a silent default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigError {
+    pub name: &'static str,
+    pub value: String,
+    pub accepted: &'static str,
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}={:?} is not valid (accepted: {})",
+            self.name, self.value, self.accepted
+        )
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+/// One strict parse of a `FLYWHEEL_*` knob: unset/empty → `Ok(None)` (the
+/// caller applies its default); set → `parse` or a [`ConfigError`] naming
+/// `accepted`. The single interpretation site per knob — domain code calls
+/// the typed accessor, never `env::var` plus an ad-hoc parse.
+pub fn parse_env_opt<T>(
+    name: &'static str,
+    accepted: &'static str,
+    parse: impl FnOnce(&str) -> Option<T>,
+) -> Result<Option<T>, ConfigError> {
+    let Some(os) = std::env::var_os(name).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let raw = os.to_string_lossy();
+    parse(&raw).map(Some).ok_or_else(|| ConfigError {
+        name,
+        value: raw.into_owned(),
+        accepted,
+    })
+}
+
+/// `1|true|on` → true, `0|false|off` → false (ASCII case-insensitive).
+pub fn parse_flag(name: &'static str) -> Result<Option<bool>, ConfigError> {
+    parse_env_opt(name, "1|true|on|0|false|off", |raw| {
+        match raw.to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" => Some(true),
+            "0" | "false" | "off" => Some(false),
+            _ => None,
+        }
+    })
+}
+
+/// A `parse`-shaped enum knob: `accepted` names the forms, `parse` decides.
+pub fn parse_enum<T>(
+    name: &'static str,
+    accepted: &'static str,
+    parse: impl FnOnce(&str) -> Option<T>,
+) -> Result<Option<T>, ConfigError> {
+    parse_env_opt(name, accepted, parse)
+}
+
+/// A non-negative integer (leading/trailing whitespace tolerated).
+pub fn parse_u64(name: &'static str) -> Result<Option<u64>, ConfigError> {
+    parse_env_opt(name, "a non-negative integer", |raw| {
+        raw.trim().parse::<u64>().ok()
+    })
+}
+
+/// A non-empty path.
+pub fn parse_path(name: &'static str) -> Result<Option<PathBuf>, ConfigError> {
+    parse_env_opt(name, "a non-empty path", |raw| Some(PathBuf::from(raw)))
+}
+
 /// Crate-wide lock for tests that mutate process env vars (193.2): env is
 /// process-global, so ALL env-mutating tests across modules must serialize
 /// under ONE lock — per-module locks would still race each other. Config's
@@ -495,7 +568,44 @@ impl Config {
             mail_cfg.name = Some(v);
             cfg.agent_mail = Some(mail_cfg);
         }
+        cfg.validate_env_knobs()?;
         Ok(cfg)
+    }
+
+    /// Startup validation (wave12-d): every listed knob parses-or-refuses
+    /// through one helper per shape. Unset/empty falls through (callers keep
+    /// their file layers and defaults); anything set-but-garbage fails the
+    /// load with a [`ConfigError`] naming the accepted forms. This stores
+    /// nothing — use-site readers (`resolve_backend_name`, `crew_max`, …)
+    /// keep their precedence and defaults byte-identical; garbage simply
+    /// never reaches them. The supervisor/inbox families validate through
+    /// their own `try_from_env` constructors (same helpers, same accepted
+    /// strings — validation may repeat the single helper; interpretation
+    /// never forks). Total functions (`PASSES`/`HINTS`: `off` disables,
+    /// all else enables) and shape-only names (`BR_BIN`) have no garbage
+    /// class and are not listed.
+    fn validate_env_knobs(&self) -> Result<(), ConfigError> {
+        parse_enum("FLYWHEEL_BACKEND", "auto|rex|superlogical|hc", |v| {
+            let choice = toron_plane::backend::plane::PlaneChoice::parse(v);
+            (!matches!(choice, toron_plane::backend::plane::PlaneChoice::Unknown(_)))
+                .then(|| v.to_string())
+        })?;
+        parse_enum("FLYWHEEL_MAIL", "toron", |v| {
+            (v == "toron").then(|| v.to_string())
+        })?;
+        parse_enum("FLYWHEEL_CREW_MAX", "an integer >= 1", |v| {
+            v.trim().parse::<u32>().ok().filter(|n| *n >= 1)
+        })?;
+        parse_flag("FLYWHEEL_TIMER")?;
+        parse_flag("FLYWHEEL_ALLOW_EXEC")?;
+        parse_flag("FLYWHEEL_NO_DOORBELL_ENSURE")?;
+        parse_enum("FLYWHEEL_SHIP_GATE_MODE", "block|warn", |v| {
+            matches!(v, "block" | "warn").then(|| v.to_string())
+        })?;
+        // Supervisor + inbox families: same constructors the domain calls.
+        crate::supervisor_host::HostCfg::try_from_env()?;
+        crate::inbox_host::HostCfg::try_from_env()?;
+        Ok(())
     }
 
     /// Toron env overrides: `FLYWHEEL_TORON_URL` / `FLYWHEEL_TORON_TOKEN`
@@ -932,6 +1042,93 @@ pub fn clear_captain_alias(alias_map: &mut BTreeMap<String, String>, project: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// wave12-d: strict helper tables + load-time refusal. Env-mutating tests
+    /// take the crate-wide `lock_env()` guard (process-global env).
+    mod config_strict_tests {
+        use super::super::*;
+        use crate::config::lock_env;
+
+        fn set(name: &str, value: &str) {
+            unsafe { std::env::set_var(name, value) };
+        }
+
+        fn remove(name: &str) {
+            unsafe { std::env::remove_var(name) };
+        }
+
+        #[test]
+        fn config_strict_flag_table() {
+            for (raw, want) in [
+                ("1", Some(true)),
+                ("true", Some(true)),
+                ("on", Some(true)),
+                ("TRUE", Some(true)),
+                ("0", Some(false)),
+                ("false", Some(false)),
+                ("off", Some(false)),
+                ("OFF", Some(false)),
+                ("perhaps", None),
+                ("2", None),
+                ("", None),
+            ] {
+                let _g = lock_env();
+                if raw.is_empty() {
+                    remove("FLYWHEEL_CONFIG_STRICT_PROBE");
+                } else {
+                    set("FLYWHEEL_CONFIG_STRICT_PROBE", raw);
+                }
+                assert_eq!(
+                    parse_flag("FLYWHEEL_CONFIG_STRICT_PROBE").ok().flatten(),
+                    want,
+                    "flag {raw:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn config_strict_error_names_knob_and_forms() {
+            let _g = lock_env();
+            set("FLYWHEEL_CONFIG_STRICT_PROBE", "bogus");
+            let err = parse_enum("FLYWHEEL_CONFIG_STRICT_PROBE", "a|b", |v| {
+                matches!(v, "a" | "b").then(|| v.to_string())
+            })
+            .expect_err("garbage must refuse");
+            assert_eq!(err.name, "FLYWHEEL_CONFIG_STRICT_PROBE");
+            assert_eq!(err.value, "bogus");
+            assert_eq!(err.accepted, "a|b");
+            assert!(err.to_string().contains("FLYWHEEL_CONFIG_STRICT_PROBE"));
+            assert!(err.to_string().contains("a|b"));
+            remove("FLYWHEEL_CONFIG_STRICT_PROBE");
+        }
+
+        #[test]
+        fn config_strict_load_refuses_garbage_backend() {
+            let _g = lock_env();
+            set("FLYWHEEL_BACKEND", "bogus");
+            let err = Config::load().expect_err("garbage backend must fail load");
+            assert!(err.to_string().contains("FLYWHEEL_BACKEND"));
+            assert!(err.to_string().contains("auto|rex|superlogical|hc"));
+            remove("FLYWHEEL_BACKEND");
+        }
+
+        #[test]
+        fn config_strict_load_accepts_valid_backend() {
+            let _g = lock_env();
+            set("FLYWHEEL_BACKEND", "hc");
+            Config::load().expect("valid backend loads");
+            remove("FLYWHEEL_BACKEND");
+        }
+
+        #[test]
+        fn config_strict_load_refuses_garbage_timer() {
+            let _g = lock_env();
+            set("FLYWHEEL_TIMER", "perhaps");
+            let err = Config::load().expect_err("garbage flag must fail load");
+            assert!(err.to_string().contains("FLYWHEEL_TIMER"));
+            remove("FLYWHEEL_TIMER");
+        }
+    }
 
     #[test]
     fn doorbell_url_defaults_to_daemon_host() {

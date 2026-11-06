@@ -881,7 +881,7 @@ async fn run_embedded_async(
     if crate::comms_send::enabled(&cfg) {
         _inbox_guard = Some(crate::inbox_host::InboxHost::spawn(
             crate::inbox_ports::FlywheelPorts::new(&cfg, project, workspace),
-            crate::inbox_host::HostCfg::from_env(),
+            crate::inbox_host::HostCfg::try_from_env()?,
         ));
     }
     let store = FileStore::new(config::state_dir());

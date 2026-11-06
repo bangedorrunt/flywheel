@@ -11,9 +11,12 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 /// The `br` binary: `$FLYWHEEL_BR_BIN` when set and non-blank, else `br`.
+/// Shape-checked through the strict helper (accepted: a non-empty path);
+/// any set value is a program name, so this cannot fail in practice.
 pub fn br_program() -> String {
-    std::env::var("FLYWHEEL_BR_BIN")
-        .ok()
+    crate::config::parse_path("FLYWHEEL_BR_BIN")
+        .unwrap_or(None)
+        .map(|p| p.to_string_lossy().into_owned())
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "br".to_string())
 }
