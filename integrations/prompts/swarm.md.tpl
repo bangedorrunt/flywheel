@@ -42,7 +42,9 @@ answer is the crew shape when a person is here, else the named squad.
 5. BRIEF: lane dispatch authoritative. Peer wakes are signals, not
    tasks; peer-aware wake rides the doorbell. The loop is bead dispatch,
    not wake. Per lane: bead ids, files, pin, claim with the pin as
-   assignee, 4min reserve, build slot, TDD RED first,
+   assignee, `toron reserve conflicts` on the lane files first (no
+   conflict = narrow reserve; overlap = re-plan/split, never wait), loop
+   heartbeat (4min window), build slot, TDD RED first,
    commit-before-close with VERIFY tail, stage ONLY reserved paths, on
    [doorbell] pull then act, blocked >10m mail captain, TIMEBOX 90m
    partial report, prove-it-works. Every dispatch ANNOUNCES its vehicle first line. --raw for
@@ -51,14 +53,17 @@ answer is the crew shape when a person is here, else the named squad.
 
 9. REPORT: crews post status/commit/verify/deviations on lane threads.
 
-6. CONFLICT: soft -> request-release -> respond -> escalate, captain
-   LAST; hard -> serialize; cross-sweep -> flag.
-   never-block-on-the-human.
+6. CONFLICT: check `toron reserve conflicts` before edits; leases are
+   180s heartbeats, so never wait on one. Soft -> re-plan/split ->
+   request-release -> respond -> escalate, captain LAST; hard (same
+   file) -> serialize or `with-lease` the one edit; cross-sweep -> flag.
+   The shared crate is the real serializer: keep it compiling, announce
+   red, land compile-green slices. never-block-on-the-human.
 
 7. WAVE GATE: fresh-eyes verify -- suite+fmt+clippy AND live wiring.
    Close with evidence, then next wave. sequence-verifiable-units.
 
-8. TEARDOWN: `toron reserve release --project <p> --agent <pin>`;
+8. TEARDOWN: `toron reserve release-by-reason <bead>` (batch: `sweep`);
    `flywheel mail slot release <project> --slot cargo --as <pin>`;
    `flywheel kill <project> --force --force-working`; br sync; commit
    .beads.
