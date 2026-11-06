@@ -1759,8 +1759,15 @@ mod loop_run_verify_tests {
             ],
         )
         .unwrap();
-        let o = crate::loop_run_verify_exec(&cfg, "lrv-test", &bead_id, &sha, Some(60), Some(&dir))
-            .unwrap();
+        let o = crate::cmd::internal::loop_run_verify_exec(
+            &cfg,
+            "lrv-test",
+            &bead_id,
+            &sha,
+            Some(60),
+            Some(&dir),
+        )
+        .unwrap();
         assert_eq!(o.band, "loop-runnable");
         assert_eq!(o.exit, 0, "verify output: {}", o.output_tail);
         assert!(!o.skipped);
@@ -1801,16 +1808,28 @@ mod loop_run_verify_tests {
         let dir = std::env::temp_dir().join(format!("lrv-fail-{}", std::process::id()));
         let bead_id = scratch_lrv(&dir, "lrv-fail", "test -f does-not-exist.txt");
         let sha = commit_and_sha(&dir, &bead_id);
-        let o1 =
-            crate::loop_run_verify_exec(&cfg, "lrv-test", &bead_id, &sha, Some(60), Some(&dir))
-                .unwrap();
+        let o1 = crate::cmd::internal::loop_run_verify_exec(
+            &cfg,
+            "lrv-test",
+            &bead_id,
+            &sha,
+            Some(60),
+            Some(&dir),
+        )
+        .unwrap();
         assert_eq!(o1.band, "loop-runnable");
         assert_ne!(o1.exit, 0, "the fixture VERIFY must fail");
         let marker = dir.join(format!(".flywheel/loop-run-verify-failed/{bead_id}-{sha}"));
         assert!(marker.exists(), "failed-head marker must be written");
-        let o2 =
-            crate::loop_run_verify_exec(&cfg, "lrv-test", &bead_id, &sha, Some(60), Some(&dir))
-                .unwrap();
+        let o2 = crate::cmd::internal::loop_run_verify_exec(
+            &cfg,
+            "lrv-test",
+            &bead_id,
+            &sha,
+            Some(60),
+            Some(&dir),
+        )
+        .unwrap();
         assert!(
             o2.skipped,
             "never re-verify the same broken head — second run must skip"
@@ -1825,8 +1844,15 @@ mod loop_run_verify_tests {
         let dir = std::env::temp_dir().join(format!("lrv-heavy-{}", std::process::id()));
         let bead_id = scratch_lrv(&dir, "lrv-heavy", "cargo test --workspace");
         let sha = commit_and_sha(&dir, &bead_id);
-        let o = crate::loop_run_verify_exec(&cfg, "lrv-test", &bead_id, &sha, Some(60), Some(&dir))
-            .unwrap();
+        let o = crate::cmd::internal::loop_run_verify_exec(
+            &cfg,
+            "lrv-test",
+            &bead_id,
+            &sha,
+            Some(60),
+            Some(&dir),
+        )
+        .unwrap();
         assert_eq!(o.band, "non-runnable");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1835,14 +1861,16 @@ mod loop_run_verify_tests {
 #[cfg(test)]
 mod loop_tests {
     use super::*;
-    use crate::cmd::internal::{first_routable, planner_recipient_chain, send_not_ready_mail};
+    use crate::cmd::internal::{
+        first_routable, loop_run_verify_exec, planner_recipient_chain, registered_orchestrator,
+        reopen_unverified_close, send_done_mail, send_not_ready_mail, send_unverified_close_mail,
+    };
     use crate::cmd::send::bare_short_group_matches;
     use crate::cmd::status::progress_waves;
     use crate::{
         WantToken, agent_name_n, agent_ordinal, doorbell_uncovered_panes, free_spawn_ordinal,
-        kill_key, name_matches_want, registered_orchestrator, reopen_unverified_close,
-        resolve_send_targets_dyn, send_done_mail, send_unverified_close_mail, slugify_label,
-        spawn_agent_profile, watch_name_for_pane,
+        kill_key, name_matches_want, resolve_send_targets_dyn, slugify_label, spawn_agent_profile,
+        watch_name_for_pane,
     };
 
     /// bd-8hv0: the sweep must re-subscribe only panes the push

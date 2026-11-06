@@ -3264,3 +3264,1127 @@ fn send_not_ready_mail(
         },
     )
 }
+
+/// --- internal batch 3: done/verify/loop-run leaves (bd-wave5-main-eviction-d5hht) ---
+use anyhow::{Result, anyhow};
+use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
+
+use crate::config::Config;
+use crate::output::print_json;
+use crate::{backend, durable, verdict};
+use crate::{project_dir, project_dir_str};
+/// The programmatic done-mail leaf (2026-08-18): the LOOP mails the captain
+/// the close-reason REPORT on `thread_id=<bead_id>` when a watched bead
+/// closes with a legal verdict. Recipient: the bead's `created_by` when it
+/// resolves as a REGISTERED identity (routable), else the project's
+/// registered orchestrator agent (program == "flywheel"), else soft-fail
+/// `{ok:false}` — a mail hiccup never kills the loop.
+pub(crate) fn cmd_internal_mail_done(cfg: &Config, project: &str, bead_id: &str) -> Result<()> {
+    let mail = match backend::mail_backend(cfg) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("flywheel: mail backend unavailable for done-mail {bead_id}: {e:#}");
+            print_json(&json!({ "ok": false, "bead_id": bead_id, "error": format!("{e:#}") }));
+            return Ok(());
+        }
+    };
+    let key = project_dir_str(cfg, project)?;
+    let fallback = cfg
+        .agent_mail
+        .as_ref()
+        .and_then(|m| m.name.clone())
+        .unwrap_or_else(|| "Flywheel".to_string());
+    let (title, report) = bead_title_and_close_report(&key, bead_id);
+    let mut chain = planner_recipient_chain(&key, bead_id, &fallback);
+    chain.push("captain".to_string());
+    let captain = first_routable(chain.iter().map(String::as_str), |c| {
+        mail_whois_ok(&*mail, &key, c)
+    })
+    .or_else(|| registered_orchestrator(&*mail, &key));
+    let Some(captain) = captain else {
+        let tried = chain.join(", ");
+        print_json(&json!({
+            "ok": false,
+            "bead_id": bead_id,
+            "notified": tried,
+            "error": format!("no routable captain identity for {key} (tried {tried})")
+        }));
+        return Ok(());
+    };
+    let out = (|| -> Result<backend::SendReceipt> {
+        backend::run_mail(mail.ensure_project(&key)).map_err(|e| anyhow!("{e}"))?;
+        send_done_mail(&*mail, &key, bead_id, &title, &report, &captain)
+    })();
+    match out {
+        Ok(_) => {
+            print_json(&json!({ "ok": true, "bead_id": bead_id, "notified": captain }));
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("flywheel: done-mail for {bead_id} failed: {e:#}");
+            print_json(&json!({
+                "ok": false,
+                "bead_id": bead_id,
+                "notified": captain,
+                "error": format!("{e:#}")
+            }));
+            Ok(())
+        }
+    }
+}
+
+/// The bead's title + close-reason REPORT: the latest comment text (the
+/// close reason lands as a comment — evidence: closed beads carry it),
+/// falling back to "closed". Best-effort — empty report degrades to the
+/// title alone.
+fn bead_title_and_close_report(project_dir: &str, bead_id: &str) -> (String, String) {
+    // Normalized through Bead::show (array-first-or-object): `br show` emits
+    // a bare object on current br, so the old array-only read silently
+    // emptied every report. Same title + last-comment semantics otherwise.
+    match crate::br::Bead::show(Some(Path::new(project_dir)), bead_id) {
+        Ok(bead) => {
+            let title = bead.title.clone();
+            (title, crate::br::latest_comment_text(&bead))
+        }
+        Err(_) => (String::new(), String::new()),
+    }
+}
+
+/// True when `name` resolves as a registered identity in the project
+/// (routable per ADR-0018 D1a/D3).
+fn mail_whois_ok(mail: &dyn backend::MailSurface, key: &str, name: &str) -> bool {
+    backend::run_mail(mail.whois(key, name)).is_ok()
+}
+
+/// The project's registered orchestrator agent (program == "flywheel") —
+/// the captain/operator identity (e.g. CoralFinch), when present.
+fn registered_orchestrator(mail: &dyn backend::MailSurface, key: &str) -> Option<String> {
+    let agents = backend::run_mail(mail.list_agents(key, None)).ok()?;
+    agents.iter().find_map(|a| {
+        let program = a.program.as_deref().unwrap_or("");
+        let model = a.model.as_deref().unwrap_or("");
+        (program == "flywheel" || model == "flywheel").then(|| a.name.clone())
+    })
+}
+
+/// The done-mail itself: thread = the bead id, body = the close-reason
+/// REPORT (status/sha/verdict/verify-tail live in it) — the captain's copy
+/// of the report the agent put in the close reason.
+fn send_done_mail(
+    mail: &dyn backend::MailSurface,
+    key: &str,
+    bead_id: &str,
+    title: &str,
+    report: &str,
+    captain: &str,
+) -> Result<backend::SendReceipt> {
+    send_loop_mail(
+        mail,
+        key,
+        &LoopMail::Done {
+            bead_id,
+            title,
+            report,
+            captain,
+        },
+    )
+}
+
+/// internal leaf: close-detect SHA check (ADR-0019 SHA rule, bd-w1-sha-xyhd).
+/// Derives `sha = git log --all -1 --grep=<bead-id> --format=%H` in the
+/// primary tree — no `git rev-parse HEAD` fallback (shared-tree bare HEAD may
+/// not contain the closed bead's work). No commit carries the id -> the close
+/// is ILLEGAL regardless of verdicts: mail the planner naming the missing
+/// commit (the reopen call lands in bd-w1-reopen-f6tw). Always soft-fail:
+/// exit 0 with `{illegal, ...}` so overnight loops never die.
+/// internal leaf: the project's active reservation board (ADR-0019 Spec
+/// 3.4/3.5, bd-w1-reserve-serialize-2mam) — `{reservations: [{path, reason,
+/// holder, ...}]}` from `active_reservations` (bd-dsu1). Feeds the loop's
+/// serialize-on-overlap decision. Always exits 0 — a mail hiccup degrades
+/// to an empty board, never a loop crash.
+pub(crate) fn cmd_internal_reservation_board(cfg: &Config, project: &str) -> Result<()> {
+    let key = project_dir_str(cfg, project)?;
+    let v = match mail_or_die(cfg) {
+        Ok(mail) => mail.list_active(&key, None, None).unwrap_or_else(|e| {
+            eprintln!("flywheel: reservation board failed (continuing): {e:#}");
+            json!({ "project": key, "count": 0, "reservations": [] })
+        }),
+        Err(e) => {
+            eprintln!("flywheel: reservation board mail unavailable (continuing): {e:#}");
+            json!({ "project": key, "count": 0, "reservations": [] })
+        }
+    };
+    print_json(&v);
+    Ok(())
+}
+
+/// ADR-0001 Wave 3 / Layer 3 (beads_rust-wave3-pin-reservation-jxsyt):
+/// stamp a dispatched bead's `pin` field with the receiving agent's mail
+/// identity. Flywheel fills pin at dispatch time — the tracker stays the
+/// ledger, toron stays the grantor. ALWAYS exits 0: a failed stamp is logged
+/// and dropped; blocking a dispatch over ownership metadata would be worse
+/// than an unstamped pin.
+pub(crate) fn cmd_internal_pin_stamp(
+    cfg: &Config,
+    project: &str,
+    bead_id: &str,
+    pin: &str,
+) -> Result<()> {
+    let dir = project_dir(cfg, project);
+    let argv: Vec<String> = durable::pin_stamp_argv(bead_id, pin);
+    let arg_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    match crate::br::run_br(Some(&dir), &arg_refs) {
+        Ok(_) => {
+            print_json(&json!({ "ok": true, "bead_id": bead_id, "pin": pin }));
+        }
+        Err(e) => {
+            eprintln!("flywheel: pin stamp failed for {bead_id}: {e:#}");
+            print_json(&json!({ "ok": false, "bead_id": bead_id, "pin": pin }));
+        }
+    }
+    Ok(())
+}
+
+/// Verifier-dispatch options (bd-llbe: cmd_internal_verify_dispatch had 8
+/// positional args — the trailing five are one option group). `dir` lets
+/// tests point at a scratch project dir; production callers pass None.
+#[derive(Debug, Clone, Default)]
+struct VerifyDispatchOpts {
+    worker_model: Option<String>,
+    candidates: Option<String>,
+    blast: String,
+    ac: String,
+    dir: Option<PathBuf>,
+}
+
+/// internal leaf: verifier-dispatch (ADR-0019 Spec 4,
+/// bd-w1-verifier-degrade-a6fk). Computes the independent-verifier plan for
+/// `bead_id`:
+/// - `none-required`: the loop-run / worker-receipt band already covers it.
+/// - `dispatch`: return the resolved model (different family, or the
+///   captain's `verifier_family_override`); the loop spawns the reviewer
+///   pane on it (one reusable verifier pane per project, headless preferred).
+/// - `degrade`: block the bead `verifier-family-missing` (idempotent) + mail
+///   the captain exactly once (`.flywheel/verifier-family-missing-<id>.mailed`
+///   marker dedup) + NEVER respawn — the single-family swarm path.
+///
+/// Always exits 0 — a block/mail hiccup must not kill the loop.
+pub(crate) fn cmd_internal_verify_dispatch(
+    cfg: &Config,
+    project: &str,
+    bead_id: &str,
+    opts: VerifyDispatchOpts,
+) -> Result<()> {
+    let key = match opts.dir {
+        Some(ref p) => p.clone(),
+        None => PathBuf::from(project_dir_str(cfg, project)?),
+    };
+    let mut bead = match verdict::bead_from_br_show(&key, bead_id) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "flywheel: verifier-dispatch for {bead_id} bead lookup failed (continuing): {e}"
+            );
+            print_json(
+                &json!({ "plan": "none-required", "bead_id": bead_id, "error": format!("{e}") }),
+            );
+            return Ok(());
+        }
+    };
+    bead.blast = if opts.blast == "high" {
+        verdict::Blast::High
+    } else {
+        verdict::Blast::Normal
+    };
+    let ac = if opts.ac == "judgment" {
+        verdict::AcShape::Judgment
+    } else {
+        verdict::AcShape::Checkable
+    };
+    let reg = match crate::models::ModelRegistry::load_routing() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "flywheel: verifier-dispatch for {bead_id} registry load failed (continuing): {e}"
+            );
+            print_json(
+                &json!({ "plan": "none-required", "bead_id": bead_id, "error": format!("{e}") }),
+            );
+            return Ok(());
+        }
+    };
+    let cands: Vec<&str> = match opts.candidates {
+        Some(ref c) => c.split(',').filter(|s| !s.is_empty()).collect(),
+        None => reg.models.keys().map(String::as_str).collect(),
+    };
+    let plan = reg.verifier_plan(
+        &bead,
+        ac,
+        opts.worker_model.as_deref().unwrap_or("unknown"),
+        &cands,
+        cfg.verifier_family_override(),
+    );
+    match plan {
+        crate::models::VerifierPlan::NoneRequired => {
+            print_json(&json!({ "plan": "none-required", "bead_id": bead_id }));
+            Ok(())
+        }
+        crate::models::VerifierPlan::Dispatch(model) => {
+            print_json(&json!({ "plan": "dispatch", "bead_id": bead_id, "model": model }));
+            Ok(())
+        }
+        crate::models::VerifierPlan::Degrade => {
+            let block = crate::br::run_br(
+                Some(&key),
+                &[
+                    "update",
+                    bead_id,
+                    "--status=blocked",
+                    "--transition-comment",
+                    "verifier-family-missing (ADR-0019 Spec 4): no second model family in the \
+                     registry and no verifier_family_override — bead blocked, captain mailed \
+                     once, no respawn",
+                ],
+            );
+            let blocked = block.is_ok();
+            let mut mailed = false;
+            let marker = key
+                .join(".flywheel")
+                .join(format!("verifier-family-missing-{bead_id}.mailed"));
+            if !marker.exists() {
+                let key_str = key.to_string_lossy().into_owned();
+                let captain = cfg
+                    .agent_mail
+                    .as_ref()
+                    .and_then(|m| m.name.clone())
+                    .unwrap_or_else(|| "Flywheel".to_string());
+                if let Ok(mail) = backend::mail_backend(cfg) {
+                    let out = (|| -> Result<backend::SendReceipt> {
+                        backend::run_mail(mail.ensure_project(&key_str))
+                            .map_err(|e| anyhow!("{e}"))?;
+                        send_verifier_family_missing_mail(&*mail, &key_str, bead_id, &captain)
+                    })();
+                    mailed = out.is_ok();
+                    if let Err(me) = out {
+                        eprintln!(
+                            "flywheel: verifier-family-missing mail for {bead_id} failed (continuing): {me:#}"
+                        );
+                    }
+                }
+                if mailed && let Some(parent) = marker.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                    let _ = std::fs::write(&marker, "1");
+                }
+            }
+            print_json(&json!({
+                "plan": "degrade",
+                "bead_id": bead_id,
+                "blocked": blocked,
+                "mailed": mailed,
+                "reason": crate::models::VERIFIER_FAMILY_MISSING,
+            }));
+            Ok(())
+        }
+    }
+}
+
+/// The verifier-family-missing mail: thread = the bead id (ADR-0019 Spec 0),
+/// recipient = the configured orchestrator/captain identity. Exactly once per
+/// bead via the marker dedup in the caller.
+fn send_verifier_family_missing_mail(
+    mail: &dyn backend::MailSurface,
+    key: &str,
+    bead_id: &str,
+    captain: &str,
+) -> Result<backend::SendReceipt> {
+    send_loop_mail(
+        mail,
+        key,
+        &LoopMail::VerifierFamilyMissing { bead_id, captain },
+    )
+}
+
+/// internal leaf: close-detect check (ADR-0019, bd-w1-reopen-f6tw) — wrap
+/// `verdict::close_check` (SHA rule + ledger): `{status: legal, sha}` |
+/// `{status: missing, sha, receipt_eligible}` | `{status: no-commit}`. The
+/// loop turns a non-legal status into `__reopen-bead`. Always exit 0.
+pub(crate) fn cmd_internal_close_check(cfg: &Config, project: &str, bead_id: &str) -> Result<()> {
+    let key = project_dir_str(cfg, project)?;
+    match verdict::close_check(std::path::Path::new(&key), bead_id) {
+        Ok(verdict::CloseCheck::Legal { sha }) => {
+            print_json(&json!({ "status": "legal", "bead_id": bead_id, "sha": sha }));
+            Ok(())
+        }
+        Ok(verdict::CloseCheck::Missing {
+            sha,
+            receipt_eligible,
+        }) => {
+            print_json(&json!({
+                "status": "missing",
+                "bead_id": bead_id,
+                "sha": sha,
+                "receipt_eligible": receipt_eligible,
+            }));
+            Ok(())
+        }
+        Ok(verdict::CloseCheck::NoCommit) => {
+            print_json(&json!({ "status": "no-commit", "bead_id": bead_id }));
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("flywheel: close-check for {bead_id} failed: {e:#}");
+            print_json(
+                &json!({ "status": "error", "bead_id": bead_id, "error": format!("{e:#}") }),
+            );
+            Ok(())
+        }
+    }
+}
+
+/// internal leaf: reopen an unverified close (ADR-0019, bd-w1-reopen-f6tw) —
+/// `br reopen <id>` (idempotent: already-open -> no-op) + ONE mail per
+/// (bead, sha) on `thread_id=<id>`, subject `[<id>] unverified close
+/// reopened`. Durable dedup: a `.flywheel/reopened/<bead>-<sha>.reopened`
+/// marker written after the mail (removed on mail failure) makes the storm
+/// guard hold across ticks AND invocations. Always exit 0.
+pub(crate) fn cmd_internal_reopen_bead(
+    cfg: &Config,
+    project: &str,
+    bead_id: &str,
+    sha: &str,
+) -> Result<()> {
+    let key = project_dir_str(cfg, project)?;
+    let fallback = cfg
+        .agent_mail
+        .as_ref()
+        .and_then(|m| m.name.clone())
+        .unwrap_or_else(|| "Flywheel".to_string());
+    let mut chain = planner_recipient_chain(&key, bead_id, &fallback);
+    chain.push("captain".to_string());
+    let mail = match backend::mail_backend(cfg) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("flywheel: mail backend unavailable for reopen alert {bead_id}: {e:#}");
+            print_json(&json!({
+                "ok": false,
+                "bead_id": bead_id,
+                "sha": sha,
+                "error": format!("mail backend: {e:#}"),
+            }));
+            return Ok(());
+        }
+    };
+    let planner = match first_routable(chain.iter().map(String::as_str), |c| {
+        mail_whois_ok(&*mail, &key, c)
+    }) {
+        Some(p) => p,
+        None => {
+            let tried = chain.join(", ");
+            eprintln!(
+                "flywheel: reopen alert for {bead_id} has no routable recipient (tried {tried})"
+            );
+            print_json(&json!({
+                "ok": false,
+                "bead_id": bead_id,
+                "sha": sha,
+                "notified": tried,
+                "error": format!("no routable planner identity for {key} (tried {tried})")
+            }));
+            return Ok(());
+        }
+    };
+    match reopen_unverified_close(&key, bead_id, sha, &*mail, &planner) {
+        Ok(v) => {
+            print_json(&v);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("flywheel: reopen of {bead_id} failed: {e:#}");
+            print_json(&json!({
+                "ok": false,
+                "bead_id": bead_id,
+                "sha": sha,
+                "error": format!("{e:#}"),
+            }));
+            Ok(())
+        }
+    }
+}
+
+/// The reopen side of the close-detect flow (ADR-0019, bd-w1-reopen-f6tw):
+/// `br reopen <id>` (idempotent — already open is a no-op) + ONE mail per
+/// (bead, sha) on the bead's thread. Durable dedup via a
+/// `.flywheel/reopened/<bead>-<sha>.reopened` marker written AFTER a
+/// successful mail (removed on failure so a retry re-mails) — the storm
+/// guard holds across repeated ticks and loop invocations. Returns the
+/// outcome JSON for the leaf / tests.
+fn reopen_unverified_close(
+    key: &str,
+    bead_id: &str,
+    sha: &str,
+    mail: &dyn backend::MailSurface,
+    planner: &str,
+) -> Result<serde_json::Value> {
+    let dir = std::path::Path::new(key);
+    let marker_dir = dir.join(".flywheel").join("reopened");
+    let marker = marker_dir.join(format!(
+        "{bead_id}-{}.reopened",
+        if sha.is_empty() { "nocommit" } else { sha }
+    ));
+    if marker.exists() {
+        return Ok(json!({
+            "ok": true,
+            "bead_id": bead_id,
+            "sha": sha,
+            "reopened": false,
+            "already_processed": true,
+        }));
+    }
+    crate::br::run_br(
+        Some(dir),
+        &[
+            "reopen",
+            bead_id,
+            "--reason",
+            "unverified close (ADR-0019: no legal verdict for the derived sha)",
+            "--actor",
+            "flywheel-loop",
+        ],
+    )
+    .map_err(|e| anyhow!("br reopen {bead_id} failed: {e:#}"))?;
+    std::fs::create_dir_all(&marker_dir)?;
+    std::fs::write(&marker, "mailed\n")?;
+    let send = (|| -> Result<backend::SendReceipt> {
+        backend::run_mail(mail.ensure_project(key)).map_err(|e| anyhow!("{e}"))?;
+        send_unverified_close_mail(mail, key, bead_id, sha, planner)
+    })();
+    match send {
+        Ok(_) => Ok(json!({
+            "ok": true,
+            "bead_id": bead_id,
+            "sha": sha,
+            "reopened": true,
+            "notified": planner,
+        })),
+        Err(e) => {
+            let _ = std::fs::remove_file(&marker);
+            Err(e)
+        }
+    }
+}
+
+/// internal leaf: loop-run VERIFY executor (ADR-0019 cheap band,
+/// bd-w1-loop-run-verify-mbbe). Classify the bead's VERIFY; on the
+/// loop-runnable band RUN it under `sh -c` with the TIMEBOX timeout (cargo
+/// under the build slot), writing a failed-head marker on non-zero exit or
+/// timeout (the loop NEVER re-verifies the same broken head). The machine
+/// receipt + the command-verified gate row are written IN-PROCESS by the
+/// armed loop — this command only executes and reports. Always exits 0 —
+/// a run hiccup must never kill the loop.
+/// The executor's outcome — what the leaf turns into the machine receipt +
+/// gate row (recorded) or the failed-head marker + reopen.
+#[derive(Debug, Clone)]
+struct LoopRunOutcome {
+    band: String,
+    dir: PathBuf,
+    sha: String,
+    exit: i32,
+    timed_out: bool,
+    skipped: bool,
+    verify: String,
+    output_tail: String,
+}
+
+pub(crate) fn cmd_internal_loop_run_verify(
+    cfg: &Config,
+    project: &str,
+    bead_id: &str,
+    sha: &str,
+    timeout_secs: Option<u64>,
+    dir: Option<&Path>,
+) -> Result<()> {
+    let o = match loop_run_verify_exec(cfg, project, bead_id, sha, timeout_secs, dir) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("flywheel: loop-run-verify for {bead_id} failed (continuing): {e}");
+            print_json(
+                &json!({ "band": "non-runnable", "bead_id": bead_id, "error": format!("{e}") }),
+            );
+            return Ok(());
+        }
+    };
+    if o.band != "loop-runnable" {
+        print_json(&json!({
+            "band": o.band,
+            "bead_id": bead_id,
+            "dir": o.dir.to_string_lossy(),
+            "verify": o.verify,
+        }));
+        return Ok(());
+    }
+    let mut v = json!({
+        "band": "loop-runnable",
+        "bead_id": bead_id,
+        "sha": o.sha,
+        "dir": o.dir.to_string_lossy(),
+        "verify": o.verify,
+    });
+    if o.skipped {
+        v["skipped"] = json!("failed-head");
+    } else if o.timed_out {
+        v["timed_out"] = json!(true);
+        v["output_tail"] = json!(o.output_tail);
+    } else {
+        v["exit"] = json!(o.exit);
+        v["output_tail"] = json!(o.output_tail);
+    }
+    print_json(&v);
+    Ok(())
+}
+
+/// Workflow-graph verify leaf (ADR-0024 Spec 6): the engine hands a templated
+/// verify command to this sink, which reuses `loop_run_verify_exec`'s exec path
+/// (slot held, TIMEBOX, receipt via `write_receipt`) so no second verify path
+/// exists. Attached on every `compose --run` / `workflow run --execute` arm.
+fn make_verify_sink(cfg: Config, project: String) -> toron_workflow::engine::VerifySink {
+    let sink = toron_workflow::engine::VerifySink::default();
+    let cfg_clone = cfg.clone();
+    let project_clone = project.clone();
+    *sink.0.lock().expect("verify-sink mutex") = Some(std::sync::Arc::new(
+        move |req: &toron_workflow::engine::VerifyRequest| {
+            let cmd = req.command.clone();
+            let cwd = project_dir(&cfg_clone, &project_clone);
+            let is_cargo = cmd.split_whitespace().next() == Some("cargo");
+            if is_cargo {
+                acquire_cargo_slot(&cfg_clone, &project_clone);
+            }
+            let outcome = run_verify_with_timeout(&cmd, 600, &cwd);
+            if is_cargo {
+                release_cargo_slot(&cfg_clone, &project_clone);
+            }
+            match outcome {
+                Ok((0, tail)) => {
+                    let receipt_content = if tail.trim().is_empty() {
+                        format!("verify ok: {cmd}")
+                    } else {
+                        tail
+                    };
+                    let receipt_path = match crate::verdict::write_receipt(
+                        &cwd,
+                        "verify-sink",
+                        "workflow-sha",
+                        crate::verdict::VerdictKind::WorkerReceipt,
+                        &receipt_content,
+                    ) {
+                        Ok(p) => Some(p.to_string_lossy().to_string()),
+                        Err(e) => {
+                            return Ok(toron_workflow::engine::VerifyResult {
+                                ok: false,
+                                exit: -1,
+                                stdout_path: None,
+                                stderr_path: None,
+                                error: Some(format!("receipt write failed: {e}")),
+                            });
+                        }
+                    };
+                    Ok(toron_workflow::engine::VerifyResult {
+                        ok: true,
+                        exit: 0,
+                        stdout_path: receipt_path,
+                        stderr_path: None,
+                        error: None,
+                    })
+                }
+                Ok((exit, tail)) => Ok(toron_workflow::engine::VerifyResult {
+                    ok: false,
+                    exit,
+                    stdout_path: None,
+                    stderr_path: None,
+                    error: Some(tail),
+                }),
+                Err(tail) => Ok(toron_workflow::engine::VerifyResult {
+                    ok: false,
+                    exit: -1,
+                    stdout_path: None,
+                    stderr_path: None,
+                    error: Some(tail),
+                }),
+            }
+        },
+    ));
+    sink
+}
+
+/// The loop-run VERIFY executor core: classify the bead's VERIFY; on the
+/// loop-runnable band run it under `sh -c` with the TIMEBOX timeout (cargo
+/// under the build slot), writing a failed-head marker on non-zero exit or
+/// timeout (the loop NEVER re-verifies the same broken head). Pure-ish: the
+/// only side effects are the failed-head marker + the build-slot hold.
+fn loop_run_verify_exec(
+    cfg: &Config,
+    project: &str,
+    bead_id: &str,
+    sha: &str,
+    timeout_secs: Option<u64>,
+    dir: Option<&Path>,
+) -> Result<LoopRunOutcome> {
+    let key = match dir {
+        Some(p) => p.to_path_buf(),
+        None => PathBuf::from(project_dir_str(cfg, project)?),
+    };
+    let bead = match verdict::bead_from_br_show(&key, bead_id) {
+        Ok(b) => b,
+        Err(e) => {
+            return Ok(LoopRunOutcome {
+                band: "non-runnable".into(),
+                dir: key,
+                sha: sha.to_string(),
+                exit: -1,
+                timed_out: false,
+                skipped: false,
+                verify: String::new(),
+                output_tail: format!("bead lookup failed: {e}"),
+            });
+        }
+    };
+    if !verdict::verify_is_loop_runnable(&bead.verify) {
+        return Ok(LoopRunOutcome {
+            band: "non-runnable".into(),
+            dir: key,
+            sha: sha.to_string(),
+            exit: -1,
+            timed_out: false,
+            skipped: false,
+            verify: bead.verify,
+            output_tail: String::new(),
+        });
+    }
+    let marker_dir = key.join(".flywheel").join("loop-run-verify-failed");
+    let marker = marker_dir.join(format!("{bead_id}-{sha}"));
+    if marker.exists() {
+        return Ok(LoopRunOutcome {
+            band: "loop-runnable".into(),
+            dir: key,
+            sha: sha.to_string(),
+            exit: -1,
+            timed_out: false,
+            skipped: true,
+            verify: bead.verify,
+            output_tail: String::new(),
+        });
+    }
+    let timeout = timeout_secs.unwrap_or_else(|| verdict::bead_timebox_secs(&key, bead_id, 600));
+    let is_cargo = bead.verify.split_whitespace().next() == Some("cargo");
+    if is_cargo {
+        acquire_cargo_slot(cfg, project);
+    }
+    let outcome = run_verify_with_timeout(&bead.verify, timeout, &key);
+    if is_cargo {
+        release_cargo_slot(cfg, project);
+    }
+    match outcome {
+        Ok((exit, tail)) => {
+            if exit != 0 {
+                let _ = std::fs::create_dir_all(&marker_dir);
+                let _ = std::fs::write(&marker, "1");
+            }
+            Ok(LoopRunOutcome {
+                band: "loop-runnable".into(),
+                dir: key,
+                sha: sha.to_string(),
+                exit,
+                timed_out: false,
+                skipped: false,
+                verify: bead.verify,
+                output_tail: tail,
+            })
+        }
+        Err(tail) => {
+            let _ = std::fs::create_dir_all(&marker_dir);
+            let _ = std::fs::write(&marker, "1");
+            Ok(LoopRunOutcome {
+                band: "loop-runnable".into(),
+                dir: key,
+                sha: sha.to_string(),
+                exit: -1,
+                timed_out: true,
+                skipped: false,
+                verify: bead.verify,
+                output_tail: tail,
+            })
+        }
+    }
+}
+
+/// Run `<verify>` under `sh -c` with a hard timeout in the bead's repo dir;
+/// the pipes are drained concurrently so a verbose test never deadlocks on
+/// the pipe buffer. Returns `Ok((exit_code, tail))` or `Err(tail)` when the
+/// deadline hit (the child was killed).
+fn run_verify_with_timeout(
+    verify: &str,
+    timeout_secs: u64,
+    cwd: &Path,
+) -> std::result::Result<(i32, String), String> {
+    use std::io::Read;
+    let mut child = match std::process::Command::new("sh")
+        .arg("-c")
+        .arg(verify)
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return Ok((-1, format!("spawn failed: {e}"))),
+    };
+    let out = child.stdout.take();
+    let err = child.stderr.take();
+    let out_handle = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut o) = out {
+            let _ = o.read_to_string(&mut buf);
+        }
+        buf
+    });
+    let err_handle = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut e2) = err {
+            let _ = e2.read_to_string(&mut buf);
+        }
+        buf
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let exit_code = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st.code().unwrap_or(-1),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let tail = tail_of(&format!(
+                        "{}\n{}",
+                        out_handle.join().unwrap_or_default(),
+                        err_handle.join().unwrap_or_default()
+                    ));
+                    return Err(tail);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return Ok((-1, format!("wait failed: {e}")));
+            }
+        }
+    };
+    let stdout = out_handle.join().unwrap_or_default();
+    let stderr = err_handle.join().unwrap_or_default();
+    Ok((exit_code, tail_of(&format!("{stdout}\n{stderr}"))))
+}
+
+/// Last ~4 KiB of captured output (receipts stay small).
+fn tail_of(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let start = chars.len().saturating_sub(4096);
+    chars[start..].iter().collect()
+}
+
+/// Best-effort build-slot hold for cargo VERIFY (ADR-0019: "cargo commands
+/// under the build slot"). Advisory — a slot failure must never block the
+/// loop (the always-serialize gate already serializes cargo dispatch).
+///
+/// bd-em85: toron's inbox surface takes `--as`, never `--agent`
+/// (flywheel shelled `--agent` and every inbox-fallback failed loud).
+/// The argv builder below keeps the flag pin-able by test. The fallback
+/// itself stays a subprocess: it runs only when the embedded path has
+/// already failed, so routing it through the facade would recurse.
+fn mail_inbox_fallback_argv(pin: &str, project: &str, since: &str) -> Vec<String> {
+    [
+        "mail",
+        "inbox",
+        "--as",
+        pin,
+        "--project",
+        project,
+        "--since",
+        since,
+        "--limit",
+        "50",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+fn acquire_cargo_slot(cfg: &Config, project: &str) {
+    let agent = cfg
+        .agent_mail
+        .as_ref()
+        .and_then(|m| m.name.clone())
+        .unwrap_or_else(|| "flywheel-toron-loop1".to_string());
+    let ttl = toron_core::bus::DEFAULT_ENVELOPE_TTL_SECS;
+    match crate::mail_or_die(cfg).and_then(|m| m.acquire_slot(project, &agent, "cargo", true, ttl))
+    {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("flywheel: loop-run-verify cargo slot acquire failed (continuing): {e:#}")
+        }
+    }
+}
+
+fn release_cargo_slot(cfg: &Config, project: &str) {
+    let agent = cfg
+        .agent_mail
+        .as_ref()
+        .and_then(|m| m.name.clone())
+        .unwrap_or_else(|| "flywheel-toron-loop1".to_string());
+    if let Ok(m) = crate::mail_or_die(cfg) {
+        let _ = m.release_slot(project, &agent, "cargo");
+    }
+}
+
+/// The unverified-close mail: thread = the bead id, subject `[<id>]
+/// unverified close reopened` (ADR-0019 Spec 0). Body names what is
+/// missing (a verdict row for the derived sha, or the commit itself).
+fn send_unverified_close_mail(
+    mail: &dyn backend::MailSurface,
+    key: &str,
+    bead_id: &str,
+    sha: &str,
+    planner: &str,
+) -> Result<backend::SendReceipt> {
+    send_loop_mail(
+        mail,
+        key,
+        &LoopMail::UnverifiedClose {
+            bead_id,
+            sha,
+            planner,
+        },
+    )
+}
+
+/// internal leaf: diagnose an unresponsive agent (bd-event-self-heal).
+///
+/// 1. Capture recent output via the read path (best-effort).
+/// 2. Send high-importance mail on thread `health-<name>` to the orchestrator
+///    identity (config agent_mail.name) so a human/supervisor can act.
+///
+/// Soft-fail always: exit 0 with `{ok, ...}` so overnight loops never die.
+pub(crate) fn cmd_internal_diagnose(
+    cfg: &Config,
+    project: &str,
+    name: &str,
+    reason: &str,
+) -> Result<()> {
+    let mut tail = String::new();
+    let backend = match backend::multiplexer_backend(cfg) {
+        Ok(b) => b,
+        Err(e) => {
+            print_json(&json!({
+                "ok": false,
+                "name": name,
+                "reason": reason,
+                "error": format!("multiplexer unavailable: {e:#}"),
+            }));
+            return Ok(());
+        }
+    };
+    let mut ops = hc::BackendAltScreenRead::new(&*backend, name, 80);
+    match alt_screen_read_ladder(&mut ops, hc::RECENT_UNWRAPPED_SOURCE) {
+        Ok(v) => {
+            tail = v;
+            if tail.len() > 4000 {
+                let start = tail.len().saturating_sub(4000);
+                tail = tail[start..].to_string();
+            }
+        }
+        Err(e) => {
+            eprintln!("flywheel: diagnose read {name}: {e:#}");
+        }
+    }
+
+    let mut mailed = false;
+    let mut mail_err: Option<String> = None;
+    let recipient = cfg
+        .agent_mail
+        .as_ref()
+        .and_then(|m| m.name.clone())
+        .unwrap_or_else(|| "Flywheel".to_string());
+    match backend::mail_backend(cfg) {
+        Ok(mail) => {
+            let key = project_dir_str(cfg, project)?;
+            let subject = format!("[{project}] {name} unresponsive ({reason})");
+            let body = format!(
+                "Agent **{name}** is unresponsive (`{reason}`).\n\n\
+                 Project: `{project}`\n\
+                 Thread: `health-{name}`\n\n\
+                 ### Recent output (truncated)\n```\n{tail}\n```\n\n\
+                 flywheel will attempt respawn if the agent stays dead (budgeted)."
+            );
+            match (|| -> Result<backend::SendReceipt> {
+                backend::run_mail(mail.ensure_project(&key)).map_err(|e| anyhow!("{e}"))?;
+                mail_send(
+                    &*mail,
+                    &key,
+                    std::slice::from_ref(&recipient),
+                    &subject,
+                    &body,
+                    "high",
+                    false,
+                    Some(&format!("health-{name}")),
+                )
+            })() {
+                Ok(_) => mailed = true,
+                Err(e) => {
+                    mail_err = Some(format!("{e:#}"));
+                    eprintln!("flywheel: diagnose mail for {name}: {e:#}");
+                }
+            }
+        }
+        Err(e) => {
+            mail_err = Some(format!("mail backend: {e:#}"));
+        }
+    }
+
+    print_json(&json!({
+        "ok": true,
+        "name": name,
+        "reason": reason,
+        "tail_len": tail.len(),
+        "mailed": mailed,
+        "recipient": recipient,
+        "mail_error": mail_err,
+    }));
+    Ok(())
+}
+
+/// Internal leaf command: renew this identity's active file reservations in
+/// the project, extending each by `extend_seconds` (bd-mail-lease-renewal-
+/// durable). Best-effort from the workflow's perspective — the durable leaf
+/// treats a non-zero exit as a missed renew (log + continue), never a hard
+/// loop failure. Output: `{"ok": true, "renewed": N, "file_reservations": [...]}`.
+pub(crate) fn cmd_internal_renew_leases(
+    cfg: &Config,
+    project: &str,
+    extend_seconds: u64,
+) -> Result<()> {
+    let mail = backend::mail_backend(cfg)?;
+    let key = project_dir_str(cfg, project)?;
+    backend::run_mail(mail.ensure_project(&key))?;
+    let agent = orchestrator_mail_name(cfg);
+    let v = backend::run_mail(mail.renew_reservations(&key, &agent, &[], extend_seconds))
+        .map_err(|e| anyhow!("mail backend: {e}"))?;
+
+    let mut released_closed: Vec<String> = Vec::new();
+    if let Ok(closed) = load_closed_bead_ids(cfg, project) {
+        let leases: Vec<(String, String)> = v
+            .reservations
+            .iter()
+            .map(|r| {
+                (
+                    r.path_pattern.clone(),
+                    bead_id_from_reason(&r.reason).unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+        let stale: Vec<String> = durable::closed_reason_lease_ids(&leases, &closed);
+        for path in &stale {
+            match backend::run_mail(mail.release_reservations(
+                &key,
+                &agent,
+                std::slice::from_ref(path),
+            )) {
+                Ok(rel) if rel.released > 0 => {
+                    eprintln!("flywheel: released stale reservation {path} (owning bead closed)");
+                    released_closed.push(path.clone());
+                }
+                Ok(_) => {
+                    eprintln!("flywheel: release of stale reservation {path} reported 0 released");
+                }
+                Err(e) => eprintln!(
+                    "flywheel: release of stale reservation {path} failed (continuing): {e}"
+                ),
+            }
+        }
+    }
+
+    let envelope = json!({
+        "renewed": v.renewed,
+        "file_reservations": v.reservations.iter().map(|r| json!({
+            "id": r.id,
+            "path_pattern": r.path_pattern,
+            "old_expires_ts": "",
+            "new_expires_ts": r.expires_ts_us.map(|u| u.to_string()).unwrap_or_default(),
+        })).collect::<Vec<_>>(),
+    });
+    let reservations = crate::mail::list_own_reservations(&envelope);
+    print_json(&json!({
+        "ok": true,
+        "renewed": v.renewed,
+        "agent": agent,
+        "released_closed": released_closed,
+        "file_reservations": reservations,
+    }));
+    Ok(())
+}
+
+/// `__release-bead-locks` leaf (bd-h3oj): operator-signed revocation of
+/// every live reservation whose reason is the closed bead id. Emits
+/// `{"bead_id": ..., "released": n}` for the durable loop's checkpoint.
+pub(crate) fn cmd_internal_release_bead_locks(
+    cfg: &Config,
+    project: &str,
+    bead_id: &str,
+) -> Result<()> {
+    let mail = backend::mail_backend(cfg)?;
+    let key = project_dir_str(cfg, project)?;
+    backend::run_mail(mail.ensure_project(&key))?;
+    let requestor = orchestrator_mail_name(cfg);
+    let v = backend::run_mail(mail.release_by_reason(&key, &requestor, bead_id, true))
+        .map_err(|e| anyhow!("mail backend: {e}"))?;
+    if v.released > 0 {
+        eprintln!(
+            "flywheel: released {} reservation(s) for closed bead {bead_id}",
+            v.released
+        );
+    }
+    print_json(&json!({
+        "bead_id": bead_id,
+        "released": v.released,
+    }));
+    Ok(())
+}
+
+/// Parse a reservation reason as a bead id, if the reason names one.
+/// Reasons are the bead id verbatim (`bd-oj9o`) or free text; only
+/// `bd-<id>`-shaped reasons are treated as bead refs (bd-evqs — the sweep
+/// must never guess that an arbitrary reason is a bead).
+#[must_use]
+pub fn bead_id_from_reason(reason: &str) -> Option<&str> {
+    let t = reason.trim();
+    let id = t.split_whitespace().next().unwrap_or(t);
+    let id = id.trim_end_matches([':', ',', ';', ')']);
+    if id.starts_with("bd-") && id.len() > 3 {
+        Some(id)
+    } else {
+        None
+    }
+}
+
+/// Load the set of CLOSED bead ids in the project (`br list --all --json`,
+/// status == "closed"). Soft-fail: a missing .beads / br error yields an
+/// empty set (the sweep no-ops, renew-all preserved).
+fn load_closed_bead_ids(cfg: &Config, project: &str) -> Result<std::collections::HashSet<String>> {
+    let dir = project_dir(cfg, project);
+    let rows = crate::br::Bead::list_issues(Some(&dir), &["--all"], "br list --all")?;
+    let mut closed = std::collections::HashSet::new();
+    for b in &rows {
+        let id = b.get("id").and_then(Value::as_str).unwrap_or("");
+        let status = b.get("status").and_then(Value::as_str).unwrap_or("");
+        if status == "closed" && !id.is_empty() {
+            closed.insert(id.to_string());
+        }
+    }
+    Ok(closed)
+}

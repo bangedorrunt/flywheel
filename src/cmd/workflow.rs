@@ -8,17 +8,16 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::cmd::internal::{headless_dispatch, headless_spawn_gate};
+use crate::cmd::internal::{headless_dispatch, headless_spawn_gate, make_verify_sink};
 use crate::config::Config;
 use crate::hc::Client;
 use crate::output::print_json;
 use crate::state::EventKind;
 use crate::{
     briefing_enabled, builtin_workflows, config, crew, decide, enrich_suggestions_live,
-    ensure_project_opt, identity, log, make_verify_sink, output, output_action_stage,
-    packed_from_flag, pane, planner_author_response, profile, project_dir, project_door_opt,
-    run_terminal_status, stages, state, steer_brief, workflow_briefing_context, workflow_catalog,
-    write_terminal_artifact,
+    ensure_project_opt, identity, log, output, output_action_stage, packed_from_flag, pane,
+    planner_author_response, profile, project_dir, project_door_opt, run_terminal_status, stages,
+    state, steer_brief, workflow_briefing_context, workflow_catalog, write_terminal_artifact,
 };
 
 /// Unified workflow commands (ADR-0005 Spec 5 / P3.7). `lint` is the
