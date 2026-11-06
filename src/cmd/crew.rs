@@ -79,6 +79,58 @@ pub(crate) fn cmd_crew(cfg: &Config, cmd: &CrewCmd) -> Result<()> {
     }
 }
 
+/// The rex arm: resolve through the selected plane. `exit` is real
+/// (`pane_close`); the key-injection verbs are hc-only today and must say so
+/// with the working alternative, never a false "no swarm".
+fn cmd_crew_control_rex(
+    cfg: &Config,
+    project: &str,
+    pin: &str,
+    verb: &ControlVerbCmd,
+) -> Result<()> {
+    let backend = crate::backend::factory::multiplexer_backend(cfg)?;
+    let ws_id = crate::find_workspace_dyn(&*backend, project)?;
+    let targets = crate::resolve_agents_dyn(&*backend, &ws_id, project, pin)?;
+    if targets.len() != 1 {
+        bail!(
+            "crew control targets ONE pane — '{pin}' resolved {} ({}); name one pin",
+            targets.len(),
+            targets
+                .iter()
+                .filter_map(|a| a.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let a = &targets[0];
+    let name = a.name.clone().unwrap_or_else(|| a.pane_id.clone());
+    match *verb {
+        ControlVerbCmd::Exit => {
+            backend
+                .pane_close(&a.pane_id)
+                .map_err(|e| anyhow!("pane.close for {name} ({}): {e}", a.pane_id))?;
+            println!(
+                "exited {name} ({}) — reservations + dirty files preserved",
+                a.pane_id
+            );
+            crate::log(
+                project,
+                EventKind::Interrupt,
+                json!({ "to": pin, "verb": "exit", "pane": a.pane_id, "plane": "crew-control" }),
+            );
+        }
+        ControlVerbCmd::Interrupt => bail!(
+            "crew control interrupt needs hc key injection; on rex cancel the tool call with              `rex send-key {pane} escape` (pane {name})",
+            pane = a.pane_id,
+            name = name
+        ),
+        ControlVerbCmd::Relaunch => bail!(
+            "crew control relaunch is hc-only today; on rex use `flywheel recover {project}` to              respawn the same pin after a pane is gone, then `flywheel send` to re-prime"
+        ),
+    }
+    Ok(())
+}
+
 /// Marker-prefixed relaunch prime: the worker's handler template tells
 /// control-plane prompts from captain payloads by the U+2063 + FLYWHEEL_OP:
 /// prefix (byte-checked round-trip in src/control.rs tests).
@@ -92,6 +144,12 @@ fn relaunch_prime_line(name: &str, pin: Option<&str>, token: &str) -> String {
 }
 
 fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCmd) -> Result<()> {
+    // ADR-0045: the pane plane is rex-first. The hc client below cannot see a
+    // rex workspace, so the door answered "no flywheel swarm" while the panes
+    // were live. Resolve through the same door `status` trusts.
+    if crate::pane::rex_door_selected(cfg) {
+        return cmd_crew_control_rex(cfg, project, pin, verb);
+    }
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let ws_id = crate::find_workspace(&mut c, project)?;
     let targets = crate::resolve_agents(&mut c, &ws_id, project, pin)?;

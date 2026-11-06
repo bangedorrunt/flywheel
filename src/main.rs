@@ -2472,7 +2472,7 @@ pub(crate) fn find_workspaces_dyn(
     Ok(matches)
 }
 
-fn resolve_agents_dyn(
+pub(crate) fn resolve_agents_dyn(
     backend: &dyn backend::MultiplexerBackend,
     ws_id: &str,
     project: &str,

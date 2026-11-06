@@ -245,6 +245,17 @@ pub(crate) fn cmd_send_rex(
                 }
             }
         } else if let Err(e) = backend.prompt(&target, &send_text, None) {
+            let err = format!("{e}");
+            // Steering friction observed live: a working pane refuses the
+            // prompt with no next step in the message. Name the queued door
+            // (mail rings on idle) and the cancel key instead of dead-ending.
+            if err.contains("not at a prompt") {
+                bail!(
+                    "{err}\n  hint: the pane is working — queue it with \
+                     `flywheel mail send {project} --to <pin> --wake tasked --subject S --body B` \
+                     (rings when idle), or cancel the tool call with `flywheel interrupt`."
+                );
+            }
             return Err(e.into());
         } else {
             results.push(send_result_row(

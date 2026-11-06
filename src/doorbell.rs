@@ -777,8 +777,32 @@ fn spawn_child(
     let mut cmd = Command::new(exe);
     cmd.args(["__doorbell", "--project", project, "--workspace", workspace]);
     cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::null());
+    // Keep the host's own diagnostics. `Stdio::null()` made a wedged or
+    // crash-looping host invisible (the reason had to be reconstructed from
+    // journals). One append log per workspace, beside the pid/gen files.
+    let log_dir = gen_path.parent().map(std::path::Path::to_path_buf);
+    let mut attached = false;
+    if let Some(dir) = log_dir
+        && std::fs::create_dir_all(&dir).is_ok()
+        && let (Ok(out), Ok(err)) = (
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join(format!("{workspace}.out.log"))),
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join(format!("{workspace}.err.log"))),
+        )
+    {
+        cmd.stdout(Stdio::from(out));
+        cmd.stderr(Stdio::from(err));
+        attached = true;
+    }
+    if !attached {
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
