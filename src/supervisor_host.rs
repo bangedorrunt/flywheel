@@ -3927,7 +3927,9 @@ mod tests {
             j,
             f.clone(),
             rx,
-            std::time::Duration::from_millis(400),
+            // 2s tick: the "not yet" window must stay wide even on a loaded
+            // CI host (400 ms flaked once a 100 ms sleep overshot the tick).
+            std::time::Duration::from_secs(2),
             stop.clone(),
             acked.clone(),
         );
@@ -3939,10 +3941,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert!(
             !acked.load(Ordering::Relaxed),
-            "no hint: not yet (the tick is 400 ms)"
+            "no hint: not yet (the tick is 2 s)"
         );
         let t = std::time::Instant::now();
-        while !acked.load(Ordering::Relaxed) && t.elapsed() < std::time::Duration::from_secs(2) {
+        while !acked.load(Ordering::Relaxed) && t.elapsed() < std::time::Duration::from_secs(5) {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         stop.store(true, Ordering::Relaxed);
