@@ -3338,17 +3338,18 @@ mod bell_fold_tests {
     #[test]
     fn bell_fold_why_replay() {
         let doorbell = include_str!("doorbell.rs");
-        let main = include_str!("main.rs");
+        // bd-wave5-main-eviction: `cmd_doorbell_why` moved to cmd/doorbell.rs.
+        let why_src = include_str!("cmd/doorbell.rs");
         assert!(
             doorbell.contains("doorbell-journal-") && doorbell.contains("journals"),
             "RED (bd-6b1y #11): doorbell.rs journal path must be state_dir/journals/doorbell-journal"
         );
         assert!(
-            main.contains("fn cmd_doorbell_why"),
+            why_src.contains("fn cmd_doorbell_why"),
             "RED (bd-6b1y #11): fn cmd_doorbell_why not found"
         );
-        let pos = main.find("fn cmd_doorbell_why").unwrap();
-        let slice = &main[pos..std::cmp::min(main.len(), pos + 8000)];
+        let pos = why_src.find("fn cmd_doorbell_why").unwrap();
+        let slice = &why_src[pos..std::cmp::min(why_src.len(), pos + 8000)];
         assert!(
             slice.contains("fold") || slice.contains("replay") || slice.contains("tick("),
             "RED (bd-6b1y #11): doorbell why must fold tick from Default over journal and assert same Cmd sequence — currently greps pin substring, not replay"
@@ -3365,7 +3366,8 @@ mod bell_fold_tests {
 
     #[test]
     fn handle_workspace_cmds_waitcorr_ticks_receipt() {
-        let src = include_str!("main.rs");
+        // bd-wave5-main-eviction: handler moved to cmd/doorbell.rs.
+        let src = include_str!("cmd/doorbell.rs");
         let pos = src
             .find("fn handle_workspace_cmds(")
             .expect("handle_workspace_cmds");

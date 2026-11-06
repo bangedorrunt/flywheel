@@ -1,11 +1,18 @@
 //! `flywheel doorbell` subcommand types (split from `main.rs`, bd-qbi8).
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
 
+#[cfg(test)]
+use crate::budget_effect;
 use crate::config::Config;
+use crate::{
+    backend, cmd_binding_rebind, config, doorbell, doorbell_tick, live_decide_snapshot,
+    project_dir_str, state, workspace,
+};
 
 /// Subcommands of `flywheel doorbell` (bd-durable-doorbell-lngf): the
 /// supervised pane-wake layer surface.
@@ -908,5 +915,1628 @@ mod wake_brain_status_tests {
             " wake_brain=dropped:0,full:0,backpressured:0,resumed:0,lost:0"
         );
         assert_eq!(wake_brain_status_segment(None), " wake_brain=unmeasured");
+    }
+}
+
+/// bd-yw4s: `doorbell why <pin>` — replay the doorbell journal and explain
+/// what the tick decided for this pin (prompted / queued / drained / died /
+/// sla). The trust surface; never log tailing. Folds tick from Default
+/// over state_dir/journals/doorbell-journal-{workspace}.jsonl and asserts
+/// the same Cmd sequence as the live run (replay, not grep). Supports
+/// --corr and --seq for assignment replay.
+pub(crate) fn cmd_doorbell_why(
+    cfg: &Config,
+    project: &str,
+    pin: &str,
+    limit: usize,
+    corr: Option<&str>,
+    seq: Option<u64>,
+    subscriber: Option<&str>,
+) -> Result<()> {
+    crate::check_project_spelling(project, "doorbell why")?;
+    let _ = cfg;
+    let scoped = doorbell_scoped_workspaces(project);
+    let entries = doorbell::journal_read_all(&config::state_dir());
+    {
+        let mut workspaces: std::collections::BTreeSet<String> =
+            entries.iter().map(|(ws, _)| ws.clone()).collect();
+        if let Ok(dir) = std::fs::read_dir(config::state_dir().join("journals")) {
+            for entry in dir.filter_map(|e| e.ok()) {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if let Some(rest) = name
+                    .strip_prefix("doorbell-journal-")
+                    .and_then(|n| n.strip_suffix(".jsonl"))
+                    && !rest.is_empty()
+                    && !rest.contains('.')
+                {
+                    workspaces.insert(rest.to_string());
+                }
+            }
+        }
+        for ws in &workspaces {
+            let (torn, first_seq) = doorbell::journal_fold_status(&config::state_dir(), ws);
+            if let Some(t) = torn {
+                eprintln!("doorbell why: {t} (workspace {ws})");
+            }
+            if let (Some(q), Some(first)) = (seq, first_seq)
+                && q < first
+            {
+                eprintln!(
+                    "doorbell why: seq {q} predates retention, first foldable seq is {first} (workspace {ws})"
+                );
+            }
+        }
+    }
+    let presence_rows = std::fs::read_to_string(crate::mail::presence_path())
+        .ok()
+        .map(|body| timeout_presence_rows(&body, doorbell_now_unix()))
+        .unwrap_or_default();
+    let mut models: std::collections::BTreeMap<String, workspace::WorkspaceModel> =
+        std::collections::BTreeMap::new();
+    let mut replay_seq: u64 = 0;
+    let mut shown = 0usize;
+    let mut matched = 0usize;
+    for (workspace, entry) in &entries {
+        if !journal_row_in_scope(workspace, entry, &scoped, project) {
+            continue;
+        }
+        if !doorbell::journal_version_accepted(entry) {
+            eprintln!(
+                "doorbell why: refusing entry with unknown journal v (workspace {workspace}) — no fold-past"
+            );
+            continue;
+        }
+        if let Some(sub) = subscriber {
+            match entry.get("subscriber").and_then(|s| s.as_str()) {
+                Some(tag) if tag == sub => {}
+                _ => continue,
+            }
+        }
+        let msg_val = entry.get("msg").cloned().unwrap_or(serde_json::Value::Null);
+        let mut actions_val = entry
+            .get("actions")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        normalize_action_shapes(&mut actions_val);
+        let replay_msg: Option<workspace::Msg> = if let Ok(m) =
+            serde_json::from_value::<workspace::Msg>(msg_val.clone())
+        {
+            Some(m)
+        } else if let Ok(dm) = serde_json::from_value::<doorbell_tick::DoorbellMsg>(msg_val.clone())
+        {
+            Some(match dm {
+                doorbell_tick::DoorbellMsg::WatchNdjson { line } => {
+                    workspace::Msg::WatchNdjson { line }
+                }
+                doorbell_tick::DoorbellMsg::InboxItems { raw, pin } => {
+                    workspace::Msg::InboxItems { raw, pin }
+                }
+                doorbell_tick::DoorbellMsg::InboxRows { rows, pin } => {
+                    workspace::Msg::InboxRows { rows, pin }
+                }
+                doorbell_tick::DoorbellMsg::PlaneStatus { pin, status } => {
+                    workspace::Msg::PlaneStatus { pin, status }
+                }
+                doorbell_tick::DoorbellMsg::Fact { summary } => workspace::Msg::Fact { summary },
+                doorbell_tick::DoorbellMsg::AckSlaTick { now } => {
+                    workspace::Msg::AckSlaTick { now }
+                }
+                doorbell_tick::DoorbellMsg::WatchDied => workspace::Msg::WatchDied,
+            })
+        } else {
+            None
+        };
+        let expected: Vec<workspace::Cmd> =
+            if let Ok(v) = serde_json::from_value::<Vec<workspace::Cmd>>(actions_val.clone()) {
+                v
+            } else if let Ok(legacy) =
+                serde_json::from_value::<Vec<doorbell_tick::DoorbellAction>>(actions_val.clone())
+            {
+                legacy
+                    .into_iter()
+                    .map(workspace::Cmd::from_doorbell)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        let folded = replay_msg.is_some();
+        let actual: Vec<workspace::Cmd> = if let Some(msg) = replay_msg.clone() {
+            let (next, actual) = {
+                let model = models.entry(workspace.clone()).or_insert_with(|| {
+                    let mut m = workspace::WorkspaceModel::from_environment();
+                    rebuild_assignment_from_receipts(&mut m);
+                    seed_why_presence(&mut m, presence_rows.clone());
+                    m
+                });
+                if let Some(pins) = entry.get("pins").and_then(|p| p.as_array()) {
+                    for pin in pins.iter().filter_map(|v| v.as_str()) {
+                        model.doorbell.index.insert_pin(pin.to_string(), None);
+                    }
+                }
+                workspace::tick(model, &msg)
+            };
+            if actual != expected {
+                eprintln!(
+                    "replay mismatch at seq {replay_seq} workspace {workspace}: expected {expected:?} got {actual:?}"
+                );
+            }
+            models.insert(workspace.clone(), next);
+            actual
+        } else {
+            expected.clone()
+        };
+        replay_seq += 1;
+        let dropped = why_dropped_pins(entry);
+        let seq_match = seq.map(|s| s == replay_seq - 1).unwrap_or(true);
+        let corr_match = match corr {
+            Some(c) => {
+                models
+                    .get(workspace)
+                    .map(|m| m.assignment.contains_key(c))
+                    .unwrap_or(false)
+                    || actual.iter().any(|cmd| match cmd {
+                        workspace::Cmd::WaitCorr { corr } => corr == c,
+                        workspace::Cmd::SqliteUpsert { corr, .. } => corr == c,
+                        _ => false,
+                    })
+            }
+            None => true,
+        };
+        let pin_match = if corr.is_some() || seq.is_some() {
+            true
+        } else {
+            let entry_pins: Vec<String> = entry
+                .get("pins")
+                .and_then(|p| p.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let effective: Vec<workspace::Cmd> = actual
+                .iter()
+                .filter(|c| match c {
+                    workspace::Cmd::Prompt { pin: p, .. } => !dropped.contains(p),
+                    _ => true,
+                })
+                .cloned()
+                .collect();
+            why_entry_mentions_pin(pin, replay_msg.as_ref(), &effective, &entry_pins)
+        };
+        if !corr_match || !seq_match || !pin_match {
+            continue;
+        }
+        matched += 1;
+        shown += 1;
+        if shown > limit {
+            continue;
+        }
+        let ts = entry.get("ts").and_then(|t| t.as_str()).unwrap_or("?");
+        let msg = entry.get("msg").cloned().unwrap_or(serde_json::Value::Null);
+        let actions = entry
+            .get("actions")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| {
+                        if let Some(p) = v
+                            .get("Prompt")
+                            .and_then(|p| p.get("pin"))
+                            .and_then(|p| p.as_str())
+                            && dropped.iter().any(|d| d == p)
+                        {
+                            return None;
+                        }
+                        Some(if v.get("Prompt").is_some() {
+                            "prompt"
+                        } else if v.get("CheckAckSla").is_some() {
+                            "check-ack-sla"
+                        } else if v.get("RestartWatch").is_some() {
+                            "restart-watch"
+                        } else if v.get("FactMiss").is_some() {
+                            "fact-miss"
+                        } else if v.get("Audit").is_some() {
+                            "audit"
+                        } else if v.get("Digest").is_some() {
+                            "digest"
+                        } else if v.get("FetchInbox").is_some() || v.as_str() == Some("FetchInbox")
+                        {
+                            "fetch-inbox"
+                        } else {
+                            "unknown"
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        let kind = if let Some(rt) = msg.get("rt_kind").and_then(|k| k.as_str()) {
+            rt
+        } else {
+            match msg.get("WatchNdjson") {
+                Some(_) => "watch",
+                None => match msg.get("PlaneStatus") {
+                    Some(_) => "status",
+                    None => match msg.get("AckSlaTick") {
+                        Some(_) => "ack-sla",
+                        None => match msg.get("WatchDied") {
+                            Some(_) => "watch-died",
+                            None => "other",
+                        },
+                    },
+                },
+            }
+        };
+        let status = msg
+            .get("PlaneStatus")
+            .and_then(|h| h.get("status"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
+        println!(
+            "{workspace} {ts} seq={} {kind}{} actions=[{actions}]{}{}{}",
+            replay_seq - 1,
+            if status.is_empty() {
+                String::new()
+            } else {
+                format!(" ->{status}")
+            },
+            if dropped.is_empty() {
+                String::new()
+            } else {
+                format!(" dropped=[{}]", dropped.join(","))
+            },
+            if folded { "" } else { " [journaled]" },
+            if workspace == DOORBELL_CONSOLE_SCOPE {
+                " [console-inject]"
+            } else {
+                ""
+            },
+        );
+    }
+    if matched == 0 {
+        if let Some(c) = corr {
+            println!("no journal entries for corr {c} (seq {:?})", seq);
+        } else if let Some(s) = seq {
+            println!("no journal entry at seq {s}");
+        } else {
+            println!(
+                "no doorbell journal entries mention pin {pin} (unaddressed, filtered before classify, or journal empty)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// ADR-0010 D5 (bd-65he): `flywheel doorbell afk <project>` — batch the
+/// captain-relevant wakes the live dispatcher queued since the last digest.
+/// Folds tick from Default over the doorbell journal (same trust surface
+/// as `why`), then renders the folded digest_queue with ages from the
+/// current clock. Urgent wakes never batch (prompted immediately live),
+/// so their presence here is record, not backlog. Wedge alarm when the
+/// queue cannot drain (overdue predicate); empty queue is clean, not an
+/// error — AFK with nothing queued means nothing needs the captain.
+pub(crate) fn cmd_doorbell_afk(cfg: &Config, project: &str, limit: usize) -> Result<()> {
+    crate::check_project_spelling(project, "doorbell afk")?;
+    let _ = cfg;
+    let scoped = doorbell_scoped_workspaces(project);
+    let entries = doorbell::journal_read_all(&config::state_dir());
+    if entries.is_empty() {
+        println!("doorbell afk: no journal entries — nothing queued");
+        return Ok(());
+    }
+    let mut models: std::collections::BTreeMap<String, workspace::WorkspaceModel> =
+        std::collections::BTreeMap::new();
+    let mut bound: Vec<(String, String, String, String)> = Vec::new();
+    for (ws, entry) in &entries {
+        if !journal_row_in_scope(ws, entry, &scoped, project) {
+            continue;
+        }
+        if !doorbell::journal_version_accepted(entry) {
+            eprintln!(
+                "doorbell afk: refusing entry with unknown journal v (workspace {ws}) — no fold-past"
+            );
+            continue;
+        }
+        let ts = entry
+            .get("ts")
+            .and_then(|t| t.as_str())
+            .unwrap_or("?")
+            .to_string();
+        for (pin, line, why) in digest_action_entries(entry) {
+            bound.push((ts.clone(), ws.clone(), pin, format!("[{why}] {line}")));
+        }
+        let msg_val = entry.get("msg").cloned().unwrap_or(serde_json::Value::Null);
+        if let Some(msg) = snapshot::replay_msg(&msg_val) {
+            let model = models.entry(ws.clone()).or_insert_with(|| {
+                let mut m = workspace::WorkspaceModel::from_environment();
+                rebuild_assignment_from_receipts(&mut m);
+                m
+            });
+            if let Some(pins) = entry.get("pins").and_then(|p| p.as_array()) {
+                for pin in pins.iter().filter_map(|v| v.as_str()) {
+                    model.doorbell.index.insert_pin(pin.to_string(), None);
+                }
+            }
+            let (next, _) = workspace::tick(model, &msg);
+            *model = next;
+        }
+    }
+    let mut queue: Vec<workspace::DigestEntry> = Vec::new();
+    let last_digest_unix: u64 = u64::MAX;
+    let mut counters: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+    for m in models.values() {
+        queue.extend(m.wake.digests.iter().cloned());
+        for k in ["benign", "routine", "captain", "urgent"] {
+            *counters.entry(k).or_insert(0) += m.wake_counters.get(k).copied().unwrap_or(0);
+        }
+    }
+    queue.sort_by_key(|e| e.at_unix);
+    let withheld = queue.len().saturating_sub(limit);
+    if withheld > 0 {
+        queue.drain(..withheld);
+    }
+    let now = doorbell_now_unix();
+    if queue.is_empty() {
+        println!("doorbell afk: queue empty — nothing needs the captain");
+    } else {
+        print!("{}", workspace::render_digest_with_holds(&queue, &[], now));
+    }
+    if withheld > 0 {
+        println!(
+            "… {withheld} older entr{} withheld — raise --limit to see them",
+            if withheld == 1 { "y" } else { "ies" }
+        );
+    }
+    bound.sort_by(|a, b| a.0.cmp(&b.0));
+    if !bound.is_empty() {
+        println!("digest-bound wakes ({}):", bound.len());
+        let hidden = bound.len().saturating_sub(limit);
+        for (ts, ws, pin, line) in bound.iter().skip(hidden) {
+            println!("- {ts} {ws} {pin} {line}");
+        }
+        if hidden > 0 {
+            println!("… {hidden} older withheld — raise --limit to see them");
+        }
+    }
+    let counters: Vec<String> = ["benign", "routine", "captain", "urgent"]
+        .iter()
+        .map(|k| format!("{k}={}", counters.get(*k).copied().unwrap_or(0)))
+        .collect();
+    println!("wake counters: {}", counters.join(" "));
+    if workspace::digest_overdue(queue.len(), last_digest_unix, now) {
+        println!(
+            "WEDGE ALARM: digest queue cannot drain (stale batch, dispatcher may be down) — inspect `flywheel doorbell status`"
+        );
+    }
+    for line in digest_roster_lines(cfg, project, now) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// Scope-bound roster lines for digests (bd-asr2.14, D5/E2). Empty unless
+/// the arrival-triple flag opts in — flag-off output stays byte-identical.
+fn digest_roster_lines(cfg: &Config, project: &str, now: u64) -> Vec<String> {
+    if !cfg.doorbell_arrival_triple() {
+        return Vec::new();
+    }
+    let registry = state::load_spawn_registry(project);
+    let pins: Vec<(String, String)> = registry
+        .iter()
+        .filter_map(|e| {
+            e.mail_identity.clone().map(|pin| {
+                let harness = e
+                    .harness
+                    .clone()
+                    .or_else(|| e.profile.clone())
+                    .unwrap_or_else(|| "?".to_string());
+                (pin, harness)
+            })
+        })
+        .collect();
+    if pins.is_empty() {
+        return Vec::new();
+    }
+    let roles: std::collections::BTreeMap<String, String> = state::load_role_binds(project)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(role, pin)| (pin, role))
+        .collect();
+    let mut presence: Vec<(String, String, u64)> = Vec::new();
+    if let Ok(body) = std::fs::read_to_string(crate::mail::presence_path()) {
+        let mut latest: std::collections::HashMap<String, (u64, String)> =
+            std::collections::HashMap::new();
+        for line in body.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if let (Some(name), Some(state), Some(ts)) = (
+                v.get("name").and_then(|n| n.as_str()),
+                v.get("state").and_then(|s| s.as_str()),
+                v.get("ts").and_then(|t| t.as_u64()),
+            ) {
+                latest.insert(name.to_string(), (ts, state.to_string()));
+            }
+        }
+        for (pin, (ts, state)) in latest {
+            presence.push((pin, state, ts));
+        }
+    }
+    let mut beads: std::collections::BTreeMap<String, String> = Default::default();
+    if let Ok(rows) = crate::br::Bead::in_progress(None) {
+        for b in rows {
+            if let Some(who) = b.assignee {
+                beads.insert(who, b.id);
+            }
+        }
+    }
+    doorbell::render_roster(&doorbell::build_roster(
+        &pins, &roles, &presence, &beads, now,
+    ))
+}
+
+pub(crate) fn cmd_doorbell_subscriptions(_cfg: &Config) -> Result<()> {
+    use doorbell_rt::subscribe::SubscriptionStore;
+    let store = SubscriptionStore::open(&config::state_dir());
+    for sub in store.list() {
+        println!(
+            "{} identity={:?} scope={:?} sink={:?}",
+            sub.id, sub.identity, sub.scope, sub.sink
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn cmd_doorbell_unsubscribe(_cfg: &Config, id: &str) -> Result<()> {
+    use doorbell_rt::subscribe::{Actor, SubscriptionStore};
+    let mut store = SubscriptionStore::open(&config::state_dir());
+    match store.unsubscribe(Actor::operator(), id) {
+        Ok(row) => {
+            println!("unsubscribed: {}", row.id);
+            Ok(())
+        }
+        Err(e) => anyhow::bail!("unsubscribe refused: {e:?}"),
+    }
+}
+
+/// bd-a8ld/bd-z5ut: the journal workspaces this project owns — `<project>`
+/// itself plus every `<project>-<workspace>` the journal dir holds. `None`
+/// means "no scoping" (`all`), which the global scan needs.
+///
+/// The journal dir accumulates workspaces that are not the caller's business:
+/// synthetic `manual` / `facts-lapsed-*` / `facts-close-*` rows written by the
+/// fact helpers, and other projects' hosts. Folding them made `why` report a
+/// mismatch per row and made `afk` print an unbounded digest of another
+/// workspace's noise — in both cases burying the answer that was asked for.
+///
+/// The one exception is the operator console scope. `doorbell inject` writes
+/// there by DEFAULT (`--workspace manual`), so excluding it wholesale made the
+/// console door unexplainable: `why <pin>` reported "no journal entries" for a
+/// row that demonstrably existed. But `manual` is GLOBAL (every project
+/// injects into the same file), so including it by name would show another
+/// project's injects — trading invisibility for a silent cross-project blend.
+/// So the console scope is admitted per ROW, by the project the row records,
+/// never by the scope name alone. See [`console_row_is_for_project`].
+fn doorbell_scoped_workspaces(project: &str) -> Option<Vec<String>> {
+    (project != "all").then(|| {
+        let mut w = vec![project.to_string()];
+        w.extend(
+            doorbell::journal_workspaces_list(&config::state_dir())
+                .into_iter()
+                .filter(|x| x.starts_with(&format!("{project}-"))),
+        );
+        w
+    })
+}
+
+/// The console scope `doorbell inject` defaults to. Shared by every project,
+/// so it is scoped by the recorded project, never by name.
+pub(crate) const DOORBELL_CONSOLE_SCOPE: &str = "manual";
+
+/// True when a row in the shared console scope was written FOR this project.
+/// Only console-inject rows qualify: they carry `executed.project`. A row
+/// with no recorded project is refused (fail-closed) rather than assumed ours.
+fn console_row_is_for_project(entry: &serde_json::Value, project: &str) -> bool {
+    entry
+        .get("executed")
+        .and_then(|e| e.get("project"))
+        .and_then(|p| p.as_str())
+        .is_some_and(|p| p == project)
+}
+
+/// The one scope test `why` and `afk` share, so the two can never disagree
+/// about what a project owns.
+///
+/// A row is in scope when its workspace is the project's own, OR when it sits
+/// in the shared console scope and records this project. `scoped = None`
+/// means `all` (no scoping). The console arm is deliberately per-ROW: the
+/// scope name is global, so admitting it wholesale would blend projects.
+fn journal_row_in_scope(
+    workspace: &str,
+    entry: &serde_json::Value,
+    scoped: &Option<Vec<String>>,
+    project: &str,
+) -> bool {
+    let Some(allowed) = scoped else { return true };
+    if allowed.iter().any(|w| w == workspace) {
+        return true;
+    }
+    workspace == DOORBELL_CONSOLE_SCOPE && console_row_is_for_project(entry, project)
+}
+
+#[cfg(test)]
+mod journal_scope_tests {
+    use super::*;
+
+    fn inject_row(project: &str) -> serde_json::Value {
+        serde_json::json!({
+            "msg": {"Fact": {"summary": format!("inject P: hello ({project})")}},
+            "pins": ["P"],
+            "executed": {"stage": "inject", "pin": "P", "project": project},
+            "workspace": DOORBELL_CONSOLE_SCOPE,
+        })
+    }
+
+    fn scoped_to(project: &str) -> Option<Vec<String>> {
+        Some(vec![project.to_string(), format!("{project}-crew")])
+    }
+
+    /// The console door must be explainable: a default inject lands in the
+    /// shared `manual` scope, and `why` still has to see it.
+    #[test]
+    fn console_inject_row_is_in_scope_for_its_own_project() {
+        let row = inject_row("proj-a");
+        assert!(journal_row_in_scope(
+            DOORBELL_CONSOLE_SCOPE,
+            &row,
+            &scoped_to("proj-a"),
+            "proj-a"
+        ));
+    }
+
+    /// The reason the console arm filters per ROW rather than by scope name:
+    /// `manual` is global, so admitting it wholesale would show another
+    /// project's injects — a silent cross-project blend.
+    #[test]
+    fn console_row_from_another_project_is_refused() {
+        let row = inject_row("proj-b");
+        assert!(
+            !journal_row_in_scope(DOORBELL_CONSOLE_SCOPE, &row, &scoped_to("proj-a"), "proj-a"),
+            "proj-b's inject must not answer a proj-a question"
+        );
+    }
+
+    /// Fail-closed: a console row with no recorded project is NOT assumed
+    /// ours. Refusing is the safe direction; guessing would blend projects.
+    #[test]
+    fn console_row_without_recorded_project_is_refused() {
+        let row = serde_json::json!({"msg": {"Fact": {"summary": "inject P: legacy"}}});
+        assert!(!journal_row_in_scope(
+            DOORBELL_CONSOLE_SCOPE,
+            &row,
+            &scoped_to("proj-a"),
+            "proj-a"
+        ));
+    }
+
+    /// The original exclusion (bd-a8ld) must survive: the synthetic
+    /// facts-lapsed-* / facts-close-* scopes are still not ours.
+    #[test]
+    fn synthetic_fact_scopes_stay_excluded() {
+        let row = serde_json::json!({"msg": {"Fact": {"summary": "closed"}}});
+        for ws in ["facts-lapsed-1", "facts-close-1", "some-other-project"] {
+            assert!(
+                !journal_row_in_scope(ws, &row, &scoped_to("proj-a"), "proj-a"),
+                "{ws} must stay out of proj-a's scope"
+            );
+        }
+    }
+
+    /// `all` means no scoping — the global scan still reads everything.
+    #[test]
+    fn no_scoping_admits_every_row() {
+        let row = serde_json::json!({"msg": {"Fact": {"summary": "x"}}});
+        assert!(journal_row_in_scope("anything", &row, &None, "proj-a"));
+    }
+}
+
+/// bd-a8ld: rewrite unit doorbell actions written in their pre-bd-z5ou
+/// object form (`{"FetchInbox":{"since":…}}`) to the current unit string.
+/// Only the three unit variants are touched: `Prompt`/`Audit`/`FactMiss`/
+/// `Digest` are struct variants in BOTH encodings and must stay objects.
+pub(crate) fn normalize_action_shapes(actions: &mut serde_json::Value) {
+    let Some(arr) = actions.as_array_mut() else {
+        return;
+    };
+    for a in arr.iter_mut() {
+        for unit in ["FetchInbox", "CheckAckSla", "RestartWatch"] {
+            let payloaded = a.get(unit).is_some_and(|v| !v.is_boolean() && !v.is_null());
+            if payloaded {
+                *a = serde_json::Value::String(unit.to_string());
+                break;
+            }
+        }
+    }
+}
+
+/// bd-bk9t: the `(pin, line, why)` of a journal row's `Digest` actions, in
+/// order. `route_or_queue` emits one per unroutable-pin wake, so a row can
+/// carry several. Non-`Digest` actions are ignored.
+///
+/// bd-z5ut: `afk` reads these too. A digest-bound wake is never produced by
+/// the embedded fold (`workspace::tick` has no `InboxFetched` arm, which is
+/// bd-c9jw), so without reading the rows the captain's batch surface missed
+/// exactly the wake that had just arrived.
+fn digest_action_entries(entry: &serde_json::Value) -> Vec<(String, String, String)> {
+    entry
+        .get("actions")
+        .and_then(|a| a.as_array())
+        .map(|actions| {
+            actions
+                .iter()
+                .filter_map(|a| {
+                    let d = a.get("Digest")?;
+                    Some((
+                        d.get("pin")?.as_str()?.to_string(),
+                        d.get("line")?.as_str()?.to_string(),
+                        d.get("why")
+                            .and_then(|w| w.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod bk9t_digest_line_tests {
+    use super::digest_action_entries;
+
+    #[test]
+    fn reads_only_digest_entries_in_order() {
+        let entry = serde_json::json!({
+            "actions": [
+                {"Audit": {"kind": "queued", "pin": "OtherPin", "detail": "x"}},
+                {"Digest": {"pin": "OperatorPin", "line": "[doorbell] plane-P urgent", "why": "no_route"}},
+                {"FetchInbox": 0},
+                {"Digest": {"pin": "OperatorPin", "line": "[doorbell] channel", "why": "no_route"}},
+            ]
+        });
+        assert_eq!(
+            digest_action_entries(&entry),
+            vec![
+                (
+                    "OperatorPin".to_string(),
+                    "[doorbell] plane-P urgent".to_string(),
+                    "no_route".to_string()
+                ),
+                (
+                    "OperatorPin".to_string(),
+                    "[doorbell] channel".to_string(),
+                    "no_route".to_string()
+                ),
+            ],
+            "a digest-bound wake must be readable from the row, in order"
+        );
+    }
+
+    #[test]
+    fn rows_without_a_digest_action_are_empty() {
+        let entry = serde_json::json!({"actions": ["FetchInbox"]});
+        assert_eq!(
+            digest_action_entries(&entry),
+            [] as [(String, String, String); 0]
+        );
+        assert_eq!(
+            digest_action_entries(&serde_json::json!({})),
+            [] as [(String, String, String); 0]
+        );
+    }
+}
+
+#[cfg(test)]
+mod action_shape_tests {
+    use super::normalize_action_shapes;
+
+    #[test]
+    fn legacy_object_shaped_unit_actions_become_unit_strings() {
+        let mut v = serde_json::json!([
+            {"FetchInbox": {"since": "2026-09-10T00:57:23Z"}},
+            "CheckAckSla",
+            {"Prompt": {"pin": "P", "line": "x"}},
+            {"Digest": {"pin": "P", "line": "l", "why": "no_route"}},
+        ]);
+        normalize_action_shapes(&mut v);
+        assert_eq!(v[0], serde_json::json!("FetchInbox"));
+        assert_eq!(v[1], serde_json::json!("CheckAckSla"));
+        assert_eq!(
+            v[2],
+            serde_json::json!({"Prompt": {"pin": "P", "line": "x"}})
+        );
+        assert_eq!(
+            v[3],
+            serde_json::json!({"Digest": {"pin": "P", "line": "l", "why": "no_route"}})
+        );
+    }
+
+    #[test]
+    fn non_array_actions_are_left_alone() {
+        let mut v = serde_json::json!({"FetchInbox": {"since": "x"}});
+        normalize_action_shapes(&mut v);
+        assert!(
+            v.get("FetchInbox").is_some(),
+            "a non-array actions field must not be rewritten"
+        );
+    }
+}
+
+fn why_entry_mentions_pin(
+    pin: &str,
+    msg: Option<&workspace::Msg>,
+    cmds: &[workspace::Cmd],
+    entry_pins: &[String],
+) -> bool {
+    let cmd_hit = cmds.iter().any(|c| match c {
+        workspace::Cmd::Prompt { pin: p, .. } => p == pin,
+        workspace::Cmd::Audit { pin: p, .. } => p == pin,
+        _ => false,
+    });
+    if cmd_hit {
+        return true;
+    }
+    if entry_pins.iter().any(|p| p == pin) {
+        return true;
+    }
+    let Some(msg) = msg else { return false };
+    match msg {
+        workspace::Msg::InboxItems { pin: p, .. }
+        | workspace::Msg::InboxRows { pin: p, .. }
+        | workspace::Msg::PlaneStatus { pin: p, .. } => p == pin,
+        workspace::Msg::WatchNdjson { line } => line.contains(pin),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod timeout_presence_tests {
+    #[test]
+    fn timeout_arm_ticks_presence_not_only_hear() {
+        let host = include_str!("../doorbell_host.rs");
+        assert!(
+            host.contains("presence.jsonl") && host.contains("Msg::Presence"),
+            "RED (55nx.5): sweep must project presence.jsonl rows into tick Msg::Presence"
+        );
+        let brain = include_str!("../crates/doorbell-rt/src/brain.rs");
+        assert!(
+            brain.contains("sweep_maintenance") && brain.contains("BrainMsg::Presence"),
+            "RED (55nx.5): brain must tick Presence rows every sweep, not hear-only"
+        );
+    }
+
+    #[test]
+    fn presence_rows_keep_fresh_states_latest_wins() {
+        let now = 1_000_000u64;
+        let body = format!(
+            "{}\n{}\n{}\n{}\n",
+            serde_json::json!({"name": "ZebraPin", "state": "idle", "ts": now - 10}),
+            serde_json::json!({"name": "BlueRidge", "state": "idle", "ts": now - 100}),
+            serde_json::json!({"name": "BlueRidge", "state": "working", "ts": now - 5}),
+            serde_json::json!({"name": "LilacChapel", "state": "working", "ts": now - 500}),
+        );
+        let rows = super::timeout_presence_rows(&body, now);
+        assert_eq!(
+            rows,
+            vec![
+                ("BlueRidge".to_string(), "working".to_string()),
+                ("ZebraPin".to_string(), "idle".to_string()),
+            ],
+            "latest fresh row wins; stale rows drop; pin order is deterministic (bd-bpj1 F2): {rows:?}"
+        );
+    }
+
+    #[test]
+    fn presence_tick_working_blocks_prompt_without_20001() {
+        let (next, _) = crate::workspace::tick(
+            &crate::workspace::WorkspaceModel::default(),
+            &crate::workspace::Msg::Presence {
+                pin: "BlueRidge".into(),
+                state: "working".into(),
+            },
+        );
+        assert_eq!(
+            next.presence.get("BlueRidge"),
+            Some(&crate::workspace::Presence::from_str("working")),
+            "jsonl working must enter Model.presence even with no 20001 seen"
+        );
+    }
+}
+
+/// Parse presence.jsonl body into fresh (pin, state) rows for the timeout path.
+/// Latest row per name wins; only rows <30s old are fresh. State comes from the
+/// row's `state` field (the Kind 20001 projection); rows without one default to
+/// `unknown`, which never prompts.
+fn timeout_presence_rows(body: &str, now: u64) -> Vec<(String, String)> {
+    let mut latest: std::collections::BTreeMap<String, (u64, String)> =
+        std::collections::BTreeMap::new();
+    for line in body.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let (Some(name), Some(ts)) = (
+            v.get("name").and_then(|n| n.as_str()),
+            v.get("ts").and_then(serde_json::Value::as_u64),
+        ) else {
+            continue;
+        };
+        let state = v
+            .get("state")
+            .and_then(|s| s.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        latest
+            .entry(name.to_string())
+            .and_modify(|e| {
+                if ts > e.0 {
+                    *e = (ts, state.clone());
+                }
+            })
+            .or_insert((ts, state));
+    }
+    latest
+        .into_iter()
+        .filter(|(_, (ts, _))| now.saturating_sub(*ts) < 30)
+        .map(|(pin, (_, state))| (pin, state))
+        .collect()
+}
+
+/// Spawn the CLI `toron watch` plane-S child + its NDJSON reader thread.
+/// Shared by the initial fallback and both respawn paths (Died burst +
+/// 1s retry gate) so every restart uses the SAME kinds and wiring.
+/// Kinds MUST match the in-process filter (presence 20001 + profile 30013).
+const DOORBELL_WATCH_KINDS: &str = "9,14,20001,30013,43001,30031,39002";
+
+/// Wake-bus socket consumer (bd-qe1r wave 2) — replaces the `toron watch`
+/// child: subscribes the daemon `wake.sock`, outcomes map onto `BrainMsg`
+/// at the call site (mapping byte-identical by the doorbell-rt golden test).
+/// GS062-ADV-5 semantics (try_send Watch / Died blocking / stamp-after-Ok)
+/// live in the call-site mapper (`wake_outcome_to_brain` / FileHost restart).
+fn spawn_wake_consumer<F>(
+    project: &str,
+    workspace: &str,
+    state_dir: &std::path::Path,
+    resume_from: Option<String>,
+    retired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    on_event: F,
+) -> (
+    tokio::task::AbortHandle,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+)
+where
+    F: Fn(doorbell_rt::wake_sock::WakeOutcome) + Send + 'static,
+{
+    use doorbell_rt::wake_sock::{self, WakeOpts};
+    let mut opts = WakeOpts::new(
+        wake_sock::wake_sock_path(),
+        wake_sock::parse_kinds(DOORBELL_WATCH_KINDS),
+        Some(project.to_string()),
+    );
+    opts.resume_from = resume_from;
+    let stored = std::sync::Arc::clone(&retired);
+    opts.retired = retired;
+    let state_dir = state_dir.to_path_buf();
+    let workspace = workspace.to_string();
+    let handle = wake_sock::spawn_wake_task(
+        opts,
+        move |kind, detail| {
+            doorbell::audit_append(
+                &state_dir,
+                &workspace,
+                serde_json::json!({"kind": kind, "detail": detail}),
+            );
+        },
+        on_event,
+    );
+    (handle, stored)
+}
+
+/// Pins plus npubs so live kind-9 `p` tags (hex) resolve to the pin.
+fn doorbell_self_index(cfg: &Config, project: &str, pins: &[String]) -> doorbell::SelfIndex {
+    let mut index = doorbell::SelfIndex::from_pins(pins.iter().cloned());
+    let Ok(key) = project_dir_str(cfg, project) else {
+        return index;
+    };
+    let Ok(mail) = backend::mail_backend(cfg) else {
+        return index;
+    };
+    for pin in pins {
+        if let Ok(w) = backend::run_mail(mail.whois(&key, pin))
+            && !w.npub.is_empty()
+        {
+            index.insert_pin(pin.clone(), Some(w.npub));
+        }
+    }
+    index
+}
+
+pub(crate) fn doorbell_now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// bd-8vci: sleep to the next wall-clock second boundary (bounded, <1s) so a
+/// re-stamp lands strictly after the prior same-second wake stamp.
+fn sleep_to_next_second() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    std::thread::sleep(Duration::from_nanos(
+        1_000_000_000 - u64::from(now.subsec_nanos()),
+    ));
+}
+
+/// GS-039 P0-1: stamp last_wake from a REAL observation without clobbering
+/// plane-P/S high-waters (refresh/sweep callers lack the live since map).
+/// Advance only when the observation is new/meaningful: wall clock moved
+/// strictly past the prior stamp. Same-second re-notes must not bump the
+/// prior stamp by one — that let background polls ratchet `last_wake` without
+/// a fresh observation (invent-adjacent). bd-8vci: a refused same-second
+/// stamp retries ONCE after sleeping to the next second boundary, so two
+/// sends landing in one wall second still advance the stamp for the caller's
+/// wake-advance gate; a second refusal leaves the caller's bail standing.
+pub(crate) fn doorbell_note_observed_wake(workspace: &str, pin: &str) -> Result<()> {
+    let path = doorbell::wake_state_file(&config::state_dir(), workspace);
+    let mut st = doorbell::load_wake_state(&path);
+    let mut now = doorbell_now_unix();
+    if let Some(prev) = st.last_wake_unix
+        && now <= prev
+    {
+        sleep_to_next_second();
+        now = doorbell_now_unix();
+        st = doorbell::load_wake_state(&path);
+        if let Some(prev) = st.last_wake_unix
+            && now <= prev
+        {
+            return Ok(());
+        }
+    }
+    doorbell::note_wake(&mut st, pin, now);
+    doorbell::save_wake_state(&path, &st).with_context(|| {
+        format!(
+            "doorbell observed-wake save failed at {} — refuse silent drop (GS-039 P0-1)",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn upsert_workspace_receipt(corr: &str, receipt: &workspace::Receipt) {
+    let state = match receipt.state.as_str() {
+        "owed" => toron_core::mailbox::receipts::ReceiptState::Owed,
+        "acked" => toron_core::mailbox::receipts::ReceiptState::Acked,
+        "resulted" => toron_core::mailbox::receipts::ReceiptState::Resulted,
+        "degraded" => toron_core::mailbox::receipts::ReceiptState::Degraded,
+        _ => return,
+    };
+    let wake = match receipt.wake.as_str() {
+        "standing" => Some(toron_core::mailbox::send_tags::Wake::Standing),
+        "tasked" => Some(toron_core::mailbox::send_tags::Wake::Tasked),
+        _ => None,
+    };
+    let r = toron_core::mailbox::receipts::Receipt {
+        corr: corr.to_string(),
+        state,
+        wake,
+        due_at: receipt.due_at.map(|v| v as i64),
+        result_path: receipt.result_path.clone(),
+        updated_at: chrono::Utc::now().timestamp_millis(),
+    };
+    let _ = crate::mail::block_on(async {
+        if let Some(mb) = crate::mail::try_mailbox()
+            && let Ok(store) = mb.receipt_store()
+        {
+            let _ = store.upsert(&r).await;
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+}
+
+/// Pins the journal effect marks dropped for one entry (`executed.effect`).
+/// Absent effect (legacy lines, unbudgeted paths) means no drops.
+fn why_dropped_pins(entry: &serde_json::Value) -> Vec<String> {
+    entry
+        .get("executed")
+        .and_then(|e| e.get("effect"))
+        .and_then(|f| f.get("dropped"))
+        .and_then(|d| d.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| p.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn handle_workspace_cmds(
+    workspace_model: &mut workspace::WorkspaceModel,
+    cmds: &[workspace::Cmd],
+    project: &str,
+    cfg: &Config,
+    drain_waits: bool,
+) -> bool {
+    let mut fetch_inbox = false;
+    for cmd in cmds {
+        match cmd {
+            workspace::Cmd::SqliteUpsert { corr, receipt } => {
+                upsert_workspace_receipt(corr, receipt);
+            }
+            workspace::Cmd::FetchInbox => {
+                fetch_inbox = true;
+            }
+            workspace::Cmd::WaitCorr { .. } => {}
+            workspace::Cmd::Publish {
+                kind,
+                content,
+                corr,
+                result_path,
+            } => {
+                publish_human_question(project, *kind, content, corr, result_path.as_deref());
+            }
+            workspace::Cmd::FactMiss { why } => {
+                eprintln!("flywheel: [FactMiss] {why}");
+            }
+            workspace::Cmd::LoudMiss { why } => {
+                eprintln!("flywheel: [LoudMiss] {why}");
+            }
+            workspace::Cmd::Invoke {
+                workflow,
+                input,
+                corr,
+            } => {
+                let mut inputs = input.clone();
+                if let Some(obj) = inputs.as_object_mut() {
+                    obj.insert("corr".into(), serde_json::json!(corr));
+                }
+                let run = WorkflowCmd::Run {
+                    name: workflow.clone(),
+                    inputs: Some(inputs.to_string()),
+                    crew: None,
+                    execute: true,
+                    mode: "pane".to_string(),
+                    project: Some(project.to_string()),
+                    reuse: None,
+                    retain: false,
+                    retire_orphans: false,
+                    json: true,
+                    yes: true,
+                    allow_worktree: false,
+                    role_model: vec![],
+                    role_harness: vec![],
+                };
+                if let Err(e) = cmd_workflow(cfg, &run) {
+                    eprintln!("flywheel: [LoudMiss] invoke {corr} ({workflow}): {e:#}");
+                }
+            }
+            workspace::Cmd::Prompt { .. }
+            | workspace::Cmd::CheckAckSla
+            | workspace::Cmd::RestartWatch => {}
+            workspace::Cmd::Audit { kind, pin, detail } => {
+                eprintln!("flywheel: [Audit {kind}] {pin}: {detail}");
+            }
+            workspace::Cmd::Digest { entries } => {
+                let holds = workspace::sorted_holds(workspace_model);
+                let now = chrono::Utc::now().timestamp() as u64;
+                eprintln!(
+                    "flywheel: [Digest]\n{}",
+                    workspace::render_digest_with_holds(entries, &holds, now)
+                );
+            }
+            workspace::Cmd::Send { .. }
+            | workspace::Cmd::PinStamp { .. }
+            | workspace::Cmd::DispatchImmediate { .. }
+            | workspace::Cmd::Blocked { .. }
+            | workspace::Cmd::Nudge { .. }
+            | workspace::Cmd::Diagnose { .. }
+            | workspace::Cmd::Respawn { .. }
+            | workspace::Cmd::Reclaim { .. }
+            | workspace::Cmd::Wait => {}
+            workspace::Cmd::RebindBinding {
+                pin,
+                profile_name,
+                model,
+                harness,
+                effect_key,
+                note,
+            } => {
+                eprintln!(
+                    "flywheel: [RebindBinding] effect_key={effect_key} pin={pin} note={note}"
+                );
+                let _ = cmd_binding_rebind(
+                    cfg,
+                    project,
+                    pin,
+                    profile_name.as_deref(),
+                    model.as_deref(),
+                    harness.as_deref(),
+                    Some(note.as_str()),
+                );
+            }
+            workspace::Cmd::Reclassify {
+                goal,
+                pin,
+                explicit_topology,
+                reason,
+                effect_key,
+            } => {
+                eprintln!(
+                    "flywheel: [Reclassify] effect_key={effect_key} reason={reason} goal_len={} sticky_explicit={:?}",
+                    goal.len(),
+                    explicit_topology
+                );
+                let snap = live_decide_snapshot(cfg, project);
+                let more = workspace::expand_reclassify_cmds(
+                    workspace_model,
+                    vec![workspace::Cmd::Reclassify {
+                        goal: goal.clone(),
+                        pin: pin.clone(),
+                        explicit_topology: explicit_topology.clone(),
+                        reason: reason.clone(),
+                        effect_key: effect_key.clone(),
+                    }],
+                    project,
+                    &crate::authority::RuntimeAuthority::resolve(),
+                    &|g| {
+                        let d = crate::decide::decide(g, &snap);
+                        (
+                            d.primitive.to_string(),
+                            d.topology.to_string(),
+                            d.argv.clone(),
+                            d.reason.clone(),
+                        )
+                    },
+                );
+                if let Some(topo) = workspace_model.session_topology.as_deref() {
+                    let _ = state::save_session_topology(project, topo);
+                }
+                let _ = handle_workspace_cmds(workspace_model, &more, project, cfg, false);
+            }
+        }
+    }
+    if drain_waits {
+        drain_pending_wait_corrs(workspace_model);
+    }
+    fetch_inbox
+}
+
+fn drain_pending_wait_corrs(workspace_model: &mut workspace::WorkspaceModel) {
+    let pending: Vec<String> = workspace_model.wake.waits.keys().cloned().collect();
+    for corr in pending {
+        if try_tick_receipt(workspace_model, &corr) {
+            workspace_model.wake.waits.remove(&corr);
+        }
+    }
+}
+
+fn try_tick_receipt(workspace_model: &mut workspace::WorkspaceModel, corr: &str) -> bool {
+    let Some(mb) = crate::mail::try_mailbox() else {
+        return false;
+    };
+    let Ok(store) = mb.receipt_store() else {
+        return false;
+    };
+    let Ok(Some(r)) = crate::mail::block_on(store.get(corr)) else {
+        return false;
+    };
+    let rec = workspace::Receipt {
+        state: r.state.as_str().to_string(),
+        wake: r
+            .wake
+            .map(|w| w.as_str().to_string())
+            .unwrap_or_else(|| "tasked".into()),
+        due_at: r.due_at.map(|v| v as u64),
+        result_path: r.result_path.clone(),
+    };
+    let msg = workspace::Msg::Receipt {
+        corr: corr.to_string(),
+        receipt: rec,
+    };
+    let (next, extra) = workspace::tick(workspace_model, &msg);
+    *workspace_model = next;
+    for c in extra {
+        if let workspace::Cmd::SqliteUpsert { corr, receipt } = c {
+            upsert_workspace_receipt(&corr, &receipt);
+        }
+    }
+    true
+}
+#[cfg(test)]
+mod waitcorr_doorbell_only_tests {
+    #[test]
+    fn waitcorr_arm_names_cli_equivalent_and_sweep_wake() {
+        let src = include_str!("doorbell.rs");
+        let pos = src.find("fn handle_workspace_cmds(").expect("handler");
+        let end = src[pos..]
+            .find("\nfn drain_pending_wait_corrs")
+            .map(|i| pos + i)
+            .unwrap_or(src.len());
+        let slice = &src[pos..end];
+        assert!(
+            slice.contains("workspace::Cmd::WaitCorr"),
+            "WaitCorr arm must be present in the handler"
+        );
+        assert!(
+            slice.contains("drain_pending_wait_corrs(workspace_model)"),
+            "drain fast-path must live in the handler"
+        );
+        assert!(
+            slice.contains("drain_waits"),
+            "E2: the peek is gated by drain_waits"
+        );
+        let host = include_str!("../doorbell_host.rs");
+        assert!(
+            host.contains("BrainMsg::Sweep { now } => (workspace::Msg::Sweep { now: *now }, true)"),
+            "ADR-0011 D7: WaitCorr also drains on Sweep, not only WatchNdjson"
+        );
+    }
+
+    #[test]
+    fn invoke_arm_hands_off_to_durable_run_gate() {
+        let src = include_str!("doorbell.rs");
+        let pos = src.find("fn handle_workspace_cmds(").expect("handler");
+        let end = src[pos..]
+            .find("\nfn drain_pending_wait_corrs")
+            .map(|i| pos + i)
+            .unwrap_or(src.len());
+        let slice = &src[pos..end];
+        assert!(
+            slice.contains("Cmd::Invoke"),
+            "Invoke arm must be applied in the handler"
+        );
+        assert!(
+            slice.contains("cmd_workflow(cfg, &run)"),
+            "Invoke must route through cmd_workflow (the durable Run gate)"
+        );
+        assert!(
+            slice.contains("\"corr\".into(), serde_json::json!(corr)"),
+            "Invoke inputs must carry the corr for attribution"
+        );
+        assert!(
+            slice.contains("[LoudMiss] invoke"),
+            "Invoke failure must be LoudMiss, never silent"
+        );
+    }
+
+    #[test]
+    fn waitcorr_never_drains_on_swarm_fold() {
+        let durable = include_str!("../durable.rs");
+        assert!(
+            !durable.contains("WaitCorr"),
+            "swarm fold must not produce/drain WaitCorr; doorbell owns pending_wait"
+        );
+        assert!(
+            !durable.contains("pending_wait"),
+            "pending_wait lives on the doorbell path only"
+        );
+    }
+}
+#[cfg(test)]
+mod s_proof_tests {
+    #[test]
+    fn s1_rebuild_reads_sqlite_into_assignment() {
+        let src = include_str!("doorbell.rs");
+        let pos = src
+            .find("fn rebuild_assignment_from_receipts(")
+            .expect("rebuild");
+        let end = src[pos..]
+            .find("\nfn unpinned_registry_names(")
+            .map(|i| pos + i)
+            .unwrap_or(src.len());
+        let slice = &src[pos..end];
+        assert!(
+            slice.contains("receipt_store") && slice.contains(".list("),
+            "S1: rebuild must read the receipts sqlite store (receipt_store list)"
+        );
+        assert!(
+            slice.contains("assignment.insert"),
+            "S1: every listed receipt must land in Model.assignment (no drop filter)"
+        );
+    }
+
+    #[test]
+    fn s1_receipt_tick_writes_assignment_and_upsert() {
+        let (next, cmds) = crate::workspace::tick(
+            &crate::workspace::WorkspaceModel::default(),
+            &crate::workspace::Msg::Receipt {
+                corr: "FM-S1".into(),
+                receipt: crate::workspace::Receipt {
+                    state: "owed".into(),
+                    wake: "tasked".into(),
+                    due_at: None,
+                    result_path: None,
+                },
+            },
+        );
+        assert!(
+            next.assignment.contains_key("FM-S1"),
+            "S1: Receipt tick must record the corr in assignment"
+        );
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                crate::workspace::Cmd::SqliteUpsert { corr, .. } if corr == "FM-S1"
+            )),
+            "S1: Receipt tick must emit SqliteUpsert, got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn s2_standing_empty_silence() {
+        let (next, cmds) = crate::workspace::tick(
+            &crate::workspace::WorkspaceModel::default(),
+            &crate::workspace::Msg::WatchNdjson {
+                line: "not json, no ring".into(),
+            },
+        );
+        assert!(
+            cmds.is_empty(),
+            "S2: unrung line must emit no Cmds, got {cmds:?}"
+        );
+        assert!(
+            next.assignment.is_empty(),
+            "S2: unrung line must not write assignment"
+        );
+    }
+
+    #[test]
+    fn why_fold_has_corr_seq_filters_from_default() {
+        let src = include_str!("doorbell.rs");
+        let pos = src.find("fn cmd_doorbell_why(").expect("why");
+        let end = src[pos..]
+            .find("\nfn cmd_loop_why(")
+            .map(|i| pos + i)
+            .unwrap_or(src.len());
+        let slice = &src[pos..end];
+        assert!(
+            slice.contains("WorkspaceModel::default()"),
+            "why must fold tick from Default"
+        );
+        assert!(
+            slice.contains("workspace::tick(&model, &msg)")
+                || slice.contains("workspace::tick(&model, &msg,"),
+            "why must reproduce Cmds by folding tick"
+        );
+        for needle in ["corr", "seq"] {
+            assert!(
+                slice.contains(needle),
+                "why must carry a {needle} filter bound, not pin-substring grep"
+            );
+        }
+    }
+
+    #[test]
+    fn why_shows_daemon_inbox_wake() {
+        let entry_pins = vec!["PearlTern".to_string()];
+        assert!(
+            super::why_entry_mentions_pin("PearlTern", None, &[], &entry_pins),
+            "daemon inbox row attributed via journal pins must match"
+        );
+        assert!(
+            !super::why_entry_mentions_pin("BrightCoast", None, &[], &entry_pins),
+            "other pins must not match"
+        );
+        assert!(
+            !super::why_entry_mentions_pin("PearlTern", None, &[], &[]),
+            "legacy rows without pins stay invisible, never invented"
+        );
+    }
+}
+
+/// E4 live producer: the rumor carries corr (+ result_path) so the human
+/// answer returns exactly that corr via --corr/--verdict (or body fallback).
+fn publish_human_question(
+    project: &str,
+    kind: u64,
+    content: &str,
+    corr: &str,
+    result_path: Option<&str>,
+) {
+    eprintln!(
+        "flywheel: [Publish kind={kind} corr={corr}] {}",
+        content.chars().take(120).collect::<String>()
+    );
+    if kind != 14 || corr.is_empty() {
+        return;
+    }
+    let Some(mb) = crate::mail::try_mailbox() else {
+        return;
+    };
+    let mut extra_tags = Vec::new();
+    for pair in [("audience", "human"), ("corr", corr)] {
+        match toron_core::nostr::Tag::parse([pair.0, pair.1]) {
+            Ok(t) => extra_tags.push(t),
+            Err(_) => return,
+        }
+    }
+    if let Some(rp) = result_path.filter(|s| !s.is_empty()) {
+        match toron_core::nostr::Tag::parse(["result_path", rp]) {
+            Ok(t) => extra_tags.push(t),
+            Err(_) => return,
+        }
+    }
+    let args = toron_core::mailbox::messaging::SendMessage {
+        project_slug: project.to_string(),
+        sender_name: "captain".into(),
+        to: vec!["captain".into()],
+        subject: "[human] question".into(),
+        body_md: content.to_string(),
+        extra_tags,
+        ..Default::default()
+    };
+    if let Err(e) = crate::mail::block_on(mb.send_message(&args)) {
+        eprintln!("flywheel: [Publish kind=14] send failed: {e:#}");
+    }
+}
+
+/// bd-adr0027-proven-leftovers-55nx.1: crash-resume presence seed for `why`.
+/// Applies fresh presence.jsonl rows (parsed by timeout_presence_rows:
+/// latest row per pin, <30s old) as Model.presence. Unparseable states
+/// become Unknown via Presence::from_str — never defaulted idle.
+fn seed_why_presence(
+    workspace_model: &mut crate::workspace::WorkspaceModel,
+    rows: Vec<(String, String)>,
+) {
+    for (pin, state) in rows {
+        workspace_model
+            .presence
+            .insert(pin, crate::workspace::Presence::from_str(&state));
+    }
+}
+
+pub(crate) fn rebuild_assignment_from_receipts(
+    workspace_model: &mut crate::workspace::WorkspaceModel,
+) {
+    if let Some(mb) = crate::mail::try_mailbox()
+        && let Ok(store) = mb.receipt_store()
+        && let Ok(receipts) = crate::mail::block_on(store.list(None))
+    {
+        for r in receipts {
+            let w = r
+                .wake
+                .map(|w| w.as_str().to_string())
+                .unwrap_or_else(|| "tasked".to_string());
+            let rec = crate::workspace::Receipt {
+                state: r.state.as_str().to_string(),
+                wake: w,
+                due_at: r.due_at.map(|v| v as u64),
+                result_path: r.result_path.clone(),
+            };
+            workspace_model.assignment.insert(r.corr.clone(), rec);
+        }
+    }
+}
+#[cfg(test)]
+mod journal_effect_tests {
+    use super::*;
+
+    #[test]
+    fn budget_effect_splits_pins() {
+        let raw = vec![
+            ("A".to_string(), "l1".to_string()),
+            ("B".to_string(), "l2".to_string()),
+        ];
+        let allowed = vec![("A".to_string(), "l1".to_string())];
+        let effect = budget_effect(&raw, &allowed);
+        assert_eq!(
+            effect
+                .get("injected")
+                .and_then(|v| v.as_array())
+                .map(std::vec::Vec::len),
+            Some(1),
+            "one pin injected, got {effect}"
+        );
+        let dropped = effect
+            .get("dropped")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            dropped.iter().any(|p| p.as_str() == Some("B")),
+            "B was dropped by budget, got {effect}"
+        );
+        assert!(
+            !dropped.iter().any(|p| p.as_str() == Some("A")),
+            "A was injected, never dropped, got {effect}"
+        );
+    }
+
+    #[test]
+    fn journal_decided_lines_carry_effect() {
+        let src = include_str!("doorbell.rs");
+        for stage in ["decided", "drain", "fact_live", "sweep_inbox"] {
+            let mut found_effect = false;
+            let mut search = src;
+            while let Some(pos) = search.find(stage) {
+                let slice = &search[pos..std::cmp::min(search.len(), pos + 600)];
+                if slice.contains("\"effect\"") || slice.contains("effect") {
+                    found_effect = true;
+                    break;
+                }
+                search = &search[pos + stage.len()..];
+            }
+            assert!(
+                found_effect,
+                "RED (55nx.9): journal stage {stage} carries no effect field — why overclaims dropped Prompts"
+            );
+        }
+    }
+
+    #[test]
+    fn why_reads_effect_before_claiming_inject() {
+        let src = include_str!("doorbell.rs");
+        let pos = src.find("fn cmd_doorbell_why(").expect("cmd_doorbell_why");
+        let slice = &src[pos..std::cmp::min(src.len(), pos + 12000)];
+        assert!(
+            slice.contains("effect") && slice.contains("dropped"),
+            "RED (55nx.9): why never reads the journal effect — dropped Prompts replay as injected"
+        );
+    }
+}
+#[cfg(test)]
+mod why_resume_tests {
+    use super::*;
+
+    #[test]
+    fn why_resume_seed_applies_presence_rows() {
+        let mut model = workspace::WorkspaceModel::default();
+        seed_why_presence(
+            &mut model,
+            vec![
+                ("A".to_string(), "working".to_string()),
+                ("B".to_string(), "weird".to_string()),
+            ],
+        );
+        assert_eq!(
+            model.presence.get("A"),
+            Some(&workspace::Presence::from_str("working"))
+        );
+        assert_eq!(
+            model.presence.get("B"),
+            Some(&workspace::Presence::Unknown),
+            "unparseable state seeds Unknown, never idle"
+        );
+    }
+
+    #[test]
+    fn why_seeds_assignment_before_fold() {
+        let src = include_str!("doorbell.rs");
+        let pos = src.find("fn cmd_doorbell_why(").expect("cmd_doorbell_why");
+        let slice = &src[pos..std::cmp::min(src.len(), pos + 9000)];
+        assert!(
+            slice.contains("rebuild_assignment_from_receipts"),
+            "RED (55nx.1): why folds from Default without the receipts seed — tasked corrs vanish from replay"
+        );
+    }
+
+    #[test]
+    fn why_seeds_presence_snapshot() {
+        let src = include_str!("doorbell.rs");
+        let pos = src.find("fn cmd_doorbell_why(").expect("cmd_doorbell_why");
+        let end = src[pos..]
+            .find("\nfn cmd_loop_why(")
+            .map(|i| pos + i)
+            .unwrap_or(src.len());
+        let slice = &src[pos..end];
+        assert!(
+            slice.contains("seed_why_presence"),
+            "RED (55nx.1): why folds without a presence seed — working pins replay Prompts live would suppress"
+        );
+        assert!(
+            slice.contains("presence_path()"),
+            "the why presence seed must read the toron-canonical root-level projection"
+        );
     }
 }
