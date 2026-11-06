@@ -1376,6 +1376,8 @@ mod tests {
     /// no way out.
     #[test]
     fn citation_lookup_is_case_insensitive() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let dir = std::env::temp_dir().join(format!("fw-cite-case-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1464,6 +1466,8 @@ mod tests {
     /// AC-shape x loop-runnability cell (9 * 5 * 2 * 2 * 2 = 360 cells).
     #[test]
     fn legal_close_matches_table_over_every_cell() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         for kind in VerdictKind::ALL {
             for priority in 0..=4u8 {
                 for blast in [Blast::Normal, Blast::High] {
@@ -1486,6 +1490,8 @@ mod tests {
 
     #[test]
     fn worker_receipt_illegal_on_loop_runnable_verify() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let bead = bead(3, Blast::Normal, true);
         let v = verdict(VerdictKind::WorkerReceipt);
         assert!(!legal_close(&v, &bead, AcShape::Checkable));
@@ -1493,6 +1499,8 @@ mod tests {
 
     #[test]
     fn command_verified_illegal_outside_cheap_band() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let p0_bead = bead(0, Blast::Normal, true);
         let v = verdict(VerdictKind::CommandVerified);
         assert!(!legal_close(&v, &p0_bead, AcShape::Checkable));
@@ -1503,6 +1511,8 @@ mod tests {
 
     #[test]
     fn judgment_ac_closes_only_with_reviewer_signed() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         for kind in VerdictKind::ALL {
             let bead = bead(1, Blast::of(false, AcShape::Judgment), true);
             let v = verdict(kind);
@@ -1517,6 +1527,8 @@ mod tests {
 
     #[test]
     fn blocked_and_failed_are_never_legal() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         for priority in 0..=4u8 {
             for blast in [Blast::Normal, Blast::High] {
                 for ac in [AcShape::Checkable, AcShape::Judgment] {
@@ -1534,6 +1546,8 @@ mod tests {
 
     #[test]
     fn cheap_band_is_loop_run_only() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let bead = bead(3, Blast::Normal, true);
         for kind in VerdictKind::ALL {
             let v = verdict(kind);
@@ -1548,6 +1562,8 @@ mod tests {
     /// shell composition and empty VERIFY never do.
     #[test]
     fn loop_run_verify_classifier_row_table() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let accepts = [
             "cargo test -p flywheel verdict::",
             "cargo test -p flywheel loop_run_verify",
@@ -1598,6 +1614,8 @@ mod tests {
     /// TIMEBOX parse: minutes -> seconds; absent/malformed -> None.
     #[test]
     fn loop_run_verify_parses_timebox_to_seconds() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         assert_eq!(parse_timebox("TIMEBOX 90min/bead"), Some(5400));
         assert_eq!(parse_timebox("TIMEBOX: 30"), Some(1800));
         assert_eq!(parse_timebox("TIMEBOX 45 minutes"), Some(2700));
@@ -1610,6 +1628,8 @@ mod tests {
     /// outright (no arm dependency — always refused).
     #[test]
     fn worker_ledger_receipt_refuses_command_verified_kind() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let dir = std::env::temp_dir().join(format!("lr-receipt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1624,6 +1644,8 @@ mod tests {
 
     #[test]
     fn blast_derivation_high_iff_overlap_or_judgment() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         assert_eq!(Blast::of(false, AcShape::Checkable), Blast::Normal);
         assert_eq!(Blast::of(true, AcShape::Checkable), Blast::High);
         assert_eq!(Blast::of(false, AcShape::Judgment), Blast::High);
@@ -1632,6 +1654,8 @@ mod tests {
 
     #[test]
     fn every_kind_has_a_distinct_gate_name() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let mut names: Vec<&str> = VerdictKind::ALL.iter().map(|k| k.gate_name()).collect();
         names.sort_unstable();
         names.dedup();
@@ -1644,6 +1668,8 @@ mod tests {
 
     #[test]
     fn agent_name_brands_non_empty_strings() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let n = AgentName::new("flywheel-toron-coder1");
         assert_eq!(n.as_str(), "flywheel-toron-coder1");
         assert_eq!(n.to_string(), "flywheel-toron-coder1");
@@ -1686,6 +1712,8 @@ mod tests {
     /// concurrent `git reset` unstaged the index and the commit landed empty).
     #[test]
     fn derive_head_sha_skips_an_empty_commit() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let (dir, bead_id) = scratch_workspace("sha-empty-skip");
         let work = derive_head_sha(&dir, &bead_id).unwrap();
         let out = std::process::Command::new("git")
@@ -1708,6 +1736,8 @@ mod tests {
     /// cannot contain the work.
     #[test]
     fn derive_head_sha_refuses_when_every_candidate_is_empty() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let bead_id = "test-empty-only";
         let dir = std::env::temp_dir().join(format!("fw-verdict-emptyonly-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1738,6 +1768,8 @@ mod tests {
     /// (worker-invoked report blocked, loop path accepted).
     #[test]
     fn loop_only_reporter_guard_blocks_workers_then_loop_roundtrips() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let _lock = crate::verdict::lock_loop_reporter();
         crate::verdict::test_reset_loop_reporter();
         let (dir, bead_id) = scratch_workspace("gate-roundtrip");
@@ -1810,6 +1842,8 @@ mod tests {
     /// reviewer-signed note with only sha= stays legal; exit=1 is not legal.
     #[test]
     fn a_command_verified_note_without_a_tail_is_not_legal() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         fn report_note(dir: &Path, bead_id: &str, gate: &str, note: &str) {
             crate::br::run_br(
                 Some(dir),
@@ -1911,6 +1945,8 @@ mod tests {
 
     #[test]
     fn derive_head_sha_refuses_when_no_commit_carries_the_id() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let (dir, _id) = scratch_workspace("sha-rule");
         let err = derive_head_sha(&dir, "bd-never-committed").unwrap_err();
         assert!(err.to_string().contains("SHA rule"), "{err}");
@@ -1919,6 +1955,8 @@ mod tests {
 
     #[test]
     fn receipt_helper_writes_exact_filename_and_refuses_empty() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let dir = std::env::temp_dir().join(format!("gate-receipt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1952,6 +1990,8 @@ mod tests {
 
     #[test]
     fn gate_names_roundtrip_through_from_gate_name() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         for kind in VerdictKind::ALL {
             assert_eq!(VerdictKind::from_gate_name(kind.gate_name()), Some(kind));
         }
@@ -1967,6 +2007,8 @@ mod tests {
     /// `ledger_check` skipped forever, so the bead could never be credited.
     #[test]
     fn every_br_gate_name_parses_to_a_kind() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         for gate in [
             "command-verified",
             "unit-test-verified",
@@ -1992,6 +2034,8 @@ mod tests {
     /// never be credited.
     #[test]
     fn triage_bead_without_verify_credits_a_triage_verified_row() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let (dir, bead_id) = scratch_workspace_with_verify("triage-close", None);
         let err = bead_from_br_show(&dir, &bead_id).unwrap_err();
         assert!(err.to_string().contains("refuse to dispatch"), "{err}");
@@ -2029,6 +2073,8 @@ mod tests {
     /// shape br told the operator was legal.
     #[test]
     fn ledger_check_credits_the_rows_br_names_for_a_p3_script_verify() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let bead = bead(3, Blast::Normal, false);
         for gate in ["worker-receipt", "triage-verified", "unit-test-verified"] {
             let kind = VerdictKind::from_gate_name(gate)
@@ -2042,6 +2088,8 @@ mod tests {
 
     #[test]
     fn triage_verified_closes_the_non_runnable_band_only() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let non_runnable = bead(3, Blast::Normal, false);
         let v = verdict(VerdictKind::TriageVerified);
         assert!(legal_close(&v, &non_runnable, AcShape::Checkable));
@@ -2052,6 +2100,8 @@ mod tests {
 
     #[test]
     fn operator_directed_closes_p0_p1_normal_only() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let v = verdict(VerdictKind::OperatorDirected);
         for priority in [0u8, 1] {
             assert!(legal_close(
@@ -2079,6 +2129,8 @@ mod tests {
 
     #[test]
     fn note_key_value_tokens_parse_sha_and_receipt() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let sha = "d".repeat(40);
         let note = format!("sha={sha} receipt=/tmp/r.txt");
         assert!(note_has_sha(&note, &sha));
@@ -2095,6 +2147,8 @@ mod tests {
     /// renders a verdict about something other than what it claims to check.
     #[test]
     fn note_has_sha_anchors_to_the_note_start_not_a_prose_mention() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let a = "a".repeat(40);
         let b = "b".repeat(40);
         let note = format!("supersedes sha={a} because the new work is at sha={b}");
@@ -2116,6 +2170,8 @@ mod tests {
     /// carries the correct sha still binds nothing — silently, until now.
     #[test]
     fn note_has_sha_rejects_a_sha_value_followed_by_a_comma() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let sha = "c".repeat(40);
         let note = format!("sha={sha}, and the suite was green");
         assert!(
@@ -2138,6 +2194,8 @@ mod tests {
     /// binding is not a binding. Both fail closed with a reason.
     #[test]
     fn note_binding_reason_reports_a_bound_but_different_revision() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let a = "a".repeat(40);
         let b = "b".repeat(40);
         let note = format!("sha={a} receipt=/tmp/r.txt");
@@ -2152,6 +2210,8 @@ mod tests {
     /// note-less passed row must never satisfy the SHA rule.
     #[test]
     fn gate_row_without_note_parses_and_never_binds_sha() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let raw = r#"{"issue_id":"bd-x","current_status":"closed","history":[{"id":1,"issue_id":"bd-x","from_status":"in_progress","to_status":"closed","status_revision":1,"gate":"unit-test-verified","provider":"a","passed":true,"recorded_by":"b","recorded_at":"2026-09-12 07:02:36"}]}"#;
         let list: GateList = serde_json::from_str(raw).expect("note-less rows parse");
         assert!(list.history[0].note.is_none());
@@ -2182,6 +2242,8 @@ mod tests {
     /// guard must not move someone else's binding.
     #[test]
     fn derive_head_sha_prefers_the_subject_and_ignores_a_body_mention() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let (dir, bead_id) = scratch_workspace("sha-subject-wins");
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/fix.rs"), "// fix\n").unwrap();
@@ -2261,6 +2323,8 @@ mod tests {
     /// so the bound revision has exactly one possible answer: the work commit.
     #[test]
     fn derive_head_sha_falls_through_to_a_body_cited_work_commit() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let dir = std::env::temp_dir().join(format!("sha-body-fallthrough-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".beads")).unwrap();
@@ -2300,6 +2364,8 @@ mod tests {
     /// commit that carries REAL work.
     #[test]
     fn derive_head_sha_ignores_bookkeeping_only_commits() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let (dir, bead_id) = scratch_workspace("sha-bookkeeping");
         let work = derive_head_sha(&dir, &bead_id).unwrap();
         std::fs::write(
@@ -2323,6 +2389,8 @@ mod tests {
     /// Orchestrator bookkeeping (`.flywheel/`) is the same class.
     #[test]
     fn derive_head_sha_ignores_flywheel_bookkeeping() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let (dir, bead_id) = scratch_workspace("sha-fw-bookkeeping");
         let work = derive_head_sha(&dir, &bead_id).unwrap();
         std::fs::create_dir_all(dir.join(".flywheel/receipts")).unwrap();
@@ -2340,6 +2408,8 @@ mod tests {
     /// id and changes source IS the bound revision.
     #[test]
     fn derive_head_sha_still_binds_a_later_work_commit() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let (dir, bead_id) = scratch_workspace("sha-work-wins");
         let first = derive_head_sha(&dir, &bead_id).unwrap();
         std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -2359,6 +2429,8 @@ mod tests {
     /// `.beads/` dirt is allowed, but it does not define the commit).
     #[test]
     fn derive_head_sha_binds_a_mixed_commit() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let (dir, bead_id) = scratch_workspace("sha-mixed");
         let first = derive_head_sha(&dir, &bead_id).unwrap();
         std::fs::write(dir.join("src-fix.txt"), "fix\n").unwrap();
@@ -2375,6 +2447,8 @@ mod tests {
     /// "no commit carries the id" would be a lie that reopens a real close.
     #[test]
     fn derive_head_sha_falls_back_to_the_newest_when_all_are_bookkeeping() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let dir = std::env::temp_dir().join(format!("sha-all-bk-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".beads")).unwrap();
@@ -2400,6 +2474,8 @@ mod tests {
     /// sha resolves to the bead's OWN commit, never bare HEAD.
     #[test]
     fn derive_head_sha_resolves_own_commit_when_head_moved() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let (dir, bead_id) = scratch_workspace("sha-head-moved");
         let own = derive_head_sha(&dir, &bead_id).unwrap();
         std::fs::write(dir.join("sibling.txt"), "sibling\n").unwrap();
@@ -2447,6 +2523,8 @@ mod tests {
     /// never trips itself).
     #[test]
     fn sha_rule_never_falls_back_to_bare_head() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let needle = format!("rev-{}", "parse");
         for f in ["src/verdict.rs", "src/durable.rs"] {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(f);
@@ -2504,6 +2582,8 @@ mod tests {
     /// arming it here would race lane A's roundtrip test in parallel runs.
     #[test]
     fn close_check_legal_when_gate_row_binds_sha() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let (dir, bead_id) = scratch_workspace("reopen-legal");
         let sha = derive_head_sha(&dir, &bead_id).unwrap();
         let bead = bead_from_br_show(&dir, &bead_id).unwrap();
@@ -2555,6 +2635,8 @@ mod tests {
     /// verdicts.
     #[test]
     fn close_check_no_commit_is_no_commit() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let (dir, bead_id) = scratch_workspace("reopen-nocommit");
         let sha = derive_head_sha(&dir, &bead_id).unwrap();
         crate::br::run_br(
@@ -2587,6 +2669,8 @@ mod tests {
     /// grants the two-tick receipt grace instead of an instant reopen.
     #[test]
     fn close_check_grants_receipt_grace_when_worker_receipt_is_legal() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let (dir, _bead1) = scratch_workspace("reopen-grace");
         let bead_id = crate::br::Bead::create(
             Some(&dir),
@@ -2665,6 +2749,8 @@ mod principles_receipt_tests {
     /// `name — decision` citations passes clean, zero lint warnings.
     #[test]
     fn principles_receipt_valid_close_reason_is_clean() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let reason = "VERIFY: cargo test --offline stage_param -> 5 passed. \
 PRINCIPLES: build-the-lever — one substitution engine serves every future \
 stage/workflow/repo; encode-lessons-in-structure — the contract becomes data.";
@@ -2682,6 +2768,8 @@ stage/workflow/repo; encode-lessons-in-structure — the contract becomes data."
     /// registry is flagged (warning names the bad name).
     #[test]
     fn principles_receipt_unknown_name_flagged() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let reason = "VERIFY: cargo test ok\nPRINCIPLES: prove-it-work — the close gate";
         let c = check_close_reason(reason);
         assert!(c.verify_tail_present);
@@ -2699,6 +2787,8 @@ stage/workflow/repo; encode-lessons-in-structure — the contract becomes data."
     /// a cargo-cult decoration — lint WARNING, not a hard failure.
     #[test]
     fn principles_receipt_decoration_is_lint_not_hard_fail() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let reason = "VERIFY: make check\nwe honored prove-it-works and minimize-reader-load here";
         let c = check_close_reason(reason);
         assert!(c.verify_tail_present);
@@ -2716,6 +2806,8 @@ stage/workflow/repo; encode-lessons-in-structure — the contract becomes data."
     /// Missing VERIFY tail is detected by the reusable shared check.
     #[test]
     fn principles_receipt_missing_verify_tail_detected() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let c = check_close_reason("closed, all good");
         assert!(!c.verify_tail_present);
     }
@@ -2723,6 +2815,8 @@ stage/workflow/repo; encode-lessons-in-structure — the contract becomes data."
     /// A legal close reason passes the hard gate.
     #[test]
     fn verify_close_reason_accepts_tail_and_citation() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let reason = "VERIFY: cargo test --offline wave_swarm -> 12 passed\n\
 PRINCIPLES: prove-it-works — ran the fixture suite before plumbing";
         verify_close_reason(reason).expect("legal close reason");
@@ -2733,6 +2827,8 @@ PRINCIPLES: prove-it-works — ran the fixture suite before plumbing";
     /// em-dash (a cargo-cult name with nothing after the dash).
     #[test]
     fn verify_close_reason_rejections() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
         let rows = [
             (
                 "missing-verify-tail",
