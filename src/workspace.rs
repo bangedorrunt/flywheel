@@ -1824,6 +1824,12 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 },
             );
             next.doorbell = dm;
+            // The plane status IS a presence fact: seed the prompt gate from
+            // it (done/idle -> Idle, working/blocked -> Busy, anything else
+            // -> Unknown). Without this a rex host saw every wake as
+            // "non-injectable presence" and filtered every prompt to Audit.
+            next.presence
+                .insert(pin.clone(), Presence::from_str(status));
             cmds.extend(filter_prompts(&next, c));
         }
         Msg::Fact { summary } => {

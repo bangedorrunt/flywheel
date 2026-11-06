@@ -44,6 +44,10 @@ pub struct RtHost {
     /// the next sweep re-arms (hc/tuios: stream death must not leave a
     /// pane stuck "covered" forever).
     covered_panes: Arc<Mutex<HashSet<String>>>,
+    /// One rex presence poller per host (wave17-b): the boot seed is applied
+    /// directly, and ongoing status changes ride a dedicated poll thread so
+    /// no blocking plane call ever runs inside the brain's async tick.
+    presence_armed: Arc<std::sync::atomic::AtomicBool>,
     /// Shared with the delivery path. bd-kz54 follow-up: `WatchRetry::reset()`
     /// had exactly one caller in the whole tree — its own unit test — so four
     /// failures anywhere in a host's life latched the 16s gate permanently and
@@ -197,6 +201,7 @@ impl RtHost {
             exe_path,
             brain_tx,
             covered_panes: Arc::new(Mutex::new(HashSet::new())),
+            presence_armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             retry: std::sync::Arc::new(std::sync::Mutex::new(doorbell_rt::WatchRetry::default())),
             authority: crate::authority::RuntimeAuthority::resolve(),
             index_refreshed_at: now,
@@ -264,7 +269,6 @@ impl RtHost {
     /// Pane ids the registry cannot map to a pin are audited loudly once —
     /// a covered pane is never silently skipped.
     fn cover_rex_panes(&mut self) {
-        use toron_plane::backend::{BackendEvent, Subscription};
         let registry = state::load_spawn_registry(&self.project);
         let covered = self.covered_panes.lock().unwrap_or_else(|e| e.into_inner());
         let pane_ids: Vec<(String, String)> = registry
@@ -277,8 +281,13 @@ impl RtHost {
         if pane_ids.is_empty() {
             return;
         }
+        if self
+            .presence_armed
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
         let pin_by_pane: HashMap<String, String> = pane_ids.iter().cloned().collect();
-        let tx = self.brain_tx.clone();
         // Seed: one bounded agent_list before the loop, so idle panes are
         // injectable without waiting for a status change.
         let backend = match crate::backend::factory::multiplexer_backend(&self.cfg) {
@@ -288,13 +297,36 @@ impl RtHost {
                 return;
             }
         };
+        // Seed: apply the statuses to the model DIRECTLY. They must not ride
+        // the brain channel: it is drained only after `drive`, and a seed
+        // routed through it was observed lost before the first tick (live:
+        // no PlaneStatus row ever reached the fold, so every wake queued
+        // forever). Direct application is deterministic.
         match backend.agent_list() {
             Ok(agents) => {
                 let (updates, unmapped) = Self::presence_updates_for(&agents, &pin_by_pane);
-                for msg in updates {
-                    if tx.blocking_send(msg).is_err() {
-                        return;
+                let live_pins: HashSet<String> = agents
+                    .iter()
+                    .filter_map(|a| pin_by_pane.get(&a.pane_id).cloned())
+                    .collect();
+                let mut applied = 0usize;
+                for update in updates {
+                    if let BrainMsg::PlaneStatus { pin, status } = update
+                        && live_pins.contains(&pin)
+                    {
+                        let (next, _) = workspace::tick(
+                            &self.model,
+                            &workspace::Msg::PlaneStatus { pin, status },
+                        );
+                        self.model = next;
+                        applied += 1;
                     }
+                }
+                if applied > 0 {
+                    eprintln!(
+                        "flywheel doorbell: {} seeded {applied} plane status(es)",
+                        self.workspace
+                    );
                 }
                 Self::audit_unmapped_panes(&self.workspace, &unmapped);
             }
@@ -302,71 +334,28 @@ impl RtHost {
                 eprintln!("flywheel doorbell: rex agent_list failed ({e:#}) — no seed statuses");
             }
         }
-        // Stream: one `rex events` scoped to the covered panes.
-        let filters: Vec<Subscription> = pin_by_pane
-            .keys()
-            .map(|p| Subscription::agent_status_changed(p.clone()))
-            .collect();
-        let mut stream = match backend.subscribe(&filters) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("flywheel doorbell: rex subscribe failed ({e:#}) — seeded only");
-                return;
-            }
-        };
-        {
-            let mut covered = self.covered_panes.lock().unwrap_or_else(|e| e.into_inner());
-            covered.extend(pin_by_pane.keys().cloned());
-        }
-        let covered_shared = Arc::clone(&self.covered_panes);
-        let clear_ids: Vec<String> = pin_by_pane.keys().cloned().collect();
-        let workspace = self.workspace.clone();
+        // Ongoing: one bounded poll thread, NOT a blocking plane call inside
+        // the async tick. `rex events` subscribe rejects the whole stream on
+        // one dead pane id, and calling the plane from the sweep path stalled
+        // the brain; a 3s agent_list poll is bounded, cheap, and reconnects
+        // by construction.
+        self.presence_armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let tx = self.brain_tx.clone();
         let cfg = self.cfg.clone();
         std::thread::spawn(move || {
-            let mut audited = std::collections::HashSet::new();
             loop {
-                match stream.read_event() {
-                    Ok(Some(BackendEvent::AgentStatusChanged { pane, status, .. }))
-                    | Ok(Some(BackendEvent::AgentDetected { pane, status, .. })) => {
-                        let pane_id = pane.as_str();
-                        match pin_by_pane.get(pane_id) {
-                            Some(pin) => {
-                                let msg = BrainMsg::PlaneStatus {
-                                    pin: pin.clone(),
-                                    status: status.as_str().to_string(),
-                                };
-                                if tx.blocking_send(msg).is_err() {
-                                    break;
-                                }
-                            }
-                            None if audited.insert(pane_id.to_string()) => {
-                                Self::audit_unmapped_panes(&workspace, &[pane_id.to_string()]);
-                            }
-                            None => {}
-                        }
-                    }
-                    Ok(Some(BackendEvent::EventsLost)) => {
-                        eprintln!(
-                            "flywheel doorbell: rex events_lost — reconciling via agent_list"
-                        );
-                        let Ok(backend) = crate::backend::factory::multiplexer_backend(&cfg) else {
-                            break;
-                        };
-                        let Ok(agents) = backend.agent_list() else {
-                            break;
-                        };
-                        let (updates, unmapped) = Self::presence_updates_for(&agents, &pin_by_pane);
-                        for msg in updates {
-                            if tx.blocking_send(msg).is_err() {
-                                break;
-                            }
-                        }
-                        Self::audit_unmapped_panes(&workspace, &unmapped);
-                    }
-                    Ok(Some(BackendEvent::PaneExited { .. })) | Ok(Some(BackendEvent::Raw(_))) => {}
-                    Ok(None) | Err(_) => {
-                        clear_covered(&covered_shared, &clear_ids);
-                        break;
+                std::thread::sleep(Duration::from_secs(3));
+                let Ok(backend) = crate::backend::factory::multiplexer_backend(&cfg) else {
+                    continue;
+                };
+                let Ok(agents) = backend.agent_list() else {
+                    continue;
+                };
+                let (updates, _) = RtHost::presence_updates_for(&agents, &pin_by_pane);
+                for msg in updates {
+                    if tx.blocking_send(msg).is_err() {
+                        return;
                     }
                 }
             }
@@ -1037,9 +1026,17 @@ async fn run_embedded_async(
     host.set_generation(generation.clone());
     let mut sinks = SinkManager::new(tx.clone());
     let mut _inbox_guard: Option<crate::inbox_host::InboxHost> = None;
-    sinks.add_sink_with_factory("hc", Box::new(doorbell_rt::NoTextSink::new()), || {
-        Box::new(doorbell_rt::NoTextSink::new())
-    });
+    // The embedded host exists to TYPE. NoTextSink was the honest answer
+    // while the plane could not inject; on rex it silently dropped every
+    // wake (`injects=0 sheds=N`). The sink now types through the one
+    // selected plane, resolving pin -> pane through the spawn registry.
+    let sink_cfg = cfg.clone();
+    let sink_project = project.to_string();
+    sinks.add_sink_with_factory(
+        "hc",
+        Box::new(PlanePromptSink::new(cfg.clone(), project)),
+        move || Box::new(PlanePromptSink::new(sink_cfg.clone(), &sink_project)),
+    );
     if crate::comms_send::enabled(&cfg) {
         _inbox_guard = Some(crate::inbox_host::InboxHost::spawn(
             crate::inbox_ports::FlywheelPorts::new(&cfg, project, workspace),
@@ -1846,14 +1843,19 @@ mod inbox_flag_tests {
         );
     }
 
+    /// The embedded host must TYPE (wave17-b): a no-text sink silently shed
+    /// every wake (`injects=0 sheds=N`) while the pane was woken by nothing.
+    /// The registered sink resolves pin -> pane and prompts the one plane.
     #[test]
-    fn the_flag_arm_registers_no_text_sink_and_starts_the_inbox_host() {
+    fn the_embedded_host_registers_the_plane_typer_and_starts_the_inbox_host() {
         let src = include_str!("doorbell_host.rs");
         let a = src.find("fn run_embedded_async(").unwrap();
         let tail = &src[a..a + 2500];
-        assert!(tail.contains("doorbell_rt::NoTextSink::new()"));
+        assert!(
+            tail.contains("PlanePromptSink::new("),
+            "the embedded host must register the plane typer, not a no-text sink"
+        );
         assert!(tail.contains("InboxHost::spawn("));
-        assert!(!tail.contains("PlanePromptSink"), "flag-off typer is gone");
     }
 }
 
@@ -1990,6 +1992,47 @@ impl ServiceTag for PromptEdgeTag {
 /// Shadow-first production: record beside the live Effect::Prompt path.
 /// Cut over only when shadow enqueue set == live deliver set over the replay
 /// corpus. Never duplicates delivery: the live path still owns the Brain.
+/// The embedded host's terminal writer: types through the ONE selected plane
+/// (rex today), resolving the pin to its pane through the spawn registry.
+/// A pin with no pane is `UndeliveredPin` (loud shed), never a silent drop.
+pub struct PlanePromptSink {
+    cfg: Config,
+    project: String,
+}
+
+impl PlanePromptSink {
+    pub fn new(cfg: Config, project: &str) -> Self {
+        Self {
+            cfg,
+            project: project.to_string(),
+        }
+    }
+}
+
+impl doorbell_rt::PromptSink for PlanePromptSink {
+    fn send(&mut self, pin: &str, line: &str) -> Result<(), doorbell_rt::RtError> {
+        let registry = state::load_spawn_registry(&self.project);
+        let Some(pane) = registry
+            .iter()
+            .find(|e| e.mail_identity.as_deref() == Some(pin))
+            .map(|e| e.pane_id.clone())
+            .filter(|p| !p.is_empty())
+        else {
+            return Err(doorbell_rt::RtError::UndeliveredPin(pin.to_string()));
+        };
+        let backend = crate::backend::factory::multiplexer_backend(&self.cfg)
+            .map_err(|e| doorbell_rt::RtError::PromptFailed(format!("plane: {e}")))?;
+        backend
+            .prompt(&pane, line, None)
+            .map(|_| ())
+            .map_err(|e| doorbell_rt::RtError::PromptFailed(format!("{e}")))
+    }
+
+    fn name(&self) -> &str {
+        "plane"
+    }
+}
+
 pub struct ShadowPromptEdge;
 
 impl PromptEdge for ShadowPromptEdge {

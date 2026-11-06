@@ -760,16 +760,32 @@ impl<H: Host> Brain<H> {
     }
 
     async fn on_inbox_fetched(&mut self, pin: String, rows: Vec<serde_json::Value>) {
-        let refs: Vec<&serde_json::Value> = rows.iter().collect();
-        if let Some(hw) = doorbell_core::inbox_high_water_from_values(refs) {
-            self.wake.since_by_pin.insert(pin.clone(), hw);
-            self.flush_wake("inbox-cursor");
-        }
         let fetched = !rows.is_empty();
+        let refs: Vec<&serde_json::Value> = rows.iter().collect();
+        let hw = doorbell_core::inbox_high_water_from_values(refs.clone());
+        // A wake row must not be consumed while it cannot be routed: the
+        // queued line lives only in the fold's model, and a host restart
+        // would lose it after the cursor moved past it. Advance the cursor
+        // only when the fetch carried no wake rows, or when the fold
+        // actually decided (Prompt/Digest). A stuck pin re-fetches until it
+        // becomes injectable — bounded, and no mail is eaten silently.
+        let wake_rows = refs
+            .iter()
+            .filter(|r| doorbell_core::parse_inbox_item(r).is_some())
+            .count();
         let effects = self.host.tick(&BrainMsg::InboxFetched {
             pin: pin.clone(),
             rows,
         });
+        let decided = effects
+            .iter()
+            .any(|e| matches!(e, Effect::Prompt { .. } | Effect::Digest { .. }));
+        if let Some(hw) = hw
+            && (wake_rows == 0 || decided)
+        {
+            self.wake.since_by_pin.insert(pin.clone(), hw);
+            self.flush_wake("inbox-cursor");
+        }
         if fetched || is_decision(&effects) {
             self.journal(
                 &serde_json::json!({"rt_kind": "InboxFetched", "pin": pin}),
@@ -2555,8 +2571,10 @@ mod tests {
         brain.host.pin_list = vec!["p".into()];
         brain.host.inbox.insert(
             ("p".into(), floor.clone()),
+            // A non-wake row: nothing to route, so the cursor is free to
+            // advance past it (wave17-b keeps only undecided WAKES).
             vec![serde_json::json!({
-                "importance": "urgent",
+                "importance": "normal",
                 "created_ts_us": row_us,
                 "body_md": "hi",
             })],
@@ -2572,6 +2590,33 @@ mod tests {
             doorbell_core::parse_rfc3339_micros(hw).expect("cursor parses"),
             row_us,
             "high-water follows the row's rumor time, not wall-clock now"
+        );
+    }
+
+    /// wave17-b: a wake row that produced NO decision must NOT advance the
+    /// cursor. The queued line lives only in the fold's model; a host restart
+    /// used to lose it after the cursor had moved past it (live: every
+    /// done-mail eaten, `rings=0`).
+    #[tokio::test]
+    async fn undecided_wake_row_does_not_advance_the_cursor() {
+        let now = 1_700_000_000u64;
+        let floor = doorbell_core::redelivery_floor_rfc3339(now);
+        let row_us = now as i64 * 1_000_000;
+        let (mut brain, _rx, _tx) = test_brain("keep", vec![vec![Effect::FetchInbox], vec![]]);
+        brain.host.now = now;
+        brain.host.pin_list = vec!["p".into()];
+        brain.host.inbox.insert(
+            ("p".into(), floor.clone()),
+            vec![serde_json::json!({
+                "importance": "urgent",
+                "created_ts_us": row_us,
+                "body_md": "hi",
+            })],
+        );
+        brain.dispatch(BrainMsg::Sweep { now }).await;
+        assert!(
+            !brain.wake.since_by_pin.contains_key("p"),
+            "an undecided wake must stay behind the cursor (no silent eat)"
         );
     }
 

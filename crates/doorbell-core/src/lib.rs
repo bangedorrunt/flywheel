@@ -979,6 +979,47 @@ mod tests {
         assert_eq!(m1.queues.len(), m2.queues.len());
     }
 
+    /// The real `toron mail inbox --json` row shape (not the fixture's
+    /// reduced `{"importance":"urgent"}`): a high-importance tasked row
+    /// must still ring an idle/done pin. bd-wave17 live probe.
+    #[test]
+    fn doorbell_tick_real_inbox_row_rings_done_pin() {
+        let mut model = model_with("SwiftBay");
+        model.statuses.insert("SwiftBay".into(), "done".into());
+        let row = serde_json::json!({
+            "ack_required": false,
+            "audience": null,
+            "body": "wake test",
+            "body_md": "wake test",
+            "corr": null,
+            "created_ts_us": 1_793_982_765_215_302_i64,
+            "duplicate_of": null,
+            "id": "936914ddb50aed6c0bf5da95afc4f8b73f61aaf2c88b61c05a9ccab29aa456b0",
+            "importance": "high",
+            "priority": null,
+            "read_ts_us": null,
+            "result_path": null,
+            "sender": "AmberHarbor",
+            "subject": "[wake-test] live",
+            "thread_id": null,
+            "verdict": null,
+            "wake": "tasked"
+        });
+        let (_, actions) = tick(
+            &model,
+            &DoorbellMsg::InboxRows {
+                rows: vec![row],
+                pin: "SwiftBay".into(),
+            },
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { .. })),
+            "a real high-importance inbox row must ring a done pin, got {actions:?}"
+        );
+    }
+
     #[test]
     fn doorbell_tick_watch_died_produces_restart() {
         let model = DoorbellModel::default();
