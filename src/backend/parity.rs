@@ -27,7 +27,7 @@ mod tests {
     use crate::backend::{BackendError, InboxQuery, MailSurface, MultiplexerBackend, run_mail};
 
     fn map_prompt_result(
-        r: std::result::Result<toron_core::backend::AgentInfo, toron_core::backend::BackendError>,
+        r: std::result::Result<toron_plane::backend::AgentInfo, toron_plane::backend::BackendError>,
     ) -> crate::backend::PromptLanding {
         match r {
             Ok(info) => crate::backend::PromptLanding {
@@ -117,7 +117,7 @@ mod tests {
     /// contract under test (no socket needed).
     #[test]
     fn prompt_landing_maps_landed_status_and_coded_error() {
-        use toron_core::backend::{AgentInfo, AgentStatus};
+        use toron_plane::backend::{AgentInfo, AgentStatus};
         let ok = map_prompt_result(Ok(AgentInfo {
             agent: Some("pi".into()),
             agent_status: AgentStatus::Working,
@@ -140,8 +140,8 @@ mod tests {
         }));
         assert_eq!(ok.status, Some(AgentStatus::Working));
         assert_eq!(ok.code, None);
-        let err = map_prompt_result(Err(toron_core::backend::BackendError::new(
-            toron_core::backend::error::BackendErrorCode::AgentPromptStalled,
+        let err = map_prompt_result(Err(toron_plane::backend::BackendError::new(
+            toron_plane::backend::error::BackendErrorCode::AgentPromptStalled,
             "x",
         )));
         assert_eq!(err.status, None);

@@ -1074,6 +1074,7 @@ dependencies = [
  "tokio-stream",
  "toml",
  "toron-core",
+ "toron-plane",
  "toron-workflow",
  "ureq",
  "uuid",
@@ -3379,6 +3380,18 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "toron-plane"
+version = "1.6.1"
+dependencies = [
+ "anyhow",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "toron-core",
+ "tracing",
 ]
 
 [[package]]

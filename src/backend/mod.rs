@@ -6,9 +6,9 @@
 //! governed-by: ADR-0002, ADR-0005, ADR-0007
 //!
 //! ADR-0005 P1 (bd-p1-unify-y9j): the multiplexer trait surface is UNIFIED in
-//! toron-core (`toron_core::backend::Backend`). flywheel no longer defines a
+//! toron-core (`toron_plane::backend::Backend`). flywheel no longer defines a
 //! local `MultiplexerBackend` trait — it re-exports the unified one:
-//! `pub use toron_core::backend::Backend as MultiplexerBackend;`. Call sites
+//! `pub use toron_plane::backend::Backend as MultiplexerBackend;`. Call sites
 //! keep the name; the trait is sync, `&self`, object-safe, Unsupported-open.
 //! The hc client lives in toron-core (`backend::hc`).
 //!
@@ -37,12 +37,12 @@ pub mod wire;
 /// The unified multiplexer backend trait (ADR-0005 P1): sync, `&self`,
 /// object-safe, Unsupported-open. The ONE trait source lives in toron-core;
 /// this re-export keeps flywheel call sites on the historical name.
-pub use toron_core::backend::Backend as MultiplexerBackend;
+pub use toron_plane::backend::Backend as MultiplexerBackend;
 /// Coded `agent.prompt` landing data (unified in toron-core). Reached only
 /// from the `__send` parity mapper (`parity` prompt-landing mapper), which is
 /// itself test-only here, so the name ships with that caller.
 #[cfg(test)]
-pub use toron_core::backend::PromptLanding;
+pub use toron_plane::backend::PromptLanding;
 
 #[allow(unused_imports)]
 pub use toron_core::index::slots::{BuildSlot, GrantedSlot, SlotConflict};
@@ -176,10 +176,10 @@ impl From<crate::hc::PlaneError> for BackendError {
     }
 }
 
-impl From<toron_core::backend::BackendError> for BackendError {
+impl From<toron_plane::backend::BackendError> for BackendError {
     /// The toron-core hc client's typed error (ADR-0003 Decision 3A,
     /// bd-o8j.2): classification on `code`, message in the `Other` context.
-    fn from(e: toron_core::backend::BackendError) -> Self {
+    fn from(e: toron_plane::backend::BackendError) -> Self {
         Self::Other(anyhow::anyhow!(
             "hc error {}: {}",
             e.code().as_str(),

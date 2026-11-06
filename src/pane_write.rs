@@ -529,8 +529,8 @@ mod tests {
             &self,
             target: &str,
             text: &str,
-            _wait: Option<&toron_core::backend::WaitOptions>,
-        ) -> Result<serde_json::Value, toron_core::backend::BackendError> {
+            _wait: Option<&toron_plane::backend::WaitOptions>,
+        ) -> Result<serde_json::Value, toron_plane::backend::BackendError> {
             self.0
                 .lock()
                 .unwrap()
@@ -542,7 +542,7 @@ mod tests {
             &self,
             target: &str,
             keys: &[&str],
-        ) -> Result<(), toron_core::backend::BackendError> {
+        ) -> Result<(), toron_plane::backend::BackendError> {
             self.0
                 .lock()
                 .unwrap()
@@ -550,7 +550,7 @@ mod tests {
             Ok(())
         }
 
-        fn pane_close(&self, pane_id: &str) -> Result<(), toron_core::backend::BackendError> {
+        fn pane_close(&self, pane_id: &str) -> Result<(), toron_plane::backend::BackendError> {
             self.0.lock().unwrap().push(format!("close {pane_id}"));
             Ok(())
         }

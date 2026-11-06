@@ -42,6 +42,7 @@ ureq = { version = "2", features = ["json"] }
 # se2.3: deps re-pointed from the stale toron-head snapshot to the live
 # workspace — the MailSurface extension (R1 + se2.3) lives on main.
 toron-core = { path = "../toron/crates/toron-core" }
+toron-plane = { path = "../toron/crates/toron-plane" }
 # The unified durable workflow engine (ADR-0005 Spec 2, P3.1): flywheel routes
 # ALL workflow execution through toron-workflow's WorkflowEngine. This is the
 # cargo edge the tier diagram always implied but no Cargo.toml wired.

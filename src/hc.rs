@@ -1,5 +1,5 @@
 //! Flywheel hc helpers (ex-`hc` shim). ClientExt is gone: `Client` is a
-//! newtype over `toron_core::backend::hc::Client` with inherent adapters for
+//! newtype over `toron_plane::backend::hc::Client` with inherent adapters for
 //! legacy call shapes, plus event-payload decoding and pane helpers.
 //!
 //! `set_read_timeout`: the toron-core `EventStream` exposes no socket handle,
@@ -16,12 +16,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use toron_core::backend::EventStream as _;
-pub use toron_core::backend::error::{BackendError, BackendErrorCode};
-use toron_core::backend::hc::Client as HcClient;
+use toron_plane::backend::EventStream as _;
+pub use toron_plane::backend::error::{BackendError, BackendErrorCode};
+use toron_plane::backend::hc::Client as HcClient;
 /// Was HDR_PROTOCOL on hc; hc advertises generation via HC_GENERATION.
-pub use toron_core::backend::hc::HC_GENERATION as HDR_PROTOCOL;
-pub use toron_core::backend::types::{
+pub use toron_plane::backend::hc::HC_GENERATION as HDR_PROTOCOL;
+pub use toron_plane::backend::types::{
     AgentInfo, AgentSessionInfo, AgentSessionRefKind, AgentStatus, PaneInfo, SendVerdict,
     Subscription, WaitOptions, WorkspaceInfo, classify_send_result,
 };
@@ -520,7 +520,7 @@ impl std::error::Error for PlaneError {}
 
 /// Map a toron-core `BackendError` onto the flywheel-local typed error.
 /// Classification stays on the machine code (`BackendErrorCode::as_str`).
-fn to_plane_error(e: toron_core::backend::error::BackendError) -> PlaneError {
+fn to_plane_error(e: toron_plane::backend::error::BackendError) -> PlaneError {
     PlaneError {
         code: e.code().as_str().to_string(),
         message: e.message.clone(),
@@ -565,7 +565,7 @@ pub fn wait_for_output_params(
     let mut params = serde_json::Map::new();
     params.insert(
         "terminal".into(),
-        Value::String(toron_core::backend::hc::strip_id_prefix(pane_id).to_string()),
+        Value::String(toron_plane::backend::hc::strip_id_prefix(pane_id).to_string()),
     );
     params.insert("output".into(), Value::String(pattern.to_string()));
     if let Some(ms) = timeout_ms {
@@ -593,7 +593,7 @@ pub fn parse_wait_for_output_result(
     let pane_id = res
         .get("terminal")
         .and_then(Value::as_str)
-        .map(toron_core::backend::hc::prefix_id)
+        .map(toron_plane::backend::hc::prefix_id)
         .ok_or_else(|| parse_err(format!("terminal.wait result missing terminal: {res}")))?;
     match reason {
         "output" => Ok(PaneWaitResult {
@@ -635,7 +635,7 @@ pub fn pane_split(
     let mut params = serde_json::Map::new();
     params.insert(
         "parent".into(),
-        serde_json::json!(toron_core::backend::hc::strip_id_prefix(pane_id)),
+        serde_json::json!(toron_plane::backend::hc::strip_id_prefix(pane_id)),
     );
     if let Some(cwd) = cwd {
         params.insert("cwd".into(), serde_json::json!(cwd));
@@ -647,10 +647,10 @@ pub fn pane_split(
         params.insert("env".into(), serde_json::json!(env));
     }
     params.insert("outlive_parent".into(), serde_json::json!(true));
-    let res: toron_core::backend::hc::Terminal =
+    let res: toron_plane::backend::hc::Terminal =
         serde_json::from_value(c.call("terminal.run", serde_json::Value::Object(params))?)
             .context("parse terminal.run result")?;
-    let want = toron_core::backend::hc::prefix_id(&res.address);
+    let want = toron_plane::backend::hc::prefix_id(&res.address);
     c.pane_list()
         .map_err(|e| anyhow!("{e}"))?
         .into_iter()
@@ -674,7 +674,7 @@ pub fn pane_wait_output(
     let seen = pane_recent_text(c, pane_id).unwrap_or_default();
     if seen.contains(pattern) {
         return Ok(PaneWaitResult {
-            pane_id: toron_core::backend::hc::prefix_id(pane_id),
+            pane_id: toron_plane::backend::hc::prefix_id(pane_id),
             matched_line: None,
             read: seen,
         });
@@ -812,7 +812,7 @@ pub struct PaneProcessInfo {
 pub fn pane_process_info(c: &Client, pane_id: &str) -> Result<PaneProcessInfo> {
     let res = c.call(
         "terminal.get",
-        json!({ "terminal": toron_core::backend::hc::strip_id_prefix(pane_id) }),
+        json!({ "terminal": toron_plane::backend::hc::strip_id_prefix(pane_id) }),
     )?;
     let shell_pid = res.get("pid").and_then(Value::as_u64);
     let (foreground_process_group_id, foreground_processes) = match res.get("foreground") {
@@ -836,7 +836,7 @@ pub fn pane_process_info(c: &Client, pane_id: &str) -> Result<PaneProcessInfo> {
         _ => (None, Vec::new()),
     };
     Ok(PaneProcessInfo {
-        pane_id: toron_core::backend::hc::prefix_id(toron_core::backend::hc::strip_id_prefix(
+        pane_id: toron_plane::backend::hc::prefix_id(toron_plane::backend::hc::strip_id_prefix(
             pane_id,
         )),
         foreground_process_group_id,
@@ -1058,7 +1058,7 @@ pub fn subscribe(c: &Client, subscriptions: &[Subscription]) -> Result<EventStre
         .map_err(|e| anyhow!("hc subscribe_terminals failed: {e}"))?;
     let allowed: std::collections::HashSet<String> = subscriptions
         .iter()
-        .map(|s| toron_core::backend::hc::strip_id_prefix(&s.pane_id).to_string())
+        .map(|s| toron_plane::backend::hc::strip_id_prefix(&s.pane_id).to_string())
         .filter(|s| !s.is_empty())
         .collect();
     let (tx, rx) = std::sync::mpsc::channel::<StreamItem>();
@@ -1069,13 +1069,13 @@ pub fn subscribe(c: &Client, subscriptions: &[Subscription]) -> Result<EventStre
 }
 
 fn push_from_backend(
-    ev: toron_core::backend::types::BackendEvent,
+    ev: toron_plane::backend::types::BackendEvent,
     allowed: &std::collections::HashSet<String>,
 ) -> Option<PushEvent> {
-    use toron_core::backend::types::BackendEvent;
-    let pane_in_scope = |pane: &toron_core::backend::types::PaneId| {
+    use toron_plane::backend::types::BackendEvent;
+    let pane_in_scope = |pane: &toron_plane::backend::types::PaneId| {
         allowed.is_empty()
-            || allowed.contains(toron_core::backend::hc::strip_id_prefix(pane.as_str()))
+            || allowed.contains(toron_plane::backend::hc::strip_id_prefix(pane.as_str()))
     };
     match ev {
         BackendEvent::AgentStatusChanged {
@@ -1123,9 +1123,9 @@ fn pump_backend_events<R>(
     tx: &std::sync::mpsc::Sender<StreamItem>,
     allowed: &std::collections::HashSet<String>,
 ) where
-    R: FnMut() -> Result<Option<toron_core::backend::types::BackendEvent>, BackendError>,
+    R: FnMut() -> Result<Option<toron_plane::backend::types::BackendEvent>, BackendError>,
 {
-    use toron_core::backend::types::BackendEvent;
+    use toron_plane::backend::types::BackendEvent;
     loop {
         match read() {
             Ok(Some(BackendEvent::EventsLost)) => {
@@ -1206,7 +1206,7 @@ impl EventStream {
 #[cfg(test)]
 mod events_lost_tests {
     use super::*;
-    use toron_core::backend::types::{BackendEvent, PaneId};
+    use toron_plane::backend::types::{BackendEvent, PaneId};
 
     /// bd-v9k6 on the LIVE loop: a gap is a NOTICE, not a death — delivered
     /// in band, and the loop keeps reading past it (same contract the dead
@@ -2444,7 +2444,7 @@ impl AltScreenReadOps for BackendAltScreenRead<'_> {
 #[cfg(test)]
 mod alt_screen_read_ladder_tests {
     use super::*;
-    use toron_core::backend::error::{BackendError, BackendErrorCode};
+    use toron_plane::backend::error::{BackendError, BackendErrorCode};
 
     struct MockOps {
         reads: Vec<(String, Result<String, BackendError>)>,
@@ -2977,7 +2977,7 @@ mod shell_prompt_tests {
 #[cfg(test)]
 mod gs049_launch_pending_tests {
     use super::*;
-    use toron_core::backend::types::AgentStatus;
+    use toron_plane::backend::types::AgentStatus;
 
     fn agent(pending: bool, ready: bool, status: AgentStatus) -> AgentInfo {
         AgentInfo {
@@ -3280,10 +3280,10 @@ fn unsupported_on_hc(method: &str) -> BackendError {
 /// again (hc has no workspaces — the shell terminal IS the workspace).
 const WORKSPACE_LABEL_KEY: &str = "flywheel_workspace";
 
-fn workspace_info_for(term: &toron_core::backend::hc::Terminal) -> Option<WorkspaceInfo> {
+fn workspace_info_for(term: &toron_plane::backend::hc::Terminal) -> Option<WorkspaceInfo> {
     let label = term.labels.get(WORKSPACE_LABEL_KEY)?.clone();
     Some(WorkspaceInfo {
-        workspace_id: toron_core::backend::hc::prefix_id(&term.address),
+        workspace_id: toron_plane::backend::hc::prefix_id(&term.address),
         number: 0,
         label,
         focused: false,
@@ -3327,7 +3327,7 @@ impl Client {
             params.insert("labels".into(), json!({ WORKSPACE_LABEL_KEY: label }));
         }
         params.insert("no_parent".into(), serde_json::json!(true));
-        let res: toron_core::backend::hc::Terminal = serde_json::from_value(
+        let res: toron_plane::backend::hc::Terminal = serde_json::from_value(
             self.call("terminal.run", Value::Object(params))
                 .map_err(|e| {
                     BackendError::new(
@@ -3338,12 +3338,12 @@ impl Client {
         )
         .map_err(|e| {
             BackendError::new(
-                toron_core::backend::error::BackendErrorCode::Malformed,
+                toron_plane::backend::error::BackendErrorCode::Malformed,
                 format!("parse terminal.run result: {e}"),
             )
         })?;
         let ws = workspace_info_for(&res).unwrap_or(WorkspaceInfo {
-            workspace_id: toron_core::backend::hc::prefix_id(&res.address),
+            workspace_id: toron_plane::backend::hc::prefix_id(&res.address),
             number: 0,
             label: label.unwrap_or_default().to_string(),
             focused: false,
@@ -3406,7 +3406,7 @@ impl Client {
         self.call_coded(
             "terminal.label",
             json!({
-                "terminal": toron_core::backend::hc::strip_id_prefix(target),
+                "terminal": toron_plane::backend::hc::strip_id_prefix(target),
                 "labels": { "toron_pin": new_name },
             }),
         )

@@ -506,10 +506,13 @@ async fn build_mailbox() -> anyhow::Result<toron_core::mailbox::Mailbox> {
     )
     .await?;
     let operator = toron_core::keys::generate();
-    Ok(
+    let mut mailbox =
         toron_core::mailbox::Mailbox::new(std::sync::Arc::new(bus), data_dir, Some(operator))
-            .with_index_pool(pool),
-    )
+            .with_index_pool(pool);
+    if let Ok(live) = toron_plane::LivePanePlane::connect_default() {
+        mailbox = mailbox.with_plane(std::sync::Arc::new(live));
+    }
+    Ok(mailbox)
 }
 
 /// Run one async mailbox operation on the shared tokio runtime (flywheel
@@ -2071,7 +2074,7 @@ impl Mail {
                         "note": "active multiplexer is not hc; pane identity cleanup not applicable",
                     }));
                 }
-                match toron_core::plane_port::LivePanePlane::connect_default() {
+                match toron_plane::LivePanePlane::connect_default() {
                     Ok(plane) => {
                         let pruned = mailbox().cleanup_pane_identities(&plane)?;
                         Ok(json!({ "pruned": pruned }))
@@ -2407,14 +2410,14 @@ impl Mail {
     /// below, never an error.
     pub fn resolve_pane_identity(&self, project_key: &str, pane_id: &str) -> Value {
         if multiplexer_is_hc()
-            && let Ok(backend) = toron_core::backend::hc::HcBackend::connect(None)
+            && let Ok(backend) = toron_plane::backend::hc::HcBackend::connect(None)
         {
             let client = backend.client();
             if let Ok(panes) = client.pane_list()
                 && let Some(pane) = panes.iter().find(|p| p.pane_id == pane_id)
                 && let Some(pin) = pane
                     .tokens
-                    .get(toron_core::backend::types::TOKEN_PIN)
+                    .get(toron_plane::backend::types::TOKEN_PIN)
                     .and_then(Value::as_str)
                     .filter(|s| !s.is_empty())
             {
@@ -4030,7 +4033,7 @@ mod tests {
     /// (same file-miss shape as before, never Err).
     #[test]
     fn resolve_prefers_pane_tokens_over_files() {
-        let pane: toron_core::backend::PaneInfo = serde_json::from_value(serde_json::json!({
+        let pane: toron_plane::backend::PaneInfo = serde_json::from_value(serde_json::json!({
             "pane_id": "w1:p1",
             "terminal_id": "term_test",
             "workspace_id": "w1",
@@ -4041,7 +4044,7 @@ mod tests {
             "tokens": { "toron_pin": "DustySparrow" },
         }))
         .expect("test pane parses");
-        let agent: toron_core::backend::AgentInfo = serde_json::from_value(serde_json::json!({
+        let agent: toron_plane::backend::AgentInfo = serde_json::from_value(serde_json::json!({
             "agent_status": "working",
             "focused": false,
             "name": "OldOccupant",

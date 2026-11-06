@@ -4,7 +4,7 @@
 //! governed-by: ADR-0002, ADR-0003, ADR-0045
 //!
 //! Plane selection itself is NOT decided here: it lives in
-//! `toron_core::backend::plane` (toron ADR-0045), so flywheel, toron, and the
+//! `toron_plane::backend::plane` (toron ADR-0045), so flywheel, toron, and the
 //! MCP server share one table and one construction site. This module supplies
 //! the two edge facts flywheel owns — the configured name and its hc socket
 //! path — and nothing else.
@@ -28,7 +28,7 @@ use crate::config::Config;
 #[cfg(feature = "mail-toron")]
 use crate::mail::Mail;
 
-pub use toron_core::backend::plane::{Plane, PlaneChoice, PlaneEnv, ResolvedPlane};
+pub use toron_plane::backend::plane::{Plane, PlaneChoice, PlaneEnv, ResolvedPlane};
 
 /// Default multiplexer backend name. toron-core always carries both planes
 /// (toron ADR-0045), so `auto` is the default regardless of flywheel features.
@@ -69,14 +69,14 @@ fn plane_env(cfg: &Config) -> PlaneEnv {
 /// while the transport fell back to hc, so a host without the rex CLI created
 /// an hc terminal set and then died in `rex run` (bd-mknvb).
 pub fn resolve_plane(cfg: &Config) -> ResolvedPlane {
-    toron_core::backend::plane::resolve(&plane_env(cfg))
+    toron_plane::backend::plane::resolve(&plane_env(cfg))
 }
 
 /// Construct the active multiplexer backend. The construction site is
-/// `toron_core::backend::plane::connect`, so `auto` resolves once (and prints
+/// `toron_plane::backend::plane::connect`, so `auto` resolves once (and prints
 /// one line per process when it cannot stay on rex) before any call is made.
 pub fn multiplexer_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> {
-    toron_core::backend::plane::connect(&plane_env(cfg))
+    toron_plane::backend::plane::connect(&plane_env(cfg))
         .map_err(|e| BackendError::Other(anyhow::anyhow!("{e}")))
 }
 
@@ -311,7 +311,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("empty rex dir");
         let prev = std::env::var_os("REX_BIN_DIR");
         unsafe { std::env::set_var("REX_BIN_DIR", dir.path()) };
-        let b = toron_core::backend::superlogical::SuperlogicalBackend;
+        let b = toron_plane::backend::superlogical::SuperlogicalBackend;
         assert_eq!(b.name(), "superlogical");
         let m: Box<dyn MultiplexerBackend> = Box::new(b);
         let err = match m.subscribe(&[]) {

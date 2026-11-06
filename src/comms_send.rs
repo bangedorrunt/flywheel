@@ -40,7 +40,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use serde_json::{Value, json};
 #[cfg(any(test, feature = "backend-superlogical"))]
-use toron_core::backend::AgentInfo;
+use toron_plane::backend::AgentInfo;
 use toron_core::contracts::task_v1::TaskV1;
 use toron_core::delivery::Reject;
 use toron_core::envelope::{
@@ -1742,7 +1742,7 @@ mod tests {
     fn listed_agent(pane: &str, name: Option<&str>, display: Option<&str>) -> AgentInfo {
         AgentInfo {
             agent: None,
-            agent_status: toron_core::backend::AgentStatus::Working,
+            agent_status: toron_plane::backend::AgentStatus::Working,
             cwd: None,
             display_agent: display.map(str::to_string),
             focused: false,

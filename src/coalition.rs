@@ -265,8 +265,11 @@ impl CoalitionStore {
                 .await?;
                 let operator = toron_core::keys::generate();
                 let bus_arc: Arc<dyn Bus> = Arc::new(bus);
-                let mailbox =
+                let mut mailbox =
                     Mailbox::new(bus_arc.clone(), data_dir, Some(operator)).with_index_pool(pool);
+                if let Ok(live) = toron_plane::LivePanePlane::connect_default() {
+                    mailbox = mailbox.with_plane(std::sync::Arc::new(live));
+                }
                 Ok(Self {
                     project: project.to_string(),
                     root,
