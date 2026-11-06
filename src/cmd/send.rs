@@ -464,7 +464,10 @@ pub(crate) fn cmd_send(
             timeout_ms: timeout,
             until: vec![AgentStatus::Idle, AgentStatus::Done, AgentStatus::Blocked],
         });
-        let mut target = crate::agent_target(a).to_string();
+        // Prompt by pane address: hc's AgentInfo.name is a MAIL name stamped on
+        // labels, not the terminal name, so `terminal_get(<name>)` says
+        // "no terminal" (live hc send failure). The address is always valid.
+        let mut target = a.pane_id.clone();
         let name = a.name.clone().unwrap_or_else(|| target.clone());
         let hosted =
             agent_ref::binding_location_for(project, &name) == agent_ref::BindingLocation::Hosted;
