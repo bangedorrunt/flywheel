@@ -119,3 +119,27 @@ to the stall.
 A future push digest (overlap mail) and a pre-edit advisory check remain
 useful, but both must stay advisory; a global write lock would trade a
 three-minute auto-heal for a fleet-wide stall.
+
+## Same-repo lanes share a gate (the serialization that did bite)
+
+Disjoint file reservations let B and C **edit** in parallel, but they cannot
+**verify** in parallel: `verify-clippy.sh` and `cargo test` are crate-wide, so
+one lane's in-flight `main.rs` (B) failed C's gate even after the toron
+dependency went green. C's correct move was to stop and escalate; the wave
+still serialized at the gate.
+
+Options, in order of preference:
+
+1. **One flywheel lane at a time** when both touch the same crate (today's
+   model: reservations serialize, the gate enforces it).
+2. **Per-lane worktree** (`flywheel worktree`) with a shared `CARGO_TARGET_DIR`
+   so each lane has a clean crate and its own gate; the captain merges green
+   commits. The crew skill says "no worktree" for *loop-owned beads* (the loop
+   owns checkout state); a captain-dispatched parallel wave is the case where
+   a worktree is the right isolation.
+3. Cross-repo lanes (toron vs flywheel) still share the path dependency; a
+   red shared crate is a compile dependency, not a reservation, so the
+   compile-green-slice rule remains the only mitigation.
+
+This is a scheduling fact, not a reservation-lock bug: the 180 s heartbeat
+never blocked anyone; the crate-wide gate did.
