@@ -366,7 +366,8 @@ pub(crate) fn probe_stall(
 ) -> StallProbe {
     let ws_label =
         crate::state::load_spawn_meta(project).unwrap_or_else(|| crate::swarm_label(project));
-    let snap = crate::snapshot::assemble(cfg, project, &ws_label, now);
+    // Wave11: label-pinned entry (same single world read as assemble).
+    let snap = crate::snapshot::assemble_with_label(cfg, project, &ws_label, now);
     let fleet_knowable = !snap.degraded.iter().any(|d| d == "pins");
     let any_pane_working = snap.pins.iter().any(|p| p.verdict.starts_with("Busy"));
     let work_remaining = snap

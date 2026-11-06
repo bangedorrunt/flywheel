@@ -30,6 +30,32 @@ pub(crate) fn coalition_is_live(created_at: &str, now_unix: u64) -> bool {
     now_unix.saturating_sub(timestamp.timestamp() as u64) < COALITION_LIVE_SECS
 }
 
+/// Wave11 projection hub — pure serializers over `&Snapshot`, no I/O.
+/// Doors call these; the fixture test asserts they agree on core facts.
+/// Wave11 projection hub — pure serializers over `&Snapshot`, no I/O.
+/// `progress` is live (progress door); `status_core`/`robot`/`serve` are
+/// pure cores proven by the wave11 fixture (residual: global fleet doors
+/// keep current shape until per-project scoping lands).
+#[allow(dead_code)]
+pub(crate) fn status_core(snap: &Snapshot) -> serde_json::Value {
+    crate::snapshot::status_core_counts(snap)
+}
+
+#[allow(dead_code)]
+pub(crate) fn progress(snap: &Snapshot) -> serde_json::Value {
+    crate::snapshot::progress_view(snap)
+}
+
+#[allow(dead_code)]
+pub(crate) fn robot(snap: &Snapshot) -> serde_json::Value {
+    crate::snapshot::robot_view(snap)
+}
+
+#[allow(dead_code)]
+pub(crate) fn serve(snap: &Snapshot) -> serde_json::Value {
+    crate::snapshot::serve_view(snap)
+}
+
 pub(crate) fn bearings_line(snap: &Snapshot) -> String {
     let join = if snap.joinable { " JOINABLE" } else { "" };
     format!(
@@ -82,6 +108,12 @@ mod tests {
             coalitions: Vec::new(),
             launch_pending: 0,
             loop_state: Default::default(),
+            project: String::new(),
+            workspace_id: String::new(),
+            progress: serde_json::Value::Null,
+            runs: Vec::new(),
+            fleet_workspaces: Vec::new(),
+            fleet_agents: Vec::new(),
         };
         assert_eq!(
             bearings_line(&snapshot),

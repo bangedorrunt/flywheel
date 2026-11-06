@@ -8639,7 +8639,8 @@ fn cmd_decide(
     if let Some(project) = project {
         check_project_spelling(project, "decide")?;
         let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
-        let live = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
+        // Wave11: label-pinned entry (same single world read as assemble).
+        let live = snapshot::assemble_with_label(cfg, project, &ws_label, doorbell_now_unix());
         if snap.ready_bead_count == 0 {
             snap.ready_bead_count = live
                 .lanes
@@ -9142,7 +9143,8 @@ fn stderr_is_never_the_error_when_the_parser_already_has_one() {
 /// `Snapshot::default()` in production expand_reclassify paths (invent-green).
 pub(crate) fn live_decide_snapshot(cfg: &Config, project: &str) -> decide::Snapshot {
     let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
-    let live = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
+    // Wave11: label-pinned entry (same single world read as assemble).
+    let live = snapshot::assemble_with_label(cfg, project, &ws_label, doorbell_now_unix());
     decide::Snapshot {
         ready_bead_count: live
             .lanes
@@ -9250,7 +9252,8 @@ fn cmd_briefing(
 ) -> Result<()> {
     let project = project_door(project, "toron", "briefing")?;
     let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
-    let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
+    // Wave11: label-pinned entry (same single world read as assemble).
+    let snap = snapshot::assemble_with_label(cfg, project, &ws_label, doorbell_now_unix());
     let world = briefing::World {
         project: project.to_string(),
         ready_beads: match load_ready_beads(cfg, project) {
@@ -9733,7 +9736,8 @@ fn cmd_arrive(
         }
     }
     let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
-    let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
+    // Wave11: label-pinned entry (same single world read as assemble).
+    let snap = snapshot::assemble_with_label(cfg, project, &ws_label, doorbell_now_unix());
     let world = briefing::World {
         project: project.to_string(),
         dispatcher: snap.dispatcher.clone(),
@@ -11283,7 +11287,8 @@ fn cmd_view(cfg: &Config, project: &str, to: &str, lines: Option<u32>, source: &
     check_project_spelling(project, "view")?;
     if std::io::stdout().is_terminal() {
         let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
-        let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
+        // Wave11: label-pinned entry (same single world read as assemble).
+        let snap = snapshot::assemble_with_label(cfg, project, &ws_label, doorbell_now_unix());
         eprintln!("{}", snapshot::bearings_line(&snap));
     }
     #[cfg(feature = "backend-superlogical")]
@@ -11374,7 +11379,8 @@ fn cmd_watch(
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     if std::io::stdout().is_terminal() {
         let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
-        let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
+        // Wave11: label-pinned entry (same single world read as assemble).
+        let snap = snapshot::assemble_with_label(cfg, project, &ws_label, doorbell_now_unix());
         eprintln!("{}", snapshot::bearings_line(&snap));
     }
     let ws_id = find_workspace(&mut c, project)?;

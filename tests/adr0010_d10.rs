@@ -58,3 +58,53 @@ fn adr0010_d10_robot_surface_present() {
         "D10 (bd-67qg): robot_capabilities must list helm/snapshot"
     );
 }
+
+/// Wave11 (bd-wave11-snapshot-mndgf): one SnapshotV1 world read — every
+/// door is a pure projection over it. Source contract: SnapshotV1 sections,
+/// single `assemble(cfg, project, now)`, and pure projection cores exist;
+/// behavioral agreement is proven by unit tests in `src/snapshot.rs`
+/// (binary-only crate has no lib target for `use flywheel::`).
+#[test]
+fn wave11_snapshot_projections_agree_on_core_facts() {
+    for token in [
+        "SnapshotV1",
+        "pub fn assemble(cfg: &crate::config::Config, project: &str, now: u64)",
+        "pub fn progress_from_rows",
+        "pub fn status_core_counts",
+        "pub fn progress_view",
+        "pub fn robot_view",
+        "pub fn serve_view",
+        "fn read_progress_section",
+        "project: project.to_string()",
+        "workspace_id,",
+        "progress,",
+        "runs,",
+        "fleet_workspaces,",
+        "fleet_agents,",
+    ] {
+        assert!(
+            MAIN.contains(token),
+            "wave11 (bd-wave11-snapshot-mndgf): snapshot.rs must contain {token}"
+        );
+    }
+    for door in [
+        "snapshot::assemble",
+        "snapshot::progress_view",
+        "fn status_core(",
+        "fn progress(",
+        "fn robot(",
+        "fn serve(",
+    ] {
+        assert!(
+            MAIN.contains(door),
+            "wave11 (bd-wave11-snapshot-mndgf): door {door} must project over the snapshot"
+        );
+    }
+    // No second world read: progress door must not shell `br` directly;
+    // the single read lives in `snapshot::read_progress_section`.
+    let progress_sites = MAIN.match_indices("Bead::list_issues").count();
+    assert!(
+        progress_sites <= 2,
+        "wave11: only snapshot may shell br list (found {progress_sites} sites)"
+    );
+}

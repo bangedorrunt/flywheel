@@ -79,7 +79,8 @@ pub fn facts(cfg: &crate::config::Config, project: &str) -> Result<Facts> {
     let state_dir = crate::config::state_dir();
     let ws_label =
         crate::state::load_spawn_meta(project).unwrap_or_else(|| crate::swarm_label(project));
-    let snap = crate::snapshot::assemble(cfg, project, &ws_label, unix_secs());
+    // Wave11: label-pinned entry (same single world read as assemble).
+    let snap = crate::snapshot::assemble_with_label(cfg, project, &ws_label, unix_secs());
 
     let agents = snap.pins.len();
     let busy = snap
@@ -452,6 +453,15 @@ mod tests {
             since: String::new(),
             bead: None,
             reservations: paths.iter().map(|p| p.to_string()).collect(),
+            pane_id: String::new(),
+            kind: None,
+            cwd: None,
+            status: String::new(),
+            pending: false,
+            npub: None,
+            last_active_ts_us: None,
+            identity_pin: None,
+            observed_pin: None,
         };
         let pins = vec![
             pin("A", &["src/lib.rs"]),

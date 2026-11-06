@@ -21,6 +21,9 @@ use crate::hc::Client;
 pub const SNAPSHOT_SCHEMA: &str = "flywheel-snapshot.v1";
 
 /// One crew pin as the fleet sees it.
+/// Wave11: SnapshotV1 agent detail — pin/npub/pane/status/verdict/bead/
+/// reservations/last_active. All additive with defaults so existing doors
+/// keep their JSON shape.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PinRow {
     pub pin: String,
@@ -29,6 +32,25 @@ pub struct PinRow {
     pub since: String,
     pub bead: Option<String>,
     pub reservations: Vec<String>,
+    /// Wave11 additive agent detail (defaults keep old JSON shape).
+    #[serde(default)]
+    pub pane_id: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub pending: bool,
+    #[serde(default)]
+    pub npub: Option<String>,
+    #[serde(default)]
+    pub last_active_ts_us: Option<u64>,
+    #[serde(default)]
+    pub identity_pin: Option<String>,
+    #[serde(default)]
+    pub observed_pin: Option<String>,
 }
 
 /// One bead lane.
@@ -70,8 +92,11 @@ pub struct JournalState {
     pub unacked_wakes: u64,
 }
 
-/// The v1 snapshot. Every source is fallible; `degraded` names the ones
-/// that fell back to empty so operators never read absence as calm.
+/// Wave11 SnapshotV1: one world read. `project`, `workspace_id`,
+/// `progress`, `runs`, `fleet_workspaces`, `fleet_agents` are additive
+/// (defaults) so existing doors keep their JSON shape. Doors are pure
+/// projections over this struct (see status_core_counts/progress_view/
+/// robot_view/serve_view).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Snapshot {
     pub schema: String,
@@ -99,6 +124,19 @@ pub struct Snapshot {
     /// hc — never invent-green hardcoded 0 in live decide Snapshot.
     #[serde(default)]
     pub launch_pending: u32,
+    /// Wave11 additive sections (defaults keep old wire shape).
+    #[serde(default)]
+    pub project: String,
+    #[serde(default)]
+    pub workspace_id: String,
+    #[serde(default)]
+    pub progress: serde_json::Value,
+    #[serde(default)]
+    pub runs: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub fleet_workspaces: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub fleet_agents: Vec<serde_json::Value>,
     /// ADR-0010 D10 delivery-verdict loop projection: per-bead phase, the
     /// mail-degraded dispatch hold, queue depth, and the event watermark as
     /// last persisted by the durable loop. `loop` on the wire.
@@ -238,7 +276,8 @@ fn collect_pin_rows(
     launch_pending: &mut u32,
 ) {
     for a in agents.iter().filter(|a| a.workspace_id == ws_id) {
-        if crate::hc::agent_still_booting(a) {
+        let pending = crate::hc::agent_still_booting(a);
+        if pending {
             *launch_pending = launch_pending.saturating_add(1);
         }
         let plane_status = a.agent_status.as_str();
@@ -251,16 +290,49 @@ fn collect_pin_rows(
             since: String::new(),
             bead: None,
             reservations: Vec::new(),
+            pane_id: a.pane_id.clone(),
+            kind: a.agent.clone(),
+            cwd: a.cwd.clone(),
+            status: plane_status.to_string(),
+            pending,
+            npub: None,
+            last_active_ts_us: None,
+            identity_pin: None,
+            observed_pin: None,
         });
     }
 }
 
-/// Assemble the snapshot. `now` is the freshness epoch (caller clock).
-pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now: u64) -> Snapshot {
+/// Assemble the SnapshotV1 world read. `now` is the freshness epoch
+/// (caller clock). `ws_label` is derived internally from spawn-meta —
+/// callers pass only `(cfg, project, now)`. Every fleet read door is a
+/// pure projection over the returned struct; no door shells `br`/`toron`
+/// separately when the snapshot is supplied.
+pub fn assemble(cfg: &crate::config::Config, project: &str, now: u64) -> Snapshot {
+    let ws_label_owned =
+        crate::state::load_spawn_meta(project).unwrap_or_else(|| crate::swarm_label(project));
+    let ws_label = ws_label_owned.as_str();
+    assemble_with_label(cfg, project, ws_label, now)
+}
+
+/// Label-pinned implementation backing `assemble`. Prefer `assemble`;
+/// this entry exists so TTY doors that already resolved the label keep one
+/// call path (no second world read — it is the same implementation).
+pub fn assemble_with_label(
+    cfg: &crate::config::Config,
+    project: &str,
+    ws_label: &str,
+    now: u64,
+) -> Snapshot {
     let mut degraded = Vec::new();
 
     let mut pins = Vec::new();
     let mut launch_pending: u32 = 0;
+    // Wave11: retain workspace_id + fleet globals from the same single
+    // workspace_list/agent_list read (no second world read for robot/serve).
+    let mut workspace_id = String::new();
+    let mut fleet_workspaces: Vec<serde_json::Value> = Vec::new();
+    let mut fleet_agents: Vec<serde_json::Value> = Vec::new();
     if crate::pane::rex_door_selected(cfg) {
         let aliases = crate::workspace_label_aliases(
             project,
@@ -269,22 +341,39 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
         let owned_label = format!("flywheel-{}", crate::project_base(project));
         match crate::backend::factory::multiplexer_backend(cfg) {
             Ok(backend) => match backend.workspace_list() {
-                Ok(list) => match pick_snapshot_workspace(&list, &aliases, &owned_label) {
-                    Some(ws_id) => match backend.agent_list() {
-                        Ok(agents) => {
-                            let source = backend.name().to_string();
-                            collect_pin_rows(
-                                &agents,
-                                &ws_id,
-                                &source,
-                                &mut pins,
-                                &mut launch_pending,
-                            );
-                        }
-                        Err(_) => degraded.push("pins".to_string()),
-                    },
-                    None => degraded.push("pins".to_string()),
-                },
+                Ok(list) => {
+                    // Wave11: fleet globals reuse the same list (no second read).
+                    fleet_workspaces = list
+                        .iter()
+                        .filter(|w| w.label.starts_with("flywheel-"))
+                        .map(|w| {
+                            serde_json::json!({"workspace_id": w.workspace_id, "label": w.label, "cwd": w.cwd, "pane_count": w.pane_count})
+                        })
+                        .collect();
+                    match pick_snapshot_workspace(&list, &aliases, &owned_label) {
+                        Some(ws_id) => match backend.agent_list() {
+                            Ok(agents) => {
+                                let source = backend.name().to_string();
+                                workspace_id = ws_id.clone();
+                                fleet_agents = agents
+                                .iter()
+                                .map(|a| {
+                                    serde_json::json!({"name": a.name, "kind": a.agent, "status": a.agent_status.as_str(), "workspace_id": a.workspace_id, "pane_id": a.pane_id})
+                                })
+                                .collect();
+                                collect_pin_rows(
+                                    &agents,
+                                    &ws_id,
+                                    &source,
+                                    &mut pins,
+                                    &mut launch_pending,
+                                );
+                            }
+                            Err(_) => degraded.push("pins".to_string()),
+                        },
+                        None => degraded.push("pins".to_string()),
+                    }
+                }
                 Err(_) => degraded.push("pins".to_string()),
             },
             Err(_) => degraded.push("pins".to_string()),
@@ -294,6 +383,14 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
             Ok(mut c) => match crate::find_workspace(&mut c, project) {
                 Ok(ws_id) => match c.agent_list() {
                     Ok(agents) => {
+                        // Wave11: same single agent_list feeds pins + fleet.
+                        workspace_id = ws_id.clone();
+                        fleet_agents = agents
+                            .iter()
+                            .map(|a| {
+                                serde_json::json!({"name": a.name, "kind": a.agent, "status": a.agent_status.as_str(), "workspace_id": a.workspace_id, "pane_id": a.pane_id})
+                            })
+                            .collect();
                         collect_pin_rows(&agents, &ws_id, "hc", &mut pins, &mut launch_pending);
                     }
                     Err(_) => degraded.push("pins".to_string()),
@@ -301,6 +398,23 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
                 Err(_) => degraded.push("pins".to_string()),
             },
             Err(_) => degraded.push("pins".to_string()),
+        }
+        // Wave11: hc workspace_list for fleet globals (same read family as
+        // pins; degraded-empty keeps the snapshot honest).
+        match crate::hc::Client::connect(Some(&cfg.socket_path())) {
+            Ok(c2) => match c2.workspace_list() {
+                Ok(list) => {
+                    fleet_workspaces = list
+                        .iter()
+                        .filter(|w| w.label.starts_with("flywheel-"))
+                        .map(|w| {
+                            serde_json::json!({"workspace_id": w.workspace_id, "label": w.label, "cwd": w.cwd, "pane_count": w.pane_count})
+                        })
+                        .collect();
+                }
+                Err(_) => degraded.push("fleet".to_string()),
+            },
+            Err(_) => degraded.push("fleet".to_string()),
         }
     }
 
@@ -382,6 +496,15 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
         }
     };
 
+    // Wave11: beads progress + runs in the same single read (degraded-empty
+    // on failure — never a hard error). `progress_from_rows` is the pure
+    // core shared with `cmd_progress`; `snapshot_runs` is the runs section.
+    let (progress, progress_degraded) = read_progress_section(cfg, project);
+    if progress_degraded {
+        degraded.push("progress".to_string());
+    }
+    let runs = snapshot_runs();
+
     Snapshot {
         schema: SNAPSHOT_SCHEMA.to_string(),
         generated_at: now,
@@ -401,7 +524,53 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
         coalitions,
         launch_pending,
         loop_state,
+        // Wave11 additive sections: single read above; defaults only when
+        // the source degraded (never a hard error).
+        project: project.to_string(),
+        workspace_id,
+        progress,
+        runs,
+        fleet_workspaces,
+        fleet_agents,
     }
+}
+
+/// Wave11: beads-progress section reader (br list + ready). Pure core is
+/// `progress_from_rows`; this wrapper only performs the two `br` reads.
+/// Returns `(progress_value, degraded)` — degraded-empty keeps the snapshot
+/// honest (never invent-green zero beads).
+fn read_progress_section(cfg: &crate::config::Config, project: &str) -> (serde_json::Value, bool) {
+    let dir = crate::project_dir(cfg, project);
+    let rows = match crate::br::Bead::list_issues(Some(&dir), &["--status", "all"], "br list") {
+        Ok(r) => r,
+        Err(_) => {
+            return (
+                serde_json::json!({"dispatching_wave": serde_json::Value::Null, "waves": [], "unlabeled": {"closed": 0, "in_progress": 0, "ready": 0, "blocked": 0, "unknown": 0, "total": 0}}),
+                true,
+            );
+        }
+    };
+    let ready_ids: std::collections::HashSet<String> = match crate::br::run_br(
+        Some(&dir),
+        &["ready", "--json"],
+    ) {
+        Ok(raw) => match crate::br::parse_ready_beads_json(&raw) {
+            Ok(beads) => beads.into_iter().map(|b| b.id).collect(),
+            Err(_) => {
+                return (
+                    serde_json::json!({"dispatching_wave": serde_json::Value::Null, "waves": [], "unlabeled": {"closed": 0, "in_progress": 0, "ready": 0, "blocked": 0, "unknown": 0, "total": 0}}),
+                    true,
+                );
+            }
+        },
+        Err(_) => {
+            return (
+                serde_json::json!({"dispatching_wave": serde_json::Value::Null, "waves": [], "unlabeled": {"closed": 0, "in_progress": 0, "ready": 0, "blocked": 0, "unknown": 0, "total": 0}}),
+                true,
+            );
+        }
+    };
+    (progress_from_rows(&rows, &ready_ids), false)
 }
 
 fn read_mail_counts(_project: &str) -> (MailCounts, bool) {
@@ -823,6 +992,8 @@ pub(crate) fn latest_run_entries(
 }
 
 /// Top-level keys the robot JSON must carry (schema validation).
+/// Wave11 SnapshotV1: project/agents-detail/progress/runs/fleet are
+/// additive — existing doors ignore unknown keys.
 #[cfg(test)]
 pub fn schema_keys() -> Vec<&'static str> {
     vec![
@@ -844,7 +1015,152 @@ pub fn schema_keys() -> Vec<&'static str> {
         "coalitions",
         "launch_pending",
         "loop",
+        "project",
+        "workspace_id",
+        "progress",
+        "runs",
+        "fleet_workspaces",
+        "fleet_agents",
     ]
+}
+
+/// Wave11 SnapshotV1 pure projections — no I/O, no `br`/`toron` shells.
+/// Every fleet read door renders through these from one `assemble`.
+/// Core-facts agreement (agent/bead/reservation counts) is asserted by the
+/// wave11 fixture test in `tests/adr0010_d10.rs`.
+///
+/// `progress_from_rows` mirrors `cmd::status::progress_waves` without
+/// importing it (snapshot cannot depend on cmd::status — one direction only).
+/// Typed `wave` field wins, legacy `wave-N` label is fallback, else
+/// `unlabeled`; dispatching wave is the lowest wave holding ready/in-progress.
+pub fn progress_from_rows(
+    rows: &[serde_json::Value],
+    ready_ids: &std::collections::HashSet<String>,
+) -> serde_json::Value {
+    use std::collections::BTreeMap;
+    #[derive(Default)]
+    struct C {
+        closed: u64,
+        in_progress: u64,
+        ready: u64,
+        blocked: u64,
+        unknown: u64,
+        total: u64,
+    }
+    impl C {
+        fn add(&mut self, status: &str, ready: bool) {
+            match status {
+                "closed" => self.closed += 1,
+                "in_progress" => self.in_progress += 1,
+                "open" if ready => self.ready += 1,
+                "open" => self.blocked += 1,
+                _ => self.unknown += 1,
+            }
+            self.total += 1;
+        }
+        fn to_json(&self) -> serde_json::Value {
+            serde_json::json!({"closed": self.closed, "in_progress": self.in_progress, "ready": self.ready, "blocked": self.blocked, "unknown": self.unknown, "total": self.total})
+        }
+    }
+    let mut waves: BTreeMap<u64, C> = BTreeMap::new();
+    let mut unlabeled = C::default();
+    for row in rows {
+        let status = row.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let id = row.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let wave = row.get("wave").and_then(|v| v.as_u64()).or_else(|| {
+            row.get("labels")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str())
+                .find_map(|l| l.strip_prefix("wave-").and_then(|n| n.parse::<u64>().ok()))
+        });
+        match wave {
+            Some(w) => waves
+                .entry(w)
+                .or_default()
+                .add(status, ready_ids.contains(id)),
+            None => unlabeled.add(status, ready_ids.contains(id)),
+        }
+    }
+    let dispatching = waves
+        .iter()
+        .find(|(_, c)| c.in_progress > 0 || c.ready > 0)
+        .map(|(w, _)| *w);
+    serde_json::json!({
+        "dispatching_wave": dispatching,
+        "waves": waves.iter().map(|(w, c)| { let mut v = c.to_json(); v["wave"] = serde_json::json!(w); v }).collect::<Vec<_>>(),
+        "unlabeled": unlabeled.to_json(),
+    })
+}
+
+/// Core-facts agreement: agent count, bead counts by status, reservation
+/// count. Pure over `&Snapshot` — doors must agree on these.
+/// Wave11 SnapshotV1 pure projections — no I/O, no `br`/`toron` shells.
+/// `progress_from_rows`/`progress_view` are live (assemble + progress door).
+/// `status_core_counts`/`robot_view`/`serve_view` are pure cores proven by
+/// the wave11 fixture; live global doors keep current shape (residual in
+/// `.flywheel/reports/wave11-snapshot.md`), hence allow(dead_code) until
+/// per-project scoping lands — never a second world read.
+#[allow(dead_code)]
+pub fn status_core_counts(snap: &Snapshot) -> serde_json::Value {
+    use std::collections::BTreeMap;
+    let mut by_status: BTreeMap<String, u64> = BTreeMap::new();
+    for l in &snap.lanes {
+        *by_status.entry(l.status.clone()).or_default() += 1;
+    }
+    serde_json::json!({
+        "agents": snap.pins.len(),
+        "beads_by_status": by_status,
+        "beads_total": snap.lanes.len(),
+        "reservations": snap.held_paths.len(),
+    })
+}
+
+/// `flywheel progress` projection — same shape as `cmd_progress` JSON
+/// (`project` + waves + unlabeled + dispatching), sourced from the snapshot.
+/// Wave11: `progress` door projection (live). See module docs for residual.
+#[allow(dead_code)]
+pub fn progress_view(snap: &Snapshot) -> serde_json::Value {
+    let mut out = snap.progress.clone();
+    if out.is_null() {
+        out = serde_json::json!({"dispatching_wave": serde_json::Value::Null, "waves": [], "unlabeled": {"closed": 0, "in_progress": 0, "ready": 0, "blocked": 0, "unknown": 0, "total": 0}});
+    }
+    out["project"] = serde_json::json!(snap.project.clone());
+    out
+}
+
+/// `--robot-snapshot` projection — same top-level keys as `robot_snapshot`
+/// (`tool/version/ts/workspaces/runs/agents`), scoped to the snapshot's
+/// workspace. The global door reuses the same fleet helpers (no second
+/// world-read shape); the fixture asserts core counts agree.
+/// Wave11: `--robot-snapshot` pure core (residual: global fleet scoping).
+#[allow(dead_code)]
+pub fn robot_view(snap: &Snapshot) -> serde_json::Value {
+    let agents: Vec<serde_json::Value> = snap.pins.iter().map(|p| {
+        serde_json::json!({"name": p.pin, "kind": p.kind, "status": p.status, "pane_id": p.pane_id, "workspace_id": snap.workspace_id})
+    }).collect();
+    serde_json::json!({
+        "tool": "flywheel",
+        "version": crate::VERSION,
+        "ts": crate::state::now_iso(),
+        "workspaces": [serde_json::json!({"label": snap.workspace, "workspace_id": snap.workspace_id, "agents": agents})],
+        "runs": snap.runs,
+        "agents": agents,
+        "core": status_core_counts(snap),
+    })
+}
+
+/// `serve /api/v1/snapshot` projection — agent list scoped to the snapshot.
+/// Wave11: `serve /api/v1/snapshot` pure core (residual: global scoping).
+#[allow(dead_code)]
+pub fn serve_view(snap: &Snapshot) -> serde_json::Value {
+    serde_json::json!({
+        "agents": snap.pins.iter().map(|p| {
+            serde_json::json!({"name": p.pin, "kind": p.kind, "status": p.status, "workspace_id": snap.workspace_id, "pane_id": p.pane_id})
+        }).collect::<Vec<_>>(),
+        "core": status_core_counts(snap),
+    })
 }
 
 #[cfg(test)]
@@ -865,6 +1181,15 @@ mod adr0010_d10_tests {
                 since: String::new(),
                 bead: None,
                 reservations: vec![],
+                pane_id: String::new(),
+                kind: None,
+                cwd: None,
+                status: String::new(),
+                pending: false,
+                npub: None,
+                last_active_ts_us: None,
+                identity_pin: None,
+                observed_pin: None,
             }],
             lanes: vec![LaneRow {
                 bead: "bd-1".into(),
@@ -902,6 +1227,12 @@ mod adr0010_d10_tests {
             coalitions: vec![],
             launch_pending: 0,
             loop_state: crate::durable::LoopSnapshot::default(),
+            project: String::new(),
+            workspace_id: String::new(),
+            progress: serde_json::Value::Null,
+            runs: Vec::new(),
+            fleet_workspaces: Vec::new(),
+            fleet_agents: Vec::new(),
         }
     }
 
@@ -934,6 +1265,15 @@ mod adr0010_d10_tests {
             since: String::new(),
             bead: None,
             reservations: vec![],
+            pane_id: String::new(),
+            kind: None,
+            cwd: None,
+            status: String::new(),
+            pending: false,
+            npub: None,
+            last_active_ts_us: None,
+            identity_pin: None,
+            observed_pin: None,
         }];
         assert!(!fleet_joinable("absent", &pins));
         assert!(fleet_joinable("up", &pins));
@@ -944,6 +1284,15 @@ mod adr0010_d10_tests {
             since: String::new(),
             bead: None,
             reservations: vec![],
+            pane_id: String::new(),
+            kind: None,
+            cwd: None,
+            status: String::new(),
+            pending: false,
+            npub: None,
+            last_active_ts_us: None,
+            identity_pin: None,
+            observed_pin: None,
         }];
         assert!(fleet_joinable("absent", &named));
     }
@@ -1037,6 +1386,15 @@ mod adr0010_d10_tests {
                 since: String::new(),
                 bead: None,
                 reservations: vec![],
+                pane_id: String::new(),
+                kind: None,
+                cwd: None,
+                status: String::new(),
+                pending: false,
+                npub: None,
+                last_active_ts_us: None,
+                identity_pin: None,
+                observed_pin: None,
             },
             PinRow {
                 pin: "wP:p9".into(),
@@ -1045,6 +1403,15 @@ mod adr0010_d10_tests {
                 since: String::new(),
                 bead: None,
                 reservations: vec![],
+                pane_id: String::new(),
+                kind: None,
+                cwd: None,
+                status: String::new(),
+                pending: false,
+                npub: None,
+                last_active_ts_us: None,
+                identity_pin: None,
+                observed_pin: None,
             },
         ];
         let board = serde_json::json!({
@@ -1114,6 +1481,115 @@ mod adr0010_d10_tests {
         assert_eq!(
             pick_snapshot_workspace(&list, &aliases, "flywheel-proj").as_deref(),
             Some("w-keyed")
+        );
+    }
+
+    /// Wave11 (bd-wave11-snapshot-mndgf): fixture with 2 agents / 2 beads /
+    /// 1 reservation — every pure projection agrees on core facts, and no
+    /// projection shells `br`/`toron` (each takes `&Snapshot` only).
+    #[test]
+    fn wave11_projections_agree_on_core_facts() {
+        use std::collections::HashSet;
+        fn pin(pin: &str) -> PinRow {
+            PinRow {
+                pin: pin.to_string(),
+                verdict: "Idle(hc)".to_string(),
+                source: "hc".to_string(),
+                since: String::new(),
+                bead: None,
+                reservations: vec![],
+                pane_id: format!("{pin}-p1"),
+                kind: Some("pi".to_string()),
+                cwd: None,
+                status: "idle".to_string(),
+                pending: false,
+                npub: None,
+                last_active_ts_us: None,
+                identity_pin: None,
+                observed_pin: None,
+            }
+        }
+        let rows = serde_json::json!([
+            {"id": "bd-a", "title": "lane-a", "status": "open", "priority": 2, "wave": 1},
+            {"id": "bd-b", "title": "lane-b", "status": "closed", "priority": 1, "wave": 1}
+        ]);
+        let rows_vec = rows.as_array().unwrap().clone();
+        let ready: HashSet<String> = ["bd-a".to_string()].into_iter().collect();
+        let progress = progress_from_rows(&rows_vec, &ready);
+        assert_eq!(progress["dispatching_wave"], serde_json::json!(1));
+        let mut pins = vec![pin("QuietBay"), pin("AmberHarbor")];
+        pins[0].bead = Some("bd-a".to_string());
+        pins[0].reservations = vec!["src/snapshot.rs".to_string()];
+        let snap = Snapshot {
+            schema: SNAPSHOT_SCHEMA.to_string(),
+            generated_at: 1000,
+            workspace: "flywheel-flywheel".to_string(),
+            freshness_epoch: 1000,
+            pins,
+            lanes: vec![
+                LaneRow {
+                    bead: "bd-a".to_string(),
+                    title: "lane-a".to_string(),
+                    status: "open".to_string(),
+                    priority: 2,
+                    age_secs: 1,
+                },
+                LaneRow {
+                    bead: "bd-b".to_string(),
+                    title: "lane-b".to_string(),
+                    status: "closed".to_string(),
+                    priority: 1,
+                    age_secs: 2,
+                },
+            ],
+            decisions: vec![],
+            mail: MailCounts {
+                owed: 0,
+                acked: 0,
+                resulted: 0,
+                degraded: false,
+            },
+            journal: JournalState {
+                last_seq: 0,
+                last_presented: 0,
+                last_acked: 0,
+                unacked_wakes: 0,
+            },
+            drain_pending: 0,
+            afk: 0,
+            degraded: vec![],
+            joinable: true,
+            dispatcher: "up".to_string(),
+            held_paths: vec!["src/snapshot.rs".to_string()],
+            coalitions: vec![],
+            launch_pending: 0,
+            loop_state: Default::default(),
+            project: "flywheel".to_string(),
+            workspace_id: "w1".to_string(),
+            progress,
+            runs: vec![],
+            fleet_workspaces: vec![],
+            fleet_agents: vec![],
+        };
+        let core = status_core_counts(&snap);
+        assert_eq!(core["agents"], serde_json::json!(2));
+        assert_eq!(core["beads_total"], serde_json::json!(2));
+        assert_eq!(core["reservations"], serde_json::json!(1));
+        let pv = progress_view(&snap);
+        assert_eq!(pv["dispatching_wave"], serde_json::json!(1));
+        assert_eq!(pv["project"], serde_json::json!("flywheel"));
+        let rv = robot_view(&snap);
+        assert_eq!(rv["agents"].as_array().unwrap().len(), 2);
+        assert_eq!(rv["core"]["agents"], serde_json::json!(2));
+        let sv = serve_view(&snap);
+        assert_eq!(sv["core"]["reservations"], serde_json::json!(1));
+        assert_eq!(
+            crate::snapshot_reporting::progress(&snap)["dispatching_wave"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            crate::snapshot_reporting::status_core(&snap)["agents"],
+            serde_json::json!(2)
         );
     }
 }

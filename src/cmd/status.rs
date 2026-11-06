@@ -14,19 +14,17 @@ use crate::output::{dim, kind_paint, print_json, status_paint};
 
 pub(crate) fn cmd_snapshot(cfg: &Config, project: &str) -> Result<()> {
     crate::check_project_spelling(project, "snapshot")?;
-    let ws_label =
-        crate::state::load_spawn_meta(project).unwrap_or_else(|| crate::swarm_label(project));
-    let snap = crate::snapshot::assemble(cfg, project, &ws_label, crate::doorbell_now_unix());
+    // Wave11: one world read — ws_label derived inside assemble.
+    let snap = crate::snapshot::assemble(cfg, project, crate::doorbell_now_unix());
     print_json(&serde_json::to_value(&snap)?);
     Ok(())
 }
 
 pub(crate) fn cmd_helm(cfg: &Config, project: &str) -> Result<()> {
     crate::check_project_spelling(project, "helm")?;
-    let ws_label =
-        crate::state::load_spawn_meta(project).unwrap_or_else(|| crate::swarm_label(project));
     let now = crate::doorbell_now_unix();
-    let snap = crate::snapshot::assemble(cfg, project, &ws_label, now);
+    // Wave11: one world read — ws_label derived inside assemble.
+    let snap = crate::snapshot::assemble(cfg, project, now);
     print!("{}", crate::snapshot::render_helm(&snap, now));
     let (holder, whois_stale) = crate::lookup_captain_holder(project);
     let pane_alive = holder
@@ -79,9 +77,11 @@ pub(crate) fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     let registry =
         crate::state::load_spawn_registry(&crate::project_dir(cfg, project).to_string_lossy());
     let mail = crate::cmd::mail::mail_or_die(cfg).ok();
+    // Wave11: one world read — ws_label derived inside assemble.
+    let snap = crate::snapshot::assemble(cfg, project, crate::doorbell_now_unix());
+    // Wave11 residual: doorbell/facts/integrations still read directly.
     let ws_label =
         crate::state::load_spawn_meta(project).unwrap_or_else(|| crate::swarm_label(project));
-    let snap = crate::snapshot::assemble(cfg, project, &ws_label, crate::doorbell_now_unix());
     let actual_by_pane: std::collections::HashMap<String, String> = {
         agents
             .iter()
@@ -282,85 +282,12 @@ pub(crate) fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Per-wave progress counts. `unknown` exists so a row whose `status` field
-/// is missing/unrecognized reads unknown — never a default `done` (the same
-/// honesty rule as `history_row_status`).
-#[derive(Debug, Default)]
-struct WaveCounts {
-    closed: u64,
-    in_progress: u64,
-    ready: u64,
-    blocked: u64,
-    unknown: u64,
-    total: u64,
-}
-
-impl WaveCounts {
-    fn add(&mut self, status: &str, ready: bool) {
-        match status {
-            "closed" => self.closed += 1,
-            "in_progress" => self.in_progress += 1,
-            "open" if ready => self.ready += 1,
-            "open" => self.blocked += 1,
-            _ => self.unknown += 1,
-        }
-        self.total += 1;
-    }
-
-    fn to_json(&self) -> Value {
-        json!({
-            "closed": self.closed,
-            "in_progress": self.in_progress,
-            "ready": self.ready,
-            "blocked": self.blocked,
-            "unknown": self.unknown,
-            "total": self.total,
-        })
-    }
-}
-
-/// Fold `br list --status all` rows + the `br ready` id set into per-wave
-/// counts. A bead's wave is its TYPED `wave` field, with the legacy `wave-N`
-/// label as fallback (bd-wave-gate-typed-authority-27et); neither present
-/// lands in the `unlabeled` bucket — a wave is never invented. The
-/// dispatching wave is the LOWEST wave holding a ready or in-progress bead,
-/// the same floor `wave_gate_held` applies (ADR-0006 D2). Pure.
+/// Wave11: per-wave counting lives in `snapshot::progress_from_rows` (one pure
+/// core). This thin `progress_waves` delegate remains for `loop_mode` tests;
+/// live doors use the snapshot projection directly.
+#[allow(dead_code)]
 pub(crate) fn progress_waves(rows: &[Value], ready_ids: &HashSet<String>) -> Value {
-    let mut waves: BTreeMap<u64, WaveCounts> = BTreeMap::new();
-    let mut unlabeled = WaveCounts::default();
-    for row in rows {
-        let status = row.get("status").and_then(Value::as_str).unwrap_or("");
-        let id = row.get("id").and_then(Value::as_str).unwrap_or("");
-        let wave = row.get("wave").and_then(Value::as_u64).or_else(|| {
-            row.get("labels")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .find_map(|l| l.strip_prefix("wave-").and_then(|n| n.parse::<u64>().ok()))
-        });
-        let counts = match wave {
-            Some(w) => waves.entry(w).or_default(),
-            None => &mut unlabeled,
-        };
-        counts.add(status, ready_ids.contains(id));
-    }
-    let dispatching = waves
-        .iter()
-        .find(|(_, c)| c.in_progress > 0 || c.ready > 0)
-        .map(|(w, _)| *w);
-    json!({
-        "dispatching_wave": dispatching,
-        "waves": waves
-            .iter()
-            .map(|(w, c)| {
-                let mut v = c.to_json();
-                v["wave"] = json!(w);
-                v
-            })
-            .collect::<Vec<_>>(),
-        "unlabeled": unlabeled.to_json(),
-    })
+    crate::snapshot::progress_from_rows(rows, ready_ids)
 }
 
 /// bd-swarm-cockpit-pczs: `flywheel progress` — beads grouped by their
@@ -376,15 +303,9 @@ pub(crate) fn cmd_progress(cfg: &Config, project: Option<&str>, json_out: bool) 
         )
     })?;
     crate::check_project_spelling(&project, "progress")?;
-    let dir = crate::project_dir(cfg, &project);
-    let rows = crate::br::Bead::list_issues(Some(&dir), &["--status", "all"], "br list")?;
-    let ready_ids: HashSet<String> =
-        crate::br::parse_ready_beads_json(&crate::br::run_br(Some(&dir), &["ready", "--json"])?)?
-            .into_iter()
-            .map(|b| b.id)
-            .collect();
-    let mut out = progress_waves(&rows, &ready_ids);
-    out["project"] = json!(project);
+    // Wave11: one world read; `progress_view` is the pure serializer.
+    let snap = crate::snapshot::assemble(cfg, &project, crate::doorbell_now_unix());
+    let out = crate::snapshot::progress_view(&snap);
     if json_out || !std::io::stdout().is_terminal() {
         print_json(&out);
         return Ok(());

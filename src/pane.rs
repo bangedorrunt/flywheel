@@ -2964,7 +2964,8 @@ fn production_drainer_reads(cfg: Config, project: String) -> DrainerReads {
             crate::state::load_spawn_meta(&signoff_project).as_deref(),
             |l| crate::doorbell::dispatcher_token(&crate::config::state_dir(), l),
         );
-        let snap = crate::snapshot::assemble(&cfg, &signoff_project, &ws, now);
+        // Wave11: label-pinned entry (same single world read as assemble).
+        let snap = crate::snapshot::assemble_with_label(&cfg, &signoff_project, &ws, now);
         let review_residual = snap.lanes.iter().filter(|l| l.status != "closed").count();
         let review_degraded = snap.degraded.iter().any(|d| d.contains("review"));
         crate::signoff::observe(snap.decisions.len(), review_residual, review_degraded)

@@ -710,7 +710,9 @@ pub(crate) fn cmd_steer(
     if brief {
         if let Some(p) = project {
             let ws_label = state::load_spawn_meta(p).unwrap_or_else(|| crate::swarm_label(p));
-            let snap = crate::snapshot::assemble(cfg, p, &ws_label, crate::doorbell_now_unix());
+            // Wave11: label-pinned entry (same single world read as assemble).
+            let snap =
+                crate::snapshot::assemble_with_label(cfg, p, &ws_label, crate::doorbell_now_unix());
             eprintln!("{}", crate::snapshot::bearings_line(&snap));
         }
         let mut ctx =
