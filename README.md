@@ -305,7 +305,7 @@ slots; a missing required slot exits naming it.
 
 ## Backend protocol (rex-first plane, hc fallback)
 
-Pane plane resolves via `toron_core::backend::plane` (rex primary, hc fallback per toron ADR-0045).
+Pane plane resolves via `toron_plane::backend::plane` (rex primary, hc fallback per toron ADR-0045).
 OpenRPC over the hc session socket (`HC_SOCKET_PATH` or
 `$XDG_STATE_HOME/herdr-core/$HC_SESSION/$HC_SESSION.sock`);
 `events.subscribe` keeps a long-lived stream. See `src/hc_support.rs` and

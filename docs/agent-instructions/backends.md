@@ -6,7 +6,7 @@ Pluggable multiplexer + mail. Spine targets traits, not concretes.
 
 | Role | Trait | Default | Stubs |
 |------|-------|---------|-------|
-| Multiplexer | `toron_core::backend::Backend` (re-export `MultiplexerBackend`) | auto = rex-first + hc fallback (both planes always compiled in toron-core) | none (single selected backend) |
+| Multiplexer | `toron_plane::backend::Backend` (re-export `MultiplexerBackend`) | auto = rex-first + hc fallback (both planes always compiled in toron-plane) | none (single selected backend) |
 | Mail | `toron_core::mailbox::surface::MailSurface` | toron (`mail-toron`) | none (single backend) |
 
 Factory: `src/backend/factory.rs`. Code: `src/backend/`.
@@ -38,9 +38,9 @@ Ack-overdue reads (`flywheel __ack-overdue`, `Mail::ack_overdue`) are **in-proce
 
 Mailbox root: `TORON_DATA_DIR` > `TORON_MCP_DATA_DIR` > `$XDG_DATA_HOME/toron` > `~/.local/share/toron`. Never per-pid temp. `src/mail.rs` + `src/coalition.rs` share this.
 
-Plane selection is resolved once per process (`factory::resolve_plane`, a thin wrapper over `toron_core::backend::plane::resolve`) and every door reads that one answer — spawn, `status`, `snapshot`, crew launch, `preflight`, captain. The table and the construction site are toron-core's (toron ADR-0045); flywheel passes only the configured name and its `[backend] socket_path`. `REX_SESSION` records where the process runs; it is not evidence of the plane. So `auto` is rex whenever the rex CLI answers, env or no env (`bd-mknvb`), an explicit `superlogical` pin never falls back silently, and a fallback prints one line naming its reason. A door that keyed on the env instead split the planes: spawn wrote a rex session while `status` read hc (`bd-l7b05`).
+Plane selection is resolved once per process (`factory::resolve_plane`, a thin wrapper over `toron_plane::backend::plane::resolve`) and every door reads that one answer — spawn, `status`, `snapshot`, crew launch, `preflight`, captain. The table and the construction site are toron-plane's (toron ADR-0045); flywheel passes only the configured name and its `[backend] socket_path`. `REX_SESSION` records where the process runs; it is not evidence of the plane. So `auto` is rex whenever the rex CLI answers, env or no env (`bd-mknvb`), an explicit `superlogical` pin never falls back silently, and a fallback prints one line naming its reason. A door that keyed on the env instead split the planes: spawn wrote a rex session while `status` read hc (`bd-l7b05`).
 
-The fallback is per effect: reads replay on `Connect`/`Io`/`Timeout`; bounded waits on `Connect`/`Io` (a timeout is the caller's answer); **writes on `Connect` only** — a timed-out write may already have committed and there is no idempotency key. Semantic rejects and `Unsupported` surface loud, never masked. Pane ids are backend-namespaced (hc `t7`/`terminal:`, rex `block:`/`session:`), and `pane_keep` matches `"hc"` exactly, so auto skips plane-only janitor work in the safe direction. Agent status on both backends folds one OSC 7501 grammar (`toron_core::osc7501::Board`; `src/backend/rex_map.rs`). One-shot Lua rides `rex do -e` (`integrations/rex/session-snapshot.lua`); handler scripts would outlive the call bound and must not ride it.
+The fallback is per effect: reads replay on `Connect`/`Io`/`Timeout`; bounded waits on `Connect`/`Io` (a timeout is the caller's answer); **writes on `Connect` only** — a timed-out write may already have committed and there is no idempotency key. Semantic rejects and `Unsupported` surface loud, never masked. Pane ids are backend-namespaced (hc `t7`/`terminal:`, rex `block:`/`session:`), and `pane_keep` matches `"hc"` exactly, so auto skips plane-only janitor work in the safe direction. Agent status on both backends folds one OSC 7501 grammar (`toron_plane::osc7501::Board`, consumed toron-side). One-shot Lua rides `rex do -e` (`integrations/rex/session-snapshot.lua`); handler scripts would outlive the call bound and must not ride it.
 
 Liveness on rex, strongest signal first: explicit 7501 records (interactive
 pane sessions emit working/blocked/done with titles — verified live;
