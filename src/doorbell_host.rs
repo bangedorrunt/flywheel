@@ -830,6 +830,14 @@ impl Host for RtHost {
         self.model.doorbell.statuses.get(pin).cloned()
     }
 
+    /// The self index resolves the pin's npub (`whois` at build time), so a
+    /// reply authored by that npub clears the unanswered ring. Without it
+    /// the hear tracker treats the ring as npub-less and an agent that
+    /// answers is still reported unanswered forever.
+    fn pin_npub(&self, pin: &str) -> Option<String> {
+        self.index.npub(pin).map(str::to_string)
+    }
+
     /// Fetch-only slice of the old sweep arm (classify + prompt moved to
     /// tick via InboxRows — the bd-9hco pipe, unchanged semantics).
     /// F6: shared borrow (no mutation; enables future off-loop pipe).
@@ -1994,6 +2002,25 @@ mod off_runtime_tests {
             let _ = host.fetch_inbox_process("SomePin", "last");
             let _ = host.tick(&BrainMsg::Watch(String::new()));
         });
+    }
+
+    /// The hear tracker gets the pin's npub from the self index, so the
+    /// agent's own reply (a watch event authored by that npub) clears the
+    /// unanswered ring. With the trait default (`None`) the ring is
+    /// npub-less and SwiftBay stayed unanswered after answering.
+    #[test]
+    fn pin_npub_resolves_through_the_self_index() {
+        let _home = crate::config::test_state_home();
+        let _mail = crate::mail::Mail::from_config(None)
+            .expect("in-process mail")
+            .expect("some");
+        let (tx, _rx) = mpsc::channel(8);
+        let mut host =
+            RtHost::new(Config::default(), "offrt-npub", "offrt-npub", tx).expect("host");
+        host.index
+            .insert_pin("SwiftBay".into(), Some("AB12".into()));
+        assert_eq!(host.pin_npub("SwiftBay").as_deref(), Some("ab12"));
+        assert_eq!(host.pin_npub("NoSuchPin"), None);
     }
 
     /// Remote-daemon mail: the index build asks `whois` per registered pin
