@@ -167,3 +167,21 @@ cross-spelling gaps the acquire check misses, or a check/grant race. That is
 the intended order: the native refusal is the gate, the digest is the
 backstop. Its detection is covered by three pure unit tests; the live board
 refusal is the evidence for the stronger path.
+
+## Residual closure wave (same day, late)
+
+Three lanes cleared the coordination residuals in parallel; the captain
+verified and, where a lane stalled at close, committed its verified tree.
+
+| Residual | Sealed by | Evidence |
+|---|---|---|
+| `toron next` blind to delivered mail | `6860f18` (toron, lane A; `bd-next-envelope-ingest-yl0cx`, live-verified) | ingest of delivered mail (sender producer, rumor dedupe, SeqGap retry) + `STRAGGLER_SQL`; live: `next` returned 8 live stragglers, `ack` removed one (8 -> 7), new mail advanced the cursor 532 -> 549 |
+| wake hint pointed at the high-water door | `188d98d6` (`bd-wake-hint-next-again-a7gzr`) | `pull_hint` back to `toron next`; doorbell-core 35 + doorbell tests 80 green |
+| hc registry split + async labels + recover respawns the captain | `ea19c4e0` (`bd-hc-registry-recover-ywypf`, unit-test-verified) | alias-file fold + pane dedupe (one key per project), label-missing retry, `recover` skips the captain unless `--include-captain`; gate 0, recover 31, registry 75; leases released 7 |
+| two doorbell host supervisors + arm not applied + collab no re-ring | `e393f0de` (`bd-supervisor-collab-rering-87gzr`, unit-test-verified) | cron-healed children are the one owner (duplicate units retired), arm recorded before proxy, collab re-rings on the shared ladder; gate 0, collab 3, supervisor 153 + 1 load flake (3/3 alone) |
+| advisory push digest | `a80b8ca3` + `986fe43f` | pure `live_conflicts` + host board read through the mail facade; unit tests; live board proves `acquire --exclusive` already refuses the second holder, so the digest is the backstop for legacy/racy overlap |
+
+Live `next` semantics verified against the operator daemon: the per-message
+door returns the live straggler set on every call until the reader acks one;
+ack removes exactly that message, and no message is skipped by the
+high-water cursor any more.
