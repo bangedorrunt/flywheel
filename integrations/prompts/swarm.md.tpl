@@ -28,7 +28,7 @@ agent reads `flywheel-crew`. One captain, up to 5 crew; the person's answer sets
    need --escape. peer-aware=off -> --no-peer-aware. Escape forfeits
    SIGNOFF + artifacts: write the trail.
 
-5. BRIEF: lane dispatch authoritative. Peer wakes are signals, not tasks; peer wake rides the doorbell. The loop is bead dispatch, not wake. Per lane: bead ids, files, pin, claim with the pin as
+5. BRIEF: lane dispatch authoritative. Peer wakes are signals, not tasks; peer-aware wake rides the doorbell. The loop is bead dispatch, not wake. Per lane: bead ids, files, pin, claim with the pin as
    assignee, `toron reserve conflicts` on the lane files first (narrow; overlap = re-plan/split, never wait), loop heartbeat (4min window), build slot, TDD RED first,
    commit-before-close with VERIFY tail, stage ONLY reserved paths, on
    [doorbell] pull then act, blocked >10m mail captain, TIMEBOX 90m
