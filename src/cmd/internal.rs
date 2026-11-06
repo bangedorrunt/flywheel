@@ -1696,11 +1696,12 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::path::Path;
 
+use crate::cmd::spawn::cmd_spawn;
 use crate::config::Config;
 use crate::output::print_json;
 use crate::state::EventKind;
 use crate::{
-    AgentCounts, SpawnOpts, XprojInboxItem, cmd_spawn, extract_context_limit_from_inbox,
+    AgentCounts, SpawnOpts, XprojInboxItem, extract_context_limit_from_inbox,
     extract_xproj_from_inbox, log, mail_send, mail_whois_ok, newest_in_thread, project_dir,
     project_dir_str, resolve_mail_target, resolve_mail_target_registry, swarm_label,
 };

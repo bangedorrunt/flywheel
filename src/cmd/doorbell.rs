@@ -384,10 +384,10 @@ fn nearby_leases(cfg: &Config, project: &str) -> Vec<(String, String)> {
 
 pub(crate) fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
     crate::check_project_spelling(project, "doorbell status")?;
-    if crate::proxy_doorbell_verb(cfg, "status", &[])? {
+    if crate::cmd::spawn::proxy_doorbell_verb(cfg, "status", &[])? {
         return Ok(());
     }
-    crate::ensure_doorbell_supervisor();
+    crate::cmd::spawn::ensure_doorbell_supervisor();
     let _ = cfg;
     let state_dir = crate::config::state_dir();
     let unpinned = crate::unpinned_registry_names(&crate::state::load_spawn_registry(project));
@@ -396,7 +396,7 @@ pub(crate) fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
     } else {
         format!(" unpinned={}", unpinned.join(","))
     };
-    for ws in crate::doorbell_project_workspaces(project) {
+    for ws in crate::cmd::spawn::doorbell_project_workspaces(project) {
         let pid = crate::doorbell::read_pid(&crate::doorbell::pid_file(&state_dir, &ws));
         let alive = pid.is_some_and(crate::doorbell::pid_alive);
         let wake =
@@ -464,17 +464,17 @@ fn wake_brain_status_segment(snap: Option<doorbell_rt::wake_brain::WakeBrainSnap
 
 pub(crate) fn cmd_doorbell_start(cfg: &Config, project: &str) -> Result<()> {
     crate::check_project_spelling(project, "doorbell start")?;
-    let workspaces = crate::doorbell_project_workspaces(project);
+    let workspaces = crate::cmd::spawn::doorbell_project_workspaces(project);
     let mut arm: Vec<String> = Vec::new();
     for ws in &workspaces {
         arm.push("--host".to_string());
         arm.push(format!("{project}/{ws}"));
     }
-    let proxied = crate::proxy_doorbell_verb(cfg, "start", &arm)?;
+    let proxied = crate::cmd::spawn::proxy_doorbell_verb(cfg, "start", &arm)?;
     if !crate::doorbell::local_loop_after_proxy(proxied, crate::comms_send::enabled(cfg)) {
         return Ok(());
     }
-    crate::ensure_doorbell_supervisor();
+    crate::cmd::spawn::ensure_doorbell_supervisor();
     let exe = std::env::current_exe()?;
     if workspaces.is_empty() {
         eprintln!("doorbell: absent (no swarm workspace yet — attach after spawn)");
@@ -491,11 +491,11 @@ pub(crate) fn cmd_doorbell_start(cfg: &Config, project: &str) -> Result<()> {
 
 pub(crate) fn cmd_doorbell_stop(cfg: &Config, project: &str, workspace: &str) -> Result<()> {
     crate::check_project_spelling(project, "doorbell stop")?;
-    if workspace == "all" && crate::proxy_doorbell_verb(cfg, "stop", &[])? {
+    if workspace == "all" && crate::cmd::spawn::proxy_doorbell_verb(cfg, "stop", &[])? {
         return Ok(());
     }
     let workspaces: Vec<String> = if workspace == "all" {
-        crate::doorbell_project_workspaces(project)
+        crate::cmd::spawn::doorbell_project_workspaces(project)
     } else {
         vec![workspace.to_string()]
     };
@@ -764,7 +764,7 @@ pub(crate) fn cmd_doorbell_digest(
 /// and post-crash respawns that never got the spawn-time injection.
 pub(crate) fn cmd_doorbell_re_inject(cfg: &Config, project: &str) -> Result<()> {
     crate::check_project_spelling(project, "doorbell re-inject")?;
-    crate::ensure_doorbell_supervisor();
+    crate::cmd::spawn::ensure_doorbell_supervisor();
     let registry = crate::state::load_spawn_registry(project);
     let peer_tpl = include_str!("../../integrations/peer-aware.md.tpl");
     let c = crate::hc::Client::connect(Some(&cfg.socket_path()))?;
