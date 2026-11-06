@@ -190,9 +190,17 @@ fn sc_d1_live_dispatcher_uses_apply_watch_line() {
         brain_journal.contains("append_journal"),
         "live path must journal ticks for `doorbell why`"
     );
+    // 2026-11-07 (bd-wave17): the no-text sink silently shed every wake
+    // (live: injects=0), so the ring never reached the pane. The embedded
+    // host now types the ring through the selected plane; the deliberate
+    // divergence is recorded in docs/known-divergences.md.
     assert!(
-        host.contains("doorbell_rt::NoTextSink::new()"),
-        "the live hc sink is the NoTextSink (rings, never typed text)"
+        host.contains("PlanePromptSink::new("),
+        "the live sink must type the ring through the selected plane"
+    );
+    assert!(
+        !host.contains("doorbell_rt::NoTextSink::new()"),
+        "the no-text sink is gone: it dropped every wake"
     );
     assert!(
         !host.contains("doorbell_prompt("),

@@ -32,7 +32,16 @@ a bug, not a divergence — file a bead.
    `start_wake_sidecar`. DECOMMISSION would require migrating both to the
    doorbell first. Never silently delete under a live caller.
 
-4. **Backend default is rex-first, not hc.** Any prose naming hc as the default
+4. **The embedded doorbell host types the ring; the no-text sink is gone.**
+   `PlanePromptSink` resolves pin → pane through the spawn registry and
+   prompts the selected plane (rex or hc). The old `NoTextSink` "rings,
+   never types" contract silently shed every wake (live: `injects=0`), so a
+   done-mail never reached an idle pane. Governor: the live wake proof
+   (`bd-wave17-presence-producer-yjfol`, 2026-11-07) plus ADR-0010 D1 (the
+   pane gets the `[doorbell]` line). The InboxHost remains the comms-ring
+   path; if both fire, the ring line is constant per watermark.
+
+5. **Backend default is rex-first, not hc.** Any prose naming hc as the default
    or only pane plane is stale (governor: toron ADR-0045 —
    `toron/docs/decisions/0045-rex-first-pane-plane-with-hc-transport-fallback.md`;
    resolver `toron_plane::backend::plane`). `auto` = rex when the CLI is present,
