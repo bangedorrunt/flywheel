@@ -19,15 +19,9 @@ Three operating topologies, one engine:
 
 ## Vocabulary
 
-These five nouns are not interchangeable.
-
-| Noun | What it is | What it is not |
-|------|------------|----------------|
-| **stage** | One named prompt. `flywheel send --to <pin> --stage ce-execute`. Catalog: `stage list`. The `ce-` family is the compound-engineering loop (ADR-0009); p-codes are retired. | Not a runner. |
-| **workflow** | An engine procedure (YAML steps or graph). A step *may* dispatch a stage to a role (`dispatch_job` + `@coder` + `ce-execute`). Other steps are not stages: `request_approval`, `retry`, `call_workflow`, mail. | Not a topology. Loop, swarm, and open are how work is supervised. |
-| **compose token** | A bare name legal as `--parts`: `wave-swarm` or `repair-until-verified`. Preferred door: `workflow compose … --parts <token> --run`. Legacy alias: `workflow run <token> --execute`. | Not every builtin. `captain-audit` / `bug-fix` / `feature` are `workflow run <name> --execute`. |
-| **profile** | A role template: harness + model + behavior + skills. `spawn --profile coder`. `crew: auto` counts the `@roles` the workflow named. | Not what makes a compose token. N panes = how many roles were named, each with that profile's default harness. |
-| **topology** | How work is supervised: loop / swarm / open. | Not Workflow YAML. "Loop workflow" is forbidden speech. |
+Five nouns, one meaning each — [definitions](docs/vocabulary.md): **stage** (one named
+prompt), **workflow** (engine procedure), **compose token** (bare `--parts` expander),
+**profile** (role template), **topology** (how work is supervised: loop / swarm / open).
 
 `flywheel squad` is a group of profiles (spawn shape). That is a different use of the word recipe.
 

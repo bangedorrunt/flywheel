@@ -58,6 +58,9 @@ These are not interchangeable with workflow definitions:
   It may use `loop-mode --work` for bead supervision, but peer wake does not
   depend on the loop.
 
+Canonical noun definitions (stage / workflow / compose token / profile / topology):
+[vocabulary](../vocabulary.md).
+
 A **workflow** is a reusable engine procedure. It can run inside open mode,
 a loop, a swarm, headlessly, or directly; it is not itself an execution
 topology.

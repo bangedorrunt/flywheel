@@ -3,7 +3,7 @@
 Session door is `flywheel arrive` then `flywheel briefing --json`. This
 command is not a mode. Ready-bead work classifies as mode `open` and argv
 `loop-mode run <project> --work`. Do not start a second loop on a
-joinable fleet.
+joinable fleet. Noun definitions live in one page: [vocabulary](../vocabulary.md).
 
 `flywheel loop-mode run <project> [--work]` is the durable **solo execution
 loop**, backed by the in-house durable engine (toron ADR-0043, indexed at [toron decisions](../../toron/docs/decisions/README.md)). One live loop per

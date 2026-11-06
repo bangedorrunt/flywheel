@@ -18,16 +18,13 @@ Design doc: toron `docs/decisions/0022-phase-native-orchestration.md`.
 
 ## 1. The mental model (60 seconds)
 
-Five nouns, not interchangeable:
+Five nouns, not interchangeable — [one page, one meaning each](../vocabulary.md)
+(stage / workflow / compose token / profile / topology). File-specific rows kept below:
 
 | Noun | What it is | What it is not |
 | :--- | :--- | :--- |
-| **stage** | one named prompt (`send --stage ce-execute`). Catalog: `stage list`. | a runner. |
-| **workflow** | engine procedure (YAML steps or graph). A step *may* dispatch a stage to a `@role`. SIGNOFF is `request_approval`, not a stage. | a topology. |
-| **profile** | role → harness + model + skills. `crew: auto` counts `@roles`. | what makes a compose token. |
 | **mode** | who works: `open` or `swarm`. A loop is the work plus one verify check. | A third mode. "Loop workflow" is forbidden speech. |
 | **compose** (verb) | assembling a Workflow from parts (`--parts`, `--from-yaml`, `--agent`). | starting anything. |
-| **compose token** | bare name legal as `--parts`: `wave-swarm`, `repair-until-verified`, or `beads-lifecycle`. Preferred door: `workflow compose … --parts <token> --run`. Legacy alias: `workflow run <token> --execute`. | a recipe / squad. |
 | **ordinary builtin** | the same Workflow type, not a `--parts` token (e.g. captain-audit). | a compose token. |
 
 Door map (one door per intent):
