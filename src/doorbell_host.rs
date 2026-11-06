@@ -839,11 +839,11 @@ pub fn run_embedded(cfg: &Config, project: &str, workspace: &str) -> anyhow::Res
     doorbell::write_pid(&path, std::process::id())?;
     let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flywheel"));
     let gen_path = doorbell::gen_file(&config::state_dir(), workspace);
-    let generation = match doorbell::read_gen(&gen_path) {
-        Some(record) => Some(record),
-        None => doorbell::WatcherGen::capture(&exe_path, unix_now())
-            .filter(|record| doorbell::write_gen(&gen_path, record).is_ok()),
-    };
+    // Always capture THIS host's binary. Reusing a gen left by a pre-install
+    // spawn made the liveness check see a stale binary and exit-loop under
+    // launchd (the host itself is the current binary).
+    let generation = doorbell::WatcherGen::capture(&exe_path, unix_now())
+        .filter(|record| doorbell::write_gen(&gen_path, record).is_ok());
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
