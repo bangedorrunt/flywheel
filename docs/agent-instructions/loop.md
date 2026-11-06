@@ -6,7 +6,7 @@ command is not a mode. Ready-bead work classifies as mode `open` and argv
 joinable fleet.
 
 `flywheel loop-mode run <project> [--work]` is the durable **solo execution
-loop**, implemented with Resonate workflow machinery. One live loop per
+loop**, backed by the in-house durable engine (toron ADR-0043, indexed at [toron decisions](../../toron/docs/decisions/README.md)). One live loop per
 project (`loop-mode list` / `loop-mode prune`).
 
 Re-running is FRESH by default. A pending invocation whose owner process is

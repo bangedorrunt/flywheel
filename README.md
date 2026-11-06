@@ -5,9 +5,9 @@ fallback + **toron** coordination) — an NTM-parity daily loop for
 opencode / pi / grok. Spawn swarms, dispatch the daily-driver stages (P1→P8),
 monitor states, checkpoint progress. Tracker: **br/bv**.
 
-Three operating modes, one engine:
+Three operating topologies, one engine:
 
-| Mode | Contract | Default path |
+| Topology | Contract | Default path |
 |------|----------|--------------|
 | **open-mode** | Direct. Current pane. No crew, no loop, no graph. | Your harness tools. If the task needs durability or lanes, stop and name loop or swarm. |
 | **loop-mode** | Durable solo execution. Crash-resume. | `--work`: beads from `br ready`. A bead may name a workflow (`## WORKFLOW <builtin>`), which the loop runs through the engine. |
@@ -39,8 +39,8 @@ cargo install --path . --force
 
 Config: `~/.config/flywheel/config.toml` (see `config.example.toml`).
 Copy [`.env.example`](.env.example) → `.env` for local backend overrides
-(`.env` is gitignored). Default stack needs a running pane plane (rex and/or hc;
-socket via `HC_SOCKET_PATH` / `$XDG_STATE_HOME/herdr-core/…`) — `flywheel deps` checks everything.
+(`.env` is gitignored). Default stack needs a running pane plane (rex-first with hc
+fallback; hc socket via `HC_SOCKET_PATH` / `$XDG_STATE_HOME/herdr-core/…`) — `flywheel deps` checks everything.
 
 > Re-install after pulling: workflow-surface features resolve from the
 > installed binary, not your working tree.
@@ -309,8 +309,9 @@ resolve by semantic name only (`fresh-eyes-explore`, `ce-execute` — p-codes
 retired, ADR-0009). `send --stage NAME --param k=v` substitutes template
 slots; a missing required slot exits naming it.
 
-## Backend protocol (hc plane)
+## Backend protocol (rex-first plane, hc fallback)
 
+Pane plane resolves via `toron_core::backend::plane` (rex primary, hc fallback per toron ADR-0045).
 OpenRPC over the hc session socket (`HC_SOCKET_PATH` or
 `$XDG_STATE_HOME/herdr-core/$HC_SESSION/$HC_SESSION.sock`);
 `events.subscribe` keeps a long-lived stream. See `src/hc_support.rs` and
