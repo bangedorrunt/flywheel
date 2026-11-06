@@ -1027,11 +1027,11 @@ pub fn find_pack_for(project: &str, id: &str) -> Result<QuestionPack, String> {
     dirs.push(crate::config::config_dir().join("judgment-packs"));
     let p = std::path::PathBuf::from(project);
     if p.is_absolute() {
-        dirs.push(p.join(PACK_DIR_REL));
+        dirs.push(crate::project_state::judgment_packs_dir(&p));
     }
     let mut cursor = env::current_dir().ok();
     while let Some(dir) = cursor {
-        dirs.push(dir.join(PACK_DIR_REL));
+        dirs.push(crate::project_state::judgment_packs_dir(&dir));
         cursor = dir.parent().map(|q| q.to_path_buf());
     }
     static PACK_CACHE: std::sync::OnceLock<std::sync::Mutex<PackCache>> =

@@ -289,12 +289,12 @@ pub fn global_crons_dir() -> PathBuf {
 /// under the workspace root; absolute project paths pass through).
 pub fn project_crons_dir(cfg: &crate::config::Config, project: &str) -> PathBuf {
     let p = PathBuf::from(project);
-    let p = if p.is_absolute() {
+    let root = if p.is_absolute() {
         p
     } else {
         cfg.workspace_root().join(project)
     };
-    p.join(".flywheel").join("crons")
+    crate::project_state::crons_dir(&root)
 }
 
 /// The project a cron invocation targets: an explicit `--project` wins;
@@ -805,7 +805,14 @@ pub fn spec_runner(spec: &CronSpec) -> toron_workflow::engine::EffectRunner {
             let name = spec.name.clone();
             let inputs = Value::Null;
             std::sync::Arc::new(move |inv: &ActionInvocation| {
-                crate::cmd::internal::headless_dispatch(&catalog, &name, &inputs, Some(&name), &inv.action, None)
+                crate::cmd::internal::headless_dispatch(
+                    &catalog,
+                    &name,
+                    &inputs,
+                    Some(&name),
+                    &inv.action,
+                    None,
+                )
             })
         }
         SpecMode::Pane => {

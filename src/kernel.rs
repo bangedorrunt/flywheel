@@ -79,7 +79,7 @@ pub(crate) enum ActionStage {
 impl ActionStage {
     /// Wire spelling (live: `failure::classify_with_action_stage` maps the
     /// typed stage back onto the stable string field).
-    pub(crate) const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(&self) -> &'static str {
         match self {
             Self::Normalize => "normalize",
             Self::Input => "input",
@@ -140,7 +140,7 @@ mod tests {
                 ActionStage::Effect,
                 ActionStage::Park,
             ]
-            .map(ActionStage::as_str),
+            .map(|stage| stage.as_str()),
             ["normalize", "input", "execute", "output", "effect", "park"]
         );
     }

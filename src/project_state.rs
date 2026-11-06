@@ -1,6 +1,8 @@
-//! One owner for the project `.flywheel/` layout (wave6-b).
+//! One owner for the project `.flywheel/` layout (wave6-b, pruned wave-heal:
+//! only helpers with a live in-scope writer survive; stranded paths stay
+//! inventoried in the manifest, not as code).
 //!
-//! Path helpers, the layout manifest + version, and atomic writes live here
+//! Path helpers, the layout manifest, and atomic writes live here
 //! so the dozen writers across the tree share one vocabulary. Paths and
 //! formats are byte-identical to the ad-hoc joins this replaces; only the
 //! construction site moves.
@@ -12,10 +14,6 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-
-/// Layout schema version. Bump only with an ADR when the manifest gains or
-/// loses an entry; writers never branch on it (formats are stable).
-pub const LAYOUT_VERSION: u32 = 1;
 
 /// A write/read failure that names the path it happened on.
 #[derive(Debug)]
@@ -45,20 +43,10 @@ pub fn dot_flywheel(root: &Path) -> PathBuf {
     root.join(".flywheel")
 }
 
-/// `<root>/.flywheel/stages.toml` (project tier; ships with the repo).
-pub fn stages_toml(root: &Path) -> PathBuf {
-    dot_flywheel(root).join("stages.toml")
-}
-
-/// `<root>/.flywheel/standing-orders.md` (project fence; authored, kept).
+/// `<root>/.flywheel/standing-orders.md` (project fence; read by
+/// preflight, authored, kept).
 pub fn standing_orders_md(root: &Path) -> PathBuf {
     dot_flywheel(root).join("standing-orders.md")
-}
-
-/// `<root>/.flywheel/compose-allowlist.toml` (operator-authored;
-/// reader lives in main.rs — stranded by lane rule, noted in the manifest).
-pub fn compose_allowlist_toml(root: &Path) -> PathBuf {
-    dot_flywheel(root).join("compose-allowlist.toml")
 }
 
 /// `<root>/.flywheel/agent-names.json` (project-local pane→name bindings).
@@ -66,12 +54,8 @@ pub fn agent_names_json(root: &Path) -> PathBuf {
     dot_flywheel(root).join("agent-names.json")
 }
 
-/// `<root>/.flywheel/workflows/` (project workflow tier).
-pub fn workflows_dir(root: &Path) -> PathBuf {
-    dot_flywheel(root).join("workflows")
-}
-
-/// `<root>/.flywheel/judgment-packs/` (operator-authored packs).
+/// `<root>/.flywheel/judgment-packs/` (project tier; read by
+/// judgment::find_pack_for).
 pub fn judgment_packs_dir(root: &Path) -> PathBuf {
     dot_flywheel(root).join("judgment-packs")
 }
@@ -86,43 +70,9 @@ pub fn receipts_dir(root: &Path) -> PathBuf {
     dot_flywheel(root).join("receipts")
 }
 
-/// `<root>/.flywheel/plans/` (plan docs; writers live in main.rs — stranded).
-pub fn plans_dir(root: &Path) -> PathBuf {
-    dot_flywheel(root).join("plans")
-}
-
-/// `<root>/.flywheel/reports/` (crew reports; no Rust writer in tree).
-pub fn reports_dir(root: &Path) -> PathBuf {
-    dot_flywheel(root).join("reports")
-}
-
-/// `<root>/.flywheel/wave/` (wave markers; written by wave workflows).
-pub fn wave_dir(root: &Path) -> PathBuf {
-    dot_flywheel(root).join("wave")
-}
-
 /// `<root>/.flywheel/crons/` (project cron tier).
 pub fn crons_dir(root: &Path) -> PathBuf {
     dot_flywheel(root).join("crons")
-}
-
-/// `<root>/.flywheel/loop-run-verify-failed/` (failed-head markers;
-/// writer lives in main.rs — stranded).
-pub fn loop_run_verify_failed_dir(root: &Path) -> PathBuf {
-    dot_flywheel(root).join("loop-run-verify-failed")
-}
-
-/// `<root>/.flywheel/reopened/` (reopen markers; writer lives in
-/// main.rs — stranded).
-pub fn reopened_dir(root: &Path) -> PathBuf {
-    dot_flywheel(root).join("reopened")
-}
-
-/// User-tier models file: `<config-dir>/flywheel/models.toml`.
-/// Takes the config dir explicitly (this module owns the project layout;
-/// XDG roots stay with `config`).
-pub fn user_models_toml(config_dir: &Path) -> PathBuf {
-    config_dir.join("flywheel/models.toml")
 }
 
 /// One receipt file: `<root>/.flywheel/receipts/<bead>-<sha>.<kind>.txt`.
@@ -149,9 +99,9 @@ pub struct LayoutEntry {
     pub owner: &'static str,
 }
 
-/// The known project layout (wave6-b manifest). `ensure_layout` creates
-/// every [`LayoutKind::Dir`] entry; writers address files through the
-/// helpers above.
+/// The known project layout (wave6-b manifest): inventory, including
+/// stranded paths no in-scope writer may touch. `ensure_layout` creates
+/// every [`LayoutKind::Dir`] entry; live files go through the helpers above.
 pub const LAYOUT: &[LayoutEntry] = &[
     LayoutEntry {
         rel: "stages.toml",
@@ -247,14 +197,14 @@ pub fn ensure_layout(root: &Path) -> Result<(), ProjectStateError> {
 /// leaves the old file or the new one, never a partial write.
 /// Best-effort callers keep `let _ =` — the helper only reports.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ProjectStateError> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|source| ProjectStateError {
-                op: "create_dir",
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|source| ProjectStateError {
+            op: "create_dir",
+            path: parent.to_path_buf(),
+            source,
+        })?;
     }
     let file_name = path
         .file_name()
@@ -307,7 +257,6 @@ mod tests {
         }
         let unique: std::collections::HashSet<&str> = rels.iter().copied().collect();
         assert_eq!(unique.len(), rels.len(), "no duplicate manifest rows");
-        assert!(LAYOUT_VERSION >= 1, "layout is versioned");
     }
 
     /// Path helpers join the project root, byte-identical to the ad-hoc joins.
@@ -315,12 +264,21 @@ mod tests {
     fn helpers_build_the_documented_paths() {
         let root = Path::new("/proj");
         assert_eq!(
-            stages_toml(root),
-            PathBuf::from("/proj/.flywheel/stages.toml")
-        );
-        assert_eq!(
             standing_orders_md(root),
             PathBuf::from("/proj/.flywheel/standing-orders.md")
+        );
+        assert_eq!(
+            agent_names_json(root),
+            PathBuf::from("/proj/.flywheel/agent-names.json")
+        );
+        assert_eq!(
+            agent_state_dir(root),
+            PathBuf::from("/proj/.flywheel/agent-state")
+        );
+        assert_eq!(crons_dir(root), PathBuf::from("/proj/.flywheel/crons"));
+        assert_eq!(
+            judgment_packs_dir(root),
+            PathBuf::from("/proj/.flywheel/judgment-packs")
         );
         assert_eq!(
             receipts_dir(root),
@@ -329,10 +287,6 @@ mod tests {
         assert_eq!(
             receipt_path(root, "bd-1", "abc", "unit-test-verified"),
             PathBuf::from("/proj/.flywheel/receipts/bd-1-abc.unit-test-verified.txt")
-        );
-        assert_eq!(
-            user_models_toml(Path::new("/cfg")),
-            PathBuf::from("/cfg/flywheel/models.toml")
         );
     }
 

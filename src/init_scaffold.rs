@@ -118,7 +118,11 @@ pub const AGENTS_POINTER: &str = "Learnings live in `docs/learnings/` (ADR-0009)
 
 /// Write every missing scaffold artifact under `project_root`. Returns the
 /// (created, kept) relative paths. Pure IO, no prompts, no overwrites.
+/// Ensures the project layout first (owner contract: the scaffold owns
+/// the initial tree, so every manifest dir exists even before its first
+/// file lands).
 pub fn scaffold(project_root: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    crate::project_state::ensure_layout(project_root)?;
     let mut created = Vec::new();
     let mut kept = Vec::new();
     for artifact in artifacts() {

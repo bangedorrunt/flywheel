@@ -697,11 +697,8 @@ pub fn scan_new_forbidden_files(dir: &Path) -> Vec<String> {
 /// with the regen command in the message.
 pub fn check_standing_orders(cfg: &Config, project: Option<&str>) -> Check {
     let global = crate::config::config_dir().join("standing-orders.md");
-    let fence = project.map(|p| {
-        crate::project_dir(cfg, p)
-            .join(".flywheel")
-            .join("standing-orders.md")
-    });
+    let fence =
+        project.map(|p| crate::project_state::standing_orders_md(&crate::project_dir(cfg, p)));
     check_standing_orders_at(&global, fence.as_deref())
 }
 
