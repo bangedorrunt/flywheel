@@ -218,3 +218,23 @@ can silently skip the rest (observed: the collab ask became invisible). The
 per-message `next` door is the right fix once the envelope log is ingested;
 until then the wake hint stays on `mail inbox`. Collab should also re-ring via
 the `expected_replies` registry instead of relying on the agent's pull.
+
+## 8. Residual closure wave (2026-11-07)
+
+The residual list above was worked to closure by three lanes plus a captain
+heal; each row cites the sealing commit.
+
+| Residual | Sealed by | Evidence |
+|---|---|---|
+| `toron next` blind to delivered mail | toron `6860f18` (`bd-next-envelope-ingest-yl0cx`, live-verified) | sender-producer ingest + straggler SQL; live `next` returned 8 unread, `ack` removed one (8->7), new mail advanced the cursor |
+| wake hint on the high-water door | flywheel `188d98d6` | `pull_hint` back to `toron next`; doorbell-core 35 + doorbell 80 |
+| hc registry split, async labels, recover respawns captain | flywheel `ea19c4e0` (`bd-hc-registry-recover-ywypf`) | alias fold + pane dedupe, label retry, captain skip; gate 0, recover 31, registry 75 |
+| two host supervisors, arm not applied, collab no re-ring | flywheel `e393f0de` (`bd-supervisor-collab-rering-87gzr`) | cron children are the one owner; arm recorded; collab ladder; gate 0, collab 3, supervisor 153+1 load flake (3/3 alone) |
+| advisory push digest | flywheel `a80b8ca3`/`986fe43f` | pure `live_conflicts` + host board read through the mail facade; live board proves exclusive acquire already refuses the second holder, so the digest is the legacy/race backstop |
+| post-wave suite heal | flywheel `4616c3cf` (`bd-final-suite-heal-cmh1y`) | cfg-resolved registry key, off-runtime board read, `/usr/bin/true`, 4 KiB swarm template; six failing targets green |
+
+Coordination protocol shipped in the same wave: crew/captain skills
+(`~/.agents` `78a4d41`), `ce-execute` + `wave-dispatch` stage prompts,
+`peer-aware` template, `docs/agent-instructions/orchestration.md`, and
+`docs/analysis/coordination-awareness-2026-11-07.md` (leases are 180 s
+heartbeats; the crate-wide gate, not a lease, is the serializer).
