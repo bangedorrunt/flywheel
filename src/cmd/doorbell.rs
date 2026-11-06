@@ -3,6 +3,9 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
 use anyhow::{Context, Result};
 use clap::Subcommand;
 
@@ -463,6 +466,127 @@ fn wake_brain_status_segment(snap: Option<doorbell_rt::wake_brain::WakeBrainSnap
     }
 }
 
+/// bd-supervisor-collab-rering-87gzr: whether `proxy_doorbell_verb` would
+/// exec the local `doorbell` binary against a loopback daemon — the only
+/// case arm recording is for. Mirrors the proxy's own resolve + host check
+/// so a remote (out-of-band) daemon never gains a misleading local record.
+fn proxy_targets_loopback_daemon(cfg: &Config) -> bool {
+    let crate::doorbell::DoorbellHost::Proxy { url } =
+        crate::doorbell::resolve_host(&crate::config::state_dir(), cfg.doorbell_url(), None)
+    else {
+        return false;
+    };
+    let host = url
+        .trim_start_matches("http://")
+        .split(['/', ':'])
+        .next()
+        .unwrap_or("");
+    host == "127.0.0.1" || host == "localhost"
+}
+
+/// bd-supervisor-collab-rering-87gzr: the arm record the running daemon
+/// actually reads. Byte-compatible with doorbell-cli `armstate::persist`
+/// (`{"v":1,"hosts":[[project,workspace],...]}`) — that crate owns the
+/// format, this is the only other writer, and the shape test below pins
+/// the compatibility. Atomic tmp+rename, 0600, same as the owner.
+fn doorbell_hosts_file(state_dir: &std::path::Path) -> std::path::PathBuf {
+    state_dir.join("hosts.json")
+}
+
+/// Merge persisted ∪ requested (persisted order first, dedup) and record
+/// it — the same merge doorbell-cli applies at startup. Fail-closed on a
+/// corrupt file (never an empty set), like the owner: treating unreadable
+/// state as "no hosts" is the exact bug bd-u54l exists to end.
+fn record_doorbell_arms(
+    state_dir: &std::path::Path,
+    requested: &[(String, String)],
+) -> Result<Vec<(String, String)>> {
+    let path = doorbell_hosts_file(state_dir);
+    let mut merged: Vec<(String, String)> = match std::fs::read_to_string(&path) {
+        Ok(raw) if raw.trim().is_empty() => Vec::new(),
+        Ok(raw) => {
+            let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+                anyhow::anyhow!(
+                    "doorbell: {} is CORRUPT ({e}). Refusing to arm: fix the file or remove it to re-arm.",
+                    path.display()
+                )
+            })?;
+            let arr = v.get("hosts").and_then(|h| h.as_array()).ok_or_else(|| {
+                anyhow::anyhow!("doorbell: {} has no `hosts` array", path.display())
+            })?;
+            let mut out = Vec::new();
+            for item in arr {
+                let pair = item.as_array().filter(|p| p.len() == 2).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "doorbell: {} has a malformed host entry: {item}",
+                        path.display()
+                    )
+                })?;
+                let h = (
+                    pair[0]
+                        .as_str()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("doorbell: {} has a non-string project", path.display())
+                        })?
+                        .to_string(),
+                    pair[1]
+                        .as_str()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "doorbell: {} has a non-string workspace",
+                                path.display()
+                            )
+                        })?
+                        .to_string(),
+                );
+                if !out.contains(&h) {
+                    out.push(h);
+                }
+            }
+            out
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => anyhow::bail!("doorbell: cannot read {}: {e}", path.display()),
+    };
+    for h in requested {
+        if !merged.contains(h) {
+            merged.push(h.clone());
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let body = serde_json::json!({
+        "v": 1,
+        "hosts": merged
+            .iter()
+            .map(|(p, w)| serde_json::json!([p, w]))
+            .collect::<Vec<_>>(),
+    });
+    let mut bytes = serde_json::to_vec_pretty(&body)?;
+    bytes.push(b'\n');
+    let tmp = path.with_extension("json.tmp");
+    {
+        use std::io::Write;
+        #[cfg(unix)]
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        #[cfg(not(unix))]
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(&bytes)?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    Ok(merged)
+}
+
 pub(crate) fn cmd_doorbell_start(cfg: &Config, project: &str) -> Result<()> {
     crate::check_project_spelling(project, "doorbell start")?;
     let workspaces = crate::cmd::spawn::doorbell_project_workspaces(project);
@@ -470,6 +594,22 @@ pub(crate) fn cmd_doorbell_start(cfg: &Config, project: &str) -> Result<()> {
     for ws in &workspaces {
         arm.push("--host".to_string());
         arm.push(format!("{project}/{ws}"));
+    }
+    // bd-supervisor-collab-rering-87gzr: `doorbell start` adopts a running
+    // daemon WITHOUT applying the requested arms (it warns and exits 0).
+    // Record persisted ∪ requested first so the adopt path sees no
+    // divergence (no misleading warning) and the arm is durable — the
+    // running daemon applies it on restart. Loopback only.
+    if proxy_targets_loopback_daemon(cfg) {
+        let requested: Vec<(String, String)> = workspaces
+            .iter()
+            .map(|ws| (project.to_string(), ws.clone()))
+            .collect();
+        let merged = record_doorbell_arms(&crate::config::state_dir(), &requested)?;
+        eprintln!(
+            "doorbell: arms recorded ({} host(s)); a running daemon applies them on restart",
+            merged.len()
+        );
     }
     let proxied = crate::cmd::spawn::proxy_doorbell_verb(cfg, "start", &arm)?;
     if !crate::doorbell::local_loop_after_proxy(proxied, crate::comms_send::enabled(cfg)) {
@@ -888,6 +1028,74 @@ pub(crate) fn cmd_doorbell_gc(older_than_days: u64, yes: bool) -> Result<()> {
         },
     }));
     Ok(())
+}
+
+#[cfg(test)]
+mod doorbell_arm_record_tests {
+    use super::*;
+
+    fn sandbox(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("fw-arm-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// bd-supervisor-collab-rering-87gzr: the recorded arm is persisted ∪
+    /// requested (persisted order first) — the running daemon's adopt path
+    /// then sees no divergence and the arm survives a restart.
+    #[test]
+    fn recorded_arms_merge_persisted_and_requested() {
+        let dir = sandbox("merge");
+        std::fs::write(
+            doorbell_hosts_file(&dir),
+            "{\"v\":1,\"hosts\":[[\"flywheel\",\"flywheel-flywheel\"]]}\n",
+        )
+        .unwrap();
+        let merged = record_doorbell_arms(
+            &dir,
+            &[
+                ("flywheel".into(), "flywheel-flywheel".into()),
+                ("flywheel".into(), "flywheel-other".into()),
+            ],
+        )
+        .expect("merge records");
+        assert_eq!(
+            merged,
+            vec![
+                ("flywheel".to_string(), "flywheel-flywheel".to_string()),
+                ("flywheel".to_string(), "flywheel-other".to_string()),
+            ],
+            "persisted order first, requested appended, deduped"
+        );
+        let raw = std::fs::read_to_string(doorbell_hosts_file(&dir)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["v"], 1, "shape matches armstate::persist");
+        assert_eq!(
+            v["hosts"],
+            serde_json::json!([
+                ["flywheel", "flywheel-flywheel"],
+                ["flywheel", "flywheel-other"]
+            ])
+        );
+        assert!(
+            !dir.join("hosts.json.tmp").exists(),
+            "atomic tmp is renamed, never left behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fail-closed like the owner: a corrupt record refuses the arm.
+    #[test]
+    fn corrupt_hosts_refuse_the_arm() {
+        let dir = sandbox("corrupt");
+        std::fs::write(doorbell_hosts_file(&dir), "not json\n").unwrap();
+        assert!(
+            record_doorbell_arms(&dir, &[("p".into(), "w".into())]).is_err(),
+            "corrupt state is never read as empty"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]

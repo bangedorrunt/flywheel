@@ -1764,15 +1764,220 @@ pub(crate) fn cmd_collab(
         "flywheel: asked {} (thread {thread_id}, msg {msg_id}); waiting up to {timeout_secs}s for the reply…",
         targets.join(", ")
     );
-    cmd_mail_watch(
+    let mut sent_ids = std::collections::HashSet::new();
+    sent_ids.insert(msg_id.clone());
+    let start_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    watch_thread_with_rering(
         cfg,
         project,
         &thread_id,
+        &targets,
+        subject,
+        body,
         as_agent,
         timeout_secs,
         5,
-        Some(&msg_id),
+        sent_ids,
+        start_unix,
     )
+}
+
+/// Collab re-ring ladder (bd-supervisor-collab-rering-87gzr): the ONE
+/// re-ring ladder, shared with the doorbell sweep —
+/// [`doorbell_core::wake_core::rering_due_with_policy`] decides, this file
+/// only feeds it collab-shaped state. No new store: the outstanding ask
+/// already lives in state::expected_replies (written above); each resend
+/// advances its head so the durable loop's `__reply-settled` leaf keeps
+/// measuring progress past the LATEST ask instead of a stale first one.
+pub(crate) const COLLAB_RERING_GRACE_SECS: u64 = 15;
+pub(crate) const COLLAB_RERING_MAX: u32 = 3;
+
+/// Newest in-thread row that is NOT one of our own sends (the initial ask
+/// plus any re-rings). Pure: rows are the thread-scoped inbox projection,
+/// the thread match is exact like [`in_thread`]. A resend must never read
+/// as the peer's reply — without the sent-ids filter the first re-ring
+/// would "answer" the collab with its own echo.
+fn collab_arrival(
+    rows: &[Value],
+    thread_id: &str,
+    sent_ids: &std::collections::HashSet<String>,
+) -> Option<Value> {
+    rows.iter()
+        .rev()
+        .filter(|row| in_thread(row, thread_id))
+        .find(|row| {
+            row.get("id")
+                .and_then(|i| i.as_str())
+                .is_some_and(|i| !sent_ids.contains(i))
+        })
+        .cloned()
+}
+
+/// Collab wait state. The clock is a parameter of [`collab_wait_step`] so
+/// tests drive the ladder on a fake timeout without sleeping.
+struct CollabWait {
+    sent_ids: std::collections::HashSet<String>,
+    ladder: doorbell_core::wake_core::ReringEntry,
+    start_unix: u64,
+}
+
+/// One pure wait step.
+enum CollabStep {
+    /// The peer replied.
+    Arrived(Value),
+    /// The deadline passed with no reply.
+    TimedOut,
+    /// Grace window lapsed: resend the ask now (caller re-rings, then
+    /// bumps the ladder exactly like the sweep does).
+    Rering,
+    /// Inside a grace window: nothing due yet.
+    Pending,
+}
+
+fn collab_wait_step(
+    rows: &[Value],
+    thread_id: &str,
+    state: &CollabWait,
+    now_unix: u64,
+    timeout_secs: u64,
+) -> CollabStep {
+    if let Some(m) = collab_arrival(rows, thread_id, &state.sent_ids) {
+        return CollabStep::Arrived(m);
+    }
+    if timeout_secs > 0 && now_unix.saturating_sub(state.start_unix) >= timeout_secs {
+        return CollabStep::TimedOut;
+    }
+    match doorbell_core::wake_core::rering_due_with_policy(
+        &state.ladder,
+        now_unix,
+        "other",
+        COLLAB_RERING_GRACE_SECS,
+        COLLAB_RERING_MAX,
+    ) {
+        doorbell_core::wake_core::ReringDecision::Ring { .. } => CollabStep::Rering,
+        _ => CollabStep::Pending,
+    }
+}
+
+/// Move the expected_replies head for (targets × thread) to the latest
+/// re-ring id (same file, no new store). Best-effort: a lost update only
+/// costs the durable loop a stale baseline, never the collab itself.
+fn advance_expected_reply_head(project: &str, targets: &[String], thread: &str, head: &str) {
+    let mut entries = state::load_expected_replies(project);
+    let mut touched = false;
+    for e in entries.iter_mut() {
+        if e.thread == thread && targets.contains(&e.agent) {
+            e.head = Some(head.to_string());
+            touched = true;
+        }
+    }
+    if touched && let Err(err) = state::save_expected_replies(project, &entries) {
+        eprintln!("flywheel: cannot advance expected-reply head: {err:#}");
+    }
+}
+
+/// Block for the in-thread reply with re-ring: until the reply lands or the
+/// timeout expires, resend the ask every [`COLLAB_RERING_GRACE_SECS`] once
+/// the grace window lapses. Each resend carries the same thread/subject/body
+/// at urgent+ack so a peer that missed the first ask (cursor skip, idle
+/// pane) is rung again; its id joins `sent_ids` so the echo never reads as
+/// the answer. Exit 0 on reply, 1 on timeout — the `collab` contract.
+#[allow(clippy::too_many_arguments)]
+fn watch_thread_with_rering(
+    cfg: &Config,
+    project: &str,
+    thread_id: &str,
+    targets: &[String],
+    subject: &str,
+    body: &str,
+    as_agent: Option<&str>,
+    timeout_secs: u64,
+    interval_secs: u64,
+    sent_ids: std::collections::HashSet<String>,
+    start_unix: u64,
+) -> Result<()> {
+    let key = crate::project_dir_str(cfg, project)?;
+    let mail = mail_as(cfg, &key, as_agent)?;
+    mail.ensure_project(&key)?;
+    let rows = |m: &mail::Mail| -> Result<Vec<Value>> {
+        let v = m.inbox_filtered(&key, &m.name, &watch_filter(thread_id))?;
+        Ok(v.as_array().cloned().unwrap_or_default())
+    };
+    let mut state = CollabWait {
+        sent_ids,
+        ladder: doorbell_core::wake_core::ReringEntry {
+            pin: targets.join(","),
+            attempts: 0,
+            window_start_unix: start_unix,
+            acked: false,
+            fire_and_forget: false,
+            raw_without_id: false,
+        },
+        start_unix,
+    };
+    eprintln!(
+        "flywheel: watching thread {thread_id} (re-ring every {COLLAB_RERING_GRACE_SECS}s, up to {timeout_secs}s); Ctrl-C to abort",
+    );
+    let start_instant = std::time::Instant::now();
+    let mut empty_noted = false;
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(interval_secs));
+        let now_unix = start_unix.saturating_add(start_instant.elapsed().as_secs());
+        let current = rows(&mail)?;
+        match collab_wait_step(&current, thread_id, &state, now_unix, timeout_secs) {
+            CollabStep::Arrived(m) => {
+                print_json(&json!({ "thread": thread_id, "new_message": m }));
+                return Ok(());
+            }
+            CollabStep::TimedOut => {
+                eprintln!(
+                    "flywheel: no reply in thread {thread_id} within {timeout_secs}s (rung {} time(s))",
+                    state.ladder.attempts
+                );
+                std::process::exit(1);
+            }
+            CollabStep::Rering => {
+                match mail.send(
+                    &key,
+                    targets,
+                    subject,
+                    body,
+                    "urgent",
+                    true,
+                    Some(thread_id),
+                ) {
+                    Ok(sent) => {
+                        let attempt = state.ladder.attempts;
+                        state.ladder.attempts = attempt + 1;
+                        state.ladder.window_start_unix = now_unix;
+                        if let Some(id) = sent
+                            .get("id")
+                            .or_else(|| sent.get("message_id"))
+                            .and_then(|i| i.as_str())
+                        {
+                            state.sent_ids.insert(id.to_string());
+                            advance_expected_reply_head(project, targets, thread_id, id);
+                        }
+                        eprintln!(
+                            "flywheel: no reply yet — re-rang {thread_id} (attempt {})",
+                            state.ladder.attempts
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("flywheel: re-ring send failed (keeping the wait): {e:#}");
+                    }
+                }
+            }
+            CollabStep::Pending => {}
+        }
+        if !current.iter().any(|row| in_thread(row, thread_id)) && !empty_noted {
+            eprintln!("flywheel: thread {thread_id} has no messages yet (waiting for reply…)");
+            empty_noted = true;
+        }
+    }
 }
 
 /// Verify the §3.8 repo-tier evidence bar against the durable run log +
@@ -2360,5 +2565,106 @@ mod watch_progress_tests {
             "the watch reads exactly one thread"
         );
         assert!(f.include_bodies, "a reply is useless without its body");
+    }
+
+    /// bd-supervisor-collab-rering-87gzr: the re-ring echo must never read
+    /// as the peer's reply — arrival excludes every id we sent (ask +
+    /// re-rings), so the first resend cannot "answer" its own collab.
+    #[test]
+    fn collab_arrival_ignores_own_resends() {
+        let row = |id: &str, thread: &str| json!({ "id": id, "thread_id": thread });
+        let rows = vec![
+            row("ask-1", "collab-x"),
+            row("rering-1", "collab-x"),
+            row("reply-1", "collab-x"),
+        ];
+        let sent: std::collections::HashSet<String> = ["ask-1", "rering-1"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            collab_arrival(&rows, "collab-x", &sent)
+                .as_ref()
+                .and_then(|r| r["id"].as_str()),
+            Some("reply-1"),
+            "the peer reply is the arrival, not our echo"
+        );
+        let own_only = vec![row("ask-1", "collab-x"), row("rering-1", "collab-x")];
+        assert!(
+            collab_arrival(&own_only, "collab-x", &sent).is_none(),
+            "our own resends are never an arrival"
+        );
+        let idless = vec![json!({ "thread_id": "collab-x" })];
+        assert!(
+            collab_arrival(&idless, "collab-x", &sent).is_none(),
+            "an id-less row proves nothing — same rule as watch_progress"
+        );
+    }
+
+    /// bd-supervisor-collab-rering-87gzr: the ladder fires on a fake clock —
+    /// Pending inside the grace window, Ring at its edge, a new window after
+    /// the bump, and TimedOut past the deadline even with rows present. No
+    /// sleeps: `now_unix` is a parameter, so this is the fake-timeout proof.
+    #[test]
+    fn collab_rering_ladder_fires_on_a_fake_timeout() {
+        use doorbell_core::wake_core::ReringEntry;
+        let row = |id: &str| json!({ "id": id, "thread_id": "collab-x" });
+        let rows = vec![row("ask-1")];
+        let sent: std::collections::HashSet<String> = ["ask-1".to_string()].into_iter().collect();
+        let state = CollabWait {
+            sent_ids: sent,
+            ladder: ReringEntry {
+                pin: "peer".into(),
+                attempts: 0,
+                window_start_unix: 1_000,
+                acked: false,
+                fire_and_forget: false,
+                raw_without_id: false,
+            },
+            start_unix: 1_000,
+        };
+        let grace = COLLAB_RERING_GRACE_SECS;
+        assert!(
+            matches!(
+                collab_wait_step(&rows, "collab-x", &state, 1_000 + grace - 1, 300),
+                CollabStep::Pending
+            ),
+            "inside the grace window nothing is due"
+        );
+        assert!(
+            matches!(
+                collab_wait_step(&rows, "collab-x", &state, 1_000 + grace, 300),
+                CollabStep::Rering
+            ),
+            "at the window edge the shared ladder rings"
+        );
+        // After the bump (attempts=1, window=1_000+grace) a new window opens.
+        let mut rung = state;
+        rung.ladder.attempts = 1;
+        rung.ladder.window_start_unix = 1_000 + grace;
+        assert!(
+            matches!(
+                collab_wait_step(&rows, "collab-x", &rung, 1_000 + grace + 1, 300),
+                CollabStep::Pending
+            ),
+            "the bump opens a fresh grace window"
+        );
+        // The deadline wins even with rows present and no reply.
+        assert!(
+            matches!(
+                collab_wait_step(&rows, "collab-x", &rung, 1_000 + 300, 300),
+                CollabStep::TimedOut
+            ),
+            "past the fake timeout the wait ends, not re-rings"
+        );
+        // But a reply landing exactly at the deadline still wins.
+        let answered = vec![row("ask-1"), row("reply-9")];
+        assert!(
+            matches!(
+                collab_wait_step(&answered, "collab-x", &rung, 1_000 + 300, 300),
+                CollabStep::Arrived(_)
+            ),
+            "arrival outranks the deadline"
+        );
     }
 }

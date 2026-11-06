@@ -1,75 +1,52 @@
 // governed-by: ADR-0012
-//! Supervised always-on doorbell hosts (wave11-b): one launchd agent
+//! Single-owner doorbell host supervision (bd-supervisor-collab-rering-87gzr).
+//!
+//! ONE runtime owner: the cron-healed detached `__doorbell` children —
+//! pid-locked through [`crate::doorbell::ensure_running`], revived every
+//! minute by the cron supervisor tick ([`crate::doorbell::heal_tick_body`]).
+//!
+//! The retired second owner was one launchd agent
 //! (`dev.flywheel.doorbell.<ws>`) or systemd user unit
 //! (`flywheel-doorbell-<ws>`) per armed workspace, each running
-//! `flywheel __doorbell --project <p> --workspace <ws>` — the one
-//! [`doorbell_rt::HostRunner`] loop, supervised so an idle subscribed pane
-//! is woken by a done-mail with no live spawn process.
+//! `flywheel __doorbell`. The two paths Superseded each other on restart
+//! (the pid lease keeps exactly one alive), so `ensure_armed_hosts` no
+//! longer installs units: it retires any leftover duplicate units
+//! (best-effort) and ensures the detached child for every armed workspace.
+//! `unload_all_hosts` retires leftover units and stops the detached
+//! children. `daemon start` / `stop` (which call these two) thereby drive
+//! the one owner.
 //!
-//! Patterns reused from the `doorbell` daemon installer
-//! (`doorbell-cli::lifecycle`): absolute binary paths, `KeepAlive` with
-//! `SuccessfulExit=false`, 4096 fds, explicit HOME. `daemon::start`
-//! installs + loads these; `daemon::stop` unloads them.
-//!
-//! Sandbox rules: unit files resolve under `$HOME` (overridable per test),
-//! and the supervisor binary resolves via `PATH`, so deny-shims prove the
-//! load attempt without touching the operator's launchd/systemd. Pass
-//! `dry_run` to render + write without loading (shim logs stay empty).
+//! Sandbox rules: unit cleanup resolves under an explicit HOME (temp HOME
+//! in tests) and children under an explicit state dir (temp dirs in
+//! tests), so the operator's launchd/systemd and live dispatchers are
+//! never touched. Child spawn shells the given exe — tests pass
+//! `/bin/true`, which exits at once, proving the spawn path without
+//! running a host.
 
 use std::path::{Path, PathBuf};
 
-/// Label prefix for supervised host jobs.
+/// Label prefix of the retired duplicate units (kept: cleanup scans for it).
 pub const HOST_LABEL_PREFIX: &str = "dev.flywheel.doorbell";
 
-/// Systemd unit prefix (launchd uses [`HOST_LABEL_PREFIX`]); Linux only.
+/// Systemd unit prefix of the retired duplicates (Linux only).
 #[cfg(not(target_os = "macos"))]
 pub const HOST_SERVICE_PREFIX: &str = "flywheel-doorbell";
 
-/// Env flag that turns the `daemon start` ride-along into a plan print
-/// (no writes, no loads). No CLI surface change — the flag is operator-only.
-pub const DRY_RUN_ENV: &str = "FLYWHEEL_DOORBELL_HOST_DRY_RUN";
-
-/// A supervised host: what to run, and where its unit file lives.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostUnit {
-    /// `dev.flywheel.doorbell.<ws>` (macOS) or `flywheel-doorbell-<ws>`.
-    pub label: String,
-    /// Unit file path (plist or service).
-    pub unit_path: PathBuf,
-    /// Rendered unit body.
-    pub body: String,
-}
-
-/// Inputs to render/install one supervised host.
-#[derive(Debug, Clone)]
-pub struct HostSpec {
-    /// Absolute path to the `flywheel` binary.
-    pub exe: PathBuf,
-    pub project: String,
-    pub workspace: String,
-    /// Flywheel state dir (XDG state; the job's logs + env).
-    pub state_dir: PathBuf,
-    /// Daemon URL the child uses (operator env wins, default documented port).
-    pub toron_mcp_url: String,
-    /// HOME to run as (launchd gives the job none).
-    pub home: PathBuf,
-    /// Operator-configured backend (`FLYWHEEL_BACKEND`) to pin the child to.
-    /// `None` (the default) omits it so the child auto-resolves rex from
-    /// its own PATH — a stale pin would fight the operator's later change.
-    pub flywheel_backend: Option<String>,
-    /// Absolute bin dirs for the unit's PATH, resolved at install time
-    /// (exe dir + resolved plane binaries + operator PATH minus shims).
-    /// Stored, not recomputed, so the render is pure and the sandbox pins it.
-    pub path_dirs: Vec<PathBuf>,
-}
-
-/// Report for one install/unload.
+/// Report for one retired duplicate unit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostAction {
     pub label: String,
     pub unit_path: PathBuf,
-    /// True when the supervisor accepted the load (false on dry-run).
+    /// Retire never loads: always false (kept for shape compat).
     pub loaded: bool,
+}
+
+/// What `ensure_armed_hosts` did for one workspace (single-owner plan).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnsuredChild {
+    pub workspace: String,
+    /// Debug rendering of the [`crate::doorbell::LockAction`] taken.
+    pub action: String,
 }
 
 /// Sanitize a workspace name into a label fragment.
@@ -114,271 +91,11 @@ pub fn unit_path(home: &Path, workspace: &str) -> PathBuf {
     }
 }
 
-/// Directories on the unit's PATH, resolved at install time (wave15-b):
-/// the operator PATH if available, else the absolute dirs containing the
-/// binaries the host shells (`flywheel`, plus `rex`/`hc`/`toron` when
-/// found). Mise shim dirs are skipped — a shim without the operator's cwd
-/// and version pin dies under launchd. Pure for tests: `operator_path` is
-/// the ambient PATH (or `None`), `exe` the flywheel binary, `bins` the
-/// already-resolved plane binary paths.
-pub fn unit_path_dirs(
-    operator_path: Option<&std::ffi::OsStr>,
-    exe: &Path,
-    bins: &[Option<PathBuf>],
-) -> Vec<PathBuf> {
-    use std::collections::HashSet;
-    let mut seen = HashSet::new();
-    let mut dirs = Vec::new();
-    let mut push = |d: PathBuf| {
-        if seen.insert(d.clone()) {
-            dirs.push(d);
-        }
-    };
-    if let Some(dir) = exe.parent() {
-        push(dir.to_path_buf());
-    }
-    for b in bins.iter().flatten() {
-        if let Some(dir) = b.parent() {
-            push(dir.to_path_buf());
-        }
-    }
-    if let Some(path_env) = operator_path {
-        for dir in std::env::split_paths(path_env) {
-            if is_mise_shim_dir(&dir) {
-                continue;
-            }
-            push(dir);
-        }
-    }
-    for sys in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
-        push(PathBuf::from(sys));
-    }
-    dirs
-}
-
-/// `.../mise/shims` is a dispatcher dir, not a real bin directory — a shim
-/// without the operator's cwd and version pin dies under launchd.
-fn is_mise_shim_dir(dir: &Path) -> bool {
-    dir.components()
-        .map(|c| c.as_os_str())
-        .collect::<Vec<_>>()
-        .windows(2)
-        .any(|w| w[0] == "mise" && w[1] == "shims")
-}
-
-/// Render the supervisor unit for one host. Pure: the sandbox pins this.
-pub fn render_host_unit(spec: &HostSpec) -> HostUnit {
-    let label = host_label(&spec.workspace);
-    let exe = spec.exe.display().to_string();
-    let state = spec.state_dir.display().to_string();
-    let home = spec.home.display().to_string();
-    let log_out = spec
-        .state_dir
-        .join(format!("doorbell-host-{}.out.log", slug(&spec.workspace)))
-        .display()
-        .to_string();
-    let log_err = spec
-        .state_dir
-        .join(format!("doorbell-host-{}.err.log", slug(&spec.workspace)))
-        .display()
-        .to_string();
-    let path_value = spec
-        .path_dirs
-        .iter()
-        .map(|d| d.display().to_string())
-        .collect::<Vec<_>>()
-        .join(":");
-    let backend_env = spec
-        .flywheel_backend
-        .as_deref()
-        .map(|b| format!("        <key>FLYWHEEL_BACKEND</key>\n        <string>{b}</string>\n"))
-        .unwrap_or_default();
-    #[cfg(target_os = "macos")]
-    let body = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{exe}</string>
-        <string>__doorbell</string>
-        <string>--project</string>
-        <string>{project}</string>
-        <string>--workspace</string>
-        <string>{workspace}</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
-    <key>ThrottleInterval</key>
-    <integer>30</integer>
-    <key>WorkingDirectory</key>
-    <string>{home}</string>
-    <key>StandardOutPath</key>
-    <string>{log_out}</string>
-    <key>StandardErrorPath</key>
-    <string>{log_err}</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>HOME</key>
-        <string>{home}</string>
-        <key>PATH</key>
-        <string>{path_value}</string>
-        <key>TORON_MCP_URL</key>
-        <string>{toron_mcp_url}</string>
-        <key>DOORBELL_STATE_DIR</key>
-        <string>{state}</string>
-{backend_env}    </dict>
-    <key>SoftResourceLimits</key>
-    <dict>
-        <key>NumberOfFiles</key>
-        <integer>4096</integer>
-    </dict>
-</dict>
-</plist>
-"#,
-        label = label,
-        exe = exe,
-        project = spec.project,
-        workspace = spec.workspace,
-        home = home,
-        log_out = log_out,
-        log_err = log_err,
-        toron_mcp_url = spec.toron_mcp_url,
-        state = state,
-        path_value = path_value,
-        backend_env = backend_env,
-    );
-    #[cfg(not(target_os = "macos"))]
-    let args = format!(
-        "__doorbell --project {} --workspace {}",
-        spec.project, spec.workspace
-    );
-    #[cfg(not(target_os = "macos"))]
-    let body = format!(
-        "[Unit]\nDescription=flywheel doorbell host {project}/{workspace} (always-on wake)\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart={exe} {args}\nWorkingDirectory={home}\nRestart=on-failure\nRestartSec=30\nLimitNOFILE=4096\nEnvironment=HOME={home}\nEnvironment=PATH={path_value}\nEnvironment=TORON_MCP_URL={toron_mcp_url}\nEnvironment=DOORBELL_STATE_DIR={state}{backend_systemd}\nStandardOutput=append:{log_out}\nStandardError=append:{log_err}\n\n[Install]\nWantedBy=default.target\n",
-        project = spec.project,
-        workspace = spec.workspace,
-        exe = exe,
-        args = args,
-        home = home,
-        toron_mcp_url = spec.toron_mcp_url,
-        state = state,
-        log_out = log_out,
-        log_err = log_err,
-        path_value = path_value,
-        backend_systemd = spec
-            .flywheel_backend
-            .as_deref()
-            .map(|b| format!("\nEnvironment=FLYWHEEL_BACKEND={b}"))
-            .unwrap_or_default(),
-    );
-    #[cfg(not(target_os = "macos"))]
-    let label = host_service(&spec.workspace);
-    let unit_path = unit_path(&spec.home, &spec.workspace);
-    HostUnit {
-        label,
-        unit_path,
-        body,
-    }
-}
-
 /// Resolve a shell command the way the sandbox expects: `name` via `PATH`
-/// (deny-shims first), so tests prove the load attempt without touching the
-/// operator's supervisor.
+/// (deny-shims first), so tests prove the unload attempt without touching
+/// the operator's supervisor.
 fn run_supervisor(name: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
     std::process::Command::new(name).args(args).output()
-}
-
-/// Install (+ load, unless `dry_run`) one supervised host. Idempotent:
-/// rewrites the unit when the render drifts, then (re)loads it.
-/// Load failure is loud (names the manual command) — never a silent skip,
-/// or the operator believes wake is always-on while nothing hosts it.
-pub fn install_host(spec: &HostSpec, dry_run: bool) -> anyhow::Result<HostAction> {
-    use anyhow::Context;
-    let unit = render_host_unit(spec);
-    if dry_run {
-        println!("--- {} ---", unit.unit_path.display());
-        print!("{}", unit.body);
-        return Ok(HostAction {
-            label: unit.label,
-            unit_path: unit.unit_path,
-            loaded: false,
-        });
-    }
-    if let Some(parent) = unit.unit_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create unit dir {}", parent.display()))?;
-    }
-    std::fs::write(&unit.unit_path, &unit.body)
-        .with_context(|| format!("write unit {}", unit.unit_path.display()))?;
-    load_unit(&unit)?;
-    Ok(HostAction {
-        label: unit.label,
-        unit_path: unit.unit_path,
-        loaded: true,
-    })
-}
-
-/// Load (or reload) an installed unit through the supervisor.
-fn load_unit(unit: &HostUnit) -> anyhow::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let uid = users_uid();
-        let domain = format!("gui/{uid}/{}", unit.label);
-        let target = unit.unit_path.display().to_string();
-        // cheap bootstrap (fresh) → bootout stale → bootstrap fresh → kickstart.
-        let _ = run_supervisor("launchctl", &["bootstrap", &format!("gui/{uid}"), &target]);
-        let _ = run_supervisor("launchctl", &["bootout", &domain]);
-        let out = run_supervisor("launchctl", &["bootstrap", &format!("gui/{uid}"), &target])
-            .map_err(|e| anyhow::anyhow!("launchctl bootstrap: {e}"))?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "launchctl bootstrap failed: {} (unit at {}; load it by hand: launchctl bootstrap gui/{uid} {})",
-                String::from_utf8_lossy(&out.stderr),
-                unit.unit_path.display(),
-                target
-            );
-        }
-        let out = run_supervisor("launchctl", &["kickstart", "-k", &domain])
-            .map_err(|e| anyhow::anyhow!("launchctl kickstart: {e}"))?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "launchctl kickstart failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        Ok(())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let svc = &unit.label;
-        let out = run_supervisor("systemctl", &["--user", "daemon-reload"])
-            .map_err(|e| anyhow::anyhow!("systemctl daemon-reload: {e}"))?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "systemctl daemon-reload failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        let out = run_supervisor("systemctl", &["--user", "enable", "--now", svc])
-            .map_err(|e| anyhow::anyhow!("systemctl enable: {e}"))?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "systemctl enable --now {svc} failed: {} (unit at {}; enable it by hand: systemctl --user enable --now {svc})",
-                String::from_utf8_lossy(&out.stderr),
-                unit.unit_path.display()
-            );
-        }
-        Ok(())
-    }
 }
 
 /// Current uid via the daemon helper (`id -u`; keeps the binary unsafe-free).
@@ -387,8 +104,8 @@ fn users_uid() -> String {
     crate::daemon::current_uid()
 }
 
-/// Unload one supervised host and remove its unit file. Best-effort per
-/// unit (stop must keep going); failures are loud, never silent.
+/// Unload one duplicate unit and remove its file. Best-effort (stop must
+/// keep going); failures are loud, never silent.
 pub fn unload_host(home: &Path, workspace: &str) -> anyhow::Result<HostAction> {
     let label = host_label(workspace);
     #[cfg(target_os = "macos")]
@@ -430,7 +147,7 @@ pub fn unload_host(home: &Path, workspace: &str) -> anyhow::Result<HostAction> {
     })
 }
 
-/// Whether the supervisor reports this host loaded.
+/// Whether the supervisor reports this (duplicate) unit loaded.
 pub fn host_loaded(workspace: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -448,16 +165,39 @@ pub fn host_loaded(workspace: &str) -> bool {
             .unwrap_or(false)
     }
 }
+
+/// Retire every duplicate unit under `home`. Best-effort per unit, never
+/// errors — a stuck supervisor must not block the child it duplicates.
+pub fn retire_duplicate_units_in(home: &Path) -> Vec<HostAction> {
+    let mut done = Vec::new();
+    for entry in unit_dir(home)
+        .read_dir()
+        .map(|r| r.filter_map(|e| e.ok()).collect::<Vec<_>>())
+        .unwrap_or_default()
+    {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(ws) = unslug(&name) else { continue };
+        match unload_host(home, &ws) {
+            Ok(action) => {
+                println!("doorbell host retired (duplicate unit): {}", action.label);
+                done.push(action);
+            }
+            Err(e) => eprintln!("doorbell host {name}: retire failed: {e:#}"),
+        }
+    }
+    done
+}
+
 /// Install + load a supervised host for every armed workspace of the
-/// project detected from the cwd (mirrors the cron host). No project in
-/// scope: loud skip (hosts cannot be armed without one). Returns the
-/// per-workspace actions. `FLYWHEEL_DOORBELL_HOST_DRY_RUN=1` prints the
-/// plan instead (no writes, no loads).
-pub fn ensure_armed_hosts(cfg: &crate::config::Config) -> anyhow::Result<Vec<HostAction>> {
-    use anyhow::Context;
-    let dry_run = std::env::var(DRY_RUN_ENV).as_deref() == Ok("1");
+/// project detected from the cwd — now through the single owner: retire
+/// duplicate units first, then [`crate::doorbell::ensure_running`] per
+/// workspace (the cron-healed detached child). No project in scope: loud
+/// skip. Testable core is [`ensure_armed_hosts_in`].
+pub fn ensure_armed_hosts(cfg: &crate::config::Config) -> anyhow::Result<Vec<EnsuredChild>> {
     let Some(project) = crate::cron::detect_project(cfg, None) else {
-        eprintln!("doorbell hosts: no project in scope — skipping supervised hosts");
+        eprintln!(
+            "doorbell hosts: no project in scope — skipping (hosts cannot be armed without one)"
+        );
         return Ok(Vec::new());
     };
     let workspaces = crate::cmd::spawn::doorbell_project_workspaces(&project);
@@ -465,68 +205,86 @@ pub fn ensure_armed_hosts(cfg: &crate::config::Config) -> anyhow::Result<Vec<Hos
         eprintln!("doorbell hosts: {project} has no swarm workspace yet — attach after spawn");
         return Ok(Vec::new());
     }
-    let exe = std::env::current_exe().context("current_exe")?;
-    let home = home_dir()?;
-    // wave15-b: resolve the plane binaries NOW, while the operator PATH
-    // is available — the unit must never rely on launchd's minimal PATH.
-    let bins = [
-        doorbell_rt::binpath::resolve_cli("rex"),
-        doorbell_rt::binpath::resolve_cli("hc"),
-        doorbell_rt::binpath::resolve_cli("toron"),
-    ];
-    let path_dirs = unit_path_dirs(std::env::var_os("PATH").as_deref(), &exe, &bins);
-    let flywheel_backend = std::env::var("FLYWHEEL_BACKEND")
-        .ok()
-        .filter(|s| !s.is_empty());
+    let exe = std::env::current_exe()?;
+    let state_dir = crate::config::state_dir();
+    let home = home_dir().ok();
+    ensure_armed_hosts_in(&project, &workspaces, &exe, &state_dir, home.as_deref())
+}
+
+/// Testable core: duplicate retire (when `home` is Some) + one ensured
+/// child per workspace. `home: None` skips the retire with a note.
+pub fn ensure_armed_hosts_in(
+    project: &str,
+    workspaces: &[String],
+    exe: &Path,
+    state_dir: &Path,
+    home: Option<&Path>,
+) -> anyhow::Result<Vec<EnsuredChild>> {
+    use anyhow::Context;
+    match home {
+        Some(h) => {
+            retire_duplicate_units_in(h);
+        }
+        None => eprintln!("doorbell hosts: no HOME — skipping duplicate-unit retire"),
+    }
     let mut done = Vec::new();
-    for ws in &workspaces {
-        let spec = HostSpec {
-            exe: exe.clone(),
-            project: project.clone(),
+    for ws in workspaces {
+        let action = crate::doorbell::ensure_running(exe, state_dir, ws, project)
+            .with_context(|| format!("supervised child {project}/{ws}"))?;
+        println!("doorbell host {project}/{ws}: {action:?}");
+        done.push(EnsuredChild {
             workspace: ws.clone(),
-            state_dir: crate::config::state_dir(),
-            toron_mcp_url: toron_mcp_url(),
-            home: home.clone(),
-            flywheel_backend: flywheel_backend.clone(),
-            path_dirs: path_dirs.clone(),
-        };
-        let action = install_host(&spec, dry_run)
-            .with_context(|| format!("supervised host {project}/{ws}"))?;
-        println!(
-            "doorbell host {project}/{ws}: {} (loaded: {})",
-            action.unit_path.display(),
-            action.loaded
-        );
-        done.push(action);
+            action: format!("{action:?}"),
+        });
     }
     Ok(done)
 }
 
-/// Unload every supervised host unit found under the user unit dir
-/// (project-agnostic: stop owns the whole fleet's hosts). Best-effort per
-/// unit; failures are loud, never silent.
-pub fn unload_all_hosts() -> anyhow::Result<Vec<HostAction>> {
-    let home = home_dir()?;
-    let mut done = Vec::new();
-    for entry in unit_dir(&home)
-        .read_dir()
-        .map(|r| r.filter_map(|e| e.ok()).collect::<Vec<_>>())
-        .unwrap_or_default()
-    {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(ws) = unslug(&name) else { continue };
-        match unload_host(&home, &ws) {
-            Ok(action) => {
-                println!("doorbell host unloaded: {}", action.label);
-                done.push(action);
-            }
-            Err(e) => eprintln!("doorbell host {name}: unload failed: {e:#}"),
+/// Workspaces with dispatcher state under `state_dir` (a `<ws>.gen` file),
+/// regardless of pid liveness — stop owns them all.
+fn dispatcher_workspaces(state_dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(state_dir.join("doorbell")) else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("gen") {
+            continue;
+        }
+        if let Some(ws) = path.file_stem().and_then(|x| x.to_str()) {
+            out.push(ws.to_string());
         }
     }
+    out.sort();
+    out
+}
+
+/// Stop every detached child under `state_dir` plus retire leftover units
+/// under `home`. Best-effort per item, always Ok — stop must keep going.
+/// Returns human log lines (the daemon stop transcript).
+pub fn unload_all_hosts_in(home: &Path, state_dir: &Path) -> anyhow::Result<Vec<String>> {
+    let mut done = Vec::new();
+    for action in retire_duplicate_units_in(home) {
+        done.push(format!("retired {}", action.label));
+    }
+    for ws in dispatcher_workspaces(state_dir) {
+        crate::doorbell::stop(state_dir, &ws);
+        let line = format!("stopped {ws}");
+        println!("doorbell host {line}");
+        done.push(line);
+    }
     Ok(done)
 }
 
-/// One-line status for every installed supervised host.
+/// Unload every supervised host (project-agnostic: stop owns the whole
+/// fleet's hosts). See [`unload_all_hosts_in`].
+pub fn unload_all_hosts() -> anyhow::Result<Vec<String>> {
+    let home = home_dir()?;
+    unload_all_hosts_in(&home, &crate::config::state_dir())
+}
+
+/// One-line status for every leftover duplicate unit.
 pub fn hosts_status() -> Vec<(String, bool)> {
     let Ok(home) = home_dir() else {
         return Vec::new();
@@ -576,7 +334,7 @@ fn unit_dir(home: &Path) -> PathBuf {
     }
 }
 
-/// HOME for unit files + job env (launchd gives the job none).
+/// HOME for unit files (duplicate retire only — children never need it).
 fn home_dir() -> anyhow::Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -584,32 +342,9 @@ fn home_dir() -> anyhow::Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("HOME is unset or relative — cannot place host units"))
 }
 
-/// Daemon URL the host child uses (operator env wins; default is toron's
-/// documented daemon port).
-fn toron_mcp_url() -> String {
-    std::env::var("TORON_MCP_URL").unwrap_or_else(|_| "http://127.0.0.1:18080/mcp".to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn spec() -> HostSpec {
-        HostSpec {
-            exe: PathBuf::from("/opt/flywheel/bin/flywheel"),
-            project: "flywheel".into(),
-            workspace: "proj-oc".into(),
-            state_dir: PathBuf::from("/tmp/fw-state"),
-            toron_mcp_url: "http://127.0.0.1:18080/mcp".into(),
-            home: PathBuf::from("/tmp/fw-home"),
-            flywheel_backend: None,
-            path_dirs: vec![
-                PathBuf::from("/opt/flywheel/bin"),
-                PathBuf::from("/opt/rex/bin"),
-                PathBuf::from("/usr/bin"),
-            ],
-        }
-    }
 
     #[test]
     fn labels_slug_the_workspace() {
@@ -620,95 +355,12 @@ mod tests {
         assert_eq!(slug("a/b c"), "a-b-c");
     }
 
-    #[test]
-    fn render_pins_the_supervision_contract() {
-        let unit = render_host_unit(&spec());
-        // absolute binary + embedded entry + project/workspace routing
-        assert!(unit.body.contains("/opt/flywheel/bin/flywheel"));
-        assert!(unit.body.contains("__doorbell"));
-        assert!(unit.body.contains("--project"));
-        assert!(unit.body.contains("proj-oc"));
-        // supervision halves: restart on crash, backoff, fds, HOME
-        assert!(unit.body.contains("SuccessfulExit") || unit.body.contains("Restart=on-failure"));
-        assert!(unit.body.contains("4096"));
-        assert!(unit.body.contains("HOME"));
-        assert!(unit.body.contains("TORON_MCP_URL"));
-        // no second loop: the unit runs the one HostRunner entry, nothing else
-        assert!(!unit.body.contains("serve"));
-        // wave15-b: the unit PATH resolves the plane binaries at install
-        // time — no bare-name lookup under launchd's minimal PATH.
-        assert!(unit.body.contains("/opt/flywheel/bin"));
-        assert!(unit.body.contains("/opt/rex/bin"));
-        // no backend pin unless the operator configured one: auto resolves
-        // rex from the unit PATH.
-        assert!(!unit.body.contains("FLYWHEEL_BACKEND"));
-        let mut pinned = spec();
-        pinned.flywheel_backend = Some("hc".into());
-        assert!(render_host_unit(&pinned).body.contains("FLYWHEEL_BACKEND"));
-        // restart rule (documented choice): SuccessfulExit=false stays —
-        // deliberate retires (pid gone, workspace gone, daemon stop) must
-        // stay dead, not respawn-loop. Only the stale-binary retire exits
-        // nonzero, and launchd restarts exactly that one. `daemon start`
-        // kickstarts loaded units so a fresh binary takes over at once
-        // (proven by the shim-log test on load_unit, not the render).
-        assert!(
-            unit.body.contains("KeepAlive") || unit.body.contains("Restart=on-failure"),
-            "restart on crash, never on clean exit"
-        );
-    }
-
-    #[test]
-    fn unit_path_dirs_prefers_real_bins_over_shims() {
-        use std::ffi::OsString;
-        let exe = PathBuf::from("/opt/flywheel/bin/flywheel");
-        let bins = vec![Some(PathBuf::from("/opt/rex/bin/rex")), None];
-        let op: OsString = "/usr/bin:/home/op/.local/share/mise/shims:/home/op/bin".into();
-        let dirs = unit_path_dirs(Some(&op), &exe, &bins);
-        let names: Vec<_> = dirs.iter().map(|d| d.display().to_string()).collect();
-        assert_eq!(names[0], "/opt/flywheel/bin", "exe dir first");
-        assert!(names.contains(&"/opt/rex/bin".to_string()));
-        assert!(
-            !names.iter().any(|d| d.contains("mise/shims")),
-            "shims never ride the unit PATH: {names:?}"
-        );
-        assert!(names.contains(&"/home/op/bin".to_string()));
-        assert!(names.contains(&"/usr/bin".to_string()));
-        // no operator PATH: resolved dirs + system fallback only.
-        let dirs = unit_path_dirs(None, &exe, &bins);
-        assert!(
-            dirs.iter()
-                .all(|d| !d.display().to_string().contains("mise"))
-        );
-        assert!(dirs.contains(&PathBuf::from("/usr/bin")));
-    }
-
-    /// Sandbox install: temp HOME, deny-shim supervisor on PATH, dry run —
-    /// files land, no supervisor is contacted (shim log stays absent).
-    #[test]
-    fn dry_run_writes_nothing_and_contacts_nobody() {
-        let _g = crate::config::lock_env();
-        let (root, home, log, prev_path) = shimmed_sandbox("dry");
-        let mut s = spec();
-        s.home = home.clone();
-        s.state_dir = root.join("state");
-        let action = install_host(&s, true).expect("dry run installs the plan");
-        assert!(!action.loaded);
-        assert!(
-            action.unit_path.starts_with(&home),
-            "unit lands under temp HOME"
-        );
-        assert!(!log.exists(), "dry run must not contact the supervisor");
-        restore_path_and_clean(root, prev_path);
-    }
-
-    /// Sandbox supervisor: temp root with a deny-shim `launchctl` +
-    /// `systemctl` first on PATH (log argv, exit 1 — never the operator's
-    /// supervisor). Returns (root, home, shim log, previous PATH).
-    /// Callers restore PATH and remove the root when done.
-    fn shimmed_sandbox(tag: &str) -> (PathBuf, PathBuf, PathBuf, Option<std::ffi::OsString>) {
-        let root = std::env::temp_dir().join(format!("fw-host-{tag}-{}", std::process::id()));
+    /// Temp root with deny-shim `launchctl` + `systemctl` first on PATH
+    /// (log argv, exit 1 — never the operator's supervisor). Returns
+    /// (root, previous PATH). Callers restore PATH and remove the root.
+    fn shimmed_path(tag: &str) -> (PathBuf, Option<std::ffi::OsString>) {
+        let root = std::env::temp_dir().join(format!("fw-sup-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let home = root.join("home");
         let shim = root.join("bin");
         std::fs::create_dir_all(&shim).unwrap();
         let log = root.join("shim.log");
@@ -740,7 +392,7 @@ mod tests {
                 ),
             );
         }
-        (root, home, log, prev_path)
+        (root, prev_path)
     }
 
     fn restore_path_and_clean(root: PathBuf, prev_path: Option<std::ffi::OsString>) {
@@ -750,95 +402,82 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Load attempt with a deny-shim supervisor: loud failure, unit file
-    /// still written, shim log proves the bootstrap was attempted.
+    /// bd-supervisor-collab-rering-87gzr: ONE owner. Ensuring armed hosts
+    /// retires the duplicate launchd unit and owns the workspace through
+    /// the cron-healed detached child — no unit is ever (re)installed.
+    /// `/bin/true` stands in for the host exe: it exits at once, proving
+    /// the spawn path without running a host. `FLYWHEEL_NO_DOORBELL_ENSURE`
+    /// pins the daemon-probe arm off (hermetic: no operator daemon poked).
     #[test]
-    fn load_attempt_hits_the_shim_and_fails_loud() {
+    fn single_owner_ensures_children_and_installs_no_units() {
         let _g = crate::config::lock_env();
-        let (root, home, log, prev_path) = shimmed_sandbox("load");
-        let mut s = spec();
-        s.home = home.clone();
-        s.state_dir = root.join("state");
-        let err = install_host(&s, false).expect_err("deny-shim load must fail loud");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("launchctl") || msg.contains("systemctl"),
-            "failure names the supervisor: {msg}"
+        let (root, prev_path) = shimmed_path("owner");
+        let home = root.join("home");
+        // A leftover duplicate unit from the retired second owner.
+        let dup = unit_path(&home, "ws1");
+        std::fs::create_dir_all(dup.parent().unwrap()).unwrap();
+        std::fs::write(&dup, "stale duplicate unit").unwrap();
+        let state = root.join("state");
+        std::fs::create_dir_all(state.join("doorbell")).unwrap();
+        let prev_no_ensure = std::env::var_os("FLYWHEEL_NO_DOORBELL_ENSURE");
+        unsafe {
+            std::env::set_var("FLYWHEEL_NO_DOORBELL_ENSURE", "1");
+        }
+        let done = ensure_armed_hosts_in(
+            "proj",
+            &["ws1".to_string()],
+            std::path::Path::new("/bin/true"),
+            &state,
+            Some(&home),
+        )
+        .expect("ensure drives the single owner");
+        match prev_no_ensure {
+            Some(v) => unsafe { std::env::set_var("FLYWHEEL_NO_DOORBELL_ENSURE", v) },
+            None => unsafe { std::env::remove_var("FLYWHEEL_NO_DOORBELL_ENSURE") },
+        }
+        assert_eq!(done.len(), 1, "one workspace in, one child out");
+        assert_eq!(done[0].workspace, "ws1");
+        assert!(!dup.exists(), "the duplicate unit is retired, not reloaded");
+        let units_left = unit_dir(&home).read_dir().map(|r| r.count()).unwrap_or(0);
+        assert_eq!(
+            units_left, 0,
+            "no unit is (re)installed: the unit dir is empty after retire"
         );
         assert!(
-            unit_path(&home, "proj-oc").is_file(),
-            "unit file is written before the load attempt"
-        );
-        let logged = std::fs::read_to_string(&log).expect("shim log proves the attempt");
-        assert!(
-            logged.contains("bootstrap") || logged.contains("daemon-reload"),
-            "shim saw the load: {logged}"
-        );
-        // On a FAILED load there is nothing to kickstart: the failure is
-        // loud and no stale unit is kicked.
-        let restarted = logged
-            .lines()
-            .any(|l| l.starts_with("kickstart") || l.contains("--now"));
-        assert!(
-            !restarted,
-            "a failed load must not kick a unit that never loaded: {logged}"
+            crate::doorbell::pid_file(&state, "ws1").is_file(),
+            "the workspace is owned through the pid-locked child"
         );
         restore_path_and_clean(root, prev_path);
     }
 
-    /// `daemon start` on an already-loaded unit kickstarts it: a succeeding
-    /// shim records the full bootstrap/bootout/bootstrap/kickstart order.
+    /// Unload retires leftover units AND stops detached children (the
+    /// daemon stop path drives the one owner out of existence). Dead pid
+    /// 999998 is the stale-lock convention — killing it is a no-op.
     #[test]
-    fn load_success_kickstarts_the_fresh_unit() {
+    fn unload_retires_units_and_stops_children() {
         let _g = crate::config::lock_env();
-        let root = std::env::temp_dir().join(format!("fw-host-ok-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let (root, prev_path) = shimmed_path("unload");
         let home = root.join("home");
-        let shim = root.join("bin");
-        std::fs::create_dir_all(&shim).unwrap();
-        let log = root.join("shim.log");
-        for b in ["launchctl", "systemctl"] {
-            std::fs::write(
-                shim.join(b),
-                format!("#!/bin/sh\necho \"$@\" >> {}\nexit 0\n", log.display()),
-            )
-            .unwrap();
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for b in ["launchctl", "systemctl"] {
-                let p = shim.join(b);
-                let mut perms = std::fs::metadata(&p).unwrap().permissions();
-                perms.set_mode(0o755);
-                std::fs::set_permissions(&p, perms).unwrap();
-            }
-        }
-        let prev_path = std::env::var_os("PATH");
-        unsafe {
-            std::env::set_var(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    shim.display(),
-                    prev_path.clone().unwrap_or_default().into_string().unwrap()
-                ),
-            );
-        }
-        let mut s = spec();
-        s.home = home.clone();
-        s.state_dir = root.join("state");
-        let action = install_host(&s, false).expect("load succeeds with a working supervisor");
-        assert!(action.loaded);
-        let logged = std::fs::read_to_string(&log).unwrap();
-        let verbs: Vec<&str> = logged
-            .lines()
-            .map(|l| l.split_whitespace().next().unwrap_or(""))
-            .collect();
-        assert_eq!(
-            verbs,
-            vec!["bootstrap", "bootout", "bootstrap", "kickstart"],
-            "load order reloads the fresh unit and kickstarts it: {logged}"
+        let dup = unit_path(&home, "ws9");
+        std::fs::create_dir_all(dup.parent().unwrap()).unwrap();
+        std::fs::write(&dup, "stale duplicate unit").unwrap();
+        let state = root.join("state");
+        std::fs::create_dir_all(state.join("doorbell")).unwrap();
+        std::fs::write(crate::doorbell::pid_file(&state, "ws9"), "999998\n").unwrap();
+        std::fs::write(crate::doorbell::gen_file(&state, "ws9"), "{}\n").unwrap();
+        let done = unload_all_hosts_in(&home, &state).expect("unload keeps going past shims");
+        assert!(!dup.exists(), "duplicate unit retired");
+        assert!(
+            !crate::doorbell::pid_file(&state, "ws9").exists(),
+            "child pid cleared"
+        );
+        assert!(
+            !crate::doorbell::gen_file(&state, "ws9").exists(),
+            "child gen cleared"
+        );
+        assert!(
+            done.iter().any(|l| l.contains("ws9")),
+            "transcript names the child: {done:?}"
         );
         restore_path_and_clean(root, prev_path);
     }
