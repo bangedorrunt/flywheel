@@ -152,14 +152,8 @@ fn phase_dispatch_output(link_out: &Value) -> Value {
 /// does not self-certify). br unavailable / no tracker → the field stays
 /// absent and the contract fails loudly on "must inject".
 fn inject_dep_cycles(report: &mut Value, project_dir: &std::path::Path) {
-    let out = std::process::Command::new("br")
-        .arg("dep")
-        .arg("cycles")
-        .arg("--json")
-        .current_dir(project_dir)
-        .output();
-    if let Ok(o) = out
-        && let Ok(v) = serde_json::from_slice::<Value>(&o.stdout)
+    if let Ok(raw) = crate::br::run_br(Some(project_dir), &["dep", "cycles", "--json"])
+        && let Ok(v) = serde_json::from_str::<Value>(&raw)
     {
         let count = v.get("count").and_then(Value::as_u64).unwrap_or(u64::MAX);
         if let Some(obj) = report.as_object_mut() {

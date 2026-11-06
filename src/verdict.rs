@@ -174,7 +174,7 @@ pub fn parse_timebox(description: &str) -> Option<u64> {
 /// when absent, malformed, or the lookup fails (best-effort — the loop must
 /// never die on a missing TIMEBOX).
 pub fn bead_timebox_secs(cwd: &Path, bead_id: &str, default: u64) -> u64 {
-    let Ok(stdout) = run_br(cwd, &["show", bead_id, "--json"]) else {
+    let Ok(stdout) = crate::br::run_br(Some(cwd), &["show", bead_id, "--json"]) else {
         return default;
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
@@ -349,25 +349,6 @@ pub struct GateList {
     pub history: Vec<GateRow>,
 }
 
-/// Run `br` with `args` in `cwd`; stdout on success, stderr in the error.
-/// Same subprocess style as the existing br calls in the loop (no nested
-/// block_on).
-fn run_br(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let out = StdCommand::new("br")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .map_err(|e| anyhow::anyhow!("br not found: {e}"))?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "br {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
 /// Record a PASS verdict (ADR-0019 Spec 1): `br gate report <id> --gate
 /// <kind> --provider <actor> --status pass --note "sha=<sha> receipt=<path>"`.
 /// For the three command-verified kinds the note also carries `exit=0
@@ -415,8 +396,8 @@ pub fn report_pass(cwd: &Path, verdict: &Verdict) -> anyhow::Result<()> {
             verdict.receipt_path.display()
         ),
     };
-    let stdout = run_br(
-        cwd,
+    let stdout = crate::br::run_br(
+        Some(cwd),
         &[
             "gate",
             "report",
@@ -437,7 +418,7 @@ pub fn report_pass(cwd: &Path, verdict: &Verdict) -> anyhow::Result<()> {
 
 /// Wrap `br gate list <id> --json`.
 pub fn list_gates(cwd: &Path, bead_id: &str) -> anyhow::Result<GateList> {
-    let stdout = run_br(cwd, &["gate", "list", bead_id, "--json"])?;
+    let stdout = crate::br::run_br(Some(cwd), &["gate", "list", bead_id, "--json"])?;
     Ok(serde_json::from_str(stdout.trim())?)
 }
 
@@ -690,7 +671,7 @@ fn load_bead(cwd: &Path, bead_id: &str, require_verify: bool) -> anyhow::Result<
         priority: u8,
         verify: Option<String>,
     }
-    let stdout = run_br(cwd, &["show", bead_id, "--json"])?;
+    let stdout = crate::br::run_br(Some(cwd), &["show", bead_id, "--json"])?;
     let v: serde_json::Value = serde_json::from_str(stdout.trim())?;
     let row_val = if v.is_array() {
         v.get(0).cloned().unwrap_or(serde_json::Value::Null)
@@ -1686,88 +1667,15 @@ mod tests {
     /// and not a command (bd-tfxv).
     fn scratch_workspace_with_verify(tag: &str, verify: Option<&str>) -> (PathBuf, String) {
         let dir = std::env::temp_dir().join(format!("{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let init = StdCommand::new("git")
-            .args(["init", "-q"])
-            .current_dir(&dir)
-            .output()
-            .expect("git init");
-        assert!(init.status.success(), "git init");
-        let bi = StdCommand::new("br")
-            .arg("init")
-            .current_dir(&dir)
-            .output()
-            .expect("br init");
-        assert!(
-            bi.status.success(),
-            "br init: {}",
-            String::from_utf8_lossy(&bi.stderr)
-        );
-        std::fs::write(
-            dir.join(".beads/policy.yaml"),
+        let bead_id = crate::br::scratch_bead(
+            &dir,
             "workflow:\n  transitions:\n    open:\n      - closed\n  gates:\n    open -> closed:\n      require_all:\n        - command-verified\n",
-        )
-        .unwrap();
-        let mut args: Vec<&str> = match verify {
-            Some(_) => vec![
-                "create",
-                "--title",
-                "gate roundtrip",
-                "--slug",
-                "gate-rt-1",
-                "-p",
-                "3",
-                "-d",
-                "work",
-            ],
-            None => vec!["q", "gate roundtrip", "-p", "3", "-d", "work"],
-        };
-        if let Some(v) = verify {
-            args.extend(["--verify", v]);
-        }
-        let created = StdCommand::new("br")
-            .args(&args)
-            .current_dir(&dir)
-            .output()
-            .expect("br create");
-        assert!(
-            created.status.success(),
-            "br create: {}",
-            String::from_utf8_lossy(&created.stderr)
-        );
-        let list = StdCommand::new("br")
-            .args(["list", "--json"])
-            .current_dir(&dir)
-            .output()
-            .expect("br list");
-        let v: serde_json::Value = serde_json::from_slice(&list.stdout).expect("br list json");
-        let bead_id = v["issues"][0]["id"].as_str().expect("bead id").to_string();
-        std::fs::write(dir.join("work.txt"), "work\n").unwrap();
-        let add = StdCommand::new("git")
-            .args(["add", "-A"])
-            .current_dir(&dir)
-            .output()
-            .expect("git add");
-        assert!(add.status.success());
-        let cm = StdCommand::new("git")
-            .args([
-                "-c",
-                "user.email=test@test",
-                "-c",
-                "user.name=test",
-                "commit",
-                "-q",
-                "-m",
-                &format!("feat: gate roundtrip ({bead_id})"),
-            ])
-            .current_dir(&dir)
-            .output()
-            .expect("git commit");
-        assert!(
-            cm.status.success(),
-            "git commit: {}",
-            String::from_utf8_lossy(&cm.stderr)
+            "gate roundtrip",
+            "gate-rt-1",
+            "3",
+            verify,
+            None,
+            Some("gate roundtrip"),
         );
         (dir, bead_id)
     }
@@ -1907,8 +1815,9 @@ mod tests {
     #[test]
     fn a_command_verified_note_without_a_tail_is_not_legal() {
         fn report_note(dir: &Path, bead_id: &str, gate: &str, note: &str) {
-            let out = StdCommand::new("br")
-                .args([
+            crate::br::run_br(
+                Some(dir),
+                &[
                     "gate",
                     "report",
                     bead_id,
@@ -1920,15 +1829,9 @@ mod tests {
                     "pass",
                     "--note",
                     note,
-                ])
-                .current_dir(dir)
-                .output()
-                .expect("br gate report");
-            assert!(
-                out.status.success(),
-                "br gate report {gate}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+                ],
+            )
+            .expect("br gate report");
         }
         let pid = std::process::id();
 
@@ -2568,19 +2471,18 @@ mod tests {
     fn close_check_reopens_when_worker_closes_without_gate_row() {
         let (dir, bead_id) = scratch_workspace("reopen-red-green");
         let sha = derive_head_sha(&dir, &bead_id).unwrap();
-        let cm = StdCommand::new("br")
-            .args([
+        crate::br::run_br(
+            Some(&dir),
+            &[
                 "close",
                 &bead_id,
                 "--reason",
                 "worker says done",
                 "--commit-sha",
                 &sha,
-            ])
-            .current_dir(&dir)
-            .output()
-            .expect("br close");
-        assert!(cm.status.success(), "br close: {cm:?}");
+            ],
+        )
+        .expect("br close");
         match close_check(&dir, &bead_id).unwrap() {
             CloseCheck::Missing {
                 sha,
@@ -2608,8 +2510,9 @@ mod tests {
         let bead = bead_from_br_show(&dir, &bead_id).unwrap();
         let tail = dir.join("tail.txt");
         std::fs::write(&tail, "test result: ok\n").unwrap();
-        let gate = StdCommand::new("br")
-            .args([
+        crate::br::run_br(
+            Some(&dir),
+            &[
                 "gate",
                 "report",
                 &bead_id,
@@ -2626,24 +2529,21 @@ mod tests {
                     tail.display(),
                     bead.verify,
                 ),
-            ])
-            .current_dir(&dir)
-            .output()
-            .expect("br gate report");
-        assert!(gate.status.success(), "br gate report: {gate:?}");
-        let cm = StdCommand::new("br")
-            .args([
+            ],
+        )
+        .expect("br gate report");
+        crate::br::run_br(
+            Some(&dir),
+            &[
                 "close",
                 &bead_id,
                 "--reason",
                 "verified",
                 "--commit-sha",
                 &sha,
-            ])
-            .current_dir(&dir)
-            .output()
-            .expect("br close");
-        assert!(cm.status.success(), "br close: {cm:?}");
+            ],
+        )
+        .expect("br close");
         assert_eq!(
             close_check(&dir, &bead_id).unwrap(),
             CloseCheck::Legal { sha },
@@ -2658,19 +2558,18 @@ mod tests {
     fn close_check_no_commit_is_no_commit() {
         let (dir, bead_id) = scratch_workspace("reopen-nocommit");
         let sha = derive_head_sha(&dir, &bead_id).unwrap();
-        let cm = StdCommand::new("br")
-            .args([
+        crate::br::run_br(
+            Some(&dir),
+            &[
                 "close",
                 &bead_id,
                 "--reason",
                 "no commit behind this",
                 "--commit-sha",
                 &sha,
-            ])
-            .current_dir(&dir)
-            .output()
-            .expect("br close");
-        assert!(cm.status.success(), "br close: {cm:?}");
+            ],
+        )
+        .expect("br close");
         let strip = StdCommand::new("git")
             .args(["update-ref", "-d", "HEAD"])
             .current_dir(&dir)
@@ -2690,8 +2589,9 @@ mod tests {
     #[test]
     fn close_check_grants_receipt_grace_when_worker_receipt_is_legal() {
         let (dir, _bead1) = scratch_workspace("reopen-grace");
-        let created = StdCommand::new("br")
-            .args([
+        let bead_id = crate::br::Bead::create(
+            Some(&dir),
+            &[
                 "create",
                 "--title",
                 "receipt bead",
@@ -2703,27 +2603,9 @@ mod tests {
                 "work",
                 "--verify",
                 "cd x && cargo test -p y z",
-            ])
-            .current_dir(&dir)
-            .output()
-            .expect("br create");
-        assert!(created.status.success(), "br create: {created:?}");
-        let list = StdCommand::new("br")
-            .args(["list", "--json"])
-            .current_dir(&dir)
-            .output()
-            .expect("br list");
-        let v: serde_json::Value = serde_json::from_slice(&list.stdout).expect("list json");
-        let bead_id = v["issues"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|i| i["title"] == "receipt bead")
-            .expect("receipt bead")
-            .get("id")
-            .and_then(|s| s.as_str())
-            .expect("id")
-            .to_string();
+            ],
+        )
+        .expect("br create");
         std::fs::write(dir.join("receipt-work.txt"), "work\n").unwrap();
         let add = StdCommand::new("git")
             .args(["add", "-A"])
@@ -2747,19 +2629,18 @@ mod tests {
             .expect("git commit");
         assert!(cm.status.success(), "git commit: {cm:?}");
         let close_sha = derive_head_sha(&dir, &bead_id).unwrap();
-        let close = StdCommand::new("br")
-            .args([
+        crate::br::run_br(
+            Some(&dir),
+            &[
                 "close",
                 &bead_id,
                 "--reason",
                 "receipt on the way",
                 "--commit-sha",
                 &close_sha,
-            ])
-            .current_dir(&dir)
-            .output()
-            .expect("br close");
-        assert!(close.status.success(), "br close: {close:?}");
+            ],
+        )
+        .expect("br close");
         match close_check(&dir, &bead_id).unwrap() {
             CloseCheck::Missing {
                 sha,

@@ -37,21 +37,10 @@ impl Bv {
 
     /// Run `br <cmd> --json` for tracker introspection.
     pub fn br_json(&self, args: &[&str]) -> Result<Value> {
-        let out = Command::new("br")
-            .args(args)
-            .arg("--json")
-            .current_dir(&self.cwd)
-            .output()
-            .map_err(|e| anyhow::anyhow!("br not found: {e}"))?;
-        if !out.status.success() {
-            bail!(
-                "br {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        Ok(serde_json::from_str(stdout.trim())
-            .unwrap_or_else(|_| serde_json::json!({ "raw": stdout.trim() })))
+        let mut full: Vec<&str> = args.to_vec();
+        full.push("--json");
+        let raw = crate::br::run_br(Some(std::path::Path::new(&self.cwd)), &full)?;
+        Ok(serde_json::from_str(raw.trim())
+            .unwrap_or_else(|_| serde_json::json!({ "raw": raw.trim() })))
     }
 }

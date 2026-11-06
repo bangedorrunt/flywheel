@@ -64,18 +64,7 @@ fn cmd_work_check(cfg: &Config, project: Option<&str>) -> Result<()> {
         Some(p) => crate::project_dir(cfg, p),
         None => std::env::current_dir()?,
     };
-    let out = std::process::Command::new("br")
-        .args(["ready", "--json"])
-        .current_dir(&dir)
-        .output()
-        .map_err(|e| anyhow::anyhow!("br ready: {e}"))?;
-    if !out.status.success() {
-        bail!(
-            "br ready failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let ready = crate::parse_ready_beads_json(&String::from_utf8_lossy(&out.stdout))?;
+    let ready = crate::br::Bead::ready(Some(&dir))?;
     let mut issues: Vec<crate::durable::BeadContractIssue> = Vec::new();
     for b in &ready {
         let desc = bead_description(&dir, &b.id);
@@ -102,17 +91,10 @@ fn cmd_work_check(cfg: &Config, project: Option<&str>) -> Result<()> {
 /// failure — a missing description only yields the fence/PRINCIPLES
 /// verdicts the ready JSON already expresses).
 fn bead_description(dir: &std::path::Path, id: &str) -> String {
-    let Ok(out) = std::process::Command::new("br")
-        .args(["show", id, "--json"])
-        .current_dir(dir)
-        .output()
-    else {
+    let Ok(raw) = crate::br::run_br(Some(dir), &["show", id, "--json"]) else {
         return String::new();
     };
-    if !out.status.success() {
-        return String::new();
-    }
-    serde_json::from_slice::<serde_json::Value>(&out.stdout)
+    serde_json::from_str::<serde_json::Value>(&raw)
         .ok()
         .and_then(|v| {
             v.as_array()

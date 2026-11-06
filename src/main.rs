@@ -21,6 +21,7 @@ mod artifact;
 mod authority;
 mod awareness;
 mod backend;
+mod br;
 mod briefing;
 mod builtin_workflows;
 mod captain_directory;
@@ -4005,16 +4006,8 @@ fn cmd_init(cfg: &Config, project: &str) -> Result<()> {
     if dir.join(".beads").exists() {
         println!("beads already initialized in {}", dir.display());
     } else {
-        let out = Command::new("br")
-            .args(["init", "--prefix", "bd"])
-            .current_dir(&dir)
-            .output()
-            .map_err(|e| anyhow!("br not found: {e}"))?;
-        if out.status.success() {
-            println!("initialized beads in {}", dir.display());
-        } else {
-            bail!("br init failed: {}", String::from_utf8_lossy(&out.stderr));
-        }
+        crate::br::run_br(Some(&dir), &["init", "--prefix", "bd"])?;
+        println!("initialized beads in {}", dir.display());
     }
     let (created, kept) = crate::init_scaffold::scaffold(&dir)?;
     for path in &created {
@@ -11333,24 +11326,10 @@ fn digest_roster_lines(cfg: &Config, project: &str, now: u64) -> Vec<String> {
         }
     }
     let mut beads: std::collections::BTreeMap<String, String> = Default::default();
-    if let Ok(out) = std::process::Command::new("br")
-        .args(["list", "--status", "in_progress", "--json"])
-        .output()
-        && out.status.success()
-        && let Ok(v) =
-            serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&out.stdout))
-    {
-        let issues = v
-            .get("issues")
-            .and_then(|i| i.as_array())
-            .cloned()
-            .unwrap_or_default();
-        for issue in issues {
-            if let (Some(id), Some(who)) = (
-                issue.get("id").and_then(|i| i.as_str()),
-                issue.get("assignee").and_then(|a| a.as_str()),
-            ) {
-                beads.insert(who.to_string(), id.to_string());
+    if let Ok(rows) = crate::br::Bead::in_progress(None) {
+        for b in rows {
+            if let Some(who) = b.assignee {
+                beads.insert(who, b.id);
             }
         }
     }
@@ -16763,27 +16742,6 @@ fn progress_waves(rows: &[Value], ready_ids: &HashSet<String>) -> Value {
     })
 }
 
-/// `br list --json` / `br ready --json` issue rows, envelope-tolerant (bare
-/// array or `{"issues":[...]}`, the schema-18 pagination envelope). An
-/// unrecognized object shape is loud — a progress board must never read
-/// empty because a shape changed.
-fn parse_issue_rows_json(raw: &str, what: &str) -> Result<Vec<Value>> {
-    let v: Value =
-        serde_json::from_str(raw.trim()).map_err(|e| anyhow!("{what} bad JSON: {e}: {raw}"))?;
-    match &v {
-        Value::Array(items) => Ok(items.clone()),
-        Value::Object(obj) => {
-            let issues = obj.get("issues").cloned().unwrap_or_default();
-            anyhow::ensure!(
-                issues.is_array(),
-                "{what}: unrecognized object shape (expected issues array): {raw}"
-            );
-            Ok(issues.as_array().cloned().unwrap_or_default())
-        }
-        _ => bail!("{what}: expected array or issues object: {raw}"),
-    }
-}
-
 /// bd-swarm-cockpit-pczs: `flywheel progress` — beads grouped by their
 /// `wave-N` label with the wave currently dispatching. The project comes from
 /// the positional / `--project`, or the workspace cwd (same inherit rule as
@@ -16798,26 +16756,12 @@ fn cmd_progress(cfg: &Config, project: Option<&str>, json_out: bool) -> Result<(
     })?;
     check_project_spelling(&project, "progress")?;
     let dir = project_dir(cfg, &project);
-    let run_br = |args: &[&str]| -> Result<String> {
-        let out = std::process::Command::new("br")
-            .args(args)
-            .current_dir(&dir)
-            .output()
-            .map_err(|e| anyhow!("br not found: {e}"))?;
-        if !out.status.success() {
-            bail!(
-                "br {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    };
-    let rows = parse_issue_rows_json(&run_br(&["list", "--status", "all", "--json"])?, "br list")?;
-    let ready_ids: HashSet<String> = parse_ready_beads_json(&run_br(&["ready", "--json"])?)?
-        .into_iter()
-        .map(|b| b.id)
-        .collect();
+    let rows = crate::br::Bead::list_issues(Some(&dir), &["--status", "all"], "br list")?;
+    let ready_ids: HashSet<String> =
+        crate::br::parse_ready_beads_json(&crate::br::run_br(Some(&dir), &["ready", "--json"])?)?
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
     let mut out = progress_waves(&rows, &ready_ids);
     out["project"] = json!(project);
     if json_out || !std::io::stdout().is_terminal() {
@@ -22332,13 +22276,7 @@ fn repo_evidence_verified(
     }
     let bead =
         review_bead.ok_or_else(|| anyhow!("{what}: repo promotion needs --review-bead <id>"))?;
-    let ok = std::process::Command::new("br")
-        .args(["show", bead])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let ok = crate::br::Bead::exists(None, bead);
     if !ok {
         bail!("{what}: review bead {bead:?} not found (br show {bead})");
     }
@@ -22561,141 +22499,11 @@ fn build_queue(
     Ok(items)
 }
 
-/// Parse `br ready --json` (array) into `ReadyBead`s. Shared by the `__ready`
-/// leaf and the sync-loop `--work` source (single source of truth).
-fn parse_ready_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
-    let v: Value =
-        serde_json::from_str(raw.trim()).map_err(|e| anyhow!("br ready bad JSON: {e}: {raw}"))?;
-    let beads: Vec<Value> = match &v {
-        Value::Array(items) => items.clone(),
-        Value::Object(obj) => {
-            let issues = obj.get("issues").cloned().unwrap_or_default();
-            anyhow::ensure!(
-                issues.is_array(),
-                "br ready JSON: unrecognized object shape (expected issues array): {raw}"
-            );
-            issues.as_array().cloned().unwrap_or_default()
-        }
-        _ => anyhow::bail!("br ready JSON: expected array or issues object: {raw}"),
-    };
-    Ok(beads
-        .into_iter()
-        .map(|b| durable::ReadyBead {
-            id: b
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            title: b
-                .get("title")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            assignee: b
-                .get("assignee")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
-            verify: b
-                .get("verify")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
-            labels: b
-                .get("labels")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default(),
-            wave: durable::bead_wave_field(&b),
-            priority: b
-                .get("priority")
-                .and_then(Value::as_u64)
-                .map(|p| p.min(u64::from(u8::MAX)) as u8)
-                .unwrap_or(3),
-            principles: durable::principles_typed_field(&b),
-            updated_at: None,
-            ..Default::default()
-        })
-        .collect())
-}
-
-/// Parse `br list --status in_progress --json` (wrapped under "issues").
-/// Shared by the `__inprogress` leaf and the sync-loop `--work` source.
-fn parse_inprogress_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
-    let v: Value =
-        serde_json::from_str(raw.trim()).map_err(|e| anyhow!("br list bad JSON: {e}: {raw}"))?;
-    let list: &Vec<Value> = v
-        .get("issues")
-        .and_then(Value::as_array)
-        .or_else(|| v.as_array())
-        .ok_or_else(|| anyhow!("br list output has no issues array: {raw}"))?;
-    Ok(list
-        .iter()
-        .map(|b| durable::ReadyBead {
-            id: b
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            title: b
-                .get("title")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            assignee: b
-                .get("assignee")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
-            verify: b
-                .get("verify")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
-            labels: b
-                .get("labels")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default(),
-            wave: durable::bead_wave_field(b),
-            priority: b
-                .get("priority")
-                .and_then(Value::as_u64)
-                .map(|p| p.min(u64::from(u8::MAX)) as u8)
-                .unwrap_or(3),
-            principles: durable::principles_typed_field(b),
-            updated_at: None,
-            ..Default::default()
-        })
-        .collect())
-}
-
 /// Run `br ready --json` in the project dir, returning the ready beads.
 /// Caller decides how to treat an error (the sync loop soft-fails).
 pub(crate) fn load_ready_beads(cfg: &Config, project: &str) -> Result<Vec<durable::ReadyBead>> {
     let dir = project_dir(cfg, project);
-    let out = std::process::Command::new("br")
-        .args(["ready", "--json"])
-        .current_dir(&dir)
-        .output()
-        .map_err(|e| anyhow!("br not found: {e}"))?;
-    if !out.status.success() {
-        bail!(
-            "br ready failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    parse_ready_beads_json(&String::from_utf8_lossy(&out.stdout))
+    crate::br::Bead::ready(Some(&dir))
 }
 
 /// Run `br list --status in_progress --json` in the project dir.
@@ -22704,18 +22512,7 @@ pub(crate) fn load_inprogress_beads(
     project: &str,
 ) -> Result<Vec<durable::ReadyBead>> {
     let dir = project_dir(cfg, project);
-    let out = std::process::Command::new("br")
-        .args(["list", "--status", "in_progress", "--json"])
-        .current_dir(&dir)
-        .output()
-        .map_err(|e| anyhow!("br not found: {e}"))?;
-    if !out.status.success() {
-        bail!(
-            "br list failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    parse_inprogress_beads_json(&String::from_utf8_lossy(&out.stdout))
+    crate::br::Bead::in_progress(Some(&dir))
 }
 
 /// Sync-loop `--work` queue refresh (parity with the durable loop's
@@ -23990,71 +23787,20 @@ mod verifier_dispatch_tests {
 
     /// Scratch workspace: git + br + one bead with a typed `verify` field.
     fn scratch_vd(dir: &Path, slug: &str, priority: &str) -> String {
-        let _ = std::fs::remove_dir_all(dir);
-        std::fs::create_dir_all(dir).unwrap();
-        let init = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(dir)
-            .output()
-            .expect("git init");
-        assert!(init.status.success());
-        let bi = std::process::Command::new("br")
-            .arg("init")
-            .current_dir(dir)
-            .output()
-            .expect("br init");
-        assert!(bi.status.success());
-        std::fs::write(
-            dir.join(".beads/policy.yaml"),
+        crate::br::scratch_bead(
+            dir,
             "workflow:\n  strict: true\n  statuses: [open, in_progress, closed, deferred, blocked]\n  transitions:\n    open: [in_progress, closed, deferred, blocked]\n    in_progress: [open, closed, deferred]\n    deferred: [open]\n    closed: [open]\n",
+            "vd",
+            slug,
+            priority,
+            Some("cargo test -p flywheel verifier"),
+            Some("prove-it-works — fixture carries runnable VERIFY fence, not a self-report"),
+            None,
         )
-        .unwrap();
-        let created = std::process::Command::new("br")
-            .args([
-                "create",
-                "--title",
-                "vd",
-                "--slug",
-                slug,
-                "-p",
-                priority,
-                "-d",
-                "work",
-                "--verify",
-                "cargo test -p flywheel verifier",
-                "--principle",
-                "prove-it-works — fixture carries runnable VERIFY fence, not a self-report",
-            ])
-            .current_dir(dir)
-            .output()
-            .expect("br create");
-        assert!(
-            created.status.success(),
-            "br create: {}",
-            String::from_utf8_lossy(&created.stderr)
-        );
-        let list = std::process::Command::new("br")
-            .args(["list", "--json"])
-            .current_dir(dir)
-            .output()
-            .expect("br list");
-        let v: Value = serde_json::from_slice(&list.stdout).expect("br list json");
-        v["issues"][0]["id"].as_str().expect("id").to_string()
     }
 
     fn status_of(dir: &Path, bead_id: &str) -> String {
-        let out = std::process::Command::new("br")
-            .args(["show", bead_id, "--json"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-        let bead = match &v {
-            Value::Array(items) => items.first().cloned().unwrap_or(Value::Null),
-            obj @ Value::Object(_) => obj.clone(),
-            _ => Value::Null,
-        };
-        bead["status"].as_str().unwrap_or("").to_string()
+        crate::br::bead_status(dir, bead_id)
     }
 
     /// A config whose mail backend fails FAST (daemon at port 1) so the
@@ -24176,45 +23922,16 @@ mod loop_run_verify_tests {
     use super::*;
 
     fn scratch_lrv(dir: &Path, slug: &str, verify: &str) -> String {
-        let _ = std::fs::remove_dir_all(dir);
-        std::fs::create_dir_all(dir).unwrap();
-        let init = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(dir)
-            .output()
-            .expect("git init");
-        assert!(init.status.success());
-        let bi = std::process::Command::new("br")
-            .arg("init")
-            .current_dir(dir)
-            .output()
-            .expect("br init");
-        assert!(bi.status.success());
-        std::fs::write(
-            dir.join(".beads/policy.yaml"),
+        crate::br::scratch_bead(
+            dir,
             "workflow:\n  transitions:\n    open:\n      - closed\n    closed:\n      - closed\n  gates:\n    open -> closed:\n      require_all:\n        - command-verified\n    closed -> closed:\n      require_all:\n        - command-verified\n",
+            "lrv",
+            slug,
+            "3",
+            Some(verify),
+            None,
+            None,
         )
-        .unwrap();
-        let created = std::process::Command::new("br")
-            .args([
-                "create", "--title", "lrv", "--slug", slug, "-p", "3", "-d", "work", "--verify",
-                verify,
-            ])
-            .current_dir(dir)
-            .output()
-            .expect("br create");
-        assert!(
-            created.status.success(),
-            "br create: {}",
-            String::from_utf8_lossy(&created.stderr)
-        );
-        let list = std::process::Command::new("br")
-            .args(["list", "--json"])
-            .current_dir(dir)
-            .output()
-            .expect("br list");
-        let v: Value = serde_json::from_slice(&list.stdout).expect("br list json");
-        v["issues"][0]["id"].as_str().expect("id").to_string()
     }
 
     fn commit_and_sha(dir: &Path, bead_id: &str) -> String {
@@ -24255,18 +23972,7 @@ mod loop_run_verify_tests {
     }
 
     fn status_of(dir: &Path, bead_id: &str) -> String {
-        let out = std::process::Command::new("br")
-            .args(["show", bead_id, "--json"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-        let bead = match &v {
-            Value::Array(items) => items.first().cloned().unwrap_or(Value::Null),
-            obj @ Value::Object(_) => obj.clone(),
-            _ => Value::Null,
-        };
-        bead["status"].as_str().unwrap_or("").to_string()
+        crate::br::bead_status(dir, bead_id)
     }
 
     fn no_mail_cfg() -> Config {
@@ -24292,19 +23998,18 @@ mod loop_run_verify_tests {
         let dir = std::env::temp_dir().join(format!("lrv-ok-{}", std::process::id()));
         let bead_id = scratch_lrv(&dir, "lrv-ok", "test -f work.txt");
         let sha = commit_and_sha(&dir, &bead_id);
-        let close = std::process::Command::new("br")
-            .args([
+        crate::br::run_br(
+            Some(&dir),
+            &[
                 "close",
                 &bead_id,
                 "--reason",
                 "worker done",
                 "--commit-sha",
                 &sha,
-            ])
-            .current_dir(&dir)
-            .output()
-            .unwrap();
-        assert!(close.status.success());
+            ],
+        )
+        .unwrap();
         let o =
             loop_run_verify_exec(&cfg, "lrv-test", &bead_id, &sha, Some(60), Some(&dir)).unwrap();
         assert_eq!(o.band, "loop-runnable");
@@ -24571,45 +24276,6 @@ mod loop_tests {
         assert!(!p.contains("br update"));
     }
 
-    #[test]
-    fn parse_ready_beads_json_handles_array_shape() {
-        let raw = r#"[{"id":"bd-a","title":"one"},{"id":"bd-b","title":"two"}]"#;
-        let beads = parse_ready_beads_json(raw).unwrap();
-        assert_eq!(beads.len(), 2);
-        assert_eq!(beads[0].id, "bd-a");
-        assert_eq!(beads[1].title, "two");
-    }
-
-    /// bd-gnej: the ready parser carries the bead's labels — the wave-gate
-    /// reads `wave-N` off them. Absent labels → empty vec.
-    #[test]
-    fn parse_ready_beads_json_carries_labels() {
-        let raw = r#"[{"id":"bd-a","title":"one","labels":["wave-1","docs"]},{"id":"bd-b","title":"two"}]"#;
-        let beads = parse_ready_beads_json(raw).unwrap();
-        assert_eq!(beads[0].labels, vec!["wave-1", "docs"]);
-        assert!(beads[1].labels.is_empty(), "absent labels -> empty");
-    }
-
-    /// bd-wave-gate-typed-authority-27et: br's typed `wave` field flows
-    /// through the ready parser (number; absent/null -> None, never 0).
-    #[test]
-    fn parse_ready_beads_json_carries_typed_wave() {
-        let raw = r#"[{"id":"bd-w","title":"w","wave":3},{"id":"bd-n","title":"n","wave":null}]"#;
-        let beads = parse_ready_beads_json(raw).unwrap();
-        assert_eq!(beads[0].wave, Some(3));
-        assert_eq!(beads[1].wave, None, "null -> no wave, not 0");
-    }
-
-    #[test]
-    fn parse_inprogress_beads_json_handles_issues_wrapper() {
-        let raw = r#"{"issues":[{"id":"bd-c","title":"three"}],"total":1}"#;
-        let beads = parse_inprogress_beads_json(raw).unwrap();
-        assert_eq!(beads.len(), 1);
-        assert_eq!(beads[0].id, "bd-c");
-        let beads = parse_inprogress_beads_json(r#"[{"id":"bd-d","title":"four"}]"#).unwrap();
-        assert_eq!(beads[0].id, "bd-d");
-    }
-
     /// bd-swarm-cockpit-pczs: `progress_waves` groups by `wave-N`, counts an
     /// open bead `ready` only when `br ready` listed it, and names the LOWEST
     /// wave holding ready/in-progress work as dispatching. Unlabeled beads
@@ -24670,56 +24336,6 @@ mod loop_tests {
         let rows3 = json!([{"id": "bd-z", "status": "closed", "labels": ["wave-1"]}]);
         let out3 = progress_waves(rows3.as_array().unwrap(), &HashSet::<String>::new());
         assert_eq!(out3["dispatching_wave"], Value::Null);
-    }
-
-    /// bd-swarm-cockpit-pczs: both br envelopes parse; an unrecognized object
-    /// shape fails loud (a progress board must not read empty on a shape drift).
-    #[test]
-    fn parse_issue_rows_json_accepts_both_envelopes_and_refuses_unknown() {
-        let bare = parse_issue_rows_json(r#"[{"id":"bd-a","status":"open"}]"#, "br list").unwrap();
-        assert_eq!(bare.len(), 1);
-        let wrapped =
-            parse_issue_rows_json(r#"{"issues":[{"id":"bd-b"}],"total":1}"#, "br list").unwrap();
-        assert_eq!(wrapped.len(), 1);
-        assert!(parse_issue_rows_json(r#"{"rows":[]}"#, "br list").is_err());
-        assert!(parse_issue_rows_json("not json", "br list").is_err());
-    }
-
-    /// bd-627z.1: the in-progress parser carries the assignee (drives the
-    /// stranded-reclaim + scoped-completion decision); absent/empty → None.
-    #[test]
-    fn parse_inprogress_beads_json_carries_assignee() {
-        let raw = r#"{"issues":[
-            {"id":"bd-a","title":"one","assignee":"oc"},
-            {"id":"bd-b","title":"two","assignee":"captain"},
-            {"id":"bd-c","title":"three"},
-            {"id":"bd-d","title":"four","assignee":""}
-        ]}"#;
-        let beads = parse_inprogress_beads_json(raw).unwrap();
-        assert_eq!(beads[0].assignee.as_deref(), Some("oc"));
-        assert_eq!(beads[1].assignee.as_deref(), Some("captain"));
-        assert_eq!(beads[2].assignee, None, "absent assignee -> None");
-        assert_eq!(beads[3].assignee, None, "empty assignee -> None");
-    }
-
-    /// `br ready --json` rows carry the typed `verify` field; it flows into
-    /// `ReadyBead.verify`. Missing/empty field -> verify = None (the bead
-    /// is NOT ready — refuse-to-dispatch).
-    #[test]
-    fn typed_verify_parse_ready_beads_json_populates_verify() {
-        let raw = serde_json::to_string(&serde_json::json!([
-            {"id":"bd-a","title":"one","verify":"cargo test -p flywheel verify_fence"},
-            {"id":"bd-b","title":"two","verify":""}
-        ]))
-        .unwrap();
-        let beads = parse_ready_beads_json(&raw).unwrap();
-        assert_eq!(beads.len(), 2);
-        assert_eq!(
-            beads[0].verify.as_deref(),
-            Some("cargo test -p flywheel verify_fence"),
-            "typed field -> verify command"
-        );
-        assert_eq!(beads[1].verify, None, "empty field -> not ready");
     }
 
     /// ADR-0019 acceptance: a bead without a fence must be refused at
@@ -24893,72 +24509,16 @@ mod loop_tests {
     /// this test used to trip on).
     fn scratch_workspace(tag: &str) -> (std::path::PathBuf, String) {
         let dir = std::env::temp_dir().join(format!("{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let init = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&dir)
-            .output()
-            .expect("git init");
-        assert!(init.status.success(), "git init");
-        let bi = std::process::Command::new("br")
-            .arg("init")
-            .current_dir(&dir)
-            .output()
-            .expect("br init");
-        assert!(bi.status.success(), "br init");
-        std::fs::write(
-            dir.join(".beads/policy.yaml"),
+        let bead_id = crate::br::scratch_bead(
+            &dir,
             "workflow:\n  transitions:\n    open:\n      - closed\n  gates:\n    open -> closed:\n      require_all:\n        - command-verified\n",
-        )
-        .unwrap();
-        let created = std::process::Command::new("br")
-            .args([
-                "create",
-                "--title",
-                "reopen fixture",
-                "--slug",
-                "reopen-fix-1",
-                "-p",
-                "3",
-                "-d",
-                "work",
-                "--verify",
-                "cargo test -p flywheel reopen::",
-            ])
-            .current_dir(&dir)
-            .output()
-            .expect("br create");
-        assert!(created.status.success(), "br create");
-        let list = std::process::Command::new("br")
-            .args(["list", "--json"])
-            .current_dir(&dir)
-            .output()
-            .expect("br list");
-        let v: serde_json::Value = serde_json::from_slice(&list.stdout).expect("br list json");
-        let bead_id = v["issues"][0]["id"].as_str().expect("bead id").to_string();
-        std::fs::write(dir.join("work.txt"), "work\n").unwrap();
-        let add = std::process::Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(&dir)
-            .output()
-            .expect("git add");
-        assert!(add.status.success());
-        let cm = std::process::Command::new("git")
-            .args([
-                "-c",
-                "user.email=test@test",
-                "-c",
-                "user.name=test",
-                "commit",
-                "-q",
-                "-m",
-                &format!("feat: reopen fixture ({bead_id})"),
-            ])
-            .current_dir(&dir)
-            .output()
-            .expect("git commit");
-        assert!(cm.status.success(), "git commit");
+            "reopen fixture",
+            "reopen-fix-1",
+            "3",
+            Some("cargo test -p flywheel reopen::"),
+            None,
+            Some("reopen fixture"),
+        );
         (dir, bead_id)
     }
 
@@ -24971,8 +24531,9 @@ mod loop_tests {
         use crate::backend::MailSurface as _;
         let (dir, bead_id) = scratch_workspace("reopen-flow");
         let dir_str = dir.to_string_lossy().to_string();
-        let bypass = std::process::Command::new("br")
-            .args([
+        crate::br::run_br_with_env(
+            Some(&dir),
+            &[
                 "close",
                 &bead_id,
                 "--reason",
@@ -24980,12 +24541,10 @@ mod loop_tests {
                 "--bypass-policy",
                 "--bypass-reason",
                 "test fixture: illegal no-gate-row close, loop floor must catch it",
-            ])
-            .current_dir(&dir)
-            .env("BR_OPERATOR", "1")
-            .output()
-            .expect("br close bypass");
-        assert!(bypass.status.success(), "br close bypass: {bypass:?}");
+            ],
+            &[("BR_OPERATOR", "1")],
+        )
+        .expect("br close bypass");
         match verdict::close_check(&dir, &bead_id).unwrap() {
             verdict::CloseCheck::Missing {
                 sha,
@@ -25011,25 +24570,10 @@ mod loop_tests {
                 let v = reopen_unverified_close(&dir_str, &bead_id, &sha, &backend, &planner)
                     .expect("reopen tick 1");
                 assert_eq!(v["reopened"].as_bool(), Some(true), "reopened: {v}");
-                let ready = std::process::Command::new("br")
-                    .args(["ready", "--json"])
-                    .current_dir(&dir)
-                    .output()
-                    .expect("br ready");
-                let rv: serde_json::Value =
-                    serde_json::from_slice(&ready.stdout).expect("ready json");
-                let ready_items = match &rv {
-                    serde_json::Value::Array(items) => items.as_slice(),
-                    serde_json::Value::Object(obj) => obj
-                        .get("issues")
-                        .and_then(Value::as_array)
-                        .map(|a| a.as_slice())
-                        .unwrap_or(&[]),
-                    _ => &[],
-                };
+                let ready = crate::br::Bead::ready(Some(&dir)).expect("br ready");
                 assert!(
-                    ready_items.iter().any(|b| b["id"] == bead_id),
-                    "reopened bead is back in br ready: {rv}"
+                    ready.iter().any(|b| b.id == bead_id),
+                    "reopened bead is back in br ready: {ready:?}"
                 );
                 let v2 = reopen_unverified_close(&dir_str, &bead_id, &sha, &backend, &planner)
                     .expect("reopen tick 2");
@@ -25076,14 +24620,10 @@ mod loop_tests {
         let dir = std::env::temp_dir().join(format!("verify-fence-planner-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let init = std::process::Command::new("br")
-            .arg("init")
-            .current_dir(&dir)
-            .output()
-            .expect("br init");
-        assert!(init.status.success(), "br init: {init:?}");
-        let created = std::process::Command::new("br")
-            .args([
+        crate::br::run_br(Some(&dir), &["init"]).expect("br init");
+        crate::br::Bead::create(
+            Some(&dir),
+            &[
                 "create",
                 "--title",
                 "fixture",
@@ -25093,17 +24633,11 @@ mod loop_tests {
                 "br list --json",
                 "--principle",
                 "prove-it-works — fixture carries runnable VERIFY fence, not a self-report",
-            ])
-            .current_dir(&dir)
-            .output()
-            .expect("br create");
-        assert!(created.status.success(), "br create: {created:?}");
-        let list = std::process::Command::new("br")
-            .args(["list", "--json"])
-            .current_dir(&dir)
-            .output()
-            .expect("br list");
-        let v: Value = serde_json::from_slice(&list.stdout).expect("br list json");
+            ],
+        )
+        .expect("br create");
+        let list = crate::br::run_br(Some(&dir), &["list", "--json"]).expect("br list");
+        let v: Value = serde_json::from_str(&list).expect("br list json");
         let id = v["issues"][0]["id"].as_str().expect("bead id").to_string();
         let dir_str = dir.to_string_lossy().to_string();
         let planner = planner_recipient_chain(&dir_str, &id, "FallbackIdentity")
@@ -25120,11 +24654,6 @@ mod loop_tests {
             "unresolvable bead -> the configured operator is the only candidate"
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn parse_ready_beads_json_rejects_garbage() {
-        assert!(parse_ready_beads_json("not json").is_err());
     }
 
     #[test]
@@ -33144,12 +32673,11 @@ fn cmd_internal_reclaim_stranded(cfg: &Config, project: &str, live: &str) -> Res
                 }
             }
             durable::ReclaimDecision::Reclaim { reason } => {
-                let out = std::process::Command::new("br")
-                    .args(["update", &b.id, "--status", "open", "--assignee", ""])
-                    .current_dir(&dir)
-                    .output();
-                match out {
-                    Ok(o) if o.status.success() => {
+                match crate::br::run_br(
+                    Some(&dir),
+                    &["update", &b.id, "--status", "open", "--assignee", ""],
+                ) {
+                    Ok(_) => {
                         eprintln!(
                             "flywheel: reclaimed stranded bead {} (assignee {:?}, {})",
                             b.id,
@@ -33158,13 +32686,7 @@ fn cmd_internal_reclaim_stranded(cfg: &Config, project: &str, live: &str) -> Res
                         );
                         reclaimed.push(b.id.clone());
                     }
-                    Ok(o) => failed.push(json!({
-                        "id": b.id,
-                        "error": String::from_utf8_lossy(&o.stderr).trim().to_string(),
-                    })),
-                    Err(e) => {
-                        failed.push(json!({ "id": b.id, "error": format!("br not found: {e}") }))
-                    }
+                    Err(e) => failed.push(json!({ "id": b.id, "error": format!("{e:#}") })),
                 }
             }
         }
@@ -34211,16 +33733,8 @@ pub(crate) fn turn_end_guard(
 /// Live in-flight count from the work ledger. None when br is unreadable
 /// (D14 fails closed on None — the turn blocks naming br, never ends blind).
 fn in_flight_count(project_root: &std::path::Path) -> Option<u64> {
-    let out = std::process::Command::new("br")
-        .args(["list", "--status", "in_progress", "--json"])
-        .current_dir(project_root)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
-    v.get("issues")?.as_array().map(|a| a.len() as u64)
+    let rows = crate::br::Bead::in_progress(Some(project_root)).ok()?;
+    Some(rows.len() as u64)
 }
 
 /// Delegation-shaped tool stems denied on the captain/steer pane (the
@@ -35235,21 +34749,8 @@ fn cmd_internal_mail_not_ready(
 /// username is never a registered mail identity.
 fn planner_recipient_chain(project_dir: &str, bead_id: &str, fallback: &str) -> Vec<String> {
     let mut chain = Vec::new();
-    if let Ok(out) = std::process::Command::new("br")
-        .args(["show", bead_id, "--json"])
-        .current_dir(project_dir)
-        .output()
-        && out.status.success()
-        && let Ok(v) = serde_json::from_slice::<Value>(&out.stdout)
-        && let Some(bead) = match &v {
-            Value::Array(items) => items.first(),
-            obj @ Value::Object(_) => Some(obj),
-            _ => None,
-        }
-        && let Some(created_by) = bead
-            .get("created_by")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
+    if let Ok(bead) = crate::br::Bead::show(Some(Path::new(project_dir)), bead_id)
+        && let Some(created_by) = bead.created_by.as_deref().filter(|s| !s.is_empty())
     {
         chain.push(created_by.to_string());
     }
@@ -35625,29 +35126,16 @@ fn cmd_internal_mail_done(cfg: &Config, project: &str, bead_id: &str) -> Result<
 /// falling back to "closed". Best-effort — empty report degrades to the
 /// title alone.
 fn bead_title_and_close_report(project_dir: &str, bead_id: &str) -> (String, String) {
-    let (mut title, mut report) = (String::new(), String::new());
-    if let Ok(out) = std::process::Command::new("br")
-        .args(["show", bead_id, "--json"])
-        .current_dir(project_dir)
-        .output()
-        && out.status.success()
-        && let Ok(v) = serde_json::from_slice::<Value>(&out.stdout)
-    {
-        let first = v.as_array().and_then(|a| a.first());
-        if let Some(t) = first.and_then(|b| b.get("title")).and_then(Value::as_str) {
-            title = t.to_string();
+    // Normalized through Bead::show (array-first-or-object): `br show` emits
+    // a bare object on current br, so the old array-only read silently
+    // emptied every report. Same title + last-comment semantics otherwise.
+    match crate::br::Bead::show(Some(Path::new(project_dir)), bead_id) {
+        Ok(bead) => {
+            let title = bead.title.clone();
+            (title, crate::br::latest_comment_text(&bead))
         }
-        if let Some(c) = first
-            .and_then(|b| b.get("comments"))
-            .and_then(Value::as_array)
-            .and_then(|a| a.last())
-            .and_then(|c| c.get("text"))
-            .and_then(Value::as_str)
-        {
-            report = c.trim().to_string();
-        }
+        Err(_) => (String::new(), String::new()),
     }
-    (title, report)
 }
 
 /// True when `name` resolves as a registered identity in the project
@@ -35726,23 +35214,14 @@ fn cmd_internal_reservation_board(cfg: &Config, project: &str) -> Result<()> {
 /// than an unstamped pin.
 fn cmd_internal_pin_stamp(cfg: &Config, project: &str, bead_id: &str, pin: &str) -> Result<()> {
     let dir = project_dir(cfg, project);
-    let out = std::process::Command::new("br")
-        .args(durable::pin_stamp_argv(bead_id, pin))
-        .current_dir(&dir)
-        .output();
-    match out {
-        Ok(o) if o.status.success() => {
+    let argv: Vec<String> = durable::pin_stamp_argv(bead_id, pin);
+    let arg_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    match crate::br::run_br(Some(&dir), &arg_refs) {
+        Ok(_) => {
             print_json(&json!({ "ok": true, "bead_id": bead_id, "pin": pin }));
         }
-        Ok(o) => {
-            eprintln!(
-                "flywheel: pin stamp failed for {bead_id}: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-            print_json(&json!({ "ok": false, "bead_id": bead_id, "pin": pin }));
-        }
         Err(e) => {
-            eprintln!("flywheel: pin stamp failed for {bead_id}: {e}");
+            eprintln!("flywheel: pin stamp failed for {bead_id}: {e:#}");
             print_json(&json!({ "ok": false, "bead_id": bead_id, "pin": pin }));
         }
     }
@@ -35838,8 +35317,9 @@ fn cmd_internal_verify_dispatch(
             Ok(())
         }
         crate::models::VerifierPlan::Degrade => {
-            let block = std::process::Command::new("br")
-                .args([
+            let block = crate::br::run_br(
+                Some(&key),
+                &[
                     "update",
                     bead_id,
                     "--status=blocked",
@@ -35847,13 +35327,9 @@ fn cmd_internal_verify_dispatch(
                     "verifier-family-missing (ADR-0019 Spec 4): no second model family in the \
                      registry and no verifier_family_override — bead blocked, captain mailed \
                      once, no respawn",
-                ])
-                .current_dir(&key)
-                .output();
-            let blocked = match block {
-                Ok(o) => o.status.success(),
-                Err(_) => false,
-            };
+                ],
+            );
+            let blocked = block.is_ok();
             let mut mailed = false;
             let marker = key
                 .join(".flywheel")
@@ -36042,24 +35518,18 @@ fn reopen_unverified_close(
             "already_processed": true,
         }));
     }
-    let out = std::process::Command::new("br")
-        .args([
+    crate::br::run_br(
+        Some(dir),
+        &[
             "reopen",
             bead_id,
             "--reason",
             "unverified close (ADR-0019: no legal verdict for the derived sha)",
             "--actor",
             "flywheel-loop",
-        ])
-        .current_dir(dir)
-        .output()
-        .map_err(|e| anyhow!("br reopen not found: {e}"))?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "br reopen {bead_id} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
+        ],
+    )
+    .map_err(|e| anyhow!("br reopen {bead_id} failed: {e:#}"))?;
     std::fs::create_dir_all(&marker_dir)?;
     std::fs::write(&marker, "mailed\n")?;
     let send = (|| -> Result<backend::SendReceipt> {
@@ -36671,27 +36141,13 @@ pub fn bead_id_from_reason(reason: &str) -> Option<&str> {
 /// empty set (the sweep no-ops, renew-all preserved).
 fn load_closed_bead_ids(cfg: &Config, project: &str) -> Result<std::collections::HashSet<String>> {
     let dir = project_dir(cfg, project);
-    let out = std::process::Command::new("br")
-        .args(["list", "--all", "--json"])
-        .current_dir(&dir)
-        .output()
-        .map_err(|e| anyhow!("br not found: {e}"))?;
-    if !out.status.success() {
-        bail!(
-            "br list --all failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(raw.trim())?;
+    let rows = crate::br::Bead::list_issues(Some(&dir), &["--all"], "br list --all")?;
     let mut closed = std::collections::HashSet::new();
-    if let Some(issues) = v.get("issues").and_then(Value::as_array) {
-        for b in issues {
-            let id = b.get("id").and_then(Value::as_str).unwrap_or("");
-            let status = b.get("status").and_then(Value::as_str).unwrap_or("");
-            if status == "closed" && !id.is_empty() {
-                closed.insert(id.to_string());
-            }
+    for b in &rows {
+        let id = b.get("id").and_then(Value::as_str).unwrap_or("");
+        let status = b.get("status").and_then(Value::as_str).unwrap_or("");
+        if status == "closed" && !id.is_empty() {
+            closed.insert(id.to_string());
         }
     }
     Ok(closed)

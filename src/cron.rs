@@ -835,10 +835,10 @@ pub fn spec_runner(spec: &CronSpec) -> toron_workflow::engine::EffectRunner {
 /// workspace (the default working dir of `flywheel cron start`). Returns the
 /// created bead id (from `br create --json`), or errors.
 pub fn spawn_failure_bead(bundle: &toron_workflow::FailureBundle) -> Result<String> {
-    use std::process::Command;
     let (title, description) = failure_bead_fields(bundle);
-    let out = Command::new("br")
-        .args([
+    crate::br::Bead::create(
+        None,
+        &[
             "create",
             &title,
             "--type",
@@ -851,36 +851,8 @@ pub fn spawn_failure_bead(bundle: &toron_workflow::FailureBundle) -> Result<Stri
             &format!("flywheel cron history {}", bundle.workflow),
             "--principle",
             "fix-root-causes — bundle carries error+step so the fixer repairs the failure, not a symptom",
-            "--json",
-        ])
-        .output()
-        .map_err(|e| anyhow!("br create failed: {e}"))?;
-    if !out.status.success() {
-        bail!(
-            "br create failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let id: String = match serde_json::from_str::<Value>(raw.trim()) {
-        Ok(v) => {
-            let node = v
-                .get("issue")
-                .or_else(|| v.get("id"))
-                .or_else(|| v.as_array().and_then(|a| a.first()))
-                .cloned();
-            match node {
-                Some(n) => n
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("(id unknown)")
-                    .to_string(),
-                None => "(id unknown)".to_string(),
-            }
-        }
-        Err(_) => "(id unknown)".to_string(),
-    };
-    Ok(id)
+        ],
+    )
 }
 
 /// The bead's title + description derived from a failure bundle. The bundle is
@@ -975,14 +947,14 @@ pub fn review_bead_fields(idea: &ReviewIdea, date: &str) -> (String, String) {
 /// found nothing worth proposing (honest, not forced). The date is the tick's
 /// calendar date (the cron label + title context). Returns the bead id.
 pub fn spawn_review_bead(output: &serde_json::Value, tick_ts: i64) -> Result<Option<String>> {
-    use std::process::Command;
     let Some(idea) = review_idea_from_output(output) else {
         return Ok(None);
     };
     let date = tick_date(tick_ts);
     let (title, description) = review_bead_fields(&idea, &date);
-    let out = Command::new("br")
-        .args([
+    let id = crate::br::Bead::create(
+        None,
+        &[
             "create",
             &title,
             "--type",
@@ -997,35 +969,8 @@ pub fn spawn_review_bead(output: &serde_json::Value, tick_ts: i64) -> Result<Opt
             "outcome-oriented-execution — proposal carries acceptance+EV so the captain decides implement-or-close on evidence",
             "--labels",
             &format!("weekly-review,{date}"),
-            "--json",
-        ])
-        .output()
-        .map_err(|e| anyhow!("br create (weekly-review) failed: {e}"))?;
-    if !out.status.success() {
-        bail!(
-            "br create (weekly-review) failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let id: String = match serde_json::from_str::<Value>(raw.trim()) {
-        Ok(v) => {
-            let node = v
-                .get("issue")
-                .or_else(|| v.get("id"))
-                .or_else(|| v.as_array().and_then(|a| a.first()))
-                .cloned();
-            match node {
-                Some(n) => n
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("(id unknown)")
-                    .to_string(),
-                None => "(id unknown)".to_string(),
-            }
-        }
-        Err(_) => "(id unknown)".to_string(),
-    };
+        ],
+    )?;
     Ok(Some(id))
 }
 

@@ -243,7 +243,6 @@ pub async fn tick(cfg: &crate::config::Config, project: &str) -> Result<Option<S
 /// File the escalation bead. The beads poller rings an idle captain on a ready
 /// bead, so this is the one wake path that costs no tokens.
 async fn file_conflict(project: &str, line: &str, conflicts: &[String]) -> Result<Option<String>> {
-    use std::process::Command;
     let title = format!("awareness: {} in {project}", conflicts.join("; "));
     let description = format!(
         "The native awareness digest saw a conflict.\n\n{line}\n\n\
@@ -254,8 +253,9 @@ async fn file_conflict(project: &str, line: &str, conflicts: &[String]) -> Resul
          `flywheel __doorbell --project {project} --report`.",
         conflicts.join("\n- ")
     );
-    let out = Command::new("br")
-        .args([
+    let raw = match crate::br::run_br(
+        None,
+        &[
             "create",
             &title,
             "--type",
@@ -270,24 +270,14 @@ async fn file_conflict(project: &str, line: &str, conflicts: &[String]) -> Resul
             "wake-on-conflict — a deaf fleet must ring once, not log every 15 minutes",
             "--labels",
             &format!("awareness,{project}"),
-            "--json",
-        ])
-        .output();
-    let out = match out {
+        ],
+    ) {
         Ok(out) => out,
         Err(e) => {
             eprintln!("cron {NAME}: br unavailable ({e}); conflict not filed");
             return Ok(None);
         }
     };
-    if !out.status.success() {
-        eprintln!(
-            "cron {NAME}: br create failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-        return Ok(None);
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
     let id = serde_json::from_str::<serde_json::Value>(raw.trim())
         .ok()
         .and_then(|v| {

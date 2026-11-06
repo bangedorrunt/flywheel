@@ -5550,70 +5550,58 @@ async fn reclaim_bead(args: ReclaimBeadArgs) -> anyhow::Result<Value> {
         }
     };
     let commented = {
-        let mut cmd = Command::new("br");
-        cmd.args([
-            "comments",
-            "add",
-            &args.bead_id,
-            "--message",
-            &evidence,
-            "--actor",
-            "flywheel-toron-loop1",
-        ]);
-        cmd.current_dir(&project_dir);
-        let mut c = cmd;
-        let res = tokio::task::spawn_blocking(move || c.output())
-            .await
-            .map_err(|e| anyhow::anyhow!("br comment task join failed: {e}"))?;
+        let project_dir = project_dir.clone();
+        let bead_id = args.bead_id.clone();
+        let evidence = evidence.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            crate::br::run_br(
+                Some(&project_dir),
+                &[
+                    "comments",
+                    "add",
+                    &bead_id,
+                    "--message",
+                    &evidence,
+                    "--actor",
+                    "flywheel-toron-loop1",
+                ],
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("br comment task join failed: {e}"))?;
         match res {
-            Ok(o) if o.status.success() => true,
-            Ok(o) => {
-                eprintln!(
-                    "flywheel: reclaim comment for {} failed: {}",
-                    args.bead_id,
-                    String::from_utf8_lossy(&o.stderr).trim()
-                );
-                false
-            }
+            Ok(_) => true,
             Err(e) => {
                 eprintln!(
-                    "flywheel: reclaim comment leaf error for {}: {e}",
-                    args.bead_id
+                    "flywheel: reclaim comment for {} failed: {e:#}",
+                    args.bead_id,
                 );
                 false
             }
         }
     };
     let opened = {
-        let mut cmd = Command::new("br");
-        cmd.args([
-            "update",
-            &args.bead_id,
-            "--status",
-            "open",
-            "--actor",
-            "flywheel-toron-loop1",
-        ]);
-        cmd.current_dir(&project_dir);
-        let mut c = cmd;
-        let res = tokio::task::spawn_blocking(move || c.output())
-            .await
-            .map_err(|e| anyhow::anyhow!("br open task join failed: {e}"))?;
+        let project_dir = project_dir.clone();
+        let bead_id = args.bead_id.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            crate::br::run_br(
+                Some(&project_dir),
+                &[
+                    "update",
+                    &bead_id,
+                    "--status",
+                    "open",
+                    "--actor",
+                    "flywheel-toron-loop1",
+                ],
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("br open task join failed: {e}"))?;
         match res {
-            Ok(o) if o.status.success() => true,
-            Ok(o) => {
-                eprintln!(
-                    "flywheel: reclaim open for {} failed: {}",
-                    args.bead_id,
-                    String::from_utf8_lossy(&o.stderr).trim()
-                );
-                false
-            }
+            Ok(_) => true,
             Err(e) => {
-                eprintln!(
-                    "flywheel: reclaim open leaf error for {}: {e}",
-                    args.bead_id
-                );
+                eprintln!("flywheel: reclaim open for {} failed: {e:#}", args.bead_id,);
                 false
             }
         }

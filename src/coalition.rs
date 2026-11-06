@@ -1483,27 +1483,10 @@ fn bead_statuses(beads: &[String], tracker_repo: Option<&str>) -> Vec<BeadStatus
 }
 
 fn bead_status(id: &str, tracker_repo: Option<&str>) -> String {
-    let mut cmd = std::process::Command::new("br");
-    cmd.args(["show", id, "--json"]);
-    if let Some(repo) = tracker_repo {
-        cmd.current_dir(repo);
-    }
-    match cmd.output() {
-        Ok(o) if o.status.success() => parse_br_status(&String::from_utf8_lossy(&o.stdout)),
+    let dir = tracker_repo.map(std::path::Path::new);
+    match crate::br::run_br(dir, &["show", id, "--json"]) {
+        Ok(o) => crate::br::br_status_of_stdout(&o).to_string(),
         _ => "unknown".into(),
-    }
-}
-
-/// Pure parser for `br show <id> --json` stdout (the unit-test surface).
-fn parse_br_status(stdout: &str) -> String {
-    if stdout.contains("\"status\":\"closed\"") {
-        "closed".into()
-    } else if stdout.contains("\"status\":\"open\"")
-        || stdout.contains("\"status\":\"in_progress\"")
-    {
-        "open".into()
-    } else {
-        "unknown".into()
     }
 }
 
@@ -1721,30 +1704,6 @@ steps:
             status == "unknown" || status == "closed" || status == "open",
             "{status}"
         );
-    }
-
-    /// The pure parser: closed / open / in_progress / garbage.
-    #[test]
-    fn parse_br_status_classifies_output() {
-        assert_eq!(
-            parse_br_status(r#"[{"id":"bd-x","status":"closed"}]"#),
-            "closed"
-        );
-        assert_eq!(
-            parse_br_status(r#"[{"id":"bd-x","status":"in_progress"}]"#),
-            "open",
-            "in_progress counts as open for the gate"
-        );
-        assert_eq!(
-            parse_br_status(r#"[{"id":"bd-x","status":"open"}]"#),
-            "open"
-        );
-        assert_eq!(
-            parse_br_status(r#"{"error":{"code":"ISSUE_NOT_FOUND"}}"#),
-            "unknown"
-        );
-        assert_eq!(parse_br_status(""), "unknown");
-        assert_eq!(parse_br_status("garbage"), "unknown");
     }
 
     /// The manifest round-trips the tracker repo (the beads-closed gate's
