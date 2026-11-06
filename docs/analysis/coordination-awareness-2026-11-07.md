@@ -77,3 +77,45 @@ final three-lane wave (A toron envelope, B hc registry, C supervisor/collab).
   close from the tracker path.
 - Cross-repo lease rows that record the repo root, so `list --repo` can prove
   which checkout a lease covers.
+
+## Correction: leases are 180 s heartbeats, not deeds
+
+`toron reserve acquire --ttl-secs` defaults to **180 s** ("a hold is a
+heartbeat, not a deed"). `reserve renew` is the heartbeat; `with-lease`
+renews every half-TTL and always releases. Live evidence at the time of
+writing:
+
+- WindyCreek's five leases were **expired** while it was blocked on the
+  shared build (it had stopped renewing).
+- SwiftBay's leases were **live** because its loop renews them
+  (`cmd_internal_renew` / `durable::renew`).
+
+So the auto-release the operator remembered is real, and it is the backstop
+for a crashed or idle lane: a dead holder frees its claim within three
+minutes. `release-by-reason`/`sweep` are hygiene, not the anti-blocker.
+
+## Does the conflict protocol serialize lanes?
+
+No, if it is used as written (skill updated 2026-11-07):
+
+- `reserve conflicts` is a **read**, not a lock. A conflict means re-plan the
+  file set, split the change, or `with-lease` the one shared file; it never
+  means wait for a holder.
+- Leases are narrow file sets, never `src/**`. Broad globs manufacture false
+  conflicts (symmetric fnmatch) and are the only way this protocol could slow
+  the fleet.
+- Captain dispatch gives lanes disjoint file sets, so same-file overlap is the
+  rare exception, not the scheduling primitive.
+
+The real drag observed this wave was **not a lease wait**: lane A's in-flight
+`toron-core` edits made the shared crate fail to compile, and flywheel
+path-deps it, so B and C could not verify. That is a dependency
+serialization, not a lock. Mitigations now in the skill: compile-green
+slices, immediate red announcement to the captain and affected pins, and
+captain sequencing (the shared-crate lane lands a compiling slice before
+other lanes' verify, or runs first). Reservation waits contributed nothing
+to the stall.
+
+A future push digest (overlap mail) and a pre-edit advisory check remain
+useful, but both must stay advisory; a global write lock would trade a
+three-minute auto-heal for a fleet-wide stall.
