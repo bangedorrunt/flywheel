@@ -1286,14 +1286,9 @@ fn load_cron_checkpoints() -> BTreeMap<String, u64> {
 }
 
 fn save_cron_checkpoints_at(path: &Path, map: &BTreeMap<String, u64>) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
     let body = serde_json::to_string(map)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("rename {}", path.display()))?;
-    Ok(())
+    crate::project_state::write_atomic(path, body.as_bytes())
+        .with_context(|| format!("checkpoint {}", path.display()))
 }
 
 fn save_cron_checkpoints(map: &BTreeMap<String, u64>) -> Result<()> {

@@ -79,6 +79,7 @@ mod preflight;
 mod principles;
 mod private_fs;
 mod profile;
+mod project_state;
 mod pull_fresh_poller;
 mod recipient_guard;
 mod redact;

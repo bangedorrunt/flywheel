@@ -538,19 +538,15 @@ pub fn upsert_stage_in_file(path: &std::path::Path, stage: &Stage) -> Result<()>
         file = toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
     }
     file.stages.insert(stage.name.clone(), stage.clone());
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
     let out = toml::to_string(&file).context("serialize stages.toml")?;
-    std::fs::write(path, out).with_context(|| format!("write {}", path.display()))
+    crate::project_state::write_atomic(path, out.as_bytes())
+        .with_context(|| format!("write {}", path.display()))
 }
 
 /// Write one complete stage record to the preferred per-entry user format.
 pub fn upsert_stage_entry(path: &std::path::Path, stage: &Stage) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    std::fs::write(path, render_stage_entry(stage)?)
+    let rendered = render_stage_entry(stage)?;
+    crate::project_state::write_atomic(path, rendered.as_bytes())
         .with_context(|| format!("write {}", path.display()))
 }
 

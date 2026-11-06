@@ -54,8 +54,9 @@ impl std::fmt::Display for NameError {
 }
 
 /// The project-relative state directory: `<project>/.flywheel/agent-state/`.
+/// Owned by [`crate::project_state`]; this keeps the name validation here.
 pub fn project_state_dir(project_dir: &Path) -> PathBuf {
-    project_dir.join(".flywheel").join("agent-state")
+    crate::project_state::agent_state_dir(project_dir)
 }
 
 /// Path of one agent's state file: `<project>/.flywheel/agent-state/<name>.json`.

@@ -127,12 +127,8 @@ pub fn scaffold(project_root: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
             kept.push(PathBuf::from(artifact.rel));
             continue;
         }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
-        }
-        std::fs::write(&path, artifact.content)
-            .with_context(|| format!("write {}", path.display()))?;
+        crate::project_state::write_atomic(&path, artifact.content.as_bytes())
+            .with_context(|| format!("scaffold {}", path.display()))?;
         created.push(PathBuf::from(artifact.rel));
     }
     Ok((created, kept))

@@ -1235,10 +1235,8 @@ pub fn write_receipt(
             "command-verified receipts are written by the LOOP only (anti-forgery, ADR-0019 Spec 1): workers never write this kind"
         );
     }
-    let dir = cwd.join(".flywheel").join("receipts");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{bead_id}-{sha}.{}.txt", kind.gate_name()));
-    std::fs::write(&path, content)?;
+    let path = crate::project_state::receipt_path(cwd, bead_id, sha, kind.gate_name());
+    crate::project_state::write_atomic(&path, content.as_bytes())?;
     Ok(path)
 }
 
@@ -1259,10 +1257,8 @@ pub fn write_command_verified_receipt(
             "command-verified receipts are written by the LOOP only (anti-forgery, ADR-0019 Spec 1)"
         );
     }
-    let dir = cwd.join(".flywheel").join("receipts");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{bead_id}-{sha}.command-verified.txt"));
-    std::fs::write(&path, content)?;
+    let path = crate::project_state::receipt_path(cwd, bead_id, sha, "command-verified");
+    crate::project_state::write_atomic(&path, content.as_bytes())?;
     Ok(path)
 }
 

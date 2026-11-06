@@ -40,10 +40,8 @@ pub fn global_standing_orders() -> String {
 /// regenerate byte-identical. Callers that want the project files verified
 /// (preflight) read them separately — never write them here.
 pub fn regen_global(global_path: &std::path::Path) -> std::io::Result<()> {
-    if let Some(parent) = global_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(global_path, global_standing_orders())
+    crate::project_state::write_atomic(global_path, global_standing_orders().as_bytes())
+        .map_err(|e| e.source)
 }
 
 #[cfg(test)]

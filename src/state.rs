@@ -568,9 +568,7 @@ pub fn save_spawn_meta(project: &str, label: &str) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let body = serde_json::to_string_pretty(&serde_json::json!({ "label": label }))?;
-    let tmp = path.with_extension("meta.json.tmp");
-    std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, &path)?;
+    crate::project_state::write_atomic(&path, body.as_bytes())?;
     Ok(())
 }
 
@@ -651,9 +649,7 @@ pub fn save_expected_replies(project: &str, entries: &[ExpectedReply]) -> Result
         std::fs::create_dir_all(parent)?;
     }
     let body = serde_json::to_string_pretty(entries)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, &path)?;
+    crate::project_state::write_atomic(&path, body.as_bytes())?;
     Ok(())
 }
 
@@ -708,9 +704,11 @@ fn fold_legacy_alias(
             merged.push(row);
         }
     }
-    let _ = std::fs::write(
-        agents_dir().join(format!("{canonical_key}.json")),
-        serde_json::to_string_pretty(&merged).unwrap_or_else(|_| "[]".into()),
+    let _ = crate::project_state::write_atomic(
+        &agents_dir().join(format!("{canonical_key}.json")),
+        serde_json::to_string_pretty(&merged)
+            .unwrap_or_else(|_| "[]".into())
+            .as_bytes(),
     );
     let _ = std::fs::remove_file(&legacy_path);
     merged
@@ -742,9 +740,7 @@ pub fn save_spawn_registry(project: &str, entries: &[SpawnEntry]) -> Result<()> 
         std::fs::create_dir_all(parent)?;
     }
     let body = serde_json::to_string_pretty(&merged)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, &path)?;
+    crate::project_state::write_atomic(&path, body.as_bytes())?;
     Ok(())
 }
 
@@ -867,7 +863,7 @@ fn project_dir_hint(project: &str) -> PathBuf {
 /// so a lost state dir cannot lose the binding. `cmd_recover` falls back
 /// to this file when the registry is empty.
 pub fn agent_names_file(dir: &std::path::Path) -> PathBuf {
-    dir.join(".flywheel").join("agent-names.json")
+    crate::project_state::agent_names_json(dir)
 }
 
 /// Atomically persist the project-local pane→name mapping.
@@ -877,9 +873,7 @@ pub fn save_agent_names(dir: &std::path::Path, entries: &[SpawnEntry]) -> Result
         std::fs::create_dir_all(parent)?;
     }
     let body = serde_json::to_string_pretty(entries)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, &path)?;
+    crate::project_state::write_atomic(&path, body.as_bytes())?;
     Ok(())
 }
 
@@ -920,9 +914,7 @@ pub fn save_captain_alias(project: &str, pin: &str) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let body = serde_json::to_string_pretty(&serde_json::json!({ "pin": pin }))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, &path)?;
+    crate::project_state::write_atomic(&path, body.as_bytes())?;
     Ok(())
 }
 
@@ -959,9 +951,7 @@ pub fn save_session_topology(project: &str, topology: &str) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let body = serde_json::to_string_pretty(&serde_json::json!({ "topology": topology }))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, &path)?;
+    crate::project_state::write_atomic(&path, body.as_bytes())?;
     Ok(())
 }
 
@@ -1000,9 +990,7 @@ pub fn save_role_binds(project: &str, map: &BTreeMap<String, String>) -> Result<
         std::fs::create_dir_all(parent)?;
     }
     let body = serde_json::to_string_pretty(map)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, &path)?;
+    crate::project_state::write_atomic(&path, body.as_bytes())?;
     Ok(())
 }
 
@@ -1118,9 +1106,7 @@ fn ensure_loops_migrated() -> Result<()> {
     for (project, al) in &map {
         let path = sidecar_file(project);
         let body = serde_json::to_string_pretty(al)?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, body)?;
-        std::fs::rename(&tmp, &path)?;
+        crate::project_state::write_atomic(&path, body.as_bytes())?;
     }
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1272,9 +1258,7 @@ pub fn save_active_loop(project: &str, al: &ActiveLoop) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     let path = sidecar_file(project);
     let body = serde_json::to_string_pretty(al)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, &path)?;
+    crate::project_state::write_atomic(&path, body.as_bytes())?;
     Ok(())
 }
 
@@ -1508,9 +1492,8 @@ pub fn save_last_sent(project: &str, records: &[SentRecord]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(records)?)?;
-    std::fs::rename(&tmp, &path)?;
+    let body = serde_json::to_string_pretty(records)?;
+    crate::project_state::write_atomic(&path, body.as_bytes())?;
     Ok(())
 }
 
@@ -1892,9 +1875,8 @@ pub fn save_loop_pids(pids: &BTreeMap<String, LoopPidEntry>) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(pids)?)?;
-    std::fs::rename(&tmp, &path)?;
+    let body = serde_json::to_string_pretty(pids)?;
+    crate::project_state::write_atomic(&path, body.as_bytes())?;
     Ok(())
 }
 

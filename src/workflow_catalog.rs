@@ -72,9 +72,11 @@ fn overwrite_with_backup(path: &Path, contents: &str) -> Result<()> {
                 .map(|e| format!("{}.bak", e.to_string_lossy()))
                 .unwrap_or_else(|| "bak".into()),
         );
-        std::fs::write(&bak, prev).with_context(|| format!("backup {}", bak.display()))?;
+        crate::project_state::write_atomic(&bak, prev.as_bytes())
+            .with_context(|| format!("backup {}", bak.display()))?;
     }
-    std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))
+    crate::project_state::write_atomic(path, contents.as_bytes())
+        .with_context(|| format!("write {}", path.display()))
 }
 
 /// Seed the user tier. `scope` decides what may be replaced; `dry_run` reports
@@ -779,11 +781,11 @@ fn absorb_pipeline(name: &str, chain: &[String]) -> (Workflow, Vec<MappingNote>)
 /// Write one workflow as canonical catalog YAML — the W6 shared writer
 /// (§3.7 T3 / §3.8): `workflow new` and compose `--keep` produce IDENTICAL
 /// file shapes, so both paths lint identically. Overwrites a same-name entry.
+/// Atomic: same-dir temp + rename, so a crash never leaves a partial file.
 pub fn write_workflow_yaml(dir: &Path, wf: &Workflow) -> Result<PathBuf> {
-    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join(format!("{}.yaml", wf.name));
     let raw = serde_yaml::to_string(wf).context("serialize workflow yaml")?;
-    std::fs::write(&path, raw).with_context(|| format!("write {}", path.display()))?;
+    crate::project_state::write_atomic(&path, raw.as_bytes())?;
     Ok(path)
 }
 

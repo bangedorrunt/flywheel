@@ -1425,10 +1425,8 @@ pub(crate) fn settle_loop_verify_output(
         } => {
             let warning = if let Some((warning, filtered, evidence)) = vacuous {
                 let _ = (|| -> anyhow::Result<()> {
-                    let dir = cwd.join(".flywheel").join("receipts");
-                    std::fs::create_dir_all(&dir)?;
-                    let path = dir.join(format!("{bead_id}-{sha}.vacuous.txt"));
-                    std::fs::write(&path, &evidence)?;
+                    let path = crate::project_state::receipt_path(cwd, bead_id, sha, "vacuous");
+                    crate::project_state::write_atomic(&path, evidence.as_bytes())?;
                     Ok(())
                 })();
                 eprintln!("{warning}");
@@ -5861,10 +5859,7 @@ pub fn spawn_graph_vehicle(
         );
         return Ok(VehicleOutcome::AlreadySpawned);
     }
-    if let Some(parent) = marker.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(&marker, workflow);
+    let _ = crate::project_state::write_atomic(&marker, workflow.as_bytes());
     let inputs = serde_json::json!({
         "bead_id": bead_id,
         "verify": verify,
