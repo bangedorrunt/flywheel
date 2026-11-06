@@ -1,0 +1,5 @@
+bead: bd-wave12-config-strict-n9hcs
+sha: c9dc22f3baf6ed3165f3147b3fc4cfd5cfc3ac72
+leg1 verify-clippy.sh: FAILS on 2 foreign fmt diffs (src/cmd/send.rs:16, src/test_source.rs:74); my files fmt-clean, check warning-free, clippy leg not reached
+leg2 test -p flywheel config_strict: EXIT 0, 36 suites ok, 7/7 strict tests green (5 unit + 2 integration)
+mutation: accepting 'perhaps' fails the flag table (ran FAILED, reverted)
