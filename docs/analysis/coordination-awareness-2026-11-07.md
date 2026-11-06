@@ -185,3 +185,24 @@ Live `next` semantics verified against the operator daemon: the per-message
 door returns the live straggler set on every call until the reader acks one;
 ack removes exactly that message, and no message is skipped by the
 high-water cursor any more.
+
+## Live finding: an answering agent stayed unanswered
+
+The live probe filed `bd-4jg3n` ("unanswered doorbell: SwiftBay") and SwiftBay
+answered (`[lane-b] heard`) without the status clearing. Two halves, one
+defect:
+
+1. `RtHost` never overrode `Host::pin_npub`, so the trait default `None`
+   reached `HearTracker::note_inject`. The ring carried no npub and
+   `note_heard_pubkey` could not match the agent's own reply. (`FileHost`
+   already implemented it from its npub map — a parity gap, not a design
+   choice.)
+2. A ring loaded from `.unanswered` at start has no pending entry at all, so
+   even with (1) fixed it needed the pin→npub map seeded from the host index
+   before any hear could map a pubkey back to it.
+
+Fix `ce23c652` + `0fff560f`: `RtHost::pin_npub` delegates to the SelfIndex
+built by `build_index` (`whois` per registered pin), and `Brain::new` fills
+the hear map for every seeded pin. Proven on the installed binary: after a
+reply the status stayed `unanswered []` past the 120 s expiry (before, the
+pin was stuck for 40+ minutes across restarts).
