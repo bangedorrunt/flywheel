@@ -324,7 +324,7 @@ impl WaveCounts {
 /// lands in the `unlabeled` bucket — a wave is never invented. The
 /// dispatching wave is the LOWEST wave holding a ready or in-progress bead,
 /// the same floor `wave_gate_held` applies (ADR-0006 D2). Pure.
-fn progress_waves(rows: &[Value], ready_ids: &HashSet<String>) -> Value {
+pub(crate) fn progress_waves(rows: &[Value], ready_ids: &HashSet<String>) -> Value {
     let mut waves: BTreeMap<u64, WaveCounts> = BTreeMap::new();
     let mut unlabeled = WaveCounts::default();
     for row in rows {

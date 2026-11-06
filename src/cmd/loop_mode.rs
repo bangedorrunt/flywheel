@@ -1831,3 +1831,1176 @@ mod loop_run_verify_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod loop_tests {
+    use super::*;
+    use crate::cmd::send::bare_short_group_matches;
+    use crate::cmd::status::progress_waves;
+    use crate::{
+        WantToken, agent_name_n, agent_ordinal, doorbell_uncovered_panes, first_routable,
+        free_spawn_ordinal, kill_key, name_matches_want, planner_recipient_chain,
+        registered_orchestrator, reopen_unverified_close, resolve_send_targets_dyn, send_done_mail,
+        send_not_ready_mail, send_unverified_close_mail, slugify_label, spawn_agent_profile,
+        watch_name_for_pane,
+    };
+
+    /// bd-8hv0: the sweep must re-subscribe only panes the push
+    /// spine does not already cover; empty ids never count as new.
+    #[test]
+    fn doorbell_delta_covers_only_uncovered_panes() {
+        let covered: HashSet<String> = ["w1:p1".to_string()].into_iter().collect();
+        let ids = vec![
+            "w1:p1".to_string(),
+            String::new(),
+            "w2:p9".to_string(),
+            "w3:p1".to_string(),
+        ];
+        assert_eq!(
+            doorbell_uncovered_panes(&covered, &ids),
+            vec!["w2:p9".to_string(), "w3:p1".to_string()]
+        );
+        let all: HashSet<String> = ids.into_iter().filter(|p| !p.is_empty()).collect();
+        assert_eq!(
+            doorbell_uncovered_panes(&all, &["w1:p1".to_string()]),
+            [] as [String; 0]
+        );
+    }
+
+    fn st(name: &str, s: AgentStatus) -> durable::AgentState {
+        durable::AgentState {
+            name: name.to_string(),
+            status: format!("{s:?}").to_ascii_lowercase(),
+            kind: String::new(),
+            pane_id: String::new(),
+            mail_identity: None,
+            nudge_streak: 0,
+        }
+    }
+
+    #[test]
+    fn active_interval_clamps_to_floor() {
+        assert_eq!(clamp_active_interval(3), 5);
+        assert_eq!(clamp_active_interval(0), 5);
+        assert_eq!(clamp_active_interval(5), 5);
+        assert_eq!(clamp_active_interval(15), 15);
+        assert_eq!(clamp_active_interval(30), 30);
+    }
+
+    /// bd-g0ge: the loop resume filter keys the window on the live
+    /// generation — a stale bead-level watermark must not re-arm a
+    /// completed attempt, and a fresh generation window must pass.
+    #[test]
+    fn resume_attempt_window_keys_live_generation() {
+        use std::collections::BTreeMap;
+        let now_us = 1_000_000_000_000_000i64;
+        let mut window: BTreeMap<String, i64> = BTreeMap::new();
+        window.insert(state::resume_key("bd-x", "PaneA"), now_us - 60 * 1_000_000);
+        let attempts = vec![durable::WorkAttempt {
+            bead_id: "bd-x".into(),
+            pane: "PaneA".into(),
+            generation: 3,
+            status: durable::WorkAttemptStatus::Running,
+            corr: None,
+            effect_key: None,
+            updated_us: now_us,
+        }];
+        let live = durable::live_attempt_for_bead(&attempts, "bd-x");
+        assert!(live.is_some_and(|a| a.generation == 3));
+        let (last, live) = attempt_window_last_us(&window, &attempts, "bd-x", "PaneA");
+        assert_eq!(last, None);
+        assert!(durable::should_resume_attempt(
+            last,
+            now_us,
+            durable::RESUME_WINDOW_DEFAULT_SECS,
+            false,
+            live,
+        ));
+        window.insert(state::resume_key("bd-y", "PaneA"), now_us);
+        let done = vec![durable::WorkAttempt {
+            bead_id: "bd-y".into(),
+            pane: "PaneA".into(),
+            generation: 1,
+            status: durable::WorkAttemptStatus::Completed,
+            corr: None,
+            effect_key: None,
+            updated_us: now_us,
+        }];
+        let (last_done, live_done) = attempt_window_last_us(&window, &done, "bd-y", "PaneA");
+        assert!(!durable::should_resume_attempt(
+            last_done,
+            now_us,
+            durable::RESUME_WINDOW_DEFAULT_SECS,
+            false,
+            live_done,
+        ));
+    }
+
+    #[test]
+    fn work_prompts_resumes_inprogress_before_fresh() {
+        let inprog = vec![
+            durable::ReadyBead {
+                id: "bd-r1".into(),
+                title: "resume me".into(),
+                assignee: None,
+                verify: None,
+                labels: Vec::new(),
+                priority: 3,
+                principles: String::new(),
+                updated_at: None,
+                ..Default::default()
+            },
+            durable::ReadyBead {
+                id: "bd-r2".into(),
+                title: "resume me too".into(),
+                assignee: None,
+                verify: None,
+                labels: Vec::new(),
+                priority: 3,
+                principles: String::new(),
+                updated_at: None,
+                ..Default::default()
+            },
+        ];
+        let ready = vec![durable::ReadyBead {
+            id: "bd-f1".into(),
+            title: "fresh".into(),
+            assignee: None,
+            verify: None,
+            labels: Vec::new(),
+            priority: 3,
+            principles: String::new(),
+            updated_at: None,
+            ..Default::default()
+        }];
+        let mut assigned = Vec::new();
+        let prompts = work_prompts(&inprog, &ready, &mut assigned, "flywheel");
+        assert_eq!(prompts.len(), 3);
+        assert!(prompts[0].contains("GOAL Resume bd-r1"));
+        assert!(prompts[1].contains("GOAL Resume bd-r2"));
+        assert!(prompts[2].contains("GOAL Execute bd-f1"));
+        assert_eq!(assigned, vec!["bd-r1", "bd-r2", "bd-f1"]);
+        let again = work_prompts(&inprog, &ready, &mut assigned, "flywheel");
+        assert_eq!(again, [] as [String; 0]);
+    }
+
+    #[test]
+    fn work_prompts_skips_already_assigned() {
+        let inprog = vec![durable::ReadyBead {
+            id: "bd-r1".into(),
+            title: "x".into(),
+            assignee: None,
+            verify: None,
+            labels: Vec::new(),
+            priority: 3,
+            principles: String::new(),
+            updated_at: None,
+            ..Default::default()
+        }];
+        let ready = vec![durable::ReadyBead {
+            id: "bd-r1".into(),
+            title: "x".into(),
+            assignee: None,
+            verify: None,
+            labels: Vec::new(),
+            priority: 3,
+            principles: String::new(),
+            updated_at: None,
+            ..Default::default()
+        }];
+        let mut assigned = vec!["bd-r1".to_string()];
+        let prompts = work_prompts(&inprog, &ready, &mut assigned, "flywheel");
+        assert_eq!(prompts, [] as [String; 0]);
+    }
+
+    #[test]
+    fn work_prompts_builds_self_contained_prompts() {
+        let ready = vec![durable::ReadyBead {
+            id: "bd-42".into(),
+            title: "fix auth".into(),
+            assignee: None,
+            verify: None,
+            labels: Vec::new(),
+            priority: 3,
+            principles: String::new(),
+            updated_at: None,
+            ..Default::default()
+        }];
+        let mut assigned = Vec::new();
+        let prompts = work_prompts(&[], &ready, &mut assigned, "flywheel");
+        assert_eq!(prompts.len(), 1);
+        let p = &prompts[0];
+        assert!(p.contains("bd-42"));
+        assert!(p.contains("GOAL Execute bd-42: fix auth."));
+        assert!(p.contains("flywheel/.flywheel/standing-orders.md"));
+        assert!(!p.contains("br update"));
+    }
+
+    /// bd-swarm-cockpit-pczs: `progress_waves` groups by `wave-N`, counts an
+    /// open bead `ready` only when `br ready` listed it, and names the LOWEST
+    /// wave holding ready/in-progress work as dispatching. Unlabeled beads
+    /// never invent a wave; an unknown status reads unknown, never a default.
+    #[test]
+    fn progress_waves_groups_and_names_the_dispatching_wave() {
+        use std::collections::HashSet;
+        let rows = json!([
+            {"id": "bd-a", "status": "closed", "labels": ["wave-1"]},
+            {"id": "bd-b", "status": "in_progress", "labels": ["wave-1"]},
+            {"id": "bd-c", "status": "open", "labels": ["wave-1"]},
+            {"id": "bd-d", "status": "open", "labels": ["wave-2"]},
+            {"id": "bd-e", "status": "open", "labels": ["wave-2"]},
+            {"id": "bd-f", "status": "open", "labels": ["wave-2"]},
+            {"id": "bd-g", "status": "open"},
+            {"id": "bd-h", "status": "open", "labels": ["wave-2"]},
+            {"id": "bd-i", "status": "mystery", "labels": ["wave-2"]},
+            {"id": "bd-j", "status": "open", "wave": 2},
+        ]);
+        let ready: HashSet<String> = ["bd-h".to_string(), "bd-j".to_string()]
+            .into_iter()
+            .collect();
+        let out = progress_waves(rows.as_array().unwrap(), &ready);
+        assert_eq!(
+            out["dispatching_wave"],
+            json!(1),
+            "wave 1 holds in-progress work"
+        );
+        let waves = out["waves"].as_array().unwrap();
+        assert_eq!(waves.len(), 2, "two labeled waves");
+        assert_eq!(waves[0]["wave"], json!(1));
+        assert_eq!(waves[0]["closed"], json!(1));
+        assert_eq!(waves[0]["in_progress"], json!(1));
+        assert_eq!(
+            waves[0]["ready"],
+            json!(0),
+            "bd-c is open but not in br ready"
+        );
+        assert_eq!(waves[0]["blocked"], json!(1));
+        assert_eq!(
+            waves[1]["ready"],
+            json!(2),
+            "bd-h by label, bd-j by the typed field — both dispatchable"
+        );
+        assert_eq!(waves[1]["blocked"], json!(3));
+        assert_eq!(waves[1]["unknown"], json!(1), "no default status");
+        assert_eq!(out["unlabeled"]["blocked"], json!(1));
+        assert_eq!(out["unlabeled"]["total"], json!(1));
+
+        let rows2 = json!([
+            {"id": "bd-r1", "status": "open", "labels": ["wave-1"]},
+            {"id": "bd-r2", "status": "in_progress", "labels": ["wave-2"]},
+        ]);
+        let ready2: HashSet<String> = ["bd-r1".to_string()].into_iter().collect();
+        let out2 = progress_waves(rows2.as_array().unwrap(), &ready2);
+        assert_eq!(out2["dispatching_wave"], json!(1));
+
+        let rows3 = json!([{"id": "bd-z", "status": "closed", "labels": ["wave-1"]}]);
+        let out3 = progress_waves(rows3.as_array().unwrap(), &HashSet::<String>::new());
+        assert_eq!(out3["dispatching_wave"], Value::Null);
+    }
+
+    /// ADR-0019 acceptance: a bead without a fence must be refused at
+    /// dispatch AND the planner must be mailed on the bead's thread. The
+    /// not-ready mail lands in the planner's inbox with thread = bead id.
+    #[test]
+    fn verify_fence_not_ready_bead_mails_planner_on_bead_thread() {
+        use crate::backend::MailSurface as _;
+        let mail = crate::mail::Mail::from_config(None)
+            .expect("mail ok")
+            .expect("mail Some");
+        let backend = crate::backend::toron::ToronMailBackend::new(mail);
+        let project = "verify-fence-mail";
+        backend::run_mail(backend.ensure_project(project)).expect("ensure");
+        let sender = backend.agent_name().to_string();
+        let sender_profile = spawn_agent_profile(&sender, "opencode", project);
+        crate::mail::fixture_register(project, &sender_profile).expect("register sender");
+        let profile = spawn_agent_profile("PlannerOne", "opencode", project);
+        crate::mail::fixture_register(project, &profile).expect("register");
+        let receipt = send_not_ready_mail(
+            &backend,
+            project,
+            "bd-fence-missing",
+            "some bead",
+            "PlannerOne",
+            None,
+        )
+        .expect("not-ready mail sends");
+        assert!(receipt.count >= 1, "delivered: {receipt:?}");
+        let items = backend::run_mail(backend.inbox(&backend::InboxQuery {
+            project: project.into(),
+            agent: "PlannerOne".into(),
+            unread_only: false,
+            limit: Some(10),
+            include_bodies: false,
+            urgent_only: false,
+            since_ts: None,
+            thread_id: None,
+        }))
+        .expect("inbox");
+        let m = items
+            .iter()
+            .find(|m| m.subject.contains("NOT ready"))
+            .expect("planner received the not-ready mail");
+        assert_eq!(
+            m.thread_id
+                .as_ref()
+                .map(toron_core::mailbox::ids::MessageId::as_str),
+            Some("bd-fence-missing"),
+            "mail rides the bead's thread (ADR-0019 Spec 0)"
+        );
+    }
+
+    /// Programmatic done-mail (2026-08-18): the loop's close-report mail
+    /// rides the bead's thread, subject `[<id>] done`, body carries the
+    /// close-reason REPORT — the captain's copy that does not depend on the
+    /// agent remembering the courtesy.
+    #[test]
+    fn done_mail_carries_close_report_on_bead_thread() {
+        use crate::backend::MailSurface as _;
+        let mail = crate::mail::Mail::from_config(None)
+            .expect("mail ok")
+            .expect("mail Some");
+        let backend = crate::backend::toron::ToronMailBackend::new(mail);
+        let project = "done-mail-test";
+        backend::run_mail(backend.ensure_project(project)).expect("ensure");
+        let sender = backend.agent_name().to_string();
+        crate::mail::fixture_register(project, &spawn_agent_profile(&sender, "opencode", project))
+            .expect("register sender");
+        let captain = "CaptainPine";
+        crate::mail::fixture_register(project, &spawn_agent_profile(captain, "flywheel", project))
+            .expect("register captain");
+        assert_eq!(
+            registered_orchestrator(&backend, project).as_deref(),
+            Some(captain),
+            "orchestrator = the registered flywheel-program agent"
+        );
+        let receipt = send_done_mail(
+            &backend,
+            project,
+            "bd-done-probe",
+            "some bead",
+            "status: closed; sha: abc123; verdict: command-verified; verify: cargo test -p x",
+            captain,
+        )
+        .expect("done mail sends");
+        assert!(receipt.count >= 1, "delivered: {receipt:?}");
+        let items = backend::run_mail(backend.inbox(&backend::InboxQuery {
+            project: project.into(),
+            agent: captain.into(),
+            unread_only: false,
+            limit: Some(10),
+            include_bodies: true,
+            urgent_only: false,
+            since_ts: None,
+            thread_id: None,
+        }))
+        .expect("inbox");
+        let m = items
+            .iter()
+            .find(|m| m.subject == "[bd-done-probe] done")
+            .expect("captain received the done mail");
+        assert_eq!(
+            m.thread_id
+                .as_ref()
+                .map(toron_core::mailbox::ids::MessageId::as_str),
+            Some("bd-done-probe"),
+            "done mail rides the bead's thread"
+        );
+        assert!(
+            m.body_md.contains("cargo test -p x"),
+            "body carries the close-reason REPORT: {}",
+            m.body_md
+        );
+    }
+
+    /// ADR-0019 (bd-w1-reopen-f6tw): the unverified-close mail rides the
+    /// bead's thread, subject `[<id>] unverified close reopened`, and NAMES
+    /// what is missing (here: the commit).
+    #[test]
+    fn sha_rule_missing_commit_mail_names_the_missing_commit() {
+        use crate::backend::MailSurface as _;
+        let mail = crate::mail::Mail::from_config(None)
+            .expect("mail ok")
+            .expect("mail Some");
+        let backend = crate::backend::toron::ToronMailBackend::new(mail);
+        let project = "sha-rule-mail";
+        backend::run_mail(backend.ensure_project(project)).expect("ensure");
+        let sender = backend.agent_name().to_string();
+        let sender_profile = spawn_agent_profile(&sender, "opencode", project);
+        crate::mail::fixture_register(project, &sender_profile).expect("register sender");
+        let profile = spawn_agent_profile("PlannerOne", "opencode", project);
+        crate::mail::fixture_register(project, &profile).expect("register");
+        send_unverified_close_mail(&backend, project, "bd-sha-missing", "", "PlannerOne")
+            .expect("unverified-close mail sends");
+        let items = backend::run_mail(backend.inbox(&backend::InboxQuery {
+            project: project.into(),
+            agent: "PlannerOne".into(),
+            unread_only: false,
+            limit: Some(10),
+            include_bodies: false,
+            urgent_only: false,
+            since_ts: None,
+            thread_id: None,
+        }))
+        .expect("inbox");
+        let m = items
+            .iter()
+            .find(|m| m.subject.contains("unverified close reopened"))
+            .expect("planner received the unverified-close mail");
+        assert_eq!(
+            m.thread_id
+                .as_ref()
+                .map(toron_core::mailbox::ids::MessageId::as_str),
+            Some("bd-sha-missing"),
+            "mail rides the bead's thread (ADR-0019 Spec 0)"
+        );
+        assert!(
+            m.body_md.contains("bd-sha-missing"),
+            "mail names the bead whose commit is missing"
+        );
+    }
+
+    /// Scratch workspace (git + br + one bead with a typed `verify` field +
+    /// a commit whose message carries the bead id + gate policy).
+    /// bd-3566 (beads_rust-wave5-flywheel-parser-strip-dkpvi): the fixture
+    /// sets the TYPED verify field (`br create --verify`) — a description
+    /// fence no longer makes a bead ready under the schema-v18 predicate,
+    /// and after bypass-close + reopen the fence-import never runs, so the
+    /// reopened bead would be missing from `br ready` (the env-dependency
+    /// this test used to trip on).
+    fn scratch_workspace(tag: &str) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!("{tag}-{}", std::process::id()));
+        let bead_id = crate::br::scratch_bead(
+            &dir,
+            "workflow:\n  transitions:\n    open:\n      - closed\n  gates:\n    open -> closed:\n      require_all:\n        - command-verified\n",
+            "reopen fixture",
+            "reopen-fix-1",
+            "3",
+            Some("cargo test -p flywheel reopen::"),
+            None,
+            Some("reopen fixture"),
+        );
+        (dir, bead_id)
+    }
+
+    /// THE RED-THEN-GREEN OF THE PROGRAM: a worker closes with no gate row
+    /// -> close-check says MISSING -> `reopen_unverified_close` reopens ->
+    /// the bead is back in `br ready`. Repeated ticks (same bead, same sha)
+    /// mail exactly ONCE (marker dedup) — the reopen storm guard.
+    #[test]
+    fn reopen_flow_reopens_unverified_close_and_mails_once() {
+        use crate::backend::MailSurface as _;
+        let (dir, bead_id) = scratch_workspace("reopen-flow");
+        let dir_str = dir.to_string_lossy().to_string();
+        crate::br::run_br_with_env(
+            Some(&dir),
+            &[
+                "close",
+                &bead_id,
+                "--reason",
+                "worker says done",
+                "--bypass-policy",
+                "--bypass-reason",
+                "test fixture: illegal no-gate-row close, loop floor must catch it",
+            ],
+            &[("BR_OPERATOR", "1")],
+        )
+        .expect("br close bypass");
+        match verdict::close_check(&dir, &bead_id).unwrap() {
+            verdict::CloseCheck::Missing {
+                sha,
+                receipt_eligible,
+            } => {
+                assert!(!receipt_eligible, "loop-runnable -> no receipt grace");
+                let mail = crate::mail::Mail::from_config(None)
+                    .expect("mail ok")
+                    .expect("mail Some");
+                let backend = crate::backend::toron::ToronMailBackend::new(mail);
+                let project = dir_str.clone();
+                backend::run_mail(backend.ensure_project(&project)).expect("ensure");
+                let sender = backend.agent_name().to_string();
+                let sender_profile = spawn_agent_profile(&sender, "opencode", &project);
+                crate::mail::fixture_register(&project, &sender_profile).expect("register sender");
+                let planner = planner_recipient_chain(&dir_str, &bead_id, "FallbackIdentity")
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+                let planner_profile = spawn_agent_profile(&planner, "opencode", &project);
+                crate::mail::fixture_register(&project, &planner_profile)
+                    .expect("register planner");
+                let v = reopen_unverified_close(&dir_str, &bead_id, &sha, &backend, &planner)
+                    .expect("reopen tick 1");
+                assert_eq!(v["reopened"].as_bool(), Some(true), "reopened: {v}");
+                let ready = crate::br::Bead::ready(Some(&dir)).expect("br ready");
+                assert!(
+                    ready.iter().any(|b| b.id == bead_id),
+                    "reopened bead is back in br ready: {ready:?}"
+                );
+                let v2 = reopen_unverified_close(&dir_str, &bead_id, &sha, &backend, &planner)
+                    .expect("reopen tick 2");
+                assert_eq!(v2["already_processed"].as_bool(), Some(true), "dedup: {v2}");
+                let items = backend::run_mail(backend.inbox(&backend::InboxQuery {
+                    project: project.clone(),
+                    agent: planner.clone(),
+                    unread_only: false,
+                    limit: Some(10),
+                    include_bodies: false,
+                    urgent_only: false,
+                    since_ts: None,
+                    thread_id: None,
+                }))
+                .expect("inbox");
+                let mails: Vec<_> = items
+                    .iter()
+                    .filter(|m| m.subject.contains("unverified close reopened"))
+                    .collect();
+                assert_eq!(
+                    mails.len(),
+                    1,
+                    "exactly one mail per (bead, sha): {items:?}"
+                );
+                assert_eq!(
+                    mails[0]
+                        .thread_id
+                        .as_ref()
+                        .map(toron_core::mailbox::ids::MessageId::as_str),
+                    Some(bead_id.as_str()),
+                    "on the bead's thread"
+                );
+            }
+            other => panic!("expected Missing, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The planner to notify is the bead's creator (`br show --json` →
+    /// `created_by`), falling back to the configured identity when the
+    /// creator cannot be resolved.
+    #[test]
+    fn verify_fence_resolve_planner_uses_bead_creator() {
+        let dir = std::env::temp_dir().join(format!("verify-fence-planner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::br::run_br(Some(&dir), &["init"]).expect("br init");
+        crate::br::Bead::create(
+            Some(&dir),
+            &[
+                "create",
+                "--title",
+                "fixture",
+                "--description",
+                "body",
+                "--verify",
+                "br list --json",
+                "--principle",
+                "prove-it-works — fixture carries runnable VERIFY fence, not a self-report",
+            ],
+        )
+        .expect("br create");
+        let list = crate::br::run_br(Some(&dir), &["list", "--json"]).expect("br list");
+        let v: Value = serde_json::from_str(&list).expect("br list json");
+        let id = v["issues"][0]["id"].as_str().expect("bead id").to_string();
+        let dir_str = dir.to_string_lossy().to_string();
+        let planner = planner_recipient_chain(&dir_str, &id, "FallbackIdentity")
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        assert!(
+            !planner.is_empty() && planner != "FallbackIdentity",
+            "creator resolved, got: {planner}"
+        );
+        assert_eq!(
+            planner_recipient_chain(&dir_str, "bd-does-not-exist", "FallbackIdentity"),
+            vec!["FallbackIdentity".to_string()],
+            "unresolvable bead -> the configured operator is the only candidate"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bare_short_group_matches_detects_crew() {
+        let names = vec![
+            "flywheel-proj-oc".to_string(),
+            "flywheel-proj-oc2".to_string(),
+            "flywheel-proj-oc3".to_string(),
+        ];
+        let group = bare_short_group_matches("proj", "oc", &names).expect("oc broadens");
+        assert_eq!(group.len(), 3);
+        assert!(group.contains(&"flywheel-proj-oc".to_string()));
+        assert!(group.contains(&"flywheel-proj-oc3".to_string()));
+        assert!(bare_short_group_matches("proj", "oc2", &names).is_none());
+        assert!(bare_short_group_matches("proj", "flywheel-proj-oc", &names).is_none());
+        assert!(bare_short_group_matches("proj", "all", &names).is_none());
+    }
+
+    #[test]
+    fn bare_short_group_matches_single_agent_is_fine() {
+        let names = vec!["flywheel-proj-oc".to_string()];
+        assert!(bare_short_group_matches("proj", "oc", &names).is_none());
+    }
+
+    /// bd-rex-default-plane-xn1t: the default send path on a rex plane
+    /// resolves `--to <pin>` through the shared exact rule and prompts once
+    /// on the pin's block — with a dead hc socket anywhere near it.
+    #[cfg(feature = "backend-superlogical")]
+    const REX_SEND_FAKE_REX: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> @@LOG@@
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    ls|session|block|capture|api|run|split|new|do) cmd=$arg; break ;;
+  esac
+done
+sub=""
+for arg in "$@"; do
+  case "$arg" in
+    program_status|send-key|write) sub=$arg ;;
+    *list_blocks*) sub=list_blocks ;;
+  esac
+done
+case "$cmd:$sub" in
+  ls:)
+    printf '%s\n' '{"sessions":[{"session_id":"session:fake-9","label":"flywheel-probe-send-rex-default","pane_count":1,"tab_count":1}]}'
+    ;;
+  api:list_blocks)
+    printf '%s\n' '{"blocks":[{"block_id":"block:fake-1","window_id":"window:fake-1","label":"NeatHeron","creator_name":"com.superlogical.terminal"}]}'
+    ;;
+  block:program_status)
+    printf '%s\n' '{"records":[{"state":"idle"}]}'
+    ;;
+  block:write)
+    printf '%s\n' '{}'
+    ;;
+  block:send-key)
+    printf '%s\n' 'keyed'
+    ;;
+  *)
+    echo "unexpected $*" >&2
+    exit 1
+    ;;
+esac
+"#;
+
+    /// The pin resolves and exactly one prompt lands on the pin's block.
+    /// No registry row exists, so this drives the shared exact-match rule;
+    /// a dead hc socket is present in the environment shape (no socket
+    /// is ever touched — the log must stay hc-free).
+    #[cfg(feature = "backend-superlogical")]
+    #[test]
+    fn rex_send_resolves_pin_and_prompts_once_on_the_rex_target() {
+        let guard = crate::backend::rex_test_guard::RexBinGuard::install(REX_SEND_FAKE_REX);
+        unsafe { std::env::set_var("FLYWHEEL_BACKEND", "superlogical") };
+        let cfg = crate::config::Config::default();
+        let out = crate::cmd::send::cmd_send_rex(
+            &cfg,
+            "probe-send-rex-default",
+            "NeatHeron",
+            "hello probe",
+            None,
+            false,
+            None,
+            false,
+            true,
+            None,
+        );
+        unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
+        out.expect("rex send of one prompt");
+        let log = guard.log_text();
+        assert_eq!(
+            log.lines().filter(|l| l.contains("write")).count(),
+            1,
+            "exactly one prompt write:\n{log}"
+        );
+        assert_eq!(
+            log.lines().filter(|l| l.contains("send-key")).count(),
+            1,
+            "one submit after the write:\n{log}"
+        );
+        assert!(!log.contains("hc"), "no hc contact:\n{log}");
+    }
+
+    /// Registry ground truth: a lane name resolves to its pane even though
+    /// no block carries the lane label (spawn renamed the block to the pin).
+    #[cfg(feature = "backend-superlogical")]
+    #[test]
+    fn rex_send_registry_lane_name_resolves_to_pane_ground_truth() {
+        fn send_agent(name: Option<&str>, pane: &str) -> AgentInfo {
+            AgentInfo {
+                agent: None,
+                agent_status: AgentStatus::Idle,
+                cwd: None,
+                display_agent: None,
+                focused: false,
+                foreground_cwd: None,
+                interactive_ready: false,
+                launch_pending: false,
+                name: name.map(str::to_string),
+                pane_id: pane.to_string(),
+                revision: 0,
+                state_change_seq: 0,
+                completion_seq: None,
+                state_labels: serde_json::Map::new(),
+                tab_id: "t1".into(),
+                terminal_id: "term".into(),
+                terminal_title: None,
+                workspace_id: "session:fake-9".into(),
+            }
+        }
+        let agents = vec![send_agent(Some("NeatHeron"), "block:fake-1")];
+        let registry = vec![state::SpawnEntry::with_mail_identity(
+            "block:fake-1",
+            "probe-send-rex-default-coder",
+            "NeatHeron",
+        )];
+        let matched =
+            resolve_send_targets_dyn(&agents, &registry, "probe-send-rex-default", "NeatHeron")
+                .expect("pin resolves");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].pane_id, "block:fake-1");
+        let lane = resolve_send_targets_dyn(
+            &agents,
+            &registry,
+            "probe-send-rex-default",
+            "probe-send-rex-default-coder",
+        )
+        .expect("lane resolves through the registry");
+        assert_eq!(lane.len(), 1);
+        assert_eq!(lane[0].pane_id, "block:fake-1");
+    }
+
+    /// Ambiguity is typed and prompts nothing: two blocks under one display
+    /// name refuse with `matches N panes; not ringing` and the fake log
+    /// shows no write.
+    #[cfg(feature = "backend-superlogical")]
+    #[test]
+    fn rex_send_ambiguity_is_typed_and_prompts_nothing() {
+        let script = REX_SEND_FAKE_REX.replace(
+            r#"{"blocks":[{"block_id":"block:fake-1","window_id":"window:fake-1","label":"NeatHeron","creator_name":"com.superlogical.terminal"}]}"#,
+            r#"{"blocks":[{"block_id":"block:fake-1","window_id":"window:fake-1","label":"NeatHeron"},{"block_id":"block:fake-2","window_id":"window:fake-1","label":"NeatHeron"}]}"#,
+        );
+        let guard = crate::backend::rex_test_guard::RexBinGuard::install(&script);
+        unsafe { std::env::set_var("FLYWHEEL_BACKEND", "superlogical") };
+        let cfg = crate::config::Config::default();
+        let err = crate::cmd::send::cmd_send_rex(
+            &cfg,
+            "probe-send-rex-default",
+            "NeatHeron",
+            "hello probe",
+            None,
+            false,
+            None,
+            false,
+            true,
+            None,
+        )
+        .expect_err("two blocks under one name must refuse");
+        unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("matches multiple panes; not ringing"),
+            "typed ambiguity, not a miss: {msg}"
+        );
+        let log = guard.log_text();
+        assert!(
+            !log.lines().any(|l| l.contains("write")),
+            "ambiguity prompts nothing:\n{log}"
+        );
+    }
+
+    /// Fence: the non-hc send arm is selected by backend name and builds
+    /// no hc client. Both halves are asserted so neither direction is
+    /// vacuous: the route must exist AND the hc constructor must be gone.
+    #[test]
+    fn rex_send_arm_constructs_no_plane_client() {
+        let src = include_str!("send.rs");
+        let send = src
+            .split_once("\nfn cmd_send(")
+            .expect("cmd_send exists")
+            .1
+            .split_once("\nfn mint_task_id()")
+            .expect("cmd_send ends before mint_task_id")
+            .0;
+        assert!(
+            send.contains("cmd_send_rex("),
+            "cmd_send must route to the rex arm"
+        );
+        assert!(
+            send.contains("resolve_backend_name(cfg) != \"hc\""),
+            "the route is by backend name, never REX_SESSION"
+        );
+        let rex = src
+            .split_once("\nfn cmd_send_rex(")
+            .expect("cmd_send_rex exists")
+            .1
+            .split_once("\nfn cmd_send(")
+            .expect("cmd_send_rex ends at cmd_send")
+            .0;
+        assert!(
+            rex.contains("multiplexer_backend"),
+            "the rex arm resolves through the selected backend"
+        );
+        assert!(
+            rex.contains("backend.prompt("),
+            "the rex arm prompts through the backend trait"
+        );
+        assert!(
+            !rex.contains("Client::connect"),
+            "no hc client on the rex arm"
+        );
+        assert!(
+            !rex.contains("hc::Client"),
+            "no hc client type on the rex arm"
+        );
+    }
+
+    #[test]
+    fn kill_key_detects_only_kill_keys() {
+        assert_eq!(kill_key(&["Escape"]), None);
+        assert_eq!(kill_key(&["ctrl+c"]), Some("ctrl+c"));
+        assert_eq!(kill_key(&["ctrl-c"]), Some("ctrl-c"));
+        assert_eq!(kill_key(&["^c"]), Some("^c"));
+        assert_eq!(kill_key(&["Escape", "ctrl+c"]), Some("ctrl+c"));
+        assert_eq!(kill_key(&[]), None);
+    }
+
+    #[test]
+    fn slugify_label_normalizes() {
+        let (s, changed) = slugify_label("ADR-0008-debate");
+        assert_eq!(s, "adr-0008-debate");
+        assert!(changed);
+        let (s, _) = slugify_label("My Cool  Label!");
+        assert_eq!(s, "my-cool-label");
+        let (s, _) = slugify_label("--leading-and-trailing--");
+        assert_eq!(s, "leading-and-trailing");
+        let (s, changed) = slugify_label("flywheel-toron");
+        assert_eq!(s, "flywheel-toron");
+        assert!(!changed, "already a slug");
+        let (s, _) = slugify_label("!!!");
+        assert_eq!(s, "", "no alphanumerics -> empty (caller rejects)");
+    }
+
+    #[test]
+    fn bare_short_group_matches_comma_list() {
+        let names = vec![
+            "flywheel-proj-oc".to_string(),
+            "flywheel-proj-oc2".to_string(),
+            "flywheel-proj-pi".to_string(),
+        ];
+        let group = bare_short_group_matches("proj", "oc,pi", &names).unwrap();
+        assert_eq!(group.len(), 3);
+        assert!(group.contains(&"flywheel-proj-pi".to_string()));
+    }
+
+    #[test]
+    fn done_agent_pops_queue_like_idle() {
+        let states = vec![st("a", AgentStatus::Done)];
+        let q = vec!["p1".into(), "p6".into()];
+        let actions = durable::plan_actions(
+            &crate::durable::LoopModel {
+                queue: q.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
+                pending_events: Default::default(),
+                states: Default::default(),
+                dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
+            },
+            &states,
+            None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+        match &actions[0] {
+            durable::LoopAction::Send { name, text } => {
+                assert_eq!(name, "a");
+                assert_eq!(text, "p1");
+            }
+            other => panic!("expected Send for done agent, got {other:?}"),
+        }
+        let states = vec![st("a", AgentStatus::Done)];
+        let q2: Vec<String> = vec![];
+        let actions = durable::plan_actions(
+            &crate::durable::LoopModel {
+                queue: q2.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
+                pending_events: Default::default(),
+                states: Default::default(),
+                dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
+            },
+            &states,
+            Some("continue"),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            matches!(actions[0], durable::LoopAction::Nudge { .. }),
+            "{actions:?}"
+        );
+    }
+
+    #[test]
+    fn sync_loop_substitutes_agent_name_at_dispatch() {
+        let states = vec![st("flywheel-proj-oc", AgentStatus::Idle)];
+        let q = vec!["write to .flywheel/agent-state/{AGENT_NAME}.json".into()];
+        let actions = durable::plan_actions(
+            &crate::durable::LoopModel {
+                queue: q.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
+                pending_events: Default::default(),
+                states: Default::default(),
+                dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
+            },
+            &states,
+            None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+        match &actions[0] {
+            durable::LoopAction::Send { text, .. } => {
+                assert!(text.contains(".flywheel/agent-state/flywheel-proj-oc.json"));
+                assert!(!text.contains("{AGENT_NAME}"));
+            }
+            other => panic!("expected Send, got {other:?}"),
+        }
+        let states = vec![st("a", AgentStatus::Idle)];
+        let q = vec!["t1".into()];
+        let actions = durable::plan_actions(
+            &crate::durable::LoopModel {
+                queue: q.clone(),
+                per_bead_phase: Default::default(),
+                wake_suppression: Default::default(),
+                done_mailed: Default::default(),
+                event_cursor: None,
+                escalation: Default::default(),
+                respawn: Default::default(),
+                mail_health: Default::default(),
+                mail_degraded: false,
+                heal_states: Default::default(),
+
+                heal_grace: Default::default(),
+
+                heal_threshold: Default::default(),
+
+                heal_budget: Default::default(),
+
+                pending_events: Default::default(),
+                states: Default::default(),
+                dispatch_pending: Default::default(),
+                drain_pending: Default::default(),
+            },
+            &states,
+            None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+        match &actions[0] {
+            durable::LoopAction::Send { text, .. } => assert_eq!(text, "t1"),
+            other => panic!("expected Send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn name_matching_handles_numbered_agents() {
+        let base = "flywheel-proj-";
+        let want_oc = WantToken {
+            name: format!("{base}oc"),
+            broaden: true,
+            short: None,
+            ordinal: 1,
+            pane: None,
+        };
+        assert!(name_matches_want(&format!("{base}oc"), &want_oc));
+        assert!(name_matches_want(&format!("{base}oc2"), &want_oc));
+        assert!(name_matches_want(&format!("{base}oc10"), &want_oc));
+        assert!(!name_matches_want(&format!("{base}ocr"), &want_oc));
+        assert!(!name_matches_want(&format!("{base}ocx"), &want_oc));
+        let want_exact = WantToken {
+            name: format!("{base}oc"),
+            broaden: false,
+            short: None,
+            ordinal: 1,
+            pane: None,
+        };
+        assert!(name_matches_want(&format!("{base}oc"), &want_exact));
+        assert!(!name_matches_want(&format!("{base}oc2"), &want_exact));
+        let want_oc2 = WantToken {
+            name: format!("{base}oc2"),
+            broaden: false,
+            short: None,
+            ordinal: 1,
+            pane: None,
+        };
+        assert!(name_matches_want(&format!("{base}oc2"), &want_oc2));
+        assert!(!name_matches_want(&format!("{base}oc20"), &want_oc2));
+    }
+
+    #[test]
+    fn agent_naming_scheme() {
+        assert_eq!(agent_name_n("proj", "oc", 1), "flywheel-proj-oc");
+        assert_eq!(agent_name_n("proj", "oc", 2), "flywheel-proj-oc2");
+        assert_eq!(agent_name_n("a/b/proj", "pi", 3), "flywheel-proj-pi3");
+        assert_eq!(agent_ordinal("flywheel-proj-oc", "proj", "oc"), Some(1));
+        assert_eq!(agent_ordinal("flywheel-proj-oc2", "proj", "oc"), Some(2));
+        assert_eq!(agent_ordinal("flywheel-proj-ocr", "proj", "oc"), None);
+        assert_eq!(agent_ordinal("flywheel-proj-gk", "proj", "oc"), None);
+    }
+
+    #[test]
+    fn spawn_retry_bumps_ordinal_past_taken_names() {
+        use std::collections::HashSet;
+        let taken: HashSet<String> = ["flywheel-flywheel-pi", "flywheel-flywheel-pi2"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(free_spawn_ordinal("flywheel", "pi", 1, &taken), 3);
+        assert_eq!(free_spawn_ordinal("flywheel", "pi", 2, &taken), 3);
+        assert_eq!(free_spawn_ordinal("flywheel", "pi", 1, &HashSet::new()), 1);
+        assert_eq!(free_spawn_ordinal("flywheel", "oc", 1, &taken), 1);
+    }
+
+    #[test]
+    fn watch_matches_event_by_pane_id_not_agent_kind() {
+        let targets = vec![
+            ("w1:p1".to_string(), "flywheel-x-oc".to_string()),
+            ("w1:p2".to_string(), "flywheel-x-pi".to_string()),
+        ];
+        assert_eq!(
+            watch_name_for_pane(&targets, "w1:p1"),
+            Some("flywheel-x-oc")
+        );
+        assert_eq!(
+            watch_name_for_pane(&targets, "w1:p2"),
+            Some("flywheel-x-pi")
+        );
+        assert_eq!(watch_name_for_pane(&targets, "w9:p9"), None);
+        assert_eq!(watch_name_for_pane(&targets, "opencode"), None);
+    }
+
+    #[test]
+    fn watch_matches_nameless_agents_by_pane() {
+        let targets = vec![("w1:p2".to_string(), "w1:p2".to_string())];
+        assert_eq!(watch_name_for_pane(&targets, "w1:p2"), Some("w1:p2"));
+    }
+
+    /// Pure: an OS username is skipped and the first REGISTERED candidate
+    /// wins. `br` writes `created_by` from `$USER`, so the first link is
+    /// almost always a name no mailbox knows.
+    #[test]
+    fn first_routable_skips_the_username_and_takes_the_registered_pin() {
+        let routable = |n: &str| n == "BoldKite" || n == "captain";
+        let chain = vec![
+            "bangedorrunt".to_string(),
+            "Flywheel".to_string(),
+            "captain".to_string(),
+        ];
+        assert_eq!(
+            first_routable(&chain, |c| routable(c)).as_deref(),
+            Some("captain"),
+            "the unroutable username and the unset operator fall through to the captain fold"
+        );
+        assert_eq!(
+            first_routable(&chain, |_| false),
+            None,
+            "nothing routable -> None, never a silent pick"
+        );
+    }
+
+    /// Pure: empty and whitespace-only candidates are never tried (an
+    /// unset `agent_mail` yields "", which would otherwise "resolve" as
+    /// the empty recipient).
+    #[test]
+    fn first_routable_ignores_blank_candidates() {
+        let mut tried = Vec::new();
+        let chain = vec!["   ".to_string(), String::new(), "BoldKite".to_string()];
+        let got = first_routable(&chain, |c| {
+            tried.push(c.to_string());
+            true
+        });
+        assert_eq!(got.as_deref(), Some("BoldKite"));
+        assert_eq!(
+            tried,
+            vec!["BoldKite"],
+            "blanks are filtered before any whois"
+        );
+    }
+
+    /// Pure: order is preserved — the chain never prefers a later rung
+    /// over an earlier routable one (created_by beats the operator pin).
+    #[test]
+    fn first_routable_respects_chain_order() {
+        let chain = vec!["BoldKite".to_string(), "captain".to_string()];
+        assert_eq!(
+            first_routable(&chain, |_| true).as_deref(),
+            Some("BoldKite"),
+            "first routable wins; the captain fold is the last rung, not the first"
+        );
+    }
+
+    /// Pure: the loop's status word comes from the leaf's own `ok` flag.
+    /// `planner mailed` over `ok:false` is how beads were silently never
+    /// dispatched with no reason delivered.
+    #[test]
+    fn not_ready_mail_status_words_the_leaf_ok_flag() {
+        use serde_json::json;
+        assert_eq!(
+            crate::durable::not_ready_mail_status(&json!({"ok": true, "notified": "BoldKite"})),
+            "planner mailed"
+        );
+        assert_eq!(
+            crate::durable::not_ready_mail_status(
+                &json!({"ok": false, "notified": "", "error": "unknown recipient"})
+            ),
+            "planner NOT mailed",
+            "a failed send is reported as a failure"
+        );
+        assert_eq!(
+            crate::durable::not_ready_mail_status(&json!({"raw": "garbage"})),
+            "planner NOT mailed"
+        );
+    }
+}
