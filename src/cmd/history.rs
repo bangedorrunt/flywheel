@@ -124,7 +124,7 @@ pub(crate) fn cmd_resume(cfg: &Config, project: &str, recipe: Option<&str>) -> R
     if ws.is_none() {
         if let Some(r) = recipe {
             println!("respawn with recipe {r}…");
-            crate::cmd_spawn(
+            crate::cmd::spawn::cmd_spawn(
                 cfg,
                 project,
                 crate::SpawnOpts {

@@ -1898,7 +1898,7 @@ pub(crate) fn cmd_ensemble(
     recipe: &str,
     workflow: &str,
 ) -> Result<()> {
-    crate::cmd_spawn(
+    crate::cmd::spawn::cmd_spawn(
         cfg,
         project,
         crate::SpawnOpts {

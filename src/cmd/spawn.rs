@@ -3530,7 +3530,7 @@ mod workspace_origin_tests {
 
     #[test]
     fn add_prime_wired_into_add_path() {
-        let src = include_str!("main.rs");
+        let src = include_str!("../main.rs");
         let add = src.find("fn cmd_add(").expect("cmd_add present in main.rs");
         let add_body = &src[add..];
         let prime_fn = src
@@ -3559,7 +3559,7 @@ mod workspace_origin_tests {
 
     #[test]
     fn add_mints_mail_identity_and_writes_agent_names() {
-        let src = include_str!("main.rs");
+        let src = include_str!("../main.rs");
         let add = src.find("fn cmd_add(").expect("cmd_add present in main.rs");
         let add_body = &src[add..];
         assert!(
@@ -3574,7 +3574,7 @@ mod workspace_origin_tests {
 
     #[test]
     fn add_never_passes_launch_text_as_agent_start_args() {
-        let src = include_str!("main.rs");
+        let src = include_str!("../main.rs");
         let add = crate::tripwire::find_fn(src, "cmd_add");
         let add_end = crate::tripwire::find_fn(src, "cmd_list");
         let add_body = &src[add..add_end];
