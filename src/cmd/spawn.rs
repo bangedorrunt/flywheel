@@ -60,6 +60,8 @@ pub(crate) fn cmd_add_rex(
     request_key: Option<&str>,
 ) -> Result<()> {
     crate::check_project_spelling(project, "add")?;
+    // A mutating door must not pave over a corrupt fleet: refuse first.
+    state::load_spawn_registry_strict(project).map_err(|e| anyhow!("{e}"))?;
     let plan = crate::recipe_counts(None, counts, kinds)?;
     let request_key = request_key.map(str::trim).filter(|k| !k.is_empty());
     let add_base = format!("{}-add", swarm_label(project));
@@ -241,6 +243,8 @@ pub(crate) fn cmd_add(
     request_key: Option<&str>,
 ) -> Result<()> {
     crate::check_project_spelling(project, "add")?;
+    // A mutating door must not pave over a corrupt fleet: refuse first.
+    state::load_spawn_registry_strict(project).map_err(|e| anyhow!("{e}"))?;
     if crate::pane::rex_door_selected(cfg) {
         return cmd_add_rex(cfg, project, counts, kinds, settle_secs, request_key);
     }
@@ -796,6 +800,8 @@ pub(crate) fn cmd_steer(
 /// Dispatched from `main()`; moved from crate root (bd-wave5-main-eviction-d5hht).
 pub(crate) fn cmd_spawn(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
     check_project_spelling(project, "spawn")?;
+    // A mutating door must not pave over a corrupt fleet: refuse first.
+    state::load_spawn_registry_strict(project).map_err(|e| anyhow!("{e}"))?;
     let dir = project_dir(cfg, project);
     if !dir.exists() {
         let mut msg = format!(
@@ -1638,6 +1644,8 @@ fn exited_status(name: &str, pane: &str, code: i32) -> String {
 #[cfg(feature = "backend-superlogical")]
 /// Dispatched from `main()`; moved from crate root (bd-wave5-main-eviction-d5hht).
 pub(crate) fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
+    // A mutating door must not pave over a corrupt fleet: refuse first.
+    state::load_spawn_registry_strict(project).map_err(|e| anyhow!("{e}"))?;
     let dir = project_dir(cfg, project);
     let kind_count_escape =
         opts.counts.oc.unwrap_or(0) + opts.counts.pi.unwrap_or(0) + opts.counts.gk.unwrap_or(0) > 0

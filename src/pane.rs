@@ -836,7 +836,10 @@ fn spawn_crew_into_rex(
     ws_id: &str,
     label: &str,
 ) -> Result<LiveRegistry> {
-    let mut registry: Vec<SpawnEntry> = state::load_spawn_registry(project);
+    let mut registry: Vec<SpawnEntry> = state::merge_registry_for_mutation(
+        project,
+        state::load_spawn_registry_strict(project).map_err(|e| anyhow!("{e}"))?,
+    );
     let mut live_known: Option<std::collections::HashSet<String>> = backend
         .pane_list(None)
         .ok()
@@ -1099,7 +1102,10 @@ fn spawn_crew_into(
     ws_id: &str,
     label: &str,
 ) -> Result<LiveRegistry> {
-    let mut registry: Vec<SpawnEntry> = state::load_spawn_registry(project);
+    let mut registry: Vec<SpawnEntry> = state::merge_registry_for_mutation(
+        project,
+        state::load_spawn_registry_strict(project).map_err(|e| anyhow!("{e}"))?,
+    );
     let mut live_known: Option<std::collections::HashSet<String>> = c
         .pane_list()
         .ok()

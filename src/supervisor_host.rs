@@ -1329,7 +1329,20 @@ impl Ports for LivePorts {
             }
             self.plane_up = Some(up);
         }
-        for e in crate::state::load_spawn_registry(&self.project) {
+        // A corrupt registry must not read as an empty fleet here: that would
+        // silently skip the crew spawn pass. Refuse it loud and keep the
+        // plane messages already pushed above.
+        let current = match crate::state::load_spawn_registry_strict(&self.project) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "flywheel: supervise {}: {e}; skipping crew spawn pass",
+                    self.project
+                );
+                return out;
+            }
+        };
+        for e in crate::state::merge_registry_for_mutation(&self.project, current) {
             let Some(pin) = e.mail_identity.clone() else {
                 continue;
             };

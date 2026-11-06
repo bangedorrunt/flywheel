@@ -5370,6 +5370,41 @@ mod tripwire {
             .map(|i| i + 1)
             .unwrap_or_else(|| panic!("expected toplevel `fn {name}(`"))
     }
+
+    /// The body of a column-0 `fn name(` definition, ending at the next fn
+    /// line (bare, pub, or pub(crate), any indent). Stopping only at bare
+    /// `fn ` leaks into neighbours and blinds the assertion — a removed
+    /// guard still passes on the next door's strict load (bd-registry-strict).
+    pub fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+        body_from(src, find_fn(src, name))
+    }
+
+    /// `fn_body` from an explicit definition offset (for methods find_fn
+    /// cannot see, e.g. trait-impl members): slice to the next fn line.
+    pub fn body_from(src: &str, start: usize) -> &str {
+        let rest = &src[start..];
+        // Skip the definition line itself: its leading `fn ` would end the
+        // slice immediately (the name is what we searched for).
+        let tail = &rest[rest.find('\n').unwrap_or(rest.len())..];
+        let mut end = rest.len();
+        let mut i = 0;
+        while i < tail.len() {
+            let line_end = tail[i..].find('\n').map_or(tail.len(), |k| i + k);
+            let line = &tail[i..line_end];
+            let t = line.trim_start_matches('#').trim_start();
+            // skip attribute lines like #[allow(...)]
+            if !line.trim_start().starts_with('#')
+                && (t.starts_with("fn ")
+                    || t.starts_with("pub fn ")
+                    || t.starts_with("pub(crate) fn "))
+            {
+                end = i + 1;
+                break;
+            }
+            i = line_end + 1;
+        }
+        &rest[..end]
+    }
 }
 
 #[cfg(test)]
@@ -8029,7 +8064,14 @@ pub(crate) fn bind_pane_mail_identity(
             }
         }
     }
-    let mut entries = state::load_spawn_registry(project);
+    let current = match state::load_spawn_registry_strict(project) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("flywheel: REFUSING to bind mail identity for {name}: {e}");
+            return;
+        }
+    };
+    let mut entries = state::merge_registry_for_mutation(project, current);
     match entries.iter_mut().find(|e| e.name == name) {
         Some(e) => {
             e.pane_id = pane_id.to_string();
@@ -10042,7 +10084,8 @@ fn cmd_binding_rebind(
     note: Option<&str>,
 ) -> Result<()> {
     let _ = cfg;
-    let mut entries = state::load_spawn_registry(project);
+    let current = state::load_spawn_registry_strict(project).map_err(|e| anyhow!("{e}"))?;
+    let mut entries = state::merge_registry_for_mutation(project, current);
     let idx = entries
         .iter()
         .position(|e| e.mail_identity.as_deref() == Some(pin) || e.name == pin)
@@ -10277,7 +10320,9 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
     check_project_spelling(project, "recover")?;
     let backend = backend::multiplexer_backend(cfg)?;
     let ws_id = find_workspace_dyn(&*backend, project)?;
-    let mut entries = state::load_spawn_registry(project);
+    let mut entries = state::load_spawn_registry_strict(project)
+        .map_err(|e| anyhow!("{e}"))
+        .map(|current| state::merge_registry_for_mutation(project, current))?;
     if entries.is_empty() {
         entries = state::load_agent_names(&project_dir(cfg, project));
     }
@@ -10438,7 +10483,8 @@ fn rebind_from_registry(
     name: &str,
     ws_id: &str,
 ) -> Result<bool> {
-    let entries = state::load_spawn_registry(project);
+    let current = state::load_spawn_registry_strict(project).map_err(|e| anyhow!("{e}"))?;
+    let entries = state::merge_registry_for_mutation(project, current);
     let Some(entry) = registry_entry_for_token(&entries, project, name) else {
         return Ok(false);
     };
@@ -11571,7 +11617,8 @@ fn cmd_kill(
     if reap_crews {
         policy = config::OnCaptainDeath::Stop;
     }
-    let registry = state::load_spawn_registry(project);
+    let entries = state::load_spawn_registry_strict(project).map_err(|e| anyhow!("{e}"))?;
+    let registry = state::merge_registry_for_mutation(project, entries);
     let captain_pin = state::load_captain_alias(project)
         .or_else(|| cfg.agent_mail.as_ref().and_then(|m| m.name.clone()))
         .unwrap_or_else(|| "captain".to_string());
@@ -13229,6 +13276,125 @@ mod wake_identity_tests {
         assert_eq!(entry.pane_id, "w9:p1");
         assert_eq!(entry.mail_identity.as_deref(), Some(pin.as_str()));
         crate::mail::cleanup_test_data_dir(&data);
+    }
+
+    /// bd-registry-strict-mutating-e5ko3: a corrupt registry refuses the
+    /// write (loud, naming the path) instead of paving the file with one row.
+    #[test]
+    fn record_spawn_entry_refuses_corrupt_registry() {
+        let _g = crate::config::lock_env();
+        let data = std::env::temp_dir().join(format!("fw-reg-refuse-{}", uuid::Uuid::new_v4()));
+        unsafe { std::env::set_var("TORON_DATA_DIR", &data) };
+        let cfg = Config::default();
+        let project = "fw-reg-refuse-proj";
+        let path = state::spawn_registry_file(project);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{not json").unwrap();
+        record_spawn_entry(
+            &cfg,
+            project,
+            state::SpawnEntry::legacy("w9:p9", "flywheel-reg-refuse-oc"),
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{not json",
+            "corrupt registry must survive the refused write byte-identical"
+        );
+        crate::mail::cleanup_test_data_dir(&data);
+    }
+
+    /// bd-registry-strict-mutating-e5ko3: the mail-identity bind also refuses
+    /// instead of saving a one-row fleet over the corrupt file.
+    #[test]
+    fn bind_pane_mail_identity_refuses_corrupt_registry() {
+        let _g = crate::config::lock_env();
+        let data = std::env::temp_dir().join(format!("fw-bind-refuse-{}", uuid::Uuid::new_v4()));
+        unsafe { std::env::set_var("TORON_DATA_DIR", &data) };
+        let cfg = Config::default();
+        let project = "fw-bind-refuse-proj";
+        let path = state::spawn_registry_file(project);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{not json").unwrap();
+        bind_pane_mail_identity(&cfg, project, "flywheel-bind-refuse-oc", "w9:p9", None);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{not json",
+            "corrupt registry must survive the refused bind byte-identical"
+        );
+        crate::mail::cleanup_test_data_dir(&data);
+    }
+
+    /// bd-registry-strict-mutating-e5ko3: every mutating door loads strict —
+    /// a corrupt fleet refuses with the typed path error, never reads empty.
+    #[test]
+    fn mutating_doors_load_spawn_registry_strict() {
+        for (file, doors) in [
+            (
+                include_str!("main.rs"),
+                &[
+                    "cmd_recover",
+                    "cmd_kill",
+                    "cmd_binding_rebind",
+                    "rebind_from_registry",
+                    "record_spawn_entry",
+                    "bind_pane_mail_identity",
+                ][..],
+            ),
+            (
+                include_str!("pane.rs"),
+                &["spawn_crew_into_rex", "spawn_crew_into"][..],
+            ),
+            (include_str!("cmd/spawn.rs"), &["cmd_add", "cmd_spawn"][..]),
+        ] {
+            for door in doors {
+                assert!(
+                    crate::tripwire::fn_body(file, door).contains("load_spawn_registry_strict"),
+                    "{door} must refuse a corrupt registry via the strict loader"
+                );
+            }
+        }
+        // The `observe` impl is a trait member find_fn cannot see: anchor on
+        // its unique signature line instead of the bare name.
+        let sup = include_str!("supervisor_host.rs");
+        let anchor = "\n    fn observe(&mut self, model: &SupModel, now_ms: u64) -> Vec<SupMsg> {";
+        let start = sup.find(anchor).expect("LivePorts observe impl present") + 1;
+        assert!(
+            crate::tripwire::body_from(sup, start).contains("load_spawn_registry_strict"),
+            "observe must refuse a corrupt registry via the strict loader"
+        );
+    }
+
+    /// bd-registry-strict-mutating-e5ko3: send's allowed degrade — a missing
+    /// fleet refuses at resolve; a live fleet resolves without the registry.
+    #[test]
+    fn send_resolve_refuses_missing_fleet_resolves_live() {
+        assert!(
+            resolve_send_targets_dyn(&[], &[], "proj", "flywheel-proj-oc").is_err(),
+            "no agents + no registry must refuse, never send nowhere"
+        );
+        let live = vec![AgentInfo {
+            agent: None,
+            agent_status: AgentStatus::Working,
+            cwd: None,
+            display_agent: None,
+            focused: false,
+            foreground_cwd: None,
+            interactive_ready: true,
+            launch_pending: false,
+            name: Some("flywheel-proj-oc".into()),
+            pane_id: "w1:p1".into(),
+            revision: 0,
+            state_change_seq: 0,
+            completion_seq: None,
+            state_labels: serde_json::Map::new(),
+            tab_id: "t".into(),
+            terminal_id: "term".into(),
+            terminal_title: None,
+            workspace_id: "w".into(),
+        }];
+        let targets = resolve_send_targets_dyn(&live, &[], "proj", "all")
+            .expect("live fleet resolves without registry rows");
+        assert_eq!(targets.len(), 1);
     }
 
     /// bd-gpj0: arrive with HC_TERMINAL_ID records the open-mode pane so
@@ -17040,7 +17206,16 @@ pub(crate) fn record_spawn_entry(cfg: &Config, project: &str, entry: state::Spaw
             return;
         }
     };
-    let mut registry = state::load_spawn_registry(&key);
+    // A mutating door must not treat a corrupt fleet as empty: refuse the
+    // write (loud, naming the path) instead of paving the file with one row.
+    let current = match state::load_spawn_registry_strict(&key) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("flywheel: REFUSING to record spawn entry for {project}: {e}");
+            return;
+        }
+    };
+    let mut registry = state::merge_registry_for_mutation(&key, current);
     registry.retain(|e| e.name != entry.name);
     registry.push(entry);
     if let Err(e) = state::save_spawn_registry(&key, &registry) {

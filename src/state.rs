@@ -793,6 +793,19 @@ pub fn load_spawn_registry_strict(project: &str) -> Result<Vec<SpawnEntry>, Spaw
     })
 }
 
+/// Mutation-load completion (bd-registry-strict-mutating-e5ko3): fold the
+/// legacy alias + mirror exactly like the lenient path, so mutating doors
+/// see identical content — except corruption already refused at the strict
+/// load each door performs first. One helper shared by every mutating door;
+/// read-only doors keep `load_spawn_registry` (warn-and-degrade).
+pub fn merge_registry_for_mutation(project: &str, current: Vec<SpawnEntry>) -> Vec<SpawnEntry> {
+    let merged = fold_legacy_alias(project, &spawn_registry_key(project), current);
+    if !merged.is_empty() {
+        return dedupe_spawn_entries(merged);
+    }
+    load_agent_names(&project_dir_hint(project))
+}
+
 /// Read the project's pane→name registry. A corrupt file warns loud
 /// (naming the file) and degrades to empty for this read-only command —
 /// it never silently reports an empty fleet. Callers that must fail loud
@@ -3574,6 +3587,22 @@ mod loops_sidecar_tests {
         assert_eq!(load_spawn_registry(&p), [] as [SpawnEntry; 0]);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("json.tmp"));
+    }
+
+    #[test]
+    fn merge_for_mutation_matches_lenient_on_healthy() {
+        let _g = loops_test_guard();
+        let p = test_project("reg-merge-healthy");
+        let entries = vec![SpawnEntry::legacy("w2A:p1", "flywheel-reg-merge-oc")];
+        save_spawn_registry(&p, &entries).unwrap();
+        let current = load_spawn_registry_strict(&p).expect("healthy strict load");
+        assert_eq!(
+            merge_registry_for_mutation(&p, current),
+            load_spawn_registry(&p),
+            "mutating doors must see identical content to read-only doors"
+        );
+        let path = spawn_registry_file(&p);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
