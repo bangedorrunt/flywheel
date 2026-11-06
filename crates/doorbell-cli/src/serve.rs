@@ -1660,8 +1660,17 @@ fn prompt_hop_degraded(
 /// (flywheel `spawn` writes one per pin as `Scope::One(workspace)`). A
 /// standby daemon hosts nothing, so 0 is the honest answer there — but it
 /// is now counted rather than asserted.
-fn hosted_subscribers(fw_state: &std::path::Path, hosted: &[String]) -> usize {
-    let workspaces: Vec<&str> = hosted.iter().filter_map(|h| hosted_workspace(h)).collect();
+/// Subscriptions scoped to hosted workspaces — daemon loops AND supervised
+/// hosts (wave11-b): a lease-held workspace the daemon does not loop still
+/// wakes its pins through its own `__doorbell` host, so its subscribers
+/// count. Bare lease names ride alongside `project/workspace` daemon keys.
+fn hosted_subscribers(
+    fw_state: &std::path::Path,
+    hosted: &[String],
+    lease_hosted: &[String],
+) -> usize {
+    let mut workspaces: Vec<&str> = hosted.iter().filter_map(|h| hosted_workspace(h)).collect();
+    workspaces.extend(lease_hosted.iter().map(|w| w.as_str()));
     if workspaces.is_empty() {
         return 0;
     }
@@ -2072,7 +2081,7 @@ fn health_body(app: &AppState) -> String {
         "wake": wake,
         "wake_brain": wake_brain,
         "sweep": {"last_age_s": sweep_age},
-        "subscribers": hosted_subscribers(&app.fw_state, &hosted),
+        "subscribers": hosted_subscribers(&app.fw_state, &hosted, &lease_hosted),
         "mailbox": {
             "toron_data_dir": mailbox_root.display().to_string(),
             "presence_age_s": presence_age,
@@ -3153,6 +3162,46 @@ mod tests {
             vec!["aaa/alpha".to_string(), "zzz/beta".to_string()],
             "health primary follows alphabetical workspace slug"
         );
+    }
+
+    #[test]
+    fn subscribers_count_lease_hosted_workspaces_too() {
+        use doorbell_rt::{
+            Actor, Budget, Filter, Identity, Scope, SinkKind, Subscription, SubscriptionStore,
+        };
+        let dir = std::env::temp_dir().join(format!("doorbell-subs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = SubscriptionStore::open(&dir);
+        for (pin, ws) in [("p-daemon", "wsd"), ("p-lease", "wsl")] {
+            store
+                .subscribe(
+                    Actor::local_process(),
+                    Subscription {
+                        id: format!("{pin}-hc"),
+                        identity: Identity::Pin(pin.into()),
+                        scope: Scope::One(ws.into()),
+                        filter: Filter::default(),
+                        sink: SinkKind::Hc,
+                        budget: Budget::default_530(),
+                        project: Some("proj".into()),
+                        endpoint: None,
+                    },
+                    ws,
+                )
+                .expect("local hc subscribe");
+        }
+        // daemon loop key + bare lease name: both pins count.
+        assert_eq!(
+            super::hosted_subscribers(&dir, &["proj/wsd".to_string()], &["wsl".to_string()]),
+            2,
+            "a supervised (lease-only) workspace's subscribers count"
+        );
+        assert_eq!(
+            super::hosted_subscribers(&dir, &[], &[]),
+            0,
+            "nothing hosted, nobody counted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

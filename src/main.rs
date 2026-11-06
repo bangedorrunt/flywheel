@@ -39,6 +39,7 @@ mod daemon;
 mod decide;
 mod doorbell;
 mod doorbell_host;
+mod doorbell_supervise;
 mod doorbell_tick;
 mod durable;
 mod durable_body;
@@ -17218,10 +17219,14 @@ fn cmd_daemon(cfg: &Config, cmd: &DaemonCmd) -> Result<()> {
             daemon::start(&state, &addr(*port))?;
             cron_host()?;
             daemon::ensure_doorbell()?;
+            // wave11-b: supervised always-on hosts for armed workspaces.
+            doorbell_supervise::ensure_armed_hosts(cfg)?;
             Ok(())
         }
         DaemonCmd::Stop { port, force } => {
             daemon::stop(&state, &addr(*port), *force)?;
+            // wave11-b: unload the supervised hosts this daemon owned.
+            doorbell_supervise::unload_all_hosts()?;
             daemon::stop_cron()
         }
         DaemonCmd::Restart { port, force } => {
@@ -17232,6 +17237,16 @@ fn cmd_daemon(cfg: &Config, cmd: &DaemonCmd) -> Result<()> {
         DaemonCmd::Status { port } => {
             daemon::status(&state, &addr(*port));
             daemon::status_cron();
+            for (ws, loaded) in doorbell_supervise::hosts_status() {
+                println!(
+                    "doorbell host {ws}: {}",
+                    if loaded {
+                        "loaded"
+                    } else {
+                        "unit present, not loaded"
+                    }
+                );
+            }
             Ok(())
         }
     }
