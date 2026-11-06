@@ -397,7 +397,12 @@ impl RtHost {
         else {
             return;
         };
-        let Ok(board) = mail.list_active(&key, None, None) else {
+        // `list_active` blocks on the shared mail runtime in-process; the
+        // sweep runs on the async host task, so the whole read goes off that
+        // runtime (the off_runtime tests caught the nested block_on).
+        let Ok(board) =
+            crate::backend::run_mail_off_runtime_sync(|| mail.list_active(&key, None, None))
+        else {
             return;
         };
         let rows: Vec<reservation_digest::Lease> = board

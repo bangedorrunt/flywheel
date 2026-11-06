@@ -17326,27 +17326,29 @@ fn prime_profile_identity(
 /// and `squad spawn` so `__send --profile` and loop conditioning resolve
 /// the agent's profile (bd-gsvn.1). Best-effort — a registry failure is not
 /// a spawn failure (cmd_spawn precedent).
-pub(crate) fn record_spawn_entry(_cfg: &Config, project: &str, entry: state::SpawnEntry) {
-    // bd-hc-registry-recover-ywypf: ONE key per project. The registry key
-    // derives from `project` as passed (bare or absolute as the caller
-    // spelled it); resolving to an absolute dir first hashed to
-    // `<base>-<hash>` while readers used the bare spelling, splitting one
-    // pane across two files. Never resolve here — `spawn_registry_key`
-    // already converges bare/abs spellings of one dir.
-    let key = project;
+pub(crate) fn record_spawn_entry(cfg: &Config, project: &str, entry: state::SpawnEntry) {
+    // bd-hc-registry-recover-ywypf: ONE key per project. Resolve through the
+    // cfg workspace root exactly like the readers (`project_dir_str`), then
+    // key the absolute dir: a bare write against the env root and an
+    // absolute read against the cfg root split one pane across two files
+    // (the hermetic spawn test caught it).
+    let Ok(key) = project_dir_str(cfg, project) else {
+        eprintln!("flywheel: cannot resolve {project} for spawn registry write");
+        return;
+    };
     // A mutating door must not treat a corrupt fleet as empty: refuse the
     // write (loud, naming the path) instead of paving the file with one row.
-    let current = match state::load_spawn_registry_strict(key) {
+    let current = match state::load_spawn_registry_strict(&key) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("flywheel: REFUSING to record spawn entry for {project}: {e}");
             return;
         }
     };
-    let mut registry = state::merge_registry_for_mutation(key, current);
+    let mut registry = state::merge_registry_for_mutation(&key, current);
     registry.retain(|e| e.name != entry.name);
     registry.push(entry);
-    if let Err(e) = state::save_spawn_registry(key, &registry) {
+    if let Err(e) = state::save_spawn_registry(&key, &registry) {
         eprintln!("flywheel: cannot save spawn registry: {e:#}");
     }
 }

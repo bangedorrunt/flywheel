@@ -426,7 +426,7 @@ mod tests {
         let done = ensure_armed_hosts_in(
             "proj",
             &["ws1".to_string()],
-            std::path::Path::new("/bin/true"),
+            std::path::Path::new("/usr/bin/true"),
             &state,
             Some(&home),
         )
