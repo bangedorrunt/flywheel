@@ -53,6 +53,14 @@ pub struct HostSpec {
     pub toron_mcp_url: String,
     /// HOME to run as (launchd gives the job none).
     pub home: PathBuf,
+    /// Operator-configured backend (`FLYWHEEL_BACKEND`) to pin the child to.
+    /// `None` (the default) omits it so the child auto-resolves rex from
+    /// its own PATH — a stale pin would fight the operator's later change.
+    pub flywheel_backend: Option<String>,
+    /// Absolute bin dirs for the unit's PATH, resolved at install time
+    /// (exe dir + resolved plane binaries + operator PATH minus shims).
+    /// Stored, not recomputed, so the render is pure and the sandbox pins it.
+    pub path_dirs: Vec<PathBuf>,
 }
 
 /// Report for one install/unload.
@@ -106,6 +114,58 @@ pub fn unit_path(home: &Path, workspace: &str) -> PathBuf {
     }
 }
 
+/// Directories on the unit's PATH, resolved at install time (wave15-b):
+/// the operator PATH if available, else the absolute dirs containing the
+/// binaries the host shells (`flywheel`, plus `rex`/`hc`/`toron` when
+/// found). Mise shim dirs are skipped — a shim without the operator's cwd
+/// and version pin dies under launchd. Pure for tests: `operator_path` is
+/// the ambient PATH (or `None`), `exe` the flywheel binary, `bins` the
+/// already-resolved plane binary paths.
+pub fn unit_path_dirs(
+    operator_path: Option<&std::ffi::OsStr>,
+    exe: &Path,
+    bins: &[Option<PathBuf>],
+) -> Vec<PathBuf> {
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    let mut dirs = Vec::new();
+    let mut push = |d: PathBuf| {
+        if seen.insert(d.clone()) {
+            dirs.push(d);
+        }
+    };
+    if let Some(dir) = exe.parent() {
+        push(dir.to_path_buf());
+    }
+    for b in bins.iter().flatten() {
+        if let Some(dir) = b.parent() {
+            push(dir.to_path_buf());
+        }
+    }
+    if let Some(path_env) = operator_path {
+        for dir in std::env::split_paths(path_env) {
+            if is_mise_shim_dir(&dir) {
+                continue;
+            }
+            push(dir);
+        }
+    }
+    for sys in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+        push(PathBuf::from(sys));
+    }
+    dirs
+}
+
+/// `.../mise/shims` is a dispatcher dir, not a real bin directory — a shim
+/// without the operator's cwd and version pin dies under launchd.
+fn is_mise_shim_dir(dir: &Path) -> bool {
+    dir.components()
+        .map(|c| c.as_os_str())
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|w| w[0] == "mise" && w[1] == "shims")
+}
+
 /// Render the supervisor unit for one host. Pure: the sandbox pins this.
 pub fn render_host_unit(spec: &HostSpec) -> HostUnit {
     let label = host_label(&spec.workspace);
@@ -122,6 +182,17 @@ pub fn render_host_unit(spec: &HostSpec) -> HostUnit {
         .join(format!("doorbell-host-{}.err.log", slug(&spec.workspace)))
         .display()
         .to_string();
+    let path_value = spec
+        .path_dirs
+        .iter()
+        .map(|d| d.display().to_string())
+        .collect::<Vec<_>>()
+        .join(":");
+    let backend_env = spec
+        .flywheel_backend
+        .as_deref()
+        .map(|b| format!("        <key>FLYWHEEL_BACKEND</key>\n        <string>{b}</string>\n"))
+        .unwrap_or_default();
     #[cfg(target_os = "macos")]
     let body = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -158,11 +229,13 @@ pub fn render_host_unit(spec: &HostSpec) -> HostUnit {
     <dict>
         <key>HOME</key>
         <string>{home}</string>
+        <key>PATH</key>
+        <string>{path_value}</string>
         <key>TORON_MCP_URL</key>
         <string>{toron_mcp_url}</string>
         <key>DOORBELL_STATE_DIR</key>
         <string>{state}</string>
-    </dict>
+{backend_env}    </dict>
     <key>SoftResourceLimits</key>
     <dict>
         <key>NumberOfFiles</key>
@@ -180,6 +253,8 @@ pub fn render_host_unit(spec: &HostSpec) -> HostUnit {
         log_err = log_err,
         toron_mcp_url = spec.toron_mcp_url,
         state = state,
+        path_value = path_value,
+        backend_env = backend_env,
     );
     #[cfg(not(target_os = "macos"))]
     let args = format!(
@@ -188,7 +263,7 @@ pub fn render_host_unit(spec: &HostSpec) -> HostUnit {
     );
     #[cfg(not(target_os = "macos"))]
     let body = format!(
-        "[Unit]\nDescription=flywheel doorbell host {project}/{workspace} (always-on wake)\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart={exe} {args}\nWorkingDirectory={home}\nRestart=on-failure\nRestartSec=30\nLimitNOFILE=4096\nEnvironment=HOME={home}\nEnvironment=TORON_MCP_URL={toron_mcp_url}\nEnvironment=DOORBELL_STATE_DIR={state}\nStandardOutput=append:{log_out}\nStandardError=append:{log_err}\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=flywheel doorbell host {project}/{workspace} (always-on wake)\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart={exe} {args}\nWorkingDirectory={home}\nRestart=on-failure\nRestartSec=30\nLimitNOFILE=4096\nEnvironment=HOME={home}\nEnvironment=PATH={path_value}\nEnvironment=TORON_MCP_URL={toron_mcp_url}\nEnvironment=DOORBELL_STATE_DIR={state}{backend_systemd}\nStandardOutput=append:{log_out}\nStandardError=append:{log_err}\n\n[Install]\nWantedBy=default.target\n",
         project = spec.project,
         workspace = spec.workspace,
         exe = exe,
@@ -198,6 +273,12 @@ pub fn render_host_unit(spec: &HostSpec) -> HostUnit {
         state = state,
         log_out = log_out,
         log_err = log_err,
+        path_value = path_value,
+        backend_systemd = spec
+            .flywheel_backend
+            .as_deref()
+            .map(|b| format!("\nEnvironment=FLYWHEEL_BACKEND={b}"))
+            .unwrap_or_default(),
     );
     #[cfg(not(target_os = "macos"))]
     let label = host_service(&spec.workspace);
@@ -386,6 +467,17 @@ pub fn ensure_armed_hosts(cfg: &crate::config::Config) -> anyhow::Result<Vec<Hos
     }
     let exe = std::env::current_exe().context("current_exe")?;
     let home = home_dir()?;
+    // wave15-b: resolve the plane binaries NOW, while the operator PATH
+    // is available — the unit must never rely on launchd's minimal PATH.
+    let bins = [
+        doorbell_rt::binpath::resolve_cli("rex"),
+        doorbell_rt::binpath::resolve_cli("hc"),
+        doorbell_rt::binpath::resolve_cli("toron"),
+    ];
+    let path_dirs = unit_path_dirs(std::env::var_os("PATH").as_deref(), &exe, &bins);
+    let flywheel_backend = std::env::var("FLYWHEEL_BACKEND")
+        .ok()
+        .filter(|s| !s.is_empty());
     let mut done = Vec::new();
     for ws in &workspaces {
         let spec = HostSpec {
@@ -395,6 +487,8 @@ pub fn ensure_armed_hosts(cfg: &crate::config::Config) -> anyhow::Result<Vec<Hos
             state_dir: crate::config::state_dir(),
             toron_mcp_url: toron_mcp_url(),
             home: home.clone(),
+            flywheel_backend: flywheel_backend.clone(),
+            path_dirs: path_dirs.clone(),
         };
         let action = install_host(&spec, dry_run)
             .with_context(|| format!("supervised host {project}/{ws}"))?;
@@ -508,6 +602,12 @@ mod tests {
             state_dir: PathBuf::from("/tmp/fw-state"),
             toron_mcp_url: "http://127.0.0.1:18080/mcp".into(),
             home: PathBuf::from("/tmp/fw-home"),
+            flywheel_backend: None,
+            path_dirs: vec![
+                PathBuf::from("/opt/flywheel/bin"),
+                PathBuf::from("/opt/rex/bin"),
+                PathBuf::from("/usr/bin"),
+            ],
         }
     }
 
@@ -535,6 +635,51 @@ mod tests {
         assert!(unit.body.contains("TORON_MCP_URL"));
         // no second loop: the unit runs the one HostRunner entry, nothing else
         assert!(!unit.body.contains("serve"));
+        // wave15-b: the unit PATH resolves the plane binaries at install
+        // time — no bare-name lookup under launchd's minimal PATH.
+        assert!(unit.body.contains("/opt/flywheel/bin"));
+        assert!(unit.body.contains("/opt/rex/bin"));
+        // no backend pin unless the operator configured one: auto resolves
+        // rex from the unit PATH.
+        assert!(!unit.body.contains("FLYWHEEL_BACKEND"));
+        let mut pinned = spec();
+        pinned.flywheel_backend = Some("hc".into());
+        assert!(render_host_unit(&pinned).body.contains("FLYWHEEL_BACKEND"));
+        // restart rule (documented choice): SuccessfulExit=false stays —
+        // deliberate retires (pid gone, workspace gone, daemon stop) must
+        // stay dead, not respawn-loop. Only the stale-binary retire exits
+        // nonzero, and launchd restarts exactly that one. `daemon start`
+        // kickstarts loaded units so a fresh binary takes over at once
+        // (proven by the shim-log test on load_unit, not the render).
+        assert!(
+            unit.body.contains("KeepAlive") || unit.body.contains("Restart=on-failure"),
+            "restart on crash, never on clean exit"
+        );
+    }
+
+    #[test]
+    fn unit_path_dirs_prefers_real_bins_over_shims() {
+        use std::ffi::OsString;
+        let exe = PathBuf::from("/opt/flywheel/bin/flywheel");
+        let bins = vec![Some(PathBuf::from("/opt/rex/bin/rex")), None];
+        let op: OsString = "/usr/bin:/home/op/.local/share/mise/shims:/home/op/bin".into();
+        let dirs = unit_path_dirs(Some(&op), &exe, &bins);
+        let names: Vec<_> = dirs.iter().map(|d| d.display().to_string()).collect();
+        assert_eq!(names[0], "/opt/flywheel/bin", "exe dir first");
+        assert!(names.contains(&"/opt/rex/bin".to_string()));
+        assert!(
+            !names.iter().any(|d| d.contains("mise/shims")),
+            "shims never ride the unit PATH: {names:?}"
+        );
+        assert!(names.contains(&"/home/op/bin".to_string()));
+        assert!(names.contains(&"/usr/bin".to_string()));
+        // no operator PATH: resolved dirs + system fallback only.
+        let dirs = unit_path_dirs(None, &exe, &bins);
+        assert!(
+            dirs.iter()
+                .all(|d| !d.display().to_string().contains("mise"))
+        );
+        assert!(dirs.contains(&PathBuf::from("/usr/bin")));
     }
 
     /// Sandbox install: temp HOME, deny-shim supervisor on PATH, dry run —
@@ -628,6 +773,72 @@ mod tests {
         assert!(
             logged.contains("bootstrap") || logged.contains("daemon-reload"),
             "shim saw the load: {logged}"
+        );
+        // On a FAILED load there is nothing to kickstart: the failure is
+        // loud and no stale unit is kicked.
+        let restarted = logged
+            .lines()
+            .any(|l| l.starts_with("kickstart") || l.contains("--now"));
+        assert!(
+            !restarted,
+            "a failed load must not kick a unit that never loaded: {logged}"
+        );
+        restore_path_and_clean(root, prev_path);
+    }
+
+    /// `daemon start` on an already-loaded unit kickstarts it: a succeeding
+    /// shim records the full bootstrap/bootout/bootstrap/kickstart order.
+    #[test]
+    fn load_success_kickstarts_the_fresh_unit() {
+        let _g = crate::config::lock_env();
+        let root = std::env::temp_dir().join(format!("fw-host-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let shim = root.join("bin");
+        std::fs::create_dir_all(&shim).unwrap();
+        let log = root.join("shim.log");
+        for b in ["launchctl", "systemctl"] {
+            std::fs::write(
+                shim.join(b),
+                format!("#!/bin/sh\necho \"$@\" >> {}\nexit 0\n", log.display()),
+            )
+            .unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for b in ["launchctl", "systemctl"] {
+                let p = shim.join(b);
+                let mut perms = std::fs::metadata(&p).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&p, perms).unwrap();
+            }
+        }
+        let prev_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    shim.display(),
+                    prev_path.clone().unwrap_or_default().into_string().unwrap()
+                ),
+            );
+        }
+        let mut s = spec();
+        s.home = home.clone();
+        s.state_dir = root.join("state");
+        let action = install_host(&s, false).expect("load succeeds with a working supervisor");
+        assert!(action.loaded);
+        let logged = std::fs::read_to_string(&log).unwrap();
+        let verbs: Vec<&str> = logged
+            .lines()
+            .map(|l| l.split_whitespace().next().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            verbs,
+            vec!["bootstrap", "bootout", "bootstrap", "kickstart"],
+            "load order reloads the fresh unit and kickstarts it: {logged}"
         );
         restore_path_and_clean(root, prev_path);
     }

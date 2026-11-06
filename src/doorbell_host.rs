@@ -990,6 +990,14 @@ async fn run_embedded_async(
     let probe_ws = workspace.to_string();
     let probe_dir = config::state_dir();
     let shutdown_tx = tx.clone();
+    // wave15-b: only a stale binary restarts the host. The flag rides out
+    // of the liveness task; `run_embedded_async` turns it into a
+    // restartable (nonzero) exit instead of the silent exit 0 that used to
+    // strand supervised hosts on the old binary. Deliberate retires (pid
+    // gone, workspace gone, daemon stop) stay exit 0 and are never
+    // restarted.
+    let stale_binary = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stale_binary_cb = std::sync::Arc::clone(&stale_binary);
     let _liveness = tokio::spawn(async move {
         let mut gone_streak = 0u32;
         let mut ticks = 0u64;
@@ -1002,8 +1010,9 @@ async fn run_embedded_async(
                 && !doorbell::inject_allowed(&record, &exe)
             {
                 eprintln!(
-                    "flywheel doorbell: binary changed since watcher start; retiring without further wakes"
+                    "flywheel doorbell: binary changed since watcher start; retiring for supervised restart"
                 );
+                stale_binary_cb.store(true, std::sync::atomic::Ordering::SeqCst);
                 break;
             }
             ticks += 1;
@@ -1047,6 +1056,9 @@ async fn run_embedded_async(
     let report = runner
         .drive(host, sinks, store, std::future::pending())
         .await;
+    if stale_binary.load(std::sync::atomic::Ordering::SeqCst) {
+        return stale_binary_exit();
+    }
     _lease_beat.abort();
     if let Ok(mut g) = watch_slot.lock() {
         let _ = g.take();
@@ -1056,6 +1068,18 @@ async fn run_embedded_async(
         report.stats.injects, report.stats.sheds, report.stats.degraded
     );
     Ok(())
+}
+
+/// Restartable exit for a stale binary (wave15-b): the supervisor only
+/// restarts on a nonzero exit, so a replaced binary must NOT retire 0
+/// (that strands the host on dead code). Deliberate retires — pid file
+/// gone, workspace gone, daemon stop — return `Ok` and stay dead.
+fn stale_binary_exit() -> anyhow::Result<()> {
+    anyhow::bail!(
+        "flywheel doorbell: replaced binary detected — exiting nonzero so the \
+         supervisor restarts this host on the new binary (re-run the command \
+         to retire quietly instead of supervising it)"
+    )
 }
 
 /// In-process bus watch (zero fork): kinds mirror the CLI fallback filter.
@@ -1135,6 +1159,22 @@ fn spawn_bus_watch(
         Some(())
     })()
     .is_some()
+}
+
+#[cfg(test)]
+mod stale_retire_tests {
+    //! wave15-b: a replaced binary must exit nonzero (supervisor restarts
+    //! it on the new code); deliberate retires stay silent exit 0.
+
+    #[test]
+    fn stale_binary_retire_is_a_restartable_error() {
+        let err = super::stale_binary_exit().expect_err("stale binary must not exit 0");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("supervisor restarts"),
+            "the error must name the restart contract: {msg}"
+        );
+    }
 }
 
 #[cfg(test)]
