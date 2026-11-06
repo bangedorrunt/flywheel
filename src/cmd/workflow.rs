@@ -14,9 +14,9 @@ use crate::output::print_json;
 use crate::state::EventKind;
 use crate::{
     briefing_enabled, builtin_workflows, config, crew, decide, enrich_suggestions_live,
-    ensure_project_opt, headless_dispatch, headless_spawn_gate, identity, lint_flywheel_tier, log,
-    make_verify_sink, output, output_action_stage, packed_from_flag, pane, planner_author_response,
-    profile, project_dir, project_door_opt, run_terminal_status, state, steer_brief,
+    ensure_project_opt, headless_dispatch, headless_spawn_gate, identity, log, make_verify_sink,
+    output, output_action_stage, packed_from_flag, pane, planner_author_response, profile,
+    project_dir, project_door_opt, run_terminal_status, stages, state, steer_brief,
     workflow_briefing_context, workflow_catalog, write_terminal_artifact,
 };
 
@@ -1833,4 +1833,192 @@ pub(crate) fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// The flywheel-tier lint checks (the bead's fail-stop contract): profile
+/// `@name` resolution against the ProfileCatalog, `stage:` alias resolution
+/// against the StageLibrary, and `{{inputs.x}}` presence against the declared
+/// `inputs:`. The ENGINE cannot do these (no dependency inversion — it never
+/// imports flywheel's StageLibrary / ProfileCatalog), so the CLI owns them
+/// and fails closed before any run.
+///
+/// `project_root` is required, not optional: the lint must resolve stages
+/// through the SAME tiers the composer and runner use, or a project-tier
+/// stage (`.flywheel/stages.toml`) is reported unresolvable and every
+/// composed workflow that references it is refused. That made every
+/// project-authored stage uncomposable while `stage show` listed it as valid.
+/// Moved from crate root (bd-wave5-main-eviction-d5hht); shared by `cmd_workflow` and lint tests.
+pub(crate) fn lint_flywheel_tier(
+    name: &str,
+    wf: &toron_workflow::schema::Workflow,
+    project_root: Option<&std::path::Path>,
+) -> usize {
+    let profiles = profile::ProfileCatalog::load().unwrap_or_default();
+    let project_stages = project_root.map(|r| r.join(".flywheel").join("stages.toml"));
+    let stages = stages::StageLibrary::load_layered(project_stages.as_deref()).unwrap_or_default();
+    let declared_inputs: std::collections::HashSet<&str> =
+        wf.inputs.iter().map(|i| i.name.as_str()).collect();
+    let mut blocking = 0;
+
+    let emit = |msg: &str, blocking: &mut usize| {
+        eprintln!("[{name}]    error {msg}");
+        *blocking += 1;
+    };
+
+    /// Resolve a profile value for the static lint. `@name` (or `name`) is
+    /// the direct case. A templated value cannot be resolved statically —
+    /// the compose tokens wire their coder seat as
+    /// `{{inputs.coder_profile}}` (bd-adv4) — so a PURE input ref is checked
+    /// through its declared string default, and anything else (a
+    /// `{{steps.x}}` ref, mixed text, a templated default) is left to the
+    /// engine at invoke time. The `{{inputs.X}}` walker still fails an
+    /// undeclared ref, so a typo cannot hide behind the skip.
+    fn resolved_profile<'a>(
+        profile: &'a str,
+        inputs: &'a [toron_workflow::schema::InputDecl],
+    ) -> Option<&'a str> {
+        let bare = profile.trim_start_matches('@');
+        if bare.is_empty() {
+            return None;
+        }
+        if !bare.contains("{{") {
+            return Some(bare);
+        }
+        let inner = bare.strip_prefix("{{")?.strip_suffix("}}")?.trim();
+        let root = inner.strip_prefix("inputs.")?.split('.').next()?;
+        let default = inputs
+            .iter()
+            .find(|i| i.name == root)
+            .and_then(|i| i.default.as_ref())?
+            .as_str()?
+            .trim_start_matches('@');
+        if default.contains("{{") {
+            return None;
+        }
+        Some(default)
+    }
+
+    fn check_profile(
+        profile: &str,
+        inputs: &[toron_workflow::schema::InputDecl],
+        profiles: &profile::ProfileCatalog,
+        blocking: &mut usize,
+        emit: &dyn Fn(&str, &mut usize),
+    ) {
+        let Some(bare) = resolved_profile(profile, inputs) else {
+            return;
+        };
+        if profiles.get(bare).is_none() {
+            let msg = format!(
+                "profile {profile:?} does not resolve (known: {})",
+                profiles.names().join(", ")
+            );
+            emit(&msg, blocking);
+        }
+    }
+
+    fn collect_input_refs(
+        v: &serde_json::Value,
+        declared: &std::collections::HashSet<&str>,
+        blocking: &mut usize,
+        emit: &dyn Fn(&str, &mut usize),
+    ) {
+        match v {
+            serde_json::Value::String(s) => {
+                for inner in template_tokens(s) {
+                    if let Some(key) = inner.strip_prefix("inputs.") {
+                        let root = key.split('.').next().unwrap_or(key);
+                        if !declared.contains(root) {
+                            let msg = format!(
+                                "{{{{inputs.{key}}}}} references input {root:?} that is not declared in `inputs:`"
+                            );
+                            emit(&msg, blocking);
+                        }
+                    }
+                }
+            }
+            serde_json::Value::Array(a) => {
+                for item in a {
+                    collect_input_refs(item, declared, blocking, emit);
+                }
+            }
+            serde_json::Value::Object(o) => {
+                for v in o.values() {
+                    collect_input_refs(v, declared, blocking, emit);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn template_tokens(s: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut rest = s;
+        while let Some(start) = rest.find("{{") {
+            if let Some(end) = rest[start + 2..].find("}}") {
+                out.push(&rest[start + 2..start + 2 + end]);
+                rest = &rest[start + 2 + end + 2..];
+            } else {
+                break;
+            }
+        }
+        out
+    }
+
+    fn scan_action(
+        action: &toron_workflow::schema::Action,
+        profiles: &profile::ProfileCatalog,
+        stages: &stages::StageLibrary,
+        inputs: &[toron_workflow::schema::InputDecl],
+        declared: &std::collections::HashSet<&str>,
+        blocking: &mut usize,
+        emit: &dyn Fn(&str, &mut usize),
+    ) {
+        let json = serde_json::to_value(action).unwrap_or_default();
+        if let Some(spec) = json.get("spec").and_then(|s| s.as_object()) {
+            if let Some(profile) = spec.get("profile").and_then(|v| v.as_str()) {
+                check_profile(profile, inputs, profiles, blocking, emit);
+            }
+            if let Some(stage) = spec.get("stage").and_then(|v| v.as_str())
+                && !stages.has(stage)
+            {
+                emit(
+                    &format!("stage {stage:?} does not resolve (semantic or p-code alias)"),
+                    blocking,
+                );
+            }
+        }
+        if let Some(profile) = json.get("profile").and_then(|v| v.as_str()) {
+            check_profile(profile, inputs, profiles, blocking, emit);
+        }
+        for v in json.as_object().into_iter().flat_map(|o| o.values()) {
+            collect_input_refs(v, declared, blocking, emit);
+        }
+    }
+
+    for step in &wf.steps {
+        scan_action(
+            &step.action,
+            &profiles,
+            &stages,
+            &wf.inputs,
+            &declared_inputs,
+            &mut blocking,
+            &emit,
+        );
+    }
+    if let Some(graph) = &wf.graph {
+        for node in graph.nodes.values() {
+            scan_action(
+                &node.action,
+                &profiles,
+                &stages,
+                &wf.inputs,
+                &declared_inputs,
+                &mut blocking,
+                &emit,
+            );
+        }
+    }
+    blocking
 }
