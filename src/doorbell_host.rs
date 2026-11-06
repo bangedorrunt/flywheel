@@ -390,15 +390,32 @@ impl RtHost {
         let Ok(key) = crate::project_dir_str(&self.cfg, &self.project) else {
             return;
         };
-        let Some(mailbox) = crate::mail::try_mailbox() else {
+        // The board through the SAME mail backend the host uses (remote MCP or
+        // in-process). `try_mailbox()` is in-process-only and is None in the
+        // remote mode the live host runs, which made the first digest silent.
+        let Ok(Some(mail)) = crate::mail::Mail::from_config(Some(&self.cfg.toron_mail_config()))
+        else {
             return;
         };
-        let rows = crate::backend::run_mail_off_runtime_sync(|| {
-            crate::mail::block_on(mailbox.active_reservations(&key))
-        });
-        let Ok(rows) = rows else {
+        let Ok(board) = mail.list_active(&key, None, None) else {
             return;
         };
+        let rows: Vec<reservation_digest::Lease> = board
+            .get("reservations")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|r| {
+                        Some(reservation_digest::Lease {
+                            holder: r.get("holder")?.as_str()?.to_string(),
+                            path: r.get("path")?.as_str()?.to_string(),
+                            exclusive: r.get("exclusive")?.as_bool()?,
+                            expires_us: r.get("expires_ts_us").and_then(|v| v.as_i64()),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let now_us = i64::try_from(now_unix)
             .unwrap_or(i64::MAX)
             .saturating_mul(1_000_000);

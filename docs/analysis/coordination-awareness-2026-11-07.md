@@ -143,3 +143,27 @@ Options, in order of preference:
 
 This is a scheduling fact, not a reservation-lock bug: the 180 s heartbeat
 never blocked anyone; the crate-wide gate did.
+
+## Implemented: advisory push digest (and why it is mostly a backstop)
+
+`src/reservation_digest.rs` is a pure overlap detector (`Lease` rows in,
+`Conflict` rows out; expired rows ignored, same-holder ignored, exclusive
+only, symmetric fnmatch, one episode key). The embedded doorbell host reads
+the board through the **same mail facade** it uses for mail (remote MCP or
+in-process, not the in-process singleton) every 30 s; on the first sweep an
+episode appears it:
+
+- types one advisory line to each holder (`⟦reserve⟧ conflict with … —
+  re-plan/split or request-release; never wait on a lease`),
+- sends the captain a `Fact` (which the workspace fold turns into a prompt),
+- appends a `reservation_conflict` audit row,
+- stays quiet until the overlap clears, then re-arms for the next episode.
+
+Live probe finding: **`reserve acquire --exclusive` already refuses the
+second overlapping holder** (HolderB's acquire returned the HolderA
+conflict; only HolderA held the path). So two *live* exclusive overlaps
+cannot normally coexist — the digest fires only for legacy 90-day holds,
+cross-spelling gaps the acquire check misses, or a check/grant race. That is
+the intended order: the native refusal is the gate, the digest is the
+backstop. Its detection is covered by three pure unit tests; the live board
+refusal is the evidence for the stronger path.

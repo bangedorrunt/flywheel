@@ -11,7 +11,15 @@
 use std::collections::BTreeSet;
 
 use toron_core::mailbox::guard::pattern_matches;
-use toron_core::mailbox::reservations::Reservation;
+
+/// One live lease row, backend-agnostic (the board facade maps to this).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lease {
+    pub holder: String,
+    pub path: String,
+    pub exclusive: bool,
+    pub expires_us: Option<i64>,
+}
 
 /// One advisory conflict between two holders.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -47,39 +55,36 @@ impl Conflict {
 /// - shared+shared is not a write block (shared leases do not stop a writer);
 /// - overlap is symmetric (`pattern_matches` either direction), so
 ///   `src/*.rs` and `src/main.rs` conflict.
-pub fn live_conflicts(rows: &[Reservation], now_us: i64) -> Vec<Conflict> {
-    let live: Vec<&Reservation> = rows
+pub fn live_conflicts(rows: &[Lease], now_us: i64) -> Vec<Conflict> {
+    let live: Vec<&Lease> = rows
         .iter()
-        .filter(|r| r.expires_ts_us.is_none_or(|e| e > now_us))
+        .filter(|r| r.expires_us.is_none_or(|e| e > now_us))
         .filter(|r| r.exclusive)
         .collect();
     let mut out = BTreeSet::new();
     for (i, a) in live.iter().enumerate() {
         for b in live.iter().skip(i + 1) {
-            if a.agent_name == b.agent_name {
+            if a.holder == b.holder {
                 continue;
             }
-            let overlap = pattern_matches(&a.path_pattern, &b.path_pattern)
-                || pattern_matches(&b.path_pattern, &a.path_pattern);
+            let overlap = pattern_matches(&a.path, &b.path) || pattern_matches(&b.path, &a.path);
             if !overlap {
                 continue;
             }
             let (holder_a, path_a, holder_b, path_b) =
-                if (a.agent_name.as_str(), a.path_pattern.as_str())
-                    <= (b.agent_name.as_str(), b.path_pattern.as_str())
-                {
+                if (a.holder.as_str(), a.path.as_str()) <= (b.holder.as_str(), b.path.as_str()) {
                     (
-                        a.agent_name.clone(),
-                        a.path_pattern.clone(),
-                        b.agent_name.clone(),
-                        b.path_pattern.clone(),
+                        a.holder.clone(),
+                        a.path.clone(),
+                        b.holder.clone(),
+                        b.path.clone(),
                     )
                 } else {
                     (
-                        b.agent_name.clone(),
-                        b.path_pattern.clone(),
-                        a.agent_name.clone(),
-                        a.path_pattern.clone(),
+                        b.holder.clone(),
+                        b.path.clone(),
+                        a.holder.clone(),
+                        a.path.clone(),
                     )
                 };
             let key = format!("{holder_a}|{path_a}||{holder_b}|{path_b}");
@@ -99,23 +104,12 @@ pub fn live_conflicts(rows: &[Reservation], now_us: i64) -> Vec<Conflict> {
 mod tests {
     use super::*;
 
-    fn row(
-        id: &str,
-        holder: &str,
-        path: &str,
-        exclusive: bool,
-        expires: Option<i64>,
-    ) -> Reservation {
-        Reservation {
-            id: id.into(),
-            agent_name: holder.into(),
-            agent_pubkey: String::new(),
-            path_pattern: path.into(),
+    fn row(_id: &str, holder: &str, path: &str, exclusive: bool, expires: Option<i64>) -> Lease {
+        Lease {
+            holder: holder.into(),
+            path: path.into(),
             exclusive,
-            reason: "test".into(),
-            expires_ts_us: expires,
-            status: toron_core::mailbox::reservations::ReservationStatus::Held,
-            epoch: 0,
+            expires_us: expires,
         }
     }
 
