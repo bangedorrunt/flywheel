@@ -1526,60 +1526,73 @@ fn swarm_slice(
     (next, cmds)
 }
 
-/// Replay / live-loop helper: every LoopMsg enters through workspace::tick.
+/// Shared reclaim fold (lane A): the swarm fold plus the synthesized reclaim
+/// action when the fold emits none. One copy serves both `tick` (workspace-
+/// owned model) and `tick_from_loop_msg` (loop-owned model).
+fn reclaim_fold(
+    swarm: &crate::durable::LoopModel,
+    bead_id: &str,
+    holder_pin: &str,
+    claimant_pin: &str,
+    is_live: bool,
+    reason: &str,
+) -> (crate::durable::LoopModel, Vec<Cmd>) {
+    let (next, mut cmds) = swarm_slice(
+        swarm,
+        crate::durable::LoopMsg::Reclaim {
+            bead_id: bead_id.to_string(),
+            holder_pin: holder_pin.to_string(),
+            claimant_pin: claimant_pin.to_string(),
+            is_live,
+        },
+    );
+    if !cmds.iter().any(|cmd| matches!(cmd, Cmd::Reclaim { .. })) {
+        cmds.push(Cmd::Reclaim {
+            bead_id: bead_id.to_string(),
+            pin: holder_pin.to_string(),
+            terminal_name: claimant_pin.to_string(),
+            reason: if reason.is_empty() {
+                "reclaim".to_string()
+            } else {
+                reason.to_string()
+            },
+        });
+    }
+    (next, cmds)
+}
+
+/// Replay / live-loop helper: loop messages fold the owned `LoopModel`
+/// directly (bd-lane-a-kernel-honesty-ub2gd). The workspace `tick` arms for
+/// these messages only read and write the swarm slice, so re-embedding the
+/// model in a default `WorkspaceModel` per message was a clone with no
+/// behavioral effect. The fold stays pure: no I/O, clock, rand, env, or
+/// locks inside.
 pub fn tick_from_loop_msg(
     model: &crate::durable::LoopModel,
     msg: &crate::durable::LoopMsg,
 ) -> (crate::durable::LoopModel, Vec<crate::durable::LoopAction>) {
-    let ws_msg = match msg {
-        crate::durable::LoopMsg::Tick { now } => Msg::Tick { now: *now },
-        crate::durable::LoopMsg::Heal {
-            name,
-            status,
-            exited,
-        } => Msg::Heal {
-            name: name.clone(),
-            status: status.clone(),
-            exited: *exited,
-        },
-        crate::durable::LoopMsg::ClaimNudge { name, bead_id } => Msg::ClaimNudge {
-            name: name.clone(),
-            bead_id: bead_id.clone(),
-        },
-        crate::durable::LoopMsg::CloseNudge {
-            name,
-            bead_id,
-            title,
-        } => Msg::CloseNudge {
-            name: name.clone(),
-            bead_id: bead_id.clone(),
-            title: title.clone(),
-        },
-        crate::durable::LoopMsg::Reclaim {
-            bead_id,
-            holder_pin,
-            claimant_pin,
-            is_live,
-        } => Msg::Reclaim {
-            bead_id: bead_id.clone(),
-            holder_pin: holder_pin.clone(),
-            claimant_pin: claimant_pin.clone(),
-            is_live: *is_live,
-            reason: String::new(),
-        },
-        other => {
-            let (next, cmds) = swarm_slice(model, other.clone());
-            let acts = cmds.iter().filter_map(Cmd::to_loop_action).collect();
-            return (next, acts);
-        }
-    };
-    let wm = WorkspaceModel {
-        swarm: model.clone(),
-        ..Default::default()
-    };
-    let (wm, cmds) = tick(&wm, &ws_msg);
+    // The reclaim synthesis lives in `reclaim_fold` (`tick` builds it with
+    // an empty reason, which renders as "reclaim").
+    if let crate::durable::LoopMsg::Reclaim {
+        bead_id,
+        holder_pin,
+        claimant_pin,
+        is_live,
+        ..
+    } = msg
+    {
+        let (next, cmds) = reclaim_fold(model, bead_id, holder_pin, claimant_pin, *is_live, "");
+        let acts = cmds.iter().filter_map(Cmd::to_loop_action).collect();
+        return (next, acts);
+    }
+    // Every other loop message folds the swarm slice only: `tick`'s arms
+    // for Tick/Heal/ClaimNudge/CloseNudge delegate to `swarm_slice` with
+    // identical input, and the trailing `tick` bookkeeping (seq, digests,
+    // counters, prompt filtering) touches only discarded workspace state —
+    // `Prompt`/`Digest` cmds never survive `to_loop_action`.
+    let (next, cmds) = swarm_slice(model, msg.clone());
     let acts = cmds.iter().filter_map(Cmd::to_loop_action).collect();
-    (wm.swarm, acts)
+    (next, acts)
 }
 
 /// One entry: pure, total, deterministic, no I/O, no &mut.
@@ -1967,28 +1980,15 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             is_live,
             reason,
         } => {
-            let (sm, mut c) = swarm_slice(
+            let (sm, c) = reclaim_fold(
                 &model.swarm,
-                crate::durable::LoopMsg::Reclaim {
-                    bead_id: bead_id.clone(),
-                    holder_pin: holder_pin.clone(),
-                    claimant_pin: claimant_pin.clone(),
-                    is_live: *is_live,
-                },
+                bead_id,
+                holder_pin,
+                claimant_pin,
+                *is_live,
+                reason,
             );
             next.swarm = sm;
-            if !c.iter().any(|cmd| matches!(cmd, Cmd::Reclaim { .. })) {
-                c.push(Cmd::Reclaim {
-                    bead_id: bead_id.clone(),
-                    pin: holder_pin.clone(),
-                    terminal_name: claimant_pin.clone(),
-                    reason: if reason.is_empty() {
-                        "reclaim".into()
-                    } else {
-                        reason.clone()
-                    },
-                });
-            }
             cmds.extend(c);
         }
         Msg::Heal {
@@ -2350,6 +2350,73 @@ mod tests {
 
     fn empty_model() -> WorkspaceModel {
         WorkspaceModel::default()
+    }
+
+    /// bd-lane-a-kernel-honesty-ub2gd: one message log, one fold. The same
+    /// LoopMsg log yields the same (model, cmds), and loop messages fold
+    /// the owned LoopModel directly — `tick_from_loop_msg` never embeds
+    /// the model in a default WorkspaceModel per message.
+    #[test]
+    fn tick_from_loop_msg_folds_swarm_slice_in_place() {
+        use crate::durable::{LoopModel, LoopMsg};
+        let model = LoopModel::default();
+        let log = vec![
+            LoopMsg::Tick { now: 7 },
+            LoopMsg::ClaimNudge {
+                name: "a".into(),
+                bead_id: "bd-1".into(),
+            },
+            LoopMsg::CloseNudge {
+                name: "a".into(),
+                bead_id: "bd-1".into(),
+                title: "t".into(),
+            },
+            LoopMsg::Heal {
+                name: "a".into(),
+                status: "idle".into(),
+                exited: false,
+            },
+            LoopMsg::Reclaim {
+                bead_id: "bd-1".into(),
+                holder_pin: "P".into(),
+                claimant_pin: "Q".into(),
+                is_live: true,
+            },
+        ];
+        let fold = |start: &LoopModel| {
+            let mut m = start.clone();
+            let mut out = Vec::new();
+            for msg in &log {
+                let (next, acts) = tick_from_loop_msg(&m, msg);
+                m = next;
+                out.extend(acts);
+            }
+            (m, out)
+        };
+        let (first, first_acts) = fold(&model);
+        let (second, second_acts) = fold(&model);
+        assert_eq!(first, second, "same log must yield same model");
+        assert_eq!(first_acts, second_acts, "same log must yield same cmds");
+        // Loop-only messages delegate to the swarm slice with identical input.
+        for msg in &log[..4] {
+            let (via_helper, helper_acts) = tick_from_loop_msg(&model, msg);
+            let (via_slice, slice_cmds) = swarm_slice(&model, msg.clone());
+            assert_eq!(
+                via_helper, via_slice,
+                "fold must match swarm slice for {msg:?}"
+            );
+            let slice_acts: Vec<_> = slice_cmds.iter().filter_map(Cmd::to_loop_action).collect();
+            assert_eq!(helper_acts, slice_acts, "cmds must match for {msg:?}");
+        }
+        // Reclaim still synthesizes the reclaim action when the fold emits none.
+        let (_, reclaim_acts) = tick_from_loop_msg(&model, &log[4]);
+        assert!(
+            reclaim_acts.iter().any(|a| matches!(
+                a,
+                crate::durable::LoopAction::Reclaim { reason, .. } if reason == "reclaim"
+            )),
+            "reclaim must synthesize its action, got {reclaim_acts:?}"
+        );
     }
 
     /// bd-context-handoff-064d: the resume delta covers only unseen runs.

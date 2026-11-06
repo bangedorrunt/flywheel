@@ -699,7 +699,7 @@ fn fold_legacy_alias(
     let Ok(raw) = std::fs::read_to_string(&legacy_path) else {
         return current;
     };
-    let legacy_rows: Vec<SpawnEntry> = serde_json::from_str(&raw).unwrap_or_default();
+    let legacy_rows: Vec<SpawnEntry> = parse_spawn_registry_lenient(&legacy_path, &raw);
     let seen: std::collections::HashSet<String> =
         current.iter().map(|e| e.pane_id.clone()).collect();
     let mut merged = current;
@@ -748,15 +748,68 @@ pub fn save_spawn_registry(project: &str, entries: &[SpawnEntry]) -> Result<()> 
     Ok(())
 }
 
-/// Read the project's pane→name registry (missing/corrupt → empty). Any
-/// pre-split alias file is folded in first, so name-form and path-form
-/// callers always see the same entries.
-pub fn load_spawn_registry(project: &str) -> Vec<SpawnEntry> {
+/// Typed spawn-registry failure (bd-lane-a-kernel-honesty-ub2gd): a present
+/// but corrupt registry is a loud error naming the path, never a silent
+/// empty fleet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpawnRegistryError {
+    Corrupt { path: PathBuf, source: String },
+}
+
+impl std::fmt::Display for SpawnRegistryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Corrupt { path, source } => {
+                write!(f, "spawn registry corrupt: {} ({source})", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for SpawnRegistryError {}
+
+/// Lenient registry parse: corrupt JSON warns loud (naming the file) and
+/// degrades to empty instead of pretending the fleet is empty.
+fn parse_spawn_registry_lenient(path: &Path, raw: &str) -> Vec<SpawnEntry> {
+    match serde_json::from_str(raw) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!(
+                "flywheel: WARNING spawn registry corrupt ({}): {e}; treating as empty for this read",
+                path.display()
+            );
+            vec![]
+        }
+    }
+}
+
+/// Strict spawn-registry read: a missing file is an empty fleet; a present
+/// but corrupt file is a loud `SpawnRegistryError` naming the path.
+pub fn load_spawn_registry_strict(project: &str) -> Result<Vec<SpawnEntry>, SpawnRegistryError> {
     let path = spawn_registry_file(project);
-    let current = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Vec<SpawnEntry>>(&raw).ok())
-        .unwrap_or_default();
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(_) => return Ok(vec![]),
+    };
+    serde_json::from_str::<Vec<SpawnEntry>>(&raw).map_err(|e| SpawnRegistryError::Corrupt {
+        path: path.clone(),
+        source: e.to_string(),
+    })
+}
+
+/// Read the project's pane→name registry. A corrupt file warns loud
+/// (naming the file) and degrades to empty for this read-only command —
+/// it never silently reports an empty fleet. Callers that must fail loud
+/// use `load_spawn_registry_strict`. Any pre-split alias file is folded
+/// in first, so name-form and path-form callers always see the same entries.
+pub fn load_spawn_registry(project: &str) -> Vec<SpawnEntry> {
+    let current = match load_spawn_registry_strict(project) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("flywheel: WARNING {e}; treating as empty for this read");
+            vec![]
+        }
+    };
     let merged = fold_legacy_alias(project, &spawn_registry_key(project), current);
     if !merged.is_empty() {
         return dedupe_spawn_entries(merged);
@@ -3509,6 +3562,34 @@ mod loops_sidecar_tests {
         );
         let path = spawn_registry_file(&p);
         std::fs::write(&path, "{not json").unwrap();
+        assert_eq!(load_spawn_registry(&p), [] as [SpawnEntry; 0]);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.tmp"));
+    }
+
+    /// bd-lane-a-kernel-honesty-ub2gd: a corrupt registry is a loud typed
+    /// failure naming the path — never a silent empty fleet.
+    #[test]
+    fn corrupt_spawn_registry_fails_loud_via_strict_loader() {
+        let _g = loops_test_guard();
+        let p = test_project("reg-corrupt");
+        let entries = vec![SpawnEntry::legacy("w2A:p1", "flywheel-reg-corrupt-oc")];
+        save_spawn_registry(&p, &entries).unwrap();
+        assert!(load_spawn_registry_strict(&p).is_ok());
+        let path = spawn_registry_file(&p);
+        std::fs::write(&path, "{not json").unwrap();
+        let err = load_spawn_registry_strict(&p).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&path.display().to_string()),
+            "error must name the file, got {msg}"
+        );
+        assert!(
+            matches!(err, SpawnRegistryError::Corrupt { .. }),
+            "corrupt registry must be typed, got {msg}"
+        );
+        // The lenient read-only path degrades (with a loud stderr warning)
+        // instead of silently reporting an empty fleet.
         assert_eq!(load_spawn_registry(&p), [] as [SpawnEntry; 0]);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("json.tmp"));

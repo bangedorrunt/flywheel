@@ -98,7 +98,6 @@ mod rot;
 mod run_log;
 mod run_state_recorder;
 mod signoff;
-mod smart_cron;
 mod snapshot;
 mod snapshot_reporting;
 mod stages;
