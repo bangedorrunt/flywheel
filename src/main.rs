@@ -2234,6 +2234,17 @@ pub(crate) fn workspace_label_aliases(project: &str, spawn_meta: Option<&str>) -
     if !slug.is_empty() && !out.iter().any(|l| l == &slug) {
         out.push(slug);
     }
+    // An absolute project path slugifies to the whole path; the plane labels
+    // the workspace after the BASENAME (`flywheel-hc-e2e-iylrua`), which no
+    // alias matched (live hc: "no flywheel swarm" for a running pane).
+    let base = project.rsplit('/').next().unwrap_or(project);
+    let (base_slug, _) = slugify_label(base);
+    if !base_slug.is_empty() {
+        let owned = format!("flywheel-{base_slug}");
+        if !out.iter().any(|l| l == &owned) {
+            out.push(owned);
+        }
+    }
     out
 }
 
