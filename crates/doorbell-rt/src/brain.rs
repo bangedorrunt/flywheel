@@ -264,6 +264,13 @@ impl<H: Host> Brain<H> {
         let wake = store.load_wake(&cfg.workspace);
         let mut hear = HearTracker::default();
         hear.seed_unanswered(store.load_unanswered(&cfg.workspace));
+        // A seeded ring has no pending entry, so the only way the agent's
+        // own reply clears it is the pin→npub map: fill it from the host
+        // index at start (an unseeded restart otherwise kept a pin that had
+        // already answered unanswered forever).
+        for pin in hear.unanswered_pins() {
+            hear.remember_npub(&pin, host.pin_npub(&pin).as_deref());
+        }
         let next_seq = store.last_seq(&cfg.workspace) + 1;
         let mut budgets = std::collections::BTreeMap::new();
         for row in &store.fold_workspace(&cfg.workspace).rows {
@@ -1607,6 +1614,30 @@ mod tests {
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .filter_map(|v| v["msg"]["rt_kind"].as_str().map(str::to_string))
             .collect()
+    }
+
+    /// A ring loaded from disk has no pending entry, so only the pin→npub
+    /// map can clear it when the agent replies. Live: SwiftBay answered and
+    /// the status still reported it unanswered until the host index filled
+    /// that map at start.
+    #[tokio::test]
+    async fn a_seeded_unanswered_pin_clears_when_its_known_npub_is_heard() {
+        let dir = std::env::temp_dir().join(format!("dbrt-brain-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = FileStore::new(&dir);
+        store.save_unanswered("w", &["SwiftBay".to_string()]);
+        let mut host = MockHost::new(1_000_000);
+        host.npubs.insert("SwiftBay".into(), "ab12".into());
+        let (tx, _rx) = tokio::sync::mpsc::channel(crate::BRAIN_CAP);
+        let sinks = SinkManager::new(tx);
+        let mut brain = Brain::new(BrainConfig::new("w"), host, store, sinks);
+        assert_eq!(brain.hear.unanswered_pins(), vec!["SwiftBay".to_string()]);
+        brain.hear.note_heard_pubkey("AB12");
+        assert!(
+            brain.hear.unanswered_pins().is_empty(),
+            "the seeded ring must carry the host-known npub"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// rv23 #3: an idle sweep decides nothing, so it writes no journal row

@@ -163,6 +163,8 @@ pub struct MockHost {
     pub statuses: BTreeMap<String, String>,
     /// Pins with no prompt route (`has_route` false) — bd-bk9t tests.
     pub unroutable: std::collections::BTreeSet<String>,
+    /// Pin → npub, for hear-tracker seeding (`Host::pin_npub`).
+    pub npubs: std::collections::BTreeMap<String, String>,
 }
 
 impl MockHost {
@@ -178,6 +180,7 @@ impl MockHost {
             restart_pending: false,
             statuses: Default::default(),
             unroutable: Default::default(),
+            npubs: Default::default(),
         }
     }
 
@@ -199,6 +202,10 @@ impl Host for MockHost {
 
     fn prev_status(&self, pin: &str) -> Option<String> {
         self.statuses.get(pin).cloned()
+    }
+
+    fn pin_npub(&self, pin: &str) -> Option<String> {
+        self.npubs.get(pin).cloned()
     }
 
     fn now_unix(&self) -> u64 {
