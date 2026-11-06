@@ -4030,7 +4030,7 @@ mod presence_model_tests {
         let mut m = empty_model();
         m.presence.insert("I".into(), Presence::from_str("idle"));
         m.presence.insert("B".into(), Presence::from_str("working"));
-        let urgent = "[doorbell] plane-P urgent. Pull: toron mail inbox --since last";
+        let urgent = "[doorbell] plane-P urgent. Pull: toron next";
         let routine = "[doorbell] kind 9. Pull: toron channel read h=ch-1";
         let cmds = vec![
             Cmd::Prompt {

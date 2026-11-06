@@ -394,8 +394,13 @@ fn pull_hint(class: EventClass, channel: Option<&str>) -> String {
             None => "toron channel read".into(),
         },
         EventClass::Job => "toron job list".into(),
+        // ADR-0041: `next` commits the cursor + Delivered PER MESSAGE, so a
+        // pull cannot skip unread mail; `mail inbox --since last` is a
+        // high-water view and silently jumped past unread mail when several
+        // arrived together (live collab probe: the peer replied to the wrong
+        // thread and the new ask became invisible).
         EventClass::RequestRelease | EventClass::PlanePUrgent | EventClass::PlanePMail => {
-            "toron mail inbox --since".into()
+            "toron next".into()
         }
         EventClass::ReservationConflict => "toron reserve list".into(),
     }
@@ -1220,10 +1225,7 @@ mod tests {
         let (class, hint) = parse_watch_ndjson(line, &index).expect("mail-delivered must ring");
         assert_eq!(class, EventClass::PlanePMail);
         assert_ne!(class, EventClass::Channel);
-        assert!(
-            hint.contains("toron mail inbox"),
-            "hint must pull inbox: {hint}"
-        );
+        assert!(hint.contains("toron next"), "hint must pull inbox: {hint}");
         let rendered = doorbell_line(class, &hint);
         assert!(
             !is_urgent_line(&rendered),
@@ -1247,7 +1249,10 @@ mod tests {
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             DoorbellAction::Prompt { line, .. } => {
-                assert!(line.contains("inbox"), "mail wake must pull inbox: {line}");
+                assert!(
+                    line.contains("toron next"),
+                    "mail wake must pull inbox: {line}"
+                );
                 assert!(
                     !line.contains("channel read"),
                     "mail wake must not channel read: {line}"
