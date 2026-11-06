@@ -257,6 +257,164 @@ impl RtHost {
             .collect()
     }
 
+    /// Rex presence producer (wave17-b): the SAME source `flywheel status`
+    /// trusts. Seeds one `agent_list()` (so a host that starts while panes
+    /// are idle is injectable at once), then streams `rex events` scoped to
+    /// the covered panes and folds every status change into a PlaneStatus.
+    /// Pane ids the registry cannot map to a pin are audited loudly once —
+    /// a covered pane is never silently skipped.
+    fn cover_rex_panes(&mut self) {
+        use toron_plane::backend::{BackendEvent, Subscription};
+        let registry = state::load_spawn_registry(&self.project);
+        let covered = self.covered_panes.lock().unwrap_or_else(|e| e.into_inner());
+        let pane_ids: Vec<(String, String)> = registry
+            .iter()
+            .filter(|e| !e.pane_id.is_empty())
+            .filter(|e| !covered.contains(&e.pane_id))
+            .filter_map(|e| e.mail_identity.clone().map(|pin| (e.pane_id.clone(), pin)))
+            .collect();
+        drop(covered);
+        if pane_ids.is_empty() {
+            return;
+        }
+        let pin_by_pane: HashMap<String, String> = pane_ids.iter().cloned().collect();
+        let tx = self.brain_tx.clone();
+        // Seed: one bounded agent_list before the loop, so idle panes are
+        // injectable without waiting for a status change.
+        let backend = match crate::backend::factory::multiplexer_backend(&self.cfg) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("flywheel doorbell: rex backend unavailable ({e:#}) — no push status");
+                return;
+            }
+        };
+        match backend.agent_list() {
+            Ok(agents) => {
+                let (updates, unmapped) = Self::presence_updates_for(&agents, &pin_by_pane);
+                for msg in updates {
+                    if tx.blocking_send(msg).is_err() {
+                        return;
+                    }
+                }
+                Self::audit_unmapped_panes(&self.workspace, &unmapped);
+            }
+            Err(e) => {
+                eprintln!("flywheel doorbell: rex agent_list failed ({e:#}) — no seed statuses");
+            }
+        }
+        // Stream: one `rex events` scoped to the covered panes.
+        let filters: Vec<Subscription> = pin_by_pane
+            .keys()
+            .map(|p| Subscription::agent_status_changed(p.clone()))
+            .collect();
+        let mut stream = match backend.subscribe(&filters) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("flywheel doorbell: rex subscribe failed ({e:#}) — seeded only");
+                return;
+            }
+        };
+        {
+            let mut covered = self.covered_panes.lock().unwrap_or_else(|e| e.into_inner());
+            covered.extend(pin_by_pane.keys().cloned());
+        }
+        let covered_shared = Arc::clone(&self.covered_panes);
+        let clear_ids: Vec<String> = pin_by_pane.keys().cloned().collect();
+        let workspace = self.workspace.clone();
+        let cfg = self.cfg.clone();
+        std::thread::spawn(move || {
+            let mut audited = std::collections::HashSet::new();
+            loop {
+                match stream.read_event() {
+                    Ok(Some(BackendEvent::AgentStatusChanged { pane, status, .. }))
+                    | Ok(Some(BackendEvent::AgentDetected { pane, status, .. })) => {
+                        let pane_id = pane.as_str();
+                        match pin_by_pane.get(pane_id) {
+                            Some(pin) => {
+                                let msg = BrainMsg::PlaneStatus {
+                                    pin: pin.clone(),
+                                    status: status.as_str().to_string(),
+                                };
+                                if tx.blocking_send(msg).is_err() {
+                                    break;
+                                }
+                            }
+                            None if audited.insert(pane_id.to_string()) => {
+                                Self::audit_unmapped_panes(&workspace, &[pane_id.to_string()]);
+                            }
+                            None => {}
+                        }
+                    }
+                    Ok(Some(BackendEvent::EventsLost)) => {
+                        eprintln!(
+                            "flywheel doorbell: rex events_lost — reconciling via agent_list"
+                        );
+                        let Ok(backend) = crate::backend::factory::multiplexer_backend(&cfg) else {
+                            break;
+                        };
+                        let Ok(agents) = backend.agent_list() else {
+                            break;
+                        };
+                        let (updates, unmapped) = Self::presence_updates_for(&agents, &pin_by_pane);
+                        for msg in updates {
+                            if tx.blocking_send(msg).is_err() {
+                                break;
+                            }
+                        }
+                        Self::audit_unmapped_panes(&workspace, &unmapped);
+                    }
+                    Ok(Some(BackendEvent::PaneExited { .. })) | Ok(Some(BackendEvent::Raw(_))) => {}
+                    Ok(None) | Err(_) => {
+                        clear_covered(&covered_shared, &clear_ids);
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Map backend agent rows onto PlaneStatus sends (wave17-b: the SAME
+    /// source `flywheel status` trusts). Returns the messages plus any pane
+    /// ids the registry could not map to a pin — the caller audits those
+    /// loudly instead of silently skipping a covered pane.
+    fn presence_updates_for(
+        agents: &[toron_core::pane_types::AgentInfo],
+        pin_by_pane: &HashMap<String, String>,
+    ) -> (Vec<BrainMsg>, Vec<String>) {
+        let mut updates = Vec::new();
+        let mut unmapped = Vec::new();
+        for ag in agents {
+            match pin_by_pane.get(&ag.pane_id) {
+                Some(pin) => updates.push(BrainMsg::PlaneStatus {
+                    pin: pin.clone(),
+                    status: ag.agent_status.as_str().to_string(),
+                }),
+                None => unmapped.push(ag.pane_id.clone()),
+            }
+        }
+        updates.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        unmapped.sort();
+        unmapped.dedup();
+        (updates, unmapped)
+    }
+
+    /// Loud audit for panes no pin resolves (wave17-b: never silently skip
+    /// a covered pane). Best-effort file append like the other host audits.
+    fn audit_unmapped_panes(workspace: &str, panes: &[String]) {
+        if panes.is_empty() {
+            return;
+        }
+        let detail = serde_json::json!({
+            "kind": "presence_unmapped_pane",
+            "workspace": workspace,
+            "panes": panes,
+        });
+        eprintln!(
+            "flywheel doorbell: {workspace} has status for unmapped panes {panes:?} — no pin to wake; audit recorded"
+        );
+        doorbell::audit_append(&crate::config::state_dir(), workspace, detail);
+    }
+
     /// Spawn push forwarders for registry panes without coverage (bd-8hv0):
     /// late crew panes get push coverage instead of the polling fallback.
     ///
@@ -271,6 +429,10 @@ impl RtHost {
     /// died, refresh the pane list and retry. `events_lost` stays TODO until
     /// toron-core surfaces it as a typed signal (see hook below).
     fn cover_new_panes(&mut self) {
+        if crate::pane::rex_door_selected(&self.cfg) {
+            self.cover_rex_panes();
+            return;
+        }
         if crate::backend::resolve_backend_name(&self.cfg) != "hc" {
             return;
         }
@@ -1510,6 +1672,95 @@ mod parity_tests {
             fx.iter()
                 .any(|e| matches!(e, doorbell_rt::Effect::RestartWatch))
         );
+    }
+}
+
+#[cfg(test)]
+mod presence_producer_tests {
+    //! wave17-b: PlantStatus comes from the SAME rows `flywheel status`
+    //! reads. Fake agent rows (no backend) pin the mapping: an idle pin
+    //! emits an injectable PlaneStatus, a working pin emits working
+    //! (queued, never dropped), and an unmapped pane is reported for
+    //! loud audit instead of silently skipped.
+    use super::*;
+    use toron_core::pane_types::{AgentInfo, AgentStatus};
+
+    fn row(pane: &str, status: AgentStatus) -> AgentInfo {
+        AgentInfo {
+            agent: Some("agent".into()),
+            agent_status: status,
+            cwd: None,
+            display_agent: None,
+            focused: false,
+            foreground_cwd: None,
+            interactive_ready: false,
+            launch_pending: false,
+            name: Some("agent".into()),
+            pane_id: pane.into(),
+            revision: 0,
+            state_change_seq: 0,
+            completion_seq: None,
+            state_labels: serde_json::Map::new(),
+            tab_id: String::new(),
+            terminal_id: String::new(),
+            terminal_title: None,
+            workspace_id: "ws".into(),
+        }
+    }
+
+    fn pin_map() -> HashMap<String, String> {
+        HashMap::from([
+            ("pane-idle".to_string(), "PinA".to_string()),
+            ("pane-working".to_string(), "PinB".to_string()),
+        ])
+    }
+
+    #[test]
+    fn idle_maps_to_an_injectable_plane_status() {
+        let agents = vec![row("pane-idle", AgentStatus::Idle)];
+        let (updates, unmapped) = RtHost::presence_updates_for(&agents, &pin_map());
+        assert!(unmapped.is_empty(), "mapped pins never audit: {unmapped:?}");
+        assert_eq!(updates.len(), 1, "one row in, one PlaneStatus out");
+        match &updates[0] {
+            BrainMsg::PlaneStatus { pin, status } => {
+                assert_eq!(pin, "PinA");
+                assert_eq!(status, "idle");
+                assert!(
+                    doorbell_core::should_inject(status),
+                    "idle must be injectable or the wake queues forever: {status}"
+                );
+            }
+            other => panic!("expected PlaneStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn working_maps_to_a_queued_not_dropped_status() {
+        let agents = vec![row("pane-working", AgentStatus::Working)];
+        let (updates, unmapped) = RtHost::presence_updates_for(&agents, &pin_map());
+        assert!(unmapped.is_empty());
+        match &updates[0] {
+            BrainMsg::PlaneStatus { pin, status } => {
+                assert_eq!(pin, "PinB");
+                assert_eq!(status, "working");
+                assert!(
+                    !doorbell_core::should_inject(status),
+                    "working queues; it must not read as idle: {status}"
+                );
+            }
+            other => panic!("expected PlaneStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unmapped_pane_is_reported_never_silently_skipped() {
+        let agents = vec![
+            row("pane-idle", AgentStatus::Idle),
+            row("pane-ghost", AgentStatus::Idle),
+        ];
+        let (updates, unmapped) = RtHost::presence_updates_for(&agents, &pin_map());
+        assert_eq!(updates.len(), 1, "only the mapped pin emits");
+        assert_eq!(unmapped, vec!["pane-ghost".to_string()]);
     }
 }
 
