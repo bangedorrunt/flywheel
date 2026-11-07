@@ -270,7 +270,7 @@ pub(crate) const PANE_TEXT_CALLS: &[&str] = &[
 pub(crate) const LEGACY_PANE_TEXT_SITES: &[(&str, usize)] = &[
     // Shrink-only: the doorbell door no longer types into panes (0).
     ("src/cmd/doorbell.rs", 0),
-    ("src/cmd/mail.rs", 1),
+    ("src/cmd/mail.rs", 0),
     ("src/cmd/send.rs", 1),
     ("src/main.rs", 6),
 ];

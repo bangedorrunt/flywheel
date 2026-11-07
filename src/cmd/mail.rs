@@ -2035,8 +2035,8 @@ fn run_workflow(cfg: &Config, project: &str, name: &str) -> Result<()> {
         .workflows
         .get(name)
         .ok_or_else(|| anyhow::anyhow!("workflow not found: {name} (flywheel workflows list)"))?;
-    let mut c = crate::hc::Client::connect(Some(&cfg.socket_path()))?;
-    let ws_id = crate::find_workspace(&mut c, project)?;
+    let mux = crate::backend::multiplexer_backend(cfg)?;
+    let ws_id = crate::find_workspace_dyn(&*mux, project)?;
     for (i, step) in steps.iter().enumerate() {
         println!(
             "[{}/{}] {}",
@@ -2051,17 +2051,17 @@ fn run_workflow(cfg: &Config, project: &str, name: &str) -> Result<()> {
                     (None, Some(m)) => m.to_string(),
                     (None, None) => anyhow::bail!("workflow step {i}: send needs stage or msg"),
                 };
-                let targets = crate::resolve_agents(&mut c, &ws_id, project, to)?;
+                let targets = crate::resolve_agents_dyn(&*mux, &ws_id, project, to)?;
                 for a in &targets {
-                    c.agent_prompt(crate::agent_target(a), &text, None)?;
+                    mux.prompt(crate::agent_target(a), &text, None)?;
                     println!("  {} sent", crate::output::dim(crate::agent_target(a)));
                 }
             }
             crate::config::WorkflowStep::Wait { until, timeout_ms } => {
                 let st = crate::hc::parse_agent_status(until)?;
-                let targets = crate::resolve_agents(&mut c, &ws_id, project, "all")?;
+                let targets = crate::resolve_agents_dyn(&*mux, &ws_id, project, "all")?;
                 for a in &targets {
-                    c.agent_wait(
+                    mux.agent_wait(
                         crate::agent_target(a),
                         &[st],
                         timeout_ms.or(Some(cfg.timeout_ms())),
@@ -2665,6 +2665,40 @@ mod watch_progress_tests {
                 CollabStep::Arrived(_)
             ),
             "arrival outranks the deadline"
+        );
+    }
+}
+
+#[cfg(test)]
+mod plane_tests {
+    /// `mail workflow run` sends and waits through live agents. It is a
+    /// project door, so it must resolve the serving plane; a hard-dialed hc
+    /// client makes every rex workflow fail at the socket.
+    #[test]
+    fn mail_workflow_resolves_the_active_plane() {
+        let src = include_str!("mail.rs");
+        let start = concat!("fn ", "run_workflow");
+        let end = concat!("fn ", "step_label");
+        let body = src
+            .split(start)
+            .nth(1)
+            .expect("run_workflow must exist")
+            .split(end)
+            .next()
+            .expect("step_label follows run_workflow");
+        let resolved = concat!("multiplexer_backend", "(cfg)");
+        let hard_dial = concat!("Client", "::connect");
+        assert!(
+            body.contains(resolved),
+            "mail workflow must build the active-plane backend"
+        );
+        assert!(
+            !body.contains(hard_dial),
+            "mail workflow must not hard-dial the hc socket"
+        );
+        assert!(
+            body.contains(concat!("resolve_agents", "_dyn")),
+            "mail workflow must resolve targets through the backend"
         );
     }
 }

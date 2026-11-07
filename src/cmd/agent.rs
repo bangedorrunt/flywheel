@@ -12,7 +12,6 @@ use clap::Subcommand;
 use serde_json::{Value, json};
 
 use crate::config::Config;
-use crate::hc::Client;
 use crate::output::print_json;
 
 #[derive(Subcommand)]
@@ -88,9 +87,9 @@ fn cmd_agent_tail(
     })?;
     crate::check_project_spelling(&project, "agent tail")?;
     let dir = crate::project_dir_str(cfg, &project)?;
-    let mut c = Client::connect(Some(&cfg.socket_path()))?;
-    let _ws_id = crate::find_workspace(&mut c, &project)?;
-    let panes = c.pane_list()?;
+    let mux = crate::backend::multiplexer_backend(cfg)?;
+    let _ws_id = crate::find_workspace_dyn(&*mux, &project)?;
+    let panes = mux.pane_list(None)?;
     let registry = crate::state::load_spawn_registry(&dir);
     let Some(pane) = pin_pane(&panes, &registry, pin) else {
         let mut known: Vec<String> = panes
@@ -149,4 +148,25 @@ fn cmd_agent_tail(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod plane_tests {
+    /// `agent tail` reads live panes; on a rex crew it must ask the serving
+    /// plane, not dial the hc socket. Source tripwire: the door builds its
+    /// backend from config, so the seam is the assertion.
+    #[test]
+    fn agent_tail_resolves_the_active_plane() {
+        let src = include_str!("agent.rs");
+        let resolved = concat!("multiplexer_backend", "(cfg)");
+        let hard_dial = concat!("Client", "::connect");
+        assert!(
+            src.contains(resolved),
+            "agent tail must build the active-plane backend"
+        );
+        assert!(
+            !src.contains(hard_dial),
+            "agent tail must not hard-dial the hc socket"
+        );
+    }
 }

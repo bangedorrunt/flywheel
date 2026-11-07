@@ -5,7 +5,7 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 use crate::config::Config;
-use crate::hc::{AgentStatus, Client};
+use crate::hc::AgentStatus;
 use crate::output::{dim, kind_paint, print_json, status_paint};
 use crate::state::EventKind;
 
@@ -81,9 +81,9 @@ pub(crate) fn cmd_changes(cfg: &Config, project: &str, since: usize) -> Result<(
         bail!("no checkpoint at index {since} (have {})", cps.len());
     };
     println!("baseline: {} — {}", dim(&base.ts), base.message);
-    let mut c = Client::connect(Some(&cfg.socket_path()))?;
-    let ws_id = crate::find_workspace(&mut c, project)?;
-    let agents = c
+    let mux = crate::backend::multiplexer_backend(cfg)?;
+    let ws_id = crate::find_workspace_dyn(&*mux, project)?;
+    let agents = mux
         .agent_list()?
         .into_iter()
         .filter(|a| a.workspace_id == ws_id)
@@ -113,8 +113,8 @@ pub(crate) fn cmd_changes(cfg: &Config, project: &str, since: usize) -> Result<(
 
 pub(crate) fn cmd_resume(cfg: &Config, project: &str, recipe: Option<&str>) -> Result<()> {
     let latest = crate::state::latest_checkpoint(project)?;
-    let mut c = Client::connect(Some(&cfg.socket_path()))?;
-    let ws = match crate::find_workspace(&mut c, project) {
+    let mux = crate::backend::multiplexer_backend(cfg)?;
+    let ws = match crate::find_workspace_dyn(&*mux, project) {
         Ok(ws_id) => {
             println!("swarm alive: workspace {}", dim(&ws_id));
             Some(ws_id)
@@ -152,4 +152,24 @@ pub(crate) fn cmd_analytics(project: &str) -> Result<()> {
     let a = crate::state::analytics(project)?;
     print_json(&serde_json::to_value(&a)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod plane_tests {
+    /// `changes` and `resume` read live agents, so they must see the plane
+    /// that is actually serving (rex included), not a hard-dialed hc socket.
+    #[test]
+    fn history_doors_resolve_the_active_plane() {
+        let src = include_str!("history.rs");
+        let resolved = concat!("multiplexer_backend", "(cfg)");
+        let hard_dial = concat!("Client", "::connect");
+        assert!(
+            src.contains(resolved),
+            "changes/resume must build the active-plane backend"
+        );
+        assert!(
+            !src.contains(hard_dial),
+            "changes/resume must not hard-dial the hc socket"
+        );
+    }
 }

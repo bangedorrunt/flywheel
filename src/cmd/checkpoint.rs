@@ -4,7 +4,6 @@ use anyhow::{Result, bail};
 use clap::Subcommand;
 
 use crate::config::Config;
-use crate::hc::Client;
 use crate::output::{dim, kind_paint, print_json, status_paint};
 
 #[derive(Subcommand)]
@@ -28,9 +27,9 @@ pub(crate) enum CheckpointCmd {
 pub(crate) fn cmd_checkpoint(cfg: &Config, cmd: &CheckpointCmd) -> Result<()> {
     match cmd {
         CheckpointCmd::Save { project, msg } => {
-            let mut c = Client::connect(Some(&cfg.socket_path()))?;
-            let ws_id = crate::find_workspace(&mut c, project)?;
-            let agents = c
+            let mux = crate::backend::multiplexer_backend(cfg)?;
+            let ws_id = crate::find_workspace_dyn(&*mux, project)?;
+            let agents = mux
                 .agent_list()?
                 .into_iter()
                 .filter(|a| a.workspace_id == ws_id)
@@ -80,4 +79,24 @@ pub(crate) fn cmd_checkpoint(cfg: &Config, cmd: &CheckpointCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod plane_tests {
+    /// A checkpoint is project state, not hc state: a rex crew must snapshot.
+    /// The door builds its backend from config, so assert the seam at source.
+    #[test]
+    fn checkpoint_save_resolves_the_active_plane() {
+        let src = include_str!("checkpoint.rs");
+        let resolved = concat!("multiplexer_backend", "(cfg)");
+        let hard_dial = concat!("Client", "::connect");
+        assert!(
+            src.contains(resolved),
+            "checkpoint must build the active-plane backend"
+        );
+        assert!(
+            !src.contains(hard_dial),
+            "checkpoint must not hard-dial the hc socket"
+        );
+    }
 }
