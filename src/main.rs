@@ -67,6 +67,7 @@ mod judgment;
 mod kernel;
 mod lead_claim;
 mod mail;
+mod mail_wake;
 mod mcp_http;
 mod models;
 mod output;

@@ -1163,6 +1163,14 @@ async fn run_embedded_async(
             crate::inbox_host::HostCfg::try_from_env()?,
         ));
     }
+    // ADR-0012/ADR-0041: NIP-17 mail wake is independent of the comms flag.
+    // The one-turn peer handler stops when a pane finishes; this poller is the
+    // door that still rings a `done`/`idle` pane for a new DM.
+    let _mail_wake = crate::mail_wake::MailWakeHost::spawn(
+        cfg.clone(),
+        project.to_string(),
+        workspace.to_string(),
+    );
     let store = FileStore::new(config::state_dir());
     let watch_slot = host.wake_task.clone();
     let bus_fw = wake_forwarder(
