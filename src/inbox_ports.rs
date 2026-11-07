@@ -305,8 +305,10 @@ impl FlywheelPorts {
         backend
             .workspace_list()
             .ok()
-            .and_then(|ws| ws.into_iter().find(|w| w.label == workspace))
-            .map(|w| w.workspace_id)
+            .and_then(|ws| {
+                ws.iter()
+                    .find_map(|w| session_id_for(&w.label, &w.workspace_id, workspace))
+            })
             .unwrap_or_default()
     }
 
@@ -840,9 +842,37 @@ impl Ports for FlywheelPorts {
     }
 }
 
+/// The host session for a workspace arg: labels and session ids both name
+/// the same live workspace, and the doorbell host now carries the id (the
+/// plane resolves ids, labels collide across sessions). A label-only match
+/// left `host_session` empty for an id host, which failed every rex binding
+/// and declared live mail recipients DEAF.
+fn session_id_for(label: &str, workspace_id: &str, workspace: &str) -> Option<String> {
+    (label == workspace || workspace_id == workspace).then(|| workspace_id.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A host carrying the session id (the plane key) must resolve the same
+    /// session as one carrying the label. The id branch is the live wake
+    /// path: label-only matching declared every recipient DEAF.
+    #[test]
+    fn session_id_for_matches_a_label_or_a_session_id() {
+        assert_eq!(
+            session_id_for("flywheel-toron", "session:abc", "flywheel-toron").as_deref(),
+            Some("session:abc")
+        );
+        assert_eq!(
+            session_id_for("flywheel-toron", "session:abc", "session:abc").as_deref(),
+            Some("session:abc")
+        );
+        assert_eq!(
+            session_id_for("flywheel-toron", "session:abc", "other"),
+            None
+        );
+    }
     use toron_core::envelope::{
         Class, ContextId, ContractId, ENVELOPE_V, Envelope, MsgId, Recipient, TaskId,
     };
