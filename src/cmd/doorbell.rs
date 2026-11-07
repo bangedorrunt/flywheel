@@ -938,6 +938,7 @@ pub(crate) fn cmd_doorbell_re_inject(cfg: &Config, project: &str) -> Result<()> 
     // rex-first: the plane backend is the one the panes actually run on.
     // `hc::Client` here failed every re-inject on the default rex plane.
     let backend = crate::backend::multiplexer_backend(cfg)?;
+    let captain = crate::state::load_captain_alias(project);
     let mut injected = 0;
     for e in &registry {
         if e.pane_id.is_empty() {
@@ -946,21 +947,35 @@ pub(crate) fn cmd_doorbell_re_inject(cfg: &Config, project: &str) -> Result<()> 
         let Some(identity) = e.mail_identity.as_deref() else {
             continue;
         };
+        // The operator/captain pane is the session the captain is typing in;
+        // injecting a peer handler there changes the operator context, and a
+        // busy captain must not abort the pass for every other pane.
+        if captain.as_deref() == Some(identity) {
+            println!(
+                "{} ({}): captain/operator pane — skipped",
+                e.name, e.pane_id
+            );
+            continue;
+        }
         let mut lines = vec![crate::doorbell::identity_prime(&e.name, identity)];
         lines.push(crate::peer_prompt_template(
             peer_tpl, &e.name, identity, 5, 30, 3,
         ));
+        let mut ok = true;
         for line in lines {
-            backend.prompt(&e.pane_id, &line, None).map_err(|err| {
-                anyhow::anyhow!(
-                    "re-inject {}: pane {} not promptable ({err}) — is the agent up?",
-                    e.name,
-                    e.pane_id
-                )
-            })?;
+            if let Err(err) = backend.prompt(&e.pane_id, &line, None) {
+                eprintln!(
+                    "re-inject {}: pane {} not promptable ({err}) — skipped; the rest continue",
+                    e.name, e.pane_id
+                );
+                ok = false;
+                break;
+            }
         }
-        injected += 1;
-        println!("{} ({}): handler + identity re-injected", e.name, e.pane_id);
+        if ok {
+            injected += 1;
+            println!("{} ({}): handler + identity re-injected", e.name, e.pane_id);
+        }
     }
     println!("re-injected {injected} pane(s) in {project}");
     Ok(())
@@ -2835,6 +2850,10 @@ mod host_key_tests {
         assert!(
             !body.contains("hc::Client::connect"),
             "re-inject must not hard-code hc"
+        );
+        assert!(
+            body.contains("load_captain_alias"),
+            "the operator/captain pane must be skipped, not abort the pass"
         );
     }
 }
