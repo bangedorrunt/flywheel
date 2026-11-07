@@ -3,6 +3,8 @@
 /.zvec-grep/
 # agent state files (context signals written by agents mid-session)
 .flywheel/
+# pi harness working notes (not repo source)
+.pi/
 
 # bv (beads viewer) local config and caches
 .bv/

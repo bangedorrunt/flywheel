@@ -8126,9 +8126,26 @@ pub(crate) fn bind_pane_mail_identity(
         }
     };
     let mut entries = state::merge_registry_for_mutation(project, current);
-    match entries.iter_mut().find(|e| e.name == name) {
-        Some(e) => {
+    // Match the pane first, then the caller's name, then the pin. A spawn
+    // writes the profiled row under the composed pane name; a later bind that
+    // arrives with the PIN only used to miss it and push a legacy row, and
+    // dedupe then kept that later row — the profile column vanished. Updating
+    // the existing row in place preserves profile/harness/model and renames it
+    // to the caller's addressable name.
+    let existing = entries
+        .iter()
+        .position(|e| e.pane_id == pane_id)
+        .or_else(|| entries.iter().position(|e| e.name == name))
+        .or_else(|| {
+            entries
+                .iter()
+                .position(|e| e.mail_identity.as_deref() == Some(pin))
+        });
+    match existing {
+        Some(i) => {
+            let e = &mut entries[i];
             e.pane_id = pane_id.to_string();
+            e.name = name.to_string();
             e.mail_identity = Some(pin.to_string());
         }
         None => entries.push(state::SpawnEntry::with_mail_identity(
@@ -13399,6 +13416,42 @@ mod wake_identity_tests {
             .expect("registry entry");
         assert_eq!(entry.pane_id, "w9:p1");
         assert_eq!(entry.mail_identity.as_deref(), Some(pin.as_str()));
+        crate::mail::cleanup_test_data_dir(&data);
+    }
+
+    /// bd-registry-profile-heal: a bind that arrives with the PIN (not the
+    /// composed pane name) must update the profiled row in place. It used to
+    /// push a legacy pin row, and dedupe then kept that later row — the
+    /// profile column vanished and pane 2 of a two-pane spawn sent raw.
+    #[test]
+    fn bind_pane_mail_identity_preserves_profile_when_called_with_the_pin() {
+        let _g = crate::config::lock_env();
+        let data = std::env::temp_dir().join(format!("fw-bind-profile-{}", uuid::Uuid::new_v4()));
+        unsafe { std::env::set_var("TORON_DATA_DIR", &data) };
+        let cfg = Config::default();
+        let project = "fw-bind-profile-proj";
+        state::save_spawn_registry(
+            project,
+            &[state::SpawnEntry::profiled(
+                "w9:p1",
+                "flywheel-x-pi-coder",
+                "pi-coder",
+                "pi",
+                None,
+            )],
+        )
+        .expect("save profiled row");
+        bind_pane_mail_identity(&cfg, project, "TopazKnoll", "w9:p1", Some("TopazKnoll"));
+        let registry = state::load_spawn_registry(project);
+        assert_eq!(registry.len(), 1, "one row per pane, no shadow legacy row");
+        assert_eq!(registry[0].name, "TopazKnoll", "the pin is addressable");
+        assert_eq!(
+            registry[0].profile.as_deref(),
+            Some("pi-coder"),
+            "the bind preserves the profile it did not own"
+        );
+        assert_eq!(registry[0].harness.as_deref(), Some("pi"));
+        assert_eq!(registry[0].mail_identity.as_deref(), Some("TopazKnoll"));
         crate::mail::cleanup_test_data_dir(&data);
     }
 

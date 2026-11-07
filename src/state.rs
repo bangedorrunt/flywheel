@@ -835,6 +835,7 @@ pub fn load_spawn_registry_strict(project: &str) -> Result<Vec<SpawnEntry>, Spaw
 pub fn merge_registry_for_mutation(project: &str, current: Vec<SpawnEntry>) -> Vec<SpawnEntry> {
     let merged = fold_legacy_alias(project, &spawn_registry_key(project), current);
     if !merged.is_empty() {
+        let merged = hydrate_profiles_from_agent_names(merged, &project_dir_hint(project));
         return dedupe_spawn_entries(merged);
     }
     load_agent_names(&project_dir_hint(project))
@@ -855,9 +856,45 @@ pub fn load_spawn_registry(project: &str) -> Vec<SpawnEntry> {
     };
     let merged = fold_legacy_alias(project, &spawn_registry_key(project), current);
     if !merged.is_empty() {
+        let merged = hydrate_profiles_from_agent_names(merged, &project_dir_hint(project));
         return dedupe_spawn_entries(merged);
     }
     load_agent_names(&project_dir_hint(project))
+}
+
+/// bd-registry-profile-heal: the state registry is the addressable view (name
+/// = pin), while the project-local mirror carries the spawn-time profile
+/// columns. A bind that ran with the pin used to shadow the profiled row; fill
+/// a missing profile from the mirror by pane id so a send can still condition
+/// the prompt. Local names are deliberately not copied — the state row keeps
+/// the pin the caller resolves.
+fn hydrate_profiles_from_agent_names(
+    mut entries: Vec<SpawnEntry>,
+    dir: &std::path::Path,
+) -> Vec<SpawnEntry> {
+    let local = load_agent_names(dir);
+    if local.is_empty() {
+        return entries;
+    }
+    for e in &mut entries {
+        if e.profile.is_some() {
+            continue;
+        }
+        let Some(l) = local
+            .iter()
+            .find(|l| l.pane_id == e.pane_id && l.profile.is_some())
+        else {
+            continue;
+        };
+        e.profile = l.profile.clone();
+        if e.harness.is_none() {
+            e.harness = l.harness.clone();
+        }
+        if e.model_pin.is_none() {
+            e.model_pin = l.model_pin.clone();
+        }
+    }
+    entries
 }
 
 /// bd-722a: ONE row per pane (and per mail identity).
@@ -3807,6 +3844,41 @@ mod loops_sidecar_tests {
         save_spawn_registry(&key, &live).unwrap();
         assert_eq!(load_spawn_registry(&key), live);
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// bd-registry-profile-heal: a state row that lost its profile (the bind
+    /// wrote the pin as the name) still conditions, because the project-local
+    /// mirror carries the spawn-time profile for the same pane.
+    #[test]
+    fn load_spawn_registry_heals_a_profile_from_the_project_mirror() {
+        let _g = loops_test_guard();
+        let root = std::env::temp_dir().join(format!("fw-reg-heal-{}", std::process::id()));
+        let abs = root.join("reg-heal");
+        std::fs::create_dir_all(&abs).unwrap();
+        let _override = set_registry_root_override(root.clone());
+        let key = abs.to_string_lossy().into_owned();
+
+        let state_row = SpawnEntry::with_mail_identity("w2C:p1", "TopazKnoll", "TopazKnoll");
+        save_spawn_registry(&key, std::slice::from_ref(&state_row)).unwrap();
+        let mirror = SpawnEntry::profiled(
+            "w2C:p1",
+            "flywheel-heal-pi-coder",
+            "pi-coder",
+            "pi",
+            Some("TopazKnoll".into()),
+        );
+        save_agent_names(&abs, std::slice::from_ref(&mirror)).unwrap();
+
+        let loaded = load_spawn_registry(&key);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "TopazKnoll", "the pin stays addressable");
+        assert_eq!(
+            loaded[0].profile.as_deref(),
+            Some("pi-coder"),
+            "profile filled from the project mirror"
+        );
+        assert_eq!(loaded[0].harness.as_deref(), Some("pi"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
