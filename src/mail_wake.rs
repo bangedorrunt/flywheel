@@ -186,11 +186,13 @@ fn poll_once(
     // The flywheel mirror may be absent; toron's own `captain` alias is the
     // authoritative one. Both are read so the operator's pane is never typed
     // into (and never retried as a busy pane).
-    let captain = captain_alias.or_else(|| {
-        crate::backend::run_mail(mail.whois(&project_key, "captain"))
-            .ok()
-            .map(|w| w.name)
-    });
+    let captain = captain_alias
+        .or_else(|| toron_captain(project))
+        .or_else(|| {
+            crate::backend::run_mail(mail.whois(&project_key, "captain"))
+                .ok()
+                .map(|w| w.name)
+        });
     let mut changed = false;
     for entry in &registry {
         if stop_pin(entry, captain.as_deref(), &pane_ids) {
@@ -242,6 +244,23 @@ fn poll_once(
     if changed {
         save_high_water(path, high_water);
     }
+}
+
+/// The authoritative captain alias lives in toron's contact table; the
+/// flywheel mirror is only written by some doors (not by `toron contact
+/// captain`). Read the one CLI door so the operator pane is always skipped.
+fn toron_captain(project: &str) -> Option<String> {
+    let out = std::process::Command::new("toron")
+        .args(["contact", "captain", "--project", project])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    v.get("captain")
+        .and_then(|c| c.as_str())
+        .map(str::to_string)
 }
 
 fn stop_pin(
