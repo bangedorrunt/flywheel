@@ -741,7 +741,7 @@ pub fn send(cfg: &Config, req: Request<'_>) -> Result<Vec<SentRow>> {
         &req.task,
     ))?;
     #[cfg(feature = "backend-superlogical")]
-    if crate::backend::resolve_backend_name(cfg) != "hc" {
+    if crate::backend::resolve_plane(cfg).plane != crate::backend::Plane::Hc {
         for (row, addr) in rows.iter_mut().zip(parsed.iter()) {
             row.wake = match addr.pin() {
                 None => "no-pane (npub address; Phase 3 rings by binding)".into(),

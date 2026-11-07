@@ -1573,8 +1573,11 @@ fn cron_spawn_launcher(
             }
             let plan = crate::pane::spawn_launch_plan(&spec.spawn_key, &value, &catalog)?;
             tokio::task::spawn_blocking(move || {
-                let mut client = crate::hc::Client::connect(Some(&cfg.socket_path()))?;
-                let ws_id = crate::find_workspace(&mut client, &project)?;
+                // The launcher below is a plane door; this resolver must be
+                // one too. A raw hc client here died on the default rex plane
+                // before the launcher ever ran (same class as the steer bug).
+                let backend = crate::backend::multiplexer_backend(&cfg)?;
+                let ws_id = crate::find_workspace_dyn(&*backend, &project)?;
                 crate::pane::launch_spawn_job(&cfg, &project, &wf_name, &ws_id, &plan)
             })
             .await

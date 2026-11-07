@@ -13,7 +13,6 @@ use crate::cmd::internal::{headless_dispatch, headless_spawn_gate, make_verify_s
 use crate::cmd::mail::{mail_or_die, repo_evidence_verified};
 use crate::cmd::send::{ComposeRunLifecycle, running_run_row_exists};
 use crate::config::Config;
-use crate::hc::Client;
 use crate::output::print_json;
 use crate::state::EventKind;
 use crate::{
@@ -938,15 +937,18 @@ pub(crate) fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             if let Some(ctx) = &pane_ctx
                 && !ctx.retained
             {
-                let mut c = Client::connect(Some(&cfg.socket_path()))?;
-                match c.workspace_close(&ctx.workspace_id, true) {
+                let backend = crate::backend::multiplexer_backend(cfg)?;
+                match backend.workspace_close(&ctx.workspace_id, true) {
                     Ok(_) => reaped = true,
                     Err(e) => eprintln!(
                         "flywheel: workspace close {} failed: {e:#}",
                         ctx.workspace_id
                     ),
                 }
-                pane::reap_dead_registry_rows(project.as_deref().unwrap_or("flywheel"), &mut c);
+                pane::reap_dead_registry_rows_on(
+                    project.as_deref().unwrap_or("flywheel"),
+                    &*backend,
+                );
             }
             let run_project = project.as_deref().unwrap_or("flywheel");
             let terminal = run_terminal_status(&output);
@@ -1431,15 +1433,18 @@ pub(crate) fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 .map_err(|_| anyhow!("approval drainer thread panicked"));
             let mut reaped = false;
             if !ctx.retained {
-                let mut c = Client::connect(Some(&cfg.socket_path()))?;
-                match c.workspace_close(&ctx.workspace_id, true) {
+                let backend = crate::backend::multiplexer_backend(cfg)?;
+                match backend.workspace_close(&ctx.workspace_id, true) {
                     Ok(_) => reaped = true,
                     Err(e) => eprintln!(
                         "flywheel: workspace close {} failed: {e:#}",
                         ctx.workspace_id
                     ),
                 }
-                pane::reap_dead_registry_rows(project.as_deref().unwrap_or("flywheel"), &mut c);
+                pane::reap_dead_registry_rows_on(
+                    project.as_deref().unwrap_or("flywheel"),
+                    &*backend,
+                );
             }
             let terminal = run_terminal_status(&output);
             let artifact_paths = write_terminal_artifact(project_name, &run_id, &output, terminal);

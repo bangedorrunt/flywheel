@@ -1332,8 +1332,8 @@ esac
         );
     }
 
-    /// Fence: the non-hc send arm is selected by backend name and builds
-    /// no hc client. Both halves are asserted so neither direction is
+    /// Fence: the non-hc send arm is selected by the RESOLVED plane and
+    /// builds no hc client. Both halves are asserted so neither direction is
     /// vacuous: the route must exist AND the hc constructor must be gone.
     #[test]
     fn rex_send_arm_constructs_no_plane_client() {
@@ -1350,8 +1350,8 @@ esac
             "cmd_send must route to the rex arm"
         );
         assert!(
-            send.contains("resolve_backend_name(cfg) != \"hc\""),
-            "the route is by backend name, never REX_SESSION"
+            send.contains("resolve_plane(cfg).plane"),
+            "the route is the RESOLVED plane, never REX_SESSION or the configured name"
         );
         let rex = src
             .split_once("\npub(crate) fn cmd_send_rex(")

@@ -268,7 +268,8 @@ pub(crate) const PANE_TEXT_CALLS: &[&str] = &[
 /// cmd/mail.rs. Counts follow the code; the total never grows.
 #[cfg(test)]
 pub(crate) const LEGACY_PANE_TEXT_SITES: &[(&str, usize)] = &[
-    ("src/cmd/doorbell.rs", 1),
+    // Shrink-only: the doorbell door no longer types into panes (0).
+    ("src/cmd/doorbell.rs", 0),
     ("src/cmd/mail.rs", 1),
     ("src/cmd/send.rs", 1),
     ("src/main.rs", 6),

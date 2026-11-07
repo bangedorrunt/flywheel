@@ -516,7 +516,9 @@ impl RtHost {
             self.cover_rex_panes();
             return;
         }
-        if crate::backend::resolve_backend_name(&self.cfg) != "hc" {
+        // The RESOLVED plane, not the configured name: `auto` is not an hc
+        // verdict, and `auto` that really serves hc still needs coverage.
+        if crate::backend::resolve_plane(&self.cfg).serving() != "hc" {
             return;
         }
         let registry = state::load_spawn_registry(&self.project);

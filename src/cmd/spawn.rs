@@ -245,7 +245,19 @@ pub(crate) fn cmd_add(
     crate::check_project_spelling(project, "add")?;
     // A mutating door must not pave over a corrupt fleet: refuse first.
     state::load_spawn_registry_strict(project).map_err(|e| anyhow!("{e}"))?;
-    if crate::pane::rex_door_selected(cfg) {
+    // One plane resolution for the whole door, with spawn's guard: a typo'd
+    // backend refuses before any side effect (the hc arm below dials the
+    // socket directly, bypassing the factory), and an explicit rex pin with no
+    // CLI refuses here instead of after the effect row is journaled.
+    let plane = crate::backend::resolve_plane(cfg);
+    crate::backend::factory::require_mux_for_spawn(plane.configured.as_str())?;
+    if plane.plane == crate::backend::Plane::Rex {
+        if !plane.rex_reachable {
+            bail!(
+                "add: {} — install the rex CLI or select the fallback (FLYWHEEL_BACKEND=hc)",
+                plane.reason
+            );
+        }
         return cmd_add_rex(cfg, project, counts, kinds, settle_secs, request_key);
     }
     let plan = crate::recipe_counts(None, counts, kinds)?;
@@ -5183,5 +5195,45 @@ mod agent_mail_name_tests {
             [] as [String; 0]
         );
         assert_eq!(uncommitted_decision_docs(""), [] as [String; 0]);
+    }
+}
+
+#[cfg(test)]
+mod plane_gate_tests {
+    use super::cmd_add;
+
+    /// A typo'd backend must refuse at the plane gate BEFORE the add effect
+    /// row is journaled. The hc arm dials the socket directly (bypassing the
+    /// factory), so without the gate `FLYWHEEL_BACKEND=nonsense` silently
+    /// added panes through hc.
+    #[test]
+    fn add_refuses_an_unknown_backend_before_journaling() {
+        let _g = crate::config::lock_env();
+        let prev = std::env::var_os("FLYWHEEL_BACKEND");
+        unsafe { std::env::set_var("FLYWHEEL_BACKEND", "nonsense") };
+        let cfg = crate::config::Config::default();
+        let out = cmd_add(
+            &cfg,
+            "typo-probe",
+            &crate::AgentCounts::default(),
+            &[],
+            0,
+            None,
+        );
+        unsafe {
+            match &prev {
+                Some(v) => std::env::set_var("FLYWHEEL_BACKEND", v),
+                None => std::env::remove_var("FLYWHEEL_BACKEND"),
+            }
+        }
+        let err = out.expect_err("a typo'd backend must refuse");
+        assert!(
+            err.to_string().contains("unknown multiplexer backend"),
+            "names the typo: {err}"
+        );
+        assert!(
+            !crate::state::project_log_path("typo-probe").exists(),
+            "the gate must run before the effect journal writes a row"
+        );
     }
 }

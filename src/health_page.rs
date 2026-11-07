@@ -141,7 +141,9 @@ pub struct HeartbeatRow {
 /// Registry rows that could hold an hc pane binding. A row with no pin or
 /// no pane is invisible to this probe (and to the wake layer).
 pub fn registry_rows(cfg: &crate::config::Config, project: &str) -> Vec<HeartbeatRow> {
-    let effective = crate::backend::resolve_backend_name(cfg);
+    // The serving plane, not the configured name (`pane_keep` matches
+    // "hc"/"rex" exactly; `auto` is neither).
+    let effective = crate::backend::resolve_plane(cfg).serving().to_string();
     let catalog = crate::profile::ProfileCatalog::load().ok();
     crate::state::load_spawn_registry(project)
         .into_iter()

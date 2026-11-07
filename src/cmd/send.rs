@@ -357,7 +357,7 @@ pub(crate) fn cmd_send(
     crate::check_send_plane_tripwires(&text, plane, unsafe_plane, raw)?;
 
     #[cfg(feature = "backend-superlogical")]
-    if crate::backend::resolve_backend_name(cfg) != "hc" {
+    if backend::resolve_plane(cfg).plane != backend::Plane::Hc {
         return cmd_send_rex(
             cfg,
             project,

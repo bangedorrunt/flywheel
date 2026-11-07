@@ -86,18 +86,35 @@ impl LiveRegistry {
     }
 }
 
-/// bd-qx0z: dispatch-time registry for runners without a live client in
-/// scope (cron engines): load + prune against a fresh pane listing.
-/// Fail-open: an unreachable hc keeps every loaded row (today's
-/// behavior — no regression, just no pruning). One socket roundtrip per
-/// construction; callers build once per engine, not per step.
+/// The live pane ids on the plane that actually serves: one construction of
+/// the active backend, then one `pane_list`. `None` when the plane cannot be
+/// built or listed, so every caller keeps its fail-open posture (an
+/// unreachable plane prunes nothing).
+///
+/// This is the door for runners that hold no backend (cron engines, a pane
+/// `dispatch_job` step). `Client::connect(None)` here dials the hc socket no
+/// matter which plane serves, so a rex fleet looked empty and a just-split
+/// pane could never settle.
+fn live_pane_set_on_active_plane() -> Option<std::collections::HashSet<String>> {
+    let cfg = Config::load().unwrap_or_default();
+    crate::backend::multiplexer_backend(&cfg)
+        .ok()?
+        .pane_list(None)
+        .ok()
+        .map(|panes| panes.into_iter().map(|p| p.pane_id).collect())
+}
+
+/// bd-qx0z: dispatch-time registry for runners without a live backend in
+/// scope (cron engines): load + prune against a fresh listing on the active
+/// plane. Fail-open: an unreachable plane keeps every loaded row (today's
+/// behavior — no regression, just no pruning). Callers build once per
+/// engine, not per step.
 pub fn live_registry_for_dispatch(project: &str) -> LiveRegistry {
     let entries = crate::state::load_spawn_registry(project);
-    let live: std::collections::HashSet<String> =
-        match Client::connect(None).and_then(|c| c.pane_list()) {
-            Ok(panes) => panes.into_iter().map(|p| p.pane_id).collect(),
-            Err(_) => entries.iter().map(|e| e.pane_id.clone()).collect(),
-        };
+    let live = match live_pane_set_on_active_plane() {
+        Some(live) => live,
+        None => entries.iter().map(|e| e.pane_id.clone()).collect(),
+    };
     LiveRegistry::prune(entries, &live)
 }
 
@@ -182,7 +199,9 @@ where
     }
 }
 
-/// bd-0s0y: production settle for the `nth` copy of a role.
+/// bd-0s0y: production settle for the `nth` copy of a role. Polls the active
+/// plane, never `Client::connect` — a rex crew's freshly split pane is not in
+/// the hc socket's world, so the settle window could never fire there.
 pub fn settle_for_role_slot(project: &str, role: &str, nth: Option<usize>) -> Option<SpawnEntry> {
     const WINDOW_MS: u64 = 5_000;
     const POLL_MS: u64 = 250;
@@ -191,12 +210,7 @@ pub fn settle_for_role_slot(project: &str, role: &str, nth: Option<usize>) -> Op
         &rows,
         role,
         nth,
-        || {
-            Client::connect(None)
-                .ok()
-                .and_then(|c| c.pane_list().ok())
-                .map(|panes| panes.into_iter().map(|p| p.pane_id).collect())
-        },
+        live_pane_set_on_active_plane,
         WINDOW_MS,
         POLL_MS,
     )
@@ -399,12 +413,16 @@ pub fn reap_dead_registry_rows(project: &str, c: &mut Client) -> usize {
             return 0;
         }
     };
-    let backend = crate::config::Config::load()
-        .map(|cfg| crate::backend::factory::resolve_backend_name(&cfg))
-        .unwrap_or_else(|_| {
-            crate::backend::factory::resolve_backend_name(&crate::config::Config::default())
-        });
-    let (kept, pruned) = reap_closed_rows(state::load_spawn_registry(project), &live, &backend);
+    // The RESOLVED plane, not the configured name: `auto` is not a backend
+    // identity, and `pane_keep` matches "hc"/"rex" exactly.
+    let resolved = crate::config::Config::load()
+        .map(|cfg| crate::backend::resolve_plane(&cfg))
+        .unwrap_or_else(|_| crate::backend::resolve_plane(&crate::config::Config::default()));
+    let (kept, pruned) = reap_closed_rows(
+        state::load_spawn_registry(project),
+        &live,
+        resolved.plane.name(),
+    );
     if pruned == 0 {
         return 0;
     }
@@ -419,6 +437,35 @@ pub fn reap_dead_registry_rows(project: &str, c: &mut Client) -> usize {
         }
     }
 }
+/// Plane-door twin of [`reap_dead_registry_rows`] for callers that hold the
+/// resolved backend (workflow run / compose): one `pane_list` on the ACTIVE
+/// plane, then the same pure reap. The hc-client shape stays for callers that
+/// already hold a live client (`kill`, `spawn`, `recover`).
+pub fn reap_dead_registry_rows_on(project: &str, backend: &dyn MultiplexerBackend) -> usize {
+    let live: std::collections::HashSet<String> = match backend.pane_list(None) {
+        Ok(panes) => panes.into_iter().map(|p| p.pane_id).collect(),
+        Err(e) => {
+            eprintln!("flywheel: dead-row reap skipped (pane list failed: {e:#})");
+            return 0;
+        }
+    };
+    let (kept, pruned) =
+        reap_closed_rows(state::load_spawn_registry(project), &live, backend.name());
+    if pruned == 0 {
+        return 0;
+    }
+    match state::save_spawn_registry(project, &kept) {
+        Ok(()) => {
+            eprintln!("flywheel: reaped {pruned} dead-pane registry row(s) for {project}");
+            pruned
+        }
+        Err(e) => {
+            eprintln!("flywheel: dead-row reap save failed: {e:#}");
+            0
+        }
+    }
+}
+
 /// bd-nwnb: the dead-row gauge core — rows hc may clear, as
 /// (pane_id, name) pairs. bd-p09m: a row is dead only when
 /// [`crate::pane_keep::pane_binding_may_clear`] is true, so a mail-only row
@@ -451,12 +498,12 @@ pub fn dead_registry_rows(project: &str, c: &mut Client) -> Vec<(String, String)
         return Vec::new();
     };
     let live: std::collections::HashSet<String> = panes.into_iter().map(|p| p.pane_id).collect();
-    let backend = crate::config::Config::load()
-        .map(|cfg| crate::backend::factory::resolve_backend_name(&cfg))
-        .unwrap_or_else(|_| {
-            crate::backend::factory::resolve_backend_name(&crate::config::Config::default())
-        });
-    find_dead_rows(&state::load_spawn_registry(project), &live, &backend)
+    // The RESOLVED plane, not the configured name: `pane_keep` matches
+    // "hc"/"rex" exactly, and `auto` is neither.
+    let plane = crate::config::Config::load()
+        .map(|cfg| crate::backend::resolve_plane(&cfg))
+        .unwrap_or_else(|_| crate::backend::resolve_plane(&crate::config::Config::default()));
+    find_dead_rows(&state::load_spawn_registry(project), &live, plane.serving())
 }
 /// bd-lvyi: resolve a per-step harness override to a crew pane running THAT
 /// harness. The pane's `harness` column is authoritative; a legacy entry
@@ -949,8 +996,12 @@ fn spawn_crew_into_rex(
                     &pane_id,
                     mail_identity.as_deref(),
                 );
+                // Wait on the PANE, not the label: rex labels are only
+                // unique within a session, and the same crew name can exist
+                // in another live session (bd live proof: "label … is in 2
+                // sessions").
                 if let Err(e) = backend.agent_wait(
-                    &name,
+                    &pane_id,
                     &[AgentStatus::Idle, AgentStatus::Working],
                     Some(90_000),
                 ) {
@@ -1589,7 +1640,7 @@ pub fn pane_dispatch(
         None => match settle_for_role_slot(project, profile_name, copy_index) {
             Some(entry) => {
                 eprintln!(
-                    "flywheel: WARNING @{profile_name} pane {} was absent from hc's listing at dispatch; settled and using it",
+                    "flywheel: WARNING @{profile_name} pane {} was absent from the plane's listing at dispatch; settled and using it",
                     entry.pane_id
                 );
                 entry
@@ -2568,8 +2619,23 @@ pub async fn drain_spawn_sink(
 /// spawn-registry entry, dispatch the job's workflow mission through the
 /// `__send` leaf, and — for `await: true` — wait for the agent to return to
 /// Idle (the job finished) before returning the receipt.
-#[allow(unused_mut)]
+/// Plane door: read ONE resolution and hand the job to that plane's arm, so
+/// a rex-crewed `steer` / `compose --run` never dials the hc socket.
 pub fn launch_spawn_job(
+    cfg: &Config,
+    project: &str,
+    wf_name: &str,
+    ws_id: &str,
+    plan: &SpawnJobLaunch,
+) -> Result<Value> {
+    if rex_door_selected(cfg) {
+        return launch_spawn_job_rex(cfg, project, wf_name, ws_id, plan);
+    }
+    launch_spawn_job_hc(cfg, project, wf_name, ws_id, plan)
+}
+
+#[allow(unused_mut)]
+fn launch_spawn_job_hc(
     cfg: &Config,
     project: &str,
     wf_name: &str,
@@ -2704,35 +2770,7 @@ pub fn launch_spawn_job(
     if let Err(e) = c.agent_wait(&name, &[AgentStatus::Idle], Some(90_000)) {
         eprintln!("flywheel: spawn drain {name} readiness wait failed (dispatching anyway): {e}");
     }
-    let mut mission_err: Option<String> = None;
-    if let Some(w) = &plan.workflow {
-        let prompt = headless::base_prompt_for(w, &json!({}));
-        let mut cmd = Command::new(std::env::current_exe()?);
-        cmd.arg("__send")
-            .arg(project)
-            .arg(&name)
-            .arg(&prompt)
-            .arg("--confirm")
-            .arg("--profile")
-            .arg(&plan.profile);
-        let output = cmd
-            .output()
-            .with_context(|| format!("__send spawn mission for {name} (workflow {w})"))?;
-        let raw = String::from_utf8_lossy(&output.stdout).to_string();
-        let trimmed = raw.trim();
-        if let Ok(v) = serde_json::from_str::<Value>(trimmed)
-            && v.get("ok").and_then(Value::as_bool) == Some(false)
-        {
-            mission_err = Some(
-                v["error"]
-                    .as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| raw.clone()),
-            );
-        } else if trimmed.is_empty() {
-            mission_err = Some(String::from_utf8_lossy(&output.stderr).to_string());
-        }
-    }
+    let mission_err = dispatch_spawn_mission(project, plan, &name)?;
     if plan.await_job {
         let timeout_ms = cfg.default_timeout_ms.unwrap_or(1_800_000);
         c.agent_wait(&name, &[AgentStatus::Idle], Some(timeout_ms))?;
@@ -2749,6 +2787,158 @@ pub fn launch_spawn_job(
         "await": plan.await_job,
         "error": mission_err,
     }))
+}
+
+/// Rex arm of [`launch_spawn_job`]: same claim/receipt contract over
+/// `&dyn MultiplexerBackend`, never `Client::connect`. `session.new_split`
+/// has no env map, so the pane env rides the one-string `env K=V` prefix and
+/// the harness launches through `pane_run` — the same recipe the crew spawner
+/// uses, so a rex crew's dynamic spawn steps land on the rex plane.
+fn launch_spawn_job_rex(
+    cfg: &Config,
+    project: &str,
+    wf_name: &str,
+    ws_id: &str,
+    plan: &SpawnJobLaunch,
+) -> Result<Value> {
+    let backend = crate::backend::factory::multiplexer_backend(cfg)?;
+    let name = crew_agent_name(wf_name, &format!("spawn-{}", plan.profile), 1);
+    let registry = state::load_spawn_registry(project);
+    let live_agents = backend.agent_list()?;
+    let is_fresh = plan.context.as_deref() == Some("fresh");
+    let existing = if is_fresh {
+        None
+    } else {
+        registry
+            .iter()
+            .find(|e| e.name == name)
+            .filter(|e| {
+                live_agents
+                    .iter()
+                    .any(|a| a.pane_id == e.pane_id && a.workspace_id == ws_id)
+            })
+            .cloned()
+    };
+    let (pane_id, name) = if let Some(e) = existing {
+        (e.pane_id, name)
+    } else {
+        let dir = crate::project_dir(cfg, project);
+        let panes = backend.pane_list(Some(ws_id))?;
+        let prev = panes
+            .last()
+            .map(|p| p.pane_id.clone())
+            .ok_or_else(|| anyhow!("spawn drain: no panes in workspace {ws_id}"))?;
+        let mail_identity = crate::pinned_mail_identity(cfg, project, &name, &plan.harness);
+        let pane_env =
+            pane_env_for_launch(cfg, mail_identity.as_deref(), plan.env_model_pin.as_deref())?;
+        let split = backend
+            .pane_split(
+                &prev,
+                "down",
+                Some(&crate::utf8_path(&dir, "workspace dir")?),
+            )
+            .map_err(|e| anyhow!("spawn drain: rex split in {ws_id}: {e:#}"))?;
+        wait_rex_shell_ready(
+            &*backend,
+            &split.pane_id,
+            &name,
+            &split.pane_id,
+            Duration::from_secs(15),
+        )?;
+        let command = rex_env_command(&pane_env, &plan.harness, &plan.args);
+        backend
+            .pane_run(&split.pane_id, &command)
+            .map_err(|e| anyhow!("spawn drain: rex run for {name} ({}): {e:#}", split.pane_id))?;
+        if let Err(e) = backend.agent_rename(&split.pane_id, Some(name.as_str())) {
+            eprintln!(
+                "flywheel: warn: rex rename {} → {name} failed: {e:#}",
+                split.pane_id
+            );
+        }
+        crate::bind_pane_mail_identity(
+            cfg,
+            project,
+            &name,
+            &split.pane_id,
+            mail_identity.as_deref(),
+        );
+        // Pane id, not the label: a rex label may exist in several sessions.
+        if let Err(e) = backend.agent_wait(
+            &split.pane_id,
+            &[AgentStatus::Idle, AgentStatus::Working],
+            Some(90_000),
+        ) {
+            eprintln!(
+                "flywheel: spawn drain {name} readiness wait failed (dispatching anyway): {e}"
+            );
+        }
+        (split.pane_id, name)
+    };
+    let harness = plan.harness.clone();
+    let mail_identity = crate::register_spawned_agent(cfg, project, &name, &harness, &pane_id);
+    crate::record_spawn_entry(
+        cfg,
+        project,
+        state::SpawnEntry::profiled(&pane_id, &name, &plan.profile, &harness, mail_identity),
+    );
+    let mission_err = dispatch_spawn_mission(project, plan, &name)?;
+    if plan.await_job {
+        let timeout_ms = cfg.default_timeout_ms.unwrap_or(1_800_000);
+        backend.agent_wait(&pane_id, &[AgentStatus::Idle], Some(timeout_ms))?;
+    }
+    Ok(json!({
+        "ok": true,
+        "spawned": true,
+        "promise_id": plan.promise_id,
+        "profile": plan.profile,
+        "harness": plan.harness,
+        "workflow": plan.workflow,
+        "pane_id": pane_id,
+        "agent": name,
+        "await": plan.await_job,
+        "error": mission_err,
+    }))
+}
+
+/// Dispatch one spawn job's workflow mission through the `__send` leaf. The
+/// leaf resolves the active plane itself, so both arms share it. `Ok(None)`
+/// is a clean dispatch; `Some(reason)` rides the receipt as `error`.
+fn dispatch_spawn_mission(
+    project: &str,
+    plan: &SpawnJobLaunch,
+    name: &str,
+) -> Result<Option<String>> {
+    let Some(w) = &plan.workflow else {
+        return Ok(None);
+    };
+    let prompt = headless::base_prompt_for(w, &json!({}));
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.arg("__send")
+        .arg(project)
+        .arg(name)
+        .arg(&prompt)
+        .arg("--confirm")
+        .arg("--profile")
+        .arg(&plan.profile);
+    let output = cmd
+        .output()
+        .with_context(|| format!("__send spawn mission for {name} (workflow {w})"))?;
+    let raw = String::from_utf8_lossy(&output.stdout).to_string();
+    let trimmed = raw.trim();
+    if let Ok(v) = serde_json::from_str::<Value>(trimmed)
+        && v.get("ok").and_then(Value::as_bool) == Some(false)
+    {
+        return Ok(Some(
+            v["error"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| raw.clone()),
+        ));
+    }
+    if trimmed.is_empty() {
+        return Ok(Some(String::from_utf8_lossy(&output.stderr).to_string()));
+    }
+    Ok(None)
 }
 
 /// Pane-mode keeps the engine alive across `invoke` so the spawn drainer can
@@ -3243,6 +3433,202 @@ mod tests {
             await_: true,
             no_claim_timeout: 600,
             context: None,
+        }
+    }
+
+    /// The durable spawn launcher is a PLANE door (backends.md: spawn, crew
+    /// launch, and preflight read one resolution). On the default rex plane
+    /// the old hard-coded `Client::connect` died with `cannot connect to hc
+    /// socket at ~/.local/state/herdr-core/default/default.sock`, so a
+    /// rex-crewed `steer` / `compose --run` could pack a crew and never land
+    /// a spawn step.
+    #[test]
+    fn the_spawn_launcher_reads_the_active_plane() {
+        let src = include_str!("pane.rs");
+        let start = src.find("pub fn launch_spawn_job(").expect("launcher");
+        let rest = &src[start..];
+        let end = rest.find("fn launch_spawn_job_hc(").expect("hc arm");
+        let dispatcher = &rest[..end];
+        assert!(
+            dispatcher.contains("rex_door_selected(cfg)"),
+            "the launcher must read the one plane resolution"
+        );
+        assert!(
+            dispatcher.contains("launch_spawn_job_rex"),
+            "the launcher must route to the rex arm"
+        );
+
+        let start = src.find("fn launch_spawn_job_rex(").expect("rex arm");
+        let rest = &src[start..];
+        let end = rest
+            .find("/// Dispatch one spawn job's workflow mission")
+            .expect("rex arm end");
+        let rex = &rest[..end];
+        assert!(
+            rex.contains("multiplexer_backend"),
+            "the rex arm must build the active backend"
+        );
+        assert!(
+            !rex.contains("Client::connect"),
+            "the rex arm must never dial the hc client"
+        );
+        assert!(
+            rex.contains("pane_run"),
+            "rex launches through pane_run (no env map on split)"
+        );
+    }
+
+    /// The post-run reap is the last door a rex run touches. It used to dial
+    /// hc after a successful rex crew, turning every `steer` into a backend
+    /// connect error at the end.
+    #[test]
+    fn the_pane_run_reap_reads_the_active_plane() {
+        let src = include_str!("cmd/workflow.rs");
+        assert!(
+            !src.contains("Client::connect"),
+            "workflow run/compose must reap through the plane backend"
+        );
+        assert!(
+            src.contains("reap_dead_registry_rows_on"),
+            "the reap must take the resolved backend"
+        );
+    }
+
+    /// `flywheel add` is a plane door: it resolves once, refuses a typo'd
+    /// backend before the hc dial, and routes to the rex arm. The hc arm still
+    /// holds a `Client::connect`, so the gate has to come first.
+    #[test]
+    fn cmd_add_routes_on_the_resolved_plane() {
+        let src = include_str!("cmd/spawn.rs");
+        let add = crate::tripwire::fn_body(src, "cmd_add");
+        for needle in ["resolve_plane(cfg)", "require_mux_for_spawn", "cmd_add_rex"] {
+            assert!(add.contains(needle), "cmd_add must use {needle}");
+        }
+        let gate = add.find("Plane::Rex").expect("the rex arm gate");
+        let dial = add
+            .find("Client::connect")
+            .expect("the hc arm still holds the client dial");
+        assert!(gate < dial, "the plane gate must precede the hc dial");
+    }
+
+    /// The dispatch registry and the settle window open on a runner with no
+    /// backend in scope. Both hard-dialed `Client::connect(None)` — the hc
+    /// socket — so a rex crew pruned every registry row and could never settle
+    /// a pane that was split moments earlier.
+    #[test]
+    fn dispatch_registry_and_settle_read_the_active_plane() {
+        let src = include_str!("pane.rs");
+        let body = |name: &str| {
+            let start = src
+                .find(&format!("\nfn {name}("))
+                .or_else(|| src.find(&format!("\npub fn {name}(")))
+                .unwrap_or_else(|| panic!("expected toplevel `fn {name}(`"));
+            crate::tripwire::body_from(src, start + 1)
+        };
+        for name in [
+            "live_registry_for_dispatch",
+            "settle_for_role_slot",
+            "live_pane_set_on_active_plane",
+        ] {
+            assert!(
+                !body(name).contains("Client::connect"),
+                "{name} must not dial the hc client"
+            );
+        }
+        for name in ["live_registry_for_dispatch", "settle_for_role_slot"] {
+            assert!(
+                body(name).contains("live_pane_set_on_active_plane"),
+                "{name} must read the active plane"
+            );
+        }
+        let probe = body("live_pane_set_on_active_plane");
+        assert!(
+            probe.contains("multiplexer_backend") && probe.contains("pane_list"),
+            "the probe must list panes on the constructed plane backend"
+        );
+    }
+
+    /// The rex/hc seam: no door may treat the CONFIGURED name as the serving
+    /// plane. `auto` is not an identity (`pane_keep` matches "hc"/"rex"
+    /// exactly), and `auto` that resolves to hc must still take the hc arm.
+    #[test]
+    fn the_rex_hc_seam_keys_on_the_resolved_plane() {
+        for src in [
+            include_str!("doorbell_host.rs"),
+            include_str!("inbox_ports.rs"),
+            include_str!("health_page.rs"),
+        ] {
+            assert!(
+                !src.contains("resolve_backend_name"),
+                "a configured name is not a plane verdict"
+            );
+            assert!(
+                src.contains("resolve_plane"),
+                "the door must read the one resolution"
+            );
+        }
+        let pane = include_str!("pane.rs");
+        let start = pane
+            .find("\npub fn dead_registry_rows(")
+            .expect("dead_registry_rows");
+        let body = crate::tripwire::body_from(pane, start + 1);
+        assert!(body.contains("resolve_plane"), "dead rows read the plane");
+        assert!(
+            !body.contains("resolve_backend_name"),
+            "`auto` is not a pane_keep identity"
+        );
+    }
+
+    /// The cron spawn launcher resolves its workspace on the active plane; a
+    /// raw hc client there died before the (plane-aware) launcher ever ran.
+    #[test]
+    fn the_cron_spawn_launcher_resolves_the_active_plane() {
+        let src = include_str!("cron.rs");
+        let start = src
+            .find("\nfn cron_spawn_launcher(")
+            .expect("cron spawn launcher");
+        let body = crate::tripwire::body_from(src, start + 1);
+        assert!(!body.contains("Client::connect"), "no raw hc dial");
+        assert!(
+            body.contains("multiplexer_backend") && body.contains("find_workspace_dyn"),
+            "the workspace must resolve through the plane backend"
+        );
+    }
+
+    /// Rex readiness/await waits must target the PANE id, never the label:
+    /// labels are unique only within one rex session, so a same-named crew in
+    /// another live session makes a label wait fail with "label … is in 2
+    /// sessions" (seen in the live steer proof).
+    #[test]
+    fn rex_waits_target_the_pane_not_the_label() {
+        let src = include_str!("pane.rs");
+        for name in ["spawn_crew_into_rex", "launch_spawn_job_rex"] {
+            let body = crate::tripwire::body_from(src, crate::tripwire::find_fn(src, name));
+            for (i, _) in body.match_indices("agent_wait(") {
+                let call = &body[i..(i + 240).min(body.len())];
+                assert!(
+                    !call.contains("&name,"),
+                    "{name}: a rex wait must target the pane, not the label"
+                );
+            }
+        }
+    }
+
+    /// The send arms key on the RESOLVED plane, not the configured name:
+    /// `auto` on a host without the rex CLI really does serve hc, and the old
+    /// `resolve_backend_name(cfg) != "hc"` gate sent that host into the rex
+    /// arm (and an explicit hc pin into rex) — a split-plane dispatch.
+    #[test]
+    fn send_arms_key_on_the_resolved_plane() {
+        for src in [include_str!("cmd/send.rs"), include_str!("comms_send.rs")] {
+            assert!(
+                !src.contains("resolve_backend_name(cfg) != \"hc\""),
+                "send must not gate on the configured name"
+            );
+            assert!(
+                src.contains("resolve_plane(cfg).plane"),
+                "send must gate on the resolved plane"
+            );
         }
     }
 

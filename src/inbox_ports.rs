@@ -604,7 +604,12 @@ impl Ports for FlywheelPorts {
     fn observe(&mut self) -> Observation {
         self.urgencies.clear();
         let registry = crate::state::load_spawn_registry(&self.project);
-        let selected = crate::backend::resolve_backend_name(&self.cfg);
+        // The serving plane, not the configured name: `auto` resolving to hc
+        // must take this arm, and `auto`-on-rex must not pass "auto" as a
+        // `pane_keep` identity (it matches "hc"/"rex" exactly).
+        let selected = crate::backend::resolve_plane(&self.cfg)
+            .serving()
+            .to_string();
         let (panes, up, host_session) = if selected == "hc" {
             let client = self.client();
             let up = client.is_some();
@@ -682,7 +687,8 @@ impl Ports for FlywheelPorts {
         let e = registry
             .iter()
             .find(|e| e.mail_identity.as_deref() == Some(pin.as_str()))?;
-        if crate::backend::resolve_backend_name(&self.cfg) != "hc" {
+        let serving = crate::backend::resolve_plane(&self.cfg).serving();
+        if serving != "hc" {
             let backend = crate::backend::multiplexer_backend(&self.cfg).ok()?;
             let p = backend
                 .agent_list()
@@ -697,7 +703,7 @@ impl Ports for FlywheelPorts {
                 true,
                 &pin,
                 npub,
-                "superlogical",
+                serving,
                 &host_session,
             );
             return bind;
@@ -1154,8 +1160,10 @@ mod tests {
         store.append_envelope(&steer).await.unwrap();
         assert_eq!(urgency_now(&store).await, (Urgency::Urgent, true));
         let mut other = steer.clone();
+        // Same recipient scope, so the next seq is 1. A second recipient
+        // would need its own lead registration in this context (toron rejects
+        // an unled recipient with `NoLead`) — out of scope for this probe.
         other.msg.seq = 1;
-        other.to = Recipient::Npub("cc".repeat(32));
         store.append_envelope(&other).await.unwrap();
         assert_eq!(urgency_now(&store).await, (Urgency::Urgent, true));
         store.next(B, None, false).await.unwrap();

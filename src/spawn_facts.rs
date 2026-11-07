@@ -2,8 +2,10 @@
 //!
 //! Best-effort: a refusal is logged and the spawn still succeeds. The
 //! operator is the doorbell's system producer, because the first role of a
-//! context must be an operator-signed captain. One `claim_epoch` covers both
-//! facts (context at seq 0, role at the next seq).
+//! context must be an operator-signed captain. Each fact is its own producer
+//! scope (`ingest_seq_for`): the context is addressed to the producer, the
+//! role to the subject npub, and each fresh scope starts at seq 0 with its own
+//! epoch (toron per-scope sequencing).
 
 use toron_core::authority::Role;
 use toron_core::contracts::context_v1::ContextV1;
@@ -79,14 +81,15 @@ pub async fn append_spawn_facts(
     if ctx_gen.is_none() && role_gen.is_none() {
         return Ok(None);
     }
-    let claim = store
-        .claim_epoch(&producer, &format!("spawn:{}", std::process::id()))
-        .await
-        .map_err(|e| e.to_string())?;
     let context = ContextId(project.to_string());
-    let mut seq = 0u64;
     let mut wrote_ctx = false;
     if let Some(generation) = ctx_gen {
+        // The context fact is addressed to the system producer itself, so it
+        // is its own scope; a fresh scope starts at seq 0 with its own epoch.
+        let (epoch, seq) = store
+            .ingest_seq_for(&producer, &producer)
+            .await
+            .map_err(|e| e.to_string())?;
         let env = ContextV1 {
             topology,
             generation,
@@ -94,23 +97,24 @@ pub async fn append_spawn_facts(
         .into_envelope(
             MsgId {
                 producer: producer.clone(),
-                epoch: claim.epoch,
+                epoch,
                 seq,
             },
             context.clone(),
             producer.clone(),
         );
         match store.append_envelope(&env).await {
-            Ok(_) => {
-                wrote_ctx = true;
-                seq = seq.saturating_add(1);
-            }
+            Ok(_) => wrote_ctx = true,
             Err(InboxError::Reject(Reject::StaleGen { .. })) => {}
             Err(e) => return Err(e.to_string()),
         }
     }
     let mut wrote_role = false;
     if let Some(generation) = role_gen {
+        let (epoch, seq) = store
+            .ingest_seq_for(&producer, npub)
+            .await
+            .map_err(|e| e.to_string())?;
         let env = RoleV1 {
             npub: npub.to_string(),
             role,
@@ -119,7 +123,7 @@ pub async fn append_spawn_facts(
         .into_envelope(
             MsgId {
                 producer: producer.clone(),
-                epoch: claim.epoch,
+                epoch,
                 seq,
             },
             context,
@@ -179,7 +183,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn captain_then_crew_share_one_epoch_and_a_repeat_writes_nothing() {
+    async fn captain_then_crew_write_one_fact_per_scope_and_a_repeat_writes_nothing() {
         let store = operated(mem().await, "proj");
         let captain = "aa".repeat(32);
         let crew = "bb".repeat(32);
@@ -195,9 +199,12 @@ mod tests {
         assert_eq!(captain_role.generation, 0);
         let ctx_key: Vec<_> = ctx.msg_key.split(':').collect();
         let role_key: Vec<_> = captain_role.msg_key.split(':').collect();
-        assert_eq!(ctx_key[1], role_key[1], "one claim_epoch for both facts");
+        assert_ne!(
+            ctx_key[1], role_key[1],
+            "each fact claims its own producer scope"
+        );
         assert_eq!(ctx_key[2], "0");
-        assert_eq!(role_key[2], "1");
+        assert_eq!(role_key[2], "0");
 
         let landed = append_spawn_facts(&store, "proj", Topology::Swarm, &crew, Role::Crew)
             .await
