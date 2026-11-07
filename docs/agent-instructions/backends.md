@@ -48,13 +48,57 @@ headless `opencode run` one-shots leave no records), then the foreground
 process (`process` block method: agent binary in front is Working, a shell
 is at a prompt), then `child_exited`/`process_changed` events. `pane_run` executes in the pane on both backends (text plus Enter); a headless one-shot belongs in Lua `rex.exec`, not in `pane_run`.
 
+## Rex API contract
+
+The adapter's wire contract lives in `../toron/crates/toron-plane/src/backend/rex_schema.rs`
+(`toron_plane::backend::rex_schema`). It pins the rex API revision last
+exercised (currently **11**), the methods the adapter adopts, their top-level
+request/response keys, and reviewed candidates that are deliberately not
+required. A method absent from the table is schema drift; `validate_response`
+is called by the format/blob/target parsers before they read a field.
+
+Adopted for the text surface:
+
+- **`target.resolve`** — one all-session block lookup replacing the
+  sessions×blocks scan. The resolver also accepts suffixes and
+  case-insensitive labels, so `locate` verifies the result equals the id or
+  label exactly before use; identity semantics do not widen.
+- **`com.superlogical.terminal.format` + `blob_read`** — bounded reads.
+  `agent_read(..., lines=0)` follows the blob to the end; a tail read seeks to
+  `total - 64 KiB` and follows chunks from there, so a large scrollback is not
+  fetched just to show the last lines.
+- **`program_status`** — object records keep `kind`, `progress`, `app`,
+  `title`, and `msg` (the old parser rebuilt a state-only sequence). The report
+  that decides the Attention fold is surfaced in
+  `AgentInfo.state_labels.program_status` as `{id, state, ...optional fields}`,
+  so a blocked child's message travels with its `Blocked` status.
+
+Still candidates, not wired: `data.connect` (replace the 20 ms polling in
+`pane_wait_output` with a stream), `session.describe_block` (per-block
+harness capabilities), and `session.attach_all` (one attach before a data
+connection).
+
+Update ritual when rex adds an API: `rex api describe <method>` → add or
+promote a row in `rex_schema.rs` → add the typed request builder/parser and a
+fixture test → add the method to `REQUIRED_API_GROUPS` only once it is
+adopted → run `mbx test -p toron-plane` and the opt-in
+`live_rex_format_blob_and_target_resolve_round_trip` probe. Keep
+`TESTED_API_REVISION` honest; it is evidence, not a compatibility promise.
+
 Manual rex crews (the escape hatch for a harness with no spawn recipe): `rex new` a session, `split` blocks, `block rename` each to its pin, start the harness via the block itself, and record `pane_id`/`name`/`harness` rows in the project's `.flywheel/agent-names.json` mirror (recover/rebind read it when the registry is empty). Bindings verify through the rex label (label plus session) with provenance `rex-label`; stamped-token panes keep the token path on every backend. Inbox observe on rex reads classified `agent_list` rows projected onto the pane shape; `pane_list` leaves status Unknown by construction and would silence every ring.
 
 ```bash
 flywheel backend list --json
 flywheel backend status
+flywheel backend schema
 flywheel backend default <multiplexer|mail> <name>
 ```
+
+`backend schema` prints the rex contract from `toron_plane::backend::rex_schema`
+as JSON: tested revision, adopted and candidate methods, and their top-level
+request/response keys. Diff it after a server upgrade before promoting a
+candidate; it is a view of the single source, not a second hand-maintained
+list.
 
 hc OpenRPC. Socket: `HC_SOCKET_PATH` or `$XDG_STATE_HOME/herdr-core/$HC_SESSION/$HC_SESSION.sock`.
 

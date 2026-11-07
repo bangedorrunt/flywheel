@@ -2926,6 +2926,7 @@ fn main() {
             "stage remove <name> — delete a user-tier stage file (backed up as <name>.toml.bak) so the compiled-in stage resolves again",
                 "checkpoint timeline audit history changes resume analytics",
                 "backend safety guards policy deps integration config upgrade tutorial serve preflight",
+            "backend schema — print the versioned rex API contract as JSON (tested revision, adopted/candidate methods, request/response keys); ONE source in toron-plane rex_schema.rs",
             "halt <project> [--context <lead>] [--sup-epoch N] (one control: cancel that subtree, no relaunch). supervisor fact|steer|view|hooks|halt (fact kinds progress|done|exit|proved|usage; usage is advisory and never a cost gate; view --json includes goal_proved; joins are FLYWHEEL_SUPERVISOR_JOIN=all|quorum:N|first:N, default all; quorum and first cancel the rest once k children are proved; hooks reports the marked hook block; production harnesses stay unverified). timer arm|meet|fail|sweep (one-shot watch, deadline required, one notify@1 under watch:<id>:<outcome> met|timer|expired|failed; default on, FLYWHEEL_TIMER=0 or [timer] enabled=false opts out; FLYWHEEL_ALLOW_EXEC=0 suppresses the ring; no stored shell)"
             ],
             "tracker": "br/bv (CLI, no MCP)",

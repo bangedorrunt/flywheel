@@ -703,6 +703,14 @@ pub(crate) fn wait_output_json(matched: bool, matched_line: Option<&str>, pane_i
     })
 }
 
+/// The first line containing `pattern`, trailing whitespace removed. `rex
+/// capture` returns the whole screen; the leaf reports the matching line.
+pub(crate) fn matched_line_in(text: &str, pattern: &str) -> Option<String> {
+    text.lines()
+        .find(|line| line.contains(pattern))
+        .map(|line| line.trim_end().to_string())
+}
+
 /// internal leaf: block until a pane's output matches a pattern.
 ///
 /// Target is an agent name (resolved via the project's agent list) or a raw
@@ -710,6 +718,10 @@ pub(crate) fn wait_output_json(matched: bool, matched_line: Option<&str>, pane_i
 /// `{"matched", "matched_line", "pane_id"}` either way (stderr for messages).
 /// For automation/scripts; the durable workflow does not use this leaf (no
 /// workflow-step type yet — future option, see cmd_workflow).
+///
+/// The rex arm asks the RESOLVED backend (never the hc socket). Its
+/// `pane_wait_output` matches plain text only, so `--regex` refuses on rex
+/// rather than silently changing transports; the hc arm keeps regex.
 pub(crate) fn cmd_internal_wait_output(
     cfg: &Config,
     project: &str,
@@ -718,6 +730,43 @@ pub(crate) fn cmd_internal_wait_output(
     regex: bool,
     timeout_ms: Option<u64>,
 ) -> Result<()> {
+    if crate::pane::rex_door_selected(cfg) {
+        if regex {
+            bail!(
+                "regex wait-output is not supported on the rex plane; pass a plain substring or use hc"
+            );
+        }
+        let backend = backend::multiplexer_backend(cfg)?;
+        let ws_id = find_workspace_dyn(&*backend, project)?;
+        let agents = backend
+            .agent_list()?
+            .into_iter()
+            .filter(|a| a.workspace_id == ws_id)
+            .collect::<Vec<_>>();
+        let Some(pane_id) = resolve_pane_id(&agents, target) else {
+            let out = wait_output_json(false, None, "");
+            print_json(&out);
+            eprintln!("flywheel: target {target} not found in {project}");
+            std::process::exit(1);
+        };
+        let timeout = timeout_ms.unwrap_or(30_000);
+        return match backend.pane_wait_output(&pane_id, pattern, timeout) {
+            Ok(value) => {
+                let text = value.get("text").and_then(Value::as_str).unwrap_or("");
+                let line = matched_line_in(text, pattern);
+                print_json(&wait_output_json(true, line.as_deref(), &pane_id));
+                Ok(())
+            }
+            Err(e) if e.code().as_str() == "timeout" => {
+                let out = wait_output_json(false, None, &pane_id);
+                print_json(&out);
+                eprintln!("flywheel: no match for {pattern:?} in {pane_id} within timeout");
+                std::process::exit(1);
+            }
+            Err(e) => Err(anyhow::anyhow!("pane.wait_for_output failed: {e:#}")),
+        };
+    }
+
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let ws_id = find_workspace(&mut c, project)?;
     let agents = c
@@ -4464,6 +4513,34 @@ mod wait_output_tests {
         let miss = wait_output_json(false, None, "w1:p1");
         assert_eq!(miss["matched"], false);
         assert_eq!(miss["matched_line"], serde_json::Value::Null);
+    }
+
+    /// The text-wait door reads the RESOLVED plane: on rex it asks the
+    /// backend, never the hc socket. `--regex` has no rex counterpart on the
+    /// trait, so it refuses instead of silently changing transports.
+    #[test]
+    fn wait_output_leaf_routes_rex_to_the_backend() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/cmd/internal.rs"))
+                .expect("read the leaf source");
+        assert!(
+            src.contains("backend.pane_wait_output(&pane_id, pattern, timeout)"),
+            "the rex arm must call the resolved backend's pane_wait_output"
+        );
+        assert!(
+            src.contains("regex wait-output is not supported on the rex plane"),
+            "regex must refuse on rex, never fall through to hc"
+        );
+    }
+
+    #[test]
+    fn matched_line_finds_the_first_containing_line() {
+        let text = "booting\nready: tests passed\nready: done\n";
+        assert_eq!(
+            matched_line_in(text, "tests"),
+            Some("ready: tests passed".to_string())
+        );
+        assert_eq!(matched_line_in(text, "missing"), None);
     }
 
     #[test]

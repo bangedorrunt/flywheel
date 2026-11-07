@@ -1180,12 +1180,16 @@ sub=""
 for arg in "$@"; do
   case "$arg" in
     program_status|send-key|write) sub=$arg ;;
+    *target.resolve*) sub=target.resolve ;;
     *list_blocks*) sub=list_blocks ;;
   esac
 done
 case "$cmd:$sub" in
   ls:)
     printf '%s\n' '{"sessions":[{"session_id":"session:fake-9","label":"flywheel-probe-send-rex-default","pane_count":1,"tab_count":1}]}'
+    ;;
+  api:target.resolve)
+    printf '%s\n' '{"results":[{"query":"block:fake-1","status":"resolved","target":{"kind":"block","session_id":"session:fake-9","window_id":"window:fake-1","block_id":"block:fake-1","label":"NeatHeron"}}]}'
     ;;
   api:list_blocks)
     printf '%s\n' '{"blocks":[{"block_id":"block:fake-1","window_id":"window:fake-1","label":"NeatHeron","creator_name":"com.superlogical.terminal"}]}'

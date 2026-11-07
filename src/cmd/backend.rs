@@ -16,6 +16,8 @@ pub(crate) enum BackendCmd {
     List,
     /// Show the active multiplexer + mail + config source + health
     Status,
+    /// Print the versioned rex API schema contract (adopted + candidate methods)
+    Schema,
     /// Persist a backend default to config.toml [backend] (env/flag still override)
     Default {
         /// multiplexer | mail
@@ -23,6 +25,14 @@ pub(crate) enum BackendCmd {
         /// backend name (hc|superlogical|toron)
         name: String,
     },
+}
+
+/// The rex contract is OWNED by toron-plane. This command is a view, never a
+/// second copy: a new rex method lands in `rex_schema.rs`, and this JSON is
+/// the diffable surface operators and agents can inspect after a server
+/// upgrade.
+fn rex_schema_contract() -> Value {
+    toron_plane::backend::rex_schema::contract_json()
 }
 
 /// `flywheel backend` — discovery + selection of the pluggable backends
@@ -116,6 +126,9 @@ pub(crate) fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
                 "mail": {"name": mail, "source": mail_source, "healthy": mail_health},
             }));
         }
+        BackendCmd::Schema => {
+            print_json(&rex_schema_contract());
+        }
         BackendCmd::Default { kind, name } => {
             let path = crate::config::config_file();
             let raw = if path.exists() {
@@ -144,4 +157,26 @@ pub(crate) fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rex_schema_contract;
+
+    #[test]
+    fn schema_view_is_machine_readable_and_names_both_states() {
+        let value = rex_schema_contract();
+        assert_eq!(value["tested_revision"], 11);
+        let rows = value["methods"].as_array().expect("methods array");
+        assert!(
+            rows.iter()
+                .any(|row| row["name"] == "target.resolve" && row["state"] == "adopted"),
+            "the adopted block resolver is in the view"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row["name"] == "data.connect" && row["state"] == "candidate"),
+            "unwired candidates stay visible, not hidden"
+        );
+    }
 }
