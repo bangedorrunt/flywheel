@@ -16,9 +16,6 @@
 # default --wait timeout in ms for send/watch (default 1800000 = 30m)
 # default_timeout_ms = 1800000
 
-# Resonate server URL for the durable loop (default http://localhost:8001)
-# resonate_url = "http://localhost:8001"
-
 # short name -> hc agent kind (defaults: oc=opencode, pi=pi, gk=grok;
 # unknown shorts pass through verbatim and fail loud at agent.start)
 # [kinds]

@@ -763,6 +763,16 @@ impl<H: Host> Brain<H> {
         }
         let unanswered = self.hear.unanswered_pins();
         self.deaf_attempts.retain(|pin, _| unanswered.contains(pin));
+        // Post-start hear-map gap: the host index learns npubs after
+        // `Brain::new` (the registry refresh lands in `sweep_maintenance`
+        // above), so a seeded unanswered pin's map entry stays empty until a
+        // sweep refreshes it — without this its late reply never clears it.
+        // Bounded to unanswered pins (no registry-wide scan); the
+        // `persist_hear` below already fires every sweep, so no write is added.
+        for pin in unanswered {
+            self.hear
+                .remember_npub(&pin, self.host.pin_npub(&pin).as_deref());
+        }
         self.persist_hear();
     }
 
@@ -1636,6 +1646,35 @@ mod tests {
         assert!(
             brain.hear.unanswered_pins().is_empty(),
             "the seeded ring must carry the host-known npub"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The post-start gap: the host index learns the npub AFTER `Brain::new`
+    /// (registry refresh on the 1s tick), so the seeded pin's map entry is
+    /// empty until a sweep refreshes it. Without the refresh the late reply
+    /// never clears the pin — it only expires at `UNANSWERED_SECS`.
+    #[tokio::test]
+    async fn sweep_refreshes_a_late_learned_npub_so_the_seeded_pin_clears_on_reply() {
+        let dir = std::env::temp_dir().join(format!("dbrt-brain-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = FileStore::new(&dir);
+        store.save_unanswered("w", &["LatePin".to_string()]);
+        let host = MockHost::new(1_000_000);
+        let (tx, _rx) = tokio::sync::mpsc::channel(crate::BRAIN_CAP);
+        let sinks = SinkManager::new(tx);
+        let mut brain = Brain::new(BrainConfig::new("w"), host, store, sinks);
+        assert_eq!(brain.hear.unanswered_pins(), vec!["LatePin".to_string()]);
+        // The host index learns the npub after start.
+        brain.host.npubs.insert("LatePin".into(), "cd34".into());
+        // An unknown npub keeps today's behavior: the pin stays.
+        brain.hear.note_heard_pubkey("zzzz");
+        assert_eq!(brain.hear.unanswered_pins(), vec!["LatePin".to_string()]);
+        brain.dispatch(BrainMsg::Sweep { now: 1_000_001 }).await;
+        brain.hear.note_heard_pubkey("CD34");
+        assert!(
+            brain.hear.unanswered_pins().is_empty(),
+            "the sweep must refresh the pin→npub map for unanswered pins"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
