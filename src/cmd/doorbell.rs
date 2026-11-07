@@ -935,7 +935,9 @@ pub(crate) fn cmd_doorbell_re_inject(cfg: &Config, project: &str) -> Result<()> 
     crate::cmd::spawn::ensure_doorbell_supervisor();
     let registry = crate::state::load_spawn_registry(project);
     let peer_tpl = include_str!("../../integrations/peer-aware.md.tpl");
-    let c = crate::hc::Client::connect(Some(&cfg.socket_path()))?;
+    // rex-first: the plane backend is the one the panes actually run on.
+    // `hc::Client` here failed every re-inject on the default rex plane.
+    let backend = crate::backend::multiplexer_backend(cfg)?;
     let mut injected = 0;
     for e in &registry {
         if e.pane_id.is_empty() {
@@ -949,7 +951,7 @@ pub(crate) fn cmd_doorbell_re_inject(cfg: &Config, project: &str) -> Result<()> 
             peer_tpl, &e.name, identity, 5, 30, 3,
         ));
         for line in lines {
-            c.agent_prompt(&e.pane_id, &line, None).map_err(|err| {
+            backend.prompt(&e.pane_id, &line, None).map_err(|err| {
                 anyhow::anyhow!(
                     "re-inject {}: pane {} not promptable ({err}) — is the agent up?",
                     e.name,
@@ -2805,6 +2807,34 @@ mod host_key_tests {
         assert_eq!(
             doorbell_host_key("flywheel-toron", "flywheel-toron", ""),
             "flywheel-toron"
+        );
+    }
+
+    /// re-inject must use the active plane backend (rex by default). The
+    /// old hc client failed with `cannot connect to hc socket` on every
+    /// rex-only host, so added panes never got the peer handler.
+    #[test]
+    fn re_inject_uses_the_plane_backend() {
+        let src = include_str!("../cmd/doorbell.rs");
+        let start = src
+            .find("pub(crate) fn cmd_doorbell_re_inject(")
+            .expect("re-inject");
+        let rest = &src[start..];
+        let end = rest
+            .find("\npub(crate) fn cmd_internal_doorbell(")
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("multiplexer_backend"),
+            "re-inject must resolve the active backend"
+        );
+        assert!(
+            body.contains("backend.prompt"),
+            "re-inject must prompt through the backend trait"
+        );
+        assert!(
+            !body.contains("hc::Client::connect"),
+            "re-inject must not hard-code hc"
         );
     }
 }
