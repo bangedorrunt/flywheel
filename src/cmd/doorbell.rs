@@ -589,7 +589,13 @@ fn record_doorbell_arms(
 
 pub(crate) fn cmd_doorbell_start(cfg: &Config, project: &str) -> Result<()> {
     crate::check_project_spelling(project, "doorbell start")?;
-    let workspaces = crate::cmd::spawn::doorbell_project_workspaces(project);
+    let snap = crate::snapshot::assemble(cfg, project, crate::doorbell_now_unix());
+    let live_label = snap.workspace.clone();
+    let live_id = snap.workspace_id.clone();
+    let mut workspaces = crate::cmd::spawn::doorbell_project_workspaces(project);
+    if workspaces.is_empty() && !live_id.is_empty() && !live_label.is_empty() {
+        workspaces.push(live_label.clone());
+    }
     let mut arm: Vec<String> = Vec::new();
     for ws in &workspaces {
         arm.push("--host".to_string());
@@ -622,12 +628,25 @@ pub(crate) fn cmd_doorbell_start(cfg: &Config, project: &str) -> Result<()> {
         return Ok(());
     }
     for ws in workspaces {
+        let host_ws = doorbell_host_key(&ws, &live_label, &live_id);
         let action =
-            crate::doorbell::ensure_running(&exe, &crate::config::state_dir(), &ws, project)
+            crate::doorbell::ensure_running(&exe, &crate::config::state_dir(), host_ws, project)
                 .with_context(|| format!("doorbell start {project}/{ws}"))?;
         println!("{project}/{ws}: {action:?}");
     }
     Ok(())
+}
+
+/// The plane resolves the live session workspace by its ID, while the state
+/// files and the central daemon arms use the stable project label. A host
+/// started with the label retires with `workspace-gone` even though the
+/// panes are live; map the label to the snapshot's ID for the local host.
+fn doorbell_host_key<'a>(label: &'a str, live_label: &'a str, live_id: &'a str) -> &'a str {
+    if !live_id.is_empty() && (live_label.is_empty() || live_label == label) {
+        live_id
+    } else {
+        label
+    }
 }
 
 pub(crate) fn cmd_doorbell_stop(cfg: &Config, project: &str, workspace: &str) -> Result<()> {
@@ -635,13 +654,21 @@ pub(crate) fn cmd_doorbell_stop(cfg: &Config, project: &str, workspace: &str) ->
     if workspace == "all" && crate::cmd::spawn::proxy_doorbell_verb(cfg, "stop", &[])? {
         return Ok(());
     }
+    let snap = crate::snapshot::assemble(cfg, project, crate::doorbell_now_unix());
+    let live_label = snap.workspace.clone();
+    let live_id = snap.workspace_id.clone();
     let workspaces: Vec<String> = if workspace == "all" {
-        crate::cmd::spawn::doorbell_project_workspaces(project)
+        let mut list = crate::cmd::spawn::doorbell_project_workspaces(project);
+        if list.is_empty() && !live_id.is_empty() && !live_label.is_empty() {
+            list.push(live_label.clone());
+        }
+        list
     } else {
         vec![workspace.to_string()]
     };
     for ws in workspaces {
-        crate::doorbell::stop(&crate::config::state_dir(), &ws);
+        let host_ws = doorbell_host_key(&ws, &live_label, &live_id);
+        crate::doorbell::stop(&crate::config::state_dir(), host_ws);
         println!("{project}/{ws}: stopped");
     }
     Ok(())
@@ -2755,6 +2782,33 @@ mod why_resume_tests {
 }
 
 /// --- moved-in test mod (bd-wave5-main-eviction-d5hht) ---
+#[cfg(test)]
+mod host_key_tests {
+    use super::doorbell_host_key;
+
+    /// The live session workspace must reach `__doorbell` by its plane ID;
+    /// every other label (scratch workspaces) stays a label.
+    #[test]
+    fn maps_only_the_live_label_to_its_id() {
+        assert_eq!(
+            doorbell_host_key("flywheel-toron", "flywheel-toron", "session:abc"),
+            "session:abc"
+        );
+        assert_eq!(
+            doorbell_host_key("scratch", "flywheel-toron", "session:abc"),
+            "scratch"
+        );
+        assert_eq!(
+            doorbell_host_key("flywheel-toron", "", "session:abc"),
+            "session:abc"
+        );
+        assert_eq!(
+            doorbell_host_key("flywheel-toron", "flywheel-toron", ""),
+            "flywheel-toron"
+        );
+    }
+}
+
 #[cfg(test)]
 mod single_writer_tests {
     #[test]
