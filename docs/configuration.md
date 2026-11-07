@@ -49,7 +49,7 @@ cron_doorbell_sink = false
 Also supported: `[mail.toron]` url+token, `[backend]` multiplexer/mail,
 `[backend]` multiplexer/mail, `[crew] max` (default 5), `[loop]`
 thresholds (unknown_diagnose, respawn_budget, detect_grace, drain_grace,
-claim_nudge), `socket_path`, `workspace_root`, `resonate_url`,
+claim_nudge), `socket_path`, `workspace_root`,
 `on_captain_death` (stop | continue | adopt), `kinds`, `verifier_family_override`. Full annotated
 inventory with every default and validation rule: `config.sample.toml`
 at the repo root (unknown keys are ignored — typos fail silent, check
@@ -146,7 +146,6 @@ ladder: CLI > `TORON_*` env > `./.toron.toml` > `~/.config/toron/`
 | `DOORBELL_TORON_BIN` / `DOORBELL_HC_BIN` | watch/prompt child binaries (tests set `true`) |
 | `DOORBELL_WEBHOOK_ALLOWLIST` | egress hosts allowed for `--sink webhook` rows (comma/space separated, exact or `.suffix`; absent = the daemon registers no webhook adapter and those wakes stay digest-visible) |
 | `TORON_DATA_DIR` / `TORON_MCP_DATA_DIR` / `TORON_KEY_PASSPHRASE` | toron roots + operator key (never `TORON_OPERATOR_PASSPHRASE`) |
-| `RESONATE_URL` | durable-loop server (default `http://localhost:8001`) |
 | `HC_SOCKET_PATH` | hc session socket |
 | `AGENT_NAME` | the only pin env. `--as` wins. `TORON_AGENT` and `FLYWHEEL_MAIL_AS` do not supply a pin. Unset means the guard blocks the commit |
 | `FLYWHEEL_JEV` | judgment gate (bd-0glq P7: on by default). Unset = auto (enrich iff `TYPESAFE_API_KEY` is set, else loud `jev: unconfigured` passthrough, never escalate); `1/true/yes` = force on (deny escalates even keyless); `0/false/no` = force off (byte-identical) |

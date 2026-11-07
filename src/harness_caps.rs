@@ -220,13 +220,14 @@ pub const TABLE: &[HarnessCaps] = &[
     },
 ];
 
-/// Static hook body. Runs `toron next --urgent --peek` and, only when that
-/// exits 0, denies the tool call with [`HOOK_REASON`]. Peek stdout is
-/// discarded so a steer body cannot reach the pane. No field is interpolated.
-/// `toron next --urgent --peek` exits 0 when an urgent steer is pending and
-/// non-zero when it is not; any other failure allows the tool call.
+/// Static hook body. Runs `toron next --urgent --peek` and branches on its
+/// exit code: 0 (urgent) denies the tool call with [`HOOK_REASON`], 1
+/// (none) allows it, 4 (ingest degraded) or any other code denies with a
+/// degraded reason. Peek stdout is discarded so a steer body cannot reach
+/// the pane. No field is interpolated; the only expansions are the peek
+/// exit code (`$?` captured once, `$code` read).
 pub fn hook_script() -> &'static str {
-    "#!/bin/sh\n# Constant deny. Steer text is discarded and never typed.\nif toron next --urgent --peek >/dev/null 2>&1; then\necho urgent steer pending: run toron next >&2\nexit 2\nfi\nexit 0\n"
+    "#!/bin/sh\n# Urgent gate. Steer text is discarded and never typed.\ntoron next --urgent --peek >/dev/null 2>&1\ncode=$?\nif [ $code -eq 0 ]; then\necho urgent steer pending: run toron next >&2\nexit 2\nfi\nif [ $code -eq 1 ]; then\nexit 0\nfi\necho toron next degraded: run toron next to diagnose >&2\nexit 2\n"
 }
 
 /// What an urgent wake types. A capable harness with the block installed
@@ -678,7 +679,9 @@ mod tests {
         assert!(s.contains(HOOK_REASON));
         assert!(s.contains("toron next --urgent --peek"));
         assert!(!s.contains('{'), "no format payload");
-        assert!(!s.contains("$"), "no shell payload");
+        // The only expansions are the peek exit code; anything else is a payload.
+        let scrubbed = s.replace("$?", "").replace("$code", "");
+        assert!(!scrubbed.contains('$'), "no shell payload: {s}");
     }
 
     #[test]
@@ -853,6 +856,55 @@ mod tests {
             std::fs::read_to_string(&hooks).unwrap(),
             "# operator hook: keep me\n"
         );
+    }
+
+    /// Exit 4 (ingest degraded) must deny, never read as "no urgent": a
+    /// degraded mail read that allows the tool lets the agent proceed on a
+    /// lie. Only exit 1 allows; 0 denies urgent, 4/anything else denies
+    /// degraded. Steer text stays discarded on every branch.
+    #[test]
+    fn hook_denies_on_degraded_exit_and_allows_only_on_exit_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("toron");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nif [ \"$*\" = \"next --urgent --peek\" ]; then\n  read code < code\n  exit \"$code\"\nfi\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut p = std::fs::metadata(&stub).unwrap().permissions();
+            p.set_mode(0o755);
+            std::fs::set_permissions(&stub, p).unwrap();
+        }
+        let hooks = dir.path().join("hooks");
+        std::fs::write(&hooks, "# operator hook: keep me\n").unwrap();
+        assert_eq!(
+            plan_launch_hook("fake", Some(&hooks), true),
+            LaunchHook::Installed
+        );
+        let run = |code: &str| {
+            std::fs::write(dir.path().join("code"), code).unwrap();
+            run_hook(dir.path())
+        };
+        let (exit, stdout, stderr) = run("1\n");
+        assert_eq!(exit, 0, "exit 1 (none) allows: {stderr}");
+        assert!(stdout.is_empty() && stderr.is_empty());
+        let (exit, stdout, stderr) = run("0\n");
+        assert_eq!(exit, 2, "exit 0 (urgent) denies");
+        assert_eq!(stderr.trim(), HOOK_REASON);
+        assert!(stdout.is_empty());
+        for degraded in ["4\n", "3\n"] {
+            let (exit, stdout, stderr) = run(degraded);
+            assert_eq!(exit, 2, "peek exit {degraded:?} must deny");
+            assert!(stdout.is_empty(), "steer stays discarded");
+            assert_ne!(stderr.trim(), HOOK_REASON);
+            assert!(
+                stderr.contains("toron next"),
+                "degraded reason names toron next: {stderr:?}"
+            );
+        }
     }
 
     fn inbox_wake_recorder() -> WakeRec {
