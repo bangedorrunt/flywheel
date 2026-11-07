@@ -90,6 +90,7 @@ mod retry;
 mod rot;
 mod run_log;
 mod run_state_recorder;
+mod self_watch;
 mod signoff;
 mod snapshot;
 mod snapshot_reporting;
@@ -17960,6 +17961,7 @@ mod hosted_workspaces_from_registry_tests {
 
 #[cfg(feature = "serve")]
 fn cmd_serve(cfg: &Config, port: u16) -> Result<()> {
+    crate::self_watch::spawn("serve");
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(serve_async(cfg.clone(), port))
 }

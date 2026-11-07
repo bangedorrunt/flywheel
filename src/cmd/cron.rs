@@ -500,6 +500,7 @@ pub(crate) fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
             Ok(())
         }
         CronCmd::Start { project } => {
+            crate::self_watch::spawn("cron");
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(cron::start_loops(cfg, project.as_deref()))
         }
