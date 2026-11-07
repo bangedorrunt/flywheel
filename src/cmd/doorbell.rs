@@ -28,6 +28,11 @@ pub(crate) enum DoorbellCmd {
     /// start/attach dispatchers for every registered workspace that ever
     /// ran one (the crash-recovery entry point).
     Start { project: String },
+    /// Run the reboot-persistent supervisor loop (the installed unit runs
+    /// this; it re-runs the idempotent start every minute and exits on its
+    /// own binary change so the service manager restarts the new binary).
+    #[command(hide = true)]
+    Supervise { project: String },
     /// stop dispatchers (per workspace; `all` for every registered one)
     Stop {
         project: String,
@@ -391,7 +396,7 @@ pub(crate) fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
     if crate::cmd::spawn::proxy_doorbell_verb(cfg, "status", &[])? {
         return Ok(());
     }
-    crate::cmd::spawn::ensure_doorbell_supervisor();
+    crate::cmd::spawn::ensure_doorbell_supervisor(cfg, project);
     let _ = cfg;
     let state_dir = crate::config::state_dir();
     let unpinned = crate::unpinned_registry_names(&crate::state::load_spawn_registry(project));
@@ -621,7 +626,7 @@ pub(crate) fn cmd_doorbell_start(cfg: &Config, project: &str) -> Result<()> {
     if !crate::doorbell::local_loop_after_proxy(proxied, crate::comms_send::enabled(cfg)) {
         return Ok(());
     }
-    crate::cmd::spawn::ensure_doorbell_supervisor();
+    crate::cmd::spawn::ensure_doorbell_supervisor(cfg, project);
     let exe = std::env::current_exe()?;
     if workspaces.is_empty() {
         eprintln!("doorbell: absent (no swarm workspace yet — attach after spawn)");
@@ -635,6 +640,32 @@ pub(crate) fn cmd_doorbell_start(cfg: &Config, project: &str) -> Result<()> {
         println!("{project}/{ws}: {action:?}");
     }
     Ok(())
+}
+
+/// The reboot-persistent supervisor body: run the idempotent start every
+/// minute, and exit when this executable changes so launchd/systemd restarts
+/// the new binary. The installed unit runs exactly this command.
+pub(crate) fn cmd_doorbell_supervise(cfg: &Config, project: &str) -> Result<()> {
+    crate::check_project_spelling(project, "doorbell supervise")?;
+    let exe = std::env::current_exe()?;
+    let stamp = binary_stamp(&exe);
+    loop {
+        if let Err(e) = cmd_doorbell_start(cfg, project) {
+            eprintln!("flywheel doorbell supervise: start failed: {e:#}");
+        }
+        if binary_stamp(&exe) != stamp {
+            eprintln!(
+                "flywheel doorbell supervise: binary changed; exiting for the supervisor restart"
+            );
+            std::process::exit(1);
+        }
+        std::thread::sleep(Duration::from_secs(60));
+    }
+}
+
+fn binary_stamp(path: &std::path::Path) -> Option<(u64, std::time::SystemTime)> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.len(), m.modified().ok()?))
 }
 
 /// The plane resolves the live session workspace by its ID, while the state
@@ -932,7 +963,7 @@ pub(crate) fn cmd_doorbell_digest(
 /// and post-crash respawns that never got the spawn-time injection.
 pub(crate) fn cmd_doorbell_re_inject(cfg: &Config, project: &str) -> Result<()> {
     crate::check_project_spelling(project, "doorbell re-inject")?;
-    crate::cmd::spawn::ensure_doorbell_supervisor();
+    crate::cmd::spawn::ensure_doorbell_supervisor(cfg, project);
     let registry = crate::state::load_spawn_registry(project);
     let peer_tpl = include_str!("../../integrations/peer-aware.md.tpl");
     // rex-first: the plane backend is the one the panes actually run on.

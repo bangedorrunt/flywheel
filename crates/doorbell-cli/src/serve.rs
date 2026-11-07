@@ -16,6 +16,25 @@ use tokio::io::AsyncWriteExt;
 
 const LOGROTATE_BYTES: u64 = 1024 * 1024;
 
+/// How often the serving process checks its own executable for a reinstall.
+const BINARY_WATCH_SECS: u64 = 30;
+
+/// The identity a reinstall changes. Length plus mtime is enough: cargo
+/// install writes a new file, and a same-length rebuild still moves mtime.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Stamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+fn stamp_of(path: &std::path::Path) -> Option<Stamp> {
+    let m = std::fs::metadata(path).ok()?;
+    Some(Stamp {
+        len: m.len(),
+        modified: m.modified().ok(),
+    })
+}
+
 /// One hosted loop: watch child + sweep/ack beats around a Brain. The
 /// channel comes from `run` so shutdown (drop all senders) ends the
 /// brain cleanly with drained, journaled intents.
@@ -819,6 +838,24 @@ pub async fn run(cfg: &Config) -> Result<()> {
             }
         });
     }
+    // Reinstall freshness: the unit's KeepAlive restarts a non-zero exit, so
+    // a new binary on disk must end this process instead of serving stale
+    // code until a human kicks it.
+    std::thread::spawn(|| {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let stamp = stamp_of(&exe);
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(BINARY_WATCH_SECS));
+            if stamp_of(&exe) != stamp {
+                eprintln!(
+                    "doorbell: binary changed on disk; exiting 1 so the supervisor restarts the new build"
+                );
+                std::process::exit(1);
+            }
+        }
+    });
     let spawn_hosts: Vec<(String, String)> = Vec::new();
     for (project, workspace) in &spawn_hosts {
         if let Some(cur) = lease::read_lease(&cfg.flywheel_state, workspace)
@@ -4176,5 +4213,23 @@ mod tests {
             !live.contains("gone-c"),
             "an unhosted, unleleased workspace stays a candidate"
         );
+    }
+
+    #[test]
+    fn a_changed_binary_stamp_is_detected() {
+        let dir = std::env::temp_dir().join(format!("doorbell-stamp-{}", std::process::id()));
+        let file = dir.join("binary");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&file, b"a").unwrap();
+        let first = super::stamp_of(&file).expect("stamp");
+        std::fs::write(&file, b"a longer body").unwrap();
+        let second = super::stamp_of(&file).expect("stamp");
+        assert_ne!(first, second, "a reinstall must change the watch stamp");
+        assert_eq!(
+            super::stamp_of(&file),
+            Some(second),
+            "an unchanged file keeps its stamp"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

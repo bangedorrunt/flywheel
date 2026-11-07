@@ -443,8 +443,80 @@ fn install_unit(state: &Path, spec: &UnitSpec<'_>) -> anyhow::Result<()> {
     }
 }
 
-/// The cron host's unit: `flywheel cron start` as its own supervised process.
-///
+/// True when a launchd/systemd user unit is loaded/active.
+pub fn unit_active(label: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let uid = current_uid();
+        Command::new("launchctl")
+            .args(["print", &format!("gui/{uid}/{label}")])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("systemctl")
+            .args(["--user", "is-active", label])
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = label;
+        false
+    }
+}
+
+fn unit_slug(project: &str) -> String {
+    let s: String = project
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if s.is_empty() { "default".into() } else { s }
+}
+
+/// Install + start the per-project doorbell supervisor. The unit runs
+/// `flywheel doorbell supervise <project>` as one long-lived process:
+/// `RunAtLoad` on boot, `KeepAlive` on failure, and the supervisor itself
+/// exits when its own binary changes, so reinstall is picked up by the
+/// service manager without a manual restart. The loop re-runs the idempotent
+/// `doorbell start`, which resolves the current session workspace id.
+pub fn install_doorbell_supervisor(
+    cfg: &crate::config::Config,
+    project: &str,
+) -> anyhow::Result<()> {
+    let slug = unit_slug(project);
+    let label = format!("dev.flywheel.doorbell.{slug}");
+    if unit_active(&label) {
+        return Ok(());
+    }
+    let state = crate::config::state_dir();
+    let dir = crate::project_dir(cfg, project);
+    let working_dir = dir.is_dir().then_some(dir.as_path());
+    let stem = format!("doorbell-{slug}");
+    install_unit(
+        &state,
+        &UnitSpec {
+            label: &label,
+            args: vec![
+                "doorbell".to_string(),
+                "supervise".to_string(),
+                project.to_string(),
+            ],
+            working_dir,
+            stem: &stem,
+        },
+    )
+}
+
+/// The cron host's unit: `flywheel cron start` as its own supervised process.///
 /// Not folded into `serve` on purpose. `serve` is the HTTP/wake surface and
 /// dies on a bind conflict or a handler panic; cron owns ticks and the
 /// doorbell-supervisor minute schedule. Separate units keep one failure from
@@ -1001,5 +1073,12 @@ mod tests {
             matches!(got, DoorbellEnsure::Degraded { .. }),
             "opt-out must degrade, got {got:?}"
         );
+    }
+
+    #[test]
+    fn doorbell_supervisor_slug_is_isolated() {
+        assert_eq!(super::unit_slug("toron"), "toron");
+        assert_eq!(super::unit_slug("a/b c"), "a-b-c");
+        assert_eq!(super::unit_slug(""), "default");
     }
 }

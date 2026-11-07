@@ -3261,6 +3261,9 @@ fn main() {
         Some(Commands::Doorbell { cmd }) => match cmd {
             DoorbellCmd::Status { project } => cmd_doorbell_status(&cfg, project),
             DoorbellCmd::Start { project } => cmd_doorbell_start(&cfg, project),
+            DoorbellCmd::Supervise { project } => {
+                crate::cmd::doorbell::cmd_doorbell_supervise(&cfg, project)
+            }
             DoorbellCmd::Stop { project, workspace } => cmd_doorbell_stop(&cfg, project, workspace),
             DoorbellCmd::ReInject { project } => cmd_doorbell_re_inject(&cfg, project),
             DoorbellCmd::Afk { project, limit } => cmd_doorbell_afk(&cfg, project, *limit),
@@ -10589,7 +10592,7 @@ fn cmd_recover(cfg: &Config, project: &str, include_captain: bool) -> Result<()>
         "skipped_captain_names": skipped_captain,
     }));
     let exe = std::env::current_exe()?;
-    ensure_doorbell_supervisor();
+    ensure_doorbell_supervisor(cfg, project);
     for ws in doorbell_project_workspaces(project) {
         match doorbell::ensure_running(&exe, &config::state_dir(), &ws, project) {
             Ok(action) => eprintln!("flywheel: doorbell {ws} healed ({action:?})"),

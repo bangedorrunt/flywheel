@@ -2289,8 +2289,10 @@ pub(crate) fn doorbell_project_workspaces(project: &str) -> Vec<String> {
 /// schedule itself lives server-side, so ticks that land while nothing is
 /// connected stay queued and execute at-least-once later. Server
 /// unreachable → skip silently; the lazy fallback still covers us.
-pub(crate) fn ensure_doorbell_supervisor() {
-    eprintln!("flywheel: doorbell supervisor rides the cron host (no server schedule registered)");
+pub(crate) fn ensure_doorbell_supervisor(cfg: &crate::config::Config, project: &str) {
+    if let Err(e) = crate::daemon::install_doorbell_supervisor(cfg, project) {
+        eprintln!("flywheel: doorbell supervisor install failed: {e:#}");
+    }
 }
 
 /// Thin proxy to the daemon CLI when it hosts wake (bd-asr2.5, D1).
