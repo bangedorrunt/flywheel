@@ -171,7 +171,7 @@ fn poll_once(
     if registry.is_empty() {
         return;
     }
-    let captain = crate::state::load_captain_alias(project);
+    let captain_alias = crate::state::load_captain_alias(project);
     let Ok(backend) = crate::backend::multiplexer_backend(cfg) else {
         return;
     };
@@ -183,6 +183,14 @@ fn poll_once(
         return;
     };
     let project_key = crate::project_dir_str(cfg, project).unwrap_or_else(|_| project.to_string());
+    // The flywheel mirror may be absent; toron's own `captain` alias is the
+    // authoritative one. Both are read so the operator's pane is never typed
+    // into (and never retried as a busy pane).
+    let captain = captain_alias.or_else(|| {
+        crate::backend::run_mail(mail.whois(&project_key, "captain"))
+            .ok()
+            .map(|w| w.name)
+    });
     let mut changed = false;
     for entry in &registry {
         if stop_pin(entry, captain.as_deref(), &pane_ids) {
@@ -309,6 +317,18 @@ mod tests {
     fn normal_text_is_not_urgent() {
         let text = wake_text("toron", "TopazKnoll", &row(1, "a", "b", "normal"));
         assert!(!text.starts_with("URGENT "), "{text}");
+    }
+
+    #[test]
+    fn the_operator_captain_is_never_woken() {
+        use std::collections::BTreeSet;
+        let entry = crate::state::SpawnEntry::with_mail_identity(
+            "p1",
+            "flywheel-toron-oc",
+            "CloudySparrow",
+        );
+        assert!(stop_pin(&entry, Some("CloudySparrow"), &BTreeSet::new()));
+        assert!(!stop_pin(&entry, Some("OtherPin"), &BTreeSet::new()));
     }
 
     /// The per-workspace host must start this poller; a future refactor that
