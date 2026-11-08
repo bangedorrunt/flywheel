@@ -971,13 +971,23 @@ pub enum JevGate {
 
 /// Resolve the gate from env. Pure read, no I/O beyond env.
 pub fn jev_gate() -> JevGate {
+    let key = env::var(API_KEY_ENV).ok();
+    jev_gate_for(key.as_deref())
+}
+
+/// Gate resolution for an entrypoint that already holds resolved authority:
+/// the key comes from the authority snapshot, never the ambient process env.
+/// The flag stays process config. A keyless authority therefore stays on the
+/// loud `Unconfigured` passthrough even when the process env has a key; an
+/// explicit `On` still denies keylessly instead of silently skipping.
+fn jev_gate_for(api_key: Option<&str>) -> JevGate {
     match env::var(FLAG_ENV) {
         Ok(v) => match v.to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" => JevGate::On,
             _ => JevGate::Off,
         },
-        Err(_) => match env::var(API_KEY_ENV) {
-            Ok(k) if !k.trim().is_empty() => JevGate::On,
+        Err(_) => match api_key {
+            Some(k) if !k.trim().is_empty() => JevGate::On,
             _ => JevGate::Unconfigured,
         },
     }
@@ -1221,7 +1231,11 @@ fn plan_of(a: ExpandArgs, stage: PostStage) -> PostPlan {
 /// (keyless default) skips loud with a reason marker — table passthrough,
 /// no escalate, no audit.
 pub fn prepare_post_with_authority(a: ExpandArgs, authority: &RuntimeAuthority) -> PostPlan {
-    prepare_post_with_authority_and_gate(a, authority, jev_gate())
+    prepare_post_with_authority_and_gate(
+        a,
+        authority,
+        jev_gate_for(authority.host.typesafe_api_key.as_deref()),
+    )
 }
 
 fn prepare_post_with_authority_and_gate(
@@ -2970,6 +2984,28 @@ questions:
     /// bd-0glq: P7 default-on — unset flag enriches iff the key is present;
     /// keyless default skips loud (marker, never escalate); explicit values
     /// keep the old contract (truthy = configured lane, else off).
+    #[test]
+    fn authority_key_wins_over_ambient_env_for_the_default_gate() {
+        let _env = crate::config::lock_env();
+        unsafe {
+            env::remove_var(FLAG_ENV);
+            env::set_var(API_KEY_ENV, "process-only");
+        }
+        let authority = RuntimeAuthority::for_test("/tmp/jev-authority", 0);
+        let plan = prepare_post_with_authority(expand_args("/nonexistent-probe"), &authority);
+        assert!(
+            matches!(plan.stage, PostStage::Off),
+            "a keyless authority must not enter the On lane from ambient env"
+        );
+        let out = finish_plan(plan, None, None);
+        assert!(
+            out.reason.contains("jev: unconfigured"),
+            "keyless authority is a loud passthrough: {}",
+            out.reason
+        );
+        unsafe { env::remove_var(API_KEY_ENV) };
+    }
+
     #[test]
     fn gate_default_on_with_key_unconfigured_without() {
         let _env = crate::config::lock_env();

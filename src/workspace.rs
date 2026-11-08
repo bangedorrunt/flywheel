@@ -21,6 +21,18 @@ pub struct Receipt {
     pub result_path: Option<String>,
 }
 
+/// Monotonic receipt progress (`owed -> acked -> resulted`, with `degraded`
+/// terminal). Unknown states have no rank and keep the permissive behavior.
+fn receipt_progress(state: &str) -> Option<u8> {
+    match state {
+        "owed" => Some(0),
+        "acked" => Some(1),
+        "resulted" => Some(2),
+        "degraded" => Some(3),
+        _ => None,
+    }
+}
+
 /// Which resume shape a handoff produced. The default return is the delta,
 /// never a full transcript; FullBrief names itself when it fires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2050,12 +2062,23 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                     why: format!("receipt corr invalid: {error}"),
                 });
             } else {
-                next.assignment.insert(corr.clone(), receipt.clone());
+                let stale = matches!(
+                    (
+                        next.assignment
+                            .get(corr)
+                            .and_then(|current| receipt_progress(&current.state)),
+                        receipt_progress(&receipt.state),
+                    ),
+                    (Some(current), Some(incoming)) if incoming < current
+                );
                 next.wake.waits.remove(corr);
-                cmds.push(Cmd::SqliteUpsert {
-                    corr: corr.clone(),
-                    receipt: receipt.clone(),
-                });
+                if !stale {
+                    next.assignment.insert(corr.clone(), receipt.clone());
+                    cmds.push(Cmd::SqliteUpsert {
+                        corr: corr.clone(),
+                        receipt: receipt.clone(),
+                    });
+                }
             }
         }
         Msg::RoleBound { role, pin } => {
@@ -2698,6 +2721,39 @@ mod tests {
             }
             other => panic!("expected SqliteUpsert got {:?}", other),
         }
+    }
+
+    #[test]
+    fn ws_model_receipt_does_not_regress_a_resulted_assignment() {
+        let mut m = empty_model();
+        let resulted = Receipt {
+            state: "resulted".into(),
+            wake: "tasked".into(),
+            due_at: None,
+            result_path: Some("/tmp/result".into()),
+        };
+        m.assignment.insert("c".into(), resulted.clone());
+        let (next, cmds) = tick(
+            &m,
+            &Msg::Receipt {
+                corr: "c".into(),
+                receipt: Receipt {
+                    state: "owed".into(),
+                    ..Receipt::default()
+                },
+            },
+        );
+        assert_eq!(
+            next.assignment.get("c"),
+            Some(&resulted),
+            "a late owed receipt must not overwrite a resulted assignment"
+        );
+        assert!(
+            !cmds
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::SqliteUpsert { .. })),
+            "a stale receipt must not write a regressed row: {cmds:?}"
+        );
     }
 
     #[test]

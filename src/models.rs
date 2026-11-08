@@ -14,7 +14,7 @@
 //!
 //! governed-by: ADR-0010 (Spec D), ADR-0007
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -362,14 +362,24 @@ impl ModelRegistry {
     /// registry id → the per-harness flag form (honoring `caps`/`fallback`);
     /// unknown id → passthrough (the caller warns; we never block).
     pub fn resolve(&self, id: &str, harness: &str) -> String {
+        let mut visited = BTreeSet::new();
+        self.resolve_inner(id, harness, &mut visited)
+    }
+
+    fn resolve_inner(&self, id: &str, harness: &str, visited: &mut BTreeSet<String>) -> String {
         match self.key_for(id) {
             Some(key) => {
+                if !visited.insert(key.clone()) {
+                    // A cycle must terminate. Return the id at the repeated
+                    // hop: deterministic, and still a real configured name.
+                    return id.to_string();
+                }
                 let entry = &self.models[key.as_str()];
                 if entry.caps.is_empty() || entry.caps.iter().any(|c| c == harness) {
                     entry.flag_for(&key, harness)
                 } else {
                     match &entry.fallback {
-                        Some(fb) => self.resolve(fb, harness),
+                        Some(fb) => self.resolve_inner(fb, harness, visited),
                         None => id.to_string(),
                     }
                 }
@@ -384,19 +394,34 @@ impl ModelRegistry {
     /// silent passthrough. Empty id resolves empty (the caller skips the
     /// flag). Ad-hoc CLI `--model` strings keep the lenient `resolve()`.
     pub fn resolve_strict(&self, id: &str, harness: &str) -> Result<String> {
+        let mut visited = BTreeSet::new();
+        self.resolve_strict_inner(id, harness, &mut visited)
+    }
+
+    fn resolve_strict_inner(
+        &self,
+        id: &str,
+        harness: &str,
+        visited: &mut BTreeSet<String>,
+    ) -> Result<String> {
         if id.is_empty() {
             return Ok(String::new());
         }
         match self.key_for(id) {
             Some(key) => {
+                if !visited.insert(key.clone()) {
+                    anyhow::bail!("model fallback cycle detected at '{id}'");
+                }
                 let entry = &self.models[key.as_str()];
                 if entry.caps.is_empty() || entry.caps.iter().any(|c| c == harness) {
                     Ok(entry.flag_for(&key, harness))
                 } else {
                     match &entry.fallback {
-                        Some(fb) => self.resolve_strict(fb, harness).with_context(|| {
-                            format!("model '{id}' fallback '{fb}' failed to resolve")
-                        }),
+                        Some(fb) => self
+                            .resolve_strict_inner(fb, harness, visited)
+                            .with_context(|| {
+                                format!("model '{id}' fallback '{fb}' failed to resolve")
+                            }),
                         None => anyhow::bail!(
                             "model '{id}' is not routable on harness '{harness}' (caps: {}) \
                              and has no fallback",
@@ -1476,6 +1501,37 @@ mod tests {
 
     /// Strict resolution fails on an unknown provider: a well-formed but
     /// unregistered composite id is an error naming the fix.
+    #[test]
+    fn fallback_cycles_terminate_instead_of_overflowing() {
+        let mut reg = ModelRegistry::default();
+        reg.models.insert(
+            "a/one".into(),
+            ModelEntry {
+                caps: vec!["opencode".into()],
+                fallback: Some("b/two".into()),
+                ..ModelEntry::default()
+            },
+        );
+        reg.models.insert(
+            "b/two".into(),
+            ModelEntry {
+                caps: vec!["opencode".into()],
+                fallback: Some("a/one".into()),
+                ..ModelEntry::default()
+            },
+        );
+        assert_eq!(
+            reg.resolve("a/one", "grok"),
+            "a/one",
+            "lenient resolution terminates at the repeated hop"
+        );
+        let err = reg
+            .resolve_strict("a/one", "grok")
+            .expect_err("strict resolution must reject a fallback cycle");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("cycle"), "{chain}");
+    }
+
     #[test]
     fn resolve_strict_fails_unknown_provider() {
         let reg = reg_with_keys(&["deepseek/deepseek-v4"]);
