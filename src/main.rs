@@ -10584,6 +10584,9 @@ fn cmd_recover(cfg: &Config, project: &str, include_captain: bool) -> Result<()>
         if let Err(e) = state::save_agent_names(&project_dir(cfg, project), &entries) {
             eprintln!("flywheel: recover agent-names mirror save failed: {e:#}");
         }
+        if let Err(e) = state::publish_agent_bindings(project, &entries) {
+            eprintln!("flywheel: recover shared agent bindings failed: {e:#}");
+        }
     }
     print_json(&json!({
         "project": project,

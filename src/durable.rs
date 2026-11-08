@@ -2610,7 +2610,13 @@ pub fn context_verdict(
     state: Option<&crate::agentstate::AgentStateFile>,
     now_unix: u64,
 ) -> ContextVerdict {
-    if terminal.contains("CONTEXT_LIMIT") {
+    // A harness reports this marker at the start of its error line. A plain
+    // substring match killed agents that merely ran `rg CONTEXT_LIMIT` or read
+    // this source file (bd-context-marker-selfkill).
+    if terminal
+        .lines()
+        .any(|line| line.trim_start().starts_with("CONTEXT_LIMIT"))
+    {
         return ContextVerdict::Exhausted;
     }
     if let Some(s) = state
@@ -4496,10 +4502,40 @@ pub fn drain_prompt(bead_id: &str) -> String {
 /// (claim/close) still fire: they target the bead's own lane, never a
 /// second executor. Consultation order: live lease → assignee pane state →
 /// mail guard (the dispatch scan the loop runs on redispatch).
+#[cfg(test)]
 pub fn claim_watch_step(
     watch: &mut std::collections::HashMap<String, ClaimWatch>,
     ready: &[ReadyBead],
     inprogress: &[ReadyBead],
+    states: &[AgentState],
+    nudge_after_polls: u32,
+    overlap: &std::collections::HashSet<String>,
+    live_leases: &std::collections::HashSet<String>,
+) -> Vec<ClaimWatchAction> {
+    claim_watch_step_with_known(
+        watch,
+        ready,
+        inprogress,
+        &[],
+        states,
+        nudge_after_polls,
+        overlap,
+        live_leases,
+    )
+}
+
+/// [`claim_watch_step`] with the explicit `not_ready` snapshot (blocked,
+/// deferred, held, or otherwise non-dispatchable beads that still EXIST).
+///
+/// A bead absent from both ready and in-progress is closed ONLY when it is
+/// absent from this set too. Without it, a Blocked/Deferred transition looks
+/// like closure and revokes the worker's live reservations (bd-claim-watch).
+#[allow(clippy::too_many_arguments)]
+pub fn claim_watch_step_with_known(
+    watch: &mut std::collections::HashMap<String, ClaimWatch>,
+    ready: &[ReadyBead],
+    inprogress: &[ReadyBead],
+    not_ready: &[&ReadyBead],
     states: &[AgentState],
     nudge_after_polls: u32,
     overlap: &std::collections::HashSet<String>,
@@ -4603,6 +4639,13 @@ pub fn claim_watch_step(
                 }
             }
             (None, None) => {
+                if not_ready.iter().any(|b| b.id == *bead_id) {
+                    // The bead still exists; it is merely not schedulable now.
+                    // Keep the watch (and its locks) until it closes.
+                    cw.wait_reason = Some(WaitReason::Blocked);
+                    cw.unclaimed_polls = 0;
+                    continue;
+                }
                 actions.push(ClaimWatchAction::ReleaseReservations {
                     bead_id: bead_id.clone(),
                 });
@@ -6230,6 +6273,9 @@ async fn swarm_loop(
                 0,
             )
             .await;
+            // The suppression exists only for the dead generation. Once the
+            // fresh pane is up, its mail must ring again (bd-ctx-suppressed).
+            ctx_suppressed.remove(&target);
         }
 
         exited_names.clear();
@@ -6560,10 +6606,11 @@ async fn swarm_loop(
                 }
             }
 
-            let watch_actions = claim_watch_step(
+            let watch_actions = claim_watch_step_with_known(
                 &mut claim_watch,
                 &ready,
                 &inprog,
+                &not_ready,
                 &states,
                 params.claim_nudge_after_polls,
                 &overlap,
@@ -6691,6 +6738,10 @@ async fn swarm_loop(
                         }
                     }
                     ClaimWatchAction::ReleaseReservations { bead_id } => {
+                        // A WorkerReceipt grace tick is NOT a close: keep the
+                        // worker's file reservations until the close is legal
+                        // or finally rejected.
+                        let mut release_locks = true;
                         match crate::elm::leaf::run_leaf_journaled(
                             &params.project,
                             "__close-check",
@@ -6809,10 +6860,15 @@ async fn swarm_loop(
                                                 eprintln!(
                                                     "flywheel: {bead_id} missing verdict (WorkerReceipt grace {ticks}/2)"
                                                 );
+                                                release_locks = false;
+                                                let agent = claim_watch
+                                                    .get(&bead_id)
+                                                    .map(|cw| cw.agent.clone())
+                                                    .unwrap_or_default();
                                                 claim_watch.insert(
                                                     bead_id.clone(),
                                                     ClaimWatch {
-                                                        agent: String::new(),
+                                                        agent,
                                                         unclaimed_polls: 0,
                                                         close_nudged: false,
                                                         close_polls: 0,
@@ -6887,16 +6943,18 @@ async fn swarm_loop(
                                 ),
                             }
                         }
-                        match crate::elm::leaf::run_leaf_journaled(
-                            &params.project,
-                            "__release-bead-locks",
-                            &[&params.project, &bead_id],
-                            &format!("release-locks:{bead_id}"),
-                        ) {
-                            Ok(_) => {}
-                            Err(e) => eprintln!(
-                                "flywheel: release of closed bead {bead_id} locks failed (continuing): {e}"
-                            ),
+                        if release_locks {
+                            match crate::elm::leaf::run_leaf_journaled(
+                                &params.project,
+                                "__release-bead-locks",
+                                &[&params.project, &bead_id],
+                                &format!("release-locks:{bead_id}"),
+                            ) {
+                                Ok(_) => {}
+                                Err(e) => eprintln!(
+                                    "flywheel: release of closed bead {bead_id} locks failed (continuing): {e}"
+                                ),
+                            }
                         }
                     }
                 }
@@ -7183,6 +7241,10 @@ async fn swarm_loop(
         queue = next_model.queue.clone();
         per_bead_phase = next_model.per_bead_phase.clone();
         dispatch_pending = next_model.dispatch_pending.clone();
+        // tick_loop_owner may update drain_pending (a write-liveness defer).
+        // Copy it back before the ActiveLoop save or the defer is dropped at
+        // the end of this iteration (bd-drain-pending-shadow).
+        swarm.drain_pending = next_model.drain_pending.clone();
         states = next_model.states.clone();
         {
             let live_agents: std::collections::HashSet<&String> =
@@ -7239,7 +7301,10 @@ async fn swarm_loop(
                             diagnose_count: v.diagnose_count,
                             respawn_count: v.respawn_count,
                             unknown_count: v.unknown_count,
-                            awaiting_clear: false,
+                            // Preserve the Diagnose -> Respawn ladder across
+                            // a resume; hardcoding false restarted it every
+                            // time and could never reach Respawn.
+                            awaiting_clear: v.awaiting_clear,
                         },
                     )
                 })
@@ -9859,7 +9924,17 @@ mod tests {
     fn context_marker_detection() {
         assert_eq!(
             context_verdict("...CONTEXT_LIMIT", None, 1_785_726_000),
-            ContextVerdict::Exhausted
+            ContextVerdict::Healthy,
+            "a marker inside prose/source is not a harness exhaustion signal"
+        );
+        assert_eq!(
+            context_verdict(
+                "if terminal.contains(\"CONTEXT_LIMIT\") {",
+                None,
+                1_785_726_000
+            ),
+            ContextVerdict::Healthy,
+            "reading the source must not self-kill the agent"
         );
         assert_eq!(
             context_verdict("CONTEXT_LIMIT\nall done", None, 1_785_726_000),
@@ -11721,6 +11796,36 @@ mod tests {
                 if bead_id == "bd-12"),
             "close drop fires the release: {:?}",
             actions
+        );
+    }
+
+    /// bd-claim-watch: a bead that still exists as Blocked/Deferred is NOT
+    /// closed. The known-not-ready snapshot must keep the watch (and its file
+    /// reservations) instead of firing a false release.
+    #[test]
+    fn claim_watch_keeps_known_not_ready_bead() {
+        let mut watch: std::collections::HashMap<String, ClaimWatch> =
+            std::collections::HashMap::new();
+        watch.insert("bd-12".into(), cw("oc-1"));
+        let not_ready = [rb2("bd-12", "Blocked")];
+        let refs: Vec<&ReadyBead> = not_ready.iter().collect();
+        let actions = claim_watch_step_with_known(
+            &mut watch,
+            &[],
+            &[],
+            &refs,
+            &[],
+            2,
+            &empty_overlap(),
+            &empty_leases(),
+        );
+        assert!(
+            actions.is_empty(),
+            "a blocked/deferred bead is not a close: {actions:?}"
+        );
+        assert!(
+            watch.contains_key("bd-12"),
+            "keep watching the still-live bead"
         );
     }
 

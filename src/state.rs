@@ -961,6 +961,62 @@ pub fn save_agent_names(dir: &std::path::Path, entries: &[SpawnEntry]) -> Result
     Ok(())
 }
 
+/// Publish the mirror's pinned identities into the shared `agent_bindings`
+/// table. The project-local JSON remains the crash-recovery mirror; toron-core
+/// reads the shared table, never flywheel's state home.
+///
+/// Best-effort by contract: a missing/old store must not block a spawn. The
+/// caller reports the error and the JSON mirror still exists.
+pub fn publish_agent_bindings(project: &str, entries: &[SpawnEntry]) -> anyhow::Result<()> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        anyhow::bail!("agent-binding publish needs a synchronous command context");
+    }
+    let (_, db_path) = crate::mail::mailbox_roots();
+    let db = db_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("shared index path is not UTF-8"))?
+        .to_string();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        let pool = toron_core::index::schema::connect(&db).await?;
+        toron_core::index::schema::migrate(&pool).await?;
+        let now_us = toron_core::mailbox::lease_liveness::host_now_us();
+        for entry in entries {
+            let Some(pin) = entry
+                .mail_identity
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+            else {
+                continue;
+            };
+            let mut binding = toron_core::mailbox::agent_bindings::AgentBinding::pane(
+                project,
+                pin,
+                &entry.pane_id,
+            );
+            binding.name = entry.name.clone();
+            binding.profile = entry.profile.clone();
+            binding.harness = entry.harness.clone();
+            binding.model = entry.model.clone();
+            binding.model_pin = entry.model_pin.clone();
+            binding.skills_digest = entry.skills_digest.clone();
+            binding.harness_session = entry.harness_session.clone();
+            binding.incarnation = entry.incarnation as i64;
+            binding.skills_injected = entry.skills_injected;
+            binding.binding_location = if entry.pane_id.is_empty() {
+                "hosted".to_string()
+            } else {
+                "pane".to_string()
+            };
+            toron_core::mailbox::agent_bindings::upsert(&pool, project, &binding, now_us).await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+}
+
 /// Read the project-local pane→name mapping (missing/corrupt → empty).
 pub fn load_agent_names(dir: &std::path::Path) -> Vec<SpawnEntry> {
     let path = agent_names_file(dir);

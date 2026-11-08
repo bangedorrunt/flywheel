@@ -1233,6 +1233,7 @@ mod tests {
                 "cargo test -p flywheel verifier && sleep 3600".into()
             },
             blast,
+            ac_shape: AcShape::Checkable,
             owner: None,
             head_sha: None,
         }

@@ -150,13 +150,13 @@ pub fn parse_ts(ts: &str) -> Option<u64> {
 }
 
 /// Is the state file fresh relative to `now_unix` (seconds)? A file exactly
-/// `max_age` old is still fresh; anything older is stale. Timestamps in the
-/// future (clock skew) count as fresh — a future `ts` is never a stale signal,
-/// so it must never trigger a respawn.
+/// `max_age` old is still fresh; anything older is stale. A timestamp in the
+/// future is clock skew, not evidence: it is INVALID and never fresh, so a
+/// bogus future `ts` can never authorize a context-limit respawn.
 pub fn is_fresh_at(ts: &str, now_unix: u64, max_age: Duration) -> bool {
     match parse_ts(ts) {
-        Some(t) => now_unix.saturating_sub(max_age.as_secs()) <= t,
-        None => false,
+        Some(t) if t <= now_unix => now_unix.saturating_sub(max_age.as_secs()) <= t,
+        Some(_) | None => false,
     }
 }
 
@@ -323,7 +323,10 @@ mod tests {
         assert!(!is_fresh_at(ts, 1_785_726_000 + 901, max));
         assert!(!is_fresh_at(ts, 1_785_726_000 + 3600, max));
         assert!(is_fresh_at(ts, 1_785_726_000, max));
-        assert!(is_fresh_at(ts, 1_785_726_000 - 60, max));
+        assert!(
+            !is_fresh_at(ts, 1_785_726_000 - 60, max),
+            "a future timestamp is clock skew, not fresh evidence"
+        );
     }
 
     #[test]

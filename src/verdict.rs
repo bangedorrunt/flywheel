@@ -52,6 +52,10 @@ pub struct BeadUnit {
     /// VERIFY command. Required; missing/empty is refuse-to-dispatch.
     pub verify: String,
     pub blast: Blast,
+    /// AC shape from the bead row. A judgment AC legally closes only with
+    /// ReviewerSigned; hardcoding Checkable made every judgment close look
+    /// illegal and reopened it on the next tick (bd-close-shape).
+    pub ac_shape: AcShape,
     pub owner: Option<AgentName>,
     /// SHA of the commit whose message carries the bead id (SHA rule).
     pub head_sha: Option<String>,
@@ -670,6 +674,10 @@ fn load_bead(cwd: &Path, bead_id: &str, require_verify: bool) -> anyhow::Result<
         title: String,
         priority: u8,
         verify: Option<String>,
+        #[serde(default)]
+        blast: Option<String>,
+        #[serde(default)]
+        ac_shape: Option<String>,
     }
     let stdout = crate::br::run_br(Some(cwd), &["show", bead_id, "--json"])?;
     let v: serde_json::Value = serde_json::from_str(stdout.trim())?;
@@ -692,7 +700,14 @@ fn load_bead(cwd: &Path, bead_id: &str, require_verify: bool) -> anyhow::Result<
         title: row.title,
         priority: row.priority,
         verify,
-        blast: Blast::Normal,
+        blast: match row.blast.as_deref() {
+            Some("high") => Blast::High,
+            _ => Blast::Normal,
+        },
+        ac_shape: match row.ac_shape.as_deref() {
+            Some("judgment") => AcShape::Judgment,
+            _ => AcShape::Checkable,
+        },
         owner: None,
         head_sha: None,
     })
@@ -1292,7 +1307,7 @@ pub fn close_check(cwd: &Path, bead_id: &str) -> anyhow::Result<CloseCheck> {
             return Err(e);
         }
     };
-    let bead = match bead_from_br_show(cwd, bead_id) {
+    let bead = match bead_from_br_show_for_close(cwd, bead_id) {
         Ok(b) => b,
         Err(_) => {
             return Ok(CloseCheck::Missing {
@@ -1301,7 +1316,8 @@ pub fn close_check(cwd: &Path, bead_id: &str) -> anyhow::Result<CloseCheck> {
             });
         }
     };
-    if ledger_check(cwd, &bead, AcShape::Checkable, &sha)? {
+    let ac_shape = bead.ac_shape;
+    if ledger_check(cwd, &bead, ac_shape, &sha)? {
         return Ok(CloseCheck::Legal { sha });
     }
     let receipt = Verdict {
@@ -1313,7 +1329,7 @@ pub fn close_check(cwd: &Path, bead_id: &str) -> anyhow::Result<CloseCheck> {
         receipt_path: PathBuf::new(),
         verify_cmd: bead.verify.clone(),
     };
-    let receipt_eligible = legal_close(&receipt, &bead, AcShape::Checkable);
+    let receipt_eligible = legal_close(&receipt, &bead, ac_shape);
     Ok(CloseCheck::Missing {
         sha,
         receipt_eligible,
@@ -1417,6 +1433,7 @@ mod tests {
                 "cargo test -p flywheel verdict:: && sleep 3600".into()
             },
             blast,
+            ac_shape: AcShape::Checkable,
             owner: None,
             head_sha: None,
         }

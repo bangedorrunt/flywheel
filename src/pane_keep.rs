@@ -1,11 +1,15 @@
-//! An hc pane binding may clear; a mail-only pin never does. bd-j0b5.
+//! A pane binding may clear only on positive evidence from the ACTIVE plane.
+//! bd-j0b5 / bd-rex-pane-reap.
 //!
-//! A pin from a harness hc cannot inject (`freebuff`) or from a different
-//! multiplexer (`superlogical`) has no hc terminal on purpose, so "hc lists
-//! no pane" is not evidence of death. Clearing on absence alone would retire a
-//! live pin. One rule, shared by every clear (and by the supervisor heartbeat
-//! page): a binding clears only for a harness hc can inject, on hc, with
-//! a non-empty pane id the known live set omits.
+//! On hc, a pin from a harness hc cannot inject (`freebuff`) has no hc
+//! terminal on purpose, so "hc lists no pane" is not evidence of death. On
+//! rex (called `superlogical` by older configs), the plane owns the pane for
+//! every harness: a missing rex block is death, and refusing to clear there
+//! stranded every dead rex row and suppressed stale-heartbeat pages.
+//!
+//! One rule, shared by every clear (and by the supervisor heartbeat page):
+//! the plane can prove death, the binding names a non-empty pane id, and the
+//! known live set omits it.
 
 use std::collections::HashSet;
 
@@ -23,8 +27,14 @@ pub fn pane_binding_may_clear(
     pane_id: &str,
     live_panes: Option<&HashSet<String>>,
 ) -> bool {
-    backend == "hc"
-        && HC_INJECTABLE.contains(&harness)
+    let plane_proves_death = match backend {
+        "hc" => HC_INJECTABLE.contains(&harness),
+        // rex has no injectable-harness carve-out: it lists every block it
+        // owns, so an omitted block is positive evidence for any harness.
+        "rex" | "superlogical" => true,
+        _ => false,
+    };
+    plane_proves_death
         && !pane_id.is_empty()
         && live_panes.is_some_and(|live| !live.contains(pane_id))
 }
@@ -38,7 +48,7 @@ mod tests {
     }
 
     #[test]
-    fn a_freebuff_or_superlogical_pin_is_kept_when_plane_has_no_pane() {
+    fn hc_keeps_non_injectable_pins_but_rex_clears_any_missing_pane() {
         let none_live = live(&[]);
         assert!(!pane_binding_may_clear(
             "freebuff",
@@ -52,6 +62,14 @@ mod tests {
             "w1:p1",
             Some(&none_live)
         ));
+        assert!(
+            pane_binding_may_clear("freebuff", "rex", "w1:p1", Some(&none_live)),
+            "rex lists every block it owns, so a missing block is death"
+        );
+        assert!(
+            pane_binding_may_clear("freebuff", "superlogical", "w1:p1", Some(&none_live)),
+            "the legacy rex name is the same plane"
+        );
         assert!(pane_binding_may_clear(
             "opencode",
             "hc",
@@ -73,7 +91,7 @@ mod tests {
             "w1:p1",
             Some(&present)
         ));
-        assert!(!pane_binding_may_clear(
+        assert!(pane_binding_may_clear(
             "opencode",
             "superlogical",
             "w1:p1",

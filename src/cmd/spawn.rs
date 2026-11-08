@@ -225,6 +225,9 @@ pub(crate) fn cmd_add_rex(
     if let Err(e) = state::save_agent_names(&dir, &registry) {
         eprintln!("flywheel: cannot save .flywheel/agent-names.json: {e:#}");
     }
+    if let Err(e) = state::publish_agent_bindings(project, &registry) {
+        eprintln!("flywheel: cannot publish shared agent bindings: {e:#}");
+    }
     crate::log(
         project,
         state::EventKind::Add,
@@ -429,6 +432,9 @@ pub(crate) fn cmd_add(
     let registry = state::load_spawn_registry(project);
     if let Err(e) = state::save_agent_names(&dir, &registry) {
         eprintln!("flywheel: cannot save .flywheel/agent-names.json: {e:#}");
+    }
+    if let Err(e) = state::publish_agent_bindings(project, &registry) {
+        eprintln!("flywheel: cannot publish shared agent bindings: {e:#}");
     }
     crate::log(
         project,
@@ -1404,6 +1410,9 @@ projects available: {}",
     if let Err(e) = state::save_agent_names(&dir, &registry) {
         eprintln!("flywheel: cannot save .flywheel/agent-names.json: {e:#}");
     }
+    if let Err(e) = state::publish_agent_bindings(project, &registry) {
+        eprintln!("flywheel: cannot publish shared agent bindings: {e:#}");
+    }
     doorbell::register_workspace_subscriptions(
         &config::state_dir(),
         project,
@@ -2098,6 +2107,9 @@ pub(crate) fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Res
     }
     if let Err(e) = state::save_agent_names(&dir, &registry) {
         eprintln!("flywheel: cannot save .flywheel/agent-names.json: {e:#}");
+    }
+    if let Err(e) = state::publish_agent_bindings(project, &registry) {
+        eprintln!("flywheel: cannot publish shared agent bindings: {e:#}");
     }
     doorbell::register_workspace_subscriptions(
         &config::state_dir(),
