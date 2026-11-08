@@ -5,9 +5,10 @@
 //! a dispatcher whose pid file names no live process pages once; a live pid
 //! clears the hold so a later death pages again. A heartbeat older than the
 //! toron presence TTL pages only when [`pane_binding_may_clear`] says the
-//! binding is an hc pane hc actually answered for. A pin hc cannot
-//! see on purpose (freebuff, superlogical, unknown harness) has no hc
-//! heartbeat and is never a stall.
+//! binding is an hc pane hc actually answered for, or a rex block it omitted.
+//! A pin hc cannot see on purpose (freebuff, unknown harness) has no hc
+//! heartbeat and is never a stall; rex lists every block it owns, so its
+//! missing pane may page.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
@@ -390,8 +391,8 @@ mod tests {
             "a freebuff pin with no heartbeat is not a stall: {events:?}"
         );
         assert!(
-            page_pin(&events, "SuperPin").is_none(),
-            "a superlogical backend never pages"
+            page_pin(&events, "SuperPin").is_some(),
+            "rex (superlogical) owns every block, so its missing pane may page: {events:?}"
         );
         assert!(
             !crate::pane_keep::pane_binding_may_clear("freebuff", "hc", "w1:p9", Some(&live)),

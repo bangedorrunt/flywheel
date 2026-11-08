@@ -4931,8 +4931,18 @@ mod tests {
             dead,
             vec![("wGone:p2".to_string(), "gone-opencode".to_string())]
         );
-        let none = find_dead_rows(&entries, &live, "superlogical");
-        assert_eq!(none, [] as [(String, String); 0]);
+        // rex (called superlogical by older configs) lists every block it
+        // owns, so every missing pane is clearable — including a mail-only
+        // harness that hc deliberately cannot inject.
+        let rex = find_dead_rows(&entries, &live, "superlogical");
+        assert_eq!(
+            rex,
+            vec![
+                ("wDead:p1".to_string(), "freebuff-pin".to_string()),
+                ("wGone:p2".to_string(), "gone-opencode".to_string()),
+                ("wLegacy:p3".to_string(), "legacy-pin".to_string()),
+            ]
+        );
     }
 
     /// bd-lvyi: a per-step harness override resolves to a crew pane OF THAT
