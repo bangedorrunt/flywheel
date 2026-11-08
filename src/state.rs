@@ -1061,6 +1061,15 @@ pub fn load_captain_alias(project: &str) -> Option<String> {
         .map(std::string::ToString::to_string)
 }
 
+/// Explicit-clear tombstone. A brand-new project has no alias and was never
+/// cleared; only `clear_captain_alias_file` writes this marker, so the two
+/// states stay distinguishable (ADR-0025 Spec 4 Wave 4a).
+fn captain_alias_cleared_marker(project: &str) -> PathBuf {
+    state_dir()
+        .join("captain_alias")
+        .join(format!("{}.cleared", state_key(project)))
+}
+
 pub fn save_captain_alias(project: &str, pin: &str) -> Result<()> {
     let path = captain_alias_file(project);
     if let Some(parent) = path.parent() {
@@ -1068,16 +1077,22 @@ pub fn save_captain_alias(project: &str, pin: &str) -> Result<()> {
     }
     let body = serde_json::to_string_pretty(&serde_json::json!({ "pin": pin }))?;
     crate::project_state::write_atomic(&path, body.as_bytes())?;
+    let _ = std::fs::remove_file(captain_alias_cleared_marker(project));
     Ok(())
 }
 
 pub fn clear_captain_alias_file(project: &str) {
     let path = captain_alias_file(project);
     let _ = std::fs::remove_file(&path);
+    let marker = captain_alias_cleared_marker(project);
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = crate::project_state::write_atomic(&marker, b"cleared");
 }
 
 pub fn is_captain_alias_cleared(project: &str) -> bool {
-    load_captain_alias(project).is_none()
+    load_captain_alias(project).is_none() && captain_alias_cleared_marker(project).exists()
 }
 
 /// GS-048: last committed session topology for sticky-open across CLI reclassify
@@ -2833,6 +2848,30 @@ mod tests {
     /// A row that is current for only ONE key still proves a live binding.
     /// The old AND filter erased I1 when the rows were (P1,I1), (P2,I1),
     /// (P2,I2): row 0 failed identity_current, row 1 failed pane_current.
+    /// A fresh project has no captain and was never cleared. Only an explicit
+    /// clear writes the tombstone; a later save removes it.
+    #[test]
+    fn a_fresh_project_is_not_a_cleared_captain_alias() {
+        let _g = crate::config::test_state_home();
+        let project = format!("alias-fresh-{}", std::process::id());
+        assert!(
+            !is_captain_alias_cleared(&project),
+            "never-set is not the same state as explicitly cleared"
+        );
+        save_captain_alias(&project, "BraveCaptain").unwrap();
+        assert!(!is_captain_alias_cleared(&project));
+        clear_captain_alias_file(&project);
+        assert!(
+            is_captain_alias_cleared(&project),
+            "an explicit clear is recorded"
+        );
+        save_captain_alias(&project, "NewCaptain").unwrap();
+        assert!(
+            !is_captain_alias_cleared(&project),
+            "rebinding removes the clear marker"
+        );
+    }
+
     #[test]
     fn spawn_registry_dedupe_keeps_a_live_identity_on_its_own_pane() {
         let first = SpawnEntry::profiled("w1:p1", "one", "coder", "omp", Some("I1".into()));
