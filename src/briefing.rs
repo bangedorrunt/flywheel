@@ -170,6 +170,26 @@ pub struct Briefing {
     /// One mode line plus the one skill to read. Open or captain, never both.
     #[serde(default)]
     pub mode_text: String,
+    /// Skills to load before acting. `toron` and `br` are always present: mail,
+    /// reservations, the bead ledger, and the mode file are all part of the
+    /// session's operating contract.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_skills: Vec<String>,
+}
+
+/// The session skill bundle. Keep this additive to [`mode_text`]: existing
+/// drivers still read one mode line, while a driver that can load several
+/// skills gets the ledger skill without having to remember it.
+pub fn required_skills(mode: Mode) -> Vec<String> {
+    let mode_skill = match mode {
+        Mode::Swarm => "flywheel-captain",
+        Mode::Open => "flywheel-open",
+    };
+    vec![
+        mode_skill.to_string(),
+        "toron".to_string(),
+        "br".to_string(),
+    ]
 }
 
 fn held_summary(paths: &[String]) -> String {
@@ -528,6 +548,7 @@ pub fn assemble(
         stale_build: None,
         harness_ranking: None,
         mode_text: mode_text(mode_of(&topology)).to_string(),
+        required_skills: required_skills(mode_of(&topology)),
         questions: vec![
             Question {
                 id: "topology".into(),
@@ -603,6 +624,7 @@ pub fn align_with_session_topology(b: &mut Briefing, session: &str, sticky_held:
     b.proposal.topology = session_topology.to_string();
     b.proposal.join = session_join;
     b.mode_text = mode_text(mode_of(session_topology)).to_string();
+    b.required_skills = required_skills(mode_of(session_topology));
     if let Some(q) = b.questions.iter_mut().find(|q| q.id == "topology") {
         q.default = session_topology.to_string();
     }
@@ -762,6 +784,7 @@ fn rebuild_argv_for_topology(b: &mut Briefing, topology: &str) {
     b.proposal.topology = topo.to_string();
     b.proposal.join = join;
     b.mode_text = mode_text(mode_of(topo)).to_string();
+    b.required_skills = required_skills(mode_of(topo));
     match topology {
         "open" => {
             b.proposal.workflow = "none".into();
@@ -900,6 +923,22 @@ mod tests {
         assert!(mode_text(Mode::Open).contains("skill://flywheel-open"));
         assert!(mode_text(Mode::Swarm).contains("skill://flywheel-captain"));
         assert!(!mode_text(Mode::Open).contains("flywheel-captain"));
+        assert_eq!(
+            required_skills(Mode::Open),
+            vec![
+                "flywheel-open".to_string(),
+                "toron".to_string(),
+                "br".to_string()
+            ]
+        );
+        assert_eq!(
+            required_skills(Mode::Swarm),
+            vec![
+                "flywheel-captain".to_string(),
+                "toron".to_string(),
+                "br".to_string()
+            ]
+        );
     }
 
     /// bd-compose-plumbing-zdzi: an empty FLEET, not an anonymous caller —

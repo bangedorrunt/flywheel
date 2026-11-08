@@ -82,6 +82,8 @@ Commands:
   debate             N-round A/B debate + judge (ADR-0001 §9.1 — threaded, ack-gated)
   plan-review        Plan → review gate → implement → verify (ADR-0001 §9.2; paper-first)
   upgrade            Reinstall the binary from source (cargo install --path)
+  stack              One operator door for the installed flywheel, doorbell, and toron stack, with `--json`/`--check`; `install` delegates to the audited stack script
+  ship               Fail-closed ship gate: bead in HEAD, clean tracker snapshot, committed closed row, and a legal ledger verdict for this SHA
   tutorial           Interactive walkthrough
   daemon             Daemon lifecycle (toron-parity): start|stop|restart|status over the `serve` HTTP surface AND the `cron start` host. `start` installs and supervises both units (`dev.flywheel.daemon`, `dev.flywheel.cron`); macOS launchd / Linux systemd user unit / pidfile fallback. `restart` VERIFIES the new daemon answers. (feature: serve — compiled out without it)
   serve              Local REST + SSE server (feature: serve)

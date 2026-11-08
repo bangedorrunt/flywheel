@@ -134,16 +134,7 @@ pub fn clear_pid(path: &Path) {
 }
 
 pub fn pid_alive(pid: u32) -> bool {
-    if pid <= 1 {
-        return false;
-    }
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    crate::state::pid_alive(pid)
 }
 
 fn kill_pid(pid: u32) {

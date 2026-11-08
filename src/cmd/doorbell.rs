@@ -74,8 +74,9 @@ pub(crate) enum DoorbellCmd {
     /// GS-007 bd-yw4s: the trust surface, not log tailing. Folds tick from Default.
     Why {
         project: String,
-        /// pin (adjective+noun) to explain (use with --corr/--seq for assignment replay)
-        pin: String,
+        /// pin (adjective+noun) to explain; omit to explain all pins in scope
+        /// (use with --corr/--seq for assignment replay)
+        pin: Option<String>,
         /// max entries to show (newest last)
         #[arg(long, default_value = "20")]
         limit: usize,
@@ -89,6 +90,15 @@ pub(crate) enum DoorbellCmd {
         /// untagged legacy rows are excluded under a filter
         #[arg(long)]
         subscriber: Option<String>,
+        /// only rows from this workspace (session id or label)
+        #[arg(long)]
+        workspace: Option<String>,
+        /// only rows at/after this RFC3339 timestamp
+        #[arg(long)]
+        since: Option<String>,
+        /// machine-readable replay with matched/shown/withheld counts
+        #[arg(long)]
+        json: bool,
     },
     /// operator console inject (D8, bd-woha): journal a Fact row plus queue
     /// one pending wake — digest-visible with zero swarm. Same-second
@@ -1202,22 +1212,62 @@ mod wake_brain_status_tests {
     }
 }
 
-/// bd-yw4s: `doorbell why <pin>` — replay the doorbell journal and explain
-/// what the tick decided for this pin (prompted / queued / drained / died /
-/// sla). The trust surface; never log tailing. Folds tick from Default
+/// bd-yw4s: `doorbell why [pin]` — replay the doorbell journal and explain
+/// what the tick decided (prompted / queued / drained / died / sla). Omitting
+/// the pin explains every pin in scope. The trust surface; never log tailing.
+/// Folds tick from Default
 /// over state_dir/journals/doorbell-journal-{workspace}.jsonl and asserts
 /// the same Cmd sequence as the live run (replay, not grep). Supports
 /// --corr and --seq for assignment replay.
+#[derive(Debug, Clone)]
+struct WhyDisplayRow {
+    workspace: String,
+    ts: String,
+    ts_us: Option<i64>,
+    seq: u64,
+    kind: String,
+    status: String,
+    actions: String,
+    dropped: Vec<String>,
+    folded: bool,
+    console: bool,
+}
+
+/// Global journal order is workspace-grouped; a global head limit therefore
+/// hides every later workspace. Sort the matched rows by time and keep the
+/// newest `limit`, so a multi-workspace project cannot silently lose a scope.
+fn why_newest(mut rows: Vec<WhyDisplayRow>, limit: usize) -> (Vec<WhyDisplayRow>, usize) {
+    rows.sort_by(|a, b| {
+        a.ts_us
+            .cmp(&b.ts_us)
+            .then_with(|| a.workspace.cmp(&b.workspace))
+            .then_with(|| a.seq.cmp(&b.seq))
+    });
+    let withheld = rows.len().saturating_sub(limit);
+    let start = rows.len().saturating_sub(limit);
+    let shown = rows.split_off(start);
+    (shown, withheld)
+}
+
 pub(crate) fn cmd_doorbell_why(
     cfg: &Config,
     project: &str,
-    pin: &str,
+    pin: Option<&str>,
     limit: usize,
     corr: Option<&str>,
     seq: Option<u64>,
     subscriber: Option<&str>,
+    workspace_filter: Option<&str>,
+    since: Option<&str>,
+    json: bool,
 ) -> Result<()> {
     crate::check_project_spelling(project, "doorbell why")?;
+    let since_us = since
+        .map(|s| {
+            doorbell_core::parse_rfc3339_micros(s)
+                .map_err(|e| anyhow::anyhow!("doorbell why: invalid --since {s:?}: {e}"))
+        })
+        .transpose()?;
     let scoped = doorbell_scoped_workspaces(cfg, project);
     let entries = doorbell::journal_read_all(&config::state_dir());
     {
@@ -1262,9 +1312,13 @@ pub(crate) fn cmd_doorbell_why(
     let mut models: std::collections::BTreeMap<String, workspace::WorkspaceModel> =
         std::collections::BTreeMap::new();
     let mut replay_seq: u64 = 0;
-    let mut shown = 0usize;
-    let mut matched = 0usize;
+    let mut rows: Vec<WhyDisplayRow> = Vec::new();
     for (workspace, entry) in &entries {
+        if let Some(wanted) = workspace_filter
+            && workspace != wanted
+        {
+            continue;
+        }
         if !journal_row_in_scope(workspace, entry, &scoped, project) {
             continue;
         }
@@ -1391,17 +1445,24 @@ pub(crate) fn cmd_doorbell_why(
                 })
                 .cloned()
                 .collect();
-            why_entry_mentions_pin(pin, replay_msg.as_ref(), &effective, &entry_pins)
+            pin.is_none_or(|pin| {
+                why_entry_mentions_pin(pin, replay_msg.as_ref(), &effective, &entry_pins)
+            })
         };
         if !corr_match || !seq_match || !pin_match {
             continue;
         }
-        matched += 1;
-        shown += 1;
-        if shown > limit {
+        let ts = entry
+            .get("ts")
+            .and_then(|t| t.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let ts_us = doorbell_core::parse_rfc3339_micros(&ts).ok();
+        if let Some(since_us) = since_us
+            && ts_us.is_none_or(|t| t < since_us)
+        {
             continue;
         }
-        let ts = entry.get("ts").and_then(|t| t.as_str()).unwrap_or("?");
         let msg = entry.get("msg").cloned().unwrap_or(serde_json::Value::Null);
         let actions = entry
             .get("actions")
@@ -1457,27 +1518,83 @@ pub(crate) fn cmd_doorbell_why(
                 },
             }
         };
-        let status = why_plane_status(&msg).unwrap_or("");
-        println!(
-            "{workspace} {ts} seq={} {kind}{} actions=[{actions}]{}{}{}",
-            replay_seq - 1,
-            if status.is_empty() {
-                String::new()
-            } else {
-                format!(" ->{status}")
-            },
-            if dropped.is_empty() {
-                String::new()
-            } else {
-                format!(" dropped=[{}]", dropped.join(","))
-            },
-            if folded { "" } else { " [journaled]" },
-            if workspace == DOORBELL_CONSOLE_SCOPE {
-                " [console-inject]"
-            } else {
-                ""
-            },
-        );
+        rows.push(WhyDisplayRow {
+            workspace: workspace.clone(),
+            ts,
+            ts_us,
+            seq: replay_seq - 1,
+            kind: kind.to_string(),
+            status: why_plane_status(&msg).unwrap_or("").to_string(),
+            actions,
+            dropped,
+            folded,
+            console: workspace == DOORBELL_CONSOLE_SCOPE,
+        });
+    }
+    let matched = rows.len();
+    let mut workspaces: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for row in &rows {
+        *workspaces.entry(row.workspace.clone()).or_default() += 1;
+    }
+    let (shown, withheld) = why_newest(rows, limit);
+    if json {
+        let out_rows: Vec<serde_json::Value> = shown
+            .iter()
+            .map(|row| {
+                let actions: Vec<&str> = if row.actions.is_empty() {
+                    Vec::new()
+                } else {
+                    row.actions.split(',').collect()
+                };
+                serde_json::json!({
+                    "workspace": row.workspace,
+                    "ts": row.ts,
+                    "seq": row.seq,
+                    "kind": row.kind,
+                    "status": if row.status.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Value::String(row.status.clone())
+                    },
+                    "actions": actions,
+                    "dropped": row.dropped,
+                    "folded": row.folded,
+                    "console": row.console,
+                })
+            })
+            .collect();
+        crate::output::print_json(&serde_json::json!({
+            "schema": "flywheel-doorbell-why.v1",
+            "project": project,
+            "pin": pin,
+            "limit": limit,
+            "matched": matched,
+            "shown": shown.len(),
+            "withheld": withheld,
+            "workspace": workspace_filter,
+            "since": since,
+            "workspaces": workspaces,
+            "rows": out_rows,
+        }));
+        return Ok(());
+    }
+    for row in &shown {
+        let mut line = format!("{} {} seq={} {}", row.workspace, row.ts, row.seq, row.kind);
+        if !row.status.is_empty() {
+            line.push_str(&format!(" ->{}", row.status));
+        }
+        line.push_str(&format!(" actions=[{}]", row.actions));
+        if !row.dropped.is_empty() {
+            line.push_str(&format!(" dropped=[{}]", row.dropped.join(",")));
+        }
+        if !row.folded {
+            line.push_str(" [journaled]");
+        }
+        if row.console {
+            line.push_str(" [console-inject]");
+        }
+        println!("{line}");
     }
     if matched == 0 {
         if let Some(c) = corr {
@@ -1485,8 +1602,28 @@ pub(crate) fn cmd_doorbell_why(
         } else if let Some(s) = seq {
             println!("no journal entry at seq {s}");
         } else {
+            match pin {
+                Some(pin) => println!(
+                    "no doorbell journal entries mention pin {pin} (unaddressed, filtered before classify, or journal empty)"
+                ),
+                None => println!(
+                    "no doorbell journal entries in scope (workspace/since filters may be empty)"
+                ),
+            }
+        }
+    } else {
+        let ws_summary = workspaces
+            .iter()
+            .map(|(ws, n)| format!("{ws}={n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "why: matched {matched}, shown {} of {matched}, withheld {withheld} (limit {limit}); workspaces {ws_summary}",
+            shown.len()
+        );
+        if withheld > 0 {
             println!(
-                "no doorbell journal entries mention pin {pin} (unaddressed, filtered before classify, or journal empty)"
+                "why: {withheld} older row(s) withheld — raise --limit or narrow with --workspace/--since"
             );
         }
     }
@@ -3024,6 +3161,38 @@ mod why_resume_tests {
         assert_eq!(
             why_plane_status(&serde_json::json!({"rt_kind": "PlaneStatus"})),
             None
+        );
+    }
+
+    #[test]
+    fn why_limit_keeps_newest_rows_across_workspaces() {
+        let row = |workspace: &str, ts: &str, seq: u64| super::WhyDisplayRow {
+            workspace: workspace.to_string(),
+            ts: ts.to_string(),
+            ts_us: doorbell_core::parse_rfc3339_micros(ts).ok(),
+            seq,
+            kind: "status".into(),
+            status: "idle".into(),
+            actions: String::new(),
+            dropped: Vec::new(),
+            folded: true,
+            console: false,
+        };
+        let rows = vec![
+            row("elm-comms-kernel", "2026-11-08T16:33:21Z", 1),
+            row("elm-comms-kernel", "2026-11-08T16:36:26Z", 2),
+            row("flywheel-toron", "2026-11-08T18:19:39Z", 3),
+            row("session:01", "2026-11-08T18:20:49Z", 4),
+        ];
+        let (shown, withheld) = super::why_newest(rows, 2);
+        assert_eq!(withheld, 2, "the two older rows are withheld");
+        assert_eq!(
+            shown
+                .iter()
+                .map(|r| r.workspace.as_str())
+                .collect::<Vec<_>>(),
+            vec!["flywheel-toron", "session:01"],
+            "limit must keep the newest rows, not the first workspace in BTreeSet order"
         );
     }
 

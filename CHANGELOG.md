@@ -5,7 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.4] — 2026-11-09
+
+### Added
+- **`flywheel stack status|install` and `flywheel ship check`.** The operator scripts now have discoverable typed doors. `stack status` is native, supports `--json` and `--check`, and fails on a replaced toron build as well as stale doorbell hosts. `ship check` proves the bead is in HEAD, `.beads` is clean, the closed row exists in `HEAD:.beads/issues.jsonl`, and the live ledger verdict is legal. `scripts/stack.sh` remains the one install authority; `scripts/ship-check.sh` is a thin wrapper.
+- **`scripts/clean-proof.sh`.** Snapshots intended working-tree files through a throwaway `GIT_INDEX_FILE`, archives the temporary commit, links sibling `toron` / `elm-effect-rs`, and runs `check --workspace` plus optional doorbell tests. Tracker and lavish artifacts stay out.
+- **`doorbell why` without a pin.** Omitting `<PIN>` explains every pin in scope, so a workspace-scoped question no longer requires an arbitrary pin.
+- **`required_skills` includes `toron`.** Briefings now name the mode skill, `toron`, and `br`, matching the mail/reservation/ledger contract.
+
+### Fixed
+- **Stale-host recovery no longer trusts a PID or claims success on a vanished host.** It verifies the process command is `flywheel __doorbell` before killing, restarts only `dev.flywheel.doorbell.<project>` for the stale host's project, and waits up to 90s for the same workspace to return live on the new hash. `install` fails if recovery fails instead of ignoring it.
+- **`/health` and leases reject zombies.** The shared doorbell liveness check uses `ps -o stat=` instead of `kill -0`, so a stopped child lingering as `Z` is reported as exited rather than live; native `stack status` also compares the installed flywheel version with the running source version.
+
+## [0.10.3] — 2026-11-09
+
+### Added
+- **One stack command and one ship gate.** `scripts/stack.sh install` builds flywheel, doorbell, and sibling toron, codesigns them on macOS, restarts installed launchd units, stops live hosts whose watcher generation is stale, restarts their per-project supervisors, and verifies the live generations; `status --check` fails on a missing binary, a down health endpoint, a stale live host, or a failed toron daemon. `scripts/ship-check.sh <bead>` refuses a ship unless the bead is in HEAD, `.beads` is clean, and the ledger verdict is legal.
+
+### Fixed
+- **`doorbell why` no longer hides workspaces behind the limit.** Journal rows are workspace-grouped; the old head slice showed only the first workspace. Rows are now ordered by timestamp and the limit keeps the newest entries, with `matched`/`shown`/`withheld` counts, `--workspace`, `--since`, and `--json`.
+- **`/health` names exited hosts and their build generations.** The new `hosts` array includes live, exited, and unknown dispatcher state files, and macOS host identity resolves through `hostname` instead of the absent `/etc/hostname`.
+- **`doorbell --version` works.** The daemon surface now exposes the same version string its `/health` build stamp reports.
+- **Briefings name the ledger skill.** `required_skills` returns the mode skill plus `br`, so a fresh session loads the close ceremony instead of relying on memory.
 
 ## [0.10.2] — 2026-11-09
 

@@ -141,14 +141,15 @@ use cmd::DaemonCmd;
 use cmd::{
     AgentCmd, ArtifactsCmd, BackendCmd, CaptainCmd, CheckpointCmd, CoalitionCmd, ConfigCmd,
     CrewCmd, CronCmd, DoorbellCmd, JudgmentCmd, LedgerCmd, LoopCmd, MailCmd, ModelCmd, PolicyCmd,
-    PrinciplesCmd, ProfileCmd, RunsCmd, SlotCmd, SquadCmd, StageCmd, StandingOrdersCmd, WorkCmd,
-    WorkflowCmd, WorktreeCmd, XprojCmd, cmd_agent, cmd_analytics, cmd_audit, cmd_backend,
-    cmd_captain, cmd_changes, cmd_checkpoint, cmd_config, cmd_crew, cmd_doorbell_digest,
-    cmd_doorbell_gc, cmd_doorbell_inject, cmd_doorbell_introduce, cmd_doorbell_re_inject,
-    cmd_doorbell_roster, cmd_doorbell_start, cmd_doorbell_status, cmd_doorbell_stop,
-    cmd_doorbell_subscribe, cmd_history, cmd_internal_doorbell, cmd_judgment, cmd_ledger, cmd_mail,
-    cmd_models, cmd_policy, cmd_principles, cmd_resume, cmd_runs, cmd_slot, cmd_stage,
-    cmd_standing_orders, cmd_timeline, cmd_work, cmd_worktree, cmd_xproj,
+    PrinciplesCmd, ProfileCmd, RunsCmd, ShipCmd, SlotCmd, SquadCmd, StackCmd, StageCmd,
+    StandingOrdersCmd, WorkCmd, WorkflowCmd, WorktreeCmd, XprojCmd, cmd_agent, cmd_analytics,
+    cmd_audit, cmd_backend, cmd_captain, cmd_changes, cmd_checkpoint, cmd_config, cmd_crew,
+    cmd_doorbell_digest, cmd_doorbell_gc, cmd_doorbell_inject, cmd_doorbell_introduce,
+    cmd_doorbell_re_inject, cmd_doorbell_roster, cmd_doorbell_start, cmd_doorbell_status,
+    cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_history, cmd_internal_doorbell, cmd_judgment,
+    cmd_ledger, cmd_mail, cmd_models, cmd_policy, cmd_principles, cmd_resume, cmd_runs, cmd_ship,
+    cmd_slot, cmd_stack, cmd_stage, cmd_standing_orders, cmd_timeline, cmd_work, cmd_worktree,
+    cmd_xproj,
     coalition::cmd_coalition,
     cron::cmd_cron,
     debate::{cmd_debate, cmd_plan_review},
@@ -1612,6 +1613,19 @@ enum Commands {
     },
     /// Reinstall the binary from source (cargo install --path)
     Upgrade,
+    /// One operator door for the installed flywheel, doorbell, and toron
+    /// stack, with `--json`/`--check`; `install` delegates to the audited
+    /// stack script.
+    Stack {
+        #[command(subcommand)]
+        cmd: StackCmd,
+    },
+    /// Fail-closed ship gate: bead in HEAD, clean tracker snapshot, committed
+    /// closed row, and a legal ledger verdict for this SHA.
+    Ship {
+        #[command(subcommand)]
+        cmd: ShipCmd,
+    },
     /// Interactive walkthrough
     Tutorial,
     /// Daemon lifecycle (toron-parity): start|stop|restart|status over the
@@ -3282,14 +3296,20 @@ fn main() {
                 corr,
                 seq,
                 subscriber,
+                workspace,
+                since,
+                json,
             } => cmd_doorbell_why(
                 &cfg,
                 project,
-                pin,
+                pin.as_deref(),
                 *limit,
                 corr.as_deref(),
                 *seq,
                 subscriber.as_deref(),
+                workspace.as_deref(),
+                since.as_deref(),
+                *json,
             ),
             DoorbellCmd::Inject {
                 project,
@@ -3601,6 +3621,8 @@ fn main() {
             bead.as_deref(),
         ),
         Some(Commands::Upgrade) => cmd_upgrade(),
+        Some(Commands::Stack { cmd }) => cmd_stack(&cfg, cmd),
+        Some(Commands::Ship { cmd }) => cmd_ship(&cfg, cmd),
         Some(Commands::Tutorial) => cmd_tutorial(),
         #[cfg(feature = "serve")]
         Some(Commands::Daemon { cmd }) => cmd_daemon(&cfg, cmd),

@@ -1929,6 +1929,52 @@ pub(super) fn standby_blind_to_wakes(hosted: usize, known_workspaces: usize) -> 
     hosted == 0 && known_workspaces > 0
 }
 
+/// One row per dispatcher state file, including exited hosts.
+///
+/// `/health` used to expose only `lease_hosted` (live leases), so a host that
+/// died after an upgrade vanished and its old generation was invisible. Keep
+/// the state-file row with its build generation and say whether its pid is
+/// alive; `why` can then be read without guessing which rows are historical.
+fn host_health_rows(fw_state: &std::path::Path, now: u64) -> Vec<serde_json::Value> {
+    let Ok(entries) = std::fs::read_dir(fw_state.join("doorbell")) else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(workspace) = name.strip_suffix(".state.json") else {
+            continue;
+        };
+        let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let pid = value
+            .get("pid")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let alive = pid > 1 && doorbell_rt::lease::pid_alive(pid as u32);
+        let last_seen = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+        rows.push(serde_json::json!({
+            "workspace": workspace,
+            "project": value.get("project").cloned().unwrap_or(serde_json::Value::Null),
+            "pid": if pid > 0 { serde_json::Value::from(pid) } else { serde_json::Value::Null },
+            "state": if alive { "live" } else if pid > 0 { "exited" } else { "unknown" },
+            "generation": value.get("generation").cloned().unwrap_or(serde_json::Value::Null),
+            "last_seen_age_s": last_seen.map(|t| now.saturating_sub(t)),
+        }));
+    }
+    rows.sort_by(|a, b| a["workspace"].as_str().cmp(&b["workspace"].as_str()));
+    rows
+}
+
 fn health_body(app: &AppState) -> String {
     let hosted = hosted_keys_for_health(&app.hosted.lock());
     let store = doorbell_rt::FileStore::new(&app.fw_state);
@@ -2094,6 +2140,7 @@ fn health_body(app: &AppState) -> String {
         "mode": mode,
         "hosted": hosted,
         "lease_hosted": lease_hosted,
+        "hosts": host_health_rows(&app.fw_state, now),
         "build": build,
         "binaries": {
             "toron": bins.toron,
@@ -2232,9 +2279,26 @@ pub(super) fn wake_brain_health(
 }
 
 fn hostname() -> String {
-    std::fs::read_to_string("/etc/hostname")
+    if let Ok(s) = std::fs::read_to_string("/etc/hostname") {
+        let s = s.trim();
+        if !s.is_empty() {
+            return s.to_string();
+        }
+    }
+    if let Ok(s) = std::env::var("HOSTNAME") {
+        let s = s.trim();
+        if !s.is_empty() {
+            return s.to_string();
+        }
+    }
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "unknown".into())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".into())
 }
 /// Retained journal rows as an SSE replay (D8, bd-asr2.12). Strictly
 /// read-only fan-out over retained history plus a closing comment (no
@@ -2389,6 +2453,55 @@ mod tests {
         assert_eq!(read.kind.as_deref(), Some("no-text"));
         assert!(!doorbell_rt::lease::is_ringer(&read));
         doorbell_rt::lease::release_lease(&d, "w", &held);
+    }
+
+    #[test]
+    fn host_health_rows_keep_exited_generations_visible() {
+        let dir = std::env::temp_dir().join(format!(
+            "db-hosts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let state = dir.join("doorbell");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(
+            state.join("session:live.state.json"),
+            serde_json::json!({
+                "project": "toron",
+                "pid": std::process::id(),
+                "generation": {"binary_hash": "abc", "binary_len": 42}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            state.join("flywheel-dead.state.json"),
+            serde_json::json!({
+                "project": "toron",
+                "pid": 4_000_000_000u64,
+                "generation": {"binary_hash": "old", "binary_len": 41}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let rows = super::host_health_rows(&dir, 1_000);
+        assert_eq!(rows.len(), 2);
+        let live = rows
+            .iter()
+            .find(|r| r["workspace"] == "session:live")
+            .expect("live state row");
+        assert_eq!(live["state"], "live");
+        assert_eq!(live["generation"]["binary_hash"], "abc");
+        let dead = rows
+            .iter()
+            .find(|r| r["workspace"] == "flywheel-dead")
+            .expect("exited state row");
+        assert_eq!(dead["state"], "exited");
+        assert_eq!(dead["generation"]["binary_hash"], "old");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     use super::known_journal_workspaces;

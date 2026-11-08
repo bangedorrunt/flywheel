@@ -10,7 +10,11 @@ mod serve;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "doorbell", about = "doorbell plane-D daemon (ADR-0012)")]
+#[command(
+    name = "doorbell",
+    version,
+    about = "doorbell plane-D daemon (ADR-0012)"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

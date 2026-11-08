@@ -19,9 +19,14 @@ mbx +nightly-aarch64-apple-darwin test
 bash scripts/verify-clippy.sh
 mbx +nightly-aarch64-apple-darwin install --path . --force
 mbx +nightly-aarch64-apple-darwin install --path crates/doorbell-cli --force
-# macOS stale-signature SIGKILL only:
-# codesign --force --sign - ~/.cargo/bin/flywheel
-# codesign --force --sign - ~/.cargo/bin/doorbell && launchctl kickstart -k gui/$(id -u)/com.doorbell.serve
+# one command for all three installed binaries (flywheel, doorbell, toron):
+flywheel stack install
+flywheel stack status --check
+# after `br close`: bead id in HEAD, clean .beads, committed closed row, legal verdict
+flywheel ship check <bead-id>
+# clean-export proof over intended files; add --tests for the doorbell suite
+bash scripts/clean-proof.sh --tests --keep
+# scripts/stack.sh and scripts/ship-check.sh remain compatibility wrappers
 ```
 
 `mbx +nightly-aarch64-apple-darwin test --exclude-ignored` is invalid.
@@ -60,8 +65,10 @@ pass.
 ## Critical overrides
 
 - **Clean-export proof.** A green suite over a dirty tree is not a green tree.
-  Proof = `git archive HEAD` into a scratch dir and build there. `git add`
-  only paths you edited — never `git add -A` (other lanes share the tree).
+  Proof = `git archive HEAD` into a scratch dir and build there. In a dirty
+  worktree use `scripts/clean-proof.sh` (throwaway index, intended paths
+  only); `git add` only paths you edited — never `git add -A` (other lanes
+  share the tree).
 - **Classify first.** Session door: `arrive` → `briefing --json`; argv runs the
   work. `decide --json` classifies (`open` | `swarm`). Live fleets join loud,
   never double-compose — an invisible crew is not an empty project (check
@@ -80,7 +87,9 @@ pass.
 - **Identity ladder.** Explicit `--as`, then `AGENT_NAME`. Registered pins
   pass verbatim. Toron guard uses the same two rungs.
 - **Bead create/close.** Create needs `-d`, `--verify` (P≤2 `--principle`).
-  Close = `br gate report` then `br close` (br skill).
+  Close = `br gate report` then `br close` (br skill), then
+  `scripts/ship-check.sh <bead-id>` after the close commit. The gate refuses a
+  bead absent from HEAD, a dirty `.beads`, or no legal verdict.
   `flywheel ledger check` needs a bound verdict — `sha=<40-hex>` (fallback) or
   `task=`/`verdict=` (proved); br skill ceremony is SoT.
 - **Tracker.** Agents use `br --json` / `--robot-*`. Bare `br` is the human TUI.

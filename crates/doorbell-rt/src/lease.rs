@@ -175,13 +175,16 @@ pub fn pid_alive(pid: u32) -> bool {
     if pid <= 1 {
         return false;
     }
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    // `kill -0` succeeds for a zombie. A zombie cannot poll or type, so it is
+    // dead for lease and `/health` purposes; otherwise a stopped host remains
+    // "live" until its parent reaps it.
+    let out = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .output()
+        .map(|out| out.stdout)
+        .unwrap_or_default();
+    let stat = String::from_utf8_lossy(&out).trim().to_string();
+    !stat.is_empty() && !stat.starts_with('Z')
 }
 
 pub fn read_lease(state_dir: &Path, workspace: &str) -> Option<OwnerLease> {
@@ -717,5 +720,33 @@ mod tests {
         };
         assert!(lease_stale_pure(&fresh, now, &other_boot));
         assert!(!lease_stale_pure(&fresh, now, &no_start));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_alive_rejects_zombies() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let stat = std::process::Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "stat="])
+                .output()
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+                .unwrap_or_default();
+            if stat.starts_with('Z') {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child did not become a zombie: stat={stat}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!pid_alive(pid), "zombie pid must not read as live");
+        let _ = child.wait();
     }
 }
