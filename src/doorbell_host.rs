@@ -1292,6 +1292,8 @@ async fn run_embedded_async(
     // restarted.
     let stale_binary = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stale_binary_cb = std::sync::Arc::clone(&stale_binary);
+    let workspace_gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let workspace_gone_cb = std::sync::Arc::clone(&workspace_gone);
     let _liveness = tokio::spawn(async move {
         let mut gone_streak = 0u32;
         let mut ticks = 0u64;
@@ -1341,6 +1343,7 @@ async fn run_embedded_async(
                     eprintln!(
                         "flywheel doorbell: workspace {probe_ws} no longer resolves on the plane; retiring ({reason})"
                     );
+                    workspace_gone_cb.store(true, std::sync::atomic::Ordering::SeqCst);
                     break;
                 }
             }
@@ -1353,6 +1356,9 @@ async fn run_embedded_async(
         .await;
     if stale_binary.load(std::sync::atomic::Ordering::SeqCst) {
         return stale_binary_exit();
+    }
+    if workspace_gone.load(std::sync::atomic::Ordering::SeqCst) {
+        doorbell::retire_workspace(&config::state_dir(), workspace, std::process::id());
     }
     _lease_beat.abort();
     if let Ok(mut g) = watch_slot.lock() {

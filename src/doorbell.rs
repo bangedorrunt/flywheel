@@ -509,6 +509,21 @@ pub fn stop(state_dir: &Path, workspace: &str) {
     let _ = fs::remove_file(project_sidecar(state_dir, workspace));
 }
 
+/// Drop a retired host's state record so `doorbell start`/`supervise` stop
+/// re-arming it. `doorbell_project_workspaces` arms exactly the workspaces
+/// that still carry a state file, so a host that confirmed `workspace-gone`
+/// would otherwise be respawned every minute for the rest of the supervisor's
+/// life. Only the record written by `pid` is removed: a replacement host that
+/// already rewrote the record is never clobbered.
+pub fn retire_workspace(state_dir: &Path, workspace: &str, pid: u32) {
+    if read_state(state_dir, workspace).and_then(|s| s.pid) != Some(pid) {
+        return;
+    }
+    let path = state_file(state_dir, workspace);
+    let _lock = lock_state(&path);
+    let _ = fs::remove_file(&path);
+}
+
 /// One-shot upgrade sweep for the pre-unification pid/gen/project sidecars.
 ///
 /// A sidecar family is removed only when it cannot still belong to a live
@@ -911,6 +926,17 @@ pub fn inject_wake_in(
     Ok(summary)
 }
 
+/// Wait on a detached child so the OS can reap it. Dropping a `Child` does not
+/// reap it on Unix; a long-lived supervisor would otherwise keep one
+/// `<defunct>` entry per respawned host until the supervisor itself exits.
+fn reap_detached(workspace: &str, mut child: std::process::Child) {
+    let _ = std::thread::Builder::new()
+        .name(format!("doorbell-reap-{workspace}"))
+        .spawn(move || {
+            let _ = child.wait();
+        });
+}
+
 fn spawn_child(exe: &Path, state_dir: &Path, project: &str, workspace: &str) -> Result<()> {
     let state_path = state_file(state_dir, workspace);
     let mut cmd = Command::new(exe);
@@ -950,11 +976,13 @@ fn spawn_child(exe: &Path, state_dir: &Path, project: &str, workspace: &str) -> 
     let child = cmd
         .spawn()
         .with_context(|| format!("spawn doorbell for {workspace}"))?;
+    let pid = child.id();
+    reap_detached(workspace, child);
     let generation = WatcherGen::capture(exe, unix_now());
     write_state(
         &state_path,
         &DoorbellState {
-            pid: Some(child.id()),
+            pid: Some(pid),
             project: Some(project.to_string()),
             generation,
         },
@@ -4655,5 +4683,91 @@ mod bd_gefp_host_exit_tests {
             src.contains("doorbell::probe_workspace_presence(&cfg_p, &project_p, &ws_p)"),
             "the poll must ask the SELECTED plane, not read a stale local file"
         );
+        assert!(
+            src.contains("doorbell::retire_workspace"),
+            "a confirmed workspace-gone retire must drop the state record, or supervise re-arms it forever"
+        );
+    }
+
+    /// `doorbell_project_workspaces` arms every workspace with a state file.
+    /// A retired host must remove its own record, and must not remove a
+    /// replacement that already rewrote it.
+    #[test]
+    fn a_retired_workspace_drops_its_state_record() {
+        let dir = scratch("retire");
+        let ws = "flywheel-scratch-retire";
+        write_state(
+            &state_file(&dir, ws),
+            &DoorbellState {
+                pid: Some(4242),
+                project: Some("toron".into()),
+                generation: None,
+            },
+        )
+        .unwrap();
+        assert!(read_state(&dir, ws).is_some());
+        retire_workspace(&dir, ws, 4242);
+        assert!(
+            read_state(&dir, ws).is_none(),
+            "a retained record is re-armed by the next supervise tick"
+        );
+        write_state(
+            &state_file(&dir, ws),
+            &DoorbellState {
+                pid: Some(7),
+                project: Some("toron".into()),
+                generation: None,
+            },
+        )
+        .unwrap();
+        retire_workspace(&dir, ws, 4242);
+        assert_eq!(
+            read_state(&dir, ws).and_then(|s| s.pid),
+            Some(7),
+            "a retired pid must not delete the replacement host's record"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Dropping a `Child` does not reap it, so a repeating supervisor kept one
+    /// `<defunct>` entry per respawn. `spawn_child` must hand the child to a
+    /// waiter: after the child exits, `ps` must have no entry at all (an
+    /// unreaped child would still show `Z`).
+    #[test]
+    fn a_spawned_child_is_reaped() {
+        #[cfg(unix)]
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = scratch("reap");
+            let script = dir.join("slow-child.sh");
+            let mut f = std::fs::File::create(&script).unwrap();
+            writeln!(f, "#!/bin/sh\nsleep 0.2").unwrap();
+            drop(f);
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            spawn_child(&script, &dir, "proj", "ws").unwrap();
+            let pid = read_state(&dir, "ws")
+                .and_then(|s| s.pid)
+                .expect("spawn_child records its pid");
+            let stat = |pid: u32| -> String {
+                let out = std::process::Command::new("ps")
+                    .args(["-p", &pid.to_string(), "-o", "stat="])
+                    .output()
+                    .map(|o| o.stdout)
+                    .unwrap_or_default();
+                String::from_utf8_lossy(&out).trim().to_string()
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !stat(pid).is_empty() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            assert!(
+                stat(pid).is_empty(),
+                "pid {pid} is still in the process table (zombie = unreaped): {}",
+                stat(pid)
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
