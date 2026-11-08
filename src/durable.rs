@@ -16513,15 +16513,17 @@ mod tick_replay_tests {
     /// context-limit slots replays a fixed message stream identically.
     #[test]
     fn loop_slots_replay_deterministically_across_drain_heal_and_respawn() {
-        let mut model = LoopModel::default();
-        model.states = vec![AgentState {
-            name: "coder".into(),
-            status: "unknown".into(),
-            kind: String::new(),
-            pane_id: String::new(),
-            mail_identity: None,
-            nudge_streak: 0,
-        }];
+        let mut model = LoopModel {
+            states: vec![AgentState {
+                name: "coder".into(),
+                status: "unknown".into(),
+                kind: String::new(),
+                pane_id: String::new(),
+                mail_identity: None,
+                nudge_streak: 0,
+            }],
+            ..LoopModel::default()
+        };
         model.drain_pending.insert(
             "coder".to_string(),
             DrainState {

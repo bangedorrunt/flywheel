@@ -2396,6 +2396,7 @@ pub fn run_cli(cmd: &SupervisorCmd) -> Result<()> {
             };
             append_input(&p, &msg)?;
             println!("queued {kind} for {child}");
+            warn_if_unhosted(&p, project);
             Ok(())
         }
         SupervisorCmd::Steer {
@@ -2454,24 +2455,29 @@ pub fn run_cli(cmd: &SupervisorCmd) -> Result<()> {
                 "queued steer {} for {child} under sup_epoch {epoch}",
                 op.tag()
             );
+            warn_if_unhosted(&p, project);
             Ok(())
         }
         SupervisorCmd::View { project, json } => {
             let p = CtxPaths::new(&CtxPaths::default_dir(), project);
-            let (msgs, _, _) = read_log(&p)?;
-            let (m, _) = crate::supervisor_program::replay(&msgs);
-            let rows = crew_view(&m);
+            let (m, rows, host_started, queued) = view_snapshot(&p)?;
+            let status = if host_started {
+                json!(m.status)
+            } else {
+                json!("not_started")
+            };
             if *json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
-                        "status": m.status, "sup_epoch": m.accepted_epoch, "leader": m.leader,
+                        "status": status, "sup_epoch": m.accepted_epoch, "leader": m.leader,
                         "restarts_in_window": m.restarts.len(), "goal_proved": m.goal_proved,
+                        "host_started": host_started, "queued_inputs": queued,
                         "rows": rows,
                     }))?
                 );
             } else {
-                print_view(&m, &rows);
+                print_view(&m, &rows, host_started, queued);
             }
             Ok(())
         }
@@ -2580,16 +2586,48 @@ pub fn queue_halt(
     Ok(())
 }
 
-fn print_view(m: &SupModel, rows: &[CrewRow]) {
-    println!(
-        "supervisor {:?} sup_epoch {} leader {} restarts {}/{} goal_proved {}",
-        m.status,
-        m.accepted_epoch,
-        m.leader,
-        m.restarts.len(),
-        m.policy.max_r,
-        m.goal_proved
-    );
+fn warn_if_unhosted(p: &CtxPaths, project: &str) {
+    if !p.log.exists() {
+        eprintln!(
+            "flywheel supervisor: no host has started {project}; input is queued. Start one with \
+             `flywheel loop-mode supervise {project}` or inspect with `flywheel supervisor view \
+             {project}`."
+        );
+    }
+}
+
+/// Read the fold plus the facts/steers that are queued but not yet folded.
+/// `host_started` is the log's existence: `Core::open` writes `Hello` before
+/// any fact can be folded, so no log means no host ever opened the context.
+fn view_snapshot(p: &CtxPaths) -> Result<(SupModel, Vec<CrewRow>, bool, usize)> {
+    let (msgs, _, in_off) = read_log(p)?;
+    let (m, _) = crate::supervisor_program::replay(&msgs);
+    let (queued, _) = read_inputs(p, in_off);
+    let rows = crew_view(&m);
+    Ok((m, rows, p.log.exists(), queued.len()))
+}
+
+fn print_view(m: &SupModel, rows: &[CrewRow], host_started: bool, queued: usize) {
+    if host_started {
+        println!(
+            "supervisor {:?} sup_epoch {} leader {} restarts {}/{} goal_proved {}",
+            m.status,
+            m.accepted_epoch,
+            m.leader,
+            m.restarts.len(),
+            m.policy.max_r,
+            m.goal_proved
+        );
+    } else {
+        println!(
+            "supervisor not_started sup_epoch {} leader {} queued_inputs {queued} \
+             (no host has folded this context)",
+            m.accepted_epoch, m.leader
+        );
+    }
+    if queued > 0 {
+        println!("  queued_inputs {queued} (not yet folded)");
+    }
     for r in rows {
         let steer = r
             .pending_steer
@@ -2610,6 +2648,33 @@ mod tests {
     const D: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     use crate::supervisor_program::{ChildState, Status, SteerState};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn view_snapshot_reports_queued_inputs_before_a_host_starts() {
+        let dir = std::env::temp_dir().join(format!(
+            "sup-view-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let p = CtxPaths::new(&dir, "proj");
+        append_input(
+            &p,
+            &SupMsg::Progress {
+                child: "A".into(),
+                generation: 1,
+                now_ms: 1,
+            },
+        )
+        .unwrap();
+        let (_, rows, host_started, queued) = view_snapshot(&p).unwrap();
+        assert!(!host_started, "a context with no log has no host");
+        assert_eq!(queued, 1, "the input remains visible as queued");
+        assert!(rows.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[derive(Default)]
     struct World {

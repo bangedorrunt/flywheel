@@ -1218,8 +1218,7 @@ pub(crate) fn cmd_doorbell_why(
     subscriber: Option<&str>,
 ) -> Result<()> {
     crate::check_project_spelling(project, "doorbell why")?;
-    let _ = cfg;
-    let scoped = doorbell_scoped_workspaces(project);
+    let scoped = doorbell_scoped_workspaces(cfg, project);
     let entries = doorbell::journal_read_all(&config::state_dir());
     {
         let mut workspaces: std::collections::BTreeSet<String> =
@@ -1238,6 +1237,11 @@ pub(crate) fn cmd_doorbell_why(
             }
         }
         for ws in &workspaces {
+            if let Some(allowed) = &scoped
+                && !allowed.iter().any(|a| a == ws)
+            {
+                continue;
+            }
             let (torn, first_seq) = doorbell::journal_fold_status(&config::state_dir(), ws);
             if let Some(t) = torn {
                 eprintln!("doorbell why: {t} (workspace {ws})");
@@ -1282,9 +1286,10 @@ pub(crate) fn cmd_doorbell_why(
             .cloned()
             .unwrap_or(serde_json::Value::Null);
         normalize_action_shapes(&mut actions_val);
-        let replay_msg: Option<workspace::Msg> = if let Ok(m) =
-            serde_json::from_value::<workspace::Msg>(msg_val.clone())
+        let replay_msg: Option<workspace::Msg> = if let Some(m) = journal_msg_to_workspace(&msg_val)
         {
+            Some(m)
+        } else if let Ok(m) = serde_json::from_value::<workspace::Msg>(msg_val.clone()) {
             Some(m)
         } else if let Ok(dm) = serde_json::from_value::<doorbell_tick::DoorbellMsg>(msg_val.clone())
         {
@@ -1452,11 +1457,7 @@ pub(crate) fn cmd_doorbell_why(
                 },
             }
         };
-        let status = msg
-            .get("PlaneStatus")
-            .and_then(|h| h.get("status"))
-            .and_then(|s| s.as_str())
-            .unwrap_or("");
+        let status = why_plane_status(&msg).unwrap_or("");
         println!(
             "{workspace} {ts} seq={} {kind}{} actions=[{actions}]{}{}{}",
             replay_seq - 1,
@@ -1502,8 +1503,7 @@ pub(crate) fn cmd_doorbell_why(
 /// error — AFK with nothing queued means nothing needs the captain.
 pub(crate) fn cmd_doorbell_afk(cfg: &Config, project: &str, limit: usize) -> Result<()> {
     crate::check_project_spelling(project, "doorbell afk")?;
-    let _ = cfg;
-    let scoped = doorbell_scoped_workspaces(project);
+    let scoped = doorbell_scoped_workspaces(cfg, project);
     let entries = doorbell::journal_read_all(&config::state_dir());
     if entries.is_empty() {
         println!("doorbell afk: no journal entries — nothing queued");
@@ -1702,14 +1702,63 @@ pub(crate) fn cmd_doorbell_unsubscribe(_cfg: &Config, id: &str) -> Result<()> {
 /// project's injects — trading invisibility for a silent cross-project blend.
 /// So the console scope is admitted per ROW, by the project the row records,
 /// never by the scope name alone. See [`console_row_is_for_project`].
-fn doorbell_scoped_workspaces(project: &str) -> Option<Vec<String>> {
+fn doorbell_scoped_workspaces(cfg: &Config, project: &str) -> Option<Vec<String>> {
+    let state_dir = config::state_dir();
+    let live_id = crate::snapshot::assemble(cfg, project, crate::doorbell_now_unix()).workspace_id;
+    doorbell_scope_with_live(
+        project,
+        doorbell::journal_workspaces_list(&state_dir),
+        Some(live_id.as_str()),
+        // The live host may be keyed by a plane session ID while the snapshot
+        // resolves the canonical label. `project_workspaces` reads each
+        // dispatcher's unified state (`state.json`) project, so an independently
+        // hosted session is still this project's wake surface.
+        doorbell::project_workspaces(&state_dir, project),
+    )
+}
+
+/// Add the live session workspace and recorded project-owned dispatchers to
+/// the label-based project scope. The host may be keyed by the plane session
+/// ID (`session:...`), which matches none of the project prefixes; without
+/// this `why` cannot explain the live wake it is meant to explain.
+fn doorbell_scope_with_live(
+    project: &str,
+    workspaces: impl IntoIterator<Item = String>,
+    live_id: Option<&str>,
+    recorded: impl IntoIterator<Item = String>,
+) -> Option<Vec<String>> {
+    let mut scoped = doorbell_scope(project, workspaces)?;
+    if let Some(id) = live_id.filter(|id| !id.trim().is_empty()) {
+        scoped.push(id.to_string());
+    }
+    scoped.extend(recorded);
+    scoped.sort();
+    scoped.dedup();
+    Some(scoped)
+}
+
+/// The workspace labels that belong to `project`: the bare project key, the
+/// canonical `flywheel-{project}` dispatcher, and their children. The live
+/// dispatcher is `flywheel-toron-rk-...`, which the old `{project}-` prefix
+/// missed entirely; keeping this pure makes the scope testable without a
+/// live journal directory.
+fn doorbell_scope(
+    project: &str,
+    workspaces: impl IntoIterator<Item = String>,
+) -> Option<Vec<String>> {
     (project != "all").then(|| {
-        let mut w = vec![project.to_string()];
-        w.extend(
-            doorbell::journal_workspaces_list(&config::state_dir())
-                .into_iter()
-                .filter(|x| x.starts_with(&format!("{project}-"))),
-        );
+        let canonical = format!("flywheel-{project}");
+        let project_prefix = format!("{project}-");
+        let canonical_prefix = format!("{canonical}-");
+        let mut w = vec![project.to_string(), canonical.clone()];
+        w.extend(workspaces.into_iter().filter(|x| {
+            x.as_str() == project
+                || x == &canonical
+                || x.starts_with(&project_prefix)
+                || x.starts_with(&canonical_prefix)
+        }));
+        w.sort();
+        w.dedup();
         w
     })
 }
@@ -1802,6 +1851,66 @@ mod journal_scope_tests {
             &scoped_to("proj-a"),
             "proj-a"
         ));
+    }
+
+    /// The live dispatcher is `flywheel-<project>-rk-...`; the canonical
+    /// prefix must claim it, while a sibling project stays out.
+    #[test]
+    fn canonical_flywheel_workspace_and_children_are_in_scope() {
+        let scoped = doorbell_scope(
+            "toron",
+            vec![
+                "flywheel-toron".to_string(),
+                "flywheel-toron-rk-live-doorbell".to_string(),
+                "toron-crew".to_string(),
+                "flywheel-other".to_string(),
+                "other-crew".to_string(),
+            ],
+        )
+        .expect("project scope");
+        assert!(
+            scoped
+                .iter()
+                .any(|w| w == "flywheel-toron-rk-live-doorbell")
+        );
+        assert!(scoped.iter().any(|w| w == "toron-crew"));
+        assert!(!scoped.iter().any(|w| w == "flywheel-other"));
+        assert!(!scoped.iter().any(|w| w == "other-crew"));
+    }
+
+    /// The live host is keyed by its plane session ID, not the project
+    /// prefix. `why` must still see that workspace's status wake.
+    #[test]
+    fn live_session_workspace_is_added_to_the_scope() {
+        let scoped = doorbell_scope_with_live(
+            "toron",
+            vec!["flywheel-toron-rk-live".to_string(), "other".to_string()],
+            Some("session:abc"),
+            Vec::<String>::new(),
+        )
+        .expect("project scope");
+        assert!(scoped.iter().any(|w| w == "flywheel-toron-rk-live"));
+        assert!(scoped.iter().any(|w| w == "session:abc"));
+        assert!(!scoped.iter().any(|w| w == "other"));
+        let without = doorbell_scope_with_live("toron", vec![], None, Vec::<String>::new())
+            .expect("project scope");
+        assert!(!without.iter().any(|w| w.starts_with("session:")));
+    }
+
+    /// The snapshot can resolve the canonical label while a separate session
+    /// host owns the status journal. The recorded project dispatcher must be
+    /// admitted even when the live ID is not the session.
+    #[test]
+    fn recorded_project_workspace_is_added_when_live_id_is_canonical() {
+        let scoped = doorbell_scope_with_live(
+            "toron",
+            vec!["flywheel-toron-rk-live".to_string()],
+            Some("flywheel-toron-rk-live"),
+            vec!["session:01a1".to_string()],
+        )
+        .expect("project scope");
+        assert!(scoped.iter().any(|w| w == "session:01a1"));
+        assert!(scoped.iter().any(|w| w == "flywheel-toron-rk-live"));
     }
 
     /// The original exclusion (bd-a8ld) must survive: the synthetic
@@ -1954,6 +2063,50 @@ mod action_shape_tests {
             v.get("FetchInbox").is_some(),
             "a non-array actions field must not be rewritten"
         );
+    }
+}
+
+/// Journal rows use the daemon's `rt_kind` envelope; serde's externally-tagged
+/// `Msg`/`DoorbellMsg` forms are only the legacy inputs. Parse the live shape
+/// here so `why` can replay the row that actually woke the pin.
+fn why_plane_status(v: &serde_json::Value) -> Option<&str> {
+    v.get("PlaneStatus")
+        .and_then(|h| h.get("status"))
+        .and_then(|s| s.as_str())
+        .or_else(|| v.get("status").and_then(|s| s.as_str()))
+}
+
+fn journal_msg_to_workspace(v: &serde_json::Value) -> Option<workspace::Msg> {
+    let text = |key: &str| v.get(key).and_then(|x| x.as_str()).map(str::to_string);
+    match text("rt_kind")?.as_str() {
+        "PlaneStatus" => Some(workspace::Msg::PlaneStatus {
+            pin: text("pin")?,
+            status: text("status")?,
+        }),
+        "RoleBound" => Some(workspace::Msg::RoleBound {
+            role: text("role")?,
+            pin: text("pin")?,
+        }),
+        "Fact" => Some(workspace::Msg::Fact {
+            summary: text("summary")?,
+        }),
+        "AckSlaTick" => Some(workspace::Msg::AckSlaTick {
+            now: v.get("now")?.as_u64()?,
+        }),
+        "Presence" => Some(workspace::Msg::Presence {
+            pin: text("pin")?,
+            state: text("state")?,
+        }),
+        "SlaFired" => Some(workspace::Msg::SlaFired {
+            posts: v
+                .get("posts")?
+                .as_array()?
+                .iter()
+                .filter_map(|p| p.as_str().map(str::to_string))
+                .collect(),
+        }),
+        "WatchDied" => Some(workspace::Msg::WatchDied),
+        _ => None,
     }
 }
 
@@ -2223,13 +2376,18 @@ fn upsert_workspace_receipt(corr: &str, receipt: &workspace::Receipt) {
         result_path: receipt.result_path.clone(),
         updated_at: chrono::Utc::now().timestamp_millis(),
     };
-    let _ = crate::mail::block_on(async {
-        if let Some(mb) = crate::mail::try_mailbox()
-            && let Ok(store) = mb.receipt_store()
-        {
-            let _ = store.upsert(&r).await;
-        }
-        Ok::<(), anyhow::Error>(())
+    // The embedded host's `tick` runs on its Tokio runtime; the receipt
+    // write synchronously block_on's the shared mail runtime, so it must be
+    // moved off that thread or the host panics at startup.
+    let _ = crate::backend::run_mail_off_runtime_sync(|| {
+        crate::mail::block_on(async {
+            if let Some(mb) = crate::mail::try_mailbox()
+                && let Ok(store) = mb.receipt_store()
+            {
+                let _ = store.upsert(&r).await;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
     });
 }
 
@@ -2416,7 +2574,8 @@ fn try_tick_receipt(workspace_model: &mut workspace::WorkspaceModel, corr: &str)
     let Ok(store) = mb.receipt_store() else {
         return false;
     };
-    let Ok(Some(r)) = crate::mail::block_on(store.get(corr)) else {
+    let got = crate::backend::run_mail_off_runtime_sync(|| crate::mail::block_on(store.get(corr)));
+    let Ok(Some(r)) = got else {
         return false;
     };
     let rec = workspace::Receipt {
@@ -2511,6 +2670,44 @@ mod waitcorr_doorbell_only_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod runtime_mail_tests {
+    use super::*;
+
+    /// The embedded host calls this from its Tokio runtime. Before the
+    /// off-runtime wrapper, the receipt write panicked at startup and the
+    /// live dispatcher never wrote a status wake.
+    #[test]
+    fn receipt_effects_do_not_nest_block_on_inside_a_runtime() {
+        let _home = crate::config::test_state_home();
+        let _mail = crate::mail::Mail::from_config(None)
+            .expect("in-process mail")
+            .expect("some");
+        let receipt = workspace::Receipt {
+            state: "owed".into(),
+            wake: "tasked".into(),
+            due_at: None,
+            result_path: None,
+        };
+        let mut model = workspace::WorkspaceModel::default();
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let _ = handle_workspace_cmds(
+                &mut model,
+                &[workspace::Cmd::SqliteUpsert {
+                    corr: "runtime-mail-receipt".into(),
+                    receipt,
+                }],
+                "runtime-mail",
+                &Config::default(),
+                false,
+            );
+            assert!(!try_tick_receipt(&mut model, "missing-corr"));
+        });
+    }
+}
+
 #[cfg(test)]
 mod s_proof_tests {
     #[test]
@@ -2619,6 +2816,22 @@ mod s_proof_tests {
         assert!(
             !super::why_entry_mentions_pin("PearlTern", None, &[], &[]),
             "legacy rows without pins stay invisible, never invented"
+        );
+        let live = serde_json::json!({
+            "rt_kind": "PlaneStatus", "pin": "PearlTern", "status": "idle"
+        });
+        let msg = super::journal_msg_to_workspace(&live)
+            .expect("the live rt_kind row must replay as a status wake");
+        assert!(
+            super::why_entry_mentions_pin("PearlTern", Some(&msg), &[], &[]),
+            "a status transition is a wake and must match its pin"
+        );
+        assert!(
+            super::journal_msg_to_workspace(&serde_json::json!({
+                "rt_kind": "PlaneStatus", "pin": "PearlTern"
+            }))
+            .is_none(),
+            "a status row without its status stays unreplayable"
         );
     }
 }
@@ -2795,6 +3008,22 @@ mod why_resume_tests {
             model.presence.get("B"),
             Some(&workspace::Presence::Unknown),
             "unparseable state seeds Unknown, never idle"
+        );
+    }
+
+    #[test]
+    fn why_reads_status_from_live_rt_kind_rows() {
+        let live = serde_json::json!({
+            "rt_kind": "PlaneStatus", "pin": "PearlTern", "status": "idle"
+        });
+        assert_eq!(why_plane_status(&live), Some("idle"));
+        let legacy = serde_json::json!({
+            "PlaneStatus": {"pin": "PearlTern", "status": "working"}
+        });
+        assert_eq!(why_plane_status(&legacy), Some("working"));
+        assert_eq!(
+            why_plane_status(&serde_json::json!({"rt_kind": "PlaneStatus"})),
+            None
         );
     }
 

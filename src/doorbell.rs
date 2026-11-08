@@ -2417,7 +2417,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("journals")).unwrap();
         std::fs::create_dir_all(dir.join("doorbell")).unwrap();
-        for ws in ["flywheel-beads", "flywheel-other", "adrx1"] {
+        for ws in ["flywheel-beads", "flywheel-other", "adrx1", "session:test"] {
             std::fs::write(
                 dir.join("journals")
                     .join(format!("doorbell-journal-{ws}.jsonl")),
@@ -2427,6 +2427,14 @@ mod tests {
         }
         write_state(
             &state_file(&dir, "adrx1"),
+            &DoorbellState {
+                project: Some("beads".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        write_state(
+            &state_file(&dir, "session:test"),
             &DoorbellState {
                 project: Some("beads".into()),
                 ..Default::default()
@@ -2443,6 +2451,10 @@ mod tests {
         let beads = project_workspaces(&dir, "beads");
         assert!(beads.contains("flywheel-beads"), "{beads:?}");
         assert!(beads.contains("adrx1"), "sidecar mapping lost: {beads:?}");
+        assert!(
+            beads.contains("session:test"),
+            "a session host's unified project record must stay in scope: {beads:?}"
+        );
         assert!(
             !beads.contains("flywheel-other"),
             "another project's workspace leaked into the scope: {beads:?}"

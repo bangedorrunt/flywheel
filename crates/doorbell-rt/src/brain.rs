@@ -640,7 +640,9 @@ impl<H: Host> Brain<H> {
         let now = self.host.now_unix();
         let injects = self.gated(raw.clone(), now);
         self.journal(
-            &serde_json::json!({"rt_kind": "PlaneStatus", "pin": pin}),
+            &serde_json::json!({
+                "rt_kind": "PlaneStatus", "pin": pin, "status": status.as_str()
+            }),
             &effects,
             serde_json::json!({"stage": "drain"}),
             &raw.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
@@ -2960,6 +2962,32 @@ mod tests {
         );
         assert!(first.is_none() || first == second);
         assert!(second.is_some());
+    }
+
+    #[tokio::test]
+    async fn status_wake_row_names_the_status_for_replay() {
+        let (mut brain, _rx, _tx) = test_brain("statuswhy", vec![]);
+        brain
+            .dispatch(BrainMsg::PlaneStatus {
+                pin: "p".into(),
+                status: "idle".into(),
+            })
+            .await;
+        let raw = std::fs::read_to_string(brain.store.journal_file("w")).unwrap();
+        let row = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|v| v["msg"]["rt_kind"] == "PlaneStatus")
+            .expect("status transition must be journaled");
+        assert_eq!(row["msg"]["pin"], "p");
+        assert_eq!(
+            row["msg"]["status"], "idle",
+            "why must replay the status, not just the pin"
+        );
+        assert!(
+            brain.wake.last_wake_unix.is_some(),
+            "the same observed transition stamps last_wake"
+        );
     }
 
     #[tokio::test]

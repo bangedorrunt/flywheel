@@ -196,30 +196,42 @@ fn read_lease_at(path: &Path) -> Option<OwnerLease> {
 
 /// Live (non-stale) leases across workspaces — the ws-blind deference
 /// probe (flywheel `resolve_host` has no workspace yet at decide time).
+///
+/// Current writers put the lease in `<ws>.state.json`; `owner-<ws>.json`
+/// remains a read fallback for the migration window. Reading only the unified
+/// shape made a live legacy lease invisible to the hourly audit prune, which
+/// then removed the audit log of a live, unhosted workspace.
 pub fn live_leases(state_dir: &Path, now_unix: u64) -> Vec<(String, OwnerLease)> {
-    let mut out = Vec::new();
+    let mut found = std::collections::BTreeMap::new();
     let Ok(entries) = std::fs::read_dir(state_dir.join("doorbell")) else {
-        return out;
+        return Vec::new();
     };
-    let mut workspaces = std::collections::BTreeSet::new();
     for entry in entries.filter_map(|e| e.ok()) {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if let Some(ws) = name.strip_suffix(".state.json") {
-            workspaces.insert(ws.to_string());
-        }
-    }
-    for ws in workspaces {
+        let (ws, lease) = if let Some(ws) = name.strip_suffix(".state.json") {
+            (ws, read_lease(state_dir, ws))
+        } else if let Some(ws) = name
+            .strip_prefix("owner-")
+            .and_then(|n| n.strip_suffix(".json"))
+        {
+            (ws, read_owner_lease_at(&entry.path()))
+        } else {
+            continue;
+        };
         if ws.is_empty() {
             continue;
         }
-        if let Some(lease) = read_lease(state_dir, &ws)
+        if let Some(lease) = lease
             && !lease_stale(&lease, now_unix)
         {
-            out.push((ws, lease));
+            found.entry(ws.to_string()).or_insert(lease);
         }
     }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
+    found.into_iter().collect()
+}
+
+fn read_owner_lease_at(path: &Path) -> Option<OwnerLease> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
 /// Injected observations for the pure staleness predicate: no clock, no
@@ -521,6 +533,22 @@ mod tests {
         let d = std::env::temp_dir().join(format!("dbrt-lease-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
+    }
+
+    /// `owner-*.json` is the migration-window record. A live one must still
+    /// widen the prune's protected set even when no unified state file exists.
+    #[test]
+    fn live_leases_reads_the_legacy_owner_file() {
+        let d = dir("legacy-live");
+        let now = unix_now();
+        let lease = crate::lease::acquire_lease(&d, "w", now).expect("lease");
+        let owner = crate::lease::owner_file(&d, "w");
+        std::fs::write(&owner, serde_json::to_vec(&lease).expect("json")).expect("owner");
+        let _ = std::fs::remove_file(crate::lease::state_file(&d, "w"));
+        let live = live_leases(&d, now);
+        assert_eq!(live.len(), 1, "legacy owner must still be live: {live:?}");
+        assert_eq!(live[0].0, "w");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

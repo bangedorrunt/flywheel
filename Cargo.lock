@@ -820,7 +820,7 @@ dependencies = [
 
 [[package]]
 name = "doorbell-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -836,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "doorbell-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chrono",
  "serde",
@@ -845,7 +845,7 @@ dependencies = [
 
 [[package]]
 name = "doorbell-rt"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bbtree",
  "chrono",
@@ -1045,7 +1045,7 @@ dependencies = [
 
 [[package]]
 name = "flywheel"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3354,7 +3354,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "toron-core"
-version = "1.6.1"
+version = "1.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3384,7 +3384,7 @@ dependencies = [
 
 [[package]]
 name = "toron-plane"
-version = "1.6.1"
+version = "1.7.0"
 dependencies = [
  "anyhow",
  "parking_lot",
@@ -3396,7 +3396,7 @@ dependencies = [
 
 [[package]]
 name = "toron-workflow"
-version = "1.6.1"
+version = "1.7.0"
 dependencies = [
  "anyhow",
  "chrono",

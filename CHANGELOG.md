@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.2] — 2026-11-09
+
+### Fixed
+- **Doorbell status wakes are journaled with their state and replay in `why`.** `PlaneStatus` rows now carry `status`; `why` parses the live `rt_kind` envelope and prints `->working` / `->idle`. Scope includes dispatchers recorded by their unified `state.json` project, so a `session:` host is visible even when the snapshot resolves the canonical workspace. Doorbell crate 0.3.1.
+- **The live host no longer panics on receipt effects.** Receipt upserts and WaitCorr probes run off the embedded Tokio runtime, so a status wake can start and settle under the host.
+- **The hourly prune keeps a live legacy lease’s audit log.** `live_leases` reads the `owner-<workspace>.json` migration record as well as unified `state.json`, so an unhosted live loop is not mistaken for abandoned state.
+- **Channel creation uses the registered captain alias, not `$USER`.** `spawn --join-channel` warns and refuses instead of asking toron to write under an OS username, and `supervisor view` distinguishes a never-started host from a running one while showing queued inputs.
+
 ## [0.10.1] — 2026-11-03
 
 ### Fixed

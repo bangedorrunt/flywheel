@@ -1561,6 +1561,7 @@ esac
     #[cfg(feature = "backend-superlogical")]
     #[test]
     fn pane_materializable_reads_the_selected_plane_not_a_plane_socket() {
+        let _env = crate::config::lock_env();
         let _guard = crate::backend::rex_test_guard::RexBinGuard::install(PANE_HC_FAKE_REX);
         unsafe { std::env::set_var("FLYWHEEL_BACKEND", "superlogical") };
         let project = "pane-plane-materializable-probe";

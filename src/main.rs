@@ -7071,20 +7071,36 @@ fn ensure_and_join_channels(project: &str, channels: &[String], pins: &[String])
     if channels.is_empty() {
         return;
     }
-    let captain = operator_pin();
+    // The channel creator must be a REGISTERED identity. `operator_pin()`
+    // falls through to $USER when AGENT_NAME is absent, which is not a toron
+    // pin; using it made `spawn --join-channel` fail for the OS username.
+    // Prefer the project's registered `captain` alias, then an explicit pane
+    // pin. Never fall back to $USER for a write that toron will reject.
+    let captain = channel_captain(project).or_else(|| {
+        std::env::var("AGENT_NAME")
+            .ok()
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+    });
+    let Some(captain) = captain.as_deref() else {
+        eprintln!(
+            "flywheel: warn: no registered captain alias for {project}; cannot ensure {channels:?}. \
+             Set one with `toron contact captain --project {project} --pin <Pin>`, or create/join \
+             the channel manually with a registered pin."
+        );
+        return;
+    };
     for ch in channels {
         let ensured = Command::new("toron")
-            .args([
-                "channel",
-                "create",
-                "--name",
-                ch,
-                "--project",
-                project,
-                "--as",
-                &captain,
-                ch,
-            ])
+            .arg("channel")
+            .arg("create")
+            .arg("--name")
+            .arg(ch)
+            .arg("--project")
+            .arg(project)
+            .arg("--as")
+            .arg(captain)
+            .arg(ch)
             .output();
         match ensured {
             Ok(o) if o.status.success() => {}
@@ -7098,16 +7114,14 @@ fn ensure_and_join_channels(project: &str, channels: &[String], pins: &[String])
     for pin in pins {
         for ch in channels {
             let status = Command::new("toron")
-                .args([
-                    "channel",
-                    "join",
-                    ch,
-                    "--project",
-                    project,
-                    "--as",
-                    pin,
-                    "--if-missing",
-                ])
+                .arg("channel")
+                .arg("join")
+                .arg(ch)
+                .arg("--project")
+                .arg(project)
+                .arg("--as")
+                .arg(pin)
+                .arg("--if-missing")
                 .output();
             match status {
                 Ok(o) if o.status.success() => {}
@@ -7118,6 +7132,50 @@ fn ensure_and_join_channels(project: &str, channels: &[String], pins: &[String])
                 Err(e) => eprintln!("flywheel: warn: channel join {ch} failed for {pin}: {e}"),
             }
         }
+    }
+}
+
+/// The project's registered orchestrator pin, from the toron captain alias.
+/// `None` means the alias is absent or unreadable; callers must not substitute
+/// the host OS username.
+fn channel_captain(project: &str) -> Option<String> {
+    let out = Command::new("toron")
+        .args(["mail", "whois", project, "captain", "--json"])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| captain_name_from_whois(&out.stdout))
+        .flatten()
+}
+
+fn captain_name_from_whois(stdout: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(stdout).ok()?;
+    value
+        .get("name")
+        .and_then(|n| n.as_str())
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod channel_captain_tests {
+    use super::*;
+
+    #[test]
+    fn whois_json_names_the_registered_captain() {
+        assert_eq!(
+            captain_name_from_whois(br#"{"name":"CloudySparrow"}"#),
+            Some("CloudySparrow".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_or_blank_captain_is_refused() {
+        assert_eq!(captain_name_from_whois(b"{}"), None);
+        assert_eq!(captain_name_from_whois(br#"{"name":"  "}"#), None);
+        assert_eq!(captain_name_from_whois(b"not json"), None);
     }
 }
 
