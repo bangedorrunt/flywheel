@@ -562,6 +562,12 @@ impl ModelRegistry {
             }
         }
         if !h.is_empty() {
+            // The coupled-default rung belongs to closed harnesses (grok,
+            // claude, codex), which `may_be_asked_for_a_model` excludes. It
+            // must run BEFORE the open-harness gate or it is dead code.
+            if let Some(m) = self.coupled_default_model(&h) {
+                return Ok((h, m, "coupled_default"));
+            }
             let open = crate::harness_registry::tier_of(&h)
                 .is_some_and(crate::harness_registry::HarnessTier::may_be_asked_for_a_model);
             if open {
@@ -575,9 +581,6 @@ impl ModelRegistry {
                     if self.caps_permit(&m, &h) {
                         return Ok((h, m, "implied_slot"));
                     }
-                }
-                if let Some(m) = self.coupled_default_model(&h) {
-                    return Ok((h, m, "coupled_default"));
                 }
                 let want_family = slot_alias(model)
                     .and_then(|name| self.slots.get(name))
@@ -2044,6 +2047,35 @@ model = "opencode/big-pickle"
             Some("pi"),
             "premium's compiled-in harness is pi after the omp drop"
         );
+    }
+
+    /// The coupled-default rung is for CLOSED harnesses, which the
+    /// open-harness gate excludes. It must run before that gate; behind it,
+    /// the rung was dead code for exactly the harnesses it serves.
+    #[test]
+    fn coupled_default_rung_runs_for_a_closed_harness() {
+        let _g = with_config_dir();
+        let mut reg = ModelRegistry::default();
+        // The slot's model is a claude id that claude itself cannot run, so
+        // the primary route fails and the coupled-default rung must answer.
+        let mut entry = sample_entry();
+        entry.caps = vec!["opencode".into()];
+        reg.models.insert("claude/sonnet-x".into(), entry);
+        reg.slots.insert(
+            "cheap".into(),
+            SlotSpec {
+                harness: String::new(),
+                model: "claude/sonnet-x".into(),
+                fallback_harness: None,
+                model_fallback: Vec::new(),
+            },
+        );
+        let (harness, model, route) = reg
+            .resolve_profile_route_full("claude", "@cheap", &[])
+            .expect("a registered claude family id must route");
+        assert_eq!(harness, "claude");
+        assert_eq!(model, "claude/sonnet-x");
+        assert_eq!(route, "coupled_default");
     }
 
     /// bd-88m4: coupled no-model defaults follow the grok pattern — a

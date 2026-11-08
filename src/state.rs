@@ -932,7 +932,12 @@ fn dedupe_spawn_entries(entries: Vec<SpawnEntry>) -> Vec<SpawnEntry> {
                 Some(id) => last_identity.get(id) == Some(i),
                 None => true,
             };
-            pane_current && identity_current
+            // A row can be current for its pane OR its identity and still be
+            // the only proof of a live binding (the append-per-registration
+            // registry interleaves panes and identities). Requiring BOTH
+            // silently erased I1 when rows looked like (P1,I1), (P2,I1),
+            // (P2,I2) — keep every row that is current for either key.
+            pane_current || identity_current
         })
         .map(|(_, e)| e)
         .collect()
@@ -1999,6 +2004,11 @@ pub fn trim_last_sent(records: &mut Vec<SentRecord>) {
 pub struct LoopPidEntry {
     pub pid: u32,
     pub started_at: String,
+    /// Kernel start time of `pid` (`ps -o lstart=`), captured at registration.
+    /// A recycled pid fails this check, so a stale entry cannot make an
+    /// unrelated process look like the live loop. Empty on pre-field entries.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub process_start: String,
     /// Filled by the durable runner once the invocation id exists; empty for
     /// the brief pre-invocation window. The authoritative invocation for a
     /// settled loop lives in `loops/<project>.json` (loop_status queries it).
@@ -2036,25 +2046,28 @@ pub fn save_loop_pids(pids: &BTreeMap<String, LoopPidEntry>) -> Result<()> {
 /// two loops on one project race polls + double-dispatch), then overwrites
 /// the registry.
 pub fn register_loop(project: &str, invocation: &str, force: bool) -> Result<Option<LoopPidEntry>> {
+    let _lock = lock_loop_pids();
     let mut pids = load_loop_pids();
+    let pid = std::process::id();
     let mine = LoopPidEntry {
-        pid: std::process::id(),
+        pid,
         started_at: now_iso(),
+        process_start: process_start(pid).unwrap_or_default(),
         invocation: invocation.to_string(),
     };
     if !force
         && let Some(prev) = pids.get(project)
-        && pid_alive(prev.pid)
+        && loop_entry_alive(prev)
     {
         return Ok(Some(prev.clone()));
     }
     if let Some(prev) = pids.get(project) {
-        if pid_alive(prev.pid) {
+        if loop_entry_alive(prev) {
             eprintln!(
                 "flywheel: --force taking over {project} loop from pid {} (terminating)",
                 prev.pid
             );
-            terminate_loop_pid(prev.pid);
+            terminate_loop_entry(prev);
         } else {
             eprintln!(
                 "flywheel: replacing stale loop entry for {project} (pid {} dead)",
@@ -2099,7 +2112,7 @@ pub fn ensure_loop_owner(project: &str) -> Result<()> {
     let pids = load_loop_pids();
     let mine = std::process::id();
     match pids.get(project) {
-        Some(e) if e.pid == mine => Ok(()),
+        Some(e) if e.pid == mine && loop_entry_alive(e) => Ok(()),
         Some(e) => bail!(
             "loop ownership for {project} taken over by pid {} (started {}) — refusing to run; if that process is a stale stray, run: flywheel loop prune",
             e.pid,
@@ -2112,6 +2125,7 @@ pub fn ensure_loop_owner(project: &str) -> Result<()> {
 /// Remove `project`'s entry ONLY when it still belongs to `pid` — a newer
 /// process must never be unregistered by an older one exiting late.
 pub fn unregister_loop(project: &str, pid: u32) {
+    let _lock = lock_loop_pids();
     let mut pids = load_loop_pids();
     let remove = pids.get(project).map(|e| e.pid == pid).unwrap_or(false);
     if remove {
@@ -2133,6 +2147,92 @@ pub fn pid_alive(pid: u32) -> bool {
         .unwrap_or_default();
     let stat = String::from_utf8_lossy(&out).trim().to_string();
     !stat.is_empty() && !stat.starts_with('Z')
+}
+
+/// Kernel start time for `pid`, with minute resolution. Used to distinguish
+/// the process we registered from a later process that reused its pid.
+fn process_start(pid: u32) -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .output()
+        .ok()?;
+    let start = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!start.is_empty()).then_some(start)
+}
+
+/// Is this registry entry still the process it claims to be? A dead pid or a
+/// pid whose start time changed is not. Entries written before the start-time
+/// column existed fall back to the pid-only check.
+pub fn loop_entry_alive(entry: &LoopPidEntry) -> bool {
+    if !pid_alive(entry.pid) {
+        return false;
+    }
+    entry.process_start.is_empty()
+        || process_start(entry.pid).is_none_or(|start| start == entry.process_start)
+}
+
+/// A file lock around the loop-pid registry's read-modify-write cycles.
+/// `create_new` is atomic; a lock left by a crashed process is stolen after
+/// 30s or when its recorded pid is dead. If the lock cannot be acquired in
+/// 5s we proceed unlocked rather than block loop startup forever — the
+/// registry write itself is atomic, so the worst case is a lost update, not
+/// a corrupt file.
+struct LoopPidsLock {
+    path: Option<PathBuf>,
+}
+
+impl Drop for LoopPidsLock {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn lock_loop_pids() -> LoopPidsLock {
+    use std::io::Write as _;
+    let path = state_dir().join("loop-pids.lock");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let started = std::time::Instant::now();
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                let _ = write!(file, "{}", std::process::id());
+                return LoopPidsLock { path: Some(path) };
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age > std::time::Duration::from_secs(30));
+                if stale {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                if started.elapsed() > std::time::Duration::from_secs(5) {
+                    return LoopPidsLock { path: None };
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => return LoopPidsLock { path: None },
+        }
+    }
+}
+
+/// Termination variant that refuses a recycled pid: only the exact process
+/// recorded in the entry is signalled.
+fn terminate_loop_entry(entry: &LoopPidEntry) {
+    if !loop_entry_alive(entry) {
+        return;
+    }
+    terminate_loop_pid(entry.pid);
 }
 
 /// Find the newest record for (agent, prompt-hash). `bd-resume-dedup` uses
@@ -2730,6 +2830,27 @@ mod loops_schema_v2_tests {
 
 #[cfg(test)]
 mod tests {
+    /// A row that is current for only ONE key still proves a live binding.
+    /// The old AND filter erased I1 when the rows were (P1,I1), (P2,I1),
+    /// (P2,I2): row 0 failed identity_current, row 1 failed pane_current.
+    #[test]
+    fn spawn_registry_dedupe_keeps_a_live_identity_on_its_own_pane() {
+        let first = SpawnEntry::profiled("w1:p1", "one", "coder", "omp", Some("I1".into()));
+        let moved = SpawnEntry::profiled("w1:p2", "two", "coder", "omp", Some("I1".into()));
+        let final_row = SpawnEntry::profiled("w1:p2", "three", "coder", "omp", Some("I2".into()));
+        let kept = dedupe_spawn_entries(vec![first, moved, final_row]);
+        assert!(
+            kept.iter()
+                .any(|e| e.pane_id == "w1:p1" && e.mail_identity.as_deref() == Some("I1")),
+            "I1's live pane P1 must survive the interleaved registrations: {kept:?}"
+        );
+        assert!(
+            kept.iter()
+                .any(|e| e.pane_id == "w1:p2" && e.mail_identity.as_deref() == Some("I2")),
+            "P2's current identity must survive: {kept:?}"
+        );
+    }
+
     /// bd-722a: the registry resolves a pane's CURRENT row.
     ///
     /// The registry is append-per-registration, so a pane that was
@@ -4083,6 +4204,24 @@ mod loops_sidecar_tests {
         let _ = std::fs::remove_file(path.with_extension("json.tmp"));
     }
 
+    /// A pid that was reused by an unrelated process must not read as our
+    /// loop. The entry carries the kernel start time for exactly this case.
+    #[test]
+    fn loop_pid_identity_rejects_a_reused_pid() {
+        let _g = loops_test_guard();
+        let p = test_project("pid-identity");
+        register_loop(&p, "inv-1", false).unwrap();
+        let entry = load_loop_pids().get(&p).cloned().expect("registered");
+        assert!(loop_entry_alive(&entry), "own process is the live loop");
+        let mut recycled = entry;
+        recycled.process_start = "Thu Jan  1 00:00:00 1970".into();
+        assert!(
+            !loop_entry_alive(&recycled),
+            "a pid whose start time changed is a different process"
+        );
+        unregister_loop(&p, std::process::id());
+    }
+
     /// bd-fw-stale-loop-processes: the pid registry round-trips atomically.
     #[test]
     fn loop_pid_registry_roundtrip() {
@@ -4091,6 +4230,7 @@ mod loops_sidecar_tests {
         let e = LoopPidEntry {
             pid: 4242,
             started_at: now_iso(),
+            process_start: String::new(),
             invocation: "swarm-loop:proj:1".into(),
         };
         let mut pids = BTreeMap::new();
@@ -4134,6 +4274,7 @@ mod loops_sidecar_tests {
             LoopPidEntry {
                 pid: child_pid,
                 started_at: now_iso(),
+                process_start: String::new(),
                 invocation: "inv-2".into(),
             },
         );
@@ -4173,6 +4314,7 @@ mod loops_sidecar_tests {
             LoopPidEntry {
                 pid: child_pid,
                 started_at: now_iso(),
+                process_start: String::new(),
                 invocation: "inv-other".into(),
             },
         );
