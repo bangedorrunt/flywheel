@@ -267,9 +267,7 @@ pub struct DoorbellState {
 
 /// `<workspace>.state.json`, beside the legacy pid/gen/project sidecars.
 pub fn state_file(state_dir: &Path, workspace: &str) -> PathBuf {
-    state_dir
-        .join("doorbell")
-        .join(format!("{workspace}.state.json"))
+    doorbell_rt::lease::state_file(state_dir, workspace)
 }
 
 pub fn read_state(state_dir: &Path, workspace: &str) -> Option<DoorbellState> {
@@ -277,27 +275,72 @@ pub fn read_state(state_dir: &Path, workspace: &str) -> Option<DoorbellState> {
     serde_json::from_str(&raw).ok()
 }
 
-/// Atomic replace: write a sibling temp file, then rename it into place. A
-/// reader never observes a half-written state record.
+/// Atomic replace under the shared state lock: write a sibling temp file,
+/// then rename it into place. The lock prevents a lease heartbeat and a
+/// dispatcher write from losing each other's fields; the rename prevents a
+/// reader from observing a half-written record.
 pub fn write_state(path: &Path, state: &DoorbellState) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("state path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    let _lock = lock_state(path)?;
     let mut value = fs::read_to_string(path)
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         .filter(serde_json::Value::is_object)
         .unwrap_or_else(|| serde_json::json!({}));
-    if let (Some(object), Ok(serde_json::Value::Object(fields))) =
-        (value.as_object_mut(), serde_json::to_value(state))
-    {
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("state record is not an object: {}", path.display()))?;
+    if let Ok(serde_json::Value::Object(fields)) = serde_json::to_value(state) {
         object.extend(fields);
+    }
+    for (key, present) in [
+        ("pid", state.pid.is_some()),
+        ("project", state.project.is_some()),
+        ("generation", state.generation.is_some()),
+    ] {
+        if !present {
+            object.remove(key);
+        }
     }
     let tmp = path.with_extension("state.tmp");
     fs::write(&tmp, serde_json::to_vec(&value)?)
         .with_context(|| format!("write {}", tmp.display()))?;
     fs::rename(&tmp, path).with_context(|| format!("rename {}", path.display()))?;
     Ok(())
+}
+
+/// Exclusive advisory lock shared with `doorbell-rt`'s lease writer. The
+/// critical section is tiny, so a bounded wait is enough to survive a
+/// competing heartbeat without parking a dispatcher forever.
+fn lock_state(path: &Path) -> Result<fs::File> {
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(5);
+    let lock_path = path.with_extension("state.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("open state lock {}", lock_path.display()))?;
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(POLL);
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                anyhow::bail!("timed out locking state {}", lock_path.display());
+            }
+            Err(fs::TryLockError::Error(error)) => {
+                return Err(error).with_context(|| format!("lock state {}", lock_path.display()));
+            }
+        }
+    }
 }
 
 /// `<workspace>.gen`, sibling of [`pid_file`].
@@ -471,7 +514,11 @@ pub fn stop(state_dir: &Path, workspace: &str) {
     clear_pid(&path);
     let _ = fs::remove_file(unanswered_file(state_dir, workspace));
     let _ = fs::remove_file(gen_file(state_dir, workspace));
-    let _ = fs::remove_file(state_file(state_dir, workspace));
+    let state_path = state_file(state_dir, workspace);
+    if state_path.exists() {
+        let _lock = lock_state(&state_path);
+        let _ = fs::remove_file(&state_path);
+    }
 }
 
 /// What the SELECTED plane says about the workspace a host watches.
@@ -3208,6 +3255,79 @@ mod tests {
         write_gen(&path, &record).expect("write");
         assert_eq!(read_gen(&path), Some(record));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_write_preserves_lease_and_respawn_drops_absent_generation() {
+        let dir = scratch("state-lease");
+        let path = state_file(&dir, "w1");
+        let record = WatcherGen {
+            started_unix: 10,
+            binary_mtime_unix: 5,
+            binary_len: 77,
+            binary_hash: String::new(),
+        };
+        write_state(
+            &path,
+            &DoorbellState {
+                pid: Some(1),
+                project: Some("proj".into()),
+                generation: Some(record),
+            },
+        )
+        .expect("initial state");
+        let lease = doorbell_rt::lease::acquire_lease(&dir, "w1", 100).expect("lease");
+        write_state(
+            &path,
+            &DoorbellState {
+                pid: Some(2),
+                project: Some("proj".into()),
+                generation: None,
+            },
+        )
+        .expect("respawn state");
+        let state = read_state(&dir, "w1").expect("state");
+        assert_eq!(state.pid, Some(2), "respawn replaces the pid");
+        assert!(state.generation.is_none(), "absent generation is removed");
+        assert_eq!(
+            doorbell_rt::lease::read_lease(&dir, "w1"),
+            Some(lease),
+            "a dispatcher write keeps the owner lease"
+        );
+        stop(&dir, "w1");
+        assert!(read_state(&dir, "w1").is_none());
+        assert!(doorbell_rt::lease::read_lease(&dir, "w1").is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn respawn_cycle_replaces_pid_and_generation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch("respawn");
+        let exe = dir.join("fake-doorbell");
+        fs::write(&exe, "#!/bin/sh\nexec sleep 30\n").expect("fake exe");
+        let mut permissions = fs::metadata(&exe).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&exe, permissions).expect("chmod");
+        let pid_path = pid_file(&dir, "w1");
+        let gen_path = gen_file(&dir, "w1");
+
+        spawn_child(&exe, "proj", "w1", &pid_path, &gen_path).expect("first spawn");
+        let first = read_state(&dir, "w1").expect("first state");
+        assert_eq!(first.project.as_deref(), Some("proj"));
+        assert!(first.pid.is_some_and(pid_alive));
+        stop(&dir, "w1");
+        assert!(read_state(&dir, "w1").is_none());
+
+        spawn_child(&exe, "proj", "w1", &pid_path, &gen_path).expect("second spawn");
+        let second = read_state(&dir, "w1").expect("second state");
+        assert!(second.pid.is_some_and(pid_alive));
+        assert_ne!(first.pid, second.pid, "respawn installs the new child pid");
+        assert!(second.generation.is_some(), "respawn captures a generation");
+        stop(&dir, "w1");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

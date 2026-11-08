@@ -366,6 +366,10 @@ fn update_state_file(
     update: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
 ) -> Result<(), LeaseDenied> {
     let path = state_file(state_dir, workspace);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|_| LeaseDenied::Io)?;
+    }
+    let _lock = lock_state(&path)?;
     let mut value = std::fs::read_to_string(&path)
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
@@ -373,9 +377,6 @@ fn update_state_file(
         .unwrap_or_else(|| serde_json::json!({}));
     let object = value.as_object_mut().ok_or(LeaseDenied::Io)?;
     update(object);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|_| LeaseDenied::Io)?;
-    }
     let tmp = path.with_extension("state.tmp");
     std::fs::write(
         &tmp,
@@ -384,6 +385,32 @@ fn update_state_file(
     .map_err(|_| LeaseDenied::Io)?;
     std::fs::rename(&tmp, &path).map_err(|_| LeaseDenied::Io)?;
     Ok(())
+}
+
+/// Exclusive advisory lock shared with flywheel's dispatcher-state writer.
+/// Bounded so a wedged writer cannot park every heartbeat forever.
+fn lock_state(path: &Path) -> Result<std::fs::File, LeaseDenied> {
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(5);
+    let lock_path = path.with_extension("state.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|_| LeaseDenied::Io)?;
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(POLL);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => return Err(LeaseDenied::Io),
+            Err(std::fs::TryLockError::Error(_)) => return Err(LeaseDenied::Io),
+        }
+    }
 }
 
 #[derive(Debug)]
