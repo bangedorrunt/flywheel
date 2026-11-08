@@ -56,6 +56,15 @@ pub fn owner_file(state_dir: &Path, workspace: &str) -> PathBuf {
         .join(format!("owner-{workspace}.json"))
 }
 
+/// The unified doorbell record: pid, project, watcher generation and the
+/// owner lease in one atomically-replaced JSON object. `owner-*.json` remains
+/// a read fallback for one migration window.
+pub fn state_file(state_dir: &Path, workspace: &str) -> PathBuf {
+    state_dir
+        .join("doorbell")
+        .join(format!("{workspace}.state.json"))
+}
+
 pub fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -176,6 +185,13 @@ pub fn pid_alive(pid: u32) -> bool {
 }
 
 pub fn read_lease(state_dir: &Path, workspace: &str) -> Option<OwnerLease> {
+    if let Ok(raw) = std::fs::read_to_string(state_file(state_dir, workspace))
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw)
+        && let Some(lease) = value.get("lease")
+        && let Ok(lease) = serde_json::from_value(lease.clone())
+    {
+        return Some(lease);
+    }
     let raw = std::fs::read_to_string(owner_file(state_dir, workspace)).ok()?;
     serde_json::from_str(&raw).ok()
 }
@@ -187,21 +203,26 @@ pub fn live_leases(state_dir: &Path, now_unix: u64) -> Vec<(String, OwnerLease)>
     let Ok(entries) = std::fs::read_dir(state_dir.join("doorbell")) else {
         return out;
     };
+    let mut workspaces = std::collections::BTreeSet::new();
     for entry in entries.filter_map(|e| e.ok()) {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(ws) = name
+        if let Some(ws) = name
             .strip_prefix("owner-")
             .and_then(|n| n.strip_suffix(".json"))
-        else {
-            continue;
-        };
+        {
+            workspaces.insert(ws.to_string());
+        } else if let Some(ws) = name.strip_suffix(".state.json") {
+            workspaces.insert(ws.to_string());
+        }
+    }
+    for ws in workspaces {
         if ws.is_empty() {
             continue;
         }
-        if let Some(lease) = read_lease(state_dir, ws)
+        if let Some(lease) = read_lease(state_dir, &ws)
             && !lease_stale(&lease, now_unix)
         {
-            out.push((ws.to_string(), lease));
+            out.push((ws, lease));
         }
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -321,6 +342,9 @@ pub fn release_lease(state_dir: &Path, workspace: &str, lease: &OwnerLease) {
                     || lease.process_start_unix == 0
                     || cur.process_start_unix == lease.process_start_unix) =>
         {
+            let _ = update_state_file(state_dir, workspace, |object| {
+                object.remove("lease");
+            });
             let _ = std::fs::remove_file(owner_file(state_dir, workspace));
         }
         _ => {}
@@ -328,13 +352,38 @@ pub fn release_lease(state_dir: &Path, workspace: &str, lease: &OwnerLease) {
 }
 
 fn write_lease(state_dir: &Path, workspace: &str, lease: &OwnerLease) -> Result<(), LeaseDenied> {
-    let path = owner_file(state_dir, workspace);
+    let value = serde_json::to_value(lease).map_err(|_| LeaseDenied::Io)?;
+    update_state_file(state_dir, workspace, |object| {
+        object.insert("lease".into(), value);
+    })
+}
+
+/// Merge one field into the unified state object and atomically replace it,
+/// preserving pid/project/generation written by the flywheel side.
+fn update_state_file(
+    state_dir: &Path,
+    workspace: &str,
+    update: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> Result<(), LeaseDenied> {
+    let path = state_file(state_dir, workspace);
+    let mut value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    let object = value.as_object_mut().ok_or(LeaseDenied::Io)?;
+    update(object);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|_| LeaseDenied::Io)?;
     }
-    serde_json::to_string(lease)
-        .map_err(|_| LeaseDenied::Io)
-        .and_then(|json| std::fs::write(path, json).map_err(|_| LeaseDenied::Io))
+    let tmp = path.with_extension("state.tmp");
+    std::fs::write(
+        &tmp,
+        serde_json::to_vec(&value).map_err(|_| LeaseDenied::Io)?,
+    )
+    .map_err(|_| LeaseDenied::Io)?;
+    std::fs::rename(&tmp, &path).map_err(|_| LeaseDenied::Io)?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -396,12 +445,36 @@ mod tests {
         let _ = std::fs::remove_file(owner_file(&d, "w"));
         let plain = acquire_lease(&d, "w", now).unwrap();
         assert!(
-            !std::fs::read_to_string(owner_file(&d, "w"))
+            !std::fs::read_to_string(state_file(&d, "w"))
                 .unwrap()
                 .contains("kind")
         );
         assert_eq!(inbox_lease_key("w"), "inbox-w");
         release_lease(&d, "w", &plain);
+    }
+
+    #[test]
+    fn lease_merges_into_unified_state_and_preserves_other_fields() {
+        let d = dir("unified");
+        let now = unix_now();
+        std::fs::create_dir_all(d.join("doorbell")).unwrap();
+        std::fs::write(
+            state_file(&d, "w"),
+            r#"{"pid":42,"project":"proj","generation":{"started_unix":1}}"#,
+        )
+        .unwrap();
+        let lease = acquire_lease(&d, "w", now).unwrap();
+        let state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(state_file(&d, "w")).unwrap()).unwrap();
+        assert_eq!(state["pid"], 42);
+        assert_eq!(state["project"], "proj");
+        assert_eq!(state["lease"]["pid"], lease.pid);
+        release_lease(&d, "w", &lease);
+        let state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(state_file(&d, "w")).unwrap()).unwrap();
+        assert!(state.get("lease").is_none());
+        assert_eq!(state["pid"], 42, "releasing the lease keeps static state");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     fn dir(name: &str) -> PathBuf {

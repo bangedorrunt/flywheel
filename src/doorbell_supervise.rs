@@ -249,10 +249,16 @@ fn dispatcher_workspaces(state_dir: &Path) -> Vec<String> {
     };
     for e in entries.flatten() {
         let path = e.path();
-        if path.extension().and_then(|x| x.to_str()) != Some("gen") {
-            continue;
-        }
-        if let Some(ws) = path.file_stem().and_then(|x| x.to_str()) {
+        let name = path
+            .file_name()
+            .and_then(|x| x.to_str())
+            .unwrap_or_default();
+        let ws = if path.extension().and_then(|x| x.to_str()) == Some("gen") {
+            path.file_stem().and_then(|x| x.to_str())
+        } else {
+            name.strip_suffix(".state.json")
+        };
+        if let Some(ws) = ws {
             out.push(ws.to_string());
         }
     }

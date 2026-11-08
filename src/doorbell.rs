@@ -42,6 +42,15 @@ pub fn pid_file(state_dir: &Path, workspace: &str) -> PathBuf {
 
 /// ADR-0005 D1.4 first line: `dispatcher: up|down …`
 pub fn dispatcher_status_line(state_dir: &Path, workspace: &str) -> String {
+    if let Some(state) = read_state(state_dir, workspace)
+        && let Some(pid) = state.pid
+    {
+        return if pid_alive(pid) {
+            format!("dispatcher: up pid={pid}")
+        } else {
+            format!("dispatcher: down stale={pid}")
+        };
+    }
     match inspect_lock(&pid_file(state_dir, workspace)) {
         LockAction::Attach { pid } => format!("dispatcher: up pid={pid}"),
         LockAction::Superseded { pid } => format!("dispatcher: up pid={pid} superseded"),
@@ -53,6 +62,15 @@ pub fn dispatcher_status_line(state_dir: &Path, workspace: &str) -> String {
 /// Helm/snapshot token: `absent` (never started) vs `down` (dead) vs `up`.
 /// Snapshot must not treat lowercase `down` as absent.
 pub fn dispatcher_token(state_dir: &Path, workspace: &str) -> &'static str {
+    if let Some(state) = read_state(state_dir, workspace)
+        && (state.pid.is_some() || state.project.is_some() || state.generation.is_some())
+    {
+        return if state.pid.is_some_and(pid_alive) {
+            "up"
+        } else {
+            "down"
+        };
+    }
     let pid_path = pid_file(state_dir, workspace);
     let gen_path = gen_file(state_dir, workspace);
     if !pid_path.exists() && !gen_path.exists() {
@@ -234,6 +252,54 @@ impl WatcherGen {
     }
 }
 
+/// One authoritative static-state record for a workspace: pid, project and
+/// watcher generation. The old pid/gen/project sidecars remain readable for
+/// one migration window, but every new write lands here first.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DoorbellState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<WatcherGen>,
+}
+
+/// `<workspace>.state.json`, beside the legacy pid/gen/project sidecars.
+pub fn state_file(state_dir: &Path, workspace: &str) -> PathBuf {
+    state_dir
+        .join("doorbell")
+        .join(format!("{workspace}.state.json"))
+}
+
+pub fn read_state(state_dir: &Path, workspace: &str) -> Option<DoorbellState> {
+    let raw = fs::read_to_string(state_file(state_dir, workspace)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Atomic replace: write a sibling temp file, then rename it into place. A
+/// reader never observes a half-written state record.
+pub fn write_state(path: &Path, state: &DoorbellState) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    let mut value = fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let (Some(object), Ok(serde_json::Value::Object(fields))) =
+        (value.as_object_mut(), serde_json::to_value(state))
+    {
+        object.extend(fields);
+    }
+    let tmp = path.with_extension("state.tmp");
+    fs::write(&tmp, serde_json::to_vec(&value)?)
+        .with_context(|| format!("write {}", tmp.display()))?;
+    fs::rename(&tmp, path).with_context(|| format!("rename {}", path.display()))?;
+    Ok(())
+}
+
 /// `<workspace>.gen`, sibling of [`pid_file`].
 pub fn gen_file(state_dir: &Path, workspace: &str) -> PathBuf {
     state_dir.join("doorbell").join(format!("{workspace}.gen"))
@@ -405,6 +471,7 @@ pub fn stop(state_dir: &Path, workspace: &str) {
     clear_pid(&path);
     let _ = fs::remove_file(unanswered_file(state_dir, workspace));
     let _ = fs::remove_file(gen_file(state_dir, workspace));
+    let _ = fs::remove_file(state_file(state_dir, workspace));
 }
 
 /// What the SELECTED plane says about the workspace a host watches.
@@ -812,8 +879,19 @@ fn spawn_child(
         .spawn()
         .with_context(|| format!("spawn doorbell for {workspace}"))?;
     write_pid(path, child.id())?;
-    if let Some(record) = WatcherGen::capture(exe, unix_now()) {
-        let _ = write_gen(gen_path, &record);
+    let generation = WatcherGen::capture(exe, unix_now());
+    if let Some(record) = &generation {
+        let _ = write_gen(gen_path, record);
+    }
+    if let Some(dir) = gen_path.parent() {
+        let _ = write_state(
+            &dir.join(format!("{workspace}.state.json")),
+            &DoorbellState {
+                pid: Some(child.id()),
+                project: Some(project.to_string()),
+                generation,
+            },
+        );
     }
     Ok(())
 }
@@ -1183,20 +1261,41 @@ pub fn read_project_sidecar(state_dir: &Path, workspace: &str) -> Option<String>
 /// Workspaces without a sidecar are skipped — they predate the supervisor.
 pub fn dead_dispatchers(state_dir: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
     let Ok(entries) = fs::read_dir(state_dir.join("doorbell")) else {
         return out;
     };
     for e in entries.flatten() {
         let path = e.path();
-        if path.extension().and_then(|x| x.to_str()) != Some("gen") {
-            continue;
-        }
-        let Some(label) = path.file_stem().and_then(|x| x.to_str()) else {
+        let name = path
+            .file_name()
+            .and_then(|x| x.to_str())
+            .unwrap_or_default();
+        let label = if path.extension().and_then(|x| x.to_str()) == Some("gen") {
+            path.file_stem()
+                .and_then(|x| x.to_str())
+                .map(str::to_string)
+        } else {
+            name.strip_suffix(".state.json").map(str::to_string)
+        };
+        let Some(label) = label.filter(|l| !l.is_empty()) else {
             continue;
         };
-        let alive = read_pid(&pid_file(state_dir, label)).is_some_and(pid_alive);
-        if !alive && let Some(project) = read_project_sidecar(state_dir, label) {
-            out.push((label.to_string(), project));
+        if !seen.insert(label.clone()) {
+            continue;
+        }
+        let state = read_state(state_dir, &label);
+        let alive = state
+            .as_ref()
+            .and_then(|s| s.pid)
+            .or_else(|| read_pid(&pid_file(state_dir, &label)))
+            .is_some_and(pid_alive);
+        if !alive
+            && let Some(project) = state
+                .and_then(|s| s.project)
+                .or_else(|| read_project_sidecar(state_dir, &label))
+        {
+            out.push((label, project));
         }
     }
     out
@@ -3108,6 +3207,28 @@ mod tests {
         };
         write_gen(&path, &record).expect("write");
         assert_eq!(read_gen(&path), Some(record));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unified_state_roundtrips_and_stop_removes_it() {
+        let dir = scratch("state");
+        let path = state_file(&dir, "w1");
+        let record = WatcherGen {
+            started_unix: 10,
+            binary_mtime_unix: 5,
+            binary_len: 77,
+            binary_hash: String::new(),
+        };
+        let state = DoorbellState {
+            pid: Some(std::process::id()),
+            project: Some("proj".into()),
+            generation: Some(record),
+        };
+        write_state(&path, &state).expect("write state");
+        assert_eq!(read_state(&dir, "w1"), Some(state));
+        stop(&dir, "w1");
+        assert_eq!(read_state(&dir, "w1"), None, "stop removes unified state");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
