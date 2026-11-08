@@ -17552,6 +17552,10 @@ fn cmd_upgrade() -> Result<()> {
     if !status.success() {
         bail!("cargo install failed");
     }
+    let removed = crate::doorbell::cleanup_legacy_sidecars(&crate::config::state_dir());
+    if removed > 0 {
+        println!("removed {removed} legacy doorbell sidecars");
+    }
     println!("flywheel upgraded");
     Ok(())
 }

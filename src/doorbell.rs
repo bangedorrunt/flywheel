@@ -518,6 +518,51 @@ pub fn stop(state_dir: &Path, workspace: &str) {
     let _ = fs::remove_file(project_sidecar(state_dir, workspace));
 }
 
+/// One-shot upgrade sweep for the pre-unification pid/gen/project sidecars.
+///
+/// A sidecar family is removed only when it cannot still belong to a live
+/// legacy dispatcher: no pid, a dead pid, or no pid at all. A live pid or an
+/// unreadable pid file is preserved (fail closed) so an upgrade never orphans
+/// a process that is still running. Returns the number of files removed.
+pub fn cleanup_legacy_sidecars(state_dir: &Path) -> usize {
+    const SUFFIXES: [&str; 3] = [".pid", ".gen", ".project"];
+    let dir = state_dir.join("doorbell");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return 0;
+    };
+    let mut workspaces = std::collections::BTreeSet::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        for suffix in SUFFIXES {
+            if let Some(workspace) = name.strip_suffix(suffix)
+                && !workspace.is_empty()
+            {
+                workspaces.insert(workspace.to_string());
+            }
+        }
+    }
+
+    let mut removed = 0usize;
+    for workspace in workspaces {
+        match fs::read_to_string(pid_file(state_dir, &workspace)) {
+            Ok(raw) => match raw.trim().parse::<u32>() {
+                Ok(pid) if pid_alive(pid) => continue,
+                Ok(_) => {}
+                Err(_) => continue,
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => continue,
+        }
+        for suffix in SUFFIXES {
+            let path = dir.join(format!("{workspace}{suffix}"));
+            if fs::remove_file(path).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
 /// What the SELECTED plane says about the workspace a host watches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspacePresence {
@@ -936,6 +981,7 @@ pub fn ensure_running(
     workspace: &str,
     project: &str,
 ) -> Result<LockAction> {
+    let _ = cleanup_legacy_sidecars(state_dir);
     let loaded = crate::config::Config::load().ok();
     let comms_on = match &loaded {
         Some(c) => crate::comms_send::enabled(c),
@@ -3493,6 +3539,41 @@ mod tests {
             "rebuilt binary supersedes even with a gen file present"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upgrade_cleanup_removes_only_orphaned_legacy_sidecars() {
+        let dir = scratch("legacy-cleanup");
+        for ws in ["dead", "orphan", "live", "unreadable"] {
+            write_gen(
+                &gen_file(&dir, ws),
+                &WatcherGen {
+                    started_unix: 1,
+                    binary_mtime_unix: 1,
+                    binary_len: 1,
+                    binary_hash: String::new(),
+                },
+            )
+            .expect("gen");
+            fs::write(project_sidecar(&dir, ws), "proj").expect("project");
+        }
+        write_pid(&pid_file(&dir, "dead"), 999_998).expect("dead pid");
+        write_pid(&pid_file(&dir, "live"), std::process::id()).expect("live pid");
+        fs::write(pid_file(&dir, "unreadable"), "not-a-pid\n").expect("bad pid");
+
+        assert_eq!(cleanup_legacy_sidecars(&dir), 5);
+        for ws in ["live", "unreadable"] {
+            assert!(pid_file(&dir, ws).exists(), "{ws} pid preserved");
+            assert!(gen_file(&dir, ws).exists(), "{ws} gen preserved");
+            assert!(project_sidecar(&dir, ws).exists(), "{ws} project preserved");
+        }
+        for ws in ["dead", "orphan"] {
+            assert!(!pid_file(&dir, ws).exists(), "{ws} pid removed");
+            assert!(!gen_file(&dir, ws).exists(), "{ws} gen removed");
+            assert!(!project_sidecar(&dir, ws).exists(), "{ws} project removed");
+        }
+        assert_eq!(cleanup_legacy_sidecars(&dir), 0, "sweep is idempotent");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -1092,6 +1092,7 @@ impl RtHost {
 
 pub fn run_embedded(cfg: &Config, project: &str, workspace: &str) -> anyhow::Result<()> {
     use anyhow::Context;
+    let _ = doorbell::cleanup_legacy_sidecars(&config::state_dir());
     let now = doorbell_rt::lease::unix_now();
     let lease = match doorbell_rt::lease::acquire_lease(&config::state_dir(), workspace, now) {
         Ok(l) => l,
