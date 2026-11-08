@@ -14405,6 +14405,8 @@ fn cmd_loop_replay(project: &str) -> Result<()> {
         states: Default::default(),
         dispatch_pending: Default::default(),
         drain_pending: Default::default(),
+        bead_slots: Default::default(),
+        agent_slots: Default::default(),
     };
     for (idx, entry) in entries.iter().enumerate() {
         let Some(msg_val) = entry.get("msg") else {
@@ -14988,6 +14990,8 @@ fn cmd_loop(
                 states: Default::default(),
                 dispatch_pending: Default::default(),
                 drain_pending: Default::default(),
+                bead_slots: Default::default(),
+                agent_slots: Default::default(),
             },
             &d_states,
             nudge,

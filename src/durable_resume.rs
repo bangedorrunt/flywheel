@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use crate::durable::{DRAIN_GRACE_POLLS, DrainState, HealState, LoopModel};
+use crate::durable::{AgentSlot, BeadSlot, DRAIN_GRACE_POLLS, DrainState, HealState, LoopModel};
 
 /// Seed crash-resume state from persisted projections without performing I/O.
 ///
@@ -18,6 +18,8 @@ pub(crate) fn seed_swarm_resume(
     heal_states: &BTreeMap<String, crate::state::HealState>,
     done_mailed: &HashSet<String>,
     drain_pending: &BTreeMap<String, String>,
+    bead_slots: &BTreeMap<String, BeadSlot>,
+    agent_slots: &BTreeMap<String, AgentSlot>,
 ) {
     for (name, state) in heal_states {
         model.heal_states.insert(
@@ -31,6 +33,22 @@ pub(crate) fn seed_swarm_resume(
         );
     }
     model.done_mailed = done_mailed.clone();
+    model.bead_slots = bead_slots.clone();
+    model.agent_slots = agent_slots
+        .iter()
+        .map(|(name, slot)| {
+            (
+                name.clone(),
+                AgentSlot {
+                    incarnation: slot.incarnation,
+                    // Suppression belongs to the dead generation. A fresh
+                    // process must ring the fresh pane's mail, so a crash
+                    // mid-respawn never mutes the new incarnation.
+                    context_suppressed: false,
+                },
+            )
+        })
+        .collect();
     model.drain_pending = drain_pending
         .iter()
         .map(|(name, bead_id)| {
@@ -67,7 +85,14 @@ mod tests {
         let done = HashSet::from(["bd-done".to_string()]);
         let drains = BTreeMap::from([("coder".to_string(), "bd-drain".to_string())]);
 
-        seed_swarm_resume(&mut model, &heal, &done, &drains);
+        seed_swarm_resume(
+            &mut model,
+            &heal,
+            &done,
+            &drains,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
 
         assert_eq!(model.done_mailed, done);
         assert!(!model.heal_states["coder"].awaiting_clear);

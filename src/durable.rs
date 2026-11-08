@@ -340,6 +340,122 @@ pub struct LoopModel {
     /// countdown; Heal-exit fulfills; Tick-expiry force-stops.
     #[serde(default)]
     pub drain_pending: std::collections::BTreeMap<String, DrainState>,
+    /// Per-bead control (bd-loop-slots): claim watch, close grace, verify
+    /// dispatch. Replaces the stack-frame maps that reset on crash-resume.
+    #[serde(default)]
+    pub bead_slots: std::collections::BTreeMap<String, BeadSlot>,
+    /// Per-agent control (bd-loop-slots): context-limit incarnations.
+    #[serde(default)]
+    pub agent_slots: std::collections::BTreeMap<String, AgentSlot>,
+}
+
+/// Per-bead control state owned by [`LoopModel`] (bd-loop-slots). One slot
+/// replaces the three stack-frame maps that used to shadow the durable model
+/// (`claim_watch`, `close_grace_ticks`, `verifier_dispatched`) and reset on
+/// every crash-resume.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeadSlot {
+    /// Claim-watch tracker while the bead is in flight.
+    #[serde(default)]
+    pub watch: Option<ClaimWatch>,
+    /// Missing-verdict grace polls before the loop reopens the bead.
+    #[serde(default)]
+    pub close_grace_ticks: u32,
+    /// Verify dispatch is once per bead, across crash-resume.
+    #[serde(default)]
+    pub verifier_dispatched: bool,
+}
+
+impl BeadSlot {
+    pub fn is_empty(&self) -> bool {
+        self.watch.is_none() && self.close_grace_ticks == 0 && !self.verifier_dispatched
+    }
+}
+
+/// Per-agent control state owned by [`LoopModel`] (bd-loop-slots).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSlot {
+    /// Fresh-pane generations started for this agent; a context-limit
+    /// respawn bumps it so suppression belongs to the dead generation.
+    #[serde(default)]
+    pub incarnation: u64,
+    /// Mail wakes are suppressed only while the dead generation's respawn
+    /// is in flight. Resume seeding clears it: a fresh process must ring the
+    /// fresh pane's mail.
+    #[serde(default)]
+    pub context_suppressed: bool,
+}
+
+impl LoopModel {
+    /// The one bead slot for `bead_id`, created empty on first touch.
+    pub fn bead_slot(&mut self, bead_id: &str) -> &mut BeadSlot {
+        self.bead_slots.entry(bead_id.to_string()).or_default()
+    }
+
+    /// Fold the claim-watch step through the model-owned slots. The local
+    /// map is a working projection only; the step's insert/remove result is
+    /// written back through the same owner.
+    pub fn fold_claim_watches(
+        &mut self,
+        step: impl FnOnce(&mut std::collections::HashMap<String, ClaimWatch>),
+    ) {
+        let mut watches: std::collections::HashMap<String, ClaimWatch> = self
+            .bead_slots
+            .iter()
+            .filter_map(|(id, slot)| slot.watch.clone().map(|w| (id.clone(), w)))
+            .collect();
+        step(&mut watches);
+        for slot in self.bead_slots.values_mut() {
+            slot.watch = None;
+        }
+        for (id, watch) in watches {
+            self.bead_slot(&id).watch = Some(watch);
+        }
+        self.bead_slots.retain(|_, slot| !slot.is_empty());
+    }
+
+    /// Count one WorkerReceipt grace poll and return the new count.
+    pub fn bump_close_grace(&mut self, bead_id: &str) -> u32 {
+        let slot = self.bead_slot(bead_id);
+        slot.close_grace_ticks = slot.close_grace_ticks.saturating_add(1);
+        slot.close_grace_ticks
+    }
+
+    /// Drop every per-bead control bit (legal close or reopen).
+    pub fn clear_bead_slot(&mut self, bead_id: &str) {
+        self.bead_slots.remove(bead_id);
+    }
+
+    /// Return true exactly once per bead (the verify-dispatch dedup).
+    pub fn mark_verifier_dispatched(&mut self, bead_id: &str) -> bool {
+        let slot = self.bead_slot(bead_id);
+        let first = !slot.verifier_dispatched;
+        slot.verifier_dispatched = true;
+        first
+    }
+
+    /// Suppress mail wakes for one dead context-limit generation.
+    pub fn suppress_context_limit(&mut self, name: &str) {
+        let slot = self.agent_slots.entry(name.to_string()).or_default();
+        slot.incarnation = slot.incarnation.saturating_add(1);
+        slot.context_suppressed = true;
+    }
+
+    /// The fresh pane is up: its mail must ring again.
+    pub fn clear_context_limit(&mut self, name: &str) {
+        if let Some(slot) = self.agent_slots.get_mut(name) {
+            slot.context_suppressed = false;
+        }
+    }
+
+    /// Names whose wakes are suppressed (derived, never a second owner).
+    pub fn wake_suppressed(&self) -> std::collections::HashSet<String> {
+        self.agent_slots
+            .iter()
+            .filter(|(_, slot)| slot.context_suppressed)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
 }
 
 /// GS-030/GS-033 (NEW-L2): seed a LoopModel's crash-resume state from the
@@ -357,8 +473,17 @@ pub fn seed_swarm_resume(
     heal_states: &std::collections::BTreeMap<String, crate::state::HealState>,
     done_mailed: &std::collections::HashSet<String>,
     drain_pending: &std::collections::BTreeMap<String, String>,
+    bead_slots: &std::collections::BTreeMap<String, BeadSlot>,
+    agent_slots: &std::collections::BTreeMap<String, AgentSlot>,
 ) {
-    crate::durable_resume::seed_swarm_resume(model, heal_states, done_mailed, drain_pending);
+    crate::durable_resume::seed_swarm_resume(
+        model,
+        heal_states,
+        done_mailed,
+        drain_pending,
+        bead_slots,
+        agent_slots,
+    );
 }
 
 /// GS-033 (NEW-L2 / B1): seed the one WorkspaceModel's swarm slice from
@@ -376,6 +501,8 @@ pub fn seed_workspace_from_active_loop(
                 &al.heal_states,
                 &al.done_mailed,
                 &al.drain_pending,
+                &al.bead_slots,
+                &al.agent_slots,
             );
             Ok(())
         }
@@ -4311,7 +4438,7 @@ fn plane_s_wake_prompt(d: &MailDigest) -> String {
 /// Why a watched bead is waiting (ADR-0019 Spec 3.4). An overlap wait is
 /// NOT a stuck owner: the bead's write paths are held by another in-flight
 /// bead — no nudge, no T0-T3 escalation, the loop waits for release.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WaitReason {
     /// the dispatched agent reported blocked (the T0-T3 escalation path
     /// owns this reason)
@@ -4331,7 +4458,7 @@ pub enum WaitReason {
 }
 
 /// One dispatched bead's claim-watch entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimWatch {
     /// the agent the bead prompt was dispatched to (terminal name)
     pub agent: String,
@@ -5964,6 +6091,8 @@ async fn swarm_loop(
                 &al.heal_states,
                 &al.done_mailed,
                 &al.drain_pending,
+                &al.bead_slots,
+                &al.agent_slots,
             );
         }
         Ok(None) => {}
@@ -5983,13 +6112,7 @@ async fn swarm_loop(
     let mut complete_holds: u32 = 0;
     let mut blind_complete_failures: u32 = 0;
     let mut critical_leaf_failed_this_iter: bool;
-    let mut claim_watch: std::collections::HashMap<String, ClaimWatch> =
-        std::collections::HashMap::new();
     let mut not_ready_mailed: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut close_grace_ticks: std::collections::HashMap<String, u32> =
-        std::collections::HashMap::new();
-    let mut verifier_dispatched: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
     let mut nudge_msgs: Vec<LoopMsg> = Vec::new();
     let mut dispatch_pending: std::collections::HashSet<String> = {
         if let Ok(Some(al)) = crate::state::load_active_loop(&params.project) {
@@ -6010,7 +6133,6 @@ async fn swarm_loop(
     };
     let mut seen_xproj: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut seen_ctx_limit: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut ctx_suppressed: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut states: Vec<AgentState> = Vec::new();
     let mut since_snapshot: u64 = 0;
     let mut wake: doorbell_core::wake_core::WakeModel = {
@@ -6262,7 +6384,7 @@ async fn swarm_loop(
                 "flywheel: CONTEXT_LIMIT from {} → respawning {target} fresh this cycle",
                 item.from
             );
-            ctx_suppressed.insert(target.clone());
+            swarm.suppress_context_limit(&target);
             respawn_and_requeue(
                 &params,
                 &mut queue,
@@ -6275,7 +6397,7 @@ async fn swarm_loop(
             .await;
             // The suppression exists only for the dead generation. Once the
             // fresh pane is up, its mail must ring again (bd-ctx-suppressed).
-            ctx_suppressed.remove(&target);
+            swarm.clear_context_limit(&target);
         }
 
         exited_names.clear();
@@ -6606,16 +6728,19 @@ async fn swarm_loop(
                 }
             }
 
-            let watch_actions = claim_watch_step_with_known(
-                &mut claim_watch,
-                &ready,
-                &inprog,
-                &not_ready,
-                &states,
-                params.claim_nudge_after_polls,
-                &overlap,
-                &live_leases,
-            );
+            let mut watch_actions = Vec::new();
+            swarm.fold_claim_watches(|claim_watch| {
+                watch_actions = claim_watch_step_with_known(
+                    claim_watch,
+                    &ready,
+                    &inprog,
+                    &not_ready,
+                    &states,
+                    params.claim_nudge_after_polls,
+                    &overlap,
+                    &live_leases,
+                );
+            });
             for a in watch_actions {
                 match a {
                     ClaimWatchAction::NudgeClaim { agent, bead_id } => {
@@ -6752,7 +6877,7 @@ async fn swarm_loop(
                                 let status = v.get("status").and_then(Value::as_str).unwrap_or("?");
                                 match status {
                                     "legal" => {
-                                        close_grace_ticks.remove(&bead_id);
+                                        swarm.clear_bead_slot(&bead_id);
                                         eprintln!(
                                             "flywheel: close of {bead_id} verified (legal verdict bound to sha)"
                                         );
@@ -6779,7 +6904,7 @@ async fn swarm_loop(
                                         }
                                     }
                                     "no-commit" => {
-                                        close_grace_ticks.remove(&bead_id);
+                                        swarm.clear_bead_slot(&bead_id);
                                         emit_ledger_fact(
                                             &crate::config::state_dir(),
                                             &params.project,
@@ -6852,31 +6977,28 @@ async fn swarm_loop(
                                                 .to_string();
                                         }
                                         if lr_band != "loop-runnable" {
-                                            let ticks = close_grace_ticks
-                                                .entry(bead_id.clone())
-                                                .or_insert(0);
-                                            *ticks += 1;
-                                            if eligible && *ticks < 2 {
+                                            let ticks = swarm.bump_close_grace(&bead_id);
+                                            if eligible && ticks < 2 {
                                                 eprintln!(
                                                     "flywheel: {bead_id} missing verdict (WorkerReceipt grace {ticks}/2)"
                                                 );
                                                 release_locks = false;
-                                                let agent = claim_watch
+                                                let agent = swarm
+                                                    .bead_slots
                                                     .get(&bead_id)
+                                                    .and_then(|slot| slot.watch.as_ref())
                                                     .map(|cw| cw.agent.clone())
                                                     .unwrap_or_default();
-                                                claim_watch.insert(
-                                                    bead_id.clone(),
-                                                    ClaimWatch {
+                                                swarm.bead_slot(&bead_id).watch =
+                                                    Some(ClaimWatch {
                                                         agent,
                                                         unclaimed_polls: 0,
                                                         close_nudged: false,
                                                         close_polls: 0,
                                                         wait_reason: None,
-                                                    },
-                                                );
+                                                    });
                                             } else {
-                                                close_grace_ticks.remove(&bead_id);
+                                                swarm.clear_bead_slot(&bead_id);
                                                 emit_ledger_fact(
                                                     &crate::config::state_dir(),
                                                     &params.project,
@@ -6899,7 +7021,7 @@ async fn swarm_loop(
                                                 }
                                             }
                                         } else {
-                                            close_grace_ticks.remove(&bead_id);
+                                            swarm.clear_bead_slot(&bead_id);
                                             emit_ledger_fact(
                                                 &crate::config::state_dir(),
                                                 &params.project,
@@ -6917,7 +7039,7 @@ async fn swarm_loop(
                                 "flywheel: close-check for {bead_id} failed (continuing): {e}"
                             ),
                         }
-                        if verifier_dispatched.insert(bead_id.clone()) {
+                        if swarm.mark_verifier_dispatched(&bead_id) {
                             match crate::elm::leaf::run_leaf_journaled(
                                 &params.project,
                                 "__verify-dispatch",
@@ -6963,8 +7085,7 @@ async fn swarm_loop(
 
         let mut blocked_names: Vec<String> = Vec::new();
         let mut actions: Vec<LoopAction> = Vec::new();
-        let wake_suppressed: std::collections::HashSet<String> =
-            ctx_suppressed.iter().cloned().collect();
+        let wake_suppressed: std::collections::HashSet<String> = swarm.wake_suppressed();
         clear_stale_landed_for_idle(&params.project, &params.invocation, &states);
         {
             let renew_extend = lease_renew_seconds(params.interval_secs);
@@ -7253,6 +7374,10 @@ async fn swarm_loop(
                 .heal_states
                 .retain(|k, _| live_agents.contains(k));
             swarm.heal_states = next_model.heal_states.clone();
+            next_model
+                .agent_slots
+                .retain(|k, _| live_agents.contains(k));
+            swarm.agent_slots = next_model.agent_slots.clone();
             if per_bead_phase.len() > 500 {
                 let mut keys: Vec<String> = per_bead_phase.keys().cloned().collect();
                 keys.sort();
@@ -7291,6 +7416,8 @@ async fn swarm_loop(
                 .iter()
                 .map(|(k, v)| (k.clone(), v.bead_id.clone()))
                 .collect();
+            al.bead_slots = swarm.bead_slots.clone();
+            al.agent_slots = swarm.agent_slots.clone();
             al.heal_states = next_model
                 .heal_states
                 .iter()
@@ -7554,15 +7681,16 @@ async fn swarm_loop(
                     match handle_send_result(&mut send_failures, name, &outcome) {
                         Escalation::Accept => {
                             if let Some(id) = bead_id_from_prompt(text) {
-                                claim_watch
-                                    .entry(id.to_string())
-                                    .or_insert_with(|| ClaimWatch {
+                                let slot = swarm.bead_slot(id);
+                                if slot.watch.is_none() {
+                                    slot.watch = Some(ClaimWatch {
                                         agent: name.clone(),
                                         unclaimed_polls: 0,
                                         close_nudged: false,
                                         close_polls: 0,
                                         wait_reason: None,
                                     });
+                                }
                             }
                         }
                         Escalation::FailStop => {
@@ -7903,7 +8031,9 @@ async fn swarm_loop(
             && !any_work
             && !inprogress_blocking
             && expected_replies.is_empty()
-            && (!params.work || (claim_watch.is_empty() && wave_held.is_empty()));
+            && (!params.work
+                || (!swarm.bead_slots.values().any(|slot| slot.watch.is_some())
+                    && wave_held.is_empty()));
         if complete_now {
             blind_complete_failures = blind_completion_count(
                 complete_now,
@@ -10295,6 +10425,8 @@ mod tests {
                 states: Default::default(),
                 dispatch_pending: Default::default(),
                 drain_pending: Default::default(),
+                bead_slots: Default::default(),
+                agent_slots: Default::default(),
             },
             &states,
             None,
@@ -10347,6 +10479,8 @@ mod tests {
                 states: Default::default(),
                 dispatch_pending: Default::default(),
                 drain_pending: Default::default(),
+                bead_slots: Default::default(),
+                agent_slots: Default::default(),
             },
             &states,
             None,
@@ -10397,6 +10531,8 @@ mod tests {
                 states: Default::default(),
                 dispatch_pending: Default::default(),
                 drain_pending: Default::default(),
+                bead_slots: Default::default(),
+                agent_slots: Default::default(),
             },
             &states,
             None,
@@ -10530,6 +10666,8 @@ mod tests {
                 states: Default::default(),
                 dispatch_pending: Default::default(),
                 drain_pending: Default::default(),
+                bead_slots: Default::default(),
+                agent_slots: Default::default(),
             },
             &states,
             None,
@@ -10574,6 +10712,8 @@ mod tests {
                 states: Default::default(),
                 dispatch_pending: Default::default(),
                 drain_pending: Default::default(),
+                bead_slots: Default::default(),
+                agent_slots: Default::default(),
             },
             &states,
             None,
@@ -10610,6 +10750,8 @@ mod tests {
                 states: Default::default(),
                 dispatch_pending: Default::default(),
                 drain_pending: Default::default(),
+                bead_slots: Default::default(),
+                agent_slots: Default::default(),
             },
             &states_plain,
             None,
@@ -10661,6 +10803,8 @@ mod tests {
                 states: Default::default(),
                 dispatch_pending: Default::default(),
                 drain_pending: Default::default(),
+                bead_slots: Default::default(),
+                agent_slots: Default::default(),
             },
             &states,
             None,
@@ -10739,6 +10883,8 @@ mod tests {
                 states: Default::default(),
                 dispatch_pending: Default::default(),
                 drain_pending: Default::default(),
+                bead_slots: Default::default(),
+                agent_slots: Default::default(),
             },
             &states,
             None,
@@ -10784,6 +10930,8 @@ mod tests {
                 states: Default::default(),
                 dispatch_pending: Default::default(),
                 drain_pending: Default::default(),
+                bead_slots: Default::default(),
+                agent_slots: Default::default(),
             },
             &states,
             None,
@@ -10824,6 +10972,8 @@ mod tests {
                 states: Default::default(),
                 dispatch_pending: Default::default(),
                 drain_pending: Default::default(),
+                bead_slots: Default::default(),
+                agent_slots: Default::default(),
             },
             &states,
             None,
@@ -10891,6 +11041,8 @@ mod tests {
                 states: Default::default(),
                 dispatch_pending: Default::default(),
                 drain_pending: Default::default(),
+                bead_slots: Default::default(),
+                agent_slots: Default::default(),
             },
             &states,
             None,
@@ -10936,6 +11088,8 @@ mod tests {
                 states: Default::default(),
                 dispatch_pending: Default::default(),
                 drain_pending: Default::default(),
+                bead_slots: Default::default(),
+                agent_slots: Default::default(),
             },
             &states,
             None,
@@ -11055,6 +11209,8 @@ mod tests {
                 states: Default::default(),
                 dispatch_pending: Default::default(),
                 drain_pending: Default::default(),
+                bead_slots: Default::default(),
+                agent_slots: Default::default(),
             },
             &states,
             None,
@@ -11127,6 +11283,8 @@ mod tests {
                 states: Default::default(),
                 dispatch_pending: Default::default(),
                 drain_pending: Default::default(),
+                bead_slots: Default::default(),
+                agent_slots: Default::default(),
             },
             &states,
             None,
@@ -11164,6 +11322,8 @@ mod tests {
                 states: Default::default(),
                 dispatch_pending: Default::default(),
                 drain_pending: Default::default(),
+                bead_slots: Default::default(),
+                agent_slots: Default::default(),
             },
             &states,
             Some("proceed"),
@@ -11283,6 +11443,8 @@ mod tests {
                 states: Default::default(),
                 dispatch_pending: Default::default(),
                 drain_pending: Default::default(),
+                bead_slots: Default::default(),
+                agent_slots: Default::default(),
             },
             &states,
             None,
@@ -11324,6 +11486,8 @@ mod tests {
                 states: Default::default(),
                 dispatch_pending: Default::default(),
                 drain_pending: Default::default(),
+                bead_slots: Default::default(),
+                agent_slots: Default::default(),
             },
             &states,
             None,
@@ -11364,6 +11528,8 @@ mod tests {
                 states: Default::default(),
                 dispatch_pending: Default::default(),
                 drain_pending: Default::default(),
+                bead_slots: Default::default(),
+                agent_slots: Default::default(),
             },
             &states,
             None,
@@ -16097,6 +16263,8 @@ mod tick_replay_tests {
             states: Default::default(),
             dispatch_pending: Default::default(),
             drain_pending: Default::default(),
+            bead_slots: Default::default(),
+            agent_slots: Default::default(),
         }
     }
 
@@ -16221,6 +16389,8 @@ mod tick_replay_tests {
             states: Default::default(),
             dispatch_pending: Default::default(),
             drain_pending: Default::default(),
+            bead_slots: Default::default(),
+            agent_slots: Default::default(),
         };
         let msgs = vec![
             LoopMsg::Tick { now: 0 },
@@ -16258,6 +16428,8 @@ mod tick_replay_tests {
             states: Default::default(),
             dispatch_pending: Default::default(),
             drain_pending: Default::default(),
+            bead_slots: Default::default(),
+            agent_slots: Default::default(),
         };
         let mut actions_log2 = Vec::new();
         for msg in &msgs {
@@ -16267,6 +16439,140 @@ mod tick_replay_tests {
         }
         assert_eq!(actions_log, actions_log2);
         assert_eq!(model, model2);
+    }
+
+    /// bd-loop-slots: per-bead control is owned by LoopModel, survives a
+    /// JSON round-trip, and resume keeps the durable counters while dropping
+    /// only the transient wake suppression.
+    #[test]
+    fn loop_slots_round_trip_and_resume_clears_only_transient_state() {
+        let mut model = LoopModel::default();
+        assert_eq!(model.bump_close_grace("bd-a"), 1);
+        assert_eq!(model.bump_close_grace("bd-a"), 2);
+        assert!(model.mark_verifier_dispatched("bd-a"));
+        assert!(!model.mark_verifier_dispatched("bd-a"));
+        model.bead_slot("bd-a").watch = Some(ClaimWatch {
+            agent: "coder".into(),
+            unclaimed_polls: 2,
+            close_nudged: true,
+            close_polls: 1,
+            wait_reason: Some(WaitReason::LiveLease),
+        });
+        model.suppress_context_limit("coder");
+
+        let encoded = serde_json::to_string(&model).expect("encode slots");
+        let decoded: LoopModel = serde_json::from_str(&encoded).expect("decode slots");
+        assert_eq!(decoded, model);
+        assert_eq!(decoded.bead_slots["bd-a"].close_grace_ticks, 2);
+        assert!(decoded.bead_slots["bd-a"].verifier_dispatched);
+        assert_eq!(
+            decoded.bead_slots["bd-a"]
+                .watch
+                .as_ref()
+                .map(|w| w.unclaimed_polls),
+            Some(2)
+        );
+
+        let mut resumed = LoopModel::default();
+        seed_swarm_resume(
+            &mut resumed,
+            &std::collections::BTreeMap::new(),
+            &std::collections::HashSet::new(),
+            &std::collections::BTreeMap::new(),
+            &decoded.bead_slots,
+            &decoded.agent_slots,
+        );
+        assert_eq!(resumed.bead_slots["bd-a"].close_grace_ticks, 2);
+        assert!(resumed.bead_slots["bd-a"].verifier_dispatched);
+        assert!(resumed.bead_slots["bd-a"].watch.is_some());
+        assert_eq!(resumed.agent_slots["coder"].incarnation, 1);
+        assert!(
+            resumed.wake_suppressed().is_empty(),
+            "a fresh process must ring the fresh pane's mail"
+        );
+    }
+
+    /// bd-ctx-suppressed: suppression is derived from the AgentSlot and clears
+    /// once the fresh incarnation is up, so mail rings again.
+    #[test]
+    fn context_limit_suppression_belongs_to_one_generation() {
+        let mut model = LoopModel::default();
+        model.suppress_context_limit("coder");
+        assert!(model.wake_suppressed().contains("coder"));
+        assert_eq!(model.agent_slots["coder"].incarnation, 1);
+
+        model.clear_context_limit("coder");
+        assert!(model.wake_suppressed().is_empty(), "fresh pane rings again");
+        assert_eq!(model.agent_slots["coder"].incarnation, 1);
+
+        model.suppress_context_limit("coder");
+        assert_eq!(model.agent_slots["coder"].incarnation, 2);
+    }
+
+    /// bd-loop-slots replay witness: a model carrying drain, heal, and
+    /// context-limit slots replays a fixed message stream identically.
+    #[test]
+    fn loop_slots_replay_deterministically_across_drain_heal_and_respawn() {
+        let mut model = LoopModel::default();
+        model.states = vec![AgentState {
+            name: "coder".into(),
+            status: "unknown".into(),
+            kind: String::new(),
+            pane_id: String::new(),
+            mail_identity: None,
+            nudge_streak: 0,
+        }];
+        model.drain_pending.insert(
+            "coder".to_string(),
+            DrainState {
+                bead_id: "bd-drain".into(),
+                grace_polls: 2,
+                defers: 1,
+                paused: None,
+            },
+        );
+        model.heal_states.insert(
+            "coder".to_string(),
+            HealState {
+                unknown_count: 2,
+                diagnose_count: 1,
+                respawn_count: 0,
+                awaiting_clear: true,
+            },
+        );
+        model.suppress_context_limit("coder");
+        model.bump_close_grace("bd-drain");
+        model.mark_verifier_dispatched("bd-drain");
+
+        let msgs = vec![
+            LoopMsg::Tick { now: 10 },
+            LoopMsg::Heal {
+                name: "coder".into(),
+                status: "unknown".into(),
+                exited: false,
+            },
+            LoopMsg::Tick { now: 20 },
+            LoopMsg::DrainRequest {
+                name: "coder".into(),
+                bead_id: "bd-drain".into(),
+            },
+        ];
+        let run = |start: &LoopModel| {
+            let mut m = start.clone();
+            let mut log = Vec::new();
+            for msg in &msgs {
+                let (next, actions) = tick(&m, msg);
+                log.push(actions);
+                m = next;
+            }
+            (m, log)
+        };
+        let (a, a_log) = run(&model);
+        let (b, b_log) = run(&model);
+        assert_eq!(a_log, b_log);
+        assert_eq!(a, b);
+        assert!(a.agent_slots.contains_key("coder"));
+        assert!(a.bead_slots.contains_key("bd-drain"));
     }
 
     #[test]
@@ -16289,6 +16595,8 @@ mod tick_replay_tests {
             states: Default::default(),
             dispatch_pending: Default::default(),
             drain_pending: Default::default(),
+            bead_slots: Default::default(),
+            agent_slots: Default::default(),
         };
         let msg = LoopMsg::Tick { now: 0 };
         let (m1, a1) = tick(&model, &msg);
@@ -16317,6 +16625,8 @@ mod tick_replay_tests {
             states: Default::default(),
             dispatch_pending: Default::default(),
             drain_pending: Default::default(),
+            bead_slots: Default::default(),
+            agent_slots: Default::default(),
         };
         let msg = LoopMsg::Tick { now: 0 };
         let (next, actions) = tick(&model, &msg);
@@ -16351,6 +16661,8 @@ mod tick_replay_tests {
             states: vec![idle],
             dispatch_pending: Default::default(),
             drain_pending: Default::default(),
+            bead_slots: Default::default(),
+            agent_slots: Default::default(),
         };
         let (next, actions) = tick(&model, &LoopMsg::Tick { now: 0 });
         assert!(next.queue.is_empty(), "taken head leaves the queue");
@@ -16420,6 +16732,8 @@ mod loop_invoke_vehicle_tests {
             states: Default::default(),
             dispatch_pending: Default::default(),
             drain_pending: Default::default(),
+            bead_slots: Default::default(),
+            agent_slots: Default::default(),
         };
         let msg = LoopMsg::Tick { now: 0 };
         let (next, _actions) = tick(&model, &msg);
@@ -16449,6 +16763,8 @@ mod loop_invoke_vehicle_tests {
             states: Default::default(),
             dispatch_pending: Default::default(),
             drain_pending: Default::default(),
+            bead_slots: Default::default(),
+            agent_slots: Default::default(),
         };
         let (next, _) = tick(
             &model,
@@ -16488,6 +16804,8 @@ mod loop_invoke_vehicle_tests {
             states: Default::default(),
             dispatch_pending: Default::default(),
             drain_pending: Default::default(),
+            bead_slots: Default::default(),
+            agent_slots: Default::default(),
         };
         let msg = LoopMsg::BrClose {
             bead_id: "bd-1".to_string(),
@@ -16552,6 +16870,8 @@ mod loop_invoke_vehicle_tests {
             states: Default::default(),
             dispatch_pending: Default::default(),
             drain_pending: Default::default(),
+            bead_slots: Default::default(),
+            agent_slots: Default::default(),
         };
         let msg = LoopMsg::Tick { now: 0 };
         let (next, actions) = tick(&model, &msg);
@@ -16586,6 +16906,8 @@ mod loop_invoke_vehicle_tests {
             states: Default::default(),
             dispatch_pending: Default::default(),
             drain_pending: Default::default(),
+            bead_slots: Default::default(),
+            agent_slots: Default::default(),
         };
         let msg = LoopMsg::Tick { now: 0 };
         let (_, actions) = tick(&model, &msg);
@@ -16620,7 +16942,14 @@ mod loop_invoke_vehicle_tests {
         drain.insert("pi".to_string(), "bd-9".to_string());
         let mut model = LoopModel::default();
         model.done_mailed.insert("stale".to_string());
-        seed_swarm_resume(&mut model, &heal, &done, &drain);
+        seed_swarm_resume(
+            &mut model,
+            &heal,
+            &done,
+            &drain,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+        );
         let h = model.heal_states.get("oc").expect("heal seeded");
         assert_eq!(
             (h.unknown_count, h.diagnose_count, h.respawn_count),
@@ -16639,7 +16968,14 @@ mod loop_invoke_vehicle_tests {
             "drains restart with fresh grace"
         );
         let mut owned = crate::workspace::WorkspaceModel::default();
-        seed_swarm_resume(&mut owned.swarm, &heal, &done, &drain);
+        seed_swarm_resume(
+            &mut owned.swarm,
+            &heal,
+            &done,
+            &drain,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+        );
         assert_eq!(
             owned.swarm.heal_states.get("oc").map(|h| h.unknown_count),
             Some(2),

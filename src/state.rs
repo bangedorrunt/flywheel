@@ -213,6 +213,12 @@ pub struct ActiveLoop {
     /// immediately, and the drain prompt re-sends (send dedup protects).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub drain_pending: std::collections::BTreeMap<String, String>,
+    /// Per-bead loop control (bd-loop-slots, additive v4 field).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bead_slots: BTreeMap<String, crate::durable::BeadSlot>,
+    /// Per-agent loop control (bd-loop-slots, additive v4 field).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agent_slots: BTreeMap<String, crate::durable::AgentSlot>,
 }
 impl ActiveLoop {
     /// Construct a v3 entry with empty control fields (fresh loop start).
@@ -235,6 +241,8 @@ impl ActiveLoop {
             heal_states: BTreeMap::new(),
             done_mailed: std::collections::HashSet::new(),
             drain_pending: BTreeMap::new(),
+            bead_slots: BTreeMap::new(),
+            agent_slots: BTreeMap::new(),
             wake: doorbell_core::wake_core::WakeModel::default(),
         }
     }
@@ -2539,6 +2547,8 @@ mod loops_schema_v2_tests {
             heal_states: Default::default(),
             done_mailed: Default::default(),
             drain_pending: Default::default(),
+            bead_slots: Default::default(),
+            agent_slots: Default::default(),
             wake: Default::default(),
         };
         let mut map = BTreeMap::new();
