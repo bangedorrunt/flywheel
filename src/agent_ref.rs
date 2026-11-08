@@ -240,10 +240,41 @@ pub enum RebindReason {
     ModelFallback { kind: String, evidence: String },
 }
 
-/// Latest settled binding location for a pin (ADR-0019 D1). Scans the
-/// project log for rebind intents; no settled row means `Pane` — a pin
-/// becomes hosted only by an explicit rebind, never by absence.
+fn binding_location_path(project: &str, pin: &str) -> std::path::PathBuf {
+    let mut h = Sha256::new();
+    h.update(b"binding-location-v1\0");
+    h.update(project.as_bytes());
+    h.update(b"\0");
+    h.update(pin.as_bytes());
+    crate::config::state_dir()
+        .join("binding-locations")
+        .join(format!("{}.json", hex::encode(h.finalize())))
+}
+
+fn write_binding_location(project: &str, pin: &str, location: BindingLocation) {
+    let path = binding_location_path(project, pin);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(body) = serde_json::to_string(&location) {
+        let _ = crate::project_state::write_atomic(&path, body.as_bytes());
+    }
+}
+
+fn cached_binding_location(project: &str, pin: &str) -> Option<BindingLocation> {
+    let raw = std::fs::read_to_string(binding_location_path(project, pin)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Latest settled binding location for a pin (ADR-0019 D1). Reads the
+/// bounded settle cache first so a rebind older than the log tail is not
+/// lost, then falls back to the tail for rows written before the cache.
+/// No settled row means `Pane` — a pin becomes hosted only by an explicit
+/// rebind, never by absence.
 pub fn binding_location_for(project: &str, pin: &str) -> BindingLocation {
+    if let Some(loc) = cached_binding_location(project, pin) {
+        return loc;
+    }
     let Ok(log) = crate::state::read_log(project) else {
         return BindingLocation::Pane;
     };
@@ -559,6 +590,11 @@ pub fn journal_rebind(project: &str, intent: &RebindIntent) -> anyhow::Result<()
     }
     let entry = serde_json::to_value(&for_log)?;
     state::log_event(project, EventKind::Spawn, entry)?;
+    if intent.state == EffectState::Settled {
+        // Bounded read cache for `binding_location_for`: the log tail is not
+        // guaranteed to contain an old settle, so persist the latest word.
+        write_binding_location(project, &intent.agent.pin, intent.to.location);
+    }
     eprintln!(
         "flywheel: rebind journal effect_key={} state={:?} pin={} {} -> {} ({})",
         for_log.effect_key,
@@ -955,6 +991,43 @@ mod tests {
         );
         assert_eq!(a.effect_key, b.effect_key);
         assert!(a.effect_key.starts_with("rebind:"));
+    }
+
+    #[test]
+    fn binding_location_for_reads_the_cache_without_the_log() {
+        let _g = crate::config::test_state_home();
+        let project = format!("binding-cache-{}", uuid::Uuid::new_v4());
+        write_binding_location(&project, "TealOtter", BindingLocation::Hosted);
+        assert_eq!(
+            binding_location_for(&project, "TealOtter"),
+            BindingLocation::Hosted,
+            "a cached settle must answer even when the log is empty"
+        );
+    }
+
+    #[test]
+    fn settled_rebind_writes_the_bounded_location_cache() {
+        let _g = crate::config::test_state_home();
+        let project = format!("binding-journal-{}", uuid::Uuid::new_v4());
+        let agent = AgentRef::new(&project, "TealOtter");
+        let from = AgentBinding::profile("coder");
+        let mut to = AgentBinding::profile("hosted");
+        to.location = BindingLocation::Hosted;
+        let mut intent = RebindIntent::prepare(
+            agent,
+            from,
+            to,
+            RebindReason::CaptainRequest {
+                note: "test".into(),
+            },
+            0,
+        );
+        intent.state = EffectState::Settled;
+        journal_rebind(&project, &intent).expect("journal settled rebind");
+        assert_eq!(
+            cached_binding_location(&project, "TealOtter"),
+            Some(BindingLocation::Hosted)
+        );
     }
 
     #[test]
