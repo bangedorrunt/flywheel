@@ -184,11 +184,8 @@ pub(crate) fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
         &crate::config::state_dir(),
         &ws_label,
     ));
-    let dispatcher_alive = crate::doorbell::read_pid(&crate::doorbell::pid_file(
-        &crate::config::state_dir(),
-        &ws_label,
-    ))
-    .is_some_and(crate::doorbell::pid_alive);
+    let dispatcher_alive = crate::doorbell::dispatcher_pid(&crate::config::state_dir(), &ws_label)
+        .is_some_and(crate::doorbell::pid_alive);
     if !dispatcher_alive {
         let _ = crate::doorbell::ensure_running(
             &std::env::current_exe()?,

@@ -406,7 +406,7 @@ pub(crate) fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
         format!(" unpinned={}", unpinned.join(","))
     };
     for ws in crate::cmd::spawn::doorbell_project_workspaces(project) {
-        let pid = crate::doorbell::read_pid(&crate::doorbell::pid_file(&state_dir, &ws));
+        let pid = crate::doorbell::dispatcher_pid(&state_dir, &ws);
         let alive = pid.is_some_and(crate::doorbell::pid_alive);
         let wake =
             crate::doorbell::load_wake_state(&crate::doorbell::wake_state_file(&state_dir, &ws));

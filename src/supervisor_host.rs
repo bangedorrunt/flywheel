@@ -5155,7 +5155,7 @@ mod tests {
             .spawn()
             .unwrap();
         let ws = supervise_lease_workspace("proj", Some("plane"));
-        let path = doorbell_rt::lease::owner_file(&crate::config::state_dir(), &ws);
+        let path = doorbell_rt::lease::state_file(&crate::config::state_dir(), &ws);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let now = doorbell_rt::lease::unix_now();
         let lease = doorbell_rt::lease::OwnerLease {
@@ -5167,7 +5167,7 @@ mod tests {
             process_start_unix: doorbell_rt::lease::process_start_unix(sleeper.id()).unwrap_or(now),
             kind: None,
         };
-        std::fs::write(&path, serde_json::to_string(&lease).unwrap()).unwrap();
+        std::fs::write(&path, serde_json::json!({ "lease": lease }).to_string()).unwrap();
         let cfg = crate::config::Config::default();
         let mut live = LivePorts::new(&cfg, "proj", "proj");
         let alive = live.observe(&c.model, 1);

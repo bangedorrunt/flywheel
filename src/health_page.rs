@@ -240,34 +240,26 @@ pub fn heartbeat_signals(
     out
 }
 
-/// Doorbell workspaces from `<state>/doorbell/*.gen`, classified by their pid
-/// file. A missing pid file is unreadable, not dead: the `.gen` row alone
-/// does not prove a dispatcher ever ran here.
+/// Doorbell workspaces from `<state>/doorbell/*.state.json`, classified by
+/// the unified pid. A state file without a pid is unreadable, not dead.
 pub fn dispatcher_signals(state_dir: &Path, project: &str) -> BTreeMap<String, DispatcherSignal> {
     let mut out = BTreeMap::new();
     let Ok(entries) = std::fs::read_dir(state_dir.join("doorbell")) else {
         return out;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|x| x.to_str()) != Some("gen") {
-            continue;
-        }
-        let Some(label) = path.file_stem().and_then(|x| x.to_str()) else {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(label) = name.strip_suffix(".state.json") else {
             continue;
         };
-        let pid_path = crate::doorbell::pid_file(state_dir, label);
-        let signal = match std::fs::read_to_string(&pid_path) {
-            Ok(raw) => match raw.trim().parse::<u32>() {
-                Ok(pid) if crate::doorbell::pid_alive(pid) => DispatcherSignal::Alive,
-                Ok(_) => DispatcherSignal::Dead {
-                    line: format!(
-                        "loop-mode supervise: DEAD DOORBELL in {project} — dispatcher {label} has no live pid; restart it (flywheel doorbell start {project})"
-                    ),
-                },
-                Err(_) => DispatcherSignal::Unreadable,
+        let signal = match crate::doorbell::dispatcher_pid(state_dir, label) {
+            Some(pid) if crate::doorbell::pid_alive(pid) => DispatcherSignal::Alive,
+            Some(_) => DispatcherSignal::Dead {
+                line: format!(
+                    "loop-mode supervise: DEAD DOORBELL in {project} — dispatcher {label} has no live pid; restart it (flywheel doorbell start {project})"
+                ),
             },
-            Err(_) => DispatcherSignal::Unreadable,
+            None => DispatcherSignal::Unreadable,
         };
         out.insert(label.to_string(), signal);
     }
@@ -302,10 +294,11 @@ mod tests {
     fn write_workspace(dir: &Path, label: &str, pid: Option<&str>) {
         let db = dir.join("doorbell");
         std::fs::create_dir_all(&db).unwrap();
-        std::fs::write(db.join(format!("{label}.gen")), "ran\n").unwrap();
-        if let Some(pid) = pid {
-            std::fs::write(db.join(format!("{label}.pid")), format!("{pid}\n")).unwrap();
-        }
+        let body = match pid {
+            Some(pid) => format!("{{\"pid\":{pid}}}"),
+            None => "{}".to_string(),
+        };
+        std::fs::write(db.join(format!("{label}.state.json")), body).unwrap();
     }
 
     fn page_pin<'a>(events: &'a [HealthEvent], pin: &str) -> Option<&'a str> {

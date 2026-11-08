@@ -14236,14 +14236,15 @@ fn cmd_loop_doctor(cfg: &Config, fix: bool, json: bool) -> Result<()> {
     let db_dir = config::state_dir().join("doorbell");
     if let Ok(entries) = std::fs::read_dir(&db_dir) {
         for e in entries.flatten() {
-            let path = e.path();
-            if path.extension().and_then(|x| x.to_str()) != Some("gen") {
-                continue;
-            }
-            let Some(label) = path.file_stem().and_then(|x| x.to_str()) else {
+            let Some(label) = e
+                .file_name()
+                .to_string_lossy()
+                .strip_suffix(".state.json")
+                .map(str::to_string)
+            else {
                 continue;
             };
-            let alive = doorbell::read_pid(&doorbell::pid_file(&config::state_dir(), label))
+            let alive = doorbell::dispatcher_pid(&config::state_dir(), &label)
                 .is_some_and(doorbell::pid_alive);
             if !alive {
                 dead_doorbells.push(label.to_string());
@@ -17724,7 +17725,7 @@ fn hosted_alive_workspaces_from_registry(state_dir: &std::path::Path) -> Vec<Str
 /// True when a registry label should sort into the `/health` alive partition.
 /// Alive = `{slug}.pid` live OR owner lease non-stale only (GS062-ADV-3).
 fn registry_label_alive(state_dir: &std::path::Path, label: &str, now_unix: u64) -> bool {
-    if doorbell::read_pid(&doorbell::pid_file(state_dir, label)).is_some_and(doorbell::pid_alive) {
+    if doorbell::dispatcher_pid(state_dir, label).is_some_and(doorbell::pid_alive) {
         return true;
     }
     if let Some(lease) = doorbell_rt::lease::read_lease(state_dir, label)

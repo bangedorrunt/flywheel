@@ -2165,8 +2165,8 @@ pub(crate) fn cmd_turn_guard(cfg: &Config, project: &str, role: Option<&str>) ->
     let ws = doorbell::load_wake_state(&doorbell::wake_state_file(&state_dir, &ws_label));
     let now = doorbell_now_unix();
     let beacon_age_secs = ws.last_wake_unix.map(|t| now.saturating_sub(t));
-    let dispatcher_required = doorbell::read_pid(&doorbell::pid_file(&state_dir, &ws_label))
-        .is_some_and(doorbell::pid_alive);
+    let dispatcher_required =
+        doorbell::dispatcher_pid(&state_dir, &ws_label).is_some_and(doorbell::pid_alive);
     let root = project_dir(cfg, project);
     let in_flight = in_flight_count(&root);
     match turn_end_guard(

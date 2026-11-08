@@ -1108,15 +1108,19 @@ pub fn run_embedded(cfg: &Config, project: &str, workspace: &str) -> anyhow::Res
             ));
         }
     };
-    let path = doorbell::pid_file(&config::state_dir(), workspace);
-    doorbell::write_pid(&path, std::process::id())?;
     let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flywheel"));
-    let gen_path = doorbell::gen_file(&config::state_dir(), workspace);
     // Always capture THIS host's binary. Reusing a gen left by a pre-install
     // spawn made the liveness check see a stale binary and exit-loop under
     // launchd (the host itself is the current binary).
-    let generation = doorbell::WatcherGen::capture(&exe_path, unix_now())
-        .filter(|record| doorbell::write_gen(&gen_path, record).is_ok());
+    let generation = doorbell::WatcherGen::capture(&exe_path, unix_now());
+    doorbell::write_state(
+        &doorbell::state_file(&config::state_dir(), workspace),
+        &doorbell::DoorbellState {
+            pid: Some(std::process::id()),
+            project: Some(project.to_string()),
+            generation: generation.clone(),
+        },
+    )?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1271,14 +1275,14 @@ async fn run_embedded_async(
             .collect();
         doorbell_rt::pollers::spawn_external_rering(tx.clone(), repo, foreign)
     });
-    let pid_path = doorbell::pid_file(&config::state_dir(), workspace);
-    let gen_path = doorbell::gen_file(&config::state_dir(), workspace);
+    let state_path = doorbell::state_file(&config::state_dir(), workspace);
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flywheel"));
     let probe_cfg = cfg.clone();
     let probe_project = project.to_string();
     let probe_ws = workspace.to_string();
     let probe_dir = config::state_dir();
     let shutdown_tx = tx.clone();
+    let liveness_workspace = workspace.to_string();
     // wave15-b: only a stale binary restarts the host. The flag rides out
     // of the liveness task; `run_embedded_async` turns it into a
     // restartable (nonzero) exit instead of the silent exit 0 that used to
@@ -1292,10 +1296,11 @@ async fn run_embedded_async(
         let mut ticks = 0u64;
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            if !pid_path.exists() {
+            if !state_path.exists() {
                 break;
             }
-            if let Some(record) = doorbell::read_gen(&gen_path)
+            if let Some(record) =
+                doorbell::dispatcher_generation(&config::state_dir(), &liveness_workspace)
                 && !doorbell::inject_allowed(&record, &exe)
             {
                 eprintln!(
@@ -2082,7 +2087,7 @@ mod off_runtime_tests {
         let h = std::thread::spawn(move || run_embedded(&cfg, "offrt-embedded", ws));
         std::thread::sleep(Duration::from_secs(4));
         let died_early = h.is_finished();
-        let _ = std::fs::remove_file(doorbell::pid_file(&config::state_dir(), ws));
+        let _ = std::fs::remove_file(doorbell::state_file(&config::state_dir(), ws));
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         while !h.is_finished() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));

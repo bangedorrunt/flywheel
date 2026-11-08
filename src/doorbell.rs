@@ -42,20 +42,10 @@ pub fn pid_file(state_dir: &Path, workspace: &str) -> PathBuf {
 
 /// ADR-0005 D1.4 first line: `dispatcher: up|down …`
 pub fn dispatcher_status_line(state_dir: &Path, workspace: &str) -> String {
-    if let Some(state) = read_state(state_dir, workspace)
-        && let Some(pid) = state.pid
-    {
-        return if pid_alive(pid) {
-            format!("dispatcher: up pid={pid}")
-        } else {
-            format!("dispatcher: down stale={pid}")
-        };
-    }
-    match inspect_lock(&pid_file(state_dir, workspace)) {
-        LockAction::Attach { pid } => format!("dispatcher: up pid={pid}"),
-        LockAction::Superseded { pid } => format!("dispatcher: up pid={pid} superseded"),
-        LockAction::Reloaded { stale } => format!("dispatcher: down stale={stale}"),
-        LockAction::Start => "dispatcher: down".into(),
+    match read_state(state_dir, workspace).and_then(|state| state.pid) {
+        Some(pid) if pid_alive(pid) => format!("dispatcher: up pid={pid}"),
+        Some(pid) => format!("dispatcher: down stale={pid}"),
+        None => "dispatcher: down".into(),
     }
 }
 
@@ -71,15 +61,7 @@ pub fn dispatcher_token(state_dir: &Path, workspace: &str) -> &'static str {
             "down"
         };
     }
-    let pid_path = pid_file(state_dir, workspace);
-    let gen_path = gen_file(state_dir, workspace);
-    if !pid_path.exists() && !gen_path.exists() {
-        return "absent";
-    }
-    match inspect_lock(&pid_path) {
-        LockAction::Attach { .. } | LockAction::Superseded { .. } => "up",
-        LockAction::Reloaded { .. } | LockAction::Start => "down",
-    }
+    "absent"
 }
 
 /// Workspace keys a doorbell might own. Always includes `swarm_label` so
@@ -138,6 +120,7 @@ pub fn read_pid(path: &Path) -> Option<u32> {
     raw.trim().parse().ok()
 }
 
+#[cfg(test)]
 pub fn write_pid(path: &Path, pid: u32) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
@@ -145,6 +128,7 @@ pub fn write_pid(path: &Path, pid: u32) -> Result<()> {
     fs::write(path, format!("{pid}\n")).with_context(|| format!("write {}", path.display()))
 }
 
+#[cfg(test)]
 pub fn clear_pid(path: &Path) {
     let _ = fs::remove_file(path);
 }
@@ -275,6 +259,54 @@ pub fn read_state(state_dir: &Path, workspace: &str) -> Option<DoorbellState> {
     serde_json::from_str(&raw).ok()
 }
 
+/// Live dispatcher pid from the unified state record.
+pub fn dispatcher_pid(state_dir: &Path, workspace: &str) -> Option<u32> {
+    read_state(state_dir, workspace).and_then(|state| state.pid)
+}
+
+/// Project recorded by the unified state record.
+pub fn dispatcher_project(state_dir: &Path, workspace: &str) -> Option<String> {
+    read_state(state_dir, workspace).and_then(|state| state.project)
+}
+
+/// Watcher generation recorded by the unified state record.
+pub fn dispatcher_generation(state_dir: &Path, workspace: &str) -> Option<WatcherGen> {
+    read_state(state_dir, workspace).and_then(|state| state.generation)
+}
+
+fn inspect_state_generation(
+    state: Option<&DoorbellState>,
+    current_identity: Option<(u64, u64)>,
+    current_hash: Option<String>,
+    alive: impl Fn(u32) -> bool,
+) -> LockAction {
+    let Some(state) = state else {
+        return LockAction::Start;
+    };
+    let Some(pid) = state.pid else {
+        return LockAction::Start;
+    };
+    if !alive(pid) {
+        return LockAction::Reloaded { stale: pid };
+    }
+    let (Some(record), Some((mtime, len))) = (state.generation.as_ref(), current_identity) else {
+        return LockAction::Superseded { pid };
+    };
+    let mtime_ok = record.matches(mtime, len);
+    let hash_ok = if record.binary_hash.is_empty() {
+        true
+    } else {
+        current_hash
+            .as_deref()
+            .is_some_and(|hash| record.binary_hash == hash)
+    };
+    if mtime_ok && hash_ok {
+        LockAction::Attach { pid }
+    } else {
+        LockAction::Superseded { pid }
+    }
+}
+
 /// Atomic replace under the shared state lock: write a sibling temp file,
 /// then rename it into place. The lock prevents a lease heartbeat and a
 /// dispatcher write from losing each other's fields; the rename prevents a
@@ -386,6 +418,7 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
 pub fn write_gen(path: &Path, record: &WatcherGen) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
@@ -424,16 +457,13 @@ pub enum LockAction {
     },
 }
 
+#[cfg(test)]
 pub fn inspect_lock_with(path: &Path, alive: impl Fn(u32) -> bool) -> LockAction {
     match read_pid(path) {
         None => LockAction::Start,
         Some(pid) if alive(pid) => LockAction::Attach { pid },
         Some(pid) => LockAction::Reloaded { stale: pid },
     }
-}
-
-pub fn inspect_lock(path: &Path) -> LockAction {
-    inspect_lock_with(path, pid_alive)
 }
 
 /// Generation-aware lock decision (bd-stale-doorbell-wake-0fic). Attach
@@ -470,55 +500,22 @@ pub fn inspect_lock_generation(
     }
 }
 
-/// Hash-aware variant that also checks the binary sha1 when the record carries
-/// it — the door `ensure_running` uses, since it holds the exe (gap 10 fix: a
-/// same-second rebuild with the same length still supersedes).
-pub fn inspect_lock_generation_with_hash(
-    path: &Path,
-    gen_path: &Path,
-    current_identity: Option<(u64, u64)>,
-    current_hash: Option<String>,
-    alive: impl Fn(u32) -> bool,
-) -> LockAction {
-    match read_pid(path) {
-        None => LockAction::Start,
-        Some(pid) if !alive(pid) => LockAction::Reloaded { stale: pid },
-        Some(pid) => match (read_gen(gen_path), current_identity) {
-            (Some(record), Some((mtime, len))) => {
-                let mtime_ok = record.matches(mtime, len);
-                let hash_ok = if record.binary_hash.is_empty() {
-                    true
-                } else {
-                    current_hash
-                        .as_deref()
-                        .map(|h| record.binary_hash == h)
-                        .unwrap_or(false)
-                };
-                if mtime_ok && hash_ok {
-                    LockAction::Attach { pid }
-                } else {
-                    LockAction::Superseded { pid }
-                }
-            }
-            _ => LockAction::Superseded { pid },
-        },
-    }
-}
-
 /// Kill the dispatcher and drop the pid + generation files (ADR-0005 D1).
 pub fn stop(state_dir: &Path, workspace: &str) {
-    let path = pid_file(state_dir, workspace);
-    if let Some(pid) = read_pid(&path) {
+    if let Some(pid) = dispatcher_pid(state_dir, workspace) {
         kill_pid(pid);
     }
-    clear_pid(&path);
     let _ = fs::remove_file(unanswered_file(state_dir, workspace));
-    let _ = fs::remove_file(gen_file(state_dir, workspace));
     let state_path = state_file(state_dir, workspace);
     if state_path.exists() {
         let _lock = lock_state(&state_path);
         let _ = fs::remove_file(&state_path);
     }
+    // Remove sidecars left by a pre-unification dispatcher. They are never
+    // written or consulted by this build.
+    let _ = fs::remove_file(pid_file(state_dir, workspace));
+    let _ = fs::remove_file(gen_file(state_dir, workspace));
+    let _ = fs::remove_file(project_sidecar(state_dir, workspace));
 }
 
 /// What the SELECTED plane says about the workspace a host watches.
@@ -878,23 +875,15 @@ pub fn inject_wake_in(
     Ok(summary)
 }
 
-fn spawn_child(
-    exe: &Path,
-    project: &str,
-    workspace: &str,
-    path: &Path,
-    gen_path: &Path,
-) -> Result<()> {
-    if let Some(parent) = gen_path.parent() {
-        let _ = fs::write(parent.join(format!("{workspace}.project")), project);
-    }
+fn spawn_child(exe: &Path, state_dir: &Path, project: &str, workspace: &str) -> Result<()> {
+    let state_path = state_file(state_dir, workspace);
     let mut cmd = Command::new(exe);
     cmd.args(["__doorbell", "--project", project, "--workspace", workspace]);
     cmd.stdin(Stdio::null());
     // Keep the host's own diagnostics. `Stdio::null()` made a wedged or
     // crash-looping host invisible (the reason had to be reconstructed from
-    // journals). One append log per workspace, beside the pid/gen files.
-    let log_dir = gen_path.parent().map(std::path::Path::to_path_buf);
+    // journals). One append log per workspace, beside the state record.
+    let log_dir = state_path.parent().map(std::path::Path::to_path_buf);
     let mut attached = false;
     if let Some(dir) = log_dir
         && std::fs::create_dir_all(&dir).is_ok()
@@ -925,21 +914,15 @@ fn spawn_child(
     let child = cmd
         .spawn()
         .with_context(|| format!("spawn doorbell for {workspace}"))?;
-    write_pid(path, child.id())?;
     let generation = WatcherGen::capture(exe, unix_now());
-    if let Some(record) = &generation {
-        let _ = write_gen(gen_path, record);
-    }
-    if let Some(dir) = gen_path.parent() {
-        let _ = write_state(
-            &dir.join(format!("{workspace}.state.json")),
-            &DoorbellState {
-                pid: Some(child.id()),
-                project: Some(project.to_string()),
-                generation,
-            },
-        );
-    }
+    write_state(
+        &state_path,
+        &DoorbellState {
+            pid: Some(child.id()),
+            project: Some(project.to_string()),
+            generation,
+        },
+    )?;
     Ok(())
 }
 
@@ -982,11 +965,9 @@ pub fn ensure_running(
         );
         return Ok(LockAction::Attach { pid: 0 });
     }
-    let path = pid_file(state_dir, workspace);
-    let gen_path = gen_file(state_dir, workspace);
-    let action = inspect_lock_generation_with_hash(
-        &path,
-        &gen_path,
+    let state = read_state(state_dir, workspace);
+    let action = inspect_state_generation(
+        state.as_ref(),
         binary_identity(exe),
         binary_hash(exe),
         pid_alive,
@@ -995,16 +976,21 @@ pub fn ensure_running(
         LockAction::Attach { .. } => Ok(action),
         LockAction::Superseded { pid } => {
             kill_pid(pid);
-            clear_pid(&path);
-            let _ = fs::remove_file(&gen_path);
-            spawn_child(exe, project, workspace, &path, &gen_path)?;
+            let path = state_file(state_dir, workspace);
+            if let Ok(_lock) = lock_state(&path) {
+                let _ = fs::remove_file(&path);
+            }
+            spawn_child(exe, state_dir, project, workspace)?;
             Ok(action)
         }
         LockAction::Start | LockAction::Reloaded { .. } => {
             if matches!(action, LockAction::Reloaded { .. }) {
-                clear_pid(&path);
+                let path = state_file(state_dir, workspace);
+                if let Ok(_lock) = lock_state(&path) {
+                    let _ = fs::remove_file(&path);
+                }
             }
-            spawn_child(exe, project, workspace, &path, &gen_path)?;
+            spawn_child(exe, state_dir, project, workspace)?;
             Ok(action)
         }
     }
@@ -1298,10 +1284,7 @@ pub fn project_sidecar(state_dir: &Path, workspace: &str) -> PathBuf {
 }
 
 pub fn read_project_sidecar(state_dir: &Path, workspace: &str) -> Option<String> {
-    fs::read_to_string(project_sidecar(state_dir, workspace))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    dispatcher_project(state_dir, workspace)
 }
 
 /// Every dispatcher workspace whose pid is missing or dead: (label, project).
@@ -1318,30 +1301,15 @@ pub fn dead_dispatchers(state_dir: &Path) -> Vec<(String, String)> {
             .file_name()
             .and_then(|x| x.to_str())
             .unwrap_or_default();
-        let label = if path.extension().and_then(|x| x.to_str()) == Some("gen") {
-            path.file_stem()
-                .and_then(|x| x.to_str())
-                .map(str::to_string)
-        } else {
-            name.strip_suffix(".state.json").map(str::to_string)
-        };
-        let Some(label) = label.filter(|l| !l.is_empty()) else {
+        let Some(label) = name.strip_suffix(".state.json").map(str::to_string) else {
             continue;
         };
-        if !seen.insert(label.clone()) {
+        if label.is_empty() || !seen.insert(label.clone()) {
             continue;
         }
         let state = read_state(state_dir, &label);
-        let alive = state
-            .as_ref()
-            .and_then(|s| s.pid)
-            .or_else(|| read_pid(&pid_file(state_dir, &label)))
-            .is_some_and(pid_alive);
-        if !alive
-            && let Some(project) = state
-                .and_then(|s| s.project)
-                .or_else(|| read_project_sidecar(state_dir, &label))
-        {
+        let alive = state.as_ref().and_then(|s| s.pid).is_some_and(pid_alive);
+        if !alive && let Some(project) = state.and_then(|s| s.project) {
             out.push((label, project));
         }
     }
@@ -1370,7 +1338,7 @@ pub const SUPERVISOR_NAME: &str = "doorbell-supervisor";
 
 pub fn report_text(state_dir: &Path, workspace: &str) -> String {
     let head = dispatcher_status_line(state_dir, workspace);
-    let gen_tail = match read_gen(&gen_file(state_dir, workspace)) {
+    let gen_tail = match dispatcher_generation(state_dir, workspace) {
         Some(record) => format!(" {}", record.stamp()),
         None => String::new(),
     };
@@ -1424,8 +1392,8 @@ pub struct DeadAuditFile {
 /// throwaway temp roots of finished gate runs. This finds those, and only
 /// those. A workspace is dead when no live dispatcher holds its pid AND
 ///
-/// - its `.project` sidecar is an absolute path that no longer exists (a
-///   temp root from a finished gate run), or
+/// - its unified state record names an absolute project path that no longer
+///   exists (a temp root from a finished gate run), or
 /// - the file has not been written for `horizon_days`.
 ///
 /// A bare project name (`flywheel`), which is how `doorbell start` records a
@@ -1448,7 +1416,7 @@ pub fn dead_audit_files(
             continue;
         };
         let path = entry.path();
-        if read_pid(&pid_file(state_dir, workspace)).is_some_and(&alive) {
+        if dispatcher_pid(state_dir, workspace).is_some_and(&alive) {
             continue;
         }
         let Ok(md) = entry.metadata() else {
@@ -1466,7 +1434,7 @@ pub fn dead_audit_files(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let project_gone = read_project_sidecar(state_dir, workspace)
+        let project_gone = dispatcher_project(state_dir, workspace)
             .is_some_and(|p| Path::new(&p).is_absolute() && !Path::new(&p).exists());
         let Some(abandon) = doorbell_rt::store::audit_abandon_reason(
             workspace,
@@ -2411,7 +2379,14 @@ mod tests {
             )
             .unwrap();
         }
-        std::fs::write(dir.join("doorbell").join("adrx1.project"), "beads").unwrap();
+        write_state(
+            &state_file(&dir, "adrx1"),
+            &DoorbellState {
+                project: Some("beads".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         std::fs::write(
             dir.join("doorbell")
                 .join("flywheel-elm-effect-rs.unanswered"),
@@ -3095,14 +3070,28 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fw-doorbell-st-{}", std::process::id()));
         let _ = std::fs::create_dir_all(dir.join("doorbell"));
         assert_eq!(dispatcher_status_line(&dir, "w1"), "dispatcher: down");
-        write_pid(&pid_file(&dir, "w1"), std::process::id()).expect("pid");
+        write_state(
+            &state_file(&dir, "w1"),
+            &DoorbellState {
+                pid: Some(std::process::id()),
+                ..Default::default()
+            },
+        )
+        .expect("pid");
         let line = dispatcher_status_line(&dir, "w1");
         assert!(line.starts_with("dispatcher: up"), "{line}");
-        clear_pid(&pid_file(&dir, "w1"));
+        let _ = std::fs::remove_file(state_file(&dir, "w1"));
         assert_eq!(dispatcher_status_line(&dir, "w1"), "dispatcher: down");
-        write_pid(&pid_file(&dir, "w1"), 999_998).expect("stale");
+        write_state(
+            &state_file(&dir, "w1"),
+            &DoorbellState {
+                pid: Some(999_998),
+                ..Default::default()
+            },
+        )
+        .expect("stale");
         stop(&dir, "w1");
-        assert!(!pid_file(&dir, "w1").exists());
+        assert!(!state_file(&dir, "w1").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3111,11 +3100,25 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fw-doorbell-token-{}", std::process::id()));
         let _ = std::fs::create_dir_all(dir.join("doorbell"));
         assert_eq!(dispatcher_token(&dir, "w1"), "absent");
-        write_pid(&pid_file(&dir, "w1"), 999_998).expect("stale");
+        write_state(
+            &state_file(&dir, "w1"),
+            &DoorbellState {
+                pid: Some(999_998),
+                ..Default::default()
+            },
+        )
+        .expect("stale");
         assert_eq!(dispatcher_token(&dir, "w1"), "down");
-        write_pid(&pid_file(&dir, "w1"), std::process::id()).expect("live");
+        write_state(
+            &state_file(&dir, "w1"),
+            &DoorbellState {
+                pid: Some(std::process::id()),
+                ..Default::default()
+            },
+        )
+        .expect("live");
         assert_eq!(dispatcher_token(&dir, "w1"), "up");
-        clear_pid(&pid_file(&dir, "w1"));
+        let _ = std::fs::remove_file(state_file(&dir, "w1"));
         assert_eq!(dispatcher_token(&dir, "w1"), "absent");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3270,7 +3273,7 @@ mod tests {
         write_state(
             &path,
             &DoorbellState {
-                pid: Some(1),
+                pid: Some(999_997),
                 project: Some("proj".into()),
                 generation: Some(record),
             },
@@ -3280,14 +3283,14 @@ mod tests {
         write_state(
             &path,
             &DoorbellState {
-                pid: Some(2),
+                pid: Some(999_998),
                 project: Some("proj".into()),
                 generation: None,
             },
         )
         .expect("respawn state");
         let state = read_state(&dir, "w1").expect("state");
-        assert_eq!(state.pid, Some(2), "respawn replaces the pid");
+        assert_eq!(state.pid, Some(999_998), "respawn replaces the pid");
         assert!(state.generation.is_none(), "absent generation is removed");
         assert_eq!(
             doorbell_rt::lease::read_lease(&dir, "w1"),
@@ -3311,17 +3314,15 @@ mod tests {
         let mut permissions = fs::metadata(&exe).expect("metadata").permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&exe, permissions).expect("chmod");
-        let pid_path = pid_file(&dir, "w1");
-        let gen_path = gen_file(&dir, "w1");
 
-        spawn_child(&exe, "proj", "w1", &pid_path, &gen_path).expect("first spawn");
+        spawn_child(&exe, &dir, "proj", "w1").expect("first spawn");
         let first = read_state(&dir, "w1").expect("first state");
         assert_eq!(first.project.as_deref(), Some("proj"));
         assert!(first.pid.is_some_and(pid_alive));
         stop(&dir, "w1");
         assert!(read_state(&dir, "w1").is_none());
 
-        spawn_child(&exe, "proj", "w1", &pid_path, &gen_path).expect("second spawn");
+        spawn_child(&exe, &dir, "proj", "w1").expect("second spawn");
         let second = read_state(&dir, "w1").expect("second state");
         assert!(second.pid.is_some_and(pid_alive));
         assert_ne!(first.pid, second.pid, "respawn installs the new child pid");
@@ -3341,7 +3342,7 @@ mod tests {
             binary_hash: String::new(),
         };
         let state = DoorbellState {
-            pid: Some(std::process::id()),
+            pid: Some(999_998),
             project: Some("proj".into()),
             generation: Some(record),
         };
@@ -3428,7 +3429,14 @@ mod tests {
             binary_len: 9,
             binary_hash: String::new(),
         };
-        write_gen(&gen_file(&dir, "w9"), &record).expect("gen");
+        write_state(
+            &state_file(&dir, "w9"),
+            &DoorbellState {
+                generation: Some(record),
+                ..Default::default()
+            },
+        )
+        .expect("gen");
         let text = report_text(&dir, "w9");
         assert!(text.contains("dispatcher:"), "{text}");
         assert!(
@@ -3490,18 +3498,21 @@ mod tests {
     #[test]
     fn stop_clears_generation_file() {
         let dir = scratch("stop");
-        write_gen(
-            &gen_file(&dir, "wst"),
-            &WatcherGen {
-                started_unix: 1,
-                binary_mtime_unix: 1,
-                binary_len: 1,
-                binary_hash: String::new(),
+        write_state(
+            &state_file(&dir, "wst"),
+            &DoorbellState {
+                generation: Some(WatcherGen {
+                    started_unix: 1,
+                    binary_mtime_unix: 1,
+                    binary_len: 1,
+                    binary_hash: String::new(),
+                }),
+                ..Default::default()
             },
         )
         .expect("gen");
         stop(&dir, "wst");
-        assert!(read_gen(&gen_file(&dir, "wst")).is_none());
+        assert!(read_state(&dir, "wst").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4247,13 +4258,31 @@ mod audit_gc_tests {
         path
     }
 
+    fn record_project(dir: &Path, workspace: &str, project: &str) {
+        write_state(
+            &state_file(dir, workspace),
+            &DoorbellState {
+                project: Some(project.to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
     /// A dispatcher that is still up owns its file, however old it looks. The
     /// pid is the only signal that says "this workspace will be served again".
     #[test]
     fn a_live_dispatcher_keeps_its_audit() {
         let dir = tempfile::tempdir().unwrap();
         write_audit(dir.path(), "live");
-        write_pid(&pid_file(dir.path(), "live"), 4242).unwrap();
+        write_state(
+            &state_file(dir.path(), "live"),
+            &DoorbellState {
+                pid: Some(4242),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let found = dead_audit_files(dir.path(), 0, SystemTime::now(), |pid| pid == 4242);
         assert!(found.is_empty(), "{found:?}");
     }
@@ -4265,11 +4294,11 @@ mod audit_gc_tests {
     fn a_vanished_project_path_is_dead_without_waiting() {
         let dir = tempfile::tempdir().unwrap();
         write_audit(dir.path(), "flywheel-fw-gate-1");
-        std::fs::write(
-            project_sidecar(dir.path(), "flywheel-fw-gate-1"),
+        record_project(
+            dir.path(),
+            "flywheel-fw-gate-1",
             "/tmp/gone-forever-fw-gate-1",
-        )
-        .unwrap();
+        );
         let found = dead_audit_files(dir.path(), 30, SystemTime::now(), |_| false);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].reason, "project-gone");
@@ -4283,7 +4312,7 @@ mod audit_gc_tests {
     fn a_bare_project_name_only_prunes_on_age() {
         let dir = tempfile::tempdir().unwrap();
         write_audit(dir.path(), "flywheel");
-        std::fs::write(project_sidecar(dir.path(), "flywheel"), "flywheel").unwrap();
+        record_project(dir.path(), "flywheel", "flywheel");
         let mtime = std::fs::metadata(audit_file(dir.path(), "flywheel"))
             .unwrap()
             .modified()
@@ -4315,7 +4344,7 @@ mod audit_gc_tests {
         write_audit(dir.path(), "ws");
         std::fs::write(dir.path().join("doorbell").join("ws.audit.loudmiss"), "x").unwrap();
         std::fs::write(dir.path().join("doorbell").join("ws.gen"), "x").unwrap();
-        std::fs::write(project_sidecar(dir.path(), "ws"), "/tmp/gone-forever-ws").unwrap();
+        record_project(dir.path(), "ws", "/tmp/gone-forever-ws");
         let found = dead_audit_files(dir.path(), 30, SystemTime::now(), |_| false);
         assert_eq!(found.len(), 1);
         assert!(found[0].path.ends_with("ws.audit.jsonl"));
@@ -4332,13 +4361,9 @@ mod audit_gc_tests {
         let now_secs = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
 
         write_audit(dir.path(), "project-gone");
-        std::fs::write(
-            project_sidecar(dir.path(), "project-gone"),
-            "/tmp/gone-forever-io2ws",
-        )
-        .unwrap();
+        record_project(dir.path(), "project-gone", "/tmp/gone-forever-io2ws");
         write_audit(dir.path(), "idle");
-        std::fs::write(project_sidecar(dir.path(), "idle"), "idle").unwrap();
+        record_project(dir.path(), "idle", "idle");
         let old = now - Duration::from_secs(40 * 86_400);
         std::fs::File::open(audit_file(dir.path(), "idle"))
             .unwrap()

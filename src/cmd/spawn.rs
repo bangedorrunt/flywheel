@@ -2301,7 +2301,7 @@ pub(crate) fn doorbell_project_workspaces(project: &str) -> Vec<String> {
     candidates.push(swarm_label(project));
     candidates
         .into_iter()
-        .filter(|l| doorbell::gen_file(&state_dir, l).exists())
+        .filter(|l| doorbell::state_file(&state_dir, l).exists())
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect()

@@ -450,8 +450,8 @@ mod tests {
             "no unit is (re)installed: the unit dir is empty after retire"
         );
         assert!(
-            crate::doorbell::pid_file(&state, "ws1").is_file(),
-            "the workspace is owned through the pid-locked child"
+            crate::doorbell::state_file(&state, "ws1").is_file(),
+            "the workspace is owned through the unified state record"
         );
         restore_path_and_clean(root, prev_path);
     }

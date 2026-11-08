@@ -185,15 +185,13 @@ pub fn pid_alive(pid: u32) -> bool {
 }
 
 pub fn read_lease(state_dir: &Path, workspace: &str) -> Option<OwnerLease> {
-    if let Ok(raw) = std::fs::read_to_string(state_file(state_dir, workspace))
-        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw)
-        && let Some(lease) = value.get("lease")
-        && let Ok(lease) = serde_json::from_value(lease.clone())
-    {
-        return Some(lease);
-    }
-    let raw = std::fs::read_to_string(owner_file(state_dir, workspace)).ok()?;
-    serde_json::from_str(&raw).ok()
+    read_lease_at(&state_file(state_dir, workspace))
+}
+
+fn read_lease_at(path: &Path) -> Option<OwnerLease> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    serde_json::from_value(value.get("lease")?.clone()).ok()
 }
 
 /// Live (non-stale) leases across workspaces — the ws-blind deference
@@ -206,12 +204,7 @@ pub fn live_leases(state_dir: &Path, now_unix: u64) -> Vec<(String, OwnerLease)>
     let mut workspaces = std::collections::BTreeSet::new();
     for entry in entries.filter_map(|e| e.ok()) {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if let Some(ws) = name
-            .strip_prefix("owner-")
-            .and_then(|n| n.strip_suffix(".json"))
-        {
-            workspaces.insert(ws.to_string());
-        } else if let Some(ws) = name.strip_suffix(".state.json") {
+        if let Some(ws) = name.strip_suffix(".state.json") {
             workspaces.insert(ws.to_string());
         }
     }
@@ -305,7 +298,14 @@ pub fn acquire_lease_kind(
     now_unix: u64,
     kind: Option<&str>,
 ) -> Result<OwnerLease, LeaseDenied> {
-    if let Some(cur) = read_lease(state_dir, workspace)
+    // Check and claim under the same state lock. Reading outside the lock
+    // let two writers both observe "free" and both overwrite the lease.
+    let path = state_file(state_dir, workspace);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|_| LeaseDenied::Io)?;
+    }
+    let _lock = lock_state(&path)?;
+    if let Some(cur) = read_lease_at(&path)
         && !lease_stale(&cur, now_unix)
     {
         return Err(LeaseDenied::Held(cur));
@@ -319,7 +319,7 @@ pub fn acquire_lease_kind(
         process_start_unix: process_start_unix(std::process::id()).unwrap_or(now_unix),
         kind: kind.map(str::to_string),
     };
-    write_lease(state_dir, workspace, &lease)?;
+    write_lease_at(&path, &lease)?;
     Ok(lease)
 }
 
@@ -334,7 +334,11 @@ pub fn refresh_lease(
 }
 
 pub fn release_lease(state_dir: &Path, workspace: &str, lease: &OwnerLease) {
-    match read_lease(state_dir, workspace) {
+    let path = state_file(state_dir, workspace);
+    let Ok(_lock) = lock_state(&path) else {
+        return;
+    };
+    match read_lease_at(&path) {
         Some(cur)
             if cur.pid == lease.pid
                 && cur.boot_id == lease.boot_id
@@ -342,48 +346,56 @@ pub fn release_lease(state_dir: &Path, workspace: &str, lease: &OwnerLease) {
                     || lease.process_start_unix == 0
                     || cur.process_start_unix == lease.process_start_unix) =>
         {
-            let _ = update_state_file(state_dir, workspace, |object| {
-                object.remove("lease");
-            });
-            let _ = std::fs::remove_file(owner_file(state_dir, workspace));
+            if let Ok(mut value) = read_state_object(&path) {
+                value.remove("lease");
+                let _ = write_state_object(&path, &value);
+            }
         }
         _ => {}
     }
+    let _ = std::fs::remove_file(owner_file(state_dir, workspace));
 }
 
 fn write_lease(state_dir: &Path, workspace: &str, lease: &OwnerLease) -> Result<(), LeaseDenied> {
-    let value = serde_json::to_value(lease).map_err(|_| LeaseDenied::Io)?;
-    update_state_file(state_dir, workspace, |object| {
-        object.insert("lease".into(), value);
-    })
-}
-
-/// Merge one field into the unified state object and atomically replace it,
-/// preserving pid/project/generation written by the flywheel side.
-fn update_state_file(
-    state_dir: &Path,
-    workspace: &str,
-    update: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
-) -> Result<(), LeaseDenied> {
     let path = state_file(state_dir, workspace);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|_| LeaseDenied::Io)?;
     }
     let _lock = lock_state(&path)?;
-    let mut value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({}));
-    let object = value.as_object_mut().ok_or(LeaseDenied::Io)?;
-    update(object);
+    write_lease_at(&path, lease)
+}
+
+fn write_lease_at(path: &Path, lease: &OwnerLease) -> Result<(), LeaseDenied> {
+    let value = serde_json::to_value(lease).map_err(|_| LeaseDenied::Io)?;
+    let mut object = read_state_object(path)?;
+    object.insert("lease".into(), value);
+    write_state_object(path, &object)
+}
+
+fn read_state_object(
+    path: &Path,
+) -> Result<serde_json::Map<String, serde_json::Value>, LeaseDenied> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .ok_or(LeaseDenied::Io),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(_) => Err(LeaseDenied::Io),
+    }
+}
+
+fn write_state_object(
+    path: &Path,
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), LeaseDenied> {
     let tmp = path.with_extension("state.tmp");
     std::fs::write(
         &tmp,
-        serde_json::to_vec(&value).map_err(|_| LeaseDenied::Io)?,
+        serde_json::to_vec(object).map_err(|_| LeaseDenied::Io)?,
     )
     .map_err(|_| LeaseDenied::Io)?;
-    std::fs::rename(&tmp, &path).map_err(|_| LeaseDenied::Io)?;
+    std::fs::rename(&tmp, path).map_err(|_| LeaseDenied::Io)?;
     Ok(())
 }
 
@@ -466,9 +478,10 @@ mod tests {
             r#"{"pid":1,"boot_id":"b","host":"h","started_unix":1,"heartbeat_unix":1}"#,
         )
         .unwrap();
-        let legacy = read_lease(&d, "w").unwrap();
-        assert!(legacy.kind.is_none() && is_ringer(&legacy));
-        release_lease(&d, "w", &legacy);
+        assert!(
+            read_lease(&d, "w").is_none(),
+            "a legacy owner file is never read in production"
+        );
         let _ = std::fs::remove_file(owner_file(&d, "w"));
         let plain = acquire_lease(&d, "w", now).unwrap();
         assert!(
@@ -532,6 +545,31 @@ mod tests {
         release_lease(&d, "w", &next);
         assert!(read_lease(&d, "w").is_none());
         assert_eq!(live_leases(&d, now + 10).len(), 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn concurrent_acquire_has_exactly_one_winner() {
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let d = dir("race");
+        let now = unix_now();
+        let barrier = Barrier::new(8);
+        let wins = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    if acquire_lease(&d, "w", now).is_ok() {
+                        wins.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(wins.load(Ordering::SeqCst), 1, "one writer takes the lease");
+        let held = read_lease(&d, "w").expect("winner lease");
+        release_lease(&d, "w", &held);
         let _ = std::fs::remove_dir_all(&d);
     }
 

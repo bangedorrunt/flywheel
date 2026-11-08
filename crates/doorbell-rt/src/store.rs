@@ -343,15 +343,25 @@ impl FileStore {
         if let Ok(hosts) = std::fs::read_dir(self.state_dir.join("doorbell")) {
             for entry in hosts.filter_map(std::result::Result::ok) {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                let Some(ws) = name.strip_suffix(".pid") else {
+                let (ws, alive) = if let Some(ws) = name.strip_suffix(".state.json") {
+                    let alive = std::fs::read_to_string(entry.path())
+                        .ok()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                        .and_then(|state| state["pid"].as_u64())
+                        .and_then(|pid| u32::try_from(pid).ok())
+                        .is_some_and(crate::lease::pid_alive);
+                    (ws.to_string(), alive)
+                } else if let Some(ws) = name.strip_suffix(".pid") {
+                    let alive = std::fs::read_to_string(entry.path())
+                        .ok()
+                        .and_then(|raw| raw.trim().parse::<u32>().ok())
+                        .is_some_and(crate::lease::pid_alive);
+                    (ws.to_string(), alive)
+                } else {
                     continue;
                 };
-                let alive = std::fs::read_to_string(entry.path())
-                    .ok()
-                    .and_then(|raw| raw.trim().parse::<u32>().ok())
-                    .is_some_and(crate::lease::pid_alive);
                 if alive {
-                    live_hosts.insert(ws.to_string());
+                    live_hosts.insert(ws);
                 }
             }
         }
@@ -360,16 +370,24 @@ impl FileStore {
         if let Ok(entries) = std::fs::read_dir(self.state_dir.join("doorbell")) {
             for entry in entries.filter_map(std::result::Result::ok) {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                let Some(ws) = name.strip_suffix(".project") else {
+                let (ws, project) = if let Some(ws) = name.strip_suffix(".state.json") {
+                    let project = std::fs::read_to_string(entry.path())
+                        .ok()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                        .and_then(|state| state["project"].as_str().map(str::to_string));
+                    (ws.to_string(), project)
+                } else if let Some(ws) = name.strip_suffix(".project") {
+                    let project = std::fs::read_to_string(entry.path())
+                        .ok()
+                        .map(|raw| raw.trim().to_string());
+                    (ws.to_string(), project)
+                } else {
                     continue;
                 };
-                let Ok(raw) = std::fs::read_to_string(entry.path()) else {
-                    continue;
-                };
-                let project = raw.trim();
-                let project = std::path::Path::new(project);
+                let Some(project) = project else { continue };
+                let project = std::path::Path::new(&project);
                 if project.is_absolute() && !project.exists() {
-                    project_gone.insert(ws.to_string());
+                    project_gone.insert(ws);
                 }
             }
         }
@@ -399,6 +417,7 @@ impl FileStore {
                 .strip_suffix(".pid")
                 .or_else(|| name.strip_suffix(".gen"))
                 .or_else(|| name.strip_suffix(".project"))
+                .or_else(|| name.strip_suffix(".state.json"))
             {
                 Some((ws, Kind::Sidecar))
             } else if let Some(ws) = name
@@ -415,7 +434,10 @@ impl FileStore {
             if ws.is_empty() || live.contains(ws) {
                 continue;
             }
-            if matches!(kind, Kind::Sidecar) && live_hosts.contains(ws) {
+            if matches!(kind, Kind::Sidecar)
+                && (live_hosts.contains(ws)
+                    || (name.ends_with(".state.json") && leased.contains(ws)))
+            {
                 continue;
             }
             if matches!(kind, Kind::Lease) && leased.contains(ws) {
@@ -2383,10 +2405,21 @@ mod prune_tests {
             (doorbell.join("gone.gen"), "{}".into()),
             (doorbell.join("gone.project"), "p".into()),
             (doorbell.join("owner-gone.json"), lease(999999, now - OLD)),
+            (
+                doorbell.join("gone.state.json"),
+                format!(
+                    r#"{{"pid":999999,"project":"p","lease":{}}}"#,
+                    lease(999999, now - OLD)
+                ),
+            ),
             (doorbell.join("live.pid"), format!("{me}\n")),
             (doorbell.join("live.gen"), "{}".into()),
             (doorbell.join("live.project"), "p".into()),
             (doorbell.join("owner-live.json"), lease(me, now)),
+            (
+                doorbell.join("live.state.json"),
+                format!(r#"{{"pid":{me},"project":"p","lease":{}}}"#, lease(me, now)),
+            ),
         ];
         for (path, body) in &files {
             std::fs::write(path, body).expect("write");
@@ -2407,8 +2440,9 @@ mod prune_tests {
             "a dead host's records are garbage: {report:?}"
         );
         assert!(
-            !doorbell.join("owner-gone.json").exists(),
-            "a stale lease is reclaimable state, not an owner"
+            !doorbell.join("owner-gone.json").exists()
+                && !doorbell.join("gone.state.json").exists(),
+            "a stale lease and its state record are reclaimable, not an owner"
         );
         assert!(
             doorbell.join("live.pid").exists()
@@ -2417,10 +2451,13 @@ mod prune_tests {
             "a live pid protects its records even when they are old"
         );
         assert!(
-            doorbell.join("owner-live.json").exists(),
-            "a live lease is the deference record; never a candidate"
+            doorbell.join("owner-live.json").exists() && doorbell.join("live.state.json").exists(),
+            "a live lease and its state record are the deference record; never a candidate"
         );
-        assert_eq!(report.sidecars_removed, 3, "pid+gen+project: {report:?}");
+        assert_eq!(
+            report.sidecars_removed, 4,
+            "pid+gen+project+state: {report:?}"
+        );
         assert_eq!(report.leases_removed, 1, "only the stale lease: {report:?}");
         assert_eq!(report.audits_removed, 0, "no audit files in this fixture");
         let _ = std::fs::remove_dir_all(&dir);
