@@ -1264,6 +1264,7 @@ mod tests {
             ac_shape: AcShape::Checkable,
             owner: None,
             head_sha: None,
+            status: None,
         }
     }
 

@@ -3683,6 +3683,12 @@ pub(crate) fn cmd_internal_close_check(cfg: &Config, project: &str, bead_id: &st
             print_json(&json!({ "status": "no-commit", "bead_id": bead_id }));
             Ok(())
         }
+        Ok(verdict::CloseCheck::NotClosed { status }) => {
+            print_json(
+                &json!({ "status": "not-closed", "bead_id": bead_id, "bead_status": status }),
+            );
+            Ok(())
+        }
         Err(e) => {
             eprintln!("flywheel: close-check for {bead_id} failed: {e:#}");
             print_json(

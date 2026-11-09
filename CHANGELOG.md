@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.5] — 2026-11-09
+
+### Fixed
+- **Status-aware `claim_watch_step` and lock retention.** Non-closed bead states (`Blocked`, `Deferred`) no longer fall through to `__close-check` or prematurely invoke `__release-bead-locks`. File reservations are preserved across paused and non-terminal loop ticks.
+- **Verifier dispatch gating.** Gate verification checks ensure verifiers are dispatched only when ready conditions and dependencies are strictly satisfied.
+- **Doorbell query robustness.** Bounded argument linting and why query formatting improvements.
+
 ## [0.10.4] — 2026-11-09
 
 ### Added

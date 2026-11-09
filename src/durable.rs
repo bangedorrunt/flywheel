@@ -6867,6 +6867,7 @@ async fn swarm_loop(
                         // worker's file reservations until the close is legal
                         // or finally rejected.
                         let mut release_locks = true;
+                        let mut dispatch_verifier = false;
                         match crate::elm::leaf::run_leaf_journaled(
                             &params.project,
                             "__close-check",
@@ -6902,6 +6903,7 @@ async fn swarm_loop(
                                                 ),
                                             }
                                         }
+                                        dispatch_verifier = true;
                                     }
                                     "no-commit" => {
                                         swarm.clear_bead_slot(&bead_id);
@@ -7028,7 +7030,24 @@ async fn swarm_loop(
                                                 &bead_id,
                                                 LedgerEvent::Closed,
                                             );
+                                            dispatch_verifier = true;
                                         }
+                                    }
+                                    "not-closed" => {
+                                        release_locks = false;
+                                        let agent = swarm
+                                            .bead_slots
+                                            .get(&bead_id)
+                                            .and_then(|slot| slot.watch.as_ref())
+                                            .map(|cw| cw.agent.clone())
+                                            .unwrap_or_default();
+                                        swarm.bead_slot(&bead_id).watch = Some(ClaimWatch {
+                                            agent,
+                                            unclaimed_polls: 0,
+                                            close_nudged: false,
+                                            close_polls: 0,
+                                            wait_reason: Some(WaitReason::Blocked),
+                                        });
                                     }
                                     other => eprintln!(
                                         "flywheel: close-check for {bead_id} unknown status {other}"
@@ -7039,7 +7058,7 @@ async fn swarm_loop(
                                 "flywheel: close-check for {bead_id} failed (continuing): {e}"
                             ),
                         }
-                        if swarm.mark_verifier_dispatched(&bead_id) {
+                        if dispatch_verifier && swarm.mark_verifier_dispatched(&bead_id) {
                             match crate::elm::leaf::run_leaf_journaled(
                                 &params.project,
                                 "__verify-dispatch",
@@ -14077,6 +14096,26 @@ mod tests {
         assert!(
             handler.contains("orchestrator_mail_name"),
             "release-by-reason is operator-signed; the loop must act in that context"
+        );
+    }
+
+    #[test]
+    fn close_path_not_closed_preserves_locks_and_gates_verifier() {
+        let loop_path = include_str!("durable.rs");
+        let arm = loop_path
+            .split("ClaimWatchAction::ReleaseReservations { bead_id } => {")
+            .nth(1)
+            .expect("the closed-bead arm exists")
+            .split("\nfn ")
+            .next()
+            .expect("arm body");
+        assert!(
+            arm.contains("\"not-closed\" => {"),
+            "not-closed status must be handled explicitly"
+        );
+        assert!(
+            arm.contains("dispatch_verifier && swarm.mark_verifier_dispatched"),
+            "verifier dispatch must be gated on dispatch_verifier flag"
         );
     }
 

@@ -59,6 +59,7 @@ pub struct BeadUnit {
     pub owner: Option<AgentName>,
     /// SHA of the commit whose message carries the bead id (SHA rule).
     pub head_sha: Option<String>,
+    pub status: Option<String>,
 }
 
 /// Who produced the proof (ADR-0019 Spec 1).
@@ -675,6 +676,8 @@ fn load_bead(cwd: &Path, bead_id: &str, require_verify: bool) -> anyhow::Result<
         priority: u8,
         verify: Option<String>,
         #[serde(default)]
+        status: Option<String>,
+        #[serde(default)]
         blast: Option<String>,
         #[serde(default)]
         ac_shape: Option<String>,
@@ -710,6 +713,7 @@ fn load_bead(cwd: &Path, bead_id: &str, require_verify: bool) -> anyhow::Result<
         },
         owner: None,
         head_sha: None,
+        status: row.status,
     })
 }
 
@@ -1291,6 +1295,8 @@ pub enum CloseCheck {
     /// No commit carries the bead id — the close is illegal regardless of
     /// verdicts; reopen now.
     NoCommit,
+    /// The bead is not closed (e.g. paused as blocked or deferred).
+    NotClosed { status: String },
 }
 
 /// The close-detect check: SHA rule first (`derive_head_sha`), then the
@@ -1298,6 +1304,31 @@ pub enum CloseCheck {
 /// leaf turns a non-`Legal` verdict into `br reopen` + one mail per
 /// (bead, sha).
 pub fn close_check(cwd: &Path, bead_id: &str) -> anyhow::Result<CloseCheck> {
+    let bead = match bead_from_br_show_for_close(cwd, bead_id) {
+        Ok(b) => b,
+        Err(_) => {
+            let sha = match derive_head_sha(cwd, bead_id) {
+                Ok(s) => s,
+                Err(e) => {
+                    if format!("{e:#}").contains("SHA rule") {
+                        return Ok(CloseCheck::NoCommit);
+                    }
+                    return Err(e);
+                }
+            };
+            return Ok(CloseCheck::Missing {
+                sha,
+                receipt_eligible: false,
+            });
+        }
+    };
+    if let Some(status) = &bead.status
+        && status != "closed"
+    {
+        return Ok(CloseCheck::NotClosed {
+            status: status.clone(),
+        });
+    }
     let sha = match derive_head_sha(cwd, bead_id) {
         Ok(s) => s,
         Err(e) => {
@@ -1305,15 +1336,6 @@ pub fn close_check(cwd: &Path, bead_id: &str) -> anyhow::Result<CloseCheck> {
                 return Ok(CloseCheck::NoCommit);
             }
             return Err(e);
-        }
-    };
-    let bead = match bead_from_br_show_for_close(cwd, bead_id) {
-        Ok(b) => b,
-        Err(_) => {
-            return Ok(CloseCheck::Missing {
-                sha,
-                receipt_eligible: false,
-            });
         }
     };
     let ac_shape = bead.ac_shape;
@@ -1436,6 +1458,7 @@ mod tests {
             ac_shape: AcShape::Checkable,
             owner: None,
             head_sha: None,
+            status: None,
         }
     }
 
@@ -2679,6 +2702,30 @@ mod tests {
             CloseCheck::NoCommit,
             "no commit -> NoCommit (illegal close)"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn close_check_not_closed_when_bead_status_is_not_closed() {
+        let _g = crate::config::lock_env();
+        let (dir, bead_id) = scratch_workspace("not-closed-check");
+        match close_check(&dir, &bead_id).unwrap() {
+            CloseCheck::NotClosed { status } => {
+                assert_eq!(status, "open");
+            }
+            other => panic!("expected NotClosed for open bead, got {other:?}"),
+        }
+        crate::br::run_br(
+            Some(&dir),
+            &["update", &bead_id, "--claim", "--actor", "test-agent"],
+        )
+        .expect("claim bead");
+        match close_check(&dir, &bead_id).unwrap() {
+            CloseCheck::NotClosed { status } => {
+                assert_eq!(status, "in_progress");
+            }
+            other => panic!("expected NotClosed for in_progress bead, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

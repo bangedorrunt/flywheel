@@ -1249,6 +1249,7 @@ fn why_newest(mut rows: Vec<WhyDisplayRow>, limit: usize) -> (Vec<WhyDisplayRow>
     (shown, withheld)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_doorbell_why(
     cfg: &Config,
     project: &str,
