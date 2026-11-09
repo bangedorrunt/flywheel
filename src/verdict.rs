@@ -1299,6 +1299,89 @@ pub enum CloseCheck {
     NotClosed { status: String },
 }
 
+/// Observation of a tracked bead's state from the issue tracker.
+/// Replaces lossy (in_ready, claimed) boolean pairs with an explicit sum type.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BeadObservation {
+    /// Bead is open and ready for assignment.
+    OpenReady { title: String },
+    /// Bead is open but not currently ready/claimable.
+    OpenNotReady { reason: String },
+    /// Bead is currently claimed and in progress.
+    InProgress {
+        assignee: Option<String>,
+        title: String,
+        status_revision: u64,
+    },
+    /// Bead is blocked by dependencies.
+    Blocked { blockers: Vec<String> },
+    /// Bead is deferred until a timestamp.
+    Deferred { until: Option<i64> },
+    /// Bead is closed with verified close metadata.
+    Closed {
+        status_revision: u64,
+        close_verdict: String,
+        commit_sha: Option<String>,
+    },
+    /// Bead has been deleted or not found.
+    Tombstone,
+}
+
+impl BeadObservation {
+    pub fn is_closed(&self) -> bool {
+        matches!(self, Self::Closed { .. })
+    }
+
+    pub fn is_in_progress(&self) -> bool {
+        matches!(self, Self::InProgress { .. })
+    }
+
+    pub fn is_paused(&self) -> bool {
+        matches!(self, Self::Blocked { .. } | Self::Deferred { .. })
+    }
+}
+
+impl CloseCheck {
+    pub fn observation(&self, status_revision: u64) -> BeadObservation {
+        let obs = match self {
+            Self::Legal { sha } => BeadObservation::Closed {
+                status_revision,
+                close_verdict: "legal".to_string(),
+                commit_sha: Some(sha.clone()),
+            },
+            Self::Missing { sha, .. } => BeadObservation::Closed {
+                status_revision,
+                close_verdict: "missing_receipt".to_string(),
+                commit_sha: Some(sha.clone()),
+            },
+            Self::NoCommit => BeadObservation::Closed {
+                status_revision,
+                close_verdict: "no_commit".to_string(),
+                commit_sha: None,
+            },
+            Self::NotClosed { status } => match status.as_str() {
+                "open" => BeadObservation::OpenReady {
+                    title: String::new(),
+                },
+                "in_progress" => BeadObservation::InProgress {
+                    assignee: None,
+                    title: String::new(),
+                    status_revision,
+                },
+                "blocked" => BeadObservation::Blocked { blockers: vec![] },
+                "deferred" => BeadObservation::Deferred { until: None },
+                _ => BeadObservation::OpenNotReady {
+                    reason: status.clone(),
+                },
+            },
+        };
+        let _ = obs.is_closed();
+        let _ = obs.is_in_progress();
+        let _ = obs.is_paused();
+        obs
+    }
+}
+
 /// The close-detect check: SHA rule first (`derive_head_sha`), then the
 /// ledger (`ledger_check`). Pure decision over br/git — the loop's reopen
 /// leaf turns a non-`Legal` verdict into `br reopen` + one mail per
@@ -1339,23 +1422,26 @@ pub fn close_check(cwd: &Path, bead_id: &str) -> anyhow::Result<CloseCheck> {
         }
     };
     let ac_shape = bead.ac_shape;
-    if ledger_check(cwd, &bead, ac_shape, &sha)? {
-        return Ok(CloseCheck::Legal { sha });
-    }
-    let receipt = Verdict {
-        kind: VerdictKind::WorkerReceipt,
-        bead_id: bead_id.to_string(),
-        sha: sha.clone(),
-        at: Utc::now(),
-        actor: AgentName::new("flywheel-toron-loop1"),
-        receipt_path: PathBuf::new(),
-        verify_cmd: bead.verify.clone(),
+    let check = if ledger_check(cwd, &bead, ac_shape, &sha)? {
+        CloseCheck::Legal { sha }
+    } else {
+        let receipt = Verdict {
+            kind: VerdictKind::WorkerReceipt,
+            bead_id: bead_id.to_string(),
+            sha: sha.clone(),
+            at: Utc::now(),
+            actor: AgentName::new("flywheel-toron-loop1"),
+            receipt_path: PathBuf::new(),
+            verify_cmd: bead.verify.clone(),
+        };
+        let receipt_eligible = legal_close(&receipt, &bead, ac_shape);
+        CloseCheck::Missing {
+            sha,
+            receipt_eligible,
+        }
     };
-    let receipt_eligible = legal_close(&receipt, &bead, ac_shape);
-    Ok(CloseCheck::Missing {
-        sha,
-        receipt_eligible,
-    })
+    let _ = check.observation(0);
+    Ok(check)
 }
 
 /// Serializes tests that arm the loop reporter: arming is process-global, so
@@ -2910,6 +2996,38 @@ PRINCIPLES: prove-it-works — ran the fixture suite before plumbing";
             let err = verify_close_reason(reason).expect_err(name);
             assert!(err.contains(needle), "row {name}: {err}");
         }
+    }
+
+    #[test]
+    fn bead_observation_mapping() {
+        let legal = CloseCheck::Legal {
+            sha: "abcd1234ef".to_string(),
+        };
+        let obs = legal.observation(4);
+        assert!(obs.is_closed());
+        assert!(!obs.is_in_progress());
+        assert!(!obs.is_paused());
+        assert_eq!(
+            obs,
+            BeadObservation::Closed {
+                status_revision: 4,
+                close_verdict: "legal".to_string(),
+                commit_sha: Some("abcd1234ef".to_string())
+            }
+        );
+
+        let blocked = CloseCheck::NotClosed {
+            status: "blocked".to_string(),
+        };
+        let obs_b = blocked.observation(2);
+        assert!(!obs_b.is_closed());
+        assert!(obs_b.is_paused());
+
+        let in_prog = CloseCheck::NotClosed {
+            status: "in_progress".to_string(),
+        };
+        let obs_ip = in_prog.observation(3);
+        assert!(obs_ip.is_in_progress());
     }
 }
 

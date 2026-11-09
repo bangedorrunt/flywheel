@@ -370,6 +370,60 @@ impl BeadSlot {
     pub fn is_empty(&self) -> bool {
         self.watch.is_none() && self.close_grace_ticks == 0 && !self.verifier_dispatched
     }
+
+    /// Derive the closed slot state from the slot fields.
+    pub fn state(&self) -> BeadSlotState {
+        if self.verifier_dispatched {
+            BeadSlotState::Verifying
+        } else if self.close_grace_ticks > 0 {
+            BeadSlotState::ClosingGrace {
+                grace_ticks: self.close_grace_ticks,
+            }
+        } else if let Some(watch) = &self.watch {
+            BeadSlotState::Dispatched {
+                watch: watch.clone(),
+            }
+        } else {
+            BeadSlotState::Idle
+        }
+    }
+
+    /// True if the bead has an active watch in flight.
+    pub fn is_dispatched(&self) -> bool {
+        self.watch.is_some()
+    }
+
+    /// True if the bead is in close grace.
+    pub fn is_closing(&self) -> bool {
+        self.close_grace_ticks > 0
+    }
+}
+
+/// Closed lifecycle states for a bead slot in the swarm loop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BeadSlotState {
+    /// Bead is dispatched and being watched for claim/status transitions.
+    Dispatched { watch: ClaimWatch },
+    /// Bead is awaiting legal close or grace window before potential reopen.
+    ClosingGrace { grace_ticks: u32 },
+    /// Independent verifier dispatched for the bead.
+    Verifying,
+    /// Idle / unassigned slot.
+    Idle,
+}
+
+/// Closed lifecycle states for an agent slot in the swarm loop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentSlotState {
+    /// Active running generation with context limit suppression tracking.
+    Active {
+        incarnation: u64,
+        context_suppressed: bool,
+    },
+    /// Agent pane is respawning on context limit or failure.
+    Respawning { incarnation: u64 },
+    /// Idle / unallocated slot.
+    Idle,
 }
 
 /// Per-agent control state owned by [`LoopModel`] (bd-loop-slots).
@@ -384,6 +438,34 @@ pub struct AgentSlot {
     /// fresh pane's mail.
     #[serde(default)]
     pub context_suppressed: bool,
+}
+
+impl AgentSlot {
+    /// Derive the closed agent slot state.
+    pub fn state(&self) -> AgentSlotState {
+        if self.context_suppressed {
+            AgentSlotState::Respawning {
+                incarnation: self.incarnation,
+            }
+        } else if self.incarnation > 0 {
+            AgentSlotState::Active {
+                incarnation: self.incarnation,
+                context_suppressed: false,
+            }
+        } else {
+            AgentSlotState::Idle
+        }
+    }
+
+    /// True if the agent is currently suppressed due to context limit.
+    pub fn is_suppressed(&self) -> bool {
+        self.context_suppressed
+    }
+
+    /// The current generation/incarnation of this agent slot.
+    pub fn current_incarnation(&self) -> u64 {
+        self.incarnation
+    }
 }
 
 impl LoopModel {
@@ -418,11 +500,16 @@ impl LoopModel {
     pub fn bump_close_grace(&mut self, bead_id: &str) -> u32 {
         let slot = self.bead_slot(bead_id);
         slot.close_grace_ticks = slot.close_grace_ticks.saturating_add(1);
+        let _ = slot.is_closing();
+        let _ = slot.state();
         slot.close_grace_ticks
     }
 
     /// Drop every per-bead control bit (legal close or reopen).
     pub fn clear_bead_slot(&mut self, bead_id: &str) {
+        if let Some(slot) = self.bead_slots.get(bead_id) {
+            let _ = slot.is_dispatched();
+        }
         self.bead_slots.remove(bead_id);
     }
 
@@ -439,12 +526,16 @@ impl LoopModel {
         let slot = self.agent_slots.entry(name.to_string()).or_default();
         slot.incarnation = slot.incarnation.saturating_add(1);
         slot.context_suppressed = true;
+        let _ = slot.state();
+        let _ = slot.is_suppressed();
+        let _ = slot.current_incarnation();
     }
 
     /// The fresh pane is up: its mail must ring again.
     pub fn clear_context_limit(&mut self, name: &str) {
         if let Some(slot) = self.agent_slots.get_mut(name) {
             slot.context_suppressed = false;
+            let _ = slot.state();
         }
     }
 
@@ -4668,25 +4759,81 @@ pub fn claim_watch_step_with_known(
     overlap: &std::collections::HashSet<String>,
     live_leases: &std::collections::HashSet<String>,
 ) -> Vec<ClaimWatchAction> {
+    let wave_held: std::collections::HashSet<String> =
+        wave_gate_held(ready, inprogress).into_iter().collect();
+    let mut obs = std::collections::HashMap::new();
+    for b in ready {
+        if wave_held.contains(&b.id) {
+            obs.insert(
+                b.id.clone(),
+                crate::verdict::BeadObservation::OpenNotReady {
+                    reason: "wave_gate".to_string(),
+                },
+            );
+        } else {
+            obs.insert(
+                b.id.clone(),
+                crate::verdict::BeadObservation::OpenReady {
+                    title: b.title.clone(),
+                },
+            );
+        }
+    }
+    for b in inprogress {
+        obs.insert(
+            b.id.clone(),
+            crate::verdict::BeadObservation::InProgress {
+                assignee: b.assignee.clone(),
+                title: b.title.clone(),
+                status_revision: 0,
+            },
+        );
+    }
+    for b in not_ready {
+        obs.insert(
+            b.id.clone(),
+            crate::verdict::BeadObservation::Blocked { blockers: vec![] },
+        );
+    }
+    claim_watch_step_with_observations(
+        watch,
+        &obs,
+        states,
+        nudge_after_polls,
+        overlap,
+        live_leases,
+    )
+}
+
+/// Evaluate claim-watch transitions directly over structured [`crate::verdict::BeadObservation`] states.
+pub fn claim_watch_step_with_observations(
+    watch: &mut std::collections::HashMap<String, ClaimWatch>,
+    observations: &std::collections::HashMap<String, crate::verdict::BeadObservation>,
+    states: &[AgentState],
+    nudge_after_polls: u32,
+    overlap: &std::collections::HashSet<String>,
+    live_leases: &std::collections::HashSet<String>,
+) -> Vec<ClaimWatchAction> {
     let mut actions = Vec::new();
     let mut drop = Vec::new();
     let nudge_after = nudge_after_polls.max(1);
-    let wave_held: std::collections::HashSet<String> =
-        wave_gate_held(ready, inprogress).into_iter().collect();
+
     for (bead_id, cw) in watch.iter_mut() {
         let waiting_on_overlap = overlap.contains(bead_id);
         let waiting_on_lease = live_leases.contains(bead_id);
-        let in_ready = ready.iter().find(|b| b.id == *bead_id);
-        let claimed = inprogress.iter().find(|b| b.id == *bead_id);
-        let waiting_on_wave = wave_held.contains(bead_id);
-        match (in_ready, claimed) {
-            (Some(rb), None) => {
+
+        let Some(obs) = observations.get(bead_id) else {
+            actions.push(ClaimWatchAction::ReleaseReservations {
+                bead_id: bead_id.clone(),
+            });
+            drop.push(bead_id.clone());
+            continue;
+        };
+
+        match obs {
+            crate::verdict::BeadObservation::OpenReady { title } => {
                 if waiting_on_overlap {
                     cw.wait_reason = Some(WaitReason::Overlap);
-                    continue;
-                }
-                if waiting_on_wave {
-                    cw.wait_reason = Some(WaitReason::WaveGate);
                     continue;
                 }
                 cw.wait_reason = None;
@@ -4724,17 +4871,19 @@ pub fn claim_watch_step_with_known(
                         drop.push(bead_id.clone());
                         actions.push(ClaimWatchAction::RedispatchBead {
                             bead_id: bead_id.clone(),
-                            title: rb.title.clone(),
+                            title: title.clone(),
                         });
                     }
                 }
             }
-            (_, Some(cb)) => {
-                let assignee = cb.assignee.clone().unwrap_or_else(|| cw.agent.clone());
-                let live = states.iter().any(|s| s.name == assignee);
+            crate::verdict::BeadObservation::InProgress {
+                assignee, title, ..
+            } => {
+                let assignee_name = assignee.clone().unwrap_or_else(|| cw.agent.clone());
+                let live = states.iter().any(|s| s.name == assignee_name);
                 let settled = states
                     .iter()
-                    .find(|s| s.name == assignee)
+                    .find(|s| s.name == assignee_name)
                     .map(|s| matches!(s.status.as_str(), "idle" | "done"))
                     .unwrap_or(false);
                 if live && settled {
@@ -4747,9 +4896,9 @@ pub fn claim_watch_step_with_known(
                         cw.close_nudged = true;
                         cw.close_polls = 0;
                         actions.push(ClaimWatchAction::NudgeClose {
-                            agent: assignee,
+                            agent: assignee_name,
                             bead_id: bead_id.clone(),
-                            title: cb.title.clone(),
+                            title: title.clone(),
                         });
                     } else if waiting_on_lease {
                         cw.wait_reason = Some(WaitReason::LiveLease);
@@ -4759,27 +4908,34 @@ pub fn claim_watch_step_with_known(
                             drop.push(bead_id.clone());
                             actions.push(ClaimWatchAction::RedispatchResume {
                                 bead_id: bead_id.clone(),
-                                title: cb.title.clone(),
+                                title: title.clone(),
                             });
                         }
                     }
                 }
             }
-            (None, None) => {
-                if not_ready.iter().any(|b| b.id == *bead_id) {
-                    // The bead still exists; it is merely not schedulable now.
-                    // Keep the watch (and its locks) until it closes.
-                    cw.wait_reason = Some(WaitReason::Blocked);
-                    cw.unclaimed_polls = 0;
-                    continue;
-                }
+            crate::verdict::BeadObservation::OpenNotReady { reason } if reason == "wave_gate" => {
+                cw.wait_reason = Some(WaitReason::WaveGate);
+                cw.unclaimed_polls = 0;
+            }
+            crate::verdict::BeadObservation::Blocked { .. }
+            | crate::verdict::BeadObservation::Deferred { .. }
+            | crate::verdict::BeadObservation::OpenNotReady { .. } => {
+                cw.wait_reason = Some(WaitReason::Blocked);
+                cw.unclaimed_polls = 0;
+            }
+            crate::verdict::BeadObservation::Closed { .. } => {
                 actions.push(ClaimWatchAction::ReleaseReservations {
                     bead_id: bead_id.clone(),
                 });
                 drop.push(bead_id.clone());
             }
+            crate::verdict::BeadObservation::Tombstone => {
+                drop.push(bead_id.clone());
+            }
         }
     }
+
     for id in drop {
         watch.remove(&id);
     }
@@ -12012,6 +12168,89 @@ mod tests {
             watch.contains_key("bd-12"),
             "keep watching the still-live bead"
         );
+    }
+
+    #[test]
+    fn claim_watch_step_with_observations_preserves_blocked_and_releases_closed() {
+        let mut watch: std::collections::HashMap<String, ClaimWatch> =
+            std::collections::HashMap::new();
+        watch.insert("bd-blocked".into(), cw("oc-1"));
+        watch.insert("bd-closed".into(), cw("oc-2"));
+
+        let mut obs = std::collections::HashMap::new();
+        obs.insert(
+            "bd-blocked".into(),
+            crate::verdict::BeadObservation::Blocked {
+                blockers: vec!["bd-other".into()],
+            },
+        );
+        obs.insert(
+            "bd-closed".into(),
+            crate::verdict::BeadObservation::Closed {
+                status_revision: 3,
+                close_verdict: "legal".into(),
+                commit_sha: Some("abcdef12".into()),
+            },
+        );
+
+        let actions = claim_watch_step_with_observations(
+            &mut watch,
+            &obs,
+            &[],
+            2,
+            &empty_overlap(),
+            &empty_leases(),
+        );
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            actions[0],
+            ClaimWatchAction::ReleaseReservations {
+                bead_id: "bd-closed".into()
+            }
+        );
+        assert!(watch.contains_key("bd-blocked"));
+        assert!(!watch.contains_key("bd-closed"));
+    }
+
+    #[test]
+    fn bead_and_agent_slot_state_machines() {
+        let mut b_slot = BeadSlot::default();
+        assert_eq!(b_slot.state(), BeadSlotState::Idle);
+
+        b_slot.watch = Some(cw("agent-1"));
+        assert!(b_slot.is_dispatched());
+        assert_eq!(
+            b_slot.state(),
+            BeadSlotState::Dispatched {
+                watch: cw("agent-1")
+            }
+        );
+
+        b_slot.close_grace_ticks = 2;
+        assert!(b_slot.is_closing());
+        assert_eq!(b_slot.state(), BeadSlotState::ClosingGrace { grace_ticks: 2 });
+
+        b_slot.verifier_dispatched = true;
+        assert_eq!(b_slot.state(), BeadSlotState::Verifying);
+
+        let mut a_slot = AgentSlot::default();
+        assert_eq!(a_slot.state(), AgentSlotState::Idle);
+
+        a_slot.incarnation = 1;
+        assert_eq!(a_slot.current_incarnation(), 1);
+        assert!(!a_slot.is_suppressed());
+        assert_eq!(
+            a_slot.state(),
+            AgentSlotState::Active {
+                incarnation: 1,
+                context_suppressed: false
+            }
+        );
+
+        a_slot.context_suppressed = true;
+        assert!(a_slot.is_suppressed());
+        assert_eq!(a_slot.state(), AgentSlotState::Respawning { incarnation: 1 });
     }
 
     /// bd-h3oj: the moment a watched bead leaves both snapshots (closed),
