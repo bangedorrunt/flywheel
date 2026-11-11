@@ -1198,9 +1198,14 @@ steps:
       task: 'Gate the wave {{inputs.wave_label}}: preflight + scope `br ready` for this wave; write .flywheel/wave/{{inputs.wave_label}}-ready.json (the DISPATCH binding artifact); a lower open wave holds. bd-wave-gate-typed-authority-27et: the TYPED `wave` field is the authority (br ready is already wave-gated by it natively) — select rows whose typed `wave` == N, falling back to the legacy `wave-N` label only when the typed field is null; hold when ANY bead with an earlier wave-M (M<N) is open or in_progress, naming the blockers. An EMPTY ready with NO bead of this wave in flight is a LOUD FAILURE — post [gate] blocked: wave <label> matched zero beads and STOP. An EMPTY ready WITH in-flight beads is held:false + in_flight — the wave is WORK IN FLIGHT, report it and continue (never a held/empty-wave failure, never re-dispatch). Write the artifact as {wave_label, held, blockers, ready, in_flight}. When the gate is GREEN (artifact written, held:false, ready non-empty OR in flight), write .flywheel/wave/{{inputs.wave_label}}-gate.done so DISPATCH may start; when held or blocked, post [gate] held and write NO marker. Objective: {{inputs.objective}}'
     on_error: fail_run
   - name: await_gate
-    action: verify
+    action: retry
+    max_attempts: 240
+    backoff_secs: 30
     on_error: fail_run
-    command: "mkdir -p .flywheel/wave; m=.flywheel/wave/{{inputs.wave_label}}-gate.done; while [ ! -f \"$m\" ]; do if command -v inotifywait >/dev/null 2>&1; then inotifywait -qq -e create,close_write,moved_to .flywheel/wave >/dev/null 2>&1 || true; elif command -v fswatch >/dev/null 2>&1; then fswatch -1 --event Created --event Updated --event Renamed --event MovedTo .flywheel/wave >/dev/null 2>&1 || true; else sleep 0.2; fi; done; test -f \"$m\" || { echo 'wave in flight: {{inputs.wave_label}}-gate.done not present yet — the wave waits for real work; widen the outer bound or fix the planner, never dispatch over a held gate'; exit 1; }"
+    step:
+      name: gate_marker
+      action: verify
+      command: "test -f .flywheel/wave/{{inputs.wave_label}}-gate.done || { mkdir -p .flywheel/wave; m=.flywheel/wave/{{inputs.wave_label}}-gate.done; for _ in $(seq 1 140); do if [ -f \"$m\" ]; then break; fi; if command -v inotifywait >/dev/null 2>&1; then inotifywait -qq -t 1 -e create,close_write,moved_to .flywheel/wave >/dev/null 2>&1 || true; elif command -v fswatch >/dev/null 2>&1; then fswatch -1 -t 1 --event Created --event Updated --event Renamed --event MovedTo .flywheel/wave >/dev/null 2>&1 || true; else sleep 0.2; fi; done; test -f \"$m\" || { echo 'wave in flight: {{inputs.wave_label}}-gate.done not present yet — the wave waits for real work; widen the outer bound or fix the planner, never dispatch over a held gate'; exit 1; }; }"
   - name: dispatch
     action: dispatch_job
     assignee: x
@@ -1210,9 +1215,14 @@ steps:
       task: 'Dispatch the wave beads: read .flywheel/wave/{{inputs.wave_label}}-ready.json for held + learnings, then take the bead list LIVE — `br ready --json` scoped to this wave at dispatch time (typed `wave` == N, legacy `wave-N` label fallback); the artifact ready[] is a snapshot that may be stale (bd-wave-gate-typed-authority-27et). One send --stage ce-execute --param payload per LIVE bead, each naming its bead id + the claim/close contract (+ learnings when the gate matched); onto {{inputs.steer_channel}}. The crew escalates to orchestrator pin {{inputs.captain_pin}}. If the artifact is missing or held:true, post [dispatch] held and STOP (write NO marker). If the live ready set is empty and the artifact names in_flight[], post [dispatch] work in flight: <ids> and write .flywheel/wave/{{inputs.wave_label}}-dispatch.done — nothing to dispatch, a live crew owns the wave; never duplicate it. After every payload is posted, write the marker so EXECUTE may start. Objective: {{inputs.objective}}'
     on_error: fail_run
   - name: await_dispatch
-    action: verify
+    action: retry
+    max_attempts: 240
+    backoff_secs: 30
     on_error: fail_run
-    command: "mkdir -p .flywheel/wave; m=.flywheel/wave/{{inputs.wave_label}}-dispatch.done; while [ ! -f \"$m\" ]; do if command -v inotifywait >/dev/null 2>&1; then inotifywait -qq -e create,close_write,moved_to .flywheel/wave >/dev/null 2>&1 || true; elif command -v fswatch >/dev/null 2>&1; then fswatch -1 --event Created --event Updated --event Renamed --event MovedTo .flywheel/wave >/dev/null 2>&1 || true; else sleep 0.2; fi; done; test -f \"$m\" || { echo 'wave in flight: {{inputs.wave_label}}-dispatch.done not present yet — EXECUTE must not start until every payload is posted; widen the outer bound if the dispatcher is really working'; exit 1; }"
+    step:
+      name: dispatch_marker
+      action: verify
+      command: "test -f .flywheel/wave/{{inputs.wave_label}}-dispatch.done || { mkdir -p .flywheel/wave; m=.flywheel/wave/{{inputs.wave_label}}-dispatch.done; for _ in $(seq 1 140); do if [ -f \"$m\" ]; then break; fi; if command -v inotifywait >/dev/null 2>&1; then inotifywait -qq -t 1 -e create,close_write,moved_to .flywheel/wave >/dev/null 2>&1 || true; elif command -v fswatch >/dev/null 2>&1; then fswatch -1 -t 1 --event Created --event Updated --event Renamed --event MovedTo .flywheel/wave >/dev/null 2>&1 || true; else sleep 0.2; fi; done; test -f \"$m\" || { echo 'wave in flight: {{inputs.wave_label}}-dispatch.done not present yet — EXECUTE must not start until every payload is posted; widen the outer bound if the dispatcher is really working'; exit 1; }; }"
   - name: execute
     action: dispatch_job
     assignee: x
@@ -1222,9 +1232,14 @@ steps:
       task: 'Execute the wave beads listed in .flywheel/wave/{{inputs.wave_label}}-ready.json (claim -> run each bead''s VERIFY -> commit before close -> ledger-legal close with VERIFY tail + principles citations). When ready is empty and in_flight[] is non-empty, do NOT claim or close — a live crew owns those beads; wait (poll `br show <id> --json`) until every in-flight bead is closed, then write the marker. After the LAST bead of the wave is closed, write .flywheel/wave/{{inputs.wave_label}}-execute.done so REVIEW reads closes and never revises an open wave. When ready AND in_flight are both empty, post [execute] blocked: nothing to execute and write NO marker (a wave that runs nothing must not report success). Objective: {{inputs.objective}}'
     on_error: fail_run
   - name: await_execute
-    action: verify
+    action: retry
+    max_attempts: 240
+    backoff_secs: 30
     on_error: fail_run
-    command: "mkdir -p .flywheel/wave; m=.flywheel/wave/{{inputs.wave_label}}-execute.done; while [ ! -f \"$m\" ]; do if command -v inotifywait >/dev/null 2>&1; then inotifywait -qq -e create,close_write,moved_to .flywheel/wave >/dev/null 2>&1 || true; elif command -v fswatch >/dev/null 2>&1; then fswatch -1 --event Created --event Updated --event Renamed --event MovedTo .flywheel/wave >/dev/null 2>&1 || true; else sleep 0.2; fi; done; test -f \"$m\" || { echo 'wave in flight: {{inputs.wave_label}}-execute.done not present yet — REVIEW must not start with closes still landing; widen the outer bound if the wave is really working'; exit 1; }"
+    step:
+      name: execute_marker
+      action: verify
+      command: "test -f .flywheel/wave/{{inputs.wave_label}}-execute.done || { mkdir -p .flywheel/wave; m=.flywheel/wave/{{inputs.wave_label}}-execute.done; for _ in $(seq 1 140); do if [ -f \"$m\" ]; then break; fi; if command -v inotifywait >/dev/null 2>&1; then inotifywait -qq -t 1 -e create,close_write,moved_to .flywheel/wave >/dev/null 2>&1 || true; elif command -v fswatch >/dev/null 2>&1; then fswatch -1 -t 1 --event Created --event Updated --event Renamed --event MovedTo .flywheel/wave >/dev/null 2>&1 || true; else sleep 0.2; fi; done; test -f \"$m\" || { echo 'wave in flight: {{inputs.wave_label}}-execute.done not present yet — REVIEW must not start with closes still landing; widen the outer bound if the wave is really working'; exit 1; }; }"
   - name: observe
     action: dispatch_job
     assignee: x
@@ -1242,9 +1257,14 @@ steps:
       task: 'Review every closed bead of {{inputs.wave_label}} for {{inputs.objective}}: audit the committed diff against each brief''s ACCEPTANCE/VERIFY — detection conditions, quoted file:line evidence, severity + autofix class per finding; single-lens pass (no corroboration claims). Findings JSON to {{inputs.steer_channel}}. After the findings are posted, write .flywheel/wave/{{inputs.wave_label}}-review.done. Objective: {{inputs.objective}}'
     on_error: fail_run
   - name: await_review
-    action: verify
+    action: retry
+    max_attempts: 240
+    backoff_secs: 30
     on_error: fail_run
-    command: "mkdir -p .flywheel/wave; m=.flywheel/wave/{{inputs.wave_label}}-review.done; while [ ! -f \"$m\" ]; do if command -v inotifywait >/dev/null 2>&1; then inotifywait -qq -e create,close_write,moved_to .flywheel/wave >/dev/null 2>&1 || true; elif command -v fswatch >/dev/null 2>&1; then fswatch -1 --event Created --event Updated --event Renamed --event MovedTo .flywheel/wave >/dev/null 2>&1 || true; else sleep 0.2; fi; done; test -f \"$m\" || { echo 'wave in flight: {{inputs.wave_label}}-review.done not present yet — VERIFY needs the findings first; widen the outer bound if the reviewer is really working'; exit 1; }"
+    step:
+      name: review_marker
+      action: verify
+      command: "test -f .flywheel/wave/{{inputs.wave_label}}-review.done || { mkdir -p .flywheel/wave; m=.flywheel/wave/{{inputs.wave_label}}-review.done; for _ in $(seq 1 140); do if [ -f \"$m\" ]; then break; fi; if command -v inotifywait >/dev/null 2>&1; then inotifywait -qq -t 1 -e create,close_write,moved_to .flywheel/wave >/dev/null 2>&1 || true; elif command -v fswatch >/dev/null 2>&1; then fswatch -1 -t 1 --event Created --event Updated --event Renamed --event MovedTo .flywheel/wave >/dev/null 2>&1 || true; else sleep 0.2; fi; done; test -f \"$m\" || { echo 'wave in flight: {{inputs.wave_label}}-review.done not present yet — VERIFY needs the findings first; widen the outer bound if the reviewer is really working'; exit 1; }; }"
   - name: verify
     action: dispatch_job
     assignee: x
@@ -3179,32 +3199,22 @@ mod tests {
         let wave = &wfs["wave-swarm"];
         let mut awaits = Vec::new();
         for s in &wave.steps {
-            let name = s.name.as_deref().unwrap_or_default();
-            match &s.action {
-                Action::Retry { step, .. } => {
-                    let Action::Verify { command } = &step.action else {
-                        panic!(
-                            "retry step {name} must wrap a verify, not {:?}",
-                            step.action.type_name()
-                        );
-                    };
-                    awaits.push((name.to_string(), command.clone()));
-                }
-                Action::Verify { command }
-                    if matches!(
-                        name,
-                        "await_gate" | "await_dispatch" | "await_execute" | "await_review"
-                    ) =>
-                {
-                    awaits.push((name.to_string(), command.clone()));
-                }
-                _ => {}
-            }
+            let Action::Retry { step, .. } = &s.action else {
+                continue;
+            };
+            let Action::Verify { command } = &step.action else {
+                panic!(
+                    "retry step {} must wrap a verify, not {:?}",
+                    s.name.as_deref().unwrap_or("?"),
+                    step.action.type_name()
+                );
+            };
+            awaits.push((s.name.clone().unwrap_or_default(), command.clone()));
         }
         assert_eq!(
             awaits.len(),
             5,
-            "wave-swarm carries five stage awaits (4 reactive + 1 retry-over-verify): {awaits:?}"
+            "wave-swarm carries five retry-over-verify awaits: {awaits:?}"
         );
         for (name, cmd) in &awaits {
             let lower = cmd.to_lowercase();
