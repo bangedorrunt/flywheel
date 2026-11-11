@@ -363,12 +363,7 @@ fn deliver_p2p_wake_hc(
     }
     let route = crate::harness_caps::wake_route(&kind, crate::harness_caps::installed_from_env());
     let line = directive.wake_line(wm);
-    crate::pane_write::write_p2p_wake(
-        &crate::pane_write::HcPanes(&c),
-        &target,
-        &line,
-        route,
-    )?;
+    crate::pane_write::write_p2p_wake(&crate::pane_write::HcPanes(&c), &target, &line, route)?;
     Ok(line)
 }
 
@@ -410,12 +405,7 @@ fn deliver_p2p_wake_rex(
     Ok(line)
 }
 
-fn deliver_p2p_wake(
-    cfg: &Config,
-    directive: &P2pDirective,
-    pin: &str,
-    wm: u64,
-) -> Result<String> {
+fn deliver_p2p_wake(cfg: &Config, directive: &P2pDirective, pin: &str, wm: u64) -> Result<String> {
     if crate::pane::rex_door_selected(cfg) {
         #[cfg(feature = "backend-superlogical")]
         {
@@ -614,7 +604,10 @@ mod tests {
         assert!(mail.windows(2).any(|w| w == ["--project", "flywheel"]));
         assert!(mail.windows(2).any(|w| w == ["--as", "BlackGorge"]));
         assert!(mail.windows(2).any(|w| w == ["--to", "AmberHarbor"]));
-        assert!(mail.windows(2).any(|w| w == ["--subject", "p2p:request-release src/pane.rs"]));
+        assert!(
+            mail.windows(2)
+                .any(|w| w == ["--subject", "p2p:request-release src/pane.rs"])
+        );
         let confirm = d.confirmation(0x7f, true);
         assert_eq!(confirm["wake"], wake);
         assert_eq!(confirm["verb"], "request-release");

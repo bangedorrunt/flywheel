@@ -165,7 +165,7 @@ pub struct QuestionDef {
     pub instructions: String,
     #[serde(default)]
     pub options: Vec<String>,
-    #[serde(default)]
+    #[serde(default, alias = "levels")]
     pub criteria: Vec<String>,
 }
 
@@ -2263,6 +2263,427 @@ pub fn annotate(
     }
 }
 
+/// Advisory P2P conflict resolution strategy recommendations (bd-typesafe-p2p-arbitrator-ncigb).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum P2PConflictResolution {
+    PartitionByFunction,
+    SequenceAThenB,
+    SequenceBThenA,
+    EscalateToCaptain,
+}
+
+impl std::str::FromStr for P2PConflictResolution {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().replace('_', "-").as_str() {
+            "partition-by-function" => Ok(Self::PartitionByFunction),
+            "sequence-a-then-b" => Ok(Self::SequenceAThenB),
+            "sequence-b-then-a" => Ok(Self::SequenceBThenA),
+            "escalate-to-captain" => Ok(Self::EscalateToCaptain),
+            other => Err(format!("unknown conflict resolution: {other}")),
+        }
+    }
+}
+
+impl std::fmt::Display for P2PConflictResolution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PartitionByFunction => write!(f, "partition-by-function"),
+            Self::SequenceAThenB => write!(f, "sequence-a-then-b"),
+            Self::SequenceBThenA => write!(f, "sequence-b-then-a"),
+            Self::EscalateToCaptain => write!(f, "escalate-to-captain"),
+        }
+    }
+}
+
+/// Advisory conflict arbitration outcome.
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ConflictArbitrationResult {
+    pub resolution: P2PConflictResolution,
+    pub confidence: f64,
+    pub advisory_note: String,
+    pub escalated: bool,
+}
+
+/// Advisory peer review severity assessment.
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ReviewSeverityResult {
+    pub score: usize,
+    pub position: f64,
+    pub confidence: f64,
+    pub is_blocking: bool,
+    pub advisory_note: String,
+}
+
+/// Arbitrate a file lock / reservation conflict between two tasks (ADR-0016).
+#[allow(dead_code)]
+pub fn arbitrate_p2p_conflict<T: Transport>(
+    transport: &T,
+    project: &str,
+    conflict_path: &str,
+    task_a: &str,
+    task_b: &str,
+) -> ConflictArbitrationResult {
+    let pack = match find_pack_for(project, "p2p-conflict-resolution") {
+        Ok(p) => p,
+        Err(_) => {
+            match default_judgment_packs()
+                .iter()
+                .find(|(name, _)| name.starts_with("p2p-conflict-resolution.v"))
+                .and_then(|(_, yaml)| QuestionPack::parse_yaml(yaml).ok())
+            {
+                Some(p) => p,
+                None => {
+                    return ConflictArbitrationResult {
+                        resolution: P2PConflictResolution::EscalateToCaptain,
+                        confidence: 0.0,
+                        advisory_note:
+                            "p2p-conflict-resolution pack not found; escalating to captain"
+                                .to_string(),
+                        escalated: true,
+                    };
+                }
+            }
+        }
+    };
+
+    let mut fields = BTreeMap::new();
+    fields.insert("conflict.path".to_string(), conflict_path.to_string());
+    fields.insert("task_a".to_string(), task_a.to_string());
+    fields.insert("task_b".to_string(), task_b.to_string());
+    let slice = build_state_slice(fields);
+
+    match transport.ask(&slice, &pack) {
+        Ok(answers) => {
+            if let Some(Answer::Choice(choice)) = answers.by_question.get("arbitration") {
+                let conf = choice.confidence;
+                let resolution = choice
+                    .choice
+                    .parse::<P2PConflictResolution>()
+                    .unwrap_or(P2PConflictResolution::EscalateToCaptain);
+                let thresholds = active_thresholds();
+                let escalated = escalate_required(conf, ActionClass::TopologyAdjacent, &thresholds)
+                    || resolution == P2PConflictResolution::EscalateToCaptain;
+                ConflictArbitrationResult {
+                    resolution,
+                    confidence: conf,
+                    advisory_note: format!(
+                        "Jev advisory choice: {} (conf: {:.2})",
+                        resolution, conf
+                    ),
+                    escalated,
+                }
+            } else {
+                ConflictArbitrationResult {
+                    resolution: P2PConflictResolution::EscalateToCaptain,
+                    confidence: 0.0,
+                    advisory_note: "missing 'arbitration' answer in response".to_string(),
+                    escalated: true,
+                }
+            }
+        }
+        Err(err) => ConflictArbitrationResult {
+            resolution: P2PConflictResolution::EscalateToCaptain,
+            confidence: 0.0,
+            advisory_note: format!("offline fallback ({err}): escalating to captain (ADR-0016)"),
+            escalated: true,
+        },
+    }
+}
+
+/// Classify peer review finding severity (ADR-0016).
+#[allow(dead_code)]
+pub fn classify_peer_review_severity<T: Transport>(
+    transport: &T,
+    project: &str,
+    finding_description: &str,
+    patch_summary: &str,
+) -> ReviewSeverityResult {
+    let pack = match find_pack_for(project, "peer-review-severity") {
+        Ok(p) => p,
+        Err(_) => {
+            match default_judgment_packs()
+                .iter()
+                .find(|(name, _)| name.starts_with("peer-review-severity.v"))
+                .and_then(|(_, yaml)| QuestionPack::parse_yaml(yaml).ok())
+            {
+                Some(p) => p,
+                None => {
+                    let lower = finding_description.to_lowercase();
+                    let critical = lower.contains("deadlock")
+                        || lower.contains("panic")
+                        || lower.contains("vulnerability")
+                        || lower.contains("leak")
+                        || lower.contains("corruption");
+                    let score = if critical { 3 } else { 2 };
+                    return ReviewSeverityResult {
+                        score,
+                        position: score as f64 - 1.0,
+                        confidence: 0.0,
+                        is_blocking: score >= 3,
+                        advisory_note:
+                            "peer-review-severity pack not found; offline heuristic fallback"
+                                .to_string(),
+                    };
+                }
+            }
+        }
+    };
+
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "finding.description".to_string(),
+        finding_description.to_string(),
+    );
+    fields.insert("patch.summary".to_string(), patch_summary.to_string());
+    let slice = build_state_slice(fields);
+
+    match transport.ask(&slice, &pack) {
+        Ok(answers) => {
+            if let Some(Answer::Score(score_ans)) = answers.by_question.get("severity") {
+                let score = score_ans.nearest_level() + 1;
+                let is_blocking = score >= 3;
+                ReviewSeverityResult {
+                    score,
+                    position: score_ans.position,
+                    confidence: score_ans.confidence,
+                    is_blocking,
+                    advisory_note: format!(
+                        "Jev advisory severity score: {} (blocking: {})",
+                        score, is_blocking
+                    ),
+                }
+            } else {
+                ReviewSeverityResult {
+                    score: 2,
+                    position: 1.0,
+                    confidence: 0.0,
+                    is_blocking: false,
+                    advisory_note: "missing 'severity' score in response".to_string(),
+                }
+            }
+        }
+        Err(err) => {
+            let lower = finding_description.to_lowercase();
+            let critical = lower.contains("deadlock")
+                || lower.contains("panic")
+                || lower.contains("vulnerability")
+                || lower.contains("leak")
+                || lower.contains("corruption");
+            let score = if critical { 3 } else { 2 };
+            ReviewSeverityResult {
+                score,
+                position: score as f64 - 1.0,
+                confidence: 0.0,
+                is_blocking: score >= 3,
+                advisory_note: format!(
+                    "offline fallback ({err}): heuristic score {score} (ADR-0016)"
+                ),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub mod p2p_tests {
+    use super::*;
+
+    struct MockTransport {
+        answers: Answers,
+    }
+
+    impl Transport for MockTransport {
+        fn ask(&self, _slice: &StateSlice, _pack: &QuestionPack) -> Result<Answers, JevError> {
+            Ok(self.answers.clone())
+        }
+    }
+
+    #[test]
+    fn test_parse_p2p_conflict_resolution_pack() {
+        let text = include_str!("../defaults/judgment-packs/p2p-conflict-resolution.v1.yaml");
+        let pack = QuestionPack::parse_yaml(text).expect("parse p2p pack");
+        assert_eq!(pack.id, "p2p-conflict-resolution");
+        assert_eq!(pack.questions.len(), 1);
+        assert_eq!(pack.questions[0].kind, QuestionKind::Choice);
+        assert_eq!(pack.questions[0].options.len(), 4);
+        assert_eq!(pack.questions[0].criteria.len(), 4);
+    }
+
+    #[test]
+    fn test_parse_peer_review_severity_pack() {
+        let text = include_str!("../defaults/judgment-packs/peer-review-severity.v1.yaml");
+        let pack = QuestionPack::parse_yaml(text).expect("parse severity pack");
+        assert_eq!(pack.id, "peer-review-severity");
+        assert_eq!(pack.questions.len(), 1);
+        assert_eq!(pack.questions[0].kind, QuestionKind::Score);
+        assert_eq!(pack.questions[0].criteria.len(), 4);
+    }
+
+    #[test]
+    fn test_arbitrate_p2p_conflict_choice() {
+        let mut by_question = BTreeMap::new();
+        let mut probs = BTreeMap::new();
+        probs.insert("partition-by-function".to_string(), 0.90);
+        probs.insert("sequence-a-then-b".to_string(), 0.10);
+        by_question.insert(
+            "arbitration".to_string(),
+            Answer::Choice(ChoiceAnswer {
+                choice: "partition-by-function".to_string(),
+                probs,
+                confidence: 0.90,
+            }),
+        );
+        let answers = Answers {
+            model_id: "jev-1.13.0".to_string(),
+            pack_id: "p2p-conflict-resolution".to_string(),
+            pack_version: 1,
+            by_question,
+            usage: "test".to_string(),
+        };
+        let transport = MockTransport { answers };
+        let res = arbitrate_p2p_conflict(
+            &transport,
+            "test_proj",
+            "src/cmd/peer.rs",
+            "task_a",
+            "task_b",
+        );
+        assert_eq!(res.resolution, P2PConflictResolution::PartitionByFunction);
+        assert_eq!(res.confidence, 0.90);
+        assert!(!res.escalated);
+    }
+
+    #[test]
+    fn test_arbitrate_p2p_conflict_low_confidence_escalates() {
+        let mut by_question = BTreeMap::new();
+        by_question.insert(
+            "arbitration".to_string(),
+            Answer::Choice(ChoiceAnswer {
+                choice: "sequence-a-then-b".to_string(),
+                probs: BTreeMap::new(),
+                confidence: 0.50,
+            }),
+        );
+        let answers = Answers {
+            model_id: "jev-1.13.0".to_string(),
+            pack_id: "p2p-conflict-resolution".to_string(),
+            pack_version: 1,
+            by_question,
+            usage: "test".to_string(),
+        };
+        let transport = MockTransport { answers };
+        let res = arbitrate_p2p_conflict(
+            &transport,
+            "test_proj",
+            "src/cmd/peer.rs",
+            "task_a",
+            "task_b",
+        );
+        assert_eq!(res.resolution, P2PConflictResolution::SequenceAThenB);
+        assert_eq!(res.confidence, 0.50);
+        assert!(res.escalated);
+    }
+
+    #[test]
+    fn test_arbitrate_p2p_conflict_offline_fallback() {
+        let transport = OfflineTransport;
+        let res = arbitrate_p2p_conflict(
+            &transport,
+            "test_proj",
+            "src/cmd/peer.rs",
+            "task_a",
+            "task_b",
+        );
+        assert_eq!(res.resolution, P2PConflictResolution::EscalateToCaptain);
+        assert!(res.escalated);
+        assert!(res.advisory_note.contains("offline fallback"));
+    }
+
+    #[test]
+    fn test_classify_peer_review_severity_blocking() {
+        let mut by_question = BTreeMap::new();
+        by_question.insert(
+            "severity".to_string(),
+            Answer::Score(ScoreAnswer {
+                position: 2.7,
+                levels: 4,
+                confidence: 0.85,
+            }),
+        );
+        let answers = Answers {
+            model_id: "jev-1.13.0".to_string(),
+            pack_id: "peer-review-severity".to_string(),
+            pack_version: 1,
+            by_question,
+            usage: "test".to_string(),
+        };
+        let transport = MockTransport { answers };
+        let res = classify_peer_review_severity(
+            &transport,
+            "test_proj",
+            "Potential race condition in lock handover",
+            "P2P multiplayer support",
+        );
+        assert_eq!(res.score, 4);
+        assert!(res.is_blocking);
+    }
+
+    #[test]
+    fn test_classify_peer_review_severity_non_blocking() {
+        let mut by_question = BTreeMap::new();
+        by_question.insert(
+            "severity".to_string(),
+            Answer::Score(ScoreAnswer {
+                position: 0.8,
+                levels: 4,
+                confidence: 0.90,
+            }),
+        );
+        let answers = Answers {
+            model_id: "jev-1.13.0".to_string(),
+            pack_id: "peer-review-severity".to_string(),
+            pack_version: 1,
+            by_question,
+            usage: "test".to_string(),
+        };
+        let transport = MockTransport { answers };
+        let res = classify_peer_review_severity(
+            &transport,
+            "test_proj",
+            "Fix typo in error message",
+            "Documentation tweak",
+        );
+        assert_eq!(res.score, 2);
+        assert!(!res.is_blocking);
+    }
+
+    #[test]
+    fn test_classify_peer_review_severity_offline_fallback() {
+        let transport = OfflineTransport;
+        let critical_res = classify_peer_review_severity(
+            &transport,
+            "test_proj",
+            "Potential deadlock in tick loop",
+            "Refactor loop",
+        );
+        assert_eq!(critical_res.score, 3);
+        assert!(critical_res.is_blocking);
+
+        let minor_res = classify_peer_review_severity(
+            &transport,
+            "test_proj",
+            "Cosmetic formatting change",
+            "Format files",
+        );
+        assert_eq!(minor_res.score, 2);
+        assert!(!minor_res.is_blocking);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// Kind name for a failure message. Only used in assertions.
@@ -4319,6 +4740,14 @@ pub fn default_judgment_packs() -> &'static [(&'static str, &'static str)] {
         (
             "doorbell-screen.v1.yaml",
             include_str!("../defaults/judgment-packs/doorbell-screen.v1.yaml"),
+        ),
+        (
+            "p2p-conflict-resolution.v1.yaml",
+            include_str!("../defaults/judgment-packs/p2p-conflict-resolution.v1.yaml"),
+        ),
+        (
+            "peer-review-severity.v1.yaml",
+            include_str!("../defaults/judgment-packs/peer-review-severity.v1.yaml"),
         ),
         (
             "profile-pick.v1.yaml",

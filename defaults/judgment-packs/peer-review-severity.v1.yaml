@@ -7,7 +7,7 @@ questions:
   - id: severity
     kind: score
     instructions: "What is the severity of the review finding `finding.description` regarding code patch `patch.summary`?"
-    levels:
+    criteria:
       - "1: Style, cosmetic suggestion, or minor typo (non-blocking)."
       - "2: Minor optimization, comment clarity, or documentation nuance (non-blocking)."
       - "3: Contract violation, API drift, or material regression risk (blocking)."

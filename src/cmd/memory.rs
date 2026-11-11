@@ -279,12 +279,10 @@ fn extract_trap_lines_json(v: &serde_json::Value) -> Vec<String> {
         }
         return vec![s.to_string()];
     }
-    if v.get("ok").and_then(|x| x.as_bool()) == Some(true) {
-        if let Some(n) = v.get("count").and_then(|x| x.as_u64()) {
-            if n == 0 {
-                return Vec::new();
-            }
-        }
+    if v.get("ok").and_then(|x| x.as_bool()) == Some(true)
+        && v.get("count").and_then(|x| x.as_u64()) == Some(0)
+    {
+        return Vec::new();
     }
     Vec::new()
 }
@@ -317,7 +315,8 @@ fn strings_from_array(arr: &[serde_json::Value]) -> Vec<String> {
     out.into_iter()
         .filter(|s| {
             let low = s.to_ascii_lowercase();
-            !low.is_empty() && !(low == "no traps" || low == "clean" || low == "ok" || low == "none")
+            !low.is_empty()
+                && !(low == "no traps" || low == "clean" || low == "ok" || low == "none")
         })
         .collect()
 }
