@@ -908,7 +908,7 @@ dependencies = [
 
 [[package]]
 name = "elm-effect"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "thiserror 1.0.69",
  "tokio",
@@ -916,7 +916,7 @@ dependencies = [
 
 [[package]]
 name = "elm-effect-durable"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "elm-effect",
  "elm-effect-journal",
@@ -926,7 +926,7 @@ dependencies = [
 
 [[package]]
 name = "elm-effect-elm"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "elm-effect",
  "elm-effect-journal",
@@ -937,7 +937,7 @@ dependencies = [
 
 [[package]]
 name = "elm-effect-journal"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "elm-effect",
  "serde",
