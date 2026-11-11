@@ -1689,25 +1689,52 @@ pub fn pane_dispatch(
     }
 
     let fence = acquire_dispatch_fence(&entry.name, unix_millis())?;
-    let fenced_tail = "— refusing to send a second prompt into an agent that already holds one. \
-                       The busy-owner fence requires a durable park, which toron-workflow's \
-                       engine has no step for; see bd-fen3. Give each concurrent stage its \
-                       own agent.";
     let _permit = match fence {
         FenceOutcome::Send(p) => Some(p),
         FenceOutcome::Park { until_ms } => {
             let wait_s = until_ms.saturating_sub(unix_millis()) / 1_000;
-            return Err(anyhow!(
-                "pane dispatch @{profile_name} ({}) is fenced as busy for another {wait_s}s \
-                 (park until {until_ms}) {fenced_tail}",
+            eprintln!(
+                "flywheel: pane dispatch @{profile_name} ({}) busy (park until {until_ms}, ~{wait_s}s) — parking gracefully instead of aborting (durable queueing/park; bd-jclab)",
                 entry.name
-            ));
+            );
+            return Ok(json!({
+                "parked": true,
+                "reason": "busy_fence",
+                "fence": "park",
+                "agent": entry.name,
+                "profile": profile_name,
+                "pane_id": entry.pane_id,
+                "until_ms": until_ms,
+                "wait_seconds": wait_s,
+            }));
         }
-        FenceOutcome::ForkAndRetry | FenceOutcome::CapContention => {
-            return Err(anyhow!(
-                "pane dispatch @{profile_name} ({}) is fenced as busy {fenced_tail}",
+        FenceOutcome::ForkAndRetry => {
+            eprintln!(
+                "flywheel: pane dispatch @{profile_name} ({}) busy (fence fork-and-retry) — parking gracefully instead of aborting (durable queueing/park; bd-jclab)",
                 entry.name
-            ));
+            );
+            return Ok(json!({
+                "parked": true,
+                "reason": "busy_fence",
+                "fence": "fork_and_retry",
+                "agent": entry.name,
+                "profile": profile_name,
+                "pane_id": entry.pane_id,
+            }));
+        }
+        FenceOutcome::CapContention => {
+            eprintln!(
+                "flywheel: pane dispatch @{profile_name} ({}) busy (fence cap contention) — parking gracefully instead of aborting (durable queueing/park; bd-jclab)",
+                entry.name
+            );
+            return Ok(json!({
+                "parked": true,
+                "reason": "busy_fence",
+                "fence": "cap_contention",
+                "agent": entry.name,
+                "profile": profile_name,
+                "pane_id": entry.pane_id,
+            }));
         }
     };
     let mut attempt_entry: &SpawnEntry = &entry;
