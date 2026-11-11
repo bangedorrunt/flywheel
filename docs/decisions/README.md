@@ -23,6 +23,7 @@ This directory contains records of the major architectural decisions made for th
 | [0017](0017-shared-foldcore-crate.md) | Shared fold crate lives in toron | **Rejected** (2026-10-11; never created; superseded by elm-effect-rs ADR-0002 + toron ADR-0040) |
 | [0018](0018-elm-effect-is-the-core.md) | elm-effect-rs is the core of the stack | **Accepted** (2026-10-22; the leaf port landed in flywheel `bd-f572` and toron `bd-6iyy`; the comms kernel, the doorbell programs, the supervisor program and the breaker-to-policy moves are still owed) |
 | [0019](0019-seat-hosted-grokbot-as-pull-tier-captain.md) | One delivery contract for stack mail | **Proposed** (2026-10-25; `queued/woke/read/unknown/expired` plus tier — including `unknown` for a degraded liveness read — on every send; `pull_fresh` derived from toron's durable npub-keyed reader cursor; policy on MailSurface; rex is the pane plane; hosted grokbot is the first pull client, not a second protocol. Two acceptance gates: `Contract` D0–D7, `Policy` D8/D9/D10/D12) |
+| [0020](0020-unify-doorbell-toron-multiplayer-engine.md) | Consolidate Plane D into Toron, In-Process Multiplayer P2P Mesh, and Atomic Bead-Lease Convergence | **Proposed** (2026-11-12; consolidates ADR-0012, sunsets standalone port :18980, in-process MailSurface P2P fast-path, zero-sweep dynamic leases, elm-effect-xstate swarm statechart) |
 
 ## Related toron ADRs
 
