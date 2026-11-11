@@ -57,8 +57,14 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// How far back HEAD's history a ship check scans for the bead citation.
+/// Sequential landings from other lanes must not invalidate a prior bead's
+/// check (bd-gate-ship-robustness-3pp9k).
+const SHIP_LOG_WINDOW: usize = 30;
+
 fn head_names_bead(dir: &Path, bead: &str) -> Result<bool> {
-    Ok(git(dir, &["log", "-1", "--format=%B"])?.contains(bead))
+    let window = format!("-n{SHIP_LOG_WINDOW}");
+    Ok(git(dir, &["log", &window, "--format=%B"])?.contains(bead))
 }
 
 fn beads_worktree_clean(dir: &Path) -> Result<bool> {
@@ -183,7 +189,7 @@ fn ship_check(bead: &str, dir: Option<&Path>, json_output: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::head_has_closed_bead;
+    use super::{head_has_closed_bead, head_names_bead};
     use std::process::Command;
 
     fn init_repo() -> tempfile::TempDir {
@@ -238,5 +244,35 @@ mod tests {
             head_has_closed_bead(dir.path(), "bd-y").unwrap(),
             (false, false)
         );
+    }
+
+    /// bd-gate-ship-robustness-3pp9k: a bead cited a few commits back still
+    /// ships — later landings from other lanes must not invalidate it.
+    #[test]
+    fn head_names_bead_survives_sequential_landings() {
+        let dir = init_repo();
+        let commit = |msg: &str| {
+            std::fs::write(dir.path().join("file.txt"), msg).unwrap();
+            assert!(
+                Command::new("git")
+                    .current_dir(dir.path())
+                    .args(["add", "."])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(
+                Command::new("git")
+                    .current_dir(dir.path())
+                    .args(["commit", "-qm", msg])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        commit("feat(work): the bd-abc123 work");
+        commit("chore: unrelated lane landing");
+        assert!(head_names_bead(dir.path(), "bd-abc123").unwrap());
+        assert!(!head_names_bead(dir.path(), "bd-zzz999").unwrap());
     }
 }

@@ -864,10 +864,31 @@ mod note_binding_tests {
         );
         assert_eq!(note_proved("proved task=run-1 verdict=v-9"), None);
         assert_eq!(note_proved("task=run-1, verdict=v-9"), None);
+        assert_eq!(note_proved("receipt=/tmp/r.txt"), None);
+    }
+
+    /// bd-gate-ship-robustness-3pp9k: header tokens bind independently of
+    /// order — `sha=` leading or `verdict=` before `task=` still proves.
+    #[test]
+    fn note_proved_binds_header_tokens_in_any_order() {
         let sha = "a".repeat(40);
+        let proved = Some(("run-1".to_string(), "v-9".to_string()));
         assert_eq!(
             note_proved(&format!("sha={sha} task=run-1 verdict=v-9")),
-            None
+            proved
+        );
+        assert_eq!(
+            note_proved(&format!(
+                "task=run-1 verdict=v-9 sha={sha} receipt=/tmp/r.txt"
+            )),
+            proved
+        );
+        assert_eq!(note_proved("verdict=v-9 task=run-1"), proved);
+        assert_eq!(
+            note_proved(&format!(
+                "receipt=/tmp/r.txt sha={sha} task=run-1 verdict=v-9;"
+            )),
+            proved
         );
     }
 
@@ -897,21 +918,24 @@ fn note_has_sha(note: &str, sha: &str) -> bool {
     matches!(note_binding(note), NoteBinding::Bound(v) if v == sha)
 }
 
-/// Phase 5 proved binding. The leading pair must be `task=<id> verdict=<id>`.
-/// A later pair, a prose mention, or a comma glued to a value does not bind.
+/// Phase 5 proved binding. The note's LEADING run of `key=value` header
+/// tokens must carry both `task=<id>` and `verdict=<id>` — order-independent,
+/// so a leading `sha=` no longer hides the pair (bd-gate-ship-robustness-3pp9k).
+/// A prose mention or a comma glued to a value does not bind.
 pub(crate) fn note_proved(note: &str) -> Option<(String, String)> {
     let tokens = note_tokens(note);
-    let (k0, v0) = tokens.first().copied()?;
-    let (k1, v1) = tokens.get(1).copied()?;
-    if k0 != "task" || k1 != "verdict" {
+    let value = |key: &str| {
+        tokens
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.trim_end_matches(';'))
+    };
+    let task = value("task")?;
+    let verdict = value("verdict")?;
+    if !is_binding_id(task) || !is_binding_id(verdict) {
         return None;
     }
-    let v0 = v0.trim_end_matches(';');
-    let v1 = v1.trim_end_matches(';');
-    if !is_binding_id(v0) || !is_binding_id(v1) {
-        return None;
-    }
-    Some((v0.to_string(), v1.to_string()))
+    Some((task.to_string(), verdict.to_string()))
 }
 
 fn is_binding_id(v: &str) -> bool {
