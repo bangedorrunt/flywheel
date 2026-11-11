@@ -140,10 +140,10 @@ use serde_json::{Value, json};
 use cmd::DaemonCmd;
 use cmd::{
     AgentCmd, ArtifactsCmd, BackendCmd, CaptainCmd, CheckpointCmd, CoalitionCmd, ConfigCmd,
-    CrewCmd, CronCmd, DoorbellCmd, JudgmentCmd, LedgerCmd, LoopCmd, MailCmd, ModelCmd, PolicyCmd,
+    CrewCmd, CronCmd, DoorbellCmd, JudgmentCmd, LedgerCmd, LoopCmd, MailCmd, ModelCmd, PeerCmd, PolicyCmd,
     PrinciplesCmd, ProfileCmd, RunsCmd, ShipCmd, SlotCmd, SquadCmd, StackCmd, StageCmd,
     StandingOrdersCmd, WorkCmd, WorkflowCmd, WorktreeCmd, XprojCmd, cmd_agent, cmd_analytics,
-    cmd_audit, cmd_backend, cmd_captain, cmd_changes, cmd_checkpoint, cmd_config, cmd_crew,
+    cmd_audit, cmd_backend, cmd_captain, cmd_changes, cmd_checkpoint, cmd_config, cmd_crew, cmd_peer,
     cmd_doorbell_digest, cmd_doorbell_gc, cmd_doorbell_inject, cmd_doorbell_introduce,
     cmd_doorbell_re_inject, cmd_doorbell_roster, cmd_doorbell_start, cmd_doorbell_status,
     cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_history, cmd_internal_doorbell, cmd_judgment,
@@ -1110,6 +1110,11 @@ enum Commands {
     Crew {
         #[command(subcommand)]
         cmd: CrewCmd,
+    },
+    /// P2P multiplayer protocol directives and reactive wake dispatch.
+    Peer {
+        #[command(subcommand)]
+        cmd: PeerCmd,
     },
     /// Captain door (bd-captain-watch-poll-exit-bbwm): the captain's own
     /// poll-exit watch. `captain watch <project>` blocks on the captain inbox
@@ -2920,7 +2925,8 @@ fn main() {
             "commands": [
                 "init spawn add list status decide rebind recover",
             "send interrupt view output watch attach kill",
-            "crew preview|control (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker)",
+            "crew preview|control|prompt (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker)",
+            "peer intent|request-release|release-response|review-request (structured P2P directives with reactive ⟦p2p:<verb>⟧ wake dispatch)",
             "captain watch <project> [--interval N] [--json] [--as <pin>] [--stall --stall-minutes N] [--preflight --preflight-mode steer|loop|workflow|cron] (bd-captain-watch-poll-exit-bbwm: harness resume on the captain inbox. The push is escalate@1 mail from the supervisor. This command blocks on that inbox's water and exits with a preview when strictly-newer mail lands; --stall also exits 0 when every bead is closed, or exits 3 when no pane is working and no commit landed for the threshold with work remaining; an unreadable fleet never alarms; --preflight adds an arm that exits 4 with the FIRST failing check and its remedy line, checked at arm time and each poll. One shot: re-arm after each resume)",
             "captain directory <project> [--json] (ADR-0019 D2/D4: read-only sessions, tiers, and per-pin addressability — ok <key> or err <code> — from the pure directory projection over an explicitly selected rex backend; never auto/hc on this path)",
             "captain approve <project> --request-key <key> --decision approve|deny [--note <text>] --as <operator-pin> (ADR-0019 D10: verify the operator via whois, mail the asker the 4-line body, fetch-back verify, rehash the payload, run it or settle denied; missing row, self-approval, or unverified sender is approval_mismatch, never a dispatch)",
@@ -3241,6 +3247,7 @@ fn main() {
             force,
         }) => cmd_interrupt(&cfg, project, to, keys, *force),
         Some(Commands::Crew { cmd }) => cmd_crew(&cfg, cmd),
+        Some(Commands::Peer { cmd }) => cmd_peer(&cfg, cmd),
         Some(Commands::Captain { cmd }) => cmd_captain(&cfg, cmd),
         Some(Commands::Supervisor { cmd }) => supervisor_host::run_cli(cmd),
         Some(Commands::Halt {

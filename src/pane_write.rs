@@ -87,6 +87,30 @@ pub fn wake_line(wm: Wm, urgency: Urgency) -> String {
     }
 }
 
+/// P2P multiplayer reactive wake dispatch line (bd-p2p-multiplayer-mesh-xf1da).
+pub fn p2p_wake_line(verb: &str, sender: &str, path: &str, wm: u64) -> String {
+    format!("⟦p2p:{verb}⟧ from {sender} for {path} (wm {wm:x}) — run: toron next")
+}
+
+/// Deliver a P2P wake line through the pane sink, honoring harness wake route.
+/// `Inject` types the line as a prompt (no interrupt injected by this helper);
+/// `NoDoor` is an error so callers can report an undeliverable directive.
+pub fn write_p2p_wake(
+    typer: &dyn PaneTyper,
+    target: &str,
+    line: &str,
+    route: crate::harness_caps::WakeRoute,
+) -> anyhow::Result<()> {
+    use crate::harness_caps::WakeRoute;
+    match route {
+        WakeRoute::Inject { .. } => typer.prompt(target, line),
+        WakeRoute::NoDoor(no_door) => anyhow::bail!(
+            "wake line could not be delivered to {target}: {}",
+            crate::harness_caps::no_door_line(&no_door)
+        ),
+    }
+}
+
 /// The per-harness launch bootstrap (redesign §8). One constant per
 /// harness; every harness gets the same pull contract today.
 pub fn launch_bootstrap(harness: Harness) -> &'static str {
