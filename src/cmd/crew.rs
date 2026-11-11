@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Subcommand;
 use serde_json::{Value, json};
+use std::process::Command;
 
 use crate::config::Config;
 use crate::hc::Client;
@@ -11,7 +12,7 @@ use crate::state::EventKind;
 use std::time::Duration;
 
 /// ADR-0010 D7 crew plane: workflow preview + lifecycle verbs.
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 pub(crate) enum CrewCmd {
     /// Preview the auto-crew a workflow would spawn (crew: auto)
     Preview {
@@ -27,10 +28,27 @@ pub(crate) enum CrewCmd {
         #[command(subcommand)]
         verb: ControlVerbCmd,
     },
+    /// High-level dispatch: gift-wrap the prompt into toron mail, stamp it on
+    /// the mail log, and deliver a compliant wake line into the target pane.
+    Prompt {
+        /// target agent pin / pane identity
+        pin: String,
+        /// task prompt body (stamped on the mail log)
+        prompt: String,
+        /// project slug
+        #[arg(long)]
+        project: String,
+        /// sender identity (mail `--as`)
+        #[arg(long = "as")]
+        r#as: Option<String>,
+        /// mark the dispatch urgent (mail importance + urgent wake line)
+        #[arg(long)]
+        urgent: bool,
+    },
 }
 
 /// The three control verbs (postconditions asserted in src/control.rs).
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 pub(crate) enum ControlVerbCmd {
     /// Cancel the current tool call (Escape only — kill-style keys stay off
     /// this plane). Confirmed only when the composer is provably empty.
@@ -76,6 +94,13 @@ pub(crate) fn cmd_crew(cfg: &Config, cmd: &CrewCmd) -> Result<()> {
             Ok(())
         }
         CrewCmd::Control { project, pin, verb } => cmd_crew_control(cfg, project, pin, verb),
+        CrewCmd::Prompt {
+            pin,
+            prompt,
+            project,
+            r#as,
+            urgent,
+        } => cmd_crew_prompt(cfg, project, pin, prompt, r#as.as_deref(), *urgent),
     }
 }
 
@@ -311,4 +336,386 @@ fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCm
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptDispatch {
+    pub pin: String,
+    pub project: String,
+    pub sender: String,
+    pub prompt: String,
+    pub urgent: bool,
+}
+
+impl PromptDispatch {
+    pub(crate) fn subject(&self) -> String {
+        format!("crew prompt for {}", self.pin)
+    }
+
+    pub(crate) fn mail_args(&self) -> Vec<String> {
+        let mut args = vec![
+            "mail".to_string(),
+            "send".to_string(),
+            "--project".to_string(),
+            self.project.clone(),
+            "--as".to_string(),
+            self.sender.clone(),
+            "--to".to_string(),
+            self.pin.clone(),
+            "--subject".to_string(),
+            self.subject(),
+            "--body".to_string(),
+            self.prompt.clone(),
+        ];
+        if self.urgent {
+            args.push("--importance".to_string());
+            args.push("urgent".to_string());
+        }
+        args
+    }
+
+    pub(crate) fn wake_line(&self, wm: u64) -> String {
+        let urgency = if self.urgent {
+            crate::pane_write::Urgency::Urgent
+        } else {
+            crate::pane_write::Urgency::Normal
+        };
+        crate::pane_write::wake_line(crate::pane_write::Wm(wm), urgency)
+    }
+
+    pub(crate) fn confirmation(&self, wm: u64) -> Value {
+        json!({
+            "pin": self.pin,
+            "sent": true,
+            "wake": self.wake_line(wm),
+            "urgent": self.urgent,
+            "project": self.project,
+        })
+    }
+}
+
+fn prompt_sender(cfg: &Config, r#as: Option<&str>) -> String {
+    if let Some(s) = r#as.filter(|s| !s.trim().is_empty()) {
+        return s.to_string();
+    }
+    if let Ok(s) = std::env::var("AGENT_NAME")
+        && !s.trim().is_empty()
+    {
+        return s;
+    }
+    if let Some(name) = cfg
+        .agent_mail
+        .as_ref()
+        .and_then(|m| m.name.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return name.to_string();
+    }
+    "agent".to_string()
+}
+
+fn harness_kind_for_target(project: &str, pane_id: &str, name: Option<&str>) -> String {
+    let reg = crate::state::load_spawn_registry(project);
+    reg.into_iter()
+        .find(|e| e.pane_id == pane_id || name.is_some_and(|n| e.name == n))
+        .and_then(|e| e.harness)
+        .unwrap_or_default()
+}
+
+fn toron_mail_send(dispatch: &PromptDispatch) -> Result<()> {
+    let args = dispatch.mail_args();
+    let out = Command::new("toron")
+        .args(&args)
+        .output()
+        .with_context(|| "run toron mail send")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        bail!(
+            "toron mail send failed for {}: {}{}",
+            dispatch.pin,
+            stderr.trim(),
+            if stdout.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" {}", stdout.trim())
+            }
+        );
+    }
+    Ok(())
+}
+
+fn recipient_wm(project: &str, pin: &str) -> u64 {
+    let Ok(mb) = crate::mail::comms_mailbox() else {
+        return 0;
+    };
+    let Ok(store) = crate::comms_send::store() else {
+        return 0;
+    };
+    crate::mail::block_on(async {
+        let Ok(npub) = mb.comms_npub(project, pin).await else {
+            return 0;
+        };
+        store.head(&npub).await.unwrap_or(0)
+    })
+}
+
+fn deliver_prompt_wake_hc(
+    cfg: &Config,
+    project: &str,
+    pin: &str,
+    urgent: bool,
+    wm: u64,
+) -> Result<String> {
+    let mut c = Client::connect(Some(&cfg.socket_path()))?;
+    let ws_id = crate::find_workspace(&mut c, project)?;
+    let targets = crate::resolve_agents(&mut c, &ws_id, project, pin)?;
+    if targets.len() != 1 {
+        bail!(
+            "crew prompt targets ONE pane — '{pin}' resolved {} ({}); name one pin",
+            targets.len(),
+            targets
+                .iter()
+                .filter_map(|a| a.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let a = &targets[0];
+    let target = crate::agent_target(a).to_string();
+    let kind = harness_kind_for_target(project, &a.pane_id, a.name.as_deref());
+    let kind = if kind.is_empty() {
+        a.agent.as_deref().unwrap_or("").to_string()
+    } else {
+        kind
+    };
+    let route = crate::harness_caps::wake_route(&kind, crate::harness_caps::installed_from_env());
+    let urgency = if urgent {
+        toron_core::wake::Urgency::Urgent
+    } else {
+        toron_core::wake::Urgency::Normal
+    };
+    let line = crate::pane_write::wake_line(crate::pane_write::Wm(wm), if urgent {
+        crate::pane_write::Urgency::Urgent
+    } else {
+        crate::pane_write::Urgency::Normal
+    });
+    match crate::inbox_ports::ring_wake(
+        &crate::pane_write::HcPanes(&c),
+        &target,
+        wm,
+        &line,
+        urgency,
+        route,
+    ) {
+        Ok(crate::inbox_ports::RingDone::Typed) => Ok(line),
+        Ok(crate::inbox_ports::RingDone::NoDoor(no_door)) => {
+            bail!(
+                "wake line could not be delivered to {pin} ({target}): {}",
+                crate::harness_caps::no_door_line(&no_door)
+            )
+        }
+        Err(e) => bail!("wake line delivery to {pin} ({target}) failed: {e}"),
+    }
+}
+
+#[cfg(feature = "backend-superlogical")]
+fn deliver_prompt_wake_rex(
+    cfg: &Config,
+    project: &str,
+    pin: &str,
+    urgent: bool,
+    wm: u64,
+) -> Result<String> {
+    let backend = crate::backend::multiplexer_backend(cfg)?;
+    let ws_id = crate::find_workspace_dyn(&*backend, project)?;
+    let targets = crate::resolve_agents_dyn(&*backend, &ws_id, project, pin)?;
+    if targets.len() != 1 {
+        bail!(
+            "crew prompt targets ONE pane — '{pin}' resolved {} ({}); name one pin",
+            targets.len(),
+            targets
+                .iter()
+                .filter_map(|a| a.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let a = &targets[0];
+    let target = a.pane_id.clone();
+    let kind = harness_kind_for_target(project, &a.pane_id, a.name.as_deref());
+    let kind = if kind.is_empty() {
+        a.agent.as_deref().unwrap_or("").to_string()
+    } else {
+        kind
+    };
+    let route = crate::harness_caps::wake_route(&kind, crate::harness_caps::installed_from_env());
+    let urgency = if urgent {
+        toron_core::wake::Urgency::Urgent
+    } else {
+        toron_core::wake::Urgency::Normal
+    };
+    let line = crate::pane_write::wake_line(crate::pane_write::Wm(wm), if urgent {
+        crate::pane_write::Urgency::Urgent
+    } else {
+        crate::pane_write::Urgency::Normal
+    });
+    match crate::inbox_ports::ring_wake(
+        &crate::pane_write::RexPanes(&*backend),
+        &target,
+        wm,
+        &line,
+        urgency,
+        route,
+    ) {
+        Ok(crate::inbox_ports::RingDone::Typed) => Ok(line),
+        Ok(crate::inbox_ports::RingDone::NoDoor(no_door)) => {
+            bail!(
+                "wake line could not be delivered to {pin} ({target}): {}",
+                crate::harness_caps::no_door_line(&no_door)
+            )
+        }
+        Err(e) => bail!("wake line delivery to {pin} ({target}) failed: {e}"),
+    }
+}
+
+fn deliver_prompt_wake(
+    cfg: &Config,
+    project: &str,
+    pin: &str,
+    urgent: bool,
+    wm: u64,
+) -> Result<String> {
+    if crate::pane::rex_door_selected(cfg) {
+        #[cfg(feature = "backend-superlogical")]
+        {
+            return deliver_prompt_wake_rex(cfg, project, pin, urgent, wm);
+        }
+        #[cfg(not(feature = "backend-superlogical"))]
+        {
+            let _ = (cfg, project, pin, urgent, wm);
+            bail!("rex backend selected but backend-superlogical feature is not enabled");
+        }
+    }
+    deliver_prompt_wake_hc(cfg, project, pin, urgent, wm)
+}
+
+fn cmd_crew_prompt(
+    cfg: &Config,
+    project: &str,
+    pin: &str,
+    prompt: &str,
+    r#as: Option<&str>,
+    urgent: bool,
+) -> Result<()> {
+    let sender = prompt_sender(cfg, r#as);
+    let dispatch = PromptDispatch {
+        pin: pin.to_string(),
+        project: project.to_string(),
+        sender,
+        prompt: prompt.to_string(),
+        urgent,
+    };
+
+    toron_mail_send(&dispatch)?;
+    let wm = recipient_wm(project, pin);
+    let wake = deliver_prompt_wake(cfg, project, pin, urgent, wm)?;
+
+    crate::log(
+        project,
+        EventKind::Send,
+        json!({
+            "op": "crew-prompt",
+            "to": pin,
+            "urgent": urgent,
+            "wake": wake,
+            "wm": wm,
+        }),
+    );
+    print_json(&dispatch.confirmation(wm));
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser, Debug)]
+    struct Cli {
+        #[command(subcommand)]
+        cmd: CrewCmd,
+    }
+
+    #[test]
+    fn crew_prompt_parses_project_as_and_urgent_flags() {
+        let cli = Cli::try_parse_from([
+            "flywheel",
+            "prompt",
+            "BlackGorge",
+            "implement bead",
+            "--project",
+            "flywheel",
+            "--as",
+            "AmberHarbor",
+            "--urgent",
+        ])
+        .expect("parse crew prompt");
+        match cli.cmd {
+            CrewCmd::Prompt {
+                pin,
+                prompt,
+                project,
+                r#as,
+                urgent,
+            } => {
+                assert_eq!(pin, "BlackGorge");
+                assert_eq!(prompt, "implement bead");
+                assert_eq!(project, "flywheel");
+                assert_eq!(r#as.as_deref(), Some("AmberHarbor"));
+                assert!(urgent);
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_dispatch_structure_builds_mail_and_wake() {
+        let dispatch = PromptDispatch {
+            pin: "BlackGorge".to_string(),
+            project: "flywheel".to_string(),
+            sender: "AmberHarbor".to_string(),
+            prompt: "do the thing".to_string(),
+            urgent: true,
+        };
+        let args = dispatch.mail_args();
+        assert_eq!(
+            args,
+            vec![
+                "mail",
+                "send",
+                "--project",
+                "flywheel",
+                "--as",
+                "AmberHarbor",
+                "--to",
+                "BlackGorge",
+                "--subject",
+                "crew prompt for BlackGorge",
+                "--body",
+                "do the thing",
+                "--importance",
+                "urgent",
+            ]
+        );
+        let wake = dispatch.wake_line(42);
+        assert!(wake.contains("toron next"), "wake must be compliant: {wake}");
+        let confirmation = dispatch.confirmation(42);
+        assert_eq!(confirmation["pin"], "BlackGorge");
+        assert_eq!(confirmation["sent"], true);
+        assert_eq!(confirmation["urgent"], true);
+        assert_eq!(confirmation["wake"], wake);
+        assert_eq!(confirmation["project"], "flywheel");
+    }
 }
