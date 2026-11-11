@@ -99,6 +99,15 @@ pass.
 - **Hosted captain (ADR-0019).** grokbot is pull-tier (`location=hosted` via
   rebind note). Hosted `steer` parks for `captain approve`. Never set
   `hook` / steer on the grok row from that ADR.
+- **P2P Multiplayer mesh.** Peers coordinate directly without in-line captain
+  bottlenecks via `flywheel peer {intent, request-release, release-response, review-request}`.
+  Wakes format as `⟦p2p:<verb>⟧ from <sender> for <path> (wm <hex>) — run: toron next`.
+- **Chie Memory preflight & lessons.** Preflight `flywheel memory check-trap <query/paths>`
+  surfaces known failure modes during briefing and before claiming tasks. Record
+  confirmed lessons via `flywheel memory record-lesson <content>`.
+- **TypeSafe AI System One arbitration (ADR-0016).** `p2p-conflict-resolution`
+  (Choice) and `peer-review-severity` (Score 1..4) provide sub-100ms structured
+  advisory evidence without LLM hallucination. Advisory only; pure tick holds.
 - **Skill sync.** CLI change → `Commands` enum + `--robot-capabilities` + this
   file's critical list + `~/.agents/skills/flywheel/SKILL.md` §5.
 
