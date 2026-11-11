@@ -140,14 +140,15 @@ use serde_json::{Value, json};
 use cmd::DaemonCmd;
 use cmd::{
     AgentCmd, ArtifactsCmd, BackendCmd, CaptainCmd, CheckpointCmd, CoalitionCmd, ConfigCmd,
-    CrewCmd, CronCmd, DoorbellCmd, JudgmentCmd, LedgerCmd, LoopCmd, MailCmd, ModelCmd, PeerCmd, PolicyCmd,
-    PrinciplesCmd, ProfileCmd, RunsCmd, ShipCmd, SlotCmd, SquadCmd, StackCmd, StageCmd,
-    StandingOrdersCmd, WorkCmd, WorkflowCmd, WorktreeCmd, XprojCmd, cmd_agent, cmd_analytics,
-    cmd_audit, cmd_backend, cmd_captain, cmd_changes, cmd_checkpoint, cmd_config, cmd_crew, cmd_peer,
-    cmd_doorbell_digest, cmd_doorbell_gc, cmd_doorbell_inject, cmd_doorbell_introduce,
+    CrewCmd, CronCmd, DoorbellCmd, JudgmentCmd, LedgerCmd, LoopCmd, MailCmd, MemoryCmd, ModelCmd,
+    PeerCmd, PolicyCmd, PrinciplesCmd, ProfileCmd, RunsCmd, ShipCmd, SlotCmd, SquadCmd, StackCmd,
+    StageCmd, StandingOrdersCmd, WorkCmd, WorkflowCmd, WorktreeCmd, XprojCmd, cmd_agent,
+    cmd_analytics, cmd_audit, cmd_backend, cmd_captain, cmd_changes, cmd_checkpoint, cmd_config,
+    cmd_crew, cmd_doorbell_digest, cmd_doorbell_gc, cmd_doorbell_inject, cmd_doorbell_introduce,
     cmd_doorbell_re_inject, cmd_doorbell_roster, cmd_doorbell_start, cmd_doorbell_status,
     cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_history, cmd_internal_doorbell, cmd_judgment,
-    cmd_ledger, cmd_mail, cmd_models, cmd_policy, cmd_principles, cmd_resume, cmd_runs, cmd_ship,
+    cmd_ledger, cmd_mail, cmd_memory, cmd_models, cmd_peer, cmd_policy, cmd_principles, cmd_resume,
+    cmd_runs, cmd_ship,
     cmd_slot, cmd_stack, cmd_stage, cmd_standing_orders, cmd_timeline, cmd_work, cmd_worktree,
     cmd_xproj,
     coalition::cmd_coalition,
@@ -1290,6 +1291,11 @@ enum Commands {
     Judgment {
         #[command(subcommand)]
         cmd: JudgmentCmd,
+    },
+    /// Chie Memory preflight (trap checks) and lesson recording.
+    Memory {
+        #[command(subcommand)]
+        cmd: MemoryCmd,
     },
     /// engineering principle registry (ADR-0019 Spec 5/6): list the 21
     /// canonical names, or show a leaf's full when+rule (unknown name ->
@@ -3467,6 +3473,7 @@ fn main() {
         }) => cmd_kill(&cfg, project, *force, *force_working, *drain, *reap_crews),
         Some(Commands::Ledger { cmd }) => cmd_ledger(&cfg, cmd),
         Some(Commands::Judgment { cmd }) => cmd_judgment(cmd),
+        Some(Commands::Memory { cmd }) => cmd_memory(&cfg, cmd),
         Some(Commands::Principles { cmd }) => cmd_principles(cmd),
         Some(Commands::StandingOrders { cmd }) => cmd_standing_orders(cmd),
         Some(Commands::Work { cmd }) => cmd_work(&cfg, cmd),
@@ -9583,6 +9590,13 @@ fn cmd_briefing(
         briefing::align_with_session_topology(&mut b, &final_topo, held);
     }
     briefing::apply_answers(&mut b, topology, crew, model).map_err(|e| anyhow!(e))?;
+    let project_dir = project_dir(cfg, project);
+    b.memory_traps = crate::cmd::memory::briefing_traps(
+        objective,
+        Some(project),
+        None,
+        Some(project_dir.as_path()),
+    );
     if json {
         print_json(&serde_json::to_value(&b)?);
     } else {
@@ -9604,6 +9618,10 @@ fn cmd_briefing(
                 .map(|q| q.default.as_str())
                 .unwrap_or("default")
         );
+        let traps_section = crate::cmd::memory::render_traps_section(&b.memory_traps);
+        if !traps_section.is_empty() {
+            print!("\n{traps_section}");
+        }
     }
     warn_uncommitted_decision_docs(cfg, project);
     if commit || yes {

@@ -167,6 +167,9 @@ pub struct Briefing {
     /// pass that was made and declined, and the line says which.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_ranking: Option<String>,
+    /// Known traps/invariants from Chie Memory preflight (offline => empty).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_traps: Vec<String>,
     /// One mode line plus the one skill to read. Open or captain, never both.
     #[serde(default)]
     pub mode_text: String,
@@ -547,6 +550,7 @@ pub fn assemble(
         harness_menu,
         stale_build: None,
         harness_ranking: None,
+        memory_traps: Vec::new(),
         mode_text: mode_text(mode_of(&topology)).to_string(),
         required_skills: required_skills(mode_of(&topology)),
         questions: vec![
