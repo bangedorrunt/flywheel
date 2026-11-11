@@ -40,6 +40,7 @@ pub enum Harness {
     Claude,
     Grok,
     Codex,
+    Antigravity,
     Other,
 }
 
@@ -52,6 +53,7 @@ impl Harness {
             "claude" | "claude-code" | "cc" => Self::Claude,
             "grok" | "gk" => Self::Grok,
             "codex" | "cx" => Self::Codex,
+            "antigravity" | "agy" | "ag" => Self::Antigravity,
             _ => Self::Other,
         }
     }
@@ -95,6 +97,7 @@ pub fn launch_bootstrap(harness: Harness) -> &'static str {
         | Harness::Claude
         | Harness::Grok
         | Harness::Codex
+        | Harness::Antigravity
         | Harness::Other => PULL,
     }
 }
@@ -365,6 +368,9 @@ mod tests {
             PaneWrite::LaunchBootstrap {
                 harness: Harness::Pi,
             },
+            PaneWrite::LaunchBootstrap {
+                harness: Harness::Antigravity,
+            },
         ];
         let r = Recorder::default();
         for w in &all {
@@ -378,6 +384,7 @@ mod tests {
                 "keys w1:p1 [\"Escape\"]".to_string(),
                 "close w1:p1".to_string(),
                 format!("prompt w1:p1 {}", launch_bootstrap(Harness::Pi)),
+                format!("prompt w1:p1 {}", launch_bootstrap(Harness::Antigravity)),
             ]
         );
         for w in &all {
@@ -385,6 +392,20 @@ mod tests {
                 assert!(line.starts_with(WAKE_MARK) || line == launch_bootstrap(Harness::Other));
             }
         }
+    }
+
+    /// bd-universal-harness-antigravity-mhp43: antigravity resolves through
+    /// the canonical name and its aliases, so a pane spawned for it gets the
+    /// same bootstrap constant instead of falling through to `Other`.
+    #[test]
+    fn antigravity_kind_resolves_canonical_and_aliases() {
+        for kind in ["antigravity", "agy", "ag", "  Antigravity  "] {
+            assert_eq!(Harness::from_kind(kind), Harness::Antigravity, "{kind}");
+        }
+        assert_eq!(
+            launch_bootstrap(Harness::Antigravity),
+            launch_bootstrap(Harness::Pi)
+        );
     }
 
     #[test]

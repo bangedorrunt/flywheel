@@ -107,6 +107,18 @@ pub const REGISTRY: &[HarnessSpec] = &[
         tier: HarnessTier::Open,
         implied_slot: None,
     },
+    HarnessSpec {
+        canonical: "antigravity",
+        aliases: &["agy", "ag"],
+        tier: HarnessTier::Closed,
+        implied_slot: None,
+    },
+    HarnessSpec {
+        canonical: "gemini",
+        aliases: &["gm"],
+        tier: HarnessTier::Closed,
+        implied_slot: None,
+    },
 ];
 
 /// Resolve any accepted spelling to its canonical name.
@@ -286,6 +298,25 @@ mod tests {
         assert!(!tier_of("codex").unwrap().may_be_asked_for_a_model());
     }
 
+    /// bd-universal-harness-antigravity-mhp43: the frontier harnesses
+    /// antigravity and gemini resolve (canonical + aliases), are Closed, and
+    /// are never handed a model.
+    #[test]
+    fn antigravity_and_gemini_resolve_and_are_closed() {
+        for (canonical_name, aliases) in [("antigravity", &["agy", "ag"][..]), ("gemini", &["gm"][..])] {
+            assert_eq!(canonical(canonical_name), canonical_name);
+            let spec = spec(canonical_name).expect("registered");
+            assert_eq!(spec.tier, HarnessTier::Closed);
+            assert!(!spec.tier.may_be_asked_for_a_model());
+            assert_eq!(spec.implied_slot, None);
+            for alias in aliases {
+                assert_eq!(canonical(alias), canonical_name, "alias {alias}");
+                assert_eq!(tier_of(alias), Some(HarnessTier::Closed));
+                assert!(!tier_of(alias).unwrap().may_be_asked_for_a_model());
+            }
+        }
+    }
+
     /// Every alias resolves back to its own canonical — the round trip the four
     /// old resolvers each did slightly differently.
     #[test]
@@ -363,9 +394,18 @@ mod tests {
     #[test]
     fn the_registry_holds_exactly_the_named_harnesses() {
         let got: BTreeSet<&str> = REGISTRY.iter().map(|s| s.canonical).collect();
-        let want: BTreeSet<&str> = ["opencode", "pi", "grok", "codex", "claude", "fx"]
-            .into_iter()
-            .collect();
+        let want: BTreeSet<&str> = [
+            "opencode",
+            "pi",
+            "grok",
+            "codex",
+            "claude",
+            "fx",
+            "antigravity",
+            "gemini",
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(got, want);
     }
 }
