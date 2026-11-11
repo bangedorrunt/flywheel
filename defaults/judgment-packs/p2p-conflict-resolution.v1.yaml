@@ -1,0 +1,15 @@
+# P2P lock conflict arbitrator (bd-typesafe-p2p-arbitrator-ncigb). Advisory only:
+# evaluates competing file reservation requests and recommends partition or sequencing.
+id: p2p-conflict-resolution
+version: 1
+model: jev-latest
+questions:
+  - id: arbitration
+    kind: choice
+    instructions: "Given the two competing tasks `task_a` and `task_b` contending for path `conflict.path`, what is the optimal conflict resolution strategy?"
+    options: [partition-by-function, sequence-a-then-b, sequence-b-then-a, escalate-to-captain]
+    criteria:
+      - "partition-by-function: the two tasks modify non-overlapping symbols/functions within the same file and can proceed concurrently with shared leases."
+      - "sequence-a-then-b: task_a is near completion or has higher priority; task_b should yield and await release."
+      - "sequence-b-then-a: task_b is a critical bugfix or dependency of task_a; task_a should yield lease."
+      - "escalate-to-captain: the tasks represent incompatible architectural changes and cannot be reconciled automatically."

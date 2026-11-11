@@ -1,0 +1,14 @@
+# Peer review severity classifier (bd-typesafe-p2p-arbitrator-ncigb).
+# Grades finding severity to prevent pedantic review gridlock; only Score >= 3 blocks bead close.
+id: peer-review-severity
+version: 1
+model: jev-latest
+questions:
+  - id: severity
+    kind: score
+    instructions: "What is the severity of the review finding `finding.description` regarding code patch `patch.summary`?"
+    levels:
+      - "1: Style, cosmetic suggestion, or minor typo (non-blocking)."
+      - "2: Minor optimization, comment clarity, or documentation nuance (non-blocking)."
+      - "3: Contract violation, API drift, or material regression risk (blocking)."
+      - "4: Critical security vulnerability, fatal deadlock, or silent data corruption (blocking)."
