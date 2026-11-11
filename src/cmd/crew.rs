@@ -496,11 +496,14 @@ fn deliver_prompt_wake_hc(
     } else {
         toron_core::wake::Urgency::Normal
     };
-    let line = crate::pane_write::wake_line(crate::pane_write::Wm(wm), if urgent {
-        crate::pane_write::Urgency::Urgent
-    } else {
-        crate::pane_write::Urgency::Normal
-    });
+    let line = crate::pane_write::wake_line(
+        crate::pane_write::Wm(wm),
+        if urgent {
+            crate::pane_write::Urgency::Urgent
+        } else {
+            crate::pane_write::Urgency::Normal
+        },
+    );
     match crate::inbox_ports::ring_wake(
         &crate::pane_write::HcPanes(&c),
         &target,
@@ -556,11 +559,14 @@ fn deliver_prompt_wake_rex(
     } else {
         toron_core::wake::Urgency::Normal
     };
-    let line = crate::pane_write::wake_line(crate::pane_write::Wm(wm), if urgent {
-        crate::pane_write::Urgency::Urgent
-    } else {
-        crate::pane_write::Urgency::Normal
-    });
+    let line = crate::pane_write::wake_line(
+        crate::pane_write::Wm(wm),
+        if urgent {
+            crate::pane_write::Urgency::Urgent
+        } else {
+            crate::pane_write::Urgency::Normal
+        },
+    );
     match crate::inbox_ports::ring_wake(
         &crate::pane_write::RexPanes(&*backend),
         &target,
@@ -710,7 +716,10 @@ mod tests {
             ]
         );
         let wake = dispatch.wake_line(42);
-        assert!(wake.contains("toron next"), "wake must be compliant: {wake}");
+        assert!(
+            wake.contains("toron next"),
+            "wake must be compliant: {wake}"
+        );
         let confirmation = dispatch.confirmation(42);
         assert_eq!(confirmation["pin"], "BlackGorge");
         assert_eq!(confirmation["sent"], true);

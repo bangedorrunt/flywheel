@@ -73,10 +73,12 @@ struct StepOutcome {
 /// - terminal success only after all 5 stages complete
 fn step(from: State, signal: Signal) -> State {
     match (from, signal) {
-        (State::InStage(current), Signal::Done(stage)) if stage == current => match current.next() {
-            Some(next) => State::InStage(next),
-            None => State::Succeeded, // Verify done => all 5 complete
-        },
+        (State::InStage(current), Signal::Done(stage)) if stage == current => {
+            match current.next() {
+                Some(next) => State::InStage(next),
+                None => State::Succeeded, // Verify done => all 5 complete
+            }
+        }
         (State::InStage(current), Signal::Failed(stage)) if stage == current => {
             State::Failed { at: current }
         }
@@ -201,7 +203,11 @@ fn deterministic_step_transitions_on_stage_done_signals() {
         let done = Signal::Done(stage);
         let expected = step(from, done);
         for _ in 0..8 {
-            assert_eq!(step(from, done), expected, "non-deterministic transition at {stage:?}");
+            assert_eq!(
+                step(from, done),
+                expected,
+                "non-deterministic transition at {stage:?}"
+            );
         }
     }
 
@@ -283,7 +289,11 @@ fn fail_stop_unexpected_failure_at_any_stage_halts_progression() {
             .expect("must enter Failed");
         for outcome in &trace[fail_idx + 1..] {
             assert_eq!(outcome.from, State::Failed { at: stage });
-            assert_eq!(outcome.to, State::Failed { at: stage }, "progressed after fail-stop");
+            assert_eq!(
+                outcome.to,
+                State::Failed { at: stage },
+                "progressed after fail-stop"
+            );
         }
     }
 }
@@ -361,24 +371,35 @@ fn xstate_export_represents_five_stage_coordinator() {
     .into_iter()
     .collect();
     let actual: BTreeSet<&str> = states.keys().map(|s| s.as_str()).collect();
-    assert_eq!(actual, expected, "xstate export must contain exactly the coordinator states");
+    assert_eq!(
+        actual, expected,
+        "xstate export must contain exactly the coordinator states"
+    );
 
     // Five in-flight stages each have a deterministic done transition and a fail transition.
     for &stage in &Stage::ORDER {
         let node = &states[stage.as_str()];
         let on = node["on"].as_object().expect("stage has on-map");
-        assert_eq!(on.len(), 2, "{stage:?} must expose done and fail transitions only");
+        assert_eq!(
+            on.len(),
+            2,
+            "{stage:?} must expose done and fail transitions only"
+        );
     }
 
     assert_eq!(states["Gate"]["on"]["DONE_GATE"]["target"], "Dispatch");
-    assert_eq!(states["Dispatch"]["on"]["DONE_DISPATCH"]["target"], "Execute");
+    assert_eq!(
+        states["Dispatch"]["on"]["DONE_DISPATCH"]["target"],
+        "Execute"
+    );
     assert_eq!(states["Execute"]["on"]["DONE_EXECUTE"]["target"], "Review");
     assert_eq!(states["Review"]["on"]["DONE_REVIEW"]["target"], "Verify");
     assert_eq!(states["Verify"]["on"]["DONE_VERIFY"]["target"], "Succeeded");
     for &stage in &Stage::ORDER {
         let key = format!("FAIL_{}", stage.as_str().to_uppercase());
         assert_eq!(
-            states[stage.as_str()]["on"][key]["target"], "Failed",
+            states[stage.as_str()]["on"][key]["target"],
+            "Failed",
             "fail-stop edge missing at {stage:?}"
         );
     }
@@ -397,7 +418,9 @@ fn tla_export_represents_same_statechart_as_model() {
     for &stage in &Stage::ORDER {
         let name = stage.as_str();
         assert!(
-            tla.contains(&format!("Fail{name} == state = \"{name}\" /\\ state' = \"Failed\"")),
+            tla.contains(&format!(
+                "Fail{name} == state = \"{name}\" /\\ state' = \"Failed\""
+            )),
             "TLA export missing fail-stop for {name}"
         );
     }
@@ -406,16 +429,31 @@ fn tla_export_represents_same_statechart_as_model() {
     let rel = transition_relation();
     assert_eq!(rel.len(), 10, "5 stages * (done + fail)");
     for (from, signal, to) in rel {
-        let State::InStage(stage) = from else { unreachable!() };
+        let State::InStage(stage) = from else {
+            unreachable!()
+        };
         let expected = match (signal, to) {
             (Signal::Done(_), State::InStage(next)) => {
-                format!("Done{} == state = \"{}\" /\\ state' = \"{}\"", stage.as_str(), stage.as_str(), next.as_str())
+                format!(
+                    "Done{} == state = \"{}\" /\\ state' = \"{}\"",
+                    stage.as_str(),
+                    stage.as_str(),
+                    next.as_str()
+                )
             }
             (Signal::Done(_), State::Succeeded) => {
-                format!("Done{} == state = \"{}\" /\\ state' = \"Succeeded\"", stage.as_str(), stage.as_str())
+                format!(
+                    "Done{} == state = \"{}\" /\\ state' = \"Succeeded\"",
+                    stage.as_str(),
+                    stage.as_str()
+                )
             }
             (Signal::Failed(_), State::Failed { .. }) => {
-                format!("Fail{} == state = \"{}\" /\\ state' = \"Failed\"", stage.as_str(), stage.as_str())
+                format!(
+                    "Fail{} == state = \"{}\" /\\ state' = \"Failed\"",
+                    stage.as_str(),
+                    stage.as_str()
+                )
             }
             other => panic!("unexpected edge shape: {other:?}"),
         };
@@ -428,14 +466,12 @@ fn xstate_and_tla_exports_are_equivalent_to_each_other() {
     // Equivalence: same state set and same transition structure.
     let x = to_xstate_json();
     let tla = to_tla();
-    let x_states: BTreeSet<String> = x["states"]
-        .as_object()
-        .unwrap()
-        .keys()
-        .cloned()
-        .collect();
+    let x_states: BTreeSet<String> = x["states"].as_object().unwrap().keys().cloned().collect();
     for s in &x_states {
-        assert!(tla.contains(&format!("\"{s}\"")), "state {s} in xstate but absent from TLA");
+        assert!(
+            tla.contains(&format!("\"{s}\"")),
+            "state {s} in xstate but absent from TLA"
+        );
     }
     // Same number of done/fail actions: 5 done + 5 fail.
     for &stage in &Stage::ORDER {

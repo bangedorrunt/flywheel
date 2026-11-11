@@ -4795,14 +4795,7 @@ pub fn claim_watch_step_with_known(
             crate::verdict::BeadObservation::Blocked { blockers: vec![] },
         );
     }
-    claim_watch_step_with_observations(
-        watch,
-        &obs,
-        states,
-        nudge_after_polls,
-        overlap,
-        live_leases,
-    )
+    claim_watch_step_with_observations(watch, &obs, states, nudge_after_polls, overlap, live_leases)
 }
 
 /// Evaluate claim-watch transitions directly over structured [`crate::verdict::BeadObservation`] states.
@@ -12229,7 +12222,10 @@ mod tests {
 
         b_slot.close_grace_ticks = 2;
         assert!(b_slot.is_closing());
-        assert_eq!(b_slot.state(), BeadSlotState::ClosingGrace { grace_ticks: 2 });
+        assert_eq!(
+            b_slot.state(),
+            BeadSlotState::ClosingGrace { grace_ticks: 2 }
+        );
 
         b_slot.verifier_dispatched = true;
         assert_eq!(b_slot.state(), BeadSlotState::Verifying);
@@ -12250,7 +12246,10 @@ mod tests {
 
         a_slot.context_suppressed = true;
         assert!(a_slot.is_suppressed());
-        assert_eq!(a_slot.state(), AgentSlotState::Respawning { incarnation: 1 });
+        assert_eq!(
+            a_slot.state(),
+            AgentSlotState::Respawning { incarnation: 1 }
+        );
     }
 
     /// bd-h3oj: the moment a watched bead leaves both snapshots (closed),

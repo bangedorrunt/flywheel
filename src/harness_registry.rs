@@ -303,7 +303,9 @@ mod tests {
     /// are never handed a model.
     #[test]
     fn antigravity_and_gemini_resolve_and_are_closed() {
-        for (canonical_name, aliases) in [("antigravity", &["agy", "ag"][..]), ("gemini", &["gm"][..])] {
+        for (canonical_name, aliases) in
+            [("antigravity", &["agy", "ag"][..]), ("gemini", &["gm"][..])]
+        {
             assert_eq!(canonical(canonical_name), canonical_name);
             let spec = spec(canonical_name).expect("registered");
             assert_eq!(spec.tier, HarnessTier::Closed);
