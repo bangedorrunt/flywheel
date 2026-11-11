@@ -290,6 +290,22 @@ fn directive_from_cmd(cfg: &Config, cmd: &PeerCmd) -> P2pDirective {
 }
 
 fn toron_mail_send(directive: &P2pDirective, to: &str) -> Result<()> {
+    let in_process = (|| -> Result<()> {
+        let mb = crate::mail::comms_mailbox()?;
+        let send = toron_core::mailbox::messaging::SendMessage {
+            project_slug: directive.project.clone(),
+            sender_name: directive.sender.clone(),
+            to: vec![to.to_string()],
+            subject: directive.subject(),
+            body_md: serde_json::to_string(&directive.body).unwrap_or_else(|_| "{}".to_string()),
+            ..Default::default()
+        };
+        crate::mail::block_on(mb.send_message(&send)).map(|_| ())
+    })();
+    if in_process.is_ok() {
+        return Ok(());
+    }
+
     let args = directive.mail_args(to);
     let out = Command::new("toron")
         .args(&args)
