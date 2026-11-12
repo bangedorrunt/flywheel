@@ -102,6 +102,17 @@ if [ "$check_status" -ne 0 ]; then
   exit 1
 fi
 
+echo "clean-proof: workflow verify --json"
+set +e
+"${MBX[@]}" run --quiet --bin flywheel -- workflow verify --json 2>&1 | tee "$TMP/workflow-verify.log"
+verify_status=${PIPESTATUS[0]}
+set -e
+echo "$verify_status" >"$TMP/workflow-verify.status"
+if [ "$verify_status" -ne 0 ]; then
+  echo "clean-proof: workflow verify failed; log $TMP/workflow-verify.log" >&2
+  exit 1
+fi
+
 if [ "$TESTS" -eq 1 ]; then
   echo "clean-proof: doorbell tests"
   set +e
