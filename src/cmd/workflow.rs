@@ -2145,7 +2145,10 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
         reports.push(verify_p2p(export_tla));
     }
     if reports.is_empty() {
-        bail!("unknown statechart {name:?} (expected SwarmLifecycle or P2PNegotiation)");
+        bail!(
+            "unknown statechart {} (expected SwarmLifecycle or P2PNegotiation)",
+            name.unwrap_or("")
+        );
     }
 
     let ok = reports.iter().all(|r| r.ok);

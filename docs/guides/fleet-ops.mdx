@@ -108,9 +108,20 @@ remains the one per-workspace growth to watch (below).
 The doorbell audit trail is the other per-workspace growth: one `<workspace>.audit.jsonl` per workspace that ever ran a dispatcher, including the throwaway temp roots of gate runs. Rotation caps a live file at 5 MB; `doorbell gc` removes the files of workspaces nothing will serve again.
 
 ```bash
-flywheel doorbell gc                     # report only; writes nothing
-flywheel doorbell gc --older-than-days 7 # same report, shorter idle horizon
-flywheel doorbell gc --yes               # delete the candidates
+flywheel doorbell gc
+```
+
+```text
+{
+  "applied": false,
+  "files": [],
+  "freed_bytes": 0,
+  "hint": "pass --yes to delete",
+  "older_than_days": 30,
+  "prunable_bytes": 0,
+  "prunable_files": 0,
+  "state_dir": "/Users/bangedorrunt/.local/state/flywheel/doorbell"
+}
 ```
 
 A file is a candidate only when **both** hold: no live dispatcher holds its `.pid`, and one of two death signals fires. Either the `.project` sidecar records an absolute project path that no longer exists (a finished gate run's temp root, dead immediately however recently it wrote), or the file has not been touched for `--older-than-days` (default 30). A bare project name like `flywheel` cannot be tested for existence, so it only ever expires on age. The small sibling files (`.pid`, `.gen`, `.unanswered`, `.audit.loudmiss`) are never candidates, so `doorbell status` still reports the workspace.

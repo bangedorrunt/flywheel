@@ -51,7 +51,7 @@ Nothing pushes to an agent; agents are woken or poll by design.
 
 ```mermaid
 flowchart LR
-    subgraph wake["doorbell daemon (18980)"]
+    subgraph wake["doorbell daemon / toron (18080)"]
         J["journals, subscriptions"]
     end
     K9["kind 9 room post / mention / job"] --> J
@@ -93,9 +93,9 @@ Findings longer than about 20 lines go to a durable file first; the post carries
 | `<project>/.flywheel/agent-state/<name>.json` | per-agent context (git-ignored) |
 | `~/.local/state/flywheel/` | flywheel loops, journals, runs, facts, doorbell state |
 | `~/.local/state/toron/toron.pid` | toron pidfile (non-launchd hosts) |
-| `127.0.0.1:18080` | toron daemon (MCP + mailbox) |
+| `127.0.0.1:18080` | toron daemon (MCP + mailbox, and consolidated doorbell Plane D per ADR-0020) |
 | `127.0.0.1:18081` | chiebukuro MCP (HTTP) |
-| `127.0.0.1:18980` | doorbell daemon |
+| `127.0.0.1:18980` | legacy doorbell port (retired per ADR-0020) |
 | `~/.local/share/toron/index.sqlite` (engine store) | Durable execution (local sqlite, no server) |
 | `.beads/` | SQLite + `issues.jsonl` + `gates.jsonl` |
 | `.flywheel/` | project stages + standing orders |

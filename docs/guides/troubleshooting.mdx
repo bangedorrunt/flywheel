@@ -23,7 +23,7 @@ description: Named failures and their fixes. Door, spawn, loop, compose, and doo
 | `no flywheel swarm` | Wrong cwd or absolute path | Run `loop-mode run <slug> --work` from the parent workspace directory |
 | Pane found but its name is `null` after a restart | Lost binding (the `toron_pin` label went with the old terminal) | `flywheel rebind` restores registered names; `recover` also respawns the dead |
 | SIGKILL on the binary | Stale signature | `codesign --force --sign - ~/.cargo/bin/flywheel` |
-| doorbell `answered by foreign owner, not child <pid>` | Port 18980 conflict | Stop the foreign holder or relocate; arrival itself was unaffected |
+| doorbell `answered by foreign owner, not child <pid>` | Port 18080/18980 conflict | Stop the foreign holder or relocate; arrival itself was unaffected |
 | preflight `engine ... store unreachable` | Durable engine down | fix the store path and permissions, or run open-vehicle work and say so in the trail |
 | Mail to `captain` fails | Alias cleared by parent death or never bound | `flywheel mail whois captain <p>` to check; `recover`/`adopt` rebinds; `toron contact captain --pin <pin>` sets it |
 | `mode: standby` + `standby_with_known_workspaces` | Daemon adopted without hosts; zero wakes delivered | Arm it: `flywheel doorbell start <project>` for registry workspaces, or subscribe with `--project` and let auto-host fire within 60s |

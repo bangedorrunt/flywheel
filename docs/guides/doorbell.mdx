@@ -3,12 +3,12 @@ title: The doorbell
 description: The wake plane. A supervised daemon turns room posts, mentions, and jobs into one prompt line, with journals that survive crashes.
 ---
 
-Nothing pushes into an agent's head; agents are woken. The doorbell follows the ADR-0016 effect-kernel boundary: observations become `Msg`, `doorbell-core::tick` returns commands, and `doorbell-rt` interprets them. Wake is plane D, owned by a dedicated daemon, not by spawn: `doorbell-core` is a pure tick reducer, `doorbell-rt` wires brain, sensors, and sinks, and the `doorbell` daemon listens on a UDS plus `127.0.0.1:18980`. Spawn records a subscription row and defers to a healthy daemon, starting one when `[doorbell]` is configured and none is running (`FLYWHEEL_NO_DOORBELL_ENSURE=1` opts out); only then does an embedded degraded mode run locally, with a WARNING naming the remediation. `flywheel kill` never touches the daemon.
+Nothing pushes into an agent's head; agents are woken. The doorbell follows the ADR-0016 effect-kernel boundary: observations become `Msg`, `doorbell-core::tick` returns commands, and `doorbell-rt` interprets them. Wake is plane D, consolidated directly into the toron daemon on `127.0.0.1:18080` (port `:18980` is retired per ADR-0020). `doorbell-core` is a pure tick reducer; `doorbell-rt` wires brain, sensors, and sinks within the unified Toron serve runtime. Spawn records a subscription row and defers to a healthy daemon, starting one when `[doorbell]` is configured and none is running (`FLYWHEEL_NO_DOORBELL_ENSURE=1` opts out); only then does an embedded degraded mode run locally, with a WARNING naming the remediation. `flywheel kill` never touches the daemon.
 
 ```mermaid
 sequenceDiagram
     participant W as watched plane (kind 9, mention, job)
-    participant DB as doorbell daemon (18980)
+    participant DB as doorbell / toron daemon (18080)
     participant A as agent pane
     W->>DB: event lands
     DB->>DB: journal it (seq-stamped, at-least-once)
@@ -222,7 +222,7 @@ plane's own files rather than tracked in RAM, so it survives a restart:
 ### Reading `/health.wake`
 
 GS-062 (PR #16) puts wake-pipe liveness on both operator doorbell `/health`
-(`:18980`) and flywheel `serve` `/health`. The object is the same shape on
+(`:18080` unified daemon, legacy `:18980`) and flywheel `serve` `/health`. The object is the same shape on
 both surfaces:
 
 ```json
@@ -341,8 +341,8 @@ serve/migrate/ping).
 | Subscriptions | `flywheel doorbell subscribe\|subscriptions\|unsubscribe` (`--project` names the auto-host pair and is required: a project-less row is refused loud, bd-zawk — it would never ring) |
 | Cross-workspace | `flywheel doorbell subscribe --workspace wA --pin P --extra wB --project <slug>` (scope printed, never implicit; `--project` required) |
 | Human wake (no pane) | `flywheel doorbell subscribe --sink webhook --url http://host:port/path` + `DOORBELL_WEBHOOK_ALLOWLIST=host` on the daemon (see above) |
-| Always-on | `flywheel daemon start` (flywheel + doorbell daemons in one command); `doorbell install` persists across reboots (launchd/systemd, idempotent) and is the durability door: the unit re-runs a job that is not running (`StartInterval 60` + `KeepAlive{SuccessfulExit=false}` on launchd, `Restart=` on systemd), `install` waits out `bootout` and retries `bootstrap` (a failed install fails loud instead of leaving the daemon down), and `stop` writes a `stopped-by-operator` marker so `status` reads STOPPED by operator (deliberate, not an outage) instead of DOWN — `start`/`install` clear it. `/health` answers from the in-memory snapshot and never shells; a cold start answers typed `starting`. `curl 127.0.0.1:18980/health` shows `mode`, `hosted`, `binaries`, `injection`, `degraded`, and `wake` (see Reading `/health.wake` above) |
+| Always-on | `flywheel daemon start` (flywheel + doorbell daemons in one command); `doorbell install` persists across reboots (launchd/systemd, idempotent) and is the durability door: the unit re-runs a job that is not running (`StartInterval 60` + `KeepAlive{SuccessfulExit=false}` on launchd, `Restart=` on systemd), `install` waits out `bootout` and retries `bootstrap` (a failed install fails loud instead of leaving the daemon down), and `stop` writes a `stopped-by-operator` marker so `status` reads STOPPED by operator (deliberate, not an outage) instead of DOWN — `start`/`install` clear it. `/health` answers from the in-memory snapshot and never shells; a cold start answers typed `starting`. `curl 127.0.0.1:18080/health` shows `mode`, `hosted`, `binaries`, `injection`, `degraded`, and `wake` (see Reading `/health.wake` above) |
 
 Cross-project wake is a captain hold: `br hold --kind captain --corr external:<proj>:<bead> <your-bead>` rings once when the foreign bead closes; you still resolve the hold.
 
-A foreign owner on port 18980 fails `doorbell start` loud ("answered by foreign owner, not child <pid>"). That is a port conflict, not corruption: stop the foreign holder or relocate the daemon.
+A foreign owner on port 18080 or legacy 18980 fails `doorbell start` loud ("answered by foreign owner, not child <pid>"). That is a port conflict, not corruption: stop the foreign holder or relocate the daemon.

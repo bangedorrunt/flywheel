@@ -126,6 +126,21 @@ flowchart LR
 
 Nested workflows use durable `ctx.run` children. The engine carries a serialized lineage envelope and refuses cycles, nesting beyond 8 workflows, or more than 32 child calls along one lineage branch before creating the child promise. This is an execution guard, not prompt guidance.
 
+## Formal Statechart Verification
+
+Per ADR-0021, all core lifecycle protocols (`SwarmLifecycle`, `P2PNegotiation`) are modeled as zero-divergence hierarchical statecharts (`elm-effect-xstate`). Formal reachability, quiescence, and deadlock-freedom verification gates run natively via `flywheel workflow verify`:
+
+```bash
+flywheel workflow verify
+```
+
+```text
+workflow verify SwarmLifecycle: ok
+workflow verify P2PNegotiation: ok
+```
+
+Passing `--json` outputs machine-readable verification verdicts (`schema: flywheel-workflow-verify.v1`) for CI gates like `scripts/clean-proof.sh`, while `--export-tla` prints the AST-derived TLA+ specification for TLC model checking.
+
 ## Authoring and graduation
 
 Ladder: `stage new`, `stage lint`, `stage promote`; `workflow new`, `workflow lint` (fail-stop), `workflow evaluate` (GS-049 evaluate-without-commit — validated partition candidates, no journal), promote. A same-named catalog file overrides a builtin; never edit the builtin. Ephemeral compose stays out of the catalog: `--keep <n>` graduates a green run through `workflow new` + lint. `--agent`-authored YAML is lint-gated: a failing lint bails before any dispatch.
