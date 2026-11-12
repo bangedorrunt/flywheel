@@ -379,7 +379,9 @@ fn deliver_p2p_wake_hc(
     }
     let route = crate::harness_caps::wake_route(&kind, crate::harness_caps::installed_from_env());
     let line = directive.wake_line(wm);
-    crate::pane_write::write_p2p_wake(&crate::pane_write::HcPanes(&c), &target, &line, route)?;
+    if let Err(e) = crate::pane_write::write_p2p_wake(&crate::pane_write::HcPanes(&c), &target, &line, route) {
+        eprintln!("note: hc pane wake deferred ({e}); directive delivered to inbox");
+    }
     Ok(line)
 }
 
@@ -412,12 +414,14 @@ fn deliver_p2p_wake_rex(
     }
     let route = crate::harness_caps::wake_route(&kind, crate::harness_caps::installed_from_env());
     let line = directive.wake_line(wm);
-    crate::pane_write::write_p2p_wake(
+    if let Err(e) = crate::pane_write::write_p2p_wake(
         &crate::pane_write::RexPanes(&*backend),
         &target,
         &line,
         route,
-    )?;
+    ) {
+        eprintln!("note: rex pane wake deferred ({e}); directive delivered to inbox");
+    }
     Ok(line)
 }
 
