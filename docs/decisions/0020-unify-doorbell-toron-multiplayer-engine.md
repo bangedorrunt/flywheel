@@ -1,6 +1,6 @@
 <!-- governed-by: ADR-0005, ADR-0010, ADR-0012, ADR-0016, ADR-0018, toron ADR-0007, toron ADR-0020, toron ADR-0027, toron ADR-0037 -->
 ---
-status: proposed
+status: accepted
 date: 2026-11-12
 decision-makers: Captain (bangedorrunt)
 consulted: |
@@ -24,7 +24,7 @@ extends: |
 
 | Field | Value |
 |---|---|
-| **Status** | **Proposed** (2026-11-12) |
+| **Status** | **Accepted** (2026-11-12) |
 | **Decision-makers** | Captain (`bangedorrunt`) |
 | **Supersedes** | Consolidates [ADR-0012](0012-doorbell-plane-independent-runtime.md) (retires port **`:18980`** and `com.doorbell.serve`) |
 | **Extends** | [ADR-0005](0005-always-on-collab-baseline-and-command-surface.md), [ADR-0010](0010-delivery-semantics-attention-triage-decision-lifecycle.md), [ADR-0016](0016-functional-effect-kernel-redesign.md), [ADR-0018](0018-elm-effect-is-the-core.md) |
@@ -223,13 +223,13 @@ Phase 4: Swarm Statechart Unification (elm-effect-xstate)
 
 ## 8. Verification Criteria
 
-- [ ] **P2P Latency Benchmark**: `flywheel peer request-release` completes in $< 20\text{ms}$ when running in-process.
-- [ ] **Zero-Sweep Lease Reclaim**:
+- [x] **P2P Latency Benchmark**: `flywheel peer request-release` completes in $< 20\text{ms}$ when running in-process (verified in `bd-p2p-inprocess-fastpath-ljllj`).
+- [x] **Zero-Sweep Lease Reclaim**:
   ```bash
   toron reserve acquire src/test.rs --reason bd-test-close --project flywheel --as AgentA
   br close bd-test-close --task-id bd-test-close --verdict-id test --commit-sha <sha>
   toron reserve acquire src/test.rs --reason bd-test-next --project flywheel --as AgentB
-  # Succeeded immediately without running `toron reserve sweep`
+  # Succeeded immediately without running `toron reserve sweep` (verified in `bd-atomic-bead-lease-reconciliation-0zvt7`)
   ```
 - [ ] **Stack Install Parity**:
   ```bash
