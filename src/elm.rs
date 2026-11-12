@@ -17,6 +17,7 @@
 
 pub mod inbox;
 pub mod leaf;
+pub mod swarm_statechart;
 
 use crate::decide::{Snapshot, decide};
 use serde::{Deserialize, Serialize};
