@@ -946,6 +946,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "elm-effect-xstate"
+version = "0.4.3"
+dependencies = [
+ "elm-effect",
+ "elm-effect-elm",
+ "elm-effect-journal",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "encode_unicode"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3364,6 +3376,7 @@ dependencies = [
  "elm-effect-durable",
  "elm-effect-elm",
  "elm-effect-journal",
+ "elm-effect-xstate",
  "git2",
  "hex",
  "negentropy",
