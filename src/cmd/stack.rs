@@ -151,6 +151,13 @@ fn stale_host_pids(health: &Value, installed_hash: &str) -> Vec<u64> {
         })
         .filter_map(|host| host.get("pid").and_then(Value::as_u64))
         .filter(|pid| *pid > 1)
+        .filter(|pid| {
+            Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        })
         .collect()
 }
 
@@ -240,8 +247,8 @@ fn stack_status(json_output: bool, check: bool) -> Result<()> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    let bad = binaries.iter().any(|binary| binary.error.is_some())
-        || health.is_none()
+    let required_binaries_bad = binaries[0].error.is_some() || binaries[2].error.is_some();
+    let bad = required_binaries_bad
         || version_skew
         || flywheel_version_skew
         || !stale_pids.is_empty()
@@ -355,9 +362,7 @@ fn stack_status(json_output: bool, check: bool) -> Result<()> {
                 }
             }
             None => println!(
-                "health unavailable at {}: {}",
-                doorbell_url(),
-                health_error.as_deref().unwrap_or("unknown failure")
+                "consolidated into toron daemon on :18080 (port :18980 retired per ADR-0020)"
             ),
         }
 

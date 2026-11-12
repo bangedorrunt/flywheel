@@ -78,7 +78,7 @@ bin_dir() {
 installed_bins() {
   local dir
   dir="$(bin_dir)"
-  printf '%s\n' "$dir/flywheel" "$dir/doorbell" "$dir/toron"
+  printf '%s\n' "$dir/flywheel" "$dir/toron"
 }
 
 restart_label() {
@@ -100,7 +100,12 @@ stale_host_rows() {
     | select(.generation.binary_hash != null and .generation.binary_hash != "")
     | select(.generation.binary_hash != $h)
     | "\(.pid)\t\(.project // "")\t\(.workspace // "")"
-  ' <<<"$health"
+  ' <<<"$health" | while IFS=$'\t' read -r pid project workspace; do
+    [ -n "$pid" ] || continue
+    if kill -0 "$pid" 2>/dev/null; then
+      printf '%s\t%s\t%s\n' "$pid" "$project" "$workspace"
+    fi
+  done
 }
 
 # A state file can outlive its process; do not kill a recycled pid.
@@ -185,7 +190,7 @@ show_status() {
   fi
 
   echo "== binaries =="
-  for bin in toron flywheel doorbell; do
+  for bin in toron flywheel; do
     if [ -x "$dir/$bin" ]; then
       path="$dir/$bin"
     elif path="$(command -v "$bin" 2>/dev/null)"; then
@@ -202,6 +207,12 @@ show_status() {
       bad=1
     fi
   done
+  if [ -x "$dir/doorbell" ] || command -v doorbell >/dev/null 2>&1; then
+    path="${dir}/doorbell"
+    [ -x "$path" ] || path="$(command -v doorbell 2>/dev/null)"
+    version="$("$path" --version 2>&1 || echo unknown)"
+    printf '%-9s %s (legacy, sunset by ADR-0020)\n          %s\n' "doorbell" "$version" "$path"
+  fi
 
   echo
   echo "== doorbell =="
@@ -212,7 +223,6 @@ show_status() {
       installed_version="$("$dir/doorbell" --version 2>/dev/null | awk '{print $2}')"
       if [ -n "$health_version" ] && [ -n "$installed_version" ] && [ "$health_version" != "$installed_version" ]; then
         echo "version skew: /health $health_version, $dir/doorbell $installed_version"
-        bad=1
       fi
       if jq -e '.hosts | type == "array" and length > 0' >/dev/null 2>&1 <<<"$health"; then
         echo "hosts:"
@@ -220,10 +230,9 @@ show_status() {
         if command -v shasum >/dev/null 2>&1 && [ -x "$dir/flywheel" ]; then
           # Host generations hash the first 8 KiB with SHA-1 (WatcherGen::capture).
           current_hash="$(dd if="$dir/flywheel" bs=8192 count=1 2>/dev/null | shasum -a 1 | awk '{print $1}')"
-          stale="$(jq --arg h "$current_hash" '[.hosts[] | select(.state == "live" and .generation.binary_hash != null and .generation.binary_hash != $h)] | length' <<<"$health")"
+          stale="$(stale_host_rows "$health" "$current_hash" | grep -c . || true)"
           if [ "$stale" -gt 0 ]; then
             echo "stale live hosts: $stale generation(s) differ from $dir/flywheel"
-            bad=1
           fi
         fi
       else
@@ -233,8 +242,7 @@ show_status() {
       printf '%s\n' "$health"
     fi
   else
-    echo "health unavailable at $DOORBELL_URL/health"
-    bad=1
+    echo "consolidated into toron daemon on :18080 (port :18980 retired per ADR-0020)"
   fi
 
   echo
@@ -284,7 +292,6 @@ do_install() {
   done
 
   [ -f "$FLYWHEEL_SOURCE/Cargo.toml" ] || die "no Cargo.toml at $FLYWHEEL_SOURCE (set FLYWHEEL_SOURCE)"
-  [ -f "$FLYWHEEL_SOURCE/crates/doorbell-cli/Cargo.toml" ] || die "no doorbell crate at $FLYWHEEL_SOURCE/crates/doorbell-cli"
   if [ "$SKIP_TORON" -eq 0 ]; then
     [ -n "$TORON_SOURCE_RESOLVED" ] || die "no toron source (set TORON_SOURCE)"
     [ -f "$TORON_SOURCE_RESOLVED/crates/toron-cli/Cargo.toml" ] || die "no toron crate at $TORON_SOURCE_RESOLVED/crates/toron-cli"
@@ -293,8 +300,10 @@ do_install() {
   cargo_command
   echo "installing flywheel from $FLYWHEEL_SOURCE"
   run "${CARGO_CMD_ARR[@]}" install --path "$FLYWHEEL_SOURCE" --force
-  echo "installing doorbell from $FLYWHEEL_SOURCE/crates/doorbell-cli"
-  run "${CARGO_CMD_ARR[@]}" install --path "$FLYWHEEL_SOURCE/crates/doorbell-cli" --force
+  if [ "${INSTALL_LEGACY_DOORBELL:-0}" -eq 1 ] && [ -f "$FLYWHEEL_SOURCE/crates/doorbell-cli/Cargo.toml" ]; then
+    echo "installing legacy doorbell from $FLYWHEEL_SOURCE/crates/doorbell-cli"
+    run "${CARGO_CMD_ARR[@]}" install --path "$FLYWHEEL_SOURCE/crates/doorbell-cli" --force
+  fi
   if [ "$SKIP_TORON" -eq 0 ]; then
     echo "installing toron from $TORON_SOURCE_RESOLVED/crates/toron-cli"
     run "${CARGO_CMD_ARR[@]}" install --path "$TORON_SOURCE_RESOLVED/crates/toron-cli" --force
@@ -314,7 +323,12 @@ do_install() {
 
   if [ "$NO_RESTART" -eq 0 ]; then
     if [ "$(uname -s)" = "Darwin" ] && command -v launchctl >/dev/null 2>&1; then
-      for label in com.doorbell.serve dev.flywheel.daemon dev.flywheel.cron; do
+      domain="gui/$(id -u)/com.doorbell.serve"
+      if launchctl print "$domain" >/dev/null 2>&1; then
+        echo "retiring standalone doorbell daemon ($domain)"
+        launchctl bootout "$domain" 2>/dev/null || true
+      fi
+      for label in dev.flywheel.daemon dev.flywheel.cron; do
         restart_label "$label"
       done
       # Per-project supervisors are named dev.flywheel.doorbell.<project>.

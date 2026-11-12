@@ -19,7 +19,7 @@ mbx +nightly-aarch64-apple-darwin test
 bash scripts/verify-clippy.sh
 mbx +nightly-aarch64-apple-darwin install --path . --force
 mbx +nightly-aarch64-apple-darwin install --path crates/doorbell-cli --force
-# one command for all three installed binaries (flywheel, doorbell, toron):
+# one command for all installed binaries (flywheel, toron):
 flywheel stack install
 flywheel stack status --check
 # after `br close`: bead id in HEAD, clean .beads, committed closed row, legal verdict
