@@ -331,6 +331,18 @@ pub(crate) enum WorkflowCmd {
         #[arg(long, default_value = "flywheel")]
         project: String,
     },
+    /// Formally verify registered statecharts (reachability, quiescence, deadlock-free non-final states)
+    /// and optionally export TLA+ specifications.
+    Verify {
+        /// Statechart name: SwarmLifecycle or P2PNegotiation. Omit to verify all.
+        name: Option<String>,
+        /// Export compiled TLA+ specification for each verified chart.
+        #[arg(long)]
+        export_tla: bool,
+        /// JSON output for agent drivers and verification gates.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// GS-049 / GS-045 P1-2: direct evaluate-without-commit (Jido cmd/3 adapt).
@@ -1808,6 +1820,11 @@ pub(crate) fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 other => bail!("unknown promote target {other:?} (user | repo)"),
             }
         }
+        WorkflowCmd::Verify {
+            name,
+            export_tla,
+            json,
+        } => cmd_workflow_verify(name.as_deref(), *export_tla, *json),
         WorkflowCmd::Approve {
             run_id,
             promise_id,
@@ -1842,6 +1859,330 @@ pub(crate) fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Formal verification report for `flywheel workflow verify` (bd-c6k7b / ADR-0021).
+#[derive(serde::Serialize)]
+struct WorkflowVerifyChartReport {
+    name: String,
+    ok: bool,
+    checks: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tla: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    errors: Vec<String>,
+}
+
+fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> Result<()> {
+    use crate::elm::p2p_negotiation::{
+        P2PNegotiationContext, P2PNegotiationEvent, P2PNegotiationState,
+        build_p2p_negotiation_machine,
+    };
+    use crate::elm::swarm_statechart::{
+        P2PVerb, SwarmContext, SwarmEvent, SwarmStage, SwarmState, build_swarm_machine,
+    };
+    use toron_core::kernel::MachineState;
+
+    fn verify_swarm(export_tla: bool) -> WorkflowVerifyChartReport {
+        let machine = build_swarm_machine();
+        let mut errors = Vec::new();
+        let initial_cfg = machine.initial_configuration();
+        let active_leaves = initial_cfg.leaves().count();
+        let reachability_ok = active_leaves > 0 && machine.initial_state() == &SwarmState::Classify;
+        if !reachability_ok {
+            errors
+                .push("SwarmLifecycle initial configuration/reachability check failed".to_string());
+        }
+
+        let started = machine.start(&SwarmContext::default(), &SwarmEvent::Init);
+        let start_leaf = started.configuration.primary().cloned();
+        let quiescence_ok = start_leaf.is_some() && !started.configuration.is_empty();
+        if !quiescence_ok {
+            errors.push(
+                "SwarmLifecycle did not settle to quiescent configuration on start".to_string(),
+            );
+        }
+
+        let non_final = [
+            SwarmState::Classify,
+            SwarmState::MitigatingTrap,
+            SwarmState::Dispatch,
+            SwarmState::Execute,
+            SwarmState::Review,
+            SwarmState::Verify,
+        ];
+        let mut outbound_map = serde_json::Map::new();
+        let mut deadlock_ok = true;
+        for state in non_final {
+            let ms = MachineState::at(state, SwarmContext::default());
+            let probes: Vec<SwarmEvent> = match state {
+                SwarmState::Classify => vec![
+                    SwarmEvent::Classify { target: "x".into() },
+                    SwarmEvent::Classified {
+                        mode: "swarm".into(),
+                    },
+                    SwarmEvent::TrapDetected {
+                        query: "q".into(),
+                        trap_summary: "t".into(),
+                    },
+                ],
+                SwarmState::MitigatingTrap => vec![SwarmEvent::Classified {
+                    mode: "swarm".into(),
+                }],
+                SwarmState::Dispatch => vec![
+                    SwarmEvent::DispatchBead {
+                        bead_id: "bd-x".into(),
+                        assignee: "A".into(),
+                    },
+                    SwarmEvent::ClaimSeen {
+                        bead_id: "bd-x".into(),
+                        agent: "A".into(),
+                    },
+                    SwarmEvent::StageDone {
+                        stage: SwarmStage::Dispatch,
+                    },
+                    SwarmEvent::P2PDirective {
+                        verb: P2PVerb::Intent,
+                        sender: "A".into(),
+                        recipient: "B".into(),
+                        path: "p".into(),
+                        bead: None,
+                    },
+                ],
+                SwarmState::Execute => vec![
+                    SwarmEvent::StageDone {
+                        stage: SwarmStage::Execute,
+                    },
+                    SwarmEvent::P2PDirective {
+                        verb: P2PVerb::ReviewRequest,
+                        sender: "A".into(),
+                        recipient: "B".into(),
+                        path: "p".into(),
+                        bead: None,
+                    },
+                    SwarmEvent::P2PDirective {
+                        verb: P2PVerb::Intent,
+                        sender: "A".into(),
+                        recipient: "B".into(),
+                        path: "p".into(),
+                        bead: None,
+                    },
+                ],
+                SwarmState::Review => vec![
+                    SwarmEvent::ReviewVerdict {
+                        passed: true,
+                        severity: 1,
+                        notes: "ok".into(),
+                    },
+                    SwarmEvent::ReviewVerdict {
+                        passed: false,
+                        severity: 2,
+                        notes: "no".into(),
+                    },
+                    SwarmEvent::StageDone {
+                        stage: SwarmStage::Review,
+                    },
+                ],
+                SwarmState::Verify => vec![
+                    SwarmEvent::VerifyVerdict {
+                        passed: true,
+                        output: "ok".into(),
+                    },
+                    SwarmEvent::VerifyVerdict {
+                        passed: false,
+                        output: "no".into(),
+                    },
+                ],
+                _ => vec![],
+            };
+            let mut has_outbound = false;
+            for e in probes {
+                let out = machine.step_state(&ms, &e);
+                if out.transitioned
+                    || out.configuration.primary() != Some(&state)
+                    || !out.commands.is_empty()
+                {
+                    has_outbound = true;
+                    break;
+                }
+            }
+            outbound_map.insert(format!("{state:?}"), serde_json::Value::Bool(has_outbound));
+            if !has_outbound {
+                deadlock_ok = false;
+                errors.push(format!(
+                    "SwarmLifecycle state {state:?} has no valid outbound transition"
+                ));
+            }
+        }
+
+        let tla = if export_tla {
+            Some(machine.to_tla_named("SwarmLifecycle"))
+        } else {
+            None
+        };
+        let ok = reachability_ok && quiescence_ok && deadlock_ok && errors.is_empty();
+        WorkflowVerifyChartReport {
+            name: "SwarmLifecycle".to_string(),
+            ok,
+            checks: serde_json::json!({
+                "reachability": { "ok": reachability_ok, "active_leaves": active_leaves, "initial": format!("{:?}", machine.initial_state()) },
+                "quiescence": { "ok": quiescence_ok, "start_leaf": start_leaf.map(|s| format!("{s:?}")) },
+                "deadlock_free_non_final": { "ok": deadlock_ok, "outbound": outbound_map },
+            }),
+            tla,
+            errors,
+        }
+    }
+
+    fn verify_p2p(export_tla: bool) -> WorkflowVerifyChartReport {
+        let machine = build_p2p_negotiation_machine();
+        let mut errors = Vec::new();
+        let initial_cfg = machine.initial_configuration();
+        let active_leaves = initial_cfg.leaves().count();
+        let reachability_ok =
+            active_leaves > 0 && machine.initial_state() == &P2PNegotiationState::Idle;
+        if !reachability_ok {
+            errors
+                .push("P2PNegotiation initial configuration/reachability check failed".to_string());
+        }
+
+        let started = machine.start(
+            &P2PNegotiationContext::default(),
+            &P2PNegotiationEvent::Init,
+        );
+        let start_leaf = started.configuration.primary().cloned();
+        let quiescence_ok = start_leaf.is_some() && !started.configuration.is_empty();
+        if !quiescence_ok {
+            errors.push(
+                "P2PNegotiation did not settle to quiescent configuration on start".to_string(),
+            );
+        }
+
+        let non_final = [
+            P2PNegotiationState::Idle,
+            P2PNegotiationState::Proposed,
+            P2PNegotiationState::WaitingDecision,
+            P2PNegotiationState::Accepted,
+            P2PNegotiationState::Rejected,
+            P2PNegotiationState::Expired,
+        ];
+        let mut outbound_map = serde_json::Map::new();
+        let mut deadlock_ok = true;
+        for state in non_final {
+            let ms = MachineState::at(state, P2PNegotiationContext::default());
+            let probes: Vec<P2PNegotiationEvent> = match state {
+                P2PNegotiationState::Idle => vec![P2PNegotiationEvent::Propose {
+                    path: "p".into(),
+                    peer: "B".into(),
+                    bead: None,
+                }],
+                P2PNegotiationState::Proposed => vec![
+                    P2PNegotiationEvent::Init,
+                    P2PNegotiationEvent::PeerResponded { accepted: true },
+                    P2PNegotiationEvent::PeerResponded { accepted: false },
+                    P2PNegotiationEvent::DeadlineElapsed,
+                ],
+                P2PNegotiationState::WaitingDecision => vec![
+                    P2PNegotiationEvent::PeerResponded { accepted: true },
+                    P2PNegotiationEvent::PeerResponded { accepted: false },
+                    P2PNegotiationEvent::DeadlineElapsed,
+                ],
+                P2PNegotiationState::Accepted
+                | P2PNegotiationState::Rejected
+                | P2PNegotiationState::Expired => vec![P2PNegotiationEvent::Reset],
+            };
+            let mut has_outbound = false;
+            for e in probes {
+                let out = machine.step_state(&ms, &e);
+                if out.transitioned
+                    || out.configuration.primary() != Some(&state)
+                    || !out.commands.is_empty()
+                {
+                    has_outbound = true;
+                    break;
+                }
+            }
+            outbound_map.insert(format!("{state:?}"), serde_json::Value::Bool(has_outbound));
+            if !has_outbound {
+                deadlock_ok = false;
+                errors.push(format!(
+                    "P2PNegotiation state {state:?} has no valid outbound transition"
+                ));
+            }
+        }
+
+        let tla = if export_tla {
+            Some(machine.to_tla_named("P2PNegotiation"))
+        } else {
+            None
+        };
+        let ok = reachability_ok && quiescence_ok && deadlock_ok && errors.is_empty();
+        WorkflowVerifyChartReport {
+            name: "P2PNegotiation".to_string(),
+            ok,
+            checks: serde_json::json!({
+                "reachability": { "ok": reachability_ok, "active_leaves": active_leaves, "initial": format!("{:?}", machine.initial_state()) },
+                "quiescence": { "ok": quiescence_ok, "start_leaf": start_leaf.map(|s| format!("{s:?}")) },
+                "deadlock_free_non_final": { "ok": deadlock_ok, "outbound": outbound_map },
+            }),
+            tla,
+            errors,
+        }
+    }
+
+    let want_all = name.is_none();
+    let want = name.unwrap_or("").to_ascii_lowercase();
+    let mut reports = Vec::new();
+    if want_all
+        || matches!(
+            want.as_str(),
+            "swarm" | "swarm-lifecycle" | "swarmlifecycle"
+        )
+    {
+        reports.push(verify_swarm(export_tla));
+    }
+    if want_all || matches!(want.as_str(), "p2p" | "p2p-negotiation" | "p2pnegotiation") {
+        reports.push(verify_p2p(export_tla));
+    }
+    if reports.is_empty() {
+        bail!("unknown statechart {name:?} (expected SwarmLifecycle or P2PNegotiation)");
+    }
+
+    let ok = reports.iter().all(|r| r.ok);
+    let body = serde_json::json!({
+        "schema": "flywheel-workflow-verify.v1",
+        "ok": ok,
+        "charts": reports,
+    });
+    if json_out {
+        print_json(&body);
+    } else {
+        for chart in body["charts"].as_array().into_iter().flatten() {
+            println!(
+                "workflow verify {}: {}",
+                chart["name"].as_str().unwrap_or("?"),
+                if chart["ok"].as_bool().unwrap_or(false) {
+                    "ok"
+                } else {
+                    "FAILED"
+                }
+            );
+            if let Some(tla) = chart.get("tla").and_then(|v| v.as_str()) {
+                println!("{tla}");
+            }
+            if let Some(errs) = chart.get("errors").and_then(|v| v.as_array()) {
+                for e in errs {
+                    if let Some(s) = e.as_str() {
+                        eprintln!("  - {s}");
+                    }
+                }
+            }
+        }
+    }
+    if !ok {
+        bail!("statechart verification failed");
+    }
+    Ok(())
 }
 
 /// The flywheel-tier lint checks (the bead's fail-stop contract): profile

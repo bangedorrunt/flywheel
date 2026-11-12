@@ -1,4 +1,4 @@
-//! Unified swarm lifecycle statechart (ADR-0020 Phase 4).
+//! Unified swarm lifecycle statechart (ADR-0020 Phase 4, ADR-0021 typed hardening).
 //!
 //! Models the multi-agent swarm wave as a pure `elm-effect-xstate` machine:
 //! classify, trap mitigation, dispatch, execute, review, and verify, with P2P
@@ -6,6 +6,9 @@
 //! surface. The fold is pure; commands are descriptions only.
 
 #![allow(dead_code)]
+
+use std::fmt;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use toron_core::kernel::{
@@ -24,6 +27,81 @@ pub enum SwarmState {
     Verify,
     Complete,
     Failed,
+}
+
+/// Typed stage marker for swarm progression events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SwarmStage {
+    Gate,
+    Dispatch,
+    Execute,
+    Review,
+    Verify,
+}
+
+impl fmt::Display for SwarmStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Gate => "gate",
+            Self::Dispatch => "dispatch",
+            Self::Execute => "execute",
+            Self::Review => "review",
+            Self::Verify => "verify",
+        };
+        f.write_str(s)
+    }
+}
+
+impl FromStr for SwarmStage {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "gate" => Ok(Self::Gate),
+            "dispatch" => Ok(Self::Dispatch),
+            "execute" => Ok(Self::Execute),
+            "review" => Ok(Self::Review),
+            "verify" => Ok(Self::Verify),
+            other => Err(format!("unknown swarm stage: {other}")),
+        }
+    }
+}
+
+/// Typed P2P directive verbs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum P2PVerb {
+    Intent,
+    RequestRelease,
+    ReleaseResponse,
+    ReviewRequest,
+}
+
+impl fmt::Display for P2PVerb {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Intent => "intent",
+            Self::RequestRelease => "request-release",
+            Self::ReleaseResponse => "release-response",
+            Self::ReviewRequest => "review-request",
+        };
+        f.write_str(s)
+    }
+}
+
+impl FromStr for P2PVerb {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "intent" => Ok(Self::Intent),
+            "request-release" | "request_release" => Ok(Self::RequestRelease),
+            "release-response" | "release_response" => Ok(Self::ReleaseResponse),
+            "review-request" | "review_request" => Ok(Self::ReviewRequest),
+            other => Err(format!("unknown p2p verb: {other}")),
+        }
+    }
 }
 
 /// Domain events driving the swarm lifecycle.
@@ -45,10 +123,10 @@ pub enum SwarmEvent {
         agent: String,
     },
     StageDone {
-        stage: String,
+        stage: SwarmStage,
     },
     P2PDirective {
-        verb: String,
+        verb: P2PVerb,
         sender: String,
         recipient: String,
         path: String,
@@ -101,7 +179,7 @@ pub enum SwarmCmd {
         line: String,
     },
     EvaluateJudgment {
-        verb: String,
+        verb: P2PVerb,
         sender: String,
         recipient: String,
         path: String,
@@ -133,15 +211,21 @@ fn is_p2p(event: &SwarmEvent) -> bool {
 }
 
 fn is_p2p_non_review(event: &SwarmEvent) -> bool {
-    matches!(event, SwarmEvent::P2PDirective { verb, .. } if verb != "review-request")
+    matches!(
+        event,
+        SwarmEvent::P2PDirective {
+            verb: P2PVerb::Intent | P2PVerb::RequestRelease | P2PVerb::ReleaseResponse,
+            ..
+        }
+    )
 }
 
-fn p2p_verb(event: &SwarmEvent, verb: &str) -> bool {
-    matches!(event, SwarmEvent::P2PDirective { verb: v, .. } if v == verb)
+fn p2p_verb(event: &SwarmEvent, verb: P2PVerb) -> bool {
+    matches!(event, SwarmEvent::P2PDirective { verb: v, .. } if *v == verb)
 }
 
-fn stage_done(event: &SwarmEvent, stage: &str) -> bool {
-    matches!(event, SwarmEvent::StageDone { stage: s } if s == stage)
+fn stage_done(event: &SwarmEvent, stage: SwarmStage) -> bool {
+    matches!(event, SwarmEvent::StageDone { stage: s } if *s == stage)
 }
 
 fn record_stage(ctx: &mut SwarmContext, event: &SwarmEvent) {
@@ -169,7 +253,7 @@ fn record_stage(ctx: &mut SwarmContext, event: &SwarmEvent) {
                 "{verb}:{sender}->{recipient}:{path}{}",
                 bead.as_ref().map(|b| format!(":{b}")).unwrap_or_default()
             ));
-            if verb == "review-request" {
+            if *verb == P2PVerb::ReviewRequest {
                 ctx.stage_history.push("p2p:review-request".into());
             }
         }
@@ -214,7 +298,7 @@ fn emit_p2p_judgment(
     } = event
     {
         q.exec(SwarmCmd::EvaluateJudgment {
-            verb: verb.clone(),
+            verb: *verb,
             sender: sender.clone(),
             recipient: recipient.clone(),
             path: path.clone(),
@@ -263,7 +347,7 @@ impl StatechartDefinition for SwarmProgramDef {
                     .assign(record_stage);
                 let staged = node
                     .transition(SwarmState::Execute)
-                    .on(|e| stage_done(e, "dispatch"))
+                    .on(|e| stage_done(e, SwarmStage::Dispatch))
                     .assign(record_stage);
                 let dispatched = node
                     .transition(SwarmState::Dispatch)
@@ -282,7 +366,7 @@ impl StatechartDefinition for SwarmProgramDef {
             .state(SwarmState::Execute, |node| {
                 let p2p_review = node
                     .transition(SwarmState::Review)
-                    .on(|e| p2p_verb(e, "review-request"))
+                    .on(|e| p2p_verb(e, P2PVerb::ReviewRequest))
                     .action(emit_p2p_judgment);
                 let p2p = node
                     .targetless()
@@ -290,7 +374,7 @@ impl StatechartDefinition for SwarmProgramDef {
                     .action(emit_p2p_judgment);
                 let review = node
                     .transition(SwarmState::Review)
-                    .on(|e| stage_done(e, "execute"))
+                    .on(|e| stage_done(e, SwarmStage::Execute))
                     .assign(record_stage);
                 node.on(p2p_review).on(p2p).on(review)
             })
@@ -301,7 +385,7 @@ impl StatechartDefinition for SwarmProgramDef {
                     .assign(record_stage);
                 let to_verify_stage = node
                     .transition(SwarmState::Verify)
-                    .on(|e| stage_done(e, "review"))
+                    .on(|e| stage_done(e, SwarmStage::Review))
                     .assign(record_stage);
                 let back = node
                     .transition(SwarmState::Execute)
@@ -386,7 +470,7 @@ mod tests {
         let m = step(
             &m.model,
             &SwarmEvent::StageDone {
-                stage: "execute".into(),
+                stage: SwarmStage::Execute,
             },
         );
         assert_eq!(m.model.state(), Some(&SwarmState::Review));
@@ -434,7 +518,7 @@ mod tests {
         let m = step(
             &m.model,
             &SwarmEvent::StageDone {
-                stage: "execute".into(),
+                stage: SwarmStage::Execute,
             },
         );
         assert_eq!(m.model.state(), Some(&SwarmState::Review));
@@ -452,7 +536,7 @@ mod tests {
         let m = step(
             &m.model,
             &SwarmEvent::StageDone {
-                stage: "execute".into(),
+                stage: SwarmStage::Execute,
             },
         );
         assert_eq!(m.model.state(), Some(&SwarmState::Review));
@@ -470,7 +554,7 @@ mod tests {
         assert_eq!(m.model.state(), Some(&SwarmState::Dispatch));
 
         let p2p = SwarmEvent::P2PDirective {
-            verb: "intent".into(),
+            verb: P2PVerb::Intent,
             sender: "A".into(),
             recipient: "B".into(),
             path: "src/lib.rs".into(),
@@ -478,11 +562,13 @@ mod tests {
         };
         let m = step(&m.model, &p2p);
         assert_eq!(m.model.state(), Some(&SwarmState::Dispatch));
-        assert!(
-            m.commands
-                .iter()
-                .any(|c| matches!(c, SwarmCmd::EvaluateJudgment { verb, .. } if verb == "intent"))
-        );
+        assert!(m.commands.iter().any(|c| matches!(
+            c,
+            SwarmCmd::EvaluateJudgment {
+                verb: P2PVerb::Intent,
+                ..
+            }
+        )));
         assert!(!m.model.context.p2p_directives_log.is_empty());
 
         let m = step(
@@ -496,7 +582,7 @@ mod tests {
         let m = step(
             &m.model,
             &SwarmEvent::P2PDirective {
-                verb: "intent".into(),
+                verb: P2PVerb::Intent,
                 sender: "B".into(),
                 recipient: "A".into(),
                 path: "src/lib.rs".into(),
@@ -509,6 +595,37 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, SwarmCmd::EvaluateJudgment { .. }))
         );
+    }
+
+    #[test]
+    fn stage_and_verb_parse_and_display() {
+        assert_eq!(
+            "dispatch".parse::<SwarmStage>().unwrap(),
+            SwarmStage::Dispatch
+        );
+        assert_eq!(
+            "execute".parse::<SwarmStage>().unwrap(),
+            SwarmStage::Execute
+        );
+        assert_eq!("review".parse::<SwarmStage>().unwrap(), SwarmStage::Review);
+        assert_eq!("verify".parse::<SwarmStage>().unwrap(), SwarmStage::Verify);
+        assert_eq!("gate".parse::<SwarmStage>().unwrap(), SwarmStage::Gate);
+        assert_eq!(SwarmStage::Dispatch.to_string(), "dispatch");
+
+        assert_eq!("intent".parse::<P2PVerb>().unwrap(), P2PVerb::Intent);
+        assert_eq!(
+            "request-release".parse::<P2PVerb>().unwrap(),
+            P2PVerb::RequestRelease
+        );
+        assert_eq!(
+            "release-response".parse::<P2PVerb>().unwrap(),
+            P2PVerb::ReleaseResponse
+        );
+        assert_eq!(
+            "review-request".parse::<P2PVerb>().unwrap(),
+            P2PVerb::ReviewRequest
+        );
+        assert_eq!(P2PVerb::ReviewRequest.to_string(), "review-request");
     }
 
     #[test]
@@ -595,7 +712,7 @@ mod tests {
         let m = step(
             &m.model,
             &SwarmEvent::StageDone {
-                stage: "execute".into(),
+                stage: SwarmStage::Execute,
             },
         );
         let m = step(
