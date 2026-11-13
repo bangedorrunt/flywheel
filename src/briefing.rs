@@ -384,12 +384,13 @@ impl Briefing {
     }
 }
 
-pub fn assemble(
+pub fn assemble_with_catalog(
     objective: &str,
     world: &World,
     unique_roles: &[String],
     cap: u32,
     catalog: Option<&crate::profile::ProfileCatalog>,
+    wf_catalog: &crate::workflow_catalog::WorkflowCatalog,
 ) -> Briefing {
     let cap = if cap == 0 { DEFAULT_CREW_MAX } else { cap };
     let snap = decide::Snapshot {
@@ -428,9 +429,7 @@ pub fn assemble(
         .collect();
 
     let mut argv = decision.argv.clone();
-    let compose_token = crate::workflow_catalog::WorkflowCatalog::load_layered(None)
-        .unwrap_or_default()
-        .is_compose_token(&decision.primitive);
+    let compose_token = wf_catalog.is_compose_token(&decision.primitive);
     if join {
         argv = vec!["flywheel".into(), "arrive".into(), world.project.clone()];
         if let Some(id) = &world.coalition_id {
@@ -596,8 +595,23 @@ pub fn assemble(
 /// rewrite argv so `--commit` cannot exec invent swarm/join/loop under an
 /// open/loop label (crew-confirm is skipped for open — invent headless
 /// `workflow run wave-swarm` would auto-dispatch).
+/// Ambient entry point: builds the user-tier catalog once and delegates to
+/// [`align_with_session_topology_with_catalog`]. Prefer the `_with_catalog`
+/// variant with an explicit catalog; this wrapper exists so `main.rs` needs
+/// no change while its lease is held elsewhere.
 pub fn align_with_session_topology(b: &mut Briefing, session: &str, sticky_held: bool) {
     let catalog = crate::workflow_catalog::WorkflowCatalog::load_layered(None).unwrap_or_default();
+    align_with_session_topology_with_catalog(b, session, sticky_held, &catalog)
+}
+
+/// Session-topology alignment with an explicit catalog (hermetic tests pass
+/// [`WorkflowCatalog::default`]; the ambient wrapper above is for `main.rs`).
+pub fn align_with_session_topology_with_catalog(
+    b: &mut Briefing,
+    session: &str,
+    sticky_held: bool,
+    catalog: &crate::workflow_catalog::WorkflowCatalog,
+) {
     let session = session.trim();
     if session.is_empty() {
         return;
@@ -641,6 +655,23 @@ pub fn align_with_session_topology(b: &mut Briefing, session: &str, sticky_held:
     if sticky_held {
         rewrite_sticky_held_argv(b, session, &catalog);
     }
+}
+
+/// Ambient entry point: loads the user-tier catalog once per call and
+/// delegates to [`assemble_with_catalog`]. Prefer the `_with_catalog`
+/// variant with an explicit (hermetic or project-aware) catalog; this
+/// wrapper exists so `main.rs` needs no change while its lease is held
+/// elsewhere.
+pub fn assemble(
+    objective: &str,
+    world: &World,
+    unique_roles: &[String],
+    cap: u32,
+    catalog: Option<&crate::profile::ProfileCatalog>,
+) -> Briefing {
+    let wf_catalog =
+        crate::workflow_catalog::WorkflowCatalog::load_layered(None).unwrap_or_default();
+    assemble_with_catalog(objective, world, unique_roles, cap, catalog, &wf_catalog)
 }
 
 /// Invent spawn / compose / join / loop vehicles suppressed under sticky-open.
