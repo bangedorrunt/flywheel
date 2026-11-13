@@ -239,6 +239,34 @@ pub fn reconcile(
             .cloned()
             .unwrap_or_default();
         haves.sort_by(|a, b| a.pin.cmp(&b.pin));
+        if haves.len() > wants.len() {
+            let mut ordered = haves.clone();
+            ordered.sort_by(|a, b| {
+                (if a.idle { 0 } else { 1 }, &a.pin).cmp(&(if b.idle { 0 } else { 1 }, &b.pin))
+            });
+            let n = haves.len() - wants.len();
+            let retire_pins: std::collections::HashSet<String> =
+                ordered.iter().take(n).map(|s| s.pin.clone()).collect();
+            let mut remaining: Vec<&LiveSeat> = haves
+                .iter()
+                .filter(|s| !retire_pins.contains(&s.pin))
+                .copied()
+                .collect();
+            remaining.sort_by(|a, b| a.pin.cmp(&b.pin));
+            for i in 0..wants.len() {
+                let effect = decide_one(wants[i], remaining[i], model_by_env);
+                effects.push((role.clone(), remaining[i].pin.clone(), effect));
+                used_live.insert(remaining[i].pin.clone());
+            }
+            let mut pins: Vec<String> = retire_pins.into_iter().collect();
+            pins.sort();
+            effects.push((
+                role.clone(),
+                pins.first().cloned().unwrap_or_default(),
+                SeatEffect::Retire { pins },
+            ));
+            continue;
+        }
         let paired = wants.len().min(haves.len());
         for i in 0..paired {
             let effect = decide_one(wants[i], haves[i], model_by_env);
@@ -253,18 +281,6 @@ pub fn reconcile(
                     role: role.clone(),
                     count: wants.len() - haves.len(),
                 },
-            ));
-        } else if haves.len() > wants.len() {
-            let mut excess: Vec<&LiveSeat> = haves[paired..].to_vec();
-            excess.sort_by(|a, b| {
-                (if a.idle { 0 } else { 1 }, &a.pin).cmp(&(if b.idle { 0 } else { 1 }, &b.pin))
-            });
-            let n = haves.len() - wants.len();
-            let pins: Vec<String> = excess.iter().take(n).map(|s| s.pin.clone()).collect();
-            effects.push((
-                role.clone(),
-                pins.first().cloned().unwrap_or_default(),
-                SeatEffect::Retire { pins },
             ));
         }
     }
@@ -452,6 +468,26 @@ mod tests {
                 },
                 SeatEffect::Retire {
                     pins: vec!["b".to_string()]
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn seat_reconcile_count_minus_one_retires_idle_even_when_idle_pin_sorts_first() {
+        let live = vec![
+            live("a", "coder", "h", true),
+            live("b", "coder", "h", false),
+        ];
+        let wants = vec![want("coder")];
+        assert_eq!(
+            reconcile(&wants, &live, &argv),
+            vec![
+                SeatEffect::Retire {
+                    pins: vec!["a".to_string()]
+                },
+                SeatEffect::Keep {
+                    pin: "b".to_string()
                 }
             ]
         );
