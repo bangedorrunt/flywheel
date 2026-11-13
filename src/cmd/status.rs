@@ -79,9 +79,14 @@ pub(crate) fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     let mail = crate::cmd::mail::mail_or_die(cfg).ok();
     // Wave11: one world read — ws_label derived inside assemble.
     let snap = crate::snapshot::assemble(cfg, project, crate::doorbell_now_unix());
-    // Wave11 residual: doorbell/facts/integrations still read directly.
-    let ws_label =
-        crate::state::load_spawn_meta(project).unwrap_or_else(|| crate::swarm_label(project));
+    // Wave11 residual: doorbell/facts/integrations still read directly. The
+    // key is canonical, so a stale label never reports or heals a second door.
+    let ws_label = crate::doorbell::canonical_workspace(
+        &crate::state::load_spawn_meta(project).unwrap_or_else(|| crate::swarm_label(project)),
+        &snap.workspace,
+        &snap.workspace_id,
+    )
+    .to_string();
     let actual_by_pane: std::collections::HashMap<String, String> = {
         agents
             .iter()

@@ -205,6 +205,9 @@ pub fn ensure_armed_hosts(cfg: &crate::config::Config) -> anyhow::Result<Vec<Ens
         eprintln!("doorbell hosts: {project} has no swarm workspace yet — attach after spawn");
         return Ok(Vec::new());
     }
+    let snap = crate::snapshot::assemble(cfg, &project, crate::doorbell_now_unix());
+    let workspaces =
+        crate::doorbell::canonical_workspaces(&workspaces, &snap.workspace, &snap.workspace_id);
     let exe = std::env::current_exe()?;
     let state_dir = crate::config::state_dir();
     let home = home_dir().ok();

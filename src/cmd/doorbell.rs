@@ -407,15 +407,23 @@ pub(crate) fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
         return Ok(());
     }
     crate::cmd::spawn::ensure_doorbell_supervisor(cfg, project);
-    let _ = cfg;
     let state_dir = crate::config::state_dir();
+    let snap = crate::snapshot::assemble(cfg, project, crate::doorbell_now_unix());
+    let live_label = snap.workspace.clone();
+    let live_id = snap.workspace_id.clone();
+    let workspaces = crate::cmd::spawn::doorbell_project_workspaces(project);
     let unpinned = crate::unpinned_registry_names(&crate::state::load_spawn_registry(project));
     let unpinned_seg = if unpinned.is_empty() {
         String::new()
     } else {
         format!(" unpinned={}", unpinned.join(","))
     };
-    for ws in crate::cmd::spawn::doorbell_project_workspaces(project) {
+    for ws in canonical_workspaces(&workspaces, &live_label, &live_id) {
+        let alias = workspaces
+            .iter()
+            .find(|raw| raw.as_str() != ws && doorbell_host_key(raw, &live_label, &live_id) == ws)
+            .map(|raw| format!(" label={raw}"))
+            .unwrap_or_default();
         let pid = crate::doorbell::dispatcher_pid(&state_dir, &ws);
         let alive = pid.is_some_and(crate::doorbell::pid_alive);
         let wake =
@@ -432,7 +440,7 @@ pub(crate) fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
         let wake_brain =
             wake_brain_status_segment(doorbell_rt::wake_brain::read_snapshot(&state_dir, &ws));
         println!(
-            "{project}/{ws}: dispatcher {} {last}{}{}{}{wake_brain}",
+            "{project}/{ws}{alias}: dispatcher {} {last}{}{}{}{wake_brain}",
             if alive { "up" } else { "DOWN" },
             {
                 let pins = crate::doorbell::read_unanswered(&crate::doorbell::unanswered_file(
@@ -611,6 +619,7 @@ pub(crate) fn cmd_doorbell_start(cfg: &Config, project: &str) -> Result<()> {
     if workspaces.is_empty() && !live_id.is_empty() && !live_label.is_empty() {
         workspaces.push(live_label.clone());
     }
+    let workspaces = canonical_workspaces(&workspaces, &live_label, &live_id);
     let mut arm: Vec<String> = Vec::new();
     for ws in &workspaces {
         arm.push("--host".to_string());
@@ -642,10 +651,9 @@ pub(crate) fn cmd_doorbell_start(cfg: &Config, project: &str) -> Result<()> {
         eprintln!("doorbell: absent (no swarm workspace yet — attach after spawn)");
         return Ok(());
     }
-    for ws in workspaces {
-        let host_ws = doorbell_host_key(&ws, &live_label, &live_id);
+    for ws in &workspaces {
         let action =
-            crate::doorbell::ensure_running(&exe, &crate::config::state_dir(), host_ws, project)
+            crate::doorbell::ensure_running(&exe, &crate::config::state_dir(), ws, project)
                 .with_context(|| format!("doorbell start {project}/{ws}"))?;
         println!("{project}/{ws}: {action:?}");
     }
@@ -683,11 +691,15 @@ fn binary_stamp(path: &std::path::Path) -> Option<(u64, std::time::SystemTime)> 
 /// started with the label retires with `workspace-gone` even though the
 /// panes are live; map the label to the snapshot's ID for the local host.
 fn doorbell_host_key<'a>(label: &'a str, live_label: &'a str, live_id: &'a str) -> &'a str {
-    if !live_id.is_empty() && (live_label.is_empty() || live_label == label) {
-        live_id
-    } else {
-        label
-    }
+    crate::doorbell::canonical_workspace(label, live_label, live_id)
+}
+
+/// One workspace, one key: `workspaces` collapsed to their canonical
+/// dispatcher keys (the live session id for a label), order preserved.
+/// Registering, starting, stopping, healing and reporting all go through
+/// this, so a label and its id never act as two workspaces (bd-g9hqu).
+fn canonical_workspaces(workspaces: &[String], live_label: &str, live_id: &str) -> Vec<String> {
+    crate::doorbell::canonical_workspaces(workspaces, live_label, live_id)
 }
 
 pub(crate) fn cmd_doorbell_stop(cfg: &Config, project: &str, workspace: &str) -> Result<()> {
@@ -710,6 +722,9 @@ pub(crate) fn cmd_doorbell_stop(cfg: &Config, project: &str, workspace: &str) ->
     for ws in workspaces {
         let host_ws = doorbell_host_key(&ws, &live_label, &live_id);
         crate::doorbell::stop(&crate::config::state_dir(), host_ws);
+        if host_ws != ws {
+            crate::doorbell::stop(&crate::config::state_dir(), &ws);
+        }
         println!("{project}/{ws}: stopped");
     }
     Ok(())
@@ -3322,5 +3337,167 @@ mod single_writer_tests {
             ws.contains("The end-state is one RAM owner"),
             "Option A: speech must name one RAM owner as the end-state"
         );
+    }
+}
+
+#[cfg(test)]
+mod doorbell_canonical_workspace_tests {
+    use super::*;
+    use crate::doorbell::{DoorbellState, state_file, write_state};
+
+    const LABEL: &str = "flywheel-flywheel-rk-adr0019-3pi-1";
+    const SESSION: &str = "session:01a1d257-9f7d-4c0a-9d1b-8c1e4f2a6b30";
+
+    /// Dispatcher registry + fake process table: one `<ws>.state.json` per
+    /// workspace and the pids that answer `alive`. The ids are the live rex
+    /// session id and its project label, exactly as `ps` showed them.
+    struct FakeDispatchRegistry {
+        dir: std::path::PathBuf,
+        alive: std::collections::BTreeSet<u32>,
+    }
+
+    impl FakeDispatchRegistry {
+        fn new(tag: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("fw-dispatch-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("doorbell")).unwrap();
+            Self {
+                dir,
+                alive: std::collections::BTreeSet::new(),
+            }
+        }
+
+        fn spawn_dispatcher(&mut self, ws: &str, pid: u32) {
+            write_state(
+                &state_file(&self.dir, ws),
+                &DoorbellState {
+                    pid: Some(pid),
+                    project: Some("flywheel".to_string()),
+                    generation: None,
+                },
+            )
+            .expect("write dispatcher record");
+            self.alive.insert(pid);
+        }
+
+        /// Live dispatchers for `keys`, in registry order.
+        fn live(&self, keys: &[String]) -> Vec<(String, u32)> {
+            keys.iter()
+                .filter_map(|ws| {
+                    let pid = crate::doorbell::dispatcher_pid(&self.dir, ws)?;
+                    self.alive.contains(&pid).then(|| (ws.clone(), pid))
+                })
+                .collect()
+        }
+
+        fn stop(&mut self, ws: &str) {
+            if let Some(pid) = crate::doorbell::dispatcher_pid(&self.dir, ws) {
+                self.alive.remove(&pid);
+            }
+            let _ = std::fs::remove_file(state_file(&self.dir, ws));
+        }
+    }
+
+    impl Drop for FakeDispatchRegistry {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// bd-g9hqu: a start by session id followed by a start by the old label
+    /// must leave ONE dispatcher. The raw (uncanonicalised) pair is the
+    /// mutation witness: it reproduces the second door.
+    #[test]
+    fn start_by_session_id_then_by_label_leaves_one_dispatcher() {
+        let mut reg = FakeDispatchRegistry::new("start");
+        let requested = vec![SESSION.to_string(), LABEL.to_string()];
+        let keys = canonical_workspaces(&requested, LABEL, SESSION);
+        assert_eq!(
+            keys,
+            vec![SESSION.to_string()],
+            "one workspace, one key: the label folds into the session id"
+        );
+        for (idx, ws) in keys.iter().enumerate() {
+            reg.spawn_dispatcher(ws, 700 + idx as u32);
+        }
+        assert_eq!(
+            reg.live(&keys).len(),
+            1,
+            "second start is a no-op on the live key, never a second door"
+        );
+        assert_eq!(
+            reg.live(&requested).len(),
+            1,
+            "the label has no door of its own"
+        );
+        assert_eq!(
+            requested.len(),
+            2,
+            "mutation keying by raw label reproduces two dispatchers: {requested:?}"
+        );
+    }
+
+    /// Stop by label must stop the one dispatcher, including a stale record
+    /// left under the label by the pre-fix binary.
+    #[test]
+    fn stop_by_label_stops_the_one_dispatcher() {
+        let mut reg = FakeDispatchRegistry::new("stop");
+        reg.spawn_dispatcher(SESSION, 701);
+        reg.spawn_dispatcher(LABEL, 76310);
+
+        let label = vec![LABEL.to_string()];
+        let key = canonical_workspaces(&label, LABEL, SESSION);
+        for ws in &key {
+            reg.stop(ws);
+        }
+        for ws in &label {
+            if !key.contains(ws) {
+                reg.stop(ws);
+            }
+        }
+        assert!(
+            reg.live(&[SESSION.to_string(), LABEL.to_string()])
+                .is_empty(),
+            "stop by label kills the canonical dispatcher AND the stale label record"
+        );
+    }
+
+    /// Heal never spawns a second door for the same canonical workspace: the
+    /// label's dead record is not a heal target when the session id is live.
+    #[test]
+    fn heal_never_spawns_a_second_for_the_same_canonical_key() {
+        let mut reg = FakeDispatchRegistry::new("heal");
+        reg.spawn_dispatcher(SESSION, 702);
+        let listed = vec![LABEL.to_string(), SESSION.to_string()];
+
+        let heal: Vec<String> = canonical_workspaces(&listed, LABEL, SESSION)
+            .into_iter()
+            .filter(|ws| reg.live(std::slice::from_ref(ws)).is_empty())
+            .collect();
+        assert!(heal.is_empty(), "one door stands: {heal:?}");
+
+        let raw_heal: Vec<String> = listed
+            .iter()
+            .filter(|ws| reg.live(std::slice::from_ref(ws)).is_empty())
+            .cloned()
+            .collect();
+        assert_eq!(
+            raw_heal,
+            vec![LABEL.to_string()],
+            "mutation keying by raw label heals the dead label back beside the live one"
+        );
+    }
+
+    /// Report names the canonical key and the label it folded, once.
+    #[test]
+    fn report_names_the_canonical_key_and_its_label() {
+        let listed = vec![LABEL.to_string(), SESSION.to_string()];
+        let keys = canonical_workspaces(&listed, LABEL, SESSION);
+        assert_eq!(keys.len(), 1, "one row per workspace: {keys:?}");
+        let alias = listed.iter().find(|raw| {
+            raw.as_str() != keys[0] && doorbell_host_key(raw, LABEL, SESSION) == keys[0]
+        });
+        assert_eq!(alias.map(String::as_str), Some(LABEL));
     }
 }
