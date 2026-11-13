@@ -151,6 +151,14 @@ All six built-ins default harness **omp**. Per-role models live in `profiles.tom
 
 Interactive TTY `steer`, `workflow run --execute`, and managed mode commands prompt before dispatch — inferred crew counts (editable), per-role model menus w/ cost/caps from the registry, squad/bare-harness shape, stage-chain preview, go/no-go. Skipped by `--json`, `--yes`, or an explicit `--crew`; non-TTY dispatch is byte-identical. Shared prompt module `src/steer_brief.rs` (`source` fork only, `workflow_briefing_context` extracts `objective`/`goal`/`target` from `--inputs`); prompt logic is pure over injected IO.
 
+## Captain steering live crews
+
+The verb-per-step crib is the flywheel skill's "Captain steering crib" (one copy). Load-bearing rules:
+
+- Brief with `flywheel crew prompt` or `flywheel assign`; read crew state from `flywheel --robot-status`. Hand-offs arrive as mail plus a doorbell wake, so the captain does not poll panes or git.
+- Crews may gate and close their own beads. The captain re-verifies after close on a clean export. A correction lands as a new commit plus a `br comments add` on the closed bead, never a reopen-and-rewrite.
+- Shared-branch history rewrites are refused by the operator's dcg hook.
+
 ## Hidden leaves
 
 Never invoke `__*` except documented `__wait-output`.
