@@ -114,6 +114,8 @@ pass.
   reachable, every reachable leaf can reach its goal. Guards count as enabled
   and data is not modelled, so a pass is not a proof; `--export-tla` text is
   topology-only and no model checker runs. `scripts/clean-proof.sh` gates on it.
+- **Standing preferences (ADR-0022 D6).** `flywheel prefer <role.field>=<value> [--project <p>]` +
+  `--list [--json]` / `--forget <role.field>`; project beats always, exact role beats `*`.
 - **Skill sync.** CLI change → `Commands` enum + `--robot-capabilities` + this
   file's critical list + `~/.agents/skills/flywheel/SKILL.md` §5.
 

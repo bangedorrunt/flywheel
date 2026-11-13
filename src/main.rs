@@ -79,6 +79,7 @@ mod phase_contracts;
 mod plan_fence;
 mod plane_route;
 mod preflight;
+mod preferences;
 mod principles;
 mod private_fs;
 mod profile;
@@ -150,7 +151,8 @@ use cmd::{
     cmd_crew, cmd_doorbell_digest, cmd_doorbell_gc, cmd_doorbell_inject, cmd_doorbell_introduce,
     cmd_doorbell_re_inject, cmd_doorbell_roster, cmd_doorbell_start, cmd_doorbell_status,
     cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_history, cmd_internal_doorbell, cmd_judgment,
-    cmd_ledger, cmd_mail, cmd_memory, cmd_models, cmd_peer, cmd_policy, cmd_principles, cmd_resume,
+    cmd_ledger, cmd_mail, cmd_memory, cmd_models, cmd_peer, cmd_policy, cmd_prefer, cmd_principles,
+    cmd_resume,
     cmd_runs, cmd_ship, cmd_slot, cmd_stack, cmd_stage, cmd_standing_orders, cmd_timeline,
     cmd_work, cmd_worktree, cmd_xproj,
     coalition::cmd_coalition,
@@ -1448,6 +1450,24 @@ enum Commands {
     Policy {
         #[command(subcommand)]
         cmd: PolicyCmd,
+    },
+    /// Standing preferences (ADR-0022 D6): set, list, and forget
+    /// role.field values. Project scope via --project, else always.
+    Prefer {
+        /// assignment ROLE.FIELD=VALUE (sets a preference)
+        assignment: Option<String>,
+        /// list preferences
+        #[arg(long)]
+        list: bool,
+        /// forget ROLE.FIELD
+        #[arg(long)]
+        forget: Option<String>,
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+        /// project scope (omit for always)
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Environment + toolchain health check
     Deps {
@@ -2955,6 +2975,7 @@ fn main() {
             "commands": [
                 "init spawn add list status decide rebind recover",
             "send interrupt view output watch attach kill",
+            "prefer <role.field>=<value> [--project <p>] | prefer --list [--json] | prefer --forget <role.field> [--project <p>] (ADR-0022 D6: standing preferences — project beats always, exact role beats *; set also records a chie lesson)",
             "crew preview|control|prompt (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker)",
             "peer intent|request-release|release-response|review-request (structured P2P directives with reactive ⟦p2p:<verb>⟧ wake dispatch)",
             "captain watch <project> [--interval N] [--json] [--as <pin>] [--stall --stall-minutes N] [--preflight --preflight-mode steer|loop|workflow|cron] (bd-captain-watch-poll-exit-bbwm: harness resume on the captain inbox. The push is escalate@1 mail from the supervisor. This command blocks on that inbox's water and exits with a preview when strictly-newer mail lands; --stall also exits 0 when every bead is closed, or exits 3 when no pane is working and no commit landed for the threshold with work remaining; an unreadable fleet never alarms; --preflight adds an arm that exits 4 with the FIRST failing check and its remedy line, checked at arm time and each poll. One shot: re-arm after each resume)",
@@ -3554,6 +3575,19 @@ fn main() {
         Some(Commands::Guards) => cmd_guards(&cfg),
         Some(Commands::Deps { ensure }) => cmd_deps(&cfg, *ensure),
         Some(Commands::Policy { cmd }) => cmd_policy(&cfg, cmd),
+        Some(Commands::Prefer {
+            assignment,
+            list,
+            forget,
+            json,
+            project,
+        }) => cmd_prefer(
+            assignment.as_deref(),
+            *list,
+            forget.as_deref(),
+            *json,
+            project.as_deref(),
+        ),
         Some(Commands::Integration { kind, out }) => {
             cmd_integration(kind.as_deref(), out.as_deref())
         }
