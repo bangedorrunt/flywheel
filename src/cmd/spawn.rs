@@ -6542,3 +6542,315 @@ mod plan_gate_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod resolver_property_tests {
+    use crate::swarm_plan::{FieldStatus, Provenance};
+    use std::collections::BTreeMap;
+
+    const HARNESSES: [&str; 8] = [
+        "opencode",
+        "pi",
+        "grok",
+        "codex",
+        "claude",
+        "fx",
+        "antigravity",
+        "gemini",
+    ];
+
+    fn herm_registry(with_slot: bool) -> crate::models::ModelRegistry {
+        let mut models = BTreeMap::new();
+        for key in ["a/m", "b/m"] {
+            models.insert(
+                key.to_string(),
+                crate::models::ModelEntry {
+                    caps: vec![],
+                    fallback: None,
+                    ..Default::default()
+                },
+            );
+        }
+        let mut slots = BTreeMap::new();
+        if with_slot {
+            slots.insert(
+                "standard".to_string(),
+                crate::models::SlotSpec {
+                    model: "s/m".to_string(),
+                    ..Default::default()
+                },
+            );
+        }
+        crate::models::ModelRegistry {
+            models,
+            slots,
+            user_keys: Default::default(),
+            defaults: None,
+        }
+    }
+
+    fn test_prefs(pairs: &[(&str, &str)]) -> crate::preferences::PreferenceSet {
+        let mut prefs = crate::preferences::PreferenceSet::new();
+        for (key, value) in pairs {
+            prefs.set(
+                key.parse().expect("pref key parses"),
+                value.to_string(),
+                crate::preferences::Scope::Always,
+            );
+        }
+        prefs
+    }
+
+    fn bare_item(kind: &str) -> crate::SpawnItem {
+        crate::SpawnItem {
+            short: kind.to_string(),
+            count: 1,
+            kind: Some(kind.to_string()),
+            profile: None,
+        }
+    }
+
+    /// V4: every bare harness carries the planned model iff its status is honored.
+    #[test]
+    fn resolver_v4_model_bare_matrix() {
+        for h in HARNESSES {
+            let reg = herm_registry(false);
+            let cfg = crate::config::Config::default();
+            let catalog = crate::profile::ProfileCatalog::default();
+            let prefs = crate::preferences::PreferenceSet::new();
+            let items = vec![bare_item(h)];
+            let plan = super::build_dry_run_plan(
+                &cfg,
+                &items,
+                &catalog,
+                &reg,
+                "totally-unknown-9z",
+                "",
+                &prefs,
+                "probe",
+            )
+            .expect("plan builds");
+            let f = plan.seats[0].model.as_ref().expect("model field");
+            assert_eq!(f.from, Provenance::User, "user ask keeps User on {h}");
+            let ask =
+                super::prefer_bare_inputs(&prefs, &items[0], "probe", "totally-unknown-9z", "");
+            let kind = crate::prefer_kind(&cfg, &items[0], &catalog, &reg, &prefs, "probe")
+                .expect("kind resolves");
+            assert_eq!(kind, h, "explicit kind wins on {h}");
+            assert_eq!(
+                kind, plan.seats[0].harness,
+                "plan and launch agree on harness {h}"
+            );
+            let (m, _) = ask.model.clone().expect("user ask present");
+            assert_eq!(m, f.value, "one resolution feeds plan and launch on {h}");
+            let (eff_model, eff_provider) = ask
+                .model
+                .map(|(m, _)| (m, ask.provider))
+                .unwrap_or_default();
+            let (args, env) = crate::bare_model_launch(&kind, &eff_model, &eff_provider, None)
+                .expect("launch builds");
+            let honoured = matches!(f.status, FieldStatus::Honored);
+            let carried =
+                args.iter().any(|a| a == &f.value) || env.as_deref() == Some(f.value.as_str());
+            assert_eq!(
+                honoured, carried,
+                "V4 no false green for model on {h}: {f:?} vs ({args:?}, {env:?})"
+            );
+        }
+    }
+
+    /// V4: every bare harness carries the preferred effort iff its status is honored.
+    #[test]
+    fn resolver_v4_effort_bare_matrix() {
+        for h in HARNESSES {
+            let reg = herm_registry(false);
+            let cfg = crate::config::Config::default();
+            let catalog = crate::profile::ProfileCatalog::default();
+            let key = format!("{h}.effort");
+            let prefs = test_prefs(&[(key.as_str(), "slow")]);
+            let items = vec![bare_item(h)];
+            let plan =
+                super::build_dry_run_plan(&cfg, &items, &catalog, &reg, "a/m", "", &prefs, "probe")
+                    .expect("plan builds");
+            let f = plan.seats[0].effort.as_ref().expect("effort field");
+            assert_eq!(
+                f.from,
+                Provenance::Preference,
+                "preference fills effort on {h}"
+            );
+            assert_eq!(f.value, "slow", "preference value flows on {h}");
+            let ask = super::prefer_bare_inputs(&prefs, &items[0], "probe", "a/m", "");
+            let kind = crate::prefer_kind(&cfg, &items[0], &catalog, &reg, &prefs, "probe")
+                .expect("kind resolves");
+            let (eff_model, eff_provider) = ask
+                .model
+                .map(|(m, _)| (m, ask.provider))
+                .unwrap_or_default();
+            let (args, _) = crate::bare_model_launch(
+                &kind,
+                &eff_model,
+                &eff_provider,
+                ask.effort.as_ref().map(|(e, _)| e.as_str()),
+            )
+            .expect("launch builds");
+            let honoured = matches!(f.status, FieldStatus::Honored);
+            let carried = args.iter().any(|a| a == "slow");
+            assert_eq!(
+                honoured, carried,
+                "V4 no false green for effort on {h}: {f:?} vs {args:?}"
+            );
+        }
+    }
+
+    /// V4: the adapter reports honored for a mode iff its argv carries it.
+    #[test]
+    fn resolver_v4_mode_table() {
+        for h in HARNESSES {
+            for mode in ["read-only", "workspace-write"] {
+                let (args, delivery) = crate::headless::mode_launch_args(h, mode);
+                let f =
+                    crate::swarm_plan::mode_field(h, Some((mode.to_string(), Provenance::User)))
+                        .expect("mode field");
+                let honoured = matches!(f.status, FieldStatus::Honored);
+                let carried =
+                    !args.is_empty() && matches!(delivery, crate::headless::ModeDelivery::Honored);
+                assert_eq!(
+                    honoured, carried,
+                    "V4 mode {h}/{mode}: {f:?} vs ({args:?}, {delivery:?})"
+                );
+            }
+        }
+        assert_eq!(
+            crate::headless::mode_launch_args("grok", "read-only").0,
+            vec!["--permission-mode".to_string(), "plan".to_string()]
+        );
+        assert_eq!(
+            crate::headless::mode_launch_args("pi", "read-only").0,
+            vec!["--tools".to_string(), "read,grep,find,ls".to_string()]
+        );
+    }
+
+    /// V4: the adapter reports honored for a phase iff its argv carries a native mechanic.
+    #[test]
+    fn resolver_v4_phase_table() {
+        for h in HARNESSES {
+            for phase in ["implement", "plan", "review"] {
+                let (args, degraded) = crate::headless::phase_launch_args(h, phase);
+                let f =
+                    crate::swarm_plan::phase_field(h, Some((phase.to_string(), Provenance::User)))
+                        .expect("phase field");
+                let honoured = matches!(f.status, FieldStatus::Honored);
+                assert_eq!(
+                    honoured,
+                    !args.is_empty() && !degraded,
+                    "V4 phase {h}/{phase}: {f:?} vs ({args:?}, {degraded})"
+                );
+            }
+        }
+        assert_eq!(
+            crate::headless::phase_launch_args("opencode", "implement").0,
+            vec!["--agent".to_string(), "build".to_string()]
+        );
+        assert_eq!(
+            crate::headless::phase_launch_args("antigravity", "plan").0,
+            vec!["--mode".to_string(), "plan".to_string()]
+        );
+    }
+
+    /// V7: user beats preference beats profile beats slot. Stage and Jev have
+    /// no representation in the spawn path (no inputs carry them), so there
+    /// is nothing below user/preference that could demote them — see REPORT.
+    #[test]
+    fn resolver_v7_precedence_table() {
+        fn check(
+            cfg: &crate::config::Config,
+            catalog: &crate::profile::ProfileCatalog,
+            reg: &crate::models::ModelRegistry,
+            prefs: &crate::preferences::PreferenceSet,
+            items: &[crate::SpawnItem],
+            user: &str,
+            expect: &str,
+            expect_from: Provenance,
+            case: &str,
+        ) {
+            let plan =
+                super::build_dry_run_plan(cfg, items, catalog, reg, user, "", prefs, "probe")
+                    .expect("plan builds");
+            let f = plan.seats[0].model.as_ref().expect("model field");
+            assert_eq!(f.value, expect, "V7 value: {case}");
+            assert_eq!(f.from, expect_from, "V7 provenance: {case}");
+        }
+        let cfg = crate::config::Config::default();
+        let mut catalog = crate::profile::ProfileCatalog::default();
+        catalog.profiles.insert(
+            "coder".to_string(),
+            crate::profile::Profile {
+                harness: "pi".to_string(),
+                model: "b/m".to_string(),
+                ..Default::default()
+            },
+        );
+        let reg = herm_registry(true);
+        let coder = || crate::SpawnItem {
+            short: "coder".to_string(),
+            count: 1,
+            kind: None,
+            profile: Some("coder".to_string()),
+        };
+        check(
+            &cfg,
+            &catalog,
+            &reg,
+            &test_prefs(&[("pi.model", "a/m")]),
+            &[bare_item("pi")],
+            "b/m",
+            "b/m",
+            Provenance::User,
+            "user beats preference and slot",
+        );
+        check(
+            &cfg,
+            &catalog,
+            &reg,
+            &test_prefs(&[("pi.model", "a/m")]),
+            &[bare_item("pi")],
+            "",
+            "a/m",
+            Provenance::Preference,
+            "preference beats slot",
+        );
+        check(
+            &cfg,
+            &catalog,
+            &reg,
+            &test_prefs(&[]),
+            &[bare_item("pi")],
+            "",
+            "s/m",
+            Provenance::Slot,
+            "slot wins with no user or preference",
+        );
+        check(
+            &cfg,
+            &catalog,
+            &reg,
+            &test_prefs(&[("coder.model", "a/m")]),
+            &[coder()],
+            "",
+            "a/m",
+            Provenance::Preference,
+            "preference beats profile",
+        );
+        check(
+            &cfg,
+            &catalog,
+            &reg,
+            &test_prefs(&[]),
+            &[coder()],
+            "",
+            "b/m",
+            Provenance::Profile,
+            "profile wins with no user or preference",
+        );
+    }
+}
