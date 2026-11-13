@@ -92,6 +92,7 @@ mod retry;
 mod rot;
 mod run_log;
 mod run_state_recorder;
+mod seat_binder;
 mod self_watch;
 mod signoff;
 mod snapshot;
