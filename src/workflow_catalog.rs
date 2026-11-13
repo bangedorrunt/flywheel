@@ -900,6 +900,9 @@ fn absorb_workflow_steps(name: &str, steps: &[LegacyStep]) -> (Workflow, Vec<Map
                         assignee: to.clone(),
                         spec,
                         channel: None,
+                        await_: None,
+                        no_claim_timeout: 600,
+                        result_timeout: None,
                     },
                 });
             }
@@ -1286,6 +1289,9 @@ msg = "legacy triage"
                         ..Default::default()
                     },
                     channel: None,
+                    await_: None,
+                    no_claim_timeout: 600,
+                    result_timeout: None,
                 },
             }],
         }

@@ -15,7 +15,10 @@
 //! - a `call_workflow` child is driven recursively with a deterministic child
 //!   run id, so a restart re-attaches instead of opening a second child;
 //! - an approval park has no resolution loop here, so it fails the body loudly
-//!   instead of hanging.
+//!   instead of hanging;
+//! - an `await: result` dispatch has no job watcher here, so its WatchJob
+//!   fails the body loudly instead of hanging (`workflow lint` rejects
+//!   `await: result` before a body can reach this arm).
 
 use std::sync::Arc;
 
@@ -302,6 +305,19 @@ async fn drive_linear(
                     {
                         eprintln!("durable body {run_id}: detached spawn failed: {e:#}");
                     }
+                }
+                RunEffect::WatchJob { node, job_id } => {
+                    // No bus handle on this door: an in-process body cannot
+                    // resolve the job's terminal, so fail loud and typed —
+                    // never park past a wake that cannot come (bd-ge1zo 1b).
+                    return failed(
+                        format!(
+                            "dispatch_job await: result needs a toron host; \
+                             flywheel in-process bodies cannot watch job {job_id} \
+                             for step {node}"
+                        ),
+                        Some(node),
+                    );
                 }
                 RunEffect::ParkUntil { until_ms, .. } => {
                     // A spawn emits StartSpawn and its deadline park together.
@@ -777,6 +793,79 @@ mod tests {
             1,
             "a settled spawn is never relaunched"
         );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// bd-ge1zo slice 1b: an `await: result` dispatch reaches WatchJob and
+    /// fails loud and typed. An in-process body has no job watcher, so it
+    /// never parks past a wake that cannot come.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_body_watch_job_fails_typed() {
+        use toron_core::index::schema;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let db = std::env::temp_dir().join(format!(
+            "fw-durable-watch-{nanos}-{}.sqlite",
+            std::process::id()
+        ));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let store = toron_core::index::workflow_effects::WorkflowEffectStore::new(pool);
+
+        let wf = toron_workflow::schema::parse_workflow(
+            "name: watch-body\nsteps:\n  - name: j\n    action: dispatch_job\n    assignee: x\n    spec: { task: hi }\n    await: result\n    result_timeout: 60\n",
+        )
+        .expect("parse dispatch await");
+
+        // The publication receipt: the leaf reports the 43001 id, the fold
+        // records it and emits the WatchJob this test exercises.
+        let runner: toron_workflow::engine::AsyncEffectRunner =
+            std::sync::Arc::new(|_inv: &toron_workflow::engine::ActionInvocation| {
+                Box::pin(async move {
+                    Ok(serde_json::json!({
+                        "ok": true,
+                        "job_id": "job-1",
+                        "published": true
+                    }))
+                })
+                    as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<Output = anyhow::Result<serde_json::Value>>
+                                + Send,
+                        >,
+                    >
+            });
+        let seams = BodySeams {
+            leaf: LeafSeams {
+                async_runner: Some(runner),
+                sync_runner: None,
+                verify_sink: toron_workflow::engine::VerifySink::default(),
+                journal_mode: toron_workflow::engine::EffectJournalMode::Recording,
+            },
+            launcher: None,
+            spawn_resolver: None,
+            resolve_child: None,
+        };
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            drive(&store, "watch-body-1", &wf, serde_json::json!({}), &seams),
+        )
+        .await
+        .expect("a watch refusal must fail fast, never hang");
+        let BodyOutcome::Failed { error, step } = outcome else {
+            panic!("an in-process body cannot watch jobs: {outcome:?}");
+        };
+        assert!(
+            error.contains("cannot watch"),
+            "typed refusal names the missing watcher: {error}"
+        );
+        assert_eq!(step.as_deref(), Some("j"));
         let _ = std::fs::remove_file(&db);
     }
 

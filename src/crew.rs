@@ -560,13 +560,21 @@ fn rewrite_action(action: &Action, aliases: &BTreeMap<String, String>) -> Action
             spec,
             assignee,
             channel,
+            await_,
+            no_claim_timeout,
+            result_timeout,
         } => {
             let mut spec = spec.clone();
             spec.profile = rewrite_profile(&spec.profile, aliases);
+            // A rebuild is not a fresh dispatch: keep the author's await
+            // bounds exactly as written (bd-ge1zo slice 1b).
             Action::DispatchJob {
                 spec,
                 assignee: assignee.clone(),
                 channel: channel.clone(),
+                await_: *await_,
+                no_claim_timeout: *no_claim_timeout,
+                result_timeout: *result_timeout,
             }
         }
         Action::Parallel { over, each } => Action::Parallel {
@@ -595,7 +603,12 @@ fn rewrite_action(action: &Action, aliases: &BTreeMap<String, String>) -> Action
             over: over.clone(),
             each: Box::new(rewrite_step(each, aliases)),
         },
-        Action::Loop { max, min, until, body } => Action::Loop {
+        Action::Loop {
+            max,
+            min,
+            until,
+            body,
+        } => Action::Loop {
             max: max.clone(),
             min: min.clone(),
             until: until.clone(),
@@ -708,7 +721,12 @@ pub fn resolve_crew_fanouts(workflow: &Workflow, plan: &CrewPlan) -> Workflow {
                 over: over.clone(),
                 each: Box::new(resolve_step(each, plan)),
             },
-            Action::Loop { max, min, until, body } => Action::Loop {
+            Action::Loop {
+                max,
+                min,
+                until,
+                body,
+            } => Action::Loop {
                 max: max.clone(),
                 min: min.clone(),
                 until: until.clone(),
@@ -1204,6 +1222,9 @@ fn build_part_step(
                         ..Default::default()
                     },
                     channel: None,
+                    await_: None,
+                    no_claim_timeout: 600,
+                    result_timeout: None,
                 },
             ),
             ComposePart::StageFirst { stage } | ComposePart::PhaseStage { stage, phase: _ } => {
@@ -1229,6 +1250,9 @@ fn build_part_step(
                             ..Default::default()
                         },
                         channel: None,
+                        await_: None,
+                        no_claim_timeout: 600,
+                        result_timeout: None,
                     },
                 )
             }
@@ -1264,6 +1288,9 @@ fn build_part_step(
                             ..Default::default()
                         },
                         channel: None,
+                        await_: None,
+                        no_claim_timeout: 600,
+                        result_timeout: None,
                     },
                 )
             }
@@ -1976,7 +2003,8 @@ steps:
             panic!("expected loop");
         };
         assert_eq!(min.as_deref(), Some("2"));
-        let aliases = std::collections::BTreeMap::from([("@coder".to_string(), "@reviewer".to_string())]);
+        let aliases =
+            std::collections::BTreeMap::from([("@coder".to_string(), "@reviewer".to_string())]);
         let rewritten = apply_role_aliases(&wf, &aliases);
         let Action::Loop { min, max, .. } = &rewritten.steps[0].action else {
             panic!("expected loop after alias rewrite");
@@ -1989,6 +2017,86 @@ steps:
             panic!("expected loop after fanout resolve");
         };
         assert_eq!(min.as_deref(), Some("2"), "fanout resolve keeps min");
+    }
+
+    /// Rebuilds preserve the dispatch await bounds (ADR-0021 D4.1, bd-ge1zo
+    /// slice 1b): an aliased or fanned-out `dispatch_job await: result`
+    /// keeps `await_`, `no_claim_timeout` and `result_timeout`, not the
+    /// fresh-dispatch defaults.
+    #[test]
+    fn crew_dispatch_await_preserved() {
+        use toron_workflow::schema::{Action, DispatchAwait};
+        let wf = toron_workflow::schema::parse_workflow(
+            r#"
+name: t
+trigger:
+  type: webhook
+steps:
+  - name: j
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@coder", task: hi }
+    await: result
+    no_claim_timeout: 300
+    result_timeout: 60
+"#,
+        )
+        .expect("parse dispatch await");
+        let aliases =
+            std::collections::BTreeMap::from([("coder".to_string(), "reviewer".to_string())]);
+        let rewritten = apply_role_aliases(&wf, &aliases);
+        let Action::DispatchJob {
+            spec,
+            await_,
+            no_claim_timeout,
+            result_timeout,
+            ..
+        } = &rewritten.steps[0].action
+        else {
+            panic!("expected dispatch after alias rewrite");
+        };
+        assert_eq!(
+            spec.profile.as_deref(),
+            Some("@reviewer"),
+            "alias still rewrites the profile"
+        );
+        assert!(
+            matches!(await_, Some(DispatchAwait::Result)),
+            "alias rewrite keeps await: {rewritten:?}"
+        );
+        assert_eq!(
+            *no_claim_timeout, 300,
+            "alias rewrite keeps no_claim_timeout"
+        );
+        assert_eq!(
+            *result_timeout,
+            Some(60),
+            "alias rewrite keeps result_timeout"
+        );
+        let plan = plan_crew(&wf);
+        let resolved = resolve_crew_fanouts(&wf, &plan);
+        let Action::DispatchJob {
+            await_,
+            no_claim_timeout,
+            result_timeout,
+            ..
+        } = &resolved.steps[0].action
+        else {
+            panic!("expected dispatch after fanout resolve");
+        };
+        assert!(
+            matches!(await_, Some(DispatchAwait::Result)),
+            "fanout resolve keeps await: {resolved:?}"
+        );
+        assert_eq!(
+            *no_claim_timeout, 300,
+            "fanout resolve keeps no_claim_timeout"
+        );
+        assert_eq!(
+            *result_timeout,
+            Some(60),
+            "fanout resolve keeps result_timeout"
+        );
     }
 
     /// bd-adv4: a `crew: auto` step riding the profile-pick input template
@@ -3465,6 +3573,9 @@ steps:
                     ..Default::default()
                 },
                 channel: None,
+                await_: None,
+                no_claim_timeout: 600,
+                result_timeout: None,
             },
         };
         let mk = |name: &str, steps: Vec<Step>| Workflow {

@@ -2376,6 +2376,17 @@ pub(crate) fn lint_flywheel_tier(
         blocking: &mut usize,
         emit: &dyn Fn(&str, &mut usize),
     ) {
+        // bd-ge1zo slice 1b: flywheel bodies run in-process with no job
+        // watcher, so `await: result` can never settle here. Reject at lint
+        // time instead of hanging on a WatchJob at run time.
+        if let toron_workflow::schema::Action::DispatchJob { await_, .. } = action
+            && matches!(await_, Some(toron_workflow::schema::DispatchAwait::Result))
+        {
+            emit(
+                "dispatch_job await: result needs a toron host; flywheel in-process bodies cannot watch jobs",
+                blocking,
+            );
+        }
         let json = serde_json::to_value(action).unwrap_or_default();
         if let Some(spec) = json.get("spec").and_then(|s| s.as_object()) {
             if let Some(profile) = spec.get("profile").and_then(|v| v.as_str()) {
@@ -2796,6 +2807,35 @@ steps:
         .expect("parse");
         let blocking = lint_flywheel_tier("t", &wf, None);
         assert_eq!(blocking, 0, "nested ref into declared root must lint clean");
+    }
+
+    /// `await: result` fails closed: flywheel bodies run in-process with no
+    /// job watcher, so the lint rejects it instead of letting a body hang
+    /// on a WatchJob it cannot resolve (bd-ge1zo slice 1b).
+    #[test]
+    fn lint_rejects_dispatch_await_result() {
+        let wf = parse_workflow(
+            r#"
+name: t
+trigger:
+  type: webhook
+inputs:
+  - name: goal
+steps:
+  - name: a
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@planner", stage: "ce-execute" }
+    await: result
+    result_timeout: 60
+"#,
+        )
+        .expect("parse");
+        let blocking = lint_flywheel_tier("t", &wf, None);
+        assert_eq!(
+            blocking, 1,
+            "await: result is the only blocking issue in an otherwise clean workflow"
+        );
     }
 
     /// A clean workflow passes the flywheel tier (no blocking issues).
