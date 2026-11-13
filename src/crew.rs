@@ -793,7 +793,11 @@ pub enum ComposePart {
 pub fn parse_compose_part(token: &str) -> Result<ComposePart, String> {
     let t = token.trim();
     let Some((kind, value)) = t.split_once(':') else {
-        if t.split(':').count() == 1 && crate::builtin_workflows::is_compose_token(t) {
+        if t.split(':').count() == 1
+            && crate::workflow_catalog::WorkflowCatalog::load_layered(None)
+                .unwrap_or_default()
+                .is_compose_token(t)
+        {
             return Ok(ComposePart::Recipe {
                 name: t.to_string(),
             });
@@ -2939,8 +2943,10 @@ steps:
     /// a stage-first part (never bare `--parts` expansion).
     #[test]
     fn thin_beads_is_not_a_compose_token() {
+        let catalog =
+            crate::workflow_catalog::WorkflowCatalog::load_layered(None).unwrap_or_default();
         assert!(
-            !crate::builtin_workflows::is_compose_token("beads"),
+            !catalog.is_compose_token("beads"),
             "thin beads stays ordinary"
         );
         assert_eq!(

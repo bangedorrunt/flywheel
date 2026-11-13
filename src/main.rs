@@ -18454,7 +18454,9 @@ mod integration_tests {
         for (name, wf) in &wfs {
             let desc = wf.description.as_deref().unwrap_or("");
             assert!(!desc.is_empty(), "{name} carries a description");
-            let token = crate::builtin_workflows::is_compose_token(name);
+            let token = crate::workflow_catalog::builtin_meta(name)
+                .compose
+                .unwrap_or(false);
             let run = if token {
                 format!("workflow compose \"<objective>\" --parts {name} --run")
             } else {
@@ -19487,9 +19489,10 @@ mod repair_recipe_tests {
 
     #[test]
     fn repair_recipe_is_registered_and_has_graph_nodes() {
-        assert!(crate::builtin_workflows::is_compose_token(
-            "repair-until-verified"
-        ));
+        assert_eq!(
+            crate::workflow_catalog::builtin_meta("repair-until-verified").compose,
+            Some(true)
+        );
         let wf = crate::builtin_workflows::builtin_recipe("repair-until-verified")
             .expect("recipe exists");
         let Action::Loop { body, .. } = &wf.steps[0].action else {

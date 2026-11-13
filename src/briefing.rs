@@ -215,13 +215,6 @@ pub fn join_banner(world: &World) -> String {
     )
 }
 
-pub fn is_compose_token(primitive: &str) -> bool {
-    matches!(
-        primitive,
-        "wave-swarm" | "repair-until-verified" | "beads-lifecycle"
-    )
-}
-
 /// Topology comes from decide's one routing table (ADR-0032 Spec 9): the
 /// only briefing-local rule is the joinable-world override. The old private
 /// primitive→topology map is deleted (it diverged on babysit-bead).
@@ -435,12 +428,15 @@ pub fn assemble(
         .collect();
 
     let mut argv = decision.argv.clone();
+    let compose_token = crate::workflow_catalog::WorkflowCatalog::load_layered(None)
+        .unwrap_or_default()
+        .is_compose_token(&decision.primitive);
     if join {
         argv = vec!["flywheel".into(), "arrive".into(), world.project.clone()];
         if let Some(id) = &world.coalition_id {
             argv.extend(["--coalition".into(), id.clone()]);
         }
-    } else if is_compose_token(decision.primitive) && !argv.iter().any(|a| a == "--crew") {
+    } else if compose_token && !argv.iter().any(|a| a == "--crew") {
         argv.push("--crew".into());
         argv.push(n.to_string());
     }
@@ -451,7 +447,7 @@ pub fn assemble(
     let binds_compose = argv
         .windows(2)
         .any(|w| w[0] == "workflow" && w[1] == "compose");
-    if binds_compose && is_compose_token(decision.primitive) {
+    if binds_compose && compose_token {
         missing.extend(bind_declared_inputs(
             &mut argv,
             decision.primitive,
@@ -476,7 +472,7 @@ pub fn assemble(
         )
     };
 
-    let token = is_compose_token(decision.primitive).then(|| decision.primitive.to_string());
+    let token = compose_token.then(|| decision.primitive.to_string());
 
     // governed-by: bd-7lms — every decide family gets a visible alternative
     let mut alternatives = vec![
@@ -649,7 +645,13 @@ pub fn align_with_session_topology(b: &mut Briefing, session: &str, sticky_held:
 /// Invent spawn / compose / join / loop vehicles suppressed under sticky-open.
 fn is_invent_spawn_under_open(workflow: &str) -> bool {
     let w = workflow.trim();
-    w.is_empty() || w == "none" || w == "join" || w == "loop-work" || is_compose_token(w)
+    w.is_empty()
+        || w == "none"
+        || w == "join"
+        || w == "loop-work"
+        || crate::workflow_catalog::WorkflowCatalog::load_layered(None)
+            .unwrap_or_default()
+            .is_compose_token(w)
 }
 
 /// Rewrite commit argv to the held session vehicle; clear invent swarm surfaces.

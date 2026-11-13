@@ -322,6 +322,20 @@ fn load_user_stages(config_root: &Path) -> Result<BTreeMap<String, crate::stages
 pub fn catalog_drift(config_root: &Path) -> Result<Vec<CatalogEntryStatus>> {
     let builtins = crate::builtin_workflows::builtin_workflows();
     let user_workflows = load_user_workflows(config_root)?;
+    let mut user_metas = BTreeMap::new();
+    for (name, (_, raw, is_toml)) in &user_workflows {
+        if *is_toml {
+            continue;
+        }
+        let meta = CatalogMeta::parse_yaml(raw)
+            .with_context(|| format!("parse compose/shape for {name}"))?;
+        user_metas.insert(name.clone(), meta);
+    }
+    let user_cat = WorkflowCatalog {
+        workflows: BTreeMap::new(),
+        notes: Vec::new(),
+        metas: user_metas,
+    };
     let mut rows = Vec::new();
     for (name, builtin) in &builtins {
         let builtin_yaml =
@@ -351,7 +365,7 @@ pub fn catalog_drift(config_root: &Path) -> Result<Vec<CatalogEntryStatus>> {
                 "builtin"
             }
             .into(),
-            compose_token: crate::builtin_workflows::is_compose_token(name),
+            compose_token: user_cat.is_compose_token(name),
         });
     }
     for name in user_workflows.keys() {
@@ -361,7 +375,7 @@ pub fn catalog_drift(config_root: &Path) -> Result<Vec<CatalogEntryStatus>> {
                 name: name.clone(),
                 status: "custom".into(),
                 source: "user".into(),
-                compose_token: false,
+                compose_token: user_cat.is_compose_token(name),
             });
         }
     }
@@ -502,6 +516,165 @@ pub fn subworkflow_resolver(
     }
 }
 
+/// ADR-0021 D2: compose tokens as data. `compose: true` + `shape:` live in
+/// the workflow YAML itself, so any tier can ship a compose token without a
+/// rebuild. Parsed (serde) from the SAME YAML text each tier already loads;
+/// toron's `Workflow` has no `deny_unknown_fields`, so these keys ride
+/// alongside it with no toron edit (one-way dependency kept).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Shape {
+    Pipeline,
+    FanOut,
+    Debate,
+    Repair,
+    Polish,
+}
+
+/// The per-file compose/shape declaration. `None` inherits the lower tier
+/// (MERGE RULE); only `Some` overrides. Unknown `shape:` values fail
+/// parsing — never silently ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+pub struct CatalogMeta {
+    #[serde(default)]
+    pub compose: Option<bool>,
+    #[serde(default)]
+    pub shape: Option<Shape>,
+}
+
+impl CatalogMeta {
+    /// Parse the declaration from the same YAML text the tier loader reads.
+    pub fn parse_yaml(yaml_text: &str) -> Result<CatalogMeta, serde_yaml::Error> {
+        serde_yaml::from_str(yaml_text)
+    }
+
+    /// MERGE RULE (critical): resolve `compose`/`shape` field-by-field
+    /// across tiers (built-in < user < project). The winning tier's `Some`
+    /// wins; `None` inherits the lower tier. `lower.overlay(upper)`.
+    pub fn overlay(self, upper: CatalogMeta) -> CatalogMeta {
+        CatalogMeta {
+            compose: upper.compose.or(self.compose),
+            shape: upper.shape.or(self.shape),
+        }
+    }
+}
+
+/// The builtin tier's declaration, parsed from the verbatim compiled-in
+/// YAML. Unknown names read as absent; a builtin whose text fails to parse
+/// also reads as absent here — the all-builtins-parse test pins every
+/// compiled-in file, so a typo fails loudly at test time, never silently
+/// at runtime.
+pub fn builtin_meta(name: &str) -> CatalogMeta {
+    crate::builtin_workflows::builtin_workflow_yaml(name)
+        .and_then(|yaml| CatalogMeta::parse_yaml(yaml).ok())
+        .unwrap_or_default()
+}
+
+impl WorkflowCatalog {
+    /// The user/project-merged declaration for `name`, if any file tier
+    /// filed one.
+    pub fn meta(&self, name: &str) -> Option<CatalogMeta> {
+        self.metas.get(name).copied()
+    }
+
+    /// Fully merged declaration: built-in < user < project, per field.
+    pub fn resolved_meta(&self, name: &str) -> CatalogMeta {
+        builtin_meta(name).overlay(self.meta(name).unwrap_or_default())
+    }
+
+    /// Catalog API: is `name` a compose token — a composed multi-phase
+    /// workflow legal as a bare `--parts` token? Data, not a match arm.
+    pub fn is_compose_token(&self, name: &str) -> bool {
+        self.resolved_meta(name).compose.unwrap_or(false)
+    }
+
+    /// Catalog API: the declared shape for `name`, if any tier declares one.
+    pub fn shape(&self, name: &str) -> Option<Shape> {
+        self.resolved_meta(name).shape
+    }
+}
+
+/// Pure conformance check for a declared shape (ADR-0021 D1): a fan-out
+/// shape needs a `parallel`/`foreach` action somewhere (steps or graph
+/// nodes, nested actions included); a repair/polish shape needs a bounded
+/// `loop` (`max` is required by the schema, so presence is boundedness).
+/// `Pipeline` and `Debate` carry no structural rule. The error names the
+/// missing construct.
+pub fn shape_conforms(shape: Shape, wf: &Workflow) -> Result<(), String> {
+    fn walk_step(step: &Step, out: &mut Vec<Action>) {
+        walk_action(&step.action, out);
+    }
+    fn walk_action(action: &Action, out: &mut Vec<Action>) {
+        out.push(action.clone());
+        match action {
+            Action::Retry { step, .. } => walk_step(step, out),
+            Action::Branch {
+                then, else_steps, ..
+            } => {
+                for s in then.iter().chain(else_steps) {
+                    walk_step(s, out);
+                }
+            }
+            Action::Foreach { each, .. } | Action::Parallel { each, .. } => walk_step(each, out),
+            Action::Loop { body, .. } => {
+                for s in body {
+                    walk_step(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut actions = Vec::new();
+    for step in &wf.steps {
+        walk_step(step, &mut actions);
+    }
+    if let Some(graph) = &wf.graph {
+        for node in graph.nodes.values() {
+            walk_action(&node.action, &mut actions);
+        }
+    }
+    let has_fanout = actions
+        .iter()
+        .any(|a| matches!(a, Action::Parallel { .. } | Action::Foreach { .. }));
+    let has_loop = actions.iter().any(|a| matches!(a, Action::Loop { .. }));
+    match shape {
+        Shape::FanOut => {
+            if has_fanout {
+                Ok(())
+            } else {
+                Err("shape fan-out needs a parallel/foreach step".to_string())
+            }
+        }
+        Shape::Repair | Shape::Polish => {
+            if has_loop {
+                Ok(())
+            } else {
+                Err("shape repair/polish needs a bounded loop".to_string())
+            }
+        }
+        Shape::Pipeline | Shape::Debate => Ok(()),
+    }
+}
+
+/// Thin lint edge over [`shape_conforms`]: resolve the declared shape for
+/// `name` across tiers and emit one blocking error on mismatch. Undeclared
+/// shapes pass (shapes are opt-in per workflow). Returns blocking count.
+pub fn lint_shape(
+    name: &str,
+    wf: &Workflow,
+    project_root: Option<&Path>,
+    emit: &dyn Fn(&str, &mut usize),
+) -> usize {
+    let catalog = WorkflowCatalog::load_layered(project_root).unwrap_or_default();
+    let mut blocking = 0;
+    if let Some(shape) = catalog.shape(name) {
+        if let Err(reason) = shape_conforms(shape, wf) {
+            emit(&reason, &mut blocking);
+        }
+    }
+    blocking
+}
+
 /// The legacy `workflows.toml` step shapes (mirrored from flywheel's
 /// `config::WorkflowStep` — the catalog parses the legacy file itself so the
 /// absorber is self-contained, no dependency on the live config struct).
@@ -558,6 +731,10 @@ pub struct WorkflowCatalog {
     pub workflows: BTreeMap<String, Workflow>,
     /// Non-1:1 mapping caveats (never silently dropped).
     pub notes: Vec<MappingNote>,
+    /// Per-file compose/shape declarations (canonical YAML only; legacy
+    /// TOML and absorbed entries read as absent). The project tier merges
+    /// per-field over the user tier at load.
+    pub metas: BTreeMap<String, CatalogMeta>,
 }
 
 impl WorkflowCatalog {
@@ -585,6 +762,20 @@ impl WorkflowCatalog {
             if dir.is_dir() {
                 for path in workflow_paths(&dir)? {
                     let wf = parse_workflow_path(&path)?;
+                    let meta = if path.extension().is_some_and(|ext| ext == "toml") {
+                        CatalogMeta::default()
+                    } else {
+                        let raw = std::fs::read_to_string(&path)
+                            .with_context(|| format!("read {}", path.display()))?;
+                        CatalogMeta::parse_yaml(&raw)
+                            .with_context(|| format!("parse compose/shape {}", path.display()))?
+                    };
+                    let merged = catalog
+                        .metas
+                        .remove(wf.name.as_str())
+                        .unwrap_or_default()
+                        .overlay(meta);
+                    catalog.metas.insert(wf.name.clone(), merged);
                     catalog.workflows.insert(wf.name.clone(), wf);
                 }
             }
@@ -599,6 +790,7 @@ impl WorkflowCatalog {
         let mut catalog = Self {
             workflows: BTreeMap::new(),
             notes: Vec::new(),
+            metas: BTreeMap::new(),
         };
         catalog.load_canonical(&config_root)?;
         catalog.absorb(&config_root)?;
@@ -613,6 +805,15 @@ impl WorkflowCatalog {
         }
         for path in workflow_paths(&dir)? {
             let wf = parse_workflow_path(&path)?;
+            let meta = if path.extension().is_some_and(|ext| ext == "toml") {
+                CatalogMeta::default()
+            } else {
+                let raw = std::fs::read_to_string(&path)
+                    .with_context(|| format!("read {}", path.display()))?;
+                CatalogMeta::parse_yaml(&raw)
+                    .with_context(|| format!("parse compose/shape {}", path.display()))?
+            };
+            self.metas.insert(wf.name.clone(), meta);
             self.workflows.insert(wf.name.clone(), wf);
         }
         Ok(())
@@ -1551,5 +1752,189 @@ mod bd_mvy4_stage_drift {
              the old prompt"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// ADR-0021 D2 red phase (bd-compose-field-w4r01): compose tokens as data.
+/// These tests pin the tiered merge rule before the builtin YAML keys land:
+/// project `compose: true` wins, a keyless user copy inherits the builtin,
+/// `compose: false` disables, shapes read back and conform. Hermetic temp
+/// dirs throughout — no ambient config, no live store.
+#[cfg(test)]
+mod compose_token_data_tests {
+    use super::*;
+
+    fn roots(tag: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("compose-{tag}-{}", uuid::Uuid::new_v4()));
+        let config = base.join("config");
+        let project = base.join("project");
+        std::fs::create_dir_all(project.join(".flywheel").join("workflows"))
+            .expect("mkdir project workflows");
+        (config, project)
+    }
+
+    fn write(path: &std::path::Path, content: &str) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, content).expect("write");
+    }
+
+    fn cleanup(config: &Path, project: &Path) {
+        let base = config.parent().expect("base");
+        debug_assert!(base.starts_with(std::env::temp_dir()));
+        let _ = std::fs::remove_dir_all(base);
+        let _ = project;
+    }
+
+    fn builtin_yaml(name: &str) -> String {
+        crate::builtin_workflows::builtin_workflow_yaml(name)
+            .unwrap_or_else(|| panic!("{name} is a builtin"))
+            .to_string()
+    }
+
+    fn without_compose_keys(yaml: &str) -> String {
+        yaml.lines()
+            .filter(|l| !l.trim_start().starts_with("compose:"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn compose_token_project_tier_true_wins() {
+        let (config, project) = roots("project-true");
+        let yaml = format!("{}\ncompose: true\n", builtin_yaml("beads"));
+        write(&project.join(".flywheel/workflows/beads.yaml"), &yaml);
+        let catalog =
+            WorkflowCatalog::load_layered_with(config.clone(), Some(&project)).expect("load");
+        assert!(
+            catalog.is_compose_token("beads"),
+            "project-tier compose:true must win"
+        );
+        cleanup(&config, &project);
+    }
+
+    #[test]
+    fn compose_token_user_copy_without_key_stays_token() {
+        let (config, project) = roots("inherit");
+        let yaml = without_compose_keys(&builtin_yaml("wave-swarm"));
+        assert!(
+            !yaml.contains("compose:"),
+            "fixture must carry no compose key"
+        );
+        write(&config.join("workflows/wave-swarm.yaml"), &yaml);
+        let catalog =
+            WorkflowCatalog::load_layered_with(config.clone(), Some(&project)).expect("load");
+        assert!(
+            catalog.is_compose_token("wave-swarm"),
+            "a keyless user copy inherits the builtin token"
+        );
+        cleanup(&config, &project);
+    }
+
+    #[test]
+    fn compose_token_explicit_false_disables() {
+        let (config, project) = roots("disable");
+        let yaml = format!(
+            "{}\ncompose: false\n",
+            without_compose_keys(&builtin_yaml("wave-swarm"))
+        );
+        write(&config.join("workflows/wave-swarm.yaml"), &yaml);
+        let catalog =
+            WorkflowCatalog::load_layered_with(config.clone(), Some(&project)).expect("load");
+        assert!(
+            !catalog.is_compose_token("wave-swarm"),
+            "tier compose:false must turn the token off"
+        );
+        cleanup(&config, &project);
+    }
+
+    #[test]
+    fn compose_shape_declared_reads_back() {
+        let (config, project) = roots("shape");
+        let yaml = format!("{}\nshape: polish\n", builtin_yaml("beads"));
+        write(&project.join(".flywheel/workflows/beads.yaml"), &yaml);
+        let catalog =
+            WorkflowCatalog::load_layered_with(config.clone(), Some(&project)).expect("load");
+        assert_eq!(catalog.shape("beads"), Some(Shape::Polish));
+        cleanup(&config, &project);
+    }
+
+    #[test]
+    fn compose_meta_unknown_shape_rejected() {
+        assert!(
+            CatalogMeta::parse_yaml("name: x\nshape: nonsense\n").is_err(),
+            "an unknown shape is a parse error, never ignored"
+        );
+    }
+
+    #[test]
+    fn compose_token_all_builtins_parse_meta() {
+        for (name, _) in crate::builtin_workflows::builtin_workflows_yaml() {
+            assert!(
+                CatalogMeta::parse_yaml(
+                    crate::builtin_workflows::builtin_workflow_yaml(name).expect("text")
+                )
+                .is_ok(),
+                "builtin {name} text must parse as CatalogMeta"
+            );
+        }
+    }
+
+    fn parsed_builtin(name: &str) -> Workflow {
+        crate::builtin_workflows::builtin_workflows()
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} is a builtin"))
+    }
+
+    #[test]
+    fn compose_token_shape_fanout_needs_parallel_or_foreach() {
+        assert!(
+            shape_conforms(Shape::FanOut, &parsed_builtin("beads")).is_err(),
+            "sequential beads must not conform to fan-out"
+        );
+        assert!(
+            shape_conforms(Shape::FanOut, &parsed_builtin("arena")).is_ok(),
+            "arena fans out over arms"
+        );
+    }
+
+    #[test]
+    fn compose_token_shape_repair_needs_bounded_loop() {
+        assert!(
+            shape_conforms(Shape::Repair, &parsed_builtin("beads")).is_err(),
+            "sequential beads must not conform to repair"
+        );
+        assert!(
+            shape_conforms(Shape::Repair, &parsed_builtin("repair-until-verified")).is_ok(),
+            "repair-until-verified loops until verified"
+        );
+        assert!(
+            shape_conforms(Shape::Polish, &parsed_builtin("beads-lifecycle")).is_ok(),
+            "beads-lifecycle polishes in a loop"
+        );
+    }
+
+    #[test]
+    fn compose_token_overlay_upper_some_wins() {
+        let lower = CatalogMeta {
+            compose: Some(true),
+            shape: Some(Shape::Pipeline),
+        };
+        let upper = CatalogMeta {
+            compose: Some(false),
+            shape: None,
+        };
+        assert_eq!(
+            lower.overlay(upper),
+            CatalogMeta {
+                compose: Some(false),
+                shape: Some(Shape::Pipeline),
+            }
+        );
+        assert_eq!(
+            CatalogMeta::default().overlay(lower),
+            lower,
+            "None inherits the lower tier"
+        );
     }
 }

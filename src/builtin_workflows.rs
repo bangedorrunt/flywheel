@@ -286,6 +286,7 @@ steps:
         "debate",
         r#"
 name: debate
+shape: debate
 description: Adversarial synthesis — reviewers brief, an oracle decides.
 trigger:
   type: webhook
@@ -913,6 +914,7 @@ graph:
         "arena",
         r#"
 name: arena
+shape: fan-out
 description: "Model race (arena): same shape as prototype but the arms may run the SAME brief on DIFFERENT models — the race is in the models, not the tree. Selection rule declared UP FRONT via the `selection` input: first-pass (pick the first arm that clears the bar) | rank-all (rank every arm) | best-of (pick the best). Sketch arms: parallel, text-only under /tmp/flywheel-proto-<run>-<arm>/; compile arms: SEQUENTIAL on the build slot, one arm at a time on a scratch ref, measure + reset between arms. The @oracle judge keeps the comparison TABLE, not raw dumps (guard-the-context-window). Principles: exhaust-the-design-space, guard-the-context-window."
 trigger:
   type: webhook
@@ -1166,6 +1168,8 @@ steps:
         "wave-swarm",
         r#"
 name: wave-swarm
+compose: true
+shape: pipeline
 description: "The compounded wave swarm. GATE scopes br ready to one wave via the TYPED wave field (grounding-reads docs/learnings/), holds on any open lower wave, and treats an empty ready with in-flight beads as WORK IN FLIGHT (bd-wave-gate-typed-authority-27et); DISPATCH emits send --stage ce-execute --param payloads (bead/scope/exit/channel/pin/report_file/learnings); OBSERVE escalates to the captain (lesson: line on every escalation) and never adjudicates; REVIEW audits each closed bead's diff against its brief (detection conditions, quoted evidence, autofix classes); VERIFY checks receipts at committed HEAD + VERIFY tails + principles citations + the residual gate (every finding fixed or filed as a bead); COMPOUND captures durable learnings to docs/learnings/ (never blocks); SIGNOFF suspends for captain-only approval. bd-compose-stage-sequencing-zgi9 / bd-o0v4q: stages are SEQUENCED by completion markers under .flywheel/wave/ (<label>-<stage>.done) — each await blocks reactively on the stage completion signal (Plane S/Doorbell-latched filesystem event watch when available, else near-zero poll) so transitions fire with zero artificial idle delay while preserving verify honesty; the outer --timeout remains the run bound. Default crew is planner+coder+reviewer; remix with --crew role:n,role:n (scout/housekeeper optional)."
 trigger:
   type: webhook
@@ -1300,6 +1304,8 @@ steps:
         "repair-until-verified",
         r#"
 name: repair-until-verified
+compose: true
+shape: repair
 description: "Repair loop: bounded fresh-context repair, evaluate, VERIFY. max_iterations caps the passes (default 3, hard cap 32). A passing verify stops the loop. Exhaustion fails the run. A failed verify continues to the next pass. GS-039 P0-3: explicit crew coder:1 reviewer:1 — remix with --crew role:n; --allow-crew-expand is a no-op (cap is crew.max)."
 trigger:
   type: webhook
@@ -1362,6 +1368,8 @@ steps:
         "beads-lifecycle",
         r#"
 name: beads-lifecycle
+compose: true
+shape: polish
 description: "The beads authoring lifecycle. grill (ce-brainstorm) sharpens the objective (goal JSON); create nests phase-plan via call_workflow; polish_1 + polish_2 + polish_more (loop max 3) revise under the fence until converged; audit (fresh plan-polish) returns findings only; integrate folds findings and re-checks cycles; fence_final gates the plan; implement hands off to wave-swarm (new graph) or babysit-bead (existing_bead); verify proves with evidence; signoff suspends for captain-only approval. inputs.from=none|session|adr|bead skips grill→fence_final when from=bead or existing_bead is set. inputs.until early-exits SUCCESS after any phase; gate_before_implement adds one outer approval between fence_final and implement."
 trigger:
   type: webhook
@@ -1643,18 +1651,14 @@ pub fn builtin_workflows() -> BTreeMap<String, Workflow> {
     map
 }
 
-/// ADR-0006 D3 (bd-wave-swarm-recipe-wsot) + ADR-0008 §6.7
-/// (bd-adr0008-token-yaml-kimg): is `name` a compose token — a
-/// composed multi-phase workflow legal as a bare `--parts` token?
-/// Deliberately NOT every builtin: only compose tokens (today: wave-swarm,
-/// repair-until-verified, beads-lifecycle) expand on the compose grammar;
-/// ordinary builtins (e.g. captain-audit, beads) stay on
-/// `workflow run <name> --execute`.
+/// TEMPORARY migration shim (bd-compose-field-w4r01): delegates to the
+/// catalog's data-driven resolution so held-file call sites keep compiling
+/// until their lanes migrate. Same answer as the new path by construction.
+/// Deletes with the final commit — never keep a parallel match arm.
 pub fn is_compose_token(name: &str) -> bool {
-    matches!(
-        name,
-        "wave-swarm" | "repair-until-verified" | "beads-lifecycle"
-    )
+    crate::workflow_catalog::WorkflowCatalog::load_layered(None)
+        .unwrap_or_default()
+        .is_compose_token(name)
 }
 
 /// Compact agent-facing guidance for the built-in catalog:
@@ -3913,13 +3917,16 @@ mod tests {
 
     #[test]
     fn beads_lifecycle_is_compose_token_and_beads_is_not() {
-        assert!(
-            is_compose_token("beads-lifecycle"),
-            "beads-lifecycle is the third compose token"
+        assert_eq!(
+            crate::workflow_catalog::builtin_meta("beads-lifecycle").compose,
+            Some(true),
+            "beads-lifecycle declares the token in its YAML"
         );
         assert!(
-            !is_compose_token("beads"),
-            "thin beads stays an ordinary builtin, never bare --parts"
+            crate::workflow_catalog::builtin_meta("beads")
+                .compose
+                .is_none(),
+            "thin beads declares no compose key, stays ordinary"
         );
     }
 
