@@ -46,6 +46,10 @@ pub struct FlywheelPorts {
     warned_store: bool,
     /// Unread urgency from the last `observe`, keyed by npub. `ring` reads it.
     urgencies: BTreeMap<String, Urgency>,
+    /// ADR-0041/bd-4xthm: a pin's wake baseline (the tip at first sight), so a
+    /// fresh pin or a restart never replays pre-registration backlog.
+    baselines: BTreeMap<String, u64>,
+    baselines_dirty: bool,
 }
 
 /// Pure: hc's word to the wake rule's pane state.
@@ -204,8 +208,11 @@ impl FlywheelPorts {
             facts_seen: BTreeSet::new(),
             warned_store: false,
             urgencies: BTreeMap::new(),
+            baselines: BTreeMap::new(),
+            baselines_dirty: false,
         };
         p.load_facts();
+        p.load_baselines();
         p
     }
 
@@ -222,6 +229,42 @@ impl FlywheelPorts {
             crate::state::state_key(&self.project),
             crate::state::state_key(&self.workspace)
         ))
+    }
+
+    fn baseline_path(&self) -> std::path::PathBuf {
+        config::state_dir().join("inbox").join(format!(
+            "{}-{}-wake-baseline.json",
+            crate::state::state_key(&self.project),
+            crate::state::state_key(&self.workspace)
+        ))
+    }
+
+    fn load_baselines(&mut self) {
+        if let Ok(raw) = std::fs::read_to_string(self.baseline_path())
+            && let Ok(map) = serde_json::from_str::<BTreeMap<String, u64>>(&raw)
+        {
+            self.baselines = map;
+        }
+    }
+
+    fn save_baselines(&mut self) {
+        if !self.baselines_dirty {
+            return;
+        }
+        let path = self.baseline_path();
+        if let Some(dir) = path.parent()
+            && crate::private_fs::create_private_dir_all(dir).is_err()
+        {
+            return;
+        }
+        if crate::private_fs::write_private_atomic(
+            &path,
+            &serde_json::to_vec(&self.baselines).unwrap_or_default(),
+        )
+        .is_ok()
+        {
+            self.baselines_dirty = false;
+        }
     }
 
     fn load_facts(&mut self) {
@@ -503,6 +546,14 @@ pub(crate) async fn head_and_cursor(store: &InboxStore, npub: &str) -> (u64, u64
     (head, cursor)
 }
 
+/// ADR-0041/bd-4xthm: the cursor the wake fold reads. The reader's real cursor
+/// wins when it is ahead of the persisted first-sight baseline; at first sight
+/// the baseline is the current head, so backlog that predates the wake host is
+/// never replayed. One door, one watermark per pin.
+pub(crate) fn effective_cursor(store_cursor: u64, head: u64, baseline: Option<u64>) -> u64 {
+    store_cursor.max(baseline.unwrap_or(head))
+}
+
 /// The urgency `observe` hands `ring`, and whether it read the store for it.
 ///
 /// `Urgent` while `npub` has an unread urgent row: toron's `pending_urgent`,
@@ -650,11 +701,20 @@ impl Ports for FlywheelPorts {
             };
             let store = store.clone();
             let n2 = npub.clone();
-            let (head, cursor, urgency) = crate::mail::block_on(async move {
-                let (head, cursor) = head_and_cursor(&store, &n2).await;
-                let (urgency, _) = urgency_of_unread(&store, &n2, head, cursor).await;
-                (head, cursor, urgency)
-            });
+            let (head, store_cursor) =
+                crate::mail::block_on(async move { head_and_cursor(&store, &n2).await });
+            let baseline = self.baselines.get(&pin).copied();
+            if baseline.is_none() {
+                self.baselines.insert(pin.clone(), head);
+                self.baselines_dirty = true;
+            }
+            let cursor = effective_cursor(store_cursor, head, baseline);
+            let n3 = npub.clone();
+            let store = self.store().expect("store read above").clone();
+            let (urgency, _) =
+                crate::mail::block_on(
+                    async move { urgency_of_unread(&store, &n3, head, cursor).await },
+                );
             self.urgencies.insert(npub.clone(), urgency);
             let (state, bind) = Self::pane_observation(
                 &panes,
@@ -675,6 +735,7 @@ impl Ports for FlywheelPorts {
                 bind,
             });
         }
+        self.save_baselines();
         Observation {
             seen,
             plane_restarted,
@@ -860,6 +921,19 @@ fn session_id_for(label: &str, workspace_id: &str, workspace: &str) -> Option<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd-4xthm: a fresh pin's cursor is initialised to the current tip so
+    /// registration never replays pre-registration backlog; the real cursor
+    /// wins once the reader has advanced it.
+    #[test]
+    fn wake_cursor_seeds_to_head_and_real_cursor_wins() {
+        assert_eq!(effective_cursor(0, 709, None), 709);
+        assert_eq!(effective_cursor(0, 709, Some(0)), 0);
+        assert_eq!(effective_cursor(0, 709, Some(100)), 100);
+        assert_eq!(effective_cursor(710, 710, Some(709)), 710);
+        assert_eq!(effective_cursor(700, 710, Some(709)), 709);
+        assert_eq!(effective_cursor(0, 0, None), 0);
+    }
 
     /// A host carrying the session id (the plane key) must resolve the same
     /// session as one carrying the label. The id branch is the live wake

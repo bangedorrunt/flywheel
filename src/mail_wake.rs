@@ -1,13 +1,12 @@
 // governed-by: ADR-0012 (doorbell), ADR-0041 (one inbox door)
 //! NIP-17 mail wake for the per-workspace doorbell host.
 //!
-//! The comms `inbox_host` rings the envelope log (`toron next`). A NIP-17
-//! `toron mail` DM used to wake only through the agent's peer handler, which
-//! is a one-turn prompt: once the pane finished (`done`), new mail sat unread
-//! until a human sent a pane prompt. This host is the missing door: on a
-//! short poll it reads each registered pin's unread NIP-17 inbox, and when a
-//! row is newer than the persisted high-water it prompts the pin's pane with
-//! a short mail notice. The agent then runs `toron mail inbox` and acts.
+//! ADR-0041 says one inbox door. While comms is enabled the envelope host
+//! (`toron next` cursor) owns rings; this poller is the door only when comms
+//! is off. It reads each registered pin's unread NIP-17 inbox and prompts the
+//! pane only for agent mail past the persisted high-water. System notices
+//! (reservation-revoked, ack/read tags) stay readable in the inbox and never
+//! ring; a fresh pin's backlog is seeded into the high-water, never replayed.
 //!
 //! Effects: the poll is a std thread (never a Tokio runtime), the mail call
 //! is the one `MailSurface` (no CLI shell-out), and the pane prompt is the one
@@ -34,29 +33,100 @@ const RETRY_AFTER: Duration = Duration::from_secs(30);
 /// The row the wake decision needs, independent of the wire type.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MailRow {
+    pub id: String,
     pub created_ts_us: i64,
     pub sender: String,
     pub subject: String,
+    /// `toron-kind` when the wire carries it; `None` for ordinary mail.
+    pub kind: Option<String>,
     pub importance: String,
 }
 
-/// The newest unread row strictly newer than `high_water`.
-pub fn newest_unseen(rows: &[MailRow], high_water: i64) -> Option<&MailRow> {
+/// What one poll should do for one pin, from the row set and the persisted
+/// high-water. `Seed` means "first sight": record the tip and stay quiet, so a
+/// fresh pin is never rung for mail that predates its wake host.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WakePlan<'a> {
+    Seed(i64),
+    Ring(&'a MailRow),
+    Idle,
+}
+
+/// `toron-kind`-tagged rows are system notices (reservation-revoked, ack,
+/// read, ...): readable in the inbox, never a pane wake. The surface DTO at
+/// toron ca87ff5c drops `toron_kind`, so the production row is recognised by
+/// its throwaway hex sender and empty subject instead.
+pub fn is_system_notice(row: &MailRow) -> bool {
+    row.kind.is_some() || (row.subject.trim().is_empty() && looks_like_key(&row.sender))
+}
+
+fn looks_like_key(sender: &str) -> bool {
+    let s = sender.trim();
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+        || (s.starts_with("npub1") && s.len() > 20)
+}
+
+/// The newest unread row that is safe to ring for.
+pub fn newest_ringable(rows: &[MailRow], high_water: i64) -> Option<&MailRow> {
     rows.iter()
-        .filter(|r| r.created_ts_us > high_water)
+        .filter(|r| r.created_ts_us > high_water && !is_system_notice(r))
         .max_by_key(|r| r.created_ts_us)
+}
+
+/// The tip to seed a fresh pin with: every row already present is
+/// pre-registration backlog and must not ring.
+fn seed_watermark(rows: &[MailRow]) -> i64 {
+    rows.iter().map(|r| r.created_ts_us).max().unwrap_or(0)
+}
+
+/// The whole per-pin poll decision: seed on first sight, ring only for a
+/// ringable row past the persisted high-water, else stay idle.
+pub fn plan_wake(stored: Option<i64>, rows: &[MailRow]) -> WakePlan<'_> {
+    let Some(stored) = stored else {
+        return WakePlan::Seed(seed_watermark(rows));
+    };
+    match newest_ringable(rows, stored) {
+        Some(row) => WakePlan::Ring(row),
+        None => WakePlan::Idle,
+    }
+}
+
+/// The one wake door (ADR-0041): the comms envelope host owns wakes while
+/// comms is enabled; the NIP-17 mail wake is the door only when it is not.
+pub fn mail_wake_owns(comms_enabled: bool) -> bool {
+    !comms_enabled
+}
+
+fn display_sender(row: &MailRow) -> String {
+    if looks_like_key(&row.sender) {
+        row.kind
+            .clone()
+            .unwrap_or_else(|| "system notice".to_string())
+    } else {
+        row.sender.clone()
+    }
+}
+
+fn display_subject(row: &MailRow) -> String {
+    let subject = row.subject.trim();
+    if subject.is_empty() {
+        row.kind
+            .clone()
+            .unwrap_or_else(|| "(no subject)".to_string())
+    } else {
+        subject.chars().take(120).collect()
+    }
 }
 
 /// The one pane prompt for a new mail. It names the pin and the exact door so
 /// the agent never has to infer the mailbox.
 pub fn wake_text(project: &str, pin: &str, row: &MailRow) -> String {
     let urgent = matches!(row.importance.as_str(), "high" | "urgent");
-    let subject: String = row.subject.chars().take(120).collect();
     format!(
         "{}Doorbell: mail from {} — {}. Run `toron mail inbox --project {} --as {} --limit 5` and act.",
         if urgent { "URGENT " } else { "" },
-        row.sender,
-        subject,
+        display_sender(row),
+        display_subject(row),
         project,
         pin
     )
@@ -202,7 +272,6 @@ fn poll_once(
         if pin.is_empty() || entry.pane_id.is_empty() {
             continue;
         }
-        let high = high_water.0.get(&pin).copied().unwrap_or(0);
         if let Some(at) = last_try.get(&pin)
             && at.elapsed() < RETRY_AFTER
         {
@@ -222,8 +291,14 @@ fn poll_once(
             continue;
         };
         let rows: Vec<MailRow> = items.into_iter().map(row_of).collect();
-        let Some(row) = newest_unseen(&rows, high) else {
-            continue;
+        let row = match plan_wake(high_water.0.get(&pin).copied(), &rows) {
+            WakePlan::Seed(tip) => {
+                high_water.0.insert(pin.clone(), tip);
+                changed = true;
+                continue;
+            }
+            WakePlan::Idle => continue,
+            WakePlan::Ring(row) => row,
         };
         let text = wake_text(project, &pin, row);
         match backend.prompt(&entry.pane_id, &text, None) {
@@ -288,9 +363,13 @@ fn stop_pin(
 
 fn row_of(item: MailItem) -> MailRow {
     MailRow {
+        id: item.id.to_string(),
         created_ts_us: item.created_ts_us,
         sender: item.sender,
         subject: item.subject,
+        // The surface DTO at toron ca87ff5c carries no `toron_kind`; the
+        // notice classifier falls back to the throwaway-sender signature.
+        kind: None,
         importance: item.importance,
     }
 }
@@ -300,24 +379,119 @@ mod tests {
     use super::*;
 
     fn row(created_ts_us: i64, sender: &str, subject: &str, importance: &str) -> MailRow {
+        row_full("m", created_ts_us, sender, subject, None, importance)
+    }
+
+    fn row_full(
+        id: &str,
+        created_ts_us: i64,
+        sender: &str,
+        subject: &str,
+        kind: Option<&str>,
+        importance: &str,
+    ) -> MailRow {
         MailRow {
+            id: id.into(),
             created_ts_us,
             sender: sender.into(),
             subject: subject.into(),
+            kind: kind.map(str::to_string),
             importance: importance.into(),
         }
     }
 
+    const HASH: &str = "66f8ee6b23714f24db7682b2d741e7ae0c0f8ff609dbafb2f7e706d3b1869f16";
+
+    /// bd-ohxou: a reservation-revoked notice never rings a pane.
     #[test]
-    fn newest_unseen_is_strictly_above_the_high_water() {
+    fn reservation_revoked_notice_never_rings() {
+        let r = row_full("n1", 10, HASH, "", Some("reservation-revoked"), "normal");
+        assert!(is_system_notice(&r));
+        assert!(plan_wake(None, std::slice::from_ref(&r)) == WakePlan::Seed(10));
+        assert!(plan_wake(Some(0), std::slice::from_ref(&r)) == WakePlan::Idle);
+        assert!(newest_ringable(std::slice::from_ref(&r), 0).is_none());
+    }
+
+    /// The production wire carries no toron-kind, so the same notice is
+    /// recognised by its throwaway hex sender and empty subject.
+    #[test]
+    fn raw_key_notice_with_empty_subject_never_rings() {
+        let r = row_full("n2", 10, HASH, "", None, "normal");
+        assert!(is_system_notice(&r));
+        assert!(plan_wake(Some(0), std::slice::from_ref(&r)) == WakePlan::Idle);
+    }
+
+    /// Agent mail rings, and the wake names the sender pin and subject.
+    #[test]
+    fn agent_mail_rings_with_pin_and_subject() {
+        let r = row_full("m1", 20, "SlateHarbor", "Brief: slice 2", None, "normal");
+        assert!(!is_system_notice(&r));
+        assert!(matches!(
+            plan_wake(Some(10), std::slice::from_ref(&r)),
+            WakePlan::Ring(row) if row.id == "m1"
+        ));
+        let text = wake_text("flywheel", "PurpleGorge", &r);
+        assert!(text.contains("SlateHarbor"), "{text}");
+        assert!(text.contains("Brief: slice 2"), "{text}");
+    }
+
+    /// A ringing row with no subject renders its kind, never an empty dash.
+    #[test]
+    fn empty_subject_renders_the_kind() {
+        let r = row_full("m2", 30, "SlateHarbor", "", Some("notice"), "normal");
+        let text = wake_text("flywheel", "PurpleGorge", &r);
+        assert!(text.contains("notice"), "{text}");
+        assert!(!text.contains("— ."), "{text}");
+    }
+
+    /// A raw hex sender never leaks into the pane prompt.
+    #[test]
+    fn wake_text_never_prints_a_raw_hex_sender() {
+        let r = row_full("n3", 40, HASH, "ping", Some("ack"), "normal");
+        let text = wake_text("flywheel", "PurpleGorge", &r);
+        assert!(!text.contains(HASH), "{text}");
+    }
+
+    /// bd-4xthm: exactly one door owns a wake; the envelope host and the mail
+    /// host never both ring.
+    #[test]
+    fn exactly_one_wake_door_owns() {
+        assert!(mail_wake_owns(false));
+        assert!(!mail_wake_owns(true));
+    }
+
+    /// A fresh pin with a backlog is seeded to the tip, not rung.
+    #[test]
+    fn fresh_pin_backlog_is_seeded_not_rung() {
+        let rows = vec![
+            row_full("old1", 10, "Someone", "old", None, "normal"),
+            row_full("old2", 20, "Someone", "older", None, "normal"),
+        ];
+        assert_eq!(plan_wake(None, &rows), WakePlan::Seed(20));
+        let fresh = vec![
+            row_full("old1", 10, "Someone", "old", None, "normal"),
+            row_full("new1", 30, "Someone", "new", None, "normal"),
+        ];
+        assert!(matches!(
+            plan_wake(Some(20), &fresh),
+            WakePlan::Ring(row) if row.id == "new1"
+        ));
+        assert_eq!(plan_wake(Some(30), &fresh), WakePlan::Idle);
+    }
+
+    #[test]
+    fn newest_ringable_is_strictly_above_the_high_water() {
         let rows = vec![
             row(10, "A", "old", "normal"),
             row(20, "B", "new", "normal"),
             row(15, "C", "middle", "normal"),
         ];
-        assert_eq!(newest_unseen(&rows, 0).map(|r| r.created_ts_us), Some(20));
-        assert_eq!(newest_unseen(&rows, 20).map(|r| r.created_ts_us), None);
-        assert_eq!(newest_unseen(&rows, 16).map(|r| r.created_ts_us), Some(20));
+        assert_eq!(newest_ringable(&rows, 0).map(|r| r.created_ts_us), Some(20));
+        assert_eq!(newest_ringable(&rows, 20).map(|r| r.created_ts_us), None);
+        assert_eq!(
+            newest_ringable(&rows, 16).map(|r| r.created_ts_us),
+            Some(20)
+        );
     }
 
     #[test]
