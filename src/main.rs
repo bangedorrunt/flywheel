@@ -7609,10 +7609,7 @@ pub(crate) enum EnvpinHopOutcome {
 /// verdict is a bug, never a silent downgrade.
 pub(crate) fn envpin_respin_hop(
     backend: &dyn backend::MultiplexerBackend,
-    split_with_env: &dyn Fn(
-        &str,
-        &std::collections::BTreeMap<String, String>,
-    ) -> anyhow::Result<String>,
+    respawn: &dyn Fn(&str) -> anyhow::Result<AgentInfo>,
     hop: &EnvpinHop,
     already_rerouted: bool,
 ) -> anyhow::Result<EnvpinHopOutcome> {
@@ -7687,10 +7684,7 @@ pub(crate) fn envpin_respin_hop(
             .find(|p| p.pane_id != hop.old_pane)
             .map(|p| p.pane_id.clone())
             .unwrap_or_else(|| hop.old_pane.clone());
-        let new_pane = split_with_env(&anchor, &hop.next_env)?;
-        let info = backend
-            .agent_start(&hop.agent, &hop.next_harness, &new_pane, &hop.next_args)
-            .map_err(anyhow::Error::from)?;
+        let info = respawn(&anchor)?;
         backend
             .pane_close(&hop.old_pane)
             .map_err(anyhow::Error::from)?;
@@ -7743,7 +7737,8 @@ fn envpin_split_refusal(err: &anyhow::Error) -> Option<String> {
 /// `cfg` and `project`. Anything else fails closed with
 /// [`EnvPinSplitUnsupported`] before anything launches — a trait split
 /// carries no env map, and hc without cfg/project cannot locate the
-/// workspace or daemon. Callers map that error to a refusal, never a hop.
+/// workspace or daemon. [`envpin_hop_respawn`] routes hc here; a backend with
+/// another launch path never calls it.
 fn envpin_hop_split(
     cfg: Option<&Config>,
     project: Option<&str>,
@@ -7768,6 +7763,98 @@ fn envpin_hop_split(
     .into())
 }
 
+/// Respawn the env-pinned hop on a fresh pane under `anchor`. hc pins the
+/// model at split (a pane's env is fixed there); rex takes a plain split and
+/// delivers the same pin as an `env` command prefix through the spawn path
+/// ([`crate::pane::rex_env_command`]) instead of refusing. A backend with
+/// neither path stays refused by [`EnvPinSplitUnsupported`].
+fn envpin_hop_respawn(
+    cfg: Option<&Config>,
+    project: &str,
+    backend: &dyn backend::MultiplexerBackend,
+    hop: &EnvpinHop,
+    anchor: &str,
+) -> anyhow::Result<AgentInfo> {
+    match backend.name() {
+        "hc" => {
+            let pane = envpin_hop_split(cfg, Some(project), backend, anchor, &hop.next_env)?;
+            backend
+                .agent_start(&hop.agent, &hop.next_harness, &pane, &hop.next_args)
+                .map_err(anyhow::Error::from)
+        }
+        "rex" => envpin_hop_rex_launch(cfg, project, backend, hop, anchor),
+        unsupported => Err(EnvPinSplitUnsupported {
+            backend: unsupported.to_string(),
+        }
+        .into()),
+    }
+}
+
+/// Rex arm of [`envpin_hop_respawn`]: split plain, then launch through the
+/// same env-prefixed `pane_run` spawn uses, so the new pane carries the model
+/// pin (and the agent's mail identity) without one.
+fn envpin_hop_rex_launch(
+    cfg: Option<&Config>,
+    project: &str,
+    backend: &dyn backend::MultiplexerBackend,
+    hop: &EnvpinHop,
+    anchor: &str,
+) -> anyhow::Result<AgentInfo> {
+    let Some(cfg) = cfg else {
+        return Err(EnvPinSplitUnsupported {
+            backend: backend.name().to_string(),
+        }
+        .into());
+    };
+    let dir = project_dir(cfg, project);
+    let split = backend
+        .pane_split(anchor, "down", Some(&utf8_path(&dir, "workspace dir")?))
+        .map_err(anyhow::Error::from)?;
+    crate::pane::wait_rex_shell_ready(
+        backend,
+        &split.pane_id,
+        &hop.agent,
+        &split.pane_id,
+        Duration::from_secs(15),
+    )?;
+    let identity = envpin_hop_mail_identity(project, &hop.agent);
+    let mut pane_env =
+        crate::pane::pane_env_for_launch(cfg, identity.as_deref(), Some(&hop.next_model))?;
+    pane_env.extend(hop.next_env.clone());
+    let command = crate::pane::rex_env_command(&pane_env, &hop.next_harness, &hop.next_args);
+    backend
+        .pane_run(&split.pane_id, &command)
+        .map_err(|e| anyhow::anyhow!("rex env-pin hop run on {}: {e}", split.pane_id))?;
+    if let Err(e) = backend.agent_rename(&split.pane_id, Some(&hop.agent)) {
+        eprintln!(
+            "flywheel: warn: rex env-pin hop rename {} → {} failed: {e}",
+            split.pane_id, hop.agent
+        );
+    }
+    backend
+        .agent_wait(
+            &split.pane_id,
+            &[AgentStatus::Idle, AgentStatus::Working],
+            Some(90_000),
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "rex env-pin hop launch on {} not confirmed: {e}",
+                split.pane_id
+            )
+        })
+}
+
+/// The mail pin a respawned pane must keep carrying: the registry entry the
+/// spawn recorded for this agent, never a fresh draw.
+fn envpin_hop_mail_identity(project: &str, agent: &str) -> Option<String> {
+    crate::state::load_spawn_registry(project)
+        .iter()
+        .find(|entry| entry.name == agent)
+        .and_then(|entry| entry.mail_identity.clone())
+        .filter(|identity| !identity.is_empty())
+}
+
 /// Outcome of one reroute-site hop attempt: return the hopped agent, fail
 /// loud on a broken hop, rejoin the in-place reroute when the reconciler
 /// is satisfied, or keep today's refusal.
@@ -7786,7 +7873,6 @@ mod envpin_reroute_tests {
 
     struct FakeHopBackend {
         order: Arc<Mutex<Vec<String>>>,
-        fail_launch: bool,
     }
 
     impl crate::backend::MultiplexerBackend for FakeHopBackend {
@@ -7831,11 +7917,6 @@ mod envpin_reroute_tests {
                 .lock()
                 .unwrap()
                 .push(format!("launch:{name}@{pane_id}"));
-            if self.fail_launch {
-                return Err(toron_plane::backend::BackendError::timeout(
-                    "fake launch failed".to_string(),
-                ));
-            }
             Ok(toron_core::pane_types::AgentInfo {
                 agent: None,
                 agent_status: toron_core::pane_types::AgentStatus::Working,
@@ -7910,7 +7991,6 @@ mod envpin_reroute_tests {
         let seen_prepared_at_split = Arc::new(Mutex::new(None));
         let backend = FakeHopBackend {
             order: order.clone(),
-            fail_launch: false,
         };
         let hop = hop_fixture();
         let key = crate::agent_ref::RebindIntent::derive_effect_key(
@@ -7932,24 +8012,16 @@ mod envpin_reroute_tests {
         let split_seen = seen_prepared_at_split.clone();
         let project = hop.project.clone();
         let key2 = key.clone();
-        let split = move |anchor: &str, env: &BTreeMap<String, String>| -> anyhow::Result<String> {
+        let respawn = move |anchor: &str| -> anyhow::Result<AgentInfo> {
             split_order.lock().unwrap().push(format!("split:{anchor}"));
-            assert!(
-                env.contains_key("OPENCODE_CONFIG_CONTENT"),
-                "new env pin travels"
-            );
-            assert!(
-                env.contains_key("FLYWHEEL_REROUTE_NOTE"),
-                "handoff note travels"
-            );
             let rows = rebind_rows(&project, &key2);
             let prepared = rows
                 .iter()
                 .any(|i| i.state == toron_core::index::workflow_effects::EffectState::Prepared);
             *split_seen.lock().unwrap() = Some(prepared);
-            Ok("new-pane-1".to_string())
+            Ok(site_agent("TestyCreek", "new-pane-1"))
         };
-        let got = envpin_respin_hop(&backend, &split, &hop, false).expect("hop runs");
+        let got = envpin_respin_hop(&backend, &respawn, &hop, false).expect("hop runs");
         assert!(
             matches!(&got, EnvpinHopOutcome::Hopped { agent } if agent.name.as_deref() == Some("TestyCreek")),
             "same agent name kept: {got:?}"
@@ -7961,12 +8033,8 @@ mod envpin_reroute_tests {
         );
         assert_eq!(
             *order.lock().unwrap(),
-            vec![
-                "split:old-pane".to_string(),
-                "launch:TestyCreek@new-pane-1".to_string(),
-                "close:old-pane".to_string(),
-            ],
-            "old pane closes only after the new one launches"
+            vec!["split:old-pane".to_string(), "close:old-pane".to_string()],
+            "the respawn runs while the intent is Prepared, old pane closes after"
         );
         let rows = rebind_rows(&hop.project, &key);
         assert_eq!(rows.len(), 3, "exactly one intent, three states: {rows:?}");
@@ -7986,14 +8054,13 @@ mod envpin_reroute_tests {
         let order = Arc::new(Mutex::new(Vec::new()));
         let backend = FakeHopBackend {
             order: order.clone(),
-            fail_launch: false,
         };
         let mut hop = hop_fixture();
         hop.kind = crate::failure::FailureKind::Timeout;
-        let split = |_: &str, _: &BTreeMap<String, String>| -> anyhow::Result<String> {
+        let respawn = |_: &str| -> anyhow::Result<AgentInfo> {
             panic!("closed gate must not split")
         };
-        let got = envpin_respin_hop(&backend, &split, &hop, false).expect("hop runs");
+        let got = envpin_respin_hop(&backend, &respawn, &hop, false).expect("hop runs");
         assert!(
             matches!(got, EnvpinHopOutcome::SuppressedGate),
             "closed gate suppresses: {got:?}"
@@ -8013,13 +8080,12 @@ mod envpin_reroute_tests {
         let order = Arc::new(Mutex::new(Vec::new()));
         let backend = FakeHopBackend {
             order: order.clone(),
-            fail_launch: false,
         };
         let hop = hop_fixture();
-        let split = |_: &str, _: &BTreeMap<String, String>| -> anyhow::Result<String> {
+        let respawn = |_: &str| -> anyhow::Result<AgentInfo> {
             panic!("second failure must not split")
         };
-        let got = envpin_respin_hop(&backend, &split, &hop, true).expect("hop runs");
+        let got = envpin_respin_hop(&backend, &respawn, &hop, true).expect("hop runs");
         assert!(
             matches!(got, EnvpinHopOutcome::AlreadyRerouted),
             "second failure does not hop: {got:?}"
@@ -8039,14 +8105,13 @@ mod envpin_reroute_tests {
         let order = Arc::new(Mutex::new(Vec::new()));
         let backend = FakeHopBackend {
             order: order.clone(),
-            fail_launch: false,
         };
         let mut hop = hop_fixture();
         hop.next_model = hop.from_model.clone();
-        let split = |_: &str, _: &BTreeMap<String, String>| -> anyhow::Result<String> {
+        let respawn = |_: &str| -> anyhow::Result<AgentInfo> {
             panic!("satisfied hop must not split")
         };
-        let got = envpin_respin_hop(&backend, &split, &hop, false).expect("hop runs");
+        let got = envpin_respin_hop(&backend, &respawn, &hop, false).expect("hop runs");
         assert!(
             matches!(got, EnvpinHopOutcome::AlreadySatisfied),
             "same model is already satisfied: {got:?}"
@@ -8060,14 +8125,13 @@ mod envpin_reroute_tests {
         let order = Arc::new(Mutex::new(Vec::new()));
         let backend = FakeHopBackend {
             order: order.clone(),
-            fail_launch: true,
         };
         let hop = hop_fixture();
-        let split = |anchor: &str, _: &BTreeMap<String, String>| -> anyhow::Result<String> {
+        let respawn = |anchor: &str| -> anyhow::Result<AgentInfo> {
             order.lock().unwrap().push(format!("split:{anchor}"));
-            Ok("new-pane-1".to_string())
+            Err(anyhow::anyhow!("fake launch failed"))
         };
-        let err = envpin_respin_hop(&backend, &split, &hop, false).expect_err("launch fails");
+        let err = envpin_respin_hop(&backend, &respawn, &hop, false).expect_err("launch fails");
         assert!(format!("{err:#}").contains("fake launch failed"));
         let calls = order.lock().unwrap().clone();
         assert!(
@@ -8075,18 +8139,201 @@ mod envpin_reroute_tests {
             "split ran: {calls:?}"
         );
         assert!(
-            calls.iter().any(|c| c.starts_with("launch:")),
-            "launch ran: {calls:?}"
-        );
-        assert!(
             !calls.iter().any(|c| c.starts_with("close:")),
             "old pane never closed on failed launch: {calls:?}"
+        );
+    }
+
+    struct FakeRexHopBackend {
+        order: Arc<Mutex<Vec<String>>>,
+        commands: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl crate::backend::MultiplexerBackend for FakeRexHopBackend {
+        fn name(&self) -> &'static str {
+            "rex"
+        }
+        fn pane_list(
+            &self,
+            _workspace_id: Option<&str>,
+        ) -> Result<Vec<toron_core::pane_types::PaneInfo>, toron_plane::backend::BackendError>
+        {
+            Ok(vec![site_pane("old-pane")])
+        }
+        fn pane_split(
+            &self,
+            parent: &str,
+            direction: &str,
+            _cwd: Option<&str>,
+        ) -> Result<toron_core::pane_types::PaneInfo, toron_plane::backend::BackendError> {
+            self.order
+                .lock()
+                .unwrap()
+                .push(format!("split:{parent}:{direction}"));
+            Ok(site_pane("new-pane-1"))
+        }
+        fn agent_list(
+            &self,
+        ) -> Result<Vec<toron_core::pane_types::AgentInfo>, toron_plane::backend::BackendError>
+        {
+            let mut row = site_agent("", "new-pane-1");
+            row.agent_status = toron_core::pane_types::AgentStatus::Idle;
+            Ok(vec![row])
+        }
+        fn pane_run(
+            &self,
+            pane_id: &str,
+            command: &str,
+        ) -> Result<(), toron_plane::backend::BackendError> {
+            self.order
+                .lock()
+                .unwrap()
+                .push(format!("run:{pane_id}"));
+            self.commands.lock().unwrap().push(command.to_string());
+            Ok(())
+        }
+        fn agent_rename(
+            &self,
+            pane_id: &str,
+            new_name: Option<&str>,
+        ) -> Result<(), toron_plane::backend::BackendError> {
+            self.order.lock().unwrap().push(format!(
+                "rename:{}@{pane_id}",
+                new_name.unwrap_or_default()
+            ));
+            Ok(())
+        }
+        fn agent_wait(
+            &self,
+            pane_id: &str,
+            _until: &[toron_core::pane_types::AgentStatus],
+            _timeout_ms: Option<u64>,
+        ) -> Result<toron_core::pane_types::AgentInfo, toron_plane::backend::BackendError> {
+            self.order.lock().unwrap().push(format!("wait:{pane_id}"));
+            Ok(site_agent("TestyCreek", pane_id))
+        }
+        fn pane_close(&self, pane_id: &str) -> Result<(), toron_plane::backend::BackendError> {
+            self.order.lock().unwrap().push(format!("close:{pane_id}"));
+            Ok(())
+        }
+    }
+
+    fn hop_effect_key(hop: &EnvpinHop) -> String {
+        crate::agent_ref::RebindIntent::derive_effect_key(
+            &crate::agent_ref::AgentRef::new(&hop.project, &hop.agent),
+            &crate::agent_ref::AgentBinding {
+                profile_name: hop.from_profile.clone(),
+                model: hop.from_model.clone(),
+                harness: hop.from_harness.clone(),
+                location: crate::agent_ref::BindingLocation::Pane,
+            },
+            &crate::agent_ref::AgentBinding {
+                profile_name: hop.next_profile.clone(),
+                model: hop.next_model.clone(),
+                harness: hop.next_harness.clone(),
+                location: crate::agent_ref::BindingLocation::Pane,
+            },
+        )
+    }
+
+    #[test]
+    fn envpin_rex_hop_splits_plain_and_pins_via_rex_env_command() {
+        let _guard = crate::config::lock_env();
+        crate::state::save_spawn_registry(
+            "envpin-test-proj",
+            &[crate::state::SpawnEntry::profiled(
+                "old-pane",
+                "TestyCreek",
+                "coder",
+                "opencode",
+                Some("CyanTest".to_string()),
+            )],
+        )
+        .expect("stage the spawn registry");
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let backend = FakeRexHopBackend {
+            order: order.clone(),
+            commands: commands.clone(),
+        };
+        let cfg = Config::default();
+        let hop = hop_fixture();
+        let respawn =
+            |anchor: &str| envpin_hop_respawn(Some(&cfg), &hop.project, &backend, &hop, anchor);
+        let got = envpin_respin_hop(&backend, &respawn, &hop, false).expect("rex hop runs");
+        assert!(
+            matches!(&got, EnvpinHopOutcome::Hopped { agent } if agent.name.as_deref() == Some("TestyCreek")),
+            "same agent name kept: {got:?}"
+        );
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec![
+                "split:old-pane:down".to_string(),
+                "run:new-pane-1".to_string(),
+                "rename:TestyCreek@new-pane-1".to_string(),
+                "wait:new-pane-1".to_string(),
+                "close:old-pane".to_string(),
+            ],
+            "plain split, then the env-prefixed run; the old pane closes last"
+        );
+        let commands = commands.lock().unwrap().clone();
+        assert_eq!(commands.len(), 1, "one run: {commands:?}");
+        let command = &commands[0];
+        assert!(
+            command.starts_with("env "),
+            "the pin travels as an env prefix: {command}"
+        );
+        assert!(
+            command.contains("OPENCODE_CONFIG_CONTENT=")
+                && command.contains("\"model\":\"opencode/new\""),
+            "the NEW model rides the rex env prefix: {command}"
+        );
+        assert!(
+            command.contains("AGENT_NAME=CyanTest"),
+            "the agent keeps its mail identity: {command}"
+        );
+        assert!(
+            command.contains("opencode"),
+            "the harness launches the hop args: {command}"
+        );
+        let rows = rebind_rows(&hop.project, &hop_effect_key(&hop));
+        assert_eq!(rows.len(), 3, "exactly one intent, three states: {rows:?}");
+        assert_eq!(
+            rows.iter().map(|i| i.state.clone()).collect::<Vec<_>>(),
+            vec![
+                toron_core::index::workflow_effects::EffectState::Prepared,
+                toron_core::index::workflow_effects::EffectState::InFlight,
+                toron_core::index::workflow_effects::EffectState::Settled,
+            ]
+        );
+    }
+
+    #[test]
+    fn envpin_hop_respawn_unknown_backend_refuses() {
+        let cfg = Config::default();
+        let hop = hop_fixture();
+        let err = envpin_hop_respawn(
+            Some(&cfg),
+            &hop.project,
+            &NeverSplitBackend("superlogical"),
+            &hop,
+            "anchor",
+        )
+        .expect_err("a backend with neither launch path must refuse");
+        assert!(
+            err.downcast_ref::<EnvPinSplitUnsupported>().is_some(),
+            "the refusal is the typed one: {err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains("superlogical"),
+            "the refusal names the backend: {err:#}"
         );
     }
 
     struct RexRefuseBackend {
         order: Arc<Mutex<Vec<String>>>,
         starts: Arc<Mutex<usize>>,
+        commands: Arc<Mutex<Vec<String>>>,
     }
 
     fn site_pane(id: &str) -> toron_core::pane_types::PaneInfo {
@@ -8144,7 +8391,9 @@ mod envpin_reroute_tests {
             &self,
         ) -> Result<Vec<toron_core::pane_types::AgentInfo>, toron_plane::backend::BackendError>
         {
-            Ok(Vec::new())
+            let mut row = site_agent("", "new-pane-1");
+            row.agent_status = toron_core::pane_types::AgentStatus::Idle;
+            Ok(vec![row])
         }
         fn pane_list(
             &self,
@@ -8155,11 +8404,47 @@ mod envpin_reroute_tests {
         }
         fn pane_split(
             &self,
-            _parent_pane_id: &str,
-            _direction: &str,
+            parent: &str,
+            direction: &str,
             _cwd: Option<&str>,
         ) -> Result<toron_core::pane_types::PaneInfo, toron_plane::backend::BackendError> {
-            panic!("rex must never split for an env-pin hop: the trait split cannot carry the pin");
+            self.order
+                .lock()
+                .unwrap()
+                .push(format!("split:{parent}:{direction}"));
+            Ok(site_pane("new-pane-1"))
+        }
+        fn pane_run(
+            &self,
+            pane_id: &str,
+            command: &str,
+        ) -> Result<(), toron_plane::backend::BackendError> {
+            self.order
+                .lock()
+                .unwrap()
+                .push(format!("run:{pane_id}"));
+            self.commands.lock().unwrap().push(command.to_string());
+            Ok(())
+        }
+        fn agent_rename(
+            &self,
+            pane_id: &str,
+            new_name: Option<&str>,
+        ) -> Result<(), toron_plane::backend::BackendError> {
+            self.order.lock().unwrap().push(format!(
+                "rename:{}@{pane_id}",
+                new_name.unwrap_or_default()
+            ));
+            Ok(())
+        }
+        fn agent_wait(
+            &self,
+            pane_id: &str,
+            _until: &[toron_core::pane_types::AgentStatus],
+            _timeout_ms: Option<u64>,
+        ) -> Result<toron_core::pane_types::AgentInfo, toron_plane::backend::BackendError> {
+            self.order.lock().unwrap().push(format!("wait:{pane_id}"));
+            Ok(site_agent("TestyCreek", pane_id))
         }
         fn agent_start(
             &self,
@@ -8230,7 +8515,7 @@ mod envpin_reroute_tests {
     }
 
     #[test]
-    fn envpin_respawn_rex_site_refuses_not_downgrades() {
+    fn envpin_respawn_rex_site_hops_with_pin() {
         let _guard = crate::config::lock_env();
         let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
         let nanos = std::time::SystemTime::now()
@@ -8252,11 +8537,14 @@ mod envpin_reroute_tests {
         )
         .expect("stage models");
         let order = Arc::new(Mutex::new(Vec::new()));
+        let commands = Arc::new(Mutex::new(Vec::new()));
         let backend = RexRefuseBackend {
             order: order.clone(),
             starts: Arc::new(Mutex::new(0)),
+            commands: commands.clone(),
         };
-        let err = start_agent_with_retry_dyn_profile(
+        let cfg = Config::default();
+        let agent = start_agent_with_retry_dyn_profile(
             &backend,
             "TestyCreek",
             "opencode",
@@ -8264,17 +8552,28 @@ mod envpin_reroute_tests {
             &[],
             Some("opencode-fallback"),
             Some("envpin-rex-proj"),
-            None,
+            Some(&cfg),
         )
-        .expect_err("rex cannot carry the pin: the site refuses, never hops");
-        assert!(
-            err.to_string().contains("reroute hop failed"),
-            "refusal falls through to today's terminal error: {err:#}"
-        );
+        .expect("rex respawns the pinned hop instead of refusing");
+        assert_eq!(agent.name.as_deref(), Some("TestyCreek"));
         assert_eq!(
             *order.lock().unwrap(),
-            vec!["start:TestyCreek@old-pane".to_string()],
-            "nothing launched and the old pane is never closed"
+            vec![
+                "start:TestyCreek@old-pane".to_string(),
+                "split:old-pane:down".to_string(),
+                "run:new-pane-1".to_string(),
+                "rename:TestyCreek@new-pane-1".to_string(),
+                "wait:new-pane-1".to_string(),
+                "close:old-pane".to_string(),
+            ],
+            "the site splits plain, runs the pinned launch, then closes the old pane"
+        );
+        let commands = commands.lock().unwrap().clone();
+        assert_eq!(commands.len(), 1, "one rex run: {commands:?}");
+        assert!(
+            commands[0].contains("\"model\":\"opencode/gold\""),
+            "the fallback model rides the rex env prefix: {}",
+            commands[0]
         );
         let key = crate::agent_ref::RebindIntent::derive_effect_key(
             &crate::agent_ref::AgentRef::new("envpin-rex-proj", "TestyCreek"),
@@ -8297,9 +8596,9 @@ mod envpin_reroute_tests {
             vec![
                 toron_core::index::workflow_effects::EffectState::Prepared,
                 toron_core::index::workflow_effects::EffectState::InFlight,
-                toron_core::index::workflow_effects::EffectState::Failed,
+                toron_core::index::workflow_effects::EffectState::Settled,
             ],
-            "the refused hop is marked Failed, never rolled back: {rows:?}"
+            "the hopped respawn settles its one intent: {rows:?}"
         );
         match prev_xdg {
             Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
@@ -8475,19 +8774,6 @@ pub(crate) fn start_agent_with_retry_profile(
                                                         return SiteHop::Failed(e.into());
                                                     }
                                                 };
-                                            let split = |anchor: &str,
-                                                         env: &std::collections::BTreeMap<
-                                                String,
-                                                String,
-                                            >| {
-                                                envpin_hop_split(
-                                                    Some(cfg),
-                                                    Some(proj),
-                                                    &*hop_backend,
-                                                    anchor,
-                                                    env,
-                                                )
-                                            };
                                             let hop = EnvpinHop {
                                                 project: proj.to_string(),
                                                 agent: name.to_string(),
@@ -8506,9 +8792,18 @@ pub(crate) fn start_agent_with_retry_profile(
                                                 evidence: cf.evidence.clone(),
                                                 attempt: attempt as u32,
                                             };
+                                            let respawn = |anchor: &str| {
+                                                envpin_hop_respawn(
+                                                    Some(cfg),
+                                                    proj,
+                                                    &*hop_backend,
+                                                    &hop,
+                                                    anchor,
+                                                )
+                                            };
                                             match envpin_respin_hop(
                                                 &*hop_backend,
-                                                &split,
+                                                &respawn,
                                                 &hop,
                                                 already_rerouted,
                                             ) {
@@ -8737,15 +9032,6 @@ fn start_agent_with_retry_dyn_profile(
                                                     cf.kind
                                                 ),
                                             );
-                                            let split = |anchor: &str,
-                                                         env: &std::collections::BTreeMap<
-                                                String,
-                                                String,
-                                            >| {
-                                                envpin_hop_split(
-                                                    cfg, project, backend, anchor, env,
-                                                )
-                                            };
                                             let hop = EnvpinHop {
                                                 project: proj.to_string(),
                                                 agent: name.to_string(),
@@ -8764,9 +9050,14 @@ fn start_agent_with_retry_dyn_profile(
                                                 evidence: cf.evidence.clone(),
                                                 attempt: attempt as u32,
                                             };
+                                            let respawn = |anchor: &str| {
+                                                envpin_hop_respawn(
+                                                    cfg, proj, backend, &hop, anchor,
+                                                )
+                                            };
                                             match envpin_respin_hop(
                                                 backend,
-                                                &split,
+                                                &respawn,
                                                 &hop,
                                                 already_rerouted,
                                             ) {
