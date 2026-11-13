@@ -113,6 +113,17 @@ if [ "$verify_status" -ne 0 ]; then
   exit 1
 fi
 
+echo "clean-proof: protocol models (TLC)"
+set +e
+bash scripts/verify-formal.sh 2>&1 | tee "$TMP/formal.log"
+formal_status=${PIPESTATUS[0]}
+set -e
+echo "$formal_status" >"$TMP/formal.status"
+if [ "$formal_status" -ne 0 ]; then
+  echo "clean-proof: protocol models failed; log $TMP/formal.log" >&2
+  exit 1
+fi
+
 if [ "$TESTS" -eq 1 ]; then
   echo "clean-proof: doorbell tests"
   set +e
