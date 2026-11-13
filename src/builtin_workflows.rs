@@ -1423,7 +1423,7 @@ graph:
       until: 'steps_fence_ok == true && steps_converged_ok == true'
       on_error: fail_run
       body:
-        - name: polish
+        - name: round
           action: dispatch_job
           assignee: x
           spec:
@@ -4118,7 +4118,7 @@ mod tests {
     }
 
     /// ADR-0021 D7: polish loop + plan-polish stage (bd-plan-polish-loop-8delw).
-    /// No judge-arms; body polish/audit/integrate dispatch
+    /// No judge-arms; body round/audit/integrate dispatch
     /// plan-polish effort max; audit fresh; polish loop min 2 max 5 until
     /// fence+converged fail_run; fence_final fail_run; stage role/phase/prompt.
     #[test]
@@ -4173,10 +4173,10 @@ mod tests {
         );
         let polish = body
             .iter()
-            .find(|s| s.name.as_deref() == Some("polish"))
-            .expect("body polish");
+            .find(|s| s.name.as_deref() == Some("round"))
+            .expect("body round");
         let Action::DispatchJob { spec, .. } = &polish.action else {
-            panic!("body polish is a dispatch");
+            panic!("body round is a dispatch");
         };
         assert_eq!(spec.stage.as_deref(), Some("plan-polish"));
         assert_eq!(spec.effort.as_deref(), Some("max"));
@@ -4203,11 +4203,19 @@ mod tests {
                 "retired node {id} absent after collapse"
             );
         }
-        for name in ["polish", "fence", "converged"] {
+        for name in ["round", "fence", "converged"] {
             assert!(
                 body.iter().any(|s| s.name.as_deref() == Some(name)),
                 "loop body has {name}"
             );
+        }
+        for s in body {
+            if let Some(n) = s.name.as_deref() {
+                assert!(
+                    !graph.nodes.contains_key(n),
+                    "body step {n} must not equal any top-level node name (flat outputs map)"
+                );
+            }
         }
         let body_fence = body
             .iter()
