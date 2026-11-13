@@ -1073,6 +1073,20 @@ pub(crate) fn patch_shadow_profile(
     }
 }
 
+/// Mode argv for one role through the same builder the plan uses
+/// (`headless::mode_launch_args`): empty when unpatched or undeployable.
+/// Every launch path that reads overrides appends this to the seat's argv.
+pub(crate) fn patched_mode_argv(
+    overrides: &std::collections::BTreeMap<String, RoleOverride>,
+    role: &str,
+    harness: &str,
+) -> Vec<String> {
+    match overrides.get(role).and_then(|o| o.mode.clone()) {
+        Some(m) => crate::headless::mode_launch_args(harness, &m).0,
+        None => Vec::new(),
+    }
+}
+
 /// Parse every `--patch` spec once, preserving the raw spec for errors.
 fn parse_role_patches(specs: &[String]) -> Result<Vec<crate::swarm_plan::PlanPatch>> {
     specs
@@ -1178,8 +1192,6 @@ pub(crate) fn build_dry_run_plan(
             };
             (harness, model, ask.effort)
         };
-        // bd-8g3uo rework: patches become inputs here — one lowering read by
-        // plan and launch alike, so a patched plan can only launch patched.
         let patch = overrides.get(item.short.as_str());
         let harness = patch.and_then(|o| o.harness.clone()).unwrap_or(harness);
         let model = match patch.and_then(|o| o.model.clone()) {
@@ -1346,18 +1358,9 @@ projects available: {}",
         project,
         &overrides,
     )?;
-    // Coverage gate through the plan primitive itself (results discarded —
-    // the plan was built from these inputs): unknown seats fail here naming
-    // valid roles, keeping the error in one tested place.
     for (spec, patch) in opts.patches.iter().zip(patches.iter()) {
-        crate::swarm_plan::apply_patch(
-            &plan,
-            patch,
-            &model_reg,
-            &cfg.consent_policy(),
-            cfg.crew_max(),
-        )
-        .map_err(|e| anyhow::anyhow!("bad --patch {spec:?}: {e}"))?;
+        crate::swarm_plan::validate_patch(&plan, patch)
+            .map_err(|e| anyhow::anyhow!("bad --patch {spec:?}: {e}"))?;
     }
     if opts.dry_run {
         if opts.json {
@@ -1611,7 +1614,10 @@ projects available: {}",
                 Some(Some(p)) => {
                     let (mut shadow, _, _) = prefer_shadow_profile(&prefs, item, p, project);
                     patch_shadow_profile(&overrides, item.short.as_str(), &mut shadow);
-                    Some(profile_launch_plan(&kind, &shadow, None)?)
+                    let mut plan = profile_launch_plan(&kind, &shadow, None)?;
+                    plan.args
+                        .extend(patched_mode_argv(&overrides, item.short.as_str(), &kind));
+                    Some(plan)
                 }
                 _ => {
                     let ask = prefer_bare_inputs(
@@ -1623,12 +1629,10 @@ projects available: {}",
                     );
                     let (eff_model, eff_provider, eff_effort) =
                         patched_bare_launch(&overrides, item.short.as_str(), ask);
-                    first_bare = Some(bare_model_launch(
-                        &kind,
-                        &eff_model,
-                        &eff_provider,
-                        eff_effort.as_deref(),
-                    )?);
+                    let (mut args, env_pin) =
+                        bare_model_launch(&kind, &eff_model, &eff_provider, eff_effort.as_deref())?;
+                    args.extend(patched_mode_argv(&overrides, item.short.as_str(), &kind));
+                    first_bare = Some((args, env_pin));
                     None
                 }
             }
@@ -1729,7 +1733,7 @@ projects available: {}",
                         .expect("profile resolved at plan build (bd-eign.13)");
                     let (mut shadow, _, _) = prefer_shadow_profile(&prefs, item, p, project);
                     patch_shadow_profile(&overrides, item.short.as_str(), &mut shadow);
-                    let plan = if first {
+                    let mut plan = if first {
                         first_plan.take().ok_or_else(|| {
                             anyhow!(
                                 "internal: the first agent's plan was resolved before \
@@ -1739,6 +1743,8 @@ projects available: {}",
                     } else {
                         profile_launch_plan(&kind, &shadow, None)?
                     };
+                    plan.args
+                        .extend(patched_mode_argv(&overrides, item.short.as_str(), &kind));
                     (plan.args, Some(plan.model), plan.env_model_pin)
                 }
                 None => {
@@ -1759,7 +1765,14 @@ projects available: {}",
                         );
                         let (eff_model, eff_provider, eff_effort) =
                             patched_bare_launch(&overrides, item.short.as_str(), ask);
-                        bare_model_launch(&kind, &eff_model, &eff_provider, eff_effort.as_deref())?
+                        let (mut args, env_pin) = bare_model_launch(
+                            &kind,
+                            &eff_model,
+                            &eff_provider,
+                            eff_effort.as_deref(),
+                        )?;
+                        args.extend(patched_mode_argv(&overrides, item.short.as_str(), &kind));
+                        (args, env_pin)
                     };
                     (args, None, env_pin)
                 }
@@ -2246,18 +2259,9 @@ pub(crate) fn cmd_spawn_rex(
         project,
         &overrides,
     )?;
-    // Coverage gate through the plan primitive itself (results discarded —
-    // the plan was built from these inputs): unknown seats fail here naming
-    // valid roles, keeping the error in one tested place.
     for (spec, patch) in opts.patches.iter().zip(patches.iter()) {
-        crate::swarm_plan::apply_patch(
-            &plan,
-            patch,
-            &model_reg,
-            &cfg.consent_policy(),
-            cfg.crew_max(),
-        )
-        .map_err(|e| anyhow::anyhow!("bad --patch {spec:?}: {e}"))?;
+        crate::swarm_plan::validate_patch(&plan, patch)
+            .map_err(|e| anyhow::anyhow!("bad --patch {spec:?}: {e}"))?;
     }
     if opts.dry_run {
         if opts.json {
@@ -2556,7 +2560,9 @@ pub(crate) fn cmd_spawn_rex(
                         .expect("profile resolved at plan build (bd-eign.13)");
                     let (mut shadow, _, _) = prefer_shadow_profile(&prefs, item, p, project);
                     patch_shadow_profile(&overrides, item.short.as_str(), &mut shadow);
-                    let plan = profile_launch_plan(&kind, &shadow, None)?;
+                    let mut plan = profile_launch_plan(&kind, &shadow, None)?;
+                    plan.args
+                        .extend(patched_mode_argv(&overrides, item.short.as_str(), &kind));
                     (plan.args, Some(plan.model), plan.env_model_pin)
                 }
                 None => {
@@ -2569,8 +2575,9 @@ pub(crate) fn cmd_spawn_rex(
                     );
                     let (eff_model, eff_provider, eff_effort) =
                         patched_bare_launch(&overrides, item.short.as_str(), ask);
-                    let (args, env_pin) =
+                    let (mut args, env_pin) =
                         bare_model_launch(&kind, &eff_model, &eff_provider, eff_effort.as_deref())?;
+                    args.extend(patched_mode_argv(&overrides, item.short.as_str(), &kind));
                     (args, None, env_pin)
                 }
             };
@@ -6797,7 +6804,7 @@ mod plan_gate_tests {
 mod plan_patch_spawn_tests {
     fn herm_registry() -> crate::models::ModelRegistry {
         let mut models = std::collections::BTreeMap::new();
-        for key in ["a/m", "b/m"] {
+        for key in ["a/m", "b/m", "gm9zprobe"] {
             models.insert(
                 key.to_string(),
                 crate::models::ModelEntry {
@@ -7006,7 +7013,11 @@ mod plan_patch_spawn_tests {
         let catalog = crate::profile::ProfileCatalog::default();
         let prefs = crate::preferences::PreferenceSet::new();
         let items = super::spawn_items_from_plan(
-            vec![("pi".to_string(), 1), ("opencode".to_string(), 1)],
+            vec![
+                ("pi".to_string(), 1),
+                ("opencode".to_string(), 1),
+                ("grok".to_string(), 1),
+            ],
             None,
         );
         let pi_item = items.iter().find(|i| i.short == "pi").expect("pi item");
@@ -7014,16 +7025,22 @@ mod plan_patch_spawn_tests {
             .iter()
             .find(|i| i.short == "opencode")
             .expect("opencode item");
+        let gk_item = items.iter().find(|i| i.short == "grok").expect("grok item");
         let patches = vec![
             crate::swarm_plan::parse_patch("pi.model=b/m").expect("parses"),
             crate::swarm_plan::parse_patch("opencode.model=a/m").expect("parses"),
+            crate::swarm_plan::parse_patch("grok.model=gm9zprobe").expect("parses"),
+            crate::swarm_plan::parse_patch("grok.mode=read-only").expect("parses"),
+            crate::swarm_plan::parse_patch("pi.mode=turbo").expect("parses"),
         ];
         let overrides = super::patch_role_overrides(&patches);
         let plan = super::build_dry_run_plan(
             &cfg, &items, &catalog, &reg, "", "", &prefs, "probe", &overrides,
         )
         .expect("plan builds");
-        for (role, value) in [("pi", "b/m"), ("opencode", "a/m")] {
+        // grok uses a bare id: no provider to strip on either registry, so the
+        // plan and the launch agree byte-for-byte.
+        for (role, value) in [("pi", "b/m"), ("opencode", "a/m"), ("grok", "gm9zprobe")] {
             let seat = plan.seats.iter().find(|s| s.role == role).expect("seat");
             let m = seat.model.as_ref().expect("model field");
             assert_eq!(m.value, value, "patched value in plan");
@@ -7034,12 +7051,35 @@ mod plan_patch_spawn_tests {
                 m.status
             );
         }
+        // grok mode: read-only is honored and rides argv.
+        let gk = plan
+            .seats
+            .iter()
+            .find(|s| s.role == "grok")
+            .expect("grok seat");
+        let gk_mode = gk.mode.as_ref().expect("grok mode field");
+        assert_eq!(gk_mode.value, "read-only");
+        assert_eq!(gk_mode.from, crate::swarm_plan::Provenance::User);
+        assert!(
+            matches!(gk_mode.status, crate::swarm_plan::FieldStatus::Honored),
+            "grok read-only mode honored, got {:?}",
+            gk_mode.status
+        );
+        // pi mode: an undeployable mode is not honored and rides nothing.
+        let pi = plan.seats.iter().find(|s| s.role == "pi").expect("pi seat");
+        let pi_mode = pi.mode.as_ref().expect("pi mode field");
+        assert_eq!(pi_mode.value, "turbo");
+        assert!(
+            !matches!(pi_mode.status, crate::swarm_plan::FieldStatus::Honored),
+            "pi turbo mode must not be honored, got {:?}",
+            pi_mode.status
+        );
         // pi: the patched value rides argv through the real builder.
         let ask_pi = super::prefer_bare_inputs(&prefs, pi_item, "probe", "", "");
         let (model_pi, provider_pi, effort_pi) =
             super::patched_bare_launch(&overrides, "pi", ask_pi);
         assert_eq!(model_pi, "b/m");
-        let (args, pi_pin) =
+        let (mut args, pi_pin) =
             crate::bare_model_launch("pi", &model_pi, &provider_pi, effort_pi.as_deref())
                 .expect("pi launches");
         assert!(
@@ -7047,6 +7087,16 @@ mod plan_patch_spawn_tests {
             "patched model reaches pi argv: {args:?}"
         );
         assert_eq!(pi_pin, None, "pi rides argv, no env pin");
+        let pi_mode_argv = super::patched_mode_argv(&overrides, "pi", "pi");
+        assert!(
+            pi_mode_argv.is_empty(),
+            "undeployable pi mode rides nothing: {pi_mode_argv:?}"
+        );
+        args.extend(pi_mode_argv);
+        assert!(
+            !args.iter().any(|a| a == "--permission-mode"),
+            "no mode flag reaches pi argv: {args:?}"
+        );
         // opencode: the patched value rides the env pin, not argv.
         let ask_oc = super::prefer_bare_inputs(&prefs, oc_item, "probe", "", "");
         let (model_oc, provider_oc, _) = super::patched_bare_launch(&overrides, "opencode", ask_oc);
@@ -7061,6 +7111,30 @@ mod plan_patch_spawn_tests {
             oc_pin.as_deref(),
             Some("a/m"),
             "patched model reaches opencode env pin"
+        );
+        // grok: the patched model rides argv and the read-only mode flag joins it.
+        let ask_gk = super::prefer_bare_inputs(&prefs, gk_item, "probe", "", "");
+        let (model_gk, provider_gk, effort_gk) =
+            super::patched_bare_launch(&overrides, "grok", ask_gk);
+        assert_eq!(model_gk, "gm9zprobe");
+        let (mut gk_args, gk_pin) =
+            crate::bare_model_launch("grok", &model_gk, &provider_gk, effort_gk.as_deref())
+                .expect("grok launches");
+        assert!(
+            gk_args.iter().any(|a| a == "gm9zprobe"),
+            "patched model reaches grok argv: {gk_args:?}"
+        );
+        assert_eq!(gk_pin, None, "grok rides argv, no env pin");
+        let gk_mode_argv = super::patched_mode_argv(&overrides, "grok", "grok");
+        assert_eq!(
+            gk_mode_argv,
+            vec!["--permission-mode".to_string(), "plan".to_string()],
+            "grok read-only mode argv"
+        );
+        gk_args.extend(gk_mode_argv);
+        assert!(
+            gk_args.iter().any(|a| a == "--permission-mode"),
+            "patched mode reaches grok argv: {gk_args:?}"
         );
     }
 }

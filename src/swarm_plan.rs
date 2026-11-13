@@ -1178,13 +1178,9 @@ fn resolve_model_ask(
 /// turns blocked, never silently swapped. Other seats are untouched, and
 /// consent is recomputed for the whole plan. Unknown seats name the valid
 /// ones.
-pub fn apply_patch(
-    plan: &Plan,
-    patch: &PlanPatch,
-    registry: &crate::models::ModelRegistry,
-    policy: &ConsentPolicy,
-    crew_max: u32,
-) -> Result<Plan, String> {
+/// Reject an unknown seat naming the valid roles. `apply_patch` and the
+/// spawn coverage gate share this single check.
+pub fn validate_patch(plan: &Plan, patch: &PlanPatch) -> Result<(), String> {
     if !plan.seats.iter().any(|s| s.role == patch.seat) {
         let mut names: Vec<&str> = plan.seats.iter().map(|s| s.role.as_str()).collect();
         names.sort();
@@ -1195,6 +1191,17 @@ pub fn apply_patch(
             names.join(", ")
         ));
     }
+    Ok(())
+}
+
+pub fn apply_patch(
+    plan: &Plan,
+    patch: &PlanPatch,
+    registry: &crate::models::ModelRegistry,
+    policy: &ConsentPolicy,
+    crew_max: u32,
+) -> Result<Plan, String> {
+    validate_patch(plan, patch)?;
     let mut out = plan.clone();
     // A role patch re-resolves EVERY seat of that role, not just the first.
     for seat in out.seats.iter_mut().filter(|s| s.role == patch.seat) {
