@@ -1904,7 +1904,15 @@ struct WorkflowVerifyChartReport {
     warnings: Vec<String>,
 }
 
-const WORKFLOW_VERIFY_SCOPE: &str = "topology only: every guard counts as enabled and data is not modelled, so a listed state is a real defect and an empty list is not a proof; no model checker runs";
+const WORKFLOW_VERIFY_SCOPE: &str = "topology only: every guard counts as enabled and data is not modelled, so a listed state is a real defect and an empty list is not a proof; no model checker runs; waiting states checked are park (max_wait_secs) and dispatch_job await: result (result_timeout); request_approval has no timeout field in toron-workflow, so its wait is not checked";
+
+/// The bounded and witnessed findings one chart's report renders.
+#[derive(Default)]
+struct ChartFindings<'a> {
+    bounded_errors: &'a [String],
+    bounded_warnings: &'a [String],
+    witnessed_errors: &'a [String],
+}
 
 fn chart_report<S: Ord + Clone + std::fmt::Debug>(
     name: &str,
@@ -1913,8 +1921,7 @@ fn chart_report<S: Ord + Clone + std::fmt::Debug>(
     is_goal: impl Fn(&S) -> bool,
     tla: Option<String>,
     tier: Option<&str>,
-    bounded_errors: &[String],
-    bounded_warnings: &[String],
+    findings: &ChartFindings<'_>,
 ) -> WorkflowVerifyChartReport {
     let names =
         |states: Vec<S>| -> Vec<String> { states.into_iter().map(|s| format!("{s:?}")).collect() };
@@ -1929,11 +1936,14 @@ fn chart_report<S: Ord + Clone + std::fmt::Debug>(
     for state in &stuck {
         errors.push(format!("{name}: {state} has no path to {goal}"));
     }
-    for e in bounded_errors {
+    for e in findings.bounded_errors {
+        errors.push(format!("{name}: {e}"));
+    }
+    for e in findings.witnessed_errors {
         errors.push(format!("{name}: {e}"));
     }
     let mut warnings = Vec::new();
-    for w in bounded_warnings {
+    for w in findings.bounded_warnings {
         warnings.push(format!("{name}: {w}"));
     }
     WorkflowVerifyChartReport {
@@ -1942,7 +1952,8 @@ fn chart_report<S: Ord + Clone + std::fmt::Debug>(
         checks: serde_json::json!({
             "reachable": { "ok": unreachable.is_empty(), "unreachable": unreachable },
             "can_finish": { "ok": stuck.is_empty(), "goal": goal, "stuck": stuck },
-            "bounded": { "ok": bounded_errors.is_empty(), "unbounded": bounded_errors },
+            "bounded": { "ok": findings.bounded_errors.is_empty(), "unbounded": findings.bounded_errors },
+            "witnessed": { "ok": findings.witnessed_errors.is_empty(), "unwitnessed": findings.witnessed_errors },
         }),
         tla,
         tier: tier.map(str::to_string),
@@ -1960,6 +1971,7 @@ fn verify_catalog_workflow(
     name: &str,
     wf: &toron_workflow::schema::Workflow,
     tier: &str,
+    stages: &crate::stages::StageLibrary,
     export_tla: bool,
 ) -> WorkflowVerifyChartReport {
     match crate::workflow_lowering::lower(wf) {
@@ -1970,6 +1982,7 @@ fn verify_catalog_workflow(
                 "reachable": { "ok": false, "unreachable": [] },
                 "can_finish": { "ok": false, "goal": "a top-level final state", "stuck": [] },
                 "bounded": { "ok": false, "unbounded": [] },
+                "witnessed": { "ok": false, "unwitnessed": [] },
             }),
             tla: None,
             tier: Some(tier.to_string()),
@@ -1986,6 +1999,7 @@ fn verify_catalog_workflow(
             };
             let (bounded_errors, bounded_warnings) =
                 crate::workflow_lowering::check_bounded(&lowered);
+            let witnessed_errors = crate::workflow_lowering::check_witnessed(wf, stages);
             chart_report(
                 name,
                 &topo,
@@ -1993,8 +2007,11 @@ fn verify_catalog_workflow(
                 is_final,
                 export_tla.then(|| crate::workflow_lowering::tla_topology_module(&lowered, name)),
                 Some(tier),
-                &bounded_errors,
-                &bounded_warnings,
+                &ChartFindings {
+                    bounded_errors: &bounded_errors,
+                    bounded_warnings: &bounded_warnings,
+                    witnessed_errors: &witnessed_errors,
+                },
             )
         }
     }
@@ -2065,8 +2082,7 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
             is_final,
             export_tla.then(|| machine.to_tla_named("SwarmLifecycle")),
             None,
-            &[],
-            &[],
+            &ChartFindings::default(),
         )
     }
 
@@ -2079,8 +2095,7 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
             |state| *state == P2PNegotiationState::Idle,
             export_tla.then(|| machine.to_tla_named("P2PNegotiation")),
             None,
-            &[],
-            &[],
+            &ChartFindings::default(),
         )
     }
 
@@ -2101,8 +2116,7 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
             is_final,
             export_tla.then(|| machine.to_tla_named("Seat")),
             None,
-            &[],
-            &[],
+            &ChartFindings::default(),
         )
     }
 
@@ -2123,8 +2137,7 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
             is_final,
             export_tla.then(|| machine.to_tla_named("Plan")),
             None,
-            &[],
-            &[],
+            &ChartFindings::default(),
         )
     }
 
@@ -2157,6 +2170,11 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
     let project_root = std::env::current_dir()
         .ok()
         .filter(|cwd| cwd.join(".flywheel").join("workflows").is_dir());
+    let project_stages = project_root
+        .as_ref()
+        .map(|root| root.join(".flywheel").join("stages.toml"));
+    let stages = crate::stages::StageLibrary::load_layered(project_stages.as_deref())
+        .unwrap_or_else(|_| crate::stages::StageLibrary::compiled_in());
     let merged = workflow_catalog::all_workflows_merged(project_root.as_deref())?;
     let project_names = match project_root.as_deref() {
         Some(root) => project_workflow_names(root),
@@ -2168,6 +2186,7 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
                 n,
                 wf,
                 catalog_tier(source, n, &project_names),
+                &stages,
                 export_tla,
             ));
         }
@@ -2178,6 +2197,7 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
             n,
             wf,
             catalog_tier(source, n, &project_names),
+            &stages,
             export_tla,
         ));
     }
@@ -2578,8 +2598,7 @@ mod workflow_verify_statechart_tests {
             |s| *s == Chart::Done,
             None,
             None,
-            &[],
-            &[],
+            &ChartFindings::default(),
         );
         assert!(!report.ok);
         assert_eq!(
@@ -2611,7 +2630,13 @@ mod workflow_cli_lint_tests {
     fn workflow_lowering_verify_row_reports_bounded_warnings() {
         let wfs = builtin_workflows::builtin_workflows();
         let wf = wfs.get("wave-swarm").expect("wave-swarm cataloged");
-        let report = verify_catalog_workflow("wave-swarm", wf, "builtin", false);
+        let report = verify_catalog_workflow(
+            "wave-swarm",
+            wf,
+            "builtin",
+            &crate::stages::StageLibrary::compiled_in(),
+            false,
+        );
         assert!(report.ok, "wave-swarm row stays ok: {:?}", report.errors);
         assert!(report.errors.is_empty());
         assert!(
@@ -2629,10 +2654,17 @@ mod workflow_cli_lint_tests {
         let wf = wfs
             .get("beads-lifecycle")
             .expect("beads-lifecycle cataloged");
-        let report = verify_catalog_workflow("beads-lifecycle", wf, "builtin", false);
+        let report = verify_catalog_workflow(
+            "beads-lifecycle",
+            wf,
+            "builtin",
+            &crate::stages::StageLibrary::compiled_in(),
+            false,
+        );
         assert!(report.ok, "{:?}", report.errors);
         assert!(report.errors.is_empty());
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert_eq!(report.checks["witnessed"]["ok"], serde_json::json!(true));
     }
 
     /// Slice A (bd-36zlq): a temp user-tier workflow with an unreachable
@@ -2654,7 +2686,13 @@ mod workflow_cli_lint_tests {
             .get("stranded")
             .expect("temp workflow cataloged");
         let tier = catalog_tier("catalog", "stranded", &std::collections::BTreeSet::new());
-        let report = verify_catalog_workflow("stranded", wf, tier, false);
+        let report = verify_catalog_workflow(
+            "stranded",
+            wf,
+            tier,
+            &crate::stages::StageLibrary::compiled_in(),
+            false,
+        );
         assert!(!report.ok, "unreachable node fails the row");
         assert!(
             report.errors.iter().any(|e| e.contains('c')),
@@ -2663,6 +2701,33 @@ mod workflow_cli_lint_tests {
         );
         assert_eq!(report.tier.as_deref(), Some("user"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A phase-ending step whose stage declares no witness fails the row's
+    /// witnessed check, and the JSON names it.
+    #[test]
+    fn workflow_lowering_verify_row_reports_unwitnessed_phase_end() {
+        let wf = parse_workflow(
+            "name: unwitnessed\ntrigger:\n  type: webhook\ninputs: []\nsteps:\n  - name: gate\n    action: dispatch_job\n    assignee: x\n    spec: { profile: \"@planner\", phase: plan, stage: repo-map, task: map }\n",
+        )
+        .expect("parse");
+        let report = verify_catalog_workflow(
+            "unwitnessed",
+            &wf,
+            "builtin",
+            &crate::stages::StageLibrary::compiled_in(),
+            false,
+        );
+        assert!(!report.ok, "unwitnessed phase end fails the row");
+        assert_eq!(report.checks["witnessed"]["ok"], serde_json::json!(false));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("gate") && e.contains("phase plan")),
+            "{:?}",
+            report.errors
+        );
     }
 
     /// A workflow that fails to lower is a named error, not a panic.
@@ -2677,7 +2742,13 @@ steps: []
 "#,
         )
         .expect("parse");
-        let report = verify_catalog_workflow("empty", &wf, "builtin", false);
+        let report = verify_catalog_workflow(
+            "empty",
+            &wf,
+            "builtin",
+            &crate::stages::StageLibrary::compiled_in(),
+            false,
+        );
         assert!(!report.ok);
         assert!(
             report

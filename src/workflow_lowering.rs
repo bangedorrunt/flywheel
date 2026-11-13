@@ -1,9 +1,8 @@
 //! Lower catalog workflows to elm-effect-xstate machines and check the
 //! D5 topology gates (ADR-0021 D5.1-D5.3, bd-lower-workflows-verify-9mdqc).
 //!
-//! First slice: reachable, can-finish, bounded cycles. The witnessed-exit
-//! check rides a later slice (needs bd-witnessed-exits-hd035). Pure logic:
-//! no I/O, no clock, no ambient state.
+//! Checks: reachable, can-finish, bounded cycles and waits, witnessed phase
+//! ends. Pure logic: no I/O, no clock, no ambient state.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -325,11 +324,30 @@ impl LowerBuilder {
                 self.parents.insert(c.clone(), here.to_string());
                 self.lower_action(&each.action, &c, exit, &each.on_error);
             }
-            Action::Park { until_ms, .. } => {
+            Action::Park {
+                until_ms,
+                max_wait_secs,
+                ..
+            } => {
                 for e in exit {
                     self.edge(here, e);
                 }
-                if self.resolve_max(until_ms).is_none() {
+                if self.resolve_max(until_ms).is_none() || *max_wait_secs == 0 {
+                    self.unbounded_waits.push(here.to_string());
+                }
+            }
+            Action::DispatchJob {
+                await_,
+                no_claim_timeout,
+                result_timeout,
+                ..
+            } => {
+                for e in exit {
+                    self.edge(here, e);
+                }
+                if await_.is_some()
+                    && (result_timeout.is_none_or(|t| t == 0) || *no_claim_timeout == 0)
+                {
                     self.unbounded_waits.push(here.to_string());
                 }
             }
@@ -480,6 +498,98 @@ pub fn check_bounded(lowered: &Lowered) -> (Vec<String>, Vec<String>) {
         }
     }
     (errors, warnings)
+}
+
+/// Phase-ending dispatches with neither a stage witness nor a phase contract
+/// (ADR-0021 D5.2). A phase end is a dispatch carrying a `spec.phase` that
+/// names one of the registered phase contracts; it is witnessed when its
+/// stage declares a witness (the seam the engine checks at step exit) or it
+/// names no stage, leaving the phase chain's contract check as the exit.
+pub fn check_witnessed(wf: &Workflow, stages: &crate::stages::StageLibrary) -> Vec<String> {
+    let mut issues = Vec::new();
+    for (i, step) in wf.steps.iter().enumerate() {
+        let label = step
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("step_{}", i + 1));
+        walk_witness(&step.action, &label, &wf.name, stages, &mut issues);
+    }
+    if let Some(graph) = &wf.graph {
+        for (name, node) in &graph.nodes {
+            walk_witness(&node.action, name, &wf.name, stages, &mut issues);
+        }
+    }
+    issues
+}
+
+/// Collect unwitnessed phase ends under an action, naming the step path.
+fn walk_witness(
+    action: &Action,
+    label: &str,
+    workflow: &str,
+    stages: &crate::stages::StageLibrary,
+    issues: &mut Vec<String>,
+) {
+    let child = |base: &str| {
+        if label.is_empty() {
+            base.to_string()
+        } else {
+            format!("{label}/{base}")
+        }
+    };
+    match action {
+        Action::DispatchJob { spec, .. } => {
+            let Some(phase) = spec.phase.as_deref() else {
+                return;
+            };
+            if !crate::phase_contracts::WITNESSES.contains(&phase) {
+                return;
+            }
+            let Some(stage) = spec.stage.as_deref() else {
+                return;
+            };
+            let witnessed = stages
+                .get_stage(stage)
+                .and_then(|s| s.witness.as_ref())
+                .is_some();
+            if !witnessed {
+                issues.push(format!(
+                    "workflow {workflow} step {label} phase {phase} ends without a witness \
+                     or fact-derived exit (stage {stage} declares none)"
+                ));
+            }
+        }
+        Action::Loop { body, .. } => {
+            for (i, s) in body.iter().enumerate() {
+                let base = s.name.clone().unwrap_or_else(|| format!("step_{}", i + 1));
+                walk_witness(&s.action, &child(&base), workflow, stages, issues);
+            }
+        }
+        Action::Branch {
+            then, else_steps, ..
+        } => {
+            for (which, arm) in [("then", then), ("else", else_steps)] {
+                for (i, s) in arm.iter().enumerate() {
+                    let base = s.name.clone().unwrap_or_else(|| format!("step_{}", i + 1));
+                    walk_witness(
+                        &s.action,
+                        &child(&format!("{which}/{base}")),
+                        workflow,
+                        stages,
+                        issues,
+                    );
+                }
+            }
+        }
+        Action::Foreach { each, .. } | Action::Parallel { each, .. } => {
+            let base = each.name.clone().unwrap_or_else(|| "each".to_string());
+            walk_witness(&each.action, &child(&base), workflow, stages, issues);
+        }
+        Action::Retry { step, .. } => {
+            walk_witness(&step.action, label, workflow, stages, issues);
+        }
+        _ => {}
+    }
 }
 
 /// Depth-first search for back edges the lowering did not record: every
@@ -799,7 +909,143 @@ steps:
         assert!(warns.is_empty());
     }
 
-    /// Every compiled-in catalog workflow lowers and passes all three
+    /// A phase-ending step whose named stage declares no witness fails the
+    /// witnessed check naming workflow, step, and phase.
+    #[test]
+    fn workflow_lowering_phase_end_with_unwitnessed_stage_fails() {
+        let wf = parse_workflow(
+            r#"
+name: phase-without-witness
+trigger:
+  type: webhook
+inputs: []
+steps:
+  - name: gate
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@planner", phase: plan, stage: repo-map, task: map it }
+"#,
+        )
+        .expect("fixture parses");
+        let misses = check_witnessed(&wf, &crate::stages::StageLibrary::compiled_in());
+        assert_eq!(misses.len(), 1, "{misses:?}");
+        assert!(misses[0].contains("phase-without-witness"), "{misses:?}");
+        assert!(misses[0].contains("gate"), "{misses:?}");
+        assert!(misses[0].contains("plan"), "{misses:?}");
+    }
+
+    /// A phase-ending step whose named stage declares the phase witness
+    /// passes.
+    #[test]
+    fn workflow_lowering_phase_end_with_witness_stage_passes() {
+        let wf = parse_workflow(
+            r#"
+name: phase-with-witness
+trigger:
+  type: webhook
+inputs: []
+steps:
+  - name: gate
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@planner", phase: plan, stage: ce-plan }
+"#,
+        )
+        .expect("fixture parses");
+        assert!(check_witnessed(&wf, &crate::stages::StageLibrary::compiled_in()).is_empty());
+    }
+
+    /// A phase-ending step with no stage is witnessed by the phase contract
+    /// the phase chain checks.
+    #[test]
+    fn workflow_lowering_phase_end_without_stage_uses_phase_contract() {
+        let wf = parse_workflow(
+            r#"
+name: phase-no-stage
+trigger:
+  type: webhook
+inputs: []
+steps:
+  - name: gate
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@planner", phase: plan, task: decompose }
+"#,
+        )
+        .expect("fixture parses");
+        assert!(check_witnessed(&wf, &crate::stages::StageLibrary::compiled_in()).is_empty());
+    }
+
+    /// `dispatch_job await: result` without a result timeout is an unbounded
+    /// wait and fails the bounded check naming the step.
+    #[test]
+    fn workflow_lowering_dispatch_await_without_timeout_fails() {
+        let l = lowered(
+            r#"
+name: awaiting
+trigger:
+  type: webhook
+inputs: []
+steps:
+  - name: wait
+    action: dispatch_job
+    assignee: x
+    await: result
+    spec: { profile: "@coder" }
+"#,
+        );
+        let (errs, warns) = check_bounded(&l);
+        assert_eq!(errs.len(), 1, "one unbounded await: {errs:?}");
+        assert!(errs[0].contains("wait"), "{errs:?}");
+        assert!(errs[0].contains("no finite timeout"), "{errs:?}");
+        assert!(warns.is_empty());
+    }
+
+    /// `dispatch_job await: result` with a result timeout passes.
+    #[test]
+    fn workflow_lowering_dispatch_await_with_timeout_passes() {
+        let l = lowered(
+            r#"
+name: awaiting
+trigger:
+  type: webhook
+inputs: []
+steps:
+  - name: wait
+    action: dispatch_job
+    assignee: x
+    await: result
+    result_timeout: 60
+    spec: { profile: "@coder" }
+"#,
+        );
+        let (errs, warns) = check_bounded(&l);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(warns.is_empty());
+    }
+
+    /// A park with a zero cap has no timeout and fails the bounded check.
+    #[test]
+    fn workflow_lowering_park_with_zero_cap_fails() {
+        let l = lowered(
+            r#"
+name: parked
+trigger:
+  type: webhook
+inputs: []
+steps:
+  - name: wait
+    action: park
+    until_ms: "1893456000000"
+    max_wait_secs: 0
+"#,
+        );
+        let (errs, _) = check_bounded(&l);
+        assert_eq!(errs.len(), 1, "zero cap is unbounded: {errs:?}");
+        assert!(errs[0].contains("wait"), "{errs:?}");
+    }
+
+    /// Every compiled-in catalog workflow lowers and passes all four
     /// checks. A shipped failure stops the lane: report it, do not weaken
     /// the check.
     #[test]
@@ -821,6 +1067,8 @@ steps:
                 errs.is_empty(),
                 "{name} bounded errors: {errs:?} warnings: {warns:?}"
             );
+            let misses = check_witnessed(&wf, &crate::stages::StageLibrary::compiled_in());
+            assert!(misses.is_empty(), "{name} unwitnessed: {misses:?}");
         }
     }
 }
