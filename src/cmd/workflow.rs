@@ -2142,20 +2142,10 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
     if want_all || matches!(want.as_str(), "p2p" | "p2p-negotiation" | "p2pnegotiation") {
         reports.push(verify_p2p(export_tla));
     }
-    if want_all
-        || matches!(
-            want.as_str(),
-            "seat" | "seat-statechart" | "seatstatechart"
-        )
-    {
+    if want_all || matches!(want.as_str(), "seat" | "seat-statechart" | "seatstatechart") {
         reports.push(verify_seat(export_tla));
     }
-    if want_all
-        || matches!(
-            want.as_str(),
-            "plan" | "plan-statechart" | "planstatechart"
-        )
-    {
+    if want_all || matches!(want.as_str(), "plan" | "plan-statechart" | "planstatechart") {
         reports.push(verify_plan(export_tla));
     }
     // Catalog workflows (ADR-0021 D5.2 slice A, bd-36zlq): one chart report
@@ -2376,17 +2366,6 @@ pub(crate) fn lint_flywheel_tier(
         blocking: &mut usize,
         emit: &dyn Fn(&str, &mut usize),
     ) {
-        // bd-ge1zo slice 1b: flywheel bodies run in-process with no job
-        // watcher, so `await: result` can never settle here. Reject at lint
-        // time instead of hanging on a WatchJob at run time.
-        if let toron_workflow::schema::Action::DispatchJob { await_, .. } = action
-            && matches!(await_, Some(toron_workflow::schema::DispatchAwait::Result))
-        {
-            emit(
-                "dispatch_job await: result needs a toron host; flywheel in-process bodies cannot watch jobs",
-                blocking,
-            );
-        }
         let json = serde_json::to_value(action).unwrap_or_default();
         if let Some(spec) = json.get("spec").and_then(|s| s.as_object()) {
             if let Some(profile) = spec.get("profile").and_then(|v| v.as_str()) {
@@ -2809,11 +2788,10 @@ steps:
         assert_eq!(blocking, 0, "nested ref into declared root must lint clean");
     }
 
-    /// `await: result` fails closed: flywheel bodies run in-process with no
-    /// job watcher, so the lint rejects it instead of letting a body hang
-    /// on a WatchJob it cannot resolve (bd-ge1zo slice 1b).
+    /// `await: result` lints clean: bodies watch the job through the
+    /// injected watcher and settle like toron's host (bd-ge1zo slice 2a).
     #[test]
-    fn lint_rejects_dispatch_await_result() {
+    fn lint_accepts_dispatch_await_result() {
         let wf = parse_workflow(
             r#"
 name: t
@@ -2832,10 +2810,7 @@ steps:
         )
         .expect("parse");
         let blocking = lint_flywheel_tier("t", &wf, None);
-        assert_eq!(
-            blocking, 1,
-            "await: result is the only blocking issue in an otherwise clean workflow"
-        );
+        assert_eq!(blocking, 0, "await: result lints clean");
     }
 
     /// A clean workflow passes the flywheel tier (no blocking issues).
