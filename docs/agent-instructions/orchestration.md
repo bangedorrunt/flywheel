@@ -155,7 +155,7 @@ Interactive TTY `steer`, `workflow run --execute`, and managed mode commands pro
 
 The verb-per-step crib is the flywheel skill's "Captain steering crib" (one copy). Load-bearing rules:
 
-- Brief with `flywheel crew prompt` or `flywheel assign`; read crew state from `flywheel --robot-status`. Hand-offs arrive as mail plus a doorbell wake, so the captain does not poll panes or git.
+- Brief with `flywheel crew prompt` or `flywheel assign`; read crew state from `flywheel --robot-status`. Crew hand-offs arrive as mail. The doorbell never types into the captain's own pane, so the captain waits on `flywheel captain watch <p> --stall` (one-shot, re-armed after each resume) instead of polling panes or git.
 - Crews may gate and close their own beads. The captain re-verifies after close on a clean export. A correction lands as a new commit plus a `br comments add` on the closed bead, never a reopen-and-rewrite.
 - Shared-branch history rewrites are refused by the operator's dcg hook.
 
