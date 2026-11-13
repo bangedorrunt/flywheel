@@ -108,6 +108,7 @@ mod stuck_vs_busy;
 mod supervisor_hints;
 mod supervisor_host;
 mod supervisor_program;
+mod swarm_plan;
 #[cfg(test)]
 mod test_env_contract;
 #[cfg(test)]
@@ -830,6 +831,15 @@ enum Commands {
         /// conflict instead of a replay of somebody else's crew.
         #[arg(long)]
         request_key: Option<String>,
+        /// flywheel ADR-0022 phase 1: resolve exactly as the real spawn does,
+        /// print flywheel-plan.v1, and return before any pane, registry,
+        /// mail, or journal effect. With --json the plan prints compact;
+        /// without it, pretty-printed. No launch behaviour changes.
+        #[arg(long)]
+        dry_run: bool,
+        /// with --dry-run: print the plan compact (machine-readable).
+        #[arg(long)]
+        json: bool,
     },
     /// Extend a running swarm with more agent panes
     Add {
@@ -3041,6 +3051,8 @@ fn main() {
             yes,
             join,
             request_key,
+            dry_run,
+            json,
         }) => cmd_spawn(
             &cfg,
             project,
@@ -3067,6 +3079,8 @@ fn main() {
                 request_key: request_key.clone(),
                 yes: *yes,
                 join: *join,
+                dry_run: *dry_run,
+                json: *json,
             },
         ),
         Some(Commands::Add {
@@ -6719,6 +6733,10 @@ struct SpawnOpts {
     join: bool,
     /// bd-command-receipts-zile: request key pinned to this spawn's slot.
     request_key: Option<String>,
+    /// flywheel ADR-0022 phase 1: dry-run — print the plan, launch nothing.
+    dry_run: bool,
+    /// with dry_run: compact JSON plan output.
+    json: bool,
 }
 
 impl Default for SpawnOpts {
@@ -6741,6 +6759,8 @@ impl Default for SpawnOpts {
             profile_name: None,
             profile_count: 1,
             request_key: None,
+            dry_run: false,
+            json: false,
             bare_model: String::new(),
             bare_provider: String::new(),
             escape: false,

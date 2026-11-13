@@ -816,6 +816,111 @@ pub(crate) fn cmd_steer(
 }
 
 /// Dispatched from `main()`; moved from crate root (bd-wave5-main-eviction-d5hht).
+/// flywheel ADR-0022 phase 1: the dry-run plan builder.
+///
+/// Resolves exactly as the real spawn does (`spawn_model_rows` /
+/// `bare_model_launch` provenance plus `headless::interactive_model_plan`
+/// per item) and returns the `flywheel-plan.v1` without touching any pane,
+/// registry, mail, or journal state. Provenance: bare `--model` => User;
+/// profile model => Profile; implied slot model => Slot; coupled default =>
+/// HarnessDefault; no model at all => `model: null`.
+///
+/// Pure except for catalog/registry/profile lookups, which are reads.
+/// A dry-run never refuses: where the real spawn would bail (unknown
+/// profile), the plan builder errors the same way; where it would fall back
+/// to "(harness default)", the plan says `model: null`.
+pub(crate) fn build_dry_run_plan(
+    cfg: &Config,
+    items: &[crate::SpawnItem],
+    catalog: &profile::ProfileCatalog,
+    registry: &models::ModelRegistry,
+    bare_model: &str,
+    bare_provider: &str,
+) -> Result<crate::swarm_plan::Plan> {
+    use crate::swarm_plan::{Provenance, seat_status};
+    let mut plan = crate::swarm_plan::Plan::new("swarm");
+    for item in items {
+        let (harness, model, effort) = if item.profile.is_some() {
+            let p = catalog
+                .get(item.profile.as_deref().unwrap_or(""))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "unknown profile '@{}' (flywheel profile list)",
+                        item.profile.as_deref().unwrap_or("")
+                    )
+                })?;
+            let (harness, resolved) = registry.resolve_profile_route(&p.harness, &p.model)?;
+            let model = if resolved.is_empty() {
+                None
+            } else if p.model.is_empty() {
+                // The profile names no model: fall back like a bare item.
+                bare_fallback_model(registry, &harness)
+            } else {
+                Some((resolved, Provenance::Profile))
+            };
+            let effort = if p.effort.is_empty() {
+                None
+            } else {
+                Some((p.effort.clone(), Provenance::Profile))
+            };
+            (harness, model, effort)
+        } else {
+            let harness = spawn_item_kind(cfg, item, catalog, registry)?;
+            if bare_model.is_empty() {
+                let fallback = bare_fallback_model(registry, &harness);
+                (harness, fallback, None)
+            } else {
+                let lookup = if bare_provider.is_empty() {
+                    bare_model.to_string()
+                } else {
+                    format!("{bare_provider}/{bare_model}")
+                };
+                let resolved = registry.resolve(&lookup, &harness);
+                (harness, Some((resolved, Provenance::User)), None)
+            }
+        };
+        let launch = crate::headless::interactive_model_plan(
+            &harness,
+            model
+                .as_ref()
+                .map(|(value, _)| value.as_str())
+                .unwrap_or(""),
+            effort.as_ref().map(|(value, _)| value.as_str()),
+        );
+        let (model_field, effort_field) = seat_status(&harness, model, effort, &launch);
+        plan.seats.push(crate::swarm_plan::Seat {
+            role: item.short.clone(),
+            count: item.count,
+            harness,
+            model: model_field,
+            effort: effort_field,
+            placement: "pane".to_string(),
+        });
+    }
+    Ok(plan)
+}
+
+/// Bare-item model fallback in launch order (`bare_model_launch`): the
+/// coupled default first (what the launch actually pins), then the implied
+/// slot model, else none (`model: null` in the plan).
+fn bare_fallback_model(
+    registry: &models::ModelRegistry,
+    harness: &str,
+) -> Option<(String, crate::swarm_plan::Provenance)> {
+    if let Some(id) = registry.coupled_default_model(harness)
+        && !id.is_empty()
+    {
+        return Some((id, crate::swarm_plan::Provenance::HarnessDefault));
+    }
+    if let Some(slot) = models::implied_slot_name_for_harness(harness)
+        .and_then(|name| registry.effective_slot_model(name))
+        && !slot.is_empty()
+    {
+        return Some((slot, crate::swarm_plan::Provenance::Slot));
+    }
+    None
+}
+
 pub(crate) fn cmd_spawn(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
     check_project_spelling(project, "spawn")?;
     // A mutating door must not pave over a corrupt fleet: refuse first.
@@ -897,6 +1002,25 @@ projects available: {}",
     let items = spawn_items_from_plan(plan, profile_plan);
     if items.is_empty() {
         bail!("nothing to spawn: pass --oc/--pi/--gk counts, --recipe NAME, or --profile NAME");
+    }
+    if opts.dry_run {
+        let plan = build_dry_run_plan(
+            cfg,
+            &items,
+            &catalog,
+            &model_reg,
+            &opts.bare_model,
+            &opts.bare_provider,
+        )?;
+        if opts.json {
+            print_json(&serde_json::to_value(&plan)?);
+        } else {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&plan).unwrap_or_else(|_| "{}".into())
+            );
+        }
+        return Ok(());
     }
     let base_label = opts
         .label_override
@@ -1696,6 +1820,25 @@ pub(crate) fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Res
     let items = spawn_items_from_plan(plan, profile_plan);
     if items.is_empty() {
         bail!("nothing to spawn: pass --oc/--pi/--gk counts, --recipe NAME, or --profile NAME");
+    }
+    if opts.dry_run {
+        let plan = build_dry_run_plan(
+            cfg,
+            &items,
+            &catalog,
+            &model_reg,
+            &opts.bare_model,
+            &opts.bare_provider,
+        )?;
+        if opts.json {
+            print_json(&serde_json::to_value(&plan)?);
+        } else {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&plan).unwrap_or_else(|_| "{}".into())
+            );
+        }
+        return Ok(());
     }
     let base_label = opts
         .label_override
@@ -3675,6 +3818,38 @@ mod adr0013_spawn_effect_tests {
             .unwrap_or(src.len());
         assert!(start < end, "{start_needle:?} must precede {end_needle:?}");
         &src[start..end]
+    }
+
+    /// ADR-0022 phase 1: `--dry-run` returns before any effect. In both
+    /// spawn entrypoints the dry-run branch precedes the receipt digest,
+    /// the intent journal, and every pane/registry/mail dispatch, so a dry
+    /// run cannot create a pane or write any state.
+    #[test]
+    fn dry_run_returns_before_any_effect() {
+        let src = crate::test_source::crate_source();
+        for entry in ["pub(crate) fn cmd_spawn(", "pub(crate) fn cmd_spawn_rex("] {
+            let start = src
+                .find(entry)
+                .unwrap_or_else(|| panic!("expected {entry:?}"));
+            let body = &src[start..];
+            let dry = body
+                .find("if opts.dry_run {")
+                .unwrap_or_else(|| panic!("{entry} must have a dry-run branch"));
+            for effect in [
+                "request_receipts::plan_digest(",
+                "AgentEffectGuard::begin",
+                "workspace_create(",
+                "pane_split(",
+            ] {
+                if let Some(pos) = body.find(effect) {
+                    assert!(dry < pos, "{entry}: dry-run must precede {effect:?}");
+                }
+            }
+            assert!(
+                body[dry..].contains("return Ok(())"),
+                "{entry}: dry-run branch must return"
+            );
+        }
     }
 
     /// I4: the spawn intent is committed before the workspace dispatch.
