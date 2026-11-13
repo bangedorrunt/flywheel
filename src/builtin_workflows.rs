@@ -1362,7 +1362,7 @@ steps:
         "beads-lifecycle",
         r#"
 name: beads-lifecycle
-description: "The beads authoring lifecycle. grill (ce-brainstorm) sharpens the objective (goal JSON); create nests phase-plan via call_workflow; review1 (@reviewer ce-plan-review) + review2 (@oracle judge-arms) are two bead-graph passes; integrate folds AGREE-WITH-CHANGES and re-checks cycles; implement hands off to wave-swarm (new graph) or babysit-bead (existing_bead); verify proves with evidence; signoff suspends for captain-only approval. inputs.from=none|session|adr|bead skips grill→integrate when from=bead or existing_bead is set. inputs.until early-exits SUCCESS after any phase; gate_before_implement adds one outer approval between integrate and implement."
+description: "The beads authoring lifecycle. grill (ce-brainstorm) sharpens the objective (goal JSON); create nests phase-plan via call_workflow; polish_1 + polish_2 + polish_more (loop max 3) revise under the fence until converged; audit (fresh plan-polish) returns findings only; integrate folds findings and re-checks cycles; fence_final gates the plan; implement hands off to wave-swarm (new graph) or babysit-bead (existing_bead); verify proves with evidence; signoff suspends for captain-only approval. inputs.from=none|session|adr|bead skips grill→fence_final when from=bead or existing_bead is set. inputs.until early-exits SUCCESS after any phase; gate_before_implement adds one outer approval between fence_final and implement."
 trigger:
   type: webhook
 crew: auto
@@ -1386,6 +1386,8 @@ inputs:
     default: "adr0008-steer"
   - name: coder_profile
     default: "@coder"
+  - name: polish_state
+    default: ".flywheel/plan/beads-lifecycle.digest"
 graph:
   nodes:
     grill:
@@ -1404,61 +1406,126 @@ graph:
       workflow: phase-plan
       inputs: { goal: "{{inputs.objective}}" }
       on_error: fail_run
-    review1:
+    polish_1:
       needs: [create]
       guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_from != "bead" && trigger_existing_bead == ""'
       action: dispatch_job
       assignee: x
       spec:
-        profile: "@reviewer"
-        stage: ce-plan-review
-        task: 'Bead-graph pass A for {{inputs.objective}}: review the plan from {{steps.create}}; return findings JSON + verdict to {{inputs.steer_channel}}.'
+        profile: "@planner"
+        stage: plan-polish
+        effort: max
+        task: 'Polish round 1 for {{inputs.objective}}: revise the beads from {{steps.create}} against the requirements from {{steps.grill}}.'
       on_error: fail_run
-    review2:
-      needs: [review1]
-      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "review1" && trigger_from != "bead" && trigger_existing_bead == ""'
-      action: dispatch_job
-      assignee: x
-      spec:
-        profile: "@oracle"
-        stage: judge-arms
-        task: 'Bead-graph pass B for {{inputs.objective}}: second review of the plan from {{steps.create}} against the pass-A findings in {{steps.review1}}; return findings JSON + verdict.'
-      on_error: fail_run
-    integrate:
-      needs: [review2]
-      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "review1" && trigger_until != "review2" && trigger_from != "bead" && trigger_existing_bead == ""'
+    snap:
+      needs: [polish_1]
+      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_from != "bead" && trigger_existing_bead == ""'
+      action: verify
+      command: 'flywheel __plan-fence converged --state {{inputs.polish_state}}'
+      on_error: continue
+    polish_2:
+      needs: [snap]
+      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_from != "bead" && trigger_existing_bead == ""'
       action: dispatch_job
       assignee: x
       spec:
         profile: "@planner"
-        task: 'Integrate for {{inputs.objective}}: fold AGREE-WITH-CHANGES from {{steps.review1}} + {{steps.review2}}; re-check bead cycles are zero; write the buildable bead set to {{inputs.steer_channel}}.'
+        stage: plan-polish
+        effort: max
+        task: 'Polish round 2 for {{inputs.objective}}: revise the beads from {{steps.polish_1}} against the requirements from {{steps.grill}}.'
+      on_error: fail_run
+    fence_2:
+      needs: [polish_2]
+      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_from != "bead" && trigger_existing_bead == ""'
+      action: verify
+      command: 'flywheel __plan-fence fence'
+      on_error: continue
+    converged_2:
+      needs: [fence_2]
+      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_from != "bead" && trigger_existing_bead == ""'
+      action: verify
+      command: 'flywheel __plan-fence converged --state {{inputs.polish_state}}'
+      on_error: continue
+    polish_more:
+      needs: [converged_2]
+      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_from != "bead" && trigger_existing_bead == "" && (steps_fence_2_ok != true || steps_converged_2_ok != true)'
+      action: loop
+      max: 3
+      until: 'steps_fence_ok == true && steps_converged_ok == true'
+      on_error: fail_run
+      body:
+        - name: polish
+          action: dispatch_job
+          assignee: x
+          spec:
+            profile: "@planner"
+            stage: plan-polish
+            effort: max
+            task: 'Another polish round for {{inputs.objective}}: revise the beads against the requirements from {{steps.grill}}.'
+          on_error: fail_run
+        - name: fence
+          action: verify
+          command: 'flywheel __plan-fence fence'
+          on_error: continue
+        - name: converged
+          action: verify
+          command: 'flywheel __plan-fence converged --state {{inputs.polish_state}}'
+          on_error: continue
+    audit:
+      needs: [polish_more]
+      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "polish" && trigger_from != "bead" && trigger_existing_bead == ""'
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@reviewer"
+        stage: plan-polish
+        context: fresh
+        effort: max
+        task: 'AUDIT MODE for {{inputs.objective}}: read-only, do NOT edit beads, return findings JSON only.'
+      on_error: fail_run
+    integrate:
+      needs: [audit]
+      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "polish" && trigger_until != "audit" && trigger_from != "bead" && trigger_existing_bead == ""'
+      action: dispatch_job
+      assignee: x
+      spec:
+        profile: "@planner"
+        stage: plan-polish
+        effort: max
+        task: 'Integrate for {{inputs.objective}}: fold the audit findings from {{steps.audit}} into the beads (one round).'
+      on_error: fail_run
+    fence_final:
+      needs: [integrate]
+      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "polish" && trigger_until != "audit" && trigger_until != "integrate" && trigger_from != "bead" && trigger_existing_bead == ""'
+      action: verify
+      command: 'flywheel __plan-fence fence'
       on_error: fail_run
     # bd-adr0008-guard-fix-16fl: the optional outer gate — a guarded
     # request_approval node (skipped unless gate_before_implement and the
     # run has not early-exited at or before integrate). Outer-only: the
     # engine parks the ONE durable run; no nested approvals exist.
     gate-before-implement:
-      needs: [integrate]
-      guard: 'trigger_gate_before_implement == "true" && trigger_until != "grill" && trigger_until != "create" && trigger_until != "review1" && trigger_until != "review2" && trigger_until != "integrate"'
+      needs: [fence_final]
+      guard: 'trigger_gate_before_implement == "true" && trigger_until != "grill" && trigger_until != "create" && trigger_until != "polish" && trigger_until != "audit" && trigger_until != "integrate"'
       action: request_approval
       message: "Beads lifecycle gate (captain-only) for {{inputs.objective}} [{{inputs.project}}]: approve to let implement proceed, reject to stop here."
     implement-bead:
       needs: [gate-before-implement]
-      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "review1" && trigger_until != "review2" && trigger_until != "integrate" && trigger_existing_bead != ""'
+      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "polish" && trigger_until != "audit" && trigger_until != "integrate" && trigger_existing_bead != ""'
       action: call_workflow
       workflow: babysit-bead
       inputs: { bead_id: "{{inputs.existing_bead}}" }
       on_error: fail_run
     implement:
       needs: [gate-before-implement]
-      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "review1" && trigger_until != "review2" && trigger_until != "integrate" && trigger_existing_bead == ""'
+      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "polish" && trigger_until != "audit" && trigger_until != "integrate" && trigger_existing_bead == ""'
       action: call_workflow
       workflow: wave-swarm
       inputs: { objective: "{{inputs.objective}}", captain_pin: "{{inputs.captain_pin}}", steer_channel: "{{inputs.steer_channel}}", coder_profile: "{{inputs.coder_profile}}" }
       on_error: fail_run
     verify:
       needs: [implement, implement-bead]
-      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "review1" && trigger_until != "review2" && trigger_until != "integrate" && trigger_until != "implement"'
+      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "polish" && trigger_until != "audit" && trigger_until != "integrate" && trigger_until != "implement"'
       action: dispatch_job
       assignee: x
       spec:
@@ -1468,7 +1535,7 @@ graph:
       on_error: fail_run
     signoff:
       needs: [verify]
-      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "review1" && trigger_until != "review2" && trigger_until != "integrate" && trigger_until != "implement" && trigger_until != "verify"'
+      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "polish" && trigger_until != "audit" && trigger_until != "integrate" && trigger_until != "implement" && trigger_until != "verify"'
       action: request_approval
       message: "Beads lifecycle signoff (captain-only) for {{inputs.objective}} [{{inputs.project}}]: review the verify evidence on {{inputs.steer_channel}}; approve closes, reject reopens."
 "#,
@@ -3884,9 +3951,15 @@ mod tests {
         let phase_order = [
             "grill",
             "create",
-            "review1",
-            "review2",
+            "polish_1",
+            "snap",
+            "polish_2",
+            "fence_2",
+            "converged_2",
+            "polish_more",
+            "audit",
             "integrate",
+            "fence_final",
             "implement-bead",
             "implement",
             "verify",
@@ -3938,9 +4011,15 @@ mod tests {
         let expected_nodes = [
             "grill",
             "create",
-            "review1",
-            "review2",
+            "polish_1",
+            "snap",
+            "polish_2",
+            "fence_2",
+            "converged_2",
+            "polish_more",
+            "audit",
             "integrate",
+            "fence_final",
             "gate-before-implement",
             "implement-bead",
             "implement",
@@ -4001,16 +4080,31 @@ mod tests {
         let wfs = builtin_workflows();
         let wf = &wfs["beads-lifecycle"];
         let graph = wf.graph.as_ref().expect("graph form");
+        // Until phases (ADR-0021 D7): grill | create | polish | audit |
+        // integrate | implement | verify | signoff. Polish covers six nodes
+        // that share the same until prefix; audit/integrate are single nodes.
         let phases = [
             "grill",
             "create",
-            "review1",
-            "review2",
+            "polish",
+            "audit",
             "integrate",
             "implement",
             "verify",
             "signoff",
         ];
+        let node_for_phase: std::collections::HashMap<&str, &str> = [
+            ("grill", "grill"),
+            ("create", "create"),
+            ("polish", "polish_1"),
+            ("audit", "audit"),
+            ("integrate", "integrate"),
+            ("implement", "implement"),
+            ("verify", "verify"),
+            ("signoff", "signoff"),
+        ]
+        .into_iter()
+        .collect();
         let ord = |p: &str| phases.iter().position(|x| *x == p).unwrap();
         for u in phases {
             let mut vars = std::collections::HashMap::new();
@@ -4026,7 +4120,8 @@ mod tests {
             );
             let mut ran: Vec<&str> = vec![];
             for p in phases {
-                let node = &graph.nodes[p];
+                let node_name = node_for_phase[p];
+                let node = &graph.nodes[node_name];
                 match &node.guard {
                     None => ran.push(p),
                     Some(g) => {
@@ -4071,6 +4166,124 @@ mod tests {
                 expect,
                 "gate fires for until={u} gate_in={gate_in}"
             );
+        }
+    }
+
+    /// ADR-0021 D7: polish loop + plan-polish stage (bd-plan-polish-loop-8delw).
+    /// No judge-arms; polish_1/polish_2/body polish/audit/integrate dispatch
+    /// plan-polish effort max; audit fresh; polish_more loop max 3 until
+    /// fence+converged fail_run; fence_final fail_run; stage role/phase/prompt.
+    #[test]
+    fn beads_lifecycle_plan_polish_loop() {
+        use toron_workflow::schema::{Action, ContextMode, StepOnError};
+        let wfs = builtin_workflows();
+        let wf = &wfs["beads-lifecycle"];
+        let graph = wf.graph.as_ref().expect("graph form");
+        for (name, node) in &graph.nodes {
+            if let Action::DispatchJob { spec, .. } = &node.action {
+                assert_ne!(
+                    spec.stage.as_deref(),
+                    Some("judge-arms"),
+                    "node {name} must not dispatch judge-arms"
+                );
+            }
+        }
+        for id in ["polish_1", "polish_2", "audit", "integrate"] {
+            let node = graph
+                .nodes
+                .get(id)
+                .unwrap_or_else(|| panic!("{id} present"));
+            let Action::DispatchJob { spec, .. } = &node.action else {
+                panic!("{id} is a dispatch");
+            };
+            assert_eq!(spec.stage.as_deref(), Some("plan-polish"), "{id} stage");
+            assert_eq!(spec.effort.as_deref(), Some("max"), "{id} effort max");
+        }
+        let audit = &graph.nodes["audit"];
+        let Action::DispatchJob { spec, .. } = &audit.action else {
+            panic!("audit is a dispatch");
+        };
+        assert_eq!(spec.profile.as_deref(), Some("@reviewer"), "audit reviewer");
+        assert!(
+            matches!(spec.context, Some(ContextMode::Fresh)),
+            "audit fresh"
+        );
+        let pm = &graph.nodes["polish_more"];
+        let Action::Loop { max, until, body } = &pm.action else {
+            panic!("polish_more is a loop");
+        };
+        assert_eq!(max, "3", "polish_more max 3");
+        assert_eq!(
+            until.as_deref(),
+            Some("steps_fence_ok == true && steps_converged_ok == true"),
+            "polish_more until"
+        );
+        assert!(
+            matches!(pm.on_error, StepOnError::FailRun),
+            "polish_more fail_run"
+        );
+        let polish = body
+            .iter()
+            .find(|s| s.name.as_deref() == Some("polish"))
+            .expect("body polish");
+        let Action::DispatchJob { spec, .. } = &polish.action else {
+            panic!("body polish is a dispatch");
+        };
+        assert_eq!(spec.stage.as_deref(), Some("plan-polish"));
+        assert_eq!(spec.effort.as_deref(), Some("max"));
+        let ff = &graph.nodes["fence_final"];
+        assert!(
+            matches!(ff.on_error, StepOnError::FailRun),
+            "fence_final fail_run"
+        );
+        let polish_state = wf
+            .inputs
+            .iter()
+            .find(|i| i.name == "polish_state")
+            .expect("polish_state input");
+        assert_eq!(
+            polish_state.default,
+            Some(serde_json::Value::String(
+                ".flywheel/plan/beads-lifecycle.digest".to_string()
+            )),
+            "polish_state default"
+        );
+        for id in ["snap", "converged_2"] {
+            let node = graph
+                .nodes
+                .get(id)
+                .unwrap_or_else(|| panic!("{id} present"));
+            let Action::Verify { command } = &node.action else {
+                panic!("{id} is a verify");
+            };
+            assert!(
+                command.contains("{{inputs.polish_state}}"),
+                "{id} uses polish_state: {command}"
+            );
+        }
+        let body_converged = body
+            .iter()
+            .find(|s| s.name.as_deref() == Some("converged"))
+            .expect("body converged");
+        let Action::Verify { command } = &body_converged.action else {
+            panic!("body converged is a verify");
+        };
+        assert!(
+            command.contains("{{inputs.polish_state}}"),
+            "body converged uses polish_state: {command}"
+        );
+        let lib = crate::stages::StageLibrary::compiled_in();
+        let st = lib.get_stage("plan-polish").expect("plan-polish exists");
+        assert_eq!(st.role.as_deref(), Some("planner"));
+        assert_eq!(st.phase.as_deref(), Some("plan"));
+        for needle in [
+            "Do not lose any feature",
+            "coverage",
+            "end-to-end",
+            "VERIFY",
+            "PRINCIPLES",
+        ] {
+            assert!(st.prompt.contains(needle), "prompt contains {needle}");
         }
     }
 }

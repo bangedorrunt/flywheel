@@ -136,6 +136,7 @@ const SEED_AFFINITY: &[(&str, &str)] = &[
     ("ce-evaluate", "reviewer"),
     ("ce-plan", "planner"),
     ("ce-plan-review", "planner"),
+    ("plan-polish", "planner"),
     ("ce-execute", "coder"),
     ("ce-simplify", "coder"),
     ("ce-compound", "housekeeper"),
@@ -161,6 +162,7 @@ const SEED_AFFINITY: &[(&str, &str)] = &[
 const SEED_PHASE: &[(&str, &str)] = &[
     ("ce-brainstorm", "plan"),
     ("ce-plan", "plan"),
+    ("plan-polish", "plan"),
     ("ce-plan-review", "review"),
     ("ce-execute", "implement"),
     ("ce-simplify", "implement"),
@@ -233,6 +235,10 @@ impl StageLibrary {
             (
                 "ce-plan-review",
                 "Check over each bead super carefully-- are you sure it makes sense? Is it optimal? Could we change anything to make the system work better for users? If so, revise the beads. It's a lot easier and faster to operate in \"plan space\" before we start implementing these things! Every generated bead description MUST carry a ## VERIFY fence (the exact command that proves acceptance) — a bead without a verifiable gate is not implementation-ready.",
+            ),
+            (
+                "plan-polish",
+                "Polish round for the bead set. Check over each bead super carefully. Are you sure it makes sense? Is it optimal? Could we change anything to make the system work better for its users? If so, revise the beads now, in place (br update, br dep add, br create). It is far cheaper to fix the plan here than after implementation. Do not oversimplify. Do not lose any feature or functionality. The coverage map from the grill step lists every requirement; after your revisions each requirement must still map to at least one bead. A requirement may leave the map only by moving to non-goals with a stated reason. Every bead that changes behaviour names its tests: unit tests by file and case, each with what it proves and how it can fail; and an end-to-end check script with detailed, structured logging, so that each step records what it ran, its inputs, and what it observed, and a failure can be diagnosed from the log alone. End-to-end scripts follow the repo test sandbox (temp HOME/XDG, deny-shims, spare ports; never the live store). A large end-to-end suite is its own bead that depends on the feature beads. Every bead stays self-contained: background, reasoning, acceptance, a ## VERIFY fence with the exact command, and ## PRINCIPLES. Dependencies are explicit and acyclic. Look in particular for: missing steps; wrong order; a bead too large to verify in one pass (split it); a bead too small to stand alone (merge it); hidden coupling between beads that will touch the same files; acceptance that cannot fail; missing failure, rollback, or migration paths; missing docs and skill sync. Reply with only JSON: {\"revised\": [], \"added\": [], \"removed\": [], \"coverage\": {}, \"open_risks\": []}.",
             ),
             (
                 "ce-execute",

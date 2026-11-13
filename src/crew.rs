@@ -2785,8 +2785,8 @@ steps:
             .expect("graph-form token expands to graph");
         assert_eq!(
             graph.nodes.len(),
-            10,
-            "8 phases + outer implement gate + existing-bead implement (guards ride ON the nodes): {:?}",
+            16,
+            "polish loop + audit + fence_final + outer implement gate + existing-bead implement (guards ride ON the nodes): {:?}",
             graph.nodes.keys().collect::<Vec<_>>()
         );
         assert!(
@@ -2914,8 +2914,8 @@ steps:
         assert_eq!(wf.steps.len(), 1, "the plain part lands in steps");
         assert_eq!(
             wf.graph.as_ref().expect("graph").nodes.len(),
-            10,
-            "the token lands in the graph (authoring + existing-bead implement + outer gate)"
+            16,
+            "the token lands in the graph (polish loop + audit + fence_final + existing-bead implement + outer gate)"
         );
         let err = compose_workflow_with(
             "bad",
