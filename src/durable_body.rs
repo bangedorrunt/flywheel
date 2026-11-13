@@ -1470,6 +1470,100 @@ mod tests {
         let _ = std::fs::remove_file(&db);
     }
 
+    fn wave_swarm_workflow() -> toron_workflow::schema::Workflow {
+        crate::builtin_workflows::builtin_workflows()["wave-swarm"].clone()
+    }
+
+    fn wave_swarm_trigger() -> serde_json::Value {
+        serde_json::json!({"inputs": {
+            "objective": "prove the wave ends on witnesses",
+            "wave_label": "wave-1",
+            "steer_channel": "adr0006-steer",
+            "captain_pin": "",
+            "coder_profile": "@coder",
+        }})
+    }
+
+    fn wave_swarm_seams(watcher: JobWatcher) -> BodySeams {
+        BodySeams {
+            leaf: LeafSeams {
+                async_runner: Some(receipt_runner()),
+                sync_runner: None,
+                verify_sink: toron_workflow::engine::VerifySink::default(),
+                journal_mode: toron_workflow::engine::EffectJournalMode::Recording,
+            },
+            launcher: None,
+            job_watcher: Some(watcher),
+            // Compiled-in seed catalog, not the operator's user tier: the
+            // test pins the shipped witnesses, not ambient config.
+            witness: Some(crate::stages::StageLibrary::compiled_in().witness_checker()),
+            clock: frozen_clock(),
+            spawn_resolver: None,
+            resolve_child: None,
+        }
+    }
+
+    /// ADR-0021 acceptance #3: a coder that never writes a witness fails
+    /// at result_timeout with a typed error naming the first stage step.
+    /// The watcher never settles; the frozen clock proves milliseconds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wave_swarm_missing_witness_fails_at_result_timeout() {
+        let (store, db) = watch_test_store("wave-timeout").await;
+        let wf = wave_swarm_workflow();
+        let (watcher, _queue) = queue_watcher(vec![]);
+        let seams = wave_swarm_seams(watcher);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            drive(&store, "wave-timeout-1", &wf, wave_swarm_trigger(), &seams),
+        )
+        .await
+        .expect("an unsettled wave must fail fast");
+        let BodyOutcome::Failed { error, step } = outcome else {
+            panic!("a witness-less wave never succeeds: {outcome:?}");
+        };
+        assert!(
+            error.contains("gate") && error.contains("no claim"),
+            "typed timeout names the first stage step: {error}"
+        );
+        assert_eq!(step.as_deref(), Some("gate"));
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// A held gate settles a failing witness, and the run fails naming
+    /// the gate step — held is a typed failure, never silent success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wave_swarm_failing_witness_goes_to_on_error() {
+        let (store, db) = watch_test_store("wave-held").await;
+        let wf = wave_swarm_workflow();
+        let (watcher, _queue) = queue_watcher(vec![
+            JobWatchOutcome::Claimed,
+            JobWatchOutcome::Settled(serde_json::json!({
+                "ok": true,
+                "job": "job-1",
+                "witness": {"held": true, "blockers": ["wave-0 still open"]},
+                "body": "[gate] held",
+            })),
+        ]);
+        let seams = wave_swarm_seams(watcher);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            drive(&store, "wave-held-1", &wf, wave_swarm_trigger(), &seams),
+        )
+        .await
+        .expect("a held gate must fail fast");
+        let BodyOutcome::Failed { error, step } = outcome else {
+            panic!("a held gate never succeeds: {outcome:?}");
+        };
+        for part in ["gate", "wave-gate", "plan"] {
+            assert!(
+                error.contains(part),
+                "refusal names step, stage and witness ({part}): {error}"
+            );
+        }
+        assert_eq!(step.as_deref(), Some("gate"));
+        let _ = std::fs::remove_file(&db);
+    }
+
     /// A broken stage catalog fails closed: every staged step is refused
     /// with the load error instead of settling ungated.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

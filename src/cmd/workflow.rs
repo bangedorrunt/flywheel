@@ -2615,13 +2615,8 @@ mod workflow_cli_lint_tests {
         assert!(report.ok, "wave-swarm row stays ok: {:?}", report.errors);
         assert!(report.errors.is_empty());
         assert!(
-            report.warnings.iter().any(|w| w.contains("await_gate")),
-            "names the await state: {:?}",
-            report.warnings
-        );
-        assert!(
-            report.warnings.iter().all(|w| w.contains("long hold")),
-            "{:?}",
+            report.warnings.is_empty(),
+            "awaits are bounded model deadlines, not retry storms: {:?}",
             report.warnings
         );
         assert_eq!(report.checks["bounded"]["ok"], serde_json::json!(true));

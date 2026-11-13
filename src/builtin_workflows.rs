@@ -1170,7 +1170,7 @@ steps:
 name: wave-swarm
 compose: true
 shape: pipeline
-description: "The compounded wave swarm. GATE scopes br ready to one wave via the TYPED wave field (grounding-reads docs/learnings/), holds on any open lower wave, and treats an empty ready with in-flight beads as WORK IN FLIGHT (bd-wave-gate-typed-authority-27et); DISPATCH emits send --stage ce-execute --param payloads (bead/scope/exit/channel/pin/report_file/learnings); OBSERVE escalates to the captain (lesson: line on every escalation) and never adjudicates; REVIEW audits each closed bead's diff against its brief (detection conditions, quoted evidence, autofix classes); VERIFY checks receipts at committed HEAD + VERIFY tails + principles citations + the residual gate (every finding fixed or filed as a bead); COMPOUND captures durable learnings to docs/learnings/ (never blocks); SIGNOFF suspends for captain-only approval. bd-compose-stage-sequencing-zgi9 / bd-o0v4q: stages are SEQUENCED by completion markers under .flywheel/wave/ (<label>-<stage>.done) — each await blocks reactively on the stage completion signal (Plane S/Doorbell-latched filesystem event watch when available, else near-zero poll) so transitions fire with zero artificial idle delay while preserving verify honesty; the outer --timeout remains the run bound. Default crew is planner+coder+reviewer; remix with --crew role:n,role:n (scout/housekeeper optional)."
+description: "The compounded wave swarm. GATE scopes br ready to one wave via the TYPED wave field (grounding-reads docs/learnings/), holds on any open lower wave, and treats an empty ready with in-flight beads as WORK IN FLIGHT (bd-wave-gate-typed-authority-27et); DISPATCH emits send --stage ce-execute --param payloads (bead/scope/exit/channel/pin/report_file/learnings); OBSERVE escalates to the captain (lesson: line on every escalation) and never adjudicates; REVIEW audits each closed bead's diff against its brief (detection conditions, quoted evidence, autofix classes); VERIFY checks receipts at committed HEAD + VERIFY tails + principles citations + the residual gate (every finding fixed or filed as a bead); COMPOUND captures durable learnings to docs/learnings/ (never blocks); SIGNOFF suspends for captain-only approval. Every stage dispatch awaits its job result (result_timeout 7200s); each witnessed exit is checked against the stage contract, EXECUTE additionally ends on a ledger fact (all wave beads closed, ship check legal each). .done files under .flywheel/wave/ are write-only compat sidecars, never read. Default crew is planner+coder+reviewer; remix with --crew role:n,role:n (scout/housekeeper optional)."
 trigger:
   type: webhook
 crew:
@@ -1196,98 +1196,102 @@ steps:
   - name: gate
     action: dispatch_job
     assignee: x
+    await: result
+    no_claim_timeout: 600
+    result_timeout: 7200
     spec:
       profile: "@planner"
       stage: wave-gate
-      task: 'Gate the wave {{inputs.wave_label}}: preflight + scope `br ready` for this wave; write .flywheel/wave/{{inputs.wave_label}}-ready.json (the DISPATCH binding artifact); a lower open wave holds. bd-wave-gate-typed-authority-27et: the TYPED `wave` field is the authority (br ready is already wave-gated by it natively) — select rows whose typed `wave` == N, falling back to the legacy `wave-N` label only when the typed field is null; hold when ANY bead with an earlier wave-M (M<N) is open or in_progress, naming the blockers. An EMPTY ready with NO bead of this wave in flight is a LOUD FAILURE — post [gate] blocked: wave <label> matched zero beads and STOP. An EMPTY ready WITH in-flight beads is held:false + in_flight — the wave is WORK IN FLIGHT, report it and continue (never a held/empty-wave failure, never re-dispatch). Write the artifact as {wave_label, held, blockers, ready, in_flight}. When the gate is GREEN (artifact written, held:false, ready non-empty OR in flight), write .flywheel/wave/{{inputs.wave_label}}-gate.done so DISPATCH may start; when held or blocked, post [gate] held and write NO marker. Objective: {{inputs.objective}}'
+      task: 'Gate the wave {{inputs.wave_label}}: preflight + scope `br ready` for this wave; write .flywheel/wave/{{inputs.wave_label}}-ready.json (the DISPATCH binding artifact); a lower open wave holds. bd-wave-gate-typed-authority-27et: the TYPED `wave` field is the authority (br ready is already wave-gated by it natively) — select rows whose typed `wave` == N, falling back to the legacy `wave-N` label only when the typed field is null; hold when ANY bead with an earlier wave-M (M<N) is open or in_progress, naming the blockers. An EMPTY ready with NO bead of this wave in flight is a LOUD FAILURE — settle the job as a failure naming the empty match ([gate] blocked: wave <label> matched zero beads). An EMPTY ready WITH in-flight beads is held:false + in_flight — the wave is WORK IN FLIGHT, report it and continue (never a held/empty-wave failure, never re-dispatch). Write the artifact as {wave_label, held, blockers, ready, in_flight}. Then settle YOUR job: `toron job result <job-id> --status ok --project <slug> --as <pin> --witness <file.json>`, where the witness file carries the contract fields for this stage: {"beads": [{"id": "<bead>", "acceptance": "<its VERIFY command>"}], "dep_cycles": <count from `br dep cycles --json`, must be 0>}. A GREEN gate (artifact written, held:false, ready non-empty OR in flight) settles ok. A held or blocked gate settles as a FAILURE — `toron job result <job-id> --status failed --project <slug> --as <pin> --body "[gate] held: <blockers>"` — never success, never an unsettled job (an unsettled job fails at result_timeout naming this step). Objective: {{inputs.objective}}'
     on_error: fail_run
-  - name: await_gate
-    action: retry
-    max_attempts: 240
-    backoff_secs: 30
-    on_error: fail_run
-    step:
-      name: gate_marker
-      action: verify
-      command: "test -f .flywheel/wave/{{inputs.wave_label}}-gate.done || { mkdir -p .flywheel/wave; m=.flywheel/wave/{{inputs.wave_label}}-gate.done; for _ in $(seq 1 140); do if [ -f \"$m\" ]; then break; fi; if command -v inotifywait >/dev/null 2>&1; then inotifywait -qq -t 1 -e create,close_write,moved_to .flywheel/wave >/dev/null 2>&1 || true; elif command -v fswatch >/dev/null 2>&1; then fswatch -1 -t 1 --event Created --event Updated --event Renamed --event MovedTo .flywheel/wave >/dev/null 2>&1 || true; else sleep 0.2; fi; done; test -f \"$m\" || { echo 'wave in flight: {{inputs.wave_label}}-gate.done not present yet — the wave waits for real work; widen the outer bound or fix the planner, never dispatch over a held gate'; exit 1; }; }"
+  - name: gate_done
+    action: verify
+    command: "mkdir -p .flywheel/wave && touch .flywheel/wave/{{inputs.wave_label}}-gate.done"
+    on_error: continue
   - name: dispatch
     action: dispatch_job
     assignee: x
+    await: result
+    no_claim_timeout: 600
+    result_timeout: 7200
     spec:
       profile: "@planner"
       stage: wave-dispatch
-      task: 'Dispatch the wave beads: read .flywheel/wave/{{inputs.wave_label}}-ready.json for held + learnings, then take the bead list LIVE — `br ready --json` scoped to this wave at dispatch time (typed `wave` == N, legacy `wave-N` label fallback); the artifact ready[] is a snapshot that may be stale (bd-wave-gate-typed-authority-27et). One send --stage ce-execute --param payload per LIVE bead, each naming its bead id + the claim/close contract (+ learnings when the gate matched); onto {{inputs.steer_channel}}. The crew escalates to orchestrator pin {{inputs.captain_pin}}. If the artifact is missing or held:true, post [dispatch] held and STOP (write NO marker). If the live ready set is empty and the artifact names in_flight[], post [dispatch] work in flight: <ids> and write .flywheel/wave/{{inputs.wave_label}}-dispatch.done — nothing to dispatch, a live crew owns the wave; never duplicate it. After every payload is posted, write the marker so EXECUTE may start. Objective: {{inputs.objective}}'
+      task: 'Dispatch the wave beads: read .flywheel/wave/{{inputs.wave_label}}-ready.json for held + learnings, then take the bead list LIVE — `br ready --json` scoped to this wave at dispatch time (typed `wave` == N, legacy `wave-N` label fallback); the artifact ready[] is a snapshot that may be stale (bd-wave-gate-typed-authority-27et). One send --stage ce-execute --param payload per LIVE bead, each naming its bead id + the claim/close contract (+ learnings when the gate matched); onto {{inputs.steer_channel}}. The crew escalates to orchestrator pin {{inputs.captain_pin}}. If the artifact is missing or held:true, settle the job as a failure naming it ([dispatch] held: <reason>) — never success, never an unsettled job. If the live ready set is empty and the artifact names in_flight[], post [dispatch] work in flight: <ids> and settle ok with a witness naming the in-flight crew — nothing to dispatch, a live crew owns the wave; never duplicate it. After every payload is posted, settle YOUR job: `toron job result <job-id> --status ok --project <slug> --as <pin> --witness <file.json>`, where the witness file carries the contract fields for this stage: {"beads": [{"id": "<bead>", "acceptance": "<its VERIFY command>"}], "dep_cycles": <count from `br dep cycles --json`, must be 0>}. Objective: {{inputs.objective}}'
     on_error: fail_run
-  - name: await_dispatch
-    action: retry
-    max_attempts: 240
-    backoff_secs: 30
-    on_error: fail_run
-    step:
-      name: dispatch_marker
-      action: verify
-      command: "test -f .flywheel/wave/{{inputs.wave_label}}-dispatch.done || { mkdir -p .flywheel/wave; m=.flywheel/wave/{{inputs.wave_label}}-dispatch.done; for _ in $(seq 1 140); do if [ -f \"$m\" ]; then break; fi; if command -v inotifywait >/dev/null 2>&1; then inotifywait -qq -t 1 -e create,close_write,moved_to .flywheel/wave >/dev/null 2>&1 || true; elif command -v fswatch >/dev/null 2>&1; then fswatch -1 -t 1 --event Created --event Updated --event Renamed --event MovedTo .flywheel/wave >/dev/null 2>&1 || true; else sleep 0.2; fi; done; test -f \"$m\" || { echo 'wave in flight: {{inputs.wave_label}}-dispatch.done not present yet — EXECUTE must not start until every payload is posted; widen the outer bound if the dispatcher is really working'; exit 1; }; }"
+  - name: dispatch_done
+    action: verify
+    command: "mkdir -p .flywheel/wave && touch .flywheel/wave/{{inputs.wave_label}}-dispatch.done"
+    on_error: continue
   - name: execute
     action: dispatch_job
     assignee: x
+    await: result
+    no_claim_timeout: 600
+    result_timeout: 7200
     spec:
       profile: "{{inputs.coder_profile}}"
       stage: ce-execute
-      task: 'Execute the wave beads listed in .flywheel/wave/{{inputs.wave_label}}-ready.json (claim -> run each bead''s VERIFY -> commit before close -> ledger-legal close with VERIFY tail + principles citations). When ready is empty and in_flight[] is non-empty, do NOT claim or close — a live crew owns those beads; wait (poll `br show <id> --json`) until every in-flight bead is closed, then write the marker. After the LAST bead of the wave is closed, write .flywheel/wave/{{inputs.wave_label}}-execute.done so REVIEW reads closes and never revises an open wave. When ready AND in_flight are both empty, post [execute] blocked: nothing to execute and write NO marker (a wave that runs nothing must not report success). Objective: {{inputs.objective}}'
+      task: 'Execute the wave beads listed in .flywheel/wave/{{inputs.wave_label}}-ready.json (claim -> run each bead''s VERIFY -> commit before close -> ledger-legal close with VERIFY tail + principles citations). When ready is empty and in_flight[] is non-empty, do NOT claim or close — a live crew owns those beads; wait (poll `br show <id> --json`) until every in-flight bead is closed, then settle ok with a witness naming the observed closes. After the LAST bead of the wave is closed, settle YOUR job: `toron job result <job-id> --status ok --project <slug> --as <pin> --witness <file.json>`, where the witness file carries the contract fields for this stage: the final close as {"commit_sha": "<sha>", "commit_message": "<must cite the bead id>", "gate": {"command": "<its VERIFY command>", "exit": 0, "output": "<tail>"}}. When ready AND in_flight are both empty, settle as a FAILURE naming it ([execute] blocked: nothing to execute) — a wave that runs nothing must not report success, and an unsettled job fails at result_timeout naming this step. Objective: {{inputs.objective}}'
     on_error: fail_run
-  - name: await_execute
-    action: retry
-    max_attempts: 240
-    backoff_secs: 30
+  - name: execute_done
+    action: verify
+    command: "mkdir -p .flywheel/wave && touch .flywheel/wave/{{inputs.wave_label}}-execute.done"
+    on_error: continue
+  - name: execute_exit
+    action: verify
+    command: 'LABEL="{{inputs.wave_label}}"; OPEN=$(br list --label "$LABEL" --json | jq -r "[.issues[] | select(.status != \"closed\") | .id] | join(\" \")"); if [ -n "$OPEN" ]; then echo "execute exit refused: wave $LABEL still open: $OPEN"; exit 1; fi; IDS=$(br list --label "$LABEL" --json | jq -r "[.issues[].id] | join(\" \")"); if [ -z "$IDS" ]; then echo "execute exit refused: wave $LABEL matched zero beads"; exit 1; fi; for id in $IDS; do flywheel ship check "$id" || exit 1; done'
     on_error: fail_run
-    step:
-      name: execute_marker
-      action: verify
-      command: "test -f .flywheel/wave/{{inputs.wave_label}}-execute.done || { mkdir -p .flywheel/wave; m=.flywheel/wave/{{inputs.wave_label}}-execute.done; for _ in $(seq 1 140); do if [ -f \"$m\" ]; then break; fi; if command -v inotifywait >/dev/null 2>&1; then inotifywait -qq -t 1 -e create,close_write,moved_to .flywheel/wave >/dev/null 2>&1 || true; elif command -v fswatch >/dev/null 2>&1; then fswatch -1 -t 1 --event Created --event Updated --event Renamed --event MovedTo .flywheel/wave >/dev/null 2>&1 || true; else sleep 0.2; fi; done; test -f \"$m\" || { echo 'wave in flight: {{inputs.wave_label}}-execute.done not present yet — REVIEW must not start with closes still landing; widen the outer bound if the wave is really working'; exit 1; }; }"
   - name: observe
     action: dispatch_job
     assignee: x
+    await: result
+    no_claim_timeout: 600
+    result_timeout: 7200
     spec:
       profile: "@reviewer"
       stage: wave-observe
-      task: 'Watch {{inputs.steer_channel}}: escalate, never adjudicate. Escalation target = the orchestrator pin {{inputs.captain_pin}} (flywheel mail send --project <slug> --to {{inputs.captain_pin}}) — DM THAT pin, never guess. Objective: {{inputs.objective}}'
+      task: 'Watch {{inputs.steer_channel}}: escalate, never adjudicate. Escalation target = the orchestrator pin {{inputs.captain_pin}} (flywheel mail send --project <slug> --to {{inputs.captain_pin}}) — DM THAT pin, never guess. Then settle YOUR job: `toron job result <job-id> --status ok --project <slug> --as <pin> --witness <file.json>`, where the witness file carries the contract fields for this stage: {"findings": ["<each escalation or watch summary posted>"...], "verdict": "<AGREE | AGREE-WITH-CHANGES | REJECT>"} — AGREE means nothing needed escalation, REJECT means the wave is blocked and names why. A quiet watch still posts its summary as findings; an empty findings list fails the witness. A blocked wave settles as a FAILURE — `toron job result <job-id> --status failed --project <slug> --as <pin> --body "[observe] blocked: <reason>"` — never success without a witness, never an unsettled job. Objective: {{inputs.objective}}'
+    on_error: continue
+  - name: observe_done
+    action: verify
+    command: "mkdir -p .flywheel/wave && touch .flywheel/wave/{{inputs.wave_label}}-observe.done"
     on_error: continue
   - name: review
     action: dispatch_job
     assignee: x
+    await: result
+    no_claim_timeout: 600
+    result_timeout: 7200
     spec:
       profile: "@reviewer"
       stage: ce-review
-      task: 'Review every closed bead of {{inputs.wave_label}} for {{inputs.objective}}: audit the committed diff against each brief''s ACCEPTANCE/VERIFY — detection conditions, quoted file:line evidence, severity + autofix class per finding; single-lens pass (no corroboration claims). Findings JSON to {{inputs.steer_channel}}. After the findings are posted, write .flywheel/wave/{{inputs.wave_label}}-review.done. Objective: {{inputs.objective}}'
+      task: 'Review every closed bead of {{inputs.wave_label}} for {{inputs.objective}}: audit the committed diff against each brief''s ACCEPTANCE/VERIFY — detection conditions, quoted file:line evidence, severity + autofix class per finding; single-lens pass (no corroboration claims). Findings JSON to {{inputs.steer_channel}}. Then settle YOUR job: `toron job result <job-id> --status ok --project <slug> --as <pin> --witness <file.json>`, where the witness file carries the contract fields for this stage: {"findings": [<each finding>] non-empty, "verdict": "<AGREE | AGREE-WITH-CHANGES | REJECT>"}. A review that cannot verify settles as a FAILURE naming why — never success without a witness, never an unsettled job. Objective: {{inputs.objective}}'
     on_error: fail_run
-  - name: await_review
-    action: retry
-    max_attempts: 240
-    backoff_secs: 30
-    on_error: fail_run
-    step:
-      name: review_marker
-      action: verify
-      command: "test -f .flywheel/wave/{{inputs.wave_label}}-review.done || { mkdir -p .flywheel/wave; m=.flywheel/wave/{{inputs.wave_label}}-review.done; for _ in $(seq 1 140); do if [ -f \"$m\" ]; then break; fi; if command -v inotifywait >/dev/null 2>&1; then inotifywait -qq -t 1 -e create,close_write,moved_to .flywheel/wave >/dev/null 2>&1 || true; elif command -v fswatch >/dev/null 2>&1; then fswatch -1 -t 1 --event Created --event Updated --event Renamed --event MovedTo .flywheel/wave >/dev/null 2>&1 || true; else sleep 0.2; fi; done; test -f \"$m\" || { echo 'wave in flight: {{inputs.wave_label}}-review.done not present yet — VERIFY needs the findings first; widen the outer bound if the reviewer is really working'; exit 1; }; }"
+  - name: review_done
+    action: verify
+    command: "mkdir -p .flywheel/wave && touch .flywheel/wave/{{inputs.wave_label}}-review.done"
+    on_error: continue
   - name: verify
     action: dispatch_job
     assignee: x
+    await: result
+    no_claim_timeout: 600
+    result_timeout: 7200
     spec:
       profile: "@reviewer"
       stage: wave-verify
-      task: 'Verify every close claim: receipt at committed HEAD + VERIFY tail + principles citations + the residual gate (each REVIEW finding from {{steps.review}} fixed in the diff or filed as a bead id). After the verification report, write .flywheel/wave/{{inputs.wave_label}}-verify.done so COMPOUND reads verified solutions. Objective: {{inputs.objective}}'
+      task: 'Verify every close claim: receipt at committed HEAD + VERIFY tail + principles citations + the residual gate (each REVIEW finding from {{steps.review}} fixed in the diff or filed as a bead id). Then settle YOUR job: `toron job result <job-id> --status ok --project <slug> --as <pin> --witness <file.json>`, where the witness file carries the contract fields for this stage: {"gate": {"command": "<the verification gate you ran>", "exit": 0, "output": "<recorded output>"}}. A verification that cannot prove the close settles as a FAILURE naming the gap — never success without a witness, never an unsettled job. Objective: {{inputs.objective}}'
     on_error: fail_run
-  - name: await_verify
-    action: retry
-    max_attempts: 240
-    backoff_secs: 30
-    on_error: fail_run
-    step:
-      name: verify_marker
-      action: verify
-      command: "test -f .flywheel/wave/{{inputs.wave_label}}-verify.done || { echo 'wave in flight: {{inputs.wave_label}}-verify.done not present yet — COMPOUND must not run before the wave is verified; widen the outer bound if the verifier is really working'; exit 1; }"
+  - name: verify_done
+    action: verify
+    command: "mkdir -p .flywheel/wave && touch .flywheel/wave/{{inputs.wave_label}}-verify.done"
+    on_error: continue
   - name: compound
     action: dispatch_job
+    await: result
+    no_claim_timeout: 600
+    result_timeout: 7200
     assignee: x
     spec:
       profile: "@planner"
@@ -3189,64 +3193,98 @@ mod tests {
         );
     }
 
-    /// bd-mszc / bd-o0v4q: stage await commands must not contain an ambiguity
-    /// signal, or the journal/provider classifier can misread a transient miss
-    /// as Unknown instead of a clean retryable failure. The signal list mirrors
-    /// toron-workflow's `classify_provider_error_msg` (boundary.rs).
-    ///
-    /// The four sequenced stage awaits (gate/dispatch/execute/review) are
-    /// reactive verify waits (filesystem-event latch with zero artificial idle
-    /// delay); await_verify remains a retry-over-verify marker check.
+    /// No step reads a completion marker: awaits are `dispatch_job`
+    /// `await: result` now, and `.done` files are write-only compat
+    /// sidecars. Any `test -f` read is a D4.4 regression.
     #[test]
-    fn wave_swarm_awaits_name_no_ambiguity_signal() {
-        use toron_workflow::schema::Action;
-        const SIGNALS: &[&str] = &[
-            "timeout",
-            "timed out",
-            "timed-out",
-            "deadline",
-            "transport",
-            "connection",
-            "network",
-            "unavailable",
-            "ambiguous",
-            "not confirmed",
-            "unknown outcome",
-            "may have",
-            "broken pipe",
-            "reset by peer",
-            "eof",
-        ];
+    fn wave_swarm_no_marker_reads() {
         let wfs = builtin_workflows();
         let wave = &wfs["wave-swarm"];
-        let mut awaits = Vec::new();
+        let json = serde_json::to_value(&wave.steps).expect("steps serialize");
+        let text = json.to_string();
+        assert!(!text.contains("test -f"), "no step reads a marker: {text}");
+    }
+
+    /// Every stage dispatch awaits its job result with a bounded wait:
+    /// `await: result`, an explicit claim bound, and the 7200s result bound.
+    #[test]
+    fn wave_swarm_stages_await_result() {
+        use toron_workflow::schema::{Action, DispatchAwait};
+        let wfs = builtin_workflows();
+        let wave = &wfs["wave-swarm"];
+        let mut dispatches = Vec::new();
         for s in &wave.steps {
-            let Action::Retry { step, .. } = &s.action else {
+            let Action::DispatchJob {
+                await_,
+                no_claim_timeout,
+                result_timeout,
+                ..
+            } = &s.action
+            else {
                 continue;
             };
-            let Action::Verify { command } = &step.action else {
-                panic!(
-                    "retry step {} must wrap a verify, not {:?}",
-                    s.name.as_deref().unwrap_or("?"),
-                    step.action.type_name()
-                );
-            };
-            awaits.push((s.name.clone().unwrap_or_default(), command.clone()));
+            dispatches.push((
+                s.name.clone().unwrap_or_default(),
+                *await_,
+                *no_claim_timeout,
+                *result_timeout,
+            ));
         }
         assert_eq!(
-            awaits.len(),
-            5,
-            "wave-swarm carries five retry-over-verify awaits: {awaits:?}"
+            dispatches.len(),
+            7,
+            "every stage dispatch awaits: {dispatches:?}"
         );
-        for (name, cmd) in &awaits {
-            let lower = cmd.to_lowercase();
-            for sig in SIGNALS {
-                assert!(
-                    !lower.contains(sig),
-                    "await {name} echo trips the Ambiguous classifier ({sig:?}): {cmd}"
-                );
-            }
+        for (name, await_, no_claim, result) in dispatches {
+            assert!(
+                matches!(await_, Some(DispatchAwait::Result)),
+                "{name} awaits result"
+            );
+            assert_eq!(no_claim, 600, "{name} names the claim bound");
+            assert_eq!(result, Some(7200), "{name} keeps the 7200s result bound");
         }
+    }
+
+    /// D4.3: the post-execute step is a ledger fact check, not a witness —
+    /// every wave bead closed plus a legal ship check each. The command
+    /// itself never runs in tests; its shape is the contract.
+    #[test]
+    fn wave_swarm_execute_exit_is_ledger_fact() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        let wave = &wfs["wave-swarm"];
+        let names: Vec<_> = wave.steps.iter().filter_map(|s| s.name.clone()).collect();
+        let at = names.iter().position(|n| n == "execute").expect("execute");
+        assert_eq!(
+            names[at + 1],
+            "execute_done",
+            "sidecar follows the witnessed exit"
+        );
+        assert_eq!(
+            names[at + 2],
+            "execute_exit",
+            "the ledger fact gates observe: {names:?}"
+        );
+        let exit = wave
+            .steps
+            .iter()
+            .find(|s| s.name.as_deref() == Some("execute_exit"))
+            .expect("execute_exit");
+        let Action::Verify { command } = &exit.action else {
+            panic!("execute_exit is a verify step");
+        };
+        assert!(
+            command.contains("br list") && command.contains("closed"),
+            "the exit reads ledger state, not a marker: {command}"
+        );
+        assert!(
+            command.contains("ship check"),
+            "each bead needs a legal ship check: {command}"
+        );
+        assert!(
+            !command.contains("test -f"),
+            "the exit never reads a marker: {command}"
+        );
     }
 
     /// bd-h4fc: every decisive step fails the run on error (on_error:
@@ -3526,7 +3564,10 @@ mod tests {
             .find(|s| s.name.as_deref() == Some("cycle"))
             .expect("cycle");
         assert_eq!(cycle.on_error, StepOnError::FailRun);
-        let Action::Loop { max, until, body, .. } = &cycle.action else {
+        let Action::Loop {
+            max, until, body, ..
+        } = &cycle.action
+        else {
             panic!("cycle is a loop");
         };
         assert_eq!(max, "{{inputs.max_iterations}}");
@@ -3715,7 +3756,10 @@ mod tests {
             .find(|s| s.name.as_deref() == Some("climb"))
             .expect("hillclimb has the climb step");
         assert_eq!(climb.on_error, StepOnError::FailRun);
-        let Action::Loop { max, until, body, .. } = &climb.action else {
+        let Action::Loop {
+            max, until, body, ..
+        } = &climb.action
+        else {
             panic!("climb is a loop");
         };
         assert_eq!(max, "{{inputs.max_iters}}");
@@ -4157,7 +4201,14 @@ mod tests {
             "audit fresh"
         );
         let pm = &graph.nodes["polish"];
-        let Action::Loop { max, min, until, body, .. } = &pm.action else {
+        let Action::Loop {
+            max,
+            min,
+            until,
+            body,
+            ..
+        } = &pm.action
+        else {
             panic!("polish is a loop");
         };
         assert_eq!(min.as_deref(), Some("2"), "polish min 2");
@@ -4197,7 +4248,14 @@ mod tests {
             )),
             "polish_state default"
         );
-        for id in ["polish_1", "snap", "polish_2", "fence_2", "converged_2", "polish_more"] {
+        for id in [
+            "polish_1",
+            "snap",
+            "polish_2",
+            "fence_2",
+            "converged_2",
+            "polish_more",
+        ] {
             assert!(
                 !graph.nodes.contains_key(id),
                 "retired node {id} absent after collapse"

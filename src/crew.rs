@@ -2655,16 +2655,17 @@ steps:
         .unwrap();
         assert_eq!(
             wf_builtin.steps.len(),
-            13,
-            "builtin token unchanged (8 stages + 5 sequencing awaits, bd-compose-stage-sequencing-zgi9)"
+            15,
+            "builtin token unchanged (7 stage dispatches + 6 write-only sidecars + ledger exit + signoff)"
         );
     }
 
     /// bd-compose-stage-sequencing-zgi9: the name is historical (ADR-0009
-    /// witness script filters it); the expansion is the 8 stages PLUS one
-    /// artifact-await step between each gated pair. The awaits are what make
-    /// stage ORDER real: a dispatch can no longer walk past a predecessor
-    /// whose completion marker is missing. See
+    /// witness script filters it); the expansion is the 7 stage dispatches
+    /// PLUS one write-only sidecar after each witnessed exit, PLUS the
+    /// execute ledger exit. Order is real because each dispatch awaits its
+    /// own job result (bounded by result_timeout): a dispatch can no longer
+    /// walk past a predecessor whose result never settled. See
     /// `compose_stage_awaits_completion` for the Acceptance proof.
     #[test]
     fn wave_swarm_compose_token_expands_eight_steps_and_lints_clean() {
@@ -2674,7 +2675,7 @@ steps:
         let part =
             parse_compose_part_with("wave-swarm", &builtin_token).expect("compose token parses");
         let wf = compose_workflow_with("composed-wave", "obj", None, &[part], &affinity).unwrap();
-        assert_eq!(wf.steps.len(), 13, "{:?}", wf.steps.iter().map(|s| &s.name));
+        assert_eq!(wf.steps.len(), 15, "{:?}", wf.steps.iter().map(|s| &s.name));
         assert!(
             matches!(&wf.steps[0].action, Action::DispatchJob { spec, .. }
                 if spec.profile.as_deref() == Some("@planner")
@@ -2685,81 +2686,67 @@ steps:
         assert!(
             matches!(&wf.steps[2].action, Action::DispatchJob { spec, .. }
                 if spec.stage.as_deref() == Some("wave-dispatch")),
-            "DISPATCH after await_gate"
+            "DISPATCH after the gate sidecar"
         );
         assert!(
             matches!(&wf.steps[4].action, Action::DispatchJob { spec, .. }
                 if spec.profile.as_deref() == Some("{{inputs.coder_profile}}")
                     && spec.stage.as_deref() == Some("ce-execute")),
-            "EXECUTE after await_dispatch (bd-wave-swarm-graduation-fix-98io: the crew needs an executor; bd-adv4: the executor profile rides the coder_profile input, default @coder)"
-        );
-        assert!(
-            matches!(&wf.steps[6].action, Action::DispatchJob { spec, .. }
-                if spec.profile.as_deref() == Some("@reviewer")
-                    && spec.stage.as_deref() == Some("wave-observe")),
-            "OBSERVE after the wave closed"
+            "EXECUTE after the dispatch sidecar (bd-wave-swarm-graduation-fix-98io: the crew needs an executor; bd-adv4: the executor profile rides the coder_profile input, default @coder)"
         );
         assert!(
             matches!(&wf.steps[7].action, Action::DispatchJob { spec, .. }
                 if spec.profile.as_deref() == Some("@reviewer")
-                    && spec.stage.as_deref() == Some("ce-review")),
-            "REVIEW after await_execute (ADR-0009: audit the diff before VERIFY audits the receipts)"
+                    && spec.stage.as_deref() == Some("wave-observe")),
+            "OBSERVE after the ledger exit"
         );
         assert!(
             matches!(&wf.steps[9].action, Action::DispatchJob { spec, .. }
                 if spec.profile.as_deref() == Some("@reviewer")
-                    && spec.stage.as_deref() == Some("wave-verify")),
-            "VERIFY after await_review"
+                    && spec.stage.as_deref() == Some("ce-review")),
+            "REVIEW after the observe sidecar (ADR-0009: audit the diff before VERIFY audits the receipts)"
         );
         assert!(
             matches!(&wf.steps[11].action, Action::DispatchJob { spec, .. }
+                if spec.profile.as_deref() == Some("@reviewer")
+                    && spec.stage.as_deref() == Some("wave-verify")),
+            "VERIFY after the review sidecar"
+        );
+        assert!(
+            matches!(&wf.steps[13].action, Action::DispatchJob { spec, .. }
                 if spec.profile.as_deref() == Some("@planner")
                     && spec.stage.as_deref() == Some("ce-compound")
                     && spec.phase.as_deref() == Some("compound")),
-            "COMPOUND after await_verify (ADR-0009: phase compound, planner)"
+            "COMPOUND after the verify sidecar (ADR-0009: phase compound, planner)"
         );
         assert!(
-            matches!(&wf.steps[12].action, Action::RequestApproval { message }
+            matches!(&wf.steps[14].action, Action::RequestApproval { message }
                 if message.contains("captain")),
             "SIGNOFF last, captain-only: {:?}",
-            wf.steps[12].action.type_name()
+            wf.steps[14].action.type_name()
         );
         for (idx, marker) in [
             (1, "gate"),
             (3, "dispatch"),
             (5, "execute"),
-            (8, "review"),
-            (10, "verify"),
+            (8, "observe"),
+            (10, "review"),
+            (12, "verify"),
         ] {
-            let Action::Retry {
-                max_attempts,
-                backoff_secs,
-                step,
-            } = &wf.steps[idx].action
-            else {
+            let Action::Verify { command } = &wf.steps[idx].action else {
                 panic!(
-                    "step {idx} ({:?}) must be the await for {marker}: {:?}",
+                    "step {idx} ({:?}) must be the {marker} sidecar: {:?}",
                     wf.steps[idx].name,
                     wf.steps[idx].action.type_name()
                 );
             };
-            let Action::Verify { command } = &step.action else {
-                panic!(
-                    "await {marker} must wrap a verify: {}",
-                    step.action.type_name()
-                );
-            };
             assert!(
                 command.contains(&format!("{{{{inputs.wave_label}}}}-{marker}.done")),
-                "await {marker} checks its completion marker: {command}"
+                "sidecar {marker} writes its completion marker: {command}"
             );
             assert!(
-                command.contains("wave in flight"),
-                "await {marker} fails loud with an in-flight message: {command}"
-            );
-            assert!(
-                u64::from(*max_attempts - 1) * *backoff_secs >= 3600,
-                "await {marker} carries a per-step budget of at least 1h: {max_attempts} x {backoff_secs}s"
+                !command.contains("test -f"),
+                "sidecar {marker} never reads a marker: {command}"
             );
         }
         let report = toron_workflow::lint_workflow(&wf);
@@ -2771,17 +2758,13 @@ steps:
     }
 
     /// bd-compose-stage-sequencing-zgi9 Acceptance: sequence-verifiable-units
-    /// — a stage fires only after the previous stage's artifact exists. Each
-    /// gated pair is (stage, await), and WRITER/WAITER AGREEMENT is the
-    /// property: the stage's task must instruct writing the exact marker the
-    /// following await verifies. If the two ever name different paths, a green
-    /// await proves nothing — which is why this is asserted (and mutation-
-    /// proven red) rather than assumed. The waits carry their own budget and
-    /// fail loud with a "wave in flight ... widen" message so a real wave is
-    /// never silently dispatched over (boundary-discipline: per-step budgets,
-    /// not one total): the CLI `--timeout` flag stays the run's outer bound,
-    /// but the await echo must never spell it (bd-mszc: the classifier reads
-    /// "--timeout" as transport ambiguity).
+    /// — a stage fires only after the previous stage's result settled. Each
+    /// stage dispatch awaits its own job result (await: result with a bounded
+    /// result_timeout), so a dispatch can no longer walk past a predecessor
+    /// whose result never settled. The write-only sidecars never read: no
+    /// step probes a `.done` file, so a green run cannot rest on a stale
+    /// marker (D4.4). Per-step budgets stay bounded (boundary-discipline:
+    /// per-step result_timeout, not one total).
     #[test]
     fn compose_stage_awaits_completion() {
         use toron_workflow::schema::Action;
@@ -2791,76 +2774,48 @@ steps:
             parse_compose_part_with("wave-swarm", &builtin_token).expect("compose token parses");
         let wf = compose_workflow_with("seq", "obj", None, &[part], &affinity).unwrap();
 
-        let pairs: [(&str, usize, usize, &str); 5] = [
-            ("gate", 0, 1, "gate"),
-            ("dispatch", 2, 3, "dispatch"),
-            ("execute", 4, 5, "execute"),
-            ("review", 7, 8, "review"),
-            ("verify", 9, 10, "verify"),
+        let stages = [
+            ("gate", 0),
+            ("dispatch", 2),
+            ("execute", 4),
+            ("observe", 7),
+            ("review", 9),
+            ("verify", 11),
+            ("compound", 13),
         ];
-        for (stage_name, si, ai, marker) in pairs {
+        for (stage_name, si) in stages {
             assert_eq!(
                 wf.steps[si].name.as_deref(),
                 Some(stage_name),
                 "step {si} is the {stage_name} stage: {:?}",
                 wf.steps[si].name
             );
-            let expected_await = format!("await_{stage_name}");
-            assert_eq!(
-                wf.steps[ai].name.as_deref(),
-                Some(expected_await.as_str()),
-                "step {ai} awaits {stage_name}"
-            );
-            let Action::DispatchJob { spec, .. } = &wf.steps[si].action else {
+            let Action::DispatchJob {
+                await_,
+                no_claim_timeout,
+                result_timeout,
+                ..
+            } = &wf.steps[si].action
+            else {
                 panic!(
                     "{stage_name} must be a dispatch_job: {:?}",
                     wf.steps[si].action.type_name()
                 );
             };
-            let task = spec
-                .task
-                .as_deref()
-                .unwrap_or_else(|| panic!("{stage_name} carries no inline task"));
-            let marker_path = format!(".flywheel/wave/{{{{inputs.wave_label}}}}-{marker}.done");
             assert!(
-                task.contains(&marker_path),
-                "{stage_name}'s task must instruct writing {marker_path}: {task}"
-            );
-            let Action::Retry {
-                max_attempts,
-                backoff_secs,
-                step,
-            } = &wf.steps[ai].action
-            else {
-                panic!(
-                    "await_{stage_name} must be a retry: {:?}",
-                    wf.steps[ai].action.type_name()
-                );
-            };
-            let Action::Verify { command } = &step.action else {
-                panic!("await_{stage_name} must wrap a verify");
-            };
-            assert!(
-                command.starts_with(&format!("test -f {marker_path} ||")),
-                "await_{stage_name} must probe {marker_path}: {command}"
+                matches!(await_, Some(toron_workflow::schema::DispatchAwait::Result)),
+                "{stage_name} awaits its own job result"
             );
             assert!(
-                command.contains("wave in flight"),
-                "await_{stage_name} fails loud when the wave is in flight: {command}"
-            );
-            assert!(
-                command.contains("outer bound"),
-                "await_{stage_name} names the extension point (outer bound): {command}"
-            );
-            assert!(
-                !command.contains("--timeout"),
-                "await_{stage_name} must not spell --timeout: the classifier reads it as ambiguity: {command}"
-            );
-            assert!(
-                u64::from(*max_attempts) * *backoff_secs >= 3600,
-                "await_{stage_name} waits at least an hour before giving up: {max_attempts} x {backoff_secs}s"
+                *no_claim_timeout == 600 && *result_timeout == Some(7200),
+                "{stage_name} carries the bounded wait: {no_claim_timeout}s claim, {result_timeout:?}s result"
             );
         }
+        let composed = serde_json::to_value(&wf.steps).expect("steps serialize");
+        assert!(
+            !composed.to_string().contains("test -f"),
+            "no step reads a marker: the waits are model deadlines, not file polls"
+        );
     }
 
     /// bd-compose-plumbing-zdzi Acceptance: a composed run ensures its declared
@@ -2933,8 +2888,8 @@ steps:
         let wf = compose_workflow_with("mixed", "obj", None, &parts, &affinity).unwrap();
         assert_eq!(
             wf.steps.len(),
-            14,
-            "1 plain + 8 compose-token stages + 5 sequencing awaits"
+            16,
+            "1 plain + 7 stage dispatches + 6 write-only sidecars + ledger exit + signoff"
         );
     }
 
