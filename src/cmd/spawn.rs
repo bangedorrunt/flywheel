@@ -1012,11 +1012,12 @@ pub(crate) fn build_dry_run_plan(
             placement: "pane".to_string(),
         });
     }
-    // ADR-0022 D5: the plan carries its computed consent set into
-    // `--dry-run --json` and the launch gates below.
+    // ADR-0022 D5: the plan carries its computed consent set and the
+    // effective policy into `--dry-run --json` and the launch gates below.
     let policy = cfg.consent_policy();
     let est = crate::swarm_plan::estimate_usd_per_mtok(&plan, registry);
     plan.needs_consent = crate::swarm_plan::needs_consent(&plan, &policy, est, cfg.crew_max());
+    plan.policy = Some(policy);
     Ok(plan)
 }
 
@@ -5822,8 +5823,8 @@ mod consent_gate_tests {
         let item = plan
             .needs_consent
             .iter()
-            .find(|item| item.reason == crate::swarm_plan::ConsentReason::Blocked)
-            .expect("unregistered ask is blocked, so consent is required");
+            .find(|item| item.reason == crate::swarm_plan::ConsentReason::Unregistered)
+            .expect("unregistered ask needs sign-off, so consent is required");
         assert_eq!(item.field, "model");
     }
 

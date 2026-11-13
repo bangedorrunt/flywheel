@@ -136,7 +136,7 @@ pub struct Question {
     pub default: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Briefing {
     pub schema: String,
     pub objective: String,
@@ -591,7 +591,8 @@ pub fn assemble_with_catalog(
             default: missing.join(","),
         });
     }
-    attach_consent_plan(&mut briefing, cap);
+    let consent_default = crate::swarm_plan::ConsentPolicy::default();
+    attach_consent_plan(&mut briefing, cap, &consent_default);
     briefing
 }
 
@@ -828,10 +829,10 @@ fn splice_project(argv: &mut Vec<String>, project: &str) {
 
 /// ADR-0022 D5: attach the briefing plan carrying computed consent. Seats
 /// carry no model ask at briefing time (`model: None`); the harness is
-/// unknown until dispatch, recorded as `"tbd"`. Under the default policy
-/// the only rule that can fire here is crew-max. This helper is the one
+/// unknown until dispatch, recorded as `"tbd"`. The consent policy rides
+/// in from the caller (which already loads config); this helper is the one
 /// call site for [`crate::swarm_plan::needs_consent`] in this module.
-fn attach_consent_plan(b: &mut Briefing, cap: u32) {
+pub fn attach_consent_plan(b: &mut Briefing, cap: u32, policy: &crate::swarm_plan::ConsentPolicy) {
     use crate::swarm_plan as consent_plan;
     if !spawns_crew(&b.proposal) {
         b.plan = None;
@@ -855,8 +856,8 @@ fn attach_consent_plan(b: &mut Briefing, cap: u32) {
             placement: "pane".to_string(),
         });
     }
-    let policy = consent_plan::ConsentPolicy::default();
-    plan.needs_consent = consent_plan::needs_consent(&plan, &policy, None, cap);
+    plan.policy = Some(policy.clone());
+    plan.needs_consent = consent_plan::needs_consent(&plan, policy, None, cap);
     b.plan = Some(plan);
 }
 
@@ -948,9 +949,11 @@ fn rebuild_argv_for_topology(b: &mut Briefing, topology: &str) {
         _ => {}
     }
     // Topology switched under the proposal: the crew map changed, so the
-    // attached plan is stale. Recompute under the default cap (advisory;
-    // the spawn gate re-weighs with the operator cap).
-    attach_consent_plan(b, DEFAULT_CREW_MAX);
+    // attached plan is stale. Recompute under the default cap and policy
+    // (advisory; cmd_briefing refreshes both from operator config after
+    // answers, and the spawn gate re-weighs before launch).
+    let consent_default = crate::swarm_plan::ConsentPolicy::default();
+    attach_consent_plan(b, DEFAULT_CREW_MAX, &consent_default);
 }
 
 fn splice_flag(argv: &mut Vec<String>, flag: &str, value: &str) {

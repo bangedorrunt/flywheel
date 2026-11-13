@@ -9680,6 +9680,7 @@ fn cmd_briefing(
         briefing::align_with_session_topology(&mut b, &final_topo, held);
     }
     briefing::apply_answers(&mut b, topology, crew, model).map_err(|e| anyhow!(e))?;
+    briefing::attach_consent_plan(&mut b, cfg.crew_max(), &cfg.consent_policy());
     let project_dir = project_dir(cfg, project);
     b.memory_traps = crate::cmd::memory::briefing_traps(
         objective,

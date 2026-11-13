@@ -595,12 +595,8 @@ impl Config {
                 .as_ref()
                 .and_then(|c| c.budget_usd_per_mtok)
                 .unwrap_or(crate::swarm_plan::DEFAULT_BUDGET_USD_PER_MTOK),
+            signoff: self.consent.as_ref().and_then(|c| c.signoff.clone()),
         }
-    }
-
-    /// ADR-0022 D5 consent signoff (parsed, carried, not acted on here).
-    pub fn consent_signoff(&self) -> Option<&str> {
-        self.consent.as_ref().and_then(|c| c.signoff.as_deref())
     }
 
     pub fn load() -> Result<Self> {
@@ -1259,6 +1255,23 @@ verifier_family_override = "deepseek"
         assert_eq!(c.verifier_family_override(), Some("deepseek"));
         let c: Config = toml::from_str("").unwrap();
         assert_eq!(c.verifier_family_override(), None);
+    }
+
+    #[test]
+    fn consent_signoff_parses_from_consent_section() {
+        let c: Config = toml::from_str(
+            r#"
+[consent]
+ask = "always"
+signoff = "witness"
+"#,
+        )
+        .unwrap();
+        let policy = c.consent_policy();
+        assert_eq!(policy.ask, crate::swarm_plan::ConsentAsk::Always);
+        assert_eq!(policy.signoff.as_deref(), Some("witness"));
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.consent_policy().signoff, None);
     }
 
     #[test]

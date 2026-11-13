@@ -74,7 +74,7 @@ pub struct Seat {
 }
 
 /// The whole plan: `flywheel-plan.v1`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
     pub schema: String,
     pub mode: String,
@@ -83,6 +83,10 @@ pub struct Plan {
     /// absent on the wire reads as empty.
     #[serde(default)]
     pub needs_consent: Vec<ConsentItem>,
+    /// ADR-0022 D5: effective consent policy for this plan. Additive and
+    /// optional: absent on the wire reads as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<ConsentPolicy>,
 }
 
 impl Plan {
@@ -94,6 +98,7 @@ impl Plan {
             mode: mode.to_string(),
             seats: Vec::new(),
             needs_consent: Vec::new(),
+            policy: None,
         }
     }
 }
@@ -122,8 +127,10 @@ impl Default for ConsentAsk {
 pub enum ConsentReason {
     Jev,
     Blocked,
+    Unregistered,
     Budget,
     CrewMax,
+    Policy,
 }
 
 impl ConsentReason {
@@ -133,8 +140,10 @@ impl ConsentReason {
         match self {
             Self::Jev => "jev",
             Self::Blocked => "blocked",
+            Self::Unregistered => "unregistered",
             Self::Budget => "budget",
             Self::CrewMax => "crew-max",
+            Self::Policy => "policy",
         }
     }
 }
@@ -151,12 +160,22 @@ pub struct ConsentItem {
 /// Default budget threshold (USD per mtok) when `[consent]` is absent.
 pub const DEFAULT_BUDGET_USD_PER_MTOK: f64 = 5.0;
 
-/// ADR-0022 D5 consent policy: the `[consent]` ask mode plus the budget
-/// threshold the summed estimate is weighed against.
-#[derive(Debug, Clone, PartialEq)]
+/// ADR-0022 D5 consent policy: the `[consent]` ask mode, the budget
+/// threshold the summed estimate is weighed against, and the signoff
+/// (parsed, carried, not acted on in this slice). Serialized with the plan
+/// so the effective policy is on the wire next to the consent it produced.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConsentPolicy {
+    #[serde(default)]
     pub ask: ConsentAsk,
+    #[serde(default = "default_budget_usd_per_mtok")]
     pub budget_usd_per_mtok: f64,
+    #[serde(default)]
+    pub signoff: Option<String>,
+}
+
+fn default_budget_usd_per_mtok() -> f64 {
+    DEFAULT_BUDGET_USD_PER_MTOK
 }
 
 impl Default for ConsentPolicy {
@@ -164,16 +183,18 @@ impl Default for ConsentPolicy {
         Self {
             ask: ConsentAsk::OnChange,
             budget_usd_per_mtok: DEFAULT_BUDGET_USD_PER_MTOK,
+            signoff: None,
         }
     }
 }
 
 /// ADR-0022 D5: compute the consent set. Pure: no I/O, no env, no clock.
-/// Rule 2 (blocked, including unregistered user asks, which refuse the same
-/// way at the gate) fires under every policy; rule 1 (any field with
-/// `from: jev`) fires on-change; `always` lists every seat's model and
-/// harness; `never` lists only rule 2. Rule 3 (estimate over budget, seat
-/// total over `crew_max`) fires under every policy except `never`.
+/// Rule 2 (blocked) fires under every policy; unregistered asks surface as
+/// `unregistered` (they need sign-off but are not delivery-blocked, so
+/// `--yes` launches them); rule 1 (any field with `from: jev`) fires
+/// on-change; `always` lists every seat's model and harness as `policy`;
+/// `never` lists only rule 2. Rule 3 (estimate over budget, seat total over
+/// `crew_max`) fires under every policy except `never`.
 #[must_use]
 pub fn needs_consent(
     plan: &Plan,
@@ -211,18 +232,21 @@ pub fn needs_consent(
     for seat in &plan.seats {
         for (name, field) in fields(seat) {
             let Some(f) = field else { continue };
-            // An unregistered user ask is consent-blocked at the gate the
-            // same way a refused delivery is (red-phase test pins this),
-            // even though its delivery status reads honored.
-            let blocked = matches!(f.status, FieldStatus::Blocked { .. })
-                || f.registry.as_deref() == Some("unregistered");
-            if blocked {
+            if matches!(f.status, FieldStatus::Blocked { .. }) {
                 push(
                     &mut out,
                     &mut seen,
                     &seat.role,
                     name,
                     ConsentReason::Blocked,
+                );
+            } else if f.registry.as_deref() == Some("unregistered") {
+                push(
+                    &mut out,
+                    &mut seen,
+                    &seat.role,
+                    name,
+                    ConsentReason::Unregistered,
                 );
             }
         }
@@ -241,14 +265,20 @@ pub fn needs_consent(
         ConsentAsk::Always => {
             for seat in &plan.seats {
                 if seat.model.is_some() {
-                    push(&mut out, &mut seen, &seat.role, "model", ConsentReason::Jev);
+                    push(
+                        &mut out,
+                        &mut seen,
+                        &seat.role,
+                        "model",
+                        ConsentReason::Policy,
+                    );
                 }
                 push(
                     &mut out,
                     &mut seen,
                     &seat.role,
                     "harness",
-                    ConsentReason::Jev,
+                    ConsentReason::Policy,
                 );
             }
         }
@@ -860,6 +890,7 @@ mod tests {
         ConsentPolicy {
             ask: ConsentAsk::OnChange,
             budget_usd_per_mtok: 5.0,
+            signoff: None,
         }
     }
 
@@ -895,6 +926,19 @@ mod tests {
         let got = needs_consent(&plan, &on_change(), None, 5);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].reason, ConsentReason::Blocked);
+    }
+
+    #[test]
+    fn needs_consent_unregistered_marker_lists_unregistered() {
+        let mut plan = Plan::new("swarm");
+        let mut field = consent_field("m", Provenance::User, FieldStatus::Honored);
+        field.registry = Some("unregistered".to_string());
+        plan.seats.push(consent_seat("coder", 1, Some(field)));
+        let got = needs_consent(&plan, &on_change(), None, 5);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].seat, "coder");
+        assert_eq!(got[0].field, "model");
+        assert_eq!(got[0].reason, ConsentReason::Unregistered);
     }
 
     #[test]
@@ -939,6 +983,7 @@ mod tests {
         let policy = ConsentPolicy {
             ask: ConsentAsk::Never,
             budget_usd_per_mtok: 5.0,
+            signoff: None,
         };
         let got = needs_consent(&plan, &policy, Some(99.0), 0);
         assert_eq!(got.len(), 1);
@@ -960,16 +1005,20 @@ mod tests {
         let policy = ConsentPolicy {
             ask: ConsentAsk::Always,
             budget_usd_per_mtok: 5.0,
+            signoff: None,
         };
         let got = needs_consent(&plan, &policy, None, 5);
         assert!(
-            got.iter().any(|i| i.seat == "coder" && i.field == "model"),
-            "always lists model: {got:?}"
+            got.iter().any(|i| i.seat == "coder"
+                && i.field == "model"
+                && i.reason == ConsentReason::Policy),
+            "always lists model as policy: {got:?}"
         );
         assert!(
-            got.iter()
-                .any(|i| i.seat == "coder" && i.field == "harness"),
-            "always lists harness: {got:?}"
+            got.iter().any(|i| i.seat == "coder"
+                && i.field == "harness"
+                && i.reason == ConsentReason::Policy),
+            "always lists harness as policy: {got:?}"
         );
     }
 
@@ -989,5 +1038,32 @@ mod tests {
             serde_json::to_value(&plan).unwrap()["needs_consent"],
             serde_json::json!([])
         );
+    }
+
+    #[test]
+    fn consent_policy_carries_signoff_and_serializes_in_plan() {
+        let policy = ConsentPolicy {
+            ask: ConsentAsk::Always,
+            budget_usd_per_mtok: 5.0,
+            signoff: Some("witness".to_string()),
+        };
+        let mut plan = Plan::new("swarm");
+        plan.policy = Some(policy);
+        let v = serde_json::to_value(&plan).unwrap();
+        assert_eq!(v["policy"]["signoff"], serde_json::json!("witness"));
+        assert_eq!(v["policy"]["ask"], serde_json::json!("always"));
+        let back: Plan = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            back.policy.as_ref().and_then(|p| p.signoff.clone()),
+            Some("witness".to_string())
+        );
+        let legacy: Plan = serde_json::from_value(serde_json::json!({
+            "schema": "flywheel-plan.v1",
+            "mode": "swarm",
+            "seats": []
+        }))
+        .unwrap();
+        assert_eq!(legacy.policy, None);
+        assert!(legacy.needs_consent.is_empty());
     }
 }
