@@ -5125,6 +5125,9 @@ mod tests {
                 ..Default::default()
             },
             channel: None,
+            await_: None,
+            no_claim_timeout: 600,
+            result_timeout: None,
         };
         let out = pane_dispatch(&catalog, "proj", "wf", &json!({}), &entries, &action, None)
             .expect("fallback must dispatch, not bail");
@@ -5161,6 +5164,9 @@ mod tests {
                 ..Default::default()
             },
             channel: None,
+            await_: None,
+            no_claim_timeout: 600,
+            result_timeout: None,
         };
         let err = pane_dispatch(&catalog, "proj", "wf", &json!({}), &entries, &action, None)
             .expect_err("no opencode pane and no reviewer pane must bail");

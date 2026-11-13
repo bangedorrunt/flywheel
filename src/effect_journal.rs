@@ -1048,6 +1048,9 @@ mod tests {
                 ..Default::default()
             },
             channel: None,
+            await_: None,
+            no_claim_timeout: 600,
+            result_timeout: None,
         }
     }
 

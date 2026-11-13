@@ -2044,6 +2044,9 @@ owner = "housekeeper"
                 ..Default::default()
             },
             channel: None,
+            await_: None,
+            no_claim_timeout: 600,
+            result_timeout: None,
         }))
         .unwrap_err();
         assert!(
@@ -2082,6 +2085,9 @@ owner = "housekeeper"
                     ..Default::default()
                 },
                 channel: None,
+                await_: None,
+                no_claim_timeout: 600,
+                result_timeout: None,
             },
             Action::CallWebhook {
                 url: "http://127.0.0.1:9/probe".into(),
