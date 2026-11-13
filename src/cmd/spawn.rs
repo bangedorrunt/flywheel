@@ -964,7 +964,7 @@ fn load_spawn_preferences(path: &std::path::Path) -> Result<crate::preferences::
 /// chain decides). Provider pairs the user ask; effort is
 /// preference-or-nothing. The plan and the launch read this: one
 /// precedence, two readers.
-struct BareAsk {
+pub(crate) struct BareAsk {
     model: Option<(String, crate::swarm_plan::Provenance)>,
     provider: String,
     effort: Option<(String, crate::swarm_plan::Provenance)>,
@@ -1000,6 +1000,88 @@ fn prefer_bare_inputs(
             effort,
         }
     }
+}
+
+/// Per-role patch overrides: the single lowering of `--patch` specs into
+/// launch inputs. `build_dry_run_plan` and every launch path
+/// read this map, so plan and launch are one decision. Later patches win
+/// per field; a model override clears its provider (the plan resolves the
+/// raw value, so the launch must look it up raw too).
+#[derive(Default)]
+pub(crate) struct RoleOverride {
+    pub harness: Option<String>,
+    pub model: Option<(String, String)>,
+    pub effort: Option<String>,
+    pub mode: Option<String>,
+}
+
+/// Lower parsed patches into per-role launch inputs. ONE place where a patch
+/// becomes launch input (bd-8g3uo rework).
+pub(crate) fn patch_role_overrides(
+    patches: &[crate::swarm_plan::PlanPatch],
+) -> std::collections::BTreeMap<String, RoleOverride> {
+    let mut map = std::collections::BTreeMap::new();
+    for p in patches {
+        let e = map
+            .entry(p.seat.clone())
+            .or_insert_with(RoleOverride::default);
+        match &p.field {
+            crate::swarm_plan::PatchField::Harness => e.harness = Some(p.value.clone()),
+            crate::swarm_plan::PatchField::Model => {
+                e.model = Some((p.value.clone(), String::new()))
+            }
+            crate::swarm_plan::PatchField::Effort => e.effort = Some(p.value.clone()),
+            crate::swarm_plan::PatchField::Mode => e.mode = Some(p.value.clone()),
+        }
+    }
+    map
+}
+
+/// Effective bare launch triple for one role: the base ask with the role's
+/// patch overrides applied. Every bare launch site (hc first, hc pane, rex)
+/// AND the launch-parity test read this — one application point.
+pub(crate) fn patched_bare_launch(
+    overrides: &std::collections::BTreeMap<String, RoleOverride>,
+    role: &str,
+    ask: BareAsk,
+) -> (String, String, Option<String>) {
+    let ov = overrides.get(role);
+    let (model, provider) = match ov.and_then(|o| o.model.clone()) {
+        Some(pair) => pair,
+        None => (ask.model.map(|(m, _)| m).unwrap_or_default(), ask.provider),
+    };
+    let effort = ov
+        .and_then(|o| o.effort.clone())
+        .or_else(|| ask.effort.map(|(e, _)| e));
+    (model, provider, effort)
+}
+
+/// Apply a role's patch overrides to a profile shadow in place. Same map as
+/// the bare path; the launch plan builders then see patched values.
+pub(crate) fn patch_shadow_profile(
+    overrides: &std::collections::BTreeMap<String, RoleOverride>,
+    role: &str,
+    shadow: &mut crate::profile::Profile,
+) {
+    if let Some(o) = overrides.get(role) {
+        if let Some((m, _)) = &o.model {
+            shadow.model = m.clone();
+        }
+        if let Some(e) = &o.effort {
+            shadow.effort = e.clone();
+        }
+    }
+}
+
+/// Parse every `--patch` spec once, preserving the raw spec for errors.
+fn parse_role_patches(specs: &[String]) -> Result<Vec<crate::swarm_plan::PlanPatch>> {
+    specs
+        .iter()
+        .map(|spec| {
+            crate::swarm_plan::parse_patch(spec)
+                .map_err(|e| anyhow::anyhow!("bad --patch {spec:?}: {e}"))
+        })
+        .collect()
 }
 
 /// Effective profile for one item: standing model/effort preferences fill a
@@ -1052,6 +1134,7 @@ pub(crate) fn build_dry_run_plan(
     bare_provider: &str,
     prefs: &crate::preferences::PreferenceSet,
     project: &str,
+    overrides: &std::collections::BTreeMap<String, RoleOverride>,
 ) -> Result<crate::swarm_plan::Plan> {
     use crate::swarm_plan::seat_status;
     let mut plan = crate::swarm_plan::Plan::new("swarm");
@@ -1095,6 +1178,21 @@ pub(crate) fn build_dry_run_plan(
             };
             (harness, model, ask.effort)
         };
+        // bd-8g3uo rework: patches become inputs here — one lowering read by
+        // plan and launch alike, so a patched plan can only launch patched.
+        let patch = overrides.get(item.short.as_str());
+        let harness = patch.and_then(|o| o.harness.clone()).unwrap_or(harness);
+        let model = match patch.and_then(|o| o.model.clone()) {
+            Some((m, _)) => Some((m, crate::swarm_plan::Provenance::User)),
+            None => model,
+        };
+        let effort = match patch.and_then(|o| o.effort.clone()) {
+            Some(e) => Some((e, crate::swarm_plan::Provenance::User)),
+            None => effort,
+        };
+        let patch_mode = patch
+            .and_then(|o| o.mode.clone())
+            .map(|m| (m, crate::swarm_plan::Provenance::User));
         let effort_str = effort.as_ref().map(|(value, _)| value.as_str());
         let (model_field, flag) = match model {
             None => (None, String::new()),
@@ -1109,7 +1207,7 @@ pub(crate) fn build_dry_run_plan(
         // and stage contracts (the phase source) arrive with workflows.
         // Wired through the field fns so the values flow when a source
         // lands; today they render as null.
-        let mode_field = crate::swarm_plan::mode_field(&harness, None);
+        let mode_field = crate::swarm_plan::mode_field(&harness, patch_mode);
         let phase_field = crate::swarm_plan::phase_field(&harness, None);
         plan.seats.push(crate::swarm_plan::Seat {
             role: item.short.clone(),
@@ -1235,7 +1333,9 @@ projects available: {}",
     if items.is_empty() {
         bail!("nothing to spawn: pass --oc/--pi/--gk counts, --recipe NAME, or --profile NAME");
     }
-    let mut plan = build_dry_run_plan(
+    let patches = parse_role_patches(&opts.patches)?;
+    let overrides = patch_role_overrides(&patches);
+    let plan = build_dry_run_plan(
         cfg,
         &items,
         &catalog,
@@ -1244,13 +1344,15 @@ projects available: {}",
         &opts.bare_provider,
         &prefs,
         project,
+        &overrides,
     )?;
-    for spec in &opts.patches {
-        let patch = crate::swarm_plan::parse_patch(spec)
-            .map_err(|e| anyhow::anyhow!("bad --patch {spec:?}: {e}"))?;
-        plan = crate::swarm_plan::apply_patch(
+    // Coverage gate through the plan primitive itself (results discarded —
+    // the plan was built from these inputs): unknown seats fail here naming
+    // valid roles, keeping the error in one tested place.
+    for (spec, patch) in opts.patches.iter().zip(patches.iter()) {
+        crate::swarm_plan::apply_patch(
             &plan,
-            &patch,
+            patch,
             &model_reg,
             &cfg.consent_policy(),
             cfg.crew_max(),
@@ -1501,9 +1603,14 @@ projects available: {}",
     let mut first_plan: Option<ProfileLaunchPlan> = match items.first() {
         Some(item) => {
             let kind = crate::prefer_kind(cfg, item, &catalog, &model_reg, &prefs, project)?;
+            let kind = overrides
+                .get(item.short.as_str())
+                .and_then(|o| o.harness.clone())
+                .unwrap_or(kind);
             match item.profile.as_deref().map(|pn| catalog.get(pn)) {
                 Some(Some(p)) => {
-                    let (shadow, _, _) = prefer_shadow_profile(&prefs, item, p, project);
+                    let (mut shadow, _, _) = prefer_shadow_profile(&prefs, item, p, project);
+                    patch_shadow_profile(&overrides, item.short.as_str(), &mut shadow);
                     Some(profile_launch_plan(&kind, &shadow, None)?)
                 }
                 _ => {
@@ -1514,15 +1621,13 @@ projects available: {}",
                         &opts.bare_model,
                         &opts.bare_provider,
                     );
-                    let (eff_model, eff_provider) = ask
-                        .model
-                        .map(|(m, _)| (m, ask.provider))
-                        .unwrap_or_default();
+                    let (eff_model, eff_provider, eff_effort) =
+                        patched_bare_launch(&overrides, item.short.as_str(), ask);
                     first_bare = Some(bare_model_launch(
                         &kind,
                         &eff_model,
                         &eff_provider,
-                        ask.effort.as_ref().map(|(e, _)| e.as_str()),
+                        eff_effort.as_deref(),
                     )?);
                     None
                 }
@@ -1591,6 +1696,10 @@ projects available: {}",
     let mut preflighted_kinds: HashSet<String> = HashSet::new();
     for item in &items {
         let kind = crate::prefer_kind(cfg, item, &catalog, &model_reg, &prefs, project)?;
+        let kind = overrides
+            .get(item.short.as_str())
+            .and_then(|o| o.harness.clone())
+            .unwrap_or(kind);
         if preflighted_kinds.insert(kind.clone()) {
             preflight_kind_integration(&mut c, &kind, &integration_statuses);
         }
@@ -1618,7 +1727,8 @@ projects available: {}",
                     let p = catalog
                         .get(pname)
                         .expect("profile resolved at plan build (bd-eign.13)");
-                    let (shadow, _, _) = prefer_shadow_profile(&prefs, item, p, project);
+                    let (mut shadow, _, _) = prefer_shadow_profile(&prefs, item, p, project);
+                    patch_shadow_profile(&overrides, item.short.as_str(), &mut shadow);
                     let plan = if first {
                         first_plan.take().ok_or_else(|| {
                             anyhow!(
@@ -1647,16 +1757,9 @@ projects available: {}",
                             &opts.bare_model,
                             &opts.bare_provider,
                         );
-                        let (eff_model, eff_provider) = ask
-                            .model
-                            .map(|(m, _)| (m, ask.provider))
-                            .unwrap_or_default();
-                        bare_model_launch(
-                            &kind,
-                            &eff_model,
-                            &eff_provider,
-                            ask.effort.as_ref().map(|(e, _)| e.as_str()),
-                        )?
+                        let (eff_model, eff_provider, eff_effort) =
+                            patched_bare_launch(&overrides, item.short.as_str(), ask);
+                        bare_model_launch(&kind, &eff_model, &eff_provider, eff_effort.as_deref())?
                     };
                     (args, None, env_pin)
                 }
@@ -2130,7 +2233,9 @@ pub(crate) fn cmd_spawn_rex(
     if items.is_empty() {
         bail!("nothing to spawn: pass --oc/--pi/--gk counts, --recipe NAME, or --profile NAME");
     }
-    let mut plan = build_dry_run_plan(
+    let patches = parse_role_patches(&opts.patches)?;
+    let overrides = patch_role_overrides(&patches);
+    let plan = build_dry_run_plan(
         cfg,
         &items,
         &catalog,
@@ -2139,13 +2244,15 @@ pub(crate) fn cmd_spawn_rex(
         &opts.bare_provider,
         prefs,
         project,
+        &overrides,
     )?;
-    for spec in &opts.patches {
-        let patch = crate::swarm_plan::parse_patch(spec)
-            .map_err(|e| anyhow::anyhow!("bad --patch {spec:?}: {e}"))?;
-        plan = crate::swarm_plan::apply_patch(
+    // Coverage gate through the plan primitive itself (results discarded —
+    // the plan was built from these inputs): unknown seats fail here naming
+    // valid roles, keeping the error in one tested place.
+    for (spec, patch) in opts.patches.iter().zip(patches.iter()) {
+        crate::swarm_plan::apply_patch(
             &plan,
-            &patch,
+            patch,
             &model_reg,
             &cfg.consent_policy(),
             cfg.crew_max(),
@@ -2419,6 +2526,10 @@ pub(crate) fn cmd_spawn_rex(
         .unwrap_or_default();
     for item in &items {
         let kind = crate::prefer_kind(cfg, item, &catalog, &model_reg, &prefs, project)?;
+        let kind = overrides
+            .get(item.short.as_str())
+            .and_then(|o| o.harness.clone())
+            .unwrap_or(kind);
         for _ in 0..item.count {
             let ordinal = ordinals.entry(item.short.clone()).or_insert(0);
             *ordinal += 1;
@@ -2443,7 +2554,8 @@ pub(crate) fn cmd_spawn_rex(
                     let p = catalog
                         .get(pname)
                         .expect("profile resolved at plan build (bd-eign.13)");
-                    let (shadow, _, _) = prefer_shadow_profile(&prefs, item, p, project);
+                    let (mut shadow, _, _) = prefer_shadow_profile(&prefs, item, p, project);
+                    patch_shadow_profile(&overrides, item.short.as_str(), &mut shadow);
                     let plan = profile_launch_plan(&kind, &shadow, None)?;
                     (plan.args, Some(plan.model), plan.env_model_pin)
                 }
@@ -2455,16 +2567,10 @@ pub(crate) fn cmd_spawn_rex(
                         &opts.bare_model,
                         &opts.bare_provider,
                     );
-                    let (eff_model, eff_provider) = ask
-                        .model
-                        .map(|(m, _)| (m, ask.provider))
-                        .unwrap_or_default();
-                    let (args, env_pin) = bare_model_launch(
-                        &kind,
-                        &eff_model,
-                        &eff_provider,
-                        ask.effort.as_ref().map(|(e, _)| e.as_str()),
-                    )?;
+                    let (eff_model, eff_provider, eff_effort) =
+                        patched_bare_launch(&overrides, item.short.as_str(), ask);
+                    let (args, env_pin) =
+                        bare_model_launch(&kind, &eff_model, &eff_provider, eff_effort.as_deref())?;
                     (args, None, env_pin)
                 }
             };
@@ -4298,6 +4404,7 @@ mod adr0013_spawn_effect_tests {
             "",
             &crate::preferences::PreferenceSet::new(),
             "test",
+            &std::collections::BTreeMap::new(),
         )
         .expect("plan builds");
         let f = plan.seats[0].model.as_ref().expect("model field");
@@ -4319,6 +4426,7 @@ mod adr0013_spawn_effect_tests {
             "",
             &crate::preferences::PreferenceSet::new(),
             "test",
+            &std::collections::BTreeMap::new(),
         )
         .expect("plan builds");
         let f = plan.seats[0].model.as_ref().expect("model field");
@@ -4372,6 +4480,7 @@ mod adr0013_spawn_effect_tests {
             "",
             &crate::preferences::PreferenceSet::new(),
             "test",
+            &std::collections::BTreeMap::new(),
         )
         .expect("plan builds");
         let f = plan.seats[0].model.as_ref().expect("model field");
@@ -5983,6 +6092,7 @@ mod consent_gate_tests {
             "",
             &crate::preferences::PreferenceSet::new(),
             "test",
+            &std::collections::BTreeMap::new(),
         )
         .expect("plan builds");
         let item = plan
@@ -6014,6 +6124,7 @@ mod consent_gate_tests {
             "",
             &crate::preferences::PreferenceSet::new(),
             "test",
+            &std::collections::BTreeMap::new(),
         )
         .expect("plan builds");
         assert!(
@@ -6077,8 +6188,18 @@ mod prefer_spawn_tests {
         let catalog = crate::profile::ProfileCatalog::default();
         let prefs = test_prefs(&[("pi.model", "a/m", None)]);
         let items = bare_pi();
-        let plan = super::build_dry_run_plan(&cfg, &items, &catalog, &reg, "", "", &prefs, "probe")
-            .expect("plan builds");
+        let plan = super::build_dry_run_plan(
+            &cfg,
+            &items,
+            &catalog,
+            &reg,
+            "",
+            "",
+            &prefs,
+            "probe",
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("plan builds");
         let f = plan.seats[0].model.as_ref().expect("model field");
         assert_eq!(f.from, crate::swarm_plan::Provenance::Preference);
         assert_eq!(f.value, "a/m");
@@ -6132,8 +6253,18 @@ mod prefer_spawn_tests {
             kind: None,
             profile: Some("coder".into()),
         }];
-        let plan = super::build_dry_run_plan(&cfg, &items, &catalog, &reg, "", "", &prefs, "probe")
-            .expect("plan builds");
+        let plan = super::build_dry_run_plan(
+            &cfg,
+            &items,
+            &catalog,
+            &reg,
+            "",
+            "",
+            &prefs,
+            "probe",
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("plan builds");
         let f = plan.seats[0].model.as_ref().expect("model field");
         assert_eq!(f.from, crate::swarm_plan::Provenance::Preference);
         assert_eq!(f.value, "a/m");
@@ -6161,9 +6292,18 @@ mod prefer_spawn_tests {
         let catalog = crate::profile::ProfileCatalog::default();
         let prefs = test_prefs(&[("pi.model", "a/m", None)]);
         let items = bare_pi();
-        let plan =
-            super::build_dry_run_plan(&cfg, &items, &catalog, &reg, "b/m", "", &prefs, "probe")
-                .expect("plan builds");
+        let plan = super::build_dry_run_plan(
+            &cfg,
+            &items,
+            &catalog,
+            &reg,
+            "b/m",
+            "",
+            &prefs,
+            "probe",
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("plan builds");
         let f = plan.seats[0].model.as_ref().expect("model field");
         assert_eq!(f.from, crate::swarm_plan::Provenance::User);
         assert_eq!(f.value, "b/m");
@@ -6201,9 +6341,18 @@ mod prefer_spawn_tests {
         let catalog = crate::profile::ProfileCatalog::default();
         let prefs = test_prefs(&[("pi.model", "a/m", None)]);
         let items = bare_pi();
-        let plan =
-            super::build_dry_run_plan(&cfg, &items, &catalog, &reg, "b/m", "", &prefs, "probe")
-                .expect("plan builds");
+        let plan = super::build_dry_run_plan(
+            &cfg,
+            &items,
+            &catalog,
+            &reg,
+            "b/m",
+            "",
+            &prefs,
+            "probe",
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("plan builds");
         let f = plan.seats[0].model.as_ref().expect("model field");
         assert_eq!(f.from, crate::swarm_plan::Provenance::User);
         assert_eq!(f.value, "b/m");
@@ -6230,8 +6379,18 @@ mod prefer_spawn_tests {
             kind: None,
             profile: Some("coder".into()),
         }];
-        let plan = super::build_dry_run_plan(&cfg, &items, &catalog, &reg, "", "", &prefs, "probe")
-            .expect("plan builds");
+        let plan = super::build_dry_run_plan(
+            &cfg,
+            &items,
+            &catalog,
+            &reg,
+            "",
+            "",
+            &prefs,
+            "probe",
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("plan builds");
         let f = plan.seats[0].model.as_ref().expect("model field");
         assert_eq!(f.from, crate::swarm_plan::Provenance::Preference);
         assert_eq!(f.value, "a/m");
@@ -6248,16 +6407,34 @@ mod prefer_spawn_tests {
             ("pi.model", "b/m", Some("probe")),
         ]);
         let items = bare_pi();
-        let scoped =
-            super::build_dry_run_plan(&cfg, &items, &catalog, &reg, "", "", &prefs, "probe")
-                .expect("plan builds");
+        let scoped = super::build_dry_run_plan(
+            &cfg,
+            &items,
+            &catalog,
+            &reg,
+            "",
+            "",
+            &prefs,
+            "probe",
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("plan builds");
         assert_eq!(
             scoped.seats[0].model.as_ref().expect("model field").value,
             "b/m"
         );
-        let other =
-            super::build_dry_run_plan(&cfg, &items, &catalog, &reg, "", "", &prefs, "other")
-                .expect("plan builds");
+        let other = super::build_dry_run_plan(
+            &cfg,
+            &items,
+            &catalog,
+            &reg,
+            "",
+            "",
+            &prefs,
+            "other",
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("plan builds");
         let f = other.seats[0].model.as_ref().expect("model field");
         assert_eq!(f.from, crate::swarm_plan::Provenance::Preference);
         assert_eq!(f.value, "a/m");
@@ -6271,8 +6448,18 @@ mod prefer_spawn_tests {
         let catalog = crate::profile::ProfileCatalog::default();
         let prefs = test_prefs(&[("*.model", "a/m", None)]);
         let items = bare_pi();
-        let plan = super::build_dry_run_plan(&cfg, &items, &catalog, &reg, "", "", &prefs, "probe")
-            .expect("plan builds");
+        let plan = super::build_dry_run_plan(
+            &cfg,
+            &items,
+            &catalog,
+            &reg,
+            "",
+            "",
+            &prefs,
+            "probe",
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("plan builds");
         let f = plan.seats[0].model.as_ref().expect("model field");
         assert_eq!(f.from, crate::swarm_plan::Provenance::Preference);
         assert_eq!(f.value, "a/m");
@@ -6287,8 +6474,18 @@ mod prefer_spawn_tests {
         let catalog = crate::profile::ProfileCatalog::default();
         let prefs = test_prefs(&[("pi.model", "ghost-9z", None)]);
         let items = bare_pi();
-        let plan = super::build_dry_run_plan(&cfg, &items, &catalog, &reg, "", "", &prefs, "probe")
-            .expect("plan builds");
+        let plan = super::build_dry_run_plan(
+            &cfg,
+            &items,
+            &catalog,
+            &reg,
+            "",
+            "",
+            &prefs,
+            "probe",
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("plan builds");
         let item = plan
             .needs_consent
             .iter()
@@ -6318,8 +6515,18 @@ mod prefer_spawn_tests {
             kind: None,
             profile: Some("coder".into()),
         }];
-        let plan = super::build_dry_run_plan(&cfg, &items, &catalog, &reg, "", "", &prefs, "probe")
-            .expect("plan builds");
+        let plan = super::build_dry_run_plan(
+            &cfg,
+            &items,
+            &catalog,
+            &reg,
+            "",
+            "",
+            &prefs,
+            "probe",
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("plan builds");
         let f = plan.seats[0].effort.as_ref().expect("effort field");
         assert_eq!(f.from, crate::swarm_plan::Provenance::Preference);
         assert_eq!(f.value, "slow");
@@ -6349,12 +6556,31 @@ mod prefer_spawn_tests {
             kind: None,
             profile: Some("coder".into()),
         }];
-        let plan = super::build_dry_run_plan(&cfg, &items, &catalog, &reg, "", "", &prefs, "probe")
-            .expect("plan builds");
+        let plan = super::build_dry_run_plan(
+            &cfg,
+            &items,
+            &catalog,
+            &reg,
+            "",
+            "",
+            &prefs,
+            "probe",
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("plan builds");
         assert_eq!(plan.seats[0].harness, "opencode");
-        let bare =
-            super::build_dry_run_plan(&cfg, &bare_pi(), &catalog, &reg, "", "", &prefs, "probe")
-                .expect("plan builds");
+        let bare = super::build_dry_run_plan(
+            &cfg,
+            &bare_pi(),
+            &catalog,
+            &reg,
+            "",
+            "",
+            &prefs,
+            "probe",
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("plan builds");
         assert_ne!(
             bare.seats[0].harness, "opencode",
             "harness preference is profile-only"
@@ -6764,6 +6990,79 @@ mod plan_patch_spawn_tests {
             super::PlanGate::Launch
         ));
     }
+
+    /// Rework defect 1: a model patch must reach the launch argv/env through
+    /// the real builders, not just the gated plan. pi rides argv, opencode
+    /// rides the env pin; the plan says from:user + honored for both.
+    #[test]
+    fn plan_patch_launch_argv_matches_plan() {
+        let _g = crate::config::lock_env();
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let cfg_home = dir.path().join("config");
+        std::fs::create_dir_all(cfg_home.join("flywheel")).expect("config dir");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_home) };
+        let reg = herm_registry();
+        let cfg = crate::config::Config::default();
+        let catalog = crate::profile::ProfileCatalog::default();
+        let prefs = crate::preferences::PreferenceSet::new();
+        let items = super::spawn_items_from_plan(
+            vec![("pi".to_string(), 1), ("opencode".to_string(), 1)],
+            None,
+        );
+        let pi_item = items.iter().find(|i| i.short == "pi").expect("pi item");
+        let oc_item = items
+            .iter()
+            .find(|i| i.short == "opencode")
+            .expect("opencode item");
+        let patches = vec![
+            crate::swarm_plan::parse_patch("pi.model=b/m").expect("parses"),
+            crate::swarm_plan::parse_patch("opencode.model=a/m").expect("parses"),
+        ];
+        let overrides = super::patch_role_overrides(&patches);
+        let plan = super::build_dry_run_plan(
+            &cfg, &items, &catalog, &reg, "", "", &prefs, "probe", &overrides,
+        )
+        .expect("plan builds");
+        for (role, value) in [("pi", "b/m"), ("opencode", "a/m")] {
+            let seat = plan.seats.iter().find(|s| s.role == role).expect("seat");
+            let m = seat.model.as_ref().expect("model field");
+            assert_eq!(m.value, value, "patched value in plan");
+            assert_eq!(m.from, crate::swarm_plan::Provenance::User);
+            assert!(
+                matches!(m.status, crate::swarm_plan::FieldStatus::Honored),
+                "patched model honored, got {:?} for {role}",
+                m.status
+            );
+        }
+        // pi: the patched value rides argv through the real builder.
+        let ask_pi = super::prefer_bare_inputs(&prefs, pi_item, "probe", "", "");
+        let (model_pi, provider_pi, effort_pi) =
+            super::patched_bare_launch(&overrides, "pi", ask_pi);
+        assert_eq!(model_pi, "b/m");
+        let (args, pi_pin) =
+            crate::bare_model_launch("pi", &model_pi, &provider_pi, effort_pi.as_deref())
+                .expect("pi launches");
+        assert!(
+            args.iter().any(|a| a == "b/m"),
+            "patched model reaches pi argv: {args:?}"
+        );
+        assert_eq!(pi_pin, None, "pi rides argv, no env pin");
+        // opencode: the patched value rides the env pin, not argv.
+        let ask_oc = super::prefer_bare_inputs(&prefs, oc_item, "probe", "", "");
+        let (model_oc, provider_oc, _) = super::patched_bare_launch(&overrides, "opencode", ask_oc);
+        assert_eq!(model_oc, "a/m");
+        let (oc_args, oc_pin) = crate::bare_model_launch("opencode", &model_oc, &provider_oc, None)
+            .expect("opencode launches");
+        assert!(
+            oc_args.is_empty(),
+            "opencode takes no model argv: {oc_args:?}"
+        );
+        assert_eq!(
+            oc_pin.as_deref(),
+            Some("a/m"),
+            "patched model reaches opencode env pin"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6851,6 +7150,7 @@ mod resolver_property_tests {
                 "",
                 &prefs,
                 "probe",
+                &std::collections::BTreeMap::new(),
             )
             .expect("plan builds");
             let f = plan.seats[0].model.as_ref().expect("model field");
@@ -6892,9 +7192,18 @@ mod resolver_property_tests {
             let key = format!("{h}.effort");
             let prefs = test_prefs(&[(key.as_str(), "slow")]);
             let items = vec![bare_item(h)];
-            let plan =
-                super::build_dry_run_plan(&cfg, &items, &catalog, &reg, "a/m", "", &prefs, "probe")
-                    .expect("plan builds");
+            let plan = super::build_dry_run_plan(
+                &cfg,
+                &items,
+                &catalog,
+                &reg,
+                "a/m",
+                "",
+                &prefs,
+                "probe",
+                &std::collections::BTreeMap::new(),
+            )
+            .expect("plan builds");
             let f = plan.seats[0].effort.as_ref().expect("effort field");
             assert_eq!(
                 f.from,
@@ -6996,9 +7305,18 @@ mod resolver_property_tests {
             expect_from: Provenance,
             case: &str,
         ) {
-            let plan =
-                super::build_dry_run_plan(cfg, items, catalog, reg, user, "", prefs, "probe")
-                    .expect("plan builds");
+            let plan = super::build_dry_run_plan(
+                cfg,
+                items,
+                catalog,
+                reg,
+                user,
+                "",
+                prefs,
+                "probe",
+                &std::collections::BTreeMap::new(),
+            )
+            .expect("plan builds");
             let f = plan.seats[0].model.as_ref().expect("model field");
             assert_eq!(f.value, expect, "V7 value: {case}");
             assert_eq!(f.from, expect_from, "V7 provenance: {case}");

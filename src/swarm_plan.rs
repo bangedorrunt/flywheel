@@ -1185,67 +1185,66 @@ pub fn apply_patch(
     policy: &ConsentPolicy,
     crew_max: u32,
 ) -> Result<Plan, String> {
-    let idx = plan
-        .seats
-        .iter()
-        .position(|s| s.role == patch.seat)
-        .ok_or_else(|| {
-            let mut names: Vec<&str> = plan.seats.iter().map(|s| s.role.as_str()).collect();
-            names.sort();
-            names.dedup();
-            format!(
-                "unknown seat {:?} (valid: {})",
-                patch.seat,
-                names.join(", ")
-            )
-        })?;
+    if !plan.seats.iter().any(|s| s.role == patch.seat) {
+        let mut names: Vec<&str> = plan.seats.iter().map(|s| s.role.as_str()).collect();
+        names.sort();
+        names.dedup();
+        return Err(format!(
+            "unknown seat {:?} (valid: {})",
+            patch.seat,
+            names.join(", ")
+        ));
+    }
     let mut out = plan.clone();
-    let seat = &mut out.seats[idx];
-    match patch.field {
-        PatchField::Harness => {
-            seat.harness = patch.value.clone();
-            let launch = crate::headless::interactive_model_plan(
-                &seat.harness,
-                seat.model.as_ref().map(|f| f.value.as_str()).unwrap_or(""),
-                seat.effort.as_ref().map(|f| f.value.as_str()),
-            );
-            let (model, effort) = seat_status(
-                &seat.harness,
-                seat.model.clone().map(|f| (f.value, f.from)),
-                seat.effort.clone().map(|f| (f.value, f.from)),
-                &launch,
-            );
-            seat.model = model;
-            seat.effort = effort;
-            let mode = seat.mode.clone().map(|f| (f.value, f.from));
-            seat.mode = mode_field(&seat.harness, mode);
-        }
-        PatchField::Model => {
-            let effort = seat.effort.as_ref().map(|e| e.value.as_str());
-            seat.model = Some(resolve_model_ask(
-                registry,
-                &seat.harness,
-                &patch.value,
-                Provenance::User,
-                effort,
-            ));
-        }
-        PatchField::Effort => {
-            let launch = crate::headless::interactive_model_plan(
-                &seat.harness,
-                seat.model.as_ref().map(|f| f.value.as_str()).unwrap_or(""),
-                Some(&patch.value),
-            );
-            let (_, effort) = seat_status(
-                &seat.harness,
-                None,
-                Some((patch.value.clone(), Provenance::User)),
-                &launch,
-            );
-            seat.effort = effort;
-        }
-        PatchField::Mode => {
-            seat.mode = mode_field(&seat.harness, Some((patch.value.clone(), Provenance::User)));
+    // A role patch re-resolves EVERY seat of that role, not just the first.
+    for seat in out.seats.iter_mut().filter(|s| s.role == patch.seat) {
+        match patch.field {
+            PatchField::Harness => {
+                seat.harness = patch.value.clone();
+                let launch = crate::headless::interactive_model_plan(
+                    &seat.harness,
+                    seat.model.as_ref().map(|f| f.value.as_str()).unwrap_or(""),
+                    seat.effort.as_ref().map(|f| f.value.as_str()),
+                );
+                let (model, effort) = seat_status(
+                    &seat.harness,
+                    seat.model.clone().map(|f| (f.value, f.from)),
+                    seat.effort.clone().map(|f| (f.value, f.from)),
+                    &launch,
+                );
+                seat.model = model;
+                seat.effort = effort;
+                let mode = seat.mode.clone().map(|f| (f.value, f.from));
+                seat.mode = mode_field(&seat.harness, mode);
+            }
+            PatchField::Model => {
+                let effort = seat.effort.as_ref().map(|e| e.value.as_str());
+                seat.model = Some(resolve_model_ask(
+                    registry,
+                    &seat.harness,
+                    &patch.value,
+                    Provenance::User,
+                    effort,
+                ));
+            }
+            PatchField::Effort => {
+                let launch = crate::headless::interactive_model_plan(
+                    &seat.harness,
+                    seat.model.as_ref().map(|f| f.value.as_str()).unwrap_or(""),
+                    Some(&patch.value),
+                );
+                let (_, effort) = seat_status(
+                    &seat.harness,
+                    None,
+                    Some((patch.value.clone(), Provenance::User)),
+                    &launch,
+                );
+                seat.effort = effort;
+            }
+            PatchField::Mode => {
+                seat.mode =
+                    mode_field(&seat.harness, Some((patch.value.clone(), Provenance::User)));
+            }
         }
     }
     let est = estimate_usd_per_mtok(&out, registry);
@@ -1579,5 +1578,43 @@ mod plan_patch_tests {
         assert_eq!(out.seats[0].harness, "pi", "first patch stuck");
         assert_eq!(m.value, "z", "second patch wins");
         assert_eq!(m.from, crate::swarm_plan::Provenance::User);
+    }
+
+    #[test]
+    fn plan_patch_role_patches_every_seat() {
+        let mut plan = crate::swarm_plan::Plan::new("swarm");
+        plan.seats
+            .push(seat_with("coder", "pi", Some(user_model("a/m"))));
+        plan.seats
+            .push(seat_with("coder", "pi", Some(user_model("a/m"))));
+        plan.seats
+            .push(seat_with("reviewer", "pi", Some(user_model("a/m"))));
+        let (reg, policy, crew) = gate_inputs();
+        let out = super::apply_patch(
+            &plan,
+            &super::parse_patch("coder.model=b/m").expect("parses"),
+            &reg,
+            &policy,
+            crew,
+        )
+        .expect("patch applies");
+        let mut patched = 0;
+        for s in out.seats.iter().filter(|s| s.role == "coder") {
+            let m = s.model.as_ref().expect("model field");
+            assert_eq!(m.value, "b/m", "every coder seat re-resolves");
+            assert_eq!(m.from, crate::swarm_plan::Provenance::User);
+            patched += 1;
+        }
+        assert_eq!(patched, 2, "both coder seats patched, not just the first");
+        let r = out
+            .seats
+            .iter()
+            .find(|s| s.role == "reviewer")
+            .expect("reviewer seat");
+        assert_eq!(
+            r.model.as_ref().expect("model").value,
+            "a/m",
+            "other roles untouched"
+        );
     }
 }
