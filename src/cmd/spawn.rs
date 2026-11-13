@@ -1832,6 +1832,8 @@ projects available: {}",
                 &pane_id,
                 &agent_args,
                 item.profile.as_deref(),
+                Some(project),
+                Some(cfg),
             )?;
             let ready =
                 hc::wait_agent_foreground(&c, &pane_id, &kind, &name, Duration::from_secs(15));
@@ -4919,7 +4921,7 @@ mod taken_name_recovery_tests {
     use crate::hc::AgentStatus;
     use crate::{
         StartAttempt, TakenNameAction, TakenNameOps, is_taken_name_error,
-        start_agent_with_retry_dyn, start_agent_with_taken_name_clear, taken_name_action,
+        start_agent_with_retry_dyn_profile, start_agent_with_taken_name_clear, taken_name_action,
     };
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5048,7 +5050,9 @@ mod taken_name_recovery_tests {
     #[test]
     fn recover_frees_a_taken_name() {
         let mux = NameMux::new(&[("flywheel-demo-oc", "wA:p1")]);
-        let agent = start_agent_with_retry_dyn(&mux, "flywheel-demo-oc", "opencode", "wA:p1", &[])
+        let agent = start_agent_with_retry_dyn_profile(
+            &mux, "flywheel-demo-oc", "opencode", "wA:p1", &[], None, None, None,
+        )
             .expect("recover's respawn must free its own stale binding and restart");
         assert_eq!(agent.pane_id, "wA:p1");
         assert_eq!(
@@ -5069,7 +5073,9 @@ mod taken_name_recovery_tests {
     fn recover_refuses_a_foreign_holder_without_burning_the_budget() {
         let mux = NameMux::new(&[("flywheel-demo-oc", "wA:p9")]);
         let started = std::time::Instant::now();
-        let err = start_agent_with_retry_dyn(&mux, "flywheel-demo-oc", "opencode", "wA:p1", &[])
+        let err = start_agent_with_retry_dyn_profile(
+            &mux, "flywheel-demo-oc", "opencode", "wA:p1", &[], None, None, None,
+        )
             .expect_err("a foreign holder is a refusal, not a retry");
         let msg = err.to_string();
         assert!(

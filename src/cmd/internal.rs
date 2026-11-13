@@ -25,7 +25,7 @@ use crate::{
     orchestrator_mail_name, plan_warning_notice, profile, profile_launch_args, project_dir,
     project_dir_str, rebind_from_registry, reroute_next_profile, resolve_agents_dyn,
     resolve_mail_target, resolve_mail_target_registry, resolve_role_flag, run_log, stage_prompt,
-    stage_prompt_for_project, start_agent_with_retry_dyn, stderr_is_only_warnings, swarm_label,
+    stage_prompt_for_project, start_agent_with_retry_dyn_profile, stderr_is_only_warnings, swarm_label,
     terminal_mail_name, utf8_path,
 };
 use crate::{
@@ -1069,7 +1069,20 @@ pub(crate) fn respawn_with_backend(
         pane.pane_id
     };
     let args = respawn_launch_args(cfg, project, name, kind);
-    let fresh = start_agent_with_retry_dyn(backend, name, kind, &new_pane, &args)?;
+    let profile = project_dir_str(cfg, project)
+        .ok()
+        .and_then(|key| state::load_spawn_registry(&key).into_iter().find(|e| e.name == name))
+        .and_then(|e| e.profile);
+    let fresh = start_agent_with_retry_dyn_profile(
+        backend,
+        name,
+        kind,
+        &new_pane,
+        &args,
+        profile.as_deref(),
+        Some(project),
+        Some(cfg),
+    )?;
     if !same_pane
         && let Ok(mail) = backend::mail_backend(cfg)
         && let Some(key) = dir.to_str()

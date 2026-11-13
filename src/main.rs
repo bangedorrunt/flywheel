@@ -78,8 +78,8 @@ mod phase_chain;
 mod phase_contracts;
 mod plan_fence;
 mod plane_route;
-mod preflight;
 mod preferences;
+mod preflight;
 mod principles;
 mod private_fs;
 mod profile;
@@ -154,9 +154,8 @@ use cmd::{
     cmd_doorbell_re_inject, cmd_doorbell_roster, cmd_doorbell_start, cmd_doorbell_status,
     cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_history, cmd_internal_doorbell, cmd_judgment,
     cmd_ledger, cmd_mail, cmd_memory, cmd_models, cmd_peer, cmd_policy, cmd_prefer, cmd_principles,
-    cmd_resume,
-    cmd_runs, cmd_ship, cmd_slot, cmd_stack, cmd_stage, cmd_standing_orders, cmd_timeline,
-    cmd_work, cmd_worktree, cmd_xproj,
+    cmd_resume, cmd_runs, cmd_ship, cmd_slot, cmd_stack, cmd_stage, cmd_standing_orders,
+    cmd_timeline, cmd_work, cmd_worktree, cmd_xproj,
     coalition::cmd_coalition,
     cron::cmd_cron,
     debate::{cmd_debate, cmd_plan_review},
@@ -7709,6 +7708,45 @@ pub(crate) fn envpin_respin_hop(
     }
 }
 
+/// Pane split for the env-pin hop: hc backends split with the new env pin
+/// (a pane's env is fixed at split), every other backend splits plain —
+/// the trait split carries no env map. `cfg` and `project` locate the
+/// workspace dir for hc; without them the trait split runs with no cwd,
+/// the same shape `cmd_recover` uses.
+fn envpin_hop_split(
+    cfg: Option<&Config>,
+    project: Option<&str>,
+    backend: &dyn backend::MultiplexerBackend,
+    anchor: &str,
+    env: &std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<String> {
+    if backend.name() == "hc" {
+        if let (Some(cfg), Some(project)) = (cfg, project) {
+            let dir = project_dir(cfg, project);
+            let cwd = utf8_path(&dir, "workspace dir")?;
+            let c = match hc::Client::connect(Some(&cfg.socket_path())) {
+                Ok(c) => c,
+                Err(e) => return Err(anyhow::anyhow!("hc connect for env-pin hop: {e}")),
+            };
+            return Ok(hc::pane_split(&c, anchor, "down", Some(&cwd), Some(env))?.pane_id);
+        }
+    }
+    backend
+        .pane_split(anchor, "down", None)
+        .map(|p| p.pane_id)
+        .map_err(anyhow::Error::from)
+}
+
+/// Outcome of one reroute-site hop attempt: return the hopped agent, fail
+/// loud on a broken hop, rejoin the in-place reroute when the reconciler
+/// is satisfied, or keep today's refusal.
+enum SiteHop {
+    Hopped(AgentInfo),
+    Failed(anyhow::Error),
+    InPlace,
+    Refused,
+}
+
 #[cfg(test)]
 mod envpin_reroute_tests {
     use super::*;
@@ -8014,6 +8052,197 @@ mod envpin_reroute_tests {
             "old pane never closed on failed launch: {calls:?}"
         );
     }
+
+    struct SiteFakeBackend {
+        order: Arc<Mutex<Vec<String>>>,
+        starts: Arc<Mutex<usize>>,
+    }
+
+    fn site_pane(id: &str) -> toron_core::pane_types::PaneInfo {
+        toron_core::pane_types::PaneInfo {
+            pane_id: id.to_string(),
+            terminal_id: String::new(),
+            workspace_id: "ws".to_string(),
+            tab_id: String::new(),
+            focused: false,
+            agent_status: toron_core::pane_types::AgentStatus::Idle,
+            revision: 0,
+            title: None,
+            cwd: None,
+            agent: None,
+            agent_session: None,
+            display_agent: None,
+            foreground_cwd: None,
+            label: None,
+            scroll: None,
+            state_labels: serde_json::Map::new(),
+            terminal_title: None,
+            terminal_title_stripped: None,
+            tokens: serde_json::Map::new(),
+        }
+    }
+
+    fn site_agent(name: &str, pane_id: &str) -> toron_core::pane_types::AgentInfo {
+        toron_core::pane_types::AgentInfo {
+            agent: None,
+            agent_status: toron_core::pane_types::AgentStatus::Working,
+            cwd: None,
+            display_agent: None,
+            focused: false,
+            foreground_cwd: None,
+            interactive_ready: false,
+            launch_pending: false,
+            name: Some(name.to_string()),
+            pane_id: pane_id.to_string(),
+            revision: 0,
+            state_change_seq: 0,
+            completion_seq: None,
+            state_labels: serde_json::Map::new(),
+            tab_id: String::new(),
+            terminal_id: String::new(),
+            terminal_title: None,
+            workspace_id: String::new(),
+        }
+    }
+
+    impl crate::backend::MultiplexerBackend for SiteFakeBackend {
+        fn name(&self) -> &'static str {
+            "site-fake"
+        }
+        fn agent_list(
+            &self,
+        ) -> Result<Vec<toron_core::pane_types::AgentInfo>, toron_plane::backend::BackendError>
+        {
+            Ok(Vec::new())
+        }
+        fn pane_list(
+            &self,
+            _workspace_id: Option<&str>,
+        ) -> Result<Vec<toron_core::pane_types::PaneInfo>, toron_plane::backend::BackendError>
+        {
+            Ok(vec![site_pane("old-pane")])
+        }
+        fn pane_split(
+            &self,
+            _parent_pane_id: &str,
+            _direction: &str,
+            _cwd: Option<&str>,
+        ) -> Result<toron_core::pane_types::PaneInfo, toron_plane::backend::BackendError> {
+            self.order
+                .lock()
+                .unwrap()
+                .push("split:old-pane".to_string());
+            Ok(site_pane("new-pane-1"))
+        }
+        fn agent_start(
+            &self,
+            name: &str,
+            _kind: &str,
+            pane_id: &str,
+            _args: &[String],
+        ) -> Result<toron_core::pane_types::AgentInfo, toron_plane::backend::BackendError> {
+            let mut starts = self.starts.lock().unwrap();
+            *starts += 1;
+            let first = *starts == 1;
+            self.order
+                .lock()
+                .unwrap()
+                .push(format!("start:{name}@{pane_id}"));
+            if first {
+                return Err(toron_plane::backend::BackendError::timeout(
+                    "agent.start failed: 401 invalid api key (fake)".to_string(),
+                ));
+            }
+            Ok(site_agent(name, pane_id))
+        }
+        fn pane_close(&self, pane_id: &str) -> Result<(), toron_plane::backend::BackendError> {
+            self.order
+                .lock()
+                .unwrap()
+                .push(format!("close:{pane_id}"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn envpin_respawn_site_no_longer_refuses() {
+        let _guard = crate::config::lock_env();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let cfgdir = std::env::temp_dir().join(format!("fw-envpin-site-{nanos}"));
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfgdir) };
+        let cfgdir = crate::config::config_dir();
+        std::fs::create_dir_all(&cfgdir).expect("hermetic config dir");
+        std::fs::write(
+            cfgdir.join("profiles.toml"),
+            "[profiles.opencode-fallback]\nharness = \"opencode\"\nprovider = \"opencode\"\nmodel = \"big-pickle\"\nfallback = [\"opencode-next\"]\n\n[profiles.opencode-next]\nharness = \"opencode\"\nprovider = \"opencode\"\nmodel = \"gold\"\n",
+        )
+        .expect("stage profiles");
+        std::fs::write(
+            cfgdir.join("models.toml"),
+            "[models.\"opencode/gold\"]\ncaps = [\"opencode\"]\n",
+        )
+        .expect("stage models");
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let backend = SiteFakeBackend {
+            order: order.clone(),
+            starts: Arc::new(Mutex::new(0)),
+        };
+        let agent = start_agent_with_retry_dyn_profile(
+            &backend,
+            "TestyCreek",
+            "opencode",
+            "old-pane",
+            &[],
+            Some("opencode-fallback"),
+            Some("envpin-site-proj"),
+            None,
+        )
+        .expect("reroute site hops instead of refusing");
+        assert_eq!(
+            agent.name.as_deref(),
+            Some("TestyCreek"),
+            "same agent name kept"
+        );
+        assert_eq!(
+            agent.pane_id, "new-pane-1",
+            "respawned onto the new pane"
+        );
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec![
+                "start:TestyCreek@old-pane".to_string(),
+                "split:old-pane".to_string(),
+                "start:TestyCreek@new-pane-1".to_string(),
+                "close:old-pane".to_string(),
+            ],
+            "old pane closes only after the new one launches"
+        );
+        let key = crate::agent_ref::RebindIntent::derive_effect_key(
+            &crate::agent_ref::AgentRef::new("envpin-site-proj", "TestyCreek"),
+            &crate::agent_ref::AgentBinding {
+                profile_name: "opencode-fallback".to_string(),
+                model: "opencode/big-pickle".to_string(),
+                harness: "opencode".to_string(),
+                location: crate::agent_ref::BindingLocation::Pane,
+            },
+            &crate::agent_ref::AgentBinding {
+                profile_name: "opencode-next".to_string(),
+                model: "opencode/gold".to_string(),
+                harness: "opencode".to_string(),
+                location: crate::agent_ref::BindingLocation::Pane,
+            },
+        );
+        let rows = rebind_rows("envpin-site-proj", &key);
+        assert_eq!(rows.len(), 3, "exactly one intent, three states: {rows:?}");
+        match prev_xdg {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -8083,7 +8312,7 @@ pub(crate) fn start_agent_with_retry(
     pane_id: &str,
     args: &[String],
 ) -> Result<AgentInfo> {
-    start_agent_with_retry_profile(c, name, kind, pane_id, args, None)
+    start_agent_with_retry_profile(c, name, kind, pane_id, args, None, None, None)
 }
 
 pub(crate) fn start_agent_with_retry_profile(
@@ -8093,6 +8322,8 @@ pub(crate) fn start_agent_with_retry_profile(
     pane_id: &str,
     args: &[String],
     profile_name: Option<&str>,
+    project: Option<&str>,
+    cfg: Option<&Config>,
 ) -> Result<AgentInfo> {
     ensure_ascii_launch_args(args)?;
     let mut recipe_launched = false;
@@ -8149,9 +8380,93 @@ pub(crate) fn start_agent_with_retry_profile(
                                         .as_deref()
                                         .and_then(|cp| cat.get(cp))
                                         .map(|p| format!("{}/{}", p.provider, p.model));
-                                    if reroute_env_pin_verdict(pinned.as_deref(), pin)
-                                        != RerouteEnvPin::AlreadyPinned
-                                    {
+                                    let mut reroute_in_place =
+                                        reroute_env_pin_verdict(pinned.as_deref(), pin)
+                                            == RerouteEnvPin::AlreadyPinned;
+                                    if !reroute_in_place {
+                                        let site_hop = || {
+                                            let Some(proj) = project else {
+                                                return SiteHop::Refused;
+                                            };
+                                            let Some(cfg) = cfg else {
+                                                return SiteHop::Refused;
+                                            };
+                                            let mut next_env =
+                                                std::collections::BTreeMap::new();
+                                            if hc::apply_opencode_model_pin(&mut next_env, pin)
+                                                .is_err()
+                                            {
+                                                return SiteHop::Refused;
+                                            }
+                                            next_env.insert(
+                                                "FLYWHEEL_REROUTE_NOTE".to_string(),
+                                                format!(
+                                                    "rerouted {orig} -> {next} after {}",
+                                                    cf.kind
+                                                ),
+                                            );
+                                            let hop_backend =
+                                                match backend::multiplexer_backend(cfg) {
+                                                    Ok(hb) => hb,
+                                                    Err(e) => {
+                                                        return SiteHop::Failed(e.into());
+                                                    }
+                                                };
+                                            let split = |anchor: &str,
+                                                         env: &std::collections::BTreeMap<
+                                                String,
+                                                String,
+                                            >| {
+                                                envpin_hop_split(
+                                                    Some(cfg),
+                                                    Some(proj),
+                                                    &*hop_backend,
+                                                    anchor,
+                                                    env,
+                                                )
+                                            };
+                                            let hop = EnvpinHop {
+                                                project: proj.to_string(),
+                                                agent: name.to_string(),
+                                                old_pane: pane_id.to_string(),
+                                                next_harness: next_kind.clone(),
+                                                next_args: next_plan.args.clone(),
+                                                next_env,
+                                                next_profile: next.clone(),
+                                                next_model: next_plan.model.clone(),
+                                                from_profile: orig.to_string(),
+                                                from_model: pinned
+                                                    .clone()
+                                                    .unwrap_or_default(),
+                                                from_harness: current_kind.clone(),
+                                                kind: cf.kind,
+                                                evidence: cf.evidence.clone(),
+                                                attempt: attempt as u32,
+                                            };
+                                            match envpin_respin_hop(
+                                                &*hop_backend,
+                                                &split,
+                                                &hop,
+                                                already_rerouted,
+                                            ) {
+                                                Ok(EnvpinHopOutcome::Hopped { agent }) => {
+                                                    SiteHop::Hopped(agent)
+                                                }
+                                                Ok(EnvpinHopOutcome::AlreadySatisfied) => {
+                                                    SiteHop::InPlace
+                                                }
+                                                Ok(_) => SiteHop::Refused,
+                                                Err(e) => SiteHop::Failed(e),
+                                            }
+                                        };
+                                        match site_hop() {
+                                            SiteHop::Hopped(agent) => return Ok(agent),
+                                            SiteHop::Failed(e) => return Err(e),
+                                            SiteHop::InPlace => reroute_in_place = true,
+                                            SiteHop::Refused => {}
+                                        }
+                                    }
+                                    if !reroute_in_place {
                                         eprintln!(
                                             "flywheel: pane reroute {} -> {} REFUSED: {} needs its \
                                              model pinned by pane env, and pane {} was created \
@@ -8264,16 +8579,6 @@ pub(crate) fn start_agent_with_retry_profile(
 /// retries via `MultiplexerBackend::agent_start` + `agent_list` instead of
 /// the concrete `Client`. Same retry contract: 30 attempts, 3s sleep, accept
 /// a same-pane agent even if nameless (bd-w17) and apply the name.
-fn start_agent_with_retry_dyn(
-    backend: &dyn backend::MultiplexerBackend,
-    name: &str,
-    kind: &str,
-    pane_id: &str,
-    args: &[String],
-) -> Result<AgentInfo> {
-    start_agent_with_retry_dyn_profile(backend, name, kind, pane_id, args, None)
-}
-
 fn start_agent_with_retry_dyn_profile(
     backend: &dyn backend::MultiplexerBackend,
     name: &str,
@@ -8281,6 +8586,8 @@ fn start_agent_with_retry_dyn_profile(
     pane_id: &str,
     args: &[String],
     profile_name: Option<&str>,
+    project: Option<&str>,
+    cfg: Option<&Config>,
 ) -> Result<AgentInfo> {
     ensure_ascii_launch_args(args)?;
     let mut recipe_launched = false;
@@ -8337,9 +8644,79 @@ fn start_agent_with_retry_dyn_profile(
                                         .as_deref()
                                         .and_then(|cp| cat.get(cp))
                                         .map(|p| format!("{}/{}", p.provider, p.model));
-                                    if reroute_env_pin_verdict(pinned.as_deref(), pin)
-                                        != RerouteEnvPin::AlreadyPinned
-                                    {
+                                    let mut reroute_in_place =
+                                        reroute_env_pin_verdict(pinned.as_deref(), pin)
+                                            == RerouteEnvPin::AlreadyPinned;
+                                    if !reroute_in_place {
+                                        let site_hop = || {
+                                            let Some(proj) = project else {
+                                                return SiteHop::Refused;
+                                            };
+                                            let mut next_env =
+                                                std::collections::BTreeMap::new();
+                                            if hc::apply_opencode_model_pin(&mut next_env, pin)
+                                                .is_err()
+                                            {
+                                                return SiteHop::Refused;
+                                            }
+                                            next_env.insert(
+                                                "FLYWHEEL_REROUTE_NOTE".to_string(),
+                                                format!(
+                                                    "rerouted {orig} -> {next} after {}",
+                                                    cf.kind
+                                                ),
+                                            );
+                                            let split = |anchor: &str,
+                                                         env: &std::collections::BTreeMap<
+                                                String,
+                                                String,
+                                            >| {
+                                                envpin_hop_split(
+                                                    cfg, project, backend, anchor, env,
+                                                )
+                                            };
+                                            let hop = EnvpinHop {
+                                                project: proj.to_string(),
+                                                agent: name.to_string(),
+                                                old_pane: pane_id.to_string(),
+                                                next_harness: next_kind.clone(),
+                                                next_args: next_plan.args.clone(),
+                                                next_env,
+                                                next_profile: next.clone(),
+                                                next_model: next_plan.model.clone(),
+                                                from_profile: orig.to_string(),
+                                                from_model: pinned
+                                                    .clone()
+                                                    .unwrap_or_default(),
+                                                from_harness: current_kind.clone(),
+                                                kind: cf.kind,
+                                                evidence: cf.evidence.clone(),
+                                                attempt: attempt as u32,
+                                            };
+                                            match envpin_respin_hop(
+                                                backend,
+                                                &split,
+                                                &hop,
+                                                already_rerouted,
+                                            ) {
+                                                Ok(EnvpinHopOutcome::Hopped { agent }) => {
+                                                    SiteHop::Hopped(agent)
+                                                }
+                                                Ok(EnvpinHopOutcome::AlreadySatisfied) => {
+                                                    SiteHop::InPlace
+                                                }
+                                                Ok(_) => SiteHop::Refused,
+                                                Err(e) => SiteHop::Failed(e),
+                                            }
+                                        };
+                                        match site_hop() {
+                                            SiteHop::Hopped(agent) => return Ok(agent),
+                                            SiteHop::Failed(e) => return Err(e),
+                                            SiteHop::InPlace => reroute_in_place = true,
+                                            SiteHop::Refused => {}
+                                        }
+                                    }
+                                    if !reroute_in_place {
                                         eprintln!(
                                             "flywheel: pane reroute {} -> {} REFUSED: {} needs its \
                                              model pinned by pane env, and pane {} was created \
@@ -8456,7 +8833,9 @@ fn start_agent_with_retry_dyn_profile(
 /// template AND the fail-fast guard (never a 30-attempt retry burn).
 #[cfg(test)]
 mod peer_encoding_tests {
-    use super::{ensure_ascii_launch_args, peer_prompt_template, start_agent_with_retry_dyn};
+    use super::{
+        ensure_ascii_launch_args, peer_prompt_template, start_agent_with_retry_dyn_profile,
+    };
     use crate::backend::MultiplexerBackend;
 
     /// Read the real template from disk (the file the spawn path loads).
@@ -8550,12 +8929,15 @@ mod peer_encoding_tests {
     #[test]
     fn start_agent_retry_fails_fast_on_poisoned_arg() {
         let backend = &PanicOnStartMux as &dyn MultiplexerBackend;
-        let err = start_agent_with_retry_dyn(
+        let err = start_agent_with_retry_dyn_profile(
             backend,
             "flywheel-toron-coder1",
             "opencode",
             "w9:p1",
             &["peer template with § section sign".to_string()],
+            None,
+            None,
+            None,
         )
         .expect_err("poisoned arg must fail fast");
         assert!(
@@ -11300,7 +11682,16 @@ fn cmd_recover(cfg: &Config, project: &str, include_captain: bool) -> Result<()>
                     }
                 };
                 let Some(target) = target else { continue };
-                match start_agent_with_retry_dyn(&*backend, &hname, kind, &target, &[]) {
+                match start_agent_with_retry_dyn_profile(
+                    &*backend,
+                    &hname,
+                    kind,
+                    &target,
+                    &[],
+                    entry.profile.as_deref(),
+                    Some(project),
+                    Some(cfg),
+                ) {
                     Ok(a) => {
                         if a.pane_id != *pane_id {
                             moved.push((pane_id.clone(), a.pane_id.clone()));
