@@ -65,6 +65,38 @@ pub const PHASES: &[&str] = &[
 /// not documents.
 pub const PROMPT_SIZE_CAP: usize = 20_000;
 
+/// Dispatch-channel contract for a stage step (ADR-0021 D3): where the step
+/// may write. Closed set — unknown values fail parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StageMode {
+    #[serde(rename = "read-only")]
+    ReadOnly,
+    #[serde(rename = "workspace-write")]
+    WorkspaceWrite,
+    #[serde(rename = "isolated")]
+    Isolated,
+}
+
+/// Execution-context contract (ADR-0021 D3; toron ContextMode Inherit|Fresh):
+/// `warm` inherits the session (= Inherit), `fresh` starts a new one.
+/// Closed set — unknown values fail parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StageContext {
+    #[serde(rename = "warm")]
+    Warm,
+    #[serde(rename = "fresh")]
+    Fresh,
+}
+
+/// Bounded repetition contract (ADR-0021 D3/D7): run at least `min`, at most
+/// `max`, until `until` holds. Validated: 1 <= min <= max <= 32.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Repeat {
+    pub min: u32,
+    pub max: u32,
+    pub until: String,
+}
+
 /// A named stage: a reusable prompt primitive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stage {
@@ -82,6 +114,27 @@ pub struct Stage {
     /// Declared principles (ADR-0019 registry names; lint validates).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub principles: Vec<String>,
+    /// Write channel the step may use (ADR-0021 D3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<StageMode>,
+    /// Session context: warm inherits, fresh starts new (ADR-0021 D3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<StageContext>,
+    /// Model-effort knob (ADR-0021 D3; mapped per harness by ADR-0022).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Typed inputs the step needs (`inputs.*` or `steps.*` refs).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reads: Vec<String>,
+    /// Named witness contract checked at the step exit (ADR-0021 D4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub witness: Option<String>,
+    /// Bounded repetition contract (ADR-0021 D3/D7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<Repeat>,
+    /// One-line note on when to dispatch this stage (stage list groups by it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_when: Option<String>,
     /// Provenance (§3.8): who authored it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
@@ -116,6 +169,17 @@ fn merge_stage(base: Stage, over: Stage) -> Stage {
         } else {
             over.params
         },
+        mode: over.mode.or(base.mode),
+        context: over.context.or(base.context),
+        effort: over.effort.or(base.effort),
+        reads: if over.reads.is_empty() {
+            base.reads
+        } else {
+            over.reads
+        },
+        witness: over.witness.or(base.witness),
+        repeat: over.repeat.or(base.repeat),
+        use_when: over.use_when.or(base.use_when),
     }
 }
 
@@ -169,7 +233,156 @@ const SEED_PHASE: &[(&str, &str)] = &[
     ("ce-review", "review"),
     ("ce-evaluate", "verify"),
     ("ce-compound", "compound"),
+    ("fresh-eyes-explore", "resolve"),
+    ("commit-and-push", "compound"),
+    ("repo-map", "resolve"),
+    ("seed-first-task", "plan"),
+    ("bv-triage", "plan"),
+    ("prioritize-assign", "plan"),
+    ("spawn-crew", "plan"),
+    ("repro-baseline", "resolve"),
+    ("tdd-red", "implement"),
+    ("minimal-fix", "implement"),
+    ("prove-verify", "verify"),
+    ("baseline-measure", "verify"),
+    ("measure-keep-or-discard", "verify"),
+    ("judge-arms", "review"),
+    ("diagnose-only", "resolve"),
+    ("resume-pickup", "resolve"),
+    ("wave-gate", "plan"),
+    ("wave-dispatch", "plan"),
+    ("wave-observe", "review"),
+    ("wave-verify", "verify"),
 ];
+
+/// Seed one-line dispatch notes (ADR-0021 D6): when to use each stage.
+const SEED_USE_WHEN: &[(&str, &str)] = &[
+    (
+        "fresh-eyes-explore",
+        "a codebase needs a cold-start bug sweep with fresh eyes",
+    ),
+    (
+        "ce-brainstorm",
+        "a rough objective needs sharpening into testable requirements",
+    ),
+    (
+        "ce-review",
+        "written code needs an independent defect review before verify",
+    ),
+    (
+        "ce-evaluate",
+        "a repair pass needs a fresh-context done-or-remaining verdict",
+    ),
+    (
+        "ce-plan",
+        "requirements need expanding into a buildable bead set",
+    ),
+    (
+        "ce-plan-review",
+        "a bead set needs a revise-in-place review pass",
+    ),
+    (
+        "plan-polish",
+        "a bead set exists and has not been polished yet",
+    ),
+    (
+        "ce-execute",
+        "an in-progress bead needs executing via its brief contract",
+    ),
+    (
+        "ce-simplify",
+        "freshly changed code needs behavior-preserving simplification",
+    ),
+    (
+        "ce-compound",
+        "a verified solution may hold a durable learning",
+    ),
+    (
+        "commit-and-push",
+        "finished work needs committing in logical groups and pushing",
+    ),
+    ("repo-map", "a newcomer needs a cold-start map of the repo"),
+    (
+        "seed-first-task",
+        "an onboarded newcomer needs one narrow first task",
+    ),
+    (
+        "bv-triage",
+        "the backlog needs a deep triage into counts and top actions",
+    ),
+    (
+        "prioritize-assign",
+        "triaged beads need ordering and owned assignment",
+    ),
+    (
+        "spawn-crew",
+        "prioritized beads need a crew spawned to execute them",
+    ),
+    (
+        "repro-baseline",
+        "a reported symptom needs a failing repro baseline",
+    ),
+    ("tdd-red", "a fix needs its failing test written first"),
+    (
+        "minimal-fix",
+        "a failing test needs the minimal fix to green it",
+    ),
+    (
+        "prove-verify",
+        "a change needs independent proof against its VERIFY",
+    ),
+    (
+        "baseline-measure",
+        "a change needs its baseline invariant stored",
+    ),
+    (
+        "measure-keep-or-discard",
+        "a measured change needs a keep-or-discard verdict",
+    ),
+    (
+        "judge-arms",
+        "prototype arms need one winner picked on named criteria",
+    ),
+    (
+        "diagnose-only",
+        "a symptom needs a read-only diagnosis with evidence",
+    ),
+    (
+        "resume-pickup",
+        "a session needs stranded beads and panes picked back up",
+    ),
+    (
+        "wave-gate",
+        "a wave needs gating on the ready set before dispatch",
+    ),
+    (
+        "wave-dispatch",
+        "a gated wave needs its beads emitted to coder panes",
+    ),
+    (
+        "wave-observe",
+        "a running wave needs watching with escalation, never adjudication",
+    ),
+    (
+        "wave-verify",
+        "close claims need proving against receipts before landing",
+    ),
+];
+
+/// Seed typed reads (ADR-0021 D3): inputs/steps each stage needs.
+const SEED_READS: &[(&str, &[&str])] = &[
+    ("judge-arms", &["steps.arms"]),
+    ("plan-polish", &["inputs.objective"]),
+];
+
+/// Seed effort knobs (ADR-0021 D3).
+const SEED_EFFORT: &[(&str, &str)] = &[("plan-polish", "max")];
+
+/// Seed repetition contracts (min, max, until).
+const SEED_REPEAT: &[(&str, (u32, u32, &str))] = &[("plan-polish", (2, 5, "converged"))];
+
+/// Review + verify seats run fresh and read-only (ADR-0021 D3).
+const SEED_FRESH_READONLY: &[&str] = &["ce-review", "ce-evaluate", "prove-verify", "wave-verify"];
 
 /// bd-ceiling-report-template-vz8a: the stages that hit or carry a ceiling
 /// report gain [`CEILING_REPORT_TEMPLATE`]. `ce-execute` renders it (the
@@ -342,6 +555,13 @@ impl StageLibrary {
                     author: None,
                     origin_run: None,
                     params: vec![],
+                    mode: None,
+                    context: None,
+                    effort: None,
+                    reads: vec![],
+                    witness: None,
+                    repeat: None,
+                    use_when: None,
                 },
             );
         }
@@ -353,6 +573,36 @@ impl StageLibrary {
         for (name, phase) in SEED_PHASE {
             if let Some(stage) = stages.get_mut(*name) {
                 stage.phase = Some(phase.to_string());
+            }
+        }
+        for (name, use_when) in SEED_USE_WHEN {
+            if let Some(stage) = stages.get_mut(*name) {
+                stage.use_when = Some(use_when.to_string());
+            }
+        }
+        for (name, reads) in SEED_READS {
+            if let Some(stage) = stages.get_mut(*name) {
+                stage.reads = reads.iter().map(|r| r.to_string()).collect();
+            }
+        }
+        for (name, effort) in SEED_EFFORT {
+            if let Some(stage) = stages.get_mut(*name) {
+                stage.effort = Some(effort.to_string());
+            }
+        }
+        for (name, (min, max, until)) in SEED_REPEAT {
+            if let Some(stage) = stages.get_mut(*name) {
+                stage.repeat = Some(Repeat {
+                    min: *min,
+                    max: *max,
+                    until: until.to_string(),
+                });
+            }
+        }
+        for name in SEED_FRESH_READONLY {
+            if let Some(stage) = stages.get_mut(*name) {
+                stage.context = Some(StageContext::Fresh);
+                stage.mode = Some(StageMode::ReadOnly);
             }
         }
         for name in CEILING_TEMPLATE_STAGES {
@@ -525,6 +775,13 @@ pub fn scaffold(name: &str) -> Stage {
         author: None,
         origin_run: None,
         params: vec![],
+        mode: None,
+        context: None,
+        effort: None,
+        reads: vec![],
+        witness: None,
+        repeat: None,
+        use_when: None,
     }
 }
 
@@ -608,7 +865,135 @@ pub fn lint_stage(stage: &Stage, valid_roles: &[String]) -> Vec<String> {
             ));
         }
     }
+    if stage.phase.as_deref().is_none_or(|p| p.trim().is_empty()) {
+        issues.push(format!(
+            "{label}: missing phase (valid: {})",
+            PHASES.join(", ")
+        ));
+    }
+    if let Some(repeat) = &stage.repeat {
+        for e in validate_repeat(repeat) {
+            issues.push(format!("{label}: {e}"));
+        }
+    }
     issues
+}
+
+/// Repeat bounds: 1 <= min <= max <= 32 (ADR-0021 D3). Pure.
+#[must_use]
+pub fn validate_repeat(repeat: &Repeat) -> Vec<String> {
+    let mut issues = Vec::new();
+    if repeat.min < 1 {
+        issues.push(format!("repeat min {} < 1", repeat.min));
+    }
+    if repeat.max > 32 {
+        issues.push(format!("repeat max {} > 32", repeat.max));
+    }
+    if repeat.min > repeat.max {
+        issues.push(format!("repeat min {} > max {}", repeat.min, repeat.max));
+    }
+    if repeat.until.trim().is_empty() {
+        issues.push("repeat until is empty".to_string());
+    }
+    issues
+}
+
+/// Tier-aware stage lint (ADR-0021 D3): missing `phase` is an ERROR on seed
+/// and repo tiers, a WARNING on user and project tiers (operator stage
+/// files predate the field). Returns (errors, warnings). Pure.
+#[must_use]
+pub fn lint_stage_tiered(
+    stage: &Stage,
+    valid_roles: &[String],
+    tier: Tier,
+) -> (Vec<String>, Vec<String>) {
+    let issues = lint_stage(stage, valid_roles);
+    match tier {
+        Tier::Seed | Tier::Repo => (issues, Vec::new()),
+        Tier::User | Tier::Project => {
+            let (warn, errors): (Vec<String>, Vec<String>) = issues
+                .into_iter()
+                .partition(|i| i.contains("missing phase"));
+            (errors, warn)
+        }
+    }
+}
+
+/// The pure reads gate (ADR-0021 D3): every `inputs.*` read must name a
+/// declared input root; every `steps.*` read must name a prior step.
+/// Anything else must exactly match a prior step. Returns the missing reads.
+/// Pure — the workflow lint calls this once per dispatch step.
+#[must_use]
+pub fn reads_unsatisfied(
+    stage_reads: &[String],
+    declared_inputs: &[String],
+    prior_steps: &[String],
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    for read in stage_reads {
+        if let Some(key) = read.strip_prefix("inputs.") {
+            let root = key.split('.').next().unwrap_or(key);
+            if !declared_inputs.iter().any(|d| d == root) {
+                missing.push(read.clone());
+            }
+        } else if let Some(key) = read.strip_prefix("steps.") {
+            let root = key.split('.').next().unwrap_or(key);
+            if !prior_steps.iter().any(|s| s == root) {
+                missing.push(read.clone());
+            }
+        } else if !prior_steps.iter().any(|s| s == read) {
+            missing.push(read.clone());
+        }
+    }
+    missing
+}
+
+/// Pure `--phase` filter for `stage list`: keep rows serving one phase.
+#[must_use]
+pub fn filter_rows_by_phase(rows: &[StageRow], phase: &str) -> Vec<StageRow> {
+    rows.iter()
+        .filter(|r| r.phase.as_deref() == Some(phase))
+        .cloned()
+        .collect()
+}
+
+/// Pure `--unused` set difference: names with no catalog `stage:` reference.
+#[must_use]
+pub fn unreferenced_stages(
+    all: &[String],
+    referenced: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut out: Vec<String> = all
+        .iter()
+        .filter(|n| !referenced.contains(*n))
+        .cloned()
+        .collect();
+    out.sort();
+    out
+}
+
+/// Collect every `stage:` value in a workflow JSON tree (spec.stage at any
+/// depth: steps, graph nodes, loop bodies). Pure — feeds `--unused`.
+/// Templated values ride along verbatim; they never match a seed name.
+pub fn collect_stage_refs(value: &serde_json::Value, out: &mut std::collections::HashSet<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, nested) in map {
+                if key == "stage"
+                    && let Some(name) = nested.as_str()
+                {
+                    out.insert(name.to_string());
+                }
+                collect_stage_refs(nested, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_stage_refs(item, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The §3.8 repo-tier evidence bar: green across at least two distinct
@@ -1776,6 +2161,8 @@ mod bd_mvy4_wave_gate {
 /// authority semantics are pinned on the compiled-in tier.
 #[cfg(test)]
 mod wave_gate_typed_authority_tests {
+    use super::*;
+
     fn compiled_in_prompt(stage: &str) -> String {
         crate::stages::StageLibrary::compiled_in()
             .get_stage(stage)
@@ -1826,5 +2213,256 @@ mod wave_gate_typed_authority_tests {
             prompt.contains("work in flight"),
             "dispatch must not duplicate a crew already working the wave: {prompt}"
         );
+    }
+
+    /// ADR-0021 D3: closed mode/context enums + repeat bounds
+    /// (bd-stage-contract-fields-t36sj). Unknown values fail parse;
+    /// repeat validates 1 <= min <= max <= 32.
+    #[test]
+    fn stage_contract_fields_parse_and_validate() {
+        let ok: Stage = toml::from_str(
+            "name = \"x\"\nprompt = \"y\"\nmode = \"read-only\"\ncontext = \"fresh\"\n",
+        )
+        .expect("closed values parse");
+        assert_eq!(ok.mode, Some(StageMode::ReadOnly));
+        assert_eq!(ok.context, Some(StageContext::Fresh));
+        assert!(
+            toml::from_str::<Stage>("name = \"x\"\nprompt = \"y\"\nmode = \"turbo\"\n").is_err(),
+            "unknown mode fails parse"
+        );
+        assert!(
+            toml::from_str::<Stage>("name = \"x\"\nprompt = \"y\"\ncontext = \"lukewarm\"\n")
+                .is_err(),
+            "unknown context fails parse"
+        );
+        let good = Repeat {
+            min: 2,
+            max: 5,
+            until: "converged".to_string(),
+        };
+        assert!(validate_repeat(&good).is_empty(), "valid repeat passes");
+        for bad in [
+            Repeat {
+                min: 0,
+                max: 5,
+                until: "c".into(),
+            },
+            Repeat {
+                min: 6,
+                max: 5,
+                until: "c".into(),
+            },
+            Repeat {
+                min: 1,
+                max: 33,
+                until: "c".into(),
+            },
+        ] {
+            assert!(
+                !validate_repeat(&bad).is_empty(),
+                "repeat bounds rejected: {bad:?}"
+            );
+        }
+    }
+
+    /// ADR-0021 D3/D6: every seed stage carries a phase + use_when; the
+    /// named seeds carry their contract data (judge-arms reads, plan-polish
+    /// effort/reads/repeat, review + verify seats fresh/read-only).
+    #[test]
+    fn stage_contract_seed_phases_complete() {
+        let lib = StageLibrary::compiled_in();
+        let names = [
+            "fresh-eyes-explore",
+            "ce-brainstorm",
+            "ce-review",
+            "ce-evaluate",
+            "ce-plan",
+            "ce-plan-review",
+            "plan-polish",
+            "ce-execute",
+            "ce-simplify",
+            "ce-compound",
+            "commit-and-push",
+            "repo-map",
+            "seed-first-task",
+            "bv-triage",
+            "prioritize-assign",
+            "spawn-crew",
+            "repro-baseline",
+            "tdd-red",
+            "minimal-fix",
+            "prove-verify",
+            "baseline-measure",
+            "measure-keep-or-discard",
+            "judge-arms",
+            "diagnose-only",
+            "resume-pickup",
+            "wave-gate",
+            "wave-dispatch",
+            "wave-observe",
+            "wave-verify",
+        ];
+        assert_eq!(names.len(), 29, "all seeds enumerated");
+        for name in names {
+            let st = lib
+                .get_stage(name)
+                .unwrap_or_else(|| panic!("{name} seeded"));
+            assert!(
+                st.phase.as_deref().is_some_and(|p| PHASES.contains(&p)),
+                "{name} has a closed phase"
+            );
+            assert!(
+                st.use_when.as_deref().is_some_and(|u| !u.is_empty()),
+                "{name} has a use_when line"
+            );
+        }
+        let judge = lib.get_stage("judge-arms").expect("judge-arms");
+        assert_eq!(judge.reads, vec!["steps.arms".to_string()]);
+        let polish = lib.get_stage("plan-polish").expect("plan-polish");
+        assert_eq!(polish.effort.as_deref(), Some("max"));
+        assert_eq!(polish.reads, vec!["inputs.objective".to_string()]);
+        assert_eq!(
+            polish.repeat,
+            Some(Repeat {
+                min: 2,
+                max: 5,
+                until: "converged".to_string()
+            })
+        );
+        for name in ["ce-review", "ce-evaluate", "prove-verify", "wave-verify"] {
+            let st = lib
+                .get_stage(name)
+                .unwrap_or_else(|| panic!("{name} seeded"));
+            assert_eq!(st.context, Some(StageContext::Fresh), "{name} fresh");
+            assert_eq!(st.mode, Some(StageMode::ReadOnly), "{name} read-only");
+        }
+    }
+
+    /// A prompt-only user-tier override keeps the seed's phase, reads, and
+    /// context (field-level merge, bd-cfgv).
+    #[test]
+    fn stage_contract_merge_keeps_seed_fields() {
+        let lib = StageLibrary::compiled_in();
+        let base = lib.get_stage("judge-arms").expect("seed").clone();
+        let over = Stage {
+            name: base.name.clone(),
+            prompt: "new prompt".to_string(),
+            role: None,
+            phase: None,
+            principles: vec![],
+            author: None,
+            origin_run: None,
+            params: vec![],
+            mode: None,
+            context: None,
+            effort: None,
+            reads: vec![],
+            witness: None,
+            repeat: None,
+            use_when: None,
+        };
+        let merged = merge_stage(base, over);
+        assert_eq!(merged.phase.as_deref(), Some("review"));
+        assert_eq!(merged.reads, vec!["steps.arms".to_string()]);
+        assert_eq!(merged.prompt, "new prompt");
+    }
+
+    /// The pure reads gate: inputs.* resolves against declared inputs,
+    /// steps.* against prior step names.
+    #[test]
+    fn stage_contract_reads_unsatisfied_pure() {
+        let reads = vec!["steps.arms".to_string()];
+        assert_eq!(
+            reads_unsatisfied(&reads, &[], &[]),
+            vec!["steps.arms".to_string()]
+        );
+        assert!(reads_unsatisfied(&reads, &[], &["arms".to_string()]).is_empty());
+        let io = vec!["inputs.objective".to_string()];
+        assert!(reads_unsatisfied(&io, &["objective".to_string()], &[]).is_empty());
+        assert_eq!(
+            reads_unsatisfied(&io, &["other".to_string()], &[]),
+            vec!["inputs.objective".to_string()]
+        );
+    }
+
+    /// Pure list filters: --phase narrows rows, --unused is set difference.
+    #[test]
+    fn stage_contract_list_filters() {
+        let rows = vec![
+            StageRow {
+                name: "a".into(),
+                tier: Tier::Seed,
+                role: None,
+                phase: Some("review".into()),
+            },
+            StageRow {
+                name: "b".into(),
+                tier: Tier::Seed,
+                role: None,
+                phase: Some("plan".into()),
+            },
+        ];
+        let got = filter_rows_by_phase(&rows, "review");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "a");
+        let all = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let used: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
+        assert_eq!(
+            unreferenced_stages(&all, &used),
+            vec!["b".to_string(), "c".to_string()]
+        );
+        let mut refs = std::collections::HashSet::new();
+        collect_stage_refs(
+            &serde_json::json!({"spec": {"stage": "judge-arms"}}),
+            &mut refs,
+        );
+        assert!(refs.contains("judge-arms"));
+    }
+
+    /// Missing phase is an ERROR on seed/repo tiers, a WARNING on
+    /// user/project tiers (operator stage files predate the field).
+    #[test]
+    fn stage_contract_tiered_phase_severity() {
+        let mut bare = scaffold("tiered-bare");
+        bare.phase = None;
+        let (errors, warnings) = lint_stage_tiered(&bare, &[], Tier::Seed);
+        assert!(
+            errors.iter().any(|e| e.contains("phase")),
+            "seed errors: {errors:?}"
+        );
+        assert!(warnings.is_empty());
+        let (errors, warnings) = lint_stage_tiered(&bare, &[], Tier::User);
+        assert!(
+            errors.iter().all(|e| !e.contains("phase")),
+            "user warns: {errors:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("phase")),
+            "user warns: {warnings:?}"
+        );
+        let (errors, warnings) = lint_stage_tiered(&bare, &[], Tier::Project);
+        assert!(errors.iter().all(|e| !e.contains("phase")));
+        assert!(warnings.iter().any(|w| w.contains("phase")));
+    }
+
+    /// New fields round-trip through the per-entry TOML renderer.
+    #[test]
+    fn stage_contract_render_round_trip() {
+        let mut st = scaffold("tiered-rt");
+        st.phase = Some("plan".to_string());
+        st.mode = Some(StageMode::ReadOnly);
+        st.context = Some(StageContext::Fresh);
+        st.effort = Some("max".to_string());
+        st.reads = vec!["inputs.objective".to_string()];
+        st.witness = Some("plan-polish.v1".to_string());
+        st.repeat = Some(Repeat {
+            min: 2,
+            max: 5,
+            until: "converged".to_string(),
+        });
+        st.use_when = Some("a bead set exists".to_string());
+        let text = render_stage_entry(&st).expect("renders");
+        let back: Stage = toml::from_str(&text).expect("parses back");
+        assert_eq!(back, st);
     }
 }

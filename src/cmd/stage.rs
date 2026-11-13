@@ -18,6 +18,13 @@ pub(crate) enum StageCmd {
         /// JSON rows (agent flag parity; list is JSON when this is set)
         #[arg(long)]
         json: bool,
+        /// only list stages serving this lifecycle phase
+        #[arg(long)]
+        phase: Option<String>,
+        /// only list stages no catalog workflow references via `stage:`
+        /// (compiled-in catalog only; the run-log recency window is out of scope)
+        #[arg(long)]
+        unused: bool,
     },
     /// Show one stage: prompt body + metadata + tier
     Show {
@@ -66,9 +73,37 @@ pub(crate) fn cmd_stage(cfg: &Config, cmd: &StageCmd) -> Result<()> {
         StageCmd::List {
             all: _,
             json: as_json,
+            phase,
+            unused,
         } => {
             let lib = crate::stages::StageLibrary::load_layered(Some(&project_stages))?;
             let rows: Vec<crate::stages::StageRow> = lib.list_tiered();
+            let rows = match phase {
+                Some(p) => {
+                    if !crate::stages::PHASES.contains(&p.as_str()) {
+                        bail!(
+                            "unknown phase {p:?} (valid: {})",
+                            crate::stages::PHASES.join(", ")
+                        );
+                    }
+                    crate::stages::filter_rows_by_phase(&rows, p)
+                }
+                None => rows,
+            };
+            let rows = if *unused {
+                let mut referenced = std::collections::HashSet::new();
+                for wf in crate::builtin_workflows::builtin_workflows().values() {
+                    let json = serde_json::to_value(wf).unwrap_or_default();
+                    crate::stages::collect_stage_refs(&json, &mut referenced);
+                }
+                let names: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
+                let keep = crate::stages::unreferenced_stages(&names, &referenced);
+                rows.into_iter()
+                    .filter(|r| keep.contains(&r.name))
+                    .collect()
+            } else {
+                rows
+            };
             if *as_json {
                 print_json(&serde_json::json!({ "stages": rows }));
                 return Ok(());
@@ -103,6 +138,39 @@ pub(crate) fn cmd_stage(cfg: &Config, cmd: &StageCmd) -> Result<()> {
             }
             if let Some(phase) = &stage.phase {
                 println!("phase:    {phase}");
+            }
+            if let Some(mode) = &stage.mode {
+                let s = match mode {
+                    crate::stages::StageMode::ReadOnly => "read-only",
+                    crate::stages::StageMode::WorkspaceWrite => "workspace-write",
+                    crate::stages::StageMode::Isolated => "isolated",
+                };
+                println!("mode:     {s}");
+            }
+            if let Some(context) = &stage.context {
+                let s = match context {
+                    crate::stages::StageContext::Warm => "warm",
+                    crate::stages::StageContext::Fresh => "fresh",
+                };
+                println!("context:  {s}");
+            }
+            if let Some(effort) = &stage.effort {
+                println!("effort:   {effort}");
+            }
+            if !stage.reads.is_empty() {
+                println!("reads:    {}", stage.reads.join(", "));
+            }
+            if let Some(witness) = &stage.witness {
+                println!("witness:  {witness}");
+            }
+            if let Some(repeat) = &stage.repeat {
+                println!(
+                    "repeat:   min={} max={} until={}",
+                    repeat.min, repeat.max, repeat.until
+                );
+            }
+            if let Some(use_when) = &stage.use_when {
+                println!("use_when: {use_when}");
             }
             if !stage.principles.is_empty() {
                 println!("principles: {}", stage.principles.join(", "));
@@ -171,19 +239,29 @@ pub(crate) fn cmd_stage(cfg: &Config, cmd: &StageCmd) -> Result<()> {
         StageCmd::Lint => {
             let lib = crate::stages::StageLibrary::load_layered(Some(&project_stages))?;
             let valid_roles: Vec<String> = crate::profile::ProfileCatalog::load()?.names();
-            let mut issues = 0;
+            let mut errors = 0;
+            let mut warnings = 0;
             for row in lib.list_tiered() {
                 let stage = lib.get_stage(&row.name).expect("row source");
-                for issue in crate::stages::lint_stage(stage, &valid_roles) {
-                    issues += 1;
+                let (errs, warns) = crate::stages::lint_stage_tiered(stage, &valid_roles, row.tier);
+                for issue in errs {
+                    errors += 1;
                     println!("[{:<7}] {}", row.tier.tag(), issue);
                 }
+                for warning in warns {
+                    warnings += 1;
+                    println!("[{:<7}] warning {warning}", row.tier.tag());
+                }
             }
-            if issues == 0 {
-                println!("stage lint clean (all tiers)");
+            if errors == 0 {
+                if warnings == 0 {
+                    println!("stage lint clean (all tiers)");
+                } else {
+                    println!("stage lint clean ({warnings} warning(s))");
+                }
                 Ok(())
             } else {
-                bail!("{issues} stage lint issue(s)")
+                bail!("{errors} stage lint issue(s)")
             }
         }
         StageCmd::Promote {

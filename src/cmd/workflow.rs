@@ -2186,7 +2186,128 @@ pub(crate) fn lint_flywheel_tier(
             );
         }
     }
+    for issue in stage_reads_issues(name, wf, &stages) {
+        emit(&issue, &mut blocking);
+    }
     blocking
+}
+
+/// The ADR-0021 D3 reads gate (bd-stage-contract-fields-t36sj): for each
+/// dispatch step with a `stage:`, the stage's typed `reads` must be
+/// satisfiable — `inputs.*` against the declared `inputs:`, `steps.*`
+/// against the steps that can precede it (steps before it in `steps:`; the
+/// transitive `needs:` ancestors in `graph:`, outer prior plus preceding
+/// siblings inside loop/branch/fan-out bodies). Each miss is one returned
+/// issue naming workflow, step, stage, and the missing reads. Steps whose
+/// stage is templated or unresolvable are skipped (the existing check
+/// reports those). Pure — the single call site is `lint_flywheel_tier`.
+pub(crate) fn stage_reads_issues(
+    name: &str,
+    wf: &toron_workflow::schema::Workflow,
+    stages: &stages::StageLibrary,
+) -> Vec<String> {
+    let declared: Vec<String> = wf.inputs.iter().map(|i| i.name.clone()).collect();
+    // (step label, stage name, prior step names) in document order.
+    let mut dispatches: Vec<(String, String, Vec<String>)> = Vec::new();
+    // Linear steps: prior = the labels before this index.
+    let mut prior: Vec<String> = Vec::new();
+    for (i, step) in wf.steps.iter().enumerate() {
+        let label = step
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("step_{}", i + 1));
+        walk_action_dispatches(&step.action, &label, &prior, &mut dispatches);
+        prior.push(label);
+    }
+    // Graph nodes: prior = the transitive needs ancestors.
+    if let Some(graph) = &wf.graph {
+        for (node_name, node) in &graph.nodes {
+            let mut ancestors = Vec::new();
+            let mut stack: Vec<&str> = node.needs.iter().map(String::as_str).collect();
+            let mut seen = std::collections::HashSet::new();
+            while let Some(next) = stack.pop() {
+                if !seen.insert(next.to_string()) {
+                    continue;
+                }
+                ancestors.push(next.to_string());
+                if let Some(parent) = graph.nodes.get(next) {
+                    stack.extend(parent.needs.iter().map(String::as_str));
+                }
+            }
+            walk_action_dispatches(&node.action, node_name, &ancestors, &mut dispatches);
+        }
+    }
+    let mut issues = Vec::new();
+    for (label, stage_name, step_prior) in dispatches {
+        if stage_name.contains("{{") {
+            continue;
+        }
+        let Some(stage) = stages.get_stage(&stage_name) else {
+            continue;
+        };
+        if stage.reads.is_empty() {
+            continue;
+        }
+        let missing = stages::reads_unsatisfied(&stage.reads, &declared, &step_prior);
+        if !missing.is_empty() {
+            issues.push(format!(
+                "workflow {name} step {label} stage {stage_name} missing reads: {}",
+                missing.join(", ")
+            ));
+        }
+    }
+    issues
+}
+
+/// Collect (step label, stage name, prior steps) for every dispatch under
+/// an action, recursing into loop/branch/fan-out/retry bodies. Body items
+/// see the outer prior plus the container label and preceding siblings.
+fn walk_action_dispatches(
+    action: &toron_workflow::schema::Action,
+    label: &str,
+    prior: &[String],
+    out: &mut Vec<(String, String, Vec<String>)>,
+) {
+    use toron_workflow::schema::Action;
+    match action {
+        Action::DispatchJob { spec, .. } => {
+            if let Some(stage) = spec.stage.clone() {
+                out.push((label.to_string(), stage, prior.to_vec()));
+            }
+        }
+        Action::Loop { body, .. } => {
+            let mut p = prior.to_vec();
+            p.push(label.to_string());
+            for (i, s) in body.iter().enumerate() {
+                let l = s.name.clone().unwrap_or_else(|| format!("step_{}", i + 1));
+                walk_action_dispatches(&s.action, &l, &p, out);
+                p.push(l);
+            }
+        }
+        Action::Branch {
+            then, else_steps, ..
+        } => {
+            for branch in [then, else_steps] {
+                let mut p = prior.to_vec();
+                p.push(label.to_string());
+                for (i, s) in branch.iter().enumerate() {
+                    let l = s.name.clone().unwrap_or_else(|| format!("step_{}", i + 1));
+                    walk_action_dispatches(&s.action, &l, &p, out);
+                    p.push(l);
+                }
+            }
+        }
+        Action::Foreach { each, .. } | Action::Parallel { each, .. } => {
+            let mut p = prior.to_vec();
+            p.push(label.to_string());
+            let l = each.name.clone().unwrap_or_else(|| format!("{label}.each"));
+            walk_action_dispatches(&each.action, &l, &p, out);
+        }
+        Action::Retry { step, .. } => {
+            walk_action_dispatches(&step.action, label, prior, out);
+        }
+        _ => {}
+    }
 }
 
 /// --- moved-in test mod (bd-wave5-main-eviction-d5hht) ---
@@ -2386,5 +2507,66 @@ steps:
                 "built-in {name} fails flywheel-tier lint (profile/stage/inputs)"
             );
         }
+    }
+
+    /// ADR-0021 D3 reads gate: a workflow that dispatches judge-arms with
+    /// no arms step FAILS lint, naming workflow, step, stage, and the
+    /// missing read (bd-stage-contract-fields-t36sj).
+    #[test]
+    fn stage_contract_judge_arms_without_arms_fails() {
+        let wf = parse_workflow(
+            r#"
+name: judge-only
+trigger:
+  type: webhook
+inputs:
+  - name: objective
+steps:
+  - name: judge
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@oracle", stage: judge-arms, task: "Judge {{inputs.objective}}." }
+"#,
+        )
+        .expect("parse");
+        let lib = crate::stages::StageLibrary::compiled_in();
+        let issues = stage_reads_issues("judge-only", &wf, &lib);
+        assert_eq!(issues.len(), 1, "one missing read: {issues:?}");
+        let msg = &issues[0];
+        for needle in [
+            "workflow judge-only",
+            "step judge",
+            "stage judge-arms",
+            "steps.arms",
+        ] {
+            assert!(msg.contains(needle), "names {needle}: {msg}");
+        }
+    }
+
+    /// The same dispatch passes once an arms step precedes it.
+    #[test]
+    fn stage_contract_arms_before_judge_passes() {
+        let wf = parse_workflow(
+            r#"
+name: judged
+trigger:
+  type: webhook
+inputs:
+  - name: objective
+steps:
+  - name: arms
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@scout", stage: diagnose-only, task: "Explore." }
+  - name: judge
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@oracle", stage: judge-arms, task: "Judge {{inputs.objective}}." }
+"#,
+        )
+        .expect("parse");
+        let lib = crate::stages::StageLibrary::compiled_in();
+        let issues = stage_reads_issues("judged", &wf, &lib);
+        assert!(issues.is_empty(), "arms satisfies steps.arms: {issues:?}");
     }
 }
