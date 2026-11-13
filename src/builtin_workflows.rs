@@ -1240,7 +1240,7 @@ steps:
     on_error: continue
   - name: execute_exit
     action: verify
-    command: 'LABEL="{{inputs.wave_label}}"; OPEN=$(br list --label "$LABEL" --json | jq -r "[.issues[] | select(.status != \"closed\") | .id] | join(\" \")"); if [ -n "$OPEN" ]; then echo "execute exit refused: wave $LABEL still open: $OPEN"; exit 1; fi; IDS=$(br list --label "$LABEL" --json | jq -r "[.issues[].id] | join(\" \")"); if [ -z "$IDS" ]; then echo "execute exit refused: wave $LABEL matched zero beads"; exit 1; fi; for id in $IDS; do flywheel ship check "$id" || exit 1; done'
+    command: 'LABEL="{{inputs.wave_label}}"; W="${LABEL#wave-}"; case "$W" in ""|*[!0-9]*) WN=null;; *) WN="$W";; esac; ROWS=$(br list --all --json | jq --argjson n "$WN" --arg label "$LABEL" "[.issues[] | select((.wave != null and .wave == \$n) or (.wave == null and ((.labels // []) | index(\$label))))]"); OPEN=$(echo "$ROWS" | jq -r "[.[] | select(.status != \"closed\") | .id] | join(\" \")"); if [ -n "$OPEN" ]; then echo "execute exit refused: wave $LABEL still open: $OPEN"; exit 1; fi; IDS=$(echo "$ROWS" | jq -r "[.[].id] | join(\" \")"); if [ -z "$IDS" ]; then echo "execute exit refused: wave $LABEL matched zero beads"; exit 1; fi; for id in $IDS; do flywheel ship check "$id" || exit 1; done'
     on_error: fail_run
   - name: observe
     action: dispatch_job
@@ -3278,6 +3278,14 @@ mod tests {
             "the exit reads ledger state, not a marker: {command}"
         );
         assert!(
+            command.contains("--all"),
+            "closed beads are members too (br list excludes them by default): {command}"
+        );
+        assert!(
+            command.contains(".wave"),
+            "membership prefers the typed wave field: {command}"
+        );
+        assert!(
             command.contains("ship check"),
             "each bead needs a legal ship check: {command}"
         );
@@ -3285,6 +3293,151 @@ mod tests {
             !command.contains("test -f"),
             "the exit never reads a marker: {command}"
         );
+    }
+
+    /// The exit command runs against a ledger: deny-shims plus fake `br`
+    /// and `flywheel` scripts first on PATH, no HOME, no real services.
+    /// The br fake prints fixture JSON and honors --all versus the default
+    /// exclude-closed; the flywheel fake passes or fails `ship check` per
+    /// id. The rendered command runs via sh -c.
+    #[test]
+    fn wave_swarm_execute_exit_runs_against_ledger() {
+        use std::os::unix::fs::PermissionsExt;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("fw-wave-exit-{nanos}-{}", std::process::id()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).expect("bin dir");
+        let exe = |name: &str, body: &str| {
+            let path = bin.join(name);
+            std::fs::write(&path, body).expect("fake script");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        };
+        exe(
+            "launchctl",
+            "#!/bin/sh\necho \"deny-shim: called $0\" >&2\nexit 1\n",
+        );
+        exe(
+            "systemctl",
+            "#!/bin/sh\necho \"deny-shim: called $0\" >&2\nexit 1\n",
+        );
+        exe(
+            "br",
+            "#!/bin/sh\nall=0\nfor a in \"$@\"; do [ \"$a\" = \"--all\" ] && all=1; done\njq --argjson all \"$all\" '[.issues[] | select($all == 1 or .status != \"closed\")] | {issues: .}' \"$BR_FIXTURE\"\n",
+        );
+        exe(
+            "flywheel",
+            "#!/bin/sh\nid=\"${3:-}\"\ncase \" $SHIP_FAIL_IDS \" in\n  *\" $id \"*) echo \"ship check failed for $id\" >&2; exit 1;;\nesac\necho \"ship check ok for $id\"\nexit 0\n",
+        );
+        let fixture = dir.join("fixture.json");
+        let run = |fixture_json: &str, ship_fail: &str| -> std::process::Output {
+            std::fs::write(&fixture, fixture_json).expect("fixture");
+            let path = format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let wfs = builtin_workflows();
+            let wave = &wfs["wave-swarm"];
+            let exit = wave
+                .steps
+                .iter()
+                .find(|s| s.name.as_deref() == Some("execute_exit"))
+                .expect("execute_exit");
+            let command = match &exit.action {
+                toron_workflow::schema::Action::Verify { command } => {
+                    command.replace("{{inputs.wave_label}}", "wave-2")
+                }
+                other => panic!("execute_exit is a verify step: {:?}", other.type_name()),
+            };
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .env("PATH", &path)
+                .env("BR_FIXTURE", &fixture)
+                .env("SHIP_FAIL_IDS", ship_fail)
+                .env_remove("HOME")
+                .output()
+                .expect("spawn sh");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                !text.contains("deny-shim"),
+                "no supervisor shims fire: {text}"
+            );
+            out
+        };
+        let text_of = |out: &std::process::Output| -> String {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        };
+        // All closed (one by label, one by typed wave only), ship legal.
+        let out = run(
+            r#"{"issues": [
+              {"id": "bd-a", "status": "closed", "labels": ["wave-2"]},
+              {"id": "bd-t", "status": "closed", "labels": [], "wave": 2}
+            ]}"#,
+            "",
+        );
+        assert!(out.status.success(), "all closed + legal ship passes");
+        // One open bead fails naming it.
+        let out = run(
+            r#"{"issues": [
+              {"id": "bd-a", "status": "closed", "labels": ["wave-2"]},
+              {"id": "bd-b", "status": "open", "labels": ["wave-2"]}
+            ]}"#,
+            "",
+        );
+        assert!(!out.status.success(), "an open bead fails the exit");
+        assert!(
+            text_of(&out).contains("bd-b"),
+            "the open bead is named: {}",
+            text_of(&out)
+        );
+        // Zero members fails.
+        let out = run(
+            r#"{"issues": [{"id": "bd-x", "status": "closed", "labels": ["wave-9"]}]}"#,
+            "",
+        );
+        assert!(!out.status.success(), "zero members fails");
+        assert!(
+            text_of(&out).contains("matched zero beads"),
+            "empty wave says so: {}",
+            text_of(&out)
+        );
+        // A typed-wave member with no label counts.
+        let out = run(
+            r#"{"issues": [{"id": "bd-t", "status": "closed", "labels": [], "wave": 2}]}"#,
+            "",
+        );
+        assert!(
+            out.status.success(),
+            "typed-wave membership needs no label: {}",
+            text_of(&out)
+        );
+        // An illegal ship check fails the exit.
+        let out = run(
+            r#"{"issues": [
+              {"id": "bd-a", "status": "closed", "labels": ["wave-2"]},
+              {"id": "bd-x", "status": "closed", "labels": ["wave-2"]}
+            ]}"#,
+            "bd-x",
+        );
+        assert!(!out.status.success(), "illegal ship check fails");
+        assert!(
+            text_of(&out).contains("bd-x"),
+            "the illegal bead is named: {}",
+            text_of(&out)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// bd-h4fc: every decisive step fails the run on error (on_error:
