@@ -42,10 +42,13 @@ pub fn converged(new_digest: &str, previous: Option<&str>) -> bool {
 /// Pure decision core: SHA-256 hex digest over the normalized open bead set.
 ///
 /// Normalization: sorted by id; only id, title, description, status,
-/// dependencies (sorted, empty when absent). Accepts either the full
-/// `br list --status open --json` envelope (`{"issues":[...]}`) or a bare
-/// array. Volatile fields (`updated_at`, counts, revisions) never enter the
-/// digest, so a round that changes nothing looks unchanged.
+/// revision, priority, issue_type, dependencies (sorted, empty when absent).
+/// `revision` bumps on ANY bead edit (including fields `br list` never
+/// carries, like VERIFY or principles), so a content change can never look
+/// unchanged. Accepts either the full `br list --status open --json`
+/// envelope (`{"issues":[...]}`) or a bare array. Volatile fields
+/// (`updated_at`, counts) never enter the digest, so a round that changes
+/// nothing looks unchanged.
 pub fn digest(beads_json: &Value) -> String {
     let issues: &[Value] = match beads_json {
         Value::Array(items) => items,
@@ -81,6 +84,9 @@ pub fn digest(beads_json: &Value) -> String {
                 "title": issue.get("title").and_then(Value::as_str).unwrap_or(""),
                 "description": issue.get("description").and_then(Value::as_str).unwrap_or(""),
                 "status": issue.get("status").and_then(Value::as_str).unwrap_or(""),
+                "revision": issue.get("revision").and_then(Value::as_u64).unwrap_or(0),
+                "priority": issue.get("priority").and_then(Value::as_u64).unwrap_or(0),
+                "issue_type": issue.get("issue_type").and_then(Value::as_str).unwrap_or(""),
                 "dependencies": deps,
             })
         })
@@ -179,15 +185,22 @@ fn collect_id_strings(v: &Value, out: &mut Vec<String>) {
     }
 }
 
-fn dependencies_for(bead_id: &str) -> Vec<String> {
-    let raw = match run_br(None, &["dep", "list", bead_id, "--json"]) {
-        Ok(raw) => raw,
-        Err(_) => return Vec::new(),
-    };
-    let v: Value = match serde_json::from_str(raw.trim()) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
+/// Pure decision core: the bead set is only digestible when fully listed.
+/// `br list` paginates; a `has_more: true` envelope is a partial surface
+/// and must never converge.
+pub fn page_is_complete(list_json: &Value) -> bool {
+    !list_json
+        .get("has_more")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Pure parse of `br dep list <id> --json`: a bare array or an object
+/// carrying `edges`. Malformed output is an error, never an empty list —
+/// a failed read must never converge.
+fn parse_dep_edges(raw: &str) -> Result<Vec<String>> {
+    let v: Value = serde_json::from_str(raw.trim())
+        .map_err(|e| anyhow::anyhow!("br dep list bad JSON: {e}: {raw}"))?;
     let edges: &[Value] = match &v {
         Value::Array(items) => items,
         Value::Object(_) => v
@@ -207,7 +220,12 @@ fn dependencies_for(bead_id: &str) -> Vec<String> {
         .collect();
     deps.sort();
     deps.dedup();
-    deps
+    Ok(deps)
+}
+
+fn dependencies_for(bead_id: &str) -> Result<Vec<String>> {
+    let raw = run_br(None, &["dep", "list", bead_id, "--json"])?;
+    parse_dep_edges(&raw).map_err(|e| anyhow::anyhow!("{bead_id}: {e:#}"))
 }
 
 /// `flywheel __plan-fence fence [--json]`: exit 0 only when `br lint`
@@ -261,15 +279,33 @@ pub(crate) fn cmd_fence(json: bool) -> Result<()> {
 /// `flywheel __plan-fence converged --state <path> [--json]`: digest the
 /// open bead set, compare with the stored digest, write on change.
 pub(crate) fn cmd_converged(state: &Path, json: bool) -> Result<()> {
-    let list_raw = run_br(None, &["list", "--status", "open", "--json"])?;
+    let list_raw = run_br(
+        None,
+        &["list", "--status", "open", "--json", "--limit", "0"],
+    )?;
     let mut list_json: Value = serde_json::from_str(list_raw.trim())
         .map_err(|e| anyhow::anyhow!("br list bad JSON: {e}"))?;
+    if !page_is_complete(&list_json) {
+        if json {
+            print_json(&json!({
+                "check": "converged",
+                "ok": false,
+                "detail": {
+                    "reason": "has_more",
+                    "state": state.display().to_string(),
+                }
+            }));
+        } else {
+            println!("converged: false (br list has_more — partial surface)");
+        }
+        bail!("bead set incomplete (br list has_more)")
+    };
     if let Some(issues) = list_json.get_mut("issues").and_then(Value::as_array_mut) {
         for issue in issues.iter_mut() {
             if issue.get("dependencies").is_none()
                 && let Some(id) = issue.get("id").and_then(Value::as_str).map(str::to_owned)
             {
-                let deps = dependencies_for(&id);
+                let deps = dependencies_for(&id)?;
                 if !deps.is_empty() {
                     issue["dependencies"] =
                         Value::Array(deps.into_iter().map(Value::String).collect());
@@ -354,5 +390,48 @@ mod tests {
         assert!(!converged("abc", Some("abd")));
         assert!(!converged("abc", None));
         assert!(!converged("abc", Some("")));
+    }
+
+    #[test]
+    fn digest_differs_on_revision_bump() {
+        let rev1 = json!({"issues": [
+            {"id": "bd-1", "title": "A", "description": "c", "status": "open",
+             "revision": 1, "priority": 2, "issue_type": "feature"},
+        ]});
+        let rev2 = json!({"issues": [
+            {"id": "bd-1", "title": "A", "description": "c", "status": "open",
+             "revision": 2, "priority": 2, "issue_type": "feature"},
+        ]});
+        assert_ne!(digest(&rev1), digest(&rev2));
+    }
+
+    #[test]
+    fn page_complete_only_without_has_more() {
+        assert!(page_is_complete(&json!({"issues": [], "has_more": false})));
+        assert!(page_is_complete(&json!({"issues": []})));
+        assert!(!page_is_complete(&json!({"issues": [], "has_more": true})));
+    }
+
+    #[test]
+    fn dep_edges_reject_malformed_output() {
+        assert!(parse_dep_edges("not json").is_err());
+        assert!(parse_dep_edges("{\"cycles\": []}").is_ok());
+        let edges = parse_dep_edges(
+            "[{\"issue_id\":\"bd-1\",\"depends_on_id\":\"bd-0\",\"type\":\"blocks\"}]",
+        )
+        .expect("array edge shape parses");
+        assert_eq!(edges, vec!["bd-0".to_owned()]);
+    }
+
+    #[test]
+    fn dep_lookup_failure_propagates() {
+        let prior = std::env::var_os("FLYWHEEL_BR_BIN");
+        unsafe { std::env::set_var("FLYWHEEL_BR_BIN", "false") };
+        let result = dependencies_for("bd-1");
+        match prior {
+            Some(v) => unsafe { std::env::set_var("FLYWHEEL_BR_BIN", v) },
+            None => unsafe { std::env::remove_var("FLYWHEEL_BR_BIN") },
+        }
+        assert!(result.is_err(), "a failed br read must never converge");
     }
 }
