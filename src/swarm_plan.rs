@@ -54,6 +54,8 @@ pub struct Seat {
     pub harness: String,
     pub model: Option<Field>,
     pub effort: Option<Field>,
+    pub mode: Option<Field>,
+    pub phase: Option<Field>,
     /// Where the seat runs. Phase 1 only knows `"pane"`.
     pub placement: String,
 }
@@ -128,6 +130,39 @@ pub fn seat_status(
         }
     });
     (model_field, effort_field)
+}
+
+/// Delivery truth for one seat's mode against the adapter's mode argv:
+/// honored iff the adapter emits argv for it. Downgraded to blocked by
+/// provenance (user/preference asks) in [`field_status`].
+#[must_use]
+pub fn mode_field(harness: &str, mode: Option<(String, Provenance)>) -> Option<Field> {
+    mode.map(|(value, from)| {
+        let (args, delivery) = crate::headless::mode_launch_args(harness, &value);
+        let delivered =
+            !args.is_empty() && matches!(delivery, crate::headless::ModeDelivery::Honored);
+        Field {
+            status: field_status(delivered, from, harness, "mode"),
+            value,
+            from,
+        }
+    })
+}
+
+/// Delivery truth for one seat's phase against the adapter's phase argv:
+/// honored iff the adapter emits argv for it (phase_launch_args reports
+/// degraded=false with args).
+#[must_use]
+pub fn phase_field(harness: &str, phase: Option<(String, Provenance)>) -> Option<Field> {
+    phase.map(|(value, from)| {
+        let (args, degraded) = crate::headless::phase_launch_args(harness, &value);
+        let delivered = !args.is_empty() && !degraded;
+        Field {
+            status: field_status(delivered, from, harness, "phase"),
+            value,
+            from,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -366,5 +401,94 @@ mod tests {
         );
         let plan = Plan::new("swarm");
         assert_eq!(plan.schema, "flywheel-plan.v1");
+    }
+
+    #[test]
+    fn mode_field_user_readonly_on_fx_is_blocked() {
+        let f = mode_field("fx", Some(("read-only".to_string(), Provenance::User)))
+            .expect("field present");
+        match f.status {
+            FieldStatus::Blocked { remedy } => {
+                assert!(remedy.contains("fx"), "{remedy}");
+                assert!(remedy.contains("mode"), "{remedy}");
+            }
+            other => panic!("user read-only on fx must block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mode_field_stage_readonly_on_gemini_is_degraded() {
+        let f = mode_field("gemini", Some(("read-only".to_string(), Provenance::Stage)))
+            .expect("field present");
+        assert!(
+            matches!(f.status, FieldStatus::Degraded { .. }),
+            "stage read-only on gemini degrades: {:?}",
+            f.status
+        );
+    }
+
+    #[test]
+    fn phase_field_user_plan_on_grok_is_honored() {
+        let f = phase_field("grok", Some(("plan".to_string(), Provenance::User)))
+            .expect("field present");
+        assert_eq!(f.status, FieldStatus::Honored);
+    }
+
+    #[test]
+    fn phase_field_plan_on_fx_is_degraded() {
+        let f =
+            phase_field("fx", Some(("plan".to_string(), Provenance::User))).expect("field present");
+        assert!(
+            matches!(f.status, FieldStatus::Blocked { .. }),
+            "user plan on flag-less fx blocks: {:?}",
+            f.status
+        );
+    }
+
+    /// V4 extended (ADR-0022 §3.4): mode and phase statuses flip only
+    /// because the argv changed — honored iff the adapter emits for it.
+    #[test]
+    fn v4_mode_and_phase_flip_only_with_argv() {
+        for spec in crate::harness_registry::REGISTRY {
+            let harness = spec.canonical;
+            let (args, delivery) = crate::headless::mode_launch_args(harness, "read-only");
+            let honored =
+                !args.is_empty() && matches!(delivery, crate::headless::ModeDelivery::Honored);
+            let f = mode_field(harness, Some(("read-only".to_string(), Provenance::User)))
+                .expect("field present");
+            assert_eq!(
+                f.status == FieldStatus::Honored,
+                honored,
+                "false green on {harness} mode: {:?} vs argv {args:?}",
+                f.status
+            );
+            let (pargs, pdegraded) = crate::headless::phase_launch_args(harness, "plan");
+            let phonored = !pargs.is_empty() && !pdegraded;
+            let pf = phase_field(harness, Some(("plan".to_string(), Provenance::User)))
+                .expect("field present");
+            assert_eq!(
+                pf.status == FieldStatus::Honored,
+                phonored,
+                "false green on {harness} phase: {:?} vs argv {pargs:?}",
+                pf.status
+            );
+        }
+    }
+
+    /// The extended V4 bites: an always-honored stub fails on the first
+    /// harness with no mode mechanic (fx).
+    #[test]
+    #[should_panic(expected = "false green")]
+    fn v4_mode_catches_an_always_honored_stub() {
+        for spec in crate::harness_registry::REGISTRY {
+            let harness = spec.canonical;
+            let (args, _) = crate::headless::mode_launch_args(harness, "read-only");
+            let stub_honored = true;
+            assert_eq!(
+                stub_honored,
+                !args.is_empty(),
+                "false green on {harness}: stub honours what the adapter drops"
+            );
+        }
     }
 }

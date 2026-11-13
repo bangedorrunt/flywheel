@@ -829,6 +829,36 @@ pub(crate) fn cmd_steer(
 /// A dry-run never refuses: where the real spawn would bail (unknown
 /// profile), the plan builder errors the same way; where it would fall back
 /// to "(harness default)", the plan says `model: null`.
+/// ADR-0022 phase 2b (bd-7rg0f): refuse a plan with any `blocked` field.
+/// Pure decision: returns every blocked seat field with its remedy so the
+/// CLI can print them and exit non-zero before launching anything.
+/// An all-honored (or all-degraded) plan proceeds.
+pub(crate) fn refuse_blocked(plan: &crate::swarm_plan::Plan) -> Result<(), Vec<String>> {
+    let mut blocked = Vec::new();
+    for seat in &plan.seats {
+        for (field_name, field) in [
+            ("model", &seat.model),
+            ("effort", &seat.effort),
+            ("mode", &seat.mode),
+            ("phase", &seat.phase),
+        ] {
+            if let Some(f) = field
+                && let crate::swarm_plan::FieldStatus::Blocked { remedy } = &f.status
+            {
+                blocked.push(format!(
+                    "{} {} {} `{}` is blocked: {}",
+                    seat.role, seat.harness, field_name, f.value, remedy
+                ));
+            }
+        }
+    }
+    if blocked.is_empty() {
+        Ok(())
+    } else {
+        Err(blocked)
+    }
+}
+
 pub(crate) fn build_dry_run_plan(
     cfg: &Config,
     items: &[crate::SpawnItem],
@@ -888,12 +918,20 @@ pub(crate) fn build_dry_run_plan(
             effort.as_ref().map(|(value, _)| value.as_str()),
         );
         let (model_field, effort_field) = seat_status(&harness, model, effort, &launch);
+        // Spawn carries no mode/phase ask today: profiles name neither,
+        // and stage contracts (the phase source) arrive with workflows.
+        // Wired through the field fns so the values flow when a source
+        // lands; today they render as null.
+        let mode_field = crate::swarm_plan::mode_field(&harness, None);
+        let phase_field = crate::swarm_plan::phase_field(&harness, None);
         plan.seats.push(crate::swarm_plan::Seat {
             role: item.short.clone(),
             count: item.count,
             harness,
             model: model_field,
             effort: effort_field,
+            mode: mode_field,
+            phase: phase_field,
             placement: "pane".to_string(),
         });
     }
@@ -1003,15 +1041,15 @@ projects available: {}",
     if items.is_empty() {
         bail!("nothing to spawn: pass --oc/--pi/--gk counts, --recipe NAME, or --profile NAME");
     }
+    let plan = build_dry_run_plan(
+        cfg,
+        &items,
+        &catalog,
+        &model_reg,
+        &opts.bare_model,
+        &opts.bare_provider,
+    )?;
     if opts.dry_run {
-        let plan = build_dry_run_plan(
-            cfg,
-            &items,
-            &catalog,
-            &model_reg,
-            &opts.bare_model,
-            &opts.bare_provider,
-        )?;
         if opts.json {
             print_json(&serde_json::to_value(&plan)?);
         } else {
@@ -1021,6 +1059,15 @@ projects available: {}",
             );
         }
         return Ok(());
+    }
+    if let Err(blocked) = refuse_blocked(&plan) {
+        for line in &blocked {
+            eprintln!("blocked: {line}");
+        }
+        anyhow::bail!(
+            "spawn refused: {} blocked field(s) would not be honoured — fix the ask (a blocked ask must not launch)",
+            blocked.len()
+        );
     }
     let base_label = opts
         .label_override
@@ -1821,15 +1868,15 @@ pub(crate) fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Res
     if items.is_empty() {
         bail!("nothing to spawn: pass --oc/--pi/--gk counts, --recipe NAME, or --profile NAME");
     }
+    let plan = build_dry_run_plan(
+        cfg,
+        &items,
+        &catalog,
+        &model_reg,
+        &opts.bare_model,
+        &opts.bare_provider,
+    )?;
     if opts.dry_run {
-        let plan = build_dry_run_plan(
-            cfg,
-            &items,
-            &catalog,
-            &model_reg,
-            &opts.bare_model,
-            &opts.bare_provider,
-        )?;
         if opts.json {
             print_json(&serde_json::to_value(&plan)?);
         } else {
@@ -1839,6 +1886,15 @@ pub(crate) fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Res
             );
         }
         return Ok(());
+    }
+    if let Err(blocked) = refuse_blocked(&plan) {
+        for line in &blocked {
+            eprintln!("blocked: {line}");
+        }
+        anyhow::bail!(
+            "spawn refused: {} blocked field(s) would not be honoured — fix the ask (a blocked ask must not launch)",
+            blocked.len()
+        );
     }
     let base_label = opts
         .label_override
@@ -3804,6 +3860,7 @@ mod workspace_origin_tests {
 
 #[cfg(test)]
 mod adr0013_spawn_effect_tests {
+    use super::refuse_blocked;
 
     /// Slice one top-level function body. Both needles carry a real newline so
     /// they can only match real code — never a test literal, which spells the
@@ -3850,6 +3907,72 @@ mod adr0013_spawn_effect_tests {
                 "{entry}: dry-run branch must return"
             );
         }
+    }
+
+    /// ADR-0022 phase 2b (bd-7rg0f): a blocked field refuses the launch.
+    /// Pure decision: any `blocked` field on any seat refuses, naming each
+    /// blocked seat field and its remedy; an all-honored plan proceeds.
+    #[test]
+    fn refuse_blocked_names_every_blocked_seat_field() {
+        let blocked = crate::swarm_plan::Field {
+            value: "gemini-2.5-pro".into(),
+            from: crate::swarm_plan::Provenance::User,
+            status: crate::swarm_plan::FieldStatus::Blocked {
+                remedy: "pick another harness".into(),
+            },
+        };
+        let honored = crate::swarm_plan::Field {
+            value: "x".into(),
+            from: crate::swarm_plan::Provenance::Slot,
+            status: crate::swarm_plan::FieldStatus::Honored,
+        };
+        let mut plan = crate::swarm_plan::Plan::new("swarm");
+        plan.seats.push(crate::swarm_plan::Seat {
+            role: "coder".into(),
+            count: 1,
+            harness: "gemini".into(),
+            model: Some(blocked),
+            effort: None,
+            mode: None,
+            phase: None,
+            placement: "pane".to_string(),
+        });
+        plan.seats.push(crate::swarm_plan::Seat {
+            role: "reviewer".into(),
+            count: 1,
+            harness: "pi".into(),
+            model: Some(honored),
+            effort: None,
+            mode: None,
+            phase: None,
+            placement: "pane".to_string(),
+        });
+        let err = refuse_blocked(&plan).expect_err("one blocked field refuses");
+        assert!(
+            err.iter()
+                .any(|e| e.contains("coder") && e.contains("model")),
+            "{err:?}"
+        );
+        assert!(
+            err.iter().any(|e| e.contains("pick another harness")),
+            "{err:?}"
+        );
+        let mut clean = crate::swarm_plan::Plan::new("swarm");
+        clean.seats.push(crate::swarm_plan::Seat {
+            role: "coder".into(),
+            count: 1,
+            harness: "pi".into(),
+            model: Some(crate::swarm_plan::Field {
+                value: "m".into(),
+                from: crate::swarm_plan::Provenance::User,
+                status: crate::swarm_plan::FieldStatus::Honored,
+            }),
+            effort: None,
+            mode: None,
+            phase: None,
+            placement: "pane".to_string(),
+        });
+        assert!(refuse_blocked(&clean).is_ok());
     }
 
     /// I4: the spawn intent is committed before the workspace dispatch.

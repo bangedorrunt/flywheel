@@ -97,11 +97,74 @@ pub fn model_args(harness: &str, model: &str, effort: Option<&str>) -> Vec<Strin
 /// dispatch proceeds in prompt mode. One match arm per harness; this
 /// registry is the ONLY place a harness's phase vocabulary lives.
 pub fn phase_launch_args(harness: &str, phase: &str) -> (Vec<String>, bool) {
-    match (harness, phase) {
+    let harness = crate::harness_registry::canonical(harness);
+    match (harness.as_str(), phase) {
         ("opencode", "implement") => (vec!["--agent".to_string(), "build".to_string()], false),
         (_, "implement") => (vec![], false),
         ("opencode", "plan") => (vec!["--agent".to_string(), "plan".to_string()], false),
+        ("grok", "plan") => (
+            vec!["--permission-mode".to_string(), "plan".to_string()],
+            false,
+        ),
+        ("antigravity" | "antigravity-cli", "plan") => {
+            (vec!["--mode".to_string(), "plan".to_string()], false)
+        }
         _ => (vec![], true),
+    }
+}
+
+/// How a harness delivers a `mode` request (ADR-0022 D3 mode column).
+/// `Honored` means the argv carries it; `Degraded` means prompt-mode with
+/// the reason. There is no blocked variant here: blocking is a resolver
+/// judgment from provenance (see `swarm_plan`), not an adapter fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModeDelivery {
+    Honored,
+    Degraded { reason: String },
+}
+
+/// Mode argv for `mode: read-only` (verified `grok --help`, `agy --help`,
+/// `pi --help --tools`, `gemini --help`, `opencode run --help`).
+/// `workspace-write` and `isolated` emit nothing today (degraded).
+#[must_use]
+pub fn mode_launch_args(harness: &str, mode: &str) -> (Vec<String>, ModeDelivery) {
+    let degraded = |reason: &str| {
+        (
+            Vec::new(),
+            ModeDelivery::Degraded {
+                reason: reason.to_string(),
+            },
+        )
+    };
+    if mode != "read-only" {
+        return degraded(&format!("mode `{mode}` has no dedicated flag; prompt-only"));
+    }
+    match crate::harness_registry::canonical(harness).as_str() {
+        "grok" => (
+            vec!["--permission-mode".to_string(), "plan".to_string()],
+            ModeDelivery::Honored,
+        ),
+        "antigravity" | "antigravity-cli" => (
+            vec!["--mode".to_string(), "plan".to_string()],
+            ModeDelivery::Honored,
+        ),
+        "opencode" => (
+            vec!["--agent".to_string(), "plan".to_string()],
+            ModeDelivery::Honored,
+        ),
+        "pi" => (
+            vec!["--tools".to_string(), "read,grep,find,ls".to_string()],
+            ModeDelivery::Honored,
+        ),
+        "gemini" => (
+            vec!["--approval-mode".to_string(), "default".to_string()],
+            ModeDelivery::Degraded {
+                reason: "approval-gated, not enforced".to_string(),
+            },
+        ),
+        other => degraded(&format!(
+            "harness {other:?} has no read-only flag; prompt-only"
+        )),
     }
 }
 
@@ -115,7 +178,7 @@ pub fn phase_launch_args(harness: &str, phase: &str) -> (Vec<String>, bool) {
 pub fn build_argv_roles(
     harness: &str,
     model: Option<&str>,
-    _effort: Option<&str>,
+    effort: Option<&str>,
     _smol: &str,
     _slow: &str,
     _plan: &str,
@@ -132,7 +195,12 @@ pub fn build_argv_roles(
         "opencode" => {
             argv.extend(["opencode", "run", "--format", "json"].map(String::from));
             if let Some(m) = model {
-                argv.extend(model_args("opencode", m, None));
+                match effort.filter(|e| !e.is_empty()) {
+                    // Headless effort rides the model variant; the pane
+                    // path (interactive_model_plan) is unchanged and degraded.
+                    Some(e) => argv.extend(["--model".to_string(), format!("{m}#{e}")]),
+                    None => argv.extend(model_args("opencode", m, None)),
+                }
             }
         }
         "grok" => {
@@ -644,6 +712,82 @@ mod tests {
         }
     }
 
+    /// ADR-0022 phase 2b (bd-7rg0f): grok and agy grow plan mechanics.
+    /// grok `--permission-mode plan` (verified `grok --help`); agy `--mode
+    /// plan` (verified `agy --help`), aliases resolving through the registry.
+    #[test]
+    fn phase_registry_plan_mechanics_grok_agy() {
+        let (args, degraded) = phase_launch_args("grok", "plan");
+        assert_eq!(args, vec!["--permission-mode", "plan"]);
+        assert!(!degraded, "grok plan is wired, not degraded");
+        for h in ["agy", "antigravity", "ag", "antigravity-cli"] {
+            let (args, degraded) = phase_launch_args(h, "plan");
+            assert_eq!(args, vec!["--mode", "plan"], "{h} rides the agy row");
+            assert!(!degraded, "{h} plan is wired, not degraded");
+        }
+        let (args, degraded) = phase_launch_args("opencode", "plan");
+        assert_eq!(args, vec!["--agent", "plan"]);
+        assert!(!degraded);
+    }
+
+    /// ADR-0022 phase 2b (bd-7rg0f): read-only mode delivery per harness.
+    #[test]
+    fn mode_launch_args_read_only_rows() {
+        for (harness, want) in [
+            ("grok", vec!["--permission-mode", "plan"]),
+            ("agy", vec!["--mode", "plan"]),
+            ("opencode", vec!["--agent", "plan"]),
+            ("pi", vec!["--tools", "read,grep,find,ls"]),
+        ] {
+            let (args, delivery) = mode_launch_args(harness, "read-only");
+            assert_eq!(
+                args,
+                want.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "{harness}"
+            );
+            assert_eq!(delivery, ModeDelivery::Honored, "{harness}");
+        }
+        let (args, delivery) = mode_launch_args("gemini", "read-only");
+        assert_eq!(args, vec!["--approval-mode", "default"]);
+        assert_eq!(
+            delivery,
+            ModeDelivery::Degraded {
+                reason: "approval-gated, not enforced".to_string()
+            }
+        );
+        for harness in ["fx", "claude", "codex"] {
+            let (args, delivery) = mode_launch_args(harness, "read-only");
+            assert!(args.is_empty(), "{harness}: no read-only flag");
+            assert!(
+                matches!(delivery, ModeDelivery::Degraded { .. }),
+                "{harness}: degraded"
+            );
+        }
+        for mode in ["workspace-write", "isolated"] {
+            let (args, delivery) = mode_launch_args("pi", mode);
+            assert!(args.is_empty(), "{mode}: nothing emitted today");
+            assert!(
+                matches!(delivery, ModeDelivery::Degraded { .. }),
+                "{mode}: degraded with a reason"
+            );
+        }
+    }
+
+    /// ADR-0022 phase 2b (bd-7rg0f): opencode headless carries effort as a
+    /// `#variant` on the model; the pane path is unchanged and degraded.
+    #[test]
+    fn opencode_headless_effort_rides_hash_variant() {
+        let argv = build_argv_roles("opencode", Some("p/m"), Some("high"), "", "", "", "hi")
+            .expect("argv");
+        assert!(
+            argv.windows(2).any(|w| w == ["--model", "p/m#high"]),
+            "headless effort rides the variant: {argv:?}"
+        );
+        let plan = interactive_model_plan("opencode", "p/m", Some("high"));
+        assert!(plan.args().is_empty(), "pane path emits no model argv");
+        assert!(effort_degraded("opencode"), "pane effort still degrades");
+    }
+
     /// P10.3 (bd-ghcj.1): the model-flag args are per-harness, shared with
     /// the pane-runner spawn path (opencode/grok `-m`, omp `--model=`, pi
     /// `--model`). bd-42fs: omp carries `--thinking=<effort>` when given.
@@ -1030,10 +1174,12 @@ mod tests {
     /// ADR-0022 §3.2 R2: loud degradation. A (harness, phase) pair with no
     /// native mechanic returns empty args + degraded=true — the caller
     /// warns, tags the run log `phase_degraded`, and the dispatch proceeds
-    /// in prompt mode. Never a silent no-op, never a panic.
+    /// in prompt mode. Never a silent no-op, never a panic. Phase 2b wired
+    /// mechanics for grok plan, so grok left this list (its row moved to
+    /// phase_registry_plan_mechanics_grok_agy).
     #[test]
     fn phase_registry_degrades_loudly_without_mechanic() {
-        for harness in ["pi", "grok", "fx", "hermes-unknown"] {
+        for harness in ["pi", "fx", "hermes-unknown"] {
             let (args, degraded) = phase_launch_args(harness, "plan");
             assert!(args.is_empty(), "{harness}: no mechanic -> no args");
             assert!(degraded, "{harness}: plan must degrade");
