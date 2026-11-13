@@ -1551,12 +1551,17 @@ pub(crate) struct ResolvedStepFields {
     pub effort: Option<(String, crate::swarm_plan::Provenance)>,
     pub mode: Option<(String, crate::swarm_plan::Provenance)>,
     pub phase: Option<(String, crate::swarm_plan::Provenance)>,
+    /// The phase that reaches the leaf as `--phase`: the step spec only.
+    pub leaf_phase: Option<(String, crate::swarm_plan::Provenance)>,
 }
 
 /// Resolve one dispatch step's effort/mode/phase through the precedence
 /// step > stage > profile. All inputs are already-rendered strings
 /// (spec `{{inputs.*}}` refs are rendered by the caller); empty counts
-/// as absent. Pure — testable without spawning anything.
+/// as absent. Pure — testable without spawning anything. Stage phase is
+/// reported, never applied: phase flags restrict writes; mode owns write
+/// access — so `phase` feeds `applied` while `leaf_phase` carries only
+/// the spec value to the leaf.
 #[must_use]
 pub(crate) fn resolve_step_fields(
     spec_effort: Option<&str>,
@@ -1577,6 +1582,7 @@ pub(crate) fn resolve_step_fields(
         effort: crate::headless::resolve_dispatch_field(spec_effort, stage_effort, profile_effort),
         mode: crate::headless::resolve_dispatch_field(spec_mode, stage_mode, None),
         phase: crate::headless::resolve_dispatch_field(spec_phase, stage_phase, None),
+        leaf_phase: crate::headless::resolve_dispatch_field(spec_phase, None, None),
     }
 }
 
@@ -1692,7 +1698,7 @@ mod headless_dispatch_args_tests {
             workflow: "wave-swarm",
             json: true,
             harness: None,
-            phase: fields.phase.as_ref().map(|(v, _)| v.as_str()),
+            phase: fields.leaf_phase.as_ref().map(|(v, _)| v.as_str()),
             effort: None,
             mode: fields.mode.as_ref().map(|(v, _)| v.as_str()),
             cron: None,
@@ -1703,9 +1709,12 @@ mod headless_dispatch_args_tests {
             "leaf argv carries stage mode: {argv:?}"
         );
         assert!(
-            argv.windows(2).any(|w| w == ["--phase", "review"]),
-            "leaf argv carries stage phase: {argv:?}"
+            !argv.iter().any(|a| a == "--phase"),
+            "stage phase stays out of the leaf: {argv:?}"
         );
+        let applied = applied_json(&None, &fields.mode, &fields.phase);
+        assert_eq!(applied["phase"]["value"], "review");
+        assert_eq!(applied["phase"]["from"], "stage");
     }
 
     /// The `applied` block reports what the leaf actually received, with
@@ -1721,6 +1730,66 @@ mod headless_dispatch_args_tests {
         assert_eq!(v["effort"]["from"], "stage");
         assert!(v["mode"].is_null(), "{v}");
         assert_eq!(v["phase"]["from"], "stage");
+    }
+
+    /// ADR-0022 (bd-2hh0h rework): a stage phase is reported, never
+    /// applied. plan-polish carries phase plan, but the leaf argv must not
+    /// contain --phase (plan-mode flags are read-only and would stop the
+    /// polish loop from revising beads); applied.phase still shows it.
+    #[test]
+    fn dispatch_stage_phase_is_reported_never_applied() {
+        let lib = crate::stages::StageLibrary::compiled_in();
+        let stage = lib.get_stage("plan-polish").expect("seed stage");
+        assert_eq!(stage.phase.as_deref(), Some("plan"));
+        let fields = resolve_step_fields(None, None, None, Some(stage), "low");
+        let argv = headless_leaf_argv(&HeadlessLeafArgs {
+            profile_name: "coder",
+            prompt: "do it",
+            workflow: "wave-swarm",
+            json: true,
+            harness: None,
+            phase: fields.leaf_phase.as_ref().map(|(v, _)| v.as_str()),
+            effort: None,
+            mode: None,
+            cron: None,
+            model: None,
+        });
+        assert!(
+            !argv.iter().any(|a| a == "--phase"),
+            "stage phase must not reach the leaf: {argv:?}"
+        );
+        let applied = applied_json(&fields.effort, &fields.mode, &fields.phase);
+        assert_eq!(applied["phase"]["value"], "plan");
+        assert_eq!(applied["phase"]["from"], "stage");
+        assert_eq!(applied["effort"]["value"], "max");
+    }
+
+    /// Spec phase keeps the prior behaviour: it still reaches the leaf.
+    #[test]
+    fn dispatch_spec_phase_still_reaches_leaf() {
+        let lib = crate::stages::StageLibrary::compiled_in();
+        let stage = lib.get_stage("plan-polish").expect("seed stage");
+        let fields = resolve_step_fields(None, Some("plan"), None, Some(stage), "");
+        assert_eq!(
+            fields.leaf_phase,
+            Some(("plan".to_string(), Provenance::Step))
+        );
+        let argv = headless_leaf_argv(&HeadlessLeafArgs {
+            profile_name: "coder",
+            prompt: "do it",
+            workflow: "wave-swarm",
+            json: true,
+            harness: None,
+            phase: fields.leaf_phase.as_ref().map(|(v, _)| v.as_str()),
+            effort: None,
+            mode: None,
+            cron: None,
+            model: None,
+        });
+        assert!(
+            argv.windows(2).any(|w| w == ["--phase", "plan"]),
+            "spec phase keeps prior behaviour: {argv:?}"
+        );
     }
 }
 
@@ -1803,7 +1872,7 @@ pub(crate) fn headless_dispatch(
         workflow: wf_name,
         json: true,
         harness: (!harness.is_empty()).then_some(harness),
-        phase: fields.phase.as_ref().map(|(v, _)| v.as_str()),
+        phase: fields.leaf_phase.as_ref().map(|(v, _)| v.as_str()),
         effort: fields.effort.as_ref().map(|(v, _)| v.as_str()),
         mode: fields.mode.as_ref().map(|(v, _)| v.as_str()),
         cron,
