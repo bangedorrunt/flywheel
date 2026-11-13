@@ -551,18 +551,40 @@ mod tests {
         assert!(reconcile_json("{\"desired\":[]}").is_err());
     }
 
-    fn v9_live(pin: &str, role: &str, harness: &str, idle: bool) -> LiveSeat {
-        LiveSeat {
-            pin: pin.into(),
-            role: role.into(),
-            harness: harness.into(),
-            model: None,
-            mode: None,
-            effort: None,
-            placement: SeatPlacement::Pane,
-            idle,
-            fresh_session: false,
+    fn v9_gen_live(n: usize, reverse: bool) -> Vec<LiveSeat> {
+        const PINS: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        const ROLES: [&str; 3] = ["coder", "reviewer", "planner"];
+        const HARNESSES: [&str; 3] = ["pi", "opencode", "grok"];
+        const MODELS: [Option<&str>; 3] = [None, Some("m1"), Some("m2")];
+        const EFFORTS: [Option<&str>; 2] = [None, Some("max")];
+        const MODES: [Option<&str>; 2] = [None, Some("read-only")];
+        let mut live: Vec<LiveSeat> = (0..n)
+            .map(|i| LiveSeat {
+                pin: PINS[i].into(),
+                role: ROLES[i % 3].into(),
+                harness: HARNESSES[i % 3].into(),
+                model: MODELS[i % 3].map(str::to_string),
+                mode: MODES[i % 2].map(str::to_string),
+                effort: EFFORTS[i % 2].map(str::to_string),
+                placement: if i % 5 == 4 {
+                    SeatPlacement::Headless
+                } else {
+                    SeatPlacement::Pane
+                },
+                idle: i % 2 == 0,
+                fresh_session: false,
+            })
+            .collect();
+        if reverse {
+            live.reverse();
         }
+        live
+    }
+
+    fn v9_sorted(live: &[LiveSeat]) -> Vec<LiveSeat> {
+        let mut sorted = live.to_vec();
+        sorted.sort_by(|a, b| a.pin.cmp(&b.pin));
+        sorted
     }
 
     fn v9_want_from(live: &LiveSeat) -> DesiredSeat {
@@ -579,58 +601,71 @@ mod tests {
     }
 
     #[test]
-    fn seat_reconcile_v9_idempotent_keep_all() {
-        let live = vec![
-            v9_live("a", "coder", "pi", true),
-            v9_live("b", "coder", "opencode", false),
-            v9_live("c", "reviewer", "grok", true),
-            v9_live("d", "reviewer", "pi", false),
-            v9_live("e", "planner", "opencode", true),
-            v9_live("f", "planner", "grok", false),
-        ];
-        let mut want: Vec<DesiredSeat> = live.iter().map(v9_want_from).collect();
-        want[1].model = Some("m1".into());
-        let mut live1 = live.clone();
-        live1[1].model = Some("m1".into());
-        want[2].mode = Some("read-only".into());
-        live1[2].mode = Some("read-only".into());
-        want[3].effort = Some("max".into());
-        live1[3].effort = Some("max".into());
-        want[4].placement = SeatPlacement::Headless;
-        live1[4].placement = SeatPlacement::Headless;
-        let got = reconcile(&want, &live1, &|_| false);
-        assert_eq!(got.len(), live1.len(), "one effect per seat");
-        assert!(
-            got.iter().all(|e| matches!(e, SeatEffect::Keep { .. })),
-            "idempotent yields only Keeps: {got:?}"
-        );
-        let keeps: Vec<&str> = got
-            .iter()
-            .filter_map(|e| match e {
-                SeatEffect::Keep { pin } => Some(pin.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(keeps.len(), live1.len());
+    fn seat_reconcile_v9_generated_idempotent_keep_all() {
+        let mut cases = 0;
+        for n in 0..=8usize {
+            for reverse in [false, true] {
+                let live = v9_gen_live(n, reverse);
+                let canon = v9_sorted(&live);
+                for env in [false, true] {
+                    let by_env = move |_: &str| env;
+                    let want_pinned: Vec<DesiredSeat> = live.iter().map(v9_want_from).collect();
+                    let got = reconcile(&want_pinned, &live, &by_env);
+                    assert_eq!(
+                        got.len(),
+                        n,
+                        "one effect per seat (pinned n={n} rev={reverse} env={env})"
+                    );
+                    assert!(
+                        got.iter().all(|e| matches!(e, SeatEffect::Keep { .. })),
+                        "pinned idempotent Keeps only (n={n} rev={reverse} env={env}): {got:?}"
+                    );
+                    cases += 1;
+                    let want_unpinned: Vec<DesiredSeat> = canon
+                        .iter()
+                        .map(|s| {
+                            let mut w = v9_want_from(s);
+                            w.pin = None;
+                            w
+                        })
+                        .collect();
+                    let got = reconcile(&want_unpinned, &live, &by_env);
+                    assert_eq!(
+                        got.len(),
+                        n,
+                        "one effect per seat (unpinned n={n} rev={reverse} env={env})"
+                    );
+                    assert!(
+                        got.iter().all(|e| matches!(e, SeatEffect::Keep { .. })),
+                        "unpinned idempotent Keeps only (n={n} rev={reverse} env={env}): {got:?}"
+                    );
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 72, "9 sizes x 2 orders x 2 env x pinned/unpinned");
     }
 
     #[test]
-    fn seat_reconcile_v9_one_field_change_one_effect() {
-        let live = vec![
-            v9_live("a", "coder", "pi", true),
-            v9_live("b", "coder", "pi", true),
-        ];
-        let mut want: Vec<DesiredSeat> = live.iter().map(v9_want_from).collect();
-        want[1].model = Some("m2".into());
-        let got = reconcile(&want, &live, &|_| false);
-        let non_keep: Vec<&SeatEffect> = got
-            .iter()
-            .filter(|e| !matches!(e, SeatEffect::Keep { .. }))
-            .collect();
-        assert_eq!(non_keep.len(), 1, "exactly one non-Keep: {got:?}");
-        assert!(matches!(
-            non_keep[0],
-            SeatEffect::Relaunch { pin, .. } if pin == "b"
-        ));
+    fn seat_reconcile_v9_generated_converse_one_non_keep() {
+        let mut cases = 0;
+        for n in 1..=8usize {
+            let live = v9_gen_live(n, false);
+            let mut want: Vec<DesiredSeat> = live.iter().map(v9_want_from).collect();
+            if want[0].model.is_none() {
+                want[0].model = Some("mX".into());
+            } else {
+                want[0].model = None;
+            }
+            assert_ne!(want[0].model, live[0].model);
+            let got = reconcile(&want, &live, &|_: &str| false);
+            let non_keep: Vec<&SeatEffect> = got
+                .iter()
+                .filter(|e| !matches!(e, SeatEffect::Keep { .. }))
+                .collect();
+            assert_eq!(non_keep.len(), 1, "exactly one non-Keep (n={n}): {got:?}");
+            cases += 1;
+        }
+        assert_eq!(cases, 8);
     }
 }
