@@ -597,6 +597,7 @@ pub fn assemble(
 /// open/loop label (crew-confirm is skipped for open — invent headless
 /// `workflow run wave-swarm` would auto-dispatch).
 pub fn align_with_session_topology(b: &mut Briefing, session: &str, sticky_held: bool) {
+    let catalog = crate::workflow_catalog::WorkflowCatalog::load_layered(None).unwrap_or_default();
     let session = session.trim();
     if session.is_empty() {
         return;
@@ -612,7 +613,7 @@ pub fn align_with_session_topology(b: &mut Briefing, session: &str, sticky_held:
                 b.proposal.why =
                     format!("session_topology={session} sticky-held — invent vehicle suppressed");
             }
-            rewrite_sticky_held_argv(b, session);
+            rewrite_sticky_held_argv(b, session, &catalog);
         }
         return;
     }
@@ -638,20 +639,17 @@ pub fn align_with_session_topology(b: &mut Briefing, session: &str, sticky_held:
         if sticky_held { " sticky-held" } else { "" },
     );
     if sticky_held {
-        rewrite_sticky_held_argv(b, session);
+        rewrite_sticky_held_argv(b, session, &catalog);
     }
 }
 
 /// Invent spawn / compose / join / loop vehicles suppressed under sticky-open.
-fn is_invent_spawn_under_open(workflow: &str) -> bool {
+fn is_invent_spawn_under_open(
+    workflow: &str,
+    catalog: &crate::workflow_catalog::WorkflowCatalog,
+) -> bool {
     let w = workflow.trim();
-    w.is_empty()
-        || w == "none"
-        || w == "join"
-        || w == "loop-work"
-        || crate::workflow_catalog::WorkflowCatalog::load_layered(None)
-            .unwrap_or_default()
-            .is_compose_token(w)
+    w.is_empty() || w == "none" || w == "join" || w == "loop-work" || catalog.is_compose_token(w)
 }
 
 /// Rewrite commit argv to the held session vehicle; clear invent swarm surfaces.
@@ -660,11 +658,16 @@ fn is_invent_spawn_under_open(workflow: &str) -> bool {
 /// workflow or `workflow run <invent> --mode headless` argv under an open
 /// label — crew-confirm is skipped for open, so that would invent-green spawn.
 /// Fail-closed: empty argv (commit bails) + workflow cleared to `none`.
-fn rewrite_sticky_held_argv(b: &mut Briefing, session: &str) {
+fn rewrite_sticky_held_argv(
+    b: &mut Briefing,
+    session: &str,
+    catalog: &crate::workflow_catalog::WorkflowCatalog,
+) {
     match session {
         "open" => {
             debug_assert!(
-                is_invent_spawn_under_open(&b.proposal.workflow) || !b.proposal.workflow.is_empty(),
+                is_invent_spawn_under_open(&b.proposal.workflow, catalog)
+                    || !b.proposal.workflow.is_empty(),
                 "sticky-held open expected a classified vehicle, got workflow={} argv={:?}",
                 b.proposal.workflow,
                 b.proposal.argv
