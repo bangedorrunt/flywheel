@@ -161,9 +161,7 @@ fn is_live_pid(pid: u64) -> bool {
 }
 
 /// Doorbell health-check target (ADR-0020): explicit `DOORBELL_URL` only.
-/// `None` skips the probe (embedded/supervise path). The retired
-/// `:18980` default is gone: toron `:18080` does not serve doorbell
-/// routes yet, so probing a default warned on every run.
+/// `None` skips the probe (embedded/supervise path).
 fn doorbell_url() -> Option<String> {
     std::env::var("DOORBELL_URL").ok().filter(|s| !s.is_empty())
 }
