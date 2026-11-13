@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::parse_idle_retire_after;
 use crate::seat_binder::{LiveSeat, SeatPlacement};
 
 /// Desired seat.
@@ -59,6 +60,12 @@ pub enum SeatEffect {
     RetireAfterTurn {
         pin: String,
     },
+    /// Idle past `idle_retire_after`: pin and reservations kept (SeatMachine
+    /// `IdleTimeout` edge). Distinct from count-driven `Retire` so the
+    /// journal says why.
+    RetireIdle {
+        pin: String,
+    },
 }
 
 fn diff_fields(desired: &DesiredSeat, live: &LiveSeat) -> Vec<String> {
@@ -84,6 +91,55 @@ fn same_except_role(desired: &DesiredSeat, live: &LiveSeat) -> bool {
         && desired.effort == live.effort
         && desired.mode == live.mode
         && desired.placement == live.placement
+}
+
+/// Policy for idle retirement (ADR-0022 D7). The clock comes in through
+/// `now_ms`; the reconciler never reads it itself.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReconcilePolicy {
+    /// Retire an idle seat this long idle, in ms. `None` (absent) = never.
+    pub idle_retire_after_ms: Option<u64>,
+    /// Wall clock, ms since epoch, supplied by the edge.
+    pub now_ms: u64,
+}
+
+fn idle_retire_due(seat: &LiveSeat, policy: &ReconcilePolicy) -> bool {
+    match (policy.idle_retire_after_ms, seat.idle_since_ms) {
+        (Some(after), Some(since)) => seat.idle && policy.now_ms.saturating_sub(since) >= after,
+        _ => false,
+    }
+}
+
+/// Idle retirement keeps pin and reservations (SeatMachine `IdleTimeout`
+/// edge), unlike count-driven `Retire`. The plan wins: a seat that would
+/// otherwise retire-idle is kept when retiring it would leave its role with
+/// zero live seats while the plan still wants that role.
+fn apply_idle_retire(
+    effect: SeatEffect,
+    seat: &LiveSeat,
+    role: &str,
+    policy: &ReconcilePolicy,
+    desired_count: &BTreeMap<&str, usize>,
+    live_count: &BTreeMap<&str, usize>,
+    retiring_count: &mut BTreeMap<String, usize>,
+) -> SeatEffect {
+    if !matches!(effect, SeatEffect::Keep { .. }) || !idle_retire_due(seat, policy) {
+        return effect;
+    }
+    let wanted = desired_count.get(role).copied().unwrap_or(0);
+    let remaining = live_count
+        .get(role)
+        .copied()
+        .unwrap_or(0)
+        .saturating_sub(retiring_count.get(role).copied().unwrap_or(0));
+    if wanted > 0 && remaining <= 1 {
+        return effect;
+    }
+    *retiring_count.entry(role.to_string()).or_default() += 1;
+    match effect {
+        SeatEffect::Keep { pin } => SeatEffect::RetireIdle { pin },
+        other => other,
+    }
 }
 
 fn decide_one(
@@ -171,16 +227,32 @@ fn decide_one(
 
 /// Pure fold: diff desired against live, cheapest effect the adapter allows.
 /// Deterministic by role then pin; never borrows another role.
+///
+/// Idle retirement (ADR-0022 D7): a seat that would otherwise be `Keep`
+/// becomes `RetireIdle` when it is idle and `now_ms - idle_since_ms >=
+/// `idle_retire_after_ms`. The plan wins: the conversion is skipped when it
+/// would leave the seat's role with zero live seats while desired still
+/// wants that role (pin and reservations are kept either way).
 pub fn reconcile(
     desired: &[DesiredSeat],
     live: &[LiveSeat],
     model_by_env: &dyn Fn(&str) -> bool,
+    policy: &ReconcilePolicy,
 ) -> Vec<SeatEffect> {
     let mut live_by_pin: BTreeMap<&str, &LiveSeat> = BTreeMap::new();
     for seat in live {
         live_by_pin.insert(seat.pin.as_str(), seat);
     }
     let mut used_live: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut desired_count: BTreeMap<&str, usize> = BTreeMap::new();
+    for want in desired {
+        *desired_count.entry(want.role.as_str()).or_default() += 1;
+    }
+    let mut live_count: BTreeMap<&str, usize> = BTreeMap::new();
+    for seat in live {
+        *live_count.entry(seat.role.as_str()).or_default() += 1;
+    }
+    let mut retiring_count: BTreeMap<String, usize> = BTreeMap::new();
     let mut effects: Vec<(String, String, SeatEffect)> = Vec::new();
 
     let mut desired_no_pin_by_role: BTreeMap<String, Vec<&DesiredSeat>> = BTreeMap::new();
@@ -188,7 +260,15 @@ pub fn reconcile(
         if let Some(pin) = &want.pin {
             if let Some(got) = live_by_pin.get(pin.as_str()) {
                 used_live.insert(pin.clone());
-                let effect = decide_one(want, got, model_by_env);
+                let effect = apply_idle_retire(
+                    decide_one(want, got, model_by_env),
+                    got,
+                    &want.role,
+                    policy,
+                    &desired_count,
+                    &live_count,
+                    &mut retiring_count,
+                );
                 effects.push((want.role.clone(), pin.clone(), effect));
             } else {
                 effects.push((
@@ -254,12 +334,21 @@ pub fn reconcile(
                 .collect();
             remaining.sort_by(|a, b| a.pin.cmp(&b.pin));
             for i in 0..wants.len() {
-                let effect = decide_one(wants[i], remaining[i], model_by_env);
+                let effect = apply_idle_retire(
+                    decide_one(wants[i], remaining[i], model_by_env),
+                    remaining[i],
+                    &role,
+                    policy,
+                    &desired_count,
+                    &live_count,
+                    &mut retiring_count,
+                );
                 effects.push((role.clone(), remaining[i].pin.clone(), effect));
                 used_live.insert(remaining[i].pin.clone());
             }
             let mut pins: Vec<String> = retire_pins.into_iter().collect();
             pins.sort();
+            *retiring_count.entry(role.clone()).or_default() += pins.len();
             effects.push((
                 role.clone(),
                 pins.first().cloned().unwrap_or_default(),
@@ -269,7 +358,15 @@ pub fn reconcile(
         }
         let paired = wants.len().min(haves.len());
         for i in 0..paired {
-            let effect = decide_one(wants[i], haves[i], model_by_env);
+            let effect = apply_idle_retire(
+                decide_one(wants[i], haves[i], model_by_env),
+                haves[i],
+                &role,
+                policy,
+                &desired_count,
+                &live_count,
+                &mut retiring_count,
+            );
             effects.push((role.clone(), haves[i].pin.clone(), effect));
             used_live.insert(haves[i].pin.clone());
         }
@@ -294,6 +391,10 @@ pub fn reconcile(
 struct ReconcileRequest {
     desired: Vec<DesiredSeat>,
     live: Vec<LiveSeat>,
+    #[serde(default)]
+    now_ms: Option<u64>,
+    #[serde(default)]
+    idle_retire_after: Option<String>,
 }
 
 pub fn reconcile_json(input: &str) -> anyhow::Result<String> {
@@ -304,7 +405,17 @@ pub fn reconcile_json(input: &str) -> anyhow::Result<String> {
             crate::headless::InteractiveModelPlan::PinnedByEnv { .. }
         )
     };
-    let effects = reconcile(&req.desired, &req.live, &by_env);
+    let after_ms = req
+        .idle_retire_after
+        .as_deref()
+        .map(parse_idle_retire_after)
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
+    let policy = ReconcilePolicy {
+        idle_retire_after_ms: after_ms.map(|d| d.as_millis() as u64),
+        now_ms: req.now_ms.unwrap_or(0),
+    };
+    let effects = reconcile(&req.desired, &req.live, &by_env, &policy);
     Ok(serde_json::to_string(&effects)?)
 }
 
@@ -324,6 +435,7 @@ mod tests {
             placement: SeatPlacement::Pane,
             idle,
             fresh_session: false,
+            idle_since_ms: None,
         }
     }
 
@@ -354,7 +466,7 @@ mod tests {
         let mut want = want("coder");
         want.harness = "h".to_string();
         assert_eq!(
-            reconcile(&[want], &live, &argv),
+            reconcile(&[want], &live, &argv, &ReconcilePolicy::default()),
             vec![SeatEffect::Keep {
                 pin: "a".to_string()
             }]
@@ -369,7 +481,7 @@ mod tests {
         want.harness = "pi".to_string();
         want.model = Some("m2".to_string());
         assert_eq!(
-            reconcile(&[want], &[live], &argv),
+            reconcile(&[want], &[live], &argv, &ReconcilePolicy::default()),
             vec![SeatEffect::Relaunch {
                 pin: "a".to_string(),
                 fields: vec!["model".to_string()]
@@ -385,7 +497,7 @@ mod tests {
         want.harness = "opencode".to_string();
         want.model = Some("m2".to_string());
         assert_eq!(
-            reconcile(&[want], &[live], &env),
+            reconcile(&[want], &[live], &env, &ReconcilePolicy::default()),
             vec![SeatEffect::Respawn {
                 pin: "a".to_string(),
                 fields: vec!["model".to_string()],
@@ -400,7 +512,7 @@ mod tests {
         let mut want = want("coder");
         want.harness = "opencode".to_string();
         assert_eq!(
-            reconcile(&[want], &[live], &argv),
+            reconcile(&[want], &[live], &argv, &ReconcilePolicy::default()),
             vec![SeatEffect::Respawn {
                 pin: "a".to_string(),
                 fields: vec!["harness".to_string()],
@@ -417,7 +529,7 @@ mod tests {
         want.pin = Some("a".to_string());
         want.context_warm_allowed = true;
         assert_eq!(
-            reconcile(&[want], &[live], &argv),
+            reconcile(&[want], &[live], &argv, &ReconcilePolicy::default()),
             vec![SeatEffect::InjectRole {
                 pin: "a".to_string(),
                 role: "reviewer".to_string()
@@ -433,7 +545,7 @@ mod tests {
         want.pin = Some("a".to_string());
         want.context_warm_allowed = false;
         assert_eq!(
-            reconcile(&[want], &[live], &argv),
+            reconcile(&[want], &[live], &argv, &ReconcilePolicy::default()),
             vec![SeatEffect::Respawn {
                 pin: "a".to_string(),
                 fields: vec!["role".to_string()],
@@ -446,7 +558,7 @@ mod tests {
     fn seat_reconcile_count_plus_two_spawns_two() {
         let live = vec![live("a", "coder", "h", true)];
         let wants = vec![want("coder"), want("coder"), want("coder")];
-        let got = reconcile(&wants, &live, &argv);
+        let got = reconcile(&wants, &live, &argv, &ReconcilePolicy::default());
         assert!(got.iter().any(|e| matches!(
             e,
             SeatEffect::Spawn { role, count } if role == "coder" && *count == 2
@@ -461,7 +573,7 @@ mod tests {
         ];
         let wants = vec![want("coder")];
         assert_eq!(
-            reconcile(&wants, &live, &argv),
+            reconcile(&wants, &live, &argv, &ReconcilePolicy::default()),
             vec![
                 SeatEffect::Keep {
                     pin: "a".to_string()
@@ -481,7 +593,7 @@ mod tests {
         ];
         let wants = vec![want("coder")];
         assert_eq!(
-            reconcile(&wants, &live, &argv),
+            reconcile(&wants, &live, &argv, &ReconcilePolicy::default()),
             vec![
                 SeatEffect::Retire {
                     pins: vec!["a".to_string()]
@@ -501,7 +613,7 @@ mod tests {
         want.harness = "h".to_string();
         want.placement = SeatPlacement::Headless;
         assert_eq!(
-            reconcile(&[want], &[got], &argv),
+            reconcile(&[want], &[got], &argv, &ReconcilePolicy::default()),
             vec![SeatEffect::RetireAfterTurn {
                 pin: "a".to_string()
             }]
@@ -515,7 +627,7 @@ mod tests {
         let mut want = want("coder");
         want.harness = "opencode".to_string();
         want.model = Some("m2".to_string());
-        let got = reconcile(&[want], &[live], &argv);
+        let got = reconcile(&[want], &[live], &argv, &ReconcilePolicy::default());
         assert_eq!(got.len(), 1);
         assert!(matches!(got[0], SeatEffect::Respawn { .. }));
     }
@@ -524,8 +636,13 @@ mod tests {
     fn seat_reconcile_order_deterministic_shuffled() {
         let live = vec![live("b", "coder", "h", true), live("a", "coder", "h", true)];
         let wants = vec![want("coder"), want("coder")];
-        let ab = reconcile(&wants, &live, &argv);
-        let ba = reconcile(&wants, &vec![live[1].clone(), live[0].clone()], &argv);
+        let ab = reconcile(&wants, &live, &argv, &ReconcilePolicy::default());
+        let ba = reconcile(
+            &wants,
+            &vec![live[1].clone(), live[0].clone()],
+            &argv,
+            &ReconcilePolicy::default(),
+        );
         assert_eq!(ab, ba);
     }
 
@@ -573,6 +690,7 @@ mod tests {
                 },
                 idle: i % 2 == 0,
                 fresh_session: false,
+                idle_since_ms: None,
             })
             .collect();
         if reverse {
@@ -610,7 +728,7 @@ mod tests {
                 for env in [false, true] {
                     let by_env = move |_: &str| env;
                     let want_pinned: Vec<DesiredSeat> = live.iter().map(v9_want_from).collect();
-                    let got = reconcile(&want_pinned, &live, &by_env);
+                    let got = reconcile(&want_pinned, &live, &by_env, &ReconcilePolicy::default());
                     assert_eq!(
                         got.len(),
                         n,
@@ -629,7 +747,8 @@ mod tests {
                             w
                         })
                         .collect();
-                    let got = reconcile(&want_unpinned, &live, &by_env);
+                    let got =
+                        reconcile(&want_unpinned, &live, &by_env, &ReconcilePolicy::default());
                     assert_eq!(
                         got.len(),
                         n,
@@ -658,7 +777,7 @@ mod tests {
                 want[0].model = None;
             }
             assert_ne!(want[0].model, live[0].model);
-            let got = reconcile(&want, &live, &|_: &str| false);
+            let got = reconcile(&want, &live, &|_: &str| false, &ReconcilePolicy::default());
             let non_keep: Vec<&SeatEffect> = got
                 .iter()
                 .filter(|e| !matches!(e, SeatEffect::Keep { .. }))
@@ -667,5 +786,196 @@ mod tests {
             cases += 1;
         }
         assert_eq!(cases, 8);
+    }
+
+    fn idle_live(pin: &str, idle: bool, idle_since_ms: Option<u64>) -> LiveSeat {
+        LiveSeat {
+            pin: pin.into(),
+            role: "coder".into(),
+            harness: "pi".into(),
+            model: None,
+            mode: None,
+            effort: None,
+            placement: SeatPlacement::Pane,
+            idle,
+            fresh_session: false,
+            idle_since_ms,
+        }
+    }
+
+    fn idle_policy(after_ms: Option<u64>, now_ms: u64) -> ReconcilePolicy {
+        ReconcilePolicy {
+            idle_retire_after_ms: after_ms,
+            now_ms,
+        }
+    }
+
+    fn idle_want(pin: &str) -> DesiredSeat {
+        DesiredSeat {
+            pin: Some(pin.into()),
+            role: "coder".into(),
+            harness: "pi".into(),
+            model: None,
+            effort: None,
+            mode: None,
+            placement: SeatPlacement::Pane,
+            context_warm_allowed: true,
+        }
+    }
+
+    #[test]
+    fn idle_retire_past_threshold_gives_retire_idle() {
+        let live = vec![
+            idle_live("a", true, Some(0)),
+            idle_live("b", false, Some(0)),
+        ];
+        let want = vec![idle_want("a"), idle_want("b")];
+        let got = reconcile(
+            &want,
+            &live,
+            &|_: &str| false,
+            &idle_policy(Some(600_000), 600_001),
+        );
+        assert_eq!(
+            got,
+            vec![
+                SeatEffect::RetireIdle {
+                    pin: "a".to_string()
+                },
+                SeatEffect::Keep {
+                    pin: "b".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn idle_retire_at_threshold_retires() {
+        let live = vec![
+            idle_live("a", true, Some(1)),
+            idle_live("b", false, Some(0)),
+        ];
+        let want = vec![idle_want("a"), idle_want("b")];
+        let got = reconcile(&want, &live, &|_: &str| false, &idle_policy(Some(600), 601));
+        assert_eq!(
+            got,
+            vec![
+                SeatEffect::RetireIdle {
+                    pin: "a".to_string()
+                },
+                SeatEffect::Keep {
+                    pin: "b".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn idle_retire_below_threshold_keeps() {
+        let live = vec![idle_live("a", true, Some(600_000))];
+        let want = vec![idle_want("a")];
+        let got = reconcile(
+            &want,
+            &live,
+            &|_: &str| false,
+            &idle_policy(Some(600_000), 600_001),
+        );
+        assert_eq!(
+            got,
+            vec![SeatEffect::Keep {
+                pin: "a".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn idle_retire_busy_keeps_despite_idle_time() {
+        let live = vec![
+            idle_live("a", false, Some(0)),
+            idle_live("b", false, Some(0)),
+        ];
+        let want = vec![idle_want("a"), idle_want("b")];
+        let got = reconcile(
+            &want,
+            &live,
+            &|_: &str| false,
+            &idle_policy(Some(600_000), 600_001),
+        );
+        assert_eq!(
+            got,
+            vec![
+                SeatEffect::Keep {
+                    pin: "a".to_string()
+                },
+                SeatEffect::Keep {
+                    pin: "b".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn idle_retire_absent_config_never_retires() {
+        let live = vec![idle_live("a", true, Some(0))];
+        let want = vec![idle_want("a")];
+        let got = reconcile(&want, &live, &|_: &str| false, &idle_policy(None, 999_999));
+        assert_eq!(
+            got,
+            vec![SeatEffect::Keep {
+                pin: "a".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn idle_retire_plan_wanted_role_kept_despite_idle() {
+        let live = vec![idle_live("a", true, Some(0))];
+        let want = vec![idle_want("a")];
+        let got = reconcile(&want, &live, &|_: &str| false, &idle_policy(Some(0), 1));
+        assert_eq!(
+            got,
+            vec![SeatEffect::Keep {
+                pin: "a".to_string()
+            }],
+            "plan still wants the role: keep, never strand it"
+        );
+    }
+
+    #[test]
+    fn idle_retire_invalid_config_fails_parse() {
+        assert!(parse_idle_retire_after("ten minutes").is_err());
+        assert_eq!(
+            parse_idle_retire_after("10m").expect("valid duration"),
+            std::time::Duration::from_secs(600)
+        );
+    }
+
+    #[test]
+    fn idle_retire_probe_json_round_trip() {
+        let live = vec![
+            idle_live("a", true, Some(0)),
+            idle_live("b", false, Some(0)),
+        ];
+        let want = vec![idle_want("a"), idle_want("b")];
+        let input = serde_json::json!({
+            "desired": want,
+            "live": live,
+            "now_ms": 600_001u64,
+            "idle_retire_after": "10m",
+        })
+        .to_string();
+        let out = reconcile_json(&input).expect("probe binds");
+        let effects: Vec<SeatEffect> = serde_json::from_str(&out).expect("parses");
+        assert_eq!(
+            effects,
+            vec![
+                SeatEffect::RetireIdle {
+                    pin: "a".to_string()
+                },
+                SeatEffect::Keep {
+                    pin: "b".to_string()
+                },
+            ]
+        );
     }
 }

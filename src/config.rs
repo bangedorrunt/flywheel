@@ -373,6 +373,10 @@ pub struct Config {
     /// (`ask = "on-change"`, budget 5.0, no signoff).
     #[serde(default)]
     pub consent: Option<ConsentSection>,
+    /// `[swarm]` (ADR-0022 D7): `idle_retire_after = "10m"` retires a seat
+    /// idle this long, keeping its pin and reservations. Absent means never.
+    #[serde(default)]
+    pub swarm: Option<SwarmSection>,
 }
 
 /// `[comms]`. Absent `inbox_log` means on. `false` opts out.
@@ -402,6 +406,46 @@ pub struct ConsentSection {
     pub ask: Option<crate::swarm_plan::ConsentAsk>,
     pub budget_usd_per_mtok: Option<f64>,
     pub signoff: Option<String>,
+}
+
+/// `[swarm] idle_retire_after` (ADR-0022 D7): how long a seat may sit idle
+/// before the reconciler retires it with its pin and reservations kept.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SwarmSection {
+    pub idle_retire_after: Option<String>,
+}
+
+/// Parse `[swarm] idle_retire_after` values like `"500ms"`, `"30s"`,
+/// `"10m"`, `"2h"`, `"1d"`. Anything else fails loud.
+pub fn parse_idle_retire_after(raw: &str) -> Result<std::time::Duration, String> {
+    let s = raw.trim();
+    let (digits, factor_ms): (&str, u64) = if let Some(n) = s.strip_suffix("ms") {
+        (n, 1)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, 1_000)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60_000)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 3_600_000)
+    } else if let Some(n) = s.strip_suffix('d') {
+        (n, 86_400_000)
+    } else {
+        return Err(format!(
+            "invalid idle_retire_after {raw:?}: expected <n>ms|s|m|h|d"
+        ));
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "invalid idle_retire_after {raw:?}: expected <n>ms|s|m|h|d"
+        ));
+    }
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| format!("invalid idle_retire_after {raw:?}: number too large"))?;
+    let ms = n
+        .checked_mul(factor_ms)
+        .ok_or_else(|| format!("invalid idle_retire_after {raw:?}: duration overflows"))?;
+    Ok(std::time::Duration::from_millis(ms))
 }
 
 /// Parent-death policy for the captain (ADR-0025 Spec 4, Wave 4a).
@@ -599,6 +643,17 @@ impl Config {
         }
     }
 
+    /// ADR-0022 D7 idle retirement (`[swarm] idle_retire_after`): the parsed
+    /// duration, `None` when the section or the knob is absent (never retire).
+    /// An invalid value fails parse loud.
+    pub fn idle_retire_after(&self) -> Result<Option<std::time::Duration>, String> {
+        self.swarm
+            .as_ref()
+            .and_then(|s| s.idle_retire_after.as_deref())
+            .map(parse_idle_retire_after)
+            .transpose()
+    }
+
     pub fn load() -> Result<Self> {
         let _ = dotenvy::dotenv();
         let xdg = config_file();
@@ -617,6 +672,9 @@ impl Config {
         } else {
             Self::default()
         };
+        if let Err(e) = cfg.idle_retire_after() {
+            anyhow::bail!("invalid [swarm] idle_retire_after: {e}");
+        }
         if let Ok(v) = std::env::var("FLYWHEEL_SOCKET") {
             cfg.socket_path = Some(v);
         }
@@ -1281,6 +1339,19 @@ signoff = "witness"
         };
         assert_eq!(p.violation("run rm -rf /"), Some("rm -rf"));
         assert_eq!(p.violation("refactor the auth layer"), None);
+    }
+
+    #[test]
+    fn swarm_idle_retire_after_parses() {
+        let c: Config = toml::from_str("[swarm]\nidle_retire_after = \"10m\"\n").unwrap();
+        assert_eq!(
+            c.idle_retire_after().unwrap(),
+            Some(std::time::Duration::from_secs(600))
+        );
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.idle_retire_after().unwrap(), None);
+        let c: Config = toml::from_str("[swarm]\nidle_retire_after = \"ten minutes\"\n").unwrap();
+        assert!(c.idle_retire_after().is_err());
     }
 
     #[test]

@@ -48,6 +48,10 @@ pub struct LiveSeat {
     pub idle: bool,
     /// The harness can start a new session in the same pane.
     pub fresh_session: bool,
+    /// Last time the seat went idle, ms since epoch. Absent = unknown,
+    /// so `__bind-seat` / `__reconcile-seats` input stays compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_since_ms: Option<u64>,
 }
 
 /// Binder policy.
@@ -235,6 +239,7 @@ mod tests {
             placement: SeatPlacement::Pane,
             idle,
             fresh_session: fresh,
+            idle_since_ms: None,
         }
     }
 
@@ -318,6 +323,7 @@ mod tests {
             placement: SeatPlacement::Pane,
             idle: false,
             fresh_session: false,
+            idle_since_ms: None,
         }];
         assert_eq!(bind(&need, &seats, &policy(5, true)), Binding::Headless);
     }
@@ -335,6 +341,7 @@ mod tests {
             placement: SeatPlacement::Pane,
             idle: false,
             fresh_session: false,
+            idle_since_ms: None,
         }];
         assert_eq!(bind(&need, &seats, &policy(2, false)), Binding::Spawn);
     }
@@ -375,6 +382,7 @@ mod tests {
             placement: SeatPlacement::Pane,
             idle: true,
             fresh_session: false,
+            idle_since_ms: None,
         }];
         assert_eq!(
             bind(&need, &seats, &policy(5, false)),
@@ -402,6 +410,7 @@ mod tests {
             placement: SeatPlacement::Pane,
             idle: false,
             fresh_session: false,
+            idle_since_ms: None,
         }];
         assert_eq!(
             bind(&need, &seats, &policy(1, false)),
