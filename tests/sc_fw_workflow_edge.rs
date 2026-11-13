@@ -273,6 +273,9 @@ async fn sc_fw_absorbed_legacy_workflow_round_trips_through_engine() {
                     }))
                     .expect("legacy spec parses"),
                     channel: None,
+                    await_: None,
+                    no_claim_timeout: 600,
+                    result_timeout: None,
                 },
             },
             Step {
