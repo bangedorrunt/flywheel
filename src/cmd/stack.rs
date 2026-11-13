@@ -136,14 +136,6 @@ fn probe_bin(name: &'static str) -> BinaryProbe {
 /// The generation hash is SHA-1 over the first 8 KiB of the flywheel binary
 /// (`doorbell::binary_hash`); only live hosts with a different non-empty hash
 /// need replacement.
-fn is_live_pid(pid: u64) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
 fn stale_host_pids(health: &Value, installed_hash: &str) -> Vec<u64> {
     health
         .get("hosts")
@@ -160,6 +152,14 @@ fn stale_host_pids(health: &Value, installed_hash: &str) -> Vec<u64> {
         .filter_map(|host| host.get("pid").and_then(Value::as_u64))
         .filter(|pid| *pid > 1)
         .collect()
+}
+
+fn is_live_pid(pid: u64) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn doorbell_url() -> String {
