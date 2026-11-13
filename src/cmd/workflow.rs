@@ -2044,6 +2044,7 @@ fn project_workflow_names(root: &Path) -> BTreeSet<String> {
 
 fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> Result<()> {
     use crate::elm::p2p_negotiation::{P2PNegotiationState, build_p2p_negotiation_machine};
+    use crate::elm::seat_statechart::{SeatState, build_seat_machine};
     use crate::elm::swarm_statechart::build_swarm_machine;
     use toron_core::kernel::StateNodeType;
 
@@ -2082,6 +2083,28 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
         )
     }
 
+    fn verify_seat(export_tla: bool) -> WorkflowVerifyChartReport {
+        use toron_core::kernel::StateNodeType;
+        let machine = build_seat_machine();
+        let topology = machine.topology();
+        let is_final = |state: &_| {
+            topology
+                .nodes
+                .get(state)
+                .is_some_and(|node| node.node_type == StateNodeType::Final)
+        };
+        chart_report(
+            "Seat",
+            &topology,
+            "a final state",
+            is_final,
+            export_tla.then(|| machine.to_tla_named("Seat")),
+            None,
+            &[],
+            &[],
+        )
+    }
+
     let want_all = name.is_none();
     let want = name.unwrap_or("").to_ascii_lowercase();
     let mut reports = Vec::new();
@@ -2095,6 +2118,14 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
     }
     if want_all || matches!(want.as_str(), "p2p" | "p2p-negotiation" | "p2pnegotiation") {
         reports.push(verify_p2p(export_tla));
+    }
+    if want_all
+        || matches!(
+            want.as_str(),
+            "seat" | "seat-statechart" | "seatstatechart"
+        )
+    {
+        reports.push(verify_seat(export_tla));
     }
     // Catalog workflows (ADR-0021 D5.2 slice A, bd-36zlq): one chart report
     // per lowered workflow from the layered catalog — builtins, then the
@@ -2131,7 +2162,7 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
     }
     if reports.is_empty() {
         bail!(
-            "unknown statechart {} (expected SwarmLifecycle, P2PNegotiation, or a workflow name)",
+            "unknown statechart {} (expected SwarmLifecycle, P2PNegotiation, Seat, or a workflow name)",
             name.unwrap_or("")
         );
     }
