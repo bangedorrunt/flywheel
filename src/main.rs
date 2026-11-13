@@ -4625,6 +4625,37 @@ pub(crate) fn project_workspaces(c: &mut Client, project: &str) -> Result<Worksp
     ))
 }
 
+/// What spawn does with the project's owned workspaces that still have a live
+/// pane tree (bd-gjtcw).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpawnWorkspace {
+    /// No owned workspace survives: create one.
+    Fresh,
+    /// Owned workspace(s) with NO agent in them (a shell only): spawn ADDS the
+    /// requested panes into the first one instead of refusing.
+    Add { index: usize },
+    /// A workspace hosts a live agent: join loud (ADR-0011 D5).
+    Join,
+}
+
+/// The classify step spawn and `--join` share. A workspace with no agent is
+/// not a stale swarm — nothing there can race a new pane. An agent present,
+/// of any status that survived the dead-pane probe, IS the fleet to join.
+pub(crate) fn classify_spawn_workspace(
+    owned: &[hc::WorkspaceInfo],
+    agents: &[hc::AgentInfo],
+) -> SpawnWorkspace {
+    if owned.is_empty() {
+        return SpawnWorkspace::Fresh;
+    }
+    let hosts_agent =
+        |ws: &hc::WorkspaceInfo| agents.iter().any(|a| a.workspace_id == ws.workspace_id);
+    if owned.iter().any(hosts_agent) {
+        return SpawnWorkspace::Join;
+    }
+    SpawnWorkspace::Add { index: 0 }
+}
+
 /// bd-bug-add-foreign-workspace-m7dg: the add path's target workspace. Same
 /// partition as spawn: owned swarm workspace required, foreign (captain/omp
 /// session sharing the base label) never targeted — the old find_workspace
@@ -7418,9 +7449,17 @@ mod channel_captain_tests {
 /// bd-ux-papercuts-t2u5: the `spawn --join` refusal must name the verb that
 /// actually ADDS panes. "JOINING — not spawning" alone sent the operator
 /// hunting for `flywheel add` (three attempts, live friction 2026-10-03).
-fn spawn_join_notice(project: &str, live: &str) -> String {
+///
+/// bd-gjtcw: the hint echoes the REQUESTED flags verbatim, so `spawn --oc 3`
+/// never points at `add --pi N`.
+fn spawn_join_notice(project: &str, live: &str, requested: &str) -> String {
+    let flags = if requested.trim().is_empty() {
+        "--kind N".to_string()
+    } else {
+        requested.trim().to_string()
+    };
     format!(
-        "JOINING — not spawning  project={project} live={live}  (ADR-0011 D5; reuse first workspace)\nto ADD panes to a live swarm use `flywheel add {project} --pi N`"
+        "JOINING — not spawning  project={project} live={live}  (ADR-0011 D5; reuse first workspace)\nto ADD panes to a live swarm run the same request with `flywheel add`: `flywheel add {project} {flags}`"
     )
 }
 
@@ -7429,13 +7468,23 @@ mod spawn_join_notice_tests {
     use super::*;
 
     #[test]
-    fn spawn_join_refusal_names_add() {
-        let msg = spawn_join_notice("proj", "w1 (label \"proj\", 2 panes)");
+    fn spawn_join_refusal_names_add_with_the_requested_flags() {
+        let msg = spawn_join_notice("proj", "w1 (label \"proj\", 2 panes)", "--oc 3");
         assert!(msg.contains("JOINING — not spawning"), "{msg}");
         assert!(
-            msg.contains("flywheel add proj --pi N"),
-            "the refusal must name `flywheel add <project> --pi N`: {msg}"
+            msg.contains("flywheel add proj --oc 3"),
+            "the refusal must echo the requested flags: {msg}"
         );
+        assert!(
+            !msg.contains("--pi"),
+            "the hint must never invent a harness count: {msg}"
+        );
+    }
+
+    #[test]
+    fn spawn_join_refusal_without_flags_stays_honest() {
+        let msg = spawn_join_notice("proj", "w1", "  ");
+        assert!(msg.contains("flywheel add proj --kind N"), "{msg}");
     }
 }
 

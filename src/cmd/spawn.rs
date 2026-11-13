@@ -1099,6 +1099,25 @@ pub(crate) fn patched_mode_argv(
     }
 }
 
+/// Verbatim `add`-accepted flags from a spawn request (bd-gjtcw): the join
+/// hint hands back what the operator asked for, never a guessed harness.
+pub(crate) fn requested_spawn_flags(opts: &SpawnOpts) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for (flag, n) in [
+        ("--oc", opts.counts.oc),
+        ("--pi", opts.counts.pi),
+        ("--gk", opts.counts.gk),
+    ] {
+        if let Some(n) = n {
+            parts.push(format!("{flag} {n}"));
+        }
+    }
+    for (kind, n) in &opts.kinds {
+        parts.push(format!("--kind {kind}={n}"));
+    }
+    parts.join(" ")
+}
+
 /// Parse every `--patch` spec once, preserving the raw spec for errors.
 fn parse_role_patches(specs: &[String]) -> Result<Vec<crate::swarm_plan::PlanPatch>> {
     specs
@@ -1595,7 +1614,8 @@ projects available: {}",
         pane::reap_dead_registry_rows(project, &mut c);
     }
     let orphans = live_owned;
-    if !orphans.is_empty() {
+    let mut adopt: Option<hc::WorkspaceInfo> = None;
+    if !orphans.is_empty() && opts.retire_orphans {
         let detail: Vec<String> = orphans
             .iter()
             .map(|ws| {
@@ -1605,28 +1625,63 @@ projects available: {}",
                 )
             })
             .collect();
-        if opts.retire_orphans {
-            eprintln!(
-                "flywheel: closing {} pre-existing workspace(s) for {project}: {}",
-                orphans.len(),
-                detail.join(", ")
-            );
-            for ws in &orphans {
-                if let Err(e) = c.workspace_close(&ws.workspace_id, true) {
-                    eprintln!("flywheel: close {} failed: {e:#}", ws.workspace_id);
-                }
+        eprintln!(
+            "flywheel: closing {} pre-existing workspace(s) for {project}: {}",
+            orphans.len(),
+            detail.join(", ")
+        );
+        for ws in &orphans {
+            if let Err(e) = c.workspace_close(&ws.workspace_id, true) {
+                eprintln!("flywheel: close {} failed: {e:#}", ws.workspace_id);
             }
-            pane::reap_dead_registry_rows(project, &mut c);
-        } else if opts.join {
-            eprintln!("{}", spawn_join_notice(project, &detail.join(", ")));
-            let pin = crate::authority::select_agent_identity(None, &|k| std::env::var(k).ok());
-            return cmd_arrive(cfg, project, pin.as_deref(), None, None, None);
-        } else {
-            bail!(
-                "found {} pre-existing workspace(s) for {project} — stale panes from a killed swarm would race the new one: {}. Close them first (flywheel kill {project} or terminal workspace close <id>), pass --join to attach, or --retire-orphans to close them automatically.",
-                orphans.len(),
-                detail.join(", ")
-            );
+        }
+        pane::reap_dead_registry_rows(project, &mut c);
+    } else if !orphans.is_empty() {
+        let detail: Vec<String> = orphans
+            .iter()
+            .map(|ws| {
+                format!(
+                    "{} (label {:?}, {} panes)",
+                    ws.workspace_id, ws.label, ws.pane_count
+                )
+            })
+            .collect();
+        let live_ids: HashSet<&str> = orphans.iter().map(|ws| ws.workspace_id.as_str()).collect();
+        let live_agents: Vec<hc::AgentInfo> = all_agents
+            .iter()
+            .filter(|a| live_ids.contains(a.workspace_id.as_str()))
+            .cloned()
+            .collect();
+        match crate::classify_spawn_workspace(&orphans, &live_agents) {
+            crate::SpawnWorkspace::Fresh => {}
+            crate::SpawnWorkspace::Add { index } => {
+                let existing = orphans[index].clone();
+                eprintln!(
+                    "flywheel: {project}: workspace {} hosts no crew pins — adding panes into it",
+                    existing.workspace_id
+                );
+                adopt = Some(existing);
+            }
+            crate::SpawnWorkspace::Join => {
+                if opts.join {
+                    eprintln!(
+                        "{}",
+                        spawn_join_notice(
+                            project,
+                            &detail.join(", "),
+                            &requested_spawn_flags(&opts)
+                        )
+                    );
+                    let pin =
+                        crate::authority::select_agent_identity(None, &|k| std::env::var(k).ok());
+                    return cmd_arrive(cfg, project, pin.as_deref(), None, None, None);
+                }
+                bail!(
+                    "found {} pre-existing workspace(s) for {project} — stale panes from a killed swarm would race the new one: {}. Close them first (flywheel kill {project} or terminal workspace close <id>), pass --join to attach, or --retire-orphans to close them automatically.",
+                    orphans.len(),
+                    detail.join(", ")
+                );
+            }
         }
     }
     let first_pin = items.first().and_then(|item| {
@@ -1685,27 +1740,49 @@ projects available: {}",
         )?,
         None => agent_ref::AgentEffectGuard::begin(project, &label, agent_ref::AgentPhase::Spawn)?,
     };
-    let (ws, root) = c.workspace_create(
-        Some(&utf8_path(&dir, "workspace dir")?),
-        Some(&label),
-        !opts.no_focus,
-        Some(&plane_env),
-    )?;
-    let root = root.ok_or_else(|| anyhow!("workspace_create returned no root pane"))?;
-    println!(
-        "{}",
-        if opts.no_focus {
-            format!("workspace {} created (background)", ws.workspace_id)
-        } else {
-            format!("workspace {} created", ws.workspace_id)
+    let adopted = adopt.is_some();
+    let (ws, root) = match adopt {
+        Some(existing) => {
+            let root = c
+                .pane_list()?
+                .into_iter()
+                .find(|p| p.workspace_id == existing.workspace_id)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "workspace {} has no panes to add into",
+                        existing.workspace_id
+                    )
+                })?;
+            println!("workspace {} reused (no crew pins)", existing.workspace_id);
+            (existing, root)
         }
-    );
+        None => {
+            let (ws, root) = c.workspace_create(
+                Some(&utf8_path(&dir, "workspace dir")?),
+                Some(&label),
+                !opts.no_focus,
+                Some(&plane_env),
+            )?;
+            let root = root.ok_or_else(|| anyhow!("workspace_create returned no root pane"))?;
+            println!(
+                "{}",
+                if opts.no_focus {
+                    format!("workspace {} created (background)", ws.workspace_id)
+                } else {
+                    format!("workspace {} created", ws.workspace_id)
+                }
+            );
+            (ws, root)
+        }
+    };
 
     let mut spawned: Vec<Value> = Vec::new();
     let mut booted: Vec<(String, String, String)> = Vec::new();
     let mut registry: Vec<state::SpawnEntry> = Vec::new();
     let mut prev = root.pane_id.clone();
-    let mut first = true;
+    // An adopted workspace's shell env is fixed: split a fresh pane for the
+    // first agent so its model pin still lands.
+    let mut first = !adopted;
     let mut ordinals: BTreeMap<String, u32> = BTreeMap::new();
     let peer_aware = opts.peer_aware && !opts.no_peer_aware;
     let peer_template: Option<String> = if peer_aware {
@@ -2453,7 +2530,8 @@ pub(crate) fn cmd_spawn_rex(
         );
     }
     let orphans = split.owned;
-    if !orphans.is_empty() {
+    let mut adopt: Option<hc::WorkspaceInfo> = None;
+    if !orphans.is_empty() && opts.retire_orphans {
         let detail: Vec<String> = orphans
             .iter()
             .map(|ws| {
@@ -2463,42 +2541,72 @@ pub(crate) fn cmd_spawn_rex(
                 )
             })
             .collect();
-        if opts.retire_orphans {
-            eprintln!(
-                "flywheel: closing {} pre-existing workspace(s) for {project}: {}",
-                orphans.len(),
-                detail.join(", ")
-            );
-            for ws in &orphans {
-                if let Err(e) = backend.workspace_close(&ws.workspace_id, true) {
-                    eprintln!("flywheel: close {} failed: {e:#}", ws.workspace_id);
-                }
+        eprintln!(
+            "flywheel: closing {} pre-existing workspace(s) for {project}: {}",
+            orphans.len(),
+            detail.join(", ")
+        );
+        for ws in &orphans {
+            if let Err(e) = backend.workspace_close(&ws.workspace_id, true) {
+                eprintln!("flywheel: close {} failed: {e:#}", ws.workspace_id);
             }
-            let live: std::collections::HashSet<String> = backend
-                .pane_list(None)
-                .map(|panes| panes.into_iter().map(|p| p.pane_id).collect())
-                .unwrap_or_default();
-            let (kept, pruned) = crate::pane::reap_closed_rows(
-                state::load_spawn_registry(project),
-                &live,
-                backend.name(),
-            );
-            if pruned > 0 {
-                eprintln!("flywheel: reaped {pruned} dead-pane registry row(s) for {project}");
-                if let Err(e) = state::save_spawn_registry(project, &kept) {
-                    eprintln!("flywheel: cannot save reaped registry: {e:#}");
-                }
+        }
+        let live: std::collections::HashSet<String> = backend
+            .pane_list(None)
+            .map(|panes| panes.into_iter().map(|p| p.pane_id).collect())
+            .unwrap_or_default();
+        let (kept, pruned) = crate::pane::reap_closed_rows(
+            state::load_spawn_registry(project),
+            &live,
+            backend.name(),
+        );
+        if pruned > 0 {
+            eprintln!("flywheel: reaped {pruned} dead-pane registry row(s) for {project}");
+            if let Err(e) = state::save_spawn_registry(project, &kept) {
+                eprintln!("flywheel: cannot save reaped registry: {e:#}");
             }
-        } else if opts.join {
-            eprintln!("{}", spawn_join_notice(project, &detail.join(", ")));
-            let pin = crate::authority::select_agent_identity(None, &|k| std::env::var(k).ok());
-            return cmd_arrive(cfg, project, pin.as_deref(), None, None, None);
-        } else {
-            bail!(
-                "found {} pre-existing workspace(s) for {project} — stale panes from a killed swarm would race the new one: {}. Close them first (flywheel kill {project}), pass --join to attach, or --retire-orphans to close them automatically.",
-                orphans.len(),
-                detail.join(", ")
-            );
+        }
+    } else if !orphans.is_empty() {
+        let detail: Vec<String> = orphans
+            .iter()
+            .map(|ws| {
+                format!(
+                    "{} (label {:?}, {} panes)",
+                    ws.workspace_id, ws.label, ws.pane_count
+                )
+            })
+            .collect();
+        let live_agents = backend.agent_list().unwrap_or_default();
+        match crate::classify_spawn_workspace(&orphans, &live_agents) {
+            crate::SpawnWorkspace::Fresh => {}
+            crate::SpawnWorkspace::Add { index } => {
+                let existing = orphans[index].clone();
+                eprintln!(
+                    "flywheel: {project}: workspace {} hosts no crew pins — adding panes into it",
+                    existing.workspace_id
+                );
+                adopt = Some(existing);
+            }
+            crate::SpawnWorkspace::Join => {
+                if opts.join {
+                    eprintln!(
+                        "{}",
+                        spawn_join_notice(
+                            project,
+                            &detail.join(", "),
+                            &requested_spawn_flags(&opts)
+                        )
+                    );
+                    let pin =
+                        crate::authority::select_agent_identity(None, &|k| std::env::var(k).ok());
+                    return cmd_arrive(cfg, project, pin.as_deref(), None, None, None);
+                }
+                bail!(
+                    "found {} pre-existing workspace(s) for {project} — stale panes from a killed swarm would race the new one: {}. Close them first (flywheel kill {project}), pass --join to attach, or --retire-orphans to close them automatically.",
+                    orphans.len(),
+                    detail.join(", ")
+                );
+            }
         }
     }
     let spawn_effect = match request_key {
@@ -2508,15 +2616,25 @@ pub(crate) fn cmd_spawn_rex(
         )?,
         None => agent_ref::AgentEffectGuard::begin(project, &label, agent_ref::AgentPhase::Spawn)?,
     };
-    let ws = backend.workspace_create(Some(&label))?;
-    println!(
-        "{}",
-        if opts.no_focus {
-            format!("workspace {} created (background)", ws.workspace_id)
-        } else {
-            format!("workspace {} created", ws.workspace_id)
+    let adopted = adopt.is_some();
+    let ws = match adopt {
+        Some(existing) => {
+            println!("workspace {} reused (no crew pins)", existing.workspace_id);
+            existing
         }
-    );
+        None => {
+            let ws = backend.workspace_create(Some(&label))?;
+            println!(
+                "{}",
+                if opts.no_focus {
+                    format!("workspace {} created (background)", ws.workspace_id)
+                } else {
+                    format!("workspace {} created", ws.workspace_id)
+                }
+            );
+            ws
+        }
+    };
 
     let mut spawned: Vec<Value> = Vec::new();
     let mut booted: Vec<(String, String, String)> = Vec::new();
@@ -2543,7 +2661,9 @@ pub(crate) fn cmd_spawn_rex(
     if let Some(stream) = exit_stream.as_mut() {
         let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
     }
-    let mut first = true;
+    // An adopted workspace's blocks keep their env: split a fresh one for the
+    // first agent so its env-carried model pin still lands.
+    let mut first = !adopted;
     let mut ordinals: BTreeMap<String, u32> = BTreeMap::new();
     let peer_aware = opts.peer_aware && !opts.no_peer_aware;
     let peer_template: Option<String> = if peer_aware {
@@ -4069,8 +4189,8 @@ mod workspace_origin_tests {
     use super::*;
     use crate::hc::{AgentInfo, AgentStatus, WorkspaceInfo};
     use crate::{
-        PrimeChoice, WorkspaceOrigin, add_target_from_split, classify_workspace_origin,
-        partition_workspaces, prime_choice,
+        PrimeChoice, SpawnWorkspace, WorkspaceOrigin, add_target_from_split,
+        classify_spawn_workspace, classify_workspace_origin, partition_workspaces, prime_choice,
     };
 
     fn ws(id: &str, label: &str, panes: u64) -> WorkspaceInfo {
@@ -4356,6 +4476,44 @@ mod workspace_origin_tests {
         assert!(
             settle < typed,
             "cmd_add must settle BEFORE typing the identity prime (bd-eign.6 L2)"
+        );
+    }
+
+    /// bd-gjtcw: a shell-only owned workspace is not a stale swarm — spawn adds
+    /// panes into it instead of refusing and then no-op joining.
+    #[test]
+    fn empty_workspace_classifies_as_add() {
+        let owned = vec![ws("w-empty", "flywheel-demo", 1)];
+        assert_eq!(
+            classify_spawn_workspace(&owned, &[]),
+            SpawnWorkspace::Add { index: 0 },
+            "no agent in the workspace means nothing can race the new panes"
+        );
+        assert_eq!(
+            classify_spawn_workspace(&[], &[]),
+            SpawnWorkspace::Fresh,
+            "no owned workspace means a fresh one"
+        );
+    }
+
+    /// A pin that survived the dead-pane probe IS the fleet: join stays loud.
+    #[test]
+    fn live_pin_classifies_as_join() {
+        let owned = vec![ws("w-live", "flywheel-demo", 2)];
+        let agents = vec![agent("flywheel-demo-oc-1", "w-live")];
+        assert_eq!(
+            classify_spawn_workspace(&owned, &agents),
+            SpawnWorkspace::Join
+        );
+        // A workspace with no agent alongside a live one still joins.
+        let owned = vec![
+            ws("w-empty", "flywheel-demo", 1),
+            ws("w-live", "flywheel-demo", 2),
+        ];
+        assert_eq!(
+            classify_spawn_workspace(&owned, &agents),
+            SpawnWorkspace::Join,
+            "one live pin makes the project a fleet"
         );
     }
 }
@@ -7995,5 +8153,26 @@ mod harness_default_model_tests {
         assert_eq!(f.value, "harness-default");
         assert_eq!(f.from, crate::swarm_plan::Provenance::Profile);
         assert_eq!(f.status, crate::swarm_plan::FieldStatus::Honored);
+    }
+}
+
+#[cfg(test)]
+#[cfg(test)]
+mod requested_spawn_flags_tests {
+    use super::requested_spawn_flags;
+    use crate::SpawnOpts;
+
+    /// bd-gjtcw: the join hint must echo what was asked (`--oc 3`), never a
+    /// guessed harness.
+    #[test]
+    fn echoes_the_requested_harness_counts_and_flags() {
+        let mut opts = SpawnOpts::default();
+        opts.counts.oc = Some(3);
+        assert_eq!(requested_spawn_flags(&opts), "--oc 3");
+        opts.kinds = vec![("coder".to_string(), 2)];
+        assert_eq!(requested_spawn_flags(&opts), "--oc 3 --kind coder=2");
+        opts.counts.oc = None;
+        assert_eq!(requested_spawn_flags(&opts), "--kind coder=2");
+        assert_eq!(requested_spawn_flags(&SpawnOpts::default()), "");
     }
 }
