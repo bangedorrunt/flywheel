@@ -319,7 +319,7 @@ pub fn build_seat_machine() -> Machine<SeatState, SeatEvent, SeatContext, SeatCm
 #[cfg(test)]
 mod tests {
     use super::*;
-    use toron_core::kernel::{Boot, MachineState, Program};
+    use toron_core::kernel::MachineState;
 
     fn ctx(pin: &str, env: bool) -> SeatContext {
         SeatContext {

@@ -2044,7 +2044,7 @@ fn project_workflow_names(root: &Path) -> BTreeSet<String> {
 
 fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> Result<()> {
     use crate::elm::p2p_negotiation::{P2PNegotiationState, build_p2p_negotiation_machine};
-    use crate::elm::seat_statechart::{SeatState, build_seat_machine};
+    use crate::elm::seat_statechart::build_seat_machine;
     use crate::elm::swarm_statechart::build_swarm_machine;
     use toron_core::kernel::StateNodeType;
 
