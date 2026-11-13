@@ -425,6 +425,7 @@ mod tests {
 
     #[test]
     fn dep_lookup_failure_propagates() {
+        let _env = crate::config::lock_env();
         let prior = std::env::var_os("FLYWHEEL_BR_BIN");
         unsafe { std::env::set_var("FLYWHEEL_BR_BIN", "false") };
         let result = dependencies_for("bd-1");
