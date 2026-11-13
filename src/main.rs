@@ -120,6 +120,7 @@ mod verdict;
 mod wake_liveness;
 mod work;
 mod workflow_catalog;
+mod workflow_lowering;
 mod workspace;
 mod workspace_policy;
 mod workspace_reporting;
