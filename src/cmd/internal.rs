@@ -19,14 +19,14 @@ use crate::hc::{
 use crate::output::{kind_paint, print_json};
 use crate::state::EventKind;
 use crate::{
-    AgentCounts, SpawnOpts, XprojInboxItem, agent_target, comms_send,
+    AgentCounts, LaunchCtx, SpawnOpts, XprojInboxItem, agent_target, comms_send,
     extract_context_limit_from_inbox, extract_xproj_from_inbox, find_workspace, find_workspace_dyn,
     headless, load_inprogress_beads, load_ready_beads, log, mail_send, newest_in_thread,
     orchestrator_mail_name, plan_warning_notice, profile, profile_launch_args, project_dir,
     project_dir_str, rebind_from_registry, reroute_next_profile, resolve_agents_dyn,
     resolve_mail_target, resolve_mail_target_registry, resolve_role_flag, run_log, stage_prompt,
-    stage_prompt_for_project, start_agent_with_retry_dyn_profile, stderr_is_only_warnings, swarm_label,
-    terminal_mail_name, utf8_path,
+    stage_prompt_for_project, start_agent_with_retry_dyn_profile, stderr_is_only_warnings,
+    swarm_label, terminal_mail_name, utf8_path,
 };
 use crate::{
     agent_ref, agentstate, backend, config, doorbell, durable, failure, hc, models, pane,
@@ -1071,7 +1071,11 @@ pub(crate) fn respawn_with_backend(
     let args = respawn_launch_args(cfg, project, name, kind);
     let profile = project_dir_str(cfg, project)
         .ok()
-        .and_then(|key| state::load_spawn_registry(&key).into_iter().find(|e| e.name == name))
+        .and_then(|key| {
+            state::load_spawn_registry(&key)
+                .into_iter()
+                .find(|e| e.name == name)
+        })
         .and_then(|e| e.profile);
     let fresh = start_agent_with_retry_dyn_profile(
         backend,
@@ -1079,9 +1083,11 @@ pub(crate) fn respawn_with_backend(
         kind,
         &new_pane,
         &args,
-        profile.as_deref(),
-        Some(project),
-        Some(cfg),
+        LaunchCtx {
+            profile_name: profile.as_deref(),
+            project: Some(project),
+            cfg: Some(cfg),
+        },
     )?;
     if !same_pane
         && let Ok(mail) = backend::mail_backend(cfg)

@@ -107,18 +107,13 @@ impl Plan {
 /// `on-change` (default) asks only about Jev-touched, blocked, and
 /// over-budget/over-cap rows; `always` lists every seat's model and
 /// harness; `never` lists only blocked rows (blocked never launches anyway).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ConsentAsk {
+    #[default]
     OnChange,
     Always,
     Never,
-}
-
-impl Default for ConsentAsk {
-    fn default() -> Self {
-        Self::OnChange
-    }
 }
 
 /// ADR-0022 D5: why one consent item needs the operator.

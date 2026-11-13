@@ -36,23 +36,12 @@ pub enum SeatEvent {
     RelaunchFailed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SeatContext {
     pub pin: String,
     pub hops_spent: BTreeSet<FailureKind>,
     pub model_by_env: bool,
     pub last_failure: Option<(FailureKind, String)>,
-}
-
-impl Default for SeatContext {
-    fn default() -> Self {
-        Self {
-            pin: String::new(),
-            hops_spent: BTreeSet::new(),
-            model_by_env: false,
-            last_failure: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -377,10 +366,11 @@ mod tests {
             }),
         );
         assert_eq!(out.configuration.primary(), Some(&SeatState::Respawning));
-        assert!(!out
-            .commands
-            .iter()
-            .any(|c| matches!(c, SeatCmd::Relaunch { .. })));
+        assert!(
+            !out.commands
+                .iter()
+                .any(|c| matches!(c, SeatCmd::Relaunch { .. }))
+        );
         assert!(out.commands.iter().any(|c| matches!(
             c,
             SeatCmd::Respawn { pin } if pin == "a"

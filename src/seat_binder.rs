@@ -78,20 +78,20 @@ fn matches(need: &StepNeed, seat: &LiveSeat) -> bool {
     if need.role != seat.role {
         return false;
     }
-    if let Some(h) = &need.harness {
-        if seat.harness != *h {
-            return false;
-        }
+    if let Some(h) = &need.harness
+        && seat.harness != *h
+    {
+        return false;
     }
-    if let Some(m) = &need.model {
-        if seat.model.as_deref() != Some(m.as_str()) {
-            return false;
-        }
+    if let Some(m) = &need.model
+        && seat.model.as_deref() != Some(m.as_str())
+    {
+        return false;
     }
-    if let Some(mode) = &need.mode {
-        if seat.mode.as_deref() != Some(mode.as_str()) {
-            return false;
-        }
+    if let Some(mode) = &need.mode
+        && seat.mode.as_deref() != Some(mode.as_str())
+    {
+        return false;
     }
     true
 }
@@ -102,20 +102,20 @@ fn is_author(need: &StepNeed, pin: &str) -> bool {
 
 fn diff_fields(need: &StepNeed, seat: &LiveSeat) -> Vec<String> {
     let mut fields = Vec::new();
-    if let Some(h) = &need.harness {
-        if seat.harness != *h {
-            fields.push("harness".to_string());
-        }
+    if let Some(h) = &need.harness
+        && seat.harness != *h
+    {
+        fields.push("harness".to_string());
     }
-    if let Some(m) = &need.model {
-        if seat.model.as_deref() != Some(m.as_str()) {
-            fields.push("model".to_string());
-        }
+    if let Some(m) = &need.model
+        && seat.model.as_deref() != Some(m.as_str())
+    {
+        fields.push("model".to_string());
     }
-    if let Some(mode) = &need.mode {
-        if seat.mode.as_deref() != Some(mode.as_str()) {
-            fields.push("mode".to_string());
-        }
+    if let Some(mode) = &need.mode
+        && seat.mode.as_deref() != Some(mode.as_str())
+    {
+        fields.push("mode".to_string());
     }
     fields
 }
@@ -138,12 +138,12 @@ pub fn bind(need: &StepNeed, seats: &[LiveSeat], policy: &BindPolicy) -> Binding
         .copied()
         .collect();
 
-    if need.context == StageContext::Warm {
-        if let Some(seat) = idle_matching.first() {
-            return Binding::Reuse {
-                pin: seat.pin.clone(),
-            };
-        }
+    if need.context == StageContext::Warm
+        && let Some(seat) = idle_matching.first()
+    {
+        return Binding::Reuse {
+            pin: seat.pin.clone(),
+        };
     }
 
     if need.context == StageContext::Fresh {

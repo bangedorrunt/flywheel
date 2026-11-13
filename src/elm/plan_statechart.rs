@@ -43,21 +43,11 @@ pub enum PlanEvent {
     Abort,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PlanContext {
     pub yes: bool,
     pub needs_consent: Vec<ConsentItem>,
     pub jev_degraded: bool,
-}
-
-impl Default for PlanContext {
-    fn default() -> Self {
-        Self {
-            yes: false,
-            needs_consent: Vec::new(),
-            jev_degraded: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,17 +225,20 @@ mod tests {
             out.configuration.primary(),
             Some(&PlanState::AwaitingConsent)
         );
-        assert!(out
-            .commands
-            .iter()
-            .any(|c| matches!(c, PlanCmd::AskConsent { .. })));
+        assert!(
+            out.commands
+                .iter()
+                .any(|c| matches!(c, PlanCmd::AskConsent { .. }))
+        );
     }
 
     #[test]
     fn plan_machine_resolved_patch_goes_drafting() {
         let m = build_plan_machine();
-        let mut c = PlanContext::default();
-        c.needs_consent = vec![consent("s", "f", ConsentReason::Jev)];
+        let c = PlanContext {
+            needs_consent: vec![consent("s", "f", ConsentReason::Jev)],
+            ..Default::default()
+        };
         let ms = MachineState::at(PlanState::Resolved, c);
         let out = m.step_state(
             &ms,
@@ -259,8 +252,10 @@ mod tests {
     #[test]
     fn plan_machine_awaiting_approve_goes_confirmed() {
         let m = build_plan_machine();
-        let mut c = PlanContext::default();
-        c.needs_consent = vec![consent("s", "f", ConsentReason::Jev)];
+        let c = PlanContext {
+            needs_consent: vec![consent("s", "f", ConsentReason::Jev)],
+            ..Default::default()
+        };
         let ms = MachineState::at(PlanState::AwaitingConsent, c);
         let out = m.step_state(&ms, &PlanEvent::Approve);
         assert_eq!(out.configuration.primary(), Some(&PlanState::Confirmed));
@@ -322,8 +317,10 @@ mod tests {
     #[test]
     fn plan_machine_blocked_plus_yes_gives_awaiting() {
         let m = build_plan_machine();
-        let mut ctx = PlanContext::default();
-        ctx.yes = true;
+        let ctx = PlanContext {
+            yes: true,
+            ..Default::default()
+        };
         let ms = MachineState::at(PlanState::Drafting, ctx);
         let out = m.step_state(
             &ms,
@@ -341,8 +338,10 @@ mod tests {
     #[test]
     fn plan_machine_blocked_approve_stays_awaiting() {
         let m = build_plan_machine();
-        let mut c = PlanContext::default();
-        c.needs_consent = vec![consent("s", "f", ConsentReason::Blocked)];
+        let c = PlanContext {
+            needs_consent: vec![consent("s", "f", ConsentReason::Blocked)],
+            ..Default::default()
+        };
         let ms = MachineState::at(PlanState::AwaitingConsent, c);
         let out = m.step_state(&ms, &PlanEvent::Approve);
         assert_eq!(
@@ -409,8 +408,10 @@ mod tests {
     #[test]
     fn plan_machine_unregistered_plus_yes_gives_confirmed() {
         let m = build_plan_machine();
-        let mut ctx = PlanContext::default();
-        ctx.yes = true;
+        let ctx = PlanContext {
+            yes: true,
+            ..Default::default()
+        };
         let ms = MachineState::at(PlanState::Drafting, ctx);
         let out = m.step_state(
             &ms,

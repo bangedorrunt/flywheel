@@ -54,7 +54,7 @@ fn cmd_prefer_at(
             None => Scope::Always,
         };
         if set.forget(&key, project) {
-            set.save(&path)?;
+            set.save(path)?;
         }
         if json {
             print_json(&serde_json::json!({

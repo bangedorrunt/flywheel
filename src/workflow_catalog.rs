@@ -664,10 +664,10 @@ pub fn lint_shape(
     emit: &dyn Fn(&str, &mut usize),
 ) -> usize {
     let mut blocking = 0;
-    if let Some(shape) = catalog.shape(name) {
-        if let Err(reason) = shape_conforms(shape, wf) {
-            emit(&reason, &mut blocking);
-        }
+    if let Some(shape) = catalog.shape(name)
+        && let Err(reason) = shape_conforms(shape, wf)
+    {
+        emit(&reason, &mut blocking);
     }
     blocking
 }

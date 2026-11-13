@@ -668,7 +668,7 @@ mod tests {
         let ab = reconcile(&wants, &live, &argv, &ReconcilePolicy::default());
         let ba = reconcile(
             &wants,
-            &vec![live[1].clone(), live[0].clone()],
+            &[live[1].clone(), live[0].clone()],
             &argv,
             &ReconcilePolicy::default(),
         );

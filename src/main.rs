@@ -7661,7 +7661,7 @@ pub(crate) struct EnvpinHop {
 
 #[derive(Debug, Clone)]
 pub(crate) enum EnvpinHopOutcome {
-    Hopped { agent: AgentInfo },
+    Hopped { agent: Box<AgentInfo> },
     AlreadySatisfied,
     SuppressedGate,
     AlreadyRerouted,
@@ -7760,7 +7760,9 @@ pub(crate) fn envpin_respin_hop(
                 "flywheel: pane reroute {} -> {} (profile fallback, respawned with env pin; old pane closed after launch)",
                 hop.from_profile, hop.next_profile
             );
-            Ok(EnvpinHopOutcome::Hopped { agent })
+            Ok(EnvpinHopOutcome::Hopped {
+                agent: Box::new(agent),
+            })
         }
         None => anyhow::bail!("envpin hop produced no agent"),
     }
@@ -7810,16 +7812,16 @@ fn envpin_hop_split(
     anchor: &str,
     env: &std::collections::BTreeMap<String, String>,
 ) -> anyhow::Result<String> {
-    if backend.name() == "hc" {
-        if let (Some(cfg), Some(project)) = (cfg, project) {
-            let dir = project_dir(cfg, project);
-            let cwd = utf8_path(&dir, "workspace dir")?;
-            let c = match hc::Client::connect(Some(&cfg.socket_path())) {
-                Ok(c) => c,
-                Err(e) => return Err(anyhow::anyhow!("hc connect for env-pin hop: {e}")),
-            };
-            return Ok(hc::pane_split(&c, anchor, "down", Some(&cwd), Some(env))?.pane_id);
-        }
+    if backend.name() == "hc"
+        && let (Some(cfg), Some(project)) = (cfg, project)
+    {
+        let dir = project_dir(cfg, project);
+        let cwd = utf8_path(&dir, "workspace dir")?;
+        let c = match hc::Client::connect(Some(&cfg.socket_path())) {
+            Ok(c) => c,
+            Err(e) => return Err(anyhow::anyhow!("hc connect for env-pin hop: {e}")),
+        };
+        return Ok(hc::pane_split(&c, anchor, "down", Some(&cwd), Some(env))?.pane_id);
     }
     Err(EnvPinSplitUnsupported {
         backend: backend.name().to_string(),
@@ -7932,7 +7934,7 @@ fn envpin_hop_mail_identity(project: &str, agent: &str) -> Option<String> {
 /// loud on a broken hop, rejoin the in-place reroute when the reconciler
 /// is satisfied, or keep today's refusal.
 enum SiteHop {
-    Hopped(AgentInfo),
+    Hopped(Box<AgentInfo>),
     Failed(anyhow::Error),
     InPlace,
     Refused,
@@ -8629,7 +8631,7 @@ mod envpin_reroute_tests {
                 .push(format!("start:{name}@{pane_id}"));
             if first {
                 return Err(toron_plane::backend::BackendError::timeout(
-                    "agent.start failed: 401 invalid api key (fake)".to_string(),
+                    "agent.start failed: 401 invalid api key (fake)",
                 ));
             }
             Ok(site_agent(name, pane_id))
@@ -8714,9 +8716,11 @@ mod envpin_reroute_tests {
             "opencode",
             "block:old-pane",
             &[],
-            Some("opencode-fallback"),
-            Some("envpin-rex-proj"),
-            Some(&cfg),
+            LaunchCtx {
+                profile_name: Some("opencode-fallback"),
+                project: Some("envpin-rex-proj"),
+                cfg: Some(&cfg),
+            },
         )
         .expect("rex respawns the pinned hop instead of refusing");
         assert_eq!(agent.name.as_deref(), Some("TestyCreek"));
@@ -8831,6 +8835,15 @@ fn ensure_ascii_launch_args(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Launch identity the retrying start needs beyond argv: profile, project and
+/// config for the recipe/reroute paths. `None` everywhere for the plain path.
+#[derive(Default)]
+pub(crate) struct LaunchCtx<'a> {
+    pub profile_name: Option<&'a str>,
+    pub project: Option<&'a str>,
+    pub cfg: Option<&'a Config>,
+}
+
 pub(crate) fn start_agent_with_retry(
     c: &mut Client,
     name: &str,
@@ -8838,7 +8851,7 @@ pub(crate) fn start_agent_with_retry(
     pane_id: &str,
     args: &[String],
 ) -> Result<AgentInfo> {
-    start_agent_with_retry_profile(c, name, kind, pane_id, args, None, None, None)
+    start_agent_with_retry_profile(c, name, kind, pane_id, args, LaunchCtx::default())
 }
 
 pub(crate) fn start_agent_with_retry_profile(
@@ -8847,15 +8860,13 @@ pub(crate) fn start_agent_with_retry_profile(
     kind: &str,
     pane_id: &str,
     args: &[String],
-    profile_name: Option<&str>,
-    project: Option<&str>,
-    cfg: Option<&Config>,
+    ctx: LaunchCtx<'_>,
 ) -> Result<AgentInfo> {
     ensure_ascii_launch_args(args)?;
     let mut recipe_launched = false;
     let mut current_kind = kind.to_string();
     let mut current_args = args.to_vec();
-    let mut current_profile = profile_name.map(std::string::ToString::to_string);
+    let mut current_profile = ctx.profile_name.map(std::string::ToString::to_string);
     let mut attempted_profiles: Vec<String> = current_profile.clone().into_iter().collect();
     let mut already_rerouted = false;
     for attempt in 0..30 {
@@ -8911,10 +8922,10 @@ pub(crate) fn start_agent_with_retry_profile(
                                             == RerouteEnvPin::AlreadyPinned;
                                     if !reroute_in_place {
                                         let site_hop = || {
-                                            let Some(proj) = project else {
+                                            let Some(proj) = ctx.project else {
                                                 return SiteHop::Refused;
                                             };
-                                            let Some(cfg) = cfg else {
+                                            let Some(cfg) = ctx.cfg else {
                                                 return SiteHop::Refused;
                                             };
                                             let mut next_env = std::collections::BTreeMap::new();
@@ -8986,7 +8997,7 @@ pub(crate) fn start_agent_with_retry_profile(
                                             }
                                         };
                                         match site_hop() {
-                                            SiteHop::Hopped(agent) => return Ok(agent),
+                                            SiteHop::Hopped(agent) => return Ok(*agent),
                                             SiteHop::Failed(e) => return Err(e),
                                             SiteHop::InPlace => reroute_in_place = true,
                                             SiteHop::Refused => {}
@@ -9031,7 +9042,7 @@ pub(crate) fn start_agent_with_retry_profile(
                                     continue;
                                 }
                             }
-                            let fallback_key = profile_name.unwrap_or(kind);
+                            let fallback_key = ctx.profile_name.unwrap_or(kind);
                             if fallback_chain_for(fallback_key).is_empty() {
                                 return Err(anyhow::anyhow!(
                                     "spawn failed ({}): {} — no fallback chain",
@@ -9062,7 +9073,7 @@ pub(crate) fn start_agent_with_retry_profile(
                         } else if cf.kind == failure::FailureKind::Billing
                             || cf.kind == failure::FailureKind::Auth
                         {
-                            let fallback_key = profile_name.unwrap_or(kind);
+                            let fallback_key = ctx.profile_name.unwrap_or(kind);
                             if fallback_chain_for(fallback_key).is_empty() {
                                 return Err(anyhow::anyhow!(
                                     "spawn failed ({}): {} — no fallback chain",
@@ -9111,15 +9122,13 @@ fn start_agent_with_retry_dyn_profile(
     kind: &str,
     pane_id: &str,
     args: &[String],
-    profile_name: Option<&str>,
-    project: Option<&str>,
-    cfg: Option<&Config>,
+    ctx: LaunchCtx<'_>,
 ) -> Result<AgentInfo> {
     ensure_ascii_launch_args(args)?;
     let mut recipe_launched = false;
     let mut current_kind = kind.to_string();
     let mut current_args = args.to_vec();
-    let mut current_profile = profile_name.map(std::string::ToString::to_string);
+    let mut current_profile = ctx.profile_name.map(std::string::ToString::to_string);
     let mut attempted_profiles: Vec<String> = current_profile.clone().into_iter().collect();
     let mut already_rerouted = false;
     for attempt in 0..30 {
@@ -9175,7 +9184,7 @@ fn start_agent_with_retry_dyn_profile(
                                             == RerouteEnvPin::AlreadyPinned;
                                     if !reroute_in_place {
                                         let site_hop = || {
-                                            let Some(proj) = project else {
+                                            let Some(proj) = ctx.project else {
                                                 return SiteHop::Refused;
                                             };
                                             let mut next_env = std::collections::BTreeMap::new();
@@ -9208,7 +9217,9 @@ fn start_agent_with_retry_dyn_profile(
                                                 attempt: attempt as u32,
                                             };
                                             let respawn = |anchor: &str| {
-                                                envpin_hop_respawn(cfg, proj, backend, &hop, anchor)
+                                                envpin_hop_respawn(
+                                                    ctx.cfg, proj, backend, &hop, anchor,
+                                                )
                                             };
                                             match envpin_respin_hop(
                                                 backend,
@@ -9234,7 +9245,7 @@ fn start_agent_with_retry_dyn_profile(
                                             }
                                         };
                                         match site_hop() {
-                                            SiteHop::Hopped(agent) => return Ok(agent),
+                                            SiteHop::Hopped(agent) => return Ok(*agent),
                                             SiteHop::Failed(e) => return Err(e),
                                             SiteHop::InPlace => reroute_in_place = true,
                                             SiteHop::Refused => {}
@@ -9279,7 +9290,7 @@ fn start_agent_with_retry_dyn_profile(
                                     continue;
                                 }
                             }
-                            let fallback_key = profile_name.unwrap_or(kind);
+                            let fallback_key = ctx.profile_name.unwrap_or(kind);
                             if fallback_chain_for(fallback_key).is_empty() {
                                 return Err(anyhow::anyhow!(
                                     "spawn failed ({}): {} — no fallback chain",
@@ -9315,7 +9326,7 @@ fn start_agent_with_retry_dyn_profile(
                         } else if cf.kind == failure::FailureKind::Billing
                             || cf.kind == failure::FailureKind::Auth
                         {
-                            let fallback_key = profile_name.unwrap_or(&current_kind);
+                            let fallback_key = ctx.profile_name.unwrap_or(&current_kind);
                             if fallback_chain_for(fallback_key).is_empty() {
                                 return Err(anyhow::anyhow!(
                                     "spawn failed ({}): {} — no fallback chain",
@@ -9459,9 +9470,7 @@ mod peer_encoding_tests {
             "opencode",
             "w9:p1",
             &["peer template with § section sign".to_string()],
-            None,
-            None,
-            None,
+            LaunchCtx::default(),
         )
         .expect_err("poisoned arg must fail fast");
         assert!(
@@ -12238,9 +12247,11 @@ fn cmd_recover(cfg: &Config, project: &str, include_captain: bool) -> Result<()>
                     kind,
                     &target,
                     &[],
-                    entry.profile.as_deref(),
-                    Some(project),
-                    Some(cfg),
+                    LaunchCtx {
+                        profile_name: entry.profile.as_deref(),
+                        project: Some(project),
+                        cfg: Some(cfg),
+                    },
                 ) {
                     Ok(a) => {
                         if a.pane_id != *pane_id {

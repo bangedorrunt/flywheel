@@ -434,7 +434,7 @@ pub fn assemble_with_catalog(
         .collect();
 
     let mut argv = decision.argv.clone();
-    let compose_token = wf_catalog.is_compose_token(&decision.primitive);
+    let compose_token = wf_catalog.is_compose_token(decision.primitive);
     if join {
         argv = vec!["flywheel".into(), "arrive".into(), world.project.clone()];
         if let Some(id) = &world.coalition_id {
@@ -635,7 +635,7 @@ pub fn align_with_session_topology_with_catalog(
                 b.proposal.why =
                     format!("session_topology={session} sticky-held — invent vehicle suppressed");
             }
-            rewrite_sticky_held_argv(b, session, &catalog);
+            rewrite_sticky_held_argv(b, session, catalog);
         }
         return;
     }
@@ -661,7 +661,7 @@ pub fn align_with_session_topology_with_catalog(
         if sticky_held { " sticky-held" } else { "" },
     );
     if sticky_held {
-        rewrite_sticky_held_argv(b, session, &catalog);
+        rewrite_sticky_held_argv(b, session, catalog);
     }
 }
 
