@@ -829,11 +829,59 @@ pub(crate) fn cmd_steer(
 /// A dry-run never refuses: where the real spawn would bail (unknown
 /// profile), the plan builder errors the same way; where it would fall back
 /// to "(harness default)", the plan says `model: null`.
-/// ADR-0022 phase 2b (bd-7rg0f): refuse a plan with any `blocked` field.
-/// Pure decision: returns every blocked seat field with its remedy so the
-/// CLI can print them and exit non-zero before launching anything.
-/// An all-honored (or all-degraded) plan proceeds.
-pub(crate) fn refuse_blocked(plan: &crate::swarm_plan::Plan) -> Result<(), Vec<String>> {
+
+/// ADR-0022 §3.1: spawn's launch decision IS the verified PlanMachine's
+/// verdict. Pure: builds the machine with `PlanContext { yes, ..default }`,
+/// steps `Resolve { needs_consent, jev: Ok }` — the plan records no Jev
+/// failure, so `Ok` is honest today — and reads the resulting state:
+/// Confirmed launches, anything else asks with today's refusal lines.
+/// The PlanCmd `Journal` and `Launch` commands are descriptive here, never
+/// executed: executing `Journal` comes with the effect journal wiring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PlanGate {
+    Launch,
+    Ask {
+        consent: Vec<String>,
+        blocked: Vec<String>,
+    },
+}
+
+pub(crate) fn plan_gate(plan: &crate::swarm_plan::Plan, yes: bool) -> PlanGate {
+    use crate::elm::plan_statechart::{JevOutcome, PlanEvent, PlanState, build_plan_machine};
+    use toron_core::kernel::MachineState;
+    let machine = build_plan_machine();
+    let start = MachineState::at(
+        PlanState::Drafting,
+        crate::elm::plan_statechart::PlanContext {
+            yes,
+            ..Default::default()
+        },
+    );
+    let out = machine.step_state(
+        &start,
+        &PlanEvent::Resolve {
+            needs_consent: plan.needs_consent.clone(),
+            jev: JevOutcome::Ok,
+        },
+    );
+    if out.configuration.primary() == Some(&PlanState::Confirmed) {
+        return PlanGate::Launch;
+    }
+    let mut consent = Vec::new();
+    if !yes {
+        for item in &plan.needs_consent {
+            consent.push(format!(
+                "consent required: {} {} ({})",
+                item.seat,
+                item.field,
+                item.reason.as_str()
+            ));
+        }
+        consent.push(
+            "re-run with --yes to proceed (flywheel plan apply does not exist yet — use the equivalent spawn flags instead)"
+                .to_string(),
+        );
+    }
     let mut blocked = Vec::new();
     for seat in &plan.seats {
         for (field_name, field) in [
@@ -852,35 +900,7 @@ pub(crate) fn refuse_blocked(plan: &crate::swarm_plan::Plan) -> Result<(), Vec<S
             }
         }
     }
-    if blocked.is_empty() {
-        Ok(())
-    } else {
-        Err(blocked)
-    }
-}
-
-/// ADR-0022 D5 consent gate: a real spawn with a non-empty `needs_consent`
-/// refuses without `--yes` (same place as [`refuse_blocked`]). With `--yes`
-/// it proceeds; blocked rows stay refused by `refuse_blocked` — a single
-/// refusal path, no duplication.
-pub(crate) fn consent_gate(plan: &crate::swarm_plan::Plan, yes: bool) -> Result<(), Vec<String>> {
-    if yes || plan.needs_consent.is_empty() {
-        return Ok(());
-    }
-    let mut lines = Vec::new();
-    for item in &plan.needs_consent {
-        lines.push(format!(
-            "consent required: {} {} ({})",
-            item.seat,
-            item.field,
-            item.reason.as_str()
-        ));
-    }
-    lines.push(
-        "re-run with --yes to proceed (flywheel plan apply does not exist yet — use the equivalent spawn flags instead)"
-            .to_string(),
-    );
-    Err(lines)
+    PlanGate::Ask { consent, blocked }
 }
 
 /// Resolve one seat's model ask into its plan field (ADR-0022 D4 phase
@@ -1236,22 +1256,22 @@ projects available: {}",
         }
         return Ok(());
     }
-    if let Err(lines) = consent_gate(&plan, opts.yes) {
-        for line in &lines {
+    if let PlanGate::Ask { consent, blocked } = plan_gate(&plan, opts.yes) {
+        for line in &consent {
             eprintln!("consent: {line}");
+        }
+        for line in &blocked {
+            eprintln!("blocked: {line}");
+        }
+        if !blocked.is_empty() {
+            anyhow::bail!(
+                "spawn refused: {} blocked field(s) would not be honoured — fix the ask (a blocked ask must not launch)",
+                blocked.len()
+            );
         }
         anyhow::bail!(
             "spawn refused: {} consent item(s) need operator sign-off — re-run with --yes",
             plan.needs_consent.len()
-        );
-    }
-    if let Err(blocked) = refuse_blocked(&plan) {
-        for line in &blocked {
-            eprintln!("blocked: {line}");
-        }
-        anyhow::bail!(
-            "spawn refused: {} blocked field(s) would not be honoured — fix the ask (a blocked ask must not launch)",
-            blocked.len()
         );
     }
     let base_label = opts
@@ -2119,22 +2139,22 @@ pub(crate) fn cmd_spawn_rex(
         }
         return Ok(());
     }
-    if let Err(lines) = consent_gate(&plan, opts.yes) {
-        for line in &lines {
+    if let PlanGate::Ask { consent, blocked } = plan_gate(&plan, opts.yes) {
+        for line in &consent {
             eprintln!("consent: {line}");
+        }
+        for line in &blocked {
+            eprintln!("blocked: {line}");
+        }
+        if !blocked.is_empty() {
+            anyhow::bail!(
+                "spawn refused: {} blocked field(s) would not be honoured — fix the ask (a blocked ask must not launch)",
+                blocked.len()
+            );
         }
         anyhow::bail!(
             "spawn refused: {} consent item(s) need operator sign-off — re-run with --yes",
             plan.needs_consent.len()
-        );
-    }
-    if let Err(blocked) = refuse_blocked(&plan) {
-        for line in &blocked {
-            eprintln!("blocked: {line}");
-        }
-        anyhow::bail!(
-            "spawn refused: {} blocked field(s) would not be honoured — fix the ask (a blocked ask must not launch)",
-            blocked.len()
         );
     }
     let base_label = opts
@@ -4159,7 +4179,7 @@ mod workspace_origin_tests {
 
 #[cfg(test)]
 mod adr0013_spawn_effect_tests {
-    use super::{build_dry_run_plan, refuse_blocked, spawn_items_from_plan};
+    use super::{build_dry_run_plan, spawn_items_from_plan};
     use crate::profile;
 
     /// Slice one top-level function body. Both needles carry a real newline so
@@ -4207,78 +4227,6 @@ mod adr0013_spawn_effect_tests {
                 "{entry}: dry-run branch must return"
             );
         }
-    }
-
-    /// ADR-0022 phase 2b (bd-7rg0f): a blocked field refuses the launch.
-    /// Pure decision: any `blocked` field on any seat refuses, naming each
-    /// blocked seat field and its remedy; an all-honored plan proceeds.
-    #[test]
-    fn refuse_blocked_names_every_blocked_seat_field() {
-        let blocked = crate::swarm_plan::Field {
-            value: "gemini-2.5-pro".into(),
-            from: crate::swarm_plan::Provenance::User,
-            status: crate::swarm_plan::FieldStatus::Blocked {
-                remedy: "pick another harness".into(),
-            },
-            registry: None,
-            was: None,
-        };
-        let honored = crate::swarm_plan::Field {
-            value: "x".into(),
-            from: crate::swarm_plan::Provenance::Slot,
-            status: crate::swarm_plan::FieldStatus::Honored,
-            registry: None,
-            was: None,
-        };
-        let mut plan = crate::swarm_plan::Plan::new("swarm");
-        plan.seats.push(crate::swarm_plan::Seat {
-            role: "coder".into(),
-            count: 1,
-            harness: "gemini".into(),
-            model: Some(blocked),
-            effort: None,
-            mode: None,
-            phase: None,
-            placement: "pane".to_string(),
-        });
-        plan.seats.push(crate::swarm_plan::Seat {
-            role: "reviewer".into(),
-            count: 1,
-            harness: "pi".into(),
-            model: Some(honored),
-            effort: None,
-            mode: None,
-            phase: None,
-            placement: "pane".to_string(),
-        });
-        let err = refuse_blocked(&plan).expect_err("one blocked field refuses");
-        assert!(
-            err.iter()
-                .any(|e| e.contains("coder") && e.contains("model")),
-            "{err:?}"
-        );
-        assert!(
-            err.iter().any(|e| e.contains("pick another harness")),
-            "{err:?}"
-        );
-        let mut clean = crate::swarm_plan::Plan::new("swarm");
-        clean.seats.push(crate::swarm_plan::Seat {
-            role: "coder".into(),
-            count: 1,
-            harness: "pi".into(),
-            model: Some(crate::swarm_plan::Field {
-                value: "m".into(),
-                from: crate::swarm_plan::Provenance::User,
-                status: crate::swarm_plan::FieldStatus::Honored,
-                registry: None,
-                was: None,
-            }),
-            effort: None,
-            mode: None,
-            phase: None,
-            placement: "pane".to_string(),
-        });
-        assert!(refuse_blocked(&clean).is_ok());
     }
 
     /// ADR-0022 D4 phase 3a (bd-uivb4): the dry-run plan carries the
@@ -5989,44 +5937,6 @@ mod plane_gate_tests {
 
 #[cfg(test)]
 mod consent_gate_tests {
-    use crate::swarm_plan::{ConsentItem, ConsentReason, Plan};
-
-    fn blocked_jev_plan() -> Plan {
-        let mut plan = Plan::new("swarm");
-        plan.needs_consent = vec![ConsentItem {
-            seat: "coder".to_string(),
-            field: "model".to_string(),
-            reason: ConsentReason::Jev,
-        }];
-        plan
-    }
-
-    #[test]
-    fn consent_gate_refuses_without_yes_and_names_items() {
-        let plan = blocked_jev_plan();
-        let err = super::consent_gate(&plan, false).expect_err("needs --yes");
-        assert!(
-            err.iter()
-                .any(|l| l.contains("coder") && l.contains("model")),
-            "names the seat and field: {err:?}"
-        );
-        assert!(
-            err.iter().any(|l| l.contains("--yes")),
-            "hint names the flag: {err:?}"
-        );
-        assert!(
-            err.iter().any(|l| l.contains("plan apply")),
-            "hint says there is no plan apply yet: {err:?}"
-        );
-    }
-
-    #[test]
-    fn consent_gate_proceeds_with_yes() {
-        let plan = blocked_jev_plan();
-        assert!(super::consent_gate(&plan, true).is_ok());
-        let clean = Plan::new("swarm");
-        assert!(super::consent_gate(&clean, false).is_ok());
-    }
 
     #[test]
     fn dry_run_carries_needs_consent_for_unregistered() {
@@ -6439,5 +6349,196 @@ mod prefer_spawn_tests {
             msg.contains(&path.display().to_string()),
             "error names the path: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod plan_gate_tests {
+    use crate::swarm_plan::{
+        ConsentItem, ConsentReason, Field, FieldStatus, Plan, Provenance, Seat,
+    };
+
+    fn field(value: &str, from: Provenance, status: FieldStatus) -> Field {
+        Field {
+            value: value.to_string(),
+            from,
+            status,
+            registry: None,
+            was: None,
+        }
+    }
+
+    fn seat_with_model(role: &str, harness: &str, model: Option<Field>) -> Seat {
+        Seat {
+            role: role.to_string(),
+            count: 1,
+            harness: harness.to_string(),
+            model,
+            effort: None,
+            mode: None,
+            phase: None,
+            placement: "pane".to_string(),
+        }
+    }
+
+    fn consent(seat: &str, field: &str, reason: ConsentReason) -> ConsentItem {
+        ConsentItem {
+            seat: seat.to_string(),
+            field: field.to_string(),
+            reason,
+        }
+    }
+
+    fn jev_plan() -> Plan {
+        let mut plan = Plan::new("swarm");
+        plan.seats.push(seat_with_model(
+            "coder",
+            "pi",
+            Some(field("a/m", Provenance::Jev, FieldStatus::Honored)),
+        ));
+        plan.needs_consent = vec![consent("coder", "model", ConsentReason::Jev)];
+        plan
+    }
+
+    /// An empty consent set launches.
+    #[test]
+    fn plan_gate_empty_consent_launches() {
+        let plan = Plan::new("swarm");
+        assert!(matches!(
+            super::plan_gate(&plan, false),
+            super::PlanGate::Launch
+        ));
+        assert!(matches!(
+            super::plan_gate(&plan, true),
+            super::PlanGate::Launch
+        ));
+    }
+
+    /// A Jev item without `--yes` asks.
+    #[test]
+    fn plan_gate_jev_without_yes_asks() {
+        let plan = jev_plan();
+        match super::plan_gate(&plan, false) {
+            super::PlanGate::Ask { consent, .. } => {
+                assert!(
+                    consent
+                        .iter()
+                        .any(|l| l.contains("coder") && l.contains("model"))
+                );
+            }
+            super::PlanGate::Launch => panic!("Jev ask without --yes must ask"),
+        }
+    }
+
+    /// A Jev item with `--yes` launches.
+    #[test]
+    fn plan_gate_jev_with_yes_launches() {
+        let plan = jev_plan();
+        assert!(matches!(
+            super::plan_gate(&plan, true),
+            super::PlanGate::Launch
+        ));
+    }
+
+    /// Unregistered plus `--yes` launches.
+    #[test]
+    fn plan_gate_unregistered_with_yes_launches() {
+        let mut plan = jev_plan();
+        plan.needs_consent = vec![consent("coder", "model", ConsentReason::Unregistered)];
+        assert!(matches!(
+            super::plan_gate(&plan, true),
+            super::PlanGate::Launch
+        ));
+    }
+
+    /// Blocked plus `--yes` asks, and the lines name the remedy.
+    #[test]
+    fn plan_gate_blocked_with_yes_asks_and_names_remedy() {
+        let mut plan = Plan::new("swarm");
+        plan.seats.push(seat_with_model(
+            "coder",
+            "gemini",
+            Some(field(
+                "gemini-2.5-pro",
+                Provenance::User,
+                FieldStatus::Blocked {
+                    remedy: "pick another harness".into(),
+                },
+            )),
+        ));
+        plan.needs_consent = vec![consent("coder", "model", ConsentReason::Blocked)];
+        match super::plan_gate(&plan, true) {
+            super::PlanGate::Ask { blocked, .. } => {
+                assert!(
+                    blocked.iter().any(|l| l.contains("pick another harness")),
+                    "remedy named: {blocked:?}"
+                );
+            }
+            super::PlanGate::Launch => panic!("blocked with --yes must still ask"),
+        }
+    }
+
+    /// crew-max without `--yes` asks.
+    #[test]
+    fn plan_gate_crew_max_without_yes_asks() {
+        let mut plan = Plan::new("swarm");
+        plan.needs_consent = vec![consent("crew", "count", ConsentReason::CrewMax)];
+        assert!(matches!(
+            super::plan_gate(&plan, false),
+            super::PlanGate::Ask { .. }
+        ));
+    }
+
+    /// Ported: the ask names the seat, the field, the `--yes` hint and the
+    /// no-`plan apply` note.
+    #[test]
+    fn plan_gate_names_items_and_hint() {
+        let plan = jev_plan();
+        match super::plan_gate(&plan, false) {
+            super::PlanGate::Ask { consent, .. } => {
+                assert!(
+                    consent
+                        .iter()
+                        .any(|l| l.contains("coder") && l.contains("model"))
+                );
+                assert!(consent.iter().any(|l| l.contains("--yes")));
+                assert!(consent.iter().any(|l| l.contains("plan apply")));
+            }
+            super::PlanGate::Launch => panic!("must ask without --yes"),
+        }
+    }
+
+    /// Ported: every blocked seat field is named with its remedy.
+    #[test]
+    fn plan_gate_blocked_names_every_blocked_seat_field() {
+        let mut plan = Plan::new("swarm");
+        plan.seats.push(seat_with_model(
+            "coder",
+            "gemini",
+            Some(field(
+                "gemini-2.5-pro",
+                Provenance::User,
+                FieldStatus::Blocked {
+                    remedy: "pick another harness".into(),
+                },
+            )),
+        ));
+        plan.seats.push(seat_with_model(
+            "reviewer",
+            "pi",
+            Some(field("x", Provenance::Slot, FieldStatus::Honored)),
+        ));
+        plan.needs_consent = vec![consent("coder", "model", ConsentReason::Blocked)];
+        match super::plan_gate(&plan, true) {
+            super::PlanGate::Ask { blocked, .. } => {
+                assert!(
+                    blocked
+                        .iter()
+                        .any(|l| l.contains("coder") && l.contains("model"))
+                );
+                assert!(blocked.iter().any(|l| l.contains("pick another harness")));
+            }
+            super::PlanGate::Launch => panic!("one blocked field refuses"),
+        }
     }
 }
