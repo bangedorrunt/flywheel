@@ -176,10 +176,10 @@ impl LowerBuilder {
         }
         for (name, def) in &self.inputs {
             if name == root {
-                if let Some(d) = def {
-                    if let Ok(n) = d.trim().parse::<u64>() {
-                        return Some(n);
-                    }
+                if let Some(d) = def
+                    && let Ok(n) = d.trim().parse::<u64>()
+                {
+                    return Some(n);
                 }
                 return None;
             }
@@ -224,10 +224,10 @@ impl LowerBuilder {
             .filter(|(_, n)| n.needs.is_empty())
             .map(|(name, _)| renames[name].clone())
             .collect();
-        if entries.is_empty() {
-            if let Some(first) = nodes.keys().next() {
-                entries.push(renames[first].clone());
-            }
+        if entries.is_empty()
+            && let Some(first) = nodes.keys().next()
+        {
+            entries.push(renames[first].clone());
         }
         for (name, node) in nodes {
             let me = renames[name].clone();
@@ -418,6 +418,13 @@ fn with_targets(
     node
 }
 
+/// States no path from the initial state enters, by name.
+///
+/// Unit-tested check API; the verify path reaches this query through
+/// `chart_report` (mandated reuse), so this stays unwired in the binary.
+/// Restructure `chart_report` to take precomputed checks if the duplication
+/// ever matters.
+#[allow(dead_code)]
 pub fn check_reachable(lowered: &Lowered) -> Vec<String> {
     lowered.machine.topology().unreachable()
 }
@@ -427,6 +434,12 @@ pub fn check_reachable(lowered: &Lowered) -> Vec<String> {
 /// No YAML form produced by [`lower`] can strand a state today: branch arms
 /// rejoin the container exit (engine-faithful) and loops carry exits, so a
 /// hand-built machine is the only way to exercise this check.
+///
+/// Unit-tested check API; the verify path reaches this query through
+/// `chart_report` (mandated reuse), so this stays unwired in the binary.
+/// Restructure `chart_report` to take precomputed checks if the duplication
+/// ever matters.
+#[allow(dead_code)]
 pub fn check_can_finish(lowered: &Lowered) -> Vec<String> {
     lowered.machine.topology().cannot_finish()
 }
@@ -458,14 +471,14 @@ pub fn check_bounded(lowered: &Lowered) -> (Vec<String>, Vec<String>) {
         &mut errors,
     );
     for b in &lowered.back_edges {
-        if let Some(n) = b.max {
-            if n > 32 {
-                let what = match b.kind {
-                    BackEdgeKind::Loop => format!("loop max={n}"),
-                    BackEdgeKind::Retry => format!("retry max_attempts={n}"),
-                };
-                warnings.push(format!("{}: {} (long hold)", b.from, what));
-            }
+        if let Some(n) = b.max
+            && n > 32
+        {
+            let what = match b.kind {
+                BackEdgeKind::Loop => format!("loop max={n}"),
+                BackEdgeKind::Retry => format!("retry max_attempts={n}"),
+            };
+            warnings.push(format!("{}: {} (long hold)", b.from, what));
         }
     }
     (errors, warnings)

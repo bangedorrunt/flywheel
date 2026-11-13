@@ -1897,6 +1897,8 @@ struct WorkflowVerifyChartReport {
     tla: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     errors: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    warnings: Vec<String>,
 }
 
 const WORKFLOW_VERIFY_SCOPE: &str = "topology only: every guard counts as enabled and data is not modelled, so a listed state is a real defect and an empty list is not a proof; no model checker runs";
@@ -1907,6 +1909,8 @@ fn chart_report<S: Ord + Clone + std::fmt::Debug>(
     goal: &str,
     is_goal: impl Fn(&S) -> bool,
     tla: Option<String>,
+    bounded_errors: &[String],
+    bounded_warnings: &[String],
 ) -> WorkflowVerifyChartReport {
     let names =
         |states: Vec<S>| -> Vec<String> { states.into_iter().map(|s| format!("{s:?}")).collect() };
@@ -1921,15 +1925,68 @@ fn chart_report<S: Ord + Clone + std::fmt::Debug>(
     for state in &stuck {
         errors.push(format!("{name}: {state} has no path to {goal}"));
     }
+    for e in bounded_errors {
+        errors.push(format!("{name}: {e}"));
+    }
+    let mut warnings = Vec::new();
+    for w in bounded_warnings {
+        warnings.push(format!("{name}: {w}"));
+    }
     WorkflowVerifyChartReport {
         name: name.to_string(),
         ok: errors.is_empty(),
         checks: serde_json::json!({
             "reachable": { "ok": unreachable.is_empty(), "unreachable": unreachable },
             "can_finish": { "ok": stuck.is_empty(), "goal": goal, "stuck": stuck },
+            "bounded": { "ok": bounded_errors.is_empty(), "unbounded": bounded_errors },
         }),
         tla,
         errors,
+        warnings,
+    }
+}
+
+/// One chart report for a catalog workflow: lower it, then run the same
+/// reachable/can-finish gates as the hand-written charts plus the bounded
+/// check. A workflow that fails to lower is a named error, not a panic.
+/// Catalog TLA export rides a later slice, so `tla` stays empty.
+fn verify_catalog_workflow(
+    name: &str,
+    wf: &toron_workflow::schema::Workflow,
+) -> WorkflowVerifyChartReport {
+    match crate::workflow_lowering::lower(wf) {
+        Err(e) => WorkflowVerifyChartReport {
+            name: name.to_string(),
+            ok: false,
+            checks: serde_json::json!({
+                "reachable": { "ok": false, "unreachable": [] },
+                "can_finish": { "ok": false, "goal": "a top-level final state", "stuck": [] },
+                "bounded": { "ok": false, "unbounded": [] },
+            }),
+            tla: None,
+            errors: vec![format!("{name}: failed to lower ({e:?})")],
+            warnings: Vec::new(),
+        },
+        Ok(lowered) => {
+            let topo = lowered.machine.topology();
+            let is_final = |state: &_| {
+                topo.nodes.get(state).is_some_and(|node| {
+                    node.node_type == toron_core::kernel::StateNodeType::Final
+                        && node.parent.is_none()
+                })
+            };
+            let (bounded_errors, bounded_warnings) =
+                crate::workflow_lowering::check_bounded(&lowered);
+            chart_report(
+                name,
+                &topo,
+                "a top-level final state",
+                is_final,
+                None,
+                &bounded_errors,
+                &bounded_warnings,
+            )
+        }
     }
 }
 
@@ -1953,6 +2010,8 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
             "a final state",
             is_final,
             export_tla.then(|| machine.to_tla_named("SwarmLifecycle")),
+            &[],
+            &[],
         )
     }
 
@@ -1964,6 +2023,8 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
             "Idle",
             |state| *state == P2PNegotiationState::Idle,
             export_tla.then(|| machine.to_tla_named("P2PNegotiation")),
+            &[],
+            &[],
         )
     }
 
@@ -1980,6 +2041,20 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
     }
     if want_all || matches!(want.as_str(), "p2p" | "p2p-negotiation" | "p2pnegotiation") {
         reports.push(verify_p2p(export_tla));
+    }
+    // Catalog workflows (ADR-0021 D5.2, bd-lower-workflows-verify-9mdqc):
+    // one chart report per lowered workflow. A name argument matches one
+    // catalog workflow case-insensitively; without one, all rows verify.
+    let catalogs = crate::builtin_workflows::builtin_workflows();
+    if want_all {
+        for (n, wf) in &catalogs {
+            reports.push(verify_catalog_workflow(n, wf));
+        }
+    } else if let Some((n, wf)) = catalogs
+        .iter()
+        .find(|(k, _)| k.to_ascii_lowercase() == want)
+    {
+        reports.push(verify_catalog_workflow(n, wf));
     }
     if reports.is_empty() {
         bail!(
@@ -2376,6 +2451,8 @@ mod workflow_verify_statechart_tests {
             "Done",
             |s| *s == Chart::Done,
             None,
+            &[],
+            &[],
         );
         assert!(!report.ok);
         assert_eq!(
@@ -2400,6 +2477,65 @@ mod workflow_cli_lint_tests {
     use super::*;
     use crate::builtin_workflows;
     use toron_workflow::schema::parse_workflow;
+
+    /// bd-lower-workflows-verify-9mdqc: the verify row for a catalog
+    /// workflow carries its bounded warnings and stays ok.
+    #[test]
+    fn workflow_lowering_verify_row_reports_bounded_warnings() {
+        let wfs = builtin_workflows::builtin_workflows();
+        let wf = wfs.get("wave-swarm").expect("wave-swarm cataloged");
+        let report = verify_catalog_workflow("wave-swarm", wf);
+        assert!(report.ok, "wave-swarm row stays ok: {:?}", report.errors);
+        assert!(report.errors.is_empty());
+        assert!(
+            report.warnings.iter().any(|w| w.contains("await_gate")),
+            "names the await state: {:?}",
+            report.warnings
+        );
+        assert!(
+            report.warnings.iter().all(|w| w.contains("long hold")),
+            "{:?}",
+            report.warnings
+        );
+        assert_eq!(report.checks["bounded"]["ok"], serde_json::json!(true));
+    }
+
+    /// A clean catalog workflow rows ok with no warnings.
+    #[test]
+    fn workflow_lowering_verify_row_clean_workflow_has_no_warnings() {
+        let wfs = builtin_workflows::builtin_workflows();
+        let wf = wfs
+            .get("beads-lifecycle")
+            .expect("beads-lifecycle cataloged");
+        let report = verify_catalog_workflow("beads-lifecycle", wf);
+        assert!(report.ok, "{:?}", report.errors);
+        assert!(report.errors.is_empty());
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    }
+
+    /// A workflow that fails to lower is a named error, not a panic.
+    #[test]
+    fn workflow_lowering_verify_row_names_lower_failure() {
+        let wf = parse_workflow(
+            r#"
+name: empty
+trigger:
+  type: webhook
+steps: []
+"#,
+        )
+        .expect("parse");
+        let report = verify_catalog_workflow("empty", &wf);
+        assert!(!report.ok);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("empty") && e.contains("failed to lower")),
+            "{:?}",
+            report.errors
+        );
+    }
 
     /// The flywheel-tier lint fails closed on an unresolved `@profile`
     /// (the bead's fail-stop contract).
