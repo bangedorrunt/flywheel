@@ -418,32 +418,6 @@ fn with_targets(
     node
 }
 
-/// States no path from the initial state enters, by name.
-///
-/// Unit-tested check API; the verify path reaches this query through
-/// `chart_report` (mandated reuse), so this stays unwired in the binary.
-/// Restructure `chart_report` to take precomputed checks if the duplication
-/// ever matters.
-#[allow(dead_code)]
-pub fn check_reachable(lowered: &Lowered) -> Vec<String> {
-    lowered.machine.topology().unreachable()
-}
-
-/// Reachable leaves that cannot reach a top-level final state, by name.
-///
-/// No YAML form produced by [`lower`] can strand a state today: branch arms
-/// rejoin the container exit (engine-faithful) and loops carry exits, so a
-/// hand-built machine is the only way to exercise this check.
-///
-/// Unit-tested check API; the verify path reaches this query through
-/// `chart_report` (mandated reuse), so this stays unwired in the binary.
-/// Restructure `chart_report` to take precomputed checks if the duplication
-/// ever matters.
-#[allow(dead_code)]
-pub fn check_can_finish(lowered: &Lowered) -> Vec<String> {
-    lowered.machine.topology().cannot_finish()
-}
-
 /// Back edges without a finite max are errors; a finite max above 32 is a
 /// long-hold warning. Unrecorded cycles are errors. Returns (errors, warnings).
 pub fn check_bounded(lowered: &Lowered) -> (Vec<String>, Vec<String>) {
@@ -516,6 +490,20 @@ mod tests {
     fn lowered(yaml: &str) -> Lowered {
         let wf = parse_workflow(yaml).expect("fixture parses");
         lower(&wf).expect("fixture lowers")
+    }
+
+    /// States no path from the initial state enters, by name.
+    fn check_reachable(lowered: &Lowered) -> Vec<String> {
+        lowered.machine.topology().unreachable()
+    }
+
+    /// Reachable leaves that cannot reach a top-level final state, by name.
+    ///
+    /// No YAML form produced by [`lower`] can strand a state today: branch arms
+    /// rejoin the container exit (engine-faithful) and loops carry exits, so a
+    /// hand-built machine is the only way to exercise this check.
+    fn check_can_finish(lowered: &Lowered) -> Vec<String> {
+        lowered.machine.topology().cannot_finish()
     }
 
     /// A graph node no path reaches fails exactly the reachable check.
