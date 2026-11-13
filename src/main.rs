@@ -4146,6 +4146,8 @@ pub(crate) fn spawn_model_rows(
     registry: &models::ModelRegistry,
     cfg: &Config,
     bare_model: &str,
+    prefs: &crate::preferences::PreferenceSet,
+    project: &str,
 ) -> Result<Vec<(String, String, String)>> {
     let mut rows = Vec::new();
     for item in items {
@@ -4153,13 +4155,25 @@ pub(crate) fn spawn_model_rows(
             let p = catalog
                 .get(name)
                 .ok_or_else(|| anyhow!("unknown profile '@{name}' (flywheel profile list)"))?;
-            let (h, m) = registry.resolve_profile_route(&p.harness, &p.model)?;
-            rows.push((format!("@{name} x{}", item.count), h, m));
+            let harness = prefer_kind(cfg, item, catalog, registry, prefs, project)?;
+            let model = if let Some(pref) =
+                prefer_fill(prefs, item, crate::preferences::Field::Model, project)
+            {
+                pref
+            } else {
+                let (_, resolved) = registry.resolve_profile_route(&harness, &p.model)?;
+                resolved
+            };
+            rows.push((format!("@{name} x{}", item.count), harness, model));
             continue;
         }
-        let kind = spawn_item_kind(cfg, item, catalog, registry)?;
+        let kind = prefer_kind(cfg, item, catalog, registry, prefs, project)?;
         let model = if !bare_model.is_empty() {
             bare_model.to_string()
+        } else if let Some(pref) =
+            prefer_fill(prefs, item, crate::preferences::Field::Model, project)
+        {
+            pref
         } else {
             match models::implied_slot_name_for_harness(&kind)
                 .and_then(|n| registry.effective_slot_model(n))
@@ -4171,6 +4185,59 @@ pub(crate) fn spawn_model_rows(
         rows.push((format!("{} x{}", item.short, item.count), kind, model));
     }
     Ok(rows)
+}
+
+/// Standing-preference role key: the profile name without `@` when the item
+/// is profile-driven, else the item's kind short name (`*` handled by lookup).
+pub(crate) fn prefer_role(item: &SpawnItem) -> &str {
+    match item.profile.as_deref() {
+        Some(p) => p.strip_prefix('@').unwrap_or(p),
+        None => item.short.as_str(),
+    }
+}
+
+/// One standing-preference lookup: project scope beats always, exact role
+/// beats `*`. `None` means no row — the existing chain decides.
+pub(crate) fn prefer_fill(
+    prefs: &crate::preferences::PreferenceSet,
+    item: &SpawnItem,
+    field: crate::preferences::Field,
+    project: &str,
+) -> Option<String> {
+    prefs
+        .lookup(prefer_role(item), field, Some(project))
+        .map(str::to_string)
+}
+
+/// Effective harness for one item: an explicit `--kind` is a user choice and
+/// wins; otherwise a standing harness preference applies to profile items
+/// only; bare items keep the existing kind resolution.
+pub(crate) fn prefer_kind(
+    cfg: &Config,
+    item: &SpawnItem,
+    catalog: &profile::ProfileCatalog,
+    registry: &models::ModelRegistry,
+    prefs: &crate::preferences::PreferenceSet,
+    project: &str,
+) -> Result<String> {
+    if item.profile.is_some() {
+        if let Some(k) = item.kind.as_deref().filter(|k| !k.is_empty()) {
+            return Ok(k.to_string());
+        }
+        if let Some(h) = prefer_fill(prefs, item, crate::preferences::Field::Harness, project) {
+            return Ok(h);
+        }
+        let p = catalog
+            .get(item.profile.as_deref().unwrap_or(""))
+            .ok_or_else(|| {
+                anyhow!(
+                    "unknown profile '@{}' (flywheel profile list)",
+                    item.profile.as_deref().unwrap_or("")
+                )
+            })?;
+        return Ok(registry.resolve_profile_route(&p.harness, &p.model)?.0);
+    }
+    spawn_item_kind(cfg, item, catalog, registry)
 }
 
 fn spawn_item_kind(
@@ -4227,6 +4294,7 @@ fn bare_model_launch(
     harness: &str,
     model: &str,
     provider: &str,
+    effort: Option<&str>,
 ) -> Result<(Vec<String>, Option<String>)> {
     let registry = models::ModelRegistry::load_routing()?;
     let model = if model.is_empty() {
@@ -4257,7 +4325,8 @@ fn bare_model_launch(
     } else {
         format!("{provider}/{model}")
     };
-    let plan = headless::interactive_model_plan(harness, &registry.resolve(&lookup, harness), None);
+    let plan =
+        headless::interactive_model_plan(harness, &registry.resolve(&lookup, harness), effort);
     Ok((plan.args().to_vec(), plan.env_pin().map(str::to_string)))
 }
 
