@@ -1168,6 +1168,7 @@ pub(crate) fn cmd_internal_run_headless(
     cron: Option<&str>,
     phase: Option<&str>,
     effort_override: Option<&str>,
+    mode_override: Option<&str>,
     json: bool,
 ) -> Result<()> {
     use sha1::Digest;
@@ -1231,6 +1232,11 @@ pub(crate) fn cmd_internal_run_headless(
                 phase,
             )
             .map_err(|e| anyhow!("headless run for @{profile_name}: {e}"))?;
+            let (argv, mode_warning) =
+                headless::apply_mode_argv(argv, harness, mode_override, prompt);
+            if let Some(warning) = mode_warning {
+                eprintln!("flywheel: {warning}");
+            }
             let started = std::time::Instant::now();
             let output = Command::new(&argv[0])
                 .args(&argv[1..])
@@ -1539,6 +1545,185 @@ pub(crate) fn parse_leaf_output(trimmed: &str, raw: &str, err: &str) -> Result<V
     }
 }
 
+/// The resolved per-step contract fields (ADR-0021 D3, ADR-0022 D2):
+/// each carries the winning value and which rung asked for it.
+pub(crate) struct ResolvedStepFields {
+    pub effort: Option<(String, crate::swarm_plan::Provenance)>,
+    pub mode: Option<(String, crate::swarm_plan::Provenance)>,
+    pub phase: Option<(String, crate::swarm_plan::Provenance)>,
+}
+
+/// Resolve one dispatch step's effort/mode/phase through the precedence
+/// step > stage > profile. All inputs are already-rendered strings
+/// (spec `{{inputs.*}}` refs are rendered by the caller); empty counts
+/// as absent. Pure — testable without spawning anything.
+#[must_use]
+pub(crate) fn resolve_step_fields(
+    spec_effort: Option<&str>,
+    spec_phase: Option<&str>,
+    spec_mode: Option<&str>,
+    stage: Option<&crate::stages::Stage>,
+    profile_effort: &str,
+) -> ResolvedStepFields {
+    let stage_effort = stage.and_then(|s| s.effort.as_deref());
+    let stage_phase = stage.and_then(|s| s.phase.as_deref());
+    let stage_mode = stage.and_then(|s| s.mode.as_ref()).map(|m| match m {
+        crate::stages::StageMode::ReadOnly => "read-only",
+        crate::stages::StageMode::WorkspaceWrite => "workspace-write",
+        crate::stages::StageMode::Isolated => "isolated",
+    });
+    let profile_effort = (!profile_effort.trim().is_empty()).then(|| profile_effort.trim());
+    ResolvedStepFields {
+        effort: crate::headless::resolve_dispatch_field(spec_effort, stage_effort, profile_effort),
+        mode: crate::headless::resolve_dispatch_field(spec_mode, stage_mode, None),
+        phase: crate::headless::resolve_dispatch_field(spec_phase, stage_phase, None),
+    }
+}
+
+/// The `__run-headless` leaf command line, factored out of
+/// [`headless_dispatch`] so tests prove the flags without spawning
+/// (ADR-0022 D2: the leaf receives exactly what the step resolved).
+pub(crate) struct HeadlessLeafArgs<'a> {
+    pub profile_name: &'a str,
+    pub prompt: &'a str,
+    pub workflow: &'a str,
+    pub json: bool,
+    pub harness: Option<&'a str>,
+    pub phase: Option<&'a str>,
+    pub effort: Option<&'a str>,
+    pub mode: Option<&'a str>,
+    pub cron: Option<&'a str>,
+    pub model: Option<&'a str>,
+}
+
+/// Build the `__run-headless` argv. Flag order is stable: positionals
+/// first, then `--json`, then one flag per resolved field. A `None` field
+/// emits nothing, so callers that resolve nothing change no bytes.
+#[must_use]
+pub(crate) fn headless_leaf_argv(a: &HeadlessLeafArgs) -> Vec<String> {
+    let mut argv = vec![
+        "__run-headless".to_string(),
+        a.profile_name.to_string(),
+        a.prompt.to_string(),
+        "--workflow".to_string(),
+        a.workflow.to_string(),
+    ];
+    if a.json {
+        argv.push("--json".to_string());
+    }
+    for (flag, value) in [
+        ("--harness", a.harness),
+        ("--phase", a.phase),
+        ("--effort", a.effort),
+        ("--mode", a.mode),
+        ("--cron", a.cron),
+        ("--model", a.model),
+    ] {
+        if let Some(v) = value.filter(|v| !v.trim().is_empty()) {
+            argv.push(flag.to_string());
+            argv.push(v.to_string());
+        }
+    }
+    argv
+}
+
+/// The `applied` block for the dispatched output: what the leaf actually
+/// received, per field, with provenance. Absent fields render null so the
+/// shape is stable whether or not a rung asked.
+#[must_use]
+pub(crate) fn applied_json(
+    effort: &Option<(String, crate::swarm_plan::Provenance)>,
+    mode: &Option<(String, crate::swarm_plan::Provenance)>,
+    phase: &Option<(String, crate::swarm_plan::Provenance)>,
+) -> Value {
+    fn field(f: &Option<(String, crate::swarm_plan::Provenance)>) -> Value {
+        match f {
+            Some((value, from)) => json!({
+                "value": value,
+                "from": format!("{from:?}").to_lowercase(),
+            }),
+            None => Value::Null,
+        }
+    }
+    json!({
+        "effort": field(effort),
+        "mode": field(mode),
+        "phase": field(phase),
+    })
+}
+
+#[cfg(test)]
+mod headless_dispatch_args_tests {
+    use super::*;
+    use crate::swarm_plan::Provenance;
+
+    /// ADR-0021 D3 step > stage > profile (bd-2hh0h): the stage contract
+    /// wins over the profile default, and the step's own ask wins over
+    /// both — per field, with provenance. plan-polish seeds effort=max.
+    #[test]
+    fn dispatch_resolves_effort_stage_over_profile() {
+        let lib = crate::stages::StageLibrary::compiled_in();
+        let stage = lib.get_stage("plan-polish").expect("seed stage");
+        assert_eq!(stage.effort.as_deref(), Some("max"));
+        let fields = resolve_step_fields(None, None, None, Some(stage), "low");
+        assert_eq!(fields.effort, Some(("max".to_string(), Provenance::Stage)));
+        let fields = resolve_step_fields(Some("high"), None, None, Some(stage), "low");
+        assert_eq!(fields.effort, Some(("high".to_string(), Provenance::Step)));
+    }
+
+    /// ADR-0021 D3 (bd-2hh0h): ce-review seeds mode read-only + phase
+    /// review, and the step carries both into the leaf argv.
+    #[test]
+    fn dispatch_ce_review_carries_mode_and_phase() {
+        let lib = crate::stages::StageLibrary::compiled_in();
+        let stage = lib.get_stage("ce-review").expect("seed stage");
+        let fields = resolve_step_fields(None, None, None, Some(stage), "");
+        assert_eq!(
+            fields.mode,
+            Some(("read-only".to_string(), Provenance::Stage))
+        );
+        assert_eq!(
+            fields.phase,
+            Some(("review".to_string(), Provenance::Stage))
+        );
+        let argv = headless_leaf_argv(&HeadlessLeafArgs {
+            profile_name: "reviewer",
+            prompt: "do it",
+            workflow: "wave-swarm",
+            json: true,
+            harness: None,
+            phase: fields.phase.as_ref().map(|(v, _)| v.as_str()),
+            effort: None,
+            mode: fields.mode.as_ref().map(|(v, _)| v.as_str()),
+            cron: None,
+            model: None,
+        });
+        assert!(
+            argv.windows(2).any(|w| w == ["--mode", "read-only"]),
+            "leaf argv carries stage mode: {argv:?}"
+        );
+        assert!(
+            argv.windows(2).any(|w| w == ["--phase", "review"]),
+            "leaf argv carries stage phase: {argv:?}"
+        );
+    }
+
+    /// The `applied` block reports what the leaf actually received, with
+    /// provenance; absent fields render null.
+    #[test]
+    fn applied_json_reports_values_with_provenance() {
+        let v = applied_json(
+            &Some(("max".to_string(), Provenance::Stage)),
+            &None,
+            &Some(("review".to_string(), Provenance::Stage)),
+        );
+        assert_eq!(v["effort"]["value"], "max");
+        assert_eq!(v["effort"]["from"], "stage");
+        assert!(v["mode"].is_null(), "{v}");
+        assert_eq!(v["phase"]["from"], "stage");
+    }
+}
+
 pub(crate) fn headless_dispatch(
     catalog: &profile::ProfileCatalog,
     wf_name: &str,
@@ -1581,34 +1766,51 @@ pub(crate) fn headless_dispatch(
     }
     let prompt = headless::conditioned_prompt(&profile.behavior, &base);
 
-    let mut cmd = Command::new(std::env::current_exe()?);
-    cmd.arg("__run-headless")
-        .arg(profile_name)
-        .arg(&prompt)
-        .arg("--workflow")
-        .arg(wf_name)
-        .arg("--json");
+    // ADR-0021 D3: resolve the step's stage once, from the same layered
+    // library the prompt resolves from (project tier wins when set).
+    // Unknown or stage-less steps simply carry no stage contract.
+    let stage_name = headless::dispatch_spec_stage(spec);
+    let stage_lib = match project_dir {
+        Some(dir) => {
+            let path = dir.join(".flywheel/stages.toml");
+            if path.is_file() {
+                crate::stages::StageLibrary::load_layered(Some(&path)).ok()
+            } else {
+                crate::stages::StageLibrary::load().ok()
+            }
+        }
+        None => crate::stages::StageLibrary::load().ok(),
+    };
+    let stage = stage_name.and_then(|name| {
+        stage_lib
+            .as_ref()
+            .and_then(|lib| lib.get_stage(name))
+            .cloned()
+    });
+    let fields = resolve_step_fields(
+        headless::spec_extra(spec, "effort", inputs).as_deref(),
+        headless::dispatch_spec_phase(spec),
+        headless::spec_extra(spec, "mode", inputs).as_deref(),
+        stage.as_ref(),
+        &profile.effort,
+    );
     let harness =
         headless::effective_step_harness(headless::dispatch_spec_harness(spec), &profile.harness);
-    if !harness.is_empty() {
-        cmd.arg("--harness").arg(harness);
-    }
-    if let Some(p) = headless::dispatch_spec_phase(spec)
-        && !p.trim().is_empty()
-    {
-        cmd.arg("--phase").arg(p);
-    }
-    // governed-by: bd-ulzi — the spec effort input rides to the leaf,
-    if let Some(e) = headless::spec_extra(spec, "effort", inputs)
-        && !e.trim().is_empty()
-    {
-        cmd.arg("--effort").arg(e);
-    }
-    if let Some(cron) = cron {
-        cmd.arg("--cron").arg(cron);
-    }
-    if !profile.model.is_empty() && models::slot_alias(&profile.model).is_none() {
-        cmd.arg("--model").arg(&profile.model);
+    let mut cmd = Command::new(std::env::current_exe()?);
+    for arg in headless_leaf_argv(&HeadlessLeafArgs {
+        profile_name,
+        prompt: &prompt,
+        workflow: wf_name,
+        json: true,
+        harness: (!harness.is_empty()).then_some(harness),
+        phase: fields.phase.as_ref().map(|(v, _)| v.as_str()),
+        effort: fields.effort.as_ref().map(|(v, _)| v.as_str()),
+        mode: fields.mode.as_ref().map(|(v, _)| v.as_str()),
+        cron,
+        model: (!profile.model.is_empty() && models::slot_alias(&profile.model).is_none())
+            .then_some(profile.model.as_str()),
+    }) {
+        cmd.arg(arg);
     }
     let output = cmd
         .output()
@@ -1616,7 +1818,16 @@ pub(crate) fn headless_dispatch(
     let raw = String::from_utf8_lossy(&output.stdout).to_string();
     let trimmed = raw.trim();
     let err = String::from_utf8_lossy(&output.stderr).to_string();
-    let v = parse_leaf_output(trimmed, &raw, &err)?;
+    let mut v = parse_leaf_output(trimmed, &raw, &err)?;
+    // ADR-0022 D2: the dispatched output says what the leaf actually
+    // received, per field, with provenance (the witness/evaluation path
+    // audits from here; the run log links by run_id).
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "applied".into(),
+            applied_json(&fields.effort, &fields.mode, &fields.phase),
+        );
+    }
     if phase_chain::plan_artifact_missing(spec, inputs) {
         eprintln!(
             "flywheel: phase implement dispatch has NO completed plan artifact — \

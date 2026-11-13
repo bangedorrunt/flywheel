@@ -2107,6 +2107,12 @@ enum Commands {
         /// wins over the profile default for THIS step only
         #[arg(long)]
         effort: Option<String>,
+        /// per-step mode override (ADR-0021 D3, ADR-0022 D3): read-only |
+        /// workspace-write | isolated. Wins over the stage contract and the
+        /// profile default for THIS step only; the harness argv carries it
+        /// (or warns loudly when the harness has no native mechanic).
+        #[arg(long)]
+        mode: Option<String>,
         /// one JSON line for the parent runner (default: human summary)
         #[arg(long)]
         json: bool,
@@ -3910,6 +3916,7 @@ fn main() {
             cron,
             phase,
             effort,
+            mode,
             json,
         }) => cmd_internal_run_headless(
             profile,
@@ -3920,6 +3927,7 @@ fn main() {
             cron.as_deref(),
             phase.as_deref(),
             effort.as_deref(),
+            mode.as_deref(),
             *json,
         ),
         None => {

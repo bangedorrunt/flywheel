@@ -27,6 +27,8 @@ pub enum Provenance {
     Slot,
     Jev,
     HarnessDefault,
+    /// The step's own ask (ADR-0021 D3.7): beats stage, profile, everything.
+    Step,
     /// The value came from a `replaced_by` retirement hop; `Field.was`
     /// carries the asked id.
     Replacement,
@@ -631,6 +633,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(Provenance::Replacement).unwrap(),
             serde_json::json!("replacement")
+        );
+        assert_eq!(
+            serde_json::to_value(Provenance::Step).unwrap(),
+            serde_json::json!("step")
         );
     }
 }

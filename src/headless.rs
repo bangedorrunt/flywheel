@@ -409,6 +409,29 @@ pub fn dispatch_spec_phase(spec: &DispatchSpec) -> Option<&str> {
     spec.phase.as_deref()
 }
 
+/// ADR-0021 D3 step > stage > profile: the step's own ask wins, then the
+/// stage contract, then the profile default. Empty strings count as
+/// absent. Returns the winning value and which rung asked for it.
+/// Provenance comes from `swarm_plan` so plan and dispatch agree.
+#[must_use]
+pub fn resolve_dispatch_field(
+    step: Option<&str>,
+    stage: Option<&str>,
+    profile: Option<&str>,
+) -> Option<(String, crate::swarm_plan::Provenance)> {
+    use crate::swarm_plan::Provenance;
+    for (ask, from) in [
+        (step, Provenance::Step),
+        (stage, Provenance::Stage),
+        (profile, Provenance::Profile),
+    ] {
+        if let Some(v) = ask.map(str::trim).filter(|v| !v.is_empty()) {
+            return Some((v.to_string(), from));
+        }
+    }
+    None
+}
+
 /// `build_argv_roles` + the ADR-0022 phase registry: when `phase` is set,
 /// the registry args are INSERTED BEFORE the trailing prompt positional
 /// (flags after it would be swallowed as prompt text). Returns `(argv,
@@ -465,6 +488,35 @@ fn phase_argv_insert_at(argv: &[String], prompt: &str) -> usize {
         Some(last) if last == prompt => argv.len() - 1,
         _ => argv.len(),
     }
+}
+
+/// ADR-0022 phase 2b (bd-2hh0h): splice a mode mechanic into the harness
+/// argv before the trailing prompt positional (same rule as
+/// [`phase_argv_insert_at`], so a flag never lands after prompt text).
+/// Returns the argv plus the stderr warning when the mode is degraded —
+/// the caller prints it (loud, never silent) and the seat still runs.
+/// Absent mode passes through untouched and quiet.
+#[must_use]
+pub fn apply_mode_argv(
+    argv: Vec<String>,
+    harness: &str,
+    mode: Option<&str>,
+    prompt: &str,
+) -> (Vec<String>, Option<String>) {
+    let Some(mode) = mode.map(str::trim).filter(|m| !m.is_empty()) else {
+        return (argv, None);
+    };
+    let (extra, delivery) = mode_launch_args(harness, mode);
+    let degraded = matches!(delivery, ModeDelivery::Degraded { .. });
+    let mut argv = argv;
+    if !extra.is_empty() {
+        let at = phase_argv_insert_at(&argv, prompt);
+        argv.splice(at..at, extra);
+    }
+    let warn = degraded.then(|| {
+        format!("flywheel: mode {mode:?} has no native mechanic on harness {harness:?} — degrading to prompt mode")
+    });
+    (argv, warn)
 }
 
 /// ADR-0022 §3.2 R3 (bd-adr22-w2-phase-registry-igya): the preflight
@@ -998,6 +1050,39 @@ mod tests {
         assert!(!degraded);
     }
 
+    /// ADR-0022 phase 2b (bd-7rg0f): mode args splice before the trailing
+    /// prompt positional without splitting a flag from its value; degraded
+    /// rows warn instead of running silent.
+    #[test]
+    fn apply_mode_argv_splices_before_prompt_and_warns_when_degraded() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let (argv, warn) = apply_mode_argv(
+            s(&["opencode", "run", "PROMPT"]),
+            "opencode",
+            Some("read-only"),
+            "PROMPT",
+        );
+        assert_eq!(argv, s(&["opencode", "run", "--agent", "plan", "PROMPT"]));
+        assert!(warn.is_none(), "honored mode stays quiet");
+        let (argv, warn) = apply_mode_argv(
+            s(&["gemini", "PROMPT"]),
+            "gemini",
+            Some("read-only"),
+            "PROMPT",
+        );
+        assert_eq!(argv, s(&["gemini", "--approval-mode", "default", "PROMPT"]));
+        assert!(
+            warn.is_some_and(|w| w.contains("gemini")),
+            "degraded mode warns naming the harness"
+        );
+        let (argv, warn) = apply_mode_argv(s(&["fx", "PROMPT"]), "fx", Some("read-only"), "PROMPT");
+        assert_eq!(argv, s(&["fx", "PROMPT"]), "no flag: argv untouched");
+        assert!(warn.is_some(), "no flag still warns, never silent");
+        let (argv, warn) = apply_mode_argv(s(&["pi", "PROMPT"]), "pi", None, "PROMPT");
+        assert_eq!(argv, s(&["pi", "PROMPT"]));
+        assert!(warn.is_none(), "absent mode is quiet");
+    }
+
     /// ADR-0022 W2: the argv wrapper inserts registry args BEFORE the
     /// trailing prompt positional and reports degradation to the caller.
     #[test]
@@ -1293,6 +1378,28 @@ mod tests {
         };
         assert_eq!(dispatch_spec_task(&no_task), None);
         assert_eq!(dispatch_spec_task(&DispatchSpec::default()), None);
+    }
+
+    /// ADR-0021 D3 step > stage > profile: the step's own ask wins, then
+    /// the stage contract, then the profile default. Empty strings count
+    /// as absent.
+    #[test]
+    fn dispatch_field_prefers_step_over_stage_over_profile() {
+        use crate::swarm_plan::Provenance;
+        assert_eq!(
+            resolve_dispatch_field(Some("high"), Some("max"), Some("low")),
+            Some(("high".to_string(), Provenance::Step))
+        );
+        assert_eq!(
+            resolve_dispatch_field(None, Some("max"), Some("low")),
+            Some(("max".to_string(), Provenance::Stage))
+        );
+        assert_eq!(
+            resolve_dispatch_field(None, None, Some("low")),
+            Some(("low".to_string(), Provenance::Profile))
+        );
+        assert_eq!(resolve_dispatch_field(None, None, None), None);
+        assert_eq!(resolve_dispatch_field(Some("  "), Some(""), None), None);
     }
 
     #[test]
