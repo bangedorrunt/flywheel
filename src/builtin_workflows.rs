@@ -262,6 +262,7 @@ steps:
   - name: gate
     action: request_approval
     message: "Approve plan for {{inputs.goal}}?"
+    timeout_secs: 3600
 "#,
     ),
     (
@@ -1302,6 +1303,7 @@ steps:
   - name: signoff
     action: request_approval
     message: "Wave signoff (captain-only) for {{inputs.objective}} [{{inputs.wave_label}}]: review the VERIFY receipts, the REVIEW findings, and the COMPOUND learnings summary; approve closes the wave gate, reject reopens."
+    timeout_secs: 3600
 "#,
     ),
     (
@@ -1482,6 +1484,7 @@ graph:
       guard: 'trigger_gate_before_implement == "true" && trigger_until != "grill" && trigger_until != "create" && trigger_until != "polish" && trigger_until != "audit" && trigger_until != "integrate"'
       action: request_approval
       message: "Beads lifecycle gate (captain-only) for {{inputs.objective}} [{{inputs.project}}]: approve to let implement proceed, reject to stop here."
+      timeout_secs: 3600
     implement-bead:
       needs: [gate-before-implement]
       guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "polish" && trigger_until != "audit" && trigger_until != "integrate" && trigger_existing_bead != ""'
@@ -1511,6 +1514,7 @@ graph:
       guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "polish" && trigger_until != "audit" && trigger_until != "integrate" && trigger_until != "implement" && trigger_until != "verify"'
       action: request_approval
       message: "Beads lifecycle signoff (captain-only) for {{inputs.objective}} [{{inputs.project}}]: review the verify evidence on {{inputs.steer_channel}}; approve closes, reject reopens."
+      timeout_secs: 3600
 "#,
     ),
     (

@@ -109,8 +109,10 @@ pass.
   (Choice) and `peer-review-severity` (Score 1..4) provide sub-100ms structured
   advisory evidence without LLM hallucination. Advisory only; pure tick holds.
 - **Statechart topology checks (ADR-0021 D5).** `flywheel workflow verify [NAME]
-  [--export-tla] [--json]` (`flywheel-workflow-verify.v2`) checks
-  `src/elm/swarm_statechart.rs` and `src/elm/p2p_negotiation.rs`: every state
+  [--export-tla] [--json]` (`flywheel-workflow-verify.v2`) checks the remaining
+  hand-written charts (`src/elm/p2p_negotiation.rs`, `seat_statechart.rs`,
+  `plan_statechart.rs`) and every catalog workflow (wave-swarm included; the
+  retired `swarm_statechart.rs` is verified as that workflow now): every state
   reachable, every reachable leaf can reach its goal. Guards count as enabled
   and data is not modelled, so a pass is not a proof; `--export-tla` text is
   topology-only and no model checker runs. `scripts/clean-proof.sh` gates on it.

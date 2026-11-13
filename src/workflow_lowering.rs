@@ -351,12 +351,12 @@ impl LowerBuilder {
                     self.unbounded_waits.push(here.to_string());
                 }
             }
-            Action::RequestApproval { .. } => {
-                // No timeout field exists on request_approval in toron-workflow
-                // (only `message`): reported, not invented. Treat like any
-                // other step: it suspends, then control continues on approval.
+            Action::RequestApproval { timeout_secs, .. } => {
                 for e in exit {
                     self.edge(here, e);
+                }
+                if timeout_secs.is_none_or(|t| t == 0) {
+                    self.unbounded_waits.push(here.to_string());
                 }
             }
             _ => {
@@ -637,6 +637,54 @@ mod tests {
     fn lowered(yaml: &str) -> Lowered {
         let wf = parse_workflow(yaml).expect("fixture parses");
         lower(&wf).expect("fixture lowers")
+    }
+
+    /// bd-36zlq: an approval step with no cap is a hang with extra steps —
+    /// the bounded check names it.
+    #[test]
+    fn workflow_lowering_approval_without_timeout_fails() {
+        let l = lowered(
+            r#"
+name: gated
+trigger:
+  type: webhook
+inputs: []
+steps:
+  - name: approve
+    action: request_approval
+    message: Ship it?
+"#,
+        );
+        assert!(check_reachable(&l).is_empty());
+        assert!(check_can_finish(&l).is_empty());
+        let (errs, warns) = check_bounded(&l);
+        assert_eq!(errs.len(), 1, "one unbounded wait: {errs:?}");
+        assert!(errs[0].contains("approve"), "{errs:?}");
+        assert!(errs[0].contains("no finite timeout"), "{errs:?}");
+        assert!(warns.is_empty());
+    }
+
+    /// The same step bounded by `timeout_secs` passes every check.
+    #[test]
+    fn workflow_lowering_approval_with_timeout_passes() {
+        let l = lowered(
+            r#"
+name: gated
+trigger:
+  type: webhook
+inputs: []
+steps:
+  - name: approve
+    action: request_approval
+    message: Ship it?
+    timeout_secs: 3600
+"#,
+        );
+        assert!(check_reachable(&l).is_empty());
+        assert!(check_can_finish(&l).is_empty());
+        let (errs, warns) = check_bounded(&l);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(warns.is_empty(), "{warns:?}");
     }
 
     /// A park step without a finite timeout fails exactly the bounded check.
@@ -1043,6 +1091,25 @@ steps:
         let (errs, _) = check_bounded(&l);
         assert_eq!(errs.len(), 1, "zero cap is unbounded: {errs:?}");
         assert!(errs[0].contains("wait"), "{errs:?}");
+    }
+
+    /// bd-36zlq: bd-ge1zo retired the marker polls, so wave-swarm lowers with
+    /// ZERO long-hold warnings. That is the precondition for deleting the
+    /// hand-written `SwarmLifecycle` statechart.
+    #[test]
+    fn workflow_lowering_wave_swarm_has_no_long_hold() {
+        let wf = crate::builtin_workflows::builtin_workflows()
+            .into_iter()
+            .find(|(name, _)| name == "wave-swarm")
+            .expect("wave-swarm is compiled in")
+            .1;
+        let lowered = lower(&wf).expect("wave-swarm lowers");
+        let (errs, warns) = check_bounded(&lowered);
+        assert!(errs.is_empty(), "wave-swarm bounded errors: {errs:?}");
+        assert!(
+            warns.is_empty(),
+            "wave-swarm still has long-hold warnings: {warns:?}"
+        );
     }
 
     /// Every compiled-in catalog workflow lowers and passes all four

@@ -334,7 +334,8 @@ pub(crate) enum WorkflowCmd {
     /// Check registered statecharts' topology: every state reachable, every reachable leaf can reach
     /// its goal. Guards count as enabled; no model checker runs. Optionally print topology-only TLA+.
     Verify {
-        /// Statechart name: SwarmLifecycle or P2PNegotiation. Omit to verify all.
+        /// Chart or workflow name: P2PNegotiation, Seat, Plan, or a catalog
+        /// workflow (wave-swarm is verified as the workflow now). Omit for all.
         name: Option<String>,
         /// Export compiled TLA+ specification for each verified chart.
         #[arg(long)]
@@ -2063,28 +2064,6 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
     use crate::elm::p2p_negotiation::{P2PNegotiationState, build_p2p_negotiation_machine};
     use crate::elm::plan_statechart::build_plan_machine;
     use crate::elm::seat_statechart::build_seat_machine;
-    use crate::elm::swarm_statechart::build_swarm_machine;
-    use toron_core::kernel::StateNodeType;
-
-    fn verify_swarm(export_tla: bool) -> WorkflowVerifyChartReport {
-        let machine = build_swarm_machine();
-        let topology = machine.topology();
-        let is_final = |state: &_| {
-            topology
-                .nodes
-                .get(state)
-                .is_some_and(|node| node.node_type == StateNodeType::Final)
-        };
-        chart_report(
-            "SwarmLifecycle",
-            &topology,
-            "a final state",
-            is_final,
-            export_tla.then(|| machine.to_tla_named("SwarmLifecycle")),
-            None,
-            &ChartFindings::default(),
-        )
-    }
 
     fn verify_p2p(export_tla: bool) -> WorkflowVerifyChartReport {
         let machine = build_p2p_negotiation_machine();
@@ -2144,14 +2123,6 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
     let want_all = name.is_none();
     let want = name.unwrap_or("").to_ascii_lowercase();
     let mut reports = Vec::new();
-    if want_all
-        || matches!(
-            want.as_str(),
-            "swarm" | "swarm-lifecycle" | "swarmlifecycle"
-        )
-    {
-        reports.push(verify_swarm(export_tla));
-    }
     if want_all || matches!(want.as_str(), "p2p" | "p2p-negotiation" | "p2pnegotiation") {
         reports.push(verify_p2p(export_tla));
     }
@@ -2203,7 +2174,7 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
     }
     if reports.is_empty() {
         bail!(
-            "unknown statechart {} (expected SwarmLifecycle, P2PNegotiation, Seat, Plan, or a workflow name)",
+            "unknown statechart {} (expected P2PNegotiation, Seat, Plan, or a workflow name)",
             name.unwrap_or("")
         );
     }
@@ -2612,9 +2583,23 @@ mod workflow_verify_statechart_tests {
         assert_eq!(report.errors.len(), 2);
     }
 
+    /// Hermetic: an operator's user tier must not decide this gate (a stale
+    /// copy shadowing a builtin would report their file, not the shipped one).
     #[test]
     fn statechart_verify_passes_the_shipped_charts() {
-        assert!(cmd_workflow_verify(None, false, true).is_ok());
+        let _env = crate::config::lock_env();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        let dir = std::env::temp_dir().join(format!("fw-verify-tier-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp config home");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        let ok = cmd_workflow_verify(None, false, true).is_ok();
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(ok, "the shipped tiers verify cleanly");
     }
 }
 

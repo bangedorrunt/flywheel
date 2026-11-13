@@ -92,8 +92,8 @@ fn test_cli_workflow_verify_plain_text() {
         "plain output must state what is not checked: {text}"
     );
     assert!(
-        text.contains("workflow verify SwarmLifecycle: ok"),
-        "expected SwarmLifecycle ok in output: {text}"
+        !text.contains("workflow verify SwarmLifecycle"),
+        "the hand-written SwarmLifecycle chart is retired; wave-swarm verifies as a workflow: {text}"
     );
     assert!(
         text.contains("workflow verify P2PNegotiation: ok"),
@@ -128,14 +128,19 @@ fn test_cli_workflow_verify_json_contract() {
     let charts = json["charts"]
         .as_array()
         .expect("charts must be a JSON array");
-    assert_eq!(charts.len(), 2, "must verify exactly 2 statecharts");
-
     let chart_names: Vec<&str> = charts
         .iter()
         .map(|c| c["name"].as_str().expect("name must be string"))
         .collect();
-    assert!(chart_names.contains(&"SwarmLifecycle"));
+    assert!(
+        !chart_names.contains(&"SwarmLifecycle"),
+        "the hand-written SwarmLifecycle chart is retired: {chart_names:?}"
+    );
     assert!(chart_names.contains(&"P2PNegotiation"));
+    assert!(
+        chart_names.contains(&"wave-swarm"),
+        "wave-swarm verifies as the lowered workflow: {chart_names:?}"
+    );
 
     for chart in charts {
         assert_eq!(
@@ -163,14 +168,17 @@ fn test_cli_workflow_verify_json_contract() {
 fn test_cli_workflow_verify_single_named_chart() {
     let env = HermeticEnv::new();
 
-    // Verify SwarmLifecycle alone
+    // The retired chart is no longer addressable (wave-swarm is a workflow).
     let out = env.run(&["workflow", "verify", "SwarmLifecycle", "--json"]);
+    assert!(!out.status.success(), "the retired chart must not verify");
+
+    let out = env.run(&["workflow", "verify", "wave-swarm", "--json"]);
     assert!(out.status.success());
     let json = stdout_json(&out);
     assert_eq!(json["ok"], true);
     let charts = json["charts"].as_array().unwrap();
     assert_eq!(charts.len(), 1);
-    assert_eq!(charts[0]["name"], "SwarmLifecycle");
+    assert_eq!(charts[0]["name"], "wave-swarm");
 
     // Verify P2PNegotiation alone
     let out = env.run(&["workflow", "verify", "P2PNegotiation", "--json"]);
@@ -209,8 +217,8 @@ fn test_cli_workflow_verify_export_tla() {
 
     let text = stdout_str(&out);
     assert!(
-        text.contains("---- MODULE SwarmLifecycle ----"),
-        "must contain SwarmLifecycle TLA+ header"
+        !text.contains("---- MODULE SwarmLifecycle ----"),
+        "the retired chart exports no module"
     );
     assert!(
         text.contains("---- MODULE P2PNegotiation ----"),
