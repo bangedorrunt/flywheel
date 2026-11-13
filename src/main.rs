@@ -845,6 +845,11 @@ enum Commands {
         /// with --dry-run: print the plan compact (machine-readable).
         #[arg(long)]
         json: bool,
+        /// re-resolve one seat (repeatable): `--patch <seat>.<field>=<value>`,
+        /// field in harness|model|effort|mode. Later patches win; unknown
+        /// seats or fields fail naming the valid ones.
+        #[arg(long, value_name = "SEAT.FIELD=VALUE")]
+        patch: Vec<String>,
     },
     /// Extend a running swarm with more agent panes
     Add {
@@ -2984,6 +2989,7 @@ fn main() {
             "upstream_parity": upstream_parity::robot_summary(),
             "commands": [
                 "init spawn add list status decide rebind recover",
+                "spawn <project> [--kind K=N ...] [--dry-run --json] [--patch <seat>.<field>=<value> (repeatable; re-resolves the seat with from: user)] [--yes] (ADR-0022 plan spawn; see --help for the full flag list)",
             "send interrupt view output watch attach kill",
             "prefer <role.field>=<value> [--project <p>] | prefer --list [--json] | prefer --forget <role.field> [--project <p>] (ADR-0022 D6: standing preferences — project beats always, exact role beats *; set also records a chie lesson)",
             "crew preview|control|prompt (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker)",
@@ -3091,6 +3097,7 @@ fn main() {
             request_key,
             dry_run,
             json,
+            patch,
         }) => cmd_spawn(
             &cfg,
             project,
@@ -3119,6 +3126,7 @@ fn main() {
                 join: *join,
                 dry_run: *dry_run,
                 json: *json,
+                patches: patch.clone(),
             },
         ),
         Some(Commands::Add {
@@ -6883,6 +6891,10 @@ struct SpawnOpts {
     dry_run: bool,
     /// with dry_run: compact JSON plan output.
     json: bool,
+    /// re-resolve one seat (repeatable): `--patch <seat>.<field>=<value>`,
+    /// field in harness|model|effort|mode. Later patches win; unknown
+    /// seats or fields fail naming the valid ones.
+    patches: Vec<String>,
 }
 
 impl Default for SpawnOpts {
@@ -6907,6 +6919,7 @@ impl Default for SpawnOpts {
             request_key: None,
             dry_run: false,
             json: false,
+            patches: Vec::new(),
             bare_model: String::new(),
             bare_provider: String::new(),
             escape: false,

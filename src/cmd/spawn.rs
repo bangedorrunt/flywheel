@@ -1235,7 +1235,7 @@ projects available: {}",
     if items.is_empty() {
         bail!("nothing to spawn: pass --oc/--pi/--gk counts, --recipe NAME, or --profile NAME");
     }
-    let plan = build_dry_run_plan(
+    let mut plan = build_dry_run_plan(
         cfg,
         &items,
         &catalog,
@@ -1245,6 +1245,18 @@ projects available: {}",
         &prefs,
         project,
     )?;
+    for spec in &opts.patches {
+        let patch = crate::swarm_plan::parse_patch(spec)
+            .map_err(|e| anyhow::anyhow!("bad --patch {spec:?}: {e}"))?;
+        plan = crate::swarm_plan::apply_patch(
+            &plan,
+            &patch,
+            &model_reg,
+            &cfg.consent_policy(),
+            cfg.crew_max(),
+        )
+        .map_err(|e| anyhow::anyhow!("bad --patch {spec:?}: {e}"))?;
+    }
     if opts.dry_run {
         if opts.json {
             print_json(&serde_json::to_value(&plan)?);
@@ -2118,7 +2130,7 @@ pub(crate) fn cmd_spawn_rex(
     if items.is_empty() {
         bail!("nothing to spawn: pass --oc/--pi/--gk counts, --recipe NAME, or --profile NAME");
     }
-    let plan = build_dry_run_plan(
+    let mut plan = build_dry_run_plan(
         cfg,
         &items,
         &catalog,
@@ -2128,6 +2140,18 @@ pub(crate) fn cmd_spawn_rex(
         prefs,
         project,
     )?;
+    for spec in &opts.patches {
+        let patch = crate::swarm_plan::parse_patch(spec)
+            .map_err(|e| anyhow::anyhow!("bad --patch {spec:?}: {e}"))?;
+        plan = crate::swarm_plan::apply_patch(
+            &plan,
+            &patch,
+            &model_reg,
+            &cfg.consent_policy(),
+            cfg.crew_max(),
+        )
+        .map_err(|e| anyhow::anyhow!("bad --patch {spec:?}: {e}"))?;
+    }
     if opts.dry_run {
         if opts.json {
             print_json(&serde_json::to_value(&plan)?);
@@ -6540,6 +6564,205 @@ mod plan_gate_tests {
             }
             super::PlanGate::Launch => panic!("one blocked field refuses"),
         }
+    }
+}
+
+#[cfg(test)]
+mod plan_patch_spawn_tests {
+    fn herm_registry() -> crate::models::ModelRegistry {
+        let mut models = std::collections::BTreeMap::new();
+        for key in ["a/m", "b/m"] {
+            models.insert(
+                key.to_string(),
+                crate::models::ModelEntry {
+                    caps: vec![],
+                    fallback: None,
+                    ..Default::default()
+                },
+            );
+        }
+        crate::models::ModelRegistry {
+            models,
+            slots: Default::default(),
+            user_keys: Default::default(),
+            defaults: None,
+        }
+    }
+
+    fn jev_item() -> crate::swarm_plan::ConsentItem {
+        crate::swarm_plan::ConsentItem {
+            seat: "coder".to_string(),
+            field: "model".to_string(),
+            reason: crate::swarm_plan::ConsentReason::Jev,
+        }
+    }
+
+    fn blocked_item() -> crate::swarm_plan::ConsentItem {
+        crate::swarm_plan::ConsentItem {
+            seat: "coder".to_string(),
+            field: "model".to_string(),
+            reason: crate::swarm_plan::ConsentReason::Blocked,
+        }
+    }
+
+    fn drafting() -> toron_core::kernel::MachineState<
+        crate::elm::plan_statechart::PlanState,
+        crate::elm::plan_statechart::PlanContext,
+    > {
+        toron_core::kernel::MachineState::at(
+            crate::elm::plan_statechart::PlanState::Drafting,
+            crate::elm::plan_statechart::PlanContext {
+                yes: false,
+                needs_consent: vec![],
+                jev_degraded: false,
+            },
+        )
+    }
+
+    /// The real chart walks Resolved -> Patch -> Drafting -> Resolve -> Confirmed.
+    #[test]
+    fn plan_patch_machine_path_reaches_confirmed() {
+        let machine = crate::elm::plan_statechart::build_plan_machine();
+        let out = machine.step_state(
+            &drafting(),
+            &crate::elm::plan_statechart::PlanEvent::Resolve {
+                needs_consent: vec![jev_item()],
+                jev: crate::elm::plan_statechart::JevOutcome::Ok,
+            },
+        );
+        assert_eq!(
+            out.configuration.primary(),
+            Some(&crate::elm::plan_statechart::PlanState::AwaitingConsent)
+        );
+        let awaiting = toron_core::kernel::MachineState::at(
+            crate::elm::plan_statechart::PlanState::AwaitingConsent,
+            crate::elm::plan_statechart::PlanContext {
+                yes: false,
+                needs_consent: vec![jev_item()],
+                jev_degraded: false,
+            },
+        );
+        let out = machine.step_state(
+            &awaiting,
+            &crate::elm::plan_statechart::PlanEvent::Patch {
+                fields: vec!["model".to_string()],
+            },
+        );
+        assert_eq!(
+            out.configuration.primary(),
+            Some(&crate::elm::plan_statechart::PlanState::Drafting)
+        );
+        let out = machine.step_state(
+            &drafting(),
+            &crate::elm::plan_statechart::PlanEvent::Resolve {
+                needs_consent: vec![],
+                jev: crate::elm::plan_statechart::JevOutcome::Ok,
+            },
+        );
+        assert_eq!(
+            out.configuration.primary(),
+            Some(&crate::elm::plan_statechart::PlanState::Confirmed)
+        );
+    }
+
+    /// ...and a still-blocked second Resolve stays in AwaitingConsent.
+    #[test]
+    fn plan_patch_machine_path_stays_awaiting() {
+        let machine = crate::elm::plan_statechart::build_plan_machine();
+        let out = machine.step_state(
+            &drafting(),
+            &crate::elm::plan_statechart::PlanEvent::Resolve {
+                needs_consent: vec![jev_item()],
+                jev: crate::elm::plan_statechart::JevOutcome::Ok,
+            },
+        );
+        assert_eq!(
+            out.configuration.primary(),
+            Some(&crate::elm::plan_statechart::PlanState::AwaitingConsent)
+        );
+        let awaiting = toron_core::kernel::MachineState::at(
+            crate::elm::plan_statechart::PlanState::AwaitingConsent,
+            crate::elm::plan_statechart::PlanContext {
+                yes: false,
+                needs_consent: vec![jev_item()],
+                jev_degraded: false,
+            },
+        );
+        let out = machine.step_state(
+            &awaiting,
+            &crate::elm::plan_statechart::PlanEvent::Patch {
+                fields: vec!["model".to_string()],
+            },
+        );
+        assert_eq!(
+            out.configuration.primary(),
+            Some(&crate::elm::plan_statechart::PlanState::Drafting)
+        );
+        let gated = toron_core::kernel::MachineState::at(
+            crate::elm::plan_statechart::PlanState::Drafting,
+            crate::elm::plan_statechart::PlanContext {
+                yes: true,
+                needs_consent: vec![],
+                jev_degraded: false,
+            },
+        );
+        let out = machine.step_state(
+            &gated,
+            &crate::elm::plan_statechart::PlanEvent::Resolve {
+                needs_consent: vec![blocked_item()],
+                jev: crate::elm::plan_statechart::JevOutcome::Ok,
+            },
+        );
+        assert_eq!(
+            out.configuration.primary(),
+            Some(&crate::elm::plan_statechart::PlanState::AwaitingConsent),
+            "blocked stays blocked even with --yes"
+        );
+    }
+
+    /// A patched plan through the gate launches when nothing asks.
+    #[test]
+    fn plan_patch_gated_after_apply() {
+        let mut plan = crate::swarm_plan::Plan::new("swarm");
+        plan.seats.push(crate::swarm_plan::Seat {
+            role: "reviewer".to_string(),
+            count: 1,
+            harness: "codex".to_string(),
+            model: Some(crate::swarm_plan::Field {
+                value: "a/m".to_string(),
+                from: crate::swarm_plan::Provenance::User,
+                status: crate::swarm_plan::field_status(
+                    false,
+                    crate::swarm_plan::Provenance::User,
+                    "codex",
+                    "model",
+                ),
+                registry: None,
+                was: None,
+            }),
+            effort: None,
+            mode: None,
+            phase: None,
+            placement: "pane".to_string(),
+        });
+        plan.needs_consent = vec![crate::swarm_plan::ConsentItem {
+            seat: "reviewer".to_string(),
+            field: "model".to_string(),
+            reason: crate::swarm_plan::ConsentReason::Blocked,
+        }];
+        let reg = herm_registry();
+        let patched = crate::swarm_plan::apply_patch(
+            &plan,
+            &crate::swarm_plan::parse_patch("reviewer.harness=pi").expect("parses"),
+            &reg,
+            &crate::swarm_plan::ConsentPolicy::default(),
+            8,
+        )
+        .expect("patch applies");
+        assert!(matches!(
+            super::plan_gate(&patched, false),
+            super::PlanGate::Launch
+        ));
     }
 }
 

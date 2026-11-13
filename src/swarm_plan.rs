@@ -1067,3 +1067,517 @@ mod tests {
         assert!(legacy.needs_consent.is_empty());
     }
 }
+
+/// ADR-0022 D7/acceptance #3: a parsed `spawn --patch <seat>.<field>=<value>` ask.
+/// The seat matches a plan seat's role (seats carry no pins at plan time).
+/// The value is always a user ask (`from: user`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanPatch {
+    /// Seat role the patch targets.
+    pub seat: String,
+    /// Which field to rewrite.
+    pub field: PatchField,
+    /// The new value (a user ask).
+    pub value: String,
+}
+
+/// Fields a patch may rewrite (`mode` included; `phase` arrives with workflows, not asks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchField {
+    Harness,
+    Model,
+    Effort,
+    Mode,
+}
+
+impl PatchField {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "harness" => Some(Self::Harness),
+            "model" => Some(Self::Model),
+            "effort" => Some(Self::Effort),
+            "mode" => Some(Self::Mode),
+            _ => None,
+        }
+    }
+
+    const VALID: &'static str = "harness|model|effort|mode";
+}
+
+/// Parse `<seat>.<field>=<value>`; unknown fields name the valid ones.
+pub fn parse_patch(s: &str) -> Result<PlanPatch, String> {
+    let (key, value) = s
+        .split_once('=')
+        .ok_or_else(|| format!("bad patch {s:?}: want <seat>.<field>=<value>"))?;
+    if value.is_empty() {
+        return Err(format!("bad patch {s:?}: value must not be empty"));
+    }
+    let (seat, field) = key
+        .rsplit_once('.')
+        .ok_or_else(|| format!("bad patch {s:?}: want <seat>.<field>=<value>"))?;
+    if seat.is_empty() {
+        return Err(format!("bad patch {s:?}: seat must not be empty"));
+    }
+    let field = PatchField::parse(field)
+        .ok_or_else(|| format!("unknown field {field:?} (valid: {})", PatchField::VALID))?;
+    Ok(PlanPatch {
+        seat: seat.to_string(),
+        field,
+        value: value.to_string(),
+    })
+}
+
+/// Ask classification plus launch-carry check for one model value, mirroring
+/// the decision `build_dry_run_plan` makes through its resolver: same
+/// `resolve_ask` ladder (registered / ambiguous / unregistered / retired),
+/// same `resolve` flag, same delivered check. Lives here (not in `cmd`)
+/// so `apply_patch` reuses it without depending on the spawn module.
+fn resolve_model_ask(
+    registry: &crate::models::ModelRegistry,
+    harness: &str,
+    ask: &str,
+    from: Provenance,
+    effort: Option<&str>,
+) -> Field {
+    match registry.resolve_ask(ask, harness) {
+        crate::models::Resolution::Resolved {
+            id,
+            registry: reg,
+            was,
+        } => {
+            let flag = registry.resolve(&id, harness);
+            let launch = crate::headless::interactive_model_plan(harness, &flag, effort);
+            let delivered =
+                launch.args().iter().any(|a| a == &flag) || launch.env_pin() == Some(flag.as_str());
+            let marker = match reg {
+                crate::models::RegistryMembership::Unregistered => Some("unregistered".to_string()),
+                _ => None,
+            };
+            resolved_field(harness, flag, from, delivered, marker, was)
+        }
+        crate::models::Resolution::Ambiguous { ask, candidates } => {
+            let message = format!(
+                "ambiguous model `{ask}` — did you mean one of: {}",
+                candidates.join(", ")
+            );
+            unresolved_field(harness, &ask, from, message)
+        }
+        crate::models::Resolution::Retired { ask, remedy } => {
+            unresolved_field(harness, &ask, from, remedy)
+        }
+    }
+}
+
+/// Apply one patch and re-resolve the seat: a harness change re-filters
+/// model/effort/mode through the same delivery checks `build_dry_run_plan`
+/// uses (`seat_status`/`mode_field` on a fresh launch plan); a model change
+/// goes through the same ask classification as a fresh ask. The patched
+/// field becomes `from: user`; everything else keeps its value and
+/// provenance while its carriage is re-checked on the (maybe new) harness —
+/// a user-sourced model the harness can't honour stays user-sourced and
+/// turns blocked, never silently swapped. Other seats are untouched, and
+/// consent is recomputed for the whole plan. Unknown seats name the valid
+/// ones.
+pub fn apply_patch(
+    plan: &Plan,
+    patch: &PlanPatch,
+    registry: &crate::models::ModelRegistry,
+    policy: &ConsentPolicy,
+    crew_max: u32,
+) -> Result<Plan, String> {
+    let idx = plan
+        .seats
+        .iter()
+        .position(|s| s.role == patch.seat)
+        .ok_or_else(|| {
+            let mut names: Vec<&str> = plan.seats.iter().map(|s| s.role.as_str()).collect();
+            names.sort();
+            names.dedup();
+            format!(
+                "unknown seat {:?} (valid: {})",
+                patch.seat,
+                names.join(", ")
+            )
+        })?;
+    let mut out = plan.clone();
+    let seat = &mut out.seats[idx];
+    match patch.field {
+        PatchField::Harness => {
+            seat.harness = patch.value.clone();
+            let launch = crate::headless::interactive_model_plan(
+                &seat.harness,
+                seat.model.as_ref().map(|f| f.value.as_str()).unwrap_or(""),
+                seat.effort.as_ref().map(|f| f.value.as_str()),
+            );
+            let (model, effort) = seat_status(
+                &seat.harness,
+                seat.model.clone().map(|f| (f.value, f.from)),
+                seat.effort.clone().map(|f| (f.value, f.from)),
+                &launch,
+            );
+            seat.model = model;
+            seat.effort = effort;
+            let mode = seat.mode.clone().map(|f| (f.value, f.from));
+            seat.mode = mode_field(&seat.harness, mode);
+        }
+        PatchField::Model => {
+            let effort = seat.effort.as_ref().map(|e| e.value.as_str());
+            seat.model = Some(resolve_model_ask(
+                registry,
+                &seat.harness,
+                &patch.value,
+                Provenance::User,
+                effort,
+            ));
+        }
+        PatchField::Effort => {
+            let launch = crate::headless::interactive_model_plan(
+                &seat.harness,
+                seat.model.as_ref().map(|f| f.value.as_str()).unwrap_or(""),
+                Some(&patch.value),
+            );
+            let (_, effort) = seat_status(
+                &seat.harness,
+                None,
+                Some((patch.value.clone(), Provenance::User)),
+                &launch,
+            );
+            seat.effort = effort;
+        }
+        PatchField::Mode => {
+            seat.mode = mode_field(&seat.harness, Some((patch.value.clone(), Provenance::User)));
+        }
+    }
+    let est = estimate_usd_per_mtok(&out, registry);
+    out.needs_consent = needs_consent(&out, policy, est, crew_max);
+    Ok(out)
+}
+
+#[cfg(test)]
+mod plan_patch_tests {
+    fn herm_registry() -> crate::models::ModelRegistry {
+        let mut models = std::collections::BTreeMap::new();
+        for key in ["a/m", "b/m"] {
+            models.insert(
+                key.to_string(),
+                crate::models::ModelEntry {
+                    caps: vec![],
+                    fallback: None,
+                    ..Default::default()
+                },
+            );
+        }
+        crate::models::ModelRegistry {
+            models,
+            slots: Default::default(),
+            user_keys: Default::default(),
+            defaults: None,
+        }
+    }
+
+    fn user_model(value: &str) -> crate::swarm_plan::Field {
+        crate::swarm_plan::Field {
+            value: value.to_string(),
+            from: crate::swarm_plan::Provenance::User,
+            status: crate::swarm_plan::FieldStatus::Honored,
+            registry: None,
+            was: None,
+        }
+    }
+
+    fn blocked_model(value: &str, harness: &str) -> crate::swarm_plan::Field {
+        crate::swarm_plan::Field {
+            value: value.to_string(),
+            from: crate::swarm_plan::Provenance::User,
+            status: crate::swarm_plan::field_status(
+                false,
+                crate::swarm_plan::Provenance::User,
+                harness,
+                "model",
+            ),
+            registry: None,
+            was: None,
+        }
+    }
+
+    fn seat_with(
+        role: &str,
+        harness: &str,
+        model: Option<crate::swarm_plan::Field>,
+    ) -> crate::swarm_plan::Seat {
+        crate::swarm_plan::Seat {
+            role: role.to_string(),
+            count: 1,
+            harness: harness.to_string(),
+            model,
+            effort: None,
+            mode: None,
+            phase: None,
+            placement: "pane".to_string(),
+        }
+    }
+
+    fn gate_inputs() -> (
+        crate::models::ModelRegistry,
+        crate::swarm_plan::ConsentPolicy,
+        u32,
+    ) {
+        (
+            herm_registry(),
+            crate::swarm_plan::ConsentPolicy::default(),
+            8,
+        )
+    }
+
+    /// `<seat>.<field>=<value>` parses for every patchable field.
+    #[test]
+    fn plan_patch_parses_seat_field_value() {
+        let p = super::parse_patch("reviewer.harness=pi").expect("parses");
+        assert_eq!(p.seat, "reviewer");
+        assert!(matches!(p.field, super::PatchField::Harness));
+        assert_eq!(p.value, "pi");
+        let p = super::parse_patch("coder.model=x").expect("parses");
+        assert!(matches!(p.field, super::PatchField::Model));
+        assert_eq!(p.value, "x");
+        let p = super::parse_patch("a.effort=high").expect("parses");
+        assert!(matches!(p.field, super::PatchField::Effort));
+        let p = super::parse_patch("b.mode=read-only").expect("parses");
+        assert!(matches!(p.field, super::PatchField::Mode));
+        let p = super::parse_patch("a.model=x=y").expect("value keeps =");
+        assert_eq!(p.value, "x=y");
+    }
+
+    /// An unknown field names the valid ones.
+    #[test]
+    fn plan_patch_rejects_unknown_field() {
+        let err = super::parse_patch("coder.bogus=x").expect_err("unknown field fails");
+        for f in ["harness", "model", "effort", "mode"] {
+            assert!(err.contains(f), "names valid field {f}: {err}");
+        }
+    }
+
+    /// An unknown seat names the valid ones.
+    #[test]
+    fn plan_patch_rejects_unknown_seat() {
+        let mut plan = crate::swarm_plan::Plan::new("swarm");
+        plan.seats
+            .push(seat_with("coder", "pi", Some(user_model("a/m"))));
+        plan.seats
+            .push(seat_with("reviewer", "pi", Some(user_model("a/m"))));
+        let (reg, policy, crew) = gate_inputs();
+        let err = super::apply_patch(
+            &plan,
+            &super::parse_patch("ghost.harness=pi").expect("parses"),
+            &reg,
+            &policy,
+            crew,
+        )
+        .expect_err("unknown seat fails");
+        assert!(
+            err.contains("coder") && err.contains("reviewer"),
+            "names valid seats: {err}"
+        );
+    }
+
+    /// Acceptance #3: a harness patch re-filters the model and clears that consent entry.
+    #[test]
+    fn plan_patch_harness_refilters_model_and_clears_consent() {
+        let mut plan = crate::swarm_plan::Plan::new("swarm");
+        plan.seats.push(seat_with(
+            "reviewer",
+            "codex",
+            Some(blocked_model("a/m", "codex")),
+        ));
+        plan.needs_consent = vec![crate::swarm_plan::ConsentItem {
+            seat: "reviewer".to_string(),
+            field: "model".to_string(),
+            reason: crate::swarm_plan::ConsentReason::Blocked,
+        }];
+        let (reg, policy, crew) = gate_inputs();
+        let out = super::apply_patch(
+            &plan,
+            &super::parse_patch("reviewer.harness=pi").expect("parses"),
+            &reg,
+            &policy,
+            crew,
+        )
+        .expect("patch applies");
+        let m = out.seats[0].model.as_ref().expect("model field");
+        assert_eq!(m.value, "a/m", "re-filter never swaps the value");
+        assert_eq!(
+            m.from,
+            crate::swarm_plan::Provenance::User,
+            "user-sourced stays user"
+        );
+        assert!(
+            matches!(m.status, crate::swarm_plan::FieldStatus::Honored),
+            "re-filtered on pi: {m:?}"
+        );
+        assert!(
+            out.needs_consent.is_empty(),
+            "that consent entry is gone: {:?}",
+            out.needs_consent
+        );
+    }
+
+    /// A model patch is from the user and beats the preference.
+    #[test]
+    fn plan_patch_model_beats_preference_as_user() {
+        let mut plan = crate::swarm_plan::Plan::new("swarm");
+        plan.seats.push(seat_with(
+            "pi",
+            "pi",
+            Some(crate::swarm_plan::Field {
+                value: "a/m".to_string(),
+                from: crate::swarm_plan::Provenance::Preference,
+                status: crate::swarm_plan::FieldStatus::Honored,
+                registry: None,
+                was: None,
+            }),
+        ));
+        plan.needs_consent = vec![];
+        let (reg, policy, crew) = gate_inputs();
+        let out = super::apply_patch(
+            &plan,
+            &super::parse_patch("pi.model=z").expect("parses"),
+            &reg,
+            &policy,
+            crew,
+        )
+        .expect("patch applies");
+        let m = out.seats[0].model.as_ref().expect("model field");
+        assert_eq!(m.value, "z");
+        assert_eq!(m.from, crate::swarm_plan::Provenance::User);
+        assert_eq!(
+            out.needs_consent.len(),
+            1,
+            "consent recomputed: {:?}",
+            out.needs_consent
+        );
+        assert!(matches!(
+            out.needs_consent[0].reason,
+            crate::swarm_plan::ConsentReason::Unregistered
+        ));
+    }
+
+    /// An invalid-for-harness model stays user-sourced and turns blocked.
+    #[test]
+    fn plan_patch_invalid_stays_user_and_blocks() {
+        let mut plan = crate::swarm_plan::Plan::new("swarm");
+        plan.seats
+            .push(seat_with("coder", "pi", Some(user_model("a/m"))));
+        plan.needs_consent = vec![];
+        let (reg, policy, crew) = gate_inputs();
+        let out = super::apply_patch(
+            &plan,
+            &super::parse_patch("coder.harness=codex").expect("parses"),
+            &reg,
+            &policy,
+            crew,
+        )
+        .expect("patch applies");
+        let m = out.seats[0].model.as_ref().expect("model field");
+        assert_eq!(m.value, "a/m", "never silently swapped");
+        assert_eq!(m.from, crate::swarm_plan::Provenance::User);
+        match &m.status {
+            crate::swarm_plan::FieldStatus::Blocked { remedy } => {
+                assert!(
+                    remedy.contains("codex"),
+                    "remedy names the harness: {remedy}"
+                );
+            }
+            other => panic!("expected blocked, got {other:?}"),
+        }
+        assert_eq!(out.needs_consent.len(), 1);
+        assert!(matches!(
+            out.needs_consent[0].reason,
+            crate::swarm_plan::ConsentReason::Blocked
+        ));
+    }
+
+    /// Other seats (and their consent) are untouched.
+    #[test]
+    fn plan_patch_leaves_other_seats_untouched() {
+        let mut plan = crate::swarm_plan::Plan::new("swarm");
+        plan.seats
+            .push(seat_with("coder", "pi", Some(user_model("a/m"))));
+        plan.seats.push(seat_with(
+            "reviewer",
+            "pi",
+            Some(crate::swarm_plan::Field {
+                value: "qz-9z".to_string(),
+                from: crate::swarm_plan::Provenance::User,
+                status: crate::swarm_plan::FieldStatus::Honored,
+                registry: Some("unregistered".to_string()),
+                was: None,
+            }),
+        ));
+        plan.needs_consent = vec![crate::swarm_plan::ConsentItem {
+            seat: "reviewer".to_string(),
+            field: "model".to_string(),
+            reason: crate::swarm_plan::ConsentReason::Unregistered,
+        }];
+        let before = plan.seats[1].clone();
+        let (reg, policy, crew) = gate_inputs();
+        let out = super::apply_patch(
+            &plan,
+            &super::parse_patch("coder.model=z").expect("parses"),
+            &reg,
+            &policy,
+            crew,
+        )
+        .expect("patch applies");
+        let m = out.seats[0].model.as_ref().expect("model field");
+        assert_eq!(m.value, "z");
+        assert_eq!(out.seats[1].harness, before.harness);
+        assert_eq!(out.seats[1].role, before.role);
+        let m2 = out.seats[1].model.as_ref().expect("reviewer model");
+        let b2 = before.model.as_ref().expect("reviewer model before");
+        assert_eq!(m2.value, b2.value);
+        assert_eq!(m2.from, b2.from);
+        assert!(
+            out.needs_consent.iter().any(|i| i.seat == "reviewer"
+                && matches!(i.reason, crate::swarm_plan::ConsentReason::Unregistered)),
+            "reviewer consent intact: {:?}",
+            out.needs_consent
+        );
+    }
+
+    /// Two patches apply in order.
+    #[test]
+    fn plan_patch_two_patches_apply_in_order() {
+        let mut plan = crate::swarm_plan::Plan::new("swarm");
+        plan.seats.push(seat_with(
+            "reviewer",
+            "codex",
+            Some(blocked_model("a/m", "codex")),
+        ));
+        plan.needs_consent = vec![crate::swarm_plan::ConsentItem {
+            seat: "reviewer".to_string(),
+            field: "model".to_string(),
+            reason: crate::swarm_plan::ConsentReason::Blocked,
+        }];
+        let (reg, policy, crew) = gate_inputs();
+        let mid = super::apply_patch(
+            &plan,
+            &super::parse_patch("reviewer.harness=pi").expect("parses"),
+            &reg,
+            &policy,
+            crew,
+        )
+        .expect("first patch applies");
+        assert_eq!(mid.seats[0].harness, "pi");
+        let out = super::apply_patch(
+            &mid,
+            &super::parse_patch("reviewer.model=z").expect("parses"),
+            &reg,
+            &policy,
+            crew,
+        )
+        .expect("second patch applies");
+        let m = out.seats[0].model.as_ref().expect("model field");
+        assert_eq!(out.seats[0].harness, "pi", "first patch stuck");
+        assert_eq!(m.value, "z", "second patch wins");
+        assert_eq!(m.from, crate::swarm_plan::Provenance::User);
+    }
+}
