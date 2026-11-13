@@ -243,9 +243,8 @@ pub struct MailServerConfig {
 /// `[doorbell]` section (ADR-0012 D2): the plane-D daemon host.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DoorbellSection {
-    /// daemon base URL (explicit only; ADR-0020 retired the `:18980`
-    /// default). Absent selects embedded with supervise (no health
-    /// probe); an explicit `url` is honored as the daemon host.
+    /// daemon base URL (explicit only). Absent selects embedded with
+    /// supervise (no health probe); an explicit `url` is honored.
     pub url: Option<String>,
     /// arrival triple (bd-asr2.14, D5): presence + role auto-bind + join
     /// ring + roster headers. Default false — behavior extensions stay
@@ -343,10 +342,8 @@ pub struct Config {
     /// per-backend mail transport (ADR-0003 V3, bd-euav single-backend):
     /// `[mail.toron]` for the toron daemon
     pub mail: Option<MailSections>,
-    /// `[doorbell]` — doorbell plane-D daemon (ADR-0020): explicit `url`
-    /// selects the daemon host. Absent `url` (even with the section
-    /// present) selects the embedded in-process host with supervise and
-    /// no health probe. Absent section → embedded as well.
+    /// `[doorbell]` — doorbell plane-D daemon: explicit `url` selects the
+    /// daemon host. Absent `url` selects embedded (no health probe).
     pub doorbell: Option<DoorbellSection>,
     /// short name -> hc agent kind (default: oc=opencode, pi=pi, gk=grok)
     pub kinds: Option<BTreeMap<String, String>>,
@@ -771,11 +768,9 @@ impl Config {
         }
     }
 
-    /// Effective doorbell host (ADR-0020): explicit `[doorbell] url` only.
-    /// No `url` means `None` (embedded/supervise path, no health probe);
-    /// an explicit `url` is still honored. The old `:18980` default is
-    /// retired: toron `:18080` does not serve doorbell routes yet (404),
-    /// so defaulting warned on every run for url-less sections.
+    /// Effective doorbell host: explicit `[doorbell] url` only. No `url`
+    /// means `None` (embedded/supervise path, no health probe); an
+    /// explicit `url` is still honored.
     pub fn doorbell_url(&self) -> Option<String> {
         self.doorbell
             .as_ref()
