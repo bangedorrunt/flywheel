@@ -8057,9 +8057,8 @@ mod envpin_reroute_tests {
         };
         let mut hop = hop_fixture();
         hop.kind = crate::failure::FailureKind::Timeout;
-        let respawn = |_: &str| -> anyhow::Result<AgentInfo> {
-            panic!("closed gate must not split")
-        };
+        let respawn =
+            |_: &str| -> anyhow::Result<AgentInfo> { panic!("closed gate must not split") };
         let got = envpin_respin_hop(&backend, &respawn, &hop, false).expect("hop runs");
         assert!(
             matches!(got, EnvpinHopOutcome::SuppressedGate),
@@ -8082,9 +8081,8 @@ mod envpin_reroute_tests {
             order: order.clone(),
         };
         let hop = hop_fixture();
-        let respawn = |_: &str| -> anyhow::Result<AgentInfo> {
-            panic!("second failure must not split")
-        };
+        let respawn =
+            |_: &str| -> anyhow::Result<AgentInfo> { panic!("second failure must not split") };
         let got = envpin_respin_hop(&backend, &respawn, &hop, true).expect("hop runs");
         assert!(
             matches!(got, EnvpinHopOutcome::AlreadyRerouted),
@@ -8108,9 +8106,8 @@ mod envpin_reroute_tests {
         };
         let mut hop = hop_fixture();
         hop.next_model = hop.from_model.clone();
-        let respawn = |_: &str| -> anyhow::Result<AgentInfo> {
-            panic!("satisfied hop must not split")
-        };
+        let respawn =
+            |_: &str| -> anyhow::Result<AgentInfo> { panic!("satisfied hop must not split") };
         let got = envpin_respin_hop(&backend, &respawn, &hop, false).expect("hop runs");
         assert!(
             matches!(got, EnvpinHopOutcome::AlreadySatisfied),
@@ -8185,10 +8182,7 @@ mod envpin_reroute_tests {
             pane_id: &str,
             command: &str,
         ) -> Result<(), toron_plane::backend::BackendError> {
-            self.order
-                .lock()
-                .unwrap()
-                .push(format!("run:{pane_id}"));
+            self.order.lock().unwrap().push(format!("run:{pane_id}"));
             self.commands.lock().unwrap().push(command.to_string());
             Ok(())
         }
@@ -8197,10 +8191,10 @@ mod envpin_reroute_tests {
             pane_id: &str,
             new_name: Option<&str>,
         ) -> Result<(), toron_plane::backend::BackendError> {
-            self.order.lock().unwrap().push(format!(
-                "rename:{}@{pane_id}",
-                new_name.unwrap_or_default()
-            ));
+            self.order
+                .lock()
+                .unwrap()
+                .push(format!("rename:{}@{pane_id}", new_name.unwrap_or_default()));
             Ok(())
         }
         fn agent_wait(
@@ -8419,10 +8413,7 @@ mod envpin_reroute_tests {
             pane_id: &str,
             command: &str,
         ) -> Result<(), toron_plane::backend::BackendError> {
-            self.order
-                .lock()
-                .unwrap()
-                .push(format!("run:{pane_id}"));
+            self.order.lock().unwrap().push(format!("run:{pane_id}"));
             self.commands.lock().unwrap().push(command.to_string());
             Ok(())
         }
@@ -8431,10 +8422,10 @@ mod envpin_reroute_tests {
             pane_id: &str,
             new_name: Option<&str>,
         ) -> Result<(), toron_plane::backend::BackendError> {
-            self.order.lock().unwrap().push(format!(
-                "rename:{}@{pane_id}",
-                new_name.unwrap_or_default()
-            ));
+            self.order
+                .lock()
+                .unwrap()
+                .push(format!("rename:{}@{pane_id}", new_name.unwrap_or_default()));
             Ok(())
         }
         fn agent_wait(
@@ -8468,10 +8459,7 @@ mod envpin_reroute_tests {
             Ok(site_agent(name, pane_id))
         }
         fn pane_close(&self, pane_id: &str) -> Result<(), toron_plane::backend::BackendError> {
-            self.order
-                .lock()
-                .unwrap()
-                .push(format!("close:{pane_id}"));
+            self.order.lock().unwrap().push(format!("close:{pane_id}"));
             Ok(())
         }
     }
@@ -9051,9 +9039,7 @@ fn start_agent_with_retry_dyn_profile(
                                                 attempt: attempt as u32,
                                             };
                                             let respawn = |anchor: &str| {
-                                                envpin_hop_respawn(
-                                                    cfg, proj, backend, &hop, anchor,
-                                                )
+                                                envpin_hop_respawn(cfg, proj, backend, &hop, anchor)
                                             };
                                             match envpin_respin_hop(
                                                 backend,
