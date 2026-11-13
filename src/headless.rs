@@ -899,16 +899,10 @@ mod tests {
         );
     }
 
-    /// governed-by: bd-ulzi — pi wires effort natively (`--thinking=`;
-    /// provider/id passes through verbatim, the pi shorthand); opencode
-    /// v2 keeps `--model provider/model#variant` verbatim and degrades LOUDLY
-    /// on effort (no effort flag); empty effort emits no thinking flag.
-    ///
-    /// bd-pi-thinking-equals-form: pi's `--thinking` is TWO argv entries. This
-    /// test previously asserted the equals form `--thinking=high`, which pi's
-    /// parser rejects; the shape is now pinned by
-    /// `pi_emitted_effort_arg_form_is_accepted_by_the_real_binary`, which asks
-    /// the binary instead of trusting this one.
+    /// governed-by: bd-ulzi — pi wires effort natively (`--thinking <level>`);
+    /// provider/id passes through verbatim; opencode v2 keeps
+    /// `--model provider/model#variant` verbatim and degrades LOUDLY on effort
+    /// (no effort flag); empty effort emits no thinking flag.
     #[test]
     fn jev_effort_pi_thinking_native_opencode_loud_degrade() {
         assert_eq!(
@@ -941,22 +935,28 @@ mod tests {
         );
     }
 
-    /// bd-pi-thinking-equals-form: the argv we EMIT must be argv pi PARSES.
-    ///
-    /// The sibling test above can only prove we emit what we emit — it locked in
-    /// `--thinking=high` because that is what the code did, and its doc comment
-    /// claimed `pi --help` verified it. It did not. Against pi 0.87.1:
-    ///
-    ///   pi --thinking=high  -> Error: Unknown option: --thinking
-    ///   pi --thinking high  -> args parse; fails later on the model
-    ///
-    /// So the equals form is rejected by the real parser while pi's own --help
-    /// advertises the space form. This test closes that gap by asking the
-    /// binary, with a deliberately bogus model so it fails at model resolution
-    /// (no network, no real completion) and `Unknown option` is the only signal
-    /// that means the ARG FORM was wrong.
+    /// bd-pi-thinking-equals-form: pi 0.87.1 rejects `--thinking=high` with
+    /// `Unknown option: --thinking` and accepts the two-entry form, so the
+    /// emitted argv is pinned pure in
+    /// `pi_emitted_effort_argv_is_space_separated`.
     #[test]
-    fn pi_emitted_effort_arg_form_is_accepted_by_the_real_binary() {
+    fn pi_emitted_effort_argv_is_space_separated() {
+        assert_eq!(
+            model_args("pi", "bogus/model-flywheel-argcheck", Some("high")),
+            vec![
+                "--model",
+                "bogus/model-flywheel-argcheck",
+                "--thinking",
+                "high"
+            ],
+            "pi takes `--thinking <level>` as two argv entries"
+        );
+    }
+
+    /// LIVE, ignored by default: spawns the operator's `pi` off PATH.
+    #[test]
+    #[ignore = "live: spawns the operator's pi binary and is flaky under load"]
+    fn live_pi_emitted_effort_arg_form_is_accepted_by_the_real_binary() {
         let bogus_model = "bogus/model-flywheel-argcheck";
         let emitted = model_args("pi", bogus_model, Some("high"));
 
