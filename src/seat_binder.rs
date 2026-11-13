@@ -5,10 +5,12 @@
 //! come later. Each binding is journaled with the step's effect key elsewhere;
 //! journaling is NOT in this slice.
 
+use serde::{Deserialize, Serialize};
+
 use crate::stages::StageContext;
 
 /// A step's needs, from its stage contract with step overrides.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepNeed {
     pub step: String,
     pub role: String,
@@ -22,7 +24,7 @@ pub struct StepNeed {
 }
 
 /// A live seat.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveSeat {
     pub pin: String,
     pub role: String,
@@ -36,14 +38,15 @@ pub struct LiveSeat {
 }
 
 /// Binder policy.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BindPolicy {
     pub crew_max: usize,
     pub headless_allowed: bool,
 }
 
 /// Binding outcome, first match wins in D8 table order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "binding", rename_all = "kebab-case")]
 pub enum Binding {
     Reuse { pin: String },
     FreshSession { pin: String },
@@ -174,6 +177,21 @@ pub fn bind(need: &StepNeed, seats: &[LiveSeat], policy: &BindPolicy) -> Binding
     Binding::Wait {
         reason: "no seat within crew_max".to_string(),
     }
+}
+
+/// Thin JSON edge for the `__bind-seat` verb and the future D7 reconciler.
+/// `bind` stays pure; this only translates JSON in/out.
+#[derive(Debug, serde::Deserialize)]
+struct BindRequest {
+    need: StepNeed,
+    seats: Vec<LiveSeat>,
+    policy: BindPolicy,
+}
+
+pub fn bind_json(input: &str) -> anyhow::Result<String> {
+    let req: BindRequest = serde_json::from_str(input)?;
+    let binding = bind(&req.need, &req.seats, &req.policy);
+    Ok(serde_json::to_string(&binding)?)
 }
 
 #[cfg(test)]
@@ -397,5 +415,28 @@ mod tests {
             bind(&need, &a_first, &policy(5, false)),
             bind(&need, &b_first, &policy(5, false))
         );
+    }
+
+    #[test]
+    fn seat_binder_json_round_trip() {
+        let need = need("coder", StageContext::Warm);
+        let seats = vec![seat("a", "coder", true, false)];
+        let policy = policy(5, false);
+        let input = serde_json::json!({"need": need, "seats": seats, "policy": policy}).to_string();
+        let out = bind_json(&input).expect("valid json binds");
+        let binding: Binding = serde_json::from_str(&out).expect("binding json parses");
+        assert_eq!(
+            binding,
+            Binding::Reuse {
+                pin: "a".to_string()
+            }
+        );
+        assert!(out.contains("\"binding\":\"reuse\""), "tagged reuse: {out}");
+    }
+
+    #[test]
+    fn seat_binder_json_malformed_errors() {
+        assert!(bind_json("not json").is_err());
+        assert!(bind_json("{\"need\":{}}").is_err());
     }
 }

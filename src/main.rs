@@ -1911,6 +1911,10 @@ enum Commands {
         bead_id: String,
         pin: String,
     },
+    /// internal: bind a step to a live seat (ADR-0022 D8) — reads
+    /// {need,seats,policy} JSON from stdin, prints Binding JSON.
+    #[command(name = "__bind-seat", hide = true)]
+    __BindSeat {},
     /// internal: diagnose unresponsive agent (tail + health mail)
     #[command(name = "__diagnose", hide = true)]
     __Diagnose {
@@ -3823,6 +3827,15 @@ fn main() {
             bead_id,
             pin,
         }) => cmd_internal_pin_stamp(&cfg, project, bead_id, pin),
+        Some(Commands::__BindSeat {}) => {
+            use std::io::Read as _;
+            let mut input = String::new();
+            std::io::stdin()
+                .read_to_string(&mut input)
+                .map_err(anyhow::Error::from)
+                .and_then(|_| crate::seat_binder::bind_json(&input))
+                .map(|out| println!("{out}"))
+        }
         Some(Commands::__Diagnose {
             project,
             name,
