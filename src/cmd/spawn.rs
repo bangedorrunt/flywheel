@@ -859,6 +859,30 @@ pub(crate) fn refuse_blocked(plan: &crate::swarm_plan::Plan) -> Result<(), Vec<S
     }
 }
 
+/// ADR-0022 D5 consent gate: a real spawn with a non-empty `needs_consent`
+/// refuses without `--yes` (same place as [`refuse_blocked`]). With `--yes`
+/// it proceeds; blocked rows stay refused by `refuse_blocked` — a single
+/// refusal path, no duplication.
+pub(crate) fn consent_gate(plan: &crate::swarm_plan::Plan, yes: bool) -> Result<(), Vec<String>> {
+    if yes || plan.needs_consent.is_empty() {
+        return Ok(());
+    }
+    let mut lines = Vec::new();
+    for item in &plan.needs_consent {
+        lines.push(format!(
+            "consent required: {} {} ({})",
+            item.seat,
+            item.field,
+            item.reason.as_str()
+        ));
+    }
+    lines.push(
+        "re-run with --yes to proceed (flywheel plan apply does not exist yet — use the equivalent spawn flags instead)"
+            .to_string(),
+    );
+    Err(lines)
+}
+
 /// Resolve one seat's model ask into its plan field (ADR-0022 D4 phase
 /// 3a). The ask goes through `resolve_ask` (retirement, ambiguity, and
 /// registry membership); the flag then goes through the existing launch
@@ -988,6 +1012,11 @@ pub(crate) fn build_dry_run_plan(
             placement: "pane".to_string(),
         });
     }
+    // ADR-0022 D5: the plan carries its computed consent set into
+    // `--dry-run --json` and the launch gates below.
+    let policy = cfg.consent_policy();
+    let est = crate::swarm_plan::estimate_usd_per_mtok(&plan, registry);
+    plan.needs_consent = crate::swarm_plan::needs_consent(&plan, &policy, est, cfg.crew_max());
     Ok(plan)
 }
 
@@ -1112,6 +1141,15 @@ projects available: {}",
             );
         }
         return Ok(());
+    }
+    if let Err(lines) = consent_gate(&plan, opts.yes) {
+        for line in &lines {
+            eprintln!("consent: {line}");
+        }
+        anyhow::bail!(
+            "spawn refused: {} consent item(s) need operator sign-off — re-run with --yes",
+            plan.needs_consent.len()
+        );
     }
     if let Err(blocked) = refuse_blocked(&plan) {
         for line in &blocked {
@@ -1939,6 +1977,15 @@ pub(crate) fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Res
             );
         }
         return Ok(());
+    }
+    if let Err(lines) = consent_gate(&plan, opts.yes) {
+        for line in &lines {
+            eprintln!("consent: {line}");
+        }
+        anyhow::bail!(
+            "spawn refused: {} consent item(s) need operator sign-off — re-run with --yes",
+            plan.needs_consent.len()
+        );
     }
     if let Err(blocked) = refuse_blocked(&plan) {
         for line in &blocked {
@@ -5712,6 +5759,92 @@ mod plane_gate_tests {
         assert!(
             !crate::state::project_log_path("typo-probe").exists(),
             "the gate must run before the effect journal writes a row"
+        );
+    }
+}
+
+#[cfg(test)]
+mod consent_gate_tests {
+    use crate::swarm_plan::{ConsentItem, ConsentReason, Plan};
+
+    fn blocked_jev_plan() -> Plan {
+        let mut plan = Plan::new("swarm");
+        plan.needs_consent = vec![ConsentItem {
+            seat: "coder".to_string(),
+            field: "model".to_string(),
+            reason: ConsentReason::Jev,
+        }];
+        plan
+    }
+
+    #[test]
+    fn consent_gate_refuses_without_yes_and_names_items() {
+        let plan = blocked_jev_plan();
+        let err = super::consent_gate(&plan, false).expect_err("needs --yes");
+        assert!(
+            err.iter()
+                .any(|l| l.contains("coder") && l.contains("model")),
+            "names the seat and field: {err:?}"
+        );
+        assert!(
+            err.iter().any(|l| l.contains("--yes")),
+            "hint names the flag: {err:?}"
+        );
+        assert!(
+            err.iter().any(|l| l.contains("plan apply")),
+            "hint says there is no plan apply yet: {err:?}"
+        );
+    }
+
+    #[test]
+    fn consent_gate_proceeds_with_yes() {
+        let plan = blocked_jev_plan();
+        assert!(super::consent_gate(&plan, true).is_ok());
+        let clean = Plan::new("swarm");
+        assert!(super::consent_gate(&clean, false).is_ok());
+    }
+
+    #[test]
+    fn dry_run_carries_needs_consent_for_unregistered() {
+        use std::collections::BTreeMap;
+        let reg = crate::models::ModelRegistry {
+            models: BTreeMap::new(),
+            slots: Default::default(),
+            user_keys: Default::default(),
+            defaults: None,
+        };
+        let cfg = crate::config::Config::default();
+        let catalog = crate::profile::ProfileCatalog::default();
+        let items = super::spawn_items_from_plan(vec![("pi".to_string(), 1)], None);
+        let plan =
+            super::build_dry_run_plan(&cfg, &items, &catalog, &reg, "totally-unknown-9z", "")
+                .expect("plan builds");
+        let item = plan
+            .needs_consent
+            .iter()
+            .find(|item| item.reason == crate::swarm_plan::ConsentReason::Blocked)
+            .expect("unregistered ask is blocked, so consent is required");
+        assert_eq!(item.field, "model");
+    }
+
+    #[test]
+    fn dry_run_ordinary_model_leaves_no_consent() {
+        use std::collections::BTreeMap;
+        let reg = crate::models::ModelRegistry {
+            models: BTreeMap::new(),
+            slots: Default::default(),
+            user_keys: Default::default(),
+            defaults: None,
+        };
+        let cfg = crate::config::Config::default();
+        let catalog = crate::profile::ProfileCatalog::default();
+        let items = super::spawn_items_from_plan(vec![("pi".to_string(), 1)], None);
+        let plan =
+            super::build_dry_run_plan(&cfg, &items, &catalog, &reg, "", "").expect("plan builds");
+        assert!(
+            plan.needs_consent.is_empty(),
+            "no ask, no consent: {:?}",
+            plan.needs_consent
         );
     }
 }

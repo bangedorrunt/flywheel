@@ -79,6 +79,10 @@ pub struct Plan {
     pub schema: String,
     pub mode: String,
     pub seats: Vec<Seat>,
+    /// ADR-0022 D5: computed consent set. Additive to `flywheel-plan.v1`:
+    /// absent on the wire reads as empty.
+    #[serde(default)]
+    pub needs_consent: Vec<ConsentItem>,
 }
 
 impl Plan {
@@ -89,8 +93,197 @@ impl Plan {
             schema: "flywheel-plan.v1".to_string(),
             mode: mode.to_string(),
             seats: Vec::new(),
+            needs_consent: Vec::new(),
         }
     }
+}
+
+/// ADR-0022 D5: when a spawn must ask instead of launching silently.
+/// `on-change` (default) asks only about Jev-touched, blocked, and
+/// over-budget/over-cap rows; `always` lists every seat's model and
+/// harness; `never` lists only blocked rows (blocked never launches anyway).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConsentAsk {
+    OnChange,
+    Always,
+    Never,
+}
+
+impl Default for ConsentAsk {
+    fn default() -> Self {
+        Self::OnChange
+    }
+}
+
+/// ADR-0022 D5: why one consent item needs the operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConsentReason {
+    Jev,
+    Blocked,
+    Budget,
+    CrewMax,
+}
+
+impl ConsentReason {
+    /// Wire spelling for refusal lines (`crew-max`, not `CrewMax`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Jev => "jev",
+            Self::Blocked => "blocked",
+            Self::Budget => "budget",
+            Self::CrewMax => "crew-max",
+        }
+    }
+}
+
+/// One question for the operator: this seat's field needs sign-off before
+/// launch (or the aggregate row does, for `budget` / `crew-max`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsentItem {
+    pub seat: String,
+    pub field: String,
+    pub reason: ConsentReason,
+}
+
+/// Default budget threshold (USD per mtok) when `[consent]` is absent.
+pub const DEFAULT_BUDGET_USD_PER_MTOK: f64 = 5.0;
+
+/// ADR-0022 D5 consent policy: the `[consent]` ask mode plus the budget
+/// threshold the summed estimate is weighed against.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConsentPolicy {
+    pub ask: ConsentAsk,
+    pub budget_usd_per_mtok: f64,
+}
+
+impl Default for ConsentPolicy {
+    fn default() -> Self {
+        Self {
+            ask: ConsentAsk::OnChange,
+            budget_usd_per_mtok: DEFAULT_BUDGET_USD_PER_MTOK,
+        }
+    }
+}
+
+/// ADR-0022 D5: compute the consent set. Pure: no I/O, no env, no clock.
+/// Rule 2 (blocked, including unregistered user asks, which refuse the same
+/// way at the gate) fires under every policy; rule 1 (any field with
+/// `from: jev`) fires on-change; `always` lists every seat's model and
+/// harness; `never` lists only rule 2. Rule 3 (estimate over budget, seat
+/// total over `crew_max`) fires under every policy except `never`.
+#[must_use]
+pub fn needs_consent(
+    plan: &Plan,
+    policy: &ConsentPolicy,
+    est_usd_per_mtok: Option<f64>,
+    crew_max: u32,
+) -> Vec<ConsentItem> {
+    use std::collections::BTreeSet;
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    fn push(
+        out: &mut Vec<ConsentItem>,
+        seen: &mut BTreeSet<(String, String)>,
+        seat: &str,
+        field: &str,
+        reason: ConsentReason,
+    ) {
+        if seen.insert((seat.to_string(), field.to_string())) {
+            out.push(ConsentItem {
+                seat: seat.to_string(),
+                field: field.to_string(),
+                reason,
+            });
+        }
+    }
+    fn fields(seat: &Seat) -> [(&'static str, &Option<Field>); 4] {
+        [
+            ("model", &seat.model),
+            ("effort", &seat.effort),
+            ("mode", &seat.mode),
+            ("phase", &seat.phase),
+        ]
+    }
+    // Rule 2 first so a blocked field keeps its reason under `always`.
+    for seat in &plan.seats {
+        for (name, field) in fields(seat) {
+            let Some(f) = field else { continue };
+            // An unregistered user ask is consent-blocked at the gate the
+            // same way a refused delivery is (red-phase test pins this),
+            // even though its delivery status reads honored.
+            let blocked = matches!(f.status, FieldStatus::Blocked { .. })
+                || f.registry.as_deref() == Some("unregistered");
+            if blocked {
+                push(
+                    &mut out,
+                    &mut seen,
+                    &seat.role,
+                    name,
+                    ConsentReason::Blocked,
+                );
+            }
+        }
+    }
+    match policy.ask {
+        ConsentAsk::Never => {}
+        ConsentAsk::OnChange => {
+            for seat in &plan.seats {
+                for (name, field) in fields(seat) {
+                    if field.as_ref().is_some_and(|f| f.from == Provenance::Jev) {
+                        push(&mut out, &mut seen, &seat.role, name, ConsentReason::Jev);
+                    }
+                }
+            }
+        }
+        ConsentAsk::Always => {
+            for seat in &plan.seats {
+                if seat.model.is_some() {
+                    push(&mut out, &mut seen, &seat.role, "model", ConsentReason::Jev);
+                }
+                push(
+                    &mut out,
+                    &mut seen,
+                    &seat.role,
+                    "harness",
+                    ConsentReason::Jev,
+                );
+            }
+        }
+    }
+    if !matches!(policy.ask, ConsentAsk::Never) {
+        if est_usd_per_mtok.is_some_and(|est| est > policy.budget_usd_per_mtok) {
+            push(&mut out, &mut seen, "crew", "budget", ConsentReason::Budget);
+        }
+        let total: u32 = plan.seats.iter().map(|s| s.count).sum();
+        if total > crew_max {
+            push(&mut out, &mut seen, "crew", "count", ConsentReason::CrewMax);
+        }
+    }
+    out
+}
+
+/// ADR-0022 D5: summed per-mtok estimate over seats — `count *`
+/// the registered `cost_in_per_mtok` of each seat's resolved model. `None`
+/// when any seat's model is unregistered or costs 0, so rule 3 budget never
+/// fires on unknowns. Pure; reads the registry passed in.
+#[must_use]
+pub fn estimate_usd_per_mtok(plan: &Plan, registry: &crate::models::ModelRegistry) -> Option<f64> {
+    let mut total = 0.0;
+    for seat in &plan.seats {
+        let Some(field) = &seat.model else { continue };
+        if field.registry.as_deref() == Some("unregistered") {
+            return None;
+        }
+        let entry = registry.get(&field.value)?;
+        if entry.cost_in_per_mtok <= 0.0 {
+            return None;
+        }
+        total += seat.count as f64 * entry.cost_in_per_mtok;
+    }
+    Some(total)
 }
 
 /// D3 exactly: delivered => honored; not delivered and from user/preference =>
@@ -637,6 +830,164 @@ mod tests {
         assert_eq!(
             serde_json::to_value(Provenance::Step).unwrap(),
             serde_json::json!("step")
+        );
+    }
+
+    fn consent_field(value: &str, from: Provenance, status: FieldStatus) -> Field {
+        Field {
+            value: value.into(),
+            from,
+            status,
+            registry: None,
+            was: None,
+        }
+    }
+
+    fn consent_seat(role: &str, count: u32, model: Option<Field>) -> Seat {
+        Seat {
+            role: role.into(),
+            count,
+            harness: "pi".into(),
+            model,
+            effort: None,
+            mode: None,
+            phase: None,
+            placement: "pane".into(),
+        }
+    }
+
+    fn on_change() -> ConsentPolicy {
+        ConsentPolicy {
+            ask: ConsentAsk::OnChange,
+            budget_usd_per_mtok: 5.0,
+        }
+    }
+
+    #[test]
+    fn needs_consent_lists_jev_field() {
+        let mut plan = Plan::new("swarm");
+        plan.seats.push(consent_seat(
+            "coder",
+            1,
+            Some(consent_field("m", Provenance::Jev, FieldStatus::Honored)),
+        ));
+        let got = needs_consent(&plan, &on_change(), None, 5);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].seat, "coder");
+        assert_eq!(got[0].field, "model");
+        assert_eq!(got[0].reason, ConsentReason::Jev);
+    }
+
+    #[test]
+    fn needs_consent_lists_blocked_field() {
+        let mut plan = Plan::new("swarm");
+        plan.seats.push(consent_seat(
+            "coder",
+            1,
+            Some(consent_field(
+                "m",
+                Provenance::User,
+                FieldStatus::Blocked {
+                    remedy: "pick another harness".into(),
+                },
+            )),
+        ));
+        let got = needs_consent(&plan, &on_change(), None, 5);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].reason, ConsentReason::Blocked);
+    }
+
+    #[test]
+    fn needs_consent_over_budget_lists_estimate() {
+        let plan = Plan::new("swarm");
+        let got = needs_consent(&plan, &on_change(), Some(7.5), 5);
+        assert!(got.iter().any(|i| i.reason == ConsentReason::Budget));
+        let got = needs_consent(&plan, &on_change(), Some(4.9), 5);
+        assert!(got.iter().all(|i| i.reason != ConsentReason::Budget));
+        let got = needs_consent(&plan, &on_change(), None, 5);
+        assert!(got.iter().all(|i| i.reason != ConsentReason::Budget));
+    }
+
+    #[test]
+    fn needs_consent_over_crew_max_listed() {
+        let mut plan = Plan::new("swarm");
+        plan.seats.push(consent_seat("a", 3, None));
+        plan.seats.push(consent_seat("b", 3, None));
+        let got = needs_consent(&plan, &on_change(), None, 5);
+        assert!(got.iter().any(|i| i.reason == ConsentReason::CrewMax));
+        let got = needs_consent(&plan, &on_change(), None, 6);
+        assert!(got.iter().all(|i| i.reason != ConsentReason::CrewMax));
+    }
+
+    #[test]
+    fn needs_consent_never_lists_only_blocked() {
+        let mut plan = Plan::new("swarm");
+        plan.seats.push(consent_seat(
+            "coder",
+            1,
+            Some(consent_field(
+                "m",
+                Provenance::User,
+                FieldStatus::Blocked { remedy: "x".into() },
+            )),
+        ));
+        plan.seats.push(consent_seat(
+            "reviewer",
+            1,
+            Some(consent_field("m", Provenance::Jev, FieldStatus::Honored)),
+        ));
+        let policy = ConsentPolicy {
+            ask: ConsentAsk::Never,
+            budget_usd_per_mtok: 5.0,
+        };
+        let got = needs_consent(&plan, &policy, Some(99.0), 0);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].reason, ConsentReason::Blocked);
+    }
+
+    #[test]
+    fn needs_consent_always_lists_model_and_harness() {
+        let mut plan = Plan::new("swarm");
+        plan.seats.push(consent_seat(
+            "coder",
+            1,
+            Some(consent_field(
+                "m",
+                Provenance::Profile,
+                FieldStatus::Honored,
+            )),
+        ));
+        let policy = ConsentPolicy {
+            ask: ConsentAsk::Always,
+            budget_usd_per_mtok: 5.0,
+        };
+        let got = needs_consent(&plan, &policy, None, 5);
+        assert!(
+            got.iter().any(|i| i.seat == "coder" && i.field == "model"),
+            "always lists model: {got:?}"
+        );
+        assert!(
+            got.iter()
+                .any(|i| i.seat == "coder" && i.field == "harness"),
+            "always lists harness: {got:?}"
+        );
+    }
+
+    #[test]
+    fn consent_item_serializes_with_kebab_reason() {
+        let item = ConsentItem {
+            seat: "coder".into(),
+            field: "model".into(),
+            reason: ConsentReason::CrewMax,
+        };
+        assert_eq!(
+            serde_json::to_value(&item).unwrap(),
+            serde_json::json!({"seat": "coder", "field": "model", "reason": "crew-max"})
+        );
+        let plan = Plan::new("swarm");
+        assert_eq!(
+            serde_json::to_value(&plan).unwrap()["needs_consent"],
+            serde_json::json!([])
         );
     }
 }

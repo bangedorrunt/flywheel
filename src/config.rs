@@ -369,6 +369,10 @@ pub struct Config {
     /// `[timer]`: one-shot watches. Absent means on. `enabled = false` opts out.
     #[serde(default)]
     pub timer: Option<TimerSection>,
+    /// `[consent]` (ADR-0022 D5): consent gate policy. Absent = defaults
+    /// (`ask = "on-change"`, budget 5.0, no signoff).
+    #[serde(default)]
+    pub consent: Option<ConsentSection>,
 }
 
 /// `[comms]`. Absent `inbox_log` means on. `false` opts out.
@@ -387,6 +391,17 @@ pub struct TimerSection {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CrewBudgetConfig {
     pub max: Option<u32>,
+}
+
+/// `[consent]` (ADR-0022 D5): `ask = "on-change" | "always" | "never"`
+/// (default `on-change`; unknown values fail parse),
+/// `budget_usd_per_mtok` (default 5.0) and `signoff` (parsed, carried,
+/// not acted on in this slice).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConsentSection {
+    pub ask: Option<crate::swarm_plan::ConsentAsk>,
+    pub budget_usd_per_mtok: Option<f64>,
+    pub signoff: Option<String>,
 }
 
 /// Parent-death policy for the captain (ADR-0025 Spec 4, Wave 4a).
@@ -564,6 +579,28 @@ impl Config {
             .and_then(|c| c.max)
             .filter(|n| *n >= 1)
             .unwrap_or(crate::crew::DEFAULT_CREW_MAX)
+    }
+
+    /// ADR-0022 D5 consent policy (`[consent]`): `ask` or `on-change`, and
+    /// the budget threshold or 5.0 when the section is absent.
+    pub fn consent_policy(&self) -> crate::swarm_plan::ConsentPolicy {
+        crate::swarm_plan::ConsentPolicy {
+            ask: self
+                .consent
+                .as_ref()
+                .and_then(|c| c.ask)
+                .unwrap_or_default(),
+            budget_usd_per_mtok: self
+                .consent
+                .as_ref()
+                .and_then(|c| c.budget_usd_per_mtok)
+                .unwrap_or(crate::swarm_plan::DEFAULT_BUDGET_USD_PER_MTOK),
+        }
+    }
+
+    /// ADR-0022 D5 consent signoff (parsed, carried, not acted on here).
+    pub fn consent_signoff(&self) -> Option<&str> {
+        self.consent.as_ref().and_then(|c| c.signoff.as_deref())
     }
 
     pub fn load() -> Result<Self> {

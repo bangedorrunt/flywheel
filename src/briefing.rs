@@ -178,6 +178,11 @@ pub struct Briefing {
     /// session's operating contract.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_skills: Vec<String>,
+    /// ADR-0022 D5: the crew plan carrying computed consent
+    /// (`flywheel-plan.v1`). Additive and optional: `None` when the proposal
+    /// spawns no crew (open/join) — a missing plan must never block a captain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<crate::swarm_plan::Plan>,
 }
 
 /// The session skill bundle. Keep this additive to [`mode_text`]: existing
@@ -548,6 +553,7 @@ pub fn assemble_with_catalog(
         memory_traps: Vec::new(),
         mode_text: mode_text(mode_of(&topology)).to_string(),
         required_skills: required_skills(mode_of(&topology)),
+        plan: None,
         questions: vec![
             Question {
                 id: "topology".into(),
@@ -585,6 +591,7 @@ pub fn assemble_with_catalog(
             default: missing.join(","),
         });
     }
+    attach_consent_plan(&mut briefing, cap);
     briefing
 }
 
@@ -819,6 +826,40 @@ fn splice_project(argv: &mut Vec<String>, project: &str) {
     }
 }
 
+/// ADR-0022 D5: attach the briefing plan carrying computed consent. Seats
+/// carry no model ask at briefing time (`model: None`); the harness is
+/// unknown until dispatch, recorded as `"tbd"`. Under the default policy
+/// the only rule that can fire here is crew-max. This helper is the one
+/// call site for [`crate::swarm_plan::needs_consent`] in this module.
+fn attach_consent_plan(b: &mut Briefing, cap: u32) {
+    use crate::swarm_plan as consent_plan;
+    if !spawns_crew(&b.proposal) {
+        b.plan = None;
+        return;
+    }
+    let mode = if b.proposal.topology == "swarm" {
+        "swarm"
+    } else {
+        "open"
+    };
+    let mut plan = consent_plan::Plan::new(mode);
+    for (role, count) in &b.proposal.crew {
+        plan.seats.push(consent_plan::Seat {
+            role: role.clone(),
+            count: *count,
+            harness: "tbd".to_string(),
+            model: None,
+            effort: None,
+            mode: None,
+            phase: None,
+            placement: "pane".to_string(),
+        });
+    }
+    let policy = consent_plan::ConsentPolicy::default();
+    plan.needs_consent = consent_plan::needs_consent(&plan, &policy, None, cap);
+    b.plan = Some(plan);
+}
+
 fn rebuild_argv_for_topology(b: &mut Briefing, topology: &str) {
     let (topo, join) = split_topology(topology);
     b.proposal.topology = topo.to_string();
@@ -906,6 +947,10 @@ fn rebuild_argv_for_topology(b: &mut Briefing, topology: &str) {
         }
         _ => {}
     }
+    // Topology switched under the proposal: the crew map changed, so the
+    // attached plan is stale. Recompute under the default cap (advisory;
+    // the spawn gate re-weighs with the operator cap).
+    attach_consent_plan(b, DEFAULT_CREW_MAX);
 }
 
 fn splice_flag(argv: &mut Vec<String>, flag: &str, value: &str) {
