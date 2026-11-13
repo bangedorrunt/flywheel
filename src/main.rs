@@ -76,6 +76,7 @@ mod pane_keep;
 mod pane_write;
 mod phase_chain;
 mod phase_contracts;
+mod plan_fence;
 mod plane_route;
 mod preflight;
 mod principles;
@@ -1857,6 +1858,13 @@ enum Commands {
         /// repo dir (default: the project dir from config)
         #[arg(long)]
         dir: Option<PathBuf>,
+    },
+    /// internal: plan fence (ADR-0021 D7, bd-plan-fence-command-49etj) —
+    /// `br lint` + `br dep cycles` gate and bead-set digest convergence.
+    #[command(name = "__plan-fence", hide = true)]
+    __PlanFence {
+        #[command(subcommand)]
+        action: plan_fence::PlanFenceAction,
     },
     /// internal: the project's active reservation board (ADR-0019 Spec
     /// 3.4/3.5, bd-w1-reserve-serialize-2mam) — serialize-on-overlap data
@@ -3745,6 +3753,12 @@ fn main() {
         }) => {
             cmd_internal_loop_run_verify(&cfg, project, bead_id, sha, *timeout_secs, dir.as_deref())
         }
+        Some(Commands::__PlanFence { action }) => match action {
+            plan_fence::PlanFenceAction::Fence { json } => plan_fence::cmd_fence(*json),
+            plan_fence::PlanFenceAction::Converged { state, json } => {
+                plan_fence::cmd_converged(state, *json)
+            }
+        },
         Some(Commands::__ReservationBoard { project }) => {
             cmd_internal_reservation_board(&cfg, project)
         }
