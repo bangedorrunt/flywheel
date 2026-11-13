@@ -8039,7 +8039,7 @@ mod envpin_reroute_tests {
         let rows = rebind_rows(&hop.project, &key);
         assert_eq!(rows.len(), 3, "exactly one intent, three states: {rows:?}");
         assert_eq!(
-            rows.iter().map(|i| i.state.clone()).collect::<Vec<_>>(),
+            rows.iter().map(|i| i.state).collect::<Vec<_>>(),
             vec![
                 toron_core::index::workflow_effects::EffectState::Prepared,
                 toron_core::index::workflow_effects::EffectState::InFlight,
@@ -8293,7 +8293,7 @@ mod envpin_reroute_tests {
         let rows = rebind_rows(&hop.project, &hop_effect_key(&hop));
         assert_eq!(rows.len(), 3, "exactly one intent, three states: {rows:?}");
         assert_eq!(
-            rows.iter().map(|i| i.state.clone()).collect::<Vec<_>>(),
+            rows.iter().map(|i| i.state).collect::<Vec<_>>(),
             vec![
                 toron_core::index::workflow_effects::EffectState::Prepared,
                 toron_core::index::workflow_effects::EffectState::InFlight,
@@ -8580,7 +8580,7 @@ mod envpin_reroute_tests {
         );
         let rows = rebind_rows("envpin-rex-proj", &key);
         assert_eq!(
-            rows.iter().map(|i| i.state.clone()).collect::<Vec<_>>(),
+            rows.iter().map(|i| i.state).collect::<Vec<_>>(),
             vec![
                 toron_core::index::workflow_effects::EffectState::Prepared,
                 toron_core::index::workflow_effects::EffectState::InFlight,
