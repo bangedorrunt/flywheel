@@ -7571,6 +7571,451 @@ pub(crate) fn reroute_env_pin_verdict(
     }
 }
 
+/// Env-pin reroute hop (ADR-0022 D7 acceptance #5): respawn with the new
+/// env pin when the reconciler says Respawn, keeping the same agent name
+/// (mail identity and toron bead reservations carry over). The old pane
+/// closes only after the new one launches; a failed launch never closes
+/// it. Journal first: exactly one RebindIntent (Prepared → InFlight →
+/// Settled) via commit_rebind_opt, gated by allowed_from_failure (no hop
+/// on Timeout/Unknown/empty evidence) and the one-hop flag.
+#[derive(Debug, Clone)]
+pub(crate) struct EnvpinHop {
+    pub project: String,
+    pub agent: String,
+    pub old_pane: String,
+    pub next_harness: String,
+    pub next_args: Vec<String>,
+    pub next_env: std::collections::BTreeMap<String, String>,
+    pub next_profile: String,
+    pub next_model: String,
+    pub from_profile: String,
+    pub from_model: String,
+    pub from_harness: String,
+    pub kind: crate::failure::FailureKind,
+    pub evidence: String,
+    pub attempt: u32,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum EnvpinHopOutcome {
+    Hopped { agent: AgentInfo },
+    AlreadySatisfied,
+    SuppressedGate,
+    AlreadyRerouted,
+}
+
+/// Decide with the reconciler, then interpret: Respawn hops, Keep means
+/// the hop is already satisfied. Anything else fails loud — the reroute
+/// loop only reaches here for an env-pinned next model, so a different
+/// verdict is a bug, never a silent downgrade.
+pub(crate) fn envpin_respin_hop(
+    backend: &dyn backend::MultiplexerBackend,
+    split_with_env: &dyn Fn(
+        &str,
+        &std::collections::BTreeMap<String, String>,
+    ) -> anyhow::Result<String>,
+    hop: &EnvpinHop,
+    already_rerouted: bool,
+) -> anyhow::Result<EnvpinHopOutcome> {
+    if already_rerouted {
+        return Ok(EnvpinHopOutcome::AlreadyRerouted);
+    }
+    if !crate::agent_ref::RebindIntent::allowed_from_failure(hop.kind, &hop.evidence) {
+        return Ok(EnvpinHopOutcome::SuppressedGate);
+    }
+    // The decision consults only harness+model (same role/placement and
+    // empty effort/mode on both sides so those never fire): that matches
+    // today's verdict domain exactly, so a same-model pane keeps working
+    // in place and a different env-pinned model respawns.
+    let live = crate::seat_binder::LiveSeat {
+        pin: hop.agent.clone(),
+        role: "coder".to_string(),
+        harness: hop.from_harness.clone(),
+        model: Some(hop.from_model.clone()),
+        mode: None,
+        effort: None,
+        placement: crate::seat_binder::SeatPlacement::Pane,
+        idle: false,
+        fresh_session: false,
+        idle_since_ms: None,
+    };
+    let want = crate::seat_reconcile::DesiredSeat {
+        pin: Some(hop.agent.clone()),
+        role: "coder".to_string(),
+        harness: hop.next_harness.clone(),
+        model: Some(hop.next_model.clone()),
+        effort: None,
+        mode: None,
+        placement: crate::seat_binder::SeatPlacement::Pane,
+        context_warm_allowed: true,
+    };
+    let effect = crate::seat_reconcile::envpin_reroute_effect(&live, &want, &|harness: &str| {
+        matches!(
+            crate::headless::interactive_model_plan(harness, "", None),
+            crate::headless::InteractiveModelPlan::PinnedByEnv { .. }
+        )
+    });
+    if !matches!(effect, crate::seat_reconcile::SeatEffect::Respawn { .. }) {
+        return Ok(EnvpinHopOutcome::AlreadySatisfied);
+    }
+    let agent = crate::agent_ref::AgentRef::new(&hop.project, &hop.agent);
+    let from = crate::agent_ref::AgentBinding {
+        profile_name: hop.from_profile.clone(),
+        model: hop.from_model.clone(),
+        harness: hop.from_harness.clone(),
+        location: crate::agent_ref::BindingLocation::Pane,
+    };
+    let to = crate::agent_ref::AgentBinding {
+        profile_name: hop.next_profile.clone(),
+        model: hop.next_model.clone(),
+        harness: hop.next_harness.clone(),
+        location: crate::agent_ref::BindingLocation::Pane,
+    };
+    let intent = crate::agent_ref::RebindIntent::prepare(
+        agent,
+        from,
+        to,
+        crate::agent_ref::RebindReason::ProfileFallback {
+            kind: hop.kind.to_string(),
+            evidence: hop.evidence.clone(),
+        },
+        hop.attempt,
+    );
+    let launched = crate::agent_ref::commit_rebind_opt(&hop.project, intent, |_| {
+        let panes = backend.pane_list(None).map_err(anyhow::Error::from)?;
+        let anchor = panes
+            .iter()
+            .find(|p| p.pane_id != hop.old_pane)
+            .map(|p| p.pane_id.clone())
+            .unwrap_or_else(|| hop.old_pane.clone());
+        let new_pane = split_with_env(&anchor, &hop.next_env)?;
+        let info = backend
+            .agent_start(&hop.agent, &hop.next_harness, &new_pane, &hop.next_args)
+            .map_err(anyhow::Error::from)?;
+        backend
+            .pane_close(&hop.old_pane)
+            .map_err(anyhow::Error::from)?;
+        Ok(Some(info))
+    })?;
+    match launched {
+        Some(agent) => {
+            eprintln!(
+                "flywheel: pane reroute {} -> {} (profile fallback, respawned with env pin; old pane closed after launch)",
+                hop.from_profile, hop.next_profile
+            );
+            Ok(EnvpinHopOutcome::Hopped { agent })
+        }
+        None => anyhow::bail!("envpin hop produced no agent"),
+    }
+}
+
+#[cfg(test)]
+mod envpin_reroute_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    struct FakeHopBackend {
+        order: Arc<Mutex<Vec<String>>>,
+        fail_launch: bool,
+    }
+
+    impl crate::backend::MultiplexerBackend for FakeHopBackend {
+        fn name(&self) -> &'static str {
+            "fake-hop"
+        }
+        fn pane_list(
+            &self,
+            _workspace_id: Option<&str>,
+        ) -> Result<Vec<toron_core::pane_types::PaneInfo>, toron_plane::backend::BackendError>
+        {
+            Ok(vec![toron_core::pane_types::PaneInfo {
+                pane_id: "old-pane".into(),
+                terminal_id: String::new(),
+                workspace_id: "ws".into(),
+                tab_id: String::new(),
+                focused: false,
+                agent_status: toron_core::pane_types::AgentStatus::Idle,
+                revision: 0,
+                title: None,
+                cwd: None,
+                agent: None,
+                agent_session: None,
+                display_agent: None,
+                foreground_cwd: None,
+                label: None,
+                scroll: None,
+                state_labels: serde_json::Map::new(),
+                terminal_title: None,
+                terminal_title_stripped: None,
+                tokens: serde_json::Map::new(),
+            }])
+        }
+        fn agent_start(
+            &self,
+            name: &str,
+            _kind: &str,
+            pane_id: &str,
+            _args: &[String],
+        ) -> Result<toron_core::pane_types::AgentInfo, toron_plane::backend::BackendError> {
+            self.order
+                .lock()
+                .unwrap()
+                .push(format!("launch:{name}@{pane_id}"));
+            if self.fail_launch {
+                return Err(toron_plane::backend::BackendError::timeout(
+                    "fake launch failed".to_string(),
+                ));
+            }
+            Ok(toron_core::pane_types::AgentInfo {
+                agent: None,
+                agent_status: toron_core::pane_types::AgentStatus::Working,
+                cwd: None,
+                display_agent: None,
+                focused: false,
+                foreground_cwd: None,
+                interactive_ready: false,
+                launch_pending: false,
+                name: Some(name.to_string()),
+                pane_id: pane_id.to_string(),
+                revision: 0,
+                state_change_seq: 0,
+                completion_seq: None,
+                state_labels: serde_json::Map::new(),
+                tab_id: String::new(),
+                terminal_id: String::new(),
+                terminal_title: None,
+                workspace_id: String::new(),
+            })
+        }
+        fn pane_close(&self, pane_id: &str) -> Result<(), toron_plane::backend::BackendError> {
+            self.order.lock().unwrap().push(format!("close:{pane_id}"));
+            Ok(())
+        }
+    }
+
+    fn hop_fixture() -> EnvpinHop {
+        let mut env = BTreeMap::new();
+        env.insert(
+            "OPENCODE_CONFIG_CONTENT".to_string(),
+            "{\"model\":\"opencode/new\"}".to_string(),
+        );
+        env.insert(
+            "FLYWHEEL_REROUTE_NOTE".to_string(),
+            "rerouted opencode-fallback -> opencode-next after 429".to_string(),
+        );
+        EnvpinHop {
+            project: "envpin-test-proj".to_string(),
+            agent: "TestyCreek".to_string(),
+            old_pane: "old-pane".to_string(),
+            next_harness: "opencode".to_string(),
+            next_args: vec!["opencode".to_string()],
+            next_env: env,
+            next_profile: "opencode-next".to_string(),
+            next_model: "opencode/new".to_string(),
+            from_profile: "opencode-fallback".to_string(),
+            from_model: "opencode/gold".to_string(),
+            from_harness: "opencode".to_string(),
+            kind: crate::failure::FailureKind::RateLimit,
+            evidence: "429 rate limited".to_string(),
+            attempt: 0,
+        }
+    }
+
+    fn rebind_rows(project: &str, key: &str) -> Vec<crate::agent_ref::RebindIntent> {
+        crate::state::read_log(project)
+            .expect("journal reads")
+            .iter()
+            .filter(|e| e.kind == crate::state::EventKind::Spawn)
+            .filter_map(|e| {
+                serde_json::from_value::<crate::agent_ref::RebindIntent>(e.data.clone()).ok()
+            })
+            .filter(|i| i.effect_key == key)
+            .collect()
+    }
+
+    #[test]
+    fn envpin_hop_journals_before_launch_keeps_name_closes_last() {
+        let _guard = crate::config::lock_env();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let seen_prepared_at_split = Arc::new(Mutex::new(None));
+        let backend = FakeHopBackend {
+            order: order.clone(),
+            fail_launch: false,
+        };
+        let hop = hop_fixture();
+        let key = crate::agent_ref::RebindIntent::derive_effect_key(
+            &crate::agent_ref::AgentRef::new(&hop.project, &hop.agent),
+            &crate::agent_ref::AgentBinding {
+                profile_name: hop.from_profile.clone(),
+                model: hop.from_model.clone(),
+                harness: hop.from_harness.clone(),
+                location: crate::agent_ref::BindingLocation::Pane,
+            },
+            &crate::agent_ref::AgentBinding {
+                profile_name: hop.next_profile.clone(),
+                model: hop.next_model.clone(),
+                harness: hop.next_harness.clone(),
+                location: crate::agent_ref::BindingLocation::Pane,
+            },
+        );
+        let split_order = order.clone();
+        let split_seen = seen_prepared_at_split.clone();
+        let project = hop.project.clone();
+        let key2 = key.clone();
+        let split = move |anchor: &str, env: &BTreeMap<String, String>| -> anyhow::Result<String> {
+            split_order.lock().unwrap().push(format!("split:{anchor}"));
+            assert!(
+                env.contains_key("OPENCODE_CONFIG_CONTENT"),
+                "new env pin travels"
+            );
+            assert!(
+                env.contains_key("FLYWHEEL_REROUTE_NOTE"),
+                "handoff note travels"
+            );
+            let rows = rebind_rows(&project, &key2);
+            let prepared = rows
+                .iter()
+                .any(|i| i.state == toron_core::index::workflow_effects::EffectState::Prepared);
+            *split_seen.lock().unwrap() = Some(prepared);
+            Ok("new-pane-1".to_string())
+        };
+        let got = envpin_respin_hop(&backend, &split, &hop, false).expect("hop runs");
+        assert!(
+            matches!(&got, EnvpinHopOutcome::Hopped { agent } if agent.name.as_deref() == Some("TestyCreek")),
+            "same agent name kept: {got:?}"
+        );
+        assert_eq!(
+            seen_prepared_at_split.lock().unwrap().clone(),
+            Some(true),
+            "Prepared row journaled BEFORE the respawn runs"
+        );
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec![
+                "split:old-pane".to_string(),
+                "launch:TestyCreek@new-pane-1".to_string(),
+                "close:old-pane".to_string(),
+            ],
+            "old pane closes only after the new one launches"
+        );
+        let rows = rebind_rows(&hop.project, &key);
+        assert_eq!(rows.len(), 3, "exactly one intent, three states: {rows:?}");
+        assert_eq!(
+            rows.iter().map(|i| i.state.clone()).collect::<Vec<_>>(),
+            vec![
+                toron_core::index::workflow_effects::EffectState::Prepared,
+                toron_core::index::workflow_effects::EffectState::InFlight,
+                toron_core::index::workflow_effects::EffectState::Settled,
+            ]
+        );
+    }
+
+    #[test]
+    fn envpin_hop_closed_gate_neither_respawns_nor_journals() {
+        let _guard = crate::config::lock_env();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let backend = FakeHopBackend {
+            order: order.clone(),
+            fail_launch: false,
+        };
+        let mut hop = hop_fixture();
+        hop.kind = crate::failure::FailureKind::Timeout;
+        let split = |_: &str, _: &BTreeMap<String, String>| -> anyhow::Result<String> {
+            panic!("closed gate must not split")
+        };
+        let got = envpin_respin_hop(&backend, &split, &hop, false).expect("hop runs");
+        assert!(
+            matches!(got, EnvpinHopOutcome::SuppressedGate),
+            "closed gate suppresses: {got:?}"
+        );
+        assert!(order.lock().unwrap().is_empty(), "no backend calls");
+        assert!(
+            crate::state::read_log(&hop.project)
+                .expect("journal reads")
+                .is_empty(),
+            "no journal rows"
+        );
+    }
+
+    #[test]
+    fn envpin_hop_second_failure_does_not_hop_again() {
+        let _guard = crate::config::lock_env();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let backend = FakeHopBackend {
+            order: order.clone(),
+            fail_launch: false,
+        };
+        let hop = hop_fixture();
+        let split = |_: &str, _: &BTreeMap<String, String>| -> anyhow::Result<String> {
+            panic!("second failure must not split")
+        };
+        let got = envpin_respin_hop(&backend, &split, &hop, true).expect("hop runs");
+        assert!(
+            matches!(got, EnvpinHopOutcome::AlreadyRerouted),
+            "second failure does not hop: {got:?}"
+        );
+        assert!(order.lock().unwrap().is_empty(), "no backend calls");
+        assert!(
+            crate::state::read_log(&hop.project)
+                .expect("journal reads")
+                .is_empty(),
+            "no journal rows"
+        );
+    }
+
+    #[test]
+    fn envpin_hop_keep_means_no_hop() {
+        let _guard = crate::config::lock_env();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let backend = FakeHopBackend {
+            order: order.clone(),
+            fail_launch: false,
+        };
+        let mut hop = hop_fixture();
+        hop.next_model = hop.from_model.clone();
+        let split = |_: &str, _: &BTreeMap<String, String>| -> anyhow::Result<String> {
+            panic!("satisfied hop must not split")
+        };
+        let got = envpin_respin_hop(&backend, &split, &hop, false).expect("hop runs");
+        assert!(
+            matches!(got, EnvpinHopOutcome::AlreadySatisfied),
+            "same model is already satisfied: {got:?}"
+        );
+        assert!(order.lock().unwrap().is_empty(), "no backend calls");
+    }
+
+    #[test]
+    fn envpin_hop_failed_launch_never_closes_old() {
+        let _guard = crate::config::lock_env();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let backend = FakeHopBackend {
+            order: order.clone(),
+            fail_launch: true,
+        };
+        let hop = hop_fixture();
+        let split = |anchor: &str, _: &BTreeMap<String, String>| -> anyhow::Result<String> {
+            order.lock().unwrap().push(format!("split:{anchor}"));
+            Ok("new-pane-1".to_string())
+        };
+        let err = envpin_respin_hop(&backend, &split, &hop, false).expect_err("launch fails");
+        assert!(format!("{err:#}").contains("fake launch failed"));
+        let calls = order.lock().unwrap().clone();
+        assert!(
+            calls.iter().any(|c| c.starts_with("split:")),
+            "split ran: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.starts_with("launch:")),
+            "launch ran: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("close:")),
+            "old pane never closed on failed launch: {calls:?}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod recipe_launch_tests {
     use super::{recipe_launch_command, shell_quote};

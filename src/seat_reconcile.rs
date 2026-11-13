@@ -142,6 +142,35 @@ fn apply_idle_retire(
     }
 }
 
+/// Env-pin reroute decision (ADR-0022 D7 acceptance #5): the current pane
+/// (with its env pin) against the next profile's harness/model/effort.
+/// Decided by the reconciler, never a parallel rule: a different env-pinned
+/// model respawns (the caller keeps the pin), the same model is Keep
+/// (today's AlreadyPinned path), and an argv-delivered model relaunches,
+/// never respawns. `model_by_env` is the harness's own delivery rule (env
+/// pin vs argv). A single pinned seat always reconciles to exactly one
+/// effect; anything else falls back to Keep (no hop) rather than inventing
+/// an answer.
+pub fn envpin_reroute_effect(
+    current: &LiveSeat,
+    next: &DesiredSeat,
+    model_by_env: &dyn Fn(&str) -> bool,
+) -> SeatEffect {
+    match reconcile(
+        std::slice::from_ref(next),
+        std::slice::from_ref(current),
+        model_by_env,
+        &ReconcilePolicy::default(),
+    )
+    .as_slice()
+    {
+        [effect] => effect.clone(),
+        _ => SeatEffect::Keep {
+            pin: current.pin.clone(),
+        },
+    }
+}
+
 fn decide_one(
     desired: &DesiredSeat,
     live: &LiveSeat,
@@ -666,6 +695,69 @@ mod tests {
     fn seat_reconcile_json_malformed_errors() {
         assert!(reconcile_json("not json", 0).is_err());
         assert!(reconcile_json("{\"desired\":[]}", 0).is_err());
+    }
+
+    fn envpin_live(pin: &str, model: Option<&str>) -> LiveSeat {
+        LiveSeat {
+            pin: pin.into(),
+            role: "coder".into(),
+            harness: "opencode".into(),
+            model: model.map(str::to_string),
+            mode: None,
+            effort: None,
+            placement: SeatPlacement::Pane,
+            idle: false,
+            fresh_session: false,
+            idle_since_ms: None,
+        }
+    }
+
+    fn envpin_want(model: Option<&str>) -> DesiredSeat {
+        DesiredSeat {
+            pin: Some("a".into()),
+            role: "coder".into(),
+            harness: "opencode".into(),
+            model: model.map(str::to_string),
+            effort: None,
+            mode: None,
+            placement: SeatPlacement::Pane,
+            context_warm_allowed: true,
+        }
+    }
+
+    #[test]
+    fn envpin_respawn_env_model_gives_respawn() {
+        let live = envpin_live("a", Some("opencode/gold"));
+        let want = envpin_want(Some("opencode/new"));
+        let got = envpin_reroute_effect(&live, &want, &|_| true);
+        assert!(
+            matches!(got, SeatEffect::Respawn { ref pin, .. } if pin == "a"),
+            "different env-pinned model respawns, keeps pin: {got:?}"
+        );
+    }
+
+    #[test]
+    fn envpin_respawn_same_model_gives_keep() {
+        let live = envpin_live("a", Some("opencode/gold"));
+        let want = envpin_want(Some("opencode/gold"));
+        let got = envpin_reroute_effect(&live, &want, &|_| true);
+        assert_eq!(
+            got,
+            SeatEffect::Keep {
+                pin: "a".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn envpin_respawn_argv_model_gives_relaunch() {
+        let live = envpin_live("a", Some("opencode/gold"));
+        let want = envpin_want(Some("opencode/new"));
+        let got = envpin_reroute_effect(&live, &want, &|_| false);
+        assert!(
+            matches!(got, SeatEffect::Relaunch { ref pin, .. } if pin == "a"),
+            "argv-delivered model relaunches, never respawns: {got:?}"
+        );
     }
 
     fn v9_gen_live(n: usize, reverse: bool) -> Vec<LiveSeat> {
