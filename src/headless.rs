@@ -1539,6 +1539,9 @@ pub enum InteractiveModelPlan {
     Argv(Vec<String>),
     /// The harness takes no model flag; the pin must travel by pane env.
     PinnedByEnv { model: String },
+    /// The ask is [`crate::models::HARNESS_DEFAULT`]: the harness's own
+    /// configured model stands, so nothing is injected.
+    HarnessDefault,
 }
 
 impl InteractiveModelPlan {
@@ -1546,14 +1549,14 @@ impl InteractiveModelPlan {
     pub fn args(&self) -> &[String] {
         match self {
             Self::Argv(a) => a,
-            Self::PinnedByEnv { .. } => &[],
+            Self::PinnedByEnv { .. } | Self::HarnessDefault => &[],
         }
     }
 
     /// The model to pin via pane env, when the harness needs one.
     pub fn env_pin(&self) -> Option<&str> {
         match self {
-            Self::Argv(_) => None,
+            Self::Argv(_) | Self::HarnessDefault => None,
             Self::PinnedByEnv { model } => Some(model),
         }
     }
@@ -1569,6 +1572,9 @@ pub fn interactive_model_plan(
     model: &str,
     effort: Option<&str>,
 ) -> InteractiveModelPlan {
+    if crate::models::ModelChoice::parse(model) == crate::models::ModelChoice::HarnessDefault {
+        return InteractiveModelPlan::HarnessDefault;
+    }
     if harness == "opencode" {
         let effort = effort.filter(|e| !e.is_empty());
         if let Some(e) = effort {

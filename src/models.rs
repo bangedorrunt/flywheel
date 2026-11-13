@@ -154,6 +154,38 @@ pub fn implied_slot_name_for_harness(kind: &str) -> Option<&'static str> {
     crate::harness_registry::implied_slot(kind)
 }
 
+/// The one spelling that asks for the harness's OWN configured model.
+pub const HARNESS_DEFAULT: &str = "harness-default";
+
+/// A model ask after parsing: a concrete id, or "let the harness decide".
+/// Every ask (spawn flag, `--patch`, standing preference, profile) lowers
+/// through [`ModelChoice::parse`], so the plan and the launch read one value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelChoice {
+    Model(String),
+    HarnessDefault,
+}
+
+impl ModelChoice {
+    #[must_use]
+    pub fn parse(ask: &str) -> Self {
+        if ask == HARNESS_DEFAULT {
+            Self::HarnessDefault
+        } else {
+            Self::Model(ask.to_string())
+        }
+    }
+
+    /// The ask spelling to record: the id, or [`HARNESS_DEFAULT`] itself.
+    #[must_use]
+    pub fn as_ask(&self) -> &str {
+        match self {
+            Self::Model(id) => id,
+            Self::HarnessDefault => HARNESS_DEFAULT,
+        }
+    }
+}
+
 /// Map `@cheap` / `free` / `smol` / … onto a canonical slot name.
 /// Requires the `@` prefix on profile.model so a model id `cheap` is not stolen.
 pub fn slot_alias(model: &str) -> Option<&'static str> {

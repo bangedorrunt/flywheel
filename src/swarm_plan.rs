@@ -435,6 +435,19 @@ pub fn resolved_field(
     }
 }
 
+/// A harness-default ask as a plan field: the harness honours it by
+/// construction (nothing is injected), so the row is always `honored`.
+#[must_use]
+pub fn harness_default_field(from: Provenance) -> Field {
+    Field {
+        value: crate::models::HARNESS_DEFAULT.to_string(),
+        from,
+        status: FieldStatus::Honored,
+        registry: None,
+        was: None,
+    }
+}
+
 /// An unresolvable model ask as a plan field (ambiguous or retired):
 /// carries the ask with the provenance split applied — `blocked` for
 /// user/preference asks, `degraded` otherwise.

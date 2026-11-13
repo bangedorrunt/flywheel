@@ -912,12 +912,18 @@ pub(crate) fn plan_gate(plan: &crate::swarm_plan::Plan, yes: bool) -> PlanGate {
 fn resolve_model_field(
     registry: &models::ModelRegistry,
     harness: &str,
-    ask: &str,
+    ask: &crate::models::ModelChoice,
     from: crate::swarm_plan::Provenance,
     effort: Option<&str>,
 ) -> (crate::swarm_plan::Field, String) {
-    use crate::models::{RegistryMembership, Resolution};
+    use crate::models::{ModelChoice, RegistryMembership, Resolution};
     use crate::swarm_plan::{resolved_field, unresolved_field};
+    let ModelChoice::Model(ask) = ask else {
+        return (
+            crate::swarm_plan::harness_default_field(from),
+            String::new(),
+        );
+    };
     match registry.resolve_ask(ask, harness) {
         Resolution::Resolved {
             id,
@@ -965,7 +971,7 @@ fn load_spawn_preferences(path: &std::path::Path) -> Result<crate::preferences::
 /// preference-or-nothing. The plan and the launch read this: one
 /// precedence, two readers.
 pub(crate) struct BareAsk {
-    model: Option<(String, crate::swarm_plan::Provenance)>,
+    model: Option<(crate::models::ModelChoice, crate::swarm_plan::Provenance)>,
     provider: String,
     effort: Option<(String, crate::swarm_plan::Provenance)>,
 }
@@ -977,13 +983,14 @@ fn prefer_bare_inputs(
     bare_model: &str,
     bare_provider: &str,
 ) -> BareAsk {
+    use crate::models::ModelChoice;
     use crate::swarm_plan::Provenance;
     let effort = crate::prefer_fill(prefs, item, crate::preferences::Field::Effort, project)
         .map(|value| (value, Provenance::Preference));
     if bare_model.is_empty() {
         match crate::prefer_fill(prefs, item, crate::preferences::Field::Model, project) {
             Some(model) => BareAsk {
-                model: Some((model, Provenance::Preference)),
+                model: Some((ModelChoice::parse(&model), Provenance::Preference)),
                 provider: String::new(),
                 effort,
             },
@@ -995,7 +1002,7 @@ fn prefer_bare_inputs(
         }
     } else {
         BareAsk {
-            model: Some((bare_model.to_string(), Provenance::User)),
+            model: Some((ModelChoice::parse(bare_model), Provenance::User)),
             provider: bare_provider.to_string(),
             effort,
         }
@@ -1010,7 +1017,7 @@ fn prefer_bare_inputs(
 #[derive(Default)]
 pub(crate) struct RoleOverride {
     pub harness: Option<String>,
-    pub model: Option<(String, String)>,
+    pub model: Option<(crate::models::ModelChoice, String)>,
     pub effort: Option<String>,
     pub mode: Option<String>,
 }
@@ -1028,7 +1035,7 @@ pub(crate) fn patch_role_overrides(
         match &p.field {
             crate::swarm_plan::PatchField::Harness => e.harness = Some(p.value.clone()),
             crate::swarm_plan::PatchField::Model => {
-                e.model = Some((p.value.clone(), String::new()))
+                e.model = Some((crate::models::ModelChoice::parse(&p.value), String::new()))
             }
             crate::swarm_plan::PatchField::Effort => e.effort = Some(p.value.clone()),
             crate::swarm_plan::PatchField::Mode => e.mode = Some(p.value.clone()),
@@ -1044,11 +1051,16 @@ pub(crate) fn patched_bare_launch(
     overrides: &std::collections::BTreeMap<String, RoleOverride>,
     role: &str,
     ask: BareAsk,
-) -> (String, String, Option<String>) {
+) -> (crate::models::ModelChoice, String, Option<String>) {
     let ov = overrides.get(role);
     let (model, provider) = match ov.and_then(|o| o.model.clone()) {
         Some(pair) => pair,
-        None => (ask.model.map(|(m, _)| m).unwrap_or_default(), ask.provider),
+        None => (
+            ask.model
+                .map(|(m, _)| m)
+                .unwrap_or_else(|| crate::models::ModelChoice::parse("")),
+            ask.provider,
+        ),
     };
     let effort = ov
         .and_then(|o| o.effort.clone())
@@ -1065,7 +1077,7 @@ pub(crate) fn patch_shadow_profile(
 ) {
     if let Some(o) = overrides.get(role) {
         if let Some((m, _)) = &o.model {
-            shadow.model = m.clone();
+            shadow.model = m.as_ask().to_string();
         }
         if let Some(e) = &o.effort {
             shadow.effort = e.clone();
@@ -1165,14 +1177,19 @@ pub(crate) fn build_dry_run_plan(
             let (_, model_ask, effort) = prefer_shadow_profile(prefs, item, p, project);
             let harness = crate::prefer_kind(cfg, item, catalog, registry, prefs, project)?;
             let model = match model_ask {
-                Some((ask, from)) => {
-                    let (_, resolved) = registry.resolve_profile_route(&harness, &ask)?;
-                    if resolved.is_empty() {
-                        None
-                    } else {
-                        Some((resolved, from))
+                Some((ask, from)) => match crate::models::ModelChoice::parse(&ask) {
+                    crate::models::ModelChoice::HarnessDefault => {
+                        Some((crate::models::ModelChoice::HarnessDefault, from))
                     }
-                }
+                    crate::models::ModelChoice::Model(ask) => {
+                        let (_, resolved) = registry.resolve_profile_route(&harness, &ask)?;
+                        if resolved.is_empty() {
+                            None
+                        } else {
+                            Some((crate::models::ModelChoice::Model(resolved), from))
+                        }
+                    }
+                },
                 None => None,
             };
             (harness, model, effort)
@@ -1180,14 +1197,7 @@ pub(crate) fn build_dry_run_plan(
             let harness = crate::prefer_kind(cfg, item, catalog, registry, prefs, project)?;
             let ask = prefer_bare_inputs(prefs, item, project, bare_model, bare_provider);
             let model = match ask.model {
-                Some((m, from)) => {
-                    let lookup = if ask.provider.is_empty() {
-                        m
-                    } else {
-                        format!("{}/{}", ask.provider, m)
-                    };
-                    Some((lookup, from))
-                }
+                Some((choice, from)) => Some((bare_with_provider(choice, &ask.provider), from)),
                 None => bare_fallback_model(registry, &harness),
             };
             (harness, model, ask.effort)
@@ -1247,19 +1257,40 @@ pub(crate) fn build_dry_run_plan(
 fn bare_fallback_model(
     registry: &models::ModelRegistry,
     harness: &str,
-) -> Option<(String, crate::swarm_plan::Provenance)> {
+) -> Option<(crate::models::ModelChoice, crate::swarm_plan::Provenance)> {
+    use crate::models::ModelChoice;
     if let Some(id) = registry.coupled_default_model(harness)
         && !id.is_empty()
     {
-        return Some((id, crate::swarm_plan::Provenance::HarnessDefault));
+        return Some((
+            ModelChoice::Model(id),
+            crate::swarm_plan::Provenance::HarnessDefault,
+        ));
     }
     if let Some(slot) = models::implied_slot_name_for_harness(harness)
         .and_then(|name| registry.effective_slot_model(name))
         && !slot.is_empty()
     {
-        return Some((slot, crate::swarm_plan::Provenance::Slot));
+        return Some((
+            ModelChoice::Model(slot),
+            crate::swarm_plan::Provenance::Slot,
+        ));
     }
     None
+}
+
+/// `--provider` joins a concrete bare id; the harness-default ask has no id
+/// to prefix, so it passes through untouched.
+fn bare_with_provider(
+    choice: crate::models::ModelChoice,
+    provider: &str,
+) -> crate::models::ModelChoice {
+    use crate::models::ModelChoice;
+    match choice {
+        ModelChoice::HarnessDefault => ModelChoice::HarnessDefault,
+        ModelChoice::Model(id) if provider.is_empty() => ModelChoice::Model(id),
+        ModelChoice::Model(id) => ModelChoice::Model(format!("{provider}/{id}")),
+    }
 }
 
 pub(crate) fn cmd_spawn(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
@@ -1745,7 +1776,11 @@ projects available: {}",
                     };
                     plan.args
                         .extend(patched_mode_argv(&overrides, item.short.as_str(), &kind));
-                    (plan.args, Some(plan.model), plan.env_model_pin)
+                    let model_pin = match crate::models::ModelChoice::parse(&plan.model) {
+                        crate::models::ModelChoice::HarnessDefault => None,
+                        crate::models::ModelChoice::Model(_) => Some(plan.model),
+                    };
+                    (plan.args, model_pin, plan.env_model_pin)
                 }
                 None => {
                     let (args, env_pin) = if first {
@@ -2565,7 +2600,11 @@ pub(crate) fn cmd_spawn_rex(
                     let mut plan = profile_launch_plan(&kind, &shadow, None)?;
                     plan.args
                         .extend(patched_mode_argv(&overrides, item.short.as_str(), &kind));
-                    (plan.args, Some(plan.model), plan.env_model_pin)
+                    let model_pin = match crate::models::ModelChoice::parse(&plan.model) {
+                        crate::models::ModelChoice::HarnessDefault => None,
+                        crate::models::ModelChoice::Model(_) => Some(plan.model),
+                    };
+                    (plan.args, model_pin, plan.env_model_pin)
                 }
                 None => {
                     let ask = prefer_bare_inputs(
@@ -3218,27 +3257,29 @@ mod spawn_profile_plan_tests {
             "[models.\"aaa/glm-5.2\"]\n[models.\"zzz/glm-5.2\"]\n",
         )
         .expect("models.toml");
-        let (args, pin) = bare_model_launch("pi", "glm-5.2", "", None).expect("bare id");
+        let (args, pin) =
+            bare_model_launch("pi", &model_ask("glm-5.2"), "", None).expect("bare id");
         assert_eq!(
             args,
             vec!["--model", "aaa/glm-5.2"],
             "registered bare id routes"
         );
         assert_eq!(pin, None, "pi carries no env pin");
-        let (args, _) = bare_model_launch("pi", "glm-5.2", "zzz", None).expect("pinned");
+        let (args, _) =
+            bare_model_launch("pi", &model_ask("glm-5.2"), "zzz", None).expect("pinned");
         assert_eq!(
             args,
             vec!["--model", "zzz/glm-5.2"],
             "explicit provider wins"
         );
-        let (args, _) =
-            bare_model_launch("pi", "ghost-model", "", None).expect("lenient passthrough");
+        let (args, _) = bare_model_launch("pi", &model_ask("ghost-model"), "", None)
+            .expect("lenient passthrough");
         assert_eq!(args, vec!["--model", "ghost-model"]);
-        let (args, _) =
-            bare_model_launch("pi", "ghost-model", "qqq", None).expect("pair passthrough");
+        let (args, _) = bare_model_launch("pi", &model_ask("ghost-model"), "qqq", None)
+            .expect("pair passthrough");
         assert_eq!(args, vec!["--model", "qqq/ghost-model"]);
         assert_eq!(
-            bare_model_launch("pi", "", "", None)
+            bare_model_launch("pi", &model_ask(""), "", None)
                 .expect("empty model")
                 .0,
             vec!["--model", "opencode-go/muse-spark-1.3-contributor"],
@@ -3260,8 +3301,8 @@ mod spawn_profile_plan_tests {
         let cfg_home = dir.path().join("config");
         std::fs::create_dir_all(cfg_home.join("flywheel")).expect("config dir");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_home) };
-        let (args, env_pin) =
-            bare_model_launch("opencode", "", "", None).expect("opencode cheap implied");
+        let (args, env_pin) = bare_model_launch("opencode", &model_ask(""), "", None)
+            .expect("opencode cheap implied");
         assert!(
             !args.iter().any(|a| a == "--model"),
             "opencode's root command rejects --model; argv must carry none: {args:?}"
@@ -3278,7 +3319,7 @@ mod spawn_profile_plan_tests {
         );
         let (args, env_pin) = bare_model_launch(
             "opencode",
-            "muse-spark-1.3-contributor",
+            &model_ask("muse-spark-1.3-contributor"),
             "opencode-go",
             None,
         )
@@ -3288,7 +3329,8 @@ mod spawn_profile_plan_tests {
             env_pin.as_deref(),
             Some("opencode-go/muse-spark-1.3-contributor")
         );
-        let (pi_args, pi_env) = bare_model_launch("pi", "", "", None).expect("pi standard implied");
+        let (pi_args, pi_env) =
+            bare_model_launch("pi", &model_ask(""), "", None).expect("pi standard implied");
         assert_eq!(
             pi_args,
             vec!["--model", "opencode-go/muse-spark-1.3-contributor"],
@@ -3331,25 +3373,27 @@ mod spawn_profile_plan_tests {
         let cfg_home = dir.path().join("config");
         std::fs::create_dir_all(cfg_home.join("flywheel")).expect("config dir");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_home) };
-        let (args, env_pin) = bare_model_launch("opencode", "", "", None).expect("cheap implied");
+        let (args, env_pin) =
+            bare_model_launch("opencode", &model_ask(""), "", None).expect("cheap implied");
         assert!(
             args.is_empty() && env_pin.as_deref() == Some("opencode/big-pickle"),
             "opencode spawn without --model uses the cheap slot, by env: {args:?} {env_pin:?}"
         );
-        let (args, env_pin) = bare_model_launch("pi", "", "", None).expect("standard implied");
+        let (args, env_pin) =
+            bare_model_launch("pi", &model_ask(""), "", None).expect("standard implied");
         assert_eq!(
             args,
             vec!["--model", "opencode-go/muse-spark-1.3-contributor"],
             "pi spawn without --model uses the standard slot: {args:?}"
         );
         assert_eq!(env_pin, None, "pi rides argv");
-        let err = bare_model_launch("grok", "", "", None).expect_err("closed premium");
+        let err = bare_model_launch("grok", &model_ask(""), "", None).expect_err("closed premium");
         assert!(
             err.to_string().contains("grok"),
             "the refusal names the harness that cannot be routed: {err}"
         );
         assert_eq!(
-            bare_model_launch("kind-without-slot", "", "", None)
+            bare_model_launch("kind-without-slot", &model_ask(""), "", None)
                 .expect("unknown kind has no implied slot"),
             (vec![], None)
         );
@@ -3366,7 +3410,7 @@ mod spawn_profile_plan_tests {
         let cfg_home = dir.path().join("config");
         std::fs::create_dir_all(cfg_home.join("flywheel")).expect("config dir");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_home) };
-        let err = bare_model_launch("grok", "", "", None)
+        let err = bare_model_launch("grok", &model_ask(""), "", None)
             .expect_err("bare grok without a registered grok model must fail loud");
         let msg = format!("{err:#}");
         assert!(
@@ -3378,7 +3422,7 @@ mod spawn_profile_plan_tests {
             "[models.\"grok/grok-4.5\"]\n",
         )
         .expect("models.toml");
-        let (args, pin) = bare_model_launch("grok", "", "", None).expect("grok routed");
+        let (args, pin) = bare_model_launch("grok", &model_ask(""), "", None).expect("grok routed");
         assert_eq!(
             args,
             vec!["-m", "grok-4.5"],
@@ -5051,9 +5095,16 @@ mod taken_name_recovery_tests {
     fn recover_frees_a_taken_name() {
         let mux = NameMux::new(&[("flywheel-demo-oc", "wA:p1")]);
         let agent = start_agent_with_retry_dyn_profile(
-            &mux, "flywheel-demo-oc", "opencode", "wA:p1", &[], None, None, None,
+            &mux,
+            "flywheel-demo-oc",
+            "opencode",
+            "wA:p1",
+            &[],
+            None,
+            None,
+            None,
         )
-            .expect("recover's respawn must free its own stale binding and restart");
+        .expect("recover's respawn must free its own stale binding and restart");
         assert_eq!(agent.pane_id, "wA:p1");
         assert_eq!(
             mux.starts(),
@@ -5074,9 +5125,16 @@ mod taken_name_recovery_tests {
         let mux = NameMux::new(&[("flywheel-demo-oc", "wA:p9")]);
         let started = std::time::Instant::now();
         let err = start_agent_with_retry_dyn_profile(
-            &mux, "flywheel-demo-oc", "opencode", "wA:p1", &[], None, None, None,
+            &mux,
+            "flywheel-demo-oc",
+            "opencode",
+            "wA:p1",
+            &[],
+            None,
+            None,
+            None,
         )
-            .expect_err("a foreign holder is a refusal, not a retry");
+        .expect_err("a foreign holder is a refusal, not a retry");
         let msg = err.to_string();
         assert!(
             msg.contains("wA:p9"),
@@ -6219,7 +6277,7 @@ mod prefer_spawn_tests {
         let ask = super::prefer_bare_inputs(&prefs, &items[0], "probe", "", "");
         let (m, from) = ask.model.clone().expect("preference resolves");
         assert_eq!(
-            (m.as_str(), from),
+            (m.as_ask(), from),
             ("a/m", crate::swarm_plan::Provenance::Preference)
         );
         let kind = crate::prefer_kind(&cfg, &items[0], &catalog, &reg, &prefs, "probe")
@@ -6228,7 +6286,7 @@ mod prefer_spawn_tests {
         let (eff_model, eff_provider) = ask
             .model
             .map(|(m, _)| (m, ask.provider))
-            .unwrap_or_default();
+            .unwrap_or_else(|| (crate::models::ModelChoice::parse(""), String::new()));
         let (args, env) = crate::bare_model_launch(
             &kind,
             &eff_model,
@@ -6323,7 +6381,7 @@ mod prefer_spawn_tests {
         let ask = super::prefer_bare_inputs(&prefs, &items[0], "probe", "b/m", "");
         let (m, from) = ask.model.clone().expect("user ask resolves");
         assert_eq!(
-            (m.as_str(), from),
+            (m.as_ask(), from),
             ("b/m", crate::swarm_plan::Provenance::User)
         );
         let kind = crate::prefer_kind(&cfg, &items[0], &catalog, &reg, &prefs, "probe")
@@ -6332,7 +6390,7 @@ mod prefer_spawn_tests {
         let (eff_model, eff_provider) = ask
             .model
             .map(|(m, _)| (m, ask.provider))
-            .unwrap_or_default();
+            .unwrap_or_else(|| (crate::models::ModelChoice::parse(""), String::new()));
         let (args, env) = crate::bare_model_launch(
             &kind,
             &eff_model,
@@ -7381,7 +7439,7 @@ mod plan_patch_spawn_tests {
         let ask_pi = super::prefer_bare_inputs(&prefs, pi_item, "probe", "", "");
         let (model_pi, provider_pi, effort_pi) =
             super::patched_bare_launch(&overrides, "pi", ask_pi);
-        assert_eq!(model_pi, "b/m");
+        assert_eq!(model_pi.as_ask(), "b/m");
         let (mut args, pi_pin) =
             crate::bare_model_launch("pi", &model_pi, &provider_pi, effort_pi.as_deref())
                 .expect("pi launches");
@@ -7403,7 +7461,7 @@ mod plan_patch_spawn_tests {
         // opencode: the patched value rides the env pin, not argv.
         let ask_oc = super::prefer_bare_inputs(&prefs, oc_item, "probe", "", "");
         let (model_oc, provider_oc, _) = super::patched_bare_launch(&overrides, "opencode", ask_oc);
-        assert_eq!(model_oc, "a/m");
+        assert_eq!(model_oc.as_ask(), "a/m");
         let (oc_args, oc_pin) = crate::bare_model_launch("opencode", &model_oc, &provider_oc, None)
             .expect("opencode launches");
         assert!(
@@ -7419,7 +7477,7 @@ mod plan_patch_spawn_tests {
         let ask_gk = super::prefer_bare_inputs(&prefs, gk_item, "probe", "", "");
         let (model_gk, provider_gk, effort_gk) =
             super::patched_bare_launch(&overrides, "grok", ask_gk);
-        assert_eq!(model_gk, "gm9zprobe");
+        assert_eq!(model_gk.as_ask(), "gm9zprobe");
         let (mut gk_args, gk_pin) =
             crate::bare_model_launch("grok", &model_gk, &provider_gk, effort_gk.as_deref())
                 .expect("grok launches");
@@ -7542,11 +7600,15 @@ mod resolver_property_tests {
                 "plan and launch agree on harness {h}"
             );
             let (m, _) = ask.model.clone().expect("user ask present");
-            assert_eq!(m, f.value, "one resolution feeds plan and launch on {h}");
+            assert_eq!(
+                m.as_ask(),
+                f.value,
+                "one resolution feeds plan and launch on {h}"
+            );
             let (eff_model, eff_provider) = ask
                 .model
                 .map(|(m, _)| (m, ask.provider))
-                .unwrap_or_default();
+                .unwrap_or_else(|| (crate::models::ModelChoice::parse(""), String::new()));
             let (args, env) = crate::bare_model_launch(&kind, &eff_model, &eff_provider, None)
                 .expect("launch builds");
             let honoured = matches!(f.status, FieldStatus::Honored);
@@ -7594,7 +7656,7 @@ mod resolver_property_tests {
             let (eff_model, eff_provider) = ask
                 .model
                 .map(|(m, _)| (m, ask.provider))
-                .unwrap_or_default();
+                .unwrap_or_else(|| (crate::models::ModelChoice::parse(""), String::new()));
             let (args, _) = crate::bare_model_launch(
                 &kind,
                 &eff_model,
@@ -7770,5 +7832,168 @@ mod resolver_property_tests {
             Provenance::Profile,
             "profile wins with no user or preference",
         );
+    }
+}
+
+#[cfg(test)]
+fn model_ask(ask: &str) -> crate::models::ModelChoice {
+    crate::models::ModelChoice::parse(ask)
+}
+
+#[cfg(test)]
+mod harness_default_model_tests {
+    use super::{
+        build_dry_run_plan, model_ask, parse_role_patches, patch_role_overrides,
+        prefer_bare_inputs, spawn_items_from_plan,
+    };
+    use crate::profile;
+    use std::collections::BTreeMap;
+
+    fn empty_registry() -> crate::models::ModelRegistry {
+        crate::models::ModelRegistry {
+            models: BTreeMap::new(),
+            slots: Default::default(),
+            user_keys: Default::default(),
+            defaults: None,
+        }
+    }
+
+    /// Slots AND a coupled default ARE configured, so a `harness-default` ask
+    /// that fell through to the implied-slot chain would show up in the launch.
+    fn slot_registry() -> crate::models::ModelRegistry {
+        use crate::models::{ModelEntry, SlotSpec};
+        let mut models = BTreeMap::new();
+        for id in ["opencode/big-pickle", "pi/slot-standard"] {
+            models.insert(id.to_string(), ModelEntry::default());
+        }
+        let mut slots = BTreeMap::new();
+        slots.insert(
+            "cheap".to_string(),
+            SlotSpec {
+                harness: "opencode".to_string(),
+                model: "opencode/big-pickle".to_string(),
+                ..Default::default()
+            },
+        );
+        slots.insert(
+            "standard".to_string(),
+            SlotSpec {
+                harness: "pi".to_string(),
+                model: "pi/slot-standard".to_string(),
+                ..Default::default()
+            },
+        );
+        crate::models::ModelRegistry {
+            models,
+            slots,
+            user_keys: Default::default(),
+            defaults: None,
+        }
+    }
+
+    #[test]
+    fn harness_default_plan_says_honored_and_the_launch_injects_nothing() {
+        let cfg = crate::config::Config::default();
+        let reg = slot_registry();
+        let catalog = profile::ProfileCatalog::default();
+        let prefs = crate::preferences::PreferenceSet::new();
+        for (short, harness) in [("oc", "opencode"), ("pi", "pi")] {
+            let items = spawn_items_from_plan(vec![(short.to_string(), 1)], None);
+            let plan = build_dry_run_plan(
+                &cfg,
+                &items,
+                &catalog,
+                &reg,
+                "harness-default",
+                "",
+                &prefs,
+                "test",
+                &BTreeMap::new(),
+            )
+            .expect("plan builds");
+            let f = plan.seats[0].model.as_ref().expect("model field");
+            assert_eq!(
+                f.value, "harness-default",
+                "{short}: the plan names the choice"
+            );
+            assert_eq!(f.from, crate::swarm_plan::Provenance::User);
+            assert_eq!(f.status, crate::swarm_plan::FieldStatus::Honored);
+            let (args, env_pin) =
+                crate::bare_model_launch(harness, &model_ask("harness-default"), "", None)
+                    .expect("bare launch builds");
+            assert!(
+                args.is_empty(),
+                "{short}: no model flag may reach the launch: {args:?}"
+            );
+            assert_eq!(env_pin, None, "{short}: no model env pin may be injected");
+        }
+    }
+
+    #[test]
+    fn harness_default_from_patch_reaches_the_same_place() {
+        let cfg = crate::config::Config::default();
+        let reg = empty_registry();
+        let catalog = profile::ProfileCatalog::default();
+        let prefs = crate::preferences::PreferenceSet::new();
+        let items = spawn_items_from_plan(vec![("pi".to_string(), 1)], None);
+        let patches =
+            parse_role_patches(&["pi.model=harness-default".to_string()]).expect("patch parses");
+        let overrides = patch_role_overrides(&patches);
+        let plan = build_dry_run_plan(
+            &cfg, &items, &catalog, &reg, "", "", &prefs, "test", &overrides,
+        )
+        .expect("plan builds");
+        let f = plan.seats[0].model.as_ref().expect("model field");
+        assert_eq!(f.value, "harness-default");
+        assert_eq!(f.from, crate::swarm_plan::Provenance::User);
+        assert_eq!(f.status, crate::swarm_plan::FieldStatus::Honored);
+        let ask = prefer_bare_inputs(&prefs, &items[0], "test", "", "");
+        let (model, provider, effort) = super::patched_bare_launch(&overrides, "pi", ask);
+        let (args, env_pin) = crate::bare_model_launch("pi", &model, &provider, effort.as_deref())
+            .expect("patched launch builds");
+        assert!(args.is_empty(), "patched default injects no argv: {args:?}");
+        assert_eq!(env_pin, None, "patched default injects no env pin");
+    }
+
+    #[test]
+    fn harness_default_profile_injects_nothing() {
+        let opencode = crate::profile::Profile {
+            harness: "opencode".into(),
+            model: "harness-default".into(),
+            ..Default::default()
+        };
+        let launch = crate::profile_launch_plan("opencode", &opencode, None)
+            .expect("a harness-default profile launches");
+        assert!(launch.args.is_empty(), "no argv: {:?}", launch.args);
+        assert_eq!(launch.env_model_pin, None, "no env pin");
+        assert_eq!(
+            launch.model, "harness-default",
+            "the ask is recorded as the sentinel; spawn drops it (no model pin)"
+        );
+
+        let mut catalog = profile::ProfileCatalog::default();
+        catalog
+            .profiles
+            .insert("coder".to_string(), opencode.clone());
+        let items = spawn_items_from_plan(
+            Vec::new(),
+            Some(("coder", catalog.profiles.get("coder").unwrap(), 1)),
+        );
+        let plan = build_dry_run_plan(
+            &crate::config::Config::default(),
+            &items,
+            &catalog,
+            &empty_registry(),
+            "",
+            "",
+            &crate::preferences::PreferenceSet::new(),
+            "test",
+            &BTreeMap::new(),
+        )
+        .expect("plan builds");
+        let f = plan.seats[0].model.as_ref().expect("model field");
+        assert_eq!(f.value, "harness-default");
+        assert_eq!(f.from, crate::swarm_plan::Provenance::Profile);
+        assert_eq!(f.status, crate::swarm_plan::FieldStatus::Honored);
     }
 }

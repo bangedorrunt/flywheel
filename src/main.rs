@@ -812,6 +812,8 @@ enum Commands {
         /// bd-j3so: bare harness+model override for kind/count spawns (no
         /// --profile): launch args route through the composite registry,
         /// lenient — registered ids route, unregistered pairs pass through.
+        /// `--model harness-default` injects nothing and lets the harness
+        /// run its own configured model.
         #[arg(long)]
         model: Option<String>,
         /// provider pin for --model's composite registry key
@@ -2988,7 +2990,7 @@ fn main() {
             "upstream_parity": upstream_parity::robot_summary(),
             "commands": [
                 "init spawn add list status decide rebind recover",
-                "spawn <project> [--kind K=N ...] [--dry-run --json] [--patch <seat>.<field>=<value> (repeatable; re-resolves the seat with from: user)] [--yes] (ADR-0022 plan spawn; see --help for the full flag list)",
+                "spawn <project> [--kind K=N ...] [--dry-run --json] [--patch <seat>.<field>=<value> (repeatable; re-resolves the seat with from: user)] [--model harness-default leaves the harness's own model untouched] [--yes] (ADR-0022 plan spawn; see --help for the full flag list)",
             "send interrupt view output watch attach kill",
             "prefer <role.field>=<value> [--project <p>] | prefer --list [--json] | prefer --forget <role.field> [--project <p>] (ADR-0022 D6: standing preferences — project beats always, exact role beats *; set also records a chie lesson)",
             "crew preview|control|prompt (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker)",
@@ -4182,7 +4184,10 @@ pub(crate) fn spawn_model_rows(
         }
         let kind = prefer_kind(cfg, item, catalog, registry, prefs, project)?;
         let model = if !bare_model.is_empty() {
-            bare_model.to_string()
+            match crate::models::ModelChoice::parse(bare_model) {
+                crate::models::ModelChoice::HarnessDefault => "(harness default)".to_string(),
+                crate::models::ModelChoice::Model(id) => id,
+            }
         } else if let Some(pref) =
             prefer_fill(prefs, item, crate::preferences::Field::Model, project)
         {
@@ -4305,11 +4310,15 @@ fn spawn_item_kind(
 /// first agent on the root pane.
 fn bare_model_launch(
     harness: &str,
-    model: &str,
+    model: &crate::models::ModelChoice,
     provider: &str,
     effort: Option<&str>,
 ) -> Result<(Vec<String>, Option<String>)> {
     let registry = models::ModelRegistry::load_routing()?;
+    let model = match model {
+        crate::models::ModelChoice::HarnessDefault => return Ok((vec![], None)),
+        crate::models::ModelChoice::Model(id) => id,
+    };
     let model = if model.is_empty() {
         match registry.coupled_default_model(harness) {
             Some(id) => id,
