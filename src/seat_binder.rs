@@ -23,6 +23,15 @@ pub struct StepNeed {
     pub reviews_author: Option<String>,
 }
 
+/// Where a live seat runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SeatPlacement {
+    #[default]
+    Pane,
+    Headless,
+}
+
 /// A live seat.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveSeat {
@@ -32,6 +41,10 @@ pub struct LiveSeat {
     pub model: Option<String>,
     /// StageMode vocabulary (`read-only` | `workspace-write` | `isolated`).
     pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub placement: SeatPlacement,
     pub idle: bool,
     /// The harness can start a new session in the same pane.
     pub fresh_session: bool,
@@ -218,6 +231,8 @@ mod tests {
             harness: "h".to_string(),
             model: None,
             mode: None,
+            effort: None,
+            placement: SeatPlacement::Pane,
             idle,
             fresh_session: fresh,
         }
@@ -299,6 +314,8 @@ mod tests {
             harness: "h".to_string(),
             model: None,
             mode: None,
+            effort: None,
+            placement: SeatPlacement::Pane,
             idle: false,
             fresh_session: false,
         }];
@@ -314,6 +331,8 @@ mod tests {
             harness: "h".to_string(),
             model: None,
             mode: None,
+            effort: None,
+            placement: SeatPlacement::Pane,
             idle: false,
             fresh_session: false,
         }];
@@ -352,6 +371,8 @@ mod tests {
             harness: "h1".to_string(),
             model: Some("m1".to_string()),
             mode: Some("read-only".to_string()),
+            effort: None,
+            placement: SeatPlacement::Pane,
             idle: true,
             fresh_session: false,
         }];
@@ -377,6 +398,8 @@ mod tests {
             harness: "h".to_string(),
             model: None,
             mode: None,
+            effort: None,
+            placement: SeatPlacement::Pane,
             idle: false,
             fresh_session: false,
         }];

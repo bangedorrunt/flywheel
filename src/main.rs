@@ -93,6 +93,7 @@ mod rot;
 mod run_log;
 mod run_state_recorder;
 mod seat_binder;
+mod seat_reconcile;
 mod self_watch;
 mod signoff;
 mod snapshot;
@@ -1915,6 +1916,10 @@ enum Commands {
     /// {need,seats,policy} JSON from stdin, prints Binding JSON.
     #[command(name = "__bind-seat", hide = true)]
     __BindSeat {},
+    /// internal: reconcile desired seats against live seats (ADR-0022 D7) — reads
+    /// {desired,live} JSON from stdin, prints effects JSON.
+    #[command(name = "__reconcile-seats", hide = true)]
+    __ReconcileSeats {},
     /// internal: diagnose unresponsive agent (tail + health mail)
     #[command(name = "__diagnose", hide = true)]
     __Diagnose {
@@ -3834,6 +3839,15 @@ fn main() {
                 .read_to_string(&mut input)
                 .map_err(anyhow::Error::from)
                 .and_then(|_| crate::seat_binder::bind_json(&input))
+                .map(|out| println!("{out}"))
+        }
+        Some(Commands::__ReconcileSeats {}) => {
+            use std::io::Read as _;
+            let mut input = String::new();
+            std::io::stdin()
+                .read_to_string(&mut input)
+                .map_err(anyhow::Error::from)
+                .and_then(|_| crate::seat_reconcile::reconcile_json(&input))
                 .map(|out| println!("{out}"))
         }
         Some(Commands::__Diagnose {
