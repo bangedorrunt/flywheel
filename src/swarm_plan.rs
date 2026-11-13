@@ -189,8 +189,13 @@ mod tests {
     }
 
     #[test]
-    fn gemini_model_from_user_is_blocked() {
+    fn gemini_model_from_user_is_honored() {
         let launch = launch_for("gemini", "gemini-2.5-pro", None);
+        assert_eq!(
+            launch.args(),
+            &["-m".to_string(), "gemini-2.5-pro".to_string()],
+            "phase 2a: gemini delivers the model as -m"
+        );
         let (model, _) = seat_status(
             "gemini",
             Some(("gemini-2.5-pro".to_string(), Provenance::User)),
@@ -199,9 +204,27 @@ mod tests {
         );
         let field = model.expect("model field present");
         assert_eq!(field.from, Provenance::User);
+        assert_eq!(
+            field.status,
+            FieldStatus::Honored,
+            "phase 2a: gemini takes a model flag: {field:?}"
+        );
+    }
+
+    #[test]
+    fn fx_model_from_user_is_blocked() {
+        let launch = launch_for("fx", "fx/whatever", None);
+        assert!(launch.args().is_empty(), "fx has no model flag by policy");
+        let (model, _) = seat_status(
+            "fx",
+            Some(("fx/whatever".to_string(), Provenance::User)),
+            None,
+            &launch,
+        );
+        let field = model.expect("model field present");
         assert!(
             matches!(field.status, FieldStatus::Blocked { .. }),
-            "gemini takes no model flag: {field:?}"
+            "fx takes no model flag: {field:?}"
         );
     }
 
@@ -237,38 +260,28 @@ mod tests {
     }
 
     #[test]
-    fn grok_effort_from_profile_degrades_from_user_blocks() {
+    fn grok_effort_is_honored_from_profile_and_user() {
+        // Phase 2a: grok delivers effort via --reasoning-effort, so a
+        // requested effort is honored whatever the provenance.
         let launch = launch_for("grok", "grok/grok-4.5", Some("high"));
         assert!(
-            !launch.args().iter().any(|a| a == "high"),
-            "grok emits no effort flag today"
+            launch.args().iter().any(|a| a == "high"),
+            "grok emits the effort flag now: {:?}",
+            launch.args()
         );
-        let (_, profile_effort) = seat_status(
-            "grok",
-            Some(("grok/grok-4.5".to_string(), Provenance::HarnessDefault)),
-            Some(("high".to_string(), Provenance::Profile)),
-            &launch,
-        );
-        assert!(
-            matches!(
-                profile_effort.expect("effort present").status,
-                FieldStatus::Degraded { .. }
-            ),
-            "profile effort on grok degrades"
-        );
-        let (_, user_effort) = seat_status(
-            "grok",
-            Some(("grok/grok-4.5".to_string(), Provenance::HarnessDefault)),
-            Some(("high".to_string(), Provenance::User)),
-            &launch,
-        );
-        assert!(
-            matches!(
-                user_effort.expect("effort present").status,
-                FieldStatus::Blocked { .. }
-            ),
-            "user effort on grok blocks"
-        );
+        for (from, label) in [(Provenance::Profile, "profile"), (Provenance::User, "user")] {
+            let (_, effort) = seat_status(
+                "grok",
+                Some(("grok/grok-4.5".to_string(), Provenance::HarnessDefault)),
+                Some(("high".to_string(), from)),
+                &launch,
+            );
+            assert_eq!(
+                effort.expect("effort present").status,
+                FieldStatus::Honored,
+                "{label} effort on grok is honored now"
+            );
+        }
     }
 
     #[test]

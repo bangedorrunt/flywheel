@@ -38,27 +38,46 @@ pub struct HarnessOutcome {
 /// omp also carries the thinking/effort flag (`--thinking=<level>`,
 /// bd-42fs) when an effort is given.
 ///
-/// governed-by: bd-ulzi — pi wires effort natively (`--thinking=<level>`,
-/// verified `pi --help`: `--thinking <level>` + `--model provider/id`
-/// shorthand). opencode v2 has no effort flag (`--model provider/model#variant`
-/// only, `--thinking` is a display toggle) — effort there degrades LOUDLY
-/// via [`effort_degraded`] (warn at the shared site, never silent).
+/// Which harnesses degrade effort LOUDLY (no native effort flag): everything
+/// except the harnesses with one. pi wires `--thinking`, grok wires
+/// `--reasoning-effort`, agy wires `--effort`; opencode, gemini, fx, claude,
+/// codex (and unknown harnesses) emit nothing, so the stderr warning fires.
 pub fn effort_degraded(harness: &str) -> bool {
-    matches!(harness, "opencode")
+    !matches!(
+        crate::harness_registry::canonical(harness).as_str(),
+        "pi" | "grok" | "antigravity" | "antigravity-cli"
+    )
 }
 
 pub fn model_args(harness: &str, model: &str, effort: Option<&str>) -> Vec<String> {
     let effort = effort.filter(|e| !e.is_empty());
+    let canonical = crate::harness_registry::canonical(harness);
     if let Some(e) = effort
-        && effort_degraded(harness)
+        && effort_degraded(canonical.as_str())
     {
         eprintln!(
             "flywheel: effort {e:?} has no native flag on harness {harness:?} — degrading to model-only (profile default stands)"
         );
     }
-    match harness {
+    match canonical.as_str() {
         "opencode" => vec!["--model".to_string(), model.to_string()],
-        "grok" => vec!["-m".to_string(), model.to_string()],
+        "grok" => {
+            let mut args = vec!["-m".to_string(), model.to_string()];
+            if let Some(e) = effort {
+                args.push("--reasoning-effort".to_string());
+                args.push(e.to_string());
+            }
+            args
+        }
+        "gemini" => vec!["-m".to_string(), model.to_string()],
+        "antigravity" | "antigravity-cli" => {
+            let mut args = vec!["--model".to_string(), model.to_string()];
+            if let Some(e) = effort {
+                args.push("--effort".to_string());
+                args.push(e.to_string());
+            }
+            args
+        }
         "pi" => {
             let mut args = vec!["--model".to_string(), model.to_string()];
             if let Some(e) = effort {
@@ -579,6 +598,50 @@ mod tests {
     fn unknown_harness_is_an_error() {
         let err = build_argv_roles("hermes", None, None, "", "", "", "hi").unwrap_err();
         assert!(err.to_string().contains("hermes"), "{err}");
+    }
+
+    /// ADR-0022 phase 2a (bd-adapters-model-effort-ptgf7): the adapter rows.
+    /// grok delivers effort via `--reasoning-effort` (verified `grok --help`);
+    /// gemini takes `-m` (verified `gemini --help`); agy takes `--model` +
+    /// `--effort` (verified `agy --help`: low|medium|high|xhigh|max).
+    /// fx/claude/codex stay flag-less by policy.
+    #[test]
+    fn phase2a_adapter_rows_deliver_model_and_effort() {
+        assert_eq!(
+            model_args("grok", "grok-4", Some("high")),
+            vec!["-m", "grok-4", "--reasoning-effort", "high"]
+        );
+        assert_eq!(
+            model_args("gemini", "gemini-2.5-pro", None),
+            vec!["-m", "gemini-2.5-pro"]
+        );
+        assert_eq!(
+            model_args("agy", "agy/some-model", Some("high")),
+            vec!["--model", "agy/some-model", "--effort", "high"]
+        );
+        for alias in ["antigravity", "ag", "antigravity-cli"] {
+            assert_eq!(
+                model_args(alias, "m", Some("low")),
+                vec!["--model", "m", "--effort", "low"],
+                "alias {alias} rides the agy row"
+            );
+        }
+        assert!(
+            model_args("fx", "x", None).is_empty(),
+            "fx has no model flag"
+        );
+        assert!(
+            model_args("fx", "x", Some("high")).is_empty(),
+            "fx has no effort flag either"
+        );
+        assert!(model_args("claude", "x", None).is_empty());
+        assert!(model_args("codex", "x", None).is_empty());
+        for h in ["opencode", "gemini", "fx", "claude", "codex"] {
+            assert!(effort_degraded(h), "{h} has no effort flag");
+        }
+        for h in ["pi", "grok", "agy", "antigravity", "ag"] {
+            assert!(!effort_degraded(h), "{h} delivers effort natively");
+        }
     }
 
     /// P10.3 (bd-ghcj.1): the model-flag args are per-harness, shared with
