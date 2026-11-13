@@ -1,9 +1,8 @@
 //! Seat lifecycle statechart (ADR-0022 §3.2).
 //!
 //! One seat from launch to retirement. Pure fold; commands are descriptive
-//! only. Closed failure taxonomy for V6 (toron ADR-0032 kinds); the existing
-//! [`crate::failure::FailureKind`] vocabulary fits semantically but has no
-//! serde derives, and slice discipline forbids touching it here.
+//! only. Closed `SeatFailureKind` duplicates [`crate::failure::FailureKind`]
+//! vocabulary; unify in bd-gb4at.
 
 use std::collections::BTreeSet;
 
@@ -62,6 +61,7 @@ pub struct SeatContext {
     pub pin: String,
     pub hops_spent: BTreeSet<SeatFailureKind>,
     pub model_by_env: bool,
+    pub last_failure: Option<(SeatFailureKind, String)>,
 }
 
 impl Default for SeatContext {
@@ -70,6 +70,7 @@ impl Default for SeatContext {
             pin: String::new(),
             hops_spent: BTreeSet::new(),
             model_by_env: false,
+            last_failure: None,
         }
     }
 }
@@ -130,13 +131,23 @@ impl StatechartDefinition for SeatProgramDef {
                     });
                 let failing = node
                     .transition(SeatState::Failing)
-                    .on(|e| matches!(e, SeatEvent::LaunchFailed { .. }));
+                    .on(|e| matches!(e, SeatEvent::LaunchFailed { .. }))
+                    .action(|ctx, e, _q: &mut ActionQueue<_, _>| {
+                        if let SeatEvent::LaunchFailed { kind, evidence } = e {
+                            ctx.last_failure = Some((*kind, evidence.clone()));
+                        }
+                    });
                 node.on(live).on(failing)
             })
             .state(SeatState::Live, |node| {
                 let failing = node
                     .transition(SeatState::Failing)
-                    .on(|e| matches!(e, SeatEvent::Failed { .. }));
+                    .on(|e| matches!(e, SeatEvent::Failed { .. }))
+                    .action(|ctx, e, _q: &mut ActionQueue<_, _>| {
+                        if let SeatEvent::Failed { kind, evidence } = e {
+                            ctx.last_failure = Some((*kind, evidence.clone()));
+                        }
+                    });
                 let relaunch = node
                     .transition(SeatState::Relaunching)
                     .on(|e| matches!(e, SeatEvent::Patch(SeatEffect::Relaunch { .. })))
@@ -215,24 +226,17 @@ impl StatechartDefinition for SeatProgramDef {
             .state(SeatState::Failing, |node| {
                 let relaunch = node
                     .transition(SeatState::Relaunching)
-                    .on(|e| matches!(e, SeatEvent::Failed { .. } | SeatEvent::LaunchFailed { .. }))
-                    .guard(|ctx, e| {
-                        let (kind, evidence) = match e {
-                            SeatEvent::Failed { kind, evidence }
-                            | SeatEvent::LaunchFailed { kind, evidence } => {
-                                (*kind, evidence.as_str())
-                            }
-                            _ => return false,
-                        };
-                        hop_allowed(ctx, kind, evidence) && !ctx.model_by_env
+                    .guard(|ctx, _| match &ctx.last_failure {
+                        Some((kind, evidence)) => {
+                            hop_allowed(ctx, *kind, evidence) && !ctx.model_by_env
+                        }
+                        None => false,
                     })
-                    .action(|ctx, e, q: &mut ActionQueue<_, _>| {
-                        let kind = match e {
-                            SeatEvent::Failed { kind, .. }
-                            | SeatEvent::LaunchFailed { kind, .. } => *kind,
-                            _ => unreachable!("guarded by on(Failed|LaunchFailed)"),
-                        };
-                        ctx.hops_spent.insert(kind);
+                    .action(|ctx, _, q: &mut ActionQueue<_, _>| {
+                        if let Some((kind, _)) = ctx.last_failure.clone() {
+                            ctx.hops_spent.insert(kind);
+                        }
+                        ctx.last_failure = None;
                         q.exec(SeatCmd::Relaunch {
                             pin: ctx.pin.clone(),
                         });
@@ -242,24 +246,17 @@ impl StatechartDefinition for SeatProgramDef {
                     });
                 let respawn = node
                     .transition(SeatState::Respawning)
-                    .on(|e| matches!(e, SeatEvent::Failed { .. } | SeatEvent::LaunchFailed { .. }))
-                    .guard(|ctx, e| {
-                        let (kind, evidence) = match e {
-                            SeatEvent::Failed { kind, evidence }
-                            | SeatEvent::LaunchFailed { kind, evidence } => {
-                                (*kind, evidence.as_str())
-                            }
-                            _ => return false,
-                        };
-                        hop_allowed(ctx, kind, evidence) && ctx.model_by_env
+                    .guard(|ctx, _| match &ctx.last_failure {
+                        Some((kind, evidence)) => {
+                            hop_allowed(ctx, *kind, evidence) && ctx.model_by_env
+                        }
+                        None => false,
                     })
-                    .action(|ctx, e, q: &mut ActionQueue<_, _>| {
-                        let kind = match e {
-                            SeatEvent::Failed { kind, .. }
-                            | SeatEvent::LaunchFailed { kind, .. } => *kind,
-                            _ => unreachable!("guarded by on(Failed|LaunchFailed)"),
-                        };
-                        ctx.hops_spent.insert(kind);
+                    .action(|ctx, _, q: &mut ActionQueue<_, _>| {
+                        if let Some((kind, _)) = ctx.last_failure.clone() {
+                            ctx.hops_spent.insert(kind);
+                        }
+                        ctx.last_failure = None;
                         q.exec(SeatCmd::Respawn {
                             pin: ctx.pin.clone(),
                         });
@@ -267,20 +264,13 @@ impl StatechartDefinition for SeatProgramDef {
                             key: format!("{}:respawn", ctx.pin),
                         });
                     });
-                let dead = node
-                    .transition(SeatState::Dead)
-                    .on(|e| matches!(e, SeatEvent::Failed { .. } | SeatEvent::LaunchFailed { .. }))
-                    .guard(|ctx, e| {
-                        let (kind, evidence) = match e {
-                            SeatEvent::Failed { kind, evidence }
-                            | SeatEvent::LaunchFailed { kind, evidence } => {
-                                (*kind, evidence.as_str())
-                            }
-                            _ => return true,
-                        };
-                        !hop_allowed(ctx, kind, evidence)
-                    });
-                node.on(relaunch).on(respawn).on(dead)
+                let dead =
+                    node.transition(SeatState::Dead)
+                        .guard(|ctx, _| match &ctx.last_failure {
+                            Some((kind, evidence)) => !hop_allowed(ctx, *kind, evidence),
+                            None => true,
+                        });
+                node.always(relaunch).always(respawn).always(dead)
             })
             .state(SeatState::Relaunching, |node| {
                 let live = node
@@ -336,6 +326,7 @@ mod tests {
             pin: pin.into(),
             hops_spent: BTreeSet::new(),
             model_by_env: env,
+            last_failure: None,
         }
     }
 
@@ -365,7 +356,7 @@ mod tests {
                 evidence: "x".into(),
             },
         );
-        assert_eq!(out.configuration.primary(), Some(&SeatState::Failing));
+        assert_eq!(out.configuration.primary(), Some(&SeatState::Relaunching));
     }
 
     #[test]
@@ -373,7 +364,7 @@ mod tests {
         let m = build_seat_machine();
         let ms = MachineState::at(SeatState::Live, ctx("a", false));
         let out = m.step_state(&ms, &failed(SeatFailureKind::Provider));
-        assert_eq!(out.configuration.primary(), Some(&SeatState::Failing));
+        assert_eq!(out.configuration.primary(), Some(&SeatState::Relaunching));
     }
 
     #[test]
@@ -406,10 +397,11 @@ mod tests {
             }),
         );
         assert_eq!(out.configuration.primary(), Some(&SeatState::Respawning));
-        assert!(!out
-            .commands
-            .iter()
-            .any(|c| matches!(c, SeatCmd::Relaunch { .. })));
+        assert!(
+            !out.commands
+                .iter()
+                .any(|c| matches!(c, SeatCmd::Relaunch { .. }))
+        );
         assert!(out.commands.iter().any(|c| matches!(
             c,
             SeatCmd::Respawn { pin } if pin == "a"
@@ -490,7 +482,7 @@ mod tests {
     #[test]
     fn seat_machine_failing_timeout_goes_dead() {
         let m = build_seat_machine();
-        let ms = MachineState::at(SeatState::Failing, ctx("a", false));
+        let ms = MachineState::at(SeatState::Live, ctx("a", false));
         let out = m.step_state(
             &ms,
             &SeatEvent::Failed {
@@ -505,7 +497,7 @@ mod tests {
     #[test]
     fn seat_machine_failing_unknown_goes_dead() {
         let m = build_seat_machine();
-        let ms = MachineState::at(SeatState::Failing, ctx("a", false));
+        let ms = MachineState::at(SeatState::Live, ctx("a", false));
         let out = m.step_state(
             &ms,
             &SeatEvent::Failed {
@@ -519,10 +511,10 @@ mod tests {
     #[test]
     fn seat_machine_failing_empty_evidence_goes_dead() {
         let m = build_seat_machine();
-        let ms = MachineState::at(SeatState::Failing, ctx("a", false));
+        let ms = MachineState::at(SeatState::Launching, ctx("a", false));
         let out = m.step_state(
             &ms,
-            &SeatEvent::Failed {
+            &SeatEvent::LaunchFailed {
                 kind: SeatFailureKind::Provider,
                 evidence: "  ".into(),
             },
@@ -533,9 +525,13 @@ mod tests {
     #[test]
     fn seat_machine_failing_second_same_class_goes_dead() {
         let m = build_seat_machine();
-        let mut c = ctx("a", false);
-        c.hops_spent.insert(SeatFailureKind::Provider);
-        let ms = MachineState::at(SeatState::Failing, c);
+        let ms = MachineState::at(SeatState::Live, ctx("a", false));
+        let out = m.step_state(&ms, &failed(SeatFailureKind::Provider));
+        assert_eq!(out.configuration.primary(), Some(&SeatState::Relaunching));
+        let ms = MachineState::at(SeatState::Relaunching, out.context);
+        let out = m.step_state(&ms, &SeatEvent::Ready);
+        assert_eq!(out.configuration.primary(), Some(&SeatState::Live));
+        let ms = MachineState::at(SeatState::Live, out.context);
         let out = m.step_state(&ms, &failed(SeatFailureKind::Provider));
         assert_eq!(out.configuration.primary(), Some(&SeatState::Dead));
     }
@@ -543,9 +539,13 @@ mod tests {
     #[test]
     fn seat_machine_failing_different_class_may_hop_once() {
         let m = build_seat_machine();
-        let mut c = ctx("a", false);
-        c.hops_spent.insert(SeatFailureKind::RateLimit);
-        let ms = MachineState::at(SeatState::Failing, c);
+        let ms = MachineState::at(SeatState::Live, ctx("a", false));
+        let out = m.step_state(&ms, &failed(SeatFailureKind::RateLimit));
+        assert_eq!(out.configuration.primary(), Some(&SeatState::Relaunching));
+        let ms = MachineState::at(SeatState::Relaunching, out.context);
+        let out = m.step_state(&ms, &SeatEvent::Ready);
+        assert_eq!(out.configuration.primary(), Some(&SeatState::Live));
+        let ms = MachineState::at(SeatState::Live, out.context);
         let out = m.step_state(&ms, &failed(SeatFailureKind::Provider));
         assert_eq!(out.configuration.primary(), Some(&SeatState::Relaunching));
         assert!(out.context.hops_spent.contains(&SeatFailureKind::Provider));
