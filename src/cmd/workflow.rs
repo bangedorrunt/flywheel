@@ -1153,9 +1153,17 @@ pub(crate) fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     Some(b) => Some(resolve_workflow(b, &all)?.clone()),
                     None => None,
                 };
+                let compose_catalog =
+                    crate::workflow_catalog::WorkflowCatalog::load_layered(Some(&project_root))
+                        .unwrap_or_default();
                 let mut parsed: Vec<crew::ComposePart> = Vec::new();
                 for token in parts {
-                    parsed.push(crew::parse_compose_part(token).map_err(anyhow::Error::msg)?);
+                    parsed.push(
+                        crew::parse_compose_part_with(token, &|t| {
+                            compose_catalog.is_compose_token(t)
+                        })
+                        .map_err(anyhow::Error::msg)?,
+                    );
                 }
                 let stage_lib = stages::StageLibrary::load_layered(Some(&project_stages))?;
                 let affinity = |s: &str| stage_lib.get_stage(s).and_then(|st| st.role.clone());

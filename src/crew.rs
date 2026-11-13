@@ -789,15 +789,16 @@ pub enum ComposePart {
 
 /// Parse one compose part token (`role:stage` | `phase:stage` | `workflow:name`
 /// | bare `stage`). Pure — the unit surface for the compose CLI's
-/// deterministic arm (bd-8xca, §3.8 stage-first).
-pub fn parse_compose_part(token: &str) -> Result<ComposePart, String> {
+/// deterministic arm (bd-8xca, §3.8 stage-first). The token predicate comes
+/// from the caller (tier-aware catalog lookup); this function never reads
+/// the operator config, so tests stay hermetic.
+pub fn parse_compose_part_with(
+    token: &str,
+    is_token: &dyn Fn(&str) -> bool,
+) -> Result<ComposePart, String> {
     let t = token.trim();
     let Some((kind, value)) = t.split_once(':') else {
-        if t.split(':').count() == 1
-            && crate::workflow_catalog::WorkflowCatalog::load_layered(None)
-                .unwrap_or_default()
-                .is_compose_token(t)
-        {
+        if t.split(':').count() == 1 && is_token(t) {
             return Ok(ComposePart::Recipe {
                 name: t.to_string(),
             });
@@ -895,7 +896,7 @@ pub fn parse_compose_part(token: &str) -> Result<ComposePart, String> {
                 ));
             }
             let inner = Box::new(
-                parse_compose_part(rest)
+                parse_compose_part_with(rest, is_token)
                     .map_err(|e| format!("compose part {token:?}: invalid inner part ({e})"))?,
             );
             match form {
@@ -933,7 +934,7 @@ pub fn parse_compose_part(token: &str) -> Result<ComposePart, String> {
                 ));
             }
             let inner = Box::new(
-                parse_compose_part(value)
+                parse_compose_part_with(value, is_token)
                     .map_err(|e| format!("compose part {token:?}: invalid inner part ({e})"))?,
             );
             Ok(ComposePart::Retry {
@@ -1041,7 +1042,7 @@ pub fn compose_workflow_with_resolvers(
         if let ComposePart::Recipe { name } = part {
             let expanded = recipe_resolver(name).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "compose part {name:?}: unknown compose token (known: wave-swarm, repair-until-verified, beads-lifecycle)"
+                    "compose part {name:?}: unknown compose token — not resolvable from the catalog"
                 )
             })?;
             match expanded.crew {
@@ -1867,6 +1868,12 @@ mod tests {
     use super::*;
     use toron_workflow::schema::parse_workflow;
 
+    fn builtin_token(name: &str) -> bool {
+        crate::workflow_catalog::builtin_meta(name)
+            .compose
+            .unwrap_or(false)
+    }
+
     /// §3.6 envelope #3 (wall-clock): a composed run whose leaves outlive
     /// the cap fails with the wall-clock error naming the remedy — never a
     /// silent hang. RED before `bounded_invoke` existed: the compose arm
@@ -2070,21 +2077,24 @@ steps:
     #[test]
     fn compose_part_parses_dispatch_and_workflow() {
         assert_eq!(
-            parse_compose_part("scout:fresh-eyes-explore").unwrap(),
+            parse_compose_part_with("scout:fresh-eyes-explore", &|_| false).unwrap(),
             ComposePart::Dispatch {
                 role: "scout".into(),
                 stage: "fresh-eyes-explore".into(),
             }
         );
         assert_eq!(
-            parse_compose_part("workflow:weekly-review").unwrap(),
+            parse_compose_part_with("workflow:weekly-review", &|_| false).unwrap(),
             ComposePart::CallWorkflow {
                 name: "weekly-review".into(),
             }
         );
-        assert!(parse_compose_part(":stage").is_err(), "empty role errors");
         assert!(
-            parse_compose_part("workflow:").is_err(),
+            parse_compose_part_with(":stage", &|_| false).is_err(),
+            "empty role errors"
+        );
+        assert!(
+            parse_compose_part_with("workflow:", &|_| false).is_err(),
             "empty name errors"
         );
     }
@@ -2094,46 +2104,46 @@ steps:
     #[test]
     fn w6_parse_stage_first_and_phase_stage() {
         assert_eq!(
-            parse_compose_part("fresh-eyes-explore").unwrap(),
+            parse_compose_part_with("fresh-eyes-explore", &|_| false).unwrap(),
             ComposePart::StageFirst {
                 stage: "fresh-eyes-explore".into(),
             }
         );
         assert_eq!(
-            parse_compose_part("review:code-review").unwrap(),
+            parse_compose_part_with("review:code-review", &|_| false).unwrap(),
             ComposePart::PhaseStage {
                 phase: "review".into(),
                 stage: "code-review".into(),
             }
         );
         assert_eq!(
-            parse_compose_part("plan:decompose-beads").unwrap(),
+            parse_compose_part_with("plan:decompose-beads", &|_| false).unwrap(),
             ComposePart::PhaseStage {
                 phase: "plan".into(),
                 stage: "decompose-beads".into(),
             }
         );
         assert_eq!(
-            parse_compose_part("stage:ce-execute").unwrap(),
+            parse_compose_part_with("stage:ce-execute", &|_| false).unwrap(),
             ComposePart::StageFirst {
                 stage: "ce-execute".into(),
             }
         );
         assert_eq!(
-            parse_compose_part("role:reviewer:ce-review").unwrap(),
+            parse_compose_part_with("role:reviewer:ce-review", &|_| false).unwrap(),
             ComposePart::Dispatch {
                 role: "reviewer".into(),
                 stage: "ce-review".into(),
             }
         );
         assert_eq!(
-            parse_compose_part("phase:implement:ce-execute").unwrap(),
+            parse_compose_part_with("phase:implement:ce-execute", &|_| false).unwrap(),
             ComposePart::PhaseStage {
                 phase: "implement".into(),
                 stage: "ce-execute".into(),
             }
         );
-        let err = parse_compose_part("phase:mars:ce-execute").unwrap_err();
+        let err = parse_compose_part_with("phase:mars:ce-execute", &|_| false).unwrap_err();
         assert!(err.contains("valid phases: resolve, plan, implement, review, verify, compound"));
         assert!(err.contains("supported forms:"));
     }
@@ -2266,7 +2276,7 @@ steps:
     #[test]
     fn t1_parse_grammar_part_forms() {
         assert_eq!(
-            parse_compose_part("each:@items:scout:fresh-eyes-explore").unwrap(),
+            parse_compose_part_with("each:@items:scout:fresh-eyes-explore", &|_| false).unwrap(),
             ComposePart::Each {
                 over: "@items".into(),
                 inner: Box::new(ComposePart::Dispatch {
@@ -2276,7 +2286,7 @@ steps:
             }
         );
         assert_eq!(
-            parse_compose_part("each:items:fresh-eyes-explore").unwrap(),
+            parse_compose_part_with("each:items:fresh-eyes-explore", &|_| false).unwrap(),
             ComposePart::Each {
                 over: "items".into(),
                 inner: Box::new(ComposePart::StageFirst {
@@ -2285,7 +2295,10 @@ steps:
             }
         );
         assert_eq!(
-            parse_compose_part("when:steps.gate.ok == true:reviewer:code-review").unwrap(),
+            parse_compose_part_with("when:steps.gate.ok == true:reviewer:code-review", &|_| {
+                false
+            })
+            .unwrap(),
             ComposePart::When {
                 guard: "steps.gate.ok == true".into(),
                 inner: Box::new(ComposePart::Dispatch {
@@ -2295,7 +2308,7 @@ steps:
             }
         );
         assert_eq!(
-            parse_compose_part("retry(3):coder:systematic-execute").unwrap(),
+            parse_compose_part_with("retry(3):coder:systematic-execute", &|_| false).unwrap(),
             ComposePart::Retry {
                 max_attempts: 3,
                 inner: Box::new(ComposePart::Dispatch {
@@ -2305,7 +2318,8 @@ steps:
             }
         );
         assert_eq!(
-            parse_compose_part("parallel:@crew.coder:workflow:weekly-review").unwrap(),
+            parse_compose_part_with("parallel:@crew.coder:workflow:weekly-review", &|_| false)
+                .unwrap(),
             ComposePart::Parallel {
                 over: "@crew.coder".into(),
                 inner: Box::new(ComposePart::CallWorkflow {
@@ -2313,7 +2327,7 @@ steps:
                 }),
             }
         );
-        let nested = parse_compose_part("each:items:retry(2):deploy:app").unwrap();
+        let nested = parse_compose_part_with("each:items:retry(2):deploy:app", &|_| false).unwrap();
         assert!(
             matches!(&nested, ComposePart::Each { inner, .. }
                 if matches!(inner.as_ref(), ComposePart::Retry { max_attempts: 2, .. })),
@@ -2339,12 +2353,12 @@ steps:
             "parallel:@crew.c",
         ] {
             assert!(
-                parse_compose_part(bad).is_err(),
+                parse_compose_part_with(bad, &|_| false).is_err(),
                 "{bad:?} must be a parse error"
             );
         }
         assert!(
-            parse_compose_part("lead:oncall").is_ok(),
+            parse_compose_part_with("lead:oncall", &|_| false).is_ok(),
             "role:stage unaffected"
         );
     }
@@ -2367,7 +2381,7 @@ steps:
             "parallel:2:coder:systematic-execute",
         ]
         .iter()
-        .map(|t| parse_compose_part(t).unwrap())
+        .map(|t| parse_compose_part_with(t, &|_| false).unwrap())
         .collect();
         let wf = compose_workflow_with("composed-t1", "obj", None, &parts, &affinity).unwrap();
         assert_eq!(wf.steps.len(), 4);
@@ -2455,7 +2469,8 @@ steps:
                 crate::builtin_workflows::builtin_recipe(n)
             }
         };
-        let part = parse_compose_part("wave-swarm").expect("compose token parses");
+        let part =
+            parse_compose_part_with("wave-swarm", &builtin_token).expect("compose token parses");
         let wf = compose_workflow_with_resolvers(
             "composed-override",
             "obj",
@@ -2503,7 +2518,8 @@ steps:
         use toron_workflow::schema::Action;
         let lib = crate::stages::StageLibrary::compiled_in();
         let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
-        let part = parse_compose_part("wave-swarm").expect("compose token parses");
+        let part =
+            parse_compose_part_with("wave-swarm", &builtin_token).expect("compose token parses");
         let wf = compose_workflow_with("composed-wave", "obj", None, &[part], &affinity).unwrap();
         assert_eq!(wf.steps.len(), 13, "{:?}", wf.steps.iter().map(|s| &s.name));
         assert!(
@@ -2618,7 +2634,8 @@ steps:
         use toron_workflow::schema::Action;
         let lib = crate::stages::StageLibrary::compiled_in();
         let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
-        let part = parse_compose_part("wave-swarm").expect("compose token parses");
+        let part =
+            parse_compose_part_with("wave-swarm", &builtin_token).expect("compose token parses");
         let wf = compose_workflow_with("seq", "obj", None, &[part], &affinity).unwrap();
 
         let pairs: [(&str, usize, usize, &str); 5] = [
@@ -2703,7 +2720,8 @@ steps:
     fn compose_ensures_steer_channel() {
         let lib = crate::stages::StageLibrary::compiled_in();
         let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
-        let part = parse_compose_part("wave-swarm").expect("compose token parses");
+        let part =
+            parse_compose_part_with("wave-swarm", &builtin_token).expect("compose token parses");
         let wf = compose_workflow_with("chan", "obj", None, &[part], &affinity).unwrap();
 
         assert_eq!(
@@ -2728,7 +2746,7 @@ steps:
                 .as_deref(),
             Some("adr0006-steer")
         );
-        let bare_part = parse_compose_part("coder:ce-execute").unwrap();
+        let bare_part = parse_compose_part_with("coder:ce-execute", &|_| false).unwrap();
         let bare = compose_workflow_with("bare", "obj", None, &[bare_part], &affinity).unwrap();
         assert_eq!(
             resolve_steer_channel(&bare, &serde_json::json!({})).unwrap(),
@@ -2757,7 +2775,7 @@ steps:
         let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
         let parts: Vec<ComposePart> = ["scout:fresh-eyes-explore", "wave-swarm"]
             .iter()
-            .map(|t| parse_compose_part(t).unwrap())
+            .map(|t| parse_compose_part_with(t, &builtin_token).unwrap())
             .collect();
         let wf = compose_workflow_with("mixed", "obj", None, &parts, &affinity).unwrap();
         assert_eq!(
@@ -2771,7 +2789,8 @@ steps:
     #[test]
     fn beads_lifecycle_compose_token_parses_and_expands_graph_lint_clean() {
         use toron_workflow::schema::Action;
-        let part = parse_compose_part("beads-lifecycle").expect("token parses");
+        let part =
+            parse_compose_part_with("beads-lifecycle", &builtin_token).expect("token parses");
         assert_eq!(
             part,
             ComposePart::Recipe {
@@ -2883,7 +2902,7 @@ steps:
     /// evaluate nodes must NOT balloon dry-run to 3+3.
     #[test]
     fn repair_compose_token_preserves_explicit_crew_1_plus_1() {
-        let part = parse_compose_part("repair-until-verified").expect("token");
+        let part = parse_compose_part_with("repair-until-verified", &builtin_token).expect("token");
         let wf = compose_workflow("composed-repair", "solo dry-run", None, &[part])
             .expect("compose repair");
         assert_eq!(
@@ -2905,14 +2924,14 @@ steps:
 
     /// A graph-form token mixes with ordinary parts (token nodes land in
     /// the graph; the plain part lands in steps); the unknown-token error
-    /// names all three tokens.
+    /// names the token and the catalog (no hardcoded token list).
     #[test]
     fn beads_lifecycle_compose_token_mixes_with_plain_parts() {
         let lib = crate::stages::StageLibrary::compiled_in();
         let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
         let parts: Vec<ComposePart> = ["scout:fresh-eyes-explore", "beads-lifecycle"]
             .iter()
-            .map(|t| parse_compose_part(t).unwrap())
+            .map(|t| parse_compose_part_with(t, &builtin_token).unwrap())
             .collect();
         let wf = compose_workflow_with("mixed", "obj", None, &parts, &affinity).unwrap();
         assert_eq!(wf.steps.len(), 1, "the plain part lands in steps");
@@ -2931,26 +2950,70 @@ steps:
             &affinity,
         )
         .expect_err("unknown token refuses");
-        for token in ["wave-swarm", "repair-until-verified", "beads-lifecycle"] {
-            assert!(
-                err.to_string().contains(token),
-                "error names {token}: {err}"
-            );
-        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains("\"nope\"") && msg.contains("not resolvable from the catalog"),
+            "error names the token and the catalog: {err}"
+        );
+    }
+
+    /// bd-compose-field-w4r01 acceptance 1: a project-tier-only token parses
+    /// as Recipe and composes to the project workflow's steps. Hermetic temp
+    /// project + temp config; no ambient config read.
+    #[test]
+    fn compose_token_project_only_token_parses_as_recipe() {
+        let project = std::env::temp_dir().join(format!("compose-proj-{}", uuid::Uuid::new_v4()));
+        let dir = project.join(".flywheel/workflows");
+        std::fs::create_dir_all(&dir).expect("mkdir project workflows");
+        std::fs::write(
+            dir.join("w4r01-proj-token.yaml"),
+            "name: w4r01-proj-token\ncompose: true\ndescription: project-only token\nsteps:\n  - name: only\n    action: delay\n    secs: 0\n",
+        )
+        .expect("write token");
+        let config =
+            std::env::temp_dir().join(format!("compose-proj-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(config.join("workflows")).expect("mkdir config");
+        let catalog = crate::workflow_catalog::WorkflowCatalog::load_layered_with(
+            config.clone(),
+            Some(&project),
+        )
+        .expect("load layered");
+        let part = parse_compose_part_with("w4r01-proj-token", &|t| catalog.is_compose_token(t));
+        assert!(
+            matches!(&part, Ok(ComposePart::Recipe { .. })),
+            "project-tier compose:true must parse as Recipe, got {part:?}"
+        );
+        let composed = compose_workflow_with_resolvers(
+            "composed-proj",
+            "obj",
+            None,
+            &[part.expect("recipe")],
+            &|_| None,
+            &|n| catalog.workflows.get(n).cloned(),
+        )
+        .expect("compose expands");
+        assert!(
+            composed
+                .steps
+                .iter()
+                .any(|s| s.name.as_deref() == Some("only")),
+            "composed workflow carries the project token's steps"
+        );
+        let _ = std::fs::remove_dir_all(&project);
+        let _ = std::fs::remove_dir_all(&config);
     }
 
     /// Thin `beads` is an ordinary builtin: not a compose token, parses as
     /// a stage-first part (never bare `--parts` expansion).
     #[test]
     fn thin_beads_is_not_a_compose_token() {
-        let catalog =
-            crate::workflow_catalog::WorkflowCatalog::load_layered(None).unwrap_or_default();
+        let catalog = crate::workflow_catalog::WorkflowCatalog::default();
         assert!(
             !catalog.is_compose_token("beads"),
             "thin beads stays ordinary"
         );
         assert_eq!(
-            parse_compose_part("beads").unwrap(),
+            parse_compose_part_with("beads", &|t| catalog.is_compose_token(t)).unwrap(),
             ComposePart::StageFirst {
                 stage: "beads".to_string()
             },
@@ -2963,7 +3026,7 @@ steps:
     fn budget_caps_fail_closed() {
         use toron_workflow::schema::{Action, Step};
         let parts: Vec<ComposePart> = (0..=(MAX_COMPOSED_DISPATCHES as u32))
-            .map(|i| parse_compose_part(&format!("r{i}:stage{i}")).unwrap())
+            .map(|i| parse_compose_part_with(&format!("r{i}:stage{i}"), &|_| false).unwrap())
             .collect();
         let wf = compose_workflow("composed-cap", "obj", None, &parts).unwrap();
         let err = enforce_budget_caps(&wf).expect_err("over-cap dispatches must fail closed");
@@ -3504,7 +3567,7 @@ steps:
     #[tokio::test]
     async fn bare_dispatch_red_fails_composed_workflow_not_silent_green() {
         use toron_workflow::schema::StepOnError;
-        let part = parse_compose_part("coder:systematic-execute").unwrap();
+        let part = parse_compose_part_with("coder:systematic-execute", &|_| false).unwrap();
         let wf = compose_workflow("composed-bare-red", "fix the bug", None, &[part]).unwrap();
         assert_eq!(wf.steps.len(), 1);
         assert_eq!(
@@ -3553,7 +3616,7 @@ steps:
             });
         let engine2 = toron_workflow::WorkflowEngine::local_with_effect_runner(Some(ok_runner))
             .expect("engine2");
-        let part2 = parse_compose_part("coder:systematic-execute").unwrap();
+        let part2 = parse_compose_part_with("coder:systematic-execute", &|_| false).unwrap();
         let wf2 = compose_workflow("composed-bare-green", "fix the bug", None, &[part2]).unwrap();
         let out2 = engine2
             .run(
@@ -3580,7 +3643,7 @@ steps:
     async fn compose_dispatch_plus_verify_red_fails_and_sink_not_missing() {
         use std::sync::{Arc, Mutex};
         use toron_workflow::schema::StepOnError;
-        let part = parse_compose_part("coder:systematic-execute").unwrap();
+        let part = parse_compose_part_with("coder:systematic-execute", &|_| false).unwrap();
         let mut wf = compose_workflow("composed-verify", "harden the loop", None, &[part]).unwrap();
         assert_eq!(wf.steps[0].on_error, StepOnError::FailRun);
         wf.steps.push(toron_workflow::schema::Step {
@@ -3662,7 +3725,7 @@ steps:
             "composed-verify-green",
             "harden the loop",
             None,
-            &[parse_compose_part("coder:systematic-execute").unwrap()],
+            &[parse_compose_part_with("coder:systematic-execute", &|_| false).unwrap()],
         )
         .unwrap();
         wf_green.steps.push(toron_workflow::schema::Step {
