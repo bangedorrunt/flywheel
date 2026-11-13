@@ -397,7 +397,7 @@ struct ReconcileRequest {
     idle_retire_after: Option<String>,
 }
 
-pub fn reconcile_json(input: &str) -> anyhow::Result<String> {
+pub fn reconcile_json(input: &str, now_ms: u64) -> anyhow::Result<String> {
     let req: ReconcileRequest = serde_json::from_str(input)?;
     let by_env = |harness: &str| {
         matches!(
@@ -413,7 +413,7 @@ pub fn reconcile_json(input: &str) -> anyhow::Result<String> {
         .map_err(anyhow::Error::msg)?;
     let policy = ReconcilePolicy {
         idle_retire_after_ms: after_ms.map(|d| d.as_millis() as u64),
-        now_ms: req.now_ms.unwrap_or(0),
+        now_ms: req.now_ms.unwrap_or(now_ms),
     };
     let effects = reconcile(&req.desired, &req.live, &by_env, &policy);
     Ok(serde_json::to_string(&effects)?)
@@ -652,7 +652,7 @@ mod tests {
         let mut want = want("coder");
         want.harness = "h".to_string();
         let input = serde_json::json!({"desired": [want], "live": live}).to_string();
-        let out = reconcile_json(&input).expect("binds");
+        let out = reconcile_json(&input, 0).expect("binds");
         let effects: Vec<SeatEffect> = serde_json::from_str(&out).expect("parses");
         assert_eq!(
             effects,
@@ -664,8 +664,8 @@ mod tests {
 
     #[test]
     fn seat_reconcile_json_malformed_errors() {
-        assert!(reconcile_json("not json").is_err());
-        assert!(reconcile_json("{\"desired\":[]}").is_err());
+        assert!(reconcile_json("not json", 0).is_err());
+        assert!(reconcile_json("{\"desired\":[]}", 0).is_err());
     }
 
     fn v9_gen_live(n: usize, reverse: bool) -> Vec<LiveSeat> {
@@ -948,6 +948,18 @@ mod tests {
             parse_idle_retire_after("10m").expect("valid duration"),
             std::time::Duration::from_secs(600)
         );
+        let rfc3339 = parse_idle_retire_after("2026-08-18T00:00:00Z");
+        assert!(rfc3339.is_err(), "RFC3339 is not a duration");
+        assert!(
+            rfc3339.unwrap_err().contains("idle_retire_after"),
+            "rejection names the field"
+        );
+        let last = parse_idle_retire_after("last");
+        assert!(last.is_err(), "`last` is not a duration");
+        assert!(
+            last.unwrap_err().contains("idle_retire_after"),
+            "rejection names the field"
+        );
     }
 
     #[test]
@@ -964,7 +976,36 @@ mod tests {
             "idle_retire_after": "10m",
         })
         .to_string();
-        let out = reconcile_json(&input).expect("probe binds");
+        let out = reconcile_json(&input, 0).expect("probe binds");
+        let effects: Vec<SeatEffect> = serde_json::from_str(&out).expect("parses");
+        assert_eq!(
+            effects,
+            vec![
+                SeatEffect::RetireIdle {
+                    pin: "a".to_string()
+                },
+                SeatEffect::Keep {
+                    pin: "b".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn idle_retire_json_without_now_uses_caller_clock() {
+        let live = vec![
+            idle_live("a", true, Some(0)),
+            idle_live("b", false, Some(0)),
+        ];
+        let want = vec![idle_want("a"), idle_want("b")];
+        let input = serde_json::json!({
+            "desired": want,
+            "live": live,
+            "idle_retire_after": "10m",
+        })
+        .to_string();
+        assert!(!input.contains("now_ms"), "request omits now_ms");
+        let out = reconcile_json(&input, 600_001).expect("probe binds");
         let effects: Vec<SeatEffect> = serde_json::from_str(&out).expect("parses");
         assert_eq!(
             effects,

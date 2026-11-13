@@ -415,37 +415,20 @@ pub struct SwarmSection {
     pub idle_retire_after: Option<String>,
 }
 
-/// Parse `[swarm] idle_retire_after` values like `"500ms"`, `"30s"`,
-/// `"10m"`, `"2h"`, `"1d"`. Anything else fails loud.
+/// Parse `[swarm] idle_retire_after` with the shared `toron_core::time_spec`
+/// parser. Only relative offsets (`30s`, `10m`, `2h`, `1d`) are accepted:
+/// RFC3339 timestamps and `last` are rejected by name — the knob is a
+/// duration, not a point in time or a cursor. Sub-second precision is not
+/// needed for an idle-retirement knob, so the shared `s|m|h|d` shapes are
+/// enough and no second parser is kept here.
 pub fn parse_idle_retire_after(raw: &str) -> Result<std::time::Duration, String> {
-    let s = raw.trim();
-    let (digits, factor_ms): (&str, u64) = if let Some(n) = s.strip_suffix("ms") {
-        (n, 1)
-    } else if let Some(n) = s.strip_suffix('s') {
-        (n, 1_000)
-    } else if let Some(n) = s.strip_suffix('m') {
-        (n, 60_000)
-    } else if let Some(n) = s.strip_suffix('h') {
-        (n, 3_600_000)
-    } else if let Some(n) = s.strip_suffix('d') {
-        (n, 86_400_000)
-    } else {
-        return Err(format!(
-            "invalid idle_retire_after {raw:?}: expected <n>ms|s|m|h|d"
-        ));
-    };
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(format!(
-            "invalid idle_retire_after {raw:?}: expected <n>ms|s|m|h|d"
-        ));
+    match toron_core::time_spec::parse(raw) {
+        Ok(toron_core::time_spec::TimeSpec::Relative(d)) => Ok(d),
+        Ok(other) => Err(format!(
+            "invalid idle_retire_after {raw:?}: expected a relative duration (30s, 10m, 2h, 1d), got {other:?}; RFC3339 timestamps and `last` are not durations"
+        )),
+        Err(e) => Err(format!("invalid idle_retire_after {raw:?}: {e}")),
     }
-    let n: u64 = digits
-        .parse()
-        .map_err(|_| format!("invalid idle_retire_after {raw:?}: number too large"))?;
-    let ms = n
-        .checked_mul(factor_ms)
-        .ok_or_else(|| format!("invalid idle_retire_after {raw:?}: duration overflows"))?;
-    Ok(std::time::Duration::from_millis(ms))
 }
 
 /// Parent-death policy for the captain (ADR-0025 Spec 4, Wave 4a).

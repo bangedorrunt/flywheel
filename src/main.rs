@@ -3847,7 +3847,13 @@ fn main() {
             std::io::stdin()
                 .read_to_string(&mut input)
                 .map_err(anyhow::Error::from)
-                .and_then(|_| crate::seat_reconcile::reconcile_json(&input))
+                .and_then(|_| {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    crate::seat_reconcile::reconcile_json(&input, now_ms)
+                })
                 .map(|out| println!("{out}"))
         }
         Some(Commands::__Diagnose {
