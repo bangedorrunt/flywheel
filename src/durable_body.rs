@@ -21,6 +21,7 @@
 //!   feed their transitions, timeouts fail typed); a body with no watcher
 //!   fails the WatchJob loudly instead of hanging.
 
+use crate::phase_contracts::PhaseContractReport;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -48,6 +49,12 @@ type State = SyncWorkflowState;
 type LinearRun = DurableRun<EngineStore, Journal, State>;
 type GraphRun = DurableGraphRun<EngineStore, Journal, State>;
 
+/// Check one settled step output against its stage's declared witness:
+/// None settles unchanged (the stage declares no witness); Some carries
+/// the pass/fail report that gates success.
+pub type WitnessCheck =
+    Arc<dyn Fn(&str, &serde_json::Value) -> Option<PhaseContractReport> + Send + Sync>;
+
 /// The seams one body needs.
 pub struct BodySeams {
     /// Leaf execution (runner + verify sink + journal mode).
@@ -55,6 +62,12 @@ pub struct BodySeams {
     /// Watches a dispatched job's 43002/43004/43006. `None` = the body has
     /// no bus, so `await: result` fails loud and typed instead of hanging.
     pub job_watcher: Option<JobWatcher>,
+    /// Gates settled step outputs against the stage's declared witness.
+    /// `None` = no gate; steps settle as the fold lands them.
+    pub witness: Option<WitnessCheck>,
+    /// Wall clock in production, frozen in tests. Every model timestamp
+    /// in this driver reads it, so deadlines stay deterministic.
+    pub clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     /// Starts a spawn child. `None` = the body refuses a spawn shape.
     pub launcher: Option<SpawnLauncher>,
     /// Profile name -> resolved profile for a `spawn` step. `None` leaves the
@@ -122,7 +135,33 @@ pub fn real_verify_sink() -> toron_workflow::engine::VerifySink {
     sink
 }
 
-fn unix_ms() -> u64 {
+/// Run the stage witness gate on one settled step output. None settles
+/// unchanged: no seam, no stage on the step, or no declared witness. A
+/// failing report returns the typed refusal that replaces success.
+fn witness_refusal(
+    seam: Option<&WitnessCheck>,
+    run: &LinearRun,
+    node: &str,
+    value: &Value,
+) -> Option<String> {
+    let check = seam?;
+    let model = run.model();
+    let (_, step) = model.plan.step_at(model.step_index)?;
+    let stage = match &step.action {
+        toron_workflow::schema::Action::DispatchJob { spec, .. } => spec.stage.clone()?,
+        _ => return None,
+    };
+    let report = check(&stage, value)?;
+    if report.ok {
+        return None;
+    }
+    Some(format!(
+        "step {node} (stage {stage}) failed witness `{}`: {}",
+        report.phase, report.evidence
+    ))
+}
+
+pub(crate) fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -224,6 +263,8 @@ async fn drive_linear(
     journal_scope: &str,
 ) -> BodyOutcome {
     let (engine_store, journal, state) = handles(store, handle, journal_scope);
+    let clock = seams.clock.clone();
+    let opened_at = clock();
     let wf = workflow.clone();
     let rid = run_id.to_string();
     let trig = trigger.clone();
@@ -233,7 +274,7 @@ async fn drive_linear(
     };
     let opened = tokio::task::spawn_blocking(move || {
         let engine = OurEngine::with_journal(engine_store, journal);
-        DurableRun::open_with_seams(engine, state, rid, wf, trig, unix_ms(), &spawn_seams)
+        DurableRun::open_with_seams(engine, state, rid, wf, trig, opened_at, &spawn_seams)
     })
     .await;
     let (mut run, mut effects) = match opened {
@@ -272,9 +313,9 @@ async fn drive_linear(
                         &seams.leaf,
                     )
                     .await;
-                    let then = move |mut run: LinearRun| {
-                        run.step_done(value, unix_ms()).map(|eff| (run, eff))
-                    };
+                    let c = clock.clone();
+                    let then =
+                        move |mut run: LinearRun| run.step_done(value, c()).map(|eff| (run, eff));
                     let Some((back, mut eff)) = verb(run_id, "step feed", move || then(run)).await
                     else {
                         return failed("step feed failed", None);
@@ -288,15 +329,16 @@ async fn drive_linear(
                         return failed(format!("spawn {node} has no launcher on this door"), None);
                     };
                     let deadline = run.model().deadline_ms();
-                    let outcome = await_spawn(&launcher, &spec, deadline).await;
+                    let outcome = await_spawn(&launcher, &spec, deadline, clock()).await;
+                    let c = clock.clone();
                     let then = move |mut run: LinearRun| match outcome {
                         SpawnLaunch::Settled(value) => {
-                            run.spawn_settled(&node, value, unix_ms()).map(|e| (run, e))
+                            run.spawn_settled(&node, value, c()).map(|e| (run, e))
                         }
                         SpawnLaunch::Failed(error) => {
-                            run.spawn_failed(&node, error, unix_ms()).map(|e| (run, e))
+                            run.spawn_failed(&node, error, c()).map(|e| (run, e))
                         }
-                        SpawnLaunch::TimedOut => run.woke(unix_ms()).map(|e| (run, e)),
+                        SpawnLaunch::TimedOut => run.woke(c()).map(|e| (run, e)),
                     };
                     let Some((back, mut eff)) = verb(run_id, "spawn feed", move || then(run)).await
                     else {
@@ -315,10 +357,6 @@ async fn drive_linear(
                 }
                 RunEffect::WatchJob { node, job_id } => {
                     let Some(watcher) = seams.job_watcher.clone() else {
-                        // No bus handle on this door: an in-process body
-                        // without a watcher cannot resolve the job's
-                        // terminal, so it fails the body loudly instead of
-                        // hanging — never park past a wake that cannot come.
                         return failed(
                             format!(
                                 "dispatch_job await: result needs a toron host; \
@@ -328,11 +366,6 @@ async fn drive_linear(
                             Some(node),
                         );
                     };
-                    // Same settlement as toron's host: the deadline and the
-                    // claim flag come from the model, the watcher resolves
-                    // the mail wait, and each outcome feeds its transition.
-                    // The fold applies the step's `on_error`; success is
-                    // never synthesized — only a watched 43004 settles.
                     let (deadline, claimed) = match run.model().phase {
                         toron_workflow::engine::durable::RunPhase::AwaitingJob {
                             claim_deadline_ms,
@@ -356,21 +389,31 @@ async fn drive_linear(
                             claimed,
                         },
                         deadline,
-                        unix_ms(),
+                        clock(),
                     )
                     .await;
+                    let outcome = match outcome {
+                        JobWatchOutcome::Settled(value) => {
+                            match witness_refusal(seams.witness.as_ref(), &run, &node, &value) {
+                                Some(error) => JobWatchOutcome::Failed(error),
+                                None => JobWatchOutcome::Settled(value),
+                            }
+                        }
+                        other => other,
+                    };
+                    let c = clock.clone();
                     let then = move |mut run: LinearRun| match outcome {
                         JobWatchOutcome::Claimed => {
-                            run.job_claimed(&node, unix_ms()).map(|eff| (run, eff))
+                            run.job_claimed(&node, c()).map(|eff| (run, eff))
                         }
-                        JobWatchOutcome::Settled(value) => run
-                            .job_settled(&node, value, unix_ms())
-                            .map(|eff| (run, eff)),
-                        JobWatchOutcome::Failed(error) => run
-                            .job_failed(&node, error, unix_ms())
-                            .map(|eff| (run, eff)),
+                        JobWatchOutcome::Settled(value) => {
+                            run.job_settled(&node, value, c()).map(|eff| (run, eff))
+                        }
+                        JobWatchOutcome::Failed(error) => {
+                            run.job_failed(&node, error, c()).map(|eff| (run, eff))
+                        }
                         JobWatchOutcome::TimedOut => {
-                            let now = unix_ms().max(deadline.unwrap_or(0));
+                            let now = c().max(deadline.unwrap_or(0));
                             run.woke(now).map(|eff| (run, eff))
                         }
                     };
@@ -393,11 +436,12 @@ async fn drive_linear(
                     ) {
                         continue;
                     }
-                    let now = unix_ms();
+                    let now = clock();
                     if until_ms > now {
                         tokio::time::sleep(std::time::Duration::from_millis(until_ms - now)).await;
                     }
-                    let then = move |mut run: LinearRun| run.woke(unix_ms()).map(|eff| (run, eff));
+                    let c = clock.clone();
+                    let then = move |mut run: LinearRun| run.woke(c()).map(|eff| (run, eff));
                     let Some((back, mut eff)) = verb(run_id, "wake", move || then(run)).await
                     else {
                         return failed("wake failed", None);
@@ -433,6 +477,8 @@ async fn drive_graph(
     journal_scope: &str,
 ) -> BodyOutcome {
     let (engine_store, journal, state) = handles(store, handle, journal_scope);
+    let clock = seams.clock.clone();
+    let opened_at = clock();
     let wf = workflow.clone();
     let rid = run_id.to_string();
     let trig = trigger.clone();
@@ -441,7 +487,7 @@ async fn drive_graph(
     };
     let opened = tokio::task::spawn_blocking(move || {
         let engine = OurEngine::with_journal(engine_store, journal);
-        DurableGraphRun::open_with_children(engine, state, rid, wf, trig, unix_ms(), &children)
+        DurableGraphRun::open_with_children(engine, state, rid, wf, trig, opened_at, &children)
     })
     .await;
     let (mut run, mut effects) = match opened {
@@ -495,8 +541,9 @@ async fn drive_graph(
                         &seams.leaf,
                     )
                     .await;
+                    let c = clock.clone();
                     let then = move |mut run: GraphRun| {
-                        run.node_done(&node, value, unix_ms()).map(|eff| (run, eff))
+                        run.node_done(&node, value, c()).map(|eff| (run, eff))
                     };
                     let Some((back, mut eff)) = verb(run_id, "node feed", move || then(run)).await
                     else {
@@ -506,11 +553,12 @@ async fn drive_graph(
                     follow.append(&mut eff);
                 }
                 GraphEffect::ParkUntil { until_ms, .. } => {
-                    let now = unix_ms();
+                    let now = clock();
                     if until_ms > now {
                         tokio::time::sleep(std::time::Duration::from_millis(until_ms - now)).await;
                     }
-                    let then = move |mut run: GraphRun| run.woke(unix_ms()).map(|eff| (run, eff));
+                    let c = clock.clone();
+                    let then = move |mut run: GraphRun| run.woke(c()).map(|eff| (run, eff));
                     let Some((back, mut eff)) = verb(run_id, "wake", move || then(run)).await
                     else {
                         return failed("wake failed", None);
@@ -543,8 +591,9 @@ async fn drive_graph(
                             "failed_step": node,
                         });
                         let n = node.clone();
+                        let c = clock.clone();
                         let then = move |mut run: GraphRun| {
-                            run.child_failed(&n, bundle, unix_ms()).map(|e| (run, e))
+                            run.child_failed(&n, bundle, c()).map(|e| (run, e))
                         };
                         let Some((back, mut eff)) =
                             verb(run_id, "child fail", move || then(run)).await
@@ -559,9 +608,10 @@ async fn drive_graph(
                         Box::pin(drive(store, &child_run_id, &child_wf, child_trigger, seams))
                             .await;
                     let n = node.clone();
+                    let c = clock.clone();
                     let then = move |mut run: GraphRun| match child {
                         BodyOutcome::Completed(output) => {
-                            run.child_succeeded(&n, output, unix_ms()).map(|e| (run, e))
+                            run.child_succeeded(&n, output, c()).map(|e| (run, e))
                         }
                         BodyOutcome::Failed { error, .. } => {
                             let bundle = serde_json::json!({
@@ -569,7 +619,7 @@ async fn drive_graph(
                                 "error": error,
                                 "failed_step": n,
                             });
-                            run.child_failed(&n, bundle, unix_ms()).map(|e| (run, e))
+                            run.child_failed(&n, bundle, c()).map(|e| (run, e))
                         }
                     };
                     let Some((back, mut eff)) = verb(run_id, "child feed", move || then(run)).await
@@ -627,6 +677,7 @@ async fn await_spawn(
     launcher: &SpawnLauncher,
     spec: &SpawnSpec,
     deadline_ms: Option<u64>,
+    now_ms: u64,
 ) -> SpawnLaunch {
     let Some(deadline) = deadline_ms else {
         return match launcher(spec.clone()).await {
@@ -634,12 +685,11 @@ async fn await_spawn(
             Err(e) => SpawnLaunch::Failed(format!("{e:#}")),
         };
     };
-    let now = unix_ms();
-    if deadline <= now {
+    if deadline <= now_ms {
         return SpawnLaunch::TimedOut;
     }
     match tokio::time::timeout(
-        std::time::Duration::from_millis(deadline - now),
+        std::time::Duration::from_millis(deadline - now_ms),
         launcher(spec.clone()),
     )
     .await
@@ -819,6 +869,8 @@ mod tests {
             },
             launcher: Some(launcher),
             job_watcher: None,
+            witness: None,
+            clock: Arc::new(unix_ms),
             spawn_resolver: Some(std::sync::Arc::new(|profile: &str| {
                 (profile == "@housekeeper").then(|| {
                     serde_json::json!({
@@ -860,9 +912,8 @@ mod tests {
         let _ = std::fs::remove_file(&db);
     }
 
-    /// bd-ge1zo slice 1b: an `await: result` dispatch reaches WatchJob and
-    /// fails loud and typed. An in-process body has no job watcher, so it
-    /// never parks past a wake that cannot come.
+    /// Without a watcher the WatchJob arm fails loud and typed instead of
+    /// parking past a wake that cannot come.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn durable_body_watch_job_fails_typed() {
         use toron_core::index::schema;
@@ -886,8 +937,7 @@ mod tests {
         )
         .expect("parse dispatch await");
 
-        // The publication receipt: the leaf reports the 43001 id, the fold
-        // records it and emits the WatchJob this test exercises.
+        // The leaf reports the 43001 id, so the fold emits the WatchJob.
         let runner: toron_workflow::engine::AsyncEffectRunner =
             std::sync::Arc::new(|_inv: &toron_workflow::engine::ActionInvocation| {
                 Box::pin(async move {
@@ -913,6 +963,8 @@ mod tests {
             },
             launcher: None,
             job_watcher: None,
+            witness: None,
+            clock: Arc::new(unix_ms),
             spawn_resolver: None,
             resolve_child: None,
         };
@@ -934,9 +986,8 @@ mod tests {
         let _ = std::fs::remove_file(&db);
     }
 
-    /// A fake watcher queue: scripted outcomes with no bus, no network, no
-    /// sleep. An empty queue times out — the same contract the real watcher
-    /// upholds (TimedOut only means the model's deadline fired).
+    /// Scripted watcher outcomes. An empty queue returns TimedOut, the same
+    /// contract the real watcher upholds.
     fn queue_watcher(
         outcomes: Vec<JobWatchOutcome>,
     ) -> (
@@ -960,6 +1011,19 @@ mod tests {
                 as std::pin::Pin<Box<dyn std::future::Future<Output = JobWatchOutcome> + Send>>
         });
         (watcher, queue)
+    }
+
+    fn frozen_clock() -> Arc<dyn Fn() -> u64 + Send + Sync> {
+        Arc::new(|| 1_000_000u64)
+    }
+
+    /// Witness seam over the real contracts: only stage `s` declares one
+    /// (the `resolve` contract); anything else settles unchecked.
+    fn resolve_witness() -> WitnessCheck {
+        Arc::new(|stage: &str, output: &Value| match stage {
+            "s" => Some(crate::phase_contracts::check_witness("resolve", output)),
+            _ => None,
+        })
     }
 
     fn receipt_runner() -> toron_workflow::engine::AsyncEffectRunner {
@@ -1002,8 +1066,8 @@ mod tests {
         )
     }
 
-    /// bd-ge1zo slice 2a: the fake watcher claims then settles; the step
-    /// output equals the result and the run continues to the next step.
+    /// Claim then settle: the step output equals the result and the run
+    /// continues to the next step.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn durable_body_await_result_settles_from_watcher() {
         let (store, db) = watch_test_store("settle").await;
@@ -1029,6 +1093,8 @@ mod tests {
             },
             launcher: None,
             job_watcher: Some(watcher),
+            witness: None,
+            clock: frozen_clock(),
             spawn_resolver: None,
             resolve_child: None,
         };
@@ -1057,8 +1123,8 @@ mod tests {
         let _ = std::fs::remove_file(&db);
     }
 
-    /// bd-ge1zo slice 2a: a watched 43006 lands through `on_error`. With
-    /// FailRun the run fails naming the step — errors never settle.
+    /// A watched 43006 lands through `on_error`: with FailRun the run fails
+    /// naming the step.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn durable_body_await_result_error_goes_to_on_error() {
         let (store, db) = watch_test_store("error").await;
@@ -1077,6 +1143,8 @@ mod tests {
             },
             launcher: None,
             job_watcher: Some(watcher),
+            witness: None,
+            clock: frozen_clock(),
             spawn_resolver: None,
             resolve_child: None,
         };
@@ -1097,10 +1165,10 @@ mod tests {
         let _ = std::fs::remove_file(&db);
     }
 
-    /// bd-ge1zo slice 2a: a watch that never resolves ends in the model's
-    /// typed timeout naming the step — never success, never a hang. The
-    /// fake pends so `await_job_watch`'s own deadline fires; the ~1s wait
-    /// is the model's deadline, not a test sleep.
+    /// A watch that resolves nothing fails typed at the claim deadline. The
+    /// fake only times out on the frozen clock's deadline (1_001_000); any
+    /// other deadline settles, so ignoring the seam clock turns this into a
+    /// success the test rejects. The 2s guard proves milliseconds, not sleep.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn durable_body_await_result_timeout_is_typed() {
         let (store, db) = watch_test_store("timeout").await;
@@ -1108,10 +1176,13 @@ mod tests {
             "name: watch-timeout\nsteps:\n  - name: j\n    action: dispatch_job\n    assignee: x\n    spec: { task: hi }\n    await: result\n    no_claim_timeout: 1\n    result_timeout: 60\n    on_error: fail_run\n",
         )
         .expect("parse dispatch await");
-        let watcher: JobWatcher = Arc::new(|_spec: JobWatchSpec| {
+        let watcher: JobWatcher = Arc::new(|spec: JobWatchSpec| {
             Box::pin(async move {
-                std::future::pending::<()>().await;
-                JobWatchOutcome::TimedOut
+                if spec.deadline_ms == Some(1_001_000) {
+                    JobWatchOutcome::TimedOut
+                } else {
+                    JobWatchOutcome::Settled(serde_json::json!({"ok": true, "job": "job-1"}))
+                }
             })
                 as std::pin::Pin<Box<dyn std::future::Future<Output = JobWatchOutcome> + Send>>
         });
@@ -1124,11 +1195,13 @@ mod tests {
             },
             launcher: None,
             job_watcher: Some(watcher),
+            witness: None,
+            clock: frozen_clock(),
             spawn_resolver: None,
             resolve_child: None,
         };
         let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(2),
             drive(
                 &store,
                 "watch-timeout-1",
@@ -1145,6 +1218,226 @@ mod tests {
         assert!(
             error.contains('j') && error.contains("no claim"),
             "typed timeout names the step and the bound: {error}"
+        );
+        assert_eq!(step.as_deref(), Some("j"));
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// A satisfied witness settles unchanged: the checked output lands as
+    /// the step value and the run continues.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_body_witness_pass_settles() {
+        let (store, db) = watch_test_store("witness-pass").await;
+        let wf = toron_workflow::schema::parse_workflow(
+            "name: witness-pass\nsteps:\n  - name: j\n    action: dispatch_job\n    assignee: x\n    spec: { task: hi, stage: s }\n    await: result\n    result_timeout: 60\n  - name: k\n    action: send_dm\n    to: x\n    body: hi\n",
+        )
+        .expect("parse dispatch await");
+        let (watcher, _queue) = queue_watcher(vec![
+            JobWatchOutcome::Claimed,
+            JobWatchOutcome::Settled(serde_json::json!({
+                "ok": true,
+                "job": "job-1",
+                "target": "fix the flake",
+                "non_goals": ["no rewrite"],
+                "blast_radius": "flywheel loop",
+                "open_questions": [],
+                "body": "did it",
+            })),
+        ]);
+        let seams = BodySeams {
+            leaf: LeafSeams {
+                async_runner: Some(receipt_runner()),
+                sync_runner: None,
+                verify_sink: toron_workflow::engine::VerifySink::default(),
+                journal_mode: toron_workflow::engine::EffectJournalMode::Recording,
+            },
+            launcher: None,
+            job_watcher: Some(watcher),
+            witness: Some(resolve_witness()),
+            clock: frozen_clock(),
+            spawn_resolver: None,
+            resolve_child: None,
+        };
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            drive(&store, "witness-pass-1", &wf, serde_json::json!({}), &seams),
+        )
+        .await
+        .expect("a witnessed settle must complete fast");
+        let BodyOutcome::Completed(output) = outcome else {
+            panic!("a passing witness settles: {outcome:?}");
+        };
+        assert_eq!(
+            output["steps"]["j"]["body"],
+            serde_json::json!("did it"),
+            "checked output lands unchanged: {output}"
+        );
+        assert!(
+            output["steps"].get("k").is_some(),
+            "the run continues: {output}"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// A violated witness fails typed through `on_error`, naming the step,
+    /// the stage, the witness and the report detail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_body_witness_fail_goes_to_on_error() {
+        let (store, db) = watch_test_store("witness-fail").await;
+        let wf = toron_workflow::schema::parse_workflow(
+            "name: witness-fail\nsteps:\n  - name: j\n    action: dispatch_job\n    assignee: x\n    spec: { task: hi, stage: s }\n    await: result\n    result_timeout: 60\n    on_error: fail_run\n",
+        )
+        .expect("parse dispatch await");
+        let (watcher, _queue) = queue_watcher(vec![
+            JobWatchOutcome::Claimed,
+            JobWatchOutcome::Settled(serde_json::json!({
+                "ok": true,
+                "job": "job-1",
+                "body": "did it",
+            })),
+        ]);
+        let seams = BodySeams {
+            leaf: LeafSeams {
+                async_runner: Some(receipt_runner()),
+                sync_runner: None,
+                verify_sink: toron_workflow::engine::VerifySink::default(),
+                journal_mode: toron_workflow::engine::EffectJournalMode::Recording,
+            },
+            launcher: None,
+            job_watcher: Some(watcher),
+            witness: Some(resolve_witness()),
+            clock: frozen_clock(),
+            spawn_resolver: None,
+            resolve_child: None,
+        };
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            drive(&store, "witness-fail-1", &wf, serde_json::json!({}), &seams),
+        )
+        .await
+        .expect("a failing witness must fail fast");
+        let BodyOutcome::Failed { error, step } = outcome else {
+            panic!("a violated witness never settles: {outcome:?}");
+        };
+        for part in ["j", "s", "resolve", "missing"] {
+            assert!(
+                error.contains(part),
+                "refusal names step, stage, witness and detail ({part}): {error}"
+            );
+        }
+        assert_eq!(step.as_deref(), Some("j"));
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// No declared witness, or no stage at all, settles exactly as the
+    /// fold lands it — the gate only runs where a witness is declared.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_body_witness_absent_settles() {
+        let (store, db) = watch_test_store("witness-absent").await;
+        let wf = toron_workflow::schema::parse_workflow(
+            "name: witness-absent\nsteps:\n  - name: j\n    action: dispatch_job\n    assignee: x\n    spec: { task: hi, stage: plain }\n    await: result\n    result_timeout: 60\n  - name: k\n    action: dispatch_job\n    assignee: x\n    spec: { task: hi }\n    await: result\n    result_timeout: 60\n",
+        )
+        .expect("parse dispatch await");
+        let settled = || {
+            JobWatchOutcome::Settled(serde_json::json!({
+                "ok": true,
+                "job": "job-1",
+                "body": "did it",
+            }))
+        };
+        let (watcher, _queue) = queue_watcher(vec![
+            JobWatchOutcome::Claimed,
+            settled(),
+            JobWatchOutcome::Claimed,
+            settled(),
+        ]);
+        let seams = BodySeams {
+            leaf: LeafSeams {
+                async_runner: Some(receipt_runner()),
+                sync_runner: None,
+                verify_sink: toron_workflow::engine::VerifySink::default(),
+                journal_mode: toron_workflow::engine::EffectJournalMode::Recording,
+            },
+            launcher: None,
+            job_watcher: Some(watcher),
+            witness: Some(resolve_witness()),
+            clock: frozen_clock(),
+            spawn_resolver: None,
+            resolve_child: None,
+        };
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            drive(
+                &store,
+                "witness-absent-1",
+                &wf,
+                serde_json::json!({}),
+                &seams,
+            ),
+        )
+        .await
+        .expect("an unwitnessed settle must complete fast");
+        let BodyOutcome::Completed(output) = outcome else {
+            panic!("no declared witness settles: {outcome:?}");
+        };
+        assert_eq!(
+            output["steps"]["j"]["body"],
+            serde_json::json!("did it"),
+            "witness-less stage settles ungated: {output}"
+        );
+        assert_eq!(
+            output["steps"]["k"]["body"],
+            serde_json::json!("did it"),
+            "stageless step settles ungated: {output}"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// A non-JSON output for a witnessed stage fails: a missing report is
+    /// never a pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_body_witness_missing_report_fails() {
+        let (store, db) = watch_test_store("witness-missing").await;
+        let wf = toron_workflow::schema::parse_workflow(
+            "name: witness-missing\nsteps:\n  - name: j\n    action: dispatch_job\n    assignee: x\n    spec: { task: hi, stage: s }\n    await: result\n    result_timeout: 60\n    on_error: fail_run\n",
+        )
+        .expect("parse dispatch await");
+        let (watcher, _queue) = queue_watcher(vec![
+            JobWatchOutcome::Claimed,
+            JobWatchOutcome::Settled(serde_json::json!("just a string")),
+        ]);
+        let seams = BodySeams {
+            leaf: LeafSeams {
+                async_runner: Some(receipt_runner()),
+                sync_runner: None,
+                verify_sink: toron_workflow::engine::VerifySink::default(),
+                journal_mode: toron_workflow::engine::EffectJournalMode::Recording,
+            },
+            launcher: None,
+            job_watcher: Some(watcher),
+            witness: Some(resolve_witness()),
+            clock: frozen_clock(),
+            spawn_resolver: None,
+            resolve_child: None,
+        };
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            drive(
+                &store,
+                "witness-missing-1",
+                &wf,
+                serde_json::json!({}),
+                &seams,
+            ),
+        )
+        .await
+        .expect("a missing report must fail fast");
+        let BodyOutcome::Failed { error, step } = outcome else {
+            panic!("a missing report never passes: {outcome:?}");
+        };
+        assert!(
+            error.contains("no machine-readable report"),
+            "refusal carries the report detail: {error}"
         );
         assert_eq!(step.as_deref(), Some("j"));
         let _ = std::fs::remove_file(&db);
@@ -1192,6 +1485,8 @@ mod tests {
             },
             launcher: None,
             job_watcher: None,
+            witness: None,
+            clock: Arc::new(unix_ms),
             spawn_resolver: None,
             resolve_child: Some(Arc::new(move |name: &str| {
                 (name == "child").then(|| child.clone())
@@ -1264,6 +1559,8 @@ mod tests {
             },
             launcher: None,
             job_watcher: None,
+            witness: None,
+            clock: Arc::new(unix_ms),
             spawn_resolver: None,
             resolve_child: None,
         };

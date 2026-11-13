@@ -727,6 +727,17 @@ impl StageLibrary {
         self.stages.get(name)
     }
 
+    /// Build the durable-body witness seam from this catalog: unknown
+    /// stages and witness-less stages yield None, so the step settles
+    /// unchanged; a declared witness runs `check_witness` on the output.
+    pub fn witness_checker(&self) -> crate::durable_body::WitnessCheck {
+        let stages = self.stages.clone();
+        std::sync::Arc::new(move |stage: &str, output: &serde_json::Value| {
+            let witness = stages.get(stage)?.witness.clone()?;
+            Some(crate::phase_contracts::check_witness(&witness, output))
+        })
+    }
+
     /// One `stage list --all` row: name + tier + the §3.8 metadata.
     pub fn list_tiered(&self) -> Vec<StageRow> {
         self.stages

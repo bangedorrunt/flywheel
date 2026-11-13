@@ -1519,11 +1519,11 @@ async fn drive_cron_body(
     let launcher = spawn_ctx.as_ref().map(|(cfg, project)| {
         cron_spawn_launcher(cfg.clone(), project.clone(), body.display.clone())
     });
-    // Watch on the same mailbox bus the job protocol lives on: the cron
-    // door builds its bodies from this handle, never a second connection.
-    // No built mailbox means no watcher — the WatchJob arm fails loud.
     let job_watcher = crate::mail::try_mailbox()
         .map(|mb| toron_workflow::engine::durable::bus_job_watcher(mb.bus().clone()));
+    let witness = crate::stages::StageLibrary::load()
+        .ok()
+        .map(|lib| lib.witness_checker());
     let seams = crate::durable_body::BodySeams {
         leaf: LeafSeams {
             async_runner: None,
@@ -1533,6 +1533,8 @@ async fn drive_cron_body(
         },
         launcher,
         job_watcher,
+        witness,
+        clock: std::sync::Arc::new(crate::durable_body::unix_ms),
         spawn_resolver: Some(crate::profile::ProfileCatalog::catalog_profile_resolver()),
         resolve_child: Some(std::sync::Arc::new(
             crate::workflow_catalog::subworkflow_resolver(None),

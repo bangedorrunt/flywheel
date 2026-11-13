@@ -2789,7 +2789,7 @@ steps:
     }
 
     /// `await: result` lints clean: bodies watch the job through the
-    /// injected watcher and settle like toron's host (bd-ge1zo slice 2a).
+    /// injected watcher and settle like toron's host.
     #[test]
     fn lint_accepts_dispatch_await_result() {
         let wf = parse_workflow(
