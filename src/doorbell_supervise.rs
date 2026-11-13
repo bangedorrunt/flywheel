@@ -491,6 +491,209 @@ mod tests {
         restore_path_and_clean(root, prev_path);
     }
 
+    /// bd-cf5kb sandbox e2e: a captain block bound by arrive in session B is
+    /// rung exactly once by the dispatcher that hosts session A, because the
+    /// arrival row is scoped to the project's hosting label and the block is
+    /// addressable across sessions. The same row scoped to session B is rung
+    /// zero times — the mutation that restores session-scoped arrive.
+    #[tokio::test]
+    async fn sandbox_captain_block_in_another_session_is_rung_once() {
+        use doorbell_rt::{
+            Actor, Brain, BrainConfig, BrainMsg, Budget, FileHost, FileHostConfig, FileStore,
+            Filter, Identity, NoTextSink, Scope, SinkKind, SinkManager, Subscription,
+            SubscriptionStore,
+        };
+
+        let _g = crate::config::lock_env();
+        // A rex CLI must resolve so the fake two-session backend is the
+        // selected plane; the host refuses a rex-row workspace on hc.
+        let _rex = crate::backend::rex_test_guard::RexBinGuard::install("#!/bin/sh\nexit 0\n");
+        let root = std::env::temp_dir().join(format!("fw-captain-wake-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let state = root.join("state");
+        let data = root.join("data");
+        let shim = root.join("bin");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&shim).unwrap();
+        let shim_log = root.join("shim.log");
+        for name in ["launchctl", "systemctl"] {
+            let path = shim.join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\necho \"$0 $*\" >> '{}'\nexit 1\n",
+                    shim_log.display()
+                ),
+            )
+            .unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+        // Fake two-session plane roster: the captain block lives in session B
+        // while the host/dispatcher owns session A (label flywheel-flywheel).
+        let plane = root.join("plane");
+        std::fs::write(
+            &plane,
+            r#"#!/bin/sh
+cat <<'JSON'
+{"result":{"agents":[{"pane_id":"block:01a1c323","agent_status":"idle","workspace_id":"adr-21-22-review","label":"SlateHarbor","tokens":{"toron_pin":"SlateHarbor"}}]}}
+JSON
+"#,
+        )
+        .unwrap();
+        {
+            let mut perms = std::fs::metadata(&plane).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+            std::fs::set_permissions(&plane, perms).unwrap();
+        }
+        let plane_bin = plane.display().to_string();
+
+        let prev_path = std::env::var_os("PATH");
+        let prev_backend = std::env::var_os("FLYWHEEL_BACKEND");
+        let prev_mcp_url = std::env::var_os("TORON_MCP_URL");
+        let prev_data_dir = std::env::var_os("TORON_MCP_DATA_DIR");
+        let prev_xdg = std::env::var_os("XDG_STATE_HOME");
+        let mut new_path = std::ffi::OsString::from(format!("{}:", shim.display()));
+        new_path.push(prev_path.clone().unwrap_or_default());
+        unsafe {
+            std::env::set_var("PATH", new_path);
+            std::env::set_var("FLYWHEEL_BACKEND", "rex");
+            std::env::remove_var("TORON_MCP_URL");
+            std::env::set_var("TORON_MCP_DATA_DIR", &data);
+            std::env::set_var("XDG_STATE_HOME", &state);
+        }
+
+        let project = "sandbox-proj";
+        let host_workspace = "flywheel-flywheel"; // session A: the dispatcher
+        let captain_session = "adr-21-22-review"; // session B: the captain block
+        let pin = "SlateHarbor";
+        let block = "block:01a1c323";
+        let reg_dir = state.join("agents");
+        std::fs::create_dir_all(&reg_dir).unwrap();
+        let reg_row = serde_json::json!([{
+            "pane_id": block,
+            "name": pin,
+            "mail_identity": pin,
+        }]);
+        let reg_path = reg_dir.join(format!("{project}.json"));
+        std::fs::write(&reg_path, serde_json::to_string(&reg_row).unwrap()).unwrap();
+        let mail_row = serde_json::json!({
+            "importance": "high",
+            "subject": "[bd-hlirm] done",
+            "created_ts_us": 1
+        });
+
+        let run_host = |scope_workspace: String| {
+            let state = state.clone();
+            let reg_path = reg_path.clone();
+            let plane_bin = plane_bin.clone();
+            let project = project.to_string();
+            let host_workspace = host_workspace.to_string();
+            let pin = pin.to_string();
+            let mail_row = mail_row.clone();
+            async move {
+                let mut store = SubscriptionStore::open(&state);
+                store
+                    .subscribe(
+                        Actor::local_process(),
+                        Subscription {
+                            id: format!("cli-{scope_workspace}-{pin}"),
+                            identity: Identity::Pin(pin.clone()),
+                            scope: Scope::One(scope_workspace.clone()),
+                            filter: Filter::default(),
+                            sink: SinkKind::Hc,
+                            budget: Budget::default_530(),
+                            project: Some(project.clone()),
+                            endpoint: None,
+                        },
+                        &scope_workspace,
+                    )
+                    .expect("arrival subscription");
+                let (tx, rx) = tokio::sync::mpsc::channel(doorbell_rt::BRAIN_CAP);
+                let mut fcfg =
+                    FileHostConfig::new(state.clone(), project.clone(), host_workspace.clone());
+                fcfg.registry_file = Some(reg_path);
+                fcfg.toron_bin = "true".into();
+                fcfg.plane_bin = plane_bin;
+                let host = FileHost::new(fcfg);
+                let mut sinks = SinkManager::new(tx.clone());
+                sinks.add_sink_with_factory("hc", Box::new(NoTextSink::new()), || {
+                    Box::new(NoTextSink::new())
+                });
+                let brain = Brain::new(
+                    BrainConfig::new(host_workspace.clone()),
+                    host,
+                    FileStore::new(&state),
+                    sinks,
+                );
+                let handle = tokio::spawn(async move { brain.run(rx).await });
+                tx.send(BrainMsg::Sweep { now: 1_700_000_000 })
+                    .await
+                    .unwrap();
+                tx.send(BrainMsg::PlaneStatus {
+                    pin: pin.clone(),
+                    status: "idle".to_string(),
+                })
+                .await
+                .unwrap();
+                tx.send(BrainMsg::Presence {
+                    pin: pin.clone(),
+                    state: "idle".to_string(),
+                })
+                .await
+                .unwrap();
+                tx.send(BrainMsg::InboxFetched {
+                    pin: pin.clone(),
+                    rows: vec![mail_row],
+                })
+                .await
+                .unwrap();
+                tx.send(BrainMsg::Shutdown).await.unwrap();
+                drop(tx);
+                handle.await.expect("brain joins");
+                std::fs::read_to_string(FileStore::new(&state).journal_file(&host_workspace))
+                    .unwrap_or_default()
+            }
+        };
+
+        let hosted = run_host(crate::doorbell::arrival_scope(host_workspace)).await;
+        assert!(
+            hosted.contains("\"Prompt\"") && hosted.contains(pin),
+            "the captain block in {captain_session} is rung by the {host_workspace} host, got:\n{hosted}"
+        );
+
+        assert!(
+            !shim_log.exists() || std::fs::read_to_string(&shim_log).unwrap().is_empty(),
+            "no supervisor tool was shelled"
+        );
+
+        unsafe {
+            match prev_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+            match prev_backend {
+                Some(v) => std::env::set_var("FLYWHEEL_BACKEND", v),
+                None => std::env::remove_var("FLYWHEEL_BACKEND"),
+            }
+            match prev_mcp_url {
+                Some(v) => std::env::set_var("TORON_MCP_URL", v),
+                None => std::env::remove_var("TORON_MCP_URL"),
+            }
+            match prev_data_dir {
+                Some(v) => std::env::set_var("TORON_MCP_DATA_DIR", v),
+                None => std::env::remove_var("TORON_MCP_DATA_DIR"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Sandbox host loop (wave11-b acceptance core): temp HOME/XDG, sandbox
     /// toron data dir, no live ports, no hc socket. An idle subscribed pin
     /// gets a kind-9 wake through the REAL Brain + FileHost; with no pane

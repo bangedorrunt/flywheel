@@ -372,14 +372,10 @@ impl FlywheelPorts {
             Some(p) => {
                 let bind = if backend_name != "hc" && !p.tokens.contains_key(TOKEN_PIN) {
                     let by_label = verify_rex_binding(p, host_session, pin, npub);
-                    // Verified, or the pane label already names this pin (or a pin-like
-                    // label): trust the label binding and skip rex-block re-verification.
-                    if by_label.verified
-                        || p.label.as_deref() == Some(pin)
-                        || p.label
-                            .as_deref()
-                            .is_some_and(|label| label != pin && looks_like_pin(label))
-                    {
+                    // A bound block outside this host's session is still the
+                    // captain's pane: the block id is the fact, and the plane
+                    // resolves it across sessions (bd-cf5kb).
+                    if by_label.verified {
                         by_label
                     } else if is_rex_block(&p.pane_id) {
                         verify_rex_block(p, pin, npub)
@@ -1350,7 +1346,10 @@ mod tests {
             "session:other",
         );
         assert_eq!(state, PaneState::Idle);
-        assert!(bind.is_some_and(|b| !b.verified));
+        assert!(
+            bind.is_some_and(|b| b.verified && b.verified_by == "rex-block"),
+            "a bound block outside the host session still verifies (bd-cf5kb)"
+        );
 
         let other = vec![listed_block("block:fake-1", "session:fake-1", "SomeOther")];
         let (_, bind) = FlywheelPorts::pane_observation(
@@ -1385,7 +1384,10 @@ mod tests {
             "superlogical",
             "",
         );
-        assert!(bind.is_some_and(|b| !b.verified));
+        assert!(
+            bind.is_some_and(|b| b.verified && b.verified_by == "rex-block"),
+            "a bound block with no host-session evidence is still addressable"
+        );
 
         let shell = vec![listed_block(
             "block:01a170b3",

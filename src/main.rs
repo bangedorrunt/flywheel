@@ -11412,36 +11412,6 @@ fn publish_presence_for_registry(
     }
 }
 
-/// The wake scope for this arriving pane (bd-ll2f2): its own rex session when
-/// the backend can resolve it, never the crew's label. Unknown/pull-only
-/// sessions keep the project's own label.
-fn arrival_scope(cfg: &Config, project: &str) -> String {
-    let default = swarm_label(project);
-    let rex = std::env::var("REX_BLOCK").ok();
-    let hc = std::env::var("HC_TERMINAL_ID").ok();
-    let Some(pane) =
-        crate::inbox_ports::arrive_pane_from_env(rex.as_deref(), hc.as_deref()).map(str::to_string)
-    else {
-        return default;
-    };
-    let Ok(backend) = crate::backend::multiplexer_backend(cfg) else {
-        return default;
-    };
-    let panes: Vec<(String, String)> = backend
-        .pane_list(None)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|p| (p.pane_id, p.workspace_id))
-        .collect();
-    let workspaces: Vec<(String, String)> = backend
-        .workspace_list()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|w| (w.workspace_id, w.label))
-        .collect();
-    doorbell::arrival_workspace(&default, &pane, &panes, &workspaces)
-}
-
 /// bd-gpj0: open-mode arrive can only be *pushed* if this pane is in the
 /// spawn registry. `HC_TERMINAL_ID` is the current hc terminal; bind it to
 /// the arriver pin. Without it, wakes stay digest-bound — say so loudly.
@@ -11706,7 +11676,7 @@ fn cmd_arrive(
         Err(e) => eprintln!("flywheel: doorbell start: {e:#}"),
     }
     if let Some(pin) = as_agent {
-        let workspace = arrival_scope(cfg, project);
+        let workspace = doorbell::arrival_scope(&swarm_label(project));
         doorbell::register_arrival_subscription(&config::state_dir(), project, &workspace, pin);
     }
     warn_uncommitted_decision_docs(cfg, project);

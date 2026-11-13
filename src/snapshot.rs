@@ -482,8 +482,14 @@ pub fn assemble_with_label(
         bind_pins_to_board(&mut pins, board, &|name| identities.get(name).cloned());
     }
 
-    let dispatcher =
-        crate::doorbell::dispatcher_token(&crate::config::state_dir(), ws_label).to_string();
+    let state_dir = crate::config::state_dir();
+    let token = crate::doorbell::dispatcher_token(&state_dir, ws_label);
+    let dispatcher = if token == "absent" {
+        crate::doorbell::dispatcher_token_for_project(&state_dir, project)
+    } else {
+        token
+    }
+    .to_string();
     let coalitions = list_active_coalitions(project, now);
     let joinable = fleet_joinable(&dispatcher, &pins);
 

@@ -723,24 +723,41 @@ pub fn register_workspace_subscriptions(
     }
 }
 
-/// The wake scope for an arriving pane: the label of the workspace (rex
-/// session) the pane actually lives in, never the caller's crew label. The
-/// agent captain's block is in a different rex session, and a row scoped to
-/// the crew's label can never ring it. Unresolvable panes fall back to
-/// `default` (the session's own project label).
-pub fn arrival_workspace(
-    default: &str,
-    pane_id: &str,
-    panes: &[(String, String)],
-    workspaces: &[(String, String)],
-) -> String {
-    panes
-        .iter()
-        .find(|(pane, _)| pane == pane_id)
-        .and_then(|(_, ws)| workspaces.iter().find(|(id, _)| id == ws))
-        .map(|(_, label)| label.trim().to_string())
-        .filter(|label| !label.is_empty())
-        .unwrap_or_else(|| default.to_string())
+/// The arrival subscription scope: the project's hosting label, never the
+/// arriving pane's own session. The one dispatcher for the project hosts this
+/// row and the plane resolves the bound block across sessions; a row scoped to
+/// a session no dispatcher hosts is silently deaf (bd-cf5kb).
+pub fn arrival_scope(hosting_label: &str) -> String {
+    hosting_label.to_string()
+}
+
+/// A dispatcher for the PROJECT, regardless of which workspace key its state
+/// record uses. The live host may key its record by a session id while callers
+/// read by label; a project match is the honest liveness answer.
+pub fn dispatcher_token_for_project(state_dir: &Path, project: &str) -> &'static str {
+    let dir = state_dir.join("doorbell");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return "absent";
+    };
+    let mut down = false;
+    for entry in entries.flatten() {
+        let Ok(raw) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(state) = serde_json::from_str::<DoorbellState>(&raw) else {
+            continue;
+        };
+        if state.project.as_deref() != Some(project) {
+            continue;
+        }
+        if state.pid.is_some_and(pid_alive) {
+            return "up";
+        }
+        if state.pid.is_some() {
+            down = true;
+        }
+    }
+    if down { "down" } else { "absent" }
 }
 
 /// Arrival registration (bd-kj2z): `arrive` records one operator row for
@@ -769,31 +786,42 @@ pub fn register_arrival_subscription(state_dir: &Path, project: &str, workspace:
     }
 }
 
-/// bd-ll2f2: the arriving pane's own session is the wake scope, not the
-/// caller's crew workspace. A block in another rex session rings there.
+/// bd-cf5kb: the arrival row is scoped to the project's hosting label, never
+/// the arriving pane's own session. The one dispatcher hosts it and the plane
+/// resolves the bound block across sessions.
 #[test]
-fn arrival_scope_follows_the_panes_session() {
-    let panes = vec![
-        ("block:cap".to_string(), "sess-captain".to_string()),
-        ("wP:p1".to_string(), "sess-crew".to_string()),
-    ];
-    let workspaces = vec![
-        ("sess-captain".to_string(), "slate-harbor".to_string()),
-        ("sess-crew".to_string(), "flywheel-flywheel".to_string()),
-    ];
-    assert_eq!(
-        arrival_workspace("flywheel-flywheel", "block:cap", &panes, &workspaces),
-        "slate-harbor"
+fn arrival_scope_is_the_hosting_label() {
+    assert_eq!(arrival_scope("flywheel-flywheel"), "flywheel-flywheel");
+    assert_ne!(
+        arrival_scope("flywheel-flywheel"),
+        "adr-21-22-review",
+        "a session-scoped row is hosted by nobody"
     );
+}
+
+/// bd-cf5kb: a dispatcher record keyed by any workspace/session still answers
+/// for its project, so arrive does not report absent while one runs.
+#[test]
+fn dispatcher_token_for_project_scans_session_keyed_records() {
+    let dir = std::env::temp_dir().join(format!("dbll-proj-token-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("doorbell")).unwrap();
+    write_state(
+        &state_file(&dir, "session:01a1d257"),
+        &DoorbellState {
+            pid: Some(std::process::id()),
+            project: Some("flywheel".to_string()),
+            generation: None,
+        },
+    )
+    .unwrap();
     assert_eq!(
-        arrival_workspace("flywheel-flywheel", "wP:p1", &panes, &workspaces),
-        "flywheel-flywheel"
+        dispatcher_token_for_project(&dir, "flywheel"),
+        "up",
+        "a session-keyed record for the project is a live dispatcher"
     );
-    assert_eq!(
-        arrival_workspace("flywheel-flywheel", "missing", &panes, &workspaces),
-        "flywheel-flywheel",
-        "an unresolved pane keeps the session's own label"
-    );
+    assert_eq!(dispatcher_token_for_project(&dir, "other"), "absent");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// bd-kj2z: arrival rows are idempotent per (workspace, pin) and carry
