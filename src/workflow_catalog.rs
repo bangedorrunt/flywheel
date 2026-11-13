@@ -656,16 +656,13 @@ pub fn shape_conforms(shape: Shape, wf: &Workflow) -> Result<(), String> {
     }
 }
 
-/// Thin lint edge over [`shape_conforms`]: resolve the declared shape for
-/// `name` across tiers and emit one blocking error on mismatch. Undeclared
-/// shapes pass (shapes are opt-in per workflow). Returns blocking count.
+/// Emit one blocking error when the declared shape does not conform; undeclared shapes pass.
 pub fn lint_shape(
     name: &str,
     wf: &Workflow,
-    project_root: Option<&Path>,
+    catalog: &WorkflowCatalog,
     emit: &dyn Fn(&str, &mut usize),
 ) -> usize {
-    let catalog = WorkflowCatalog::load_layered(project_root).unwrap_or_default();
     let mut blocking = 0;
     if let Some(shape) = catalog.shape(name) {
         if let Err(reason) = shape_conforms(shape, wf) {

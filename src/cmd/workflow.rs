@@ -418,9 +418,19 @@ fn cmd_workflow_evaluate(
 /// Used by brief + full list projections so family/selection/run/compose_token
 /// cannot drift between `--brief` and bare `list --json`.
 pub(crate) fn workflow_hybrid_fields(name: &str) -> (String, &'static str, &'static str, bool) {
-    let compose_token = crate::workflow_catalog::WorkflowCatalog::load_layered(None)
-        .unwrap_or_default()
-        .is_compose_token(name);
+    let catalog = crate::workflow_catalog::WorkflowCatalog::load_layered(None)
+        .unwrap_or_default();
+    workflow_hybrid_fields_in(name, &catalog)
+}
+
+/// Hybrid selection fields with an explicit catalog (see [`workflow_hybrid_fields`]).
+/// The caller builds the catalog once (e.g. per list command) and reuses it
+/// across rows, instead of loading per row.
+pub(crate) fn workflow_hybrid_fields_in(
+    name: &str,
+    catalog: &crate::workflow_catalog::WorkflowCatalog,
+) -> (String, &'static str, &'static str, bool) {
+    let compose_token = catalog.is_compose_token(name);
     let run = if compose_token {
         format!("workflow compose \"<objective>\" --parts {name} --run")
     } else {
@@ -438,8 +448,9 @@ pub(crate) fn workflow_list_brief_rows(
     all: &std::collections::BTreeMap<String, (toron_workflow::schema::Workflow, &'static str)>,
 ) -> Vec<serde_json::Value> {
     let mut rows: Vec<serde_json::Value> = Vec::new();
+    let catalog = crate::workflow_catalog::WorkflowCatalog::load_layered(None).unwrap_or_default();
     for (name, (_wf, _source)) in all {
-        let (run, family, selection, compose_token) = workflow_hybrid_fields(name);
+        let (run, family, selection, compose_token) = workflow_hybrid_fields_in(name, &catalog);
         rows.push(serde_json::json!({
             "name": name,
             "family": family,
@@ -460,8 +471,9 @@ pub(crate) fn workflow_list_full_rows(
 ) -> Vec<serde_json::Value> {
     use toron_workflow::schema::CrewSpec;
     let mut rows: Vec<serde_json::Value> = Vec::new();
+    let catalog = crate::workflow_catalog::WorkflowCatalog::load_layered(None).unwrap_or_default();
     for (name, (wf, source)) in all {
-        let (run, family, selection, compose_token) = workflow_hybrid_fields(name);
+        let (run, family, selection, compose_token) = workflow_hybrid_fields_in(name, &catalog);
         rows.push(serde_json::json!({
             "name": name,
             "description": wf.description,
@@ -2203,7 +2215,8 @@ pub(crate) fn lint_flywheel_tier(
     for issue in stage_reads_issues(name, wf, &stages) {
         emit(&issue, &mut blocking);
     }
-    blocking += crate::workflow_catalog::lint_shape(name, wf, project_root, &emit);
+    let wf_catalog = crate::workflow_catalog::WorkflowCatalog::load_layered(project_root).unwrap_or_default();
+    blocking += crate::workflow_catalog::lint_shape(name, wf, &wf_catalog, &emit);
     blocking
 }
 
