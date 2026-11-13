@@ -355,9 +355,22 @@ mod tests {
     #[test]
     fn plan_machine_blocked_patch_clean_resolve_approve_confirms() {
         let m = build_plan_machine();
-        let mut c = PlanContext::default();
-        c.needs_consent = vec![consent("s", "f", ConsentReason::Blocked)];
-        let ms = MachineState::at(PlanState::AwaitingConsent, c);
+        let ms = MachineState::at(PlanState::Drafting, PlanContext::default());
+        let out = m.step_state(
+            &ms,
+            &resolve_event(
+                vec![consent("s", "f", ConsentReason::Blocked)],
+                JevOutcome::Ok,
+            ),
+        );
+        assert_eq!(
+            out.configuration.primary(),
+            Some(&PlanState::AwaitingConsent)
+        );
+        let ms = MachineState::at(
+            out.configuration.primary().cloned().unwrap(),
+            out.context.clone(),
+        );
         let out = m.step_state(
             &ms,
             &PlanEvent::Patch {
@@ -365,10 +378,22 @@ mod tests {
             },
         );
         assert_eq!(out.configuration.primary(), Some(&PlanState::Drafting));
-        let ms = MachineState::at(PlanState::Drafting, out.context);
-        let out = m.step_state(&ms, &resolve_event(vec![], JevOutcome::Ok));
-        assert_eq!(out.configuration.primary(), Some(&PlanState::Confirmed));
-        let ms = MachineState::at(PlanState::AwaitingConsent, PlanContext::default());
+        let ms = MachineState::at(
+            out.configuration.primary().cloned().unwrap(),
+            out.context.clone(),
+        );
+        let out = m.step_state(
+            &ms,
+            &resolve_event(vec![consent("s", "f", ConsentReason::Jev)], JevOutcome::Ok),
+        );
+        assert_eq!(
+            out.configuration.primary(),
+            Some(&PlanState::AwaitingConsent)
+        );
+        let ms = MachineState::at(
+            out.configuration.primary().cloned().unwrap(),
+            out.context.clone(),
+        );
         let out = m.step_state(&ms, &PlanEvent::Approve);
         assert_eq!(out.configuration.primary(), Some(&PlanState::Confirmed));
     }
