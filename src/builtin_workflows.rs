@@ -1651,16 +1651,6 @@ pub fn builtin_workflows() -> BTreeMap<String, Workflow> {
     map
 }
 
-/// TEMPORARY migration shim (bd-compose-field-w4r01): delegates to the
-/// catalog's data-driven resolution so held-file call sites keep compiling
-/// until their lanes migrate. Same answer as the new path by construction.
-/// Deletes with the final commit — never keep a parallel match arm.
-pub fn is_compose_token(name: &str) -> bool {
-    crate::workflow_catalog::WorkflowCatalog::load_layered(None)
-        .unwrap_or_default()
-        .is_compose_token(name)
-}
-
 /// Compact agent-facing guidance for the built-in catalog:
 /// `(family, selection)`. The full workflow description remains available
 /// from `workflow show`; list consumers should use this bounded projection

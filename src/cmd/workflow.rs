@@ -418,7 +418,9 @@ fn cmd_workflow_evaluate(
 /// Used by brief + full list projections so family/selection/run/compose_token
 /// cannot drift between `--brief` and bare `list --json`.
 pub(crate) fn workflow_hybrid_fields(name: &str) -> (String, &'static str, &'static str, bool) {
-    let compose_token = crate::builtin_workflows::is_compose_token(name);
+    let compose_token = crate::workflow_catalog::WorkflowCatalog::load_layered(None)
+        .unwrap_or_default()
+        .is_compose_token(name);
     let run = if compose_token {
         format!("workflow compose \"<objective>\" --parts {name} --run")
     } else {
@@ -733,7 +735,11 @@ pub(crate) fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             let run_root = project_dir(cfg, project.as_deref().unwrap_or("flywheel"));
             let all = all_workflows_layered(Some(&run_root))?;
             let wf = resolve_workflow(name, &all)?.clone();
-            if *execute && crate::builtin_workflows::is_compose_token(name) {
+            if *execute
+                && crate::workflow_catalog::WorkflowCatalog::load_layered(Some(&run_root))
+                    .unwrap_or_default()
+                    .is_compose_token(name)
+            {
                 eprintln!(
                     "flywheel: deprecated: `workflow run {name} --execute` is the legacy alias; prefer `workflow compose \"<objective>\" --parts {name} --run`"
                 );
@@ -2189,6 +2195,7 @@ pub(crate) fn lint_flywheel_tier(
     for issue in stage_reads_issues(name, wf, &stages) {
         emit(&issue, &mut blocking);
     }
+    blocking += crate::workflow_catalog::lint_shape(name, wf, project_root, &emit);
     blocking
 }
 
