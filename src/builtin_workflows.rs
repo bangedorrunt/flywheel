@@ -1240,7 +1240,7 @@ steps:
     on_error: continue
   - name: execute_exit
     action: verify
-    command: 'LABEL="{{inputs.wave_label}}"; W="${LABEL#wave-}"; case "$W" in ""|*[!0-9]*) WN=null;; *) WN="$W";; esac; ROWS=$(br list --all --json | jq --argjson n "$WN" --arg label "$LABEL" "[.issues[] | select((.wave != null and .wave == \$n) or (.wave == null and ((.labels // []) | index(\$label))))]"); OPEN=$(echo "$ROWS" | jq -r "[.[] | select(.status != \"closed\") | .id] | join(\" \")"); if [ -n "$OPEN" ]; then echo "execute exit refused: wave $LABEL still open: $OPEN"; exit 1; fi; IDS=$(echo "$ROWS" | jq -r "[.[].id] | join(\" \")"); if [ -z "$IDS" ]; then echo "execute exit refused: wave $LABEL matched zero beads"; exit 1; fi; for id in $IDS; do flywheel ship check "$id" || exit 1; done'
+    command: 'LABEL="{{inputs.wave_label}}"; W="${LABEL#wave-}"; case "$W" in ""|*[!0-9]*) WN=null;; *) WN="$W";; esac; IDS_ALL=$(br list --all --json | jq -r ".issues[].id"); if [ -z "$IDS_ALL" ]; then echo "execute exit refused: wave $LABEL matched zero beads"; exit 1; fi; ROWS=$(echo "$IDS_ALL" | xargs br show --json | jq --argjson n "$WN" --arg label "$LABEL" "[.[] | select((.wave != null and .wave == \$n) or (.wave == null and ((.labels // []) | index(\$label))))]"); OPEN=$(echo "$ROWS" | jq -r "[.[] | select(.status != \"closed\") | .id] | join(\" \")"); if [ -n "$OPEN" ]; then echo "execute exit refused: wave $LABEL still open: $OPEN"; exit 1; fi; IDS=$(echo "$ROWS" | jq -r "[.[].id] | join(\" \")"); if [ -z "$IDS" ]; then echo "execute exit refused: wave $LABEL matched zero beads"; exit 1; fi; for id in $IDS; do flywheel ship check "$id" || exit 1; done'
     on_error: fail_run
   - name: observe
     action: dispatch_job
@@ -3282,6 +3282,10 @@ mod tests {
             "closed beads are members too (br list excludes them by default): {command}"
         );
         assert!(
+            command.contains("br show"),
+            "membership comes from br show, which projects the typed wave field: {command}"
+        );
+        assert!(
             command.contains(".wave"),
             "membership prefers the typed wave field: {command}"
         );
@@ -3325,7 +3329,7 @@ mod tests {
         );
         exe(
             "br",
-            "#!/bin/sh\nall=0\nfor a in \"$@\"; do [ \"$a\" = \"--all\" ] && all=1; done\njq --argjson all \"$all\" '[.issues[] | select($all == 1 or .status != \"closed\")] | {issues: .}' \"$BR_FIXTURE\"\n",
+            "#!/bin/sh\nif [ \"$1\" = \"list\" ]; then\n  all=0\n  for a in \"$@\"; do [ \"$a\" = \"--all\" ] && all=1; done\n  jq --argjson all \"$all\" '[.issues[] | select($all == 1 or .status != \"closed\") | del(.wave)] | {issues: .}' \"$BR_FIXTURE\"\n  exit $?\nfi\nif [ \"$1\" = \"show\" ]; then\n  shift\n  ids=\"\"\n  for a in \"$@\"; do case \"$a\" in --*) ;; *) ids=\"$ids,\\\"$a\\\"\";; esac; done\n  jq --argjson ids \"[${ids#,}]\" '[(if type == \"object\" then .issues else . end)[] | select(.id as $id | $ids | index($id))]' \"$BR_FIXTURE_ROWS\"\n  exit $?\nfi\necho \"fake br: unknown op $1\" >&2\nexit 2\n",
         );
         exe(
             "flywheel",
@@ -3334,6 +3338,8 @@ mod tests {
         let fixture = dir.join("fixture.json");
         let run = |fixture_json: &str, ship_fail: &str| -> std::process::Output {
             std::fs::write(&fixture, fixture_json).expect("fixture");
+            std::fs::write(fixture.with_extension("rows.json"), fixture_json)
+                .expect("rows fixture");
             let path = format!(
                 "{}:{}",
                 bin.display(),
@@ -3357,6 +3363,7 @@ mod tests {
                 .arg(&command)
                 .env("PATH", &path)
                 .env("BR_FIXTURE", &fixture)
+                .env("BR_FIXTURE_ROWS", fixture.with_extension("rows.json"))
                 .env("SHIP_FAIL_IDS", ship_fail)
                 .env_remove("HOME")
                 .output()
