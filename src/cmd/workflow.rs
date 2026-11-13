@@ -4,7 +4,7 @@ use clap::Subcommand;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::Arc;
@@ -418,8 +418,7 @@ fn cmd_workflow_evaluate(
 /// Used by brief + full list projections so family/selection/run/compose_token
 /// cannot drift between `--brief` and bare `list --json`.
 pub(crate) fn workflow_hybrid_fields(name: &str) -> (String, &'static str, &'static str, bool) {
-    let catalog = crate::workflow_catalog::WorkflowCatalog::load_layered(None)
-        .unwrap_or_default();
+    let catalog = crate::workflow_catalog::WorkflowCatalog::load_layered(None).unwrap_or_default();
     workflow_hybrid_fields_in(name, &catalog)
 }
 
@@ -1895,6 +1894,10 @@ struct WorkflowVerifyChartReport {
     checks: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     tla: Option<String>,
+    /// Slice A (bd-36zlq): layered-catalog tier of this row
+    /// (`builtin` | `user` | `project`). Hand-written charts carry none.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    tier: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     errors: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -1909,6 +1912,7 @@ fn chart_report<S: Ord + Clone + std::fmt::Debug>(
     goal: &str,
     is_goal: impl Fn(&S) -> bool,
     tla: Option<String>,
+    tier: Option<&str>,
     bounded_errors: &[String],
     bounded_warnings: &[String],
 ) -> WorkflowVerifyChartReport {
@@ -1941,6 +1945,7 @@ fn chart_report<S: Ord + Clone + std::fmt::Debug>(
             "bounded": { "ok": bounded_errors.is_empty(), "unbounded": bounded_errors },
         }),
         tla,
+        tier: tier.map(str::to_string),
         errors,
         warnings,
     }
@@ -1949,10 +1954,13 @@ fn chart_report<S: Ord + Clone + std::fmt::Debug>(
 /// One chart report for a catalog workflow: lower it, then run the same
 /// reachable/can-finish gates as the hand-written charts plus the bounded
 /// check. A workflow that fails to lower is a named error, not a panic.
-/// Catalog TLA export rides a later slice, so `tla` stays empty.
+/// `tier` is the layered-catalog tier (`builtin` | `user` | `project`);
+/// `--export-tla` emits the topology-only module (ADR-0021 D5.3).
 fn verify_catalog_workflow(
     name: &str,
     wf: &toron_workflow::schema::Workflow,
+    tier: &str,
+    export_tla: bool,
 ) -> WorkflowVerifyChartReport {
     match crate::workflow_lowering::lower(wf) {
         Err(e) => WorkflowVerifyChartReport {
@@ -1964,6 +1972,7 @@ fn verify_catalog_workflow(
                 "bounded": { "ok": false, "unbounded": [] },
             }),
             tla: None,
+            tier: Some(tier.to_string()),
             errors: vec![format!("{name}: failed to lower ({e:?})")],
             warnings: Vec::new(),
         },
@@ -1982,12 +1991,55 @@ fn verify_catalog_workflow(
                 &topo,
                 "a top-level final state",
                 is_final,
-                None,
+                export_tla.then(|| crate::workflow_lowering::tla_topology_module(&lowered, name)),
+                Some(tier),
                 &bounded_errors,
                 &bounded_warnings,
             )
         }
     }
+}
+
+/// Slice A (bd-36zlq): the tier of a merged catalog row. A file-tier copy
+/// shadows a builtin of the same name, so anything the layered catalog
+/// carries verifies as the file tier that wins at runtime — never builtin.
+fn catalog_tier(source: &str, name: &str, project_names: &BTreeSet<String>) -> &'static str {
+    if project_names.contains(name) {
+        "project"
+    } else if source == "catalog" {
+        "user"
+    } else {
+        "builtin"
+    }
+}
+
+/// Names declared by the project tier (`<root>/.flywheel/workflows/`), the
+/// set that shadows user and builtin rows at runtime. Unreadable entries
+/// read as absent — verify reports the lower tier instead of failing.
+fn project_workflow_names(root: &Path) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let entries = match std::fs::read_dir(root.join(".flywheel").join("workflows")) {
+        Ok(entries) => entries,
+        Err(_) => return out,
+    };
+    for path in entries.filter_map(|entry| entry.ok().map(|entry| entry.path())) {
+        let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+        let name = match ext {
+            "yaml" | "yml" => std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|raw| toron_workflow::schema::parse_workflow(&raw).ok())
+                .map(|wf| wf.name),
+            "toml" => std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|raw| toml::from_str::<toron_workflow::schema::Workflow>(&raw).ok())
+                .map(|wf| wf.name),
+            _ => None,
+        };
+        if let Some(name) = name {
+            out.insert(name);
+        }
+    }
+    out
 }
 
 fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> Result<()> {
@@ -2010,6 +2062,7 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
             "a final state",
             is_final,
             export_tla.then(|| machine.to_tla_named("SwarmLifecycle")),
+            None,
             &[],
             &[],
         )
@@ -2023,6 +2076,7 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
             "Idle",
             |state| *state == P2PNegotiationState::Idle,
             export_tla.then(|| machine.to_tla_named("P2PNegotiation")),
+            None,
             &[],
             &[],
         )
@@ -2042,23 +2096,42 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
     if want_all || matches!(want.as_str(), "p2p" | "p2p-negotiation" | "p2pnegotiation") {
         reports.push(verify_p2p(export_tla));
     }
-    // Catalog workflows (ADR-0021 D5.2, bd-lower-workflows-verify-9mdqc):
-    // one chart report per lowered workflow. A name argument matches one
-    // catalog workflow case-insensitively; without one, all rows verify.
-    let catalogs = crate::builtin_workflows::builtin_workflows();
+    // Catalog workflows (ADR-0021 D5.2 slice A, bd-36zlq): one chart report
+    // per lowered workflow from the layered catalog — builtins, then the
+    // user tier, then the project tier — so a file-tier copy verifies as
+    // the copy that wins at runtime. A name argument matches one catalog
+    // workflow case-insensitively; without one, all rows verify. The CLI
+    // loads the operator's real tiers; tests use `load_layered_with`.
+    let project_root = std::env::current_dir()
+        .ok()
+        .filter(|cwd| cwd.join(".flywheel").join("workflows").is_dir());
+    let merged = workflow_catalog::all_workflows_merged(project_root.as_deref())?;
+    let project_names = match project_root.as_deref() {
+        Some(root) => project_workflow_names(root),
+        None => BTreeSet::new(),
+    };
     if want_all {
-        for (n, wf) in &catalogs {
-            reports.push(verify_catalog_workflow(n, wf));
+        for (n, (wf, source)) in &merged {
+            reports.push(verify_catalog_workflow(
+                n,
+                wf,
+                catalog_tier(source, n, &project_names),
+                export_tla,
+            ));
         }
-    } else if let Some((n, wf)) = catalogs
-        .iter()
-        .find(|(k, _)| k.to_ascii_lowercase() == want)
+    } else if let Some((n, (wf, source))) =
+        merged.iter().find(|(k, _)| k.to_ascii_lowercase() == want)
     {
-        reports.push(verify_catalog_workflow(n, wf));
+        reports.push(verify_catalog_workflow(
+            n,
+            wf,
+            catalog_tier(source, n, &project_names),
+            export_tla,
+        ));
     }
     if reports.is_empty() {
         bail!(
-            "unknown statechart {} (expected SwarmLifecycle or P2PNegotiation)",
+            "unknown statechart {} (expected SwarmLifecycle, P2PNegotiation, or a workflow name)",
             name.unwrap_or("")
         );
     }
@@ -2290,7 +2363,8 @@ pub(crate) fn lint_flywheel_tier(
     for issue in stage_reads_issues(name, wf, &stages) {
         emit(&issue, &mut blocking);
     }
-    let wf_catalog = crate::workflow_catalog::WorkflowCatalog::load_layered(project_root).unwrap_or_default();
+    let wf_catalog =
+        crate::workflow_catalog::WorkflowCatalog::load_layered(project_root).unwrap_or_default();
     blocking += crate::workflow_catalog::lint_shape(name, wf, &wf_catalog, &emit);
     blocking
 }
@@ -2451,6 +2525,7 @@ mod workflow_verify_statechart_tests {
             "Done",
             |s| *s == Chart::Done,
             None,
+            None,
             &[],
             &[],
         );
@@ -2484,7 +2559,7 @@ mod workflow_cli_lint_tests {
     fn workflow_lowering_verify_row_reports_bounded_warnings() {
         let wfs = builtin_workflows::builtin_workflows();
         let wf = wfs.get("wave-swarm").expect("wave-swarm cataloged");
-        let report = verify_catalog_workflow("wave-swarm", wf);
+        let report = verify_catalog_workflow("wave-swarm", wf, "builtin", false);
         assert!(report.ok, "wave-swarm row stays ok: {:?}", report.errors);
         assert!(report.errors.is_empty());
         assert!(
@@ -2507,10 +2582,40 @@ mod workflow_cli_lint_tests {
         let wf = wfs
             .get("beads-lifecycle")
             .expect("beads-lifecycle cataloged");
-        let report = verify_catalog_workflow("beads-lifecycle", wf);
+        let report = verify_catalog_workflow("beads-lifecycle", wf, "builtin", false);
         assert!(report.ok, "{:?}", report.errors);
         assert!(report.errors.is_empty());
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    }
+
+    /// Slice A (bd-36zlq): a temp user-tier workflow with an unreachable
+    /// step shows up as a failing row with tier `user`.
+    #[test]
+    fn workflow_lowering_user_tier_unreachable_row_is_user() {
+        let dir = std::env::temp_dir().join(format!("fw-verify-tier-{}", std::process::id()));
+        let wf_dir = dir.join("workflows");
+        std::fs::create_dir_all(&wf_dir).expect("temp workflows dir");
+        std::fs::write(
+            wf_dir.join("stranded.yaml"),
+            "name: stranded\ntrigger:\n  type: webhook\ninputs: []\ngraph:\n  nodes:\n    a:\n      action: dispatch_job\n      assignee: x\n      spec: { profile: \"@coder\" }\n    c:\n      action: dispatch_job\n      assignee: x\n      spec: { profile: \"@coder\" }\n      needs: [zzz]\n",
+        )
+        .expect("temp workflow");
+        let cat = crate::workflow_catalog::WorkflowCatalog::load_layered_with(dir.clone(), None)
+            .expect("temp catalog loads");
+        let wf = cat
+            .workflows
+            .get("stranded")
+            .expect("temp workflow cataloged");
+        let tier = catalog_tier("catalog", "stranded", &std::collections::BTreeSet::new());
+        let report = verify_catalog_workflow("stranded", wf, tier, false);
+        assert!(!report.ok, "unreachable node fails the row");
+        assert!(
+            report.errors.iter().any(|e| e.contains('c')),
+            "names the stranded state: {:?}",
+            report.errors
+        );
+        assert_eq!(report.tier.as_deref(), Some("user"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A workflow that fails to lower is a named error, not a panic.
@@ -2525,7 +2630,7 @@ steps: []
 "#,
         )
         .expect("parse");
-        let report = verify_catalog_workflow("empty", &wf);
+        let report = verify_catalog_workflow("empty", &wf, "builtin", false);
         assert!(!report.ok);
         assert!(
             report

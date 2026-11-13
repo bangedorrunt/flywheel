@@ -37,6 +37,8 @@ pub enum BackEdgeKind {
 pub struct Lowered {
     pub machine: Machine<String, (), (), ()>,
     pub back_edges: Vec<BackEdge>,
+    /// Waiting states with no finite timeout.
+    pub unbounded_waits: Vec<String>,
 }
 
 /// Lowering failures: only workflows with no states at all.
@@ -106,6 +108,7 @@ struct LowerBuilder {
     edges: BTreeMap<String, Vec<String>>,
     parents: BTreeMap<String, String>,
     back_edges: Vec<BackEdge>,
+    unbounded_waits: Vec<String>,
     used: BTreeSet<String>,
     inputs: Vec<(String, Option<String>)>,
 }
@@ -117,6 +120,7 @@ impl LowerBuilder {
             edges: BTreeMap::new(),
             parents: BTreeMap::new(),
             back_edges: Vec::new(),
+            unbounded_waits: Vec::new(),
             used: [START, DONE, FAILED]
                 .iter()
                 .map(|s| s.to_string())
@@ -321,6 +325,22 @@ impl LowerBuilder {
                 self.parents.insert(c.clone(), here.to_string());
                 self.lower_action(&each.action, &c, exit, &each.on_error);
             }
+            Action::Park { until_ms, .. } => {
+                for e in exit {
+                    self.edge(here, e);
+                }
+                if self.resolve_max(until_ms).is_none() {
+                    self.unbounded_waits.push(here.to_string());
+                }
+            }
+            Action::RequestApproval { .. } => {
+                // No timeout field exists on request_approval in toron-workflow
+                // (only `message`): reported, not invented. Treat like any
+                // other step: it suspends, then control continues on approval.
+                for e in exit {
+                    self.edge(here, e);
+                }
+            }
             _ => {
                 for e in exit {
                     self.edge(here, e);
@@ -400,6 +420,7 @@ impl LowerBuilder {
         Ok(Lowered {
             machine: b.build(),
             back_edges: self.back_edges,
+            unbounded_waits: self.unbounded_waits,
         })
     }
 }
@@ -432,6 +453,9 @@ pub fn check_bounded(lowered: &Lowered) -> (Vec<String>, Vec<String>) {
                 b.from
             ));
         }
+    }
+    for w in &lowered.unbounded_waits {
+        errors.push(format!("unbounded wait at {w} (no finite timeout)"));
     }
     let topo = lowered.machine.topology();
     let mut visited = BTreeSet::new();
@@ -482,6 +506,19 @@ fn dfs_cycle(
     on_stack.remove(u);
 }
 
+/// Topology-only TLA+ export header (ADR-0021 D5.3): guards count as
+/// enabled and data is not modelled, so listed states are real defects
+/// and an empty report is not a proof; no model checker runs.
+pub const TLA_TOPOLOGY_HEADER: &str = "\\* Topology-only export: every guard counts as enabled and data is not modelled. No model checker runs. (ADR-0021 D5.3)";
+
+/// Render a topology-only TLA+ module for a lowered workflow.
+pub fn tla_topology_module(lowered: &Lowered, name: &str) -> String {
+    format!(
+        "{TLA_TOPOLOGY_HEADER}\n{}",
+        lowered.machine.to_tla_named(name)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,6 +527,82 @@ mod tests {
     fn lowered(yaml: &str) -> Lowered {
         let wf = parse_workflow(yaml).expect("fixture parses");
         lower(&wf).expect("fixture lowers")
+    }
+
+    /// A park step without a finite timeout fails exactly the bounded check.
+    #[test]
+    fn workflow_lowering_park_without_timeout_fails() {
+        let l = lowered(
+            r#"
+name: parked
+trigger:
+  type: webhook
+inputs: []
+steps:
+  - name: wait
+    action: park
+    until_ms: "{{inputs.missing}}"
+    max_wait_secs: 3600
+"#,
+        );
+        assert!(check_reachable(&l).is_empty());
+        assert!(check_can_finish(&l).is_empty());
+        let (errs, warns) = check_bounded(&l);
+        assert_eq!(errs.len(), 1, "one unbounded wait: {errs:?}");
+        assert!(errs[0].contains("wait"), "{errs:?}");
+        assert!(errs[0].contains("no finite timeout"), "{errs:?}");
+        assert!(warns.is_empty());
+    }
+
+    /// A park step with a finite timeout passes all three checks.
+    #[test]
+    fn workflow_lowering_park_with_timeout_passes() {
+        let l = lowered(
+            r#"
+name: parked
+trigger:
+  type: webhook
+inputs: []
+steps:
+  - name: wait
+    action: park
+    until_ms: "1893456000000"
+    max_wait_secs: 3600
+"#,
+        );
+        assert!(check_reachable(&l).is_empty());
+        assert!(check_can_finish(&l).is_empty());
+        let (errs, warns) = check_bounded(&l);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(warns.is_empty(), "{warns:?}");
+    }
+
+    /// The topology-only TLA export carries the D5.3 header and every state.
+    #[test]
+    fn workflow_lowering_tla_export_has_header_and_states() {
+        let l = lowered(
+            r#"
+name: tiny
+trigger:
+  type: webhook
+inputs: []
+steps:
+  - name: one
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@coder" }
+  - name: two
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@coder" }
+"#,
+        );
+        let tla = tla_topology_module(&l, "tiny");
+        assert!(tla.contains("Topology-only"), "header present");
+        assert!(tla.contains("No model checker"), "header present");
+        for s in ["Start", "one", "two", "Done"] {
+            assert!(tla.contains(s), "state {s} exported");
+        }
     }
 
     /// States no path from the initial state enters, by name.
@@ -583,6 +696,7 @@ steps:
         let l = Lowered {
             machine,
             back_edges: vec![],
+            unbounded_waits: vec![],
         };
         assert!(check_reachable(&l).is_empty());
         assert_eq!(check_can_finish(&l), vec!["a".to_string()]);
