@@ -103,8 +103,12 @@ if [ "$check_status" -ne 0 ]; then
 fi
 
 echo "clean-proof: workflow verify --json"
+# Hermetic catalog: the proof covers the export, never the operator's user-tier
+# workflows (an ambient override once reddened this gate).
+mkdir -p "$TMP/config"
 set +e
-"${MBX[@]}" run --quiet --bin flywheel -- workflow verify --json 2>&1 | tee "$TMP/workflow-verify.log"
+env XDG_CONFIG_HOME="$TMP/config" \
+  "${MBX[@]}" run --quiet --bin flywheel -- workflow verify --json 2>&1 | tee "$TMP/workflow-verify.log"
 verify_status=${PIPESTATUS[0]}
 set -e
 echo "$verify_status" >"$TMP/workflow-verify.status"
