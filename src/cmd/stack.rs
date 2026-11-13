@@ -12,8 +12,6 @@ use serde_json::{Value, json};
 use crate::config::Config;
 use crate::output::print_json;
 
-const DEFAULT_DOORBELL_URL: &str = "http://127.0.0.1:18980";
-
 #[derive(Subcommand)]
 pub(crate) enum StackCmd {
     /// Report installed binaries, live host generations, and toron build state.
@@ -162,8 +160,12 @@ fn is_live_pid(pid: u64) -> bool {
         .unwrap_or(false)
 }
 
-fn doorbell_url() -> String {
-    std::env::var("DOORBELL_URL").unwrap_or_else(|_| DEFAULT_DOORBELL_URL.into())
+/// Doorbell health-check target (ADR-0020): explicit `DOORBELL_URL` only.
+/// `None` skips the probe (embedded/supervise path). The retired
+/// `:18980` default is gone: toron `:18080` does not serve doorbell
+/// routes yet, so probing a default warned on every run.
+fn doorbell_url() -> Option<String> {
+    std::env::var("DOORBELL_URL").ok().filter(|s| !s.is_empty())
 }
 
 fn toron_status() -> (Option<Value>, Option<String>) {
@@ -209,11 +211,15 @@ fn stack_status(json_output: bool, check: bool) -> Result<()> {
         .path
         .as_deref()
         .and_then(crate::doorbell::binary_hash);
-    let health_result = crate::doorbell::daemon_health_probe(&doorbell_url());
-    let health = health_result.as_ref().ok().cloned();
+    let health_result = doorbell_url()
+        .as_deref()
+        .map(crate::doorbell::daemon_health_probe);
+    let health = health_result
+        .as_ref()
+        .and_then(|r| r.as_ref().ok().cloned());
     let health_error = health_result
         .as_ref()
-        .err()
+        .and_then(|r| r.as_ref().err())
         .map(|failure| failure.reason().to_string());
     let health_version = health
         .as_ref()

@@ -243,9 +243,9 @@ pub struct MailServerConfig {
 /// `[doorbell]` section (ADR-0012 D2): the plane-D daemon host.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DoorbellSection {
-    /// daemon base URL (default `http://127.0.0.1:18980` when the section
-    /// exists). The section's presence selects the daemon host; absence
-    /// selects embedded (with a 200ms loopback deference probe, D9).
+    /// daemon base URL (explicit only; ADR-0020 retired the `:18980`
+    /// default). Absent selects embedded with supervise (no health
+    /// probe); an explicit `url` is honored as the daemon host.
     pub url: Option<String>,
     /// arrival triple (bd-asr2.14, D5): presence + role auto-bind + join
     /// ring + roster headers. Default false — behavior extensions stay
@@ -343,10 +343,10 @@ pub struct Config {
     /// per-backend mail transport (ADR-0003 V3, bd-euav single-backend):
     /// `[mail.toron]` for the toron daemon
     pub mail: Option<MailSections>,
-    /// `[doorbell]` — doorbell plane-D daemon (ADR-0012 D2): `url` selects
-    /// the daemon host (default `http://127.0.0.1:18980` when the section
-    /// exists). Absent section → embedded in-process host, with a 200ms
-    /// loopback probe that still defers to a running daemon (D9).
+    /// `[doorbell]` — doorbell plane-D daemon (ADR-0020): explicit `url`
+    /// selects the daemon host. Absent `url` (even with the section
+    /// present) selects the embedded in-process host with supervise and
+    /// no health probe. Absent section → embedded as well.
     pub doorbell: Option<DoorbellSection>,
     /// short name -> hc agent kind (default: oc=opencode, pi=pi, gk=grok)
     pub kinds: Option<BTreeMap<String, String>>,
@@ -771,16 +771,15 @@ impl Config {
         }
     }
 
-    /// Effective doorbell host (ADR-0012 D1): `[doorbell] url`, defaulting
-    /// to `http://127.0.0.1:18980` when the section exists. `None` selects
-    /// embedded (D9 probe may still defer to a running daemon).
+    /// Effective doorbell host (ADR-0020): explicit `[doorbell] url` only.
+    /// No `url` means `None` (embedded/supervise path, no health probe);
+    /// an explicit `url` is still honored. The old `:18980` default is
+    /// retired: toron `:18080` does not serve doorbell routes yet (404),
+    /// so defaulting warned on every run for url-less sections.
     pub fn doorbell_url(&self) -> Option<String> {
-        self.doorbell.as_ref().map(|d| {
-            d.url
-                .clone()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "http://127.0.0.1:18980".to_string())
-        })
+        self.doorbell
+            .as_ref()
+            .and_then(|d| d.url.clone().filter(|s| !s.is_empty()))
     }
 
     /// Arrival triple flag (bd-asr2.14, D5): false unless opted in.
@@ -1253,11 +1252,21 @@ mod tests {
     }
 
     #[test]
-    fn doorbell_url_defaults_to_daemon_host() {
+    fn doorbell_url_explicit_url_only() {
         let c: Config = toml::from_str("[doorbell]").unwrap();
-        assert_eq!(c.doorbell_url().as_deref(), Some("http://127.0.0.1:18980"));
+        assert_eq!(c.doorbell_url(), None);
         let c: Config = toml::from_str("").unwrap();
         assert_eq!(c.doorbell_url(), None);
+        let c: Config = toml::from_str("[doorbell]\nurl = \"http://127.0.0.1:19999\"").unwrap();
+        assert_eq!(c.doorbell_url().as_deref(), Some("http://127.0.0.1:19999"));
+    }
+
+    #[test]
+    fn doorbell_url_section_without_url_is_none() {
+        let c: Config = toml::from_str("[doorbell]\nbeads_poller = false").unwrap();
+        assert_eq!(c.doorbell_url(), None);
+        let c: Config = toml::from_str("[doorbell]\nurl = \"http://127.0.0.1:19980\"").unwrap();
+        assert_eq!(c.doorbell_url().as_deref(), Some("http://127.0.0.1:19980"));
     }
 
     #[test]
