@@ -14,19 +14,31 @@ pub(crate) fn cmd_prefer(
     json: bool,
     project: Option<&str>,
 ) -> Result<()> {
-    cmd_prefer_at(&preferences_path(), assignment, list, forget, json, project)
+    cmd_prefer_at(
+        &preferences_path(),
+        &|msg| crate::cmd::memory::record_lesson(msg, Some("preference"), None),
+        assignment,
+        list,
+        forget,
+        json,
+        project,
+    )
+    .map(|_| ())
 }
 
-/// The same verb against an explicit store path — the seam CLI tests use
-/// so they never touch the process env or the operator's config.
+/// The same verb against an explicit store path with the lesson edge
+/// injected — the seam CLI tests use so they never touch the process env
+/// or the operator's config. Returns the lesson outcome for the set path;
+/// list and forget record nothing and return `None`.
 fn cmd_prefer_at(
     path: &std::path::Path,
+    record: &dyn Fn(&str) -> bool,
     assignment: Option<&str>,
     list: bool,
     forget: Option<&str>,
     json: bool,
     project: Option<&str>,
-) -> Result<()> {
+) -> Result<Option<bool>> {
     let modes = [assignment.is_some(), list, forget.is_some()]
         .into_iter()
         .filter(|b| *b)
@@ -51,7 +63,7 @@ fn cmd_prefer_at(
         } else {
             println!("forgot {key} ({scope})");
         }
-        return Ok(());
+        return Ok(None);
     }
     if list {
         let rows = set.list();
@@ -72,7 +84,7 @@ fn cmd_prefer_at(
                 println!("{}={} ({})", p.key, p.value, p.scope);
             }
         }
-        return Ok(());
+        return Ok(None);
     }
     let assignment = assignment.expect("assignment mode checked above");
     let (raw_key, value) = assignment.split_once('=').ok_or_else(|| {
@@ -91,12 +103,7 @@ fn cmd_prefer_at(
         .map(str::to_string);
     set.set(key.clone(), value.to_string(), scope.clone());
     set.save(path)?;
-    // D6 lesson: the preference persists even when Chie is unreachable.
-    let recorded = crate::cmd::memory::record_lesson(
-        &format!("operator prefers {key}={value} ({scope})"),
-        Some("preference"),
-        None,
-    );
+    let recorded = record(&format!("operator prefers {key}={value} ({scope})"));
     if !recorded {
         eprintln!(
             "flywheel: memory record unavailable (chie offline?) — preference kept, lesson not recorded"
@@ -112,13 +119,12 @@ fn cmd_prefer_at(
     } else {
         println!("preferred {key}={value} ({scope})");
     }
-    Ok(())
+    Ok(Some(recorded))
 }
 
 #[cfg(test)]
 mod prefer_cli_tests {
     use super::*;
-    use std::ffi::OsString;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static N: AtomicU64 = AtomicU64::new(0);
@@ -135,41 +141,13 @@ mod prefer_cli_tests {
         dir.join("preferences.toml")
     }
 
-    /// Fake the Chie edge via its existing binary override; restores on
-    /// drop. No test asserts on the lesson outcome, so a concurrent
-    /// swap is assertion-harmless — and no other suite reads this var.
-    struct ChieFake {
-        saved: Option<OsString>,
-    }
-
-    impl ChieFake {
-        fn new(bin: &str) -> Self {
-            let saved = std::env::var_os("FLYWHEEL_CHIE_BIN");
-            // SAFETY: prefer-scoped var; restored on drop.
-            unsafe { std::env::set_var("FLYWHEEL_CHIE_BIN", bin) };
-            Self { saved }
-        }
-    }
-
-    impl Drop for ChieFake {
-        fn drop(&mut self) {
-            // SAFETY: restores the pre-test value (or absence).
-            unsafe {
-                match self.saved.take() {
-                    Some(v) => std::env::set_var("FLYWHEEL_CHIE_BIN", v),
-                    None => std::env::remove_var("FLYWHEEL_CHIE_BIN"),
-                }
-            }
-        }
-    }
-
-    /// Set writes the file and lookup finds it, Chie faked present.
+    /// Set writes the file and lookup finds it; the lesson edge reports true.
     #[test]
     fn prefer_set_persists_and_lookup_finds_it() {
-        let _chie = ChieFake::new("/usr/bin/true");
         let path = store("set");
-        cmd_prefer_at(
+        let recorded = cmd_prefer_at(
             &path,
+            &|_| true,
             Some("reviewer.harness=grok"),
             false,
             None,
@@ -177,6 +155,7 @@ mod prefer_cli_tests {
             None,
         )
         .expect("set works");
+        assert_eq!(recorded, Some(true));
         let back = PreferenceSet::load(&path).expect("loads");
         assert_eq!(
             back.lookup("reviewer", crate::preferences::Field::Harness, None),
@@ -187,10 +166,10 @@ mod prefer_cli_tests {
     /// Project scope lands in the project tier and lists stably.
     #[test]
     fn prefer_set_project_scope_and_list() {
-        let _chie = ChieFake::new("/usr/bin/true");
         let path = store("proj");
-        cmd_prefer_at(
+        let recorded = cmd_prefer_at(
             &path,
+            &|_| true,
             Some("coder.model=zai/glm-5.3"),
             false,
             None,
@@ -198,7 +177,8 @@ mod prefer_cli_tests {
             Some("flywheel"),
         )
         .expect("project set works");
-        cmd_prefer_at(&path, None, true, None, true, None).expect("list works");
+        assert_eq!(recorded, Some(true));
+        cmd_prefer_at(&path, &|_| true, None, true, None, true, None).expect("list works");
         let back = PreferenceSet::load(&path).expect("loads");
         assert_eq!(
             back.lookup("coder", crate::preferences::Field::Model, Some("flywheel")),
@@ -213,11 +193,20 @@ mod prefer_cli_tests {
     /// Forget removes only the named scope.
     #[test]
     fn prefer_forget_removes_only_the_named_scope() {
-        let _chie = ChieFake::new("/usr/bin/true");
         let path = store("forget");
-        cmd_prefer_at(&path, Some("coder.model=a"), false, None, false, None).expect("set");
         cmd_prefer_at(
             &path,
+            &|_| true,
+            Some("coder.model=a"),
+            false,
+            None,
+            false,
+            None,
+        )
+        .expect("set");
+        cmd_prefer_at(
+            &path,
+            &|_| true,
             Some("coder.model=b"),
             false,
             None,
@@ -227,6 +216,7 @@ mod prefer_cli_tests {
         .expect("project set");
         cmd_prefer_at(
             &path,
+            &|_| true,
             None,
             false,
             Some("coder.model"),
@@ -240,7 +230,16 @@ mod prefer_cli_tests {
             Some("a"),
             "always row shows through"
         );
-        cmd_prefer_at(&path, None, false, Some("coder.model"), false, None).expect("forget");
+        cmd_prefer_at(
+            &path,
+            &|_| true,
+            None,
+            false,
+            Some("coder.model"),
+            false,
+            None,
+        )
+        .expect("forget");
         let back = PreferenceSet::load(&path).expect("loads");
         assert_eq!(
             back.lookup("coder", crate::preferences::Field::Model, Some("flywheel")),
@@ -251,10 +250,18 @@ mod prefer_cli_tests {
     /// A missing Chie warns but keeps the preference.
     #[test]
     fn prefer_set_keeps_preference_when_chie_missing() {
-        let _chie = ChieFake::new("/nonexistent-chie-binary");
         let path = store("offline");
-        cmd_prefer_at(&path, Some("coder.effort=high"), false, None, false, None)
-            .expect("set works offline");
+        let recorded = cmd_prefer_at(
+            &path,
+            &|_| false,
+            Some("coder.effort=high"),
+            false,
+            None,
+            false,
+            None,
+        )
+        .expect("set works offline");
+        assert_eq!(recorded, Some(false));
         let back = PreferenceSet::load(&path).expect("loads");
         assert_eq!(
             back.lookup("coder", crate::preferences::Field::Effort, None),
@@ -265,16 +272,48 @@ mod prefer_cli_tests {
     /// Bad assignments and empty invocations fail loud with usage.
     #[test]
     fn prefer_rejects_bad_assignment_and_empty_invocation() {
-        let _chie = ChieFake::new("/usr/bin/true");
         let path = store("bad");
-        cmd_prefer_at(&path, Some("reviewer.harness"), false, None, false, None)
-            .expect_err("missing = fails");
-        cmd_prefer_at(&path, Some("reviewer.bogus=x"), false, None, false, None)
-            .expect_err("unknown field fails");
-        cmd_prefer_at(&path, Some("reviewer.harness="), false, None, false, None)
-            .expect_err("empty value fails");
-        cmd_prefer_at(&path, None, false, None, false, None).expect_err("empty invocation fails");
-        cmd_prefer_at(&path, None, true, Some("coder.model"), false, None)
-            .expect_err("two modes fail");
+        cmd_prefer_at(
+            &path,
+            &|_| true,
+            Some("reviewer.harness"),
+            false,
+            None,
+            false,
+            None,
+        )
+        .expect_err("missing = fails");
+        cmd_prefer_at(
+            &path,
+            &|_| true,
+            Some("reviewer.bogus=x"),
+            false,
+            None,
+            false,
+            None,
+        )
+        .expect_err("unknown field fails");
+        cmd_prefer_at(
+            &path,
+            &|_| true,
+            Some("reviewer.harness="),
+            false,
+            None,
+            false,
+            None,
+        )
+        .expect_err("empty value fails");
+        cmd_prefer_at(&path, &|_| true, None, false, None, false, None)
+            .expect_err("empty invocation fails");
+        cmd_prefer_at(
+            &path,
+            &|_| true,
+            None,
+            true,
+            Some("coder.model"),
+            false,
+            None,
+        )
+        .expect_err("two modes fail");
     }
 }
