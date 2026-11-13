@@ -1,29 +1,15 @@
 //! Seat lifecycle statechart (ADR-0022 §3.2).
 //!
 //! One seat from launch to retirement. Pure fold; commands are descriptive
-//! only. Closed `SeatFailureKind` duplicates [`crate::failure::FailureKind`]
-//! vocabulary; unify in bd-gb4at.
+//! only. Reuses [`crate::failure::FailureKind`] for V6 (no new taxonomy).
 
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 use toron_core::kernel::{ActionQueue, Cmd as CmdTrait, Durability, Machine, StatechartDefinition};
 
+use crate::failure::FailureKind;
 use crate::seat_reconcile::SeatEffect;
-
-/// Closed failure taxonomy for V6 (toron ADR-0032 kinds).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
-pub enum SeatFailureKind {
-    Auth,
-    RateLimit,
-    Timeout,
-    Blocked,
-    Provider,
-    Cancelled,
-    Unknown,
-    Billing,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum SeatState {
@@ -40,14 +26,8 @@ pub enum SeatState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SeatEvent {
     Ready,
-    LaunchFailed {
-        kind: SeatFailureKind,
-        evidence: String,
-    },
-    Failed {
-        kind: SeatFailureKind,
-        evidence: String,
-    },
+    LaunchFailed { kind: FailureKind, evidence: String },
+    Failed { kind: FailureKind, evidence: String },
     Patch(SeatEffect),
     Retire,
     IdleTimeout,
@@ -59,9 +39,9 @@ pub enum SeatEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeatContext {
     pub pin: String,
-    pub hops_spent: BTreeSet<SeatFailureKind>,
+    pub hops_spent: BTreeSet<FailureKind>,
     pub model_by_env: bool,
-    pub last_failure: Option<(SeatFailureKind, String)>,
+    pub last_failure: Option<(FailureKind, String)>,
 }
 
 impl Default for SeatContext {
@@ -91,11 +71,11 @@ impl CmdTrait for SeatCmd {
     }
 }
 
-fn is_timeout_or_unknown(kind: SeatFailureKind) -> bool {
-    matches!(kind, SeatFailureKind::Timeout | SeatFailureKind::Unknown)
+fn is_timeout_or_unknown(kind: FailureKind) -> bool {
+    matches!(kind, FailureKind::Timeout | FailureKind::Unknown)
 }
 
-fn hop_allowed(ctx: &SeatContext, kind: SeatFailureKind, evidence: &str) -> bool {
+fn hop_allowed(ctx: &SeatContext, kind: FailureKind, evidence: &str) -> bool {
     !is_timeout_or_unknown(kind) && !evidence.trim().is_empty() && !ctx.hops_spent.contains(&kind)
 }
 
@@ -330,7 +310,7 @@ mod tests {
         }
     }
 
-    fn failed(kind: SeatFailureKind) -> SeatEvent {
+    fn failed(kind: FailureKind) -> SeatEvent {
         SeatEvent::Failed {
             kind,
             evidence: "boom".into(),
@@ -352,7 +332,7 @@ mod tests {
         let out = m.step_state(
             &ms,
             &SeatEvent::LaunchFailed {
-                kind: SeatFailureKind::Provider,
+                kind: FailureKind::Provider,
                 evidence: "x".into(),
             },
         );
@@ -363,7 +343,7 @@ mod tests {
     fn seat_machine_live_failed_goes_failing() {
         let m = build_seat_machine();
         let ms = MachineState::at(SeatState::Live, ctx("a", false));
-        let out = m.step_state(&ms, &failed(SeatFailureKind::Provider));
+        let out = m.step_state(&ms, &failed(FailureKind::Provider));
         assert_eq!(out.configuration.primary(), Some(&SeatState::Relaunching));
     }
 
@@ -397,11 +377,10 @@ mod tests {
             }),
         );
         assert_eq!(out.configuration.primary(), Some(&SeatState::Respawning));
-        assert!(
-            !out.commands
-                .iter()
-                .any(|c| matches!(c, SeatCmd::Relaunch { .. }))
-        );
+        assert!(!out
+            .commands
+            .iter()
+            .any(|c| matches!(c, SeatCmd::Relaunch { .. })));
         assert!(out.commands.iter().any(|c| matches!(
             c,
             SeatCmd::Respawn { pin } if pin == "a"
@@ -486,7 +465,7 @@ mod tests {
         let out = m.step_state(
             &ms,
             &SeatEvent::Failed {
-                kind: SeatFailureKind::Timeout,
+                kind: FailureKind::Timeout,
                 evidence: "t".into(),
             },
         );
@@ -501,7 +480,7 @@ mod tests {
         let out = m.step_state(
             &ms,
             &SeatEvent::Failed {
-                kind: SeatFailureKind::Unknown,
+                kind: FailureKind::Unknown,
                 evidence: "u".into(),
             },
         );
@@ -515,7 +494,7 @@ mod tests {
         let out = m.step_state(
             &ms,
             &SeatEvent::LaunchFailed {
-                kind: SeatFailureKind::Provider,
+                kind: FailureKind::Provider,
                 evidence: "  ".into(),
             },
         );
@@ -526,13 +505,13 @@ mod tests {
     fn seat_machine_failing_second_same_class_goes_dead() {
         let m = build_seat_machine();
         let ms = MachineState::at(SeatState::Live, ctx("a", false));
-        let out = m.step_state(&ms, &failed(SeatFailureKind::Provider));
+        let out = m.step_state(&ms, &failed(FailureKind::Provider));
         assert_eq!(out.configuration.primary(), Some(&SeatState::Relaunching));
         let ms = MachineState::at(SeatState::Relaunching, out.context);
         let out = m.step_state(&ms, &SeatEvent::Ready);
         assert_eq!(out.configuration.primary(), Some(&SeatState::Live));
         let ms = MachineState::at(SeatState::Live, out.context);
-        let out = m.step_state(&ms, &failed(SeatFailureKind::Provider));
+        let out = m.step_state(&ms, &failed(FailureKind::Provider));
         assert_eq!(out.configuration.primary(), Some(&SeatState::Dead));
     }
 
@@ -540,15 +519,15 @@ mod tests {
     fn seat_machine_failing_different_class_may_hop_once() {
         let m = build_seat_machine();
         let ms = MachineState::at(SeatState::Live, ctx("a", false));
-        let out = m.step_state(&ms, &failed(SeatFailureKind::RateLimit));
+        let out = m.step_state(&ms, &failed(FailureKind::RateLimit));
         assert_eq!(out.configuration.primary(), Some(&SeatState::Relaunching));
         let ms = MachineState::at(SeatState::Relaunching, out.context);
         let out = m.step_state(&ms, &SeatEvent::Ready);
         assert_eq!(out.configuration.primary(), Some(&SeatState::Live));
         let ms = MachineState::at(SeatState::Live, out.context);
-        let out = m.step_state(&ms, &failed(SeatFailureKind::Provider));
+        let out = m.step_state(&ms, &failed(FailureKind::Provider));
         assert_eq!(out.configuration.primary(), Some(&SeatState::Relaunching));
-        assert!(out.context.hops_spent.contains(&SeatFailureKind::Provider));
+        assert!(out.context.hops_spent.contains(&FailureKind::Provider));
     }
 
     #[test]
@@ -591,7 +570,7 @@ mod tests {
             let ms = MachineState::at(state, ctx("a", false));
             for event in [
                 SeatEvent::Ready,
-                failed(SeatFailureKind::Provider),
+                failed(FailureKind::Provider),
                 SeatEvent::Retire,
                 SeatEvent::IdleTimeout,
                 SeatEvent::Ack,
