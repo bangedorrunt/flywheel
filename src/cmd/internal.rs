@@ -4620,6 +4620,7 @@ mod headless_retry_tests {
                 fallback: Some("grok/grok-4.5".into()),
                 effort: Some("max".into()),
                 tier: None,
+                ..Default::default()
             },
         );
         reg.models.insert(
@@ -4631,6 +4632,7 @@ mod headless_retry_tests {
                 fallback: None,
                 effort: Some("max".into()),
                 tier: None,
+                ..Default::default()
             },
         );
         let fb = reg

@@ -237,6 +237,7 @@ pub(crate) fn cmd_models(cmd: &ModelCmd) -> Result<()> {
                     fallback: fallback.clone(),
                     effort: effort.clone(),
                     tier: tier_val,
+                    ..Default::default()
                 },
             );
             reg.save()?;

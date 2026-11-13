@@ -859,6 +859,56 @@ pub(crate) fn refuse_blocked(plan: &crate::swarm_plan::Plan) -> Result<(), Vec<S
     }
 }
 
+/// Resolve one seat's model ask into its plan field (ADR-0022 D4 phase
+/// 3a). The ask goes through `resolve_ask` (retirement, ambiguity, and
+/// registry membership); the flag then goes through the existing launch
+/// resolution so the delivery check sees exactly what would launch.
+/// Returns the field plus the launch flag, so the caller can reuse the
+/// flag for the effort delivery check without resolving twice.
+fn resolve_model_field(
+    registry: &models::ModelRegistry,
+    harness: &str,
+    ask: &str,
+    from: crate::swarm_plan::Provenance,
+    effort: Option<&str>,
+) -> (crate::swarm_plan::Field, String) {
+    use crate::models::{RegistryMembership, Resolution};
+    use crate::swarm_plan::{resolved_field, unresolved_field};
+    match registry.resolve_ask(ask, harness) {
+        Resolution::Resolved {
+            id,
+            registry: reg,
+            was,
+        } => {
+            let flag = registry.resolve(&id, harness);
+            let launch = crate::headless::interactive_model_plan(harness, &flag, effort);
+            let delivered =
+                launch.args().iter().any(|a| a == &flag) || launch.env_pin() == Some(flag.as_str());
+            let marker = match reg {
+                RegistryMembership::Registered => None,
+                RegistryMembership::Unregistered => Some("unregistered".to_string()),
+            };
+            (
+                resolved_field(harness, flag.clone(), from, delivered, marker, was),
+                flag,
+            )
+        }
+        Resolution::Ambiguous { ask, candidates } => {
+            let message = format!(
+                "ambiguous model `{ask}` — did you mean one of: {}",
+                candidates.join(", ")
+            );
+            (
+                unresolved_field(harness, &ask, from, message),
+                String::new(),
+            )
+        }
+        Resolution::Retired { ask, remedy } => {
+            (unresolved_field(harness, &ask, from, remedy), String::new())
+        }
+    }
+}
+
 pub(crate) fn build_dry_run_plan(
     cfg: &Config,
     items: &[crate::SpawnItem],
@@ -905,19 +955,22 @@ pub(crate) fn build_dry_run_plan(
                 } else {
                     format!("{bare_provider}/{bare_model}")
                 };
-                let resolved = registry.resolve(&lookup, &harness);
-                (harness, Some((resolved, Provenance::User)), None)
+                // Pass the raw ask: resolve_ask classifies it (unique /
+                // ambiguous / unregistered / retired); resolution to the
+                // launch flag happens inside resolve_model_field.
+                (harness, Some((lookup, Provenance::User)), None)
             }
         };
-        let launch = crate::headless::interactive_model_plan(
-            &harness,
-            model
-                .as_ref()
-                .map(|(value, _)| value.as_str())
-                .unwrap_or(""),
-            effort.as_ref().map(|(value, _)| value.as_str()),
-        );
-        let (model_field, effort_field) = seat_status(&harness, model, effort, &launch);
+        let effort_str = effort.as_ref().map(|(value, _)| value.as_str());
+        let (model_field, flag) = match model {
+            None => (None, String::new()),
+            Some((ask, from)) => {
+                let (field, flag) = resolve_model_field(registry, &harness, &ask, from, effort_str);
+                (Some(field), flag)
+            }
+        };
+        let launch = crate::headless::interactive_model_plan(&harness, &flag, effort_str);
+        let (_, effort_field) = seat_status(&harness, None, effort, &launch);
         // Spawn carries no mode/phase ask today: profiles name neither,
         // and stage contracts (the phase source) arrive with workflows.
         // Wired through the field fns so the values flow when a source
@@ -2770,10 +2823,10 @@ mod spawn_profile_plan_tests {
         );
         let mut ghost = profile("pi", "glm-5.2");
         ghost.provider = "qqq".into();
-        let err = profile_launch_args("pi", &ghost, None).expect_err("unknown provider");
-        assert!(
-            err.to_string().contains("qqq/glm-5.2"),
-            "error names the composite pair: {err}"
+        assert_eq!(
+            profile_launch_args("pi", &ghost, None).expect("unknown provider passes through"),
+            vec!["--model", "qqq/glm-5.2"],
+            "explicit unregistered pair launches verbatim"
         );
     }
 
@@ -3013,16 +3066,20 @@ mod spawn_profile_plan_tests {
         );
     }
 
+    /// ADR-0022 D4 phase 3a (bd-uivb4): the strictness split ends. An
+    /// unregistered explicit id passes through (the plan marks it
+    /// `registry: unregistered`); caps exclusion still refuses.
     #[test]
-    fn launch_args_fail_loud_on_unregistered_model() {
+    fn launch_args_unregistered_model_passes_through_marked() {
         let _g = lock_env();
         let dir = tempfile::TempDir::new().expect("temp dir");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
         let p = profile("omp", "totally-unknown-model");
-        let err = profile_launch_args("pi", &p, None).expect_err("unknown id must fail");
-        assert!(
-            err.to_string().contains("flywheel model add"),
-            "error names the fix: {err}"
+        let args = profile_launch_args("pi", &p, None).expect("unknown id passes through");
+        assert_eq!(
+            args,
+            vec!["--model", "totally-unknown-model"],
+            "unregistered id launches verbatim: {args:?}"
         );
         let bp = profile("pi", "big-pickle");
         let err = profile_launch_args("pi", &bp, None).expect_err("caps must refuse");
@@ -3039,7 +3096,11 @@ mod spawn_profile_plan_tests {
         );
         let mut role = profile("pi", "zai/glm-4.5-air");
         role.smol = "ghost-role".into();
-        assert!(profile_launch_args("pi", &role, None).is_err());
+        assert_eq!(
+            profile_launch_args("pi", &role, None).expect("unknown id passes through"),
+            vec!["--model", "zai/glm-4.5-air"],
+            "unregistered model launches verbatim (smol is advisory here)"
+        );
     }
 
     #[test]
@@ -3860,7 +3921,8 @@ mod workspace_origin_tests {
 
 #[cfg(test)]
 mod adr0013_spawn_effect_tests {
-    use super::refuse_blocked;
+    use super::{build_dry_run_plan, refuse_blocked, spawn_items_from_plan};
+    use crate::profile;
 
     /// Slice one top-level function body. Both needles carry a real newline so
     /// they can only match real code — never a test literal, which spells the
@@ -3920,11 +3982,15 @@ mod adr0013_spawn_effect_tests {
             status: crate::swarm_plan::FieldStatus::Blocked {
                 remedy: "pick another harness".into(),
             },
+            registry: None,
+            was: None,
         };
         let honored = crate::swarm_plan::Field {
             value: "x".into(),
             from: crate::swarm_plan::Provenance::Slot,
             status: crate::swarm_plan::FieldStatus::Honored,
+            registry: None,
+            was: None,
         };
         let mut plan = crate::swarm_plan::Plan::new("swarm");
         plan.seats.push(crate::swarm_plan::Seat {
@@ -3966,6 +4032,8 @@ mod adr0013_spawn_effect_tests {
                 value: "m".into(),
                 from: crate::swarm_plan::Provenance::User,
                 status: crate::swarm_plan::FieldStatus::Honored,
+                registry: None,
+                was: None,
             }),
             effort: None,
             mode: None,
@@ -3973,6 +4041,106 @@ mod adr0013_spawn_effect_tests {
             placement: "pane".to_string(),
         });
         assert!(refuse_blocked(&clean).is_ok());
+    }
+
+    /// ADR-0022 D4 phase 3a (bd-uivb4): the dry-run plan carries the
+    /// resolution. Ambiguous bare ask from the user blocks listing the
+    /// candidates; replaced ids resolve with from=replacement and was set.
+    #[test]
+    fn dry_run_resolution_marks_ambiguous_and_replaced() {
+        use std::collections::BTreeMap;
+        let mut models = BTreeMap::new();
+        for key in ["a/m", "b/m", "old/r", "new/r", "zai/ok"] {
+            models.insert(
+                key.to_string(),
+                crate::models::ModelEntry {
+                    caps: vec![],
+                    fallback: None,
+                    ..Default::default()
+                },
+            );
+        }
+        models.insert(
+            "old/r".to_string(),
+            crate::models::ModelEntry {
+                caps: vec![],
+                fallback: None,
+                replaced_by: Some("new/r".to_string()),
+                retired: false,
+                ..Default::default()
+            },
+        );
+        let reg = crate::models::ModelRegistry {
+            models,
+            slots: Default::default(),
+            user_keys: Default::default(),
+            defaults: None,
+        };
+        let cfg = crate::config::Config::default();
+        let catalog = profile::ProfileCatalog::default();
+        let items = spawn_items_from_plan(vec![("pi".to_string(), 1)], None);
+        let plan = build_dry_run_plan(&cfg, &items, &catalog, &reg, "m", "").expect("plan builds");
+        let f = plan.seats[0].model.as_ref().expect("model field");
+        match &f.status {
+            crate::swarm_plan::FieldStatus::Blocked { remedy } => {
+                assert!(
+                    remedy.contains("a/m") && remedy.contains("b/m"),
+                    "remedy lists candidates: {remedy}"
+                );
+            }
+            other => panic!("user ambiguity must block, got {other:?}"),
+        }
+        let plan =
+            build_dry_run_plan(&cfg, &items, &catalog, &reg, "old/r", "").expect("plan builds");
+        let f = plan.seats[0].model.as_ref().expect("model field");
+        assert_eq!(f.from, crate::swarm_plan::Provenance::Replacement);
+        assert_eq!(f.was.as_deref(), Some("old/r"));
+        assert_eq!(f.status, crate::swarm_plan::FieldStatus::Honored);
+    }
+
+    /// ADR-0022 D4 phase 3a (bd-uivb4): the same ambiguous ask from a
+    /// profile degrades instead of blocking.
+    #[test]
+    fn dry_run_ambiguous_from_profile_is_degraded() {
+        use std::collections::BTreeMap;
+        let mut models = BTreeMap::new();
+        for key in ["a/m", "b/m"] {
+            models.insert(
+                key.to_string(),
+                crate::models::ModelEntry {
+                    caps: vec![],
+                    fallback: None,
+                    ..Default::default()
+                },
+            );
+        }
+        let reg = crate::models::ModelRegistry {
+            models,
+            slots: Default::default(),
+            user_keys: Default::default(),
+            defaults: None,
+        };
+        let cfg = crate::config::Config::default();
+        let mut catalog = profile::ProfileCatalog::default();
+        catalog.profiles.insert(
+            "coder".to_string(),
+            crate::profile::Profile {
+                harness: "pi".into(),
+                model: "m".into(),
+                ..Default::default()
+            },
+        );
+        let items = spawn_items_from_plan(
+            Vec::new(),
+            Some(("coder", catalog.profiles.get("coder").unwrap(), 1)),
+        );
+        let plan = build_dry_run_plan(&cfg, &items, &catalog, &reg, "", "").expect("plan builds");
+        let f = plan.seats[0].model.as_ref().expect("model field");
+        assert!(
+            matches!(f.status, crate::swarm_plan::FieldStatus::Degraded { .. }),
+            "profile ambiguity degrades: {:?}",
+            f.status
+        );
     }
 
     /// I4: the spawn intent is committed before the workspace dispatch.

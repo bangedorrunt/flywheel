@@ -27,6 +27,9 @@ pub enum Provenance {
     Slot,
     Jev,
     HarnessDefault,
+    /// The value came from a `replaced_by` retirement hop; `Field.was`
+    /// carries the asked id.
+    Replacement,
 }
 
 /// Whether the harness will actually receive a requested field (D3).
@@ -44,6 +47,14 @@ pub struct Field {
     pub value: String,
     pub from: Provenance,
     pub status: FieldStatus,
+    /// Registry membership marker: `Some("unregistered")` when the ask
+    /// matched nothing; absent when registered. Serialized only when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry: Option<String>,
+    /// The asked id when `from` is `Replacement` (retirement hop).
+    /// Serialized only when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub was: Option<String>,
 }
 
 /// One seat of the plan: a role × count on one harness.
@@ -119,6 +130,8 @@ pub fn seat_status(
             status: field_status(delivered, from, harness, "model"),
             value,
             from,
+            registry: None,
+            was: None,
         }
     });
     let effort_field = effort.map(|(value, from)| {
@@ -127,6 +140,8 @@ pub fn seat_status(
             status: field_status(delivered, from, harness, "effort"),
             value,
             from,
+            registry: None,
+            was: None,
         }
     });
     (model_field, effort_field)
@@ -145,6 +160,8 @@ pub fn mode_field(harness: &str, mode: Option<(String, Provenance)>) -> Option<F
             status: field_status(delivered, from, harness, "mode"),
             value,
             from,
+            registry: None,
+            was: None,
         }
     })
 }
@@ -161,8 +178,58 @@ pub fn phase_field(harness: &str, phase: Option<(String, Provenance)>) -> Option
             status: field_status(delivered, from, harness, "phase"),
             value,
             from,
+            registry: None,
+            was: None,
         }
     })
+}
+
+/// A resolved model ask as a plan field: honored iff the launch will
+/// carry it, with `from` flipped to `Replacement` when a retirement hop
+/// produced the value, and `was` carrying the asked id.
+#[must_use]
+pub fn resolved_field(
+    harness: &str,
+    value: String,
+    from: Provenance,
+    delivered: bool,
+    registry: Option<String>,
+    was: Option<String>,
+) -> Field {
+    let from = if was.is_some() {
+        Provenance::Replacement
+    } else {
+        from
+    };
+    Field {
+        status: field_status(delivered, from, harness, "model"),
+        value,
+        from,
+        registry,
+        was,
+    }
+}
+
+/// An unresolvable model ask as a plan field (ambiguous or retired):
+/// carries the ask with the provenance split applied — `blocked` for
+/// user/preference asks, `degraded` otherwise.
+#[must_use]
+pub fn unresolved_field(_harness: &str, ask: &str, from: Provenance, message: String) -> Field {
+    let status = match from {
+        Provenance::User | Provenance::Preference => FieldStatus::Blocked {
+            remedy: message.clone(),
+        },
+        _ => FieldStatus::Degraded {
+            reason: message.clone(),
+        },
+    };
+    Field {
+        value: ask.to_string(),
+        from,
+        status,
+        registry: None,
+        was: None,
+    }
 }
 
 #[cfg(test)]
@@ -490,5 +557,80 @@ mod tests {
                 "false green on {harness}: stub honours what the adapter drops"
             );
         }
+    }
+
+    #[test]
+    fn replacement_shows_from_replacement_and_was() {
+        let f = resolved_field(
+            "pi",
+            "zai/glm-5.3".to_string(),
+            Provenance::User,
+            true,
+            None,
+            Some("old/glm".to_string()),
+        );
+        assert_eq!(f.from, Provenance::Replacement);
+        assert_eq!(f.was.as_deref(), Some("old/glm"));
+        assert_eq!(f.status, FieldStatus::Honored);
+    }
+
+    #[test]
+    fn unresolved_ambiguous_user_is_blocked_listing_candidates() {
+        let f = unresolved_field(
+            "pi",
+            "m",
+            Provenance::User,
+            "ambiguous model `m` — did you mean one of: a/m, b/m".to_string(),
+        );
+        assert_eq!(f.value, "m");
+        match f.status {
+            FieldStatus::Blocked { remedy } => {
+                assert!(remedy.contains("a/m") && remedy.contains("b/m"), "{remedy}");
+            }
+            other => panic!("user ambiguity must block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unresolved_from_profile_is_degraded() {
+        let f = unresolved_field(
+            "pi",
+            "m",
+            Provenance::Profile,
+            "ambiguous model `m`".to_string(),
+        );
+        assert!(
+            matches!(f.status, FieldStatus::Degraded { .. }),
+            "{:?}",
+            f.status
+        );
+    }
+
+    #[test]
+    fn field_registry_and_was_serialize_only_when_present() {
+        let bare = Field {
+            value: "x".into(),
+            from: Provenance::User,
+            status: FieldStatus::Honored,
+            registry: None,
+            was: None,
+        };
+        let v = serde_json::to_value(&bare).unwrap();
+        assert!(v.get("registry").is_none(), "{v}");
+        assert!(v.get("was").is_none(), "{v}");
+        let marked = Field {
+            value: "x".into(),
+            from: Provenance::HarnessDefault,
+            status: FieldStatus::Honored,
+            registry: Some("unregistered".to_string()),
+            was: Some("old".to_string()),
+        };
+        let v = serde_json::to_value(&marked).unwrap();
+        assert_eq!(v["registry"], "unregistered");
+        assert_eq!(v["was"], "old");
+        assert_eq!(
+            serde_json::to_value(Provenance::Replacement).unwrap(),
+            serde_json::json!("replacement")
+        );
     }
 }

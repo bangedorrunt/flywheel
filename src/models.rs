@@ -190,6 +190,14 @@ pub struct ModelEntry {
     /// absent = harness default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Replacement id this model retires into (ADR-0022 D4: retirement is
+    /// data). `resolve_ask` follows the chain and reports `was`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_by: Option<String>,
+    /// Retired with no replacement: `resolve_ask` refuses with a remedy
+    /// naming `flywheel model list` instead of resolving.
+    #[serde(default)]
+    pub retired: bool,
     /// Cost/purpose band (ADR-0007). Absent = unclassified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<Tier>,
@@ -234,6 +242,36 @@ pub struct ModelRegistry {
     /// by [`ModelRegistry::load_routing`]; `None` (or inactive) = legacy
     /// per-slot behavior.
     pub defaults: Option<DefaultsSpec>,
+}
+
+/// Registry membership of a resolved ask (ADR-0022 D4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistryMembership {
+    Registered,
+    Unregistered,
+}
+
+/// The answer of [`ModelRegistry::resolve_ask`] for one model ask.
+/// `Resolved` carries the registry key (or the verbatim ask when
+/// unregistered); `Ambiguous` lists every matching key sorted;
+/// `Retired` refuses with a remedy. There is no error variant: an
+/// unregistered ask passes through, and only caps enforcement (in the
+/// launch path) refuses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolution {
+    Resolved {
+        id: String,
+        registry: RegistryMembership,
+        was: Option<String>,
+    },
+    Ambiguous {
+        ask: String,
+        candidates: Vec<String>,
+    },
+    Retired {
+        ask: String,
+        remedy: String,
+    },
 }
 
 /// Where a rate-limited run retries: the registry `ModelEntry.fallback` rung
@@ -388,11 +426,109 @@ impl ModelRegistry {
         }
     }
 
-    /// Strict resolution for PROFILE-sourced model ids (ADR-0010 Spec D):
-    /// the id MUST be a registry entry — unknown ids and caps-excluded
-    /// harnesses without a fallback are errors naming the fix, never a
-    /// silent passthrough. Empty id resolves empty (the caller skips the
-    /// flag). Ad-hoc CLI `--model` strings keep the lenient `resolve()`.
+    /// Key-level routing mirroring [`ModelRegistry::resolve_inner`] but
+    /// returning the registry key instead of the harness flag form. Used
+    /// by [`ModelRegistry::resolve_ask`] so the plan names the identity
+    /// the launch path will route to.
+    fn route_key(&self, key: &str, harness: &str, visited: &mut BTreeSet<String>) -> String {
+        match self.models.get(key) {
+            Some(entry) if entry.caps.is_empty() || entry.caps.iter().any(|c| c == harness) => {
+                key.to_string()
+            }
+            Some(entry) => match &entry.fallback {
+                Some(fb) if visited.insert(fb.clone()) => self.route_key(fb, harness, visited),
+                _ => key.to_string(),
+            },
+            None => key.to_string(),
+        }
+    }
+
+    /// One resolver for a model ask (ADR-0022 D4: "resolve generously,
+    /// refuse precisely"). Used by both spawn paths.
+    ///
+    /// Rules, in order: an explicit `provider/model` resolves (registered
+    /// or verbatim); a bare name resolves when exactly one registered key
+    /// ends in `/<name>` (two or more is `Ambiguous`); retirement data
+    /// wins over routing (`replaced_by` chains to the end reporting `was`,
+    /// `retired` with no replacement refuses). Caps/fallback routing stays
+    /// as [`ModelRegistry::resolve`] does today; unknown ids pass through
+    /// verbatim marked `Unregistered` (the plan marks them, the spawn
+    /// refuses only on caps, never on registry membership).
+    #[must_use]
+    pub fn resolve_ask(&self, ask: &str, harness: &str) -> Resolution {
+        let key: Option<String> = if ask.contains('/') {
+            if self.models.contains_key(ask) {
+                Some(ask.to_string())
+            } else {
+                None
+            }
+        } else {
+            let mut hits: Vec<&String> = self
+                .models
+                .keys()
+                .filter(|k| k.as_str() == ask || split_key(k).1 == ask)
+                .collect();
+            hits.sort();
+            match hits.len() {
+                0 => None,
+                1 => Some(hits[0].clone()),
+                _ => {
+                    return Resolution::Ambiguous {
+                        ask: ask.to_string(),
+                        candidates: hits.into_iter().cloned().collect(),
+                    };
+                }
+            }
+        };
+        let Some(key) = key else {
+            return Resolution::Resolved {
+                id: ask.to_string(),
+                registry: RegistryMembership::Unregistered,
+                was: None,
+            };
+        };
+        let mut cur = key;
+        let mut was: Option<String> = None;
+        let mut visited = BTreeSet::new();
+        visited.insert(cur.clone());
+        while let Some(next) = self.models.get(&cur).and_then(|e| e.replaced_by.clone()) {
+            if !visited.insert(next.clone()) {
+                break;
+            }
+            cur = next;
+            was = Some(ask.to_string());
+            if !self.models.contains_key(&cur) {
+                return Resolution::Resolved {
+                    id: cur,
+                    registry: RegistryMembership::Unregistered,
+                    was,
+                };
+            }
+        }
+        if self.models.get(&cur).is_some_and(|e| e.retired) {
+            return Resolution::Retired {
+                ask: ask.to_string(),
+                remedy: format!(
+                    "`{ask}` is retired with no replacement — see `flywheel model list` for current ids"
+                ),
+            };
+        }
+        let mut routed_visited = BTreeSet::new();
+        let routed = self.route_key(&cur, harness, &mut routed_visited);
+        Resolution::Resolved {
+            id: routed,
+            registry: RegistryMembership::Registered,
+            was,
+        }
+    }
+
+    /// Strict routing for PROFILE-sourced and bare model ids (ADR-0022 D4
+    /// phase 3a): the strictness split ends. Unknown ids pass through
+    /// verbatim (the plan marks them `registry: unregistered`); a
+    /// caps-excluded harness with no fallback is still an error naming
+    /// the incompatibility — that is real, not strictness. Empty id
+    /// resolves empty (the caller skips the flag). Ad-hoc CLI `--model`
+    /// strings keep the lenient `resolve()`.
     pub fn resolve_strict(&self, id: &str, harness: &str) -> Result<String> {
         let mut visited = BTreeSet::new();
         self.resolve_strict_inner(id, harness, &mut visited)
@@ -430,11 +566,7 @@ impl ModelRegistry {
                     }
                 }
             }
-            None => anyhow::bail!(
-                "model '{id}' is not in the registry — add it first: \
-                 `flywheel model add {id} --provider <provider>` \
-                 (profile models route ONLY through the registry)"
-            ),
+            None => Ok(id.to_string()),
         }
     }
 
@@ -980,6 +1112,8 @@ mod tests {
             fallback: None,
             effort: None,
             tier: None,
+            replaced_by: None,
+            retired: false,
         }
     }
 
@@ -1037,6 +1171,8 @@ mod tests {
             fallback: Some("grok/grok-4.5".into()),
             effort: Some("high".into()),
             tier: None,
+            replaced_by: None,
+            retired: false,
         };
         assert_eq!(e.effort.as_deref(), Some("high"));
         assert_eq!(e.fallback.as_deref(), Some("grok/grok-4.5"));
@@ -1085,6 +1221,8 @@ mod tests {
                 fallback: Some("anthropic/claude-opus-4".into()),
                 effort: None,
                 tier: None,
+                replaced_by: None,
+                retired: false,
             },
         );
         reg.models.insert(
@@ -1096,6 +1234,8 @@ mod tests {
                 fallback: None,
                 effort: None,
                 tier: None,
+                replaced_by: None,
+                retired: false,
             },
         );
         assert_eq!(
@@ -1124,6 +1264,8 @@ mod tests {
                 fallback: None,
                 effort: None,
                 tier: None,
+                replaced_by: None,
+                retired: false,
             },
         );
         assert_eq!(
@@ -1408,11 +1550,164 @@ mod tests {
         );
     }
 
-    /// Strict resolution: profile-sourced models MUST be registry ids.
-    /// Unknown id, or a caps-excluded harness with no fallback, is an
-    /// error naming the fix — never a silent passthrough.
+    /// ADR-0022 D4 phase 3a (bd-uivb4): one resolver for a model ask.
+    /// In-memory registries, no ambient config.
+    fn reg_resolve(entries: &[(&str, ModelEntry)]) -> ModelRegistry {
+        ModelRegistry {
+            models: entries
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn entry_with(
+        caps: &[&str],
+        fallback: Option<&str>,
+        replaced_by: Option<&str>,
+        retired: bool,
+    ) -> ModelEntry {
+        ModelEntry {
+            caps: caps.iter().map(|s| s.to_string()).collect(),
+            fallback: fallback.map(str::to_string),
+            replaced_by: replaced_by.map(str::to_string),
+            retired,
+            ..ModelEntry::default()
+        }
+    }
+
     #[test]
-    fn resolve_strict_fails_unknown_and_caps_excluded() {
+    fn resolve_ask_bare_unique_resolves_registered() {
+        let reg = reg_resolve(&[
+            ("zai/glm-5.3", entry_with(&[], None, None, false)),
+            ("other/x", entry_with(&[], None, None, false)),
+        ]);
+        assert_eq!(
+            reg.resolve_ask("glm-5.3", "pi"),
+            Resolution::Resolved {
+                id: "zai/glm-5.3".into(),
+                registry: RegistryMembership::Registered,
+                was: None,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_ask_bare_two_matches_is_ambiguous() {
+        let reg = reg_resolve(&[
+            ("b/m", entry_with(&[], None, None, false)),
+            ("a/m", entry_with(&[], None, None, false)),
+        ]);
+        assert_eq!(
+            reg.resolve_ask("m", "pi"),
+            Resolution::Ambiguous {
+                ask: "m".into(),
+                candidates: vec!["a/m".into(), "b/m".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_ask_bare_unknown_passes_through_unregistered() {
+        let reg = reg_resolve(&[("zai/x", entry_with(&[], None, None, false))]);
+        assert_eq!(
+            reg.resolve_ask("nope", "pi"),
+            Resolution::Resolved {
+                id: "nope".into(),
+                registry: RegistryMembership::Unregistered,
+                was: None,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_ask_explicit_unregistered_passes_through() {
+        let reg = reg_resolve(&[("zai/x", entry_with(&[], None, None, false))]);
+        assert_eq!(
+            reg.resolve_ask("zz/top", "pi"),
+            Resolution::Resolved {
+                id: "zz/top".into(),
+                registry: RegistryMembership::Unregistered,
+                was: None,
+            }
+        );
+        assert_eq!(
+            reg.resolve_ask("zai/x", "pi"),
+            Resolution::Resolved {
+                id: "zai/x".into(),
+                registry: RegistryMembership::Registered,
+                was: None,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_ask_replaced_by_resolves_with_was() {
+        let reg = reg_resolve(&[
+            ("old/m", entry_with(&[], None, Some("new/m"), false)),
+            ("new/m", entry_with(&[], None, None, false)),
+        ]);
+        assert_eq!(
+            reg.resolve_ask("old/m", "pi"),
+            Resolution::Resolved {
+                id: "new/m".into(),
+                registry: RegistryMembership::Registered,
+                was: Some("old/m".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_ask_two_hop_chain_resolves_to_the_end() {
+        let reg = reg_resolve(&[
+            ("a/m", entry_with(&[], None, Some("b/m"), false)),
+            ("b/m", entry_with(&[], None, Some("c/m"), false)),
+            ("c/m", entry_with(&[], None, None, false)),
+        ]);
+        assert_eq!(
+            reg.resolve_ask("a/m", "pi"),
+            Resolution::Resolved {
+                id: "c/m".into(),
+                registry: RegistryMembership::Registered,
+                was: Some("a/m".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_ask_cycle_terminates() {
+        let reg = reg_resolve(&[
+            ("a/m", entry_with(&[], None, Some("b/m"), false)),
+            ("b/m", entry_with(&[], None, Some("a/m"), false)),
+        ]);
+        match reg.resolve_ask("a/m", "pi") {
+            Resolution::Resolved { id, was, .. } => {
+                assert!(!id.is_empty());
+                assert_eq!(was, Some("a/m".into()));
+            }
+            other => panic!("cycle must terminate resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_ask_retired_without_replacement_is_retired() {
+        let reg = reg_resolve(&[("old/m", entry_with(&[], None, None, true))]);
+        match reg.resolve_ask("old/m", "pi") {
+            Resolution::Retired { ask, remedy } => {
+                assert_eq!(ask, "old/m");
+                assert!(remedy.contains("flywheel model list"), "{remedy}");
+            }
+            other => panic!("retired id must not resolve, got {other:?}"),
+        }
+    }
+
+    /// Strict resolution, ADR-0022 D4 phase 3a (bd-uivb4): the strictness
+    /// split ends. Unknown ids pass through (the plan marks them
+    /// unregistered); a caps-excluded harness with no fallback is still an
+    /// error naming the incompatibility.
+    #[test]
+    fn resolve_strict_passes_unknown_still_refuses_caps_excluded() {
         let _g = with_config_dir();
         let path = crate::config::config_dir().join("models.toml");
         let _ = fs::remove_file(&path);
@@ -1424,12 +1719,10 @@ mod tests {
                 .expect("known ok"),
             "opencode-go/deepseek-v4.1-flash"
         );
-        let err = reg
-            .resolve_strict("no-such-model", "omp")
-            .expect_err("unknown id must fail");
-        assert!(
-            err.to_string().contains("flywheel model add"),
-            "error names the fix: {err}"
+        assert_eq!(
+            reg.resolve_strict("no-such-model", "omp")
+                .expect("unknown passes through"),
+            "no-such-model"
         );
         let err = reg
             .resolve_strict("big-pickle", "omp")
@@ -1469,7 +1762,12 @@ mod tests {
         )
         .expect("rewrite");
         let reg = ModelRegistry::load_routing().expect("reg");
-        assert!(reg.resolve_strict("flagship", "opencode").is_err());
+        assert_eq!(
+            reg.resolve_strict("flagship", "opencode")
+                .expect("fallback to unregistered passes through"),
+            "ghost",
+            "caps-excluded -> unregistered fallback passes through (D4: never block on registry membership)"
+        );
     }
 
     /// Composite lookup hits exactly; a bare model id falls back to the
@@ -1533,15 +1831,15 @@ mod tests {
         assert!(chain.contains("cycle"), "{chain}");
     }
 
+    /// ADR-0022 D4 phase 3a (bd-uivb4): the strictness split ends. An
+    /// explicit id with an unknown provider passes through verbatim.
     #[test]
-    fn resolve_strict_fails_unknown_provider() {
+    fn resolve_strict_unknown_provider_passes_through() {
         let reg = reg_with_keys(&["deepseek/deepseek-v4"]);
-        let err = reg
-            .resolve_strict("ghost/deepseek-v4", "omp")
-            .expect_err("unknown provider must fail");
-        assert!(
-            err.to_string().contains("flywheel model add"),
-            "error names the fix: {err}"
+        assert_eq!(
+            reg.resolve_strict("ghost/deepseek-v4", "omp")
+                .expect("unknown provider passes through"),
+            "ghost/deepseek-v4"
         );
     }
 
