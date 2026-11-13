@@ -240,6 +240,31 @@ pub struct DoorbellState {
     pub generation: Option<WatcherGen>,
 }
 
+/// Canonical dispatcher key for `ws`: the live session id when `ws` names
+/// this workspace by its label, else `ws` itself. One workspace, one key,
+/// one door (bd-g9hqu) — the label and its id are the same host.
+pub fn canonical_workspace<'a>(ws: &'a str, live_label: &str, live_id: &'a str) -> &'a str {
+    if !live_id.is_empty() && (live_label.is_empty() || live_label == ws) {
+        live_id
+    } else {
+        ws
+    }
+}
+
+/// `workspaces` collapsed to their canonical dispatcher keys, order kept,
+/// first occurrence wins. Every register/start/stop/heal/report path folds
+/// through this so a label and its session id never act as two workspaces.
+pub fn canonical_workspaces(workspaces: &[String], live_label: &str, live_id: &str) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for ws in workspaces {
+        let key = canonical_workspace(ws, live_label, live_id).to_string();
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
 /// `<workspace>.state.json`, beside the legacy pid/gen/project sidecars.
 pub fn state_file(state_dir: &Path, workspace: &str) -> PathBuf {
     doorbell_rt::lease::state_file(state_dir, workspace)
@@ -698,6 +723,26 @@ pub fn register_workspace_subscriptions(
     }
 }
 
+/// The wake scope for an arriving pane: the label of the workspace (rex
+/// session) the pane actually lives in, never the caller's crew label. The
+/// agent captain's block is in a different rex session, and a row scoped to
+/// the crew's label can never ring it. Unresolvable panes fall back to
+/// `default` (the session's own project label).
+pub fn arrival_workspace(
+    default: &str,
+    pane_id: &str,
+    panes: &[(String, String)],
+    workspaces: &[(String, String)],
+) -> String {
+    panes
+        .iter()
+        .find(|(pane, _)| pane == pane_id)
+        .and_then(|(_, ws)| workspaces.iter().find(|(id, _)| id == ws))
+        .map(|(_, label)| label.trim().to_string())
+        .filter(|label| !label.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
 /// Arrival registration (bd-kj2z): `arrive` records one operator row for
 /// the arriving pin so zero-fleet sessions get woken with no babysitting —
 /// the daemon auto-hosts the named pair within 60s. Idempotent per
@@ -722,6 +767,33 @@ pub fn register_arrival_subscription(state_dir: &Path, project: &str, workspace:
     if let Err(e) = store.subscribe(Actor::local_process(), sub, workspace) {
         eprintln!("flywheel: cannot record arrival wake subscription for {pin}: {e:?}");
     }
+}
+
+/// bd-ll2f2: the arriving pane's own session is the wake scope, not the
+/// caller's crew workspace. A block in another rex session rings there.
+#[test]
+fn arrival_scope_follows_the_panes_session() {
+    let panes = vec![
+        ("block:cap".to_string(), "sess-captain".to_string()),
+        ("wP:p1".to_string(), "sess-crew".to_string()),
+    ];
+    let workspaces = vec![
+        ("sess-captain".to_string(), "slate-harbor".to_string()),
+        ("sess-crew".to_string(), "flywheel-flywheel".to_string()),
+    ];
+    assert_eq!(
+        arrival_workspace("flywheel-flywheel", "block:cap", &panes, &workspaces),
+        "slate-harbor"
+    );
+    assert_eq!(
+        arrival_workspace("flywheel-flywheel", "wP:p1", &panes, &workspaces),
+        "flywheel-flywheel"
+    );
+    assert_eq!(
+        arrival_workspace("flywheel-flywheel", "missing", &panes, &workspaces),
+        "flywheel-flywheel",
+        "an unresolved pane keeps the session's own label"
+    );
 }
 
 /// bd-kj2z: arrival rows are idempotent per (workspace, pin) and carry

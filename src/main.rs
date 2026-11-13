@@ -873,6 +873,10 @@ enum Commands {
         /// and the same key with a different plan is a typed conflict.
         #[arg(long)]
         request_key: Option<String>,
+        /// bd-ll2f2: join every new pin to these channels (comma-separated),
+        /// exactly like `spawn --join-channel`.
+        #[arg(long = "join-channel", value_delimiter = ',')]
+        join_channels: Vec<String>,
     },
     /// List flywheel swarms and their agents
     List {
@@ -3136,6 +3140,7 @@ fn main() {
             kinds,
             settle_secs,
             request_key,
+            join_channels,
         }) => cmd_add(
             &cfg,
             project,
@@ -3143,6 +3148,7 @@ fn main() {
             kinds,
             *settle_secs,
             request_key.as_deref(),
+            join_channels,
         ),
         Some(Commands::List { all }) => cmd_list(&cfg, *all),
         Some(Commands::Status { project }) => cmd_status(&cfg, project.as_deref()),
@@ -8911,8 +8917,7 @@ pub(crate) fn start_agent_with_retry_profile(
                                             let Some(cfg) = cfg else {
                                                 return SiteHop::Refused;
                                             };
-                                            let mut next_env =
-                                                std::collections::BTreeMap::new();
+                                            let mut next_env = std::collections::BTreeMap::new();
                                             if hc::apply_opencode_model_pin(&mut next_env, pin)
                                                 .is_err()
                                             {
@@ -8942,9 +8947,7 @@ pub(crate) fn start_agent_with_retry_profile(
                                                 next_profile: next.clone(),
                                                 next_model: next_plan.model.clone(),
                                                 from_profile: orig.to_string(),
-                                                from_model: pinned
-                                                    .clone()
-                                                    .unwrap_or_default(),
+                                                from_model: pinned.clone().unwrap_or_default(),
                                                 from_harness: current_kind.clone(),
                                                 kind: cf.kind,
                                                 evidence: cf.evidence.clone(),
@@ -8973,8 +8976,7 @@ pub(crate) fn start_agent_with_retry_profile(
                                                 }
                                                 Ok(_) => SiteHop::Refused,
                                                 Err(e) => {
-                                                    if let Some(reason) = envpin_split_refusal(&e)
-                                                    {
+                                                    if let Some(reason) = envpin_split_refusal(&e) {
                                                         eprintln!("flywheel: {reason}");
                                                         SiteHop::Refused
                                                     } else {
@@ -9176,8 +9178,7 @@ fn start_agent_with_retry_dyn_profile(
                                             let Some(proj) = project else {
                                                 return SiteHop::Refused;
                                             };
-                                            let mut next_env =
-                                                std::collections::BTreeMap::new();
+                                            let mut next_env = std::collections::BTreeMap::new();
                                             if hc::apply_opencode_model_pin(&mut next_env, pin)
                                                 .is_err()
                                             {
@@ -9200,9 +9201,7 @@ fn start_agent_with_retry_dyn_profile(
                                                 next_profile: next.clone(),
                                                 next_model: next_plan.model.clone(),
                                                 from_profile: orig.to_string(),
-                                                from_model: pinned
-                                                    .clone()
-                                                    .unwrap_or_default(),
+                                                from_model: pinned.clone().unwrap_or_default(),
                                                 from_harness: current_kind.clone(),
                                                 kind: cf.kind,
                                                 evidence: cf.evidence.clone(),
@@ -9225,8 +9224,7 @@ fn start_agent_with_retry_dyn_profile(
                                                 }
                                                 Ok(_) => SiteHop::Refused,
                                                 Err(e) => {
-                                                    if let Some(reason) = envpin_split_refusal(&e)
-                                                    {
+                                                    if let Some(reason) = envpin_split_refusal(&e) {
                                                         eprintln!("flywheel: {reason}");
                                                         SiteHop::Refused
                                                     } else {
@@ -11405,6 +11403,36 @@ fn publish_presence_for_registry(
     }
 }
 
+/// The wake scope for this arriving pane (bd-ll2f2): its own rex session when
+/// the backend can resolve it, never the crew's label. Unknown/pull-only
+/// sessions keep the project's own label.
+fn arrival_scope(cfg: &Config, project: &str) -> String {
+    let default = swarm_label(project);
+    let rex = std::env::var("REX_BLOCK").ok();
+    let hc = std::env::var("HC_TERMINAL_ID").ok();
+    let Some(pane) =
+        crate::inbox_ports::arrive_pane_from_env(rex.as_deref(), hc.as_deref()).map(str::to_string)
+    else {
+        return default;
+    };
+    let Ok(backend) = crate::backend::multiplexer_backend(cfg) else {
+        return default;
+    };
+    let panes: Vec<(String, String)> = backend
+        .pane_list(None)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| (p.pane_id, p.workspace_id))
+        .collect();
+    let workspaces: Vec<(String, String)> = backend
+        .workspace_list()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|w| (w.workspace_id, w.label))
+        .collect();
+    doorbell::arrival_workspace(&default, &pane, &panes, &workspaces)
+}
+
 /// bd-gpj0: open-mode arrive can only be *pushed* if this pane is in the
 /// spawn registry. `HC_TERMINAL_ID` is the current hc terminal; bind it to
 /// the arriver pin. Without it, wakes stay digest-bound — say so loudly.
@@ -11669,12 +11697,8 @@ fn cmd_arrive(
         Err(e) => eprintln!("flywheel: doorbell start: {e:#}"),
     }
     if let Some(pin) = as_agent {
-        doorbell::register_arrival_subscription(
-            &config::state_dir(),
-            project,
-            &swarm_label(project),
-            pin,
-        );
+        let workspace = arrival_scope(cfg, project);
+        doorbell::register_arrival_subscription(&config::state_dir(), project, &workspace, pin);
     }
     warn_uncommitted_decision_docs(cfg, project);
     if let Some(obj) = objective {

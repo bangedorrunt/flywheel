@@ -241,7 +241,6 @@ fn poll_once(
     if registry.is_empty() {
         return;
     }
-    let captain_alias = crate::state::load_captain_alias(project);
     let Ok(backend) = crate::backend::multiplexer_backend(cfg) else {
         return;
     };
@@ -253,19 +252,9 @@ fn poll_once(
         return;
     };
     let project_key = crate::project_dir_str(cfg, project).unwrap_or_else(|_| project.to_string());
-    // The flywheel mirror may be absent; toron's own `captain` alias is the
-    // authoritative one. Both are read so the operator's pane is never typed
-    // into (and never retried as a busy pane).
-    let captain = captain_alias
-        .or_else(|| toron_captain(project))
-        .or_else(|| {
-            crate::backend::run_mail(mail.whois(&project_key, "captain"))
-                .ok()
-                .map(|w| w.name)
-        });
     let mut changed = false;
     for entry in &registry {
-        if stop_pin(entry, captain.as_deref(), &pane_ids) {
+        if stop_pin(entry, &pane_ids) {
             continue;
         }
         let pin = entry.mail_identity.clone().unwrap_or_default();
@@ -321,26 +310,13 @@ fn poll_once(
     }
 }
 
-/// The authoritative captain alias lives in toron's contact table; the
-/// flywheel mirror is only written by some doors (not by `toron contact
-/// captain`). Read the one CLI door so the operator pane is always skipped.
-fn toron_captain(project: &str) -> Option<String> {
-    let out = std::process::Command::new("toron")
-        .args(["contact", "captain", "--project", project])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    v.get("captain")
-        .and_then(|c| c.as_str())
-        .map(str::to_string)
-}
-
+/// Whether this wake host must leave the pane alone. The agent captain is
+/// woken like any crew pin: an arrive-bound rex block lives in its own
+/// session, outside this workspace's pane list, and is still addressable by
+/// block id (`locate` searches every session). Same-workspace hc panes keep
+/// the stale-session filter.
 fn stop_pin(
     entry: &crate::state::SpawnEntry,
-    captain: Option<&str>,
     pane_ids: &std::collections::BTreeSet<String>,
 ) -> bool {
     let Some(pin) = entry.mail_identity.as_deref() else {
@@ -349,12 +325,9 @@ fn stop_pin(
     if pin.is_empty() || entry.pane_id.is_empty() {
         return true;
     }
-    // The operator/captain pane is never woken by the mail host.
-    if captain == Some(pin) {
-        return true;
+    if crate::inbox_ports::is_rex_block(&entry.pane_id) {
+        return false;
     }
-    // A registry may retain panes from an earlier session; only wake the
-    // panes that belong to THIS workspace when the plane answered.
     if !pane_ids.is_empty() && !pane_ids.contains(&entry.pane_id) {
         return true;
     }
@@ -512,16 +485,34 @@ mod tests {
         assert!(!text.starts_with("URGENT "), "{text}");
     }
 
+    /// bd-ll2f2: an arrive-bound agent captain is a crew pin — a rex block in
+    /// another session is rung even though it is outside this workspace's
+    /// pane list. A pin with no bound pane is never rung.
     #[test]
-    fn the_operator_captain_is_never_woken() {
+    fn an_arrive_bound_captain_block_is_woken_from_another_session() {
         use std::collections::BTreeSet;
-        let entry = crate::state::SpawnEntry::with_mail_identity(
-            "p1",
-            "flywheel-toron-oc",
-            "CloudySparrow",
+        let crew_panes = BTreeSet::from(["wP:p1".to_string()]);
+        let captain = crate::state::SpawnEntry::with_mail_identity(
+            "block:01a17136-a780-714f-9211-b78766ffd515",
+            "flywheel-captain",
+            "SlateHarbor",
         );
-        assert!(stop_pin(&entry, Some("CloudySparrow"), &BTreeSet::new()));
-        assert!(!stop_pin(&entry, Some("OtherPin"), &BTreeSet::new()));
+        // `auto` and `superlogical` both serve rex in production; the block
+        // id is the fact, so neither name gates the wake.
+        for backend in ["auto", "superlogical"] {
+            assert!(
+                !stop_pin(&captain, &crew_panes),
+                "{backend}: captain block outside the workspace must ring"
+            );
+        }
+        let stale_hc =
+            crate::state::SpawnEntry::with_mail_identity("w-other:p1", "other", "OtherPin");
+        assert!(
+            stop_pin(&stale_hc, &crew_panes),
+            "a stale hc pane outside the workspace stays skipped"
+        );
+        let unbound = crate::state::SpawnEntry::legacy("", "no-pane");
+        assert!(stop_pin(&unbound, &crew_panes), "no bound pane => no wake");
     }
 
     /// The per-workspace host must start this poller; a future refactor that

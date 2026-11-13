@@ -58,6 +58,7 @@ pub(crate) fn cmd_add_rex(
     kinds: &[(String, u32)],
     settle_secs: u64,
     request_key: Option<&str>,
+    join_channels: &[String],
 ) -> Result<()> {
     crate::check_project_spelling(project, "add")?;
     // A mutating door must not pave over a corrupt fleet: refuse first.
@@ -228,6 +229,13 @@ pub(crate) fn cmd_add_rex(
     if let Err(e) = state::publish_agent_bindings(project, &registry) {
         eprintln!("flywheel: cannot publish shared agent bindings: {e:#}");
     }
+    if !join_channels.is_empty() {
+        let pins: Vec<String> = registry
+            .iter()
+            .filter_map(|e| e.mail_identity.clone())
+            .collect();
+        ensure_and_join_channels(project, join_channels, &pins);
+    }
     crate::log(
         project,
         state::EventKind::Add,
@@ -244,6 +252,7 @@ pub(crate) fn cmd_add(
     kinds: &[(String, u32)],
     settle_secs: u64,
     request_key: Option<&str>,
+    join_channels: &[String],
 ) -> Result<()> {
     crate::check_project_spelling(project, "add")?;
     // A mutating door must not pave over a corrupt fleet: refuse first.
@@ -261,7 +270,15 @@ pub(crate) fn cmd_add(
                 plane.reason
             );
         }
-        return cmd_add_rex(cfg, project, counts, kinds, settle_secs, request_key);
+        return cmd_add_rex(
+            cfg,
+            project,
+            counts,
+            kinds,
+            settle_secs,
+            request_key,
+            join_channels,
+        );
     }
     let plan = crate::recipe_counts(None, counts, kinds)?;
     let request_key = request_key.map(str::trim).filter(|k| !k.is_empty());
@@ -435,6 +452,13 @@ pub(crate) fn cmd_add(
     }
     if let Err(e) = state::publish_agent_bindings(project, &registry) {
         eprintln!("flywheel: cannot publish shared agent bindings: {e:#}");
+    }
+    if !join_channels.is_empty() {
+        let pins: Vec<String> = registry
+            .iter()
+            .filter_map(|e| e.mail_identity.clone())
+            .collect();
+        ensure_and_join_channels(project, join_channels, &pins);
     }
     crate::log(
         project,
@@ -6278,6 +6302,7 @@ mod plane_gate_tests {
             &[],
             0,
             None,
+            &[],
         );
         unsafe {
             match &prev {
@@ -8157,6 +8182,21 @@ mod harness_default_model_tests {
 }
 
 #[cfg(test)]
+mod add_join_channel_tests {
+    /// bd-ll2f2: both add paths join every new pin to the requested channels,
+    /// exactly like `spawn --join-channel`.
+    #[test]
+    fn both_add_paths_join_channels() {
+        let src = include_str!("spawn.rs");
+        let needle = concat!("if !join_channels", ".is_empty() {");
+        assert_eq!(
+            src.matches(needle).count(),
+            2,
+            "hc and rex add must each join the new pins"
+        );
+    }
+}
+
 #[cfg(test)]
 mod requested_spawn_flags_tests {
     use super::requested_spawn_flags;
