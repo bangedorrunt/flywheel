@@ -939,48 +939,88 @@ fn load_spawn_preferences(path: &std::path::Path) -> Result<crate::preferences::
     crate::preferences::PreferenceSet::load(path)
 }
 
-/// Effective bare launch inputs for one item: user `--model`/`--provider`
-/// win; otherwise the standing model preference fills (provider stays empty —
-/// preference values are full registered ids); otherwise the existing empty
-/// default chain runs. Effort is preference-or-nothing, same as the plan.
+/// Effective bare ask with provenance: user `--model` (User), else the
+/// standing model preference (Preference), else none (the existing default
+/// chain decides). Provider pairs the user ask; effort is
+/// preference-or-nothing. The plan and the launch read this: one
+/// precedence, two readers.
+struct BareAsk {
+    model: Option<(String, crate::swarm_plan::Provenance)>,
+    provider: String,
+    effort: Option<(String, crate::swarm_plan::Provenance)>,
+}
+
 fn prefer_bare_inputs(
     prefs: &crate::preferences::PreferenceSet,
     item: &crate::SpawnItem,
     project: &str,
     bare_model: &str,
     bare_provider: &str,
-) -> (String, String, Option<String>) {
-    let effort = crate::prefer_fill(prefs, item, crate::preferences::Field::Effort, project);
+) -> BareAsk {
+    use crate::swarm_plan::Provenance;
+    let effort = crate::prefer_fill(prefs, item, crate::preferences::Field::Effort, project)
+        .map(|value| (value, Provenance::Preference));
     if bare_model.is_empty() {
         match crate::prefer_fill(prefs, item, crate::preferences::Field::Model, project) {
-            Some(model) => (model, String::new(), effort),
-            None => (String::new(), String::new(), effort),
+            Some(model) => BareAsk {
+                model: Some((model, Provenance::Preference)),
+                provider: String::new(),
+                effort,
+            },
+            None => BareAsk {
+                model: None,
+                provider: String::new(),
+                effort,
+            },
         }
     } else {
-        (bare_model.to_string(), bare_provider.to_string(), effort)
+        BareAsk {
+            model: Some((bare_model.to_string(), Provenance::User)),
+            provider: bare_provider.to_string(),
+            effort,
+        }
     }
 }
 
 /// Effective profile for one item: standing model/effort preferences fill a
-/// copy, so the launch routes exactly what the plan resolved. The harness
-/// still comes from `prefer_kind` at the call site.
+/// copy, so the launch routes exactly what the plan resolved. Returns the
+/// shadow plus the model and effort asks with provenance (a profile row
+/// falls back to the profile's own values). The plan and the launch read
+/// this: one precedence, two readers. The harness still comes from
+/// `prefer_kind` at the call site.
 fn prefer_shadow_profile(
     prefs: &crate::preferences::PreferenceSet,
     item: &crate::SpawnItem,
     profile: &profile::Profile,
     project: &str,
-) -> profile::Profile {
+) -> (
+    profile::Profile,
+    Option<(String, crate::swarm_plan::Provenance)>,
+    Option<(String, crate::swarm_plan::Provenance)>,
+) {
+    use crate::swarm_plan::Provenance;
     let mut shadow = profile.clone();
-    if let Some(model) = crate::prefer_fill(prefs, item, crate::preferences::Field::Model, project)
+    let model = if let Some(value) =
+        crate::prefer_fill(prefs, item, crate::preferences::Field::Model, project)
     {
-        shadow.model = model;
-    }
-    if let Some(effort) =
+        shadow.model = value.clone();
+        Some((value, Provenance::Preference))
+    } else if shadow.model.is_empty() {
+        None
+    } else {
+        Some((shadow.model.clone(), Provenance::Profile))
+    };
+    let effort = if let Some(value) =
         crate::prefer_fill(prefs, item, crate::preferences::Field::Effort, project)
     {
-        shadow.effort = effort;
-    }
-    shadow
+        shadow.effort = value.clone();
+        Some((value, Provenance::Preference))
+    } else if shadow.effort.is_empty() {
+        None
+    } else {
+        Some((shadow.effort.clone(), Provenance::Profile))
+    };
+    (shadow, model, effort)
 }
 
 pub(crate) fn build_dry_run_plan(
@@ -993,7 +1033,7 @@ pub(crate) fn build_dry_run_plan(
     prefs: &crate::preferences::PreferenceSet,
     project: &str,
 ) -> Result<crate::swarm_plan::Plan> {
-    use crate::swarm_plan::{Provenance, seat_status};
+    use crate::swarm_plan::seat_status;
     let mut plan = crate::swarm_plan::Plan::new("swarm");
     for item in items {
         let (harness, model, effort) = if item.profile.is_some() {
@@ -1005,59 +1045,35 @@ pub(crate) fn build_dry_run_plan(
                         item.profile.as_deref().unwrap_or("")
                     )
                 })?;
+            let (_, model_ask, effort) = prefer_shadow_profile(prefs, item, p, project);
             let harness = crate::prefer_kind(cfg, item, catalog, registry, prefs, project)?;
-            let model = if let Some(pref) =
-                crate::prefer_fill(prefs, item, crate::preferences::Field::Model, project)
-            {
-                Some((pref, Provenance::Preference))
-            } else {
-                let (_, resolved) = registry.resolve_profile_route(&harness, &p.model)?;
-                if resolved.is_empty() {
-                    None
-                } else if p.model.is_empty() {
-                    // The profile names no model: fall back like a bare item.
-                    bare_fallback_model(registry, &harness)
-                } else {
-                    Some((resolved, Provenance::Profile))
+            let model = match model_ask {
+                Some((ask, from)) => {
+                    let (_, resolved) = registry.resolve_profile_route(&harness, &ask)?;
+                    if resolved.is_empty() {
+                        None
+                    } else {
+                        Some((resolved, from))
+                    }
                 }
-            };
-            let effort = if let Some(pref) =
-                crate::prefer_fill(prefs, item, crate::preferences::Field::Effort, project)
-            {
-                Some((pref, Provenance::Preference))
-            } else if p.effort.is_empty() {
-                None
-            } else {
-                Some((p.effort.clone(), Provenance::Profile))
+                None => None,
             };
             (harness, model, effort)
         } else {
             let harness = crate::prefer_kind(cfg, item, catalog, registry, prefs, project)?;
-            let effort =
-                crate::prefer_fill(prefs, item, crate::preferences::Field::Effort, project)
-                    .map(|value| (value, Provenance::Preference));
-            if bare_model.is_empty() {
-                let model = match crate::prefer_fill(
-                    prefs,
-                    item,
-                    crate::preferences::Field::Model,
-                    project,
-                ) {
-                    Some(pref) => Some((pref, Provenance::Preference)),
-                    None => bare_fallback_model(registry, &harness),
-                };
-                (harness, model, effort)
-            } else {
-                let lookup = if bare_provider.is_empty() {
-                    bare_model.to_string()
-                } else {
-                    format!("{bare_provider}/{bare_model}")
-                };
-                // Pass the raw ask: resolve_ask classifies it (unique /
-                // ambiguous / unregistered / retired); resolution to the
-                // launch flag happens inside resolve_model_field.
-                (harness, Some((lookup, Provenance::User)), None)
-            }
+            let ask = prefer_bare_inputs(prefs, item, project, bare_model, bare_provider);
+            let model = match ask.model {
+                Some((m, from)) => {
+                    let lookup = if ask.provider.is_empty() {
+                        m
+                    } else {
+                        format!("{}/{}", ask.provider, m)
+                    };
+                    Some((lookup, from))
+                }
+                None => bare_fallback_model(registry, &harness),
+            };
+            (harness, model, ask.effort)
         };
         let effort_str = effort.as_ref().map(|(value, _)| value.as_str());
         let (model_field, flag) = match model {
@@ -1455,22 +1471,26 @@ projects available: {}",
             let kind = crate::prefer_kind(cfg, item, &catalog, &model_reg, &prefs, project)?;
             match item.profile.as_deref().map(|pn| catalog.get(pn)) {
                 Some(Some(p)) => {
-                    let shadow = prefer_shadow_profile(&prefs, item, p, project);
+                    let (shadow, _, _) = prefer_shadow_profile(&prefs, item, p, project);
                     Some(profile_launch_plan(&kind, &shadow, None)?)
                 }
                 _ => {
-                    let (eff_model, eff_provider, eff_effort) = prefer_bare_inputs(
+                    let ask = prefer_bare_inputs(
                         &prefs,
                         item,
                         project,
                         &opts.bare_model,
                         &opts.bare_provider,
                     );
+                    let (eff_model, eff_provider) = ask
+                        .model
+                        .map(|(m, _)| (m, ask.provider))
+                        .unwrap_or_default();
                     first_bare = Some(bare_model_launch(
                         &kind,
                         &eff_model,
                         &eff_provider,
-                        eff_effort.as_deref(),
+                        ask.effort.as_ref().map(|(e, _)| e.as_str()),
                     )?);
                     None
                 }
@@ -1566,7 +1586,7 @@ projects available: {}",
                     let p = catalog
                         .get(pname)
                         .expect("profile resolved at plan build (bd-eign.13)");
-                    let shadow = prefer_shadow_profile(&prefs, item, p, project);
+                    let (shadow, _, _) = prefer_shadow_profile(&prefs, item, p, project);
                     let plan = if first {
                         first_plan.take().ok_or_else(|| {
                             anyhow!(
@@ -1588,14 +1608,23 @@ projects available: {}",
                             )
                         })?
                     } else {
-                        let (eff_model, eff_provider, eff_effort) = prefer_bare_inputs(
+                        let ask = prefer_bare_inputs(
                             &prefs,
                             item,
                             project,
                             &opts.bare_model,
                             &opts.bare_provider,
                         );
-                        bare_model_launch(&kind, &eff_model, &eff_provider, eff_effort.as_deref())?
+                        let (eff_model, eff_provider) = ask
+                            .model
+                            .map(|(m, _)| (m, ask.provider))
+                            .unwrap_or_default();
+                        bare_model_launch(
+                            &kind,
+                            &eff_model,
+                            &eff_provider,
+                            ask.effort.as_ref().map(|(e, _)| e.as_str()),
+                        )?
                     };
                     (args, None, env_pin)
                 }
@@ -2370,20 +2399,28 @@ pub(crate) fn cmd_spawn_rex(
                     let p = catalog
                         .get(pname)
                         .expect("profile resolved at plan build (bd-eign.13)");
-                    let shadow = prefer_shadow_profile(&prefs, item, p, project);
+                    let (shadow, _, _) = prefer_shadow_profile(&prefs, item, p, project);
                     let plan = profile_launch_plan(&kind, &shadow, None)?;
                     (plan.args, Some(plan.model), plan.env_model_pin)
                 }
                 None => {
-                    let (eff_model, eff_provider, eff_effort) = prefer_bare_inputs(
+                    let ask = prefer_bare_inputs(
                         &prefs,
                         item,
                         project,
                         &opts.bare_model,
                         &opts.bare_provider,
                     );
-                    let (args, env_pin) =
-                        bare_model_launch(&kind, &eff_model, &eff_provider, eff_effort.as_deref())?;
+                    let (eff_model, eff_provider) = ask
+                        .model
+                        .map(|(m, _)| (m, ask.provider))
+                        .unwrap_or_default();
+                    let (args, env_pin) = bare_model_launch(
+                        &kind,
+                        &eff_model,
+                        &eff_provider,
+                        ask.effort.as_ref().map(|(e, _)| e.as_str()),
+                    )?;
                     (args, None, env_pin)
                 }
             };
@@ -6111,14 +6148,114 @@ mod prefer_spawn_tests {
         let f = plan.seats[0].model.as_ref().expect("model field");
         assert_eq!(f.from, crate::swarm_plan::Provenance::Preference);
         assert_eq!(f.value, "a/m");
-        let (args, env) = super::bare_model_launch(&plan.seats[0].harness, "a/m", "", None)
-            .expect("launch builds");
+        let ask = super::prefer_bare_inputs(&prefs, &items[0], "probe", "", "");
+        let (m, from) = ask.model.clone().expect("preference resolves");
+        assert_eq!(
+            (m.as_str(), from),
+            ("a/m", crate::swarm_plan::Provenance::Preference)
+        );
+        let kind = crate::prefer_kind(&cfg, &items[0], &catalog, &reg, &prefs, "probe")
+            .expect("kind resolves");
+        assert_eq!(kind, plan.seats[0].harness);
+        let (eff_model, eff_provider) = ask
+            .model
+            .map(|(m, _)| (m, ask.provider))
+            .unwrap_or_default();
+        let (args, env) = crate::bare_model_launch(
+            &kind,
+            &eff_model,
+            &eff_provider,
+            ask.effort.as_ref().map(|(e, _)| e.as_str()),
+        )
+        .expect("launch builds");
         let carries =
             args.iter().any(|a| a == &f.value) || env.as_deref() == Some(f.value.as_str());
         let honoured = matches!(f.status, crate::swarm_plan::FieldStatus::Honored);
         assert_eq!(
             honoured, carries,
             "plan delivery must equal launch carriage: {f:?} vs ({args:?}, {env:?})"
+        );
+    }
+
+    /// The profile launch resolves the same model the plan computed.
+    #[test]
+    fn prefer_spawn_launch_matches_plan_profile() {
+        let reg = test_registry();
+        let cfg = crate::config::Config::default();
+        let mut catalog = crate::profile::ProfileCatalog::default();
+        catalog.profiles.insert(
+            "coder".to_string(),
+            crate::profile::Profile {
+                harness: "pi".into(),
+                model: "b/m".into(),
+                ..Default::default()
+            },
+        );
+        let prefs = test_prefs(&[("coder.model", "a/m", None)]);
+        let items = vec![crate::SpawnItem {
+            short: "coder".into(),
+            count: 1,
+            kind: None,
+            profile: Some("coder".into()),
+        }];
+        let plan = super::build_dry_run_plan(&cfg, &items, &catalog, &reg, "", "", &prefs, "probe")
+            .expect("plan builds");
+        let f = plan.seats[0].model.as_ref().expect("model field");
+        assert_eq!(f.from, crate::swarm_plan::Provenance::Preference);
+        assert_eq!(f.value, "a/m");
+        let p = catalog.get("coder").expect("profile resolves");
+        let (shadow, model_ask, _) = super::prefer_shadow_profile(&prefs, &items[0], p, "probe");
+        assert_eq!(
+            model_ask,
+            Some(("a/m".to_string(), crate::swarm_plan::Provenance::Preference))
+        );
+        let kind = crate::prefer_kind(&cfg, &items[0], &catalog, &reg, &prefs, "probe")
+            .expect("kind resolves");
+        assert_eq!(kind, plan.seats[0].harness);
+        let launched = crate::profile_launch_plan(&kind, &shadow, None).expect("launch builds");
+        assert_eq!(
+            launched.model, f.value,
+            "launch must resolve the planned model"
+        );
+    }
+
+    /// A user `--model` flows through the same resolution into plan and launch.
+    #[test]
+    fn prefer_spawn_launch_matches_plan_user_override() {
+        let reg = test_registry();
+        let cfg = crate::config::Config::default();
+        let catalog = crate::profile::ProfileCatalog::default();
+        let prefs = test_prefs(&[("pi.model", "a/m", None)]);
+        let items = bare_pi();
+        let plan =
+            super::build_dry_run_plan(&cfg, &items, &catalog, &reg, "b/m", "", &prefs, "probe")
+                .expect("plan builds");
+        let f = plan.seats[0].model.as_ref().expect("model field");
+        assert_eq!(f.from, crate::swarm_plan::Provenance::User);
+        assert_eq!(f.value, "b/m");
+        let ask = super::prefer_bare_inputs(&prefs, &items[0], "probe", "b/m", "");
+        let (m, from) = ask.model.clone().expect("user ask resolves");
+        assert_eq!(
+            (m.as_str(), from),
+            ("b/m", crate::swarm_plan::Provenance::User)
+        );
+        let kind = crate::prefer_kind(&cfg, &items[0], &catalog, &reg, &prefs, "probe")
+            .expect("kind resolves");
+        assert_eq!(kind, plan.seats[0].harness);
+        let (eff_model, eff_provider) = ask
+            .model
+            .map(|(m, _)| (m, ask.provider))
+            .unwrap_or_default();
+        let (args, env) = crate::bare_model_launch(
+            &kind,
+            &eff_model,
+            &eff_provider,
+            ask.effort.as_ref().map(|(e, _)| e.as_str()),
+        )
+        .expect("launch builds");
+        assert!(
+            args.iter().any(|a| a == &f.value) || env.as_deref() == Some(f.value.as_str()),
+            "launch must carry the planned model"
         );
     }
 
