@@ -7708,11 +7708,42 @@ pub(crate) fn envpin_respin_hop(
     }
 }
 
+/// Split refused: this backend cannot carry a pane env pin, so an env-pin
+/// hop through it would launch the new pane without the pin — the new
+/// process would run the previous model while the journal records a
+/// RebindIntent to the new one. The old REFUSED message existed to prevent
+/// exactly this silent downgrade.
+#[derive(Debug)]
+struct EnvPinSplitUnsupported {
+    backend: String,
+}
+
+impl std::fmt::Display for EnvPinSplitUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} cannot carry a pane env pin; refusing a silent model downgrade",
+            self.backend
+        )
+    }
+}
+
+impl std::error::Error for EnvPinSplitUnsupported {}
+
+/// The backend reason when a hop died on [`EnvPinSplitUnsupported`], so a
+/// reroute site can print today's refusal plus the reason instead of
+/// failing loud on a broken hop.
+fn envpin_split_refusal(err: &anyhow::Error) -> Option<String> {
+    err.downcast_ref::<EnvPinSplitUnsupported>()
+        .map(|unsupported| unsupported.to_string())
+}
+
 /// Pane split for the env-pin hop: hc backends split with the new env pin
-/// (a pane's env is fixed at split), every other backend splits plain —
-/// the trait split carries no env map. `cfg` and `project` locate the
-/// workspace dir for hc; without them the trait split runs with no cwd,
-/// the same shape `cmd_recover` uses.
+/// (a pane's env is fixed at split) using the workspace dir and socket from
+/// `cfg` and `project`. Anything else fails closed with
+/// [`EnvPinSplitUnsupported`] before anything launches — a trait split
+/// carries no env map, and hc without cfg/project cannot locate the
+/// workspace or daemon. Callers map that error to a refusal, never a hop.
 fn envpin_hop_split(
     cfg: Option<&Config>,
     project: Option<&str>,
@@ -7731,10 +7762,10 @@ fn envpin_hop_split(
             return Ok(hc::pane_split(&c, anchor, "down", Some(&cwd), Some(env))?.pane_id);
         }
     }
-    backend
-        .pane_split(anchor, "down", None)
-        .map(|p| p.pane_id)
-        .map_err(anyhow::Error::from)
+    Err(EnvPinSplitUnsupported {
+        backend: backend.name().to_string(),
+    }
+    .into())
 }
 
 /// Outcome of one reroute-site hop attempt: return the hopped agent, fail
@@ -8053,7 +8084,7 @@ mod envpin_reroute_tests {
         );
     }
 
-    struct SiteFakeBackend {
+    struct RexRefuseBackend {
         order: Arc<Mutex<Vec<String>>>,
         starts: Arc<Mutex<usize>>,
     }
@@ -8105,9 +8136,9 @@ mod envpin_reroute_tests {
         }
     }
 
-    impl crate::backend::MultiplexerBackend for SiteFakeBackend {
+    impl crate::backend::MultiplexerBackend for RexRefuseBackend {
         fn name(&self) -> &'static str {
-            "site-fake"
+            "rex"
         }
         fn agent_list(
             &self,
@@ -8128,11 +8159,7 @@ mod envpin_reroute_tests {
             _direction: &str,
             _cwd: Option<&str>,
         ) -> Result<toron_core::pane_types::PaneInfo, toron_plane::backend::BackendError> {
-            self.order
-                .lock()
-                .unwrap()
-                .push("split:old-pane".to_string());
-            Ok(site_pane("new-pane-1"))
+            panic!("rex must never split for an env-pin hop: the trait split cannot carry the pin");
         }
         fn agent_start(
             &self,
@@ -8164,8 +8191,46 @@ mod envpin_reroute_tests {
         }
     }
 
+    struct NeverSplitBackend(&'static str);
+
+    impl crate::backend::MultiplexerBackend for NeverSplitBackend {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn pane_split(
+            &self,
+            _parent_pane_id: &str,
+            _direction: &str,
+            _cwd: Option<&str>,
+        ) -> Result<toron_core::pane_types::PaneInfo, toron_plane::backend::BackendError> {
+            panic!("{} must never split for an env-pin hop", self.0);
+        }
+    }
+
     #[test]
-    fn envpin_respawn_site_no_longer_refuses() {
+    fn envpin_hop_split_non_hc_refuses() {
+        let _guard = crate::config::lock_env();
+        let mut env = BTreeMap::new();
+        env.insert(
+            "OPENCODE_CONFIG_CONTENT".to_string(),
+            "{\"model\":\"opencode/gold\"}".to_string(),
+        );
+        for (backend, name) in [
+            (NeverSplitBackend("rex"), "rex"),
+            (NeverSplitBackend("hc"), "hc"),
+        ] {
+            let err = envpin_hop_split(None, Some("envpin-test-proj"), &backend, "anchor", &env)
+                .expect_err("a backend that cannot carry the pin must refuse");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(name) && msg.contains("pane env pin"),
+                "refusal names the backend and the reason: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn envpin_respawn_rex_site_refuses_not_downgrades() {
         let _guard = crate::config::lock_env();
         let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
         let nanos = std::time::SystemTime::now()
@@ -8187,42 +8252,32 @@ mod envpin_reroute_tests {
         )
         .expect("stage models");
         let order = Arc::new(Mutex::new(Vec::new()));
-        let backend = SiteFakeBackend {
+        let backend = RexRefuseBackend {
             order: order.clone(),
             starts: Arc::new(Mutex::new(0)),
         };
-        let agent = start_agent_with_retry_dyn_profile(
+        let err = start_agent_with_retry_dyn_profile(
             &backend,
             "TestyCreek",
             "opencode",
             "old-pane",
             &[],
             Some("opencode-fallback"),
-            Some("envpin-site-proj"),
+            Some("envpin-rex-proj"),
             None,
         )
-        .expect("reroute site hops instead of refusing");
-        assert_eq!(
-            agent.name.as_deref(),
-            Some("TestyCreek"),
-            "same agent name kept"
-        );
-        assert_eq!(
-            agent.pane_id, "new-pane-1",
-            "respawned onto the new pane"
+        .expect_err("rex cannot carry the pin: the site refuses, never hops");
+        assert!(
+            err.to_string().contains("reroute hop failed"),
+            "refusal falls through to today's terminal error: {err:#}"
         );
         assert_eq!(
             *order.lock().unwrap(),
-            vec![
-                "start:TestyCreek@old-pane".to_string(),
-                "split:old-pane".to_string(),
-                "start:TestyCreek@new-pane-1".to_string(),
-                "close:old-pane".to_string(),
-            ],
-            "old pane closes only after the new one launches"
+            vec!["start:TestyCreek@old-pane".to_string()],
+            "nothing launched and the old pane is never closed"
         );
         let key = crate::agent_ref::RebindIntent::derive_effect_key(
-            &crate::agent_ref::AgentRef::new("envpin-site-proj", "TestyCreek"),
+            &crate::agent_ref::AgentRef::new("envpin-rex-proj", "TestyCreek"),
             &crate::agent_ref::AgentBinding {
                 profile_name: "opencode-fallback".to_string(),
                 model: "opencode/big-pickle".to_string(),
@@ -8236,8 +8291,16 @@ mod envpin_reroute_tests {
                 location: crate::agent_ref::BindingLocation::Pane,
             },
         );
-        let rows = rebind_rows("envpin-site-proj", &key);
-        assert_eq!(rows.len(), 3, "exactly one intent, three states: {rows:?}");
+        let rows = rebind_rows("envpin-rex-proj", &key);
+        assert_eq!(
+            rows.iter().map(|i| i.state.clone()).collect::<Vec<_>>(),
+            vec![
+                toron_core::index::workflow_effects::EffectState::Prepared,
+                toron_core::index::workflow_effects::EffectState::InFlight,
+                toron_core::index::workflow_effects::EffectState::Failed,
+            ],
+            "the refused hop is marked Failed, never rolled back: {rows:?}"
+        );
         match prev_xdg {
             Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
             None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
@@ -8456,7 +8519,15 @@ pub(crate) fn start_agent_with_retry_profile(
                                                     SiteHop::InPlace
                                                 }
                                                 Ok(_) => SiteHop::Refused,
-                                                Err(e) => SiteHop::Failed(e),
+                                                Err(e) => {
+                                                    if let Some(reason) = envpin_split_refusal(&e)
+                                                    {
+                                                        eprintln!("flywheel: {reason}");
+                                                        SiteHop::Refused
+                                                    } else {
+                                                        SiteHop::Failed(e)
+                                                    }
+                                                }
                                             }
                                         };
                                         match site_hop() {
@@ -8706,7 +8777,15 @@ fn start_agent_with_retry_dyn_profile(
                                                     SiteHop::InPlace
                                                 }
                                                 Ok(_) => SiteHop::Refused,
-                                                Err(e) => SiteHop::Failed(e),
+                                                Err(e) => {
+                                                    if let Some(reason) = envpin_split_refusal(&e)
+                                                    {
+                                                        eprintln!("flywheel: {reason}");
+                                                        SiteHop::Refused
+                                                    } else {
+                                                        SiteHop::Failed(e)
+                                                    }
+                                                }
                                             }
                                         };
                                         match site_hop() {
