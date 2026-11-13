@@ -300,10 +300,6 @@ pub fn check_phase(phase: &str, step_out: &serde_json::Value) -> PhaseContractRe
 /// non-empty `coverage` array of `{requirement, beads: [id, ...]}` rows each
 /// with at least one bead, and `tests_named` (bool). Fails naming the
 /// missing or empty field.
-///
-/// Not yet called by runtime code: step-exit wiring is a later slice; the
-/// contract is exercised by its unit tests until then.
-#[allow(dead_code)]
 pub fn polish_round_contract(report: &serde_json::Value) -> PhaseContractReport {
     let Some(changed) = report.get("changed").and_then(serde_json::Value::as_bool) else {
         return PhaseContractReport::fail(
@@ -357,10 +353,6 @@ pub fn polish_round_contract(report: &serde_json::Value) -> PhaseContractReport 
 /// ADR-0021 D4.2: resolve a witness name to its checked contract. Phase
 /// names delegate to [`check_phase`] (same input, same report); unknown
 /// names fail naming the witness. Never succeeds by default.
-///
-/// Not yet called by runtime code: step-exit wiring is a later slice; the
-/// checker is exercised by its unit tests until then.
-#[allow(dead_code)]
 pub fn check_witness(name: &str, step_out: &serde_json::Value) -> PhaseContractReport {
     if !WITNESSES.contains(&name) {
         return PhaseContractReport::fail(

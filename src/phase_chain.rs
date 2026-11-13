@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use toron_workflow::WorkflowEngine;
 use toron_workflow::schema::{Action, Step, Workflow};
 
-use crate::phase_contracts::check_phase;
+use crate::phase_contracts::check_witness;
 
 /// Gate disposition between ship links (§3.5): warn-first until the
 /// enforcement flip; `block` refuses to continue past a failed contract.
@@ -242,7 +242,7 @@ pub async fn run_ship_chain(
         if phase == "plan" {
             merge_dep_cycles_into_step(&mut step_out, project_dir);
         }
-        let verdict = check_phase(phase, &step_out);
+        let verdict = check_witness(phase, &step_out);
         let evaluation = crate::artifact::EvaluationEvidence::from_phase_contract(
             run_id,
             "ship",
