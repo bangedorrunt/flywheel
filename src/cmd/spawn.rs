@@ -6953,49 +6953,346 @@ mod plan_patch_spawn_tests {
         );
     }
 
-    /// A patched plan through the gate launches when nothing asks.
+    /// A patched plan through the gate launches when nothing asks: the
+    /// codex base is blocked (codex carries no model argv), the pi-patched
+    /// plan built from the same overrides launches.
     #[test]
     fn plan_patch_gated_after_apply() {
-        let mut plan = crate::swarm_plan::Plan::new("swarm");
-        plan.seats.push(crate::swarm_plan::Seat {
-            role: "reviewer".to_string(),
-            count: 1,
-            harness: "codex".to_string(),
-            model: Some(crate::swarm_plan::Field {
-                value: "a/m".to_string(),
-                from: crate::swarm_plan::Provenance::User,
-                status: crate::swarm_plan::field_status(
-                    false,
-                    crate::swarm_plan::Provenance::User,
-                    "codex",
-                    "model",
-                ),
-                registry: None,
-                was: None,
-            }),
-            effort: None,
-            mode: None,
-            phase: None,
-            placement: "pane".to_string(),
-        });
-        plan.needs_consent = vec![crate::swarm_plan::ConsentItem {
-            seat: "reviewer".to_string(),
-            field: "model".to_string(),
-            reason: crate::swarm_plan::ConsentReason::Blocked,
-        }];
+        let _g = crate::config::lock_env();
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let cfg_home = dir.path().join("config");
+        std::fs::create_dir_all(cfg_home.join("flywheel")).expect("config dir");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_home) };
         let reg = herm_registry();
-        let patched = crate::swarm_plan::apply_patch(
-            &plan,
-            &crate::swarm_plan::parse_patch("reviewer.harness=pi").expect("parses"),
+        let cfg = crate::config::Config::default();
+        let catalog = crate::profile::ProfileCatalog::default();
+        let prefs = crate::preferences::PreferenceSet::new();
+        let items = super::spawn_items_from_plan(vec![("codex".to_string(), 1)], None);
+        let base = super::build_dry_run_plan(
+            &cfg,
+            &items,
+            &catalog,
             &reg,
-            &crate::swarm_plan::ConsentPolicy::default(),
-            8,
+            "a/m",
+            "",
+            &prefs,
+            "probe",
+            &std::collections::BTreeMap::new(),
         )
-        .expect("patch applies");
+        .expect("plan builds");
+        assert!(
+            matches!(super::plan_gate(&base, false), super::PlanGate::Ask { .. }),
+            "codex base is blocked"
+        );
+        let patches = vec![crate::swarm_plan::parse_patch("codex.harness=pi").expect("parses")];
+        let overrides = super::patch_role_overrides(&patches);
+        let patched = super::build_dry_run_plan(
+            &cfg, &items, &catalog, &reg, "a/m", "", &prefs, "probe", &overrides,
+        )
+        .expect("patched plan builds");
         assert!(matches!(
             super::plan_gate(&patched, false),
             super::PlanGate::Launch
         ));
+    }
+
+    fn plan_probe_prefs(rows: &[(&str, &str, Option<&str>)]) -> crate::preferences::PreferenceSet {
+        let mut prefs = crate::preferences::PreferenceSet::new();
+        for (key, value, project) in rows {
+            let scope = match project {
+                Some(p) => crate::preferences::Scope::Project(p.to_string()),
+                None => crate::preferences::Scope::Always,
+            };
+            prefs.set(
+                key.parse().expect("pref key parses"),
+                value.to_string(),
+                scope,
+            );
+        }
+        prefs
+    }
+
+    /// Unknown seats fail at the coverage gate naming the valid roles: the
+    /// plan is built from the same overrides the gate checks.
+    #[test]
+    fn plan_patch_unknown_seat_names_valid_roles() {
+        let reg = herm_registry();
+        let cfg = crate::config::Config::default();
+        let catalog = crate::profile::ProfileCatalog::default();
+        let prefs = crate::preferences::PreferenceSet::new();
+        let items = super::spawn_items_from_plan(
+            vec![("pi".to_string(), 1), ("opencode".to_string(), 1)],
+            None,
+        );
+        let plan = super::build_dry_run_plan(
+            &cfg,
+            &items,
+            &catalog,
+            &reg,
+            "",
+            "",
+            &prefs,
+            "probe",
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("plan builds");
+        let err = crate::swarm_plan::validate_patch(
+            &plan,
+            &crate::swarm_plan::parse_patch("ghost.harness=pi").expect("parses"),
+        )
+        .expect_err("unknown seat fails");
+        assert!(
+            err.contains("pi") && err.contains("opencode"),
+            "names valid seats: {err}"
+        );
+    }
+
+    /// A harness patch re-filters the model through the real resolvers and
+    /// clears that consent entry: the codex base is blocked, patched to pi
+    /// the same user ask is honored and the gate launches.
+    #[test]
+    fn plan_patch_harness_refilters_model_and_clears_consent() {
+        let reg = herm_registry();
+        let cfg = crate::config::Config::default();
+        let catalog = crate::profile::ProfileCatalog::default();
+        let prefs = crate::preferences::PreferenceSet::new();
+        let items = super::spawn_items_from_plan(vec![("codex".to_string(), 1)], None);
+        let base = super::build_dry_run_plan(
+            &cfg,
+            &items,
+            &catalog,
+            &reg,
+            "a/m",
+            "",
+            &prefs,
+            "probe",
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("plan builds");
+        let bm = base.seats[0].model.as_ref().expect("model field");
+        assert_eq!(bm.value, "a/m", "re-filter never swaps the value");
+        assert_eq!(
+            bm.from,
+            crate::swarm_plan::Provenance::User,
+            "user-sourced stays user"
+        );
+        assert!(
+            matches!(bm.status, crate::swarm_plan::FieldStatus::Blocked { .. }),
+            "blocked on codex: {bm:?}"
+        );
+        let patches = vec![crate::swarm_plan::parse_patch("codex.harness=pi").expect("parses")];
+        let overrides = super::patch_role_overrides(&patches);
+        let out = super::build_dry_run_plan(
+            &cfg, &items, &catalog, &reg, "a/m", "", &prefs, "probe", &overrides,
+        )
+        .expect("patched plan builds");
+        assert_eq!(out.seats[0].harness, "pi");
+        let m = out.seats[0].model.as_ref().expect("model field");
+        assert_eq!(m.value, "a/m", "re-filter never swaps the value");
+        assert_eq!(
+            m.from,
+            crate::swarm_plan::Provenance::User,
+            "user-sourced stays user"
+        );
+        assert!(
+            matches!(m.status, crate::swarm_plan::FieldStatus::Honored),
+            "re-filtered on pi: {m:?}"
+        );
+        assert!(
+            out.needs_consent.is_empty(),
+            "that consent entry is gone: {:?}",
+            out.needs_consent
+        );
+    }
+
+    /// A model patch beats the standing preference and is recorded as the
+    /// user's own ask: the base plan resolves from preference, the patched
+    /// plan is from user with recomputed unregistered consent.
+    #[test]
+    fn plan_patch_model_beats_preference_as_user() {
+        let reg = herm_registry();
+        let cfg = crate::config::Config::default();
+        let catalog = crate::profile::ProfileCatalog::default();
+        let prefs = plan_probe_prefs(&[("pi.model", "a/m", None)]);
+        let items = super::spawn_items_from_plan(vec![("pi".to_string(), 1)], None);
+        let base = super::build_dry_run_plan(
+            &cfg,
+            &items,
+            &catalog,
+            &reg,
+            "",
+            "",
+            &prefs,
+            "probe",
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("plan builds");
+        let b = base.seats[0].model.as_ref().expect("model field");
+        assert_eq!(b.from, crate::swarm_plan::Provenance::Preference);
+        assert_eq!(b.value, "a/m");
+        let patches = vec![crate::swarm_plan::parse_patch("pi.model=z").expect("parses")];
+        let overrides = super::patch_role_overrides(&patches);
+        let out = super::build_dry_run_plan(
+            &cfg, &items, &catalog, &reg, "", "", &prefs, "probe", &overrides,
+        )
+        .expect("patched plan builds");
+        let m = out.seats[0].model.as_ref().expect("model field");
+        assert_eq!(m.value, "z");
+        assert_eq!(m.from, crate::swarm_plan::Provenance::User);
+        assert_eq!(
+            out.needs_consent.len(),
+            1,
+            "consent recomputed: {:?}",
+            out.needs_consent
+        );
+        assert!(matches!(
+            out.needs_consent[0].reason,
+            crate::swarm_plan::ConsentReason::Unregistered
+        ));
+    }
+
+    /// An invalid-for-harness model stays user-sourced and turns blocked:
+    /// patching pi to codex keeps the ask, names codex in the remedy, and
+    /// records blocked consent.
+    #[test]
+    fn plan_patch_invalid_stays_user_and_blocks() {
+        let reg = herm_registry();
+        let cfg = crate::config::Config::default();
+        let catalog = crate::profile::ProfileCatalog::default();
+        let prefs = crate::preferences::PreferenceSet::new();
+        let items = super::spawn_items_from_plan(vec![("pi".to_string(), 1)], None);
+        let patches = vec![crate::swarm_plan::parse_patch("pi.harness=codex").expect("parses")];
+        let overrides = super::patch_role_overrides(&patches);
+        let out = super::build_dry_run_plan(
+            &cfg, &items, &catalog, &reg, "a/m", "", &prefs, "probe", &overrides,
+        )
+        .expect("patched plan builds");
+        assert_eq!(out.seats[0].harness, "codex");
+        let m = out.seats[0].model.as_ref().expect("model field");
+        assert_eq!(m.value, "a/m", "never silently swapped");
+        assert_eq!(m.from, crate::swarm_plan::Provenance::User);
+        match &m.status {
+            crate::swarm_plan::FieldStatus::Blocked { remedy } => {
+                assert!(
+                    remedy.contains("codex"),
+                    "remedy names the harness: {remedy}"
+                );
+            }
+            other => panic!("expected blocked, got {other:?}"),
+        }
+        assert_eq!(out.needs_consent.len(), 1);
+        assert!(matches!(
+            out.needs_consent[0].reason,
+            crate::swarm_plan::ConsentReason::Blocked
+        ));
+    }
+
+    /// Other seats (and their consent) are untouched by a patch on the real
+    /// path: the unpatched role keeps its value, provenance, and consent.
+    #[test]
+    fn plan_patch_leaves_other_seats_untouched() {
+        let reg = herm_registry();
+        let cfg = crate::config::Config::default();
+        let catalog = crate::profile::ProfileCatalog::default();
+        let prefs = crate::preferences::PreferenceSet::new();
+        let items = super::spawn_items_from_plan(
+            vec![("pi".to_string(), 1), ("opencode".to_string(), 1)],
+            None,
+        );
+        let base = super::build_dry_run_plan(
+            &cfg,
+            &items,
+            &catalog,
+            &reg,
+            "qz-9z",
+            "",
+            &prefs,
+            "probe",
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("plan builds");
+        let patches = vec![crate::swarm_plan::parse_patch("pi.model=z").expect("parses")];
+        let overrides = super::patch_role_overrides(&patches);
+        let out = super::build_dry_run_plan(
+            &cfg, &items, &catalog, &reg, "qz-9z", "", &prefs, "probe", &overrides,
+        )
+        .expect("patched plan builds");
+        let m = out.seats[0].model.as_ref().expect("model field");
+        assert_eq!(m.value, "z");
+        assert_eq!(out.seats[1].harness, base.seats[1].harness);
+        assert_eq!(out.seats[1].role, base.seats[1].role);
+        let m2 = out.seats[1].model.as_ref().expect("opencode model");
+        let b2 = base.seats[1].model.as_ref().expect("opencode model before");
+        assert_eq!(m2.value, b2.value);
+        assert_eq!(m2.from, b2.from);
+        assert!(
+            out.needs_consent.iter().any(|i| i.seat == "opencode"
+                && matches!(i.reason, crate::swarm_plan::ConsentReason::Unregistered)),
+            "opencode consent intact: {:?}",
+            out.needs_consent
+        );
+    }
+
+    /// Two patches apply in order through one plan build: the harness
+    /// sticks and the later model wins, both from the user.
+    #[test]
+    fn plan_patch_two_patches_apply_in_order() {
+        let reg = herm_registry();
+        let cfg = crate::config::Config::default();
+        let catalog = crate::profile::ProfileCatalog::default();
+        let prefs = crate::preferences::PreferenceSet::new();
+        let items = super::spawn_items_from_plan(vec![("codex".to_string(), 1)], None);
+        let patches = vec![
+            crate::swarm_plan::parse_patch("codex.harness=pi").expect("parses"),
+            crate::swarm_plan::parse_patch("codex.model=z").expect("parses"),
+        ];
+        let overrides = super::patch_role_overrides(&patches);
+        let out = super::build_dry_run_plan(
+            &cfg, &items, &catalog, &reg, "a/m", "", &prefs, "probe", &overrides,
+        )
+        .expect("patched plan builds");
+        let m = out.seats[0].model.as_ref().expect("model field");
+        assert_eq!(out.seats[0].harness, "pi", "first patch stuck");
+        assert_eq!(m.value, "z", "second patch wins");
+        assert_eq!(m.from, crate::swarm_plan::Provenance::User);
+    }
+
+    /// A role patch re-resolves EVERY seat of that role, not just the
+    /// first: two pi seats both carry the patched model from the user.
+    #[test]
+    fn plan_patch_role_patches_every_seat() {
+        let reg = herm_registry();
+        let cfg = crate::config::Config::default();
+        let catalog = crate::profile::ProfileCatalog::default();
+        let prefs = crate::preferences::PreferenceSet::new();
+        let items = super::spawn_items_from_plan(
+            vec![
+                ("pi".to_string(), 1),
+                ("pi".to_string(), 1),
+                ("opencode".to_string(), 1),
+            ],
+            None,
+        );
+        let patches = vec![crate::swarm_plan::parse_patch("pi.model=b/m").expect("parses")];
+        let overrides = super::patch_role_overrides(&patches);
+        let out = super::build_dry_run_plan(
+            &cfg, &items, &catalog, &reg, "", "", &prefs, "probe", &overrides,
+        )
+        .expect("patched plan builds");
+        let mut patched = 0;
+        for s in out.seats.iter().filter(|s| s.role == "pi") {
+            let m = s.model.as_ref().expect("model field");
+            assert_eq!(m.value, "b/m", "every pi seat re-resolves");
+            assert_eq!(m.from, crate::swarm_plan::Provenance::User);
+            patched += 1;
+        }
+        assert_eq!(patched, 2, "both pi seats patched, not just the first");
+        let r = out
+            .seats
+            .iter()
+            .find(|s| s.role == "opencode")
+            .expect("opencode seat");
+        assert!(r.model.is_none(), "other roles untouched: {:?}", r.model);
     }
 
     /// Rework defect 1: a model patch must reach the launch argv/env through
