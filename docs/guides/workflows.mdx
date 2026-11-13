@@ -128,18 +128,19 @@ Nested workflows use durable `ctx.run` children. The engine carries a serialized
 
 ## Formal Statechart Verification
 
-Per ADR-0021, all core lifecycle protocols (`SwarmLifecycle`, `P2PNegotiation`) are modeled as zero-divergence hierarchical statecharts (`elm-effect-xstate`). Formal reachability, quiescence, and deadlock-freedom verification gates run natively via `flywheel workflow verify`:
+`SwarmLifecycle` and `P2PNegotiation` are `elm-effect-xstate` charts. `flywheel workflow verify` checks their topology (ADR-0021 D5): every state is reachable, and every reachable leaf can reach its goal (a final state for `SwarmLifecycle`, `Idle` for the long-lived `P2PNegotiation`).
 
 ```bash
 flywheel workflow verify
 ```
 
 ```text
+workflow verify scope: topology only: every guard counts as enabled and data is not modelled, so a listed state is a real defect and an empty list is not a proof; no model checker runs
 workflow verify SwarmLifecycle: ok
 workflow verify P2PNegotiation: ok
 ```
 
-Passing `--json` outputs machine-readable verification verdicts (`schema: flywheel-workflow-verify.v1`) for CI gates like `scripts/clean-proof.sh`, while `--export-tla` prints the AST-derived TLA+ specification for TLC model checking.
+`--json` prints `schema: flywheel-workflow-verify.v2` with `checks.reachable.unreachable` and `checks.can_finish.stuck` per chart; `scripts/clean-proof.sh` gates on it. `--export-tla` prints a topology-only TLA+ module (states and edges, no guards or data). It is input for a model checker, not a result from one.
 
 ## Authoring and graduation
 

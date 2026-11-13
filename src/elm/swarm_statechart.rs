@@ -162,7 +162,13 @@ pub struct SwarmContext {
     pub traps_detected: Vec<String>,
     pub p2p_directives_log: Vec<String>,
     pub stage_history: Vec<String>,
+    #[serde(default)]
+    pub repairs: u32,
 }
+
+/// Failed review or verify verdicts a wave may repair. The verdict that
+/// reaches this count fails the wave (flywheel-crew: at most 32 repair loops).
+pub const MAX_REPAIRS: u32 = 32;
 
 /// Commands emitted by the swarm statechart. Ephemeral: the fold describes
 /// intent, the host interprets it.
@@ -226,6 +232,23 @@ fn p2p_verb(event: &SwarmEvent, verb: P2PVerb) -> bool {
 
 fn stage_done(event: &SwarmEvent, stage: SwarmStage) -> bool {
     matches!(event, SwarmEvent::StageDone { stage: s } if *s == stage)
+}
+
+fn review_failed(event: &SwarmEvent) -> bool {
+    matches!(event, SwarmEvent::ReviewVerdict { passed: false, .. })
+}
+
+fn verify_failed(event: &SwarmEvent) -> bool {
+    matches!(event, SwarmEvent::VerifyVerdict { passed: false, .. })
+}
+
+fn repairs_spent(ctx: &SwarmContext, _event: &SwarmEvent) -> bool {
+    ctx.repairs + 1 >= MAX_REPAIRS
+}
+
+fn count_repair(ctx: &mut SwarmContext, event: &SwarmEvent) {
+    ctx.repairs += 1;
+    record_stage(ctx, event);
 }
 
 fn record_stage(ctx: &mut SwarmContext, event: &SwarmEvent) {
@@ -387,25 +410,35 @@ impl StatechartDefinition for SwarmProgramDef {
                     .transition(SwarmState::Verify)
                     .on(|e| stage_done(e, SwarmStage::Review))
                     .assign(record_stage);
+                let give_up = node
+                    .transition(SwarmState::Failed)
+                    .on(review_failed)
+                    .guard(repairs_spent)
+                    .assign(count_repair);
                 let back = node
                     .transition(SwarmState::Execute)
-                    .on(|e| matches!(e, SwarmEvent::ReviewVerdict { passed: false, .. }))
-                    .assign(record_stage);
-                node.on(to_verify).on(to_verify_stage).on(back)
+                    .on(review_failed)
+                    .assign(count_repair);
+                node.on(to_verify).on(to_verify_stage).on(give_up).on(back)
             })
             .state(SwarmState::Verify, |node| {
                 let ok = node
                     .transition(SwarmState::Complete)
                     .on(|e| matches!(e, SwarmEvent::VerifyVerdict { passed: true, .. }))
                     .assign(record_stage);
+                let give_up = node
+                    .transition(SwarmState::Failed)
+                    .on(verify_failed)
+                    .guard(repairs_spent)
+                    .assign(count_repair);
                 let back = node
                     .transition(SwarmState::Execute)
-                    .on(|e| matches!(e, SwarmEvent::VerifyVerdict { passed: false, .. }))
-                    .assign(record_stage);
-                node.on(ok).on(back)
+                    .on(verify_failed)
+                    .assign(count_repair);
+                node.on(ok).on(give_up).on(back)
             })
-            .state(SwarmState::Complete, |node| node)
-            .state(SwarmState::Failed, |node| node)
+            .final_state(SwarmState::Complete, |node| node)
+            .final_state(SwarmState::Failed, |node| node)
             .build()
     }
 
@@ -733,5 +766,91 @@ mod tests {
             },
         );
         assert_eq!(m.model.state(), Some(&SwarmState::Execute));
+    }
+
+    fn at_review() -> StatechartModel<SwarmState, SwarmContext> {
+        let init = SwarmProgram::init(&Boot::default());
+        let m = step(
+            &init.model,
+            &SwarmEvent::Classified {
+                mode: "swarm".into(),
+            },
+        );
+        let m = step(
+            &m.model,
+            &SwarmEvent::ClaimSeen {
+                bead_id: "bd-x".into(),
+                agent: "BlackGorge".into(),
+            },
+        );
+        step(
+            &m.model,
+            &SwarmEvent::StageDone {
+                stage: SwarmStage::Execute,
+            },
+        )
+        .model
+    }
+
+    fn fail_review(
+        model: &StatechartModel<SwarmState, SwarmContext>,
+    ) -> StatechartModel<SwarmState, SwarmContext> {
+        step(
+            model,
+            &SwarmEvent::ReviewVerdict {
+                passed: false,
+                severity: 3,
+                notes: "fix".into(),
+            },
+        )
+        .model
+    }
+
+    fn redo_execute(
+        model: &StatechartModel<SwarmState, SwarmContext>,
+    ) -> StatechartModel<SwarmState, SwarmContext> {
+        step(
+            model,
+            &SwarmEvent::StageDone {
+                stage: SwarmStage::Execute,
+            },
+        )
+        .model
+    }
+
+    #[test]
+    fn every_state_is_reachable_and_every_leaf_can_finish() {
+        let topology = build_swarm_machine().topology();
+        assert_eq!(topology.unreachable(), Vec::<SwarmState>::new());
+        assert_eq!(topology.cannot_finish(), Vec::<SwarmState>::new());
+    }
+
+    #[test]
+    fn the_last_allowed_repair_still_returns_to_execute() {
+        let mut m = at_review();
+        for _ in 1..MAX_REPAIRS {
+            m = redo_execute(&fail_review(&m));
+        }
+        assert_eq!(m.state(), Some(&SwarmState::Review));
+        let m = step(
+            &m,
+            &SwarmEvent::ReviewVerdict {
+                passed: true,
+                severity: 0,
+                notes: "ok".into(),
+            },
+        );
+        assert_eq!(m.model.state(), Some(&SwarmState::Verify));
+    }
+
+    #[test]
+    fn a_failed_verdict_past_the_repair_cap_fails_the_wave() {
+        let mut m = at_review();
+        for _ in 1..MAX_REPAIRS {
+            m = redo_execute(&fail_review(&m));
+        }
+        let m = fail_review(&m);
+        assert_eq!(m.state(), Some(&SwarmState::Failed));
+        assert_eq!(m.context.repairs, MAX_REPAIRS);
     }
 }

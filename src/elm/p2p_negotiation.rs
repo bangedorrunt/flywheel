@@ -337,4 +337,14 @@ mod tests {
         );
         assert_eq!(update.model.state(), Some(&P2PNegotiationState::Proposed));
     }
+
+    #[test]
+    fn every_state_is_reachable_and_returns_to_idle() {
+        let topology = build_p2p_negotiation_machine().topology();
+        assert_eq!(topology.unreachable(), Vec::<P2PNegotiationState>::new());
+        assert_eq!(
+            topology.cannot_reach(|s| *s == P2PNegotiationState::Idle),
+            Vec::<P2PNegotiationState>::new()
+        );
+    }
 }

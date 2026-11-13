@@ -108,12 +108,12 @@ pass.
 - **TypeSafe AI System One arbitration (ADR-0016).** `p2p-conflict-resolution`
   (Choice) and `peer-review-severity` (Score 1..4) provide sub-100ms structured
   advisory evidence without LLM hallucination. Advisory only; pure tick holds.
-- **Formal Statechart Verification Phase (ADR-0021).** Zero-divergence TLA+ proofs
-  and reachability/quiescence/deadlock-freedom checks run natively via
-  `flywheel workflow verify [NAME] [--export-tla] [--json]` and are enforced by
-  `scripts/clean-proof.sh`. Lateral negotiation protocols (`src/elm/p2p_negotiation.rs`)
-  and swarm lifecycle (`src/elm/swarm_statechart.rs`) are mathematically verified
-  against state explosion and deadlocks before deployment.
+- **Statechart topology checks (ADR-0021 D5).** `flywheel workflow verify [NAME]
+  [--export-tla] [--json]` (`flywheel-workflow-verify.v2`) checks
+  `src/elm/swarm_statechart.rs` and `src/elm/p2p_negotiation.rs`: every state
+  reachable, every reachable leaf can reach its goal. Guards count as enabled
+  and data is not modelled, so a pass is not a proof; `--export-tla` text is
+  topology-only and no model checker runs. `scripts/clean-proof.sh` gates on it.
 - **Skill sync.** CLI change → `Commands` enum + `--robot-capabilities` + this
   file's critical list + `~/.agents/skills/flywheel/SKILL.md` §5.
 
