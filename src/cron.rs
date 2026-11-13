@@ -1521,9 +1521,10 @@ async fn drive_cron_body(
     });
     let job_watcher = crate::mail::try_mailbox()
         .map(|mb| toron_workflow::engine::durable::bus_job_watcher(mb.bus().clone()));
-    let witness = crate::stages::StageLibrary::load()
-        .ok()
-        .map(|lib| lib.witness_checker());
+    let witness = Some(match crate::stages::StageLibrary::load() {
+        Ok(lib) => lib.witness_checker(),
+        Err(e) => crate::stages::StageLibrary::witness_checker_unavailable(format!("{e:#}")),
+    });
     let seams = crate::durable_body::BodySeams {
         leaf: LeafSeams {
             async_runner: None,

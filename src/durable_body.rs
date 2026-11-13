@@ -135,23 +135,29 @@ pub fn real_verify_sink() -> toron_workflow::engine::VerifySink {
     sink
 }
 
+/// The stage the settled step dispatches under, when the step carries one.
+/// Spawn steps carry none, so the gate correctly skips them.
+fn settle_stage(run: &LinearRun) -> Option<String> {
+    let model = run.model();
+    let (_, step) = model.plan.step_at(model.step_index)?;
+    match &step.action {
+        toron_workflow::schema::Action::DispatchJob { spec, .. } => spec.stage.clone(),
+        _ => None,
+    }
+}
+
 /// Run the stage witness gate on one settled step output. None settles
 /// unchanged: no seam, no stage on the step, or no declared witness. A
 /// failing report returns the typed refusal that replaces success.
 fn witness_refusal(
     seam: Option<&WitnessCheck>,
-    run: &LinearRun,
     node: &str,
+    stage: Option<&str>,
     value: &Value,
 ) -> Option<String> {
     let check = seam?;
-    let model = run.model();
-    let (_, step) = model.plan.step_at(model.step_index)?;
-    let stage = match &step.action {
-        toron_workflow::schema::Action::DispatchJob { spec, .. } => spec.stage.clone()?,
-        _ => return None,
-    };
-    let report = check(&stage, value)?;
+    let stage = stage?;
+    let report = check(stage, value)?;
     if report.ok {
         return None;
     }
@@ -330,6 +336,21 @@ async fn drive_linear(
                     };
                     let deadline = run.model().deadline_ms();
                     let outcome = await_spawn(&launcher, &spec, deadline, clock()).await;
+                    let stage = settle_stage(&run);
+                    let outcome = match outcome {
+                        SpawnLaunch::Settled(value) => {
+                            match witness_refusal(
+                                seams.witness.as_ref(),
+                                &node,
+                                stage.as_deref(),
+                                &value,
+                            ) {
+                                Some(error) => SpawnLaunch::Failed(error),
+                                None => SpawnLaunch::Settled(value),
+                            }
+                        }
+                        other => other,
+                    };
                     let c = clock.clone();
                     let then = move |mut run: LinearRun| match outcome {
                         SpawnLaunch::Settled(value) => {
@@ -392,9 +413,15 @@ async fn drive_linear(
                         clock(),
                     )
                     .await;
+                    let stage = settle_stage(&run);
                     let outcome = match outcome {
                         JobWatchOutcome::Settled(value) => {
-                            match witness_refusal(seams.witness.as_ref(), &run, &node, &value) {
+                            match witness_refusal(
+                                seams.witness.as_ref(),
+                                &node,
+                                stage.as_deref(),
+                                &value,
+                            ) {
                                 Some(error) => JobWatchOutcome::Failed(error),
                                 None => JobWatchOutcome::Settled(value),
                             }
@@ -1440,6 +1467,141 @@ mod tests {
             "refusal carries the report detail: {error}"
         );
         assert_eq!(step.as_deref(), Some("j"));
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// A broken stage catalog fails closed: every staged step is refused
+    /// with the load error instead of settling ungated.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_body_witness_catalog_error_fails_closed() {
+        let (store, db) = watch_test_store("witness-catalog").await;
+        let wf = toron_workflow::schema::parse_workflow(
+            "name: witness-catalog\nsteps:\n  - name: j\n    action: dispatch_job\n    assignee: x\n    spec: { task: hi, stage: s }\n    await: result\n    result_timeout: 60\n    on_error: fail_run\n",
+        )
+        .expect("parse dispatch await");
+        let (watcher, _queue) = queue_watcher(vec![
+            JobWatchOutcome::Claimed,
+            JobWatchOutcome::Settled(serde_json::json!({
+                "ok": true,
+                "job": "job-1",
+                "body": "did it",
+            })),
+        ]);
+        let seams = BodySeams {
+            leaf: LeafSeams {
+                async_runner: Some(receipt_runner()),
+                sync_runner: None,
+                verify_sink: toron_workflow::engine::VerifySink::default(),
+                journal_mode: toron_workflow::engine::EffectJournalMode::Recording,
+            },
+            launcher: None,
+            job_watcher: Some(watcher),
+            witness: Some(crate::stages::StageLibrary::witness_checker_unavailable(
+                "bad user stages.toml".to_string(),
+            )),
+            clock: frozen_clock(),
+            spawn_resolver: None,
+            resolve_child: None,
+        };
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            drive(
+                &store,
+                "witness-catalog-1",
+                &wf,
+                serde_json::json!({}),
+                &seams,
+            ),
+        )
+        .await
+        .expect("a catalog failure must fail fast");
+        let BodyOutcome::Failed { error, step } = outcome else {
+            panic!("a broken catalog never settles staged steps: {outcome:?}");
+        };
+        for part in ["j", "s", "unavailable", "bad user stages.toml"] {
+            assert!(
+                error.contains(part),
+                "refusal names step, stage and the load error ({part}): {error}"
+            );
+        }
+        assert_eq!(step.as_deref(), Some("j"));
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// Spawn steps carry no stage, so the gated StartSpawn arm consults
+    /// the gate and settles: the fail-everything spy is never called.
+    /// (A failing spawn witness needs `stage` on the spawn path, which
+    /// neither `Action::Spawn` nor `SpawnSpec` carries today.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_body_witness_spawn_unstaged_settles() {
+        let (store, db) = watch_test_store("witness-spawn").await;
+        let wf = toron_workflow::schema::parse_workflow(
+            "name: witness-spawn\nsteps:\n  - name: j\n    action: spawn\n    profile: \"@housekeeper\"\n    workflow: child\n    await: true\n    no_claim_timeout: 600\n",
+        )
+        .expect("parse spawn await");
+        let launcher: toron_workflow::engine::spawn::SpawnLauncher = std::sync::Arc::new(|spec| {
+            Box::pin(
+                async move { Ok(serde_json::json!({ "ok": true, "spawn_key": spec.spawn_key })) },
+            )
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
+                >
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let witness: WitnessCheck = Arc::new(move |_stage: &str, _output: &Value| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            Some(crate::phase_contracts::PhaseContractReport {
+                phase: "witness",
+                ok: false,
+                evidence: "spy must never fire for a stageless step".to_string(),
+            })
+        });
+        let seams = BodySeams {
+            leaf: LeafSeams {
+                async_runner: None,
+                sync_runner: None,
+                verify_sink: toron_workflow::engine::VerifySink::default(),
+                journal_mode: toron_workflow::engine::EffectJournalMode::Recording,
+            },
+            launcher: Some(launcher),
+            job_watcher: None,
+            witness: Some(witness),
+            clock: frozen_clock(),
+            spawn_resolver: Some(std::sync::Arc::new(|profile: &str| {
+                (profile == "@housekeeper").then(|| {
+                    serde_json::json!({
+                        "npub": "",
+                        "spec": { "harness": "pi" }
+                    })
+                })
+            })),
+            resolve_child: None,
+        };
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            drive(
+                &store,
+                "witness-spawn-1",
+                &wf,
+                serde_json::json!({}),
+                &seams,
+            ),
+        )
+        .await
+        .expect("an unstaged spawn must settle fast");
+        let BodyOutcome::Completed(output) = outcome else {
+            panic!("a stageless spawn settles: {outcome:?}");
+        };
+        assert!(
+            output["steps"]["j"]["ok"].as_bool().unwrap_or(false),
+            "spawn settled: {output}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the gate never fires without a stage"
+        );
         let _ = std::fs::remove_file(&db);
     }
 

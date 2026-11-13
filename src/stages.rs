@@ -738,6 +738,19 @@ impl StageLibrary {
         })
     }
 
+    /// Fail-closed seam for an unloadable catalog: every staged step is
+    /// refused with the load error. A broken catalog never reads as
+    /// "no witnesses".
+    pub fn witness_checker_unavailable(reason: String) -> crate::durable_body::WitnessCheck {
+        std::sync::Arc::new(move |_stage: &str, _output: &serde_json::Value| {
+            Some(crate::phase_contracts::PhaseContractReport {
+                phase: "witness",
+                ok: false,
+                evidence: format!("stage catalog unavailable: {reason}"),
+            })
+        })
+    }
+
     /// One `stage list --all` row: name + tier + the §3.8 metadata.
     pub fn list_tiered(&self) -> Vec<StageRow> {
         self.stages
