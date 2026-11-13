@@ -418,7 +418,9 @@ mod tests {
     }
 
     fn with_chie_bin<T>(bin: &Path, f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let old = std::env::var_os("FLYWHEEL_CHIE_BIN");
         unsafe { std::env::set_var("FLYWHEEL_CHIE_BIN", bin) };
         let out = f();

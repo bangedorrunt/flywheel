@@ -136,6 +136,14 @@ fn probe_bin(name: &'static str) -> BinaryProbe {
 /// The generation hash is SHA-1 over the first 8 KiB of the flywheel binary
 /// (`doorbell::binary_hash`); only live hosts with a different non-empty hash
 /// need replacement.
+fn is_live_pid(pid: u64) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 fn stale_host_pids(health: &Value, installed_hash: &str) -> Vec<u64> {
     health
         .get("hosts")
@@ -151,13 +159,6 @@ fn stale_host_pids(health: &Value, installed_hash: &str) -> Vec<u64> {
         })
         .filter_map(|host| host.get("pid").and_then(Value::as_u64))
         .filter(|pid| *pid > 1)
-        .filter(|pid| {
-            Command::new("kill")
-                .args(["-0", &pid.to_string()])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        })
         .collect()
 }
 
@@ -235,10 +236,15 @@ fn stack_status(json_output: bool, check: bool) -> Result<()> {
         && health_version != installed_doorbell_version;
     let flywheel_version_skew = !installed_flywheel_version.is_empty()
         && installed_flywheel_version != env!("CARGO_PKG_VERSION");
-    let stale_pids = health
+    let stale_pids: Vec<u64> = health
         .as_ref()
         .zip(installed_hash.as_deref())
-        .map(|(health, hash)| stale_host_pids(health, hash))
+        .map(|(health, hash)| {
+            stale_host_pids(health, hash)
+                .into_iter()
+                .filter(|pid| is_live_pid(*pid))
+                .collect()
+        })
         .unwrap_or_default();
     let (toron, toron_error) = toron_status();
     let toron_restart_required = toron
