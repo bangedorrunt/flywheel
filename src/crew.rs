@@ -595,8 +595,9 @@ fn rewrite_action(action: &Action, aliases: &BTreeMap<String, String>) -> Action
             over: over.clone(),
             each: Box::new(rewrite_step(each, aliases)),
         },
-        Action::Loop { max, until, body } => Action::Loop {
+        Action::Loop { max, min, until, body } => Action::Loop {
             max: max.clone(),
+            min: min.clone(),
             until: until.clone(),
             body: rewrite_steps(body, aliases),
         },
@@ -707,8 +708,9 @@ pub fn resolve_crew_fanouts(workflow: &Workflow, plan: &CrewPlan) -> Workflow {
                 over: over.clone(),
                 each: Box::new(resolve_step(each, plan)),
             },
-            Action::Loop { max, until, body } => Action::Loop {
+            Action::Loop { max, min, until, body } => Action::Loop {
                 max: max.clone(),
+                min: min.clone(),
                 until: until.clone(),
                 body: resolve_steps(body, plan),
             },
@@ -1946,6 +1948,49 @@ steps:
         assert_eq!(plan.total(), 2, "unique roles, not occurrence count");
     }
 
+    /// Loop rebuilds preserve `min` (ADR-0021 D7): alias + fanout rewrites
+    /// must carry the minimum-pass gate, not drop it.
+    #[test]
+    fn loop_rewrites_preserve_min() {
+        use toron_workflow::schema::Action;
+        let wf = toron_workflow::schema::parse_workflow(
+            r#"
+name: t
+trigger:
+  type: webhook
+steps:
+  - name: polish
+    action: loop
+    min: 2
+    max: 5
+    until: 'steps_fence_ok == true'
+    body:
+      - name: check
+        action: send_dm
+        to: x
+        body: y
+"#,
+        )
+        .expect("parse loop with min");
+        let Action::Loop { min, .. } = &wf.steps[0].action else {
+            panic!("expected loop");
+        };
+        assert_eq!(min.as_deref(), Some("2"));
+        let aliases = std::collections::BTreeMap::from([("@coder".to_string(), "@reviewer".to_string())]);
+        let rewritten = apply_role_aliases(&wf, &aliases);
+        let Action::Loop { min, max, .. } = &rewritten.steps[0].action else {
+            panic!("expected loop after alias rewrite");
+        };
+        assert_eq!(min.as_deref(), Some("2"), "alias rewrite keeps min");
+        assert_eq!(max, "5");
+        let plan = plan_crew(&wf);
+        let resolved = resolve_crew_fanouts(&wf, &plan);
+        let Action::Loop { min, .. } = &resolved.steps[0].action else {
+            panic!("expected loop after fanout resolve");
+        };
+        assert_eq!(min.as_deref(), Some("2"), "fanout resolve keeps min");
+    }
+
     /// bd-adv4: a `crew: auto` step riding the profile-pick input template
     /// still seats a coder — the implement profile is decided at invoke
     /// time, the seat is known at plan time.
@@ -2808,7 +2853,7 @@ steps:
             .expect("graph-form token expands to graph");
         assert_eq!(
             graph.nodes.len(),
-            16,
+            11,
             "polish loop + audit + fence_final + outer implement gate + existing-bead implement (guards ride ON the nodes): {:?}",
             graph.nodes.keys().collect::<Vec<_>>()
         );
@@ -2937,7 +2982,7 @@ steps:
         assert_eq!(wf.steps.len(), 1, "the plain part lands in steps");
         assert_eq!(
             wf.graph.as_ref().expect("graph").nodes.len(),
-            16,
+            11,
             "the token lands in the graph (polish loop + audit + fence_final + existing-bead implement + outer gate)"
         );
         let err = compose_workflow_with(

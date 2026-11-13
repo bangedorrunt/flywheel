@@ -1370,7 +1370,7 @@ steps:
 name: beads-lifecycle
 compose: true
 shape: polish
-description: "The beads authoring lifecycle. grill (ce-brainstorm) sharpens the objective (goal JSON); create nests phase-plan via call_workflow; polish_1 + polish_2 + polish_more (loop max 3) revise under the fence until converged; audit (fresh plan-polish) returns findings only; integrate folds findings and re-checks cycles; fence_final gates the plan; implement hands off to wave-swarm (new graph) or babysit-bead (existing_bead); verify proves with evidence; signoff suspends for captain-only approval. inputs.from=none|session|adr|bead skips grill→fence_final when from=bead or existing_bead is set. inputs.until early-exits SUCCESS after any phase; gate_before_implement adds one outer approval between fence_final and implement."
+description: "The beads authoring lifecycle. grill (ce-brainstorm) sharpens the objective (goal JSON); create nests phase-plan via call_workflow; polish (loop min 2 max 5) revises under the fence until converged; audit (fresh plan-polish) returns findings only; integrate folds findings and re-checks cycles; fence_final gates the plan; implement hands off to wave-swarm (new graph) or babysit-bead (existing_bead); verify proves with evidence; signoff suspends for captain-only approval. inputs.from=none|session|adr|bead skips grill→fence_final when from=bead or existing_bead is set. inputs.until early-exits SUCCESS after any phase; gate_before_implement adds one outer approval between fence_final and implement."
 trigger:
   type: webhook
 crew: auto
@@ -1414,51 +1414,12 @@ graph:
       workflow: phase-plan
       inputs: { goal: "{{inputs.objective}}" }
       on_error: fail_run
-    polish_1:
+    polish:
       needs: [create]
       guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_from != "bead" && trigger_existing_bead == ""'
-      action: dispatch_job
-      assignee: x
-      spec:
-        profile: "@planner"
-        stage: plan-polish
-        effort: max
-        task: 'Polish round 1 for {{inputs.objective}}: revise the beads from {{steps.create}} against the requirements from {{steps.grill}}.'
-      on_error: fail_run
-    snap:
-      needs: [polish_1]
-      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_from != "bead" && trigger_existing_bead == ""'
-      action: verify
-      command: 'flywheel __plan-fence converged --state {{inputs.polish_state}}'
-      on_error: continue
-    polish_2:
-      needs: [snap]
-      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_from != "bead" && trigger_existing_bead == ""'
-      action: dispatch_job
-      assignee: x
-      spec:
-        profile: "@planner"
-        stage: plan-polish
-        effort: max
-        task: 'Polish round 2 for {{inputs.objective}}: revise the beads from {{steps.polish_1}} against the requirements from {{steps.grill}}.'
-      on_error: fail_run
-    fence_2:
-      needs: [polish_2]
-      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_from != "bead" && trigger_existing_bead == ""'
-      action: verify
-      command: 'flywheel __plan-fence fence'
-      on_error: continue
-    converged_2:
-      needs: [fence_2]
-      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_from != "bead" && trigger_existing_bead == ""'
-      action: verify
-      command: 'flywheel __plan-fence converged --state {{inputs.polish_state}}'
-      on_error: continue
-    polish_more:
-      needs: [converged_2]
-      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_from != "bead" && trigger_existing_bead == "" && (steps_fence_2_ok != true || steps_converged_2_ok != true)'
       action: loop
-      max: 3
+      min: 2
+      max: 5
       until: 'steps_fence_ok == true && steps_converged_ok == true'
       on_error: fail_run
       body:
@@ -1480,7 +1441,7 @@ graph:
           command: 'flywheel __plan-fence converged --state {{inputs.polish_state}}'
           on_error: continue
     audit:
-      needs: [polish_more]
+      needs: [polish]
       guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "polish" && trigger_from != "bead" && trigger_existing_bead == ""'
       action: dispatch_job
       assignee: x
@@ -3565,7 +3526,7 @@ mod tests {
             .find(|s| s.name.as_deref() == Some("cycle"))
             .expect("cycle");
         assert_eq!(cycle.on_error, StepOnError::FailRun);
-        let Action::Loop { max, until, body } = &cycle.action else {
+        let Action::Loop { max, until, body, .. } = &cycle.action else {
             panic!("cycle is a loop");
         };
         assert_eq!(max, "{{inputs.max_iterations}}");
@@ -3754,7 +3715,7 @@ mod tests {
             .find(|s| s.name.as_deref() == Some("climb"))
             .expect("hillclimb has the climb step");
         assert_eq!(climb.on_error, StepOnError::FailRun);
-        let Action::Loop { max, until, body } = &climb.action else {
+        let Action::Loop { max, until, body, .. } = &climb.action else {
             panic!("climb is a loop");
         };
         assert_eq!(max, "{{inputs.max_iters}}");
@@ -3948,12 +3909,7 @@ mod tests {
         let phase_order = [
             "grill",
             "create",
-            "polish_1",
-            "snap",
-            "polish_2",
-            "fence_2",
-            "converged_2",
-            "polish_more",
+            "polish",
             "audit",
             "integrate",
             "fence_final",
@@ -4008,12 +3964,7 @@ mod tests {
         let expected_nodes = [
             "grill",
             "create",
-            "polish_1",
-            "snap",
-            "polish_2",
-            "fence_2",
-            "converged_2",
-            "polish_more",
+            "polish",
             "audit",
             "integrate",
             "fence_final",
@@ -4078,8 +4029,8 @@ mod tests {
         let wf = &wfs["beads-lifecycle"];
         let graph = wf.graph.as_ref().expect("graph form");
         // Until phases (ADR-0021 D7): grill | create | polish | audit |
-        // integrate | implement | verify | signoff. Polish covers six nodes
-        // that share the same until prefix; audit/integrate are single nodes.
+        // integrate | implement | verify | signoff. Polish is one loop node;
+        // audit/integrate are single nodes.
         let phases = [
             "grill",
             "create",
@@ -4093,7 +4044,7 @@ mod tests {
         let node_for_phase: std::collections::HashMap<&str, &str> = [
             ("grill", "grill"),
             ("create", "create"),
-            ("polish", "polish_1"),
+            ("polish", "polish"),
             ("audit", "audit"),
             ("integrate", "integrate"),
             ("implement", "implement"),
@@ -4167,8 +4118,8 @@ mod tests {
     }
 
     /// ADR-0021 D7: polish loop + plan-polish stage (bd-plan-polish-loop-8delw).
-    /// No judge-arms; polish_1/polish_2/body polish/audit/integrate dispatch
-    /// plan-polish effort max; audit fresh; polish_more loop max 3 until
+    /// No judge-arms; body polish/audit/integrate dispatch
+    /// plan-polish effort max; audit fresh; polish loop min 2 max 5 until
     /// fence+converged fail_run; fence_final fail_run; stage role/phase/prompt.
     #[test]
     fn beads_lifecycle_plan_polish_loop() {
@@ -4185,7 +4136,7 @@ mod tests {
                 );
             }
         }
-        for id in ["polish_1", "polish_2", "audit", "integrate"] {
+        for id in ["audit", "integrate"] {
             let node = graph
                 .nodes
                 .get(id)
@@ -4205,19 +4156,20 @@ mod tests {
             matches!(spec.context, Some(ContextMode::Fresh)),
             "audit fresh"
         );
-        let pm = &graph.nodes["polish_more"];
-        let Action::Loop { max, until, body } = &pm.action else {
-            panic!("polish_more is a loop");
+        let pm = &graph.nodes["polish"];
+        let Action::Loop { max, min, until, body, .. } = &pm.action else {
+            panic!("polish is a loop");
         };
-        assert_eq!(max, "3", "polish_more max 3");
+        assert_eq!(min.as_deref(), Some("2"), "polish min 2");
+        assert_eq!(max, "5", "polish max 5");
         assert_eq!(
             until.as_deref(),
             Some("steps_fence_ok == true && steps_converged_ok == true"),
-            "polish_more until"
+            "polish until"
         );
         assert!(
             matches!(pm.on_error, StepOnError::FailRun),
-            "polish_more fail_run"
+            "polish fail_run"
         );
         let polish = body
             .iter()
@@ -4245,19 +4197,26 @@ mod tests {
             )),
             "polish_state default"
         );
-        for id in ["snap", "converged_2"] {
-            let node = graph
-                .nodes
-                .get(id)
-                .unwrap_or_else(|| panic!("{id} present"));
-            let Action::Verify { command } = &node.action else {
-                panic!("{id} is a verify");
-            };
+        for id in ["polish_1", "snap", "polish_2", "fence_2", "converged_2", "polish_more"] {
             assert!(
-                command.contains("{{inputs.polish_state}}"),
-                "{id} uses polish_state: {command}"
+                !graph.nodes.contains_key(id),
+                "retired node {id} absent after collapse"
             );
         }
+        for name in ["polish", "fence", "converged"] {
+            assert!(
+                body.iter().any(|s| s.name.as_deref() == Some(name)),
+                "loop body has {name}"
+            );
+        }
+        let body_fence = body
+            .iter()
+            .find(|s| s.name.as_deref() == Some("fence"))
+            .expect("body fence");
+        assert!(
+            matches!(&body_fence.action, Action::Verify { .. }),
+            "body fence is a verify"
+        );
         let body_converged = body
             .iter()
             .find(|s| s.name.as_deref() == Some("converged"))
