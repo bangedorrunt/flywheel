@@ -43,6 +43,19 @@ impl PhaseContractReport {
 /// The review verdict vocabulary (§4 review row): a closed set.
 pub const REVIEW_VERDICTS: [&str; 3] = ["AGREE", "AGREE-WITH-CHANGES", "REJECT"];
 
+/// The closed witness registry (ADR-0021 D4.2): every `witness` name a stage
+/// may carry. The five phase contracts under their phase names, plus the
+/// polish-round exit contract. `lint_stage` rejects anything outside this
+/// list on every tier — a typo'd witness is a silent never-exit.
+pub const WITNESSES: &[&str] = &[
+    "resolve",
+    "plan",
+    "implement",
+    "review",
+    "verify",
+    "polish-round",
+];
+
 /// Extract the machine-readable report from a dispatch step output.
 /// `{"response": "<json>"}` (headless leaf) parses the inner JSON; an
 /// already-object value passes through; anything else is not a report.
@@ -283,6 +296,91 @@ pub fn check_phase(phase: &str, step_out: &serde_json::Value) -> PhaseContractRe
     }
 }
 
+/// ADR-0021 D7 polish-round: the report carries `changed` (bool), a
+/// non-empty `coverage` array of `{requirement, beads: [id, ...]}` rows each
+/// with at least one bead, and `tests_named` (bool). Fails naming the
+/// missing or empty field.
+///
+/// Not yet called by runtime code: step-exit wiring is a later slice; the
+/// contract is exercised by its unit tests until then.
+#[allow(dead_code)]
+pub fn polish_round_contract(report: &serde_json::Value) -> PhaseContractReport {
+    let Some(changed) = report.get("changed").and_then(serde_json::Value::as_bool) else {
+        return PhaseContractReport::fail(
+            "polish-round",
+            "polish-round report missing `changed` (bool)".into(),
+        );
+    };
+    let Some(coverage) = report.get("coverage").and_then(serde_json::Value::as_array) else {
+        return PhaseContractReport::fail(
+            "polish-round",
+            "polish-round report missing `coverage` (non-empty array of {requirement, beads})"
+                .into(),
+        );
+    };
+    if coverage.is_empty() {
+        return PhaseContractReport::fail(
+            "polish-round",
+            "polish-round `coverage` is empty (needs ≥1 {requirement, beads} row)".into(),
+        );
+    }
+    for (i, row) in coverage.iter().enumerate() {
+        let beads_ok = row
+            .get("beads")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|b| !b.is_empty() && b.iter().all(|id| non_empty_str(id).is_some()));
+        if !beads_ok {
+            return PhaseContractReport::fail(
+                "polish-round",
+                format!("polish-round `coverage` row {i} has no beads (needs ≥1 bead id)"),
+            );
+        }
+    }
+    let Some(tests_named) = report
+        .get("tests_named")
+        .and_then(serde_json::Value::as_bool)
+    else {
+        return PhaseContractReport::fail(
+            "polish-round",
+            "polish-round report missing `tests_named` (bool)".into(),
+        );
+    };
+    PhaseContractReport::ok(
+        "polish-round",
+        format!(
+            "changed={changed}; {} coverage row(s) each with beads; tests_named={tests_named}",
+            coverage.len()
+        ),
+    )
+}
+
+/// ADR-0021 D4.2: resolve a witness name to its checked contract. Phase
+/// names delegate to [`check_phase`] (same input, same report); unknown
+/// names fail naming the witness. Never succeeds by default.
+///
+/// Not yet called by runtime code: step-exit wiring is a later slice; the
+/// checker is exercised by its unit tests until then.
+#[allow(dead_code)]
+pub fn check_witness(name: &str, step_out: &serde_json::Value) -> PhaseContractReport {
+    if !WITNESSES.contains(&name) {
+        return PhaseContractReport::fail(
+            "witness",
+            format!("unknown witness `{name}` (valid: {})", WITNESSES.join(", ")),
+        );
+    }
+    if name == "polish-round" {
+        let Some(report) = agent_report(step_out) else {
+            return PhaseContractReport::fail(
+                "polish-round",
+                "no machine-readable report for witness `polish-round` (response is not JSON)"
+                    .into(),
+            );
+        };
+        return polish_round_contract(&report);
+    }
+    check_phase(name, step_out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,5 +551,100 @@ mod tests {
         assert!(!prose.ok && prose.evidence.contains("no machine-readable report"));
         let unknown = check_phase("brainstorm", &json!({ "x": 1 }));
         assert!(!unknown.ok && unknown.evidence.contains("no §4.5 contract"));
+    }
+
+    /// bd-witnessed-exits-hd035: polish-round passes a full report.
+    #[test]
+    fn check_witness_polish_round_passes_full_report() {
+        let r = check_witness(
+            "polish-round",
+            &json!({
+                "changed": true,
+                "coverage": [
+                    {"requirement": "no lost features", "beads": ["bd-abc1", "bd-abc2"]}
+                ],
+                "tests_named": true
+            }),
+        );
+        assert!(r.ok, "{}", r.evidence);
+        assert_eq!(r.phase, "polish-round");
+    }
+
+    /// bd-witnessed-exits-hd035: polish-round fails naming each bad field.
+    #[test]
+    fn check_witness_polish_round_fails_naming_each_bad_field() {
+        let r = check_witness(
+            "polish-round",
+            &json!({
+                "coverage": [{"requirement": "x", "beads": ["bd-1"]}],
+                "tests_named": true
+            }),
+        );
+        assert!(!r.ok && r.evidence.contains("changed"), "{}", r.evidence);
+        let r = check_witness(
+            "polish-round",
+            &json!({"changed": false, "coverage": [], "tests_named": true}),
+        );
+        assert!(!r.ok && r.evidence.contains("coverage"), "{}", r.evidence);
+        let r = check_witness(
+            "polish-round",
+            &json!({
+                "changed": true,
+                "coverage": [{"requirement": "x", "beads": []}],
+                "tests_named": true
+            }),
+        );
+        assert!(!r.ok && r.evidence.contains("beads"), "{}", r.evidence);
+        let r = check_witness(
+            "polish-round",
+            &json!({
+                "changed": true,
+                "coverage": [{"requirement": "x", "beads": ["bd-1"]}]
+            }),
+        );
+        assert!(
+            !r.ok && r.evidence.contains("tests_named"),
+            "{}",
+            r.evidence
+        );
+    }
+
+    /// bd-witnessed-exits-hd035: unknown names fail naming the witness.
+    #[test]
+    fn check_witness_unknown_name_fails_naming_it() {
+        let r = check_witness("nonsense", &json!({"changed": true}));
+        assert!(!r.ok, "never succeed by default");
+        assert!(r.evidence.contains("nonsense"), "{}", r.evidence);
+    }
+
+    /// bd-witnessed-exits-hd035: witness and phase checks agree on phases.
+    #[test]
+    fn check_witness_and_check_phase_agree_for_all_phases() {
+        let reports = [
+            (
+                "resolve",
+                json!({"target": "t", "non_goals": ["n"], "blast_radius": "b", "open_questions": []}),
+            ),
+            (
+                "plan",
+                json!({"beads": [{"id": "bd-1", "acceptance": "x"}], "dep_cycles": 0}),
+            ),
+            (
+                "implement",
+                json!({"commit_sha": "abc", "commit_message": "fix (bd-abc1)",
+                         "gate": {"command": "true", "exit": 0, "output": "ok"}}),
+            ),
+            ("review", json!({"findings": ["x"], "verdict": "AGREE"})),
+            (
+                "verify",
+                json!({"gate": {"command": "true", "exit": 0, "output": "ok"}}),
+            ),
+        ];
+        for (phase, report) in reports {
+            let step_out = json!({"response": serde_json::to_string(&report).unwrap()});
+            let a = check_witness(phase, &step_out);
+            let b = check_phase(phase, &step_out);
+            assert_eq!(a, b, "witness and phase agree on {phase}");
+        }
     }
 }

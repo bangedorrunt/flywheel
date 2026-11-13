@@ -255,6 +255,18 @@ const SEED_PHASE: &[(&str, &str)] = &[
     ("wave-verify", "verify"),
 ];
 
+/// Seed witness contracts (ADR-0021 D4.2): the named contract checked at the
+/// step exit. Every name must be in `phase_contracts::WITNESSES` (lint
+/// enforces on every tier); a typo'd witness is a silent never-exit.
+const SEED_WITNESS: &[(&str, &str)] = &[
+    ("ce-plan", "plan"),
+    ("plan-polish", "polish-round"),
+    ("ce-execute", "implement"),
+    ("ce-review", "review"),
+    ("wave-verify", "verify"),
+    ("prove-verify", "verify"),
+];
+
 /// Seed one-line dispatch notes (ADR-0021 D6): when to use each stage.
 const SEED_USE_WHEN: &[(&str, &str)] = &[
     (
@@ -575,6 +587,11 @@ impl StageLibrary {
                 stage.phase = Some(phase.to_string());
             }
         }
+        for (name, witness) in SEED_WITNESS {
+            if let Some(stage) = stages.get_mut(*name) {
+                stage.witness = Some(witness.to_string());
+            }
+        }
         for (name, use_when) in SEED_USE_WHEN {
             if let Some(stage) = stages.get_mut(*name) {
                 stage.use_when = Some(use_when.to_string());
@@ -856,6 +873,14 @@ pub fn lint_stage(stage: &Stage, valid_roles: &[String]) -> Vec<String> {
         issues.push(format!(
             "{label}: unknown phase {phase:?} (valid: {})",
             PHASES.join(", ")
+        ));
+    }
+    if let Some(witness) = &stage.witness
+        && !crate::phase_contracts::WITNESSES.contains(&witness.as_str())
+    {
+        issues.push(format!(
+            "{label}: unknown witness {witness:?} (valid: {})",
+            crate::phase_contracts::WITNESSES.join(", ")
         ));
     }
     for p in &stage.principles {
@@ -2464,5 +2489,44 @@ mod wave_gate_typed_authority_tests {
         let text = render_stage_entry(&st).expect("renders");
         let back: Stage = toml::from_str(&text).expect("parses back");
         assert_eq!(back, st);
+    }
+
+    /// bd-witnessed-exits-hd035: an unknown witness is an ERROR on every
+    /// tier (a typo'd witness is a silent never-exit).
+    #[test]
+    fn lint_stage_rejects_unknown_witness_on_every_tier() {
+        for tier in [Tier::Seed, Tier::Repo, Tier::User, Tier::Project] {
+            let mut st = scaffold("witness-bad");
+            st.phase = Some("plan".to_string());
+            st.witness = Some("nonsense".to_string());
+            let (errors, _) = lint_stage_tiered(&st, &[], tier);
+            assert!(
+                errors.iter().any(|e| e.contains("nonsense")),
+                "{tier:?} must error: {errors:?}"
+            );
+        }
+    }
+
+    /// bd-witnessed-exits-hd035: the seed witnesses are present and known,
+    /// and no seed stage trips the witness rule.
+    #[test]
+    fn seed_witnesses_are_known_and_lint_clean() {
+        let lib = StageLibrary::compiled_in();
+        assert!(!SEED_WITNESS.is_empty(), "the seed table exists");
+        for (name, witness) in SEED_WITNESS {
+            let st = lib
+                .get_stage(name)
+                .unwrap_or_else(|| panic!("seed stage {name}"));
+            assert_eq!(st.witness.as_deref(), Some(*witness), "{name}");
+            assert!(
+                crate::phase_contracts::WITNESSES.contains(witness),
+                "{witness} is a registered witness"
+            );
+            let issues = lint_stage(st, &[]);
+            assert!(
+                issues.iter().all(|i| !i.contains("witness")),
+                "{name} trips the witness rule: {issues:?}"
+            );
+        }
     }
 }
