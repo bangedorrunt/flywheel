@@ -7775,8 +7775,11 @@ fn envpin_hop_split(
 /// Respawn the env-pinned hop on a fresh pane under `anchor`. hc pins the
 /// model at split (a pane's env is fixed there); rex takes a plain split and
 /// delivers the same pin as an `env` command prefix through the spawn path
-/// ([`crate::pane::rex_env_command`]) instead of refusing. A backend with
-/// neither path stays refused by [`EnvPinSplitUnsupported`].
+/// ([`crate::pane::rex_env_command`]) instead of refusing. The arm follows the
+/// ANCHOR's id, not the backend name: the live rex backends call themselves
+/// `superlogical` and `auto` (a per-target router), so a name match would
+/// leave production refusing. A backend with neither path stays refused by
+/// [`EnvPinSplitUnsupported`].
 fn envpin_hop_respawn(
     cfg: Option<&Config>,
     project: &str,
@@ -7784,6 +7787,9 @@ fn envpin_hop_respawn(
     hop: &EnvpinHop,
     anchor: &str,
 ) -> anyhow::Result<AgentInfo> {
+    if crate::inbox_ports::is_rex_block(anchor) {
+        return envpin_hop_rex_launch(cfg, project, backend, hop, anchor);
+    }
     match backend.name() {
         "hc" => {
             let pane = envpin_hop_split(cfg, Some(project), backend, anchor, &hop.next_env)?;
@@ -7791,7 +7797,6 @@ fn envpin_hop_respawn(
                 .agent_start(&hop.agent, &hop.next_harness, &pane, &hop.next_args)
                 .map_err(anyhow::Error::from)
         }
-        "rex" => envpin_hop_rex_launch(cfg, project, backend, hop, anchor),
         unsupported => Err(EnvPinSplitUnsupported {
             backend: unsupported.to_string(),
         }
@@ -7831,9 +7836,13 @@ fn envpin_hop_rex_launch(
         crate::pane::pane_env_for_launch(cfg, identity.as_deref(), Some(&hop.next_model))?;
     pane_env.extend(hop.next_env.clone());
     let command = crate::pane::rex_env_command(&pane_env, &hop.next_harness, &hop.next_args);
-    backend
-        .pane_run(&split.pane_id, &command)
-        .map_err(|e| anyhow::anyhow!("rex env-pin hop run on {}: {e}", split.pane_id))?;
+    if let Err(e) = backend.pane_run(&split.pane_id, &command) {
+        let _ = backend.pane_close(&split.pane_id);
+        return Err(anyhow::anyhow!(
+            "rex env-pin hop run on {}: {e}",
+            split.pane_id
+        ));
+    }
     if let Err(e) = backend.agent_rename(&split.pane_id, Some(&hop.agent)) {
         eprintln!(
             "flywheel: warn: rex env-pin hop rename {} → {} failed: {e}",
@@ -8151,20 +8160,22 @@ mod envpin_reroute_tests {
     }
 
     struct FakeRexHopBackend {
+        name: &'static str,
         order: Arc<Mutex<Vec<String>>>,
         commands: Arc<Mutex<Vec<String>>>,
+        fail_run: bool,
     }
 
     impl crate::backend::MultiplexerBackend for FakeRexHopBackend {
         fn name(&self) -> &'static str {
-            "rex"
+            self.name
         }
         fn pane_list(
             &self,
             _workspace_id: Option<&str>,
         ) -> Result<Vec<toron_core::pane_types::PaneInfo>, toron_plane::backend::BackendError>
         {
-            Ok(vec![site_pane("old-pane")])
+            Ok(vec![site_pane("block:old-pane")])
         }
         fn pane_split(
             &self,
@@ -8176,13 +8187,13 @@ mod envpin_reroute_tests {
                 .lock()
                 .unwrap()
                 .push(format!("split:{parent}:{direction}"));
-            Ok(site_pane("new-pane-1"))
+            Ok(site_pane("block:new-pane-1"))
         }
         fn agent_list(
             &self,
         ) -> Result<Vec<toron_core::pane_types::AgentInfo>, toron_plane::backend::BackendError>
         {
-            let mut row = site_agent("", "new-pane-1");
+            let mut row = site_agent("", "block:new-pane-1");
             row.agent_status = toron_core::pane_types::AgentStatus::Idle;
             Ok(vec![row])
         }
@@ -8192,6 +8203,11 @@ mod envpin_reroute_tests {
             command: &str,
         ) -> Result<(), toron_plane::backend::BackendError> {
             self.order.lock().unwrap().push(format!("run:{pane_id}"));
+            if self.fail_run {
+                return Err(toron_plane::backend::BackendError::timeout(
+                    "fake rex run failed",
+                ));
+            }
             self.commands.lock().unwrap().push(command.to_string());
             Ok(())
         }
@@ -8239,46 +8255,13 @@ mod envpin_reroute_tests {
         )
     }
 
-    #[test]
-    fn envpin_rex_hop_splits_plain_and_pins_via_rex_env_command() {
-        let _guard = crate::config::lock_env();
-        crate::state::save_spawn_registry(
-            "envpin-test-proj",
-            &[crate::state::SpawnEntry::profiled(
-                "old-pane",
-                "TestyCreek",
-                "coder",
-                "opencode",
-                Some("CyanTest".to_string()),
-            )],
-        )
-        .expect("stage the spawn registry");
-        let order = Arc::new(Mutex::new(Vec::new()));
-        let commands = Arc::new(Mutex::new(Vec::new()));
-        let backend = FakeRexHopBackend {
-            order: order.clone(),
-            commands: commands.clone(),
-        };
-        let cfg = Config::default();
-        let hop = hop_fixture();
-        let respawn =
-            |anchor: &str| envpin_hop_respawn(Some(&cfg), &hop.project, &backend, &hop, anchor);
-        let got = envpin_respin_hop(&backend, &respawn, &hop, false).expect("rex hop runs");
-        assert!(
-            matches!(&got, EnvpinHopOutcome::Hopped { agent } if agent.name.as_deref() == Some("TestyCreek")),
-            "same agent name kept: {got:?}"
-        );
-        assert_eq!(
-            *order.lock().unwrap(),
-            vec![
-                "split:old-pane:down".to_string(),
-                "run:new-pane-1".to_string(),
-                "rename:TestyCreek@new-pane-1".to_string(),
-                "wait:new-pane-1".to_string(),
-                "close:old-pane".to_string(),
-            ],
-            "plain split, then the env-prefixed run; the old pane closes last"
-        );
+    fn rex_hop_fixture() -> EnvpinHop {
+        let mut hop = hop_fixture();
+        hop.old_pane = "block:old-pane".to_string();
+        hop
+    }
+
+    fn assert_rex_hop_command(commands: &Arc<Mutex<Vec<String>>>) {
         let commands = commands.lock().unwrap().clone();
         assert_eq!(commands.len(), 1, "one run: {commands:?}");
         let command = &commands[0];
@@ -8299,37 +8282,166 @@ mod envpin_reroute_tests {
             command.contains("opencode"),
             "the harness launches the hop args: {command}"
         );
+    }
+
+    /// The live rex backends name themselves `superlogical` / `auto`; the arm
+    /// must follow the ANCHOR id, so a name-keyed dispatch would refuse here.
+    #[test]
+    fn envpin_rex_hop_splits_plain_and_pins_via_rex_env_command() {
+        for backend_name in ["auto", "superlogical"] {
+            let _guard = crate::config::lock_env();
+            crate::state::save_spawn_registry(
+                "envpin-test-proj",
+                &[crate::state::SpawnEntry::profiled(
+                    "block:old-pane",
+                    "TestyCreek",
+                    "coder",
+                    "opencode",
+                    Some("CyanTest".to_string()),
+                )],
+            )
+            .expect("stage the spawn registry");
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let commands = Arc::new(Mutex::new(Vec::new()));
+            let backend = FakeRexHopBackend {
+                name: backend_name,
+                order: order.clone(),
+                commands: commands.clone(),
+                fail_run: false,
+            };
+            let cfg = Config::default();
+            let hop = rex_hop_fixture();
+            let respawn =
+                |anchor: &str| envpin_hop_respawn(Some(&cfg), &hop.project, &backend, &hop, anchor);
+            let got = envpin_respin_hop(&backend, &respawn, &hop, false)
+                .unwrap_or_else(|e| panic!("{backend_name} rex hop runs: {e:#}"));
+            assert!(
+                matches!(&got, EnvpinHopOutcome::Hopped { agent } if agent.name.as_deref() == Some("TestyCreek")),
+                "{backend_name}: same agent name kept: {got:?}"
+            );
+            assert_eq!(
+                *order.lock().unwrap(),
+                vec![
+                    "split:block:old-pane:down".to_string(),
+                    "run:block:new-pane-1".to_string(),
+                    "rename:TestyCreek@block:new-pane-1".to_string(),
+                    "wait:block:new-pane-1".to_string(),
+                    "close:block:old-pane".to_string(),
+                ],
+                "{backend_name}: plain split, then the env-prefixed run; old pane closes last"
+            );
+            assert_rex_hop_command(&commands);
+            let rows = rebind_rows(&hop.project, &hop_effect_key(&hop));
+            assert_eq!(
+                rows.iter().map(|i| i.state).collect::<Vec<_>>(),
+                vec![
+                    toron_core::index::workflow_effects::EffectState::Prepared,
+                    toron_core::index::workflow_effects::EffectState::InFlight,
+                    toron_core::index::workflow_effects::EffectState::Settled,
+                ],
+                "{backend_name}: one intent, settled: {rows:?}"
+            );
+        }
+    }
+
+    /// A failed rex `pane_run` must not leave the fresh split behind.
+    #[test]
+    fn envpin_rex_hop_failed_run_closes_the_orphan_split() {
+        let _guard = crate::config::lock_env();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let backend = FakeRexHopBackend {
+            name: "auto",
+            order: order.clone(),
+            commands: Arc::new(Mutex::new(Vec::new())),
+            fail_run: true,
+        };
+        let cfg = Config::default();
+        let hop = rex_hop_fixture();
+        let respawn =
+            |anchor: &str| envpin_hop_respawn(Some(&cfg), &hop.project, &backend, &hop, anchor);
+        let err = envpin_respin_hop(&backend, &respawn, &hop, false).expect_err("run fails");
+        assert!(
+            format!("{err:#}").contains("fake rex run failed"),
+            "{err:#}"
+        );
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec![
+                "split:block:old-pane:down".to_string(),
+                "run:block:new-pane-1".to_string(),
+                "close:block:new-pane-1".to_string(),
+            ],
+            "the orphan split closes; the old pane is never touched"
+        );
         let rows = rebind_rows(&hop.project, &hop_effect_key(&hop));
-        assert_eq!(rows.len(), 3, "exactly one intent, three states: {rows:?}");
         assert_eq!(
             rows.iter().map(|i| i.state).collect::<Vec<_>>(),
             vec![
                 toron_core::index::workflow_effects::EffectState::Prepared,
                 toron_core::index::workflow_effects::EffectState::InFlight,
-                toron_core::index::workflow_effects::EffectState::Settled,
-            ]
+                toron_core::index::workflow_effects::EffectState::Failed,
+            ],
+            "the failed hop is marked Failed: {rows:?}"
         );
     }
 
+    /// A non-rex anchor on the per-target router is not provably rex, so the
+    /// hop must refuse rather than guess a plane.
     #[test]
-    fn envpin_hop_respawn_unknown_backend_refuses() {
+    fn envpin_hop_respawn_non_rex_anchor_refuses() {
         let cfg = Config::default();
         let hop = hop_fixture();
-        let err = envpin_hop_respawn(
-            Some(&cfg),
-            &hop.project,
-            &NeverSplitBackend("superlogical"),
-            &hop,
-            "anchor",
-        )
-        .expect_err("a backend with neither launch path must refuse");
+        for backend_name in ["auto", "superlogical"] {
+            let err = envpin_hop_respawn(
+                Some(&cfg),
+                &hop.project,
+                &NeverSplitBackend(backend_name),
+                &hop,
+                "old-pane",
+            )
+            .expect_err("a non-rex anchor with no hc backend must refuse");
+            assert!(
+                err.downcast_ref::<EnvPinSplitUnsupported>().is_some(),
+                "{backend_name}: the refusal is the typed one: {err:#}"
+            );
+            assert!(
+                format!("{err:#}").contains(backend_name),
+                "{backend_name}: the refusal names the backend: {err:#}"
+            );
+        }
+    }
+
+    /// hc keeps the split-with-env arm; with no daemon on the configured
+    /// socket it fails there (never by taking the rex path).
+    #[test]
+    fn envpin_hop_respawn_hc_arm_needs_its_daemon() {
+        let _guard = crate::config::lock_env();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let backend = FakeRexHopBackend {
+            name: "hc",
+            order: order.clone(),
+            commands: Arc::new(Mutex::new(Vec::new())),
+            fail_run: false,
+        };
+        let cfg = Config {
+            socket_path: Some(
+                std::env::temp_dir()
+                    .join("fw-envpin-no-daemon.sock")
+                    .display()
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let hop = hop_fixture();
+        let err = envpin_hop_respawn(Some(&cfg), &hop.project, &backend, &hop, "old-pane")
+            .expect_err("no hc daemon on the configured socket");
         assert!(
-            err.downcast_ref::<EnvPinSplitUnsupported>().is_some(),
-            "the refusal is the typed one: {err:#}"
+            format!("{err:#}").contains("hc connect for env-pin hop"),
+            "the hc arm tries its own split path: {err:#}"
         );
         assert!(
-            format!("{err:#}").contains("superlogical"),
-            "the refusal names the backend: {err:#}"
+            !order.lock().unwrap().iter().any(|c| c.starts_with("run:")),
+            "the hc arm never takes the rex pane_run path"
         );
     }
 
@@ -8388,13 +8500,13 @@ mod envpin_reroute_tests {
 
     impl crate::backend::MultiplexerBackend for RexRefuseBackend {
         fn name(&self) -> &'static str {
-            "rex"
+            "auto"
         }
         fn agent_list(
             &self,
         ) -> Result<Vec<toron_core::pane_types::AgentInfo>, toron_plane::backend::BackendError>
         {
-            let mut row = site_agent("", "new-pane-1");
+            let mut row = site_agent("", "block:new-pane-1");
             row.agent_status = toron_core::pane_types::AgentStatus::Idle;
             Ok(vec![row])
         }
@@ -8403,7 +8515,7 @@ mod envpin_reroute_tests {
             _workspace_id: Option<&str>,
         ) -> Result<Vec<toron_core::pane_types::PaneInfo>, toron_plane::backend::BackendError>
         {
-            Ok(vec![site_pane("old-pane")])
+            Ok(vec![site_pane("block:old-pane")])
         }
         fn pane_split(
             &self,
@@ -8415,7 +8527,7 @@ mod envpin_reroute_tests {
                 .lock()
                 .unwrap()
                 .push(format!("split:{parent}:{direction}"));
-            Ok(site_pane("new-pane-1"))
+            Ok(site_pane("block:new-pane-1"))
         }
         fn pane_run(
             &self,
@@ -8545,7 +8657,7 @@ mod envpin_reroute_tests {
             &backend,
             "TestyCreek",
             "opencode",
-            "old-pane",
+            "block:old-pane",
             &[],
             Some("opencode-fallback"),
             Some("envpin-rex-proj"),
@@ -8556,12 +8668,12 @@ mod envpin_reroute_tests {
         assert_eq!(
             *order.lock().unwrap(),
             vec![
-                "start:TestyCreek@old-pane".to_string(),
-                "split:old-pane:down".to_string(),
-                "run:new-pane-1".to_string(),
-                "rename:TestyCreek@new-pane-1".to_string(),
-                "wait:new-pane-1".to_string(),
-                "close:old-pane".to_string(),
+                "start:TestyCreek@block:old-pane".to_string(),
+                "split:block:old-pane:down".to_string(),
+                "run:block:new-pane-1".to_string(),
+                "rename:TestyCreek@block:new-pane-1".to_string(),
+                "wait:block:new-pane-1".to_string(),
+                "close:block:old-pane".to_string(),
             ],
             "the site splits plain, runs the pinned launch, then closes the old pane"
         );
