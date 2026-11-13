@@ -461,6 +461,40 @@ fn recipient_wm(project: &str, pin: &str) -> u64 {
     })
 }
 
+/// The line this wake puts on the pane (urgent or normal form).
+fn prompt_wake_line(wm: u64, urgent: bool) -> String {
+    crate::pane_write::wake_line(
+        crate::pane_write::Wm(wm),
+        if urgent {
+            crate::pane_write::Urgency::Urgent
+        } else {
+            crate::pane_write::Urgency::Normal
+        },
+    )
+}
+
+/// Ring one crew-prompt wake. `ring_wake` demands the FOLD line — always the
+/// normal form — and types from `urgency` itself, so the urgent form must
+/// never be handed to it.
+fn ring_prompt_wake(
+    typer: &dyn crate::pane_write::PaneTyper,
+    target: &str,
+    wm: u64,
+    urgent: bool,
+    route: crate::harness_caps::WakeRoute,
+) -> Result<crate::inbox_ports::RingDone, String> {
+    let urgency = if urgent {
+        toron_core::wake::Urgency::Urgent
+    } else {
+        toron_core::wake::Urgency::Normal
+    };
+    let fold = crate::pane_write::wake_line(
+        crate::pane_write::Wm(wm),
+        crate::pane_write::Urgency::Normal,
+    );
+    crate::inbox_ports::ring_wake(typer, target, wm, &fold, urgency, route)
+}
+
 fn deliver_prompt_wake_hc(
     cfg: &Config,
     project: &str,
@@ -491,28 +525,8 @@ fn deliver_prompt_wake_hc(
         kind
     };
     let route = crate::harness_caps::wake_route(&kind, crate::harness_caps::installed_from_env());
-    let urgency = if urgent {
-        toron_core::wake::Urgency::Urgent
-    } else {
-        toron_core::wake::Urgency::Normal
-    };
-    let line = crate::pane_write::wake_line(
-        crate::pane_write::Wm(wm),
-        if urgent {
-            crate::pane_write::Urgency::Urgent
-        } else {
-            crate::pane_write::Urgency::Normal
-        },
-    );
-    match crate::inbox_ports::ring_wake(
-        &crate::pane_write::HcPanes(&c),
-        &target,
-        wm,
-        &line,
-        urgency,
-        route,
-    ) {
-        Ok(crate::inbox_ports::RingDone::Typed) => Ok(line),
+    match ring_prompt_wake(&crate::pane_write::HcPanes(&c), &target, wm, urgent, route) {
+        Ok(crate::inbox_ports::RingDone::Typed) => Ok(prompt_wake_line(wm, urgent)),
         Ok(crate::inbox_ports::RingDone::NoDoor(no_door)) => {
             bail!(
                 "wake line could not be delivered to {pin} ({target}): {}",
@@ -554,28 +568,14 @@ fn deliver_prompt_wake_rex(
         kind
     };
     let route = crate::harness_caps::wake_route(&kind, crate::harness_caps::installed_from_env());
-    let urgency = if urgent {
-        toron_core::wake::Urgency::Urgent
-    } else {
-        toron_core::wake::Urgency::Normal
-    };
-    let line = crate::pane_write::wake_line(
-        crate::pane_write::Wm(wm),
-        if urgent {
-            crate::pane_write::Urgency::Urgent
-        } else {
-            crate::pane_write::Urgency::Normal
-        },
-    );
-    match crate::inbox_ports::ring_wake(
+    match ring_prompt_wake(
         &crate::pane_write::RexPanes(&*backend),
         &target,
         wm,
-        &line,
-        urgency,
+        urgent,
         route,
     ) {
-        Ok(crate::inbox_ports::RingDone::Typed) => Ok(line),
+        Ok(crate::inbox_ports::RingDone::Typed) => Ok(prompt_wake_line(wm, urgent)),
         Ok(crate::inbox_ports::RingDone::NoDoor(no_door)) => {
             bail!(
                 "wake line could not be delivered to {pin} ({target}): {}",
@@ -726,5 +726,99 @@ mod tests {
         assert_eq!(confirmation["urgent"], true);
         assert_eq!(confirmation["wake"], wake);
         assert_eq!(confirmation["project"], "flywheel");
+    }
+
+    /// A pane that records every boundary write.
+    #[derive(Default)]
+    struct RecTyper(std::sync::Mutex<Vec<String>>);
+
+    impl crate::pane_write::PaneTyper for RecTyper {
+        fn prompt(&self, target: &str, line: &str) -> anyhow::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("prompt {target} {line}"));
+            Ok(())
+        }
+        fn keys(&self, target: &str, keys: &[&str]) -> anyhow::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("keys {target} {}", keys.join("+")));
+            Ok(())
+        }
+        fn close(&self, pane_id: &str) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(format!("close {pane_id}"));
+            Ok(())
+        }
+    }
+
+    fn writes(rec: &RecTyper) -> Vec<String> {
+        rec.0.lock().unwrap().clone()
+    }
+
+    /// bd-vb96v: `--urgent` must ring. `ring_wake` checks the FOLD line (always
+    /// the normal form) and types from `urgency`; handing it the urgent line is
+    /// the bug that made every urgent prompt fail after its mail went out.
+    #[test]
+    fn urgent_prompt_wake_types_the_urgent_line_and_returns_ok() {
+        use crate::harness_caps::WakeRoute;
+        let rec = RecTyper::default();
+        let got = ring_prompt_wake(
+            &rec,
+            "block:pane-1",
+            42,
+            true,
+            WakeRoute::Inject { interrupt: true },
+        )
+        .expect("an urgent crew prompt must ring");
+        assert_eq!(got, crate::inbox_ports::RingDone::Typed);
+        let typed = prompt_wake_line(42, true);
+        assert!(typed.contains("URGENT"), "urgent form: {typed}");
+        assert_eq!(
+            writes(&rec),
+            vec![
+                "keys block:pane-1 Escape".to_string(),
+                format!("prompt block:pane-1 {typed}"),
+            ],
+            "Interrupt then the urgent wake line"
+        );
+    }
+
+    #[test]
+    fn normal_prompt_wake_types_the_normal_line_only() {
+        use crate::harness_caps::WakeRoute;
+        let rec = RecTyper::default();
+        let got = ring_prompt_wake(
+            &rec,
+            "block:pane-1",
+            42,
+            false,
+            WakeRoute::Inject { interrupt: true },
+        )
+        .expect("a normal crew prompt must ring");
+        assert_eq!(got, crate::inbox_ports::RingDone::Typed);
+        let typed = prompt_wake_line(42, false);
+        assert!(typed.contains("toron next"), "wake is compliant: {typed}");
+        assert_eq!(writes(&rec), vec![format!("prompt block:pane-1 {typed}")]);
+    }
+
+    /// The contract the helper exists for: the fold line is never the urgent
+    /// form, so the old passing of `wake_line(.., Urgent)` can only fail.
+    #[test]
+    fn ring_wake_refuses_an_urgent_fold_line() {
+        use crate::harness_caps::WakeRoute;
+        let rec = RecTyper::default();
+        let err = crate::inbox_ports::ring_wake(
+            &rec,
+            "block:pane-1",
+            42,
+            &prompt_wake_line(42, true),
+            toron_core::wake::Urgency::Urgent,
+            WakeRoute::Inject { interrupt: true },
+        )
+        .expect_err("the fold must name the normal line");
+        assert!(err.contains("fold line differs"), "got: {err}");
+        assert!(writes(&rec).is_empty(), "a refused ring types nothing");
     }
 }
