@@ -2720,7 +2720,7 @@ steps:
             "COMPOUND after the verify sidecar (ADR-0009: phase compound, planner)"
         );
         assert!(
-            matches!(&wf.steps[14].action, Action::RequestApproval { message }
+            matches!(&wf.steps[14].action, Action::RequestApproval { message, .. }
                 if message.contains("captain")),
             "SIGNOFF last, captain-only: {:?}",
             wf.steps[14].action.type_name()

@@ -2924,6 +2924,7 @@ owner = "housekeeper"
         let mut approval = linear.clone();
         approval.steps[0].action = Action::RequestApproval {
             message: "m".into(),
+            timeout_secs: Some(3600),
         };
         let reason = refusal_reason(&approval, true, false).expect("approval refuses");
         assert!(reason.contains("resolution loop"), "{reason}");

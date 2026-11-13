@@ -9470,7 +9470,7 @@ mod peer_encoding_tests {
             "opencode",
             "w9:p1",
             &["peer template with § section sign".to_string()],
-            LaunchCtx::default(),
+            crate::LaunchCtx::default(),
         )
         .expect_err("poisoned arg must fail fast");
         assert!(
