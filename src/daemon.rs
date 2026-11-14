@@ -540,13 +540,10 @@ pub(crate) fn plist_project_argument(body: &str) -> Option<String> {
     let mut tokens: Vec<String> = Vec::new();
     for line in body.lines() {
         let line = line.trim();
-        let value = if let Some(rest) = line.strip_prefix("<string>") {
-            rest.strip_suffix("</string>")
-        } else if let Some(rest) = line.strip_prefix("ExecStart=") {
-            Some(rest)
-        } else {
-            None
-        };
+        let value = line
+            .strip_prefix("<string>")
+            .and_then(|rest| rest.strip_suffix("</string>"))
+            .or_else(|| line.strip_prefix("ExecStart="));
         if let Some(value) = value {
             tokens.extend(value.split_whitespace().map(str::to_string));
         }
