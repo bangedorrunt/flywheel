@@ -2659,14 +2659,12 @@ mod tests {
             ["BlueRidge".to_string()].into_iter().collect();
         let mut taken = 0usize;
         std::thread::scope(|scope| {
-            for t in 0..8 {
+            for _ in 0..8 {
                 let dir = dir.clone();
                 let line = line.clone();
                 scope.spawn(move || {
-                    for i in 0..total / 8 {
-                        let pin = format!("BlueRidge");
-                        let _ = (t, i);
-                        append_deferred_wake(&dir, "flywheel", &pin, &line).expect("append");
+                    for _ in 0..total / 8 {
+                        append_deferred_wake(&dir, "flywheel", "BlueRidge", &line).expect("append");
                     }
                 });
             }
