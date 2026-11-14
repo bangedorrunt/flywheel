@@ -4064,15 +4064,13 @@ mod start_sites_one_key_tests {
             "spawn/add must not start a dispatcher by the swarm label"
         );
         assert_eq!(
-            spawn
-                .matches("ensure_running(&exe, &config::state_dir(), host_ws, project)")
-                .count(),
+            spawn.matches("dispatcher_workspace(&ws, &label),").count(),
             2,
-            "spawn and add both pass the resolved session id"
+            "spawn and add both route through the one key fn"
         );
         assert!(
-            spawn.contains("let host_ws = if ws.workspace_id.is_empty()"),
-            "the label survives only as the no-id fallback"
+            spawn.contains("fn dispatcher_workspace<'a>(ws: &'a hc::WorkspaceInfo, label: &'a str) -> &'a str {"),
+            "the one key fn exists"
         );
 
         let doors = include_str!("doorbell.rs");

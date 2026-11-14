@@ -51,6 +51,16 @@ use crate::{
 /// wait, foreground wait, integration preflight, send-text prime) are
 /// skipped: rex blocks report readiness via `agent_wait` and the prime
 /// rides `pane_run`.
+/// The dispatcher's key for a workspace: the live session id, or the label
+/// only when the plane answered none.
+fn dispatcher_workspace<'a>(ws: &'a hc::WorkspaceInfo, label: &'a str) -> &'a str {
+    if ws.workspace_id.is_empty() {
+        label
+    } else {
+        ws.workspace_id.as_str()
+    }
+}
+
 pub(crate) fn cmd_add_rex(
     cfg: &Config,
     project: &str,
@@ -2350,16 +2360,13 @@ the panes may still be live in hc; `--no-verify` skips this check in scripts"
 
     if peer_aware {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flywheel"));
-        // bd-bj9xk: the dispatcher is keyed by the live session id, never the
-        // swarm label — a label start spawned a second door beside the session
-        // one. The label is only a fallback for a plane that answers no id.
-        let host_ws = if ws.workspace_id.is_empty() {
-            label.as_str()
-        } else {
-            ws.workspace_id.as_str()
-        };
-        doorbell::ensure_running(&exe, &config::state_dir(), host_ws, project)
-            .context("doorbell dispatcher")?;
+        doorbell::ensure_running(
+            &exe,
+            &config::state_dir(),
+            dispatcher_workspace(&ws, &label),
+            project,
+        )
+        .context("doorbell dispatcher")?;
     }
 
     println!(
@@ -3164,16 +3171,13 @@ pub(crate) fn cmd_spawn_rex(
 
     if peer_aware {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flywheel"));
-        // bd-bj9xk: the dispatcher is keyed by the live session id, never the
-        // swarm label — a label start spawned a second door beside the session
-        // one. The label is only a fallback for a plane that answers no id.
-        let host_ws = if ws.workspace_id.is_empty() {
-            label.as_str()
-        } else {
-            ws.workspace_id.as_str()
-        };
-        doorbell::ensure_running(&exe, &config::state_dir(), host_ws, project)
-            .context("doorbell dispatcher")?;
+        doorbell::ensure_running(
+            &exe,
+            &config::state_dir(),
+            dispatcher_workspace(&ws, &label),
+            project,
+        )
+        .context("doorbell dispatcher")?;
     }
 
     println!(
@@ -8445,5 +8449,38 @@ mod requested_spawn_flags_tests {
         opts.counts.oc = None;
         assert_eq!(requested_spawn_flags(&opts), "--kind coder=2");
         assert_eq!(requested_spawn_flags(&SpawnOpts::default()), "");
+    }
+}
+
+#[cfg(test)]
+mod dispatcher_workspace_tests {
+    use super::*;
+
+    fn ws(workspace_id: &str) -> hc::WorkspaceInfo {
+        hc::WorkspaceInfo {
+            workspace_id: workspace_id.to_string(),
+            number: 1,
+            label: "flywheel-chiebukuro".into(),
+            focused: false,
+            pane_count: 0,
+            tab_count: 0,
+            active_tab_id: String::new(),
+            agent_status: toron_core::pane_types::AgentStatus::Unknown,
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn dispatcher_workspace_keys_by_the_session_id() {
+        assert_eq!(
+            dispatcher_workspace(&ws("session:01a1d1e6"), "flywheel-chiebukuro"),
+            "session:01a1d1e6",
+            "the live session id is the key"
+        );
+        assert_eq!(
+            dispatcher_workspace(&ws(""), "flywheel-chiebukuro"),
+            "flywheel-chiebukuro",
+            "the label survives only when the plane answers no id"
+        );
     }
 }
