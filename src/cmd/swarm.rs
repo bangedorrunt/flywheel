@@ -1155,7 +1155,7 @@ mod tests {
         let agents = vec![agent("captain-1", "wA:p1", "wA")];
         let mut idle = std::collections::BTreeMap::new();
         let (desired, live) = crate::supervisor_host::seat_observation(
-            &[entry.clone()],
+            std::slice::from_ref(&entry),
             &agents,
             Some("Captain"),
             &mut idle,
