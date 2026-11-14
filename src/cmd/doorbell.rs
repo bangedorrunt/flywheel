@@ -3691,7 +3691,6 @@ mod doorbell_canonical_project_tests {
 
 #[cfg(test)]
 mod project_dispatchers_tests {
-    use super::*;
     use crate::doorbell::{DoorbellState, state_file, write_state};
 
     /// bd-bj9xk: status must see every dispatcher record for the project —
