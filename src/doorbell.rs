@@ -1043,7 +1043,6 @@ pub fn append_deferred_wake(
     })?
 }
 
-
 /// Take the wakes this host hosts, leaving the rest for the dispatcher that
 /// owns those pins (a project can run one dispatcher per plane session, and a
 /// host that takes a foreign pin's wake queues it for a pane it never
