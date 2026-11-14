@@ -765,10 +765,28 @@ pub(crate) fn dispatcher_gone(
     }
 }
 
-/// The reap's effects, behind a port (bd-bj9xk review): plane list, the
-/// project's doors, stop, liveness, audit and clock.
+/// The plane that produced a live list (bd-bj9xk review): the reap rule may
+/// only trust rex-primary ids. Inferring the plane from the id SHAPE is the
+/// hazard — an hc fallback answers with hc ids, every session door then looks
+/// absent, and a plain status would reap every live rex dispatcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LivePlane {
+    Rex,
+    Hc,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlaneLive {
+    pub plane: LivePlane,
+    pub ids: Vec<String>,
+    /// `auto` had to leave the primary for hc (an explicit hc is a choice).
+    pub fallback: bool,
+}
+
+/// The reap's effects, behind a port (bd-bj9xk review): plane identity+list,
+/// the project's doors, stop, liveness, audit and clock.
 pub(crate) trait ReapPort {
-    fn live_ids(&self) -> Vec<String>;
+    fn live(&self) -> Option<PlaneLive>;
     fn doors(&self, project: &str) -> Vec<(String, Option<u32>)>;
     fn stop(&self, workspace: &str);
     fn alive(&self, workspace: &str) -> bool;
@@ -778,15 +796,64 @@ pub(crate) trait ReapPort {
 
 /// Reap every door the pure decision calls gone. A failed stop keeps the
 /// record (the next status retries); an empty plane list reaps nothing.
-pub(crate) fn reap_gone_with(port: &dyn ReapPort, project: &str) -> Vec<String> {
-    let live = port.live_ids();
-    if live.is_empty() {
-        return Vec::new();
+pub(crate) fn reap_gone_with(
+    port: &dyn ReapPort,
+    project: &str,
+    own_session: Option<&str>,
+) -> Vec<String> {
+    let skip = |kind: &str, why: &str| {
+        port.audit(
+            project,
+            serde_json::json!({
+                "ts": port.now(),
+                "kind": kind,
+                "project": project,
+                "why": why,
+            }),
+        );
+        Vec::new()
+    };
+    let Some(live) = port.live() else {
+        return skip("reap_skipped_plane_unresolved", "the plane did not answer");
+    };
+    if live.plane != LivePlane::Rex {
+        return skip(
+            "reap_skipped_plane_not_rex",
+            "only a rex-primary list may call a session door absent",
+        );
+    }
+    if live.fallback {
+        return skip(
+            "reap_skipped_plane_fallback",
+            "auto fell back to hc; its ids say nothing about rex sessions",
+        );
+    }
+    let ids = live.ids;
+    if ids.is_empty() {
+        return skip("reap_skipped_empty_plane", "an empty list is not evidence");
+    }
+    match own_session {
+        Some(own)
+            if ids
+                .iter()
+                .any(|s| s == own || s == own.trim_start_matches("session:")) => {}
+        Some(_) => {
+            return skip(
+                "reap_skipped_own_session_absent",
+                "the list omits this host's own live session, so it is not trustworthy",
+            );
+        }
+        None => {
+            return skip(
+                "reap_skipped_own_session_unknown",
+                "no own session to sanity-check the list against",
+            );
+        }
     }
     let doors: Vec<String> = port.doors(project).into_iter().map(|(ws, _)| ws).collect();
     let mut reaped = Vec::new();
     for (ws, pid) in port.doors(project) {
-        let Some(reason) = dispatcher_gone(&ws, &live, &doors) else {
+        let Some(reason) = dispatcher_gone(&ws, &ids, &doors) else {
             continue;
         };
         let reason = match reason {
@@ -827,16 +894,27 @@ pub(crate) fn reap_gone_with(port: &dyn ReapPort, project: &str) -> Vec<String> 
     reaped
 }
 
-/// The plane's live session ids. `workspace_list` IS the session list on rex
-/// (each WorkspaceInfo is one session); hc returns its own workspace ids.
-fn live_session_ids(cfg: &Config) -> Vec<String> {
-    let Ok(backend) = crate::backend::multiplexer_backend(cfg) else {
-        return Vec::new();
+/// The resolved plane AND its live ids, from the ONE plane resolution — never
+/// inferred from the id shape (bd-bj9xk review).
+fn plane_live(cfg: &Config) -> Option<PlaneLive> {
+    let resolved = crate::backend::resolve_plane(cfg);
+    let plane = match resolved.plane {
+        toron_plane::backend::plane::Plane::Rex => LivePlane::Rex,
+        toron_plane::backend::plane::Plane::Hc => LivePlane::Hc,
+        _ => return None,
     };
-    let Ok(list) = backend.workspace_list() else {
-        return Vec::new();
-    };
-    list.into_iter().map(|w| w.workspace_id).collect()
+    let backend = crate::backend::multiplexer_backend(cfg).ok()?;
+    let ids = backend
+        .workspace_list()
+        .ok()?
+        .into_iter()
+        .map(|w| w.workspace_id)
+        .collect();
+    Some(PlaneLive {
+        plane,
+        ids,
+        fallback: resolved.is_fallback(),
+    })
 }
 
 /// Production port over one config + state dir.
@@ -846,8 +924,8 @@ struct LiveReapPort<'a> {
 }
 
 impl ReapPort for LiveReapPort<'_> {
-    fn live_ids(&self) -> Vec<String> {
-        live_session_ids(self.cfg)
+    fn live(&self) -> Option<PlaneLive> {
+        plane_live(self.cfg)
     }
     fn doors(&self, project: &str) -> Vec<(String, Option<u32>)> {
         crate::doorbell::project_dispatchers(&self.state_dir, project)
@@ -868,11 +946,12 @@ impl ReapPort for LiveReapPort<'_> {
 }
 
 fn reap_gone_dispatchers(cfg: &Config, project: &str) -> Vec<String> {
+    let own = crate::snapshot::assemble(cfg, project, crate::doorbell_now_unix()).workspace_id;
     let port = LiveReapPort {
         cfg,
         state_dir: crate::config::state_dir(),
     };
-    reap_gone_with(&port, project)
+    reap_gone_with(&port, project, (!own.is_empty()).then_some(own.as_str()))
 }
 
 /// The project key every door folds through: a path names the same project
@@ -3806,6 +3885,8 @@ mod reap_tests {
         doors: Vec<(String, Option<u32>)>,
         stopped: RefCell<Vec<String>>,
         alive_after_stop: bool,
+        plane: LivePlane,
+        fallback: bool,
         audits: RefCell<Vec<serde_json::Value>>,
     }
 
@@ -3819,14 +3900,20 @@ mod reap_tests {
                     .collect(),
                 stopped: RefCell::new(Vec::new()),
                 alive_after_stop: false,
+                plane: LivePlane::Rex,
+                fallback: false,
                 audits: RefCell::new(Vec::new()),
             }
         }
     }
 
     impl ReapPort for FakePort {
-        fn live_ids(&self) -> Vec<String> {
-            self.live.clone()
+        fn live(&self) -> Option<PlaneLive> {
+            Some(PlaneLive {
+                plane: self.plane,
+                ids: self.live.clone(),
+                fallback: self.fallback,
+            })
         }
         fn doors(&self, _project: &str) -> Vec<(String, Option<u32>)> {
             self.doors.clone()
@@ -3856,7 +3943,7 @@ mod reap_tests {
     #[test]
     fn label_door_is_kept_when_it_is_the_only_door() {
         let port = FakePort::new(&["session:01a1d1e6"], &[("flywheel-chiebukuro", 17301)]);
-        assert!(reap_gone_with(&port, "chiebukuro").is_empty());
+        assert!(reap_gone_with(&port, "chiebukuro", Some("session:01a1d1e6")).is_empty());
         assert!(port.stopped.borrow().is_empty(), "never stop the only door");
         assert!(kinds(&port).is_empty(), "and never audit a reap");
     }
@@ -3868,7 +3955,7 @@ mod reap_tests {
             &[("session:01a1d1e6", 49772), ("flywheel-chiebukuro", 17301)],
         );
         assert_eq!(
-            reap_gone_with(&port, "chiebukuro"),
+            reap_gone_with(&port, "chiebukuro", Some("session:01a1d1e6")),
             vec!["flywheel-chiebukuro"]
         );
         assert_eq!(*port.stopped.borrow(), vec!["flywheel-chiebukuro"]);
@@ -3884,7 +3971,7 @@ mod reap_tests {
             &["w1:p1", "w2:p1"],
             &[("flywheel-hc-a", 11), ("flywheel-hc-b", 12)],
         );
-        assert!(reap_gone_with(&port, "p").is_empty());
+        assert!(reap_gone_with(&port, "p", Some("session:own")).is_empty());
         assert!(port.stopped.borrow().is_empty());
     }
 
@@ -3895,7 +3982,7 @@ mod reap_tests {
             &[("session:01a1d1e6", 49772), ("session:01a1d816", 17093)],
         );
         assert_eq!(
-            reap_gone_with(&port, "chiebukuro"),
+            reap_gone_with(&port, "chiebukuro", Some("session:01a1d1e6")),
             vec!["session:01a1d816"]
         );
     }
@@ -3904,17 +3991,62 @@ mod reap_tests {
     fn stop_failure_keeps_the_record_and_says_so() {
         let mut port = FakePort::new(&["session:01a1d1e6"], &[("session:01a1d816", 17093)]);
         port.alive_after_stop = true;
-        assert!(reap_gone_with(&port, "chiebukuro").is_empty());
+        assert!(reap_gone_with(&port, "chiebukuro", Some("session:01a1d1e6")).is_empty());
         assert_eq!(
             kinds(&port),
             vec!["dispatcher_gone_intent", "dispatcher_gone_stop_failed"]
         );
     }
 
+    /// THE hazard (review): an hc fallback answers with hc ids; every session
+    /// door looks absent. Nothing may be reaped, and the skip is audited.
+    #[test]
+    fn hc_fallback_list_with_session_doors_reaps_nothing() {
+        let mut port = FakePort::new(
+            &["w1:p1"],
+            &[("session:01a1d1e6", 1), ("session:01a1d816", 2)],
+        );
+        port.plane = LivePlane::Hc;
+        port.fallback = true;
+        assert!(reap_gone_with(&port, "p", Some("w1:p1")).is_empty());
+        assert!(port.stopped.borrow().is_empty(), "no mass kill");
+        assert_eq!(kinds(&port), vec!["reap_skipped_plane_not_rex"]);
+    }
+
+    /// An explicit hc is a choice, not a fallback — still never a session
+    /// reaper, and it says so with its own skip reason.
+    #[test]
+    fn explicit_hc_plane_reaps_nothing() {
+        let mut port = FakePort::new(&["w1:p1"], &[("session:dead", 9)]);
+        port.plane = LivePlane::Hc;
+        assert!(reap_gone_with(&port, "p", Some("w1:p1")).is_empty());
+        assert_eq!(kinds(&port), vec!["reap_skipped_plane_not_rex"]);
+    }
+
+    /// A rex list that omits our OWN live session is not trustworthy: skip.
+    #[test]
+    fn list_missing_our_own_session_reaps_nothing() {
+        let port = FakePort::new(
+            &["session:someone-else"],
+            &[("session:01a1d1e6", 1), ("session:01a1d816", 2)],
+        );
+        assert!(reap_gone_with(&port, "p", Some("session:01a1d1e6")).is_empty());
+        assert!(port.stopped.borrow().is_empty());
+        assert_eq!(kinds(&port), vec!["reap_skipped_own_session_absent"]);
+    }
+
+    /// No own session to check against: skip, never guess.
+    #[test]
+    fn unknown_own_session_reaps_nothing() {
+        let port = FakePort::new(&["session:01a1d1e6"], &[("session:01a1d816", 2)]);
+        assert!(reap_gone_with(&port, "p", None).is_empty());
+        assert_eq!(kinds(&port), vec!["reap_skipped_own_session_unknown"]);
+    }
+
     #[test]
     fn an_empty_plane_list_reaps_nothing() {
         let port = FakePort::new(&[], &[("session:dead", 1), ("label", 2)]);
-        assert!(reap_gone_with(&port, "p").is_empty());
+        assert!(reap_gone_with(&port, "p", Some("session:own")).is_empty());
         assert!(port.stopped.borrow().is_empty());
     }
 }
