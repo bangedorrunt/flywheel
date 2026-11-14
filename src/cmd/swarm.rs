@@ -1429,10 +1429,7 @@ mod tests {
     fn retire_dispatches_one_retire_and_releases_only_that_pin() {
         let _g = lock_env();
         let (cfg, _dir) = hermetic();
-        retire_registry(&[
-            ("wA:p1", "Alpha", "a-1"),
-            ("wA:p2", "Beta", "b-1"),
-        ]);
+        retire_registry(&[("wA:p1", "Alpha", "a-1"), ("wA:p2", "Beta", "b-1")]);
         let mux = FakeMux::default();
         let mut ports = Fake::default();
         let mut journal = MemJournal::default();
@@ -1472,10 +1469,12 @@ mod tests {
         let (cfg, _dir) = hermetic();
         retire_registry(&[("wA:p1", "Alpha", "a-1")]);
         let mux = FakeMux::default();
-        mux.agents
-            .lock()
-            .unwrap()
-            .push(agent_with_status("a-1", "wA:p1", "wA", AgentStatus::Working));
+        mux.agents.lock().unwrap().push(agent_with_status(
+            "a-1",
+            "wA:p1",
+            "wA",
+            AgentStatus::Working,
+        ));
         let mut ports = Fake::default();
         let mut journal = MemJournal::default();
         let mut release = |_: &str| Ok(0u64);
@@ -1529,16 +1528,15 @@ mod tests {
     fn close_panes_for_pins_closes_exactly_that_pane() {
         let _g = lock_env();
         let (_cfg, _dir) = hermetic();
-        retire_registry(&[
-            ("wA:p1", "Alpha", "a-1"),
-            ("wA:p2", "Beta", "b-1"),
-        ]);
+        retire_registry(&[("wA:p1", "Alpha", "a-1"), ("wA:p2", "Beta", "b-1")]);
         let mux = FakeMux::default();
-        let closed =
-            crate::supervisor_host::close_panes_for_pins(&mux, "demo", &["Alpha".into()])
-                .expect("close ok");
+        let closed = crate::supervisor_host::close_panes_for_pins(&mux, "demo", &["Alpha".into()])
+            .expect("close ok");
         assert_eq!(closed, vec![("Alpha".to_string(), "wA:p1".to_string())]);
-        assert_eq!(mux.closed.lock().unwrap().clone(), vec!["wA:p1".to_string()]);
+        assert_eq!(
+            mux.closed.lock().unwrap().clone(),
+            vec!["wA:p1".to_string()]
+        );
     }
 
     /// Unused-import guard: `execute`/`RoundReport`/`SupCmd` are the 5d
