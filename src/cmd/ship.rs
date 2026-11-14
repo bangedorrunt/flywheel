@@ -43,7 +43,9 @@ pub(crate) enum ShipCmd {
         /// Proof receipt (machine-readable; becomes the gate `tail=`).
         #[arg(long)]
         receipt: PathBuf,
-        /// Toron project for the reservation release (default: repo dir name).
+        /// Toron project for the reservation release (default: the workspace
+        /// project this repo sits in; a repo outside the workspace root must
+        /// name it).
         #[arg(long)]
         project: Option<String>,
         /// Agent pin releasing the reservations (default: AGENT_NAME).
@@ -61,7 +63,7 @@ pub(crate) enum ShipCmd {
     },
 }
 
-pub(crate) fn cmd_ship(_cfg: &Config, cmd: &ShipCmd) -> Result<()> {
+pub(crate) fn cmd_ship(cfg: &Config, cmd: &ShipCmd) -> Result<()> {
     match cmd {
         ShipCmd::Check { bead_id, dir, json } => ship_check(bead_id, dir.as_deref(), *json),
         ShipCmd::Land {
@@ -74,6 +76,7 @@ pub(crate) fn cmd_ship(_cfg: &Config, cmd: &ShipCmd) -> Result<()> {
             dir,
             json,
         } => ship_land(LandArgs {
+            cfg,
             bead: bead_id,
             sha,
             receipt,
@@ -396,6 +399,7 @@ fn stage_bead_hunks(dir: &Path, file: &str, key: &str, bead: &str) -> Result<boo
 }
 
 pub(crate) struct LandArgs<'a> {
+    pub cfg: &'a Config,
     pub bead: &'a str,
     pub sha: &'a str,
     pub receipt: &'a Path,
@@ -406,8 +410,28 @@ pub(crate) struct LandArgs<'a> {
     pub json: bool,
 }
 
+/// The toron project `ship land` releases reservations in.
+///
+/// The reservation release is operator-signed and scoped to one slug, so a
+/// wrong slug releases the wrong leases. This is therefore the ONE
+/// project-resolution rule every other verb uses
+/// ([`crate::cron::detect_project_in`]) and never the repo directory's name: an
+/// explicit `--project` wins, a repo under the workspace root resolves to its
+/// project, and anything else refuses naming the flag.
+fn land_project(cfg: &Config, dir: &Path, explicit: Option<&str>) -> Result<String> {
+    crate::cron::detect_project_in(cfg, dir, explicit).ok_or_else(|| {
+        anyhow!(
+            "ship land: no toron project for {} — it is not a project under the workspace \
+             root {}; pass --project <slug>",
+            dir.display(),
+            cfg.workspace_root().display()
+        )
+    })
+}
+
 fn ship_land(args: LandArgs<'_>) -> Result<()> {
     let LandArgs {
+        cfg,
         bead,
         sha,
         receipt,
@@ -438,10 +462,7 @@ fn ship_land(args: LandArgs<'_>) -> Result<()> {
     if !cited.contains(bead) {
         bail!("commit {sha} does not cite {bead}; land only ships a commit that names the bead");
     }
-    let project = project
-        .map(str::to_string)
-        .or_else(|| dir.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .ok_or_else(|| anyhow!("cannot derive a toron project from {}", dir.display()))?;
+    let project = land_project(cfg, &dir, project)?;
     let pin = as_pin
         .map(str::to_string)
         .or_else(|| {
@@ -579,7 +600,8 @@ fn ship_land(args: LandArgs<'_>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{head_has_closed_bead, head_names_bead};
+    use super::{head_has_closed_bead, head_names_bead, land_project};
+    use crate::config::Config;
     use std::process::Command;
 
     fn init_repo() -> tempfile::TempDir {
@@ -599,6 +621,39 @@ mod tests {
             );
         }
         dir
+    }
+
+    /// bd-ni0ek: the release project comes from the ONE resolver, never the
+    /// repo directory's name. A repo whose directory name is not its toron slug
+    /// refuses without `--project` (a guessed slug releases the wrong leases),
+    /// and an explicit slug wins over any directory name.
+    #[test]
+    fn land_refuses_a_repo_whose_dir_is_not_its_toron_slug() {
+        let workspace = tempfile::tempdir().expect("workspace root");
+        let mut cfg = Config::default();
+        cfg.workspace_root = Some(workspace.path().display().to_string());
+
+        let outside = tempfile::tempdir().expect("repo outside the workspace");
+        let err = land_project(&cfg, outside.path(), None)
+            .expect_err("a repo outside the workspace root must refuse");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("--project"),
+            "the refusal names the flag: {message}"
+        );
+        assert_eq!(
+            land_project(&cfg, outside.path(), Some("real-slug")).expect("explicit slug wins"),
+            "real-slug",
+            "an explicit slug never falls back to the directory name"
+        );
+
+        let inside = workspace.path().join("some-slug").join("crates").join("x");
+        std::fs::create_dir_all(&inside).expect("project subdir");
+        assert_eq!(
+            land_project(&cfg, &inside, None).expect("workspace child resolves"),
+            "some-slug",
+            "a repo under the workspace root resolves to its project"
+        );
     }
 
     #[test]

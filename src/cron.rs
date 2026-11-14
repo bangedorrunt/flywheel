@@ -301,11 +301,28 @@ pub fn project_crons_dir(cfg: &crate::config::Config, project: &str) -> PathBuf 
 /// otherwise detect from cwd — a path under the workspace root maps to the
 /// relative project name (running outside any project = no project tier).
 pub fn detect_project(cfg: &crate::config::Config, explicit: Option<&str>) -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    detect_project_in(cfg, &cwd, explicit)
+}
+
+/// [`detect_project`] for an explicit directory — the ONE rule for "which
+/// project is this repo", so a verb that takes `--dir` resolves exactly like a
+/// verb that reads cwd.
+///
+/// An explicit slug wins. Otherwise the repo must sit under the workspace root,
+/// where its first relative component IS the slug by construction
+/// ([`crate::config::Config::workspace_root`] + `project_dir`). Anywhere else
+/// there is no derivable slug: the caller refuses and names `--project` rather
+/// than guessing from the directory name.
+pub fn detect_project_in(
+    cfg: &crate::config::Config,
+    dir: &Path,
+    explicit: Option<&str>,
+) -> Option<String> {
     if let Some(p) = explicit {
         return Some(p.to_string());
     }
-    let cwd = std::env::current_dir().ok()?;
-    let rel = cwd.strip_prefix(cfg.workspace_root()).ok()?;
+    let rel = dir.strip_prefix(cfg.workspace_root()).ok()?;
     let first = rel.components().next()?.as_os_str().to_str()?;
     if first.is_empty() {
         None
