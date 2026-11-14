@@ -500,43 +500,19 @@ fn wake_is_busy(err: &str) -> bool {
     err.contains("not at a prompt") || err.to_ascii_lowercase().contains("busy")
 }
 
-/// Hand a busy pane's wake to the ONE doorbell queue (bd-9mjla): the same
-/// `PromptRefused` message the plane sink emits, journaled for the live
-/// workspace so the reducer coalesces one entry per pin and rings it at the
-/// pane's next prompt. No second queue, no retry loop.
-fn defer_busy_wake(state_dir: &std::path::Path, workspace: &str, pin: &str, line: &str) {
-    crate::doorbell::journal_append_workspace(
-        state_dir,
-        workspace,
-        &crate::workspace::Msg::PromptRefused {
-            pin: pin.to_string(),
-            line: line.to_string(),
-        },
-        &[],
-        serde_json::json!({ "stage": "crew-prompt-busy", "pin": pin, "workspace": workspace }),
-        Some(&[pin.to_string()]),
-    );
-}
-
-/// bd-vb96v follow-up: mail is already delivered by the time the ring runs, so
-/// a busy pane is a DEFERRAL, never a failure. Anything else still fails loud.
-fn finish_prompt(
-    pin: &str,
-    line: &str,
-    delivered: Result<String, String>,
-    defer: &dyn Fn(&str, &str),
-) -> Result<String> {
+/// A busy pane's mail is already delivered; the doorbell owns the ring and
+/// defers it itself (bd-9mjla's sink refusal -> the one queue -> the next
+/// prompt). The CLI must not write its own deferral: a journal row has no live
+/// consumer, so live and replay would diverge (bd-346jl).
+fn finish_prompt(delivered: Result<String, String>) -> Result<String> {
     match delivered {
         Ok(typed) => Ok(typed),
-        Err(err) if wake_is_busy(&err) => {
-            defer(pin, line);
-            Ok(QUEUED_WAKE.to_string())
-        }
+        Err(err) if wake_is_busy(&err) => Ok(QUEUED_WAKE.to_string()),
         Err(err) => Err(anyhow!("{err}")),
     }
 }
 
-const QUEUED_WAKE: &str = "mail delivered, wake queued";
+const QUEUED_WAKE: &str = "mail delivered; the doorbell rings at the next prompt";
 
 fn deliver_prompt_wake_hc(
     cfg: &Config,
@@ -672,15 +648,7 @@ fn cmd_crew_prompt(
     let line = prompt_wake_line(wm, urgent);
     let delivered =
         deliver_prompt_wake(cfg, project, pin, urgent, wm).map_err(|e| format!("{e:#}"));
-    let state_dir = crate::config::state_dir();
-    // The live host may be keyed by a plane session id; `assemble` resolves the
-    // same workspace the doorbell journal is written under.
-    let workspace =
-        crate::snapshot::assemble(cfg, project, crate::doorbell_now_unix()).workspace_id;
-    let defer = |pin: &str, line: &str| {
-        defer_busy_wake(&state_dir, &workspace, pin, line);
-    };
-    let wake = finish_prompt(pin, &line, delivered, &defer)?;
+    let wake = finish_prompt(delivered)?;
     let queued = wake == QUEUED_WAKE;
 
     crate::log(
@@ -862,66 +830,80 @@ mod tests {
         assert_eq!(writes(&rec), vec![format!("prompt block:pane-1 {typed}")]);
     }
 
-    /// bd-6a53x: a busy pane's mail is delivered; the wake defers through the
-    /// one doorbell queue and the command still succeeds.
+    /// bd-346jl: a busy pane's mail is already delivered, so the CLI reports
+    /// that the doorbell owns the ring — and writes NOTHING to the journal
+    /// (a journal row has no live consumer; live and replay must agree).
     #[test]
-    fn busy_prompt_defers_the_wake_and_reports_queued() {
-        let calls = std::sync::Mutex::new(Vec::new());
-        let defer = |pin: &str, line: &str| {
-            calls
-                .lock()
-                .unwrap()
-                .push((pin.to_string(), line.to_string()));
-        };
-        let out = finish_prompt(
-            "BlueRidge",
-            "⟦toron⟧ wake (wm 1) — run: toron next",
-            Err(
-                "wake line delivery to BlueRidge (block:p1) failed: pane busy: not at a prompt"
-                    .into(),
-            ),
-            &defer,
-        )
+    fn busy_prompt_reports_the_doorbell_ring_and_writes_no_deferral() {
+        let out = finish_prompt(Err(
+            "wake line delivery to BlueRidge (block:p1) failed: pane busy: not at a prompt".into(),
+        ))
         .expect("a busy pane must not fail the prompt");
         assert_eq!(out, QUEUED_WAKE);
-        assert_eq!(calls.lock().unwrap().len(), 1, "exactly one deferral");
-        assert_eq!(calls.lock().unwrap()[0].0, "BlueRidge");
-    }
-
-    #[test]
-    fn non_busy_prompt_failure_stays_loud_and_defers_nothing() {
-        let calls = std::sync::Mutex::new(0usize);
-        let defer = |_: &str, _: &str| *calls.lock().unwrap() += 1;
-        let err = finish_prompt(
-            "BlueRidge",
-            "line",
-            Err("wake line delivery failed: hc connect refused".into()),
-            &defer,
-        )
-        .expect_err("a transport failure is not a deferral");
-        assert!(format!("{err:#}").contains("hc connect refused"));
-        assert_eq!(
-            *calls.lock().unwrap(),
-            0,
-            "no queue entry on a real failure"
+        assert!(
+            out.contains("doorbell rings at the next prompt"),
+            "the operator is told who rings: {out}"
+        );
+        // Mutation witness: re-adding a journal-only deferral here reddens this
+        // (the row has no live consumer, so live and replay would diverge).
+        let src = include_str!("crew.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert!(
+            !production.contains("journal_append_workspace")
+                && !production.contains("fn defer_busy_wake"),
+            "crew prompt must not write its own deferral; the doorbell owns the ring"
         );
     }
 
-    /// The deferral appends to the SAME journal the reducer folds: N refused
-    /// mails for one pin stay ONE queue entry (bd-9mjla's coalescing).
     #[test]
-    fn deferred_busy_wakes_coalesce_to_one_queue_entry() {
-        let dir = tempfile::TempDir::new().expect("temp state dir");
-        let ws = "flywheel-test";
-        defer_busy_wake(dir.path(), ws, "BlueRidge", "wake A");
-        defer_busy_wake(dir.path(), ws, "BlueRidge", "wake B");
-        let rows = crate::doorbell::journal_read_all(dir.path());
-        assert_eq!(rows.len(), 2, "each refused mail is its own journal row");
-        let model = crate::snapshot::fold_model_for(&rows, ws);
-        assert_eq!(
-            model.doorbell.queues.get("BlueRidge").map(Vec::len),
-            Some(1),
-            "the reducer keeps one coalesced entry per pin"
+    fn non_busy_prompt_failure_stays_loud() {
+        let err = finish_prompt(Err("wake line delivery failed: hc connect refused".into()))
+            .expect_err("a transport failure is not a deferral");
+        assert!(format!("{err:#}").contains("hc connect refused"));
+    }
+
+    /// The doorbell itself rings the deferred wake: one refusal is queued by
+    /// the sink/reducer, the pane's next at-prompt status rings exactly once,
+    /// and a second idle emits nothing (bd-346jl e2e at the seam the CLI feeds).
+    #[test]
+    fn a_busy_crew_prompt_rings_once_at_the_next_prompt() {
+        let mut model = crate::workspace::WorkspaceModel::default();
+        model.doorbell.index.insert_pin("BlueRidge".into(), None);
+        let msg = crate::workspace::Msg::PromptRefused {
+            pin: "BlueRidge".into(),
+            line: "⟦toron⟧ URGENT steer (wm 1) — run: toron next".into(),
+        };
+        let (model, cmds) = crate::workspace::tick(&model, &msg);
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, crate::workspace::Cmd::Prompt { .. })),
+            "a refused prompt does not ring while the pane is busy: {cmds:?}"
+        );
+        let (model, idle) = crate::workspace::tick(
+            &model,
+            &crate::workspace::Msg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+        );
+        let rings: Vec<&crate::workspace::Cmd> = idle
+            .iter()
+            .filter(|c| matches!(c, crate::workspace::Cmd::Prompt { .. }))
+            .collect();
+        assert_eq!(rings.len(), 1, "exactly one ring at the prompt: {idle:?}");
+        let (_model, again) = crate::workspace::tick(
+            &model,
+            &crate::workspace::Msg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+        );
+        assert!(
+            !again
+                .iter()
+                .any(|c| matches!(c, crate::workspace::Cmd::Prompt { .. })),
+            "a second idle emits nothing: {again:?}"
         );
     }
 
