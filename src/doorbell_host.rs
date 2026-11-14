@@ -882,20 +882,35 @@ impl Host for RtHost {
             | BrainMsg::Ask { .. }
             | BrainMsg::Shutdown => return Vec::new(),
         };
-        let mut deferred_cmds: Vec<workspace::Cmd> = Vec::new();
         if matches!(msg, BrainMsg::Sweep { .. }) {
             let hosted: std::collections::BTreeSet<String> =
                 self.model.presence.keys().cloned().collect();
-            for (pin, line) in crate::doorbell::take_deferred_wakes(
-                &crate::config::state_dir(),
-                &self.project,
-                &self.workspace,
-                &hosted,
-            ) {
-                let (next, cmds) =
-                    workspace::tick(&self.model, &workspace::Msg::PromptRefused { pin, line });
+            let state_dir = crate::config::state_dir();
+            let mut journaled = true;
+            for (pin, line) in
+                crate::doorbell::take_deferred_wakes(&state_dir, &self.project, &hosted)
+            {
+                let (next, cmds) = workspace::tick(
+                    &self.model,
+                    &workspace::Msg::PromptRefused {
+                        pin: pin.clone(),
+                        line: line.clone(),
+                    },
+                );
                 self.model = next;
-                deferred_cmds.extend(cmds);
+                if let Err(e) = crate::doorbell::journal_deferred_wake(
+                    &state_dir,
+                    &self.workspace,
+                    &pin,
+                    &line,
+                    &cmds,
+                ) {
+                    eprintln!("flywheel: deferred wake journal failed: {e}");
+                    journaled = false;
+                }
+            }
+            if journaled {
+                crate::doorbell::commit_deferred_wakes(&state_dir, &self.project);
             }
         }
         let (next, cmds) = workspace::tick(&self.model, &wmsg);
@@ -935,7 +950,6 @@ impl Host for RtHost {
             eprintln!("flywheel: run-state boundary not recorded: {refusal}");
         }
         let mut effects = cmds_to_effects(cmds);
-        effects.extend(cmds_to_effects(deferred_cmds));
         if matches!(msg, BrainMsg::Sweep { .. }) {
             effects.extend(
                 self.pending_conflict_prompts
@@ -2184,14 +2198,20 @@ mod off_runtime_tests {
 
         let effects = host.tick(&BrainMsg::Sweep { now: 1 });
         assert!(
-            effects
-                .iter()
-                .any(|e| matches!(e, Effect::Audit { kind, pin, .. } if kind == "deferred" && pin == "BlueRidge")),
-            "the sweep queues the deferred wake: {effects:?}"
-        );
-        assert!(
             !effects.iter().any(|e| matches!(e, Effect::Prompt { .. })),
             "a working pin is never prompted: {effects:?}"
+        );
+        let journal = std::fs::read_to_string(
+            crate::config::state_dir()
+                .join("journals")
+                .join("doorbell-journal-session:01a1d257.jsonl"),
+        )
+        .expect("the taken wake is journaled");
+        assert!(
+            journal.contains("\"handoff\"")
+                && journal.contains("PromptRefused")
+                && journal.contains("\"deferred\""),
+            "the handoff row carries its own fold actions: {journal}"
         );
 
         let effects = host.tick(&BrainMsg::PlaneStatus {
@@ -2241,19 +2261,27 @@ mod off_runtime_tests {
             status: "working".into(),
         });
 
-        let a_effects = host_a.tick(&BrainMsg::Sweep { now: 1 });
+        host_a.tick(&BrainMsg::Sweep { now: 1 });
+        let journal_a = std::fs::read_to_string(
+            crate::config::state_dir()
+                .join("journals")
+                .join("doorbell-journal-session:a.jsonl"),
+        )
+        .unwrap_or_default();
         assert!(
-            !a_effects
-                .iter()
-                .any(|e| matches!(e, Effect::Audit { kind, .. } if kind == "deferred")),
-            "the foreign host takes nothing: {a_effects:?}"
+            !journal_a.contains("handoff"),
+            "the foreign host takes nothing: {journal_a}"
         );
-        let b_effects = host_b.tick(&BrainMsg::Sweep { now: 1 });
+        host_b.tick(&BrainMsg::Sweep { now: 1 });
+        let journal_b = std::fs::read_to_string(
+            crate::config::state_dir()
+                .join("journals")
+                .join("doorbell-journal-session:b.jsonl"),
+        )
+        .expect("the owning host journals the handoff");
         assert!(
-            b_effects
-                .iter()
-                .any(|e| matches!(e, Effect::Audit { kind, pin, .. } if kind == "deferred" && pin == "BlueRidge")),
-            "the owning host queues it: {b_effects:?}"
+            journal_b.contains("handoff") && journal_b.contains("BlueRidge"),
+            "the owning host takes and journals it: {journal_b}"
         );
         let ring = host_b.tick(&BrainMsg::PlaneStatus {
             pin: "BlueRidge".into(),

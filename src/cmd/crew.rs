@@ -869,12 +869,7 @@ mod tests {
         let hosted: std::collections::BTreeSet<String> =
             ["BlueRidge".to_string()].into_iter().collect();
         assert_eq!(
-            crate::doorbell::take_deferred_wakes(
-                &crate::config::state_dir(),
-                &project,
-                "session:01a1d257",
-                &hosted
-            ),
+            crate::doorbell::take_deferred_wakes(&crate::config::state_dir(), &project, &hosted),
             vec![(
                 "BlueRidge".to_string(),
                 "[doorbell] plane-P mail. Pull: toron next".to_string()

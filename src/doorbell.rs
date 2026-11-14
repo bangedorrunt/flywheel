@@ -1043,69 +1043,77 @@ pub fn append_deferred_wake(
     })?
 }
 
+/// Pending deferrals for a project, without taking them: which pins are holding
+/// a wake that never rang. Read-only, so a watch may look at the same file the
+/// dispatcher owns.
+pub fn pending_deferred_wakes(state_dir: &Path, project: &str) -> Vec<(String, String)> {
+    let path = deferred_wakes_path(state_dir, project);
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    raw.lines()
+        .filter_map(|row| serde_json::from_str::<serde_json::Value>(row.trim()).ok())
+        .filter_map(|v| {
+            Some((
+                v.get("pin")?.as_str()?.to_string(),
+                v.get("line")?.as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
 /// Take the wakes this host hosts, leaving the rest for the dispatcher that
 /// owns those pins (a project can run one dispatcher per plane session, and a
 /// host that takes a foreign pin's wake queues it for a pane it never
-/// prompts). Each taken wake is journaled BEFORE the handoff is rewritten, so
-/// a crash cannot drop it: the row is the durable record, and an unrewritten
-/// file simply re-drains (at-least-once).
+/// prompts). The taken set moves to `<handoff>.draining` and is removed only
+/// by [`commit_deferred_wakes`], after the host has journaled it: a crash in
+/// between re-takes the same wakes instead of dropping them.
 pub fn take_deferred_wakes(
     state_dir: &Path,
     project: &str,
-    workspace: &str,
     hosted: &std::collections::BTreeSet<String>,
 ) -> Vec<(String, String)> {
     let path = deferred_wakes_path(state_dir, project);
+    let draining = path.with_extension("draining");
     let store = doorbell_rt::FileStore::new(state_dir);
     let taken = store.with_file_lock(&path, |_| -> std::io::Result<Vec<(String, String)>> {
-        let Ok(raw) = fs::read_to_string(&path) else {
-            return Ok(Vec::new());
-        };
-        let mut mine: Vec<(String, String)> = Vec::new();
-        let mut rest = String::new();
-        for row in raw.lines() {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(row.trim()) else {
+        let mut all: Vec<(String, String)> = Vec::new();
+        for source in [&draining, &path] {
+            let Ok(raw) = fs::read_to_string(source) else {
                 continue;
             };
-            let entry = match (
-                v.get("pin").and_then(|p| p.as_str()),
-                v.get("line").and_then(|l| l.as_str()),
-            ) {
-                (Some(pin), Some(line)) => (pin.to_string(), line.to_string()),
-                _ => continue,
-            };
-            if hosted.contains(&entry.0) {
-                mine.push(entry);
-            } else {
-                rest.push_str(&v.to_string());
-                rest.push('\n');
+            for row in raw.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(row.trim()) else {
+                    continue;
+                };
+                if let (Some(pin), Some(line)) = (
+                    v.get("pin").and_then(|p| p.as_str()),
+                    v.get("line").and_then(|l| l.as_str()),
+                ) {
+                    all.push((pin.to_string(), line.to_string()));
+                }
             }
+            let _ = fs::remove_file(source);
+        }
+        let (mine, rest): (Vec<_>, Vec<_>) =
+            all.into_iter().partition(|(pin, _)| hosted.contains(pin));
+        if !rest.is_empty() {
+            let mut body = String::new();
+            for (pin, line) in &rest {
+                body.push_str(&serde_json::json!({ "pin": pin, "line": line }).to_string());
+                body.push('\n');
+            }
+            fs::write(&path, body)?;
         }
         if mine.is_empty() {
             return Ok(Vec::new());
         }
+        let mut body = String::new();
         for (pin, line) in &mine {
-            let msg = crate::workspace::Msg::PromptRefused {
-                pin: pin.clone(),
-                line: line.clone(),
-            };
-            store
-                .append_journal(
-                    workspace,
-                    &serde_json::to_value(&msg).unwrap_or(serde_json::Value::Null),
-                    &serde_json::Value::Array(Vec::new()),
-                    serde_json::json!({ "stage": "handoff", "pin": pin }),
-                    std::slice::from_ref(pin),
-                )
-                .map_err(|e| std::io::Error::other(format!("journal the deferred wake: {e}")))?;
+            body.push_str(&serde_json::json!({ "pin": pin, "line": line }).to_string());
+            body.push('\n');
         }
-        if rest.is_empty() {
-            let _ = fs::remove_file(&path);
-        } else {
-            let tmp = path.with_extension("rewrite");
-            fs::write(&tmp, rest)?;
-            fs::rename(&tmp, &path)?;
-        }
+        fs::write(&draining, body)?;
         Ok(mine)
     });
     match taken {
@@ -1115,6 +1123,40 @@ pub fn take_deferred_wakes(
             Vec::new()
         }
     }
+}
+
+/// Journal one taken wake with the actions its fold produced, BEFORE
+/// [`commit_deferred_wakes`] removes it: the row is the durable record, and
+/// replaying it reproduces the same audit the live run recorded.
+pub fn journal_deferred_wake(
+    state_dir: &Path,
+    workspace: &str,
+    pin: &str,
+    line: &str,
+    cmds: &[crate::workspace::Cmd],
+) -> std::io::Result<()> {
+    let msg = crate::workspace::Msg::PromptRefused {
+        pin: pin.to_string(),
+        line: line.to_string(),
+    };
+    doorbell_rt::FileStore::new(state_dir)
+        .append_journal(
+            workspace,
+            &serde_json::to_value(&msg).unwrap_or(serde_json::Value::Null),
+            &serde_json::to_value(cmds).unwrap_or(serde_json::Value::Null),
+            serde_json::json!({ "stage": "handoff", "pin": pin }),
+            std::slice::from_ref(&pin.to_string()),
+        )
+        .map_err(|e| std::io::Error::other(format!("journal the deferred wake: {e}")))
+}
+
+/// Drop the taken set once every row is journaled.
+pub fn commit_deferred_wakes(state_dir: &Path, project: &str) {
+    let draining = deferred_wakes_path(state_dir, project).with_extension("draining");
+    let store = doorbell_rt::FileStore::new(state_dir);
+    let _ = store.with_file_lock(&draining, |_| {
+        let _ = fs::remove_file(&draining);
+    });
 }
 
 pub fn inject_wake_in(
@@ -2605,23 +2647,29 @@ mod tests {
             ["BlueRidge".to_string()].into_iter().collect();
 
         assert!(
-            take_deferred_wakes(&dir, "other-project", "session:a", &hosted).is_empty(),
+            take_deferred_wakes(&dir, "other-project", &hosted).is_empty(),
             "another project never drains this project's wakes"
         );
+        let mine = take_deferred_wakes(&dir, "flywheel", &hosted);
         assert_eq!(
-            take_deferred_wakes(&dir, "flywheel", "session:a", &hosted),
+            mine,
             vec![("BlueRidge".to_string(), line.clone())],
             "the host takes its own pin's wake"
         );
-        assert_eq!(
-            take_deferred_wakes(&dir, "flywheel", "session:b", &hosted),
-            Vec::new(),
-            "a taken wake is not re-rung"
+        let cmds = vec![crate::workspace::Cmd::Audit {
+            kind: "deferred".into(),
+            pin: "BlueRidge".into(),
+            detail: line.clone(),
+        }];
+        journal_deferred_wake(&dir, "session:a", "BlueRidge", &line, &cmds).expect("journal");
+        commit_deferred_wakes(&dir, "flywheel");
+        assert!(
+            take_deferred_wakes(&dir, "flywheel", &hosted).is_empty(),
+            "a committed wake is not re-rung"
         );
         let left = take_deferred_wakes(
             &dir,
             "flywheel",
-            "session:b",
             &["LilacChapel".to_string()].into_iter().collect(),
         );
         assert_eq!(
@@ -2670,11 +2718,12 @@ mod tests {
             }
             scope.spawn(|| {
                 for _ in 0..40 {
-                    taken += take_deferred_wakes(&dir, "flywheel", "session:race", &hosted).len();
+                    taken += take_deferred_wakes(&dir, "flywheel", &hosted).len();
+                    commit_deferred_wakes(&dir, "flywheel");
                 }
             });
         });
-        let left = take_deferred_wakes(&dir, "flywheel", "session:race", &hosted).len();
+        let left = take_deferred_wakes(&dir, "flywheel", &hosted).len();
         assert_eq!(
             taken + left,
             total,
