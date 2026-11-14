@@ -263,6 +263,9 @@ pub struct Policy {
     /// Cost is never this field: self-reported usage stays advisory.
     #[serde(default)]
     pub max_wall_ms: Option<u64>,
+    /// `[swarm] idle_retire_after` in ms (ADR-0022 D7). `None` = never retire.
+    #[serde(default)]
+    pub idle_retire_after_ms: Option<u64>,
 }
 
 impl Policy {
@@ -284,6 +287,7 @@ impl Policy {
             t_orphan_ms: orphan_window_ms(DEFAULT_LEASE_MS),
             join: Join::All,
             max_wall_ms: None,
+            idle_retire_after_ms: None,
         }
     }
 }
@@ -601,6 +605,9 @@ pub struct SupModel {
     pub deaf_seen: RecentKeys,
     /// Latest time seen.
     pub now_ms: u64,
+    /// Desired vs live seats for the reconciler (ADR-0022 D7).
+    #[serde(default)]
+    pub seats: SeatsModel,
     /// Generation floor for crews a failure halted: a re-adopted crew starts
     /// above it, so effect keys (`relaunch:<id>:<gen>`) and the generation
     /// fence never see an old incarnation's values again.
@@ -691,6 +698,7 @@ impl SupModel {
             goal_proved: false,
             wall_origin_ms: 0,
             budget_escalated: false,
+            seats: SeatsModel::default(),
         }
     }
 
@@ -919,6 +927,15 @@ pub enum SupMsg {
         /// Time.
         now_ms: u64,
     },
+    /// Desired vs live seats from the edge; `now_ms` is data (ADR-0022 D7).
+    Seats {
+        /// Desired seats (the plan).
+        desired: Vec<DesiredSeat>,
+        /// Live seats (registry + presence).
+        live: Vec<LiveSeat>,
+        /// Time.
+        now_ms: u64,
+    },
     /// The child proved its own acceptance at `generation`. Not `Done`.
     Proved {
         /// Child.
@@ -1085,6 +1102,13 @@ pub enum SupCmd {
         /// Child, if any.
         child: String,
     },
+    /// One reconciler effect, through the host's one seat interpreter.
+    Seat {
+        /// The effect.
+        effect: SeatEffect,
+        /// Stable effect key (journal + retry).
+        key: String,
+    },
 }
 
 impl KCmd for SupCmd {
@@ -1104,12 +1128,53 @@ impl KCmd for SupCmd {
             Self::Park { child, .. } => format!("park:{child}"),
             Self::Page { n, kind, pin, .. } => format!("page:{n}:{kind}:{pin}"),
             Self::Reject { n, cause, .. } => format!("reject:{n}:{}", cause.tag()),
+            Self::Seat { key, .. } => key.clone(),
         };
         Durability::Durable { key }
     }
 }
 
 /// The Elm program.
+use crate::seat_binder::LiveSeat;
+use crate::seat_reconcile::{DesiredSeat, ReconcilePolicy, SeatEffect, reconcile};
+
+/// Desired vs live seats carried by the fold (ADR-0022 D7). The edge supplies
+/// both and `now_ms`; the fold only reconciles.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatsModel {
+    #[serde(default)]
+    pub desired: Vec<DesiredSeat>,
+    #[serde(default)]
+    pub live: Vec<LiveSeat>,
+    /// Effect keys already emitted, so one reconcile does not repeat a retire.
+    #[serde(default)]
+    pub emitted: BTreeSet<String>,
+}
+
+fn seat_model_by_env(harness: &str) -> bool {
+    matches!(
+        crate::headless::interactive_model_plan(harness, "", None),
+        crate::headless::InteractiveModelPlan::PinnedByEnv { .. }
+    )
+}
+
+fn seat_effect_key(effect: &SeatEffect) -> String {
+    match effect {
+        SeatEffect::Keep { pin } => format!("seat:keep:{pin}"),
+        SeatEffect::Relaunch { pin, fields } => {
+            format!("seat:relaunch:{pin}:{}", fields.join(","))
+        }
+        SeatEffect::Respawn { pin, fields, .. } => {
+            format!("seat:respawn:{pin}:{}", fields.join(","))
+        }
+        SeatEffect::InjectRole { pin, role } => format!("seat:inject:{pin}:{role}"),
+        SeatEffect::Spawn { role, count } => format!("seat:spawn:{role}:{count}"),
+        SeatEffect::Retire { pins } => format!("seat:retire:{}", pins.join(",")),
+        SeatEffect::RetireAfterTurn { pin } => format!("seat:retire-after-turn:{pin}"),
+        SeatEffect::RetireIdle { pin } => format!("seat:retire-idle:{pin}"),
+    }
+}
+
 pub struct SupervisorProgram;
 
 fn reject(next: &mut SupModel, cmds: &mut Vec<SupCmd>, cause: RejectCause, child: &str) {
@@ -2009,6 +2074,41 @@ impl Program for SupervisorProgram {
                 }
             }
             SupMsg::ReadyBeadsFailed { .. } => {}
+            SupMsg::Seats {
+                desired,
+                live,
+                now_ms,
+            } => {
+                next.seats.desired = desired.clone();
+                next.seats.live = live.clone();
+                let now = next.now_ms.max(*now_ms);
+                next.now_ms = now;
+                if next.status == Status::Running {
+                    let policy = ReconcilePolicy {
+                        idle_retire_after_ms: next.policy.idle_retire_after_ms,
+                        now_ms: now,
+                    };
+                    for effect in reconcile(desired, live, &seat_model_by_env, &policy) {
+                        if matches!(effect, SeatEffect::Keep { .. }) {
+                            continue;
+                        }
+                        let key = match &effect {
+                            SeatEffect::RetireIdle { pin } => {
+                                let since = live
+                                    .iter()
+                                    .find(|s| &s.pin == pin)
+                                    .and_then(|s| s.idle_since_ms)
+                                    .unwrap_or(0);
+                                format!("seat:retire-idle:{pin}:{since}")
+                            }
+                            _ => seat_effect_key(&effect),
+                        };
+                        if next.seats.emitted.insert(key.clone()) {
+                            cmds.push(SupCmd::Seat { effect, key });
+                        }
+                    }
+                }
+            }
             SupMsg::Tick { now_ms } => {
                 let now = next.now_ms.max(*now_ms);
                 if next.status == Status::Running {
@@ -2342,6 +2442,106 @@ mod tests {
             all.extend(c);
         }
         (m, all)
+    }
+
+    /// bd-fsth6: an idle seat past `idle_retire_after` emits exactly one
+    /// RetireIdle command; a replay of the same log emits the same command;
+    /// the emitted key stops a repeat; no live seat emits none.
+    #[test]
+    fn idle_seat_past_retire_after_emits_one_retire_idle() {
+        use crate::seat_binder::{LiveSeat, SeatPlacement};
+        use crate::seat_reconcile::{DesiredSeat, SeatEffect};
+        let mut policy = Policy::for_tier(Tier::Lead);
+        policy.idle_retire_after_ms = Some(1_000);
+        let hello = SupMsg::Hello {
+            me: "me".into(),
+            tier: Tier::Lead,
+            policy: Some(policy),
+        };
+        let seat = |pin: &str| DesiredSeat {
+            pin: Some(pin.into()),
+            role: "coder".into(),
+            harness: "rex".into(),
+            model: None,
+            effort: None,
+            mode: None,
+            placement: SeatPlacement::Pane,
+            context_warm_allowed: true,
+        };
+        let idle = |pin: &str| LiveSeat {
+            pin: pin.into(),
+            role: "coder".into(),
+            harness: "rex".into(),
+            model: None,
+            mode: None,
+            effort: None,
+            placement: SeatPlacement::Pane,
+            idle: true,
+            fresh_session: false,
+            idle_since_ms: Some(0),
+        };
+        // Two seats in the role: the plan-wins guard refuses to retire the
+        // LAST live seat of a wanted role, so an idle retire needs a spare.
+        let desired = vec![seat("P1"), seat("P2")];
+        let live = vec![idle("P1"), idle("P2")];
+        let seats = SupMsg::Seats {
+            desired: desired.clone(),
+            live: live.clone(),
+            now_ms: 1_000,
+        };
+        let (m0, _) = step(&SupModel::new("me", Tier::Lead), &hello);
+        let (m1, cmds) = step(&m0, &seats);
+        let seat_cmds: Vec<&SupCmd> = cmds
+            .iter()
+            .filter(|c| matches!(c, SupCmd::Seat { .. }))
+            .collect();
+        assert_eq!(seat_cmds.len(), 1, "one retire: {cmds:?}");
+        match seat_cmds[0] {
+            SupCmd::Seat { effect, key } => {
+                assert!(
+                    matches!(effect, SeatEffect::RetireIdle { pin } if pin == "P1" || pin == "P2"),
+                    "idle retire, not count retire: {effect:?}"
+                );
+                assert!(key.starts_with("seat:retire-idle:P"), "{key}");
+            }
+            other => panic!("not a seat command: {other:?}"),
+        }
+
+        let (_, replay) = run(
+            SupModel::new("me", Tier::Lead),
+            &[hello.clone(), seats.clone()],
+        );
+        assert_eq!(
+            format!("{replay:?}"),
+            format!("{:?}", cmds),
+            "replaying the same log emits the same commands"
+        );
+
+        let (_, again) = step(
+            &m1,
+            &SupMsg::Seats {
+                desired,
+                live,
+                now_ms: 2_000,
+            },
+        );
+        assert!(
+            again.iter().all(|c| !matches!(c, SupCmd::Seat { .. })),
+            "the emitted key stops a second retire: {again:?}"
+        );
+
+        let (_, terminal) = step(
+            &m1,
+            &SupMsg::Seats {
+                desired: vec![],
+                live: vec![],
+                now_ms: 3_000,
+            },
+        );
+        assert!(
+            terminal.iter().all(|c| !matches!(c, SupCmd::Seat { .. })),
+            "no live seat emits no seat command"
+        );
     }
 
     fn exit(id: &str, t: u64) -> SupMsg {

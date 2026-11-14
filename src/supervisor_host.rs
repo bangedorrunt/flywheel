@@ -91,6 +91,12 @@ pub trait Ports {
     fn page(&mut self, kind: &str, pin: &str, line: &str) -> Result<(), String>;
     /// Record a rejected input.
     fn reject(&mut self, n: u64, cause: &str, child: &str) -> Result<(), String>;
+    /// One reconciler effect. The ONE named seat interpreter: a live host
+    /// implements the effects it can honour; anything else is a typed
+    /// failure, never a silent skip.
+    fn seat(&mut self, _effect: &crate::seat_reconcile::SeatEffect) -> Result<(), String> {
+        Err("seat effects are unsupported by this host".to_string())
+    }
     /// The directory a captain hold runs `br` in: the project's, where its
     /// `.beads` is (the same dir `br ready` and `br init` use). `None`
     /// inherits the host's cwd.
@@ -789,6 +795,9 @@ fn suppression_line(cmd: &SupCmd) -> Option<String> {
         SupCmd::Exit { child, generation } => Some(format!(
             "suppressed Exit {child} gen {generation}: FLYWHEEL_ALLOW_EXEC=0"
         )),
+        SupCmd::Seat { key, .. } => Some(format!(
+            "suppressed Seat {key}: FLYWHEEL_ALLOW_EXEC=0 (dry arm records, never invokes)"
+        )),
         _ => None,
     }
 }
@@ -917,6 +926,7 @@ pub fn execute(
             kind, pin, line, ..
         } => ports.page(kind, pin, line).map(|_| vec![]),
         SupCmd::Reject { n, cause, child } => ports.reject(*n, cause.tag(), child).map(|_| vec![]),
+        SupCmd::Seat { effect, .. } => ports.seat(effect).map(|_| vec![]),
     };
     j.finish(&key, generation, res.is_ok());
     match res {
@@ -1197,6 +1207,8 @@ pub struct LivePorts {
     /// rv23 #6: the `sup_epoch` this host holds the lead at. `None` holds
     /// every steer (see [`steer_gate`]).
     lead: Option<u64>,
+    /// When each seat last went idle (ms), for the reconciler's idle retire.
+    idle_since: BTreeMap<String, u64>,
 }
 
 impl LivePorts {
@@ -1217,6 +1229,7 @@ impl LivePorts {
             relaunch_bin,
             context: None,
             lead: None,
+            idle_since: BTreeMap::new(),
         }
     }
 
@@ -1415,6 +1428,66 @@ impl Ports for LivePorts {
                 }
             }
         }
+        // Desired seats are the registry (the plan); live seats are the same
+        // rows with the plane's idle state. The fold reconciles; this edge
+        // supplies only facts and the clock.
+        let agents = crate::backend::multiplexer_backend(&self.cfg)
+            .ok()
+            .and_then(|b| b.agent_list().ok())
+            .unwrap_or_default();
+        let registry = crate::state::load_spawn_registry(&self.project);
+        let mut desired = Vec::new();
+        let mut live = Vec::new();
+        for e in &registry {
+            let Some(pin) = e.mail_identity.clone().filter(|p| !p.is_empty()) else {
+                continue;
+            };
+            let idle = agents
+                .iter()
+                .find(|a| a.pane_id == e.pane_id)
+                .is_some_and(|a| {
+                    matches!(
+                        a.agent_status,
+                        toron_core::pane_types::AgentStatus::Idle
+                            | toron_core::pane_types::AgentStatus::Done
+                    )
+                });
+            if idle {
+                self.idle_since.entry(pin.clone()).or_insert(now_ms);
+            } else {
+                self.idle_since.remove(&pin);
+            }
+            let role = e.profile.clone().unwrap_or_else(|| "crew".to_string());
+            let harness = e.harness.clone().unwrap_or_default();
+            let model = e.model.clone().or_else(|| e.model_pin.clone());
+            desired.push(crate::seat_reconcile::DesiredSeat {
+                pin: Some(pin.clone()),
+                role: role.clone(),
+                harness: harness.clone(),
+                model: model.clone(),
+                effort: None,
+                mode: None,
+                placement: crate::seat_binder::SeatPlacement::Pane,
+                context_warm_allowed: true,
+            });
+            live.push(crate::seat_binder::LiveSeat {
+                pin: pin.clone(),
+                role,
+                harness,
+                model,
+                mode: None,
+                effort: None,
+                placement: crate::seat_binder::SeatPlacement::Pane,
+                idle,
+                fresh_session: false,
+                idle_since_ms: self.idle_since.get(&pin).copied(),
+            });
+        }
+        out.push(SupMsg::Seats {
+            desired,
+            live,
+            now_ms,
+        });
         out
     }
 
@@ -1559,6 +1632,42 @@ impl Ports for LivePorts {
             json!({"kind": "reject", "cause": cause_s, "child": child_s}),
         )
     }
+
+    /// The one seat interpreter. Retirement closes the pane only: the pin and
+    /// its reservations stay (ADR-0022 D7), and every other effect is a typed
+    /// failure until its binder lands.
+    fn seat(&mut self, effect: &crate::seat_reconcile::SeatEffect) -> Result<(), String> {
+        use crate::seat_reconcile::SeatEffect;
+        let pins: Vec<String> = match effect {
+            SeatEffect::RetireIdle { pin } | SeatEffect::RetireAfterTurn { pin } => {
+                vec![pin.clone()]
+            }
+            SeatEffect::Retire { pins } => pins.clone(),
+            other => {
+                return Err(format!(
+                    "seat effect {other:?} is not implemented by the live interpreter yet"
+                ));
+            }
+        };
+        let backend = crate::backend::multiplexer_backend(&self.cfg)
+            .map_err(|e| format!("seat retire: plane: {e}"))?;
+        let registry = crate::state::load_spawn_registry(&self.project);
+        for pin in pins {
+            let pane = registry
+                .iter()
+                .find(|e| e.mail_identity.as_deref() == Some(pin.as_str()))
+                .map(|e| e.pane_id.clone())
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| format!("seat retire: no bound pane for {pin}"))?;
+            backend
+                .pane_close(&pane)
+                .map_err(|e| format!("seat retire {pin} ({pane}): {e}"))?;
+            eprintln!(
+                "flywheel supervisor: retired idle seat {pin} ({pane}); pin and reservations kept"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Settings from the environment (fixtures shorten these; production uses
@@ -1585,6 +1694,8 @@ pub struct HostCfg {
     pub join: Option<crate::supervisor_program::Join>,
     /// `FLYWHEEL_SUPERVISOR_MAX_WALL_MS`. `None` does not gate on the wall.
     pub max_wall_ms: Option<u64>,
+    /// `[swarm] idle_retire_after` (or `FLYWHEEL_IDLE_RETIRE_AFTER`), ms.
+    pub idle_retire_after_ms: Option<u64>,
 }
 
 impl HostCfg {
@@ -1612,6 +1723,13 @@ impl HostCfg {
             "all|quorum:N|first:N (N >= 1)",
             crate::supervisor_program::Join::parse,
         )?;
+        // Env only: config validation calls this builder, so reading the
+        // config here would recurse. `run_supervise` folds `[swarm]` in.
+        let idle_retire_after_ms = std::env::var("FLYWHEEL_IDLE_RETIRE_AFTER")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .and_then(|raw| crate::config::parse_idle_retire_after(&raw).ok())
+            .map(|d| d.as_millis() as u64);
         Ok(Self {
             tick_ms: num("FLYWHEEL_SUPERVISOR_TICK_MS")?.unwrap_or(1_000).max(10),
             ack_ms: num("FLYWHEEL_SUPERVISOR_ACK_MS")?,
@@ -1626,6 +1744,7 @@ impl HostCfg {
                 .unwrap_or(1),
             join,
             max_wall_ms: num("FLYWHEEL_SUPERVISOR_MAX_WALL_MS")?,
+            idle_retire_after_ms,
         })
     }
 
@@ -1648,6 +1767,10 @@ impl HostCfg {
                 .ok()
                 .and_then(|v| crate::supervisor_program::Join::parse(&v)),
             max_wall_ms: num("FLYWHEEL_SUPERVISOR_MAX_WALL_MS"),
+            idle_retire_after_ms: std::env::var("FLYWHEEL_IDLE_RETIRE_AFTER")
+                .ok()
+                .and_then(|raw| crate::config::parse_idle_retire_after(&raw).ok())
+                .map(|d| d.as_millis() as u64),
         }
     }
 
@@ -1658,6 +1781,7 @@ impl HostCfg {
             && self.strategy.is_none()
             && self.join.is_none()
             && self.max_wall_ms.is_none()
+            && self.idle_retire_after_ms.is_none()
             && scale == 1
         {
             return None;
@@ -1679,6 +1803,7 @@ impl HostCfg {
         if let Some(w) = self.max_wall_ms {
             p.max_wall_ms = Some(w);
         }
+        p.idle_retire_after_ms = self.idle_retire_after_ms;
         p.t_orphan_ms = crate::supervisor_program::scaled_orphan_ms(lease, scale);
         Some(p)
     }
@@ -1969,7 +2094,15 @@ pub fn run_supervise(
     {
         bail!("--context must be letters, digits, '-' or '_'");
     }
-    let hc = HostCfg::try_from_env()?;
+    let mut hc = HostCfg::try_from_env()?;
+    if hc.idle_retire_after_ms.is_none() {
+        hc.idle_retire_after_ms = cfg
+            .swarm
+            .as_ref()
+            .and_then(|s| s.idle_retire_after.as_deref())
+            .and_then(|raw| crate::config::parse_idle_retire_after(raw).ok())
+            .map(|d| d.as_millis() as u64);
+    }
     let dir = CtxPaths::default_dir();
     let paths = match context {
         Some(c) => CtxPaths::with_context(&dir, project, c),
@@ -2687,6 +2820,7 @@ mod tests {
         pages: Vec<(String, String)>,
         rejects: Vec<(u64, String)>,
         assigns: Vec<(String, String, u64)>,
+        seats: Vec<crate::seat_reconcile::SeatEffect>,
         next_offset: u64,
         fail_relaunch: bool,
     }
@@ -2736,6 +2870,10 @@ mod tests {
         }
         fn reject(&mut self, n: u64, c: &str, _child: &str) -> Result<(), String> {
             self.0.lock().unwrap().rejects.push((n, c.into()));
+            Ok(())
+        }
+        fn seat(&mut self, effect: &crate::seat_reconcile::SeatEffect) -> Result<(), String> {
+            self.0.lock().unwrap().seats.push(effect.clone());
             Ok(())
         }
     }
@@ -2793,6 +2931,228 @@ mod tests {
     /// Every new comms file under umask 022. A creator that forgets the
     /// explicit mode lands at 0644, which this walk rejects.
     #[cfg(unix)]
+    /// bd-fsth6: one Seat command goes through the journal before the one
+    /// seat interpreter; a settled key is skipped (retry keeps the effect
+    /// key); the dry arm records and never invokes.
+    #[test]
+    fn seat_command_journals_before_the_interpreter() {
+        use crate::seat_reconcile::SeatEffect;
+        let fake = Fake::default();
+        let mut j = MemJournal::default();
+        let effect = SeatEffect::RetireIdle { pin: "P".into() };
+        let cmd = SupCmd::Seat {
+            effect: effect.clone(),
+            key: "seat:retire-idle:P".into(),
+        };
+        let mut rep = RoundReport::default();
+        let back = execute(&mut j, &mut fake.clone(), &cmd, &mut rep);
+        assert!(back.is_empty(), "a successful seat emits no follow-up");
+        assert_eq!(
+            fake.0.lock().unwrap().seats,
+            vec![effect.clone()],
+            "the interpreter ran once"
+        );
+        assert_eq!(
+            j.rows.get("seat:retire-idle:P").map(|r| r.2),
+            Some(1),
+            "the journal began before the interpreter"
+        );
+
+        // Retry with the same key: Begin::Skip, never a second retire.
+        let mut rep2 = RoundReport::default();
+        let back = execute(&mut j, &mut fake.clone(), &cmd, &mut rep2);
+        assert!(back.is_empty());
+        assert_eq!(
+            fake.0.lock().unwrap().seats.len(),
+            1,
+            "a settled effect key is not retried"
+        );
+
+        // A journal that already holds the key gates the interpreter: if the
+        // journal were skipped, the seat would run again.
+        let mut settled = MemJournal::default();
+        settled
+            .rows
+            .insert("seat:retire-idle:P".into(), (true, true, 1));
+        let before = fake.0.lock().unwrap().seats.len();
+        let _ = execute(
+            &mut settled,
+            &mut fake.clone(),
+            &cmd,
+            &mut RoundReport::default(),
+        );
+        assert_eq!(
+            fake.0.lock().unwrap().seats.len(),
+            before,
+            "the journal gate runs before the interpreter"
+        );
+    }
+
+    /// bd-fsth6 sandbox e2e: one message log folds desired+live seats with a
+    /// 1s idle_retire_after; the emitted RetireIdle goes through the journal
+    /// and the one interpreter, and the pin survives (no count Retire).
+    #[test]
+    fn sandbox_idle_pane_retired_after_one_second() {
+        use crate::seat_binder::{LiveSeat, SeatPlacement};
+        use crate::seat_reconcile::{DesiredSeat, SeatEffect};
+
+        let _g = crate::config::lock_env();
+        let root = std::env::temp_dir().join(format!("fw-seat-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let shim = root.join("bin");
+        std::fs::create_dir_all(&shim).unwrap();
+        let shim_log = root.join("shim.log");
+        for name in ["launchctl", "systemctl"] {
+            let path = shim.join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\necho \"$0 $*\" >> '{}'\nexit 1\n",
+                    shim_log.display()
+                ),
+            )
+            .unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+        let prev_path = std::env::var_os("PATH");
+        let prev_home = std::env::var_os("HOME");
+        let prev_xdg = std::env::var_os("XDG_STATE_HOME");
+        let mut new_path = std::ffi::OsString::from(format!("{}:", shim.display()));
+        new_path.push(prev_path.clone().unwrap_or_default());
+        unsafe {
+            std::env::set_var("PATH", new_path);
+            std::env::set_var("HOME", &root);
+            std::env::set_var("XDG_STATE_HOME", root.join("state"));
+        }
+
+        let mut policy = Policy::for_tier(Tier::Lead);
+        policy.idle_retire_after_ms = Some(1_000);
+        let seat = |pin: &str| DesiredSeat {
+            pin: Some(pin.into()),
+            role: "coder".into(),
+            harness: "rex".into(),
+            model: None,
+            effort: None,
+            mode: None,
+            placement: SeatPlacement::Pane,
+            context_warm_allowed: true,
+        };
+        let idle = |pin: &str| LiveSeat {
+            pin: pin.into(),
+            role: "coder".into(),
+            harness: "rex".into(),
+            model: None,
+            mode: None,
+            effort: None,
+            placement: SeatPlacement::Pane,
+            idle: true,
+            fresh_session: false,
+            idle_since_ms: Some(0),
+        };
+        let msgs = vec![
+            SupMsg::Hello {
+                me: "me".into(),
+                tier: Tier::Lead,
+                policy: Some(policy),
+            },
+            SupMsg::Seats {
+                desired: vec![seat("P1"), seat("P2")],
+                live: vec![idle("P1"), idle("P2")],
+                now_ms: 1_000,
+            },
+        ];
+        let mut model = SupModel::new("me", Tier::Lead);
+        let mut cmds: Vec<SupCmd> = Vec::new();
+        for msg in &msgs {
+            let update = SupervisorProgram::update(&model, msg);
+            model = update.model;
+            cmds.extend(update.commands);
+        }
+        let seat_cmd = cmds
+            .iter()
+            .find(|c| matches!(c, SupCmd::Seat { .. }))
+            .expect("one idle retire after 1s");
+        let SupCmd::Seat { effect, .. } = seat_cmd else {
+            unreachable!()
+        };
+        assert!(
+            matches!(effect, SeatEffect::RetireIdle { .. }),
+            "idle retire keeps the pin: {effect:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(
+                c,
+                SupCmd::Seat {
+                    effect: SeatEffect::Retire { .. },
+                    ..
+                }
+            )),
+            "never a count retire for an idle seat"
+        );
+
+        let fake = Fake::default();
+        let mut journal = MemJournal::default();
+        let mut rep = RoundReport::default();
+        let _ = execute(&mut journal, &mut fake.clone(), seat_cmd, &mut rep);
+        assert_eq!(fake.0.lock().unwrap().seats, vec![effect.clone()]);
+        assert!(
+            model
+                .seats
+                .emitted
+                .iter()
+                .any(|k| k.starts_with("seat:retire-idle:P"))
+        );
+        assert!(
+            !shim_log.exists() || std::fs::read_to_string(&shim_log).unwrap().is_empty(),
+            "no supervisor tool was shelled"
+        );
+
+        unsafe {
+            match prev_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The dry arm (`FLYWHEEL_ALLOW_EXEC=0`) records the seat and does not
+    /// invoke the interpreter.
+    #[test]
+    fn seat_command_dry_arm_records_and_never_invokes() {
+        use crate::seat_reconcile::SeatEffect;
+        EXEC_FORCE_OFF.with(|c| c.set(true));
+        let fake = Fake::default();
+        let mut j = MemJournal::default();
+        let cmd = SupCmd::Seat {
+            effect: SeatEffect::RetireIdle { pin: "P".into() },
+            key: "seat:retire-idle:P".into(),
+        };
+        let mut rep = RoundReport::default();
+        let _ = execute(&mut j, &mut fake.clone(), &cmd, &mut rep);
+        EXEC_FORCE_OFF.with(|c| c.set(false));
+        assert!(
+            fake.0.lock().unwrap().seats.is_empty(),
+            "dry arm invokes nothing"
+        );
+        assert_eq!(
+            rep.suppressed.len(),
+            1,
+            "the dry arm records the suppression"
+        );
+        assert!(rep.suppressed[0].contains("suppressed Seat"));
+    }
+
     #[test]
     fn supervisor_log_and_inbox_are_owner_only_under_umask_022() {
         let _home = crate::config::lock_env();
