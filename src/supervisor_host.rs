@@ -3156,10 +3156,78 @@ mod tests {
         seats: Vec<crate::seat_reconcile::SeatEffect>,
         next_offset: u64,
         fail_relaunch: bool,
+        /// pin -> panes bound to it (the mail identity is the holder).
+        bound: std::collections::BTreeMap<String, Vec<String>>,
+        /// Every holder count the interpreter observed, in order.
+        holders: Vec<(String, usize)>,
+        /// Panes the seat interpreter launched.
+        launches: Vec<(String, String)>,
+        /// When set, a Respawn journals one rebind and moves the pane.
+        rebind: Option<RebindRig>,
+    }
+
+    impl World {
+        fn observe_holders(&mut self, pin: &str) {
+            let n = self.bound.get(pin).map_or(0, Vec::len);
+            self.holders.push((pin.to_string(), n));
+        }
+    }
+
+    #[derive(Clone)]
+    struct RebindRig {
+        project: String,
+        from: crate::agent_ref::AgentBinding,
+        to: crate::agent_ref::AgentBinding,
     }
 
     #[derive(Clone, Default)]
     struct Fake(Arc<Mutex<World>>);
+
+    impl Fake {
+        fn bind(&self, pin: &str, pane: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .bound
+                .entry(pin.into())
+                .or_default()
+                .push(pane.into());
+        }
+
+        fn holders(&self) -> Vec<(String, usize)> {
+            self.0.lock().unwrap().holders.clone()
+        }
+
+        /// The one rebind shape a fake respawn journals: clear the old holder,
+        /// then write the new one, so no observation ever sees two.
+        fn rebind_pin(&self, rig: &RebindRig, pin: &str, note: &str) -> Result<(), String> {
+            let intent = crate::agent_ref::RebindIntent::prepare(
+                crate::agent_ref::AgentRef::new(&rig.project, pin),
+                rig.from.clone(),
+                rig.to.clone(),
+                crate::agent_ref::RebindReason::CaptainRequest {
+                    note: note.to_string(),
+                },
+                0,
+            );
+            let me = self.clone();
+            let pin = pin.to_string();
+            let shown = pin.clone();
+            crate::agent_ref::commit_rebind_opt(&rig.project, intent, move |_| {
+                let mut w = me.0.lock().unwrap();
+                w.observe_holders(&pin);
+                w.bound.entry(pin.clone()).or_default().clear();
+                w.observe_holders(&pin);
+                let pane = format!("pane-new-{}", w.launches.len() + 1);
+                w.launches.push((pin.clone(), pane.clone()));
+                w.bound.entry(pin.clone()).or_default().push(pane);
+                w.observe_holders(&pin);
+                Ok::<Option<()>, anyhow::Error>(Some(()))
+            })
+            .map(|_| ())
+            .map_err(|e| format!("seat respawn {shown}: {e:#}"))
+        }
+    }
 
     impl Ports for Fake {
         fn observe(&mut self, _m: &SupModel, _now: u64) -> Vec<SupMsg> {
@@ -3206,8 +3274,16 @@ mod tests {
             Ok(())
         }
         fn seat(&mut self, effect: &crate::seat_reconcile::SeatEffect) -> Result<(), String> {
-            self.0.lock().unwrap().seats.push(effect.clone());
-            Ok(())
+            use crate::seat_reconcile::SeatEffect;
+            let rig = {
+                let mut w = self.0.lock().unwrap();
+                w.seats.push(effect.clone());
+                w.rebind.clone()
+            };
+            let (SeatEffect::Respawn { pin, fields, .. }, Some(rig)) = (effect, rig) else {
+                return Ok(());
+            };
+            self.rebind_pin(&rig, pin, &format!("swarm apply --patch: {fields:?}"))
         }
     }
 
@@ -3264,6 +3340,158 @@ mod tests {
     /// Every new comms file under umask 022. A creator that forgets the
     /// explicit mode lands at 0644, which this walk rejects.
     #[cfg(unix)]
+    /// bd-fbiza (5): a Respawn through the one seat interpreter is
+    /// journal-first and replayable. The host dies holding its effect claim
+    /// after the rebind's Prepared row; the restarted host replays the SAME
+    /// effect key, the pane moves once, and no observation ever sees two live
+    /// holders for the seat.
+    #[test]
+    fn respawn_replays_one_effect_key_and_never_doubles_a_holder() {
+        use crate::agent_ref::{AgentBinding, BindingLocation, RebindIntent, RebindReason};
+        use crate::seat_binder::SeatPlacement;
+        use crate::seat_reconcile::{DesiredSeat, SeatEffect, SeatField};
+
+        let _g = crate::config::lock_env();
+        let project = "bd-fbiza-respawn";
+        let pin = "P";
+        let dead = journal_owner("supervise-bd-fbiza", 1);
+        let next = journal_owner("supervise-bd-fbiza", 2);
+        let (mut js, _rt) = toron_journals(&[&dead, &next]);
+        let key = "seat:respawn:P";
+        let effect = SeatEffect::Respawn {
+            pin: pin.into(),
+            fields: vec![SeatField::Harness],
+            context_fresh: true,
+            to: Some(DesiredSeat {
+                pin: Some(pin.into()),
+                role: crate::kernel::SeatRole::parse("coder").expect("role"),
+                harness: crate::kernel::SeatHarness::parse("rex").expect("harness"),
+                model: Some("a/m".into()),
+                effort: None,
+                mode: None,
+                placement: SeatPlacement::Pane,
+                context_warm_allowed: true,
+            }),
+        };
+        let cmd = SupCmd::Seat {
+            effect: effect.clone(),
+            key: key.into(),
+        };
+
+        let from = AgentBinding {
+            profile_name: "coder".into(),
+            model: String::new(),
+            harness: "pi".into(),
+            location: BindingLocation::Pane,
+        };
+        let to = AgentBinding {
+            profile_name: "coder".into(),
+            model: "a/m".into(),
+            harness: "rex".into(),
+            location: BindingLocation::Pane,
+        };
+        let rig = RebindRig {
+            project: project.into(),
+            from: from.clone(),
+            to: to.clone(),
+        };
+        let intent = RebindIntent::prepare(
+            crate::agent_ref::AgentRef::new(project, pin),
+            from,
+            to,
+            RebindReason::CaptainRequest {
+                note: "swarm apply --patch: Harness".into(),
+            },
+            0,
+        );
+        let interrupted_key = intent.effect_key.clone();
+
+        let fake = Fake::default();
+        fake.bind(pin, "pane-old");
+
+        // The dead host claimed the seat, journaled Prepared, and never ran the
+        // provider: the old pane is still the one live holder.
+        assert!(
+            matches!(js[0].begin(key), Begin::Run(_)),
+            "the dead host claims the seat"
+        );
+        crate::agent_ref::journal_rebind(project, &intent).expect("prepared row");
+        let rows = rebind_rows(project);
+        assert_eq!(rows.len(), 1, "one prepared row: {rows:?}");
+        assert_eq!(rows[0]["state"], "prepared");
+        assert!(
+            fake.0.lock().unwrap().bound[pin].len() == 1,
+            "the interrupt leaves the old pane holding the seat"
+        );
+
+        // The restarted host takes the claim over and replays the same command.
+        fake.0.lock().unwrap().rebind = Some(rig);
+        let mut rep = RoundReport::default();
+        let back = execute(&mut js[1], &mut fake.clone(), &cmd, &mut rep);
+        assert!(back.is_empty(), "a landed respawn emits no follow-up");
+        assert_eq!(rep.ran, 1);
+
+        let rows = rebind_rows(project);
+        let keys: std::collections::BTreeSet<&str> = rows
+            .iter()
+            .filter_map(|r| r["effect_key"].as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([interrupted_key.as_str()]),
+            "the replay re-derives the interrupted key, not a new one: {rows:?}"
+        );
+        let states: Vec<&str> = rows.iter().filter_map(|r| r["state"].as_str()).collect();
+        assert_eq!(
+            states,
+            vec!["prepared", "prepared", "in_flight", "settled"],
+            "the replay walks the same intent to Settled: {rows:?}"
+        );
+
+        let launches = fake.0.lock().unwrap().launches.clone();
+        assert_eq!(
+            launches.len(),
+            1,
+            "the pane launched exactly once: {launches:?}"
+        );
+        let holders = fake.holders();
+        assert!(
+            holders.iter().all(|(_, n)| *n <= 1),
+            "never two live holders: {holders:?}"
+        );
+        assert_eq!(
+            (
+                holders.last().unwrap().1,
+                fake.0.lock().unwrap().bound[pin].len()
+            ),
+            (1, 1),
+            "the new pane ends up the one holder"
+        );
+        assert_eq!(
+            js[1].begin(key),
+            Begin::Skip,
+            "the replay settled the seat's effect key"
+        );
+
+        fake.bind(pin, "pane-rogue");
+        assert_eq!(
+            fake.0.lock().unwrap().bound[pin].len(),
+            2,
+            "the fake can hold two panes, so the <=1 count above is not vacuous"
+        );
+    }
+
+    /// Every rebind row in the project log, unwrapped from its log envelope.
+    fn rebind_rows(project: &str) -> Vec<serde_json::Value> {
+        let log =
+            std::fs::read_to_string(crate::state::project_log_path(project)).unwrap_or_default();
+        log.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|e| e["data"]["effect_key"].as_str().is_some())
+            .map(|e| e["data"].clone())
+            .collect()
+    }
+
     /// bd-fsth6: one Seat command goes through the journal before the one
     /// seat interpreter; a settled key is skipped (retry keeps the effect
     /// key); the dry arm records and never invokes.
