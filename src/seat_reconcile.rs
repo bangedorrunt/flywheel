@@ -537,16 +537,8 @@ mod live_e2e_tests {
         }
     }
 
-    /// E2E leg 3 (ADR-0022 V11), live leg — run with
-    /// `cargo test -p flywheel --bin flywheel live_respawn_never_two_holders -- --ignored`:
-    /// one desired seat yields exactly ONE execution at every observed step,
-    /// including when the respawn is interrupted (the same live seat is seen
-    /// again before the new holder lands) and when it lands (Keep).
-    /// Mutation that proves it can fail: make `reconcile` push the effect twice
-    /// for one pinned seat — the `len() == 1` asserts panic.
     #[test]
-    #[ignore]
-    fn live_respawn_never_two_holders_for_one_seat() {
+    fn respawn_never_two_holders_for_one_seat() {
         let desired = [want()];
         let policy = ReconcilePolicy::default();
         let env = |_h: &str| false;

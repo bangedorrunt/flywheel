@@ -378,15 +378,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// E2E leg 1 (ADR-0021 acceptance 3), live leg — run with
-    /// `cargo test -p flywheel --bin flywheel live_wave_swarm_without_witness -- --ignored`:
-    /// a wave-swarm coder that never writes a witness must end in a TYPED
-    /// failure naming the missing fields, never a silent pass or a hang.
-    /// Mutation that proves it can fail: fill the witness fields in
-    /// `empty` below — the leg then reports green and the assert panics.
     #[test]
-    #[ignore]
-    fn live_wave_swarm_without_witness_is_a_typed_failure() {
+    fn wave_swarm_without_witness_is_a_typed_failure() {
         let empty = json!({ "response": "", "ok": true });
         let failed = check_witness("implement", &empty);
         assert!(!failed.ok, "no witness must not pass: {failed:?}");
@@ -404,15 +397,8 @@ mod tests {
         assert!(control.ok, "the control witness must pass: {control:?}");
     }
 
-    /// E2E leg 2 (ADR-0021 acceptance 4), live leg — run with
-    /// `cargo test -p flywheel --bin flywheel live_beads_lifecycle_polish_converges -- --ignored`:
-    /// polish converges (unchanged digest stops the loop) and a round that
-    /// drops a requirement from coverage fails the contract.
-    /// Mutation: treat an empty `beads` row as covered — the drop case then
-    /// passes and the assert panics.
     #[test]
-    #[ignore]
-    fn live_beads_lifecycle_polish_converges() {
+    fn beads_lifecycle_polish_converges() {
         let round = |changed: bool| {
             json!({
                 "changed": changed,
