@@ -690,6 +690,30 @@ fn binary_stamp(path: &std::path::Path) -> Option<(u64, std::time::SystemTime)> 
 /// files and the central daemon arms use the stable project label. A host
 /// started with the label retires with `workspace-gone` even though the
 /// panes are live; map the label to the snapshot's ID for the local host.
+/// Why a dispatcher's workspace is gone (bd-bj9xk reap). The live host keys by
+/// rex session id (bd-g9hqu), so a `session:<id>` absent from the plane is
+/// dead, and a bare label is the legacy alias form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GoneReason {
+    SessionAbsent,
+    LabelAlias,
+}
+
+/// Pure: does this dispatcher workspace still belong to the plane? A caller
+/// that has the live session ids passes them in; nothing is guessed.
+pub(crate) fn dispatcher_gone(workspace: &str, live: &[String]) -> Option<GoneReason> {
+    match workspace.strip_prefix("session:") {
+        Some(id) => {
+            if live.iter().any(|s| s == id || s == workspace) {
+                None
+            } else {
+                Some(GoneReason::SessionAbsent)
+            }
+        }
+        None => Some(GoneReason::LabelAlias),
+    }
+}
+
 /// The project key every door folds through: a path names the same project
 /// as its slug, and one project must not get two dispatchers (bd-1mi26).
 fn canonical_project_key(project: &str, door: &str) -> Result<String> {
@@ -3565,5 +3589,38 @@ mod doorbell_canonical_project_tests {
                 "doorbell {door} must canonicalise the project: missing {needle}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod dispatcher_gone_tests {
+    use super::*;
+
+    /// Only a live session id survives; an absent one is dead, and the legacy
+    /// label form is an alias of the session door (bd-bj9xk reap target).
+    #[test]
+    fn a_dispatcher_is_gone_when_its_session_is_absent_or_it_is_a_label() {
+        let live = vec!["01a1d1e6-0b95-767c-861f-176fd88da6ea".to_string()];
+        assert_eq!(
+            dispatcher_gone("session:01a1d1e6-0b95-767c-861f-176fd88da6ea", &live),
+            None,
+            "the one live session is kept"
+        );
+        for ws in [
+            "session:01a1d816-a391-7bb0-8b05-cb9f25cef836",
+            "session:01a1d877-0d27-76a3-a2a1-dc08848f7105",
+            "session:01a1d8f0-6600-7943-8c9c-b104b1457df9",
+        ] {
+            assert_eq!(
+                dispatcher_gone(ws, &live),
+                Some(GoneReason::SessionAbsent),
+                "{ws} has no live rex session"
+            );
+        }
+        assert_eq!(
+            dispatcher_gone("flywheel-chiebukuro", &live),
+            Some(GoneReason::LabelAlias),
+            "the bare label is the legacy alias form"
+        );
     }
 }

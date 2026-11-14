@@ -656,6 +656,7 @@ fn retire_stale_supervisor_units(project: &str, canonical: &str, state: &Path) -
             state,
             &format!("supervisor-{canonical}"),
             serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                 "kind": "supervisor_stale_unit_retire_intent",
                 "label": label,
                 "project": project,
@@ -677,6 +678,7 @@ fn retire_stale_supervisor_units(project: &str, canonical: &str, state: &Path) -
             state,
             &format!("supervisor-{canonical}"),
             serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                 "kind": kind,
                 "label": label,
                 "project": project,
