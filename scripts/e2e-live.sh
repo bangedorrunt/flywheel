@@ -105,6 +105,10 @@ cleanup() {
   set +e
   stop_plane
   stop_doorbell
+  if [ -n "${E2E_KEEP:-}" ]; then
+    echo "e2e-live: sandbox kept at $SANDBOX (E2E_KEEP)" >&2
+    return 0
+  fi
   local tries=0
   while [ "$tries" -lt 5 ]; do
     tries="$((tries + 1))"
@@ -197,6 +201,7 @@ pick_port() { # prints a spare loopback port, or fails with a reason
 }
 
 start_plane() {
+  stop_plane
   local picked
   if ! picked="$(pick_port)"; then
     return 1
@@ -312,6 +317,73 @@ print(json.load(sys.stdin)["seats"][0]["pin"])')"
   return 0
 }
 
+# bd-iscat: the captain watch must not page for a pin that is merely idle — it
+# pages on a working -> idle TRANSITION. This leg holds a real unread captain
+# brief (and a real unrung deferral row) against a real, statically idle pin and
+# requires the watch to stay armed: a false page here would page the captain on
+# every poll. The transition half is the pure fold (unit + mutation proof);
+# a sandbox has no authenticated harness to make a pane genuinely work.
+idle_leg() {
+  : "${AGENT_NAME:?set AGENT_NAME to your pin — the send refuses without a sender}"
+  local project="e2e-idle-page"
+  local session="flywheel-$project"
+  LIVE_PROJECT="$project"
+
+  if ! start_plane; then
+    live_fail "the sandboxed toron daemon did not come up (log $SANDBOX/toron.log)"
+    return 1
+  fi
+  export FLYWHEEL_TORON_URL="http://127.0.0.1:$PORT"
+
+  "$REX_BIN" kill "$session" >/dev/null 2>&1 || true
+  "$FLYWHEEL_BIN" init "$project" >>"$LOG" 2>&1
+  if ! "$FLYWHEEL_BIN" spawn "$project" --kind opencode=2 --skip-preflight --no-focus \
+    --no-verify --retire-orphans >>"$LOG" 2>&1; then
+    live_fail "spawn of $project failed (log $LOG)"
+    return 1
+  fi
+  PLANE_SESSION="$session"
+
+  local pin
+  pin="$("$FLYWHEEL_BIN" swarm status "$project" --json | "$PYTHON_BIN" -c '
+import json, sys
+print(json.load(sys.stdin)["seats"][0]["pin"])')"
+
+  "$FLYWHEEL_BIN" mail send --project "$project" --to "$pin" \
+    --subject "[e2e] brief nobody rang" --body "unread on purpose" >>"$LOG" 2>&1 ||
+    { live_fail "sending the brief to $pin failed (log $LOG)"; return 1; }
+
+  # A real pending deferral, in the dispatcher's own row shape and file name.
+  local state="$XDG_STATE_HOME/flywheel"
+  mkdir -p "$state"
+  printf '{"pin":"%s","line":"[doorbell] plane-P mail. Pull: toron next"}\n' "$pin" \
+    >>"$state/doorbell-deferred-$project.jsonl"
+
+  : >"$SANDBOX/watch.out"
+  "$FLYWHEEL_BIN" captain watch "$project" --interval 1 --json \
+    >"$SANDBOX/watch.out" 2>>"$LOG" &
+  local watch_pid=$!
+  local waited=0
+  while [ "$waited" -lt 6 ]; do
+    if ! kill -0 "$watch_pid" 2>/dev/null; then
+      kill "$watch_pid" 2>/dev/null
+      wait "$watch_pid" 2>/dev/null
+      live_fail "the watch paged on a statically idle pin: $(cat "$SANDBOX/watch.out")"
+      return 1
+    fi
+    waited="$((waited + 1))"
+    sleep 1
+  done
+  kill "$watch_pid" 2>/dev/null
+  wait "$watch_pid" 2>/dev/null
+  if [ -s "$SANDBOX/watch.out" ]; then
+    live_fail "the watch printed a page while the pin never worked: $(cat "$SANDBOX/watch.out")"
+    return 1
+  fi
+  echo "  PASS  idle-page ($pin idle with an unread brief and a deferral, no page)" | tee -a "$LOG"
+  return 0
+}
+
 echo "e2e-live: live$([ "$MUTATE" -eq 1 ] && echo ' --mutate')" | tee -a "$LOG"
 set +e
 live_leg "$MUTATE"
@@ -325,6 +397,17 @@ if [ "$MUTATE" -eq 1 ]; then
   fi
 elif [ "$leg_rc" -ne 0 ]; then
   fail "live leg failed (rc=$leg_rc, log $LOG)"
+fi
+
+if [ "$MUTATE" -eq 0 ]; then
+  echo "e2e-live: idle-page" | tee -a "$LOG"
+  set +e
+  idle_leg
+  idle_rc=$?
+  set -e
+  if [ "$idle_rc" -ne 0 ]; then
+    fail "idle-page leg failed (rc=$idle_rc, log $LOG)"
+  fi
 fi
 
 if [ -s "$SANDBOX/denied.log" ]; then

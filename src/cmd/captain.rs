@@ -155,6 +155,154 @@ const STALL_EXIT: i32 = 3;
 /// re-arming wrapper tells a broken environment from a stalled fleet.
 const PREFLIGHT_EXIT: i32 = 4;
 
+/// One poll's observation of the fleet, as data: the plane's verdict for a pin
+/// and what that pin is holding unread.
+///
+/// This is the whole input to [`IdleWatch::step`]; the caller does the I/O
+/// (plane read, inbox read, deferral read) at the edge.
+pub(crate) struct IdleSample {
+    /// The crew pin.
+    pub pin: String,
+    /// The pane is occupied right now (working/busy/blocked).
+    pub working: bool,
+    /// Subjects of unread captain mail plus pending deferrals. Empty means the
+    /// pin holds nothing a page could name.
+    pub unread: Vec<String>,
+}
+
+/// One page the watch owes the captain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IdlePage {
+    pub pin: String,
+    pub subjects: Vec<String>,
+}
+
+/// The captain-watch idle fold (bd-iscat).
+///
+/// Fires when a pin transitions working -> idle while it holds unread captain
+/// mail (or an unrung deferral): the case where a crew sits on a brief and the
+/// operator notices before the captain does. Once per transition by
+/// construction: the page needs the pin in the PREVIOUS sample's working set,
+/// which the next sample consumes. An empty inbox never pages, and a pin idle
+/// since before the watch armed did not transition.
+#[derive(Default)]
+pub(crate) struct IdleWatch {
+    /// Pins working at the previous sample.
+    working: std::collections::BTreeSet<String>,
+}
+
+impl IdleWatch {
+    /// Fold one sample. Pure: no clock, no I/O, no policy knobs.
+    pub(crate) fn step(&mut self, sample: &[IdleSample]) -> Vec<IdlePage> {
+        let mut pages = Vec::new();
+        let mut working_now = std::collections::BTreeSet::new();
+        for row in sample {
+            if row.working {
+                working_now.insert(row.pin.clone());
+                continue;
+            }
+            if self.working.contains(&row.pin) && !row.unread.is_empty() {
+                pages.push(IdlePage {
+                    pin: row.pin.clone(),
+                    subjects: row.unread.clone(),
+                });
+            }
+        }
+        self.working = working_now;
+        pages
+    }
+}
+
+/// Is this inbox row a captain-side brief for `pin`?
+///
+/// Captain-side means a sender that is neither the pin itself nor another crew
+/// pin: crew-to-crew handoffs are the crew's business, not a captain page. The
+/// classifier is pure over the row so the wire rows `captain watch` already
+/// holds are testable without an inbox.
+fn is_captain_row(row: &Value, pin: &str, crew: &std::collections::BTreeSet<String>) -> bool {
+    let Some(sender) = row.get("sender").and_then(Value::as_str) else {
+        return false;
+    };
+    if sender == pin {
+        return false;
+    }
+    !crew.contains(sender)
+}
+
+/// The subjects of the rows a pin holds from the captain side.
+fn captain_subjects(
+    rows: &[Value],
+    pin: &str,
+    crew: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    rows.iter()
+        .filter(|row| is_captain_row(row, pin, crew))
+        .map(|row| {
+            row.get("subject")
+                .and_then(Value::as_str)
+                .unwrap_or("(no subject)")
+                .to_string()
+        })
+        .collect()
+}
+
+/// The idle arm's edge: crew pins from the registry, status from the snapshot
+/// this poll already read, and what each pin holds unread (captain mail plus
+/// any unrung deferral). All I/O lives here; [`IdleWatch::step`] sees data.
+fn idle_sample(
+    mail: &crate::mail::Mail,
+    project: &str,
+    key: &str,
+    snap: &crate::snapshot::Snapshot,
+    registry: &[crate::state::SpawnEntry],
+) -> Result<Vec<IdleSample>> {
+    let crew: std::collections::BTreeSet<String> = registry
+        .iter()
+        .filter_map(|e| e.mail_identity.clone().or_else(|| Some(e.name.clone())))
+        .filter(|pin| !pin.is_empty())
+        .collect();
+    let deferrals = crate::doorbell::pending_deferred_wakes(&crate::config::state_dir(), project);
+    let mut sample = Vec::with_capacity(registry.len());
+    for entry in registry {
+        let pin = entry
+            .mail_identity
+            .clone()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| entry.name.clone());
+        let working = snap
+            .pins
+            .iter()
+            .any(|row| row.pane_id == entry.pane_id && row.verdict.starts_with("Busy"));
+        // Each crew pin has its own inbox: read AS the pin, not as the watch's
+        // identity, or the mailbox answers for the wrong reader.
+        let unread_rows = mail
+            .clone()
+            .with_name(pin.clone())
+            .inbox_filtered(
+                key,
+                &pin,
+                &MailInboxFilter {
+                    unread_only: true,
+                    include_bodies: false,
+                    limit: 50,
+                    ..Default::default()
+                },
+            )
+            .map(|v| v.as_array().cloned().unwrap_or_default())
+            .unwrap_or_default();
+        let mut unread = captain_subjects(&unread_rows, &pin, &crew);
+        if deferrals.iter().any(|(deferred, _)| deferred == &pin) {
+            unread.push("unrung deferral (the doorbell never rang)".to_string());
+        }
+        sample.push(IdleSample {
+            pin,
+            working,
+            unread,
+        });
+    }
+    Ok(sample)
+}
+
 /// The FIRST failing check as `(name, message)`. Skips are advisory (the
 /// operation can proceed) and passes are silent; only a `Fail` arms the exit.
 /// Pure, so the arm's rule is pinned without a live hc/toron.
@@ -271,7 +419,7 @@ fn cmd_captain_watch(
     let baseline_rfc = doorbell_core::inbox_high_water_from_values(armed.iter().collect());
 
     eprintln!(
-        "flywheel: captain watch {project} armed (mail water {}, stall {}); Ctrl-C to abort",
+        "flywheel: captain watch {project} armed (mail water {}, stall {}, idle-page on); Ctrl-C to abort",
         baseline_rfc.as_deref().unwrap_or("<empty>"),
         if stall {
             format!("on, {} min", stall_minutes.max(1))
@@ -282,6 +430,14 @@ fn cmd_captain_watch(
 
     let stall_secs = stall_minutes.max(1) * 60;
     let project_dir = crate::project_dir(cfg, project);
+    let registry = crate::state::load_spawn_registry(project);
+    let mut idle = IdleWatch::default();
+    // Seed the fold with the fleet as it stands at arm time: a pin already
+    // working must page if it goes idle before the first poll.
+    let armed_now = chrono::Utc::now().timestamp().max(0) as u64;
+    let armed_snap =
+        crate::snapshot::assemble_with_label(cfg, project, &swarm_label_for(project), armed_now);
+    let _ = idle.step(&idle_sample(&mail, project, &key, &armed_snap, &registry)?);
     loop {
         std::thread::sleep(std::time::Duration::from_secs(interval));
 
@@ -317,11 +473,41 @@ fn cmd_captain_watch(
             std::process::exit(code);
         }
 
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        let snap =
+            crate::snapshot::assemble_with_label(cfg, project, &swarm_label_for(project), now);
+
+        if let Some(page) = idle
+            .step(&idle_sample(&mail, project, &key, &snap, &registry)?)
+            .into_iter()
+            .next()
+        {
+            if json_out {
+                print_json(&json!({
+                    "reason": "idle",
+                    "project": project,
+                    "pin": page.pin,
+                    "subjects": page.subjects,
+                }));
+            } else {
+                println!(
+                    "{} went idle holding {} unread: {}",
+                    page.pin,
+                    page.subjects.len(),
+                    page.subjects.join(" | ")
+                );
+                println!(
+                    "read it: flywheel mail inbox {project} --as {} --unread",
+                    page.pin
+                );
+            }
+            return Ok(());
+        }
+
         if !stall {
             continue;
         }
-        let now = chrono::Utc::now().timestamp().max(0) as u64;
-        let probe = probe_stall(cfg, project, &project_dir, now, stall_secs);
+        let probe = stall_probe_from(&snap, &project_dir, now, stall_secs);
         match stall_verdict(&probe) {
             StallVerdict::Working => continue,
             StallVerdict::AllComplete => {
@@ -367,10 +553,23 @@ pub(crate) fn probe_stall(
     now: u64,
     stall_secs: u64,
 ) -> StallProbe {
-    let ws_label =
-        crate::state::load_spawn_meta(project).unwrap_or_else(|| crate::swarm_label(project));
-    // Wave11: label-pinned entry (same single world read as assemble).
-    let snap = crate::snapshot::assemble_with_label(cfg, project, &ws_label, now);
+    let snap = crate::snapshot::assemble_with_label(cfg, project, &swarm_label_for(project), now);
+    stall_probe_from(&snap, project_dir, now, stall_secs)
+}
+
+/// The workspace label one project's plane session carries.
+fn swarm_label_for(project: &str) -> String {
+    crate::state::load_spawn_meta(project).unwrap_or_else(|| crate::swarm_label(project))
+}
+
+/// [`probe_stall`] over a snapshot the caller already read, so a watch that
+/// needs the same fleet for two arms reads the plane once per poll.
+pub(crate) fn stall_probe_from(
+    snap: &crate::snapshot::Snapshot,
+    project_dir: &std::path::Path,
+    now: u64,
+    stall_secs: u64,
+) -> StallProbe {
     let fleet_knowable = !snap.degraded.iter().any(|d| d == "pins");
     let any_pane_working = snap.pins.iter().any(|p| p.verdict.starts_with("Busy"));
     let work_remaining = snap
@@ -1025,6 +1224,85 @@ mod tests {
             Some("b")
         );
         assert!(matches!(skewed[1].status, Status::Fail(_)));
+    }
+
+    /// bd-iscat: a crew that goes working -> idle holding an unread captain
+    /// brief pages ONCE, naming the pin and the subjects — and never twice for
+    /// the same idle stretch. A new working stretch re-arms it.
+    #[test]
+    fn idle_page_fires_once_per_transition() {
+        let sample = |working: bool| {
+            vec![IdleSample {
+                pin: "CyanCove".into(),
+                working,
+                unread: vec!["[bd-x] brief".into(), "revise the plan".into()],
+            }]
+        };
+        let mut watch = IdleWatch::default();
+
+        assert!(
+            watch.step(&sample(false)).is_empty(),
+            "a pin idle since before the watch armed did not transition"
+        );
+        assert!(watch.step(&sample(true)).is_empty(), "working never pages");
+        let pages = watch.step(&sample(false));
+        assert_eq!(pages.len(), 1, "one page per transition: {pages:?}");
+        assert_eq!(pages[0].pin, "CyanCove");
+        assert_eq!(
+            pages[0].subjects,
+            vec!["[bd-x] brief".to_string(), "revise the plan".to_string()],
+            "the page names the unread subjects"
+        );
+        assert!(
+            watch.step(&sample(false)).is_empty(),
+            "the same idle stretch never pages twice"
+        );
+        assert!(watch.step(&sample(true)).is_empty());
+        assert_eq!(
+            watch.step(&sample(false)).len(),
+            1,
+            "a new idle stretch pages again"
+        );
+    }
+
+    /// An empty inbox never pages, however the pane moves.
+    #[test]
+    fn idle_page_never_fires_for_an_empty_inbox() {
+        let sample = |working: bool| {
+            vec![IdleSample {
+                pin: "CyanCove".into(),
+                working,
+                unread: Vec::new(),
+            }]
+        };
+        let mut watch = IdleWatch::default();
+        assert!(watch.step(&sample(true)).is_empty());
+        assert!(
+            watch.step(&sample(false)).is_empty(),
+            "idle with nothing unread is not a page"
+        );
+        assert!(watch.step(&sample(false)).is_empty());
+    }
+
+    /// Only captain-side mail counts: a crew peer's unread is not a captain
+    /// page, and a pin's own rows are never counted against it.
+    #[test]
+    fn captain_subjects_skip_crew_senders() {
+        let crew =
+            std::collections::BTreeSet::from(["CyanCove".to_string(), "MaroonLynx".to_string()]);
+        let rows = vec![
+            json!({"sender": "MaroonLynx", "subject": "crew handoff"}),
+            json!({"sender": "CyanCove", "subject": "to myself"}),
+            json!({"sender": "SlateHarbor", "subject": "[bd-x] brief"}),
+            json!({"subject": "(no sender)"}),
+        ];
+        assert_eq!(
+            captain_subjects(&rows, "CyanCove", &crew),
+            vec!["[bd-x] brief".to_string()],
+            "only the captain-side row is named"
+        );
+        assert!(is_captain_row(&rows[2], "CyanCove", &crew));
+        assert!(!is_captain_row(&rows[0], "CyanCove", &crew));
     }
 
     /// The poll-exit contract: the mail door reports EXACTLY the newest row
