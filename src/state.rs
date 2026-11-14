@@ -1085,15 +1085,15 @@ pub fn captain_pin(project: &str, project_key: &str) -> Option<String> {
     if let Some(pin) = load_captain_alias(project) {
         return Some(pin);
     }
-    let (_, db) = crate::mail::mailbox_roots();
-    let db = db.to_str()?.to_string();
+    // The ONE resolver: `Mailbox::captain_alias` canonicalizes a path-form key
+    // and reads over the project read set, so a row written by
+    // `toron contact captain --project <slug>` (keyed by the slug) is found
+    // from the supervisor/CLI path key too. Mirrors `whois`.
+    let mailbox = crate::mail::comms_mailbox().ok()?;
     let rt = crate::mail::runtime().ok()?;
-    rt.block_on(toron_core::mailbox::identity::captain_alias_in_db(
-        &db,
-        project_key,
-    ))
-    .ok()
-    .flatten()
+    rt.block_on(mailbox.captain_alias(project_key))
+        .ok()
+        .flatten()
 }
 
 /// Explicit-clear tombstone. A brand-new project has no alias and was never

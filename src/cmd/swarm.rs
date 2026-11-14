@@ -465,8 +465,16 @@ pub(crate) fn cmd_retire(
     actor: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    let backend = crate::backend::multiplexer_backend(cfg)?;
     let key = crate::project_dir_str(cfg, project)?;
+    // Refuse the captain BEFORE touching the plane: the captain/operator seat
+    // is never a retire target, and the refusal must not depend on a backend.
+    let captain = crate::state::captain_pin(project, &key);
+    for pin in pins {
+        if captain.as_deref() == Some(pin.as_str()) {
+            bail!("retire refuses the captain/operator seat {pin} (role-resolved)");
+        }
+    }
+    let backend = crate::backend::multiplexer_backend(cfg)?;
     let actor = actor
         .map(str::to_string)
         .unwrap_or_else(crate::operator_pin);
@@ -1497,12 +1505,26 @@ mod tests {
         );
     }
 
-    /// The captain/operator seat is refused by role.
+    /// The captain/operator seat is refused by role. The alias is seeded
+    /// EXACTLY as `toron contact captain --project <slug> --pin X` writes it
+    /// (the row is keyed by the SLUG), while the lookup passes a path key —
+    /// the live mismatch that made bd-8fiwv fail.
     #[test]
     fn retire_refuses_the_captain_seat() {
         let _g = lock_env();
         let (cfg, _dir) = hermetic();
-        crate::state::save_captain_alias("demo", "Captain").expect("alias");
+        let mb = crate::mail::comms_mailbox().expect("mailbox");
+        let rt = crate::mail::runtime().expect("runtime");
+        // The same upsert `toron contact captain --project <slug>` writes:
+        // the row is keyed by the SLUG.
+        rt.block_on(mb.set_captain_alias("demo", "Captain"))
+            .expect("set the captain row keyed by the slug");
+        // The live lookup passes a PATH-form key; the row is keyed by the slug.
+        assert_eq!(
+            crate::state::captain_pin("demo", "/tmp/captainkeytest/demo").as_deref(),
+            Some("Captain"),
+            "a path-form lookup must resolve the slug-keyed captain row"
+        );
         retire_registry(&[("wA:p1", "Captain", "c-1")]);
         let mux = FakeMux::default();
         let mut ports = Fake::default();
