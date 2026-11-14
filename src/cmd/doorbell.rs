@@ -425,6 +425,22 @@ pub(crate) fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
     } else {
         vec![live_id.clone()]
     };
+    let reaped = reap_gone_dispatchers(cfg, project);
+    if !reaped.is_empty() {
+        println!(
+            "{project}: reaped {} gone dispatcher(s): {}",
+            reaped.len(),
+            reaped.join(",")
+        );
+    }
+    for (ws, pid) in crate::doorbell::project_dispatchers(&state_dir, project) {
+        let alive = pid.is_some_and(crate::doorbell::pid_alive);
+        println!(
+            "{project}/{ws}: dispatcher {} pid={}",
+            if alive { "up" } else { "DOWN" },
+            pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
+        );
+    }
     for ws in canonical_workspaces(&workspaces, &live_label, &live_id) {
         let gone = match dispatcher_gone(&ws, &live_ids) {
             Some(GoneReason::SessionAbsent) => " gone=session-absent",
@@ -677,6 +693,7 @@ pub(crate) fn cmd_doorbell_start(cfg: &Config, project: &str) -> Result<()> {
 /// the new binary. The installed unit runs exactly this command.
 pub(crate) fn cmd_doorbell_supervise(cfg: &Config, project: &str) -> Result<()> {
     let project = &canonical_project_key(project, "doorbell supervise")?;
+    let _ = reap_gone_dispatchers(cfg, project);
     let exe = std::env::current_exe()?;
     let stamp = binary_stamp(&exe);
     loop {
@@ -724,6 +741,74 @@ pub(crate) fn dispatcher_gone(workspace: &str, live: &[String]) -> Option<GoneRe
         }
         None => Some(GoneReason::LabelAlias),
     }
+}
+
+/// The plane's live session ids. `workspace_list` IS the session list on rex
+/// (each WorkspaceInfo is one session; hc's workspaces are hc panes), so no
+/// second accessor is invented for it (bd-bj9xk).
+fn live_session_ids(cfg: &Config) -> Vec<String> {
+    let Ok(backend) = crate::backend::multiplexer_backend(cfg) else {
+        return Vec::new();
+    };
+    let Ok(list) = backend.workspace_list() else {
+        return Vec::new();
+    };
+    list.into_iter().map(|w| w.workspace_id).collect()
+}
+
+/// Reap every dispatcher whose workspace no longer belongs to the plane:
+/// journal-first intent, stop (which also drops the record), outcome audit.
+/// A failed stop keeps the record so the next status retries it.
+fn reap_gone_dispatchers(cfg: &Config, project: &str) -> Vec<String> {
+    let live = live_session_ids(cfg);
+    if live.is_empty() {
+        return Vec::new();
+    }
+    let state_dir = crate::config::state_dir();
+    let mut reaped = Vec::new();
+    for (ws, pid) in crate::doorbell::project_dispatchers(&state_dir, project) {
+        let Some(reason) = dispatcher_gone(&ws, &live) else {
+            continue;
+        };
+        let reason = match reason {
+            GoneReason::SessionAbsent => "session-absent",
+            GoneReason::LabelAlias => "label-alias",
+        };
+        crate::doorbell::audit_append(
+            &state_dir,
+            &ws,
+            serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "kind": "dispatcher_gone_intent",
+                "project": project,
+                "workspace": ws,
+                "pid": pid,
+                "reason": reason,
+            }),
+        );
+        crate::doorbell::stop(&state_dir, &ws);
+        let still = crate::doorbell::dispatcher_pid(&state_dir, &ws)
+            .is_some_and(crate::doorbell::pid_alive);
+        crate::doorbell::audit_append(
+            &state_dir,
+            &ws,
+            serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "kind": if still { "dispatcher_gone_stop_failed" } else { "dispatcher_gone_reaped" },
+                "project": project,
+                "workspace": ws,
+                "pid": pid,
+                "reason": reason,
+            }),
+        );
+        if !still {
+            eprintln!(
+                "flywheel doorbell: reaped gone dispatcher {project}/{ws} (pid {pid:?}, {reason})"
+            );
+            reaped.push(ws);
+        }
+    }
+    reaped
 }
 
 /// The project key every door folds through: a path names the same project
@@ -3601,6 +3686,49 @@ mod doorbell_canonical_project_tests {
                 "doorbell {door} must canonicalise the project: missing {needle}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod project_dispatchers_tests {
+    use super::*;
+    use crate::doorbell::{DoorbellState, state_file, write_state};
+
+    /// bd-bj9xk: status must see every dispatcher record for the project —
+    /// including dead sessions and the legacy label — because that is the only
+    /// way the reap and the operator can see duplicates.
+    #[test]
+    fn every_dispatcher_record_is_listed_with_its_pid() {
+        let dir = std::env::temp_dir().join(format!("fw-projdisp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("doorbell")).unwrap();
+        for (ws, project, pid) in [
+            ("session:01a1d1e6-live", "chiebukuro", 49772u32),
+            ("session:01a1d816-dead", "chiebukuro", 17093),
+            ("flywheel-chiebukuro", "chiebukuro", 17301),
+            ("session:other-project", "other", 999),
+        ] {
+            write_state(
+                &state_file(&dir, ws),
+                &DoorbellState {
+                    pid: Some(pid),
+                    project: Some(project.to_string()),
+                    generation: None,
+                },
+            )
+            .unwrap();
+        }
+        let rows = crate::doorbell::project_dispatchers(&dir, "chiebukuro");
+        assert_eq!(
+            rows,
+            vec![
+                ("flywheel-chiebukuro".to_string(), Some(17301)),
+                ("session:01a1d1e6-live".to_string(), Some(49772)),
+                ("session:01a1d816-dead".to_string(), Some(17093)),
+            ],
+            "every chiebukuro door, with its pid; other projects excluded"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

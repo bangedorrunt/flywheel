@@ -251,6 +251,33 @@ pub fn canonical_workspace<'a>(ws: &'a str, live_label: &str, live_id: &'a str) 
     }
 }
 
+/// Every dispatcher record for one project: (workspace, pid). bd-bj9xk:
+/// `doorbell status` listed one row per canonical workspace, so duplicate
+/// doors — including the dead sessions — were invisible.
+pub fn project_dispatchers(state_dir: &Path, project: &str) -> Vec<(String, Option<u32>)> {
+    let dir = state_dir.join("doorbell");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(ws) = name.strip_suffix(".state.json") else {
+            continue;
+        };
+        let Some(state) = read_state(state_dir, ws) else {
+            continue;
+        };
+        if state.project.as_deref() != Some(project) {
+            continue;
+        }
+        out.push((ws.to_string(), state.pid));
+    }
+    out.sort();
+    out
+}
+
 /// Canonical project key: a filesystem path names the same project as its
 /// directory slug (`…/workspace/chiebukuro` == `chiebukuro`), so a
 /// path-valued `--project` never starts a second dispatcher for one project
