@@ -1096,6 +1096,25 @@ pub fn unrung_deferrals(
     pending.into_iter().collect()
 }
 
+/// Pending deferrals still in the handoff file, without taking them: the wakes
+/// the dispatcher has not journaled yet. [`unrung_deferrals`] covers the taken
+/// ones, so a watch that wants "holding a wake that never rang" reads both.
+pub fn pending_deferred_wakes(state_dir: &Path, project: &str) -> Vec<(String, String)> {
+    let path = deferred_wakes_path(state_dir, project);
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    raw.lines()
+        .filter_map(|row| serde_json::from_str::<serde_json::Value>(row.trim()).ok())
+        .filter_map(|v| {
+            Some((
+                v.get("pin")?.as_str()?.to_string(),
+                v.get("line")?.as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
 /// Take the wakes this host hosts, leaving the rest for the dispatcher that
 /// owns those pins (a project can run one dispatcher per plane session, and a
 /// host that takes a foreign pin's wake queues it for a pane it never

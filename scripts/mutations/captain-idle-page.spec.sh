@@ -27,7 +27,13 @@ mutation "C2  an idle pin with an empty inbox still pages" \
     find="$PAGE" \
     replace='            if self.working.contains(&row.pin) {'
 
-mutation "C3  a crew peer's unread counts as captain mail" \
+mutation "C3  a queued deferral is not a brief" \
+    file=$CAPTAIN \
+    expect=a_queued_deferral_is_an_unread_brief \
+    find='    if deferred {' \
+    replace='    if false {'
+
+mutation "C4  a crew peer's unread counts as captain mail" \
     file=$CAPTAIN \
     expect=captain_subjects_skip_crew_senders \
     find='    !crew.contains(sender)' \

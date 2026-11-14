@@ -246,6 +246,24 @@ fn captain_subjects(
         .collect()
 }
 
+/// What one pin holds: captain-side inbox subjects, plus the deferral marker
+/// when it holds a wake that never rang. Pure, so the decision is pinned
+/// without an inbox, a journal or a plane.
+const UNRUNG_DEFERRAL: &str = "unrung deferral (the doorbell never rang)";
+
+fn pin_unread(
+    rows: &[Value],
+    pin: &str,
+    crew: &std::collections::BTreeSet<String>,
+    deferred: bool,
+) -> Vec<String> {
+    let mut unread = captain_subjects(rows, pin, crew);
+    if deferred {
+        unread.push(UNRUNG_DEFERRAL.to_string());
+    }
+    unread
+}
+
 /// The idle arm's edge: crew pins from the registry, status from the snapshot
 /// this poll already read, and what each pin holds unread (captain mail plus
 /// any unrung deferral). All I/O lives here; [`IdleWatch::step`] sees data.
@@ -261,9 +279,20 @@ fn idle_sample(
         .filter_map(|e| e.mail_identity.clone().or_else(|| Some(e.name.clone())))
         .filter(|pin| !pin.is_empty())
         .collect();
-    let deferrals = crate::doorbell::unrung_deferrals(
-        &crate::config::state_dir(),
-        crate::doorbell::project_workspaces(&crate::config::state_dir(), project),
+    // A wake that never rang is held in one of two places: the handoff file
+    // (not yet taken) or the journal (taken, never drained). Both count.
+    let state_dir = crate::config::state_dir();
+    let mut deferred: std::collections::BTreeSet<String> = crate::doorbell::unrung_deferrals(
+        &state_dir,
+        crate::doorbell::project_workspaces(&state_dir, project),
+    )
+    .into_iter()
+    .map(|(pin, _)| pin)
+    .collect();
+    deferred.extend(
+        crate::doorbell::pending_deferred_wakes(&state_dir, project)
+            .into_iter()
+            .map(|(pin, _)| pin),
     );
     let mut sample = Vec::with_capacity(registry.len());
     for entry in registry {
@@ -293,10 +322,7 @@ fn idle_sample(
             )
             .map(|v| v.as_array().cloned().unwrap_or_default())
             .unwrap_or_default();
-        let mut unread = captain_subjects(&unread_rows, &pin, &crew);
-        if deferrals.iter().any(|(deferred, _)| deferred == &pin) {
-            unread.push("unrung deferral (the doorbell never rang)".to_string());
-        }
+        let unread = pin_unread(&unread_rows, &pin, &crew, deferred.contains(&pin));
         sample.push(IdleSample {
             pin,
             working,
@@ -1285,6 +1311,29 @@ mod tests {
             "idle with nothing unread is not a page"
         );
         assert!(watch.step(&sample(false)).is_empty());
+    }
+
+    /// A wake the host took and never rang is a brief the captain must hear
+    /// about, whether it is still in the handoff file or already journaled —
+    /// `pin_unread` is the ONE decision both sources feed.
+    #[test]
+    fn a_queued_deferral_is_an_unread_brief() {
+        let crew = std::collections::BTreeSet::from(["CyanCove".to_string()]);
+        assert_eq!(
+            pin_unread(&[], "CyanCove", &crew, true),
+            vec![UNRUNG_DEFERRAL.to_string()],
+            "a deferral counts with an otherwise empty inbox"
+        );
+        assert!(
+            pin_unread(&[], "CyanCove", &crew, false).is_empty(),
+            "no deferral, nothing unread"
+        );
+        let rows = vec![json!({"sender": "SlateHarbor", "subject": "[bd-x] brief"})];
+        assert_eq!(
+            pin_unread(&rows, "CyanCove", &crew, true),
+            vec!["[bd-x] brief".to_string(), UNRUNG_DEFERRAL.to_string()],
+            "mail and the deferral both surface"
+        );
     }
 
     /// Only captain-side mail counts: a crew peer's unread is not a captain
