@@ -75,6 +75,18 @@ pub enum SeatEffect {
     },
 }
 
+/// Review/verify roles are `context:fresh` by rule (ADR-0021 D3): a seat
+/// used for them must not inherit the context of the work it checks, so a
+/// role-only change respawns instead of injecting. Role names are the proxy
+/// the plan tier has (the registry carries no stage contract).
+#[must_use]
+pub fn role_is_fresh(role: &str) -> bool {
+    matches!(
+        role.trim().to_ascii_lowercase().as_str(),
+        "reviewer" | "verifier" | "review" | "verify"
+    )
+}
+
 fn diff_fields(desired: &DesiredSeat, live: &LiveSeat) -> Vec<String> {
     let mut fields = Vec::new();
     if desired.harness != live.harness {

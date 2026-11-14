@@ -123,10 +123,12 @@ pass.
 - **Standing preferences (ADR-0022 D6).** `flywheel prefer <role.field>=<value> [--project <p>]` +
   `--list [--json]` / `--forget <role.field>`; project beats always, exact role beats `*`.
 - **Live seat change (ADR-0022 D7/rollout 6).** One mechanism: `flywheel swarm apply
-  <project> --patch <seat>.<field>=<value>` → pure reconciler → the one `Ports::seat`
-  interpreter, journal-first (respawn journals one `RebindIntent`). `binding-rebind
-  --model` routes here; never a second apply path. `swarm plan` is byte-identical to
-  `spawn --dry-run --json`; `swarm status` lists live seats.
+  <project> --patch <seat>.<field>=<value> [--count <role>=<n>]` → pure reconciler →
+  the one `Ports::seat` interpreter, journal-first (respawn journals one `RebindIntent`;
+  Spawn runs within `crew.max`; InjectRole is one prompt turn and never for
+  review/verify seats). `binding-rebind --model` routes here; never a second apply
+  path. `swarm plan` is byte-identical to `spawn --dry-run --json`; `swarm status`
+  lists live seats. `SpawnEntry` carries effort/mode so a second reconcile is Keep.
 - **Skill sync.** CLI change → `Commands` enum + `--robot-capabilities` + this
   file's critical list + `~/.agents/skills/flywheel/SKILL.md` §5.
 

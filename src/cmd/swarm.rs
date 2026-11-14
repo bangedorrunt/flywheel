@@ -55,10 +55,13 @@ pub(crate) enum SwarmCmd {
     /// Apply a seat patch on a live swarm through the reconciler
     Apply {
         project: String,
-        /// `<seat>.<field>=<value>`, field in harness|model|effort|mode.
+        /// `<seat>.<field>=<value>`, field in harness|model|effort|mode|role.
         /// `<seat>` is a pin, a role, or a terminal name.
-        #[arg(long, value_name = "SEAT.FIELD=VALUE", required = true)]
+        #[arg(long, value_name = "SEAT.FIELD=VALUE")]
         patch: Vec<String>,
+        /// grow a role: `--count <role>=<n>` adds n seats (reconciler Spawn).
+        #[arg(long, value_name = "ROLE=N")]
+        count: Vec<String>,
         /// machine-readable result
         #[arg(long)]
         json: bool,
@@ -102,8 +105,9 @@ pub(crate) fn cmd_swarm(cfg: &Config, cmd: &SwarmCmd) -> Result<()> {
         SwarmCmd::Apply {
             project,
             patch,
+            count,
             json,
-        } => cmd_swarm_apply(cfg, project, patch, *json),
+        } => cmd_swarm_apply(cfg, project, patch, count, *json),
         SwarmCmd::Status { project, json } => {
             let project = crate::cron::detect_project(cfg, project.as_deref()).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -157,6 +161,8 @@ pub(crate) struct SeatRow {
     pub role: String,
     pub harness: String,
     pub model: Option<String>,
+    pub effort: Option<String>,
+    pub mode: Option<String>,
     pub pane_id: String,
     pub status: String,
 }
@@ -183,6 +189,8 @@ pub(crate) fn seat_rows(registry: &[SpawnEntry], agents: &[(String, String)]) ->
                 role: e.profile.clone().unwrap_or_else(|| "crew".to_string()),
                 harness: e.harness.clone().unwrap_or_default(),
                 model: e.model.clone().or_else(|| e.model_pin.clone()),
+                effort: e.effort.clone(),
+                mode: e.mode.clone(),
                 pane_id: e.pane_id.clone(),
                 status,
             })
@@ -213,6 +221,8 @@ fn cmd_swarm_status(cfg: &Config, project: &str, json: bool) -> Result<()> {
                 "role": r.role,
                 "harness": r.harness,
                 "model": r.model,
+                "effort": r.effort,
+                "mode": r.mode,
                 "pane_id": r.pane_id,
                 "status": r.status,
             })).collect::<Vec<_>>(),
@@ -242,6 +252,7 @@ pub(crate) fn cmd_swarm_apply(
     cfg: &Config,
     project: &str,
     patches: &[String],
+    counts: &[String],
     json: bool,
 ) -> Result<()> {
     let registry = crate::state::load_spawn_registry(project);
@@ -256,7 +267,10 @@ pub(crate) fn cmd_swarm_apply(
         .map(|a| (a.pane_id, a.agent_status.as_str().to_string()))
         .collect();
     let rows = seat_rows(&registry, &agents);
-    let desired = patched_desired(&rows, patches)?;
+    if patches.is_empty() && counts.is_empty() {
+        bail!("swarm apply: pass --patch <seat>.<field>=<value> and/or --count <role>=<n>");
+    }
+    let desired = patched_desired(&rows, patches, counts)?;
     let live: Vec<LiveSeat> = rows
         .iter()
         .map(|r| LiveSeat {
@@ -264,8 +278,8 @@ pub(crate) fn cmd_swarm_apply(
             role: r.role.clone(),
             harness: r.harness.clone(),
             model: r.model.clone(),
-            mode: None,
-            effort: None,
+            mode: r.mode.clone(),
+            effort: r.effort.clone(),
             placement: SeatPlacement::Pane,
             idle: matches!(r.status.as_str(), "idle" | "done"),
             fresh_session: false,
@@ -382,7 +396,11 @@ fn effect_line(effect: &SeatEffect) -> String {
 
 /// Apply the patches to the desired rows. A patch matches a pin, a role, or a
 /// terminal name; an unknown seat fails naming the live ones.
-fn patched_desired(rows: &[SeatRow], patches: &[String]) -> Result<Vec<DesiredSeat>> {
+fn patched_desired(
+    rows: &[SeatRow],
+    patches: &[String],
+    counts: &[String],
+) -> Result<Vec<DesiredSeat>> {
     let mut desired: Vec<DesiredSeat> = rows
         .iter()
         .map(|r| DesiredSeat {
@@ -390,10 +408,10 @@ fn patched_desired(rows: &[SeatRow], patches: &[String]) -> Result<Vec<DesiredSe
             role: r.role.clone(),
             harness: r.harness.clone(),
             model: r.model.clone(),
-            effort: None,
-            mode: None,
+            effort: r.effort.clone(),
+            mode: r.mode.clone(),
             placement: SeatPlacement::Pane,
-            context_warm_allowed: true,
+            context_warm_allowed: !crate::seat_reconcile::role_is_fresh(&r.role),
         })
         .collect();
     for spec in patches {
@@ -433,7 +451,49 @@ fn patched_desired(rows: &[SeatRow], patches: &[String]) -> Result<Vec<DesiredSe
                 crate::swarm_plan::PatchField::Mode => {
                     seat.mode = Some(patch.value.clone());
                 }
+                crate::swarm_plan::PatchField::Role => {
+                    // A review/verify seat (current OR target) must not inherit
+                    // context: the reconciler respawns instead of injecting.
+                    let current_fresh = crate::seat_reconcile::role_is_fresh(&seat.role);
+                    seat.role = patch.value.clone();
+                    seat.context_warm_allowed =
+                        !current_fresh && !crate::seat_reconcile::role_is_fresh(&patch.value);
+                }
             }
+        }
+    }
+    for spec in counts {
+        let (role, delta) = spec
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("bad --count {spec:?}: want <role>=<n>"))?;
+        let delta: usize =
+            delta.trim().trim_start_matches('+').parse().map_err(|_| {
+                anyhow::anyhow!("bad --count {spec:?}: n must be a positive integer")
+            })?;
+        if delta == 0 {
+            continue;
+        }
+        let Some(template) = rows.iter().find(|r| r.role == role) else {
+            let mut names: Vec<&str> = rows.iter().map(|r| r.role.as_str()).collect();
+            names.sort();
+            names.dedup();
+            return Err(anyhow::anyhow!(
+                "swarm apply: --count role {:?} has no live seat (live: {})",
+                role,
+                names.join(", ")
+            ));
+        };
+        for _ in 0..delta {
+            desired.push(DesiredSeat {
+                pin: None,
+                role: role.to_string(),
+                harness: template.harness.clone(),
+                model: template.model.clone(),
+                effort: template.effort.clone(),
+                mode: template.mode.clone(),
+                placement: SeatPlacement::Pane,
+                context_warm_allowed: !crate::seat_reconcile::role_is_fresh(role),
+            });
         }
     }
     Ok(desired)
@@ -457,6 +517,207 @@ mod tests {
         let mut e = SpawnEntry::profiled(pane, name, role, harness, Some(pin.to_string()));
         e.model = Some(model.to_string());
         e
+    }
+
+    // ---- ADR-0022 D7 remainder: Spawn + InjectRole + effort/mode ----
+
+    use crate::backend::MultiplexerBackend;
+    use crate::config::lock_env;
+    use crate::hc::AgentStatus;
+    use crate::hc::{AgentInfo, PaneInfo, WorkspaceInfo};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Hermetic cfg: temp workspace root + temp XDG dirs, and a real project
+    /// dir so the registry key is the same whether the caller passes the name
+    /// or the path.
+    fn hermetic() -> (Config, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let state_home = dir.path().join("state");
+        let config_home = dir.path().join("config");
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &config_home) };
+        std::fs::create_dir_all(config_home.join("flywheel")).expect("config dir");
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(ws.join("demo")).expect("project dir");
+        let cfg = Config {
+            workspace_root: Some(ws.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        (cfg, dir)
+    }
+
+    fn agent(name: &str, pane: &str, ws: &str) -> AgentInfo {
+        AgentInfo {
+            agent: Some(name.to_string()),
+            agent_status: AgentStatus::Idle,
+            cwd: None,
+            display_agent: None,
+            focused: false,
+            foreground_cwd: None,
+            interactive_ready: false,
+            launch_pending: false,
+            name: Some(name.to_string()),
+            pane_id: pane.to_string(),
+            revision: 0,
+            state_change_seq: 0,
+            completion_seq: None,
+            state_labels: serde_json::Map::new(),
+            tab_id: "t1".into(),
+            terminal_id: "term".into(),
+            terminal_title: None,
+            workspace_id: ws.to_string(),
+        }
+    }
+
+    fn pane(ws: &str, n: u32) -> PaneInfo {
+        PaneInfo {
+            pane_id: format!("{ws}:p{n}"),
+            terminal_id: format!("term-{n}"),
+            workspace_id: ws.into(),
+            tab_id: format!("{ws}:t1"),
+            focused: false,
+            agent_status: AgentStatus::Idle,
+            revision: 0,
+            title: None,
+            cwd: None,
+            agent: None,
+            agent_session: None,
+            display_agent: None,
+            foreground_cwd: None,
+            label: None,
+            scroll: None,
+            state_labels: serde_json::Map::new(),
+            terminal_title: None,
+            terminal_title_stripped: None,
+            tokens: serde_json::Map::new(),
+        }
+    }
+
+    fn workspace(label: &str) -> WorkspaceInfo {
+        WorkspaceInfo {
+            workspace_id: "wA".into(),
+            number: 1,
+            label: label.into(),
+            focused: false,
+            pane_count: 1,
+            tab_count: 1,
+            active_tab_id: "wA:t1".into(),
+            agent_status: AgentStatus::Idle,
+            cwd: None,
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeMux {
+        agents: Mutex<Vec<AgentInfo>>,
+        splits: AtomicUsize,
+        prompts: Mutex<Vec<(String, String)>>,
+    }
+
+    impl MultiplexerBackend for FakeMux {
+        fn name(&self) -> &'static str {
+            "fake-mux"
+        }
+        fn workspace_list(&self) -> Result<Vec<WorkspaceInfo>, toron_plane::backend::BackendError> {
+            Ok(vec![workspace("demo")])
+        }
+        fn pane_list(
+            &self,
+            _workspace_id: Option<&str>,
+        ) -> Result<Vec<PaneInfo>, toron_plane::backend::BackendError> {
+            Ok(vec![pane("wA", 1)])
+        }
+        fn pane_split(
+            &self,
+            _parent_pane_id: &str,
+            _direction: &str,
+            _cwd: Option<&str>,
+        ) -> Result<PaneInfo, toron_plane::backend::BackendError> {
+            let n = self.splits.fetch_add(1, Ordering::SeqCst) + 2;
+            Ok(pane("wA", n as u32))
+        }
+        fn pane_close(&self, _pane_id: &str) -> Result<(), toron_plane::backend::BackendError> {
+            Ok(())
+        }
+        fn agent_list(&self) -> Result<Vec<AgentInfo>, toron_plane::backend::BackendError> {
+            Ok(self.agents.lock().unwrap().clone())
+        }
+        fn agent_start(
+            &self,
+            name: &str,
+            _kind: &str,
+            pane_id: &str,
+            _args: &[String],
+        ) -> Result<AgentInfo, toron_plane::backend::BackendError> {
+            let a = agent(name, pane_id, "wA");
+            self.agents.lock().unwrap().push(a.clone());
+            Ok(a)
+        }
+        fn agent_rename(
+            &self,
+            _target: &str,
+            _new_name: Option<&str>,
+        ) -> Result<(), toron_plane::backend::BackendError> {
+            Ok(())
+        }
+        fn prompt(
+            &self,
+            target: &str,
+            text: &str,
+            _wait: Option<&toron_plane::backend::WaitOptions>,
+        ) -> Result<serde_json::Value, toron_plane::backend::BackendError> {
+            self.prompts
+                .lock()
+                .unwrap()
+                .push((target.to_string(), text.to_string()));
+            Ok(serde_json::json!({"ok": true}))
+        }
+    }
+
+    /// The three verbs parse (ADR-0022 rollout 6): `plan`, `apply`, `status`.
+    #[test]
+    fn swarm_verbs_parse() {
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                use clap::Parser;
+                let plan = crate::Cli::try_parse_from([
+                    "flywheel", "swarm", "plan", "proj", "--pi", "1", "--model", "m",
+                ])
+                .expect("swarm plan parses");
+                assert!(matches!(
+                    plan.command,
+                    Some(crate::Commands::Swarm {
+                        cmd: SwarmCmd::Plan { .. }
+                    })
+                ));
+                let apply = crate::Cli::try_parse_from([
+                    "flywheel",
+                    "swarm",
+                    "apply",
+                    "proj",
+                    "--patch",
+                    "reviewer.model=x",
+                ])
+                .expect("swarm apply parses");
+                assert!(matches!(
+                    apply.command,
+                    Some(crate::Commands::Swarm {
+                        cmd: SwarmCmd::Apply { .. }
+                    })
+                ));
+                let status =
+                    crate::Cli::try_parse_from(["flywheel", "swarm", "status", "proj", "--json"])
+                        .expect("swarm status parses");
+                assert!(matches!(
+                    status.command,
+                    Some(crate::Commands::Swarm {
+                        cmd: SwarmCmd::Status { .. }
+                    })
+                ));
+            })
+            .expect("spawn the parse thread");
+        handle.join().expect("the parse assertions must hold");
     }
 
     /// V6/plan: `swarm plan` delegates to `spawn --dry-run --json`; the
@@ -485,10 +746,12 @@ mod tests {
             role: "reviewer".into(),
             harness: "pi".into(),
             model: Some("old".into()),
+            effort: None,
+            mode: None,
             pane_id: "pane-1".into(),
             status: "idle".into(),
         }];
-        let desired = patched_desired(&rows, &["reviewer.model=new".into()]).expect("patches");
+        let desired = patched_desired(&rows, &["reviewer.model=new".into()], &[]).expect("patches");
         let live: Vec<LiveSeat> = rows
             .iter()
             .map(|r| LiveSeat {
@@ -534,11 +797,13 @@ mod tests {
             role: "coder".into(),
             harness: "opencode".into(),
             model: Some("opencode/old".into()),
+            effort: None,
+            mode: None,
             pane_id: "pane-1".into(),
             status: "idle".into(),
         }];
         let desired =
-            patched_desired(&rows, &["coder.model=opencode/new".into()]).expect("patches");
+            patched_desired(&rows, &["coder.model=opencode/new".into()], &[]).expect("patches");
         let live: Vec<LiveSeat> = rows
             .iter()
             .map(|r| LiveSeat {
@@ -583,10 +848,13 @@ mod tests {
             role: "reviewer".into(),
             harness: "pi".into(),
             model: None,
+            effort: None,
+            mode: None,
             pane_id: "pane-1".into(),
             status: "idle".into(),
         }];
-        let err = patched_desired(&rows, &["nobody.model=x".into()]).expect_err("unknown seat");
+        let err =
+            patched_desired(&rows, &["nobody.model=x".into()], &[]).expect_err("unknown seat");
         assert!(err.to_string().contains("Reviewer"), "{err}");
         assert!(err.to_string().contains("reviewer"), "{err}");
     }
@@ -666,50 +934,180 @@ mod tests {
         }
     }
 
-    /// The three verbs parse (ADR-0022 rollout 6): `plan`, `apply`, `status`.
+    /// `--count role=+1` emits exactly one Spawn through the reconciler.
     #[test]
-    fn swarm_verbs_parse() {
-        let handle = std::thread::Builder::new()
-            .stack_size(256 * 1024 * 1024)
-            .spawn(|| {
-                use clap::Parser;
-                let plan = crate::Cli::try_parse_from([
-                    "flywheel", "swarm", "plan", "proj", "--pi", "1", "--model", "m",
-                ])
-                .expect("swarm plan parses");
-                assert!(matches!(
-                    plan.command,
-                    Some(crate::Commands::Swarm {
-                        cmd: SwarmCmd::Plan { .. }
-                    })
-                ));
-                let apply = crate::Cli::try_parse_from([
-                    "flywheel",
-                    "swarm",
-                    "apply",
-                    "proj",
-                    "--patch",
-                    "reviewer.model=x",
-                ])
-                .expect("swarm apply parses");
-                assert!(matches!(
-                    apply.command,
-                    Some(crate::Commands::Swarm {
-                        cmd: SwarmCmd::Apply { .. }
-                    })
-                ));
-                let status =
-                    crate::Cli::try_parse_from(["flywheel", "swarm", "status", "proj", "--json"])
-                        .expect("swarm status parses");
-                assert!(matches!(
-                    status.command,
-                    Some(crate::Commands::Swarm {
-                        cmd: SwarmCmd::Status { .. }
-                    })
-                ));
+    fn apply_count_plus_one_emits_one_spawn() {
+        let rows = vec![SeatRow {
+            pin: "Coder".into(),
+            name: "coder-1".into(),
+            role: "coder".into(),
+            harness: "pi".into(),
+            model: Some("m".into()),
+            effort: None,
+            mode: None,
+            pane_id: "pane-1".into(),
+            status: "idle".into(),
+        }];
+        let desired = patched_desired(&rows, &[], &["coder=+1".into()]).expect("counts");
+        let live: Vec<LiveSeat> = rows
+            .iter()
+            .map(|r| LiveSeat {
+                pin: r.pin.clone(),
+                role: r.role.clone(),
+                harness: r.harness.clone(),
+                model: r.model.clone(),
+                mode: r.mode.clone(),
+                effort: r.effort.clone(),
+                placement: SeatPlacement::Pane,
+                idle: false,
+                fresh_session: false,
+                idle_since_ms: None,
             })
-            .expect("spawn the parse thread");
-        handle.join().expect("the parse assertions must hold");
+            .collect();
+        let effects: Vec<SeatEffect> =
+            reconcile(&desired, &live, &|_| false, &ReconcilePolicy::default())
+                .into_iter()
+                .filter(|e| !matches!(e, SeatEffect::Keep { .. }))
+                .collect();
+        assert_eq!(effects.len(), 1, "one non-Keep effect: {effects:?}");
+        assert!(
+            matches!(&effects[0], SeatEffect::Spawn { role, count } if role == "coder" && *count == 1),
+            "count grows the role: {effects:?}"
+        );
+    }
+
+    /// The interpreter adds exactly one seat within crew.max.
+    #[test]
+    fn spawn_seats_adds_one_within_cap() {
+        let _g = lock_env();
+        let (cfg, _dir) = hermetic();
+        let mux = FakeMux::default();
+        crate::supervisor_host::spawn_seats(&mux, &cfg, "demo", "coder", 1)
+            .expect("one seat within cap");
+        let rows = crate::state::load_spawn_registry("demo");
+        assert_eq!(rows.len(), 1, "one seat recorded: {rows:?}");
+        assert_eq!(rows[0].profile.as_deref(), Some("coder"));
+        assert_eq!(mux.splits.load(Ordering::SeqCst), 1, "one pane split");
+        assert_eq!(mux.agents.lock().unwrap().len(), 1, "one agent started");
+    }
+
+    /// Over `crew.max` is a typed refusal before any pane effect.
+    #[test]
+    fn spawn_seats_over_cap_is_a_typed_refusal() {
+        let _g = lock_env();
+        let (cfg, _dir) = hermetic();
+        let cap = cfg.crew_max() as usize;
+        let mut rows = Vec::new();
+        for i in 0..cap {
+            rows.push(crate::state::SpawnEntry::profiled(
+                format!("wA:p{i}"),
+                format!("coder-{i}"),
+                "coder",
+                "pi",
+                None,
+            ));
+        }
+        crate::state::save_spawn_registry("demo", &rows).expect("save registry");
+        let mux = FakeMux::default();
+        let err = crate::supervisor_host::spawn_seats(&mux, &cfg, "demo", "coder", 1)
+            .expect_err("over cap refuses");
+        assert!(err.contains("crew.max"), "{err}");
+        assert_eq!(mux.splits.load(Ordering::SeqCst), 0, "no pane effect");
+    }
+
+    /// A role-only patch with context:warm emits one InjectRole and the
+    /// interpreter delivers exactly one prompt turn.
+    #[test]
+    fn inject_role_delivers_one_turn() {
+        let _g = lock_env();
+        let (_cfg, _dir) = hermetic();
+        let mut entry = crate::state::SpawnEntry::profiled(
+            "wA:p1",
+            "crew-1",
+            "coder",
+            "pi",
+            Some("Coder".into()),
+        );
+        entry.model = Some("m".into());
+        crate::state::save_spawn_registry("demo", &[entry]).expect("save registry");
+        let mux = FakeMux::default();
+        crate::supervisor_host::inject_role_into(&mux, "demo", "Coder", "planner")
+            .expect("inject ok");
+        let prompts = mux.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1, "one turn: {prompts:?}");
+        assert_eq!(prompts[0].0, "wA:p1");
+        assert!(prompts[0].1.contains("planner"), "{}", prompts[0].1);
+    }
+
+    /// A review seat is context:fresh by rule and never receives InjectRole.
+    #[test]
+    fn inject_role_never_reaches_a_review_seat() {
+        let _g = lock_env();
+        let (_cfg, _dir) = hermetic();
+        let entry = crate::state::SpawnEntry::profiled(
+            "wA:p1",
+            "crew-1",
+            "reviewer",
+            "pi",
+            Some("Reviewer".into()),
+        );
+        crate::state::save_spawn_registry("demo", &[entry]).expect("save registry");
+        let mux = FakeMux::default();
+        let err = crate::supervisor_host::inject_role_into(&mux, "demo", "Reviewer", "reviewer")
+            .expect_err("review seats refuse injection");
+        assert!(err.contains("context:fresh"), "{err}");
+        assert!(mux.prompts.lock().unwrap().is_empty(), "no turn sent");
+    }
+
+    /// Effort/mode persisted on the registry row -> the next reconcile is
+    /// Keep (no phantom diff).
+    #[test]
+    fn effort_persisted_second_reconcile_is_keep() {
+        let mut entry = crate::state::SpawnEntry::profiled(
+            "wA:p1",
+            "crew-1",
+            "coder",
+            "pi",
+            Some("Coder".into()),
+        );
+        entry.model = Some("m".into());
+        entry.effort = Some("high".into());
+        entry.mode = Some("workspace-write".into());
+        let rows = seat_rows(&[entry], &[]);
+        assert_eq!(rows[0].effort.as_deref(), Some("high"));
+        let desired = patched_desired(&rows, &[], &[]).expect("no patches");
+        let live: Vec<LiveSeat> = rows
+            .iter()
+            .map(|r| LiveSeat {
+                pin: r.pin.clone(),
+                role: r.role.clone(),
+                harness: r.harness.clone(),
+                model: r.model.clone(),
+                mode: r.mode.clone(),
+                effort: r.effort.clone(),
+                placement: SeatPlacement::Pane,
+                idle: false,
+                fresh_session: false,
+                idle_since_ms: None,
+            })
+            .collect();
+        let effects = reconcile(&desired, &live, &|_| false, &ReconcilePolicy::default());
+        assert!(
+            matches!(effects.as_slice(), [SeatEffect::Keep { .. }]),
+            "persisted effort/mode reconcile to Keep: {effects:?}"
+        );
+    }
+
+    /// Old registry JSON without effort/mode still loads (serde default).
+    #[test]
+    fn old_registry_json_without_effort_mode_loads() {
+        let old =
+            r#"[{"pane_id":"wA:p1","name":"crew-1","profile":"coder","harness":"pi","model":"m"}]"#;
+        let rows: Vec<crate::state::SpawnEntry> =
+            serde_json::from_str(old).expect("old JSON loads");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].effort, None);
+        assert_eq!(rows[0].mode, None);
     }
 
     /// Unused-import guard: `execute`/`RoundReport`/`SupCmd` are the 5d

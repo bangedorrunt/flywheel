@@ -392,6 +392,14 @@ pub struct SpawnEntry {
     /// bare launch that declared no route to resolve.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_pin: Option<String>,
+    /// ADR-0022 D7: the effort the seat launched with, so the plan tier can
+    /// re-derive it (a second reconcile is Keep). `None` = harness default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// ADR-0022 D7: the harness mode the seat launched with (same contract
+    /// as `effort`). `None` = harness default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     /// ADR-0013 P1-8: bounded digest of the profile's attached skills
     /// (`profile::skills_digest`) — identity + count, never the list.
     /// `None` = the profile attaches no skills.
@@ -428,6 +436,8 @@ impl SpawnEntry {
             harness: None,
             model: None,
             model_pin: None,
+            effort: None,
+            mode: None,
             skills_digest: None,
             harness_session: None,
             mail_identity: None,
@@ -449,6 +459,8 @@ impl SpawnEntry {
             harness: None,
             model: None,
             model_pin: None,
+            effort: None,
+            mode: None,
             skills_digest: None,
             harness_session: None,
             mail_identity: Some(mail_identity.into()),
@@ -474,6 +486,8 @@ impl SpawnEntry {
             harness: Some(harness.into()),
             model: None,
             model_pin: None,
+            effort: None,
+            mode: None,
             skills_digest: None,
             mail_identity,
             harness_session: None,
@@ -507,6 +521,10 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 #[serde(default)]
                 model_pin: Option<String>,
                 #[serde(default)]
+                effort: Option<String>,
+                #[serde(default)]
+                mode: Option<String>,
+                #[serde(default)]
                 skills_digest: Option<String>,
                 #[serde(default)]
                 mail_identity: Option<String>,
@@ -526,6 +544,8 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 harness: None,
                 model: None,
                 model_pin: None,
+                effort: None,
+                mode: None,
                 skills_digest: None,
                 mail_identity: None,
                 harness_session: None,
@@ -539,6 +559,8 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 harness,
                 model,
                 model_pin,
+                effort,
+                mode,
                 skills_digest,
                 mail_identity,
                 harness_session,
@@ -551,6 +573,8 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 harness,
                 model,
                 model_pin,
+                effort,
+                mode,
                 skills_digest,
                 mail_identity,
                 harness_session,
@@ -4122,6 +4146,8 @@ mod loops_sidecar_tests {
                 harness: Some("omp".into()),
                 model: None,
                 model_pin: None,
+                effort: None,
+                mode: None,
                 skills_digest: None,
                 mail_identity: None,
                 harness_session: None,

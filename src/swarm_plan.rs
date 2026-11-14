@@ -1096,6 +1096,9 @@ pub enum PatchField {
     Model,
     Effort,
     Mode,
+    /// Live only (`swarm apply`): change the seat's role. `spawn --patch`
+    /// rejects it — a plan seat's role is its identity.
+    Role,
 }
 
 impl PatchField {
@@ -1105,11 +1108,12 @@ impl PatchField {
             "model" => Some(Self::Model),
             "effort" => Some(Self::Effort),
             "mode" => Some(Self::Mode),
+            "role" => Some(Self::Role),
             _ => None,
         }
     }
 
-    const VALID: &'static str = "harness|model|effort|mode";
+    const VALID: &'static str = "harness|model|effort|mode|role";
 }
 
 /// Parse `<seat>.<field>=<value>`; unknown fields name the valid ones.

@@ -1133,6 +1133,8 @@ pub(crate) fn respawn_binding(
             e.harness = Some(want.harness.clone());
             e.model = want.model.clone();
             e.model_pin = want.model.clone();
+            e.effort = want.effort.clone();
+            e.mode = want.mode.clone();
         }
         state::save_spawn_registry(&key, &entries)?;
     }

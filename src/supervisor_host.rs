@@ -1465,8 +1465,8 @@ impl Ports for LivePorts {
                 role: role.clone(),
                 harness: harness.clone(),
                 model: model.clone(),
-                effort: None,
-                mode: None,
+                effort: e.effort.clone(),
+                mode: e.mode.clone(),
                 placement: crate::seat_binder::SeatPlacement::Pane,
                 context_warm_allowed: true,
             });
@@ -1475,8 +1475,8 @@ impl Ports for LivePorts {
                 role,
                 harness,
                 model,
-                mode: None,
-                effort: None,
+                mode: e.mode.clone(),
+                effort: e.effort.clone(),
                 placement: crate::seat_binder::SeatPlacement::Pane,
                 idle,
                 fresh_session: false,
@@ -1648,6 +1648,12 @@ impl Ports for LivePorts {
         {
             return self.seat_rebind(pin, fields, to.as_ref(), true);
         }
+        if let SeatEffect::Spawn { role, count } = effect {
+            return self.seat_spawn(role, *count);
+        }
+        if let SeatEffect::InjectRole { pin, role } = effect {
+            return self.seat_inject_role(pin, role);
+        }
         let pins: Vec<String> = match effect {
             SeatEffect::RetireIdle { pin } | SeatEffect::RetireAfterTurn { pin } => {
                 vec![pin.clone()]
@@ -1763,6 +1769,159 @@ impl LivePorts {
             fields.join(",")
         );
         Ok(())
+    }
+
+    /// Grow the fleet by `count` seats of `role` (ADR-0022 D7 `Spawn`), never
+    /// past `crew.max`. The launch reuses the one binding launcher
+    /// ([`crate::cmd::internal::respawn_binding`]), so there is no second
+    /// spawn implementation; the effect journal row (`seat:spawn:<role>:<n>`)
+    /// makes a retry idempotent.
+    fn seat_spawn(&mut self, role: &str, count: usize) -> Result<(), String> {
+        let backend = crate::backend::multiplexer_backend(&self.cfg)
+            .map_err(|e| format!("seat spawn {role}: plane: {e}"))?;
+        spawn_seats(&*backend, &self.cfg, &self.project, role, count)
+    }
+
+    /// Morph a live seat's role with ONE prompt turn (ADR-0022 D7
+    /// `InjectRole`). Review/verify roles are `context:fresh` by rule, so they
+    /// are refused here even if a caller bypasses the reconciler.
+    fn seat_inject_role(&mut self, pin: &str, role: &str) -> Result<(), String> {
+        let backend = crate::backend::multiplexer_backend(&self.cfg)
+            .map_err(|e| format!("seat inject {pin}: plane: {e}"))?;
+        inject_role_into(&*backend, &self.project, pin, role)
+    }
+}
+
+/// Grow the fleet by `count` seats of `role`, never past `crew.max`. Reuses
+/// the one binding launcher, so there is no second spawn implementation.
+pub(crate) fn spawn_seats(
+    backend: &dyn crate::backend::MultiplexerBackend,
+    cfg: &crate::config::Config,
+    project: &str,
+    role: &str,
+    count: usize,
+) -> Result<(), String> {
+    let registry = crate::state::load_spawn_registry(project);
+    let cap = cfg.crew_max() as usize;
+    if registry.len() + count > cap {
+        return Err(format!(
+            "seat spawn {role} x{count}: crew.max {cap} would be exceeded ({} live)",
+            registry.len()
+        ));
+    }
+    let catalog = crate::profile::ProfileCatalog::load()
+        .map_err(|e| format!("seat spawn {role}: profile catalog: {e:#}"))?;
+    let profile = catalog
+        .get(role)
+        .ok_or_else(|| format!("seat spawn: unknown profile {role} (flywheel profile list)"))?;
+    let routes = crate::models::ModelRegistry::load_routing()
+        .map_err(|e| format!("seat spawn {role}: model registry: {e:#}"))?;
+    let (harness, model) = if profile.model.is_empty() {
+        let h = if profile.harness.is_empty() {
+            cfg.resolve_kind(role)
+        } else {
+            profile.harness.clone()
+        };
+        (h, None)
+    } else {
+        let (h, m) = routes
+            .resolve_profile_route(&profile.harness, &profile.model)
+            .map_err(|e| format!("seat spawn {role}: route: {e:#}"))?;
+        (h, Some(m))
+    };
+    let effort = (!profile.effort.is_empty()).then(|| profile.effort.clone());
+    let mut entries = registry;
+    for _ in 0..count {
+        let ordinal = entries
+            .iter()
+            .filter_map(|e| crate::agent_ordinal(&e.name, project, role))
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let name = crate::agent_name_n(project, role, ordinal);
+        let mail = crate::pinned_mail_identity(cfg, project, &name, &harness);
+        let want = crate::seat_reconcile::DesiredSeat {
+            pin: Some(name.clone()),
+            role: role.to_string(),
+            harness: harness.clone(),
+            model: model.clone(),
+            effort: effort.clone(),
+            mode: None,
+            placement: crate::seat_binder::SeatPlacement::Pane,
+            context_warm_allowed: true,
+        };
+        let info = crate::cmd::internal::respawn_binding(
+            backend,
+            cfg,
+            project,
+            &name,
+            &harness,
+            true,
+            Some(&want),
+        )
+        .map_err(|e| format!("seat spawn {role} x{count}: {e:#}"))?;
+        let mut entry = crate::state::SpawnEntry::profiled(
+            info.pane_id.clone(),
+            name,
+            role,
+            harness.clone(),
+            mail,
+        );
+        entry.model = model.clone();
+        entry.model_pin = model.clone();
+        entry.effort = effort.clone();
+        entries.push(entry);
+    }
+    crate::state::save_spawn_registry(project, &entries)
+        .map_err(|e| format!("seat spawn {role}: registry: {e:#}"))?;
+    eprintln!("flywheel supervisor: spawned {count} seat(s) of {role}");
+    Ok(())
+}
+
+/// Morph a live seat's role with ONE prompt turn. Review/verify roles are
+/// `context:fresh` by rule, so they are refused here even if a caller
+/// bypasses the reconciler.
+pub(crate) fn inject_role_into(
+    backend: &dyn crate::backend::MultiplexerBackend,
+    project: &str,
+    pin: &str,
+    role: &str,
+) -> Result<(), String> {
+    if crate::seat_reconcile::role_is_fresh(role) {
+        return Err(format!(
+            "seat inject {pin} -> {role}: review/verify seats are context:fresh; respawn instead of injecting"
+        ));
+    }
+    let registry = crate::state::load_spawn_registry(project);
+    let entry = registry
+        .iter()
+        .find(|e| e.mail_identity.as_deref() == Some(pin) || e.name == pin)
+        .ok_or_else(|| format!("seat inject: no SpawnEntry for pin {pin}"))?;
+    if crate::seat_reconcile::role_is_fresh(entry.profile.as_deref().unwrap_or("")) {
+        return Err(format!(
+            "seat inject {pin} -> {role}: the live seat is a review/verify seat (context:fresh)"
+        ));
+    }
+    let text = role_morph_prompt(role);
+    backend
+        .prompt(&entry.pane_id, &text, None)
+        .map_err(|e| format!("seat inject {pin} -> {role}: {e:#}"))?;
+    eprintln!("flywheel supervisor: injected role {role} into {pin}");
+    Ok(())
+}
+
+/// The one-turn role-morph prompt: the profile's own preamble when the
+/// catalog has it, else a minimal role line.
+fn role_morph_prompt(role: &str) -> String {
+    let behavior = crate::profile::ProfileCatalog::load()
+        .ok()
+        .and_then(|c| c.get(role).map(|p| p.behavior.clone()))
+        .filter(|b| !b.is_empty());
+    match behavior {
+        Some(b) => format!("ROLE MORPH — you are now the {role} seat.\n\n{b}"),
+        None => {
+            format!("ROLE MORPH — you are now the {role} seat. Act only in that role from here.")
+        }
     }
 }
 

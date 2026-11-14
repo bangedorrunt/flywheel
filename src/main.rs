@@ -3002,7 +3002,7 @@ fn main() {
             "commands": [
                 "init spawn add list status decide rebind recover",
                 "spawn <project> [--kind K=N ...] [--dry-run --json] [--patch <seat>.<field>=<value> (repeatable; re-resolves the seat with from: user)] [--model harness-default leaves the harness's own model untouched] [--yes] (ADR-0022 plan spawn; see --help for the full flag list)",
-                "swarm plan <project> [spawn flags] | swarm apply <project> --patch <seat>.<field>=<value> [--json] | swarm status [<project>] [--json] (ADR-0022 rollout 6: plan prints the SAME flywheel-plan.v1 object as `spawn --dry-run --json`; apply is the D7 one mechanism — patch -> pure reconciler -> the one `Ports::seat` interpreter, journal-first; `binding-rebind --model` routes here; status lists live seats with the plane's status)",
+                "swarm plan <project> [spawn flags] | swarm apply <project> [--patch <seat>.<field>=<value>] [--count <role>=<n>] [--json] | swarm status [<project>] [--json] (ADR-0022 rollout 6 + D7 remainder: plan prints the SAME flywheel-plan.v1 object as `spawn --dry-run --json`; apply is the one mechanism — patch/count -> pure reconciler -> the one `Ports::seat` interpreter, journal-first; fields harness|model|effort|mode|role (role only on apply; spawn rejects it); `--count role=+1` grows the fleet within crew.max; Spawn/InjectRole run live (InjectRole never for review/verify seats); `binding-rebind --model` routes here; status lists live seats with the plane's status)",
             "send interrupt view output watch attach kill",
             "prefer <role.field>=<value> [--project <p>] | prefer --list [--json] | prefer --forget <role.field> [--project <p>] (ADR-0022 D6: standing preferences — project beats always, exact role beats *; set also records a chie lesson)",
             "crew preview|control|prompt (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker)",
@@ -11927,7 +11927,7 @@ fn cmd_binding_rebind(
         if let Some(h) = harness {
             patches.push(format!("{pin}.harness={h}"));
         }
-        return crate::cmd::swarm::cmd_swarm_apply(cfg, project, &patches, false);
+        return crate::cmd::swarm::cmd_swarm_apply(cfg, project, &patches, &[], false);
     }
     let intent = agent_ref::RebindIntent::prepare(
         agent,

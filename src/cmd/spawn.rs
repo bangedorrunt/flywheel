@@ -1062,6 +1062,8 @@ pub(crate) fn patch_role_overrides(
             }
             crate::swarm_plan::PatchField::Effort => e.effort = Some(p.value.clone()),
             crate::swarm_plan::PatchField::Mode => e.mode = Some(p.value.clone()),
+            // `spawn --patch` rejects `role` before it gets here.
+            crate::swarm_plan::PatchField::Role => {}
         }
     }
     map
@@ -1146,8 +1148,14 @@ fn parse_role_patches(specs: &[String]) -> Result<Vec<crate::swarm_plan::PlanPat
     specs
         .iter()
         .map(|spec| {
-            crate::swarm_plan::parse_patch(spec)
-                .map_err(|e| anyhow::anyhow!("bad --patch {spec:?}: {e}"))
+            let patch = crate::swarm_plan::parse_patch(spec)
+                .map_err(|e| anyhow::anyhow!("bad --patch {spec:?}: {e}"))?;
+            if matches!(patch.field, crate::swarm_plan::PatchField::Role) {
+                bail!(
+                    "spawn --patch {spec:?}: `role` is the seat's identity in a plan; patch harness|model|effort|mode (a live role change is `swarm apply --patch <seat>.role=…`)"
+                );
+            }
+            Ok(patch)
         })
         .collect()
 }
@@ -2071,6 +2079,13 @@ projects available: {}",
                 }
             };
             entry.model_pin = model_pin;
+            entry.effort = item
+                .profile
+                .as_deref()
+                .and_then(|pname| catalog.get(pname))
+                .map(|p| p.effort.clone())
+                .filter(|e| !e.is_empty());
+            entry.mode = None;
             entry.skills_digest = skills_digest;
             entry.harness_session = captain_directory::capture_harness_session(&kind);
             registry.push(entry);
@@ -2891,6 +2906,13 @@ pub(crate) fn cmd_spawn_rex(
                 }
             };
             entry.model_pin = model_pin;
+            entry.effort = item
+                .profile
+                .as_deref()
+                .and_then(|pname| catalog.get(pname))
+                .map(|p| p.effort.clone())
+                .filter(|e| !e.is_empty());
+            entry.mode = None;
             entry.skills_digest = item
                 .profile
                 .as_deref()
