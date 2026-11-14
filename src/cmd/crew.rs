@@ -645,7 +645,6 @@ fn cmd_crew_prompt(
 
     toron_mail_send(&dispatch)?;
     let wm = recipient_wm(project, pin);
-    let line = prompt_wake_line(wm, urgent);
     let delivered =
         deliver_prompt_wake(cfg, project, pin, urgent, wm).map_err(|e| format!("{e:#}"));
     let wake = finish_prompt(delivered)?;
