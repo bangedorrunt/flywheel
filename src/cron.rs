@@ -3122,4 +3122,35 @@ owner = "housekeeper"
         }
         let _ = std::fs::remove_file(&db);
     }
+
+    /// bd-ni0ek: the split that lets a `--dir` verb resolve like a cwd verb
+    /// must not drift. `detect_project` is exactly `detect_project_in(cwd)`.
+    #[test]
+    fn detect_project_in_mirrors_the_cwd_resolver() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let root = cwd.parent().expect("a parent dir").to_path_buf();
+        let cfg = crate::config::Config {
+            workspace_root: Some(root.display().to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            detect_project(&cfg, None),
+            detect_project_in(&cfg, &cwd, None),
+            "the cwd door and the --dir door are one rule"
+        );
+        assert_eq!(
+            detect_project_in(&cfg, &cwd, Some("explicit")),
+            Some("explicit".to_string()),
+            "an explicit slug wins on the --dir door too"
+        );
+        let outside = crate::config::Config {
+            workspace_root: Some("/nonexistent-root-for-bd-ni0ek".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            detect_project_in(&outside, &cwd, None),
+            None,
+            "a directory outside the workspace root has no derivable slug"
+        );
+    }
 }
