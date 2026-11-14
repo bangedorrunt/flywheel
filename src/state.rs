@@ -1074,6 +1074,28 @@ pub fn load_captain_alias(project: &str) -> Option<String> {
         .map(std::string::ToString::to_string)
 }
 
+/// The captain/operator pin for `project`, from the one authoritative source
+/// available to a sync caller: flywheel's alias file first, then toron's
+/// canonical `captain` alias in the shared store. `project_key` is the mail
+/// project key (the absolute project dir, as every mail write uses).
+///
+/// The supervisor and `swarm status` use this to keep the captain seat out of
+/// the reconcile (ADR-0022 D7): identified by ROLE, never by a name literal.
+pub fn captain_pin(project: &str, project_key: &str) -> Option<String> {
+    if let Some(pin) = load_captain_alias(project) {
+        return Some(pin);
+    }
+    let (_, db) = crate::mail::mailbox_roots();
+    let db = db.to_str()?.to_string();
+    let rt = crate::mail::runtime().ok()?;
+    rt.block_on(toron_core::mailbox::identity::captain_alias_in_db(
+        &db,
+        project_key,
+    ))
+    .ok()
+    .flatten()
+}
+
 /// Explicit-clear tombstone. A brand-new project has no alias and was never
 /// cleared; only `clear_captain_alias_file` writes this marker, so the two
 /// states stay distinguishable (ADR-0025 Spec 4 Wave 4a).

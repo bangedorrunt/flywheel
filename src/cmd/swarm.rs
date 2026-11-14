@@ -169,7 +169,11 @@ pub(crate) struct SeatRow {
 
 /// Registry rows joined to the plane's agent status. Pure: the caller supplies
 /// the agent facts. A row whose pane is not live reads `gone`.
-pub(crate) fn seat_rows(registry: &[SpawnEntry], agents: &[(String, String)]) -> Vec<SeatRow> {
+pub(crate) fn seat_rows(
+    registry: &[SpawnEntry],
+    agents: &[(String, String)],
+    captain: Option<&str>,
+) -> Vec<SeatRow> {
     registry
         .iter()
         .filter_map(|e| {
@@ -178,6 +182,10 @@ pub(crate) fn seat_rows(registry: &[SpawnEntry], agents: &[(String, String)]) ->
                 .clone()
                 .filter(|p| !p.is_empty())
                 .or_else(|| Some(e.name.clone()))?;
+            // The captain/operator seat is not a crew seat (role-resolved).
+            if captain == Some(pin.as_str()) {
+                return None;
+            }
             let status = agents
                 .iter()
                 .find(|(pane, _)| pane == &e.pane_id)
@@ -214,7 +222,11 @@ fn cmd_swarm_status(cfg: &Config, project: &str, json: bool) -> Result<()> {
         .into_iter()
         .map(|a| (a.pane_id, a.agent_status.as_str().to_string()))
         .collect();
-    let rows = seat_rows(&registry, &agents);
+    let captain = crate::state::captain_pin(
+        project,
+        &crate::project_dir_str(cfg, project).unwrap_or_else(|_| project.to_string()),
+    );
+    let rows = seat_rows(&registry, &agents, captain.as_deref());
     if json {
         print_json(&json!({
             "schema": "flywheel-seats.v1",
@@ -270,7 +282,11 @@ pub(crate) fn cmd_swarm_apply(
         .into_iter()
         .map(|a| (a.pane_id, a.agent_status.as_str().to_string()))
         .collect();
-    let rows = seat_rows(&registry, &agents);
+    let captain = crate::state::captain_pin(
+        project,
+        &crate::project_dir_str(cfg, project).unwrap_or_else(|_| project.to_string()),
+    );
+    let rows = seat_rows(&registry, &agents, captain.as_deref());
     if patches.is_empty() && counts.is_empty() {
         bail!("swarm apply: pass --patch <seat>.<field>=<value> and/or --count <role>=<n>");
     }
@@ -890,7 +906,7 @@ mod tests {
             ),
         ];
         let agents = vec![("pane-1".to_string(), "working".to_string())];
-        let rows = seat_rows(&registry, &agents);
+        let rows = seat_rows(&registry, &agents, None);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].pin, "Alpha");
         assert_eq!(rows[0].status, "working");
@@ -1088,7 +1104,7 @@ mod tests {
         entry.model = Some("m".into());
         entry.effort = Some("high".into());
         entry.mode = Some("workspace-write".into());
-        let rows = seat_rows(&[entry], &[]);
+        let rows = seat_rows(&[entry], &[], None);
         assert_eq!(rows[0].effort.as_deref(), Some("high"));
         let desired = patched_desired(&rows, &[], &[]).expect("no patches");
         let live: Vec<LiveSeat> = rows
@@ -1123,6 +1139,124 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].effort, None);
         assert_eq!(rows[0].mode, None);
+    }
+
+    /// ADR-0022 D7: the captain/operator seat is never a reconcile target,
+    /// so with `idle_retire_after` set no Seat command can close it.
+    #[test]
+    fn captain_seat_is_never_a_reconcile_target() {
+        let entry = crate::state::SpawnEntry::profiled(
+            "wA:p1",
+            "captain-1",
+            "captain",
+            "pi",
+            Some("Captain".into()),
+        );
+        let agents = vec![agent("captain-1", "wA:p1", "wA")];
+        let mut idle = std::collections::BTreeMap::new();
+        let (desired, live) = crate::supervisor_host::seat_observation(
+            &[entry.clone()],
+            &agents,
+            Some("Captain"),
+            &mut idle,
+            1_000,
+        );
+        assert!(
+            desired.is_empty(),
+            "captain is not a desired seat: {desired:?}"
+        );
+        assert!(live.is_empty(), "captain is not a live seat: {live:?}");
+        let policy = ReconcilePolicy {
+            idle_retire_after_ms: Some(0),
+            now_ms: 2_000,
+        };
+        let effects = reconcile(&desired, &live, &|_| false, &policy);
+        assert!(
+            effects.is_empty(),
+            "no Seat cmd for the captain: {effects:?}"
+        );
+        assert!(
+            seat_rows(
+                &[entry],
+                &[("wA:p1".into(), "idle".into())],
+                Some("Captain")
+            )
+            .is_empty(),
+            "swarm status never lists the captain as a crew seat"
+        );
+    }
+
+    /// A gone row is its own state: not a live seat, never a retire target.
+    #[test]
+    fn gone_row_is_not_a_live_seat() {
+        let entry = crate::state::SpawnEntry::profiled(
+            "wA:p9",
+            "gone-1",
+            "coder",
+            "pi",
+            Some("Gone".into()),
+        );
+        let mut idle = std::collections::BTreeMap::new();
+        let (desired, live) =
+            crate::supervisor_host::seat_observation(&[entry], &[], None, &mut idle, 1_000);
+        assert!(desired.is_empty(), "gone is not desired: {desired:?}");
+        assert!(live.is_empty(), "gone is not live: {live:?}");
+        let effects = reconcile(
+            &desired,
+            &live,
+            &|_| false,
+            &ReconcilePolicy {
+                idle_retire_after_ms: Some(0),
+                now_ms: 2_000,
+            },
+        );
+        assert!(effects.is_empty(), "gone never retires: {effects:?}");
+    }
+
+    /// The captain role resolver reads the alias (the role source), never a
+    /// name literal.
+    #[test]
+    fn captain_pin_reads_the_alias() {
+        let _g = lock_env();
+        let (cfg, _dir) = hermetic();
+        crate::state::save_captain_alias("demo", "Captain").expect("save alias");
+        let key = crate::project_dir_str(&cfg, "demo").expect("project key");
+        assert_eq!(
+            crate::state::captain_pin("demo", &key).as_deref(),
+            Some("Captain"),
+            "the captain pin comes from the alias file"
+        );
+    }
+
+    /// `add --oc` rows persist harness and model, so status/reconcile see them.
+    #[test]
+    fn add_oc_rows_carry_harness_and_model() {
+        let _g = lock_env();
+        let (cfg, _dir) = hermetic();
+        let reg = crate::models::ModelRegistry::load_routing().ok();
+        crate::cmd::spawn::record_added_seat(
+            &cfg,
+            "demo",
+            "demo-oc-1",
+            "wA:p1",
+            "opencode",
+            Some("BlueLake"),
+            reg.as_ref(),
+        );
+        // `record_spawn_entry` keys the absolute project dir; read it back the
+        // same way (the hermetic cfg root and the ambient `Config::load` root
+        // differ in tests).
+        let key = crate::project_dir_str(&cfg, "demo").expect("project key");
+        let rows = crate::state::load_spawn_registry(&key);
+        assert_eq!(rows.len(), 1, "one add row: {rows:?}");
+        assert_eq!(rows[0].harness.as_deref(), Some("opencode"));
+        assert!(
+            rows[0].model.is_some(),
+            "opencode model persisted: {rows:?}"
+        );
+        let view = seat_rows(&rows, &[("wA:p1".into(), "idle".into())], None);
+        assert_eq!(view[0].harness.as_str(), "opencode");
+        assert!(view[0].model.is_some(), "status shows the model");
     }
 
     /// Unused-import guard: `execute`/`RoundReport`/`SupCmd` are the 5d

@@ -169,6 +169,7 @@ pub(crate) fn cmd_add_rex(
         }
     }
     let mut prev = root;
+    let model_reg = crate::models::ModelRegistry::load_routing().ok();
     let mut spawned: Vec<Value> = Vec::new();
     for (short, n) in &plan {
         let kind = cfg.resolve_kind(short);
@@ -217,6 +218,15 @@ pub(crate) fn cmd_add_rex(
                 eprintln!("flywheel: warn: rex prime for {name} ({prev}) failed: {e:#}");
             }
             crate::bind_pane_mail_identity(cfg, project, &name, &prev, mail_identity.as_deref());
+            record_added_seat(
+                cfg,
+                project,
+                &name,
+                &prev,
+                &kind,
+                mail_identity.as_deref(),
+                model_reg.as_ref(),
+            );
             crate::bind_spawn_role(cfg, project, None, short, mail_identity.as_deref())?;
             println!("  {} {}", kind_paint(&kind), prev);
             spawned.push(json!({ "name": name, "kind": kind, "pane_id": prev }));
@@ -243,6 +253,34 @@ pub(crate) fn cmd_add_rex(
     );
     add_effect.settle(Some(&format!("workspace={ws_id} added={}", spawned.len())));
     Ok(())
+}
+
+/// Persist an `add` seat's harness and model (bd-8fiwv): the add path used to
+/// leave both empty, so `swarm status` showed `-` and the reconciler saw an
+/// empty harness. The model is the harness's fallback route (coupled default,
+/// then the implied slot), the same value a bare spawn would launch.
+pub(crate) fn record_added_seat(
+    cfg: &Config,
+    project: &str,
+    name: &str,
+    pane_id: &str,
+    kind: &str,
+    mail_identity: Option<&str>,
+    model_reg: Option<&crate::models::ModelRegistry>,
+) {
+    let mut entry = match mail_identity {
+        Some(mid) => state::SpawnEntry::with_mail_identity(pane_id, name, mid),
+        None => state::SpawnEntry::legacy(pane_id, name),
+    };
+    entry.harness = Some(kind.to_string());
+    entry.model = model_reg
+        .and_then(|r| bare_fallback_model(r, kind))
+        .and_then(|(choice, _)| match choice {
+            crate::models::ModelChoice::Model(m) if !m.is_empty() => Some(m),
+            _ => None,
+        });
+    entry.model_pin = entry.model.clone();
+    crate::record_spawn_entry(cfg, project, entry);
 }
 
 pub(crate) fn cmd_add(
@@ -360,6 +398,7 @@ pub(crate) fn cmd_add(
         }
     }
     let mut prev = root.pane_id.clone();
+    let model_reg = crate::models::ModelRegistry::load_routing().ok();
     let mut spawned: Vec<Value> = Vec::new();
     let integration_statuses = crate::read_integration_statuses();
     let mut preflighted_kinds: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -439,6 +478,15 @@ pub(crate) fn cmd_add(
                 &name,
                 &agent.pane_id,
                 mail_identity.as_deref(),
+            );
+            record_added_seat(
+                cfg,
+                project,
+                &name,
+                &agent.pane_id,
+                &kind,
+                mail_identity.as_deref(),
+                model_reg.as_ref(),
             );
             crate::bind_spawn_role(cfg, project, None, short, mail_identity.as_deref())?;
             println!("  {} {}", crate::output::kind_paint(&kind), agent.pane_id);
@@ -1308,7 +1356,7 @@ pub(crate) fn build_dry_run_plan(
 /// Bare-item model fallback in launch order (`bare_model_launch`): the
 /// coupled default first (what the launch actually pins), then the implied
 /// slot model, else none (`model: null` in the plan).
-fn bare_fallback_model(
+pub(crate) fn bare_fallback_model(
     registry: &models::ModelRegistry,
     harness: &str,
 ) -> Option<(crate::models::ModelChoice, crate::swarm_plan::Provenance)> {

@@ -1190,6 +1190,80 @@ impl EffectJournal for MemJournal {
     }
 }
 
+/// Build the reconcile round's desired/live seats from the registry rows.
+///
+/// `desired` is the persisted PLAN — the spawn registry as edited by
+/// `swarm apply` (the one write path) — not a second intent source; `live` is
+/// those same rows joined to the plane's current status. So this fold can
+/// only ever emit a retire/relaunch/respawn for a seat the plan still names.
+///
+/// ADR-0022 D7: the captain/operator seat is never a reconcile target — it is
+/// identified by ROLE (`captain`, resolved from the alias/store), never by a
+/// name literal. A row whose pane is GONE is its own state: it is neither a
+/// live seat nor a retire target (a stale row must never be closed as idle).
+/// `idle_since` is the host's per-pin idle clock; it is pruned for gone rows.
+pub(crate) fn seat_observation(
+    registry: &[crate::state::SpawnEntry],
+    agents: &[crate::hc::AgentInfo],
+    captain: Option<&str>,
+    idle_since: &mut BTreeMap<String, u64>,
+    now_ms: u64,
+) -> (
+    Vec<crate::seat_reconcile::DesiredSeat>,
+    Vec<crate::seat_binder::LiveSeat>,
+) {
+    let mut desired = Vec::new();
+    let mut live = Vec::new();
+    for e in registry {
+        let Some(pin) = e.mail_identity.clone().filter(|p| !p.is_empty()) else {
+            continue;
+        };
+        if captain == Some(pin.as_str()) {
+            idle_since.remove(&pin);
+            continue;
+        }
+        let Some(agent) = agents.iter().find(|a| a.pane_id == e.pane_id) else {
+            idle_since.remove(&pin);
+            continue;
+        };
+        let idle = matches!(
+            agent.agent_status,
+            toron_core::pane_types::AgentStatus::Idle | toron_core::pane_types::AgentStatus::Done
+        );
+        if idle {
+            idle_since.entry(pin.clone()).or_insert(now_ms);
+        } else {
+            idle_since.remove(&pin);
+        }
+        let role = e.profile.clone().unwrap_or_else(|| "crew".to_string());
+        let harness = e.harness.clone().unwrap_or_default();
+        let model = e.model.clone().or_else(|| e.model_pin.clone());
+        desired.push(crate::seat_reconcile::DesiredSeat {
+            pin: Some(pin.clone()),
+            role: role.as_str().into(),
+            harness: harness.as_str().into(),
+            model: model.clone(),
+            effort: e.effort.clone(),
+            mode: e.mode.clone(),
+            placement: crate::seat_binder::SeatPlacement::Pane,
+            context_warm_allowed: true,
+        });
+        live.push(crate::seat_binder::LiveSeat {
+            pin: pin.clone(),
+            role: role.as_str().into(),
+            harness: harness.as_str().into(),
+            model,
+            mode: e.mode.clone(),
+            effort: e.effort.clone(),
+            placement: crate::seat_binder::SeatPlacement::Pane,
+            idle,
+            fresh_session: false,
+            idle_since_ms: idle_since.get(&pin).copied(),
+        });
+    }
+    (desired, live)
+}
+
 /// hc + mail + the captain page, as the supervisor's effect boundary.
 pub struct LivePorts {
     cfg: crate::config::Config,
@@ -1209,6 +1283,9 @@ pub struct LivePorts {
     lead: Option<u64>,
     /// When each seat last went idle (ms), for the reconciler's idle retire.
     idle_since: BTreeMap<String, u64>,
+    /// The captain/operator pin, resolved once at construction (role, never a
+    /// name). The alias rarely changes; a restart picks up a rebind.
+    captain: Option<String>,
 }
 
 impl LivePorts {
@@ -1218,6 +1295,8 @@ impl LivePorts {
             .map(PathBuf::from)
             .or_else(|| std::env::current_exe().ok())
             .unwrap_or_else(|| PathBuf::from("flywheel"));
+        let key = crate::project_dir_str(cfg, project).unwrap_or_else(|_| project.to_string());
+        let captain = crate::state::captain_pin(project, &key);
         Self {
             cfg: cfg.clone(),
             project: project.into(),
@@ -1230,6 +1309,7 @@ impl LivePorts {
             context: None,
             lead: None,
             idle_since: BTreeMap::new(),
+            captain,
         }
     }
 
@@ -1288,6 +1368,13 @@ impl LivePorts {
         }
         let mut f = crate::private_fs::open_private_append(&path).map_err(|e| e.to_string())?;
         writeln!(f, "{v}").map_err(|e| e.to_string())
+    }
+
+    /// The captain/operator pin (role-resolved; never a name literal). The
+    /// seat interpreter and `swarm status` use it to keep the captain out of
+    /// the reconcile.
+    fn captain_pin(&self) -> Option<String> {
+        self.captain.clone()
     }
 
     fn pane_of(&self, pin: &str) -> Option<String> {
@@ -1436,53 +1523,14 @@ impl Ports for LivePorts {
             .and_then(|b| b.agent_list().ok())
             .unwrap_or_default();
         let registry = crate::state::load_spawn_registry(&self.project);
-        let mut desired = Vec::new();
-        let mut live = Vec::new();
-        for e in &registry {
-            let Some(pin) = e.mail_identity.clone().filter(|p| !p.is_empty()) else {
-                continue;
-            };
-            let idle = agents
-                .iter()
-                .find(|a| a.pane_id == e.pane_id)
-                .is_some_and(|a| {
-                    matches!(
-                        a.agent_status,
-                        toron_core::pane_types::AgentStatus::Idle
-                            | toron_core::pane_types::AgentStatus::Done
-                    )
-                });
-            if idle {
-                self.idle_since.entry(pin.clone()).or_insert(now_ms);
-            } else {
-                self.idle_since.remove(&pin);
-            }
-            let role = e.profile.clone().unwrap_or_else(|| "crew".to_string());
-            let harness = e.harness.clone().unwrap_or_default();
-            let model = e.model.clone().or_else(|| e.model_pin.clone());
-            desired.push(crate::seat_reconcile::DesiredSeat {
-                pin: Some(pin.clone()),
-                role: role.as_str().into(),
-                harness: harness.as_str().into(),
-                model: model.clone(),
-                effort: e.effort.clone(),
-                mode: e.mode.clone(),
-                placement: crate::seat_binder::SeatPlacement::Pane,
-                context_warm_allowed: true,
-            });
-            live.push(crate::seat_binder::LiveSeat {
-                pin: pin.clone(),
-                role: role.as_str().into(),
-                harness: harness.as_str().into(),
-                model,
-                mode: e.mode.clone(),
-                effort: e.effort.clone(),
-                placement: crate::seat_binder::SeatPlacement::Pane,
-                idle,
-                fresh_session: false,
-                idle_since_ms: self.idle_since.get(&pin).copied(),
-            });
-        }
+        let captain = self.captain_pin();
+        let (desired, live) = seat_observation(
+            &registry,
+            &agents,
+            captain.as_deref(),
+            &mut self.idle_since,
+            now_ms,
+        );
         out.push(SupMsg::Seats {
             desired,
             live,
