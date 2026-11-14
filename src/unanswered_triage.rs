@@ -269,7 +269,7 @@ pub fn triage_pack(objective: &str) -> QuestionPack {
     QuestionPack {
         id: "unanswered-triage".to_string(),
         version: 1,
-        model: "jev-latest".to_string(),
+        model: crate::judgment::JEV_MODEL_PIN.to_string(),
         questions,
     }
 }

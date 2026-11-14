@@ -1,9 +1,9 @@
 # Reclassify enrichment pack v2 (bd-lpn6): v1 + criteria defining each
 # option 1:1 (typesafe-ai shaping). v1 stays on disk for audit. v3 is the
-# live pack. Model is the jev-latest alias.
+# live pack. Model is judgment::JEV_MODEL_PIN.
 id: reclassify
 version: 2
-model: jev-latest
+model: jev-preview
 questions:
   - id: intent
     kind: choice

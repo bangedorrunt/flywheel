@@ -15,13 +15,10 @@ use std::path::{Path, PathBuf};
 
 use crate::authority::RuntimeAuthority;
 
-/// Model sent on every pack. The operator ordered the `jev-latest` alias
-/// (2026-09-26). A moving alias can change answers without a code change.
-/// Journal the response model id when the API returns one.
-/// Operator order 2026-09-26: send the alias. Live docs say `jev-latest`
-/// is the current stable release. Today that alias resolves to `jev-1.13.0`.
-/// The response `model` field is the version that answered.
-pub const JEV_MODEL_PIN: &str = "jev-latest";
+/// Model sent on every Jev pack. This is the one literal: the bundled default
+/// packs pin it, and `every_bundled_pack_pins_the_one_model` holds them to it,
+/// so changing the pin is this line plus a pack reseed.
+pub const JEV_MODEL_PIN: &str = "jev-preview";
 
 /// System One request endpoint.
 pub const SYSTEMONE_URL: &str = "https://api.typesafe.ai/v1/systemone";
@@ -190,10 +187,9 @@ pub struct QuestionPack {
 }
 
 impl QuestionPack {
-    /// Parse + validate: non-empty id, version >= 1, pinned model, at least
-    /// one question, every question with an id and instructions, Choice with
-    /// at least 2 options. The model must be non-empty. `jev-latest` is the
-    /// operator-ordered alias.
+    /// Parse + validate: non-empty id, version >= 1, non-empty model, at
+    /// least one question, every question with an id and instructions, Choice
+    /// with at least 2 options.
     pub fn parse_yaml(text: &str) -> Result<Self, String> {
         let pack: QuestionPack =
             serde_yaml::from_str(text).map_err(|e| format!("pack yaml: {e}"))?;
@@ -407,7 +403,7 @@ pub struct StateSlice {
 /// when the contract is the thing in question.
 ///
 /// Live request that produced it, for reproducibility:
-///   model `jev-latest`; state "A crew of three coding agents must refactor a Rust
+///   model `jev-preview`; state "A crew of three coding agents must refactor a Rust
 ///   workspace so the build passes."; one `score` question over four fit levels,
 ///   one `noul`, and one `choice` with a criteria MAP.
 ///
@@ -2799,7 +2795,7 @@ mod tests {
         let pack = QuestionPack {
             id: "jev-v1-real".into(),
             version: 1,
-            model: "jev-latest".into(),
+            model: "jev-preview".into(),
             questions: vec![
                 QuestionDef {
                     id: "fit_opencode".into(),
@@ -2985,7 +2981,7 @@ mod tests {
     const PACK_YAML: &str = r#"
 id: reclassify
 version: 1
-model: jev-latest
+model: jev-preview
 questions:
   - id: intent
     kind: choice
@@ -3086,17 +3082,17 @@ questions:
     }
 
     /// Every malformed pack the parser must refuse in one table. A blank
-    /// model is refused. `jev-latest` itself is the operator-ordered alias.
+    /// model is refused; any non-empty pin is accepted and sent as written.
     #[test]
     fn pack_rejects_malformed_yaml_rows() {
         let cases: [(&str, String); 3] = [
-            ("blank-model", PACK_YAML.replace("jev-latest", "   ")),
+            ("blank-model", PACK_YAML.replace("jev-preview", "   ")),
             (
                 "misaligned_criteria",
                 r#"
 id: x
 version: 1
-model: jev-latest
+model: jev-preview
 questions:
   - id: q
     kind: choice
@@ -3111,7 +3107,7 @@ questions:
                 r#"
 id: x
 version: 1
-model: jev-latest
+model: jev-preview
 questions:
   - id: q
     kind: choice
@@ -3508,7 +3504,7 @@ questions:
         let bad = r#"
 id: x
 version: 1
-model: jev-latest
+model: jev-preview
 questions:
   - id: q
     kind: score
@@ -3700,7 +3696,7 @@ questions:
     const SCREEN_YAML: &str = r#"
 id: doorbell-screen
 version: 1
-model: jev-latest
+model: jev-preview
 questions:
   - id: injection
     kind: noul
@@ -3867,7 +3863,7 @@ questions:
     #[test]
     fn annotate_folds_state_intent_plainly() {
         let pack = QuestionPack::parse_yaml(
-            "id: coalition-intent\nversion: 1\nmodel: jev-latest\nquestions:\n  - id: intent\n    kind: choice\n    instructions: \"?\"\n    options: [joint-ownership, review-handoff, no-coalition, unclear]\n    criteria: [\"a\", \"b\", \"c\", \"d\"]\n",
+            "id: coalition-intent\nversion: 1\nmodel: jev-preview\nquestions:\n  - id: intent\n    kind: choice\n    instructions: \"?\"\n    options: [joint-ownership, review-handoff, no-coalition, unclear]\n    criteria: [\"a\", \"b\", \"c\", \"d\"]\n",
         )
         .unwrap();
         let answers = Answers {
@@ -3904,7 +3900,7 @@ questions:
             r#"
 id: profile-pick
 version: 1
-model: jev-latest
+model: jev-preview
 questions:
   - id: profile_fit
     kind: score
@@ -3943,7 +3939,7 @@ questions:
             r#"
 id: tier-pick
 version: 1
-model: jev-latest
+model: jev-preview
 questions:
   - id: reasoning_depth
     kind: score
@@ -4025,7 +4021,7 @@ questions:
             r#"
 id: profile-pick
 version: 1
-model: jev-latest
+model: jev-preview
 questions:
   - id: profile_fit
     kind: score
@@ -4050,7 +4046,7 @@ questions:
             r#"
 id: profile-pick
 version: 1
-model: jev-latest
+model: jev-preview
 questions:
   - id: profile_fit__coder
     kind: score
@@ -4150,7 +4146,7 @@ questions:
             r#"
 id: profile-pick
 version: 1
-model: jev-latest
+model: jev-preview
 questions:
   - id: profile_fit
     kind: score
@@ -4166,7 +4162,7 @@ questions:
             r#"
 id: tier-pick
 version: 1
-model: jev-latest
+model: jev-preview
 questions:
   - id: reasoning_depth
     kind: score
@@ -4900,6 +4896,17 @@ fn write_pack_file(dst: &Path, body: &str) -> anyhow::Result<()> {
 mod bd_pack_sync {
     use super::*;
 
+    /// bd-5bno9: one pin. Every bundled default pack names exactly
+    /// [`JEV_MODEL_PIN`], so moving the pin is one literal plus a reseed.
+    #[test]
+    fn every_bundled_pack_pins_the_one_model() {
+        assert!(!default_judgment_packs().is_empty(), "no bundled packs");
+        for (name, body) in default_judgment_packs() {
+            let pack = QuestionPack::parse_yaml(body).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(pack.model, JEV_MODEL_PIN, "{name} must name JEV_MODEL_PIN");
+        }
+    }
+
     #[test]
     fn default_pack_seed_fills_gaps_and_keeps_a_diverged_file() {
         let dir = root("defaults").join("judgment-packs");
@@ -4907,7 +4914,7 @@ mod bd_pack_sync {
         let diverged = dir.join("reclassify.v3.yaml");
         std::fs::write(
             &diverged,
-            "id: reclassify\nversion: 3\nmodel: jev-latest\n# LOCAL\n",
+            "id: reclassify\nversion: 3\nmodel: jev-preview\n# LOCAL\n",
         )
         .unwrap();
         let rep = seed_default_packs_with(&dir, PackOverwrite::None, false).unwrap();
@@ -4931,7 +4938,7 @@ mod bd_pack_sync {
         let path = dir.join("reclassify.v3.yaml");
         std::fs::write(
             &path,
-            "id: reclassify\nversion: 3\nmodel: jev-latest\n# LOCAL\n",
+            "id: reclassify\nversion: 3\nmodel: jev-preview\n# LOCAL\n",
         )
         .unwrap();
         let plan = seed_default_packs_with(&dir, PackOverwrite::Stale, true).unwrap();

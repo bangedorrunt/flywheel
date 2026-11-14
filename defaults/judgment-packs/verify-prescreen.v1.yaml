@@ -2,7 +2,7 @@
 # candidates stay uncommitted, `workflow run --execute` remains authoritative.
 id: verify-prescreen
 version: 1
-model: jev-latest
+model: jev-preview
 questions:
   - id: safe_shape
     kind: choice

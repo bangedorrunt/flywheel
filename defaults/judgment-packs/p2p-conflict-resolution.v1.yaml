@@ -2,7 +2,7 @@
 # evaluates competing file reservation requests and recommends partition or sequencing.
 id: p2p-conflict-resolution
 version: 1
-model: jev-latest
+model: jev-preview
 questions:
   - id: arbitration
     kind: choice

@@ -1,7 +1,7 @@
 # Reclassify enrichment pack (ADR-0014, I5). Pure data: versioned, pinned model.
 id: reclassify
 version: 1
-model: jev-latest
+model: jev-preview
 questions:
   - id: intent
     kind: choice

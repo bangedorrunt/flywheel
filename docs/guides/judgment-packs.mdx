@@ -25,10 +25,13 @@ or verification authority.
 
 ## Validation
 
-`QuestionPack::parse_yaml` enforces: non-empty id, version ≥ 1, pinned model
-(never `jev-latest`), every question with id + instructions, Choice/Score
-with ≥ 2 options, criteria aligned 1:1 when present. Model pin is
-`jev-1.13.0` until pack re-validation CI exists.
+`QuestionPack::parse_yaml` enforces: non-empty id, version ≥ 1, a non-empty
+model, every question with id + instructions, Choice/Score with ≥ 2 options,
+criteria aligned 1:1 when present.
+
+The model is one literal, `judgment::JEV_MODEL_PIN` (`jev-preview`). Every
+bundled default pack names it and a test holds them to it, so a pin change is
+that line plus `flywheel judgment pack seed --overwrite all --yes`.
 
 ## Available packs
 

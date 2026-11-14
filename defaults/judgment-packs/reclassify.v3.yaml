@@ -2,7 +2,7 @@
 # owns the workflow and the topology. This answer is advisory only.
 id: reclassify
 version: 3
-model: jev-latest
+model: jev-preview
 questions:
   - id: intent
     kind: choice

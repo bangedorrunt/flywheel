@@ -2,7 +2,7 @@
 # shape a goal wants, for the captain to confirm. Never forms anything.
 id: coalition-intent
 version: 1
-model: jev-latest
+model: jev-preview
 questions:
   - id: intent
     kind: choice

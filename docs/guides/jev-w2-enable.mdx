@@ -29,9 +29,10 @@ paged on 429 streaks.
 
 ## Pack re-validation CI
 
-Model pin is `jev-1.13.0` — never `jev-latest`. On any pin bump or pack edit:
+Model pin is `judgment::JEV_MODEL_PIN` (`jev-preview`) — one literal, with
+every bundled pack held to it by test. On any pin bump or pack edit:
 
-1. `QuestionPack::parse_yaml` rejects `jev-latest`, empty ids, Choice with
+1. `QuestionPack::parse_yaml` rejects an empty model, empty ids, Choice with
    fewer than 2 options, Score with fewer than 2 levels.
 2. Re-run `test --bin flywheel judgment` (pack + confidence + merge suite).
 3. Re-validate thresholds against fresh traffic before keeping them

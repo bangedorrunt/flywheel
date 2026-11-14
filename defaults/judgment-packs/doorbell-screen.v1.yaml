@@ -3,7 +3,7 @@
 # table/Tick/beads authority untouched. Detections annotate, never block.
 id: doorbell-screen
 version: 1
-model: jev-latest
+model: jev-preview
 questions:
   - id: injection
     kind: noul

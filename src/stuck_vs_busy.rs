@@ -240,7 +240,7 @@ pub fn pack(objective: &str) -> QuestionPack {
     QuestionPack {
         id: "stuck-vs-busy".to_string(),
         version: 1,
-        model: "jev-latest".to_string(),
+        model: crate::judgment::JEV_MODEL_PIN.to_string(),
         questions,
     }
 }

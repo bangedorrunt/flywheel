@@ -3,7 +3,7 @@
 # code suggests a tier, the user decides. Never dispatches anyone.
 id: tier-pick
 version: 1
-model: jev-latest
+model: jev-preview
 questions:
   - id: reasoning_depth
     kind: score

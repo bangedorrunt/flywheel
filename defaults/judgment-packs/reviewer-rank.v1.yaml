@@ -2,7 +2,7 @@
 # over `state.candidates`; code ranks by score. Never assigns anyone.
 id: reviewer-rank
 version: 1
-model: jev-latest
+model: jev-preview
 questions:
   - id: reviewer_fit
     kind: score

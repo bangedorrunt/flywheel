@@ -3,7 +3,7 @@
 # Never assigns anyone.
 id: profile-pick
 version: 1
-model: jev-latest
+model: jev-preview
 questions:
   - id: profile_fit
     kind: score

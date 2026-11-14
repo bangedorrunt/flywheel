@@ -179,7 +179,7 @@ pub fn fit_pack(objective: &str, candidates: &[HarnessOption]) -> QuestionPack {
     QuestionPack {
         id: "crew-menu-fit".into(),
         version: 1,
-        model: "jev-latest".into(),
+        model: crate::judgment::JEV_MODEL_PIN.into(),
         questions,
     }
 }

@@ -2,7 +2,7 @@
 # (code) holds beads; this Noul is a second opinion for the captain.
 id: wave-readiness
 version: 1
-model: jev-latest
+model: jev-preview
 questions:
   - id: ready_to_release
     kind: noul
