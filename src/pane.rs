@@ -1545,6 +1545,81 @@ pub fn harness_override_conflicts(profile_harness: &str, spec_harness: Option<&s
     }
 }
 
+/// ADR-0022 D8 acceptance 6: a review/verify dispatch binds through the seat
+/// binder, never to the authoring seat, and prefers a registered model of a
+/// different family. Returns `None` for steps that are not a fresh reviewer
+/// dispatch (the ordinary role-slot path owns those).
+pub(crate) fn review_bind(
+    profile_name: &str,
+    spec: &toron_workflow::schema::DispatchSpec,
+    entries: &LiveRegistry,
+    crew_max: usize,
+) -> Option<crate::seat_binder::Binding> {
+    if profile_name != "reviewer"
+        || spec.context != Some(toron_workflow::schema::ContextMode::Fresh)
+    {
+        return None;
+    }
+    use crate::seat_binder::{BindPolicy, LiveSeat, SeatPlacement, StepNeed};
+    let seats: Vec<LiveSeat> = entries
+        .entries()
+        .iter()
+        .filter_map(|e| {
+            let pin = e.mail_identity.clone().filter(|p| !p.is_empty())?;
+            Some(LiveSeat {
+                pin,
+                role: e.profile.clone().unwrap_or_else(|| "crew".into()),
+                harness: e.harness.clone().unwrap_or_default(),
+                model: e.model.clone().or_else(|| e.model_pin.clone()),
+                mode: None,
+                effort: None,
+                placement: SeatPlacement::Pane,
+                idle: true,
+                fresh_session: true,
+                idle_since_ms: None,
+            })
+        })
+        .collect();
+    let author = entries
+        .entries()
+        .iter()
+        .find(|e| e.profile.as_deref() == Some("planner"));
+    let explicit_author = spec
+        .extra
+        .get("author_pin")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let author_pin = explicit_author.or_else(|| author.and_then(|e| e.mail_identity.clone()));
+    let author_model = author.and_then(|e| e.model.clone().or_else(|| e.model_pin.clone()));
+    let candidates: Vec<String> = seats
+        .iter()
+        .filter(|s| s.role == profile_name)
+        .filter_map(|s| s.model.clone())
+        .collect();
+    let registry = crate::models::ModelRegistry::default();
+    let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+    let model = author_model
+        .as_deref()
+        .and_then(|m| registry.verifier_for(m, &refs, None));
+    let need = StepNeed {
+        step: profile_name.to_string(),
+        role: profile_name.to_string(),
+        harness: spec.harness.clone(),
+        model,
+        mode: None,
+        context: crate::stages::StageContext::Fresh,
+        reviews_author: author_pin,
+    };
+    Some(crate::seat_binder::bind(
+        &need,
+        &seats,
+        &BindPolicy {
+            crew_max,
+            headless_allowed: false,
+        },
+    ))
+}
+
 /// The pane ActionRunner dispatch (ADR-0010 Spec A pane row, P10.3): a
 /// `dispatch_job` step resolves its `@profile` to a running crew pane, gets
 /// the profile behavior preamble prepended (Spec C — same conditioning as
@@ -1582,6 +1657,33 @@ pub fn pane_dispatch(
             "pane dispatch: dispatch_job @{profile_name} requests context=fresh — new session (honored: fresh maps to new spawn pane)"
         );
     }
+    // ADR-0022 D8 acceptance 6: a fresh reviewer dispatch binds through the
+    // seat binder (non-author, different family when registered). A Wait is
+    // bounded by the step's no_claim_timeout; a Spawn goes through the seat
+    // interpreter, never a second dispatch path.
+    let crew_max = crate::config::Config::load()
+        .map(|c| c.crew_max() as usize)
+        .unwrap_or(crate::crew::DEFAULT_CREW_MAX as usize);
+    let bound = review_bind(profile_name, spec, entries, crew_max);
+    let bound_entry: Option<SpawnEntry> = match &bound {
+        Some(crate::seat_binder::Binding::Reuse { pin })
+        | Some(crate::seat_binder::Binding::FreshSession { pin })
+        | Some(crate::seat_binder::Binding::Other { pin })
+        | Some(crate::seat_binder::Binding::Patch { pin, .. }) => entries
+            .entries()
+            .iter()
+            .find(|e| e.mail_identity.as_deref() == Some(pin.as_str()))
+            .cloned(),
+        Some(crate::seat_binder::Binding::Wait { reason }) => bail!(
+            "pane dispatch: @{profile_name} waits for a seat ({reason}); the step is bounded by \
+             its no_claim_timeout and never borrows another role"
+        ),
+        Some(crate::seat_binder::Binding::Spawn) => bail!(
+            "pane dispatch: @{profile_name} needs a new seat — Spawn goes through the seat \
+             interpreter (Ports::seat), not a second dispatch path"
+        ),
+        Some(crate::seat_binder::Binding::Headless) | None => None,
+    };
     let mut override_entry: Option<&SpawnEntry> = None;
     if let Some(override_h) = headless::dispatch_spec_harness(spec)
         && harness_override_conflicts(&profile.harness, Some(override_h))
@@ -1633,6 +1735,7 @@ pub fn pane_dispatch(
     }
     let prompt = base;
     let entry: SpawnEntry = match override_entry
+        .or(bound_entry.as_ref())
         .or(resolve_role_slot(entries, profile_name, copy_index)?)
         .cloned()
     {
@@ -1863,6 +1966,11 @@ pub fn pane_dispatch(
             }
             Err(DispatchErr::Fatal(msg)) => return Err(anyhow!(msg)),
         };
+        if let Some(binding) = &bound
+            && let Ok(v) = serde_json::to_value(binding)
+        {
+            out["binding"] = v;
+        }
         if out.get("kind").and_then(Value::as_str) == Some(rate_limit_kind.as_str()) {
             let err_str = out
                 .get("error")
@@ -4409,6 +4517,95 @@ mod tests {
         use std::collections::HashSet;
         let live: HashSet<String> = entries.iter().map(|e| e.pane_id.clone()).collect();
         LiveRegistry::prune(entries, &live)
+    }
+
+    fn crew_row(pane: &str, name: &str, profile: &str, pin: &str, model: &str) -> SpawnEntry {
+        let mut e = SpawnEntry::with_mail_identity(pane, name, pin);
+        e.profile = Some(profile.into());
+        e.harness = Some("rex".into());
+        e.model = Some(model.into());
+        e
+    }
+
+    /// ADR-0022 D8 acceptance 6 on the real beads-lifecycle audit step: the
+    /// fresh reviewer dispatch binds a non-author seat of a different model
+    /// family, and a replay binds identically.
+    #[test]
+    fn beads_lifecycle_audit_binds_a_non_author_different_family() {
+        use crate::seat_binder::Binding;
+        use toron_workflow::schema::Action;
+        let wf = crate::builtin_workflows::builtin_workflows()
+            .get("beads-lifecycle")
+            .cloned()
+            .expect("beads-lifecycle cataloged");
+        let audit = wf
+            .graph
+            .as_ref()
+            .and_then(|g| g.nodes.get("audit"))
+            .expect("audit node");
+        let Action::DispatchJob { spec, .. } = &audit.action else {
+            panic!("audit is a dispatch_job");
+        };
+        // Same-family reviewer sorts first; the binder must prefer the
+        // registered different-family reviewer.
+        let entries = as_live(vec![
+            crew_row("w1:p1", "planner", "planner", "PlanPin", "anthropic/claude"),
+            crew_row(
+                "w1:p2",
+                "reviewer-same",
+                "reviewer",
+                "AaSame",
+                "anthropic/claude",
+            ),
+            crew_row("w1:p3", "reviewer-diff", "reviewer", "ZzDiff", "openai/gpt"),
+        ]);
+        let first = review_bind("reviewer", spec, &entries, 5).expect("review binding");
+        assert!(
+            matches!(
+                &first,
+                Binding::Other { pin } | Binding::FreshSession { pin } if pin == "ZzDiff"
+            ),
+            "audit binds a non-author seat of a different family: {first:?}"
+        );
+        assert_eq!(
+            review_bind("reviewer", spec, &entries, 5),
+            Some(first),
+            "a replay binds identically"
+        );
+    }
+
+    /// The author is excluded even when it is a same-role candidate: a
+    /// reviewer that authored the beads is never bound to review them.
+    #[test]
+    fn review_never_binds_the_authoring_seat() {
+        use crate::seat_binder::Binding;
+        let spec = toron_workflow::schema::parse_workflow(
+            "name: t\ntrigger:\n  type: webhook\nsteps:\n  - name: audit\n    action: dispatch_job\n    assignee: x\n    spec: { profile: \"@reviewer\", context: fresh, author_pin: \"AuthorPin\" }\n",
+        )
+        .expect("parse")
+        .steps
+        .first()
+        .and_then(|s| match &s.action {
+            toron_workflow::schema::Action::DispatchJob { spec, .. } => Some(spec.clone()),
+            _ => None,
+        })
+        .expect("dispatch spec");
+        // Author sorts first; the binder must still pick the other reviewer.
+        let entries = as_live(vec![
+            crew_row(
+                "w1:p1",
+                "author",
+                "reviewer",
+                "AuthorPin",
+                "anthropic/claude",
+            ),
+            crew_row("w1:p2", "other", "reviewer", "OtherPin", "openai/gpt"),
+        ]);
+        let b = review_bind("reviewer", &spec, &entries, 5).expect("binding");
+        assert!(
+            matches!(&b, Binding::Other { pin } | Binding::FreshSession { pin } if pin == "OtherPin"),
+            "the authoring reviewer is never bound: {b:?}"
+        );
     }
 
     /// bd-rkx8 (red first): among same-profile rows the highest
