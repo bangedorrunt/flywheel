@@ -261,7 +261,10 @@ fn idle_sample(
         .filter_map(|e| e.mail_identity.clone().or_else(|| Some(e.name.clone())))
         .filter(|pin| !pin.is_empty())
         .collect();
-    let deferrals = crate::doorbell::pending_deferred_wakes(&crate::config::state_dir(), project);
+    let deferrals = crate::doorbell::unrung_deferrals(
+        &crate::config::state_dir(),
+        crate::doorbell::project_workspaces(&crate::config::state_dir(), project),
+    );
     let mut sample = Vec::with_capacity(registry.len());
     for entry in registry {
         let pin = entry

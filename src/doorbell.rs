@@ -1043,23 +1043,57 @@ pub fn append_deferred_wake(
     })?
 }
 
-/// Pending deferrals for a project, without taking them: which pins are holding
-/// a wake that never rang. Read-only, so a watch may look at the same file the
-/// dispatcher owns.
-pub fn pending_deferred_wakes(state_dir: &Path, project: &str) -> Vec<(String, String)> {
-    let path = deferred_wakes_path(state_dir, project);
-    let Ok(raw) = fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    raw.lines()
-        .filter_map(|row| serde_json::from_str::<serde_json::Value>(row.trim()).ok())
-        .filter_map(|v| {
-            Some((
-                v.get("pin")?.as_str()?.to_string(),
-                v.get("line")?.as_str()?.to_string(),
-            ))
-        })
-        .collect()
+/// Journaled handoff rows that never rang: the dispatcher took (and journaled)
+/// a wake, but no later row drained or prompted that pin. The per-pin queue is
+/// memory-only, so a restart between the take and the idle status loses it
+/// unless boot re-derives it here. One query for the host's boot refold and
+/// the captain watch (bd-pbng7).
+pub fn unrung_deferrals(
+    state_dir: &Path,
+    workspaces: impl IntoIterator<Item = String>,
+) -> Vec<(String, String)> {
+    let wanted: std::collections::BTreeSet<String> = workspaces.into_iter().collect();
+    let mut pending: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for (ws, row) in journal_read_all(state_dir) {
+        if !wanted.contains(&ws) {
+            continue;
+        }
+        let handoff = row
+            .get("executed")
+            .and_then(|e| e.get("stage"))
+            .and_then(|s| s.as_str())
+            == Some("handoff");
+        if handoff
+            && let Some(m) = row.get("msg").and_then(|m| m.get("PromptRefused"))
+            && let (Some(pin), Some(line)) = (
+                m.get("pin").and_then(|p| p.as_str()),
+                m.get("line").and_then(|l| l.as_str()),
+            )
+        {
+            pending.insert(pin.to_string(), line.to_string());
+        }
+        for action in row
+            .get("actions")
+            .and_then(|a| a.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if let Some(audit) = action.get("Audit")
+                && audit.get("kind").and_then(|k| k.as_str()) == Some("drained")
+                && let Some(pin) = audit.get("pin").and_then(|p| p.as_str())
+            {
+                pending.remove(pin);
+            }
+            if let Some(pin) = action
+                .get("Prompt")
+                .and_then(|p| p.get("pin"))
+                .and_then(|p| p.as_str())
+            {
+                pending.remove(pin);
+            }
+        }
+    }
+    pending.into_iter().collect()
 }
 
 /// Take the wakes this host hosts, leaving the rest for the dispatcher that
@@ -2636,6 +2670,63 @@ mod tests {
     /// session, a foreign pin's wake must survive for the host that can ring
     /// it. The journal row is written before the file is rewritten, so a
     /// crash re-drains instead of dropping.
+    /// A restart empties the per-pin queue, so boot asks the journal: a
+    /// handoff row with no later drained/Prompt row for that pin is still
+    /// owed a ring; one that drained is never re-rung. Foreign workspaces are
+    /// not this host's business.
+    #[test]
+    fn unrung_deferrals_reads_the_journal_not_the_memory() {
+        let dir = std::env::temp_dir().join(format!("fw-unrung-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let line = deferred_wake_line();
+        let refused = |pin: &str| crate::workspace::Msg::PromptRefused {
+            pin: pin.to_string(),
+            line: line.clone(),
+        };
+        journal_append_workspace(
+            &dir,
+            "session:a",
+            &refused("BlueRidge"),
+            &[],
+            serde_json::json!({ "stage": "handoff", "pin": "BlueRidge" }),
+            Some(&["BlueRidge".to_string()]),
+        );
+        journal_append_workspace(
+            &dir,
+            "session:b",
+            &refused("LilacChapel"),
+            &[],
+            serde_json::json!({ "stage": "handoff", "pin": "LilacChapel" }),
+            Some(&["LilacChapel".to_string()]),
+        );
+        assert_eq!(
+            unrung_deferrals(&dir, ["session:a".to_string()]),
+            vec![("BlueRidge".to_string(), line.clone())],
+            "the journaled wake is still owed a ring, and only this workspace's"
+        );
+        let drained = crate::workspace::Cmd::Audit {
+            kind: "drained".into(),
+            pin: "BlueRidge".into(),
+            detail: "1 deferred wake(s) at prompt".into(),
+        };
+        journal_append_workspace(
+            &dir,
+            "session:a",
+            &crate::workspace::Msg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+            &[drained],
+            serde_json::json!({ "stage": "drain" }),
+            Some(&["BlueRidge".to_string()]),
+        );
+        assert!(
+            unrung_deferrals(&dir, ["session:a".to_string()]).is_empty(),
+            "a drained wake is never re-rung"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_deferred_wake_goes_to_the_host_that_owns_the_pin() {
         let dir = std::env::temp_dir().join(format!("fw-defer-{}", std::process::id()));

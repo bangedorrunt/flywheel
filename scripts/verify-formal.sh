@@ -126,6 +126,7 @@ expect_violation() { # model cfg invariant
 echo "verify-formal: positive models"
 expect_pass JobLease JobLease
 expect_pass Respawn Respawn
+expect_pass DeferredHandoff DeferredHandoff
 
 echo "verify-formal: negative fixtures (must fail)"
 expect_violation JobLease JobLease.broken-steal NoSteal
@@ -133,6 +134,7 @@ expect_violation JobLease JobLease.broken-stale-settle NoStaleSettle
 expect_violation JobLease JobLease.broken-revive-terminal TerminalStable
 expect_violation Respawn Respawn.broken-claim-before-free OneLiveHolder
 expect_violation Respawn Respawn.broken-drop-reservations ReservationsKept
+expect_violation DeferredHandoff DeferredHandoff.broken-memory-only NoLostWake
 
 echo "verify-formal: ${passed} passed, ${failed} failed"
 [ "$failed" -eq 0 ] || die "protocol models did not match their expectations"

@@ -57,6 +57,10 @@ pub struct RtHost {
     /// Pins already audited as holding a deferral with no observable pane
     /// (bd-346jl: a stuck wake must be visible, once per pin).
     deferred_audited: std::collections::BTreeSet<String>,
+    /// bd-pbng7: the boot refold of journaled-but-unrung handoff rows runs
+    /// once, on the first sweep, after the seed has told us which pins this
+    /// host owns.
+    boot_refolded: bool,
     conflict_checked_at: u64,
     pending_conflict_prompts: Vec<(String, String)>,
     /// Shared with the delivery path. bd-kz54 follow-up: `WatchRetry::reset()`
@@ -246,6 +250,7 @@ impl RtHost {
             presence_armed: false,
             conflict_seen: std::collections::BTreeSet::new(),
             deferred_audited: std::collections::BTreeSet::new(),
+            boot_refolded: false,
             conflict_checked_at: 0,
             pending_conflict_prompts: Vec::new(),
             retry: std::sync::Arc::new(std::sync::Mutex::new(doorbell_rt::WatchRetry::default())),
@@ -886,6 +891,31 @@ impl Host for RtHost {
             let hosted: std::collections::BTreeSet<String> =
                 self.model.presence.keys().cloned().collect();
             let state_dir = crate::config::state_dir();
+            if !self.boot_refolded {
+                self.boot_refolded = true;
+                for (pin, line) in crate::doorbell::unrung_deferrals(
+                    &state_dir,
+                    std::iter::once(self.workspace.clone()),
+                ) {
+                    let (next, cmds) = workspace::tick(
+                        &self.model,
+                        &workspace::Msg::PromptRefused {
+                            pin: pin.clone(),
+                            line: line.clone(),
+                        },
+                    );
+                    self.model = next;
+                    if let Err(e) = crate::doorbell::journal_deferred_wake(
+                        &state_dir,
+                        &self.workspace,
+                        &pin,
+                        &line,
+                        &cmds,
+                    ) {
+                        eprintln!("flywheel: boot refold journal failed: {e}");
+                    }
+                }
+            }
             let mut journaled = true;
             for (pin, line) in
                 crate::doorbell::take_deferred_wakes(&state_dir, &self.project, &hosted)
@@ -2291,6 +2321,79 @@ mod off_runtime_tests {
             ring.iter()
                 .any(|e| matches!(e, Effect::Prompt { pin, .. } if pin == "BlueRidge")),
             "and rings it on the prompt transition: {ring:?}"
+        );
+    }
+
+    /// A dispatcher restart empties the per-pin queue. Boot must re-derive it
+    /// from the journal, or a wake taken before the restart never rings.
+    #[test]
+    fn a_restart_refolds_a_journaled_unrung_handoff() {
+        let _home = crate::config::test_state_home();
+        let project = format!("refold-{}", std::process::id());
+        let workspace = "session:refold";
+        crate::doorbell::journal_deferred_wake(
+            &crate::config::state_dir(),
+            workspace,
+            "BlueRidge",
+            &crate::doorbell::deferred_wake_line(),
+            &[],
+        )
+        .expect("journal the handoff");
+        let (tx, _rx) = mpsc::channel(8);
+        let mut host = RtHost::new(Config::default(), &project, workspace, tx).expect("host");
+        host.tick(&BrainMsg::PlaneStatus {
+            pin: "BlueRidge".into(),
+            status: "idle".into(),
+        });
+
+        host.tick(&BrainMsg::Sweep { now: 1 });
+        let effects = host.tick(&BrainMsg::PlaneStatus {
+            pin: "BlueRidge".into(),
+            status: "idle".into(),
+        });
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Prompt { pin, .. } if pin == "BlueRidge")),
+            "the refolded wake rings at the first idle: {effects:?}"
+        );
+
+        // The brain journals the ring; a host tick alone cannot.
+        crate::doorbell::journal_append_workspace(
+            &crate::config::state_dir(),
+            workspace,
+            &workspace::Msg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+            &[
+                workspace::Cmd::Audit {
+                    kind: "drained".into(),
+                    pin: "BlueRidge".into(),
+                    detail: "1 deferred wake(s) at prompt".into(),
+                },
+                workspace::Cmd::Prompt {
+                    pin: "BlueRidge".into(),
+                    line: crate::doorbell::deferred_wake_line(),
+                },
+            ],
+            serde_json::json!({ "stage": "drain" }),
+            Some(&["BlueRidge".to_string()]),
+        );
+        let (tx2, _rx2) = mpsc::channel(8);
+        let mut after = RtHost::new(Config::default(), &project, workspace, tx2).expect("host");
+        after.tick(&BrainMsg::PlaneStatus {
+            pin: "BlueRidge".into(),
+            status: "idle".into(),
+        });
+        after.tick(&BrainMsg::Sweep { now: 1 });
+        let effects = after.tick(&BrainMsg::PlaneStatus {
+            pin: "BlueRidge".into(),
+            status: "idle".into(),
+        });
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Prompt { .. })),
+            "a drained wake is never re-rung: {effects:?}"
         );
     }
 
