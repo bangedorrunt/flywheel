@@ -506,6 +506,84 @@ pub fn reconcile_json(input: &str, now_ms: u64) -> anyhow::Result<String> {
 }
 
 #[cfg(test)]
+mod live_e2e_tests {
+    use super::*;
+
+    fn want() -> DesiredSeat {
+        DesiredSeat {
+            pin: Some("P".into()),
+            role: crate::kernel::SeatRole::parse("coder").expect("role"),
+            harness: crate::kernel::SeatHarness::parse("opencode").expect("harness"),
+            model: Some("a/m".into()),
+            effort: None,
+            mode: None,
+            placement: SeatPlacement::Pane,
+            context_warm_allowed: true,
+        }
+    }
+
+    fn live(harness: &str, model: &str) -> LiveSeat {
+        LiveSeat {
+            pin: "P".into(),
+            role: crate::kernel::SeatRole::parse("coder").expect("role"),
+            harness: crate::kernel::SeatHarness::parse(harness).expect("harness"),
+            model: Some(model.into()),
+            mode: None,
+            effort: None,
+            placement: SeatPlacement::Pane,
+            idle: false,
+            fresh_session: false,
+            idle_since_ms: None,
+        }
+    }
+
+    /// E2E leg 3 (ADR-0022 V11), live leg — run with
+    /// `cargo test -p flywheel --bin flywheel live_respawn_never_two_holders -- --ignored`:
+    /// one desired seat yields exactly ONE execution at every observed step,
+    /// including when the respawn is interrupted (the same live seat is seen
+    /// again before the new holder lands) and when it lands (Keep).
+    /// Mutation that proves it can fail: make `reconcile` push the effect twice
+    /// for one pinned seat — the `len() == 1` asserts panic.
+    #[test]
+    #[ignore]
+    fn live_respawn_never_two_holders_for_one_seat() {
+        let desired = [want()];
+        let policy = ReconcilePolicy::default();
+        let env = |_h: &str| false;
+
+        // Step 1: a harness change decides Respawn — exactly one execution.
+        let before = [live("pi", "a/m")];
+        let first = reconcile(&desired, &before, &env, &policy);
+        assert_eq!(
+            first.len(),
+            1,
+            "one seat => one effect at step 1: {first:?}"
+        );
+        assert!(
+            matches!(first.as_slice(), [SeatEffect::Respawn { .. }]),
+            "a harness change respawns: {first:?}"
+        );
+
+        // Step 2 (interrupted): the respawn never landed, so the SAME live seat
+        // is observed again. Still exactly one execution — never a second holder.
+        let second = reconcile(&desired, &before, &env, &policy);
+        assert_eq!(
+            second.len(),
+            1,
+            "an interrupted respawn must not double the execution: {second:?}"
+        );
+
+        // Step 3: the respawn landed; the seat is Keep — no third holder.
+        let after = [live("opencode", "a/m")];
+        let third = reconcile(&desired, &after, &env, &policy);
+        assert!(
+            matches!(third.as_slice(), [SeatEffect::Keep { .. }]),
+            "a landed respawn is Keep: {third:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::seat_binder::{LiveSeat, SeatPlacement};

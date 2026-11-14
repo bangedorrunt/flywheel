@@ -378,6 +378,70 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// E2E leg 1 (ADR-0021 acceptance 3), live leg — run with
+    /// `cargo test -p flywheel --bin flywheel live_wave_swarm_without_witness -- --ignored`:
+    /// a wave-swarm coder that never writes a witness must end in a TYPED
+    /// failure naming the missing fields, never a silent pass or a hang.
+    /// Mutation that proves it can fail: fill the witness fields in
+    /// `empty` below — the leg then reports green and the assert panics.
+    #[test]
+    #[ignore]
+    fn live_wave_swarm_without_witness_is_a_typed_failure() {
+        let empty = json!({ "response": "", "ok": true });
+        let failed = check_witness("implement", &empty);
+        assert!(!failed.ok, "no witness must not pass: {failed:?}");
+        let reason = format!("{failed:?}");
+        assert!(
+            reason.contains("implement") || reason.contains("missing"),
+            "the typed failure must name what is missing: {reason}"
+        );
+
+        let passing = json!({
+            "response": r#"{"commit_sha":"abcdef1","commit_message":"feat: work [bd-abc]","gate":{"command":"cargo test -p demo","exit":0,"output":"ok"}}"#,
+            "ok": true
+        });
+        let control = check_witness("implement", &passing);
+        assert!(control.ok, "the control witness must pass: {control:?}");
+    }
+
+    /// E2E leg 2 (ADR-0021 acceptance 4), live leg — run with
+    /// `cargo test -p flywheel --bin flywheel live_beads_lifecycle_polish_converges -- --ignored`:
+    /// polish converges (unchanged digest stops the loop) and a round that
+    /// drops a requirement from coverage fails the contract.
+    /// Mutation: treat an empty `beads` row as covered — the drop case then
+    /// passes and the assert panics.
+    #[test]
+    #[ignore]
+    fn live_beads_lifecycle_polish_converges() {
+        let round = |changed: bool| {
+            json!({
+                "changed": changed,
+                "coverage": [
+                    {"requirement": "R1", "beads": ["bd-a"]},
+                    {"requirement": "R2", "beads": ["bd-b"]}
+                ],
+                "tests_named": true
+            })
+        };
+        assert!(polish_round_contract(&round(true)).ok, "round 1 changes");
+        let converged = polish_round_contract(&round(false));
+        assert!(converged.ok, "round 2 unchanged digest stops cleanly");
+        assert!(
+            format!("{converged:?}").contains("changed=false"),
+            "the report states the stop condition"
+        );
+
+        let dropped = json!({
+            "changed": false,
+            "coverage": [{"requirement": "R1", "beads": []}],
+            "tests_named": true
+        });
+        assert!(
+            !polish_round_contract(&dropped).ok,
+            "a requirement with no covering bead must fail the round"
+        );
+    }
+
     #[test]
     fn agent_report_parses_headless_response_string() {
         let out = json!({ "response": r#"{"target":"x"}"#, "ok": true });
