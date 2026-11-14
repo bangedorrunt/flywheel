@@ -1516,16 +1516,27 @@ mod tests {
         let mb = crate::mail::comms_mailbox().expect("mailbox");
         let rt = crate::mail::runtime().expect("runtime");
         // The same upsert `toron contact captain --project <slug>` writes:
-        // the row is keyed by the SLUG.
-        rt.block_on(mb.set_captain_alias("demo", "Captain"))
+        // the row is keyed by the SLUG and says SlateHarbor.
+        rt.block_on(mb.set_captain_alias("demo", "SlateHarbor"))
             .expect("set the captain row keyed by the slug");
+        // A DISAGREEING stale flywheel mirror file (the live split-brain: it
+        // said WindyCreek since Nov 7). toron owns identity; the file must
+        // never win.
+        let stale = crate::state::captain_alias_file("demo");
+        std::fs::create_dir_all(stale.parent().expect("parent")).expect("dir");
+        std::fs::write(&stale, r#"{"pin":"WindyCreek"}"#).expect("stale mirror");
         // The live lookup passes a PATH-form key; the row is keyed by the slug.
         assert_eq!(
             crate::state::captain_pin("demo", "/tmp/captainkeytest/demo").as_deref(),
-            Some("Captain"),
-            "a path-form lookup must resolve the slug-keyed captain row"
+            Some("SlateHarbor"),
+            "toron's fold wins over the stale flywheel file"
         );
-        retire_registry(&[("wA:p1", "Captain", "c-1")]);
+        assert_eq!(
+            crate::state::load_captain_alias("demo").as_deref(),
+            Some("SlateHarbor"),
+            "the stale file is never read as the captain value"
+        );
+        retire_registry(&[("wA:p1", "SlateHarbor", "c-1")]);
         let mux = FakeMux::default();
         let mut ports = Fake::default();
         let mut journal = MemJournal::default();
@@ -1534,7 +1545,7 @@ mod tests {
             &mux,
             &cfg,
             "demo",
-            &["Captain".into()],
+            &["SlateHarbor".into()],
             true,
             &mut journal,
             &mut ports,

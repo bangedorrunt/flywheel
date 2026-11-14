@@ -1065,13 +1065,16 @@ pub fn captain_alias_file(project: &str) -> PathBuf {
         .join(format!("{}.json", state_key(project)))
 }
 
+/// The captain pin, from TORON ONLY. Identity has one store (toron's
+/// `agent_name_aliases` fold); the flywheel file is a legacy mirror and is
+/// never read as the value source (a stale file said WindyCreek while toron
+/// said SlateHarbor — the bd-8fiwv live split-brain).
 pub fn load_captain_alias(project: &str) -> Option<String> {
-    let path = captain_alias_file(project);
-    let raw = std::fs::read_to_string(&path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    v.get("pin")
-        .and_then(|p| p.as_str())
-        .map(std::string::ToString::to_string)
+    crate::backend::run_mail_off_runtime_sync(|| {
+        let mailbox = crate::mail::comms_mailbox().ok()?;
+        let rt = crate::mail::runtime().ok()?;
+        rt.block_on(mailbox.captain_alias(project)).ok().flatten()
+    })
 }
 
 /// The captain/operator pin for `project`, from the one authoritative source
@@ -1081,19 +1084,19 @@ pub fn load_captain_alias(project: &str) -> Option<String> {
 ///
 /// The supervisor and `swarm status` use this to keep the captain seat out of
 /// the reconcile (ADR-0022 D7): identified by ROLE, never by a name literal.
-pub fn captain_pin(project: &str, project_key: &str) -> Option<String> {
-    if let Some(pin) = load_captain_alias(project) {
-        return Some(pin);
-    }
+pub fn captain_pin(_project: &str, project_key: &str) -> Option<String> {
     // The ONE resolver: `Mailbox::captain_alias` canonicalizes a path-form key
     // and reads over the project read set, so a row written by
     // `toron contact captain --project <slug>` (keyed by the slug) is found
-    // from the supervisor/CLI path key too. Mirrors `whois`.
-    let mailbox = crate::mail::comms_mailbox().ok()?;
-    let rt = crate::mail::runtime().ok()?;
-    rt.block_on(mailbox.captain_alias(project_key))
-        .ok()
-        .flatten()
+    // from the supervisor/CLI path key too. Mirrors `whois`. TORON ONLY: the
+    // flywheel alias file is never consulted (bd-8fiwv live split-brain).
+    crate::backend::run_mail_off_runtime_sync(|| {
+        let mailbox = crate::mail::comms_mailbox().ok()?;
+        let rt = crate::mail::runtime().ok()?;
+        rt.block_on(mailbox.captain_alias(project_key))
+            .ok()
+            .flatten()
+    })
 }
 
 /// Explicit-clear tombstone. A brand-new project has no alias and was never
@@ -1106,6 +1109,19 @@ fn captain_alias_cleared_marker(project: &str) -> PathBuf {
 }
 
 pub fn save_captain_alias(project: &str, pin: &str) -> Result<()> {
+    // toron owns identity: write the fold first (the only value readers see).
+    let wrote = crate::backend::run_mail_off_runtime_sync(|| -> anyhow::Result<()> {
+        let mailbox = crate::mail::comms_mailbox()?;
+        let rt = crate::mail::runtime()?;
+        rt.block_on(mailbox.set_captain_alias(project, pin))
+    });
+    if let Err(e) = wrote {
+        eprintln!(
+            "flywheel: warn: cannot write the toron captain alias for {project}: {e:#} (the legacy file mirror is written, but toron is the only value source)"
+        );
+    }
+    // Legacy mirror (never read as the value source; kept so tooling that
+    // inspects the file still sees a pin).
     let path = captain_alias_file(project);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1117,6 +1133,15 @@ pub fn save_captain_alias(project: &str, pin: &str) -> Result<()> {
 }
 
 pub fn clear_captain_alias_file(project: &str) {
+    // Clear the authoritative toron fold too, so a cleared alias is not
+    // resurrected by the stale-file read path (there is none now) or by a
+    // later toron read.
+    let _ = crate::backend::run_mail_off_runtime_sync(|| -> anyhow::Result<()> {
+        let mailbox = crate::mail::comms_mailbox()?;
+        let rt = crate::mail::runtime()?;
+        rt.block_on(mailbox.clear_captain_alias(project))?;
+        Ok(())
+    });
     let path = captain_alias_file(project);
     let _ = std::fs::remove_file(&path);
     let marker = captain_alias_cleared_marker(project);
