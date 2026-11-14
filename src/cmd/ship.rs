@@ -103,14 +103,22 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// How far back HEAD's history a ship check scans for the bead citation.
-/// Sequential landings from other lanes must not invalidate a prior bead's
-/// check (bd-gate-ship-robustness-3pp9k).
-const SHIP_LOG_WINDOW: usize = 30;
-
+/// bd-wcjsu: the bead is bound to the revision the GATE recorded (its leading
+/// `sha=`), never to the newest commit that merely mentions the id — a later
+/// unrelated commit citing a closed bead used to flip its verdict. The bound
+/// revision must be an ancestor of HEAD.
 fn head_names_bead(dir: &Path, bead: &str) -> Result<bool> {
-    let window = format!("-n{SHIP_LOG_WINDOW}");
-    Ok(git(dir, &["log", &window, "--format=%B"])?.contains(bead))
+    // No commit carries the id at all: not named (the check reports the
+    // missing row separately), never a hard error here.
+    let Ok(sha) = crate::verdict::derive_head_sha(dir, bead) else {
+        return Ok(false);
+    };
+    let out = Command::new("git")
+        .args(["merge-base", "--is-ancestor", &sha, "HEAD"])
+        .current_dir(dir)
+        .output()
+        .map_err(|err| anyhow!("git not found: {err}"))?;
+    Ok(out.status.success())
 }
 
 /// The tracker rows that belong to ONE bead, in HEAD and in the worktree.

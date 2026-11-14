@@ -295,6 +295,61 @@ fn injected_close_failure_resumes_from_that_step() {
     assert_eq!(f.gate_rows(), 1, "the gate row is not duplicated on resume");
 }
 
+/// bd-wcjsu: a later commit that merely NAMES the closed bead must not move the
+/// binding — the gate's `sha=` decides.
+#[test]
+fn a_later_mention_does_not_flip_a_landed_verdict() {
+    let f = fixture();
+    let out = f.land(&[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // A REAL commit (the live case changed files), not an empty one: derive
+    // filters commits that change nothing.
+    std::fs::write(f.repo.join("mentions.txt"), "unrelated work\n").expect("mention file");
+    assert!(
+        sh(&f.repo, "git", &["add", "mentions.txt"])
+            .status
+            .success()
+    );
+    assert!(
+        sh(
+            &f.repo,
+            "git",
+            &["commit", "-qm", "mentions bd-x in passing"]
+        )
+        .status
+        .success()
+    );
+    let check = Command::new(env!("CARGO_BIN_EXE_flywheel"))
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                f.bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("FAKE_STATE", &f.state)
+        .args([
+            "ship",
+            "check",
+            "bd-x",
+            "--dir",
+            f.repo.to_str().expect("repo"),
+        ])
+        .output()
+        .expect("ship check");
+    assert!(
+        check.status.success(),
+        "a mention-only commit must not flip the verdict:\n{}\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
 #[test]
 fn land_refuses_a_sha_that_does_not_cite_the_bead() {
     let f = fixture();

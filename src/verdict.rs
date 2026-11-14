@@ -531,6 +531,32 @@ fn rank_binding<'a>(parsed: &'a [(String, bool, bool)], candidates: &[&'a str]) 
 }
 
 pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
+    // bd-wcjsu: the verdict BINDS its revision. A gate row's leading `sha=`
+    // (the commit that ran the proof) is the binding; scanning the log for the
+    // newest commit that merely MENTIONS the bead flipped a closed bead's
+    // verdict whenever a later commit cited it (live: 1dc8d143 naming bd-i19jn).
+    if let Ok(list) = list_gates(cwd, bead_id) {
+        for row in list.history.iter().rev() {
+            if !row.passed {
+                continue;
+            }
+            let Some(note) = row.note.as_deref() else {
+                continue;
+            };
+            let NoteBinding::Bound(sha) = note_binding(note) else {
+                continue;
+            };
+            let exists = StdCommand::new("git")
+                .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
+                .current_dir(cwd)
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false);
+            if exists {
+                return Ok(sha);
+            }
+        }
+    }
     let out = StdCommand::new("git")
         .args([
             "log",
