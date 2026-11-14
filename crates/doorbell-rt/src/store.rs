@@ -544,13 +544,55 @@ impl FileStore {
         if let (Some(sub), Some(obj)) = (subscriber, entry.as_object_mut()) {
             obj.insert("subscriber".into(), sub.into());
         }
-        use std::io::Write;
-        let mut f = private_append(&path)?;
-        writeln!(f, "{entry}")?;
-        f.flush()?;
-        drop(f);
+        // bd-bj9xk-adjacent (live tear): the line goes out in ONE write under
+        // an exclusive cross-process lock. `writeln!` on a File issued several
+        // syscalls (payload, then newline), so two appenders — the host and a
+        // CLI — interleaved halves into an unparseable row; and a rotation
+        // landing between them rewrote the file underneath the writer.
+        let mut line = entry.to_string();
+        line.push('\n');
+        self.with_journal_lock(workspace, |_| {
+            use std::io::Write;
+            let mut f = private_append(&path)?;
+            f.write_all(line.as_bytes())?;
+            f.flush()?;
+            Ok::<(), std::io::Error>(())
+        })??;
         self.maybe_rotate(workspace);
         Ok(())
+    }
+
+    /// Exclusive cross-process lock for one journal (bd-bj9xk-adjacent):
+    /// appenders and rotation share it, so a rewrite can never land between
+    /// another process's append and its newline.
+    fn with_journal_lock<T>(
+        &self,
+        workspace: &str,
+        f: impl FnOnce(&std::fs::File) -> T,
+    ) -> Result<T, std::io::Error> {
+        let path = self.journal_file(workspace).with_extension("lock");
+        if let Some(parent) = path.parent() {
+            private_dir(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(f(&file)),
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(std::io::Error::other("journal lock timed out"));
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(e),
+            }
+        }
     }
 
     /// Rotation check after every append (D4.3). Cheap gate first: only
@@ -575,7 +617,7 @@ impl FileStore {
         if oldest.is_none() && count_lines(&path) <= KEEP_LINES {
             return;
         }
-        self.rotate(workspace);
+        let _ = self.with_journal_lock(workspace, |_| self.rotate(workspace));
     }
 
     /// Move the active head into generations in chunks (D4.3): shift
@@ -1530,6 +1572,60 @@ mod tests {
         let fold = st.fold_workspace("w");
         assert!(fold.torn.is_none(), "rotation must not tear the fold");
         assert!(!fold.rows.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// bd-bj9xk-adjacent (live tear): concurrent appenders plus rotation never
+    /// produce an unparseable row. The one-write-under-lock append is what
+    /// makes it hold; the old `writeln!` issued two syscalls and a rotation
+    /// could rewrite the file between them.
+    #[test]
+    fn concurrent_appends_never_tear_with_rotation() {
+        let (st, dir) = test_store("tear-race");
+        let st = std::sync::Arc::new(st);
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let mut handles = Vec::new();
+        for t in 0..8u64 {
+            let st = std::sync::Arc::clone(&st);
+            let counter = std::sync::Arc::clone(&counter);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..150u64 {
+                    let _seq = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    st.append_journal_seq(
+                        "w",
+                        &serde_json::json!({"rt_kind": "Sweep", "t": t}),
+                        &serde_json::json!([]),
+                        serde_json::json!({"stage": "race", "pad": "x".repeat(200)}),
+                        &[],
+                        None,
+                        None,
+                    )
+                    .expect("append");
+                }
+            }));
+        }
+        {
+            let st = std::sync::Arc::clone(&st);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..20 {
+                    st.maybe_rotate("w");
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread");
+        }
+        let fold = st.fold_workspace("w");
+        let tear = fold
+            .torn
+            .as_ref()
+            .filter(|t| t.reason.contains("unparseable"));
+        assert!(
+            tear.is_none(),
+            "concurrent appends must not produce an unparseable row: {tear:?}"
+        );
+        assert!(!fold.rows.is_empty(), "rows survive");
         let _ = std::fs::remove_dir_all(dir);
     }
 
