@@ -44,8 +44,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --sha) [ $# -ge 2 ] || die "--sha needs a revision"; MODE="sha"; TARGET_REV="$2"; shift 2 ;;
     --head) MODE="head"; shift ;;
-    --mutate) [ $# -ge 2 ] || die "--mutate needs a spec"; MUT_SPECS="$MUT_SPECS
-$2"; shift 2 ;;
+    --mutate) [ $# -ge 2 ] || die "--mutate needs a spec"; MUT_SPECS="${MUT_SPECS}$2"$'\n'; shift 2 ;;
     --receipt) [ $# -ge 2 ] || die "--receipt needs a path"; RECEIPT="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
     -h|--help) usage 0 ;;
@@ -116,7 +115,7 @@ SHORT="$(git -C "$ROOT" rev-parse --short "$PROVEN_SHA")"
 SIBLING_RECORDS=""
 while IFS='	' read -r rel pin; do
   [ -n "${rel:-}" ] || continue
-  sib_repo="$(cd "$ROOT/$(dirname "$rel")" && pwd)"
+  sib_repo="$(cd "$ROOT/$rel" && pwd)"
   sib_name="$(basename "$rel")"
   proof_archive "$sib_repo" "$pin" "$TMP/$sib_name" \
     || die "cannot archive sibling $rel at $pin"
@@ -213,8 +212,8 @@ done <"$TMP/mutations.in"
 MUTATION_RECORDS_FILE="$TMP/mutations.txt"
 printf '%s' "$MUTATION_RECORDS" >"$MUTATION_RECORDS_FILE"
 
-OK=1
-[ -n "$FAILED_STEP" ] && OK=0
+OK=0
+[ -n "$FAILED_STEP" ] && OK=1
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 [ -n "$RECEIPT" ] || RECEIPT="${TMPDIR:-/tmp}/clean-proof/${SHORT}-${STAMP}.json"
