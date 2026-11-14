@@ -261,6 +261,10 @@ impl CoreReducer {
                 summary: summary.clone(),
             },
             BrainMsg::AckSlaTick { now } => DoorbellMsg::AckSlaTick { now: *now },
+            BrainMsg::PromptRefused { pin, line } => DoorbellMsg::PromptRefused {
+                pin: pin.clone(),
+                line: line.clone(),
+            },
             BrainMsg::Died => DoorbellMsg::WatchDied,
             BrainMsg::Sweep { .. }
             | BrainMsg::RoleBound { .. }

@@ -20,6 +20,11 @@ pub enum RtError {
     /// The embedded hc prompt delivered to no pane.
     #[error("prompt for {0} delivered nowhere")]
     UndeliveredPin(String),
+    /// The pane is mid-turn and refused the prompt ("not at a prompt").
+    /// bd-9mjla: a typed DEFERRAL for the reducer — the wake is kept and
+    /// rings once at the pane's next prompt, never a sink failure.
+    #[error("pane busy: {0} is not at a prompt")]
+    PaneBusy(String),
     /// Webhook construction refused: host outside the egress allowlist.
     #[error("webhook host not allowlisted: {0}")]
     NotAllowlisted(String),

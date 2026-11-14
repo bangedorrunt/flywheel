@@ -178,6 +178,11 @@ pub struct MailWakeHost {
 
 impl MailWakeHost {
     /// Start the mail-wake thread for one workspace.
+    ///
+    /// ADR-0041 one door by construction: while the comms envelope is enabled
+    /// it owns wakes, so this host refuses to start no matter which call site
+    /// asks (a caller-side gate was not enough — a second process can start it
+    /// with the flag unset and then poll beside the envelope host).
     pub fn spawn(cfg: crate::config::Config, project: String, workspace: String) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let st = Arc::clone(&stop);
@@ -513,6 +518,28 @@ mod tests {
         );
         let unbound = crate::state::SpawnEntry::legacy("", "no-pane");
         assert!(stop_pin(&unbound, &crew_panes), "no bound pane => no wake");
+    }
+
+    /// bd-346jl: the host refuses to start while comms owns wakes, so a second
+    /// caller (or a second process with the flag unset) cannot open a second
+    /// door. Mutation: dropping the guard starts the poller.
+    #[test]
+    fn spawn_refuses_while_the_envelope_owns_wakes() {
+        let src = include_str!("mail_wake.rs");
+        let spawn = src
+            .find("pub fn spawn(cfg: crate::config::Config")
+            .expect("spawn");
+        let body = &src[spawn..];
+        let end = body.find("\n    }\n").expect("spawn body end");
+        let body = &body[..end];
+        assert!(
+            body.contains("mail_wake_owns(crate::comms_send::enabled(&cfg))"),
+            "spawn must gate on the comms flag: {body}"
+        );
+        assert!(
+            body.contains("return Self { stop, join: None }"),
+            "the refusal returns an inert host: {body}"
+        );
     }
 
     /// The per-workspace host must start this poller; a future refactor that

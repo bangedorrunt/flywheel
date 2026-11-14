@@ -104,6 +104,8 @@ pub const RETENTION_LINES: usize = 5000;
 pub const RETENTION_BYTES: u64 = 5 * 1024 * 1024;
 /// Generations kept besides the active file.
 pub const RETENTION_GENS: usize = 4;
+/// Rows kept in the active journal by one rotation.
+const KEEP_LINES: usize = 4000;
 
 /// bd-oa4u (item C of bd-3uqz): the workspace a journal file belongs to, generation
 /// suffix included.
@@ -561,8 +563,16 @@ impl FileStore {
         if bytes <= 512 * 1024 {
             return;
         }
-        let (total_lines, total_bytes, _) = self.generation_totals(workspace);
+        let (total_lines, total_bytes, oldest) = self.generation_totals(workspace);
         if total_lines <= RETENTION_LINES && total_bytes <= RETENTION_BYTES {
+            return;
+        }
+        // bd-346jl: a journal can be over budget with nothing to move (the
+        // active file is already at KEEP and no generation is left). Rotating
+        // it again frees nothing but writes another row, so a full audit fills
+        // with rotation noise and the real wakes stop being visible. Only
+        // rotate when there is something rotatable.
+        if oldest.is_none() && count_lines(&path) <= KEEP_LINES {
             return;
         }
         self.rotate(workspace);
@@ -574,7 +584,6 @@ impl FileStore {
     /// would let the totals enforcer delete everything at once — chunks
     /// keep the retained history dense. Every drop is an audit row.
     fn rotate(&self, workspace: &str) {
-        const KEEP_LINES: usize = 4000;
         let mut dropped_lines = 0usize;
         let mut dropped_bytes = 0u64;
         let mut drop_lo: Option<u64> = None;
@@ -678,6 +687,11 @@ impl FileStore {
                  (GS-039); no seq range is recorded for this rotation: {}",
                 failed.join("; ")
             );
+        }
+        if dropped_lines == 0 && failed.is_empty() {
+            // bd-346jl: a rotation that removed nothing is not an event. One
+            // row per real rotation, never one per attempt.
+            return;
         }
         let mut row = serde_json::json!({
             "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -1475,6 +1489,75 @@ mod tests {
         let fold = st.fold_workspace("w");
         assert!(fold.torn.is_none(), "rotation must not tear the fold");
         assert!(!fold.rows.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// bd-346jl: one rotation of a burst is ONE summary row, never a row per
+    /// dropped line (a 997-line burst once flooded the audit and the real
+    /// wake rows stopped being visible).
+    #[test]
+    fn one_rotation_of_a_burst_writes_one_summary_row() {
+        let (st, dir) = test_store("rot-burst");
+        let mut body = String::new();
+        for seq in 1..=6000u64 {
+            body.push_str(&format!(
+                "{{\"v\":2,\"seq\":{seq},\"actions\":[],\"executed\":{{}}}}\n"
+            ));
+        }
+        let active = st.journal_file("w");
+        std::fs::create_dir_all(active.parent().expect("journals dir")).expect("mkdir journals");
+        std::fs::write(&active, &body).expect("oversized active journal");
+
+        st.rotate("w");
+
+        let audit = std::fs::read_to_string(st.audit_file("w")).expect("audit sidecar");
+        let rows: Vec<&str> = audit.lines().collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "one rotation, one row (a per-line row is the bug): {audit}"
+        );
+        let row: serde_json::Value = serde_json::from_str(rows[0]).expect("json row");
+        assert_eq!(row["kind"], "journal_rotated");
+        assert!(
+            row["dropped_lines"].as_u64().unwrap_or(0) >= 1000,
+            "the whole burst is one count: {row}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// bd-346jl: a journal over budget with nothing rotatable (active already
+    /// at KEEP, no generations) must not rotate on every append — that row
+    /// storm is what crowded the audit.
+    #[test]
+    fn a_stuck_rotation_writes_no_rows() {
+        let (st, dir) = test_store("rot-stuck");
+        let pad = "x".repeat(1300);
+        let mut body = String::new();
+        for seq in 1..=4000u64 {
+            body.push_str(&format!(
+                "{{\"v\":2,\"seq\":{seq},\"pad\":\"{pad}\",\"actions\":[],\"executed\":{{}}}}\n"
+            ));
+        }
+        let active = st.journal_file("w");
+        std::fs::create_dir_all(active.parent().expect("journals dir")).expect("mkdir journals");
+        std::fs::write(&active, &body).expect("big active journal");
+        let (lines, bytes, _) = st.generation_totals("w");
+        assert!(
+            bytes > super::RETENTION_BYTES && lines <= super::RETENTION_LINES,
+            "fixture must be over budget with nothing to move: {lines} lines / {bytes} bytes"
+        );
+
+        for _ in 0..5 {
+            st.maybe_rotate("w");
+        }
+
+        let audit = std::fs::read_to_string(st.audit_file("w")).unwrap_or_default();
+        assert!(
+            !audit.contains("journal_rotated"),
+            "a no-op rotation is not an event: {audit}"
+        );
+        assert_eq!(super::count_lines(&active), 4000, "and it rewrites nothing");
         let _ = std::fs::remove_dir_all(dir);
     }
 

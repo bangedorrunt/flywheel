@@ -565,6 +565,11 @@ pub enum DoorbellMsg {
     },
     /// Hc status change for one pin.
     PlaneStatus { pin: String, status: String },
+    /// The pane refused a Prompt because it is mid-turn ("not at a prompt").
+    /// bd-9mjla: a busy refusal is a typed DEFERRAL, not a delivery failure —
+    /// the wake stays in the per-pin queue (one entry, coalesced) and rings
+    /// once when the plane next reports at-prompt.
+    PromptRefused { pin: String, line: String },
     /// Captain-bound fact (no alias info here — honest FactMiss).
     Fact { summary: String },
     /// Periodic tick (60s cadence in the live dispatcher); drives the
@@ -800,6 +805,18 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 }
             }
             next.statuses.insert(pin.clone(), status.clone());
+        }
+        DoorbellMsg::PromptRefused { pin, line } => {
+            next.statuses.insert(pin.clone(), "working".into());
+            let queue = next.queues.entry(pin.clone()).or_default();
+            if queue.is_empty() {
+                queue.push(line.clone());
+                actions.push(DoorbellAction::Audit {
+                    kind: "deferred".into(),
+                    pin: pin.clone(),
+                    detail: line.clone(),
+                });
+            }
         }
         DoorbellMsg::Fact { summary } => {
             actions.push(DoorbellAction::FactMiss {
@@ -1088,6 +1105,72 @@ mod tests {
         let (next2, second) = tick(&next, &msg);
         assert!(second.is_empty(), "no audit storm while queued");
         assert_eq!(next2.queues.get("BlueRidge").map(Vec::len), Some(2));
+    }
+
+    /// bd-9mjla: a busy refusal is a deferral, not a lost wake. The wake
+    /// keeps its per-pin key, N refusals coalesce into the one queued entry,
+    /// and the next at-prompt status rings exactly once; a later status
+    /// emits nothing (terminal).
+    #[test]
+    fn prompt_refused_defers_then_rings_once_at_prompt() {
+        let mut model = model_with("BlueRidge");
+        model.statuses.insert("BlueRidge".into(), "idle".into());
+        let refused = DoorbellMsg::PromptRefused {
+            pin: "BlueRidge".into(),
+            line: "wake A".into(),
+        };
+        let (next, actions) = tick(&model, &refused);
+        assert!(
+            matches!(&actions[0], DoorbellAction::Audit { kind, .. } if kind == "deferred"),
+            "the deferral is journal-visible: {actions:?}"
+        );
+        assert_eq!(next.queues.get("BlueRidge").map(Vec::len), Some(1));
+
+        let (next2, actions2) = tick(
+            &next,
+            &DoorbellMsg::PromptRefused {
+                pin: "BlueRidge".into(),
+                line: "wake B".into(),
+            },
+        );
+        assert!(actions2.is_empty(), "coalesced, no audit storm");
+        assert_eq!(
+            next2.queues.get("BlueRidge").map(Vec::len),
+            Some(1),
+            "two deferred mails share one ring"
+        );
+
+        let (next3, actions3) = tick(
+            &next2,
+            &DoorbellMsg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+        );
+        assert_eq!(actions3.len(), 1, "exactly one ring: {actions3:?}");
+        match &actions3[0] {
+            DoorbellAction::Prompt { pin, line } => {
+                assert_eq!(pin, "BlueRidge");
+                assert_eq!(line, "wake A", "same effect key: the first line");
+            }
+            other => panic!("expected the deferred Prompt, got {other:?}"),
+        }
+        assert!(
+            next3
+                .queues
+                .get("BlueRidge")
+                .is_none_or(std::vec::Vec::is_empty),
+            "the deferral is spent"
+        );
+
+        let (_, actions4) = tick(
+            &next3,
+            &DoorbellMsg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+        );
+        assert!(actions4.is_empty(), "terminal state emits nothing");
     }
 
     #[test]

@@ -477,6 +477,13 @@ impl<H: Host> Brain<H> {
                 });
                 self.deliver(effects, "presence").await;
             }
+            BrainMsg::PromptRefused { pin, line } => {
+                let effects = self.host.tick(&BrainMsg::PromptRefused {
+                    pin: pin.clone(),
+                    line: line.clone(),
+                });
+                self.deliver(effects, "prompt-refused").await;
+            }
             BrainMsg::InboxFetched { pin, rows } => self.on_inbox_fetched(pin, rows).await,
             BrainMsg::SlaFired { posts } => self.on_sla_fired(posts).await,
             BrainMsg::Degraded { source, reason } => {
@@ -1281,6 +1288,7 @@ fn brain_msg_label(msg: &BrainMsg) -> &'static str {
         BrainMsg::SlaFired { .. } => "sla-fired",
         BrainMsg::Degraded { .. } => "degraded",
         BrainMsg::Delivered { .. } => "delivered",
+        BrainMsg::PromptRefused { .. } => "prompt-refused",
         BrainMsg::Ask { .. } => "ask",
         BrainMsg::Shutdown => "shutdown",
     }

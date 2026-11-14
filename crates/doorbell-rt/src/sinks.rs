@@ -358,6 +358,18 @@ async fn worker_loop(
         };
         let (pin, line) = next;
         if let Err(e) = adapter.send(&pin, &line) {
+            // bd-9mjla: a busy pane is a DEFERRAL, not a sink failure. Keep
+            // the worker alive, hand the wake to the reducer (one per pin),
+            // and never park or shed the queue for it.
+            if matches!(e, RtError::PaneBusy(_)) {
+                let _ = degraded_tx
+                    .send(BrainMsg::PromptRefused {
+                        pin: pin.clone(),
+                        line: line.clone(),
+                    })
+                    .await;
+                continue;
+            }
             let mut guard = inner.lock().await;
             guard.parked = true;
             guard.sheds += (guard.queue.len() + 1) as u64;
@@ -1020,6 +1032,54 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(sent_len(&sent), 1, "hc worker pumps independently");
         let _ = deg_rx.try_recv();
+    }
+
+    /// bd-9mjla: a busy pane is a DEFERRAL, not a sink failure — the worker
+    /// stays up, hands the wake to the reducer, and keeps delivering.
+    #[tokio::test]
+    async fn busy_refusal_defers_and_never_parks_the_sink() {
+        let (deg_tx, mut deg_rx) = mpsc::channel(16);
+        let mut mgr = SinkManager::new(deg_tx);
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct BusyOnce {
+            n: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl PromptSink for BusyOnce {
+            fn send(&mut self, pin: &str, _line: &str) -> Result<(), RtError> {
+                if self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    return Err(RtError::PaneBusy(pin.to_string()));
+                }
+                Ok(())
+            }
+            fn name(&self) -> &str {
+                "busy-once"
+            }
+        }
+        mgr.add_sink("plane", Box::new(BusyOnce { n: n.clone() }));
+        mgr.send("plane", "BlueRidge", "wake A").await;
+        mgr.send("plane", "BlueRidge", "wake B").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut deferred = Vec::new();
+        let mut degraded = 0;
+        while let Ok(msg) = deg_rx.try_recv() {
+            match msg {
+                BrainMsg::PromptRefused { pin, line } => deferred.push((pin, line)),
+                BrainMsg::Degraded { .. } => degraded += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(deferred, vec![("BlueRidge".into(), "wake A".into())]);
+        assert_eq!(degraded, 0, "a busy pane never degrades the sink");
+        assert!(
+            !mgr.parked("plane").await,
+            "the worker keeps its queue: no park, no shed"
+        );
+        assert_eq!(
+            n.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the next intent still goes to the adapter"
+        );
     }
 
     #[tokio::test]

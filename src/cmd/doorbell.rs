@@ -1376,6 +1376,9 @@ pub(crate) fn cmd_doorbell_why(
                 doorbell_tick::DoorbellMsg::PlaneStatus { pin, status } => {
                     workspace::Msg::PlaneStatus { pin, status }
                 }
+                doorbell_tick::DoorbellMsg::PromptRefused { pin, line } => {
+                    workspace::Msg::PromptRefused { pin, line }
+                }
                 doorbell_tick::DoorbellMsg::Fact { summary } => workspace::Msg::Fact { summary },
                 doorbell_tick::DoorbellMsg::AckSlaTick { now } => {
                     workspace::Msg::AckSlaTick { now }

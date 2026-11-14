@@ -1826,6 +1826,39 @@ impl Host for FileHost {
                 },
                 Effect::FetchInbox,
             ],
+            BrainMsg::PromptRefused { pin, line } => {
+                let (next, actions) = doorbell_core::tick(
+                    &self.reducer.model,
+                    &doorbell_core::DoorbellMsg::PromptRefused {
+                        pin: pin.clone(),
+                        line: line.clone(),
+                    },
+                );
+                self.reducer.model = next;
+                actions
+                    .into_iter()
+                    .map(|a| match a {
+                        doorbell_core::DoorbellAction::Prompt { pin, line } => {
+                            Effect::Prompt { pin, line }
+                        }
+                        doorbell_core::DoorbellAction::Audit { kind, pin, detail } => {
+                            Effect::Audit {
+                                kind,
+                                pin,
+                                detail: serde_json::json!(detail),
+                            }
+                        }
+                        doorbell_core::DoorbellAction::Digest { pin, line, why } => {
+                            Effect::Digest { pin, line, why }
+                        }
+                        other => Effect::Audit {
+                            kind: "unmapped-action".into(),
+                            pin: String::new(),
+                            detail: serde_json::json!(format!("{other:?}")),
+                        },
+                    })
+                    .collect()
+            }
             BrainMsg::Degraded { .. }
             | BrainMsg::Delivered { .. }
             | BrainMsg::Ask { .. }

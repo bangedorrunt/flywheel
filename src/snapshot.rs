@@ -163,6 +163,9 @@ pub fn replay_msg(v: &serde_json::Value) -> Option<crate::workspace::Msg> {
             crate::doorbell_tick::DoorbellMsg::PlaneStatus { pin, status } => {
                 Msg::PlaneStatus { pin, status }
             }
+            crate::doorbell_tick::DoorbellMsg::PromptRefused { pin, line } => {
+                Msg::PromptRefused { pin, line }
+            }
             crate::doorbell_tick::DoorbellMsg::Fact { summary } => Msg::Fact { summary },
             crate::doorbell_tick::DoorbellMsg::AckSlaTick { now } => Msg::AckSlaTick { now },
             crate::doorbell_tick::DoorbellMsg::WatchDied => Msg::WatchDied,

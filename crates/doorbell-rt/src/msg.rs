@@ -34,6 +34,9 @@ pub enum BrainMsg {
     /// F5: delivery receipt — worker confirms adapter.send succeeded.
     /// Hear/deaf tracking keys off this, not enqueue.
     Delivered { pin: String },
+    /// bd-9mjla: the pane refused the prompt as busy; the reducer keeps the
+    /// wake (one per pin) and rings it once at the next at-prompt status.
+    PromptRefused { pin: String, line: String },
     /// Ask-verb query; reply travels the oneshot (see [`crate::api`]).
     Ask {
         kind: AskKind,

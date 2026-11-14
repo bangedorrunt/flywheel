@@ -749,6 +749,13 @@ impl Host for RtHost {
                 },
                 false,
             ),
+            BrainMsg::PromptRefused { pin, line } => (
+                workspace::Msg::PromptRefused {
+                    pin: pin.clone(),
+                    line: line.clone(),
+                },
+                false,
+            ),
             BrainMsg::Degraded { .. }
             | BrainMsg::Delivered { .. }
             | BrainMsg::Ask { .. }
@@ -2187,10 +2194,23 @@ impl doorbell_rt::PromptSink for PlanePromptSink {
         };
         let backend = crate::backend::factory::multiplexer_backend(&self.cfg)
             .map_err(|e| doorbell_rt::RtError::PromptFailed(format!("plane: {e}")))?;
-        backend
-            .prompt(&pane, line, None)
-            .map(|_| ())
-            .map_err(|e| doorbell_rt::RtError::PromptFailed(format!("{e}")))
+        backend.prompt(&pane, line, None).map(|_| ()).map_err(|e| {
+            // bd-9mjla: a mid-turn pane is a DEFERRAL, not a delivery
+            // failure. The reducer keeps the wake and rings it at the next
+            // at-prompt status; anything else stays a loud prompt failure.
+            let busy = matches!(
+                e.code(),
+                toron_plane::backend::BackendErrorCode::AgentNotIdle
+            ) || matches!(
+                e.code(),
+                toron_plane::backend::BackendErrorCode::Other(code) if code == "busy"
+            ) || e.message.contains("not at a prompt");
+            if busy {
+                doorbell_rt::RtError::PaneBusy(pin.to_string())
+            } else {
+                doorbell_rt::RtError::PromptFailed(format!("{e}"))
+            }
+        })
     }
 
     fn name(&self) -> &str {

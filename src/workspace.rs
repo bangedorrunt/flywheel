@@ -676,6 +676,13 @@ pub enum Msg {
         pin: String,
         status: String,
     },
+    /// bd-9mjla: the pane refused a Prompt as busy. The doorbell slice keeps
+    /// the wake (one per pin) and rings it once at the next at-prompt status;
+    /// the interpreter only reports the refusal, it never retries.
+    PromptRefused {
+        pin: String,
+        line: String,
+    },
     /// Captain/operator injection. Prompts the captain-role pin iff
     /// prompt_allowed, else falls through to the doorbell slice.
     Fact {
@@ -1848,6 +1855,17 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                     .insert(pin.clone(), Presence::from_str(status));
             }
             cmds.extend(filter_prompts(&next, c));
+        }
+        Msg::PromptRefused { pin, line } => {
+            let (dm, c) = doorbell_slice(
+                &model.doorbell,
+                crate::doorbell_tick::DoorbellMsg::PromptRefused {
+                    pin: pin.clone(),
+                    line: line.clone(),
+                },
+            );
+            next.doorbell = dm;
+            cmds.extend(c);
         }
         Msg::Fact { summary } => {
             let (dm, c) = doorbell_slice(
@@ -4079,6 +4097,66 @@ mod presence_model_tests {
             },
         );
         assert_eq!(next.presence.get("P"), Some(&Presence::from_str("idle")));
+    }
+
+    /// bd-9mjla through the live reducer: a refused prompt defers, two
+    /// deferred mails share one queue entry, and the next at-prompt status
+    /// emits exactly one Prompt for that pin.
+    #[test]
+    fn prompt_refused_defers_through_the_workspace_tick() {
+        let mut m = empty_model();
+        m.doorbell.index.insert_pin("BlueRidge".into(), None);
+        m.presence
+            .insert("BlueRidge".into(), Presence::from_str("idle"));
+        let (m1, c1) = tick(
+            &m,
+            &Msg::PromptRefused {
+                pin: "BlueRidge".into(),
+                line: "⟦toron⟧ URGENT steer (wm 1) — wake A".into(),
+            },
+        );
+        assert!(
+            c1.iter()
+                .any(|c| matches!(c, Cmd::Audit { kind, .. } if kind == "deferred")),
+            "deferral is audit-visible: {c1:?}"
+        );
+        assert_eq!(m1.doorbell.queues.get("BlueRidge").map(Vec::len), Some(1));
+        let (m2, c2) = tick(
+            &m1,
+            &Msg::PromptRefused {
+                pin: "BlueRidge".into(),
+                line: "⟦toron⟧ URGENT steer (wm 2) — wake B".into(),
+            },
+        );
+        assert!(
+            !c2.iter().any(|c| matches!(c, Cmd::Prompt { .. })),
+            "{c2:?}"
+        );
+        assert_eq!(
+            m2.doorbell.queues.get("BlueRidge").map(Vec::len),
+            Some(1),
+            "coalesced to one ring"
+        );
+        let (_m3, c3) = tick(
+            &m2,
+            &Msg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+        );
+        let prompts: Vec<&Cmd> = c3
+            .iter()
+            .filter(|c| matches!(c, Cmd::Prompt { .. }))
+            .collect();
+        assert_eq!(
+            prompts.len(),
+            1,
+            "exactly one ring at the next prompt: {c3:?}"
+        );
+        assert!(
+            matches!(prompts[0], Cmd::Prompt { pin, line } if pin == "BlueRidge" && line.contains("wake A")),
+            "same effect key, first line: {prompts:?}"
+        );
     }
 
     #[test]
