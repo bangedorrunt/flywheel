@@ -25,35 +25,47 @@ LOG="/tmp/e2e-idle-page-live.${STAMP}.log"
 
 echo "e2e-idle-page-live: project=$PROJECT pin=$PIN timeout=${TIMEOUT}s receipt=$LOG"
 
-# The watch is the product's one-shot poll-exit door: arm it, let the pane work
-# and then idle, and require it to exit with an idle page instead of a stall.
-(
-  flywheel captain watch "$PROJECT" --interval 2 --json >"$LOG" 2>&1
-  echo "watch_exit=$?" >>"$LOG"
-) &
-WATCH_PID=$!
-
+# The watch is the product's one-shot poll-exit door. It is armed repeatedly:
+# any unrelated new mail legitimately ends it (reason "mail"), including crew
+# mail that arrives while we wait for the transition, so the leg re-arms and
+# keeps its deadline. Only an idle page naming the pin is the answer.
 deadline=$(( $(date +%s) + TIMEOUT ))
-while kill -0 "$WATCH_PID" 2>/dev/null; do
-  if [ "$(date +%s)" -ge "$deadline" ]; then
-    kill "$WATCH_PID" 2>/dev/null || true
-    wait "$WATCH_PID" 2>/dev/null || true
-    printf '  FAIL  live positive: the watch never paged within %ss (receipt %s)\n' \
-      "$TIMEOUT" "$LOG" >&2
-    sed -n '1,20p' "$LOG" >&2 || true
-    exit 1
+attempt=0
+armed_pages=0
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  attempt=$((attempt + 1))
+  run="$LOG.arm$attempt"
+  flywheel captain watch "$PROJECT" --interval 2 --json >"$run" 2>&1 &
+  WATCH_PID=$!
+  while kill -0 "$WATCH_PID" 2>/dev/null; do
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      kill "$WATCH_PID" 2>/dev/null || true
+      wait "$WATCH_PID" 2>/dev/null || true
+      printf '  FAIL  live positive: no idle page for %s in %ss (%s arms, %s unrelated pages)\n' \
+        "$PIN" "$TIMEOUT" "$attempt" "$armed_pages" >&2
+      sed -n '1,10p' "$run" >&2 || true
+      exit 1
+    fi
+    sleep 2
+  done
+  wait "$WATCH_PID" 2>/dev/null || true
+
+  if grep -q '"reason": *"idle"' "$run" && grep -q "\"$PIN\"" "$run"; then
+    printf '  PASS  live positive: the watch exited naming %s with its unread brief (arm %s)\n' \
+      "$PIN" "$attempt"
+    sed -n '1,20p' "$run"
+    cp "$run" "$LOG" 2>/dev/null || true
+    exit 0
   fi
-  sleep 2
+  if grep -q '"reason": *"mail"' "$run"; then
+    armed_pages=$((armed_pages + 1))
+    continue
+  fi
+  printf '  FAIL  live positive: the watch exited for a reason that is not an idle page (%s)\n' \
+    "$run" >&2
+  sed -n '1,20p' "$run" >&2 || true
+  exit 1
 done
-wait "$WATCH_PID" 2>/dev/null || true
 
-if grep -q '"reason": *"idle"' "$LOG" && grep -q "\"$PIN\"" "$LOG"; then
-  printf '  PASS  live positive: the watch exited naming %s with its unread brief\n' "$PIN"
-  sed -n '1,20p' "$LOG"
-  exit 0
-fi
-
-printf '  FAIL  live positive: the watch exited without an idle page for %s (receipt %s)\n' \
-  "$PIN" "$LOG" >&2
-sed -n '1,20p' "$LOG" >&2 || true
+printf '  FAIL  live positive: deadline passed with no idle page for %s\n' "$PIN" >&2
 exit 1
