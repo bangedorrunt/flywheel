@@ -57,7 +57,28 @@ pub enum WakePlan<'a> {
 /// toron ca87ff5c drops `toron_kind`, so the production row is recognised by
 /// its throwaway hex sender and empty subject instead.
 pub fn is_system_notice(row: &MailRow) -> bool {
-    row.kind.is_some() || (row.subject.trim().is_empty() && looks_like_key(&row.sender))
+    system_notice_fields(row.kind.as_deref(), &row.subject, &row.sender)
+}
+
+/// The field-level classifier both readers share (bd-271ws): the doorbell's
+/// typed sink and `captain watch`'s JSON rows must agree on what is noise.
+pub fn system_notice_fields(kind: Option<&str>, subject: &str, sender: &str) -> bool {
+    kind.is_some() || (subject.trim().is_empty() && looks_like_key(sender))
+}
+
+/// The same predicate over a wire row (`captain watch` holds `serde_json`
+/// values, not `MailRow`). One classifier, two shapes.
+pub fn is_system_notice_value(row: &serde_json::Value) -> bool {
+    let kind = row.get("kind").and_then(serde_json::Value::as_str);
+    let subject = row
+        .get("subject")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let sender = row
+        .get("sender")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    system_notice_fields(kind, subject, sender)
 }
 
 fn looks_like_key(sender: &str) -> bool {
@@ -395,6 +416,32 @@ mod tests {
         assert!(plan_wake(None, std::slice::from_ref(&r)) == WakePlan::Seed(10));
         assert!(plan_wake(Some(0), std::slice::from_ref(&r)) == WakePlan::Idle);
         assert!(newest_ringable(std::slice::from_ref(&r), 0).is_none());
+    }
+
+    /// bd-271ws: the wire-value shape (`captain watch`) uses the SAME
+    /// classifier as the typed sink — one predicate, two row shapes.
+    #[test]
+    fn wire_values_share_the_system_notice_predicate() {
+        let notice = serde_json::json!({
+            "sender": HASH,
+            "subject": "",
+            "created_ts_us": 10,
+        });
+        assert!(is_system_notice_value(&notice));
+        let typed = row_full("n1", 10, HASH, "", None, "normal");
+        assert_eq!(is_system_notice_value(&notice), is_system_notice(&typed));
+        let done = serde_json::json!({
+            "sender": HASH,
+            "subject": "[bd-x] done",
+            "created_ts_us": 20,
+        });
+        assert!(!is_system_notice_value(&done));
+        let human = serde_json::json!({
+            "sender": "BlueRidge",
+            "subject": "",
+            "created_ts_us": 30,
+        });
+        assert!(!is_system_notice_value(&human), "a human DM is never noise");
     }
 
     /// The production wire carries no toron-kind, so the same notice is

@@ -192,8 +192,11 @@ fn preflight_arm_exit(
 /// matches the toron `since` contract (equal timestamps are not new), so a row
 /// already in the inbox at arm time is never re-reported.
 fn newest_since(rows: &[Value], baseline_us: i64) -> Option<&Value> {
+    // bd-271ws: the doorbell's system-notice classifier, shared — an empty-
+    // subject reservation-release DM never wakes the captain.
     rows.iter()
         .filter(|row| created_us(row).is_some_and(|us| us > baseline_us))
+        .filter(|row| !crate::mail_wake::is_system_notice_value(row))
         .max_by_key(|row| created_us(row).unwrap_or(i64::MIN))
 }
 
@@ -1041,6 +1044,26 @@ mod tests {
         assert_eq!(hit.get("subject").and_then(Value::as_str), Some("newer"));
         let junk = vec![json!({ "subject": "no ts" }), row(2_000, "at water")];
         assert!(newest_since(&junk, 2_000).is_none());
+
+        // bd-271ws: a system notice (empty subject from a 64-hex sender) is
+        // not captain mail; a [bd-x] done row behind it still wakes.
+        let key_sender = "a".repeat(64);
+        let notice = json!({
+            "sender": key_sender,
+            "subject": "",
+            "created_ts_us": 5_000,
+        });
+        assert!(
+            newest_since(std::slice::from_ref(&notice), 2_000).is_none(),
+            "a reservation-release notice never ends the watch"
+        );
+        let done = row(4_000, "[bd-x] done");
+        let mixed = vec![notice, done];
+        let hit = newest_since(&mixed, 2_000).expect("the done row wakes");
+        assert_eq!(
+            hit.get("subject").and_then(Value::as_str),
+            Some("[bd-x] done")
+        );
 
         let base = StallProbe {
             work_remaining: false,
