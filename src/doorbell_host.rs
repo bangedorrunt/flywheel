@@ -54,6 +54,9 @@ pub struct RtHost {
     /// Advisory reservation-conflict digest (bd-coordination-awareness):
     /// one notice per overlap episode, pushed to the holders and the captain.
     conflict_seen: std::collections::BTreeSet<String>,
+    /// Pins already audited as holding a deferral with no observable pane
+    /// (bd-346jl: a stuck wake must be visible, once per pin).
+    deferred_audited: std::collections::BTreeSet<String>,
     conflict_checked_at: u64,
     pending_conflict_prompts: Vec<(String, String)>,
     /// Shared with the delivery path. bd-kz54 follow-up: `WatchRetry::reset()`
@@ -163,6 +166,37 @@ fn wake_forwarder(
 }
 
 impl RtHost {
+    /// Deferrals whose pin has no pane this host can observe: a stuck wake
+    /// must be visible, never a quiet queue (bd-346jl). One audit row per pin.
+    fn stalled_deferrals(&mut self) -> Vec<Effect> {
+        let queued: Vec<String> = self
+            .model
+            .doorbell
+            .queues
+            .iter()
+            .filter(|(_, q)| !q.is_empty())
+            .map(|(pin, _)| pin.clone())
+            .collect();
+        if queued.is_empty() {
+            return Vec::new();
+        }
+        let mapped: std::collections::HashSet<String> = state::load_spawn_registry(&self.project)
+            .iter()
+            .filter_map(|e| e.mail_identity.clone())
+            .collect();
+        queued
+            .into_iter()
+            .filter(|pin| !mapped.contains(pin))
+            .filter(|pin| self.deferred_audited.insert(pin.clone()))
+            .map(|pin| Effect::Audit {
+                kind: "deferred_stalled".into(),
+                pin,
+                detail: serde_json::json!({
+                    "why": "deferred wake has no pane this host observes; the at-prompt drain cannot fire",
+                }),
+            })
+            .collect()
+    }
     pub fn new(
         cfg: Config,
         project: &str,
@@ -211,6 +245,7 @@ impl RtHost {
             covered_panes: Arc::new(Mutex::new(HashSet::new())),
             presence_armed: false,
             conflict_seen: std::collections::BTreeSet::new(),
+            deferred_audited: std::collections::BTreeSet::new(),
             conflict_checked_at: 0,
             pending_conflict_prompts: Vec::new(),
             retry: std::sync::Arc::new(std::sync::Mutex::new(doorbell_rt::WatchRetry::default())),
@@ -298,7 +333,7 @@ impl RtHost {
         if self.presence_armed {
             return;
         }
-        let pin_by_pane: HashMap<String, String> = pane_ids.iter().cloned().collect();
+        let mut pin_by_pane: HashMap<String, String> = pane_ids.iter().cloned().collect();
         // Seed: one bounded agent_list before the loop, so idle panes are
         // injectable without waiting for a status change.
         let backend = match crate::backend::factory::multiplexer_backend(&self.cfg) {
@@ -315,6 +350,13 @@ impl RtHost {
         // forever). Direct application is deterministic.
         match backend.agent_list() {
             Ok(agents) => {
+                let pane_ids: Vec<String> = agents.iter().map(|a| a.pane_id.clone()).collect();
+                Self::extend_with_pane_bindings(
+                    &self.cfg,
+                    &self.project,
+                    &mut pin_by_pane,
+                    &pane_ids,
+                );
                 let (updates, unmapped) = Self::presence_updates_for(&agents, &pin_by_pane);
                 let live_pins: HashSet<String> = agents
                     .iter()
@@ -366,11 +408,13 @@ impl RtHost {
                 // Re-read the registry every cycle: `flywheel add` panes are
                 // only in the registry after the host started, and a map
                 // frozen at boot would leave them on the old unknown path.
-                let pin_by_pane: HashMap<String, String> = state::load_spawn_registry(&project)
+                let mut pin_by_pane: HashMap<String, String> = state::load_spawn_registry(&project)
                     .iter()
                     .filter(|e| !e.pane_id.is_empty())
                     .filter_map(|e| e.mail_identity.clone().map(|pin| (e.pane_id.clone(), pin)))
                     .collect();
+                let pane_ids: Vec<String> = agents.iter().map(|a| a.pane_id.clone()).collect();
+                RtHost::extend_with_pane_bindings(&cfg, &project, &mut pin_by_pane, &pane_ids);
                 let (updates, _) = RtHost::presence_updates_for(&agents, &pin_by_pane);
                 for msg in updates {
                     if tx.blocking_send(msg).is_err() {
@@ -479,6 +523,48 @@ impl RtHost {
         unmapped.sort();
         unmapped.dedup();
         (updates, unmapped)
+    }
+
+    /// Extend the registry's pane→pin map with the pane-identity bridge:
+    /// `flywheel arrive` binds a pane (often a rex block in ANOTHER session)
+    /// to a pin without a spawn-registry row, so a registry-only map reports
+    /// that pane as unmapped and its at-prompt transition never fires — the
+    /// deferred wake then never drains (bd-346jl). Pure over the resolver.
+    fn bindings_for_unmapped(
+        map: &HashMap<String, String>,
+        pane_ids: &[String],
+        resolve: impl Fn(&str) -> Option<String>,
+    ) -> Vec<(String, String)> {
+        pane_ids
+            .iter()
+            .filter(|pane| !map.contains_key(*pane))
+            .filter_map(|pane| resolve(pane).map(|pin| (pane.clone(), pin)))
+            .collect()
+    }
+
+    /// Live wrapper over [`Self::bindings_for_unmapped`]: same mail surface
+    /// and project key the identity bridge was written with.
+    fn extend_with_pane_bindings(
+        cfg: &Config,
+        project: &str,
+        map: &mut HashMap<String, String>,
+        pane_ids: &[String],
+    ) {
+        let Ok(key) = crate::project_dir_str(cfg, project) else {
+            return;
+        };
+        let Ok(mail) = crate::cmd::mail::mail_or_die(cfg) else {
+            return;
+        };
+        for (pane, pin) in Self::bindings_for_unmapped(map, pane_ids, |pane| {
+            mail.resolve_pane_identity(&key, pane)
+                .get("agent_name")
+                .and_then(serde_json::Value::as_str)
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+        }) {
+            map.insert(pane, pin);
+        }
     }
 
     /// Loud audit for panes no pin resolves (wave17-b: never silently skip
@@ -823,6 +909,7 @@ impl Host for RtHost {
                     .drain(..)
                     .map(|(pin, line)| Effect::Prompt { pin, line }),
             );
+            effects.extend(self.stalled_deferrals());
         }
         effects
     }
@@ -2712,5 +2799,74 @@ mod durable_tests {
         }
         assert!(prompt_rec.ran.lock().unwrap().is_empty());
         assert!(detached_rec.ran.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod bd_346jl_binding_tests {
+    use super::*;
+
+    /// A cross-session rex block bound by `flywheel arrive` has no spawn row;
+    /// the identity bridge is the only thing that names its pin, and without
+    /// it the pane is "unmapped" and its at-prompt transition never fires.
+    #[test]
+    fn a_bound_block_without_a_spawn_row_still_maps_to_its_pin() {
+        let mut map: HashMap<String, String> = HashMap::new();
+        map.insert("block:crew".into(), "CrewPin".into());
+        let panes = vec![
+            "block:crew".to_string(),
+            "block:01a1c323-captain".to_string(),
+            "block:unknown".to_string(),
+        ];
+        let extra = RtHost::bindings_for_unmapped(&map, &panes, |pane| {
+            (pane == "block:01a1c323-captain").then(|| "SlateHarbor".to_string())
+        });
+        assert_eq!(
+            extra,
+            vec![(
+                "block:01a1c323-captain".to_string(),
+                "SlateHarbor".to_string()
+            )],
+            "the bridge maps the foreign block; the unbound one stays unmapped"
+        );
+        for (pane, pin) in extra {
+            map.insert(pane, pin);
+        }
+        let agents = vec![
+            site_agent_for("block:01a1c323-captain", "idle"),
+            site_agent_for("block:unknown", "idle"),
+        ];
+        let (updates, unmapped) = RtHost::presence_updates_for(&agents, &map);
+        assert_eq!(
+            updates.len(),
+            1,
+            "the captain block is observed: {updates:?}"
+        );
+        assert_eq!(unmapped, vec!["block:unknown".to_string()]);
+    }
+
+    fn site_agent_for(pane: &str, status: &str) -> toron_core::pane_types::AgentInfo {
+        let mut row = toron_core::pane_types::AgentInfo {
+            agent: None,
+            agent_status: toron_core::pane_types::AgentStatus::Idle,
+            cwd: None,
+            display_agent: None,
+            focused: false,
+            foreground_cwd: None,
+            interactive_ready: false,
+            launch_pending: false,
+            name: None,
+            pane_id: pane.to_string(),
+            revision: 0,
+            state_change_seq: 0,
+            completion_seq: None,
+            state_labels: serde_json::Map::new(),
+            tab_id: String::new(),
+            terminal_id: String::new(),
+            terminal_title: None,
+            workspace_id: String::new(),
+        };
+        row.agent_status = status.parse().expect("status");
+        row
     }
 }
