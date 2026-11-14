@@ -43,10 +43,11 @@ mod doorbell_supervise;
 mod doorbell_tick;
 mod durable;
 mod envpin_hop;
+#[cfg(test)]
+pub(crate) use envpin_hop::{EnvPinSplitUnsupported, envpin_hop_split};
 pub(crate) use envpin_hop::{
-    EnvPinSplitUnsupported, EnvpinHop, EnvpinHopOutcome, RerouteEnvPin, envpin_hop_mail_identity,
-    envpin_hop_respawn, envpin_hop_split, envpin_respin_hop, envpin_split_refusal,
-    reroute_env_pin_verdict,
+    EnvpinHop, EnvpinHopOutcome, RerouteEnvPin, envpin_hop_respawn, envpin_respin_hop,
+    envpin_split_refusal, reroute_env_pin_verdict,
 };
 mod durable_body;
 mod durable_policy;
@@ -7614,22 +7615,6 @@ fn recipe_launch_command(recipe: &str, args: &[String]) -> String {
     }
     cmd
 }
-
-/// bd-qlr1: what a reroute means for a model that must be pinned by PANE ENV.
-///
-/// A reroute launches into an EXISTING pane. That pane's environment was fixed
-/// by the split that created it, and a process's env cannot be changed after
-/// it starts — so an env-delivered pin (`OPENCODE_CONFIG_CONTENT`) can never be
-/// re-applied here. There are exactly two cases, and only one is safe:
-///
-/// - the reroute keeps the SAME model the pane is already pinned to: the pane
-///   env already carries it, so the hop is genuinely satisfied. This is the
-///   common case (a profile fallback that only changes harness) and it must
-///   keep working — refusing it would break a working recovery path.
-/// - the reroute CHANGES the model: the pane still carries the old pin, so the
-///   agent would silently run the PREVIOUS model while the ledger records the
-///   new one. That is unsatisfiable, and it is refused by name rather than
-///   silently downgraded.
 
 /// Outcome of one reroute-site hop attempt: return the hopped agent, fail
 /// loud on a broken hop, rejoin the in-place reroute when the reconciler

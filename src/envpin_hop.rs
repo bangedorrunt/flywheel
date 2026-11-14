@@ -3,7 +3,6 @@
 //! journaled `RebindIntent`, respawn the pinned seat, and close the old pane
 //! only after the new one launches.
 
-use anyhow::anyhow;
 use std::time::Duration;
 
 use crate::config::Config;
