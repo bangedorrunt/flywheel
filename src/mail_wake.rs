@@ -185,6 +185,13 @@ impl MailWakeHost {
     /// with the flag unset and then poll beside the envelope host).
     pub fn spawn(cfg: crate::config::Config, project: String, workspace: String) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
+        if !mail_wake_owns(crate::comms_send::enabled(&cfg)) {
+            eprintln!(
+                "flywheel mail-wake: refused for {project}/{workspace} — the comms envelope \
+                 owns wakes while comms is enabled (ADR-0041: one door)"
+            );
+            return Self { stop, join: None };
+        }
         let st = Arc::clone(&stop);
         let join = std::thread::Builder::new()
             .name("flywheel-mail-wake".into())
