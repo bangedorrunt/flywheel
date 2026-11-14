@@ -495,6 +495,113 @@ pub(crate) fn doorbell_supervisor_key(project: &str) -> String {
     unit_slug(&crate::doorbell::canonical_project(project))
 }
 
+/// Units under `dir` that supervise the SAME canonical project under a
+/// non-canonical key (bd-bj9xk: chiebukuro was installed as both
+/// `dev.flywheel.doorbell.chiebukuro` and the path-splatted
+/// `…-users-…-workspace-chiebukuro`). Pure over the plist bodies so a test
+/// never needs a supervisor.
+pub(crate) fn stale_supervisor_units(
+    dir: &Path,
+    canonical: &str,
+) -> Vec<(String, std::path::PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(label) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !label.starts_with("dev.flywheel.doorbell.") {
+            continue;
+        }
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some(project) = plist_project_argument(&body) else {
+            continue;
+        };
+        if crate::doorbell::canonical_project(&project) != canonical {
+            continue;
+        }
+        if label == format!("dev.flywheel.doorbell.{canonical}") {
+            continue;
+        }
+        out.push((label.to_string(), path));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// The project argument of a `doorbell supervise <project>` unit, read from
+/// the plist's ProgramArguments (or its systemd ExecStart line).
+pub(crate) fn plist_project_argument(body: &str) -> Option<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        let value = if let Some(rest) = line.strip_prefix("<string>") {
+            rest.strip_suffix("</string>")
+        } else if let Some(rest) = line.strip_prefix("ExecStart=") {
+            Some(rest)
+        } else {
+            None
+        };
+        if let Some(value) = value {
+            tokens.extend(value.split_whitespace().map(str::to_string));
+        }
+    }
+    let at = tokens.iter().position(|t| t == "supervise")?;
+    tokens.get(at + 1).cloned()
+}
+
+/// Unload + remove every duplicate unit for this project, through the same
+/// supervisor port the install uses. Journal-first + audited; never fails the
+/// install because a stale unit refused to die.
+fn retire_stale_supervisor_units(project: &str, canonical: &str, state: &Path) -> Vec<String> {
+    let Ok(agents) = home_launch_agents() else {
+        return Vec::new();
+    };
+    let mut retired = Vec::new();
+    for (label, plist) in stale_supervisor_units(&agents, canonical) {
+        crate::doorbell::audit_append(
+            state,
+            &format!("supervisor-{canonical}"),
+            serde_json::json!({
+                "kind": "supervisor_stale_unit_retired",
+                "label": label,
+                "project": project,
+                "canonical": canonical,
+            }),
+        );
+        retire_unit(&label, &plist);
+        eprintln!(
+            "flywheel: retired stale supervisor unit {label} for project {project} (same project, non-canonical key)"
+        );
+        retired.push(label);
+    }
+    retired
+}
+
+/// Bootout + delete one plist through the supervisor CLI. Best-effort: a
+/// unit that already died is still removed from disk.
+fn retire_unit(label: &str, plist: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        let uid = current_uid();
+        let _ = Command::new("launchctl")
+            .args(["bootout", &format!("gui/{uid}/{label}")])
+            .output();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = Command::new("systemctl")
+            .args(["--user", "disable", "--now", &format!("{label}.service")])
+            .output();
+    }
+    let _ = std::fs::remove_file(plist);
+}
+
 pub fn install_doorbell_supervisor(
     cfg: &crate::config::Config,
     project: &str,
@@ -503,6 +610,7 @@ pub fn install_doorbell_supervisor(
     let project = project.as_str();
     let slug = doorbell_supervisor_key(project);
     let label = format!("dev.flywheel.doorbell.{slug}");
+    let _ = retire_stale_supervisor_units(project, &slug, &crate::config::state_dir());
     if unit_active(&label) {
         return Ok(());
     }
@@ -1115,6 +1223,59 @@ mod doorbell_supervisor_one_key_tests {
             "-users-op-workspace-chiebukuro",
             "the raw spelling is what produced the second unit"
         );
+    }
+
+    fn plist_with(project: &str) -> String {
+        format!(
+            "<plist><array>\n<string>/usr/local/bin/flywheel</string>\n<string>doorbell</string>\n<string>supervise</string>\n<string>{project}</string>\n</array></plist>\n"
+        )
+    }
+
+    /// bd-bj9xk: the migration finds a unit that supervises the SAME project
+    /// under a non-canonical key, and leaves the canonical one and other
+    /// projects alone. Fake supervisor dir only — never real LaunchAgents.
+    #[test]
+    fn stale_units_for_one_project_are_found_by_canonical_key() {
+        let dir = std::env::temp_dir().join(format!("fw-units-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("dev.flywheel.doorbell.chiebukuro.plist"),
+            plist_with("chiebukuro"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("dev.flywheel.doorbell.-users-op-workspace-chiebukuro.plist"),
+            plist_with("/Users/op/workspace/chiebukuro"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("dev.flywheel.doorbell.flywheel.plist"),
+            plist_with("flywheel"),
+        )
+        .unwrap();
+
+        let stale = stale_supervisor_units(&dir, "chiebukuro");
+        assert_eq!(
+            stale.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(),
+            vec!["dev.flywheel.doorbell.-users-op-workspace-chiebukuro"],
+            "only the non-canonical spelling is stale: {stale:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn project_argument_reads_plists_and_systemd_units() {
+        assert_eq!(
+            plist_project_argument(&plist_with("/Users/op/workspace/chiebukuro")).as_deref(),
+            Some("/Users/op/workspace/chiebukuro")
+        );
+        assert_eq!(
+            plist_project_argument("ExecStart=/usr/bin/flywheel doorbell supervise chiebukuro\n")
+                .as_deref(),
+            Some("chiebukuro")
+        );
+        assert_eq!(plist_project_argument("<plist></plist>"), None);
     }
 
     /// The install site folds the project, so the unit's argv carries the
