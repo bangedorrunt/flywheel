@@ -866,8 +866,15 @@ mod tests {
             out.contains("doorbell rings at the next prompt"),
             "the operator is told who rings: {out}"
         );
+        let hosted: std::collections::BTreeSet<String> =
+            ["BlueRidge".to_string()].into_iter().collect();
         assert_eq!(
-            crate::doorbell::drain_deferred_wakes(&crate::config::state_dir(), &project),
+            crate::doorbell::take_deferred_wakes(
+                &crate::config::state_dir(),
+                &project,
+                "session:01a1d257",
+                &hosted
+            ),
             vec![(
                 "BlueRidge".to_string(),
                 "[doorbell] plane-P mail. Pull: toron next".to_string()

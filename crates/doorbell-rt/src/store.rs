@@ -570,7 +570,20 @@ impl FileStore {
         workspace: &str,
         f: impl FnOnce(&std::fs::File) -> T,
     ) -> Result<T, std::io::Error> {
-        let path = self.journal_file(workspace).with_extension("lock");
+        self.with_file_lock(&self.journal_file(workspace), f)
+    }
+
+    /// The same exclusive cross-process lock, for any state file (bd-bj9xk
+    /// adjacent). A CLI handoff and its host drain share it, so a write can
+    /// never land between the other side's read and its rename. Open the file
+    /// INSIDE the closure: an fd opened before a rename keeps writing into the
+    /// moved inode, and that write would be read by nobody.
+    pub fn with_file_lock<T>(
+        &self,
+        path: &std::path::Path,
+        f: impl FnOnce(&std::fs::File) -> T,
+    ) -> Result<T, std::io::Error> {
+        let path = path.with_extension("lock");
         if let Some(parent) = path.parent() {
             private_dir(parent)?;
         }

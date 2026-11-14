@@ -884,9 +884,14 @@ impl Host for RtHost {
         };
         let mut deferred_cmds: Vec<workspace::Cmd> = Vec::new();
         if matches!(msg, BrainMsg::Sweep { .. }) {
-            for (pin, line) in
-                crate::doorbell::drain_deferred_wakes(&crate::config::state_dir(), &self.project)
-            {
+            let hosted: std::collections::BTreeSet<String> =
+                self.model.presence.keys().cloned().collect();
+            for (pin, line) in crate::doorbell::take_deferred_wakes(
+                &crate::config::state_dir(),
+                &self.project,
+                &self.workspace,
+                &hosted,
+            ) {
                 let (next, cmds) =
                     workspace::tick(&self.model, &workspace::Msg::PromptRefused { pin, line });
                 self.model = next;
@@ -2153,9 +2158,9 @@ mod off_runtime_tests {
     }
 
     /// The CLI knows the project, never the dispatcher's plane session id, so
-    /// the handoff is project-keyed: this host runs under a session workspace
-    /// and still folds the deferral into its one queue, then rings it on the
-    /// prompt transition.
+    /// the handoff is project-keyed; the host takes only the pins it hosts and
+    /// folds the wake into its one queue, then rings it on the prompt
+    /// transition.
     #[test]
     fn a_deferred_crew_wake_is_folded_and_rung_at_the_next_prompt() {
         let _home = crate::config::test_state_home();
@@ -2170,10 +2175,12 @@ mod off_runtime_tests {
         let (tx, _rx) = mpsc::channel(8);
         let mut host =
             RtHost::new(Config::default(), &project, "session:01a1d257", tx).expect("host");
-        host.model
-            .doorbell
-            .statuses
-            .insert("BlueRidge".into(), "working".into());
+        // A status is what makes this host the owner of the pin (presence is
+        // the same set `cover_rex_panes` seeds for its own workspace).
+        host.tick(&BrainMsg::PlaneStatus {
+            pin: "BlueRidge".into(),
+            status: "working".into(),
+        });
 
         let effects = host.tick(&BrainMsg::Sweep { now: 1 });
         assert!(
@@ -2202,6 +2209,60 @@ mod off_runtime_tests {
                 .iter()
                 .any(|e| matches!(e, Effect::Prompt { pin, .. } if pin == "BlueRidge")),
             "and rings the deferred line: {effects:?}"
+        );
+    }
+
+    /// One dispatcher per plane session (chiebukuro runs several). A host that
+    /// does not host the pin must leave the handoff for the host that does;
+    /// otherwise the wake is queued for a pane that host never prompts.
+    #[test]
+    fn a_foreign_pin_wake_is_left_for_the_host_that_owns_it() {
+        let _home = crate::config::test_state_home();
+        let project = format!("defer-two-{}", std::process::id());
+        crate::doorbell::append_deferred_wake(
+            &crate::config::state_dir(),
+            &project,
+            "BlueRidge",
+            &crate::doorbell::deferred_wake_line(),
+        )
+        .expect("record the deferral");
+        let (tx_a, _rx_a) = mpsc::channel(8);
+        let mut host_a =
+            RtHost::new(Config::default(), &project, "session:a", tx_a).expect("host a");
+        host_a.tick(&BrainMsg::PlaneStatus {
+            pin: "LilacChapel".into(),
+            status: "working".into(),
+        });
+        let (tx_b, _rx_b) = mpsc::channel(8);
+        let mut host_b =
+            RtHost::new(Config::default(), &project, "session:b", tx_b).expect("host b");
+        host_b.tick(&BrainMsg::PlaneStatus {
+            pin: "BlueRidge".into(),
+            status: "working".into(),
+        });
+
+        let a_effects = host_a.tick(&BrainMsg::Sweep { now: 1 });
+        assert!(
+            !a_effects
+                .iter()
+                .any(|e| matches!(e, Effect::Audit { kind, .. } if kind == "deferred")),
+            "the foreign host takes nothing: {a_effects:?}"
+        );
+        let b_effects = host_b.tick(&BrainMsg::Sweep { now: 1 });
+        assert!(
+            b_effects
+                .iter()
+                .any(|e| matches!(e, Effect::Audit { kind, pin, .. } if kind == "deferred" && pin == "BlueRidge")),
+            "the owning host queues it: {b_effects:?}"
+        );
+        let ring = host_b.tick(&BrainMsg::PlaneStatus {
+            pin: "BlueRidge".into(),
+            status: "idle".into(),
+        });
+        assert!(
+            ring.iter()
+                .any(|e| matches!(e, Effect::Prompt { pin, .. } if pin == "BlueRidge")),
+            "and rings it on the prompt transition: {ring:?}"
         );
     }
 

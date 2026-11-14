@@ -995,9 +995,10 @@ fn inject_budget_path(state_dir: &Path, project: &str) -> PathBuf {
     ))
 }
 
-/// A refused wake waiting for the project's live dispatcher. Keyed by PROJECT,
-/// never by workspace: the CLI cannot know the dispatcher's plane session id,
-/// and a workspace key is what made the deferral invisible to the host.
+/// A refused wake waiting for a live dispatcher. Keyed by PROJECT: the CLI
+/// cannot know the dispatcher's plane session id, and a workspace key is what
+/// made the deferral invisible to the host. The host that owns the pin takes
+/// it; every other dispatcher leaves it alone.
 fn deferred_wakes_path(state_dir: &Path, project: &str) -> PathBuf {
     state_dir.join(format!(
         "doorbell-deferred-{}.jsonl",
@@ -1015,44 +1016,105 @@ pub fn deferred_wake_line() -> String {
 
 /// Hand one refused wake to the live dispatcher. The host folds it as
 /// `PromptRefused`: a working pin queues it, and the next at-prompt status
-/// rings it.
+/// rings it. Written under the journal's cross-process lock, and the file is
+/// opened INSIDE the lock, so an append can never land between a drain's read
+/// and its rewrite.
 pub fn append_deferred_wake(
     state_dir: &Path,
     project: &str,
     pin: &str,
     line: &str,
 ) -> std::io::Result<()> {
-    use std::io::Write;
     let path = deferred_wakes_path(state_dir, project);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-    writeln!(f, "{}", serde_json::json!({ "pin": pin, "line": line }))
+    let mut row = serde_json::json!({ "pin": pin, "line": line }).to_string();
+    row.push('\n');
+    let store = doorbell_rt::FileStore::new(state_dir);
+    store.with_file_lock(&path, |_| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        f.write_all(row.as_bytes())?;
+        f.flush()
+    })?
 }
 
-/// Take the wakes this project's dispatcher has not folded yet. `rename` first
-/// so a concurrent append lands in a fresh file instead of being truncated.
-pub fn drain_deferred_wakes(state_dir: &Path, project: &str) -> Vec<(String, String)> {
+/// Take the wakes this host hosts, leaving the rest for the dispatcher that
+/// owns those pins (a project can run one dispatcher per plane session, and a
+/// host that takes a foreign pin's wake queues it for a pane it never
+/// prompts). Each taken wake is journaled BEFORE the handoff is rewritten, so
+/// a crash cannot drop it: the row is the durable record, and an unrewritten
+/// file simply re-drains (at-least-once).
+pub fn take_deferred_wakes(
+    state_dir: &Path,
+    project: &str,
+    workspace: &str,
+    hosted: &std::collections::BTreeSet<String>,
+) -> Vec<(String, String)> {
     let path = deferred_wakes_path(state_dir, project);
-    let taken = path.with_extension("draining");
-    if fs::rename(&path, &taken).is_err() {
-        return Vec::new();
+    let store = doorbell_rt::FileStore::new(state_dir);
+    let taken = store.with_file_lock(&path, |_| -> std::io::Result<Vec<(String, String)>> {
+        let Ok(raw) = fs::read_to_string(&path) else {
+            return Ok(Vec::new());
+        };
+        let mut mine: Vec<(String, String)> = Vec::new();
+        let mut rest = String::new();
+        for row in raw.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(row.trim()) else {
+                continue;
+            };
+            let entry = match (
+                v.get("pin").and_then(|p| p.as_str()),
+                v.get("line").and_then(|l| l.as_str()),
+            ) {
+                (Some(pin), Some(line)) => (pin.to_string(), line.to_string()),
+                _ => continue,
+            };
+            if hosted.contains(&entry.0) {
+                mine.push(entry);
+            } else {
+                rest.push_str(&v.to_string());
+                rest.push('\n');
+            }
+        }
+        if mine.is_empty() {
+            return Ok(Vec::new());
+        }
+        for (pin, line) in &mine {
+            let msg = crate::workspace::Msg::PromptRefused {
+                pin: pin.clone(),
+                line: line.clone(),
+            };
+            store
+                .append_journal(
+                    workspace,
+                    &serde_json::to_value(&msg).unwrap_or(serde_json::Value::Null),
+                    &serde_json::Value::Array(Vec::new()),
+                    serde_json::json!({ "stage": "handoff", "pin": pin }),
+                    std::slice::from_ref(pin),
+                )
+                .map_err(|e| std::io::Error::other(format!("journal the deferred wake: {e}")))?;
+        }
+        if rest.is_empty() {
+            let _ = fs::remove_file(&path);
+        } else {
+            let tmp = path.with_extension("rewrite");
+            fs::write(&tmp, rest)?;
+            fs::rename(&tmp, &path)?;
+        }
+        Ok(mine)
+    });
+    match taken {
+        Ok(Ok(entries)) => entries,
+        Ok(Err(e)) | Err(e) => {
+            eprintln!("flywheel: deferred wake handoff not drained (retried next sweep): {e}");
+            Vec::new()
+        }
     }
-    let raw = fs::read_to_string(&taken).unwrap_or_default();
-    let _ = fs::remove_file(&taken);
-    raw.lines()
-        .filter_map(|l| {
-            let v: serde_json::Value = serde_json::from_str(l.trim()).ok()?;
-            Some((
-                v.get("pin")?.as_str()?.to_string(),
-                v.get("line")?.as_str()?.to_string(),
-            ))
-        })
-        .collect()
 }
 
 pub fn inject_wake_in(
@@ -2527,37 +2589,98 @@ mod tests {
         assert!(out[0].1.contains("[doorbell]"));
     }
 
-    /// The deferral handoff is keyed by PROJECT: the CLI knows the project,
-    /// never the dispatcher's plane session id, and a workspace-keyed row is
-    /// what left the live deferral invisible. A host running under any
-    /// workspace id drains it; another project never sees it.
+    /// The handoff is keyed by PROJECT (the CLI knows no dispatcher session),
+    /// and a host takes only the pins it hosts: with one dispatcher per plane
+    /// session, a foreign pin's wake must survive for the host that can ring
+    /// it. The journal row is written before the file is rewritten, so a
+    /// crash re-drains instead of dropping.
     #[test]
-    fn a_deferred_wake_is_scoped_by_project_not_workspace() {
+    fn a_deferred_wake_goes_to_the_host_that_owns_the_pin() {
         let dir = std::env::temp_dir().join(format!("fw-defer-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let line = deferred_wake_line();
         append_deferred_wake(&dir, "flywheel", "BlueRidge", &line).expect("record");
+        append_deferred_wake(&dir, "flywheel", "LilacChapel", &line).expect("record");
+        let hosted: std::collections::BTreeSet<String> =
+            ["BlueRidge".to_string()].into_iter().collect();
 
         assert!(
-            drain_deferred_wakes(&dir, "session:01a1d257-5b3f-711d-a203-536c92281ed9").is_empty(),
-            "the handoff is not keyed by the dispatcher's workspace"
-        );
-        assert!(
-            drain_deferred_wakes(&dir, "other-project").is_empty(),
+            take_deferred_wakes(&dir, "other-project", "session:a", &hosted).is_empty(),
             "another project never drains this project's wakes"
         );
         assert_eq!(
-            drain_deferred_wakes(&dir, "flywheel"),
+            take_deferred_wakes(&dir, "flywheel", "session:a", &hosted),
             vec![("BlueRidge".to_string(), line.clone())],
-            "the project's dispatcher takes it, whatever workspace it runs under"
+            "the host takes its own pin's wake"
         );
-        assert!(
-            drain_deferred_wakes(&dir, "flywheel").is_empty(),
-            "a drained handoff is not re-rung"
+        assert_eq!(
+            take_deferred_wakes(&dir, "flywheel", "session:b", &hosted),
+            Vec::new(),
+            "a taken wake is not re-rung"
+        );
+        let left = take_deferred_wakes(
+            &dir,
+            "flywheel",
+            "session:b",
+            &["LilacChapel".to_string()].into_iter().collect(),
+        );
+        assert_eq!(
+            left,
+            vec![("LilacChapel".to_string(), line.clone())],
+            "the foreign pin's wake survived for the host that owns it"
         );
         assert!(
             doorbell_core::is_mail_wake(&line),
             "the deferred line survives the routine-chatter drop: {line}"
+        );
+        let journal = std::fs::read_to_string(
+            dir.join("journals")
+                .join("doorbell-journal-session:a.jsonl"),
+        )
+        .expect("the taken wake is journaled before the file is rewritten");
+        assert!(
+            journal.contains("\"PromptRefused\"") && journal.contains("BlueRidge"),
+            "journal row before removal: {journal}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Appends and the drain share one cross-process lock, and the appender
+    /// opens the file INSIDE it: a writer that opened before a drain's rewrite
+    /// would append into a moved inode and be read by nobody. Every line must
+    /// end up either taken (journaled) or still pending.
+    #[test]
+    fn concurrent_appends_survive_a_drain() {
+        let dir = std::env::temp_dir().join(format!("fw-defer-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let line = deferred_wake_line();
+        let total = 160usize;
+        let hosted: std::collections::BTreeSet<String> =
+            ["BlueRidge".to_string()].into_iter().collect();
+        let mut taken = 0usize;
+        std::thread::scope(|scope| {
+            for t in 0..8 {
+                let dir = dir.clone();
+                let line = line.clone();
+                scope.spawn(move || {
+                    for i in 0..total / 8 {
+                        let pin = format!("BlueRidge");
+                        let _ = (t, i);
+                        append_deferred_wake(&dir, "flywheel", &pin, &line).expect("append");
+                    }
+                });
+            }
+            scope.spawn(|| {
+                for _ in 0..40 {
+                    taken += take_deferred_wakes(&dir, "flywheel", "session:race", &hosted).len();
+                }
+            });
+        });
+        let left = take_deferred_wakes(&dir, "flywheel", "session:race", &hosted).len();
+        assert_eq!(
+            taken + left,
+            total,
+            "no append may be lost between a read and a rewrite (taken {taken}, left {left})"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
