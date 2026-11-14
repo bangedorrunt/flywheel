@@ -418,7 +418,19 @@ pub(crate) fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
     } else {
         format!(" unpinned={}", unpinned.join(","))
     };
+    // bd-bj9xk: name a dead session row instead of hiding it. The live plane
+    // list this host can prove today is the snapshot's own session id.
+    let live_ids: Vec<String> = if live_id.is_empty() {
+        Vec::new()
+    } else {
+        vec![live_id.clone()]
+    };
     for ws in canonical_workspaces(&workspaces, &live_label, &live_id) {
+        let gone = match dispatcher_gone(&ws, &live_ids) {
+            Some(GoneReason::SessionAbsent) => " gone=session-absent",
+            Some(GoneReason::LabelAlias) => " gone=label-alias",
+            None => "",
+        };
         let alias = workspaces
             .iter()
             .find(|raw| raw.as_str() != ws && doorbell_host_key(raw, &live_label, &live_id) == ws)
@@ -440,7 +452,7 @@ pub(crate) fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
         let wake_brain =
             wake_brain_status_segment(doorbell_rt::wake_brain::read_snapshot(&state_dir, &ws));
         println!(
-            "{project}/{ws}{alias}: dispatcher {} {last}{}{}{}{wake_brain}",
+            "{project}/{ws}{alias}{gone}: dispatcher {} {last}{}{}{}{wake_brain}",
             if alive { "up" } else { "DOWN" },
             {
                 let pins = crate::doorbell::read_unanswered(&crate::doorbell::unanswered_file(
