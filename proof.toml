@@ -1,0 +1,19 @@
+# clean-proof sibling pins (bd-v6j35).
+#
+# `scripts/clean-proof.sh --sha <rev>` proves ONE revision of this repo against
+# these exact sibling revisions, archived from their own git objects — never
+# against a sibling's dirty working tree. Each `path` is relative to this repo
+# root and must keep the directory name its Cargo path deps use (`../toron`,
+# `../elm-effect-rs`).
+#
+# Bump a `rev` only together with the code that needs it (a toron API move, an
+# elm-effect bump), and re-run the proof. Reviewers read this file to know what
+# a green proof actually covered.
+
+[[sibling]]
+path = "../toron"
+rev = "d41d2f82801f90d91ccaf46fc089708ae1fa90ce"
+
+[[sibling]]
+path = "../elm-effect-rs"
+rev = "3387c446ee5a0a2729274415272587d98d085fb8"
