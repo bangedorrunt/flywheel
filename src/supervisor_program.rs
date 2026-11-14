@@ -1158,10 +1158,10 @@ fn seat_model_by_env(harness: &str) -> bool {
     )
 }
 
-fn seat_effect_key(effect: &SeatEffect) -> String {
+pub(crate) fn seat_effect_key(effect: &SeatEffect) -> String {
     match effect {
         SeatEffect::Keep { pin } => format!("seat:keep:{pin}"),
-        SeatEffect::Relaunch { pin, fields } => {
+        SeatEffect::Relaunch { pin, fields, .. } => {
             format!("seat:relaunch:{pin}:{}", fields.join(","))
         }
         SeatEffect::Respawn { pin, fields, .. } => {

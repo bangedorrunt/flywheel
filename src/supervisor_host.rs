@@ -1634,15 +1634,26 @@ impl Ports for LivePorts {
     }
 
     /// The one seat interpreter. Retirement closes the pane only: the pin and
-    /// its reservations stay (ADR-0022 D7), and every other effect is a typed
-    /// failure until its binder lands.
+    /// its reservations stay (ADR-0022 D7). Relaunch/Respawn go through
+    /// [`Self::seat_rebind`]. `InjectRole`/`Spawn` stay typed failures until
+    /// their binder lands.
     fn seat(&mut self, effect: &crate::seat_reconcile::SeatEffect) -> Result<(), String> {
         use crate::seat_reconcile::SeatEffect;
+        if let SeatEffect::Relaunch { pin, fields, to } = effect {
+            return self.seat_rebind(pin, fields, to.as_ref(), false);
+        }
+        if let SeatEffect::Respawn {
+            pin, fields, to, ..
+        } = effect
+        {
+            return self.seat_rebind(pin, fields, to.as_ref(), true);
+        }
         let pins: Vec<String> = match effect {
             SeatEffect::RetireIdle { pin } | SeatEffect::RetireAfterTurn { pin } => {
                 vec![pin.clone()]
             }
             SeatEffect::Retire { pins } => pins.clone(),
+            SeatEffect::Keep { .. } => return Ok(()),
             other => {
                 return Err(format!(
                     "seat effect {other:?} is not implemented by the live interpreter yet"
@@ -1666,6 +1677,91 @@ impl Ports for LivePorts {
                 "flywheel supervisor: retired idle seat {pin} ({pane}); pin and reservations kept"
             );
         }
+        Ok(())
+    }
+}
+
+impl LivePorts {
+    /// Relaunch/Respawn one seat into the target binding (ADR-0022 D7). A
+    /// respawn journals one `RebindIntent` (Prepared → InFlight → Settled)
+    /// before the pane work; a relaunch is argv delivery, so the Seat journal
+    /// row is its record. The registry row moves only after the new pane
+    /// launches (see [`crate::cmd::internal::respawn_binding`]).
+    fn seat_rebind(
+        &mut self,
+        pin: &str,
+        fields: &[String],
+        to: Option<&crate::seat_reconcile::DesiredSeat>,
+        journal_rebind: bool,
+    ) -> Result<(), String> {
+        let registry = crate::state::load_spawn_registry(&self.project);
+        let entry = registry
+            .iter()
+            .find(|e| e.mail_identity.as_deref() == Some(pin) || e.name == pin)
+            .ok_or_else(|| format!("seat rebind: no SpawnEntry for pin {pin}"))?
+            .clone();
+        let to =
+            to.ok_or_else(|| format!("seat rebind {pin}: the effect carries no target binding"))?;
+        let backend = crate::backend::multiplexer_backend(&self.cfg)
+            .map_err(|e| format!("seat rebind {pin}: plane: {e}"))?;
+        let project = self.project.clone();
+        let cfg = self.cfg.clone();
+        let name = entry.name.clone();
+        let launch = |backend: &dyn crate::backend::MultiplexerBackend| {
+            crate::cmd::internal::respawn_binding(
+                backend,
+                &cfg,
+                &project,
+                &name,
+                &to.harness,
+                true,
+                Some(to),
+            )
+            .map(|_| ())
+            .map_err(|e| format!("seat rebind {pin}: {e:#}"))
+        };
+        if journal_rebind {
+            let from = crate::agent_ref::AgentBinding {
+                profile_name: entry.profile.clone().unwrap_or_default(),
+                model: entry
+                    .model
+                    .clone()
+                    .or(entry.model_pin.clone())
+                    .unwrap_or_default(),
+                harness: entry.harness.clone().unwrap_or_default(),
+                location: crate::agent_ref::BindingLocation::Pane,
+            };
+            let target = crate::agent_ref::AgentBinding {
+                profile_name: to.role.clone(),
+                model: to.model.clone().unwrap_or_default(),
+                harness: to.harness.clone(),
+                location: crate::agent_ref::BindingLocation::Pane,
+            };
+            let intent = crate::agent_ref::RebindIntent::prepare(
+                crate::agent_ref::AgentRef::new(&project, pin),
+                from,
+                target,
+                crate::agent_ref::RebindReason::CaptainRequest {
+                    note: format!("swarm apply --patch: {}", fields.join(",")),
+                },
+                0,
+            );
+            crate::agent_ref::commit_rebind(&project, intent, |_| {
+                launch(&*backend).map_err(|e| anyhow::anyhow!(e))
+            })
+            .map_err(|e| format!("seat respawn {pin}: {e:#}"))?;
+        } else {
+            launch(&*backend)?;
+        }
+        eprintln!(
+            "flywheel supervisor: {} seat {pin} ({})",
+            if journal_rebind {
+                "respawned"
+            } else {
+                "relaunched"
+            },
+            fields.join(",")
+        );
         Ok(())
     }
 }

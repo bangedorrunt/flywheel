@@ -1023,8 +1023,27 @@ pub(crate) fn respawn_with_backend(
     kind: &str,
     force: bool,
 ) -> Result<()> {
+    respawn_binding(backend, cfg, project, name, kind, force, None).map(|_| ())
+}
+
+/// Respawn `name` into the binding `to` (ADR-0022 D7 seat effects): a fresh
+/// pane launched with the target harness/model/effort. An env-delivered model
+/// pins the new pane's env (hc and rex), because a process env is fixed at
+/// creation. The registry row is updated only after the new pane launches, so
+/// a failed launch leaves the old binding visible. `to: None` keeps the
+/// historical respawn (profile args, no binding change).
+pub(crate) fn respawn_binding(
+    backend: &dyn backend::MultiplexerBackend,
+    cfg: &Config,
+    project: &str,
+    name: &str,
+    kind: &str,
+    force: bool,
+    to: Option<&crate::seat_reconcile::DesiredSeat>,
+) -> Result<AgentInfo> {
     let ws_id = find_workspace_dyn(backend, project)?;
     let dir = project_dir(cfg, project);
+    let kind = to.map(|w| w.harness.as_str()).unwrap_or(kind);
     let agents = backend.agent_list()?;
     if !force
         && let Some(a) = agents
@@ -1033,19 +1052,22 @@ pub(crate) fn respawn_with_backend(
     {
         let healthy = matches!(a.agent_status.as_str(), "idle" | "working" | "blocked");
         if healthy {
-            print_json(&json!({
-                "already_exists": true,
-                "name": name,
-                "pane_id": a.pane_id,
-            }));
-            return Ok(());
+            if to.is_none() {
+                print_json(&json!({
+                    "already_exists": true,
+                    "name": name,
+                    "pane_id": a.pane_id,
+                }));
+            }
+            return Ok(a.clone());
         }
     }
     let agent = agents
         .into_iter()
         .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name));
     let old_pane = agent.as_ref().map(|a| a.pane_id.clone());
-    let same_pane = kind == "omp";
+    let same_pane = kind == "omp" && to.is_none();
+    let mut launched = false;
     let new_pane = if same_pane {
         old_pane.clone().ok_or_else(|| {
             anyhow!("omp respawn for {name} in {project}: no live pane to restart in")
@@ -1062,13 +1084,17 @@ pub(crate) fn respawn_with_backend(
             })
             .or_else(|| panes.first().map(|p| p.pane_id.clone()))
             .ok_or_else(|| anyhow!("no pane in {project} to split for respawn"))?;
-        let pane = backend.pane_split(&anchor, "down", Some(&utf8_path(&dir, "workspace dir")?))?;
+        let (pane, done) = split_for_binding(backend, cfg, project, name, &anchor, to, &dir)?;
+        launched = done;
         if let Some(old) = &old_pane {
             let _ = backend.pane_close(old);
         }
-        pane.pane_id
+        pane
     };
-    let args = respawn_launch_args(cfg, project, name, kind);
+    let args = match to {
+        Some(want) => binding_args(want).0,
+        None => respawn_launch_args(cfg, project, name, kind),
+    };
     let profile = project_dir_str(cfg, project)
         .ok()
         .and_then(|key| {
@@ -1077,18 +1103,39 @@ pub(crate) fn respawn_with_backend(
                 .find(|e| e.name == name)
         })
         .and_then(|e| e.profile);
-    let fresh = start_agent_with_retry_dyn_profile(
-        backend,
-        name,
-        kind,
-        &new_pane,
-        &args,
-        LaunchCtx {
-            profile_name: profile.as_deref(),
-            project: Some(project),
-            cfg: Some(cfg),
-        },
-    )?;
+    let fresh = if launched {
+        backend
+            .agent_list()?
+            .into_iter()
+            .find(|a| a.pane_id == new_pane)
+            .ok_or_else(|| anyhow!("rex seat relaunch on {new_pane} did not register an agent"))?
+    } else {
+        start_agent_with_retry_dyn_profile(
+            backend,
+            name,
+            kind,
+            &new_pane,
+            &args,
+            LaunchCtx {
+                profile_name: profile.as_deref(),
+                project: Some(project),
+                cfg: Some(cfg),
+            },
+        )?
+    };
+    if let Some(want) = to
+        && let Ok(key) = project_dir_str(cfg, project)
+    {
+        let mut entries = state::load_spawn_registry(&key);
+        if let Some(e) = entries.iter_mut().find(|e| e.name == name) {
+            e.pane_id = fresh.pane_id.clone();
+            e.incarnation += 1;
+            e.harness = Some(want.harness.clone());
+            e.model = want.model.clone();
+            e.model_pin = want.model.clone();
+        }
+        state::save_spawn_registry(&key, &entries)?;
+    }
     if !same_pane
         && let Ok(mail) = backend::mail_backend(cfg)
         && let Some(key) = dir.to_str()
@@ -1109,13 +1156,112 @@ pub(crate) fn respawn_with_backend(
             );
         }
     }
-    println!(
-        "respawned {} {} -> {}",
-        kind_paint(kind),
-        old_pane.as_deref().unwrap_or("<gone>"),
-        fresh.pane_id
+    if to.is_none() {
+        println!(
+            "respawned {} {} -> {}",
+            kind_paint(kind),
+            old_pane.as_deref().unwrap_or("<gone>"),
+            fresh.pane_id
+        );
+    }
+    Ok(fresh)
+}
+
+/// The argv and env pin a binding launches with: model/effort through the
+/// one interactive plan, then the harness's mode args. `mode` is not a
+/// registry column today, so it is delivered but not re-derivable from the
+/// plan tier (`shortcut: effort/mode are launch-only until SpawnEntry carries
+/// them, add the columns then`).
+fn binding_args(want: &crate::seat_reconcile::DesiredSeat) -> (Vec<String>, Option<String>) {
+    let plan = crate::headless::interactive_model_plan(
+        &want.harness,
+        want.model.as_deref().unwrap_or(""),
+        want.effort.as_deref(),
     );
-    Ok(())
+    let mut args = plan.args().to_vec();
+    if let Some(mode) = want.mode.as_deref() {
+        let (mode_args, _) = crate::headless::mode_launch_args(&want.harness, mode);
+        args.extend(mode_args);
+    }
+    (args, plan.env_pin().map(str::to_string))
+}
+
+/// Split a fresh pane for a seat rebind. An env-delivered model rides the new
+/// pane's env (hc: split env; rex: `pane_run` with an env prefix) because a
+/// process env is fixed at creation. Anything else is a plain split.
+fn split_for_binding(
+    backend: &dyn backend::MultiplexerBackend,
+    cfg: &Config,
+    project: &str,
+    name: &str,
+    anchor: &str,
+    to: Option<&crate::seat_reconcile::DesiredSeat>,
+    dir: &std::path::Path,
+) -> Result<(String, bool)> {
+    let Some(want) = to else {
+        return Ok((
+            backend
+                .pane_split(anchor, "down", Some(&utf8_path(dir, "workspace dir")?))?
+                .pane_id,
+            false,
+        ));
+    };
+    let (args, env_pin) = binding_args(want);
+    let Some(model) = env_pin.as_deref() else {
+        return Ok((
+            backend
+                .pane_split(anchor, "down", Some(&utf8_path(dir, "workspace dir")?))?
+                .pane_id,
+            false,
+        ));
+    };
+    let identity = crate::state::load_spawn_registry(project)
+        .into_iter()
+        .find(|e| e.name == name)
+        .and_then(|e| e.mail_identity)
+        .filter(|p| !p.is_empty());
+    let env = crate::pane::pane_env_for_launch(cfg, identity.as_deref(), Some(model))?;
+    if backend.name() == "hc" {
+        let c = crate::hc::Client::connect(Some(&cfg.socket_path()))?;
+        let pane = crate::hc::pane_split(
+            &c,
+            anchor,
+            "down",
+            Some(&utf8_path(dir, "workspace dir")?),
+            Some(&env),
+        )?;
+        return Ok((pane.pane_id, false));
+    }
+    let pane = backend.pane_split(anchor, "down", Some(&utf8_path(dir, "workspace dir")?))?;
+    crate::pane::wait_rex_shell_ready(
+        backend,
+        &pane.pane_id,
+        name,
+        &pane.pane_id,
+        std::time::Duration::from_secs(15),
+    )?;
+    let command = crate::pane::rex_env_command(&env, &want.harness, &args);
+    if let Err(e) = backend.pane_run(&pane.pane_id, &command) {
+        let _ = backend.pane_close(&pane.pane_id);
+        return Err(anyhow!("rex seat relaunch run on {}: {e}", pane.pane_id));
+    }
+    if let Err(e) = backend.agent_rename(&pane.pane_id, Some(name)) {
+        eprintln!(
+            "flywheel: warn: rex seat relaunch rename {} → {name} failed: {e}",
+            pane.pane_id
+        );
+    }
+    backend
+        .agent_wait(
+            &pane.pane_id,
+            &[
+                toron_plane::backend::AgentStatus::Idle,
+                toron_plane::backend::AgentStatus::Working,
+            ],
+            Some(90_000),
+        )
+        .map_err(|e| anyhow!("rex seat relaunch on {} not confirmed: {e}", pane.pane_id))?;
+    Ok((pane.pane_id, true))
 }
 
 /// bd-ude8: respawn argv = the agent's registry-pinned profile launch args

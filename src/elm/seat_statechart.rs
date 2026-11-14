@@ -345,6 +345,7 @@ mod tests {
             &SeatEvent::Patch(SeatEffect::Relaunch {
                 pin: "a".into(),
                 fields: vec!["effort".into()],
+                to: None,
             }),
         );
         assert_eq!(out.configuration.primary(), Some(&SeatState::Relaunching));
@@ -363,6 +364,7 @@ mod tests {
             &SeatEvent::Patch(SeatEffect::Relaunch {
                 pin: "a".into(),
                 fields: vec!["model".into()],
+                to: None,
             }),
         );
         assert_eq!(out.configuration.primary(), Some(&SeatState::Respawning));
@@ -386,6 +388,7 @@ mod tests {
             &SeatEvent::Patch(SeatEffect::Relaunch {
                 pin: "a".into(),
                 fields: vec!["model".into(), "effort".into()],
+                to: None,
             }),
         );
         assert_eq!(out.configuration.primary(), Some(&SeatState::Respawning));
@@ -401,6 +404,7 @@ mod tests {
                 pin: "a".into(),
                 fields: vec!["harness".into()],
                 context_fresh: true,
+                to: None,
             }),
         );
         assert_eq!(out.configuration.primary(), Some(&SeatState::Respawning));
@@ -589,6 +593,7 @@ mod tests {
             SeatEvent::Patch(SeatEffect::Relaunch {
                 pin: "a".into(),
                 fields: vec!["effort".into()],
+                to: None,
             }),
             SeatEvent::Ready,
         ];

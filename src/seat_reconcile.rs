@@ -40,11 +40,18 @@ pub enum SeatEffect {
     Relaunch {
         pin: String,
         fields: Vec<String>,
+        /// The desired binding the relaunch lands (ADR-0022 D7): the
+        /// interpreter needs the target, not just the field names.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<DesiredSeat>,
     },
     Respawn {
         pin: String,
         fields: Vec<String>,
         context_fresh: bool,
+        /// The desired binding the respawn lands.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<DesiredSeat>,
     },
     InjectRole {
         pin: String,
@@ -189,6 +196,7 @@ fn decide_one(
                 pin,
                 fields: vec!["role".to_string()],
                 context_fresh: true,
+                to: Some(desired.clone()),
             };
         }
         return SeatEffect::Respawn {
@@ -203,6 +211,7 @@ fn decide_one(
                 f
             },
             context_fresh: true,
+            to: Some(desired.clone()),
         };
     }
     if desired.harness != live.harness {
@@ -216,6 +225,7 @@ fn decide_one(
             pin,
             fields,
             context_fresh: true,
+            to: Some(desired.clone()),
         };
     }
     let model_diff = desired.model != live.model;
@@ -234,9 +244,14 @@ fn decide_one(
                 pin,
                 fields,
                 context_fresh: true,
+                to: Some(desired.clone()),
             };
         }
-        return SeatEffect::Relaunch { pin, fields };
+        return SeatEffect::Relaunch {
+            pin,
+            fields,
+            to: Some(desired.clone()),
+        };
     }
     if effort_diff || mode_diff {
         let mut fields = Vec::new();
@@ -246,7 +261,11 @@ fn decide_one(
         if mode_diff {
             fields.push("mode".to_string());
         }
-        return SeatEffect::Relaunch { pin, fields };
+        return SeatEffect::Relaunch {
+            pin,
+            fields,
+            to: Some(desired.clone()),
+        };
     }
     if desired.placement == SeatPlacement::Headless && live.placement == SeatPlacement::Pane {
         return SeatEffect::RetireAfterTurn { pin };
@@ -495,7 +514,7 @@ mod tests {
         let mut want = want("coder");
         want.harness = "h".to_string();
         assert_eq!(
-            reconcile(&[want], &live, &argv, &ReconcilePolicy::default()),
+            reconcile(&[want.clone()], &live, &argv, &ReconcilePolicy::default()),
             vec![SeatEffect::Keep {
                 pin: "a".to_string()
             }]
@@ -510,10 +529,11 @@ mod tests {
         want.harness = "pi".to_string();
         want.model = Some("m2".to_string());
         assert_eq!(
-            reconcile(&[want], &[live], &argv, &ReconcilePolicy::default()),
+            reconcile(&[want.clone()], &[live], &argv, &ReconcilePolicy::default()),
             vec![SeatEffect::Relaunch {
                 pin: "a".to_string(),
-                fields: vec!["model".to_string()]
+                fields: vec!["model".to_string()],
+                to: Some(want),
             }]
         );
     }
@@ -526,11 +546,12 @@ mod tests {
         want.harness = "opencode".to_string();
         want.model = Some("m2".to_string());
         assert_eq!(
-            reconcile(&[want], &[live], &env, &ReconcilePolicy::default()),
+            reconcile(&[want.clone()], &[live], &env, &ReconcilePolicy::default()),
             vec![SeatEffect::Respawn {
                 pin: "a".to_string(),
                 fields: vec!["model".to_string()],
-                context_fresh: true
+                context_fresh: true,
+                to: Some(want),
             }]
         );
     }
@@ -541,11 +562,12 @@ mod tests {
         let mut want = want("coder");
         want.harness = "opencode".to_string();
         assert_eq!(
-            reconcile(&[want], &[live], &argv, &ReconcilePolicy::default()),
+            reconcile(&[want.clone()], &[live], &argv, &ReconcilePolicy::default()),
             vec![SeatEffect::Respawn {
                 pin: "a".to_string(),
                 fields: vec!["harness".to_string()],
-                context_fresh: true
+                context_fresh: true,
+                to: Some(want),
             }]
         );
     }
@@ -558,7 +580,7 @@ mod tests {
         want.pin = Some("a".to_string());
         want.context_warm_allowed = true;
         assert_eq!(
-            reconcile(&[want], &[live], &argv, &ReconcilePolicy::default()),
+            reconcile(&[want.clone()], &[live], &argv, &ReconcilePolicy::default()),
             vec![SeatEffect::InjectRole {
                 pin: "a".to_string(),
                 role: "reviewer".to_string()
@@ -574,11 +596,12 @@ mod tests {
         want.pin = Some("a".to_string());
         want.context_warm_allowed = false;
         assert_eq!(
-            reconcile(&[want], &[live], &argv, &ReconcilePolicy::default()),
+            reconcile(&[want.clone()], &[live], &argv, &ReconcilePolicy::default()),
             vec![SeatEffect::Respawn {
                 pin: "a".to_string(),
                 fields: vec!["role".to_string()],
-                context_fresh: true
+                context_fresh: true,
+                to: Some(want),
             }]
         );
     }
@@ -656,7 +679,7 @@ mod tests {
         let mut want = want("coder");
         want.harness = "opencode".to_string();
         want.model = Some("m2".to_string());
-        let got = reconcile(&[want], &[live], &argv, &ReconcilePolicy::default());
+        let got = reconcile(&[want.clone()], &[live], &argv, &ReconcilePolicy::default());
         assert_eq!(got.len(), 1);
         assert!(matches!(got[0], SeatEffect::Respawn { .. }));
     }

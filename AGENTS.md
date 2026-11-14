@@ -22,6 +22,10 @@ mbx +nightly-aarch64-apple-darwin install --path crates/doorbell-cli --force
 # one command for all installed binaries (flywheel, toron):
 flywheel stack install
 flywheel stack status --check
+# ADR-0022 rollout 6: front the plan, a live patch, and the live seat view
+flywheel swarm plan <project> [spawn flags]      # byte-equal to spawn --dry-run --json
+flywheel swarm apply <project> --patch <seat>.<field>=<value>   # reconciler -> Ports::seat
+flywheel swarm status [<project>] [--json]       # live seats + plane status
 # after `br close`: bead id in HEAD, clean .beads, committed closed row, legal verdict
 flywheel ship check <bead-id>
 # clean-export proof over intended files; add --tests for the doorbell suite
@@ -118,6 +122,11 @@ pass.
   topology-only and no model checker runs. `scripts/clean-proof.sh` gates on it.
 - **Standing preferences (ADR-0022 D6).** `flywheel prefer <role.field>=<value> [--project <p>]` +
   `--list [--json]` / `--forget <role.field>`; project beats always, exact role beats `*`.
+- **Live seat change (ADR-0022 D7/rollout 6).** One mechanism: `flywheel swarm apply
+  <project> --patch <seat>.<field>=<value>` → pure reconciler → the one `Ports::seat`
+  interpreter, journal-first (respawn journals one `RebindIntent`). `binding-rebind
+  --model` routes here; never a second apply path. `swarm plan` is byte-identical to
+  `spawn --dry-run --json`; `swarm status` lists live seats.
 - **Skill sync.** CLI change → `Commands` enum + `--robot-capabilities` + this
   file's critical list + `~/.agents/skills/flywheel/SKILL.md` §5.
 

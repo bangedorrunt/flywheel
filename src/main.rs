@@ -148,13 +148,13 @@ use cmd::{
     AgentCmd, ArtifactsCmd, BackendCmd, CaptainCmd, CheckpointCmd, CoalitionCmd, ConfigCmd,
     CrewCmd, CronCmd, DoorbellCmd, JudgmentCmd, LedgerCmd, LoopCmd, MailCmd, MemoryCmd, ModelCmd,
     PeerCmd, PolicyCmd, PrinciplesCmd, ProfileCmd, RunsCmd, ShipCmd, SlotCmd, SquadCmd, StackCmd,
-    StageCmd, StandingOrdersCmd, WorkCmd, WorkflowCmd, WorktreeCmd, XprojCmd, cmd_agent,
+    StageCmd, StandingOrdersCmd, SwarmCmd, WorkCmd, WorkflowCmd, WorktreeCmd, XprojCmd, cmd_agent,
     cmd_analytics, cmd_audit, cmd_backend, cmd_captain, cmd_changes, cmd_checkpoint, cmd_config,
     cmd_crew, cmd_doorbell_digest, cmd_doorbell_gc, cmd_doorbell_inject, cmd_doorbell_introduce,
     cmd_doorbell_re_inject, cmd_doorbell_roster, cmd_doorbell_start, cmd_doorbell_status,
     cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_history, cmd_internal_doorbell, cmd_judgment,
     cmd_ledger, cmd_mail, cmd_memory, cmd_models, cmd_peer, cmd_policy, cmd_prefer, cmd_principles,
-    cmd_resume, cmd_runs, cmd_ship, cmd_slot, cmd_stack, cmd_stage, cmd_standing_orders,
+    cmd_resume, cmd_runs, cmd_ship, cmd_slot, cmd_stack, cmd_stage, cmd_standing_orders, cmd_swarm,
     cmd_timeline, cmd_work, cmd_worktree, cmd_xproj,
     coalition::cmd_coalition,
     cron::cmd_cron,
@@ -851,6 +851,13 @@ enum Commands {
         /// seats or fields fail naming the valid ones.
         #[arg(long, value_name = "SEAT.FIELD=VALUE")]
         patch: Vec<String>,
+    },
+    /// ADR-0022 rollout 6: front the plan (`plan`), a live patch (`apply`),
+    /// and the live seat view (`status`). `plan` prints the same
+    /// flywheel-plan.v1 object as `spawn --dry-run --json`.
+    Swarm {
+        #[command(subcommand)]
+        cmd: SwarmCmd,
     },
     /// Extend a running swarm with more agent panes
     Add {
@@ -2995,6 +3002,7 @@ fn main() {
             "commands": [
                 "init spawn add list status decide rebind recover",
                 "spawn <project> [--kind K=N ...] [--dry-run --json] [--patch <seat>.<field>=<value> (repeatable; re-resolves the seat with from: user)] [--model harness-default leaves the harness's own model untouched] [--yes] (ADR-0022 plan spawn; see --help for the full flag list)",
+                "swarm plan <project> [spawn flags] | swarm apply <project> --patch <seat>.<field>=<value> [--json] | swarm status [<project>] [--json] (ADR-0022 rollout 6: plan prints the SAME flywheel-plan.v1 object as `spawn --dry-run --json`; apply is the D7 one mechanism — patch -> pure reconciler -> the one `Ports::seat` interpreter, journal-first; `binding-rebind --model` routes here; status lists live seats with the plane's status)",
             "send interrupt view output watch attach kill",
             "prefer <role.field>=<value> [--project <p>] | prefer --list [--json] | prefer --forget <role.field> [--project <p>] (ADR-0022 D6: standing preferences — project beats always, exact role beats *; set also records a chie lesson)",
             "crew preview|control|prompt (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker)",
@@ -3134,6 +3142,7 @@ fn main() {
                 patches: patch.clone(),
             },
         ),
+        Some(Commands::Swarm { cmd }) => cmd_swarm(&cfg, cmd),
         Some(Commands::Add {
             project,
             counts,
@@ -5179,24 +5188,25 @@ mod serve_port_tests {
 
 #[cfg(test)]
 mod gs043_residual_honesty_tests {
-    /// MEDIUM invent-green: binding-rebind --model must fail-loud before Settled
-    /// while SpawnEntry.model has no spawn/pane/headless consumer.
+    /// ADR-0022 rollout 6: `binding-rebind --model` routes through the one
+    /// seat reconciler (`swarm apply --patch`) — never a write-only
+    /// SpawnEntry.model Settled.
     #[test]
-    fn binding_rebind_model_fails_loud_not_write_only_settled() {
+    fn binding_rebind_model_routes_through_swarm_apply() {
         let src = include_str!("main.rs");
         let start = crate::tripwire::find_fn(src, "cmd_binding_rebind");
         let body = &src[start..start.saturating_add(4500)];
         assert!(
-            body.contains("--model refused (fail-loud)"),
-            "cmd_binding_rebind must fail-loud on --model before Settled"
+            body.contains("cmd_swarm_apply"),
+            "cmd_binding_rebind must delegate --model to swarm apply"
+        );
+        assert!(
+            body.contains("swarm apply --patch"),
+            "the delegation must name the one mechanism"
         );
         assert!(
             !body.contains("e.model = Some(m.to_string())"),
             "must not Settled a write-only SpawnEntry.model write"
-        );
-        assert!(
-            body.contains("Never invent Settled"),
-            "error must name invent-Settled refusal"
         );
     }
 
@@ -11861,7 +11871,6 @@ fn cmd_binding_rebind(
     harness: Option<&str>,
     note: Option<&str>,
 ) -> Result<()> {
-    let _ = cfg;
     let current = state::load_spawn_registry_strict(project).map_err(|e| anyhow!("{e}"))?;
     let mut entries = state::merge_registry_for_mutation(project, current);
     let idx = entries
@@ -11906,10 +11915,19 @@ fn cmd_binding_rebind(
             bail!("binding-rebind: unknown profile {p:?} (flywheel profile list)");
         }
     }
-    if model.is_some() {
-        bail!(
-            "binding-rebind: --model refused (fail-loud) — live model override is not wired into spawn/pane/headless dispatch (SpawnEntry.model is write-only). Use `flywheel profile set --model …` for catalog SoT, or pass --profile/--harness only. Never invent Settled."
-        );
+    if let Some(m) = model {
+        // ADR-0022 D7/rollout 6: a live model change is the seat reconciler's
+        // job, not a registry write. `swarm apply --patch` is that one path.
+        if profile.is_some() {
+            bail!(
+                "binding-rebind: --model rides `swarm apply --patch <pin>.model=…`; a profile change is a role rebind, not a model patch — run them separately"
+            );
+        }
+        let mut patches = vec![format!("{pin}.model={m}")];
+        if let Some(h) = harness {
+            patches.push(format!("{pin}.harness={h}"));
+        }
+        return crate::cmd::swarm::cmd_swarm_apply(cfg, project, &patches, false);
     }
     let intent = agent_ref::RebindIntent::prepare(
         agent,
