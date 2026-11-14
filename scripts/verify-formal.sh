@@ -85,8 +85,10 @@ run_tlc() { # model cfg
   local model="$1" cfg="$2" dir="$WORK/$1-$2"
   mkdir -p "$dir"
   cp "$MODELS/$model.tla" "$MODELS/$cfg.cfg" "$dir/"
+  # -metadir keeps TLC's states/ under the temp dir; the run also happens there,
+  # so a check never writes into the repo (bd-wum95).
   ( cd "$dir" && "$JAVA" -cp "$JAR" tlc2.TLC -workers 1 -deadlock \
-      -config "$cfg.cfg" "$model.tla" ) >"$dir/out.log" 2>&1
+      -metadir "$dir/meta" -config "$cfg.cfg" "$model.tla" ) >"$dir/out.log" 2>&1
 }
 
 passed=0
