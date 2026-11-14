@@ -1572,8 +1572,8 @@ pub(crate) fn review_bind(
             let pin = e.mail_identity.clone().filter(|p| !p.is_empty())?;
             Some(LiveSeat {
                 pin,
-                role: e.profile.clone().unwrap_or_else(|| "crew".into()),
-                harness: e.harness.clone().unwrap_or_default(),
+                role: e.profile.clone().unwrap_or_else(|| "crew".into()).into(),
+                harness: e.harness.clone().unwrap_or_default().into(),
                 model: e.model.clone().or_else(|| e.model_pin.clone()),
                 mode: None,
                 effort: None,
@@ -1597,7 +1597,7 @@ pub(crate) fn review_bind(
     let author_model = author.and_then(|e| e.model.clone().or_else(|| e.model_pin.clone()));
     let candidates: Vec<String> = seats
         .iter()
-        .filter(|s| s.role == profile_name)
+        .filter(|s| s.role.as_str() == profile_name)
         .filter_map(|s| s.model.clone())
         .collect();
     let registry = crate::models::ModelRegistry::default();

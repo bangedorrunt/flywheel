@@ -1130,7 +1130,7 @@ pub(crate) fn respawn_binding(
         if let Some(e) = entries.iter_mut().find(|e| e.name == name) {
             e.pane_id = fresh.pane_id.clone();
             e.incarnation += 1;
-            e.harness = Some(want.harness.clone());
+            e.harness = Some(want.harness.to_string());
             e.model = want.model.clone();
             e.model_pin = want.model.clone();
             e.effort = want.effort.clone();
@@ -1176,13 +1176,13 @@ pub(crate) fn respawn_binding(
 /// them, add the columns then`).
 fn binding_args(want: &crate::seat_reconcile::DesiredSeat) -> (Vec<String>, Option<String>) {
     let plan = crate::headless::interactive_model_plan(
-        &want.harness,
+        want.harness.as_str(),
         want.model.as_deref().unwrap_or(""),
         want.effort.as_deref(),
     );
     let mut args = plan.args().to_vec();
     if let Some(mode) = want.mode.as_deref() {
-        let (mode_args, _) = crate::headless::mode_launch_args(&want.harness, mode);
+        let (mode_args, _) = crate::headless::mode_launch_args(want.harness.as_str(), mode);
         args.extend(mode_args);
     }
     (args, plan.env_pin().map(str::to_string))
@@ -1242,7 +1242,7 @@ fn split_for_binding(
         &pane.pane_id,
         std::time::Duration::from_secs(15),
     )?;
-    let command = crate::pane::rex_env_command(&env, &want.harness, &args);
+    let command = crate::pane::rex_env_command(&env, want.harness.as_str(), &args);
     if let Err(e) = backend.pane_run(&pane.pane_id, &command) {
         let _ = backend.pane_close(&pane.pane_id);
         return Err(anyhow!("rex seat relaunch run on {}: {e}", pane.pane_id));

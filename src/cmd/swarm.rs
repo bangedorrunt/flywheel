@@ -158,8 +158,8 @@ fn cmd_swarm_plan(cfg: &Config, project: &str, args: PlanArgs) -> Result<()> {
 pub(crate) struct SeatRow {
     pub pin: String,
     pub name: String,
-    pub role: String,
-    pub harness: String,
+    pub role: crate::kernel::SeatRole,
+    pub harness: crate::kernel::SeatHarness,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub mode: Option<String>,
@@ -186,8 +186,12 @@ pub(crate) fn seat_rows(registry: &[SpawnEntry], agents: &[(String, String)]) ->
             Some(SeatRow {
                 pin,
                 name: e.name.clone(),
-                role: e.profile.clone().unwrap_or_else(|| "crew".to_string()),
-                harness: e.harness.clone().unwrap_or_default(),
+                role: e
+                    .profile
+                    .clone()
+                    .unwrap_or_else(|| "crew".to_string())
+                    .into(),
+                harness: e.harness.clone().unwrap_or_default().into(),
                 model: e.model.clone().or_else(|| e.model_pin.clone()),
                 effort: e.effort.clone(),
                 mode: e.mode.clone(),
@@ -372,6 +376,14 @@ pub(crate) fn dispatch_effects(
     rep
 }
 
+fn field_names(fields: &[crate::seat_reconcile::SeatField]) -> String {
+    fields
+        .iter()
+        .map(|f| f.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn effect_json(effect: &SeatEffect) -> serde_json::Value {
     serde_json::to_value(effect).unwrap_or(serde_json::Value::Null)
 }
@@ -379,10 +391,10 @@ fn effect_json(effect: &SeatEffect) -> serde_json::Value {
 fn effect_line(effect: &SeatEffect) -> String {
     match effect {
         SeatEffect::Relaunch { pin, fields, .. } => {
-            format!("relaunch {pin} ({})", fields.join(","))
+            format!("relaunch {pin} ({})", field_names(fields))
         }
         SeatEffect::Respawn { pin, fields, .. } => {
-            format!("respawn {pin} ({})", fields.join(","))
+            format!("respawn {pin} ({})", field_names(fields))
         }
         SeatEffect::RetireIdle { pin } | SeatEffect::RetireAfterTurn { pin } => {
             format!("retire {pin}")
@@ -420,13 +432,15 @@ fn patched_desired(
         let matched: Vec<usize> = rows
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.pin == patch.seat || r.role == patch.seat || r.name == patch.seat)
+            .filter(|(_, r)| {
+                r.pin == patch.seat || r.role.as_str() == patch.seat || r.name == patch.seat
+            })
             .map(|(i, _)| i)
             .collect();
         if matched.is_empty() {
             let mut names: Vec<String> = rows
                 .iter()
-                .flat_map(|r| [r.pin.clone(), r.role.clone(), r.name.clone()])
+                .flat_map(|r| [r.pin.clone(), r.role.as_str().to_string(), r.name.clone()])
                 .collect();
             names.sort();
             names.dedup();
@@ -440,7 +454,7 @@ fn patched_desired(
             let seat = &mut desired[i];
             match patch.field {
                 crate::swarm_plan::PatchField::Harness => {
-                    seat.harness = patch.value.clone();
+                    seat.harness = patch.value.clone().into();
                 }
                 crate::swarm_plan::PatchField::Model => {
                     seat.model = Some(patch.value.clone());
@@ -455,9 +469,10 @@ fn patched_desired(
                     // A review/verify seat (current OR target) must not inherit
                     // context: the reconciler respawns instead of injecting.
                     let current_fresh = crate::seat_reconcile::role_is_fresh(&seat.role);
-                    seat.role = patch.value.clone();
+                    let target = crate::kernel::SeatRole::from(patch.value.as_str());
+                    seat.role = target.clone();
                     seat.context_warm_allowed =
-                        !current_fresh && !crate::seat_reconcile::role_is_fresh(&patch.value);
+                        !current_fresh && !crate::seat_reconcile::role_is_fresh(&target);
                 }
             }
         }
@@ -473,7 +488,7 @@ fn patched_desired(
         if delta == 0 {
             continue;
         }
-        let Some(template) = rows.iter().find(|r| r.role == role) else {
+        let Some(template) = rows.iter().find(|r| r.role.as_str() == role) else {
             let mut names: Vec<&str> = rows.iter().map(|r| r.role.as_str()).collect();
             names.sort();
             names.dedup();
@@ -486,13 +501,13 @@ fn patched_desired(
         for _ in 0..delta {
             desired.push(DesiredSeat {
                 pin: None,
-                role: role.to_string(),
+                role: role.into(),
                 harness: template.harness.clone(),
                 model: template.model.clone(),
                 effort: template.effort.clone(),
                 mode: template.mode.clone(),
                 placement: SeatPlacement::Pane,
-                context_warm_allowed: !crate::seat_reconcile::role_is_fresh(role),
+                context_warm_allowed: !crate::seat_reconcile::role_is_fresh(&role.into()),
             });
         }
     }
@@ -971,7 +986,7 @@ mod tests {
                 .collect();
         assert_eq!(effects.len(), 1, "one non-Keep effect: {effects:?}");
         assert!(
-            matches!(&effects[0], SeatEffect::Spawn { role, count } if role == "coder" && *count == 1),
+            matches!(&effects[0], SeatEffect::Spawn { role, count } if role.as_str() == "coder" && *count == 1),
             "count grows the role: {effects:?}"
         );
     }

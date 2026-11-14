@@ -1162,10 +1162,24 @@ pub(crate) fn seat_effect_key(effect: &SeatEffect) -> String {
     match effect {
         SeatEffect::Keep { pin } => format!("seat:keep:{pin}"),
         SeatEffect::Relaunch { pin, fields, .. } => {
-            format!("seat:relaunch:{pin}:{}", fields.join(","))
+            format!(
+                "seat:relaunch:{pin}:{}",
+                fields
+                    .iter()
+                    .map(|f| f.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
         }
         SeatEffect::Respawn { pin, fields, .. } => {
-            format!("seat:respawn:{pin}:{}", fields.join(","))
+            format!(
+                "seat:respawn:{pin}:{}",
+                fields
+                    .iter()
+                    .map(|f| f.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
         }
         SeatEffect::InjectRole { pin, role } => format!("seat:inject:{pin}:{role}"),
         SeatEffect::Spawn { role, count } => format!("seat:spawn:{role}:{count}"),

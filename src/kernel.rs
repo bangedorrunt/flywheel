@@ -32,6 +32,66 @@ validated_text!(Corr, "correlation id");
 validated_text!(AgentPin, "agent pin");
 validated_text!(WorkflowName, "workflow name");
 
+/// A seat role (a profile name like `coder`/`reviewer`). Law 11: internal
+/// code holds the typed value; the string exists only at the wire.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct SeatRole(String);
+
+/// A seat harness (`pi`, `opencode`, ...). Empty is allowed for a legacy row
+/// with no recorded harness (the reconciler then sees "no harness").
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct SeatHarness(String);
+
+macro_rules! seat_text {
+    ($name:ident, $label:literal, $allow_empty:expr) => {
+        impl $name {
+            /// Parse a wire/registry value. Rejects control characters; role
+            /// also rejects empty (a harness may be empty on a legacy row).
+            pub(crate) fn parse(value: impl Into<String>) -> Result<Self, KernelError> {
+                let value = value.into();
+                if !$allow_empty && value.trim().is_empty() {
+                    return Err(KernelError::Empty($label));
+                }
+                if value.chars().any(char::is_control) {
+                    return Err(KernelError::ControlCharacter($label));
+                }
+                Ok(Self(value))
+            }
+
+            pub(crate) fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl From<String> for $name {
+            fn from(value: String) -> Self {
+                Self(value)
+            }
+        }
+
+        impl From<&str> for $name {
+            fn from(value: &str) -> Self {
+                Self(value.to_string())
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+    };
+}
+
+seat_text!(SeatRole, "seat role", false);
+seat_text!(SeatHarness, "seat harness", true);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectPath(PathBuf);
 

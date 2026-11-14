@@ -71,7 +71,7 @@ fn hop_allowed(ctx: &SeatContext, kind: FailureKind, evidence: &str) -> bool {
 fn patch_is_model_relaunch(event: &SeatEvent) -> bool {
     match event {
         SeatEvent::Patch(SeatEffect::Relaunch { fields, .. }) => {
-            fields.iter().any(|f| f == "model")
+            fields.contains(&crate::seat_reconcile::SeatField::Model)
         }
         _ => false,
     }
@@ -161,7 +161,7 @@ impl StatechartDefinition for SeatProgramDef {
                         if let SeatEvent::Patch(SeatEffect::InjectRole { role, .. }) = e {
                             q.exec(SeatCmd::InjectRole {
                                 pin: ctx.pin.clone(),
-                                role: role.clone(),
+                                role: role.to_string(),
                             });
                             q.exec(SeatCmd::Journal {
                                 key: format!("{}:inject", ctx.pin),
@@ -344,7 +344,7 @@ mod tests {
             &ms,
             &SeatEvent::Patch(SeatEffect::Relaunch {
                 pin: "a".into(),
-                fields: vec!["effort".into()],
+                fields: vec![crate::seat_reconcile::SeatField::Effort],
                 to: None,
             }),
         );
@@ -363,7 +363,7 @@ mod tests {
             &ms,
             &SeatEvent::Patch(SeatEffect::Relaunch {
                 pin: "a".into(),
-                fields: vec!["model".into()],
+                fields: vec![crate::seat_reconcile::SeatField::Model],
                 to: None,
             }),
         );
@@ -387,7 +387,10 @@ mod tests {
             &ms,
             &SeatEvent::Patch(SeatEffect::Relaunch {
                 pin: "a".into(),
-                fields: vec!["model".into(), "effort".into()],
+                fields: vec![
+                    crate::seat_reconcile::SeatField::Model,
+                    crate::seat_reconcile::SeatField::Effort,
+                ],
                 to: None,
             }),
         );
@@ -402,7 +405,7 @@ mod tests {
             &ms,
             &SeatEvent::Patch(SeatEffect::Respawn {
                 pin: "a".into(),
-                fields: vec!["harness".into()],
+                fields: vec![crate::seat_reconcile::SeatField::Harness],
                 context_fresh: true,
                 to: None,
             }),
@@ -592,7 +595,7 @@ mod tests {
             SeatEvent::Ready,
             SeatEvent::Patch(SeatEffect::Relaunch {
                 pin: "a".into(),
-                fields: vec!["effort".into()],
+                fields: vec![crate::seat_reconcile::SeatField::Effort],
                 to: None,
             }),
             SeatEvent::Ready,

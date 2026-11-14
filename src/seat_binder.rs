@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::kernel::{SeatHarness, SeatRole};
 use crate::stages::StageContext;
 
 /// A step's needs, from its stage contract with step overrides.
@@ -36,8 +37,8 @@ pub enum SeatPlacement {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveSeat {
     pub pin: String,
-    pub role: String,
-    pub harness: String,
+    pub role: SeatRole,
+    pub harness: SeatHarness,
     pub model: Option<String>,
     /// StageMode vocabulary (`read-only` | `workspace-write` | `isolated`).
     pub mode: Option<String>,
@@ -75,11 +76,11 @@ pub enum Binding {
 }
 
 fn matches(need: &StepNeed, seat: &LiveSeat) -> bool {
-    if need.role != seat.role {
+    if need.role != seat.role.as_str() {
         return false;
     }
     if let Some(h) = &need.harness
-        && seat.harness != *h
+        && seat.harness.as_str() != h
     {
         return false;
     }
@@ -103,7 +104,7 @@ fn is_author(need: &StepNeed, pin: &str) -> bool {
 fn diff_fields(need: &StepNeed, seat: &LiveSeat) -> Vec<String> {
     let mut fields = Vec::new();
     if let Some(h) = &need.harness
-        && seat.harness != *h
+        && seat.harness.as_str() != h
     {
         fields.push("harness".to_string());
     }
@@ -123,7 +124,10 @@ fn diff_fields(need: &StepNeed, seat: &LiveSeat) -> Vec<String> {
 /// Pure fold: which live seat serves this step. Candidates are pin-ordered,
 /// so a replay binds the same way. Never borrows another role's seat.
 pub fn bind(need: &StepNeed, seats: &[LiveSeat], policy: &BindPolicy) -> Binding {
-    let mut same_role: Vec<&LiveSeat> = seats.iter().filter(|s| s.role == need.role).collect();
+    let mut same_role: Vec<&LiveSeat> = seats
+        .iter()
+        .filter(|s| s.role.as_str() == need.role)
+        .collect();
     same_role.sort_by(|a, b| a.pin.cmp(&b.pin));
 
     let non_author: Vec<&LiveSeat> = same_role
@@ -231,8 +235,8 @@ mod tests {
     fn seat(pin: &str, role: &str, idle: bool, fresh: bool) -> LiveSeat {
         LiveSeat {
             pin: pin.to_string(),
-            role: role.to_string(),
-            harness: "h".to_string(),
+            role: role.to_string().into(),
+            harness: "h".to_string().into(),
             model: None,
             mode: None,
             effort: None,
@@ -315,8 +319,8 @@ mod tests {
         let need = need("coder", StageContext::Fresh);
         let seats = vec![LiveSeat {
             pin: "a".to_string(),
-            role: "coder".to_string(),
-            harness: "h".to_string(),
+            role: "coder".to_string().into(),
+            harness: "h".to_string().into(),
             model: None,
             mode: None,
             effort: None,
@@ -333,8 +337,8 @@ mod tests {
         let need = need("coder", StageContext::Fresh);
         let seats = vec![LiveSeat {
             pin: "a".to_string(),
-            role: "coder".to_string(),
-            harness: "h".to_string(),
+            role: "coder".to_string().into(),
+            harness: "h".to_string().into(),
             model: None,
             mode: None,
             effort: None,
@@ -374,8 +378,8 @@ mod tests {
         };
         let seats = vec![LiveSeat {
             pin: "a".to_string(),
-            role: "coder".to_string(),
-            harness: "h1".to_string(),
+            role: "coder".to_string().into(),
+            harness: "h1".to_string().into(),
             model: Some("m1".to_string()),
             mode: Some("read-only".to_string()),
             effort: None,
@@ -402,8 +406,8 @@ mod tests {
         let need = need("coder", StageContext::Fresh);
         let seats = vec![LiveSeat {
             pin: "a".to_string(),
-            role: "coder".to_string(),
-            harness: "h".to_string(),
+            role: "coder".to_string().into(),
+            harness: "h".to_string().into(),
             model: None,
             mode: None,
             effort: None,

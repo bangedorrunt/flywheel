@@ -1462,8 +1462,8 @@ impl Ports for LivePorts {
             let model = e.model.clone().or_else(|| e.model_pin.clone());
             desired.push(crate::seat_reconcile::DesiredSeat {
                 pin: Some(pin.clone()),
-                role: role.clone(),
-                harness: harness.clone(),
+                role: role.as_str().into(),
+                harness: harness.as_str().into(),
                 model: model.clone(),
                 effort: e.effort.clone(),
                 mode: e.mode.clone(),
@@ -1472,8 +1472,8 @@ impl Ports for LivePorts {
             });
             live.push(crate::seat_binder::LiveSeat {
                 pin: pin.clone(),
-                role,
-                harness,
+                role: role.as_str().into(),
+                harness: harness.as_str().into(),
                 model,
                 mode: e.mode.clone(),
                 effort: e.effort.clone(),
@@ -1696,7 +1696,7 @@ impl LivePorts {
     fn seat_rebind(
         &mut self,
         pin: &str,
-        fields: &[String],
+        fields: &[crate::seat_reconcile::SeatField],
         to: Option<&crate::seat_reconcile::DesiredSeat>,
         journal_rebind: bool,
     ) -> Result<(), String> {
@@ -1719,7 +1719,7 @@ impl LivePorts {
                 &cfg,
                 &project,
                 &name,
-                &to.harness,
+                to.harness.as_str(),
                 true,
                 Some(to),
             )
@@ -1738,9 +1738,9 @@ impl LivePorts {
                 location: crate::agent_ref::BindingLocation::Pane,
             };
             let target = crate::agent_ref::AgentBinding {
-                profile_name: to.role.clone(),
+                profile_name: to.role.to_string(),
                 model: to.model.clone().unwrap_or_default(),
-                harness: to.harness.clone(),
+                harness: to.harness.to_string(),
                 location: crate::agent_ref::BindingLocation::Pane,
             };
             let intent = crate::agent_ref::RebindIntent::prepare(
@@ -1748,7 +1748,7 @@ impl LivePorts {
                 from,
                 target,
                 crate::agent_ref::RebindReason::CaptainRequest {
-                    note: format!("swarm apply --patch: {}", fields.join(",")),
+                    note: format!("swarm apply --patch: {}", seat_field_names(fields)),
                 },
                 0,
             );
@@ -1766,7 +1766,7 @@ impl LivePorts {
             } else {
                 "relaunched"
             },
-            fields.join(",")
+            seat_field_names(fields)
         );
         Ok(())
     }
@@ -1776,19 +1776,23 @@ impl LivePorts {
     /// ([`crate::cmd::internal::respawn_binding`]), so there is no second
     /// spawn implementation; the effect journal row (`seat:spawn:<role>:<n>`)
     /// makes a retry idempotent.
-    fn seat_spawn(&mut self, role: &str, count: usize) -> Result<(), String> {
+    fn seat_spawn(&mut self, role: &crate::kernel::SeatRole, count: usize) -> Result<(), String> {
         let backend = crate::backend::multiplexer_backend(&self.cfg)
             .map_err(|e| format!("seat spawn {role}: plane: {e}"))?;
-        spawn_seats(&*backend, &self.cfg, &self.project, role, count)
+        spawn_seats(&*backend, &self.cfg, &self.project, role.as_str(), count)
     }
 
     /// Morph a live seat's role with ONE prompt turn (ADR-0022 D7
     /// `InjectRole`). Review/verify roles are `context:fresh` by rule, so they
     /// are refused here even if a caller bypasses the reconciler.
-    fn seat_inject_role(&mut self, pin: &str, role: &str) -> Result<(), String> {
+    fn seat_inject_role(
+        &mut self,
+        pin: &str,
+        role: &crate::kernel::SeatRole,
+    ) -> Result<(), String> {
         let backend = crate::backend::multiplexer_backend(&self.cfg)
             .map_err(|e| format!("seat inject {pin}: plane: {e}"))?;
-        inject_role_into(&*backend, &self.project, pin, role)
+        inject_role_into(&*backend, &self.project, pin, role.as_str())
     }
 }
 
@@ -1842,8 +1846,8 @@ pub(crate) fn spawn_seats(
         let mail = crate::pinned_mail_identity(cfg, project, &name, &harness);
         let want = crate::seat_reconcile::DesiredSeat {
             pin: Some(name.clone()),
-            role: role.to_string(),
-            harness: harness.clone(),
+            role: role.into(),
+            harness: harness.clone().into(),
             model: model.clone(),
             effort: effort.clone(),
             mode: None,
@@ -1887,7 +1891,7 @@ pub(crate) fn inject_role_into(
     pin: &str,
     role: &str,
 ) -> Result<(), String> {
-    if crate::seat_reconcile::role_is_fresh(role) {
+    if crate::seat_reconcile::role_is_fresh(&crate::kernel::SeatRole::from(role)) {
         return Err(format!(
             "seat inject {pin} -> {role}: review/verify seats are context:fresh; respawn instead of injecting"
         ));
@@ -1897,7 +1901,9 @@ pub(crate) fn inject_role_into(
         .iter()
         .find(|e| e.mail_identity.as_deref() == Some(pin) || e.name == pin)
         .ok_or_else(|| format!("seat inject: no SpawnEntry for pin {pin}"))?;
-    if crate::seat_reconcile::role_is_fresh(entry.profile.as_deref().unwrap_or("")) {
+    if crate::seat_reconcile::role_is_fresh(&crate::kernel::SeatRole::from(
+        entry.profile.as_deref().unwrap_or(""),
+    )) {
         return Err(format!(
             "seat inject {pin} -> {role}: the live seat is a review/verify seat (context:fresh)"
         ));
@@ -1908,6 +1914,14 @@ pub(crate) fn inject_role_into(
         .map_err(|e| format!("seat inject {pin} -> {role}: {e:#}"))?;
     eprintln!("flywheel supervisor: injected role {role} into {pin}");
     Ok(())
+}
+
+fn seat_field_names(fields: &[crate::seat_reconcile::SeatField]) -> String {
+    fields
+        .iter()
+        .map(|f| f.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The one-turn role-morph prompt: the profile's own preamble when the

@@ -9,15 +9,41 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::config::parse_idle_retire_after;
+use crate::kernel::{SeatHarness, SeatRole};
 use crate::seat_binder::{LiveSeat, SeatPlacement};
+
+/// One field a seat effect rewrites (law 11: a closed typed set; the wire
+/// spelling is the old lowercase string, so JSON is byte-identical).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SeatField {
+    Harness,
+    Model,
+    Effort,
+    Mode,
+    Role,
+}
+
+impl SeatField {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Harness => "harness",
+            Self::Model => "model",
+            Self::Effort => "effort",
+            Self::Mode => "mode",
+            Self::Role => "role",
+        }
+    }
+}
 
 /// Desired seat.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesiredSeat {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin: Option<String>,
-    pub role: String,
-    pub harness: String,
+    pub role: SeatRole,
+    pub harness: SeatHarness,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -39,7 +65,7 @@ pub enum SeatEffect {
     },
     Relaunch {
         pin: String,
-        fields: Vec<String>,
+        fields: Vec<SeatField>,
         /// The desired binding the relaunch lands (ADR-0022 D7): the
         /// interpreter needs the target, not just the field names.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -47,7 +73,7 @@ pub enum SeatEffect {
     },
     Respawn {
         pin: String,
-        fields: Vec<String>,
+        fields: Vec<SeatField>,
         context_fresh: bool,
         /// The desired binding the respawn lands.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -55,10 +81,10 @@ pub enum SeatEffect {
     },
     InjectRole {
         pin: String,
-        role: String,
+        role: SeatRole,
     },
     Spawn {
-        role: String,
+        role: SeatRole,
         count: usize,
     },
     Retire {
@@ -80,26 +106,26 @@ pub enum SeatEffect {
 /// role-only change respawns instead of injecting. Role names are the proxy
 /// the plan tier has (the registry carries no stage contract).
 #[must_use]
-pub fn role_is_fresh(role: &str) -> bool {
+pub fn role_is_fresh(role: &SeatRole) -> bool {
     matches!(
-        role.trim().to_ascii_lowercase().as_str(),
+        role.as_str().trim().to_ascii_lowercase().as_str(),
         "reviewer" | "verifier" | "review" | "verify"
     )
 }
 
-fn diff_fields(desired: &DesiredSeat, live: &LiveSeat) -> Vec<String> {
+fn diff_fields(desired: &DesiredSeat, live: &LiveSeat) -> Vec<SeatField> {
     let mut fields = Vec::new();
     if desired.harness != live.harness {
-        fields.push("harness".to_string());
+        fields.push(SeatField::Harness);
     }
     if desired.model != live.model {
-        fields.push("model".to_string());
+        fields.push(SeatField::Model);
     }
     if desired.effort != live.effort {
-        fields.push("effort".to_string());
+        fields.push(SeatField::Effort);
     }
     if desired.mode != live.mode {
-        fields.push("mode".to_string());
+        fields.push(SeatField::Mode);
     }
     fields
 }
@@ -206,7 +232,7 @@ fn decide_one(
             }
             return SeatEffect::Respawn {
                 pin,
-                fields: vec!["role".to_string()],
+                fields: vec![SeatField::Role],
                 context_fresh: true,
                 to: Some(desired.clone()),
             };
@@ -214,9 +240,9 @@ fn decide_one(
         return SeatEffect::Respawn {
             pin,
             fields: {
-                let mut f = vec!["role".to_string()];
+                let mut f = vec![SeatField::Role];
                 for extra in diff_fields(desired, live) {
-                    if extra != "role" && !f.contains(&extra) {
+                    if extra != SeatField::Role && !f.contains(&extra) {
                         f.push(extra);
                     }
                 }
@@ -227,9 +253,9 @@ fn decide_one(
         };
     }
     if desired.harness != live.harness {
-        let mut fields = vec!["harness".to_string()];
+        let mut fields = vec![SeatField::Harness];
         for extra in diff_fields(desired, live) {
-            if extra != "harness" {
+            if extra != SeatField::Harness {
                 fields.push(extra);
             }
         }
@@ -244,14 +270,14 @@ fn decide_one(
     let effort_diff = desired.effort != live.effort;
     let mode_diff = desired.mode != live.mode;
     if model_diff {
-        let mut fields = vec!["model".to_string()];
+        let mut fields = vec![SeatField::Model];
         if effort_diff {
-            fields.push("effort".to_string());
+            fields.push(SeatField::Effort);
         }
         if mode_diff {
-            fields.push("mode".to_string());
+            fields.push(SeatField::Mode);
         }
-        if model_by_env(&live.harness) {
+        if model_by_env(live.harness.as_str()) {
             return SeatEffect::Respawn {
                 pin,
                 fields,
@@ -268,10 +294,10 @@ fn decide_one(
     if effort_diff || mode_diff {
         let mut fields = Vec::new();
         if effort_diff {
-            fields.push("effort".to_string());
+            fields.push(SeatField::Effort);
         }
         if mode_diff {
-            fields.push("mode".to_string());
+            fields.push(SeatField::Mode);
         }
         return SeatEffect::Relaunch {
             pin,
@@ -323,16 +349,16 @@ pub fn reconcile(
                 let effect = apply_idle_retire(
                     decide_one(want, got, model_by_env),
                     got,
-                    &want.role,
+                    want.role.as_str(),
                     policy,
                     &desired_count,
                     &live_count,
                     &mut retiring_count,
                 );
-                effects.push((want.role.clone(), pin.clone(), effect));
+                effects.push((want.role.as_str().to_string(), pin.clone(), effect));
             } else {
                 effects.push((
-                    want.role.clone(),
+                    want.role.as_str().to_string(),
                     pin.clone(),
                     SeatEffect::Spawn {
                         role: want.role.clone(),
@@ -342,7 +368,7 @@ pub fn reconcile(
             }
         } else {
             desired_no_pin_by_role
-                .entry(want.role.clone())
+                .entry(want.role.as_str().to_string())
                 .or_default()
                 .push(want);
         }
@@ -352,7 +378,7 @@ pub fn reconcile(
     for seat in live {
         if !used_live.contains(&seat.pin) {
             live_unmatched_by_role
-                .entry(seat.role.clone())
+                .entry(seat.role.as_str().to_string())
                 .or_default()
                 .push(seat);
         }
@@ -397,7 +423,7 @@ pub fn reconcile(
                 let effect = apply_idle_retire(
                     decide_one(wants[i], remaining[i], model_by_env),
                     remaining[i],
-                    &role,
+                    role.as_str(),
                     policy,
                     &desired_count,
                     &live_count,
@@ -421,7 +447,7 @@ pub fn reconcile(
             let effect = apply_idle_retire(
                 decide_one(wants[i], haves[i], model_by_env),
                 haves[i],
-                &role,
+                role.as_str(),
                 policy,
                 &desired_count,
                 &live_count,
@@ -435,7 +461,7 @@ pub fn reconcile(
                 role.clone(),
                 String::new(),
                 SeatEffect::Spawn {
-                    role: role.clone(),
+                    role: role.as_str().into(),
                     count: wants.len() - haves.len(),
                 },
             ));
@@ -487,8 +513,8 @@ mod tests {
     fn live(pin: &str, role: &str, harness: &str, idle: bool) -> LiveSeat {
         LiveSeat {
             pin: pin.to_string(),
-            role: role.to_string(),
-            harness: harness.to_string(),
+            role: role.to_string().into(),
+            harness: harness.to_string().into(),
             model: None,
             mode: None,
             effort: None,
@@ -502,8 +528,8 @@ mod tests {
     fn want(role: &str) -> DesiredSeat {
         DesiredSeat {
             pin: None,
-            role: role.to_string(),
-            harness: "h".to_string(),
+            role: role.to_string().into(),
+            harness: "h".to_string().into(),
             model: None,
             effort: None,
             mode: None,
@@ -524,7 +550,7 @@ mod tests {
     fn seat_reconcile_no_change_gives_keep() {
         let live = vec![live("a", "coder", "h", true)];
         let mut want = want("coder");
-        want.harness = "h".to_string();
+        want.harness = "h".into();
         assert_eq!(
             reconcile(&[want.clone()], &live, &argv, &ReconcilePolicy::default()),
             vec![SeatEffect::Keep {
@@ -538,13 +564,13 @@ mod tests {
         let mut live = live("a", "coder", "pi", true);
         live.model = Some("m1".to_string());
         let mut want = want("coder");
-        want.harness = "pi".to_string();
+        want.harness = "pi".into();
         want.model = Some("m2".to_string());
         assert_eq!(
             reconcile(&[want.clone()], &[live], &argv, &ReconcilePolicy::default()),
             vec![SeatEffect::Relaunch {
                 pin: "a".to_string(),
-                fields: vec!["model".to_string()],
+                fields: vec![SeatField::Model],
                 to: Some(want),
             }]
         );
@@ -555,13 +581,13 @@ mod tests {
         let mut live = live("a", "coder", "opencode", true);
         live.model = Some("m1".to_string());
         let mut want = want("coder");
-        want.harness = "opencode".to_string();
+        want.harness = "opencode".into();
         want.model = Some("m2".to_string());
         assert_eq!(
             reconcile(&[want.clone()], &[live], &env, &ReconcilePolicy::default()),
             vec![SeatEffect::Respawn {
                 pin: "a".to_string(),
-                fields: vec!["model".to_string()],
+                fields: vec![SeatField::Model],
                 context_fresh: true,
                 to: Some(want),
             }]
@@ -572,12 +598,12 @@ mod tests {
     fn seat_reconcile_harness_change_gives_respawn() {
         let live = live("a", "coder", "pi", true);
         let mut want = want("coder");
-        want.harness = "opencode".to_string();
+        want.harness = "opencode".into();
         assert_eq!(
             reconcile(&[want.clone()], &[live], &argv, &ReconcilePolicy::default()),
             vec![SeatEffect::Respawn {
                 pin: "a".to_string(),
-                fields: vec!["harness".to_string()],
+                fields: vec![SeatField::Harness],
                 context_fresh: true,
                 to: Some(want),
             }]
@@ -588,14 +614,14 @@ mod tests {
     fn seat_reconcile_role_inject_when_warm_allowed() {
         let live = live("a", "coder", "h", true);
         let mut want = want("reviewer");
-        want.harness = "h".to_string();
+        want.harness = "h".into();
         want.pin = Some("a".to_string());
         want.context_warm_allowed = true;
         assert_eq!(
             reconcile(&[want.clone()], &[live], &argv, &ReconcilePolicy::default()),
             vec![SeatEffect::InjectRole {
                 pin: "a".to_string(),
-                role: "reviewer".to_string()
+                role: "reviewer".into()
             }]
         );
     }
@@ -604,14 +630,14 @@ mod tests {
     fn seat_reconcile_role_respawns_when_warm_not_allowed() {
         let live = live("a", "coder", "h", true);
         let mut want = want("reviewer");
-        want.harness = "h".to_string();
+        want.harness = "h".into();
         want.pin = Some("a".to_string());
         want.context_warm_allowed = false;
         assert_eq!(
             reconcile(&[want.clone()], &[live], &argv, &ReconcilePolicy::default()),
             vec![SeatEffect::Respawn {
                 pin: "a".to_string(),
-                fields: vec!["role".to_string()],
+                fields: vec![SeatField::Role],
                 context_fresh: true,
                 to: Some(want),
             }]
@@ -625,7 +651,7 @@ mod tests {
         let got = reconcile(&wants, &live, &argv, &ReconcilePolicy::default());
         assert!(got.iter().any(|e| matches!(
             e,
-            SeatEffect::Spawn { role, count } if role == "coder" && *count == 2
+            SeatEffect::Spawn { role, count } if role.as_str() == "coder" && *count == 2
         )));
     }
 
@@ -674,7 +700,7 @@ mod tests {
         let mut got = live("a", "coder", "h", true);
         got.placement = SeatPlacement::Pane;
         let mut want = want("coder");
-        want.harness = "h".to_string();
+        want.harness = "h".into();
         want.placement = SeatPlacement::Headless;
         assert_eq!(
             reconcile(&[want], &[got], &argv, &ReconcilePolicy::default()),
@@ -689,7 +715,7 @@ mod tests {
         let mut live = live("a", "coder", "pi", true);
         live.model = Some("m1".to_string());
         let mut want = want("coder");
-        want.harness = "opencode".to_string();
+        want.harness = "opencode".into();
         want.model = Some("m2".to_string());
         let got = reconcile(&[want.clone()], &[live], &argv, &ReconcilePolicy::default());
         assert_eq!(got.len(), 1);
@@ -710,11 +736,57 @@ mod tests {
         assert_eq!(ab, ba);
     }
 
+    /// Law 11 wire proof: the typed seat vocabulary serializes to the SAME
+    /// bytes the string fields did. A fixture parses and re-serializes
+    /// byte-identically.
+    #[test]
+    fn seat_vocabulary_serde_is_byte_identical() {
+        let desired = DesiredSeat {
+            pin: Some("a".into()),
+            role: "reviewer".into(),
+            harness: "opencode".into(),
+            model: Some("m".into()),
+            effort: Some("high".into()),
+            mode: Some("read-only".into()),
+            placement: SeatPlacement::Pane,
+            context_warm_allowed: true,
+        };
+        let want = r#"{"pin":"a","role":"reviewer","harness":"opencode","model":"m","effort":"high","mode":"read-only","placement":"pane","context_warm_allowed":true}"#;
+        assert_eq!(serde_json::to_string(&desired).expect("serializes"), want);
+        let back: DesiredSeat = serde_json::from_str(want).expect("parses");
+        assert_eq!(back, desired);
+
+        let live = crate::seat_binder::LiveSeat {
+            pin: "a".into(),
+            role: "coder".into(),
+            harness: "pi".into(),
+            model: Some("m1".into()),
+            mode: None,
+            effort: None,
+            placement: SeatPlacement::Pane,
+            idle: false,
+            fresh_session: false,
+            idle_since_ms: None,
+        };
+        let live_want = r#"{"pin":"a","role":"coder","harness":"pi","model":"m1","mode":null,"placement":"pane","idle":false,"fresh_session":false}"#;
+        assert_eq!(serde_json::to_string(&live).expect("serializes"), live_want);
+
+        let effect = SeatEffect::Relaunch {
+            pin: "a".into(),
+            fields: vec![SeatField::Model, SeatField::Effort],
+            to: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&effect).expect("serializes"),
+            r#"{"effect":"relaunch","pin":"a","fields":["model","effort"]}"#
+        );
+    }
+
     #[test]
     fn seat_reconcile_json_round_trip() {
         let live = vec![live("a", "coder", "h", true)];
         let mut want = want("coder");
-        want.harness = "h".to_string();
+        want.harness = "h".into();
         let input = serde_json::json!({"desired": [want], "live": live}).to_string();
         let out = reconcile_json(&input, 0).expect("binds");
         let effects: Vec<SeatEffect> = serde_json::from_str(&out).expect("parses");
