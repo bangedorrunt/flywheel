@@ -968,6 +968,66 @@ fn inject_budget_path(state_dir: &Path, project: &str) -> PathBuf {
     ))
 }
 
+/// A refused wake waiting for the project's live dispatcher. Keyed by PROJECT,
+/// never by workspace: the CLI cannot know the dispatcher's plane session id,
+/// and a workspace key is what made the deferral invisible to the host.
+fn deferred_wakes_path(state_dir: &Path, project: &str) -> PathBuf {
+    state_dir.join(format!(
+        "doorbell-deferred-{}.jsonl",
+        crate::state::state_key(project)
+    ))
+}
+
+/// The line the dispatcher types for a deferred crew wake. It must be a mail
+/// wake, never routine chatter: the fold drops a non-urgent, non-mail prompt
+/// line (bd-346jl), so any other text would be silently swallowed at the
+/// drain.
+pub fn deferred_wake_line() -> String {
+    doorbell_core::doorbell_line(doorbell_core::EventClass::PlanePMail, "toron next")
+}
+
+/// Hand one refused wake to the live dispatcher. The host folds it as
+/// `PromptRefused`: a working pin queues it, and the next at-prompt status
+/// rings it.
+pub fn append_deferred_wake(
+    state_dir: &Path,
+    project: &str,
+    pin: &str,
+    line: &str,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let path = deferred_wakes_path(state_dir, project);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(f, "{}", serde_json::json!({ "pin": pin, "line": line }))
+}
+
+/// Take the wakes this project's dispatcher has not folded yet. `rename` first
+/// so a concurrent append lands in a fresh file instead of being truncated.
+pub fn drain_deferred_wakes(state_dir: &Path, project: &str) -> Vec<(String, String)> {
+    let path = deferred_wakes_path(state_dir, project);
+    let taken = path.with_extension("draining");
+    if fs::rename(&path, &taken).is_err() {
+        return Vec::new();
+    }
+    let raw = fs::read_to_string(&taken).unwrap_or_default();
+    let _ = fs::remove_file(&taken);
+    raw.lines()
+        .filter_map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l.trim()).ok()?;
+            Some((
+                v.get("pin")?.as_str()?.to_string(),
+                v.get("line")?.as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
 pub fn inject_wake_in(
     state_dir: &Path,
     project: &str,
@@ -2438,6 +2498,41 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, "LilacChapel");
         assert!(out[0].1.contains("[doorbell]"));
+    }
+
+    /// The deferral handoff is keyed by PROJECT: the CLI knows the project,
+    /// never the dispatcher's plane session id, and a workspace-keyed row is
+    /// what left the live deferral invisible. A host running under any
+    /// workspace id drains it; another project never sees it.
+    #[test]
+    fn a_deferred_wake_is_scoped_by_project_not_workspace() {
+        let dir = std::env::temp_dir().join(format!("fw-defer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let line = deferred_wake_line();
+        append_deferred_wake(&dir, "flywheel", "BlueRidge", &line).expect("record");
+
+        assert!(
+            drain_deferred_wakes(&dir, "session:01a1d257-5b3f-711d-a203-536c92281ed9").is_empty(),
+            "the handoff is not keyed by the dispatcher's workspace"
+        );
+        assert!(
+            drain_deferred_wakes(&dir, "other-project").is_empty(),
+            "another project never drains this project's wakes"
+        );
+        assert_eq!(
+            drain_deferred_wakes(&dir, "flywheel"),
+            vec![("BlueRidge".to_string(), line.clone())],
+            "the project's dispatcher takes it, whatever workspace it runs under"
+        );
+        assert!(
+            drain_deferred_wakes(&dir, "flywheel").is_empty(),
+            "a drained handoff is not re-rung"
+        );
+        assert!(
+            doorbell_core::is_mail_wake(&line),
+            "the deferred line survives the routine-chatter drop: {line}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

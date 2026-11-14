@@ -271,9 +271,18 @@ impl RtHost {
     /// Outcomes fold quiet (sentinel), so the model only gains ambient
     /// per-message bookkeeping. FactMiss keeps today's path: the final match
     /// in tick still renders it as Effect::Audit for the rt journal.
+    ///
+    /// The deferral trail also stays on the rt journal: `doorbell why` folds
+    /// those rows to explain a wake that did not ring now, and an audit the
+    /// journal never saw cannot be explained.
     fn run_durable_audit(&mut self, cmds: Vec<workspace::Cmd>) -> Vec<workspace::Cmd> {
         let mut rest = Vec::with_capacity(cmds.len());
         for cmd in cmds {
+            let journaled = matches!(
+                &cmd,
+                workspace::Cmd::Audit { kind, .. }
+                    if matches!(kind.as_str(), "deferred" | "drained" | "queued")
+            );
             if !matches!(cmd, workspace::Cmd::Audit { .. }) {
                 rest.push(cmd);
                 continue;
@@ -292,6 +301,9 @@ impl RtHost {
                 ),
             };
             self.model = next;
+            if journaled {
+                rest.push(cmd);
+            }
         }
         rest
     }
@@ -782,6 +794,29 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// The one place a workspace `Cmd` becomes a host `Effect`.
+fn cmds_to_effects(cmds: Vec<workspace::Cmd>) -> Vec<Effect> {
+    cmds.into_iter()
+        .filter_map(|c| match c {
+            workspace::Cmd::Prompt { pin, line } => Some(Effect::Prompt { pin, line }),
+            workspace::Cmd::FetchInbox => Some(Effect::FetchInbox),
+            workspace::Cmd::CheckAckSla => Some(Effect::CheckAckSla),
+            workspace::Cmd::RestartWatch => Some(Effect::RestartWatch),
+            workspace::Cmd::FactMiss { why } => Some(Effect::Audit {
+                kind: "fact_miss".into(),
+                pin: String::new(),
+                detail: serde_json::json!({ "why": why }),
+            }),
+            workspace::Cmd::Audit { kind, pin, detail } => Some(Effect::Audit {
+                kind,
+                pin,
+                detail: serde_json::json!(detail),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
 impl Host for RtHost {
     fn tick(&mut self, msg: &BrainMsg) -> Vec<Effect> {
         let (wmsg, drain_waits) = match msg {
@@ -847,6 +882,17 @@ impl Host for RtHost {
             | BrainMsg::Ask { .. }
             | BrainMsg::Shutdown => return Vec::new(),
         };
+        let mut deferred_cmds: Vec<workspace::Cmd> = Vec::new();
+        if matches!(msg, BrainMsg::Sweep { .. }) {
+            for (pin, line) in
+                crate::doorbell::drain_deferred_wakes(&crate::config::state_dir(), &self.project)
+            {
+                let (next, cmds) =
+                    workspace::tick(&self.model, &workspace::Msg::PromptRefused { pin, line });
+                self.model = next;
+                deferred_cmds.extend(cmds);
+            }
+        }
         let (next, cmds) = workspace::tick(&self.model, &wmsg);
         self.model = next;
         let snap = crate::backend::run_mail_off_runtime_sync(|| {
@@ -883,26 +929,8 @@ impl Host for RtHost {
         {
             eprintln!("flywheel: run-state boundary not recorded: {refusal}");
         }
-        let mut effects: Vec<Effect> = cmds
-            .into_iter()
-            .filter_map(|c| match c {
-                workspace::Cmd::Prompt { pin, line } => Some(Effect::Prompt { pin, line }),
-                workspace::Cmd::FetchInbox => Some(Effect::FetchInbox),
-                workspace::Cmd::CheckAckSla => Some(Effect::CheckAckSla),
-                workspace::Cmd::RestartWatch => Some(Effect::RestartWatch),
-                workspace::Cmd::FactMiss { why } => Some(Effect::Audit {
-                    kind: "fact_miss".into(),
-                    pin: String::new(),
-                    detail: serde_json::json!({ "why": why }),
-                }),
-                workspace::Cmd::Audit { kind, pin, detail } => Some(Effect::Audit {
-                    kind,
-                    pin,
-                    detail: serde_json::json!(detail),
-                }),
-                _ => None,
-            })
-            .collect();
+        let mut effects = cmds_to_effects(cmds);
+        effects.extend(cmds_to_effects(deferred_cmds));
         if matches!(msg, BrainMsg::Sweep { .. }) {
             effects.extend(
                 self.pending_conflict_prompts
@@ -2122,6 +2150,59 @@ mod off_runtime_tests {
             let _ = host.fetch_inbox_process("SomePin", "last");
             let _ = host.tick(&BrainMsg::Watch(String::new()));
         });
+    }
+
+    /// The CLI knows the project, never the dispatcher's plane session id, so
+    /// the handoff is project-keyed: this host runs under a session workspace
+    /// and still folds the deferral into its one queue, then rings it on the
+    /// prompt transition.
+    #[test]
+    fn a_deferred_crew_wake_is_folded_and_rung_at_the_next_prompt() {
+        let _home = crate::config::test_state_home();
+        let project = format!("defer-host-{}", std::process::id());
+        crate::doorbell::append_deferred_wake(
+            &crate::config::state_dir(),
+            &project,
+            "BlueRidge",
+            &crate::doorbell::deferred_wake_line(),
+        )
+        .expect("record the deferral");
+        let (tx, _rx) = mpsc::channel(8);
+        let mut host =
+            RtHost::new(Config::default(), &project, "session:01a1d257", tx).expect("host");
+        host.model
+            .doorbell
+            .statuses
+            .insert("BlueRidge".into(), "working".into());
+
+        let effects = host.tick(&BrainMsg::Sweep { now: 1 });
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Audit { kind, pin, .. } if kind == "deferred" && pin == "BlueRidge")),
+            "the sweep queues the deferred wake: {effects:?}"
+        );
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Prompt { .. })),
+            "a working pin is never prompted: {effects:?}"
+        );
+
+        let effects = host.tick(&BrainMsg::PlaneStatus {
+            pin: "BlueRidge".into(),
+            status: "idle".into(),
+        });
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Audit { kind, .. } if kind == "drained")),
+            "the prompt transition drains the queue: {effects:?}"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Prompt { pin, .. } if pin == "BlueRidge")),
+            "and rings the deferred line: {effects:?}"
+        );
     }
 
     /// The hear tracker gets the pin's npub from the self index, so the

@@ -500,19 +500,37 @@ fn wake_is_busy(err: &str) -> bool {
     err.contains("not at a prompt") || err.to_ascii_lowercase().contains("busy")
 }
 
-/// A busy pane's mail is already delivered; the doorbell owns the ring and
-/// defers it itself (bd-9mjla's sink refusal -> the one queue -> the next
-/// prompt). The CLI must not write its own deferral: a journal row has no live
-/// consumer, so live and replay would diverge (bd-346jl).
-fn finish_prompt(delivered: Result<String, String>) -> Result<String> {
+/// A busy pane's mail is already delivered; the ring is deferred to the
+/// project's live dispatcher, which folds the deferral as a refusal (working
+/// pin queues it, the next at-prompt status rings it). The handoff is
+/// project-keyed on disk, so the dispatcher's workspace id never has to match.
+fn finish_prompt(
+    delivered: Result<String, String>,
+    defer: impl FnOnce() -> Result<()>,
+) -> Result<String> {
     match delivered {
         Ok(typed) => Ok(typed),
-        Err(err) if wake_is_busy(&err) => Ok(QUEUED_WAKE.to_string()),
+        Err(err) if wake_is_busy(&err) => {
+            defer()?;
+            Ok(QUEUED_WAKE.to_string())
+        }
         Err(err) => Err(anyhow!("{err}")),
     }
 }
 
 const QUEUED_WAKE: &str = "mail delivered; the doorbell rings at the next prompt";
+
+/// Record the refused wake for the project's dispatcher, in the one line shape
+/// the fold treats as a mail wake.
+fn defer_busy_wake(project: &str, pin: &str) -> Result<()> {
+    crate::doorbell::append_deferred_wake(
+        &crate::config::state_dir(),
+        project,
+        pin,
+        &crate::doorbell::deferred_wake_line(),
+    )
+    .map_err(|e| anyhow!("record the deferred wake: {e}"))
+}
 
 fn deliver_prompt_wake_hc(
     cfg: &Config,
@@ -647,7 +665,7 @@ fn cmd_crew_prompt(
     let wm = recipient_wm(project, pin);
     let delivered =
         deliver_prompt_wake(cfg, project, pin, urgent, wm).map_err(|e| format!("{e:#}"));
-    let wake = finish_prompt(delivered)?;
+    let wake = finish_prompt(delivered, || defer_busy_wake(project, pin))?;
     let queued = wake == QUEUED_WAKE;
 
     crate::log(
@@ -829,36 +847,48 @@ mod tests {
         assert_eq!(writes(&rec), vec![format!("prompt block:pane-1 {typed}")]);
     }
 
-    /// bd-346jl: a busy pane's mail is already delivered, so the CLI reports
-    /// that the doorbell owns the ring — and writes NOTHING to the journal
-    /// (a journal row has no live consumer; live and replay must agree).
+    /// A busy pane's mail is already delivered, so the CLI hands the ring to
+    /// the project's dispatcher instead of pretending a journal row would ring.
     #[test]
-    fn busy_prompt_reports_the_doorbell_ring_and_writes_no_deferral() {
-        let out = finish_prompt(Err(
-            "wake line delivery to BlueRidge (block:p1) failed: pane busy: not at a prompt".into(),
-        ))
+    fn busy_prompt_hands_the_ring_to_the_dispatcher() {
+        let _g = crate::config::test_state_home();
+        let project = format!("busy-defer-{}", std::process::id());
+        let out = finish_prompt(
+            Err(
+                "wake line delivery to BlueRidge (block:p1) failed: pane busy: not at a prompt"
+                    .into(),
+            ),
+            || defer_busy_wake(&project, "BlueRidge"),
+        )
         .expect("a busy pane must not fail the prompt");
         assert_eq!(out, QUEUED_WAKE);
         assert!(
             out.contains("doorbell rings at the next prompt"),
             "the operator is told who rings: {out}"
         );
-        // Mutation witness: re-adding a journal-only deferral here reddens this
-        // (the row has no live consumer, so live and replay would diverge).
-        let src = include_str!("crew.rs");
-        let production = src.split("#[cfg(test)]").next().unwrap_or(src);
-        assert!(
-            !production.contains("journal_append_workspace")
-                && !production.contains("fn defer_busy_wake"),
-            "crew prompt must not write its own deferral; the doorbell owns the ring"
+        assert_eq!(
+            crate::doorbell::drain_deferred_wakes(&crate::config::state_dir(), &project),
+            vec![(
+                "BlueRidge".to_string(),
+                "[doorbell] plane-P mail. Pull: toron next".to_string()
+            )],
+            "the refused wake is on the dispatcher's queue as a mail wake"
         );
     }
 
     #[test]
     fn non_busy_prompt_failure_stays_loud() {
-        let err = finish_prompt(Err("wake line delivery failed: hc connect refused".into()))
-            .expect_err("a transport failure is not a deferral");
+        let mut deferred = false;
+        let err = finish_prompt(
+            Err("wake line delivery failed: hc connect refused".into()),
+            || {
+                deferred = true;
+                Ok(())
+            },
+        )
+        .expect_err("a transport failure is not a deferral");
         assert!(format!("{err:#}").contains("hc connect refused"));
+        assert!(!deferred, "a transport failure must not be deferred");
     }
 
     /// The doorbell itself rings the deferred wake: one refusal is queued by
