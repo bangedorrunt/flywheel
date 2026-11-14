@@ -221,7 +221,7 @@ mkdir -p "$(dirname "$RECEIPT")"
 proof_write_receipt "$RECEIPT" "$OK" "$PROVEN_SHA" "$SHORT" "$STAMP" "$MODE" "$TMP" \
   "$FAILED_STEP" "$STEP_NAMES" "$STEP_STATUSES" "$SIBLING_RECORDS" "$MUTATION_RECORDS_FILE"
 
-if [ "$OK" -eq 1 ]; then
+if [ "$OK" -eq 0 ]; then
   echo "clean-proof: ok — $TMP"
   exit 0
 fi
