@@ -80,7 +80,7 @@ pub(crate) use squad::SquadCmd;
 pub(crate) use stack::{StackCmd, cmd_stack};
 pub(crate) use stage::{StageCmd, cmd_stage};
 pub(crate) use standing_orders::{StandingOrdersCmd, cmd_standing_orders};
-pub(crate) use swarm::{SwarmCmd, cmd_swarm};
+pub(crate) use swarm::{SwarmCmd, cmd_retire, cmd_swarm};
 pub(crate) use work::{WorkCmd, cmd_work};
 pub(crate) use workflow::WorkflowCmd;
 pub(crate) use worktree::{WorktreeCmd, cmd_worktree};

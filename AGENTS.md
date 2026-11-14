@@ -26,6 +26,7 @@ flywheel stack status --check
 flywheel swarm plan <project> [spawn flags]      # byte-equal to spawn --dry-run --json
 flywheel swarm apply <project> --patch <seat>.<field>=<value>   # reconciler -> Ports::seat
 flywheel swarm status [<project>] [--json]       # live seats + plane status
+flywheel retire <pin>... [--project p]            # one seat Retire + lease release + deregister
 # after `br close`: bead id in HEAD, committed closed row, legal verdict
 flywheel ship check <bead-id>
 # one verb for the whole close ceremony (gate -> close -> sync -> release ->
@@ -137,6 +138,11 @@ pass.
   review/verify seats). `binding-rebind --model` routes here; never a second apply
   path. `swarm plan` is byte-identical to `spawn --dry-run --json`; `swarm status`
   lists live seats. `SpawnEntry` carries effort/mode so a second reconcile is Keep.
+- **Retire one pin (bd-rilvn).** `flywheel retire <pin>... [--project p] [--force-working]`
+  is the thin verb over the seat path: one journaled `SeatEffect::Retire` through
+  `Ports::seat`, the pin's leases released operator-signed (by HOLDER, so a
+  sibling keeps its lease), then the row deregistered. Refuses the captain seat
+  and a working pin without `--force-working`. Never a second retire path.
 - **Skill sync.** CLI change → `Commands` enum + `--robot-capabilities` + this
   file's critical list + `~/.agents/skills/flywheel/SKILL.md` §5.
 

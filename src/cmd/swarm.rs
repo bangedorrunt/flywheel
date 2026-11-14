@@ -365,6 +365,150 @@ pub(crate) fn cmd_swarm_apply(
     Ok(())
 }
 
+/// One `flywheel retire` run's outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RetireOutcome {
+    pub pins: Vec<String>,
+    pub released: u64,
+    pub closed: Vec<(String, String)>,
+}
+
+/// The retire core: ONE journaled `SeatEffect::Retire` through the seat
+/// interpreter, then the pin's leases (operator-signed, via `release`), then
+/// deregistration. Refuses the captain/operator seat by role, and a working
+/// pin without `force_working` (mirrors `kill`). `release` is the one
+/// operator-signed lease call, injected so the path is testable.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn retire_with(
+    backend: &dyn crate::backend::MultiplexerBackend,
+    cfg: &Config,
+    project: &str,
+    pins: &[String],
+    force_working: bool,
+    journal: &mut dyn crate::supervisor_host::EffectJournal,
+    ports: &mut dyn crate::supervisor_host::Ports,
+    release: &mut dyn FnMut(&str) -> Result<u64>,
+) -> Result<RetireOutcome> {
+    if pins.is_empty() {
+        bail!("retire: name at least one pin");
+    }
+    let key = crate::project_dir_str(cfg, project)?;
+    let captain = crate::state::captain_pin(project, &key);
+    for pin in pins {
+        if captain.as_deref() == Some(pin.as_str()) {
+            bail!("retire refuses the captain/operator seat {pin} (role-resolved)");
+        }
+    }
+    let registry = crate::state::load_spawn_registry(project);
+    let agents = backend.agent_list().unwrap_or_default();
+    let mut closed = Vec::new();
+    for pin in pins {
+        let pane = registry
+            .iter()
+            .find(|e| e.mail_identity.as_deref() == Some(pin.as_str()))
+            .map(|e| e.pane_id.clone())
+            .filter(|p| !p.is_empty());
+        let working = pane
+            .as_ref()
+            .and_then(|p| agents.iter().find(|a| &a.pane_id == p))
+            .is_some_and(|a| a.agent_status == toron_core::pane_types::AgentStatus::Working);
+        if working && !force_working {
+            bail!("refuse retire: {pin} is working; pass --force-working to retire anyway");
+        }
+        closed.push((pin.clone(), pane.unwrap_or_default()));
+    }
+
+    // The one seat path: journal first, then the interpreter closes the pane.
+    let rep = dispatch_effects(
+        journal,
+        ports,
+        &[crate::seat_reconcile::SeatEffect::Retire {
+            pins: pins.to_vec(),
+        }],
+    );
+    if rep.failed > 0 {
+        bail!(
+            "retire: {} seat effect(s) failed — see the journal",
+            rep.failed
+        );
+    }
+    if rep.ran == 0 && !rep.suppressed.is_empty() {
+        bail!("retire: the seat effect was suppressed (FLYWHEEL_ALLOW_EXEC=0); nothing closed");
+    }
+
+    let mut released = 0u64;
+    for pin in pins {
+        released += release(pin)?;
+    }
+
+    // Deregister: drop exactly these rows (siblings untouched).
+    let mut entries = registry;
+    entries.retain(|e| {
+        !pins
+            .iter()
+            .any(|p| e.mail_identity.as_deref() == Some(p.as_str()))
+    });
+    crate::state::save_spawn_registry(project, &entries)?;
+    Ok(RetireOutcome {
+        pins: pins.to_vec(),
+        released,
+        closed,
+    })
+}
+
+/// `flywheel retire <pin>... [--project p] [--force-working] [--as <pin>]`.
+pub(crate) fn cmd_retire(
+    cfg: &Config,
+    project: &str,
+    pins: &[String],
+    force_working: bool,
+    actor: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let backend = crate::backend::multiplexer_backend(cfg)?;
+    let key = crate::project_dir_str(cfg, project)?;
+    let actor = actor
+        .map(str::to_string)
+        .unwrap_or_else(crate::operator_pin);
+    let mail = crate::cmd::mail::mail_or_die(cfg)?;
+    let mut journal = crate::supervisor_host::ToronEffectJournal::open("retire", "retire")?;
+    let mut ports = crate::supervisor_host::LivePorts::new(cfg, project, project);
+    let mut release = |pin: &str| -> Result<u64> {
+        let r = mail.release_by_holder(&key, &actor, pin, false)?;
+        Ok(r.get("released")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0))
+    };
+    let out = retire_with(
+        &*backend,
+        cfg,
+        project,
+        pins,
+        force_working,
+        &mut journal,
+        &mut ports,
+        &mut release,
+    )?;
+    if json {
+        print_json(&json!({
+            "project": project,
+            "retired": out.pins,
+            "released": out.released,
+            "closed": out.closed.iter().map(|(p, pane)| json!({"pin": p, "pane_id": pane})).collect::<Vec<_>>(),
+        }));
+    } else {
+        for (pin, pane) in &out.closed {
+            println!("retired {pin} (pane {pane})");
+        }
+        println!(
+            "released {} lease(s) held by {}",
+            out.released,
+            out.pins.join(", ")
+        );
+    }
+    Ok(())
+}
+
 /// Dispatch the reconciler's effects through the 5d interpreter. Exposed for
 /// the unit proof: exactly one `Seat` command per non-`Keep` effect, journal
 /// first.
@@ -600,6 +744,12 @@ mod tests {
         }
     }
 
+    fn agent_with_status(name: &str, pane: &str, ws: &str, status: AgentStatus) -> AgentInfo {
+        let mut a = agent(name, pane, ws);
+        a.agent_status = status;
+        a
+    }
+
     fn pane(ws: &str, n: u32) -> PaneInfo {
         PaneInfo {
             pane_id: format!("{ws}:p{n}"),
@@ -643,6 +793,7 @@ mod tests {
         agents: Mutex<Vec<AgentInfo>>,
         splits: AtomicUsize,
         prompts: Mutex<Vec<(String, String)>>,
+        closed: Mutex<Vec<String>>,
     }
 
     impl MultiplexerBackend for FakeMux {
@@ -667,7 +818,8 @@ mod tests {
             let n = self.splits.fetch_add(1, Ordering::SeqCst) + 2;
             Ok(pane("wA", n as u32))
         }
-        fn pane_close(&self, _pane_id: &str) -> Result<(), toron_plane::backend::BackendError> {
+        fn pane_close(&self, pane_id: &str) -> Result<(), toron_plane::backend::BackendError> {
+            self.closed.lock().unwrap().push(pane_id.to_string());
             Ok(())
         }
         fn agent_list(&self) -> Result<Vec<AgentInfo>, toron_plane::backend::BackendError> {
@@ -1257,6 +1409,136 @@ mod tests {
         let view = seat_rows(&rows, &[("wA:p1".into(), "idle".into())], None);
         assert_eq!(view[0].harness.as_str(), "opencode");
         assert!(view[0].model.is_some(), "status shows the model");
+    }
+
+    // ---- bd-rilvn: flywheel retire ----
+
+    fn retire_registry(pins: &[(&str, &str, &str)]) {
+        let rows: Vec<SpawnEntry> = pins
+            .iter()
+            .map(|(pane, pin, name)| {
+                SpawnEntry::profiled(*pane, *name, "coder", "pi", Some((*pin).to_string()))
+            })
+            .collect();
+        crate::state::save_spawn_registry("demo", &rows).expect("save registry");
+    }
+
+    /// One journaled `SeatEffect::Retire` for exactly that pin, its lease
+    /// released once, its row deregistered, the sibling untouched.
+    #[test]
+    fn retire_dispatches_one_retire_and_releases_only_that_pin() {
+        let _g = lock_env();
+        let (cfg, _dir) = hermetic();
+        retire_registry(&[
+            ("wA:p1", "Alpha", "a-1"),
+            ("wA:p2", "Beta", "b-1"),
+        ]);
+        let mux = FakeMux::default();
+        let mut ports = Fake::default();
+        let mut journal = MemJournal::default();
+        let mut released: Vec<String> = Vec::new();
+        let mut release = |pin: &str| {
+            released.push(pin.to_string());
+            Ok(1)
+        };
+        let out = retire_with(
+            &mux,
+            &cfg,
+            "demo",
+            &["Alpha".into()],
+            false,
+            &mut journal,
+            &mut ports,
+            &mut release,
+        )
+        .expect("retire ok");
+        assert_eq!(out.released, 1, "one lease released");
+        assert_eq!(released, vec!["Alpha".to_string()], "only that pin");
+        let seats = ports.0.lock().unwrap().seats.clone();
+        assert_eq!(seats.len(), 1, "one seat command: {seats:?}");
+        assert!(
+            matches!(&seats[0], SeatEffect::Retire { pins } if pins == &vec!["Alpha".to_string()]),
+            "the one seat path is Retire: {seats:?}"
+        );
+        let rows = crate::state::load_spawn_registry("demo");
+        assert_eq!(rows.len(), 1, "the sibling stays: {rows:?}");
+        assert_eq!(rows[0].mail_identity.as_deref(), Some("Beta"));
+    }
+
+    /// A working pin is refused without `--force-working`, mirroring kill.
+    #[test]
+    fn retire_refuses_working_without_flag() {
+        let _g = lock_env();
+        let (cfg, _dir) = hermetic();
+        retire_registry(&[("wA:p1", "Alpha", "a-1")]);
+        let mux = FakeMux::default();
+        mux.agents
+            .lock()
+            .unwrap()
+            .push(agent_with_status("a-1", "wA:p1", "wA", AgentStatus::Working));
+        let mut ports = Fake::default();
+        let mut journal = MemJournal::default();
+        let mut release = |_: &str| Ok(0u64);
+        let err = retire_with(
+            &mux,
+            &cfg,
+            "demo",
+            &["Alpha".into()],
+            false,
+            &mut journal,
+            &mut ports,
+            &mut release,
+        )
+        .expect_err("working pin refused");
+        assert!(err.to_string().contains("--force-working"), "{err}");
+        assert!(ports.0.lock().unwrap().seats.is_empty(), "no effect ran");
+        assert!(
+            crate::state::load_spawn_registry("demo").len() == 1,
+            "the row is untouched"
+        );
+    }
+
+    /// The captain/operator seat is refused by role.
+    #[test]
+    fn retire_refuses_the_captain_seat() {
+        let _g = lock_env();
+        let (cfg, _dir) = hermetic();
+        crate::state::save_captain_alias("demo", "Captain").expect("alias");
+        retire_registry(&[("wA:p1", "Captain", "c-1")]);
+        let mux = FakeMux::default();
+        let mut ports = Fake::default();
+        let mut journal = MemJournal::default();
+        let mut release = |_: &str| Ok(0u64);
+        let err = retire_with(
+            &mux,
+            &cfg,
+            "demo",
+            &["Captain".into()],
+            true,
+            &mut journal,
+            &mut ports,
+            &mut release,
+        )
+        .expect_err("captain refused");
+        assert!(err.to_string().contains("captain"), "{err}");
+        assert!(ports.0.lock().unwrap().seats.is_empty());
+    }
+
+    /// The pane effect closes exactly that pane, never a sibling's.
+    #[test]
+    fn close_panes_for_pins_closes_exactly_that_pane() {
+        let _g = lock_env();
+        let (_cfg, _dir) = hermetic();
+        retire_registry(&[
+            ("wA:p1", "Alpha", "a-1"),
+            ("wA:p2", "Beta", "b-1"),
+        ]);
+        let mux = FakeMux::default();
+        let closed =
+            crate::supervisor_host::close_panes_for_pins(&mux, "demo", &["Alpha".into()])
+                .expect("close ok");
+        assert_eq!(closed, vec![("Alpha".to_string(), "wA:p1".to_string())]);
+        assert_eq!(mux.closed.lock().unwrap().clone(), vec!["wA:p1".to_string()]);
     }
 
     /// Unused-import guard: `execute`/`RoundReport`/`SupCmd` are the 5d

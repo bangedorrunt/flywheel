@@ -1190,6 +1190,32 @@ impl EffectJournal for MemJournal {
     }
 }
 
+/// Close one pane per pin — the ONE `Retire*` pane effect. Returns the
+/// `(pin, pane)` pairs it closed; a pin with no bound pane is a typed error,
+/// never a silent skip. Shared by the supervisor interpreter and `flywheel
+/// retire` (which adds the lease release + deregistration around it).
+pub(crate) fn close_panes_for_pins(
+    backend: &dyn crate::backend::MultiplexerBackend,
+    project: &str,
+    pins: &[String],
+) -> Result<Vec<(String, String)>, String> {
+    let registry = crate::state::load_spawn_registry(project);
+    let mut closed = Vec::new();
+    for pin in pins {
+        let pane = registry
+            .iter()
+            .find(|e| e.mail_identity.as_deref() == Some(pin.as_str()))
+            .map(|e| e.pane_id.clone())
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| format!("seat retire: no bound pane for {pin}"))?;
+        backend
+            .pane_close(&pane)
+            .map_err(|e| format!("seat retire {pin} ({pane}): {e}"))?;
+        closed.push((pin.clone(), pane));
+    }
+    Ok(closed)
+}
+
 /// Build the reconcile round's desired/live seats from the registry rows.
 ///
 /// `desired` is the persisted PLAN — the spawn registry as edited by
@@ -1716,17 +1742,7 @@ impl Ports for LivePorts {
         };
         let backend = crate::backend::multiplexer_backend(&self.cfg)
             .map_err(|e| format!("seat retire: plane: {e}"))?;
-        let registry = crate::state::load_spawn_registry(&self.project);
-        for pin in pins {
-            let pane = registry
-                .iter()
-                .find(|e| e.mail_identity.as_deref() == Some(pin.as_str()))
-                .map(|e| e.pane_id.clone())
-                .filter(|p| !p.is_empty())
-                .ok_or_else(|| format!("seat retire: no bound pane for {pin}"))?;
-            backend
-                .pane_close(&pane)
-                .map_err(|e| format!("seat retire {pin} ({pane}): {e}"))?;
+        for (pin, pane) in close_panes_for_pins(&*backend, &self.project, &pins)? {
             eprintln!(
                 "flywheel supervisor: retired idle seat {pin} ({pane}); pin and reservations kept"
             );

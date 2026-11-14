@@ -161,8 +161,8 @@ use cmd::{
     cmd_doorbell_re_inject, cmd_doorbell_roster, cmd_doorbell_start, cmd_doorbell_status,
     cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_history, cmd_internal_doorbell, cmd_judgment,
     cmd_ledger, cmd_mail, cmd_memory, cmd_models, cmd_peer, cmd_policy, cmd_prefer, cmd_principles,
-    cmd_resume, cmd_runs, cmd_ship, cmd_slot, cmd_stack, cmd_stage, cmd_standing_orders, cmd_swarm,
-    cmd_timeline, cmd_work, cmd_worktree, cmd_xproj,
+    cmd_resume, cmd_retire, cmd_runs, cmd_ship, cmd_slot, cmd_stack, cmd_stage,
+    cmd_standing_orders, cmd_swarm, cmd_timeline, cmd_work, cmd_worktree, cmd_xproj,
     coalition::cmd_coalition,
     cron::cmd_cron,
     debate::{cmd_debate, cmd_plan_review},
@@ -1316,6 +1316,28 @@ enum Commands {
         /// on_captain_death (ADR-0025 Spec 4)
         #[arg(long)]
         reap_crews: bool,
+    },
+    /// Retire ONE OR MORE pins (bd-rilvn): the thin verb over the seat path —
+    /// one journaled `SeatEffect::Retire` through `Ports::seat` (closes the
+    /// pane), the pin's leases released operator-signed, and the roster row
+    /// deregistered. Refuses the captain/operator seat by role, and a working
+    /// pin without --force-working.
+    Retire {
+        /// one or more pins (adjective+noun)
+        #[arg(required = true)]
+        pins: Vec<String>,
+        /// project slug (default: the workspace cwd)
+        #[arg(long)]
+        project: Option<String>,
+        /// retire a pin that is still `working` (mirrors kill --force-working)
+        #[arg(long)]
+        force_working: bool,
+        /// actor recorded on the lease release (default: the operator pin)
+        #[arg(long = "as")]
+        as_pin: Option<String>,
+        /// machine-readable result
+        #[arg(long)]
+        json: bool,
     },
     /// bead-verdict ledger (ADR-0019): br gate wrappers + receipt helper.
     /// `check` exits 0 only on a legal verdict for the current SHA; `receipt`
@@ -3010,7 +3032,8 @@ fn main() {
                 "init spawn add list status decide rebind recover",
                 "ship check <bead> [--json] | ship land <bead> --sha <40hex> --receipt <file> [--project <p>] [--as <pin>] [--message <m>] (one verb: gate -> close -> sync -> release -> commit THIS bead's tracker rows -> check; idempotent, prints the resume command on failure; another lane's dirty tracker row never blocks)",
                 "spawn <project> [--kind K=N ...] [--dry-run --json] [--patch <seat>.<field>=<value> (repeatable; re-resolves the seat with from: user)] [--model harness-default leaves the harness's own model untouched] [--yes] (ADR-0022 plan spawn; see --help for the full flag list)",
-                "swarm plan <project> [spawn flags] | swarm apply <project> [--patch <seat>.<field>=<value>] [--count <role>=<n>] [--json] | swarm status [<project>] [--json] (ADR-0022 rollout 6 + D7 remainder: plan prints the SAME flywheel-plan.v1 object as `spawn --dry-run --json`; apply is the one mechanism — patch/count -> pure reconciler -> the one `Ports::seat` interpreter, journal-first; fields harness|model|effort|mode|role (role only on apply; spawn rejects it); `--count role=+1` grows the fleet within crew.max; Spawn/InjectRole run live (InjectRole never for review/verify seats); `binding-rebind --model` routes here; status lists live seats with the plane's status)",
+                "retire <pin>... [--project <p>] [--force-working] [--as <pin>] [--json] (bd-rilvn: the thin per-pin stop verb over the seat path — ONE journaled SeatEffect::Retire through Ports::seat closes that pane, the pin's leases are released operator-signed by HOLDER (a sibling on the same bead keeps its lease), then the roster row is deregistered; refuses the captain/operator seat by role and a working pin without --force-working)",
+            "swarm plan <project> [spawn flags] | swarm apply <project> [--patch <seat>.<field>=<value>] [--count <role>=<n>] [--json] | swarm status [<project>] [--json] (ADR-0022 rollout 6 + D7 remainder: plan prints the SAME flywheel-plan.v1 object as `spawn --dry-run --json`; apply is the one mechanism — patch/count -> pure reconciler -> the one `Ports::seat` interpreter, journal-first; fields harness|model|effort|mode|role (role only on apply; spawn rejects it); `--count role=+1` grows the fleet within crew.max; Spawn/InjectRole run live (InjectRole never for review/verify seats); `binding-rebind --model` routes here; status lists live seats with the plane's status)",
             "send interrupt view output watch attach kill",
             "prefer <role.field>=<value> [--project <p>] | prefer --list [--json] | prefer --forget <role.field> [--project <p>] (ADR-0022 D6: standing preferences — project beats always, exact role beats *; set also records a chie lesson)",
             "crew preview|control|prompt (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker)",
@@ -3562,6 +3585,28 @@ fn main() {
             drain,
             reap_crews,
         }) => cmd_kill(&cfg, project, *force, *force_working, *drain, *reap_crews),
+        Some(Commands::Retire {
+            pins,
+            project,
+            force_working,
+            as_pin,
+            json,
+        }) => crate::cron::detect_project(&cfg, project.as_deref())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "retire: no project — pass --project <slug> or run from a workspace/<project> cwd"
+                )
+            })
+            .and_then(|project| {
+                cmd_retire(
+                    &cfg,
+                    &project,
+                    pins,
+                    *force_working,
+                    as_pin.as_deref(),
+                    *json,
+                )
+            }),
         Some(Commands::Ledger { cmd }) => cmd_ledger(&cfg, cmd),
         Some(Commands::Judgment { cmd }) => cmd_judgment(cmd),
         Some(Commands::Memory { cmd }) => cmd_memory(&cfg, cmd),

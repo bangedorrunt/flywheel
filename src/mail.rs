@@ -1850,6 +1850,32 @@ impl Mail {
         }
     }
 
+    /// `release_by_holder` (bd-rilvn): operator-signed release of every live
+    /// lease held by one agent pin — the `flywheel retire` path. Filtered by
+    /// HOLDER, so a sibling on the same bead keeps its lease.
+    pub fn release_by_holder(
+        &self,
+        project_key: &str,
+        requestor_name: &str,
+        holder: &str,
+        notify_previous: bool,
+    ) -> Result<Value> {
+        match &self.backend {
+            BackendKind::InProcess => {
+                let r = block_on(mailbox().release_by_holder(
+                    project_key,
+                    requestor_name,
+                    holder,
+                    notify_previous,
+                ))?;
+                Ok(r.to_json())
+            }
+            BackendKind::Remote(_) => anyhow::bail!(
+                "release-by-holder failed (remote mailbox): run `toron reserve release-by-holder --holder {holder} --project {project_key} --as {requestor_name}` (no remote MCP op; refusing a silent skip)"
+            ),
+        }
+    }
+
     /// `check_file_reservation_conflicts` (agent-scoped).
     pub fn conflicts_for(
         &self,
