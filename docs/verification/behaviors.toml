@@ -78,3 +78,14 @@ tests = [
   "src/daemon.rs::bootout_failure_keeps_the_plist_and_reports_the_reason",
 ]
 mutations = ["remove the canonical-key guard in stale_supervisor_units"]
+
+[[behavior]]
+id = "judgment.bundled-highest-version"
+owner = "src/judgment.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/judgment.rs::bundled_pack_picks_the_highest_version_per_id",
+  "src/judgment.rs::seed_all_replaces_a_same_version_pack_whose_bytes_differ",
+]
+mutations = ["use .next() (first bundled file) instead of the highest version"]

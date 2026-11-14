@@ -232,7 +232,11 @@ fn cmd_pack(cmd: &PackCmd) -> Result<()> {
                 println!(
                     "   {} {}",
                     out::ok(&rep.copied.len().to_string()),
-                    out::dim("pack(s) promoted from the project tier")
+                    out::dim(if rep.copied_from_bundled.is_empty() {
+                        "pack(s) promoted from the project tier"
+                    } else {
+                        "pack(s) promoted (bundled defaults included)"
+                    })
                 );
             }
             if !rep.overwritten.is_empty() {

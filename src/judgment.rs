@@ -4660,6 +4660,8 @@ pub fn pack_drift(user_dir: &Path, project_dir: &Path) -> Vec<PackDriftRow> {
 #[derive(Debug, Default, serde::Serialize)]
 pub struct PackSeedReport {
     pub copied: Vec<String>,
+    /// Ids copied from the BUNDLED tier (no project-tier file existed).
+    pub copied_from_bundled: Vec<String>,
     pub kept: Vec<String>,
     pub overwritten: Vec<String>,
     pub planned_overwrites: Vec<String>,
@@ -4668,10 +4670,14 @@ pub struct PackSeedReport {
 
 /// The bundled default for one pack id: (file name, body).
 pub fn bundled_pack(id: &str) -> Option<(&'static str, &'static str)> {
+    // The HIGHEST bundled version wins: a `.find` returned the first file for
+    // the id (reclassify.v1), so the user's v3 looked "newer" and was kept
+    // while the operator's order stayed unapplied (bd-0op96 live reseed).
     default_judgment_packs()
         .iter()
         .copied()
-        .find(|(name, _)| pack_entry(Path::new(name)).is_some_and(|(eid, _)| eid == id))
+        .filter(|(name, _)| pack_entry(Path::new(name)).is_some_and(|(eid, _)| eid == id))
+        .max_by_key(|(name, _)| pack_entry(Path::new(name)).map_or(0, |(_, v)| v))
 }
 
 /// The version of a bundled pack id, from its file name.
@@ -4703,6 +4709,7 @@ pub fn pack_seed(
             continue;
         }
         let project_src = highest_pack(project_dir, &row.id);
+        let from_bundled = project_src.is_none();
         let (src_name, src_bytes) = match project_src {
             Some(path) => {
                 let Some(name) = path.file_name().map(|n| n.to_owned()) else {
@@ -4746,6 +4753,9 @@ pub fn pack_seed(
             std::fs::write(&dst, &src_bytes)?;
             rep.overwritten.push(row.id);
         } else {
+            if from_bundled {
+                rep.copied_from_bundled.push(row.id.clone());
+            }
             rep.copied.push(row.id);
             if !dry_run {
                 std::fs::create_dir_all(user_dir)?;
@@ -5045,9 +5055,12 @@ mod bd_pack_sync {
         let r = root("all-content");
         let user = r.join("judgment-packs");
         std::fs::create_dir_all(&user).expect("mkdir");
-        let id = "reclassify.v1.yaml";
         let (name, body) = bundled_pack("reclassify").expect("bundled reclassify");
-        assert_eq!(name, id);
+        assert_eq!(
+            name, "reclassify.v3.yaml",
+            "the HIGHEST bundled version wins, not the first file"
+        );
+        let id = name;
         std::fs::write(user.join(id), format!("{body}\n# operator copy\n")).expect("write");
 
         let rep =
@@ -5068,6 +5081,18 @@ mod bd_pack_sync {
             pack_seed(&user, &r.join("no-project-tier"), PackOverwrite::All, false).expect("seed");
         assert!(rep2.overwritten.is_empty(), "identical is kept: {rep2:?}");
         let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// bd-0op96 live reseed: reclassify shipped v1 AND v3; a `.find` took v1,
+    /// so the user's v3 counted as newer and the operator's order never
+    /// landed. The highest bundled version must win.
+    #[test]
+    fn bundled_pack_picks_the_highest_version_per_id() {
+        let (name, _) = bundled_pack("reclassify").expect("bundled reclassify");
+        assert_eq!(name, "reclassify.v3.yaml");
+        assert_eq!(bundled_version("reclassify"), Some(3));
+        let (single, _) = bundled_pack("doorbell-screen").expect("single-version pack");
+        assert_eq!(single, "doorbell-screen.v1.yaml");
     }
 
     /// A user pack NEWER than the bundled default is never downgraded, even
