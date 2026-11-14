@@ -506,35 +506,38 @@ impl<'de> Deserialize<'de> for SpawnEntry {
         D: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        struct NewRaw {
+            pane_id: String,
+            name: String,
+            #[serde(default)]
+            profile: Option<String>,
+            #[serde(default)]
+            harness: Option<String>,
+            #[serde(default)]
+            model: Option<String>,
+            #[serde(default)]
+            model_pin: Option<String>,
+            #[serde(default)]
+            effort: Option<String>,
+            #[serde(default)]
+            mode: Option<String>,
+            #[serde(default)]
+            skills_digest: Option<String>,
+            #[serde(default)]
+            mail_identity: Option<String>,
+            #[serde(default)]
+            harness_session: Option<String>,
+            #[serde(default)]
+            skills_injected: bool,
+            #[serde(default)]
+            incarnation: u64,
+        }
+
+        #[derive(Deserialize)]
         #[serde(untagged)]
         enum Raw {
             Legacy((String, String)),
-            New {
-                pane_id: String,
-                name: String,
-                #[serde(default)]
-                profile: Option<String>,
-                #[serde(default)]
-                harness: Option<String>,
-                #[serde(default)]
-                model: Option<String>,
-                #[serde(default)]
-                model_pin: Option<String>,
-                #[serde(default)]
-                effort: Option<String>,
-                #[serde(default)]
-                mode: Option<String>,
-                #[serde(default)]
-                skills_digest: Option<String>,
-                #[serde(default)]
-                mail_identity: Option<String>,
-                #[serde(default)]
-                harness_session: Option<String>,
-                #[serde(default)]
-                skills_injected: bool,
-                #[serde(default)]
-                incarnation: u64,
-            },
+            New(Box<NewRaw>),
         }
         match Raw::deserialize(d)? {
             Raw::Legacy((pane_id, name)) => Ok(Self {
@@ -552,34 +555,20 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 skills_injected: false,
                 incarnation: 0,
             }),
-            Raw::New {
-                pane_id,
-                name,
-                profile,
-                harness,
-                model,
-                model_pin,
-                effort,
-                mode,
-                skills_digest,
-                mail_identity,
-                harness_session,
-                skills_injected,
-                incarnation,
-            } => Ok(Self {
-                pane_id,
-                name,
-                profile,
-                harness,
-                model,
-                model_pin,
-                effort,
-                mode,
-                skills_digest,
-                mail_identity,
-                harness_session,
-                skills_injected,
-                incarnation,
+            Raw::New(new) => Ok(Self {
+                pane_id: new.pane_id,
+                name: new.name,
+                profile: new.profile,
+                harness: new.harness,
+                model: new.model,
+                model_pin: new.model_pin,
+                effort: new.effort,
+                mode: new.mode,
+                skills_digest: new.skills_digest,
+                mail_identity: new.mail_identity,
+                harness_session: new.harness_session,
+                skills_injected: new.skills_injected,
+                incarnation: new.incarnation,
             }),
         }
     }
