@@ -4050,3 +4050,41 @@ mod reap_tests {
         assert!(port.stopped.borrow().is_empty());
     }
 }
+
+#[cfg(test)]
+mod start_sites_one_key_tests {
+    /// bd-bj9xk, last verify line: NO start site may open a door by the swarm
+    /// label while a session-keyed door can exist. Four sites: spawn, add,
+    /// `doorbell start`, the supervise arm.
+    #[test]
+    fn every_start_site_keys_by_the_live_session_id() {
+        let spawn = include_str!("spawn.rs");
+        assert!(
+            !spawn.contains("ensure_running(&exe, &config::state_dir(), &label, project)"),
+            "spawn/add must not start a dispatcher by the swarm label"
+        );
+        assert_eq!(
+            spawn
+                .matches("ensure_running(&exe, &config::state_dir(), host_ws, project)")
+                .count(),
+            2,
+            "spawn and add both pass the resolved session id"
+        );
+        assert!(
+            spawn.contains("let host_ws = if ws.workspace_id.is_empty()"),
+            "the label survives only as the no-id fallback"
+        );
+
+        let doors = include_str!("doorbell.rs");
+        assert!(
+            doors.contains("canonical_workspaces(&workspaces, &live_label, &live_id)"),
+            "doorbell start/stop fold the workspace list"
+        );
+
+        let supervise = include_str!("../doorbell_supervise.rs");
+        assert!(
+            supervise.contains("crate::doorbell::canonical_workspaces"),
+            "the supervise arm folds the same list"
+        );
+    }
+}

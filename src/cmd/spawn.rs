@@ -2350,7 +2350,15 @@ the panes may still be live in hc; `--no-verify` skips this check in scripts"
 
     if peer_aware {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flywheel"));
-        doorbell::ensure_running(&exe, &config::state_dir(), &label, project)
+        // bd-bj9xk: the dispatcher is keyed by the live session id, never the
+        // swarm label — a label start spawned a second door beside the session
+        // one. The label is only a fallback for a plane that answers no id.
+        let host_ws = if ws.workspace_id.is_empty() {
+            label.as_str()
+        } else {
+            ws.workspace_id.as_str()
+        };
+        doorbell::ensure_running(&exe, &config::state_dir(), host_ws, project)
             .context("doorbell dispatcher")?;
     }
 
@@ -3156,7 +3164,15 @@ pub(crate) fn cmd_spawn_rex(
 
     if peer_aware {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flywheel"));
-        doorbell::ensure_running(&exe, &config::state_dir(), &label, project)
+        // bd-bj9xk: the dispatcher is keyed by the live session id, never the
+        // swarm label — a label start spawned a second door beside the session
+        // one. The label is only a fallback for a plane that answers no id.
+        let host_ws = if ws.workspace_id.is_empty() {
+            label.as_str()
+        } else {
+            ws.workspace_id.as_str()
+        };
+        doorbell::ensure_running(&exe, &config::state_dir(), host_ws, project)
             .context("doorbell dispatcher")?;
     }
 
