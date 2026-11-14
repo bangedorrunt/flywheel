@@ -3515,7 +3515,6 @@ mod doorbell_canonical_workspace_tests {
 #[cfg(test)]
 mod doorbell_canonical_project_tests {
     use super::*;
-    use crate::doorbell::{DoorbellState, state_file, write_state};
 
     const PATH: &str = "/Users/op/workspace/chiebukuro";
     const SLUG: &str = "chiebukuro";
