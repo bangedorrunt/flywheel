@@ -2338,7 +2338,14 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
         .wake_counters
         .entry(tick_class.label().to_string())
         .or_insert(0) += 1;
-    cmds.retain(|c| !matches!(c, Cmd::Prompt { line, .. } if !is_urgent_line(line)));
+    // bd-l72k batched non-urgent channel traffic into the digest; bd-346jl
+    // showed the batch also swallowed MAIL wakes, so a normal-importance done
+    // mail never rang the captain or a crew. A mail wake always reaches its
+    // pane; routine channel chatter keeps the afk batch.
+    cmds.retain(|c| {
+        !matches!(c, Cmd::Prompt { line, .. }
+            if !is_urgent_line(line) && !doorbell_core::is_mail_wake(line))
+    });
     if let Some(now) = match msg {
         Msg::AckSlaTick { now } | Msg::Sweep { now, .. } | Msg::Tick { now } => Some(*now),
         _ => None,
@@ -2631,6 +2638,60 @@ mod tests {
                 .queues
                 .get("BlueRidge")
                 .is_none_or(std::vec::Vec::is_empty)
+        );
+    }
+
+    /// bd-346jl: the afk batch must never swallow a MAIL wake. A normal
+    /// (non-urgent) mail-delivered ring reaches its pane exactly once; the
+    /// same watch line without the mail tag keeps the batch.
+    #[test]
+    fn a_normal_importance_mail_wake_rings_its_pane() {
+        let mut m = empty_model();
+        m.doorbell.index.insert_pin("SlateHarbor".into(), None);
+        m.presence
+            .insert("SlateHarbor".into(), Presence::from_str("idle"));
+        m.doorbell
+            .statuses
+            .insert("SlateHarbor".into(), "idle".into());
+        let mail = r#"{"kind":9,"id":"aa","tags":[["p","SlateHarbor"],["toron-kind","mail-delivered"],["h","t-1"]],"content":"sealed"}"#;
+        let (_m, cmds) = tick(
+            &m,
+            &Msg::WatchNdjson {
+                line: mail.to_string(),
+            },
+        );
+        let prompts: Vec<&Cmd> = cmds
+            .iter()
+            .filter(|c| matches!(c, Cmd::Prompt { .. }))
+            .collect();
+        assert_eq!(
+            prompts.len(),
+            1,
+            "a normal done mail must ring exactly once: {cmds:?}"
+        );
+        let Cmd::Prompt { pin, line } = prompts[0] else {
+            unreachable!()
+        };
+        assert_eq!(pin, "SlateHarbor");
+        assert!(
+            doorbell_core::is_mail_wake(line),
+            "the ring is a mail wake: {line}"
+        );
+        assert!(
+            !doorbell_core::is_urgent_line(line),
+            "and it is routine, so only the mail rule keeps it: {line}"
+        );
+
+        let channel = r#"{"kind":9,"id":"ab","tags":[["p","SlateHarbor"],["h","ch-1"]],"content":"@SlateHarbor hi"}"#;
+        let (_m2, cmds2) = tick(
+            &m,
+            &Msg::WatchNdjson {
+                line: channel.to_string(),
+            },
+        );
+        assert!(
+            !cmds2.iter().any(|c| matches!(c, Cmd::Prompt { .. })),
+            "routine channel traffic still batches: {cmds2:?}"
         );
     }
 

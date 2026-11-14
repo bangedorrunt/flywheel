@@ -724,6 +724,13 @@ pub fn take_allowed_like(
 /// re-ring vehicle `doorbell_mail_line`, which carries "unacked for").
 /// Moved verbatim from flywheel `workspace.rs` (bd-ene2): one definition —
 /// the daemon FileHost presence filter and the embedded path share it.
+/// A mail wake: the router's plane-P mail class or the mail-wake host's line.
+/// These always reach a pane — a done mail that never rings is a lost
+/// hand-off (bd-346jl); the afk batch only applies to routine channel traffic.
+pub fn is_mail_wake(line: &str) -> bool {
+    line.contains("plane-P mail") || line.starts_with("Doorbell: mail from")
+}
+
 pub fn is_urgent_line(line: &str) -> bool {
     line.contains("plane-P urgent")
         || line.contains("URGENT steer")
@@ -797,7 +804,15 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
             if is_drain_transition(&from, status)
                 && let Some(q) = next.queues.get_mut(pin)
             {
-                for line in std::mem::take(q) {
+                let deferred = std::mem::take(q);
+                if !deferred.is_empty() {
+                    actions.push(DoorbellAction::Audit {
+                        kind: "drained".into(),
+                        pin: pin.clone(),
+                        detail: format!("{} deferred wake(s) at prompt", deferred.len()),
+                    });
+                }
+                for line in deferred {
                     actions.push(DoorbellAction::Prompt {
                         pin: pin.clone(),
                         line,
@@ -1084,8 +1099,21 @@ mod tests {
                 status: "idle".into(),
             },
         );
-        assert_eq!(actions2.len(), 1);
-        assert!(actions2[0].to_label().contains("BlueRidge"));
+        assert_eq!(
+            actions2
+                .iter()
+                .filter(|a| matches!(a, DoorbellAction::Prompt { .. }))
+                .count(),
+            1,
+            "exactly one ring on the drain: {actions2:?}"
+        );
+        assert!(
+            actions2
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Audit { kind, .. } if kind == "drained")),
+            "the drain is audited: {actions2:?}"
+        );
+        assert!(actions2.iter().any(|a| a.to_label().contains("BlueRidge")));
         assert!(
             next2
                 .queues
@@ -1147,14 +1175,24 @@ mod tests {
                 status: "idle".into(),
             },
         );
-        assert_eq!(actions3.len(), 1, "exactly one ring: {actions3:?}");
-        match &actions3[0] {
+        let rings: Vec<&DoorbellAction> = actions3
+            .iter()
+            .filter(|a| matches!(a, DoorbellAction::Prompt { .. }))
+            .collect();
+        assert_eq!(rings.len(), 1, "exactly one ring: {actions3:?}");
+        match rings[0] {
             DoorbellAction::Prompt { pin, line } => {
                 assert_eq!(pin, "BlueRidge");
                 assert_eq!(line, "wake A", "same effect key: the first line");
             }
             other => panic!("expected the deferred Prompt, got {other:?}"),
         }
+        assert!(
+            actions3
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Audit { kind, .. } if kind == "drained")),
+            "the deferred drain is audited: {actions3:?}"
+        );
         assert!(
             next3
                 .queues
