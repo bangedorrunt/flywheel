@@ -442,7 +442,11 @@ pub(crate) fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
         );
     }
     for ws in canonical_workspaces(&workspaces, &live_label, &live_id) {
-        let gone = match dispatcher_gone(&ws, &live_ids) {
+        let project_doors: Vec<String> = crate::doorbell::project_dispatchers(&state_dir, project)
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect();
+        let gone = match dispatcher_gone(&ws, &live_ids, &project_doors) {
             Some(GoneReason::SessionAbsent) => " gone=session-absent",
             Some(GoneReason::LabelAlias) => " gone=label-alias",
             None => "",
@@ -719,66 +723,80 @@ fn binary_stamp(path: &std::path::Path) -> Option<(u64, std::time::SystemTime)> 
 /// files and the central daemon arms use the stable project label. A host
 /// started with the label retires with `workspace-gone` even though the
 /// panes are live; map the label to the snapshot's ID for the local host.
-/// Why a dispatcher's workspace is gone (bd-bj9xk reap). The live host keys by
-/// rex session id (bd-g9hqu), so a `session:<id>` absent from the plane is
-/// dead, and a bare label is the legacy alias form.
+/// Why a dispatcher's workspace is gone (bd-bj9xk reap).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GoneReason {
     SessionAbsent,
     LabelAlias,
 }
 
-/// Pure: does this dispatcher workspace still belong to the plane? A caller
-/// that has the live session ids passes them in; nothing is guessed.
-pub(crate) fn dispatcher_gone(workspace: &str, live: &[String]) -> Option<GoneReason> {
-    match workspace.strip_prefix("session:") {
-        Some(id) => {
-            if live.iter().any(|s| s == id || s == workspace) {
-                None
-            } else {
-                Some(GoneReason::SessionAbsent)
-            }
+/// Pure: does this dispatcher workspace still belong to the plane? Never reaps
+/// a label on its own — a label is the ONLY door on a label-keyed plane (hc),
+/// and it is an alias only when the same project already has a live
+/// session-keyed door.
+pub(crate) fn dispatcher_gone(
+    workspace: &str,
+    live: &[String],
+    project_doors: &[String],
+) -> Option<GoneReason> {
+    if let Some(id) = workspace.strip_prefix("session:") {
+        if live.iter().any(|s| s == id || s == workspace) {
+            None
+        } else {
+            Some(GoneReason::SessionAbsent)
         }
-        None => Some(GoneReason::LabelAlias),
+    } else {
+        if live.iter().all(|s| !s.starts_with("session:")) {
+            return None;
+        }
+        let live_session_doors = project_doors
+            .iter()
+            .filter(|d| d.starts_with("session:"))
+            .any(|d| {
+                let id = d.trim_start_matches("session:");
+                live.iter()
+                    .any(|s| s == d || s.trim_start_matches("session:") == id)
+            });
+        if live_session_doors {
+            Some(GoneReason::LabelAlias)
+        } else {
+            None
+        }
     }
 }
 
-/// The plane's live session ids. `workspace_list` IS the session list on rex
-/// (each WorkspaceInfo is one session; hc's workspaces are hc panes), so no
-/// second accessor is invented for it (bd-bj9xk).
-fn live_session_ids(cfg: &Config) -> Vec<String> {
-    let Ok(backend) = crate::backend::multiplexer_backend(cfg) else {
-        return Vec::new();
-    };
-    let Ok(list) = backend.workspace_list() else {
-        return Vec::new();
-    };
-    list.into_iter().map(|w| w.workspace_id).collect()
+/// The reap's effects, behind a port (bd-bj9xk review): plane list, the
+/// project's doors, stop, liveness, audit and clock.
+pub(crate) trait ReapPort {
+    fn live_ids(&self) -> Vec<String>;
+    fn doors(&self, project: &str) -> Vec<(String, Option<u32>)>;
+    fn stop(&self, workspace: &str);
+    fn alive(&self, workspace: &str) -> bool;
+    fn audit(&self, workspace: &str, row: serde_json::Value);
+    fn now(&self) -> String;
 }
 
-/// Reap every dispatcher whose workspace no longer belongs to the plane:
-/// journal-first intent, stop (which also drops the record), outcome audit.
-/// A failed stop keeps the record so the next status retries it.
-fn reap_gone_dispatchers(cfg: &Config, project: &str) -> Vec<String> {
-    let live = live_session_ids(cfg);
+/// Reap every door the pure decision calls gone. A failed stop keeps the
+/// record (the next status retries); an empty plane list reaps nothing.
+pub(crate) fn reap_gone_with(port: &dyn ReapPort, project: &str) -> Vec<String> {
+    let live = port.live_ids();
     if live.is_empty() {
         return Vec::new();
     }
-    let state_dir = crate::config::state_dir();
+    let doors: Vec<String> = port.doors(project).into_iter().map(|(ws, _)| ws).collect();
     let mut reaped = Vec::new();
-    for (ws, pid) in crate::doorbell::project_dispatchers(&state_dir, project) {
-        let Some(reason) = dispatcher_gone(&ws, &live) else {
+    for (ws, pid) in port.doors(project) {
+        let Some(reason) = dispatcher_gone(&ws, &live, &doors) else {
             continue;
         };
         let reason = match reason {
             GoneReason::SessionAbsent => "session-absent",
             GoneReason::LabelAlias => "label-alias",
         };
-        crate::doorbell::audit_append(
-            &state_dir,
+        port.audit(
             &ws,
             serde_json::json!({
-                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "ts": port.now(),
                 "kind": "dispatcher_gone_intent",
                 "project": project,
                 "workspace": ws,
@@ -786,14 +804,12 @@ fn reap_gone_dispatchers(cfg: &Config, project: &str) -> Vec<String> {
                 "reason": reason,
             }),
         );
-        crate::doorbell::stop(&state_dir, &ws);
-        let still = crate::doorbell::dispatcher_pid(&state_dir, &ws)
-            .is_some_and(crate::doorbell::pid_alive);
-        crate::doorbell::audit_append(
-            &state_dir,
+        port.stop(&ws);
+        let still = port.alive(&ws);
+        port.audit(
             &ws,
             serde_json::json!({
-                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "ts": port.now(),
                 "kind": if still { "dispatcher_gone_stop_failed" } else { "dispatcher_gone_reaped" },
                 "project": project,
                 "workspace": ws,
@@ -809,6 +825,54 @@ fn reap_gone_dispatchers(cfg: &Config, project: &str) -> Vec<String> {
         }
     }
     reaped
+}
+
+/// The plane's live session ids. `workspace_list` IS the session list on rex
+/// (each WorkspaceInfo is one session); hc returns its own workspace ids.
+fn live_session_ids(cfg: &Config) -> Vec<String> {
+    let Ok(backend) = crate::backend::multiplexer_backend(cfg) else {
+        return Vec::new();
+    };
+    let Ok(list) = backend.workspace_list() else {
+        return Vec::new();
+    };
+    list.into_iter().map(|w| w.workspace_id).collect()
+}
+
+/// Production port over one config + state dir.
+struct LiveReapPort<'a> {
+    cfg: &'a Config,
+    state_dir: std::path::PathBuf,
+}
+
+impl ReapPort for LiveReapPort<'_> {
+    fn live_ids(&self) -> Vec<String> {
+        live_session_ids(self.cfg)
+    }
+    fn doors(&self, project: &str) -> Vec<(String, Option<u32>)> {
+        crate::doorbell::project_dispatchers(&self.state_dir, project)
+    }
+    fn stop(&self, workspace: &str) {
+        crate::doorbell::stop(&self.state_dir, workspace);
+    }
+    fn alive(&self, workspace: &str) -> bool {
+        crate::doorbell::dispatcher_pid(&self.state_dir, workspace)
+            .is_some_and(crate::doorbell::pid_alive)
+    }
+    fn audit(&self, workspace: &str, row: serde_json::Value) {
+        crate::doorbell::audit_append(&self.state_dir, workspace, row);
+    }
+    fn now(&self) -> String {
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+}
+
+fn reap_gone_dispatchers(cfg: &Config, project: &str) -> Vec<String> {
+    let port = LiveReapPort {
+        cfg,
+        state_dir: crate::config::state_dir(),
+    };
+    reap_gone_with(&port, project)
 }
 
 /// The project key every door folds through: a path names the same project
@@ -3732,34 +3796,125 @@ mod project_dispatchers_tests {
 }
 
 #[cfg(test)]
-mod dispatcher_gone_tests {
+mod reap_tests {
     use super::*;
+    use std::cell::RefCell;
 
-    /// Only a live session id survives; an absent one is dead, and the legacy
-    /// label form is an alias of the session door (bd-bj9xk reap target).
-    #[test]
-    fn a_dispatcher_is_gone_when_its_session_is_absent_or_it_is_a_label() {
-        let live = vec!["01a1d1e6-0b95-767c-861f-176fd88da6ea".to_string()];
-        assert_eq!(
-            dispatcher_gone("session:01a1d1e6-0b95-767c-861f-176fd88da6ea", &live),
-            None,
-            "the one live session is kept"
-        );
-        for ws in [
-            "session:01a1d816-a391-7bb0-8b05-cb9f25cef836",
-            "session:01a1d877-0d27-76a3-a2a1-dc08848f7105",
-            "session:01a1d8f0-6600-7943-8c9c-b104b1457df9",
-        ] {
-            assert_eq!(
-                dispatcher_gone(ws, &live),
-                Some(GoneReason::SessionAbsent),
-                "{ws} has no live rex session"
-            );
+    /// Fake plane + fake process table (bd-bj9xk review ask 3).
+    struct FakePort {
+        live: Vec<String>,
+        doors: Vec<(String, Option<u32>)>,
+        stopped: RefCell<Vec<String>>,
+        alive_after_stop: bool,
+        audits: RefCell<Vec<serde_json::Value>>,
+    }
+
+    impl FakePort {
+        fn new(live: &[&str], doors: &[(&str, u32)]) -> Self {
+            Self {
+                live: live.iter().map(|s| s.to_string()).collect(),
+                doors: doors
+                    .iter()
+                    .map(|(d, p)| (d.to_string(), Some(*p)))
+                    .collect(),
+                stopped: RefCell::new(Vec::new()),
+                alive_after_stop: false,
+                audits: RefCell::new(Vec::new()),
+            }
         }
-        assert_eq!(
-            dispatcher_gone("flywheel-chiebukuro", &live),
-            Some(GoneReason::LabelAlias),
-            "the bare label is the legacy alias form"
+    }
+
+    impl ReapPort for FakePort {
+        fn live_ids(&self) -> Vec<String> {
+            self.live.clone()
+        }
+        fn doors(&self, _project: &str) -> Vec<(String, Option<u32>)> {
+            self.doors.clone()
+        }
+        fn stop(&self, workspace: &str) {
+            self.stopped.borrow_mut().push(workspace.to_string());
+        }
+        fn alive(&self, _workspace: &str) -> bool {
+            self.alive_after_stop
+        }
+        fn audit(&self, _workspace: &str, row: serde_json::Value) {
+            self.audits.borrow_mut().push(row);
+        }
+        fn now(&self) -> String {
+            "2026-01-01T00:00:00Z".into()
+        }
+    }
+
+    fn kinds(port: &FakePort) -> Vec<String> {
+        port.audits
+            .borrow()
+            .iter()
+            .filter_map(|r| r.get("kind").and_then(|k| k.as_str()).map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn label_door_is_kept_when_it_is_the_only_door() {
+        let port = FakePort::new(&["session:01a1d1e6"], &[("flywheel-chiebukuro", 17301)]);
+        assert!(reap_gone_with(&port, "chiebukuro").is_empty());
+        assert!(port.stopped.borrow().is_empty(), "never stop the only door");
+        assert!(kinds(&port).is_empty(), "and never audit a reap");
+    }
+
+    #[test]
+    fn label_door_is_reaped_when_a_live_session_door_exists() {
+        let port = FakePort::new(
+            &["session:01a1d1e6"],
+            &[("session:01a1d1e6", 49772), ("flywheel-chiebukuro", 17301)],
         );
+        assert_eq!(
+            reap_gone_with(&port, "chiebukuro"),
+            vec!["flywheel-chiebukuro"]
+        );
+        assert_eq!(*port.stopped.borrow(), vec!["flywheel-chiebukuro"]);
+        assert_eq!(
+            kinds(&port),
+            vec!["dispatcher_gone_intent", "dispatcher_gone_reaped"]
+        );
+    }
+
+    #[test]
+    fn hc_label_keyed_plane_keeps_every_door() {
+        let port = FakePort::new(
+            &["w1:p1", "w2:p1"],
+            &[("flywheel-hc-a", 11), ("flywheel-hc-b", 12)],
+        );
+        assert!(reap_gone_with(&port, "p").is_empty());
+        assert!(port.stopped.borrow().is_empty());
+    }
+
+    #[test]
+    fn absent_session_door_is_reaped() {
+        let port = FakePort::new(
+            &["session:01a1d1e6"],
+            &[("session:01a1d1e6", 49772), ("session:01a1d816", 17093)],
+        );
+        assert_eq!(
+            reap_gone_with(&port, "chiebukuro"),
+            vec!["session:01a1d816"]
+        );
+    }
+
+    #[test]
+    fn stop_failure_keeps_the_record_and_says_so() {
+        let mut port = FakePort::new(&["session:01a1d1e6"], &[("session:01a1d816", 17093)]);
+        port.alive_after_stop = true;
+        assert!(reap_gone_with(&port, "chiebukuro").is_empty());
+        assert_eq!(
+            kinds(&port),
+            vec!["dispatcher_gone_intent", "dispatcher_gone_stop_failed"]
+        );
+    }
+
+    #[test]
+    fn an_empty_plane_list_reaps_nothing() {
+        let port = FakePort::new(&[], &[("session:dead", 1), ("label", 2)]);
+        assert!(reap_gone_with(&port, "p").is_empty());
+        assert!(port.stopped.borrow().is_empty());
     }
 }
