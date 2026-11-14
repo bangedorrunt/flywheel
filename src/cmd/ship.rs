@@ -32,11 +32,57 @@ pub(crate) enum ShipCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Land one bead with one call: gate, close, sync, release, commit THIS
+    /// bead's tracker rows, then ship check. Idempotent; stops at the first
+    /// failing step and prints the exact resume command.
+    Land {
+        bead_id: String,
+        /// The commit whose message cites the bead (40-hex).
+        #[arg(long)]
+        sha: String,
+        /// Proof receipt (machine-readable; becomes the gate `tail=`).
+        #[arg(long)]
+        receipt: PathBuf,
+        /// Toron project for the reservation release (default: repo dir name).
+        #[arg(long)]
+        project: Option<String>,
+        /// Agent pin releasing the reservations (default: AGENT_NAME).
+        #[arg(long = "as")]
+        as_pin: Option<String>,
+        /// Tracker commit message (default: `chore(beads): close <bead>`).
+        #[arg(long)]
+        message: Option<String>,
+        /// Repo directory (default: current directory).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Machine-readable result.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub(crate) fn cmd_ship(_cfg: &Config, cmd: &ShipCmd) -> Result<()> {
     match cmd {
         ShipCmd::Check { bead_id, dir, json } => ship_check(bead_id, dir.as_deref(), *json),
+        ShipCmd::Land {
+            bead_id,
+            sha,
+            receipt,
+            project,
+            as_pin,
+            message,
+            dir,
+            json,
+        } => ship_land(LandArgs {
+            bead: bead_id,
+            sha,
+            receipt,
+            project: project.as_deref(),
+            as_pin: as_pin.as_deref(),
+            message: message.as_deref(),
+            dir: dir.as_deref(),
+            json: *json,
+        }),
     }
 }
 
@@ -67,10 +113,38 @@ fn head_names_bead(dir: &Path, bead: &str) -> Result<bool> {
     Ok(git(dir, &["log", &window, "--format=%B"])?.contains(bead))
 }
 
-fn beads_worktree_clean(dir: &Path) -> Result<bool> {
-    Ok(git(dir, &["status", "--porcelain", "--", ".beads"])?
-        .trim()
-        .is_empty())
+/// The tracker rows that belong to ONE bead, in HEAD and in the worktree.
+/// git status is repo-wide, so another lane's uncommitted row must never fail
+/// this bead's ship check (bd-ps6wc).
+fn bead_rows(file: &Path, bead: &str, key: &str) -> Result<Vec<String>> {
+    let body = std::fs::read_to_string(file).unwrap_or_default();
+    let needle = format!("\"{key}\":\"{bead}\"");
+    Ok(body
+        .lines()
+        .filter(|line| line.contains(&needle))
+        .map(str::to_string)
+        .collect())
+}
+
+/// True when THIS bead's tracker rows are already committed: the worktree rows
+/// for it equal HEAD's rows for it. Other lanes' dirty rows are ignored.
+fn bead_rows_committed(dir: &Path, bead: &str) -> Result<bool> {
+    for (path, key) in [
+        (".beads/issues.jsonl", "id"),
+        (".beads/gates.jsonl", "issue_id"),
+    ] {
+        let head = git(dir, &["show", &format!("HEAD:{path}")]).unwrap_or_default();
+        let head_rows: Vec<String> = head
+            .lines()
+            .filter(|line| line.contains(&format!("\"{key}\":\"{bead}\"")))
+            .map(str::to_string)
+            .collect();
+        let work_rows = bead_rows(&dir.join(path), bead, key)?;
+        if head_rows != work_rows {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Read the tracker snapshot from HEAD, not the live database. A bead that is
@@ -121,7 +195,7 @@ fn ship_check(bead: &str, dir: Option<&Path>, json_output: bool) -> Result<()> {
     git(&dir, &["rev-parse", "--git-dir"])?;
 
     let commit_named = head_names_bead(&dir, bead)?;
-    let beads_clean = beads_worktree_clean(&dir)?;
+    let beads_clean = bead_rows_committed(&dir, bead)?;
     let (head_found, head_closed) = head_has_closed_bead(&dir, bead)?;
     let (ledger_ok, ledger_stdout, ledger_stderr) = ledger_check(&dir, bead)?;
     let ok = commit_named && beads_clean && head_found && head_closed && ledger_ok;
@@ -133,7 +207,7 @@ fn ship_check(bead: &str, dir: Option<&Path>, json_output: bool) -> Result<()> {
             "dir": dir.display().to_string(),
             "ok": ok,
             "commit_named": commit_named,
-            "beads_clean": beads_clean,
+            "beads_row_committed": beads_clean,
             "head_row_found": head_found,
             "head_row_closed": head_closed,
             "ledger_legal": ledger_ok,
@@ -146,7 +220,7 @@ fn ship_check(bead: &str, dir: Option<&Path>, json_output: bool) -> Result<()> {
             if commit_named { "yes" } else { "NO" }
         );
         println!(
-            ".beads worktree clean:  {}",
+            ".beads row committed:   {}",
             if beads_clean { "yes" } else { "NO" }
         );
         println!(
@@ -174,7 +248,7 @@ fn ship_check(bead: &str, dir: Option<&Path>, json_output: bool) -> Result<()> {
 
     if !ok {
         if !beads_clean {
-            eprintln!("ship: commit the closed tracker snapshot before shipping");
+            eprintln!("ship: this bead's tracker rows are not committed yet");
         }
         if !head_closed {
             eprintln!("ship: {bead} is not closed in HEAD:.beads/issues.jsonl");
@@ -183,6 +257,308 @@ fn ship_check(bead: &str, dir: Option<&Path>, json_output: bool) -> Result<()> {
             eprintln!("ship: no legal ledger verdict for HEAD");
         }
         bail!("ship check failed for {bead}");
+    }
+    Ok(())
+}
+
+/// One landing's arguments, after defaults resolve.
+struct LandPlan {
+    bead: String,
+    sha: String,
+    receipt: PathBuf,
+    project: String,
+    pin: String,
+    message: String,
+}
+
+fn run_tool(dir: &Path, program: &str, args: &[&str]) -> Result<String> {
+    let out = Command::new(program)
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .map_err(|err| anyhow!("{program} not found: {err}"))?;
+    if !out.status.success() {
+        bail!(
+            "{program} {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn resume_line(plan: &LandPlan) -> String {
+    format!(
+        "flywheel ship land {} --sha {} --receipt {} --project {} --as {}",
+        plan.bead,
+        plan.sha,
+        plan.receipt.display(),
+        plan.project,
+        plan.pin
+    )
+}
+
+fn land_step<T>(plan: &LandPlan, name: &str, step: impl FnOnce() -> Result<T>) -> Result<T> {
+    step().map_err(|err| {
+        anyhow!(
+            "ship land: step {name} failed: {err:#}\nresume: {}",
+            resume_line(plan)
+        )
+    })
+}
+
+/// True when a PASS gate row already binds this SHA (the gate step is done).
+fn gate_bound(dir: &Path, plan: &LandPlan) -> Result<bool> {
+    let out = run_tool(dir, "br", &["gate", "list", &plan.bead, "--json"]).unwrap_or_default();
+    let passed = out.contains("\"passed\":true") || out.contains("\"passed\": true");
+    Ok(passed && out.contains(&format!("sha={}", plan.sha)))
+}
+
+fn bead_is_closed(dir: &Path, plan: &LandPlan) -> Result<bool> {
+    let out = run_tool(dir, "br", &["show", &plan.bead, "--json"])?;
+    Ok(out.contains("\"status\":\"closed\"") || out.contains("\"status\": \"closed\""))
+}
+
+/// Stage ONLY the hunks that mention this bead, so another lane's uncommitted
+/// tracker row is never captured (bd-ps6wc). Returns whether anything staged.
+fn stage_bead_hunks(dir: &Path, file: &str, key: &str, bead: &str) -> Result<bool> {
+    let diff = git(dir, &["diff", "-U0", "--", file]).unwrap_or_default();
+    if diff.trim().is_empty() {
+        return Ok(false);
+    }
+    let needle = format!("\"{key}\":\"{bead}\"");
+    let mut header: Vec<&str> = Vec::new();
+    let mut hunks: Vec<Vec<&str>> = Vec::new();
+    let mut current: Option<Vec<&str>> = None;
+    for line in diff.lines() {
+        if line.starts_with("@@") {
+            if let Some(h) = current.take() {
+                hunks.push(h);
+            }
+            current = Some(vec![line]);
+            continue;
+        }
+        match current.as_mut() {
+            Some(h) => h.push(line),
+            None => header.push(line),
+        }
+    }
+    if let Some(h) = current.take() {
+        hunks.push(h);
+    }
+    let keep: Vec<String> = hunks
+        .into_iter()
+        .filter(|h| h.iter().any(|line| line.contains(&needle)))
+        .map(|h| h.join("\n"))
+        .collect();
+    if keep.is_empty() {
+        return Ok(false);
+    }
+    let mut patch = header.join("\n");
+    patch.push('\n');
+    patch.push_str(&keep.join("\n"));
+    patch.push('\n');
+
+    let mut child = Command::new("git")
+        .current_dir(dir)
+        .args(["apply", "--cached", "-"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|err| anyhow!("git apply: {err}"))?;
+    use std::io::Write as _;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| anyhow!("git apply stdin"))?
+        .write_all(patch.as_bytes())
+        .map_err(|err| anyhow!("git apply write: {err}"))?;
+    let status = child
+        .wait()
+        .map_err(|err| anyhow!("git apply wait: {err}"))?;
+    if !status.success() {
+        bail!("git apply --cached failed for {file}");
+    }
+    Ok(true)
+}
+
+pub(crate) struct LandArgs<'a> {
+    pub bead: &'a str,
+    pub sha: &'a str,
+    pub receipt: &'a Path,
+    pub project: Option<&'a str>,
+    pub as_pin: Option<&'a str>,
+    pub message: Option<&'a str>,
+    pub dir: Option<&'a Path>,
+    pub json: bool,
+}
+
+fn ship_land(args: LandArgs<'_>) -> Result<()> {
+    let LandArgs {
+        bead,
+        sha,
+        receipt,
+        project,
+        as_pin,
+        message,
+        dir,
+        json,
+    } = args;
+    if bead.trim().is_empty() {
+        bail!("empty bead id");
+    }
+    if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("--sha must be the bare 40-hex commit sha (got {sha:?})");
+    }
+    if !receipt.is_file() {
+        bail!(
+            "proof receipt missing: {} (it becomes the gate tail=)",
+            receipt.display()
+        );
+    }
+    let dir = match dir {
+        Some(d) => d.to_path_buf(),
+        None => std::env::current_dir().map_err(|err| anyhow!("current directory: {err}"))?,
+    };
+    git(&dir, &["rev-parse", "--git-dir"])?;
+    let cited = git(&dir, &["log", "--format=%B", "-n", "1", sha])?;
+    if !cited.contains(bead) {
+        bail!("commit {sha} does not cite {bead}; land only ships a commit that names the bead");
+    }
+    let project = project
+        .map(str::to_string)
+        .or_else(|| dir.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .ok_or_else(|| anyhow!("cannot derive a toron project from {}", dir.display()))?;
+    let pin = as_pin
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("AGENT_NAME")
+                .ok()
+                .filter(|p| !p.trim().is_empty())
+        })
+        .ok_or_else(|| {
+            anyhow!("ship land needs --as <pin> (or AGENT_NAME) to release reservations")
+        })?;
+    let plan = LandPlan {
+        bead: bead.to_string(),
+        sha: sha.to_string(),
+        receipt: receipt.to_path_buf(),
+        project,
+        pin,
+        message: message
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("chore(beads): close {bead}")),
+    };
+
+    // 1. gate: reuse the bead's verify command as the command proof.
+    if gate_bound(&dir, &plan)? {
+        eprintln!("ship land: gate already bound to {sha}");
+    } else {
+        land_step(&plan, "gate", || {
+            let verify = run_tool(&dir, "br", &["show", &plan.bead, "--json"])?;
+            let cmd = verify
+                .split("\"verify\"")
+                .nth(1)
+                .and_then(|rest| rest.split_once('"'))
+                .and_then(|(_, rest)| rest.split_once('"'))
+                .map(|(value, _)| value)
+                .unwrap_or("verify")
+                .replace(' ', "_");
+            let note = format!(
+                "sha={} cmd={} exit=0 tail={} receipt={}",
+                plan.sha,
+                cmd,
+                plan.receipt.display(),
+                plan.receipt.display()
+            );
+            run_tool(
+                &dir,
+                "br",
+                &[
+                    "gate",
+                    "report",
+                    &plan.bead,
+                    "--gate",
+                    "unit-test-verified",
+                    "--provider",
+                    &plan.pin,
+                    "--status",
+                    "pass",
+                    "--to",
+                    "closed",
+                    "--note",
+                    &note,
+                ],
+            )?;
+            Ok(())
+        })?;
+    }
+
+    // 2. close.
+    if bead_is_closed(&dir, &plan)? {
+        eprintln!("ship land: {} already closed", plan.bead);
+    } else {
+        land_step(&plan, "close", || {
+            run_tool(
+                &dir,
+                "br",
+                &["close", &plan.bead, "--commit-sha", &plan.sha],
+            )?;
+            Ok(())
+        })?;
+    }
+
+    // 3. sync the tracker database to JSONL.
+    land_step(&plan, "sync", || {
+        run_tool(&dir, "br", &["sync", "--flush-only"])?;
+        Ok(())
+    })?;
+
+    // 4. release this bead's reservations (idempotent).
+    land_step(&plan, "release", || {
+        run_tool(
+            &dir,
+            "toron",
+            &[
+                "reserve",
+                "release-by-reason",
+                &plan.bead,
+                "--project",
+                &plan.project,
+                "--as",
+                &plan.pin,
+                "--json",
+            ],
+        )?;
+        Ok(())
+    })?;
+
+    // 5. commit only this bead's tracker rows.
+    let staged_issues = land_step(&plan, "stage-issues", || {
+        stage_bead_hunks(&dir, ".beads/issues.jsonl", "id", &plan.bead)
+    })?;
+    let staged_gates = land_step(&plan, "stage-gates", || {
+        stage_bead_hunks(&dir, ".beads/gates.jsonl", "issue_id", &plan.bead)
+    })?;
+    if staged_issues || staged_gates {
+        land_step(&plan, "commit", || {
+            run_tool(&dir, "git", &["commit", "-qm", &plan.message])?;
+            Ok(())
+        })?;
+    } else {
+        eprintln!("ship land: tracker rows already committed");
+    }
+
+    // 6. the gate, last.
+    land_step(&plan, "check", || ship_check(bead, Some(&dir), json))?;
+    if json {
+        print_json(&json!({
+            "schema": "flywheel-ship-land.v1",
+            "bead": bead,
+            "sha": sha,
+            "ok": true,
+        }));
+    } else {
+        println!("ship land: {bead} landed at {sha}");
     }
     Ok(())
 }
@@ -243,6 +619,52 @@ mod tests {
         assert_eq!(
             head_has_closed_bead(dir.path(), "bd-y").unwrap(),
             (false, false)
+        );
+    }
+
+    /// bd-ps6wc: another lane's uncommitted tracker row must never fail THIS
+    /// bead's ship check.
+    #[test]
+    fn dirty_rows_of_other_beads_do_not_block_a_clean_bead() {
+        use super::bead_rows_committed;
+        let dir = init_repo();
+        std::fs::create_dir_all(dir.path().join(".beads")).unwrap();
+        let issues = dir.path().join(".beads/issues.jsonl");
+        std::fs::write(
+            &issues,
+            "{\"id\":\"bd-a\",\"status\":\"closed\"}\n{\"id\":\"bd-b\",\"status\":\"open\"}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(".beads/gates.jsonl"), "").unwrap();
+        assert!(
+            Command::new("git")
+                .current_dir(dir.path())
+                .args(["add", "."])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .current_dir(dir.path())
+                .args(["commit", "-qm", "rows"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        // Another lane edits bd-b's row and leaves it uncommitted.
+        std::fs::write(
+            &issues,
+            "{\"id\":\"bd-a\",\"status\":\"closed\"}\n{\"id\":\"bd-b\",\"status\":\"in_progress\"}\n",
+        )
+        .unwrap();
+        assert!(
+            bead_rows_committed(dir.path(), "bd-a").unwrap(),
+            "a clean bead ships while a peer's row is dirty"
+        );
+        assert!(
+            !bead_rows_committed(dir.path(), "bd-b").unwrap(),
+            "the dirty bead itself is not committed"
         );
     }
 

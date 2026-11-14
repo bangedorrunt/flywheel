@@ -26,8 +26,12 @@ flywheel stack status --check
 flywheel swarm plan <project> [spawn flags]      # byte-equal to spawn --dry-run --json
 flywheel swarm apply <project> --patch <seat>.<field>=<value>   # reconciler -> Ports::seat
 flywheel swarm status [<project>] [--json]       # live seats + plane status
-# after `br close`: bead id in HEAD, clean .beads, committed closed row, legal verdict
+# after `br close`: bead id in HEAD, committed closed row, legal verdict
 flywheel ship check <bead-id>
+# one verb for the whole close ceremony (gate -> close -> sync -> release ->
+# commit ONLY this bead's tracker rows -> check); idempotent, and another
+# lane's dirty tracker row never blocks it
+flywheel ship land <bead-id> --sha <40hex> --receipt <proof> --as <pin>
 # clean-export proof over intended files; add --tests for the doorbell suite
 bash scripts/clean-proof.sh --tests --keep
 # scripts/stack.sh and scripts/ship-check.sh remain compatibility wrappers
@@ -91,9 +95,13 @@ pass.
 - **Identity ladder.** Explicit `--as`, then `AGENT_NAME`. Registered pins
   pass verbatim. Toron guard uses the same two rungs.
 - **Bead create/close.** Create needs `-d`, `--verify` (P≤2 `--principle`).
-  Close = `br gate report` then `br close` (br skill), then
-  `scripts/ship-check.sh <bead-id>` after the close commit. The gate refuses a
-  bead absent from HEAD, a dirty `.beads`, or no legal verdict.
+  Prefer `flywheel ship land <bead> --sha <40hex> --receipt <proof> --as <pin>`:
+  it runs the gate, `br close`, `br sync`, the reservation release, and a
+  tracker commit limited to THAT bead's hunks, then `ship check`; a rerun
+  resumes. Manual equivalent: `br gate report` then `br close` (br skill), then
+  `flywheel ship check <bead-id>`. The check refuses a bead absent from HEAD,
+  an uncommitted row for THIS bead, or no legal verdict — other lanes' dirty
+  tracker rows never block it.
   `flywheel ledger check` needs a bound verdict — `sha=<40-hex>` (fallback) or
   `task=`/`verdict=` (proved); br skill ceremony is SoT.
 - **Tracker.** Agents use `br --json` / `--robot-*`. Bare `br` is the human TUI.

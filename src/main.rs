@@ -3008,6 +3008,7 @@ fn main() {
             "upstream_parity": upstream_parity::robot_summary(),
             "commands": [
                 "init spawn add list status decide rebind recover",
+                "ship check <bead> [--json] | ship land <bead> --sha <40hex> --receipt <file> [--project <p>] [--as <pin>] [--message <m>] (one verb: gate -> close -> sync -> release -> commit THIS bead's tracker rows -> check; idempotent, prints the resume command on failure; another lane's dirty tracker row never blocks)",
                 "spawn <project> [--kind K=N ...] [--dry-run --json] [--patch <seat>.<field>=<value> (repeatable; re-resolves the seat with from: user)] [--model harness-default leaves the harness's own model untouched] [--yes] (ADR-0022 plan spawn; see --help for the full flag list)",
                 "swarm plan <project> [spawn flags] | swarm apply <project> [--patch <seat>.<field>=<value>] [--count <role>=<n>] [--json] | swarm status [<project>] [--json] (ADR-0022 rollout 6 + D7 remainder: plan prints the SAME flywheel-plan.v1 object as `spawn --dry-run --json`; apply is the one mechanism — patch/count -> pure reconciler -> the one `Ports::seat` interpreter, journal-first; fields harness|model|effort|mode|role (role only on apply; spawn rejects it); `--count role=+1` grows the fleet within crew.max; Spawn/InjectRole run live (InjectRole never for review/verify seats); `binding-rebind --model` routes here; status lists live seats with the plane's status)",
             "send interrupt view output watch attach kill",
