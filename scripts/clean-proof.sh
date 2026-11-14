@@ -5,7 +5,7 @@
 #   build (warnings are errors) · `test --workspace --no-run` (every target,
 #   tests/ included) · full `-p flywheel --bin flywheel` suite · `workflow
 #   verify` with a hermetic XDG_CONFIG_HOME · doorbell crates · verify-clippy ·
-#   verify-formal (TLC).
+#   verify-formal (TLC) · verify-coverage (the behavior ledger).
 #
 # Siblings come from proof.toml (path + rev); their rev is archived from git
 # objects, never a dirty working tree. No proof.toml means a single-repo project.
@@ -164,6 +164,7 @@ run_step build "${MBX[@]}" build --workspace --all-targets || true
   "${MBX[@]}" test -p doorbell-cli -p doorbell-rt -p doorbell-core || true
 [ -n "$FAILED_STEP" ] || run_step verify-clippy bash scripts/verify-clippy.sh || true
 [ -n "$FAILED_STEP" ] || run_step verify-formal bash scripts/verify-formal.sh || true
+[ -n "$FAILED_STEP" ] || run_step verify-coverage bash scripts/verify-coverage.sh || true
 
 # Opt-in mutations, applied inside the export only (never the repo).
 MUTATION_RECORDS=""

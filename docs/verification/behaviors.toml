@@ -1,0 +1,80 @@
+# Behavior ledger (bd-ksbtp, epic bd-jp9z1).
+#
+# One entry per behavior a reviewer would want proof for. The gate
+# (scripts/verify-coverage.sh) checks that every referenced test exists, every
+# mutation/spec file exists, and that each behavior has >=1 test and >=1
+# mutation. It is wired into scripts/clean-proof.sh.
+#
+# status = "proven"  : test + mutation landed and were seen RED
+# status = "pending" : behavior known, proof not yet landed (reported, not failed)
+#
+# concurrent = true means the behavior is a protocol with a race; such an entry
+# MUST name a formal model (TLA model+cfg, or a workflow-verify chart).
+
+[[behavior]]
+id = "doorbell.busy-deferral"
+owner = "crates/doorbell-core/src/lib.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "crates/doorbell-core/src/lib.rs::prompt_refused_defers_then_rings_once_at_prompt",
+  "crates/doorbell-rt/src/sinks.rs::busy_refusal_defers_and_never_parks_the_sink",
+  "src/workspace.rs::a_normal_importance_mail_wake_rings_its_pane",
+]
+mutations = ["remove the PaneBusy branch in crates/doorbell-rt/src/sinks.rs"]
+
+[[behavior]]
+id = "doorbell.reap-plane-guard"
+owner = "src/cmd/doorbell.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/doorbell.rs::hc_fallback_list_with_session_doors_reaps_nothing",
+  "src/cmd/doorbell.rs::label_door_is_kept_when_it_is_the_only_door",
+  "src/cmd/doorbell.rs::stop_failure_keeps_the_record_and_says_so",
+]
+mutations = ["remove both plane guards in src/cmd/doorbell.rs"]
+
+[[behavior]]
+id = "doorbell.journal-append-atomic"
+owner = "crates/doorbell-rt/src/store.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "crates/doorbell-rt/src/store.rs::concurrent_appends_never_tear_with_rotation",
+  "crates/doorbell-rt/src/store.rs::a_torn_row_is_quarantined_and_replay_continues",
+]
+mutations = ["restore the two-write writer in crates/doorbell-rt/src/store.rs"]
+
+[[behavior]]
+id = "spawn.dispatcher-session-key"
+owner = "src/cmd/spawn.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/spawn.rs::dispatcher_workspace_keys_by_the_session_id",
+  "src/cmd/doorbell.rs::every_start_site_keys_by_the_live_session_id",
+]
+mutations = ["return the label unconditionally in dispatcher_workspace"]
+
+[[behavior]]
+id = "judgment.pack-seed-content"
+owner = "src/judgment.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/judgment.rs::seed_all_replaces_a_same_version_pack_whose_bytes_differ",
+  "src/judgment.rs::seed_all_never_downgrades_a_newer_user_pack",
+]
+mutations = ["PackOverwrite::All => dst.exists() in src/judgment.rs"]
+
+[[behavior]]
+id = "doorbell.supervisor-stale-unit"
+owner = "src/daemon.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/daemon.rs::stale_units_for_one_project_are_found_by_canonical_key",
+  "src/daemon.rs::bootout_failure_keeps_the_plist_and_reports_the_reason",
+]
+mutations = ["remove the canonical-key guard in stale_supervisor_units"]

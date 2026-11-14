@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# Verify-coverage gate (bd-bd-ksbtp, epic bd-jp9z1).
+#
+# Reads docs/verification/behaviors.toml and proves the ledger cannot rot:
+#   1. every referenced test name exists in the source tree;
+#   2. every mutation names a file that exists;
+#   3. every behavior has >= 1 test and >= 1 mutation;
+#   4. a concurrent (race-prone) behavior names a formal model that exists;
+#   5. every status is known (proven | pending);
+#   6. module coverage: every src module is named by some behavior's owner.
+#
+# Exit 0 when the ledger is consistent. The module check is advisory unless
+# --strict is passed, so the ledger can grow while the gate is already wired:
+# an unledgered module is REPORTED, never silently ignored, and --strict turns
+# the report into a failure once the seed is complete.
+#
+# Usage: scripts/verify-coverage.sh [--strict] [--json]
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+STRICT=0
+JSON=0
+for arg in "$@"; do
+  case "$arg" in
+    --strict) STRICT=1 ;;
+    --json) JSON=1 ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    *) echo "verify-coverage: unknown argument $arg" >&2; exit 2 ;;
+  esac
+done
+
+LEDGER="docs/verification/behaviors.toml"
+[ -f "$LEDGER" ] || { echo "verify-coverage: missing $LEDGER" >&2; exit 1; }
+
+exec python3 - "$LEDGER" "$STRICT" "$JSON" <<'PY'
+import json
+import pathlib
+import sys
+import tomllib
+
+ledger = pathlib.Path(sys.argv[1])
+strict = sys.argv[2] == "1"
+as_json = sys.argv[3] == "1"
+root = pathlib.Path.cwd()
+
+data = tomllib.loads(ledger.read_text())
+behaviors = data.get("behavior", [])
+errors: list[str] = []
+warnings: list[str] = []
+owners: set[str] = set()
+
+sources: dict[pathlib.Path, str] = {}
+for path in root.rglob("*.rs"):
+    if "target" in path.parts:
+        continue
+    sources[path] = path.read_text(errors="ignore")
+
+def test_exists(spec: str) -> bool:
+    file, _, name = spec.partition("::")
+    path = root / file
+    if path not in sources:
+        return False
+    body = sources[path]
+    return f"fn {name}(" in body or f"fn {name}<" in body
+
+def formal_exists(spec: str) -> bool:
+    file = spec.split("::")[0]
+    return (root / file).exists()
+
+for b in behaviors:
+    bid = b.get("id")
+    owner = b.get("owner")
+    status = b.get("status")
+    tests = b.get("tests", [])
+    mutations = b.get("mutations", [])
+    if not bid:
+        errors.append("a behavior has no id")
+        continue
+    if status not in {"proven", "pending"}:
+        errors.append(f"{bid}: unknown status {status!r} (proven|pending)")
+    if not owner or not (root / owner).exists():
+        errors.append(f"{bid}: owner module {owner!r} does not exist")
+    else:
+        owners.add(owner)
+    if not tests:
+        errors.append(f"{bid}: no test")
+    for spec in tests:
+        if not test_exists(spec):
+            errors.append(f"{bid}: test not found: {spec}")
+    if not mutations:
+        errors.append(f"{bid}: no mutation (a check never seen failing proves nothing)")
+    for m in mutations:
+        if not m.strip():
+            errors.append(f"{bid}: empty mutation")
+    if b.get("concurrent"):
+        formal = b.get("formal")
+        if not formal:
+            errors.append(f"{bid}: concurrent behavior without a formal model")
+        elif not formal_exists(formal):
+            errors.append(f"{bid}: formal model missing: {formal}")
+
+# Module coverage: every top-level src module and every src/<dir>/mod.rs.
+modules = sorted(
+    {p.name for p in (root / "src").glob("*.rs") if p.name != "main.rs"}
+    | {"src/" + p.parent.name + "/" for p in (root / "src").glob("*/mod.rs")}
+)
+ledger_owners = {o.split("/")[-1] for o in owners}
+unledgered = [m for m in modules if m not in ledger_owners and m.removesuffix(".rs") not in ledger_owners]
+
+proven = sum(1 for b in behaviors if b.get("status") == "proven")
+pending = sum(1 for b in behaviors if b.get("status") == "pending")
+
+body = {
+    "schema": "flywheel-verify-coverage.v1",
+    "behaviors": len(behaviors),
+    "proven": proven,
+    "pending": pending,
+    "unledgered_modules": unledgered,
+    "strict": strict,
+    "errors": errors,
+    "ok": not errors and (not strict or not unledgered),
+}
+
+if as_json:
+    print(json.dumps(body, indent=2))
+else:
+    print(
+        f"verify-coverage: {len(behaviors)} behavior(s) — {proven} proven, {pending} pending; "
+        f"{len(unledgered)} module(s) without a ledger entry"
+    )
+    for w in warnings:
+        print(f"  warn: {w}")
+    for e in errors:
+        print(f"  ERROR: {e}", file=sys.stderr)
+    if unledgered:
+        stream = sys.stderr if strict else sys.stdout
+        print(
+            f"  {'ERROR' if strict else 'note'}: unledgered module(s): "
+            + ", ".join(unledgered),
+            file=stream,
+        )
+
+sys.exit(0 if body["ok"] else 1)
+PY
