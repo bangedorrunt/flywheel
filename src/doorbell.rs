@@ -1043,24 +1043,6 @@ pub fn append_deferred_wake(
     })?
 }
 
-/// Pending deferrals for a project, without taking them: which pins are holding
-/// a wake that never rang. Read-only, so a watch may look at the same file the
-/// dispatcher owns.
-pub fn pending_deferred_wakes(state_dir: &Path, project: &str) -> Vec<(String, String)> {
-    let path = deferred_wakes_path(state_dir, project);
-    let Ok(raw) = fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    raw.lines()
-        .filter_map(|row| serde_json::from_str::<serde_json::Value>(row.trim()).ok())
-        .filter_map(|v| {
-            Some((
-                v.get("pin")?.as_str()?.to_string(),
-                v.get("line")?.as_str()?.to_string(),
-            ))
-        })
-        .collect()
-}
 
 /// Take the wakes this host hosts, leaving the rest for the dispatcher that
 /// owns those pins (a project can run one dispatcher per plane session, and a
