@@ -4666,6 +4666,19 @@ pub struct PackSeedReport {
     pub dry_run: bool,
 }
 
+/// The bundled default for one pack id: (file name, body).
+pub fn bundled_pack(id: &str) -> Option<(&'static str, &'static str)> {
+    default_judgment_packs()
+        .iter()
+        .copied()
+        .find(|(name, _)| pack_entry(Path::new(name)).is_some_and(|(eid, _)| eid == id))
+}
+
+/// The version of a bundled pack id, from its file name.
+fn bundled_version(id: &str) -> Option<u32> {
+    bundled_pack(id).and_then(|(name, _)| pack_entry(Path::new(name)).map(|(_, v)| v))
+}
+
 /// Copy project-tier packs UP into the user tier, which is the loader's source
 /// of truth. Same contract as `workflow seed`: fill gaps by default, replace
 /// only on request, back up before replacing.
@@ -4681,18 +4694,40 @@ pub fn pack_seed(
     };
     let rows = pack_drift(user_dir, project_dir);
     for row in rows {
-        if row.status == "user-only" || row.status == "newer-user" {
+        // A user-only row is only a dead end when no bundled default exists:
+        // the bundled packs ARE a source tier (bd-0op96).
+        if row.status == "newer-user"
+            || (row.status == "user-only" && bundled_pack(&row.id).is_none())
+        {
             rep.kept.push(row.id);
             continue;
         }
-        let Some(src) = highest_pack(project_dir, &row.id) else {
-            continue;
+        let project_src = highest_pack(project_dir, &row.id);
+        let (src_name, src_bytes) = match project_src {
+            Some(path) => {
+                let Some(name) = path.file_name().map(|n| n.to_owned()) else {
+                    continue;
+                };
+                let Ok(bytes) = std::fs::read(&path) else {
+                    continue;
+                };
+                (name, bytes)
+            }
+            None => match bundled_pack(&row.id) {
+                Some((name, body)) => (std::ffi::OsString::from(name), body.as_bytes().to_vec()),
+                None => continue,
+            },
         };
-        let dst = user_dir.join(src.file_name().expect("pack path has a file name"));
+        let dst = user_dir.join(&src_name);
+        let user_newer = row
+            .user_version
+            .zip(row.project_version.or_else(|| bundled_version(&row.id)))
+            .is_some_and(|(u, s)| u > s);
+        let identical = std::fs::read(&dst).ok().is_some_and(|b| b == src_bytes);
         let replace = match scope {
             PackOverwrite::None => false,
-            PackOverwrite::Stale => row.status == "stale",
-            PackOverwrite::All => dst.exists(),
+            PackOverwrite::Stale => !identical && !user_newer,
+            PackOverwrite::All => dst.exists() && !identical && !user_newer,
         };
         if dst.exists() {
             if !replace {
@@ -4708,16 +4743,13 @@ pub fn pack_seed(
                 std::fs::write(&bak, prev)?;
             }
             std::fs::create_dir_all(user_dir)?;
-            std::fs::copy(&src, &dst)
-                .map_err(|e| anyhow::anyhow!("copy {} -> {}: {e}", src.display(), dst.display()))?;
+            std::fs::write(&dst, &src_bytes)?;
             rep.overwritten.push(row.id);
         } else {
             rep.copied.push(row.id);
             if !dry_run {
                 std::fs::create_dir_all(user_dir)?;
-                std::fs::copy(&src, &dst).map_err(|e| {
-                    anyhow::anyhow!("copy {} -> {}: {e}", src.display(), dst.display())
-                })?;
+                std::fs::write(&dst, &src_bytes)?;
             }
         }
     }
@@ -5000,6 +5032,62 @@ mod bd_pack_sync {
                 .expect("read")
                 .contains("# LOCAL"),
             "an existing user pack must never be replaced without --overwrite"
+        );
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// bd-0op96: `--overwrite all` over a same-version user pack whose CONTENT
+    /// changed must replace it from the bundled default (with a .bak), because
+    /// bd-5bno9 changed pack content without bumping versions. Version-only
+    /// comparison kept all 8 packs and the operator's order never took effect.
+    #[test]
+    fn seed_all_replaces_a_same_version_pack_whose_bytes_differ() {
+        let r = root("all-content");
+        let user = r.join("judgment-packs");
+        std::fs::create_dir_all(&user).expect("mkdir");
+        let id = "reclassify.v1.yaml";
+        let (name, body) = bundled_pack("reclassify").expect("bundled reclassify");
+        assert_eq!(name, id);
+        std::fs::write(user.join(id), format!("{body}\n# operator copy\n")).expect("write");
+
+        let rep =
+            pack_seed(&user, &r.join("no-project-tier"), PackOverwrite::All, false).expect("seed");
+        assert_eq!(rep.overwritten, vec!["reclassify".to_string()]);
+        assert!(
+            user.join(format!("{id}.bak")).exists(),
+            "the operator copy is backed up, never destroyed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(user.join(id)).expect("read"),
+            body,
+            "the bundled default lands"
+        );
+
+        // Identical bytes is a no-op.
+        let rep2 =
+            pack_seed(&user, &r.join("no-project-tier"), PackOverwrite::All, false).expect("seed");
+        assert!(rep2.overwritten.is_empty(), "identical is kept: {rep2:?}");
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// A user pack NEWER than the bundled default is never downgraded, even
+    /// with --overwrite all.
+    #[test]
+    fn seed_all_never_downgrades_a_newer_user_pack() {
+        let r = root("all-newer");
+        let user = r.join("judgment-packs");
+        std::fs::create_dir_all(&user).expect("mkdir");
+        std::fs::write(
+            user.join("reclassify.v9.yaml"),
+            "name: reclassify\nversion: 9\nquestions: []\n",
+        )
+        .expect("write");
+        let rep =
+            pack_seed(&user, &r.join("no-project-tier"), PackOverwrite::All, false).expect("seed");
+        assert!(rep.overwritten.is_empty(), "never downgrade: {rep:?}");
+        assert!(
+            user.join("reclassify.v9.yaml").exists(),
+            "the operator's newer pack stays"
         );
         let _ = std::fs::remove_dir_all(&r);
     }
