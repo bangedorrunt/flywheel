@@ -322,7 +322,9 @@ fn bead_is_closed(dir: &Path, plan: &LandPlan) -> Result<bool> {
 /// Stage ONLY the hunks that mention this bead, so another lane's uncommitted
 /// tracker row is never captured (bd-ps6wc). Returns whether anything staged.
 fn stage_bead_hunks(dir: &Path, file: &str, key: &str, bead: &str) -> Result<bool> {
-    let diff = git(dir, &["diff", "-U0", "--", file]).unwrap_or_default();
+    // -U3 keeps context so `git apply --cached` can locate the hunk even when
+    // a peer's row shifted the line numbers (bd-ps6wc).
+    let diff = git(dir, &["diff", "-U3", "--", file]).unwrap_or_default();
     if diff.trim().is_empty() {
         return Ok(false);
     }
@@ -348,7 +350,11 @@ fn stage_bead_hunks(dir: &Path, file: &str, key: &str, bead: &str) -> Result<boo
     }
     let keep: Vec<String> = hunks
         .into_iter()
-        .filter(|h| h.iter().any(|line| line.contains(&needle)))
+        .filter(|h| {
+            h.iter()
+                .filter(|line| line.starts_with('+') || line.starts_with('-'))
+                .any(|line| line.contains(&needle))
+        })
         .map(|h| h.join("\n"))
         .collect();
     if keep.is_empty() {
