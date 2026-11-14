@@ -815,6 +815,13 @@ impl FileStore {
     /// One fingerprint per line, append-only, never pruned: the size is bounded by
     /// the number of DISTINCT tears, which is a handful, not by the traffic that
     /// produces reports.
+    /// Raw journal lines the fold could not parse, kept beside the journal
+    /// (bd-nrxgz): a skipped row is quarantined, never silently dropped.
+    fn torn_quarantine_file(&self, workspace: &str) -> std::path::PathBuf {
+        self.journal_file(workspace)
+            .with_file_name(format!("doorbell-journal-{workspace}.torn"))
+    }
+
     fn loudmiss_file(&self, workspace: &str) -> std::path::PathBuf {
         let dir = self.audit_file(workspace);
         let stem = dir.file_stem().and_then(|s| s.to_str()).unwrap_or("audit");
@@ -871,6 +878,8 @@ impl FileStore {
         let mut torn: Option<TornTail> = None;
         let drops = self.retention_drops(workspace);
         let chain = self.journal_chain(workspace);
+        let mut skipped = 0usize;
+        let mut quarantined: Vec<String> = Vec::new();
         'files: for path in &chain {
             let Ok(raw) = std::fs::read_to_string(path) else {
                 continue;
@@ -881,17 +890,24 @@ impl FileStore {
                     continue;
                 }
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-                    torn = Some(TornTail {
-                        at_line: idx + 1,
-                        file: path.display().to_string(),
-                        reason: "unparseable row".into(),
-                        missing_seqs: 0,
-                        missing_from: None,
-                        missing_to: None,
-                        rows_withheld: 0,
-                        explained_by_drop: None,
-                    });
-                    break 'files;
+                    // bd-nrxgz: a torn row must not stop replay. Record the
+                    // tear once, quarantine the raw line, and keep folding —
+                    // the rows after the tear are the ones an operator needs.
+                    skipped += 1;
+                    if torn.is_none() {
+                        torn = Some(TornTail {
+                            at_line: idx + 1,
+                            file: path.display().to_string(),
+                            reason: "unparseable row".into(),
+                            missing_seqs: 0,
+                            missing_from: None,
+                            missing_to: None,
+                            rows_withheld: 0,
+                            explained_by_drop: None,
+                        });
+                    }
+                    quarantined.push(line.to_string());
+                    continue;
                 };
                 if let Some(s) = v.get("seq").and_then(|s| s.as_u64()) {
                     if first_seq.is_none() {
@@ -920,6 +936,15 @@ impl FileStore {
                         let missing_from = p + 1;
                         let missing_to = s - 1;
                         let missing = s - p - 1;
+                        if torn.is_some() && missing <= skipped as u64 {
+                            // The quarantined rows carried those seqs; the
+                            // tear below already reports them.
+                            prev_seq = Some(s);
+                            if keep_rows {
+                                rows.push(v);
+                            }
+                            continue;
+                        }
                         match drops.iter().find(|d| d.explains(missing_from, missing_to)) {
                             Some(_) => {}
                             None => {
@@ -946,6 +971,22 @@ impl FileStore {
                 if keep_rows {
                     rows.push(v);
                 }
+            }
+        }
+        // bd-nrxgz: quarantine the torn rows once, beside the audit trail, so
+        // a skipped line is never silently lost; the fold above already
+        // carried the rows after the tear.
+        if keep_rows && !quarantined.is_empty() {
+            let path = self.torn_quarantine_file(workspace);
+            if let Some(parent) = path.parent() {
+                let _ = private_dir(parent);
+            }
+            if let Ok(mut f) = private_append(&path) {
+                use std::io::Write;
+                for line in &quarantined {
+                    let _ = writeln!(f, "{line}");
+                }
+                let _ = f.flush();
             }
         }
         if let Some(t) = torn.as_mut() {
@@ -1489,6 +1530,49 @@ mod tests {
         let fold = st.fold_workspace("w");
         assert!(fold.torn.is_none(), "rotation must not tear the fold");
         assert!(!fold.rows.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// bd-nrxgz: a torn row must not stop replay. Rows after the tear fold,
+    /// the tear is reported once, and the raw line is quarantined beside the
+    /// journal instead of vanishing.
+    #[test]
+    fn a_torn_row_is_quarantined_and_replay_continues() {
+        let (st, dir) = test_store("torn-continue");
+        let mut body = String::new();
+        for seq in 1..=3u64 {
+            body.push_str(&format!(
+                "{{\"v\":2,\"seq\":{seq},\"actions\":[],\"executed\":{{}}}}\n"
+            ));
+        }
+        body.push_str("{\"v\":2,\"seq\":4,\"actions\":[\"trunc\n");
+        for seq in 5..=7u64 {
+            body.push_str(&format!(
+                "{{\"v\":2,\"seq\":{seq},\"actions\":[],\"executed\":{{}}}}\n"
+            ));
+        }
+        let active = st.journal_file("w");
+        std::fs::create_dir_all(active.parent().expect("journals dir")).expect("mkdir journals");
+        std::fs::write(&active, &body).expect("torn journal");
+
+        let fold = st.fold_workspace("w");
+        let seqs: Vec<u64> = fold
+            .rows
+            .iter()
+            .filter_map(|r| r.get("seq").and_then(serde_json::Value::as_u64))
+            .collect();
+        assert_eq!(
+            seqs,
+            vec![1, 2, 3, 5, 6, 7],
+            "replay continues past the tear"
+        );
+        let torn = fold.torn.expect("the tear is still reported");
+        assert!(torn.reason.contains("unparseable"), "{:?}", torn.reason);
+        let sidecar = st
+            .journal_file("w")
+            .with_file_name("doorbell-journal-w.torn");
+        let raw = std::fs::read_to_string(&sidecar).expect("quarantine sidecar");
+        assert!(raw.contains("\"seq\":4"), "the raw line is kept: {raw}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
