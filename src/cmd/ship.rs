@@ -630,8 +630,10 @@ mod tests {
     #[test]
     fn land_refuses_a_repo_whose_dir_is_not_its_toron_slug() {
         let workspace = tempfile::tempdir().expect("workspace root");
-        let mut cfg = Config::default();
-        cfg.workspace_root = Some(workspace.path().display().to_string());
+        let cfg = Config {
+            workspace_root: Some(workspace.path().display().to_string()),
+            ..Config::default()
+        };
 
         let outside = tempfile::tempdir().expect("repo outside the workspace");
         let err = land_project(&cfg, outside.path(), None)
