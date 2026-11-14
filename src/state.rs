@@ -1052,23 +1052,15 @@ pub fn load_agent_names(dir: &std::path::Path) -> Vec<SpawnEntry> {
     serde_json::from_str(&raw).unwrap_or_default()
 }
 
-/// Captain alias persistence (ADR-0025 Spec 4 Wave 4a).
-///
-/// Production alias lives in toron (`contact captain --clear` / --pin);
-/// flywheel mirrors the *presence* of the alias in the state dir so
-/// `mail send --to captain` can fail loud when alias is cleared under
-/// `continue` / `adopt` until rebound, and so `recover` (= adopt) can
-/// rebind it without a toron flag. File: `state_dir/captain_alias/<key>.json`.
+/// The legacy captain-alias file path. The value lives in toron; this file is
+/// no longer read.
 pub fn captain_alias_file(project: &str) -> PathBuf {
     state_dir()
         .join("captain_alias")
         .join(format!("{}.json", state_key(project)))
 }
 
-/// The captain pin, from TORON ONLY. Identity has one store (toron's
-/// `agent_name_aliases` fold); the flywheel file is a legacy mirror and is
-/// never read as the value source (a stale file said WindyCreek while toron
-/// said SlateHarbor — the bd-8fiwv live split-brain).
+/// The captain pin, from toron's alias fold.
 pub fn load_captain_alias(project: &str) -> Option<String> {
     crate::backend::run_mail_off_runtime_sync(|| {
         let mailbox = crate::mail::comms_mailbox().ok()?;
@@ -1077,19 +1069,10 @@ pub fn load_captain_alias(project: &str) -> Option<String> {
     })
 }
 
-/// The captain/operator pin for `project`, from the one authoritative source
-/// available to a sync caller: flywheel's alias file first, then toron's
-/// canonical `captain` alias in the shared store. `project_key` is the mail
-/// project key (the absolute project dir, as every mail write uses).
-///
-/// The supervisor and `swarm status` use this to keep the captain seat out of
-/// the reconcile (ADR-0022 D7): identified by ROLE, never by a name literal.
+/// The captain/operator pin for `project_key` (a path or slug), from toron's
+/// fold. `Mailbox::captain_alias` canonicalizes the key, so a row written by
+/// `toron contact captain --project <slug>` is found from a path lookup too.
 pub fn captain_pin(_project: &str, project_key: &str) -> Option<String> {
-    // The ONE resolver: `Mailbox::captain_alias` canonicalizes a path-form key
-    // and reads over the project read set, so a row written by
-    // `toron contact captain --project <slug>` (keyed by the slug) is found
-    // from the supervisor/CLI path key too. Mirrors `whois`. TORON ONLY: the
-    // flywheel alias file is never consulted (bd-8fiwv live split-brain).
     crate::backend::run_mail_off_runtime_sync(|| {
         let mailbox = crate::mail::comms_mailbox().ok()?;
         let rt = crate::mail::runtime().ok()?;
@@ -1099,51 +1082,44 @@ pub fn captain_pin(_project: &str, project_key: &str) -> Option<String> {
     })
 }
 
-/// Explicit-clear tombstone. A brand-new project has no alias and was never
-/// cleared; only `clear_captain_alias_file` writes this marker, so the two
-/// states stay distinguishable (ADR-0025 Spec 4 Wave 4a).
+/// Explicit-clear tombstone: a brand-new project has no alias and was never
+/// cleared; only [`clear_captain_alias_file`] writes this marker.
 fn captain_alias_cleared_marker(project: &str) -> PathBuf {
     state_dir()
         .join("captain_alias")
         .join(format!("{}.cleared", state_key(project)))
 }
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_CAPTAIN_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Bind the captain to `pin` in toron's fold. A failed write is an error: the
+/// alias is the only value readers see.
 pub fn save_captain_alias(project: &str, pin: &str) -> Result<()> {
-    // toron owns identity: write the fold first (the only value readers see).
-    let wrote = crate::backend::run_mail_off_runtime_sync(|| -> anyhow::Result<()> {
+    #[cfg(test)]
+    if FAIL_CAPTAIN_WRITE.with(|c| c.get()) {
+        bail!("injected toron captain write failure");
+    }
+    crate::backend::run_mail_off_runtime_sync(|| -> anyhow::Result<()> {
         let mailbox = crate::mail::comms_mailbox()?;
         let rt = crate::mail::runtime()?;
         rt.block_on(mailbox.set_captain_alias(project, pin))
-    });
-    if let Err(e) = wrote {
-        eprintln!(
-            "flywheel: warn: cannot write the toron captain alias for {project}: {e:#} (the legacy file mirror is written, but toron is the only value source)"
-        );
-    }
-    // Legacy mirror (never read as the value source; kept so tooling that
-    // inspects the file still sees a pin).
-    let path = captain_alias_file(project);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let body = serde_json::to_string_pretty(&serde_json::json!({ "pin": pin }))?;
-    crate::project_state::write_atomic(&path, body.as_bytes())?;
+    })?;
     let _ = std::fs::remove_file(captain_alias_cleared_marker(project));
     Ok(())
 }
 
+/// Clear the captain alias in toron and leave the cleared tombstone.
 pub fn clear_captain_alias_file(project: &str) {
-    // Clear the authoritative toron fold too, so a cleared alias is not
-    // resurrected by the stale-file read path (there is none now) or by a
-    // later toron read.
     let _ = crate::backend::run_mail_off_runtime_sync(|| -> anyhow::Result<()> {
         let mailbox = crate::mail::comms_mailbox()?;
         let rt = crate::mail::runtime()?;
         rt.block_on(mailbox.clear_captain_alias(project))?;
         Ok(())
     });
-    let path = captain_alias_file(project);
-    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(captain_alias_file(project));
     let marker = captain_alias_cleared_marker(project);
     if let Some(parent) = marker.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -2929,6 +2905,23 @@ mod tests {
         assert!(
             !is_captain_alias_cleared(&project),
             "rebinding removes the clear marker"
+        );
+    }
+
+    /// A failed toron write is an error, never a warn-and-Ok: the alias is
+    /// the only value readers see, so a caller must not believe it was set.
+    #[test]
+    fn save_captain_alias_errors_when_the_toron_write_fails() {
+        let _g = crate::config::test_state_home();
+        let project = format!("alias-write-fail-{}", std::process::id());
+        FAIL_CAPTAIN_WRITE.with(|c| c.set(true));
+        let err = save_captain_alias(&project, "BraveCaptain")
+            .expect_err("a failed toron write must be an error");
+        FAIL_CAPTAIN_WRITE.with(|c| c.set(false));
+        assert!(format!("{err}").contains("injected"), "{err}");
+        assert!(
+            load_captain_alias(&project).is_none(),
+            "nothing was bound when the write failed"
         );
     }
 
