@@ -402,7 +402,7 @@ fn nearby_leases(cfg: &Config, project: &str) -> Vec<(String, String)> {
 }
 
 pub(crate) fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
-    crate::check_project_spelling(project, "doorbell status")?;
+    let project = &canonical_project_key(project, "doorbell status")?;
     if crate::cmd::spawn::proxy_doorbell_verb(cfg, "status", &[])? {
         return Ok(());
     }
@@ -611,7 +611,7 @@ fn record_doorbell_arms(
 }
 
 pub(crate) fn cmd_doorbell_start(cfg: &Config, project: &str) -> Result<()> {
-    crate::check_project_spelling(project, "doorbell start")?;
+    let project = &canonical_project_key(project, "doorbell start")?;
     let snap = crate::snapshot::assemble(cfg, project, crate::doorbell_now_unix());
     let live_label = snap.workspace.clone();
     let live_id = snap.workspace_id.clone();
@@ -664,7 +664,7 @@ pub(crate) fn cmd_doorbell_start(cfg: &Config, project: &str) -> Result<()> {
 /// minute, and exit when this executable changes so launchd/systemd restarts
 /// the new binary. The installed unit runs exactly this command.
 pub(crate) fn cmd_doorbell_supervise(cfg: &Config, project: &str) -> Result<()> {
-    crate::check_project_spelling(project, "doorbell supervise")?;
+    let project = &canonical_project_key(project, "doorbell supervise")?;
     let exe = std::env::current_exe()?;
     let stamp = binary_stamp(&exe);
     loop {
@@ -690,6 +690,13 @@ fn binary_stamp(path: &std::path::Path) -> Option<(u64, std::time::SystemTime)> 
 /// files and the central daemon arms use the stable project label. A host
 /// started with the label retires with `workspace-gone` even though the
 /// panes are live; map the label to the snapshot's ID for the local host.
+/// The project key every door folds through: a path names the same project
+/// as its slug, and one project must not get two dispatchers (bd-1mi26).
+fn canonical_project_key(project: &str, door: &str) -> Result<String> {
+    crate::check_project_spelling(project, door)?;
+    Ok(crate::doorbell::canonical_project(project))
+}
+
 fn doorbell_host_key<'a>(label: &'a str, live_label: &'a str, live_id: &'a str) -> &'a str {
     crate::doorbell::canonical_workspace(label, live_label, live_id)
 }
@@ -703,7 +710,7 @@ fn canonical_workspaces(workspaces: &[String], live_label: &str, live_id: &str) 
 }
 
 pub(crate) fn cmd_doorbell_stop(cfg: &Config, project: &str, workspace: &str) -> Result<()> {
-    crate::check_project_spelling(project, "doorbell stop")?;
+    let project = &canonical_project_key(project, "doorbell stop")?;
     if workspace == "all" && crate::cmd::spawn::proxy_doorbell_verb(cfg, "stop", &[])? {
         return Ok(());
     }
@@ -3502,5 +3509,62 @@ mod doorbell_canonical_workspace_tests {
             raw.as_str() != keys[0] && doorbell_host_key(raw, LABEL, SESSION) == keys[0]
         });
         assert_eq!(alias.map(String::as_str), Some(LABEL));
+    }
+}
+
+#[cfg(test)]
+mod doorbell_canonical_project_tests {
+    use super::*;
+    use crate::doorbell::{DoorbellState, state_file, write_state};
+
+    const PATH: &str = "/Users/op/workspace/chiebukuro";
+    const SLUG: &str = "chiebukuro";
+
+    /// One project, one key: a path-valued project is the slug it names.
+    #[test]
+    fn a_path_and_its_slug_are_the_same_project_key() {
+        assert_eq!(canonical_project_key(PATH, "test").unwrap(), SLUG);
+        assert_eq!(canonical_project_key(SLUG, "test").unwrap(), SLUG);
+        assert_eq!(
+            canonical_project_key("/Users/op/workspace/chiebukuro/", "test").unwrap(),
+            SLUG,
+            "a trailing separator is still the same project"
+        );
+        assert_eq!(
+            canonical_project_key("workspace/chiebukuro", "test").unwrap(),
+            SLUG
+        );
+        assert!(
+            canonical_project_key(".", "test").is_err(),
+            "a cwd alias is still refused"
+        );
+    }
+
+    /// The construction site canonicalises: the spawned host's argv can
+    /// never carry a path-valued project.
+    #[test]
+    fn spawn_child_carries_the_slug() {
+        let src = include_str!("../doorbell.rs");
+        let at = src.find("fn spawn_child(").expect("spawn_child");
+        let body = &src[at..];
+        let end = body.find("\n}\n").expect("body end");
+        assert!(
+            body[..end].contains("let project = canonical_project(project);"),
+            "spawn_child must canonicalise the project before building argv"
+        );
+    }
+
+    /// Every door folds through the same key: a path cannot open a second
+    /// dispatcher path for one project (chibuikuro live bug).
+    #[test]
+    fn every_door_folds_through_the_project_key() {
+        let src = include_str!("doorbell.rs");
+        for door in ["status", "start", "supervise", "stop"] {
+            let needle = format!("canonical_project_key(project, \"doorbell {door}\")");
+            assert!(
+                src.contains(&needle),
+                "doorbell {door} must canonicalise the project: missing {needle}"
+            );
+        }
     }
 }

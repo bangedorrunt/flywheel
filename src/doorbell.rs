@@ -251,6 +251,23 @@ pub fn canonical_workspace<'a>(ws: &'a str, live_label: &str, live_id: &'a str) 
     }
 }
 
+/// Canonical project key: a filesystem path names the same project as its
+/// directory slug (`…/workspace/chiebukuro` == `chiebukuro`), so a
+/// path-valued `--project` never starts a second dispatcher for one project
+/// (bd-1mi26). Pure and total: a bare slug is already canonical.
+pub fn canonical_project(project: &str) -> String {
+    let trimmed = project.trim();
+    if !trimmed.contains(std::path::MAIN_SEPARATOR) && !trimmed.contains('/') {
+        return trimmed.to_string();
+    }
+    std::path::Path::new(trimmed)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .filter(|slug| !slug.is_empty())
+        .unwrap_or_else(|| trimmed.to_string())
+}
+
 /// `workspaces` collapsed to their canonical dispatcher keys, order kept,
 /// first occurrence wins. Every register/start/stop/heal/report path folds
 /// through this so a label and its session id never act as two workspaces.
@@ -1039,8 +1056,15 @@ fn reap_detached(workspace: &str, mut child: std::process::Child) {
 
 fn spawn_child(exe: &Path, state_dir: &Path, project: &str, workspace: &str) -> Result<()> {
     let state_path = state_file(state_dir, workspace);
+    let project = canonical_project(project);
     let mut cmd = Command::new(exe);
-    cmd.args(["__doorbell", "--project", project, "--workspace", workspace]);
+    cmd.args([
+        "__doorbell",
+        "--project",
+        &project,
+        "--workspace",
+        workspace,
+    ]);
     cmd.stdin(Stdio::null());
     // Keep the host's own diagnostics. `Stdio::null()` made a wedged or
     // crash-looping host invisible (the reason had to be reconstructed from
@@ -1100,6 +1124,7 @@ pub fn ensure_running(
     workspace: &str,
     project: &str,
 ) -> Result<LockAction> {
+    let project = &canonical_project(project);
     let _ = cleanup_legacy_sidecars(state_dir);
     let loaded = crate::config::Config::load().ok();
     let comms_on = match &loaded {
