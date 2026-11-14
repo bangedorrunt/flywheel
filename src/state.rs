@@ -1090,41 +1090,61 @@ fn captain_alias_cleared_marker(project: &str) -> PathBuf {
         .join(format!("{}.cleared", state_key(project)))
 }
 
-#[cfg(test)]
-thread_local! {
-    static FAIL_CAPTAIN_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+/// The toron write behind the alias port: the fold is the only store, so a
+/// failure has nowhere else to land.
+fn toron_write_captain_alias(project: &str, pin: &str) -> anyhow::Result<()> {
+    crate::backend::run_mail_off_runtime_sync(|| -> anyhow::Result<()> {
+        let mailbox = crate::mail::comms_mailbox()?;
+        let rt = crate::mail::runtime()?;
+        rt.block_on(mailbox.set_captain_alias(project, pin))
+    })
+}
+
+/// The toron clear behind the alias port.
+fn toron_clear_captain_alias(project: &str) -> anyhow::Result<()> {
+    crate::backend::run_mail_off_runtime_sync(|| -> anyhow::Result<()> {
+        let mailbox = crate::mail::comms_mailbox()?;
+        let rt = crate::mail::runtime()?;
+        rt.block_on(mailbox.clear_captain_alias(project))?;
+        Ok(())
+    })
 }
 
 /// Bind the captain to `pin` in toron's fold. A failed write is an error: the
 /// alias is the only value readers see.
 pub fn save_captain_alias(project: &str, pin: &str) -> Result<()> {
-    #[cfg(test)]
-    if FAIL_CAPTAIN_WRITE.with(|c| c.get()) {
-        bail!("injected toron captain write failure");
-    }
-    crate::backend::run_mail_off_runtime_sync(|| -> anyhow::Result<()> {
-        let mailbox = crate::mail::comms_mailbox()?;
-        let rt = crate::mail::runtime()?;
-        rt.block_on(mailbox.set_captain_alias(project, pin))
-    })?;
+    save_captain_alias_with(toron_write_captain_alias, project, pin)
+}
+
+fn save_captain_alias_with(
+    write: impl Fn(&str, &str) -> anyhow::Result<()>,
+    project: &str,
+    pin: &str,
+) -> Result<()> {
+    write(project, pin)?;
     let _ = std::fs::remove_file(captain_alias_cleared_marker(project));
     Ok(())
 }
 
-/// Clear the captain alias in toron and leave the cleared tombstone.
-pub fn clear_captain_alias_file(project: &str) {
-    let _ = crate::backend::run_mail_off_runtime_sync(|| -> anyhow::Result<()> {
-        let mailbox = crate::mail::comms_mailbox()?;
-        let rt = crate::mail::runtime()?;
-        rt.block_on(mailbox.clear_captain_alias(project))?;
-        Ok(())
-    });
+/// Clear the captain alias in toron, then leave the cleared tombstone. A
+/// failed clear is an error: the tombstone would claim an alias nobody
+/// cleared.
+pub fn clear_captain_alias_file(project: &str) -> Result<()> {
+    clear_captain_alias_file_with(toron_clear_captain_alias, project)
+}
+
+fn clear_captain_alias_file_with(
+    clear: impl Fn(&str) -> anyhow::Result<()>,
+    project: &str,
+) -> Result<()> {
+    clear(project)?;
     let _ = std::fs::remove_file(captain_alias_file(project));
     let marker = captain_alias_cleared_marker(project);
     if let Some(parent) = marker.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = crate::project_state::write_atomic(&marker, b"cleared");
+    Ok(())
 }
 
 pub fn is_captain_alias_cleared(project: &str) -> bool {
@@ -2896,7 +2916,7 @@ mod tests {
         );
         save_captain_alias(&project, "BraveCaptain").unwrap();
         assert!(!is_captain_alias_cleared(&project));
-        clear_captain_alias_file(&project);
+        clear_captain_alias_file(&project).unwrap();
         assert!(
             is_captain_alias_cleared(&project),
             "an explicit clear is recorded"
@@ -2908,20 +2928,34 @@ mod tests {
         );
     }
 
-    /// A failed toron write is an error, never a warn-and-Ok: the alias is
-    /// the only value readers see, so a caller must not believe it was set.
+    /// The writer port is where the real toron write fails, so the `?` that
+    /// carries it to the caller is the code under test. A warn-and-Ok there
+    /// leaves the caller believing the captain is bound.
     #[test]
-    fn save_captain_alias_errors_when_the_toron_write_fails() {
-        let _g = crate::config::test_state_home();
+    fn save_captain_alias_propagates_a_writer_failure() {
         let project = format!("alias-write-fail-{}", std::process::id());
-        FAIL_CAPTAIN_WRITE.with(|c| c.set(true));
-        let err = save_captain_alias(&project, "BraveCaptain")
-            .expect_err("a failed toron write must be an error");
-        FAIL_CAPTAIN_WRITE.with(|c| c.set(false));
+        let err = save_captain_alias_with(
+            |_, _| bail!("injected toron captain write failure"),
+            &project,
+            "BraveCaptain",
+        )
+        .expect_err("a failed writer must reach the caller");
+        assert!(format!("{err}").contains("injected"), "{err}");
+    }
+
+    /// The clear port is the toron delete. Swallowing its failure would leave
+    /// the tombstone claiming an alias that toron still holds.
+    #[test]
+    fn clear_captain_alias_propagates_a_writer_failure() {
+        let _g = crate::config::test_state_home();
+        let project = format!("alias-clear-fail-{}", std::process::id());
+        let err =
+            clear_captain_alias_file_with(|_| bail!("injected toron clear failure"), &project)
+                .expect_err("a failed clear must reach the caller");
         assert!(format!("{err}").contains("injected"), "{err}");
         assert!(
-            load_captain_alias(&project).is_none(),
-            "nothing was bound when the write failed"
+            !is_captain_alias_cleared(&project),
+            "a failed clear leaves no tombstone"
         );
     }
 

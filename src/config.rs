@@ -2070,7 +2070,7 @@ daily = [
         let proj = format!("oncap-mail-{}", std::process::id());
         st::save_captain_alias(&proj, "BraveCaptain").unwrap();
         assert!(st::resolve_captain_target(&proj, "captain").is_ok());
-        st::clear_captain_alias_file(&proj);
+        st::clear_captain_alias_file(&proj).unwrap();
         let err =
             st::resolve_captain_target(&proj, "captain").expect_err("cleared alias must fail");
         assert!(format!("{err}").contains("alias cleared"));
@@ -2078,7 +2078,7 @@ daily = [
         st::save_captain_alias(&proj, "NewCaptain").unwrap();
         assert!(st::resolve_captain_target(&proj, "captain").is_ok());
         assert!(st::resolve_captain_target(&proj, "CAPTAIN").is_ok());
-        st::clear_captain_alias_file(&proj);
+        st::clear_captain_alias_file(&proj).unwrap();
     }
 
     #[test]
@@ -2093,7 +2093,7 @@ daily = [
         let registry = st::load_spawn_registry(&proj);
         let remain = registry_after_captain_death(&registry, captain, OnCaptainDeath::Continue);
         st::save_spawn_registry(&proj, &remain).unwrap();
-        st::clear_captain_alias_file(&proj);
+        st::clear_captain_alias_file(&proj).unwrap();
         let after = st::load_spawn_registry(&proj);
         assert!(
             after.iter().any(|e| e.pane_id == "pane-child"),
@@ -2108,7 +2108,7 @@ daily = [
             st::load_captain_alias(&proj).as_deref(),
             Some("AdoptedCaptain")
         );
-        st::clear_captain_alias_file(&proj);
+        st::clear_captain_alias_file(&proj).unwrap();
         let _ = std::fs::remove_file(st::spawn_registry_file(&proj));
     }
 

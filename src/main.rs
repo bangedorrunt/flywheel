@@ -12056,7 +12056,8 @@ fn cmd_recover(cfg: &Config, project: &str, include_captain: bool) -> Result<()>
                 })
         })
         .unwrap_or_else(|| "captain".to_string());
-    let _ = state::save_captain_alias(project, &recovering_pin);
+    state::save_captain_alias(project, &recovering_pin)
+        .context("recover: bind the captain alias")?;
     Ok(())
 }
 
@@ -13260,7 +13261,7 @@ fn cmd_kill(
         config::OnCaptainDeath::Continue | config::OnCaptainDeath::Adopt if !reap_crews => {
             let remaining = config::registry_after_captain_death(&registry, &captain_pin, policy);
             let _ = state::save_spawn_registry(project, &remaining);
-            state::clear_captain_alias_file(project);
+            state::clear_captain_alias_file(project).context("kill: clear the captain alias")?;
             println!(
                 "closed captain for {project} (policy {} — crews remain, alias cleared)",
                 policy
@@ -13294,7 +13295,7 @@ fn cmd_kill(
     let remaining =
         config::registry_after_captain_death(&registry, &captain_pin, config::OnCaptainDeath::Stop);
     let _ = state::save_spawn_registry(project, &remaining);
-    state::clear_captain_alias_file(project);
+    state::clear_captain_alias_file(project).context("kill: clear the captain alias")?;
     let _ = std::fs::remove_dir_all(agentstate::project_state_dir(&project_dir(cfg, project)));
     if let Ok(mail) = backend::mail_backend(cfg)
         && let Some(key) = project_dir(cfg, project).to_str()
