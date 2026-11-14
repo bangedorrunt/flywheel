@@ -9419,7 +9419,12 @@ pub(crate) fn pinned_mail_identity(
                     eprintln!("flywheel: mail list_agents failed during pin draw for {name}: {e}");
                 }
             }
-            let seed = state::fnv1a64(name);
+            // bd-3qun4: toron enforces one key per pin across the WHOLE store,
+            // so two projects drawing from the same agent name collided
+            // ("pin X is already registered in <other project>"). Seed with the
+            // project key as well: a re-spawn in the same project stays
+            // deterministic, a different project draws a different pin.
+            let seed = state::fnv1a64(&format!("{key}|{name}"));
             let mut pin = unique_adjnoun_pin(&taken, seed);
             for _ in 0..256 {
                 if daemon_mode || !mail::pin_bound_elsewhere(&key, &pin) {
@@ -15139,6 +15144,25 @@ mod wake_identity_tests {
             );
         }
         crate::mail::cleanup_test_data_dir(&data);
+    }
+
+    /// bd-3qun4: the pin seed is project-scoped, so two projects sharing one
+    /// toron store never draw the same pin for the same agent name (toron
+    /// allows one key per pin across the whole store), while a re-spawn in the
+    /// SAME project still draws deterministically.
+    #[test]
+    fn pin_seed_is_project_scoped_and_stable() {
+        let seed = |project: &str| state::fnv1a64(&format!("{project}|flywheel-toron-oc"));
+        assert_eq!(
+            seed("/tmp/proj-a"),
+            seed("/tmp/proj-a"),
+            "same project, same seed (idempotent re-spawn)"
+        );
+        assert_ne!(
+            seed("/tmp/proj-a"),
+            seed("/tmp/proj-b"),
+            "different projects never share a seed"
+        );
     }
 
     /// bd-pin-public-plane-s-easy.2: register_spawned_agent writes the
