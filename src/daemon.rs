@@ -488,11 +488,20 @@ fn unit_slug(project: &str) -> String {
 /// exits when its own binary changes, so reinstall is picked up by the
 /// service manager without a manual restart. The loop re-runs the idempotent
 /// `doorbell start`, which resolves the current session workspace id.
+/// The supervisor's one key: a path-valued project is the same project as its
+/// slug (bd-bj9xk: chiebukuro ran TWO supervisors, one per spelling, because
+/// the unit label was built from the raw argument).
+pub(crate) fn doorbell_supervisor_key(project: &str) -> String {
+    unit_slug(&crate::doorbell::canonical_project(project))
+}
+
 pub fn install_doorbell_supervisor(
     cfg: &crate::config::Config,
     project: &str,
 ) -> anyhow::Result<()> {
-    let slug = unit_slug(project);
+    let project = crate::doorbell::canonical_project(project);
+    let project = project.as_str();
+    let slug = doorbell_supervisor_key(project);
     let label = format!("dev.flywheel.doorbell.{slug}");
     if unit_active(&label) {
         return Ok(());
@@ -1080,5 +1089,51 @@ mod tests {
         assert_eq!(super::unit_slug("toron"), "toron");
         assert_eq!(super::unit_slug("a/b c"), "a-b-c");
         assert_eq!(super::unit_slug(""), "default");
+    }
+}
+
+#[cfg(test)]
+mod doorbell_supervisor_one_key_tests {
+    use super::*;
+
+    /// bd-bj9xk: starting the supervisor under the path and under the slug
+    /// must land on ONE unit. Live: chiebukuro ran both
+    /// `dev.flywheel.doorbell.chiebukuro` and
+    /// `dev.flywheel.doorbell.-users-bangedorrunt-workspace-chiebukuro`.
+    #[test]
+    fn path_and_slug_are_one_supervisor_unit() {
+        let slug = "chiebukuro";
+        let path = "/Users/op/workspace/chiebukuro";
+        assert_eq!(
+            doorbell_supervisor_key(path),
+            doorbell_supervisor_key(slug),
+            "one project, one supervisor unit"
+        );
+        assert_eq!(doorbell_supervisor_key(path), "chiebukuro");
+        assert_eq!(
+            unit_slug("/Users/op/workspace/chiebukuro"),
+            "-users-op-workspace-chiebukuro",
+            "the raw spelling is what produced the second unit"
+        );
+    }
+
+    /// The install site folds the project, so the unit's argv carries the
+    /// slug too — not just the label.
+    #[test]
+    fn install_appends_the_canonical_project() {
+        let src = include_str!("daemon.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let at = production
+            .find("pub fn install_doorbell_supervisor(")
+            .expect("install fn");
+        let body = &production[at..];
+        assert!(
+            body.contains("let project = crate::doorbell::canonical_project(project);"),
+            "install must canonicalise before naming the unit"
+        );
+        assert!(
+            body.contains("doorbell_supervisor_key(project)"),
+            "the unit slug goes through the one key"
+        );
     }
 }
