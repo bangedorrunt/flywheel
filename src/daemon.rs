@@ -552,51 +552,143 @@ pub(crate) fn plist_project_argument(body: &str) -> Option<String> {
     tokens.get(at + 1).cloned()
 }
 
-/// Unload + remove every duplicate unit for this project, through the same
-/// supervisor port the install uses. Journal-first + audited; never fails the
-/// install because a stale unit refused to die.
+/// Typed outcome of retiring one stale supervisor unit. The plist is the only
+/// index a later install has, so it is removed ONLY when the unit is provably
+/// gone (bd-bj9xk review): a failed bootout that also deleted the plist would
+/// leave a running supervisor invisible forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RetireOutcome {
+    Retired,
+    NotLoaded,
+    BootoutFailed(String),
+}
+
+/// The supervisor effect, behind a port so the outcome logic is unit-tested
+/// with a fake (bd-bj9xk review ask 1). Production: launchctl / systemctl.
+pub(crate) trait SupervisorPort {
+    /// Boot one unit out. `Ok(Err(stderr))` = the tool ran and failed.
+    fn bootout(&self, label: &str) -> Result<(), String>;
+}
+
+#[cfg(target_os = "macos")]
+struct LaunchctlPort;
+#[cfg(target_os = "macos")]
+impl SupervisorPort for LaunchctlPort {
+    fn bootout(&self, label: &str) -> Result<(), String> {
+        let uid = current_uid();
+        let out = Command::new("launchctl")
+            .args(["bootout", &format!("gui/{uid}/{label}")])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        Err(if stderr.is_empty() { stdout } else { stderr })
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct SystemdPort;
+#[cfg(target_os = "linux")]
+impl SupervisorPort for SystemdPort {
+    fn bootout(&self, label: &str) -> Result<(), String> {
+        let out = Command::new("systemctl")
+            .args(["--user", "disable", "--now", &format!("{label}.service")])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if out.status.success() {
+            return Ok(());
+        }
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn supervisor_port() -> Box<dyn SupervisorPort> {
+    Box::new(LaunchctlPort)
+}
+#[cfg(target_os = "linux")]
+fn supervisor_port() -> Box<dyn SupervisorPort> {
+    Box::new(SystemdPort)
+}
+
+/// Retire one unit. The plist goes only on a proven-gone outcome; a failed
+/// bootout keeps it so the next install can still find and retry the unit.
+pub(crate) fn retire_stale_unit(
+    port: &dyn SupervisorPort,
+    label: &str,
+    plist: &Path,
+) -> RetireOutcome {
+    match port.bootout(label) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(plist);
+            RetireOutcome::Retired
+        }
+        Err(stderr) => {
+            let lower = stderr.to_ascii_lowercase();
+            let not_loaded = lower.contains("no such process")
+                || lower.contains("could not find service")
+                || lower.contains("not loaded")
+                || lower.contains("not-found");
+            if not_loaded {
+                let _ = std::fs::remove_file(plist);
+                RetireOutcome::NotLoaded
+            } else {
+                RetireOutcome::BootoutFailed(stderr)
+            }
+        }
+    }
+}
+
+/// Find + retire every stale unit for this project: intent audit first, then
+/// the attempt, then an outcome audit (loud on failure). Never fails the
+/// install.
 fn retire_stale_supervisor_units(project: &str, canonical: &str, state: &Path) -> Vec<String> {
     let Ok(agents) = home_launch_agents() else {
         return Vec::new();
     };
+    let port = supervisor_port();
     let mut retired = Vec::new();
     for (label, plist) in stale_supervisor_units(&agents, canonical) {
         crate::doorbell::audit_append(
             state,
             &format!("supervisor-{canonical}"),
             serde_json::json!({
-                "kind": "supervisor_stale_unit_retired",
+                "kind": "supervisor_stale_unit_retire_intent",
                 "label": label,
                 "project": project,
                 "canonical": canonical,
             }),
         );
-        retire_unit(&label, &plist);
-        eprintln!(
-            "flywheel: retired stale supervisor unit {label} for project {project} (same project, non-canonical key)"
+        let outcome = retire_stale_unit(&*port, &label, &plist);
+        let (kind, detail) = match &outcome {
+            RetireOutcome::Retired => ("supervisor_stale_unit_retired", None),
+            RetireOutcome::NotLoaded => ("supervisor_stale_unit_not_loaded", None),
+            RetireOutcome::BootoutFailed(stderr) => {
+                eprintln!(
+                    "flywheel: STALE SUPERVISOR SURVIVED bootout: {label} for project {project}: {stderr} — plist kept so the next install can retry"
+                );
+                ("supervisor_stale_unit_bootout_failed", Some(stderr.clone()))
+            }
+        };
+        crate::doorbell::audit_append(
+            state,
+            &format!("supervisor-{canonical}"),
+            serde_json::json!({
+                "kind": kind,
+                "label": label,
+                "project": project,
+                "canonical": canonical,
+                "detail": detail,
+            }),
         );
-        retired.push(label);
+        if matches!(outcome, RetireOutcome::Retired | RetireOutcome::NotLoaded) {
+            retired.push(label);
+        }
     }
     retired
-}
-
-/// Bootout + delete one plist through the supervisor CLI. Best-effort: a
-/// unit that already died is still removed from disk.
-fn retire_unit(label: &str, plist: &Path) {
-    #[cfg(target_os = "macos")]
-    {
-        let uid = current_uid();
-        let _ = Command::new("launchctl")
-            .args(["bootout", &format!("gui/{uid}/{label}")])
-            .output();
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let _ = Command::new("systemctl")
-            .args(["--user", "disable", "--now", &format!("{label}.service")])
-            .output();
-    }
-    let _ = std::fs::remove_file(plist);
 }
 
 pub fn install_doorbell_supervisor(
@@ -1293,5 +1385,84 @@ mod doorbell_supervisor_one_key_tests {
             body.contains("doorbell_supervisor_key(project)"),
             "the unit slug goes through the one key"
         );
+    }
+}
+
+#[cfg(test)]
+mod retire_outcomes_tests {
+    use super::*;
+
+    struct FakePort {
+        fail: Option<String>,
+    }
+
+    impl SupervisorPort for FakePort {
+        fn bootout(&self, _label: &str) -> Result<(), String> {
+            match &self.fail {
+                None => Ok(()),
+                Some(e) => Err(e.clone()),
+            }
+        }
+    }
+
+    fn temp_plist(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("fw-retire-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plist = dir.join("dev.flywheel.doorbell.-users-op-workspace-chiebukuro.plist");
+        std::fs::write(&plist, "<plist/>").unwrap();
+        (dir, plist)
+    }
+
+    /// A successful bootout retires the unit and takes the plist with it.
+    #[test]
+    fn retire_ok_removes_the_plist() {
+        let (dir, plist) = temp_plist("ok");
+        let out = retire_stale_unit(&FakePort { fail: None }, "dev.flywheel.x", &plist);
+        assert_eq!(out, RetireOutcome::Retired);
+        assert!(!plist.exists(), "a retired unit's plist is gone");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// "already gone" is a success: the plist still goes.
+    #[test]
+    fn not_loaded_still_removes_the_plist() {
+        let (dir, plist) = temp_plist("gone");
+        let out = retire_stale_unit(
+            &FakePort {
+                fail: Some(
+                    "Could not find service \"dev.flywheel.x\" in domain for user gui: 501".into(),
+                ),
+            },
+            "dev.flywheel.x",
+            &plist,
+        );
+        assert_eq!(out, RetireOutcome::NotLoaded);
+        assert!(!plist.exists(), "a gone unit's plist is cleared");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// THE defect: a failed bootout must KEEP the plist, or the still-running
+    /// supervisor becomes invisible to every later install (the finder reads
+    /// plists). Mutation: removing the plist anyway reddens this.
+    #[test]
+    fn bootout_failure_keeps_the_plist_and_reports_the_reason() {
+        let (dir, plist) = temp_plist("fail");
+        let out = retire_stale_unit(
+            &FakePort {
+                fail: Some("Boot-out failed: 1: Operation not permitted".into()),
+            },
+            "dev.flywheel.x",
+            &plist,
+        );
+        assert_eq!(
+            out,
+            RetireOutcome::BootoutFailed("Boot-out failed: 1: Operation not permitted".into())
+        );
+        assert!(
+            plist.exists(),
+            "the plist is the only index a later install has; keep it"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
