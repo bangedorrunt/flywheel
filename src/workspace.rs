@@ -491,7 +491,7 @@ impl WakeClass {
 
 /// Single definition lives in `doorbell-core` (bd-ene2) — the daemon
 /// FileHost presence filter shares it; this re-export keeps call sites.
-pub use doorbell_core::is_urgent_line;
+pub use doorbell_core::{is_act_now_line, is_urgent_line};
 
 /// Edge-triage predicate (bd-l72k): a machine-rendered addressed kind-9
 /// wake (`doorbell::doorbell_line(Channel, _)` head). Routine chatter:
@@ -1385,7 +1385,7 @@ fn filter_prompts(model: &WorkspaceModel, cmds: Vec<Cmd>) -> (Vec<Cmd>, Vec<(Str
         match c {
             Cmd::Prompt { pin, line } => {
                 if prompt_allowed(model, &pin)
-                    || (is_urgent_line(&line)
+                    || (is_act_now_line(&line)
                         && matches!(model.presence.get(&pin), Some(Presence::Busy { .. })))
                 {
                     keep.push(Cmd::Prompt { pin, line });
@@ -4328,6 +4328,7 @@ mod presence_model_tests {
         m.presence.insert("I".into(), Presence::from_str("idle"));
         m.presence.insert("B".into(), Presence::from_str("working"));
         let urgent = "[doorbell] plane-P urgent. Pull: toron next";
+        let peer = "[doorbell] request-release. Pull: toron next";
         let routine = "[doorbell] kind 9. Pull: toron channel read h=ch-1";
         let cmds = vec![
             Cmd::Prompt {
@@ -4337,6 +4338,10 @@ mod presence_model_tests {
             Cmd::Prompt {
                 pin: "B".into(),
                 line: urgent.into(),
+            },
+            Cmd::Prompt {
+                pin: "B".into(),
+                line: peer.into(),
             },
             Cmd::Prompt {
                 pin: "B".into(),
@@ -4352,16 +4357,20 @@ mod presence_model_tests {
         assert!(matches!(&keep[0], Cmd::Prompt { pin, .. } if pin == "I"));
         assert!(
             matches!(&keep[1], Cmd::Prompt { pin, .. } if pin == "B"),
-            "busy+urgent breaks through: {keep:?}"
+            "busy+act-now breaks through: {keep:?}"
         );
         assert_eq!(
             held.len(),
-            2,
+            3,
             "held, never dropped: a filtered prompt used to become an audit row \
              and vanish (bd-0uzrq.8)"
         );
-        assert_eq!(held[0].0, "B", "busy+routine is held for the queue");
-        assert_eq!(held[1].0, "Ghost", "unknown never prompts, even urgent");
+        assert_eq!(
+            held[0].0, "B",
+            "a peer request waits for the prompt — it is not act-now (bd-0uzrq.13)"
+        );
+        assert_eq!(held[1].0, "B", "busy+routine is held for the queue");
+        assert_eq!(held[2].0, "Ghost", "unknown never prompts, even urgent");
     }
 
     #[test]

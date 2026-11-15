@@ -1063,11 +1063,6 @@ pub fn take_allowed_like(
     }
     out
 }
-/// A doorbell line that must ring now, never batch: plane-P urgent,
-/// request-release, reservation conflicts, ack-SLA expiry (including the
-/// re-ring vehicle `doorbell_mail_line`, which carries "unacked for").
-/// Moved verbatim from flywheel `workspace.rs` (bd-ene2): one definition —
-/// the daemon FileHost presence filter and the embedded path share it.
 /// A mail wake: the router's plane-P mail class or the mail-wake host's line.
 /// These always reach a pane — a done mail that never rings is a lost
 /// hand-off (bd-346jl); the afk batch only applies to routine channel traffic.
@@ -1075,6 +1070,21 @@ pub fn is_mail_wake(line: &str) -> bool {
     line.contains("plane-P mail") || line.starts_with("Doorbell: mail from")
 }
 
+/// May this line PREEMPT a pane that is already occupied? Only an explicit
+/// act-now does: the captain's urgent mail and an urgent steer.
+///
+/// A peer request is a queue-and-wait event, not a preemption. Treating it as
+/// urgent typed it into a WORKING pane — which the harness swallows, so the
+/// crew never saw it — and the preempt arm recorded no key, so the CLI's own
+/// deferred copy rang the same message a second time at the drain
+/// (bd-0uzrq.13, the peer Prompts at 05:29:41, 09:24:43 and 10:58:15Z).
+pub fn is_act_now_line(line: &str) -> bool {
+    line.contains("plane-P urgent") || line.contains("URGENT steer")
+}
+
+/// Does this line carry urgency worth classifying as such (wake class, digest
+/// escalation)? Broader than [`is_act_now_line`] on purpose: a peer request is
+/// urgent enough to name, never urgent enough to interrupt.
 pub fn is_urgent_line(line: &str) -> bool {
     line.contains("plane-P urgent")
         || line.contains("URGENT steer")
@@ -1247,7 +1257,7 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
     (next, actions)
 }
 
-/// Idle/done panes get a Prompt now; blocked+urgent prompts while
+/// Idle/done panes get a Prompt now; blocked+act-now prompts while
 /// blocked+routine digests with a reason (bd-zawk G6); working panes queue
 /// (drained on the next working -> idle|done|blocked PlaneStatus).
 fn route_or_queue(
@@ -1263,17 +1273,20 @@ fn route_or_queue(
         .get(pin)
         .map(String::as_str)
         .unwrap_or("unknown");
+    // One message rings ONCE, however many producers carry it and whenever the
+    // inbox is re-read. This guard sits above the injectable split because the
+    // preempt arm below could otherwise type the same wake twice (bd-0uzrq.13).
+    if !key.is_empty() && next.rung.contains(&key) {
+        actions.push(DoorbellAction::Audit {
+            kind: "already_rung".into(),
+            pin: pin.to_string(),
+            detail: line,
+        });
+        return;
+    }
     // governed-by: bd-zawk — per-wake verdict via the typed InjectGate so the
     if should_inject(status) {
-        if !key.is_empty() && next.rung.contains(&key) {
-            actions.push(DoorbellAction::Audit {
-                kind: "already_rung".into(),
-                pin: pin.to_string(),
-                detail: line,
-            });
-            return;
-        }
-        match inject_gate_for_plane(status, is_urgent_line(&line)) {
+        match inject_gate_for_plane(status, is_act_now_line(&line)) {
             InjectGate::Inject => {
                 if !key.is_empty() {
                     next.rung.insert(key);
@@ -1302,9 +1315,15 @@ fn route_or_queue(
         });
     } else {
         if matches!(
-            inject_gate_for_plane(status, is_urgent_line(&line)),
+            inject_gate_for_plane(status, is_act_now_line(&line)),
             InjectGate::Inject
         ) {
+            // A preempt rings ONCE. Recording the key here is what stops the
+            // CLI's own refused-handoff copy from ringing the same message
+            // again at the drain (bd-0uzrq.13).
+            if !key.is_empty() {
+                next.rung.insert(key);
+            }
             actions.push(DoorbellAction::Prompt {
                 pin: pin.to_string(),
                 line,
@@ -1801,6 +1820,128 @@ mod tests {
             .filter(|a| matches!(a, DoorbellAction::Prompt { .. }))
             .count();
         assert_eq!(rings, 1, "ONE ring, not two: {drained:?}");
+    }
+
+    /// bd-0uzrq.13: a peer request is a queue-and-wait event. Typing it into a
+    /// working pane meant the harness swallowed it (the crew never saw the
+    /// request) and no key was recorded, so the CLI's own deferred copy rang
+    /// the same message again at the drain. The live signatures are the peer
+    /// Prompts at 05:29:41, 09:24:43 and 10:58:15Z.
+    #[test]
+    fn a_peer_request_waits_for_the_prompt_instead_of_preempting_it() {
+        let model = working_model("BlueRidge");
+        let (next, actions) = tick(
+            &model,
+            &DoorbellMsg::InboxRows {
+                rows: vec![serde_json::json!({
+                    "id": "9f2d",
+                    "subject": "p2p:request-release docs/live-leg-r2.probe",
+                    "sender": "SlateHarbor",
+                    "importance": "normal",
+                })],
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { .. })),
+            "a peer request must never be typed into a working pane: {actions:?}"
+        );
+        assert!(
+            matches!(&actions[0], DoorbellAction::Audit { kind, .. } if kind == "queued"),
+            "it is queued, and says so: {actions:?}"
+        );
+        assert!(
+            next.rung.is_empty(),
+            "nothing rang yet, so nothing is marked as rung"
+        );
+
+        let (next, drained) = tick(
+            &next,
+            &DoorbellMsg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+        );
+        let rings: Vec<&String> = drained
+            .iter()
+            .filter_map(|a| match a {
+                DoorbellAction::Prompt { line, .. } => Some(line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rings.len(), 1, "exactly one ring at the drain: {drained:?}");
+        assert!(
+            rings[0].contains("request-release"),
+            "the ring names the peer request: {}",
+            rings[0]
+        );
+
+        // The inbox is re-read at the prompt; the drained message must not ring
+        // a second time.
+        let (_, again) = tick(
+            &next,
+            &DoorbellMsg::InboxRows {
+                rows: vec![serde_json::json!({
+                    "id": "9f2d",
+                    "subject": "p2p:request-release docs/live-leg-r2.probe",
+                    "sender": "SlateHarbor",
+                    "importance": "normal",
+                })],
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert!(
+            matches!(&again[0], DoorbellAction::Audit { kind, .. } if kind == "already_rung"),
+            "the re-read is refused, not re-rung: {again:?}"
+        );
+    }
+
+    /// bd-0uzrq.13: an explicit act-now MAY preempt a working pane, and a
+    /// preempt records its key — otherwise the panic-line and the inbox would
+    /// each ring the same message.
+    #[test]
+    fn an_act_now_preempt_records_its_key_so_the_reread_is_silent() {
+        let model = working_model("BlueRidge");
+        let (next, actions) = tick(
+            &model,
+            &DoorbellMsg::InboxRows {
+                rows: vec![serde_json::json!({
+                    "id": "9f2e",
+                    "subject": "URGENT steer",
+                    "sender": "SlateHarbor",
+                    "importance": "urgent",
+                })],
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert!(
+            matches!(&actions[0], DoorbellAction::Prompt { line, .. } if line.contains("plane-P urgent")),
+            "act-now preempts the working pane: {actions:?}"
+        );
+        assert!(
+            next.rung.contains("9f2e"),
+            "the preempt is recorded as rung: {:?}",
+            next.rung
+        );
+
+        let (_, again) = tick(
+            &next,
+            &DoorbellMsg::InboxRows {
+                rows: vec![serde_json::json!({
+                    "id": "9f2e",
+                    "subject": "URGENT steer",
+                    "sender": "SlateHarbor",
+                    "importance": "urgent",
+                })],
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert!(
+            matches!(&again[0], DoorbellAction::Audit { kind, .. } if kind == "already_rung"),
+            "the same message does not ring twice: {again:?}"
+        );
     }
 
     /// bd-0uzrq.1: a NEWER message of a queued thread replaces the older one —

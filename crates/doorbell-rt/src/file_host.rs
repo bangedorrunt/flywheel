@@ -1631,7 +1631,7 @@ impl FileHost {
                     let input = doorbell_core::wake_core::RouteInput {
                         pin: pin.clone(),
                         line: line.clone(),
-                        urgent: doorbell_core::is_urgent_line(&line),
+                        urgent: doorbell_core::is_act_now_line(&line),
                         presence,
                         has_route: true,
                         budget_allows: true,
@@ -3069,9 +3069,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// bd-0uzrq.13: a peer request is not act-now. It waits for the prompt even
+    /// when the presence row says busy — typing it there is swallowed by the
+    /// harness, which is why the crew never saw the peer Prompts at 05:29:41,
+    /// 09:24:43 and 10:58:15Z.
     #[test]
-    fn busy_presence_urgent_breaks_through() {
-        let (mut host, _dir) = host_with_registry("t3", entries());
+    fn busy_presence_holds_a_peer_request_for_the_prompt() {
+        let (mut host, _dir) = host_with_registry("t3-peer", entries());
         host.refresh_index();
         host.tick(&BrainMsg::PlaneStatus {
             pin: "PinA".into(),
@@ -3089,9 +3093,42 @@ mod tests {
         .to_string();
         let fx = host.tick(&BrainMsg::Watch(line));
         assert!(
+            !fx.iter().any(|e| matches!(e, Effect::Prompt { .. })),
+            "busy + a peer request must not Prompt: {fx:?}"
+        );
+        assert!(
+            fx.iter().any(|e| matches!(e, Effect::Digest { .. })),
+            "it is held, visibly: {fx:?}"
+        );
+    }
+
+    /// bd-0uzrq.13: the captain's urgent line IS act-now and still breaks
+    /// through a busy presence row.
+    #[test]
+    fn busy_presence_urgent_breaks_through() {
+        let (mut host, _dir) = host_with_registry("t3-urgent", entries());
+        host.refresh_index();
+        host.tick(&BrainMsg::PlaneStatus {
+            pin: "PinA".into(),
+            status: "working".into(),
+        });
+        host.tick(&BrainMsg::Presence {
+            pin: "PinA".into(),
+            state: "working".into(),
+        });
+        let fx = host.tick(&BrainMsg::InboxFetched {
+            pin: "PinA".into(),
+            rows: vec![serde_json::json!({
+                "id": "ea",
+                "subject": "URGENT steer",
+                "sender": "SlateHarbor",
+                "importance": "urgent",
+            })],
+        });
+        assert!(
             fx.iter()
                 .any(|e| matches!(e, Effect::Prompt { pin, .. } if pin == "PinA")),
-            "busy + urgent prompts: {fx:?}"
+            "busy + act-now prompts: {fx:?}"
         );
     }
 

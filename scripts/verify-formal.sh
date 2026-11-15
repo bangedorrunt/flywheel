@@ -145,6 +145,8 @@ expect_violation DeferredHandoff DeferredHandoff.broken-memory-only NoLostWake
 expect_violation P2pDelivery P2pDelivery.broken-drop-on-busy EveryDirectiveReachesTargetOrIsJournaledPending
 expect_violation DeferredQueue DeferredQueue.broken-ring-twice AtMostOnceRung
 expect_violation DeferredQueue DeferredQueue.broken-strand EveryWakeAccounted
+expect_violation DeferredQueue DeferredQueue.broken-preempt-any OnlyActNowPreempts
+expect_violation DeferredQueue DeferredQueue.broken-preempt-unrecorded AtMostOnceRung
 expect_violation DispatcherReap DispatcherReap.broken-fallback-reap NeverReapOnFallback
 expect_violation DispatcherReap DispatcherReap.broken-reap-live-session NeverReapLiveSession
 expect_violation DispatcherReap DispatcherReap.broken-label-dropped LabelOnlyDoorKept
