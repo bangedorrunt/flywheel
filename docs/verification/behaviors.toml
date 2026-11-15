@@ -39,23 +39,14 @@ mutations = ["scripts/mutations/doorbell-reap.spec.sh#D3"]
 [[behavior]]
 id = "doorbell.journal-append-atomic"
 owner = "crates/doorbell-rt/src/store.rs"
-# The single-write atomicity is mutation-proven. The LOCK's necessity is NOT:
-# three type-preserving mutation shapes were tried and none reddens a test -
-#   (a) split the write in two        -> green (the lock serialises it)
-#   (b) bypass the lock call         -> build-broken (TryLockError arms stop
-#                                       typechecking)
-#   (c) unique lock path per call    -> green (concurrent_appends_lose_no_rows
-#                                       still sees every row: the rename race
-#                                       window is real but not reproducible)
-# concurrent_appends_lose_no_rows now asserts every appended row is retained or
-# recorded as a rotation drop; it is a real property, not a lock witness. This
-# flips to proven when a test isolates the lock itself.
-status = "pending"
+status = "proven"
 concurrent = false
 tests = [
+  "crates/doorbell-rt/src/store.rs::append_waits_for_the_journal_lock_then_lands_exactly_once",
+  "crates/doorbell-rt/src/store.rs::concurrent_appends_lose_no_rows",
   "crates/doorbell-rt/src/store.rs::a_torn_row_is_quarantined_and_replay_continues",
 ]
-mutations = ["scripts/mutations/doorbell-deferral.spec.sh#D1"]
+mutations = ["scripts/mutations/doorbell-journal.spec.sh#D2"]
 
 [[behavior]]
 id = "spawn.dispatcher-session-key"
@@ -100,3 +91,19 @@ tests = [
   "src/judgment.rs::seed_all_replaces_a_same_version_pack_whose_bytes_differ",
 ]
 mutations = ["scripts/mutations/judgment.spec.sh#J2"]
+
+[[behavior]]
+id = "p2p.delivery"
+owner = "src/cmd/peer.rs"
+status = "proven"
+concurrent = true
+formal = ".agents/skills/verify-protocol-tla/models/P2pDelivery.tla::.agents/skills/verify-protocol-tla/models/P2pDelivery.cfg"
+tests = [
+  "src/cmd/peer.rs::a_busy_target_defers_through_the_handoff",
+  "src/cmd/peer.rs::intent_targets_overlapping_reservation_holders",
+  "crates/doorbell-core/src/lib.rs::a_p2p_mail_is_a_peer_wake_never_noise",
+]
+mutations = [
+  "scripts/mutations/p2p-delivery.spec.sh#P1",
+  "scripts/mutations/p2p-classify.spec.sh#P2",
+]

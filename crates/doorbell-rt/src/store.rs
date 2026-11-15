@@ -1651,6 +1651,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The lock itself, deterministically: hold it, and a second appender must
+    /// WAIT (nothing lands), then land exactly once when it is released.
+    /// A mutation that lets try_lock "succeed" while held reddens the wait.
+    #[test]
+    fn append_waits_for_the_journal_lock_then_lands_exactly_once() {
+        use std::sync::mpsc;
+        let (st, dir) = test_store("lock-witness");
+        let st = std::sync::Arc::new(st);
+        let lock_path = st.journal_file("w").with_extension("lock");
+        std::fs::create_dir_all(lock_path.parent().expect("journals dir")).expect("mkdir");
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock");
+        held.try_lock().expect("hold the journal lock");
+
+        let (tx, rx) = mpsc::channel();
+        let writer = {
+            let st = std::sync::Arc::clone(&st);
+            std::thread::spawn(move || {
+                let ok = st
+                    .append_journal(
+                        "w",
+                        &serde_json::json!({"rt_kind": "Sweep"}),
+                        &serde_json::json!([]),
+                        serde_json::json!({}),
+                        &[],
+                    )
+                    .is_ok();
+                let _ = tx.send(ok);
+            })
+        };
+
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "the append must WAIT while the journal lock is held, not write through"
+        );
+        drop(held);
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the append completes once the lock is free"),
+            "append succeeded"
+        );
+        writer.join().expect("writer thread");
+        let fold = st.fold_workspace("w");
+        assert_eq!(fold.rows.len(), 1, "the waiting append lands exactly once");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// The LOCK, not just the single write: with rotation running beside the
     /// appenders, no row may be lost (rotation rewrites the file; an append
     /// that races the rewrite lands in a file that no longer exists).
