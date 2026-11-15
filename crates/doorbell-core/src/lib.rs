@@ -1111,7 +1111,7 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
         DoorbellMsg::PromptRefused { pin, line } => {
             next.statuses.insert(pin.clone(), "working".into());
             let queue = next.queues.entry(pin.clone()).or_default();
-            let fold = queue_line(queue, wake_key(&line), line.clone());
+            let fold = queue_line(queue, wake_key(line), line.clone());
             actions.push(DoorbellAction::Audit {
                 kind: match fold {
                     Queued::Fresh => "deferred",
