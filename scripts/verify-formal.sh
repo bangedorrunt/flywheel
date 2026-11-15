@@ -129,6 +129,7 @@ expect_pass JobLease JobLease
 expect_pass Respawn Respawn
 expect_pass DeferredHandoff DeferredHandoff
 expect_pass P2pDelivery P2pDelivery
+expect_pass DeferredQueue DeferredQueue
 expect_pass DispatcherReap DispatcherReap
 expect_pass JournalAppend JournalAppend
 expect_pass SupervisorRetire SupervisorRetire
@@ -141,6 +142,8 @@ expect_violation Respawn Respawn.broken-claim-before-free OneLiveHolder
 expect_violation Respawn Respawn.broken-drop-reservations ReservationsKept
 expect_violation DeferredHandoff DeferredHandoff.broken-memory-only NoLostWake
 expect_violation P2pDelivery P2pDelivery.broken-drop-on-busy EveryDirectiveReachesTargetOrIsJournaledPending
+expect_violation DeferredQueue DeferredQueue.broken-ring-twice AtMostOnceRung
+expect_violation DeferredQueue DeferredQueue.broken-strand EveryWakeAccounted
 expect_violation DispatcherReap DispatcherReap.broken-fallback-reap NeverReapOnFallback
 expect_violation DispatcherReap DispatcherReap.broken-reap-live-session NeverReapLiveSession
 expect_violation DispatcherReap DispatcherReap.broken-label-dropped LabelOnlyDoorKept
