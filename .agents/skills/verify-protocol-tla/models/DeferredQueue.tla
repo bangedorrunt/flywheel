@@ -41,9 +41,12 @@ Arrive(m) ==
             /\ queued' = queued \cup {m}
             /\ UNCHANGED <<rung, audited>>
 
-\* The same message arrives again through a second producer: no second entry,
-\* no second ring. Modelled as a step that changes nothing observable.
-Redeliver(m) ==
+\* bd-0uzrq.2: the IDLE EDGE re-reads the inbox, so an arrival can repeat —
+\* either because a second producer carries the same message, or because the
+\* pane went at-prompt and the doorbell asked for its unread mail again. A
+\* repeat is a step that changes nothing observable: no second entry, no second
+\* ring. This is the action that makes AtMostOnceRung non-trivial.
+RereadByTheIdleEdge(m) ==
     /\ m \in arrived
     /\ UNCHANGED vars
 
@@ -68,7 +71,7 @@ Idle ==
 
 Next ==
     \/ \E m \in Messages : Arrive(m)
-    \/ \E m \in Messages : Redeliver(m)
+    \/ \E m \in Messages : RereadByTheIdleEdge(m)
     \/ Ring
     \/ \E m \in Messages : Audit(m)
     \/ Idle
