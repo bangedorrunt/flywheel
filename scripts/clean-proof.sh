@@ -218,7 +218,10 @@ if [ -n "$MUTATIONS_MODE" ] && [ -z "$FAILED_STEP" ]; then
     mut_ran=$((mut_ran + 1))
     echo "clean-proof: mutations $spec"
     set +e
-    bash scripts/verify-mutations.sh "$spec" --cargo "$wrapper" \
+    # The proof build is -D warnings; a mutation deliberately leaves dead code
+    # (that is what killing a guard looks like), so the witness run must not
+    # inherit it or every such mutation reports BUILD-BROKEN.
+    RUSTFLAGS="" bash scripts/verify-mutations.sh "$spec" --cargo "$wrapper" \
       --json-out "$TMP/mut-rows.$mut_ran.jsonl" >"$TMP/mutations-$mut_ran.log" 2>&1
     mut_status=$?
     set -e
