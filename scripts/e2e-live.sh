@@ -200,11 +200,69 @@ stable_surfaces() { # tag
   snapshot_live "$REAL_HOME/.local/state/flywheel/doorbell/subscriptions.json" \
     >"$LIVE_SNAP.$tag.subs"
 }
+# Leak guard for the MAILBOX, not just the filesystem (bd-0uzrq.7). The toron
+# CLI resolves its source by precedence, and TORON_DATA_DIR alone does NOT keep
+# it off a running daemon: the durable :18080 answers, and a leg then registers
+# identities and claims leases in the OPERATOR store. The filesystem assertion
+# below cannot see any of that. These are READ-ONLY calls against the operator
+# daemon (never the store): the lease boards of the projects the legs use, and
+# the registry row for every pin a leg can mint.
+TORON_LIVE_URL="http://127.0.0.1:18080/mcp"
+LEAK_PROJECTS=(e2e-contention e2e-live-seat e2e-idle-page probe)
+LEAK_PINS=(QuartzTester OnyxTester CobaltRidge)
+
+toron_live_snapshot() { # tag
+  local tag="$1" p pin
+  local out="$SANDBOX/toron-live.$tag"
+  : >"$out"
+  if ! ( exec 3<>"/dev/tcp/127.0.0.1/18080" ) >/dev/null 2>&1; then
+    printf 'unreachable: no daemon on :18080\n' >>"$out"
+    return 0
+  fi
+  for p in "${LEAK_PROJECTS[@]}"; do
+    printf 'leases %s\n' "$p" >>"$out"
+    TORON_MCP_URL="$TORON_LIVE_URL" "$TORON_BIN" reserve list --project "$p" --json 2>/dev/null |
+      "$PYTHON_BIN" -c '
+import json, sys
+try:
+    rows = json.load(sys.stdin).get("reservations") or []
+except Exception:
+    print("  unreadable"); raise SystemExit(0)
+for r in sorted(rows, key=lambda r: (r.get("id") or "", r.get("path") or "")):
+    print("  {} {} {} {}".format(r.get("id"), r.get("path"), r.get("holder"), r.get("reason")))
+' >>"$out" 2>/dev/null || printf '  unreadable\n' >>"$out"
+  done
+  for p in "${LEAK_PROJECTS[@]}"; do
+    for pin in "${LEAK_PINS[@]}"; do
+      printf 'registry %s %s\n' "$p" "$pin" >>"$out"
+      local row
+      row="$(TORON_MCP_URL="$TORON_LIVE_URL" "$TORON_BIN" mail whois "$p" "$pin" --json 2>/dev/null |
+        "$PYTHON_BIN" -c '
+import json, sys
+try:
+    print(json.load(sys.stdin).get("npub") or "unnamed")
+except Exception:
+    raise SystemExit(1)
+' || true)"
+      printf '  %s\n' "${row:-absent}" >>"$out"
+    done
+  done
+}
+
 stable_surfaces before
+toron_live_snapshot before
 
 assert_live_unchanged() {
   stable_surfaces after
+  toron_live_snapshot after
   local surface changed=0
+  if grep -q '^unreachable' "$SANDBOX/toron-live.before"; then
+    echo "e2e-live: note: no operator daemon on :18080, so the mailbox leak guard saw nothing" >&2
+  elif ! cmp -s "$SANDBOX/toron-live.before" "$SANDBOX/toron-live.after"; then
+    echo "e2e-live: the leg changed the operator MAILBOX (bd-0uzrq.7):" >&2
+    diff -u "$SANDBOX/toron-live.before" "$SANDBOX/toron-live.after" 2>/dev/null | head -40 >&2 || true
+    changed=1
+  fi
   for surface in agents subs; do
     if ! cmp -s "$LIVE_SNAP.before.$surface" "$LIVE_SNAP.after.$surface"; then
       echo "e2e-live: the leg changed the operator's $surface (bd-yd74j):" >&2
