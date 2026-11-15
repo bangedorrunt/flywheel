@@ -98,6 +98,27 @@ pub fn plane_launch_env(
         env.insert("AGENT_NAME".to_string(), pin.to_string());
         env.insert("FLYWHEEL_MAIL_AS".to_string(), pin.to_string());
     }
+    // The pane is spawned by the running rex server, whose env is the
+    // operator's. Anything the agent or its doorbell host writes must land in
+    // the SAME roots the spawner resolved, or a sandboxed run (e2e-live) leaks
+    // into the live state (bd-yd74j). Only set vars are carried; a var absent
+    // here is not invented.
+    for key in [
+        "HOME",
+        "XDG_STATE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+        "TORON_DATA_DIR",
+        "TORON_MCP_URL",
+        "TORON_MCP_DATA_DIR",
+    ] {
+        if let Ok(value) = std::env::var(key)
+            && !value.is_empty()
+        {
+            env.insert(key.to_string(), value);
+        }
+    }
     apply_opencode_go_api_key_alias(&mut env);
     env
 }
@@ -1457,6 +1478,42 @@ mod plane_launch_env_tests {
 
     fn cfg() -> crate::config::Config {
         crate::config::Config::default()
+    }
+
+    /// bd-yd74j: the pane runs in the SPAWNER's state roots. The rex server
+    /// that splits the pane has the operator's env, so without these the pane
+    /// (and its doorbell host) writes live state under a sandboxed run.
+    #[test]
+    fn env_carries_the_spawners_state_roots() {
+        let _g = crate::config::lock_env();
+        unsafe {
+            std::env::set_var("HOME", "/tmp/sandbox-home");
+            std::env::set_var("XDG_STATE_HOME", "/tmp/sandbox-state");
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::set_var("TORON_DATA_DIR", "/tmp/sandbox-toron");
+        }
+        let env = plane_launch_env(&cfg(), None);
+        assert_eq!(
+            env.get("HOME").map(String::as_str),
+            Some("/tmp/sandbox-home")
+        );
+        assert_eq!(
+            env.get("XDG_STATE_HOME").map(String::as_str),
+            Some("/tmp/sandbox-state")
+        );
+        assert_eq!(
+            env.get("TORON_DATA_DIR").map(String::as_str),
+            Some("/tmp/sandbox-toron")
+        );
+        assert!(
+            !env.contains_key("XDG_CONFIG_HOME"),
+            "an absent var is not invented"
+        );
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::remove_var("XDG_STATE_HOME");
+            std::env::remove_var("TORON_DATA_DIR");
+        }
     }
 
     /// bd-pin-public-plane-s-easy.2: the pane env carries the agent's mail

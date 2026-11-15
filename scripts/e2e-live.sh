@@ -151,7 +151,80 @@ trap cleanup EXIT
 : >"$LOG"
 
 status=0
+LEG_PROJECT="e2e-live-seat"
 fail() { echo "  FAIL  $*" | tee -a "$LOG"; status=1; }
+
+# Live hygiene (bd-yd74j): the leg must leave the operator's world
+# byte-identical. Panes are split by the running rex server with ITS env, so a
+# spawn that does not pin the caller's state roots writes live state from
+# inside the pane. These snapshots are the assertion that it does not.
+snapshot_live() { # path -> "rel<TAB>sha256" per file, sorted
+  "$PYTHON_BIN" - "$1" <<'SNAP'
+import hashlib, os, sys
+root = sys.argv[1]
+rows = []
+if os.path.isfile(root):
+    with open(root, "rb") as f:
+        rows.append(f"{os.path.basename(root)}\t{hashlib.sha256(f.read()).hexdigest()}")
+elif os.path.isdir(root):
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for name in sorted(filenames):
+            path = os.path.join(dirpath, name)
+            rel = os.path.relpath(path, root)
+            try:
+                with open(path, "rb") as f:
+                    rows.append(f"{rel}\t{hashlib.sha256(f.read()).hexdigest()}")
+            except OSError as e:
+                rows.append(f"{rel}\tunreadable:{e.errno}")
+print("\n".join(rows))
+SNAP
+}
+
+LIVE_SNAP="$SANDBOX/live-before"
+LIVE_ROOTS=("$REAL_HOME/.local/state/flywheel" "$REAL_HOME/.config/flywheel")
+
+# The fleet writes state continuously, so a whole-tree byte comparison would
+# fail for reasons that have nothing to do with the leg. The assertions are
+# therefore: (1) the two stable surfaces are byte-identical, and (2) nothing
+# under the live roots mentions the sandbox project at all. The defect this
+# gates (bd-yd74j) wrote project files and LaunchAgents, both of which these
+# catch.
+stable_surfaces() { # tag
+  local tag="$1"
+  snapshot_live "$REAL_HOME/Library/LaunchAgents" >"$LIVE_SNAP.$tag.agents"
+  snapshot_live "$REAL_HOME/.local/state/flywheel/doorbell/subscriptions.json" \
+    >"$LIVE_SNAP.$tag.subs"
+}
+stable_surfaces before
+
+assert_live_unchanged() {
+  stable_surfaces after
+  local surface changed=0
+  for surface in agents subs; do
+    if ! cmp -s "$LIVE_SNAP.before.$surface" "$LIVE_SNAP.after.$surface"; then
+      echo "e2e-live: the leg changed the operator's $surface (bd-yd74j):" >&2
+      diff -u "$LIVE_SNAP.before.$surface" "$LIVE_SNAP.after.$surface" 2>/dev/null |
+        head -40 >&2 || true
+      changed=1
+    fi
+  done
+  # A file NAMED for the project is the leak shape (inbox baselines, facts,
+  # doorbell audit/state, LaunchAgents). Content is not scanned: live agents
+  # discuss this project in their own journals, and that is not a leak.
+  local root leaked=""
+  for root in "${LIVE_ROOTS[@]}"; do
+    [ -e "$root" ] || continue
+    leaked="$leaked$(find "$root" -name "*$LEG_PROJECT*" 2>/dev/null || true)"
+  done
+  if [ -n "$leaked" ]; then
+    echo "e2e-live: live state mentions $LEG_PROJECT (bd-yd74j):" >&2
+    printf '%s\n' "$leaked" | head -20 >&2
+    changed=1
+  fi
+  [ "$changed" -eq 0 ] ||
+    fail "live state changed: a LaunchAgent, the subscription list, or a file naming $LEG_PROJECT under ~/.local/state/flywheel or ~/.config/flywheel"
+}
 
 run_test_leg() { # name, dir, filter, --, cargo selector
   local name="$1" dir="$2" filter="$3"
@@ -413,6 +486,8 @@ fi
 if [ -s "$SANDBOX/denied.log" ]; then
   fail "a leg called a supervisor tool: $(cat "$SANDBOX/denied.log")"
 fi
+
+assert_live_unchanged
 
 echo "e2e-live: receipt $LOG"
 exit "$status"
