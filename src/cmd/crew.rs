@@ -496,7 +496,7 @@ fn ring_prompt_wake(
 }
 
 /// The wake line a busy pane refused: the same text the ring would have typed.
-fn wake_is_busy(err: &str) -> bool {
+pub(crate) fn wake_is_busy(err: &str) -> bool {
     err.contains("not at a prompt") || err.to_ascii_lowercase().contains("busy")
 }
 

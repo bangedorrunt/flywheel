@@ -147,6 +147,49 @@ fn directive_sender(cfg: &Config, r#as: Option<&str>) -> String {
     "agent".to_string()
 }
 
+/// Crews holding or reserving a path that overlaps `path` (the toron
+/// reservations are the registry of who is touching what). `sender` is never a
+/// recipient of its own intent.
+fn overlapping_holders(project: &str, path: &str, sender: &str) -> Vec<String> {
+    let Ok(mb) = crate::mail::comms_mailbox() else {
+        return Vec::new();
+    };
+    let reservations =
+        crate::mail::block_on(async { mb.active_reservations(project).await }).unwrap_or_default();
+    reservations
+        .into_iter()
+        .filter(|r| toron_core::mailbox::overlaps(&r.path_pattern, path))
+        .map(|r| r.agent_name)
+        .filter(|pin| !pin.is_empty() && pin != sender)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// A busy pane is a DEFERRAL, not a drop: the directive rides the ONE
+/// handoff the doorbell drains (bd-s0uxh), so the peer hears it at the next
+/// prompt instead of never.
+fn defer_busy_p2p_wake(
+    directive: &P2pDirective,
+    pin: &str,
+    line: &str,
+    err: &anyhow::Error,
+) -> Result<()> {
+    if !crate::cmd::crew::wake_is_busy(&err.to_string()) {
+        eprintln!("note: pane wake failed ({err}); directive delivered to inbox");
+        return Ok(());
+    }
+    crate::doorbell::append_deferred_wake(
+        &crate::config::state_dir(),
+        &directive.project,
+        pin,
+        line,
+    )
+    .map_err(|e| anyhow::anyhow!("record the deferred p2p wake: {e}"))?;
+    eprintln!("peer: pane busy; the doorbell rings this directive at the next prompt");
+    Ok(())
+}
+
 pub(crate) fn cmd_peer(cfg: &Config, cmd: &PeerCmd) -> Result<()> {
     let directive = directive_from_cmd(cfg, cmd);
     if let Some(to) = directive.target_pin.as_deref() {
@@ -169,7 +212,31 @@ pub(crate) fn cmd_peer(cfg: &Config, cmd: &PeerCmd) -> Result<()> {
         return Ok(());
     }
 
-    // Intent has no explicit target pin; stamp locally as a structured directive.
+    // Intent has no target pin: fan out to every crew holding or reserving an
+    // overlapping path, and fall back to the room's captain identity. A local
+    // log line alone reached nobody (bd-ncgyf).
+    let mut recipients =
+        overlapping_holders(&directive.project, &directive.path, &directive.sender);
+    if recipients.is_empty()
+        && let Some(captain) = crate::state::captain_pin(&directive.project, &directive.project)
+        && captain != directive.sender
+    {
+        recipients.push(captain);
+    }
+    for to in &recipients {
+        toron_mail_send(&directive, to)?;
+        let wm = recipient_wm(&directive.project, to);
+        // The mail is the durable channel; a peer with no pane here still
+        // received the intent, so a wake failure must not fail the broadcast.
+        if let Err(e) = deliver_p2p_wake(cfg, &directive, to, wm) {
+            eprintln!("peer intent: mailed {to}, wake not typed ({e:#})");
+        }
+    }
+    if recipients.is_empty() {
+        eprintln!(
+            "peer intent: no crew holds or reserves an overlapping path and no captain is bound; nothing was sent"
+        );
+    }
     crate::log(
         &directive.project,
         EventKind::Send,
@@ -179,13 +246,15 @@ pub(crate) fn cmd_peer(cfg: &Config, cmd: &PeerCmd) -> Result<()> {
             "path": directive.path,
             "body": directive.body,
             "broadcast": true,
+            "to": recipients,
         }),
     );
     print_json(&json!({
         "verb": directive.verb,
-        "sent": true,
+        "sent": !recipients.is_empty(),
         "project": directive.project,
         "path": directive.path,
+        "to": recipients,
         "broadcast": true,
     }));
     Ok(())
@@ -382,7 +451,7 @@ fn deliver_p2p_wake_hc(
     if let Err(e) =
         crate::pane_write::write_p2p_wake(&crate::pane_write::HcPanes(&c), &target, &line, route)
     {
-        eprintln!("note: hc pane wake deferred ({e}); directive delivered to inbox");
+        crate::cmd::peer::defer_busy_p2p_wake(directive, pin, &line, &e)?;
     }
     Ok(line)
 }
@@ -422,7 +491,7 @@ fn deliver_p2p_wake_rex(
         &line,
         route,
     ) {
-        eprintln!("note: rex pane wake deferred ({e}); directive delivered to inbox");
+        defer_busy_p2p_wake(directive, pin, &line, &e)?;
     }
     Ok(line)
 }
@@ -634,5 +703,96 @@ mod tests {
         assert_eq!(confirm["wake"], wake);
         assert_eq!(confirm["verb"], "request-release");
         assert_eq!(confirm["sent"], true);
+    }
+    fn directive(project: &str, verb: &'static str, path: &str) -> P2pDirective {
+        P2pDirective {
+            verb,
+            project: project.to_string(),
+            sender: "CyanCove".to_string(),
+            target_pin: Some("StormyDesert".to_string()),
+            path: path.to_string(),
+            body: serde_json::json!({ "verb": verb, "path": path }),
+        }
+    }
+
+    /// A busy target is a deferral through the ONE handoff, so the peer hears
+    /// the directive at the next prompt instead of never (bd-ncgyf).
+    #[test]
+    fn a_busy_target_defers_through_the_handoff() {
+        let _g = crate::config::test_state_home();
+        let project = format!("p2p-defer-{}", std::process::id());
+        let d = directive(&project, "request-release", "src/peer.rs");
+        let line =
+            crate::pane_write::p2p_wake_line("request-release", "CyanCove", "src/peer.rs", 7);
+        defer_busy_p2p_wake(
+            &d,
+            "StormyDesert",
+            &line,
+            &anyhow::anyhow!("rex prompt refused: status working is not at a prompt"),
+        )
+        .expect("a busy pane is a deferral");
+        let hosted: std::collections::BTreeSet<String> =
+            ["StormyDesert".to_string()].into_iter().collect();
+        assert_eq!(
+            crate::doorbell::take_deferred_wakes(&crate::config::state_dir(), &project, &hosted),
+            vec![("StormyDesert".to_string(), line.clone())],
+            "the p2p line is on the handoff"
+        );
+        crate::doorbell::commit_deferred_wakes(&crate::config::state_dir(), &project);
+
+        let d2 = directive(&project, "review-request", "src/peer.rs");
+        defer_busy_p2p_wake(
+            &d2,
+            "StormyDesert",
+            &line,
+            &anyhow::anyhow!("hc connect refused"),
+        )
+        .expect("a transport failure is not a deferral");
+        assert!(
+            crate::doorbell::take_deferred_wakes(&crate::config::state_dir(), &project, &hosted)
+                .is_empty(),
+            "a transport failure never defers"
+        );
+    }
+
+    /// Intent reaches the crews touching an overlapping path, never just a
+    /// local log line (bd-ncgyf).
+    #[test]
+    fn intent_targets_overlapping_reservation_holders() {
+        let _g = crate::config::test_state_home();
+        let project = format!("p2p-intent-{}", std::process::id());
+        let mb = crate::mail::comms_mailbox().expect("mailbox");
+        let rt = crate::mail::runtime().expect("runtime");
+        let profile = toron_core::mailbox::AgentProfile {
+            name: "CyanCove".into(),
+            program: Some("opencode".into()),
+            model: None,
+            persona: None,
+            task_description: None,
+        };
+        rt.block_on(mb.register_agent(&project, &profile))
+            .expect("register the holder");
+        rt.block_on(mb.file_reservation_paths(
+            &project,
+            "CyanCove",
+            &["src/peer.rs".to_string()],
+            Some(60),
+            true,
+            Some("test"),
+        ))
+        .expect("reserve");
+        assert_eq!(
+            overlapping_holders(&project, "src/peer.rs", "PurpleGorge"),
+            vec!["CyanCove".to_string()],
+            "the holder of the path is the intent recipient"
+        );
+        assert!(
+            overlapping_holders(&project, "src/other.rs", "PurpleGorge").is_empty(),
+            "a disjoint path reaches no holder"
+        );
+        assert!(
+            overlapping_holders(&project, "src/peer.rs", "CyanCove").is_empty(),
+            "a peer never receives its own intent"
+        );
     }
 }

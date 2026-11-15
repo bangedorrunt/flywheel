@@ -2344,7 +2344,9 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
     // pane; routine channel chatter keeps the afk batch.
     cmds.retain(|c| {
         !matches!(c, Cmd::Prompt { line, .. }
-            if !is_urgent_line(line) && !doorbell_core::is_mail_wake(line))
+            if !is_urgent_line(line)
+                && !doorbell_core::is_mail_wake(line)
+                && !doorbell_core::is_p2p_wake(line))
     });
     if let Some(now) = match msg {
         Msg::AckSlaTick { now } | Msg::Sweep { now, .. } | Msg::Tick { now } => Some(*now),

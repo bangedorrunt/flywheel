@@ -30,6 +30,9 @@ pub enum EventClass {
     /// watch path, so it rings a routine inbox-pull. True urgency comes
     /// from the inbox fold (`parse_inbox_item` reads importance).
     PlanePMail,
+    /// Peer directive (bd-ncgyf): a `p2p:<verb>` mail rings the peer line,
+    /// never the system-notice digest.
+    P2p,
 }
 
 /// A watch/inbox edge the dispatcher might ring on.
@@ -398,9 +401,10 @@ fn pull_hint(class: EventClass, channel: Option<&str>) -> String {
         // real: next returns every live straggler; ack advances one). The
         // high-water `mail inbox --since last` can skip messages after the
         // one an agent answers, so the wake points at `next`.
-        EventClass::RequestRelease | EventClass::PlanePUrgent | EventClass::PlanePMail => {
-            "toron next".into()
-        }
+        EventClass::RequestRelease
+        | EventClass::PlanePUrgent
+        | EventClass::PlanePMail
+        | EventClass::P2p => "toron next".into(),
         EventClass::ReservationConflict => "toron reserve list".into(),
     }
 }
@@ -427,7 +431,43 @@ pub fn parse_inbox_item(v: &serde_json::Value) -> Option<(EventClass, String)> {
         })
         .unwrap_or(false);
     let importance = v.get("importance").and_then(|x| x.as_str()).unwrap_or("");
-    let class = if request_release {
+    let subject = v.get("subject").and_then(|x| x.as_str()).unwrap_or("");
+    // A peer directive is a wake even with an EMPTY subject (live rows exist):
+    // the body carries the structured verb and path.
+    let body_json = v
+        .get("body_md")
+        .or_else(|| v.get("body"))
+        .and_then(|b| b.as_str())
+        .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok());
+    let p2p = subject
+        .strip_prefix("p2p:")
+        .map(|rest| {
+            let mut parts = rest.splitn(2, ' ');
+            (
+                parts.next().unwrap_or("directive").to_string(),
+                parts.next().unwrap_or("").to_string(),
+            )
+        })
+        .or_else(|| {
+            body_json.as_ref().and_then(|j| {
+                j.get("verb").and_then(|x| x.as_str()).map(|verb| {
+                    (
+                        verb.to_string(),
+                        j.get("path")
+                            .and_then(|p| p.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    )
+                })
+            })
+        });
+    let class = if let Some((verb, path)) = p2p {
+        let sender = v.get("sender").and_then(|x| x.as_str()).unwrap_or("peer");
+        return Some((
+            EventClass::P2p,
+            format!("{verb}{P2P_HINT_SEP}{sender}{P2P_HINT_SEP}{path}"),
+        ));
+    } else if request_release {
         EventClass::RequestRelease
     } else if matches!(importance, "high" | "urgent") {
         EventClass::PlanePUrgent
@@ -520,8 +560,31 @@ pub fn doorbell_line(class: EventClass, hint: &str) -> String {
         EventClass::ReservationConflict => "kind 30031",
         EventClass::PlanePUrgent => "plane-P urgent",
         EventClass::PlanePMail => "plane-P mail",
+        EventClass::P2p => return p2p_line_from_hint(hint),
     };
     format!("[doorbell] {kind}. Pull: {hint}")
+}
+
+/// The separator `parse_inbox_item` uses to carry a peer directive's verb,
+/// sender and path through the `(class, hint)` shape.
+pub const P2P_HINT_SEP: char = '\u{1f}';
+
+/// The peer line a `p2p:` mail rings: the same shape the CLI types, minus the
+/// mail watermark (the doorbell has no cursor for the recipient).
+pub fn p2p_line_from_hint(hint: &str) -> String {
+    let mut parts = hint.split(P2P_HINT_SEP);
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(verb), Some(sender), Some(path)) => {
+            format!("⟦p2p:{verb}⟧ from {sender} for {path} — run: toron next")
+        }
+        _ => "⟦p2p⟧ peer directive — run: toron next".to_string(),
+    }
+}
+
+/// A peer directive wake line. The fold keeps these (they are a direct
+/// directive, not channel chatter).
+pub fn is_p2p_wake(line: &str) -> bool {
+    line.starts_with("⟦p2p:")
 }
 
 /// Trust-aware line that carries the triggering event id for proof (gap 17).
@@ -536,6 +599,7 @@ pub fn doorbell_line_with_event(class: EventClass, hint: &str, event_id: &str) -
             EventClass::ReservationConflict => "kind 30031",
             EventClass::PlanePUrgent => "plane-P urgent",
             EventClass::PlanePMail => "plane-P mail",
+            EventClass::P2p => return p2p_line_from_hint(hint),
         };
         format!("[doorbell] {kind} event={event_id}. Pull: {hint}")
     }
@@ -1455,5 +1519,53 @@ mod tests {
         assert!(super::take_allowed(one("p"), &mut m, 1001).is_empty());
         assert_eq!(super::take_allowed(one("q"), &mut m, 1001).len(), 1);
         assert_eq!(super::take_allowed(one("p"), &mut m, 1000 + 1800).len(), 1);
+    }
+    /// bd-ncgyf: a peer directive is a wake, not system noise. The subject
+    /// carries the verb and path; the sender is the row's sender.
+    #[test]
+    fn a_p2p_mail_is_a_peer_wake_never_noise() {
+        let row = serde_json::json!({
+            "subject": "p2p:request-release src/workflow_lowering.rs",
+            "sender": "CyanCove",
+            "importance": "normal",
+            "ack_only": false,
+        });
+        let (class, hint) = super::parse_inbox_item(&row).expect("a p2p row is a wake");
+        assert_eq!(class, super::EventClass::P2p);
+        assert_eq!(
+            super::doorbell_line(class, &hint),
+            "⟦p2p:request-release⟧ from CyanCove for src/workflow_lowering.rs — run: toron next"
+        );
+        assert!(super::is_p2p_wake(&super::doorbell_line(class, &hint)));
+        assert!(
+            super::parse_inbox_item(&serde_json::json!({
+                "subject": "p2p:review-request",
+                "sender": "StormyDesert",
+            }))
+            .is_some(),
+            "a p2p subject with no path still rings"
+        );
+        let (class, hint) = super::parse_inbox_item(&serde_json::json!({
+            "subject": "",
+            "sender": "CyanCove",
+            "importance": "normal",
+            "body_md": r#"{"verb":"release-response","path":"src/peer.rs"}"#,
+        }))
+        .expect("an empty-subject peer mail still rings");
+        assert_eq!(class, super::EventClass::P2p);
+        assert_eq!(
+            super::doorbell_line(class, &hint),
+            "⟦p2p:release-response⟧ from CyanCove for src/peer.rs — run: toron next"
+        );
+        assert!(
+            super::parse_inbox_item(&serde_json::json!({
+                "subject": "(no subject)",
+                "sender": "CyanCove",
+                "importance": "normal",
+                "body_md": "plain agent prose",
+            }))
+            .is_none(),
+            "an empty-subject routine row stays out of the wake path"
+        );
     }
 }
