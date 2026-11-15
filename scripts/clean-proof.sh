@@ -50,6 +50,13 @@ while [ $# -gt 0 ]; do
     --sha) [ $# -ge 2 ] || die "--sha needs a revision"; MODE="sha"; TARGET_REV="$2"; shift 2 ;;
     --head) MODE="head"; shift ;;
     --mutate) [ $# -ge 2 ] || die "--mutate needs a spec"; MUT_SPECS="${MUT_SPECS}$2"$'\n'; shift 2 ;;
+    --mutations)
+      [ $# -ge 2 ] || die "--mutations needs changed|full"
+      case "$2" in
+        changed | full) MUTATIONS_MODE="$2" ;;
+        *) die "--mutations takes changed or full (got $2)" ;;
+      esac
+      shift 2 ;;
     --receipt) [ $# -ge 2 ] || die "--receipt needs a path"; RECEIPT="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
     -h|--help) usage 0 ;;
