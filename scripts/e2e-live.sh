@@ -16,19 +16,36 @@
 # from the caller. A sandboxed XDG would otherwise hide mise's trust store and
 # every shim would die mid-run.
 #
-# Usage: bash scripts/e2e-live.sh [--mutate]
-#   --mutate  run ONLY the live leg with FLYWHEEL_ALLOW_EXEC=0 and REQUIRE it
-#             to fail: the seat must not move when the dry arm suppresses it.
+# Provenance: by default (and with --sha <rev>) the suite runs from git archive
+# exports of flywheel and siblings pinned in proof.toml (clean-proof style), so
+# a dirty working tree can never break or fake a leg. The exported flywheel/toron
+# binaries are built into the sandbox target dir.
+#
+# Usage: bash scripts/e2e-live.sh [--sha <rev>|--head] [--mutate|--contention]
+#   --sha <rev>  prove this revision (default: HEAD)
+#   --head       prove HEAD explicitly
+#   --mutate     run ONLY the live leg with FLYWHEEL_ALLOW_EXEC=0 and REQUIRE it
+#                to fail: the seat must not move when the dry arm suppresses it.
+#   --contention run ONLY the contention legs
 # Exit: 0 all legs green, 1 a leg failed, 2 a tool or dir was missing.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+# shellcheck source=proof-lib.sh
+. "$ROOT/scripts/proof-lib.sh"
 
 MUTATE=0
 CONTENTION_ONLY=0
-case "${1:-}" in
-  --mutate) MUTATE=1 ;;
-  --contention) CONTENTION_ONLY=1 ;;
-esac
+TARGET_REV="HEAD"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --sha) [ $# -ge 2 ] || { echo "e2e-live: --sha needs a revision" >&2; exit 2; }; TARGET_REV="$2"; shift 2 ;;
+    --head) TARGET_REV="HEAD"; shift ;;
+    --mutate) MUTATE=1; shift ;;
+    --contention) CONTENTION_ONLY=1; shift ;;
+    *) echo "e2e-live: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
 
 REAL_HOME="$HOME"
 die() { printf 'e2e-live: %s\n' "$*" >&2; exit 2; }
@@ -58,8 +75,6 @@ resolve_tool() { # name -> absolute real binary, searched without trusting shims
 }
 
 CARGO_BIN="$(resolve_tool cargo)" || die "cargo not found (looked on PATH, ~/.cargo/bin, mise installs)"
-TORON_BIN="$(resolve_tool toron)" || die "toron not found (looked on PATH, ~/.cargo/bin, mise installs)"
-FLYWHEEL_BIN="$(resolve_tool flywheel)" || die "flywheel not found (looked on PATH, ~/.cargo/bin, mise installs)"
 REX_BIN="$(resolve_tool rex)" || die "rex not found (looked on PATH, ~/.local/bin)"
 if [ -x /usr/bin/python3 ]; then
   PYTHON_BIN=/usr/bin/python3
@@ -79,6 +94,41 @@ fi
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 LOG="/tmp/e2e-live-${STAMP}.log"
 SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/e2e-sandbox.XXXXXX")"
+export CARGO_TARGET_DIR="$SANDBOX/target"
+git -C "$ROOT" cat-file -e "$TARGET_REV^{commit}" 2>/dev/null || die "rev not found: $TARGET_REV"
+PROVEN_SHA="$(git -C "$ROOT" rev-parse "$TARGET_REV")"
+SHORT_SHA="$(git -C "$ROOT" rev-parse --short "$PROVEN_SHA")"
+echo "e2e-live: proving $SHORT_SHA ($PROVEN_SHA)" | tee -a "$LOG"
+
+EXPORT_ROOT="$SANDBOX/export"
+mkdir -p "$EXPORT_ROOT/flywheel"
+git -C "$ROOT" archive "$PROVEN_SHA" | tar -x -C "$EXPORT_ROOT/flywheel"
+while IFS=$'\t' read -r rel pin; do
+  [ -n "${rel:-}" ] || continue
+  sib_repo="$(cd "$ROOT/$rel" && pwd)"
+  sib_name="$(basename "$rel")"
+  proof_archive "$sib_repo" "$pin" "$EXPORT_ROOT/$sib_name" || die "cannot archive sibling $rel at $pin"
+  echo "e2e-live: sibling $rel @ $pin" | tee -a "$LOG"
+done < <(proof_siblings "$ROOT")
+
+FW_SRC="$EXPORT_ROOT/flywheel"
+TORON_SRC="$EXPORT_ROOT/toron"
+[ -d "$TORON_SRC" ] || die "missing exported toron sibling (check proof.toml)"
+
+# Build proven binaries from the export so live legs cannot run host/dirty builds.
+echo "e2e-live: building proven binaries from export" | tee -a "$LOG"
+(
+  cd "$FW_SRC"
+  "${CARGO_CMD[@]}" build -p flywheel --bin flywheel >>"$LOG" 2>&1
+)
+(
+  cd "$TORON_SRC"
+  "${CARGO_CMD[@]}" build -p toron-cli --bin toron >>"$LOG" 2>&1
+)
+FLYWHEEL_BIN="$CARGO_TARGET_DIR/debug/flywheel"
+TORON_BIN="$CARGO_TARGET_DIR/debug/toron"
+[ -x "$FLYWHEEL_BIN" ] || die "built flywheel binary missing at $FLYWHEEL_BIN"
+[ -x "$TORON_BIN" ] || die "built toron binary missing at $TORON_BIN"
 TORON_PID=""
 PLANE_SESSION=""
 LIVE_PROJECT=""
@@ -149,7 +199,6 @@ export XDG_CONFIG_HOME="$SANDBOX/config"
 export XDG_STATE_HOME="$SANDBOX/state"
 export XDG_DATA_HOME="$SANDBOX/data"
 export TORON_DATA_DIR="$SANDBOX/data/toron"
-export CARGO_TARGET_DIR="$SANDBOX/target"
 export FLYWHEEL_ROOT="$SANDBOX/workspace"
 trap cleanup EXIT
 : >"$LOG"
@@ -211,6 +260,19 @@ TORON_LIVE_URL="http://127.0.0.1:18080/mcp"
 LEAK_PROJECTS=(e2e-contention e2e-live-seat e2e-idle-page probe)
 LEAK_PINS=(QuartzTester OnyxTester CobaltRidge)
 
+retire_live_leak_pins() {
+  # Best-effort cleanup for known leak pins (bd-0uzrq.7 follow-up). Read-only
+  # callers must not mutate, but the suite may retire seats/leases it created.
+  # Runs against the operator mailbox only when the daemon is reachable.
+  local p pin
+  ( exec 3<>"/dev/tcp/127.0.0.1/18080" ) >/dev/null 2>&1 || return 0
+  for p in "${LEAK_PROJECTS[@]}"; do
+    for pin in QuartzTester OnyxTester; do
+      TORON_MCP_URL="$TORON_LIVE_URL" "$FLYWHEEL_BIN" retire "$pin" --project "$p" --as "${AGENT_NAME:-PurpleGorge}" --force-working --json >/dev/null 2>&1 || true
+    done
+  done
+}
+
 toron_live_snapshot() { # tag
   local tag="$1" p pin
   local out="$SANDBOX/toron-live.$tag"
@@ -249,7 +311,51 @@ except Exception:
   done
 }
 
+assert_no_live_leak_pins() {
+  # Extend leak guard to explicitly cover toron registry + leases for known
+  # leak pins (bd-0uzrq.7 follow-up): no reservation held by QuartzTester/
+  # OnyxTester and no newly created registry rows for them in LEAK_PROJECTS.
+  local p pin out changed=0
+  ( exec 3<>"/dev/tcp/127.0.0.1/18080" ) >/dev/null 2>&1 || return 0
+  out="$SANDBOX/toron-live.after.leaks"
+  : >"$out"
+  for p in "${LEAK_PROJECTS[@]}"; do
+    TORON_MCP_URL="$TORON_LIVE_URL" "$TORON_BIN" reserve list --project "$p" --json 2>/dev/null |
+      "$PYTHON_BIN" -c '
+import json, sys
+p = sys.argv[1]
+pins = set(sys.argv[2:])
+try:
+    rows = json.load(sys.stdin).get("reservations") or []
+except Exception:
+    raise SystemExit(0)
+for r in rows:
+    if (r.get("holder") or "") in pins:
+        print(f"lease {p} {r.get('holder')} {r.get('path')} {r.get('reason')}")
+' "$p" QuartzTester OnyxTester >>"$out" 2>/dev/null || true
+    for pin in QuartzTester OnyxTester; do
+      local before after
+      before="$(awk -v key="registry $p $pin" '$0==key{getline; print; exit}' "$SANDBOX/toron-live.before" 2>/dev/null || echo absent)"
+      after="$(awk -v key="registry $p $pin" '$0==key{getline; print; exit}' "$SANDBOX/toron-live.after" 2>/dev/null || echo absent)"
+      # Any newly present registry row is a leak; pre-existing rows must remain unchanged.
+      if [ "$before" != "$after" ] && [ "$after" != "  absent" ]; then
+        printf 'registry %s %s before=%s after=%s\n' "$p" "$pin" "$before" "$after" >>"$out"
+      fi
+    done
+  done
+  if [ -s "$out" ]; then
+    echo "e2e-live: live toron registry/leases leaked leak pins:" >&2
+    sed -n '1,40p' "$out" >&2
+    return 1
+  fi
+  return 0
+}
+
 stable_surfaces before
+toron_live_snapshot before
+# bd-0uzrq.7 follow-up: retire known leak pins from the live store, then take
+# the baseline snapshot that assert_live_unchanged compares against.
+retire_live_leak_pins
 toron_live_snapshot before
 
 assert_live_unchanged() {
@@ -261,6 +367,9 @@ assert_live_unchanged() {
   elif ! cmp -s "$SANDBOX/toron-live.before" "$SANDBOX/toron-live.after"; then
     echo "e2e-live: the leg changed the operator MAILBOX (bd-0uzrq.7):" >&2
     diff -u "$SANDBOX/toron-live.before" "$SANDBOX/toron-live.after" 2>/dev/null | head -40 >&2 || true
+    changed=1
+  fi
+  if ! assert_no_live_leak_pins; then
     changed=1
   fi
   for surface in agents subs; do
@@ -307,11 +416,11 @@ run_test_leg() { # name, dir, filter, --, cargo selector
 }
 
 if [ "$MUTATE" -eq 0 ] && [ "$CONTENTION_ONLY" -eq 0 ]; then
-  run_test_leg witness ../toron wave_swarm_gate_result_timeout_is_a_journaled_typed_failure \
+  run_test_leg witness "$TORON_SRC" wave_swarm_gate_result_timeout_is_a_journaled_typed_failure \
     -- -p toron-workflow --test durable_host
-  run_test_leg polish ../toron beads_lifecycle_polish_stops_on_an_unchanged_digest \
+  run_test_leg polish "$TORON_SRC" beads_lifecycle_polish_stops_on_an_unchanged_digest \
     -- -p toron-workflow --test durable_host
-  run_test_leg respawn . supervisor_host::tests::respawn_replays_one_effect_key_and_never_doubles_a_holder \
+  run_test_leg respawn "$FW_SRC" supervisor_host::tests::respawn_replays_one_effect_key_and_never_doubles_a_holder \
     -- -p flywheel --bin flywheel
 fi
 
