@@ -67,8 +67,8 @@ mutation "W11  a thread correction rings beside the brief it corrects" \
 mutation "W9  an already-rung message rings again on the idle re-read" \
     file=$CORE \
     expect=the_idle_edge_asks_for_the_inbox_when_the_queue_is_empty \
-    find='        if !key.is_empty() && next.rung.contains(&key) {' \
-    replace='        if false && next.rung.contains(&key) {'
+    find='    if !key.is_empty() && next.rung.contains(&key) {' \
+    replace='    if false && next.rung.contains(&key) {'
 
 mutation "W10  the idle edge does not ask for the inbox" \
     file=$CORE \
