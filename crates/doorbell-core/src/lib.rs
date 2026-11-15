@@ -2539,11 +2539,15 @@ mod tests {
             },
         );
         assert!(
-            again.iter().all(|a| !matches!(a, DoorbellAction::Prompt { .. })),
+            again
+                .iter()
+                .all(|a| !matches!(a, DoorbellAction::Prompt { .. })),
             "poll of the same message must not ring again: {again:?}"
         );
         assert!(
-            again.iter().any(|a| matches!(a, DoorbellAction::Audit { kind, .. } if kind == "already_rung")),
+            again
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Audit { kind, .. } if kind == "already_rung")),
             "poll of the same message must be audibly deduped: {again:?}"
         );
     }
