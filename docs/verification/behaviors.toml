@@ -178,36 +178,36 @@ mutations = ["scripts/mutations/recipient-guard.spec.sh#R1"]
 [[behavior]]
 id = "doorbell-tick.edge-fold"
 owner = "src/doorbell_tick.rs"
-status = "pending"
-missing = "the module is a re-export shim with no tests of its own; its behavior lives in doorbell-core (see the doorbell.* entries)"
+status = "proven"
 concurrent = false
 tests = [
   "crates/doorbell-core/src/lib.rs::prompt_refused_defers_then_rings_once_at_prompt",
+  "crates/doorbell-core/src/lib.rs::doorbell_tick_watch_line_queues_working_pin_then_drains",
 ]
-mutations = []
+mutations = ["scripts/mutations/doorbell-deferral.spec.sh#D1"]
 
 [[behavior]]
 id = "wake-liveness.health"
 owner = "src/wake_liveness.rs"
-status = "pending"
-missing = "no tests in the module yet; the health verdict is only exercised through doorbell_host"
+status = "proven"
 concurrent = false
 tests = [
-  "src/doorbell_host.rs::a_bound_block_without_a_spawn_row_still_maps_to_its_pin",
+  "crates/doorbell-rt/src/wake_liveness.rs::quiet_when_heartbeat_inside_ceiling",
+  "crates/doorbell-rt/src/wake_liveness.rs::deaf_when_no_frames_past_ceiling",
 ]
-mutations = []
+mutations = ["scripts/mutations/wake-liveness.spec.sh#L1"]
 
 [[behavior]]
 id = "supervisor.retire-plist"
 owner = "src/doorbell_supervise.rs"
-status = "pending"
-missing = "a runnable mutation for the plist delete path (the retire verb's bootout outcome has no spec yet)"
+status = "proven"
 concurrent = false
 formal = ".agents/skills/verify-protocol-tla/models/SupervisorRetire.tla::.agents/skills/verify-protocol-tla/models/SupervisorRetire.cfg"
 tests = [
-  "src/cmd/swarm.rs::retire_refuses_the_captain_seat",
+  "src/doorbell_supervise.rs::unload_retires_units_and_stops_children",
+  "src/doorbell_supervise.rs::single_owner_ensures_children_and_installs_no_units",
 ]
-mutations = []
+mutations = ["scripts/mutations/supervisor-retire-plist.spec.sh#P1"]
 
 [[behavior]]
 id = "fleet.captain-only-mutation"
@@ -252,4 +252,4 @@ concurrent = false
 tests = [
   "tests/clean_proof_slot.rs::clean_proof_slot_serializes_and_recovers",
 ]
-mutations = ["scripts/mutations/clean-proof-slot.spec.sh#S1"]
+mutations = ["scripts/mutations/clean-proof-slot.spec.sh#S1", "scripts/mutations/clean-proof-slot.spec.sh#S2"]
