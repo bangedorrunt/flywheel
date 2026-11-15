@@ -47,6 +47,48 @@ MUT_SPECS=""
 usage() { sed -n '2,29p' "$0"; exit "${1:-0}"; }
 die() { echo "clean-proof: $*" >&2; exit 2; }
 
+# bd-jp9z1.1: one machine-wide slot for the whole run, released on every exit
+# path (process death closes the flock). Re-exec under a python holder so the
+# lock fd survives exec into this script.
+if [ "${CLEAN_PROOF_SLOTTED:-}" != 1 ]; then
+  export CLEAN_PROOF_SLOTTED=1
+  exec python3 - "$0" "$@" <<'PY'
+import fcntl, json, os, sys, time
+script, args = sys.argv[1], sys.argv[2:]
+lock = os.environ.get("CLEAN_PROOF_LOCK_FILE", os.path.join(os.environ.get("XDG_RUNTIME_DIR") or os.environ.get("TMPDIR") or "/tmp", "clean-proof.lock"))
+holder = lock + ".holder"
+fd = open(lock, "a+")
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    who = "unknown holder"
+    try:
+        with open(holder, "r", encoding="utf-8") as f:
+            who = f.read().strip()
+    except Exception:
+        pass
+    print(f"clean-proof: waiting for slot ({who})", file=sys.stderr, flush=True)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+info = {
+    "pid": os.getpid(),
+    "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "argv": [os.path.basename(script)] + args,
+}
+try:
+    with open(holder, "w", encoding="utf-8") as f:
+        json.dump(info, f, sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
+except Exception:
+    pass
+# Keep fd open across exec so the flock is held by the proof run.
+os.set_inheritable(fd.fileno(), True)
+os.execv("/bin/bash", ["bash", script] + args)
+PY
+fi
+
+LOCK_HOLD_TEST=""
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --sha) [ $# -ge 2 ] || die "--sha needs a revision"; MODE="sha"; TARGET_REV="$2"; shift 2 ;;
@@ -61,12 +103,26 @@ while [ $# -gt 0 ]; do
       shift 2 ;;
     --receipt) [ $# -ge 2 ] || die "--receipt needs a path"; RECEIPT="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
+    --lock-hold-test) [ $# -ge 2 ] || die "--lock-hold-test needs seconds"; LOCK_HOLD_TEST="$2"; shift 2 ;;
     -h|--help) usage 0 ;;
     *) die "unknown arg: $1" ;;
   esac
 done
 
 git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1 || die "not a git repo: $ROOT"
+
+# Test hook (bd-jp9z1.1): prove slot serialization with a fake build step.
+if [ -n "$LOCK_HOLD_TEST" ]; then
+  marker="${CLEAN_PROOF_LOCK_TEST_MARKER:-}"
+  if [ -n "$marker" ]; then
+    printf 'start %s %s\n' "$$" "$(python3 -c 'import time; print(time.time_ns())')" >>"$marker"
+    sleep "$LOCK_HOLD_TEST"
+    printf 'end %s %s\n' "$$" "$(python3 -c 'import time; print(time.time_ns())')" >>"$marker"
+  else
+    sleep "$LOCK_HOLD_TEST"
+  fi
+  exit 0
+fi
 
 if [ -n "${MBX_CMD:-}" ]; then
   read -r -a MBX <<<"$MBX_CMD"

@@ -243,3 +243,13 @@ tests = [
   "tests/stack_recover.rs::stack_recover_script_cases",
 ]
 mutations = ["scripts/mutations/stack-recover.spec.sh#R1"]
+
+[[behavior]]
+id = "clean-proof.slot-serialization"
+owner = "scripts/clean-proof.sh"
+status = "proven"
+concurrent = false
+tests = [
+  "tests/clean_proof_slot.rs::clean_proof_slot_serializes_and_recovers",
+]
+mutations = ["scripts/mutations/clean-proof-slot.spec.sh#S1"]

@@ -647,10 +647,8 @@ mod tests {
 
     #[test]
     fn the_loop_journals_the_identity_and_refolds_after_a_crash() {
-        let dir = std::env::temp_dir().join(format!("flywheel-inbox-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        let path = dir.join("inbox.jsonl");
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let path = dir.path().join("inbox.jsonl");
         let edge = Arc::new(Recorder::default());
 
         let boot = Boot::default();
@@ -694,7 +692,38 @@ mod tests {
             edge.ran.lock().unwrap().len() >= 2,
             "the replay ran the command"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_inbox_loops_in_one_process_use_distinct_journals() {
+        let a = tempfile::tempdir().expect("dir a");
+        let b = tempfile::tempdir().expect("dir b");
+        assert_ne!(a.path(), b.path(), "temp dirs must not collide");
+        let path_a = a.path().join("inbox.jsonl");
+        let path_b = b.path().join("inbox.jsonl");
+        for (path, label) in [(&path_a, "a"), (&path_b, "b")] {
+            let edge = Arc::new(Recorder::default());
+            let boot = Boot::default();
+            let mut loop_ = Loop::<InboxProgram, InboxInterpret>::boot(
+                &boot,
+                ManagedRuntime::make(
+                    &Layer::<InboxEdgeTag, std::convert::Infallible, ()>::from_value(edge),
+                )
+                .unwrap(),
+                Arc::new(FileLog::open(path).expect("open log")),
+                Producer::new(format!("inbox-{label}")),
+            )
+            .expect("boot runs init");
+            loop_
+                .send(InboxMsg::Edge(DoorbellMsg::AckSlaTick {
+                    now: 1_700_000_000,
+                }))
+                .expect("send folds");
+        }
+        let a_rows = std::fs::read_to_string(&path_a).expect("a rows");
+        let b_rows = std::fs::read_to_string(&path_b).expect("b rows");
+        assert!(a_rows.contains("inbox-a") && !a_rows.contains("inbox-b"));
+        assert!(b_rows.contains("inbox-b") && !b_rows.contains("inbox-a"));
     }
 
     #[test]
