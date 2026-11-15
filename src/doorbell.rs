@@ -3075,13 +3075,16 @@ mod tests {
             pin: "BlueRidge".into(),
             status: "idle".into(),
         };
-        let (seeded, _) = crate::workspace::tick(&model, &idle);
+        // The journal records what the fold EMITTED, so the seed keeps the
+        // actions too: an idle edge now asks for the inbox (bd-0uzrq.2), and a
+        // replay that emitted nothing would no longer match its own record.
+        let (seeded, idle_cmds) = crate::workspace::tick(&model, &idle);
         model = seeded;
         let presence = crate::workspace::Msg::Presence {
             pin: "BlueRidge".into(),
             state: "idle".into(),
         };
-        let (seeded, _) = crate::workspace::tick(&model, &presence);
+        let (seeded, presence_cmds) = crate::workspace::tick(&model, &presence);
         model = seeded;
         let msg = crate::workspace::Msg::WatchNdjson {
             line: r#"{"kind":14,"id":"u1","tags":[["p","BlueRidge"],["toron-kind","request-release"]],"content":"release?"}"#.to_string(),
@@ -3099,11 +3102,18 @@ mod tests {
             &dir,
             "ws1",
             &presence,
-            &[],
+            &presence_cmds,
             serde_json::json!({}),
             Some(&pins),
         );
-        journal_append_workspace(&dir, "ws1", &idle, &[], serde_json::json!({}), Some(&pins));
+        journal_append_workspace(
+            &dir,
+            "ws1",
+            &idle,
+            &idle_cmds,
+            serde_json::json!({}),
+            Some(&pins),
+        );
         journal_append_workspace(&dir, "ws1", &msg, &cmds, serde_json::json!({}), Some(&pins));
         let entries = journal_read_all(&dir);
         assert_eq!(entries.len(), 3, "roundtrip must read 3 entries");

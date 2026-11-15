@@ -52,6 +52,18 @@ mutation "W7  the watermark makes two renderings of one message distinct" \
     find='    let core = match core.rfind(" (wm ") {' \
     replace='    let core = match None::<usize> {'
 
+mutation "W9  an already-rung message rings again on the idle re-read" \
+    file=$CORE \
+    expect=the_idle_edge_asks_for_the_inbox_when_the_queue_is_empty \
+    find='        if !key.is_empty() && next.rung.contains(&key) {' \
+    replace='        if false && next.rung.contains(&key) {'
+
+mutation "W10  the idle edge does not ask for the inbox" \
+    file=$CORE \
+    expect=the_idle_edge_asks_for_the_inbox_when_the_queue_is_empty \
+    find='                    actions.push(DoorbellAction::FetchInbox);' \
+    replace='                    let _ = 0;'
+
 mutation "W4  a lone system notice rides the ring" \
     file=$CORE \
     expect=a_system_notice_never_rings_and_says_so \

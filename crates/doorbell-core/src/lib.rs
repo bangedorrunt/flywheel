@@ -905,6 +905,11 @@ pub struct DoorbellModel {
     /// Coalescing is by class, never silent: a merge bumps `count` and journals
     /// `merged`, and the ring names every class it carries (bd-0uzrq.8).
     pub queues: BTreeMap<String, Vec<QueuedWake>>,
+    /// Message ids already rung (or digested) for this dispatcher. The idle
+    /// edge re-reads the inbox (bd-0uzrq.2), so the fold must know what it has
+    /// already delivered or a still-unread row would ring on every transition.
+    #[serde(default)]
+    pub rung: std::collections::BTreeSet<String>,
     /// Last-known hc status per pin.
     pub statuses: BTreeMap<String, String>,
     /// Pins (+npubs) this dispatcher owns.
@@ -1102,13 +1107,21 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 .get(pin)
                 .cloned()
                 .unwrap_or_else(|| "unknown".into());
-            if is_drain_transition(&from, status)
-                && let Some(q) = next.queues.get_mut(pin)
-            {
-                let deferred = std::mem::take(q);
+            if is_drain_transition(&from, status) {
+                let deferred = next
+                    .queues
+                    .get_mut(pin)
+                    .map(std::mem::take)
+                    .unwrap_or_default();
                 let total: u32 = deferred.iter().map(|w| w.count).sum();
                 if deferred.is_empty() {
-                    // nothing queued: fall through to the status update
+                    // bd-0uzrq.2: the pane is at a prompt and the queue knows
+                    // nothing. The wake may never have been queued (mail sent
+                    // while this dispatcher was down, or lost between the
+                    // journal append and the file rewrite), so the doorbell
+                    // asks for the inbox itself. Already-rung ids are refused
+                    // by the fold, so a re-read is free.
+                    actions.push(DoorbellAction::FetchInbox);
                 } else if deferred.iter().all(|w| w.kind == WakeKind::Notice) {
                     // Machine notices never ring, even alone.
                     actions.push(DoorbellAction::Audit {
@@ -1117,6 +1130,11 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                         detail: format!("{total} system notice(s) dropped at prompt"),
                     });
                 } else {
+                    for w in &deferred {
+                        if !w.key.is_empty() {
+                            next.rung.insert(w.key.clone());
+                        }
+                    }
                     let ring = composed_ring(&deferred);
                     actions.push(DoorbellAction::Audit {
                         kind: "drained".into(),
@@ -1179,14 +1197,28 @@ fn route_or_queue(
         .unwrap_or("unknown");
     // governed-by: bd-zawk — per-wake verdict via the typed InjectGate so the
     if should_inject(status) {
+        if !key.is_empty() && next.rung.contains(&key) {
+            actions.push(DoorbellAction::Audit {
+                kind: "already_rung".into(),
+                pin: pin.to_string(),
+                detail: line,
+            });
+            return;
+        }
         match inject_gate_for_plane(status, is_urgent_line(&line)) {
             InjectGate::Inject => {
+                if !key.is_empty() {
+                    next.rung.insert(key);
+                }
                 actions.push(DoorbellAction::Prompt {
                     pin: pin.to_string(),
                     line,
                 });
             }
             InjectGate::Digest(reason) => {
+                if !key.is_empty() {
+                    next.rung.insert(key);
+                }
                 actions.push(DoorbellAction::Digest {
                     pin: pin.to_string(),
                     line: format!("{line} [{reason}]"),
@@ -1769,6 +1801,75 @@ mod tests {
         let c = "⟦p2p:request-release⟧ from A for src/y.rs — run: toron next";
         assert_eq!(wake_key(a), wake_key(b));
         assert_ne!(wake_key(a), wake_key(c));
+    }
+
+    /// bd-0uzrq.2: the idle edge rings the doorbell itself. A crew that goes
+    /// at-prompt with an EMPTY queue still gets its unread brief, because the
+    /// wake may never have been queued (mail sent while the dispatcher was
+    /// down, or lost between the journal append and the file rewrite).
+    #[test]
+    fn the_idle_edge_asks_for_the_inbox_when_the_queue_is_empty() {
+        let mut model = DoorbellModel::default();
+        model.index.insert_pin("BlueRidge".into(), None);
+        model.statuses.insert("BlueRidge".into(), "working".into());
+        let (next, actions) = tick(
+            &model,
+            &DoorbellMsg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+        );
+        assert!(
+            matches!(actions.as_slice(), [DoorbellAction::FetchInbox]),
+            "an idle edge with nothing queued asks for the inbox: {actions:?}"
+        );
+
+        // The inbox answers with a brief this dispatcher never queued. The pin
+        // is idle, so it rings now.
+        let rows = vec![serde_json::json!({
+            "id": "c0ffee",
+            "subject": "crew prompt",
+            "sender": "SlateHarbor",
+            "importance": "normal",
+        })];
+        let (next, actions) = tick(
+            &next,
+            &DoorbellMsg::InboxRows {
+                rows: rows.clone(),
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert!(
+            matches!(actions.as_slice(), [DoorbellAction::Prompt { .. }]),
+            "the unread brief rings at the idle edge: {actions:?}"
+        );
+
+        // A second idle with no NEW mail gives nothing: the re-read comes back
+        // with the same still-unread row, and the fold refuses what it already
+        // rung.
+        let (next, actions) = tick(
+            &next,
+            &DoorbellMsg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+        );
+        assert!(
+            actions.is_empty(),
+            "no transition, no fetch, no ring: {actions:?}"
+        );
+        let (_, actions) = tick(
+            &next,
+            &DoorbellMsg::InboxRows {
+                rows,
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert!(
+            matches!(&actions[0], DoorbellAction::Audit { kind, .. } if kind == "already_rung"),
+            "a re-read of an already-rung message is journaled, never rung again: {actions:?}"
+        );
+        assert_eq!(actions.len(), 1, "one audit, no prompt: {actions:?}");
     }
 
     /// The urgent class is the head even when it queued second: a captain-side

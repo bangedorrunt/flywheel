@@ -2969,8 +2969,14 @@ mod tests {
     }
 
     fn watch_line(pin: &str, content: &str) -> String {
+        watch_line_with_id(pin, content, "e1")
+    }
+
+    /// A watch line's identity is its event id (bd-0uzrq.2 — an already-rung id
+    /// is refused, so a fixture that means "a NEW message" must say so).
+    fn watch_line_with_id(pin: &str, content: &str, id: &str) -> String {
         serde_json::json!({
-            "kind": 9, "id": "e1", "pubkey": "ab",
+            "kind": 9, "id": id, "pubkey": "ab",
             "tags": [["p", pin]], "content": content, "created_at": 1
         })
         .to_string()
@@ -2998,7 +3004,11 @@ mod tests {
             pin: "PinA".into(),
             state: "working".into(),
         });
-        let fx = host.tick(&BrainMsg::Watch(watch_line("PinA", "hello again")));
+        let fx = host.tick(&BrainMsg::Watch(watch_line_with_id(
+            "PinA",
+            "hello again",
+            "e2",
+        )));
         assert!(
             fx.iter()
                 .any(|e| matches!(e, Effect::Audit { kind, .. } if kind == "prompt_filtered")),
