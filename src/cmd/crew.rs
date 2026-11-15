@@ -493,15 +493,23 @@ fn prompt_wake_line(wm: u64, urgent: bool) -> String {
     )
 }
 
-/// Ring one crew-prompt wake. `ring_wake` demands the FOLD line — always the
-/// normal form — and types from `urgency` itself, so the urgent form must
-/// never be handed to it.
+/// Ring one crew-prompt wake and CONFIRM the pane turned it into a turn.
+/// `ring_wake` demands the FOLD line — always the normal form — and types from
+/// `urgency` itself, so the urgent form must never be handed to it.
+///
+/// The confirmation is the piece bd-0uzrq.16 adds: a typed wake can be written
+/// and submitted with nothing behind it (a reset opencode sitting on its
+/// welcome screen swallowed the paste live, 2026-11-15 13:47Z), and a writer
+/// that trusts its own write reports a wake that never rang. `wait_turn` asks
+/// the caller's own status plane, so this stays harness-agnostic.
 fn ring_prompt_wake(
     typer: &dyn crate::pane_write::PaneTyper,
     target: &str,
     wm: u64,
     urgent: bool,
     route: crate::harness_caps::WakeRoute,
+    probe: &dyn Fn(&str) -> Result<(String, bool)>,
+    bound: Duration,
 ) -> Result<crate::inbox_ports::RingDone, String> {
     let urgency = if urgent {
         toron_core::wake::Urgency::Urgent
@@ -512,7 +520,58 @@ fn ring_prompt_wake(
         crate::pane_write::Wm(wm),
         crate::pane_write::Urgency::Normal,
     );
-    crate::inbox_ports::ring_wake(typer, target, wm, &fold, urgency, route)
+    // Taken BEFORE the write: a pane whose status record is already stuck at
+    // `working` (bd-0uzrq.10) would otherwise confirm a wake it never consumed,
+    // so the proof is a turn AND a screen that moved off this capture.
+    // shortcut: an unreadable pre-capture degrades the proof to "a turn is in
+    // flight"; upgrade if a harness is found where capture fails but status is
+    // trustworthy.
+    let before = probe(target).ok().map(|(screen, _)| screen_digest(&screen));
+    let done = crate::inbox_ports::ring_wake(typer, target, wm, &fold, urgency, route)?;
+    if done != crate::inbox_ports::RingDone::Typed {
+        return Ok(done);
+    }
+    match wait_turn(target, bound, before, probe) {
+        Ok(true) => Ok(done),
+        Ok(false) => Err(wake_not_landed(target, bound)),
+        Err(e) => Err(format!("{} ({e})", wake_not_landed(target, bound))),
+    }
+}
+
+/// Poll until the pane reports a turn in flight AND its screen differs from the
+/// pre-write capture. Both halves are load-bearing: the screen alone moves on an
+/// idle spinner, and the status alone can be a stale `working` record.
+fn wait_turn(
+    target: &str,
+    bound: Duration,
+    before: Option<u64>,
+    probe: &dyn Fn(&str) -> Result<(String, bool)>,
+) -> Result<bool> {
+    let deadline = std::time::Instant::now() + bound;
+    loop {
+        let (screen, in_turn) = probe(target)?;
+        let moved = before.is_none_or(|before| screen_digest(&screen) != before);
+        if in_turn && moved {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn screen_digest(screen: &str) -> u64 {
+    toron_plane::backend::rex_cli::rex_map::screen_prompt_digest(screen)
+}
+
+/// The typed failure a pane's silence earns: the line went out, no turn
+/// followed, so the wake did not land.
+fn wake_not_landed(target: &str, bound: Duration) -> String {
+    format!(
+        "wake line did not land in {target}: no turn within {}s of the write",
+        bound.as_secs()
+    )
 }
 
 /// The wake line a busy pane refused: the same text the ring would have typed.
@@ -520,19 +579,26 @@ pub(crate) fn wake_is_busy(err: &str) -> bool {
     err.contains("not at a prompt") || err.to_ascii_lowercase().contains("busy")
 }
 
-/// A busy pane's mail is already delivered; the ring is deferred to the
-/// project's live dispatcher, which folds the deferral as a refusal (working
-/// pin queues it, the next at-prompt status rings it). The handoff is
+/// Both refusals mean the same thing to the caller — the mail is delivered and
+/// the ring is not on the pane yet — so both defer to the dispatcher.
+pub(crate) fn wake_is_deferrable(err: &str) -> bool {
+    wake_is_busy(err) || err.contains("wake line did not land")
+}
+
+/// A busy or unconsumed pane's mail is already delivered; the ring is deferred
+/// to the project's live dispatcher, which folds the deferral as a refusal
+/// (working pin queues it, the next at-prompt status rings it). The handoff is
 /// project-keyed on disk, so the dispatcher's workspace id never has to match.
+/// Returns the operator line and, when the ring was deferred, why.
 fn finish_prompt(
     delivered: Result<String, String>,
     defer: impl FnOnce() -> Result<()>,
-) -> Result<String> {
+) -> Result<(String, Option<String>)> {
     match delivered {
-        Ok(typed) => Ok(typed),
-        Err(err) if wake_is_busy(&err) => {
+        Ok(typed) => Ok((typed, None)),
+        Err(err) if wake_is_deferrable(&err) => {
             defer()?;
-            Ok(QUEUED_WAKE.to_string())
+            Ok((QUEUED_WAKE.to_string(), Some(err)))
         }
         Err(err) => Err(anyhow!("{err}")),
     }
@@ -582,7 +648,15 @@ fn deliver_prompt_wake_hc(
         kind
     };
     let route = crate::harness_caps::wake_route(&kind, crate::harness_caps::installed_from_env());
-    match ring_prompt_wake(&crate::pane_write::HcPanes(&c), &target, wm, urgent, route) {
+    match ring_prompt_wake(
+        &crate::pane_write::HcPanes(&c),
+        &target,
+        wm,
+        urgent,
+        route,
+        &|pane| probe_hc(&c, pane),
+        crate::pane_write::WAKE_LANDING_BOUND,
+    ) {
         Ok(crate::inbox_ports::RingDone::Typed) => Ok(prompt_wake_line(wm, urgent)),
         Ok(crate::inbox_ports::RingDone::NoDoor(no_door)) => {
             bail!(
@@ -592,6 +666,24 @@ fn deliver_prompt_wake_hc(
         }
         Err(e) => bail!("wake line delivery to {pin} ({target}) failed: {e}"),
     }
+}
+
+/// Did the typed line become a turn? hc's own `agent_wait` ignores its `until`
+/// set (it waits for terminal idle), so read the status and the screen directly:
+/// working or blocked means the agent picked the line up.
+fn probe_hc(c: &Client, target: &str) -> Result<(String, bool)> {
+    let status = c
+        .agent_get(target)
+        .map_err(|e| anyhow!("hc agent.get {target}: {e}"))?
+        .agent_status;
+    let in_turn = matches!(
+        status,
+        crate::hc::AgentStatus::Working | crate::hc::AgentStatus::Blocked
+    );
+    let screen = c
+        .agent_read(target, "screen", Some(40))
+        .map_err(|e| anyhow!("hc pane read {target}: {e}"))?;
+    Ok((screen, in_turn))
 }
 
 #[cfg(feature = "backend-superlogical")]
@@ -631,6 +723,8 @@ fn deliver_prompt_wake_rex(
         wm,
         urgent,
         route,
+        &|pane| probe_rex(&*backend, pane),
+        crate::pane_write::WAKE_LANDING_BOUND,
     ) {
         Ok(crate::inbox_ports::RingDone::Typed) => Ok(prompt_wake_line(wm, urgent)),
         Ok(crate::inbox_ports::RingDone::NoDoor(no_door)) => {
@@ -641,6 +735,31 @@ fn deliver_prompt_wake_rex(
         }
         Err(e) => bail!("wake line delivery to {pin} ({target}) failed: {e}"),
     }
+}
+
+/// rex answers both halves in one round trip: the folded status (`agent_wait`
+/// with an empty `until` set is a read) and the block's current screen for the
+/// digest.
+#[cfg(feature = "backend-superlogical")]
+fn probe_rex(
+    backend: &dyn crate::backend::MultiplexerBackend,
+    target: &str,
+) -> Result<(String, bool)> {
+    use crate::hc::AgentStatus;
+    let status = backend
+        .agent_wait(target, &[], Some(0))
+        .map_err(|e| anyhow!("rex agent.get {target}: {e}"))?
+        .agent_status;
+    let in_turn = matches!(status, AgentStatus::Working | AgentStatus::Blocked);
+    let read = backend
+        .agent_read(target, "screen", 40)
+        .map_err(|e| anyhow!("rex pane read {target}: {e}"))?;
+    let screen = read
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Ok((screen, in_turn))
 }
 
 fn deliver_prompt_wake(
@@ -687,7 +806,7 @@ fn cmd_crew_prompt(
     let wm = recipient_wm(project, pin);
     let delivered =
         deliver_prompt_wake(cfg, project, pin, urgent, wm).map_err(|e| format!("{e:#}"));
-    let wake = finish_prompt(delivered, || defer_busy_wake(project, pin))?;
+    let (wake, deferred_reason) = finish_prompt(delivered, || defer_busy_wake(project, pin))?;
     let queued = wake == QUEUED_WAKE;
 
     crate::log(
@@ -699,6 +818,7 @@ fn cmd_crew_prompt(
             "urgent": urgent,
             "wake": wake,
             "wake_queued": queued,
+            "wake_deferred_reason": deferred_reason,
             "wm": wm,
             "bead": bead,
         }),
@@ -867,6 +987,23 @@ mod tests {
         rec.0.lock().unwrap().clone()
     }
 
+    /// A pane that really takes the line: the first read is the pre-write
+    /// capture, every later read is the turn the wake started.
+    fn landed_probe() -> impl Fn(&str) -> Result<(String, bool)> {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        move |_| {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(if n == 0 {
+                (
+                    "at the prompt: …/flywheel:adr-0021-stage-contracts".to_string(),
+                    false,
+                )
+            } else {
+                ("es...upt   1 shell  770.3K (77%)".to_string(), true)
+            })
+        }
+    }
+
     /// bd-vb96v: `--urgent` must ring. `ring_wake` checks the FOLD line (always
     /// the normal form) and types from `urgency`; handing it the urgent line is
     /// the bug that made every urgent prompt fail after its mail went out.
@@ -880,6 +1017,8 @@ mod tests {
             42,
             true,
             WakeRoute::Inject { interrupt: true },
+            &landed_probe(),
+            Duration::ZERO,
         )
         .expect("an urgent crew prompt must ring");
         assert_eq!(got, crate::inbox_ports::RingDone::Typed);
@@ -905,12 +1044,114 @@ mod tests {
             42,
             false,
             WakeRoute::Inject { interrupt: true },
+            &landed_probe(),
+            Duration::ZERO,
         )
         .expect("a normal crew prompt must ring");
         assert_eq!(got, crate::inbox_ports::RingDone::Typed);
         let typed = prompt_wake_line(42, false);
         assert!(typed.contains("toron next"), "wake is compliant: {typed}");
         assert_eq!(writes(&rec), vec![format!("prompt block:pane-1 {typed}")]);
+    }
+
+    /// bd-0uzrq.16, the live failure in a unit shape: a reset opencode sitting
+    /// on its welcome screen swallowed the pasted wake on 2026-11-15 13:47Z —
+    /// the write returned Ok, the input box stayed empty, no turn started, and
+    /// the captain's brief never rang. The writer must see the silence.
+    #[test]
+    fn a_welcome_screen_that_swallows_the_paste_is_a_typed_failure() {
+        use crate::harness_caps::WakeRoute;
+        let rec = RecTyper::default();
+        let err = ring_prompt_wake(
+            &rec,
+            "block:01a1d6a1-fresh",
+            42,
+            false,
+            WakeRoute::Inject { interrupt: false },
+            &|_| Ok(("welcome: Ask anything".to_string(), false)),
+            Duration::ZERO,
+        )
+        .expect_err("a pane that never turns must not report a landed wake");
+        assert!(err.contains("wake line did not land"), "got: {err}");
+        assert_eq!(
+            writes(&rec),
+            vec![format!(
+                "prompt block:01a1d6a1-fresh {}",
+                prompt_wake_line(42, false)
+            )],
+            "the line is typed either way — the failure is that nothing consumed it"
+        );
+    }
+
+    /// And an unconsumed wake must not vanish: it goes back to the queue as a
+    /// deferral, with the reason on the journal.
+    #[test]
+    fn an_unconsumed_wake_defers_to_the_dispatcher_with_its_reason() {
+        let _g = crate::config::test_state_home();
+        let project = format!("landing-defer-{}", std::process::id());
+        let out = finish_prompt(
+            Err(wake_not_landed("block:p1", Duration::from_secs(8))),
+            || defer_busy_wake(&project, "BlueRidge"),
+        )
+        .expect("an unconsumed wake must not fail the whole prompt");
+        assert_eq!(out.0, QUEUED_WAKE);
+        assert!(
+            out.1
+                .as_deref()
+                .is_some_and(|why| why.contains("did not land")),
+            "the journal names the typed failure: {out:?}"
+        );
+        let hosted: std::collections::BTreeSet<String> =
+            ["BlueRidge".to_string()].into_iter().collect();
+        assert_eq!(
+            crate::doorbell::take_deferred_wakes(&crate::config::state_dir(), &project, &hosted),
+            vec![(
+                "BlueRidge".to_string(),
+                "[doorbell] plane-P mail. Pull: toron next".to_string()
+            )],
+            "the unconsumed wake is on the dispatcher's queue, not lost"
+        );
+    }
+
+    /// The .10 stale record is the trap this guard exists for: a pane can report
+    /// `working` while its screen never moved, so status alone would confirm a
+    /// wake that landed nowhere.
+    #[test]
+    fn a_stale_working_record_cannot_confirm_a_silent_wake() {
+        let screen = "…/work…/flywheel:adr-0021-stage-contracts";
+        let before = screen_digest(screen);
+        let started = wait_turn("block:p1", Duration::ZERO, Some(before), &|_| {
+            Ok((screen.to_string(), true))
+        })
+        .expect("probe");
+        assert!(!started, "an identical screen is not proof the line landed");
+    }
+
+    /// The other half: the box kept the text (so the screen moved) but no turn
+    /// started — the Enter was lost, not the paste.
+    #[test]
+    fn a_moved_screen_without_a_turn_is_not_a_landing() {
+        let started = wait_turn(
+            "block:p1",
+            Duration::ZERO,
+            Some(screen_digest("before")),
+            &|_| Ok(("⟦toron⟧ typed but not submitted".to_string(), false)),
+        )
+        .expect("probe");
+        assert!(!started, "text sitting in the box is not a turn");
+    }
+
+    /// And the shape that does land both ways confirms on the first poll.
+    #[test]
+    fn a_turn_on_a_moved_screen_confirms_the_wake() {
+        let started = wait_turn(
+            "block:p1",
+            Duration::ZERO,
+            Some(screen_digest("before")),
+            &|_| Ok(("es...upt 1 shell 770.3K (77%)".to_string(), true)),
+        )
+        .expect("probe");
+        assert!(started, "a turn on a screen that moved is a landed wake");
     }
 
     /// A busy pane's mail is already delivered, so the CLI hands the ring to
@@ -927,7 +1168,12 @@ mod tests {
             || defer_busy_wake(&project, "BlueRidge"),
         )
         .expect("a busy pane must not fail the prompt");
-        assert_eq!(out, QUEUED_WAKE);
+        assert_eq!(out.0, QUEUED_WAKE);
+        assert!(
+            out.1.as_deref().is_some_and(|why| why.contains("busy")),
+            "the journal gets the refusal: {out:?}"
+        );
+        let out = out.0;
         assert!(
             out.contains("doorbell rings at the next prompt"),
             "the operator is told who rings: {out}"

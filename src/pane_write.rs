@@ -20,6 +20,10 @@
 
 /// The marker every wake line starts with (redesign §4.1).
 pub const WAKE_MARK: &str = "⟦toron⟧";
+/// How long a typed wake may take to become a turn before it is a typed
+/// failure (bd-0uzrq.16). A turn that starts does so in well under a second
+/// live; the bound only has to outlast a slow paste, never a whole turn.
+pub const WAKE_LANDING_BOUND: std::time::Duration = std::time::Duration::from_secs(8);
 /// Wake urgency (redesign §6A.4): urgent steers ring with the URGENT line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Urgency {
