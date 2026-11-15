@@ -1857,6 +1857,10 @@ impl Host for FileHost {
         Self::now_unix()
     }
 
+    fn doorbell_index(&self) -> Option<&doorbell_core::SelfIndex> {
+        Some(&self.reducer.model.index)
+    }
+
     fn fetch_inbox(&self, pin: &str, since: &str) -> Vec<serde_json::Value> {
         fetch_inbox_rows(
             &self.cfg.toron_bin,

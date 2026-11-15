@@ -603,9 +603,20 @@ impl<H: Host> Brain<H> {
             .collect();
         let now = self.host.now_unix();
         let injects = self.gated(raw.clone(), now);
-        let effect = serde_json::json!({
-            "allowed": injects.len(), "gated": raw.len().saturating_sub(injects.len()),
+        let (class, targets) = self.host.doorbell_index().map_or((None, 0), |idx| {
+            (
+                doorbell_core::parse_watch_ndjson(&line, idx)
+                    .map(|(c, _)| format!("{c:?}")),
+                doorbell_core::watch_targets(&line, idx).len(),
+            )
         });
+        let mut effect = serde_json::json!({
+            "allowed": injects.len(), "gated": raw.len().saturating_sub(injects.len()),
+            "targets": targets,
+        });
+        if let Some(c) = class {
+            effect["class"] = serde_json::Value::String(c);
+        }
         let pins: Vec<String> = raw.iter().map(|(p, _)| p.clone()).collect();
         self.journal(
             &serde_json::json!({"rt_kind": "Watch"}),

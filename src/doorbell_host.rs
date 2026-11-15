@@ -1023,6 +1023,10 @@ impl Host for RtHost {
         unix_now()
     }
 
+    fn doorbell_index(&self) -> Option<&doorbell_core::SelfIndex> {
+        Some(&self.model.doorbell.index)
+    }
+
     /// GS-039 transition gate (audit P1): the reducer model owns the
     /// last-known status — `tick` ran `workspace::tick` before the brain
     /// reads this, so it must return the PREVIOUS tick's value. Untrained

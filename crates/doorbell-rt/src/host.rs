@@ -46,6 +46,11 @@ pub trait Host: Send {
     fn tick(&mut self, msg: &BrainMsg) -> Vec<Effect>;
     /// Wall-clock unix secs (enters tick only as payload, replayable).
     fn now_unix(&self) -> u64;
+    /// Doorbell index for watch-line analysis (classification/targeting). Used
+    /// for observability (journal) and must reflect the same index tick uses.
+    fn doorbell_index(&self) -> Option<&doorbell_core::SelfIndex> {
+        None
+    }
     /// Plane-P inbox rows for one pin (F6: shared borrow — fetch needs no
     /// &mut; pipe worker in .5 calls this off-loop, immediate here).
     fn fetch_inbox(&self, pin: &str, since: &str) -> Vec<serde_json::Value>;
@@ -198,6 +203,10 @@ impl Host for MockHost {
             self.statuses.insert(pin.clone(), status.clone());
         }
         self.script.pop_front().unwrap_or_default()
+    }
+
+    fn doorbell_index(&self) -> Option<&doorbell_core::SelfIndex> {
+        None
     }
 
     fn prev_status(&self, pin: &str) -> Option<String> {

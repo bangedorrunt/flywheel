@@ -2539,9 +2539,42 @@ mod tests {
             },
         );
         assert!(
-            matches!(&again[..], [DoorbellAction::Audit { kind, .. }] if kind == "already_rung"),
-            "poll of the same message must dedup: {again:?}"
+            again.iter().all(|a| !matches!(a, DoorbellAction::Prompt { .. })),
+            "poll of the same message must not ring again: {again:?}"
         );
+        assert!(
+            again.iter().any(|a| matches!(a, DoorbellAction::Audit { kind, .. } if kind == "already_rung")),
+            "poll of the same message must be audibly deduped: {again:?}"
+        );
+    }
+
+    /// bd-0uzrq.18: the in-process wake bus delivers mail-delivered events with
+    /// the recipient in the `p` tag as a hex npub and the message id in `mid`;
+    /// an index that knows the pin's npub must resolve the target and ring.
+    #[test]
+    fn mail_delivered_watch_with_hex_npub_p_tag_rings_idle_pin() {
+        let npub = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let mut index = SelfIndex::default();
+        index.insert_pin("BlueRidge".into(), Some(npub.into()));
+        let mut model = DoorbellModel::default();
+        model.index = index;
+        model.statuses.insert("BlueRidge".into(), "idle".into());
+        let watch = format!(
+            r#"{{"kind":9,"id":"wake-hex-1","pubkey":"senderpk","created_at":1700000000,"tags":[["p","{npub}"],["t","flywheel"],["h","thread-1"],["toron-kind","mail-delivered"],["thread","thread-1"],["importance","normal"],["from","SlateHarbor"],["mid","msg-hex-1"]],"content":"[doorbell] mail from SlateHarbor thread thread-1 importance normal"}}"#
+        );
+        let (class, hint) = parse_watch_ndjson(&watch, &model.index).expect("must classify");
+        assert_eq!(class, EventClass::PlanePMail);
+        assert!(hint.contains("toron next"));
+        assert_eq!(
+            watch_targets(&watch, &model.index),
+            vec!["BlueRidge".to_string()]
+        );
+        let (next, actions) = tick(&model, &DoorbellMsg::WatchNdjson { line: watch });
+        assert!(
+            matches!(&actions[..], [DoorbellAction::Prompt { pin, line }] if pin == "BlueRidge" && line.contains("toron next")),
+            "hex-npub p tag with mid must ring idle pin: {actions:?}"
+        );
+        assert!(next.rung.contains("msg-hex-1"));
     }
 
     /// bd-0uzrq.18: two mails on one thread are two messages and must both ring.
