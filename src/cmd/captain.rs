@@ -230,6 +230,10 @@ fn is_captain_row(row: &Value, pin: &str, crew: &std::collections::BTreeSet<Stri
 }
 
 /// The subjects of the rows a pin holds from the captain side.
+///
+/// A system notice (empty subject from a 64-hex sender) is not a brief and is
+/// dropped by the doorbell's own classifier, shared here so the page names only
+/// what a person can act on; a real row with no subject still gets a label.
 fn captain_subjects(
     rows: &[Value],
     pin: &str,
@@ -237,12 +241,13 @@ fn captain_subjects(
 ) -> Vec<String> {
     rows.iter()
         .filter(|row| is_captain_row(row, pin, crew))
-        .map(|row| {
-            row.get("subject")
-                .and_then(Value::as_str)
-                .unwrap_or("(no subject)")
-                .to_string()
-        })
+        .filter(|row| !crate::mail_wake::is_system_notice_value(row))
+        .map(
+            |row| match row.get("subject").and_then(Value::as_str).map(str::trim) {
+                Some(subject) if !subject.is_empty() => subject.to_string(),
+                _ => "(no subject)".to_string(),
+            },
+        )
         .collect()
 }
 
@@ -1352,6 +1357,15 @@ mod tests {
             captain_subjects(&rows, "CyanCove", &crew),
             vec!["[bd-x] brief".to_string()],
             "only the captain-side row is named"
+        );
+        let noise = vec![
+            json!({"sender": "a".repeat(64), "subject": ""}),
+            json!({"sender": "SlateHarbor", "subject": "  "}),
+        ];
+        assert_eq!(
+            captain_subjects(&noise, "CyanCove", &crew),
+            vec!["(no subject)".to_string()],
+            "a system notice is not a brief; a blank human subject still gets a label"
         );
         assert!(is_captain_row(&rows[2], "CyanCove", &crew));
         assert!(!is_captain_row(&rows[0], "CyanCove", &crew));
