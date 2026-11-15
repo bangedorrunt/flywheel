@@ -176,6 +176,7 @@ run_step build "${MBX[@]}" build --workspace --all-targets || true
   "${MBX[@]}" run --quiet --bin flywheel -- workflow verify --json || true
 [ -n "$FAILED_STEP" ] || run_step doorbell \
   "${MBX[@]}" test -p doorbell-cli -p doorbell-rt -p doorbell-core || true
+[ -n "$FAILED_STEP" ] || run_step stack-recover bash scripts/test-stack-recover.sh || true
 [ -n "$FAILED_STEP" ] || run_step verify-clippy bash scripts/verify-clippy.sh || true
 [ -n "$FAILED_STEP" ] || run_step verify-formal bash scripts/verify-formal.sh || true
 [ -n "$FAILED_STEP" ] || run_step verify-coverage bash scripts/verify-coverage.sh || true

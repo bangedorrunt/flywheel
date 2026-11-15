@@ -233,3 +233,13 @@ mutations = [
   "scripts/mutations/doorbell-mail-push.spec.sh#M1",
   "scripts/mutations/doorbell-mail-push.spec.sh#M2",
 ]
+
+[[behavior]]
+id = "stack.recover-absent-legacy-daemon"
+owner = "scripts/stack.sh"
+status = "proven"
+concurrent = false
+tests = [
+  "tests/stack_recover.rs::stack_recover_script_cases",
+]
+mutations = ["scripts/mutations/stack-recover.spec.sh#R1"]
