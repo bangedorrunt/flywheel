@@ -176,7 +176,14 @@ impl SelfIndex {
         if self.pins.contains_key(token) {
             return Some(token.to_string());
         }
-        self.npubs.get(&token.to_lowercase()).cloned()
+        let lower = token.to_lowercase();
+        if let Some(pin) = self.npubs.get(&lower) {
+            return Some(pin.clone());
+        }
+        self.pins
+            .keys()
+            .find(|pin| pin.eq_ignore_ascii_case(token))
+            .cloned()
     }
 
     pub fn pin_names(&self) -> impl Iterator<Item = &str> {
@@ -322,27 +329,10 @@ pub fn watch_targets(line: &str, index: &SelfIndex) -> Vec<String> {
             let Some(val) = a.get(1).and_then(|x| x.as_str()) else {
                 continue;
             };
-            if matches!(key, "p" | "assignee") {
-                if let Some(pin) = index.resolve(val) {
-                    out.insert(pin);
-                } else {
-                    // Mail-delivered p tags carry hex npub; tolerate case/format
-                    // drift so a push wake can still target the owning pin.
-                    let lower = val.to_ascii_lowercase();
-                    for pin in index.pin_names() {
-                        if pin.eq_ignore_ascii_case(val) {
-                            out.insert(pin.to_string());
-                            break;
-                        }
-                        if index
-                            .npub(pin)
-                            .is_some_and(|n| n.eq_ignore_ascii_case(val) || n.eq_ignore_ascii_case(&lower))
-                        {
-                            out.insert(pin.to_string());
-                            break;
-                        }
-                    }
-                }
+            if matches!(key, "p" | "assignee")
+                && let Some(pin) = index.resolve(val)
+            {
+                out.insert(pin);
             }
         }
     }
@@ -1135,10 +1125,6 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
             let Some((class, hint)) = parse_watch_ndjson(line, &next.index) else {
                 return (next, actions);
             };
-            // A watch line renders with its EVENT id, so two distinct events of
-            // one class are two messages (they merge) and a redelivery of one is
-            // the same message (it dedups). The inbox/CLI producers do not, so
-            // their identity is the line itself.
             let v = serde_json::from_str::<serde_json::Value>(line).ok();
             let event_id = v
                 .as_ref()
@@ -1149,39 +1135,51 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                         .map(str::to_string)
                 })
                 .unwrap_or_default();
-            let line_out = doorbell_line(class, &hint);
-            // Watch events carry an id and the inbox/CLI producers do not, so a
-            // watch key is the line core PLUS the event: two events of a class
-            // merge, a redelivery of one dedups. Mail-delivered push and inbox
-            // poll are different producers of one delivery (bd-0uzrq.18): share
-            // the thread/h ref so the poll dedups the push ring.
-            let key = event_id;
-            let thread = if matches!(class, EventClass::PlanePMail | EventClass::PlanePUrgent) {
-                v.as_ref().and_then(|v| {
-                    v.get("tags").and_then(|t| t.as_array()).and_then(|tags| {
-                        tags.iter().find_map(|t| {
-                            let a = t.as_array()?;
-                            if a.first()?.as_str()? == "h" {
-                                a.get(1)?
-                                    .as_str()
-                                    .filter(|s| !s.is_empty())
-                                    .map(str::to_string)
-                            } else {
-                                None
-                            }
-                        })
-                    })
+            let tags = v
+                .as_ref()
+                .and_then(|v| v.get("tags"))
+                .and_then(|t| t.as_array());
+            let thread = tags.and_then(|tags| {
+                tags.iter().find_map(|t| {
+                    let a = t.as_array()?;
+                    if a.first()?.as_str()? == "h" {
+                        a.get(1)?
+                            .as_str()
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                    } else {
+                        None
+                    }
                 })
-            } else {
-                None
+            });
+            let message_id = tags.and_then(|tags| {
+                tags.iter().find_map(|t| {
+                    let a = t.as_array()?;
+                    let k = a.first()?.as_str()?;
+                    if matches!(k, "mid" | "message-id" | "msg") {
+                        a.get(1)?
+                            .as_str()
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+            });
+            let (key, queue_thread) = match class {
+                EventClass::PlanePMail | EventClass::PlanePUrgent => {
+                    (message_id.unwrap_or(event_id), thread)
+                }
+                _ => (event_id, None),
             };
+            let line_out = doorbell_line(class, &hint);
             for pin in watch_targets(line, &next.index) {
                 route_or_queue(
                     &mut next,
                     &mut actions,
                     &pin,
                     key.clone(),
-                    thread.clone(),
+                    queue_thread.clone(),
                     line_out.clone(),
                 );
             }
@@ -1299,22 +1297,6 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
 /// Idle/done panes get a Prompt now; blocked+act-now prompts while
 /// blocked+routine digests with a reason (bd-zawk G6); working panes queue
 /// (drained on the next working -> idle|done|blocked PlaneStatus).
-fn rung_hit(next: &DoorbellModel, key: &str, thread: Option<&str>) -> bool {
-    (!key.is_empty() && next.rung.contains(key))
-        || thread
-            .filter(|t| !t.is_empty())
-            .is_some_and(|t| next.rung.contains(t))
-}
-
-fn record_rung(next: &mut DoorbellModel, key: String, thread: Option<&str>) {
-    if !key.is_empty() {
-        next.rung.insert(key);
-    }
-    if let Some(t) = thread.filter(|t| !t.is_empty()) {
-        next.rung.insert(t.to_string());
-    }
-}
-
 fn route_or_queue(
     next: &mut DoorbellModel,
     actions: &mut Vec<DoorbellAction>,
@@ -1328,10 +1310,7 @@ fn route_or_queue(
         .get(pin)
         .map(String::as_str)
         .unwrap_or("unknown");
-    // One message rings ONCE, however many producers carry it and whenever the
-    // inbox is re-read. This guard sits above the injectable split because the
-    // preempt arm below could otherwise type the same wake twice (bd-0uzrq.13).
-    if rung_hit(next, &key, thread.as_deref()) {
+    if !key.is_empty() && next.rung.contains(&key) {
         actions.push(DoorbellAction::Audit {
             kind: "already_rung".into(),
             pin: pin.to_string(),
@@ -1339,18 +1318,21 @@ fn route_or_queue(
         });
         return;
     }
-    // governed-by: bd-zawk — per-wake verdict via the typed InjectGate so the
     if should_inject(status) {
         match inject_gate_for_plane(status, is_act_now_line(&line)) {
             InjectGate::Inject => {
-                record_rung(next, key, thread.as_deref());
+                if !key.is_empty() {
+                    next.rung.insert(key);
+                }
                 actions.push(DoorbellAction::Prompt {
                     pin: pin.to_string(),
                     line,
                 });
             }
             InjectGate::Digest(reason) => {
-                record_rung(next, key, thread.as_deref());
+                if !key.is_empty() {
+                    next.rung.insert(key);
+                }
                 actions.push(DoorbellAction::Digest {
                     pin: pin.to_string(),
                     line: format!("{line} [{reason}]"),
@@ -1369,10 +1351,9 @@ fn route_or_queue(
             inject_gate_for_plane(status, is_act_now_line(&line)),
             InjectGate::Inject
         ) {
-            // A preempt rings ONCE. Recording the key here is what stops the
-            // CLI's own refused-handoff copy from ringing the same message
-            // again at the drain (bd-0uzrq.13).
-            record_rung(next, key, thread.as_deref());
+            if !key.is_empty() {
+                next.rung.insert(key);
+            }
             actions.push(DoorbellAction::Prompt {
                 pin: pin.to_string(),
                 line,
@@ -1380,10 +1361,6 @@ fn route_or_queue(
             return;
         }
         let queue = next.queues.entry(pin.to_string()).or_default();
-        // bd-0uzrq.8/.x3pqw: one identity per message. The same message from a
-        // second producer is a DEDUP (one ring); a different message of a
-        // class MERGES visibly. Silently coalescing is how a captain brief
-        // vanished behind a peer wake.
         let fold = queue_line(queue, key, thread, line.clone());
         actions.push(DoorbellAction::Audit {
             kind: match fold {
@@ -2535,24 +2512,20 @@ mod tests {
     }
 
     /// bd-0uzrq.18: a mail-delivered push event rings an idle pin at once; a
-    /// later inbox poll of the same delivery must not ring again.
+    /// later inbox poll of the same message must not ring again.
     #[test]
     fn mail_delivered_watch_rings_once_then_poll_dedups() {
         let model = model_with("BlueRidge");
-        let watch = r#"{"kind":9,"id":"wake-1","tags":[["p","BlueRidge"],["toron-kind","mail-delivered"],["h","t-1"]],"content":"sealed"}"#;
+        let watch = r#"{"kind":9,"id":"wake-1","tags":[["p","BlueRidge"],["toron-kind","mail-delivered"],["h","t-1"],["mid","msg-1"]],"content":"sealed"}"#;
         let (next, actions) = tick(&model, &DoorbellMsg::WatchNdjson { line: watch.into() });
         assert!(
             matches!(&actions[..], [DoorbellAction::Prompt { pin, line }] if pin == "BlueRidge" && line.contains("toron next")),
             "push path must ring the idle pin immediately: {actions:?}"
         );
-        assert!(
-            next.rung.contains("wake-1") && next.rung.contains("t-1"),
-            "the watch id and thread ref are rung: {:?}",
-            next.rung
-        );
+        assert!(next.rung.contains("msg-1"));
 
         let row = serde_json::json!({
-            "id": "inbox-1",
+            "id": "msg-1",
             "thread_id": "t-1",
             "subject": "crew prompt",
             "sender": "SlateHarbor",
@@ -2566,12 +2539,50 @@ mod tests {
             },
         );
         assert!(
-            !again.iter().any(|a| matches!(a, DoorbellAction::Prompt { .. })),
-            "poll must not ring the already-rung delivery again: {again:?}"
+            matches!(&again[..], [DoorbellAction::Audit { kind, .. }] if kind == "already_rung"),
+            "poll of the same message must dedup: {again:?}"
+        );
+    }
+
+    /// bd-0uzrq.18: two mails on one thread are two messages and must both ring.
+    #[test]
+    fn two_mails_on_one_thread_to_idle_pin_give_two_rings() {
+        let model = model_with("BlueRidge");
+        let first = serde_json::json!({
+            "id": "msg-1",
+            "thread_id": "thread-9",
+            "subject": "first",
+            "sender": "SlateHarbor",
+            "importance": "normal",
+        });
+        let second = serde_json::json!({
+            "id": "msg-2",
+            "thread_id": "thread-9",
+            "subject": "second",
+            "sender": "SlateHarbor",
+            "importance": "normal",
+        });
+        let (next, a1) = tick(
+            &model,
+            &DoorbellMsg::InboxRows {
+                rows: vec![first],
+                pin: "BlueRidge".into(),
+            },
         );
         assert!(
-            matches!(&again[..], [DoorbellAction::Audit { kind, .. }] if kind == "already_rung"),
-            "and the dedup is journaled: {again:?}"
+            matches!(&a1[..], [DoorbellAction::Prompt { .. }]),
+            "first mail must ring: {a1:?}"
+        );
+        let (_, a2) = tick(
+            &next,
+            &DoorbellMsg::InboxRows {
+                rows: vec![second],
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert!(
+            matches!(&a2[..], [DoorbellAction::Prompt { .. }]),
+            "second mail on same thread must ring: {a2:?}"
         );
     }
 

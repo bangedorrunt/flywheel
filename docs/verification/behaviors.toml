@@ -227,5 +227,9 @@ status = "proven"
 concurrent = false
 tests = [
   "crates/doorbell-core/src/lib.rs::mail_delivered_watch_rings_once_then_poll_dedups",
+  "crates/doorbell-core/src/lib.rs::two_mails_on_one_thread_to_idle_pin_give_two_rings",
 ]
-mutations = ["scripts/mutations/doorbell-mail-push.spec.sh#M1"]
+mutations = [
+  "scripts/mutations/doorbell-mail-push.spec.sh#M1",
+  "scripts/mutations/doorbell-mail-push.spec.sh#M2",
+]
