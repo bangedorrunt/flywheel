@@ -136,9 +136,14 @@ host_replacement_ready() {
 recover_stale_hosts() {
   local health hash rows original_rows pid project workspace label
   local waited=0 killed=0
+  # ADR-0020: the legacy :18980 doorbell daemon is retired. If it is absent,
+  # there are no stale legacy hosts to replace — that is success, not failure.
+  health="$(curl -fsS --max-time 2 "$DOORBELL_URL/health" 2>/dev/null)" || {
+    echo "no legacy doorbell daemon; nothing to replace"
+    return 0
+  }
   command -v jq >/dev/null 2>&1 || return 1
   [ -x "$(bin_dir)/flywheel" ] || return 1
-  health="$(curl -fsS --max-time 2 "$DOORBELL_URL/health" 2>/dev/null)" || return 1
   hash="$(dd if="$(bin_dir)/flywheel" bs=8192 count=1 2>/dev/null | shasum -a 1 | awk '{print $1}')"
   [ -n "$hash" ] || return 1
   rows="$(stale_host_rows "$health" "$hash")"
@@ -163,7 +168,8 @@ recover_stale_hosts() {
   done <<<"$rows"
   [ "$killed" -gt 0 ] || return 1
 
-  while [ "$waited" -lt 90 ]; do
+  local timeout="${RECOVER_STALE_TIMEOUT:-90}"
+  while [ "$waited" -lt "$timeout" ]; do
     sleep 2
     waited=$((waited + 2))
     health="$(curl -fsS --max-time 2 "$DOORBELL_URL/health" 2>/dev/null)" || continue
@@ -353,14 +359,20 @@ do_install() {
   fi
 }
 
-if [ $# -eq 0 ]; then
-  usage 2
+main() {
+  if [ $# -eq 0 ]; then
+    usage 2
+  fi
+  local cmd="$1"
+  shift
+  case "$cmd" in
+    status) do_status "$@" ;;
+    install) do_install "$@" ;;
+    -h|--help|help) usage 0 ;;
+    *) die "unknown command: $cmd" ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
 fi
-cmd="$1"
-shift
-case "$cmd" in
-  status) do_status "$@" ;;
-  install) do_install "$@" ;;
-  -h|--help|help) usage 0 ;;
-  *) die "unknown command: $cmd" ;;
-esac
