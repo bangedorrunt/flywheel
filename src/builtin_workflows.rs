@@ -1843,6 +1843,11 @@ pub const WORKFLOW_GUIDANCE: &[(&str, &str, &str)] = &[
         "review",
         "scheduled scoped review with one follow-up bead",
     ),
+    (
+        "mutation-full",
+        "ops",
+        "nightly full mutation proof; a red spec files a bead",
+    ),
 ];
 
 /// Return bounded catalog guidance for one built-in workflow.
