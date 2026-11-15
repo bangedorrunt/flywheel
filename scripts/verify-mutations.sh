@@ -575,8 +575,13 @@ main() {
     if [ "$dead" -gt 0 ] || [ "$alive" -gt 0 ]; then
         printf '%s guard(s) confirmed dead, %s still load-bearing\n' "$dead" "$alive"
     fi
-    printf '%s/%s mutations proved red\n' "$proven" "$total"
-    [ "$restored_ok" = yes ] && [ "$proven" -eq "$total" ]
+    # An `expect_green` mutation is accounted for by DEAD-CONFIRMED, not by RED:
+    # its whole point is that the guard it kills cannot change behaviour. A spec
+    # mixing both kinds is green only when every mutation landed in its expected
+    # class (nothing MISS/OTHER/VACUOUS/BUILD).
+    printf '%s/%s mutations accounted for (%s red, %s dead)\n' \
+        "$((proven + dead))" "$total" "$proven" "$dead"
+    [ "$restored_ok" = yes ] && [ "$((proven + dead))" -eq "$total" ]
 }
 
 main "$@"
