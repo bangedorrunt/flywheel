@@ -12,4 +12,4 @@ mutation "V1  the finder forgets the canonical-key guard" \
     file=$DAEMON \
     expect=stale_units_for_one_project_are_found_by_canonical_key \
     find=$'        if label == format!("dev.flywheel.doorbell.{canonical}") {\n            continue;\n        }\n' \
-    replace=''
+    replace=$'        // mutation: canonical guard removed\n'

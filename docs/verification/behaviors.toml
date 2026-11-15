@@ -39,11 +39,17 @@ mutations = ["scripts/mutations/doorbell-reap.spec.sh#D3"]
 [[behavior]]
 id = "doorbell.journal-append-atomic"
 owner = "crates/doorbell-rt/src/store.rs"
-# The single-write atomicity is mutation-proven. The LOCK's necessity is not:
-# bypassing it is a build-broken edit (the TryLockError match arms stop
-# typechecking), and splitting the write alone stays green because the lock
-# serialises it. A test that isolates the lock is owed before this flips to
-# proven.
+# The single-write atomicity is mutation-proven. The LOCK's necessity is NOT:
+# three type-preserving mutation shapes were tried and none reddens a test -
+#   (a) split the write in two        -> green (the lock serialises it)
+#   (b) bypass the lock call         -> build-broken (TryLockError arms stop
+#                                       typechecking)
+#   (c) unique lock path per call    -> green (concurrent_appends_lose_no_rows
+#                                       still sees every row: the rename race
+#                                       window is real but not reproducible)
+# concurrent_appends_lose_no_rows now asserts every appended row is retained or
+# recorded as a rotation drop; it is a real property, not a lock witness. This
+# flips to proven when a test isolates the lock itself.
 status = "pending"
 concurrent = false
 tests = [

@@ -1626,6 +1626,15 @@ mod tests {
                 }
             }));
         }
+        {
+            let st = std::sync::Arc::clone(&st);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..40 {
+                    st.maybe_rotate("w");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }));
+        }
         for h in handles {
             h.join().expect("thread");
         }
@@ -1639,6 +1648,78 @@ mod tests {
             "concurrent appends must not produce an unparseable row: {tear:?}"
         );
         assert!(!fold.rows.is_empty(), "rows survive");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The LOCK, not just the single write: with rotation running beside the
+    /// appenders, no row may be lost (rotation rewrites the file; an append
+    /// that races the rewrite lands in a file that no longer exists).
+    #[test]
+    fn concurrent_appends_lose_no_rows() {
+        const THREADS: u64 = 8;
+        const PER_THREAD: u64 = 400;
+        let (st, dir) = test_store("lock-loss");
+        let st = std::sync::Arc::new(st);
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let pad = "y".repeat(1200);
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let st = std::sync::Arc::clone(&st);
+            let counter = std::sync::Arc::clone(&counter);
+            let pad = pad.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..PER_THREAD {
+                    let seq = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    st.append_journal_seq(
+                        "w",
+                        &serde_json::json!({"rt_kind": "Sweep"}),
+                        &serde_json::json!([]),
+                        serde_json::json!({"stage": "lock", "pad": pad, "n": seq}),
+                        &[],
+                        None,
+                        None,
+                    )
+                    .expect("append");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread");
+        }
+
+        let fold = st.fold_workspace("w");
+        let tear = fold
+            .torn
+            .as_ref()
+            .filter(|t| t.reason.contains("unparseable"));
+        assert!(tear.is_none(), "no torn row: {tear:?}");
+        let mut seqs: Vec<u64> = fold
+            .rows
+            .iter()
+            .filter_map(|r| {
+                r.get("executed")
+                    .and_then(|e| e.get("n"))
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .collect();
+        let before = seqs.len();
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(before, seqs.len(), "no row appears twice");
+
+        let audit = std::fs::read_to_string(st.audit_file("w")).unwrap_or_default();
+        let dropped: u64 = audit
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v.get("kind").and_then(|k| k.as_str()) == Some("journal_rotated"))
+            .filter_map(|v| v.get("dropped_lines").and_then(serde_json::Value::as_u64))
+            .sum();
+        assert_eq!(
+            seqs.len() as u64 + dropped,
+            THREADS * PER_THREAD,
+            "every appended row is either retained or recorded as a rotation drop              (retained {} + dropped {dropped}); a row that vanished is a lost append",
+            seqs.len()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
