@@ -68,9 +68,8 @@ mutation "S7  the run-state retain floor clamp is behaviourally inert" \
 # ever stopped being true. Green here means NO TEST DECIDES, and this row is the
 # one place where the two readings diverge: either argv cannot be empty (the
 # guard is dead) or no test says so (the guard is unproven). Unresolved.
-mutation "S8  nothing pins whether argv can be empty" \
-    file=src/headless.rs \
-    expect=arg \
-    find='argv.len().saturating_sub(1)' \
-    replace='argv.len() - 1' \
-    expect_green
+# S8 retired (bd-0uzrq.8 proof): it pinned `argv.len().saturating_sub(1)` as a
+# guard whose only job was to be dead. bd-s9zu0 (c4c19f7a) replaced that line
+# with plain `argv.len() - 1`, so the needle is gone and the mutation proved
+# nothing. Retired rather than retargeted: there is no saturating_sub left to
+# pin, and inventing a new dead guard here would be theatre.
