@@ -37,6 +37,9 @@ pub(crate) enum StackCmd {
         /// Leave the installed toron binary and daemon alone.
         #[arg(long)]
         skip_toron: bool,
+        /// Install as the operator: bypass the captain-only fleet guard.
+        #[arg(long)]
+        operator: bool,
     },
 }
 
@@ -48,7 +51,13 @@ pub(crate) fn cmd_stack(_cfg: &Config, cmd: &StackCmd) -> Result<()> {
             no_codesign,
             no_restart,
             skip_toron,
-        } => stack_install(*dry_run, *no_codesign, *no_restart, *skip_toron),
+            operator,
+        } => {
+            if !dry_run {
+                crate::authority::guard_fleet_mutation(_cfg, None, *operator, "stack install")?;
+            }
+            stack_install(*dry_run, *no_codesign, *no_restart, *skip_toron)
+        }
     }
 }
 
@@ -454,7 +463,44 @@ fn stack_install(
     if !status.success() {
         bail!("stack install failed");
     }
+    // A fleet-wide binary change is a digest fact: every other pane is now
+    // running different code than it booted with (bd-0uzrq.6).
+    broadcast_install();
     Ok(())
+}
+
+/// Queue the install notice where the digest reads it. Best effort: a missing
+/// project must not fail an install that already replaced the binaries.
+fn broadcast_install() {
+    let cfg = crate::config::Config::default();
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let Some(project) = crate::cron::detect_project_in(&cfg, &cwd, None) else {
+        return;
+    };
+    let state_dir = crate::config::state_dir();
+    let digest = format!(
+        "stack install: {} replaced at {}",
+        crate::cmd::stack::installed_flywheel_version(),
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    );
+    crate::doorbell::service_emit_wake_in(&state_dir, &project, "stack-install", "captain");
+    let _ = crate::append_pending_fact(&state_dir, &project, &digest);
+}
+
+/// The installed flywheel version, or "unknown" when the binary is not found.
+pub(crate) fn installed_flywheel_version() -> String {
+    find_bin("flywheel")
+        .and_then(|path| {
+            std::process::Command::new(path)
+                .arg("--version")
+                .output()
+                .ok()
+        })
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 #[cfg(test)]

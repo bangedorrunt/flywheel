@@ -36,6 +36,40 @@ pub fn select_agent_identity(
         .filter(|s| !s.is_empty())
 }
 
+/// Fleet-wide mutations (installing a binary, bouncing the live daemons) are
+/// captain-only: a crew pin that changes the code under every other pane is how
+/// a fleet ran mixed binaries (bd-0uzrq.6). `--operator` is the explicit escape,
+/// and an unset identity (the operator's own shell) is never a crew pin.
+pub fn guard_fleet_mutation(
+    cfg: &crate::config::Config,
+    project: Option<&str>,
+    operator: bool,
+    what: &str,
+) -> anyhow::Result<()> {
+    if operator {
+        return Ok(());
+    }
+    let Some(who) = select_agent_identity(None, &|k| std::env::var(k).ok()) else {
+        return Ok(());
+    };
+    let key = project.map(str::to_string).or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .and_then(|dir| crate::cron::detect_project_in(cfg, &dir, None))
+    });
+    let captain = key.as_deref().and_then(|p| crate::state::captain_pin(p, p));
+    match captain {
+        Some(captain) if captain == who => Ok(()),
+        Some(captain) => anyhow::bail!(
+            "{what} is captain-only: {who} is a crew pin (captain {captain}); pass --operator to override"
+        ),
+        None => anyhow::bail!(
+            "{what} is captain-only: no captain is bound for {} and {who} is a crew pin; pass --operator to override",
+            key.as_deref().unwrap_or("this directory")
+        ),
+    }
+}
+
 /// Wall-clock authority. Reducers never own or read this trait; effects use it
 /// to stamp observations before sending time back as a message.
 #[allow(dead_code)]
@@ -323,5 +357,37 @@ mod tests {
             "2001-09-09T01:46:40+00:00",
             "the conversion must be a real calendar conversion of the injected instant"
         );
+    }
+    /// bd-0uzrq.6: a crew pin may not replace the fleet's binary or bounce its
+    /// daemons; the captain, `--operator`, and an unset identity may.
+    #[test]
+    fn a_crew_pin_may_not_install_or_bounce_the_fleet() {
+        let _g = crate::config::lock_env();
+        let cfg = crate::config::Config::default();
+        let project = format!("fleet-guard-{}", std::process::id());
+        let mailbox = crate::mail::comms_mailbox().expect("mailbox");
+        let rt = crate::mail::runtime().expect("runtime");
+        rt.block_on(mailbox.set_captain_alias(&project, "CaptainPin"))
+            .expect("bind the captain");
+
+        unsafe { std::env::set_var("AGENT_NAME", "CrewPin") };
+        let err = super::guard_fleet_mutation(&cfg, Some(&project), false, "stack install")
+            .expect_err("a crew pin is refused");
+        assert!(
+            format!("{err}").contains("captain-only"),
+            "the refusal names the rule: {err}"
+        );
+
+        unsafe { std::env::set_var("AGENT_NAME", "CaptainPin") };
+        super::guard_fleet_mutation(&cfg, Some(&project), false, "stack install")
+            .expect("the captain may install");
+
+        unsafe { std::env::set_var("AGENT_NAME", "CrewPin") };
+        super::guard_fleet_mutation(&cfg, Some(&project), true, "stack install")
+            .expect("--operator may install");
+
+        unsafe { std::env::remove_var("AGENT_NAME") };
+        super::guard_fleet_mutation(&cfg, Some(&project), false, "stack install")
+            .expect("an operator shell has no crew pin");
     }
 }

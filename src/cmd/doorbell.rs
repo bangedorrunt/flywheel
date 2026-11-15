@@ -27,7 +27,12 @@ pub(crate) enum DoorbellCmd {
     Status { project: String },
     /// start/attach dispatchers for every registered workspace that ever
     /// ran one (the crash-recovery entry point).
-    Start { project: String },
+    Start {
+        project: String,
+        /// Bounce live daemons as the operator: bypass the captain-only guard.
+        #[arg(long)]
+        operator: bool,
+    },
     /// Run the reboot-persistent supervisor loop (the installed unit runs
     /// this; it re-runs the idempotent start every minute and exits on its
     /// own binary change so the service manager restarts the new binary).
@@ -39,6 +44,9 @@ pub(crate) enum DoorbellCmd {
         /// workspace id, or `all`
         #[arg(default_value = "all")]
         workspace: String,
+        /// Bounce live daemons as the operator: bypass the captain-only guard.
+        #[arg(long)]
+        operator: bool,
     },
     /// re-inject the peer-aware handler + identity line into EXISTING panes
     /// (covers hc terminal-split additions and post-crash respawns).

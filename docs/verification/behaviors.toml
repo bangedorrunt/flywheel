@@ -213,3 +213,13 @@ tests = [
   "src/cmd/swarm.rs::retire_refuses_the_captain_seat",
 ]
 mutations = []
+
+[[behavior]]
+id = "fleet.captain-only-mutation"
+owner = "src/authority.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/authority.rs::a_crew_pin_may_not_install_or_bounce_the_fleet",
+]
+mutations = ["scripts/mutations/stack-guard.spec.sh#G1"]

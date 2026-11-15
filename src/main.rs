@@ -3403,11 +3403,29 @@ fn main() {
         }) => cmd_watch(&cfg, project, to, until.as_deref(), *timeout_ms),
         Some(Commands::Doorbell { cmd }) => match cmd {
             DoorbellCmd::Status { project } => cmd_doorbell_status(&cfg, project),
-            DoorbellCmd::Start { project } => cmd_doorbell_start(&cfg, project),
+            DoorbellCmd::Start { project, operator } => {
+                crate::authority::guard_fleet_mutation(
+                    &cfg,
+                    Some(project),
+                    *operator,
+                    "doorbell start",
+                )
+                .and_then(|()| cmd_doorbell_start(&cfg, project))
+            }
             DoorbellCmd::Supervise { project } => {
                 crate::cmd::doorbell::cmd_doorbell_supervise(&cfg, project)
             }
-            DoorbellCmd::Stop { project, workspace } => cmd_doorbell_stop(&cfg, project, workspace),
+            DoorbellCmd::Stop {
+                project,
+                workspace,
+                operator,
+            } => crate::authority::guard_fleet_mutation(
+                &cfg,
+                Some(project),
+                *operator,
+                "doorbell stop",
+            )
+            .and_then(|()| cmd_doorbell_stop(&cfg, project, workspace)),
             DoorbellCmd::ReInject { project } => cmd_doorbell_re_inject(&cfg, project),
             DoorbellCmd::Afk { project, limit } => cmd_doorbell_afk(&cfg, project, *limit),
             DoorbellCmd::Digest {
