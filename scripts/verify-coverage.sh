@@ -56,16 +56,50 @@ for path in root.rglob("*.rs"):
     sources[path] = path.read_text(errors="ignore")
 
 def test_exists(spec: str) -> bool:
+    """The named fn must exist AND carry a test attribute (a helper is not a test)."""
     file, _, name = spec.partition("::")
     path = root / file
     if path not in sources:
         return False
-    body = sources[path]
-    return f"fn {name}(" in body or f"fn {name}<" in body
+    lines = sources[path].splitlines()
+    for i, line in enumerate(lines):
+        if not (f"fn {name}(" in line or f"fn {name}<" in line):
+            continue
+        for back in range(1, 5):
+            if i - back < 0:
+                break
+            prev = lines[i - back].strip()
+            if prev.startswith("#[test]") or prev.startswith("#[tokio::test"):
+                return True
+            if prev.startswith("fn ") or prev.startswith("pub fn "):
+                break
+        return False
+    return False
+
+
+def mutation_exists(spec: str) -> bool:
+    """'scripts/mutations/<area>.spec.sh#<name>' must name a declared mutation."""
+    file, _, name = spec.partition("#")
+    if not name:
+        return False
+    path = root / file
+    if not path.is_file():
+        return False
+    needle = f'mutation "{name} '
+    for line in path.read_text(errors="ignore").splitlines():
+        if line.startswith(needle):
+            return True
+    return False
 
 def formal_exists(spec: str) -> bool:
-    file = spec.split("::")[0]
-    return (root / file).exists()
+    """A formal entry is a TLA model file plus its .cfg, or a workflow-verify chart."""
+    parts = spec.split("::")
+    if len(parts) == 2:
+        model = root / parts[0]
+        cfg = root / parts[1]
+        return model.is_file() and cfg.is_file()
+    file = root / parts[0]
+    return file.is_file()
 
 for b in behaviors:
     bid = b.get("id")
@@ -92,6 +126,11 @@ for b in behaviors:
     for m in mutations:
         if not m.strip():
             errors.append(f"{bid}: empty mutation")
+        elif not mutation_exists(m):
+            errors.append(
+                f"{bid}: mutation not declared: {m} "
+                "(expected scripts/mutations/<area>.spec.sh#<name>)"
+            )
     if b.get("concurrent"):
         formal = b.get("formal")
         if not formal:

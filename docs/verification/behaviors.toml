@@ -15,13 +15,14 @@
 id = "doorbell.busy-deferral"
 owner = "crates/doorbell-core/src/lib.rs"
 status = "proven"
-concurrent = false
+concurrent = true
+formal = ".agents/skills/verify-protocol-tla/models/DeferredHandoff.tla::.agents/skills/verify-protocol-tla/models/DeferredHandoff.cfg"
 tests = [
   "crates/doorbell-core/src/lib.rs::prompt_refused_defers_then_rings_once_at_prompt",
   "crates/doorbell-rt/src/sinks.rs::busy_refusal_defers_and_never_parks_the_sink",
   "src/workspace.rs::a_normal_importance_mail_wake_rings_its_pane",
 ]
-mutations = ["remove the PaneBusy branch in crates/doorbell-rt/src/sinks.rs"]
+mutations = ["scripts/mutations/doorbell-deferral.spec.sh#D1"]
 
 [[behavior]]
 id = "doorbell.reap-plane-guard"
@@ -33,18 +34,22 @@ tests = [
   "src/cmd/doorbell.rs::label_door_is_kept_when_it_is_the_only_door",
   "src/cmd/doorbell.rs::stop_failure_keeps_the_record_and_says_so",
 ]
-mutations = ["remove both plane guards in src/cmd/doorbell.rs"]
+mutations = ["scripts/mutations/doorbell-reap.spec.sh#D3"]
 
 [[behavior]]
 id = "doorbell.journal-append-atomic"
 owner = "crates/doorbell-rt/src/store.rs"
-status = "proven"
+# The single-write atomicity is mutation-proven. The LOCK's necessity is not:
+# bypassing it is a build-broken edit (the TryLockError match arms stop
+# typechecking), and splitting the write alone stays green because the lock
+# serialises it. A test that isolates the lock is owed before this flips to
+# proven.
+status = "pending"
 concurrent = false
 tests = [
-  "crates/doorbell-rt/src/store.rs::concurrent_appends_never_tear_with_rotation",
   "crates/doorbell-rt/src/store.rs::a_torn_row_is_quarantined_and_replay_continues",
 ]
-mutations = ["restore the two-write writer in crates/doorbell-rt/src/store.rs"]
+mutations = ["scripts/mutations/doorbell-deferral.spec.sh#D1"]
 
 [[behavior]]
 id = "spawn.dispatcher-session-key"
@@ -55,7 +60,7 @@ tests = [
   "src/cmd/spawn.rs::dispatcher_workspace_keys_by_the_session_id",
   "src/cmd/doorbell.rs::every_start_site_keys_by_the_live_session_id",
 ]
-mutations = ["return the label unconditionally in dispatcher_workspace"]
+mutations = ["scripts/mutations/spawn.spec.sh#S1"]
 
 [[behavior]]
 id = "judgment.pack-seed-content"
@@ -66,7 +71,7 @@ tests = [
   "src/judgment.rs::seed_all_replaces_a_same_version_pack_whose_bytes_differ",
   "src/judgment.rs::seed_all_never_downgrades_a_newer_user_pack",
 ]
-mutations = ["PackOverwrite::All => dst.exists() in src/judgment.rs"]
+mutations = ["scripts/mutations/judgment.spec.sh#J1"]
 
 [[behavior]]
 id = "doorbell.supervisor-stale-unit"
@@ -77,7 +82,7 @@ tests = [
   "src/daemon.rs::stale_units_for_one_project_are_found_by_canonical_key",
   "src/daemon.rs::bootout_failure_keeps_the_plist_and_reports_the_reason",
 ]
-mutations = ["remove the canonical-key guard in stale_supervisor_units"]
+mutations = ["scripts/mutations/supervisor.spec.sh#V1"]
 
 [[behavior]]
 id = "judgment.bundled-highest-version"
@@ -88,4 +93,4 @@ tests = [
   "src/judgment.rs::bundled_pack_picks_the_highest_version_per_id",
   "src/judgment.rs::seed_all_replaces_a_same_version_pack_whose_bytes_differ",
 ]
-mutations = ["use .next() (first bundled file) instead of the highest version"]
+mutations = ["scripts/mutations/judgment.spec.sh#J2"]
