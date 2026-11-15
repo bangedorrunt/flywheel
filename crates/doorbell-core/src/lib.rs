@@ -2560,8 +2560,10 @@ mod tests {
         let npub = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
         let mut index = SelfIndex::default();
         index.insert_pin("BlueRidge".into(), Some(npub.into()));
-        let mut model = DoorbellModel::default();
-        model.index = index;
+        let mut model = DoorbellModel {
+            index,
+            ..Default::default()
+        };
         model.statuses.insert("BlueRidge".into(), "idle".into());
         let watch = format!(
             r#"{{"kind":9,"id":"wake-hex-1","pubkey":"senderpk","created_at":1700000000,"tags":[["p","{npub}"],["t","flywheel"],["h","thread-1"],["toron-kind","mail-delivered"],["thread","thread-1"],["importance","normal"],["from","SlateHarbor"],["mid","msg-hex-1"]],"content":"[doorbell] mail from SlateHarbor thread thread-1 importance normal"}}"#
