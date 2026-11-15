@@ -40,7 +40,7 @@ TEST_FILTER=(vbf2_a_shared_microsecond vbf2_newest_urgent_wins skills_injected_r
 # can land two urgent rows in the same microsecond, and the winner became
 # whichever row the slice ended on.
 mutation "S1  the wake selector drops the id tiebreak" \
-    file=src/main.rs \
+    file=src/cmd/mail.rs \
     expect=vbf2_a_shared_microsecond_resolves_by_id_in_either_order \
     find=$'            (\n                m.get("created_ts_us")\n                    .and_then(serde_json::Value::as_u64)\n                    .unwrap_or(0),\n                m.get("id")\n                    .and_then(serde_json::Value::as_str)\n                    .unwrap_or(""),\n            )' \
     replace=$'            m.get("created_ts_us")\n                .and_then(serde_json::Value::as_u64)\n                .unwrap_or(0)'
@@ -55,7 +55,7 @@ mutation "S1  the wake selector drops the id tiebreak" \
 # reversing the iterator cannot change it. An order-blind fixture needs an
 # order-DEPENDENT mutation; reversing only proves the fix already holds.
 mutation "S2  the wake selector lets the id outrank the timestamp" \
-    file=src/main.rs \
+    file=src/cmd/mail.rs \
     expect=vbf2_newest_urgent_wins_regardless_of_wire_order \
     find=$'            (\n                m.get("created_ts_us")\n                    .and_then(serde_json::Value::as_u64)\n                    .unwrap_or(0),\n                m.get("id")\n                    .and_then(serde_json::Value::as_str)\n                    .unwrap_or(""),\n            )' \
     replace=$'            (\n                m.get("id")\n                    .and_then(serde_json::Value::as_str)\n                    .unwrap_or(""),\n                m.get("created_ts_us")\n                    .and_then(serde_json::Value::as_u64)\n                    .unwrap_or(0),\n            )'
@@ -65,7 +65,7 @@ mutation "S2  the wake selector lets the id outrank the timestamp" \
 # This mutation makes the site read the FIRST maximum instead, which is the
 # other half of an order-dependent answer.
 mutation "S3  skills_injected takes the first tied row" \
-    file=src/main.rs \
+    file=src/cmd/internal.rs \
     expect=skills_injected_reads_the_later_registry_row_when_incarnations_tie \
     find='.max_by_key(|e| e.incarnation)' \
     replace='.rev().max_by_key(|e| e.incarnation)'
