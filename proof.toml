@@ -17,3 +17,11 @@ rev = "5449694ce202f99af438487d039e8d3ebaf15e29"
 [[sibling]]
 path = "../elm-effect-rs"
 rev = "3387c446ee5a0a2729274415272587d98d085fb8"
+
+# The last revision a FULL mutation run covered (bd-m5afp). A landing proves
+# only the specs whose target files changed since this pin; a nightly
+# `clean-proof --mutations full` covers everything, and bumping this to that
+# run's sha is what keeps a landing fast without letting proofs lapse. Unset or
+# unknown means every spec runs.
+[mutations]
+base = "d243d21948ed7d6c4b424b30455fa7dcd04c1001"

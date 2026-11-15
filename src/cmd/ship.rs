@@ -429,6 +429,65 @@ fn land_project(cfg: &Config, dir: &Path, explicit: Option<&str>) -> Result<Stri
     })
 }
 
+/// May this receipt land a bead?
+///
+/// A green proof that ran no mutation is not a proof of the behaviours the
+/// landing touches (bd-m5afp): the receipt must carry one machine-readable row
+/// per mutation that ran, every row must have produced the verdict it declared
+/// (RED for a live guard, GREEN for a guard believed dead), and every row's
+/// `<spec>#<id>` must still resolve in `scripts/mutations/<spec>` so a receipt
+/// cannot cite a mutation the tree no longer has.
+fn receipt_is_landable(root: &Path, receipt: &Path) -> Result<()> {
+    let raw = std::fs::read_to_string(receipt)
+        .map_err(|e| anyhow!("proof receipt unreadable: {}: {e}", receipt.display()))?;
+    let doc: Value = serde_json::from_str(&raw)
+        .map_err(|e| anyhow!("proof receipt is not JSON: {}: {e}", receipt.display()))?;
+    if doc.get("ok").and_then(Value::as_bool) != Some(true) {
+        bail!(
+            "proof receipt is not green: {} — fix the failing step ({}), re-prove, then land",
+            receipt.display(),
+            doc.get("failed_step")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+        );
+    }
+    let rows = match doc.get("mutations") {
+        Some(Value::Array(rows)) if !rows.is_empty() => rows,
+        _ => bail!(
+            "proof receipt carries no mutation run: {} — run `scripts/clean-proof.sh --sha <rev> \
+             --mutations changed` (or --mutations full), never a bare proof",
+            receipt.display()
+        ),
+    };
+    for row in rows {
+        if let Some(text) = row.as_str() {
+            bail!("proof receipt has a legacy mutation row ({text}); re-prove with --mutations");
+        }
+        let spec = row.get("spec").and_then(Value::as_str).unwrap_or("");
+        let id = row.get("id").and_then(Value::as_str).unwrap_or("");
+        let verdict = row.get("verdict").and_then(Value::as_str).unwrap_or("");
+        let expect_green = row
+            .get("expect_green")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let want = if expect_green { "GREEN" } else { "RED" };
+        if verdict != want {
+            bail!("proof receipt mutation {spec}#{id} proved {verdict}, expected {want}");
+        }
+        if spec == "ad-hoc" {
+            continue;
+        }
+        let path = root.join("scripts/mutations").join(spec);
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow!("proof receipt cites {spec}, which does not exist: {e}"))?;
+        let needle = format!("mutation \"{id} ");
+        if !text.contains(&needle) {
+            bail!("proof receipt cites {spec}#{id}, which the spec no longer declares");
+        }
+    }
+    Ok(())
+}
+
 fn ship_land(args: LandArgs<'_>) -> Result<()> {
     let LandArgs {
         cfg,
@@ -457,6 +516,7 @@ fn ship_land(args: LandArgs<'_>) -> Result<()> {
         Some(d) => d.to_path_buf(),
         None => std::env::current_dir().map_err(|err| anyhow!("current directory: {err}"))?,
     };
+    receipt_is_landable(&dir, receipt)?;
     git(&dir, &["rev-parse", "--git-dir"])?;
     let cited = git(&dir, &["log", "--format=%B", "-n", "1", sha])?;
     if !cited.contains(bead) {
@@ -600,7 +660,7 @@ fn ship_land(args: LandArgs<'_>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{head_has_closed_bead, head_names_bead, land_project};
+    use super::{head_has_closed_bead, head_names_bead, land_project, receipt_is_landable};
     use crate::config::Config;
     use std::process::Command;
 
@@ -656,6 +716,84 @@ mod tests {
             "some-slug",
             "a repo under the workspace root resolves to its project"
         );
+    }
+
+    /// bd-m5afp: a receipt lands a bead only when it carries a real mutation
+    /// run — every row produced its declared verdict, and every `<spec>#<id>`
+    /// still resolves. A green proof with no witnesses is not a proof.
+    #[test]
+    fn a_receipt_without_mutation_witnesses_cannot_land() {
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join("scripts/mutations")).unwrap();
+        std::fs::write(
+            repo.path().join("scripts/mutations/demo.spec.sh"),
+            "mutation \"D1  a decision\" \\\n    file=src/x.rs \\\n    expect=a_test\n",
+        )
+        .unwrap();
+        let receipt = |body: &str| {
+            let path = repo.path().join("receipt.json");
+            std::fs::write(&path, body).unwrap();
+            path
+        };
+        let row = |spec: &str, id: &str, verdict: &str, green: bool| {
+            format!(
+                r#"{{"spec":"{spec}","id":"{id}","expect_test":"a_test","expect_green":{green},"verdict":"{verdict}"}}"#
+            )
+        };
+        let doc = |ok: bool, rows: &[String]| {
+            format!(
+                r#"{{"schema":"flywheel-clean-proof.v1","ok":{ok},"failed_step":null,"mutations":[{rows}]}}"#,
+                rows = rows.join(",")
+            )
+        };
+
+        let none = receipt(&doc(true, &[]));
+        let err = format!("{:#}", receipt_is_landable(repo.path(), &none).unwrap_err());
+        assert!(
+            err.contains("no mutation run"),
+            "an empty mutation list is refused: {err}"
+        );
+
+        let legacy = receipt(r#"{"ok":true,"mutations":["src/x.rs:t:expect=RED:got=RED"]}"#);
+        let err = format!(
+            "{:#}",
+            receipt_is_landable(repo.path(), &legacy).unwrap_err()
+        );
+        assert!(err.contains("legacy mutation row"), "{err}");
+
+        let red_is_green = receipt(&doc(true, &[row("demo.spec.sh", "D1", "GREEN", false)]));
+        let err = format!(
+            "{:#}",
+            receipt_is_landable(repo.path(), &red_is_green).unwrap_err()
+        );
+        assert!(
+            err.contains("proved GREEN, expected RED"),
+            "a mutation that stayed green fails the gate: {err}"
+        );
+
+        let dangling = receipt(&doc(true, &[row("demo.spec.sh", "D9", "RED", false)]));
+        let err = format!(
+            "{:#}",
+            receipt_is_landable(repo.path(), &dangling).unwrap_err()
+        );
+        assert!(
+            err.contains("no longer declares"),
+            "a receipt cannot cite a mutation the spec dropped: {err}"
+        );
+
+        let not_green = receipt(&doc(false, &[row("demo.spec.sh", "D1", "RED", false)]));
+        let err = format!(
+            "{:#}",
+            receipt_is_landable(repo.path(), &not_green).unwrap_err()
+        );
+        assert!(err.contains("not green"), "{err}");
+
+        let good = receipt(&doc(true, &[row("demo.spec.sh", "D1", "RED", false)]));
+        receipt_is_landable(repo.path(), &good).expect("a proving receipt lands");
+
+        // A guard expected dead is the other way round and is not a failure.
+        let dead = receipt(&doc(true, &[row("demo.spec.sh", "D1", "GREEN", true)]));
+        receipt_is_landable(repo.path(), &dead).expect("a dead-guard witness lands");
     }
 
     #[test]

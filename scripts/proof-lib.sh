@@ -18,6 +18,22 @@ proof_siblings() {
   ' "$cfg"
 }
 
+# proof_mutation_base <repo-root>
+# Print the `[mutations] base` revision from proof.toml, or nothing. It is the
+# last revision a FULL mutation run covered, so a landing only re-proves the
+# specs whose target files changed since then. Unset means "no base": every
+# spec runs (the safe default, and what a fresh clone does).
+proof_mutation_base() {
+  local root="$1" cfg="$1/proof.toml"
+  [ -f "$cfg" ] || return 0
+  awk '
+    /^\[/ { in_block = ($0 ~ /^\[mutations\]/) ; next }
+    in_block && /^[[:space:]]*base[[:space:]]*=/ {
+      v=$0; sub(/^[^=]*=[[:space:]]*"/,"",v); sub(/".*/,"",v); print v; exit
+    }
+  ' "$cfg"
+}
+
 # proof_archive <source-repo> <rev> <dest-dir>
 # Extract one revision from git objects into <dest-dir> (created). Fails loud
 # if the rev is not in that repo.
@@ -91,7 +107,14 @@ mid = os.environ.get("PROOF_MUTATIONS_FILE", "")
 mutations = []
 if mid and os.path.exists(mid):
     with open(mid, encoding="utf-8") as fh:
-        mutations = [x for x in fh.read().splitlines() if x]
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                mutations.append(json.loads(line))
+            except ValueError:
+                mutations.append(line)
 receipt = {
     "schema": "flywheel-clean-proof.v1",
     "ok": os.environ["PROOF_OK"] == "0",

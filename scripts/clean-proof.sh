@@ -10,13 +10,17 @@
 # Siblings come from proof.toml (path + rev); their rev is archived from git
 # objects, never a dirty working tree. No proof.toml means a single-repo project.
 #
-# Mutations are OPT-IN: --mutate '<json>' applies {file,find,replace,filter,
-# expect=RED|GREEN} inside the export and proves the expectation. Absent, the
-# receipt says "mutations": none.
+# Mutations: `--mutations changed` (the landing default) runs every spec under
+# scripts/mutations/ whose target files changed since the `[mutations] base` pin
+# in proof.toml; `--mutations full` runs all of them. Both execute
+# scripts/verify-mutations.sh inside the export, so the receipt carries one
+# machine-readable row per mutation (spec, id, expected test, verdict).
+# `--mutate '<json>'` still applies one ad-hoc {file,find,replace,filter,expect}
+# in the export. With none of them the receipt says "mutations": none.
 #
 # Usage:
 #   scripts/clean-proof.sh [--sha <rev>] [--head] [--mutate <json>]...
-#                          [--receipt <path>] [--keep]
+#                          [--mutations changed|full] [--receipt <path>] [--keep]
 #
 #   no selector  : prove the dirty tree (temporary commit from intended paths)
 #   --head       : prove HEAD
@@ -32,6 +36,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ROOT/scripts/proof-lib.sh"
 
 KEEP=0
+MUTATIONS_MODE=""
 MODE="dirty"
 TARGET_REV=""
 RECEIPT=""
@@ -166,8 +171,77 @@ run_step build "${MBX[@]}" build --workspace --all-targets || true
 [ -n "$FAILED_STEP" ] || run_step verify-formal bash scripts/verify-formal.sh || true
 [ -n "$FAILED_STEP" ] || run_step verify-coverage bash scripts/verify-coverage.sh || true
 
-# Opt-in mutations, applied inside the export only (never the repo).
 MUTATION_RECORDS=""
+
+# Diff-scoped specs: every scripts/mutations/*.spec.sh whose target files the
+# proven revision changed since the [mutations] base pin. `full` runs them all;
+# no base (fresh clone, or a project without one) also means all, because a
+# landing that skips proofs silently is worse than a slow one.
+if [ -n "$MUTATIONS_MODE" ] && [ -z "$FAILED_STEP" ]; then
+  mut_base=""
+  [ "$MUTATIONS_MODE" = changed ] && mut_base="$(proof_mutation_base "$ROOT")"
+  mut_changed=""
+  if [ -n "$mut_base" ] && git -C "$ROOT" cat-file -e "${mut_base}^{commit}" 2>/dev/null; then
+    mut_changed="$(git -C "$ROOT" diff --name-only "$mut_base..$PROVEN_SHA" || true)"
+    echo "clean-proof: mutations since $mut_base ($(printf '%s\n' "$mut_changed" | grep -c .) path(s))"
+  elif [ "$MUTATIONS_MODE" = changed ]; then
+    echo "clean-proof: no [mutations] base in proof.toml — running every spec"
+  fi
+  wrapper="$TMP/mbx-wrapper"
+  {
+    printf '#!/usr/bin/env bash\nexec'
+    printf ' %q' "${MBX[@]}"
+    printf ' "$@"\n'
+  } >"$wrapper"
+  chmod +x "$wrapper"
+  mut_ran=0
+  mut_failed=0
+  for spec in scripts/mutations/*.spec.sh; do
+    [ -f "$spec" ] || continue
+    if [ -n "$mut_changed" ]; then
+      hit=""
+      while IFS=$'\t' read -r _id target; do
+        if printf '%s\n' "$mut_changed" | grep -qxF -- "$target"; then
+          hit=yes
+          break
+        fi
+      done < <(bash scripts/verify-mutations.sh --list "$spec")
+      [ -n "$hit" ] || continue
+    fi
+    mut_ran=$((mut_ran + 1))
+    echo "clean-proof: mutations $spec"
+    set +e
+    bash scripts/verify-mutations.sh "$spec" --cargo "$wrapper" \
+      --json-out "$TMP/mut-rows.$mut_ran.jsonl" >"$TMP/mutations-$mut_ran.log" 2>&1
+    mut_status=$?
+    set -e
+    if [ -f "$TMP/mut-rows.$mut_ran.jsonl" ]; then
+      cat "$TMP/mut-rows.$mut_ran.jsonl" >>"$TMP/mutations.txt"
+    fi
+    if [ "$mut_status" -ne 0 ]; then
+      echo "clean-proof: $spec did not prove every mutation; log $TMP/mutations-$mut_ran.log" >&2
+      tail -20 "$TMP/mutations-$mut_ran.log" >&2 || true
+      mut_failed=$((mut_failed + 1))
+    fi
+  done
+  if [ "$mut_ran" -eq 0 ]; then
+    echo "clean-proof: mutations no changed spec (nothing to re-prove)"
+  else
+    echo "clean-proof: mutations $mut_ran spec(s), $mut_failed failing"
+  fi
+  STEP_NAMES="$STEP_NAMES"mutations"
+"
+  if [ "$mut_failed" -ne 0 ]; then
+    STEP_STATUSES="$STEP_STATUSES"1"
+"
+    FAILED_STEP="mutations"
+  else
+    STEP_STATUSES="$STEP_STATUSES"0"
+"
+  fi
+fi
+
+# Opt-in ad-hoc mutations, applied inside the export only (never the repo).
 printf '%s' "$MUT_SPECS" >"$TMP/mutations.in"
 while IFS= read -r spec; do
   [ -n "$spec" ] || continue
@@ -204,6 +278,9 @@ PY
   [ "$mut_status" -ne 0 ] && mut_actual="RED"
   MUTATION_RECORDS="$MUTATION_RECORDS$mut_file:$mut_filter:expect=$mut_expect:got=$mut_actual
 "
+  printf '{"spec":"ad-hoc","id":"%s","expect_test":"%s","expect_green":%s,"verdict":"%s"}\n' \
+    "$mut_file" "$mut_filter" "$([ "$mut_expect" = GREEN ] && echo true || echo false)" \
+    "$mut_actual" >>"$TMP/mutations.txt"
   if ! proof_mutation_verdict "$mut_actual" "$mut_expect"; then
     echo "clean-proof: mutation expectation failed ($mut_actual != $mut_expect); log $TMP/mutation.log" >&2
     FAILED_STEP="mutation:$mut_file"
@@ -211,7 +288,7 @@ PY
   fi
 done <"$TMP/mutations.in"
 MUTATION_RECORDS_FILE="$TMP/mutations.txt"
-printf '%s' "$MUTATION_RECORDS" >"$MUTATION_RECORDS_FILE"
+touch "$MUTATION_RECORDS_FILE"
 
 OK=0
 [ -n "$FAILED_STEP" ] && OK=1

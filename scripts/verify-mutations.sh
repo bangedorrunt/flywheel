@@ -77,6 +77,32 @@ M_GREEN=()
 # an empty array as unbound, so an empty initialiser turns a legality check into
 # a crash. `${name+set}` on the name itself is the portable test.
 
+# --- machine-readable identity -------------------------------------------
+
+JSON_OUT=""
+LIST_ONLY=0
+
+# A mutation's stable id is the first token of its label ("C3  a queued …" ->
+# "C3"). Ledger receipts reference `<spec>#<id>`, so the id may not drift with
+# the prose after it.
+mutation_id() {
+    printf '%s\n' "${1%%  *}"
+}
+
+# One JSONL row per mutation for the clean-proof receipt. `expect` is the test
+# that had to go red; `verdict` is what the run actually proved.
+json_row() {
+    local i="$1" verdict="$2"
+    [ -n "$JSON_OUT" ] || return 0
+    local spec_name id green
+    spec_name="$(basename "${SPEC_PATH:-$SPEC_FILE}")"
+    id="$(mutation_id "${M_LABEL[$i]}")"
+    green="false"
+    [ "${M_GREEN[$i]}" = 1 ] && green="true"
+    printf '{"spec":"%s","id":"%s","expect_test":"%s","expect_green":%s,"verdict":"%s"}\n' \
+        "$spec_name" "$id" "${M_EXPECT[$i]}" "$green" "$verdict" >>"$JSON_OUT"
+}
+
 # --- the harness proper ---------------------------------------------------
 
 # Name what one mutation's test run proved.
@@ -143,6 +169,7 @@ mutation() {
 
 load_spec() {
     local spec="$1"
+    SPEC_PATH="$spec"
     [ -f "$spec" ] || { echo "no such spec: $spec" >&2; exit 2; }
     # shellcheck disable=SC1090
     . "$spec"
@@ -423,6 +450,8 @@ main() {
             --self-test) self_test; exit $? ;;
             --cargo) CARGO_BIN="$2"; shift ;;
             --repo) REPO="$2"; shift ;;
+            --json-out) JSON_OUT="$2"; shift ;;
+            --list) LIST_ONLY=1 ;;
             -h | --help) usage; exit 0 ;;
             -*) echo "unknown flag: $1" >&2; usage >&2; exit 2 ;;
             *) spec="$1" ;;
@@ -436,6 +465,16 @@ main() {
     fi
 
     load_spec "$spec"
+
+    # --list: what this spec targets, so a caller can scope the run by diff
+    # without executing anything. One `ID<TAB>file` row per mutation.
+    if [ "${LIST_ONLY:-0}" = 1 ]; then
+        local i
+        for i in "${!M_FILE[@]}"; do
+            printf '%s\t%s\n' "$(mutation_id "${M_LABEL[$i]}")" "${M_FILE[$i]}"
+        done
+        exit 0
+    fi
 
     # HUP too: `nohup verify-mutations.sh ... &` from a shell that then exits
     # delivers SIGHUP, and nohup has already set it to SIG_IGN — so the INT/TERM
@@ -462,6 +501,7 @@ main() {
     for i in $(seq 0 $((total - 1))); do
         snapshot_restore
         if ! grep -qF -- "${M_FIND[$i]}" "$REPO/${M_FILE[$i]}"; then
+            json_row "$i" "$VERDICT_MISS"
             printf '%-52s %s\n' "${M_LABEL[$i]}" "$VERDICT_MISS"
             continue
         fi
@@ -501,9 +541,11 @@ main() {
                 "$VERDICT_VACUOUS") verdict="$VERDICT_DEAD"; dead=$((dead + 1)) ;;
                 "$VERDICT_RED") verdict="$VERDICT_ALIVE" ;;
             esac
+            json_row "$i" "$verdict"
             printf '%-52s %-13s (guard is dead)\n' "${M_LABEL[$i]}" "$verdict"
             continue
         fi
+        json_row "$i" "$verdict"
         printf '%-52s %-13s (%s)\n' "${M_LABEL[$i]}" "$verdict" "${M_EXPECT[$i]}"
         case "$verdict" in
             "$VERDICT_RED") proven=$((proven + 1)) ;;

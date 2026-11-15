@@ -585,6 +585,28 @@ steps:
 "#,
     ),
     (
+        "mutation-full",
+        r#"
+name: mutation-full
+description: "Nightly full mutation proof (bd-m5afp): a clean export of HEAD runs every spec under scripts/mutations/, so no witness is ever only as fresh as the last landing that touched its file. A red spec files a bead."
+trigger:
+  type: schedule
+  cron: "30 3 * * *"
+  owner: housekeeper
+  scope: host
+policy:
+  on_failure: bead
+  on_success: log
+  max_retries: 0
+  no_claim_timeout: 600
+steps:
+  - name: full-mutations
+    action: verify
+    command: 'bash scripts/clean-proof.sh --head --mutations full --receipt /tmp/clean-proof-mutation-full.json'
+    on_error: fail_run
+"#,
+    ),
+    (
         "weekly-review",
         r#"
 name: weekly-review
@@ -2702,6 +2724,38 @@ mod tests {
             "oracle consumes scout findings"
         );
         assert!(task.contains("idea"), "oracle outputs the idea contract");
+    }
+
+    /// bd-m5afp: the full mutation proof runs nightly through flywheel cron, so
+    /// a witness is never only as fresh as the last landing that touched its
+    /// file. Host scope: one run proves the repo, not one project's copy.
+    #[test]
+    fn mutation_full_is_a_nightly_host_cron() {
+        use toron_workflow::schema::{Action, CronScope, Trigger};
+        let wfs = builtin_workflows();
+        let mf = &wfs["mutation-full"];
+        match &mf.trigger {
+            Some(Trigger::Schedule { cron, owner, scope }) => {
+                assert_eq!(cron, "30 3 * * *", "nightly");
+                assert_eq!(owner.as_deref(), Some("housekeeper"));
+                assert_eq!(*scope, CronScope::Host);
+            }
+            other => panic!("mutation-full must be schedule-triggered: {other:?}"),
+        }
+        let [step] = mf.steps.as_slice() else {
+            panic!("one step: the proof is one command, not a pipeline");
+        };
+        let Action::Verify { command } = &step.action else {
+            panic!("the proof is a verify step");
+        };
+        assert!(
+            command.contains("clean-proof.sh") && command.contains("--mutations full"),
+            "the nightly job runs the FULL mutation set: {command}"
+        );
+        assert!(
+            crate::cron::builtin_crons().contains_key("mutation-full"),
+            "cron list shows it"
+        );
     }
 
     /// bd-oj9o #2: the cold-start + deep-triage workflows exist, and the
