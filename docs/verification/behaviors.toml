@@ -219,3 +219,13 @@ tests = [
   "src/authority.rs::a_crew_pin_may_not_install_or_bounce_the_fleet",
 ]
 mutations = ["scripts/mutations/stack-guard.spec.sh#G1"]
+
+[[behavior]]
+id = "doorbell.mail-push-rings-idle"
+owner = "crates/doorbell-core/src/lib.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "crates/doorbell-core/src/lib.rs::mail_delivered_watch_rings_once_then_poll_dedups",
+]
+mutations = ["scripts/mutations/doorbell-mail-push.spec.sh#M1"]
