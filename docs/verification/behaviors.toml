@@ -224,7 +224,8 @@ mutations = ["scripts/mutations/stack-guard.spec.sh#G1"]
 id = "doorbell.mail-push-rings-idle"
 owner = "crates/doorbell-core/src/lib.rs"
 status = "proven"
-concurrent = false
+concurrent = true
+formal = ".agents/skills/verify-protocol-tla/models/DoorbellMailPush.tla::.agents/skills/verify-protocol-tla/models/DoorbellMailPush.cfg"
 tests = [
   "crates/doorbell-core/src/lib.rs::mail_delivered_watch_rings_once_then_poll_dedups",
   "crates/doorbell-core/src/lib.rs::two_mails_on_one_thread_to_idle_pin_give_two_rings",

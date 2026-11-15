@@ -130,6 +130,7 @@ expect_pass Respawn Respawn
 expect_pass DeferredHandoff DeferredHandoff
 expect_pass P2pDelivery P2pDelivery
 expect_pass DeferredQueue DeferredQueue
+expect_pass DoorbellMailPush DoorbellMailPush
 expect_pass DispatcherReap DispatcherReap
 expect_pass JournalAppend JournalAppend
 expect_pass SupervisorRetire SupervisorRetire
@@ -147,6 +148,7 @@ expect_violation DeferredQueue DeferredQueue.broken-ring-twice AtMostOnceRung
 expect_violation DeferredQueue DeferredQueue.broken-strand EveryWakeAccounted
 expect_violation DeferredQueue DeferredQueue.broken-preempt-any OnlyActNowPreempts
 expect_violation DeferredQueue DeferredQueue.broken-preempt-unrecorded AtMostOnceRung
+expect_violation DoorbellMailPush DoorbellMailPush.broken-thread-rung EveryWakeAccounted
 expect_violation DispatcherReap DispatcherReap.broken-fallback-reap NeverReapOnFallback
 expect_violation DispatcherReap DispatcherReap.broken-reap-live-session NeverReapLiveSession
 expect_violation DispatcherReap DispatcherReap.broken-label-dropped LabelOnlyDoorKept
