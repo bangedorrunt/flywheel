@@ -31,20 +31,12 @@
 # Exit: 0 proof passed, 1 proof failed, 2 usage / environment error.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# shellcheck source=proof-lib.sh
-. "$ROOT/scripts/proof-lib.sh"
+SELF_PATH="${BASH_SOURCE[0]}"
+SELF_DIR="$(cd "$(dirname "$SELF_PATH")" && pwd)"
+SELF_REPO_ROOT="$(cd "$SELF_DIR/.." && pwd)"
+ROOT="${CLEAN_PROOF_REPO_ROOT:-$SELF_REPO_ROOT}"
 
-KEEP=0
-MUTATIONS_MODE=""
-RECEIPT_MUTATIONS_BASE=""
-RECEIPT_CHANGED_PATHS=""
-MODE="dirty"
-TARGET_REV=""
-RECEIPT=""
-MUT_SPECS=""
-
-usage() { sed -n '2,29p' "$0"; exit "${1:-0}"; }
+usage() { sed -n '2,29p' "$SELF_PATH"; exit "${1:-0}"; }
 die() { echo "clean-proof: $*" >&2; exit 2; }
 
 # bd-jp9z1.1: one machine-wide slot for the whole run, released on every exit
@@ -52,6 +44,8 @@ die() { echo "clean-proof: $*" >&2; exit 2; }
 # lock fd survives exec into this script.
 if [ "${CLEAN_PROOF_SLOTTED:-}" != 1 ]; then
   export CLEAN_PROOF_SLOTTED=1
+  export CLEAN_PROOF_ORIG_SCRIPT="${CLEAN_PROOF_ORIG_SCRIPT:-$SELF_PATH}"
+  export CLEAN_PROOF_REPO_ROOT="${CLEAN_PROOF_REPO_ROOT:-$SELF_REPO_ROOT}"
   exec python3 - "$0" "$@" <<'PY'
 import fcntl, json, os, sys, time
 script, args = sys.argv[1], sys.argv[2:]
@@ -81,11 +75,38 @@ try:
         os.fsync(f.fileno())
 except Exception:
     pass
-# Keep fd open across exec so the flock is held by the proof run.
-os.set_inheritable(fd.fileno(), True)
+os.dup2(fd.fileno(), 9)
+os.close(fd.fileno())
+os.set_inheritable(9, True)
 os.execv("/bin/bash", ["bash", script] + args)
 PY
 fi
+
+# Snapshot driver + sourced helpers into scratch and re-exec so edits to the
+# repo tree cannot break a running proof (bash reads scripts incrementally).
+if [ "${CLEAN_PROOF_SNAPSHOTTED:-}" != 1 ]; then
+  SNAP_BASE="${CLEAN_PROOF_SNAPSHOT_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/clean-proof-driver.XXXXXX")}"
+  mkdir -p "$SNAP_BASE/scripts"
+  cp "$SELF_PATH" "$SNAP_BASE/scripts/clean-proof.sh"
+  cp "$SELF_DIR/proof-lib.sh" "$SNAP_BASE/scripts/proof-lib.sh"
+  chmod +x "$SNAP_BASE/scripts/clean-proof.sh"
+  export CLEAN_PROOF_SNAPSHOTTED=1
+  export CLEAN_PROOF_REPO_ROOT="$ROOT"
+  export CLEAN_PROOF_SNAPSHOT_DIR="$SNAP_BASE"
+  exec /bin/bash "$SNAP_BASE/scripts/clean-proof.sh" "$@"
+fi
+
+# shellcheck source=proof-lib.sh
+. "$SELF_DIR/proof-lib.sh"
+
+KEEP=0
+MUTATIONS_MODE=""
+RECEIPT_MUTATIONS_BASE=""
+RECEIPT_CHANGED_PATHS=""
+MODE="dirty"
+TARGET_REV=""
+RECEIPT=""
+MUT_SPECS=""
 
 LOCK_HOLD_TEST=""
 
@@ -116,10 +137,13 @@ if [ -n "$LOCK_HOLD_TEST" ]; then
   marker="${CLEAN_PROOF_LOCK_TEST_MARKER:-}"
   if [ -n "$marker" ]; then
     printf 'start %s %s\n' "$$" "$(python3 -c 'import time; print(time.time_ns())')" >>"$marker"
-    sleep "$LOCK_HOLD_TEST"
+    # Sleep in subprocess with lock fd closed so a killed holder releases flock.
+    ( exec 9>&-; sleep "$LOCK_HOLD_TEST" ) &
+    wait $! || true
     printf 'end %s %s\n' "$$" "$(python3 -c 'import time; print(time.time_ns())')" >>"$marker"
   else
-    sleep "$LOCK_HOLD_TEST"
+    ( exec 9>&-; sleep "$LOCK_HOLD_TEST" ) &
+    wait $! || true
   fi
   exit 0
 fi

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sandbox test for clean-proof slot serialization (bd-jp9z1.1).
+# Sandbox test for clean-proof slot serialization + snapshotting (bd-jp9z1.1).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -49,8 +49,8 @@ PY
 pass "concurrent invocations do not overlap"
 
 # --- Case 2: killed holder frees the slot ---
-HOLDER_LOG="$TMP/holder.log"
-bash "$ROOT/scripts/clean-proof.sh" --lock-hold-test 30 >"$HOLDER_LOG" 2>&1 &
+: >"$MARKER"
+bash "$ROOT/scripts/clean-proof.sh" --lock-hold-test 30 >/dev/null 2>&1 &
 holder=$!
 for _ in $(seq 1 50); do
   grep -q '^start' "$MARKER" 2>/dev/null && break
@@ -72,5 +72,34 @@ if end - start > 5:
 print("prompt")
 PY
 pass "killed holder frees slot promptly"
+
+# --- Case 3: edit source script mid-run; run completes on snapshot copy ---
+FAKE="$TMP/fakerepo"
+mkdir -p "$FAKE/scripts"
+cp "$ROOT/scripts/clean-proof.sh" "$FAKE/scripts/clean-proof.sh"
+cp "$ROOT/scripts/proof-lib.sh" "$FAKE/scripts/proof-lib.sh"
+chmod +x "$FAKE/scripts/clean-proof.sh"
+
+git -C "$FAKE" init -q
+git -C "$FAKE" config user.email test@test
+git -C "$FAKE" config user.name test
+git -C "$FAKE" add scripts/clean-proof.sh scripts/proof-lib.sh
+git -C "$FAKE" commit -qm init
+
+: >"$TMP/marker3.txt"
+CLEAN_PROOF_LOCK_FILE="$TMP/clean-proof3.lock" \
+CLEAN_PROOF_LOCK_TEST_MARKER="$TMP/marker3.txt" \
+bash "$FAKE/scripts/clean-proof.sh" --lock-hold-test 2 >"$TMP/edit.log" 2>&1 &
+ep=$!
+for _ in $(seq 1 50); do
+  grep -q '^start' "$TMP/marker3.txt" 2>/dev/null && break
+  sleep 0.1
+done
+grep -q '^start' "$TMP/marker3.txt" || fail "mid-run edit holder did not start"
+printf '\nthis_should_break_if_read_from_tree () { :; }\nSYNTAX_BOMB(((\n' >>"$FAKE/scripts/clean-proof.sh"
+wait "$ep"
+rc=$?
+[ "$rc" -eq 0 ] || fail "mid-run edit case: expected exit 0, got $rc (log: $(cat "$TMP/edit.log"))"
+pass "mid-run source edit does not break running proof (snapshot copy)"
 
 echo "ok"
