@@ -253,3 +253,14 @@ tests = [
   "tests/clean_proof_slot.rs::clean_proof_slot_serializes_and_recovers",
 ]
 mutations = ["scripts/mutations/clean-proof-slot.spec.sh#S1", "scripts/mutations/clean-proof-slot.spec.sh#S2"]
+
+
+[[behavior]]
+id = "inbox-ports.arrive-pane"
+owner = "src/inbox_ports.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/inbox_ports.rs::arrive_pane_prefers_rex_block_and_falls_back_when_it_is_empty",
+]
+mutations = ["scripts/mutations/inbox-ports-arrive-pane.spec.sh#A1"]
