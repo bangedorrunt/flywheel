@@ -42,6 +42,10 @@ pub struct RtHost {
     generation: Option<doorbell::WatcherGen>,
     exe_path: PathBuf,
     brain_tx: mpsc::Sender<BrainMsg>,
+    /// bd-0uzrq.17: the status-only lane. When set, the plane poll sends
+    /// PlaneStatus here instead of the mail lane, so a status cannot queue
+    /// behind a mail-bound dispatch (live: 76-155s).
+    status_tx: Option<mpsc::Sender<BrainMsg>>,
     /// Panes with an active multiplexed events.subscribe forwarder.
     /// Shared with the reader thread so stream death can clear coverage and
     /// the next sweep re-arms (hc/tuios: stream death must not leave a
@@ -246,6 +250,7 @@ impl RtHost {
             generation: None,
             exe_path,
             brain_tx,
+            status_tx: None,
             covered_panes: Arc::new(Mutex::new(HashSet::new())),
             presence_armed: false,
             conflict_seen: std::collections::BTreeSet::new(),
@@ -334,6 +339,20 @@ impl RtHost {
     /// the covered panes and folds every status change into a PlaneStatus.
     /// Pane ids the registry cannot map to a pin are audited loudly once —
     /// a covered pane is never silently skipped.
+    /// bd-0uzrq.17: point the plane poll at the status lane.
+    pub(crate) fn set_status_tx(&mut self, tx: mpsc::Sender<BrainMsg>) {
+        self.status_tx = Some(tx);
+    }
+
+    /// The lane a plane status belongs on: its own when the entry point
+    /// provided one, else the mail lane (tests and hosts without a runner).
+    fn status_lane(&self) -> mpsc::Sender<BrainMsg> {
+        match &self.status_tx {
+            Some(tx) => tx.clone(),
+            None => self.brain_tx.clone(),
+        }
+    }
+
     fn cover_rex_panes(&mut self) {
         let registry = state::load_spawn_registry(&self.project);
         let covered = self.covered_panes.lock().unwrap_or_else(|e| e.into_inner());
@@ -410,7 +429,9 @@ impl RtHost {
         // the brain; a 3s agent_list poll is bounded, cheap, and reconnects
         // by construction.
         self.presence_armed = true;
-        let tx = self.brain_tx.clone();
+        // bd-0uzrq.17: statuses get their own lane when the entry point
+        // provided one; the mail lane stays for everything else.
+        let tx = self.status_lane();
         let cfg = self.cfg.clone();
         let project = self.project.clone();
         std::thread::spawn(move || {
@@ -1353,6 +1374,9 @@ async fn run_embedded_async(
     let died_bell = runner.died_bell();
     let mut host = RtHost::new(cfg.clone(), project, workspace, tx.clone())?;
     host.set_died_bell(std::sync::Arc::clone(&died_bell));
+    // bd-0uzrq.17: plane statuses ride their own lane, polled by the brain
+    // before mail, so a status cannot queue behind a mail-bound dispatch.
+    host.set_status_tx(runner.status_sender());
     host.set_generation(generation.clone());
     let mut sinks = SinkManager::new(tx.clone());
     let mut _inbox_guard: Option<crate::inbox_host::InboxHost> = None;
@@ -2096,6 +2120,37 @@ mod presence_producer_tests {
             }
             other => panic!("expected PlaneStatus, got {other:?}"),
         }
+    }
+
+    /// bd-0uzrq.17: statuses ride their own lane when the entry point
+    /// provides one. The poll must not put them on the mail lane, or a
+    /// mail-bound dispatch ahead of them delays every idle edge — live
+    /// 16:16-16:19Z that was 76-155s between a rex record change and the
+    /// journaled PlaneStatus, and the deferred wake waited with it.
+    #[test]
+    fn a_plane_status_rides_the_status_lane_when_one_is_set() {
+        let (mail_tx, mut mail_rx) = mpsc::channel(8);
+        let (status_tx, mut status_rx) = mpsc::channel(8);
+        let mut host =
+            RtHost::new(Config::default(), "lane-routing", "lane-routing", mail_tx).expect("host");
+        host.set_status_tx(status_tx);
+
+        let updates =
+            RtHost::presence_updates_for(&[row("pane-idle", AgentStatus::Idle)], &pin_map()).0;
+        assert_eq!(updates.len(), 1, "one mapped pin: {updates:?}");
+        // The same send the poll thread performs, through the same choice.
+        let tx = host.status_lane();
+        for msg in updates {
+            tx.try_send(msg).expect("status lane accepts");
+        }
+        assert!(
+            status_rx.try_recv().is_ok(),
+            "the status landed on its own lane"
+        );
+        assert!(
+            mail_rx.try_recv().is_err(),
+            "and NOT on the mail lane, where it would queue behind mail"
+        );
     }
 
     #[test]

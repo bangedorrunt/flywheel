@@ -54,6 +54,11 @@ impl RunnerConfig {
     }
 }
 
+/// Capacity of the status lane (bd-0uzrq.17). A status is edge-triggered, so
+/// eight is already generous: if the brain is eight statuses behind, the poll
+/// producer should park rather than pile up stale values.
+pub const STATUS_LANE_CAP: usize = 8;
+
 /// Phase 1 of the hosted loop: the bounded channel ([`crate::BRAIN_CAP`],
 /// slow producers park — backpressure is the queue, never a drop), the
 /// [`DiedBell`], and the two canonical Msg-producer tickers.
@@ -67,6 +72,11 @@ pub struct HostRunner {
     config: RunnerConfig,
     tx: mpsc::Sender<BrainMsg>,
     rx: Option<mpsc::Receiver<BrainMsg>>,
+    /// bd-0uzrq.17: the status-only lane, polled before mail. Small on
+    /// purpose — a status is edge-triggered, so a backlog means the brain is
+    /// behind, and parking the producer is the honest signal.
+    status_tx: mpsc::Sender<BrainMsg>,
+    status_rx: Option<mpsc::Receiver<BrainMsg>>,
     died_bell: Arc<DiedBell>,
     _sweep: SensorHandle,
     _sla: SensorHandle,
@@ -103,10 +113,13 @@ impl HostRunner {
                 now: crate::lease::unix_now(),
             },
         );
+        let (status_tx, status_rx) = mpsc::channel(STATUS_LANE_CAP);
         Self {
             config,
             tx,
             rx: Some(rx),
+            status_tx,
+            status_rx: Some(status_rx),
             died_bell: DiedBell::new(),
             _sweep: sweep,
             _sla: sla,
@@ -115,6 +128,13 @@ impl HostRunner {
     }
 
     /// Sender the entry point's host, sinks, and extra producers share.
+    /// bd-0uzrq.17: the STATUS lane's sender. Status producers hand this to
+    /// whoever owns the plane poll; the brain polls it before mail so a
+    /// status cannot queue behind a mail-bound dispatch.
+    pub fn status_sender(&self) -> mpsc::Sender<BrainMsg> {
+        self.status_tx.clone()
+    }
+
     pub fn sender(&self) -> mpsc::Sender<BrainMsg> {
         self.tx.clone()
     }
@@ -158,7 +178,8 @@ impl HostRunner {
             brain = brain.with_liveness(liveness);
         }
         let rx = self.rx.take().expect("HostRunner::drive runs once");
-        let run = brain.run(rx);
+        let status_rx = self.status_rx.take();
+        let run = brain.run_with_status(rx, status_rx);
         tokio::pin!(run);
         tokio::select! {
             report = &mut run => report,

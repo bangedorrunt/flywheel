@@ -363,7 +363,22 @@ impl<H: Host> Brain<H> {
         self.liveness.clone()
     }
 
-    pub async fn run(mut self, mut rx: tokio::sync::mpsc::Receiver<BrainMsg>) -> RunReport {
+    pub async fn run(self, rx: tokio::sync::mpsc::Receiver<BrainMsg>) -> RunReport {
+        self.run_with_status(rx, None).await
+    }
+
+    /// bd-0uzrq.17: the same loop with a SECOND, status-only lane polled
+    /// `biased` first. Live 16:16-16:19Z a PlaneStatus took 76-155s to reach
+    /// the journal because it queued behind mail-bound dispatches on the one
+    /// channel; the wake it should have drained waited with it. Statuses are
+    /// small, idempotent and edge-triggered, so letting them overtake mail is
+    /// safe in the direction that matters — a drain never clears mail the fold
+    /// has not seen (DeferredQueueLanes.tla's `drain-unreceived` fixture).
+    pub async fn run_with_status(
+        mut self,
+        mut rx: tokio::sync::mpsc::Receiver<BrainMsg>,
+        mut status_rx: Option<tokio::sync::mpsc::Receiver<BrainMsg>>,
+    ) -> RunReport {
         let mut digest_tick = tokio::time::interval(std::time::Duration::from_secs(
             self.cfg.digest_interval_secs.max(1),
         ));
@@ -390,6 +405,29 @@ impl<H: Host> Brain<H> {
                     run_dispatch_with_slow_warn(label, self.dispatch(BrainMsg::Died), move |label| {
                         eprintln!(
                             "doorbell serve: brain {ws_d} dispatch {label} still running after {}s",
+                            SLOW_DISPATCH_WARN.as_secs()
+                        );
+                    })
+                    .await;
+                }
+                msg = async {
+                    match status_rx.as_mut() {
+                        Some(r) => r.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // A closed status lane is not the end of the brain: the
+                    // poll thread can be restarted without losing mail.
+                    let Some(msg) = msg else {
+                        status_rx = None;
+                        continue;
+                    };
+                    let label = brain_msg_label(&msg);
+                    dispatched += 1;
+                    let ws_s = ws.clone();
+                    run_dispatch_with_slow_warn(label, self.dispatch(msg), move |label| {
+                        eprintln!(
+                            "doorbell serve: brain {ws_s} dispatch {label} still running after {}s",
                             SLOW_DISPATCH_WARN.as_secs()
                         );
                     })
@@ -605,8 +643,7 @@ impl<H: Host> Brain<H> {
         let injects = self.gated(raw.clone(), now);
         let (class, targets) = self.host.doorbell_index().map_or((None, 0), |idx| {
             (
-                doorbell_core::parse_watch_ndjson(&line, idx)
-                    .map(|(c, _)| format!("{c:?}")),
+                doorbell_core::parse_watch_ndjson(&line, idx).map(|(c, _)| format!("{c:?}")),
                 doorbell_core::watch_targets(&line, idx).len(),
             )
         });
@@ -1645,6 +1682,32 @@ mod tests {
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .filter_map(|v| v["msg"]["rt_kind"].as_str().map(str::to_string))
             .collect()
+    }
+
+    /// bd-0uzrq.17: the status lane is polled BEFORE mail. With one channel a
+    /// status queued behind a backlog of mail-bound dispatches reached the fold
+    /// 76-155s late (live 16:16-16:19Z) and the idle edge it carried drained
+    /// nothing. A `Shutdown` already queued on the mail lane is the sharpest
+    /// form of that backlog: FIFO would end the loop before the status is ever
+    /// seen, and the biased lane must journal the status instead.
+    #[tokio::test]
+    async fn a_status_lane_overtakes_mail_already_queued() {
+        let (brain, rx, tx) = test_brain("lane-order", vec![]);
+        let (status_tx, status_rx) = tokio::sync::mpsc::channel(4);
+        tx.send(BrainMsg::Shutdown).await.expect("mail lane");
+        status_tx
+            .send(BrainMsg::PlaneStatus {
+                pin: "PinA".into(),
+                status: "idle".into(),
+            })
+            .await
+            .expect("status lane");
+        brain.run_with_status(rx, Some(status_rx)).await;
+        let kinds = journal_kinds("lane-order");
+        assert!(
+            kinds.iter().any(|k| k == "PlaneStatus"),
+            "the status overtook the queued shutdown: {kinds:?}"
+        );
     }
 
     /// A ring loaded from disk has no pending entry, so only the pin→npub
