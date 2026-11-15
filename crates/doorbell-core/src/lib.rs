@@ -641,6 +641,14 @@ pub fn wake_kind_of_line(line: &str) -> WakeKind {
 /// not. Keying on the line is what makes one directive one ring (bd-x3pqw).
 /// When the envelope carries a message id to both producers (bd-0uzrq.1), that
 /// id becomes the key and this fn goes away.
+/// The thread a row belongs to, when it names one.
+fn row_thread(row: &serde_json::Value) -> Option<String> {
+    row.get("thread_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+}
+
 fn row_key(row: &serde_json::Value, _line: &str) -> String {
     row.get("id")
         .and_then(serde_json::Value::as_str)
@@ -747,6 +755,13 @@ pub struct QueuedWake {
     /// review).
     #[serde(default)]
     pub core: String,
+    /// The message's thread, when the row carries one. A newer message of the
+    /// same thread SUPERSEDES an older queued one (bd-0uzrq.1) — a correction
+    /// replaces what it corrects instead of ringing beside it. `None` today:
+    /// toron's projection leaves `thread_id` null, so this path is live code
+    /// with no live traffic yet.
+    #[serde(default)]
+    pub thread: Option<String>,
     pub line: String,
     pub count: u32,
 }
@@ -754,12 +769,23 @@ pub struct QueuedWake {
 impl QueuedWake {
     #[must_use]
     pub fn new(kind: WakeKind, key: impl Into<String>, line: impl Into<String>) -> Self {
+        Self::with_thread(kind, key, None, line)
+    }
+
+    #[must_use]
+    pub fn with_thread(
+        kind: WakeKind,
+        key: impl Into<String>,
+        thread: Option<String>,
+        line: impl Into<String>,
+    ) -> Self {
         let line = line.into();
         let core = wake_key(&line);
         Self {
             kind,
             key: key.into(),
             core,
+            thread,
             line,
             count: 1,
         }
@@ -776,6 +802,10 @@ pub enum Queued {
     /// The SAME message arrived again (a second producer): nothing rises, and
     /// the newest text wins. One directive must ring once, never twice.
     Duplicate,
+    /// A NEWER message of a thread already queued: it replaces that entry
+    /// (bd-0uzrq.1). A correction rings instead of ringing beside the brief it
+    /// corrects.
+    Superseded,
 }
 
 /// The identity of a ring line when no message id is available: the line with
@@ -795,7 +825,12 @@ pub fn wake_key(line: &str) -> String {
 
 /// Fold one line into the queue: same class merges (newest line wins, count
 /// bumps), a new class appends. Returns true when it merged.
-pub fn queue_line(queue: &mut Vec<QueuedWake>, key: String, line: String) -> Queued {
+pub fn queue_line(
+    queue: &mut Vec<QueuedWake>,
+    key: String,
+    thread: Option<String>,
+    line: String,
+) -> Queued {
     let kind = wake_kind_of_line(&line);
     let core = wake_key(&line);
     let duplicate = queue.iter().position(|w| {
@@ -817,6 +852,20 @@ pub fn queue_line(queue: &mut Vec<QueuedWake>, key: String, line: String) -> Que
         }
         return Queued::Duplicate;
     }
+    // A newer message of an already-queued thread supersedes it: the queue
+    // keeps ONE wake per thread, carrying the newest text.
+    if let Some(thread) = thread.as_deref().filter(|t| !t.is_empty())
+        && let Some(at) = queue
+            .iter()
+            .position(|w| w.thread.as_deref() == Some(thread))
+    {
+        let w = &mut queue[at];
+        w.kind = kind;
+        w.line = line;
+        w.key = key;
+        w.core = core;
+        return Queued::Superseded;
+    }
     match queue.iter_mut().find(|w| w.kind == kind) {
         Some(w) => {
             w.line = line;
@@ -824,7 +873,7 @@ pub fn queue_line(queue: &mut Vec<QueuedWake>, key: String, line: String) -> Que
             Queued::Merged
         }
         None => {
-            queue.push(QueuedWake::new(kind, key, line));
+            queue.push(QueuedWake::with_thread(kind, key, thread, line));
             Queued::Fresh
         }
     }
@@ -1070,7 +1119,14 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
             // merge, a redelivery of one dedups.
             let key = event_id;
             for pin in watch_targets(line, &next.index) {
-                route_or_queue(&mut next, &mut actions, &pin, key.clone(), line_out.clone());
+                route_or_queue(
+                    &mut next,
+                    &mut actions,
+                    &pin,
+                    key.clone(),
+                    None,
+                    line_out.clone(),
+                );
             }
         }
         DoorbellMsg::InboxItems { raw, pin } => {
@@ -1088,7 +1144,8 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 };
                 let line_out = doorbell_line(class, &hint);
                 let key = row_key(item, &line_out);
-                route_or_queue(&mut next, &mut actions, pin, key, line_out);
+                let thread = row_thread(item);
+                route_or_queue(&mut next, &mut actions, pin, key, thread, line_out);
             }
         }
         DoorbellMsg::InboxRows { rows, pin } => {
@@ -1098,7 +1155,8 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 };
                 let line_out = doorbell_line(class, &hint);
                 let key = row_key(item, &line_out);
-                route_or_queue(&mut next, &mut actions, pin, key, line_out);
+                let thread = row_thread(item);
+                route_or_queue(&mut next, &mut actions, pin, key, thread, line_out);
             }
         }
         DoorbellMsg::PlaneStatus { pin, status } => {
@@ -1152,12 +1210,13 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
         DoorbellMsg::PromptRefused { pin, line } => {
             next.statuses.insert(pin.clone(), "working".into());
             let queue = next.queues.entry(pin.clone()).or_default();
-            let fold = queue_line(queue, String::new(), line.clone());
+            let fold = queue_line(queue, String::new(), None, line.clone());
             actions.push(DoorbellAction::Audit {
                 kind: match fold {
                     Queued::Fresh => "deferred",
                     Queued::Merged => "merged",
                     Queued::Duplicate => "dedup",
+                    Queued::Superseded => "superseded",
                 }
                 .into(),
                 pin: pin.clone(),
@@ -1188,6 +1247,7 @@ fn route_or_queue(
     actions: &mut Vec<DoorbellAction>,
     pin: &str,
     key: String,
+    thread: Option<String>,
     line: String,
 ) {
     let status = next
@@ -1248,12 +1308,13 @@ fn route_or_queue(
         // second producer is a DEDUP (one ring); a different message of a
         // class MERGES visibly. Silently coalescing is how a captain brief
         // vanished behind a peer wake.
-        let fold = queue_line(queue, key, line.clone());
+        let fold = queue_line(queue, key, thread, line.clone());
         actions.push(DoorbellAction::Audit {
             kind: match fold {
                 Queued::Fresh => "queued",
                 Queued::Merged => "merged",
                 Queued::Duplicate => "dedup",
+                Queued::Superseded => "superseded",
             }
             .into(),
             pin: pin.to_string(),
@@ -1734,6 +1795,71 @@ mod tests {
         assert_eq!(rings, 1, "ONE ring, not two: {drained:?}");
     }
 
+    /// bd-0uzrq.1: a NEWER message of a queued thread replaces the older one —
+    /// a correction rings instead of ringing beside the brief it corrects. No
+    /// live rows carry `thread_id` today, so this test is the only traffic the
+    /// path has.
+    #[test]
+    fn a_thread_correction_supersedes_the_queued_brief() {
+        let model = working_model("BlueRidge");
+        let row = |id: &str, subject: &str| {
+            serde_json::json!({
+                "id": id,
+                "subject": subject,
+                "sender": "SlateHarbor",
+                "importance": "normal",
+                "thread_id": "thread-7",
+            })
+        };
+        let (next, _) = tick(
+            &model,
+            &DoorbellMsg::InboxRows {
+                rows: vec![row("m1", "crew prompt")],
+                pin: "BlueRidge".into(),
+            },
+        );
+        let (next, actions) = tick(
+            &next,
+            &DoorbellMsg::InboxRows {
+                rows: vec![row("m2", "crew prompt (correction)")],
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert!(
+            matches!(&actions[0], DoorbellAction::Audit { kind, .. } if kind == "superseded"),
+            "the correction supersedes, journalled: {actions:?}"
+        );
+        assert_eq!(
+            next.queues.get("BlueRidge").map(Vec::len),
+            Some(1),
+            "one wake for the thread, not two"
+        );
+        assert_eq!(
+            next.queues["BlueRidge"][0].count, 1,
+            "a supersede is not a merge: the thread holds one live message"
+        );
+
+        // The RING text for mail is generic, so identity is what proves the
+        // supersede: the queued entry now belongs to the newer message.
+        assert_eq!(
+            next.queues["BlueRidge"][0].key, "m2",
+            "the thread entry carries the newest message's identity"
+        );
+        let (_, drained) = tick(
+            &next,
+            &DoorbellMsg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+        );
+        assert!(
+            drained
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { .. })),
+            "the thread rings once: {drained:?}"
+        );
+    }
+
     /// bd-x3pqw review: two DIFFERENT captain briefs render the same generic
     /// line, so an id-bearing producer must not fold onto the core — otherwise
     /// the ring under-counts what it carries. The id-less CLI handoff still
@@ -1980,6 +2106,7 @@ mod tests {
             &mut actions,
             "BlueRidge",
             wake_key("⟦toron⟧ URGENT steer (wm 7) — run: toron next"),
+            None,
             "⟦toron⟧ URGENT steer (wm 7) — run: toron next".to_string(),
         );
         assert!(
@@ -2009,6 +2136,7 @@ mod tests {
                     .to_string()
                     .as_str(),
             ),
+            None,
             "[doorbell] kind 9. Pull: toron channel read".to_string(),
         );
         assert!(
@@ -2030,6 +2158,7 @@ mod tests {
             &mut urgent,
             "BlueRidge",
             wake_key("⟦toron⟧ URGENT steer (wm 7) — run: toron next"),
+            None,
             "⟦toron⟧ URGENT steer (wm 7) — run: toron next".to_string(),
         );
         assert!(
@@ -2046,6 +2175,7 @@ mod tests {
                     .to_string()
                     .as_str(),
             ),
+            None,
             "[doorbell] kind 9. Pull: toron channel read".to_string(),
         );
         assert!(

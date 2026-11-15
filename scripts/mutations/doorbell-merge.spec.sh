@@ -52,6 +52,12 @@ mutation "W7  the watermark makes two renderings of one message distinct" \
     find='    let core = match core.rfind(" (wm ") {' \
     replace='    let core = match None::<usize> {'
 
+mutation "W11  a thread correction rings beside the brief it corrects" \
+    file=$CORE \
+    expect=a_thread_correction_supersedes_the_queued_brief \
+    find='    if let Some(thread) = thread.as_deref().filter(|t| !t.is_empty())' \
+    replace='    if let Some(thread) = None::<&str>'
+
 mutation "W9  an already-rung message rings again on the idle re-read" \
     file=$CORE \
     expect=the_idle_edge_asks_for_the_inbox_when_the_queue_is_empty \
