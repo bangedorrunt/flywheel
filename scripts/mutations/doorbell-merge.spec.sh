@@ -34,6 +34,18 @@ mutation "W3  a peer line outranks the captain brief" \
     find='    by_kind.sort_by_key(|w| std::cmp::Reverse(w.kind));' \
     replace='    by_kind.sort_by_key(|w| w.kind);'
 
+mutation "W6  the two producers of one directive are not deduped" \
+    file=$CORE \
+    expect=one_directive_rings_once_through_two_producers \
+    find='    if let Some(w) = queue.iter_mut().find(|w| !key.is_empty() && w.key == key) {' \
+    replace='    if let Some(w) = queue.iter_mut().find(|_w| false && !key.is_empty()) {'
+
+mutation "W7  the watermark makes two renderings of one message distinct" \
+    file=$CORE \
+    expect=the_wake_key_ignores_the_watermark_but_not_the_body \
+    find='    let core = match core.rfind(" (wm ") {' \
+    replace='    let core = match None::<usize> {'
+
 mutation "W4  a lone system notice rides the ring" \
     file=$CORE \
     expect=a_system_notice_never_rings_and_says_so \

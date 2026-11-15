@@ -507,6 +507,7 @@ mod recorder_tests {
                 .map(|i| {
                     doorbell_core::QueuedWake::new(
                         doorbell_core::WakeKind::Digest,
+                        format!("k{i}"),
                         format!("corr-{i:08}"),
                     )
                 })

@@ -634,6 +634,17 @@ pub fn wake_kind_of_line(line: &str) -> WakeKind {
     WakeKind::Digest
 }
 
+/// The identity a row's wake carries into the queue.
+///
+/// It is the RENDERED line's core, not the row id, because only one of the two
+/// producers has an id: the inbox row does, the CLI's refused-handoff line does
+/// not. Keying on the line is what makes one directive one ring (bd-x3pqw).
+/// When the envelope carries a message id to both producers (bd-0uzrq.1), that
+/// id becomes the key and this fn goes away.
+fn row_key(_row: &serde_json::Value, line: &str) -> String {
+    wake_key(line)
+}
+
 /// The `hint` a composed line ends with: every class it carries, most urgent
 /// first, then the single pull the pane should run.
 pub fn composed_ring(queue: &[QueuedWake]) -> String {
@@ -720,34 +731,74 @@ pub fn parse_status_pair(s: &str) -> Option<(String, String)> {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct QueuedWake {
     pub kind: WakeKind,
+    /// The message identity this wake belongs to. Two producers exist for one
+    /// directive (the inbox's classified mail line and the CLI's handoff line),
+    /// so the key is the mail id when the row carries one and the line's
+    /// normalised core otherwise (bd-x3pqw).
+    #[serde(default)]
+    pub key: String,
     pub line: String,
     pub count: u32,
 }
 
 impl QueuedWake {
     #[must_use]
-    pub fn new(kind: WakeKind, line: impl Into<String>) -> Self {
+    pub fn new(kind: WakeKind, key: impl Into<String>, line: impl Into<String>) -> Self {
         Self {
             kind,
+            key: key.into(),
             line: line.into(),
             count: 1,
         }
     }
 }
 
+/// What folding one line into the queue did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Queued {
+    /// A new class joined the queue.
+    Fresh,
+    /// A different message of a class already queued: the count rises.
+    Merged,
+    /// The SAME message arrived again (a second producer): nothing rises, and
+    /// the newest text wins. One directive must ring once, never twice.
+    Duplicate,
+}
+
+/// The identity of a ring line when no message id is available: the line with
+/// its transport decorations stripped, so the inbox producer
+/// (`⟦p2p:request-release⟧ from A for b — run: toron next`) and the CLI
+/// producer (`⟦p2p:request-release⟧ from A for b (wm 382) — run: toron next`)
+/// resolve to the same wake.
+#[must_use]
+pub fn wake_key(line: &str) -> String {
+    let core = line.split(" — run: ").next().unwrap_or(line).trim_end();
+    let core = match core.rfind(" (wm ") {
+        Some(at) if core.ends_with(')') => &core[..at],
+        _ => core,
+    };
+    core.trim_end().to_string()
+}
+
 /// Fold one line into the queue: same class merges (newest line wins, count
 /// bumps), a new class appends. Returns true when it merged.
-pub fn queue_line(queue: &mut Vec<QueuedWake>, line: String) -> bool {
+pub fn queue_line(queue: &mut Vec<QueuedWake>, key: String, line: String) -> Queued {
     let kind = wake_kind_of_line(&line);
+    if let Some(w) = queue.iter_mut().find(|w| !key.is_empty() && w.key == key) {
+        // The same message through a second producer: replace the text, do not
+        // inflate the count, and never ring a third time.
+        w.line = line;
+        return Queued::Duplicate;
+    }
     match queue.iter_mut().find(|w| w.kind == kind) {
         Some(w) => {
             w.line = line;
             w.count = w.count.saturating_add(1);
-            true
+            Queued::Merged
         }
         None => {
-            queue.push(QueuedWake::new(kind, line));
-            false
+            queue.push(QueuedWake::new(kind, key, line));
+            Queued::Fresh
         }
     }
 }
@@ -968,9 +1019,30 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
             let Some((class, hint)) = parse_watch_ndjson(line, &next.index) else {
                 return (next, actions);
             };
+            // A watch line renders with its EVENT id, so two distinct events of
+            // one class are two messages (they merge) and a redelivery of one is
+            // the same message (it dedups). The inbox/CLI producers have no id
+            // in their text, so their identity is the line itself.
+            let event_id = serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|v| {
+                    v.get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
             let line_out = doorbell_line(class, &hint);
+            // Watch events carry an id and the inbox/CLI producers do not, so a
+            // watch key is the line core PLUS the event: two events of a class
+            // merge, a redelivery of one dedups.
+            let key = if event_id.is_empty() {
+                wake_key(&line_out)
+            } else {
+                format!("{}#{event_id}", wake_key(&line_out))
+            };
             for pin in watch_targets(line, &next.index) {
-                route_or_queue(&mut next, &mut actions, &pin, line_out.clone());
+                route_or_queue(&mut next, &mut actions, &pin, key.clone(), line_out.clone());
             }
         }
         DoorbellMsg::InboxItems { raw, pin } => {
@@ -987,7 +1059,8 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                     continue;
                 };
                 let line_out = doorbell_line(class, &hint);
-                route_or_queue(&mut next, &mut actions, pin, line_out);
+                let key = row_key(item, &line_out);
+                route_or_queue(&mut next, &mut actions, pin, key, line_out);
             }
         }
         DoorbellMsg::InboxRows { rows, pin } => {
@@ -996,7 +1069,8 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                     continue;
                 };
                 let line_out = doorbell_line(class, &hint);
-                route_or_queue(&mut next, &mut actions, pin, line_out);
+                let key = row_key(item, &line_out);
+                route_or_queue(&mut next, &mut actions, pin, key, line_out);
             }
         }
         DoorbellMsg::PlaneStatus { pin, status } => {
@@ -1037,9 +1111,14 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
         DoorbellMsg::PromptRefused { pin, line } => {
             next.statuses.insert(pin.clone(), "working".into());
             let queue = next.queues.entry(pin.clone()).or_default();
-            let merged = queue_line(queue, line.clone());
+            let fold = queue_line(queue, wake_key(&line), line.clone());
             actions.push(DoorbellAction::Audit {
-                kind: if merged { "merged" } else { "deferred" }.into(),
+                kind: match fold {
+                    Queued::Fresh => "deferred",
+                    Queued::Merged => "merged",
+                    Queued::Duplicate => "dedup",
+                }
+                .into(),
                 pin: pin.clone(),
                 detail: format!("{line} (queue {} class(es))", queue.len()),
             });
@@ -1067,6 +1146,7 @@ fn route_or_queue(
     next: &mut DoorbellModel,
     actions: &mut Vec<DoorbellAction>,
     pin: &str,
+    key: String,
     line: String,
 ) {
     let status = next
@@ -1109,12 +1189,18 @@ fn route_or_queue(
             return;
         }
         let queue = next.queues.entry(pin.to_string()).or_default();
-        // bd-0uzrq.8: a later wake MERGES by class and the journal says so.
-        // Silently coalescing is how a captain brief vanished behind a peer
-        // wake with no row to find it by; a notice merges too, but never rings.
-        let merged = queue_line(queue, line.clone());
+        // bd-0uzrq.8/.x3pqw: one identity per message. The same message from a
+        // second producer is a DEDUP (one ring); a different message of a
+        // class MERGES visibly. Silently coalescing is how a captain brief
+        // vanished behind a peer wake.
+        let fold = queue_line(queue, key, line.clone());
         actions.push(DoorbellAction::Audit {
-            kind: if merged { "merged" } else { "queued" }.into(),
+            kind: match fold {
+                Queued::Fresh => "queued",
+                Queued::Merged => "merged",
+                Queued::Duplicate => "dedup",
+            }
+            .into(),
             pin: pin.to_string(),
             detail: format!("{line} (queue {} class(es))", queue.len()),
         });
@@ -1343,19 +1429,34 @@ mod tests {
             matches!(&first[0], DoorbellAction::Audit { kind, .. } if kind == "queued"),
             "the first queue is journaled: {first:?}"
         );
+        // The SAME message redelivered is a DEDUP: one directive must ring once,
+        // however many producers or redeliveries carry it (bd-x3pqw).
         let (next2, second) = tick(&next, &msg);
         assert!(
-            matches!(&second[0], DoorbellAction::Audit { kind, .. } if kind == "merged"),
-            "the SECOND wake is journaled as a merge, never silently swallowed: {second:?}"
+            matches!(&second[0], DoorbellAction::Audit { kind, .. } if kind == "dedup"),
+            "a redelivery of one message is a dedup, journaled: {second:?}"
         );
         assert_eq!(
             next2.queues.get("BlueRidge").map(Vec::len),
             Some(1),
-            "same class coalesces to one entry"
+            "one entry"
         );
         assert_eq!(
-            next2.queues["BlueRidge"][0].count, 2,
-            "the merge count is kept, so the ring can say how many it carries"
+            next2.queues["BlueRidge"][0].count, 1,
+            "a dedup never inflates the count the ring reports"
+        );
+
+        // A DIFFERENT message of the same class MERGES: the count rises and the
+        // merge is journaled, so the ring can say how many it carries.
+        let other = r#"{"kind":9,"id":"cd","tags":[["p","BlueRidge"],["h","ch-1"]],"content":"@BlueRidge again"}"#;
+        let (next3, third) = tick(&next2, &DoorbellMsg::WatchNdjson { line: other.into() });
+        assert!(
+            matches!(&third[0], DoorbellAction::Audit { kind, .. } if kind == "merged"),
+            "a second message of the class merges visibly: {third:?}"
+        );
+        assert_eq!(
+            next3.queues["BlueRidge"][0].count, 2,
+            "two distinct messages, one ring entry"
         );
     }
 
@@ -1516,6 +1617,80 @@ mod tests {
         );
     }
 
+    /// bd-x3pqw, the live double ring: ONE peer directive reaches the queue
+    /// through TWO producers — the inbox's classified p2p line (no watermark)
+    /// and the CLI's refused-handoff line (with `(wm N)`). One message, one
+    /// ring, however many producers carry it.
+    #[test]
+    fn one_directive_rings_once_through_two_producers() {
+        // "unknown" is the live shape: the pane's status was not known when the
+        // peers arrived, so even an urgent line queues instead of typing.
+        let mut model = DoorbellModel::default();
+        model.index.insert_pin("BlueRidge".into(), None);
+        let rows = vec![serde_json::json!({
+            "id": "9f2c",
+            "subject": "p2p:request-release src/elm/inbox.rs",
+            "sender": "PurpleGorge",
+            "importance": "normal",
+        })];
+        let (next, _) = tick(
+            &model,
+            &DoorbellMsg::InboxRows {
+                rows,
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert_eq!(
+            next.queues.get("BlueRidge").map(Vec::len),
+            Some(1),
+            "the inbox producer queued the directive"
+        );
+
+        // The CLI's own handoff for the SAME directive: same verb, sender and
+        // path, plus a watermark the inbox line does not carry.
+        let (next, actions) = tick(
+            &next,
+            &DoorbellMsg::PromptRefused {
+                pin: "BlueRidge".into(),
+                line: "⟦p2p:request-release⟧ from PurpleGorge for src/elm/inbox.rs (wm 382) — run: toron next".into(),
+            },
+        );
+        assert!(
+            matches!(&actions[0], DoorbellAction::Audit { kind, .. } if kind == "dedup"),
+            "the second producer is a DEDUP, not a second wake: {actions:?}"
+        );
+        assert_eq!(
+            next.queues.get("BlueRidge").map(Vec::len),
+            Some(1),
+            "one entry for one directive"
+        );
+
+        let (_, drained) = tick(
+            &next,
+            &DoorbellMsg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+        );
+        let rings = drained
+            .iter()
+            .filter(|a| matches!(a, DoorbellAction::Prompt { .. }))
+            .count();
+        assert_eq!(rings, 1, "ONE ring, not two: {drained:?}");
+    }
+
+    /// The watermark is transport decoration: two different directives that
+    /// differ only by it are one message, and two genuinely different ones are
+    /// two.
+    #[test]
+    fn the_wake_key_ignores_the_watermark_but_not_the_body() {
+        let a = "⟦p2p:request-release⟧ from A for src/x.rs — run: toron next";
+        let b = "⟦p2p:request-release⟧ from A for src/x.rs (wm 382) — run: toron next";
+        let c = "⟦p2p:request-release⟧ from A for src/y.rs — run: toron next";
+        assert_eq!(wake_key(a), wake_key(b));
+        assert_ne!(wake_key(a), wake_key(c));
+    }
+
     /// The urgent class is the head even when it queued second: a captain-side
     /// wake is never hidden behind a peer line.
     #[test]
@@ -1623,6 +1798,7 @@ mod tests {
             &mut model,
             &mut actions,
             "BlueRidge",
+            wake_key("⟦toron⟧ URGENT steer (wm 7) — run: toron next"),
             "⟦toron⟧ URGENT steer (wm 7) — run: toron next".to_string(),
         );
         assert!(
@@ -1647,6 +1823,11 @@ mod tests {
             &mut model,
             &mut actions,
             "BlueRidge",
+            wake_key(
+                "[doorbell] kind 9. Pull: toron channel read"
+                    .to_string()
+                    .as_str(),
+            ),
             "[doorbell] kind 9. Pull: toron channel read".to_string(),
         );
         assert!(
@@ -1667,6 +1848,7 @@ mod tests {
             &mut model,
             &mut urgent,
             "BlueRidge",
+            wake_key("⟦toron⟧ URGENT steer (wm 7) — run: toron next"),
             "⟦toron⟧ URGENT steer (wm 7) — run: toron next".to_string(),
         );
         assert!(
@@ -1678,6 +1860,11 @@ mod tests {
             &mut model,
             &mut routine,
             "BlueRidge",
+            wake_key(
+                "[doorbell] kind 9. Pull: toron channel read"
+                    .to_string()
+                    .as_str(),
+            ),
             "[doorbell] kind 9. Pull: toron channel read".to_string(),
         );
         assert!(

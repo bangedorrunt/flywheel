@@ -176,6 +176,7 @@ mod tests {
             vec![doorbell_core::QueuedWake::new(
                 doorbell_core::WakeKind::Digest,
                 "corr-1",
+                "corr-1",
             )],
         );
         m.doorbell
