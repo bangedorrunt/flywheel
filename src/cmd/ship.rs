@@ -564,7 +564,11 @@ fn receipt_is_landable(root: &Path, receipt: &Path, sha: &str) -> Result<()> {
             .unwrap_or(false);
         // A dead-guard mutation is accounted for by DEAD-CONFIRMED (its guard
         // cannot change behaviour); a live-guard mutation by RED.
-        let want = if expect_green { "DEAD-CONFIRMED" } else { "RED" };
+        let want = if expect_green {
+            "DEAD-CONFIRMED"
+        } else {
+            "RED"
+        };
         if verdict != want {
             bail!("proof receipt mutation {spec}#{id} proved {verdict}, expected {want}");
         }
@@ -892,7 +896,10 @@ mod tests {
         receipt_is_landable(repo.path(), &good, SHA).expect("a proving receipt lands");
 
         // A guard expected dead is the other way round and is not a failure.
-        let dead = receipt(&doc(true, &[row("demo.spec.sh", "D1", "DEAD-CONFIRMED", true)]));
+        let dead = receipt(&doc(
+            true,
+            &[row("demo.spec.sh", "D1", "DEAD-CONFIRMED", true)],
+        ));
         receipt_is_landable(repo.path(), &dead, SHA).expect("a dead-guard witness lands");
     }
 
