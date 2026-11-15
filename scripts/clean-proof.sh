@@ -239,15 +239,12 @@ if [ -n "$MUTATIONS_MODE" ] && [ -z "$FAILED_STEP" ]; then
   else
     echo "clean-proof: mutations $mut_ran spec(s), $mut_failed failing"
   fi
-  STEP_NAMES="$STEP_NAMES"mutations"
-"
+  STEP_NAMES="$STEP_NAMES"$'mutations\n' 
   if [ "$mut_failed" -ne 0 ]; then
-    STEP_STATUSES="$STEP_STATUSES"1"
-"
+    STEP_STATUSES="$STEP_STATUSES"$'1\n'
     FAILED_STEP="mutations"
   else
-    STEP_STATUSES="$STEP_STATUSES"0"
-"
+    STEP_STATUSES="$STEP_STATUSES"$'0\n' 
   fi
 fi
 
