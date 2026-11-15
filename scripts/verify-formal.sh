@@ -133,6 +133,7 @@ expect_pass DeferredQueue DeferredQueue
 expect_pass DispatcherReap DispatcherReap
 expect_pass JournalAppend JournalAppend
 expect_pass SupervisorRetire SupervisorRetire
+expect_pass PeerContention PeerContention
 
 echo "verify-formal: negative fixtures (must fail)"
 expect_violation JobLease JobLease.broken-steal NoSteal
@@ -149,6 +150,7 @@ expect_violation DispatcherReap DispatcherReap.broken-reap-live-session NeverRea
 expect_violation DispatcherReap DispatcherReap.broken-label-dropped LabelOnlyDoorKept
 expect_violation JournalAppend JournalAppend.broken-interleave NoTornRow
 expect_violation SupervisorRetire SupervisorRetire.broken-delete-on-failure PlistOnlyWhenGone
+expect_violation PeerContention PeerContention.broken-no-tiebreak AtMostOneHolder
 
 # Every model in the directory must be exercised: a new .tla that nobody added
 # an expectation for would otherwise pass silently as "not run".
