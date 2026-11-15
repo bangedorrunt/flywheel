@@ -158,14 +158,13 @@ mutations = ["scripts/mutations/doorbell-host.spec.sh#H1"]
 [[behavior]]
 id = "stuck-vs-busy.evidence"
 owner = "src/stuck_vs_busy.rs"
-status = "pending"
-missing = "mutation scripts/mutations/stuck-vs-busy.spec.sh#B1 declared but NEEDLE-MISS in harness (multi-line find); needs exact match fixed and RED shown"
+status = "proven"
 concurrent = false
 tests = [
   "src/stuck_vs_busy.rs::both_yes_is_a_contradiction_and_is_not_resolved_by_picking_a_side",
   "src/stuck_vs_busy.rs::wedged_and_working_are_both_bounded_by_a_confident_opposite",
 ]
-mutations = []
+mutations = ["scripts/mutations/stuck-vs-busy.spec.sh#B1"]
 
 [[behavior]]
 id = "recipient-guard.explicit-npub"
