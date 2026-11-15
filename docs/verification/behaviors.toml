@@ -28,7 +28,8 @@ mutations = ["scripts/mutations/doorbell-deferral.spec.sh#D1"]
 id = "doorbell.reap-plane-guard"
 owner = "src/cmd/doorbell.rs"
 status = "proven"
-concurrent = false
+concurrent = true
+formal = ".agents/skills/verify-protocol-tla/models/DispatcherReap.tla::.agents/skills/verify-protocol-tla/models/DispatcherReap.cfg"
 tests = [
   "src/cmd/doorbell.rs::hc_fallback_list_with_session_doors_reaps_nothing",
   "src/cmd/doorbell.rs::label_door_is_kept_when_it_is_the_only_door",
@@ -40,7 +41,8 @@ mutations = ["scripts/mutations/doorbell-reap.spec.sh#D3"]
 id = "doorbell.journal-append-atomic"
 owner = "crates/doorbell-rt/src/store.rs"
 status = "proven"
-concurrent = false
+concurrent = true
+formal = ".agents/skills/verify-protocol-tla/models/JournalAppend.tla::.agents/skills/verify-protocol-tla/models/JournalAppend.cfg"
 tests = [
   "crates/doorbell-rt/src/store.rs::append_waits_for_the_journal_lock_then_lands_exactly_once",
   "crates/doorbell-rt/src/store.rs::concurrent_appends_lose_no_rows",
@@ -197,5 +199,17 @@ missing = "no tests in the module yet; the health verdict is only exercised thro
 concurrent = false
 tests = [
   "src/doorbell_host.rs::a_bound_block_without_a_spawn_row_still_maps_to_its_pin",
+]
+mutations = []
+
+[[behavior]]
+id = "supervisor.retire-plist"
+owner = "src/doorbell_supervise.rs"
+status = "pending"
+missing = "a runnable mutation for the plist delete path (the retire verb's bootout outcome has no spec yet)"
+concurrent = false
+formal = ".agents/skills/verify-protocol-tla/models/SupervisorRetire.tla::.agents/skills/verify-protocol-tla/models/SupervisorRetire.cfg"
+tests = [
+  "src/cmd/swarm.rs::retire_refuses_the_captain_seat",
 ]
 mutations = []
