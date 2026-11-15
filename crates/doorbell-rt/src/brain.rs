@@ -2658,9 +2658,11 @@ mod tests {
         brain.host.pin_list = vec!["p".into()];
         brain.host.inbox.insert(
             ("p".into(), floor.clone()),
-            // A non-wake row: nothing to route, so the cursor is free to
-            // advance past it (wave17-b keeps only undecided WAKES).
+            // A genuinely non-wake row: an ack-only delivery. Routine mail is
+            // a wake since bd-0uzrq.8 (dropping it lost a captain brief), so
+            // only ack-only rows are free to advance the cursor.
             vec![serde_json::json!({
+                "ack_only": true,
                 "importance": "normal",
                 "created_ts_us": row_us,
                 "body_md": "hi",
