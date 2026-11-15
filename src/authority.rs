@@ -386,6 +386,17 @@ mod tests {
         super::guard_fleet_mutation(&cfg, Some(&project), true, "stack install")
             .expect("--operator may install");
 
+        // No captain bound for the project: nobody can vouch for the pin, so
+        // the fleet guard still refuses (the `None` arm).
+        unsafe { std::env::set_var("AGENT_NAME", "CrewPin") };
+        let unowned = format!("fleet-guard-unowned-{}", std::process::id());
+        let err = super::guard_fleet_mutation(&cfg, Some(&unowned), false, "doorbell stop")
+            .expect_err("no captain means no crew permission");
+        assert!(
+            format!("{err}").contains("no captain is bound"),
+            "the refusal names the missing captain: {err}"
+        );
+
         unsafe { std::env::remove_var("AGENT_NAME") };
         super::guard_fleet_mutation(&cfg, Some(&project), false, "stack install")
             .expect("an operator shell has no crew pin");
