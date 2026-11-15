@@ -122,7 +122,13 @@ for b in behaviors:
         if not test_exists(spec):
             errors.append(f"{bid}: test not found: {spec}")
     if not mutations:
-        errors.append(f"{bid}: no mutation (a check never seen failing proves nothing)")
+        if status == "pending" and b.get("missing"):
+            warnings.append(f"{bid}: pending — {b.get('missing')}")
+        else:
+            errors.append(
+                f"{bid}: no mutation (a check never seen failing proves nothing); "
+                "a pending entry must name what is 'missing'"
+            )
     for m in mutations:
         if not m.strip():
             errors.append(f"{bid}: empty mutation")

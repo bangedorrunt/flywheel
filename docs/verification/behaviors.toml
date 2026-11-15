@@ -107,3 +107,95 @@ mutations = [
   "scripts/mutations/p2p-delivery.spec.sh#P1",
   "scripts/mutations/p2p-classify.spec.sh#P2",
 ]
+
+[[behavior]]
+id = "mail-wake.system-notice-never-rings"
+owner = "src/mail_wake.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/mail_wake.rs::reservation_revoked_notice_never_rings",
+  "src/mail_wake.rs::wire_values_share_the_system_notice_predicate",
+  "src/mail_wake.rs::spawn_refuses_while_the_envelope_owns_wakes",
+]
+mutations = ["scripts/mutations/mail-wake.spec.sh#W1"]
+
+[[behavior]]
+id = "comms.envelope-send"
+owner = "src/comms_send.rs"
+status = "pending"
+missing = "a runnable mutation for the retry/msg-id shape (a_retry_resends_the_recorded_msg_id_and_never_mints_twice has no spec yet)"
+concurrent = false
+tests = [
+  "src/comms_send.rs::a_retry_resends_the_recorded_msg_id_and_never_mints_twice",
+  "src/comms_send.rs::task_envelope_is_npub_addressed_and_valid",
+]
+mutations = []
+
+[[behavior]]
+id = "inbox-host.restart-budget"
+owner = "src/inbox_host.rs"
+status = "pending"
+missing = "a runnable mutation for the restart/budget path (a_restart_does_not_refresh_the_ring_budget and the restored-binding cases have no spec yet)"
+concurrent = false
+tests = [
+  "src/inbox_host.rs::a_restart_does_not_refresh_the_ring_budget",
+  "src/inbox_host.rs::a_restored_binding_rings_only_after_it_is_reverified",
+]
+mutations = []
+
+[[behavior]]
+id = "doorbell-host.presence-bridge"
+owner = "src/doorbell_host.rs"
+status = "pending"
+missing = "a runnable mutation for the cross-session binding map (a_bound_block_without_a_spawn_row_still_maps_to_its_pin has no spec yet)"
+concurrent = false
+tests = [
+  "src/doorbell_host.rs::a_bound_block_without_a_spawn_row_still_maps_to_its_pin",
+]
+mutations = []
+
+[[behavior]]
+id = "stuck-vs-busy.evidence"
+owner = "src/stuck_vs_busy.rs"
+status = "pending"
+missing = "a runnable mutation for the ratio evidence (both_yes_is_a_contradiction_and_is_not_resolved_by_picking_a_side has no spec yet)"
+concurrent = false
+tests = [
+  "src/stuck_vs_busy.rs::both_yes_is_a_contradiction_and_is_not_resolved_by_picking_a_side",
+  "src/stuck_vs_busy.rs::wedged_and_working_are_both_bounded_by_a_confident_opposite",
+]
+mutations = []
+
+[[behavior]]
+id = "recipient-guard.explicit-npub"
+owner = "src/recipient_guard.rs"
+status = "pending"
+missing = "only one unit test in the module and no runnable mutation yet"
+concurrent = false
+tests = [
+  "src/recipient_guard.rs::divergent_pin_send_refuses",
+]
+mutations = []
+
+[[behavior]]
+id = "doorbell-tick.edge-fold"
+owner = "src/doorbell_tick.rs"
+status = "pending"
+missing = "the module is a re-export shim with no tests of its own; its behavior lives in doorbell-core (see the doorbell.* entries)"
+concurrent = false
+tests = [
+  "crates/doorbell-core/src/lib.rs::prompt_refused_defers_then_rings_once_at_prompt",
+]
+mutations = []
+
+[[behavior]]
+id = "wake-liveness.health"
+owner = "src/wake_liveness.rs"
+status = "pending"
+missing = "no tests in the module yet; the health verdict is only exercised through doorbell_host"
+concurrent = false
+tests = [
+  "src/doorbell_host.rs::a_bound_block_without_a_spawn_row_still_maps_to_its_pin",
+]
+mutations = []
