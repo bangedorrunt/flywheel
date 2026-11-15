@@ -414,12 +414,23 @@ pub(crate) fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
     if crate::cmd::spawn::proxy_doorbell_verb(cfg, "status", &[])? {
         return Ok(());
     }
-    crate::cmd::spawn::ensure_doorbell_supervisor(cfg, project);
     let state_dir = crate::config::state_dir();
+    let workspaces = crate::cmd::spawn::doorbell_project_workspaces(project);
+    let flywheel_known = !workspaces.is_empty()
+        || crate::state::load_spawn_meta(project).is_some()
+        || !crate::state::load_spawn_registry(project).is_empty();
+    if !flywheel_known {
+        // bd-y5e43: status is read-only. Unknown projects must not create
+        // durable state (no snapshot/audit/install side effects).
+        println!("{project}: unknown project");
+        return Ok(());
+    }
     let snap = crate::snapshot::assemble(cfg, project, crate::doorbell_now_unix());
     let live_label = snap.workspace.clone();
     let live_id = snap.workspace_id.clone();
-    let workspaces = crate::cmd::spawn::doorbell_project_workspaces(project);
+    let has_live_workspace = !live_id.is_empty() || !live_label.is_empty();
+    let _ = has_live_workspace; // known by flywheel state; live info still used below
+
     let unpinned = crate::unpinned_registry_names(&crate::state::load_spawn_registry(project));
     let unpinned_seg = if unpinned.is_empty() {
         String::new()
@@ -501,6 +512,8 @@ pub(crate) fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
                 None => " watch_idle=never".to_string(),
             },
         );
+        // bd-y5e43: heal only the dispatcher for known projects; never install
+        // supervisor units (that is `doorbell start`'s job).
         if !alive {
             match crate::doorbell::ensure_running(
                 &std::env::current_exe()?,
