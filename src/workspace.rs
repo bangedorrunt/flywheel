@@ -1371,26 +1371,63 @@ pub fn expand_reclassify_cmds(
     out
 }
 
-fn filter_prompts(model: &WorkspaceModel, cmds: Vec<Cmd>) -> Vec<Cmd> {
-    cmds.into_iter()
-        .flat_map(|c| match c {
+/// Which prompts may be typed now, and which must be HELD.
+///
+/// A held prompt is not a dropped one (bd-0uzrq.8, the 01:12 stall): it used to
+/// become an audit row and vanish, so the wake rang only when the doorbell's own
+/// status map next transitioned — minutes later, or never. The caller re-enters
+/// the held lines through the typed deferral ([`Msg::PromptRefused`]), which
+/// queues them and journals the merge.
+fn filter_prompts(model: &WorkspaceModel, cmds: Vec<Cmd>) -> (Vec<Cmd>, Vec<(String, String)>) {
+    let mut keep = Vec::new();
+    let mut held = Vec::new();
+    for c in cmds {
+        match c {
             Cmd::Prompt { pin, line } => {
                 if prompt_allowed(model, &pin)
                     || (is_urgent_line(&line)
                         && matches!(model.presence.get(&pin), Some(Presence::Busy { .. })))
                 {
-                    vec![Cmd::Prompt { pin, line }]
+                    keep.push(Cmd::Prompt { pin, line });
                 } else {
-                    vec![Cmd::Audit {
-                        kind: "prompt_filtered".into(),
-                        pin,
-                        detail: format!("non-injectable presence held wake for digest: {line}"),
-                    }]
+                    held.push((pin, line));
                 }
             }
-            _ => vec![c],
-        })
-        .collect()
+            other => keep.push(other),
+        }
+    }
+    (keep, held)
+}
+
+/// Hold every prompt the workspace cannot type now as a typed deferral, so the
+/// doorbell's queue owns it (one class entry, journaled) instead of it becoming
+/// an audit row nobody rings for.
+fn hold_filtered(model: &WorkspaceModel, cmds: Vec<Cmd>) -> (WorkspaceModel, Vec<Cmd>) {
+    let (keep, held) = filter_prompts(model, cmds);
+    let mut next = model.clone();
+    let mut out = keep;
+    for (pin, line) in held {
+        let (dm, c) = doorbell_slice(
+            &next.doorbell,
+            crate::doorbell_tick::DoorbellMsg::PromptRefused {
+                pin: pin.clone(),
+                line: line.clone(),
+            },
+        );
+        next.doorbell = dm;
+        for cmd in c {
+            match cmd {
+                Cmd::Prompt { .. } => {}
+                other => out.push(other),
+            }
+        }
+        out.push(Cmd::Audit {
+            kind: "held".into(),
+            pin,
+            detail: format!("non-injectable presence held wake in the queue: {line}"),
+        });
+    }
+    (next, out)
 }
 
 fn parse_verdict(raw: &str) -> Option<String> {
@@ -1628,7 +1665,9 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 crate::doorbell_tick::DoorbellMsg::WatchNdjson { line: line.clone() },
             );
             next.doorbell = dm;
-            cmds.extend(filter_prompts(&next, c));
+            let (m2, c) = hold_filtered(&next, c);
+            next = m2;
+            cmds.extend(c);
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                 if v.get("kind").and_then(serde_json::Value::as_u64) == Some(20001)
                     && let Some(content) = v.get("content").and_then(|c| c.as_str())
@@ -1750,7 +1789,9 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 },
             );
             next.doorbell = dm;
-            cmds.extend(filter_prompts(&next, c));
+            let (m2, c) = hold_filtered(&next, c);
+            next = m2;
+            cmds.extend(c);
         }
         Msg::InboxRows { rows, pin } => {
             let (dm, c) = doorbell_slice(
@@ -1761,7 +1802,9 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 },
             );
             next.doorbell = dm;
-            cmds.extend(filter_prompts(&next, c));
+            let (m2, c) = hold_filtered(&next, c);
+            next = m2;
+            cmds.extend(c);
             for row in rows {
                 let corr = row
                     .get("corr")
@@ -1854,7 +1897,9 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 next.presence
                     .insert(pin.clone(), Presence::from_str(status));
             }
-            cmds.extend(filter_prompts(&next, c));
+            let (m2, c) = hold_filtered(&next, c);
+            next = m2;
+            cmds.extend(c);
         }
         Msg::PromptRefused { pin, line } => {
             let (dm, c) = doorbell_slice(
@@ -4217,8 +4262,63 @@ mod presence_model_tests {
             "exactly one ring at the next prompt: {c3:?}"
         );
         assert!(
-            matches!(prompts[0], Cmd::Prompt { pin, line } if pin == "BlueRidge" && line.contains("wake A")),
-            "same effect key, first line: {prompts:?}"
+            matches!(prompts[0], Cmd::Prompt { pin, line } if pin == "BlueRidge" && line.contains("wake B")),
+            "one ring, and the newest line of the class wins (a correction replaces \
+             the brief it corrects): {prompts:?}"
+        );
+    }
+
+    /// bd-0uzrq.8 (the 2-minute stall): a prompt the workspace cannot type is
+    /// HELD IN THE QUEUE, so the next at-prompt transition rings it. It used to
+    /// become an audit row, so the wake rang only if the doorbell's own status
+    /// map happened to transition afterwards — minutes later, or never.
+    #[test]
+    fn a_held_prompt_is_queued_not_dropped() {
+        let mut m = empty_model();
+        m.doorbell.index.insert_pin("B".into(), None);
+        m.doorbell.statuses.insert("B".into(), "working".into());
+        m.presence.insert("B".into(), Presence::from_str("working"));
+        let (next, cmds) = hold_filtered(
+            &m,
+            vec![Cmd::Prompt {
+                pin: "B".into(),
+                line: "[doorbell] plane-P mail. Pull: toron next".into(),
+            }],
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Prompt { .. })),
+            "a busy pane is not typed into: {cmds:?}"
+        );
+        assert_eq!(
+            next.doorbell.queues.get("B").map(Vec::len),
+            Some(1),
+            "the held wake is QUEUED, so an at-prompt transition can ring it"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::Audit { kind, .. } if kind == "held")),
+            "and the hold is journaled: {cmds:?}"
+        );
+
+        let (after, drained) = tick(
+            &next,
+            &Msg::PlaneStatus {
+                pin: "B".into(),
+                status: "idle".into(),
+            },
+        );
+        assert!(
+            drained
+                .iter()
+                .any(|c| matches!(c, Cmd::Prompt { line, .. } if line.contains("plane-P mail"))),
+            "the held wake rings at the next prompt: {drained:?}"
+        );
+        assert!(
+            after
+                .doorbell
+                .queues
+                .get("B")
+                .is_none_or(std::vec::Vec::is_empty)
         );
     }
 
@@ -4247,21 +4347,21 @@ mod presence_model_tests {
                 line: urgent.into(),
             },
         ];
-        let out = filter_prompts(&m, cmds);
-        assert_eq!(out.len(), 4, "nothing vanishes: {out:?}");
-        assert!(matches!(&out[0], Cmd::Prompt { pin, .. } if pin == "I"));
+        let (keep, held) = filter_prompts(&m, cmds);
+        assert_eq!(keep.len(), 2, "typed now: {keep:?}");
+        assert!(matches!(&keep[0], Cmd::Prompt { pin, .. } if pin == "I"));
         assert!(
-            matches!(&out[1], Cmd::Prompt { pin, .. } if pin == "B"),
-            "busy+urgent breaks through: {out:?}"
+            matches!(&keep[1], Cmd::Prompt { pin, .. } if pin == "B"),
+            "busy+urgent breaks through: {keep:?}"
         );
-        assert!(
-            matches!(&out[2], Cmd::Audit { kind, pin, .. } if kind == "prompt_filtered" && pin == "B"),
-            "busy+routine audits for the digest: {out:?}"
+        assert_eq!(
+            held.len(),
+            2,
+            "held, never dropped: a filtered prompt used to become an audit row \
+             and vanish (bd-0uzrq.8)"
         );
-        assert!(
-            matches!(&out[3], Cmd::Audit { kind, pin, .. } if kind == "prompt_filtered" && pin == "Ghost"),
-            "unknown never prompts, even urgent: {out:?}"
-        );
+        assert_eq!(held[0].0, "B", "busy+routine is held for the queue");
+        assert_eq!(held[1].0, "Ghost", "unknown never prompts, even urgent");
     }
 
     #[test]

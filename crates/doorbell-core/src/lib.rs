@@ -471,8 +471,15 @@ pub fn parse_inbox_item(v: &serde_json::Value) -> Option<(EventClass, String)> {
         EventClass::RequestRelease
     } else if matches!(importance, "high" | "urgent") {
         EventClass::PlanePUrgent
+    } else if is_system_notice_row(v) {
+        // A reservation-release notice is machine chatter: it never rings, and
+        // it says so in the journal instead of vanishing.
+        return Some((EventClass::PlanePMail, SYSTEM_NOTICE_HINT.to_string()));
     } else {
-        return None;
+        // bd-0uzrq.8: routine mail used to be dropped HERE with no audit, which
+        // is how a captain brief disappeared while a peer wake rang. Ordinary
+        // mail is a wake; it queues and rings at the next prompt.
+        EventClass::PlanePMail
     };
     Some((class, pull_hint(class, None)))
 }
@@ -565,6 +572,99 @@ pub fn doorbell_line(class: EventClass, hint: &str) -> String {
     format!("[doorbell] {kind}. Pull: {hint}")
 }
 
+/// The hint that marks a system notice: a `PlanePMail` line carrying it is
+/// journaled as silent and never rings (bd-0uzrq.1).
+pub const SYSTEM_NOTICE_HINT: &str = "system-notice";
+
+/// Is this inbox row the doorbell's own machine notice (empty subject from a
+/// 64-hex sender)? One predicate with the wave layer's `is_system_notice`.
+pub fn is_system_notice_row(v: &serde_json::Value) -> bool {
+    let subject = v.get("subject").and_then(|s| s.as_str()).unwrap_or("");
+    let sender = v.get("sender").and_then(|s| s.as_str()).unwrap_or("");
+    subject.trim().is_empty() && sender.len() == 64 && sender.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// What a queued ring line carries, parsed back out of the line itself so the
+/// queue stays plain strings across the journal. Order is the ring's priority:
+/// a captain-side wake is never hidden behind a peer or machine line.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub enum WakeKind {
+    /// Machine chatter: journaled, never rung on its own.
+    Notice,
+    /// Routine mail / digest: rides the next real wake.
+    Digest,
+    /// Peer directive.
+    Peer,
+    /// Act at idle: a mail wake. Outranks a peer line, so a captain brief is
+    /// never buried under peer chatter.
+    AtIdle,
+    /// Act now (plane-P urgent, request-release).
+    ActNow,
+}
+
+impl WakeKind {
+    /// The word a composed ring uses for this kind.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Notice => "system notice",
+            Self::Digest => "digest",
+            Self::Peer => "peer request",
+            Self::AtIdle => "brief",
+            Self::ActNow => "urgent",
+        }
+    }
+}
+
+/// Classify a composed or raw ring line.
+pub fn wake_kind_of_line(line: &str) -> WakeKind {
+    if line.starts_with("⟦p2p") {
+        return WakeKind::Peer;
+    }
+    if line.contains("plane-P urgent") || line.contains("request-release") {
+        return WakeKind::ActNow;
+    }
+    if line.contains(SYSTEM_NOTICE_HINT) {
+        return WakeKind::Notice;
+    }
+    if line.contains("plane-P mail") || line.contains("kind 43001") || line.contains("kind 9") {
+        return WakeKind::AtIdle;
+    }
+    WakeKind::Digest
+}
+
+/// The `hint` a composed line ends with: every class it carries, most urgent
+/// first, then the single pull the pane should run.
+pub fn composed_ring(queue: &[QueuedWake]) -> String {
+    let mut by_kind: Vec<&QueuedWake> = queue
+        .iter()
+        .filter(|w| w.kind != WakeKind::Notice)
+        .collect();
+    if by_kind.is_empty() {
+        return String::new();
+    }
+    // Most urgent class first: a captain-side wake is never hidden behind a
+    // peer or machine line.
+    by_kind.sort_by_key(|w| std::cmp::Reverse(w.kind));
+    let head = by_kind[0]
+        .line
+        .split(" — run: ")
+        .next()
+        .unwrap_or(&by_kind[0].line)
+        .trim_end()
+        .to_string();
+    let rest: Vec<String> = by_kind
+        .iter()
+        .skip(1)
+        .map(|w| format!("{} {}", w.count, w.kind.label()))
+        .collect();
+    if rest.is_empty() {
+        return format!("{head} — run: toron next");
+    }
+    format!("{head} + {} — run: toron next", rest.join(" + "))
+}
+
 /// The separator `parse_inbox_item` uses to carry a peer directive's verb,
 /// sender and path through the `(class, hint)` shape.
 pub const P2P_HINT_SEP: char = '\u{1f}';
@@ -612,6 +712,44 @@ pub fn parse_status_pair(s: &str) -> Option<(String, String)> {
         return None;
     }
     Some((pin.to_string(), st.to_string()))
+}
+
+/// One queued wake: a wake CLASS, the newest line of that class, and how many
+/// of the class merged into it. Coalescing keeps the queue bounded; the count
+/// and the journal rows keep it honest.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QueuedWake {
+    pub kind: WakeKind,
+    pub line: String,
+    pub count: u32,
+}
+
+impl QueuedWake {
+    #[must_use]
+    pub fn new(kind: WakeKind, line: impl Into<String>) -> Self {
+        Self {
+            kind,
+            line: line.into(),
+            count: 1,
+        }
+    }
+}
+
+/// Fold one line into the queue: same class merges (newest line wins, count
+/// bumps), a new class appends. Returns true when it merged.
+pub fn queue_line(queue: &mut Vec<QueuedWake>, line: String) -> bool {
+    let kind = wake_kind_of_line(&line);
+    match queue.iter_mut().find(|w| w.kind == kind) {
+        Some(w) => {
+            w.line = line;
+            w.count = w.count.saturating_add(1);
+            true
+        }
+        None => {
+            queue.push(QueuedWake::new(kind, line));
+            false
+        }
+    }
 }
 
 /// One doorbell message. Every bus/inbox/status edge is a Msg; nothing
@@ -685,8 +823,10 @@ pub enum DoorbellAction {
 /// round trip is exact. The reducer stays pure and untouched.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DoorbellModel {
-    /// LWW queues per pin (working panes hold their wake here).
-    pub queues: BTreeMap<String, Vec<String>>,
+    /// One entry per wake CLASS per pin (working panes hold their wake here).
+    /// Coalescing is by class, never silent: a merge bumps `count` and journals
+    /// `merged`, and the ring names every class it carries (bd-0uzrq.8).
+    pub queues: BTreeMap<String, Vec<QueuedWake>>,
     /// Last-known hc status per pin.
     pub statuses: BTreeMap<String, String>,
     /// Pins (+npubs) this dispatcher owns.
@@ -869,17 +1009,26 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 && let Some(q) = next.queues.get_mut(pin)
             {
                 let deferred = std::mem::take(q);
-                if !deferred.is_empty() {
+                let total: u32 = deferred.iter().map(|w| w.count).sum();
+                if deferred.is_empty() {
+                    // nothing queued: fall through to the status update
+                } else if deferred.iter().all(|w| w.kind == WakeKind::Notice) {
+                    // Machine notices never ring, even alone.
+                    actions.push(DoorbellAction::Audit {
+                        kind: "silent".into(),
+                        pin: pin.clone(),
+                        detail: format!("{total} system notice(s) dropped at prompt"),
+                    });
+                } else {
+                    let ring = composed_ring(&deferred);
                     actions.push(DoorbellAction::Audit {
                         kind: "drained".into(),
                         pin: pin.clone(),
-                        detail: format!("{} deferred wake(s) at prompt", deferred.len()),
+                        detail: format!("{total} deferred wake(s) at prompt: {ring}"),
                     });
-                }
-                for line in deferred {
                     actions.push(DoorbellAction::Prompt {
                         pin: pin.clone(),
-                        line,
+                        line: ring,
                     });
                 }
             }
@@ -888,14 +1037,12 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
         DoorbellMsg::PromptRefused { pin, line } => {
             next.statuses.insert(pin.clone(), "working".into());
             let queue = next.queues.entry(pin.clone()).or_default();
-            if queue.is_empty() {
-                queue.push(line.clone());
-                actions.push(DoorbellAction::Audit {
-                    kind: "deferred".into(),
-                    pin: pin.clone(),
-                    detail: line.clone(),
-                });
-            }
+            let merged = queue_line(queue, line.clone());
+            actions.push(DoorbellAction::Audit {
+                kind: if merged { "merged" } else { "deferred" }.into(),
+                pin: pin.clone(),
+                detail: format!("{line} (queue {} class(es))", queue.len()),
+            });
         }
         DoorbellMsg::Fact { summary } => {
             actions.push(DoorbellAction::FactMiss {
@@ -961,18 +1108,16 @@ fn route_or_queue(
             });
             return;
         }
-        let fresh = next.queues.get(pin).is_none_or(std::vec::Vec::is_empty);
-        next.queues
-            .entry(pin.to_string())
-            .or_default()
-            .push(line.clone());
-        if fresh {
-            actions.push(DoorbellAction::Audit {
-                kind: "queued".into(),
-                pin: pin.to_string(),
-                detail: line,
-            });
-        }
+        let queue = next.queues.entry(pin.to_string()).or_default();
+        // bd-0uzrq.8: a later wake MERGES by class and the journal says so.
+        // Silently coalescing is how a captain brief vanished behind a peer
+        // wake with no row to find it by; a notice merges too, but never rings.
+        let merged = queue_line(queue, line.clone());
+        actions.push(DoorbellAction::Audit {
+            kind: if merged { "merged" } else { "queued" }.into(),
+            pin: pin.to_string(),
+            detail: format!("{line} (queue {} class(es))", queue.len()),
+        });
     }
 }
 
@@ -1187,16 +1332,31 @@ mod tests {
     }
 
     #[test]
-    fn queue_audit_fires_once_per_nonempty_stretch() {
+    fn queue_audit_journals_every_merge_not_just_the_first() {
         let mut model = model_with("BlueRidge");
         model.statuses.insert("BlueRidge".into(), "working".into());
         let line = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["h","ch-1"]],"content":"@BlueRidge hi"}"#;
         let msg = DoorbellMsg::WatchNdjson { line: line.into() };
         let (next, first) = tick(&model, &msg);
         assert_eq!(first.len(), 1);
+        assert!(
+            matches!(&first[0], DoorbellAction::Audit { kind, .. } if kind == "queued"),
+            "the first queue is journaled: {first:?}"
+        );
         let (next2, second) = tick(&next, &msg);
-        assert!(second.is_empty(), "no audit storm while queued");
-        assert_eq!(next2.queues.get("BlueRidge").map(Vec::len), Some(2));
+        assert!(
+            matches!(&second[0], DoorbellAction::Audit { kind, .. } if kind == "merged"),
+            "the SECOND wake is journaled as a merge, never silently swallowed: {second:?}"
+        );
+        assert_eq!(
+            next2.queues.get("BlueRidge").map(Vec::len),
+            Some(1),
+            "same class coalesces to one entry"
+        );
+        assert_eq!(
+            next2.queues["BlueRidge"][0].count, 2,
+            "the merge count is kept, so the ring can say how many it carries"
+        );
     }
 
     /// bd-9mjla: a busy refusal is a deferral, not a lost wake. The wake
@@ -1225,11 +1385,18 @@ mod tests {
                 line: "wake B".into(),
             },
         );
-        assert!(actions2.is_empty(), "coalesced, no audit storm");
+        assert!(
+            matches!(&actions2[0], DoorbellAction::Audit { kind, .. } if kind == "merged"),
+            "the second refusal is a visible merge: {actions2:?}"
+        );
         assert_eq!(
             next2.queues.get("BlueRidge").map(Vec::len),
             Some(1),
-            "two deferred mails share one ring"
+            "two deferred mails of one class share one ring"
+        );
+        assert_eq!(
+            next2.queues["BlueRidge"][0].count, 2,
+            "and the ring can name how many it carries"
         );
 
         let (next3, actions3) = tick(
@@ -1247,7 +1414,11 @@ mod tests {
         match rings[0] {
             DoorbellAction::Prompt { pin, line } => {
                 assert_eq!(pin, "BlueRidge");
-                assert_eq!(line, "wake A", "same effect key: the first line");
+                assert_eq!(
+                    line, "wake B — run: toron next",
+                    "one composed ring, and the NEWEST line of the class wins: a \
+                     correction replaces the brief it corrects (bd-0uzrq.1)"
+                );
             }
             other => panic!("expected the deferred Prompt, got {other:?}"),
         }
@@ -1273,6 +1444,170 @@ mod tests {
             },
         );
         assert!(actions4.is_empty(), "terminal state emits nothing");
+    }
+
+    /// bd-0uzrq.8, the live incident: a captain brief and a peer request land
+    /// in ONE fetch for a working pane. The peer wake must not hide the brief —
+    /// the queue keeps both classes and the ring names both.
+    #[test]
+    fn a_peer_wake_never_hides_a_captain_brief() {
+        let model = working_model("BlueRidge");
+        let rows = vec![
+            serde_json::json!({
+                "subject": "p2p:classify src/elm/inbox.rs",
+                "sender": "PurpleGorge",
+                "importance": "normal",
+            }),
+            serde_json::json!({
+                "subject": "crew prompt for StormyDesert",
+                "sender": "SlateHarbor",
+                "importance": "normal",
+            }),
+        ];
+        let (next, actions) = tick(
+            &model,
+            &DoorbellMsg::InboxRows {
+                rows,
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { .. })),
+            "a working pane queues instead of typing"
+        );
+        assert_eq!(
+            next.queues.get("BlueRidge").map(Vec::len),
+            Some(2),
+            "one entry per class: neither wake is swallowed: {:?}",
+            next.queues.get("BlueRidge")
+        );
+
+        let (_, drained) = tick(
+            &next,
+            &DoorbellMsg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+        );
+        let ring = drained
+            .iter()
+            .find_map(|a| match a {
+                DoorbellAction::Prompt { line, .. } => Some(line.clone()),
+                _ => None,
+            })
+            .expect("the handoff rings once");
+        assert!(
+            ring.starts_with("[doorbell] plane-P mail"),
+            "the captain brief leads, never buried under the peer line: {ring}"
+        );
+        assert!(
+            ring.contains("1 peer request"),
+            "and the peer wake is named, not dropped: {ring}"
+        );
+        assert_eq!(
+            drained
+                .iter()
+                .filter(|a| matches!(a, DoorbellAction::Prompt { .. }))
+                .count(),
+            1,
+            "ONE ring, not one per wake: {drained:?}"
+        );
+    }
+
+    /// The urgent class is the head even when it queued second: a captain-side
+    /// wake is never hidden behind a peer line.
+    #[test]
+    fn an_urgent_wake_leads_the_composed_ring() {
+        let model = working_model("BlueRidge");
+        let (next, _) = tick(
+            &model,
+            &DoorbellMsg::InboxRows {
+                rows: vec![serde_json::json!({
+                    "subject": "p2p:classify src/elm/inbox.rs",
+                    "sender": "PurpleGorge",
+                    "importance": "normal",
+                })],
+                pin: "BlueRidge".into(),
+            },
+        );
+        let (next, _) = tick(
+            &next,
+            &DoorbellMsg::InboxRows {
+                rows: vec![serde_json::json!({
+                    "subject": "crew prompt",
+                    "sender": "SlateHarbor",
+                    "importance": "normal",
+                })],
+                pin: "BlueRidge".into(),
+            },
+        );
+        let (_, drained) = tick(
+            &next,
+            &DoorbellMsg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+        );
+        let ring = drained
+            .iter()
+            .find_map(|a| match a {
+                DoorbellAction::Prompt { line, .. } => Some(line.clone()),
+                _ => None,
+            })
+            .expect("rings");
+        assert!(
+            ring.starts_with("[doorbell] plane-P mail"),
+            "the captain brief leads even though the peer queued first: {ring}"
+        );
+        assert!(ring.contains("1 peer request"), "{ring}");
+    }
+
+    /// A machine notice is journaled as silent and never rides a ring.
+    #[test]
+    fn a_system_notice_never_rings_and_says_so() {
+        let model = working_model("BlueRidge");
+        let rows = vec![serde_json::json!({
+            "subject": "",
+            "sender": "b".repeat(64),
+            "importance": "normal",
+        })];
+        let (next, actions) = tick(
+            &model,
+            &DoorbellMsg::InboxRows {
+                rows,
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert!(
+            matches!(&actions[0], DoorbellAction::Audit { kind, .. } if kind == "queued"),
+            "the notice is still journaled: {actions:?}"
+        );
+        let (_, drained) = tick(
+            &next,
+            &DoorbellMsg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+        );
+        assert!(
+            !drained
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { .. })),
+            "a lone notice never rings: {drained:?}"
+        );
+        assert!(
+            matches!(&drained[0], DoorbellAction::Audit { kind, .. } if kind == "silent"),
+            "and it is journaled as silent, not dropped: {drained:?}"
+        );
+    }
+
+    fn working_model(pin: &str) -> DoorbellModel {
+        let mut m = DoorbellModel::default();
+        m.index.insert_pin(pin.to_string(), None);
+        m.statuses.insert(pin.to_string(), "working".into());
+        m
     }
 
     #[test]
@@ -1467,7 +1802,12 @@ mod tests {
                 pin: "BlueRidge".into(),
             },
         );
-        assert_eq!(actions.len(), 2, "urgent+high ring, normal stays quiet");
+        assert_eq!(
+            actions.len(),
+            3,
+            "urgent, high AND normal ring: routine mail used to be dropped here \
+             with no audit (bd-0uzrq.8)"
+        );
     }
 
     #[test]
@@ -1485,7 +1825,12 @@ mod tests {
                 pin: "BlueRidge".into(),
             },
         );
-        assert_eq!(actions.len(), 2, "urgent+high ring, normal stays quiet");
+        assert_eq!(
+            actions.len(),
+            3,
+            "urgent, high AND normal ring on an idle pin: a dropped row is how a \
+             captain brief vanished"
+        );
         for a in &actions {
             assert!(a.to_label().contains("BlueRidge"));
         }
@@ -1564,8 +1909,18 @@ mod tests {
                 "importance": "normal",
                 "body_md": "plain agent prose",
             }))
-            .is_none(),
-            "an empty-subject routine row stays out of the wake path"
+            .is_some(),
+            "routine mail is a wake: dropping it silently lost a captain brief \
+             once (bd-0uzrq.8)"
         );
+        // The one row that must NOT ring: the doorbell's own machine notice.
+        let (class, hint) = super::parse_inbox_item(&serde_json::json!({
+            "subject": "",
+            "sender": "a".repeat(64),
+            "importance": "normal",
+        }))
+        .expect("a notice is journaled as silent, not dropped");
+        assert_eq!(class, super::EventClass::PlanePMail);
+        assert_eq!(hint, super::SYSTEM_NOTICE_HINT);
     }
 }

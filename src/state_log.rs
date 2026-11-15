@@ -171,9 +171,13 @@ mod tests {
         );
         m.wake_acked.insert("BrashOtter".into(), 7);
         m.wake_counters.insert("routine".into(), 3);
-        m.doorbell
-            .queues
-            .insert("BrashOtter".into(), vec!["corr-1".into()]);
+        m.doorbell.queues.insert(
+            "BrashOtter".into(),
+            vec![doorbell_core::QueuedWake::new(
+                doorbell_core::WakeKind::Digest,
+                "corr-1",
+            )],
+        );
         m.doorbell
             .statuses
             .insert("QuietMarmot".into(), "idle".into());

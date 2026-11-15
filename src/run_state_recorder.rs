@@ -503,7 +503,14 @@ mod recorder_tests {
         let mut model = WorkspaceModel::default();
         model.doorbell.queues.insert(
             "pin".into(),
-            (0..120_000).map(|i| format!("corr-{i:08}")).collect(),
+            (0..120_000)
+                .map(|i| {
+                    doorbell_core::QueuedWake::new(
+                        doorbell_core::WakeKind::Digest,
+                        format!("corr-{i:08}"),
+                    )
+                })
+                .collect(),
         );
 
         let err = r.record(&model, &[]).await.expect_err("must refuse");

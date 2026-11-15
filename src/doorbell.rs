@@ -3560,9 +3560,20 @@ mod tests {
     }
 
     #[test]
-    fn sc_d2_routine_inbox_does_not_ring() {
+    fn sc_d2_routine_inbox_is_a_wake_not_a_silent_drop() {
+        // bd-0uzrq.8: SC-D2 read "routine inbox does not ring" from a fold that
+        // DROPPED the row entirely, which is how a captain brief vanished while
+        // a peer wake rang. Routine mail is now a wake of the lowest ringing
+        // class; only a machine notice is silent.
         let raw = r#"{"importance":"normal","ack_only":false}"#;
-        assert!(parse_inbox_item(&serde_json::from_str(raw).unwrap()).is_none());
+        let (class, _hint) = parse_inbox_item(&serde_json::from_str(raw).unwrap())
+            .expect("routine mail is a wake, never silence");
+        assert_eq!(class, EventClass::PlanePMail);
+        let ack_only = r#"{"importance":"normal","ack_only":true}"#;
+        assert!(
+            parse_inbox_item(&serde_json::from_str(ack_only).unwrap()).is_none(),
+            "ack-only rows stay out of the wake path"
+        );
     }
 
     #[test]
