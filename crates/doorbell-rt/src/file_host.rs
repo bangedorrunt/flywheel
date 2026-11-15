@@ -3329,7 +3329,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-
     /// bd-68q2: the still-failing digest names the rate, the fd census, and
     /// the backoff — one row per power-of-two fails, decided by the caller.
     #[test]
@@ -3353,8 +3352,6 @@ mod tests {
             "absent census stays null, never zero"
         );
     }
-
-
 
     /// bd-jqjh: the audit door itself failing must be countable, not `let _`.
     /// A FILE where the state dir should be fails mkdir with ENOTDIR for any

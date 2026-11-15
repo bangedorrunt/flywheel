@@ -2114,9 +2114,8 @@ mod presence_producer_tests {
     #[test]
     fn only_a_status_change_reaches_the_brain() {
         let mut last = HashMap::new();
-        let status = |st: AgentStatus| {
-            RtHost::presence_updates_for(&[row("pane-idle", st)], &pin_map()).0
-        };
+        let status =
+            |st: AgentStatus| RtHost::presence_updates_for(&[row("pane-idle", st)], &pin_map()).0;
 
         let first = RtHost::changed_statuses(&mut last, status(AgentStatus::Working));
         assert_eq!(first.len(), 1, "the first answer is news: {first:?}");
