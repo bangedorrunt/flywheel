@@ -33,7 +33,7 @@ mutation "L2  the resolver accepts a directory outside the workspace root" \
 mutation "L3  a receipt with no mutation witnesses lands" \
     file=$SHIP \
     expect=a_receipt_without_mutation_witnesses_cannot_land \
-    find='    if rows_opt.map_or(true, Vec::is_empty) {' \
+    find='    if rows_opt.is_none_or(Vec::is_empty) {' \
     replace='    if false {'
 
 mutation "L4  a mutation that stayed green still lands" \

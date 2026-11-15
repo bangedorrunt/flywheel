@@ -516,7 +516,7 @@ fn receipt_is_landable(root: &Path, receipt: &Path, sha: &str) -> Result<()> {
         );
     }
     let rows_opt = doc.get("mutations").and_then(Value::as_array);
-    if rows_opt.map_or(true, Vec::is_empty) {
+    if rows_opt.is_none_or(Vec::is_empty) {
         // An empty set lands only when the diff provably touched no spec
         // target: changed mode, a base that resolves, and a changed-path list
         // re-derived here rather than trusted.
