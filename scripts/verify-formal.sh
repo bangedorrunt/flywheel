@@ -18,6 +18,7 @@ TLA_URL="https://github.com/tlaplus/tlaplus/releases/download/v${TLA_VERSION}/tl
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/flywheel/tla"
 JAR="${FLYWHEEL_TLA_JAR:-$CACHE/tla2tools-${TLA_VERSION}.jar}"
 MODELS=".agents/skills/verify-protocol-tla/models"
+SELF="$0"
 
 die() {
   echo "verify-formal: $*" >&2
@@ -145,6 +146,13 @@ expect_violation DispatcherReap DispatcherReap.broken-reap-live-session NeverRea
 expect_violation DispatcherReap DispatcherReap.broken-label-dropped LabelOnlyDoorKept
 expect_violation JournalAppend JournalAppend.broken-interleave NoTornRow
 expect_violation SupervisorRetire SupervisorRetire.broken-delete-on-failure PlistOnlyWhenGone
+
+# Every model in the directory must be exercised: a new .tla that nobody added
+# an expectation for would otherwise pass silently as "not run".
+for model in "$MODELS"/*.tla; do
+  name="$(basename "$model" .tla)"
+  grep -q "expect_pass $name $name$" "$SELF" || die "model $name has no positive expectation"
+done
 
 echo "verify-formal: ${passed} passed, ${failed} failed"
 [ "$failed" -eq 0 ] || die "protocol models did not match their expectations"
