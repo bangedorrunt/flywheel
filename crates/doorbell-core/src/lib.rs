@@ -641,8 +641,12 @@ pub fn wake_kind_of_line(line: &str) -> WakeKind {
 /// not. Keying on the line is what makes one directive one ring (bd-x3pqw).
 /// When the envelope carries a message id to both producers (bd-0uzrq.1), that
 /// id becomes the key and this fn goes away.
-fn row_key(_row: &serde_json::Value, line: &str) -> String {
-    wake_key(line)
+fn row_key(row: &serde_json::Value, _line: &str) -> String {
+    row.get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .unwrap_or_default()
 }
 
 /// The `hint` a composed line ends with: every class it carries, most urgent
@@ -731,12 +735,18 @@ pub fn parse_status_pair(s: &str) -> Option<(String, String)> {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct QueuedWake {
     pub kind: WakeKind,
-    /// The message identity this wake belongs to. Two producers exist for one
-    /// directive (the inbox's classified mail line and the CLI's handoff line),
-    /// so the key is the mail id when the row carries one and the line's
-    /// normalised core otherwise (bd-x3pqw).
+    /// The message identity the producer could give: the inbox row's mail id,
+    /// or the event id for a watch line. Empty when the producer has none — the
+    /// CLI's refused-handoff line carries only text (bd-x3pqw).
     #[serde(default)]
     pub key: String,
+    /// The rendered line's core. An id-less producer folds onto a queued wake
+    /// whose core matches, so one directive from two producers is one ring;
+    /// an id-bearing producer NEVER matches on the core, so two different
+    /// briefs that render the same generic line stay two wakes (bd-x3pqw
+    /// review).
+    #[serde(default)]
+    pub core: String,
     pub line: String,
     pub count: u32,
 }
@@ -744,10 +754,13 @@ pub struct QueuedWake {
 impl QueuedWake {
     #[must_use]
     pub fn new(kind: WakeKind, key: impl Into<String>, line: impl Into<String>) -> Self {
+        let line = line.into();
+        let core = wake_key(&line);
         Self {
             kind,
             key: key.into(),
-            line: line.into(),
+            core,
+            line,
             count: 1,
         }
     }
@@ -784,10 +797,24 @@ pub fn wake_key(line: &str) -> String {
 /// bumps), a new class appends. Returns true when it merged.
 pub fn queue_line(queue: &mut Vec<QueuedWake>, key: String, line: String) -> Queued {
     let kind = wake_kind_of_line(&line);
-    if let Some(w) = queue.iter_mut().find(|w| !key.is_empty() && w.key == key) {
-        // The same message through a second producer: replace the text, do not
-        // inflate the count, and never ring a third time.
+    let core = wake_key(&line);
+    let duplicate = queue.iter().position(|w| {
+        if !key.is_empty() {
+            // An identified message matches only its own identity: two briefs
+            // that render the same generic line are two messages.
+            !w.key.is_empty() && w.key == key
+        } else {
+            // The id-less producer (the CLI's handoff) folds onto the message
+            // its text names.
+            w.core == core
+        }
+    });
+    if let Some(at) = duplicate {
+        let w = &mut queue[at];
         w.line = line;
+        if !key.is_empty() && w.key.is_empty() {
+            w.key = key;
+        }
         return Queued::Duplicate;
     }
     match queue.iter_mut().find(|w| w.kind == kind) {
@@ -1036,11 +1063,7 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
             // Watch events carry an id and the inbox/CLI producers do not, so a
             // watch key is the line core PLUS the event: two events of a class
             // merge, a redelivery of one dedups.
-            let key = if event_id.is_empty() {
-                wake_key(&line_out)
-            } else {
-                format!("{}#{event_id}", wake_key(&line_out))
-            };
+            let key = event_id;
             for pin in watch_targets(line, &next.index) {
                 route_or_queue(&mut next, &mut actions, &pin, key.clone(), line_out.clone());
             }
@@ -1111,7 +1134,7 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
         DoorbellMsg::PromptRefused { pin, line } => {
             next.statuses.insert(pin.clone(), "working".into());
             let queue = next.queues.entry(pin.clone()).or_default();
-            let fold = queue_line(queue, wake_key(line), line.clone());
+            let fold = queue_line(queue, String::new(), line.clone());
             actions.push(DoorbellAction::Audit {
                 kind: match fold {
                     Queued::Fresh => "deferred",
@@ -1677,6 +1700,63 @@ mod tests {
             .filter(|a| matches!(a, DoorbellAction::Prompt { .. }))
             .count();
         assert_eq!(rings, 1, "ONE ring, not two: {drained:?}");
+    }
+
+    /// bd-x3pqw review: two DIFFERENT captain briefs render the same generic
+    /// line, so an id-bearing producer must not fold onto the core — otherwise
+    /// the ring under-counts what it carries. The id-less CLI handoff still
+    /// folds onto the text it names.
+    #[test]
+    fn two_briefs_of_one_rendering_stay_two_wakes() {
+        let model = working_model("BlueRidge");
+        let brief = |id: &str| {
+            serde_json::json!({
+                "id": id,
+                "subject": "crew prompt",
+                "sender": "SlateHarbor",
+                "importance": "normal",
+            })
+        };
+        let (next, _) = tick(
+            &model,
+            &DoorbellMsg::InboxRows {
+                rows: vec![brief("aaa1")],
+                pin: "BlueRidge".into(),
+            },
+        );
+        let (next, _) = tick(
+            &next,
+            &DoorbellMsg::InboxRows {
+                rows: vec![brief("bbb2")],
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert_eq!(
+            next.queues.get("BlueRidge").map(Vec::len),
+            Some(1),
+            "one class entry"
+        );
+        assert_eq!(
+            next.queues["BlueRidge"][0].count, 2,
+            "two distinct briefs are two messages: the ring must say +1, not hide one"
+        );
+
+        // The CLI's handoff for ONE of them has no id: it folds onto the text.
+        let (next, actions) = tick(
+            &next,
+            &DoorbellMsg::PromptRefused {
+                pin: "BlueRidge".into(),
+                line: "[doorbell] plane-P mail. Pull: toron next".into(),
+            },
+        );
+        assert!(
+            matches!(&actions[0], DoorbellAction::Audit { kind, .. } if kind == "dedup"),
+            "the CLI's second producer folds onto the mail already queued: {actions:?}"
+        );
+        assert_eq!(
+            next.queues["BlueRidge"][0].count, 2,
+            "and it does not become a third wake"
+        );
     }
 
     /// The watermark is transport decoration: two different directives that

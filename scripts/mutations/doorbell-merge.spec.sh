@@ -37,8 +37,14 @@ mutation "W3  a peer line outranks the captain brief" \
 mutation "W6  the two producers of one directive are not deduped" \
     file=$CORE \
     expect=one_directive_rings_once_through_two_producers \
-    find='    if let Some(w) = queue.iter_mut().find(|w| !key.is_empty() && w.key == key) {' \
-    replace='    if let Some(w) = queue.iter_mut().find(|_w| false && !key.is_empty()) {'
+    find='    if let Some(at) = duplicate {' \
+    replace='    if let Some(at) = None::<usize> {'
+
+mutation "W8  an identified brief folds onto another brief's text" \
+    file=$CORE \
+    expect=two_briefs_of_one_rendering_stay_two_wakes \
+    find='            !w.key.is_empty() && w.key == key' \
+    replace='            w.core == core'
 
 mutation "W7  the watermark makes two renderings of one message distinct" \
     file=$CORE \
