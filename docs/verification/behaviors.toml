@@ -125,14 +125,13 @@ mutations = ["scripts/mutations/mail-wake.spec.sh#W1"]
 [[behavior]]
 id = "comms.envelope-send"
 owner = "src/comms_send.rs"
-status = "pending"
-missing = "a runnable mutation for the retry/msg-id shape (a_retry_resends_the_recorded_msg_id_and_never_mints_twice has no spec yet)"
+status = "proven"
 concurrent = false
 tests = [
   "src/comms_send.rs::a_retry_resends_the_recorded_msg_id_and_never_mints_twice",
   "src/comms_send.rs::task_envelope_is_npub_addressed_and_valid",
 ]
-mutations = []
+mutations = ["scripts/mutations/comms-envelope-send.spec.sh#E1"]
 
 [[behavior]]
 id = "inbox-host.restart-budget"
