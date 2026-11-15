@@ -33,11 +33,30 @@ mutation "L2  the resolver accepts a directory outside the workspace root" \
 mutation "L3  a receipt with no mutation witnesses lands" \
     file=$SHIP \
     expect=a_receipt_without_mutation_witnesses_cannot_land \
-    find='        Some(Value::Array(rows)) if !rows.is_empty() => rows,' \
-    replace='        Some(Value::Array(rows)) if true => rows,'
+    find='    if rows_opt.map_or(true, Vec::is_empty) {' \
+    replace='    if false {'
 
 mutation "L4  a mutation that stayed green still lands" \
     file=$SHIP \
     expect=a_receipt_without_mutation_witnesses_cannot_land \
     find='        if verdict != want {' \
     replace='        if false {'
+
+mutation "L5  the receipt is not bound to the landed sha" \
+    file=$SHIP \
+    expect=a_receipt_is_bound_to_the_commit_it_proved \
+    find='    if proved != sha {' \
+    replace='    if false {'
+
+mutation "L6  an empty mutation set lands without re-deriving the targets" \
+    file=$SHIP \
+    expect=a_receipt_is_bound_to_the_commit_it_proved \
+    find='        if let Some(path) = changed.iter().find(|p| spec_targets_include(root, p)) {' \
+    replace='        if let Some(path) = changed.iter().find(|_p| false) {'
+
+mutation "L7  a dirty-tree receipt lands a commit" \
+    file=$SHIP \
+    expect=a_receipt_is_bound_to_the_commit_it_proved \
+    find='    if doc.get("mode").and_then(Value::as_str) == Some("dirty") {' \
+    replace='    if false {'
+

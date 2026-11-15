@@ -437,7 +437,54 @@ fn land_project(cfg: &Config, dir: &Path, explicit: Option<&str>) -> Result<Stri
 /// (RED for a live guard, GREEN for a guard believed dead), and every row's
 /// `<spec>#<id>` must still resolve in `scripts/mutations/<spec>` so a receipt
 /// cannot cite a mutation the tree no longer has.
-fn receipt_is_landable(root: &Path, receipt: &Path) -> Result<()> {
+/// Does any mutation spec target this production file? Re-derived at landing
+/// time from the specs themselves, so a receipt cannot claim "nothing to
+/// re-prove" about a file a spec actually covers.
+fn spec_targets_include(root: &Path, path: &str) -> bool {
+    let harness = root.join("scripts/verify-mutations.sh");
+    if !harness.is_file() {
+        // No harness to re-derive with: assume the path IS covered, so a
+        // missing tool can only make a landing stricter, never skip a witness.
+        return true;
+    }
+    let Ok(entries) = std::fs::read_dir(root.join("scripts/mutations")) else {
+        return false;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let spec = entry.path();
+        if spec.extension().and_then(|e| e.to_str()) != Some("sh") {
+            continue;
+        }
+        let Ok(out) = Command::new("bash")
+            .arg("scripts/verify-mutations.sh")
+            .arg("--list")
+            .arg(&spec)
+            .current_dir(root)
+            .output()
+        else {
+            continue;
+        };
+        for row in String::from_utf8_lossy(&out.stdout).lines() {
+            if row.rsplit('\t').next() == Some(path) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Is `rev` a commit in this repo?
+fn base_is_a_commit(root: &Path, rev: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["cat-file", "-e", &format!("{rev}^{{commit}}")])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn receipt_is_landable(root: &Path, receipt: &Path, sha: &str) -> Result<()> {
     let raw = std::fs::read_to_string(receipt)
         .map_err(|e| anyhow!("proof receipt unreadable: {}: {e}", receipt.display()))?;
     let doc: Value = serde_json::from_str(&raw)
@@ -451,13 +498,58 @@ fn receipt_is_landable(root: &Path, receipt: &Path) -> Result<()> {
                 .unwrap_or("?")
         );
     }
-    let rows = match doc.get("mutations") {
-        Some(Value::Array(rows)) if !rows.is_empty() => rows,
-        _ => bail!(
-            "proof receipt carries no mutation run: {} — run `scripts/clean-proof.sh --sha <rev> \
-             --mutations changed` (or --mutations full), never a bare proof",
+    // The receipt proves ONE tree. A green receipt for another commit (or for a
+    // dirty tree, a temporary commit nobody can check out) says nothing about
+    // the sha being landed.
+    let proved = doc.get("sha").and_then(Value::as_str).unwrap_or("");
+    if proved != sha {
+        bail!(
+            "proof receipt proves {proved}, not {sha}: {} — re-prove this commit \
+             (`scripts/clean-proof.sh --sha {sha} --mutations changed`)",
             receipt.display()
-        ),
+        );
+    }
+    if doc.get("mode").and_then(Value::as_str) == Some("dirty") {
+        bail!(
+            "proof receipt is for a dirty tree, not a commit: {} — land only a --sha proof",
+            receipt.display()
+        );
+    }
+    let rows_opt = doc.get("mutations").and_then(Value::as_array);
+    if rows_opt.map_or(true, Vec::is_empty) {
+        // An empty set lands only when the diff provably touched no spec
+        // target: changed mode, a base that resolves, and a changed-path list
+        // re-derived here rather than trusted.
+        let mode = doc.get("mutations_mode").and_then(Value::as_str);
+        let base = doc
+            .get("mutations_base")
+            .and_then(Value::as_str)
+            .filter(|b| !b.is_empty());
+        let changed: Vec<&str> = doc
+            .get("changed_paths")
+            .and_then(Value::as_array)
+            .map(|rows| rows.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let (Some("changed"), Some(base)) = (mode, base) else {
+            bail!(
+                "proof receipt carries no mutation run: {} — a landing needs witnesses \
+                 (`--mutations changed` with a [mutations] base, or `--mutations full`)",
+                receipt.display()
+            );
+        };
+        if !base_is_a_commit(root, base) {
+            bail!("proof receipt cites mutations_base {base}, which is not a commit here");
+        }
+        if let Some(path) = changed.iter().find(|p| spec_targets_include(root, p)) {
+            bail!(
+                "proof receipt ran no mutation but {path} is a spec target — re-prove with \
+                 `--mutations changed` (its base is too new) or `--mutations full`"
+            );
+        }
+        return Ok(());
+    }
+    let Some(rows) = rows_opt else {
+        return Ok(());
     };
     for row in rows {
         if let Some(text) = row.as_str() {
@@ -516,7 +608,7 @@ fn ship_land(args: LandArgs<'_>) -> Result<()> {
         Some(d) => d.to_path_buf(),
         None => std::env::current_dir().map_err(|err| anyhow!("current directory: {err}"))?,
     };
-    receipt_is_landable(&dir, receipt)?;
+    receipt_is_landable(&dir, receipt, sha)?;
     git(&dir, &["rev-parse", "--git-dir"])?;
     let cited = git(&dir, &["log", "--format=%B", "-n", "1", sha])?;
     if !cited.contains(bead) {
@@ -723,11 +815,12 @@ mod tests {
     /// still resolves. A green proof with no witnesses is not a proof.
     #[test]
     fn a_receipt_without_mutation_witnesses_cannot_land() {
+        const SHA: &str = "c0000000000000000000000000000000000000000";
         let repo = tempfile::tempdir().expect("repo");
         std::fs::create_dir_all(repo.path().join("scripts/mutations")).unwrap();
         std::fs::write(
             repo.path().join("scripts/mutations/demo.spec.sh"),
-            "mutation \"D1  a decision\" \\\n    file=src/x.rs \\\n    expect=a_test\n",
+            "mutation \"D1  a decision\" \\\n    file=src/x.rs \\\n    find='a' \\\n    replace='b' \\\n    expect=a_test\n",
         )
         .unwrap();
         let receipt = |body: &str| {
@@ -742,29 +835,34 @@ mod tests {
         };
         let doc = |ok: bool, rows: &[String]| {
             format!(
-                r#"{{"schema":"flywheel-clean-proof.v1","ok":{ok},"failed_step":null,"mutations":[{rows}]}}"#,
+                r#"{{"schema":"flywheel-clean-proof.v1","ok":{ok},"failed_step":null,"sha":"{SHA}","mode":"sha","mutations_mode":null,"mutations_base":null,"changed_paths":[],"mutations":[{rows}]}}"#,
                 rows = rows.join(",")
             )
         };
 
         let none = receipt(&doc(true, &[]));
-        let err = format!("{:#}", receipt_is_landable(repo.path(), &none).unwrap_err());
+        let err = format!(
+            "{:#}",
+            receipt_is_landable(repo.path(), &none, SHA).unwrap_err()
+        );
         assert!(
             err.contains("no mutation run"),
             "an empty mutation list is refused: {err}"
         );
 
-        let legacy = receipt(r#"{"ok":true,"mutations":["src/x.rs:t:expect=RED:got=RED"]}"#);
+        let legacy = receipt(&format!(
+            r#"{{"ok":true,"sha":"{SHA}","mode":"sha","mutations":["src/x.rs:t:expect=RED:got=RED"]}}"#
+        ));
         let err = format!(
             "{:#}",
-            receipt_is_landable(repo.path(), &legacy).unwrap_err()
+            receipt_is_landable(repo.path(), &legacy, SHA).unwrap_err()
         );
         assert!(err.contains("legacy mutation row"), "{err}");
 
         let red_is_green = receipt(&doc(true, &[row("demo.spec.sh", "D1", "GREEN", false)]));
         let err = format!(
             "{:#}",
-            receipt_is_landable(repo.path(), &red_is_green).unwrap_err()
+            receipt_is_landable(repo.path(), &red_is_green, SHA).unwrap_err()
         );
         assert!(
             err.contains("proved GREEN, expected RED"),
@@ -774,7 +872,7 @@ mod tests {
         let dangling = receipt(&doc(true, &[row("demo.spec.sh", "D9", "RED", false)]));
         let err = format!(
             "{:#}",
-            receipt_is_landable(repo.path(), &dangling).unwrap_err()
+            receipt_is_landable(repo.path(), &dangling, SHA).unwrap_err()
         );
         assert!(
             err.contains("no longer declares"),
@@ -784,16 +882,131 @@ mod tests {
         let not_green = receipt(&doc(false, &[row("demo.spec.sh", "D1", "RED", false)]));
         let err = format!(
             "{:#}",
-            receipt_is_landable(repo.path(), &not_green).unwrap_err()
+            receipt_is_landable(repo.path(), &not_green, SHA).unwrap_err()
         );
         assert!(err.contains("not green"), "{err}");
 
         let good = receipt(&doc(true, &[row("demo.spec.sh", "D1", "RED", false)]));
-        receipt_is_landable(repo.path(), &good).expect("a proving receipt lands");
+        receipt_is_landable(repo.path(), &good, SHA).expect("a proving receipt lands");
 
         // A guard expected dead is the other way round and is not a failure.
         let dead = receipt(&doc(true, &[row("demo.spec.sh", "D1", "GREEN", true)]));
-        receipt_is_landable(repo.path(), &dead).expect("a dead-guard witness lands");
+        receipt_is_landable(repo.path(), &dead, SHA).expect("a dead-guard witness lands");
+    }
+
+    /// bd-m5afp review (captain re-verify): the receipt must prove the commit
+    /// being landed, never a different tree, and an empty mutation set may land
+    /// only when the diff provably touched no spec target.
+    #[test]
+    fn a_receipt_is_bound_to_the_commit_it_proved() {
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join("scripts/mutations")).unwrap();
+        std::fs::write(
+            repo.path().join("scripts/mutations/demo.spec.sh"),
+            "mutation \"D1  a decision\" \\\n    file=src/x.rs \\\n    find='a' \\\n    replace='b' \\\n    expect=a_test\n",
+        )
+        .unwrap();
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/verify-mutations.sh"),
+            repo.path().join("scripts/verify-mutations.sh"),
+        )
+        .expect("the land gate re-derives targets with the real harness");
+        // A real commit so the mutations_base arm can resolve.
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "T"],
+            vec!["commit", "-q", "--allow-empty", "-m", "base"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .current_dir(repo.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let base = String::from_utf8(
+            Command::new("git")
+                .current_dir(repo.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let receipt = |body: &str| {
+            let path = repo.path().join("receipt.json");
+            std::fs::write(&path, body).unwrap();
+            path
+        };
+        let sha = "a".repeat(40);
+        let other = "b".repeat(40);
+
+        let wrong_tree = receipt(&format!(
+            r#"{{"ok":true,"sha":"{other}","mode":"sha","mutations":[{{"spec":"demo.spec.sh","id":"D1","expect_test":"a_test","expect_green":false,"verdict":"RED"}}]}}"#
+        ));
+        let err = format!(
+            "{:#}",
+            receipt_is_landable(repo.path(), &wrong_tree, &sha).unwrap_err()
+        );
+        assert!(
+            err.contains("proves") && err.contains(&other[..7]),
+            "a receipt for another commit is refused: {err}"
+        );
+
+        let dirty = receipt(&format!(
+            r#"{{"ok":true,"sha":"{sha}","mode":"dirty","mutations":[{{"spec":"demo.spec.sh","id":"D1","expect_test":"a_test","expect_green":false,"verdict":"RED"}}]}}"#
+        ));
+        let err = format!(
+            "{:#}",
+            receipt_is_landable(repo.path(), &dirty, &sha).unwrap_err()
+        );
+        assert!(err.contains("dirty tree"), "{err}");
+
+        // Empty set, changed mode, real base, and NO changed path is a spec
+        // target: the "docs-only landing" case, which must land.
+        let docs_only = receipt(&format!(
+            r#"{{"ok":true,"sha":"{sha}","mode":"sha","mutations":[],"mutations_mode":"changed","mutations_base":"{base}","changed_paths":["docs/guide.mdx","src/uncovered.rs"]}}"#
+        ));
+        receipt_is_landable(repo.path(), &docs_only, &sha)
+            .expect("a diff that touches no spec target may land");
+
+        // Same shape, but one changed path IS a spec target.
+        let covered = receipt(&format!(
+            r#"{{"ok":true,"sha":"{sha}","mode":"sha","mutations":[],"mutations_mode":"changed","mutations_base":"{base}","changed_paths":["src/x.rs"]}}"#
+        ));
+        let err = format!(
+            "{:#}",
+            receipt_is_landable(repo.path(), &covered, &sha).unwrap_err()
+        );
+        assert!(
+            err.contains("is a spec target"),
+            "an uncovered-looking receipt cannot skip a covered file: {err}"
+        );
+
+        // No mode at all (a bare proof) still refuses.
+        let bare = receipt(&format!(
+            r#"{{"ok":true,"sha":"{sha}","mode":"sha","mutations":[]}}"#
+        ));
+        let err = format!(
+            "{:#}",
+            receipt_is_landable(repo.path(), &bare, &sha).unwrap_err()
+        );
+        assert!(err.contains("no mutation run"), "{err}");
+
+        // A base that is not a commit cannot vouch for an empty set.
+        let bogus_base = receipt(&format!(
+            r#"{{"ok":true,"sha":"{sha}","mode":"sha","mutations":[],"mutations_mode":"changed","mutations_base":"not-a-commit","changed_paths":["docs/guide.mdx"]}}"#
+        ));
+        let err = format!(
+            "{:#}",
+            receipt_is_landable(repo.path(), &bogus_base, &sha).unwrap_err()
+        );
+        assert!(err.contains("not a commit here"), "{err}");
     }
 
     #[test]

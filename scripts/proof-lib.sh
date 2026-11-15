@@ -115,6 +115,15 @@ if mid and os.path.exists(mid):
                 mutations.append(json.loads(line))
             except ValueError:
                 mutations.append(line)
+
+# How the mutation set was chosen, so a landing can tell "nothing to re-prove"
+# (changed, base known, no spec target touched) from "nobody asked for a proof"
+# (none) and from "a full run covered everything". `changed_paths` is the diff
+# the selection was made from; the landing re-derives the target match itself
+# rather than trusting this list.
+mutations_mode = os.environ.get("PROOF_MUTATIONS_MODE") or None
+mutations_base = os.environ.get("PROOF_MUTATIONS_BASE") or None
+changed_paths = lines("PROOF_CHANGED_PATHS")
 receipt = {
     "schema": "flywheel-clean-proof.v1",
     "ok": os.environ["PROOF_OK"] == "0",
@@ -125,7 +134,10 @@ receipt = {
     "steps": steps,
     "failed_step": os.environ.get("PROOF_FAILED") or None,
     "siblings": siblings,
-    "mutations": mutations or "none",
+    "mutations": mutations,
+    "mutations_mode": mutations_mode,
+    "mutations_base": mutations_base,
+    "changed_paths": changed_paths,
     "logs": os.environ.get("PROOF_TMP"),
 }
 path = os.environ["PROOF_RECEIPT"]

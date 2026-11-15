@@ -180,7 +180,10 @@ load_spec() {
     if [ -z "${CARGO_ARGS+set}" ]; then
         CARGO_ARGS=(-p flywheel --lib)
     fi
-    [ -n "${TEST_FILTER+set}" ] || {
+    # --list executes nothing, so the filter requirement does not apply: a
+    # caller scoping a run by diff must be able to ask what a spec targets
+    # without the spec having to be runnable yet.
+    [ "${LIST_ONLY:-0}" = 1 ] || [ -n "${TEST_FILTER+set}" ] || {
         echo "the spec needs TEST_FILTER: a mutation with no filter runs the whole" >&2
         echo "suite once per mutation, which is how a run turns into hours" >&2
         exit 2

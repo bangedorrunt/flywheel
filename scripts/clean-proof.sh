@@ -37,6 +37,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 KEEP=0
 MUTATIONS_MODE=""
+RECEIPT_MUTATIONS_BASE=""
+RECEIPT_CHANGED_PATHS=""
 MODE="dirty"
 TARGET_REV=""
 RECEIPT=""
@@ -186,14 +188,21 @@ MUTATION_RECORDS=""
 # landing that skips proofs silently is worse than a slow one.
 if [ -n "$MUTATIONS_MODE" ] && [ -z "$FAILED_STEP" ]; then
   mut_base=""
-  [ "$MUTATIONS_MODE" = changed ] && mut_base="$(proof_mutation_base "$ROOT")"
+  mut_scoped=0
   mut_changed=""
-  if [ -n "$mut_base" ] && git -C "$ROOT" cat-file -e "${mut_base}^{commit}" 2>/dev/null; then
-    mut_changed="$(git -C "$ROOT" diff --name-only "$mut_base..$PROVEN_SHA" || true)"
-    echo "clean-proof: mutations since $mut_base ($(printf '%s\n' "$mut_changed" | grep -c .) path(s))"
-  elif [ "$MUTATIONS_MODE" = changed ]; then
-    echo "clean-proof: no [mutations] base in proof.toml — running every spec"
+  if [ "$MUTATIONS_MODE" = changed ]; then
+    mut_base="$(proof_mutation_base "$ROOT")"
+    if [ -n "$mut_base" ] && git -C "$ROOT" cat-file -e "${mut_base}^{commit}" 2>/dev/null; then
+      mut_scoped=1
+      mut_changed="$(git -C "$ROOT" diff --name-only "$mut_base..$PROVEN_SHA" || true)"
+      echo "clean-proof: mutations since $mut_base ($(printf '%s\n' "$mut_changed" | grep -c .) path(s))"
+    else
+      mut_base=""
+      echo "clean-proof: no [mutations] base in proof.toml — running every spec"
+    fi
   fi
+  RECEIPT_MUTATIONS_BASE="$mut_base"
+  RECEIPT_CHANGED_PATHS="$mut_changed"
   wrapper="$TMP/mbx-wrapper"
   {
     printf '#!/usr/bin/env bash\nexec'
@@ -205,7 +214,7 @@ if [ -n "$MUTATIONS_MODE" ] && [ -z "$FAILED_STEP" ]; then
   mut_failed=0
   for spec in scripts/mutations/*.spec.sh; do
     [ -f "$spec" ] || continue
-    if [ -n "$mut_changed" ]; then
+    if [ "$mut_scoped" -eq 1 ]; then
       hit=""
       while IFS=$'\t' read -r _id target; do
         if printf '%s\n' "$mut_changed" | grep -qxF -- "$target"; then
@@ -303,6 +312,9 @@ OK=0
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 [ -n "$RECEIPT" ] || RECEIPT="${TMPDIR:-/tmp}/clean-proof/${SHORT}-${STAMP}.json"
 mkdir -p "$(dirname "$RECEIPT")"
+PROOF_MUTATIONS_MODE="$MUTATIONS_MODE" \
+PROOF_MUTATIONS_BASE="$RECEIPT_MUTATIONS_BASE" \
+PROOF_CHANGED_PATHS="$RECEIPT_CHANGED_PATHS" \
 proof_write_receipt "$RECEIPT" "$OK" "$PROVEN_SHA" "$SHORT" "$STAMP" "$MODE" "$TMP" \
   "$FAILED_STEP" "$STEP_NAMES" "$STEP_STATUSES" "$SIBLING_RECORDS" "$MUTATION_RECORDS_FILE"
 
