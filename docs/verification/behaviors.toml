@@ -137,31 +137,29 @@ mutations = []
 [[behavior]]
 id = "inbox-host.restart-budget"
 owner = "src/inbox_host.rs"
-status = "pending"
-missing = "a runnable mutation for the restart/budget path (a_restart_does_not_refresh_the_ring_budget and the restored-binding cases have no spec yet)"
+status = "proven"
 concurrent = false
 tests = [
   "src/inbox_host.rs::a_restart_does_not_refresh_the_ring_budget",
   "src/inbox_host.rs::a_restored_binding_rings_only_after_it_is_reverified",
 ]
-mutations = []
+mutations = ["scripts/mutations/inbox-host.spec.sh#I1"]
 
 [[behavior]]
 id = "doorbell-host.presence-bridge"
 owner = "src/doorbell_host.rs"
-status = "pending"
-missing = "a runnable mutation for the cross-session binding map (a_bound_block_without_a_spawn_row_still_maps_to_its_pin has no spec yet)"
+status = "proven"
 concurrent = false
 tests = [
   "src/doorbell_host.rs::a_bound_block_without_a_spawn_row_still_maps_to_its_pin",
 ]
-mutations = []
+mutations = ["scripts/mutations/doorbell-host.spec.sh#H1"]
 
 [[behavior]]
 id = "stuck-vs-busy.evidence"
 owner = "src/stuck_vs_busy.rs"
 status = "pending"
-missing = "a runnable mutation for the ratio evidence (both_yes_is_a_contradiction_and_is_not_resolved_by_picking_a_side has no spec yet)"
+missing = "mutation scripts/mutations/stuck-vs-busy.spec.sh#B1 declared but NEEDLE-MISS in harness (multi-line find); needs exact match fixed and RED shown"
 concurrent = false
 tests = [
   "src/stuck_vs_busy.rs::both_yes_is_a_contradiction_and_is_not_resolved_by_picking_a_side",
@@ -172,13 +170,12 @@ mutations = []
 [[behavior]]
 id = "recipient-guard.explicit-npub"
 owner = "src/recipient_guard.rs"
-status = "pending"
-missing = "only one unit test in the module and no runnable mutation yet"
+status = "proven"
 concurrent = false
 tests = [
   "src/recipient_guard.rs::divergent_pin_send_refuses",
 ]
-mutations = []
+mutations = ["scripts/mutations/recipient-guard.spec.sh#R1"]
 
 [[behavior]]
 id = "doorbell-tick.edge-fold"
