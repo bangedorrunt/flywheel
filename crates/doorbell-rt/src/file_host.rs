@@ -123,12 +123,6 @@ pub(crate) fn failing_still_row(
     })
 }
 
-/// PlaneStatus changes the sweep could not enqueue on a full or closed brain
-/// channel. Counted per host (self.hc advances only on receipt, so drops
-/// self-heal next sweep); audited sampled via should_audit_count, the same
-/// repeat-is-a-count shape as wake_brain_full.
-pub const AUDIT_PLANE_FULL: &str = "plane_brain_full";
-
 /// A consumer death relayed to the brain, counted so a STORM reads as a rate.
 ///
 /// The relay used to be the quietest place in the process: one death in, one
@@ -980,7 +974,6 @@ pub struct FileHost {
     /// PlaneStatus sends dropped on a full or closed brain channel, this host.
     /// Host-wide like died_relayed: the sweep recomputes `changed` every tick,
     /// so the count survives across sweeps by construction.
-    plane_dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// mcc9: exact wake → brain counters for this workspace, shared by every
     /// consumer this host arms (see [`crate::wake_brain`]).
     wake_counters: std::sync::Arc<crate::wake_brain::WakeBrainCounters>,
@@ -1064,7 +1057,6 @@ impl FileHost {
             restart_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             absent_rows: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             died_relayed: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            plane_dropped: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_counters,
             wake_resume: std::sync::Arc::new(std::sync::Mutex::new(None)),
             daemon_exe,
@@ -1488,14 +1480,6 @@ impl FileHost {
                 pins.contains(pin) && now.saturating_sub(*ts) < PRESENCE_FRESH_SECS
             })
             .map(|(pin, (_, state))| (pin, state))
-            .collect()
-    }
-
-    /// hc statuses joined to pins: `{pane_id: status}` -> `{pin: status}`.
-    fn poll_plane(&self) -> BTreeMap<String, String> {
-        plane_agent_statuses(&self.cfg.plane_bin)
-            .into_iter()
-            .filter_map(|(pane, status)| self.panes.get(&pane).map(|pin| (pin.clone(), status)))
             .collect()
     }
 
@@ -2138,46 +2122,15 @@ impl Host for FileHost {
         self.hc.get(pin).cloned()
     }
 
+    /// Presence rows only. The plane-status source this sweep used to read
+    /// shelled `hc agent list`, which the installed hc does not implement, so
+    /// it returned nothing and every sweep silently published no status at all
+    /// (bd-0uzrq.17). The embedded host owns plane status now, through the one
+    /// detector every other reader uses (`block_state` via `agent_list`).
     fn sweep_maintenance(&mut self) -> Vec<(String, String)> {
         self.refresh_index();
-        let current = self.poll_plane();
-        let mut changed: Vec<(String, String)> = current
-            .iter()
-            .filter(|(pin, st)| self.hc.get(*pin) != Some(*st))
-            .map(|(p, s)| (p.clone(), s.clone()))
-            .collect();
-        changed.sort();
         let now = Self::now_unix();
-        let rows = self.presence_rows(&self.index_pins, now);
-        if let Some(tx) = &self.tx {
-            for (pin, status) in &changed {
-                match tx.try_send(BrainMsg::PlaneStatus {
-                    pin: pin.clone(),
-                    status: status.clone(),
-                }) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        let closed = matches!(e, tokio::sync::mpsc::error::TrySendError::Closed(_));
-                        let prior = self
-                            .plane_dropped
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        if should_audit_count(prior) {
-                            Self::append_audit_row(
-                                &self.cfg.flywheel_state,
-                                &self.cfg.workspace,
-                                AUDIT_PLANE_FULL,
-                                serde_json::json!({
-                                    "reason": "hc status change could not be enqueued (brain channel full or closed); next sweep retries",
-                                    "dropped": prior + 1,
-                                    "closed": closed,
-                                }),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        rows
+        self.presence_rows(&self.index_pins, now)
     }
 
     fn drain_role_bounds(&mut self) -> Vec<(String, String)> {
@@ -3376,51 +3329,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The daemon-hosted Brain runs the `Host` on ITS OWN tokio runtime, so
-    /// the sweep path must never use `Sender::blocking_send`: it panics
-    /// ("Cannot block the current thread from within a runtime"), the sweep
-    /// task dies on the first hc status change, and the hosted workspace
-    /// goes ring-deaf while `/health` still says `mode=hosted` (only the
-    /// climbing `sweep.last_age_s` and a frozen journal show it).
-    #[test]
-    fn sweep_forwards_status_changes_without_blocking_a_runtime() {
-        let dir = tmp_state("sweep-runtime");
-        let script = dir.join("hc");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\necho '{\"result\":{\"agents\":[{\"pane_id\":\"pane-a\",\"agent_status\":\"working\"}]}}'\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
-        }
-        std::fs::write(
-            dir.join("agents").join("proj.json"),
-            serde_json::to_string(&entries()).unwrap(),
-        )
-        .unwrap();
-        let mut cfg = FileHostConfig::new(dir.clone(), "proj", "w");
-        cfg.toron_bin = "true".into();
-        cfg.plane_bin = script.to_string_lossy().into_owned();
-        cfg.registry_file = Some(dir.join("agents").join("proj.json"));
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let mut host = FileHost::new(cfg).with_tx(tx);
-        host.refresh_index();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let _ = host.sweep_maintenance();
-        });
-        assert!(
-            rx.try_recv().is_ok(),
-            "the hc status change must reach the brain channel"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     /// bd-68q2: the still-failing digest names the rate, the fd census, and
     /// the backoff — one row per power-of-two fails, decided by the caller.
@@ -3446,108 +3354,7 @@ mod tests {
         );
     }
 
-    /// bd-jqjh: a full brain channel must not silently drop PlaneStatus.
-    /// The drop self-heals (self.hc advances only on receipt, so the next
-    /// sweep retries) — but the rate has to be countable and sampled-audited,
-    /// same shape as wake_brain_full. Fence: no `let _ =` on this send.
-    #[test]
-    fn sweep_full_channel_counts_plane_drops_and_audits_sampled() {
-        let dir = tmp_state("sweep-full");
-        let script = dir.join("hc");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\necho '{\"result\":{\"agents\":[{\"pane_id\":\"pane-a\",\"agent_status\":\"working\"}]}}'\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
-        }
-        std::fs::write(
-            dir.join("agents").join("proj.json"),
-            serde_json::to_string(&entries()).unwrap(),
-        )
-        .unwrap();
-        let mut cfg = FileHostConfig::new(dir.clone(), "proj", "w");
-        cfg.toron_bin = "true".into();
-        cfg.plane_bin = script.to_string_lossy().into_owned();
-        cfg.registry_file = Some(dir.join("agents").join("proj.json"));
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        tx.try_send(BrainMsg::Died).unwrap();
-        let mut host = FileHost::new(cfg).with_tx(tx);
-        host.refresh_index();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            for _ in 0..4 {
-                let _ = host.sweep_maintenance();
-            }
-        });
-        assert_eq!(
-            host.plane_dropped.load(std::sync::atomic::Ordering::SeqCst),
-            4,
-            "every Full send must be counted"
-        );
-        assert!(matches!(rx.try_recv(), Ok(BrainMsg::Died)));
-        let body = std::fs::read_to_string(dir.join("doorbell").join("w.audit.jsonl")).unwrap();
-        let rows = body.matches(AUDIT_PLANE_FULL).count();
-        assert_eq!(
-            rows, 3,
-            "sampled audit: priors 0,1,2 row, prior 3 counts only, got: {body}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
-    /// bd-jqjh: a closed brain channel (brain gone) counts too, flagged closed.
-    #[test]
-    fn sweep_closed_channel_counts_plane_drop_as_closed() {
-        let dir = tmp_state("sweep-closed");
-        let script = dir.join("hc");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\necho '{\"result\":{\"agents\":[{\"pane_id\":\"pane-a\",\"agent_status\":\"working\"}]}}'\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
-        }
-        std::fs::write(
-            dir.join("agents").join("proj.json"),
-            serde_json::to_string(&entries()).unwrap(),
-        )
-        .unwrap();
-        let mut cfg = FileHostConfig::new(dir.clone(), "proj", "w");
-        cfg.toron_bin = "true".into();
-        cfg.plane_bin = script.to_string_lossy().into_owned();
-        cfg.registry_file = Some(dir.join("agents").join("proj.json"));
-        let (tx, rx) = tokio::sync::mpsc::channel(4);
-        drop(rx);
-        let mut host = FileHost::new(cfg).with_tx(tx);
-        host.refresh_index();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let _ = host.sweep_maintenance();
-        });
-        assert_eq!(
-            host.plane_dropped.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "the Closed send must be counted"
-        );
-        let body = std::fs::read_to_string(dir.join("doorbell").join("w.audit.jsonl")).unwrap();
-        assert!(
-            body.contains(AUDIT_PLANE_FULL) && body.contains("\"closed\":true"),
-            "the drop must be audited and flagged closed, got: {body}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     /// bd-jqjh: the audit door itself failing must be countable, not `let _`.
     /// A FILE where the state dir should be fails mkdir with ENOTDIR for any

@@ -414,6 +414,12 @@ impl RtHost {
         let cfg = self.cfg.clone();
         let project = self.project.clone();
         std::thread::spawn(move || {
+            // Transitions only: the brain channel is bounded and every repeated
+            // row is one more stale status the fold must chew through. Live
+            // (bd-0uzrq.17, 14:49-14:52Z) the unconditional republication kept
+            // an idle pane reported `working` for minutes, so its queued wake
+            // never drained.
+            let mut last: HashMap<String, String> = HashMap::new();
             loop {
                 std::thread::sleep(Duration::from_secs(3));
                 let Ok(backend) = crate::backend::factory::multiplexer_backend(&cfg) else {
@@ -433,13 +439,35 @@ impl RtHost {
                 let pane_ids: Vec<String> = agents.iter().map(|a| a.pane_id.clone()).collect();
                 RtHost::extend_with_pane_bindings(&cfg, &project, &mut pin_by_pane, &pane_ids);
                 let (updates, _) = RtHost::presence_updates_for(&agents, &pin_by_pane);
-                for msg in updates {
+                for msg in RtHost::changed_statuses(&mut last, updates) {
                     if tx.blocking_send(msg).is_err() {
                         return;
                     }
                 }
             }
         });
+    }
+
+    /// Keep only the statuses that differ from the last cycle's, recording the
+    /// new ones. The plane source is already the one detector `block_state`;
+    /// what the fold must not receive is the same answer again and again.
+    fn changed_statuses(
+        last: &mut HashMap<String, String>,
+        updates: Vec<BrainMsg>,
+    ) -> Vec<BrainMsg> {
+        updates
+            .into_iter()
+            .filter(|msg| match msg {
+                BrainMsg::PlaneStatus { pin, status } => match last.get(pin) {
+                    Some(prev) if prev == status => false,
+                    _ => {
+                        last.insert(pin.clone(), status.clone());
+                        true
+                    }
+                },
+                _ => true,
+            })
+            .collect()
     }
 
     /// Advisory reservation-conflict digest: read the same board the reserve
@@ -2075,6 +2103,49 @@ mod presence_producer_tests {
         let (updates, unmapped) = RtHost::presence_updates_for(&agents, &pin_map());
         assert_eq!(updates.len(), 1, "only the mapped pin emits");
         assert_eq!(unmapped, vec!["pane-ghost".to_string()]);
+    }
+
+    /// bd-0uzrq.17: the poll used to forward every pin every cycle, so a
+    /// bounded brain channel carried a backlog of stale statuses — an idle pane
+    /// was rung as `working` for minutes and its deferred wake never drained
+    /// (live 14:49-14:52Z). Transitions only: the first answer, the idle flip,
+    /// and nothing in between. The drain on that one idle flip is fenced by
+    /// `a_busy_crew_prompt_rings_once_at_the_next_prompt`.
+    #[test]
+    fn only_a_status_change_reaches_the_brain() {
+        let mut last = HashMap::new();
+        let status = |st: AgentStatus| {
+            RtHost::presence_updates_for(&[row("pane-idle", st)], &pin_map()).0
+        };
+
+        let first = RtHost::changed_statuses(&mut last, status(AgentStatus::Working));
+        assert_eq!(first.len(), 1, "the first answer is news: {first:?}");
+
+        for _ in 0..3 {
+            let repeat = RtHost::changed_statuses(&mut last, status(AgentStatus::Working));
+            assert!(
+                repeat.is_empty(),
+                "a repeated working row is a stale row: {repeat:?}"
+            );
+        }
+
+        let idle = RtHost::changed_statuses(&mut last, status(AgentStatus::Idle));
+        assert_eq!(idle.len(), 1, "the idle flip must reach the fold: {idle:?}");
+        match &idle[0] {
+            BrainMsg::PlaneStatus { pin, status } => {
+                assert_eq!(pin, "PinA");
+                assert_eq!(status, "idle");
+                assert!(
+                    doorbell_core::should_inject(status),
+                    "an idle transition that is not injectable never drains the queue"
+                );
+            }
+            other => panic!("expected PlaneStatus, got {other:?}"),
+        }
+        assert!(
+            RtHost::changed_statuses(&mut last, status(AgentStatus::Idle)).is_empty(),
+            "the idle itself does not repeat either"
+        );
     }
 }
 
