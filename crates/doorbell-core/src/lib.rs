@@ -641,12 +641,20 @@ pub fn wake_kind_of_line(line: &str) -> WakeKind {
 /// not. Keying on the line is what makes one directive one ring (bd-x3pqw).
 /// When the envelope carries a message id to both producers (bd-0uzrq.1), that
 /// id becomes the key and this fn goes away.
-/// The thread a row belongs to, when it names one.
+/// The key a message supersedes on: its thread when it names one, else its
+/// `corr` — which IS populated on crew mail (a `crew prompt --bead bd-x` rides
+/// `corr=bd-x`), so a captain's correction about the same bead replaces the
+/// queued brief instead of ringing beside it (bd-0uzrq.11). Without the
+/// fallback the supersede path never fires on real rows: `thread_id` is null
+/// everywhere today.
 fn row_thread(row: &serde_json::Value) -> Option<String> {
-    row.get("thread_id")
-        .and_then(serde_json::Value::as_str)
-        .filter(|t| !t.is_empty())
-        .map(str::to_string)
+    let field = |key: &str| {
+        row.get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    field("thread_id").or_else(|| field("corr"))
 }
 
 fn row_key(row: &serde_json::Value, _line: &str) -> String {
@@ -1858,6 +1866,63 @@ mod tests {
                 .any(|a| matches!(a, DoorbellAction::Prompt { .. })),
             "the thread rings once: {drained:?}"
         );
+    }
+
+    /// bd-0uzrq.11: `thread_id` is null on every real row, so the supersede
+    /// key falls back to `corr` — which crew mail carries (a `crew prompt
+    /// --bead bd-x` rides corr=bd-x). Two briefs about one bead are ONE wake;
+    /// two about different beads merge.
+    #[test]
+    fn a_corr_supersedes_when_the_row_has_no_thread() {
+        let model = working_model("BlueRidge");
+        let row = |id: &str, corr: &str| {
+            serde_json::json!({
+                "id": id,
+                "subject": "crew prompt",
+                "sender": "SlateHarbor",
+                "importance": "normal",
+                "thread_id": serde_json::Value::Null,
+                "corr": corr,
+            })
+        };
+        let (next, _) = tick(
+            &model,
+            &DoorbellMsg::InboxRows {
+                rows: vec![row("m1", "bd-alpha")],
+                pin: "BlueRidge".into(),
+            },
+        );
+        let (next, actions) = tick(
+            &next,
+            &DoorbellMsg::InboxRows {
+                rows: vec![row("m2", "bd-alpha")],
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert!(
+            matches!(&actions[0], DoorbellAction::Audit { kind, .. } if kind == "superseded"),
+            "same corr supersedes, journalled: {actions:?}"
+        );
+        assert_eq!(
+            next.queues.get("BlueRidge").map(Vec::len),
+            Some(1),
+            "one wake for one bead"
+        );
+        assert_eq!(next.queues["BlueRidge"][0].key, "m2");
+
+        // A different bead on the same pin merges instead.
+        let (next, actions) = tick(
+            &next,
+            &DoorbellMsg::InboxRows {
+                rows: vec![row("m3", "bd-beta")],
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert!(
+            matches!(&actions[0], DoorbellAction::Audit { kind, .. } if kind == "merged"),
+            "a different bead merges: {actions:?}"
+        );
+        assert_eq!(next.queues["BlueRidge"][0].count, 2);
     }
 
     /// bd-x3pqw review: two DIFFERENT captain briefs render the same generic

@@ -44,6 +44,10 @@ pub(crate) enum CrewCmd {
         /// mark the dispatch urgent (mail importance + urgent wake line)
         #[arg(long)]
         urgent: bool,
+        /// the work-ledger bead this prompt is about. Rides `corr`, so a later
+        /// prompt for the SAME bead supersedes the queued one (bd-0uzrq.11).
+        #[arg(long)]
+        bead: Option<String>,
     },
 }
 
@@ -100,7 +104,16 @@ pub(crate) fn cmd_crew(cfg: &Config, cmd: &CrewCmd) -> Result<()> {
             project,
             r#as,
             urgent,
-        } => cmd_crew_prompt(cfg, project, pin, prompt, r#as.as_deref(), *urgent),
+            bead,
+        } => cmd_crew_prompt(
+            cfg,
+            project,
+            pin,
+            prompt,
+            r#as.as_deref(),
+            *urgent,
+            bead.as_deref(),
+        ),
     }
 }
 
@@ -345,6 +358,9 @@ pub(crate) struct PromptDispatch {
     pub sender: String,
     pub prompt: String,
     pub urgent: bool,
+    /// The bead this prompt is about; rides `corr` so the doorbell can
+    /// supersede an older brief about the same work.
+    pub bead: Option<String>,
 }
 
 impl PromptDispatch {
@@ -370,6 +386,10 @@ impl PromptDispatch {
         if self.urgent {
             args.push("--importance".to_string());
             args.push("urgent".to_string());
+        }
+        if let Some(bead) = &self.bead {
+            args.push("--corr".to_string());
+            args.push(bead.clone());
         }
         args
     }
@@ -651,6 +671,7 @@ fn cmd_crew_prompt(
     prompt: &str,
     r#as: Option<&str>,
     urgent: bool,
+    bead: Option<&str>,
 ) -> Result<()> {
     let sender = prompt_sender(cfg, r#as);
     let dispatch = PromptDispatch {
@@ -659,6 +680,7 @@ fn cmd_crew_prompt(
         sender,
         prompt: prompt.to_string(),
         urgent,
+        bead: bead.map(str::to_string),
     };
 
     toron_mail_send(&dispatch)?;
@@ -678,6 +700,7 @@ fn cmd_crew_prompt(
             "wake": wake,
             "wake_queued": queued,
             "wm": wm,
+            "bead": bead,
         }),
     );
     print_json(&dispatch.confirmation(wm));
@@ -719,7 +742,9 @@ mod tests {
                 project,
                 r#as,
                 urgent,
+                bead,
             } => {
+                assert!(bead.is_none(), "no --bead in this argv");
                 assert_eq!(pin, "BlackGorge");
                 assert_eq!(prompt, "implement bead");
                 assert_eq!(project, "flywheel");
@@ -730,6 +755,46 @@ mod tests {
         }
     }
 
+    /// bd-0uzrq.11: `--bead` rides `corr`, and `corr` is what the doorbell
+    /// supersedes on when a row has no thread. A captain's correction about the
+    /// same bead therefore replaces the queued brief instead of ringing beside
+    /// it.
+    #[test]
+    fn a_bead_prompt_carries_corr_and_the_parsed_flag_reaches_it() {
+        let cli = Cli::try_parse_from([
+            "flywheel",
+            "prompt",
+            "BlackGorge",
+            "correct the brief",
+            "--project",
+            "flywheel",
+            "--bead",
+            "bd-0uzrq.11",
+        ])
+        .expect("parse crew prompt --bead");
+        let bead = match cli.cmd {
+            CrewCmd::Prompt { bead, .. } => bead,
+            other => panic!("expected Prompt, got {other:?}"),
+        };
+        assert_eq!(bead.as_deref(), Some("bd-0uzrq.11"));
+
+        let dispatch = PromptDispatch {
+            pin: "BlackGorge".to_string(),
+            project: "flywheel".to_string(),
+            sender: "AmberHarbor".to_string(),
+            prompt: "correct the brief".to_string(),
+            urgent: false,
+            bead: Some("bd-0uzrq.11".to_string()),
+        };
+        let args = dispatch.mail_args();
+        let corr_at = args.iter().position(|a| a == "--corr");
+        assert_eq!(
+            corr_at.map(|at| args[at + 1].as_str()),
+            Some("bd-0uzrq.11"),
+            "the bead rides --corr: {args:?}"
+        );
+    }
+
     #[test]
     fn prompt_dispatch_structure_builds_mail_and_wake() {
         let dispatch = PromptDispatch {
@@ -738,6 +803,7 @@ mod tests {
             sender: "AmberHarbor".to_string(),
             prompt: "do the thing".to_string(),
             urgent: true,
+            bead: None,
         };
         let args = dispatch.mail_args();
         assert_eq!(
