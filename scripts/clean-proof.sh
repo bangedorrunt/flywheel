@@ -305,6 +305,10 @@ PY
 done <"$TMP/mutations.in"
 MUTATION_RECORDS_FILE="$TMP/mutations.txt"
 touch "$MUTATION_RECORDS_FILE"
+# Local belt for the receipt env below: a run that never entered the mutations
+# section must still hand proof_write_receipt a DEFINED value under set -u.
+RECEIPT_MUTATIONS_BASE="${RECEIPT_MUTATIONS_BASE:-}"
+RECEIPT_CHANGED_PATHS="${RECEIPT_CHANGED_PATHS:-}"
 
 OK=0
 [ -n "$FAILED_STEP" ] && OK=1

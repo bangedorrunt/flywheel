@@ -111,10 +111,18 @@ empty="$TMP/mutations-empty.txt"
 : >"$empty"
 receipt="$TMP/receipt-none.json"
 proof_write_receipt "$receipt" 0 deadbeef dead 20260101T000000Z head "$TMP" "" "build" "0" "" "$empty" >/dev/null
-if python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["mutations"]=="none"; assert d["ok"] is True; assert d["schema"]=="flywheel-clean-proof.v1"' "$receipt"; then
-  pass "a proof without mutations reports mutations: none"
+if python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["mutations"]==[]; assert d["ok"] is True; assert d["schema"]=="flywheel-clean-proof.v1"' "$receipt"; then
+  pass "a proof without mutations reports an empty mutation list"
 else
-  fail "receipt does not report mutations: none"
+  fail "receipt does not report an empty mutation list"
+fi
+# No base is a DISTINCT state from an empty diff: a receipt that ran nothing
+# because nobody pinned a base must say so, or a landing cannot tell the two
+# apart (bd-m5afp review).
+if python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["mutations_base"] is None, d["mutations_base"]; assert d["mutations_mode"] is None; assert d["changed_paths"]==[]' "$receipt"; then
+  pass "no base -> receipt writes mutations_base null (not an empty string)"
+else
+  fail "receipt conflates \"no base\" with a base"
 fi
 withmut="$TMP/mutations.txt"
 printf 'src/x.rs:foo:expect=RED:got=RED\n' >"$withmut"
@@ -124,6 +132,19 @@ if python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["mutati
   pass "a mutated proof records each witness in the receipt"
 else
   fail "receipt does not record mutation witnesses"
+fi
+
+# A changed-mode receipt carries the mode, the base and the diff it selected
+# from, so a landing can re-derive the coverage itself.
+receipt3="$TMP/receipt-changed.json"
+PROOF_MUTATIONS_MODE=changed PROOF_MUTATIONS_BASE=deadbeef \
+  PROOF_CHANGED_PATHS="docs/a.mdx
+scripts/b.sh" \
+  proof_write_receipt "$receipt3" 0 deadbeef dead 20260101T000000Z sha "$TMP" "" "mutations" "0" "" "$empty" >/dev/null
+if python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["mutations_mode"]=="changed"; assert d["mutations_base"]=="deadbeef"; assert d["changed_paths"]==["docs/a.mdx","scripts/b.sh"]' "$receipt3"; then
+  pass "a changed-mode receipt records mode, base and the selected diff"
+else
+  fail "changed-mode receipt does not record how the set was chosen"
 fi
 
 if [ "$FAILED" -ne 0 ]; then
