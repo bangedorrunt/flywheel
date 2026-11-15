@@ -260,19 +260,6 @@ TORON_LIVE_URL="http://127.0.0.1:18080/mcp"
 LEAK_PROJECTS=(e2e-contention e2e-live-seat e2e-idle-page probe)
 LEAK_PINS=(QuartzTester OnyxTester CobaltRidge)
 
-retire_live_leak_pins() {
-  # Best-effort cleanup for known leak pins (bd-0uzrq.7 follow-up). Read-only
-  # callers must not mutate, but the suite may retire seats/leases it created.
-  # Runs against the operator mailbox only when the daemon is reachable.
-  local p pin
-  ( exec 3<>"/dev/tcp/127.0.0.1/18080" ) >/dev/null 2>&1 || return 0
-  for p in "${LEAK_PROJECTS[@]}"; do
-    for pin in QuartzTester OnyxTester; do
-      TORON_MCP_URL="$TORON_LIVE_URL" "$FLYWHEEL_BIN" retire "$pin" --project "$p" --as "${AGENT_NAME:-PurpleGorge}" --force-working --json >/dev/null 2>&1 || true
-    done
-  done
-}
-
 toron_live_snapshot() { # tag
   local tag="$1" p pin
   local out="$SANDBOX/toron-live.$tag"
@@ -311,13 +298,17 @@ except Exception:
   done
 }
 
-assert_no_live_leak_pins() {
+assert_no_live_leak_pins() { # mode: baseline|after
   # Extend leak guard to explicitly cover toron registry + leases for known
-  # leak pins (bd-0uzrq.7 follow-up): no reservation held by QuartzTester/
-  # OnyxTester and no newly created registry rows for them in LEAK_PROJECTS.
-  local p pin out changed=0
+  # leak pins (bd-0uzrq.7 follow-up). Diagnose only, never clean/mutate live
+  # state. Baseline fails loudly if a known leak pin already holds a lease.
+  local mode="${1:-after}" p pin out changed=0
   ( exec 3<>"/dev/tcp/127.0.0.1/18080" ) >/dev/null 2>&1 || return 0
-  out="$SANDBOX/toron-live.after.leaks"
+  if [ "$mode" = "baseline" ]; then
+    out="$SANDBOX/toron-live.baseline.leaks"
+  else
+    out="$SANDBOX/toron-live.after.leaks"
+  fi
   : >"$out"
   for p in "${LEAK_PROJECTS[@]}"; do
     TORON_MCP_URL="$TORON_LIVE_URL" "$TORON_BIN" reserve list --project "$p" --json 2>/dev/null |
@@ -333,6 +324,16 @@ for r in rows:
     if (r.get("holder") or "") in pins:
         print(f"lease {p} {r.get('holder')} {r.get('path')} {r.get('reason')}")
 ' "$p" QuartzTester OnyxTester >>"$out" 2>/dev/null || true
+  done
+  if [ "$mode" = "baseline" ]; then
+    if [ -s "$out" ]; then
+      echo "e2e-live: live toron baseline already has leak-pin leases (diagnose, do not clean):" >&2
+      sed -n '1,40p' "$out" >&2
+      return 1
+    fi
+    return 0
+  fi
+  for p in "${LEAK_PROJECTS[@]}"; do
     for pin in QuartzTester OnyxTester; do
       local before after
       before="$(awk -v key="registry $p $pin" '$0==key{getline; print; exit}' "$SANDBOX/toron-live.before" 2>/dev/null || echo absent)"
@@ -353,10 +354,7 @@ for r in rows:
 
 stable_surfaces before
 toron_live_snapshot before
-# bd-0uzrq.7 follow-up: retire known leak pins from the live store, then take
-# the baseline snapshot that assert_live_unchanged compares against.
-retire_live_leak_pins
-toron_live_snapshot before
+assert_no_live_leak_pins baseline
 
 assert_live_unchanged() {
   stable_surfaces after
@@ -369,7 +367,7 @@ assert_live_unchanged() {
     diff -u "$SANDBOX/toron-live.before" "$SANDBOX/toron-live.after" 2>/dev/null | head -40 >&2 || true
     changed=1
   fi
-  if ! assert_no_live_leak_pins; then
+  if ! assert_no_live_leak_pins after; then
     changed=1
   fi
   for surface in agents subs; do
