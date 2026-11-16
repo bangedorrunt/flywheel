@@ -2762,6 +2762,17 @@ mod tests {
                      — a cron must not ship a workflow its runner refuses"
                 );
             }
+            // The cron fires the TICK workflow rebuilt from the CronSpec, not
+            // the catalog Workflow; that is the shape the runner actually opens.
+            let spec = crate::cron::builtin_crons()
+                .remove(&name)
+                .unwrap_or_else(|| panic!("{name} is a builtin cron"));
+            let tick = toron_workflow::cron::spec_tick_workflow(&spec);
+            if let Some(reason) = toron_workflow::engine::durable::unsupported_reason(&tick) {
+                panic!(
+                    "the tick workflow a cron actually fires ({name}-tick) cannot open: {reason}"
+                );
+            }
         }
         assert!(
             scheduled >= 2,
