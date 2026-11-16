@@ -200,6 +200,29 @@ fn witness_gate(
     ))
 }
 
+/// One witnessed settle: a failing witness replaces the settle with its typed
+/// refusal, and only a PASSING one derives the `.done` sidecar (ADR-0021 D4.4:
+/// the marker follows the exit, never a step an author can reorder).
+fn witnessed_settle<T>(
+    seams: &BodySeams,
+    trigger: &Value,
+    node: &str,
+    stage: Option<&str>,
+    value: Value,
+    refused: impl FnOnce(String) -> T,
+    settled: impl FnOnce(Value) -> T,
+) -> T {
+    match witness_gate(seams.witness.as_ref(), node, stage, &value) {
+        WitnessGate::Failed(error) => refused(error),
+        gate => {
+            if matches!(gate, WitnessGate::Passed) {
+                write_done_sidecar(seams.sidecar_root.as_deref(), trigger, node);
+            }
+            settled(value)
+        }
+    }
+}
+
 /// ADR-0021 D4.4 (bd-jhz8x.3): the `.done` sidecar an external watcher polls,
 /// derived from the witnessed exit instead of from a step an author can skip or
 /// reorder. Write-only and idempotent — nothing in the tree reads it, a replay
@@ -412,26 +435,15 @@ async fn drive_linear(
                     let outcome = await_spawn(&launcher, &spec, deadline, clock()).await;
                     let stage = settle_stage(&run);
                     let outcome = match outcome {
-                        SpawnLaunch::Settled(value) => {
-                            match witness_gate(
-                                seams.witness.as_ref(),
-                                &node,
-                                stage.as_deref(),
-                                &value,
-                            ) {
-                                WitnessGate::Failed(error) => SpawnLaunch::Failed(error),
-                                gate => {
-                                    if matches!(gate, WitnessGate::Passed) {
-                                        write_done_sidecar(
-                                            seams.sidecar_root.as_deref(),
-                                            &trigger,
-                                            &node,
-                                        );
-                                    }
-                                    SpawnLaunch::Settled(value)
-                                }
-                            }
-                        }
+                        SpawnLaunch::Settled(value) => witnessed_settle(
+                            seams,
+                            &trigger,
+                            &node,
+                            stage.as_deref(),
+                            value,
+                            SpawnLaunch::Failed,
+                            SpawnLaunch::Settled,
+                        ),
                         other => other,
                     };
                     let c = clock.clone();
@@ -498,26 +510,15 @@ async fn drive_linear(
                     .await;
                     let stage = settle_stage(&run);
                     let outcome = match outcome {
-                        JobWatchOutcome::Settled(value) => {
-                            match witness_gate(
-                                seams.witness.as_ref(),
-                                &node,
-                                stage.as_deref(),
-                                &value,
-                            ) {
-                                WitnessGate::Failed(error) => JobWatchOutcome::Failed(error),
-                                gate => {
-                                    if matches!(gate, WitnessGate::Passed) {
-                                        write_done_sidecar(
-                                            seams.sidecar_root.as_deref(),
-                                            &trigger,
-                                            &node,
-                                        );
-                                    }
-                                    JobWatchOutcome::Settled(value)
-                                }
-                            }
-                        }
+                        JobWatchOutcome::Settled(value) => witnessed_settle(
+                            seams,
+                            &trigger,
+                            &node,
+                            stage.as_deref(),
+                            value,
+                            JobWatchOutcome::Failed,
+                            JobWatchOutcome::Settled,
+                        ),
                         other => other,
                     };
                     let c = clock.clone();
@@ -726,26 +727,15 @@ async fn drive_graph(
                     .await;
                     let stage = graph_stage(&run, &node);
                     let outcome = match outcome {
-                        JobWatchOutcome::Settled(value) => {
-                            match witness_gate(
-                                seams.witness.as_ref(),
-                                &node,
-                                stage.as_deref(),
-                                &value,
-                            ) {
-                                WitnessGate::Failed(error) => JobWatchOutcome::Failed(error),
-                                gate => {
-                                    if matches!(gate, WitnessGate::Passed) {
-                                        write_done_sidecar(
-                                            seams.sidecar_root.as_deref(),
-                                            &trigger,
-                                            &node,
-                                        );
-                                    }
-                                    JobWatchOutcome::Settled(value)
-                                }
-                            }
-                        }
+                        JobWatchOutcome::Settled(value) => witnessed_settle(
+                            seams,
+                            &trigger,
+                            &node,
+                            stage.as_deref(),
+                            value,
+                            JobWatchOutcome::Failed,
+                            JobWatchOutcome::Settled,
+                        ),
                         other => other,
                     };
                     let c = clock.clone();
