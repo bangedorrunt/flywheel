@@ -2655,9 +2655,9 @@ steps:
         .unwrap();
         assert_eq!(
             wf_builtin.steps.len(),
-            12,
-            "builtin token unchanged (2 engine verifies + the per-bead foreach + 4 stage dispatches \
-             + 3 write-only sidecars + ledger exit + signoff)"
+            9,
+            "builtin token unchanged (preflight + gate + the per-bead foreach + execute + ledger \
+             exit + review + verify + compound + signoff; the runner writes the sidecars)"
         );
     }
 
@@ -2676,7 +2676,7 @@ steps:
         let part =
             parse_compose_part_with("wave-swarm", &builtin_token).expect("compose token parses");
         let wf = compose_workflow_with("composed-wave", "obj", None, &[part], &affinity).unwrap();
-        assert_eq!(wf.steps.len(), 12, "{:?}", wf.steps.iter().map(|s| &s.name));
+        assert_eq!(wf.steps.len(), 9, "{:?}", wf.steps.iter().map(|s| &s.name));
         // bd-jhz8x.2 (ADR-0021 D4.5): GATE is engine steps, DISPATCH is a
         // foreach over the gate artifact, and OBSERVE is the doorbell fold's
         // escalation — so the seat dispatches are execute, review, verify,
@@ -2705,45 +2705,41 @@ steps:
             "EXECUTE after the per-bead dispatch (bd-wave-swarm-graduation-fix-98io: the crew needs an executor; bd-adv4: the executor profile rides the coder_profile input, default @coder)"
         );
         assert!(
-            matches!(&wf.steps[6].action, Action::DispatchJob { spec, .. }
+            matches!(&wf.steps[5].action, Action::DispatchJob { spec, .. }
                 if spec.profile.as_deref() == Some("@reviewer")
                     && spec.stage.as_deref() == Some("ce-review")),
             "REVIEW after the ledger exit (ADR-0009: audit the diff before VERIFY audits the receipts)"
         );
         assert!(
-            matches!(&wf.steps[8].action, Action::DispatchJob { spec, .. }
+            matches!(&wf.steps[6].action, Action::DispatchJob { spec, .. }
                 if spec.profile.as_deref() == Some("@reviewer")
                     && spec.stage.as_deref() == Some("wave-verify")),
-            "VERIFY after the review sidecar"
+            "VERIFY after REVIEW (bd-jhz8x.3: the sidecar step between them is gone)"
         );
         assert!(
-            matches!(&wf.steps[10].action, Action::DispatchJob { spec, .. }
+            matches!(&wf.steps[7].action, Action::DispatchJob { spec, .. }
                 if spec.profile.as_deref() == Some("@planner")
                     && spec.stage.as_deref() == Some("ce-compound")
                     && spec.phase.as_deref() == Some("compound")),
-            "COMPOUND after the verify sidecar (ADR-0009: phase compound, planner)"
+            "COMPOUND after VERIFY (ADR-0009: phase compound, planner)"
         );
         assert!(
-            matches!(&wf.steps[11].action, Action::RequestApproval { message, .. }
+            matches!(&wf.steps[8].action, Action::RequestApproval { message, .. }
                 if message.contains("captain")),
             "SIGNOFF last, captain-only: {:?}",
-            wf.steps[11].action.type_name()
+            wf.steps[8].action.type_name()
         );
-        for (idx, marker) in [(4, "execute"), (7, "review"), (9, "verify")] {
-            let Action::Verify { command } = &wf.steps[idx].action else {
-                panic!(
-                    "step {idx} ({:?}) must be the {marker} sidecar: {:?}",
-                    wf.steps[idx].name,
-                    wf.steps[idx].action.type_name()
-                );
+        // bd-jhz8x.3 (D4.4): the runner writes the .done sidecars after a
+        // witnessed exit, so no step may write (or skip) one.
+        for step in &wf.steps {
+            let writes_done = match &step.action {
+                Action::Verify { command } => command.contains(".done"),
+                _ => false,
             };
             assert!(
-                command.contains(&format!("{{{{inputs.wave_label}}}}-{marker}.done")),
-                "sidecar {marker} writes its completion marker: {command}"
-            );
-            assert!(
-                !command.contains("test -f"),
-                "sidecar {marker} never reads a marker: {command}"
+                !writes_done,
+                "the runner writes the sidecars, not step {:?}",
+                step.name
             );
         }
         let report = toron_workflow::lint_workflow(&wf);
@@ -2775,9 +2771,9 @@ steps:
         // is a foreach, so the awaited SEAT dispatches start at EXECUTE.
         let stages = [
             ("execute", 3),
-            ("review", 6),
-            ("verify", 8),
-            ("compound", 10),
+            ("review", 5),
+            ("verify", 6),
+            ("compound", 7),
         ];
         for (stage_name, si) in stages {
             assert_eq!(
@@ -2882,11 +2878,7 @@ steps:
             .map(|t| parse_compose_part_with(t, &builtin_token).unwrap())
             .collect();
         let wf = compose_workflow_with("mixed", "obj", None, &parts, &affinity).unwrap();
-        assert_eq!(
-            wf.steps.len(),
-            13,
-            "1 plain scout + the 12 wave-swarm steps"
-        );
+        assert_eq!(wf.steps.len(), 10, "1 plain scout + the 9 wave-swarm steps");
     }
 
     // beads-lifecycle expand-path coverage: graph-form token parses,

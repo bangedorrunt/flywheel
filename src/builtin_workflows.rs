@@ -1194,7 +1194,7 @@ steps:
 name: wave-swarm
 compose: true
 shape: pipeline
-description: "The compounded wave swarm. GATE is an engine step (preflight + __wave-gate; a lower open wave holds, an empty ready with work in flight is in-flight, a zero match fails loud); DISPATCH is a foreach over the gate's typed ready set, one awaited job per bead. GATE scopes br ready to one wave via the TYPED wave field (grounding-reads docs/learnings/), holds on any open lower wave, and treats an empty ready with in-flight beads as WORK IN FLIGHT (bd-wave-gate-typed-authority-27et); DISPATCH emits send --stage ce-execute --param payloads (bead/scope/exit/channel/pin/report_file/learnings); OBSERVE escalates to the captain (lesson: line on every escalation) and never adjudicates; REVIEW audits each closed bead's diff against its brief (detection conditions, quoted evidence, autofix classes); VERIFY checks receipts at committed HEAD + VERIFY tails + principles citations + the residual gate (every finding fixed or filed as a bead); COMPOUND captures durable learnings to docs/learnings/ (never blocks); SIGNOFF suspends for captain-only approval. Every stage dispatch awaits its job result (result_timeout 7200s); each witnessed exit is checked against the stage contract, EXECUTE additionally ends on a ledger fact (all wave beads closed, ship check legal each). .done files under .flywheel/wave/ are write-only compat sidecars, never read. Default crew is planner+coder+reviewer; remix with --crew role:n,role:n (scout/housekeeper optional)."
+description: "The compounded wave swarm. GATE is an engine step (preflight + __wave-gate; a lower open wave holds, an empty ready with work in flight is in-flight, a zero match fails loud); DISPATCH is a foreach over the gate's typed ready set, one awaited job per bead. GATE scopes br ready to one wave via the TYPED wave field (grounding-reads docs/learnings/), holds on any open lower wave, and treats an empty ready with in-flight beads as WORK IN FLIGHT (bd-wave-gate-typed-authority-27et); DISPATCH emits send --stage ce-execute --param payloads (bead/scope/exit/channel/pin/report_file/learnings); OBSERVE escalates to the captain (lesson: line on every escalation) and never adjudicates; REVIEW audits each closed bead's diff against its brief (detection conditions, quoted evidence, autofix classes); VERIFY checks receipts at committed HEAD + VERIFY tails + principles citations + the residual gate (every finding fixed or filed as a bead); COMPOUND captures durable learnings to docs/learnings/ (never blocks); SIGNOFF suspends for captain-only approval. Every stage dispatch awaits its job result (result_timeout 7200s); each witnessed exit is checked against the stage contract, EXECUTE additionally ends on a ledger fact (all wave beads closed, ship check legal each). .done files under .flywheel/wave/ are write-only compat sidecars the RUNNER writes after a witnessed exit (ADR-0021 D4.4); no step writes or reads one. Default crew is planner+coder+reviewer; remix with --crew role:n,role:n (scout/housekeeper optional)."
 trigger:
   type: webhook
 crew:
@@ -1254,10 +1254,6 @@ steps:
       stage: ce-execute
       task: 'Execute the wave beads listed in .flywheel/wave/{{inputs.wave_label}}-ready.json (claim -> run each bead''s VERIFY -> commit before close -> ledger-legal close with VERIFY tail + principles citations). When ready is empty and in_flight[] is non-empty, do NOT claim or close — a live crew owns those beads; wait (poll `br show <id> --json`) until every in-flight bead is closed, then settle ok with a witness naming the observed closes. After the LAST bead of the wave is closed, settle YOUR job: `toron job result <job-id> --status ok --project <slug> --as <pin> --witness <file.json>`, where the witness file carries the contract fields for this stage: the final close as {"commit_sha": "<sha>", "commit_message": "<must cite the bead id>", "gate": {"command": "<its VERIFY command>", "exit": 0, "output": "<tail>"}}. When ready AND in_flight are both empty, settle as a FAILURE naming it ([execute] blocked: nothing to execute) — a wave that runs nothing must not report success, and an unsettled job fails at result_timeout naming this step. Objective: {{inputs.objective}}'
     on_error: fail_run
-  - name: execute_done
-    action: verify
-    command: "mkdir -p .flywheel/wave && touch .flywheel/wave/{{inputs.wave_label}}-execute.done"
-    on_error: continue
   - name: execute_exit
     action: verify
     command: 'LABEL="{{inputs.wave_label}}"; W="${LABEL#wave-}"; case "$W" in ""|*[!0-9]*) WN=null;; *) WN="$W";; esac; IDS_ALL=$(br list --all --json | jq -r ".issues[].id"); if [ -z "$IDS_ALL" ]; then echo "execute exit refused: wave $LABEL matched zero beads"; exit 1; fi; ROWS=$(echo "$IDS_ALL" | xargs br show --json | jq --argjson n "$WN" --arg label "$LABEL" "[.[] | select((.wave != null and .wave == \$n) or (.wave == null and ((.labels // []) | index(\$label))))]"); OPEN=$(echo "$ROWS" | jq -r "[.[] | select(.status != \"closed\") | .id] | join(\" \")"); if [ -n "$OPEN" ]; then echo "execute exit refused: wave $LABEL still open: $OPEN"; exit 1; fi; IDS=$(echo "$ROWS" | jq -r "[.[].id] | join(\" \")"); if [ -z "$IDS" ]; then echo "execute exit refused: wave $LABEL matched zero beads"; exit 1; fi; for id in $IDS; do flywheel ship check "$id" || exit 1; done'
@@ -1273,10 +1269,6 @@ steps:
       stage: ce-review
       task: 'Review every closed bead of {{inputs.wave_label}} for {{inputs.objective}}: audit the committed diff against each brief''s ACCEPTANCE/VERIFY — detection conditions, quoted file:line evidence, severity + autofix class per finding; single-lens pass (no corroboration claims). Findings JSON to {{inputs.steer_channel}}. Then settle YOUR job: `toron job result <job-id> --status ok --project <slug> --as <pin> --witness <file.json>`, where the witness file carries the contract fields for this stage: {"findings": [<each finding>] non-empty, "verdict": "<AGREE | AGREE-WITH-CHANGES | REJECT>"}. A review that cannot verify settles as a FAILURE naming why — never success without a witness, never an unsettled job. Objective: {{inputs.objective}}'
     on_error: fail_run
-  - name: review_done
-    action: verify
-    command: "mkdir -p .flywheel/wave && touch .flywheel/wave/{{inputs.wave_label}}-review.done"
-    on_error: continue
   - name: verify
     action: dispatch_job
     assignee: x
@@ -1288,10 +1280,6 @@ steps:
       stage: wave-verify
       task: 'Verify every close claim: receipt at committed HEAD + VERIFY tail + principles citations + the residual gate (each REVIEW finding from {{steps.review}} fixed in the diff or filed as a bead id). Then settle YOUR job: `toron job result <job-id> --status ok --project <slug> --as <pin> --witness <file.json>`, where the witness file carries the contract fields for this stage: {"gate": {"command": "<the verification gate you ran>", "exit": 0, "output": "<recorded output>"}}. A verification that cannot prove the close settles as a FAILURE naming the gap — never success without a witness, never an unsettled job. Objective: {{inputs.objective}}'
     on_error: fail_run
-  - name: verify_done
-    action: verify
-    command: "mkdir -p .flywheel/wave && touch .flywheel/wave/{{inputs.wave_label}}-verify.done"
-    on_error: continue
   - name: compound
     action: dispatch_job
     await: result
@@ -1610,10 +1598,14 @@ pub fn builtin_workflows_yaml() -> impl Iterator<Item = (&'static str, &'static 
 }
 
 pub fn builtin_workflows() -> BTreeMap<String, Workflow> {
+    let stages = crate::stages::StageLibrary::shared();
     let mut map = BTreeMap::new();
     for (name, yaml) in BUILTIN_WORKFLOWS_YAML {
         match parse_workflow(yaml) {
-            Ok(wf) => {
+            Ok(mut wf) => {
+                // bd-6setu.6: a review step's stage-contract reads ride the job
+                // spec, so toron's CLAIM can refuse the node's author.
+                crate::workflow_lowering::stamp_claim_exclusions(&mut wf, stages);
                 map.insert(name.to_string(), wf);
             }
             Err(e) => {
@@ -3479,12 +3471,12 @@ graph:
         let at = names.iter().position(|n| n == "execute").expect("execute");
         assert_eq!(
             names[at + 1],
-            "execute_done",
-            "sidecar follows the witnessed exit"
+            "execute_exit",
+            "the ledger fact gates review (bd-jhz8x.3: no sidecar step between them)"
         );
         assert_eq!(
             names[at + 2],
-            "execute_exit",
+            "review",
             "the ledger fact gates review: {names:?}"
         );
         let exit = wave
