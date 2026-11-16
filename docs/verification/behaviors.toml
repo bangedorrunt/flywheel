@@ -278,6 +278,7 @@ status = "proven"
 concurrent = false
 tests = [
   "src/builtin_workflows.rs::every_scheduled_catalog_workflow_opens_on_the_durable_models",
+  "src/builtin_workflows.rs::every_published_workflow_is_durable_or_legacy_by_design",
   "src/builtin_workflows.rs::weekly_review_is_scout_fanout_to_oracle",
   "src/builtin_workflows.rs::a_graph_parallel_node_is_refused_by_the_durable_models",
 ]

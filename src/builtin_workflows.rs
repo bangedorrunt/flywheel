@@ -294,18 +294,18 @@ trigger:
 crew: auto
 inputs:
   - name: proposal
-graph:
-  nodes:
-    briefs:
-      action: parallel
-      over: "2"
-      each: { action: dispatch_job, assignee: x, spec: { profile: "@reviewer", harness: "opencode", task: "Brief on the proposal from your adversarial angle: {{inputs.proposal}}" } }
-    decide:
-      action: dispatch_job
-      assignee: x
-      spec: { profile: "@oracle", task: "Adjudicate the briefs and decide on: {{inputs.proposal}}\n\nReviewer briefs: {{steps.briefs}}" }
-      needs: [briefs]
-      on_error: fail_run
+# bd-gtw4i: STEPS, not a graph — the durable runner lowers a steps fan-out into
+# its copies; a graph parallel node is refused (see the graph-fan-out test).
+steps:
+  - name: briefs
+    action: parallel
+    over: "2"
+    each: { action: dispatch_job, assignee: x, spec: { profile: "@reviewer", harness: "opencode", task: "Brief on the proposal from your adversarial angle: {{inputs.proposal}}" } }
+  - name: decide
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@oracle", task: "Adjudicate the briefs and decide on: {{inputs.proposal}}\n\nReviewer briefs: {{steps.briefs}}" }
+    on_error: fail_run
 "#,
     ),
     (
@@ -1003,26 +1003,25 @@ principles:
   - prove-it-works
   - fix-root-causes
   - guard-the-context-window
-graph:
-  nodes:
-    briefs:
-      action: parallel
-      over: "{{inputs.reviewers}}"
-      each:
-        action: dispatch_job
-        assignee: x
-        spec:
-          profile: "@reviewer"
-          harness: "opencode"
-          task: "READONLY adversarial review — no edits, no repo writes, no beads. Same rubric for every reviewer (DIFFERENT model families per reviewer). Target: {{inputs.target}}. Review the target against the rubric; per finding give ONE classification: Act-on | Consider | Noted | Dismissed, with evidence. Rubric: prove-it-works (check the real artifact, not a proxy), fix-root-causes (name the root cause), guard-the-context-window (compressed evidence, no dumps)."
-    synthesize:
+# bd-gtw4i: STEPS, not a graph (the durable runner lowers a steps fan-out).
+steps:
+  - name: briefs
+    action: parallel
+    over: "{{inputs.reviewers}}"
+    each:
       action: dispatch_job
       assignee: x
       spec:
-        profile: "@oracle"
-        task: "Synthesize the N reviewer briefs for: {{inputs.target}}. Group every finding into Act-on / Consider / Noted / Dismissed with the supporting evidence. Do not apply changes — the parent routes Act-on into a follow-up playbook. Reviewer briefs: {{steps.briefs}}"
-      needs: [briefs]
-      on_error: fail_run
+        profile: "@reviewer"
+        harness: "opencode"
+        task: "READONLY adversarial review — no edits, no repo writes, no beads. Same rubric for every reviewer (DIFFERENT model families per reviewer). Target: {{inputs.target}}. Review the target against the rubric; per finding give ONE classification: Act-on | Consider | Noted | Dismissed, with evidence. Rubric: prove-it-works (check the real artifact, not a proxy), fix-root-causes (name the root cause), guard-the-context-window (compressed evidence, no dumps)."
+  - name: synthesize
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@oracle"
+      task: "Synthesize the N reviewer briefs for: {{inputs.target}}. Group every finding into Act-on / Consider / Noted / Dismissed with the supporting evidence. Do not apply changes — the parent routes Act-on into a follow-up playbook. Reviewer briefs: {{steps.briefs}}"
+    on_error: fail_run
 "#,
     ),
     (
@@ -2818,6 +2817,44 @@ graph:
         );
     }
 
+    /// bd-gtw4i: EVERY published workflow must either open on the durable
+    /// models or be refused for a feature those models do not have
+    /// (`branch`/`loop` graph nodes, which route to the legacy runner by
+    /// design). A shape the durable model CAN express — a fan-out — must never
+    /// be refused: that is how weekly-review, debate and interrogate shipped
+    /// workflows their own runner could not open.
+    #[test]
+    fn every_published_workflow_is_durable_or_legacy_by_design() {
+        let mut durable = 0;
+        let mut legacy = Vec::new();
+        for (name, wf) in builtin_workflows() {
+            match toron_workflow::engine::durable::unsupported_reason(&wf) {
+                None => durable += 1,
+                Some(reason) => {
+                    let engine_gap =
+                        reason.contains("uses 'branch'") || reason.contains("uses 'loop'");
+                    assert!(
+                        engine_gap,
+                        "{name} is refused by the durable models for a shape they can express: {reason}"
+                    );
+                    legacy.push(name);
+                }
+            }
+        }
+        assert!(
+            durable >= 10,
+            "expected the durable catalog, found {durable}"
+        );
+        assert!(
+            legacy.len() <= 3,
+            "the legacy-by-design set should not grow silently: {legacy:?}"
+        );
+    }
+
+    /// bd-gtw4i: a cron can never ship a workflow its runner REFUSES. Every
+    /// schedule-triggered catalog workflow must open on the durable models —
+    /// the check the weekly-review failure slipped past for a whole week —
+    /// including the TICK workflow the cron actually fires.
     /// bd-m5afp: the full mutation proof runs nightly through flywheel cron, so
     /// a witness is never only as fresh as the last landing that touched its
     /// file. Host scope: one run proves the repo, not one project's copy.
