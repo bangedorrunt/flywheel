@@ -61,11 +61,6 @@ async fn host_workspace(
     let mut fcfg = FileHostConfig::new(fw_state.clone(), project.clone(), workspace.clone());
     fcfg.toron_bin = bins.toron.clone();
     fcfg.plane_bin = bins.hc.clone();
-    fcfg.wake_brain_wait = doorbell_rt::wake_brain::wait_from_env(
-        std::env::var(doorbell_rt::wake_brain::WAIT_ENV)
-            .ok()
-            .as_deref(),
-    );
     let mut host = FileHost::new(fcfg).with_tx(tx.clone());
     doorbell_rt::ensure_daemon_gen(&fw_state, &workspace);
     let mut sinks = SinkManager::new(tx.clone());
@@ -2268,10 +2263,7 @@ pub(super) fn wake_brain_health(
             "resumed": total.resumed,
             "events_lost": total.events_lost,
             "last_drop_age_s": total.last_drop_unix.map(|t| now.saturating_sub(t)),
-            "policy": format!(
-                "backpressure up to {}s on a full brain channel; then drop (counted exactly), one death, the replacement resumes from the last accepted cursor",
-                doorbell_rt::wake_brain::BACKPRESSURE_WAIT.as_secs()
-            ),
+            "policy": "park on a full brain channel until it has room (counted, never shed); only a closed channel ends the consumer, and the replacement resumes from the last accepted cursor",
             "workspaces": per,
         }),
         fresh,

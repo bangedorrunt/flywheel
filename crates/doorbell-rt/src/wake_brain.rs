@@ -10,16 +10,20 @@
 //!
 //! 1. `try_send` succeeds → **forwarded**.
 //! 2. The channel is full → `wake_brain_full` += 1 and the forwarder PARKS
-//!    (backpressure), retrying until capacity frees or [`BACKPRESSURE_WAIT`]
-//!    elapses. A line that lands after waiting counts as **backpressured** (it
-//!    is still forwarded). Nothing is shed while the brain is merely slow.
-//! 3. The wait elapses (the brain made no room for the whole window) or the
-//!    channel is closed → the line is **dropped** and counted exactly. The
-//!    first drop CONDEMNS this consumer: it reports one death, and every later
-//!    line on it is dropped at once (counted, no wait — it is being replaced).
-//!    The replacement subscribes with `since_cursor` = the cursor of the last
-//!    line the brain ACCEPTED ([`WatchForwarder::resume_cursor`]), so the
-//!    sidecar replays the dropped lines instead of discarding them.
+//!    (backpressure), retrying until capacity frees — with no deadline. A line
+//!    that lands after waiting counts as **backpressured** (it is still
+//!    forwarded). A slow brain parks its sensor; it never sheds it.
+//! 3. Only a CLOSED channel (the brain is gone) ends the consumer: that line
+//!    is counted and the caller relays one death. The replacement subscribes
+//!    with `since_cursor` = the cursor of the last line the brain ACCEPTED
+//!    ([`WatchForwarder::resume_cursor`]).
+//!
+//! A deadline here was the restart loop: a replay larger than the channel
+//! filled it, the first overflow dropped after the window, the consumer was
+//! condemned, and the replacement resubscribed at the same cursor and replayed
+//! into the same full channel (measured live: 210 drops, one `Died` every
+//! ~25s). Backpressure without a cliff lets the cursor advance on every
+//! accepted line.
 //!
 //! Before mcc9 a full channel shed the line immediately, the counter lived in
 //! a per-consumer local nobody could read, and the replacement consumer
@@ -44,29 +48,29 @@ use std::time::{Duration, Instant};
 
 use crate::msg::BrainMsg;
 
-/// How long a forwarder parks on a full brain channel before it drops the line
-/// and condemns its consumer. Long enough that a busy brain is never shed
-/// (one brain tick is milliseconds), short enough that a wedged brain is
-/// reported within one health refresh.
-pub const BACKPRESSURE_WAIT: Duration = Duration::from_secs(5);
-
-/// Env override for the backpressure window in milliseconds, read ONCE at the
-/// daemon boundary ([`wait_from_env`]). For fixtures and live drills only:
-/// `0` turns every full channel into an immediate counted drop so the drop
-/// and resume path can be exercised end to end.
-pub const WAIT_ENV: &str = "DOORBELL_WAKE_BRAIN_WAIT_MS";
-
-/// The backpressure window from a raw [`WAIT_ENV`] value: unset or unparsable
-/// keeps [`BACKPRESSURE_WAIT`] (never a silent zero).
-#[must_use]
-pub fn wait_from_env(raw: Option<&str>) -> Duration {
-    raw.and_then(|v| v.trim().parse::<u64>().ok())
-        .map_or(BACKPRESSURE_WAIT, Duration::from_millis)
-}
-
 /// Retry spacing while parked. Not a poll of truth: the channel has no
 /// timed blocking send usable off-runtime, and this bounds the spin.
 const BACKPRESSURE_POLL: Duration = Duration::from_millis(2);
+
+/// How far back a consumer with no persisted cursor subscribes. Whole-retention
+/// replay is a second backfill path (and the replay that wedged the brain); the
+/// inbox sweep already backfills 24h.
+pub const COLD_START_LOOKBACK: Duration = Duration::from_secs(300);
+
+/// The cursor a consumer subscribes from: the last line the brain accepted, or
+/// — on a cold start — a bounded lookback from `now`. The event id is a
+/// lower-bound filler; the sidecar orders by `(created_at, event_id)`.
+#[must_use]
+pub fn start_cursor(persisted: Option<String>, now_unix: u64) -> String {
+    match persisted {
+        Some(c) if !c.is_empty() => c,
+        _ => format!(
+            "{}:{}",
+            now_unix.saturating_sub(COLD_START_LOOKBACK.as_secs()),
+            "0".repeat(64)
+        ),
+    }
+}
 
 /// Audit kind for a line that found the brain channel full (sampled rows).
 pub const AUDIT_WAKE_BRAIN_FULL: &str = crate::file_host::AUDIT_BRAIN_FULL;
@@ -298,7 +302,6 @@ pub struct WatchForwarder {
     counters: Arc<WakeBrainCounters>,
     resume: Arc<Mutex<Option<String>>>,
     condemned: AtomicBool,
-    wait: Duration,
     park: Arc<dyn Park>,
     audit: Option<AuditFn>,
     persist_to: Option<PathBuf>,
@@ -317,19 +320,11 @@ impl WatchForwarder {
             counters,
             resume,
             condemned: AtomicBool::new(false),
-            wait: BACKPRESSURE_WAIT,
             park: Arc::new(ThreadPark),
             audit: None,
             persist_to: None,
             unix_now: crate::lease::unix_now,
         }
-    }
-
-    /// Override the backpressure window (tests; never zero in production).
-    #[must_use]
-    pub fn with_wait(mut self, wait: Duration) -> Self {
-        self.wait = wait;
-        self
     }
 
     /// Substitute the clock/park port (interpreter tests).
@@ -379,38 +374,32 @@ impl WatchForwarder {
         }
         let cursor = watch_line_cursor(&line);
         let mut msg = BrainMsg::Watch(line);
-        match self.tx.try_send(msg) {
-            Ok(()) => return self.landed(cursor, Forwarded::Delivered),
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                return self.condemn_and_drop(true);
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(m)) => msg = m,
-        }
-        let prior = self.counters.wake_brain_full.fetch_add(1, Ordering::SeqCst);
-        self.counters.dirty.store(true, Ordering::SeqCst);
-        if crate::file_host::should_audit_count(prior as usize) {
-            self.audit_row(
-                AUDIT_WAKE_BRAIN_FULL,
-                "brain channel full; forwarder parked (backpressure), line not shed",
-            );
-            self.persist();
-        }
-        let deadline = self.park.now() + self.wait;
+        let mut parked = false;
         loop {
-            if self.park.now() >= deadline {
-                return self.condemn_and_drop(false);
-            }
-            self.park.park(BACKPRESSURE_POLL);
             match self.tx.try_send(msg) {
-                Ok(()) => {
+                Ok(()) if parked => {
                     self.counters.backpressured.fetch_add(1, Ordering::SeqCst);
                     return self.landed(cursor, Forwarded::Backpressured);
                 }
+                Ok(()) => return self.landed(cursor, Forwarded::Delivered),
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                     return self.condemn_and_drop(true);
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(m)) => msg = m,
             }
+            if !parked {
+                let prior = self.counters.wake_brain_full.fetch_add(1, Ordering::SeqCst);
+                self.counters.dirty.store(true, Ordering::SeqCst);
+                if crate::file_host::should_audit_count(prior as usize) {
+                    self.audit_row(
+                        AUDIT_WAKE_BRAIN_FULL,
+                        "brain channel full; forwarder parked (backpressure), line not shed",
+                    );
+                    self.persist();
+                }
+                parked = true;
+            }
+            self.park.park(BACKPRESSURE_POLL);
         }
     }
 
@@ -444,7 +433,7 @@ impl WatchForwarder {
                 if closed {
                     "brain channel closed; line not enqueued, next consumer resumes from the cursor"
                 } else {
-                    "brain made no room within the backpressure window; line dropped, next consumer resumes from the cursor"
+                    "consumer already condemned; line not enqueued, the replacement resumes from the cursor"
                 },
             );
             self.persist();
@@ -467,7 +456,6 @@ impl WatchForwarder {
                 "dropped_total": s.dropped,
                 "forwarded_total": s.forwarded,
                 "resume_from": self.resume_cursor(),
-                "wait_ms": self.wait.as_millis() as u64,
             }),
         );
     }
@@ -581,12 +569,24 @@ mod tests {
         }
     }
 
+    /// A cold start asks for a bounded lookback, never the sidecar's whole
+    /// retention; a persisted cursor wins unchanged. The zero-filled event id
+    /// is a lower bound in the sidecar's `(created_at, event_id)` order.
     #[test]
-    fn wait_from_env_defaults_unless_a_number_is_given() {
-        assert_eq!(wait_from_env(None), BACKPRESSURE_WAIT);
-        assert_eq!(wait_from_env(Some("nope")), BACKPRESSURE_WAIT);
-        assert_eq!(wait_from_env(Some("0")), Duration::ZERO);
-        assert_eq!(wait_from_env(Some(" 250 ")), Duration::from_millis(250));
+    fn a_cold_start_cursor_is_a_bounded_lookback_not_origin() {
+        let cold = start_cursor(None, 10_000);
+        assert_eq!(
+            cold,
+            format!(
+                "{}:{}",
+                10_000 - COLD_START_LOOKBACK.as_secs(),
+                "0".repeat(64)
+            )
+        );
+        assert_ne!(cold, "head");
+        assert_eq!(start_cursor(Some(String::new()), 10_000), cold);
+        let warm = format!("1007:{}", hex(7));
+        assert_eq!(start_cursor(Some(warm.clone()), 10_000), warm);
     }
 
     #[test]
@@ -648,74 +648,47 @@ mod tests {
         }
     }
 
-    /// Overload, exact counts: a wedged brain (never drains) with a 1-slot
-    /// channel and 500 offered lines. Line 1 fills the slot; line 2 waits the
-    /// whole window and is the ONE drop that reports a death; lines 3..=500
-    /// are dropped at once on the condemned consumer. Exactly 499 dropped,
-    /// exactly 1 death, 1 `wake_brain_full`, and the resume cursor is line 1 —
-    /// the last line the brain actually accepted.
+    /// A replay larger than the channel neither drops nor ends the consumer:
+    /// every line parks until the brain takes it, and the cursor ends past the
+    /// last event. This is the shape that looped live (a 1,321-line replay into
+    /// a 1,024-slot channel): the old deadline dropped and condemned here.
     #[test]
-    fn overload_drops_are_counted_exactly_and_resume_from_the_last_accepted_line() {
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let park = FakePark::new(|_| {});
+    fn a_replay_larger_than_the_channel_neither_drops_nor_ends_the_consumer() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let rx = Arc::new(Mutex::new(rx));
+        let brain = rx.clone();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let sink = seen.clone();
+        let park = FakePark::new(move |_| {
+            if let Ok(BrainMsg::Watch(l)) = brain.lock().unwrap().try_recv() {
+                sink.lock().unwrap().push(l);
+            }
+        });
         let c = fresh_counters();
         let resume = Arc::new(Mutex::new(None));
-        let rows: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::default();
-        let sink = rows.clone();
-        let fw = WatchForwarder::new(tx, c.clone(), resume.clone())
-            .with_park(park.clone())
-            .with_audit(Arc::new(move |k, v| {
-                sink.lock().unwrap().push((k.to_string(), v));
-            }));
-        let outcomes: Vec<Forwarded> = (1..=500).map(|n| fw.forward(line(n))).collect();
-        assert_eq!(outcomes[0], Forwarded::Delivered);
-        let deaths = outcomes
-            .iter()
-            .filter(|o| {
-                matches!(
-                    o,
-                    Forwarded::Dropped {
-                        report_death: true,
-                        ..
-                    }
-                )
-            })
-            .count();
-        assert_eq!(deaths, 1, "one death per consumer, not one per line");
-        let s = c.snapshot();
-        assert_eq!(s.forwarded, 1);
-        assert_eq!(
-            s.wake_brain_full, 1,
-            "only line 2 was offered to a full channel"
+        let fw = WatchForwarder::new(tx, c.clone(), resume.clone()).with_park(park.clone());
+        let outcomes: Vec<Forwarded> = (1..=50).map(|n| fw.forward(line(n))).collect();
+        assert!(
+            outcomes.iter().all(|o| o.reached_brain()),
+            "a slow brain must never shed a line: {outcomes:?}"
         );
-        assert_eq!(s.backpressured, 0);
-        assert_eq!(s.dropped, 499, "exact, not sampled");
-        assert!(s.last_drop_unix.is_some());
-        let expected_parks =
-            (BACKPRESSURE_WAIT.as_millis() / BACKPRESSURE_POLL.as_millis()) as usize;
-        assert_eq!(park.parks.load(Ordering::SeqCst), expected_parks);
+        let s = c.snapshot();
+        assert_eq!(s.forwarded, 50);
+        assert_eq!(s.dropped, 0);
+        assert_eq!(s.backpressured, 46, "every line past the 4 slots parked");
+        assert_eq!(s.wake_brain_full, 46);
+        assert!(park.parks.load(Ordering::SeqCst) >= 46);
         assert_eq!(
             resume.lock().unwrap().clone(),
-            Some(format!("1001:{}", hex(1))),
-            "the replacement must replay from the last accepted line"
+            Some(format!("1050:{}", hex(50))),
+            "the cursor ends past the last accepted event"
         );
-        let rows = rows.lock().unwrap();
-        let drop_rows: Vec<_> = rows
-            .iter()
-            .filter(|(k, _)| k == AUDIT_WAKE_BRAIN_DROPPED)
-            .collect();
-        assert!(
-            drop_rows.len() <= 12,
-            "sampled, not one row per drop: {}",
-            drop_rows.len()
-        );
-        assert_eq!(drop_rows.last().unwrap().1["dropped_total"], 257);
-        assert!(
-            rows.iter()
-                .filter(|(k, _)| k == AUDIT_WAKE_BRAIN_FULL)
-                .all(|(_, v)| v.get("dropped").is_none()),
-            "full rows never carry a bare `dropped` key"
-        );
+        while let Ok(BrainMsg::Watch(l)) = rx.lock().unwrap().try_recv() {
+            seen.lock().unwrap().push(l);
+        }
+        let got = seen.lock().unwrap().clone();
+        let want: Vec<String> = (1..=50).map(line).collect();
+        assert_eq!(got, want, "order preserved, nothing lost");
     }
 
     /// A closed channel (brain gone) drops without waiting and is flagged.
@@ -748,27 +721,33 @@ mod tests {
             uuid_like()
         ));
         let path = snapshot_path(&dir, "ws-persist");
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
         let c = fresh_counters();
         let resume = Arc::new(Mutex::new(None));
         let first = WatchForwarder::new(tx.clone(), c.clone(), resume.clone())
             .with_park(FakePark::new(|_| {}))
             .persist_to(path.clone());
         assert_eq!(first.forward(line(1)), Forwarded::Delivered);
-        for n in 2..=10 {
-            let _ = first.forward(line(n));
-        }
-        assert_eq!(c.snapshot().dropped, 9);
-        rx.try_recv().unwrap();
-        let second = WatchForwarder::new(tx, c.clone(), resume)
+        drop(rx);
+        assert!(matches!(
+            first.forward(line(2)),
+            Forwarded::Dropped {
+                report_death: true,
+                closed: true
+            }
+        ));
+        assert_eq!(c.snapshot().dropped, 1);
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel(1);
+        let second = WatchForwarder::new(tx2, c.clone(), resume)
             .with_park(FakePark::new(|_| {}))
             .persist_to(path.clone());
         assert_eq!(second.resume_cursor(), Some(format!("1001:{}", hex(1))));
         assert_eq!(second.forward(line(2)), Forwarded::Delivered);
+        rx2.try_recv().unwrap();
         let on_disk: WakeBrainSnapshot =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(on_disk, c.snapshot(), "episode end flushed the exact count");
-        assert_eq!((on_disk.dropped, on_disk.forwarded), (9, 2));
+        assert_eq!((on_disk.dropped, on_disk.forwarded), (1, 2));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

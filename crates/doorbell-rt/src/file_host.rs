@@ -476,11 +476,6 @@ pub struct FileHostConfig {
     /// Registry file override (tests/sandbox). `None` resolves
     /// `agents/{key}.json` under the flywheel state dir.
     pub registry_file: Option<PathBuf>,
-    /// mcc9: how long a wake forwarder parks on a full brain channel before
-    /// it drops (counted) and condemns its consumer. Default
-    /// [`crate::wake_brain::BACKPRESSURE_WAIT`]; the daemon takes
-    /// [`crate::wake_brain::WAIT_ENV`] at its boundary (fixtures only).
-    pub wake_brain_wait: std::time::Duration,
 }
 
 impl FileHostConfig {
@@ -497,7 +492,6 @@ impl FileHostConfig {
             toron_bin: "toron".into(),
             plane_bin: "hc".into(),
             registry_file: None,
-            wake_brain_wait: crate::wake_brain::BACKPRESSURE_WAIT,
         }
     }
 }
@@ -1977,7 +1971,6 @@ impl Host for FileHost {
         let absent = self.absent_rows.clone();
         let wake_counters = self.wake_counters.clone();
         let wake_resume = self.wake_resume.clone();
-        let wake_wait = self.cfg.wake_brain_wait;
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
             pending.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -2016,7 +2009,6 @@ impl Host for FileHost {
                     wake_counters.clone(),
                     wake_resume.clone(),
                 )
-                .with_wait(wake_wait)
                 .with_audit(std::sync::Arc::new(move |kind, detail| {
                     FileHost::append_audit_row(&st, &ws, kind, detail);
                 }))
@@ -3431,26 +3423,25 @@ mod tests {
         assert!(!host3.inject_allowed("PinA"), "stale gen refuses");
         let _ = std::fs::remove_dir_all(&dir);
     }
-    /// A full channel reports ONE death, not one per line. The live burst
+    /// A closed channel reports ONE death, not one per line. The live burst
     /// (2026-09-28 03:53-03:56Z) was 1,928 `Died` rows
     /// in one workspace, peaking at 127 inside a single second and pulsing
     /// every few seconds for three minutes — each one claiming the child had
     /// died, each one advancing the retry backoff, and not one audit row to
     /// show for any of it.
     ///
-    /// mcc9: the rule now lives in the shared forwarder, so this pins it there
-    /// on a wedged 1-slot channel (zero backpressure window, so no waiting).
+    /// A merely FULL channel no longer terminates anything (it parks); only a
+    /// closed brain ends the consumer, and that is reported once.
     #[test]
-    fn a_full_channel_reports_one_death_not_one_per_line() {
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        tx.try_send(BrainMsg::Watch("fill".into())).unwrap();
+    fn a_closed_channel_reports_one_death_not_one_per_line() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
         let counters = std::sync::Arc::new(crate::wake_brain::WakeBrainCounters::default());
         let fw = crate::wake_brain::WatchForwarder::new(
             tx,
             counters.clone(),
             std::sync::Arc::new(std::sync::Mutex::new(None)),
-        )
-        .with_wait(std::time::Duration::ZERO);
+        );
         let actions: Vec<crate::wake_brain::Forwarded> =
             (0..200).map(|n| fw.forward(format!("line-{n}"))).collect();
         let deaths = actions

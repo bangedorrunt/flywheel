@@ -1210,7 +1210,10 @@ impl Host for RtHost {
             let tx_g = tx.clone();
             let beat_workspace = workspace.clone();
             let retry = retry.clone();
-            let resume_from = resume.lock().ok().and_then(|g| g.clone());
+            let resume_from = Some(doorbell_rt::wake_brain::start_cursor(
+                resume.lock().ok().and_then(|g| g.clone()),
+                unix_now(),
+            ));
             if let Some(from) = &resume_from {
                 counters.note_resume();
                 doorbell::audit_append(
@@ -1471,7 +1474,10 @@ async fn run_embedded_async(
             &project,
             workspace,
             &config::state_dir(),
-            doorbell_rt::wake_brain::read_cursor(&config::state_dir(), workspace),
+            Some(doorbell_rt::wake_brain::start_cursor(
+                doorbell_rt::wake_brain::read_cursor(&config::state_dir(), workspace),
+                unix_now(),
+            )),
             retired,
             move |out| {
                 wake_outcome_to_brain(
