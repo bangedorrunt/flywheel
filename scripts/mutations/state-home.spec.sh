@@ -12,15 +12,16 @@ set -uo pipefail
 CARGO_ARGS=(--bin flywheel)
 TEST_FILTER=(config::tests::)
 
-mutation "M1: constructor stops pinning XDG_STATE_HOME" \
+mutation "M1  constructor stops pinning XDG_STATE_HOME" \
   file=src/config.rs \
-  find='    let prev = std::env::var_os("XDG_STATE_HOME");
-    unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };' \
-  replace='    let prev = std::env::var_os("XDG_STATE_HOME");
-    let _ = &dir;' \
+  find='        std::env::remove_var("FLYWHEEL_BR_BIN");
+        std::env::set_var("XDG_STATE_HOME", &dir);
+    }' \
+  replace='        std::env::remove_var("FLYWHEEL_BR_BIN");
+    }' \
   expect=lock_env_pins_a_private_hermetic_state_dir
 
-mutation "M2: drop clears the var instead of restoring the prior value" \
+mutation "M2  drop clears the var instead of restoring the prior value" \
   file=src/config.rs \
   find='        match self.prev.take() {
             Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
@@ -32,23 +33,17 @@ mutation "M2: drop clears the var instead of restoring the prior value" \
 
 # M3: every lock-holder gets the SAME dir, so a stale fixture is inherited by
 # the next test. This is the bd-9w95 flake mechanism, so it must be RED.
-mutation "M3: lock_env returns a shared dir instead of a fresh one" \
+mutation "M3  lock_env returns a shared dir instead of a fresh one" \
   file=src/config.rs \
-  find='pub fn lock_env() -> TestStateHome {
-    test_state_home()
-}' \
-  replace='pub fn lock_env() -> TestStateHome {
+  find='    let dir = std::env::temp_dir().join(format!(
+        "flywheel-state-home-{}-{nanos}",
+        std::process::id()
+    ));' \
+  replace='    let _ = nanos;
     static SHARED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    let dir = SHARED.get_or_init(|| {
-        let d = std::env::temp_dir().join("flywheel-bd-uu58-shared");
-        std::fs::create_dir_all(&d).expect("create shared");
-        d
-    });
-    let _env = ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let prev = std::env::var_os("XDG_STATE_HOME");
-    unsafe { std::env::set_var("XDG_STATE_HOME", dir) };
-    TestStateHome { _env, dir: dir.clone(), prev }
-}' \
+    let dir = SHARED
+        .get_or_init(|| {
+            std::env::temp_dir().join(format!("flywheel-state-home-{}-shared", std::process::id()))
+        })
+        .clone();' \
   expect=lock_env_pins_a_private_hermetic_state_dir
