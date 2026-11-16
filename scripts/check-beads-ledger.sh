@@ -12,7 +12,12 @@
 #   1. every row that exists at base still exists, and
 #   2. no row that was `closed` at base reads anything else now.
 # Pass 3 (`--history`, opt-in) additionally requires that every bead a commit
-# subject claims to close still reads `closed`.
+# CLAIMS to close still reads `closed`. A claim is a structured trailer -
+# `Closes: bd-x` / `Closed: bd-x` in the message body - never a bead id that
+# merely appears in prose: "close the duplicates against bd-3vkpe" names a
+# survivor and a bead under work, it does not claim either is closed. Reading
+# prose made the gate cry wolf, and a guard everyone force-passes is not a
+# guard (bd-i4fqc follow-up).
 #
 # Passes 1-2 in CI (`--base origin/<base_ref>`) are what catches a branch that
 # publishes a snapshot from a stale sqlite: locally the worktree equals HEAD, so
@@ -36,8 +41,22 @@ LEDGER=".beads/issues.jsonl"
 HISTORY=0
 FORCE_REASON=""
 
+# The ids a commit CLAIMS to close: `Closes:` or `Closed:` trailers in the
+# message body, comma/space separated. Pure text -> ids, so the self-test can
+# pin it without a repo.
+history_claims_text() {
+  grep -oE '^(Closes|Closed):[[:space:]].*$' \
+    | grep -oE 'bd-[A-Za-z0-9._-]+' || true
+}
+
+history_claims() {
+  git log --format=%B "$1" | history_claims_text | sort -u
+}
+
+SELF_TEST=0
 while [ $# -gt 0 ]; do
   case "$1" in
+    --self-test)   SELF_TEST=1; shift ;;
     --base)        BASE="${2:-}"; shift 2 ;;
     --base-ledger) BASE_LEDGER="${2:-}"; shift 2 ;;
     --ledger)      LEDGER="${2:-}"; shift 2 ;;
@@ -47,6 +66,19 @@ while [ $# -gt 0 ]; do
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+
+if [ "$SELF_TEST" -eq 1 ]; then
+  # A prose mention is NOT a claim; a trailer is. Fixture messages, no repo.
+  prose="$(printf 'chore(beads): close the duplicates against bd-alpha (bd-beta)\n' | history_claims_text)"
+  trailer="$(printf 'fix: the thing\n\nCloses: bd-alpha, bd-beta\n' | history_claims_text)"
+  [ -z "$prose" ] || { echo "self-test: prose produced a claim: $prose" >&2; exit 1; }
+  [ "$trailer" = "$(printf 'bd-alpha\nbd-beta')" ] || {
+    echo "self-test: trailer claims were $trailer" >&2
+    exit 1
+  }
+  echo "self-test ok"
+  exit 0
+fi
 
 [ -n "$BASE" ] || { echo "--base needs a revision" >&2; exit 2; }
 cd "$ROOT"
@@ -79,16 +111,11 @@ if [ "$HISTORY" -eq 1 ]; then
     echo "(re-run with \`git fetch --unshallow\`, or drop --history)" >&2
     exit 2
   fi
-  # The ids a commit SUBJECT claims to close. Prose subjects are the norm
-  # ("close bd-a, bd-b; file bd-c"), so the close clause ends at the first
-  # `;` or at a "file"/"and"/"then" keyword — anything past that names beads
-  # in some other role. Only ids that HAVE a row are reported: an id with no
-  # row was never in this ledger (a foreign lane's bead), which is absence,
-  # not a regression.
-  HISTORY_IDS="$(git log --format=%s "$BASE" \
-    | grep -oE 'close[[:space:]]+[^;]*' \
-    | sed -E 's/([[:space:]]|^)(file|and|then|plus)([[:space:]]|$).*/ /' \
-    | grep -oE 'bd-[A-Za-z0-9._-]+' || true)"
+  # Structured trailers only (see the header): a subject that mentions an id
+  # is prose, and prose is not a claim. Only ids that HAVE a row are reported:
+  # an id with no row was never in this ledger (a foreign lane's bead), which
+  # is absence, not a regression.
+  HISTORY_IDS="$(history_claims "$BASE")"
 fi
 
 RC=0

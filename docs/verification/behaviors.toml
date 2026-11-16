@@ -790,3 +790,16 @@ mutations = [
   "scripts/mutations/awareness-dedupe.spec.sh#A4",
   "scripts/mutations/awareness-dedupe.spec.sh#A5",
 ]
+
+[[behavior]]
+id = "ledger.claims-are-trailers"
+owner = "scripts/check-beads-ledger.sh"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/clean_proof.rs::the_beads_ledger_guard_reads_trailers_not_prose",
+]
+mutations = [
+  "scripts/mutations/ledger-claims.spec.sh#L1",
+  "scripts/mutations/ledger-claims.spec.sh#L2",
+]

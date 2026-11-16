@@ -608,3 +608,21 @@ fn clean_proof_computes_and_passes_a_cache_key() {
         "a full run bypasses the cache"
     );
 }
+
+/// The beads-ledger guard reads a close CLAIM from a structured trailer, never
+/// from a bead id that merely appears in prose (bd-sy7vn). Its own self-test
+/// pins both directions; a subject like "close the duplicates against bd-x"
+/// must not read as a claim on bd-x.
+#[test]
+fn the_beads_ledger_guard_reads_trailers_not_prose() {
+    let out = Command::new("bash")
+        .arg(repo_root().join("scripts/check-beads-ledger.sh"))
+        .arg("--self-test")
+        .output()
+        .expect("run the ledger guard self-test");
+    assert!(
+        out.status.success(),
+        "ledger guard self-test failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
