@@ -212,6 +212,78 @@ impl ReleaseWaits {
     }
 }
 
+fn row_str<'a>(row: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    row.get(key).and_then(serde_json::Value::as_str)
+}
+
+fn row_body(row: &serde_json::Value) -> Option<serde_json::Value> {
+    row_str(row, "body_md")
+        .or_else(|| row_str(row, "body"))
+        .and_then(|b| serde_json::from_str(b).ok())
+}
+
+fn row_field(row: &serde_json::Value, key: &str) -> Option<String> {
+    let body = row_body(row);
+    body.as_ref()
+        .and_then(|b| b.get(key).and_then(serde_json::Value::as_str))
+        .or_else(|| row_str(row, key))
+        .map(str::to_string)
+}
+
+/// The `(verb, path)` a peer directive row carries: the `p2p:<verb> <path>`
+/// subject, the `[request-release] <path>` subject, or the body's
+/// `{"verb":…,"path":…}`. All three exist live.
+fn verb_and_path(row: &serde_json::Value) -> Option<(String, String)> {
+    let subject = row_str(row, "subject").unwrap_or("");
+    if let Some(rest) = subject.strip_prefix("p2p:") {
+        let mut parts = rest.splitn(2, ' ');
+        return Some((
+            parts.next()?.to_string(),
+            parts.next().unwrap_or("").trim().to_string(),
+        ));
+    }
+    if let Some(rest) = subject.strip_prefix("[request-release]") {
+        return Some(("request-release".to_string(), rest.trim().to_string()));
+    }
+    let body = row_body(row)?;
+    Some((
+        body.get("verb")?.as_str()?.to_string(),
+        body.get("path")?.as_str()?.to_string(),
+    ))
+}
+
+/// Arm (b)'s input: a `request-release` row in the HOLDER's inbox. `holder` is
+/// the pin whose inbox carried it, `sender` is the requester, and the ask is
+/// timed from the row's own rumor time (not the sweep clock).
+pub fn release_request(row: &serde_json::Value, holder: &str) -> Option<ReleaseWait> {
+    let (verb, path) = verb_and_path(row)?;
+    if verb != "request-release" || path.is_empty() {
+        return None;
+    }
+    let requester = row_str(row, "sender")?.trim();
+    if requester.is_empty() || requester == holder {
+        return None;
+    }
+    let asked_at = crate::row_created_us(row)?.max(0) / 1_000_000;
+    Some(ReleaseWait {
+        path,
+        requester: requester.to_string(),
+        holder: holder.to_string(),
+        bead: row_field(row, "bead").unwrap_or_default(),
+        asked_at: asked_at as u64,
+    })
+}
+
+/// The answer: a `release-response` row in the REQUESTER's inbox. Its subject
+/// or body names the path; the ask is cleared by (path, requester).
+pub fn release_answer(row: &serde_json::Value) -> Option<String> {
+    let (verb, path) = verb_and_path(row)?;
+    if verb != "release-response" || path.is_empty() {
+        return None;
+    }
+    Some(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +401,66 @@ mod tests {
         assert_eq!(e.kind, ObserveKind::Fork);
         assert_eq!(e.subject, "bd-a", "one fork per bead");
         assert_eq!(e.evidence, "fix here or hand over?");
+    }
+
+    /// Arm (b)'s data: a request row names its path, its requester, its holder,
+    /// its bead and its age — and nothing else parses as one.
+    #[test]
+    fn a_release_request_row_parses_from_subject_or_body() {
+        let subject_form = serde_json::json!({
+            "subject": "p2p:request-release src/a.rs",
+            "sender": "BoldBay",
+            "created_ts_us": 1_000_000_000i64,
+            "body": r#"{"verb":"request-release","path":"src/a.rs","bead":"bd-a"}"#,
+        });
+        let wait = release_request(&subject_form, "CyanCove").expect("subject form");
+        assert_eq!(wait.path, "src/a.rs");
+        assert_eq!(wait.requester, "BoldBay");
+        assert_eq!(wait.holder, "CyanCove");
+        assert_eq!(wait.bead, "bd-a");
+        assert_eq!(wait.asked_at, 1_000, "age is timed from the rumor time");
+
+        let body_form = serde_json::json!({
+            "sender": "BoldBay",
+            "created_ts_us": 1_000_000_000i64,
+            "body": r#"{"verb":"request-release","path":"src/b.rs","bead":"bd-b"}"#,
+        });
+        assert_eq!(
+            release_request(&body_form, "CyanCove").map(|w| w.path),
+            Some("src/b.rs".to_string())
+        );
+
+        for not_a_request in [
+            serde_json::json!({"subject": "p2p:release-response src/a.rs", "sender": "BoldBay"}),
+            serde_json::json!({"subject": "bd-a: ordinary mail", "sender": "BoldBay"}),
+            serde_json::json!({"subject": "p2p:request-release ", "sender": "BoldBay"}),
+            serde_json::json!({"subject": "p2p:request-release src/a.rs", "sender": "CyanCove"}),
+        ] {
+            assert_eq!(
+                release_request(&not_a_request, "CyanCove"),
+                None,
+                "{not_a_request}"
+            );
+        }
+    }
+
+    /// Only a response answers an ask — a second request on the same path is
+    /// not an answer, and a response names the path so the key can match.
+    #[test]
+    fn only_a_release_response_answers_an_ask() {
+        let answer =
+            serde_json::json!({"subject": "p2p:release-response src/a.rs", "sender": "CyanCove"});
+        assert_eq!(release_answer(&answer), Some("src/a.rs".to_string()));
+        let answer_body = serde_json::json!({
+            "body": r#"{"verb":"release-response","path":"src/b.rs","status":"yield"}"#,
+        });
+        assert_eq!(release_answer(&answer_body), Some("src/b.rs".to_string()));
+        let request = serde_json::json!({"subject": "p2p:request-release src/a.rs"});
+        assert_eq!(release_answer(&request), None);
+        assert_eq!(
+            release_answer(&serde_json::json!({"subject": "plain"})),
+            None
+        );
     }
 
     /// Distinct subjects are distinct episodes, and the kind is part of the key

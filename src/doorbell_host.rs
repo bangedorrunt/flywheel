@@ -903,6 +903,12 @@ impl Host for RtHost {
     /// bd-3vkpe: only pins that still HAVE a pane can hear a ring. A gone or
     /// retired pin's row stays in the registry, so `pins()` is the wrong
     /// question for a wake — the plane holds the truth.
+    /// bd-jhz8x.2: observe escalations go to the captain. Same fold the guard
+    /// and `retire` use, never a name literal.
+    fn captain_pin(&self) -> Option<String> {
+        state::captain_pin(&self.project, &self.project)
+    }
+
     fn live_pins(&self) -> Option<Vec<String>> {
         let registry = state::load_spawn_registry(&self.project);
         let backend = crate::backend::multiplexer_backend(&self.cfg).ok()?;

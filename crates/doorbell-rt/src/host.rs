@@ -135,6 +135,12 @@ pub trait Host: Send {
     fn live_pins(&self) -> Option<Vec<String>> {
         None
     }
+    /// The captain pin this brain escalates observe findings to (bd-jhz8x.2).
+    /// `None` = this host cannot say, and the escalation is JOURNALED rather
+    /// than dropped.
+    fn captain_pin(&self) -> Option<String> {
+        None
+    }
     /// Npub for hear tracking (.5: SelfIndex; default unknown).
     fn pin_npub(&self, _pin: &str) -> Option<String> {
         None

@@ -207,6 +207,14 @@ pub struct Brain<H: Host> {
     /// std's map, and are keyed by pin (tens of rows), so this stays std.
     budgets: std::collections::BTreeMap<String, PinBudget>,
     hear: HearTracker,
+    /// bd-jhz8x.2: when each pin's pane entered `blocked`, and the episodes
+    /// already escalated (so one blocked bead rings once, not every sweep).
+    blocked_since: std::collections::BTreeMap<String, u64>,
+    escalated: doorbell_core::observe::EscalateSet,
+    /// Forks seen in inbox rows since the last sweep (`[fork] <bead>: <q>`).
+    pending_forks: Vec<doorbell_core::observe::ObserveEscalation>,
+    /// bd-jhz8x.2 arm (b): unanswered peer request-release asks.
+    release_waits: doorbell_core::observe::ReleaseWaits,
     wake: doorbell_core::WakeState,
     digest: Vec<(String, String)>,
     digest_since: Option<tokio::time::Instant>,
@@ -329,6 +337,10 @@ impl<H: Host> Brain<H> {
             sinks,
             budgets,
             hear,
+            blocked_since: std::collections::BTreeMap::new(),
+            escalated: doorbell_core::observe::EscalateSet::default(),
+            pending_forks: Vec::new(),
+            release_waits: doorbell_core::observe::ReleaseWaits::default(),
             wake,
             digest: Vec::new(),
             digest_since: None,
@@ -721,6 +733,15 @@ impl<H: Host> Brain<H> {
         self.flush_journal("status");
         let delivered = self.deliver_prompts(injects).await;
         let s = status.to_ascii_lowercase();
+        // bd-jhz8x.2 arm (a): the clock starts when the pane ENTERS blocked and
+        // is cleared the moment it leaves — a flapping pane never accumulates.
+        if s == "blocked" {
+            self.blocked_since
+                .entry(pin.clone())
+                .or_insert_with(|| self.host.now_unix());
+        } else {
+            self.blocked_since.remove(&pin);
+        }
         let transitioned = match from.as_deref() {
             Some(f) => f != s.as_str(),
             None => true,
@@ -850,6 +871,7 @@ impl<H: Host> Brain<H> {
                 std::slice::from_ref(&pin),
             );
         }
+        self.emit_observe_escalations(now).await;
         let unanswered = self.hear.unanswered_pins();
         self.deaf_attempts.retain(|pin, _| unanswered.contains(pin));
         // Post-start hear-map gap: the host index learns npubs after
@@ -865,7 +887,93 @@ impl<H: Host> Brain<H> {
         self.persist_hear();
     }
 
+    /// bd-jhz8x.2 (ADR-0021 D4.5): the observe arms, in the engine. One line per
+    /// (kind, subject) EPISODE, addressed to the captain. A host that cannot
+    /// name the captain gets a journaled audit instead — never a silent drop.
+    async fn emit_observe_escalations(&mut self, now: u64) {
+        use doorbell_core::observe::{BLOCKED_AFTER_SECS, ObserveEscalation};
+
+        let mut escalations: Vec<ObserveEscalation> = Vec::new();
+        let mut blocked: Vec<(&String, u64)> = self
+            .blocked_since
+            .iter()
+            .map(|(pin, since)| (pin, now.saturating_sub(*since)))
+            .filter(|(_, age)| *age >= BLOCKED_AFTER_SECS)
+            .collect();
+        blocked.sort();
+        for (pin, age) in blocked {
+            escalations.push(ObserveEscalation::blocked_bead(
+                pin,
+                pin,
+                age,
+                "unblock a blocked pane earlier: split the step, or mark the fork before it blocks",
+            ));
+        }
+        escalations.append(&mut self.pending_forks);
+        escalations.extend(self.release_waits.expired(now));
+
+        let fresh = self
+            .escalated
+            .new_since(&escalations)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        if fresh.is_empty() {
+            return;
+        }
+        let captain = self.host.captain_pin();
+        let mut effects = Vec::new();
+        for escalation in &fresh {
+            let line = escalation.line();
+            match &captain {
+                Some(pin) => effects.push(Effect::Prompt {
+                    pin: pin.clone(),
+                    line,
+                }),
+                None => effects.push(Effect::Audit {
+                    kind: "observe-escalation".into(),
+                    pin: escalation.subject.clone(),
+                    detail: serde_json::json!({
+                        "reason": "no captain bound for this project",
+                        "line": line,
+                    }),
+                }),
+            }
+        }
+        self.journal(
+            &serde_json::json!({"rt_kind": "Observe"}),
+            &effects,
+            serde_json::json!({"stage": "escalate", "count": fresh.len()}),
+            &fresh.iter().map(|e| e.subject.clone()).collect::<Vec<_>>(),
+        );
+        self.deliver(effects, "observe").await;
+    }
+
     async fn on_inbox_fetched(&mut self, pin: String, rows: Vec<serde_json::Value>) {
+        // bd-jhz8x.2 arm (c): an explicit fork is a mail SUBJECT of
+        // `[fork] <bead>: <question>`. Parks until the next sweep so the
+        // episode rule and the captain address live in one place.
+        for row in &rows {
+            let Some(subject) = row.get("subject").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if let Some((bead, question)) = doorbell_core::observe::fork_subject(subject) {
+                self.pending_forks
+                    .push(doorbell_core::observe::ObserveEscalation::fork(
+                        bead, question,
+                    ));
+            }
+        }
+        // Arm (b): asks this pin holds, and answers to its own asks (a
+        // release-response lands in the REQUESTER's inbox, so the fetch pin is
+        // the requester the answer clears).
+        for row in &rows {
+            if let Some(wait) = doorbell_core::observe::release_request(row, &pin) {
+                self.release_waits.note_request(wait);
+            } else if let Some(path) = doorbell_core::observe::release_answer(row) {
+                self.release_waits.note_answered(&path, &pin);
+            }
+        }
         let fetched = !rows.is_empty();
         let refs: Vec<&serde_json::Value> = rows.iter().collect();
         let hw = doorbell_core::inbox_high_water_from_values(refs.clone());
@@ -1524,6 +1632,346 @@ mod tests {
         if let Some(watch_at) = got.iter().position(|s| s == "watch") {
             assert!(restart_at < watch_at, "{got:?}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-jhz8x.2 arm (a)+(c): a blocked pane past the window reaches the
+    /// CAPTAIN as one observe line carrying its lesson, once per episode; a
+    /// resolved block re-rings on a recurrence. This is what replaces the
+    /// `wave-observe` seat.
+    #[tokio::test]
+    async fn a_blocked_pane_escalates_to_the_captain_once_per_episode() {
+        struct ObserveHost {
+            captain: Option<String>,
+        }
+        impl Host for ObserveHost {
+            fn tick(&mut self, _msg: &BrainMsg) -> Vec<crate::host::Effect> {
+                Vec::new()
+            }
+            fn now_unix(&self) -> u64 {
+                1_000
+            }
+            fn pins(&self) -> Vec<String> {
+                vec!["CyanCove".to_string()]
+            }
+            fn captain_pin(&self) -> Option<String> {
+                self.captain.clone()
+            }
+            fn fetch_inbox(&self, _pin: &str, _since: &str) -> Vec<serde_json::Value> {
+                Vec::new()
+            }
+            fn scan_ack_sla(&mut self) -> Vec<String> {
+                Vec::new()
+            }
+            fn restart_wake(&mut self) -> bool {
+                false
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("observe-brain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tx, _rx) = tokio::sync::mpsc::channel(crate::BRAIN_CAP);
+        let sinks = SinkManager::new(tx.clone());
+        let (sink, sent) = MockSink::new();
+        let mut brain = Brain::new(
+            BrainConfig::new("observe"),
+            ObserveHost {
+                captain: Some("SlateHarbor".to_string()),
+            },
+            FileStore::new(dir.clone()),
+            sinks,
+        );
+        brain.sinks.add_sink("hc", Box::new(sink));
+
+        // Blocked at t=1000; the window is 600s.
+        brain
+            .dispatch(BrainMsg::PlaneStatus {
+                pin: "CyanCove".into(),
+                status: "blocked".into(),
+            })
+            .await;
+        // The sink worker is its own task, so "nothing sent" needs a settle
+        // window and "sent" needs a wait — never a bare len() right after.
+        async fn settle() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        async fn wait_for(
+            sent: &std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+            want: usize,
+        ) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if sent.lock().unwrap_or_else(|e| e.into_inner()).len() >= want {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("expected {want} escalation line(s)"));
+        }
+
+        brain.dispatch(BrainMsg::Sweep { now: 1_599 }).await;
+        settle().await;
+        assert!(
+            sent.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "under the window nothing escalates"
+        );
+        brain.dispatch(BrainMsg::Sweep { now: 1_600 }).await;
+        wait_for(&sent, 1).await;
+        let lines: Vec<String> = sent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(pin, line)| format!("{pin}|{line}"))
+            .collect();
+        assert_eq!(lines.len(), 1, "one escalation: {lines:?}");
+        assert!(lines[0].starts_with("SlateHarbor|"), "{lines:?}");
+        assert!(lines[0].contains("[observe] blocked-bead"), "{lines:?}");
+        assert!(
+            lines[0].contains("lesson:"),
+            "the lesson rides along: {lines:?}"
+        );
+
+        // Same episode: silent on the next sweep.
+        brain.dispatch(BrainMsg::Sweep { now: 1_900 }).await;
+        settle().await;
+        assert_eq!(
+            sent.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            1,
+            "one ring per episode"
+        );
+
+        // Resolved, then blocked again: a new episode rings again.
+        brain
+            .dispatch(BrainMsg::PlaneStatus {
+                pin: "CyanCove".into(),
+                status: "idle".into(),
+            })
+            .await;
+        brain.dispatch(BrainMsg::Sweep { now: 2_000 }).await;
+        brain
+            .dispatch(BrainMsg::PlaneStatus {
+                pin: "CyanCove".into(),
+                status: "blocked".into(),
+            })
+            .await;
+        brain.dispatch(BrainMsg::Sweep { now: 2_601 }).await;
+        wait_for(&sent, 2).await;
+        assert_eq!(
+            sent.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            2,
+            "a recurrence is a new episode"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-jhz8x.2 arm (c): a `[fork] <bead>: <question>` SUBJECT reaches the
+    /// captain once per bead, with the question as evidence. Two forks on one
+    /// bead are still one episode; a normal subject is never a fork.
+    #[tokio::test]
+    async fn a_fork_subject_escalates_to_the_captain_once_per_bead() {
+        struct ForkHost;
+        impl Host for ForkHost {
+            fn tick(&mut self, _msg: &BrainMsg) -> Vec<crate::host::Effect> {
+                Vec::new()
+            }
+            fn now_unix(&self) -> u64 {
+                1_000
+            }
+            fn pins(&self) -> Vec<String> {
+                vec!["CyanCove".to_string()]
+            }
+            fn captain_pin(&self) -> Option<String> {
+                Some("SlateHarbor".to_string())
+            }
+            fn fetch_inbox(&self, _pin: &str, _since: &str) -> Vec<serde_json::Value> {
+                Vec::new()
+            }
+            fn scan_ack_sla(&mut self) -> Vec<String> {
+                Vec::new()
+            }
+            fn restart_wake(&mut self) -> bool {
+                false
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("fork-brain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tx, _rx) = tokio::sync::mpsc::channel(crate::BRAIN_CAP);
+        let sinks = SinkManager::new(tx.clone());
+        let (sink, sent) = MockSink::new();
+        let mut brain = Brain::new(
+            BrainConfig::new("fork"),
+            ForkHost,
+            FileStore::new(dir.clone()),
+            sinks,
+        );
+        brain.sinks.add_sink("hc", Box::new(sink));
+
+        brain
+            .dispatch(BrainMsg::InboxFetched {
+                pin: "CyanCove".into(),
+                rows: vec![
+                    serde_json::json!({"subject": "[fork] bd-a: fix here or hand over?"}),
+                    serde_json::json!({"subject": "[fork] bd-a: or split the bead?"}),
+                    serde_json::json!({"subject": "bd-b: not a fork"}),
+                ],
+            })
+            .await;
+        brain.dispatch(BrainMsg::Sweep { now: 1_100 }).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !sent.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the fork reaches the captain");
+        let lines: Vec<String> = sent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(pin, line)| format!("{pin}|{line}"))
+            .collect();
+        assert_eq!(lines.len(), 1, "one episode per bead: {lines:?}");
+        assert!(
+            lines[0].starts_with("SlateHarbor|[observe] fork bd-a:"),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("fix here or hand over?"), "{lines:?}");
+        assert!(lines[0].contains("lesson:"), "{lines:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-jhz8x.2 arm (b): a request-release the holder never answered inside
+    /// one lease period reaches the captain once, with holder, bead and age;
+    /// the response clears it, and a later ask is a fresh episode.
+    #[tokio::test]
+    async fn an_unanswered_release_request_escalates_to_the_captain_once() {
+        struct ReleaseHost;
+        impl Host for ReleaseHost {
+            fn tick(&mut self, _msg: &BrainMsg) -> Vec<crate::host::Effect> {
+                Vec::new()
+            }
+            fn now_unix(&self) -> u64 {
+                1_000
+            }
+            fn pins(&self) -> Vec<String> {
+                vec!["CyanCove".to_string()]
+            }
+            fn captain_pin(&self) -> Option<String> {
+                Some("SlateHarbor".to_string())
+            }
+            fn fetch_inbox(&self, _pin: &str, _since: &str) -> Vec<serde_json::Value> {
+                Vec::new()
+            }
+            fn scan_ack_sla(&mut self) -> Vec<String> {
+                Vec::new()
+            }
+            fn restart_wake(&mut self) -> bool {
+                false
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("release-brain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tx, _rx) = tokio::sync::mpsc::channel(crate::BRAIN_CAP);
+        let sinks = SinkManager::new(tx.clone());
+        let (sink, sent) = MockSink::new();
+        let mut brain = Brain::new(
+            BrainConfig::new("release"),
+            ReleaseHost,
+            FileStore::new(dir.clone()),
+            sinks,
+        );
+        brain.sinks.add_sink("hc", Box::new(sink));
+
+        // asked at t=2000s by BoldBay, held by CyanCove, on bd-a.
+        let request = serde_json::json!({
+            "subject": "p2p:request-release src/a.rs",
+            "sender": "BoldBay",
+            "created_ts_us": 2_000_000_000i64,
+            "body": r#"{"verb":"request-release","path":"src/a.rs","bead":"bd-a"}"#,
+        });
+        brain
+            .dispatch(BrainMsg::InboxFetched {
+                pin: "CyanCove".into(),
+                rows: vec![request.clone()],
+            })
+            .await;
+        brain.dispatch(BrainMsg::Sweep { now: 2_179 }).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            sent.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "under one lease period it is just a request"
+        );
+        brain.dispatch(BrainMsg::Sweep { now: 2_180 }).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !sent.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the unanswered ask reaches the captain");
+        let lines: Vec<String> = sent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(pin, line)| format!("{pin}|{line}"))
+            .collect();
+        assert_eq!(lines.len(), 1, "one ring per episode: {lines:?}");
+        assert!(
+            lines[0].starts_with("SlateHarbor|[observe] reservation-ladder src/a.rs:"),
+            "{lines:?}"
+        );
+        for field in ["CyanCove", "bd-a", "180s", "BoldBay"] {
+            assert!(lines[0].contains(field), "missing {field}: {lines:?}");
+        }
+
+        // Answered: the ask is cleared, never repeats.
+        brain
+            .dispatch(BrainMsg::InboxFetched {
+                pin: "BoldBay".into(),
+                rows: vec![serde_json::json!({
+                    "subject": "p2p:release-response src/a.rs",
+                    "sender": "CyanCove",
+                })],
+            })
+            .await;
+        brain.dispatch(BrainMsg::Sweep { now: 2_300 }).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            sent.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            1,
+            "an answered ask is silent"
+        );
+
+        // A LATER ask on the same path is a new episode.
+        brain
+            .dispatch(BrainMsg::InboxFetched {
+                pin: "CyanCove".into(),
+                rows: vec![serde_json::json!({
+                    "subject": "p2p:request-release src/a.rs",
+                    "sender": "BoldBay",
+                    "created_ts_us": 2_400_000_000i64,
+                    "body": r#"{"verb":"request-release","path":"src/a.rs","bead":"bd-a"}"#,
+                })],
+            })
+            .await;
+        brain.dispatch(BrainMsg::Sweep { now: 2_580 }).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if sent.lock().unwrap_or_else(|e| e.into_inner()).len() >= 2 {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a recurrence rings again");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
