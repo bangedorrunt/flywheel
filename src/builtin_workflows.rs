@@ -1262,21 +1262,6 @@ steps:
     action: verify
     command: 'LABEL="{{inputs.wave_label}}"; W="${LABEL#wave-}"; case "$W" in ""|*[!0-9]*) WN=null;; *) WN="$W";; esac; IDS_ALL=$(br list --all --json | jq -r ".issues[].id"); if [ -z "$IDS_ALL" ]; then echo "execute exit refused: wave $LABEL matched zero beads"; exit 1; fi; ROWS=$(echo "$IDS_ALL" | xargs br show --json | jq --argjson n "$WN" --arg label "$LABEL" "[.[] | select((.wave != null and .wave == \$n) or (.wave == null and ((.labels // []) | index(\$label))))]"); OPEN=$(echo "$ROWS" | jq -r "[.[] | select(.status != \"closed\") | .id] | join(\" \")"); if [ -n "$OPEN" ]; then echo "execute exit refused: wave $LABEL still open: $OPEN"; exit 1; fi; IDS=$(echo "$ROWS" | jq -r "[.[].id] | join(\" \")"); if [ -z "$IDS" ]; then echo "execute exit refused: wave $LABEL matched zero beads"; exit 1; fi; for id in $IDS; do flywheel ship check "$id" || exit 1; done'
     on_error: fail_run
-  - name: observe
-    action: dispatch_job
-    assignee: x
-    await: result
-    no_claim_timeout: 600
-    result_timeout: 7200
-    spec:
-      profile: "@reviewer"
-      stage: wave-observe
-      task: 'Watch {{inputs.steer_channel}}: escalate, never adjudicate. Escalation target = the orchestrator pin {{inputs.captain_pin}} (flywheel mail send --project <slug> --to {{inputs.captain_pin}}) — DM THAT pin, never guess. Then settle YOUR job: `toron job result <job-id> --status ok --project <slug> --as <pin> --witness <file.json>`, where the witness file carries the contract fields for this stage: {"findings": ["<each escalation or watch summary posted>"...], "verdict": "<AGREE | AGREE-WITH-CHANGES | REJECT>"} — AGREE means nothing needed escalation, REJECT means the wave is blocked and names why. A quiet watch still posts its summary as findings; an empty findings list fails the witness. A blocked wave settles as a FAILURE — `toron job result <job-id> --status failed --project <slug> --as <pin> --body "[observe] blocked: <reason>"` — never success without a witness, never an unsettled job. Objective: {{inputs.objective}}'
-    on_error: continue
-  - name: observe_done
-    action: verify
-    command: "mkdir -p .flywheel/wave && touch .flywheel/wave/{{inputs.wave_label}}-observe.done"
-    on_error: continue
   - name: review
     action: dispatch_job
     assignee: x
@@ -3421,12 +3406,13 @@ graph:
             ));
         }
         // bd-jhz8x.2 (ADR-0021 D4.5): GATE moved to engine steps (preflight +
-        // __wave-gate) and DISPATCH is a `foreach` over the gate's ready set, so
-        // the remaining top-level seat dispatches are 5. The per-bead dispatch
-        // rides inside the foreach and is asserted below.
+        // __wave-gate), DISPATCH is a `foreach` over the gate's ready set, and
+        // OBSERVE is the doorbell fold's escalation, so the remaining top-level
+        // seat dispatches are 4 (execute, review, verify, compound). The
+        // per-bead dispatch rides inside the foreach and is asserted below.
         assert_eq!(
             dispatches.len(),
-            5,
+            4,
             "every remaining stage dispatch awaits: {dispatches:?}"
         );
         let dispatch = wave
@@ -3473,7 +3459,7 @@ graph:
         assert_eq!(
             names[at + 2],
             "execute_exit",
-            "the ledger fact gates observe: {names:?}"
+            "the ledger fact gates review: {names:?}"
         );
         let exit = wave
             .steps

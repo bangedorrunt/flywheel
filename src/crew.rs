@@ -2655,8 +2655,9 @@ steps:
         .unwrap();
         assert_eq!(
             wf_builtin.steps.len(),
-            15,
-            "builtin token unchanged (7 stage dispatches + 6 write-only sidecars + ledger exit + signoff)"
+            12,
+            "builtin token unchanged (2 engine verifies + the per-bead foreach + 4 stage dispatches \
+             + 3 write-only sidecars + ledger exit + signoff)"
         );
     }
 
@@ -2675,64 +2676,60 @@ steps:
         let part =
             parse_compose_part_with("wave-swarm", &builtin_token).expect("compose token parses");
         let wf = compose_workflow_with("composed-wave", "obj", None, &[part], &affinity).unwrap();
-        assert_eq!(wf.steps.len(), 15, "{:?}", wf.steps.iter().map(|s| &s.name));
+        assert_eq!(wf.steps.len(), 12, "{:?}", wf.steps.iter().map(|s| &s.name));
+        // bd-jhz8x.2 (ADR-0021 D4.5): GATE is engine steps, DISPATCH is a
+        // foreach over the gate artifact, and OBSERVE is the doorbell fold's
+        // escalation — so the seat dispatches are execute, review, verify,
+        // compound; preflight + gate are verifies and dispatch is a foreach.
+        let Action::Verify { command } = &wf.steps[0].action else {
+            panic!("PREFLIGHT first: {:?}", wf.steps[0].action.type_name());
+        };
+        assert!(command.contains("preflight"), "{command}");
+        let Action::Verify { command } = &wf.steps[1].action else {
+            panic!("GATE second: {:?}", wf.steps[1].action.type_name());
+        };
+        assert!(command.contains("__wave-gate"), "{command}");
+        let Action::Foreach { over, each } = &wf.steps[2].action else {
+            panic!("DISPATCH third: {:?}", wf.steps[2].action.type_name());
+        };
+        assert!(over.contains("steps.gate.json.ready"), "{over}");
         assert!(
-            matches!(&wf.steps[0].action, Action::DispatchJob { spec, .. }
-                if spec.profile.as_deref() == Some("@planner")
-                    && spec.stage.as_deref() == Some("wave-gate")),
-            "GATE first: {:?}",
-            wf.steps[0].action.type_name()
+            matches!(&each.action, Action::DispatchJob { spec, .. }
+                if spec.stage.as_deref() == Some("ce-execute")),
+            "each ready bead is an executor job"
         );
         assert!(
-            matches!(&wf.steps[2].action, Action::DispatchJob { spec, .. }
-                if spec.stage.as_deref() == Some("wave-dispatch")),
-            "DISPATCH after the gate sidecar"
-        );
-        assert!(
-            matches!(&wf.steps[4].action, Action::DispatchJob { spec, .. }
+            matches!(&wf.steps[3].action, Action::DispatchJob { spec, .. }
                 if spec.profile.as_deref() == Some("{{inputs.coder_profile}}")
                     && spec.stage.as_deref() == Some("ce-execute")),
-            "EXECUTE after the dispatch sidecar (bd-wave-swarm-graduation-fix-98io: the crew needs an executor; bd-adv4: the executor profile rides the coder_profile input, default @coder)"
+            "EXECUTE after the per-bead dispatch (bd-wave-swarm-graduation-fix-98io: the crew needs an executor; bd-adv4: the executor profile rides the coder_profile input, default @coder)"
         );
         assert!(
-            matches!(&wf.steps[7].action, Action::DispatchJob { spec, .. }
-                if spec.profile.as_deref() == Some("@reviewer")
-                    && spec.stage.as_deref() == Some("wave-observe")),
-            "OBSERVE after the ledger exit"
-        );
-        assert!(
-            matches!(&wf.steps[9].action, Action::DispatchJob { spec, .. }
+            matches!(&wf.steps[6].action, Action::DispatchJob { spec, .. }
                 if spec.profile.as_deref() == Some("@reviewer")
                     && spec.stage.as_deref() == Some("ce-review")),
-            "REVIEW after the observe sidecar (ADR-0009: audit the diff before VERIFY audits the receipts)"
+            "REVIEW after the ledger exit (ADR-0009: audit the diff before VERIFY audits the receipts)"
         );
         assert!(
-            matches!(&wf.steps[11].action, Action::DispatchJob { spec, .. }
+            matches!(&wf.steps[8].action, Action::DispatchJob { spec, .. }
                 if spec.profile.as_deref() == Some("@reviewer")
                     && spec.stage.as_deref() == Some("wave-verify")),
             "VERIFY after the review sidecar"
         );
         assert!(
-            matches!(&wf.steps[13].action, Action::DispatchJob { spec, .. }
+            matches!(&wf.steps[10].action, Action::DispatchJob { spec, .. }
                 if spec.profile.as_deref() == Some("@planner")
                     && spec.stage.as_deref() == Some("ce-compound")
                     && spec.phase.as_deref() == Some("compound")),
             "COMPOUND after the verify sidecar (ADR-0009: phase compound, planner)"
         );
         assert!(
-            matches!(&wf.steps[14].action, Action::RequestApproval { message, .. }
+            matches!(&wf.steps[11].action, Action::RequestApproval { message, .. }
                 if message.contains("captain")),
             "SIGNOFF last, captain-only: {:?}",
-            wf.steps[14].action.type_name()
+            wf.steps[11].action.type_name()
         );
-        for (idx, marker) in [
-            (1, "gate"),
-            (3, "dispatch"),
-            (5, "execute"),
-            (8, "observe"),
-            (10, "review"),
-            (12, "verify"),
-        ] {
+        for (idx, marker) in [(4, "execute"), (7, "review"), (9, "verify")] {
             let Action::Verify { command } = &wf.steps[idx].action else {
                 panic!(
                     "step {idx} ({:?}) must be the {marker} sidecar: {:?}",
@@ -2774,14 +2771,13 @@ steps:
             parse_compose_part_with("wave-swarm", &builtin_token).expect("compose token parses");
         let wf = compose_workflow_with("seq", "obj", None, &[part], &affinity).unwrap();
 
+        // bd-jhz8x.2 (D4.5): PREFLIGHT + GATE are engine verifies and DISPATCH
+        // is a foreach, so the awaited SEAT dispatches start at EXECUTE.
         let stages = [
-            ("gate", 0),
-            ("dispatch", 2),
-            ("execute", 4),
-            ("observe", 7),
-            ("review", 9),
-            ("verify", 11),
-            ("compound", 13),
+            ("execute", 3),
+            ("review", 6),
+            ("verify", 8),
+            ("compound", 10),
         ];
         for (stage_name, si) in stages {
             assert_eq!(
@@ -2888,8 +2884,8 @@ steps:
         let wf = compose_workflow_with("mixed", "obj", None, &parts, &affinity).unwrap();
         assert_eq!(
             wf.steps.len(),
-            16,
-            "1 plain + 7 stage dispatches + 6 write-only sidecars + ledger exit + signoff"
+            13,
+            "1 plain scout + the 12 wave-swarm steps"
         );
     }
 
