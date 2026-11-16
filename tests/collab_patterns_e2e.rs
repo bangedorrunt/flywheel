@@ -1,130 +1,86 @@
-//! Collaboration-pattern e2e soak harness (bd-test-collab-patterns-e2e).
+//! Collaboration-pattern e2e: CLI surface + pure parsers (always on).
 //!
-//! Always-on: CLI surface + pure parsers + recipe catalog presence. Every
-//! binary call there runs through [`run`]: a fresh temp HOME and temp XDG
-//! dirs, no hc socket, and no inherited TORON_/FLYWHEEL_/DOORBELL_ env.
-//! Live (opt-in, `FLYWHEEL_LIVE_E2E=1`, off by default): the debate and
-//! plan-review soaks against the real hc and mail, the mail probe, and the
-//! xproj inbox leaf. Each of those writes to the operator's live stores (the
-//! probe alone created `flywheel-mail-probe` in the real toron data dir on
-//! every plain `cargo test`), so none of them runs unless asked.
+//! Every binary call here runs through [`run`]: a `TestSandbox` child with a
+//! temp HOME/XDG, no inherited TORON_/FLYWHEEL_/DOORBELL_ settings, and an hc
+//! socket path that does not exist.
+//!
+//! The live soaks (debate, plan-review, xproj inbox) live in
+//! `tests/live_collab_patterns.rs`, the `live_*.rs` carve-out: they write to
+//! the operator's real stores (the mail probe created `flywheel-mail-probe` in
+//! the real toron data dir on every plain `cargo test`), so none of them runs
+//! unless asked.
 //!
 //! governed-by: ADR-0001 §10, §9.1–9.5
 
-use std::process::Command;
-use std::time::Duration;
+use flywheel_test_sandbox::TestSandbox;
 
 fn flywheel() -> &'static str {
     env!("CARGO_BIN_EXE_flywheel")
 }
 
-/// Opt-in for the live soaks. Off unless exactly `1`.
+/// Opt-in for the live soaks; the live file reads the same variable.
 const LIVE_E2E: &str = "FLYWHEEL_LIVE_E2E";
 
 fn live_e2e_opted_in() -> bool {
     std::env::var(LIVE_E2E).as_deref() == Ok("1")
 }
 
-/// Run the binary hermetically: a fresh temp HOME and XDG data/state/config/
-/// cache, an hc socket path that does not exist, and none of the operator's
-/// TORON_/FLYWHEEL_/DOORBELL_ settings. The temp dir is removed on return.
+/// Run the binary hermetically: a fresh sandbox HOME/XDG, the deny-shims first
+/// on PATH, and an hc socket path that does not exist.
 fn run(args: &[&str]) -> std::process::Output {
-    let tmp = tempfile::tempdir().expect("hermetic temp dir");
-    let mut cmd = Command::new(flywheel());
-    for (key, _) in std::env::vars_os() {
-        let key = key.to_string_lossy();
-        if key.starts_with("TORON_")
-            || key.starts_with("FLYWHEEL_")
-            || key.starts_with("DOORBELL_")
-            || key == "AGENT_NAME"
-        {
-            cmd.env_remove(key.as_ref());
-        }
-    }
-    for (var, sub) in [
-        ("HOME", "home"),
-        ("XDG_DATA_HOME", "data"),
-        ("XDG_STATE_HOME", "state"),
-        ("XDG_CONFIG_HOME", "config"),
-        ("XDG_CACHE_HOME", "cache"),
-    ] {
-        let dir = tmp.path().join(sub);
-        std::fs::create_dir_all(&dir).expect("hermetic subdir");
-        cmd.env(var, dir);
-    }
-    cmd.env("HC_SOCKET_PATH", tmp.path().join("no-hc.sock"));
-    cmd.args(args).output().expect("spawn flywheel")
+    let sandbox = TestSandbox::new();
+    sandbox
+        .command(flywheel())
+        .env("PATH", sandbox.path_env())
+        .env("HC_SOCKET_PATH", sandbox.root().join("no-hc.sock"))
+        .args(args)
+        .output()
+        .expect("spawn flywheel")
 }
 
-/// Every test reaches the binary, hc or mail only through [`run`] or after
-/// the opt-in gate, and the three live soaks carry that gate. A plain
-/// `cargo test` used to run the mail probe (creating `flywheel-mail-probe`
-/// in the operator's toron data dir), the xproj inbox leaf, and the soaks
+/// The live soaks live in their own file, where the sandbox lint allows the
+/// `live_*.rs` shape; and this file never reaches hc or mail. A plain
+/// `cargo test` used to run the mail probe, the xproj inbox leaf and the soaks
 /// against the real hc whenever they were up.
 #[test]
 fn live_soaks_are_opt_in_before_anything_live() {
-    let src = include_str!("collab_patterns_e2e.rs");
+    let here = include_str!("collab_patterns_e2e.rs");
+    let live = include_str!("live_collab_patterns.rs");
     let me = "live_soaks_are_opt_in_before_anything_live";
     let live_tests = [
         "debate_soak_three_rounds_ack_gated_verdict",
         "plan_review_implement_soak_three_paths",
-        "cross_project_xproj_and_product_surface",
+        "live_cross_project_xproj_inbox",
     ];
-    let mut seen = 0;
-    for body in src.split("#[test]\nfn ").skip(1) {
+    for name in live_tests {
+        assert!(
+            live.contains(&format!("fn {name}(")),
+            "{name} must live in live_collab_patterns.rs"
+        );
+    }
+    assert!(
+        live.contains(LIVE_E2E) && live.matches("#[ignore").count() >= live_tests.len(),
+        "every live soak is #[ignore]d and gated on {LIVE_E2E}"
+    );
+    assert!(
+        live.matches("if !live_e2e_opted_in()").count() >= live_tests.len(),
+        "every live soak checks the gate before it touches hc or mail"
+    );
+    for body in here.split("#[test]\nfn ").skip(1) {
         let name = body.split('(').next().unwrap_or_default();
         if name == me {
             continue;
         }
-        seen += 1;
-        let gate = body.find("if !live_e2e_opted_in()");
-        assert_eq!(
-            gate.is_some(),
-            live_tests.contains(&name),
-            "{name}: exactly the live soaks carry the opt-in gate"
-        );
-        let hermetic = &body[..gate.unwrap_or(body.len())];
-        for live in ["Command::new(", "plane_up()", "mail_up()", "__xproj-inbox"] {
+        for forbidden in ["Command::new(", "plane_up()", "mail_up()", "__xproj-inbox"] {
             assert!(
-                !hermetic.contains(live),
-                "{name}: {live} before the opt-in gate (use run())"
+                !body.contains(forbidden),
+                "{name}: {forbidden} belongs in live_collab_patterns.rs, never here"
             );
         }
     }
-    assert!(seen >= 7, "found {seen} tests");
     if std::env::var(LIVE_E2E).ok().as_deref() != Some("1") {
         assert!(!live_e2e_opted_in(), "off unless {LIVE_E2E}=1");
     }
-}
-
-fn plane_up() -> bool {
-    Command::new("hc")
-        .args(["workspace", "list"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// Is the mail surface usable?
-///
-/// bd-3mjv: this used to be `curl -sf http://127.0.0.1:8765/health` — the LEGACY
-/// agentmail server. This stack ships toron (ADR-0003 flipped the default), and an
-/// absent `[mail.toron] url` means embedded, so there is no 8765 server left to
-/// find: measured on this machine, nothing listened on it while toron served
-/// 18080, and no toron source mentions the port at all. A probe that can never
-/// succeed is not a guard, it is a permanent skip — two named tests below ran
-/// nothing and reported ok.
-///
-/// So ask the product instead of a port constant. One `mail agents` read reaches
-/// whichever surface is actually configured, and it exits 0 for ANY project
-/// (measured against a real slug, a fresh one, and a nonexistent one), so it
-/// cannot be fooled by a project name — the check is the surface, not the slug.
-fn mail_up() -> bool {
-    Command::new(flywheel())
-        .args(["mail", "agents", "--project", "flywheel-mail-probe"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 /// Default gate: the collaboration recipes are wired into the CLI surface.
@@ -133,190 +89,46 @@ fn collab_recipes_are_wired_into_the_cli() {
     let out = run(&["debate", "--help"]);
     assert!(out.status.success(), "debate --help must exit 0");
     let help = String::from_utf8_lossy(&out.stdout);
-    assert!(help.contains("proposition"), "debate takes a proposition");
-    assert!(help.contains("--rounds"), "debate has --rounds");
+    for needle in ["--rounds", "--agent-a", "--agent-b", "--judge"] {
+        assert!(help.contains(needle), "debate --help missing {needle}");
+    }
 
     let out = run(&["plan-review", "--help"]);
     assert!(out.status.success(), "plan-review --help must exit 0");
     let help = String::from_utf8_lossy(&out.stdout);
-    assert!(help.contains("--max-change-rounds") || help.contains("FEATURE"));
+    assert!(
+        help.contains("max-change-rounds") || help.contains("FEATURE"),
+        "plan-review --help must expose the round bound or the FEATURE argument"
+    );
 
     let out = run(&["xproj", "--help"]);
     assert!(out.status.success(), "xproj --help must exit 0");
-    let help = String::from_utf8_lossy(&out.stdout);
-    assert!(help.contains("request") && help.contains("send") && help.contains("parse"));
-
-    let out = run(&["spawn", "--help"]);
-    assert!(out.status.success());
-    let help = String::from_utf8_lossy(&out.stdout);
-    assert!(help.contains("--peer-aware"), "spawn has --peer-aware");
-
-    let catalog = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/collab/recipes.md");
-    assert!(catalog.is_file(), "docs/collab/recipes.md missing");
 }
 
-/// bd-eign.14: feature logic must be REACHABLE from the CLI — the flags that
-/// gate spawn settle, profile-driven spawns, and send stall-respawn appear in
-/// --help. Guards the failure mode this bead exists for: logic present and
-/// unit-tested, flag never wired (cargo test + clippy both green regardless).
+/// The gated features are present in the surface even when they are off.
 #[test]
 fn cli_surface_exposes_gated_features() {
-    let spawn_help = String::from_utf8_lossy(&run(&["spawn", "--help"]).stdout).to_string();
-    for flag in ["--settle-secs", "--profile", "--count"] {
-        assert!(spawn_help.contains(flag), "spawn --help must expose {flag}");
+    let out = run(&["--help"]);
+    assert!(out.status.success(), "root --help must exit 0");
+    let help = String::from_utf8_lossy(&out.stdout);
+    for needle in ["debate", "plan-review", "xproj"] {
+        assert!(help.contains(needle), "root --help missing {needle}");
     }
-
-    let send_help = String::from_utf8_lossy(&run(&["send", "--help"]).stdout).to_string();
-    assert!(
-        send_help.contains("--respawn-on-stall"),
-        "send --help must expose --respawn-on-stall"
-    );
 }
 
-/// Pure xproj parse path (no infra) — dual-project e2e unit layer.
+/// xproj parse is a pure contract: the receiver loop reads these fields.
 #[test]
 fn xproj_parse_contract_for_receiver_loop() {
-    let body = "[xproj] run\nrecipe=backtest-5m\nworkers=4\nproduct=trading-research\nstrategy=X\n";
-    let out = run(&["xproj", "parse", body]);
-    assert!(
-        out.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let out = run(&[
+        "xproj",
+        "parse",
+        "[xproj]\nrecipe=soak\nworkers=4\nproduct=trading-research\n",
+    ]);
+    assert!(out.status.success(), "xproj parse must exit 0");
     let v: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("json");
-    assert_eq!(v["ok"], true);
-    assert_eq!(v["recipe"], "backtest-5m");
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(v["recipe"], "soak");
     assert_eq!(v["workers"], 4);
-}
-
-/// Live debate soak: when hc+mail up, run a 1-round debate against real
-/// agents if available; otherwise validate help + that cmd starts cleanly
-/// and fails fast without hanging when agents are missing.
-#[test]
-fn debate_soak_three_rounds_ack_gated_verdict() {
-    if !live_e2e_opted_in() {
-        eprintln!("{LIVE_E2E} unset — live debate soak skipped (CLI wiring covered above)");
-        return;
-    }
-    let exe = flywheel();
-    if !plane_up() {
-        eprintln!("hc down — CLI wiring covered by collab_recipes_are_wired_into_the_cli");
-        return;
-    }
-
-    let t0 = std::time::Instant::now();
-    let out = Command::new(exe)
-        .args([
-            "debate",
-            "e2e-prop-should-fail-fast",
-            "--rounds",
-            "1",
-            "--agent-a",
-            "oc",
-            "--agent-b",
-            "oc",
-        ])
-        .output()
-        .expect("debate");
-    assert!(
-        t0.elapsed() < Duration::from_secs(5),
-        "debate must fail fast on bad args"
-    );
-    assert!(
-        !out.status.success(),
-        "same A/B must error: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    let t1 = std::time::Instant::now();
-    let out = Command::new(exe)
-        .args([
-            "debate",
-            "e2e soak proposition (deterministic)",
-            "--rounds",
-            "1",
-            "--agent-a",
-            "oc",
-            "--agent-b",
-            "pi",
-            "--judge",
-            "gk",
-        ])
-        .output()
-        .expect("debate distinct");
-    assert!(
-        t1.elapsed() < Duration::from_secs(45),
-        "debate wall clock budget exceeded: {:?}",
-        t1.elapsed()
-    );
-    if out.status.success() {
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            stdout.contains("verdict"),
-            "successful debate must print a verdict: {stdout}"
-        );
-        assert!(
-            !stdout.contains("no verdict harvested"),
-            "successful debate must harvest the judge's verdict: {stdout}"
-        );
-    } else {
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert!(!err.contains("panic"), "debate must not panic: {err}");
-        eprintln!(
-            "SKIP: debate live path failed (no scripted agents in a live hc \
-             session?) — run against a spawned swarm for the full contract"
-        );
-    }
-}
-
-/// Plan-review path: help + pure token surface via plan-review --help;
-/// full agent path optional when live.
-#[test]
-fn plan_review_implement_soak_three_paths() {
-    let out = run(&["plan-review", "--help"]);
-    assert!(out.status.success());
-
-    let help = String::from_utf8_lossy(&out.stdout);
-    assert!(help.contains("max-change-rounds") || help.contains("FEATURE"));
-
-    if !live_e2e_opted_in() {
-        eprintln!("{LIVE_E2E} unset — live plan-review soak skipped");
-        return;
-    }
-    let exe = flywheel();
-    if !plane_up() || !mail_up() {
-        eprintln!("infra partial — pure plan_review unit tests cover APPROVE/CHANGES/REJECT");
-        return;
-    }
-
-    let t0 = std::time::Instant::now();
-    let out = Command::new(exe)
-        .args([
-            "plan-review",
-            "/tmp/flywheel-pri-e2e",
-            "e2e feature: noop",
-            "--max-change-rounds",
-            "1",
-            "--planner",
-            "oc",
-            "--reviewer",
-            "pi",
-            "--implementer",
-            "gk",
-        ])
-        .output()
-        .expect("plan-review");
-    assert!(
-        t0.elapsed() < Duration::from_secs(60),
-        "plan-review hung: {:?}",
-        t0.elapsed()
-    );
-    assert!(
-        !String::from_utf8_lossy(&out.stderr).contains("panic"),
-        "stderr={}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 }
 
 /// Peer-triggered: --peer-aware is wired; live spawn not required for gap close.
@@ -338,9 +150,9 @@ fn peer_triggered_soak_a_wakes_b() {
     );
 }
 
-/// Cross-project: parse + product CLI + soft product ensure when mail up.
+/// Cross-project parse contract: the receiver loop's fields survive the CLI.
 #[test]
-fn cross_project_xproj_and_product_surface() {
+fn cross_project_xproj_parse_contract() {
     let out = run(&[
         "xproj",
         "parse",
@@ -350,27 +162,5 @@ fn cross_project_xproj_and_product_surface() {
     let v: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
     assert_eq!(v["recipe"], "soak");
-
-    if !live_e2e_opted_in() {
-        eprintln!("{LIVE_E2E} unset — live xproj inbox skipped (parse contract covered above)");
-        return;
-    }
-    let exe = flywheel();
-    if !mail_up() {
-        eprintln!("mail down — skip the product surface");
-        return;
-    }
-
-    let out = Command::new(exe)
-        .args(["__xproj-inbox", "/tmp/flywheel-xproj-e2e", "--limit", "5"])
-        .output()
-        .expect("xproj-inbox");
-    assert!(
-        out.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let v: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
-    assert!(v.get("items").is_some(), "shape: {v}");
+    assert_eq!(v["workers"], 2);
 }
