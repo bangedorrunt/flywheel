@@ -910,7 +910,7 @@ mutations = [
 
 [[behavior]]
 id = "mail.reply-joins-the-parent-thread"
-owner = "src/mail.rs::reply"
+owner = "src/mail.rs"
 status = "proven"
 concurrent = false
 tests = [
@@ -923,7 +923,7 @@ mutations = [
 
 [[behavior]]
 id = "collab.sends-once-and-waits"
-owner = "src/cmd/mail.rs::cmd_collab"
+owner = "src/cmd/mail.rs"
 status = "proven"
 concurrent = false
 tests = [
