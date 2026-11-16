@@ -4496,3 +4496,109 @@ steps:
         );
     }
 }
+
+#[cfg(test)]
+mod acceptance6_audit_binding {
+    use crate::seat_binder::{BindPolicy, LiveSeat, StepNeed, bind};
+    use crate::stages::StageContext;
+    use toron_workflow::schema::Action;
+
+    fn seat(pin: &str, role: &str, model: &str) -> LiveSeat {
+        LiveSeat {
+            pin: pin.to_string(),
+            role: role.into(),
+            harness: "pi".into(),
+            model: Some(model.to_string()),
+            mode: None,
+            effort: None,
+            placement: Default::default(),
+            idle: true,
+            fresh_session: true,
+            idle_since_ms: None,
+        }
+    }
+
+    /// ADR-0022 acceptance 6 (bd-6setu.13): the beads-lifecycle audit is a fresh
+    /// reviewer dispatch (never the planner that polished), the binder refuses an
+    /// author that shares the reviewer role, and a registered different family is
+    /// preferred over the author's own.
+    #[test]
+    fn acceptance6_lifecycle_audit_binds_a_non_author_and_another_family() {
+        let token = |name: &str| {
+            crate::workflow_catalog::builtin_meta(name)
+                .compose
+                .unwrap_or(false)
+        };
+        let part = super::parse_compose_part_with("beads-lifecycle", &token).expect("token parses");
+        let lib = crate::stages::StageLibrary::compiled_in();
+        let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
+        let wf = super::compose_workflow_with("composed-life", "obj", None, &[part], &affinity)
+            .expect("lifecycle expands");
+        let graph = wf.graph.as_ref().expect("graph-form token");
+        let audit = graph.nodes.get("audit").expect("audit node");
+        let Action::DispatchJob { spec, .. } = &audit.action else {
+            panic!("audit is a dispatch_job: {:?}", audit.action.type_name());
+        };
+        assert_eq!(spec.stage.as_deref(), Some("plan-polish"));
+        assert_eq!(
+            spec.profile.as_deref(),
+            Some("@reviewer"),
+            "a fresh reviewer audits what the planner polished"
+        );
+        assert_eq!(
+            spec.context,
+            Some(toron_workflow::schema::ContextMode::Fresh),
+            "the audit never inherits the author's context"
+        );
+
+        // The binder: the planner authored; two reviewer seats exist and one of
+        // them is ALSO an author. Neither may audit.
+        let seats = vec![
+            seat("PlannerPin", "planner", "zai/glm-5.3"),
+            seat("AuthorReviewer", "reviewer", "groq/llama-4"),
+            seat("CleanReviewer", "reviewer", "grok/grok-4.5"),
+        ];
+        let need = StepNeed {
+            step: "audit".to_string(),
+            role: "reviewer".to_string(),
+            harness: Some("pi".to_string()),
+            model: None,
+            mode: None,
+            context: StageContext::Fresh,
+            reviews_author: ["PlannerPin".to_string(), "AuthorReviewer".to_string()]
+                .into_iter()
+                .collect(),
+        };
+        match bind(
+            &need,
+            &seats,
+            &BindPolicy {
+                crew_max: 5,
+                headless_allowed: false,
+            },
+        ) {
+            crate::seat_binder::Binding::FreshSession { pin } => {
+                assert_eq!(pin, "CleanReviewer", "the non-author reviewer audits");
+            }
+            other => panic!("expected the clean reviewer: {other:?}"),
+        }
+
+        // A registered different family beats the author's own.
+        let mut models = std::collections::BTreeMap::new();
+        for id in ["zai/glm-5.3", "grok/grok-4.5"] {
+            models.insert(id.to_string(), crate::models::ModelEntry::default());
+        }
+        let registry = crate::models::ModelRegistry {
+            models,
+            slots: Default::default(),
+            user_keys: Default::default(),
+            defaults: None,
+        };
+        let picked = registry.verifier_for("zai/glm-5.3", &["zai/glm-5.3", "grok/grok-4.5"], None);
+        assert_eq!(
+            picked.as_deref(),
+            Some("grok/grok-4.5"),
+            "a different family is preferred over the author's own"
+        );
+    }
+}
