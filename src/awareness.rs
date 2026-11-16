@@ -18,6 +18,7 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Schedule name. The cron host owns this one natively, like the doorbell
 /// supervisor: no workflow body, no LLM.
@@ -224,7 +225,15 @@ pub async fn tick(cfg: &crate::config::Config, project: &str) -> Result<Option<S
             conflicts,
             signature,
         } => {
-            let bead = file_conflict(project, &line, &conflicts).await?;
+            // One bead per CONDITION, not per episode: a digest whose conflict
+            // set reshuffles must not file the same condition again (bd-i4fqc).
+            let mut ids = Vec::new();
+            for conflict in &conflicts {
+                if let Some(id) = ensure_conflict_bead(project, conflict, &line).await? {
+                    ids.push(id);
+                }
+            }
+            let bead = ids.last().cloned();
             remembered.line = line.clone();
             remembered.fingerprint = facts.fingerprint.clone();
             remembered.swarm = facts.swarm;
@@ -234,25 +243,75 @@ pub async fn tick(cfg: &crate::config::Config, project: &str) -> Result<Option<S
             println!(
                 "cron {NAME}: {line} — CONFLICT {} (bead {})",
                 conflicts.join("; "),
-                bead.as_deref().unwrap_or("unfiled")
+                if ids.is_empty() {
+                    "unfiled".to_string()
+                } else {
+                    ids.join(",")
+                }
             );
             Ok(Some(line))
         }
     }
 }
 
-/// File the escalation bead. The beads poller rings an idle captain on a ready
-/// bead, so this is the one wake path that costs no tokens.
-async fn file_conflict(project: &str, line: &str, conflicts: &[String]) -> Result<Option<String>> {
-    let title = format!("awareness: {} in {project}", conflicts.join("; "));
+/// The durable identity of one conflict: its kind and its subject, with digits
+/// collapsed so a drifting count is not mistaken for a new condition.
+fn condition_of(conflict: &str) -> String {
+    let (kind, detail) = conflict.split_once(':').unwrap_or((conflict, ""));
+    let normalize = |text: &str| {
+        text.trim()
+            .to_ascii_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_digit() { '#' } else { c })
+            .collect::<String>()
+    };
+    format!("{}|{}", normalize(kind), normalize(detail))
+}
+
+/// The condition an awareness bead was filed for:
+/// `awareness: <conflict> in <project>`.
+fn title_condition(title: &str, project: &str) -> Option<String> {
+    let rest = title.strip_prefix("awareness: ")?;
+    let rest = rest.strip_suffix(&format!(" in {project}"))?;
+    Some(condition_of(rest))
+}
+
+/// The OPEN awareness bead already filed for this condition, if one exists.
+fn open_bead_for(rows: &[Value], project: &str, condition: &str) -> Option<String> {
+    rows.iter().find_map(|row| {
+        let title = row.get("title")?.as_str()?;
+        if title_condition(title, project).as_deref() != Some(condition) {
+            return None;
+        }
+        row.get("id")?.as_str().map(String::from)
+    })
+}
+
+/// File the escalation bead for ONE conflict, or update the open bead that
+/// already covers it. The beads poller rings an idle captain on a ready bead,
+/// so this is the one wake path that costs no tokens; a repeat observation is a
+/// comment, not a second bead.
+async fn ensure_conflict_bead(project: &str, conflict: &str, line: &str) -> Result<Option<String>> {
+    let condition = condition_of(conflict);
+    if let Ok(raw) = crate::br::run_br(None, &["list", "--json", "--status", "open"])
+        && let Ok(rows) = crate::br::parse_issue_rows_json(&raw, "awareness list")
+        && let Some(id) = open_bead_for(&rows, project, &condition)
+    {
+        let note = format!("Still observed for the same condition.\n\n{line}");
+        if let Err(e) = crate::br::run_br(None, &["comments", "add", &id, "--message", &note]) {
+            eprintln!("cron {NAME}: could not update bead {id} ({e})");
+        }
+        return Ok(Some(id));
+    }
+    let title = format!("awareness: {conflict} in {project}");
     let description = format!(
         "The native awareness digest saw a conflict.\n\n{line}\n\n\
-         conflicts:\n- {}\n\n\
-         This bead is filed once per conflict episode: while the same conflict \
-         persists the digest stays quiet, and a cleared conflict resets it.\n\n\
+         conflict: {conflict}\n\n\
+         This bead is filed once per CONDITION: while the same condition \
+         persists the digest comments here instead of filing another bead, and \
+         a cleared conflict resets it.\n\n\
          Diagnose before acting: `flywheel status {project}` and \
-         `flywheel __doorbell --project {project} --report`.",
-        conflicts.join("\n- ")
+         `flywheel __doorbell --project {project} --report`."
     );
     let raw = match crate::br::run_br(
         None,
@@ -476,5 +535,150 @@ mod tests {
             )]
         );
         assert!(overlaps(&pins[..1]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod dedupe_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// The same condition keeps one key across the noise a digest line adds:
+    /// counts drift, spacing drifts, and the subject is the identity.
+    #[test]
+    fn a_condition_key_ignores_count_and_case_noise() {
+        assert_eq!(
+            condition_of("unanswered doorbell: SunnyMarsh"),
+            condition_of("Unanswered Doorbell:  sunnyMarsh ")
+        );
+        assert_eq!(
+            condition_of("swarm vanished: 6 agents"),
+            condition_of("swarm vanished: 0 agents")
+        );
+        assert_ne!(
+            condition_of("unanswered doorbell: SunnyMarsh"),
+            condition_of("unanswered doorbell: QuietHeron")
+        );
+        assert_ne!(
+            condition_of("unanswered doorbell: SunnyMarsh"),
+            condition_of("swarm vanished: SunnyMarsh")
+        );
+    }
+
+    /// Only an OPEN bead filed for this exact condition counts as the survivor.
+    #[test]
+    fn the_open_bead_for_a_condition_is_matched_by_title_and_project() {
+        let rows = vec![
+            serde_json::json!({"id":"bd-old","title":"awareness: unanswered doorbell: SunnyMarsh in flywheel"}),
+            serde_json::json!({"id":"bd-other-project","title":"awareness: unanswered doorbell: SunnyMarsh in toron"}),
+            serde_json::json!({"id":"bd-other-condition","title":"awareness: swarm vanished: 0 agents in flywheel"}),
+        ];
+        let key = condition_of("unanswered doorbell: SunnyMarsh");
+        assert_eq!(
+            open_bead_for(&rows, "flywheel", &key).as_deref(),
+            Some("bd-old")
+        );
+        assert_eq!(
+            open_bead_for(&rows[1..], "flywheel", &key),
+            None,
+            "another project or condition is not the survivor"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dedupe_br_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    const FAKE_BR: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+echo "$*" >> "@LOG@"
+case "$1" in
+  list)
+    python3 - "@STATE@" <<'PY'
+import json, pathlib, sys
+rows = []
+for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
+    if not line.strip():
+        continue
+    title, eid = line.split("\t")
+    rows.append({"id": eid, "title": title, "status": "open"})
+print(json.dumps({"issues": rows}))
+PY
+    ;;
+  create)
+    printf '%s\tbd-new\n' "$2" >> "@STATE@"
+    printf '{"id":"bd-new"}\n'
+    ;;
+  *) printf '{}\n' ;;
+esac
+"#;
+
+    /// The bead's verify: emitting the same condition twice yields ONE open bead,
+    /// and the second observation is a comment on it. The fake br reflects a
+    /// `create` back into its own list, so the second call sees it as a real
+    /// tracker would.
+    #[tokio::test]
+    async fn emitting_the_same_condition_twice_updates_one_open_bead() {
+        let _env = crate::config::lock_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = dir.path().join("beads.tsv");
+        let log = dir.path().join("br.log");
+        std::fs::write(&state, "").expect("state");
+        let script = dir.path().join("br");
+        std::fs::write(
+            &script,
+            FAKE_BR
+                .replace("@LOG@", &log.display().to_string())
+                .replace("@STATE@", &state.display().to_string()),
+        )
+        .expect("fake br");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        unsafe { std::env::set_var("FLYWHEEL_BR_BIN", &script) };
+
+        let first = ensure_conflict_bead(
+            "flywheel",
+            "unanswered doorbell: SunnyMarsh",
+            "awareness flywheel: unanswered doorbell: SunnyMarsh",
+        )
+        .await
+        .expect("first filing");
+        let second = ensure_conflict_bead(
+            "flywheel",
+            "unanswered doorbell: SunnyMarsh",
+            "awareness flywheel: unanswered doorbell: SunnyMarsh; swarm vanished",
+        )
+        .await
+        .expect("second filing");
+        unsafe { std::env::remove_var("FLYWHEEL_BR_BIN") };
+
+        assert_eq!(first.as_deref(), Some("bd-new"));
+        assert_eq!(
+            second.as_deref(),
+            Some("bd-new"),
+            "the same condition reuses the open bead"
+        );
+        let calls = std::fs::read_to_string(&log).expect("br log");
+        assert_eq!(
+            calls.lines().filter(|l| l.starts_with("create")).count(),
+            1,
+            "one bead, not one per episode: {calls}"
+        );
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|l| l.starts_with("comments add bd-new"))
+                .count(),
+            1,
+            "the repeat is a comment on the survivor: {calls}"
+        );
     }
 }

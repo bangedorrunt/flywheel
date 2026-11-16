@@ -757,3 +757,21 @@ mutations = [
   "scripts/mutations/mutation-cache.spec.sh#C6",
   "scripts/mutations/mutation-cache.spec.sh#C8",
 ]
+
+[[behavior]]
+id = "awareness.one-bead-per-condition"
+owner = "src/awareness.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/awareness.rs::a_condition_key_ignores_count_and_case_noise",
+  "src/awareness.rs::the_open_bead_for_a_condition_is_matched_by_title_and_project",
+  "src/awareness.rs::emitting_the_same_condition_twice_updates_one_open_bead",
+]
+mutations = [
+  "scripts/mutations/awareness-dedupe.spec.sh#A1",
+  "scripts/mutations/awareness-dedupe.spec.sh#A2",
+  "scripts/mutations/awareness-dedupe.spec.sh#A3",
+  "scripts/mutations/awareness-dedupe.spec.sh#A4",
+  "scripts/mutations/awareness-dedupe.spec.sh#A5",
+]
