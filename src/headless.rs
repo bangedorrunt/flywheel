@@ -163,7 +163,9 @@ pub fn build_argv_roles(
         "pi" => {
             argv.extend(["pi", "-p", "--mode", "json"].map(String::from));
             if let Some(m) = model {
-                argv.extend(model_args("pi", m, None));
+                // bd-6setu.17: the registry gives pi an effort flag, so the leaf
+                // must carry it; dropping it made the plan's `honored` a lie.
+                argv.extend(model_args("pi", m, effort));
             }
         }
         "opencode" => {
@@ -189,7 +191,9 @@ pub fn build_argv_roles(
                 .map(String::from),
             );
             if let Some(m) = model {
-                argv.extend(model_args("grok", m, None));
+                // bd-6setu.17: same as pi — the plan reports the effort honored,
+                // so the leaf carries it.
+                argv.extend(model_args("grok", m, effort));
             }
             return Ok(argv);
         }
@@ -1764,6 +1768,90 @@ mod bd_7wah_tests {
         );
         assert_eq!(out.status, "success");
         assert_eq!(out.response, "hello from a plain-text harness");
+    }
+}
+
+#[cfg(test)]
+mod v4_composition {
+    use super::{build_argv_roles, effort_degraded, interactive_model_plan};
+
+    /// ADR-0022 V4 composition (bd-6setu.17): V4 proves the PLAN matches the
+    /// pane launch, and V4-ext proves the STEP's phase args reach the leaf — but
+    /// nothing joined them, so a field the plan reported `honored` could still
+    /// be dropped by the headless leaf. This is the join: for every harness, the
+    /// pane delivery and the leaf delivery must agree on the MODEL both ways, and
+    /// effort must be delivered on both or explicitly degraded on the pane —
+    /// never silently dropped by one side.
+    ///
+    /// The only sanctioned difference is the variant path (opencode: no effort
+    /// flag, the leaf encodes it as `model#effort`), and it must be VISIBLE: the
+    /// pane reports degraded rather than honored.
+    #[test]
+    fn the_plan_and_the_leaf_agree_on_every_field() {
+        const MODEL: &str = "probe-model";
+        const EFFORT: &str = "probe-effort";
+        let mut agreeing = 0;
+        let mut refusing = 0;
+        let mut variant = 0;
+        for spec in crate::harness_registry::REGISTRY {
+            let h = spec.canonical;
+            let plan = interactive_model_plan(h, MODEL, Some(EFFORT));
+            let pane_model =
+                plan.args().iter().any(|a| a == MODEL) || plan.env_pin() == Some(MODEL);
+            let pane_effort = plan.args().iter().any(|a| a == EFFORT);
+            match build_argv_roles(h, Some(MODEL), Some(EFFORT), "", "", "", "PROMPT") {
+                Ok(argv) => {
+                    let as_variant = format!("{MODEL}#{EFFORT}");
+                    let leaf_variant = argv.iter().any(|a| a == &as_variant);
+                    let leaf_model = argv.iter().any(|a| a == MODEL || a == &as_variant);
+                    let leaf_effort = argv.iter().any(|a| a == EFFORT) || leaf_variant;
+                    assert_eq!(
+                        pane_model,
+                        leaf_model,
+                        "model delivery must agree on {h}: pane args {:?} env {:?}, leaf {argv:?}",
+                        plan.args(),
+                        plan.env_pin()
+                    );
+                    if leaf_variant {
+                        assert!(
+                            effort_degraded(h),
+                            "{h} carries effort as a variant but declares an effort flag"
+                        );
+                        assert!(
+                            !pane_effort,
+                            "{h}: an effort the leaf delivers as a variant must not read as a pane flag"
+                        );
+                        assert!(pane_model, "{h} still delivers the model");
+                        variant += 1;
+                    } else {
+                        assert_eq!(
+                            pane_effort,
+                            leaf_effort,
+                            "effort delivery must agree on {h}: pane args {:?}, leaf {argv:?}",
+                            plan.args()
+                        );
+                    }
+                    agreeing += 1;
+                }
+                Err(error) => {
+                    // No headless runner: the leaf refuses instead of dropping a
+                    // field, and the pane path is the only delivery there is.
+                    assert!(
+                        error.to_string().contains(h),
+                        "the refusal names the harness: {error}"
+                    );
+                    refusing += 1;
+                }
+            }
+        }
+        assert!(
+            agreeing > 0 && refusing > 0,
+            "{agreeing} harnesses run headless, {refusing} refuse"
+        );
+        assert!(
+            variant > 0,
+            "the variant path is exercised, or the exception half is untested"
+        );
     }
 }
 
