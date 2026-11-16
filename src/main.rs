@@ -9862,7 +9862,9 @@ mod recover_session_loss_tests {
     use super::{recover_seats, recover_workspace, state};
     use crate::backend::MultiplexerBackend;
     use crate::config::{Config, lock_env};
-    use crate::hc::{AgentInfo, AgentStatus, BackendError, BackendErrorCode, PaneInfo, WorkspaceInfo};
+    use crate::hc::{
+        AgentInfo, AgentStatus, BackendError, BackendErrorCode, PaneInfo, WorkspaceInfo,
+    };
     use std::sync::Mutex;
 
     fn pane(ws: &str, n: u32) -> PaneInfo {
@@ -10006,7 +10008,12 @@ mod recover_session_loss_tests {
                     "flywheel-demo-oc",
                     "SlateHarbor",
                 ),
-                crew("block:dead:job", "flywheel-demo-job", "FrostyCreek", "coder"),
+                crew(
+                    "block:dead:job",
+                    "flywheel-demo-job",
+                    "FrostyCreek",
+                    "coder",
+                ),
                 crew("block:dead:rev", "flywheel-demo-rev", "BoldBay", "reviewer"),
             ],
         )
@@ -10024,8 +10031,8 @@ mod recover_session_loss_tests {
         assert_eq!(panes.len(), 1);
 
         let entries = state::load_spawn_registry("demo");
-        let rep =
-            recover_seats(&fleet, &cfg, "demo", &ws_id, Some(&panes), &entries, false).expect("seats");
+        let rep = recover_seats(&fleet, &cfg, "demo", &ws_id, Some(&panes), &entries, false)
+            .expect("seats");
         assert_eq!(rep.skipped_captain, vec!["flywheel-demo-oc".to_string()]);
         assert_eq!(rep.healthy, 0, "every crew pane is gone, none healthy");
         assert_eq!(
