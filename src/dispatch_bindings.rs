@@ -43,17 +43,43 @@ pub fn bindings_file(project: &str) -> PathBuf {
         .join(format!("{}.jsonl", crate::state::state_key(project)))
 }
 
-/// Every binding row this host wrote for `project`, oldest first. A torn or
-/// unreadable line is skipped, never fatal: the store is an index of evidence,
-/// not the evidence itself.
-#[must_use]
-pub fn all(project: &str) -> Vec<BindingRow> {
-    let Ok(body) = std::fs::read_to_string(bindings_file(project)) else {
-        return Vec::new();
+/// Every binding row this host wrote for `project`, oldest first.
+///
+/// FAIL CLOSED (bd-6setu.16 H2): a store that cannot be read, or a torn row,
+/// is an error — never an empty list. An empty answer would let the binder fall
+/// back to its planner heuristic and hand a review to its author, which is the
+/// one thing this store exists to prevent. A missing file is the only empty
+/// answer: nothing has been dispatched yet.
+///
+/// # Errors
+///
+/// Returns the read error, or one naming the torn line.
+pub fn all(project: &str) -> Result<Vec<BindingRow>> {
+    let body = match std::fs::read_to_string(bindings_file(project)) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!(
+                "dispatch bindings unreadable at {}: refusing to guess the author",
+                bindings_file(project).display()
+            )));
+        }
     };
-    body.lines()
-        .filter_map(|line| serde_json::from_str::<BindingRow>(line).ok())
-        .collect()
+    let mut rows = Vec::new();
+    for (n, line) in body.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row = serde_json::from_str::<BindingRow>(line).with_context(|| {
+            format!(
+                "dispatch bindings torn at {} line {}: refusing to guess the author",
+                bindings_file(project).display(),
+                n + 1
+            )
+        })?;
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 /// Record that `pin` took `step` at `node_path` in `run_id`, before the prompt.
@@ -73,7 +99,7 @@ pub fn append(project: &str, run_id: &str, node_path: &str, step: &str, pin: &st
         step: step.to_string(),
         pin: pin.to_string(),
     };
-    if all(project).iter().any(|r| r.key() == row.key()) {
+    if all(project)?.iter().any(|r| r.key() == row.key()) {
         return Ok(());
     }
     let path = bindings_file(project);
@@ -91,19 +117,31 @@ pub fn append(project: &str, run_id: &str, node_path: &str, step: &str, pin: &st
         .with_context(|| format!("dispatch bindings open {}", path.display()))?;
     file.write_all(line.as_bytes())
         .with_context(|| format!("dispatch bindings append {}", path.display()))?;
+    // bd-6setu.16 H2: the row must survive a crash before the prompt, or the
+    // journal claims a binding that no reader will see.
+    file.sync_all()
+        .with_context(|| format!("dispatch bindings fsync {}", path.display()))?;
     Ok(())
 }
 
 /// The pins that took any of `steps` in `run_id`. A review step's authors are
 /// the pins bound to the steps its stage READS, in the SAME run: nothing from
 /// another run, and never a pin that never ran a step here.
-#[must_use]
-pub fn authors_for(project: &str, run_id: &str, steps: &BTreeSet<String>) -> BTreeSet<String> {
-    all(project)
+///
+/// # Errors
+///
+/// Propagates a failed read: a caller that cannot see the rows must refuse the
+/// bind rather than bind blind.
+pub fn authors_for(
+    project: &str,
+    run_id: &str,
+    steps: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    Ok(all(project)?
         .into_iter()
         .filter(|r| r.run_id == run_id && steps.contains(&r.step))
         .map(|r| r.pin)
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -125,7 +163,7 @@ mod tests {
         append(&project, "run-1", "plan", "review", "Ada").unwrap();
         append(&project, "run-1", "plan", "review", "Ada").unwrap();
         append(&project, "run-1", "plan", "review", "Grace").unwrap();
-        let rows = all(&project);
+        let rows = all(&project).expect("readable store");
         assert_eq!(
             rows.len(),
             1,
@@ -144,12 +182,14 @@ mod tests {
         append(&project, "run-2", "n1", "execute", "Grace").unwrap();
         let steps: BTreeSet<String> = ["execute".to_string()].into_iter().collect();
         assert_eq!(
-            authors_for(&project, "run-1", &steps),
+            authors_for(&project, "run-1", &steps).expect("readable store"),
             ["Ada".to_string()].into_iter().collect::<BTreeSet<_>>()
         );
         let other: BTreeSet<String> = ["review".to_string()].into_iter().collect();
         assert!(
-            authors_for(&project, "run-1", &other).is_empty(),
+            authors_for(&project, "run-1", &other)
+                .expect("readable store")
+                .is_empty(),
             "a step nobody ran in this run has no author"
         );
     }
@@ -162,6 +202,41 @@ mod tests {
         let project = temp_project("empty-scope");
         append(&project, "", "plan", "review", "Ada").unwrap();
         append(&project, "run-1", "plan", "review", "").unwrap();
-        assert!(all(&project).is_empty());
+        assert!(all(&project).expect("readable store").is_empty());
+    }
+
+    /// bd-6setu.16 H2: the store is EVIDENCE. A torn row or an unreadable file
+    /// must refuse the bind, never answer "no rows" — an empty answer hands a
+    /// review to its author through the planner fallback.
+    #[test]
+    fn a_torn_row_refuses_instead_of_guessing() {
+        let _g = crate::config::lock_env();
+        let project = temp_project("torn-row");
+        append(&project, "run-1", "plan", "execute", "Ada").unwrap();
+        let path = bindings_file(&project);
+        let mut body = std::fs::read_to_string(&path).unwrap();
+        body.push_str("{\"run_id\":\"run-1\",\"node_path\":\"pl\n");
+        std::fs::write(&path, body).unwrap();
+        let err = all(&project).expect_err("a torn row is not an empty store");
+        assert!(
+            format!("{err:#}").contains("torn"),
+            "the refusal names the tear: {err:#}"
+        );
+        let steps: BTreeSet<String> = ["execute".to_string()].into_iter().collect();
+        assert!(
+            authors_for(&project, "run-1", &steps).is_err(),
+            "authors must refuse too: guessing here binds the author"
+        );
+    }
+
+    /// A row is readable by a SECOND handle the moment append returns, which is
+    /// what journal-before-prompt buys (the write is synced, not buffered).
+    #[test]
+    fn a_row_is_visible_to_a_second_reader_after_append() {
+        let _g = crate::config::lock_env();
+        let project = temp_project("durable");
+        append(&project, "run-1", "plan", "execute", "Ada").unwrap();
+        let rows = all(&project).expect("readable store");
+        assert_eq!(rows.len(), 1, "append is durable before it returns");
     }
 }

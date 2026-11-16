@@ -20,5 +20,11 @@ mutation "B1  the binder borrows the author the journal names" \
 mutation "B2  the scoped pane dispatch writes no binding row" \
     file=$PANE \
     expect=only_the_scoped_pane_dispatch_writes_a_binding \
-    find='        crate::dispatch_bindings::append(project, scope.run_id, scope.node_path, step, &pin)?;' \
-    replace='        let _ = (project, scope, step, pin);'
+    find='        crate::dispatch_bindings::append(
+            project,
+            ctx.scope.run_id,
+            ctx.scope.node_path,
+            step,
+            &pin,
+        )?;' \
+    replace='        let _ = (project, ctx.scope.run_id, ctx.scope.node_path, step, pin);'

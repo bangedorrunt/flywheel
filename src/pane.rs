@@ -1662,6 +1662,18 @@ pub struct DispatchScope<'a> {
     pub node_path: &'a str,
 }
 
+/// Everything a bindable pane dispatch needs from its caller (bd-6setu.16):
+/// the run scope, the stage→reads map resolved ONCE at construction (H3), and
+/// a prompt port a test can observe (M1). No per-step library reload.
+pub struct DispatchContext<'a> {
+    pub scope: DispatchScope<'a>,
+    /// stage name → the step refs its contract reads.
+    pub reads: &'a std::collections::BTreeMap<String, Vec<String>>,
+    /// When set, called INSTEAD of sending the prompt, after the binding row is
+    /// written — the execution witness for journal-before-prompt.
+    pub prompt_port: Option<&'a dyn Fn(&str, &str) -> Result<()>>,
+}
+
 /// [`pane_dispatch`] with the run scope that makes the dispatch bindable. The
 /// binding row is written BEFORE the pane prompt, keyed (run, node, step).
 #[allow(clippy::too_many_arguments)]
@@ -1673,7 +1685,7 @@ pub fn pane_dispatch_scoped(
     entries: &LiveRegistry,
     action: &Action,
     copy_index: Option<usize>,
-    scope: Option<&DispatchScope<'_>>,
+    ctx: Option<&DispatchContext<'_>>,
 ) -> Result<Value> {
     let Action::DispatchJob { spec, .. } = action else {
         if matches!(action, Action::Spawn { .. }) {
@@ -1702,26 +1714,25 @@ pub fn pane_dispatch_scoped(
         .map(|c| c.crew_max() as usize)
         .unwrap_or(crate::crew::DEFAULT_CREW_MAX as usize);
     // bd-6setu.2 / V10: a review step's authors are the pins bound to the steps
-    // its stage READS, in THIS run. No scope (headless, loop Send, plane-S) =
-    // no journal authors, and the binder falls back to its planner heuristic.
-    let journal_authors = scope.map_or_else(std::collections::BTreeSet::new, |scope| {
-        let steps: std::collections::BTreeSet<String> = headless::dispatch_spec_stage(spec)
-            .and_then(|stage| {
-                crate::stages::StageLibrary::load()
-                    .ok()?
-                    .get_stage(stage)
-                    .cloned()
-            })
-            .map(|stage| {
-                stage
-                    .reads
-                    .iter()
-                    .filter_map(|r| r.strip_prefix("steps.").map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        crate::dispatch_bindings::authors_for(project, scope.run_id, &steps)
-    });
+    // its stage READS, in THIS run. No context (headless, loop Send, plane-S) =
+    // no journal authors. bd-6setu.16: the reads map is DATA supplied by the
+    // construction site (H3), and an unreadable store REFUSES the dispatch (H2)
+    // instead of falling back to the planner heuristic.
+    let journal_authors = match ctx {
+        None => std::collections::BTreeSet::new(),
+        Some(ctx) => {
+            let steps: std::collections::BTreeSet<String> = headless::dispatch_spec_stage(spec)
+                .and_then(|stage| ctx.reads.get(stage).cloned())
+                .map(|reads| {
+                    reads
+                        .iter()
+                        .filter_map(|r| r.strip_prefix("steps.").map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            crate::dispatch_bindings::authors_for(project, ctx.scope.run_id, &steps)?
+        }
+    };
     let bound = review_bind(profile_name, spec, entries, crew_max, &journal_authors);
     let bound_entry: Option<SpawnEntry> = match &bound {
         Some(crate::seat_binder::Binding::Reuse { pin })
@@ -1824,14 +1835,33 @@ pub fn pane_dispatch_scoped(
     // between the two leaves a claim that the pane may not have received —
     // the safe direction for V10. Keyed (run, node, step), so a replay adds
     // nothing. A scope-less caller writes no row at all.
-    if let Some(scope) = scope {
+    if let Some(ctx) = ctx {
         let pin = entry
             .mail_identity
             .clone()
             .filter(|p| !p.trim().is_empty())
             .unwrap_or_else(|| entry.name.clone());
         let step = headless::dispatch_spec_stage(spec).unwrap_or(profile_name);
-        crate::dispatch_bindings::append(project, scope.run_id, scope.node_path, step, &pin)?;
+        crate::dispatch_bindings::append(
+            project,
+            ctx.scope.run_id,
+            ctx.scope.node_path,
+            step,
+            &pin,
+        )?;
+        // M1 (bd-6setu.16): the witness is EXECUTION, not source order — the
+        // port is invoked after the row is durable and before any prompt
+        // leaves, so a test observes the row at prompt time.
+        if let Some(port) = ctx.prompt_port {
+            port(&entry.name, &prompt)?;
+            return Ok(json!({
+                "delivered": true,
+                "prompt_port": true,
+                "agent": entry.name,
+                "profile": profile_name,
+                "step": step,
+            }));
+        }
     }
     eprintln!(
         "flywheel: dispatch @{} → {} ({})",
@@ -5856,6 +5886,200 @@ steps:
     fn local_engine_constructs_without_a_runtime() {
         let engine = toron_workflow::WorkflowEngine::local();
         assert!(engine.is_ok(), "local engine constructs off-runtime");
+    }
+
+    /// bd-6setu.16 M1 + H3, witnessed by EXECUTION: a prompt port observes the
+    /// store, so the test proves the binding row is durable BEFORE any prompt
+    /// leaves (not that two statements are written in a certain order), and the
+    /// authors come from the reads map handed to the dispatch (H3) rather than
+    /// from a library reloaded per step.
+    #[test]
+    fn the_binding_row_is_durable_before_the_prompt_port_runs() {
+        let _g = crate::config::lock_env();
+        let project = format!("pane-bind-{}", std::process::id());
+        // A row for the step this review READS: the binder must see it as an
+        // author, which only holds if the reads map is the data we passed.
+        crate::dispatch_bindings::append(&project, "run-9", "plan", "plan", "PlanAuthor")
+            .expect("seed the author row");
+
+        let catalog = test_catalog_with_reviewer_harness("pi");
+        let entries = as_live(vec![SpawnEntry {
+            pane_id: "w1:p1".into(),
+            name: "crew-goal-reviewer".into(),
+            profile: Some("reviewer".into()),
+            harness: Some("pi".into()),
+            model: None,
+            model_pin: None,
+            effort: None,
+            mode: None,
+            skills_digest: None,
+            mail_identity: Some("BlueLake".into()),
+            harness_session: None,
+            skills_injected: false,
+            incarnation: 0,
+        }]);
+        let action = Action::DispatchJob {
+            assignee: "x".into(),
+            spec: toron_workflow::schema::DispatchSpec {
+                profile: Some("@reviewer".into()),
+                stage: Some("ce-review".into()),
+                ..Default::default()
+            },
+            channel: None,
+            await_: None,
+            no_claim_timeout: 600,
+            result_timeout: None,
+        };
+        let reads: std::collections::BTreeMap<String, Vec<String>> =
+            [("ce-review".to_string(), vec!["steps.plan".to_string()])]
+                .into_iter()
+                .collect();
+        let seen: std::cell::RefCell<Option<(usize, std::collections::BTreeSet<String>)>> =
+            std::cell::RefCell::new(None);
+        let port = |_agent: &str, _prompt: &str| -> anyhow::Result<()> {
+            let rows = crate::dispatch_bindings::all(&project)?;
+            let steps: std::collections::BTreeSet<String> =
+                ["plan".to_string()].into_iter().collect();
+            let authors = crate::dispatch_bindings::authors_for(&project, "run-9", &steps)?;
+            *seen.borrow_mut() = Some((rows.len(), authors));
+            Ok(())
+        };
+        let ctx = DispatchContext {
+            scope: DispatchScope {
+                run_id: "run-9",
+                node_path: "review",
+            },
+            reads: &reads,
+            prompt_port: Some(&port),
+        };
+        let out = pane_dispatch_scoped(
+            &catalog,
+            &project,
+            "wf",
+            &json!({}),
+            &entries,
+            &action,
+            None,
+            Some(&ctx),
+        )
+        .expect("the dispatch reaches the port");
+        assert_eq!(
+            out["prompt_port"], true,
+            "the port is the prompt seam: {out}"
+        );
+        let (row_count, authors) = seen.into_inner().expect("the port ran");
+        assert_eq!(
+            row_count, 2,
+            "the author row plus THIS dispatch's row are already on disk when the port runs"
+        );
+        assert!(
+            authors.contains("PlanAuthor"),
+            "the reads map we passed names the author step: {authors:?}"
+        );
+    }
+
+    /// bd-6setu.16 H3, by execution: the authors come from the reads map the
+    /// dispatch was HANDED. With the map naming the step, the seeded author is
+    /// the reviewer itself and the binder refuses; with an empty map the same
+    /// dispatch is free. A per-step library reload cannot tell those apart.
+    #[test]
+    fn the_reads_map_decides_the_authors_at_dispatch() {
+        let _g = crate::config::lock_env();
+        let project = format!("pane-reads-{}", std::process::id());
+        // The author row names the REVIEWER's own pin.
+        crate::dispatch_bindings::append(&project, "run-9", "plan", "plan", "BlueLake")
+            .expect("seed the author row");
+
+        let catalog = test_catalog_with_reviewer_harness("pi");
+        let entries = as_live(vec![SpawnEntry {
+            pane_id: "w1:p1".into(),
+            name: "crew-goal-reviewer".into(),
+            profile: Some("reviewer".into()),
+            harness: Some("pi".into()),
+            model: None,
+            model_pin: None,
+            effort: None,
+            mode: None,
+            skills_digest: None,
+            mail_identity: Some("BlueLake".into()),
+            harness_session: None,
+            skills_injected: false,
+            incarnation: 0,
+        }]);
+        let action = Action::DispatchJob {
+            assignee: "x".into(),
+            spec: toron_workflow::schema::DispatchSpec {
+                profile: Some("@reviewer".into()),
+                stage: Some("ce-review".into()),
+                context: Some(toron_workflow::schema::ContextMode::Fresh),
+                ..Default::default()
+            },
+            channel: None,
+            await_: None,
+            no_claim_timeout: 600,
+            result_timeout: None,
+        };
+        let named: std::collections::BTreeMap<String, Vec<String>> =
+            [("ce-review".to_string(), vec!["steps.plan".to_string()])]
+                .into_iter()
+                .collect();
+        // A no-op port: if the binder ever frees this dispatch the port makes
+        // that a clean Ok, so the mutation shows up as "no refusal" instead of
+        // as a failed launch.
+        let never = |_a: &str, _p: &str| -> anyhow::Result<()> { Ok(()) };
+        let ctx_named = DispatchContext {
+            scope: DispatchScope {
+                run_id: "run-9",
+                node_path: "review",
+            },
+            reads: &named,
+            prompt_port: Some(&never),
+        };
+        let refused = pane_dispatch_scoped(
+            &catalog,
+            &project,
+            "wf",
+            &json!({}),
+            &entries,
+            &action,
+            None,
+            Some(&ctx_named),
+        );
+        assert!(
+            refused.is_err(),
+            "the reviewer that authored the read step must not review it: {refused:?}"
+        );
+        let msg = format!("{:#}", refused.err().unwrap());
+        assert!(
+            msg.contains("seat"),
+            "the refusal is the binder refusing a seat, not a launch failure: {msg}"
+        );
+
+        // Empty map = no author constraint = the dispatch proceeds.
+        let empty: std::collections::BTreeMap<String, Vec<String>> =
+            [("ce-review".to_string(), Vec::new())]
+                .into_iter()
+                .collect();
+        let port = |_a: &str, _p: &str| -> anyhow::Result<()> { Ok(()) };
+        let ctx_empty = DispatchContext {
+            scope: DispatchScope {
+                run_id: "run-9",
+                node_path: "review2",
+            },
+            reads: &empty,
+            prompt_port: Some(&port),
+        };
+        pane_dispatch_scoped(
+            &catalog,
+            &project,
+            "wf",
+            &json!({}),
+            &entries,
+            &action,
+            None,
+            Some(&ctx_empty),
+        )
+        .expect("no reads, no author constraint");
     }
 
     /// ADR-0022 V8: rex and hc build the SAME launch for one seat. The argv is

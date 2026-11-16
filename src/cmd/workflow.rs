@@ -830,14 +830,32 @@ pub(crate) fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         let entries = ctx.entries.clone();
                         let project_c = project.to_string();
                         pane_ctx = Some(ctx);
+                        // bd-6setu.16 H3: the stage library is read ONCE here,
+                        // at the construction site, and handed over as data.
+                        let reads: std::collections::BTreeMap<String, Vec<String>> =
+                            stages::StageLibrary::load()
+                                .map(|lib| {
+                                    lib.list()
+                                        .into_iter()
+                                        .filter_map(|n| {
+                                            lib.get_stage(n)
+                                                .map(|s| (n.to_string(), s.reads.clone()))
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
                         Arc::new(move |inv: &toron_workflow::engine::ActionInvocation| {
                             // bd-6setu.2: the durable leaf knows its run and
                             // node, so a pane dispatch here is bindable. The
                             // run id is the journal key; an empty one (a
                             // context that cannot name its run) writes no row.
-                            let scope = pane::DispatchScope {
-                                run_id: inv.run.run_id.as_str(),
-                                node_path: inv.run.node_path.as_str(),
+                            let ctx = pane::DispatchContext {
+                                scope: pane::DispatchScope {
+                                    run_id: inv.run.run_id.as_str(),
+                                    node_path: inv.run.node_path.as_str(),
+                                },
+                                reads: &reads,
+                                prompt_port: None,
                             };
                             pane::pane_dispatch_scoped(
                                 &catalog,
@@ -849,7 +867,7 @@ pub(crate) fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                                 toron_workflow::identity::copy_ordinal(
                                     inv.run.iteration_key.as_deref(),
                                 ),
-                                Some(&scope),
+                                Some(&ctx),
                             )
                         })
                     }

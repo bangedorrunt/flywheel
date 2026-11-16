@@ -1194,3 +1194,20 @@ mutations = [
   "scripts/mutations/registry-relationship-tests.spec.sh#H1",
   "scripts/mutations/registry-relationship-tests.spec.sh#H2",
 ]
+
+[[behavior]]
+id = "dispatch-binding-fails-closed"
+owner = "src/dispatch_bindings.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/dispatch_bindings.rs::a_torn_row_refuses_instead_of_guessing",
+  "src/dispatch_bindings.rs::a_row_is_visible_to_a_second_reader_after_append",
+  "src/pane.rs::the_binding_row_is_durable_before_the_prompt_port_runs",
+  "src/pane.rs::the_reads_map_decides_the_authors_at_dispatch",
+]
+mutations = [
+  "scripts/mutations/dispatch-binding-fail-closed.spec.sh#H2",
+  "scripts/mutations/dispatch-binding-fail-closed.spec.sh#M1",
+  "scripts/mutations/dispatch-binding-fail-closed.spec.sh#H3",
+]
