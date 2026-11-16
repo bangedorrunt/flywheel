@@ -2534,6 +2534,30 @@ pub(crate) fn cmd_gate_learnings(
     wiki: Option<&str>,
     memory: Option<&str>,
 ) -> Result<()> {
+    let (entries, projected) = project_gate_learnings(root, budget, wiki, memory)?;
+    let mut lanes = std::collections::BTreeMap::new();
+    for e in &projected {
+        *lanes.entry(e.lane.name()).or_insert(0usize) += 1;
+    }
+    print_json(&json!({
+        "budget": budget,
+        "corpus": entries,
+        "projected": projected,
+        "lanes": lanes,
+    }));
+    Ok(())
+}
+
+/// The bounded projection itself: corpus size IN, the projected rows OUT.
+/// Shared by `__gate-learnings` (the CLI door) and `__wave-gate`, which carries
+/// the projected PATHS in the artifact DISPATCH reads (bd-jhz8x.2 retarget of
+/// ADR-0010 D12: the gate stage is an engine step now).
+pub(crate) fn project_gate_learnings(
+    root: &str,
+    budget: usize,
+    wiki: Option<&str>,
+    memory: Option<&str>,
+) -> Result<(usize, Vec<crate::stages::learning::LearningEntry>)> {
     use crate::stages::learning::{
         LearningEntry, LearningLane, gate_projection, parse_lane_entries,
         parse_learning_frontmatter,
@@ -2578,17 +2602,7 @@ pub(crate) fn cmd_gate_learnings(
         entries.append(&mut lane_entries);
     }
     let projected = gate_projection(&entries, today, budget);
-    let mut lanes = std::collections::BTreeMap::new();
-    for e in &projected {
-        *lanes.entry(e.lane.name()).or_insert(0usize) += 1;
-    }
-    print_json(&json!({
-        "budget": budget,
-        "corpus": entries.len(),
-        "projected": projected,
-        "lanes": lanes,
-    }));
-    Ok(())
+    Ok((entries.len(), projected.into_iter().cloned().collect()))
 }
 
 /// Sorted .md files under root, archive/ excluded (archived learnings are

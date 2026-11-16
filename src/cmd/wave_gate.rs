@@ -73,9 +73,11 @@ pub fn gate(ready: &[ReadyBead], inprogress: &[ReadyBead], label: &str) -> Resul
 }
 
 impl Gate {
-    /// The binding artifact DISPATCH reads.
-    pub fn artifact(&self, label: &str) -> Value {
-        json!({
+    /// The binding artifact DISPATCH reads. `learnings` is the bounded GATE
+    /// grounding read (ADR-0010 D12): the projected docs/learnings paths the
+    /// wave carries as constraints. Absent when the corpus projects nothing.
+    pub fn artifact(&self, label: &str, learnings: &[String]) -> Value {
+        let mut artifact = json!({
             "wave_label": label,
             "held": self.held,
             "blockers": self.blockers,
@@ -85,7 +87,24 @@ impl Gate {
                 "title": b.title,
                 "verify": b.verify,
             })).collect::<Vec<_>>(),
-        })
+        });
+        if !learnings.is_empty() {
+            artifact["learnings"] = json!(learnings);
+        }
+        artifact
+    }
+}
+
+/// The gate's grounding read: the SAME bounded projection `__gate-learnings`
+/// prints, projected to the paths the artifact carries. A missing corpus is not
+/// a gate failure — it is an empty read, said out loud.
+pub fn learnings(root: &str, budget: usize) -> Vec<String> {
+    match crate::cmd::internal::project_gate_learnings(root, budget, None, None) {
+        Ok((_, projected)) => projected.iter().map(|e| e.path.clone()).collect(),
+        Err(e) => {
+            eprintln!("flywheel: wave gate could not read {root} for the grounding read: {e:#}");
+            Vec::new()
+        }
     }
 }
 
@@ -94,7 +113,11 @@ pub(crate) fn cmd(cfg: &crate::config::Config, project: &str, label: &str) -> an
     let ready = crate::load_ready_beads(cfg, project)?;
     let inprogress = crate::load_inprogress_beads(cfg, project)?;
     let decided = gate(&ready, &inprogress, label).map_err(anyhow::Error::msg)?;
-    let artifact = decided.artifact(label);
+    let projected = learnings(
+        "docs/learnings",
+        crate::cmd::internal::default_gate_budget(),
+    );
+    let artifact = decided.artifact(label, &projected);
     let path = crate::project_state::wave_dir(&crate::project_dir(cfg, project))
         .join(format!("{label}-ready.json"));
     if let Some(parent) = path.parent() {
@@ -112,6 +135,7 @@ pub(crate) fn cmd(cfg: &crate::config::Config, project: &str, label: &str) -> an
         "blockers": artifact["blockers"],
         "in_flight": artifact["in_flight"],
         "ready": artifact["ready"],
+        "learnings": artifact["learnings"],
     }));
     if decided.held {
         anyhow::bail!(
@@ -144,7 +168,7 @@ mod tests {
         assert!(g.held, "a lower wave must hold");
         assert_eq!(g.blockers, vec!["bd-a".to_string()]);
         assert!(g.ready.is_empty(), "nothing is dispatchable while held");
-        let artifact = g.artifact("wave-2");
+        let artifact = g.artifact("wave-2", &[]);
         assert_eq!(artifact["held"], true);
         assert_eq!(artifact["blockers"][0], "bd-a");
     }
@@ -168,6 +192,21 @@ mod tests {
         let err = gate(&[], &[], "wave-4").expect_err("a zero match must fail");
         assert!(err.contains("matched zero beads"), "{err}");
         assert!(err.contains("wave-4"), "{err}");
+    }
+
+    /// ADR-0010 D12: the artifact carries the bounded GATE grounding read —
+    /// the projected learnings paths — and omits the key when nothing projects.
+    #[test]
+    fn the_artifact_carries_the_projected_learnings() {
+        let g = gate(&[bead("bd-a", 2)], &[], "wave-2").expect("a ready wave");
+        let empty = g.artifact("wave-2", &[]);
+        assert!(
+            empty.get("learnings").is_none(),
+            "no projection = no key, not an empty list: {empty}"
+        );
+        let paths = vec!["docs/learnings/inbox/x.md".to_string()];
+        let artifact = g.artifact("wave-2", &paths);
+        assert_eq!(artifact["learnings"][0], "docs/learnings/inbox/x.md");
     }
 
     /// Only this wave's rows are dispatchable.

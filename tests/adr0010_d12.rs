@@ -9,6 +9,9 @@
 
 const MAIN: &str = include_str!("../src/main.rs");
 const STAGES: &str = include_str!("../src/stages.rs");
+/// bd-jhz8x.2: GATE is an engine step (`__wave-gate`), so the bounded
+/// projection's *caller* is this file, not the retired wave-gate prompt.
+const WAVE_GATE: &str = include_str!("../src/cmd/wave_gate.rs");
 const WORKFLOWS: &str = include_str!("../src/builtin_workflows.rs");
 const README: &str = include_str!("../docs/learnings/README.md");
 
@@ -38,15 +41,29 @@ fn adr0010_d12_ttls_in_structure() {
     );
 }
 
+/// The property ADR-0010 D12 pins is "the gate's grounding read IS the bounded
+/// projection, under the budget knob" — not "a prompt says so". The gate is an
+/// engine step now (`__wave-gate`), so the assertion follows the caller: the
+/// step runs the shared projection and carries its paths into the artifact
+/// DISPATCH reads. The prompt that used to name the command is retired.
 #[test]
 fn adr0010_d12_gate_stage_uses_the_bounded_projection() {
     assert!(
-        STAGES.contains("__gate-learnings") || STAGES.contains("gate-learnings"),
-        "wave-gate stage references the bounded projection command"
+        WAVE_GATE.contains("project_gate_learnings"),
+        "the gate step runs the bounded projection (not a bare corpus scan)"
     );
     assert!(
-        STAGES.contains("FLYWHEEL_GATE_BUDGET") || STAGES.contains("budget"),
-        "gate stage names the budget knob"
+        WAVE_GATE.contains("default_gate_budget"),
+        "the gate step reads the budget knob (FLYWHEEL_GATE_BUDGET)"
+    );
+    assert!(
+        WAVE_GATE.contains("\"learnings\"") && WAVE_GATE.contains("artifact[\"learnings\"]"),
+        "the projected paths ride the artifact, which is what DISPATCH reads"
+    );
+    // The projection itself (ranking, TTLs, budget) still lives in stages.rs.
+    assert!(
+        STAGES.contains("fn gate_projection") && STAGES.contains("FLYWHEEL_GATE_BUDGET"),
+        "the bounded projection layer is unchanged"
     );
 }
 
