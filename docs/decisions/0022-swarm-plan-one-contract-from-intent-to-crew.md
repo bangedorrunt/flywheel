@@ -1,6 +1,6 @@
 <!-- governed-by: ADR-0007, ADR-0011, ADR-0013, ADR-0016, ADR-0018, ADR-0021, toron ADR-0010, toron ADR-0022, toron ADR-0026, toron ADR-0032, toron ADR-0045 -->
 ---
-status: proposed
+status: proposed  # 2026-11-17: implementation map in §8 (D1–D8, V1–V11, acceptance 1–7); not reviewed for acceptance
 date: 2026-11-13
 decision-makers: Captain (bangedorrunt)
 consulted: |
@@ -348,3 +348,53 @@ ADR-0021 was revised in place on 2026-11-13 and absorbs these; they are kept her
 4. **Coarse modes.** "Zero per-tool config" holds for the captain, not for the stack: each mode must map to a per-harness flag (D3 table). Where no flag enforces it, the seat shows `degraded`, never a silent pass.
 5. **Idle-pane cost.** An idle interactive harness spends no tokens. The real cost is RAM and screen space; the real benefit is a warm context. Pane economy is therefore a policy (D7), not a correctness concern.
 6. **Example ids.** ADR-0021's profile examples use `model = "claude-3-7-sonnet"` with no provider and `harness = "hermes"`, which is not in `harness_registry::REGISTRY`. Under today's `resolve_strict` those profiles fail to spawn. Under D4 the bare id resolves only if one registered key matches; otherwise the plan says `blocked` with the candidates.
+
+---
+
+## 8. Implementation map (2026-11-17)
+
+Every row below was checked by grepping the named test and mutation at `3af56271`-onward, not from memory. A mutation id in the `mutation` column is the spec that must go RED; `scripts/mutations/adr0022-gates.spec.sh` carries the decision gates (bd-6setu.5), the `plan-*` specs carry D1.
+
+### Decisions
+
+| # | Witness test | Mutation | Status |
+|---|---|---|---|
+| D1 plan is a durable object | `plan_record_mints_once_and_keeps_the_patch_log`, `retire_journals_the_plan_event`, `the_fold_rebuilds_the_desired_seats_from_the_journal`, `the_plan_of_record_counts_the_journal_not_the_fleet`, `a_legacy_base_excludes_gone_rows`, `a_lost_seat_is_a_planned_spawn` | `plan-record P1`, `plan-retire T1`, `plan-fold F1`, `plan-of-record R1`, `plan-spawn-consent S1` | closed by bd-6setu.3 |
+| D2 one precedence rule | `prefer_spawn_user_model_wins` | `D2` | closed |
+| D3 adapters say what they honour | `harness_default_plan_says_honored_and_the_launch_injects_nothing`, `dry_run_ambiguous_from_profile_is_degraded` | none | **open: the honoured/degraded/blocked table is witnessed per case, not as the full adapter × field property V4 promises; no bead filed** |
+| D4 bare ids resolve or refuse | `resolve_ask_retired_without_replacement_is_retired` | `D4` | closed |
+| D5 consent asks only on change | `needs_consent_lists_jev_field`, `needs_consent_over_budget_lists_estimate`, `consent_policy_serializes_in_plan`, `plan_gate_names_items_and_hint`; `signoff` deleted (bd-6setu.4) | `D5` | closed |
+| D6 standing preferences | `prefer_spawn_model_from_preference` | `D6` | closed |
+| D7 reconciler, not a script | `seat_reconcile_precedence_harness_model_one_respawn`, `seat_reconcile_env_model_gives_respawn_fresh`, `seat_reconcile_no_change_gives_keep` | `V5`, `V9` | closed |
+| D8 binder picks the seat | `seat_binder_reviewer_never_author` | `V10` | closed; the dispatch-time binding rows are bd-6setu.2 (`scripts/mutations/dispatch-binding.spec.sh`) |
+
+### Properties
+
+| # | Witness test | Mutation | Status |
+|---|---|---|---|
+| V1 reachable / can-finish / bounded | `flywheel workflow verify` (catalog + hand charts) | `S1`, `C1`, `R1`, `W1`, `L1`, `F1` in `adr0021-gates.spec.sh` | closed as a GRAPH check; no TLC proof runs (honesty note above) |
+| V2 Jev failure never blocks Resolve | `plan_machine_jev_timeout_reaches_resolved_then_awaiting`, `plan_machine_jev_rate_limited_reaches_resolved`, `plan_machine_jev_missing_key_reaches_resolved`, `plan_machine_jev_shrug_reaches_resolved` | none | **open: witnessed, not mutation-proven** |
+| V3 a blocked seat never launches | `plan_gate_blocked_with_yes_asks_and_names_remedy`, `plan_gate_blocked_names_every_blocked_seat_field` | `D5` | closed |
+| V4 no false green (adapter × field) | `harness_default_plan_says_honored_and_the_launch_injects_nothing` | none | **open: per-case witness only, the property over the full table is unproven** |
+| V5 env-delivered model never relaunches | `seat_reconcile_env_model_gives_respawn_fresh` | `V5` | closed |
+| V6 no hop on Timeout/Unknown/empty evidence | `timeout_alone_never_allows_rebind`, `billing_with_evidence_allows_profile_hop` | none | **open: witnessed, not mutation-proven** |
+| V7 precedence is never inverted | `prefer_spawn_user_model_wins`, `seat_reconcile_precedence_harness_model_one_respawn` | `D2` | closed for user > preference; stage/profile/slot/Jev rows ride the same resolver |
+| V8 rex and hc produce the same launch command | none | none | **open: no witness, no bead filed** |
+| V9 reconciler idempotent | `seat_reconcile_no_change_gives_keep` | `V9` | closed |
+| V10 binder never gives a review to its author | `seat_binder_reviewer_never_author` | `V10` | closed |
+| V11 one live pane per pin, reservations survive | none (hand TLA+ model, ADR-0021 D5.4) | none | **open: no model checker runs; `tests/e2e_statechart_formal_verification.rs` is the chart fixture, not this property** |
+
+### Acceptance
+
+| # | Claim | Witness | Status |
+|---|---|---|---|
+| 1 | `spawn --gemini --model gemini-2.5-pro` shows honored and the argv carries it; `--harness fx` shows blocked | `harness_default_plan_says_honored_and_the_launch_injects_nothing` (honored half) | **partial: the gemini/fx pair is not pinned by a test** |
+| 2 | `briefing --json` lists Jev-filled fields with confidence and non-empty consent | `attach_consent_plan` + `needs_consent_lists_jev_field` | **partial: consent is pinned, `confidence` is not a field the plan carries (audit row 6)** |
+| 3 | a harness patch re-filters the model and clears the entry | `plan_patch_harness_refilters_model_and_clears_consent` | closed, mutation `A3` |
+| 4 | a remembered preference suppresses the question | `prefer_spawn_model_from_preference` | closed, mutation `D6` |
+| 5 | a 429 on an env-pinned seat respawns, keeps pin and reservations, journals one `RebindIntent` | `billing_with_evidence_allows_profile_hop`, `is_rate_limited_detects_429` | **partial: the hop rules are witnessed, the end-to-end respawn+journal row is not** |
+| 6 | a `beads-lifecycle` audit step binds to another seat, and a different model family when one is registered | `seat_binder_reviewer_never_author` | **partial: the author rule is witnessed; the lifecycle-step and family preference are not** |
+| 7 | V1–V11 pass; `verify-clippy.sh` and `clean-proof.sh --tests` pass | this table | **open where the rows above are open** |
+
+What this map does not claim: a green row means a witness exists and a named mutation was seen RED; it does not mean the behaviour is right, and the four `open`/`partial` rows above are exactly the places a reviewer should look first.
+
