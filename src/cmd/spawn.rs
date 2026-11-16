@@ -293,18 +293,33 @@ pub(crate) fn record_added_seat(
     crate::record_spawn_entry(cfg, project, entry);
 }
 
-pub(crate) fn cmd_add(
-    cfg: &Config,
-    project: &str,
-    counts: &crate::AgentCounts,
-    kinds: &[(String, u32)],
-    settle_secs: u64,
-    request_key: Option<&str>,
-    join_channels: &[String],
-    assign: &[String],
-) -> Result<()> {
+/// bd-koafr: the add door takes ONE options struct, like spawn, so the
+/// argument count stays clippy-clean as options grow.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AddOpts {
+    pub counts: crate::AgentCounts,
+    pub kinds: Vec<(String, u32)>,
+    pub settle_secs: u64,
+    pub request_key: Option<String>,
+    pub join_channels: Vec<String>,
+    pub assign: Vec<String>,
+}
+
+pub(crate) fn cmd_add(cfg: &Config, project: &str, opts: AddOpts) -> Result<()> {
+    let AddOpts {
+        counts,
+        kinds,
+        settle_secs,
+        request_key,
+        join_channels,
+        assign,
+    } = opts;
+    let counts = &counts;
+    let kinds = &kinds;
+    let request_key = request_key.as_deref();
+    let join_channels = &join_channels;
     crate::check_project_spelling(project, "add")?;
-    let assign = super::spawn::parse_assign(assign)?;
+    let assign = super::spawn::parse_assign(&assign)?;
     let _ = &assign;
     // A mutating door must not pave over a corrupt fleet: refuse first.
     state::load_spawn_registry_strict(project).map_err(|e| anyhow!("{e}"))?;
@@ -6407,12 +6422,7 @@ mod plane_gate_tests {
         let out = cmd_add(
             &cfg,
             "typo-probe",
-            &crate::AgentCounts::default(),
-            &[],
-            0,
-            None,
-            &[],
-            &[],
+            super::AddOpts::default(),
         );
         unsafe {
             match &prev {
@@ -8621,7 +8631,15 @@ pub(crate) fn dispatch_assignments(
     }
     let cfg = crate::config::Config::load().unwrap_or_default();
     for (pin, text, bead) in planned_briefs(assign) {
-        crate::cmd::crew::cmd_crew_prompt(&cfg, project, &pin, &text, r#as, false, bead.as_deref())?;
+        crate::cmd::crew::cmd_crew_prompt(
+            &cfg,
+            project,
+            &pin,
+            &text,
+            r#as,
+            false,
+            bead.as_deref(),
+        )?;
     }
     Ok(())
 }
