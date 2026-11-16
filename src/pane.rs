@@ -1662,6 +1662,10 @@ pub struct DispatchScope<'a> {
     pub node_path: &'a str,
 }
 
+/// The prompt seam a bindable dispatch hands over (bd-6setu.16 M1): called
+/// after the binding row is durable, instead of sending the prompt.
+pub type PromptPort<'a> = &'a dyn Fn(&str, &str) -> Result<()>;
+
 /// Everything a bindable pane dispatch needs from its caller (bd-6setu.16):
 /// the run scope, the stage→reads map resolved ONCE at construction (H3), and
 /// a prompt port a test can observe (M1). No per-step library reload.
@@ -1671,7 +1675,7 @@ pub struct DispatchContext<'a> {
     pub reads: &'a std::collections::BTreeMap<String, Vec<String>>,
     /// When set, called INSTEAD of sending the prompt, after the binding row is
     /// written — the execution witness for journal-before-prompt.
-    pub prompt_port: Option<&'a dyn Fn(&str, &str) -> Result<()>>,
+    pub prompt_port: Option<PromptPort<'a>>,
 }
 
 /// [`pane_dispatch`] with the run scope that makes the dispatch bindable. The
