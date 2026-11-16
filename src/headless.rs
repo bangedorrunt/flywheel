@@ -43,10 +43,8 @@ pub struct HarnessOutcome {
 /// `--reasoning-effort`, agy wires `--effort`; opencode, gemini, fx, claude,
 /// codex (and unknown harnesses) emit nothing, so the stderr warning fires.
 pub fn effort_degraded(harness: &str) -> bool {
-    !matches!(
-        crate::harness_registry::canonical(harness).as_str(),
-        "pi" | "grok" | "antigravity" | "antigravity-cli"
-    )
+    crate::harness_registry::spec(&crate::harness_registry::canonical(harness))
+        .is_none_or(|row| row.effort_flag.is_none())
 }
 
 pub fn model_args(harness: &str, model: &str, effort: Option<&str>) -> Vec<String> {
@@ -59,35 +57,20 @@ pub fn model_args(harness: &str, model: &str, effort: Option<&str>) -> Vec<Strin
             "flywheel: effort {e:?} has no native flag on harness {harness:?} — degrading to model-only (profile default stands)"
         );
     }
-    match canonical.as_str() {
-        "opencode" => vec!["--model".to_string(), model.to_string()],
-        "grok" => {
-            let mut args = vec!["-m".to_string(), model.to_string()];
-            if let Some(e) = effort {
-                args.push("--reasoning-effort".to_string());
-                args.push(e.to_string());
-            }
-            args
-        }
-        "gemini" => vec!["-m".to_string(), model.to_string()],
-        "antigravity" | "antigravity-cli" => {
-            let mut args = vec!["--model".to_string(), model.to_string()];
-            if let Some(e) = effort {
-                args.push("--effort".to_string());
-                args.push(e.to_string());
-            }
-            args
-        }
-        "pi" => {
-            let mut args = vec!["--model".to_string(), model.to_string()];
-            if let Some(e) = effort {
-                args.push("--thinking".to_string());
-                args.push(e.to_string());
-            }
-            args
-        }
-        _ => vec![],
+    // The flag itself is a registry fact (bd-6setu.1, ADR-0022 D3): this
+    // function only assembles it.
+    let Some(row) = crate::harness_registry::spec(&canonical) else {
+        return vec![];
+    };
+    let Some(flag) = row.model_flag else {
+        return vec![];
+    };
+    let mut args = vec![flag.to_string(), model.to_string()];
+    if let (Some(e), Some(effort_flag)) = (effort, row.effort_flag) {
+        args.push(effort_flag.to_string());
+        args.push(e.to_string());
     }
+    args
 }
 
 /// ADR-0022 L2 (bd-adr22-w2-phase-registry-igya): per-harness launch args
@@ -98,19 +81,17 @@ pub fn model_args(harness: &str, model: &str, effort: Option<&str>) -> Vec<Strin
 /// registry is the ONLY place a harness's phase vocabulary lives.
 pub fn phase_launch_args(harness: &str, phase: &str) -> (Vec<String>, bool) {
     let harness = crate::harness_registry::canonical(harness);
-    match (harness.as_str(), phase) {
-        ("opencode", "implement") => (vec!["--agent".to_string(), "build".to_string()], false),
-        (_, "implement") => (vec![], false),
-        ("opencode", "plan") => (vec!["--agent".to_string(), "plan".to_string()], false),
-        ("grok", "plan") => (
-            vec!["--permission-mode".to_string(), "plan".to_string()],
-            false,
-        ),
-        ("antigravity" | "antigravity-cli", "plan") => {
-            (vec!["--mode".to_string(), "plan".to_string()], false)
-        }
-        _ => (vec![], true),
-    }
+    let Some(row) = crate::harness_registry::spec(&harness) else {
+        // An unknown harness keeps the baseline: implement is never tagged
+        // degraded (there is nothing to degrade), plan is.
+        return (vec![], phase != "implement");
+    };
+    let (argv, degraded) = match phase {
+        "plan" => row.phase_plan,
+        "implement" => row.phase_implement,
+        _ => return (vec![], true),
+    };
+    (argv.iter().map(|s| (*s).to_string()).collect(), degraded)
 }
 
 /// How a harness delivers a `mode` request (ADR-0022 D3 mode column).
@@ -139,32 +120,25 @@ pub fn mode_launch_args(harness: &str, mode: &str) -> (Vec<String>, ModeDelivery
     if mode != "read-only" {
         return degraded(&format!("mode `{mode}` has no dedicated flag; prompt-only"));
     }
-    match crate::harness_registry::canonical(harness).as_str() {
-        "grok" => (
-            vec!["--permission-mode".to_string(), "plan".to_string()],
-            ModeDelivery::Honored,
-        ),
-        "antigravity" | "antigravity-cli" => (
-            vec!["--mode".to_string(), "plan".to_string()],
-            ModeDelivery::Honored,
-        ),
-        "opencode" => (
-            vec!["--agent".to_string(), "plan".to_string()],
-            ModeDelivery::Honored,
-        ),
-        "pi" => (
-            vec!["--tools".to_string(), "read,grep,find,ls".to_string()],
-            ModeDelivery::Honored,
-        ),
-        "gemini" => (
-            vec!["--approval-mode".to_string(), "default".to_string()],
+    let canonical = crate::harness_registry::canonical(harness);
+    let Some(row) = crate::harness_registry::spec(&canonical) else {
+        return degraded(&format!(
+            "harness {canonical:?} has no read-only flag; prompt-only"
+        ));
+    };
+    let (argv, degraded_reason) = row.read_only;
+    let args: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
+    match degraded_reason {
+        Some(reason) => (
+            args,
             ModeDelivery::Degraded {
-                reason: "approval-gated, not enforced".to_string(),
+                reason: reason.to_string(),
             },
         ),
-        other => degraded(&format!(
-            "harness {other:?} has no read-only flag; prompt-only"
+        None if args.is_empty() => degraded(&format!(
+            "harness {canonical:?} has no read-only flag; prompt-only"
         )),
+        None => (args, ModeDelivery::Honored),
     }
 }
 
@@ -1575,7 +1549,8 @@ pub fn interactive_model_plan(
     if crate::models::ModelChoice::parse(model) == crate::models::ModelChoice::HarnessDefault {
         return InteractiveModelPlan::HarnessDefault;
     }
-    if harness == "opencode" {
+    let row = crate::harness_registry::spec(&crate::harness_registry::canonical(harness));
+    if row.is_some_and(|r| r.pane_model_by_env) {
         let effort = effort.filter(|e| !e.is_empty());
         if let Some(e) = effort {
             eprintln!(

@@ -70,6 +70,21 @@ pub struct HarnessSpec {
     /// (model-opaque), so a seat with no registered family id is blocked
     /// rather than handed a foreign-provider default.
     pub coupled: bool,
+    /// The model flag for the headless argv (and the pane argv when
+    /// `pane_model_by_env` is false). `None` = the harness takes no model flag.
+    pub model_flag: Option<&'static str>,
+    /// The interactive pane cannot take a model flag at all; the pin travels
+    /// by pane env instead (opencode v2.0.16 rejects `--model` on its root).
+    pub pane_model_by_env: bool,
+    /// The effort flag, when the harness has a native one. `None` = effort is
+    /// degraded there, loudly.
+    pub effort_flag: Option<&'static str>,
+    /// `mode: read-only` argv and, when the argv does not ENFORCE it, the
+    /// reason it is degraded.
+    pub read_only: (&'static [&'static str], Option<&'static str>),
+    /// Orchestration-phase argv: (plan, implement) with a degraded flag each.
+    pub phase_plan: (&'static [&'static str], bool),
+    pub phase_implement: (&'static [&'static str], bool),
 }
 
 /// The registry. Adding a harness is a one-line change HERE, and the fences at
@@ -81,6 +96,12 @@ pub const REGISTRY: &[HarnessSpec] = &[
         tier: HarnessTier::Open,
         implied_slot: Some(SLOT_CHEAP),
         coupled: false,
+        model_flag: Some("--model"),
+        pane_model_by_env: true,
+        effort_flag: None,
+        read_only: (&["--agent", "plan"], None),
+        phase_plan: (&["--agent", "plan"], false),
+        phase_implement: (&["--agent", "build"], false),
     },
     HarnessSpec {
         canonical: "pi",
@@ -88,6 +109,12 @@ pub const REGISTRY: &[HarnessSpec] = &[
         tier: HarnessTier::Open,
         implied_slot: Some(SLOT_STANDARD),
         coupled: false,
+        model_flag: Some("--model"),
+        pane_model_by_env: false,
+        effort_flag: Some("--thinking"),
+        read_only: (&["--tools", "read,grep,find,ls"], None),
+        phase_plan: (&[], true),
+        phase_implement: (&[], false),
     },
     HarnessSpec {
         canonical: "grok",
@@ -95,6 +122,12 @@ pub const REGISTRY: &[HarnessSpec] = &[
         tier: HarnessTier::Closed,
         implied_slot: Some(SLOT_PREMIUM),
         coupled: true,
+        model_flag: Some("-m"),
+        pane_model_by_env: false,
+        effort_flag: Some("--reasoning-effort"),
+        read_only: (&["--permission-mode", "plan"], None),
+        phase_plan: (&["--permission-mode", "plan"], false),
+        phase_implement: (&[], false),
     },
     HarnessSpec {
         canonical: "codex",
@@ -102,6 +135,12 @@ pub const REGISTRY: &[HarnessSpec] = &[
         tier: HarnessTier::Closed,
         implied_slot: None,
         coupled: true,
+        model_flag: None,
+        pane_model_by_env: false,
+        effort_flag: None,
+        read_only: (&[], Some("no read-only flag")),
+        phase_plan: (&[], true),
+        phase_implement: (&[], false),
     },
     HarnessSpec {
         canonical: "claude",
@@ -109,6 +148,12 @@ pub const REGISTRY: &[HarnessSpec] = &[
         tier: HarnessTier::Closed,
         implied_slot: None,
         coupled: true,
+        model_flag: None,
+        pane_model_by_env: false,
+        effort_flag: None,
+        read_only: (&[], Some("no read-only flag")),
+        phase_plan: (&[], true),
+        phase_implement: (&[], false),
     },
     HarnessSpec {
         canonical: "fx",
@@ -116,13 +161,25 @@ pub const REGISTRY: &[HarnessSpec] = &[
         tier: HarnessTier::Open,
         implied_slot: None,
         coupled: false,
+        model_flag: None,
+        pane_model_by_env: false,
+        effort_flag: None,
+        read_only: (&[], Some("no read-only flag")),
+        phase_plan: (&[], true),
+        phase_implement: (&[], false),
     },
     HarnessSpec {
         canonical: "antigravity",
-        aliases: &["agy", "ag"],
+        aliases: &["agy", "ag", "antigravity-cli"],
         tier: HarnessTier::Closed,
         implied_slot: None,
         coupled: false,
+        model_flag: Some("--model"),
+        pane_model_by_env: false,
+        effort_flag: Some("--effort"),
+        read_only: (&["--mode", "plan"], None),
+        phase_plan: (&["--mode", "plan"], false),
+        phase_implement: (&[], false),
     },
     HarnessSpec {
         canonical: "gemini",
@@ -130,6 +187,15 @@ pub const REGISTRY: &[HarnessSpec] = &[
         tier: HarnessTier::Closed,
         implied_slot: None,
         coupled: false,
+        model_flag: Some("-m"),
+        pane_model_by_env: false,
+        effort_flag: None,
+        read_only: (
+            &["--approval-mode", "default"],
+            Some("approval-gated, not enforced"),
+        ),
+        phase_plan: (&[], true),
+        phase_implement: (&[], false),
     },
 ];
 
@@ -461,5 +527,60 @@ mod tests {
             !is_coupled("some-config-harness"),
             "an unknown harness is not coupled by default"
         );
+    }
+
+    /// bd-6setu.1 (ADR-0022 D3): every launch column is answered by the ROW.
+    /// This walks the registry and asks the headless accessors, so a row and a
+    /// second match arm cannot disagree.
+    #[test]
+    fn every_row_answers_the_launch_columns() {
+        use crate::headless::ModeDelivery;
+        use crate::headless::{effort_degraded, mode_launch_args, model_args, phase_launch_args};
+        for row in REGISTRY {
+            let name = row.canonical;
+            let got = model_args(name, "m", None);
+            match row.model_flag {
+                Some(flag) => assert_eq!(
+                    got,
+                    vec![flag.to_string(), "m".to_string()],
+                    "{name}: model argv must be the row flag"
+                ),
+                None => assert!(got.is_empty(), "{name}: no model flag, no argv: {got:?}"),
+            }
+            assert_eq!(
+                effort_degraded(name),
+                row.effort_flag.is_none(),
+                "{name}: effort degraded iff the row has no flag"
+            );
+            let (mode_args, delivery) = mode_launch_args(name, "read-only");
+            let want: Vec<String> = row.read_only.0.iter().map(|s| (*s).to_string()).collect();
+            assert_eq!(mode_args, want, "{name}: read-only argv is the row");
+            match row.read_only.1 {
+                Some(_) => assert!(
+                    matches!(delivery, ModeDelivery::Degraded { .. }),
+                    "{name}: a row reason means degraded"
+                ),
+                None if want.is_empty() => assert!(
+                    matches!(delivery, ModeDelivery::Degraded { .. }),
+                    "{name}: no flag and no reason is still degraded"
+                ),
+                None => assert_eq!(
+                    delivery,
+                    ModeDelivery::Honored,
+                    "{name}: argv the harness enforces is honored"
+                ),
+            }
+            for (phase, (argv, degraded)) in
+                [("plan", row.phase_plan), ("implement", row.phase_implement)]
+            {
+                let (args, got_degraded) = phase_launch_args(name, phase);
+                let want: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
+                assert_eq!(args, want, "{name}: {phase} argv is the row");
+                assert_eq!(
+                    got_degraded, degraded,
+                    "{name}: {phase} degraded is the row"
+                );
+            }
+        }
     }
 }

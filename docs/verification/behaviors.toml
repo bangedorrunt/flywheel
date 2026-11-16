@@ -1126,3 +1126,16 @@ tests = [
 mutations = [
   "scripts/mutations/launch-parity.spec.sh#V8",
 ]
+
+[[behavior]]
+id = "harness.launch-columns-are-registry-facts"
+owner = "src/harness_registry.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/harness_registry.rs::every_row_answers_the_launch_columns",
+  "src/headless.rs::model_args_follow_harness_forms",
+]
+mutations = [
+  "scripts/mutations/harness-registry-launch-columns.spec.sh#L1",
+]
