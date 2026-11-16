@@ -2599,9 +2599,25 @@ mod tests {
     fn stop_escalates_to_sigkill_when_sigterm_is_ignored() {
         let dir = tmp_lifecycle("stop-kill");
         let cfg = test_cfg(&dir, 0);
+        // The child writes this only after the trap is installed. Without it
+        // the test raced the shell's startup: under load the SIGTERM arrived
+        // first, a not-yet-trapped process died cleanly, and the SIGKILL
+        // assertion failed with no defect in the code under test.
+        let armed = dir.join("term-ignored");
         let mut sh = std::process::Command::new("sh");
-        sh.args(["-c", "trap '' TERM; exec sleep 300"]);
+        sh.args([
+            "-c",
+            &format!("trap '' TERM; : > '{}'; exec sleep 300", armed.display()),
+        ]);
         let pid = spawn_reaped(&mut sh);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !armed.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never installed its TERM trap"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         std::fs::write(cfg.pid_file(), format!("{pid}\n")).unwrap();
         let mut sup = FakeSupervisor::unreadable();
         let msg = stop_with_budgets(
