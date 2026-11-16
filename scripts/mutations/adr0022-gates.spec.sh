@@ -19,6 +19,11 @@ TEST_FILTER=(
     seat_reconcile_no_change_gives_keep
     seat_binder_reviewer_never_author
     plan_patch_harness_refilters_model_and_clears_consent
+    plan_machine_jev_timeout_reaches_resolved_then_awaiting
+    plan_machine_jev_rate_limited_reaches_resolved
+    plan_machine_jev_missing_key_reaches_resolved
+    plan_machine_jev_shrug_reaches_resolved
+    timeout_alone_never_allows_rebind
 )
 
 SPAWN=src/cmd/spawn.rs
@@ -95,3 +100,22 @@ mutation "A3  a harness patch is dropped before re-resolution" \
     expect=plan_patch_harness_refilters_model_and_clears_consent \
     find='            crate::swarm_plan::PatchField::Harness => e.harness = Some(p.value.clone()),' \
     replace='            crate::swarm_plan::PatchField::Harness => e.harness = None,'
+
+# V2 (bd-6setu.7): a Jev failure never blocks Resolve. The mutant gates the
+# Drafting->Resolved edge on JevOutcome::Ok, so a timeout, a 429, a missing key
+# or a shrug leaves the plan drafting forever.
+mutation "V2  a Jev failure blocks Resolve" \
+    file=$CHART \
+    expect=plan_machine_jev_timeout_reaches_resolved_then_awaiting \
+    find='                    .on(|e| matches!(e, PlanEvent::Resolve { .. }))' \
+    replace='                    .on(|e| matches!(e, PlanEvent::Resolve { jev: JevOutcome::Ok, .. }))'
+
+# V6 (bd-6setu.7): no hop on Timeout / Unknown / empty evidence. The mutant lets
+# a bare timeout drive a rebind, which is the failure class toron ADR-0032 says
+# must never justify one.
+mutation "V6  a timeout alone allows a rebind" \
+    file=src/agent_ref.rs \
+    expect=timeout_alone_never_allows_rebind \
+    find='                | FailureKind::RateLimit' \
+    replace='                | FailureKind::RateLimit
+                | FailureKind::Timeout'
