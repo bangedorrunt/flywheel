@@ -7,9 +7,20 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# Files that predate the helper: debt, not permission. A new test cannot be
-# added here to get green — remove a line when its file migrates.
+# The baseline is RETIRED (bd-jp9z1.6): every file migrated, so the file is empty
+# and any entry is a failure. It stays in the tree so the rule is visible.
 BASELINE="$ROOT/scripts/test-sandbox-baseline.txt"
+
+# No exceptions: a line in the baseline is a spawn that skipped the sandbox, and
+# there is nowhere left to put one. Sandbox the test instead.
+refuse_baseline_entries() {
+    local file="$1"
+    [ -f "$file" ] || return 0
+    grep -q '[^[:space:]]' "$file" || return 0
+    echo "test-sandbox: the baseline is retired; sandbox the test instead. Entries:" >&2
+    grep -n '[^[:space:]]' "$file" >&2
+    return 1
+}
 
 offends() {
     local file="$1"
@@ -40,6 +51,7 @@ live_carve_out() {
 
 scan() {
     local bad=0 file
+    refuse_baseline_entries "$BASELINE" || bad=1
     while IFS= read -r file; do
         rel="${file#"$ROOT"/}"
         [ "$rel" = "src/test_sandbox.rs" ] && continue
@@ -71,6 +83,14 @@ self_test() {
     [ "$ok" = yes ] || { echo "self-test: an ignored, gated live file was refused" >&2; exit 1; }
     [ "$unignored" = yes ] || { echo "self-test: a live file with a non-ignored test was allowed" >&2; exit 1; }
     [ "$misfiled" = yes ] || { echo "self-test: the carve-out ignored the live_*.rs name rule" >&2; exit 1; }
+
+    # The retired baseline: empty passes, one entry fails.
+    : >"$tmp/baseline_empty.txt"
+    printf 'tests/legacy.rs\n' >"$tmp/baseline_entry.txt"
+    if refuse_baseline_entries "$tmp/baseline_empty.txt" 2>/dev/null; then empty_ok=yes; else empty_ok=no; fi
+    if refuse_baseline_entries "$tmp/baseline_entry.txt" 2>/dev/null; then entry_ok=no; else entry_ok=yes; fi
+    [ "$empty_ok" = yes ] || { echo "self-test: an empty baseline was refused" >&2; exit 1; }
+    [ "$entry_ok" = yes ] || { echo "self-test: a baseline entry was allowed" >&2; exit 1; }
     echo "self-test ok"
 }
 
