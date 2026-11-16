@@ -24,6 +24,10 @@ pub(crate) enum LedgerCmd {
         /// repo dir for SHA derivation + br (default: current directory)
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// repo to search for the citing commit when the work lives elsewhere
+        /// (symmetric with `br close --repo`); default: the `--dir` repo
+        #[arg(long)]
+        repo: Option<PathBuf>,
     },
     /// worker helper: write ONLY the receipt file
     /// `.flywheel/receipts/<bead-id>-<sha>.<kind>.txt` (refuses empty stdin).
@@ -62,11 +66,13 @@ pub(crate) fn cmd_ledger(_cfg: &Config, cmd: &LedgerCmd) -> Result<()> {
             blast,
             ac,
             dir,
+            repo,
         } => {
             let cwd = dir
                 .clone()
                 .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
-            let sha = crate::verdict::derive_head_sha(&cwd, bead_id);
+            let search = repo.as_deref().unwrap_or(&cwd);
+            let sha = crate::verdict::derive_head_sha_in(&cwd, search, bead_id);
             let mut bead = crate::verdict::bead_from_br_show_for_close(&cwd, bead_id)?;
             bead.blast = match blast.as_str() {
                 "high" => crate::verdict::Blast::High,
@@ -86,7 +92,14 @@ pub(crate) fn cmd_ledger(_cfg: &Config, cmd: &LedgerCmd) -> Result<()> {
                 println!("ledger check {bead_id}: LEGAL (task {task} verdict {verdict})");
                 return Ok(());
             }
-            let sha = sha?;
+            let sha = match sha {
+                Ok(sha) => sha,
+                Err(e) if repo.is_none() => bail!(
+                    "{e}\n  pass --repo <dir> when the work repo lives elsewhere \
+                     (symmetric with br close --repo)"
+                ),
+                Err(e) => return Err(e),
+            };
             let why = crate::verdict::ledger_check_diagnostics(&cwd, &bead, &sha)?;
             let detail = if why.is_empty() {
                 String::new()

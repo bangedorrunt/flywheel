@@ -874,3 +874,16 @@ mutations = [
   "scripts/mutations/ledger-claims.spec.sh#L1",
   "scripts/mutations/ledger-claims.spec.sh#L2",
 ]
+
+[[behavior]]
+id = "ledger.citing-sha-may-live-in-another-repo"
+owner = "src/cmd/ledger.rs::cmd_ledger"
+status = "proven"
+concurrent = false
+tests = [
+  "src/verdict.rs::derive_head_sha_in_searches_the_work_repo_for_the_citing_commit",
+]
+mutations = [
+  "scripts/mutations/ledger-repo-search.spec.sh#R1",
+  "scripts/mutations/ledger-repo-search.spec.sh#R2",
+]

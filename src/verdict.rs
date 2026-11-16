@@ -531,6 +531,13 @@ fn rank_binding<'a>(parsed: &'a [(String, bool, bool)], candidates: &[&'a str]) 
 }
 
 pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
+    derive_head_sha_in(cwd, cwd, bead_id)
+}
+
+/// [`derive_head_sha`] where the citing commit may live in another repo
+/// (bd-8q3qf): `cwd` owns the gate rows and the bead store, `search` is the
+/// repo git is asked about. Symmetric with `br close --repo <dir>`.
+pub fn derive_head_sha_in(cwd: &Path, search: &Path, bead_id: &str) -> anyhow::Result<String> {
     // bd-wcjsu: the verdict BINDS its revision. A gate row's leading `sha=`
     // (the commit that ran the proof) is the binding; scanning the log for the
     // newest commit that merely MENTIONS the bead flipped a closed bead's
@@ -548,7 +555,7 @@ pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
             };
             let exists = StdCommand::new("git")
                 .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
-                .current_dir(cwd)
+                .current_dir(search)
                 .output()
                 .map(|out| out.status.success())
                 .unwrap_or(false);
@@ -565,7 +572,7 @@ pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
             &format!("--grep={bead_id}"),
             "--format=%H%x1f%s",
         ])
-        .current_dir(cwd)
+        .current_dir(search)
         .output()
         .map_err(|e| anyhow::anyhow!("git not found: {e}"))?;
     if !out.status.success() {
@@ -602,7 +609,7 @@ pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
     let candidates: Vec<&str> = parsed
         .iter()
         .map(|(sha, _, _)| sha.as_str())
-        .filter(|sha| !commit_changes_nothing(cwd, sha).unwrap_or(false))
+        .filter(|sha| !commit_changes_nothing(search, sha).unwrap_or(false))
         .collect();
     if candidates.is_empty() {
         anyhow::bail!(
@@ -614,7 +621,7 @@ pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
     let mut work_candidates: Vec<&str> = Vec::new();
     let mut bookkeeping_candidates: Vec<&str> = Vec::new();
     for sha in &candidates {
-        if commit_is_bookkeeping_only(cwd, sha)? {
+        if commit_is_bookkeeping_only(search, sha)? {
             bookkeeping_candidates.push(sha);
         } else {
             work_candidates.push(sha);
@@ -1578,6 +1585,85 @@ mod tests {
             .expect("the lowercase bead id must find the uppercase citation");
         assert_eq!(bound, head, "the uppercase citation must bind the bead");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-8q3qf: the work a bead proves can live in another repo (bd-nwfj7
+    /// closed against a beads-fork sha that flywheel never carried). The gate
+    /// rows stay in `cwd`; only the SEARCH moves, so the citing commit resolves
+    /// in the repo that has it and the SHA rule stops calling that close
+    /// illegal forever. Without the search dir the refusal must still fire.
+    #[test]
+    fn derive_head_sha_in_searches_the_work_repo_for_the_citing_commit() {
+        // br/git shelling reads process-global env: serialize with the pin tests.
+        let _g = crate::config::lock_env();
+        let store = std::env::temp_dir().join(format!("fw-repo-store-{}", std::process::id()));
+        let work = std::env::temp_dir().join(format!("fw-repo-work-{}", std::process::id()));
+        for dir in [&store, &work] {
+            let _ = std::fs::remove_dir_all(dir);
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?} in {} failed: {}",
+                dir.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        for dir in [&store, &work] {
+            git(dir, &["init", "-q"]);
+            git(dir, &["config", "user.email", "t@example.com"]);
+            git(dir, &["config", "user.name", "t"]);
+        }
+        std::fs::write(store.join("f.txt"), "x").unwrap();
+        git(&store, &["add", "-A"]);
+        git(&store, &["commit", "-q", "-m", "chore: no citation here"]);
+        std::fs::write(work.join("g.txt"), "y").unwrap();
+        git(&work, &["add", "-A"]);
+        git(
+            &work,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "fix: bd-repo-witness lives in the work repo",
+            ],
+        );
+        let cited = git_stdout(&work, &["log", "-1", "--format=%H"]).expect("work head");
+        git(
+            &work,
+            &[
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "chore: bd-repo-witness empty",
+            ],
+        );
+        let empty = git_stdout(&work, &["log", "-1", "--format=%H"]).expect("empty head");
+        assert_ne!(
+            cited, empty,
+            "the empty commit must move the work repo HEAD"
+        );
+
+        let refused = derive_head_sha(&store, "bd-repo-witness")
+            .expect_err("the store repo carries no citing commit");
+        assert!(
+            refused.to_string().contains("SHA rule"),
+            "the refusal must be the SHA rule, got: {refused}"
+        );
+        assert_eq!(
+            derive_head_sha_in(&store, &work, "bd-repo-witness").unwrap(),
+            cited,
+            "the foreign citing commit must bind when the search dir names its repo"
+        );
+        let _ = std::fs::remove_dir_all(&store);
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     fn bead(priority: u8, blast: Blast, runnable: bool) -> BeadUnit {
