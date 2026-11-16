@@ -1619,7 +1619,11 @@ mod tests {
             "the audit keeps receiving rows after the burst"
         );
         let fold = st.fold_workspace("w");
-        assert!(fold.torn.is_none(), "no tear across the burst: {:?}", fold.torn);
+        assert!(
+            fold.torn.is_none(),
+            "no tear across the burst: {:?}",
+            fold.torn
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

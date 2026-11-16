@@ -14,5 +14,5 @@ mutation "S1  the suite step only runs --bin flywheel" \
 mutation "I1  the mutation harness edits the caller tree" \
     file=scripts/verify-mutations.sh \
     expect=proof_verify_mutations_never_edits_the_shared_tree \
-    find='    isolate_if_shared "$@"' \
-    replace='    : isolate_if_shared "$@"'
+    find='        isolate_if_shared "${original[@]}"' \
+    replace='        : isolate_if_shared "${original[@]}"'
