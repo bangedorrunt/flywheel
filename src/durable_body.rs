@@ -123,12 +123,19 @@ pub fn real_verify_sink() -> toron_workflow::engine::VerifySink {
             .arg("-c")
             .arg(&req.command)
             .output()?;
+        // bd-jhz8x.2: a verify step's data must be consumable downstream
+        // (`foreach over: "{{steps.gate.json.ready}}"`). `None` when the
+        // command printed no JSON — never an empty object.
+        let json = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            .ok()
+            .filter(|v| !v.is_null());
         Ok(VerifyResult {
             ok: out.status.success(),
             exit: out.status.code().unwrap_or(-1),
             stdout_path: None,
             stderr_path: None,
             error: None,
+            json,
         })
     });
     *sink.0.lock().expect("verify sink lock poisoned") = Some(f);
@@ -1863,6 +1870,7 @@ mod tests {
                 stdout_path: None,
                 stderr_path: None,
                 error: None,
+                json: None,
             })
         });
         *sink.0.lock().expect("verify sink lock poisoned") = Some(f);

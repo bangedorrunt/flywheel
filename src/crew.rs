@@ -3792,6 +3792,7 @@ steps:
                     stdout_path: None,
                     stderr_path: None,
                     error: Some("simulated test failure".into()),
+                    json: None,
                 })
             },
         ));
@@ -3829,6 +3830,7 @@ steps:
                     stdout_path: Some("/tmp/out".into()),
                     stderr_path: None,
                     error: None,
+                    json: None,
                 })
             }));
         *engine2.verify_sink().0.lock().unwrap() = sink2.0.lock().unwrap().clone();

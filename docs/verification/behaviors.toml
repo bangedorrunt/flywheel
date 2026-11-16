@@ -272,6 +272,21 @@ tests = [
 mutations = ["scripts/mutations/clean-proof-slot.spec.sh#S1", "scripts/mutations/clean-proof-slot.spec.sh#S2"]
 
 [[behavior]]
+id = "wave.verify-json-carrier"
+owner = "src/cmd/internal.rs"
+status = "proven"
+concurrent = false
+# The toron-side half (a VerifyResult without json omits the field) lives in
+# crates/toron-workflow/src/engine/sinks.rs and is proven in the toron repo; this
+# ledger only resolves paths inside flywheel.
+tests = [
+  "src/cmd/internal.rs::verify_sink_carries_json_stdout_and_none_for_plain_text",
+]
+mutations = [
+  "scripts/mutations/verify-result-json.spec.sh#J1",
+]
+
+[[behavior]]
 id = "wave.gate-engine-step"
 owner = "src/cmd/wave_gate.rs"
 status = "proven"

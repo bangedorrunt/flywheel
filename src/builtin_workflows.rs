@@ -1194,7 +1194,7 @@ steps:
 name: wave-swarm
 compose: true
 shape: pipeline
-description: "The compounded wave swarm. GATE scopes br ready to one wave via the TYPED wave field (grounding-reads docs/learnings/), holds on any open lower wave, and treats an empty ready with in-flight beads as WORK IN FLIGHT (bd-wave-gate-typed-authority-27et); DISPATCH emits send --stage ce-execute --param payloads (bead/scope/exit/channel/pin/report_file/learnings); OBSERVE escalates to the captain (lesson: line on every escalation) and never adjudicates; REVIEW audits each closed bead's diff against its brief (detection conditions, quoted evidence, autofix classes); VERIFY checks receipts at committed HEAD + VERIFY tails + principles citations + the residual gate (every finding fixed or filed as a bead); COMPOUND captures durable learnings to docs/learnings/ (never blocks); SIGNOFF suspends for captain-only approval. Every stage dispatch awaits its job result (result_timeout 7200s); each witnessed exit is checked against the stage contract, EXECUTE additionally ends on a ledger fact (all wave beads closed, ship check legal each). .done files under .flywheel/wave/ are write-only compat sidecars, never read. Default crew is planner+coder+reviewer; remix with --crew role:n,role:n (scout/housekeeper optional)."
+description: "The compounded wave swarm. GATE is an engine step (preflight + __wave-gate; a lower open wave holds, an empty ready with work in flight is in-flight, a zero match fails loud); DISPATCH is a foreach over the gate's typed ready set, one awaited job per bead. GATE scopes br ready to one wave via the TYPED wave field (grounding-reads docs/learnings/), holds on any open lower wave, and treats an empty ready with in-flight beads as WORK IN FLIGHT (bd-wave-gate-typed-authority-27et); DISPATCH emits send --stage ce-execute --param payloads (bead/scope/exit/channel/pin/report_file/learnings); OBSERVE escalates to the captain (lesson: line on every escalation) and never adjudicates; REVIEW audits each closed bead's diff against its brief (detection conditions, quoted evidence, autofix classes); VERIFY checks receipts at committed HEAD + VERIFY tails + principles citations + the residual gate (every finding fixed or filed as a bead); COMPOUND captures durable learnings to docs/learnings/ (never blocks); SIGNOFF suspends for captain-only approval. Every stage dispatch awaits its job result (result_timeout 7200s); each witnessed exit is checked against the stage contract, EXECUTE additionally ends on a ledger fact (all wave beads closed, ship check legal each). .done files under .flywheel/wave/ are write-only compat sidecars, never read. Default crew is planner+coder+reviewer; remix with --crew role:n,role:n (scout/housekeeper optional)."
 trigger:
   type: webhook
 crew:
@@ -1230,20 +1230,19 @@ steps:
     command: 'flywheel __wave-gate --label {{inputs.wave_label}} --project "$PWD"'
     on_error: fail_run
   - name: dispatch
-    action: dispatch_job
-    assignee: x
-    await: result
-    no_claim_timeout: 600
-    result_timeout: 7200
-    spec:
-      profile: "@planner"
-      stage: wave-dispatch
-      task: 'Dispatch the wave beads: read .flywheel/wave/{{inputs.wave_label}}-ready.json for held + learnings, then take the bead list LIVE — `br ready --json` scoped to this wave at dispatch time (typed `wave` == N, legacy `wave-N` label fallback); the artifact ready[] is a snapshot that may be stale (bd-wave-gate-typed-authority-27et). One send --stage ce-execute --param payload per LIVE bead, each naming its bead id + the claim/close contract (+ learnings when the gate matched); onto {{inputs.steer_channel}}. The crew escalates to orchestrator pin {{inputs.captain_pin}}. If the artifact is missing or held:true, settle the job as a failure naming it ([dispatch] held: <reason>) — never success, never an unsettled job. If the live ready set is empty and the artifact names in_flight[], post [dispatch] work in flight: <ids> and settle ok with a witness naming the in-flight crew — nothing to dispatch, a live crew owns the wave; never duplicate it. After every payload is posted, settle YOUR job: `toron job result <job-id> --status ok --project <slug> --as <pin> --witness <file.json>`, where the witness file carries the contract fields for this stage: {"beads": [{"id": "<bead>", "acceptance": "<its VERIFY command>"}], "dep_cycles": <count from `br dep cycles --json`, must be 0>}. Objective: {{inputs.objective}}'
-    on_error: fail_run
-  - name: dispatch_done
-    action: verify
-    command: "mkdir -p .flywheel/wave && touch .flywheel/wave/{{inputs.wave_label}}-dispatch.done"
-    on_error: continue
+    action: foreach
+    over: '{{steps.gate.json.ready}}'
+    each:
+      action: dispatch_job
+      assignee: x
+      await: result
+      no_claim_timeout: 600
+      result_timeout: 7200
+      spec:
+        profile: "@coder"
+        stage: ce-execute
+        task: 'Execute bead {{item.id}} ({{item.title}}) for {{inputs.objective}}. Its exit is its VERIFY fence: {{item.verify}}. Claim it first (br update {{item.id}} --claim --actor <your pin>) and reserve the narrow files you touch; commit with the bead id in the message, run the VERIFY fence, then gate and close with the commit sha. Steer channel: {{inputs.steer_channel}}; escalate to {{inputs.captain_pin}}. Settle YOUR job with toron job result <job-id> --status ok --project <slug> --as <pin> --witness <file.json>; a bead you cannot verify settles as a failure naming why — never an unsettled job.'
+      on_error: fail_run
   - name: execute
     action: dispatch_job
     assignee: x
@@ -3422,12 +3421,30 @@ graph:
             ));
         }
         // bd-jhz8x.2 (ADR-0021 D4.5): GATE moved to engine steps (preflight +
-        // __wave-gate), so the remaining seat dispatches are 6.
+        // __wave-gate) and DISPATCH is a `foreach` over the gate's ready set, so
+        // the remaining top-level seat dispatches are 5. The per-bead dispatch
+        // rides inside the foreach and is asserted below.
         assert_eq!(
             dispatches.len(),
-            6,
+            5,
             "every remaining stage dispatch awaits: {dispatches:?}"
         );
+        let dispatch = wave
+            .steps
+            .iter()
+            .find(|s| s.name.as_deref() == Some("dispatch"))
+            .expect("dispatch step");
+        let Action::Foreach { over, each } = &dispatch.action else {
+            panic!("dispatch is a foreach over the gate artifact");
+        };
+        assert!(
+            over.contains("steps.gate.json.ready"),
+            "dispatch consumes the gate's parsed stdout: {over}"
+        );
+        let Action::DispatchJob { await_, .. } = &each.action else {
+            panic!("each dispatched bead is a job");
+        };
+        assert!(matches!(await_, Some(DispatchAwait::Result)));
         for (name, await_, no_claim, result) in dispatches {
             assert!(
                 matches!(await_, Some(DispatchAwait::Result)),

@@ -4372,12 +4372,12 @@ pub(crate) fn make_verify_sink(cfg: Config, project: String) -> toron_workflow::
             if is_cargo {
                 acquire_cargo_slot(&cfg_clone, &project_clone);
             }
-            let outcome = run_verify_with_timeout(&cmd, 600, &cwd);
+            let outcome = run_verify_capture(&cmd, 600, &cwd);
             if is_cargo {
                 release_cargo_slot(&cfg_clone, &project_clone);
             }
             match outcome {
-                Ok((0, tail)) => {
+                Ok((0, tail, stdout)) => {
                     let receipt_content = if tail.trim().is_empty() {
                         format!("verify ok: {cmd}")
                     } else {
@@ -4398,23 +4398,30 @@ pub(crate) fn make_verify_sink(cfg: Config, project: String) -> toron_workflow::
                                 stdout_path: None,
                                 stderr_path: None,
                                 error: Some(format!("receipt write failed: {e}")),
+                                json: None,
                             });
                         }
                     };
+                    // bd-jhz8x.2: the command's data, parsed when it is JSON.
+                    let json = serde_json::from_str::<serde_json::Value>(&stdout)
+                        .ok()
+                        .filter(|v| !v.is_null());
                     Ok(toron_workflow::engine::VerifyResult {
                         ok: true,
                         exit: 0,
                         stdout_path: receipt_path,
                         stderr_path: None,
                         error: None,
+                        json,
                     })
                 }
-                Ok((exit, tail)) => Ok(toron_workflow::engine::VerifyResult {
+                Ok((exit, tail, _stdout)) => Ok(toron_workflow::engine::VerifyResult {
                     ok: false,
                     exit,
                     stdout_path: None,
                     stderr_path: None,
                     error: Some(tail),
+                    json: None,
                 }),
                 Err(tail) => Ok(toron_workflow::engine::VerifyResult {
                     ok: false,
@@ -4422,6 +4429,7 @@ pub(crate) fn make_verify_sink(cfg: Config, project: String) -> toron_workflow::
                     stdout_path: None,
                     stderr_path: None,
                     error: Some(tail),
+                    json: None,
                 }),
             }
         },
@@ -4539,6 +4547,17 @@ pub(crate) fn run_verify_with_timeout(
     timeout_secs: u64,
     cwd: &Path,
 ) -> std::result::Result<(i32, String), String> {
+    run_verify_capture(verify, timeout_secs, cwd).map(|(exit, tail, _stdout)| (exit, tail))
+}
+
+/// [`run_verify_with_timeout`] with the RAW stdout as well: bd-jhz8x.2 carries
+/// it parsed as JSON on the verify result, and `tail_of` truncation would make
+/// a JSON artifact unparseable.
+pub(crate) fn run_verify_capture(
+    verify: &str,
+    timeout_secs: u64,
+    cwd: &Path,
+) -> std::result::Result<(i32, String, String), String> {
     use std::io::Read;
     let mut child = match std::process::Command::new("sh")
         .arg("-c")
@@ -4549,7 +4568,7 @@ pub(crate) fn run_verify_with_timeout(
         .spawn()
     {
         Ok(c) => c,
-        Err(e) => return Ok((-1, format!("spawn failed: {e}"))),
+        Err(e) => return Ok((-1, format!("spawn failed: {e}"), String::new())),
     };
     let out = child.stdout.take();
     let err = child.stderr.take();
@@ -4586,13 +4605,13 @@ pub(crate) fn run_verify_with_timeout(
             }
             Err(e) => {
                 let _ = child.kill();
-                return Ok((-1, format!("wait failed: {e}")));
+                return Ok((-1, format!("wait failed: {e}"), String::new()));
             }
         }
     };
     let stdout = out_handle.join().unwrap_or_default();
     let stderr = err_handle.join().unwrap_or_default();
-    Ok((exit_code, tail_of(&format!("{stdout}\n{stderr}"))))
+    Ok((exit_code, tail_of(&format!("{stdout}\n{stderr}")), stdout))
 }
 
 /// Last ~4 KiB of captured output (receipts stay small).
@@ -5138,6 +5157,45 @@ mod is_rate_limited_tests {
 mod verify_sink_tests {
     use super::*;
     use toron_workflow::engine::VerifyRequest;
+
+    /// bd-jhz8x.2: a verify step's JSON stdout rides the result so a downstream
+    /// `foreach over: "{{steps.x.json.<field>}}"` can consume it; non-JSON
+    /// stdout leaves `json` None (never an empty object).
+    #[test]
+    fn verify_sink_carries_json_stdout_and_none_for_plain_text() {
+        let dir = std::env::temp_dir().join(format!("fw-vs-json-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg = Config::default();
+        let sink = make_verify_sink(cfg, dir.to_string_lossy().to_string());
+        let run = |command: &str| {
+            let f = sink
+                .0
+                .lock()
+                .expect("sink")
+                .clone()
+                .expect("installed sink");
+            f(&VerifyRequest {
+                command: command.to_string(),
+            })
+            .expect("verify runs")
+        };
+
+        let json = run("printf '{\"ready\":[{\"id\":\"bd-a\"}]}'");
+        assert!(json.ok, "the command exits 0");
+        assert_eq!(
+            json.json
+                .as_ref()
+                .and_then(|v| v.get("ready"))
+                .map(|r| r.is_array()),
+            Some(true),
+            "the parsed artifact rides the result: {:?}",
+            json.json
+        );
+
+        let plain = run("echo hello");
+        assert!(plain.ok);
+        assert_eq!(plain.json, None, "plain text is not JSON: {:?}", plain.json);
+    }
 
     #[test]
     fn verify_sink_returns_ok_on_success() {

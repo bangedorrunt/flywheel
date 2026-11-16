@@ -101,11 +101,17 @@ pub(crate) fn cmd(cfg: &crate::config::Config, project: &str, label: &str) -> an
         std::fs::create_dir_all(parent)?;
     }
     crate::project_state::write_atomic(&path, artifact.to_string().as_bytes())?;
+    // stdout IS the artifact: the workflow consumes it as
+    // `{{steps.gate.json.ready}}`, so a wrapper would put the data one level
+    // too deep (bd-jhz8x.2).
     crate::output::print_json(&json!({
         "schema": "flywheel-wave-gate.v1",
         "project": project,
         "artifact": path.display().to_string(),
-        "gate": artifact,
+        "held": artifact["held"],
+        "blockers": artifact["blockers"],
+        "in_flight": artifact["in_flight"],
+        "ready": artifact["ready"],
     }));
     if decided.held {
         anyhow::bail!(
