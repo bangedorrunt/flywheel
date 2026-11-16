@@ -164,9 +164,22 @@ Rules:
 ### D6. Curate the stage catalog
 
 A small spine of contract-typed stages, plus stages that belong to one
-workflow. `stage list` groups by phase and prints `use_when`; `stage list
---unused` lists stages no catalog workflow references and no run used in 30
-days (from the run log), as candidates to retire.
+workflow. `stage list` groups by phase and prints `use_when`.
+
+"Unused" is decided by the catalog, never by history. A stage is USED when a
+catalog workflow references it in a `stage:` field, or when its own contract
+declares how it is reached without one — `reached_by = "compose"` for a crew
+compose token (`scout:fresh-eyes-explore`), `reached_by = "manual"` for
+`flywheel send --stage`. A stage that is neither referenced nor declared is
+DEAD, and `flywheel workflow verify` fails on it; `workflow verify` keeps
+reporting the set, and `stage list --unused` names it, so retiring a stage is
+a decision with an owner rather than a slow decay.
+
+The earlier rule read the run log (a stage no run had used in 30 days was a
+candidate). It is withdrawn: a workflow scan cannot see the manual surface, so
+a hard failure on it depended on what the operator last ran, and a proof
+machine has no run log at all. A gate that ships must answer the same question
+on every machine, and "who can reach this" is a property of the catalog.
 
 | Phase | Spine stage | Disposition of the others |
 |---|---|---|
@@ -291,7 +304,7 @@ The same `repeat` field fits other stages that improve with passes:
 Each step ships alone and changes no default until its last bullet.
 
 1. **Honesty** (D5.5). Small, independent, first.
-2. **Stage contract** (D3) with `reads` lint; add `phase` to every stage; `stage list` by phase; `--unused`.
+2. **Stage contract** (D3) with `reads` lint; add `phase` to every stage; `stage list` by phase; `--unused` (catalog-referenced ∪ `reached_by` declared; the rest is fatal to `workflow verify`).
 3. **`plan-polish`** (D7) with two fixed steps + loop; new `beads-lifecycle` order; fence verify step; digest convergence.
 4. **Witnessed exits** (D4): `dispatch_job await: result`, `toron job result --witness`, witness contracts; `wave-swarm` moves off markers; wave stages become engine steps.
 5. **Lowering and verify** (D5.1–D5.3) over every catalog workflow; delete the hand-written `SwarmLifecycle` once `wave-swarm` lowers.
