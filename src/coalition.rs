@@ -384,6 +384,7 @@ impl CoalitionStore {
         });
         let (run_status, exit_code, response, error) = coalition_invocation_outcome(invocation);
         run_log::write_run(&run_log::RunLogEntry {
+            stage: None,
             run_id: run_id.clone(),
             ts: crate::state::now_iso(),
             workflow: goal.to_string(),

@@ -1343,7 +1343,6 @@ pub(crate) fn cmd_internal_run_headless(
     harness_override: Option<&str>,
     workflow: Option<&str>,
     cron: Option<&str>,
-    /// bd-jhz8x.4: the stage this headless run executes (run-log attribution).
     stage: Option<&str>,
     phase: Option<&str>,
     effort_override: Option<&str>,

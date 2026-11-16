@@ -125,6 +125,7 @@ mod tests {
 
     fn sample_entry(run_id: &str) -> RunLogEntry {
         RunLogEntry {
+            stage: None,
             run_id: run_id.into(),
             ts: "2026-08-09T10:00:00Z".into(),
             workflow: "beads".into(),
