@@ -1313,7 +1313,10 @@ budget_usd_per_mtok = 9.0
         assert_eq!(policy.ask, crate::swarm_plan::ConsentAsk::Always);
         assert_eq!(policy.budget_usd_per_mtok, 9.0);
         let c: Config = toml::from_str("").unwrap();
-        assert_eq!(c.consent_policy(), crate::swarm_plan::ConsentPolicy::default());
+        assert_eq!(
+            c.consent_policy(),
+            crate::swarm_plan::ConsentPolicy::default()
+        );
     }
 
     #[test]
