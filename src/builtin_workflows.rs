@@ -2027,13 +2027,12 @@ mod tests {
             .and_then(|i| i.default.as_ref())
             .and_then(|d| d.as_str());
         assert_eq!(default, Some("2"), "interrogate defaults N=2");
+        // bd-gtw4i: interrogate is steps form now.
         let briefs = inter
-            .graph
-            .as_ref()
-            .expect("interrogate graph")
-            .nodes
-            .get("briefs")
-            .expect("briefs node");
+            .steps
+            .iter()
+            .find(|s| s.name.as_deref() == Some("briefs"))
+            .expect("briefs step");
         assert!(
             matches!(briefs.action, Action::Parallel { .. }),
             "briefs is a parallel fanout"
@@ -3091,11 +3090,8 @@ graph:
             "brainstorm's divergers must not share a role: {cb:?}"
         );
 
-        let g = wfs["debate"]
-            .graph
-            .as_ref()
-            .unwrap_or_else(|| panic!("debate has a graph"));
-        let Action::Parallel { over, .. } = &g.nodes["briefs"].action else {
+        // bd-gtw4i: steps form (the durable runner refuses a graph fan-out).
+        let Action::Parallel { over, .. } = &wfs["debate"].steps[0].action else {
             panic!("debate.briefs is a parallel action");
         };
         let copies: usize = over.trim().parse().unwrap_or(1);
@@ -3169,8 +3165,19 @@ graph:
             ),
             ("debate", "decide", vec!["{{steps.briefs}}"]),
         ] {
-            let g = wfs[name].graph.as_ref().expect("graph present");
-            let Action::DispatchJob { spec, .. } = &g.nodes[node].action else {
+            // bd-gtw4i: debate is steps form now; ce-brainstorm still has a graph.
+            let action = match wfs[name].graph.as_ref() {
+                Some(g) => &g.nodes[node].action,
+                None => {
+                    let step = wfs[name]
+                        .steps
+                        .iter()
+                        .find(|s| s.name.as_deref() == Some(node))
+                        .unwrap_or_else(|| panic!("{name} has a step {node}"));
+                    &step.action
+                }
+            };
+            let Action::DispatchJob { spec, .. } = action else {
                 panic!("{name}.{node} is a dispatch_job");
             };
             let task = spec

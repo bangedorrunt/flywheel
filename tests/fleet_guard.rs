@@ -99,6 +99,16 @@ fn run(mut cmd: Command, sandbox: &Sandbox, limit: Duration) -> Run {
 
 fn refused(sandbox: &Sandbox, cmd: Command, what: &str) -> Run {
     let out = run(cmd, sandbox, Duration::from_secs(20));
+    // A guard that let the call through is the FINDING. Disarm the sandbox's
+    // own Drop assertion first: it panics when the real supervisor was reached,
+    // and a panic raised while this test is already unwinding aborts the
+    // process — libtest then prints no `test result:` line and a mutation run
+    // can only report NO-RESULTS instead of naming this test. One clean panic
+    // is the evidence.
+    let reached = sandbox.shim_log();
+    if !reached.is_empty() {
+        sandbox.inner.allow_supervisor_calls();
+    }
     assert!(
         !out.timed_out,
         "{what} did not refuse: the guard let it run (killed after 20s); stderr: {}",
@@ -111,9 +121,8 @@ fn refused(sandbox: &Sandbox, cmd: Command, what: &str) -> Run {
         out.stderr
     );
     assert!(
-        sandbox.shim_log().is_empty(),
-        "{what} reached a live supervisor tool: {}",
-        sandbox.shim_log()
+        reached.is_empty(),
+        "{what} reached a live supervisor tool: {reached}"
     );
     out
 }
