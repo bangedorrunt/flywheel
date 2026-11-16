@@ -33,6 +33,7 @@ mod comms_send;
 mod config;
 mod control;
 mod crew;
+mod crew_briefs;
 mod crew_menu;
 mod cron;
 mod daemon;

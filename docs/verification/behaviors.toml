@@ -272,6 +272,22 @@ tests = [
 mutations = ["scripts/mutations/clean-proof-slot.spec.sh#S1", "scripts/mutations/clean-proof-slot.spec.sh#S2"]
 
 [[behavior]]
+id = "crew.brief-done-reply"
+owner = "src/crew_briefs.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/crew_briefs.rs::an_unanswered_brief_ages_into_the_open_list",
+  "src/crew_briefs.rs::a_done_reply_closes_the_brief_and_wakes_the_captain_once",
+  "src/crew_briefs.rs::a_replayed_reply_emits_nothing",
+  "src/crew_briefs.rs::a_reply_for_an_unknown_brief_does_nothing",
+]
+mutations = [
+  "scripts/mutations/crew-briefs.spec.sh#B1",
+  "scripts/mutations/crew-briefs.spec.sh#B2",
+]
+
+[[behavior]]
 id = "pane.input-line-guard"
 owner = "src/pane_screen.rs"
 status = "proven"

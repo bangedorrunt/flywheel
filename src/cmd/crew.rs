@@ -49,6 +49,32 @@ pub(crate) enum CrewCmd {
         #[arg(long)]
         bead: Option<String>,
     },
+    /// The crew's structured reply: closes the brief, wakes the captain once
+    /// (deferred if the captain is busy), and is safe to replay (bd-0uzrq.4).
+    Done {
+        /// the brief id the dispatch carried (`Brief id: <id>`)
+        brief: String,
+        /// what proved the work (commit sha, proof receipt, test tail)
+        #[arg(long)]
+        receipt: String,
+        /// project slug
+        #[arg(long)]
+        project: String,
+        /// report as this pin (`--as`)
+        #[arg(long = "as")]
+        r#as: Option<String>,
+    },
+    /// Open briefs per pin, with their age. A silent crew is a row here.
+    Inbox {
+        /// project slug
+        #[arg(long)]
+        project: String,
+        /// only briefs with no reply yet
+        #[arg(long)]
+        open: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// The three control verbs (postconditions asserted in src/control.rs).
@@ -114,6 +140,17 @@ pub(crate) fn cmd_crew(cfg: &Config, cmd: &CrewCmd) -> Result<()> {
             *urgent,
             bead.as_deref(),
         ),
+        CrewCmd::Done {
+            brief,
+            receipt,
+            project,
+            r#as,
+        } => cmd_crew_done(cfg, project, brief, receipt, r#as.as_deref()),
+        CrewCmd::Inbox {
+            project,
+            open,
+            json,
+        } => cmd_crew_inbox(cfg, project, *open, *json),
     }
 }
 
@@ -811,6 +848,152 @@ fn deliver_prompt_wake(
     deliver_prompt_wake_hc(cfg, project, pin, urgent, wm)
 }
 
+/// Where the brief book lives: per project, beside the other state.
+fn briefs_path(project: &str) -> std::path::PathBuf {
+    crate::config::state_dir()
+        .join("briefs")
+        .join(format!("{}.json", crate::state::state_key(project)))
+}
+
+fn load_briefs(project: &str) -> crate::crew_briefs::BriefBook {
+    std::fs::read_to_string(briefs_path(project))
+        .ok()
+        .and_then(|body| serde_json::from_str(&body).ok())
+        .unwrap_or_default()
+}
+
+fn save_briefs(project: &str, book: &crate::crew_briefs::BriefBook) -> Result<()> {
+    let path = briefs_path(project);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_string_pretty(book)?;
+    crate::project_state::write_atomic(&path, body.as_bytes())
+        .map_err(|e| anyhow!("save briefs: {e}"))
+}
+
+fn now_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
+
+/// Record a dispatch as a brief and append the id the crew replies with.
+fn open_brief(project: &str, pin: &str, subject: &str) -> Result<String> {
+    let mut book = load_briefs(project);
+    let id = format!("{}-{}", pin, now_us());
+    let brief = crate::crew_briefs::Brief {
+        id: id.clone(),
+        pin: pin.to_string(),
+        subject: subject.to_string(),
+        opened_ts_us: now_us(),
+        closed_ts_us: None,
+        receipt: None,
+    };
+    book.reduce(crate::crew_briefs::Msg::Opened(brief));
+    save_briefs(project, &book)?;
+    Ok(id)
+}
+
+/// The crew's structured reply (bd-0uzrq.4): close the brief, then wake the
+/// captain ONCE. A busy captain defers to the project's dispatcher — the same
+/// contract crews get — and a replayed reply emits nothing.
+fn cmd_crew_done(
+    cfg: &Config,
+    project: &str,
+    brief: &str,
+    receipt: &str,
+    r#as: Option<&str>,
+) -> Result<()> {
+    let mut book = load_briefs(project);
+    if book.get(brief).is_none() {
+        bail!("no such brief: {brief} — see `flywheel crew inbox --open --project {project}`");
+    }
+    let effects = book.reduce(crate::crew_briefs::Msg::Done {
+        id: brief.to_string(),
+        receipt: receipt.to_string(),
+        now_us: now_us(),
+    });
+    save_briefs(project, &book)?;
+    let pin = r#as
+        .map(str::to_string)
+        .unwrap_or_else(|| brief.to_string());
+    let mut wake = "replay: the brief was already closed; nothing rang".to_string();
+    for effect in &effects {
+        let crate::crew_briefs::Effect::WakeCaptain { id, pin } = effect;
+        let key = crate::project_dir_str(cfg, project)?;
+        let Some(captain) = crate::state::captain_pin(project, &key) else {
+            wake = "closed; no captain is bound for this project, so nothing rang".to_string();
+            continue;
+        };
+        let wm = recipient_wm(project, &captain);
+        let delivered =
+            deliver_prompt_wake(cfg, project, &captain, false, wm).map_err(|e| format!("{e:#}"));
+        let (line, deferred) = finish_prompt(delivered, || defer_busy_wake(project, &captain))?;
+        wake = match deferred {
+            Some(reason) => format!("captain busy ({reason}); {line}"),
+            None => format!("captain rung ({line})"),
+        };
+        crate::log(
+            project,
+            EventKind::Send,
+            json!({
+                "op": "crew-done",
+                "brief": id,
+                "from": pin,
+                "receipt": receipt,
+                "wake": line,
+            }),
+        );
+    }
+    println!("brief {brief} closed; {wake}");
+    Ok(())
+}
+
+/// `crew inbox --open`: a silent crew is a row with an age.
+fn cmd_crew_inbox(cfg: &Config, project: &str, open: bool, json: bool) -> Result<()> {
+    let _ = cfg;
+    let book = load_briefs(project);
+    let rows = book.open(now_us());
+    let listed: Vec<Value> = if open {
+        rows.iter()
+            .map(serde_json::to_value)
+            .collect::<Result<_, _>>()?
+    } else {
+        book.briefs
+            .iter()
+            .map(|b| {
+                json!({
+                    "id": b.id,
+                    "pin": b.pin,
+                    "subject": b.subject,
+                    "age_secs": now_us().saturating_sub(b.opened_ts_us) / 1_000_000,
+                    "closed": b.closed_ts_us.is_some(),
+                    "receipt": b.receipt,
+                })
+            })
+            .collect()
+    };
+    if json {
+        crate::output::print_json(&json!({
+            "schema": "flywheel-crew-inbox.v1",
+            "project": project,
+            "open": rows.len(),
+            "briefs": listed,
+        }));
+        return Ok(());
+    }
+    if listed.is_empty() {
+        println!("no briefs for {project}");
+        return Ok(());
+    }
+    for row in &listed {
+        println!("{}", serde_json::to_string(row)?);
+    }
+    Ok(())
+}
+
 fn cmd_crew_prompt(
     cfg: &Config,
     project: &str,
@@ -821,11 +1004,18 @@ fn cmd_crew_prompt(
     bead: Option<&str>,
 ) -> Result<()> {
     let sender = prompt_sender(cfg, r#as);
+    // bd-0uzrq.4: the dispatch IS a brief. Its id rides the body so the crew
+    // replies with the one verb that closes it, and `crew inbox --open` can
+    // show what nobody answered.
+    let brief = open_brief(project, pin, prompt.lines().next().unwrap_or(prompt))?;
+    let prompt = format!(
+        "{prompt}\n\n---\nBrief id: {brief}\nReply when done: flywheel crew done {brief} --receipt \"<commit sha + proof receipt + test tail>\" --project {project}"
+    );
     let dispatch = PromptDispatch {
         pin: pin.to_string(),
         project: project.to_string(),
         sender,
-        prompt: prompt.to_string(),
+        prompt,
         urgent,
         bead: bead.map(str::to_string),
     };
