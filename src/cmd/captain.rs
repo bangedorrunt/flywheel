@@ -16,6 +16,8 @@
 use anyhow::Result;
 use clap::Subcommand;
 use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 #[cfg(feature = "backend-superlogical")]
 use crate::backend::MultiplexerBackend as _;
@@ -401,6 +403,15 @@ pub(crate) struct StallProbe {
     pub fleet_knowable: bool,
     /// seconds since the newest commit in the project, None when git is absent
     pub last_commit_age_secs: Option<u64>,
+    /// a clean-proof/build slot is held (bd-0uzrq.5): a 466s suite is work,
+    /// not a stall, even though no pane output and no commit arrives.
+    pub proof_slot_held: bool,
+    /// seconds since the newest pane-output delta the watcher observed. None
+    /// when no pane tail was readable — then the commit clock is all we have.
+    pub activity_age_secs: Option<u64>,
+    /// longest run of identical tails on one busy pane (same error, again and
+    /// again). 0 when nothing is readable or every sample moved.
+    pub loop_repeats: u32,
     pub stall_secs: u64,
 }
 
@@ -409,16 +420,38 @@ pub(crate) enum StallVerdict {
     Working,
     AllComplete,
     Stalled,
+    /// A busy pane repeats one tail (bd-0uzrq.5): a crew spinning on one error
+    /// looks alive to a wall clock, so it gets its own verdict.
+    Looping,
 }
 
-/// The stall decision. `AllComplete` wins first (nothing left to do), then any
-/// working pane, then an unknowable fleet (never alarm blind), and only then
-/// the idle-plus-silent clock.
+/// How many identical tails on one busy pane make a loop. Three samples is
+/// short enough to catch a spin and long enough that a two-line flicker does
+/// not trip it.
+pub(crate) const LOOP_REPEATS: u32 = 3;
+
+/// The stall decision. `AllComplete` wins first (nothing left to do), then an
+/// unknowable fleet (never alarm blind), then the activity facts: a held proof
+/// slot and a moving pane are work, and only a silent fleet falls through to
+/// the commit clock. A busy pane repeating one tail is `Looping` even though
+/// it reads Busy — that is the case a wall clock cannot see.
 fn stall_verdict(p: &StallProbe) -> StallVerdict {
     if !p.work_remaining {
         return StallVerdict::AllComplete;
     }
-    if p.any_pane_working || !p.fleet_knowable {
+    if !p.fleet_knowable {
+        return StallVerdict::Working;
+    }
+    if p.proof_slot_held {
+        return StallVerdict::Working;
+    }
+    if p.loop_repeats >= LOOP_REPEATS {
+        return StallVerdict::Looping;
+    }
+    if p.any_pane_working {
+        return StallVerdict::Working;
+    }
+    if p.activity_age_secs.is_some_and(|age| age < p.stall_secs) {
         return StallVerdict::Working;
     }
     match p.last_commit_age_secs {
@@ -464,6 +497,12 @@ fn cmd_captain_watch(
 
     let stall_secs = stall_minutes.max(1) * 60;
     let project_dir = crate::project_dir(cfg, project);
+    let stall_backend = if stall {
+        crate::backend::factory::multiplexer_backend(cfg).ok()
+    } else {
+        None
+    };
+    let mut activity = ActivityWatch::default();
     let registry = crate::state::load_spawn_registry(project);
     let mut idle = IdleWatch::default();
     // Seed the fold with the fleet as it stands at arm time: a pin already
@@ -541,7 +580,14 @@ fn cmd_captain_watch(
         if !stall {
             continue;
         }
-        let probe = stall_probe_from(&snap, &project_dir, now, stall_secs);
+        let probe = stall_probe_from(&snap, &project_dir, now, stall_secs, {
+            match stall_backend.as_deref() {
+                Some(backend) => {
+                    activity.observe(now, &read_pane_tails(backend, &snap), &busy_panes(&snap))
+                }
+                None => ActivityFacts::default(),
+            }
+        });
         match stall_verdict(&probe) {
             StallVerdict::Working => continue,
             StallVerdict::AllComplete => {
@@ -556,6 +602,25 @@ fn cmd_captain_watch(
                 }
                 return Ok(());
             }
+            StallVerdict::Looping => {
+                let repeats = probe.loop_repeats;
+                if json_out {
+                    print_json(&json!({
+                        "reason": "looping",
+                        "project": project,
+                        "stall_secs": stall_secs,
+                        "loop_repeats": repeats,
+                        "no_commit_secs": probe.last_commit_age_secs.unwrap_or(0),
+                        "work_remaining": true,
+                    }));
+                } else {
+                    println!(
+                        "LOOPING in {project}: a busy pane produced the same tail {repeats}x \
+                         with no new output — spinning on one error, not progressing"
+                    );
+                }
+                std::process::exit(STALL_EXIT);
+            }
             StallVerdict::Stalled => {
                 let age = probe.last_commit_age_secs.unwrap_or(0);
                 if json_out {
@@ -564,6 +629,8 @@ fn cmd_captain_watch(
                         "project": project,
                         "stall_secs": stall_secs,
                         "no_commit_secs": age,
+                        "activity_age_secs": probe.activity_age_secs,
+                        "proof_slot_held": probe.proof_slot_held,
                         "work_remaining": true,
                         "panes_working": 0,
                     }));
@@ -588,7 +655,13 @@ pub(crate) fn probe_stall(
     stall_secs: u64,
 ) -> StallProbe {
     let snap = crate::snapshot::assemble_with_label(cfg, project, &swarm_label_for(project), now);
-    stall_probe_from(&snap, project_dir, now, stall_secs)
+    stall_probe_from(
+        &snap,
+        project_dir,
+        now,
+        stall_secs,
+        ActivityFacts::default(),
+    )
 }
 
 /// The workspace label one project's plane session carries.
@@ -603,6 +676,7 @@ pub(crate) fn stall_probe_from(
     project_dir: &std::path::Path,
     now: u64,
     stall_secs: u64,
+    activity: ActivityFacts,
 ) -> StallProbe {
     let fleet_knowable = !snap.degraded.iter().any(|d| d == "pins");
     let any_pane_working = snap.pins.iter().any(|p| p.verdict.starts_with("Busy"));
@@ -615,6 +689,9 @@ pub(crate) fn stall_probe_from(
         any_pane_working,
         fleet_knowable,
         last_commit_age_secs: last_commit_age_secs(project_dir, now),
+        proof_slot_held: proof_slot_held(),
+        activity_age_secs: activity.activity_age_secs,
+        loop_repeats: activity.loop_repeats,
         stall_secs,
     }
 }
@@ -634,6 +711,149 @@ pub(crate) fn last_commit_age_secs(project_dir: &std::path::Path, now: u64) -> O
     }
     let secs: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
     Some(now.saturating_sub(secs))
+}
+
+/// What the watcher observed since the previous poll (bd-0uzrq.5). Data, not a
+/// decision: the verdict stays in [`stall_verdict`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ActivityFacts {
+    /// seconds since the newest pane-output delta, None when no tail was read
+    pub activity_age_secs: Option<u64>,
+    /// longest run of identical tails on one busy pane
+    pub loop_repeats: u32,
+}
+
+/// Consecutive-sample state for the stall arm. Pure: [`observe`](Self::observe)
+/// takes the pane tails as data, so a fake clock and fake digests are the whole
+/// test surface.
+#[derive(Debug, Default)]
+pub(crate) struct ActivityWatch {
+    tails: BTreeMap<String, String>,
+    repeats: BTreeMap<String, u32>,
+    last_delta_secs: Option<u64>,
+}
+
+impl ActivityWatch {
+    /// Fold one poll. `busy` names the panes the plane says are mid-turn; only
+    /// those can be looping, because an idle pane repeats its tail by
+    /// definition. A first sighting of a tail is a delta — a sample that names
+    /// no pane has no clock, which is honest: nothing was read.
+    pub(crate) fn observe(
+        &mut self,
+        now_secs: u64,
+        tails: &BTreeMap<String, String>,
+        busy: &BTreeSet<String>,
+    ) -> ActivityFacts {
+        let mut delta = false;
+        for (pane, tail) in tails {
+            let same = self.tails.get(pane).is_some_and(|prev| prev == tail);
+            if !same {
+                delta = true;
+            }
+            let repeats = if same {
+                self.repeats.get(pane).copied().unwrap_or(1) + 1
+            } else {
+                1
+            };
+            self.repeats.insert(pane.clone(), repeats);
+            self.tails.insert(pane.clone(), tail.clone());
+        }
+        if delta {
+            self.last_delta_secs = Some(now_secs);
+        }
+        ActivityFacts {
+            activity_age_secs: self.last_delta_secs.map(|at| now_secs.saturating_sub(at)),
+            loop_repeats: tails
+                .keys()
+                .filter(|pane| busy.contains(*pane))
+                .filter_map(|pane| self.repeats.get(pane).copied())
+                .max()
+                .unwrap_or(0),
+        }
+    }
+}
+
+/// The machine-wide clean-proof slot file, the same path `clean-proof.sh`
+/// flocks (`CLEAN_PROOF_LOCK_FILE`, else `clean-proof.lock` under
+/// `XDG_RUNTIME_DIR` or `TMPDIR`).
+fn proof_slot_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("CLEAN_PROOF_LOCK_FILE") {
+        return Some(PathBuf::from(path));
+    }
+    let base = std::env::var_os("XDG_RUNTIME_DIR").or_else(|| std::env::var_os("TMPDIR"))?;
+    Some(PathBuf::from(base).join("clean-proof.lock"))
+}
+
+/// True when another process holds the proof slot. The flock is the truth: a
+/// stale `.holder` file beside a free lock cannot fake a running proof.
+pub(crate) fn proof_slot_held() -> bool {
+    match proof_slot_path() {
+        Some(path) => proof_slot_held_at(&path),
+        None => false,
+    }
+}
+
+fn proof_slot_held_at(path: &Path) -> bool {
+    let Ok(file) = std::fs::OpenOptions::new().read(true).open(path) else {
+        return false;
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(_)) => false,
+    }
+}
+
+/// One readable tail per pane, keyed by pane id and prefixed with the plane's
+/// verdict so a status transition counts as a delta even when the text repeats.
+fn read_pane_tails(
+    backend: &dyn crate::backend::MultiplexerBackend,
+    snap: &crate::snapshot::Snapshot,
+) -> BTreeMap<String, String> {
+    let mut tails = BTreeMap::new();
+    for pin in &snap.pins {
+        if pin.pane_id.is_empty() {
+            continue;
+        }
+        let Ok(read) = backend.agent_read(&pin.pane_id, "screen", 120) else {
+            continue;
+        };
+        let Some(text) = pane_tail_text(&read) else {
+            continue;
+        };
+        tails.insert(pin.pane_id.clone(), format!("{}\u{1f}{text}", pin.verdict));
+    }
+    tails
+}
+
+/// The text of an `agent_read` reply, whatever shape the backend used. A shape
+/// this does not know is not evidence, so the pane drops out of the sample
+/// instead of contributing a fabricated digest.
+fn pane_tail_text(read: &Value) -> Option<String> {
+    match read {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(rows) => Some(
+            rows.iter()
+                .map(|row| row.as_str().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        Value::Object(map) => ["content", "text", "screen", "lines"]
+            .iter()
+            .find_map(|key| map.get(*key).and_then(pane_tail_text)),
+        _ => None,
+    }
+}
+
+fn busy_panes(snap: &crate::snapshot::Snapshot) -> BTreeSet<String> {
+    snap.pins
+        .iter()
+        .filter(|pin| pin.verdict.starts_with("Busy") && !pin.pane_id.is_empty())
+        .map(|pin| pin.pane_id.clone())
+        .collect()
 }
 
 /// One inbox read for the watch. `since` scopes the read server-side so the
@@ -1414,6 +1634,9 @@ mod tests {
             any_pane_working: false,
             fleet_knowable: true,
             last_commit_age_secs: Some(99_999),
+            proof_slot_held: false,
+            activity_age_secs: None,
+            loop_repeats: 0,
             stall_secs: 2_700,
         };
         assert_eq!(stall_verdict(&base), StallVerdict::AllComplete);
@@ -1447,6 +1670,9 @@ mod tests {
                 any_pane_working: false,
                 fleet_knowable: true,
                 last_commit_age_secs: Some(60),
+                proof_slot_held: false,
+                activity_age_secs: None,
+                loop_repeats: 0,
                 stall_secs: 2_700,
             }),
             StallVerdict::Working
@@ -1457,10 +1683,164 @@ mod tests {
                 any_pane_working: false,
                 fleet_knowable: true,
                 last_commit_age_secs: None,
+                proof_slot_held: false,
+                activity_age_secs: None,
+                loop_repeats: 0,
                 stall_secs: 2_700,
             }),
             StallVerdict::Working
         );
+    }
+
+    /// bd-0uzrq.5: the live incident. A 2713s silence while a 466s suite held
+    /// the machine-wide proof slot paged the captain. The slot is the activity
+    /// fact; wall time alone is not.
+    #[test]
+    fn a_long_build_holding_the_proof_slot_is_not_a_stall() {
+        let base = StallProbe {
+            work_remaining: true,
+            any_pane_working: false,
+            fleet_knowable: true,
+            last_commit_age_secs: Some(2_713),
+            proof_slot_held: true,
+            activity_age_secs: None,
+            loop_repeats: 0,
+            stall_secs: 2_700,
+        };
+        assert_eq!(stall_verdict(&base), StallVerdict::Working);
+        assert_eq!(
+            stall_verdict(&StallProbe {
+                proof_slot_held: false,
+                ..base
+            }),
+            StallVerdict::Stalled,
+            "the same silence with the slot free is the stall the clock was right about"
+        );
+    }
+
+    /// An unchanged screen past the threshold is a stall; a delta inside it is
+    /// not, and an unreadable fleet never alarms.
+    #[test]
+    fn an_unchanged_screen_is_a_stall_and_a_moving_one_is_not() {
+        let base = StallProbe {
+            work_remaining: true,
+            any_pane_working: false,
+            fleet_knowable: true,
+            last_commit_age_secs: Some(9_999),
+            proof_slot_held: false,
+            activity_age_secs: Some(2_700),
+            loop_repeats: 0,
+            stall_secs: 2_700,
+        };
+        assert_eq!(stall_verdict(&base), StallVerdict::Stalled);
+        assert_eq!(
+            stall_verdict(&StallProbe {
+                activity_age_secs: Some(60),
+                ..base
+            }),
+            StallVerdict::Working
+        );
+        assert_eq!(
+            stall_verdict(&StallProbe {
+                fleet_knowable: false,
+                ..base
+            }),
+            StallVerdict::Working,
+            "a degraded pane read is not a stall"
+        );
+    }
+
+    /// A busy pane repeating one tail is a loop, even though the pane reads
+    /// Busy. Two identical samples are not enough, and a held slot outranks it.
+    #[test]
+    fn a_busy_pane_repeating_one_tail_is_looping() {
+        let base = StallProbe {
+            work_remaining: true,
+            any_pane_working: true,
+            fleet_knowable: true,
+            last_commit_age_secs: Some(60),
+            proof_slot_held: false,
+            activity_age_secs: Some(3_000),
+            loop_repeats: LOOP_REPEATS,
+            stall_secs: 2_700,
+        };
+        assert_eq!(stall_verdict(&base), StallVerdict::Looping);
+        assert_eq!(
+            stall_verdict(&StallProbe {
+                loop_repeats: LOOP_REPEATS - 1,
+                ..base
+            }),
+            StallVerdict::Working
+        );
+        assert_eq!(
+            stall_verdict(&StallProbe {
+                proof_slot_held: true,
+                ..base
+            }),
+            StallVerdict::Working,
+            "the captain's own long suite is not a loop"
+        );
+    }
+
+    /// The sampler: the first poll seeds the clock, a repeated tail ages it, a
+    /// moved tail resets it, and only a BUSY pane's repeats count as looping.
+    #[test]
+    fn activity_watch_seeds_the_clock_and_counts_only_busy_tails() {
+        let mut watch = ActivityWatch::default();
+        let mut tails = BTreeMap::new();
+        tails.insert("pane-a".to_string(), "Busy\u{1f}building".to_string());
+        tails.insert("pane-b".to_string(), "Idle\u{1f}prompt".to_string());
+        let busy: BTreeSet<String> = ["pane-a".to_string()].into_iter().collect();
+
+        let first = watch.observe(1_000, &tails, &busy);
+        assert_eq!(
+            first.activity_age_secs,
+            Some(0),
+            "the first poll seeds the clock"
+        );
+        assert_eq!(first.loop_repeats, 1);
+
+        let same = watch.observe(1_600, &tails, &busy);
+        assert_eq!(same.activity_age_secs, Some(600), "an unchanged fleet ages");
+        let looped = watch.observe(2_200, &tails, &busy);
+        assert_eq!(
+            looped.loop_repeats, LOOP_REPEATS,
+            "three identical busy tails is a loop"
+        );
+        assert_eq!(looped.activity_age_secs, Some(1_200));
+
+        let mut moved = tails.clone();
+        moved.insert("pane-a".to_string(), "Busy\u{1f}compiling".to_string());
+        let fresh = watch.observe(2_300, &moved, &busy);
+        assert_eq!(fresh.activity_age_secs, Some(0), "a moved tail is a delta");
+        assert_eq!(fresh.loop_repeats, 1, "the loop counter resets on movement");
+
+        let idle_only: BTreeSet<String> = BTreeSet::new();
+        watch.observe(3_000, &tails, &idle_only);
+        assert_eq!(
+            watch.observe(3_100, &tails, &idle_only).loop_repeats,
+            0,
+            "an idle pane repeats its tail by definition; it is not looping"
+        );
+    }
+
+    /// The slot probe reads the flock clean-proof.sh takes, not the `.holder`
+    /// file: a stale holder beside a free lock must not fake a running proof.
+    #[test]
+    fn proof_slot_probe_reads_the_flock_not_the_holder_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock = dir.path().join("clean-proof.lock");
+        std::fs::write(&lock, "").expect("create lock");
+        assert!(!proof_slot_held_at(&lock), "an unlocked slot file is free");
+
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&lock)
+            .expect("open lock");
+        held.lock().expect("take the slot");
+        assert!(proof_slot_held_at(&lock), "a held flock is a running proof");
+        held.unlock().expect("release");
+        assert!(!proof_slot_held_at(&lock), "released is free again");
     }
 
     /// ADR-0019 D10: approve classifies the loaded row before any I/O.

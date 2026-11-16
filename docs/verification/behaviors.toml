@@ -539,3 +539,25 @@ mutations = [
   "scripts/mutations/recover-session-loss.spec.sh#R1",
   "scripts/mutations/recover-session-loss.spec.sh#R2",
 ]
+
+[[behavior]]
+id = "captain.stall-reads-activity"
+owner = "src/cmd/captain.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/captain.rs::a_long_build_holding_the_proof_slot_is_not_a_stall",
+  "src/cmd/captain.rs::an_unchanged_screen_is_a_stall_and_a_moving_one_is_not",
+  "src/cmd/captain.rs::a_busy_pane_repeating_one_tail_is_looping",
+  "src/cmd/captain.rs::activity_watch_seeds_the_clock_and_counts_only_busy_tails",
+  "src/cmd/captain.rs::proof_slot_probe_reads_the_flock_not_the_holder_file",
+]
+mutations = [
+  "scripts/mutations/stall-activity.spec.sh#A1",
+  "scripts/mutations/stall-activity.spec.sh#A2",
+  "scripts/mutations/stall-activity.spec.sh#A3",
+  "scripts/mutations/stall-activity.spec.sh#A4",
+  "scripts/mutations/stall-activity.spec.sh#A5",
+  "scripts/mutations/stall-activity.spec.sh#A6",
+  "scripts/mutations/stall-activity.spec.sh#A7",
+]
