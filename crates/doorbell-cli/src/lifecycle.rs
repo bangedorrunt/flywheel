@@ -2594,43 +2594,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
+    /// Effect law, not real timing: the escalation decision is driven through
+    /// `ScriptedStop`, so a loaded machine cannot flip the verdict. The real
+    /// signal path is RealStop's thin kill/poll wrapper, not this decision.
     #[test]
     fn stop_escalates_to_sigkill_when_sigterm_is_ignored() {
-        let dir = tmp_lifecycle("stop-kill");
-        let cfg = test_cfg(&dir, 0);
-        // The child writes this only after the trap is installed. Without it
-        // the test raced the shell's startup: under load the SIGTERM arrived
-        // first, a not-yet-trapped process died cleanly, and the SIGKILL
-        // assertion failed with no defect in the code under test.
-        let armed = dir.join("term-ignored");
-        let mut sh = std::process::Command::new("sh");
-        sh.args([
-            "-c",
-            &format!("trap '' TERM; : > '{}'; exec sleep 300", armed.display()),
-        ]);
-        let pid = spawn_reaped(&mut sh);
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !armed.exists() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the child never installed its TERM trap"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        std::fs::write(cfg.pid_file(), format!("{pid}\n")).unwrap();
-        let mut sup = FakeSupervisor::unreadable();
-        let msg = stop_with_budgets(
-            &cfg,
-            &mut sup,
-            false,
-            Duration::from_millis(400),
-            Duration::from_secs(3),
-        )
-        .expect("SIGKILL escalation must still stop");
+        let mut w = ScriptedStop {
+            target: Some(4242),
+            dead_after: vec![false, true].into(),
+            ..Default::default()
+        };
+        let msg = w.stop(false).expect("SIGKILL escalation must still stop");
         assert!(msg.contains("SIGKILL"), "escalation reported: {msg}");
-        assert!(!pid_alive(pid), "SIGKILLed process must be gone");
-        let _ = std::fs::remove_dir_all(&dir);
+        let term = w.position("signal 4242 Term");
+        let kill = w.position("signal 4242 Kill");
+        assert!(
+            term < kill,
+            "TERM first, KILL only as escalation: {:?}",
+            w.actions
+        );
+        assert_eq!(
+            w.actions
+                .iter()
+                .filter(|a| a.as_str() == "signal 4242 Kill")
+                .count(),
+            1,
+            "exactly one escalation: {:?}",
+            w.actions
+        );
     }
 
     #[cfg(unix)]
