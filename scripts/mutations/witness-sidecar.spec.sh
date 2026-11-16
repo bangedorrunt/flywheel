@@ -9,5 +9,6 @@ TEST_FILTER=(a_witnessed_exit_writes_the_done_sidecar_and_a_refusal_writes_none)
 mutation "W1  the sidecar is written before the witness decides" \
     file=src/durable_body.rs \
     expect=a_witnessed_exit_writes_the_done_sidecar_and_a_refusal_writes_none \
-    find='            if matches!(gate, WitnessGate::Passed) {' \
-    replace='            if true {'
+    find='    match witness_gate(seams.witness.as_ref(), node, stage, &value) {' \
+    replace='    write_done_sidecar(seams.sidecar_root.as_deref(), trigger, node);
+    match witness_gate(seams.witness.as_ref(), node, stage, &value) {'
