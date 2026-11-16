@@ -288,6 +288,12 @@ pub fn integration_target(kind: &str) -> Option<&'static str> {
     if kind == "antigravity-cli" {
         return Some("antigravity_cli");
     }
+    // bd-6setu.1: a REGISTRY harness answers from its own row (which also says
+    // when it is not a pane at all); the hc list remains the vocabulary for
+    // integrations flywheel never spawns.
+    if let Some(row) = crate::harness_registry::spec(kind) {
+        return row.hc_target;
+    }
     INTEGRATION_KINDS.iter().copied().find(|k| *k == kind)
 }
 
