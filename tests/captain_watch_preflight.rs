@@ -3,13 +3,17 @@
 //!
 //! The unit test pins the pure selection rule; this drives the REAL binary so
 //! the wiring is proven too (a helper-only test stays green when the arm is
-//! deleted from the watch loop). A nonexistent project makes `project-dir`
-//! fail deterministically — no hc/toron store is required, and the
-//! arm runs BEFORE the mail setup so no inbox is reached.
-//!
+//! deleted from the watch loop). The run is sandboxed (bd-jp9z1.6): an empty
+//! HOME/XDG and a PATH of deny-shims only, so the arm's deterministic failure
+//! is the pane plane (no rex, no hc socket) rather than whatever the operator's
+//! machine happens to have. It runs BEFORE the mail setup, so no inbox is read.
+
 //! governed-by: bd-captain-watch-preflight-arm-snak
 
-use std::process::Command;
+#[path = "../src/test_sandbox.rs"]
+mod test_sandbox;
+
+use test_sandbox::TestSandbox;
 
 fn flywheel() -> &'static str {
     env!("CARGO_BIN_EXE_flywheel")
@@ -19,8 +23,9 @@ fn flywheel() -> &'static str {
 /// one JSON object naming the failing check and its message — the remedy line.
 #[test]
 fn captain_watch_exits_on_preflight_failure_e2e() {
-    let dir = tempfile::TempDir::new().expect("temp dir");
-    let out = Command::new(flywheel())
+    let sandbox = TestSandbox::new();
+    let out = sandbox
+        .command(flywheel())
         .args([
             "captain",
             "watch",
@@ -30,8 +35,6 @@ fn captain_watch_exits_on_preflight_failure_e2e() {
             "steer",
             "--json",
         ])
-        .env("XDG_CONFIG_HOME", dir.path().join("config"))
-        .env("XDG_STATE_HOME", dir.path().join("state"))
         .output()
         .expect("spawn flywheel");
 
@@ -58,8 +61,10 @@ fn captain_watch_exits_on_preflight_failure_e2e() {
         !msg.is_empty(),
         "the failing check's message is rendered: {v}"
     );
+    // A hermetic sandbox has no rex and no hc socket, so the first check that
+    // can fail is the pane plane; the arm names whichever check it reached.
     assert!(
-        check == "project-dir" || check == "hc-socket",
+        matches!(check, "project-dir" | "hc-socket" | "pane-plane"),
         "the named failure is one the real preflight produces: {v}"
     );
 }
