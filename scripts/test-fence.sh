@@ -46,6 +46,11 @@ GOOD="$(git -C "$REPO" rev-parse HEAD)"
 # callee that defines what it calls is the split commit, and it never builds.
 cat >"$TMP/bin/cargo" <<'SH'
 #!/usr/bin/env bash
+echo "$1" >>"${FAKE_CARGO_LOG:-/dev/null}"
+if [ "$1" = clippy ] && [ -e clippy_only.rs ]; then
+  echo "error: very complex type used. Consider factoring parts into \`type\` definitions" >&2
+  exit 1
+fi
 if [ -e dead.rs ]; then
   echo "error: function \`dead\` is never used" >&2
   exit 1
@@ -102,6 +107,24 @@ git -C "$REPO" add callee.rs
 out="$(FENCE_CARGO="$TMP/bin/cargo" bash "$ROOT/scripts/fence.sh" --repo "$REPO" --index 2>&1)" \
   || fail "a staged caller WITH its callee must pass: $out"
 pass "a staged change that builds on its own passes"
+
+# bd-4z7mb follow-up: the gate runs CLIPPY, so a clippy-only error cannot slip
+# past it (f93a8f42 did under the old check leg). The fake cargo fails this only
+# when the subcommand really is clippy.
+: >"$TMP/cargo-calls"
+printf 'fn clippy_only() -> Option<&%s dyn Fn(u8) -> u8> {\n    None\n}\n' "'a" >"$REPO/clippy_only.rs"
+git -C "$REPO" add clippy_only.rs
+out="$(FAKE_CARGO_LOG="$TMP/cargo-calls" FENCE_CARGO="$TMP/bin/cargo" \
+    bash "$ROOT/scripts/fence.sh" --repo "$REPO" --index 2>&1)" \
+    && fail "a staged clippy-only error must be refused"
+case "$out" in
+    *"complex type"*) ;;
+    *) fail "the refusal must name the lint: $out" ;;
+esac
+grep -q '^clippy$' "$TMP/cargo-calls" || fail "the gate must run clippy, not check: $(cat "$TMP/cargo-calls")"
+pass "a staged clippy-only error is refused, naming the lint"
+git -C "$REPO" rm -q --cached clippy_only.rs
+rm -f "$REPO/clippy_only.rs"
 git -C "$REPO" rm -q --cached caller.rs callee.rs
 rm -f "$REPO/caller.rs" "$REPO/callee.rs"
 

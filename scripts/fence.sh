@@ -73,12 +73,12 @@ step() { printf 'fence: %s\n' "$1"; }
 step "needles"
 bash scripts/verify-needles.sh
 if [ "$INDEX" = 1 ]; then
-    # bd-4z7mb: the commit gate wants name resolution, not codegen. `check` is
-    # the same caller/callee detector the split commits needed, at a fraction of
-    # the wall time, so a hook stays usable.
-    step "check (-D warnings, all targets)"
+    # bd-4z7mb: the commit gate. Clippy runs the same type check as `cargo
+    # check` plus the lints, so a clippy-only regression cannot slip past it
+    # (f93a8f42 did exactly that under the old check leg).
+    step "clippy (-D warnings, all targets)"
     # shellcheck disable=SC2086
-    RUSTFLAGS=-Dwarnings $CARGO check --workspace --all-targets
+    $CARGO clippy --workspace --all-targets -- -D warnings
 else
     step "build (-D warnings, all targets)"
     # shellcheck disable=SC2086
