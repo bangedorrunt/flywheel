@@ -153,6 +153,17 @@ fn settle_stage(run: &LinearRun) -> Option<String> {
     }
 }
 
+/// The stage one GRAPH node declares, for the witness gate (bd-jhz8x.5: the
+/// graph path now settles on a job's terminal, not on its publish).
+fn graph_stage(run: &GraphRun, node: &str) -> Option<String> {
+    let model = run.model();
+    let def = model.workflow.graph.as_ref()?.nodes.get(node)?;
+    match &def.action {
+        toron_workflow::schema::Action::DispatchJob { spec, .. } => spec.stage.clone(),
+        _ => None,
+    }
+}
+
 /// Run the stage witness gate on one settled step output. None settles
 /// unchanged: no seam, no stage on the step, or no declared witness. A
 /// failing report returns the typed refusal that replaces success.
@@ -541,6 +552,19 @@ async fn drive_graph(
         }
         let mut follow: Vec<GraphEffect> = Vec::new();
         for effect in std::mem::take(&mut effects) {
+            // A verb can end the run while its batch still holds parks and
+            // watches for siblings (bd-jhz8x.5): feeding those to a terminal
+            // model is a refused transition, and it hides the real failure.
+            if run.model().is_terminal()
+                && !matches!(
+                    effect,
+                    GraphEffect::Fail { .. }
+                        | GraphEffect::Complete { .. }
+                        | GraphEffect::Cancelled
+                )
+            {
+                continue;
+            }
             match effect {
                 GraphEffect::ExecuteNode {
                     node,
@@ -582,6 +606,80 @@ async fn drive_graph(
                     let Some((back, mut eff)) = verb(run_id, "node feed", move || then(run)).await
                     else {
                         return failed("node feed failed", None);
+                    };
+                    run = back;
+                    follow.append(&mut eff);
+                }
+                GraphEffect::WatchJob { node, job_id } => {
+                    // bd-jhz8x.5: a graph dispatch awaits its job exactly as a
+                    // linear step does, so this mirrors the linear arm below —
+                    // deadline from the node's own AwaitingJob state, then the
+                    // stage witness gate on the settled value.
+                    let (deadline, claimed) = match run.model().node_state.get(&node) {
+                        Some(toron_workflow::engine::durable::NodeState::AwaitingJob {
+                            claim_deadline_ms,
+                            result_deadline_ms,
+                            claimed,
+                            ..
+                        }) => {
+                            if *claimed {
+                                (*result_deadline_ms, true)
+                            } else {
+                                (*claim_deadline_ms, false)
+                            }
+                        }
+                        _ => (None, false),
+                    };
+                    let Some(watcher) = seams.job_watcher.clone() else {
+                        return failed(
+                            format!(
+                                "dispatch_job await: result needs a toron host; \
+                                 flywheel in-process bodies cannot watch job {job_id} for step {node}"
+                            ),
+                            Some(node),
+                        );
+                    };
+                    let outcome = await_job_watch(
+                        &watcher,
+                        JobWatchSpec {
+                            job_id: job_id.clone(),
+                            deadline_ms: deadline,
+                            claimed,
+                        },
+                        deadline,
+                        clock(),
+                    )
+                    .await;
+                    let stage = graph_stage(&run, &node);
+                    let outcome = match outcome {
+                        JobWatchOutcome::Settled(value) => {
+                            match witness_refusal(seams.witness.as_ref(), &node, stage.as_deref(), &value)
+                            {
+                                Some(error) => JobWatchOutcome::Failed(error),
+                                None => JobWatchOutcome::Settled(value),
+                            }
+                        }
+                        other => other,
+                    };
+                    let c = clock.clone();
+                    let then = move |mut run: GraphRun| match outcome {
+                        JobWatchOutcome::Claimed => run
+                            .job_claimed(&node, c())
+                            .map(|eff| (run, eff)),
+                        JobWatchOutcome::Settled(value) => run
+                            .job_settled(&node, value, c())
+                            .map(|eff| (run, eff)),
+                        JobWatchOutcome::Failed(error) => run
+                            .job_failed(&node, error, c())
+                            .map(|eff| (run, eff)),
+                        JobWatchOutcome::TimedOut => {
+                            let now = c().max(deadline.unwrap_or(0));
+                            run.woke(now).map(|eff| (run, eff))
+                        }
+                    };
+                    let Some((back, mut eff)) = verb(run_id, "job watch", move || then(run)).await
+                    else {
+                        return failed("job watch failed", None);
                     };
                     run = back;
                     follow.append(&mut eff);
@@ -1532,18 +1630,25 @@ mod tests {
     /// with a typed error naming the step that dispatched it. The watcher
     /// never settles; the frozen clock proves milliseconds.
     ///
-    /// IGNORED: wave-swarm runs on the GRAPH model (it has a `foreach`), and
-    /// the graph model has no awaiting-job state — `ExecuteNode` returns the
-    /// publish receipt, so `await: result` is not honoured there and a
-    /// witness-less wave settles green. The invariant itself is still proven
-    /// on the linear path by `durable_body_await_result_timeout_is_typed`;
-    /// this test is the wave-level witness and un-ignores the moment the graph
-    /// model watches jobs (bd-jhz8x follow-up).
-    #[ignore = "graph model has no awaiting-job state: wave dispatches settle on publish"]
+    /// bd-jhz8x.5: this is the wave-level witness for the graph model's
+    /// awaiting-job state — it was ignored from the day the hole was found
+    /// until the graph model watched jobs, and it must never be ignored again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wave_swarm_missing_witness_fails_at_result_timeout() {
         let (store, db) = watch_test_store("wave-timeout").await;
-        let wf = wave_swarm_workflow();
+        // The wave shape is the shipped one; only the per-bead claim bound is
+        // shortened, because the clock is frozen and the real timer is what the
+        // test would otherwise wait out (600s).
+        let mut wf = wave_swarm_workflow();
+        for step in &mut wf.steps {
+            if let toron_workflow::schema::Action::Foreach { each, .. } = &mut step.action
+                && let toron_workflow::schema::Action::DispatchJob {
+                    no_claim_timeout, ..
+                } = &mut each.action
+            {
+                *no_claim_timeout = 1;
+            }
+        }
         let (watcher, _queue) = queue_watcher(vec![]);
         let mut seams = wave_swarm_seams(watcher);
         seams.leaf.async_runner = Some(verify_runner(serde_json::json!({
