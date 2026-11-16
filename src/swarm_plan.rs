@@ -1177,3 +1177,81 @@ mod plan_patch_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod v4_adapter_property {
+    use super::{FieldStatus, Provenance, mode_field, phase_field, seat_status};
+
+    /// ADR-0022 V4 (bd-6setu.8): for EVERY harness the registry names and every
+    /// field a seat carries, the plan says `honored` iff that harness's own
+    /// launch argv/env carries the value. The emission truth is read from the
+    /// launcher API directly, never from the status function, so a status that
+    /// drifts from the argv a pane would actually get turns this red.
+    #[test]
+    fn every_harness_field_is_honored_iff_the_launch_emits_it() {
+        let mut honored = 0;
+        let mut not_honored = 0;
+        for spec in crate::harness_registry::REGISTRY {
+            let h = spec.canonical;
+
+            let launch =
+                crate::headless::interactive_model_plan(h, "probe-model", Some("probe-effort"));
+            let emits_model = launch.args().iter().any(|a| a == "probe-model")
+                || launch.env_pin() == Some("probe-model");
+            let emits_effort = launch.args().iter().any(|a| a == "probe-effort");
+            let (model, effort) = seat_status(
+                h,
+                Some(("probe-model".to_string(), Provenance::User)),
+                Some(("probe-effort".to_string(), Provenance::User)),
+                &launch,
+            );
+            assert_eq!(
+                model.as_ref().expect("model field").status == FieldStatus::Honored,
+                emits_model,
+                "model status must match the launch argv/env on {h}"
+            );
+            assert_eq!(
+                effort.as_ref().expect("effort field").status == FieldStatus::Honored,
+                emits_effort,
+                "effort status must match the launch argv on {h}"
+            );
+
+            let (mode_args, delivery) = crate::headless::mode_launch_args(h, "read-only");
+            let mode = mode_field(h, Some(("read-only".to_string(), Provenance::User)))
+                .expect("mode field");
+            let emits_mode =
+                !mode_args.is_empty() && matches!(delivery, crate::headless::ModeDelivery::Honored);
+            assert_eq!(
+                mode.status == FieldStatus::Honored,
+                emits_mode,
+                "mode status must match the adapter's mode argv on {h}"
+            );
+
+            let (phase_args, degraded) = crate::headless::phase_launch_args(h, "plan");
+            let phase =
+                phase_field(h, Some(("plan".to_string(), Provenance::User))).expect("phase field");
+            let emits_phase = !phase_args.is_empty() && !degraded;
+            assert_eq!(
+                phase.status == FieldStatus::Honored,
+                emits_phase,
+                "phase status must match the adapter's phase argv on {h}"
+            );
+
+            for field in [model.as_ref(), effort.as_ref(), Some(&mode), Some(&phase)]
+                .into_iter()
+                .flatten()
+            {
+                if field.status == FieldStatus::Honored {
+                    honored += 1;
+                } else {
+                    not_honored += 1;
+                }
+            }
+        }
+        assert!(honored > 0, "at least one row honors a field");
+        assert!(
+            not_honored > 0,
+            "at least one row refuses a field, or the property has only one half"
+        );
+    }
+}
