@@ -3,10 +3,16 @@
 # fail-fast prefix, in a clean export, so a dirty tree cannot change the answer.
 #
 #   scripts/fence.sh [--sha <rev>] [--repo <dir>] [--keep]
+#   scripts/fence.sh --index        # the STAGED index, as the pre-commit hook
 #
 # Steps, in the proof's order, stopping at the first failure:
 #   verify-needles · build -Dwarnings --all-targets · test --no-run ·
 #   verify-clippy
+# `--index` (bd-4z7mb) fences exactly what a commit would land: `git write-tree`
+# over the staging area, a throwaway commit off HEAD, then needles, the
+# -Dwarnings build and `rustfmt --check` on the staged .rs files. It is the
+# commit-time gate: a caller staged without its callee builds in the dirty tree
+# and dies in this export.
 # Export comes from scripts/proof-lib.sh (proof_archive), the same function
 # clean-proof uses — the two doors cannot disagree about what a commit is.
 set -euo pipefail
@@ -15,20 +21,34 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO="$ROOT"
 REV="HEAD"
 KEEP=0
+INDEX=0
 CARGO="${FENCE_CARGO:-mbx +nightly-aarch64-apple-darwin}"
+RUSTFMT="${FENCE_RUSTFMT:-rustup run nightly-aarch64-apple-darwin rustfmt --edition 2024}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --sha) REV="$2"; shift ;;
         --repo) REPO="$2"; shift ;;
+        --index) INDEX=1 ;;
         --keep) KEEP=1 ;;
-        -h | --help) sed -n '2,13p' "$0"; exit 0 ;;
+        -h | --help) sed -n '2,22p' "$0"; exit 0 ;;
         *) echo "fence: unknown arg: $1" >&2; exit 2 ;;
     esac
     shift
 done
 
-SHA="$(git -C "$REPO" rev-parse "$REV")"
+STAGED_RS=""
+if [ "$INDEX" = 1 ]; then
+    # bd-4z7mb: fence what the commit WOULD land. A throwaway commit off HEAD
+    # carries the staged tree; git archive then exports exactly that.
+    TREE="$(git -C "$REPO" write-tree)"
+    SHA="$(printf '%s\n' 'fence-index' | git -C "$REPO" \
+        -c user.name='fence' -c user.email='fence@localhost' \
+        commit-tree "$TREE" -p HEAD)"
+    STAGED_RS="$(git -C "$REPO" diff --cached --name-only --diff-filter=ACM -- '*.rs')"
+else
+    SHA="$(git -C "$REPO" rev-parse "$REV")"
+fi
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/fence.XXXXXX")"
 cleanup() { [ "$KEEP" -eq 1 ] || rm -rf "$TMP"; }
 trap cleanup EXIT
@@ -55,6 +75,19 @@ bash scripts/verify-needles.sh
 step "build (-D warnings, all targets)"
 # shellcheck disable=SC2086
 RUSTFLAGS=-Dwarnings $CARGO build --workspace --all-targets
+if [ "$INDEX" = 1 ]; then
+    # bd-4z7mb: the commit-time gate is the fast prefix, and its fmt leg reads
+    # the STAGED content (the export), not the files still dirty in the tree.
+    [ -n "$STAGED_RS" ] || { echo "fence: nothing staged to format"; }
+    for f in $STAGED_RS; do
+        [ -f "$f" ] || continue
+        step "fmt ($f)"
+        # shellcheck disable=SC2086
+        $RUSTFMT --check "$f"
+    done
+    echo "fence: $SHA GREEN (index)"
+    exit 0
+fi
 step "test --no-run (every target)"
 # shellcheck disable=SC2086
 $CARGO test --workspace --no-run

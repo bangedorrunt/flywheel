@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# bd-4z7mb: the commit-time gate. Fences the STAGED index, not the tree, so a
+# caller staged without its callee dies here instead of breaking HEAD for every
+# lane. Install once per clone: bash scripts/hooks/install.sh
+exec "$(dirname "$0")/../../scripts/fence.sh" --index

@@ -41,11 +41,17 @@ git -C "$REPO" commit -qm good
 GOOD="$(git -C "$REPO" rev-parse HEAD)"
 
 # Fake cargo: fails when a dead fn reached the EXPORT. That is the -Dwarnings
-# build's real job, reduced to a marker so this test stays instant.
+# build's real job, reduced to a marker so this test stays instant. It also
+# models the caller/callee split (bd-4z7mb): a caller in the export without the
+# callee that defines what it calls is the split commit, and it never builds.
 cat >"$TMP/bin/cargo" <<'SH'
 #!/usr/bin/env bash
 if [ -e dead.rs ]; then
   echo "error: function \`dead\` is never used" >&2
+  exit 1
+fi
+if [ -e caller.rs ] && [ ! -e callee.rs ]; then
+  echo "error: cannot find function \`callee\` in this scope" >&2
   exit 1
 fi
 exit 0
@@ -75,6 +81,29 @@ if FENCE_CARGO="$TMP/bin/cargo" bash "$ROOT/scripts/fence.sh" --repo "$REPO" --s
   fail "a committed sibling pin must be read and enforced"
 fi
 pass "a committed sibling pin is enforced"
+
+# bd-4z7mb: the index gate. A caller staged while its callee stays DIRTY is the
+# split that breaks HEAD for every lane; the fence of the index refuses it.
+pin_toml "$PIN"
+git -C "$REPO" add proof.toml
+printf 'fn caller() {\n    callee();\n}\n' >"$REPO/caller.rs"
+printf 'fn callee() {}\n' >"$REPO/callee.rs"
+git -C "$REPO" add caller.rs
+out="$(FENCE_CARGO="$TMP/bin/cargo" bash "$ROOT/scripts/fence.sh" --repo "$REPO" --index 2>&1)" \
+  && fail "a staged caller without its callee must be refused"
+case "$out" in
+  *"cannot find function"*) ;;
+  *) fail "the refusal must name the build error: $out" ;;
+esac
+pass "a staged caller whose callee is only dirty is refused, naming the error"
+
+# Staged together, the same change builds: the gate refuses splits, not work.
+git -C "$REPO" add callee.rs
+out="$(FENCE_CARGO="$TMP/bin/cargo" bash "$ROOT/scripts/fence.sh" --repo "$REPO" --index 2>&1)" \
+  || fail "a staged caller WITH its callee must pass: $out"
+pass "a staged change that builds on its own passes"
+git -C "$REPO" rm -q --cached caller.rs callee.rs
+rm -f "$REPO/caller.rs" "$REPO/callee.rs"
 
 # The same dead fn COMMITTED must fail.
 pin_toml "$PIN"
