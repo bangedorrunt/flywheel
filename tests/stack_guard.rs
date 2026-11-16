@@ -5,8 +5,15 @@
 
 use std::process::Command;
 
+use flywheel_test_sandbox::TestSandbox;
+
 #[test]
 fn stack_script_refuses_a_crew_pin() {
+    // The script shells out and builds its own throwaway env per case; this
+    // sandbox covers the harness process itself (temp HOME/XDG, scrubbed
+    // routing env, deny-shims first on PATH).
+    let sandbox = TestSandbox::new();
+    let _scope = sandbox.scope();
     let root = env!("CARGO_MANIFEST_DIR");
     let status = Command::new("bash")
         .arg(format!("{root}/scripts/test-stack-guard.sh"))
