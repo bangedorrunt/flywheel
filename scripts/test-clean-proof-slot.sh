@@ -11,6 +11,9 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
 
 export CLEAN_PROOF_LOCK_FILE="$TMP/clean-proof.lock"
+# Inside an outer proof CLEAN_PROOF_SLOTTED is already 1, so the nested
+# invocations would skip the flock re-exec and this test would see overlap.
+unset CLEAN_PROOF_SLOTTED
 MARKER="$TMP/markers.txt"
 export CLEAN_PROOF_LOCK_TEST_MARKER="$MARKER"
 
