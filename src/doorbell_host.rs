@@ -335,18 +335,6 @@ impl RtHost {
             .collect()
     }
 
-    /// bd-3vkpe: only pins that still HAVE a pane can hear a ring. A gone or
-    /// retired pin's row stays in the registry, so `pins()` is the wrong
-    /// question for a wake — the plane holds the truth.
-    fn live_pins(&self) -> Option<Vec<String>> {
-        let registry = state::load_spawn_registry(&self.project);
-        let backend = crate::backend::multiplexer_backend(&self.cfg).ok()?;
-        // A plane we cannot read is not evidence that every pin is gone.
-        let agents = backend.agent_list().ok()?;
-        let panes: Vec<String> = agents.into_iter().map(|a| a.pane_id).collect();
-        Some(Self::live_pins_from(&registry, &panes))
-    }
-
     /// Registry pins whose pane is still on the plane (bd-3vkpe). Pure, so the
     /// fixture tests pin the rule: a retired/gone pin has no pane and no ring.
     pub(crate) fn live_pins_from(
@@ -912,6 +900,18 @@ fn cmds_to_effects(cmds: Vec<workspace::Cmd>) -> Vec<Effect> {
 }
 
 impl Host for RtHost {
+    /// bd-3vkpe: only pins that still HAVE a pane can hear a ring. A gone or
+    /// retired pin's row stays in the registry, so `pins()` is the wrong
+    /// question for a wake — the plane holds the truth.
+    fn live_pins(&self) -> Option<Vec<String>> {
+        let registry = state::load_spawn_registry(&self.project);
+        let backend = crate::backend::multiplexer_backend(&self.cfg).ok()?;
+        // A plane we cannot read is not evidence that every pin is gone.
+        let agents = backend.agent_list().ok()?;
+        let panes: Vec<String> = agents.into_iter().map(|a| a.pane_id).collect();
+        Some(Self::live_pins_from(&registry, &panes))
+    }
+
     fn tick(&mut self, msg: &BrainMsg) -> Vec<Effect> {
         let (wmsg, drain_waits) = match msg {
             BrainMsg::Watch(line) => (workspace::Msg::WatchNdjson { line: line.clone() }, true),
@@ -2401,7 +2401,6 @@ mod inbox_flag_tests {
     }
 }
 
-#[cfg(test)]
 /// bd-3vkpe: the fixture that reproduces the digest conflict — six gone pins
 /// and one live one. Only the live pin is a wake target, so only it can ever be
 /// "unanswered".
@@ -2444,6 +2443,7 @@ mod live_pins_tests {
     }
 }
 
+#[cfg(test)]
 mod off_runtime_tests {
     use super::*;
     use doorbell_rt::Host;
