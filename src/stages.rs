@@ -2315,17 +2315,13 @@ mod stage_contract_tests {
             "only steps.* refs become claim exclusions (inputs.* never do)"
         );
         assert!(
-            spec_of("execute")
+            !spec_of("execute")
                 .extra
-                .get("exclude_claimants_of")
-                .is_none(),
+                .contains_key("exclude_claimants_of"),
             "an execute step carries no exclusion"
         );
         assert!(
-            spec_of("verify")
-                .extra
-                .get("exclude_claimants_of")
-                .is_none(),
+            !spec_of("verify").extra.contains_key("exclude_claimants_of"),
             "wave-verify is not a review-witness step"
         );
 
