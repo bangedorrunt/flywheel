@@ -16,18 +16,16 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
+
+use flywheel_test_sandbox::TestSandbox;
 
 fn flywheel() -> &'static str {
     env!("CARGO_BIN_EXE_flywheel")
 }
 
 struct Hermetic {
-    #[expect(
-        dead_code,
-        reason = "keeps the temp dir alive for the hermetic env's lifetime"
-    )]
-    dir: tempfile::TempDir,
+    sandbox: TestSandbox,
     config_home: PathBuf,
     state_home: PathBuf,
     /// The per-project tier root (passed as `--project <abs>` so cwd never
@@ -42,12 +40,12 @@ fn cron_yaml(name: &str, owner: &str, schedule: &str) -> String {
 }
 
 fn hermetic() -> Hermetic {
-    let dir = tempfile::TempDir::new().expect("temp dir");
-    let config_home = dir.path().join("config");
-    let state_home = dir.path().join("state");
-    let project = dir.path().join("proj");
+    let sandbox = TestSandbox::new();
+    let config_home = sandbox.root().join("config");
+    let state_home = sandbox.root().join("state");
+    let project = sandbox.root().join("proj");
     Hermetic {
-        dir,
+        sandbox,
         config_home,
         state_home,
         project,
@@ -83,10 +81,11 @@ fn write_project(h: &Hermetic, name: &str, owner: &str, schedule: &str) {
 }
 
 fn run(h: &Hermetic, args: &[&str]) -> Output {
-    Command::new(flywheel())
+    h.sandbox
+        .command(flywheel())
         .args(args)
-        .env("XDG_CONFIG_HOME", &h.config_home)
-        .env("XDG_STATE_HOME", &h.state_home)
+        .env("PATH", h.sandbox.path_env())
+        .current_dir(h.sandbox.root())
         .output()
         .expect("spawn flywheel")
 }
