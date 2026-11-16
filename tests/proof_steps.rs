@@ -117,6 +117,22 @@ fn proof_verify_mutations_never_edits_the_shared_tree() {
     );
 }
 
+/// bd-6setu.18: a TEST_FILTER that matches no #[test] runs zero tests, so its
+/// spec reads VACUOUS instead of RED and the mutants are silently lost. The
+/// needle gate must refuse it, and the fixture drives both halves.
+#[test]
+fn proof_verify_needles_refuses_a_dead_test_filter() {
+    let status = Command::new("bash")
+        .arg(format!("{}/scripts/test-verify-needles-filters.sh", root()))
+        .current_dir(root())
+        .status()
+        .expect("run scripts/test-verify-needles-filters.sh");
+    assert!(
+        status.success(),
+        "scripts/test-verify-needles-filters.sh failed"
+    );
+}
+
 /// Every quality-gate leg denies warnings (bd-0uzrq.4). A plain `cargo check`
 /// compiled src/cmd/crew.rs:919's dead binding and reported success; only the
 /// `-D warnings` build caught it.

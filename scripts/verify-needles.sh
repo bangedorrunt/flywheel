@@ -67,6 +67,15 @@ for spec in "${SPECS[@]}"; do
         "$(printf '%s' "$find" | base64 | tr -d '\n')"
     }
     . "$spec"
+    # bd-6setu.18: TEST_FILTER is a substring filter, and a filter that names
+    # nothing runs zero tests — the spec then reads VACUOUS instead of RED, so
+    # its mutation is silently lost. Record every filter name for the check.
+    if [ -n "${TEST_FILTER+set}" ]; then
+      for name in "${TEST_FILTER[@]}"; do
+        [ -n "$name" ] || continue
+        printf 'FILTER\t%s\t%s\n' "$spec" "$name"
+      done
+    fi
   ) >>"$RECORDS"
 done
 
@@ -79,8 +88,68 @@ records = pathlib.Path(sys.argv[1])
 spec_count = sys.argv[2]
 bad = 0
 rows = 0
-for line in records.read_text(errors="ignore").splitlines():
+dead_filters = []
+raw = records.read_text(errors="ignore").splitlines()
+
+
+def test_name_index() -> list[str]:
+    """Test fn names and module names across the bin and the workspace crates.
+
+    A filter is a SUBSTRING match over the names libtest prints, and specs name
+    them in several forms (`fn`, `module::tests::fn`, `cmd::swarm::tests::fn`,
+    or a bare prefix like `bd20_`). Resolving the exact nested path would need a
+    Rust parser; resolving "does this name still exist anywhere" does not, and
+    that is the failure this gate exists to catch: a test DELETED while a spec
+    kept naming it. So a filter is live when every `::` segment matches some
+    test fn or module name.
+
+    Limit, stated on purpose: a filter naming a real fn under the WRONG module
+    passes here and fails loudly at the test runner instead.
+    """
+    import re
+
+    names: list[str] = []
+    # A spec may target the bin's src/tests OR a workspace crate: the doorbell,
+    # awareness and wake specs all point at crates/*.
+    roots = [pathlib.Path("src"), pathlib.Path("tests")]
+    for crate in sorted(pathlib.Path("crates").glob("*/")):
+        roots.extend([crate / "src", crate / "tests"])
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*.rs"):
+            try:
+                text = path.read_text(errors="ignore")
+            except OSError:
+                continue
+            stem = path.with_suffix("").name
+            if stem != "mod":
+                names.append(stem)
+            names.extend(re.findall(r"\bmod\s+([A-Za-z0-9_]+)", text))
+            lines = text.splitlines()
+            for i, line in enumerate(lines):
+                if "#[test]" not in line and "#[tokio::test" not in line:
+                    continue
+                for follow in lines[i + 1 : i + 5]:
+                    m = re.search(r"\bfn\s+([A-Za-z0-9_]+)\s*\(", follow)
+                    if m:
+                        names.append(m.group(1))
+                        break
+    return names
+
+
+test_names = None
+for line in raw:
     if not line.strip():
+        continue
+    if line.startswith("FILTER\t"):
+        _, spec, name = line.split("\t", 2)
+        if test_names is None:
+            test_names = test_name_index()
+        segments = [seg for seg in name.split("::") if seg]
+        live = any(seg in candidate for seg in segments for candidate in test_names)
+        if not live:
+            dead_filters.append((spec, name))
         continue
     spec, mid, file, encoded = line.split("\t", 3)
     rows += 1
@@ -103,6 +172,13 @@ for line in records.read_text(errors="ignore").splitlines():
         )
         bad += 1
 
+for spec, name in dead_filters:
+    print(
+        f"{spec}: TEST_FILTER names {name!r}, which matches no #[test] fn — "
+        "its mutants prove nothing (bd-6setu.18)",
+        file=sys.stderr,
+    )
+bad += len(dead_filters)
 if bad:
     print(
         f"verify-needles: {bad} bad needle(s) across {rows} mutation(s) — "

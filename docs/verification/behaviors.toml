@@ -1223,3 +1223,15 @@ mutations = [
   "scripts/mutations/dispatch-binding-fail-closed.spec.sh#M1",
   "scripts/mutations/dispatch-binding-fail-closed.spec.sh#H3",
 ]
+
+[[behavior]]
+id = "proof.dead-test-filter-is-refused"
+owner = "scripts/verify-needles.sh"
+status = "proven"
+concurrent = false
+tests = [
+  "tests/proof_steps.rs::proof_verify_needles_refuses_a_dead_test_filter",
+]
+mutations = [
+  "scripts/mutations/verify-needles-dead-filter.spec.sh#D1",
+]
