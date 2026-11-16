@@ -8711,3 +8711,86 @@ mod planned_briefs_tests {
         assert!(planned_briefs(&std::collections::BTreeMap::new()).is_empty());
     }
 }
+
+#[cfg(test)]
+mod acceptance1_harness_pair {
+    use std::collections::BTreeMap;
+
+    use super::{PlanAsk, build_dry_run_plan, spawn_items_from_plan};
+
+    fn registry() -> crate::models::ModelRegistry {
+        use crate::models::ModelEntry;
+        let mut models = BTreeMap::new();
+        models.insert("gemini/gemini-2.5-pro".to_string(), ModelEntry::default());
+        crate::models::ModelRegistry {
+            models,
+            slots: BTreeMap::new(),
+            user_keys: Default::default(),
+            defaults: None,
+        }
+    }
+
+    /// ADR-0022 acceptance 1 (bd-6setu.10): one explicit-model ask is honored on
+    /// gemini, whose launch argv carries it, and BLOCKED on fx, which has no model
+    /// flag at all. The plan says which is which; the argv is read from the
+    /// launcher, not from the status.
+    #[test]
+    fn acceptance1_gemini_honored_fx_blocked() {
+        let cfg = crate::config::Config::default();
+        let catalog = crate::profile::ProfileCatalog::default();
+        let prefs = crate::preferences::PreferenceSet::new();
+        let reg = registry();
+
+        let items = spawn_items_from_plan(vec![("gemini".to_string(), 1)], None);
+        let plan = build_dry_run_plan(
+            &cfg,
+            &catalog,
+            &reg,
+            &prefs,
+            "test",
+            PlanAsk {
+                items: &items,
+                bare_model: "gemini-2.5-pro",
+                bare_provider: "",
+                overrides: &BTreeMap::new(),
+            },
+        )
+        .expect("gemini plan builds");
+        let field = plan.seats[0].model.as_ref().expect("model field");
+        assert_eq!(
+            field.status,
+            crate::swarm_plan::FieldStatus::Honored,
+            "gemini honours an explicit model: {field:?}"
+        );
+        let args = crate::headless::model_args("gemini", "gemini-2.5-pro", None);
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-m" && w[1] == "gemini-2.5-pro"),
+            "the launch carries -m gemini-2.5-pro: {args:?}"
+        );
+
+        let items = spawn_items_from_plan(vec![("fx".to_string(), 1)], None);
+        let plan = build_dry_run_plan(
+            &cfg,
+            &catalog,
+            &reg,
+            &prefs,
+            "test",
+            PlanAsk {
+                items: &items,
+                bare_model: "gemini-2.5-pro",
+                bare_provider: "",
+                overrides: &BTreeMap::new(),
+            },
+        )
+        .expect("fx plan builds");
+        let field = plan.seats[0].model.as_ref().expect("model field");
+        match &field.status {
+            crate::swarm_plan::FieldStatus::Blocked { remedy } => assert!(
+                remedy.contains("fx"),
+                "the remedy names the harness: {remedy}"
+            ),
+            other => panic!("fx takes no model flag, so the ask is blocked: {other:?}"),
+        }
+    }
+}
