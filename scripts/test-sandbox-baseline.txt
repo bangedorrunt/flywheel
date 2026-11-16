@@ -2,7 +2,6 @@ tests/adr0027_slice1.rs
 tests/collab_patterns_e2e.rs
 tests/e2e_serialize_worktree.rs
 tests/e2e_statechart_formal_verification.rs
-tests/event_poll_parity.rs
 tests/fleet_guard.rs
 tests/sc_fw_workflow_edge.rs
 tests/stack_guard.rs

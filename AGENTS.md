@@ -80,6 +80,18 @@ Live suites and any test that shells supervisor tools must:
 A suite that bootouts the operator's real LaunchAgent is a regression, not a
 pass.
 
+Tests that spawn the binary build the `Command` through
+`tests`' `flywheel_test_sandbox::TestSandbox` (temp HOME/XDG/TORON_DATA_DIR,
+scrubbed routing env, deny-shims first on `PATH`, a `Drop` that asserts no shim
+was reached). `scripts/check-test-sandbox.sh` refuses a new spawn that skips it;
+`scripts/test-sandbox-baseline.txt` lists the files still to migrate (debt, not
+permission).
+
+The ONE carve-out is `tests/live_*.rs`: a live test measures the real plane, so
+it cannot be sandboxed. The lint allows the name only when every `#[test]` in
+the file is `#[ignore]`d AND the file is gated on `FLYWHEEL_LIVE_E2E`, so a live
+test can never run by default. Anything else that spawns gets the sandbox.
+
 ## Critical overrides
 
 - **Clean-export proof.** A green suite over a dirty tree is not a green tree.
