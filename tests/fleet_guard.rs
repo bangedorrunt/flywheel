@@ -12,70 +12,41 @@
 //! goes to files so a stray grandchild can never hold the suite open.
 
 use std::fs::File;
-use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+use flywheel_test_sandbox::TestSandbox;
 
 fn flywheel() -> &'static str {
     env!("CARGO_BIN_EXE_flywheel")
 }
 
+/// The shared contract sandbox (bd-jp9z1.4): env_clear + temp HOME/XDG/toron,
+/// the operator's routing env scrubbed, deny-shims first on PATH, and a Drop
+/// that fails the test if the real supervisor was ever reached.
 struct Sandbox {
-    dir: tempfile::TempDir,
+    inner: TestSandbox,
 }
 
 impl Sandbox {
     fn new() -> Self {
-        let dir = tempfile::TempDir::new().expect("temp dir");
-        for sub in [
-            "home", "config", "state", "data", "toron", "shims", "src", "cargo",
-        ] {
-            std::fs::create_dir_all(dir.path().join(sub)).expect("sandbox dir");
+        Self {
+            inner: TestSandbox::new(),
         }
-        std::fs::write(dir.path().join("src/Cargo.toml"), "").expect("dummy Cargo.toml");
-        for tool in ["launchctl", "systemctl", "codesign"] {
-            let path = dir.path().join("shims").join(tool);
-            std::fs::write(
-                &path,
-                format!(
-                    "#!/bin/sh\necho \"{tool} $*\" >> \"{}\"\nexit 1\n",
-                    dir.path().join("shim.log").display()
-                ),
-            )
-            .expect("shim");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                    .expect("shim mode");
-            }
-        }
-        Self { dir }
     }
 
-    fn root(&self) -> &Path {
-        self.dir.path()
+    fn root(&self) -> &std::path::Path {
+        self.inner.root()
     }
 
     fn shim_log(&self) -> String {
-        std::fs::read_to_string(self.root().join("shim.log")).unwrap_or_default()
+        self.inner.shim_log()
     }
 
     /// Positional args and an explicitly clean environment.
     fn command(&self, pane: bool, pin: Option<&str>, args: &[&str]) -> Command {
-        let mut cmd = Command::new(flywheel());
-        cmd.args(args)
-            .env_clear()
-            .env("PATH", self.root().join("shims"))
-            .env("HOME", self.root().join("home"))
-            .env("XDG_CONFIG_HOME", self.root().join("config"))
-            .env("XDG_STATE_HOME", self.root().join("state"))
-            .env("XDG_DATA_HOME", self.root().join("data"))
-            .env("XDG_RUNTIME_DIR", self.root().join("state"))
-            .env("TORON_DATA_DIR", self.root().join("toron"))
-            .env("TORON_MCP_DATA_DIR", self.root().join("toron"))
-            .env("FLYWHEEL_SOURCE", self.root().join("src"))
-            .env("CARGO_INSTALL_ROOT", self.root().join("cargo"));
+        let mut cmd = self.inner.command(flywheel());
+        cmd.args(args);
         if pane {
             cmd.env("FLYWHEEL_PANE", "1");
         }
@@ -218,6 +189,9 @@ fn daemon_start_refuses_a_crew_pin() {
 #[test]
 fn the_operator_shell_still_reaches_a_read_only_verb() {
     let sandbox = Sandbox::new();
+    // `daemon status` probes the live supervisor with `launchctl print`: a read,
+    // and exactly what this control wants to prove still works.
+    sandbox.inner.allow_supervisor_calls();
     let out = run(
         sandbox.command(false, None, &["daemon", "status", "--port", "39071"]),
         &sandbox,
