@@ -326,7 +326,8 @@ Each step ships alone and changes no default until its last bullet.
 
 ## 6. Implementation map (2026-11-17)
 
-Every name below was grepped at `8ce0e80e`, not recalled. A mutation id is
+Every name below was grepped, not recalled (the decisions and acceptance
+rows at `8ce0e80e`, the bd-jhz8x.6 mutants at the commit that added them). A mutation id is
 **spec-qualified** (`spec-id`) because ids collide across specs: `adr0021-gates
 S1` is the shape gate, not `plan-spawn-consent S1`. `AD²` means the row is
 witnessed by ADR-0022's map (§8), which owns the adapter/profile half of D3.
@@ -341,20 +342,20 @@ witnessed by ADR-0022's map (§8), which owns the adapter/profile half of D3.
 | D3.2 `mode` reaches the harness, else `degraded` | `harness_default_plan_says_honored_and_the_launch_injects_nothing`, `dry_run_ambiguous_from_profile_is_degraded` | `v4-adapter-property V4` | closed (AD² D3/V4) |
 | D3.3 skills stay on the profile | `digest_is_bounded_deterministic_and_order_sensitive`, `empty_skills_have_no_digest`, `builtins_have_verbatim_preamble_and_skills` | none | closed (structural: `Stage` has no skills field; the profile does) |
 | D3.4 `witness` is the exit | `adr0021_witness_exit_refuses_an_empty_report`, `durable_body_witness_fail_goes_to_on_error`, `durable_body_witness_missing_report_fails` | `adr0021-gates W1`, `witness-sidecar W1` | closed |
-| D3.5 review + verify run `context: fresh` | `stage_contract_seed_phases_complete` (all four seeds fresh + read-only), `beads_lifecycle_plan_polish_loop` (audit fresh) | none | **open: witnessed, not mutation-proven — bd-jhz8x.6** |
-| D3.6 `effort` replaces in-prompt keywords | `dispatch_resolves_effort_stage_over_profile`, `resolver_v4_effort_bare_matrix`, `grok_effort_is_honored_from_profile_and_user` | none | **open: witnessed, not mutation-proven — bd-jhz8x.6** |
+| D3.5 review + verify run `context: fresh` | `stage_contract_seed_phases_complete` (all four seeds fresh + read-only), `beads_lifecycle_plan_polish_loop` (audit fresh) | `adr0021-witnessed E1` | closed (bd-jhz8x.6) |
+| D3.6 `effort` replaces in-prompt keywords | `dispatch_resolves_effort_stage_over_profile`, `resolver_v4_effort_bare_matrix`, `grok_effort_is_honored_from_profile_and_user` | `adr0021-witnessed E2` | closed (bd-jhz8x.6) |
 | D3.7 a step's fields override the stage | structural: a stage carries no dispatch fields (`DispatchSpec` lives on the step, the stage supplies only the prompt) | none | closed (structural) |
 | D4.1 `dispatch_job await: result` suspends to the terminal | `wave_swarm_stages_await_result`; toron `graph_dispatch_await_waits_for_the_job_terminal` | `graph-await P1/T1/O1` (toron), `wave_swarm_*` | closed (bd-jhz8x.2/.5) |
 | D4.2 the engine checks the witness; a miss is typed | `durable_body_witness_fail_goes_to_on_error`, `durable_body_witness_missing_report_fails` | `adr0021-gates W1`, `witness-sidecar W1` | closed |
-| D4.3 fact-derived exits win over reported ones | `wave_swarm_execute_exit_is_ledger_fact`, `wave_swarm_execute_exit_runs_against_ledger` | none | **open: witnessed, not mutation-proven — bd-jhz8x.6** |
+| D4.3 fact-derived exits win over reported ones | `wave_swarm_execute_exit_is_ledger_fact`, `wave_swarm_execute_exit_runs_against_ledger` | `adr0021-witnessed E3` | closed (bd-jhz8x.6) |
 | D4.4 `.done` markers retire (sidecars, never read) | `wave_swarm_no_marker_reads` | `witness-sidecar W1` | **partial: nothing reads a marker, but the sidecars are still steps — the RUNNER writing them is bd-jhz8x.3** |
 | D4.5 the LLM-as-loop stages become engine steps | `wave_swarm_stages_await_result` (dispatch), `a_lower_open_wave_holds_and_names_the_blockers` (gate), `a_blocked_pane_escalates_to_the_captain_once_per_episode` (observe) | `wave-gate-engine G1/G2`, `observe-fold W1/R1/K1`, `observe-escalation L1/E1/B1/F1` | **partial: gate/dispatch/observe are engine steps; `spawn-crew` is still a stage — bd-jhz8x.2** |
-| D5.1 lower every workflow to a machine | `workflow_lowering_unreachable_node_named`, `workflow_lowering_can_finish_names_stranded_state`, `workflow_lowering_unbounded_back_edge_named`, `workflow_lowering_approval_without_timeout_fails` | `adr0021-gates L1` (bounded) | **partial: reachable/can-finish have no mutant — bd-jhz8x.6** |
-| D5.2 `workflow verify` checks the machine; the report says what it does not prove | `statechart_verify_passes_the_shipped_charts`, `statechart_report_fails_on_an_orphan_and_a_trap`, `test_cli_workflow_verify_json_contract` | `adr0021-gates S1/L1/W1`, `workflow-verify-unused U1` | **partial: reachable/can-finish unmutated — bd-jhz8x.6** |
+| D5.1 lower every workflow to a machine | `workflow_lowering_unreachable_node_named`, `workflow_lowering_can_finish_names_stranded_state`, `workflow_lowering_unbounded_back_edge_named`, `workflow_lowering_approval_without_timeout_fails` | `adr0021-gates L1` (bounded), `adr0021-witnessed E4/E5` (reachable, can-finish) | closed (bd-jhz8x.6) |
+| D5.2 `workflow verify` checks the machine; the report says what it does not prove | `statechart_verify_passes_the_shipped_charts`, `statechart_report_fails_on_an_orphan_and_a_trap`, `test_cli_workflow_verify_json_contract` | `adr0021-gates S1/L1/W1`, `adr0021-witnessed E4/E5`, `workflow-verify-unused U1` | closed (bd-jhz8x.6) |
 | D5.3 the report names what is not checked | `test_cli_workflow_verify_plain_text` (scope line), `test_cli_workflow_verify_json_contract` (scope field) | none | closed (the text is the assertion) |
 | D5.4 hand TLA+ protocols, each shown failing on a broken variant | `.agents/skills/verify-protocol-tla/models/{JobLease,ReservationBoard,Respawn}.tla` with `.broken-*.cfg` variants, run by `scripts/verify-formal.sh` (the proof's `verify-formal` step) | none (the models are the artifact) | closed |
 | D5.5 honesty fixes ship first | `tests/e2e_statechart_formal_verification.rs` — `test_cli_workflow_verify_plain_text`, `test_cli_workflow_verify_json_contract`, `test_cli_workflow_verify_export_tla` (SwarmLifecycle retired); `AGENTS.md`/skill grep for "zero-divergence"/"mathematically verified" is empty | none | closed |
-| D6 curate the catalog (unused is a property of the catalog) | `an_undeclared_unreferenced_stage_fails_and_a_declaration_clears_it`, `declared_reach_names_only_real_stages`, `filter_rows_by_phase` (`stage list --phase`) | `workflow-verify-unused U1`, `unused-stage U1` | **partial: phase grouping has no mutant — bd-jhz8x.6** |
+| D6 curate the catalog (unused is a property of the catalog) | `an_undeclared_unreferenced_stage_fails_and_a_declaration_clears_it`, `declared_reach_names_only_real_stages`, `stage_contract_list_filters` (`stage list --phase`) | `workflow-verify-unused U1`, `unused-stage U1`, `adr0021-witnessed E6` | closed (bd-jhz8x.6) |
 | D7 the plan-polish loop (min 2, max 5, digest convergence, fence) | `beads_lifecycle_plan_polish_loop`, `adr0021_plan_fence_never_converges_on_a_changed_digest`, `converged_only_on_equal_previous`, `digest_sees_content_and_dependency_changes`, `fence_passes_only_on_double_zero` | `adr0021-gates F1` | **partial: the fence never checks coverage non-shrink — bd-jhz8x.7** |
 
 ### Acceptance
@@ -373,8 +374,9 @@ witnessed by ADR-0022's map (§8), which owns the adapter/profile half of D3.
 
 Every row above was grepped; none was recalled. A row marked **open** or
 **partial** is a real gap with an owner bead — nothing here is closed without
-both a witness test and a mutation seen RED. The four checks that are
-witnessed but unmutated are filed as bd-jhz8x.6; the missing coverage fence as
-bd-jhz8x.7; the sidecar-writer and `spawn-crew` legs stay with bd-jhz8x.3 and
-bd-jhz8x.2. The topology export still proves nothing (D5.3): no model checker
-runs over it, and D5.4's TLC models cover protocols, not workflows.
+both a witness test and a mutation seen RED. The five checks that were
+witnessed but unmutated are closed by bd-jhz8x.6 (`adr0021-witnessed E1–E6`,
+6/6 RED); the missing coverage fence is bd-jhz8x.7; the sidecar-writer and
+`spawn-crew` legs stay with bd-jhz8x.3 and bd-jhz8x.2. The topology export
+still proves nothing (D5.3): no model checker runs over it, and D5.4's TLC
+models cover protocols, not workflows.
