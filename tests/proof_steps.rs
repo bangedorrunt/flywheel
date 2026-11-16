@@ -36,7 +36,9 @@ fn proof_reservation_board_model_fences_the_grant() {
     let model = std::fs::read_to_string(format!("{models}/ReservationBoard.tla"))
         .expect("ReservationBoard.tla");
     assert!(
-        model.contains(r#"[] OTHER                    -> v.status = "complete" /\ v.seen = {} /\ held = {}"#),
+        model.contains(
+            r#"[] OTHER                    -> v.status = "complete" /\ v.seen = {} /\ held = {}"#
+        ),
         "a grant must need a complete read AND an empty board (the per-coordinate lock)"
     );
     let formal = std::fs::read_to_string(format!("{}/scripts/verify-formal.sh", root()))

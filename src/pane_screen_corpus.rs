@@ -39,7 +39,10 @@ fn rows(harness: &str) -> Vec<Row> {
                 "operator-text" => InputLine::OperatorText,
                 other => panic!("unknown expect {other:?}"),
             },
-            last_typed: row.get("last_typed").and_then(|v| v.as_str()).map(String::from),
+            last_typed: row
+                .get("last_typed")
+                .and_then(|v| v.as_str())
+                .map(String::from),
         })
         .collect()
 }
