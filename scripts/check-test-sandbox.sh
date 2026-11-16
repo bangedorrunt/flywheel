@@ -15,7 +15,7 @@ offends() {
     local file="$1"
     grep -q 'CARGO_BIN_EXE_\(flywheel\|toron\|doorbell\)' "$file" || return 1
     grep -q 'test_sandbox' "$file" && return 1
-    echo "test-sandbox: $file spawns a built binary without the test sandbox" >&2
+    echo "test-sandbox: $file spawns a built binary without src/test_sandbox.rs" >&2
     return 0
 }
 
