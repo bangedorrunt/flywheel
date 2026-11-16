@@ -1072,6 +1072,7 @@ dependencies = [
  "doorbell-rt",
  "dotenvy",
  "evalexpr",
+ "flywheel-test-sandbox",
  "futures-core",
  "hex",
  "ratatui",
@@ -1090,6 +1091,13 @@ dependencies = [
  "toron-workflow",
  "ureq",
  "uuid",
+]
+
+[[package]]
+name = "flywheel-test-sandbox"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]
