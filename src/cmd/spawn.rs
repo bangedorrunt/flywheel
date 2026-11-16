@@ -593,18 +593,33 @@ pub(crate) fn cmd_preflight(
 /// `approval_expired` and mail the asker. A denied key replays
 /// `approval_denied` and never dispatches. Returns true when the steer is
 /// fully answered here; false means the normal gate path continues.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn cmd_steer_hosted_park(
-    project_owned: &str,
-    pin: &str,
-    objective: &str,
-    direct: bool,
-    crew: Option<&str>,
-    reuse: Option<&str>,
-    retain: bool,
-    retire_orphans: bool,
-    request_key: Option<&str>,
-) -> Result<bool> {
+/// bd-koafr: the hosted-park door's options, so the argument count stays
+/// clippy-clean without a suppression.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HostedParkOpts<'a> {
+    pub project_owned: &'a str,
+    pub pin: &'a str,
+    pub objective: &'a str,
+    pub direct: bool,
+    pub crew: Option<&'a str>,
+    pub reuse: Option<&'a str>,
+    pub retain: bool,
+    pub retire_orphans: bool,
+    pub request_key: Option<&'a str>,
+}
+
+pub(crate) fn cmd_steer_hosted_park(opts: HostedParkOpts<'_>) -> Result<bool> {
+    let HostedParkOpts {
+        project_owned,
+        pin,
+        objective,
+        direct,
+        crew,
+        reuse,
+        retain,
+        retire_orphans,
+        request_key,
+    } = opts;
     let key = request_key
         .map(str::trim)
         .filter(|k| !k.is_empty())
@@ -696,21 +711,36 @@ pub(crate) fn cmd_steer_hosted_park(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn cmd_steer(
-    cfg: &Config,
-    objective: &str,
-    direct: bool,
-    crew: Option<&str>,
-    project: Option<&str>,
-    reuse: Option<&str>,
-    retain: bool,
-    retire_orphans: bool,
-    json: bool,
-    yes: bool,
-    request_key: Option<&str>,
-    as_agent: Option<&str>,
-) -> Result<()> {
+/// The steer door's options: one struct keeps the count honest as flags grow.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SteerOpts<'a> {
+    pub objective: &'a str,
+    pub direct: bool,
+    pub crew: Option<&'a str>,
+    pub project: Option<&'a str>,
+    pub reuse: Option<&'a str>,
+    pub retain: bool,
+    pub retire_orphans: bool,
+    pub json: bool,
+    pub yes: bool,
+    pub request_key: Option<&'a str>,
+    pub as_agent: Option<&'a str>,
+}
+
+pub(crate) fn cmd_steer(cfg: &Config, opts: SteerOpts<'_>) -> Result<()> {
+    let SteerOpts {
+        objective,
+        direct,
+        crew,
+        project,
+        reuse,
+        retain,
+        retire_orphans,
+        json,
+        yes,
+        request_key,
+        as_agent,
+    } = opts;
     if objective.trim().is_empty() {
         bail!("steer: objective must not be empty");
     }
@@ -737,8 +767,8 @@ pub(crate) fn cmd_steer(
         _ => None,
     };
     if let Some(pin) = hosted_pin
-        && cmd_steer_hosted_park(
-            &project_owned,
+        && cmd_steer_hosted_park(HostedParkOpts {
+            project_owned: &project_owned,
             pin,
             objective,
             direct,
@@ -747,7 +777,7 @@ pub(crate) fn cmd_steer(
             retain,
             retire_orphans,
             request_key,
-        )?
+        })?
     {
         return Ok(());
     }

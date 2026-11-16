@@ -3765,17 +3765,19 @@ fn main() {
         .and_then(|()| {
             cmd_steer(
                 &cfg,
-                objective,
-                *direct,
-                crew.as_deref(),
-                project.as_deref(),
-                reuse.as_deref(),
-                *retain,
-                *retire_orphans,
-                *json,
-                *yes,
-                request_key.as_deref(),
-                as_agent.as_deref(),
+                crate::cmd::spawn::SteerOpts {
+                    objective,
+                    direct: *direct,
+                    crew: crew.as_deref(),
+                    project: project.as_deref(),
+                    reuse: reuse.as_deref(),
+                    retain: *retain,
+                    retire_orphans: *retire_orphans,
+                    json: *json,
+                    yes: *yes,
+                    request_key: request_key.as_deref(),
+                    as_agent: as_agent.as_deref(),
+                },
             )
         }),
         Some(Commands::Workflow { cmd }) => {
