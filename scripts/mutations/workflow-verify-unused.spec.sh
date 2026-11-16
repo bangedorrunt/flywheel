@@ -1,13 +1,14 @@
 # Sourced by scripts/verify-mutations.sh.
-# bd-jhz8x.2: an unreferenced stage is REPORTED, never fatal — the catalog is
-# also the manual dispatch surface, and failing on it made `workflow verify`
-# read the operator's run log. U1 makes it fatal again.
+# ADR-0021 D6 (bd-jhz8x.4): an unused stage fails verify, and a declaration
+# (`reached_by = compose|manual`) is what keeps a manual/compose-only stage
+# alive. U1 drops the declarations, so the five legitimate ones read as dead and
+# the shipped tiers fail.
 
 CARGO_ARGS=(--bin flywheel)
 TEST_FILTER=(statechart_verify_passes_the_shipped_charts)
 
-mutation "U1  an unreferenced stage fails workflow verify again" \
+mutation "U1  a declared reach is not counted as a reference" \
     file=src/cmd/workflow.rs \
     expect=statechart_verify_passes_the_shipped_charts \
-    find='    let ok = reports.iter().all(|r| r.ok);' \
-    replace='    let ok = reports.iter().all(|r| r.ok) && unused.is_empty();'
+    find='        referenced.extend(lib.declared_reach());' \
+    replace='        let _ = lib.declared_reach();'

@@ -88,6 +88,19 @@ pub enum StageContext {
     Fresh,
 }
 
+/// How a stage that NO shipped workflow dispatches is still reachable
+/// (ADR-0021 D6, bd-jhz8x.3): a compose token (`scout:fresh-eyes-explore`) or a
+/// by-hand `flywheel send --stage`. Declared, it counts as referenced; silent,
+/// it stays a dead stage and `workflow verify` fails on it. Closed set —
+/// unknown values fail parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StageReach {
+    #[serde(rename = "compose")]
+    Compose,
+    #[serde(rename = "manual")]
+    Manual,
+}
+
 /// Bounded repetition contract (ADR-0021 D3/D7): run at least `min`, at most
 /// `max`, until `until` holds. Validated: 1 <= min <= max <= 32.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +148,9 @@ pub struct Stage {
     /// One-line note on when to dispatch this stage (stage list groups by it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub use_when: Option<String>,
+    /// Declared reach for a stage no shipped workflow dispatches (ADR-0021 D6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reached_by: Option<StageReach>,
     /// Provenance (§3.8): who authored it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
@@ -180,6 +196,7 @@ fn merge_stage(base: Stage, over: Stage) -> Stage {
         witness: over.witness.or(base.witness),
         repeat: over.repeat.or(base.repeat),
         use_when: over.use_when.or(base.use_when),
+        reached_by: over.reached_by.or(base.reached_by),
     }
 }
 
@@ -372,6 +389,19 @@ const SEED_READS: &[(&str, &[&str])] = &[
 /// Seed effort knobs (ADR-0021 D3).
 const SEED_EFFORT: &[(&str, &str)] = &[("plan-polish", "max")];
 
+/// Stages no shipped workflow dispatches, and HOW they are reached instead
+/// (ADR-0021 D6). Everything here must name a real seed stage; everything
+/// else unreferenced stays a dead stage `workflow verify` fails on.
+const SEED_REACH: &[(&str, StageReach)] = &[
+    // `scout:fresh-eyes-explore` is a crew compose token, not a workflow step.
+    ("fresh-eyes-explore", StageReach::Compose),
+    // Reached by hand (`flywheel send --stage`) as the loop's own steps.
+    ("ce-simplify", StageReach::Manual),
+    ("tdd-red", StageReach::Manual),
+    ("minimal-fix", StageReach::Manual),
+    ("repro-baseline", StageReach::Manual),
+];
+
 /// Seed repetition contracts (min, max, until).
 const SEED_REPEAT: &[(&str, (u32, u32, &str))] = &[("plan-polish", (2, 5, "converged"))];
 
@@ -545,6 +575,7 @@ impl StageLibrary {
                     witness: None,
                     repeat: None,
                     use_when: None,
+                    reached_by: None,
                 },
             );
         }
@@ -566,6 +597,11 @@ impl StageLibrary {
         for (name, use_when) in SEED_USE_WHEN {
             if let Some(stage) = stages.get_mut(*name) {
                 stage.use_when = Some(use_when.to_string());
+            }
+        }
+        for (name, reach) in SEED_REACH {
+            if let Some(stage) = stages.get_mut(*name) {
+                stage.reached_by = Some(*reach);
             }
         }
         for (name, reads) in SEED_READS {
@@ -722,6 +758,16 @@ impl StageLibrary {
         })
     }
 
+    /// Stage names that DECLARE how they are reached without a workflow
+    /// (ADR-0021 D6). The verify gate counts these as referenced.
+    pub fn declared_reach(&self) -> Vec<String> {
+        self.stages
+            .values()
+            .filter(|s| s.reached_by.is_some())
+            .map(|s| s.name.clone())
+            .collect()
+    }
+
     /// One `stage list --all` row: name + tier + the §3.8 metadata.
     pub fn list_tiered(&self) -> Vec<StageRow> {
         self.stages
@@ -794,6 +840,7 @@ pub fn scaffold(name: &str) -> Stage {
         witness: None,
         repeat: None,
         use_when: None,
+        reached_by: None,
     }
 }
 
@@ -1001,12 +1048,8 @@ pub fn unreferenced_stages(
 pub fn unused_stages(
     all: &[String],
     referenced: &std::collections::HashSet<String>,
-    recent_stage_uses: &std::collections::HashSet<String>,
 ) -> Vec<String> {
     unreferenced_stages(all, referenced)
-        .into_iter()
-        .filter(|name| !recent_stage_uses.contains(name))
-        .collect()
 }
 
 /// Collect every `stage:` value in a workflow JSON tree (spec.stage at any
@@ -2241,6 +2284,7 @@ mod stage_contract_tests {
             witness: None,
             repeat: None,
             use_when: None,
+            reached_by: None,
         };
         let merged = merge_stage(base, over);
         assert_eq!(merged.phase.as_deref(), Some("review"));
@@ -2389,38 +2433,63 @@ mod stage_contract_tests {
 
 #[cfg(test)]
 mod unused_stage_gate_tests {
-    use super::unused_stages;
+    use super::{StageLibrary, unused_stages};
     use std::collections::HashSet;
 
     fn set(items: &[&str]) -> HashSet<String> {
         items.iter().map(|s| (*s).to_string()).collect()
     }
 
-    /// bd-jhz8x.4 (ADR-0021 D6): an unreferenced stage with no recent use is
-    /// a verify failure; a reference or a recent run-log use clears it.
+    /// ADR-0021 D6 (bd-jhz8x.4): an unreferenced stage with NO declaration is
+    /// a verify failure; a workflow reference or a declared reach
+    /// (`reached_by = compose|manual`) clears it. The gate takes no run log.
     #[test]
-    fn an_unreferenced_unused_stage_fails_and_either_use_clears_it() {
+    fn an_undeclared_unreferenced_stage_fails_and_a_declaration_clears_it() {
         let all = vec![
             "referenced".to_string(),
-            "used-now".to_string(),
+            "declared".to_string(),
             "dead".to_string(),
         ];
-        let referenced = set(&["referenced"]);
-        let recent = set(&["used-now"]);
         assert_eq!(
-            unused_stages(&all, &referenced, &recent),
+            unused_stages(&all, &set(&["referenced"])),
+            vec!["dead".to_string(), "declared".to_string()],
+            "a stage with neither a reference nor a declaration is unused"
+        );
+        assert_eq!(
+            unused_stages(&all, &set(&["referenced", "declared"])),
             vec!["dead".to_string()],
-            "only the stage with neither reference nor recent use is unused"
+            "a declaration clears exactly the stage that declares it"
         );
-        assert!(
-            !unused_stages(&all, &referenced, &set(&["used-now", "dead"]))
-                .contains(&"dead".to_string()),
-            "a recent run-log use clears the gate"
+        assert!(unused_stages(&all, &set(&["referenced", "declared", "dead"])).is_empty());
+    }
+
+    /// The shipped declarations are exactly the stages reached without a
+    /// workflow step — and every one of them must exist (a typo'd name would
+    /// silently protect nothing while the real stage stayed dead).
+    #[test]
+    fn declared_reach_names_only_real_stages() {
+        let lib = StageLibrary::compiled_in();
+        let mut declared = lib.declared_reach();
+        declared.sort();
+        assert_eq!(
+            declared,
+            vec![
+                "ce-simplify".to_string(),
+                "fresh-eyes-explore".to_string(),
+                "minimal-fix".to_string(),
+                "repro-baseline".to_string(),
+                "tdd-red".to_string(),
+            ],
+            "the declared manual/compose surface is explicit, not incidental"
         );
-        assert!(
-            !unused_stages(&all, &set(&["referenced", "dead"]), &recent)
-                .contains(&"dead".to_string()),
-            "a catalog reference clears the gate"
+        for name in declared {
+            assert!(lib.has(&name), "{name} declares a reach, so it must exist");
+        }
+        assert_eq!(
+            lib.get_stage("fresh-eyes-explore")
+                .and_then(|s| s.reached_by),
+            Some(super::StageReach::Compose),
+            "fresh-eyes-explore is reached by a compose token"
         );
     }
 }

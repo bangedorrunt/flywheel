@@ -2188,31 +2188,24 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
         );
     }
 
-    // bd-jhz8x.4 (ADR-0021 D6): an unreferenced stage is REPORTED, never fatal.
-    // The catalog is also the manual dispatch surface (`flywheel send --stage`,
-    // crew compose tokens like `scout:fresh-eyes-explore`) and that use is
-    // invisible to a scan of the builtin workflows, so a hard failure here made
-    // `verify` depend on the operator's run log — the one thing this gate must
-    // not do. The 30-day set stays as a hint when a run log exists.
+    // ADR-0021 D6 (bd-jhz8x.4): an unused stage FAILS this gate. "Used" is the
+    // builtin workflows' `stage:` refs PLUS a stage that DECLARES how it is
+    // reached without one (`reached_by = compose|manual`) — a compose token such
+    // as `scout:fresh-eyes-explore` is invisible to a workflow scan, and reading
+    // the operator's run log here would make the gate ambient. No run log, no
+    // history: a proof and a workstation answer the same.
     let unused: Vec<String> = {
-        let rows = crate::stages::StageLibrary::load_layered(None)
-            .unwrap_or_default()
-            .list_tiered();
+        let lib = crate::stages::StageLibrary::load_layered(None).unwrap_or_default();
         let mut referenced = std::collections::HashSet::new();
         for wf in crate::builtin_workflows::builtin_workflows().values() {
             let json = serde_json::to_value(wf).unwrap_or_default();
             crate::stages::collect_stage_refs(&json, &mut referenced);
         }
-        let mut recent = std::collections::HashSet::new();
-        for run in crate::run_log::read_runs() {
-            if let Some(stage) = run.stage {
-                recent.insert(stage);
-            }
-        }
-        let names: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
-        crate::stages::unused_stages(&names, &referenced, &recent)
+        referenced.extend(lib.declared_reach());
+        let names: Vec<String> = lib.list_tiered().iter().map(|r| r.name.clone()).collect();
+        crate::stages::unused_stages(&names, &referenced)
     };
-    let ok = reports.iter().all(|r| r.ok);
+    let ok = reports.iter().all(|r| r.ok) && unused.is_empty();
     let body = serde_json::json!({
         "schema": "flywheel-workflow-verify.v2",
         "ok": ok,
@@ -2649,6 +2642,66 @@ mod workflow_verify_statechart_tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
         assert!(ok, "the shipped tiers verify cleanly");
+    }
+
+    /// ADR-0021 D6: the gate takes NO ambient state. A run log naming a stage
+    /// that neither a workflow references nor a contract declares must not
+    /// change the verdict — a proof machine has no log, and a workstation's
+    /// history must not decide what ships.
+    #[test]
+    fn statechart_verify_ignores_the_operator_run_log() {
+        let _env = crate::config::lock_env();
+        let prev_cfg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_state = std::env::var_os("XDG_STATE_HOME");
+        let dir = std::env::temp_dir().join(format!("fw-verify-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp home");
+        std::fs::create_dir_all(dir.join("flywheel/stages")).expect("empty config tier");
+
+        let verify = || -> bool {
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+            unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
+            cmd_workflow_verify(None, false, true).is_ok()
+        };
+        let hermetic = verify();
+
+        // A run log that claims a ghost stage ran ten minutes ago.
+        let runs = dir.join("flywheel/runs");
+        std::fs::create_dir_all(&runs).expect("runs dir");
+        std::fs::write(
+            runs.join("ghost-run.jsonl"),
+            serde_json::json!({
+                "run_id": "ghost-run",
+                "ts": "2026-11-17T00:00:00Z",
+                "workflow": "ghost",
+                "stage": "ghost-stage",
+                "profile": "@coder",
+                "harness": "opencode",
+                "model": "m",
+                "mode": "work",
+                "prompt_hash": "h",
+                "response": "",
+                "status": "ok",
+            })
+            .to_string(),
+        )
+        .expect("write run log");
+        let with_log = verify();
+
+        match prev_cfg {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        match prev_state {
+            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            hermetic, with_log,
+            "a run log changed the verify verdict: the gate is reading ambient state"
+        );
+        assert!(hermetic, "the shipped tiers verify cleanly");
     }
 }
 

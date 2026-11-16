@@ -294,12 +294,15 @@ mutations = [
 ]
 
 [[behavior]]
-id = "workflow.verify-reports-unused-stages"
+id = "workflow.verify-unused-stage-gate"
 owner = "src/cmd/workflow.rs"
 status = "proven"
 concurrent = false
 tests = [
   "src/cmd/workflow.rs::statechart_verify_passes_the_shipped_charts",
+  "src/cmd/workflow.rs::statechart_verify_ignores_the_operator_run_log",
+  "src/stages.rs::an_undeclared_unreferenced_stage_fails_and_a_declaration_clears_it",
+  "src/stages.rs::declared_reach_names_only_real_stages",
 ]
 mutations = [
   "scripts/mutations/workflow-verify-unused.spec.sh#U1",
