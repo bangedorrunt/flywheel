@@ -9,7 +9,6 @@ tests/e2e_verdict_reopen.rs
 tests/event_poll_parity.rs
 tests/fleet_guard.rs
 tests/replay_transcript.rs
-tests/sc_bugfix_playbook.rs
 tests/sc_doorbell_adr0005.rs
 tests/sc_fw_workflow_edge.rs
 tests/ship_land.rs

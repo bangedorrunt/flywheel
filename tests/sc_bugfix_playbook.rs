@@ -20,6 +20,11 @@
 //!
 //! governed-by: ADR-0019 (Spec 6, Spec 7.2), ADR-0024 Scenario B
 
+#[path = "../src/test_sandbox.rs"]
+mod test_sandbox;
+
+use test_sandbox::TestSandbox;
+
 use toron_workflow::schema::{Action, Workflow};
 
 /// Parse the COMPILED-IN builtin `bug-fix` workflow. The builtins live in
@@ -150,25 +155,22 @@ graph:
 /// `dirs::home_dir()` fallback. Redirection of all three is what makes the run
 /// below report CODE state instead of machine state (bd-hcfk).
 struct HermeticRoots {
-    dir: tempfile::TempDir,
+    sandbox: TestSandbox,
 }
 
 impl HermeticRoots {
     fn new() -> Self {
-        let dir = tempfile::TempDir::new().expect("temp dir");
-        for sub in ["config", "state", "home"] {
-            std::fs::create_dir_all(dir.path().join(sub)).expect("create hermetic root");
+        Self {
+            sandbox: TestSandbox::new(),
         }
-        Self { dir }
     }
 
-    /// A spawn whose ambient roots are this tree, NOT the operator's.
+    /// A spawn whose ambient roots are this tree, NOT the operator's. PATH
+    /// keeps the inherited tail because the workflow under test shells out
+    /// (cargo); the deny-shims still come first.
     fn cmd(&self, args: &[&str]) -> std::process::Command {
-        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_flywheel"));
-        c.args(args)
-            .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
-            .env("XDG_STATE_HOME", self.dir.path().join("state"))
-            .env("HOME", self.dir.path().join("home"));
+        let mut c = self.sandbox.command(env!("CARGO_BIN_EXE_flywheel"));
+        c.args(args).env("PATH", self.sandbox.path_env());
         c
     }
 }
