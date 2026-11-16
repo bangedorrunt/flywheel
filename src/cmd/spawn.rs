@@ -8525,7 +8525,10 @@ mod assign_tests {
     fn assign_pairs_parse_one_per_pin_and_keep_the_bead_list() {
         let got = parse_assign(&["SlateHarbor=bd-a,bd-b".into(), "BoldBay=bd-c".into()])
             .expect("valid pairs");
-        assert_eq!(got.get("SlateHarbor").map(String::as_str), Some("bd-a,bd-b"));
+        assert_eq!(
+            got.get("SlateHarbor").map(String::as_str),
+            Some("bd-a,bd-b")
+        );
         assert_eq!(got.get("BoldBay").map(String::as_str), Some("bd-c"));
     }
 
