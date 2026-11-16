@@ -31,7 +31,9 @@
 //! governed-by: ADR-0019
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
+
+use flywheel_test_sandbox::TestSandbox;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn flywheel() -> &'static str {
@@ -42,19 +44,18 @@ fn flywheel() -> &'static str {
 /// (the close-detect leaves take the project dir as the project key; the
 /// repo's tmp-hygiene gate requires absolute scratch paths).
 struct Scratch {
+    sandbox: TestSandbox,
     dir: PathBuf,
     mailbox: PathBuf,
     cfg: PathBuf,
 }
 
 impl Scratch {
-    fn new(tag: &str) -> Self {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let base = std::env::temp_dir().join(format!("fw-{tag}-{}-{ts}", std::process::id()));
+    fn new(_tag: &str) -> Self {
+        let sandbox = TestSandbox::new();
+        let base = sandbox.root().to_path_buf();
         let s = Self {
+            sandbox,
             dir: base.join("proj"),
             mailbox: base.join("mailbox"),
             cfg: base.join("cfg/flywheel"),
@@ -82,12 +83,10 @@ impl Scratch {
     }
 
     fn flywheel(&self, args: &[&str]) -> Output {
-        let mut c = Command::new(flywheel());
+        let mut c = self.sandbox.command(flywheel());
         c.args(args)
             .current_dir(&self.dir)
-            .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .env("HOME", std::env::var_os("HOME").unwrap_or_default());
+            .env("PATH", self.sandbox.path_env());
         for (k, v) in self.flywheel_env() {
             c.env(k, v);
         }
@@ -126,12 +125,14 @@ impl Scratch {
 }
 
 fn run(cwd: &Path, bin: &str, args: &[&str]) -> Output {
-    Command::new(bin)
+    // A tool spawn (git, br): sandboxed per call, shims first because br can
+    // shell out; the scratch repo is the cwd.
+    let sandbox = TestSandbox::new();
+    sandbox
+        .command(bin)
         .args(args)
         .current_dir(cwd)
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", std::env::var_os("HOME").unwrap_or_default())
+        .env("PATH", sandbox.path_env())
         .output()
         .expect("cmd runs")
 }
@@ -303,7 +304,9 @@ fn close(dir: &Path, bead_id: &str, sha: &str) {
 /// operator bypass is the only way to manufacture that illegal state. The
 /// loop-side NoCommit reopen stays the enforcement floor (ADR-0001 §5.3).
 fn close_operator_bypass(dir: &Path, bead_id: &str) {
-    let out = Command::new("br")
+    let sandbox = TestSandbox::new();
+    let out = sandbox
+        .command("br")
         .args([
             "close",
             bead_id,
@@ -314,9 +317,7 @@ fn close_operator_bypass(dir: &Path, bead_id: &str) {
             "test fixture: illegal no-commit close, loop floor must catch it",
         ])
         .current_dir(dir)
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", std::env::var_os("HOME").unwrap_or_default())
+        .env("PATH", sandbox.path_env())
         .env("BR_OPERATOR", "1")
         .output()
         .expect("br close bypass");
