@@ -531,6 +531,15 @@ pub(crate) fn cmd_internal_send(
     };
 
     let Some(timeout_ms) = confirm_ms else {
+        // bd-0uzrq.3: the operator types in these same panes; never write over
+        // their half-typed line. A deferral is returned, never retried.
+        crate::pane_read::defer_if_operator_typing(
+            &crate::pane_read::PlaneReader(&*backend),
+            &crate::pane_read::harness_of(project, &target),
+            &target,
+            project,
+        )
+        .map_err(anyhow::Error::msg)?;
         match backend.prompt(&target, &send_text, None) {
             Ok(_) => {}
             Err(e) if is_agent_not_ready(&e.code) => {

@@ -502,8 +502,12 @@ fn prompt_wake_line(wm: u64, urgent: bool) -> String {
 /// welcome screen swallowed the paste live, 2026-11-15 13:47Z), and a writer
 /// that trusts its own write reports a wake that never rang. `wait_turn` asks
 /// the caller's own status plane, so this stays harness-agnostic.
+#[allow(clippy::too_many_arguments)]
 fn ring_prompt_wake(
     typer: &dyn crate::pane_write::PaneTyper,
+    reader: &dyn crate::pane_read::PaneReader,
+    project: &str,
+    harness: &str,
     target: &str,
     wm: u64,
     urgent: bool,
@@ -511,6 +515,10 @@ fn ring_prompt_wake(
     probe: &dyn Fn(&str) -> Result<(String, bool)>,
     bound: Duration,
 ) -> Result<crate::inbox_ports::RingDone, String> {
+    // bd-0uzrq.3: the pane belongs to whoever is typing in it. A captain-sent
+    // prompt is still a prompt into a shared pane, and --urgent does not
+    // override a half-typed line.
+    crate::pane_read::defer_if_operator_typing(reader, harness, target, project)?;
     let urgency = if urgent {
         toron_core::wake::Urgency::Urgent
     } else {
@@ -658,6 +666,9 @@ fn deliver_prompt_wake_hc(
     let route = crate::harness_caps::wake_route(&kind, crate::harness_caps::installed_from_env());
     match ring_prompt_wake(
         &crate::pane_write::HcPanes(&c),
+        &crate::pane_read::HcReader(&c),
+        project,
+        &kind,
         &target,
         wm,
         urgent,
@@ -730,6 +741,9 @@ fn deliver_prompt_wake_rex(
     let route = crate::harness_caps::wake_route(&kind, crate::harness_caps::installed_from_env());
     match ring_prompt_wake(
         &crate::pane_write::RexPanes(&*backend),
+        &crate::pane_read::PlaneReader(&*backend),
+        project,
+        &kind,
         &target,
         wm,
         urgent,
@@ -1027,6 +1041,9 @@ mod tests {
         let rec = RecTyper::default();
         let got = ring_prompt_wake(
             &rec,
+            &QuietPane,
+            "crew-probe",
+            "opencode",
             "block:pane-1",
             42,
             true,
@@ -1054,6 +1071,9 @@ mod tests {
         let rec = RecTyper::default();
         let got = ring_prompt_wake(
             &rec,
+            &QuietPane,
+            "crew-probe",
+            "opencode",
             "block:pane-1",
             42,
             false,
@@ -1068,6 +1088,57 @@ mod tests {
         assert_eq!(writes(&rec), vec![format!("prompt block:pane-1 {typed}")]);
     }
 
+    /// A pane whose box holds the operator's half-typed line.
+    struct TypedPane;
+
+    impl crate::pane_read::PaneReader for TypedPane {
+        fn tail(&self, _pane_id: &str, _lines: u32) -> Result<String, String> {
+            std::fs::read_to_string(format!(
+                "{}/tests/fixtures/pane-screens/opencode/partial-input.txt",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .map_err(|e| e.to_string())
+        }
+    }
+
+    /// bd-0uzrq.3: a captain-sent prompt is still a prompt into a shared pane.
+    /// `--urgent` does not override the operator's half-typed line.
+    #[test]
+    fn pane_screen_crew_prompt_defers_on_a_typed_box() {
+        use crate::harness_caps::WakeRoute;
+        let rec = RecTyper::default();
+        let err = ring_prompt_wake(
+            &rec,
+            &TypedPane,
+            "crew-probe",
+            "opencode",
+            "block:pane-typed",
+            42,
+            true,
+            WakeRoute::Inject { interrupt: true },
+            &landed_probe(),
+            Duration::ZERO,
+        )
+        .expect_err("operator text must defer, urgent or not");
+        assert!(
+            err.starts_with("deferred: operator is typing in "),
+            "the refusal names the pin: {err}"
+        );
+        assert!(
+            writes(&rec).is_empty(),
+            "a deferred prompt types nothing, not even the interrupt"
+        );
+    }
+
+    /// A pane with nothing in its input line (no capture for this test).
+    struct QuietPane;
+
+    impl crate::pane_read::PaneReader for QuietPane {
+        fn tail(&self, _pane_id: &str, _lines: u32) -> Result<String, String> {
+            Ok(String::new())
+        }
+    }
+
     /// bd-0uzrq.16, the live failure in a unit shape: a reset opencode sitting
     /// on its welcome screen swallowed the pasted wake on 2026-11-15 13:47Z —
     /// the write returned Ok, the input box stayed empty, no turn started, and
@@ -1078,6 +1149,9 @@ mod tests {
         let rec = RecTyper::default();
         let err = ring_prompt_wake(
             &rec,
+            &QuietPane,
+            "crew-probe",
+            "opencode",
             "block:01a1d6a1-fresh",
             42,
             false,

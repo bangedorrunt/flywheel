@@ -244,7 +244,16 @@ pub(crate) fn cmd_send_rex(
                     ));
                 }
             }
-        } else if let Err(e) = backend.prompt(&target, &send_text, None) {
+        } else if let Err(e) = {
+            crate::pane_read::defer_if_operator_typing(
+                &crate::pane_read::PlaneReader(&*backend),
+                &crate::pane_read::harness_of(project, &target),
+                &target,
+                project,
+            )
+            .map_err(anyhow::Error::msg)?;
+            backend.prompt(&target, &send_text, None)
+        } {
             let err = format!("{e}");
             // Steering friction observed live: a working pane refuses the
             // prompt with no next step in the message. Name the queued door

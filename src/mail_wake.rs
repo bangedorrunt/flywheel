@@ -323,6 +323,18 @@ fn poll_once(
             WakePlan::Ring(row) => row,
         };
         let text = wake_text(project, &pin, row);
+        // bd-0uzrq.3: the operator types in these panes too. A typed deferral is
+        // the existing "not promptable — retry later" path, so the row stays.
+        if let Err(deferred) = crate::pane_read::defer_if_operator_typing_strict(
+            &crate::pane_read::PlaneReader(&*backend),
+            &crate::pane_read::harness_of(project, &entry.pane_id),
+            &entry.pane_id,
+            project,
+        ) {
+            last_try.insert(pin.clone(), Instant::now());
+            eprintln!("flywheel mail-wake: {pin} {deferred}");
+            continue;
+        }
         match backend.prompt(&entry.pane_id, &text, None) {
             Ok(_) => {
                 high_water.0.insert(pin.clone(), row.created_ts_us);

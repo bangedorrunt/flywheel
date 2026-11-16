@@ -280,11 +280,15 @@ tests = [
   "src/pane_screen_corpus.rs::every_captured_screen_classifies",
   "src/pane_screen_corpus.rs::an_uncaptured_harness_is_unknown_and_does_not_block",
   "src/inbox_ports.rs::pane_screen_defers_a_typed_box_and_types_nothing",
+  "src/cmd/crew.rs::pane_screen_crew_prompt_defers_on_a_typed_box",
+  "src/pane_read.rs::pane_screen_every_prompt_door_asks_the_input_guard",
 ]
 mutations = [
   "scripts/mutations/pane-screen-input-guard.spec.sh#G1",
   "scripts/mutations/pane-screen-input-guard.spec.sh#G2",
   "scripts/mutations/pane-screen-input-guard.spec.sh#G3",
+  "scripts/mutations/pane-screen-input-guard.spec.sh#G4",
+  "scripts/mutations/pane-screen-input-guard.spec.sh#G5",
 ]
 
 [[behavior]]

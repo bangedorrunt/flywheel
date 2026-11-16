@@ -526,7 +526,7 @@ isolate_if_shared() {
                 ;;
         esac
     done
-    echo "verify-mutations: scratch export $export (the shared tree is read only)"
+    echo "verify-mutations: scratch export $export (the shared tree is read only)" >&2
     cd "$export" || exit 2
     VERIFY_MUTATIONS_IN_EXPORT=1 exec bash "$export/scripts/verify-mutations.sh" "${out_args[@]}"
 }
@@ -546,7 +546,7 @@ usage() {
 
 main() {
     local spec=""
-    isolate_if_shared "$@"
+    local original=("$@")
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --self-test) self_test; exit $? ;;
@@ -568,6 +568,12 @@ main() {
         echo "a spec file is required unless --self-test is given" >&2
         usage >&2
         exit 2
+    fi
+
+    # --list executes nothing, so it must not pay for (or print about) an
+    # export: its output is parsed by machine callers.
+    if [ "${LIST_ONLY:-0}" != 1 ]; then
+        isolate_if_shared "${original[@]}"
     fi
 
     load_spec "$spec"

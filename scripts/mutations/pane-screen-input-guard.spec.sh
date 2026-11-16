@@ -26,3 +26,21 @@ mutation "G3  ring_wake ignores the captured input line" \
     expect=pane_screen_defers_a_typed_box_and_types_nothing \
     find='    if !crate::pane_screen::may_inject(input) {' \
     replace='    if false {'
+
+mutation "G4  the crew prompt types over a typed box" \
+    file=src/cmd/crew.rs \
+    expect=pane_screen_crew_prompt_defers_on_a_typed_box \
+    find='    crate::pane_read::defer_if_operator_typing(reader, harness, target, project)?;' \
+    replace='    let _ = (reader, harness, target, project);'
+
+mutation "G5  the send door stops asking the guard" \
+    file=src/cmd/send.rs \
+    expect=pane_screen_every_prompt_door_asks_the_input_guard \
+    find='crate::pane_read::defer_if_operator_typing(
+                &crate::pane_read::PlaneReader(&*backend),
+                &crate::pane_read::harness_of(project, &target),
+                &target,
+                project,
+            )
+            .map_err(anyhow::Error::msg)?;' \
+    replace='// mutation: the send door no longer asks the operator-typing guard'
