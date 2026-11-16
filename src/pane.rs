@@ -5871,12 +5871,10 @@ steps:
             env_pin.is_none(),
             "pi delivers its model by argv, so both planes carry it in the command: {env_pin:?}"
         );
-        let pane_env: BTreeMap<String, String> = [(
-            "FLYWHEEL_AGENT".to_string(),
-            "Ada".to_string(),
-        )]
-        .into_iter()
-        .collect();
+        let pane_env: BTreeMap<String, String> =
+            [("FLYWHEEL_AGENT".to_string(), "Ada".to_string())]
+                .into_iter()
+                .collect();
 
         // hc hands (kind, args) to the pane API; rex renders the same pair.
         let hc_command: Vec<String> = std::iter::once("pi".to_string())
@@ -5884,10 +5882,7 @@ steps:
             .collect();
         let rex = rex_env_command(&pane_env, "pi", &args);
         // Transport differs (rex prefixes `env K=V`); the COMMAND must not.
-        let rex_tail: Vec<&str> = rex
-            .split_whitespace()
-            .skip_while(|t| *t != "pi")
-            .collect();
+        let rex_tail: Vec<&str> = rex.split_whitespace().skip_while(|t| *t != "pi").collect();
         assert_eq!(
             rex_tail.join(" "),
             hc_command.join(" "),
