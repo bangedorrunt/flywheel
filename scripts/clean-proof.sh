@@ -320,10 +320,17 @@ run_step verify-needles bash scripts/verify-needles.sh || true
 # tests/adr0027_slice1 refuses an installed toron on purpose — it needs the
 # PINNED sibling built at ../toron/target/debug/toron. Build the export's
 # sibling, never the host's.
+#
+# bd-proof-toron-bin: the mutation stage below runs in verify-mutations' own
+# scratch export, whose ../toron symlink points at the WORKSPACE tree, not this
+# export. Hand it the CLI this step built, or adr0027-s1-receipts fails only
+# inside the proof.
+TORON_BIN_BUILT=""
 if [ ! -f "$TMP/toron/Cargo.toml" ]; then
   echo "clean-proof: no sibling toron to build; integration tests that need it are ignored"
 elif [ -z "$FAILED_STEP" ]; then
   run_step sibling-toron "${MBX[@]}" build --manifest-path "$TMP/toron/Cargo.toml" -p toron-cli || true
+  [ -x "$TMP/toron/target/debug/toron" ] && TORON_BIN_BUILT="$TMP/toron/target/debug/toron"
 fi
 [ -n "$FAILED_STEP" ] || run_step suite "${MBX[@]}" test -p flywheel --tests || true
 [ -n "$FAILED_STEP" ] || run_step workflow-verify \
@@ -393,7 +400,9 @@ if [ -n "$MUTATIONS_MODE" ] && [ -z "$FAILED_STEP" ]; then
     # The proof build is -D warnings; a mutation deliberately leaves dead code
     # (that is what killing a guard looks like), so the witness run must not
     # inherit it or every such mutation reports BUILD-BROKEN.
-    RUSTFLAGS="" bash scripts/verify-mutations.sh "$spec" --cargo "$wrapper" \
+    proof_env=(RUSTFLAGS="")
+    [ -n "$TORON_BIN_BUILT" ] && proof_env+=("TORON_BIN=$TORON_BIN_BUILT")
+    env "${proof_env[@]}" bash scripts/verify-mutations.sh "$spec" --cargo "$wrapper" \
       --cache-key "$mut_key" --cache-dir "$CACHE_DIR" \
       --json-out "$TMP/mut-rows.$mut_ran.jsonl" >"$TMP/mutations-$mut_ran.log" 2>&1
     mut_status=$?

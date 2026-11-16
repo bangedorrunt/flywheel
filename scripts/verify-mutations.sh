@@ -579,8 +579,22 @@ isolate_if_shared() {
                 ;;
         esac
     done
+    # bd-proof-toron-bin: a caller (clean-proof) may hand us the sibling CLI it
+    # BUILT. That path is outside this export and must survive the re-exec
+    # unchanged; the export's own ../toron link points at the workspace tree,
+    # which is not built. An empty value is not a path, so it is never passed.
+    local toron_bin=""
+    if [ -n "${TORON_BIN:-}" ]; then
+        case "$TORON_BIN" in
+            /*) toron_bin="$TORON_BIN" ;;
+            *) toron_bin="$PWD/$TORON_BIN" ;;
+        esac
+    fi
     echo "verify-mutations: scratch export $export (the shared tree is read only)" >&2
     cd "$export" || exit 2
+    if [ -n "$toron_bin" ]; then
+        TORON_BIN="$toron_bin" VERIFY_MUTATIONS_IN_EXPORT=1 exec bash "$export/scripts/verify-mutations.sh" "${out_args[@]}"
+    fi
     VERIFY_MUTATIONS_IN_EXPORT=1 exec bash "$export/scripts/verify-mutations.sh" "${out_args[@]}"
 }
 

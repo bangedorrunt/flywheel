@@ -25,6 +25,37 @@ fn proof_suite_step_runs_the_tests_directory() {
     );
 }
 
+/// bd-proof-toron-bin: the suite step builds the pinned sibling toron and the
+/// tests that need it pass; the mutation stage runs in verify-mutations' own
+/// scratch export, whose ../toron link points at the WORKSPACE tree. Proven at
+/// f5971320: adr0027-s1-receipts passed the suite and its mutation control
+/// panicked with "toron CLI not found at <export>/flywheel/../toron/...".
+/// clean-proof must hand the built path to the mutation stage, and the
+/// isolation re-exec must keep it absolute.
+#[test]
+fn proof_mutation_stage_hands_the_built_toron_to_the_mutations() {
+    let clean = std::fs::read_to_string(format!("{}/scripts/clean-proof.sh", root()))
+        .expect("scripts/clean-proof.sh");
+    assert!(
+        clean.contains(r#"TORON_BIN_BUILT="$TMP/toron/target/debug/toron""#),
+        "clean-proof must remember the sibling CLI it built"
+    );
+    assert!(
+        clean.contains(r#"[ -n "$TORON_BIN_BUILT" ] && proof_env+=("TORON_BIN=$TORON_BIN_BUILT")"#),
+        "the mutation stage must receive TORON_BIN"
+    );
+    assert!(
+        clean.contains(r#"env "${proof_env[@]}" bash scripts/verify-mutations.sh"#),
+        "and that environment must be the one the harness runs under"
+    );
+    let harness = std::fs::read_to_string(format!("{}/scripts/verify-mutations.sh", root()))
+        .expect("scripts/verify-mutations.sh");
+    assert!(
+        harness.contains(r#"TORON_BIN="$toron_bin" VERIFY_MUTATIONS_IN_EXPORT=1 exec"#),
+        "the isolation re-exec must keep the caller's absolute TORON_BIN"
+    );
+}
+
 /// The reservation board's fence (bd-0uzrq.12): the Rust fix lives in toron
 /// (@51e27bde, pinned), and this model is what says a truncated read may not
 /// grant. TLC runs in verify-formal, not in this gate, so this pins the two

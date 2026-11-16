@@ -1059,3 +1059,17 @@ tests = [
 mutations = [
   "scripts/mutations/adr0022-gates.spec.sh#A3",
 ]
+
+[[behavior]]
+id = "proof.mutation-stage-gets-the-built-toron"
+owner = "scripts/clean-proof.sh"
+status = "proven"
+concurrent = false
+tests = [
+  "tests/proof_steps.rs::proof_mutation_stage_hands_the_built_toron_to_the_mutations",
+  "tests/proof_steps.rs::proof_verify_mutations_never_edits_the_shared_tree",
+]
+mutations = [
+  "scripts/mutations/proof-suite-and-isolation.spec.sh#T1",
+  "scripts/mutations/proof-suite-and-isolation.spec.sh#T2",
+]

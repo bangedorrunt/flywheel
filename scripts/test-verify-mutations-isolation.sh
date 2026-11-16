@@ -35,6 +35,9 @@ git commit -qm init
 
 cat >"$TMP/bin/fakecargo" <<'STUB'
 #!/usr/bin/env bash
+# bd-proof-toron-bin: record what the isolated child saw, so the caller can
+# prove the built sibling CLI survived the re-exec as an absolute path.
+[ -n "${SEE_TORON_FILE:-}" ] && printf '%s\n' "${TORON_BIN:-}" >"$SEE_TORON_FILE"
 if grep -q MUTATED src/a.rs 2>/dev/null; then
   printf 'running 1 test\ntest result: FAILED. 0 passed; 1 failed\nfailures:\n    some_test\n'
   exit 101
@@ -50,7 +53,11 @@ sum_before="$(sum_of)"
 mtime_before="$(mtime_of)"
 sleep 1
 
-out="$(bash "$ROOT/scripts/verify-mutations.sh" spec.sh --cargo "$TMP/bin/fakecargo" 2>&1)" \
+mkdir -p "$TMP/fake-toron"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$TMP/fake-toron/toron"
+chmod +x "$TMP/fake-toron/toron"
+out="$(TORON_BIN="$TMP/fake-toron/toron" SEE_TORON_FILE="$TMP/seen-toron" \
+  bash "$ROOT/scripts/verify-mutations.sh" spec.sh --cargo "$TMP/bin/fakecargo" 2>&1)" \
   || { printf '%s\n' "$out" | tail -20 >&2; fail "the harness exited non-zero"; }
 
 [ "$(sum_of)" = "$sum_before" ] || fail "the harness changed src/a.rs in the caller's tree"
@@ -64,3 +71,8 @@ pass "the run happened in its own scratch export"
 printf '%s\n' "$out" | grep -q "RED" \
   || fail "the mutation did not prove RED in the export: $(printf '%s\n' "$out" | tail -8)"
 pass "the mutation still proves RED inside the export"
+
+seen="$(cat "$TMP/seen-toron" 2>/dev/null || true)"
+[ "$seen" = "$TMP/fake-toron/toron" ] \
+  || fail "the isolated child saw TORON_BIN='${seen}', not the caller's absolute build"
+pass "the scratch export kept the caller's absolute TORON_BIN"
