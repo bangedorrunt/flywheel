@@ -206,3 +206,72 @@ fn mutation_specs_run_newest_change_first() {
         "the most recently changed spec runs first"
     );
 }
+
+/// A proof of one sha must run THAT sha's driver (bd-jp9z1.3 follow-up).
+/// Otherwise another lane's uncommitted edit to clean-proof.sh silently changes
+/// what a receipt of an older sha checks, and a proof of a tree without a new
+/// step dies on the working copy's version of it.
+#[test]
+fn a_sha_proof_runs_the_revisions_own_driver() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let scripts = dir.path().join("scripts");
+    std::fs::create_dir_all(&scripts).unwrap();
+    let real_driver = std::fs::read_to_string(repo_root().join("scripts/clean-proof.sh")).unwrap();
+    let real_lib = std::fs::read_to_string(repo_root().join("scripts/proof-lib.sh")).unwrap();
+    std::fs::write(scripts.join("proof-lib.sh"), &real_lib).unwrap();
+    // The committed driver announces itself once it is actually running.
+    let marker = "echo 'REV-DRIVER-RAN' >&2\n";
+    let at = real_driver
+        .find("\n# shellcheck source=proof-lib.sh")
+        .expect("the snapshot block is followed by the library source line")
+        + 1;
+    let committed = format!("{}{}{}", &real_driver[..at], marker, &real_driver[at..]);
+    std::fs::write(scripts.join("clean-proof.sh"), &committed).unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "t@example.com"],
+        vec!["config", "user.name", "T"],
+        vec!["add", "scripts"],
+        vec!["commit", "-q", "-m", "driver at the proven rev"],
+    ] {
+        assert!(
+            Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let rev = String::from_utf8(
+        Command::new("git")
+            .current_dir(dir.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    // The working tree now carries a driver WITHOUT the marker: the copy a
+    // buggy snapshot would run.
+    std::fs::write(scripts.join("clean-proof.sh"), &real_driver).unwrap();
+
+    let lock = dir.path().join("clean-proof.lock");
+    let out = Command::new("bash")
+        .arg(scripts.join("clean-proof.sh"))
+        .args(["--sha", &rev, "--lock-hold-test", "0"])
+        .env("CLEAN_PROOF_LOCK_FILE", &lock)
+        .output()
+        .expect("run clean-proof");
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        err.contains(&format!("driver from {rev}")),
+        "the driver source sha is named: {err}"
+    );
+    assert!(
+        err.contains("REV-DRIVER-RAN"),
+        "the revision's driver actually ran, not the working tree's: {err}"
+    );
+}

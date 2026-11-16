@@ -87,12 +87,40 @@ fi
 if [ "${CLEAN_PROOF_SNAPSHOTTED:-}" != 1 ]; then
   SNAP_BASE="${CLEAN_PROOF_SNAPSHOT_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/clean-proof-driver.XXXXXX")}"
   mkdir -p "$SNAP_BASE/scripts"
-  cp "$SELF_PATH" "$SNAP_BASE/scripts/clean-proof.sh"
-  cp "$SELF_DIR/proof-lib.sh" "$SNAP_BASE/scripts/proof-lib.sh"
+  # Which driver runs is part of the proof (bd-jp9z1.3 follow-up). A proof of
+  # one sha must verdict that sha's own driver: the working tree may carry
+  # another lane's uncommitted edit to this script or to its helpers, and then
+  # the receipt would describe code nobody proved. --sha/--head take the driver
+  # from the revision; only the dirty-tree mode runs the working copy.
+  DRIVER_ARG=""
+  prev=""
+  for arg in "$@"; do
+    case "$prev" in
+      --sha) DRIVER_ARG="$arg" ;;
+    esac
+    case "$arg" in
+      --head) DRIVER_ARG="HEAD" ;;
+    esac
+    prev="$arg"
+  done
+  if [ -n "$DRIVER_ARG" ]; then
+    DRIVER_SHA="$(git -C "$ROOT" rev-parse "$DRIVER_ARG^{commit}" 2>/dev/null)" \
+      || die "rev not found for the driver: $DRIVER_ARG"
+    git -C "$ROOT" show "$DRIVER_SHA:scripts/clean-proof.sh" >"$SNAP_BASE/scripts/clean-proof.sh" 2>/dev/null \
+      || die "no scripts/clean-proof.sh at $DRIVER_SHA"
+    git -C "$ROOT" show "$DRIVER_SHA:scripts/proof-lib.sh" >"$SNAP_BASE/scripts/proof-lib.sh" 2>/dev/null \
+      || die "no scripts/proof-lib.sh at $DRIVER_SHA"
+  else
+    DRIVER_SHA=""
+    cp "$SELF_PATH" "$SNAP_BASE/scripts/clean-proof.sh"
+    cp "$SELF_DIR/proof-lib.sh" "$SNAP_BASE/scripts/proof-lib.sh"
+  fi
   chmod +x "$SNAP_BASE/scripts/clean-proof.sh"
   export CLEAN_PROOF_SNAPSHOTTED=1
   export CLEAN_PROOF_REPO_ROOT="$ROOT"
   export CLEAN_PROOF_SNAPSHOT_DIR="$SNAP_BASE"
+  export CLEAN_PROOF_DRIVER_SHA="$DRIVER_SHA"
+  echo "clean-proof: driver from ${DRIVER_SHA:-the working tree}" >&2
   exec /bin/bash "$SNAP_BASE/scripts/clean-proof.sh" "$@"
 fi
 

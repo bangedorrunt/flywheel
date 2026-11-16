@@ -53,3 +53,9 @@ mutation "N7  the mutation loop ignores the recency order" \
     expect=mutation_specs_run_newest_change_first \
     find='done < <(ordered_specs)' \
     replace='done < <(printf "%s\n" scripts/mutations/*.spec.sh)'
+
+mutation "N8  the proof runs the working tree's driver again" \
+    file=$PROOF \
+    expect=a_sha_proof_runs_the_revisions_own_driver \
+    find='  if [ -n "$DRIVER_ARG" ]; then' \
+    replace='  if false; then'

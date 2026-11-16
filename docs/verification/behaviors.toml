@@ -658,3 +658,13 @@ mutations = [
   "scripts/mutations/mail-init.spec.sh#M1",
   "scripts/mutations/mail-init.spec.sh#M2",
 ]
+
+[[behavior]]
+id = "proof.driver-from-the-proven-sha"
+owner = "scripts/clean-proof.sh"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/clean_proof.rs::a_sha_proof_runs_the_revisions_own_driver",
+]
+mutations = ["scripts/mutations/proof-fail-fast.spec.sh#N8"]

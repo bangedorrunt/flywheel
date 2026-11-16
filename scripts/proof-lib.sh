@@ -91,7 +91,8 @@ proof_write_receipt() {
   PROOF_RECEIPT="$1" PROOF_OK="$2" PROOF_SHA="$3" PROOF_SHORT="$4" \
   PROOF_STAMP="$5" PROOF_MODE="$6" PROOF_TMP="$7" PROOF_FAILED="$8" \
   PROOF_STEPS="$9" PROOF_STATUSES="${10}" PROOF_SIBLINGS="${11}" \
-  PROOF_MUTATIONS_FILE="${12}" python3 - <<'PY'
+  PROOF_MUTATIONS_FILE="${12}" \
+  PROOF_DRIVER_SHA="${CLEAN_PROOF_DRIVER_SHA:-}" python3 - <<'PY'
 import json, os
 
 def lines(key):
@@ -130,6 +131,9 @@ receipt = {
     "sha": os.environ["PROOF_SHA"],
     "short": os.environ["PROOF_SHORT"],
     "mode": os.environ["PROOF_MODE"],
+    # bd-jp9z1.3 follow-up: the revision the driver scripts came from. None in
+    # dirty-tree mode, where the working copy is the input by definition.
+    "driver_sha": os.environ.get("PROOF_DRIVER_SHA") or None,
     "stamp": os.environ["PROOF_STAMP"],
     "steps": steps,
     "failed_step": os.environ.get("PROOF_FAILED") or None,
