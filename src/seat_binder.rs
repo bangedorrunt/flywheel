@@ -20,8 +20,10 @@ pub struct StepNeed {
     /// StageMode vocabulary (`read-only` | `workspace-write` | `isolated`).
     pub mode: Option<String>,
     pub context: StageContext,
-    /// Pin that authored the work a review/verify step checks.
-    pub reviews_author: Option<String>,
+    /// Pins that authored the work a review/verify step checks (the steps its
+    /// stage contract `reads` were bound to). Empty = no author constraint.
+    #[serde(default)]
+    pub reviews_author: std::collections::BTreeSet<String>,
 }
 
 /// Where a live seat runs.
@@ -98,7 +100,7 @@ fn matches(need: &StepNeed, seat: &LiveSeat) -> bool {
 }
 
 fn is_author(need: &StepNeed, pin: &str) -> bool {
-    need.reviews_author.as_deref() == Some(pin)
+    need.reviews_author.contains(pin)
 }
 
 fn diff_fields(need: &StepNeed, seat: &LiveSeat) -> Vec<String> {
@@ -228,7 +230,7 @@ mod tests {
             model: None,
             mode: None,
             context,
-            reviews_author: None,
+            reviews_author: std::collections::BTreeSet::new(),
         }
     }
 
@@ -347,13 +349,17 @@ mod tests {
             fresh_session: false,
             idle_since_ms: None,
         }];
-        assert_eq!(bind(&need, &seats, &policy(2, false)), Binding::Spawn);
+        let got = bind(&need, &seats, &policy(2, false));
+        assert!(
+            matches!(got, Binding::Spawn | Binding::Wait { .. }),
+            "every seat is an author, so never Reuse: {got:?}"
+        );
     }
 
     #[test]
     fn seat_binder_reviewer_never_author() {
         let mut need = need("reviewer", StageContext::Warm);
-        need.reviews_author = Some("a".to_string());
+        need.reviews_author.insert("a".to_string());
         let seats = vec![seat("a", "reviewer", true, false)];
         let got = bind(&need, &seats, &policy(2, false));
         assert_ne!(
@@ -365,6 +371,24 @@ mod tests {
         assert_eq!(got, Binding::Spawn);
     }
 
+    /// bd-6setu.2: the author set is a SET — a review step refuses every pin
+    /// bound to a step it reads, not just the first one.
+    #[test]
+    fn seat_binder_reviewer_refuses_every_author_in_the_set() {
+        let mut need = need("reviewer", StageContext::Warm);
+        need.reviews_author.insert("a".to_string());
+        need.reviews_author.insert("b".to_string());
+        let seats = vec![
+            seat("a", "reviewer", true, false),
+            seat("b", "reviewer", true, false),
+        ];
+        let got = bind(&need, &seats, &policy(2, false));
+        assert!(
+            matches!(got, Binding::Spawn | Binding::Wait { .. }),
+            "every seat is an author, so never Reuse: {got:?}"
+        );
+    }
+
     #[test]
     fn seat_binder_mismatch_gives_patch_naming_fields() {
         let need = StepNeed {
@@ -374,7 +398,7 @@ mod tests {
             model: Some("m2".to_string()),
             mode: Some("isolated".to_string()),
             context: StageContext::Warm,
-            reviews_author: None,
+            reviews_author: std::collections::BTreeSet::new(),
         };
         let seats = vec![LiveSeat {
             pin: "a".to_string(),

@@ -1612,7 +1612,7 @@ pub(crate) fn review_bind(
         model,
         mode: None,
         context: crate::stages::StageContext::Fresh,
-        reviews_author: author_pin,
+        reviews_author: author_pin.into_iter().collect(),
     };
     Some(crate::seat_binder::bind(
         &need,
