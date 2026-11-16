@@ -462,6 +462,8 @@ tests = [
   "src/cmd/ship.rs::land_refuses_a_repo_whose_dir_is_not_its_toron_slug",
   "src/cmd/ship.rs::a_receipt_without_mutation_witnesses_cannot_land",
   "src/cmd/ship.rs::a_receipt_is_bound_to_the_commit_it_proved",
+  "src/cmd/ship.rs::a_receipt_for_a_descendant_of_the_citing_commit_lands",
+  "src/cmd/ship.rs::the_gate_note_binds_the_citing_sha_and_records_the_proven_one",
 ]
 mutations = [
   "scripts/mutations/ship-land-project.spec.sh#L1",
@@ -471,6 +473,9 @@ mutations = [
   "scripts/mutations/ship-land-project.spec.sh#L5",
   "scripts/mutations/ship-land-project.spec.sh#L6",
   "scripts/mutations/ship-land-project.spec.sh#L7",
+  "scripts/mutations/ship-land-project.spec.sh#L8",
+  "scripts/mutations/ship-land-project.spec.sh#L9",
+  "scripts/mutations/ship-land-project.spec.sh#L10",
 ]
 
 [[behavior]]

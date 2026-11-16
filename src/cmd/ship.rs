@@ -484,6 +484,37 @@ fn base_is_a_commit(root: &Path, rev: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The sha a green receipt proved, when it carries one.
+fn receipt_proven_sha(receipt: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(receipt).ok()?;
+    let doc: Value = serde_json::from_str(&raw).ok()?;
+    doc.get("sha").and_then(Value::as_str).map(str::to_string)
+}
+
+/// Is `ancestor` contained in `descendant`? The one git question the
+/// descendant rule asks (bd-0uzrq.22): a proof of a later tree also proves the
+/// commits it contains.
+fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> bool {
+    Command::new("git")
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .current_dir(dir)
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// The gate note for one landing (bd-0uzrq.22). It LEADS with the citing sha —
+/// `note_binding` reads that token, and `ledger check` keys the whole verdict on
+/// it — then records the sha the receipt actually proved, so a reader can see
+/// both halves of a descendant landing.
+fn gate_note(sha: &str, proved: &str, cmd: &str, receipt: &Path) -> String {
+    format!(
+        "sha={sha} proved={proved} cmd={cmd} exit=0 tail={} receipt={}",
+        receipt.display(),
+        receipt.display()
+    )
+}
+
 fn receipt_is_landable(root: &Path, receipt: &Path, sha: &str) -> Result<()> {
     let raw = std::fs::read_to_string(receipt)
         .map_err(|e| anyhow!("proof receipt unreadable: {}: {e}", receipt.display()))?;
@@ -502,9 +533,14 @@ fn receipt_is_landable(root: &Path, receipt: &Path, sha: &str) -> Result<()> {
     // dirty tree, a temporary commit nobody can check out) says nothing about
     // the sha being landed.
     let proved = doc.get("sha").and_then(Value::as_str).unwrap_or("");
-    if proved != sha {
+    // bd-0uzrq.22: one proof lands every bead its tree contains. The citing sha
+    // (the commit that names the bead, which `br close --commit-sha` validates)
+    // may be an ANCESTOR of the proven sha: a later proof covers it. A receipt
+    // that does not contain the citing commit still proves a different tree and
+    // is refused.
+    if proved != sha && !is_ancestor(root, sha, proved) {
         bail!(
-            "proof receipt proves {proved}, not {sha}: {} — re-prove this commit \
+            "proof receipt proves {proved}, which does not contain {sha}: {} — re-prove at or after {sha} \
              (`scripts/clean-proof.sh --sha {sha} --mutations changed`)",
             receipt.display()
         );
@@ -656,13 +692,8 @@ fn ship_land(args: LandArgs<'_>) -> Result<()> {
                 .map(|(value, _)| value)
                 .unwrap_or("verify")
                 .replace(' ', "_");
-            let note = format!(
-                "sha={} cmd={} exit=0 tail={} receipt={}",
-                plan.sha,
-                cmd,
-                plan.receipt.display(),
-                plan.receipt.display()
-            );
+            let proved = receipt_proven_sha(&plan.receipt).unwrap_or_else(|| plan.sha.clone());
+            let note = gate_note(&plan.sha, &proved, &cmd, &plan.receipt);
             run_tool(
                 &dir,
                 "br",
@@ -1016,6 +1047,111 @@ mod tests {
             receipt_is_landable(repo.path(), &bogus_base, &sha).unwrap_err()
         );
         assert!(err.contains("not a commit here"), "{err}");
+    }
+
+    /// bd-0uzrq.22: the gate note binds the CITING sha (the token
+    /// `note_binding` and `ledger check` read) and records the proven sha
+    /// beside it, so a descendant landing shows both halves.
+    #[test]
+    fn the_gate_note_binds_the_citing_sha_and_records_the_proven_one() {
+        let citing = "a".repeat(40);
+        let proven = "b".repeat(40);
+        let note = super::gate_note(
+            &citing,
+            &proven,
+            "cargo_test",
+            std::path::Path::new("/r.json"),
+        );
+        assert!(
+            note.starts_with(&format!("sha={citing}")),
+            "the note must LEAD with the citing sha: {note}"
+        );
+        assert!(note.contains(&format!("proved={proven}")), "{note}");
+        assert!(note.contains("cmd=cargo_test exit=0"), "{note}");
+        assert_eq!(
+            crate::verdict::note_binding(&note),
+            crate::verdict::NoteBinding::Bound(citing),
+            "the binding is the citing sha, never the proven one"
+        );
+    }
+
+    /// bd-0uzrq.22: a proof of a LATER tree lands every bead whose citing
+    /// commit it contains. The citing sha is the one `br close` validates
+    /// (it must name the bead); the receipt may prove any descendant of it,
+    /// because that tree contains the citing commit's work. A receipt that
+    /// does not contain the citing commit is still a different tree.
+    #[test]
+    fn a_receipt_for_a_descendant_of_the_citing_commit_lands() {
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join("scripts/mutations")).unwrap();
+        std::fs::write(
+            repo.path().join("scripts/mutations/demo.spec.sh"),
+            "mutation \"D1  a decision\" \\\n    file=src/x.rs \\\n    find='a' \\\n    replace='b' \\\n    expect=a_test\n",
+        )
+        .unwrap();
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/verify-mutations.sh"),
+            repo.path().join("scripts/verify-mutations.sh"),
+        )
+        .expect("the land gate re-derives targets with the real harness");
+        let commit = |message: &str| {
+            assert!(
+                Command::new("git")
+                    .current_dir(repo.path())
+                    .args(["-c", "user.email=t@example.com", "-c", "user.name=T"])
+                    .args(["commit", "-q", "--allow-empty", "-m", message])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            String::from_utf8(
+                Command::new("git")
+                    .current_dir(repo.path())
+                    .args(["rev-parse", "HEAD"])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_string()
+        };
+        assert!(
+            Command::new("git")
+                .current_dir(repo.path())
+                .args(["init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let base = commit("base");
+        let citing = commit("fix: the cited work (bd-0uzrq.22)");
+        let proven = commit("chore: a later proof target");
+        let receipt = |proved_sha: &str| {
+            let path = repo
+                .path()
+                .join(format!("receipt-{}.json", &proved_sha[..7]));
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"ok":true,"sha":"{proved_sha}","mode":"sha","mutations":[{{"spec":"demo.spec.sh","id":"D1","expect_test":"a_test","expect_green":false,"verdict":"RED"}}],"mutations_mode":"changed","mutations_base":"{base}","changed_paths":["src/other.rs"]}}"#
+                ),
+            )
+            .unwrap();
+            path
+        };
+
+        receipt_is_landable(repo.path(), &receipt(&proven), &citing)
+            .expect("a receipt proving a descendant of the citing commit lands");
+
+        let err = format!(
+            "{:#}",
+            receipt_is_landable(repo.path(), &receipt(&citing), &proven).unwrap_err()
+        );
+        assert!(
+            err.contains("does not contain") && err.contains(&citing[..7]),
+            "a receipt for an EARLIER commit does not contain the citing one: {err}"
+        );
     }
 
     #[test]

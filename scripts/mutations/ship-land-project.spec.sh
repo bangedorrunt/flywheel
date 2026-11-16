@@ -42,11 +42,29 @@ mutation "L4  a mutation that stayed green still lands" \
     find='        if verdict != want {' \
     replace='        if false {'
 
-mutation "L5  the receipt is not bound to the landed sha" \
+mutation "L5  a descendant proof no longer lands its ancestors" \
     file=$SHIP \
-    expect=a_receipt_is_bound_to_the_commit_it_proved \
-    find='    if proved != sha {' \
+    expect=a_receipt_for_a_descendant_of_the_citing_commit_lands \
+    find='    if proved != sha && !is_ancestor(root, sha, proved) {' \
+    replace='    if proved != sha {'
+
+mutation "L8  any receipt lands, even one for an earlier tree" \
+    file=$SHIP \
+    expect=a_receipt_for_a_descendant_of_the_citing_commit_lands \
+    find='    if proved != sha && !is_ancestor(root, sha, proved) {' \
     replace='    if false {'
+
+mutation "L9  the ancestry test runs the wrong way" \
+    file=$SHIP \
+    expect=a_receipt_for_a_descendant_of_the_citing_commit_lands \
+    find='    if proved != sha && !is_ancestor(root, sha, proved) {' \
+    replace='    if proved != sha && !is_ancestor(root, proved, sha) {'
+
+mutation "L10  the gate note leads with the proven sha" \
+    file=$SHIP \
+    expect=the_gate_note_binds_the_citing_sha_and_records_the_proven_one \
+    find='        "sha={sha} proved={proved} cmd={cmd} exit=0 tail={} receipt={}",' \
+    replace='        "proved={proved} sha={sha} cmd={cmd} exit=0 tail={} receipt={}",'
 
 mutation "L6  an empty mutation set lands without re-deriving the targets" \
     file=$SHIP \
