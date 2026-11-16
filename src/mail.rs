@@ -443,6 +443,37 @@ impl Mail {
     }
 }
 
+/// Who a reply goes to when the caller names nobody: the parent's sender.
+fn reply_sender(parent: Option<&Value>) -> Option<Vec<String>> {
+    parent
+        .and_then(|r| r.get("sender").or_else(|| r.get("from")))
+        .and_then(|s| s.as_str())
+        .map(|s| vec![s.to_string()])
+}
+
+/// `Re: <parent subject>` (c3b.5); empty when the parent is gone, so the wire
+/// builder still carries the subject field.
+fn reply_subject(parent: Option<&Value>) -> String {
+    match parent.and_then(|r| r["subject"].as_str()) {
+        Some(subj) if !subj.is_empty() => format!("Re: {subj}"),
+        _ => String::new(),
+    }
+}
+
+/// bd-0qsc1: a reply joins the PARENT's thread. Threading on the replied
+/// message's own id starts a fresh thread per message, so a waiter on the
+/// parent thread never sees the answer (live 2026-11-16: eleven copies of one
+/// collab question). A parent with no thread of its own is a thread of one,
+/// and only then does the message id become the anchor.
+fn reply_thread(parent: Option<&Value>, message_id: &str) -> String {
+    parent
+        .and_then(|r| r.get("thread_id"))
+        .and_then(|t| t.as_str())
+        .filter(|t| !t.is_empty())
+        .unwrap_or(message_id)
+        .to_string()
+}
+
 /// bd-vhia: `sqlx::migrate!` reports a store written by a NEWER embedded toron
 /// as "migration 10 was previously applied but is missing in the resolved
 /// migrations". That error names neither the store nor the remedy, and the
@@ -1556,7 +1587,8 @@ impl Mail {
         Ok(out)
     }
 
-    /// `reply_message` (threaded).
+    /// `reply_message` (threaded). One parent lookup backs the recipients, the
+    /// subject and the thread, so the three cannot disagree about the parent.
     pub fn reply(
         &self,
         project_key: &str,
@@ -1564,10 +1596,12 @@ impl Mail {
         body: &str,
         to: Option<&[String]>,
     ) -> Result<Value> {
+        let parent = self.parent_row(project_key, message_id)?;
         let to: Option<Vec<String>> = match to {
             Some(t) if !t.is_empty() => Some(t.to_vec()),
-            _ => self.parent_sender(project_key, message_id)?,
+            _ => reply_sender(parent.as_ref()),
         };
+        let thread = reply_thread(parent.as_ref(), message_id);
         match &self.backend {
             BackendKind::InProcess => {
                 let result = block_on(mailbox().reply_message(&SendMessage {
@@ -1576,7 +1610,7 @@ impl Mail {
                     to: to.clone().unwrap_or_default(),
                     subject: String::new(),
                     body_md: body.to_string(),
-                    thread_id: Some(message_id.to_string()),
+                    thread_id: Some(thread.clone()),
                     ..Default::default()
                 }))?;
                 Ok(result.to_json())
@@ -1587,58 +1621,18 @@ impl Mail {
                     project_key,
                     &self.name,
                     &to.unwrap_or_default(),
-                    &self.parent_reply_subject(project_key, message_id)?,
+                    &reply_subject(parent.as_ref()),
                     body,
                     "thread_id",
-                    json!(message_id),
+                    json!(thread),
                 ),
             ),
         }
     }
 
-    /// Resolve the sender of the message being replied to (for toron, which
-    /// requires explicit reply recipients). Looks the parent up in the
-    /// project inbox; returns `None` when the parent cannot be found (the
-    /// caller then fails with a clear message instead of a silent drop).
-    fn parent_sender(&self, project_key: &str, message_id: &str) -> Result<Option<Vec<String>>> {
-        let v = self.inbox_filtered(
-            project_key,
-            &self.name,
-            &MailInboxFilter {
-                unread_only: false,
-                include_bodies: false,
-                limit: 100,
-                ..Default::default()
-            },
-        )?;
-        let arr = v.as_array().cloned().unwrap_or_default();
-        for m in &arr {
-            let id = m
-                .get("id")
-                .or_else(|| m.get("message_id"))
-                .and_then(|i| i.as_str());
-            let thread = m.get("thread_id").and_then(|t| t.as_str());
-            if id == Some(message_id) || thread == Some(message_id) {
-                let sender = m
-                    .get("sender")
-                    .or_else(|| m.get("from"))
-                    .and_then(|s| s.as_str())
-                    .map(String::from);
-                if sender.is_some() {
-                    return Ok(sender.map(|s| vec![s]));
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    /// c3b.5: resolve the `Re: <parent subject>` subject for a reply. Looks
-    /// the parent up in the project inbox (the message being replied to must
-    /// be visible to this identity); falls back to `""` when the parent
-    /// cannot be found — the wire builder still carries the subject field, so
-    /// the hardcoded-empty contract is gone. Works for BOTH backends (the
-    /// inbox fetch is the common projection).
-    fn parent_reply_subject(&self, project_key: &str, message_id: &str) -> Result<String> {
+    /// The parent row of a reply, looked up once in the project inbox (the
+    /// message being replied to must be visible to this identity).
+    fn parent_row(&self, project_key: &str, message_id: &str) -> Result<Option<Value>> {
         let v = self.inbox_filtered(
             project_key,
             &self.name,
@@ -1649,15 +1643,14 @@ impl Mail {
                 ..Default::default()
             },
         )?;
-        let parent = v.as_array().and_then(|rs| {
-            rs.iter().find(|r| {
-                r["id"].as_str() == Some(message_id) || r["thread_id"].as_str() == Some(message_id)
-            })
-        });
-        Ok(match parent.and_then(|r| r["subject"].as_str()) {
-            Some(subj) if !subj.is_empty() => format!("Re: {subj}"),
-            _ => String::new(),
-        })
+        Ok(v.as_array().and_then(|rows| {
+            rows.iter()
+                .find(|r| {
+                    r["id"].as_str() == Some(message_id)
+                        || r["thread_id"].as_str() == Some(message_id)
+                })
+                .cloned()
+        }))
     }
 
     /// `summarize_thread`.
@@ -4600,5 +4593,36 @@ mod mail_door_tests {
         );
         unsafe { std::env::remove_var("TORON_DATA_DIR") };
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// bd-0qsc1: a reply joins the PARENT's thread, not a new thread keyed by
+    /// its own message id. Live 2026-11-16: a collab waiter on thread T never
+    /// saw the answer because the reply was stored under thread_id = parent
+    /// message id, so the sender flooded T with 11 copies of one question.
+    #[test]
+    fn a_reply_inherits_the_parent_thread() {
+        let parent = serde_json::json!({
+            "id": "msg-7",
+            "thread_id": "collab-20261116T110100739-34451",
+            "sender": "SlateHarbor",
+            "subject": "Re: bd-nwfj7 ledger illegality",
+        });
+        assert_eq!(
+            reply_thread(Some(&parent), "msg-7"),
+            "collab-20261116T110100739-34451",
+            "the reply must stay in the parent thread"
+        );
+    }
+
+    /// A parent with no thread of its own is a thread of one: the message id
+    /// is the only stable anchor the store gives us, and that is the fallback,
+    /// never the default.
+    #[test]
+    fn a_reply_to_a_threadless_message_is_its_own_thread() {
+        let parent = serde_json::json!({ "id": "msg-8", "thread_id": null });
+        assert_eq!(reply_thread(Some(&parent), "msg-8"), "msg-8");
+        let empty = serde_json::json!({ "id": "msg-9", "thread_id": "" });
+        assert_eq!(reply_thread(Some(&empty), "msg-9"), "msg-9");
+        assert_eq!(reply_thread(None, "msg-10"), "msg-10");
     }
 }
