@@ -377,7 +377,8 @@ Every row below was checked by grepping the named test and mutation at `3af56271
 | V1 reachable / can-finish / bounded | `flywheel workflow verify` (catalog + hand charts) | `S1`, `C1`, `R1`, `W1`, `L1`, `F1` in `adr0021-gates.spec.sh` | closed as a GRAPH check; no TLC proof runs (honesty note above) |
 | V2 Jev failure never blocks Resolve | `plan_machine_jev_timeout_reaches_resolved_then_awaiting`, `plan_machine_jev_rate_limited_reaches_resolved`, `plan_machine_jev_missing_key_reaches_resolved`, `plan_machine_jev_shrug_reaches_resolved` | `adr0022-gates V2` | closed (bd-6setu.7) |
 | V3 a blocked seat never launches | `plan_gate_blocked_with_yes_asks_and_names_remedy`, `plan_gate_blocked_names_every_blocked_seat_field` | `D5` | closed |
-| V4 no false green (adapter × field) | `harness_default_plan_says_honored_and_the_launch_injects_nothing` | none | **open: bd-6setu.8** |
+| V4 no false green (adapter × field) | `harness_default_plan_says_honored_and_the_launch_injects_nothing`, `every_harness_field_is_honored_iff_the_launch_emits_it` (the property over the whole table) | `v4-adapter-property V4` | closed by bd-6setu.8 |
+| V4 extension — headless step-phase resolution | `headless_step_fields_match_the_leaf_argv` (what the step resolves IS the leaf argv) | `headless-phase-argv H4` | closed by bd-6setu.14 |
 | V5 env-delivered model never relaunches | `seat_reconcile_env_model_gives_respawn_fresh` | `V5` | closed |
 | V6 no hop on Timeout/Unknown/empty evidence | `timeout_alone_never_allows_rebind`, `billing_with_evidence_allows_profile_hop` | `adr0022-gates V6` | closed (bd-6setu.7) |
 | V7 precedence is never inverted | `prefer_spawn_user_model_wins`, `seat_reconcile_precedence_harness_model_one_respawn` | `D2` | closed for user > preference; stage/profile/slot/Jev rows ride the same resolver |
@@ -390,13 +391,13 @@ Every row below was checked by grepping the named test and mutation at `3af56271
 
 | # | Claim | Witness | Status |
 |---|---|---|---|
-| 1 | `spawn --gemini --model gemini-2.5-pro` shows honored and the argv carries it; `--harness fx` shows blocked | `harness_default_plan_says_honored_and_the_launch_injects_nothing` (honored half) | **partial: bd-6setu.10** — the gemini/fx pair is not pinned |
+| 1 | `spawn --gemini --model gemini-2.5-pro` shows honored and the argv carries it; `--harness fx` shows blocked | `acceptance1_gemini_honored_fx_blocked` (both halves, one test) | closed, `acceptance1-harness-pair A1` |
 | 2 | `briefing --json` lists Jev-filled fields with provenance and non-empty consent | `attach_consent_plan` + `needs_consent_lists_jev_field` | closed by narrowing (bd-6setu.11): no confidence field, because no consumer reads one |
 | 3 | a harness patch re-filters the model and clears the entry | `plan_patch_harness_refilters_model_and_clears_consent` | closed, mutation `A3` |
 | 4 | a remembered preference suppresses the question | `prefer_spawn_model_from_preference` | closed, mutation `D6` |
-| 5 | a 429 on an env-pinned seat respawns, keeps pin and reservations, journals one `RebindIntent` | `billing_with_evidence_allows_profile_hop`, `is_rate_limited_detects_429` | **partial: bd-6setu.12** — the end-to-end respawn+journal row is not witnessed |
-| 6 | a `beads-lifecycle` audit step binds to another seat, and a different model family when one is registered | `seat_binder_reviewer_never_author` | **partial: bd-6setu.13** — the lifecycle-step and family halves are not witnessed |
+| 5 | a 429 on an env-pinned seat respawns, keeps pin and reservations, journals one `RebindIntent` | `acceptance5_429_respawn_journals_one_rebind_intent_and_keeps_the_pin` (end to end), `billing_with_evidence_allows_profile_hop`, `is_rate_limited_detects_429` | closed, `acceptance5-429-hop A5` |
+| 6 | a `beads-lifecycle` audit step binds to another seat, and a different model family when one is registered | `acceptance6_lifecycle_audit_binds_a_non_author_and_another_family` (the step, the seat, the family), `seat_binder_reviewer_never_author` | closed, `acceptance6-audit-binding A6` |
 | 7 | V1–V11 pass; `verify-clippy.sh` and `clean-proof.sh --tests` pass | this table | **open where the rows above are open** |
 
-What this map does not claim: a green row means a witness exists and a named mutation was seen RED; it does not mean the behaviour is right, and the four `open`/`partial` rows above are exactly the places a reviewer should look first.
+What this map does not claim: a green row means a witness exists and a named mutation was seen RED; it does not mean the behaviour is right. The `open`/`partial` rows are the places a reviewer should look first, and no row is closed by prose — each names the spec-qualified mutant that must go RED.
 
