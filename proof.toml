@@ -12,7 +12,7 @@
 
 [[sibling]]
 path = "../toron"
-rev = "4eb57bac1fc7e9b5ece630c84197ef5a451f6f85"
+rev = "cf52d28ba417d65f4a97e7a215e5e7535f8c49fe"
 
 [[sibling]]
 path = "../elm-effect-rs"

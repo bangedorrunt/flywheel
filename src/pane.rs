@@ -1600,7 +1600,6 @@ pub(crate) fn review_bind(
     if let Some(pin) = explicit_author.or_else(|| author.and_then(|e| e.mail_identity.clone())) {
         authors.insert(pin);
     }
-    let author_pin = authors.iter().next().cloned();
     let author_model = author.and_then(|e| e.model.clone().or_else(|| e.model_pin.clone()));
     let candidates: Vec<String> = seats
         .iter()
