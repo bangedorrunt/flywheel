@@ -646,6 +646,13 @@ steps:
     spec:
       profile: "@oracle"
       task: "Synthesize the scout findings: {{steps.scout-fanout}}. Rank by EV + project-fit. Pick the SINGLE best improvement idea (feature / design pattern / bug fix). Output JSON: {\"idea\": {\"title\": ..., \"what\": ..., \"why\": ..., \"ev\": ..., \"blast_radius\": ..., \"acceptance\": ...}} — or {\"idea\": null} if nothing worth proposing (honest, not forced)."
+  # reflect edge (wave 6, OFF by default — bd-w6-reflect-8gp5): uncomment to
+  # append the reflect playbook to the weekly review so repeated corrections
+  # become structure (a hook bead, never an AGENTS.md paragraph).
+  # - name: reflect
+  #   action: call_workflow
+  #   workflow: reflect
+  #   inputs: { project: "{{trigger.project}}", run_id: "{{trigger.id}}" }
 "#,
     ),
     (
@@ -4197,8 +4204,8 @@ graph:
             .unwrap();
         assert!(yaml.contains("reflect edge (wave 6, OFF by default"));
         assert!(
-            yaml.contains("#     action: call_workflow"),
-            "edge is commented out"
+            yaml.contains("#   action: call_workflow"),
+            "edge is commented out (steps form: the comment IS the step)"
         );
     }
 
