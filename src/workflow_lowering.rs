@@ -1094,8 +1094,7 @@ steps:
     }
 
     /// bd-36zlq: bd-ge1zo retired the marker polls, so wave-swarm lowers with
-    /// ZERO long-hold warnings. That is the precondition for deleting the
-    /// hand-written `SwarmLifecycle` statechart.
+    /// ZERO long-hold warnings.
     #[test]
     fn workflow_lowering_wave_swarm_has_no_long_hold() {
         let wf = crate::builtin_workflows::builtin_workflows()

@@ -272,6 +272,28 @@ tests = [
 mutations = ["scripts/mutations/clean-proof-slot.spec.sh#S1", "scripts/mutations/clean-proof-slot.spec.sh#S2"]
 
 [[behavior]]
+id = "adr0021.gates-witnessed"
+owner = "src/adr0021_gates.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/adr0021_gates.rs::adr0021_shape_lint_refuses_a_fanout_without_parallel",
+  "src/adr0021_gates.rs::adr0021_compose_override_wins_from_the_upper_tier",
+  "src/adr0021_gates.rs::adr0021_reads_lint_refuses_a_missing_read",
+  "src/adr0021_gates.rs::adr0021_witness_exit_refuses_an_empty_report",
+  "src/adr0021_gates.rs::adr0021_lowering_flags_an_unbounded_wait",
+  "src/adr0021_gates.rs::adr0021_plan_fence_never_converges_on_a_changed_digest",
+]
+mutations = [
+  "scripts/mutations/adr0021-gates.spec.sh#S1",
+  "scripts/mutations/adr0021-gates.spec.sh#C1",
+  "scripts/mutations/adr0021-gates.spec.sh#R1",
+  "scripts/mutations/adr0021-gates.spec.sh#W1",
+  "scripts/mutations/adr0021-gates.spec.sh#L1",
+  "scripts/mutations/adr0021-gates.spec.sh#F1",
+]
+
+[[behavior]]
 id = "awareness.gone-pin-ring-resolves"
 owner = "crates/doorbell-rt/src/brain.rs"
 status = "proven"

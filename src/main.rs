@@ -13,6 +13,7 @@
 
 #![cfg_attr(not(feature = "serve"), allow(dead_code))]
 
+mod adr0021_gates;
 mod agent_ref;
 mod agentstate;
 #[cfg_attr(not(test), allow(dead_code))]
