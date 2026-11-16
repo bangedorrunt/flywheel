@@ -1166,14 +1166,31 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                     }
                 })
             });
-            let (key, queue_thread) = match class {
-                EventClass::PlanePMail | EventClass::PlanePUrgent => {
-                    (message_id.unwrap_or(event_id), thread)
-                }
-                _ => (event_id, None),
+            let mail = matches!(class, EventClass::PlanePMail | EventClass::PlanePUrgent);
+            // A mail wake without a message id (replayed pre-mid events) has no
+            // identity the inbox row can match, so a ring built here could only
+            // double-ring the same mail later. The fetch carries the id; it owns
+            // that delivery.
+            let unidentified_mail = mail && message_id.is_none();
+            let (key, queue_thread) = if unidentified_mail {
+                (String::new(), None)
+            } else if mail {
+                (message_id.unwrap_or_else(|| event_id.clone()), thread)
+            } else {
+                (event_id.clone(), None)
             };
             let line_out = doorbell_line(class, &hint);
             for pin in watch_targets(line, &next.index) {
+                if unidentified_mail {
+                    actions.push(DoorbellAction::Audit {
+                        kind: "unidentified_mail_wake".into(),
+                        pin: pin.clone(),
+                        detail: format!(
+                            "event {event_id} carries no message id; the inbox fetch owns this mail"
+                        ),
+                    });
+                    continue;
+                }
                 route_or_queue(
                     &mut next,
                     &mut actions,
@@ -1583,6 +1600,119 @@ mod tests {
                 .queues
                 .get("BlueRidge")
                 .is_none_or(std::vec::Vec::is_empty)
+        );
+    }
+
+    /// bd-0uzrq.23: a drained deferred wake already rang the mail, so the inbox
+    /// fetch that returns the SAME message must not prompt again — the drain's
+    /// key has to be in the rung set the inbox path consults.
+    #[test]
+    fn drained_deferred_wake_does_not_ring_again_from_the_inbox_row() {
+        let mut model = model_with("BlueRidge");
+        model.statuses.insert("BlueRidge".into(), "working".into());
+        let line = r#"{"kind":9,"id":"ev1","tags":[["p","BlueRidge"],["toron-kind","mail-delivered"],["mid","msg-1"],["h","t-1"]],"content":"sealed"}"#;
+        let (queued, actions) = tick(&model, &DoorbellMsg::WatchNdjson { line: line.into() });
+        assert!(
+            matches!(&actions[0], DoorbellAction::Audit { kind, .. } if kind == "queued"),
+            "{actions:?}"
+        );
+        let (rung, drain) = tick(
+            &queued,
+            &DoorbellMsg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+        );
+        assert!(
+            drain
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { .. })),
+            "the drain rings: {drain:?}"
+        );
+        let row = serde_json::json!({
+            "id": "msg-1",
+            "thread_id": "t-1",
+            "from": "SlateHarbor",
+            "subject": "hi",
+            "tags": [["toron-kind", "mail-delivered"]],
+        });
+        let (_, again) = tick(
+            &rung,
+            &DoorbellMsg::InboxRows {
+                rows: vec![row],
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert!(
+            !again
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { .. })),
+            "the consumed mail must not ring again: {again:?}"
+        );
+    }
+
+    /// bd-0uzrq.23: a replayed pre-mid wake carries no message id, so its only
+    /// key would be the event id — a value the inbox row can never match. It
+    /// must not queue a ring the fetch cannot dedup: the fetch (which has real
+    /// ids) delivers that mail exactly once.
+    #[test]
+    fn an_unidentified_mail_wake_is_left_to_the_inbox_fetch() {
+        let mut model = model_with("BlueRidge");
+        model.statuses.insert("BlueRidge".into(), "idle".into());
+        let line = r#"{"kind":9,"id":"ev-old","tags":[["p","BlueRidge"],["toron-kind","mail-delivered"],["h","t-1"]],"content":"sealed"}"#;
+        let (queued, actions) = tick(&model, &DoorbellMsg::WatchNdjson { line: line.into() });
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { .. })),
+            "an unidentified mail wake must not ring: {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Audit { kind, .. } if kind == "unidentified_mail_wake")),
+            "the skip is audited, never silent: {actions:?}"
+        );
+        assert!(
+            queued
+                .queues
+                .get("BlueRidge")
+                .is_none_or(std::vec::Vec::is_empty),
+            "an unidentified mail wake must not sit in the queue: {actions:?}"
+        );
+        let row = serde_json::json!({
+            "id": "msg-1",
+            "thread_id": "t-1",
+            "from": "SlateHarbor",
+            "subject": "hi",
+        });
+        let (after, first) = tick(
+            &queued,
+            &DoorbellMsg::InboxRows {
+                rows: vec![row.clone()],
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert_eq!(
+            first
+                .iter()
+                .filter(|a| matches!(a, DoorbellAction::Prompt { .. }))
+                .count(),
+            1,
+            "the fetch rings the mail once: {first:?}"
+        );
+        let (_, again) = tick(
+            &after,
+            &DoorbellMsg::InboxRows {
+                rows: vec![row],
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert!(
+            !again
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { .. })),
+            "the same fetch must not ring twice: {again:?}"
         );
     }
 
@@ -2493,7 +2623,7 @@ mod tests {
     #[test]
     fn doorbell_tick_mail_delivered_pulls_inbox_not_channel() {
         let model = model_with("BlueRidge");
-        let line = r#"{"kind":9,"id":"aa","tags":[["p","BlueRidge"],["toron-kind","mail-delivered"],["h","t-1"]],"content":"sealed"}"#;
+        let line = r#"{"kind":9,"id":"aa","tags":[["p","BlueRidge"],["toron-kind","mail-delivered"],["h","t-1"],["mid","msg-1"]],"content":"sealed"}"#;
         let (_, actions) = tick(&model, &DoorbellMsg::WatchNdjson { line: line.into() });
         assert_eq!(actions.len(), 1);
         match &actions[0] {
