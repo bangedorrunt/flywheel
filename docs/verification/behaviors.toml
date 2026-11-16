@@ -1099,6 +1099,7 @@ tests = [
 mutations = [
   "scripts/mutations/proof-suite-and-isolation.spec.sh#T1",
   "scripts/mutations/proof-suite-and-isolation.spec.sh#T2",
+  "scripts/mutations/proof-suite-and-isolation.spec.sh#T3",
 ]
 
 [[behavior]]

@@ -327,12 +327,23 @@ run_step verify-needles bash scripts/verify-needles.sh || true
 # scratch export, whose ../toron symlink points at the WORKSPACE tree, not this
 # export. Hand it the CLI this step built, or adr0027-s1-receipts fails only
 # inside the proof.
+#
+# The path handed over must be a file the PROOF owns. In the export,
+# toron/target is a symlink into mbx's shared cache, and mbx evicts that
+# directory while a multi-hour proof runs: proof38 handed over a path that
+# dangled by the time the mutation stage reached it ("run failed: NotFound" at
+# tests/adr0027_slice1.rs:121). Copy the binary out first, then hand over the
+# copy.
 TORON_BIN_BUILT=""
 if [ ! -f "$TMP/toron/Cargo.toml" ]; then
   echo "clean-proof: no sibling toron to build; integration tests that need it are ignored"
 elif [ -z "$FAILED_STEP" ]; then
   run_step sibling-toron "${MBX[@]}" build --manifest-path "$TMP/toron/Cargo.toml" -p toron-cli || true
-  [ -x "$TMP/toron/target/debug/toron" ] && TORON_BIN_BUILT="$TMP/toron/target/debug/toron"
+  if [ -x "$TMP/toron/target/debug/toron" ]; then
+    mkdir -p "$TMP/bin"
+    cp "$TMP/toron/target/debug/toron" "$TMP/bin/toron"
+    TORON_BIN_BUILT="$TMP/bin/toron"
+  fi
 fi
 [ -n "$FAILED_STEP" ] || run_step suite "${MBX[@]}" test -p flywheel --tests || true
 [ -n "$FAILED_STEP" ] || run_step workflow-verify \

@@ -33,3 +33,14 @@ mutation "T2  the isolation re-exec drops the built toron" \
     expect=proof_mutation_stage_hands_the_built_toron_to_the_mutations \
     find='        TORON_BIN="$toron_bin" VERIFY_MUTATIONS_IN_EXPORT=1 exec bash' \
     replace='        VERIFY_MUTATIONS_IN_EXPORT=1 exec bash'
+
+# bd-proof-toron-bin, second half: the handed-over path must be a file the proof
+# OWNS. toron/target in the export is a symlink into mbx's shared cache, which
+# mbx evicts mid-proof (proof38: "run failed: NotFound"). T3 hands over the
+# target path again.
+
+mutation "T3  the built toron is handed over from the evictable target dir" \
+    file=scripts/clean-proof.sh \
+    expect=proof_mutation_stage_hands_the_built_toron_to_the_mutations \
+    find='    TORON_BIN_BUILT="$TMP/bin/toron"' \
+    replace='    TORON_BIN_BUILT="$TMP/toron/target/debug/toron"'

@@ -36,9 +36,21 @@ fn proof_suite_step_runs_the_tests_directory() {
 fn proof_mutation_stage_hands_the_built_toron_to_the_mutations() {
     let clean = std::fs::read_to_string(format!("{}/scripts/clean-proof.sh", root()))
         .expect("scripts/clean-proof.sh");
+    // The handed-over path must be a file the PROOF owns. In the export,
+    // toron/target is a symlink into mbx's shared cache, which mbx evicts
+    // during a multi-hour proof: proof38 handed over a path that dangled
+    // ("run failed: NotFound" at tests/adr0027_slice1.rs:121).
     assert!(
-        clean.contains(r#"TORON_BIN_BUILT="$TMP/toron/target/debug/toron""#),
-        "clean-proof must remember the sibling CLI it built"
+        clean.contains(r#"cp "$TMP/toron/target/debug/toron" "$TMP/bin/toron""#),
+        "clean-proof must copy the built CLI out of the evictable target dir"
+    );
+    assert!(
+        clean.contains(r#"TORON_BIN_BUILT="$TMP/bin/toron""#),
+        "and hand over the copy, not a path inside the shared cache"
+    );
+    assert!(
+        !clean.contains(r#"TORON_BIN_BUILT="$TMP/toron/target/debug/toron""#),
+        "the target path may dangle by the time the mutation stage runs"
     );
     assert!(
         clean.contains(r#"[ -n "$TORON_BIN_BUILT" ] && proof_env+=("TORON_BIN=$TORON_BIN_BUILT")"#),
