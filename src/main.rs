@@ -10028,7 +10028,12 @@ mod recover_session_loss_tests {
             recover_seats(&fleet, &cfg, "demo", &ws_id, Some(&panes), &entries, false).expect("seats");
         assert_eq!(rep.skipped_captain, vec!["flywheel-demo-oc".to_string()]);
         assert_eq!(rep.healthy, 0, "every crew pane is gone, none healthy");
-        assert_eq!(rep.recovered.len(), 2, "both crew pins respawn: {rep:?}", rep = rep.recovered);
+        assert_eq!(
+            rep.recovered.len(),
+            2,
+            "both crew pins respawn: {rep:?}",
+            rep = rep.recovered
+        );
         for row in &rep.recovered {
             assert_eq!(row["action"], "respawned");
             assert_eq!(row["kind"], "opencode");
@@ -10041,7 +10046,11 @@ mod recover_session_loss_tests {
             Some("FrostyCreek"),
             "the pin identity survives the respawn"
         );
-        assert_eq!(after[1].profile.as_deref(), Some("coder"), "role bind survives");
+        assert_eq!(
+            after[1].profile.as_deref(),
+            Some("coder"),
+            "role bind survives"
+        );
         assert_eq!(after[1].name, "flywheel-demo-job");
     }
 }
