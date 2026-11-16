@@ -3,10 +3,15 @@
 //!
 //! governed-by: ADR-0005
 
+#[path = "../src/test_sandbox.rs"]
+mod test_sandbox;
+
+use test_sandbox::TestSandbox;
+
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::sync::Arc;
 
 fn repo_root() -> PathBuf {
@@ -74,10 +79,11 @@ fn sc_d10_loop_playbook_is_not_a_five_min_poll() {
 /// arrives via a 20001 self-attest line (first stdin line).
 #[test]
 fn sc_d1_kind9_at_pin_is_routine_without_prompt() {
+    let sandbox = TestSandbox::new();
     let presence = r#"{"kind":20001,"tags":[["p","BlueRidge"]],"content":"idle"}"#;
     let kind9 = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["h","steer-x"]],"content":"@BlueRidge hi"}"#;
     let stdin = format!("{presence}\n{kind9}");
-    let stdout = run_doorbell_once(&stdin, &["BlueRidge=idle", "LilacChapel=idle"]);
+    let stdout = run_doorbell_once(&sandbox, &stdin, &["BlueRidge=idle", "LilacChapel=idle"]);
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).unwrap_or(serde_json::json!(null));
     assert_eq!(
@@ -97,13 +103,14 @@ fn sc_d1_kind9_at_pin_is_routine_without_prompt() {
 /// ADR-0010 D3: trusted presence via 20001 self-attest first.
 #[test]
 fn sc_d1_kind9_live_npub_p_tag_urgent_rings() {
+    let sandbox = TestSandbox::new();
     let npub = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
     let presence = r#"{"kind":20001,"tags":[["p","BlueRidge"]],"content":"idle"}"#;
     let kind9 = format!(
         r#"{{"kind":9,"id":"ab","tags":[["p","{npub}"],["toron-kind","ack-sla-expired"],["h","steer-x"]],"content":"@BlueRidge hi"}}"#
     );
     let stdin = format!("{presence}\n{kind9}");
-    let stdout = run_doorbell_once(&stdin, &["BlueRidge=idle", "LilacChapel=idle"]);
+    let stdout = run_doorbell_once(&sandbox, &stdin, &["BlueRidge=idle", "LilacChapel=idle"]);
     assert!(
         stdout.contains("[doorbell]"),
         "urgent npub line must become a doorbell, got {stdout}"
@@ -115,8 +122,9 @@ fn sc_d1_kind9_live_npub_p_tag_urgent_rings() {
 /// SC-D1 / SC-D3: working pin is queued, not injected (no interrupt).
 #[test]
 fn sc_d1_working_pin_is_not_injected() {
+    let sandbox = TestSandbox::new();
     let line = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"]],"content":"@BlueRidge hi"}"#;
-    let stdout = run_doorbell_once(line, &["BlueRidge=working"]);
+    let stdout = run_doorbell_once(&sandbox, line, &["BlueRidge=working"]);
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).unwrap_or(serde_json::json!(null));
     assert_eq!(
@@ -126,8 +134,8 @@ fn sc_d1_working_pin_is_not_injected() {
     );
 }
 
-fn run_doorbell_once(stdin_line: &str, status: &[&str]) -> String {
-    let mut cmd = Command::new(flywheel());
+fn run_doorbell_once(sandbox: &TestSandbox, stdin_line: &str, status: &[&str]) -> String {
+    let mut cmd = sandbox.command(flywheel());
     cmd.args([
         "__doorbell",
         "--project",
@@ -471,13 +479,14 @@ fn sc_kill_stops_doorbell() {
 /// Captain CLI still offers spawn, loop, and the integration commands.
 #[test]
 fn captain_triggers_spawn_loop_and_integration_exist() {
+    let sandbox = TestSandbox::new();
     let exe = flywheel();
     for (args, needle) in [
         (["spawn", "--help"].as_slice(), "profile"),
         (["loop-mode", "--help"].as_slice(), "work"),
         (["integration", "--help"].as_slice(), "kind"),
     ] {
-        let out = Command::new(exe).args(args).output().expect("help");
+        let out = sandbox.command(exe).args(args).output().expect("help");
         assert!(
             out.status.success(),
             "{} --help failed: {}",
@@ -536,13 +545,14 @@ fn toron_bin() -> PathBuf {
     sibling
 }
 
-fn toron_run(data_dir: &Path, args: &[&str]) -> Output {
-    Command::new(toron_bin())
+fn toron_run(sandbox: &TestSandbox, data_dir: &Path, args: &[&str]) -> Output {
+    sandbox
+        .command(toron_bin())
         .args(args)
         .arg("--json")
         .arg("--no-input")
+        .env("TORON_DATA_DIR", data_dir)
         .env("TORON_MCP_DATA_DIR", data_dir)
-        .env_remove("TORON_MCP_URL")
         .env("TORON_WAKE_SOCK", data_dir.join("wake.sock"))
         .output()
         .unwrap_or_else(|e| panic!("spawn toron {}: {e}", toron_bin().display()))
@@ -595,10 +605,12 @@ async fn sc_d1_live_kind9_channel_post_rings() {
     let target = "PaleHarbor";
     let project = "doorbell-live";
     let channel = format!("steer-d1-{}", std::process::id());
-    let dir = std::env::temp_dir().join(format!("fw-sc-d1-live-{}", std::process::id()));
+    let sandbox = TestSandbox::new();
+    let dir = sandbox.root().join("toron-live");
     live_mailbox(&dir, project, &[poster, target]).await;
 
     let created = toron_run(
+        &sandbox,
         &dir,
         &[
             "channel",
@@ -618,6 +630,7 @@ async fn sc_d1_live_kind9_channel_post_rings() {
         String::from_utf8_lossy(&created.stderr)
     );
     let joined = toron_run(
+        &sandbox,
         &dir,
         &[
             "channel",
@@ -637,6 +650,7 @@ async fn sc_d1_live_kind9_channel_post_rings() {
 
     let body = format!("@{target} take the repro");
     let posted = toron_run(
+        &sandbox,
         &dir,
         &[
             "channel",
@@ -665,6 +679,7 @@ async fn sc_d1_live_kind9_channel_post_rings() {
     assert_ne!(npub, target, "p-tag must not be the pin name");
 
     let watched = toron_run(
+        &sandbox,
         &dir,
         &[
             "watch",
@@ -713,6 +728,7 @@ async fn sc_d1_live_kind9_channel_post_rings() {
         let presence = format!(r#"{{"kind":20001,"tags":[["p","{target}"]],"content":"idle"}}"#);
         let stdin = format!("{presence}\n{line}");
         run_doorbell_once(
+            &sandbox,
             &stdin,
             &[&format!("{target}=idle"), &format!("{poster}=idle")],
         )
@@ -724,7 +740,6 @@ async fn sc_d1_live_kind9_channel_post_rings() {
         serde_json::json!([]),
         "bd-l72k: live routine line spends zero prompts, got {stdout}"
     );
-    let _ = fs::remove_dir_all(&dir);
 }
 
 /// bd-swad: `doorbell why` is the trust surface, so a tear has to arrive with
@@ -737,9 +752,8 @@ async fn sc_d1_live_kind9_channel_post_rings() {
 /// machine and a CI runner are both in.
 #[test]
 fn doorbell_why_names_the_tear_size_end_to_end() {
-    let dir = std::env::temp_dir().join(format!("fw-why-tear-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    let state = dir.join("state");
+    let sandbox = TestSandbox::new();
+    let state = sandbox.root().join("state");
     fs::create_dir_all(state.join("flywheel/journals")).expect("journals dir");
     let mut body = String::new();
     for seq in [1u64, 2, 3, 10, 11] {
@@ -753,11 +767,9 @@ fn doorbell_why_names_the_tear_size_end_to_end() {
     )
     .expect("write torn journal");
 
-    let out = Command::new(flywheel())
+    let out = sandbox
+        .command(flywheel())
         .args(["doorbell", "why", "probe", "SomePin"])
-        .env("XDG_STATE_HOME", &state)
-        .env("XDG_CONFIG_HOME", dir.join("config"))
-        .env("HOME", &dir)
         .output()
         .expect("flywheel doorbell why runs");
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -772,5 +784,4 @@ fn doorbell_why_names_the_tear_size_end_to_end() {
         "the tear line must carry its size, its range and the rows it hides, \
          not just that a tear exists: {stderr}"
     );
-    let _ = fs::remove_dir_all(&dir);
 }
