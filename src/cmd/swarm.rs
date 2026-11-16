@@ -154,7 +154,7 @@ fn cmd_swarm_plan(cfg: &Config, project: &str, args: PlanArgs) -> Result<()> {
 }
 
 /// One seat as the plan and the plane see it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SeatRow {
     pub pin: String,
     pub name: String,
@@ -291,6 +291,9 @@ pub(crate) fn cmd_swarm_apply(
     if patches.is_empty() && counts.is_empty() {
         bail!("swarm apply: pass --patch <seat>.<field>=<value> and/or --count <role>=<n>");
     }
+    // ADR-0022 D1: the plan is a durable object. A legacy swarm mints its record
+    // here, with the seats it runs right now as the base, so the fold is total.
+    let record = crate::state::ensure_plan(project, serde_json::to_value(&rows)?)?;
     let desired = patched_desired(&rows, patches, counts)?;
     let live: Vec<LiveSeat> = rows
         .iter()
@@ -329,8 +332,20 @@ pub(crate) fn cmd_swarm_apply(
         return Ok(());
     }
 
-    let mut journal =
-        crate::supervisor_host::ToronEffectJournal::open("swarm-apply", "swarm-apply")?;
+    // ADR-0022 D1: the event leads the effect. Append it to the plan's journal
+    // first, so a replay folds the same desired seats this call is about to run.
+    for spec in patches.iter() {
+        crate::state::append_plan_event(project, &format!("patch:{spec}"))?;
+    }
+    for spec in counts.iter() {
+        crate::state::append_plan_event(project, &format!("count:{spec}"))?;
+    }
+    // The replay check: the journal must fold to the seats this call decided.
+    let replay = fold_plan(&crate::state::load_plan(project).unwrap_or(record.clone()))?;
+    let mut journal = crate::supervisor_host::ToronEffectJournal::open(
+        &format!("plan:{}", record.id),
+        "swarm-apply",
+    )?;
     let mut ports = crate::supervisor_host::LivePorts::new(cfg, project, project);
     let rep = dispatch_effects(&mut journal, &mut ports, &applied);
     if rep.failed > 0 {
@@ -349,6 +364,8 @@ pub(crate) fn cmd_swarm_apply(
     if json {
         print_json(&json!({
             "project": project,
+            "plan_id": record.id,
+            "journal_matches": replay == desired,
             "effects": applied.iter().map(effect_json).collect::<Vec<_>>(),
             "ran": rep.ran,
             "skipped": rep.skipped,
@@ -577,6 +594,24 @@ fn effect_line(effect: &SeatEffect) -> String {
 
 /// Apply the patches to the desired rows. A patch matches a pin, a role, or a
 /// terminal name; an unknown seat fails naming the live ones.
+/// ADR-0022 D1 (bd-6setu.3): rebuild the desired seats from the plan's journal —
+/// its recorded base folded through every event — instead of from flags. This is
+/// the replay path: same pure function the live apply used, same answer.
+pub(crate) fn fold_plan(record: &crate::state::PlanRecord) -> Result<Vec<DesiredSeat>> {
+    let base: Vec<SeatRow> =
+        serde_json::from_value(record.base.clone().unwrap_or_else(|| json!([])))?;
+    let mut patches = Vec::new();
+    let mut counts = Vec::new();
+    for event in &record.patches {
+        if let Some(spec) = event.strip_prefix("patch:") {
+            patches.push(spec.to_string());
+        } else if let Some(spec) = event.strip_prefix("count:") {
+            counts.push(spec.to_string());
+        }
+    }
+    patched_desired(&base, &patches, &counts)
+}
+
 fn patched_desired(
     rows: &[SeatRow],
     patches: &[String],
@@ -1670,6 +1705,58 @@ mod tests {
                 key: "seat:keep:x".to_string(),
             },
             &mut rep,
+        );
+    }
+}
+
+#[cfg(test)]
+mod plan_journal_tests {
+    use super::{SeatRow, fold_plan, patched_desired};
+
+    fn row(pin: &str, role: &str) -> SeatRow {
+        SeatRow {
+            pin: pin.into(),
+            name: pin.into(),
+            role: role.into(),
+            harness: "pi".into(),
+            model: None,
+            effort: None,
+            mode: None,
+            pane_id: format!("{pin}-pane"),
+            status: "live".into(),
+        }
+    }
+
+    fn record_with(events: &[&str]) -> crate::state::PlanRecord {
+        crate::state::PlanRecord {
+            id: "plan-test".to_string(),
+            plan: crate::swarm_plan::Plan::new("swarm"),
+            base: Some(serde_json::to_value(vec![row("p1", "coder")]).unwrap()),
+            patches: events.iter().map(|e| (*e).to_string()).collect(),
+        }
+    }
+
+    /// ADR-0022 D1 (bd-6setu.3): the desired seats are the fold of the recorded
+    /// base and the journal's events, not a rebuild from flags.
+    #[test]
+    fn the_fold_rebuilds_the_desired_seats_from_the_journal() {
+        let base = vec![row("p1", "coder")];
+        assert_eq!(
+            fold_plan(&record_with(&[])).unwrap(),
+            patched_desired(&base, &[], &[]).unwrap(),
+            "with no events the fold is the recorded base"
+        );
+        let ask = "p1.model=zai/glm-5.3";
+        let folded = fold_plan(&record_with(&[&format!("patch:{ask}")])).unwrap();
+        assert_eq!(
+            folded,
+            patched_desired(&base, &[ask.to_string()], &[]).unwrap(),
+            "the event reaches the fold through the recorded base"
+        );
+        assert_ne!(
+            folded,
+            fold_plan(&record_with(&[])).unwrap(),
+            "a fold that ignores its events is not a replay"
         );
     }
 }

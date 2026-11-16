@@ -357,7 +357,11 @@ pub fn spawn_registry_file(project: &str) -> PathBuf {
 pub struct PlanRecord {
     pub id: String,
     pub plan: crate::swarm_plan::Plan,
-    /// `swarm apply` patch events, oldest first.
+    /// The seats the plan was resolved from (a legacy swarm's live seats, or the
+    /// resolved draft), so the fold has a base to replay the events onto.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<serde_json::Value>,
+    /// `swarm apply` events, oldest first: `patch:<spec>` / `count:<spec>`.
     #[serde(default)]
     pub patches: Vec<String>,
 }
@@ -402,8 +406,35 @@ pub fn record_plan(project: &str, plan: &crate::swarm_plan::Plan) -> anyhow::Res
             .map(|r| r.id.clone())
             .unwrap_or_else(mint_plan_id),
         plan: plan.clone(),
+        base: existing.as_ref().and_then(|r| r.base.clone()),
         patches: existing.map(|r| r.patches).unwrap_or_default(),
     };
+    save_plan(project, &record)?;
+    Ok(record)
+}
+
+/// The record a live change patches: the plan's own if it has one, otherwise a
+/// freshly minted one whose base is the seats the swarm runs right now — so the
+/// fold is total even for a swarm spawned before plans had ids.
+pub fn ensure_plan(project: &str, base: serde_json::Value) -> anyhow::Result<PlanRecord> {
+    let mut record = match load_plan(project) {
+        Some(record) => record,
+        None => record_plan(project, &crate::swarm_plan::Plan::new("swarm"))?,
+    };
+    if record.base.is_none() {
+        record.base = Some(base);
+        save_plan(project, &record)?;
+    }
+    Ok(record)
+}
+
+/// Append one plan event and persist it. Called BEFORE the seat effect, so the
+/// journal leads the world: a crash mid-apply leaves an event whose effect a
+/// replay can settle, never an effect nobody can name.
+pub fn append_plan_event(project: &str, event: &str) -> anyhow::Result<PlanRecord> {
+    let mut record = load_plan(project)
+        .ok_or_else(|| anyhow::anyhow!("append plan event: no plan record for {project}"))?;
+    record.patches.push(event.to_string());
     save_plan(project, &record)?;
     Ok(record)
 }
