@@ -133,6 +133,7 @@ impl HarnessCaps {
 /// injection row names one of these; a harness an operator adds names its own.
 const SINK_WITNESS: &str = "only_the_sink_types_into_panes";
 const SINK_SHAPE_WITNESS: &str = "every_pane_write_renders_a_constant_shape";
+#[cfg(test)]
 const FAKE_WITNESS: &str = "fake_harness_denies_once_and_types_no_interrupt";
 
 /// The capability shape every hc-driven harness carries: injection, interrupt
@@ -158,6 +159,11 @@ const fn hc_pane_caps(harness: &'static str) -> HarnessCaps {
 }
 
 /// Every registry harness as a capability row, canonical order.
+///
+/// The enumeration surface (ADR-0022 V4 walks it; `row()` answers one name).
+/// Nothing in the product loops it yet, so a non-test build would flag it —
+/// the same reason `harness_registry::all_spellings` carries the allow.
+#[allow(dead_code)]
 #[must_use]
 pub fn rows() -> Vec<HarnessCaps> {
     crate::harness_registry::REGISTRY
