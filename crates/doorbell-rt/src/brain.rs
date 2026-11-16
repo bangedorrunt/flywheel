@@ -834,6 +834,17 @@ impl<H: Host> Brain<H> {
         for pin in self.hear.expire(now, doorbell_core::UNANSWERED_SECS) {
             *self.deaf_attempts.entry(pin).or_insert(0) += 1;
         }
+        // A pin with no pane cannot hear: resolve its ring instead of letting
+        // it age into a permanent conflict (bd-3vkpe).
+        for pin in self.hear.retain_live(&self.host.live_pins()) {
+            self.deaf_attempts.remove(&pin);
+            self.journal(
+                &serde_json::json!({"rt_kind": "RingResolved"}),
+                &[],
+                serde_json::json!({"stage": "ring_resolved", "pin": pin, "why": "no pane, nothing to ring"}),
+                std::slice::from_ref(&pin),
+            );
+        }
         let unanswered = self.hear.unanswered_pins();
         self.deaf_attempts.retain(|pin, _| unanswered.contains(pin));
         // Post-start hear-map gap: the host index learns npubs after
@@ -3462,6 +3473,28 @@ impl HearTracker {
         self.unanswered.iter().cloned().collect()
     }
 
+    /// Resolve every ring for a pin that has no live pane: "no pane, nothing
+    /// to ring". A gone or retired pin can never answer, so its ring must not
+    /// sit in `unanswered` forever and page the captain every digest
+    /// (bd-3vkpe). Returns the pins it resolved (sorted).
+    pub fn retain_live(&mut self, live: &[String]) -> Vec<String> {
+        let live: BTreeSet<&String> = live.iter().collect();
+        let gone: Vec<String> = self
+            .pending
+            .keys()
+            .chain(self.unanswered.iter())
+            .filter(|pin| !live.contains(pin))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        for pin in &gone {
+            self.pending.remove(pin);
+            self.unanswered.remove(pin);
+        }
+        gone
+    }
+
     pub fn seed_unanswered(&mut self, pins: impl IntoIterator<Item = String>) {
         self.unanswered.extend(pins);
     }
@@ -3470,6 +3503,48 @@ impl HearTracker {
 #[cfg(test)]
 mod hear_tests {
     use super::*;
+
+    /// bd-3vkpe: a pin with no pane can never answer, so its ring is resolved
+    /// as "no pane, nothing to ring" — never an unanswered conflict that pages
+    /// the captain every digest. A live pin keeps its ring.
+    #[test]
+    fn a_gone_pins_ring_is_resolved_not_unanswered() {
+        let mut h = HearTracker::default();
+        h.note_inject("SunnyMarsh", None, 100);
+        h.note_inject("BoldBay", None, 100);
+        h.note_inject("CyanCove", None, 100);
+        assert_eq!(h.expire(100 + 120, 120).len(), 3, "all three aged out");
+        assert_eq!(h.unanswered_pins().len(), 3);
+
+        // Only CyanCove has a pane now; the other two are gone/retired.
+        let resolved = h.retain_live(&["CyanCove".to_string()]);
+        assert_eq!(
+            resolved,
+            vec!["BoldBay".to_string(), "SunnyMarsh".to_string()],
+            "both pin-less rings are resolved"
+        );
+        assert_eq!(
+            h.unanswered_pins(),
+            vec!["CyanCove".to_string()],
+            "the live pin keeps its ring: it can still answer"
+        );
+    }
+
+    /// The same rule applies to a ring still PENDING: a pin whose pane vanished
+    /// between inject and expiry is resolved at once, not left to age.
+    #[test]
+    fn a_pending_ring_for_a_gone_pin_is_resolved_early() {
+        let mut h = HearTracker::default();
+        h.note_inject("MistyMarsh", None, 100);
+        let resolved = h.retain_live(&["CyanCove".to_string()]);
+        assert_eq!(resolved, vec!["MistyMarsh".to_string()]);
+        assert!(h.unanswered_pins().is_empty(), "it never aged into deaf");
+        assert_eq!(
+            h.expire(100 + 120, 120),
+            Vec::<String>::new(),
+            "nothing left to expire"
+        );
+    }
 
     #[test]
     fn heard_clears_and_late_pubkey_clears_deaf() {

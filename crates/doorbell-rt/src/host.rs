@@ -126,6 +126,13 @@ pub trait Host: Send {
     fn pins(&self) -> Vec<String> {
         Vec::new()
     }
+    /// Pins with a pane to ring RIGHT NOW (bd-3vkpe). A ring for a pin with no
+    /// pane has nothing to ring, so it must never age into "unanswered". The
+    /// default is `pins()` — a host that cannot tell keeps today's behaviour
+    /// instead of silently dropping every wake.
+    fn live_pins(&self) -> Vec<String> {
+        self.pins()
+    }
     /// Npub for hear tracking (.5: SelfIndex; default unknown).
     fn pin_npub(&self, _pin: &str) -> Option<String> {
         None

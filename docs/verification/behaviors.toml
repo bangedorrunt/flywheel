@@ -272,6 +272,22 @@ tests = [
 mutations = ["scripts/mutations/clean-proof-slot.spec.sh#S1", "scripts/mutations/clean-proof-slot.spec.sh#S2"]
 
 [[behavior]]
+id = "awareness.gone-pin-ring-resolves"
+owner = "crates/doorbell-rt/src/brain.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "crates/doorbell-rt/src/brain.rs::a_gone_pins_ring_is_resolved_not_unanswered",
+  "crates/doorbell-rt/src/brain.rs::a_pending_ring_for_a_gone_pin_is_resolved_early",
+  "src/doorbell_host.rs::a_gone_pins_pane_is_not_a_wake_target",
+  "src/doorbell_host.rs::a_retired_row_is_not_a_wake_target_even_if_its_pane_is_listed",
+]
+mutations = [
+  "scripts/mutations/awareness-gone-pin.spec.sh#A1",
+  "scripts/mutations/awareness-live-pins.spec.sh#L1",
+]
+
+[[behavior]]
 id = "cron.workflow-durable-open"
 owner = "src/builtin_workflows.rs"
 status = "proven"

@@ -335,6 +335,39 @@ impl RtHost {
             .collect()
     }
 
+    /// bd-3vkpe: only pins that still HAVE a pane can hear a ring. A gone or
+    /// retired pin's row stays in the registry, so `pins()` is the wrong
+    /// question for a wake — the plane holds the truth.
+    fn live_pins(&self) -> Vec<String> {
+        let registry = state::load_spawn_registry(&self.project);
+        let Ok(backend) = crate::backend::multiplexer_backend(&self.cfg) else {
+            return self.registry_pins();
+        };
+        let Ok(agents) = backend.agent_list() else {
+            // A plane we cannot read is not evidence that every pin is gone.
+            return self.registry_pins();
+        };
+        let panes: Vec<String> = agents.into_iter().map(|a| a.pane_id).collect();
+        Self::live_pins_from(&registry, &panes)
+    }
+
+    /// Registry pins whose pane is still on the plane (bd-3vkpe). Pure, so the
+    /// fixture tests pin the rule: a retired/gone pin has no pane and no ring.
+    pub(crate) fn live_pins_from(
+        registry: &[state::SpawnEntry],
+        live_panes: &[String],
+    ) -> Vec<String> {
+        let live: std::collections::BTreeSet<&String> = live_panes.iter().collect();
+        registry
+            .iter()
+            .filter(|e| live.contains(&e.pane_id))
+            .filter_map(|e| e.mail_identity.clone())
+            .filter(|pin| !pin.is_empty())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     /// Rex presence producer (wave17-b): the SAME source `flywheel status`
     /// trusts. Seeds one `agent_list()` (so a host that starts while panes
     /// are idle is injectable at once), then streams `rex events` scoped to
@@ -2373,6 +2406,48 @@ mod inbox_flag_tests {
 }
 
 #[cfg(test)]
+/// bd-3vkpe: the fixture that reproduces the digest conflict — six gone pins
+/// and one live one. Only the live pin is a wake target, so only it can ever be
+/// "unanswered".
+#[cfg(test)]
+mod live_pins_tests {
+    use super::RtHost;
+    use crate::state::SpawnEntry;
+
+    fn row(pane: &str, pin: &str) -> SpawnEntry {
+        SpawnEntry::with_mail_identity(pane, format!("pane-{pane}"), pin)
+    }
+
+    #[test]
+    fn a_gone_pins_pane_is_not_a_wake_target() {
+        let registry = vec![
+            row("block:01a1e1c0-a", "SunnyMarsh"),
+            row("block:01a1e1c0-b", "BoldBay"),
+            row("block:01a1e1c0-c", "MistyMarsh"),
+            row("block:01a1e1c0-d", "CyanCove"),
+        ];
+        // The plane holds exactly one of those panes.
+        let live = RtHost::live_pins_from(&registry, &["block:01a1e1c0-d".to_string()]);
+        assert_eq!(live, vec!["CyanCove".to_string()]);
+
+        // Nothing live: every pin resolves as "no pane, nothing to ring" —
+        // which is what the brain then does with its rings.
+        assert!(
+            RtHost::live_pins_from(&registry, &[]).is_empty(),
+            "no pane means no wake target"
+        );
+    }
+
+    #[test]
+    fn a_retired_row_is_not_a_wake_target_even_if_its_pane_is_listed() {
+        // A retired pin's row is gone; a stale plane row alone does not make it
+        // addressable.
+        let registry = vec![row("block:01a1e1c0-a", "SunnyMarsh")];
+        let live = RtHost::live_pins_from(&registry, &["block:01a1e1c0-f".to_string()]);
+        assert!(live.is_empty(), "{live:?}");
+    }
+}
+
 mod off_runtime_tests {
     use super::*;
     use doorbell_rt::Host;
