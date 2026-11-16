@@ -214,9 +214,6 @@ const SEED_AFFINITY: &[(&str, &str)] = &[
     ("judge-arms", "oracle"),
     ("diagnose-only", "scout"),
     ("resume-pickup", "housekeeper"),
-    ("wave-gate", "planner"),
-    ("wave-dispatch", "planner"),
-    ("wave-observe", "scout"),
     ("wave-verify", "reviewer"),
 ];
 
@@ -249,9 +246,6 @@ const SEED_PHASE: &[(&str, &str)] = &[
     ("judge-arms", "review"),
     ("diagnose-only", "resolve"),
     ("resume-pickup", "resolve"),
-    ("wave-gate", "plan"),
-    ("wave-dispatch", "plan"),
-    ("wave-observe", "review"),
     ("wave-verify", "verify"),
 ];
 
@@ -263,9 +257,6 @@ const SEED_WITNESS: &[(&str, &str)] = &[
     ("plan-polish", "polish-round"),
     ("ce-execute", "implement"),
     ("ce-review", "review"),
-    ("wave-gate", "plan"),
-    ("wave-dispatch", "plan"),
-    ("wave-observe", "review"),
     ("wave-verify", "verify"),
     ("prove-verify", "verify"),
 ];
@@ -367,18 +358,6 @@ const SEED_USE_WHEN: &[(&str, &str)] = &[
         "a session needs stranded beads and panes picked back up",
     ),
     (
-        "wave-gate",
-        "a wave needs gating on the ready set before dispatch",
-    ),
-    (
-        "wave-dispatch",
-        "a gated wave needs its beads emitted to coder panes",
-    ),
-    (
-        "wave-observe",
-        "a running wave needs watching with escalation, never adjudication",
-    ),
-    (
         "wave-verify",
         "close claims need proving against receipts before landing",
     ),
@@ -401,10 +380,11 @@ const SEED_FRESH_READONLY: &[&str] = &["ce-review", "ce-evaluate", "prove-verify
 
 /// bd-ceiling-report-template-vz8a: the stages that hit or carry a ceiling
 /// report gain [`CEILING_REPORT_TEMPLATE`]. `ce-execute` renders it (the
-/// executor), `wave-observe` escalates it to the captain, `wave-verify`
-/// accepts the amendment close that cites it. wave-gate/wave-dispatch
-/// dispatch work and never report a ceiling, so they do not carry it.
-const CEILING_TEMPLATE_STAGES: &[&str] = &["ce-execute", "wave-observe", "wave-verify"];
+/// executor; the doorbell fold escalates it, bd-jhz8x.2) and `wave-verify`
+/// accepts the amendment close that cites it. The retired wave-gate /
+/// wave-dispatch / wave-observe stages are engine steps now, so they have no
+/// prompt to carry it.
+const CEILING_TEMPLATE_STAGES: &[&str] = &["ce-execute", "wave-verify"];
 
 /// bd-ceiling-report-template-vz8a (encode-lessons-in-structure,
 /// minimize-reader-load): ONE ceiling shape for every pane, so the captain's
@@ -470,7 +450,7 @@ impl StageLibrary {
             ),
             (
                 "ce-execute",
-                "Execute the beads via the brief contract. Every dispatched bead carries a filled brief (GOAL / SCOPE / CONTEXT / LEARNINGS / ACCEPTANCE / VERIFY / TIMEBOX / FORBIDDEN / REPORT / PRINCIPLES / STANDING) — the brief IS the work contract, and the lifecycle lives in the standing-orders file named in its STANDING field (read it once before starting; never re-derive it from memory). LEARNINGS carries the docs/learnings/ entries matching this scope — their constraints ride the brief; never re-derive a lesson the corpus already holds. IDEMPOTENT RE-ENTRY: before starting a bead, run its VERIFY at HEAD — already green means already done: mark complete and skip (a resumed wave never redoes shipped work). SIMPLIFY AS YOU GO: after each green VERIFY, one behavior-preserving pass (delete weightless code, collapse one-caller wrappers), then re-run the VERIFY. For each bead: run the VERIFY command from the brief, write the receipt to `.flywheel/receipts/<bead-id>-<sha>.<kind>.txt`, then close only with a REPORT that states status, commit sha (commit BEFORE close; bead id IN the commit message), verdict kind, what you actually ran, deviations, and the PRINCIPLES cited (`<name> — <the decision it changed>`). Principles in force: prove-it-works (the close is not done without a legal ledger row — verify with `flywheel ledger check <bead-id>`; the receipt is evidence, the verdict is the proof), fix-root-causes (reproduce before diagnosing; no silencers), sequence-verifiable-units (each bead ends in a check before the next starts). Prefer delegating to the `beads` subagent when available. If another agent (peer) is working in this project, join its shared room and steer on plane S (ADR-0020): `toron channel join steer-<bead-id> --project <slug> --as \"$AGENT_NAME\"` then accept/claim jobs posted there via `toron job list --state open --project <slug> --as \"$AGENT_NAME\"` + `toron job claim <job-id> --project <slug> --as \"$AGENT_NAME\"` (first claimer wins; a second claimer exits 1). Keep shared work on the room; keep secrets on plane P (`toron mail`). COORDINATION (one board, whole stack): before editing, run `toron reserve conflicts --project <slug> --as \"$AGENT_NAME\" --paths '<file-glob>' --json`; a non-empty report means re-plan or split the file set, or run the one genuinely shared edit under `toron reserve with-lease` — never wait on a lease. Reserve narrow write paths (exclusive) under the captain's project, repo-prefixed when you edit a sibling repo (`toron/src/...`); leases are 180 s heartbeats the loop renews, so a dead lane frees its claim in under three minutes. Peer-first on a real overlap: mail the holder or `flywheel collab`; escalate to the captain only when the holder is silent or a shared build breaks (name the file and the error in the same message). Keep shared crates compiling: land compile-green slices and announce a red shared crate immediately. Release at close with `toron reserve release-by-reason <bead>`. No worktree. If the dispatch names no bead binding (no BEAD line), do NOT act on the TASK-ID: stop and ask the captain for the bead id. Ask-user authority (ADR-0010 D15): never self-answer an ask-user finding. Unambiguous restorations of accepted behavior auto-decide — Publish the corr (journaled) and proceed. Expansions (new guarantee, threat model, architecture, destructive, security) stop the stage, Publish the corr, and park on WaitCorr with the five-element escalation (original criterion, proposed expansion, smallest compliant alternative, accept-vs-decline consequences, recommendation) into OPEN DECISIONS. Only an answer/--verdict closes the call; worker-side auto-close is a LoudMiss.",
+                "Execute the beads via the brief contract. Every dispatched bead carries a filled brief (GOAL / SCOPE / CONTEXT / LEARNINGS / ACCEPTANCE / VERIFY / TIMEBOX / FORBIDDEN / REPORT / PRINCIPLES / STANDING) — the brief IS the work contract, and the lifecycle lives in the standing-orders file named in its STANDING field (read it once before starting; never re-derive it from memory). LEARNINGS carries the docs/learnings/ entries matching this scope — their constraints ride the brief; never re-derive a lesson the corpus already holds. IDEMPOTENT RE-ENTRY: before starting a bead, run its VERIFY at HEAD — already green means already done: mark complete and skip (a resumed wave never redoes shipped work). SIMPLIFY AS YOU GO: after each green VERIFY, one behavior-preserving pass (delete weightless code, collapse one-caller wrappers), then re-run the VERIFY. For each bead: run the VERIFY command from the brief, write the receipt to `.flywheel/receipts/<bead-id>-<sha>.<kind>.txt`, then close only with a REPORT that states status, commit sha (commit BEFORE close; bead id IN the commit message), verdict kind, what you actually ran, deviations, and the PRINCIPLES cited (`<name> — <the decision it changed>`). Principles in force: prove-it-works (the close is not done without a legal ledger row — verify with `flywheel ledger check <bead-id>`; the receipt is evidence, the verdict is the proof), fix-root-causes (reproduce before diagnosing; no silencers), sequence-verifiable-units (each bead ends in a check before the next starts). Prefer delegating to the `beads` subagent when available. If another agent (peer) is working in this project, join its shared room and steer on plane S (ADR-0020): `toron channel join steer-<bead-id> --project <slug> --as \"$AGENT_NAME\"` then accept/claim jobs posted there via `toron job list --state open --project <slug> --as \"$AGENT_NAME\"` + `toron job claim <job-id> --project <slug> --as \"$AGENT_NAME\"` (first claimer wins; a second claimer exits 1). Keep shared work on the room; keep secrets on plane P (`toron mail`). COORDINATION (one board, whole stack): before editing, run `toron reserve conflicts --project <slug> --as \"$AGENT_NAME\" --paths '<file-glob>' --json`; a non-empty report means re-plan or split the file set, or run the one genuinely shared edit under `toron reserve with-lease` — never wait on a lease. Reserve narrow write paths (exclusive) under the captain's project, repo-prefixed when you edit a sibling repo (`toron/src/...`); leases are 180 s heartbeats the loop renews, so a dead lane frees its claim in under three minutes. Peer-first on a real overlap: mail the holder or `flywheel collab`; escalate to the captain only when the holder is silent or a shared build breaks (name the file and the error in the same message). Keep shared crates compiling: land compile-green slices and announce a red shared crate immediately. Release at close with `toron reserve release-by-reason <bead>`. No worktree. If the dispatch names no bead binding (no BEAD line), do NOT act on the TASK-ID: stop and ask the captain for the bead id. Ask-user authority (ADR-0010 D15): never self-answer an ask-user finding. Unambiguous restorations of accepted behavior auto-decide — Publish the corr (journaled) and proceed. Expansions (new guarantee, threat model, architecture, destructive, security) stop the stage, Publish the corr, and park on WaitCorr with the five-element escalation (original criterion, proposed expansion, smallest compliant alternative, accept-vs-decline consequences, recommendation) into OPEN DECISIONS. Only an answer/--verdict closes the call; worker-side auto-close is a LoudMiss. CLAIM/CLOSE CEREMONY for every bead: claim BEFORE work with `br update <id> --claim --actor <your pin>` (the PIN — a registered hc slug folds to its pin — and never a username-class assignee; without `--claim` the atomic guard does not run and a second lane overwrites the first), reserve the narrow files you touch, commit BEFORE close with the bead id IN the commit message, then `br gate report <id> --gate <verdict> --provider <pin> --status pass --to closed` and `br close <id> --commit-sha <sha>`.",
             ),
             (
                 "ce-simplify",
@@ -539,18 +519,6 @@ impl StageLibrary {
             (
                 "resume-pickup",
                 "Session pickup (ADR-0019): read .flywheel/agent-state/, `br list --status in_progress --json` for stranded beads, ledger gaps, and the last-sent registry; respawn context-exhausted panes; resume briefs for stranded in_progress beads. Idempotent: a done pickup finds nothing to do. Keep SUMMARIES in your report, not raw dumps (guard-the-context-window).",
-            ),
-            (
-                "wave-gate",
-                "Wave gate (ADR-0006 D3): run `flywheel preflight --mode workflow --project <this project slug>` — a failed check STOPS the wave. bd-mvy4: the `--project` is REQUIRED, not a nicety: `worktree` and `playbook-files` are project-scoped checks and both FAIL when no project is given, so omitting it made the gate hold every wave while naming a blocker that was the gate's own omission (post `[gate] blocked: <check>` to the steer channel; never fix infra yourself mid-gate). Then scope the ready set for this wave: `br ready --json` is already wave-gated by br itself, and the TYPED `wave` field is the authority (bd-wave-gate-typed-authority-27et) — select rows whose typed `wave` == N, falling back to the legacy `wave-N` label only when the typed field is null — and if ANY bead with an earlier wave-M (M<N) is open or in_progress, post `[gate] held: <bead ids>` and STOP (waves run in order, never around them). GROUNDING READ (ADR-0009, bounded by ADR-0010 D12): `flywheel __gate-learnings --budget ${FLYWHEEL_GATE_BUDGET:-4000}` — a budgeted projection of docs/learnings (top-N by reinforcement recency within ~4k tokens; pinned never decays, aging 30d / perishable 7d unreinforced decays OUT of the projection). Optional `--wiki/--memory` lane files (chiebukuro exports) join the SAME 4k pool — the budget is shared across lanes, never per-lane. Read ONLY the projected paths — frontmatter + rg context, under the budget; matching entries become the wave's carried constraints. BINDING CONTRACT (bd-wave-swarm-graduation-fix-98io — GATE output is the DISPATCH input): `mkdir -p .flywheel/wave` then write `.flywheel/wave/<wave-label>-ready.json` containing EXACTLY {\"wave_label\": \"<label>\", \"held\": <bool>, \"blockers\": [\"<bead-id>\"], \"in_flight\": [\"<bead-id>\"], \"ready\": [{\"id\": \"<bead-id>\", \"title\": \"...\", \"verify\": \"<VERIFY command>\", \"priority\": <n>}]} plus, when the grounding read matched, \"learnings\": [\"docs/learnings/<...>\"]. Reply with ONLY that JSON object. Never dispatch, never adjudicate — gate, write the artifact, report. bd-mvy4 DEFECT 3 (refined, bd-wave-gate-typed-authority-27et): an EMPTY `ready` with NO bead of this wave in flight is a LOUD FAILURE, not a green wave — post `[gate] blocked: wave <label> matched zero beads` and settle the job as a failure naming the empty match; an EMPTY `ready` WITH in-flight beads is `held: false` + `in_flight` — the wave is WORK IN FLIGHT (a crew is closing it), so report it and settle ok with a witness naming the in-flight crew, never a held/empty wave. A run that dispatches nothing must never report success; that is the false-green this gate exists to prevent. Settle with `toron job result <job-id> --status ok --project <slug> --as <pin> --witness <file.json>`; the witness file carries beads (each with id and acceptance, the bead VERIFY command) plus dep_cycles from `br dep cycles --json` (must be 0). Held or blocked settles as failed with the reason — never success, never an unsettled job.",
-            ),
-            (
-                "wave-dispatch",
-                "Wave dispatch (ADR-0006 D3/D1/D4). FIRST read the gate artifact `.flywheel/wave/<wave-label>-ready.json` for `held` + `learnings[]` (bd-wave-swarm-graduation-fix-98io), then take the bead list LIVE: `br ready --json` scoped to this wave at dispatch time (typed `wave` == N, legacy `wave-N` label fallback) — the artifact is a snapshot and may be stale (bd-wave-gate-typed-authority-27et). If the file is missing or \"held\": true, post `[dispatch] held` and settle the job as a failure naming it. If the live ready set is empty and the artifact names `in_flight[]`, post `[dispatch] work in flight: <ids>` and continue without duplicating a running crew. For EACH bead in ready[] emit ONE payload to the crew's coder pane (find it: `hc agent list`, this workspace, profile coder): `flywheel send --to <coder-pane-name> --stage ce-execute --param bead=<id> --param scope=<owned globs> --param exit=<the bead's VERIFY command from the artifact> --param channel=<steer-channel> --param pin=<coder-pin> --param report_file=/tmp/<id>-report-<epoch>.md` — and when the gate artifact carries learnings[], append `--param learnings=<paths csv>` so the brief's LEARNINGS field carries their constraints. fresh-eyes-explore is scout-only; coder execution is ce-execute. Every payload NAMES its bead id and carries the CLAIM/CLOSE CONTRACT — also post it once on the steer channel: claim before work (`br update <id> --claim --actor <the coder pin>` — the PIN, and `--claim` with it: the tracker stores a pin (a registered hc slug folds to its pin) and refuses a username-class assignee, `--claim` is what runs the atomic guard so a second lane cannot overwrite the first lane's assignee, and without an actor the claim falls back to the host username, which matches no live pane), reserve narrow files before editing (run `toron reserve conflicts` first; exclusive leases; release-by-reason at close), commit BEFORE close with the bead id in the message, gate the completion (`br gate report <id> --gate <verdict> --provider <pin> --status pass --to closed`) then close with the commit sha (`br close <id> --commit-sha <sha>`) carrying the VERIFY tail + principles citations. Full reports go to report_file; the steer channel gets a <=700-char summary plus the file path. Settle with `toron job result <job-id> --status ok --project <slug> --as <pin> --witness <file.json>`; the witness file carries beads (each dispatched bead with id and acceptance) plus dep_cycles from `br dep cycles --json` (must be 0). Held or empty settles as failed with the reason — never success, never an unsettled job.",
-            ),
-            (
-                "wave-observe",
-                "Wave observe (ADR-0006 D3): watch the steer channel for claims, receipts, and blocks. ESCALATE, never adjudicate: a bead blocked >10min, a reservation-ladder timeout, a fix-vs-hand-over fork, regression suspicion, or any judgment call -> mail the captain on the task thread with the evidence. You do NOT decide fixes, reassign work, or close beads. ESCALATION LESSON (ADR-0009 failure path): every escalation mail ends with a `lesson:` line — one sentence on what a future wave could do differently; if genuinely nothing, `lesson: none` (these feed the corpus at compound time). Escalations wake the captain; everything else runs unattended. Settle with `toron job result <job-id> --status ok --project <slug> --as <pin> --witness <file.json>`; the witness file carries findings (every escalation or watch summary posted, non-empty) plus verdict AGREE, AGREE-WITH-CHANGES, or REJECT — AGREE means nothing needed escalation. A quiet watch still posts its summary. Blocked settles as failed with the reason.",
             ),
             (
                 "wave-verify",
@@ -1648,17 +1616,6 @@ mod tests {
             execute.contains("reserve conflicts"),
             "ce-execute names the pre-edit conflict check"
         );
-        let dispatch = lib
-            .resolve("wave-dispatch")
-            .expect("wave-dispatch resolves");
-        assert!(
-            dispatch.contains("toron reserve conflicts"),
-            "wave-dispatch tells the captain to check conflicts before arming"
-        );
-        assert!(
-            dispatch.contains("release-by-reason"),
-            "wave-dispatch names the close-time release"
-        );
         let review = lib.resolve("ce-review").expect("ce-review resolves");
         for name in ["prove-it-works", "fix-root-causes", "minimize-reader-load"] {
             assert!(review.contains(name), "ce-review must name {name}");
@@ -1682,8 +1639,8 @@ mod tests {
     }
 
     /// bd-ceiling-report-template-vz8a: ONE ceiling shape, rendered into the
-    /// stages that hit (ce-execute) and carry (wave-observe escalates,
-    /// wave-verify accepts the amendment close) a ceiling. Pinned on
+    /// stages that hit (ce-execute) and carry (wave-verify accepts the
+    /// amendment close) a ceiling. Pinned on
     /// `compiled_in()` — the tier this change edits; a user-tier copy
     /// legitimately differs and `load()` would flake on machines holding one.
     #[test]
@@ -1796,14 +1753,12 @@ mod tests {
     /// and a second lane overwrote the first lane's assignee - both worked
     /// the bead.
     ///
-    /// wave-dispatch is the remaining taught surface after /beads-commit was
-    /// deleted.
+    /// The coder seat is the remaining taught surface now that /beads-commit
+    /// and the wave-dispatch stage are gone.
     #[test]
     fn close_ceremony_contract_names_gate_sha_and_the_pin_claim() {
         let lib = StageLibrary::compiled_in();
-        let dispatch = lib
-            .resolve("wave-dispatch")
-            .expect("wave-dispatch resolves");
+        let dispatch = lib.resolve("ce-execute").expect("ce-execute resolves");
         for needle in [
             "gate report",
             "--commit-sha",
@@ -1812,24 +1767,24 @@ mod tests {
         ] {
             assert!(
                 dispatch.contains(needle),
-                "wave-dispatch must teach {needle:?}"
+                "ce-execute must teach {needle:?}"
             );
         }
         assert!(
             !dispatch.contains("--assignee <hc-name>"),
-            "wave-dispatch must not teach the hc-slug assignee: the tracker stores a pin, \
+            "ce-execute must not teach the hc-slug assignee: the tracker stores a pin, \
              and a slug the registry does not know makes the claim hard-fail"
         );
         assert!(
             !dispatch.contains("--status=in_progress --assignee"),
-            "wave-dispatch must not teach the unguarded claim: without --claim the atomic \
+            "ce-execute must not teach the unguarded claim: without --claim the atomic \
              guard does not run and a second lane can overwrite the first lane's assignee"
         );
         let commit_pos = dispatch.find("commit BEFORE close").expect("order anchor");
         let close_pos = dispatch.find("br close").expect("close anchor");
         assert!(
             commit_pos < close_pos,
-            "wave-dispatch must order commit before close"
+            "ce-execute must order commit before close"
         );
     }
 
@@ -2122,167 +2077,27 @@ mod tests {
         assert!(check_repo_evidence(2, true));
     }
 
-    /// ADR-0006 D3 + ADR-0009: the wave-swarm compose token's compiled-in
-    /// stages resolve; DISPATCH briefs ce-execute (never fresh-eyes-explore)
-    /// and carries the learnings param when the gate matched.
-    #[test]
-    fn wave_dispatch_briefs_ce_execute_with_learnings() {
-        let lib = StageLibrary::compiled_in();
-        let prompt = &lib
-            .get_stage("wave-dispatch")
-            .expect("wave-dispatch seed")
-            .prompt;
-        assert!(
-            prompt.contains("--stage ce-execute"),
-            "DISPATCH must brief the coder stage, got: {prompt}"
-        );
-        assert!(
-            !prompt.contains("--stage p1"),
-            "p1 is retired; coder execution is ce-execute"
-        );
-        assert!(
-            prompt.contains("--param learnings="),
-            "DISPATCH carries the gate's learnings into the brief (ADR-0009)"
-        );
-    }
-
+    /// The one wave stage left: gate/dispatch/observe are ENGINE steps
+    /// (ADR-0021 D4.5), so their prompts are gone and must stay gone.
     #[test]
     fn wave_swarm_stages_resolve_compiled_in() {
         let lib = StageLibrary::compiled_in();
-        for stage in ["wave-gate", "wave-dispatch", "wave-observe", "wave-verify"] {
-            assert!(lib.has(stage), "compiled-in stage {stage} resolves");
+        assert!(
+            lib.has("wave-verify"),
+            "compiled-in stage wave-verify resolves"
+        );
+        for retired in ["wave-gate", "wave-dispatch", "wave-observe"] {
+            assert!(
+                !lib.has(retired),
+                "{retired} is an engine step now, not a stage: a prompt for it is dead config"
+            );
         }
     }
 }
 
 #[cfg(test)]
-mod bd_mvy4_wave_gate {
-    /// bd-mvy4: the wave-gate prompt ran `flywheel preflight --mode workflow`
-    /// with NO `--project`. `worktree` and `playbook-files` are project-scoped
-    /// and fail without one, so the gate held EVERY wave for a reason that was
-    /// the gate's own omission. Verified live: those are exactly the two checks
-    /// that fail bare and pass with `--project flywheel` (12/12).
-    ///
-    /// A prompt is not code, so this pins the prompt. That is normally a weak
-    /// assertion — except the failure it prevents is precisely a prompt
-    /// omitting a flag, so the prompt IS the thing under test. Mutation-checked:
-    /// deleting the flag must fail this test.
-    #[test]
-    fn the_wave_gate_passes_project_to_preflight() {
-        let lib = crate::stages::StageLibrary::compiled_in();
-        let prompt = lib
-            .get_stage("wave-gate")
-            .expect("wave-gate is a compiled-in stage")
-            .prompt
-            .clone();
-        assert!(
-            prompt.contains("preflight --mode workflow --project"),
-            "the wave gate must pass --project to preflight. `worktree` and `playbook-files` \
-             are project-scoped, so without it the gate holds every wave and names a blocker \
-             that is its own omission."
-        );
-    }
-
-    /// The gate's hold has to be visible to a human reading a live artifact, and
-    /// the artifact is what the dispatch prompt reads. If the prompt stops
-    /// naming the binding artifact, the contract between the two halves is gone
-    /// and the dispatch half falls back to guessing.
-    #[test]
-    fn the_wave_gate_still_writes_the_binding_artifact() {
-        let lib = crate::stages::StageLibrary::load().expect("load stages");
-        let prompt = lib
-            .get_stage("wave-gate")
-            .expect("wave-gate")
-            .prompt
-            .clone();
-        assert!(
-            prompt.contains("ready.json") && prompt.contains("\"held\""),
-            "the gate must keep writing the binding artifact with an explicit `held` field — \
-             it is the only channel between the gate and the dispatch half"
-        );
-    }
-
-    /// bd-mvy4 DEFECT 3: a label nothing carries produced an empty `ready`
-    /// and a GREEN run that dispatched nothing. The gate must name the empty
-    /// label as a blocker, or the false green comes straight back.
-    ///
-    /// Asserted on the COMPILED-IN tier, not `StageLibrary::load()`: a
-    /// user-tier `stages/wave-gate.toml` legitimately overrides the prompt,
-    /// and a test that reads the merged view fails on whichever machine has
-    /// an override. The repo can only guarantee what it ships.
-    #[test]
-    fn the_wave_gate_refuses_an_empty_label() {
-        let lib = crate::stages::StageLibrary::compiled_in();
-        let prompt = lib
-            .get_stage("wave-gate")
-            .expect("wave-gate")
-            .prompt
-            .clone();
-        assert!(
-            prompt.contains("matched zero beads"),
-            "an empty ready set must be a loud gate failure: {prompt}"
-        );
-    }
-}
-
-/// bd-wave-gate-typed-authority-27et: the wave-gate/dispatch prompts are the
-/// thing under test (a prompt omission IS the failure mode), so the typed-
-/// authority semantics are pinned on the compiled-in tier.
-#[cfg(test)]
-mod wave_gate_typed_authority_tests {
+mod stage_contract_tests {
     use super::*;
-
-    fn compiled_in_prompt(stage: &str) -> String {
-        crate::stages::StageLibrary::compiled_in()
-            .get_stage(stage)
-            .unwrap_or_else(|| panic!("{stage} is a compiled-in stage"))
-            .prompt
-            .clone()
-    }
-
-    /// The gate selects by the TYPED `wave` field (legacy label fallback) —
-    /// not the label alone.
-    #[test]
-    fn the_wave_gate_scopes_by_the_typed_field() {
-        let prompt = compiled_in_prompt("wave-gate");
-        assert!(
-            prompt.contains("TYPED `wave` field is the authority")
-                && prompt.contains("typed `wave` == N")
-                && prompt.contains("falling back to the legacy `wave-N` label"),
-            "the gate must read the typed wave field with a label fallback: {prompt}"
-        );
-    }
-
-    /// An empty ready WITH in-flight beads is work in flight, and the
-    /// artifact carries the `in_flight` list the dispatch/execute halves
-    /// need. Proven red by deleting either branch.
-    #[test]
-    fn the_wave_gate_calls_an_empty_ready_with_inflight_work_in_flight() {
-        let prompt = compiled_in_prompt("wave-gate");
-        assert!(
-            prompt.contains("WORK IN FLIGHT") && prompt.contains("in_flight"),
-            "an empty ready with in-flight beads must read WORK IN FLIGHT, not a held/empty wave: {prompt}"
-        );
-        assert!(
-            prompt.contains("\"in_flight\": [\"<bead-id>\"]"),
-            "the binding artifact must carry the in_flight list: {prompt}"
-        );
-    }
-
-    /// DISPATCH reads the bead list LIVE — the artifact is a snapshot and
-    /// may be stale (the mid-wave empty-read-dead-dispatch gap).
-    #[test]
-    fn the_wave_dispatch_takes_the_bead_list_live() {
-        let prompt = compiled_in_prompt("wave-dispatch");
-        assert!(
-            prompt.contains("take the bead list LIVE") && prompt.contains("br ready --json"),
-            "dispatch must re-read br ready at dispatch time, not trust the artifact snapshot: {prompt}"
-        );
-        assert!(
-            prompt.contains("work in flight"),
-            "dispatch must not duplicate a crew already working the wave: {prompt}"
-        );
-    }
 
     /// ADR-0021 D3: closed mode/context enums + repeat bounds
     /// (bd-stage-contract-fields-t36sj). Unknown values fail parse;
@@ -2366,12 +2181,9 @@ mod wave_gate_typed_authority_tests {
             "judge-arms",
             "diagnose-only",
             "resume-pickup",
-            "wave-gate",
-            "wave-dispatch",
-            "wave-observe",
             "wave-verify",
         ];
-        assert_eq!(names.len(), 29, "all seeds enumerated");
+        assert_eq!(names.len(), 26, "all seeds enumerated");
         for name in names {
             let st = lib
                 .get_stage(name)

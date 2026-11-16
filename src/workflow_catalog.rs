@@ -1703,11 +1703,12 @@ mod bd_mvy4_stage_drift {
     /// bd-mvy4: drift must report a user-tier STAGE whose prompt diverged from
     /// the compiled-in one as `stale`.
     ///
-    /// Found while fixing bd-mvy4's own live effect: the compiled-in wave-gate
-    /// prompt was corrected to pass `--project` to preflight, the user-tier copy
-    /// at `~/.config/flywheel/stages/wave-gate.toml` still lacked it, and
-    /// `flywheel stage show wave-gate` returned the STALE prompt — so the fix was
-    /// inert in production. `workflow drift` reported that file `current`.
+    /// Found while fixing bd-mvy4's own live effect: a compiled-in stage prompt
+    /// was corrected, the user-tier copy at `~/.config/flywheel/stages/<name>.toml`
+    /// still lacked the fix, and `flywheel stage show <name>` returned the STALE
+    /// prompt — so the fix was inert in production. `workflow drift` reported
+    /// that file `current`. (Subject is `wave-verify`: the stage the retired
+    /// wave-gate/wave-dispatch/wave-observe prompts used to use is gone.)
     ///
     /// The workflow tier does not have this problem: it compares VERBATIM SOURCE
     /// TEXT. The stage tier compares parsed structs, and something in that path
@@ -1719,17 +1720,17 @@ mod bd_mvy4_stage_drift {
         std::fs::create_dir_all(&dir).expect("mkdir");
         let compiled = crate::stages::StageLibrary::compiled_in();
         let real = compiled
-            .get_stage("wave-gate")
-            .expect("wave-gate is compiled in");
+            .get_stage("wave-verify")
+            .expect("wave-verify is compiled in");
         std::fs::write(
-            dir.join("wave-gate.toml"),
+            dir.join("wave-verify.toml"),
             crate::stages::render_stage_entry(real).expect("render"),
         )
         .expect("write faithful");
         let rows = catalog_drift(&root).expect("drift");
         let faithful = rows
             .iter()
-            .find(|r| r.kind == "stage" && r.name == "wave-gate")
+            .find(|r| r.kind == "stage" && r.name == "wave-verify")
             .expect("row");
         assert_eq!(
             faithful.status, "current",
@@ -1739,14 +1740,14 @@ mod bd_mvy4_stage_drift {
         let mut diverged = real.clone();
         diverged.prompt = format!("{} --but-diverged", diverged.prompt);
         std::fs::write(
-            dir.join("wave-gate.toml"),
+            dir.join("wave-verify.toml"),
             crate::stages::render_stage_entry(&diverged).expect("render"),
         )
         .expect("write diverged");
         let rows = catalog_drift(&root).expect("drift");
         let stale = rows
             .iter()
-            .find(|r| r.kind == "stage" && r.name == "wave-gate")
+            .find(|r| r.kind == "stage" && r.name == "wave-verify")
             .expect("row");
         assert_eq!(
             stale.status, "stale",

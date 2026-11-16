@@ -1241,7 +1241,7 @@ steps:
       spec:
         profile: "@coder"
         stage: ce-execute
-        task: 'Execute bead {{item.id}} ({{item.title}}) for {{inputs.objective}}. Its exit is its VERIFY fence: {{item.verify}}. Claim it first (br update {{item.id}} --claim --actor <your pin>) and reserve the narrow files you touch; commit with the bead id in the message, run the VERIFY fence, then gate and close with the commit sha. Steer channel: {{inputs.steer_channel}}; escalate to {{inputs.captain_pin}}. Settle YOUR job with toron job result <job-id> --status ok --project <slug> --as <pin> --witness <file.json>; a bead you cannot verify settles as a failure naming why — never an unsettled job.'
+        task: 'Execute bead {{item.id}} ({{item.title}}) for {{inputs.objective}}. Its exit is its VERIFY fence: {{item.verify}}. Read the gate artifact `.flywheel/wave/{{inputs.wave_label}}-ready.json` `learnings[]` first — those are the carried constraints of this wave (ADR-0009); never re-derive a lesson the corpus already holds. Claim it first (br update {{item.id}} --claim --actor <your pin>) and reserve the narrow files you touch; commit with the bead id in the message, run the VERIFY fence, then gate and close with the commit sha. Steer channel: {{inputs.steer_channel}}; escalate to {{inputs.captain_pin}}. Settle YOUR job with toron job result <job-id> --status ok --project <slug> --as <pin> --witness <file.json>; a bead you cannot verify settles as a failure naming why — never an unsettled job.'
       on_error: fail_run
   - name: execute
     action: dispatch_job
@@ -3378,6 +3378,32 @@ graph:
         let json = serde_json::to_value(&wave.steps).expect("steps serialize");
         let text = json.to_string();
         assert!(!text.contains("test -f"), "no step reads a marker: {text}");
+    }
+
+    /// bd-jhz8x.2 (D4.5): DISPATCH is an engine step, so the gate's grounding
+    /// read must still reach the coder — the artifact's `learnings[]` is the
+    /// carrier now that the wave-dispatch prompt is gone.
+    #[test]
+    fn wave_swarm_dispatch_carries_the_gate_learnings() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        let wave = &wfs["wave-swarm"];
+        let dispatch = wave
+            .steps
+            .iter()
+            .find(|s| s.name.as_deref() == Some("dispatch"))
+            .expect("dispatch step");
+        let Action::Foreach { each, .. } = &dispatch.action else {
+            panic!("dispatch is a foreach over the gate artifact");
+        };
+        let Action::DispatchJob { spec, .. } = &each.action else {
+            panic!("each ready bead is a job");
+        };
+        let task = spec.task.as_deref().unwrap_or("");
+        assert!(
+            task.contains("ready.json") && task.contains("learnings"),
+            "the per-bead task must read the gate's learnings: {task}"
+        );
     }
 
     /// Every stage dispatch awaits its job result with a bounded wait:
