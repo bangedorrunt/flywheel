@@ -134,6 +134,7 @@ expect_pass DeferredQueueLanes DeferredQueueLanes
 expect_pass DoorbellMailPush DoorbellMailPush
 expect_pass DispatcherReap DispatcherReap
 expect_pass JournalAppend JournalAppend
+expect_pass JournalRotate JournalRotate
 expect_pass SupervisorRetire SupervisorRetire
 expect_pass PeerContention PeerContention
 expect_pass ReservationBoard ReservationBoard
@@ -156,6 +157,7 @@ expect_violation DispatcherReap DispatcherReap.broken-fallback-reap NeverReapOnF
 expect_violation DispatcherReap DispatcherReap.broken-reap-live-session NeverReapLiveSession
 expect_violation DispatcherReap DispatcherReap.broken-label-dropped LabelOnlyDoorKept
 expect_violation JournalAppend JournalAppend.broken-interleave NoTornRow
+expect_violation JournalRotate JournalRotate.broken-unlocked NoLostRow
 expect_violation SupervisorRetire SupervisorRetire.broken-delete-on-failure PlistOnlyWhenGone
 expect_violation PeerContention PeerContention.broken-no-tiebreak AtMostOneHolder
 expect_violation ReservationBoard ReservationBoard.broken-truncated-grants NoGrantWithoutCompleteBoard
