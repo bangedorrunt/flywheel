@@ -9,13 +9,16 @@
 //! a rerun resumes from it; the reservation release actually happened (a code
 //! mutation skipping it fails the assertion).
 
+#[path = "../src/test_sandbox.rs"]
+mod test_sandbox;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use test_sandbox::TestSandbox;
 
 struct Fixture {
-    _dir: tempfile::TempDir,
+    sandbox: TestSandbox,
     repo: PathBuf,
-    bin: PathBuf,
     state: PathBuf,
     work_sha: String,
 }
@@ -134,10 +137,10 @@ printf '{"leases":[],"count":0}\n'
 }
 
 fn fixture() -> Fixture {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let repo = dir.path().join("repo");
-    let bin = dir.path().join("bin");
-    let state = dir.path().join("state");
+    let sandbox = TestSandbox::new();
+    let repo = sandbox.root().join("repo");
+    let bin = sandbox.bin_dir();
+    let state = sandbox.root().join("state");
     std::fs::create_dir_all(&repo).expect("repo");
     std::fs::create_dir_all(&state).expect("state");
     write_fakes(&bin);
@@ -149,6 +152,14 @@ fn fixture() -> Fixture {
         let out = sh(&repo, "git", &args);
         assert!(out.status.success(), "git {args:?}");
     }
+    // The landing gate re-derives spec targets with the real harness; without
+    // one it fails closed and treats every changed path as covered.
+    std::fs::create_dir_all(repo.join("scripts/mutations")).expect("mutations dir");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/verify-mutations.sh"),
+        repo.join("scripts/verify-mutations.sh"),
+    )
+    .expect("copy the harness");
     std::fs::create_dir_all(repo.join(".beads")).expect(".beads");
     std::fs::write(
         repo.join(".beads/issues.jsonl"),
@@ -169,9 +180,8 @@ fn fixture() -> Fixture {
         .trim()
         .to_string();
     Fixture {
-        _dir: dir,
+        sandbox,
         repo,
-        bin,
         state,
         work_sha,
     }
@@ -181,7 +191,14 @@ impl Fixture {
     fn land_with(&self, sha: &str, extra: &[&str]) -> std::process::Output {
         let receipt = self.state.join("receipt.json");
         if !receipt.exists() {
-            std::fs::write(&receipt, "{\"ok\":true}\n").expect("receipt");
+            // A receipt the current gate accepts: it proves THIS revision, and
+            // an empty mutation set is legal because the fixture tree has no
+            // spec targets (bd-m5afp's rule re-derives that, it does not trust
+            // the list).
+            let body = format!(
+                "{{\"ok\":true,\"sha\":\"{sha}\",\"mode\":\"sha\",\"mutations\":[],\"mutations_mode\":\"changed\",\"mutations_base\":\"{sha}\",\"changed_paths\":[\"work.txt\"]}}\n"
+            );
+            std::fs::write(&receipt, body).expect("receipt");
         }
         let mut args = vec![
             "ship",
@@ -199,13 +216,9 @@ impl Fixture {
             self.repo.to_str().expect("repo path"),
         ];
         args.extend_from_slice(extra);
-        let path = format!(
-            "{}:{}",
-            self.bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
-        Command::new(env!("CARGO_BIN_EXE_flywheel"))
-            .env("PATH", path)
+        self.sandbox
+            .command(env!("CARGO_BIN_EXE_flywheel"))
+            .env("PATH", self.sandbox.path_env())
             .env("FAKE_STATE", &self.state)
             .args(args)
             .output()
@@ -323,15 +336,10 @@ fn a_later_mention_does_not_flip_a_landed_verdict() {
         .status
         .success()
     );
-    let check = Command::new(env!("CARGO_BIN_EXE_flywheel"))
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                f.bin.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
+    let check = f
+        .sandbox
+        .command(env!("CARGO_BIN_EXE_flywheel"))
+        .env("PATH", f.sandbox.path_env())
         .env("FAKE_STATE", &f.state)
         .args([
             "ship",
