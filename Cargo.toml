@@ -6,7 +6,12 @@ description = "Multi-agent swarm orchestrator on hc and rex (Superlogical) backe
 license = "MIT"
 
 [workspace]
-members = ["crates/doorbell-core", "crates/doorbell-rt", "crates/doorbell-cli"]
+members = [
+    "crates/doorbell-core",
+    "crates/doorbell-rt",
+    "crates/doorbell-cli",
+    "crates/test-sandbox",
+]
 # default-members: the root package is implied, so without this a bare
 # `cargo test` at the root ran ONLY flywheel and the doorbell crates' tests
 # (doorbell-rt's brain/sinks, doorbell-cli's lifecycle) silently never ran.
@@ -91,6 +96,7 @@ optional = true
 
 [dev-dependencies]
 serde_json = "1"
+flywheel-test-sandbox = { path = "crates/test-sandbox" }
 tempfile = "3.27.0"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

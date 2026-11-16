@@ -23,12 +23,6 @@
 //! `/bin/true`, which exits at once, proving the spawn path without
 //! running a host.
 
-// bd-jp9z1.4: declared here because this is the first module that needs it;
-// the operator-shared dispatch file (main.rs) should not be touched for it.
-#[cfg(test)]
-#[path = "test_sandbox.rs"]
-pub(crate) mod test_sandbox;
-
 use std::path::{Path, PathBuf};
 
 /// Label prefix of the retired duplicate units (kept: cleanup scans for it).
@@ -379,7 +373,7 @@ mod tests {
     #[test]
     fn single_owner_ensures_children_and_installs_no_units() {
         let _g = crate::config::lock_env();
-        let sandbox = super::test_sandbox::TestSandbox::new();
+        let sandbox = flywheel_test_sandbox::TestSandbox::new();
         let _scope = sandbox.scope();
         sandbox.allow_supervisor_calls();
         let home = sandbox.root().join("home");
@@ -425,7 +419,7 @@ mod tests {
     #[test]
     fn unload_retires_units_and_stops_children() {
         let _g = crate::config::lock_env();
-        let sandbox = super::test_sandbox::TestSandbox::new();
+        let sandbox = flywheel_test_sandbox::TestSandbox::new();
         let _scope = sandbox.scope();
         sandbox.allow_supervisor_calls();
         let home = sandbox.root().join("home");
@@ -469,7 +463,7 @@ mod tests {
         // A rex CLI must resolve so the fake two-session backend is the
         // selected plane; the host refuses a rex-row workspace on hc.
         let _rex = crate::backend::rex_test_guard::RexBinGuard::install("#!/bin/sh\nexit 0\n");
-        let sandbox = super::test_sandbox::TestSandbox::new();
+        let sandbox = flywheel_test_sandbox::TestSandbox::new();
         let _scope = sandbox.scope();
         let root = sandbox.root().to_path_buf();
         let state = root.join("state");

@@ -1,0 +1,12 @@
+[package]
+name = "flywheel-test-sandbox"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The one test sandbox for tests that spawn a flywheel/toron/doorbell process"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tempfile = "3.27.0"

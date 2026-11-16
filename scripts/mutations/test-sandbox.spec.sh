@@ -9,7 +9,7 @@ TEST_FILTER=(
 )
 
 mutation "M1  Drop stops asserting the deny-shim log" \
-    file=src/test_sandbox.rs \
+    file=crates/test-sandbox/src/lib.rs \
     expect=drop_panics_when_a_supervisor_shim_was_reached \
     find='self.allow_supervisor.load(Ordering::SeqCst) || log.is_empty(),' \
     replace='true,'

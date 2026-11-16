@@ -27,11 +27,11 @@ mutation "A2  a moving pane no longer counts as activity" \
 mutation "A3  a pane repeating one tail is no longer a loop" \
     file=src/cmd/captain.rs \
     expect=a_busy_pane_repeating_one_tail_is_looping \
-    find='    if p.loop_repeats >= LOOP_REPEATS {
+    find='    if p.loop_repeats >= LOOP_REPEATS && p.loop_repeat_secs >= p.loop_min_secs {
         return StallVerdict::Looping;
     }
 ' \
-    replace='    let _ = p.loop_repeats;'
+    replace='    let _ = (p.loop_repeats, p.loop_repeat_secs, p.loop_min_secs);'
 
 mutation "A4  two identical tails are called a loop" \
     file=src/cmd/captain.rs \
@@ -50,8 +50,8 @@ mutation "A5  a first sighting of a tail is not a delta" \
 mutation "A6  an idle pane's repeated tail counts as a loop" \
     file=src/cmd/captain.rs \
     expect=activity_watch_seeds_the_clock_and_counts_only_busy_tails \
-    find='                .filter(|pane| busy.contains(*pane))' \
-    replace='                .filter(|_pane| true)'
+    find='            .filter(|pane| busy.contains(*pane))' \
+    replace='            .filter(|_pane| true)'
 
 mutation "A7  a held flock is read as a free slot" \
     file=src/cmd/captain.rs \
