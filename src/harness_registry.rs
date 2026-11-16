@@ -82,6 +82,10 @@ pub struct HarnessSpec {
     /// `mode: read-only` argv and, when the argv does not ENFORCE it, the
     /// reason it is degraded.
     pub read_only: (&'static [&'static str], Option<&'static str>),
+    /// The hc integration this harness runs as a pane (`None` = not an hc
+    /// pane; flywheel launches it by argv only). The hc vocabulary is the
+    /// multiplexer's, so the value must be one of `hc::INTEGRATION_KINDS`.
+    pub hc_target: Option<&'static str>,
     /// Orchestration-phase argv: (plan, implement) with a degraded flag each.
     pub phase_plan: (&'static [&'static str], bool),
     pub phase_implement: (&'static [&'static str], bool),
@@ -100,6 +104,7 @@ pub const REGISTRY: &[HarnessSpec] = &[
         pane_model_by_env: true,
         effort_flag: None,
         read_only: (&["--agent", "plan"], None),
+        hc_target: Some("opencode"),
         phase_plan: (&["--agent", "plan"], false),
         phase_implement: (&["--agent", "build"], false),
     },
@@ -113,6 +118,7 @@ pub const REGISTRY: &[HarnessSpec] = &[
         pane_model_by_env: false,
         effort_flag: Some("--thinking"),
         read_only: (&["--tools", "read,grep,find,ls"], None),
+        hc_target: Some("pi"),
         phase_plan: (&[], true),
         phase_implement: (&[], false),
     },
@@ -126,6 +132,7 @@ pub const REGISTRY: &[HarnessSpec] = &[
         pane_model_by_env: false,
         effort_flag: Some("--reasoning-effort"),
         read_only: (&["--permission-mode", "plan"], None),
+        hc_target: Some("grok"),
         phase_plan: (&["--permission-mode", "plan"], false),
         phase_implement: (&[], false),
     },
@@ -139,6 +146,7 @@ pub const REGISTRY: &[HarnessSpec] = &[
         pane_model_by_env: false,
         effort_flag: None,
         read_only: (&[], Some("no read-only flag")),
+        hc_target: Some("codex"),
         phase_plan: (&[], true),
         phase_implement: (&[], false),
     },
@@ -152,6 +160,7 @@ pub const REGISTRY: &[HarnessSpec] = &[
         pane_model_by_env: false,
         effort_flag: None,
         read_only: (&[], Some("no read-only flag")),
+        hc_target: Some("claude"),
         phase_plan: (&[], true),
         phase_implement: (&[], false),
     },
@@ -165,6 +174,7 @@ pub const REGISTRY: &[HarnessSpec] = &[
         pane_model_by_env: false,
         effort_flag: None,
         read_only: (&[], Some("no read-only flag")),
+        hc_target: None,
         phase_plan: (&[], true),
         phase_implement: (&[], false),
     },
@@ -178,6 +188,7 @@ pub const REGISTRY: &[HarnessSpec] = &[
         pane_model_by_env: false,
         effort_flag: Some("--effort"),
         read_only: (&["--mode", "plan"], None),
+        hc_target: Some("antigravity-cli"),
         phase_plan: (&["--mode", "plan"], false),
         phase_implement: (&[], false),
     },
@@ -194,6 +205,7 @@ pub const REGISTRY: &[HarnessSpec] = &[
             &["--approval-mode", "default"],
             Some("approval-gated, not enforced"),
         ),
+        hc_target: None,
         phase_plan: (&[], true),
         phase_implement: (&[], false),
     },
@@ -580,6 +592,63 @@ mod tests {
                     "{name}: {phase} degraded is the row"
                 );
             }
+        }
+    }
+
+    /// bd-6setu.1 (ADR-0022 D3), relationship not merge: the hc vocabulary is
+    /// the MULTIPLEXER's and is a superset (it names integrations flywheel
+    /// never spawns). Folding it into the registry would silently widen what
+    /// flywheel launches, so the two are pinned together instead: every row
+    /// that runs as an hc pane names an integration the hc list really has.
+    #[test]
+    fn every_hc_pane_row_names_a_real_integration() {
+        for spec in REGISTRY {
+            let Some(target) = spec.hc_target else {
+                continue;
+            };
+            assert!(
+                crate::hc::INTEGRATION_KINDS.contains(&target),
+                "{}: hc_target {target:?} is not an hc integration — a pane launch would \
+                 resolve no target",
+                spec.canonical
+            );
+        }
+        // The hc target resolves to a launch target; the one spelling
+        // difference is the multiplexer's and is stated here, not hidden in a
+        // loop that would have to special-case it.
+        assert_eq!(
+            crate::hc::integration_target("antigravity-cli"),
+            Some("antigravity_cli")
+        );
+        assert!(
+            REGISTRY.iter().any(|s| s.hc_target.is_none()),
+            "not every harness is an hc pane"
+        );
+    }
+
+    /// bd-6setu.1, second relationship: `profile::compiled_in_harnesses` holds
+    /// RECIPE spawn commands for harnesses the registry does not declare. That
+    /// is a different domain, so the pin is "no duplicate truth": a name with a
+    /// compiled-in recipe must not also be a registry row.
+    #[test]
+    fn compiled_in_recipe_harnesses_are_not_registry_rows() {
+        let recipes = crate::profile::compiled_in_harnesses();
+        assert!(
+            !recipes.is_empty(),
+            "the recipe set is the point of the test"
+        );
+        for (name, config) in &recipes {
+            assert!(
+                spec(name).is_none(),
+                "{name}: a recipe row and a registry row would be two truths"
+            );
+            assert!(
+                config
+                    .spawn_cmd
+                    .as_deref()
+                    .is_some_and(|c| !c.trim().is_empty()),
+                "{name}: a compiled-in harness without a spawn command launches nothing"
+            );
         }
     }
 }

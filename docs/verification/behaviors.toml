@@ -1152,3 +1152,17 @@ tests = [
 mutations = [
   "scripts/mutations/caps-rows-follow-registry.spec.sh#R1",
 ]
+
+[[behavior]]
+id = "harness.registry-pins-the-two-foreign-domains"
+owner = "src/harness_registry.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/harness_registry.rs::every_hc_pane_row_names_a_real_integration",
+  "src/harness_registry.rs::compiled_in_recipe_harnesses_are_not_registry_rows",
+]
+mutations = [
+  "scripts/mutations/registry-relationship-tests.spec.sh#H1",
+  "scripts/mutations/registry-relationship-tests.spec.sh#H2",
+]
