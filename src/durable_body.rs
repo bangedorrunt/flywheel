@@ -653,8 +653,12 @@ async fn drive_graph(
                     let stage = graph_stage(&run, &node);
                     let outcome = match outcome {
                         JobWatchOutcome::Settled(value) => {
-                            match witness_refusal(seams.witness.as_ref(), &node, stage.as_deref(), &value)
-                            {
+                            match witness_refusal(
+                                seams.witness.as_ref(),
+                                &node,
+                                stage.as_deref(),
+                                &value,
+                            ) {
                                 Some(error) => JobWatchOutcome::Failed(error),
                                 None => JobWatchOutcome::Settled(value),
                             }
@@ -663,15 +667,15 @@ async fn drive_graph(
                     };
                     let c = clock.clone();
                     let then = move |mut run: GraphRun| match outcome {
-                        JobWatchOutcome::Claimed => run
-                            .job_claimed(&node, c())
-                            .map(|eff| (run, eff)),
-                        JobWatchOutcome::Settled(value) => run
-                            .job_settled(&node, value, c())
-                            .map(|eff| (run, eff)),
-                        JobWatchOutcome::Failed(error) => run
-                            .job_failed(&node, error, c())
-                            .map(|eff| (run, eff)),
+                        JobWatchOutcome::Claimed => {
+                            run.job_claimed(&node, c()).map(|eff| (run, eff))
+                        }
+                        JobWatchOutcome::Settled(value) => {
+                            run.job_settled(&node, value, c()).map(|eff| (run, eff))
+                        }
+                        JobWatchOutcome::Failed(error) => {
+                            run.job_failed(&node, error, c()).map(|eff| (run, eff))
+                        }
                         JobWatchOutcome::TimedOut => {
                             let now = c().max(deadline.unwrap_or(0));
                             run.woke(now).map(|eff| (run, eff))
