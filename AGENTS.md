@@ -102,6 +102,13 @@ test can never run by default. Anything else that spawns gets the sandbox.
   <your sha>` (or a clean export of it) is the crew-facing fence and the
   default, because one shared tree is the rule; a per-pin worktree is not the
   proof's job. A syntax error in the dirty tree must not change the result.
+  **Crew pre-mail check:** before you mail a sha, run `scripts/fence.sh
+  --sha <your sha>`. It exports that commit with `proof_archive` (the same
+  function clean-proof uses) and runs the proof's fail-fast prefix —
+  `verify-needles`, `-Dwarnings build --workspace --all-targets`,
+  `test --workspace --no-run`, `verify-clippy` — stopping at the first red.
+  A green fence is necessary, not sufficient; the captain still proves and
+  installs.
 - **Classify first.** Session door: `arrive` → `briefing --json`; argv runs the
   work. `decide --json` classifies (`open` | `swarm`). Live fleets join loud,
   never double-compose — an invisible crew is not an empty project (check

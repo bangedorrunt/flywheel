@@ -593,8 +593,6 @@ pub(crate) fn cmd_preflight(
 /// `approval_expired` and mail the asker. A denied key replays
 /// `approval_denied` and never dispatches. Returns true when the steer is
 /// fully answered here; false means the normal gate path continues.
-/// bd-koafr: the hosted-park door's options, so the argument count stays
-/// clippy-clean without a suppression.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HostedParkOpts<'a> {
     pub project_owned: &'a str,
@@ -711,7 +709,6 @@ pub(crate) fn cmd_steer_hosted_park(opts: HostedParkOpts<'_>) -> Result<bool> {
     }
 }
 
-/// The steer door's options: one struct keeps the count honest as flags grow.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SteerOpts<'a> {
     pub objective: &'a str,
