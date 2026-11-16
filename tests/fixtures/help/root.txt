@@ -11,6 +11,7 @@ Usage: flywheel [OPTIONS] [COMMAND]
 Commands:
   init               Scaffold a project (ensure dir + .beads + the project-scope compound spine: .flywheel/stages.toml, .flywheel/standing-orders.md, docs/learnings/) without spawning
   spawn              Spawn a swarm (escape hatch). Default multi-lane is `workflow compose --parts wave-swarm --run`
+  swarm              ADR-0022 rollout 6: front the plan (`plan`), a live patch (`apply`), and the live seat view (`status`). `plan` prints the same flywheel-plan.v1 object as `spawn --dry-run --json`
   add                Extend a running swarm with more agent panes
   list               List flywheel swarms and their agents
   status             Show one swarm's agents and states
@@ -28,6 +29,7 @@ Commands:
   recover            Recover a damaged swarm (bd-fw-interrupt-kills-agent-or3): for each registered agent, restore the name binding if the pane survived, or respawn the agent if it died. The durable loop self-heals on its own; this is the CLI supervision counterpart. bd-hc-registry-recover-ywypf: never respawn the captain pin by default (a duplicate idle captain pane was created); pass --include-captain for the deliberate case
   send               Send a prompt to one or more agents (with optional wait)
   crew               Crew plane: preview + lifecycle control (ADR-0010 D7). Control has NO arbitrary-text entry point — the verbs are interrupt|exit|relaunch only; text the worker reads is not a lifecycle verb
+  peer               P2P multiplayer protocol directives and reactive wake dispatch
   captain            Captain door (bd-captain-watch-poll-exit-bbwm): the captain's own poll-exit watch. `captain watch <project>` blocks on the captain inbox water (or a stall, with --stall, or a preflight failure, with --preflight), prints a preview, and exits so the harness completion callback resumes the captain. One shot — re-arm
   supervisor         Supervisor facts and steers (Phase 4a; `TORON_COMMS_INBOX` on): crews report `progress|done|exit|proved|usage`, the operator steers `redirect|pause|resume|cancel`, `view` prints the CrewView (`goal_proved` is the read-only subscriber), `halt` cancels one context
   halt               Cancel one supervisor context: live children get Exit, the host stops relaunching that subtree. Escalate mail is the captain push. `captain watch` resumes the captain when that mail lands
@@ -42,8 +44,10 @@ Commands:
   artifacts          Typed artifacts (ADR-0025 Spec 2): list or stitch per-run records
   attach             Attach to an agent's terminal (interactive; execs `hc attach`)
   kill               Close (kill) a swarm workspace
+  retire             Retire ONE OR MORE pins (bd-rilvn): the thin verb over the seat path — one journaled `SeatEffect::Retire` through `Ports::seat` (closes the pane), the pin's leases released operator-signed, and the roster row deregistered. Refuses the captain/operator seat by role, and a working pin without --force-working
   ledger             bead-verdict ledger (ADR-0019): br gate wrappers + receipt helper. `check` exits 0 only on a legal verdict for the current SHA; `receipt` writes only the receipt file (workers never write verdicts)
   judgment           host-side judgment surfaces (ADR-0014, bd-lpn6): miss ledger (resolve/list/needles), on-demand annotators, verify prescreen. Annotate-only — nothing here dispatches, holds, or closes
+  memory             Chie Memory preflight (trap checks) and lesson recording
   principles         engineering principle registry (ADR-0019 Spec 5/6): list the 21 canonical names, or show a leaf's full when+rule (unknown name -> non-zero + suggestion)
   standing-orders    standing orders (ADR-0019 Spec 2): regen the GENERATED global file (~/.config/flywheel/standing-orders.md) from the registry + wave-1 criticals; project fences (<project>/.flywheel/standing-orders.md) are authored and preserved byte-identical
   work               Work-graph surfaces (bv/br pass-through)
@@ -65,6 +69,7 @@ Commands:
   safety             Safety posture: deps + active guards
   guards             Active policy guards (deny patterns)
   policy             Destructive-command policy management
+  prefer             Standing preferences (ADR-0022 D6): set, list, and forget role.field values. Project scope via --project, else always
   deps               Environment + toolchain health check
   integration        Generate orchestration slash commands for an agent kind. Writes {open,swarm,loop,peer-aware}-mode.md into the tool's prompts dir and removes leftover /beads-* and /workflow-* files (catalog + br own those verbs). Kinds: opencode|pi|grok|omp|pa (shorts oc|pi|gk accepted); omit to list kinds. Re-run after a flywheel rebuild to refresh
   config             XDG user config (~/.config/flywheel). `config seed` fills missing workflows, stages, and judgment packs from compiled-in defaults and never overwrites. `config path` prints the directory

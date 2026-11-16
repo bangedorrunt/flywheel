@@ -271,6 +271,20 @@ tests = [
 ]
 mutations = ["scripts/mutations/clean-proof-slot.spec.sh#S1", "scripts/mutations/clean-proof-slot.spec.sh#S2"]
 
+[[behavior]]
+id = "proof.suite-runs-tests-and-isolation"
+owner = "scripts/clean-proof.sh"
+status = "proven"
+concurrent = false
+tests = [
+  "tests/proof_steps.rs::proof_suite_step_runs_the_tests_directory",
+  "tests/proof_steps.rs::proof_verify_mutations_never_edits_the_shared_tree",
+]
+mutations = [
+  "scripts/mutations/proof-suite-and-isolation.spec.sh#S1",
+  "scripts/mutations/proof-suite-and-isolation.spec.sh#I1",
+]
+
 
 [[behavior]]
 id = "inbox-ports.arrive-pane"

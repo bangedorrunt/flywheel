@@ -316,7 +316,16 @@ run_step verify-needles bash scripts/verify-needles.sh || true
 [ -n "$FAILED_STEP" ] || run_step build "${MBX[@]}" build --workspace --all-targets || true
 [ -n "$FAILED_STEP" ] || run_step no-run "${MBX[@]}" test --workspace --no-run || true
 [ -n "$FAILED_STEP" ] || run_step verify-clippy bash scripts/verify-clippy.sh || true
-[ -n "$FAILED_STEP" ] || run_step suite "${MBX[@]}" test -p flywheel --bin flywheel || true
+# bd-jp9z1.5: the suite now executes the tests/ targets, and
+# tests/adr0027_slice1 refuses an installed toron on purpose — it needs the
+# PINNED sibling built at ../toron/target/debug/toron. Build the export's
+# sibling, never the host's.
+if [ -n "$FAILED_STEP" ] || [ ! -f "$TMP/toron/Cargo.toml" ]; then
+  echo "clean-proof: no sibling toron to build; integration tests that need it are ignored"
+else
+  run_step sibling-toron "${MBX[@]}" build --manifest-path "$TMP/toron/Cargo.toml" -p toron-cli || true
+fi
+[ -n "$FAILED_STEP" ] || run_step suite "${MBX[@]}" test -p flywheel --tests || true
 [ -n "$FAILED_STEP" ] || run_step workflow-verify \
   env "XDG_CONFIG_HOME=$TMP/config" "XDG_STATE_HOME=$TMP/state" \
   "${MBX[@]}" run --quiet --bin flywheel -- workflow verify --json || true

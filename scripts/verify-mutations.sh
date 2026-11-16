@@ -437,6 +437,100 @@ SPEC
     printf '\nself-test pass\n'
 }
 
+# --- scratch export (bd-jp9z1.5) -----------------------------------------
+
+# The harness edits source IN PLACE. Inside clean-proof's export that is the
+# point; in a shared working tree a concurrent build in another lane compiles
+# the mutant — that is how the D2 mutant ran the real launchctl and loaded a
+# LaunchAgent into the operator's session. Unless we are already inside a
+# scratch export (clean-proof sets the marker), copy this revision to a
+# throwaway tree (`git archive HEAD` plus every dirty/untracked path overlaid,
+# so a lane proves its own uncommitted fix) and re-exec there. The caller's
+# tree is only ever read.
+isolate_if_shared() {
+    if [ "${VERIFY_MUTATIONS_IN_EXPORT:-0}" = 1 ]; then
+        # Consume the marker: a child the tests spawn (another harness call) must
+        # isolate on its own instead of inheriting "already in an export".
+        unset VERIFY_MUTATIONS_IN_EXPORT
+        return 0
+    fi
+    local args=("$@")
+    local repo="."
+    local i
+    for ((i = 0; i < ${#args[@]}; i++)); do
+        [ "${args[$i]}" = "--repo" ] && repo="${args[$((i + 1))]:-}"
+    done
+    git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || return 0
+    local repo_abs
+    repo_abs="$(cd "$repo" && pwd)"
+    local export_root export
+    export_root="$(mktemp -d "${TMPDIR:-/tmp}/verify-mutations-export.XXXXXX")"
+    export="$export_root/$(basename "$repo_abs")"
+    mkdir -p "$export"
+    git -C "$repo" archive HEAD | tar -x -C "$export" || {
+        echo "verify-mutations: cannot export HEAD from $repo" >&2
+        exit 2
+    }
+    # Sibling path deps (`../toron`, `../elm-effect-rs`) resolve against the
+    # export's parent, so mirror the workspace layout with links.
+    local sibling
+    for sibling in "$(dirname "$repo_abs")"/*; do
+        [ -d "$sibling/.git" ] || continue
+        [ "$sibling" = "$repo_abs" ] && continue
+        ln -sfn "$sibling" "$export_root/$(basename "$sibling")"
+    done
+    local dirty
+    while IFS= read -r -d '' dirty; do
+        [ -n "$dirty" ] || continue
+        if [ -e "$repo_abs/$dirty" ]; then
+            mkdir -p "$export/$(dirname "$dirty")"
+            cp "$repo_abs/$dirty" "$export/$dirty"
+        else
+            rm -f "$export/$dirty"
+        fi
+    done < <(git -C "$repo_abs" ls-files -m -o -d --exclude-standard -z)
+    if [ ! -f "$export/scripts/verify-mutations.sh" ]; then
+        mkdir -p "$export/scripts"
+        cp "$SELF_PATH" "$export/scripts/verify-mutations.sh"
+    fi
+    local out_args=()
+    i=0
+    while [ "$i" -lt "${#args[@]}" ]; do
+        case "${args[$i]}" in
+            --repo)
+                out_args+=("--repo" "$export")
+                i=$((i + 2))
+                ;;
+            --cargo)
+                local cargo="${args[$((i + 1))]:-}"
+                case "$cargo" in
+                    /*) ;;
+                    *) [ -e "$cargo" ] && cargo="$PWD/$cargo" ;;
+                esac
+                out_args+=("--cargo" "$cargo")
+                i=$((i + 2))
+                ;;
+            -*)
+                out_args+=("${args[$i]}")
+                i=$((i + 1))
+                ;;
+            *)
+                local arg="${args[$i]}"
+                case "$arg" in
+                    "$repo_abs"/*) arg="$export/${arg#"$repo_abs"/}" ;;
+                    /*) ;;
+                    *) arg="$PWD/$arg" ;;
+                esac
+                out_args+=("$arg")
+                i=$((i + 1))
+                ;;
+        esac
+    done
+    echo "verify-mutations: scratch export $export (the shared tree is read only)"
+    cd "$export" || exit 2
+    VERIFY_MUTATIONS_IN_EXPORT=1 exec bash "$export/scripts/verify-mutations.sh" "${out_args[@]}"
+}
+
 # --- main -----------------------------------------------------------------
 
 on_signal() {
@@ -452,6 +546,7 @@ usage() {
 
 main() {
     local spec=""
+    isolate_if_shared "$@"
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --self-test) self_test; exit $? ;;
