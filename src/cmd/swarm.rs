@@ -322,7 +322,7 @@ pub(crate) fn cmd_swarm_apply(
     }
     // ADR-0022 D1: the plan is a durable object. A legacy swarm mints its record
     // here, with the seats it runs right now as the base, so the fold is total.
-    let record = crate::state::ensure_plan(project, serde_json::to_value(&rows)?)?;
+    let record = crate::state::ensure_plan(project, serde_json::to_value(live_base(&rows))?)?;
     let desired = patched_desired(&rows, patches, counts)?;
     let live: Vec<LiveSeat> = rows
         .iter()
@@ -448,6 +448,21 @@ pub(crate) fn retire_with(
     }
     let registry = crate::state::load_spawn_registry(project);
     let agents = backend.agent_list().unwrap_or_default();
+    // ADR-0022 D1: the retire is a plan event on the same path as its seat
+    // effect, recorded BEFORE it runs, so the fold stops planning the seat the
+    // operator removed and the next apply does not resurrect it.
+    let live_rows = seat_rows(
+        &registry,
+        &agents
+            .iter()
+            .map(|a| (a.pane_id.clone(), a.agent_status.as_str().to_string()))
+            .collect::<Vec<_>>(),
+        captain.as_deref(),
+    );
+    crate::state::ensure_plan(project, serde_json::to_value(live_base(&live_rows))?)?;
+    for pin in pins {
+        crate::state::append_plan_event(project, &format!("retire:{pin}"))?;
+    }
     let mut closed = Vec::new();
     for pin in pins {
         let pane = registry
@@ -631,14 +646,31 @@ pub(crate) fn fold_plan(record: &crate::state::PlanRecord) -> Result<Vec<Desired
         serde_json::from_value(record.base.clone().unwrap_or_else(|| json!([])))?;
     let mut patches = Vec::new();
     let mut counts = Vec::new();
+    let mut retired = Vec::new();
     for event in &record.patches {
         if let Some(spec) = event.strip_prefix("patch:") {
             patches.push(spec.to_string());
         } else if let Some(spec) = event.strip_prefix("count:") {
             counts.push(spec.to_string());
+        } else if let Some(pin) = event.strip_prefix("retire:") {
+            retired.push(pin.to_string());
         }
     }
-    patched_desired(&base, &patches, &counts)
+    // A retired seat leaves the fold, so the next apply does not resurrect what
+    // the operator removed.
+    let mut desired = patched_desired(&base, &patches, &counts)?;
+    desired.retain(|d| !d.pin.as_ref().is_some_and(|p| retired.contains(p)));
+    Ok(desired)
+}
+
+/// The base a legacy (pre-plan) swarm mints: the seats it actually runs. A
+/// registry row whose pane is gone never enters the record — minting from it
+/// would plan a spawn for a seat that no longer exists.
+pub(crate) fn live_base(rows: &[SeatRow]) -> Vec<SeatRow> {
+    rows.iter()
+        .filter(|r| r.status != "gone")
+        .cloned()
+        .collect()
 }
 
 fn patched_desired(
@@ -1567,6 +1599,37 @@ mod tests {
         assert_eq!(rows[0].mail_identity.as_deref(), Some("Beta"));
     }
 
+    /// ADR-0022 D1 (bd-6setu.3): the retire writes its plan event on the same
+    /// path as its seat effect, so the fold stops planning the seat. Without it
+    /// the next apply resurrects the pin the operator just removed.
+    #[test]
+    fn retire_journals_the_plan_event() {
+        let _g = lock_env();
+        let (cfg, _dir) = hermetic();
+        retire_registry(&[("wA:p1", "Alpha", "a-1")]);
+        let mux = FakeMux::default();
+        let mut ports = Fake::default();
+        let mut journal = MemJournal::default();
+        let mut release = |_pin: &str| Ok(1u64);
+        retire_with(
+            &mux,
+            &cfg,
+            "demo",
+            &["Alpha".into()],
+            false,
+            &mut journal,
+            &mut ports,
+            &mut release,
+        )
+        .expect("retire ok");
+        let record = crate::state::load_plan("demo").expect("the retire minted a plan record");
+        assert!(
+            record.patches.iter().any(|e| e == "retire:Alpha"),
+            "the retire is a plan event: {:?}",
+            record.patches
+        );
+    }
+
     /// A working pin is refused without `--force-working`, mirroring kill.
     #[test]
     fn retire_refuses_working_without_flag() {
@@ -1787,6 +1850,24 @@ mod plan_journal_tests {
             fold_plan(&record_with(&[])).unwrap(),
             "a fold that ignores its events is not a replay"
         );
+        let retired =
+            fold_plan(&record_with(&["patch:p1.model=zai/glm-5.3", "retire:p1"])).unwrap();
+        assert!(
+            retired.is_empty(),
+            "a retired seat leaves the fold, so apply cannot resurrect it: {retired:?}"
+        );
+    }
+
+    /// ADR-0022 D1: a legacy base is minted from the seats the fleet RUNS. A
+    /// registry row whose pane is gone must never enter the plan, or the first
+    /// apply would spawn a seat nobody has had for weeks.
+    #[test]
+    fn a_legacy_base_excludes_gone_rows() {
+        let mut gone = row("p2", "coder");
+        gone.status = "gone".to_string();
+        let base = super::live_base(&[row("p1", "coder"), gone]);
+        assert_eq!(base.len(), 1, "only the live seat is planned: {base:?}");
+        assert_eq!(base[0].pin, "p1");
     }
 }
 
