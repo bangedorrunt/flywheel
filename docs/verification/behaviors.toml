@@ -1139,3 +1139,16 @@ tests = [
 mutations = [
   "scripts/mutations/harness-registry-launch-columns.spec.sh#L1",
 ]
+
+[[behavior]]
+id = "harness.capability-rows-are-the-registry"
+owner = "src/harness_caps.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/harness_caps.rs::capability_rows_are_the_registry",
+  "src/harness_caps.rs::an_unverified_harness_cannot_be_marked_capable",
+]
+mutations = [
+  "scripts/mutations/caps-rows-follow-registry.spec.sh#R1",
+]

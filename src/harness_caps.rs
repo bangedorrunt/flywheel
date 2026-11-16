@@ -135,14 +135,17 @@ const SINK_WITNESS: &str = "only_the_sink_types_into_panes";
 const SINK_SHAPE_WITNESS: &str = "every_pane_write_renders_a_constant_shape";
 const FAKE_WITNESS: &str = "fake_harness_denies_once_and_types_no_interrupt";
 
-/// Harnesses this repo already names. No product row is verified for a hook,
-/// and `structured_question` / `mcp` are unsupported for every row: nothing in
-/// this repo implements them, so claiming them would be a lie the caller acts
-/// on. Injection, interrupt and resume go through the hc sink, which the
-/// sink fence and its shape test cover.
-pub const TABLE: &[HarnessCaps] = &[
+/// The capability shape every hc-driven harness carries: injection, interrupt
+/// and resume go through the pane sink (whose witnesses are named), steer falls
+/// back to mail because no product row has a verified hook, and neither
+/// structured questions nor a harness MCP door exists in this repo — claiming
+/// them would be a lie the caller acts on.
+///
+/// bd-6setu.1 (ADR-0022 D3): the harness LIST is the registry's; this is the
+/// policy those rows carry. One name set, one shape, no second vocabulary.
+const fn hc_pane_caps(harness: &'static str) -> HarnessCaps {
     HarnessCaps {
-        harness: "opencode",
+        harness,
         hook: None,
         verified_by: None,
         inject: Capability::supported(SINK_WITNESS),
@@ -151,62 +154,22 @@ pub const TABLE: &[HarnessCaps] = &[
         resume: Capability::supported(SINK_WITNESS),
         structured_question: Capability::unsupported(Fallback::Explicit),
         mcp: Capability::unsupported(Fallback::Explicit),
-    },
-    HarnessCaps {
-        harness: "pi",
-        hook: None,
-        verified_by: None,
-        inject: Capability::supported(SINK_WITNESS),
-        interrupt: Capability::supported(SINK_SHAPE_WITNESS),
-        steer: Capability::unsupported(Fallback::Mail),
-        resume: Capability::supported(SINK_WITNESS),
-        structured_question: Capability::unsupported(Fallback::Explicit),
-        mcp: Capability::unsupported(Fallback::Explicit),
-    },
-    HarnessCaps {
-        harness: "grok",
-        hook: None,
-        verified_by: None,
-        inject: Capability::supported(SINK_WITNESS),
-        interrupt: Capability::supported(SINK_SHAPE_WITNESS),
-        steer: Capability::unsupported(Fallback::Mail),
-        resume: Capability::supported(SINK_WITNESS),
-        structured_question: Capability::unsupported(Fallback::Explicit),
-        mcp: Capability::unsupported(Fallback::Explicit),
-    },
-    HarnessCaps {
-        harness: "omp",
-        hook: None,
-        verified_by: None,
-        inject: Capability::supported(SINK_WITNESS),
-        interrupt: Capability::supported(SINK_SHAPE_WITNESS),
-        steer: Capability::unsupported(Fallback::Mail),
-        resume: Capability::supported(SINK_WITNESS),
-        structured_question: Capability::unsupported(Fallback::Explicit),
-        mcp: Capability::unsupported(Fallback::Explicit),
-    },
-    HarnessCaps {
-        harness: "claude",
-        hook: None,
-        verified_by: None,
-        inject: Capability::supported(SINK_WITNESS),
-        interrupt: Capability::supported(SINK_SHAPE_WITNESS),
-        steer: Capability::unsupported(Fallback::Mail),
-        resume: Capability::supported(SINK_WITNESS),
-        structured_question: Capability::unsupported(Fallback::Explicit),
-        mcp: Capability::unsupported(Fallback::Explicit),
-    },
-    HarnessCaps {
-        harness: "codex",
-        hook: None,
-        verified_by: None,
-        inject: Capability::supported(SINK_WITNESS),
-        interrupt: Capability::supported(SINK_SHAPE_WITNESS),
-        steer: Capability::unsupported(Fallback::Mail),
-        resume: Capability::supported(SINK_WITNESS),
-        structured_question: Capability::unsupported(Fallback::Explicit),
-        mcp: Capability::unsupported(Fallback::Explicit),
-    },
+    }
+}
+
+/// Every registry harness as a capability row, canonical order.
+#[must_use]
+pub fn rows() -> Vec<HarnessCaps> {
+    crate::harness_registry::REGISTRY
+        .iter()
+        .map(|s| hc_pane_caps(s.canonical))
+        .collect()
+}
+
+/// The test-only fake harness: a verified hook row, so the hook doors have a
+/// live witness. Never part of the product set.
+#[cfg(test)]
+const fn fake_caps() -> HarnessCaps {
     HarnessCaps {
         harness: "fake",
         hook: Some("pre_tool_use"),
@@ -217,8 +180,8 @@ pub const TABLE: &[HarnessCaps] = &[
         resume: Capability::supported(FAKE_WITNESS),
         structured_question: Capability::unsupported(Fallback::Explicit),
         mcp: Capability::unsupported(Fallback::Explicit),
-    },
-];
+    }
+}
 
 /// Static hook body. Runs `toron next --urgent --peek` and branches on its
 /// exit code: 0 (urgent) denies the tool call with [`HOOK_REASON`], 1
@@ -251,19 +214,15 @@ pub fn capable(kind: &str) -> bool {
 /// `pane_write::Harness::from_kind`: `oc`/`opencode`, `gk`/`grok`, `pi`,
 /// `omp`, `claude`/`claude-code`/`cc`, `codex`/`cx`, `fake`. A kind nobody
 /// mapped has no row.
-pub fn row(kind: &str) -> Option<&'static HarnessCaps> {
-    let lower = kind.trim().to_ascii_lowercase();
-    let name = match lower.as_str() {
-        "oc" | "opencode" => "opencode",
-        "gk" | "grok" => "grok",
-        "pi" => "pi",
-        "omp" => "omp",
-        "claude" | "claude-code" | "cc" => "claude",
-        "codex" | "cx" => "codex",
-        "fake" => "fake",
-        _ => return None,
-    };
-    let found = TABLE.iter().find(|r| r.harness == name);
+pub fn row(kind: &str) -> Option<HarnessCaps> {
+    // bd-6setu.1: the spelling vocabulary is the registry's (`canonical`), so
+    // an alias added there answers here too.
+    let name = crate::harness_registry::canonical(kind.trim());
+    #[cfg(test)]
+    if name == "fake" {
+        return Some(fake_caps());
+    }
+    let found = crate::harness_registry::spec(&name).map(|s| hc_pane_caps(s.canonical));
     debug_assert!(
         found.is_none_or(|r| r.check().is_ok()),
         "the capability table's invariants hold in debug builds"
@@ -322,7 +281,7 @@ pub fn wake_route(kind: &str, hook_installed: bool) -> WakeRoute {
 
 /// The policy for one row, or for no row (see [`wake_route`]). Split out so a
 /// test can drive a refusing row without shipping one.
-pub fn route_for(row: Option<&HarnessCaps>, kind: &str, hook_installed: bool) -> WakeRoute {
+pub fn route_for(row: Option<HarnessCaps>, kind: &str, hook_installed: bool) -> WakeRoute {
     match row {
         Some(r) if r.inject.supported => WakeRoute::Inject {
             interrupt: interrupt_for(kind, hook_installed),
@@ -525,7 +484,7 @@ mod tests {
 
     #[test]
     fn an_unverified_harness_cannot_be_marked_capable() {
-        let good = *row("opencode").expect("opencode row");
+        let good = row("opencode").expect("opencode row");
         let bad = HarnessCaps {
             harness: "opencode",
             hook: Some("echo hi"),
@@ -559,7 +518,7 @@ mod tests {
         );
         let src = include_str!("harness_caps.rs");
         let sink = include_str!("pane_write.rs");
-        for row in TABLE {
+        for row in rows().into_iter().chain(std::iter::once(fake_caps())) {
             row.check().unwrap_or_else(|e| panic!("{e}"));
             for cap in [row.inject, row.interrupt, row.steer, row.resume] {
                 if let Some(witness) = cap.verified_by {
@@ -571,7 +530,8 @@ mod tests {
                 }
             }
             match row.harness {
-                "opencode" | "pi" | "grok" | "omp" | "claude" | "codex" => {
+                // Every registry harness is an hc pane with no verified hook.
+                _ if row.harness != "fake" => {
                     assert!(row.hook.is_none() && row.verified_by.is_none());
                     assert!(
                         row.inject.supported,
@@ -579,7 +539,7 @@ mod tests {
                         row.harness
                     );
                 }
-                "fake" => {
+                _ => {
                     assert_eq!(row.hook, Some("pre_tool_use"));
                     let v = row.verified_by.expect("fake names its fixture");
                     assert!(
@@ -587,7 +547,6 @@ mod tests {
                         "{v} is not a test in this file"
                     );
                 }
-                other => panic!("unexpected harness {other}"),
             }
         }
         assert!(!capable("opencode"));
@@ -637,9 +596,9 @@ mod tests {
 
         let refusing = HarnessCaps {
             inject: Capability::unsupported(Fallback::Mail),
-            ..*row("opencode").expect("opencode row")
+            ..row("opencode").expect("opencode row")
         };
-        let WakeRoute::NoDoor(no_door) = route_for(Some(&refusing), "opencode", false) else {
+        let WakeRoute::NoDoor(no_door) = route_for(Some(refusing), "opencode", false) else {
             panic!("a row that records no door must not be typed into");
         };
         assert_eq!(no_door.harness, "opencode");
@@ -662,7 +621,7 @@ mod tests {
             7,
             &line,
             toron_core::wake::Urgency::Urgent,
-            route_for(Some(&refusing), "opencode", false),
+            route_for(Some(refusing), "opencode", false),
             crate::pane_screen::InputLine::Empty,
         )
         .expect("a no-door route is not a sink failure");
@@ -942,5 +901,31 @@ mod tests {
             self.0.lock().unwrap().push(format!("{target} close"));
             Ok(())
         }
+    }
+
+    /// bd-6setu.1 (ADR-0022 D3): capability rows ARE the registry's harnesses.
+    /// A harness added there is capability-known with no second list, and its
+    /// aliases answer because the registry says they do.
+    #[test]
+    fn capability_rows_are_the_registry() {
+        let rows = rows();
+        let names: Vec<&str> = rows.iter().map(|r| r.harness).collect();
+        let want: Vec<&str> = crate::harness_registry::REGISTRY
+            .iter()
+            .map(|s| s.canonical)
+            .collect();
+        assert_eq!(names, want, "one row per registry harness, canonical order");
+        for spec in crate::harness_registry::REGISTRY {
+            let r = row(spec.canonical).expect("a registry harness has a row");
+            assert_eq!(r.harness, spec.canonical);
+            for alias in spec.aliases {
+                assert_eq!(
+                    row(alias).map(|r| r.harness),
+                    Some(spec.canonical),
+                    "the registry alias {alias} answers here too"
+                );
+            }
+        }
+        assert!(row("widget").is_none(), "an unknown kind has no row");
     }
 }

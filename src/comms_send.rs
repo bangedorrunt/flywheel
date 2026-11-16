@@ -970,9 +970,7 @@ fn tier_of_recipient(
         .iter()
         .find(|e| e.mail_identity.as_deref() == Some(pin));
     let kind = entry.and_then(|e| e.harness.clone()).unwrap_or_default();
-    let caps = crate::harness_caps::TABLE
-        .iter()
-        .find(|c| c.harness == kind.as_str());
+    let caps = crate::harness_caps::row(kind.as_str());
     let location_hosted = crate::agent_ref::binding_location_for(project, pin)
         == crate::agent_ref::BindingLocation::Hosted;
     crate::captain_directory::tier_of(&TierSnapshot {
@@ -1466,9 +1464,9 @@ mod tests {
             inject: crate::harness_caps::Capability::unsupported(
                 crate::harness_caps::Fallback::Mail,
             ),
-            ..*crate::harness_caps::row("opencode").expect("opencode row")
+            ..crate::harness_caps::row("opencode").expect("opencode row")
         };
-        let note = match crate::harness_caps::route_for(Some(&refusing), "opencode", false) {
+        let note = match crate::harness_caps::route_for(Some(refusing), "opencode", false) {
             crate::harness_caps::WakeRoute::NoDoor(no_door) => {
                 crate::harness_caps::no_door_line(&no_door)
             }

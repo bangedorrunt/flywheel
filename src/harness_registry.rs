@@ -131,7 +131,7 @@ pub const REGISTRY: &[HarnessSpec] = &[
     },
     HarnessSpec {
         canonical: "codex",
-        aliases: &[],
+        aliases: &["cx"],
         tier: HarnessTier::Closed,
         implied_slot: None,
         coupled: true,
@@ -144,7 +144,7 @@ pub const REGISTRY: &[HarnessSpec] = &[
     },
     HarnessSpec {
         canonical: "claude",
-        aliases: &[],
+        aliases: &["cc", "claude-code"],
         tier: HarnessTier::Closed,
         implied_slot: None,
         coupled: true,
