@@ -2,7 +2,7 @@
 # bd-4z7mb: the commit-time gate. Fences the STAGED index, not the tree, so a
 # caller staged without its callee dies here instead of breaking HEAD for every
 # lane. Install once per clone: bash scripts/hooks/install.sh
-# Measured on this host, warm: ~50s end to end (cargo clippy, all targets, -D
+# Measured on this host, warm: ~55s end to end (cargo clippy, all targets, -D
 # warnings); a cold cache is minutes. Clippy carries the type check too, so it
 # replaces the check leg rather than adding one. The frozen --sha fence still
 # does the full build.
