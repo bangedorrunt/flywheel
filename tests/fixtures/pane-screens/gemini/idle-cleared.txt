@@ -1,0 +1,36 @@
+
+ ███            █████████  ██████████ ██████   ██████ █████ ██████   █████ █████
+░░░███         ███░░░░░███░░███░░░░░█░░██████ ██████ ░░███ ░░██████ ░░███ ░░███
+  ░░░███      ███     ░░░  ░███  █ ░  ░███░█████░███  ░███  ░███░███ ░███  ░███
+    ░░░███   ░███          ░██████    ░███░░███ ░███  ░███  ░███░░███░███  ░███
+     ███░    ░███    █████ ░███░░█    ░███ ░░░  ░███  ░███  ░███ ░░██████  ░███
+   ███░      ░░███  ░░███  ░███ ░   █ ░███      ░███  ░███  ░███  ░░█████  ░███
+ ███░         ░░█████████  ██████████ █████     █████ █████ █████  ░░█████ █████
+░░░            ░░░░░░░░░  ░░░░░░░░░░ ░░░░░     ░░░░░ ░░░░░ ░░░░░    ░░░░░ ░░░░░
+
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ Gemini 3 Flash and Pro are now available.                                    │
+│ Enable "Preview features" in /settings.                                      │
+│ Learn more at https://goo.gle/enable-preview-features                        │
+╰──────────────────────────────────────────────────────────────────────────────╯
+Tips for getting started:
+1. Ask questions, edit files, or run commands.
+2. Be specific for the best results.
+3. /help for more information.
+✕ Error during discovery for MCP server 'chiebukuro': MCP error -32000:
+  Connection closed
+
+
+ℹ Update successful! The new version will be used on your next run.
+
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ You are running Gemini CLI in your home directory. It is recommended to run  │
+│ in a project-specific directory.                                             │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+
+ Using: 1 GEMINI.md file | 1 MCP server
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ >   Type your message or @path/to/file                                       │
+╰──────────────────────────────────────────────────────────────────────────────╯
+ ~                     no sandbox                      Auto (Gemini 2.5) /model

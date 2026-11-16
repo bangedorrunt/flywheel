@@ -63,6 +63,13 @@ fn every_captured_screen_classifies() {
             .file_name()
             .and_then(|n| n.to_str())
             .expect("harness name");
+        if !path.join("index.toml").is_file() {
+            assert!(
+                path.join("GAP.md").is_file(),
+                "{harness}: a harness directory without index.toml must document its gap in GAP.md"
+            );
+            continue;
+        }
         let rows = rows(harness);
         assert!(
             rows.len() >= 6,
@@ -90,7 +97,10 @@ fn every_captured_screen_classifies() {
         }
         harnesses += 1;
     }
-    assert!(harnesses > 0, "no captured harnesses under {root}");
+    assert!(
+        harnesses >= 4,
+        "expected at least four captured harnesses (opencode, claude, gemini, pi), found {harnesses}"
+    );
 }
 
 /// A harness with no capture is `Unknown`, and `Unknown` never blocks a wake on

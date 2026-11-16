@@ -1,0 +1,24 @@
+
+ Warning: (fff): Your cwd (/Users/bangedorrunt) is too large. Indexing will     
+ take additional time and resources.                                            
+ You can prevent home dir indexing with --fff-enable-home-scan=false,           
+ FFF_ENABLE_HOME_SCAN=0, or "enableHomeDirScanning": false in pi-fff.json. To   
+ keep indexing but silence this warning use --fff-warn-home-scan=false,         
+ FFF_WARN_HOME_SCAN=0, or "warnOnHomeDirScan": false in pi-fff.json.            
+
+ Ponytail loaded: full                                                          
+
+────────────────────────────────────────────────────────────────────────────────
+ Package Updates Available                                                      
+ Package updates are available. Run pi update --extensions                      
+ Packages:                                                                      
+ - pi-web-access                                                                
+────────────────────────────────────────────────────────────────────────────────
+
+
+────────────────────────────────────────────────────────────────────────────────
+                                                                                
+────────────────────────────────────────────────────────────────────────────────
+~
+0.0%/1.0M (auto)                 (opencode-go) muse-spark-1.3-contributor • high
+○ 🐴 ponytail: ⚡ FULL

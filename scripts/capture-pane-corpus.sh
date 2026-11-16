@@ -55,6 +55,16 @@ for h in "${HARNESSES[@]}"; do
     continue
   }
   sleep 12
+  # claude opens on a trust prompt (the cursor starts on "No, exit"); confirm
+  # the project so the capture is a prompt, not a gate.
+  if [ "$h" = claude ]; then
+    cur="$(rex capture -s "$SESSION" --block "$b" 2>/dev/null || true)"
+    if printf '%s' "$cur" | grep -q "Is this a project you created"; then
+      rex send-key -s "$SESSION" --block "$b" down >/dev/null 2>&1
+      rex send-key -s "$SESSION" --block "$b" enter >/dev/null 2>&1
+      sleep 8
+    fi
+  fi
   cap "$h" "$b" idle-fresh
 
   rex send -s "$SESSION" --block "$b" "half typed line" >/dev/null 2>&1

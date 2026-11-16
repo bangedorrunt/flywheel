@@ -1,0 +1,24 @@
+ keep indexing but silence this warning use --fff-warn-home-scan=false,         
+ FFF_WARN_HOME_SCAN=0, or "warnOnHomeDirScan": false in pi-fff.json.            
+
+ Ponytail loaded: full                                                          
+
+────────────────────────────────────────────────────────────────────────────────
+ Package Updates Available                                                      
+ Package updates are available. Run pi update --extensions                      
+ Packages:                                                                      
+ - pi-web-access                                                                
+────────────────────────────────────────────────────────────────────────────────
+
+                                                                                
+ Reply with exactly: OK                                                         
+                                                                                
+
+ OK                                                                             
+
+── ⠸ Working ───────────────────────────────────────────────────────────────────
+                                                                                
+────────────────────────────────────────────────────────────────────────────────
+~
+3.5%/1.0M (auto)                 (opencode-go) muse-spark-1.3-contributor • high
+● 🐴 ponytail: ⚡ FULL

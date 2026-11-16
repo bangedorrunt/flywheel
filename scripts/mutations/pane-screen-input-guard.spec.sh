@@ -20,3 +20,9 @@ mutation "G2  the harness echo of our own line reads as operator text" \
 ' \
     replace='        || false
 '
+
+mutation "G3  ring_wake ignores the captured input line" \
+    file=src/inbox_ports.rs \
+    expect=pane_screen_defers_a_typed_box_and_types_nothing \
+    find='    if !crate::pane_screen::may_inject(input) {' \
+    replace='    if false {'

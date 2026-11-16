@@ -3,14 +3,13 @@
 //! The operator supervises through the same panes crews run in. An injected
 //! prompt that lands while a half-typed line sits in the input box corrupts
 //! both, so the wake path refuses to type when the box is not empty and defers
-//! instead.
+//! instead — the wake stays queued for the next idle edge, never a timer.
 //!
-//! Scope: this answers ONE question from ONE captured frame — is the input line
-//! empty? It deliberately does not try to answer "is the harness idle": for
-//! opencode's chat view the working and finished frames are visually identical
-//! (measured, bd-0uzrq.3), so idle/working stays with the plane status gate and
-//! the transcript readers. Anything unrecognized is `Unknown`, which never
-//! blocks a wake on its own.
+//! Scope (approved split, bd-0uzrq.3): a captured frame answers ONE question —
+//! is the operator typing? Idle vs working stays status-derived (the plane
+//! status gate plus the transcript and activity readers); frames cannot tell
+//! those apart for every harness (measured: opencode's working and
+//! idle-after-turn frames differ only by a post-turn footer).
 
 /// What the input line says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,63 +27,98 @@ pub fn may_inject(line: InputLine) -> bool {
     !matches!(line, InputLine::OperatorText)
 }
 
-/// The prompt markers whose line IS the input box, per harness. A harness with
-/// no entry here returns [`InputLine::Unknown`].
-fn box_marker(harness: &str) -> Option<&'static str> {
+fn canonical(harness: &str) -> String {
     match harness.trim().to_ascii_lowercase().as_str() {
-        "opencode" | "oc" => Some("┃"),
-        _ => None,
+        "oc" | "opencode" => "opencode".to_string(),
+        "cc" | "claude" | "claude-code" => "claude".to_string(),
+        other => other.to_string(),
     }
 }
 
-/// Placeholders that mean "the box is empty" for that harness.
-fn placeholders(harness: &str) -> &'static [&'static str] {
-    match harness.trim().to_ascii_lowercase().as_str() {
-        "opencode" | "oc" => &["Ask anything…", "Ask anything..."],
-        _ => &[],
-    }
+/// The trailing box/scrollbar glyphs a capture carries at the right edge.
+fn trim_box_edge(text: &str) -> &str {
+    text.trim_end_matches(|c: char| {
+        c == '█' || c == '│' || c == '╮' || c == '╯' || c == '╰' || c.is_whitespace()
+    })
 }
 
-/// Classify the LAST captured screen (terminal tail) for `harness`.
+/// The content line of a marker-prefixed input box, scanning up from the tail.
 ///
-/// The box is the last marker line above the status footer. `last_typed` is the
-/// line the wake path itself wrote: opencode keeps the SUBMITTED text visible
-/// in the box, so a box holding exactly that line is not operator typing —
-/// measured in the corpus (`working.txt`, `idle-after-turn.txt`). Without this,
-/// every wake after the first turn would defer forever.
-pub fn input_line_for(harness: &str, tail: &str, last_typed: Option<&str>) -> InputLine {
-    let Some(marker) = box_marker(harness) else {
-        return InputLine::Unknown;
-    };
-    let placeholders = placeholders(harness);
+/// `skip` drops the footer lines the same box character draws under the input
+/// (opencode prints its model line there). `None` means there is no such box on
+/// screen at all.
+fn marker_box(tail: &str, marker: &str, skip: &dyn Fn(&str) -> bool) -> Option<String> {
     let mut saw_box = false;
-    let mut content: Option<&str> = None;
     for line in tail.lines().rev() {
         let trimmed = line.trim_start();
         let Some(rest) = trimmed.strip_prefix(marker) else {
             continue;
         };
-        let text = rest
-            .trim()
-            .trim_end_matches(|c: char| c == '█' || c.is_whitespace());
-        // The same box character draws the model/status footer under the input
-        // line; that is not the input.
-        if text.starts_with("Build ") || text.contains("shift+tab") {
+        let text = trim_box_edge(rest.trim());
+        if skip(text) {
             continue;
         }
         saw_box = true;
-        // The block pads the content line with empty box lines on both sides.
+        // The block pads the content line with empty box lines on both sides,
+        // so an empty line is not yet the answer.
         if !text.is_empty() {
-            content = Some(text);
-            break;
+            return Some(text.to_string());
         }
     }
-    if !saw_box {
-        return InputLine::Unknown;
+    saw_box.then(String::new)
+}
+
+/// pi draws a bare input line between two rules, above a footer carrying the
+/// context percentage. No marker, so the box is positional.
+fn pi_box(tail: &str) -> Option<String> {
+    let lines: Vec<&str> = tail.lines().collect();
+    let footer = lines.iter().rposition(|l| l.contains("%/1.0M"))?;
+    // The box's rules are drawn with ─; pi also draws a spinner rule
+    // ("── ⠸ Working ─…") inside the same block while a turn runs.
+    let is_rule = |l: &str| l.trim().starts_with('─');
+    let mut i = footer;
+    while i > 0 {
+        if is_rule(lines[i]) {
+            let mut content: Vec<&str> = Vec::new();
+            let mut j = i - 1;
+            while j > 0 && !is_rule(lines[j]) {
+                content.push(lines[j].trim());
+                j -= 1;
+            }
+            return Some(content.join(" ").trim().to_string());
+        }
+        i -= 1;
     }
-    let Some(content) = content else {
-        return InputLine::Empty;
+    None
+}
+
+/// Classify the LAST captured screen (terminal tail) for `harness`.
+///
+/// `last_typed` is the line the wake path itself wrote: opencode and claude
+/// keep SUBMITTED text visible in the box, so a box holding exactly that line
+/// is not operator typing — measured in the corpus.
+pub fn input_line_for(harness: &str, tail: &str, last_typed: Option<&str>) -> InputLine {
+    let harness = canonical(harness);
+    let content: Option<String> = match harness.as_str() {
+        "opencode" => marker_box(tail, "┃", &|text| {
+            text.starts_with("Build ") || text.contains("shift+tab")
+        }),
+        "claude" => marker_box(tail, "❯", &|_| false),
+        "gemini" => marker_box(tail, "│", &|text| !text.starts_with('>')),
+        "pi" => pi_box(tail),
+        _ => return InputLine::Unknown,
     };
+    let placeholders: &[&str] = match harness.as_str() {
+        "opencode" => &["Ask anything…", "Ask anything..."],
+        "claude" => &["Try \""],
+        "gemini" => &["Type your message"],
+        _ => &[],
+    };
+    let Some(content) = content else {
+        return InputLine::Unknown;
+    };
+    // gemini prefixes the content with `>` inside the box.
+    let content = content.trim_start_matches('>').trim();
     if content.is_empty()
         || placeholders.iter().any(|p| content.starts_with(p))
         || last_typed.is_some_and(|typed| !typed.is_empty() && content == typed.trim())

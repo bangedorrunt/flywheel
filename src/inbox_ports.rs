@@ -312,6 +312,32 @@ impl FlywheelPorts {
         Client::connect(Some(&self.cfg.socket_path())).ok()
     }
 
+    /// bd-0uzrq.3: the input line this pane is showing, read through the ONE
+    /// read port so hc and rex answer the same question. An unreadable pane is
+    /// a refusal ("deferred"), never a type.
+    fn pane_input_line(
+        &self,
+        pane_id: &str,
+        harness: &str,
+    ) -> Result<crate::pane_screen::InputLine, String> {
+        if !is_rex_block(pane_id) {
+            let client = self.client().ok_or("hc unreachable")?;
+            return crate::pane_read::gate(
+                &crate::pane_read::HcReader(&client),
+                harness,
+                pane_id,
+                None,
+            );
+        }
+        let backend = crate::backend::multiplexer_backend(&self.cfg).map_err(|e| e.to_string())?;
+        crate::pane_read::gate(
+            &crate::pane_read::PlaneReader(&*backend),
+            harness,
+            pane_id,
+            None,
+        )
+    }
+
     /// Pure: project a backend agent row onto the pane shape the wake rule
     /// folds. `agent_list` (unlike `pane_list`) classifies status through
     /// block records plus the process fallback; rex rows carry no stamped
@@ -587,6 +613,10 @@ pub(crate) async fn urgency_of_unread(
 pub(crate) enum RingDone {
     Typed,
     NoDoor(crate::harness_caps::NoDoor),
+    /// The pane is not ours to type into right now (operator text in the box,
+    /// or a box we could not read). The wake stays queued for the next idle
+    /// edge — bd-0uzrq.3.
+    Deferred(&'static str),
 }
 
 /// Type the wake for `wm`.
@@ -605,9 +635,15 @@ pub(crate) fn ring_wake(
     line: &str,
     urgency: Urgency,
     route: crate::harness_caps::WakeRoute,
+    input: crate::pane_screen::InputLine,
 ) -> Result<RingDone, String> {
     use crate::harness_caps::WakeRoute;
     use crate::pane_write::{PaneWrite, Urgency as U, Wm};
+    if !crate::pane_screen::may_inject(input) {
+        return Ok(RingDone::Deferred(
+            "operator text in the input line; the wake stays queued for the next idle edge",
+        ));
+    }
     let interrupt = match route {
         WakeRoute::Inject { interrupt } => interrupt,
         WakeRoute::NoDoor(no_door) => return Ok(RingDone::NoDoor(no_door)),
@@ -787,6 +823,11 @@ impl Ports for FlywheelPorts {
             .find(|e| e.pane_id == pane_id)
             .and_then(|e| e.harness)
             .unwrap_or_default();
+        // bd-0uzrq.3: the operator supervises through these same panes. Never
+        // type over a half-typed line, and never type into a pane we cannot
+        // read — a deferral is reported as a refusal, so the wake re-rings on
+        // the next idle edge instead of a timer firing into their input.
+        let input = self.pane_input_line(pane_id, &kind)?;
         let route =
             crate::harness_caps::wake_route(&kind, crate::harness_caps::installed_from_env());
         if !is_rex_block(pane_id) {
@@ -798,9 +839,11 @@ impl Ports for FlywheelPorts {
                 line,
                 urgency,
                 route,
+                input,
             )? {
                 RingDone::Typed => Ok(()),
                 RingDone::NoDoor(no_door) => Err(crate::harness_caps::no_door_line(&no_door)),
+                RingDone::Deferred(why) => Err(format!("deferred ({pane_id}): {why}")),
             };
         }
         #[cfg(feature = "backend-superlogical")]
@@ -814,9 +857,11 @@ impl Ports for FlywheelPorts {
                 line,
                 urgency,
                 route,
+                input,
             )? {
                 RingDone::Typed => Ok(()),
                 RingDone::NoDoor(no_door) => Err(crate::harness_caps::no_door_line(&no_door)),
+                RingDone::Deferred(why) => Err(format!("deferred ({pane_id}): {why}")),
             }
         }
         #[cfg(not(feature = "backend-superlogical"))]
@@ -1042,6 +1087,32 @@ mod tests {
         )
     }
 
+    /// bd-0uzrq.3: the operator supervises through these panes. A box holding
+    /// their half-typed line defers the wake — nothing is typed, and the caller
+    /// takes it as "not rung" so the next idle edge re-rings.
+    #[test]
+    fn pane_screen_defers_a_typed_box_and_types_nothing() {
+        let pane = Rec::default();
+        let done = ring_wake(
+            &pane,
+            "w1:a",
+            9,
+            &fold_line(9),
+            Urgency::Normal,
+            crate::harness_caps::WakeRoute::Inject { interrupt: false },
+            crate::pane_screen::InputLine::OperatorText,
+        )
+        .expect("a deferral is not an error");
+        assert!(
+            matches!(done, RingDone::Deferred(why) if why.contains("operator text")),
+            "expected a deferral, got {done:?}"
+        );
+        assert!(
+            pane.0.lock().unwrap().is_empty(),
+            "a deferred wake types nothing"
+        );
+    }
+
     #[test]
     fn steer_priority_makes_the_observation_urgent_and_a_non_steer_does_not() {
         let urgent = steer("resume", "urgent");
@@ -1066,6 +1137,7 @@ mod tests {
             &fold_line(7),
             urgency_of_envelope(&urgent),
             interrupt,
+            crate::pane_screen::InputLine::Empty,
         )
         .unwrap();
         ring_wake(
@@ -1075,6 +1147,7 @@ mod tests {
             &fold_line(8),
             urgency_of_envelope(&notify),
             interrupt,
+            crate::pane_screen::InputLine::Empty,
         )
         .unwrap();
         let writes = pane.0.lock().unwrap().clone();

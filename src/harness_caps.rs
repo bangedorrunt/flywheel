@@ -663,6 +663,7 @@ mod tests {
             &line,
             toron_core::wake::Urgency::Urgent,
             route_for(Some(&refusing), "opencode", false),
+            crate::pane_screen::InputLine::Empty,
         )
         .expect("a no-door route is not a sink failure");
         assert_eq!(done, crate::inbox_ports::RingDone::NoDoor(no_door));
@@ -821,6 +822,7 @@ mod tests {
             ),
             toron_core::wake::Urgency::Urgent,
             wake_route("fake", true),
+            crate::pane_screen::InputLine::Empty,
         )
         .unwrap();
         crate::inbox_ports::ring_wake(
@@ -833,6 +835,7 @@ mod tests {
             ),
             toron_core::wake::Urgency::Urgent,
             wake_route("pi", true),
+            crate::pane_screen::InputLine::Empty,
         )
         .unwrap();
         let writes = pane.lines();

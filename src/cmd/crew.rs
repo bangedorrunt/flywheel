@@ -527,7 +527,15 @@ fn ring_prompt_wake(
     // flight"; upgrade if a harness is found where capture fails but status is
     // trustworthy.
     let before = probe(target).ok().map(|(screen, _)| screen_digest(&screen));
-    let done = crate::inbox_ports::ring_wake(typer, target, wm, &fold, urgency, route)?;
+    let done = crate::inbox_ports::ring_wake(
+        typer,
+        target,
+        wm,
+        &fold,
+        urgency,
+        route,
+        crate::pane_screen::InputLine::Unknown,
+    )?;
     if done != crate::inbox_ports::RingDone::Typed {
         return Ok(done);
     }
@@ -658,6 +666,9 @@ fn deliver_prompt_wake_hc(
         crate::pane_write::WAKE_LANDING_BOUND,
     ) {
         Ok(crate::inbox_ports::RingDone::Typed) => Ok(prompt_wake_line(wm, urgent)),
+        Ok(crate::inbox_ports::RingDone::Deferred(why)) => {
+            bail!("wake line deferred for {pin} ({target}): {why}")
+        }
         Ok(crate::inbox_ports::RingDone::NoDoor(no_door)) => {
             bail!(
                 "wake line could not be delivered to {pin} ({target}): {}",
@@ -727,6 +738,9 @@ fn deliver_prompt_wake_rex(
         crate::pane_write::WAKE_LANDING_BOUND,
     ) {
         Ok(crate::inbox_ports::RingDone::Typed) => Ok(prompt_wake_line(wm, urgent)),
+        Ok(crate::inbox_ports::RingDone::Deferred(why)) => {
+            bail!("wake line deferred for {pin} ({target}): {why}")
+        }
         Ok(crate::inbox_ports::RingDone::NoDoor(no_door)) => {
             bail!(
                 "wake line could not be delivered to {pin} ({target}): {}",
@@ -1263,6 +1277,7 @@ mod tests {
             &prompt_wake_line(42, true),
             toron_core::wake::Urgency::Urgent,
             WakeRoute::Inject { interrupt: true },
+            crate::pane_screen::InputLine::Empty,
         )
         .expect_err("the fold must name the normal line");
         assert!(err.contains("fold line differs"), "got: {err}");

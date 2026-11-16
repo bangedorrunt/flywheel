@@ -1,0 +1,31 @@
+# Captured from a throwaway rex session by scripts/capture-pane-corpus.sh
+# (bd-0uzrq.3). Every row is a real screen.
+# last_typed: the harness keeps SUBMITTED text in the box; a box holding
+# exactly the line we typed is not operator typing.
+
+[[screen]]
+file = "idle-fresh.txt"
+expect = "empty"
+
+[[screen]]
+file = "partial-input.txt"
+expect = "operator-text"
+
+[[screen]]
+file = "idle-cleared.txt"
+expect = "empty"
+
+[[screen]]
+file = "working.txt"
+expect = "empty"
+last_typed = "Reply with exactly: OK"
+
+[[screen]]
+file = "idle-after-turn.txt"
+expect = "empty"
+last_typed = "Reply with exactly: OK"
+
+[[screen]]
+file = "modal.txt"
+expect = "empty"
+last_typed = "Reply with exactly: OK"

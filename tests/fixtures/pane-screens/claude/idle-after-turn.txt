@@ -1,0 +1,24 @@
+
+ ▐▛███▛█   Claude Code v2.1.325
+▝▜██████▀  Opus 5.5 · Claude Pro
+ ▝▝   ▝▝   /Users/bangedorrunt
+
+⚠ Code Mode (experimental) is on · this session can be resumed only with Code 
+  Mode on
+
+❯ Reply with exactly: OK                                                        
+
+⏺ OK
+
+✻ Crunched for 3s · done 5:25 PM
+
+
+
+
+
+
+                                                            
+────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent

@@ -1,0 +1,49 @@
+
+ ███            █████████  ██████████ ██████   ██████ █████ ██████   █████ █████
+░░░███         ███░░░░░███░░███░░░░░█░░██████ ██████ ░░███ ░░██████ ░░███ ░░███
+  ░░░███      ███     ░░░  ░███  █ ░  ░███░█████░███  ░███  ░███░███ ░███  ░███
+    ░░░███   ░███          ░██████    ░███░░███ ░███  ░███  ░███░░███░███  ░███
+     ███░    ░███    █████ ░███░░█    ░███ ░░░  ░███  ░███  ░███ ░░██████  ░███
+   ███░      ░░███  ░░███  ░███ ░   █ ░███      ░███  ░███  ░███  ░░█████  ░███
+ ███░         ░░█████████  ██████████ █████     █████ █████ █████  ░░█████ █████
+░░░            ░░░░░░░░░  ░░░░░░░░░░ ░░░░░     ░░░░░ ░░░░░ ░░░░░    ░░░░░ ░░░░░
+
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ Gemini 3 Flash and Pro are now available.                                    │
+│ Enable "Preview features" in /settings.                                      │
+│ Learn more at https://goo.gle/enable-preview-features                        │
+╰──────────────────────────────────────────────────────────────────────────────╯
+Tips for getting started:
+1. Ask questions, edit files, or run commands.
+2. Be specific for the best results.
+3. /help for more information.
+✕ Error during discovery for MCP server 'chiebukuro': MCP error -32000:
+  Connection closed
+
+
+ℹ Update successful! The new version will be used on your next run.
+
+> Reply with exactly: OK
+
+✕ [API Error: {"error":{"message":"{\n  \"error\": {\n    \"code\": 401,\n
+  \"message\": \"API key not valid. Please pass a valid API key.\",\n
+  \"status\": \"UNAUTHENTICATED\",\n    \"details\": [\n      {\n
+  \"@type\": \"type.googleapis.com/google.rpc.ErrorInfo\",\n        \"reason\":
+  \"ACCESS_TOKEN_TYPE_UNSUPPORTED\",\n        \"metadata\": {\n
+  \"method\":
+  \"google.ai.generativelanguage.v1beta.GenerativeService.StreamGenerateContent\
+  ",\n          \"service\": \"generativelanguage.googleapis.com\"\n        }\n
+  }\n    ]\n  }\n}\n","code":401,"status":""}}]
+
+
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ You are running Gemini CLI in your home directory. It is recommended to run  │
+│ in a project-specific directory.                                             │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+
+ Using: 1 GEMINI.md file | 1 MCP server
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ >   Type your message or @path/to/file                                       │
+╰──────────────────────────────────────────────────────────────────────────────╯
+ ~      no sandbox      Auto (Gemini 2.5) /model | ✖ 2 errors (F12 for details)

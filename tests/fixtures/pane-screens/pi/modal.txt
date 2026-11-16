@@ -1,0 +1,24 @@
+
+ Ponytail loaded: full                                                          
+
+────────────────────────────────────────────────────────────────────────────────
+ Package Updates Available                                                      
+ Package updates are available. Run pi update --extensions                      
+ Packages:                                                                      
+ - pi-web-access                                                                
+────────────────────────────────────────────────────────────────────────────────
+
+                                                                                
+ Reply with exactly: OK                                                         
+                                                                                
+
+ OK                                                                             
+
+ Switched to Anthropic: Claude Fable Latest (thinking: high)                    
+
+────────────────────────────────────────────────────────────────────────────────
+                                                                                
+────────────────────────────────────────────────────────────────────────────────
+~
+↑36k ↓16 $0.004 3.6%/1.0M (auto)           ~anthropic/claude-fable-latest • high
+○ 🐴 ponytail: ⚡ FULL
