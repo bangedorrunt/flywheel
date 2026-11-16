@@ -210,6 +210,29 @@ pub(crate) fn seat_rows(
         .collect()
 }
 
+/// ADR-0022 D1 (bd-6setu.3): the plan OF RECORD — what the journal still plans,
+/// beside what the fleet runs. Pure: the caller supplies the live rows, so the
+/// divergence an operator sees is a fact about two inputs, never ambient state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlanView {
+    pub id: String,
+    /// Seats the record plans (base folded through every event).
+    pub planned: usize,
+    /// Seats the live registry runs.
+    pub live: usize,
+}
+
+pub(crate) fn plan_of_record(
+    record: &crate::state::PlanRecord,
+    live: &[SeatRow],
+) -> Result<PlanView> {
+    Ok(PlanView {
+        id: record.id.clone(),
+        planned: fold_plan(record)?.len(),
+        live: live.len(),
+    })
+}
+
 fn cmd_swarm_status(cfg: &Config, project: &str, json: bool) -> Result<()> {
     let registry = crate::state::load_spawn_registry(project);
     if registry.is_empty() {
@@ -227,11 +250,17 @@ fn cmd_swarm_status(cfg: &Config, project: &str, json: bool) -> Result<()> {
         &crate::project_dir_str(cfg, project).unwrap_or_else(|_| project.to_string()),
     );
     let rows = seat_rows(&registry, &agents, captain.as_deref());
+    let plan = match crate::state::load_plan(project) {
+        Some(record) => Some(plan_of_record(&record, &rows)?),
+        None => None,
+    };
     if json {
         print_json(&json!({
             "schema": "flywheel-seats.v1",
             "project": project,
-            "plan_id": crate::state::load_plan(project).map(|r| r.id),
+            "plan_id": plan.as_ref().map(|p| p.id.clone()),
+            "plan_seats": plan.as_ref().map(|p| p.planned),
+            "plan_matches_fleet": plan.as_ref().map(|p| p.planned == p.live),
             "seats": rows.iter().map(|r| json!({
                 "pin": r.pin,
                 "name": r.name,
@@ -1757,6 +1786,48 @@ mod plan_journal_tests {
             folded,
             fold_plan(&record_with(&[])).unwrap(),
             "a fold that ignores its events is not a replay"
+        );
+    }
+}
+
+#[cfg(test)]
+mod plan_of_record_tests {
+    use super::{SeatRow, plan_of_record};
+
+    fn row(pin: &str) -> SeatRow {
+        SeatRow {
+            pin: pin.into(),
+            name: pin.into(),
+            role: "coder".into(),
+            harness: "pi".into(),
+            model: None,
+            effort: None,
+            mode: None,
+            pane_id: format!("{pin}-pane"),
+            status: "live".into(),
+        }
+    }
+
+    /// ADR-0022 D1 (bd-6setu.3): the plan of record is the FOLD, so a seat the
+    /// journal still plans reads as planned-but-not-live instead of vanishing
+    /// because the fleet lost it.
+    #[test]
+    fn the_plan_of_record_counts_the_journal_not_the_fleet() {
+        let record = crate::state::PlanRecord {
+            id: "plan-view".to_string(),
+            plan: crate::swarm_plan::Plan::new("swarm"),
+            base: Some(serde_json::to_value(vec![row("p1"), row("p2")]).unwrap()),
+            patches: Vec::new(),
+        };
+        let view = plan_of_record(&record, &[row("p1")]).unwrap();
+        assert_eq!(view.planned, 2, "the record plans both seats");
+        assert_eq!(view.live, 1, "the fleet lost one");
+        assert_ne!(view.planned, view.live, "and the view says so");
+        assert_eq!(
+            plan_of_record(&record, &[row("p1"), row("p2")])
+                .unwrap()
+                .live,
+            2
         );
     }
 }
