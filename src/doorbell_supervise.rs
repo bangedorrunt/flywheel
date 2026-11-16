@@ -381,6 +381,7 @@ mod tests {
         let _g = crate::config::lock_env();
         let sandbox = super::test_sandbox::TestSandbox::new();
         let _scope = sandbox.scope();
+        sandbox.allow_supervisor_calls();
         let home = sandbox.root().join("home");
         // A leftover duplicate unit from the retired second owner.
         let dup = unit_path(&home, "ws1");
@@ -426,6 +427,7 @@ mod tests {
         let _g = crate::config::lock_env();
         let sandbox = super::test_sandbox::TestSandbox::new();
         let _scope = sandbox.scope();
+        sandbox.allow_supervisor_calls();
         let home = sandbox.root().join("home");
         let dup = unit_path(&home, "ws9");
         std::fs::create_dir_all(dup.parent().unwrap()).unwrap();
