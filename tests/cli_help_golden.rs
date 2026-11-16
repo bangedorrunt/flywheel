@@ -4,11 +4,16 @@
 //! `cargo build && ./target/debug/flywheel --help > tests/fixtures/help/root.txt`
 //! (same for `mail --help`, `workflow --help`).
 
-use std::process::Command;
+#[path = "../src/test_sandbox.rs"]
+mod test_sandbox;
+
+use test_sandbox::TestSandbox;
 
 fn help_output(args: &[&str]) -> String {
+    let sandbox = TestSandbox::new();
     let exe = env!("CARGO_BIN_EXE_flywheel");
-    let out = Command::new(exe)
+    let out = sandbox
+        .command(exe)
         .args(args)
         .output()
         .expect("flywheel binary runs");

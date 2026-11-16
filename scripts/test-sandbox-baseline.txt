@@ -1,5 +1,4 @@
 tests/adr0027_slice1.rs
-tests/cli_help_golden.rs
 tests/collab_patterns_e2e.rs
 tests/config_strict.rs
 tests/cron_cli.rs
