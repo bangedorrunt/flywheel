@@ -6726,8 +6726,26 @@ mod spawn_boot_reliability_tests {
 /// integration surface, so the foreground/readiness check plus this prime is
 /// what removes the detection-class race (bd-bug-omp-hc-wedge, H5
 /// bd-harness-prime-kind-list-eivx).
-fn boot_prime_line() -> &'static str {
-    "Boot ready check: reply exactly READY and await captain instructions."
+fn boot_prime_line() -> String {
+    boot_prime_line_for(None)
+}
+
+/// bd-koafr: the boot prompt is the difference between a crew that starts on
+/// its bead and one that burns two minutes reading mail and listing
+/// awareness beads before saying "no objective".
+fn boot_prime_line_for(assign: Option<&str>) -> String {
+    match assign.map(str::trim).filter(|a| !a.is_empty()) {
+        Some(beads) => format!(
+            "Boot ready check: reply exactly READY. Your assignment: {beads}. \
+             Claim it (`br update <id> --status in_progress --assignee <pin>`) \
+             and run its VERIFY. Do not read mail or triage the project \
+             backlog first."
+        ),
+        None => "Boot ready check: reply exactly READY and wait for an \
+                 assignment. Do not read mail or triage the project backlog; \
+                 the brief arrives next."
+            .to_string(),
+    }
 }
 
 /// Kinds that require the prime as a positional launch arg (secondary path —
@@ -6748,7 +6766,7 @@ fn needs_in_arg_prime(_kind: &str) -> bool {
 /// socket one-liner so an operator can prime the pane by hand instead of
 /// discovering `agent_not_ready` on the first send.
 fn prime_via_send_text(c: &mut Client, pane_id: &str) {
-    prime_line_via_send_text(c, pane_id, boot_prime_line());
+    prime_line_via_send_text(c, pane_id, &boot_prime_line());
 }
 
 /// Phase 3: is the inbox comms path on? Default on. `TORON_COMMS_INBOX=0`
@@ -21847,5 +21865,34 @@ mod bd_qlr1_reroute_env_pin_tests {
                 "pinned={pinned:?} is not the same pin as {wants}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod boot_prime_tests {
+    use super::*;
+
+    /// bd-koafr: with an assignment the first prompt names the bead and points
+    /// at its VERIFY; it never sends the crew to the backlog.
+    #[test]
+    fn an_assigned_boot_names_the_bead_and_skips_triage() {
+        let line = boot_prime_line_for(Some("bd-koafr"));
+        assert!(line.contains("bd-koafr"), "{line}");
+        assert!(line.contains("VERIFY"), "{line}");
+        assert!(line.contains("Do not read mail"), "{line}");
+        assert!(
+            !line.contains("wait for an assignment"),
+            "an assigned crew must not be told to wait: {line}"
+        );
+    }
+
+    /// Without one it instructs to WAIT — the old neutral line left crews to
+    /// triage mail and awareness beads on their own.
+    #[test]
+    fn an_unassigned_boot_waits_instead_of_triaging() {
+        let line = boot_prime_line_for(None);
+        assert!(line.contains("wait for an assignment"), "{line}");
+        assert!(line.contains("Do not read mail"), "{line}");
+        assert!(!line.contains("br update"), "{line}");
     }
 }
