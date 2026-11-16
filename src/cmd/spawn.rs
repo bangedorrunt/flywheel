@@ -6419,11 +6419,7 @@ mod plane_gate_tests {
         let prev = std::env::var_os("FLYWHEEL_BACKEND");
         unsafe { std::env::set_var("FLYWHEEL_BACKEND", "nonsense") };
         let cfg = crate::config::Config::default();
-        let out = cmd_add(
-            &cfg,
-            "typo-probe",
-            super::AddOpts::default(),
-        );
+        let out = cmd_add(&cfg, "typo-probe", super::AddOpts::default());
         unsafe {
             match &prev {
                 Some(v) => std::env::set_var("FLYWHEEL_BACKEND", v),
