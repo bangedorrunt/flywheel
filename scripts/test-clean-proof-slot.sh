@@ -11,9 +11,10 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
 
 export CLEAN_PROOF_LOCK_FILE="$TMP/clean-proof.lock"
-# Inside an outer proof CLEAN_PROOF_SLOTTED is already 1, so the nested
-# invocations would skip the flock re-exec and this test would see overlap.
-unset CLEAN_PROOF_SLOTTED
+# Inside an outer proof these are already exported, so the nested invocations
+# would skip the flock re-exec (overlap) and the snapshot re-exec (making the
+# S2 mutation indistinguishable from its control).
+unset CLEAN_PROOF_SLOTTED CLEAN_PROOF_SNAPSHOTTED CLEAN_PROOF_SNAPSHOT_DIR
 MARKER="$TMP/markers.txt"
 export CLEAN_PROOF_LOCK_TEST_MARKER="$MARKER"
 
@@ -92,6 +93,7 @@ git -C "$FAKE" commit -qm init
 : >"$TMP/marker3.txt"
 CLEAN_PROOF_LOCK_FILE="$TMP/clean-proof3.lock" \
 CLEAN_PROOF_LOCK_TEST_MARKER="$TMP/marker3.txt" \
+CLEAN_PROOF_SNAPSHOT_DIR="$TMP/snapshot3" \
 bash "$FAKE/scripts/clean-proof.sh" --lock-hold-test 2 >"$TMP/edit.log" 2>&1 &
 ep=$!
 for _ in $(seq 1 50); do
@@ -103,6 +105,7 @@ printf '\nthis_should_break_if_read_from_tree () { :; }\nSYNTAX_BOMB(((\n' >>"$F
 wait "$ep"
 rc=$?
 [ "$rc" -eq 0 ] || fail "mid-run edit case: expected exit 0, got $rc (log: $(cat "$TMP/edit.log"))"
+[ -x "$TMP/snapshot3/scripts/clean-proof.sh" ] || fail "case 3: no snapshot copy — the run executed from the tree"
 pass "mid-run source edit does not break running proof (snapshot copy)"
 
 echo "ok"
