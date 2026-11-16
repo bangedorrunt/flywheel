@@ -24,3 +24,15 @@ mutation "E1  the same episode rings on every sweep" \
     find='        self.live.retain(|k| current.contains(k));' \
     replace='        self.live.clear();
         let _ = current;'
+
+mutation "B1  a release wait never expires" \
+    file=crates/doorbell-core/src/observe.rs \
+    expect=a_release_wait_escalates_once_after_one_lease_period \
+    find='            .filter(|w| now.saturating_sub(w.asked_at) >= RELEASE_WAIT_SECS)' \
+    replace='            .filter(|_w| false)'
+
+mutation "F1  any subject with a colon reads as a fork" \
+    file=crates/doorbell-core/src/observe.rs \
+    expect=only_a_fork_subject_is_a_fork \
+    find='    let rest = subject.trim().strip_prefix("[fork]")?.trim_start();' \
+    replace='    let rest = subject.trim();'

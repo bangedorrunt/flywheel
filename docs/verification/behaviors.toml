@@ -280,10 +280,15 @@ tests = [
   "crates/doorbell-core/src/observe.rs::every_escalation_line_carries_its_lesson",
   "crates/doorbell-core/src/observe.rs::a_blocked_bead_rings_once_per_episode",
   "crates/doorbell-core/src/observe.rs::kind_and_subject_are_both_part_of_the_episode_key",
+  "crates/doorbell-core/src/observe.rs::a_blocked_pane_escalates_at_the_window_not_before",
+  "crates/doorbell-core/src/observe.rs::a_release_wait_escalates_once_after_one_lease_period",
+  "crates/doorbell-core/src/observe.rs::only_a_fork_subject_is_a_fork",
 ]
 mutations = [
   "scripts/mutations/observe-escalation.spec.sh#L1",
   "scripts/mutations/observe-escalation.spec.sh#E1",
+  "scripts/mutations/observe-escalation.spec.sh#B1",
+  "scripts/mutations/observe-escalation.spec.sh#F1",
 ]
 
 [[behavior]]
@@ -901,4 +906,29 @@ tests = [
 mutations = [
   "scripts/mutations/ledger-repo-search.spec.sh#R1",
   "scripts/mutations/ledger-repo-search.spec.sh#R2",
+]
+
+[[behavior]]
+id = "mail.reply-joins-the-parent-thread"
+owner = "src/mail.rs::reply"
+status = "proven"
+concurrent = false
+tests = [
+  "src/mail.rs::a_reply_inherits_the_parent_thread",
+  "src/mail.rs::a_reply_to_a_threadless_message_is_its_own_thread",
+]
+mutations = [
+  "scripts/mutations/collab-single-send.spec.sh#Q1",
+]
+
+[[behavior]]
+id = "collab.sends-once-and-waits"
+owner = "src/cmd/mail.rs::cmd_collab"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/mail.rs::collab_sends_once_and_waits_without_rerings",
+]
+mutations = [
+  "scripts/mutations/collab-single-send.spec.sh#Q2",
 ]

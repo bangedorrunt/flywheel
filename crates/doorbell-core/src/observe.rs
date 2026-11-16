@@ -92,6 +92,126 @@ impl EscalateSet {
     }
 }
 
+/// How long a bead's pane may sit in `blocked` before it is an escalation.
+pub const BLOCKED_AFTER_SECS: u64 = 600;
+
+/// One lease period: a `request-release` unanswered this long is an
+/// escalation. An EXPIRED lease is not — it frees itself.
+pub const RELEASE_WAIT_SECS: u64 = 180;
+
+impl ObserveEscalation {
+    /// Arm (a): a bead whose assigned pane stayed `blocked` past the window.
+    pub fn blocked_bead(bead: &str, pin: &str, blocked_secs: u64, lesson: &str) -> Self {
+        Self {
+            kind: ObserveKind::BlockedBead,
+            subject: bead.to_string(),
+            evidence: format!("{pin} blocked {blocked_secs}s (>{BLOCKED_AFTER_SECS}s)"),
+            lesson: lesson.to_string(),
+        }
+    }
+
+    /// Arm (b): a peer's `request-release` the holder never answered inside one
+    /// lease period. The episode key is the PATH — one ring per requester per
+    /// path, so two requests on one file do not become two pages.
+    pub fn release_wait(
+        path: &str,
+        requester: &str,
+        holder: &str,
+        bead: &str,
+        age_secs: u64,
+    ) -> Self {
+        Self {
+            kind: ObserveKind::ReservationLadder,
+            subject: path.to_string(),
+            evidence: format!(
+                "holder {holder} bead {bead} age {age_secs}s asked by {requester} — no answer inside {RELEASE_WAIT_SECS}s"
+            ),
+            lesson: "answer a request-release by transferring the lease or yielding; an unanswered ask blocks a peer".to_string(),
+        }
+    }
+
+    /// Arm (c): a worker marked a fix-vs-hand-over fork explicitly. The subject
+    /// is the bead, so one fork per bead rings once.
+    pub fn fork(bead: &str, question: &str) -> Self {
+        Self {
+            kind: ObserveKind::Fork,
+            subject: bead.to_string(),
+            evidence: question.trim().to_string(),
+            lesson: "a wave that hits a judgment call should mark it before it blocks, not after"
+                .to_string(),
+        }
+    }
+}
+
+/// Parse the fork convention: a mail SUBJECT of `[fork] <bead>: <question>`.
+/// `None` for anything else, so the classifier can never mistake a normal
+/// subject for a fork.
+pub fn fork_subject(subject: &str) -> Option<(&str, &str)> {
+    let rest = subject.trim().strip_prefix("[fork]")?.trim_start();
+    let (bead, question) = rest.split_once(':')?;
+    let bead = bead.trim();
+    let question = question.trim();
+    if bead.is_empty() || question.is_empty() {
+        return None;
+    }
+    Some((bead, question))
+}
+
+/// One outstanding peer request-release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseWait {
+    pub path: String,
+    pub requester: String,
+    pub holder: String,
+    pub bead: String,
+    pub asked_at: u64,
+}
+
+impl ReleaseWait {
+    fn key(&self) -> (String, String) {
+        (self.path.clone(), self.requester.clone())
+    }
+}
+
+/// The outstanding request-release asks. A request is answered by a transfer
+/// (the holder yielded) or by the path no longer existing; unanswered past one
+/// lease period it escalates ONCE per (path, requester).
+#[derive(Debug, Default)]
+pub struct ReleaseWaits {
+    open: Vec<ReleaseWait>,
+}
+
+impl ReleaseWaits {
+    pub fn note_request(&mut self, wait: ReleaseWait) {
+        let key = wait.key();
+        self.open.retain(|w| w.key() != key);
+        self.open.push(wait);
+    }
+
+    /// The holder yielded (transfer / yield / release): the ask is answered.
+    pub fn note_answered(&mut self, path: &str, requester: &str) {
+        let key = (path.to_string(), requester.to_string());
+        self.open.retain(|w| w.key() != key);
+    }
+
+    /// Requests older than one lease period that nobody answered.
+    pub fn expired(&self, now: u64) -> Vec<ObserveEscalation> {
+        self.open
+            .iter()
+            .filter(|w| now.saturating_sub(w.asked_at) >= RELEASE_WAIT_SECS)
+            .map(|w| {
+                ObserveEscalation::release_wait(
+                    &w.path,
+                    &w.requester,
+                    &w.holder,
+                    &w.bead,
+                    now.saturating_sub(w.asked_at),
+                )
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +264,71 @@ mod tests {
             1,
             "a recurrence after resolution rings again"
         );
+    }
+
+    /// Arm (a): the threshold is a boundary, not a vibe — 599s is fine, 600s
+    /// escalates, and the evidence names the pin and the age.
+    #[test]
+    fn a_blocked_pane_escalates_at_the_window_not_before() {
+        let e = ObserveEscalation::blocked_bead("bd-a", "CyanCove", BLOCKED_AFTER_SECS, "l");
+        assert_eq!(e.kind, ObserveKind::BlockedBead);
+        assert_eq!(e.subject, "bd-a");
+        assert!(e.evidence.contains("CyanCove"), "{:?}", e.evidence);
+        assert_eq!(BLOCKED_AFTER_SECS, 600);
+    }
+
+    /// Arm (b): one ring per (path, requester), only after a full lease period,
+    /// and an answered request never escalates.
+    #[test]
+    fn a_release_wait_escalates_once_after_one_lease_period() {
+        let mut waits = ReleaseWaits::default();
+        waits.note_request(ReleaseWait {
+            path: "src/a.rs".into(),
+            requester: "BoldBay".into(),
+            holder: "CyanCove".into(),
+            bead: "bd-a".into(),
+            asked_at: 1_000,
+        });
+        assert!(
+            waits.expired(1_000 + RELEASE_WAIT_SECS - 1).is_empty(),
+            "under one lease period it is just a request"
+        );
+        let due = waits.expired(1_000 + RELEASE_WAIT_SECS);
+        assert_eq!(due.len(), 1, "{due:?}");
+        assert_eq!(due[0].kind, ObserveKind::ReservationLadder);
+        assert_eq!(due[0].subject, "src/a.rs", "the path is the episode key");
+        assert!(due[0].evidence.contains("CyanCove"), "{due:?}");
+        assert!(due[0].evidence.contains("bd-a"), "{due:?}");
+
+        // Answered: gone, never escalates.
+        waits.note_answered("src/a.rs", "BoldBay");
+        assert!(waits.expired(9_999).is_empty(), "answered asks are silent");
+    }
+
+    /// Arm (c): the fork convention parses exactly, and nothing else matches.
+    #[test]
+    fn only_a_fork_subject_is_a_fork() {
+        assert_eq!(
+            fork_subject("[fork] bd-a: fix here or hand over?"),
+            Some(("bd-a", "fix here or hand over?"))
+        );
+        assert_eq!(
+            fork_subject("  [fork]  bd-b :  ask "),
+            Some(("bd-b", "ask"))
+        );
+        for not_a_fork in [
+            "bd-a: fix here or hand over?",
+            "[fork] bd-a",
+            "[fork]: question",
+            "[forking] bd-a: question",
+            "[fork] bd-a: ",
+        ] {
+            assert_eq!(fork_subject(not_a_fork), None, "{not_a_fork:?}");
+        }
+        let e = ObserveEscalation::fork("bd-a", "fix here or hand over?");
+        assert_eq!(e.kind, ObserveKind::Fork);
+        assert_eq!(e.subject, "bd-a", "one fork per bead");
+        assert_eq!(e.evidence, "fix here or hand over?");
     }
 
     /// Distinct subjects are distinct episodes, and the kind is part of the key
