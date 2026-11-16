@@ -516,3 +516,26 @@ mutations = [
   "scripts/mutations/sweep-order.spec.sh#S2",
   "scripts/mutations/sweep-order.spec.sh#S3",
 ]
+
+[[behavior]]
+id = "supervisor.retire-gone-seat"
+owner = "src/supervisor_host.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/swarm.rs::retire_gone_seat_counts_as_closed_and_retire_completes",
+]
+mutations = ["scripts/mutations/retire-gone-seat.spec.sh#G1"]
+
+[[behavior]]
+id = "fleet.recover-session-loss"
+owner = "src/main.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/main.rs::recover_after_session_loss_respawns_every_gone_crew_pin",
+]
+mutations = [
+  "scripts/mutations/recover-session-loss.spec.sh#R1",
+  "scripts/mutations/recover-session-loss.spec.sh#R2",
+]
