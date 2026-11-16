@@ -65,6 +65,10 @@ pub struct BodySeams {
     /// Gates settled step outputs against the stage's declared witness.
     /// `None` = no gate; steps settle as the fold lands them.
     pub witness: Option<WitnessCheck>,
+    /// ADR-0021 D4.4 (bd-jhz8x.3): where the `.done` compat sidecars go.
+    /// `None` = the run's cwd, which is the project a workflow runs in; tests
+    /// point it at a temp dir so the write is observable, never ambient.
+    pub sidecar_root: Option<std::path::PathBuf>,
     /// Wall clock in production, frozen in tests. Every model timestamp
     /// in this driver reads it, so deadlines stay deterministic.
     pub clock: Arc<dyn Fn() -> u64 + Send + Sync>,
@@ -164,25 +168,77 @@ fn graph_stage(run: &GraphRun, node: &str) -> Option<String> {
     }
 }
 
-/// Run the stage witness gate on one settled step output. None settles
-/// unchanged: no seam, no stage on the step, or no declared witness. A
-/// failing report returns the typed refusal that replaces success.
-fn witness_refusal(
+/// What the stage witness gate decided for one settled step output.
+enum WitnessGate {
+    /// No contract to check: no seam, no stage on the step, or the stage
+    /// declares no witness.
+    Uncontracted,
+    Passed,
+    Failed(String),
+}
+
+/// Run the stage witness gate on one settled step output. A failing report
+/// carries the typed refusal that replaces success.
+fn witness_gate(
     seam: Option<&WitnessCheck>,
     node: &str,
     stage: Option<&str>,
     value: &Value,
-) -> Option<String> {
-    let check = seam?;
-    let stage = stage?;
-    let report = check(stage, value)?;
+) -> WitnessGate {
+    let (Some(check), Some(stage)) = (seam, stage) else {
+        return WitnessGate::Uncontracted;
+    };
+    let Some(report) = check(stage, value) else {
+        return WitnessGate::Uncontracted;
+    };
     if report.ok {
-        return None;
+        return WitnessGate::Passed;
     }
-    Some(format!(
+    WitnessGate::Failed(format!(
         "step {node} (stage {stage}) failed witness `{}`: {}",
         report.phase, report.evidence
     ))
+}
+
+/// ADR-0021 D4.4 (bd-jhz8x.3): the `.done` sidecar an external watcher polls,
+/// derived from the witnessed exit instead of from a step an author can skip or
+/// reorder. Write-only and idempotent — nothing in the tree reads it, a replay
+/// rewrites the same bytes — and a run with no `wave_label` input has no
+/// watcher convention to keep, so it writes nothing.
+fn write_done_sidecar(root: Option<&std::path::Path>, trigger: &Value, node: &str) {
+    let Some(label) = trigger
+        .pointer("/inputs/wave_label")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+    else {
+        return;
+    };
+    let base = match root {
+        Some(dir) => dir.to_path_buf(),
+        None => match std::env::current_dir() {
+            Ok(dir) => dir,
+            Err(e) => {
+                eprintln!("durable body: no cwd for the .done sidecar of {node}: {e}");
+                return;
+            }
+        },
+    };
+    let dir = base.join(".flywheel").join("wave");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!(
+            "durable body: cannot create {} for {node}: {e}",
+            dir.display()
+        );
+        return;
+    }
+    let path = dir.join(format!("{label}-{node}.done"));
+    if let Err(e) = std::fs::write(&path, b"") {
+        eprintln!(
+            "durable body: cannot write {} for {node}: {e}",
+            path.display()
+        );
+    }
 }
 
 pub(crate) fn unix_ms() -> u64 {
@@ -357,14 +413,23 @@ async fn drive_linear(
                     let stage = settle_stage(&run);
                     let outcome = match outcome {
                         SpawnLaunch::Settled(value) => {
-                            match witness_refusal(
+                            match witness_gate(
                                 seams.witness.as_ref(),
                                 &node,
                                 stage.as_deref(),
                                 &value,
                             ) {
-                                Some(error) => SpawnLaunch::Failed(error),
-                                None => SpawnLaunch::Settled(value),
+                                WitnessGate::Failed(error) => SpawnLaunch::Failed(error),
+                                gate => {
+                                    if matches!(gate, WitnessGate::Passed) {
+                                        write_done_sidecar(
+                                            seams.sidecar_root.as_deref(),
+                                            &trigger,
+                                            &node,
+                                        );
+                                    }
+                                    SpawnLaunch::Settled(value)
+                                }
                             }
                         }
                         other => other,
@@ -434,14 +499,23 @@ async fn drive_linear(
                     let stage = settle_stage(&run);
                     let outcome = match outcome {
                         JobWatchOutcome::Settled(value) => {
-                            match witness_refusal(
+                            match witness_gate(
                                 seams.witness.as_ref(),
                                 &node,
                                 stage.as_deref(),
                                 &value,
                             ) {
-                                Some(error) => JobWatchOutcome::Failed(error),
-                                None => JobWatchOutcome::Settled(value),
+                                WitnessGate::Failed(error) => JobWatchOutcome::Failed(error),
+                                gate => {
+                                    if matches!(gate, WitnessGate::Passed) {
+                                        write_done_sidecar(
+                                            seams.sidecar_root.as_deref(),
+                                            &trigger,
+                                            &node,
+                                        );
+                                    }
+                                    JobWatchOutcome::Settled(value)
+                                }
                             }
                         }
                         other => other,
@@ -653,14 +727,23 @@ async fn drive_graph(
                     let stage = graph_stage(&run, &node);
                     let outcome = match outcome {
                         JobWatchOutcome::Settled(value) => {
-                            match witness_refusal(
+                            match witness_gate(
                                 seams.witness.as_ref(),
                                 &node,
                                 stage.as_deref(),
                                 &value,
                             ) {
-                                Some(error) => JobWatchOutcome::Failed(error),
-                                None => JobWatchOutcome::Settled(value),
+                                WitnessGate::Failed(error) => JobWatchOutcome::Failed(error),
+                                gate => {
+                                    if matches!(gate, WitnessGate::Passed) {
+                                        write_done_sidecar(
+                                            seams.sidecar_root.as_deref(),
+                                            &trigger,
+                                            &node,
+                                        );
+                                    }
+                                    JobWatchOutcome::Settled(value)
+                                }
                             }
                         }
                         other => other,
@@ -1006,6 +1089,7 @@ mod tests {
             launcher: Some(launcher),
             job_watcher: None,
             witness: None,
+            sidecar_root: None,
             clock: Arc::new(unix_ms),
             spawn_resolver: Some(std::sync::Arc::new(|profile: &str| {
                 (profile == "@housekeeper").then(|| {
@@ -1100,6 +1184,7 @@ mod tests {
             launcher: None,
             job_watcher: None,
             witness: None,
+            sidecar_root: None,
             clock: Arc::new(unix_ms),
             spawn_resolver: None,
             resolve_child: None,
@@ -1230,6 +1315,7 @@ mod tests {
             launcher: None,
             job_watcher: Some(watcher),
             witness: None,
+            sidecar_root: None,
             clock: frozen_clock(),
             spawn_resolver: None,
             resolve_child: None,
@@ -1280,6 +1366,7 @@ mod tests {
             launcher: None,
             job_watcher: Some(watcher),
             witness: None,
+            sidecar_root: None,
             clock: frozen_clock(),
             spawn_resolver: None,
             resolve_child: None,
@@ -1332,6 +1419,7 @@ mod tests {
             launcher: None,
             job_watcher: Some(watcher),
             witness: None,
+            sidecar_root: None,
             clock: frozen_clock(),
             spawn_resolver: None,
             resolve_child: None,
@@ -1390,6 +1478,7 @@ mod tests {
             launcher: None,
             job_watcher: Some(watcher),
             witness: Some(resolve_witness()),
+            sidecar_root: None,
             clock: frozen_clock(),
             spawn_resolver: None,
             resolve_child: None,
@@ -1442,6 +1531,7 @@ mod tests {
             launcher: None,
             job_watcher: Some(watcher),
             witness: Some(resolve_witness()),
+            sidecar_root: None,
             clock: frozen_clock(),
             spawn_resolver: None,
             resolve_child: None,
@@ -1497,6 +1587,7 @@ mod tests {
             launcher: None,
             job_watcher: Some(watcher),
             witness: Some(resolve_witness()),
+            sidecar_root: None,
             clock: frozen_clock(),
             spawn_resolver: None,
             resolve_child: None,
@@ -1552,6 +1643,7 @@ mod tests {
             launcher: None,
             job_watcher: Some(watcher),
             witness: Some(resolve_witness()),
+            sidecar_root: None,
             clock: frozen_clock(),
             spawn_resolver: None,
             resolve_child: None,
@@ -1606,6 +1698,7 @@ mod tests {
             // Compiled-in seed catalog, not the operator's user tier: the
             // test pins the shipped witnesses, not ambient config.
             witness: Some(crate::stages::StageLibrary::compiled_in().witness_checker()),
+            sidecar_root: None,
             clock: frozen_clock(),
             spawn_resolver: None,
             resolve_child: None,
@@ -1746,6 +1839,7 @@ mod tests {
             witness: Some(crate::stages::StageLibrary::witness_checker_unavailable(
                 "bad user stages.toml".to_string(),
             )),
+            sidecar_root: None,
             clock: frozen_clock(),
             spawn_resolver: None,
             resolve_child: None,
@@ -1773,6 +1867,90 @@ mod tests {
         }
         assert_eq!(step.as_deref(), Some("j"));
         let _ = std::fs::remove_file(&db);
+    }
+
+    /// One dispatch step, one settled job, one witness verdict: the fixture the
+    /// sidecar witness needs.
+    async fn run_sidecar_step(
+        run_id: &str,
+        root: &std::path::Path,
+        witness_ok: bool,
+    ) -> (BodyOutcome, std::path::PathBuf) {
+        let (store, db) = watch_test_store(run_id).await;
+        let wf = toron_workflow::schema::parse_workflow(
+            "name: sidecar\nsteps:\n  - name: j\n    action: dispatch_job\n    assignee: x\n    spec: { task: hi, stage: s }\n    await: result\n    result_timeout: 60\n    on_error: fail_run\n",
+        )
+        .expect("parse dispatch await");
+        let (watcher, _queue) = queue_watcher(vec![
+            JobWatchOutcome::Claimed,
+            JobWatchOutcome::Settled(serde_json::json!({
+                "ok": true,
+                "job": "job-1",
+                "body": "did it",
+            })),
+        ]);
+        let seams = BodySeams {
+            leaf: LeafSeams {
+                async_runner: Some(receipt_runner()),
+                sync_runner: None,
+                verify_sink: toron_workflow::engine::VerifySink::default(),
+                journal_mode: toron_workflow::engine::EffectJournalMode::Recording,
+            },
+            launcher: None,
+            job_watcher: Some(watcher),
+            witness: Some(std::sync::Arc::new(move |_stage: &str, _output: &Value| {
+                Some(crate::phase_contracts::PhaseContractReport {
+                    phase: "s",
+                    ok: witness_ok,
+                    evidence: "fixture verdict".to_string(),
+                })
+            })),
+            sidecar_root: Some(root.to_path_buf()),
+            clock: frozen_clock(),
+            spawn_resolver: None,
+            resolve_child: None,
+        };
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            drive(
+                &store,
+                run_id,
+                &wf,
+                serde_json::json!({"inputs": {"wave_label": "wave-9"}}),
+                &seams,
+            ),
+        )
+        .await
+        .expect("one dispatch step settles");
+        let _ = std::fs::remove_file(&db);
+        (outcome, root.join(".flywheel").join("wave").join("wave-9-j.done"))
+    }
+
+    /// ADR-0021 D4.4 (bd-jhz8x.3): the `.done` sidecar belongs to the RUNNER and
+    /// follows a passing witness. A refused exit writes none, so a watcher never
+    /// sees a marker that no witnessed exit produced — the property the `*_done`
+    /// verify steps could not keep.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_witnessed_exit_writes_the_done_sidecar_and_a_refusal_writes_none() {
+        let root = std::env::temp_dir().join(format!("flywheel-sidecar-{}", unix_ms()));
+        let (passed, done) = run_sidecar_step("sidecar-pass", &root.join("passed"), true).await;
+        assert!(
+            !matches!(passed, BodyOutcome::Failed { .. }),
+            "a passing witness settles: {passed:?}"
+        );
+        assert!(done.exists(), "a witnessed exit writes {}", done.display());
+        let (refused, refused_done) =
+            run_sidecar_step("sidecar-refused", &root.join("refused"), false).await;
+        assert!(
+            matches!(refused, BodyOutcome::Failed { .. }),
+            "a failing witness must fail the run: {refused:?}"
+        );
+        assert!(
+            !refused_done.exists(),
+            "a refused exit writes no {}",
+            refused_done.display()
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Spawn steps carry no stage, so the gated StartSpawn arm consults
@@ -1814,6 +1992,7 @@ mod tests {
             launcher: Some(launcher),
             job_watcher: None,
             witness: Some(witness),
+            sidecar_root: None,
             clock: frozen_clock(),
             spawn_resolver: Some(std::sync::Arc::new(|profile: &str| {
                 (profile == "@housekeeper").then(|| {
@@ -1895,6 +2074,7 @@ mod tests {
             launcher: None,
             job_watcher: None,
             witness: None,
+            sidecar_root: None,
             clock: Arc::new(unix_ms),
             spawn_resolver: None,
             resolve_child: Some(Arc::new(move |name: &str| {
@@ -1969,6 +2149,7 @@ mod tests {
             launcher: None,
             job_watcher: None,
             witness: None,
+            sidecar_root: None,
             clock: Arc::new(unix_ms),
             spawn_resolver: None,
             resolve_child: None,

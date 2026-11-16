@@ -1552,6 +1552,7 @@ async fn drive_cron_body(
         launcher,
         job_watcher,
         witness,
+        sidecar_root: None,
         clock: std::sync::Arc::new(crate::durable_body::unix_ms),
         spawn_resolver: Some(crate::profile::ProfileCatalog::catalog_profile_resolver()),
         resolve_child: Some(std::sync::Arc::new(
