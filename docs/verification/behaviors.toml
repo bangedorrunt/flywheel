@@ -281,10 +281,12 @@ tests = [
   "src/crew_briefs.rs::a_done_reply_closes_the_brief_and_wakes_the_captain_once",
   "src/crew_briefs.rs::a_replayed_reply_emits_nothing",
   "src/crew_briefs.rs::a_reply_for_an_unknown_brief_does_nothing",
+  "src/crew_briefs.rs::the_open_list_filters_to_one_pin",
 ]
 mutations = [
   "scripts/mutations/crew-briefs.spec.sh#B1",
   "scripts/mutations/crew-briefs.spec.sh#B2",
+  "scripts/mutations/crew-briefs-pin.spec.sh#P1",
 ]
 
 [[behavior]]
@@ -329,10 +331,12 @@ concurrent = false
 tests = [
   "tests/proof_steps.rs::proof_suite_step_runs_the_tests_directory",
   "tests/proof_steps.rs::proof_verify_mutations_never_edits_the_shared_tree",
+  "tests/proof_steps.rs::proof_every_gate_leg_denies_warnings",
 ]
 mutations = [
   "scripts/mutations/proof-suite-and-isolation.spec.sh#S1",
   "scripts/mutations/proof-suite-and-isolation.spec.sh#I1",
+  "scripts/mutations/verify-clippy-gates.spec.sh#W1",
 ]
 
 

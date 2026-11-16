@@ -93,11 +93,13 @@ impl BriefBook {
         }
     }
 
-    /// Every brief with no reply yet, oldest first, with its age.
-    pub fn open(&self, now_us: u64) -> Vec<OpenBrief> {
+    /// Every brief with no reply yet, oldest first, with its age. `pin`
+    /// narrows to one crew: "what is outstanding for THIS pin".
+    pub fn open_for(&self, pin: Option<&str>, now_us: u64) -> Vec<OpenBrief> {
         let mut rows: Vec<OpenBrief> = self
             .briefs
             .iter()
+            .filter(|b| pin.is_none_or(|p| b.pin == p))
             .filter(|b| b.closed_ts_us.is_none())
             .map(|b| OpenBrief {
                 id: b.id.clone(),
@@ -136,7 +138,7 @@ mod tests {
     fn an_unanswered_brief_ages_into_the_open_list() {
         let mut book = BriefBook::default();
         book.reduce(Msg::Opened(brief("b1", "FrostyCreek", 1_000_000_000)));
-        let open = book.open(1_000_000_000 + 90 * 1_000_000);
+        let open = book.open_for(None, 1_000_000_000 + 90 * 1_000_000);
         assert_eq!(open.len(), 1, "{open:?}");
         assert_eq!(open[0].pin, "FrostyCreek");
         assert_eq!(open[0].age_secs, 90);
@@ -161,7 +163,7 @@ mod tests {
             }]
         );
         assert!(
-            book.open(10).is_empty(),
+            book.open_for(None, 10).is_empty(),
             "a closed brief leaves the open list"
         );
         assert_eq!(
@@ -208,6 +210,30 @@ mod tests {
             now_us: 5,
         });
         assert!(effects.is_empty());
-        assert!(book.open(5).is_empty());
+        assert!(book.open_for(None, 5).is_empty());
+    }
+
+    /// `crew inbox --pin` answers "what is outstanding for THIS crew" and
+    /// nothing else.
+    #[test]
+    fn the_open_list_filters_to_one_pin() {
+        let mut book = BriefBook::default();
+        book.reduce(Msg::Opened(brief("a1", "FrostyCreek", 1)));
+        book.reduce(Msg::Opened(brief("a2", "BoldBay", 1)));
+        book.reduce(Msg::Opened(brief("a3", "FrostyCreek", 1)));
+        assert_eq!(
+            book.open_for(None, 2).len(),
+            3,
+            "no filter lists every crew"
+        );
+        let only = book.open_for(Some("FrostyCreek"), 2);
+        assert_eq!(
+            only.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["a1", "a3"]
+        );
+        assert!(
+            book.open_for(Some("Nobody"), 2).is_empty(),
+            "an unknown pin has no briefs"
+        );
     }
 }

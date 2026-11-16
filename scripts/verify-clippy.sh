@@ -13,6 +13,11 @@ cd "$(dirname "$0")/.."
 # repo on another session's dirt. When adding a workspace member, add its -p
 # here too.
 PKGS="-p flywheel -p doorbell-core -p doorbell-rt -p doorbell-cli"
+# bd-0uzrq.4: EVERY leg denies warnings, and `cargo check` does not take
+# `-- -D warnings` (that is clippy-driver syntax), so the discipline rides
+# RUSTFLAGS for the whole script. A bare `check` compiled a dead binding
+# (crew.rs:919) and reported success while the -D warnings build caught it.
+export RUSTFLAGS="${RUSTFLAGS:-} -D warnings"
 echo "-> fmt"
 cargo fmt $PKGS -- --check
 echo "-> clippy (all features)"
@@ -20,6 +25,9 @@ echo "-> clippy (all features)"
 # path bumps + rmcp re-resolve ride this commit); a lock refresh is otherwise
 # a separate bead. No --offline: cold caches must be able to fetch.
 cargo clippy --all-targets --all-features --locked $PKGS -- -D warnings
+# bd-0uzrq.4: EVERY leg denies warnings. A plain `check` compiled the crate and
+# reported success while a dead binding (crew.rs:919) sat in it — the
+# -D warnings build caught what these legs let through.
 echo "-> check (all targets)"
 cargo check --all-targets --all-features --locked $PKGS
 echo "-> check (no default features)"

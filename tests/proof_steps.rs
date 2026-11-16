@@ -73,3 +73,32 @@ fn proof_verify_mutations_never_edits_the_shared_tree() {
         "scripts/test-verify-mutations-isolation.sh failed"
     );
 }
+
+/// Every quality-gate leg denies warnings (bd-0uzrq.4). A plain `cargo check`
+/// compiled src/cmd/crew.rs:919's dead binding and reported success; only the
+/// `-D warnings` build caught it.
+#[test]
+fn proof_every_gate_leg_denies_warnings() {
+    let src = std::fs::read_to_string(format!("{}/scripts/verify-clippy.sh", root()))
+        .expect("scripts/verify-clippy.sh");
+    assert!(
+        src.lines()
+            .any(|l| l.contains("export RUSTFLAGS=") && l.contains("-D warnings")),
+        "the gates must export RUSTFLAGS with -D warnings for every leg"
+    );
+    let mut legs = 0;
+    for line in src.lines() {
+        let line = line.trim();
+        if !(line.contains("cargo check") || line.contains("cargo clippy")) {
+            continue;
+        }
+        legs += 1;
+        if line.contains("cargo clippy") {
+            assert!(
+                line.contains("-D warnings"),
+                "clippy must deny warnings on its own line: {line}"
+            );
+        }
+    }
+    assert!(legs >= 4, "expected every gate leg, found {legs}");
+}

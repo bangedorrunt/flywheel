@@ -72,6 +72,9 @@ pub(crate) enum CrewCmd {
         /// only briefs with no reply yet
         #[arg(long)]
         open: bool,
+        /// one crew's outstanding briefs
+        #[arg(long)]
+        pin: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -149,8 +152,9 @@ pub(crate) fn cmd_crew(cfg: &Config, cmd: &CrewCmd) -> Result<()> {
         CrewCmd::Inbox {
             project,
             open,
+            pin,
             json,
-        } => cmd_crew_inbox(cfg, project, *open, *json),
+        } => cmd_crew_inbox(cfg, project, *open, pin.as_deref(), *json),
     }
 }
 
@@ -953,10 +957,17 @@ fn cmd_crew_done(
 }
 
 /// `crew inbox --open`: a silent crew is a row with an age.
-fn cmd_crew_inbox(cfg: &Config, project: &str, open: bool, json: bool) -> Result<()> {
+fn cmd_crew_inbox(
+    cfg: &Config,
+    project: &str,
+    open: bool,
+    pin: Option<&str>,
+    json: bool,
+) -> Result<()> {
     let _ = cfg;
     let book = load_briefs(project);
-    let rows = book.open(now_us());
+    let now = now_us();
+    let rows = book.open_for(pin, now);
     let listed: Vec<Value> = if open {
         rows.iter()
             .map(serde_json::to_value)
@@ -969,7 +980,7 @@ fn cmd_crew_inbox(cfg: &Config, project: &str, open: bool, json: bool) -> Result
                     "id": b.id,
                     "pin": b.pin,
                     "subject": b.subject,
-                    "age_secs": now_us().saturating_sub(b.opened_ts_us) / 1_000_000,
+                    "age_secs": now.saturating_sub(b.opened_ts_us) / 1_000_000,
                     "closed": b.closed_ts_us.is_some(),
                     "receipt": b.receipt,
                 })
