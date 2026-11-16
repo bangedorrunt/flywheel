@@ -8490,9 +8490,7 @@ mod dispatcher_workspace_tests {
 /// One assignment per pin; the value keeps the bead list verbatim (the boot
 /// brief text names them all). Duplicate pins are refused: two boot briefs to
 /// one pane would race the same `READY` turn.
-pub(crate) fn parse_assign(
-    pairs: &[String],
-) -> Result<std::collections::BTreeMap<String, String>> {
+pub(crate) fn parse_assign(pairs: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
     let mut out = std::collections::BTreeMap::new();
     for pair in pairs {
         let Some((pin, beads)) = pair.split_once('=') else {
