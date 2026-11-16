@@ -8043,6 +8043,89 @@ mod envpin_reroute_tests {
         );
     }
 
+    /// ADR-0022 acceptance 5 (bd-6setu.12): a classified 429 on an opencode seat
+    /// with a model fallback respawns under the SAME pin and journals exactly one
+    /// RebindIntent. Reservations key by pin, so the pin's registry row surviving
+    /// unchanged is what keeps them.
+    #[test]
+    fn acceptance5_429_respawn_journals_one_rebind_intent_and_keeps_the_pin() {
+        let _guard = crate::config::lock_env();
+        let backend = FakeHopBackend {
+            order: Arc::new(Mutex::new(Vec::new())),
+        };
+        let hop = hop_fixture();
+        assert_eq!(
+            hop.kind,
+            crate::failure::FailureKind::RateLimit,
+            "the fixture is the 429 case"
+        );
+        assert_eq!(
+            crate::agent_ref::RebindIntent::hop_kind(hop.kind),
+            Some("model"),
+            "a 429 drives the model hop, not a profile hop"
+        );
+        assert!(
+            crate::agent_ref::RebindIntent::allowed_from_failure(hop.kind, &hop.evidence),
+            "classified 429 evidence permits the hop"
+        );
+
+        crate::state::save_spawn_registry(
+            &hop.project,
+            &[crate::state::SpawnEntry::profiled(
+                &hop.old_pane,
+                &hop.agent,
+                "coder",
+                "opencode",
+                Some(hop.agent.clone()),
+            )],
+        )
+        .expect("seed the pin's row");
+
+        let key = crate::agent_ref::RebindIntent::derive_effect_key(
+            &crate::agent_ref::AgentRef::new(&hop.project, &hop.agent),
+            &crate::agent_ref::AgentBinding {
+                profile_name: hop.from_profile.clone(),
+                model: hop.from_model.clone(),
+                harness: hop.from_harness.clone(),
+                location: crate::agent_ref::BindingLocation::Pane,
+            },
+            &crate::agent_ref::AgentBinding {
+                profile_name: hop.next_profile.clone(),
+                model: hop.next_model.clone(),
+                harness: hop.next_harness.clone(),
+                location: crate::agent_ref::BindingLocation::Pane,
+            },
+        );
+        let name = hop.agent.clone();
+        let respawn = move |_anchor: &str| -> anyhow::Result<toron_core::pane_types::AgentInfo> {
+            Ok(site_agent(&name, "new-pane-9"))
+        };
+        let got = envpin_respin_hop(&backend, &respawn, &hop, false).expect("hop runs");
+        assert!(
+            matches!(got, EnvpinHopOutcome::Hopped { .. }),
+            "a classified 429 hops: {got:?}"
+        );
+
+        let rows = rebind_rows(&hop.project, &key);
+        assert_eq!(rows.len(), 3, "exactly one intent, three states: {rows:?}");
+        assert_eq!(
+            rows.iter().map(|i| i.state).collect::<Vec<_>>(),
+            vec![
+                toron_core::index::workflow_effects::EffectState::Prepared,
+                toron_core::index::workflow_effects::EffectState::InFlight,
+                toron_core::index::workflow_effects::EffectState::Settled,
+            ],
+            "one journaled intent, in order"
+        );
+        let reg = crate::state::load_spawn_registry(&hop.project);
+        assert_eq!(reg.len(), 1, "the pin's row survives: {reg:?}");
+        assert_eq!(
+            reg[0].mail_identity.as_deref(),
+            Some(hop.agent.as_str()),
+            "the pin is unchanged, so its reservations still key to it"
+        );
+    }
+
     #[test]
     fn envpin_hop_keep_means_no_hop() {
         let _guard = crate::config::lock_env();
