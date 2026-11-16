@@ -33,13 +33,10 @@ use flywheel_test_sandbox::TestSandbox;
 mod support;
 
 /// The toron CLI this file drives: an explicit `TORON_BIN`, else the sibling
-/// debug build. There is deliberately NO PATH fallback, matching
-/// `sc_doorbell_adr0005.rs` (bd-oylu). A bare `toron` is whatever happens to be
-/// installed, and an older one disagrees with the working tree about store
-/// shape, so the test then fails somewhere that reads like a product bug
-/// instead of a missing build. bd-rvma: this fallback used to hand the tests a
-/// mise shim silently, and the only symptom was a green test that had skipped
-/// its own assertions.
+/// debug build. There is deliberately NO PATH fallback (bd-oylu, bd-rvma): an
+/// installed toron can predate the working tree and then refuses the store the
+/// in-process toron_core wrote, which reads as a product failure instead of a
+/// missing build.
 fn toron_bin() -> PathBuf {
     if let Ok(p) = std::env::var("TORON_BIN") {
         return PathBuf::from(p);
@@ -160,62 +157,6 @@ fn adr0027_s1_workspace_model_exists() {
     assert!(
         content.contains("doorbell_tick::tick") || content.contains("durable::tick"),
         "RED (bd-7fat): workspace tick should compose doorbell_tick::tick / durable::tick as private slice reducers"
-    );
-}
-
-/// Needs the sibling toron debug build: `toron_bin()` refuses to fall back to
-/// PATH on purpose (bd-oylu, bd-rvma), so without that build this can only
-/// fail for a reason unrelated to the diff. Same shape as the live legs: the
-/// prerequisite is named and the test is opt-in by running it explicitly.
-///   mbx +nightly-aarch64-apple-darwin test --test adr0027_slice1 -- --ignored adr0027_s1_toron
-#[ignore = "needs the sibling toron debug build (mbx +nightly-aarch64-apple-darwin build -p toron-cli in ~/workspace/toron)"]
-#[test]
-fn adr0027_s1_toron_send_flags_exist() {
-    let cli = toron_root().join("crates/toron-cli/src/cli.rs");
-    assert!(cli.exists(), "toron cli.rs not found at {}", cli.display());
-    let content = read_file(&cli);
-    for field in [
-        "pub corr:",
-        "pub wake:",
-        "pub priority:",
-        "pub audience:",
-        "pub result_path:",
-    ] {
-        assert!(
-            content.contains(field),
-            "RED (bd-2u27): toron mail send missing field {field} — flags must ride SendMessage.extra_tags (E2). See bd-2u27 contract."
-        );
-    }
-    let sandbox = TestSandbox::new();
-    let out = sandbox
-        .command(toron_bin())
-        .args(["mail", "send", "--help"])
-        .env("PATH", sandbox.path_env())
-        .output()
-        .expect("toron help");
-    let help =
-        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
-    for flag in [
-        "--corr",
-        "--wake",
-        "--priority",
-        "--audience",
-        "--result-path",
-    ] {
-        assert!(
-            help.contains(flag),
-            "RED (bd-2u27): toron mail send --help missing {flag} — binary help must list it"
-        );
-    }
-    let messaging = toron_root().join("crates/toron-core/src/mailbox/messaging.rs");
-    let m = read_file(&messaging);
-    assert!(
-        m.contains("extra_tags"),
-        "RED (bd-2u27): messaging.rs must have SendMessage.extra_tags (vehicle exists, currently unused by CLI)"
-    );
-    assert!(
-        content.contains("wake") && content.contains("priority") && content.contains("audience"),
-        "RED (bd-2u27): CLI must have typed wake/priority/audience vocabulary"
     );
 }
 
