@@ -39,7 +39,10 @@ pub fn select_agent_identity(
 /// Fleet-wide mutations (installing a binary, bouncing the live daemons) are
 /// captain-only: a crew pin that changes the code under every other pane is how
 /// a fleet ran mixed binaries (bd-0uzrq.6). `--operator` is the explicit escape,
-/// and an unset identity (the operator's own shell) is never a crew pin.
+/// and an unset identity is the operator's own shell — but ONLY outside a
+/// flywheel pane: every spawned pane is stamped with `FLYWHEEL_PANE`, so a crew
+/// that unsets `AGENT_NAME` cannot inherit the operator's permission
+/// (bd-0uzrq.24).
 pub fn guard_fleet_mutation(
     cfg: &crate::config::Config,
     project: Option<&str>,
@@ -50,7 +53,13 @@ pub fn guard_fleet_mutation(
         return Ok(());
     }
     let Some(who) = select_agent_identity(None, &|k| std::env::var(k).ok()) else {
-        return Ok(());
+        let in_pane = std::env::var("FLYWHEEL_PANE").is_ok_and(|v| !v.is_empty());
+        if !in_pane {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "{what} is captain-only: this crew pane carries no pin (AGENT_NAME unset); set the pin or an operator passes --operator"
+        );
     };
     let key = project.map(str::to_string).or_else(|| {
         std::env::current_dir()
@@ -400,5 +409,32 @@ mod tests {
         unsafe { std::env::remove_var("AGENT_NAME") };
         super::guard_fleet_mutation(&cfg, Some(&project), false, "stack install")
             .expect("an operator shell has no crew pin");
+    }
+
+    /// bd-0uzrq.24: an unset AGENT_NAME is the operator's shell only OUTSIDE a
+    /// flywheel pane. A crew pane that unsets its pin must not inherit that
+    /// permission, and `--operator` stays the one deliberate escape.
+    #[test]
+    fn an_unpinned_crew_pane_may_not_mutate_the_fleet() {
+        let _g = crate::config::lock_env();
+        let cfg = crate::config::Config::default();
+        let project = format!("fleet-guard-pane-{}", std::process::id());
+        unsafe {
+            std::env::remove_var("AGENT_NAME");
+            std::env::set_var("FLYWHEEL_PANE", "1");
+        }
+        let err = super::guard_fleet_mutation(&cfg, Some(&project), false, "stack install")
+            .expect_err("a crew pane with no pin is refused");
+        assert!(
+            format!("{err}").contains("no pin"),
+            "the refusal names the missing pin: {err}"
+        );
+
+        super::guard_fleet_mutation(&cfg, Some(&project), true, "stack install")
+            .expect("--operator is the explicit escape, pane or not");
+
+        unsafe { std::env::remove_var("FLYWHEEL_PANE") };
+        super::guard_fleet_mutation(&cfg, Some(&project), false, "stack install")
+            .expect("outside a pane an unset identity is the operator shell");
     }
 }

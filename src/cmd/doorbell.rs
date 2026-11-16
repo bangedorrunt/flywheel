@@ -37,7 +37,12 @@ pub(crate) enum DoorbellCmd {
     /// this; it re-runs the idempotent start every minute and exits on its
     /// own binary change so the service manager restarts the new binary).
     #[command(hide = true)]
-    Supervise { project: String },
+    Supervise {
+        project: String,
+        /// Bounce live daemons as the operator: bypass the captain-only guard.
+        #[arg(long)]
+        operator: bool,
+    },
     /// stop dispatchers (per workspace; `all` for every registered one)
     Stop {
         project: String,

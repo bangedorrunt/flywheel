@@ -1702,7 +1702,11 @@ enum Commands {
         bead: Option<String>,
     },
     /// Reinstall the binary from source (cargo install --path)
-    Upgrade,
+    Upgrade {
+        /// Install as the operator: bypass the captain-only fleet guard.
+        #[arg(long)]
+        operator: bool,
+    },
     /// One operator door for the installed flywheel, doorbell, and toron
     /// stack, with `--json`/`--check`; `install` delegates to the audited
     /// stack script.
@@ -1751,6 +1755,20 @@ enum Commands {
         /// JSON output
         #[arg(long)]
         json: bool,
+    },
+    /// internal: prove the caller may mutate the fleet (the captain-only gate
+    /// scripts/stack.sh install runs before it replaces a live binary)
+    #[command(name = "__guard-fleet", hide = true)]
+    __GuardFleet {
+        /// what the caller is about to do, named in the refusal
+        #[arg(long)]
+        what: String,
+        /// project whose captain vouches for the caller (default: from cwd)
+        #[arg(long)]
+        project: Option<String>,
+        /// the operator's explicit escape
+        #[arg(long)]
+        operator: bool,
     },
     /// internal: poll swarm state as JSON (durable workflow leaf)
     #[command(name = "__poll", hide = true)]
@@ -3412,8 +3430,14 @@ fn main() {
                 )
                 .and_then(|()| cmd_doorbell_start(&cfg, project))
             }
-            DoorbellCmd::Supervise { project } => {
-                crate::cmd::doorbell::cmd_doorbell_supervise(&cfg, project)
+            DoorbellCmd::Supervise { project, operator } => {
+                crate::authority::guard_fleet_mutation(
+                    &cfg,
+                    Some(project),
+                    *operator,
+                    "doorbell supervise",
+                )
+                .and_then(|()| crate::cmd::doorbell::cmd_doorbell_supervise(&cfg, project))
             }
             DoorbellCmd::Stop {
                 project,
@@ -3801,7 +3825,10 @@ fn main() {
             implementer.as_deref(),
             bead.as_deref(),
         ),
-        Some(Commands::Upgrade) => cmd_upgrade(),
+        Some(Commands::Upgrade { operator }) => {
+            crate::authority::guard_fleet_mutation(&cfg, None, *operator, "flywheel upgrade")
+                .and_then(|()| cmd_upgrade())
+        }
         Some(Commands::Stack { cmd }) => cmd_stack(&cfg, cmd),
         Some(Commands::Ship { cmd }) => cmd_ship(&cfg, cmd),
         Some(Commands::Tutorial) => cmd_tutorial(),
@@ -3814,6 +3841,11 @@ fn main() {
             work,
             json,
         }) => cmd_preflight(&cfg, mode, project.as_deref(), *work, *json),
+        Some(Commands::__GuardFleet {
+            what,
+            project,
+            operator,
+        }) => crate::authority::guard_fleet_mutation(&cfg, project.as_deref(), *operator, what),
         Some(Commands::__Poll { project, to }) => cmd_internal_poll(&cfg, project, to),
         Some(Commands::__Doorbell {
             project,
@@ -5242,7 +5274,7 @@ mod serve_port_tests {
                         .expect("daemon verb parses");
                     let port = match cli.command {
                         Some(crate::Commands::Daemon { cmd }) => match cmd {
-                            crate::cmd::daemon::DaemonCmd::Start { port }
+                            crate::cmd::daemon::DaemonCmd::Start { port, .. }
                             | crate::cmd::daemon::DaemonCmd::Stop { port, .. }
                             | crate::cmd::daemon::DaemonCmd::Restart { port, .. }
                             | crate::cmd::daemon::DaemonCmd::Status { port } => port,
@@ -19365,6 +19397,15 @@ fn cmd_loop_status(cfg: &Config, project: &str) -> Result<()> {
 
 #[cfg(feature = "serve")]
 fn cmd_daemon(cfg: &Config, cmd: &DaemonCmd) -> Result<()> {
+    let (operator, what) = match cmd {
+        DaemonCmd::Start { operator, .. } => (*operator, "daemon start"),
+        DaemonCmd::Stop { operator, .. } => (*operator, "daemon stop"),
+        DaemonCmd::Restart { operator, .. } => (*operator, "daemon restart"),
+        DaemonCmd::Status { .. } => (false, ""),
+    };
+    if !what.is_empty() {
+        crate::authority::guard_fleet_mutation(cfg, None, operator, what)?;
+    }
     let state = daemon::default_state_dir();
     std::fs::create_dir_all(&state)?;
     let addr = |port: u16| format!("127.0.0.1:{port}");
@@ -19374,7 +19415,7 @@ fn cmd_daemon(cfg: &Config, cmd: &DaemonCmd) -> Result<()> {
         daemon::start_cron(&state, &cwd, project.as_deref())
     };
     match cmd {
-        DaemonCmd::Start { port } => {
+        DaemonCmd::Start { port, .. } => {
             daemon::start(&state, &addr(*port))?;
             cron_host()?;
             daemon::ensure_doorbell()?;
@@ -19382,13 +19423,13 @@ fn cmd_daemon(cfg: &Config, cmd: &DaemonCmd) -> Result<()> {
             doorbell_supervise::ensure_armed_hosts(cfg)?;
             Ok(())
         }
-        DaemonCmd::Stop { port, force } => {
+        DaemonCmd::Stop { port, force, .. } => {
             daemon::stop(&state, &addr(*port), *force)?;
             // wave11-b: unload the supervised hosts this daemon owned.
             doorbell_supervise::unload_all_hosts()?;
             daemon::stop_cron()
         }
-        DaemonCmd::Restart { port, force } => {
+        DaemonCmd::Restart { port, force, .. } => {
             daemon::restart(&state, &addr(*port), *force)?;
             daemon::stop_cron()?;
             cron_host()

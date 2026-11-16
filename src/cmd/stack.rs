@@ -443,6 +443,9 @@ fn stack_install(
         );
     }
     let mut args = vec!["install".to_string()];
+    // The native door already passed the guard, so the script's own check (for
+    // a direct `scripts/stack.sh install` call) is told the authority is proven.
+    args.push("--operator".into());
     if dry_run {
         args.push("--dry-run".into());
     }

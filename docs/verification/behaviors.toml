@@ -216,8 +216,25 @@ status = "proven"
 concurrent = false
 tests = [
   "src/authority.rs::a_crew_pin_may_not_install_or_bounce_the_fleet",
+  "src/authority.rs::an_unpinned_crew_pane_may_not_mutate_the_fleet",
+  "src/hc.rs::env_marks_the_pane_for_the_fleet_guard",
+  "tests/fleet_guard.rs::upgrade_refuses_a_crew_pane_with_no_pin",
+  "tests/fleet_guard.rs::upgrade_refuses_a_crew_pin",
+  "tests/fleet_guard.rs::doorbell_supervise_refuses_a_crew_pin",
+  "tests/fleet_guard.rs::stack_install_refuses_a_crew_pin",
+  "tests/fleet_guard.rs::daemon_start_refuses_a_crew_pin",
+  "tests/stack_guard.rs::stack_script_refuses_a_crew_pin",
 ]
-mutations = ["scripts/mutations/stack-guard.spec.sh#G1"]
+mutations = [
+  "scripts/mutations/stack-guard.spec.sh#G1",
+  "scripts/mutations/fleet-guard-pane.spec.sh#P1",
+  "scripts/mutations/fleet-guard-pane.spec.sh#P2",
+  "scripts/mutations/fleet-guard-doors.spec.sh#D1",
+  "scripts/mutations/fleet-guard-doors.spec.sh#D2",
+  "scripts/mutations/fleet-guard-doors.spec.sh#D3",
+  "scripts/mutations/fleet-guard-doors.spec.sh#D4",
+  "scripts/mutations/fleet-guard-doors.spec.sh#D5",
+]
 
 [[behavior]]
 id = "doorbell.mail-push-rings-idle"

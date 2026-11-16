@@ -94,6 +94,10 @@ pub fn plane_launch_env(
         ("HC_SOCKET_PATH".to_string(), cfg.socket_path()),
         ("HC_SESSION".to_string(), session),
     ]);
+    // bd-0uzrq.24: every crew pane is stamped, pinned or not. The fleet guard
+    // reads it to refuse a pane that unset AGENT_NAME instead of mistaking it
+    // for the operator's own shell. The operator's shell never carries it.
+    env.insert("FLYWHEEL_PANE".to_string(), "1".to_string());
     if let Some(pin) = pin.filter(|p| !p.is_empty()) {
         env.insert("AGENT_NAME".to_string(), pin.to_string());
         env.insert("FLYWHEEL_MAIL_AS".to_string(), pin.to_string());
@@ -1552,6 +1556,25 @@ mod plane_launch_env_tests {
         let env = plane_launch_env(&cfg(), Some(""));
         assert!(!env.contains_key("AGENT_NAME"));
         assert!(!env.contains_key("FLYWHEEL_MAIL_AS"));
+    }
+
+    /// bd-0uzrq.24: every crew pane carries the pane marker, pinned or not, so
+    /// the fleet guard can tell a crew pane whose pin was unset from the
+    /// operator's own shell.
+    #[test]
+    fn env_marks_the_pane_for_the_fleet_guard() {
+        assert_eq!(
+            plane_launch_env(&cfg(), Some("DustySparrow"))
+                .get("FLYWHEEL_PANE")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            plane_launch_env(&cfg(), None)
+                .get("FLYWHEEL_PANE")
+                .map(String::as_str),
+            Some("1")
+        );
     }
 
     /// GS-037 P0-4: OPENCODE_GO_API_KEY aliases into OPENCODE_API_KEY when API unset.

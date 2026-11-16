@@ -10,7 +10,7 @@
 # Usage:
 #   scripts/stack.sh status [--check]
 #   scripts/stack.sh install [--dry-run] [--no-codesign] [--no-restart]
-#                            [--skip-toron]
+#                            [--skip-toron] [--operator]
 #
 # status is read-only. `--check` exits 1 when a binary is missing, the
 # doorbell health endpoint is down, a live host generation differs from the
@@ -39,6 +39,7 @@ DRY_RUN=0
 NO_CODESIGN=0
 NO_RESTART=0
 SKIP_TORON=0
+OPERATOR=0
 
 die() {
   echo "stack: $*" >&2
@@ -285,6 +286,21 @@ do_status() {
   show_status
 }
 
+# bd-0uzrq.24: replacing the installed binaries is a fleet mutation, so the
+# rule lives in the tool and this door asks it. A crew pin, or a crew pane that
+# unset AGENT_NAME, is refused; `--operator` is the deliberate escape. Fail
+# CLOSED: no binary to answer, or a binary too old to know the verb, refuses.
+require_fleet_authority() {
+  [ "$OPERATOR" -eq 1 ] && return 0
+  local fw
+  fw="$(command -v flywheel 2>/dev/null || true)"
+  if [ -z "$fw" ]; then
+    die "install is captain-only and no flywheel binary is on PATH to prove the caller's identity; an operator runs it with --operator"
+  fi
+  "$fw" __guard-fleet --what "stack install" \
+    || die "refused: replacing the installed binaries is captain-only (an operator passes --operator)"
+}
+
 do_install() {
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -292,10 +308,13 @@ do_install() {
       --no-codesign) NO_CODESIGN=1; shift ;;
       --no-restart) NO_RESTART=1; shift ;;
       --skip-toron) SKIP_TORON=1; shift ;;
+      --operator) OPERATOR=1; shift ;;
       -h|--help) usage 0 ;;
       *) die "unknown install arg: $1" ;;
     esac
   done
+
+  require_fleet_authority
 
   [ -f "$FLYWHEEL_SOURCE/Cargo.toml" ] || die "no Cargo.toml at $FLYWHEEL_SOURCE (set FLYWHEEL_SOURCE)"
   if [ "$SKIP_TORON" -eq 0 ]; then

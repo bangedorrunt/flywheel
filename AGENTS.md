@@ -95,6 +95,12 @@ pass.
   effect rows and `RunJournal` lifecycle.
 - **Identity ladder.** Explicit `--as`, then `AGENT_NAME`. Registered pins
   pass verbatim. Toron guard uses the same two rungs.
+- **Fleet mutation is captain-only.** `upgrade`, `stack install`,
+  `daemon start|stop|restart`, `doorbell start|stop|supervise`, and
+  `scripts/stack.sh install` all ask `authority::guard_fleet_mutation`: a
+  non-captain pin, or a crew pane with `AGENT_NAME` unset (every pane carries
+  `FLYWHEEL_PANE`), is refused; `--operator` is the deliberate escape and the
+  script fails closed when no binary can answer. bd-0uzrq.24.
 - **Bead create/close.** Create needs `-d`, `--verify` (P≤2 `--principle`).
   Prefer `flywheel ship land <bead> --sha <40hex> --receipt <proof> --as <pin>`:
   it runs the gate, `br close`, `br sync`, the reservation release, and a
