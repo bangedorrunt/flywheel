@@ -1,0 +1,24 @@
+                                                                             █  
+  ┃                                                                          █  
+  ┃  Reply with exactly: OK                                                  █  
+  ┃                                                                          █  
+                                                                             █  
+     OK                                                                      █  
+                                                                             █  
+     Build · DCommandsV4.1 Flash 1017 · 4.9s · 48.8 tok/s · 2.9esctft        █  
+                                                                             █  
+              Search                                                         █  
+                                                                             █  
+              Suggested                                                      █  
+              Switch session                              ctrl+x l           █  
+              New session                                 ctrl+x n           █  
+              Switch model                                ctrl+x m           █  
+              Open settings                                                  █  
+                                                                                
+  ┃                                                                             
+  ┃                                                                             
+  ┃                                                                             
+  ┃  Build auto · DeepSeek V4.1 Flash 1017 OpenCode Go · high                   
+                                                                                
+  ~                                                37.3K (4%)  ctrl+p commands  
+                                                                                

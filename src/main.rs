@@ -80,6 +80,9 @@ mod models;
 mod output;
 mod pane;
 mod pane_keep;
+mod pane_screen;
+#[cfg(test)]
+mod pane_screen_corpus;
 mod pane_write;
 mod phase_chain;
 mod phase_contracts;

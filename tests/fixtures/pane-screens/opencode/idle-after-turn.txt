@@ -1,0 +1,24 @@
+                                                                             █  
+  ┃                                                                          █  
+  ┃  Reply with exactly: OK                                                  █  
+  ┃                                                                          █  
+                                                                             █  
+     OK                                                                      █  
+                                                                             █  
+     Build · DeepSeek V4.1 Flash 1017 · 4.9s · 48.8 tok/s · 2.9s ttft        █  
+                                                                             █  
+                                                                             █  
+                                                                             █  
+                                                                             █  
+                                                                             █  
+                                                                             █  
+                                                                             █  
+                                                                             █  
+                                                                                
+  ┃                                                                             
+  ┃                                                                             
+  ┃                                                                             
+  ┃  Build auto · DeepSeek V4.1 Flash 1017 OpenCode Go · high                   
+                                                                                
+  ~                                                37.3K (4%)  ctrl+p commands  
+                                                                                

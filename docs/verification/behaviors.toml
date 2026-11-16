@@ -272,6 +272,20 @@ tests = [
 mutations = ["scripts/mutations/clean-proof-slot.spec.sh#S1", "scripts/mutations/clean-proof-slot.spec.sh#S2"]
 
 [[behavior]]
+id = "pane.input-line-guard"
+owner = "src/pane_screen.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/pane_screen_corpus.rs::every_captured_screen_classifies",
+  "src/pane_screen_corpus.rs::an_uncaptured_harness_is_unknown_and_does_not_block",
+]
+mutations = [
+  "scripts/mutations/pane-screen-input-guard.spec.sh#G1",
+  "scripts/mutations/pane-screen-input-guard.spec.sh#G2",
+]
+
+[[behavior]]
 id = "reservation.board-fail-closed"
 owner = "scripts/verify-formal.sh"
 status = "proven"

@@ -1,0 +1,36 @@
+# Captured from a throwaway rex session by scripts/capture-pane-corpus.sh
+# (bd-0uzrq.3). Every row is a real screen, not a drawn one.
+#
+# expect: empty | operator-text
+# last_typed: the line the wake path itself wrote into the box, if any. opencode
+#   keeps the submitted text visible, so a box holding exactly that line is NOT
+#   operator typing (that is the finding this corpus exists to record).
+
+[[screen]]
+file = "idle-fresh.txt"
+expect = "empty"
+
+[[screen]]
+file = "partial-input.txt"
+expect = "operator-text"
+
+[[screen]]
+file = "idle-cleared.txt"
+expect = "empty"
+
+[[screen]]
+file = "working.txt"
+expect = "empty"
+last_typed = "Reply with exactly: OK"
+
+[[screen]]
+file = "idle-after-turn.txt"
+expect = "empty"
+last_typed = "Reply with exactly: OK"
+
+[[screen]]
+file = "modal.txt"
+expect = "operator-text"
+# The palette overlay repaints over the input box and the frame is a collision
+# of both layers. The safe answer for an unrecognized non-empty box is defer:
+# the pane belongs to whoever is typing in it.
