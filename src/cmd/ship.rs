@@ -28,6 +28,10 @@ pub(crate) enum ShipCmd {
         /// Repo directory (default: current directory).
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// Repo to search for the citing commit when the work lives elsewhere
+        /// (symmetric with `br close --repo`); default: the `--dir` repo.
+        #[arg(long)]
+        repo: Option<PathBuf>,
         /// Machine-readable result.
         #[arg(long)]
         json: bool,
@@ -57,6 +61,10 @@ pub(crate) enum ShipCmd {
         /// Repo directory (default: current directory).
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// Repo holding the citing commit and the receipt's specs when the
+        /// work lives elsewhere (symmetric with `br close --repo`).
+        #[arg(long)]
+        repo: Option<PathBuf>,
         /// Machine-readable result.
         #[arg(long)]
         json: bool,
@@ -65,7 +73,12 @@ pub(crate) enum ShipCmd {
 
 pub(crate) fn cmd_ship(cfg: &Config, cmd: &ShipCmd) -> Result<()> {
     match cmd {
-        ShipCmd::Check { bead_id, dir, json } => ship_check(bead_id, dir.as_deref(), *json),
+        ShipCmd::Check {
+            bead_id,
+            dir,
+            repo,
+            json,
+        } => ship_check(bead_id, dir.as_deref(), repo.as_deref(), *json),
         ShipCmd::Land {
             bead_id,
             sha,
@@ -74,6 +87,7 @@ pub(crate) fn cmd_ship(cfg: &Config, cmd: &ShipCmd) -> Result<()> {
             as_pin,
             message,
             dir,
+            repo,
             json,
         } => ship_land(LandArgs {
             cfg,
@@ -84,6 +98,7 @@ pub(crate) fn cmd_ship(cfg: &Config, cmd: &ShipCmd) -> Result<()> {
             as_pin: as_pin.as_deref(),
             message: message.as_deref(),
             dir: dir.as_deref(),
+            repo: repo.as_deref(),
             json: *json,
         }),
     }
@@ -110,15 +125,19 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
 /// `sha=`), never to the newest commit that merely mentions the id — a later
 /// unrelated commit citing a closed bead used to flip its verdict. The bound
 /// revision must be an ancestor of HEAD.
-fn head_names_bead(dir: &Path, bead: &str) -> Result<bool> {
+///
+/// bd-9zqjo (b): `search` is the repo the citing commit may live in (a flywheel
+/// bead whose work landed in toron). The gate rows stay in `cwd`; only git is
+/// asked about `search`, and the ancestry question is asked in that repo.
+fn head_names_bead(cwd: &Path, search: &Path, bead: &str) -> Result<bool> {
     // No commit carries the id at all: not named (the check reports the
     // missing row separately), never a hard error here.
-    let Ok(sha) = crate::verdict::derive_head_sha(dir, bead) else {
+    let Ok(sha) = crate::verdict::derive_head_sha_in(cwd, search, bead) else {
         return Ok(false);
     };
     let out = Command::new("git")
         .args(["merge-base", "--is-ancestor", &sha, "HEAD"])
-        .current_dir(dir)
+        .current_dir(search)
         .output()
         .map_err(|err| anyhow!("git not found: {err}"))?;
     Ok(out.status.success())
@@ -178,11 +197,14 @@ fn head_has_closed_bead(dir: &Path, bead: &str) -> Result<(bool, bool)> {
     Ok((found, false))
 }
 
-fn ledger_check(dir: &Path, bead: &str) -> Result<(bool, String, String)> {
+fn ledger_check(dir: &Path, bead: &str, repo: Option<&Path>) -> Result<(bool, String, String)> {
     let exe = std::env::current_exe().map_err(|err| anyhow!("current exe: {err}"))?;
-    let out = Command::new(exe)
-        .args(["ledger", "check", bead, "--dir"])
-        .arg(dir)
+    let mut cmd = Command::new(exe);
+    cmd.args(["ledger", "check", bead, "--dir"]).arg(dir);
+    if let Some(repo) = repo {
+        cmd.arg("--repo").arg(repo);
+    }
+    let out = cmd
         .output()
         .map_err(|err| anyhow!("could not run ledger check: {err}"))?;
     Ok((
@@ -192,7 +214,12 @@ fn ledger_check(dir: &Path, bead: &str) -> Result<(bool, String, String)> {
     ))
 }
 
-fn ship_check(bead: &str, dir: Option<&Path>, json_output: bool) -> Result<()> {
+fn ship_check(
+    bead: &str,
+    dir: Option<&Path>,
+    repo: Option<&Path>,
+    json_output: bool,
+) -> Result<()> {
     if bead.trim().is_empty() {
         bail!("empty bead id");
     }
@@ -205,10 +232,11 @@ fn ship_check(bead: &str, dir: Option<&Path>, json_output: bool) -> Result<()> {
     }
     git(&dir, &["rev-parse", "--git-dir"])?;
 
-    let commit_named = head_names_bead(&dir, bead)?;
+    let search = repo.unwrap_or(&dir);
+    let commit_named = head_names_bead(&dir, search, bead)?;
     let beads_clean = bead_rows_committed(&dir, bead)?;
     let (head_found, head_closed) = head_has_closed_bead(&dir, bead)?;
-    let (ledger_ok, ledger_stdout, ledger_stderr) = ledger_check(&dir, bead)?;
+    let (ledger_ok, ledger_stdout, ledger_stderr) = ledger_check(&dir, bead, repo)?;
     let ok = commit_named && beads_clean && head_found && head_closed && ledger_ok;
 
     if json_output {
@@ -280,6 +308,7 @@ struct LandPlan {
     project: String,
     pin: String,
     message: String,
+    repo: Option<PathBuf>,
 }
 
 fn run_tool(dir: &Path, program: &str, args: &[&str]) -> Result<String> {
@@ -299,14 +328,18 @@ fn run_tool(dir: &Path, program: &str, args: &[&str]) -> Result<String> {
 }
 
 fn resume_line(plan: &LandPlan) -> String {
-    format!(
+    let mut line = format!(
         "flywheel ship land {} --sha {} --receipt {} --project {} --as {}",
         plan.bead,
         plan.sha,
         plan.receipt.display(),
         plan.project,
         plan.pin
-    )
+    );
+    if let Some(repo) = &plan.repo {
+        line.push_str(&format!(" --repo {}", repo.display()));
+    }
+    line
 }
 
 fn land_step<T>(plan: &LandPlan, name: &str, step: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -407,6 +440,7 @@ pub(crate) struct LandArgs<'a> {
     pub as_pin: Option<&'a str>,
     pub message: Option<&'a str>,
     pub dir: Option<&'a Path>,
+    pub repo: Option<&'a Path>,
     pub json: bool,
 }
 
@@ -699,6 +733,7 @@ fn ship_land(args: LandArgs<'_>) -> Result<()> {
         as_pin,
         message,
         dir,
+        repo,
         json,
     } = args;
     if bead.trim().is_empty() {
@@ -717,9 +752,12 @@ fn ship_land(args: LandArgs<'_>) -> Result<()> {
         Some(d) => d.to_path_buf(),
         None => std::env::current_dir().map_err(|err| anyhow!("current directory: {err}"))?,
     };
-    receipt_is_landable(&dir, receipt, sha)?;
+    // The proof and the citing commit belong to the WORK repo when one is
+    // named; the tracker rows, the gate and the commit stay in `dir`.
+    let proof_root = repo.unwrap_or(&dir);
+    receipt_is_landable(proof_root, receipt, sha)?;
     git(&dir, &["rev-parse", "--git-dir"])?;
-    let cited = git(&dir, &["log", "--format=%B", "-n", "1", sha])?;
+    let cited = git(proof_root, &["log", "--format=%B", "-n", "1", sha])?;
     if !cited.contains(bead) {
         bail!("commit {sha} does not cite {bead}; land only ships a commit that names the bead");
     }
@@ -743,6 +781,7 @@ fn ship_land(args: LandArgs<'_>) -> Result<()> {
         message: message
             .map(str::to_string)
             .unwrap_or_else(|| format!("chore(beads): close {bead}")),
+        repo: repo.map(Path::to_path_buf),
     };
 
     // 1. gate: reuse the bead's verify command as the command proof.
@@ -789,11 +828,18 @@ fn ship_land(args: LandArgs<'_>) -> Result<()> {
         eprintln!("ship land: {} already closed", plan.bead);
     } else {
         land_step(&plan, "close", || {
-            run_tool(
-                &dir,
-                "br",
-                &["close", &plan.bead, "--commit-sha", &plan.sha],
-            )?;
+            let mut argv: Vec<String> = vec![
+                "close".into(),
+                plan.bead.clone(),
+                "--commit-sha".into(),
+                plan.sha.clone(),
+            ];
+            if let Some(repo) = repo {
+                argv.push("--repo".into());
+                argv.push(repo.display().to_string());
+            }
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+            run_tool(&dir, "br", &argv)?;
             Ok(())
         })?;
     }
@@ -840,7 +886,7 @@ fn ship_land(args: LandArgs<'_>) -> Result<()> {
     }
 
     // 6. the gate, last.
-    land_step(&plan, "check", || ship_check(bead, Some(&dir), json))?;
+    land_step(&plan, "check", || ship_check(bead, Some(&dir), repo, json))?;
     if json {
         print_json(&json!({
             "schema": "flywheel-ship-land.v1",
@@ -1328,7 +1374,45 @@ mod tests {
         };
         commit("feat(work): the bd-abc123 work");
         commit("chore: unrelated lane landing");
-        assert!(head_names_bead(dir.path(), "bd-abc123").unwrap());
-        assert!(!head_names_bead(dir.path(), "bd-zzz999").unwrap());
+        assert!(head_names_bead(dir.path(), dir.path(), "bd-abc123").unwrap());
+        assert!(!head_names_bead(dir.path(), dir.path(), "bd-zzz999").unwrap());
+    }
+
+    /// bd-9zqjo (b): a bead can be a tracker row in one repo while its work
+    /// landed in another (bd-9zqjo's own commits live in toron). `--repo`
+    /// moves only the SEARCH; the tracker checks stay in `dir`, so the same
+    /// call must still refuse when the citing commit is nowhere.
+    #[test]
+    fn head_names_bead_searches_the_work_repo_when_named() {
+        let store = init_repo();
+        let work = init_repo();
+        let commit = |dir: &std::path::Path, msg: &str| {
+            std::fs::write(dir.join("f.txt"), msg).unwrap();
+            for args in [vec!["add", "-A"], vec!["commit", "-qm", msg]] {
+                assert!(
+                    Command::new("git")
+                        .current_dir(dir)
+                        .args(args)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+        };
+        commit(store.path(), "chore: the tracker repo, no citation");
+        commit(work.path(), "feat(work): bd-crossrepo is here");
+
+        assert!(
+            !head_names_bead(store.path(), store.path(), "bd-crossrepo").unwrap(),
+            "the tracker repo does not carry the work"
+        );
+        assert!(
+            head_names_bead(store.path(), work.path(), "bd-crossrepo").unwrap(),
+            "the named work repo does"
+        );
+        assert!(
+            !head_names_bead(store.path(), work.path(), "bd-nobody").unwrap(),
+            "no repo carrying the id is still a refusal, not an error"
+        );
     }
 }

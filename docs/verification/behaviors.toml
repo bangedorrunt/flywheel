@@ -932,3 +932,16 @@ tests = [
 mutations = [
   "scripts/mutations/collab-single-send.spec.sh#Q2",
 ]
+
+[[behavior]]
+id = "ship.repo-search-is-the-work-repo"
+owner = "src/cmd/ship.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/ship.rs::head_names_bead_searches_the_work_repo_when_named",
+  "src/cmd/ship.rs::head_names_bead_survives_sequential_landings",
+]
+mutations = [
+  "scripts/mutations/ship-repo-search.spec.sh#S1",
+]
