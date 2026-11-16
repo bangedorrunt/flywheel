@@ -641,6 +641,7 @@ mutations = [
   "scripts/mutations/headless-phase-argv.spec.sh#H1",
   "scripts/mutations/headless-phase-argv.spec.sh#H2",
   "scripts/mutations/headless-phase-argv.spec.sh#H3",
+  "scripts/mutations/headless-phase-argv.spec.sh#H4",
 ]
 
 [[behavior]]
