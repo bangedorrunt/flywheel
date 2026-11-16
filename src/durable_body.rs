@@ -1923,7 +1923,10 @@ mod tests {
         .await
         .expect("one dispatch step settles");
         let _ = std::fs::remove_file(&db);
-        (outcome, root.join(".flywheel").join("wave").join("wave-9-j.done"))
+        (
+            outcome,
+            root.join(".flywheel").join("wave").join("wave-9-j.done"),
+        )
     }
 
     /// ADR-0021 D4.4 (bd-jhz8x.3): the `.done` sidecar belongs to the RUNNER and
