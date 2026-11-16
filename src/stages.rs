@@ -640,6 +640,14 @@ impl StageLibrary {
         Self { stages, tiers }
     }
 
+    /// The compiled-in library, built once per process. Hot callers (workflow
+    /// lowering stamps every workflow it resolves) must not rebuild ~40
+    /// prompts on each call.
+    pub fn shared() -> &'static StageLibrary {
+        static LIB: std::sync::OnceLock<StageLibrary> = std::sync::OnceLock::new();
+        LIB.get_or_init(Self::compiled_in)
+    }
+
     /// The repo DATA tier: `repo-stages.toml` compiled into the binary
     /// (include_str!). Empty until a stage is promoted to the repo tier
     /// through the §3.8 evidence bar.
@@ -2260,6 +2268,73 @@ mod stage_contract_tests {
             assert_eq!(st.context, Some(StageContext::Fresh), "{name} fresh");
             assert_eq!(st.mode, Some(StageMode::ReadOnly), "{name} read-only");
         }
+    }
+
+    /// bd-6setu.6 (V10 at the claim): a REVIEW step's stage-contract reads ride
+    /// its job spec as `exclude_claimants_of`, so toron's claim can refuse the
+    /// pin that authored one of those nodes in the same run. A step whose stage
+    /// is not a review, or reads no `steps.*`, carries nothing.
+    #[test]
+    fn a_review_steps_reads_ride_its_job_spec() {
+        let dir = std::env::temp_dir().join(format!("fd-claim-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("claim-review.toml");
+        std::fs::write(
+            &path,
+            "name = \"claim-review\"\nprompt = \"review the work\"\nwitness = \"review\"\nreads = [\"steps.execute\", \"inputs.objective\"]\n",
+        )
+        .expect("stage file");
+        let mut lib = StageLibrary::compiled_in();
+        lib.apply_stage_entry_path(&path, Tier::Project).expect("load stage");
+
+        let mut wf = toron_workflow::schema::parse_workflow(
+            "name: stamp\nsteps:\n  - name: execute\n    action: dispatch_job\n    assignee: x\n    spec: { task: go, stage: ce-execute }\n    on_error: fail_run\n  - name: review\n    action: dispatch_job\n    assignee: x\n    spec: { task: check, stage: claim-review }\n    on_error: fail_run\n  - name: verify\n    action: dispatch_job\n    assignee: x\n    spec: { task: verify, stage: wave-verify }\n    on_error: fail_run\n",
+        )
+        .expect("parse workflow");
+        assert_eq!(
+            crate::workflow_lowering::stamp_claim_exclusions(&mut wf, &lib),
+            1,
+            "exactly the review step is stamped"
+        );
+        let spec_of = |name: &str| -> toron_workflow::schema::DispatchSpec {
+            let step = wf.steps.iter().find(|s| s.name.as_deref() == Some(name)).expect("step");
+            match &step.action {
+                toron_workflow::schema::Action::DispatchJob { spec, .. } => spec.clone(),
+                other => panic!("{name} is a dispatch: {}", other.type_name()),
+            }
+        };
+        assert_eq!(
+            spec_of("review").extra.get("exclude_claimants_of"),
+            Some(&serde_json::json!(["execute"])),
+            "only steps.* refs become claim exclusions (inputs.* never do)"
+        );
+        assert!(
+            spec_of("execute").extra.get("exclude_claimants_of").is_none(),
+            "an execute step carries no exclusion"
+        );
+        assert!(
+            spec_of("verify").extra.get("exclude_claimants_of").is_none(),
+            "wave-verify is not a review-witness step"
+        );
+
+        // Idempotent: re-stamping writes the same list, never a duplicate key.
+        assert_eq!(
+            crate::workflow_lowering::stamp_claim_exclusions(&mut wf, &lib),
+            1
+        );
+        let spec_of = |name: &str| -> toron_workflow::schema::DispatchSpec {
+            let step = wf.steps.iter().find(|s| s.name.as_deref() == Some(name)).expect("step");
+            match &step.action {
+                toron_workflow::schema::Action::DispatchJob { spec, .. } => spec.clone(),
+                other => panic!("{name} is a dispatch: {}", other.type_name()),
+            }
+        };
+        assert_eq!(
+            spec_of("review").extra.get("exclude_claimants_of"),
+            Some(&serde_json::json!(["execute"]))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A prompt-only user-tier override keeps the seed's phase, reads, and

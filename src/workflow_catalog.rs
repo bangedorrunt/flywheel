@@ -436,7 +436,11 @@ pub fn all_workflows_merged(
         Some(root) => WorkflowCatalog::load_layered(Some(root))?,
         None => WorkflowCatalog::load()?,
     };
-    for (name, wf) in cat.workflows {
+    let stages = crate::stages::StageLibrary::shared();
+    for (name, mut wf) in cat.workflows {
+        // bd-6setu.6: same stamp as the built-ins — a catalog workflow's review
+        // step must carry the exclusion its claim-side guard reads.
+        crate::workflow_lowering::stamp_claim_exclusions(&mut wf, stages);
         out.insert(name, (wf, "catalog"));
     }
     Ok(out)

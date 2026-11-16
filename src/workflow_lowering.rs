@@ -500,6 +500,75 @@ pub fn check_bounded(lowered: &Lowered) -> (Vec<String>, Vec<String>) {
     (errors, warnings)
 }
 
+/// bd-6setu.6 (V10 at the CLAIM): stamp `exclude_claimants_of` on a REVIEW
+/// step's job spec from the stage contract's `steps.<node>` reads.
+///
+/// The dispatch-side binder (bd-6setu.2) only sees jobs flywheel dispatches; a
+/// plane-S job is claimed by the agent in its own pane, so the author guard
+/// moves to the claim — and the claim needs the node list on the wire. A step
+/// whose stage declares no `review` witness, or reads no `steps.*`, gets
+/// nothing: absence is not a rule, and an empty list is never written.
+pub fn stamp_claim_exclusions(wf: &mut Workflow, stages: &crate::stages::StageLibrary) -> usize {
+    let mut stamped = 0;
+    for step in &mut wf.steps {
+        stamped += stamp_action_claims(&mut step.action, stages);
+    }
+    if let Some(graph) = &mut wf.graph {
+        for node in graph.nodes.values_mut() {
+            stamped += stamp_action_claims(&mut node.action, stages);
+        }
+    }
+    stamped
+}
+
+fn stamp_action_claims(action: &mut Action, stages: &crate::stages::StageLibrary) -> usize {
+    match action {
+        Action::DispatchJob { spec, .. } => {
+            let Some(stage_name) = spec.stage.as_deref() else {
+                return 0;
+            };
+            let Some(stage) = stages.get_stage(stage_name) else {
+                return 0;
+            };
+            if stage.witness.as_deref() != Some("review") {
+                return 0;
+            }
+            let mut nodes: Vec<String> = stage
+                .reads
+                .iter()
+                .filter_map(|r| r.strip_prefix("steps.").map(str::to_string))
+                .filter(|n| !n.is_empty())
+                .collect();
+            nodes.sort();
+            nodes.dedup();
+            if nodes.is_empty() {
+                return 0;
+            }
+            spec.extra.insert(
+                "exclude_claimants_of".to_string(),
+                serde_json::Value::Array(nodes.into_iter().map(serde_json::Value::String).collect()),
+            );
+            1
+        }
+        Action::Loop { body, .. } => body
+            .iter_mut()
+            .map(|s| stamp_action_claims(&mut s.action, stages))
+            .sum(),
+        Action::Branch {
+            then, else_steps, ..
+        } => then
+            .iter_mut()
+            .chain(else_steps.iter_mut())
+            .map(|s| stamp_action_claims(&mut s.action, stages))
+            .sum(),
+        Action::Foreach { each, .. } | Action::Parallel { each, .. } => {
+            stamp_action_claims(&mut each.action, stages)
+        }
+        Action::Retry { step, .. } => stamp_action_claims(&mut step.action, stages),
+        _ => 0,
+    }
+}
+
 /// Phase-ending dispatches with neither a stage witness nor a phase contract
 /// (ADR-0021 D5.2). A phase end is a dispatch carrying a `spec.phase` that
 /// names one of the registered phase contracts; it is witnessed when its
