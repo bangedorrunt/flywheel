@@ -218,6 +218,33 @@ while IFS='	' read -r rel pin; do
   echo "clean-proof: sibling $rel @ $pin"
 done < <(proof_siblings "$ROOT")
 
+# bd-jp9z1.3: specs whose spec file or targets changed most recently run
+# first, so a fresh edit fails the proof early instead of after every other
+# spec. The export has no git history, so the table is built from the real
+# repo at the proven revision.
+SPEC_RECENCY="$TMP/spec-recency.tsv"
+: >"$SPEC_RECENCY"
+for spec in scripts/mutations/*.spec.sh; do
+  [ -f "$spec" ] || continue
+  spec_files=("$spec")
+  while IFS=$'\t' read -r _id target; do
+    [ -n "${target:-}" ] && spec_files+=("$target")
+  done < <(bash scripts/verify-mutations.sh --list "$spec" 2>/dev/null || true)
+  spec_ts="$(git -C "$ROOT" log -1 --format=%ct "$PROVEN_SHA" -- "${spec_files[@]}" 2>/dev/null || true)"
+  printf '%s\t%s\n' "${spec_ts:-0}" "$(basename "$spec")" >>"$SPEC_RECENCY"
+done
+
+# Mutation specs in the order above (newest change first, name on a tie).
+ordered_specs() {
+  local spec name ts
+  for spec in scripts/mutations/*.spec.sh; do
+    [ -f "$spec" ] || continue
+    name="$(basename "$spec")"
+    ts="$(awk -F'\t' -v n="$name" '$2 == n { print $1; exit }' "$SPEC_RECENCY")"
+    printf '%s\t%s\n' "${ts:-0}" "$spec"
+  done | sort -t "$(printf '\t')" -k1,1nr -k2,2 | cut -f2
+}
+
 cd "$TMP/flywheel"
 
 STEP_NAMES=""
@@ -248,8 +275,13 @@ run_step() { # name cmd...
 # Warnings are errors for every workspace target (skips cached deps).
 export RUSTFLAGS="${RUSTFLAGS:-} -D warnings"
 
-run_step build "${MBX[@]}" build --workspace --all-targets || true
+# bd-jp9z1.3: the cheapest check that can fail runs first. A rotted needle
+# costs under a second here instead of 40 minutes after the suite; a clippy
+# error fails before the suite instead of after it.
+run_step verify-needles bash scripts/verify-needles.sh || true
+[ -n "$FAILED_STEP" ] || run_step build "${MBX[@]}" build --workspace --all-targets || true
 [ -n "$FAILED_STEP" ] || run_step no-run "${MBX[@]}" test --workspace --no-run || true
+[ -n "$FAILED_STEP" ] || run_step verify-clippy bash scripts/verify-clippy.sh || true
 [ -n "$FAILED_STEP" ] || run_step suite "${MBX[@]}" test -p flywheel --bin flywheel || true
 [ -n "$FAILED_STEP" ] || run_step workflow-verify \
   env "XDG_CONFIG_HOME=$TMP/config" "XDG_STATE_HOME=$TMP/state" \
@@ -257,7 +289,6 @@ run_step build "${MBX[@]}" build --workspace --all-targets || true
 [ -n "$FAILED_STEP" ] || run_step doorbell \
   "${MBX[@]}" test -p doorbell-cli -p doorbell-rt -p doorbell-core || true
 [ -n "$FAILED_STEP" ] || run_step stack-recover bash scripts/test-stack-recover.sh || true
-[ -n "$FAILED_STEP" ] || run_step verify-clippy bash scripts/verify-clippy.sh || true
 [ -n "$FAILED_STEP" ] || run_step verify-formal bash scripts/verify-formal.sh || true
 [ -n "$FAILED_STEP" ] || run_step verify-coverage bash scripts/verify-coverage.sh || true
 
@@ -293,7 +324,7 @@ if [ -n "$MUTATIONS_MODE" ] && [ -z "$FAILED_STEP" ]; then
   chmod +x "$wrapper"
   mut_ran=0
   mut_failed=0
-  for spec in scripts/mutations/*.spec.sh; do
+  while IFS= read -r spec; do
     [ -f "$spec" ] || continue
     if [ "$mut_scoped" -eq 1 ]; then
       hit=""
@@ -323,7 +354,7 @@ if [ -n "$MUTATIONS_MODE" ] && [ -z "$FAILED_STEP" ]; then
       tail -20 "$TMP/mutations-$mut_ran.log" >&2 || true
       mut_failed=$((mut_failed + 1))
     fi
-  done
+  done < <(ordered_specs)
   if [ "$mut_ran" -eq 0 ]; then
     echo "clean-proof: mutations no changed spec (nothing to re-prove)"
   else

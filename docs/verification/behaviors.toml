@@ -601,3 +601,60 @@ mutations = [
   "scripts/mutations/doorbell-fetch-backoff.spec.sh#B4",
   "scripts/mutations/doorbell-fetch-backoff.spec.sh#B5",
 ]
+
+[[behavior]]
+id = "proof.fail-fast"
+owner = "scripts/clean-proof.sh"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/clean_proof.rs::the_needle_lint_fails_and_names_spec_and_id_when_a_needle_is_gone",
+  "src/cmd/clean_proof.rs::the_needle_lint_fails_when_a_needle_occurs_twice",
+  "src/cmd/clean_proof.rs::the_needle_lint_passes_on_exactly_one_occurrence",
+  "src/cmd/clean_proof.rs::the_needle_lint_reports_a_missing_target_file",
+  "src/cmd/clean_proof.rs::clean_proof_runs_needles_then_build_then_clippy_then_suite",
+  "src/cmd/clean_proof.rs::mutation_specs_run_newest_change_first",
+]
+mutations = [
+  "scripts/mutations/proof-fail-fast.spec.sh#N1",
+  "scripts/mutations/proof-fail-fast.spec.sh#N2",
+  "scripts/mutations/proof-fail-fast.spec.sh#N3",
+  "scripts/mutations/proof-fail-fast.spec.sh#N4",
+  "scripts/mutations/proof-fail-fast.spec.sh#N5",
+  "scripts/mutations/proof-fail-fast.spec.sh#N6",
+  "scripts/mutations/proof-fail-fast.spec.sh#N7",
+]
+
+[[behavior]]
+id = "mail-cleanup.guard-holds-the-live-store"
+owner = "src/mail.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/mail.rs::the_durable_root_holding_the_store_is_protected",
+  "src/mail.rs::the_store_dir_itself_is_protected",
+  "src/mail.rs::a_string_prefix_sibling_is_not_protected",
+  "src/mail.rs::an_unrelated_dir_and_a_missing_store_are_unprotected",
+  "src/mail.rs::an_unrelated_temp_dir_is_still_removed",
+]
+mutations = [
+  "scripts/mutations/mail-cleanup-guard.spec.sh#G1",
+  "scripts/mutations/mail-cleanup-guard.spec.sh#G2",
+  "scripts/mutations/mail-cleanup-guard.spec.sh#G3",
+  "scripts/mutations/mail-cleanup-guard.spec.sh#G4",
+  "scripts/mutations/mail-cleanup-guard.spec.sh#G5",
+]
+
+[[behavior]]
+id = "mail.init-once"
+owner = "src/mail.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/mail.rs::a_successful_build_runs_exactly_once",
+  "src/mail.rs::an_unrelated_temp_dir_is_still_removed",
+]
+mutations = [
+  "scripts/mutations/mail-init.spec.sh#M1",
+  "scripts/mutations/mail-init.spec.sh#M2",
+]

@@ -6,6 +6,8 @@ pub(crate) mod artifacts;
 pub(crate) mod backend;
 pub(crate) mod captain;
 pub(crate) mod checkpoint;
+#[cfg(test)]
+pub(crate) mod clean_proof;
 pub(crate) mod coalition;
 pub(crate) mod config;
 pub(crate) mod crew;

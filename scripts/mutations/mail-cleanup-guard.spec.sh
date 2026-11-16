@@ -34,13 +34,13 @@
 # the same cases the previous spec drove, plus the ancestor shape.
 
 CARGO_ARGS=(--bin flywheel)
-TEST_FILTER=(mail_shim::cleanup_test_data_dir_tests)
+TEST_FILTER=(mail::cleanup_test_data_dir_tests)
 
 # G1 — THE REGRESSION. Back to equality, i.e. exactly what bd-tg4n shipped. The
 # durable-root case is the one every caller in the module hits, so this is the
 # mutation that would have caught the original no-op.
 mutation "G1  the guard is equality again, so it never matches the root" \
-    file=src/mail_shim.rs \
+    file=src/mail.rs \
     expect=the_durable_root_holding_the_store_is_protected \
     find='    matches!(built, Some(root) if root.starts_with(dir))' \
     replace='    matches!(built, Some(root) if root == dir)'
@@ -49,7 +49,7 @@ mutation "G1  the guard is equality again, so it never matches the root" \
 # guard DID get right, so it is the branch that must not lose protection when
 # the ancestor form is added.
 mutation "G2  the guard protects nothing" \
-    file=src/mail_shim.rs \
+    file=src/mail.rs \
     expect=the_store_dir_itself_is_protected \
     find='    matches!(built, Some(root) if root.starts_with(dir))
 }' \
@@ -61,7 +61,7 @@ mutation "G2  the guard protects nothing" \
 # instead of a path one; every case still passes except the sibling, and
 # `fw-bind-stamp-XY` would keep `fw-bind-stamp-XYZ`'s store alive forever.
 mutation "G3  the guard compares string prefixes, not path components" \
-    file=src/mail_shim.rs \
+    file=src/mail.rs \
     expect=a_string_prefix_sibling_is_not_protected \
     find='    matches!(built, Some(root) if root.starts_with(dir))' \
     replace='    matches!(built, Some(root) if root.to_string_lossy().starts_with(dir.to_string_lossy().as_ref()))'
@@ -70,7 +70,7 @@ mutation "G3  the guard compares string prefixes, not path components" \
 # when the symptom is "a store went missing" and the fix is "delete less". It
 # leaks a temp dir per test per run and is invisible in a red-suite reading.
 mutation "G4  the guard protects everything, leaking every temp dir" \
-    file=src/mail_shim.rs \
+    file=src/mail.rs \
     expect=an_unrelated_dir_and_a_missing_store_are_unprotected \
     find='    matches!(built, Some(root) if root.starts_with(dir))' \
     replace='    built.is_some() || dir.as_os_str().is_empty()'
@@ -79,7 +79,7 @@ mutation "G4  the guard protects everything, leaking every temp dir" \
 # never touches the filesystem, and the suite stops leaving temp dirs behind
 # while every protection test stays green.
 mutation "G5  the cleanup removes nothing at all" \
-    file=src/mail_shim.rs \
+    file=src/mail.rs \
     expect=an_unrelated_temp_dir_is_still_removed \
     find='    let _ = std::fs::remove_dir_all(dir);
 }' \

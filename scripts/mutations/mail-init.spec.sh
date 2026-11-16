@@ -16,7 +16,7 @@
 # so the cell holds `T` and a failing builder returns before the `set`.
 
 CARGO_ARGS=(--bin flywheel)
-TEST_FILTER=(mail_shim::init_once_tests mail_shim::cleanup_test_data_dir_tests)
+TEST_FILTER=(mail::init_once_tests mail::cleanup_test_data_dir_tests)
 
 # ONE mutation, and it is not the obvious one.
 #
@@ -47,7 +47,7 @@ TEST_FILTER=(mail_shim::init_once_tests mail_shim::cleanup_test_data_dir_tests)
 # TEST; a needle that does not exist is a claim about a MUTATION. Read the diff
 # back after a surprising VACUOUS.
 mutation "M1  a memoised value is never read back" \
-    file=src/mail_shim.rs \
+    file=src/mail.rs \
     expect=a_successful_build_runs_exactly_once \
     find='    if let Some(v) = cell.get() {
         return Ok(v);
@@ -56,7 +56,7 @@ mutation "M1  a memoised value is never read back" \
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(v) = cell.get() {
-        return Ok(v); // lost the race; the winner'"'"'s value is the answer
+        return Ok(v);
     }' \
     replace='    let _held = gate
         .lock()
@@ -69,9 +69,9 @@ mutation "M1  a memoised value is never read back" \
 # satisfy the production symptom and leak a temp dir on every run, so this is
 # the half worth a test rather than a comment.
 mutation "M2  the cleanup removes nothing at all" \
-    file=src/mail_shim.rs \
+    file=src/mail.rs \
     expect=an_unrelated_temp_dir_is_still_removed \
-    find='    if built_mail_root() == Some(dir) {
+    find='    if dir_holds_live_store(built_mail_root(), dir) {
         return;
     }
     let _ = std::fs::remove_dir_all(dir);' \

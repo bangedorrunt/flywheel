@@ -36,8 +36,10 @@ mutation "C3  a queued deferral is not a brief" \
 mutation "C4  a system notice counts as a brief" \
     file=$CAPTAIN \
     expect=captain_subjects_skip_crew_senders \
-    find='        .filter(|row| !crate::mail_wake::is_system_notice_value(row))' \
-    replace='        .filter(|_row| true)'
+    find='        .filter(|row| is_captain_row(row, pin, crew))
+        .filter(|row| !crate::mail_wake::is_system_notice_value(row))' \
+    replace='        .filter(|row| is_captain_row(row, pin, crew))
+        .filter(|_row| true)'
 
 mutation "C5  a crew peer's unread counts as captain mail" \
     file=$CAPTAIN \
