@@ -15,7 +15,9 @@
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+
+use flywheel_test_sandbox::TestSandbox;
 
 use toron_core::delivery::{DeliveryEvent, DeliveryFsm, DeliveryState, Phase};
 use toron_core::envelope::Class;
@@ -72,7 +74,8 @@ fn split_transcript() -> (Vec<String>, Vec<String>, Vec<serde_json::Value>) {
 }
 
 fn run_doorbell_once(seeds: &[String], watch_lines: &[String]) -> serde_json::Value {
-    let mut cmd = Command::new(flywheel());
+    let sandbox = TestSandbox::new();
+    let mut cmd = sandbox.command(flywheel());
     cmd.args([
         "__doorbell",
         "--project",

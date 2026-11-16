@@ -6,6 +6,5 @@ tests/e2e_statechart_formal_verification.rs
 tests/e2e_verdict_reopen.rs
 tests/event_poll_parity.rs
 tests/fleet_guard.rs
-tests/replay_transcript.rs
 tests/sc_fw_workflow_edge.rs
 tests/stack_guard.rs
