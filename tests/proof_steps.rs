@@ -102,3 +102,30 @@ fn proof_every_gate_leg_denies_warnings() {
     }
     assert!(legs >= 4, "expected every gate leg, found {legs}");
 }
+
+/// The mutation harness must call an aborted run what it is (bd-0uzrq.24 /
+/// proof33): a breach that panicked during unwind aborted the process, and
+/// NO-RESULTS sent the reader hunting a CARGO_ARGS bug that did not exist.
+#[test]
+fn proof_mutation_harness_classifies_an_abort() {
+    let out = Command::new("bash")
+        .arg(format!("{}/scripts/verify-mutations.sh", root()))
+        .arg("--self-test")
+        .current_dir(root())
+        .output()
+        .expect("run the mutation harness self-test");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "self-test failed: {text}");
+    assert!(
+        text.contains("ABORTED      a run that aborts after starting"),
+        "the harness must classify an abort as ABORTED: {text}"
+    );
+    assert!(
+        text.contains("the abort names the test that was running"),
+        "the ABORTED verdict must name the running test: {text}"
+    );
+}

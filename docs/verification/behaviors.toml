@@ -347,11 +347,13 @@ tests = [
   "tests/proof_steps.rs::proof_suite_step_runs_the_tests_directory",
   "tests/proof_steps.rs::proof_verify_mutations_never_edits_the_shared_tree",
   "tests/proof_steps.rs::proof_every_gate_leg_denies_warnings",
+  "tests/proof_steps.rs::proof_mutation_harness_classifies_an_abort",
 ]
 mutations = [
   "scripts/mutations/proof-suite-and-isolation.spec.sh#S1",
   "scripts/mutations/proof-suite-and-isolation.spec.sh#I1",
   "scripts/mutations/verify-clippy-gates.spec.sh#W1",
+  "scripts/mutations/mutation-harness-aborted.spec.sh#A1",
 ]
 
 

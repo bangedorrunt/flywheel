@@ -59,6 +59,7 @@ VERDICT_BUILD="BUILD-BROKEN"
 VERDICT_OTHER="RED-OTHER"
 VERDICT_MISS="NEEDLE-MISS"
 VERDICT_NO_RESULTS="NO-RESULTS"
+VERDICT_ABORTED="ABORTED"
 VERDICT_DEAD="DEAD-CONFIRMED"
 VERDICT_ALIVE="STILL-LOAD-BEARING"
 
@@ -109,6 +110,30 @@ json_row() {
 
 # --- the harness proper ---------------------------------------------------
 
+# True when the test process STARTED and then died without a summary: cargo says
+# "signal: N", or libtest printed its opening "running N tests" and no
+# `test result:` line ever followed.
+is_aborted() {
+    local out="$1"
+    case "$out" in
+        *"test result:"*) return 1 ;;
+    esac
+    case "$out" in
+        *"signal: "*) return 0 ;;
+        *"running "*) return 0 ;;
+    esac
+    return 1
+}
+
+# The evidence for an ABORTED verdict: the signal, and the last test the log
+# named (that is the test that was running when the process died).
+abort_detail() {
+    local out="$1" signal last
+    signal="$(printf '%s\n' "$out" | grep -o 'signal: [0-9]*[^)]*' | head -1)"
+    last="$(printf '%s\n' "$out" | grep -oE '^test [^ ]+ \.\.\.' | tail -1 | awk '{print $2}')"
+    printf 'signal %s; last test %s' "${signal:-none}" "${last:-unknown}"
+}
+
 # Name what one mutation's test run proved.
 #
 # `expect` is the test that must go red. A suite that fails without naming it
@@ -120,6 +145,14 @@ classify() {
     case "$out" in
         *"could not compile"* | *"error[E"*) printf '%s\n' "$VERDICT_BUILD"; return ;;
     esac
+    # A run that STARTED and then died (SIGABRT from a panic during unwind, a
+    # killed process) is its own verdict: it is a real FAILURE with a witness,
+    # not a wrong package. Reading it as NO-RESULTS sent a live breach hunting
+    # for a CARGO_ARGS bug.
+    if is_aborted "$out"; then
+        printf '%s\n' "$VERDICT_ABORTED"
+        return
+    fi
     # Cargo failing before it runs anything -- a bad package name, a missing
     # toolchain -- prints no `test result:` line at all. That is NOT a passing
     # suite, and treating it as one made a broken command report "control green"
@@ -310,6 +343,26 @@ EOF
         "$VERDICT_NO_RESULTS" "a cargo invocation that ran no tests is not a passing suite"
     expect_verdict "$(classify "" the_worker_is_not_claiming)" \
         "$VERDICT_NO_RESULTS" "empty output is not a passing suite either"
+    # bd-0uzrq.24 / proof33: the process STARTED and then died. A live breach
+    # must read as ABORTED with the signal and the running test named, never
+    # NO-RESULTS (which sends the reader hunting a wrong package).
+    local aborted
+    aborted="running 2 tests
+test upgrade_refuses_a_crew_pin ... ok
+test doorbell_supervise_refuses_a_crew_pin ... FAILED
+a sandboxed test reached the real supervisor
+thread caused non-unwinding panic. aborting.
+Caused by:
+  process didn't exit successfully: ./fleet_guard (signal: 6, SIGABRT: process abort signal)"
+    expect_verdict "$(classify "$aborted" doorbell_supervise_refuses_a_crew_pin)" \
+        "$VERDICT_ABORTED" "a run that aborts after starting is ABORTED, not a package mistake"
+    case "$(abort_detail "$aborted")" in
+        *"last test doorbell_supervise_refuses_a_crew_pin"*)
+            printf '  ok    %-12s %s\n' detail "the abort names the test that was running" ;;
+        *)
+            printf '  FAIL  detail    did not name the running test: %s\n' "$(abort_detail "$aborted")"
+            SELF_FAILURES=$((SELF_FAILURES + 1)) ;;
+    esac
     expect_verdict "$(classify "$failed_elsewhere" the_worker_is_not_claiming)" \
         "$VERDICT_OTHER" "a different test failing does not clear this one"
 
@@ -673,7 +726,9 @@ main() {
             continue
         fi
         touch "$REPO/${M_FILE[$i]}"
-        verdict="$(classify "$(run_tests)" "${M_EXPECT[$i]}")"
+        local mut_out
+        mut_out="$(run_tests)"
+        verdict="$(classify "$mut_out" "${M_EXPECT[$i]}")"
         # A green-expected mutation asks the opposite question: this guard is
         # supposed to be dead, so a green suite is the ANSWER and a red one is
         # the finding. Scoring it like a normal mutation would report the whole
@@ -698,6 +753,7 @@ main() {
                     "$VERDICT_BUILD") echo "       the mutation did not build; the needle is probably not arity-preserving" ;;
                     "$VERDICT_OTHER") echo "       a different test went red; the named one did not" ;;
                     "$VERDICT_NO_RESULTS") echo "       cargo ran no tests at all; the spec's CARGO_ARGS is probably wrong" ;;
+                    "$VERDICT_ABORTED") echo "       the run started and died before a summary: $(abort_detail "$mut_out")" ;;
                 esac
                 ;;
         esac
