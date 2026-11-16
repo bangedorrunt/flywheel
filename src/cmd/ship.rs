@@ -10,7 +10,7 @@
 //! live `br` database, which can be newer than the committed tracker snapshot.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Result, anyhow, bail};
 use clap::Subcommand;
@@ -515,6 +515,43 @@ fn gate_note(sha: &str, proved: &str, cmd: &str, receipt: &Path) -> String {
     )
 }
 
+/// The cache key for one spec, recomputed from the PROVEN revision's own
+/// cache script so the working tree cannot vouch for a cache entry (bd-jp9z1.2).
+fn cache_key_at(root: &Path, rev: &str, spec: &str, driver: &str) -> Result<String> {
+    let script = git(root, &["show", &format!("{rev}:scripts/mutation-cache.py")])
+        .map_err(|e| anyhow!("cannot read scripts/mutation-cache.py at {rev}: {e}"))?;
+    let mut child = Command::new("python3")
+        .arg("-")
+        .args([
+            "key",
+            "--proven",
+            rev,
+            "--repo",
+            &root.display().to_string(),
+            "--spec",
+            spec,
+            "--driver",
+            driver,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow!("python3 is required to recompute a cached key: {e}"))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        use std::io::Write;
+        stdin.write_all(script.as_bytes())?;
+    }
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        bail!(
+            "cannot recompute the cache key for {spec} at {rev}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 fn receipt_is_landable(root: &Path, receipt: &Path, sha: &str) -> Result<()> {
     let raw = std::fs::read_to_string(receipt)
         .map_err(|e| anyhow!("proof receipt unreadable: {}: {e}", receipt.display()))?;
@@ -607,6 +644,36 @@ fn receipt_is_landable(root: &Path, receipt: &Path, sha: &str) -> Result<()> {
         };
         if verdict != want {
             bail!("proof receipt mutation {spec}#{id} proved {verdict}, expected {want}");
+        }
+        // bd-jp9z1.2: a cached row is honest only while the key still describes
+        // the proven tree and its witness is still green. Recomputation runs
+        // the cache script FROM the proven revision, so an edit to the working
+        // copy cannot vouch for itself.
+        if row.get("cached").is_some() && spec != "ad-hoc" {
+            let key = row.get("key").and_then(Value::as_str).unwrap_or("");
+            if key.is_empty() {
+                bail!("cached mutation {spec}#{id} carries no key");
+            }
+            let driver = doc.get("driver_sha").and_then(Value::as_str).unwrap_or("");
+            if driver.is_empty() {
+                bail!("cached mutation {spec}#{id} but the receipt names no driver_sha — re-prove");
+            }
+            let witness = row.get("cached").and_then(Value::as_str).unwrap_or("");
+            let witness_green = std::fs::read_to_string(witness)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .is_some_and(|d| d.get("ok").and_then(Value::as_bool) == Some(true));
+            if !witness_green {
+                bail!(
+                    "cached mutation {spec}#{id} cites witness {witness}, which is missing or not green"
+                );
+            }
+            let recomputed = cache_key_at(root, proved, spec, driver)?;
+            if recomputed != key {
+                bail!(
+                    "cached mutation {spec}#{id} key is stale at {proved} ({key} != {recomputed}) — re-prove this spec"
+                );
+            }
         }
         if spec == "ad-hoc" {
             continue;

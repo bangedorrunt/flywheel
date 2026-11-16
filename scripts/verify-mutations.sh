@@ -81,6 +81,10 @@ M_GREEN=()
 
 JSON_OUT=""
 LIST_ONLY=0
+LIST_EXPECT=0
+CACHE_KEY=""
+NO_CACHE=0
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/flywheel/mutation-verdicts"
 
 # A mutation's stable id is the first token of its label ("C3  a queued …" ->
 # "C3"). Ledger receipts reference `<spec>#<id>`, so the id may not drift with
@@ -455,6 +459,10 @@ main() {
             --repo) REPO="$2"; shift ;;
             --json-out) JSON_OUT="$2"; shift ;;
             --list) LIST_ONLY=1 ;;
+            --list-expect) LIST_ONLY=1; LIST_EXPECT=1 ;;
+            --cache-key) CACHE_KEY="$2"; shift ;;
+            --cache-dir) CACHE_DIR="$2"; shift ;;
+            --no-cache) NO_CACHE=1 ;;
             -h | --help) usage; exit 0 ;;
             -*) echo "unknown flag: $1" >&2; usage >&2; exit 2 ;;
             *) spec="$1" ;;
@@ -474,7 +482,11 @@ main() {
     if [ "${LIST_ONLY:-0}" = 1 ]; then
         local i
         for i in "${!M_FILE[@]}"; do
-            printf '%s\t%s\n' "$(mutation_id "${M_LABEL[$i]}")" "${M_FILE[$i]}"
+            if [ "$LIST_EXPECT" -eq 1 ]; then
+                printf '%s\t%s\t%s\n' "$(mutation_id "${M_LABEL[$i]}")" "${M_EXPECT[$i]}" "${M_GREEN[$i]}"
+            else
+                printf '%s\t%s\n' "$(mutation_id "${M_LABEL[$i]}")" "${M_FILE[$i]}"
+            fi
         done
         exit 0
     fi
@@ -483,6 +495,32 @@ main() {
     # delivers SIGHUP, and nohup has already set it to SIG_IGN — so the INT/TERM
     # trap never fired and a killed run left its mutation applied to the tree.
     # Measured here: N3 was still in contacts.rs after the harness died.
+    # bd-jp9z1.2: a spec whose inputs a prior RED already proved does not run
+    # again. The key is content-addressed; a hit still requires the witness
+    # receipt to exist and be green, so a cache entry can never outlive its
+    # evidence.
+    if [ -n "$CACHE_KEY" ] && [ "$NO_CACHE" -eq 0 ]; then
+        local cache_expect cached_rows
+        cache_expect="$(mktemp "${TMPDIR:-/tmp}/vm-expect.XXXXXX")"
+        for i in "${!M_FILE[@]}"; do
+            printf '%s\t%s\t%s\n' "$(mutation_id "${M_LABEL[$i]}")" "${M_EXPECT[$i]}" "${M_GREEN[$i]}" >>"$cache_expect"
+        done
+        if cached_rows="$(python3 scripts/mutation-cache.py lookup --dir "$CACHE_DIR" --key "$CACHE_KEY" --expect "$cache_expect")"; then
+            rm -f "$cache_expect"
+            if [ -n "$JSON_OUT" ]; then
+                printf '%s\n' "$cached_rows" >>"$JSON_OUT"
+            fi
+            local n=0
+            while IFS= read -r row; do
+                [ -n "$row" ] || continue
+                n=$((n + 1))
+                printf '%-52s %s\n' "$(printf '%s' "$row" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("id","?"), d.get("expect_test","?"))' 2>/dev/null || echo "cached")" "CACHED"
+            done <<<"$cached_rows"
+            echo "$n/$n mutations accounted for ($n cached, key ${CACHE_KEY:0:12})"
+            exit 0
+        fi
+        rm -f "$cache_expect"
+    fi
     trap on_signal INT TERM HUP
     snapshot_save
     trap on_signal EXIT

@@ -275,3 +275,318 @@ fn a_sha_proof_runs_the_revisions_own_driver() {
         "the revision's driver actually ran, not the working tree's: {err}"
     );
 }
+
+/// A fixture that the cache script can key: a spec, its target, the test that
+/// the mutation names, the harness itself, a lockfile and a sibling pin.
+struct CacheFixture {
+    dir: tempfile::TempDir,
+}
+
+impl CacheFixture {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("scripts/mutations")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // Embedded, not copied from the checkout: include_str! makes both
+        // scripts build inputs, so a mutation to either forces a rebuild and
+        // the fixture can never run a stale binary's idea of them.
+        std::fs::write(
+            root.join("scripts/verify-mutations.sh"),
+            include_str!("../../scripts/verify-mutations.sh"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("scripts/mutation-cache.py"),
+            include_str!("../../scripts/mutation-cache.py"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("scripts/mutations/demo.spec.sh"),
+            "CARGO_ARGS=(--lib)\nTEST_FILTER=(demo)\n\nmutation \"D1  a decision\" \\\n    file=src/x.rs \\\n    find='the_needle' \\\n    replace='other' \\\n    expect=a_test\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/x.rs"), "fn f() { the_needle }\n").unwrap();
+        std::fs::write(root.join("src/t.rs"), "#[test]\nfn a_test() {}\n").unwrap();
+        std::fs::write(root.join("Cargo.lock"), "[[package]]\nname = \"demo\"\n").unwrap();
+        std::fs::write(
+            root.join("proof.toml"),
+            "[[sibling]]\npath = \"../toron\"\nrev = \"1111111111111111111111111111111111111111\"\n",
+        )
+        .unwrap();
+        Self { dir }
+    }
+
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    fn key(&self, driver: &str) -> String {
+        let out = Command::new("python3")
+            .arg(self.path().join("scripts/mutation-cache.py"))
+            .args([
+                "key",
+                "--root",
+                &self.path().display().to_string(),
+                "--spec",
+                "scripts/mutations/demo.spec.sh",
+                "--driver",
+                driver,
+            ])
+            .output()
+            .expect("run key");
+        assert!(
+            out.status.success(),
+            "key failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn lookup(&self, key: &str, expect: &Path) -> Output {
+        Command::new("python3")
+            .arg(self.path().join("scripts/mutation-cache.py"))
+            .args([
+                "lookup",
+                "--dir",
+                &self.path().join("cache").display().to_string(),
+                "--key",
+                key,
+                "--expect",
+                &expect.display().to_string(),
+            ])
+            .output()
+            .expect("run lookup")
+    }
+
+    fn expect_file(&self) -> PathBuf {
+        let path = self.path().join("expect.tsv");
+        std::fs::write(&path, "D1\ta_test\t0\n").unwrap();
+        path
+    }
+}
+
+/// The key must move for every input a verdict depends on: the spec, a target,
+/// the file declaring the expect test, the harness, the lockfile, the driver,
+/// and the sibling pins. Each step compares against the key immediately before
+/// its own edit, so one input cannot stand in for another.
+#[test]
+fn the_cache_key_covers_spec_target_test_harness_lock_driver_and_siblings() {
+    let fx = CacheFixture::new();
+    let base = fx.key("driver-sha");
+    assert_eq!(base.len(), 64, "the key is a sha256 hex string");
+
+    let step = |label: &str, edit: &dyn Fn()| {
+        let before = fx.key("driver-sha");
+        edit();
+        assert_ne!(before, fx.key("driver-sha"), "{label} must change the key");
+    };
+    let write = |rel: &str, body: &str| std::fs::write(fx.path().join(rel), body).unwrap();
+
+    step("a target byte", &|| {
+        write("src/x.rs", "fn f() { the_needle; }\n")
+    });
+    step("a spec byte", &|| {
+        write(
+            "scripts/mutations/demo.spec.sh",
+            "CARGO_ARGS=(--lib)\nTEST_FILTER=(demo)\n\nmutation \"D1  a decision\" \\\n    file=src/x.rs \\\n    find='the_needle' \\\n    replace='something_else' \\\n    expect=a_test\n",
+        )
+    });
+    step("the test-declaring file", &|| {
+        write("src/t.rs", "#[test]\nfn a_test() { let _ = 1; }\n")
+    });
+    step("the harness", &|| {
+        let harness = std::fs::read_to_string(repo_root().join("scripts/verify-mutations.sh"))
+            .unwrap()
+            .replace(
+                "VERDICT_VACUOUS=\"VACUOUS\"",
+                "VERDICT_VACUOUS=\"VACUOUS2\"",
+            );
+        write("scripts/verify-mutations.sh", &harness)
+    });
+    step("the lockfile", &|| {
+        write("Cargo.lock", "[[package]]\nname = \"demo2\"\n")
+    });
+    step("a sibling pin", &|| {
+        write(
+            "proof.toml",
+            "[[sibling]]\npath = \"../toron\"\nrev = \"2222222222222222222222222222222222222222\"\n",
+        )
+    });
+    let before_driver = fx.key("driver-sha");
+    assert_ne!(
+        before_driver,
+        fx.key("another-driver"),
+        "the driver revision moves it"
+    );
+}
+
+/// A hit needs the key, every declared id at its expected verdict, and a
+/// witness receipt that is still green.
+#[test]
+fn a_cached_spec_hits_only_on_the_same_key_with_a_green_witness() {
+    let fx = CacheFixture::new();
+    let key = fx.key("driver-sha");
+    let witness = fx.path().join("witness.json");
+    std::fs::write(&witness, r#"{"ok":true,"sha":"deadbeef"}"#).unwrap();
+    let rows = fx.path().join("rows.jsonl");
+    std::fs::write(
+        &rows,
+        "{\"spec\":\"demo.spec.sh\",\"id\":\"D1\",\"expect_test\":\"a_test\",\"expect_green\":false,\"verdict\":\"RED\"}\n",
+    )
+    .unwrap();
+    let stored = Command::new("python3")
+        .arg(fx.path().join("scripts/mutation-cache.py"))
+        .args([
+            "store",
+            "--dir",
+            &fx.path().join("cache").display().to_string(),
+            "--key",
+            &key,
+            "--spec",
+            "scripts/mutations/demo.spec.sh",
+            "--rows",
+            &rows.display().to_string(),
+            "--witness",
+            &witness.display().to_string(),
+            "--witness-sha",
+            "deadbeef",
+        ])
+        .output()
+        .expect("store");
+    assert!(stored.status.success());
+
+    let expect = fx.expect_file();
+    let hit = fx.lookup(&key, &expect);
+    assert!(
+        hit.status.success(),
+        "a matching key with a green witness hits"
+    );
+    let stdout = String::from_utf8_lossy(&hit.stdout);
+    assert!(
+        stdout.contains("\"cached\""),
+        "the row names its witness: {stdout}"
+    );
+
+    // A different key is a miss even with the entry still on disk.
+    assert_eq!(fx.lookup(&"0".repeat(64), &expect).status.code(), Some(3));
+
+    // The same key with a verdict that is not the expected RED is a miss: a
+    // cached GREEN cannot stand in for a red witness.
+    let green_key = "1".repeat(64);
+    let green_rows = fx.path().join("green.jsonl");
+    std::fs::write(
+        &green_rows,
+        "{\"spec\":\"demo.spec.sh\",\"id\":\"D1\",\"expect_test\":\"a_test\",\"expect_green\":false,\"verdict\":\"GREEN\"}\n",
+    )
+    .unwrap();
+    let stored_green = Command::new("python3")
+        .arg(fx.path().join("scripts/mutation-cache.py"))
+        .args([
+            "store",
+            "--dir",
+            &fx.path().join("cache").display().to_string(),
+            "--key",
+            &green_key,
+            "--spec",
+            "scripts/mutations/demo.spec.sh",
+            "--rows",
+            &green_rows.display().to_string(),
+            "--witness",
+            &witness.display().to_string(),
+            "--witness-sha",
+            "deadbeef",
+        ])
+        .output()
+        .expect("store green");
+    assert!(stored_green.status.success());
+    assert_eq!(fx.lookup(&green_key, &expect).status.code(), Some(3));
+
+    // The witness going away invalidates the hit: nothing outlives its evidence.
+    std::fs::remove_file(&witness).unwrap();
+    assert_eq!(fx.lookup(&key, &expect).status.code(), Some(3));
+}
+
+/// The key recomputed from a git revision must equal the key computed in the
+/// checkout — that equality is what lets ship land verify a cached row.
+#[test]
+fn the_key_from_a_revision_equals_the_key_from_its_checkout() {
+    let fx = CacheFixture::new();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "t@example.com"],
+        vec!["config", "user.name", "T"],
+        vec!["add", "."],
+        vec!["commit", "-q", "-m", "fixture"],
+    ] {
+        assert!(
+            Command::new("git")
+                .current_dir(fx.path())
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let rev = String::from_utf8(
+        Command::new("git")
+            .current_dir(fx.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let from_root = fx.key("driver-sha");
+    let from_rev = Command::new("python3")
+        .arg(fx.path().join("scripts/mutation-cache.py"))
+        .args([
+            "key",
+            "--proven",
+            &rev,
+            "--repo",
+            &fx.path().display().to_string(),
+            "--spec",
+            "scripts/mutations/demo.spec.sh",
+            "--driver",
+            "driver-sha",
+        ])
+        .output()
+        .expect("key from rev");
+    assert!(
+        from_rev.status.success(),
+        "{}",
+        String::from_utf8_lossy(&from_rev.stderr)
+    );
+    assert_eq!(
+        from_root,
+        String::from_utf8_lossy(&from_rev.stdout).trim(),
+        "the same tree must key the same from a checkout and from git"
+    );
+}
+
+/// The cache is only real if the proof passes a key and stores the witness
+/// after the receipt exists. Both fail silently otherwise: everything runs and
+/// nobody notices the cache never fills.
+#[test]
+fn clean_proof_computes_and_passes_a_cache_key() {
+    let script = read_script("scripts/clean-proof.sh");
+    assert!(
+        script.contains("mutation-cache.py key --root ."),
+        "the proof computes each spec's key in the export"
+    );
+    assert!(
+        script.contains("--cache-key \"$mut_key\""),
+        "the key reaches the harness"
+    );
+    assert!(
+        script.contains("mutation-cache.py store"),
+        "a freshly proved spec is stored with this receipt as its witness"
+    );
+    assert!(
+        script.contains("[ \"$MUTATIONS_MODE\" != full ]"),
+        "a full run bypasses the cache"
+    );
+}

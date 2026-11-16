@@ -668,3 +668,24 @@ tests = [
   "src/cmd/clean_proof.rs::a_sha_proof_runs_the_revisions_own_driver",
 ]
 mutations = ["scripts/mutations/proof-fail-fast.spec.sh#N8"]
+
+[[behavior]]
+id = "proof.mutation-verdict-cache"
+owner = "scripts/clean-proof.sh"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/clean_proof.rs::the_cache_key_covers_spec_target_test_harness_lock_driver_and_siblings",
+  "src/cmd/clean_proof.rs::a_cached_spec_hits_only_on_the_same_key_with_a_green_witness",
+  "src/cmd/clean_proof.rs::the_key_from_a_revision_equals_the_key_from_its_checkout",
+  "src/cmd/clean_proof.rs::clean_proof_computes_and_passes_a_cache_key",
+]
+mutations = [
+  "scripts/mutations/mutation-cache.spec.sh#C1",
+  "scripts/mutations/mutation-cache.spec.sh#C2",
+  "scripts/mutations/mutation-cache.spec.sh#C3",
+  "scripts/mutations/mutation-cache.spec.sh#C4",
+  "scripts/mutations/mutation-cache.spec.sh#C5",
+  "scripts/mutations/mutation-cache.spec.sh#C6",
+  "scripts/mutations/mutation-cache.spec.sh#C8",
+]

@@ -21,6 +21,7 @@
 # Usage:
 #   scripts/clean-proof.sh [--sha <rev>] [--head] [--mutate <json>]...
 #                          [--mutations changed|full] [--receipt <path>] [--keep]
+#                          [--no-cache]
 #
 #   no selector  : prove the dirty tree (temporary commit from intended paths)
 #   --head       : prove HEAD
@@ -128,6 +129,8 @@ fi
 . "$SELF_DIR/proof-lib.sh"
 
 KEEP=0
+NO_CACHE=0
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/flywheel/mutation-verdicts"
 MUTATIONS_MODE=""
 RECEIPT_MUTATIONS_BASE=""
 RECEIPT_CHANGED_PATHS=""
@@ -152,6 +155,7 @@ while [ $# -gt 0 ]; do
       shift 2 ;;
     --receipt) [ $# -ge 2 ] || die "--receipt needs a path"; RECEIPT="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
+    --no-cache) NO_CACHE=1; shift ;;
     --lock-hold-test) [ $# -ge 2 ] || die "--lock-hold-test needs seconds"; LOCK_HOLD_TEST="$2"; shift 2 ;;
     -h|--help) usage 0 ;;
     *) die "unknown arg: $1" ;;
@@ -185,6 +189,8 @@ else
 fi
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/fw-proof.XXXXXX")"
+CACHE_STORES="$TMP/cache-stores.tsv"
+: >"$CACHE_STORES"
 cleanup() {
   local status=$?
   if [ "$status" -ne 0 ] || [ "$KEEP" -eq 1 ]; then
@@ -365,17 +371,29 @@ if [ -n "$MUTATIONS_MODE" ] && [ -z "$FAILED_STEP" ]; then
       [ -n "$hit" ] || continue
     fi
     mut_ran=$((mut_ran + 1))
+    # bd-jp9z1.2: content-addressed key over everything the verdict depends on.
+    # A hit reuses a RED whose witness receipt is still green; --mutations full
+    # and --no-cache bypass the cache by design.
+    mut_key=""
+    if [ "$NO_CACHE" -eq 0 ] && [ "$MUTATIONS_MODE" != full ]; then
+      mut_key="$(python3 scripts/mutation-cache.py key --root . --spec "$spec" \
+        --driver "${CLEAN_PROOF_DRIVER_SHA:-}" 2>/dev/null || true)"
+    fi
     echo "clean-proof: mutations $spec"
     set +e
     # The proof build is -D warnings; a mutation deliberately leaves dead code
     # (that is what killing a guard looks like), so the witness run must not
     # inherit it or every such mutation reports BUILD-BROKEN.
     RUSTFLAGS="" bash scripts/verify-mutations.sh "$spec" --cargo "$wrapper" \
+      --cache-key "$mut_key" --cache-dir "$CACHE_DIR" \
       --json-out "$TMP/mut-rows.$mut_ran.jsonl" >"$TMP/mutations-$mut_ran.log" 2>&1
     mut_status=$?
     set -e
     if [ -f "$TMP/mut-rows.$mut_ran.jsonl" ]; then
       cat "$TMP/mut-rows.$mut_ran.jsonl" >>"$TMP/mutations.txt"
+      if [ "$mut_status" -eq 0 ] && [ -n "$mut_key" ] && ! grep -q '"cached"' "$TMP/mut-rows.$mut_ran.jsonl"; then
+        printf '%s\t%s\t%s\n' "$mut_key" "$spec" "$TMP/mut-rows.$mut_ran.jsonl" >>"$CACHE_STORES"
+      fi
     fi
     if [ "$mut_status" -ne 0 ]; then
       echo "clean-proof: $spec did not prove every mutation; log $TMP/mutations-$mut_ran.log" >&2
@@ -461,6 +479,18 @@ PROOF_MUTATIONS_BASE="$RECEIPT_MUTATIONS_BASE" \
 PROOF_CHANGED_PATHS="$RECEIPT_CHANGED_PATHS" \
 proof_write_receipt "$RECEIPT" "$OK" "$PROVEN_SHA" "$SHORT" "$STAMP" "$MODE" "$TMP" \
   "$FAILED_STEP" "$STEP_NAMES" "$STEP_STATUSES" "$SIBLING_RECORDS" "$MUTATION_RECORDS_FILE"
+
+# bd-jp9z1.2: the witness for a freshly proved spec is THIS receipt, so the
+# entries are written only after it exists.
+if [ "$OK" -eq 0 ] && [ "$NO_CACHE" -eq 0 ] && [ -s "$CACHE_STORES" ]; then
+  while IFS=$'\t' read -r store_key store_spec store_rows; do
+    [ -n "$store_key" ] || continue
+    python3 scripts/mutation-cache.py store --dir "$CACHE_DIR" --key "$store_key" \
+      --spec "$store_spec" --rows "$store_rows" --witness "$RECEIPT" \
+      --witness-sha "$PROVEN_SHA" >/dev/null 2>&1 || true
+  done <"$CACHE_STORES"
+  echo "clean-proof: cached $(wc -l <"$CACHE_STORES" | tr -d ' ') mutation spec(s) under $CACHE_DIR"
+fi
 
 if [ "$OK" -eq 0 ]; then
   echo "clean-proof: ok — $TMP"
