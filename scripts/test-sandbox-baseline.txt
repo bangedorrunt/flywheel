@@ -3,7 +3,6 @@ tests/cli_help_golden.rs
 tests/collab_patterns_e2e.rs
 tests/config_strict.rs
 tests/cron_cli.rs
-tests/decide_cli.rs
 tests/e2e_loop_run_verify.rs
 tests/e2e_serialize_worktree.rs
 tests/e2e_statechart_formal_verification.rs

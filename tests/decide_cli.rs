@@ -16,39 +16,21 @@
 //!
 //! governed-by: ADR-0005 (orchestration vocabulary)
 
-use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
+
+#[path = "../src/test_sandbox.rs"]
+mod test_sandbox;
+
+use test_sandbox::TestSandbox;
 
 fn flywheel() -> &'static str {
     env!("CARGO_BIN_EXE_flywheel")
 }
 
-struct Hermetic {
-    #[expect(
-        dead_code,
-        reason = "keeps the temp dir alive for the hermetic env's lifetime"
-    )]
-    dir: tempfile::TempDir,
-    config_home: PathBuf,
-    state_home: PathBuf,
-}
-
-fn hermetic() -> Hermetic {
-    let dir = tempfile::TempDir::new().expect("temp dir");
-    let config_home = dir.path().join("config");
-    let state_home = dir.path().join("state");
-    Hermetic {
-        dir,
-        config_home,
-        state_home,
-    }
-}
-
-fn run(h: &Hermetic, args: &[&str]) -> Output {
-    Command::new(flywheel())
+fn run(sandbox: &TestSandbox, args: &[&str]) -> Output {
+    sandbox
+        .command(flywheel())
         .args(args)
-        .env("XDG_CONFIG_HOME", &h.config_home)
-        .env("XDG_STATE_HOME", &h.state_home)
         .output()
         .expect("spawn flywheel")
 }
@@ -60,8 +42,8 @@ fn stdout_json(out: &Output) -> serde_json::Value {
 
 #[test]
 fn decide_audit_json_shape() {
-    let h = hermetic();
-    let out = run(&h, &["decide", "audit the mailbox layer", "--json"]);
+    let sandbox = TestSandbox::new();
+    let out = run(&sandbox, &["decide", "audit the mailbox layer", "--json"]);
     assert!(
         out.status.success(),
         "stderr: {}",
@@ -87,9 +69,9 @@ fn decide_audit_json_shape() {
 
 #[test]
 fn decide_ready_beads_is_loop_work() {
-    let h = hermetic();
+    let sandbox = TestSandbox::new();
     let out = run(
-        &h,
+        &sandbox,
         &[
             "decide",
             "work the ready beads",
@@ -109,9 +91,9 @@ fn decide_ready_beads_is_loop_work() {
 
 #[test]
 fn decide_implement_is_steer() {
-    let h = hermetic();
+    let sandbox = TestSandbox::new();
     let out = run(
-        &h,
+        &sandbox,
         &["decide", "implement the parser with a plan gate", "--json"],
     );
     assert!(out.status.success());
@@ -129,8 +111,8 @@ fn decide_implement_is_steer() {
 /// forensics-shaped needle (`leak`).
 #[test]
 fn decide_fix_memory_leak_is_bug_fix_not_forensics() {
-    let h = hermetic();
-    let out = run(&h, &["decide", "fix the memory leak", "--json"]);
+    let sandbox = TestSandbox::new();
+    let out = run(&sandbox, &["decide", "fix the memory leak", "--json"]);
     assert!(out.status.success());
     let v = stdout_json(&out);
     assert_eq!(v["primitive"], "bug-fix");
@@ -154,8 +136,8 @@ fn decide_fix_memory_leak_is_bug_fix_not_forensics() {
 /// it.
 #[test]
 fn decide_profile_idle_cpu_spin_is_forensics() {
-    let h = hermetic();
-    let out = run(&h, &["decide", "profile the idle cpu spin", "--json"]);
+    let sandbox = TestSandbox::new();
+    let out = run(&sandbox, &["decide", "profile the idle cpu spin", "--json"]);
     assert!(out.status.success());
     let v = stdout_json(&out);
     assert_eq!(v["primitive"], "forensics");
@@ -175,8 +157,8 @@ fn decide_profile_idle_cpu_spin_is_forensics() {
 
 #[test]
 fn decide_contention_flag_is_coalition() {
-    let h = hermetic();
-    let out = run(&h, &["decide", "ship it", "--contention", "--json"]);
+    let sandbox = TestSandbox::new();
+    let out = run(&sandbox, &["decide", "ship it", "--contention", "--json"]);
     assert!(out.status.success());
     let v = stdout_json(&out);
     assert_eq!(v["primitive"], "coalition-form");
@@ -184,8 +166,8 @@ fn decide_contention_flag_is_coalition() {
 
 #[test]
 fn decide_plain_mode_prints_contract_lines() {
-    let h = hermetic();
-    let out = run(&h, &["decide", "analyze the durable loop"]);
+    let sandbox = TestSandbox::new();
+    let out = run(&sandbox, &["decide", "analyze the durable loop"]);
     assert!(out.status.success());
     let s = String::from_utf8(out.stdout).expect("utf8 stdout");
     let lines: Vec<&str> = s.lines().collect();
@@ -203,8 +185,8 @@ fn decide_plain_mode_prints_contract_lines() {
 
 #[test]
 fn decide_unknown_target_is_explicit_none() {
-    let h = hermetic();
-    let out = run(&h, &["decide", "zzz fuzzy intent", "--json"]);
+    let sandbox = TestSandbox::new();
+    let out = run(&sandbox, &["decide", "zzz fuzzy intent", "--json"]);
     assert!(out.status.success());
     let v = stdout_json(&out);
     assert_eq!(v["primitive"], "none");
@@ -215,15 +197,15 @@ fn decide_unknown_target_is_explicit_none() {
 
 #[test]
 fn decide_rejects_unknown_flag_usage_error() {
-    let h = hermetic();
-    let out = run(&h, &["decide", "audit", "--nonsense"]);
+    let sandbox = TestSandbox::new();
+    let out = run(&sandbox, &["decide", "audit", "--nonsense"]);
     assert_eq!(out.status.code(), Some(2), "clap usage error exit code");
 }
 
 #[test]
 fn decide_json_never_dispatches() {
-    let h = hermetic();
-    let out = run(&h, &["decide", "implement the parser", "--json"]);
+    let sandbox = TestSandbox::new();
+    let out = run(&sandbox, &["decide", "implement the parser", "--json"]);
     assert!(out.status.success());
     let v = stdout_json(&out);
     let mut keys: Vec<&str> = v
