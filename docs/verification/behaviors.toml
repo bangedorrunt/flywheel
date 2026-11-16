@@ -294,6 +294,18 @@ mutations = [
 ]
 
 [[behavior]]
+id = "workflow.verify-reports-unused-stages"
+owner = "src/cmd/workflow.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/workflow.rs::statechart_verify_passes_the_shipped_charts",
+]
+mutations = [
+  "scripts/mutations/workflow-verify-unused.spec.sh#U1",
+]
+
+[[behavior]]
 id = "observe.fold-escalation"
 owner = "crates/doorbell-rt/src/brain.rs"
 status = "proven"
