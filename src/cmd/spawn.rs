@@ -6606,6 +6606,17 @@ mod prefer_spawn_tests {
         let f = plan.seats[0].model.as_ref().expect("model field");
         assert_eq!(f.from, crate::swarm_plan::Provenance::Preference);
         assert_eq!(f.value, "a/m");
+        // Acceptance 4: the remembered preference IS the answer, so the next
+        // session must not ask again — a Preference field is never a consent
+        // item (only Jev, blocked, and over-budget/cap rows are).
+        assert!(
+            !plan
+                .needs_consent
+                .iter()
+                .any(|c| c.seat == plan.seats[0].role && c.field == "model"),
+            "a remembered preference suppresses the question: {:?}",
+            plan.needs_consent
+        );
         let ask = super::prefer_bare_inputs(&prefs, &items[0], "probe", "", "");
         let (m, from) = ask.model.clone().expect("preference resolves");
         assert_eq!(

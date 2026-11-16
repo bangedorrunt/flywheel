@@ -283,12 +283,30 @@ tests = [
   "crates/doorbell-core/src/observe.rs::a_blocked_pane_escalates_at_the_window_not_before",
   "crates/doorbell-core/src/observe.rs::a_release_wait_escalates_once_after_one_lease_period",
   "crates/doorbell-core/src/observe.rs::only_a_fork_subject_is_a_fork",
+  "crates/doorbell-core/src/observe.rs::a_release_request_row_parses_from_subject_or_body",
+  "crates/doorbell-core/src/observe.rs::only_a_release_response_answers_an_ask",
 ]
 mutations = [
   "scripts/mutations/observe-escalation.spec.sh#L1",
   "scripts/mutations/observe-escalation.spec.sh#E1",
   "scripts/mutations/observe-escalation.spec.sh#B1",
   "scripts/mutations/observe-escalation.spec.sh#F1",
+]
+
+[[behavior]]
+id = "observe.fold-escalation"
+owner = "crates/doorbell-rt/src/brain.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "crates/doorbell-rt/src/brain.rs::a_blocked_pane_escalates_to_the_captain_once_per_episode",
+  "crates/doorbell-rt/src/brain.rs::an_unanswered_release_request_escalates_to_the_captain_once",
+  "crates/doorbell-rt/src/brain.rs::a_fork_subject_escalates_to_the_captain_once_per_bead",
+]
+mutations = [
+  "scripts/mutations/observe-fold.spec.sh#W1",
+  "scripts/mutations/observe-fold.spec.sh#R1",
+  "scripts/mutations/observe-fold.spec.sh#K1",
 ]
 
 [[behavior]]
@@ -944,4 +962,100 @@ tests = [
 ]
 mutations = [
   "scripts/mutations/ship-repo-search.spec.sh#S1",
+]
+
+[[behavior]]
+id = "plan.user-beats-preference"
+owner = "src/cmd/spawn.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/spawn.rs::prefer_spawn_user_model_wins",
+]
+mutations = [
+  "scripts/mutations/adr0022-gates.spec.sh#D2",
+]
+
+[[behavior]]
+id = "models.retired-without-replacement-refuses"
+owner = "src/models.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/models.rs::resolve_ask_retired_without_replacement_is_retired",
+]
+mutations = [
+  "scripts/mutations/adr0022-gates.spec.sh#D4",
+]
+
+[[behavior]]
+id = "plan.blocked-never-confirms"
+owner = "src/elm/plan_statechart.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/spawn.rs::plan_gate_blocked_with_yes_asks_and_names_remedy",
+]
+mutations = [
+  "scripts/mutations/adr0022-gates.spec.sh#D5",
+]
+
+[[behavior]]
+id = "plan.remembered-preference-not-asked-again"
+owner = "src/swarm_plan.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/spawn.rs::prefer_spawn_model_from_preference",
+]
+mutations = [
+  "scripts/mutations/adr0022-gates.spec.sh#D6",
+]
+
+[[behavior]]
+id = "seat.env-model-change-respawns"
+owner = "src/seat_reconcile.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/seat_reconcile.rs::seat_reconcile_env_model_gives_respawn_fresh",
+]
+mutations = [
+  "scripts/mutations/adr0022-gates.spec.sh#V5",
+]
+
+[[behavior]]
+id = "seat.reconcile-idempotent"
+owner = "src/seat_reconcile.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/seat_reconcile.rs::seat_reconcile_no_change_gives_keep",
+]
+mutations = [
+  "scripts/mutations/adr0022-gates.spec.sh#V9",
+]
+
+[[behavior]]
+id = "seat.binder-never-author"
+owner = "src/seat_binder.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/seat_binder.rs::seat_binder_reviewer_never_author",
+]
+mutations = [
+  "scripts/mutations/adr0022-gates.spec.sh#V10",
+]
+
+[[behavior]]
+id = "plan.patch-refilters-and-clears-consent"
+owner = "src/cmd/spawn.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/spawn.rs::plan_patch_harness_refilters_model_and_clears_consent",
+]
+mutations = [
+  "scripts/mutations/adr0022-gates.spec.sh#A3",
 ]
