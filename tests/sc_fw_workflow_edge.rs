@@ -18,7 +18,7 @@
 //! governed-by: ADR-0005 Spec 2, P3.1
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 use std::sync::Arc;
 
 use toron_workflow::engine::WorkflowEngine;
@@ -34,7 +34,7 @@ fn flywheel() -> &'static str {
 /// config/state homes. The project key is an ABSOLUTE path so `project_dir`
 /// resolves it verbatim (bd-test-tmp-hygiene-pq5b).
 struct TieredProject {
-    _dir: tempfile::TempDir,
+    sandbox: flywheel_test_sandbox::TestSandbox,
     project: std::path::PathBuf,
     config_home: std::path::PathBuf,
     state_home: std::path::PathBuf,
@@ -42,8 +42,9 @@ struct TieredProject {
 
 impl TieredProject {
     fn new() -> Self {
-        let dir = tempfile::TempDir::new().expect("temp dir");
-        let project = dir.path().join("proj");
+        let sandbox = flywheel_test_sandbox::TestSandbox::new();
+        let dir = sandbox.root().to_path_buf();
+        let project = dir.join("proj");
         let workflows = project.join(".flywheel/workflows");
         std::fs::create_dir_all(&workflows).expect("workflow dir");
         std::fs::write(
@@ -52,18 +53,20 @@ impl TieredProject {
         )
         .expect("write project-tier workflow");
         Self {
-            config_home: dir.path().join("config"),
-            state_home: dir.path().join("state"),
+            sandbox,
+            config_home: dir.join("config"),
+            state_home: dir.join("state"),
             project,
-            _dir: dir,
         }
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(flywheel())
+        self.sandbox
+            .command(flywheel())
             .args(args)
             .arg("--project")
             .arg(&self.project)
+            .env("PATH", self.sandbox.path_env())
             .env("XDG_CONFIG_HOME", &self.config_home)
             .env("XDG_STATE_HOME", &self.state_home)
             .output()
@@ -72,8 +75,10 @@ impl TieredProject {
 
     /// For the verbs that carry no project context at all (the read doors).
     fn run_without_project(&self, args: &[&str]) -> Output {
-        Command::new(flywheel())
+        self.sandbox
+            .command(flywheel())
             .args(args)
+            .env("PATH", self.sandbox.path_env())
             .env("XDG_CONFIG_HOME", &self.config_home)
             .env("XDG_STATE_HOME", &self.state_home)
             .output()
