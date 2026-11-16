@@ -155,9 +155,8 @@ pub struct ConsentItem {
 /// Default budget threshold (USD per mtok) when `[consent]` is absent.
 pub const DEFAULT_BUDGET_USD_PER_MTOK: f64 = 5.0;
 
-/// ADR-0022 D5 consent policy: the `[consent]` ask mode, the budget
-/// threshold the summed estimate is weighed against, and the signoff
-/// (parsed, carried, not acted on in this slice). Serialized with the plan
+/// ADR-0022 D5 consent policy: the `[consent]` ask mode and the budget
+/// threshold the summed estimate is weighed against. Serialized with the plan
 /// so the effective policy is on the wire next to the consent it produced.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConsentPolicy {
@@ -165,8 +164,6 @@ pub struct ConsentPolicy {
     pub ask: ConsentAsk,
     #[serde(default = "default_budget_usd_per_mtok")]
     pub budget_usd_per_mtok: f64,
-    #[serde(default)]
-    pub signoff: Option<String>,
 }
 
 fn default_budget_usd_per_mtok() -> f64 {
@@ -178,7 +175,6 @@ impl Default for ConsentPolicy {
         Self {
             ask: ConsentAsk::OnChange,
             budget_usd_per_mtok: DEFAULT_BUDGET_USD_PER_MTOK,
-            signoff: None,
         }
     }
 }
@@ -898,7 +894,6 @@ mod tests {
         ConsentPolicy {
             ask: ConsentAsk::OnChange,
             budget_usd_per_mtok: 5.0,
-            signoff: None,
         }
     }
 
@@ -991,7 +986,6 @@ mod tests {
         let policy = ConsentPolicy {
             ask: ConsentAsk::Never,
             budget_usd_per_mtok: 5.0,
-            signoff: None,
         };
         let got = needs_consent(&plan, &policy, Some(99.0), 0);
         assert_eq!(got.len(), 1);
@@ -1013,7 +1007,6 @@ mod tests {
         let policy = ConsentPolicy {
             ask: ConsentAsk::Always,
             budget_usd_per_mtok: 5.0,
-            signoff: None,
         };
         let got = needs_consent(&plan, &policy, None, 5);
         assert!(
@@ -1049,21 +1042,21 @@ mod tests {
     }
 
     #[test]
-    fn consent_policy_carries_signoff_and_serializes_in_plan() {
+    fn consent_policy_serializes_in_plan() {
         let policy = ConsentPolicy {
             ask: ConsentAsk::Always,
             budget_usd_per_mtok: 5.0,
-            signoff: Some("witness".to_string()),
         };
         let mut plan = Plan::new("swarm");
         plan.policy = Some(policy);
         let v = serde_json::to_value(&plan).unwrap();
-        assert_eq!(v["policy"]["signoff"], serde_json::json!("witness"));
         assert_eq!(v["policy"]["ask"], serde_json::json!("always"));
+        assert_eq!(v["policy"]["budget_usd_per_mtok"], serde_json::json!(5.0));
         let back: Plan = serde_json::from_value(v).unwrap();
         assert_eq!(
-            back.policy.as_ref().and_then(|p| p.signoff.clone()),
-            Some("witness".to_string())
+            back.policy.map(|p| p.ask),
+            Some(ConsentAsk::Always),
+            "the policy round-trips with the plan"
         );
         let legacy: Plan = serde_json::from_value(serde_json::json!({
             "schema": "flywheel-plan.v1",

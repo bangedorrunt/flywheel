@@ -98,7 +98,7 @@ estimate: { panes: 2, headless: 1, usd_per_mtok_in: 1.8 }
 
 Every field carries **provenance** (`from`). Every seat carries a **status** computed by the resolver (D3). `needs_consent` is computed by the consent policy (D5). `briefing --json`, `steer --json`, `spawn --dry-run --json`, and the TTY gate all print this same object.
 
-**Where the plan lives.** The plan grows out of `crew::CrewPlan` (today role → count, `src/crew.rs:34`); it is not a second type beside it. Before dispatch a plan is a draft with its own id in the run store. On dispatch it becomes the **input of the workflow run**, journaled with the run, so the plan id is the run id and there is one durable record. A later `plan apply --patch` on a running swarm is a journaled patch event on that run, not a write to a side file.
+**Where the plan lives.** The plan grows out of `crew::CrewPlan` (today role → count, `src/crew.rs:34`); it is not a second type beside it. Before dispatch a plan is a draft with its own id in the run store. On dispatch it becomes the **input of the workflow run**, journaled with the run, so the plan id is the run id and there is one durable record. A later `flywheel swarm apply --patch` on a running swarm is a journaled patch event on that run, not a write to a side file.
 
 ### D2. One precedence rule, applied per field
 
@@ -154,10 +154,9 @@ The user wants to confirm Jev's choices. The captain wants no interruptions. Bot
 [consent]
 ask = "on-change"     # on-change (default) | always | never
 budget_usd_per_mtok = 5.0
-signoff = "human"     # human (default; ADR-0008 SIGNOFF outer-only) | witness
 ```
 
-`signoff = "witness"` is the autonomous setting: the outer `request_approval` is replaced by a fact-derived gate (every bead closed, `flywheel ship check` legal, `wave-verify` witness passed; ADR-0021 D4), and open risks are filed as beads instead of waiting for a person. It is opt-in per project because it changes ADR-0008's captain-only signoff.
+**No `signoff` knob.** An earlier draft of this section carried `signoff = "human" | "witness"`, where `witness` would replace the outer `request_approval` with a fact-derived gate (every bead closed, `flywheel ship check` legal, `wave-verify` witness passed; ADR-0021 D4). That gate is not built: nothing in the tree computes it, and the only live auto-pass is ADR-0011 D7's `signoff::observe` (REVIEW residual empty, OPEN DECISIONS empty), which is a different predicate. Config that parses and does nothing is worse than absent config — it changes ADR-0008's captain-only outer signoff on paper only — so the field and its parsing were deleted (bd-6setu.4, 2026-11-17). ADR-0008's captain-only outer signoff stands. When the fact gate ships, `signoff` comes back with the gate in the same change.
 
 With `on-change`, a field enters `needs_consent` when **any** of these holds:
 
@@ -171,7 +170,7 @@ The same object drives two surfaces:
 
 - **TTY.** Ask in this order: head-count per role (`coder:2, reviewer:1`), then harness per role, then model and effort re-filtered for that harness, then go. Jev and preference values are pre-filled and labelled. Enter accepts.
 - **Agent.** `--json` returns the plan with `needs_consent`. The agent asks the user in chat (or with a multiple-choice tool), then submits a **patch**:
-  `flywheel plan apply <plan-id> --patch 'reviewer.harness=pi; coder.count=3'`
+  `flywheel swarm apply <project> --patch reviewer.harness=pi --count coder=3`
   The patch re-resolves; only then does dispatch happen.
 
 ### D6. Standing preferences: ask once, remember
@@ -203,7 +202,7 @@ A live change is a patch to the plan, not a new verb. The **reconciler** diffs d
 
 Every effect is journaled before it runs (`agent_ref::commit_rebind`, `EffectJournalMode::Enforced`). Failure-driven hops (toron ADR-0026 kinds) are patches the stack writes itself; toron ADR-0032 still holds: no hop on `Timeout`, `Unknown`, or empty evidence, one hop per failure class.
 
-This turns three dead ends into one mechanism: `RerouteEnvPin::ModelChanged` becomes a respawn, `binding-rebind --model` becomes `plan apply --patch '<pin>.model=…'`, and `cmd_recover`'s respawn re-resolves the full seat instead of only its kind.
+This turns three dead ends into one mechanism: `RerouteEnvPin::ModelChanged` becomes a respawn, `binding-rebind --model` becomes `flywheel swarm apply --patch '<pin>.model=…'`, and `cmd_recover`'s respawn re-resolves the full seat instead of only its kind.
 
 **Pane economy is a reconciler policy, not an architectural cap** (amends the ADR-0021 draft §5.1). `crew.max` (`DEFAULT_CREW_MAX` = 5) stays the one head-count cap; an earlier draft added `max_live_panes` beside it, which would have been two knobs for one limit. The only new knob is retirement:
 
@@ -322,7 +321,7 @@ Each phase ships alone and changes no default behaviour until its last step.
 
 1. **See the truth.** `spawn --dry-run --json` and `briefing --json` print `flywheel-plan.v1` with provenance and status, computed from today's code paths. No launch changes. Captains immediately see every degraded field.
 2. **Adapters.** One adapter table. Wire grok effort/plan, gemini, agy, opencode `#variant` headless. Rex honours `[harness.*]`. Statuses become real; `blocked` starts refusing.
-3. **One resolver + consent.** D2 precedence, D4 resolution, D5 policy, `plan apply --patch`. `briefing` and `steer_brief` become two renderers of one gate. PlanMachine verified.
+3. **One resolver + consent.** D2 precedence, D4 resolution, D5 policy, `swarm apply --patch`. `briefing` and `steer_brief` become two renderers of one gate. PlanMachine verified.
 4. **Preferences.** D6.
 5. **Reconciler and binder.** D7 + D8, SeatMachine verified. `binding-rebind --model` and env-pin hops start working. `[swarm] idle_retire_after` replaces the ADR-0021 draft's slot cap. The SeatMachine runs inside the doorbell/supervisor fold, the one live model that already receives job results, presence, and failures; that fold emits the seat patches.
 6. **Verbs.** `flywheel swarm plan | apply | status` front the plan, patch, and live view; `briefing --json` and `spawn --dry-run --json` keep printing the same object.

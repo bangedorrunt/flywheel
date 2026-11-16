@@ -1004,10 +1004,7 @@ pub(crate) fn plan_gate(plan: &crate::swarm_plan::Plan, yes: bool) -> PlanGate {
                 item.reason.as_str()
             ));
         }
-        consent.push(
-            "re-run with --yes to proceed (flywheel plan apply does not exist yet — use the equivalent spawn flags instead)"
-                .to_string(),
-        );
+        consent.push("re-run with --yes to proceed".to_string());
     }
     let mut blocked = Vec::new();
     for seat in &plan.seats {
@@ -7175,8 +7172,8 @@ mod plan_gate_tests {
         ));
     }
 
-    /// Ported: the ask names the seat, the field, the `--yes` hint and the
-    /// no-`plan apply` note.
+    /// Ported: the ask names the seat, the field and the `--yes` hint, and
+    /// never names `plan apply` (ADR-0022 D5: the verb is `flywheel swarm apply`).
     #[test]
     fn plan_gate_names_items_and_hint() {
         let plan = jev_plan();
@@ -7188,7 +7185,10 @@ mod plan_gate_tests {
                         .any(|l| l.contains("coder") && l.contains("model"))
                 );
                 assert!(consent.iter().any(|l| l.contains("--yes")));
-                assert!(consent.iter().any(|l| l.contains("plan apply")));
+                assert!(
+                    !consent.iter().any(|l| l.contains("plan apply")),
+                    "no live verb is called `plan apply`: {consent:?}"
+                );
             }
             super::PlanGate::Launch => panic!("must ask without --yes"),
         }

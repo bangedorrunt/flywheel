@@ -367,7 +367,7 @@ pub struct Config {
     #[serde(default)]
     pub timer: Option<TimerSection>,
     /// `[consent]` (ADR-0022 D5): consent gate policy. Absent = defaults
-    /// (`ask = "on-change"`, budget 5.0, no signoff).
+    /// (`ask = "on-change"`, budget 5.0).
     #[serde(default)]
     pub consent: Option<ConsentSection>,
     /// `[swarm]` (ADR-0022 D7): `idle_retire_after = "10m"` retires a seat
@@ -395,14 +395,12 @@ pub struct CrewBudgetConfig {
 }
 
 /// `[consent]` (ADR-0022 D5): `ask = "on-change" | "always" | "never"`
-/// (default `on-change`; unknown values fail parse),
-/// `budget_usd_per_mtok` (default 5.0) and `signoff` (parsed, carried,
-/// not acted on in this slice).
+/// (default `on-change`; unknown values fail parse) and
+/// `budget_usd_per_mtok` (default 5.0).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConsentSection {
     pub ask: Option<crate::swarm_plan::ConsentAsk>,
     pub budget_usd_per_mtok: Option<f64>,
-    pub signoff: Option<String>,
 }
 
 /// `[swarm] idle_retire_after` (ADR-0022 D7): how long a seat may sit idle
@@ -619,7 +617,6 @@ impl Config {
                 .as_ref()
                 .and_then(|c| c.budget_usd_per_mtok)
                 .unwrap_or(crate::swarm_plan::DEFAULT_BUDGET_USD_PER_MTOK),
-            signoff: self.consent.as_ref().and_then(|c| c.signoff.clone()),
         }
     }
 
@@ -1303,20 +1300,20 @@ verifier_family_override = "deepseek"
     }
 
     #[test]
-    fn consent_signoff_parses_from_consent_section() {
+    fn consent_ask_parses_from_consent_section() {
         let c: Config = toml::from_str(
             r#"
 [consent]
 ask = "always"
-signoff = "witness"
+budget_usd_per_mtok = 9.0
 "#,
         )
         .unwrap();
         let policy = c.consent_policy();
         assert_eq!(policy.ask, crate::swarm_plan::ConsentAsk::Always);
-        assert_eq!(policy.signoff.as_deref(), Some("witness"));
+        assert_eq!(policy.budget_usd_per_mtok, 9.0);
         let c: Config = toml::from_str("").unwrap();
-        assert_eq!(c.consent_policy().signoff, None);
+        assert_eq!(c.consent_policy(), crate::swarm_plan::ConsentPolicy::default());
     }
 
     #[test]
