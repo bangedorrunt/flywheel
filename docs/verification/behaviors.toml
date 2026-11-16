@@ -272,6 +272,20 @@ tests = [
 mutations = ["scripts/mutations/clean-proof-slot.spec.sh#S1", "scripts/mutations/clean-proof-slot.spec.sh#S2"]
 
 [[behavior]]
+id = "reservation.board-fail-closed"
+owner = "scripts/verify-formal.sh"
+status = "proven"
+concurrent = true
+formal = ".agents/skills/verify-protocol-tla/models/ReservationBoard.tla::.agents/skills/verify-protocol-tla/models/ReservationBoard.cfg"
+tests = [
+  "tests/proof_steps.rs::proof_reservation_board_model_fences_the_grant",
+]
+mutations = [
+  "scripts/mutations/reservation-board.spec.sh#B1",
+  "scripts/mutations/reservation-board.spec.sh#B2",
+]
+
+[[behavior]]
 id = "proof.suite-runs-tests-and-isolation"
 owner = "scripts/clean-proof.sh"
 status = "proven"

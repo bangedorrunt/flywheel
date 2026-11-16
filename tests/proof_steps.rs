@@ -25,6 +25,34 @@ fn proof_suite_step_runs_the_tests_directory() {
     );
 }
 
+/// The reservation board's fence (bd-0uzrq.12): the Rust fix lives in toron
+/// (@51e27bde, pinned), and this model is what says a truncated read may not
+/// grant. TLC runs in verify-formal, not in this gate, so this pins the two
+/// halves that would otherwise drift silently: the grant guard and the
+/// registration of both violations.
+#[test]
+fn proof_reservation_board_model_fences_the_grant() {
+    let models = format!("{}/.agents/skills/verify-protocol-tla/models", root());
+    let model = std::fs::read_to_string(format!("{models}/ReservationBoard.tla"))
+        .expect("ReservationBoard.tla");
+    assert!(
+        model.contains(r#"[] OTHER                    -> v.status = "complete" /\ v.seen = {} /\ held = {}"#),
+        "a grant must need a complete read AND an empty board (the per-coordinate lock)"
+    );
+    let formal = std::fs::read_to_string(format!("{}/scripts/verify-formal.sh", root()))
+        .expect("scripts/verify-formal.sh");
+    assert!(
+        formal.contains("expect_pass ReservationBoard ReservationBoard"),
+        "the model must run positively in verify-formal"
+    );
+    for broken in ["broken-truncated-grants", "broken-no-refresh"] {
+        assert!(
+            formal.contains(&format!("ReservationBoard.{broken}")),
+            "the {broken} fixture must be expected to violate its invariant"
+        );
+    }
+}
+
 /// The harness edits source in place. Started from a shared working tree it
 /// planted mutants under every other lane's build; one of them ran the real
 /// launchctl. It must run in its own scratch export instead.
