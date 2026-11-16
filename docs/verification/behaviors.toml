@@ -306,6 +306,18 @@ mutations = [
 ]
 
 [[behavior]]
+id = "harness.plan-and-leaf-agree-on-every-field"
+owner = "src/headless.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/headless.rs::the_plan_and_the_leaf_agree_on_every_field",
+]
+mutations = [
+  "scripts/mutations/v4-composition.spec.sh#C1",
+]
+
+[[behavior]]
 id = "plan-fence.coverage-non-shrink"
 owner = "src/plan_fence.rs"
 status = "proven"
