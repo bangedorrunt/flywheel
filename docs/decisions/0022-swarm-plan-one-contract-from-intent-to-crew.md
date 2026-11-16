@@ -294,7 +294,7 @@ A pure fold: `(DesiredPlan, LiveSwarm) -> Vec<SeatPatch>`. The D8 binder is a se
 | V10 | The binder never gives a review or verify step to the seat that authored the work | Binder property test |
 | V11 | At most one live pane per pin, and a respawn keeps the pin's reservations | Hand TLA+ model run by TLC (ADR-0021 D5.4), shown failing on a variant that closes the old pane after the new one claims |
 
-Honesty note: `flywheel workflow verify --export-tla` writes TLA+ text; no model checker runs today (`src/cmd/workflow.rs` invokes none). V1 is a graph check, not a TLC proof. Running TLC in CI is a later, separate decision.
+Honesty note: `flywheel workflow verify --export-tla` writes TLA+ text; no model checker runs on that text today (`src/cmd/workflow.rs` invokes none), so V1 is a graph check, not a TLC proof. The hand-written protocol models are different: `scripts/verify-formal.sh` does run TLC 1.8.0 over `.agents/skills/verify-protocol-tla/models/`, positive and negative fixtures alike, and V11 rides it. Running TLC on the *workflow* export in CI remains a later, separate decision.
 
 ---
 
@@ -382,7 +382,7 @@ Every row below was checked by grepping the named test and mutation at `3af56271
 | V8 rex and hc produce the same launch command | none | none | **open: bd-6setu.1** |
 | V9 reconciler idempotent | `seat_reconcile_no_change_gives_keep` | `V9` | closed |
 | V10 binder never gives a review to its author | `seat_binder_reviewer_never_author` | `V10` | closed |
-| V11 one live pane per pin, reservations survive | none (hand TLA+ model, ADR-0021 D5.4) | none | **open: bd-6setu.9** — decide a TLA model or say it is out of model |
+| V11 one live pane per pin, reservations survive | `Respawn.tla` (`.agents/skills/verify-protocol-tla/models/`): positive config `Respawn` holds `OneLiveHolder` and `ReservationsKept`; `Respawn.broken-claim-before-free` is refuted on `OneLiveHolder` and `Respawn.broken-drop-reservations` on `ReservationsKept` | `scripts/verify-formal.sh` (bd-6setu.9) | closed: TLC 1.8.0, `verify-formal.sh` 35 passed / 0 failed |
 
 ### Acceptance
 
