@@ -8484,3 +8484,63 @@ mod dispatcher_workspace_tests {
         );
     }
 }
+
+/// bd-koafr: `--assign pin=bd-a,bd-b` pairs for the spawn/add flags.
+///
+/// One assignment per pin; the value keeps the bead list verbatim (the boot
+/// brief text names them all). Duplicate pins are refused: two boot briefs to
+/// one pane would race the same `READY` turn.
+pub(crate) fn parse_assign(
+    pairs: &[String],
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut out = std::collections::BTreeMap::new();
+    for pair in pairs {
+        let Some((pin, beads)) = pair.split_once('=') else {
+            anyhow::bail!("--assign wants pin=bead[,bead]: {pair}");
+        };
+        let pin = pin.trim();
+        let beads: Vec<&str> = beads
+            .split(',')
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .collect();
+        if pin.is_empty() || beads.is_empty() {
+            anyhow::bail!("--assign wants pin=bead[,bead]: {pair}");
+        }
+        for bead in &beads {
+            if !bead.starts_with("bd-") {
+                anyhow::bail!("--assign names a bead id (bd-…): {bead}");
+            }
+        }
+        if out.insert(pin.to_string(), beads.join(",")).is_some() {
+            anyhow::bail!("--assign names {pin} twice");
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod assign_tests {
+    use super::parse_assign;
+
+    #[test]
+    fn assign_pairs_parse_one_per_pin_and_keep_the_bead_list() {
+        let got = parse_assign(&["SlateHarbor=bd-a,bd-b".into(), "BoldBay=bd-c".into()])
+            .expect("valid pairs");
+        assert_eq!(got.get("SlateHarbor").map(String::as_str), Some("bd-a,bd-b"));
+        assert_eq!(got.get("BoldBay").map(String::as_str), Some("bd-c"));
+    }
+
+    #[test]
+    fn assign_refuses_malformed_duplicate_or_non_bead_input() {
+        for bad in [
+            vec!["no-equals".to_string()],
+            vec!["=bd-a".to_string()],
+            vec!["PinA=".to_string()],
+            vec!["PinA=notabead".to_string()],
+            vec!["PinA=bd-a".to_string(), "PinA=bd-b".to_string()],
+        ] {
+            assert!(parse_assign(&bad).is_err(), "must refuse {bad:?}");
+        }
+    }
+}
