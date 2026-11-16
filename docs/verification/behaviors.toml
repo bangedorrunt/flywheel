@@ -294,6 +294,18 @@ mutations = [
 ]
 
 [[behavior]]
+id = "claim.v10-author-exclusion"
+owner = "src/workflow_lowering.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/stages.rs::a_review_steps_reads_ride_its_job_spec",
+]
+mutations = [
+  "scripts/mutations/v10-claim-exclusion.spec.sh#F1",
+]
+
+[[behavior]]
 id = "workflow.verify-unused-stage-gate"
 owner = "src/cmd/workflow.rs"
 status = "proven"
