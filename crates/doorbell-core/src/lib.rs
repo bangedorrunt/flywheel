@@ -1166,7 +1166,10 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                     }
                 })
             });
-            let mail = matches!(class, EventClass::PlanePMail | EventClass::PlanePUrgent);
+            // Only a MAIL DELIVERY has an inbox row behind it. An ack-SLA or
+            // other urgent kind-9 rings on its own event and must not be
+            // skipped with it.
+            let mail = matches!(class, EventClass::PlanePMail);
             // A mail wake without a message id (replayed pre-mid events) has no
             // identity the inbox row can match, so a ring built here could only
             // double-ring the same mail later. The fetch carries the id; it owns

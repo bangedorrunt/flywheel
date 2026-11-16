@@ -2700,7 +2700,7 @@ mod tests {
         m.doorbell
             .statuses
             .insert("SlateHarbor".into(), "idle".into());
-        let mail = r#"{"kind":9,"id":"aa","tags":[["p","SlateHarbor"],["toron-kind","mail-delivered"],["h","t-1"]],"content":"sealed"}"#;
+        let mail = r#"{"kind":9,"id":"aa","tags":[["p","SlateHarbor"],["toron-kind","mail-delivered"],["h","t-1"],["mid","msg-1"]],"content":"sealed"}"#;
         let (_m, cmds) = tick(
             &m,
             &Msg::WatchNdjson {
