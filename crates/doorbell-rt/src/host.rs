@@ -170,6 +170,10 @@ pub struct MockHost {
     pub unroutable: std::collections::BTreeSet<String>,
     /// Pin → npub, for hear-tracker seeding (`Host::pin_npub`).
     pub npubs: std::collections::BTreeMap<String, String>,
+    /// Inbox probes served (bd-0uzrq.20): the fake host's fetch counter, so a
+    /// test can prove the backoff bounds the work instead of trusting a
+    /// journal row that only the non-empty fetches produce.
+    pub fetch_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl MockHost {
@@ -186,6 +190,7 @@ impl MockHost {
             statuses: Default::default(),
             unroutable: Default::default(),
             npubs: Default::default(),
+            fetch_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -222,6 +227,8 @@ impl Host for MockHost {
     }
 
     fn fetch_inbox(&self, pin: &str, since: &str) -> Vec<serde_json::Value> {
+        self.fetch_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inbox
             .get(&(pin.to_string(), since.to_string()))
             .cloned()

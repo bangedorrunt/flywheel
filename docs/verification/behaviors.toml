@@ -561,3 +561,19 @@ mutations = [
   "scripts/mutations/stall-activity.spec.sh#A6",
   "scripts/mutations/stall-activity.spec.sh#A7",
 ]
+
+[[behavior]]
+id = "doorbell.fetch-backoff-unroutable"
+owner = "crates/doorbell-rt/src/brain.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "crates/doorbell-rt/src/brain.rs::bd20_unroutable_pin_is_fetched_once_per_backoff_window",
+  "crates/doorbell-rt/src/brain.rs::bd20_routable_pin_still_fetches_every_sweep",
+]
+mutations = [
+  "scripts/mutations/doorbell-fetch-backoff.spec.sh#B1",
+  "scripts/mutations/doorbell-fetch-backoff.spec.sh#B2",
+  "scripts/mutations/doorbell-fetch-backoff.spec.sh#B3",
+  "scripts/mutations/doorbell-fetch-backoff.spec.sh#B4",
+]

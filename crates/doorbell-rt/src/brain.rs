@@ -31,6 +31,12 @@ pub const AUDIT_JOURNAL_SYNC_FAILED: &str = "journal_sync_failed";
 /// now names all three, with the same sampled-row shape as the other repeats.
 pub const AUDIT_WAKE_SAVE_FAILED: &str = "wake_save_failed";
 
+/// bd-0uzrq.20: how long a structurally unroutable pin waits between inbox
+/// probes. Its rows cannot become a ring (no covered pane), so fetching it
+/// every sweep is pure cost: live 2026-11-15 showed one toron round trip every
+/// ~3s for the captain's pin, each returning rows nobody could route.
+pub(crate) const FETCH_BACKOFF_SECS: u64 = 60;
+
 pub struct BrainConfig {
     pub workspace: String,
     pub digest_threshold: usize,
@@ -254,6 +260,14 @@ pub struct Brain<H: Host> {
     /// Side signal for [`crate::msg::BrainMsg::Died`]. `None` keeps the
     /// channel-only path (tests that enqueue Died).
     died_bell: Option<std::sync::Arc<crate::msg::DiedBell>>,
+    /// bd-0uzrq.20: last time the brain probed an unroutable pin's inbox. A
+    /// pin with no prompt route is fetched at most once per
+    /// [`FETCH_BACKOFF_SECS`]; the entry is dropped the moment a fetch routes.
+    unroutable_park: BTreeMap<String, u64>,
+    /// bd-0uzrq.20: the last unroutable row set already reported per pin, so a
+    /// parked pin re-probing the same rows makes one journal row, not one per
+    /// backoff window.
+    unroutable_reported: BTreeMap<String, u64>,
 }
 
 impl<H: Host> Brain<H> {
@@ -333,6 +347,8 @@ impl<H: Host> Brain<H> {
             sla_seen: BTreeSet::new(),
             liveness: std::sync::Arc::new(BrainLiveness::new()),
             died_bell: None,
+            unroutable_park: BTreeMap::new(),
+            unroutable_reported: BTreeMap::new(),
         };
         if redelivered > 0 {
             this.journal(
@@ -847,6 +863,7 @@ impl<H: Host> Brain<H> {
             .iter()
             .filter(|r| doorbell_core::parse_inbox_item(r).is_some())
             .count();
+        let rows_digest = inbox_rows_digest(&rows);
         let effects = self.host.tick(&BrainMsg::InboxFetched {
             pin: pin.clone(),
             rows,
@@ -861,11 +878,37 @@ impl<H: Host> Brain<H> {
         let queued = effects
             .iter()
             .any(|e| matches!(e, Effect::Audit { kind, .. } if kind == "queued"));
+        // bd-0uzrq.20: rows that produced neither a ring nor a queue entry can
+        // never become one — no later sweep decides them. For a pin with no
+        // prompt route (the captain: a subscriber with no covered pane) that
+        // used to hold the cursor, so every Sweep refetched the same rows: one
+        // toron round trip every ~3s, forever. Report the row set ONCE and park
+        // the pin; the park is what bounds the probes. A routable pin keeps the
+        // old hold — its wake may still become deliverable.
+        let mut effects = effects;
+        let stuck = wake_rows > 0 && !decided && !queued;
+        let unroutable = stuck && !self.host.has_route(&pin);
+        if unroutable && self.unroutable_reported.get(&pin) != Some(&rows_digest) {
+            self.unroutable_reported.insert(pin.clone(), rows_digest);
+            effects.push(Effect::Audit {
+                kind: "unroutable".into(),
+                pin: pin.clone(),
+                detail: serde_json::json!({
+                    "reason": "no prompt route; rows stay unread in the mailbox",
+                    "rows": wake_rows,
+                    "backoff_secs": FETCH_BACKOFF_SECS,
+                }),
+            });
+        }
         if let Some(hw) = hw
-            && (wake_rows == 0 || decided || queued)
+            && (wake_rows == 0 || decided || queued || unroutable)
         {
             self.wake.since_by_pin.insert(pin.clone(), hw);
             self.flush_wake("inbox-cursor");
+        }
+        if decided || queued {
+            self.unroutable_park.remove(&pin);
+            self.unroutable_reported.remove(&pin);
         }
         if fetched || is_decision(&effects) {
             self.journal(
@@ -878,10 +921,23 @@ impl<H: Host> Brain<H> {
         self.deliver(effects, "inbox").await;
     }
 
-    fn fetch_targets(&self, now_unix: u64) -> Vec<(String, String)> {
+    fn fetch_targets(&mut self, now_unix: u64) -> Vec<(String, String)> {
         let floor = doorbell_core::redelivery_floor_rfc3339(now_unix);
         let mut targets = Vec::new();
         for pin in self.host.pins() {
+            if !self.host.has_route(&pin) {
+                let due = self
+                    .unroutable_park
+                    .get(&pin)
+                    .is_none_or(|at| now_unix.saturating_sub(*at) >= FETCH_BACKOFF_SECS);
+                if !due {
+                    continue;
+                }
+                // Hand out the probe and start the next window now, so an
+                // empty probe (the common case once the cursor has advanced)
+                // cannot put this pin back on the every-sweep path.
+                self.unroutable_park.insert(pin.clone(), now_unix);
+            }
             let pin_since = self
                 .wake
                 .since_by_pin
@@ -1300,6 +1356,18 @@ fn is_decision(effects: &[Effect]) -> bool {
     effects.iter().any(|e| !matches!(e, Effect::FetchInbox))
 }
 
+/// A stable fingerprint of one fetched row set (bd-0uzrq.20), so a parked pin
+/// that keeps seeing the same rows reports them once instead of once per
+/// backoff window.
+fn inbox_rows_digest(rows: &[serde_json::Value]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for row in rows {
+        row.to_string().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// Journaled Prompt intents awaiting confirmation (crash-resume redelivery
 /// set). Counts `{"Prompt": …}` actions across the loud fold.
 fn count_journaled_prompts(store: &FileStore, workspace: &str) -> usize {
@@ -1682,6 +1750,83 @@ mod tests {
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .filter_map(|v| v["msg"]["rt_kind"].as_str().map(str::to_string))
             .collect()
+    }
+
+    /// bd-0uzrq.20: an unroutable pin's rows used to hold the cursor, so every
+    /// sweep refetched them — live: one toron round trip every ~3s for the
+    /// captain's pin, each returning rows nobody could route. The pin is parked
+    /// now: 60 sweeps at 3s across 180s fetch it once per backoff window, not
+    /// 60 times, and the same row set journals ONE typed unroutable row.
+    #[tokio::test]
+    async fn bd20_unroutable_pin_is_fetched_once_per_backoff_window() {
+        let name = "bd20-unroutable-backoff";
+        let script: Vec<Vec<Effect>> = (0..200).map(|_| vec![Effect::FetchInbox]).collect();
+        let (mut brain, _rx, _tx) = test_brain(name, script);
+        brain.host.pin_list = vec!["SlateHarbor".to_string()];
+        brain.host.unroutable.insert("SlateHarbor".to_string());
+        // A wake the fold never decides, and no timestamp to advance a cursor
+        // to: the live shape that refetched the same rows forever.
+        let rows = vec![serde_json::json!({
+            "id": "m1",
+            "subject": "brief from the human",
+            "sender": "SlateHarbor",
+        })];
+        let t0 = 1_000_000u64;
+        for step in [0u64, 20, 40] {
+            let at = t0 + step * 3;
+            let floor = doorbell_core::redelivery_floor_rfc3339(at);
+            brain
+                .host
+                .inbox
+                .insert(("SlateHarbor".to_string(), floor), rows.clone());
+        }
+        for step in 0..60u64 {
+            brain.dispatch(BrainMsg::Sweep { now: t0 + step * 3 }).await;
+        }
+        let fetches = brain
+            .host
+            .fetch_calls
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            fetches, 3,
+            "180s of sweeps at a 60s backoff is three probes, not sixty"
+        );
+        let dir = std::env::temp_dir().join(format!("dbrt-brain-{}-{}", std::process::id(), name));
+        let raw =
+            std::fs::read_to_string(FileStore::new(&dir).journal_file("w")).unwrap_or_default();
+        assert_eq!(
+            raw.lines()
+                .filter(|line| line.contains("\"unroutable\""))
+                .count(),
+            1,
+            "the same row set is reported once, not once per window: {raw}"
+        );
+    }
+
+    /// The backoff is for pins with NO route only. A routable pin must keep the
+    /// every-sweep fetch that rings its mail — parking it would starve a real
+    /// crew wake.
+    #[tokio::test]
+    async fn bd20_routable_pin_still_fetches_every_sweep() {
+        let name = "bd20-routable-every-sweep";
+        let script: Vec<Vec<Effect>> = (0..10).map(|_| vec![Effect::FetchInbox]).collect();
+        let (mut brain, _rx, _tx) = test_brain(name, script);
+        brain.host.pin_list = vec!["PinA".to_string()];
+        for step in 0..10u64 {
+            brain
+                .dispatch(BrainMsg::Sweep {
+                    now: 1_000_000 + step * 3,
+                })
+                .await;
+        }
+        assert_eq!(
+            brain
+                .host
+                .fetch_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            10,
+            "a routable pin is polled every sweep, backoff or not"
+        );
     }
 
     /// bd-0uzrq.17: the status lane is polled BEFORE mail. With one channel a
