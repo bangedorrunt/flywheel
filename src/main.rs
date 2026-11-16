@@ -12248,7 +12248,7 @@ fn recover_seats(
                 };
                 let Some(target) = target else { continue };
                 match start_agent_with_retry_dyn_profile(
-                    &*backend,
+                    backend,
                     &hname,
                     kind,
                     &target,
