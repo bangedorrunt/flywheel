@@ -30,8 +30,9 @@
 //! governed-by: ADR-0019
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::Output;
+
+use flywheel_test_sandbox::TestSandbox;
 
 fn flywheel() -> &'static str {
     env!("CARGO_BIN_EXE_flywheel")
@@ -40,19 +41,18 @@ fn flywheel() -> &'static str {
 /// Scratch project dir + isolated mailbox + isolated config (same hermetic
 /// harness as e2e_verdict_reopen.rs — see there for the rationale).
 struct Scratch {
+    sandbox: TestSandbox,
     dir: PathBuf,
     mailbox: PathBuf,
     cfg: PathBuf,
 }
 
 impl Scratch {
-    fn new(tag: &str) -> Self {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let base = std::env::temp_dir().join(format!("fw-{tag}-{}-{ts}", std::process::id()));
+    fn new(_tag: &str) -> Self {
+        let sandbox = TestSandbox::new();
+        let base = sandbox.root().to_path_buf();
         let s = Self {
+            sandbox,
             dir: base.join("proj"),
             mailbox: base.join("mailbox"),
             cfg: base.join("cfg/flywheel"),
@@ -79,12 +79,10 @@ impl Scratch {
     }
 
     fn flywheel(&self, args: &[&str]) -> Output {
-        let mut c = Command::new(flywheel());
+        let mut c = self.sandbox.command(flywheel());
         c.args(args)
             .current_dir(&self.dir)
-            .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .env("HOME", std::env::var_os("HOME").unwrap_or_default());
+            .env("PATH", self.sandbox.path_env());
         for (k, v) in self.flywheel_env() {
             c.env(k, v);
         }
@@ -120,12 +118,15 @@ impl Scratch {
 }
 
 fn run(cwd: &Path, bin: &str, args: &[&str]) -> Output {
-    Command::new(bin)
+    // A tool spawn (git, br): still sandboxed, and the shims must be first on
+    // PATH because br can shell out. The scratch repo is the cwd, so a fresh
+    // sandbox per call costs only its temp dir.
+    let sandbox = TestSandbox::new();
+    sandbox
+        .command(bin)
         .args(args)
         .current_dir(cwd)
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", std::env::var_os("HOME").unwrap_or_default())
+        .env("PATH", sandbox.path_env())
         .output()
         .expect("cmd runs")
 }
