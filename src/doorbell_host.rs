@@ -2232,6 +2232,45 @@ mod presence_producer_tests {
             RtHost::changed_statuses(&mut last, status(AgentStatus::Idle)).is_empty(),
             "the idle itself does not repeat either"
         );
+
+        // …and that ONE idle transition is what drains a wake queued while the
+        // pane was working. The producer and the reducer are judged together:
+        // a dedup that swallows the idle leaves the queue parked (bd-0uzrq.17).
+        let mut model = crate::workspace::WorkspaceModel::default();
+        model.doorbell.index.insert_pin("PinA".into(), None);
+        model
+            .doorbell
+            .statuses
+            .insert("PinA".into(), "working".into());
+        let line = r#"{"kind":9,"id":"ev-17","tags":[["p","PinA"],["toron-kind","mail-delivered"],["mid","msg-17"]],"content":"sealed"}"#;
+        let (queued, qcmds) = crate::workspace::tick(
+            &model,
+            &crate::workspace::Msg::WatchNdjson {
+                line: line.to_string(),
+            },
+        );
+        assert!(
+            !qcmds
+                .iter()
+                .any(|c| matches!(c, crate::workspace::Cmd::Prompt { .. })),
+            "a working pane queues, never prompts: {qcmds:?}"
+        );
+        let BrainMsg::PlaneStatus { pin, status } = &idle[0] else {
+            unreachable!()
+        };
+        let (_, drained) = crate::workspace::tick(
+            &queued,
+            &crate::workspace::Msg::PlaneStatus {
+                pin: pin.clone(),
+                status: status.clone(),
+            },
+        );
+        assert!(
+            drained
+                .iter()
+                .any(|c| matches!(c, crate::workspace::Cmd::Prompt { pin, .. } if pin == "PinA")),
+            "the one idle transition drains the queued wake: {drained:?}"
+        );
     }
 }
 
