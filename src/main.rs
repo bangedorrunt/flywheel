@@ -3986,6 +3986,9 @@ fn main() {
             plan_fence::PlanFenceAction::Converged { state, json } => {
                 plan_fence::cmd_converged(state, *json)
             }
+            plan_fence::PlanFenceAction::Coverage { state, map, json } => {
+                plan_fence::cmd_coverage(state, map, *json)
+            }
         },
         Some(Commands::__ReservationBoard { project }) => {
             cmd_internal_reservation_board(&cfg, project)

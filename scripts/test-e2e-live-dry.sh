@@ -18,8 +18,19 @@ for shim in launchctl systemctl; do
     printf '#!/usr/bin/env bash\necho "SHIM %s $*" >>"$E2E_DRY_SHIM_LOG"\nexit 1\n' "$shim" >"$TMP/bin/$shim"
     chmod +x "$TMP/bin/$shim"
 done
-# Fake rex: records every call. A dry run must produce an EMPTY record.
-printf '#!/usr/bin/env bash\necho "rex $*" >>"%s"\nexit 0\n' "$TMP/rex.log" >"$TMP/bin/rex"
+# Fake rex: records every call, and answers `new` with the REAL shape of
+# `session.create`'s output (rex api describe session.create --json:
+# session_id + initial_windows[{window_id, block_ids[]}]), so the parse below is
+# witnessed against the contract rather than a guess.
+printf '#!/usr/bin/env bash
+echo "rex $*" >>"%s"
+if [ "$1" = new ]; then
+  cat <<JSON
+{"session_id":"sess-abc123","initial_windows":[{"window_id":"win-1","block_ids":["blk-9"],"revision":1}]}
+JSON
+fi
+exit 0
+' "$TMP/rex.log" >"$TMP/bin/rex"
 chmod +x "$TMP/bin/rex"
 printf '#!/usr/bin/env bash\necho "cargo $*" >>"%s"\nexit 0\n' "$TMP/cargo.log" >"$TMP/bin/cargo"
 chmod +x "$TMP/bin/cargo"
@@ -46,5 +57,23 @@ pass "a dry run creates no session (rex was never called)"
 
 [ ! -s "$TMP/shims.log" ] || fail "a dry run reached launchctl/systemctl: $(cat "$TMP/shims.log")"
 pass "a dry run never reaches the supervisor tools"
+
+
+# --selftest drives the create + parse + teardown against the fake rex, so the
+# session.create JSON parse is witnessed without a live server.
+self_out="$(HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg/config" XDG_DATA_HOME="$TMP/xdg/data" \
+    XDG_STATE_HOME="$TMP/xdg/state" XDG_RUNTIME_DIR="$TMP/xdg/run" \
+    E2E_DRY_SHIM_LOG="$TMP/shims.log" PATH="$TMP/bin:$PATH" \
+    FLYWHEEL_LIVE_E2E=1 FLYWHEEL_LIVE_SESSION="self-session" TORON_BIN="$TMP/bin/cargo" \
+    bash "$ROOT/scripts/e2e-live-five.sh" --selftest 2>&1)" || fail "selftest must exit 0: $self_out"
+case "$self_out" in
+    *"session=sess-abc123 block=blk-9"*) ;;
+    *) fail "the parse must read session_id and the first block id: $self_out" ;;
+esac
+pass "session.create's JSON is parsed into the session and block ids"
+
+grep -q "rex new self-session --json" "$TMP/rex.log" || fail "rex new must be by label: $(cat "$TMP/rex.log")"
+grep -q "rex kill self-session" "$TMP/rex.log" || fail "the session must be torn down: $(cat "$TMP/rex.log")"
+pass "the session is created by label and killed by label"
 
 echo "ok"

@@ -27,6 +27,151 @@ pub enum PlanFenceAction {
         #[arg(long)]
         json: bool,
     },
+    /// ADR-0021 D7 rule 3: a round may not drop a requirement from coverage
+    /// without moving it to non-goals with a reason.
+    Coverage {
+        /// Path holding the requirement baseline (seeded by the first round).
+        #[arg(long)]
+        state: PathBuf,
+        /// The round's reply JSON: `{"coverage": {req: [ids]}, "non_goals": [...]}`.
+        #[arg(long)]
+        map: PathBuf,
+        /// Print one JSON object (`{"check","ok","detail"...}`).
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Pure decision core: requirements that left BOTH the coverage map and the
+/// non-goals list — the exact shrinkage D7 forbids. Sorted, deduped.
+pub fn coverage_shrink(
+    requirements: &[String],
+    covered: &std::collections::BTreeSet<String>,
+    non_goals: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let mut missing: Vec<String> = requirements
+        .iter()
+        .filter(|r| !covered.contains(*r) && !non_goals.contains(*r))
+        .cloned()
+        .collect();
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
+/// The requirement set a round maps: every coverage key plus every non-goal.
+fn mapped_requirements(map: &Value) -> std::collections::BTreeSet<String> {
+    let mut out: std::collections::BTreeSet<String> = map
+        .get("coverage")
+        .and_then(Value::as_object)
+        .map(|c| c.keys().cloned().collect())
+        .unwrap_or_default();
+    for n in map
+        .get("non_goals")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(s) = n.as_str() {
+            out.insert(s.to_owned());
+        } else {
+            for key in ["requirement", "name", "id"] {
+                if let Some(s) = n.get(key).and_then(Value::as_str) {
+                    out.insert(s.to_owned());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `flywheel __plan-fence coverage --state <path> --map <path> [--json]`.
+///
+/// The FIRST round seeds the baseline: its map names the requirements the grill
+/// produced, so later rounds are measured against what the plan once covered.
+/// A round passes when every baseline requirement is still covered or has a
+/// non-goals entry; the baseline never shrinks.
+pub(crate) fn cmd_coverage(state: &Path, map: &Path, json: bool) -> Result<()> {
+    let raw = std::fs::read_to_string(map)
+        .map_err(|e| anyhow::anyhow!("read covereage map {}: {e}", map.display()))?;
+    let round: Value = serde_json::from_str(raw.trim())
+        .map_err(|e| anyhow::anyhow!("coverage map {} is not JSON: {e}", map.display()))?;
+    let requirements: Vec<String> = match std::fs::read_to_string(state)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(s.trim()).ok())
+        .and_then(|v| v.get("requirements").and_then(Value::as_array).cloned())
+    {
+        Some(rows) => rows
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        None => {
+            // First round: seed the baseline from this map and pass it through.
+            let seeded: Vec<String> = mapped_requirements(&round).into_iter().collect();
+            std::fs::create_dir_all(state.parent().unwrap_or(Path::new(".")))
+                .map_err(|e| anyhow::anyhow!("create {}: {e}", state.display()))?;
+            std::fs::write(state, json!({ "requirements": seeded }).to_string())
+                .map_err(|e| anyhow::anyhow!("seed {}: {e}", state.display()))?;
+            seeded
+        }
+    };
+    let covered: std::collections::BTreeSet<String> = round
+        .get("coverage")
+        .and_then(Value::as_object)
+        .map(|c| c.keys().cloned().collect())
+        .unwrap_or_default();
+    let mut non_goals: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for n in round
+        .get("non_goals")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(s) = n.as_str() {
+            non_goals.insert(s.to_owned());
+        } else {
+            for key in ["requirement", "name", "id"] {
+                if let Some(s) = n.get(key).and_then(Value::as_str) {
+                    non_goals.insert(s.to_owned());
+                }
+            }
+        }
+    }
+    let missing = coverage_shrink(&requirements, &covered, &non_goals);
+    let ok = missing.is_empty();
+    if json {
+        print_json(&json!({
+            "check": "coverage",
+            "ok": ok,
+            "detail": {
+                "requirements": requirements.len(),
+                "covered": covered.len(),
+                "non_goals": non_goals.len(),
+                "dropped": missing,
+            }
+        }));
+    } else if ok {
+        println!(
+            "coverage: ok ({} requirements, {} covered, {} non-goals)",
+            requirements.len(),
+            covered.len(),
+            non_goals.len()
+        );
+    } else {
+        println!(
+            "coverage: FAILED (dropped without a non-goal: {})",
+            missing.join(", ")
+        );
+    }
+    if ok {
+        Ok(())
+    } else {
+        bail!(
+            "plan coverage shrank: {} dropped without a non-goals entry",
+            missing.join(", ")
+        )
+    }
 }
 
 /// Pure decision core: the fence passes only when both checks are clean.
@@ -390,6 +535,82 @@ mod tests {
         assert!(!converged("abc", Some("abd")));
         assert!(!converged("abc", None));
         assert!(!converged("abc", Some("")));
+    }
+
+    /// ADR-0021 D7 rule 3 / acceptance 4: a round that drops a requirement
+    /// from coverage without a non-goals entry is the failure the fence exists
+    /// to catch; a non-goals entry is the sanctioned way out.
+    #[test]
+    fn coverage_shrink_names_every_dropped_requirement() {
+        use std::collections::BTreeSet;
+        let reqs: Vec<String> = ["r1", "r2", "r3"].iter().map(|s| s.to_string()).collect();
+        let set =
+            |items: &[&str]| -> BTreeSet<String> { items.iter().map(|s| s.to_string()).collect() };
+        assert!(
+            coverage_shrink(&reqs, &set(&["r1", "r2", "r3"]), &set(&[])).is_empty(),
+            "full coverage is not a shrink"
+        );
+        assert_eq!(
+            coverage_shrink(&reqs, &set(&["r1"]), &set(&["r2", "r3"])),
+            Vec::<String>::new(),
+            "a declared non-goal is a sanctioned exit"
+        );
+        assert_eq!(
+            coverage_shrink(&reqs, &set(&["r1"]), &set(&["r3"])),
+            vec!["r2".to_string()],
+            "the dropped requirement is named"
+        );
+        assert_eq!(
+            coverage_shrink(&reqs, &set(&[]), &set(&[])),
+            vec!["r1".to_string(), "r2".to_string(), "r3".to_string()],
+            "every dropped requirement is named, sorted"
+        );
+    }
+
+    /// The CLI seeds the baseline from the FIRST round's map and never lets it
+    /// shrink: a later round is measured against what the plan once covered.
+    #[test]
+    fn the_coverage_fence_seeds_once_and_never_shrinks() {
+        let dir = std::env::temp_dir().join(format!("fw-coverage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let state = dir.join("coverage.json");
+        let map = dir.join("round.json");
+
+        std::fs::write(
+            &map,
+            json!({"coverage": {"r1": ["bd-1"], "r2": ["bd-2"]}, "non_goals": []}).to_string(),
+        )
+        .expect("round 1 map");
+        cmd_coverage(&state, &map, true).expect("the first round seeds the baseline");
+
+        // Round 2 keeps everything: passes.
+        std::fs::write(
+            &map,
+            json!({"coverage": {"r1": ["bd-1"], "r2": ["bd-2", "bd-3"]}, "non_goals": []})
+                .to_string(),
+        )
+        .expect("round 2 map");
+        cmd_coverage(&state, &map, true).expect("a non-shrinking round passes");
+
+        // Round 3 drops r2 with no non-goal: fails, naming it.
+        std::fs::write(
+            &map,
+            json!({"coverage": {"r1": ["bd-1"]}, "non_goals": []}).to_string(),
+        )
+        .expect("round 3 map");
+        let err = cmd_coverage(&state, &map, true).expect_err("a dropped requirement fails");
+        assert!(err.to_string().contains("r2"), "{err}");
+
+        // Round 4 drops r2 but declares it a non-goal: passes.
+        std::fs::write(
+            &map,
+            json!({"coverage": {"r1": ["bd-1"]}, "non_goals": ["r2"]}).to_string(),
+        )
+        .expect("round 4 map");
+        cmd_coverage(&state, &map, true).expect("a declared non-goal passes");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

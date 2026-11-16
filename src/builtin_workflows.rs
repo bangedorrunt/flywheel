@@ -1394,6 +1394,8 @@ inputs:
     default: "@coder"
   - name: polish_state
     default: ".flywheel/plan/beads-lifecycle.digest"
+  - name: polish_coverage_state
+    default: ".flywheel/plan/beads-lifecycle.coverage"
 graph:
   nodes:
     grill:
@@ -1418,7 +1420,7 @@ graph:
       action: loop
       min: 2
       max: 5
-      until: 'steps_fence_ok == true && steps_converged_ok == true'
+      until: 'steps_fence_ok == true && steps_converged_ok == true && steps_coverage_ok == true'
       on_error: fail_run
       body:
         - name: round
@@ -1428,7 +1430,7 @@ graph:
             profile: "@planner"
             stage: plan-polish
             effort: max
-            task: 'Another polish round for {{inputs.objective}}: revise the beads against the requirements from {{steps.grill}}.'
+            task: 'Another polish round for {{inputs.objective}}: revise the beads against the requirements from {{steps.grill}}. Write the SAME reply JSON object to .flywheel/plan/polish-round.json as well as returning it — the coverage fence reads that file (ADR-0021 D7 rule 3).'
           on_error: fail_run
         - name: fence
           action: verify
@@ -1437,6 +1439,10 @@ graph:
         - name: converged
           action: verify
           command: 'flywheel __plan-fence converged --state {{inputs.polish_state}}'
+          on_error: continue
+        - name: coverage
+          action: verify
+          command: 'flywheel __plan-fence coverage --state {{inputs.polish_coverage_state}} --map .flywheel/plan/polish-round.json'
           on_error: continue
     audit:
       needs: [polish]
@@ -4589,7 +4595,9 @@ graph:
         assert_eq!(max, "5", "polish max 5");
         assert_eq!(
             until.as_deref(),
-            Some("steps_fence_ok == true && steps_converged_ok == true"),
+            Some(
+                "steps_fence_ok == true && steps_converged_ok == true && steps_coverage_ok == true"
+            ),
             "polish until"
         );
         assert!(
@@ -4649,6 +4657,47 @@ graph:
                 );
             }
         }
+        // bd-jhz8x.7: the coverage fence is part of the loop, and the round
+        // hands it the map it just returned (D7 rule 3, acceptance 4).
+        let cov = body
+            .iter()
+            .find(|s| s.name.as_deref() == Some("coverage"))
+            .expect("body coverage step");
+        let Action::Verify { command } = &cov.action else {
+            panic!("body coverage is a verify");
+        };
+        assert!(
+            command.contains("__plan-fence coverage")
+                && command.contains("{{inputs.polish_coverage_state}}")
+                && command.contains(".flywheel/plan/polish-round.json"),
+            "the coverage fence reads the round's map and the seeded baseline: {command}"
+        );
+        let round = body
+            .iter()
+            .find(|s| s.name.as_deref() == Some("round"))
+            .expect("body round");
+        let Action::DispatchJob { spec, .. } = &round.action else {
+            panic!("body round is a dispatch");
+        };
+        assert!(
+            spec.task
+                .as_deref()
+                .is_some_and(|t| t.contains(".flywheel/plan/polish-round.json")),
+            "the round writes the map the coverage fence reads"
+        );
+        let coverage_state = wf
+            .inputs
+            .iter()
+            .find(|i| i.name == "polish_coverage_state")
+            .expect("polish_coverage_state input");
+        assert_eq!(
+            coverage_state.default,
+            Some(serde_json::Value::String(
+                ".flywheel/plan/beads-lifecycle.coverage".to_string()
+            )),
+            "polish_coverage_state default"
+        );
+
         let body_fence = body
             .iter()
             .find(|s| s.name.as_deref() == Some("fence"))

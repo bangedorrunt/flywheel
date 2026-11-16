@@ -294,6 +294,21 @@ mutations = [
 ]
 
 [[behavior]]
+id = "plan-fence.coverage-non-shrink"
+owner = "src/plan_fence.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/plan_fence.rs::coverage_shrink_names_every_dropped_requirement",
+  "src/plan_fence.rs::the_coverage_fence_seeds_once_and_never_shrinks",
+  "src/builtin_workflows.rs::beads_lifecycle_plan_polish_loop",
+]
+mutations = [
+  "scripts/mutations/coverage-fence.spec.sh#C1",
+  "scripts/mutations/coverage-fence.spec.sh#W1",
+]
+
+[[behavior]]
 id = "claim.v10-author-exclusion"
 owner = "src/workflow_lowering.rs"
 status = "proven"

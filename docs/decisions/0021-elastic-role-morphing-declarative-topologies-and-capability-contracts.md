@@ -356,7 +356,7 @@ witnessed by ADR-0022's map (§8), which owns the adapter/profile half of D3.
 | D5.4 hand TLA+ protocols, each shown failing on a broken variant | `.agents/skills/verify-protocol-tla/models/{JobLease,ReservationBoard,Respawn}.tla` with `.broken-*.cfg` variants, run by `scripts/verify-formal.sh` (the proof's `verify-formal` step) | none (the models are the artifact) | closed |
 | D5.5 honesty fixes ship first | `tests/e2e_statechart_formal_verification.rs` — `test_cli_workflow_verify_plain_text`, `test_cli_workflow_verify_json_contract`, `test_cli_workflow_verify_export_tla` (SwarmLifecycle retired); `AGENTS.md`/skill grep for "zero-divergence"/"mathematically verified" is empty | none | closed |
 | D6 curate the catalog (unused is a property of the catalog) | `an_undeclared_unreferenced_stage_fails_and_a_declaration_clears_it`, `declared_reach_names_only_real_stages`, `stage_contract_list_filters` (`stage list --phase`) | `workflow-verify-unused U1`, `unused-stage U1`, `adr0021-witnessed E6` | closed (bd-jhz8x.6) |
-| D7 the plan-polish loop (min 2, max 5, digest convergence, fence) | `beads_lifecycle_plan_polish_loop`, `adr0021_plan_fence_never_converges_on_a_changed_digest`, `converged_only_on_equal_previous`, `digest_sees_content_and_dependency_changes`, `fence_passes_only_on_double_zero` | `adr0021-gates F1` | **partial: the fence never checks coverage non-shrink — bd-jhz8x.7** |
+| D7 the plan-polish loop (min 2, max 5, digest convergence, fence, coverage non-shrink) | `beads_lifecycle_plan_polish_loop`, `adr0021_plan_fence_never_converges_on_a_changed_digest`, `converged_only_on_equal_previous`, `digest_sees_content_and_dependency_changes`, `fence_passes_only_on_double_zero`, `coverage_shrink_names_every_dropped_requirement`, `the_coverage_fence_seeds_once_and_never_shrinks` | `adr0021-gates F1`, `coverage-fence C1/W1` | closed (bd-jhz8x.7) |
 
 ### Acceptance
 
@@ -365,7 +365,7 @@ witnessed by ADR-0022's map (§8), which owns the adapter/profile half of D3.
 | 1 | lint fails on `judge-arms` without an arms step, passes with one | `stage_contract_judge_arms_without_arms_fails` | closed, `adr0021-gates R1` |
 | 2 | `workflow verify --json` lists every catalog workflow; the retired `SwarmLifecycle` is unreachable/unbounded | `test_cli_workflow_verify_json_contract` (chart list), `test_cli_workflow_verify_single_named_chart` | superseded: D5.1 deleted the hand chart; the test now pins its ABSENCE and `wave-swarm` verifying as a workflow |
 | 3 | a coder that never writes a witness fails typed at `result_timeout`; no `.done` is read | `wave_swarm_missing_witness_fails_at_result_timeout`, `wave_swarm_no_marker_reads` | closed (bd-jhz8x.5 un-ignored it), `graph-await P1/T1/O1` |
-| 4 | two polish rounds, converge on an unchanged digest, fail on a dropped requirement | `beads_lifecycle_plan_polish_loop`, `adr0021_plan_fence_never_converges_on_a_changed_digest` | **partial: the dropped-requirement half is not checked — bd-jhz8x.7** |
+| 4 | two polish rounds, converge on an unchanged digest, fail on a dropped requirement | `beads_lifecycle_plan_polish_loop`, `adr0021_plan_fence_never_converges_on_a_changed_digest`, `the_coverage_fence_seeds_once_and_never_shrinks` | closed (bd-jhz8x.7), `coverage-fence C1/W1` |
 | 5 | a project-tier `compose: true` expands without a rebuild | `adr0021_compose_override_wins_from_the_upper_tier` | closed, `adr0021-gates C1` |
 | 6 | every new check is seen failing on a broken variant first | `scripts/mutations/adr0021-gates.spec.sh` 6/6 RED at `bd-jhz8x.1` | closed |
 | 7 | `verify-clippy.sh` and `clean-proof.sh --tests` pass | those scripts, plus `verify-clippy-gates` and `proof-suite-and-isolation` | closed, `verify-clippy-gates W1`, `proof-suite-and-isolation S1` |
@@ -376,7 +376,7 @@ Every row above was grepped; none was recalled. A row marked **open** or
 **partial** is a real gap with an owner bead — nothing here is closed without
 both a witness test and a mutation seen RED. The five checks that were
 witnessed but unmutated are closed by bd-jhz8x.6 (`adr0021-witnessed E1–E6`,
-6/6 RED); the missing coverage fence is bd-jhz8x.7; the sidecar-writer and
-`spawn-crew` legs stay with bd-jhz8x.3 and bd-jhz8x.2. The topology export
+6/6 RED) and the coverage fence by bd-jhz8x.7 (`coverage-fence C1/W1`);
+the sidecar-writer and `spawn-crew` legs stay with bd-jhz8x.3 and bd-jhz8x.2. The topology export
 still proves nothing (D5.3): no model checker runs over it, and D5.4's TLC
 models cover protocols, not workflows.
