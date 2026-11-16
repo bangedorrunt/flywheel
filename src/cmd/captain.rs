@@ -392,6 +392,7 @@ fn created_us(row: &Value) -> Option<i64> {
 
 /// What one stall probe observed. Shared with `loop-mode supervise` (rweq),
 /// so the captain watch and the supervisor judge the same fleet the same way.
+#[derive(Debug, Clone)]
 pub(crate) struct StallProbe {
     /// any bead not closed/done
     pub work_remaining: bool,
@@ -412,6 +413,13 @@ pub(crate) struct StallProbe {
     /// longest run of identical tails on one busy pane (same error, again and
     /// again). 0 when nothing is readable or every sample moved.
     pub loop_repeats: u32,
+    /// the pane holding that run, named in the verdict
+    pub loop_pin: Option<String>,
+    /// how long the identical run has held. Three samples at a 15s poll is
+    /// ~45s — an ordinary think, not a spin.
+    pub loop_repeat_secs: u64,
+    /// how long an identical run must hold before it can page (bd-0uzrq.25)
+    pub loop_min_secs: u64,
     pub stall_secs: u64,
 }
 
@@ -430,6 +438,21 @@ pub(crate) enum StallVerdict {
 /// not trip it.
 pub(crate) const LOOP_REPEATS: u32 = 3;
 
+/// How long the identical run must hold before it is a loop. Three samples at
+/// the 15s poll is ~45s, which is an ordinary LLM think or one long tool call;
+/// the true positive this verdict exists for ran 13 minutes. Five minutes is
+/// well past a turn. `CAPTAIN_LOOP_MIN_SECS` overrides it.
+pub(crate) const LOOP_MIN_SECS: u64 = 300;
+
+/// The loop window from a raw env value: unset or unparsable keeps
+/// [`LOOP_MIN_SECS`], so a typo can never turn the alarm off.
+#[must_use]
+pub(crate) fn loop_min_secs_from_env(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(LOOP_MIN_SECS)
+}
+
 /// The stall decision. `AllComplete` wins first (nothing left to do), then an
 /// unknowable fleet (never alarm blind), then the activity facts: a held proof
 /// slot and a moving pane are work, and only a silent fleet falls through to
@@ -445,7 +468,7 @@ fn stall_verdict(p: &StallProbe) -> StallVerdict {
     if p.proof_slot_held {
         return StallVerdict::Working;
     }
-    if p.loop_repeats >= LOOP_REPEATS {
+    if p.loop_repeats >= LOOP_REPEATS && p.loop_repeat_secs >= p.loop_min_secs {
         return StallVerdict::Looping;
     }
     if p.any_pane_working {
@@ -604,19 +627,23 @@ fn cmd_captain_watch(
             }
             StallVerdict::Looping => {
                 let repeats = probe.loop_repeats;
+                let pin = probe.loop_pin.clone().unwrap_or_default();
+                let held = probe.loop_repeat_secs;
                 if json_out {
                     print_json(&json!({
                         "reason": "looping",
                         "project": project,
+                        "pin": pin,
                         "stall_secs": stall_secs,
                         "loop_repeats": repeats,
+                        "loop_repeat_secs": held,
                         "no_commit_secs": probe.last_commit_age_secs.unwrap_or(0),
                         "work_remaining": true,
                     }));
                 } else {
                     println!(
-                        "LOOPING in {project}: a busy pane produced the same tail {repeats}x \
-                         with no new output — spinning on one error, not progressing"
+                        "LOOPING in {project}: {pin} produced the same tail {repeats}x \
+                         over {held}s with no new output — spinning on one error, not progressing"
                     );
                 }
                 std::process::exit(STALL_EXIT);
@@ -692,6 +719,11 @@ pub(crate) fn stall_probe_from(
         proof_slot_held: proof_slot_held(),
         activity_age_secs: activity.activity_age_secs,
         loop_repeats: activity.loop_repeats,
+        loop_pin: activity.loop_pin,
+        loop_repeat_secs: activity.loop_repeat_secs,
+        loop_min_secs: loop_min_secs_from_env(
+            std::env::var("CAPTAIN_LOOP_MIN_SECS").ok().as_deref(),
+        ),
         stall_secs,
     }
 }
@@ -715,12 +747,16 @@ pub(crate) fn last_commit_age_secs(project_dir: &std::path::Path, now: u64) -> O
 
 /// What the watcher observed since the previous poll (bd-0uzrq.5). Data, not a
 /// decision: the verdict stays in [`stall_verdict`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ActivityFacts {
     /// seconds since the newest pane-output delta, None when no tail was read
     pub activity_age_secs: Option<u64>,
     /// longest run of identical tails on one busy pane
     pub loop_repeats: u32,
+    /// the pane holding the longest run
+    pub loop_pin: Option<String>,
+    /// how long that run has held
+    pub loop_repeat_secs: u64,
 }
 
 /// Consecutive-sample state for the stall arm. Pure: [`observe`](Self::observe)
@@ -730,6 +766,8 @@ pub(crate) struct ActivityFacts {
 pub(crate) struct ActivityWatch {
     tails: BTreeMap<String, String>,
     repeats: BTreeMap<String, u32>,
+    /// when the current identical run on a pane started
+    loop_since: BTreeMap<String, u64>,
     last_delta_secs: Option<u64>,
 }
 
@@ -755,19 +793,30 @@ impl ActivityWatch {
             } else {
                 1
             };
+            if same && repeats == 2 {
+                self.loop_since.insert(pane.clone(), now_secs);
+            } else if !same {
+                self.loop_since.remove(pane);
+            }
             self.repeats.insert(pane.clone(), repeats);
             self.tails.insert(pane.clone(), tail.clone());
         }
         if delta {
             self.last_delta_secs = Some(now_secs);
         }
+        let longest = tails
+            .keys()
+            .filter(|pane| busy.contains(*pane))
+            .max_by_key(|pane| self.repeats.get(*pane).copied().unwrap_or(0));
         ActivityFacts {
             activity_age_secs: self.last_delta_secs.map(|at| now_secs.saturating_sub(at)),
-            loop_repeats: tails
-                .keys()
-                .filter(|pane| busy.contains(*pane))
-                .filter_map(|pane| self.repeats.get(pane).copied())
-                .max()
+            loop_repeats: longest
+                .and_then(|pane| self.repeats.get(pane).copied())
+                .unwrap_or(0),
+            loop_pin: longest.cloned(),
+            loop_repeat_secs: longest
+                .and_then(|pane| self.loop_since.get(pane))
+                .map(|since| now_secs.saturating_sub(*since))
                 .unwrap_or(0),
         }
     }
@@ -1637,13 +1686,16 @@ mod tests {
             proof_slot_held: false,
             activity_age_secs: None,
             loop_repeats: 0,
+            loop_pin: None,
+            loop_repeat_secs: 0,
+            loop_min_secs: LOOP_MIN_SECS,
             stall_secs: 2_700,
         };
         assert_eq!(stall_verdict(&base), StallVerdict::AllComplete);
         assert_eq!(
             stall_verdict(&StallProbe {
                 work_remaining: true,
-                ..base
+                ..base.clone()
             }),
             StallVerdict::Stalled
         );
@@ -1651,7 +1703,7 @@ mod tests {
             stall_verdict(&StallProbe {
                 work_remaining: true,
                 any_pane_working: true,
-                ..base
+                ..base.clone()
             }),
             StallVerdict::Working
         );
@@ -1660,7 +1712,7 @@ mod tests {
                 work_remaining: true,
                 any_pane_working: false,
                 fleet_knowable: false,
-                ..base
+                ..base.clone()
             }),
             StallVerdict::Working
         );
@@ -1673,6 +1725,9 @@ mod tests {
                 proof_slot_held: false,
                 activity_age_secs: None,
                 loop_repeats: 0,
+                loop_pin: None,
+                loop_repeat_secs: 0,
+                loop_min_secs: LOOP_MIN_SECS,
                 stall_secs: 2_700,
             }),
             StallVerdict::Working
@@ -1686,6 +1741,9 @@ mod tests {
                 proof_slot_held: false,
                 activity_age_secs: None,
                 loop_repeats: 0,
+                loop_pin: None,
+                loop_repeat_secs: 0,
+                loop_min_secs: LOOP_MIN_SECS,
                 stall_secs: 2_700,
             }),
             StallVerdict::Working
@@ -1705,13 +1763,16 @@ mod tests {
             proof_slot_held: true,
             activity_age_secs: None,
             loop_repeats: 0,
+            loop_pin: None,
+            loop_repeat_secs: 0,
+            loop_min_secs: LOOP_MIN_SECS,
             stall_secs: 2_700,
         };
         assert_eq!(stall_verdict(&base), StallVerdict::Working);
         assert_eq!(
             stall_verdict(&StallProbe {
                 proof_slot_held: false,
-                ..base
+                ..base.clone()
             }),
             StallVerdict::Stalled,
             "the same silence with the slot free is the stall the clock was right about"
@@ -1730,20 +1791,23 @@ mod tests {
             proof_slot_held: false,
             activity_age_secs: Some(2_700),
             loop_repeats: 0,
+            loop_pin: None,
+            loop_repeat_secs: 0,
+            loop_min_secs: LOOP_MIN_SECS,
             stall_secs: 2_700,
         };
         assert_eq!(stall_verdict(&base), StallVerdict::Stalled);
         assert_eq!(
             stall_verdict(&StallProbe {
                 activity_age_secs: Some(60),
-                ..base
+                ..base.clone()
             }),
             StallVerdict::Working
         );
         assert_eq!(
             stall_verdict(&StallProbe {
                 fleet_knowable: false,
-                ..base
+                ..base.clone()
             }),
             StallVerdict::Working,
             "a degraded pane read is not a stall"
@@ -1762,24 +1826,82 @@ mod tests {
             proof_slot_held: false,
             activity_age_secs: Some(3_000),
             loop_repeats: LOOP_REPEATS,
+            loop_pin: Some("SlateHarbor".into()),
+            loop_repeat_secs: LOOP_MIN_SECS,
+            loop_min_secs: LOOP_MIN_SECS,
             stall_secs: 2_700,
         };
         assert_eq!(stall_verdict(&base), StallVerdict::Looping);
         assert_eq!(
+            base.loop_pin.as_deref(),
+            Some("SlateHarbor"),
+            "the verdict names the pane it accuses"
+        );
+        assert_eq!(
             stall_verdict(&StallProbe {
                 loop_repeats: LOOP_REPEATS - 1,
-                ..base
+                ..base.clone()
             }),
             StallVerdict::Working
         );
         assert_eq!(
             stall_verdict(&StallProbe {
                 proof_slot_held: true,
-                ..base
+                ..base.clone()
             }),
             StallVerdict::Working,
             "the captain's own long suite is not a loop"
         );
+    }
+
+    /// bd-0uzrq.25: three identical tails ~45s apart is a think, not a spin.
+    /// Only a run that outlives an ordinary turn may page, and it names the
+    /// pane — the 13-minute hung child still pages.
+    #[test]
+    fn a_thinking_pane_is_not_looping_until_the_run_outlives_a_turn() {
+        let base = StallProbe {
+            work_remaining: true,
+            any_pane_working: true,
+            fleet_knowable: true,
+            last_commit_age_secs: Some(60),
+            proof_slot_held: false,
+            activity_age_secs: Some(3_000),
+            loop_repeats: LOOP_REPEATS,
+            loop_pin: Some("SlateHarbor".into()),
+            loop_repeat_secs: 45,
+            loop_min_secs: LOOP_MIN_SECS,
+            stall_secs: 2_700,
+        };
+        assert_eq!(
+            stall_verdict(&base),
+            StallVerdict::Working,
+            "45s of one tail is an ordinary think"
+        );
+        assert_eq!(
+            stall_verdict(&StallProbe {
+                loop_repeat_secs: LOOP_MIN_SECS - 1,
+                ..base.clone()
+            }),
+            StallVerdict::Working,
+            "just under the window is still a think"
+        );
+        assert_eq!(
+            stall_verdict(&StallProbe {
+                loop_repeat_secs: 780,
+                ..base.clone()
+            }),
+            StallVerdict::Looping,
+            "the 13-minute hung child still pages"
+        );
+    }
+
+    /// The window is configurable but a typo can never disable the alarm.
+    #[test]
+    fn loop_min_secs_ignores_junk_and_zero() {
+        assert_eq!(loop_min_secs_from_env(None), LOOP_MIN_SECS);
+        assert_eq!(loop_min_secs_from_env(Some("nope")), LOOP_MIN_SECS);
+        assert_eq!(loop_min_secs_from_env(Some("0")), LOOP_MIN_SECS);
+        assert_eq!(loop_min_secs_from_env(Some(" 600 ")), 600);
     }
 
     /// The sampler: the first poll seeds the clock, a repeated tail ages it, a
@@ -1799,6 +1921,7 @@ mod tests {
             "the first poll seeds the clock"
         );
         assert_eq!(first.loop_repeats, 1);
+        assert_eq!(first.loop_pin.as_deref(), Some("pane-a"));
 
         let same = watch.observe(1_600, &tails, &busy);
         assert_eq!(same.activity_age_secs, Some(600), "an unchanged fleet ages");
@@ -1808,6 +1931,10 @@ mod tests {
             "three identical busy tails is a loop"
         );
         assert_eq!(looped.activity_age_secs, Some(1_200));
+        assert_eq!(
+            looped.loop_repeat_secs, 600,
+            "the run is aged from its first repeat, not from the first sighting"
+        );
 
         let mut moved = tails.clone();
         moved.insert("pane-a".to_string(), "Busy\u{1f}compiling".to_string());
