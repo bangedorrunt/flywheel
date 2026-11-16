@@ -1024,6 +1024,23 @@ pub fn unreferenced_stages(
     out
 }
 
+/// bd-jhz8x.4 (ADR-0021 D6): an unused stage fails `workflow verify`.
+/// Pure: `recent_stage_uses` is an INPUT (the CLI reads the run log; the proof
+/// has no history, and a gate whose answer depends on the operator's runs is
+/// ambient state). A stage is unused when the catalog never references it and
+/// nothing used it in the window.
+#[must_use]
+pub fn unused_stages(
+    all: &[String],
+    referenced: &std::collections::HashSet<String>,
+    recent_stage_uses: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    unreferenced_stages(all, referenced)
+        .into_iter()
+        .filter(|name| !recent_stage_uses.contains(name))
+        .collect()
+}
+
 /// Collect every `stage:` value in a workflow JSON tree (spec.stage at any
 /// depth: steps, graph nodes, loop bodies). Pure — feeds `--unused`.
 /// Templated values ride along verbatim; they never match a seed name.
@@ -2555,5 +2572,42 @@ mod wave_gate_typed_authority_tests {
                 "{name} trips the witness rule: {issues:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod unused_stage_gate_tests {
+    use super::unused_stages;
+    use std::collections::HashSet;
+
+    fn set(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// bd-jhz8x.4 (ADR-0021 D6): an unreferenced stage with no recent use is
+    /// a verify failure; a reference or a recent run-log use clears it.
+    #[test]
+    fn an_unreferenced_unused_stage_fails_and_either_use_clears_it() {
+        let all = vec![
+            "referenced".to_string(),
+            "used-now".to_string(),
+            "dead".to_string(),
+        ];
+        let referenced = set(&["referenced"]);
+        let recent = set(&["used-now"]);
+        assert_eq!(
+            unused_stages(&all, &referenced, &recent),
+            vec!["dead".to_string()],
+            "only the stage with neither reference nor recent use is unused"
+        );
+        assert!(
+            !unused_stages(&all, &referenced, &set(&["used-now", "dead"])).contains(&"dead".to_string()),
+            "a recent run-log use clears the gate"
+        );
+        assert!(
+            !unused_stages(&all, &set(&["referenced", "dead"]), &recent)
+                .contains(&"dead".to_string()),
+            "a catalog reference clears the gate"
+        );
     }
 }

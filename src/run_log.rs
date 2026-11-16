@@ -20,6 +20,10 @@ pub struct RunLogEntry {
     pub run_id: String,
     pub ts: String,
     pub workflow: String,
+    /// bd-jhz8x.4: the stage this run executed, when it ran one. Absent on
+    /// every row written before ADR-0021 D6's gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cron: Option<String>,
     pub profile: String,
@@ -233,5 +237,20 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.starts_with("hl-"), "prefixed for the runs view");
         assert_ne!(a, "");
+    }
+}
+
+#[cfg(test)]
+mod stage_field_tests {
+    /// bd-jhz8x.4: a row written before the field existed still parses.
+    #[test]
+    fn an_old_row_without_stage_still_parses() {
+        let row: super::RunLogEntry = serde_json::from_str(
+            r#"{"run_id":"r","ts":"t","workflow":"w","profile":"p","harness":"h",
+                "model":"m","mode":"pane","prompt_hash":"x","response":"","status":"success",
+                "tokens_in":0,"tokens_out":0,"duration_ms":0,"exit_code":0}"#,
+        )
+        .expect("legacy row parses");
+        assert_eq!(row.stage, None);
     }
 }

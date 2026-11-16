@@ -2179,17 +2179,45 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
         );
     }
 
-    let ok = reports.iter().all(|r| r.ok);
+    // bd-jhz8x.4 (ADR-0021 D6): an unused stage fails this gate. The 30-day
+    // set comes from the run log; a proof has none, so there a stage counts as
+    // used iff the catalog references it (the gate takes no ambient state).
+    let unused: Vec<String> = {
+        let rows = crate::stages::StageLibrary::load_layered(None)
+            .unwrap_or_default()
+            .list_tiered();
+        let mut referenced = std::collections::HashSet::new();
+        for wf in crate::builtin_workflows::builtin_workflows().values() {
+            let json = serde_json::to_value(wf).unwrap_or_default();
+            crate::stages::collect_stage_refs(&json, &mut referenced);
+        }
+        let mut recent = std::collections::HashSet::new();
+        for run in crate::run_log::read_runs() {
+            if let Some(stage) = run.stage {
+                recent.insert(stage);
+            }
+        }
+        let names: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
+        crate::stages::unused_stages(&names, &referenced, &recent)
+    };
+    let ok = reports.iter().all(|r| r.ok) && unused.is_empty();
     let body = serde_json::json!({
         "schema": "flywheel-workflow-verify.v2",
         "ok": ok,
         "scope": WORKFLOW_VERIFY_SCOPE,
+        "unused_stages": unused,
         "charts": reports,
     });
     if json_out {
         print_json(&body);
     } else {
         println!("workflow verify scope: {WORKFLOW_VERIFY_SCOPE}");
+        for stage in body["unused_stages"].as_array().into_iter().flatten() {
+            println!(
+                "workflow verify unused stage: {} — no catalog workflow references it and no run used it in 30 days",
+                stage.as_str().unwrap_or("?")
+            );
+        }
         for chart in body["charts"].as_array().into_iter().flatten() {
             println!(
                 "workflow verify {}: {}",

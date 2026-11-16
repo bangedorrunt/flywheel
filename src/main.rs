@@ -2215,6 +2215,9 @@ enum Commands {
         /// owning cron name (P10.4 run-log attribution; `cron history` reads it)
         #[arg(long)]
         cron: Option<String>,
+        /// bd-jhz8x.4: the stage this run executes (ADR-0021 D6 attribution)
+        #[arg(long)]
+        stage: Option<String>,
         /// lifecycle phase (ADR-0022 W2): rides the phase registry
         /// (`headless::phase_launch_args`); a harness without a native
         /// mechanic degrades loudly + tags the run log `phase_degraded`
@@ -4144,6 +4147,7 @@ fn main() {
             harness,
             workflow,
             cron,
+            stage,
             phase,
             effort,
             mode,
@@ -4155,6 +4159,7 @@ fn main() {
             harness.as_deref(),
             workflow.as_deref(),
             cron.as_deref(),
+            stage.as_deref(),
             phase.as_deref(),
             effort.as_deref(),
             mode.as_deref(),

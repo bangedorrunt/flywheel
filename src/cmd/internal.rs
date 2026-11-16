@@ -656,6 +656,7 @@ fn log_engine_dispatch(
         run_id: run_log::new_run_id(),
         ts: state::now_iso(),
         workflow: String::new(),
+        stage: None,
         cron: None,
         profile: profile_name.to_string(),
         harness,
@@ -1342,6 +1343,8 @@ pub(crate) fn cmd_internal_run_headless(
     harness_override: Option<&str>,
     workflow: Option<&str>,
     cron: Option<&str>,
+    /// bd-jhz8x.4: the stage this headless run executes (run-log attribution).
+    stage: Option<&str>,
     phase: Option<&str>,
     effort_override: Option<&str>,
     mode_override: Option<&str>,
@@ -1608,6 +1611,7 @@ pub(crate) fn cmd_internal_run_headless(
         run_id: run_log::new_run_id(),
         ts: state::now_iso(),
         workflow: workflow.unwrap_or("").to_string(),
+        stage: stage.map(str::to_string),
         cron: cron.map(str::to_string),
         profile: profile_name.to_string(),
         harness: harness.to_string(),
@@ -1769,6 +1773,8 @@ pub(crate) struct HeadlessLeafArgs<'a> {
     pub profile_name: &'a str,
     pub prompt: &'a str,
     pub workflow: &'a str,
+    /// bd-jhz8x.4: the stage this step executes, so the run log records it.
+    pub stage: Option<&'a str>,
     pub json: bool,
     pub harness: Option<&'a str>,
     pub phase: Option<&'a str>,
@@ -1795,6 +1801,7 @@ pub(crate) fn headless_leaf_argv(a: &HeadlessLeafArgs) -> Vec<String> {
     }
     for (flag, value) in [
         ("--harness", a.harness),
+        ("--stage", a.stage),
         ("--phase", a.phase),
         ("--effort", a.effort),
         ("--mode", a.mode),
@@ -1872,6 +1879,7 @@ mod headless_dispatch_args_tests {
             profile_name: "reviewer",
             prompt: "do it",
             workflow: "wave-swarm",
+            stage: None,
             json: true,
             harness: None,
             phase: fields.leaf_phase.as_ref().map(|(v, _)| v.as_str()),
@@ -1922,6 +1930,7 @@ mod headless_dispatch_args_tests {
             profile_name: "coder",
             prompt: "do it",
             workflow: "wave-swarm",
+            stage: None,
             json: true,
             harness: None,
             phase: fields.leaf_phase.as_ref().map(|(v, _)| v.as_str()),
@@ -1954,6 +1963,7 @@ mod headless_dispatch_args_tests {
             profile_name: "coder",
             prompt: "do it",
             workflow: "wave-swarm",
+            stage: None,
             json: true,
             harness: None,
             phase: fields.leaf_phase.as_ref().map(|(v, _)| v.as_str()),
@@ -2046,6 +2056,7 @@ pub(crate) fn headless_dispatch(
         profile_name,
         prompt: &prompt,
         workflow: wf_name,
+        stage: stage_name,
         json: true,
         harness: (!harness.is_empty()).then_some(harness),
         phase: fields.leaf_phase.as_ref().map(|(v, _)| v.as_str()),
@@ -5332,5 +5343,40 @@ graph:
         assert_eq!(res.exit, 0);
         assert!(res.stdout_path.is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod headless_stage_argv_tests {
+    use super::{HeadlessLeafArgs, headless_leaf_argv};
+
+    fn args(stage: Option<&str>) -> HeadlessLeafArgs<'_> {
+        HeadlessLeafArgs {
+            profile_name: "p",
+            prompt: "x",
+            workflow: "w",
+            stage,
+            json: true,
+            harness: None,
+            phase: None,
+            effort: None,
+            mode: None,
+            cron: None,
+            model: None,
+        }
+    }
+
+    /// bd-jhz8x.4: the leaf records the stage it executes, and a step with no
+    /// stage changes no bytes.
+    #[test]
+    fn headless_leaf_argv_emits_stage_iff_the_step_names_one() {
+        let unnamed = headless_leaf_argv(&args(None));
+        assert!(
+            !unnamed.iter().any(|a| a == "--stage"),
+            "no stage, no flag: {unnamed:?}"
+        );
+        let named = headless_leaf_argv(&args(Some("ce-execute")));
+        let at = named.iter().position(|a| a == "--stage").expect("--stage");
+        assert_eq!(named.get(at + 1).map(String::as_str), Some("ce-execute"));
     }
 }
