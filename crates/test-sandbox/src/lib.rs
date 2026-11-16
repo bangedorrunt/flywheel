@@ -151,6 +151,12 @@ impl TestSandbox {
     }
 }
 
+impl Default for TestSandbox {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Drop for TestSandbox {
     fn drop(&mut self) {
         let log = self.shim_log();
