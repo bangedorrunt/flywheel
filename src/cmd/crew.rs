@@ -916,7 +916,7 @@ fn cmd_crew_done(
         now_us: now_us(),
     });
     save_briefs(project, &book)?;
-    let pin = r#as
+    let reporter = r#as
         .map(str::to_string)
         .unwrap_or_else(|| brief.to_string());
     let mut wake = "replay: the brief was already closed; nothing rang".to_string();
@@ -941,7 +941,8 @@ fn cmd_crew_done(
             json!({
                 "op": "crew-done",
                 "brief": id,
-                "from": pin,
+                "pin": pin,
+                "from": reporter,
                 "receipt": receipt,
                 "wake": line,
             }),
