@@ -23,6 +23,12 @@
 //! `/bin/true`, which exits at once, proving the spawn path without
 //! running a host.
 
+// bd-jp9z1.4: declared here because this is the first module that needs it;
+// the operator-shared dispatch file (main.rs) should not be touched for it.
+#[cfg(test)]
+#[path = "test_sandbox.rs"]
+pub(crate) mod test_sandbox;
+
 use std::path::{Path, PathBuf};
 
 /// Label prefix of the retired duplicate units (kept: cleanup scans for it).
@@ -364,53 +370,6 @@ mod tests {
         assert_eq!(slug("a/b c"), "a-b-c");
     }
 
-    /// Temp root with deny-shim `launchctl` + `systemctl` first on PATH
-    /// (log argv, exit 1 — never the operator's supervisor). Returns
-    /// (root, previous PATH). Callers restore PATH and remove the root.
-    fn shimmed_path(tag: &str) -> (PathBuf, Option<std::ffi::OsString>) {
-        let root = std::env::temp_dir().join(format!("fw-sup-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let shim = root.join("bin");
-        std::fs::create_dir_all(&shim).unwrap();
-        let log = root.join("shim.log");
-        for b in ["launchctl", "systemctl"] {
-            std::fs::write(
-                shim.join(b),
-                format!("#!/bin/sh\necho \"$@\" >> {}\nexit 1\n", log.display()),
-            )
-            .unwrap();
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for b in ["launchctl", "systemctl"] {
-                let p = shim.join(b);
-                let mut perms = std::fs::metadata(&p).unwrap().permissions();
-                perms.set_mode(0o755);
-                std::fs::set_permissions(&p, perms).unwrap();
-            }
-        }
-        let prev_path = std::env::var_os("PATH");
-        unsafe {
-            std::env::set_var(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    shim.display(),
-                    prev_path.clone().unwrap_or_default().into_string().unwrap()
-                ),
-            );
-        }
-        (root, prev_path)
-    }
-
-    fn restore_path_and_clean(root: PathBuf, prev_path: Option<std::ffi::OsString>) {
-        if let Some(p) = prev_path {
-            unsafe { std::env::set_var("PATH", p) };
-        }
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     /// bd-supervisor-collab-rering-87gzr: ONE owner. Ensuring armed hosts
     /// retires the duplicate launchd unit and owns the workspace through
     /// the cron-healed detached child — no unit is ever (re)installed.
@@ -420,13 +379,14 @@ mod tests {
     #[test]
     fn single_owner_ensures_children_and_installs_no_units() {
         let _g = crate::config::lock_env();
-        let (root, prev_path) = shimmed_path("owner");
-        let home = root.join("home");
+        let sandbox = super::test_sandbox::TestSandbox::new();
+        let _scope = sandbox.scope();
+        let home = sandbox.root().join("home");
         // A leftover duplicate unit from the retired second owner.
         let dup = unit_path(&home, "ws1");
         std::fs::create_dir_all(dup.parent().unwrap()).unwrap();
         std::fs::write(&dup, "stale duplicate unit").unwrap();
-        let state = root.join("state");
+        let state = sandbox.root().join("state");
         std::fs::create_dir_all(state.join("doorbell")).unwrap();
         let prev_no_ensure = std::env::var_os("FLYWHEEL_NO_DOORBELL_ENSURE");
         unsafe {
@@ -456,7 +416,6 @@ mod tests {
             crate::doorbell::state_file(&state, "ws1").is_file(),
             "the workspace is owned through the unified state record"
         );
-        restore_path_and_clean(root, prev_path);
     }
 
     /// Unload retires leftover units AND stops detached children (the
@@ -465,12 +424,13 @@ mod tests {
     #[test]
     fn unload_retires_units_and_stops_children() {
         let _g = crate::config::lock_env();
-        let (root, prev_path) = shimmed_path("unload");
-        let home = root.join("home");
+        let sandbox = super::test_sandbox::TestSandbox::new();
+        let _scope = sandbox.scope();
+        let home = sandbox.root().join("home");
         let dup = unit_path(&home, "ws9");
         std::fs::create_dir_all(dup.parent().unwrap()).unwrap();
         std::fs::write(&dup, "stale duplicate unit").unwrap();
-        let state = root.join("state");
+        let state = sandbox.root().join("state");
         std::fs::create_dir_all(state.join("doorbell")).unwrap();
         std::fs::write(crate::doorbell::pid_file(&state, "ws9"), "999998\n").unwrap();
         std::fs::write(crate::doorbell::gen_file(&state, "ws9"), "{}\n").unwrap();
@@ -488,7 +448,6 @@ mod tests {
             done.iter().any(|l| l.contains("ws9")),
             "transcript names the child: {done:?}"
         );
-        restore_path_and_clean(root, prev_path);
     }
 
     /// bd-cf5kb sandbox e2e: a captain block bound by arrive in session B is
@@ -508,29 +467,10 @@ mod tests {
         // A rex CLI must resolve so the fake two-session backend is the
         // selected plane; the host refuses a rex-row workspace on hc.
         let _rex = crate::backend::rex_test_guard::RexBinGuard::install("#!/bin/sh\nexit 0\n");
-        let root = std::env::temp_dir().join(format!("fw-captain-wake-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let sandbox = super::test_sandbox::TestSandbox::new();
+        let _scope = sandbox.scope();
+        let root = sandbox.root().to_path_buf();
         let state = root.join("state");
-        let data = root.join("data");
-        let shim = root.join("bin");
-        std::fs::create_dir_all(&state).unwrap();
-        std::fs::create_dir_all(&data).unwrap();
-        std::fs::create_dir_all(&shim).unwrap();
-        let shim_log = root.join("shim.log");
-        for name in ["launchctl", "systemctl"] {
-            let path = shim.join(name);
-            std::fs::write(
-                &path,
-                format!(
-                    "#!/bin/sh\necho \"$0 $*\" >> '{}'\nexit 1\n",
-                    shim_log.display()
-                ),
-            )
-            .unwrap();
-            let mut perms = std::fs::metadata(&path).unwrap().permissions();
-            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-            std::fs::set_permissions(&path, perms).unwrap();
-        }
         // Fake two-session plane roster: the captain block lives in session B
         // while the host/dispatcher owns session A (label flywheel-flywheel).
         let plane = root.join("plane");
@@ -550,19 +490,9 @@ JSON
         }
         let plane_bin = plane.display().to_string();
 
-        let prev_path = std::env::var_os("PATH");
         let prev_backend = std::env::var_os("FLYWHEEL_BACKEND");
-        let prev_mcp_url = std::env::var_os("TORON_MCP_URL");
-        let prev_data_dir = std::env::var_os("TORON_MCP_DATA_DIR");
-        let prev_xdg = std::env::var_os("XDG_STATE_HOME");
-        let mut new_path = std::ffi::OsString::from(format!("{}:", shim.display()));
-        new_path.push(prev_path.clone().unwrap_or_default());
         unsafe {
-            std::env::set_var("PATH", new_path);
             std::env::set_var("FLYWHEEL_BACKEND", "rex");
-            std::env::remove_var("TORON_MCP_URL");
-            std::env::set_var("TORON_MCP_DATA_DIR", &data);
-            std::env::set_var("XDG_STATE_HOME", &state);
         }
 
         let project = "sandbox-proj";
@@ -665,33 +595,17 @@ JSON
         );
 
         assert!(
-            !shim_log.exists() || std::fs::read_to_string(&shim_log).unwrap().is_empty(),
-            "no supervisor tool was shelled"
+            sandbox.shim_log().is_empty(),
+            "no supervisor tool was shelled: {}",
+            sandbox.shim_log()
         );
 
         unsafe {
-            match prev_path {
-                Some(v) => std::env::set_var("PATH", v),
-                None => std::env::remove_var("PATH"),
-            }
             match prev_backend {
                 Some(v) => std::env::set_var("FLYWHEEL_BACKEND", v),
                 None => std::env::remove_var("FLYWHEEL_BACKEND"),
             }
-            match prev_mcp_url {
-                Some(v) => std::env::set_var("TORON_MCP_URL", v),
-                None => std::env::remove_var("TORON_MCP_URL"),
-            }
-            match prev_data_dir {
-                Some(v) => std::env::set_var("TORON_MCP_DATA_DIR", v),
-                None => std::env::remove_var("TORON_MCP_DATA_DIR"),
-            }
-            match prev_xdg {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
-            }
         }
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Sandbox host loop (wave11-b acceptance core): temp HOME/XDG, sandbox
