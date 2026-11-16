@@ -334,15 +334,16 @@ pub(crate) fn cmd_swarm_apply(
     patched_desired(&rows, patches, counts)?;
     // ADR-0022 D1: the RECORD is the source of the seats apply reconciles — a
     // seat the fold still plans but the fleet lacks is a planned spawn, not a
-    // seat that quietly stopped existing.
-    for spec in patches.iter() {
-        crate::state::append_plan_event(project, &format!("patch:{spec}"))?;
-    }
-    for spec in counts.iter() {
-        crate::state::append_plan_event(project, &format!("count:{spec}"))?;
-    }
-    let record = crate::state::load_plan(project).unwrap_or(record);
-    let desired = fold_plan(&record)?;
+    // seat that quietly stopped existing. The pending events are folded in
+    // MEMORY: nothing reaches the record until every gate has passed.
+    let mut pending = record.clone();
+    pending
+        .patches
+        .extend(patches.iter().map(|spec| format!("patch:{spec}")));
+    pending
+        .patches
+        .extend(counts.iter().map(|spec| format!("count:{spec}")));
+    let desired = fold_plan(&pending)?;
     let live: Vec<LiveSeat> = rows
         .iter()
         .map(|r| LiveSeat {
@@ -390,6 +391,15 @@ pub(crate) fn cmd_swarm_apply(
             spawns.len(),
             spawns.join(", ")
         );
+    }
+    // bd-6setu.15 M2: with execution switched off nothing runs, so the plan must
+    // not advance either — the record would otherwise claim seats no effect
+    // touched.
+    let exec_off = std::env::var("FLYWHEEL_ALLOW_EXEC").ok().as_deref() == Some("0");
+    if !exec_off {
+        // bd-6setu.15 H1/L2: only now, after every gate, do the events land —
+        // and as one write, right before the effects they describe.
+        crate::state::append_plan_events(project, &pending.patches[record.patches.len()..])?;
     }
     let mut journal = crate::supervisor_host::ToronEffectJournal::open(
         &format!("plan:{}", record.id),
@@ -2000,5 +2010,72 @@ mod planned_spawn_tests {
             !spawns.is_empty(),
             "the lost seat is planned, not forgotten: {effects:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod apply_gate_tests {
+    use super::cmd_swarm_apply;
+
+    fn seeded(project: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("fw-apply-gate-{}-{}", project, std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _ = crate::state::set_registry_root_override(root.clone());
+        crate::state::save_spawn_registry(
+            project,
+            &[crate::state::SpawnEntry::profiled(
+                "wA:p1",
+                "PinOne",
+                "coder",
+                "pi",
+                Some("PinOne".to_string()),
+            )],
+        )
+        .expect("seed registry");
+        crate::state::save_plan(
+            project,
+            &crate::state::PlanRecord {
+                id: "plan-gate".to_string(),
+                plan: crate::swarm_plan::Plan::new("swarm"),
+                base: Some(serde_json::json!([{
+                    "pin": "PinOne",
+                    "name": "PinOne",
+                    "role": "coder",
+                    "harness": "pi",
+                    "model": null,
+                    "effort": null,
+                    "mode": null,
+                    "pane_id": "wA:p1",
+                    "status": "idle"
+                }])),
+                patches: Vec::new(),
+            },
+        )
+        .expect("seed plan");
+        root
+    }
+
+    /// bd-6setu.15 H1/M2: a refused or suppressed apply must not advance the
+    /// plan record. The file is the witness: byte-identical across the attempt.
+    #[test]
+    fn a_refused_apply_leaves_the_plan_file_byte_identical() {
+        let _g = crate::config::lock_env();
+        let project = "applygate";
+        let root = seeded(project);
+        let path = crate::state::plan_file(project);
+        let before = std::fs::read(&path).expect("plan file exists");
+
+        let cfg = crate::config::Config::default();
+        let counts = vec!["coder=+1".to_string()];
+        let err = cmd_swarm_apply(&cfg, project, &[], &counts, false, false)
+            .expect_err("a planned spawn without --yes must refuse");
+        assert!(
+            err.to_string().contains("--yes"),
+            "the refusal names the flag: {err}"
+        );
+        let after = std::fs::read(&path).expect("plan file still exists");
+        assert_eq!(before, after, "a refused apply wrote to the plan of record");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

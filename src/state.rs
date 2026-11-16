@@ -428,15 +428,23 @@ pub fn ensure_plan(project: &str, base: serde_json::Value) -> anyhow::Result<Pla
     Ok(record)
 }
 
-/// Append one plan event and persist it. Called BEFORE the seat effect, so the
-/// journal leads the world: a crash mid-apply leaves an event whose effect a
-/// replay can settle, never an effect nobody can name.
-pub fn append_plan_event(project: &str, event: &str) -> anyhow::Result<PlanRecord> {
+/// Append a batch of plan events in ONE write (a multi-patch apply is one
+/// advance, not N), and persist it. Called right before the seat effects run,
+/// after every gate — a refused or suppressed apply leaves the record untouched.
+pub fn append_plan_events(project: &str, events: &[String]) -> anyhow::Result<PlanRecord> {
     let mut record = load_plan(project)
-        .ok_or_else(|| anyhow::anyhow!("append plan event: no plan record for {project}"))?;
-    record.patches.push(event.to_string());
+        .ok_or_else(|| anyhow::anyhow!("append plan events: no plan record for {project}"))?;
+    if events.is_empty() {
+        return Ok(record);
+    }
+    record.patches.extend(events.iter().cloned());
     save_plan(project, &record)?;
     Ok(record)
+}
+
+/// Append one plan event and persist it.
+pub fn append_plan_event(project: &str, event: &str) -> anyhow::Result<PlanRecord> {
+    append_plan_events(project, &[event.to_string()])
 }
 
 /// One spawn-registry record: (pane_id, agent name, optional crew profile).
