@@ -272,6 +272,20 @@ tests = [
 mutations = ["scripts/mutations/clean-proof-slot.spec.sh#S1", "scripts/mutations/clean-proof-slot.spec.sh#S2"]
 
 [[behavior]]
+id = "cron.workflow-durable-open"
+owner = "src/builtin_workflows.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/builtin_workflows.rs::every_scheduled_catalog_workflow_opens_on_the_durable_models",
+  "src/builtin_workflows.rs::weekly_review_is_scout_fanout_to_oracle",
+  "src/builtin_workflows.rs::a_graph_parallel_node_is_refused_by_the_durable_models",
+]
+mutations = [
+  "scripts/mutations/cron-workflow-durable.spec.sh#G1",
+]
+
+[[behavior]]
 id = "crew.brief-done-reply"
 owner = "src/crew_briefs.rs"
 status = "proven"

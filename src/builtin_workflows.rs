@@ -625,32 +625,27 @@ policy:
   no_claim_timeout: 600
 inputs:
   - name: goal
-graph:
-  nodes:
-    scout-fanout:
-      action: parallel
-      over: "3"
-      each:
-        action: dispatch_job
-        assignee: x
-        spec:
-          profile: "@scout"
-          task: "Scout the toron + flywheel repos: (1) internal gaps — code health, deferred design items still open, open seams, test gaps; (2) upstream parity — the docs/upstream-parity.toml pins (compound-engineering, pstack) plus block/buzz patterns not yet ported. Return COMPRESSED findings JSON: [{area, finding, evidence, ev}]. No academic literature."
-    oracle:
+# bd-gtw4i: authored as STEPS, not a `graph:`. The durable runner lowers a steps
+# fan-out into copies (scout-fanout:0..2) with the join's needs; it refuses a
+# GRAPH parallel node whose needs do not name its copies, and a graph node's
+# needs must also be declared nodes — so a graph fan-out cannot satisfy both
+# and this workflow never opened. Same semantics, the form the runner supports.
+steps:
+  - name: scout-fanout
+    action: parallel
+    over: "3"
+    each:
       action: dispatch_job
       assignee: x
       spec:
-        profile: "@oracle"
-        task: "Synthesize the scout findings: {{steps.scout-fanout}}. Rank by EV + project-fit. Pick the SINGLE best improvement idea (feature / design pattern / bug fix). Output JSON: {\"idea\": {\"title\": ..., \"what\": ..., \"why\": ..., \"ev\": ..., \"blast_radius\": ..., \"acceptance\": ...}} — or {\"idea\": null} if nothing worth proposing (honest, not forced)."
-    # reflect edge (wave 6, OFF by default — bd-w6-reflect-8gp5): uncomment
-    # to append the reflect playbook to the weekly review so repeated
-    # corrections become structure (a hook bead, never an AGENTS.md paragraph).
-    #   reflect:
-    #     action: call_workflow
-    #     workflow: reflect
-    #     inputs: { project: "{{trigger.project}}", run_id: "{{trigger.id}}" }
-    #     needs: [oracle]
-      needs: [scout-fanout]
+        profile: "@scout"
+        task: "Scout the toron + flywheel repos: (1) internal gaps — code health, deferred design items still open, open seams, test gaps; (2) upstream parity — the docs/upstream-parity.toml pins (compound-engineering, pstack) plus block/buzz patterns not yet ported. Return COMPRESSED findings JSON: [{area, finding, evidence, ev}]. No academic literature."
+  - name: oracle
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@oracle"
+      task: "Synthesize the scout findings: {{steps.scout-fanout}}. Rank by EV + project-fit. Pick the SINGLE best improvement idea (feature / design pattern / bug fix). Output JSON: {\"idea\": {\"title\": ..., \"what\": ..., \"why\": ..., \"ev\": ..., \"blast_radius\": ..., \"acceptance\": ...}} — or {\"idea\": null} if nothing worth proposing (honest, not forced)."
 "#,
     ),
     (
@@ -2699,8 +2694,10 @@ mod tests {
         );
     }
 
-    /// bd-m7ac: weekly-review is a schedule-triggered graph — parallel
-    /// scouts (3 elastic copies) feeding an oracle node that needs them.
+    /// bd-m7ac/bd-gtw4i: weekly-review is a schedule-triggered STEPS fan-out —
+    /// 3 elastic scouts feeding the oracle that consumes them. Steps, not a
+    /// graph: the durable runner lowers a steps fan-out into copies and refuses
+    /// a graph parallel node (see the guard test below).
     #[test]
     fn weekly_review_is_scout_fanout_to_oracle() {
         use toron_workflow::schema::{Action, Trigger};
@@ -2714,12 +2711,17 @@ mod tests {
             }
             other => panic!("weekly-review must be schedule-triggered: {other:?}"),
         }
-        let g = wr.graph.as_ref().expect("graph present");
-        let fanout = &g.nodes["scout-fanout"];
+        assert!(
+            wr.graph.is_none(),
+            "a graph fan-out is the shape the durable runner refuses (bd-gtw4i)"
+        );
+        let [fanout, oracle] = wr.steps.as_slice() else {
+            panic!("two steps: scouts then oracle");
+        };
+        assert_eq!(fanout.name.as_deref(), Some("scout-fanout"));
         assert!(matches!(fanout.action, Action::Parallel { .. }));
-        let oracle = &g.nodes["oracle"];
+        assert_eq!(oracle.name.as_deref(), Some("oracle"));
         assert!(matches!(oracle.action, Action::DispatchJob { .. }));
-        assert!(oracle.needs.contains(&"scout-fanout".to_string()));
         let Action::DispatchJob { spec, .. } = &oracle.action else {
             unreachable!()
         };
@@ -2729,6 +2731,73 @@ mod tests {
             "oracle consumes scout findings"
         );
         assert!(task.contains("idea"), "oracle outputs the idea contract");
+    }
+
+    /// bd-gtw4i: a cron can never ship a workflow its runner REFUSES. Every
+    /// schedule-triggered catalog workflow must open on the durable models —
+    /// the check the weekly-review failure slipped past for a whole week.
+    #[test]
+    fn every_scheduled_catalog_workflow_opens_on_the_durable_models() {
+        use toron_workflow::schema::{CronScope, Trigger};
+        let mut scheduled = 0;
+        for (name, wf) in builtin_workflows() {
+            let Some(Trigger::Schedule { scope, .. }) = &wf.trigger else {
+                continue;
+            };
+            // Project-scoped schedules are the ones a project cron fires.
+            if !matches!(scope, CronScope::Project | CronScope::Host) {
+                continue;
+            }
+            scheduled += 1;
+            if let Some(reason) = toron_workflow::engine::durable::unsupported_reason(&wf) {
+                panic!(
+                    "cron workflow {name} cannot open on the durable models: {reason} \
+                     — a cron must not ship a workflow its runner refuses"
+                );
+            }
+        }
+        assert!(
+            scheduled >= 2,
+            "expected the scheduled catalog, found {scheduled}"
+        );
+    }
+
+    /// bd-gtw4i: the diagnosis, pinned. A GRAPH parallel node is the shape the
+    /// durable runner refuses — its join must name copies that the graph
+    /// validator also requires to be declared nodes, so no author can satisfy
+    /// both. weekly-review therefore lives in steps form, and this pins the
+    /// refusal that told us so.
+    #[test]
+    fn a_graph_parallel_node_is_refused_by_the_durable_models() {
+        let yaml = r#"
+name: graph-fanout
+trigger:
+  type: schedule
+  cron: "0 4 * * 0"
+graph:
+  nodes:
+    scout-fanout:
+      action: parallel
+      over: "3"
+      each:
+        action: dispatch_job
+        assignee: x
+        spec:
+          task: "scout"
+    oracle:
+      action: dispatch_job
+      assignee: x
+      spec:
+        task: "{{steps.scout-fanout}}"
+      needs: [scout-fanout]
+"#;
+        let wf = toron_workflow::schema::parse_workflow(yaml).expect("parses");
+        let reason = toron_workflow::engine::durable::unsupported_reason(&wf)
+            .expect("a graph fan-out cannot open on the durable models");
+        assert!(
+            reason.contains("parallel join with no copies"),
+            "the refusal names the fan-out: {reason}"
+        );
     }
 
     /// bd-m5afp: the full mutation proof runs nightly through flywheel cron, so
