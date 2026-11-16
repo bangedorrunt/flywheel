@@ -772,6 +772,10 @@ enum Commands {
         /// bounces). Repeatable/comma-separated.
         #[arg(long = "join-channel", value_delimiter = ',')]
         join_channels: Vec<String>,
+        /// bd-koafr: boot assignment per pin (--assign SlateHarbor=bd-a,bd-b).
+        /// The pane gets the boot prime, then one crew-prompt brief per pin.
+        #[arg(long = "assign", value_name = "PIN=BEAD[,BEAD]")]
+        assign: Vec<String>,
         #[arg(long)]
         label: Option<String>,
         /// do not focus the new workspace
@@ -896,6 +900,9 @@ enum Commands {
         /// exactly like `spawn --join-channel`.
         #[arg(long = "join-channel", value_delimiter = ',')]
         join_channels: Vec<String>,
+        /// bd-koafr: boot assignment per pin (--assign SlateHarbor=bd-a,bd-b).
+        #[arg(long = "assign", value_name = "PIN=BEAD[,BEAD]")]
+        assign: Vec<String>,
     },
     /// List flywheel swarms and their agents
     List {
@@ -3054,7 +3061,7 @@ fn main() {
             "commands": [
                 "init spawn add list status decide rebind recover",
                 "ship check <bead> [--json] | ship land <bead> --sha <40hex> --receipt <file> [--project <p>] [--as <pin>] [--message <m>] (one verb: gate -> close -> sync -> release -> commit THIS bead's tracker rows -> check; idempotent, prints the resume command on failure; another lane's dirty tracker row never blocks)",
-                "spawn <project> [--kind K=N ...] [--dry-run --json] [--patch <seat>.<field>=<value> (repeatable; re-resolves the seat with from: user)] [--model harness-default leaves the harness's own model untouched] [--yes] (ADR-0022 plan spawn; see --help for the full flag list)",
+                "spawn <project> [--kind K=N ...] [--assign PIN=BEAD[,BEAD] ...] [--dry-run --json] [--patch <seat>.<field>=<value> (repeatable; re-resolves the seat with from: user)] [--model harness-default leaves the harness's own model untouched] [--yes] (ADR-0022 plan spawn; see --help for the full flag list)",
                 "retire <pin>... [--project <p>] [--force-working] [--as <pin>] [--json] (bd-rilvn: the thin per-pin stop verb over the seat path — ONE journaled SeatEffect::Retire through Ports::seat closes that pane, the pin's leases are released operator-signed by HOLDER (a sibling on the same bead keeps its lease), then the roster row is deregistered; refuses the captain/operator seat by role and a working pin without --force-working)",
             "swarm plan <project> [spawn flags] | swarm apply <project> [--patch <seat>.<field>=<value>] [--count <role>=<n>] [--json] | swarm status [<project>] [--json] (ADR-0022 rollout 6 + D7 remainder: plan prints the SAME flywheel-plan.v1 object as `spawn --dry-run --json`; apply is the one mechanism — patch/count -> pure reconciler -> the one `Ports::seat` interpreter, journal-first; fields harness|model|effort|mode|role (role only on apply; spawn rejects it); `--count role=+1` grows the fleet within crew.max; Spawn/InjectRole run live (InjectRole never for review/verify seats); `binding-rebind --model` routes here; status lists live seats with the plane's status)",
             "send interrupt view output watch attach kill",
@@ -3139,6 +3146,7 @@ fn main() {
     let result = match &cli.command {
         Some(Commands::Init { project }) => cmd_init(&cfg, project),
         Some(Commands::Spawn {
+            assign,
             project,
             counts,
             recipe,
@@ -3183,6 +3191,7 @@ fn main() {
                 peer_max_prompts: *peer_max_prompts,
                 settle_secs: *settle_secs,
                 join_channels: join_channels.clone(),
+                assign: assign.clone(),
                 profile_name: profile.clone(),
                 profile_count: *count,
                 bare_model: model.clone().unwrap_or_default(),
@@ -3204,6 +3213,7 @@ fn main() {
             settle_secs,
             request_key,
             join_channels,
+            assign,
         }) => cmd_add(
             &cfg,
             project,
@@ -3212,6 +3222,7 @@ fn main() {
             *settle_secs,
             request_key.as_deref(),
             join_channels,
+            assign,
         ),
         Some(Commands::List { all }) => cmd_list(&cfg, *all),
         Some(Commands::Status { project }) => cmd_status(&cfg, project.as_deref()),
@@ -7044,6 +7055,8 @@ struct SpawnOpts {
     /// bd-kbl1c join-before-post: steer channels every spawned agent joins
     /// at pane creation (membership is the only gate).
     join_channels: Vec<String>,
+    /// bd-koafr: boot assignment per pin from --assign.
+    assign: Vec<String>,
     label_override: Option<String>,
     no_focus: bool,
     no_verify: bool,
@@ -7085,6 +7098,7 @@ impl Default for SpawnOpts {
             recipe: None,
             kinds: Vec::new(),
             join_channels: Vec::new(),
+            assign: Vec::new(),
             label_override: None,
             no_focus: false,
             no_verify: false,

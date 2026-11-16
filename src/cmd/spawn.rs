@@ -301,8 +301,11 @@ pub(crate) fn cmd_add(
     settle_secs: u64,
     request_key: Option<&str>,
     join_channels: &[String],
+    assign: &[String],
 ) -> Result<()> {
     crate::check_project_spelling(project, "add")?;
+    let assign = super::spawn::parse_assign(assign)?;
+    let _ = &assign;
     // A mutating door must not pave over a corrupt fleet: refuse first.
     state::load_spawn_registry_strict(project).map_err(|e| anyhow!("{e}"))?;
     // One plane resolution for the whole door, with spawn's guard: a typo'd
@@ -1407,6 +1410,7 @@ fn bare_with_provider(
 
 pub(crate) fn cmd_spawn(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
     check_project_spelling(project, "spawn")?;
+    let assign = super::spawn::parse_assign(&opts.assign)?;
     // A mutating door must not pave over a corrupt fleet: refuse first.
     state::load_spawn_registry_strict(project).map_err(|e| anyhow!("{e}"))?;
     let dir = project_dir(cfg, project);
@@ -1508,12 +1512,14 @@ projects available: {}",
             .map_err(|e| anyhow::anyhow!("bad --patch {spec:?}: {e}"))?;
     }
     if opts.dry_run {
+        // bd-koafr: the assignment rides the envelope, never the seat plan.
+        let doc = dry_run_doc(&plan, &assign);
         if opts.json {
-            print_json(&serde_json::to_value(&plan)?);
+            print_json(&doc);
         } else {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&plan).unwrap_or_else(|_| "{}".into())
+                serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into())
             );
         }
         return Ok(());
@@ -6404,6 +6410,7 @@ mod plane_gate_tests {
             0,
             None,
             &[],
+            &[],
         );
         unsafe {
             match &prev {
@@ -8543,5 +8550,44 @@ mod assign_tests {
         ] {
             assert!(parse_assign(&bad).is_err(), "must refuse {bad:?}");
         }
+    }
+}
+
+/// bd-koafr: the `--dry-run --json` document. The assignment is a post-launch
+/// action (it launches no seat), so it rides the envelope and the seat plan
+/// stays byte-equal with `swarm plan`.
+pub(crate) fn dry_run_doc(
+    plan: &crate::swarm_plan::Plan,
+    assign: &std::collections::BTreeMap<String, String>,
+) -> serde_json::Value {
+    if assign.is_empty() {
+        serde_json::to_value(plan).unwrap_or(serde_json::Value::Null)
+    } else {
+        serde_json::json!({ "plan": plan, "assign": assign })
+    }
+}
+
+#[cfg(test)]
+mod dry_run_doc_tests {
+    use super::dry_run_doc;
+
+    #[test]
+    fn the_assignment_rides_the_envelope_not_the_seat_plan() {
+        let plan = crate::swarm_plan::Plan::new("swarm");
+        let empty = dry_run_doc(&plan, &std::collections::BTreeMap::new());
+        assert!(
+            empty.get("assign").is_none(),
+            "no assignment, plan-only doc"
+        );
+        assert_eq!(empty, serde_json::to_value(&plan).unwrap());
+        let mut assign = std::collections::BTreeMap::new();
+        assign.insert("SlateHarbor".to_string(), "bd-a,bd-b".to_string());
+        let doc = dry_run_doc(&plan, &assign);
+        assert_eq!(doc["assign"]["SlateHarbor"], "bd-a,bd-b");
+        assert_eq!(
+            doc["plan"],
+            serde_json::to_value(&plan).unwrap(),
+            "the seat plan is unchanged by an assignment"
+        );
     }
 }
