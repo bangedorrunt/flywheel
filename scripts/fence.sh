@@ -72,9 +72,18 @@ cd "$DEST"
 step() { printf 'fence: %s\n' "$1"; }
 step "needles"
 bash scripts/verify-needles.sh
-step "build (-D warnings, all targets)"
-# shellcheck disable=SC2086
-RUSTFLAGS=-Dwarnings $CARGO build --workspace --all-targets
+if [ "$INDEX" = 1 ]; then
+    # bd-4z7mb: the commit gate wants name resolution, not codegen. `check` is
+    # the same caller/callee detector the split commits needed, at a fraction of
+    # the wall time, so a hook stays usable.
+    step "check (-D warnings, all targets)"
+    # shellcheck disable=SC2086
+    RUSTFLAGS=-Dwarnings $CARGO check --workspace --all-targets
+else
+    step "build (-D warnings, all targets)"
+    # shellcheck disable=SC2086
+    RUSTFLAGS=-Dwarnings $CARGO build --workspace --all-targets
+fi
 if [ "$INDEX" = 1 ]; then
     # bd-4z7mb: the commit-time gate is the fast prefix, and its fmt leg reads
     # the STAGED content (the export), not the files still dirty in the tree.
