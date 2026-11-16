@@ -6,6 +6,7 @@ CARGO_ARGS=(--bin flywheel)
 TEST_FILTER=(
     an_assigned_boot_names_the_bead_and_skips_triage
     an_unassigned_boot_waits_instead_of_triaging
+    one_brief_per_assigned_pin_naming_its_beads
 )
 
 mutation "B1  an unassigned crew is sent to triage" \
@@ -23,8 +24,5 @@ mutation "B2  an assigned crew is sent to triage anyway" \
 mutation "B3  the assignment plan is dropped" \
     file=src/cmd/spawn.rs \
     expect=one_brief_per_assigned_pin_naming_its_beads \
-    find='    assign
-        .iter()
-        .map(|(pin, beads)| {' \
-    replace='    let _ = assign;
-    Vec::new().into_iter().map(|(pin, beads): (String, String)| {'
+    find=$'        .iter()\n        .map(|(pin, beads)| {' \
+    replace=$'        .iter()\n        .filter(|_| false)\n        .map(|(pin, beads)| {'
