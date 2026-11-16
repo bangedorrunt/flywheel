@@ -1766,3 +1766,68 @@ mod bd_7wah_tests {
         assert_eq!(out.response, "hello from a plain-text harness");
     }
 }
+
+#[cfg(test)]
+mod v4_headless_property {
+    use super::{build_argv_roles_phase, phase_launch_args};
+
+    /// ADR-0022 V4 extension (bd-6setu.14): for every harness the registry
+    /// names, the headless leaf's argv carries exactly the phase args the
+    /// adapter registry says it can, and reports the same degradation. A harness
+    /// with no headless runner refuses rather than silently dropping the field.
+    #[test]
+    fn headless_step_fields_match_the_leaf_argv() {
+        let mut emitting = 0;
+        let mut refusing = 0;
+        for spec in crate::harness_registry::REGISTRY {
+            let h = spec.canonical;
+            let built = build_argv_roles_phase(
+                h,
+                Some("probe-model"),
+                Some("probe-effort"),
+                "",
+                "",
+                "",
+                "PROMPT",
+                Some("plan"),
+            );
+            let (phase_args, emitter_degraded) = phase_launch_args(h, "plan");
+            match built {
+                Ok((argv, degraded)) => {
+                    assert_eq!(
+                        degraded, emitter_degraded,
+                        "the leaf reports the registry's degradation on {h}"
+                    );
+                    for a in &phase_args {
+                        assert!(
+                            argv.iter().any(|x| x == a),
+                            "phase arg {a:?} reaches the leaf on {h}: {argv:?}"
+                        );
+                    }
+                    if phase_args.is_empty() {
+                        assert!(
+                            !argv
+                                .iter()
+                                .any(|x| x == "--agent" || x == "--permission-mode"),
+                            "no phase flag is invented on {h}: {argv:?}"
+                        );
+                    }
+                    emitting += 1;
+                }
+                Err(error) => {
+                    // No headless runner: the leaf refuses the run instead of
+                    // dropping the field silently. Any phase args the registry
+                    // holds for that harness describe the PANE path, so nothing
+                    // here can be false-green.
+                    assert!(
+                        error.to_string().contains(h),
+                        "the refusal names the harness: {error}"
+                    );
+                    refusing += 1;
+                }
+            }
+        }
+        assert!(emitting > 0, "at least one harness runs headless");
+        assert!(refusing > 0, "and the registry names harnesses that do not");
+    }
+}
