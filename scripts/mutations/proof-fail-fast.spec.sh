@@ -16,13 +16,11 @@ mutation "N1  the needle lint is dropped from the proof" \
     find='run_step verify-needles bash scripts/verify-needles.sh || true' \
     replace='true'
 
-mutation "N2  clippy runs after the suite again" \
+mutation "N2  clippy is dropped from before the suite" \
     file=$PROOF \
     expect=clean_proof_runs_needles_then_build_then_clippy_then_suite \
-    find='[ -n "$FAILED_STEP" ] || run_step verify-clippy bash scripts/verify-clippy.sh || true
-[ -n "$FAILED_STEP" ] || run_step suite "${MBX[@]}" test -p flywheel --bin flywheel || true' \
-    replace='[ -n "$FAILED_STEP" ] || run_step suite "${MBX[@]}" test -p flywheel --bin flywheel || true
-[ -n "$FAILED_STEP" ] || run_step verify-clippy bash scripts/verify-clippy.sh || true'
+    find='[ -n "$FAILED_STEP" ] || run_step verify-clippy bash scripts/verify-clippy.sh || true' \
+    replace='true  # mutation: clippy dropped from before the suite'
 
 mutation "N3  the lint accepts a needle that matches nothing" \
     file=$NEEDLES \
