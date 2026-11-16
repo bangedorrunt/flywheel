@@ -52,3 +52,12 @@ mutation "C8  the proof stops computing a cache key" \
     if [ "$NO_CACHE" -eq 0 ] && [ "$MUTATIONS_MODE" != full ]; then' \
     replace='    mut_key=""
     if false; then'
+
+mutation "C9  the driver fixture inherits the running proof's environment" \
+    file=src/cmd/clean_proof.rs \
+    expect=a_sha_proof_runs_the_revisions_own_driver \
+    find='        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", dir.path().join("home"))' \
+    replace='        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", dir.path().join("home"))'

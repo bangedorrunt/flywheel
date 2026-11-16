@@ -98,8 +98,14 @@ def spec_listing(root: str, listing_args: "list[str]") -> "tuple[list[str], list
     )
     if listed.returncode != 0:
         die(f"the harness cannot list the spec: {listed.stderr.strip()}")
+    # Only well-formed rows: the harness may print progress or an isolation
+    # notice, and a listing line without a tab is not a target.
     targets = sorted(
-        {line.split("\t")[1] for line in listed.stdout.splitlines() if line.strip()}
+        {
+            line.split("\t")[1]
+            for line in listed.stdout.splitlines()
+            if "\t" in line and line.strip()
+        }
     )
     tests = []
     if expects.returncode == 0:

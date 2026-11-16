@@ -259,12 +259,30 @@ fn a_sha_proof_runs_the_revisions_own_driver() {
     std::fs::write(scripts.join("clean-proof.sh"), &real_driver).unwrap();
 
     let lock = dir.path().join("clean-proof.lock");
+    // A proof of one sha must be judged on its own, never on the variables a
+    // proof that is CURRENTLY RUNNING exported into this process (that is how
+    // this test first failed inside a real proof: CLEAN_PROOF_SNAPSHOTTED made
+    // the child skip the driver resolution it is here to prove). Poison this
+    // process with them so the fence is proved on every run, not only when an
+    // outer proof happens to be in flight.
+    unsafe {
+        std::env::set_var("CLEAN_PROOF_SNAPSHOTTED", "1");
+        std::env::set_var("CLEAN_PROOF_DRIVER_SHA", "poison");
+    }
     let out = Command::new("bash")
         .arg(scripts.join("clean-proof.sh"))
         .args(["--sha", &rev, "--lock-hold-test", "0"])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", dir.path().join("home"))
+        .env("TMPDIR", dir.path())
         .env("CLEAN_PROOF_LOCK_FILE", &lock)
         .output()
         .expect("run clean-proof");
+    unsafe {
+        std::env::remove_var("CLEAN_PROOF_SNAPSHOTTED");
+        std::env::remove_var("CLEAN_PROOF_DRIVER_SHA");
+    }
     let err = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(
         err.contains(&format!("driver from {rev}")),
