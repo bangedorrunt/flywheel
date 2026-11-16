@@ -4869,3 +4869,33 @@ mod loops_sidecar_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod plan_base_tests {
+    use super::{ensure_plan, set_registry_root_override};
+
+    /// bd-6setu.15 L1: an id pins its base. A second ensure_plan (the retire path
+    /// runs one) must keep the base the id was minted with, or two folds under
+    /// one id disagree with no event saying why.
+    #[test]
+    fn a_second_ensure_plan_keeps_the_base() {
+        let _g = crate::config::test_state_home();
+        let root = std::env::temp_dir().join(format!("fw-plan-base-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _override = set_registry_root_override(root.clone());
+
+        let base = serde_json::json!([{"pin": "PinOne", "role": "coder"}]);
+        let first = ensure_plan("l1proj", base.clone()).expect("mint");
+        assert_eq!(first.base.as_ref(), Some(&base), "the mint sets the base");
+
+        let other = serde_json::json!([{"pin": "PinTwo", "role": "reviewer"}]);
+        let second = ensure_plan("l1proj", other).expect("second ensure");
+        assert_eq!(second.id, first.id, "the id is minted once");
+        assert_eq!(
+            second.base.as_ref(),
+            Some(&base),
+            "a second ensure_plan rewrote the base under an existing id"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
