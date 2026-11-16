@@ -1,5 +1,4 @@
 tests/collab_patterns_e2e.rs
 tests/e2e_serialize_worktree.rs
-tests/e2e_statechart_formal_verification.rs
 tests/sc_fw_workflow_edge.rs
 tests/stack_guard.rs

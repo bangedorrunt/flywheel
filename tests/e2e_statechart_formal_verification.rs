@@ -4,15 +4,16 @@
 //! in `src/elm/`; this file has no copy of their transitions.
 
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
+
+use flywheel_test_sandbox::TestSandbox;
 
 fn flywheel_bin() -> &'static str {
     env!("CARGO_BIN_EXE_flywheel")
 }
 
 struct HermeticEnv {
-    #[expect(dead_code, reason = "keeps tempdir alive until dropped")]
-    dir: tempfile::TempDir,
+    sandbox: TestSandbox,
     home: PathBuf,
     config_home: PathBuf,
     state_home: PathBuf,
@@ -23,13 +24,14 @@ struct HermeticEnv {
 
 impl HermeticEnv {
     fn new() -> Self {
-        let dir = tempfile::TempDir::new().expect("create temp dir for hermetic test env");
-        let home = dir.path().join("home");
-        let config_home = dir.path().join("config");
-        let state_home = dir.path().join("state");
-        let data_home = dir.path().join("data");
-        let runtime_dir = dir.path().join("runtime");
-        let toron_data_dir = dir.path().join("toron");
+        let sandbox = TestSandbox::new();
+        let dir = sandbox.root();
+        let home = dir.join("home");
+        let config_home = dir.join("config");
+        let state_home = dir.join("state");
+        let data_home = dir.join("data");
+        let runtime_dir = dir.join("runtime");
+        let toron_data_dir = dir.join("toron");
 
         std::fs::create_dir_all(&home).expect("mkdir home");
         std::fs::create_dir_all(&config_home).expect("mkdir config");
@@ -39,7 +41,7 @@ impl HermeticEnv {
         std::fs::create_dir_all(&toron_data_dir).expect("mkdir toron");
 
         Self {
-            dir,
+            sandbox,
             home,
             config_home,
             state_home,
@@ -50,8 +52,10 @@ impl HermeticEnv {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(flywheel_bin())
+        self.sandbox
+            .command(flywheel_bin())
             .args(args)
+            .env("PATH", self.sandbox.path_env())
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", &self.config_home)
             .env("XDG_STATE_HOME", &self.state_home)
@@ -267,7 +271,16 @@ fn test_cli_peer_intent_directive() {
     );
     let json = stdout_json(&out);
     assert_eq!(json["verb"], "intent");
-    assert_eq!(json["sent"], true);
+    // A sandbox has no peers, so nothing is addressed and `sent` must say so;
+    // this test used to assert sent:true, which only held because the operator's
+    // live fleet happened to hold the path. Delivery is covered by the p2p
+    // behaviour ledger, not by a CLI contract test.
+    assert_eq!(json["sent"], false);
+    assert!(
+        stderr_str(&out).contains("nothing was sent"),
+        "an empty fleet is named on stderr: {}",
+        stderr_str(&out)
+    );
     assert_eq!(json["broadcast"], true);
     assert_eq!(json["project"], "test-proj");
     assert_eq!(json["path"], "src/elm/p2p_negotiation.rs");
