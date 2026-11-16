@@ -34,7 +34,6 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use flywheel_test_sandbox::TestSandbox;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 fn flywheel() -> &'static str {
     env!("CARGO_BIN_EXE_flywheel")
