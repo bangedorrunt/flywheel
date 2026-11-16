@@ -835,8 +835,13 @@ impl<H: Host> Brain<H> {
             *self.deaf_attempts.entry(pin).or_insert(0) += 1;
         }
         // A pin with no pane cannot hear: resolve its ring instead of letting
-        // it age into a permanent conflict (bd-3vkpe).
-        for pin in self.hear.retain_live(&self.host.live_pins()) {
+        // it age into a permanent conflict (bd-3vkpe). Only an authoritative
+        // live set may drop a ring; a host that cannot tell keeps them all.
+        let resolved = match self.host.live_pins() {
+            Some(live) => self.hear.retain_live(&live),
+            None => Vec::new(),
+        };
+        for pin in resolved {
             self.deaf_attempts.remove(&pin);
             self.journal(
                 &serde_json::json!({"rt_kind": "RingResolved"}),

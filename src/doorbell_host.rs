@@ -338,17 +338,13 @@ impl RtHost {
     /// bd-3vkpe: only pins that still HAVE a pane can hear a ring. A gone or
     /// retired pin's row stays in the registry, so `pins()` is the wrong
     /// question for a wake — the plane holds the truth.
-    fn live_pins(&self) -> Vec<String> {
+    fn live_pins(&self) -> Option<Vec<String>> {
         let registry = state::load_spawn_registry(&self.project);
-        let Ok(backend) = crate::backend::multiplexer_backend(&self.cfg) else {
-            return self.registry_pins();
-        };
-        let Ok(agents) = backend.agent_list() else {
-            // A plane we cannot read is not evidence that every pin is gone.
-            return self.registry_pins();
-        };
+        let backend = crate::backend::multiplexer_backend(&self.cfg).ok()?;
+        // A plane we cannot read is not evidence that every pin is gone.
+        let agents = backend.agent_list().ok()?;
         let panes: Vec<String> = agents.into_iter().map(|a| a.pane_id).collect();
-        Self::live_pins_from(&registry, &panes)
+        Some(Self::live_pins_from(&registry, &panes))
     }
 
     /// Registry pins whose pane is still on the plane (bd-3vkpe). Pure, so the
