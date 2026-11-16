@@ -83,9 +83,9 @@ pass.
 Tests that spawn the binary build the `Command` through
 `tests`' `flywheel_test_sandbox::TestSandbox` (temp HOME/XDG/TORON_DATA_DIR,
 scrubbed routing env, deny-shims first on `PATH`, a `Drop` that asserts no shim
-was reached). `scripts/check-test-sandbox.sh` refuses a new spawn that skips it;
-`scripts/test-sandbox-baseline.txt` lists the files still to migrate (debt, not
-permission).
+was reached). `scripts/check-test-sandbox.sh` refuses any spawn that skips it.
+`scripts/test-sandbox-baseline.txt` is RETIRED and stays empty: an entry is a
+failure, not a permission, because there is nowhere left to put one.
 
 The ONE carve-out is `tests/live_*.rs`: a live test measures the real plane, so
 it cannot be sandboxed. The lint allows the name only when every `#[test]` in
@@ -98,7 +98,10 @@ test can never run by default. Anything else that spawns gets the sandbox.
   Proof = `git archive HEAD` into a scratch dir and build there. In a dirty
   worktree use `scripts/clean-proof.sh` (throwaway index, intended paths
   only); `git add` only paths you edited — never `git add -A` (other lanes
-  share the tree).
+  share the tree). **Prove your commit, not a worktree:** `clean-proof --sha
+  <your sha>` (or a clean export of it) is the crew-facing fence and the
+  default, because one shared tree is the rule; a per-pin worktree is not the
+  proof's job. A syntax error in the dirty tree must not change the result.
 - **Classify first.** Session door: `arrive` → `briefing --json`; argv runs the
   work. `decide --json` classifies (`open` | `swarm`). Live fleets join loud,
   never double-compose — an invisible crew is not an empty project (check

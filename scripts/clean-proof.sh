@@ -376,7 +376,7 @@ if [ -n "$MUTATIONS_MODE" ] && [ -z "$FAILED_STEP" ]; then
           hit=yes
           break
         fi
-      done < <(bash scripts/verify-mutations.sh --list "$spec")
+      done < <(bash scripts/verify-mutations.sh --list "$spec" 2>/dev/null)
       [ -n "$hit" ] || continue
     fi
     mut_ran=$((mut_ran + 1))
