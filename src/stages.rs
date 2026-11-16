@@ -2601,7 +2601,8 @@ mod unused_stage_gate_tests {
             "only the stage with neither reference nor recent use is unused"
         );
         assert!(
-            !unused_stages(&all, &referenced, &set(&["used-now", "dead"])).contains(&"dead".to_string()),
+            !unused_stages(&all, &referenced, &set(&["used-now", "dead"]))
+                .contains(&"dead".to_string()),
             "a recent run-log use clears the gate"
         );
         assert!(
