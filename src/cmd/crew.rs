@@ -1006,7 +1006,7 @@ fn cmd_crew_inbox(
     Ok(())
 }
 
-fn cmd_crew_prompt(
+pub(crate) fn cmd_crew_prompt(
     cfg: &Config,
     project: &str,
     pin: &str,

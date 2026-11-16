@@ -527,6 +527,7 @@ pub(crate) fn cmd_add(
         json!({ "workspace_id": ws_id, "agents": spawned }),
     );
     add_effect.settle(Some(&format!("workspace={ws_id} added={}", spawned.len())));
+    dispatch_assignments(project, &assign, None)?;
     Ok(())
 }
 
@@ -2381,6 +2382,7 @@ the panes may still be live in hc; `--no-verify` skips this check in scripts"
         dim(project),
         dim("--to all --stage ce-execute")
     );
+    dispatch_assignments(project, &assign, None)?;
     Ok(())
 }
 
@@ -8589,5 +8591,61 @@ mod dry_run_doc_tests {
             serde_json::to_value(&plan).unwrap(),
             "the seat plan is unchanged by an assignment"
         );
+    }
+}
+
+/// bd-koafr: what `--assign` will brief. One entry per pin, carrying the boot
+/// line text and the first bead for the brief's corr. Pure, so the witness
+/// runs without mail or a pane.
+pub(crate) fn planned_briefs(
+    assign: &std::collections::BTreeMap<String, String>,
+) -> Vec<(String, String, Option<String>)> {
+    assign
+        .iter()
+        .map(|(pin, beads)| {
+            let first = beads.split(',').next().map(str::to_string);
+            (pin.clone(), crate::boot_prime_line_for(Some(beads)), first)
+        })
+        .collect()
+}
+
+/// bd-koafr: deliver the planned briefs through the crew-prompt door — the
+/// brief id, the operator-typing guard, and the busy deferral are that door's.
+pub(crate) fn dispatch_assignments(
+    project: &str,
+    assign: &std::collections::BTreeMap<String, String>,
+    r#as: Option<&str>,
+) -> Result<()> {
+    if assign.is_empty() {
+        return Ok(());
+    }
+    let cfg = crate::config::Config::load().unwrap_or_default();
+    for (pin, text, bead) in planned_briefs(assign) {
+        crate::cmd::crew::cmd_crew_prompt(&cfg, project, &pin, &text, r#as, false, bead.as_deref())?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod planned_briefs_tests {
+    use super::planned_briefs;
+
+    /// bd-koafr: exactly one brief per assigned pin, and the text is the
+    /// assignment variant of the boot line (names the bead, forbids triage).
+    #[test]
+    fn one_brief_per_assigned_pin_naming_its_beads() {
+        let mut assign = std::collections::BTreeMap::new();
+        assign.insert("SlateHarbor".to_string(), "bd-a,bd-b".to_string());
+        assign.insert("BoldBay".to_string(), "bd-c".to_string());
+        let briefs = planned_briefs(&assign);
+        assert_eq!(briefs.len(), 2, "one brief per pin: {briefs:?}");
+        let slate = briefs
+            .iter()
+            .find(|(pin, _, _)| pin == "SlateHarbor")
+            .expect("slate brief");
+        assert!(slate.1.contains("bd-a,bd-b"), "{}", slate.1);
+        assert!(slate.1.contains("Do not read mail"), "{}", slate.1);
+        assert_eq!(slate.2.as_deref(), Some("bd-a"), "corr is the first bead");
+        assert!(planned_briefs(&std::collections::BTreeMap::new()).is_empty());
     }
 }

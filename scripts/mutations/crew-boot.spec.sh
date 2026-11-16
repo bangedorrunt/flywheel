@@ -19,3 +19,12 @@ mutation "B2  an assigned crew is sent to triage anyway" \
     expect=an_assigned_boot_names_the_bead_and_skips_triage \
     find='             and run its VERIFY. Do not read mail or triage the project \' \
     replace='             and run its VERIFY. Read your mail and triage the project  \'
+
+mutation "B3  the assignment plan is dropped" \
+    file=src/cmd/spawn.rs \
+    expect=one_brief_per_assigned_pin_naming_its_beads \
+    find='    assign
+        .iter()
+        .map(|(pin, beads)| {' \
+    replace='    let _ = assign;
+    Vec::new().into_iter().map(|(pin, beads): (String, String)| {'
