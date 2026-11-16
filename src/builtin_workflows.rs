@@ -469,7 +469,7 @@ steps:
         "triage-deep",
         r#"
 name: triage-deep
-description: "Deep backlog triage — bv robot-triage, prioritize + assign, spawn the crew. NOTE: /triage -> triage-deep is intentional (triage = auto #support trigger; triage-deep = interactive)."
+description: "Deep backlog triage — bv robot-triage, prioritize + assign; the crew comes from this workflow's `crew:` field (bd-jhz8x.2 retired the spawn-crew seat). NOTE: /triage -> triage-deep is intentional (triage = auto #support trigger; triage-deep = interactive)."
 trigger:
   type: webhook
 crew: auto
@@ -485,11 +485,6 @@ steps:
     action: dispatch_job
     assignee: x
     spec: { profile: "@planner", stage: "prioritize-assign", plan: "{{steps.triage}}", project: "{{inputs.project}}" }
-    on_error: fail_run
-  - name: spawn
-    action: dispatch_job
-    assignee: x
-    spec: { profile: "@housekeeper", stage: "spawn-crew", plan: "{{steps.prioritize}}", project: "{{inputs.project}}" }
     on_error: fail_run
 "#,
     ),
@@ -3404,6 +3399,41 @@ graph:
         );
     }
 
+    /// ADR-0021 D4.5 (bd-jhz8x.2): triage-deep's crew comes from the workflow's
+    /// own `crew:` field — the pane door's `pre_spawn_crew` brings the seats up
+    /// before the run — not from a housekeeper seat that shells out to
+    /// `flywheel spawn`. The `spawn-crew` stage is retired, and no node
+    /// dispatches it.
+    ///
+    /// The `spawn` ACTION is not the equivalent here: nothing on the CLI door
+    /// drains `spawn_sink`, so a detached spawn would announce a key nobody
+    /// consumes and the crew would silently not exist (a false green). The
+    /// crew field is the engine-visible declaration the door already honours.
+    #[test]
+    fn triage_deep_crew_comes_from_the_workflow_not_a_seat() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        let wf = &wfs["triage-deep"];
+        assert!(
+            wf.crew.is_some(),
+            "triage-deep must DECLARE its crew; that declaration is what spawns it"
+        );
+        for step in &wf.steps {
+            if let Action::DispatchJob { spec, .. } = &step.action {
+                assert_ne!(
+                    spec.stage.as_deref(),
+                    Some("spawn-crew"),
+                    "no seat spawns the crew: {:?}",
+                    step.name
+                );
+            }
+        }
+        assert!(
+            !crate::stages::StageLibrary::compiled_in().has("spawn-crew"),
+            "the spawn-crew stage is retired; a prompt for it is dead config"
+        );
+    }
+
     /// Every stage dispatch awaits its job result with a bounded wait:
     /// `await: result`, an explicit claim bound, and the 7200s result bound.
     #[test]
@@ -3700,7 +3730,7 @@ graph:
             ("ce-plan-review", &["review"]),
             ("ce-sweep", &["sweep"]),
             ("onboard", &["map", "seed"]),
-            ("triage-deep", &["triage", "prioritize", "spawn"]),
+            ("triage-deep", &["triage", "prioritize"]),
         ];
         for (name, must_fail) in checks {
             let errors = step_errors(&wfs[*name]);
@@ -3742,7 +3772,6 @@ graph:
         for (name, step_name, token) in [
             ("onboard", "seed", "{{steps.map}}"),
             ("triage-deep", "prioritize", "{{steps.triage}}"),
-            ("triage-deep", "spawn", "{{steps.prioritize}}"),
         ] {
             let wf = &wfs[name];
             let step = wf

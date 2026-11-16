@@ -147,7 +147,8 @@ Rules:
 2. **The witness is checked by the engine** against the stage's named contract (extend `phase_contracts`). A missing or failing witness is a typed failure that goes to the step's `on_error` or the enclosing repair loop. It is never success.
 3. **Fact-derived exits win over reported ones.** Where a ledger already knows the answer, the exit is a `verify` step over that ledger, not a witness. Examples: execute ends when every bead of the wave is closed and `flywheel ship check` is legal; plan ends when `br lint` is clean and `br dep cycles` is 0.
 4. **`.done` markers retire.** For one release the runner writes them as sidecars after a witnessed exit, so external watchers keep working; nothing reads them.
-5. **The LLM-as-loop stages become engine steps.** `wave-gate` → a `verify` over `flywheel preflight` + `br ready --json` (already wave-gated by the typed field) with a lower-wave hold check. `wave-dispatch` → `foreach` over the ready set with `dispatch_job await: result`. `wave-observe` → the doorbell fold's escalation (it already sees claims, receipts, and stalls). `spawn-crew` → the `spawn` action. The planner seat in `wave-swarm` then only plans.
+5. **The LLM-as-loop stages become engine steps.** `wave-gate` → a `verify` over `flywheel preflight` + `br ready --json` (already wave-gated by the typed field) with a lower-wave hold check. `wave-dispatch` → `foreach` over the ready set with `dispatch_job await: result`. `wave-observe` → the doorbell fold's escalation (it already sees claims, receipts, and stalls). `spawn-crew` → the workflow's own `crew:` declaration, which the pane door's `pre_spawn_crew` honours before the run starts; the `spawn` ACTION is for child runs, and is NOT a substitute here (nothing on the CLI door drains `spawn_sink`, so a detached spawn would announce a key nobody consumes and the crew would silently not exist). The planner seat in `wave-swarm` then only plans.
+
 
 ### D5. Verify the workflow that runs
 
@@ -349,7 +350,7 @@ witnessed by ADR-0022's map (§8), which owns the adapter/profile half of D3.
 | D4.2 the engine checks the witness; a miss is typed | `durable_body_witness_fail_goes_to_on_error`, `durable_body_witness_missing_report_fails` | `adr0021-gates W1`, `witness-sidecar W1` | closed |
 | D4.3 fact-derived exits win over reported ones | `wave_swarm_execute_exit_is_ledger_fact`, `wave_swarm_execute_exit_runs_against_ledger` | `adr0021-witnessed E3` | closed (bd-jhz8x.6) |
 | D4.4 `.done` markers retire — the RUNNER writes a sidecar after a witnessed exit and nothing reads it | `a_witnessed_exit_writes_the_done_sidecar_and_a_refusal_writes_none`, `wave_swarm_no_marker_reads` | `witness-sidecar W1` | closed (bd-jhz8x.3) |
-| D4.5 the LLM-as-loop stages become engine steps | `wave_swarm_stages_await_result` (dispatch), `a_lower_open_wave_holds_and_names_the_blockers` (gate), `a_blocked_pane_escalates_to_the_captain_once_per_episode` (observe) | `wave-gate-engine G1/G2`, `observe-fold W1/R1/K1`, `observe-escalation L1/E1/B1/F1` | **partial: gate/dispatch/observe are engine steps; `spawn-crew` is still a stage — bd-jhz8x.2** |
+| D4.5 the LLM-as-loop stages become engine steps | `wave_swarm_stages_await_result` (dispatch), `a_lower_open_wave_holds_and_names_the_blockers` (gate), `a_blocked_pane_escalates_to_the_captain_once_per_episode` (observe), `triage_deep_crew_comes_from_the_workflow_not_a_seat` (spawn-crew retired; the crew field spawns it) | `wave-gate-engine G1/G2`, `observe-fold W1/R1/K1`, `observe-escalation L1/E1/B1/F1`, `triage-crew S1` (bd-jhz8x.2) | closed (bd-jhz8x.2) |
 | D5.1 lower every workflow to a machine | `workflow_lowering_unreachable_node_named`, `workflow_lowering_can_finish_names_stranded_state`, `workflow_lowering_unbounded_back_edge_named`, `workflow_lowering_approval_without_timeout_fails` | `adr0021-gates L1` (bounded), `adr0021-witnessed E4/E5` (reachable, can-finish) | closed (bd-jhz8x.6) |
 | D5.2 `workflow verify` checks the machine; the report says what it does not prove | `statechart_verify_passes_the_shipped_charts`, `statechart_report_fails_on_an_orphan_and_a_trap`, `test_cli_workflow_verify_json_contract` | `adr0021-gates S1/L1/W1`, `adr0021-witnessed E4/E5`, `workflow-verify-unused U1` | closed (bd-jhz8x.6) |
 | D5.3 the report names what is not checked | `test_cli_workflow_verify_plain_text` (scope line), `test_cli_workflow_verify_json_contract` (scope field) | none | closed (the text is the assertion) |
@@ -377,6 +378,7 @@ Every row above was grepped; none was recalled. A row marked **open** or
 both a witness test and a mutation seen RED. The five checks that were
 witnessed but unmutated are closed by bd-jhz8x.6 (`adr0021-witnessed E1–E6`,
 6/6 RED) and the coverage fence by bd-jhz8x.7 (`coverage-fence C1/W1`);
-the sidecar-writer and `spawn-crew` legs stay with bd-jhz8x.3 and bd-jhz8x.2. The topology export
+the sidecar-writer row is closed by bd-jhz8x.3 and the `spawn-crew` row by
+bd-jhz8x.2 (the crew field, not the spawn action). The topology export
 still proves nothing (D5.3): no model checker runs over it, and D5.4's TLC
 models cover protocols, not workflows.

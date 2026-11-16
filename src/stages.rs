@@ -253,7 +253,6 @@ const SEED_PHASE: &[(&str, &str)] = &[
     ("seed-first-task", "plan"),
     ("bv-triage", "plan"),
     ("prioritize-assign", "plan"),
-    ("spawn-crew", "plan"),
     ("repro-baseline", "resolve"),
     ("tdd-red", "implement"),
     ("minimal-fix", "implement"),
@@ -336,10 +335,6 @@ const SEED_USE_WHEN: &[(&str, &str)] = &[
     (
         "prioritize-assign",
         "triaged beads need ordering and owned assignment",
-    ),
-    (
-        "spawn-crew",
-        "prioritized beads need a crew spawned to execute them",
     ),
     (
         "repro-baseline",
@@ -509,10 +504,6 @@ impl StageLibrary {
             (
                 "prioritize-assign",
                 "Deep-triage step 2: from the bv-triage summary, prioritize the actionable backlog in dependency order and assign each item to an owner (agent identity registered in the project). Output an ordered, owned list the crew can execute.",
-            ),
-            (
-                "spawn-crew",
-                "Deep-triage step 3: spawn the assigned crew for the prioritized backlog — `flywheel spawn <project> --recipe <squad>` (or the explicit counts) and hand each owner their assigned items. Confirm the panes are up and the crew is ready before finishing.",
             ),
             (
                 "repro-baseline",
@@ -1848,7 +1839,6 @@ mod tests {
             "seed-first-task",
             "bv-triage",
             "prioritize-assign",
-            "spawn-crew",
         ] {
             assert!(
                 lib.resolve(semantic).is_some(),
@@ -2222,7 +2212,6 @@ mod stage_contract_tests {
             "seed-first-task",
             "bv-triage",
             "prioritize-assign",
-            "spawn-crew",
             "repro-baseline",
             "tdd-red",
             "minimal-fix",
@@ -2234,7 +2223,7 @@ mod stage_contract_tests {
             "resume-pickup",
             "wave-verify",
         ];
-        assert_eq!(names.len(), 26, "all seeds enumerated");
+        assert_eq!(names.len(), 25, "all seeds enumerated");
         for name in names {
             let st = lib
                 .get_stage(name)

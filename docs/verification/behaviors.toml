@@ -294,6 +294,18 @@ mutations = [
 ]
 
 [[behavior]]
+id = "triage.crew-comes-from-the-workflow"
+owner = "src/builtin_workflows.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/builtin_workflows.rs::triage_deep_crew_comes_from_the_workflow_not_a_seat",
+]
+mutations = [
+  "scripts/mutations/triage-crew.spec.sh#S1",
+]
+
+[[behavior]]
 id = "plan-fence.coverage-non-shrink"
 owner = "src/plan_fence.rs"
 status = "proven"
