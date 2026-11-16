@@ -17,10 +17,10 @@ shim).
 ```bash
 mbx +nightly-aarch64-apple-darwin test
 bash scripts/verify-clippy.sh
-mbx +nightly-aarch64-apple-darwin install --path . --force
-mbx +nightly-aarch64-apple-darwin install --path crates/doorbell-cli --force
-# one command for all installed binaries (flywheel, toron):
-flywheel stack install
+# installed binaries change only by the captain, from a green proof's kept
+# export, with that export's own script (captain-only guard, bd-0uzrq.6):
+#   AGENT_NAME=<captain> FLYWHEEL_SOURCE=<kept>/flywheel TORON_SOURCE=<kept>/toron \
+#     bash <kept>/flywheel/scripts/stack.sh install
 flywheel stack status --check
 # ADR-0022 rollout 6: front the plan, a live patch, and the live seat view
 flywheel swarm plan <project> [spawn flags]      # byte-equal to spawn --dry-run --json
@@ -31,10 +31,12 @@ flywheel retire <pin>... [--project p]            # one seat Retire + lease rele
 flywheel ship check <bead-id>
 # one verb for the whole close ceremony (gate -> close -> sync -> release ->
 # commit ONLY this bead's tracker rows -> check); idempotent, and another
-# lane's dirty tracker row never blocks it
+# lane's dirty tracker row never blocks it; the receipt may prove the citing
+# sha or any descendant of it (bd-0uzrq.22)
 flywheel ship land <bead-id> --sha <40hex> --receipt <proof> --as <pin>
-# clean-export proof over intended files; add --tests for the doorbell suite
-bash scripts/clean-proof.sh --tests --keep
+# clean-export proof of one revision (no selector = the dirty tree's intended
+# paths); one machine-wide slot; mutations run inside the export
+bash scripts/clean-proof.sh --sha <rev> --mutations changed --keep --receipt /tmp/<dir>/r.json
 # scripts/stack.sh and scripts/ship-check.sh remain compatibility wrappers
 ```
 
