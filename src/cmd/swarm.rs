@@ -231,6 +231,7 @@ fn cmd_swarm_status(cfg: &Config, project: &str, json: bool) -> Result<()> {
         print_json(&json!({
             "schema": "flywheel-seats.v1",
             "project": project,
+            "plan_id": crate::state::load_plan(project).map(|r| r.id),
             "seats": rows.iter().map(|r| json!({
                 "pin": r.pin,
                 "name": r.name,

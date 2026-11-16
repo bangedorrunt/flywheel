@@ -348,6 +348,66 @@ pub fn spawn_registry_file(project: &str) -> PathBuf {
     agents_dir().join(format!("{}.json", spawn_registry_key(project)))
 }
 
+/// ADR-0022 D1 (bd-6setu.3): the swarm plan as a durable object — one record
+/// per project, beside the spawn registry. `id` is minted at the first resolve
+/// and never re-minted, so a replay names the plan the live swarm runs, and the
+/// patch log rides the same record so the desired seats are the fold of the base
+/// plan and its patches — never a rebuild from flags.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PlanRecord {
+    pub id: String,
+    pub plan: crate::swarm_plan::Plan,
+    /// `swarm apply` patch events, oldest first.
+    #[serde(default)]
+    pub patches: Vec<String>,
+}
+
+pub fn plan_file(project: &str) -> PathBuf {
+    agents_dir().join(format!("{}.plan.json", spawn_registry_key(project)))
+}
+
+pub fn load_plan(project: &str) -> Option<PlanRecord> {
+    let body = std::fs::read_to_string(plan_file(project)).ok()?;
+    serde_json::from_str(&body).ok()
+}
+
+pub fn save_plan(project: &str, record: &PlanRecord) -> anyhow::Result<()> {
+    let path = plan_file(project);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_string_pretty(record)?;
+    crate::project_state::write_atomic(&path, body.as_bytes())
+        .map_err(|e| anyhow::anyhow!("save plan {}: {e:?}", path.display()))
+}
+
+/// `plan-<nanos>-<pid>`: minted once per project record, so two mints can never
+/// collide and no dependency is added for an id.
+pub fn mint_plan_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("plan-{nanos:x}-{:x}", std::process::id())
+}
+
+/// Record the resolved plan: mint an id the first time and keep it after, so a
+/// re-resolve (a second spawn into the same swarm) joins the plan it belongs to
+/// instead of forking a second identity. The patch log is never touched here.
+pub fn record_plan(project: &str, plan: &crate::swarm_plan::Plan) -> anyhow::Result<PlanRecord> {
+    let existing = load_plan(project);
+    let record = PlanRecord {
+        id: existing
+            .as_ref()
+            .map(|r| r.id.clone())
+            .unwrap_or_else(mint_plan_id),
+        plan: plan.clone(),
+        patches: existing.map(|r| r.patches).unwrap_or_default(),
+    };
+    save_plan(project, &record)?;
+    Ok(record)
+}
+
 /// One spawn-registry record: (pane_id, agent name, optional crew profile).
 ///
 /// The `profile` column (P10.3, bd-ghcj.1) lets the pane runner resolve
@@ -4072,6 +4132,38 @@ mod loops_sidecar_tests {
             load_spawn_registry("regsplit-rt"),
             flipped,
             "save under PATH form -> load under NAME form returns entries"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ADR-0022 D1 (bd-6setu.3): the plan is a durable object with an id minted
+    /// once, and the patch log rides the same record, so a replay reads the plan
+    /// instead of rebuilding it from flags.
+    #[test]
+    fn plan_record_mints_once_and_keeps_the_patch_log() {
+        let _g = loops_test_guard();
+        let root = std::env::temp_dir().join(format!("fw-plan-rec-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _override = set_registry_root_override(root.clone());
+
+        let plan = crate::swarm_plan::Plan::new("swarm");
+        let first = record_plan("planrec", &plan).unwrap();
+        assert!(first.id.starts_with("plan-"), "minted id: {}", first.id);
+        assert_eq!(
+            load_plan("planrec").as_ref(),
+            Some(&first),
+            "the resolved plan round-trips through the record"
+        );
+
+        let mut patched = first.clone();
+        patched.patches.push("reviewer.harness=pi".to_string());
+        save_plan("planrec", &patched).unwrap();
+        let again = record_plan("planrec", &plan).unwrap();
+        assert_eq!(again.id, first.id, "a re-resolve keeps the id");
+        assert_eq!(
+            again.patches,
+            vec!["reviewer.harness=pi".to_string()],
+            "and the patch events it already has"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

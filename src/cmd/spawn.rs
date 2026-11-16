@@ -1582,6 +1582,10 @@ projects available: {}",
             plan.needs_consent.len()
         );
     }
+    // ADR-0022 D1 (bd-6setu.3): the plan is a durable object from the moment it
+    // resolves to launch. The id is minted once and kept, so a replay names the
+    // plan the swarm runs instead of rebuilding it from flags.
+    let plan_record = crate::state::record_plan(project, &plan)?;
     let base_label = opts
         .label_override
         .as_deref()
@@ -2208,7 +2212,8 @@ projects available: {}",
         project,
         EventKind::Spawn,
         json!({
-            "workspace_id": ws.workspace_id, "label": label, "agents": spawned
+            "workspace_id": ws.workspace_id, "label": label, "agents": spawned,
+            "plan_id": plan_record.id
         }),
     );
 
@@ -2564,6 +2569,10 @@ pub(crate) fn cmd_spawn_rex(
             plan.needs_consent.len()
         );
     }
+    // ADR-0022 D1 (bd-6setu.3): the plan is a durable object from the moment it
+    // resolves to launch. The id is minted once and kept, so a replay names the
+    // plan the swarm runs instead of rebuilding it from flags.
+    let plan_record = crate::state::record_plan(project, &plan)?;
     let base_label = opts
         .label_override
         .as_deref()
@@ -3045,7 +3054,8 @@ pub(crate) fn cmd_spawn_rex(
         project,
         EventKind::Spawn,
         json!({
-            "workspace_id": ws.workspace_id, "label": label, "agents": spawned
+            "workspace_id": ws.workspace_id, "label": label, "agents": spawned,
+            "plan_id": plan_record.id
         }),
     );
 
