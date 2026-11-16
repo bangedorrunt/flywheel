@@ -272,6 +272,22 @@ tests = [
 mutations = ["scripts/mutations/clean-proof-slot.spec.sh#S1", "scripts/mutations/clean-proof-slot.spec.sh#S2"]
 
 [[behavior]]
+id = "wave.gate-engine-step"
+owner = "src/cmd/wave_gate.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/wave_gate.rs::a_lower_open_wave_holds_and_names_the_blockers",
+  "src/cmd/wave_gate.rs::an_empty_ready_with_this_wave_in_flight_is_work_in_flight",
+  "src/cmd/wave_gate.rs::an_empty_ready_with_nothing_in_flight_is_a_loud_failure",
+  "src/cmd/wave_gate.rs::only_this_waves_rows_are_ready",
+]
+mutations = [
+  "scripts/mutations/wave-gate-engine.spec.sh#G1",
+  "scripts/mutations/wave-gate-engine.spec.sh#G2",
+]
+
+[[behavior]]
 id = "adr0021.gates-witnessed"
 owner = "src/adr0021_gates.rs"
 status = "proven"

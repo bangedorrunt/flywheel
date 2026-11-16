@@ -1217,21 +1217,18 @@ inputs:
   - name: coder_profile
     default: "@coder"
 steps:
-  - name: gate
-    action: dispatch_job
-    assignee: x
-    await: result
-    no_claim_timeout: 600
-    result_timeout: 7200
-    spec:
-      profile: "@planner"
-      stage: wave-gate
-      task: 'Gate the wave {{inputs.wave_label}}: preflight + scope `br ready` for this wave; write .flywheel/wave/{{inputs.wave_label}}-ready.json (the DISPATCH binding artifact); a lower open wave holds. bd-wave-gate-typed-authority-27et: the TYPED `wave` field is the authority (br ready is already wave-gated by it natively) — select rows whose typed `wave` == N, falling back to the legacy `wave-N` label only when the typed field is null; hold when ANY bead with an earlier wave-M (M<N) is open or in_progress, naming the blockers. An EMPTY ready with NO bead of this wave in flight is a LOUD FAILURE — settle the job as a failure naming the empty match ([gate] blocked: wave <label> matched zero beads). An EMPTY ready WITH in-flight beads is held:false + in_flight — the wave is WORK IN FLIGHT, report it and continue (never a held/empty-wave failure, never re-dispatch). Write the artifact as {wave_label, held, blockers, ready, in_flight}. Then settle YOUR job: `toron job result <job-id> --status ok --project <slug> --as <pin> --witness <file.json>`, where the witness file carries the contract fields for this stage: {"beads": [{"id": "<bead>", "acceptance": "<its VERIFY command>"}], "dep_cycles": <count from `br dep cycles --json`, must be 0>}. A GREEN gate (artifact written, held:false, ready non-empty OR in flight) settles ok. A held or blocked gate settles as a FAILURE — `toron job result <job-id> --status failed --project <slug> --as <pin> --body "[gate] held: <blockers>"` — never success, never an unsettled job (an unsettled job fails at result_timeout naming this step). Objective: {{inputs.objective}}'
-    on_error: fail_run
-  - name: gate_done
+  # ADR-0021 D4.5 (bd-jhz8x.2): GATE is an ENGINE step. preflight is a verify,
+  # and __wave-gate scopes `br ready` to this wave, holds on a lower open wave,
+  # writes the binding artifact DISPATCH reads, and fails on a zero match. The
+  # planner seat no longer runs either.
+  - name: preflight
     action: verify
-    command: "mkdir -p .flywheel/wave && touch .flywheel/wave/{{inputs.wave_label}}-gate.done"
-    on_error: continue
+    command: 'flywheel preflight --mode workflow --project "$PWD"'
+    on_error: fail_run
+  - name: gate
+    action: verify
+    command: 'flywheel __wave-gate --label {{inputs.wave_label}} --project "$PWD"'
+    on_error: fail_run
   - name: dispatch
     action: dispatch_job
     assignee: x
@@ -3424,10 +3421,12 @@ graph:
                 *result_timeout,
             ));
         }
+        // bd-jhz8x.2 (ADR-0021 D4.5): GATE moved to engine steps (preflight +
+        // __wave-gate), so the remaining seat dispatches are 6.
         assert_eq!(
             dispatches.len(),
-            7,
-            "every stage dispatch awaits: {dispatches:?}"
+            6,
+            "every remaining stage dispatch awaits: {dispatches:?}"
         );
         for (name, await_, no_claim, result) in dispatches {
             assert!(

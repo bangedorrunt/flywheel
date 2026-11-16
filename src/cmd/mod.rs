@@ -39,6 +39,7 @@ pub(crate) mod stage;
 pub(crate) mod standing_orders;
 pub(crate) mod status;
 pub(crate) mod swarm;
+pub(crate) mod wave_gate;
 pub(crate) mod work;
 pub(crate) mod workflow;
 pub(crate) mod worktree;

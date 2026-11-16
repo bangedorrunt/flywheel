@@ -2145,6 +2145,17 @@ enum Commands {
     /// idempotent, `released == 0` is a clean no-op)
     #[command(name = "__release-bead-locks", hide = true)]
     __ReleaseBeadLocks { project: String, bead_id: String },
+    /// internal: the wave gate as an ENGINE step (ADR-0021 D4.5): scope
+    /// `br ready` to wave N, hold on a lower open wave, write the binding
+    /// artifact, exit non-zero on a hold or a zero match
+    #[command(name = "__wave-gate", hide = true)]
+    __WaveGate {
+        /// `wave-<N>`
+        #[arg(long)]
+        label: String,
+        #[arg(long)]
+        project: String,
+    },
     /// internal: list ready beads as JSON (durable workflow leaf)
     #[command(name = "__ready", hide = true)]
     __Ready { project: String },
@@ -4104,6 +4115,9 @@ fn main() {
             regex,
             timeout_ms,
         }) => cmd_internal_wait_output(&cfg, project, target, pattern, *regex, *timeout_ms),
+        Some(Commands::__WaveGate { label, project }) => {
+            crate::cmd::wave_gate::cmd(&cfg, project, label)
+        }
         Some(Commands::__Ready { project }) => cmd_internal_ready(&cfg, project),
         Some(Commands::__LastSent {
             project,

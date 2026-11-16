@@ -71,6 +71,12 @@ pub fn receipts_dir(root: &Path) -> PathBuf {
 }
 
 /// `<root>/.flywheel/crons/` (project cron tier).
+/// The wave artifact dir (`.flywheel/wave/`): the gate writes
+/// `<label>-ready.json` here and DISPATCH reads it (ADR-0021 D4.5).
+pub fn wave_dir(root: &Path) -> PathBuf {
+    root.join(".flywheel").join("wave")
+}
+
 pub fn crons_dir(root: &Path) -> PathBuf {
     dot_flywheel(root).join("crons")
 }
