@@ -35,8 +35,15 @@ flywheel ship check <bead-id>
 # sha or any descendant of it (bd-0uzrq.22)
 flywheel ship land <bead-id> --sha <40hex> --receipt <proof> --as <pin>
 # clean-export proof of one revision (no selector = the dirty tree's intended
-# paths); one machine-wide slot; mutations run inside the export
+# paths): needles, build, no-run, clippy, suite incl. tests/, workflow verify,
+# formal, coverage, then changed mutation specs (cached by content key). A
+# --sha proof runs that revision's own driver; one machine-wide slot; --keep
+# keeps the export for the captain's install
 bash scripts/clean-proof.sh --sha <rev> --mutations changed --keep --receipt /tmp/<dir>/r.json
+# sub-second check that every mutation find= still matches exactly once
+bash scripts/verify-needles.sh
+# mutations alone; runs in its own scratch export, never edits your tree
+bash scripts/verify-mutations.sh scripts/mutations/<spec>.spec.sh
 # scripts/stack.sh and scripts/ship-check.sh remain compatibility wrappers
 ```
 
