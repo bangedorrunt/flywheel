@@ -3,10 +3,7 @@
 //!
 //! governed-by: ADR-0005
 
-#[path = "../src/test_sandbox.rs"]
-mod test_sandbox;
-
-use test_sandbox::TestSandbox;
+use flywheel_test_sandbox::TestSandbox;
 
 use std::fs;
 use std::io::Write;

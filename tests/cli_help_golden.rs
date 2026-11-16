@@ -4,10 +4,7 @@
 //! `cargo build && ./target/debug/flywheel --help > tests/fixtures/help/root.txt`
 //! (same for `mail --help`, `workflow --help`).
 
-#[path = "../src/test_sandbox.rs"]
-mod test_sandbox;
-
-use test_sandbox::TestSandbox;
+use flywheel_test_sandbox::TestSandbox;
 
 fn help_output(args: &[&str]) -> String {
     let sandbox = TestSandbox::new();

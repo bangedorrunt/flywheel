@@ -20,10 +20,7 @@
 //!
 //! governed-by: ADR-0019 (Spec 6, Spec 7.2), ADR-0024 Scenario B
 
-#[path = "../src/test_sandbox.rs"]
-mod test_sandbox;
-
-use test_sandbox::TestSandbox;
+use flywheel_test_sandbox::TestSandbox;
 
 use toron_workflow::schema::{Action, Workflow};
 

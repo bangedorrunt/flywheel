@@ -18,10 +18,7 @@
 
 use std::process::Output;
 
-#[path = "../src/test_sandbox.rs"]
-mod test_sandbox;
-
-use test_sandbox::TestSandbox;
+use flywheel_test_sandbox::TestSandbox;
 
 fn flywheel() -> &'static str {
     env!("CARGO_BIN_EXE_flywheel")

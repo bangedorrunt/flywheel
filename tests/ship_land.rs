@@ -9,12 +9,9 @@
 //! a rerun resumes from it; the reservation release actually happened (a code
 //! mutation skipping it fails the assertion).
 
-#[path = "../src/test_sandbox.rs"]
-mod test_sandbox;
-
+use flywheel_test_sandbox::TestSandbox;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use test_sandbox::TestSandbox;
 
 struct Fixture {
     sandbox: TestSandbox,
