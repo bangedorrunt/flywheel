@@ -2600,6 +2600,53 @@ mod off_runtime_tests {
         let _ = std::fs::remove_file(&socket);
     }
 
+    /// bd-0uzrq.18: the constructor must put the npub-rich index where the
+    /// reducer classifies, not in a side field. With the model index built
+    /// from pin names alone, the hex `p` tag of a mail-delivered wake resolved
+    /// zero targets and no Prompt was emitted; this asserts the ring that only
+    /// the merged index can produce.
+    #[test]
+    fn host_construction_makes_a_hex_npub_mail_ring() {
+        let _home = crate::config::test_state_home();
+        let mail = crate::mail::Mail::from_config(None)
+            .expect("in-process mail")
+            .expect("some");
+        let project = "offrt-npub-ring";
+        let key = crate::state::spawn_registry_key(project);
+        let agents = config::state_dir().join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join(format!("{key}.json")),
+            serde_json::json!([{"pane_id": "p1", "name": "h1", "mail_identity": "SwiftBay"}])
+                .to_string(),
+        )
+        .unwrap();
+        mail.register_agent(project, "SwiftBay", "test-harness", "m", "t")
+            .expect("register");
+        let npub = mail.whois(project, "SwiftBay").expect("whois")["npub"]
+            .as_str()
+            .expect("npub")
+            .to_string();
+
+        let (tx, _rx) = mpsc::channel(8);
+        let mut host =
+            RtHost::new(Config::default(), project, "offrt-npub-ring", tx).expect("host");
+        host.tick(&BrainMsg::PlaneStatus {
+            pin: "SwiftBay".into(),
+            status: "idle".into(),
+        });
+        let line = format!(
+            r#"{{"kind":9,"id":"wake-npub-1","tags":[["p","{npub}"],["t","{project}"],["toron-kind","mail-delivered"],["mid","msg-npub-1"]],"content":"[doorbell] mail from SwiftBay thread t importance normal"}}"#
+        );
+        let effects = host.tick(&BrainMsg::Watch(line));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Prompt { pin, .. } if pin == "SwiftBay")),
+            "the merged index must ring the hex npub: {effects:?}"
+        );
+    }
+
     /// Remote-daemon mail: the index build asks `whois` per registered pin
     /// through `backend::run_mail` (a `block_on`). Inline inside a runtime
     /// that panics, so it must go off the runtime. (The daemon is
