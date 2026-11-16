@@ -248,11 +248,10 @@ pub fn is_coupled(name: &str) -> bool {
 
 /// Every spelling the registry accepts, canonical names first.
 ///
-/// Only the spelling-completeness test reads it today, and it stays a `pub`
-/// registry accessor rather than a `#[cfg(test)]` helper: it is the one place
-/// the full accepted vocabulary is enumerable, which is what makes "every
-/// spelling is known" a fact rather than a claim.
-#[allow(dead_code)]
+/// The one place the full accepted vocabulary is enumerable, and only tests
+/// read it today, so it is gated: a dead-code warning here is telling the
+/// truth about a non-test build.
+#[cfg(test)]
 #[must_use]
 pub fn all_spellings() -> Vec<&'static str> {
     let mut v: Vec<&'static str> = REGISTRY.iter().map(|s| s.canonical).collect();

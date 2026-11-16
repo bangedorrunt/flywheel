@@ -160,10 +160,10 @@ const fn hc_pane_caps(harness: &'static str) -> HarnessCaps {
 
 /// Every registry harness as a capability row, canonical order.
 ///
-/// The enumeration surface (ADR-0022 V4 walks it; `row()` answers one name).
-/// Nothing in the product loops it yet, so a non-test build would flag it —
-/// the same reason `harness_registry::all_spellings` carries the allow.
-#[allow(dead_code)]
+/// The enumeration surface: ADR-0022 V4 walks it, `row()` answers one name.
+/// Test-only today — the product asks by name — and a non-test build is right
+/// to say so, so it is gated rather than allowed.
+#[cfg(test)]
 #[must_use]
 pub fn rows() -> Vec<HarnessCaps> {
     crate::harness_registry::REGISTRY
