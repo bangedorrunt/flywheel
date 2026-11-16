@@ -1,8 +1,8 @@
 //! bd-jp9z1.4: the shared test sandbox's own contract, plus the lint that
 //! refuses a test spawning the built binary without it.
 
-use std::process::Command;
 use flywheel_test_sandbox::{SCRUBBED, TestSandbox};
+use std::process::Command;
 
 /// A sandbox whose deny-shim was reached must fail on Drop — the live
 /// launchctl/systemctl must never run from a test.
