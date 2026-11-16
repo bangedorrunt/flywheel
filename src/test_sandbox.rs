@@ -42,7 +42,9 @@ impl TestSandbox {
     #[must_use]
     pub fn new() -> Self {
         let dir = tempfile::TempDir::new().expect("sandbox temp dir");
-        for sub in ["home", "config", "state", "data", "toron", "bin", "src", "cargo"] {
+        for sub in [
+            "home", "config", "state", "data", "toron", "bin", "src", "cargo",
+        ] {
             std::fs::create_dir_all(dir.path().join(sub)).expect("sandbox dir");
         }
         std::fs::write(dir.path().join("src/Cargo.toml"), "").expect("dummy Cargo.toml");
