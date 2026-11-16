@@ -5,35 +5,25 @@
 //! garbage value exits nonzero naming the accepted forms; a valid value
 //! behaves as before (exit 0, no refusal).
 
-use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
+
+use flywheel_test_sandbox::TestSandbox;
 
 fn flywheel() -> &'static str {
     env!("CARGO_BIN_EXE_flywheel")
 }
 
-struct Hermetic {
-    dir: tempfile::TempDir,
-    home: PathBuf,
+fn hermetic() -> TestSandbox {
+    let sandbox = TestSandbox::new();
+    std::fs::create_dir_all(sandbox.root().join("work")).expect("work dir");
+    sandbox
 }
 
-fn hermetic() -> Hermetic {
-    let dir = tempfile::TempDir::new().expect("temp dir");
-    let home = dir.path().join("home");
-    std::fs::create_dir_all(home.join(".config")).expect("config dir");
-    std::fs::create_dir_all(home.join(".local").join("state")).expect("state dir");
-    std::fs::create_dir_all(dir.path().join("work")).expect("work dir");
-    Hermetic { dir, home }
-}
-
-fn run_with_env(h: &Hermetic, envs: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new(flywheel());
-    cmd.env_clear();
-    cmd.env("PATH", std::env::var_os("PATH").unwrap_or_default());
-    cmd.env("HOME", &h.home);
-    cmd.env("XDG_CONFIG_HOME", h.home.join(".config"));
-    cmd.env("XDG_STATE_HOME", h.home.join(".local").join("state"));
-    cmd.current_dir(h.dir.path().join("work"));
+fn run_with_env(sandbox: &TestSandbox, envs: &[(&str, &str)]) -> Output {
+    let mut cmd = sandbox.command(flywheel());
+    // The binary shells out for some config paths; the shims still come first.
+    cmd.env("PATH", sandbox.path_env());
+    cmd.current_dir(sandbox.root().join("work"));
     for (k, v) in envs {
         cmd.env(k, v);
     }

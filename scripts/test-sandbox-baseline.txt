@@ -1,6 +1,5 @@
 tests/adr0027_slice1.rs
 tests/collab_patterns_e2e.rs
-tests/config_strict.rs
 tests/cron_cli.rs
 tests/e2e_loop_run_verify.rs
 tests/e2e_serialize_worktree.rs
