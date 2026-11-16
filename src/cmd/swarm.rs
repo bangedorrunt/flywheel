@@ -65,6 +65,10 @@ pub(crate) enum SwarmCmd {
         /// machine-readable result
         #[arg(long)]
         json: bool,
+        /// ADR-0022 D1: a planned SPAWN starts a new pane, so it needs this the
+        /// way `spawn` needs --yes past the consent gate
+        #[arg(long)]
+        yes: bool,
     },
     /// List live seats with status
     Status {
@@ -107,7 +111,8 @@ pub(crate) fn cmd_swarm(cfg: &Config, cmd: &SwarmCmd) -> Result<()> {
             patch,
             count,
             json,
-        } => cmd_swarm_apply(cfg, project, patch, count, *json),
+            yes,
+        } => cmd_swarm_apply(cfg, project, patch, count, *json, *yes),
         SwarmCmd::Status { project, json } => {
             let project = crate::cron::detect_project(cfg, project.as_deref()).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -300,6 +305,7 @@ pub(crate) fn cmd_swarm_apply(
     patches: &[String],
     counts: &[String],
     json: bool,
+    yes: bool,
 ) -> Result<()> {
     let registry = crate::state::load_spawn_registry(project);
     if registry.is_empty() {
@@ -323,7 +329,20 @@ pub(crate) fn cmd_swarm_apply(
     // ADR-0022 D1: the plan is a durable object. A legacy swarm mints its record
     // here, with the seats it runs right now as the base, so the fold is total.
     let record = crate::state::ensure_plan(project, serde_json::to_value(live_base(&rows))?)?;
-    let desired = patched_desired(&rows, patches, counts)?;
+    // Validate the ask before it becomes an event: a bad --patch must not leave
+    // a line in the plan.
+    patched_desired(&rows, patches, counts)?;
+    // ADR-0022 D1: the RECORD is the source of the seats apply reconciles — a
+    // seat the fold still plans but the fleet lacks is a planned spawn, not a
+    // seat that quietly stopped existing.
+    for spec in patches.iter() {
+        crate::state::append_plan_event(project, &format!("patch:{spec}"))?;
+    }
+    for spec in counts.iter() {
+        crate::state::append_plan_event(project, &format!("count:{spec}"))?;
+    }
+    let record = crate::state::load_plan(project).unwrap_or(record);
+    let desired = fold_plan(&record)?;
     let live: Vec<LiveSeat> = rows
         .iter()
         .map(|r| LiveSeat {
@@ -361,16 +380,17 @@ pub(crate) fn cmd_swarm_apply(
         return Ok(());
     }
 
-    // ADR-0022 D1: the event leads the effect. Append it to the plan's journal
-    // first, so a replay folds the same desired seats this call is about to run.
-    for spec in patches.iter() {
-        crate::state::append_plan_event(project, &format!("patch:{spec}"))?;
+    // ADR-0022 D1 condition 3: a planned SPAWN starts a new pane, so it takes
+    // the same consent a spawn does. Without --yes the apply refuses and names
+    // what it would start; nothing runs.
+    let spawns = planned_spawns(&applied);
+    if !spawns.is_empty() && !yes {
+        bail!(
+            "swarm apply: the plan calls for {} seat(s) the fleet lacks ({}); re-run with --yes to spawn them",
+            spawns.len(),
+            spawns.join(", ")
+        );
     }
-    for spec in counts.iter() {
-        crate::state::append_plan_event(project, &format!("count:{spec}"))?;
-    }
-    // The replay check: the journal must fold to the seats this call decided.
-    let replay = fold_plan(&crate::state::load_plan(project).unwrap_or(record.clone()))?;
     let mut journal = crate::supervisor_host::ToronEffectJournal::open(
         &format!("plan:{}", record.id),
         "swarm-apply",
@@ -394,7 +414,7 @@ pub(crate) fn cmd_swarm_apply(
         print_json(&json!({
             "project": project,
             "plan_id": record.id,
-            "journal_matches": replay == desired,
+            "plan_seats": desired.len(),
             "effects": applied.iter().map(effect_json).collect::<Vec<_>>(),
             "ran": rep.ran,
             "skipped": rep.skipped,
@@ -661,6 +681,18 @@ pub(crate) fn fold_plan(record: &crate::state::PlanRecord) -> Result<Vec<Desired
     let mut desired = patched_desired(&base, &patches, &counts)?;
     desired.retain(|d| !d.pin.as_ref().is_some_and(|p| retired.contains(p)));
     Ok(desired)
+}
+
+/// The seats an apply would START. A spawn is the one effect that adds a pane,
+/// so it is the one that needs consent.
+pub(crate) fn planned_spawns(applied: &[SeatEffect]) -> Vec<String> {
+    applied
+        .iter()
+        .filter_map(|e| match e {
+            SeatEffect::Spawn { role, count } => Some(format!("{role} x{count}")),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The base a legacy (pre-plan) swarm mints: the seats it actually runs. A
@@ -1909,6 +1941,64 @@ mod plan_of_record_tests {
                 .unwrap()
                 .live,
             2
+        );
+    }
+}
+
+#[cfg(test)]
+mod planned_spawn_tests {
+    use super::{LiveSeat, SeatRow, fold_plan, planned_spawns};
+
+    fn row(pin: &str) -> SeatRow {
+        SeatRow {
+            pin: pin.into(),
+            name: pin.into(),
+            role: "coder".into(),
+            harness: "pi".into(),
+            model: None,
+            effort: None,
+            mode: None,
+            pane_id: format!("{pin}-pane"),
+            status: "live".into(),
+        }
+    }
+
+    fn live(pin: &str) -> LiveSeat {
+        LiveSeat {
+            pin: pin.into(),
+            role: "coder".into(),
+            harness: "pi".into(),
+            model: None,
+            mode: None,
+            effort: None,
+            placement: Default::default(),
+            idle: false,
+            fresh_session: true,
+            idle_since_ms: None,
+        }
+    }
+
+    /// ADR-0022 D1 condition 3: a seat the journal plans but the fleet lacks is
+    /// a PLANNED SPAWN - named, and gated by --yes - never a silent pane.
+    #[test]
+    fn a_lost_seat_is_a_planned_spawn() {
+        let record = crate::state::PlanRecord {
+            id: "plan-lost".to_string(),
+            plan: crate::swarm_plan::Plan::new("swarm"),
+            base: Some(serde_json::to_value(vec![row("p1"), row("p2")]).unwrap()),
+            patches: Vec::new(),
+        };
+        let desired = fold_plan(&record).unwrap();
+        let policy = crate::seat_reconcile::ReconcilePolicy {
+            idle_retire_after_ms: None,
+            now_ms: 0,
+        };
+        let effects =
+            crate::seat_reconcile::reconcile(&desired, &[live("p1")], &|_| false, &policy);
+        let spawns = planned_spawns(&effects);
+        assert!(
+            !spawns.is_empty(),
+            "the lost seat is planned, not forgotten: {effects:?}"
         );
     }
 }

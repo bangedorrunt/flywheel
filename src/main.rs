@@ -12002,7 +12002,7 @@ fn cmd_binding_rebind(
         if let Some(h) = harness {
             patches.push(format!("{pin}.harness={h}"));
         }
-        return crate::cmd::swarm::cmd_swarm_apply(cfg, project, &patches, &[], false);
+        return crate::cmd::swarm::cmd_swarm_apply(cfg, project, &patches, &[], false, true);
     }
     let intent = agent_ref::RebindIntent::prepare(
         agent,
