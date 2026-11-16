@@ -1192,14 +1192,21 @@ impl EffectJournal for MemJournal {
 
 /// Close one pane per pin — the ONE `Retire*` pane effect. Returns the
 /// `(pin, pane)` pairs it closed; a pin with no bound pane is a typed error,
-/// never a silent skip. Shared by the supervisor interpreter and `flywheel
-/// retire` (which adds the lease release + deregistration around it).
+/// never a silent skip. A pane the plane no longer lists is ALREADY closed, so
+/// its row counts as closed without a close call: after a host blackout every
+/// crew pane is gone, and a close on an absent pane must not strand the pin
+/// (bd-0uzrq.21). Shared by the supervisor interpreter and `flywheel retire`
+/// (which adds the lease release + deregistration around it).
 pub(crate) fn close_panes_for_pins(
     backend: &dyn crate::backend::MultiplexerBackend,
     project: &str,
     pins: &[String],
 ) -> Result<Vec<(String, String)>, String> {
     let registry = crate::state::load_spawn_registry(project);
+    let live: Option<BTreeSet<String>> = backend
+        .pane_list(None)
+        .ok()
+        .map(|panes| panes.into_iter().map(|p| p.pane_id).collect());
     let mut closed = Vec::new();
     for pin in pins {
         let pane = registry
@@ -1208,9 +1215,11 @@ pub(crate) fn close_panes_for_pins(
             .map(|e| e.pane_id.clone())
             .filter(|p| !p.is_empty())
             .ok_or_else(|| format!("seat retire: no bound pane for {pin}"))?;
-        backend
-            .pane_close(&pane)
-            .map_err(|e| format!("seat retire {pin} ({pane}): {e}"))?;
+        if live.as_ref().is_none_or(|set| set.contains(&pane)) {
+            backend
+                .pane_close(&pane)
+                .map_err(|e| format!("seat retire {pin} ({pane}): {e}"))?;
+        }
         closed.push((pin.clone(), pane));
     }
     Ok(closed)

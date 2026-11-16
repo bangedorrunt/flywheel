@@ -796,12 +796,24 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
     struct FakeMux {
         agents: Mutex<Vec<AgentInfo>>,
         splits: AtomicUsize,
         prompts: Mutex<Vec<(String, String)>>,
         closed: Mutex<Vec<String>>,
+        panes: Mutex<Vec<String>>,
+    }
+
+    impl Default for FakeMux {
+        fn default() -> Self {
+            Self {
+                agents: Mutex::new(Vec::new()),
+                splits: AtomicUsize::new(0),
+                prompts: Mutex::new(Vec::new()),
+                closed: Mutex::new(Vec::new()),
+                panes: Mutex::new(vec!["wA:p1".to_string()]),
+            }
+        }
     }
 
     impl MultiplexerBackend for FakeMux {
@@ -815,7 +827,19 @@ mod tests {
             &self,
             _workspace_id: Option<&str>,
         ) -> Result<Vec<PaneInfo>, toron_plane::backend::BackendError> {
-            Ok(vec![pane("wA", 1)])
+            Ok(self
+                .panes
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|id| {
+                    let n = id
+                        .rsplit_once(":p")
+                        .and_then(|(_, n)| n.parse::<u32>().ok())
+                        .unwrap_or(1);
+                    pane("wA", n)
+                })
+                .collect())
         }
         fn pane_split(
             &self,
@@ -827,6 +851,14 @@ mod tests {
             Ok(pane("wA", n as u32))
         }
         fn pane_close(&self, pane_id: &str) -> Result<(), toron_plane::backend::BackendError> {
+            let mut panes = self.panes.lock().unwrap();
+            let Some(i) = panes.iter().position(|p| p == pane_id) else {
+                return Err(toron_plane::backend::BackendError::new(
+                    toron_plane::backend::BackendErrorCode::Other("pane_not_found".into()),
+                    format!("pane {pane_id} not found"),
+                ));
+            };
+            panes.remove(i);
             self.closed.lock().unwrap().push(pane_id.to_string());
             Ok(())
         }
@@ -1569,6 +1601,53 @@ mod tests {
         assert_eq!(
             mux.closed.lock().unwrap().clone(),
             vec!["wA:p1".to_string()]
+        );
+    }
+
+    /// bd-0uzrq.21: after a host blackout the registry still names panes the
+    /// plane no longer has. A close on an absent pane errors (`pane_not_found`),
+    /// which used to strand the pin before the lease release + deregistration.
+    /// An absent pane counts as closed: no close call, and retire completes.
+    #[test]
+    fn retire_gone_seat_counts_as_closed_and_retire_completes() {
+        let _g = lock_env();
+        let (cfg, _dir) = hermetic();
+        retire_registry(&[("wA:p1", "Alpha", "a-1"), ("wA:p9", "Beta", "b-1")]);
+        let mux = FakeMux::default();
+        // The plane lists wA:p1 only; Beta's wA:p9 died with the session.
+        let closed = crate::supervisor_host::close_panes_for_pins(&mux, "demo", &["Beta".into()])
+            .expect("a pane the plane no longer lists is already closed");
+        assert_eq!(closed, vec![("Beta".to_string(), "wA:p9".to_string())]);
+        assert!(
+            mux.closed.lock().unwrap().is_empty(),
+            "no close RPC for an absent pane"
+        );
+
+        let mut ports = Fake::default();
+        let mut journal = MemJournal::default();
+        let mut released: Vec<String> = Vec::new();
+        let mut release = |pin: &str| {
+            released.push(pin.to_string());
+            Ok(1u64)
+        };
+        let out = retire_with(
+            &mux,
+            &cfg,
+            "demo",
+            &["Beta".into()],
+            true,
+            &mut journal,
+            &mut ports,
+            &mut release,
+        )
+        .expect("retire a gone seat");
+        assert_eq!(out.closed, vec![("Beta".to_string(), "wA:p9".to_string())]);
+        assert_eq!(released, vec!["Beta".to_string()], "leases are released");
+        assert!(
+            crate::state::load_spawn_registry("demo")
+                .iter()
+                .all(|e| e.mail_identity.as_deref() != Some("Beta")),
+            "the row is deregistered"
         );
     }
 

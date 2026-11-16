@@ -264,3 +264,255 @@ tests = [
   "src/inbox_ports.rs::arrive_pane_prefers_rex_block_and_falls_back_when_it_is_empty",
 ]
 mutations = ["scripts/mutations/inbox-ports-arrive-pane.spec.sh#A1"]
+
+[[behavior]]
+id = "captain.idle-page-once-per-transition"
+owner = "src/cmd/captain.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/captain.rs::idle_page_fires_once_per_transition",
+  "src/cmd/captain.rs::idle_page_never_fires_for_an_empty_inbox",
+  "src/cmd/captain.rs::a_queued_deferral_is_an_unread_brief",
+  "src/cmd/captain.rs::captain_subjects_skip_crew_senders",
+]
+mutations = [
+  "scripts/mutations/captain-idle-page.spec.sh#C1",
+  "scripts/mutations/captain-idle-page.spec.sh#C2",
+  "scripts/mutations/captain-idle-page.spec.sh#C3",
+  "scripts/mutations/captain-idle-page.spec.sh#C4",
+  "scripts/mutations/captain-idle-page.spec.sh#C5",
+]
+
+[[behavior]]
+id = "crew.wake-landing-evidence"
+owner = "src/cmd/crew.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/crew.rs::a_welcome_screen_that_swallows_the_paste_is_a_typed_failure",
+  "src/cmd/crew.rs::a_stale_working_record_cannot_confirm_a_silent_wake",
+  "src/cmd/crew.rs::a_moved_screen_without_a_turn_is_not_a_landing",
+  "src/cmd/crew.rs::an_unconsumed_wake_defers_to_the_dispatcher_with_its_reason",
+]
+mutations = [
+  "scripts/mutations/crew-prompt-landing.spec.sh#L1",
+  "scripts/mutations/crew-prompt-landing.spec.sh#L2",
+  "scripts/mutations/crew-prompt-landing.spec.sh#L3",
+  "scripts/mutations/crew-prompt-landing.spec.sh#L4",
+  "scripts/mutations/crew-prompt-landing.spec.sh#L5",
+  "scripts/mutations/crew-prompt-landing.spec.sh#L6",
+]
+
+[[behavior]]
+id = "doorbell.held-prompt-queued"
+owner = "src/workspace.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/workspace.rs::a_held_prompt_is_queued_not_dropped",
+]
+mutations = [
+  "scripts/mutations/doorbell-held.spec.sh#H1",
+  "scripts/mutations/doorbell-held.spec.sh#H2",
+]
+
+[[behavior]]
+id = "doorbell.preempt-act-now"
+owner = "crates/doorbell-core/src/lib.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "crates/doorbell-core/src/lib.rs::a_peer_request_waits_for_the_prompt_instead_of_preempting_it",
+  "crates/doorbell-core/src/lib.rs::an_act_now_preempt_records_its_key_so_the_reread_is_silent",
+  "crates/doorbell-rt/src/file_host.rs::busy_presence_holds_a_peer_request_for_the_prompt",
+  "src/workspace.rs::filter_prompts_busy_urgent_breaks_through_rest_audits",
+]
+mutations = [
+  "scripts/mutations/doorbell-preempt.spec.sh#W13",
+  "scripts/mutations/doorbell-preempt.spec.sh#W14",
+  "scripts/mutations/doorbell-preempt.spec.sh#W15",
+  "scripts/mutations/doorbell-preempt-host.spec.sh#W16",
+  "scripts/mutations/doorbell-preempt-workspace.spec.sh#W17",
+]
+
+[[behavior]]
+id = "doorbell.one-directive-one-wake"
+owner = "crates/doorbell-core/src/lib.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "crates/doorbell-core/src/lib.rs::a_peer_wake_never_hides_a_captain_brief",
+  "crates/doorbell-core/src/lib.rs::one_directive_rings_once_through_two_producers",
+  "crates/doorbell-core/src/lib.rs::two_briefs_of_one_rendering_stay_two_wakes",
+  "crates/doorbell-core/src/lib.rs::the_wake_key_ignores_the_watermark_but_not_the_body",
+  "crates/doorbell-core/src/lib.rs::a_corr_supersedes_when_the_row_has_no_thread",
+  "crates/doorbell-core/src/lib.rs::a_thread_correction_supersedes_the_queued_brief",
+  "crates/doorbell-core/src/lib.rs::the_idle_edge_asks_for_the_inbox_when_the_queue_is_empty",
+  "crates/doorbell-core/src/lib.rs::a_system_notice_never_rings_and_says_so",
+]
+mutations = [
+  "scripts/mutations/doorbell-merge.spec.sh#W1",
+  "scripts/mutations/doorbell-merge.spec.sh#W2",
+  "scripts/mutations/doorbell-merge.spec.sh#W3",
+  "scripts/mutations/doorbell-merge.spec.sh#W4",
+  "scripts/mutations/doorbell-merge.spec.sh#W6",
+  "scripts/mutations/doorbell-merge.spec.sh#W7",
+  "scripts/mutations/doorbell-merge.spec.sh#W8",
+  "scripts/mutations/doorbell-merge.spec.sh#W9",
+  "scripts/mutations/doorbell-merge.spec.sh#W10",
+  "scripts/mutations/doorbell-merge.spec.sh#W11",
+  "scripts/mutations/doorbell-merge.spec.sh#W12",
+]
+
+[[behavior]]
+id = "doorbell.plane-status-change-only"
+owner = "src/doorbell_host.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/doorbell_host.rs::only_a_status_change_reaches_the_brain",
+]
+mutations = [
+  "scripts/mutations/doorbell-plane-source.spec.sh#P1",
+  "scripts/mutations/doorbell-plane-source.spec.sh#P2",
+]
+
+[[behavior]]
+id = "doorbell.status-lane-priority"
+owner = "crates/doorbell-rt/src/brain.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "crates/doorbell-rt/src/brain.rs::a_status_lane_overtakes_mail_already_queued",
+  "src/doorbell_host.rs::a_plane_status_rides_the_status_lane_when_one_is_set",
+]
+mutations = [
+  "scripts/mutations/doorbell-status-lane.spec.sh#L1",
+  "scripts/mutations/doorbell-status-lane-host.spec.sh#L2",
+]
+
+[[behavior]]
+id = "headless.phase-argv-split"
+owner = "src/headless.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/headless.rs::phase_args_never_split_a_flag_from_its_value",
+  "src/headless.rs::grok_argv_does_not_end_with_the_prompt",
+]
+mutations = [
+  "scripts/mutations/headless-phase-argv.spec.sh#H1",
+  "scripts/mutations/headless-phase-argv.spec.sh#H2",
+  "scripts/mutations/headless-phase-argv.spec.sh#H3",
+]
+
+[[behavior]]
+id = "judgment.bundled-pin-parity"
+owner = "src/judgment.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/judgment.rs::every_bundled_pack_pins_the_one_model",
+]
+mutations = [
+  "scripts/mutations/jev-pin.spec.sh#J1",
+  "scripts/mutations/jev-pin.spec.sh#J2",
+]
+
+[[behavior]]
+id = "judgment.seed-all-replaces-drift"
+owner = "src/judgment.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/judgment.rs::seed_all_replaces_a_same_version_pack_whose_bytes_differ",
+]
+mutations = ["scripts/mutations/seed-all.spec.sh#S1"]
+
+[[behavior]]
+id = "seat.rebind-journal-honesty"
+owner = "src/agent_ref.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/supervisor_host.rs::respawn_replays_one_effect_key_and_never_doubles_a_holder",
+]
+mutations = [
+  "scripts/mutations/seat-respawn.spec.sh#R1",
+  "scripts/mutations/seat-respawn.spec.sh#R2",
+]
+
+[[behavior]]
+id = "seat.respawn-takes-over-dead-claim"
+owner = "src/supervisor_host.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/supervisor_host.rs::respawn_replays_one_effect_key_and_never_doubles_a_holder",
+]
+mutations = ["scripts/mutations/seat-respawn.spec.sh#R3"]
+
+[[behavior]]
+id = "ship.land-requires-bound-receipt"
+owner = "src/cmd/ship.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/ship.rs::land_refuses_a_repo_whose_dir_is_not_its_toron_slug",
+  "src/cmd/ship.rs::a_receipt_without_mutation_witnesses_cannot_land",
+  "src/cmd/ship.rs::a_receipt_is_bound_to_the_commit_it_proved",
+]
+mutations = [
+  "scripts/mutations/ship-land-project.spec.sh#L1",
+  "scripts/mutations/ship-land-project.spec.sh#L2",
+  "scripts/mutations/ship-land-project.spec.sh#L3",
+  "scripts/mutations/ship-land-project.spec.sh#L4",
+  "scripts/mutations/ship-land-project.spec.sh#L5",
+  "scripts/mutations/ship-land-project.spec.sh#L6",
+  "scripts/mutations/ship-land-project.spec.sh#L7",
+]
+
+[[behavior]]
+id = "config.hermetic-state-home"
+owner = "src/config.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/config.rs::lock_env_pins_a_private_hermetic_state_dir",
+  "src/config.rs::drop_restores_a_foreign_prior_value_rather_than_clearing_it",
+]
+mutations = [
+  "scripts/mutations/state-home.spec.sh#M1",
+  "scripts/mutations/state-home.spec.sh#M2",
+  "scripts/mutations/state-home.spec.sh#M3",
+]
+
+[[behavior]]
+id = "main.settle-retry-budget"
+owner = "src/main.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/main.rs::settle_retry_exhaustion_returns_last_error",
+]
+mutations = [
+  "scripts/mutations/sweep-guards.spec.sh#S4",
+  "scripts/mutations/sweep-guards.spec.sh#S5",
+]
+
+[[behavior]]
+id = "mail.order-stable-by-id"
+owner = "src/cmd/mail.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/main.rs::vbf2_a_shared_microsecond_resolves_by_id_in_either_order",
+  "src/main.rs::vbf2_newest_urgent_wins_regardless_of_wire_order",
+  "src/main.rs::skills_injected_reads_the_later_registry_row_when_incarnations_tie",
+]
+mutations = [
+  "scripts/mutations/sweep-order.spec.sh#S1",
+  "scripts/mutations/sweep-order.spec.sh#S2",
+  "scripts/mutations/sweep-order.spec.sh#S3",
+]

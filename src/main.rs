@@ -9853,6 +9853,199 @@ mod hc_registry_recover_tests {
     }
 }
 
+/// bd-0uzrq.21: recover after a host blackout — no owned workspace survives and
+/// every registered pane is gone. Recover must recreate the workspace and
+/// respawn each non-captain pin under its own identity, kind and profile,
+/// instead of refusing with "no flywheel swarm".
+#[cfg(test)]
+mod recover_session_loss_tests {
+    use super::{recover_seats, recover_workspace, state};
+    use crate::backend::MultiplexerBackend;
+    use crate::config::{Config, lock_env};
+    use crate::hc::{AgentInfo, AgentStatus, BackendError, BackendErrorCode, PaneInfo, WorkspaceInfo};
+    use std::sync::Mutex;
+
+    fn pane(ws: &str, n: u32) -> PaneInfo {
+        PaneInfo {
+            pane_id: format!("{ws}:p{n}"),
+            terminal_id: format!("term-{n}"),
+            workspace_id: ws.into(),
+            tab_id: format!("{ws}:t1"),
+            focused: false,
+            agent_status: AgentStatus::Idle,
+            revision: 0,
+            title: None,
+            cwd: None,
+            agent: None,
+            agent_session: None,
+            display_agent: None,
+            foreground_cwd: None,
+            label: None,
+            scroll: None,
+            state_labels: serde_json::Map::new(),
+            terminal_title: None,
+            terminal_title_stripped: None,
+            tokens: serde_json::Map::new(),
+        }
+    }
+
+    fn agent(name: &str, pane_id: &str, ws: &str) -> AgentInfo {
+        AgentInfo {
+            agent: Some(name.to_string()),
+            agent_status: AgentStatus::Idle,
+            cwd: None,
+            display_agent: None,
+            focused: false,
+            foreground_cwd: None,
+            interactive_ready: true,
+            launch_pending: false,
+            name: Some(name.to_string()),
+            pane_id: pane_id.to_string(),
+            revision: 0,
+            state_change_seq: 0,
+            completion_seq: None,
+            state_labels: serde_json::Map::new(),
+            tab_id: "t1".into(),
+            terminal_id: "term".into(),
+            terminal_title: None,
+            workspace_id: ws.to_string(),
+        }
+    }
+
+    /// A plane that lost its session: no workspace, no panes, no agents.
+    #[derive(Default)]
+    struct LostFleet {
+        created: Mutex<Vec<Option<String>>>,
+        panes: Mutex<Vec<PaneInfo>>,
+        agents: Mutex<Vec<AgentInfo>>,
+    }
+
+    const WS: &str = "w-recreated";
+
+    impl MultiplexerBackend for LostFleet {
+        fn name(&self) -> &'static str {
+            "lost-fleet"
+        }
+        fn workspace_list(&self) -> Result<Vec<WorkspaceInfo>, BackendError> {
+            Ok(Vec::new())
+        }
+        fn workspace_create(&self, label: Option<&str>) -> Result<WorkspaceInfo, BackendError> {
+            self.created.lock().unwrap().push(label.map(str::to_string));
+            self.panes.lock().unwrap().push(pane(WS, 1));
+            Ok(WorkspaceInfo {
+                workspace_id: WS.into(),
+                number: 1,
+                label: label.unwrap_or_default().to_string(),
+                focused: false,
+                pane_count: 1,
+                tab_count: 1,
+                active_tab_id: format!("{WS}:t1"),
+                agent_status: AgentStatus::Idle,
+                cwd: None,
+            })
+        }
+        fn pane_list(&self, _ws: Option<&str>) -> Result<Vec<PaneInfo>, BackendError> {
+            Ok(self.panes.lock().unwrap().clone())
+        }
+        fn pane_split(
+            &self,
+            _parent: &str,
+            _direction: &str,
+            _cwd: Option<&str>,
+        ) -> Result<PaneInfo, BackendError> {
+            let mut panes = self.panes.lock().unwrap();
+            let p = pane(WS, panes.len() as u32 + 1);
+            panes.push(p.clone());
+            Ok(p)
+        }
+        fn agent_list(&self) -> Result<Vec<AgentInfo>, BackendError> {
+            Ok(self.agents.lock().unwrap().clone())
+        }
+        fn agent_start(
+            &self,
+            name: &str,
+            _kind: &str,
+            pane_id: &str,
+            _args: &[String],
+        ) -> Result<AgentInfo, BackendError> {
+            let a = agent(name, pane_id, WS);
+            self.agents.lock().unwrap().push(a.clone());
+            Ok(a)
+        }
+        fn agent_rename(&self, _target: &str, _name: Option<&str>) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn pane_close(&self, pane_id: &str) -> Result<(), BackendError> {
+            Err(BackendError::new(
+                BackendErrorCode::Other("pane_not_found".into()),
+                format!("pane {pane_id} not found"),
+            ))
+        }
+    }
+
+    #[test]
+    fn recover_after_session_loss_respawns_every_gone_crew_pin() {
+        let _g = lock_env();
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        std::fs::create_dir_all(dir.path().join("demo")).expect("project dir");
+        let cfg = Config {
+            workspace_root: Some(dir.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        state::save_captain_alias("demo", "SlateHarbor").expect("captain alias");
+        let crew = |pane_id: &str, name: &str, pin: &str, profile: &str| {
+            let mut e = state::SpawnEntry::with_mail_identity(pane_id, name, pin);
+            e.profile = Some(profile.to_string());
+            e
+        };
+        state::save_spawn_registry(
+            "demo",
+            &[
+                state::SpawnEntry::with_mail_identity(
+                    "block:dead:captain",
+                    "flywheel-demo-oc",
+                    "SlateHarbor",
+                ),
+                crew("block:dead:job", "flywheel-demo-job", "FrostyCreek", "coder"),
+                crew("block:dead:rev", "flywheel-demo-rev", "BoldBay", "reviewer"),
+            ],
+        )
+        .expect("registry");
+
+        let fleet = LostFleet::default();
+        let (ws_id, panes) = recover_workspace(&fleet, "demo").expect("recreate the swarm");
+        assert_eq!(ws_id, WS);
+        assert_eq!(
+            fleet.created.lock().unwrap().as_slice(),
+            &[Some("flywheel-demo".to_string())],
+            "the recreated workspace carries the swarm label"
+        );
+        let panes = panes.expect("the recreated workspace lists its root pane");
+        assert_eq!(panes.len(), 1);
+
+        let entries = state::load_spawn_registry("demo");
+        let rep =
+            recover_seats(&fleet, &cfg, "demo", &ws_id, Some(&panes), &entries, false).expect("seats");
+        assert_eq!(rep.skipped_captain, vec!["flywheel-demo-oc".to_string()]);
+        assert_eq!(rep.healthy, 0, "every crew pane is gone, none healthy");
+        assert_eq!(rep.recovered.len(), 2, "both crew pins respawn: {rep:?}", rep = rep.recovered);
+        for row in &rep.recovered {
+            assert_eq!(row["action"], "respawned");
+            assert_eq!(row["kind"], "opencode");
+        }
+        assert_eq!(rep.moved.len(), 2, "each respawn records its new pane");
+
+        let after = state::load_spawn_registry("demo");
+        assert_eq!(
+            after[1].mail_identity.as_deref(),
+            Some("FrostyCreek"),
+            "the pin identity survives the respawn"
+        );
+        assert_eq!(after[1].profile.as_deref(), Some("coder"), "role bind survives");
+        assert_eq!(after[1].name, "flywheel-demo-job");
+    }
+}
+
 /// The legacy whitelist pair for a hash: ADJECTIVES[h % 75] +
 /// NOUNS[(h >> 32) % 132], PascalCase. This is the pair shape agent-mail
 /// validates (bd-odc) — the "legacy generator" the captain's adj+noun pins
@@ -11884,26 +12077,64 @@ enum RecoverDecision<'a> {
 /// the foreground-group check. Alive agents are additionally probed for
 /// responsiveness (state_change_seq advancing across a window); a frozen +
 /// idle agent is respawned, not classified healthy.
-fn cmd_recover(cfg: &Config, project: &str, include_captain: bool) -> Result<()> {
-    // bd-hc-registry-recover-ywypf: never respawn the captain pin by default
-    // (a duplicate idle captain pane was created). Skip captain rows unless
-    // --include-captain is passed for the deliberate case; report the skip.
-    check_project_spelling(project, "recover")?;
-    let backend = backend::multiplexer_backend(cfg)?;
-    let ws_id = find_workspace_dyn(&*backend, project)?;
-    let mut entries = state::load_spawn_registry_strict(project)
-        .map_err(|e| anyhow!("{e}"))
-        .map(|current| state::merge_registry_for_mutation(project, current))?;
-    if entries.is_empty() {
-        entries = state::load_agent_names(&project_dir(cfg, project));
-    }
-    if entries.is_empty() {
+/// The workspace (and panes) a recover pass acts on. After a host blackout no
+/// owned workspace survives, and a survivor with no pane cannot anchor a split:
+/// both recreate the swarm workspace under its spawn label instead of refusing,
+/// so recover converges on a lost fleet (bd-0uzrq.21).
+fn recover_workspace(
+    backend: &dyn backend::MultiplexerBackend,
+    project: &str,
+) -> Result<(String, Option<Vec<hc::PaneInfo>>)> {
+    let label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
+    let recreate = |why: String| -> Result<(String, Option<Vec<hc::PaneInfo>>)> {
+        let ws = backend.workspace_create(Some(&label))?;
         eprintln!(
-            "flywheel: no spawn registry for {project} — re-run `flywheel spawn {project}` to record pane→name bindings"
+            "flywheel: recover {project}: {why} — created workspace {} ({label})",
+            ws.workspace_id
         );
-        print_json(&json!({ "project": project, "recovered": 0, "registry": "empty" }));
-        return Ok(());
+        let panes = backend.pane_list(Some(&ws.workspace_id)).ok();
+        Ok((ws.workspace_id, panes))
+    };
+    let ws_id = match find_workspace_dyn(backend, project) {
+        Ok(id) => id,
+        Err(e) => {
+            // An owned workspace that exists but resolves ambiguously is a
+            // different problem; only total loss recreates.
+            if find_workspaces_dyn(backend, project).is_ok() {
+                return Err(e);
+            }
+            return recreate("no swarm workspace survived".to_string());
+        }
+    };
+    let panes = backend.pane_list(Some(&ws_id)).ok();
+    if panes.as_ref().is_some_and(Vec::is_empty) {
+        return recreate(format!("workspace {ws_id} has no pane to anchor a respawn"));
     }
+    Ok((ws_id, panes))
+}
+
+/// One recover pass's outcome.
+#[derive(Default)]
+struct RecoverReport {
+    recovered: Vec<Value>,
+    healthy: usize,
+    moved: Vec<(String, String)>,
+    skipped_captain: Vec<String>,
+}
+
+/// The recover interpreter: one registry row at a time, decide from the live
+/// plane whether the seat is healthy, needs its name rebound, or is gone and
+/// must be respawned under its own pin, kind and profile. Takes the plane as a
+/// trait object so a fake backend proves each branch.
+fn recover_seats(
+    backend: &dyn backend::MultiplexerBackend,
+    cfg: &Config,
+    project: &str,
+    ws_id: &str,
+    pane_list: Option<&[hc::PaneInfo]>,
+    entries: &[state::SpawnEntry],
+    include_captain: bool,
+) -> Result<RecoverReport> {
     let kinds = spawn_kinds_from_log(project);
     let agents = backend.agent_list()?;
     let mut probe = (backend.name() == "hc")
@@ -11911,7 +12142,6 @@ fn cmd_recover(cfg: &Config, project: &str, include_captain: bool) -> Result<()>
         .flatten();
     let mut recovered: Vec<Value> = Vec::new();
     let mut healthy = 0usize;
-    let pane_list = backend.pane_list(Some(&ws_id)).ok();
     let pane_exists = |id: &str| {
         pane_list
             .as_ref()
@@ -11928,7 +12158,7 @@ fn cmd_recover(cfg: &Config, project: &str, include_captain: bool) -> Result<()>
         .and_then(|m| m.name.clone())
         .or_else(|| state::load_captain_alias(project));
     let mut skipped_captain: Vec<String> = Vec::new();
-    for entry in &entries {
+    for entry in entries {
         if !include_captain && is_captain_entry(entry, captain_pin.as_deref()) {
             skipped_captain.push(entry.name.clone());
             eprintln!(
@@ -12027,6 +12257,48 @@ fn cmd_recover(cfg: &Config, project: &str, include_captain: bool) -> Result<()>
             }
         }
     }
+    Ok(RecoverReport {
+        recovered,
+        healthy,
+        moved,
+        skipped_captain,
+    })
+}
+
+fn cmd_recover(cfg: &Config, project: &str, include_captain: bool) -> Result<()> {
+    // bd-hc-registry-recover-ywypf: never respawn the captain pin by default
+    // (a duplicate idle captain pane was created). Skip captain rows unless
+    // --include-captain is passed for the deliberate case; report the skip.
+    check_project_spelling(project, "recover")?;
+    let backend = backend::multiplexer_backend(cfg)?;
+    let mut entries = state::load_spawn_registry_strict(project)
+        .map_err(|e| anyhow!("{e}"))
+        .map(|current| state::merge_registry_for_mutation(project, current))?;
+    if entries.is_empty() {
+        entries = state::load_agent_names(&project_dir(cfg, project));
+    }
+    if entries.is_empty() {
+        eprintln!(
+            "flywheel: no spawn registry for {project} — re-run `flywheel spawn {project}` to record pane→name bindings"
+        );
+        print_json(&json!({ "project": project, "recovered": 0, "registry": "empty" }));
+        return Ok(());
+    }
+    let (ws_id, pane_list) = recover_workspace(&*backend, project)?;
+    let RecoverReport {
+        recovered,
+        healthy,
+        moved,
+        skipped_captain,
+    } = recover_seats(
+        &*backend,
+        cfg,
+        project,
+        &ws_id,
+        pane_list.as_deref(),
+        &entries,
+        include_captain,
+    )?;
     if !moved.is_empty() {
         for e in entries.iter_mut() {
             if let Some((_, new)) = moved.iter().find(|(old, _)| old == &e.pane_id) {
