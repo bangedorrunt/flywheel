@@ -18,9 +18,7 @@ mutation "A1  a held proof slot no longer counts as work" \
 mutation "A2  a moving pane no longer counts as activity" \
     file=src/cmd/captain.rs \
     expect=an_unchanged_screen_is_a_stall_and_a_moving_one_is_not \
-    find='    if p.activity_age_secs
-        .is_some_and(|age| age < p.stall_secs)
-    {
+    find='    if p.activity_age_secs.is_some_and(|age| age < p.stall_secs) {
         return StallVerdict::Working;
     }
 ' \
