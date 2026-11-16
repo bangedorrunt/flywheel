@@ -139,6 +139,8 @@ This is the whole fix for false-green previews. It also makes ADR-0021's coarse 
 
 Launch goes through the adapter on **both** planes, so rex and hc launch `[harness.pa]` the same way. `antigravity` / `agy` / `ag` / `antigravity-cli` become one row with `bin = "agy"` and `hc_target = "antigravity_cli"`.
 
+**What the one table became (2026-11-17, bd-6setu.1).** Three of the six tables were the same domain and are now merged into `harness_registry::REGISTRY`: the coupled-model set, the launch columns (model/effort/read-only/plan/implement argv, plus the pane env-pin rule), and the capability rows (`harness_caps::rows()` derives one per registry row from one const shape; aliases answer through `canonical`). Two are a **different** domain and are pinned by a relationship test rather than merged, because merging would widen what flywheel launches: `hc::INTEGRATION_KINDS` is the multiplexer's vocabulary and a superset, so every registry row that is an hc pane names an `hc_target` the list really has; `profile::compiled_in_harnesses` holds recipe spawn commands for harnesses the registry does not declare, so a recipe name must never also be a registry row. V8 is witnessed by `rex_and_hc_build_the_same_launch_for_one_seat`. The honest summary is three merged, two related, one witnessed — not six logos collapsing into one.
+
 ### D4. Models: resolve generously, refuse precisely
 
 - **Bare names resolve when unambiguous.** `--model glm-5.3` resolves to `zai/glm-5.3` if exactly one registered key ends in that id. Ambiguity is `blocked` with the candidates listed.
@@ -361,7 +363,7 @@ Every row below was checked by grepping the named test and mutation at `3af56271
 |---|---|---|---|
 | D1 plan is a durable object | `plan_record_mints_once_and_keeps_the_patch_log`, `retire_journals_the_plan_event`, `the_fold_rebuilds_the_desired_seats_from_the_journal`, `the_plan_of_record_counts_the_journal_not_the_fleet`, `a_legacy_base_excludes_gone_rows`, `a_lost_seat_is_a_planned_spawn` | `plan-record P1`, `plan-retire T1`, `plan-fold F1`, `plan-of-record R1`, `plan-spawn-consent S1` | closed by bd-6setu.3 |
 | D2 one precedence rule | `prefer_spawn_user_model_wins` | `D2` | closed |
-| D3 adapters say what they honour | `harness_default_plan_says_honored_and_the_launch_injects_nothing`, `dry_run_ambiguous_from_profile_is_degraded` | none | **open: bd-6setu.1** (the adapter table is that bead's) |
+| D3 adapters say what they honour | `every_row_answers_the_launch_columns`, `capability_rows_are_the_registry`, `the_coupled_resolver_follows_the_registry_rows`, `every_hc_pane_row_names_a_real_integration`, `compiled_in_recipe_harnesses_are_not_registry_rows`, `harness_default_plan_says_honored_and_the_launch_injects_nothing`, `dry_run_ambiguous_from_profile_is_degraded` | `harness-registry-launch-columns L1`, `caps-rows-follow-registry R1`, `harness-registry-coupled C1`, `registry-relationship-tests H1`, `H2` | closed by bd-6setu.1: three tables merged, two pinned by relationship (see D3's note) |
 | D4 bare ids resolve or refuse | `resolve_ask_retired_without_replacement_is_retired` | `D4` | closed |
 | D5 consent asks only on change | `needs_consent_lists_jev_field`, `needs_consent_over_budget_lists_estimate`, `consent_policy_serializes_in_plan`, `plan_gate_names_items_and_hint`; `signoff` deleted (bd-6setu.4) | `D5` | closed |
 | D6 standing preferences | `prefer_spawn_model_from_preference` | `D6` | closed |
@@ -379,7 +381,7 @@ Every row below was checked by grepping the named test and mutation at `3af56271
 | V5 env-delivered model never relaunches | `seat_reconcile_env_model_gives_respawn_fresh` | `V5` | closed |
 | V6 no hop on Timeout/Unknown/empty evidence | `timeout_alone_never_allows_rebind`, `billing_with_evidence_allows_profile_hop` | `adr0022-gates V6` | closed (bd-6setu.7) |
 | V7 precedence is never inverted | `prefer_spawn_user_model_wins`, `seat_reconcile_precedence_harness_model_one_respawn` | `D2` | closed for user > preference; stage/profile/slot/Jev rows ride the same resolver |
-| V8 rex and hc produce the same launch command | none | none | **open: bd-6setu.1** |
+| V8 rex and hc produce the same launch command | `rex_and_hc_build_the_same_launch_for_one_seat` (argv token-for-token behind the env prefix, and the env-delivered half) | `launch-parity V8` | closed by bd-6setu.1 |
 | V9 reconciler idempotent | `seat_reconcile_no_change_gives_keep` | `V9` | closed |
 | V10 binder never gives a review to its author | `seat_binder_reviewer_never_author` | `V10` | closed |
 | V11 one live pane per pin, reservations survive | `Respawn.tla` (`.agents/skills/verify-protocol-tla/models/`): positive config `Respawn` holds `OneLiveHolder` and `ReservationsKept`; `Respawn.broken-claim-before-free` is refuted on `OneLiveHolder` and `Respawn.broken-drop-reservations` on `ReservationsKept` | `scripts/verify-formal.sh` (bd-6setu.9) | closed: TLC 1.8.0, `verify-formal.sh` 35 passed / 0 failed |
