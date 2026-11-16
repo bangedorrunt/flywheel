@@ -129,14 +129,18 @@ mod tests {
     fn a_blocked_bead_rings_once_per_episode() {
         let mut set = EscalateSet::default();
         let e = esc(ObserveKind::BlockedBead, "bd-a", "unblock it earlier");
-        assert_eq!(set.new_since(&[e.clone()]).len(), 1, "first sighting rings");
+        assert_eq!(
+            set.new_since(std::slice::from_ref(&e)).len(),
+            1,
+            "first sighting rings"
+        );
         assert!(
-            set.new_since(&[e.clone()]).is_empty(),
+            set.new_since(std::slice::from_ref(&e)).is_empty(),
             "the same episode is silent on the next sweep"
         );
         assert!(set.new_since(&[]).is_empty(), "resolved: nothing to say");
         assert_eq!(
-            set.new_since(&[e]).len(),
+            set.new_since(std::slice::from_ref(&e)).len(),
             1,
             "a recurrence after resolution rings again"
         );
