@@ -1114,3 +1114,15 @@ tests = [
 mutations = [
   "scripts/mutations/harness-registry-coupled.spec.sh#C1",
 ]
+
+[[behavior]]
+id = "harness.rex-and-hc-build-one-launch"
+owner = "src/pane.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/pane.rs::rex_and_hc_build_the_same_launch_for_one_seat",
+]
+mutations = [
+  "scripts/mutations/launch-parity.spec.sh#V8",
+]

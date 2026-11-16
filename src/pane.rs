@@ -5858,6 +5858,73 @@ steps:
         assert!(engine.is_ok(), "local engine constructs off-runtime");
     }
 
+    /// ADR-0022 V8: rex and hc build the SAME launch for one seat. The argv is
+    /// one decision (`bare_model_launch`); the planes differ only in transport
+    /// (rex an `env K=V` prefix, hc an env map), so the command tail must be
+    /// identical token for token.
+    #[test]
+    fn rex_and_hc_build_the_same_launch_for_one_seat() {
+        let choice = crate::models::ModelChoice::Model("zai/glm-5.3".into());
+        let (args, env_pin) =
+            crate::bare_model_launch("pi", &choice, "", Some("high")).expect("pi launch");
+        assert!(
+            env_pin.is_none(),
+            "pi delivers its model by argv, so both planes carry it in the command: {env_pin:?}"
+        );
+        let pane_env: BTreeMap<String, String> = [(
+            "FLYWHEEL_AGENT".to_string(),
+            "Ada".to_string(),
+        )]
+        .into_iter()
+        .collect();
+
+        // hc hands (kind, args) to the pane API; rex renders the same pair.
+        let hc_command: Vec<String> = std::iter::once("pi".to_string())
+            .chain(args.iter().cloned())
+            .collect();
+        let rex = rex_env_command(&pane_env, "pi", &args);
+        // Transport differs (rex prefixes `env K=V`); the COMMAND must not.
+        let rex_tail: Vec<&str> = rex
+            .split_whitespace()
+            .skip_while(|t| *t != "pi")
+            .collect();
+        assert_eq!(
+            rex_tail.join(" "),
+            hc_command.join(" "),
+            "behind the env prefix the rex command IS the hc argv: {rex}"
+        );
+
+        // The env-delivered harness is the other half: the model rides the env
+        // pin on BOTH planes and the command carries no model flag.
+        let (oc_args, oc_env) = crate::bare_model_launch(
+            "opencode",
+            &crate::models::ModelChoice::Model("zai/glm-5.3".into()),
+            "",
+            None,
+        )
+        .expect("opencode launch");
+        assert!(
+            oc_env.is_some(),
+            "opencode delivers by env, so the pin is the delivery"
+        );
+        assert!(
+            !oc_args.iter().any(|a| a.contains("glm-5.3")),
+            "an env-delivered model must not also ride argv: {oc_args:?}"
+        );
+        let oc_rex = rex_env_command(&pane_env, "opencode", &oc_args);
+        let oc_tail: Vec<&str> = oc_rex
+            .split_whitespace()
+            .skip_while(|t| *t != "opencode")
+            .collect();
+        assert_eq!(
+            oc_tail,
+            std::iter::once("opencode")
+                .chain(oc_args.iter().map(String::as_str))
+                .collect::<Vec<_>>(),
+            "the env-delivered seat keeps the same shape on both planes: {oc_rex}"
+        );
+    }
+
     /// bd-6setu.2 / V10 at the dispatch level: when the journal says the
     /// reviewer's pin authored the work under review, the binder must not hand
     /// that step back to it, and with no journal author it may reuse freely.
