@@ -888,7 +888,10 @@ impl ModelRegistry {
     /// foreign-provider id (operator note, `resolve_profile_route_full`
     /// step 4: grok with no family id fails loud, never the premium zai id).
     pub fn coupled_default_model(&self, harness: &str) -> Option<String> {
-        if !matches!(harness, "grok" | "claude" | "codex") {
+        // The coupled SET is a harness fact and lives on the registry row
+        // (bd-6setu.1, ADR-0022 D3): one table, not a second `matches!` here.
+        let harness = crate::harness_registry::canonical(harness);
+        if !crate::harness_registry::is_coupled(&harness) {
             return None;
         }
         let mut user = self.models.keys().filter(|k| {
@@ -2463,6 +2466,35 @@ model = "opencode/big-pickle"
         assert_eq!(harness, "claude");
         assert_eq!(model, "claude/sonnet-x");
         assert_eq!(route, "coupled_default");
+    }
+
+    /// bd-6setu.1 (ADR-0022 D3): the coupled set is the REGISTRY row, and the
+    /// resolver follows it. A second `matches!` beside the table drifts the
+    /// moment a row changes, and the seat is then handed (or refused) a model
+    /// for the wrong reason.
+    #[test]
+    fn the_coupled_resolver_follows_the_registry_rows() {
+        let reg = reg_with_keys(&[
+            "grok/grok-4.5",
+            "codex/gpt-5",
+            "claude/sonnet-x",
+            "pi/pi-3",
+            "opencode/big",
+        ]);
+        for spec in crate::harness_registry::REGISTRY {
+            let got = reg.coupled_default_model(spec.canonical);
+            assert_eq!(
+                got.is_some(),
+                spec.coupled,
+                "coupled_default_model({}) must follow the registry row (coupled={}), got {got:?}",
+                spec.canonical,
+                spec.coupled
+            );
+        }
+        assert!(
+            reg.coupled_default_model("some-config-harness").is_none(),
+            "an unknown harness has no row, so it is never coupled"
+        );
     }
 
     /// bd-88m4: coupled no-model defaults follow the grok pattern — a

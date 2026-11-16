@@ -66,6 +66,10 @@ pub struct HarnessSpec {
     /// Slot a bare spawn rides when the profile names no model. `None` means
     /// the harness launches model-less.
     pub implied_slot: Option<&'static str>,
+    /// bd-6setu.1 (ADR-0022 D3): this harness runs only its OWN model family
+    /// (model-opaque), so a seat with no registered family id is blocked
+    /// rather than handed a foreign-provider default.
+    pub coupled: bool,
 }
 
 /// The registry. Adding a harness is a one-line change HERE, and the fences at
@@ -76,48 +80,56 @@ pub const REGISTRY: &[HarnessSpec] = &[
         aliases: &["oc"],
         tier: HarnessTier::Open,
         implied_slot: Some(SLOT_CHEAP),
+        coupled: false,
     },
     HarnessSpec {
         canonical: "pi",
         aliases: &[],
         tier: HarnessTier::Open,
         implied_slot: Some(SLOT_STANDARD),
+        coupled: false,
     },
     HarnessSpec {
         canonical: "grok",
         aliases: &["gk"],
         tier: HarnessTier::Closed,
         implied_slot: Some(SLOT_PREMIUM),
+        coupled: true,
     },
     HarnessSpec {
         canonical: "codex",
         aliases: &[],
         tier: HarnessTier::Closed,
         implied_slot: None,
+        coupled: true,
     },
     HarnessSpec {
         canonical: "claude",
         aliases: &[],
         tier: HarnessTier::Closed,
         implied_slot: None,
+        coupled: true,
     },
     HarnessSpec {
         canonical: "fx",
         aliases: &[],
         tier: HarnessTier::Open,
         implied_slot: None,
+        coupled: false,
     },
     HarnessSpec {
         canonical: "antigravity",
         aliases: &["agy", "ag"],
         tier: HarnessTier::Closed,
         implied_slot: None,
+        coupled: false,
     },
     HarnessSpec {
         canonical: "gemini",
         aliases: &["gm"],
         tier: HarnessTier::Closed,
         implied_slot: None,
+        coupled: false,
     },
 ];
 
@@ -157,6 +169,15 @@ pub fn tier_of(name: &str) -> Option<HarnessTier> {
 #[must_use]
 pub fn implied_slot(name: &str) -> Option<&'static str> {
     spec(name).and_then(|s| s.implied_slot)
+}
+
+/// Does `name` run only its own model family (ADR-0022 D3, bd-6setu.1)?
+///
+/// One table answers this: the coupled set lives on the row, never in a second
+/// `matches!` beside it.
+#[must_use]
+pub fn is_coupled(name: &str) -> bool {
+    spec(name).is_some_and(|s| s.coupled)
 }
 
 /// Every spelling the registry accepts, canonical names first.
@@ -409,5 +430,36 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(got, want);
+    }
+
+    /// bd-6setu.1 (ADR-0022 D3): the coupled set is a REGISTRY fact. The
+    /// resolver reads the flag, so a harness that gains or loses its family
+    /// coupling cannot keep answering from a stale `matches!` beside it.
+    #[test]
+    fn the_coupled_set_is_the_registry_row() {
+        let coupled: Vec<&str> = REGISTRY
+            .iter()
+            .filter(|s| s.coupled)
+            .map(|s| s.canonical)
+            .collect();
+        assert_eq!(
+            coupled,
+            vec!["grok", "codex", "claude"],
+            "the coupled set is exactly the model-opaque CLIs"
+        );
+        for spec in REGISTRY {
+            assert_eq!(
+                is_coupled(spec.canonical),
+                spec.coupled,
+                "is_coupled must answer from the row for {}",
+                spec.canonical
+            );
+        }
+        assert!(is_coupled("gk"), "an alias answers for its row");
+        assert!(!is_coupled("pi"));
+        assert!(
+            !is_coupled("some-config-harness"),
+            "an unknown harness is not coupled by default"
+        );
     }
 }

@@ -1100,3 +1100,16 @@ mutations = [
   "scripts/mutations/proof-suite-and-isolation.spec.sh#T1",
   "scripts/mutations/proof-suite-and-isolation.spec.sh#T2",
 ]
+
+[[behavior]]
+id = "harness.coupled-set-is-the-registry-row"
+owner = "src/harness_registry.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/harness_registry.rs::the_coupled_set_is_the_registry_row",
+  "src/models.rs::the_coupled_resolver_follows_the_registry_rows",
+]
+mutations = [
+  "scripts/mutations/harness-registry-coupled.spec.sh#C1",
+]
