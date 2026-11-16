@@ -272,6 +272,21 @@ tests = [
 mutations = ["scripts/mutations/clean-proof-slot.spec.sh#S1", "scripts/mutations/clean-proof-slot.spec.sh#S2"]
 
 [[behavior]]
+id = "observe.escalation-carrier"
+owner = "crates/doorbell-core/src/observe.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "crates/doorbell-core/src/observe.rs::every_escalation_line_carries_its_lesson",
+  "crates/doorbell-core/src/observe.rs::a_blocked_bead_rings_once_per_episode",
+  "crates/doorbell-core/src/observe.rs::kind_and_subject_are_both_part_of_the_episode_key",
+]
+mutations = [
+  "scripts/mutations/observe-escalation.spec.sh#L1",
+  "scripts/mutations/observe-escalation.spec.sh#E1",
+]
+
+[[behavior]]
 id = "wave.verify-json-carrier"
 owner = "src/cmd/internal.rs"
 status = "proven"
@@ -877,7 +892,7 @@ mutations = [
 
 [[behavior]]
 id = "ledger.citing-sha-may-live-in-another-repo"
-owner = "src/cmd/ledger.rs::cmd_ledger"
+owner = "src/cmd/ledger.rs"
 status = "proven"
 concurrent = false
 tests = [

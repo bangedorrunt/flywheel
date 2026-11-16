@@ -35,6 +35,8 @@ pub enum EventClass {
     P2p,
 }
 
+pub mod observe;
+
 /// A watch/inbox edge the dispatcher might ring on.
 #[derive(Debug, Clone)]
 pub struct RingInput {
