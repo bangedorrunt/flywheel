@@ -1829,6 +1829,46 @@ mod tests {
         );
     }
 
+    /// The other half of the contract (bd-0uzrq.20): a ROUTABLE pin whose rows
+    /// the fold does not decide keeps its cursor, so the next sweep re-reads
+    /// them. That hold is how a wake survives until the pane can take it, and
+    /// it must never be parked like an unroutable pin.
+    #[tokio::test]
+    async fn bd20_routable_pin_keeps_its_cursor_on_undecided_rows() {
+        let name = "bd20-routable-hold";
+        let script: Vec<Vec<Effect>> = (0..4).map(|_| vec![Effect::FetchInbox]).collect();
+        let (mut brain, _rx, _tx) = test_brain(name, script);
+        brain.host.pin_list = vec!["PinA".to_string()];
+        let rows = vec![serde_json::json!({
+            "id": "m1",
+            "subject": "brief from a peer",
+            "sender": "Peer",
+            "created_ts_us": 1_000_000_500i64,
+        })];
+        let t0 = 1_000_000u64;
+        for step in [0u64, 1] {
+            let floor = doorbell_core::redelivery_floor_rfc3339(t0 + step);
+            brain
+                .host
+                .inbox
+                .insert(("PinA".to_string(), floor), rows.clone());
+        }
+        brain.dispatch(BrainMsg::Sweep { now: t0 }).await;
+        brain.dispatch(BrainMsg::Sweep { now: t0 + 1 }).await;
+        assert!(
+            !brain.wake.since_by_pin.contains_key("PinA"),
+            "a routable pin keeps its cursor while its rows are undecided"
+        );
+        assert_eq!(
+            brain
+                .host
+                .fetch_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "and it is re-read on every sweep, not parked"
+        );
+    }
+
     /// bd-0uzrq.17: the status lane is polled BEFORE mail. With one channel a
     /// status queued behind a backlog of mail-bound dispatches reached the fold
     /// 76-155s late (live 16:16-16:19Z) and the idle edge it carried drained
