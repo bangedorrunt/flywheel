@@ -1588,6 +1588,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// bd-ifqqx: the audit must stay writable across a rotation BURST. Live,
+    /// the audit went silent after one; here several rotations run and the
+    /// rotation row after them still lands, with no tear in the fold.
+    #[test]
+    fn a_rotation_burst_keeps_the_audit_writable() {
+        let (st, dir) = test_store("rot-burst");
+        let rotations = |st: &FileStore| {
+            std::fs::read_to_string(st.audit_file("w"))
+                .map(|raw| {
+                    raw.lines()
+                        .filter(|l| l.contains("journal_rotated"))
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        for seq in 1..=6000u64 {
+            append_seq(&st, "w", seq);
+        }
+        let after_burst = rotations(&st);
+        assert!(
+            after_burst >= 2,
+            "the burst must rotate more than once, got {after_burst}"
+        );
+        for seq in 6001..=6600u64 {
+            append_seq(&st, "w", seq);
+        }
+        assert!(
+            rotations(&st) > after_burst,
+            "the audit keeps receiving rows after the burst"
+        );
+        let fold = st.fold_workspace("w");
+        assert!(fold.torn.is_none(), "no tear across the burst: {:?}", fold.torn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// bd-bj9xk-adjacent (live tear): concurrent appenders plus rotation never
     /// produce an unparseable row. The one-write-under-lock append is what
     /// makes it hold; the old `writeln!` issued two syscalls and a rotation
