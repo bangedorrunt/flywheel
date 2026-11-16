@@ -78,14 +78,14 @@ seats:
     count: 2
     harness:  { value: pi,        from: user }
     model:    { value: zai/glm-5.3, from: preference, note: "project pref coder.model" }
-    effort:   { value: high,      from: jev, confidence: 0.81 }
+    effort:   { value: high,      from: jev }
     mode:     { value: workspace-write, from: profile }
     context:  warm             # warm (reuse a live pane) | fresh (cold start)
     placement: pane            # pane | headless
     status:   honored          # honored | degraded{reason} | blocked{remedy}
   - role: reviewer
     count: 1
-    harness:  { value: grok,      from: jev, confidence: 0.74 }
+    harness:  { value: grok,      from: jev }
     model:    { value: grok/grok-4.5, from: coupled-default }
     effort:   { value: high,      from: slot }
     mode:     { value: read-only, from: profile }
@@ -329,7 +329,7 @@ Each phase ships alone and changes no default behaviour until its last step.
 ## 6. Acceptance
 
 1. `flywheel spawn proj --gemini --model gemini-2.5-pro --dry-run --json` shows `model.status = honored` and the argv contains `-m gemini-2.5-pro`. The same call with `--harness fx` shows `blocked`.
-2. `flywheel briefing "<goal>" --json` lists every Jev-filled field with confidence and a non-empty `needs_consent` when Jev changed a profile choice.
+2. `flywheel briefing "<goal>" --json` lists every Jev-filled field with its provenance (`from: jev`) and a non-empty `needs_consent` when Jev changed a profile choice. It does **not** carry a per-field confidence: that number is Jev's own ranking input (`CONFIDENCE_FLOOR` in `src/jev_rank.rs`), consumed inside the ranker and never carried outward, and a plan field with no reader is exactly what D5's `signoff` mistake taught us to refuse.
 3. A patch `reviewer.harness=pi` re-filters the reviewer's model and clears that consent entry.
 4. A remembered preference suppresses the same question in the next session.
 5. A 429 on an opencode seat with a `model_fallback` respawns the seat with the new model, keeps the pin and its bead reservations, and journals one `RebindIntent`.
@@ -389,7 +389,7 @@ Every row below was checked by grepping the named test and mutation at `3af56271
 | # | Claim | Witness | Status |
 |---|---|---|---|
 | 1 | `spawn --gemini --model gemini-2.5-pro` shows honored and the argv carries it; `--harness fx` shows blocked | `harness_default_plan_says_honored_and_the_launch_injects_nothing` (honored half) | **partial: bd-6setu.10** — the gemini/fx pair is not pinned |
-| 2 | `briefing --json` lists Jev-filled fields with confidence and non-empty consent | `attach_consent_plan` + `needs_consent_lists_jev_field` | **partial: bd-6setu.11** — the plan carries no confidence field |
+| 2 | `briefing --json` lists Jev-filled fields with provenance and non-empty consent | `attach_consent_plan` + `needs_consent_lists_jev_field` | closed by narrowing (bd-6setu.11): no confidence field, because no consumer reads one |
 | 3 | a harness patch re-filters the model and clears the entry | `plan_patch_harness_refilters_model_and_clears_consent` | closed, mutation `A3` |
 | 4 | a remembered preference suppresses the question | `prefer_spawn_model_from_preference` | closed, mutation `D6` |
 | 5 | a 429 on an env-pinned seat respawns, keeps pin and reservations, journals one `RebindIntent` | `billing_with_evidence_allows_profile_hop`, `is_rate_limited_detects_429` | **partial: bd-6setu.12** — the end-to-end respawn+journal row is not witnessed |
