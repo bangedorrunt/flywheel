@@ -39,6 +39,7 @@ mod crew_menu;
 mod cron;
 mod daemon;
 mod decide;
+mod dispatch_bindings;
 mod doorbell;
 mod doorbell_host;
 mod doorbell_supervise;

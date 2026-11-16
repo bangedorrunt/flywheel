@@ -1558,6 +1558,7 @@ pub(crate) fn review_bind(
     spec: &toron_workflow::schema::DispatchSpec,
     entries: &LiveRegistry,
     crew_max: usize,
+    journal_authors: &std::collections::BTreeSet<String>,
 ) -> Option<crate::seat_binder::Binding> {
     if profile_name != "reviewer"
         || spec.context != Some(toron_workflow::schema::ContextMode::Fresh)
@@ -1593,7 +1594,13 @@ pub(crate) fn review_bind(
         .get("author_pin")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let author_pin = explicit_author.or_else(|| author.and_then(|e| e.mail_identity.clone()));
+    // The journal is the authority on who ran the reads (bd-6setu.2); the
+    // planner heuristic is the fallback for a run with no rows yet.
+    let mut authors: std::collections::BTreeSet<String> = journal_authors.clone();
+    if let Some(pin) = explicit_author.or_else(|| author.and_then(|e| e.mail_identity.clone())) {
+        authors.insert(pin);
+    }
+    let author_pin = authors.iter().next().cloned();
     let author_model = author.and_then(|e| e.model.clone().or_else(|| e.model_pin.clone()));
     let candidates: Vec<String> = seats
         .iter()
@@ -1612,7 +1619,7 @@ pub(crate) fn review_bind(
         model,
         mode: None,
         context: crate::stages::StageContext::Fresh,
-        reviews_author: author_pin.into_iter().collect(),
+        reviews_author: authors,
     };
     Some(crate::seat_binder::bind(
         &need,
@@ -1642,6 +1649,33 @@ pub fn pane_dispatch(
     action: &Action,
     copy_index: Option<usize>,
 ) -> Result<Value> {
+    pane_dispatch_scoped(
+        catalog, project, wf_name, inputs, entries, action, copy_index, None,
+    )
+}
+
+/// The run scope a pane step is dispatched under (bd-6setu.2). A durable-body
+/// leaf knows its run and node; every other caller does not, and passes
+/// `None` — no scope, no binding row, no guessed author.
+#[derive(Debug, Clone, Copy)]
+pub struct DispatchScope<'a> {
+    pub run_id: &'a str,
+    pub node_path: &'a str,
+}
+
+/// [`pane_dispatch`] with the run scope that makes the dispatch bindable. The
+/// binding row is written BEFORE the pane prompt, keyed (run, node, step).
+#[allow(clippy::too_many_arguments)]
+pub fn pane_dispatch_scoped(
+    catalog: &ProfileCatalog,
+    project: &str,
+    wf_name: &str,
+    inputs: &Value,
+    entries: &LiveRegistry,
+    action: &Action,
+    copy_index: Option<usize>,
+    scope: Option<&DispatchScope<'_>>,
+) -> Result<Value> {
     let Action::DispatchJob { spec, .. } = action else {
         if matches!(action, Action::Spawn { .. }) {
             bail!(
@@ -1668,7 +1702,28 @@ pub fn pane_dispatch(
     let crew_max = crate::config::Config::load()
         .map(|c| c.crew_max() as usize)
         .unwrap_or(crate::crew::DEFAULT_CREW_MAX as usize);
-    let bound = review_bind(profile_name, spec, entries, crew_max);
+    // bd-6setu.2 / V10: a review step's authors are the pins bound to the steps
+    // its stage READS, in THIS run. No scope (headless, loop Send, plane-S) =
+    // no journal authors, and the binder falls back to its planner heuristic.
+    let journal_authors = scope.map_or_else(std::collections::BTreeSet::new, |scope| {
+        let steps: std::collections::BTreeSet<String> = headless::dispatch_spec_stage(spec)
+            .and_then(|stage| {
+                crate::stages::StageLibrary::load()
+                    .ok()?
+                    .get_stage(stage)
+                    .cloned()
+            })
+            .map(|stage| {
+                stage
+                    .reads
+                    .iter()
+                    .filter_map(|r| r.strip_prefix("steps.").map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        crate::dispatch_bindings::authors_for(project, scope.run_id, &steps)
+    });
+    let bound = review_bind(profile_name, spec, entries, crew_max, &journal_authors);
     let bound_entry: Option<SpawnEntry> = match &bound {
         Some(crate::seat_binder::Binding::Reuse { pin })
         | Some(crate::seat_binder::Binding::FreshSession { pin })
@@ -1766,6 +1821,19 @@ pub fn pane_dispatch(
             },
         },
     };
+    // bd-6setu.2: the binding is journaled BEFORE the prompt, so a crash
+    // between the two leaves a claim that the pane may not have received —
+    // the safe direction for V10. Keyed (run, node, step), so a replay adds
+    // nothing. A scope-less caller writes no row at all.
+    if let Some(scope) = scope {
+        let pin = entry
+            .mail_identity
+            .clone()
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or_else(|| entry.name.clone());
+        let step = headless::dispatch_spec_stage(spec).unwrap_or(profile_name);
+        crate::dispatch_bindings::append(project, scope.run_id, scope.node_path, step, &pin)?;
+    }
     eprintln!(
         "flywheel: dispatch @{} → {} ({})",
         profile_name, entry.name, entry.pane_id
@@ -4581,7 +4649,14 @@ mod tests {
             ),
             crew_row("w1:p3", "reviewer-diff", "reviewer", "ZzDiff", "openai/gpt"),
         ]);
-        let first = review_bind("reviewer", spec, &entries, 5).expect("review binding");
+        let first = review_bind(
+            "reviewer",
+            spec,
+            &entries,
+            5,
+            &std::collections::BTreeSet::new(),
+        )
+        .expect("review binding");
         assert!(
             matches!(
                 &first,
@@ -4590,7 +4665,13 @@ mod tests {
             "audit binds a non-author seat of a different family: {first:?}"
         );
         assert_eq!(
-            review_bind("reviewer", spec, &entries, 5),
+            review_bind(
+                "reviewer",
+                spec,
+                &entries,
+                5,
+                &std::collections::BTreeSet::new()
+            ),
             Some(first),
             "a replay binds identically"
         );
@@ -4623,7 +4704,14 @@ mod tests {
             ),
             crew_row("w1:p2", "other", "reviewer", "OtherPin", "openai/gpt"),
         ]);
-        let b = review_bind("reviewer", &spec, &entries, 5).expect("binding");
+        let b = review_bind(
+            "reviewer",
+            &spec,
+            &entries,
+            5,
+            &std::collections::BTreeSet::new(),
+        )
+        .expect("binding");
         assert!(
             matches!(&b, Binding::Other { pin } | Binding::FreshSession { pin } if pin == "OtherPin"),
             "the authoring reviewer is never bound: {b:?}"
@@ -5769,6 +5857,112 @@ steps:
     fn local_engine_constructs_without_a_runtime() {
         let engine = toron_workflow::WorkflowEngine::local();
         assert!(engine.is_ok(), "local engine constructs off-runtime");
+    }
+
+    /// bd-6setu.2 / V10 at the dispatch level: when the journal says the
+    /// reviewer's pin authored the work under review, the binder must not hand
+    /// that step back to it, and with no journal author it may reuse freely.
+    #[test]
+    fn review_bind_refuses_every_journal_author() {
+        let catalog = test_catalog_with_reviewer_harness("pi");
+        let _ = &catalog;
+        let entries = as_live(vec![
+            SpawnEntry {
+                pane_id: "w1:p1".into(),
+                name: "crew-goal-reviewer".into(),
+                profile: Some("reviewer".into()),
+                harness: Some("pi".into()),
+                model: Some("zai/glm-5.3".into()),
+                model_pin: None,
+                effort: None,
+                mode: None,
+                skills_digest: None,
+                mail_identity: Some("BlueLake".into()),
+                harness_session: None,
+                skills_injected: false,
+                incarnation: 0,
+            },
+            SpawnEntry {
+                pane_id: "w1:p2".into(),
+                name: "crew-goal-reviewer-2".into(),
+                profile: Some("reviewer".into()),
+                harness: Some("pi".into()),
+                model: Some("grok/grok-4.5".into()),
+                model_pin: None,
+                effort: None,
+                mode: None,
+                skills_digest: None,
+                mail_identity: Some("RedStone".into()),
+                harness_session: None,
+                skills_injected: false,
+                incarnation: 0,
+            },
+        ]);
+        let spec = toron_workflow::schema::DispatchSpec {
+            profile: Some("@reviewer".into()),
+            context: Some(toron_workflow::schema::ContextMode::Fresh),
+            ..Default::default()
+        };
+        let authored: std::collections::BTreeSet<String> =
+            ["BlueLake".to_string()].into_iter().collect();
+        let bound = review_bind("reviewer", &spec, &entries, 5, &authored)
+            .expect("a fresh reviewer dispatch binds");
+        let chosen = match &bound {
+            crate::seat_binder::Binding::Reuse { pin }
+            | crate::seat_binder::Binding::FreshSession { pin }
+            | crate::seat_binder::Binding::Other { pin }
+            | crate::seat_binder::Binding::Patch { pin, .. } => pin.clone(),
+            other => panic!("expected a seat, got {other:?}"),
+        };
+        assert_ne!(
+            chosen, "BlueLake",
+            "the author of the work under review never reviews it"
+        );
+
+        let none = std::collections::BTreeSet::new();
+        let free = review_bind("reviewer", &spec, &entries, 5, &none)
+            .expect("a fresh reviewer dispatch binds");
+        assert!(
+            matches!(
+                free,
+                crate::seat_binder::Binding::Reuse { .. }
+                    | crate::seat_binder::Binding::FreshSession { .. }
+                    | crate::seat_binder::Binding::Other { .. }
+                    | crate::seat_binder::Binding::Patch { .. }
+            ),
+            "with no journal author the binder is free: {free:?}"
+        );
+    }
+
+    /// bd-6setu.2: only the scoped pane dispatch writes a binding row. Headless
+    /// and the loop's Send never do — nothing there knows the run, and a
+    /// guessed author is worse than none.
+    #[test]
+    fn only_the_scoped_pane_dispatch_writes_a_binding() {
+        let pane_src = include_str!("pane.rs")
+            .split("mod tests")
+            .next()
+            .expect("the production half");
+        assert_eq!(
+            pane_src.matches("dispatch_bindings::append(").count(),
+            1,
+            "one writer, inside the scope branch"
+        );
+        let append_at = pane_src
+            .find("dispatch_bindings::append(")
+            .expect("the append call exists");
+        let guard_at = pane_src
+            .find("if let Some(scope) = scope {")
+            .expect("the scope guard exists");
+        assert!(
+            guard_at < append_at,
+            "the append sits inside the run-scope guard"
+        );
+        let headless_src = include_str!("headless.rs");
+        assert!(
+            !headless_src.contains("dispatch_bindings::append"),
+            "a headless dispatch writes no binding row"
+        );
     }
 }
 

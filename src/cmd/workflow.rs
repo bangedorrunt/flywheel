@@ -831,7 +831,15 @@ pub(crate) fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         let project_c = project.to_string();
                         pane_ctx = Some(ctx);
                         Arc::new(move |inv: &toron_workflow::engine::ActionInvocation| {
-                            pane::pane_dispatch(
+                            // bd-6setu.2: the durable leaf knows its run and
+                            // node, so a pane dispatch here is bindable. The
+                            // run id is the journal key; an empty one (a
+                            // context that cannot name its run) writes no row.
+                            let scope = pane::DispatchScope {
+                                run_id: inv.run.run_id.as_str(),
+                                node_path: inv.run.node_path.as_str(),
+                            };
+                            pane::pane_dispatch_scoped(
                                 &catalog,
                                 &project_c,
                                 &wf_name,
@@ -841,6 +849,7 @@ pub(crate) fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                                 toron_workflow::identity::copy_ordinal(
                                     inv.run.iteration_key.as_deref(),
                                 ),
+                                Some(&scope),
                             )
                         })
                     }
@@ -2179,9 +2188,12 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
         );
     }
 
-    // bd-jhz8x.4 (ADR-0021 D6): an unused stage fails this gate. The 30-day
-    // set comes from the run log; a proof has none, so there a stage counts as
-    // used iff the catalog references it (the gate takes no ambient state).
+    // bd-jhz8x.4 (ADR-0021 D6): an unreferenced stage is REPORTED, never fatal.
+    // The catalog is also the manual dispatch surface (`flywheel send --stage`,
+    // crew compose tokens like `scout:fresh-eyes-explore`) and that use is
+    // invisible to a scan of the builtin workflows, so a hard failure here made
+    // `verify` depend on the operator's run log — the one thing this gate must
+    // not do. The 30-day set stays as a hint when a run log exists.
     let unused: Vec<String> = {
         let rows = crate::stages::StageLibrary::load_layered(None)
             .unwrap_or_default()
@@ -2200,7 +2212,7 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
         let names: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
         crate::stages::unused_stages(&names, &referenced, &recent)
     };
-    let ok = reports.iter().all(|r| r.ok) && unused.is_empty();
+    let ok = reports.iter().all(|r| r.ok);
     let body = serde_json::json!({
         "schema": "flywheel-workflow-verify.v2",
         "ok": ok,
@@ -2616,15 +2628,24 @@ mod workflow_verify_statechart_tests {
     #[test]
     fn statechart_verify_passes_the_shipped_charts() {
         let _env = crate::config::lock_env();
-        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        // BOTH homes: the config tier supplies stages, and the state tier holds
+        // the run log the unused-stage hint reads. Sandboxing only one made this
+        // gate depend on whatever the operator last ran.
+        let prev_cfg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_state = std::env::var_os("XDG_STATE_HOME");
         let dir = std::env::temp_dir().join(format!("fw-verify-tier-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp config home");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
         let ok = cmd_workflow_verify(None, false, true).is_ok();
-        match prev {
+        match prev_cfg {
             Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
             None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        match prev_state {
+            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
         }
         let _ = std::fs::remove_dir_all(&dir);
         assert!(ok, "the shipped tiers verify cleanly");
