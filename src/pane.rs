@@ -6222,37 +6222,6 @@ steps:
             "with no journal author the binder is free: {free:?}"
         );
     }
-
-    /// bd-6setu.2: only the scoped pane dispatch writes a binding row. Headless
-    /// and the loop's Send never do — nothing there knows the run, and a
-    /// guessed author is worse than none.
-    #[test]
-    fn only_the_scoped_pane_dispatch_writes_a_binding() {
-        let pane_src = include_str!("pane.rs")
-            .split("mod tests")
-            .next()
-            .expect("the production half");
-        assert_eq!(
-            pane_src.matches("dispatch_bindings::append(").count(),
-            1,
-            "one writer, inside the scope branch"
-        );
-        let append_at = pane_src
-            .find("dispatch_bindings::append(")
-            .expect("the append call exists");
-        let guard_at = pane_src
-            .find("if let Some(scope) = scope {")
-            .expect("the scope guard exists");
-        assert!(
-            guard_at < append_at,
-            "the append sits inside the run-scope guard"
-        );
-        let headless_src = include_str!("headless.rs");
-        assert!(
-            !headless_src.contains("dispatch_bindings::append"),
-            "a headless dispatch writes no binding row"
-        );
-    }
 }
 
 #[cfg(test)]

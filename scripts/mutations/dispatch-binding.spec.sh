@@ -6,7 +6,7 @@
 CARGO_ARGS=(-p flywheel --bin flywheel)
 TEST_FILTER=(
     review_bind_refuses_every_journal_author
-    only_the_scoped_pane_dispatch_writes_a_binding
+    the_binding_row_is_durable_before_the_prompt_port_runs
 )
 
 PANE=src/pane.rs
@@ -19,7 +19,7 @@ mutation "B1  the binder borrows the author the journal names" \
 
 mutation "B2  the scoped pane dispatch writes no binding row" \
     file=$PANE \
-    expect=only_the_scoped_pane_dispatch_writes_a_binding \
+    expect=the_binding_row_is_durable_before_the_prompt_port_runs \
     find='        crate::dispatch_bindings::append(
             project,
             ctx.scope.run_id,
