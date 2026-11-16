@@ -2286,7 +2286,8 @@ mod stage_contract_tests {
         )
         .expect("stage file");
         let mut lib = StageLibrary::compiled_in();
-        lib.apply_stage_entry_path(&path, Tier::Project).expect("load stage");
+        lib.apply_stage_entry_path(&path, Tier::Project)
+            .expect("load stage");
 
         let mut wf = toron_workflow::schema::parse_workflow(
             "name: stamp\nsteps:\n  - name: execute\n    action: dispatch_job\n    assignee: x\n    spec: { task: go, stage: ce-execute }\n    on_error: fail_run\n  - name: review\n    action: dispatch_job\n    assignee: x\n    spec: { task: check, stage: claim-review }\n    on_error: fail_run\n  - name: verify\n    action: dispatch_job\n    assignee: x\n    spec: { task: verify, stage: wave-verify }\n    on_error: fail_run\n",
@@ -2298,7 +2299,11 @@ mod stage_contract_tests {
             "exactly the review step is stamped"
         );
         let spec_of = |name: &str| -> toron_workflow::schema::DispatchSpec {
-            let step = wf.steps.iter().find(|s| s.name.as_deref() == Some(name)).expect("step");
+            let step = wf
+                .steps
+                .iter()
+                .find(|s| s.name.as_deref() == Some(name))
+                .expect("step");
             match &step.action {
                 toron_workflow::schema::Action::DispatchJob { spec, .. } => spec.clone(),
                 other => panic!("{name} is a dispatch: {}", other.type_name()),
@@ -2310,11 +2315,17 @@ mod stage_contract_tests {
             "only steps.* refs become claim exclusions (inputs.* never do)"
         );
         assert!(
-            spec_of("execute").extra.get("exclude_claimants_of").is_none(),
+            spec_of("execute")
+                .extra
+                .get("exclude_claimants_of")
+                .is_none(),
             "an execute step carries no exclusion"
         );
         assert!(
-            spec_of("verify").extra.get("exclude_claimants_of").is_none(),
+            spec_of("verify")
+                .extra
+                .get("exclude_claimants_of")
+                .is_none(),
             "wave-verify is not a review-witness step"
         );
 
@@ -2324,7 +2335,11 @@ mod stage_contract_tests {
             1
         );
         let spec_of = |name: &str| -> toron_workflow::schema::DispatchSpec {
-            let step = wf.steps.iter().find(|s| s.name.as_deref() == Some(name)).expect("step");
+            let step = wf
+                .steps
+                .iter()
+                .find(|s| s.name.as_deref() == Some(name))
+                .expect("step");
             match &step.action {
                 toron_workflow::schema::Action::DispatchJob { spec, .. } => spec.clone(),
                 other => panic!("{name} is a dispatch: {}", other.type_name()),

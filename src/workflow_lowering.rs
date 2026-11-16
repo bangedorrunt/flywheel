@@ -546,7 +546,9 @@ fn stamp_action_claims(action: &mut Action, stages: &crate::stages::StageLibrary
             }
             spec.extra.insert(
                 "exclude_claimants_of".to_string(),
-                serde_json::Value::Array(nodes.into_iter().map(serde_json::Value::String).collect()),
+                serde_json::Value::Array(
+                    nodes.into_iter().map(serde_json::Value::String).collect(),
+                ),
             );
             1
         }
