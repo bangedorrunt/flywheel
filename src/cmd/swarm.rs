@@ -1672,3 +1672,53 @@ mod tests {
         );
     }
 }
+
+/// bd-6setu.2: the binder's view of a live seat. `seat_rows` is the one
+/// registry+plane fold (`swarm status`), so the dispatch cannot see a
+/// different fleet than the operator does.
+pub(crate) fn live_seat(row: &SeatRow) -> crate::seat_binder::LiveSeat {
+    crate::seat_binder::LiveSeat {
+        pin: row.pin.clone(),
+        role: row.role.as_str().to_string().into(),
+        harness: row.harness.as_str().to_string().into(),
+        model: row.model.clone(),
+        mode: row.mode.clone(),
+        effort: row.effort.clone(),
+        placement: crate::seat_binder::SeatPlacement::Pane,
+        idle: matches!(row.status.as_str(), "idle" | "done" | "blocked"),
+        fresh_session: false,
+        idle_since_ms: None,
+    }
+}
+
+#[cfg(test)]
+mod live_seat_tests {
+    use super::*;
+
+    /// The mapping keeps the identity the binder answers with and reads the
+    /// injectable statuses as idle (a working pane is not borrowable).
+    #[test]
+    fn a_seat_row_maps_to_the_binders_live_seat() {
+        let row = SeatRow {
+            pin: "SlateHarbor".into(),
+            name: "t".into(),
+            role: "reviewer".to_string().into(),
+            harness: "opencode".to_string().into(),
+            model: Some("m".into()),
+            effort: Some("high".into()),
+            mode: Some("read-only".into()),
+            pane_id: "block:1".into(),
+            status: "idle".into(),
+        };
+        let live = live_seat(&row);
+        assert_eq!(live.pin, "SlateHarbor");
+        assert_eq!(live.role.as_str(), "reviewer");
+        assert!(live.idle, "idle is borrowable");
+        assert_eq!(live.model.as_deref(), Some("m"));
+        let busy = SeatRow {
+            status: "working".into(),
+            ..row
+        };
+        assert!(!live_seat(&busy).idle, "a working seat is never borrowed");
+    }
+}
