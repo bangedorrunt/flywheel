@@ -188,6 +188,33 @@ pub fn read_snapshot(flywheel_state: &Path, workspace: &str) -> Option<WakeBrain
     serde_json::from_slice(&raw).ok()
 }
 
+/// The last line the brain ACCEPTED, persisted across consumer restarts.
+///
+/// Without it a replacement consumer resumed from origin: the sidecar sent its
+/// whole retention (measured 26h), the brain channel filled, lines were
+/// dropped, and the replacement resumed from the same origin again.
+#[must_use]
+pub fn cursor_path(flywheel_state: &Path, workspace: &str) -> PathBuf {
+    flywheel_state
+        .join("doorbell")
+        .join(format!("{workspace}.wake-cursor"))
+}
+
+pub fn write_cursor(flywheel_state: &Path, workspace: &str, cursor: &str) {
+    let path = cursor_path(flywheel_state, workspace);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, cursor);
+}
+
+#[must_use]
+pub fn read_cursor(flywheel_state: &Path, workspace: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(cursor_path(flywheel_state, workspace)).ok()?;
+    let cursor = raw.trim();
+    (!cursor.is_empty()).then(|| cursor.to_string())
+}
+
 /// Write the snapshot atomically (tmp + rename, 0600 like the audit rows).
 pub fn write_snapshot(path: &Path, snap: &WakeBrainSnapshot) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
@@ -461,6 +488,21 @@ impl WatchForwarder {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// The resume cursor survives a restart: an absent file reads as `None`,
+    /// and a written cursor reads back trimmed so the next consumer resumes at
+    /// the line the brain accepted instead of the sidecar's origin.
+    #[test]
+    fn cursor_round_trips_and_absent_reads_none() {
+        let dir = std::env::temp_dir().join(format!("wb-cursor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(read_cursor(&dir, "ws"), None);
+        write_cursor(&dir, "ws", "1099:abc\n");
+        assert_eq!(read_cursor(&dir, "ws").as_deref(), Some("1099:abc"));
+        write_cursor(&dir, "ws", "");
+        assert_eq!(read_cursor(&dir, "ws"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// toron#17: every `events_lost` frame is counted exactly, persisted at
     /// once, and degrades health; a quiet run counts zero (negative control).

@@ -38,7 +38,6 @@ pub struct RtHost {
     project: String,
     workspace: String,
     model: workspace::WorkspaceModel,
-    index: doorbell::SelfIndex,
     generation: Option<doorbell::WatcherGen>,
     exe_path: PathBuf,
     brain_tx: mpsc::Sender<BrainMsg>,
@@ -122,6 +121,9 @@ fn wake_outcome_to_brain(
         WakeOutcome::Watch(l) => match fw.forward(l) {
             f if f.reached_brain() => {
                 doorbell_rt::watchbeat::touch_event(&config::state_dir(), workspace);
+                if let Some(cursor) = fw.resume_cursor() {
+                    doorbell_rt::wake_brain::write_cursor(&config::state_dir(), workspace, &cursor);
+                }
                 if let Ok(mut r) = retry.lock() {
                     r.reset();
                 }
@@ -235,7 +237,8 @@ impl RtHost {
             .clone()
             .map(crate::run_state_recorder::spawn_writer);
         let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flywheel"));
-        let index = build_index(&cfg, project);
+        let rich_index = build_index(&cfg, project);
+        merge_index(&mut model.doorbell.index, &rich_index);
         let now = unix_now();
         let index_pins = state::load_spawn_registry(project)
             .iter()
@@ -246,7 +249,6 @@ impl RtHost {
             project: project.to_string(),
             workspace: workspace.to_string(),
             model,
-            index,
             generation: None,
             exe_path,
             brain_tx,
@@ -841,6 +843,15 @@ fn build_index(cfg: &Config, project: &str) -> doorbell::SelfIndex {
     })
 }
 
+/// Union, never replace: the watcher must keep resolving every pin pane status
+/// already taught it (a manual attach may never reach the spawn registry), and
+/// the registry pass adds the npubs that kind-9 `p` tags carry.
+fn merge_index(into: &mut doorbell::SelfIndex, from: &doorbell::SelfIndex) {
+    for pin in from.pin_names() {
+        into.insert_pin(pin.to_string(), from.npub(pin).map(str::to_string));
+    }
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1061,7 +1072,7 @@ impl Host for RtHost {
     /// the hear tracker treats the ring as npub-less and an agent that
     /// answers is still reported unanswered forever.
     fn pin_npub(&self, pin: &str) -> Option<String> {
-        self.index.npub(pin).map(str::to_string)
+        self.model.doorbell.index.npub(pin).map(str::to_string)
     }
 
     /// Fetch-only slice of the old sweep arm (classify + prompt moved to
@@ -1139,7 +1150,8 @@ impl Host for RtHost {
         let pins_now: Vec<String> = self.registry_pins();
         let now = unix_now();
         if pins_now != self.index_pins || now.saturating_sub(self.index_refreshed_at) >= 60 {
-            self.index = build_index(&self.cfg, &self.project);
+            let rich_index = build_index(&self.cfg, &self.project);
+            merge_index(&mut self.model.doorbell.index, &rich_index);
             self.index_pins = pins_now;
             self.index_refreshed_at = now;
         }
@@ -1417,7 +1429,7 @@ async fn run_embedded_async(
         host.wake_counters.clone(),
         host.wake_resume.clone(),
     );
-    let bus_armed = {
+    let bus_armed = if arm_in_process_bus(&doorbell_rt::wake_sock::wake_sock_path()) {
         let (cfg_b, project_b, workspace_b, tx_b) = (
             cfg.clone(),
             project.to_string(),
@@ -1438,6 +1450,8 @@ async fn run_embedded_async(
             ))
         })
         .await?
+    } else {
+        false
     };
     if !bus_armed {
         let tx_w = tx.clone();
@@ -1457,7 +1471,7 @@ async fn run_embedded_async(
             &project,
             workspace,
             &config::state_dir(),
-            None,
+            doorbell_rt::wake_brain::read_cursor(&config::state_dir(), workspace),
             retired,
             move |out| {
                 wake_outcome_to_brain(
@@ -1612,6 +1626,14 @@ fn stale_binary_exit() -> anyhow::Result<()> {
          supervisor restarts this host on the new binary (re-run the command \
          to retire quietly instead of supervising it)"
     )
+}
+
+/// The in-process bus only fans out events published by THIS process. A toron
+/// daemon publishes mail in its own process and streams it through the wake
+/// socket, so arming the bus while that socket exists would shadow the only
+/// live source with a subscription that never sees a mail event.
+fn arm_in_process_bus(wake_socket: &std::path::Path) -> bool {
+    !wake_socket.exists()
 }
 
 /// In-process bus watch (zero fork): kinds mirror the CLI fallback filter.
@@ -2539,10 +2561,43 @@ mod off_runtime_tests {
         let (tx, _rx) = mpsc::channel(8);
         let mut host =
             RtHost::new(Config::default(), "offrt-npub", "offrt-npub", tx).expect("host");
-        host.index
+        host.model
+            .doorbell
+            .index
             .insert_pin("SwiftBay".into(), Some("AB12".into()));
         assert_eq!(host.pin_npub("SwiftBay").as_deref(), Some("ab12"));
         assert_eq!(host.pin_npub("NoSuchPin"), None);
+    }
+
+    /// bd-0uzrq.18: the watcher index is the union of the pins pane status
+    /// already taught the model and the npub-rich registry build. Replacing it
+    /// would forget an attached pin; skipping the merge would leave the hex
+    /// `p` tag of every mail-delivered wake unresolved.
+    #[test]
+    fn merge_index_keeps_status_pins_and_adds_registry_npubs() {
+        let mut into = doorbell::SelfIndex::from_pins(["AttachedPin"]);
+        let mut from = doorbell::SelfIndex::default();
+        from.insert_pin("RegistryPin".into(), Some("AB12".into()));
+        from.insert_pin("AttachedPin".into(), Some("cd34".into()));
+        merge_index(&mut into, &from);
+        assert_eq!(into.resolve("ab12").as_deref(), Some("RegistryPin"));
+        assert_eq!(into.resolve("cd34").as_deref(), Some("AttachedPin"));
+        assert!(into.resolve("AttachedPin").is_some());
+    }
+
+    /// bd-0uzrq.18: the daemon's wake socket is the live door when it exists.
+    /// The in-process bus is only the no-daemon fallback, so a mail published
+    /// in the daemon process is not shadowed by a subscription that never
+    /// sees it.
+    #[test]
+    fn in_process_bus_is_only_armed_without_a_wake_socket() {
+        let dir = std::env::temp_dir().join(format!("offrt-wake-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("wake.sock");
+        assert!(arm_in_process_bus(&socket));
+        std::fs::write(&socket, b"").unwrap();
+        assert!(!arm_in_process_bus(&socket));
+        let _ = std::fs::remove_file(&socket);
     }
 
     /// Remote-daemon mail: the index build asks `whois` per registered pin
