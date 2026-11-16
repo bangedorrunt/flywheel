@@ -37,14 +37,15 @@ trap cleanup EXIT
 . "$ROOT/scripts/proof-lib.sh"
 DEST="$TMP/flywheel"
 proof_archive "$REPO" "$SHA" "$DEST" || { echo "fence: cannot export $SHA" >&2; exit 1; }
-# Siblings exactly as clean-proof archives them: pinned revisions from
-# proof.toml, git objects only, at the directory names the Cargo path deps use.
+# The fence proves the COMMIT, not the tree, including the pins: the siblings
+# come from the fenced revision's proof.toml (bd-gmrxv), never from the working
+# tree, so a shared tree's dirty pin cannot change what "GREEN at <sha>" covers.
 while IFS=$'\t' read -r rel pin; do
     [ -n "${rel:-}" ] || continue
     sib_repo="$(cd "$REPO/$rel" && pwd)"
     proof_archive "$sib_repo" "$pin" "$TMP/$(basename "$rel")" \
         || { echo "fence: cannot archive sibling $rel at $pin" >&2; exit 1; }
-done < <(proof_siblings "$REPO")
+done < <(proof_siblings "$REPO" "$SHA")
 echo "fence: $SHA exported to $DEST"
 cd "$DEST"
 

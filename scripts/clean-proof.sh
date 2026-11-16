@@ -7,8 +7,10 @@
 #   verify` with a hermetic XDG_CONFIG_HOME · doorbell crates · verify-clippy ·
 #   verify-formal (TLC) · verify-coverage (the behavior ledger).
 #
-# Siblings come from proof.toml (path + rev); their rev is archived from git
-# objects, never a dirty working tree. No proof.toml means a single-repo project.
+# Siblings come from proof.toml (path + rev), read from the PROVEN revision
+# (bd-gmrxv: a dirty working-tree pin cannot move the proof); their rev is
+# archived from git objects, never a dirty working tree. No proof.toml means a
+# single-repo project.
 #
 # Mutations: `--mutations changed` (the landing default) runs every spec under
 # scripts/mutations/ whose target files changed since the `[mutations] base` pin
@@ -250,7 +252,7 @@ while IFS='	' read -r rel pin; do
   SIBLING_RECORDS="$SIBLING_RECORDS$rel=$pin
 "
   echo "clean-proof: sibling $rel @ $pin"
-done < <(proof_siblings "$ROOT")
+done < <(proof_siblings "$ROOT" "$PROVEN_SHA")
 
 # bd-jp9z1.3: specs whose spec file or targets changed most recently run
 # first, so a fresh edit fails the proof early instead of after every other
@@ -353,7 +355,7 @@ if [ -n "$MUTATIONS_MODE" ] && [ -z "$FAILED_STEP" ]; then
   mut_scoped=0
   mut_changed=""
   if [ "$MUTATIONS_MODE" = changed ]; then
-    mut_base="$(proof_mutation_base "$ROOT")"
+    mut_base="$(proof_mutation_base "$ROOT" "$PROVEN_SHA")"
     if [ -n "$mut_base" ] && git -C "$ROOT" cat-file -e "${mut_base}^{commit}" 2>/dev/null; then
       mut_scoped=1
       mut_changed="$(git -C "$ROOT" diff --name-only "$mut_base..$PROVEN_SHA" || true)"

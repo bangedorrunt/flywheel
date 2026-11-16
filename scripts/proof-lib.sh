@@ -3,35 +3,48 @@
 # (bd-v6j35). Sourced, never executed. Every function is side-effect free
 # unless its name says otherwise.
 
-# proof_siblings <repo-root>
-# Print one `path<TAB>rev` line per [[sibling]] in <repo-root>/proof.toml.
+# proof_toml <repo-root> [<rev>]
+# The proof.toml a proof of <rev> must use. With a rev the blob is read from
+# that commit, so another lane's dirty pin cannot move what "proved at <sha>"
+# covers (bd-gmrxv); without one the working copy is the input by definition.
+proof_toml() {
+  local root="$1" rev="${2:-}"
+  if [ -n "$rev" ]; then
+    git -C "$root" show "$rev:proof.toml" 2>/dev/null || true
+  elif [ -f "$root/proof.toml" ]; then
+    cat "$root/proof.toml"
+  fi
+}
+
+# proof_siblings <repo-root> [<rev>]
+# Print one `path<TAB>rev` line per [[sibling]] in the proof.toml of <rev>
+# (bd-gmrxv), or in the working tree when no rev is given.
 # No file, or no [[sibling]] block: print nothing (single-repo project).
 proof_siblings() {
-  local root="$1" cfg="$1/proof.toml"
-  [ -f "$cfg" ] || return 0
-  awk '
+  local root="$1" rev="${2:-}"
+  proof_toml "$root" "$rev" | awk '
     /^\[\[sibling\]\]/ { if (path != "") print path "\t" rev; path=""; rev=""; in_block=1; next }
     /^\[/ { if (path != "") print path "\t" rev; path=""; rev=""; in_block=0; next }
     in_block && /^[[:space:]]*path[[:space:]]*=/ { v=$0; sub(/^[^=]*=[[:space:]]*"/,"",v); sub(/".*/,"",v); path=v }
     in_block && /^[[:space:]]*rev[[:space:]]*=/ { v=$0; sub(/^[^=]*=[[:space:]]*"/,"",v); sub(/".*/,"",v); rev=v }
     END { if (path != "") print path "\t" rev }
-  ' "$cfg"
+  '
 }
 
-# proof_mutation_base <repo-root>
-# Print the `[mutations] base` revision from proof.toml, or nothing. It is the
-# last revision a FULL mutation run covered, so a landing only re-proves the
-# specs whose target files changed since then. Unset means "no base": every
-# spec runs (the safe default, and what a fresh clone does).
+# proof_mutation_base <repo-root> [<rev>]
+# Print the `[mutations] base` revision from the proof.toml of <rev> (bd-gmrxv;
+# working tree when no rev is given), or nothing. It is the last revision a
+# FULL mutation run covered, so a landing only re-proves the specs whose target
+# files changed since then. Unset means "no base": every spec runs (the safe
+# default, and what a fresh clone does).
 proof_mutation_base() {
-  local root="$1" cfg="$1/proof.toml"
-  [ -f "$cfg" ] || return 0
-  awk '
+  local root="$1" rev="${2:-}"
+  proof_toml "$root" "$rev" | awk '
     /^\[/ { in_block = ($0 ~ /^\[mutations\]/) ; next }
     in_block && /^[[:space:]]*base[[:space:]]*=/ {
       v=$0; sub(/^[^=]*=[[:space:]]*"/,"",v); sub(/".*/,"",v); print v; exit
     }
-  ' "$cfg"
+  '
 }
 
 # proof_archive <source-repo> <rev> <dest-dir>
