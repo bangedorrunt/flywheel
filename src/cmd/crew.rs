@@ -639,7 +639,14 @@ pub(crate) fn wake_is_busy(err: &str) -> bool {
 /// Both refusals mean the same thing to the caller — the mail is delivered and
 /// the ring is not on the pane yet — so both defer to the dispatcher.
 pub(crate) fn wake_is_deferrable(err: &str) -> bool {
-    wake_is_busy(err) || err.contains("wake line did not land")
+    wake_is_busy(err) || err.contains("wake line did not land") || wake_is_redundant(err)
+}
+
+/// bd-8wdgn: the box already holds our own queued wake line. The mail is
+/// stored and only the ring is redundant, so the prompt succeeds with
+/// queued:true rather than looking like a failed send.
+fn wake_is_redundant(err: &str) -> bool {
+    err.contains("a wake line is already queued")
 }
 
 /// A busy or unconsumed pane's mail is already delivered; the ring is deferred
@@ -1505,6 +1512,31 @@ mod tests {
             )],
             "the line is typed either way — the failure is that nothing consumed it"
         );
+    }
+
+    /// bd-8wdgn: when the box already holds our own queued wake line, the mail
+    /// is stored and only the ring is redundant. The prompt SUCCEEDS carrying
+    /// queued:true (exit 0), so a scripted send is not reported as a failure.
+    #[test]
+    fn an_already_queued_wake_line_succeeds_with_queued_true() {
+        let _g = crate::config::test_state_home();
+        let mut deferred = false;
+        let out = finish_prompt(
+            Err("deferred: a wake line is already queued for BlueRidge; nothing was typed, and the mail stays queued".to_string()),
+            || {
+                deferred = true;
+                Ok(())
+            },
+        )
+        .expect("a redundant wake is not a failed send");
+        assert_eq!(out.0, QUEUED_WAKE, "the operator line says the mail landed");
+        assert!(
+            out.1
+                .as_deref()
+                .is_some_and(|why| why.contains("already queued")),
+            "and the journal names the wake line: {out:?}"
+        );
+        assert!(deferred, "the deferral is recorded for the dispatcher");
     }
 
     /// And an unconsumed wake must not vanish: it goes back to the queue as a
