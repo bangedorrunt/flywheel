@@ -932,12 +932,17 @@ fn cmd_crew_done(
             continue;
         };
         let wm = recipient_wm(project, &captain);
-        let delivered =
-            deliver_prompt_wake(cfg, project, &captain, false, wm).map_err(|e| format!("{e:#}"));
-        let (line, deferred) = finish_prompt(delivered, || defer_busy_wake(project, &captain))?;
+        let (line, deferred) = done_reply(
+            || {
+                let delivered = deliver_prompt_wake(cfg, project, &captain, false, wm)
+                    .map_err(|e| format!("{e:#}"));
+                finish_prompt(delivered, || defer_busy_wake(project, &captain))
+            },
+            || done_reply_via_mail(cfg, project, &captain, brief, receipt, &reporter),
+        )?;
         wake = match deferred {
             Some(reason) => format!("captain busy ({reason}); {line}"),
-            None => format!("captain rung ({line})"),
+            None => line,
         };
         crate::log(
             project,
@@ -948,12 +953,61 @@ fn cmd_crew_done(
                 "pin": pin,
                 "from": reporter,
                 "receipt": receipt,
-                "wake": line,
+                "wake": wake,
             }),
         );
     }
     println!("brief {brief} closed; {wake}");
     Ok(())
+}
+
+/// bd-ezlme: how a done reply reaches the captain, as one decision.
+///
+/// The pane wake is the fast path, but a captain can be a MAIL-ONLY identity —
+/// a pin with no agent row (the live case: `crew done` closed the brief and
+/// then failed with "no agents match --to SlateHarbor"). A done reply that
+/// never rings is the lost hand-off this whole verb exists to prevent, so a
+/// failed pane wake falls back to the plane-P mail path instead of inventing a
+/// pane-less registry row. Both failing is a typed error, never a silent close.
+fn done_reply(
+    pane: impl FnOnce() -> Result<(String, Option<String>)>,
+    mail: impl FnOnce() -> Result<String>,
+) -> Result<(String, Option<String>)> {
+    match pane() {
+        Ok((line, deferred)) => Ok((line, deferred)),
+        Err(pane_error) => match mail() {
+            Ok(line) => Ok((line, None)),
+            Err(mail_error) => bail!(
+                "the brief is closed but the captain heard nothing: pane wake failed ({pane_error}); \
+                 mail fallback failed ({mail_error})"
+            ),
+        },
+    }
+}
+
+/// The plane-P fallback: mail the done reply to the captain pin.
+fn done_reply_via_mail(
+    cfg: &Config,
+    project: &str,
+    captain: &str,
+    brief: &str,
+    receipt: &str,
+    reporter: &str,
+) -> Result<String> {
+    let mail = crate::cmd::mail::mail_or_die(cfg)?;
+    let key = crate::project_dir_str(cfg, project)?;
+    let sent = mail.with_name(reporter.to_string()).send(
+        &key,
+        &[captain.to_string()],
+        &format!("[crew] {brief} done"),
+        receipt,
+        "normal",
+        false,
+        None,
+    )?;
+    Ok(format!(
+        "captain mailed (plane-P fallback: no pane route to {captain}; {sent})"
+    ))
 }
 
 /// `crew inbox --open`: a silent crew is a row with an age.
@@ -1058,6 +1112,86 @@ pub(crate) fn cmd_crew_prompt(
         println!("{QUEUED_WAKE}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod bd_ezlme_tests {
+    use super::done_reply;
+
+    /// bd-ezlme end to end on the mail side: the fallback actually lands a mail
+    /// in the captain's inbox (in-process mailbox, no pane registry row needed).
+    #[test]
+    fn the_mail_fallback_lands_in_the_captains_inbox() {
+        let _g = crate::config::lock_env();
+        let cfg = crate::config::Config::default();
+        let mail = crate::mail::Mail::from_config(None)
+            .expect("mail facade")
+            .expect("in-process mailbox");
+        let project = format!("crew-done-{}", std::process::id());
+        mail.ensure_project(&project).expect("project");
+        for name in ["BlueLake", "SlateHarbor"] {
+            mail.register_fixture(&project, name, "test", "test", "crew done fallback")
+                .expect("register");
+        }
+        let line = super::done_reply_via_mail(
+            &cfg,
+            &project,
+            "SlateHarbor",
+            "brief-ezlme",
+            "receipt-ezlme",
+            "BlueLake",
+        )
+        .expect("the fallback mails the captain");
+        assert!(line.contains("plane-P fallback"), "{line}");
+        let inbox = mail
+            .inbox(&project, "SlateHarbor", false, 10)
+            .expect("captain inbox");
+        let text = format!("{inbox}");
+        assert!(
+            text.contains("brief-ezlme") && text.contains("receipt-ezlme"),
+            "the done reply reaches the captain by mail: {text}"
+        );
+    }
+
+    /// bd-ezlme: the decision the live failure needed. A pane wake that cannot
+    /// resolve the captain (no agent row) must fall back to the plane-P mail,
+    /// not close the brief silently; both failing is a typed error naming both.
+    #[test]
+    fn a_failed_pane_wake_falls_back_to_the_mail_path() {
+        let (line, deferred) = done_reply(
+            || {
+                Err(anyhow::anyhow!(
+                    "no agents match --to SlateHarbor (available: shell)"
+                ))
+            },
+            || Ok("captain mailed (plane-P fallback)".to_string()),
+        )
+        .expect("the fallback is not a failure");
+        assert!(
+            line.contains("plane-P fallback"),
+            "the reply says which path delivered it: {line}"
+        );
+        assert!(deferred.is_none(), "a mailed reply is not a deferred wake");
+
+        // A pane wake that works is still preferred: no mail is sent.
+        let (line, _) = done_reply(
+            || Ok(("captain rung (prompt sent)".to_string(), None)),
+            || panic!("the mail path must not run when the pane wake lands"),
+        )
+        .expect("the pane path");
+        assert!(line.contains("rung"), "{line}");
+
+        // Both dead: the operator hears that the captain heard nothing.
+        let err = done_reply(
+            || Err(anyhow::anyhow!("no agents match")),
+            || Err(anyhow::anyhow!("mail not configured")),
+        )
+        .expect_err("both paths dead is a failure");
+        let text = err.to_string();
+        assert!(text.contains("heard nothing"), "{text}");
+        assert!(text.contains("no agents match"), "{text}");
+        assert!(text.contains("mail not configured"), "{text}");
+    }
 }
 
 #[cfg(test)]
