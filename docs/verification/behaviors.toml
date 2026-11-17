@@ -306,6 +306,19 @@ mutations = [
 ]
 
 [[behavior]]
+id = "crew.done-reply-falls-back-to-mail"
+owner = "src/cmd/crew.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/crew.rs::a_failed_pane_wake_falls_back_to_the_mail_path",
+  "src/cmd/crew.rs::the_mail_fallback_lands_in_the_captains_inbox",
+]
+mutations = [
+  "scripts/mutations/crew-done-fallback.spec.sh#F1",
+]
+
+[[behavior]]
 id = "harness.plan-and-leaf-agree-on-every-field"
 owner = "src/headless.rs"
 status = "proven"
@@ -1234,4 +1247,40 @@ tests = [
 ]
 mutations = [
   "scripts/mutations/verify-needles-dead-filter.spec.sh#D1",
+]
+
+[[behavior]]
+id = "ship.gate-name-is-the-beads-policy"
+owner = "src/cmd/ship.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/ship.rs::the_legal_gate_set_is_read_from_br_and_respected",
+]
+mutations = [
+  "scripts/mutations/ship-land-legal-gate.spec.sh#G1",
+]
+
+[[behavior]]
+id = "ship.close-reads-the-status-field"
+owner = "src/cmd/ship.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/ship.rs::closed_is_the_beads_own_status_not_a_child_field",
+]
+mutations = [
+  "scripts/mutations/ship-land-legal-gate.spec.sh#S1",
+]
+
+[[behavior]]
+id = "ship.head-lock-race-is-retried"
+owner = "src/cmd/ship.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/ship.rs::the_head_lock_race_is_recognised",
+]
+mutations = [
+  "scripts/mutations/ship-land-legal-gate.spec.sh#R1",
 ]

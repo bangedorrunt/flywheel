@@ -360,7 +360,103 @@ fn gate_bound(dir: &Path, plan: &LandPlan) -> Result<bool> {
 
 fn bead_is_closed(dir: &Path, plan: &LandPlan) -> Result<bool> {
     let out = run_tool(dir, "br", &["show", &plan.bead, "--json"])?;
-    Ok(out.contains("\"status\":\"closed\"") || out.contains("\"status\": \"closed\""))
+    // bd-pgfqg: a SUBSTRING match said "closed" for an epic whose payload
+    // embeds a closed child, so land skipped the close and check then failed.
+    // Ask the field, not the text.
+    Ok(status_of(&out).as_deref() == Some("closed"))
+}
+
+/// The `status` field of a `br show --json` payload, when it parses.
+fn status_of(br_json: &str) -> Option<String> {
+    let doc: Value = serde_json::from_str(br_json).ok()?;
+    doc.get("status")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// The gate names `br` says are legal for this bead, from its own refusal text.
+///
+/// bd-42vhw: ship land hardcoded `unit-test-verified`, so a bead whose policy
+/// names `command-verified` needed a manual gate report before a resume worked.
+/// br already states the set; read it instead of keeping a second copy.
+fn legal_gates(dir: &Path, bead: &str) -> Result<Vec<String>> {
+    let out = Command::new("br")
+        .current_dir(dir)
+        .args(["close", bead, "--dry-run"])
+        .output()
+        .map_err(|err| anyhow!("br not found: {err}"))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(parse_legal_gates(&text))
+}
+
+/// Pull the `Legal gate names for this bead: a | b | c.` sentence out of a
+/// `br close --dry-run` refusal.
+fn parse_legal_gates(text: &str) -> Vec<String> {
+    let Some((_, rest)) = text.split_once("Legal gate names for this bead: ") else {
+        return Vec::new();
+    };
+    rest.split('.')
+        .next()
+        .unwrap_or("")
+        .split('|')
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// Which legal gate to record: a command proof is what ship land carries, so
+/// prefer `command-verified`; otherwise the unit-test name; otherwise whatever
+/// the bead allows first. Never a name br did not list.
+fn pick_gate(legal: &[String]) -> Option<String> {
+    for want in ["command-verified", "unit-test-verified"] {
+        if legal.iter().any(|name| name == want) {
+            return Some(want.to_string());
+        }
+    }
+    legal.first().cloned()
+}
+
+/// Is this failure the HEAD-lock race (another lane committed mid-land)?
+///
+/// bd-pgfqg: `cannot lock ref HEAD: is at A but expected B` is transient and
+/// the verb must retry itself instead of making the operator rerun.
+fn is_head_lock_race(stderr: &str) -> bool {
+    stderr.contains("cannot lock ref")
+        || (stderr.contains("is at") && stderr.contains("but expected"))
+}
+
+/// Commit this bead's staged tracker rows, retrying the HEAD-lock race.
+///
+/// bd-pgfqg: another lane committing between the gate and this commit makes git
+/// refuse with `cannot lock ref HEAD: is at A but expected B`. That is a race,
+/// not a conflict: the same command succeeds a moment later, so the verb retries
+/// instead of handing the operator a resume line.
+fn commit_with_retry(dir: &Path, message: &str) -> Result<()> {
+    const ATTEMPTS: u8 = 4;
+    let mut last = String::new();
+    for attempt in 0..ATTEMPTS {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(["commit", "-qm", message])
+            .output()
+            .map_err(|err| anyhow!("git not found: {err}"))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        last = String::from_utf8_lossy(&out.stderr).to_string();
+        if !is_head_lock_race(&last) {
+            bail!("git commit failed: {}", last.trim());
+        }
+        eprintln!(
+            "ship land: HEAD moved under the tracker commit (attempt {}), retrying",
+            u16::from(attempt) + 1
+        );
+    }
+    bail!("git commit kept losing the HEAD-lock race: {}", last.trim())
 }
 
 /// Stage ONLY the hunks that mention this bead, so another lane's uncommitted
@@ -798,6 +894,14 @@ fn ship_land(args: LandArgs<'_>) -> Result<()> {
                 .map(|(value, _)| value)
                 .unwrap_or("verify")
                 .replace(' ', "_");
+            // bd-42vhw: record a gate the bead's own policy allows.
+            let legal = legal_gates(&dir, &plan.bead)?;
+            let gate = pick_gate(&legal).ok_or_else(|| {
+                anyhow!(
+                    "ship land: br names no legal gate for {} (legal set: {legal:?})",
+                    plan.bead
+                )
+            })?;
             let proved = receipt_proven_sha(&plan.receipt).unwrap_or_else(|| plan.sha.clone());
             let note = gate_note(&plan.sha, &proved, &cmd, &plan.receipt);
             run_tool(
@@ -808,7 +912,7 @@ fn ship_land(args: LandArgs<'_>) -> Result<()> {
                     "report",
                     &plan.bead,
                     "--gate",
-                    "unit-test-verified",
+                    &gate,
                     "--provider",
                     &plan.pin,
                     "--status",
@@ -877,10 +981,7 @@ fn ship_land(args: LandArgs<'_>) -> Result<()> {
         stage_bead_hunks(&dir, ".beads/gates.jsonl", "issue_id", &plan.bead)
     })?;
     if staged_issues || staged_gates {
-        land_step(&plan, "commit", || {
-            run_tool(&dir, "git", &["commit", "-qm", &plan.message])?;
-            Ok(())
-        })?;
+        land_step(&plan, "commit", || commit_with_retry(&dir, &plan.message))?;
     } else {
         eprintln!("ship land: tracker rows already committed");
     }
@@ -902,7 +1003,10 @@ fn ship_land(args: LandArgs<'_>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{head_has_closed_bead, head_names_bead, land_project, receipt_is_landable};
+    use super::{
+        head_has_closed_bead, head_names_bead, is_head_lock_race, land_project, parse_legal_gates,
+        pick_gate, receipt_is_landable, status_of,
+    };
     use crate::config::Config;
     use std::process::Command;
 
@@ -923,6 +1027,63 @@ mod tests {
             );
         }
         dir
+    }
+
+    /// bd-42vhw: the gate name comes from the bead's OWN legal set, which br
+    /// states in its refusal, not from a hardcoded preference.
+    #[test]
+    fn the_legal_gate_set_is_read_from_br_and_respected() {
+        let refusal = r#"close --dry-run bd-x (open -> closed): would refuse
+  missing: transition 'open' -> 'closed' is fail-closed for bd-x: no legal PASS
+gate row is recorded. Legal gate names for this bead: command-verified |
+live-verified. Record one BEFORE closing."#;
+        assert_eq!(
+            parse_legal_gates(refusal),
+            vec!["command-verified".to_string(), "live-verified".to_string()],
+            "the legal set is br's sentence, parsed"
+        );
+        assert!(parse_legal_gates("no refusal text here").is_empty());
+
+        // A bead whose only legal gate is command-verified gets that name.
+        assert_eq!(
+            pick_gate(&["command-verified".to_string()]),
+            Some("command-verified".to_string())
+        );
+        assert_eq!(
+            pick_gate(&["live-verified".to_string()]),
+            Some("live-verified".to_string()),
+            "never a name br did not list"
+        );
+        assert_eq!(pick_gate(&[]), None);
+    }
+
+    /// bd-pgfqg: an epic whose payload embeds a CLOSED CHILD is still open —
+    /// the old substring match read the child's status and skipped the close.
+    #[test]
+    fn closed_is_the_beads_own_status_not_a_child_field() {
+        let epic =
+            r#"{"id":"bd-epic","status":"open","children":[{"id":"bd-kid","status":"closed"}]}"#;
+        assert_eq!(status_of(epic).as_deref(), Some("open"));
+        assert!(
+            !(status_of(epic).as_deref() == Some("closed")),
+            "a closed child must not mark its parent closed"
+        );
+        let closed = r#"{"id":"bd-x","status":"closed"}"#;
+        assert_eq!(status_of(closed).as_deref(), Some("closed"));
+        assert_eq!(status_of("not json"), None);
+    }
+
+    /// bd-pgfqg: the HEAD-lock race is classified as retryable, a real
+    /// conflict is not.
+    #[test]
+    fn the_head_lock_race_is_recognised() {
+        assert!(is_head_lock_race(
+            "error: cannot lock ref 'HEAD': is at abc123 but expected def456"
+        ));
+        assert!(
+            !is_head_lock_race("error: conflicting changes, please commit or stash"),
+            "an unrelated failure must not be retried"
+        );
     }
 
     /// bd-ni0ek: the release project comes from the ONE resolver, never the
