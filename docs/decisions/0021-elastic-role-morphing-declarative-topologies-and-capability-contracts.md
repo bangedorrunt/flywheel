@@ -333,6 +333,19 @@ rows at `8ce0e80e`, the bd-jhz8x.6 mutants at the commit that added them). A mut
 S1` is the shape gate, not `plan-spawn-consent S1`. `AD²` means the row is
 witnessed by ADR-0022's map (§8), which owns the adapter/profile half of D3.
 
+Scope of a mutant, honestly stated: a row is mutated in the repo that owns the
+check. Two rows here lean on siblings and no flywheel mutant can reach the
+kernel:
+
+- **D5.1 can-finish** — `Topology::cannot_finish` is toron's kernel
+  (`toron_core::kernel`), and no YAML form `lower()` produces can strand a
+  state, so the witness hand-builds a machine. `adr0021-named-witnesses C1`
+  therefore mutates the flywheel wrapper the witness calls, not the kernel
+  walk; a toron-side mutant is owed if the kernel itself is to be proven.
+- **graph-await** — `P1/T1/O1` run in **toron's** proof (`cf52d28b`), not this
+  repo's: flywheel's `X1` witnesses the deadline flywheel hands the watcher,
+  and toron proves the engine settles on it.
+
 ### Decisions
 
 | # | Witness test | Mutation | Status |
@@ -340,18 +353,18 @@ witnessed by ADR-0022's map (§8), which owns the adapter/profile half of D3.
 | D1 vocabulary (`mode`, `shape`, no `swarm` shape) | `adr0021_shape_lint_refuses_a_fanout_without_parallel`, `decide_router_topology_declared_no_silent_swarm`; `Shape` has five values and no `Swarm` (`workflow_catalog.rs`) | `adr0021-gates S1` | closed |
 | D2 one control language (`compose:` is data) | `adr0021_compose_override_wins_from_the_upper_tier`, `beads_lifecycle_is_compose_token_and_beads_is_not` | `adr0021-gates C1` | closed |
 | D3.1 `reads` is linted | `adr0021_reads_lint_refuses_a_missing_read`, `stage_contract_judge_arms_without_arms_fails` | `adr0021-gates R1` | closed |
-| D3.2 `mode` reaches the harness, else `degraded` | `harness_default_plan_says_honored_and_the_launch_injects_nothing`, `dry_run_ambiguous_from_profile_is_degraded` | `v4-adapter-property V4` | closed (AD² D3/V4) |
+| D3.2 `mode` reaches the harness, else `degraded` | `every_harness_field_is_honored_iff_the_launch_emits_it` (what `v4-adapter-property V4` expects), `harness_default_plan_says_honored_and_the_launch_injects_nothing`, `dry_run_ambiguous_from_profile_is_degraded` | `v4-adapter-property V4` | closed (AD² D3/V4) |
 | D3.3 skills stay on the profile | `digest_is_bounded_deterministic_and_order_sensitive`, `empty_skills_have_no_digest`, `builtins_have_verbatim_preamble_and_skills` | none | closed (structural: `Stage` has no skills field; the profile does) |
 | D3.4 `witness` is the exit | `adr0021_witness_exit_refuses_an_empty_report`, `durable_body_witness_fail_goes_to_on_error`, `durable_body_witness_missing_report_fails` | `adr0021-gates W1`, `witness-sidecar W1` | closed |
 | D3.5 review + verify run `context: fresh` | `stage_contract_seed_phases_complete` (all four seeds fresh + read-only), `beads_lifecycle_plan_polish_loop` (audit fresh) | `adr0021-witnessed E1` | closed (bd-jhz8x.6) |
 | D3.6 `effort` replaces in-prompt keywords | `dispatch_resolves_effort_stage_over_profile`, `resolver_v4_effort_bare_matrix`, `grok_effort_is_honored_from_profile_and_user` | `adr0021-witnessed E2` | closed (bd-jhz8x.6) |
 | D3.7 a step's fields override the stage | structural: a stage carries no dispatch fields (`DispatchSpec` lives on the step, the stage supplies only the prompt) | none | closed (structural) |
 | D4.1 `dispatch_job await: result` suspends to the terminal | `wave_swarm_stages_await_result`; toron `graph_dispatch_await_waits_for_the_job_terminal` | `graph-await P1/T1/O1` (toron), `wave_swarm_*` | closed (bd-jhz8x.2/.5) |
-| D4.2 the engine checks the witness; a miss is typed | `durable_body_witness_fail_goes_to_on_error`, `durable_body_witness_missing_report_fails` | `adr0021-gates W1`, `witness-sidecar W1` | closed |
+| D4.2 the engine checks the witness; a miss is typed | `durable_body_witness_fail_goes_to_on_error`, `durable_body_witness_missing_report_fails` | `adr0021-named-witnesses W1` (fail settles), `W2` (missing report accepted), `witness-sidecar W1` | closed (bd-jhz8x.8) |
 | D4.3 fact-derived exits win over reported ones | `wave_swarm_execute_exit_is_ledger_fact`, `wave_swarm_execute_exit_runs_against_ledger` | `adr0021-witnessed E3` | closed (bd-jhz8x.6) |
 | D4.4 `.done` markers retire — the RUNNER writes a sidecar after a witnessed exit and nothing reads it | `a_witnessed_exit_writes_the_done_sidecar_and_a_refusal_writes_none`, `wave_swarm_no_marker_reads` | `witness-sidecar W1` | closed (bd-jhz8x.3) |
 | D4.5 the LLM-as-loop stages become engine steps | `wave_swarm_stages_await_result` (dispatch), `a_lower_open_wave_holds_and_names_the_blockers` (gate), `a_blocked_pane_escalates_to_the_captain_once_per_episode` (observe), `triage_deep_crew_comes_from_the_workflow_not_a_seat` (spawn-crew retired; the crew field spawns it) | `wave-gate-engine G1/G2`, `observe-fold W1/R1/K1`, `observe-escalation L1/E1/B1/F1`, `triage-crew S1` (bd-jhz8x.2) | closed (bd-jhz8x.2) |
-| D5.1 lower every workflow to a machine | `workflow_lowering_unreachable_node_named`, `workflow_lowering_can_finish_names_stranded_state`, `workflow_lowering_unbounded_back_edge_named`, `workflow_lowering_approval_without_timeout_fails` | `adr0021-gates L1` (bounded), `adr0021-witnessed E4/E5` (reachable, can-finish) | closed (bd-jhz8x.6) |
+| D5.1 lower every workflow to a machine | `workflow_lowering_unreachable_node_named`, `workflow_lowering_can_finish_names_stranded_state`, `workflow_lowering_unbounded_back_edge_named`, `workflow_lowering_approval_without_timeout_fails` | `adr0021-named-witnesses R1` (reachable), `C1` (can-finish), `B1` (back edge), `T1` (approval), `adr0021-gates L1` (park wait), `adr0021-witnessed E4/E5` (the verify report) | closed (bd-jhz8x.6/.8) |
 | D5.2 `workflow verify` checks the machine; the report says what it does not prove | `statechart_verify_passes_the_shipped_charts`, `statechart_report_fails_on_an_orphan_and_a_trap`, `test_cli_workflow_verify_json_contract` | `adr0021-gates S1/L1/W1`, `adr0021-witnessed E4/E5`, `workflow-verify-unused U1` | closed (bd-jhz8x.6) |
 | D5.3 the report names what is not checked | `test_cli_workflow_verify_plain_text` (scope line), `test_cli_workflow_verify_json_contract` (scope field) | none | closed (the text is the assertion) |
 | D5.4 hand TLA+ protocols, each shown failing on a broken variant | `.agents/skills/verify-protocol-tla/models/{JobLease,ReservationBoard,Respawn}.tla` with `.broken-*.cfg` variants, run by `scripts/verify-formal.sh` (the proof's `verify-formal` step) | none (the models are the artifact) | closed |
@@ -363,12 +376,12 @@ witnessed by ADR-0022's map (§8), which owns the adapter/profile half of D3.
 
 | # | Claim | Witness | Status |
 |---|---|---|---|
-| 1 | lint fails on `judge-arms` without an arms step, passes with one | `stage_contract_judge_arms_without_arms_fails` | closed, `adr0021-gates R1` |
+| 1 | lint fails on `judge-arms` without an arms step, passes with one | `stage_contract_judge_arms_without_arms_fails` | closed, `adr0021-named-witnesses J1` (the declaration) + `adr0021-gates R1` (the reads check) |
 | 2 | `workflow verify --json` lists every catalog workflow; the retired `SwarmLifecycle` is unreachable/unbounded | `test_cli_workflow_verify_json_contract` (chart list), `test_cli_workflow_verify_single_named_chart` | superseded: D5.1 deleted the hand chart; the test now pins its ABSENCE and `wave-swarm` verifying as a workflow |
-| 3 | a coder that never writes a witness fails typed at `result_timeout`; no `.done` is read | `wave_swarm_missing_witness_fails_at_result_timeout`, `wave_swarm_no_marker_reads` | closed (bd-jhz8x.5 un-ignored it), `graph-await P1/T1/O1` |
+| 3 | a coder that never writes a witness fails typed at `result_timeout`; no `.done` is read | `wave_swarm_missing_witness_fails_at_result_timeout`, `wave_swarm_no_marker_reads` | closed (bd-jhz8x.5 un-ignored it), `adr0021-named-witnesses X1` (deadline) `M1` (marker read); the graph-await engine half is `graph-await P1/T1/O1`, which run in **toron's** proof |
 | 4 | two polish rounds, converge on an unchanged digest, fail on a dropped requirement | `beads_lifecycle_plan_polish_loop`, `adr0021_plan_fence_never_converges_on_a_changed_digest`, `the_coverage_fence_seeds_once_and_never_shrinks` | closed (bd-jhz8x.7), `coverage-fence C1/W1` |
 | 5 | a project-tier `compose: true` expands without a rebuild | `adr0021_compose_override_wins_from_the_upper_tier` | closed, `adr0021-gates C1` |
-| 6 | every new check is seen failing on a broken variant first | `scripts/mutations/adr0021-gates.spec.sh` 6/6 RED at `bd-jhz8x.1` | closed |
+| 6 | every new check is seen failing on a broken variant first | `scripts/mutations/adr0021-gates.spec.sh` 6/6 RED at `bd-jhz8x.1`, `adr0021-witnessed` 6/6 RED at `bd-jhz8x.6`, `adr0021-named-witnesses` 9/9 RED at `bd-jhz8x.8` | closed |
 | 7 | `verify-clippy.sh` and `clean-proof.sh --tests` pass | those scripts, plus `verify-clippy-gates` and `proof-suite-and-isolation` | closed, `verify-clippy-gates W1`, `proof-suite-and-isolation S1` |
 
 ### What the map does not claim
