@@ -14,6 +14,7 @@
 # Usage:
 #   scripts/verify-mutations.sh --self-test                 # no cargo, instant
 #   scripts/verify-mutations.sh scripts/mutations/<name>.spec.sh --cargo mbx
+#   VERIFY_MUTATIONS_KEEP_EXPORT=1 ...                      # keep the scratch export
 #
 # The spec is a shell file of `mutation` calls, so there is no parser layer and
 # the needles stay greppable:
@@ -86,6 +87,17 @@ LIST_EXPECT=0
 CACHE_KEY=""
 NO_CACHE=0
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/flywheel/mutation-verdicts"
+
+# bd-3681w: isolate_if_shared makes a ~4-5 GB export per spec, then execs. The
+# path travels to the child in the environment; the child's traps end it.
+VERIFY_MUTATIONS_EXPORT_ROOT="${VERIFY_MUTATIONS_EXPORT_ROOT:-}"
+cleanup_export() {
+    [ -n "$VERIFY_MUTATIONS_EXPORT_ROOT" ] || return 0
+    [ -d "$VERIFY_MUTATIONS_EXPORT_ROOT" ] || { VERIFY_MUTATIONS_EXPORT_ROOT=""; return 0; }
+    [ "${VERIFY_MUTATIONS_KEEP_EXPORT:-0}" = 1 ] && return 0
+    rm -rf "$VERIFY_MUTATIONS_EXPORT_ROOT"
+    VERIFY_MUTATIONS_EXPORT_ROOT=""
+}
 
 # A mutation's stable id is the first token of its label ("C3  a queued …" ->
 # "C3"). Ledger receipts reference `<spec>#<id>`, so the id may not drift with
@@ -518,6 +530,10 @@ isolate_if_shared() {
     repo_abs="$(cd "$repo" && pwd)"
     local export_root export
     export_root="$(mktemp -d "${TMPDIR:-/tmp}/verify-mutations-export.XXXXXX")"
+    # Failures before the exec (git archive, overlay, arg rewrite) must not leak
+    # either. The exec replaces this process; the child installs its own trap.
+    export VERIFY_MUTATIONS_EXPORT_ROOT="$export_root"
+    trap cleanup_export EXIT
     export="$export_root/$(basename "$repo_abs")"
     mkdir -p "$export"
     git -C "$repo" archive HEAD | tar -x -C "$export" || {
@@ -607,11 +623,25 @@ on_signal() {
     exit 130
 }
 
+# The single EXIT trap for the life of the process, installed at the top of main
+# so early exits (a cache hit, a red control, a bad flag) clean up too. The old
+# `trap - EXIT` at the end of main is gone for the same reason.
+on_exit() {
+    local status=$?
+    if [ -n "$SNAP_DIR" ]; then
+        snapshot_restore
+        snapshot_discard
+    fi
+    cleanup_export
+    return "$status"
+}
+
 usage() {
     sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 main() {
+    trap on_exit EXIT
     local spec=""
     local original=("$@")
     while [ "$#" -gt 0 ]; do
@@ -691,7 +721,6 @@ main() {
     fi
     trap on_signal INT TERM HUP
     snapshot_save
-    trap on_signal EXIT
 
     printf 'control (unmutated): ...\n'
     local before
@@ -701,7 +730,6 @@ main() {
         printf '%s\n' "$before" | tail -40 >&2
         snapshot_restore
         snapshot_discard
-        trap - EXIT
         exit 1
     fi
     echo "control green"
@@ -779,7 +807,6 @@ main() {
     [ "$(classify "$after" "")" = "$VERDICT_VACUOUS" ] && restored_ok=yes || restored_ok=no
     printf '\ncontrol after restore: %s\n' "$([ "$restored_ok" = yes ] && echo GREEN || echo RED)"
     snapshot_discard
-    trap - EXIT
 
     if [ "$dead" -gt 0 ] || [ "$alive" -gt 0 ]; then
         printf '%s guard(s) confirmed dead, %s still load-bearing\n' "$dead" "$alive"

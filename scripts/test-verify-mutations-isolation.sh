@@ -11,9 +11,16 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/verify-mutations-isolation.XXXXXX")"
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
+# bd-3681w: every spec run makes a ~4-5 GB scratch export. Keep every export this
+# test triggers inside our own sandbox; never touch the operator's real $TMPDIR.
+export TMPDIR="$TMP"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
+
+leftover_export() {
+  find "$TMP" -maxdepth 1 -type d -name 'verify-mutations-export.*' -print -quit
+}
 
 mkdir -p "$TMP/repo/src" "$TMP/bin"
 cd "$TMP/repo"
@@ -72,7 +79,30 @@ printf '%s\n' "$out" | grep -q "RED" \
   || fail "the mutation did not prove RED in the export: $(printf '%s\n' "$out" | tail -8)"
 pass "the mutation still proves RED inside the export"
 
+# bd-3681w: the re-exec replaces the harness process, so only a trap can end the
+# export's lifetime. A successful run must leave no export behind.
+[ -z "$(leftover_export)" ] \
+  || fail "a scratch export survived a successful run: $(leftover_export)"
+pass "a successful run removed its scratch export"
+
 seen="$(cat "$TMP/seen-toron" 2>/dev/null || true)"
 [ "$seen" = "$TMP/fake-toron/toron" ] \
   || fail "the isolated child saw TORON_BIN='${seen}', not the caller's absolute build"
 pass "the scratch export kept the caller's absolute TORON_BIN"
+
+# bd-3681w: an injected failure (a red control) exits early, before the normal
+# cleanup at the end of main. The trap must still remove the export on that path.
+cat >"$TMP/bin/failcargo" <<'STUB'
+#!/usr/bin/env bash
+printf 'running 1 test\ntest result: FAILED. 0 passed; 1 failed\nfailures:\n    some_test\n'
+exit 101
+STUB
+chmod +x "$TMP/bin/failcargo"
+set +e
+fail_out="$(bash "$ROOT/scripts/verify-mutations.sh" spec.sh --cargo "$TMP/bin/failcargo" 2>&1)"
+fail_rc=$?
+set -e
+[ "$fail_rc" -ne 0 ] || fail "the harness accepted a red control: $fail_out"
+[ -z "$(leftover_export)" ] \
+  || fail "a scratch export survived the injected failure: $(leftover_export)"
+pass "a failing run removed its scratch export too"

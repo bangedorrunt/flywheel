@@ -117,6 +117,18 @@ fn proof_verify_mutations_never_edits_the_shared_tree() {
     );
 }
 
+/// bd-3681w: a kept proof export is for the captain's install. Letting every
+/// kept `fw-proof.*` directory accumulate filled the disk and killed proof44.
+#[test]
+fn proof_clean_proof_keep_prunes_older_exports() {
+    let src = std::fs::read_to_string(format!("{}/scripts/clean-proof.sh", root()))
+        .expect("scripts/clean-proof.sh");
+    assert!(
+        src.contains(r#"-name 'fw-proof.*' ! -path "$TMP" -exec rm -rf {} +"#),
+        "clean-proof must prune older kept fw-proof.* exports (bd-3681w)"
+    );
+}
+
 /// bd-6setu.18: a TEST_FILTER that matches no #[test] runs zero tests, so its
 /// spec reads VACUOUS instead of RED and the mutants are silently lost. The
 /// needle gate must refuse it, and the fixture drives both halves.

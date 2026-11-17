@@ -197,6 +197,9 @@ cleanup() {
   local status=$?
   if [ "$status" -ne 0 ] || [ "$KEEP" -eq 1 ]; then
     echo "clean-proof: kept $TMP" >&2
+    # bd-3681w: a kept export is for the captain's install. Older kept exports
+    # accumulate until the disk fills; keep only the newest.
+    find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'fw-proof.*' ! -path "$TMP" -exec rm -rf {} + 2>/dev/null || true
   else
     rm -rf "$TMP"
   fi
