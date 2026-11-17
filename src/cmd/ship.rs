@@ -408,9 +408,25 @@ fn parse_legal_gates(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Which legal gate to record: a command proof is what ship land carries, so
-/// prefer `command-verified`; otherwise the unit-test name; otherwise whatever
-/// the bead allows first. Never a name br did not list.
+/// Which gate to record for a bead.
+///
+/// br prints the "Legal gate names" sentence ONLY when a policy narrows the
+/// transition, so an EMPTY set means "no restriction": keep the default this
+/// verb always recorded. When br does name a set, record one of those names and
+/// never an invented one.
+fn gate_for(legal: &[String]) -> String {
+    if legal.is_empty() {
+        return DEFAULT_GATE.to_string();
+    }
+    pick_gate(legal).unwrap_or_else(|| DEFAULT_GATE.to_string())
+}
+
+/// The gate ship land records when the bead's policy names no set.
+const DEFAULT_GATE: &str = "unit-test-verified";
+
+/// Which named gate to record: a command proof is what ship land carries, so
+/// prefer `command-verified`; otherwise the unit-test name; otherwise the first
+/// name the bead allows. Never a name br did not list.
 fn pick_gate(legal: &[String]) -> Option<String> {
     for want in ["command-verified", "unit-test-verified"] {
         if legal.iter().any(|name| name == want) {
@@ -894,14 +910,11 @@ fn ship_land(args: LandArgs<'_>) -> Result<()> {
                 .map(|(value, _)| value)
                 .unwrap_or("verify")
                 .replace(' ', "_");
-            // bd-42vhw: record a gate the bead's own policy allows.
+            // bd-42vhw: record a gate the bead's own policy allows. An EMPTY
+            // set is not a refusal - br prints the sentence only when a policy
+            // narrows the transition - so it keeps the default gate.
             let legal = legal_gates(&dir, &plan.bead)?;
-            let gate = pick_gate(&legal).ok_or_else(|| {
-                anyhow!(
-                    "ship land: br names no legal gate for {} (legal set: {legal:?})",
-                    plan.bead
-                )
-            })?;
+            let gate = gate_for(&legal);
             let proved = receipt_proven_sha(&plan.receipt).unwrap_or_else(|| plan.sha.clone());
             let note = gate_note(&plan.sha, &proved, &cmd, &plan.receipt);
             run_tool(
@@ -1004,8 +1017,8 @@ fn ship_land(args: LandArgs<'_>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        head_has_closed_bead, head_names_bead, is_head_lock_race, land_project, parse_legal_gates,
-        pick_gate, receipt_is_landable, status_of,
+        gate_for, head_has_closed_bead, head_names_bead, is_head_lock_race, land_project,
+        parse_legal_gates, pick_gate, receipt_is_landable, status_of,
     };
     use crate::config::Config;
     use std::process::Command;
@@ -1055,6 +1068,16 @@ live-verified. Record one BEFORE closing."#;
             "never a name br did not list"
         );
         assert_eq!(pick_gate(&[]), None);
+
+        // bd-42vhw correction: br names a set only when a policy RESTRICTS the
+        // transition, so an empty set is "no restriction" and keeps the
+        // default gate rather than refusing the land.
+        assert_eq!(gate_for(&[]), "unit-test-verified");
+        assert_eq!(
+            gate_for(&["command-verified".to_string()]),
+            "command-verified",
+            "a named set still wins"
+        );
     }
 
     /// bd-pgfqg: an epic whose payload embeds a CLOSED CHILD is still open —

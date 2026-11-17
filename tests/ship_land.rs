@@ -91,6 +91,12 @@ elif cmd == "gate" and argv[1] == "report":
         fh.write(json.dumps(row, sort_keys=True) + "\n")
 elif cmd == "close":
     bead = argv[1]
+    if "--dry-run" in argv:
+        # br --dry-run answers without writing: it names the legal gate set
+        # only when a policy NARROWS the transition, so the unrestricted
+        # fixture prints no sentence and touches no state (bd-42vhw).
+        print("close --dry-run %s (open -> closed): would close" % bead)
+        sys.exit(0)
     if os.path.exists(os.path.join(state, "fail_close")):
         os.remove(os.path.join(state, "fail_close"))
         print("injected close failure", file=sys.stderr)
