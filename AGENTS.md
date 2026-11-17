@@ -24,7 +24,10 @@ bash scripts/verify-clippy.sh
 flywheel stack status --check
 # ADR-0022 rollout 6: front the plan, a live patch, and the live seat view
 flywheel swarm plan <project> [spawn flags]      # byte-equal to spawn --dry-run --json
-flywheel swarm apply <project> --patch <seat>.<field>=<value>   # reconciler -> Ports::seat
+flywheel swarm apply <project> --patch <seat>.<field>=<value> [--count <role>=<n>] [--yes]
+#   ADR-0022 D1: every apply is a plan EVENT first (the plan of record is the
+#   source of the desired seats); a planned SPAWN needs --yes, exactly as
+#   `spawn` needs it past the consent gate (bd-6setu.3/.17)
 flywheel swarm status [<project>] [--json]       # live seats + plane status
 flywheel retire <pin>... [--project p]            # one seat Retire + lease release + deregister
 # after `br close`: bead id in HEAD, committed closed row, legal verdict
@@ -33,17 +36,36 @@ flywheel ship check <bead-id>
 # commit ONLY this bead's tracker rows -> check); idempotent, and another
 # lane's dirty tracker row never blocks it; the receipt may prove the citing
 # sha or any descendant of it (bd-0uzrq.22)
-flywheel ship land <bead-id> --sha <40hex> --receipt <proof> --as <pin>
+flywheel ship land <bead-id> --sha <40hex> --receipt <proof> --as <pin> [--repo <dir>]
+#   --repo names the repo holding the citing commit and the receipt's specs when
+#   the work lives elsewhere (symmetric with `br close --repo`, bd-8q3qf/7d60f7a6);
+#   land retries the HEAD-lock race other lanes cause (bd-pgfqg)
 # clean-export proof of one revision (no selector = the dirty tree's intended
 # paths): needles, build, no-run, clippy, suite incl. tests/, workflow verify,
 # formal, coverage, then changed mutation specs (cached by content key). A
 # --sha proof runs that revision's own driver; one machine-wide slot; --keep
 # keeps the export for the captain's install
 bash scripts/clean-proof.sh --sha <rev> --mutations changed --keep --receipt /tmp/<dir>/r.json
-# sub-second check that every mutation find= still matches exactly once
+# sub-second check that every mutation find= still matches exactly once, AND
+# that each spec's TEST_FILTER names a real #[test] fn (bd-6setu.18: a filter
+# that matches nothing makes a mutation read NO-RESULTS, not RED)
 bash scripts/verify-needles.sh
+# the commit-time gate: fence the STAGED index (git write-tree -> throwaway
+# commit -> pinned-sibling export -> needles, -Dwarnings build, rustfmt on the
+# staged .rs). Installed per clone by scripts/hooks/install.sh (core.hooksPath),
+# so a caller staged without its callee dies before HEAD breaks for every lane
+bash scripts/fence.sh --index
 # mutations alone; runs in its own scratch export, never edits your tree
 bash scripts/verify-mutations.sh scripts/mutations/<spec>.spec.sh
+# crew briefs (bd-0uzrq.4): a dispatched crew prompt IS a brief; the reply
+# closes it and wakes the captain. A pane wake that cannot resolve the captain
+# (a mail-only identity with no pane row) falls back to plane-P mail; both paths
+# dead is a typed error that says the captain heard NOTHING (bd-ezlme)
+flywheel crew inbox --open [--pin <pin>] [--project p]      # what nobody answered
+flywheel crew done <brief-id> --receipt "<sha + proof + test tail>" [--project p]
+# a ring the pane already holds is not a failure: the mail is stored and the
+# prompt exits 0 saying it is queued (bd-8wdgn) — a scripted send never reads a
+# redundant wake as a dead one
 # scripts/stack.sh and scripts/ship-check.sh remain compatibility wrappers
 ```
 
