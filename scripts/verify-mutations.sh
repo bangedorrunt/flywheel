@@ -606,6 +606,13 @@ isolate_if_shared() {
             *) toron_bin="$PWD/$TORON_BIN" ;;
         esac
     fi
+    # A mutated build must never ride the shared mbx cache. The export would
+    # inherit a `target` link into it, mbx evicts that directory during a long
+    # run, and the mutation then builds something other than the mutated tree -
+    # which reads as VACUOUS ("this test cannot fail") for a mutant that in fact
+    # turns the test red. Pin a target dir the export owns (bd-6setu.20).
+    rm -f "$export/target"
+    export CARGO_TARGET_DIR="$export_root/target"
     echo "verify-mutations: scratch export $export (the shared tree is read only)" >&2
     cd "$export" || exit 2
     if [ -n "$toron_bin" ]; then

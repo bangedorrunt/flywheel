@@ -34,6 +34,36 @@ pub enum Provenance {
     Replacement,
 }
 
+impl Provenance {
+    /// The D2 precedence ladder as a number: LOWER wins.
+    ///
+    /// user > standing preference > stage contract > profile > slot > Jev >
+    /// harness default. `Replacement` and `Step` are not rungs: a replacement
+    /// carries the rung it replaced (`Field.was`), and a step's own ask is the
+    /// strongest thing a step can say, so both sit at the user end.
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Step | Self::User => 0,
+            Self::Preference => 1,
+            Self::Stage => 2,
+            Self::Profile => 3,
+            Self::Slot => 4,
+            Self::Jev => 5,
+            Self::Replacement | Self::HarnessDefault => 6,
+        }
+    }
+
+    /// Does this rung outrank `other` on the D2 ladder?
+    ///
+    /// V7 is this one rule: a higher rung is never replaced by a lower one. It
+    /// is a method so the ladder is stated once, not re-guessed per call site.
+    #[must_use]
+    pub const fn beats(self, other: Self) -> bool {
+        self.rank() < other.rank()
+    }
+}
+
 /// Whether the harness will actually receive a requested field (D3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "lowercase")]
@@ -315,7 +345,9 @@ pub fn field_status(delivered: bool, from: Provenance, harness: &str, field: &st
         return FieldStatus::Honored;
     }
     match from {
-        Provenance::User | Provenance::Preference => FieldStatus::Blocked {
+        // V7 through the ladder, not a hand-written set: everything ABOVE the
+        // stage contract is a captain ask, so an undelivered one blocks.
+        from if from.beats(Provenance::Stage) => FieldStatus::Blocked {
             remedy: format!(
                 "harness {harness:?} takes no {field} flag — ask for a model it honours or pick another harness"
             ),
@@ -445,7 +477,7 @@ pub fn harness_default_field(from: Provenance) -> Field {
 #[must_use]
 pub fn unresolved_field(_harness: &str, ask: &str, from: Provenance, message: String) -> Field {
     let status = match from {
-        Provenance::User | Provenance::Preference => FieldStatus::Blocked {
+        from if from.beats(Provenance::Stage) => FieldStatus::Blocked {
             remedy: message.clone(),
         },
         _ => FieldStatus::Degraded {
@@ -471,6 +503,49 @@ mod tests {
         effort: Option<&str>,
     ) -> crate::headless::InteractiveModelPlan {
         crate::headless::interactive_model_plan(harness, model, effort)
+    }
+
+    /// ADR-0022 V7 as a PROPERTY over every ordered pair: the higher rung is
+    /// never replaced by a lower one. The ladder is one method, and a hand-set
+    /// `User | Preference` in two places used to restate it.
+    #[test]
+    fn the_precedence_ladder_never_lets_a_lower_rung_win() {
+        use Provenance::*;
+        // Strict rungs only: a step's own ask sits at the user end beside an
+        // explicit flag (both rank 0), so equality is asserted separately.
+        let ladder = [User, Preference, Stage, Profile, Slot, Jev, HarnessDefault];
+        assert_eq!(
+            Step.rank(),
+            User.rank(),
+            "a step ask is a captain-level ask"
+        );
+        for (i, a) in ladder.iter().enumerate() {
+            for (j, b) in ladder.iter().enumerate() {
+                assert_eq!(
+                    a.beats(*b),
+                    i < j,
+                    "{a:?} vs {b:?}: the ladder is the ONLY precedence"
+                );
+            }
+            assert!(!a.beats(*a), "{a:?} cannot beat itself");
+        }
+        // The rule the two production sites now delegate to: an undelivered ask
+        // blocks exactly when it outranks the stage contract.
+        for p in ladder {
+            let blocked = matches!(
+                field_status(false, p, "gemini", "model"),
+                FieldStatus::Blocked { .. }
+            );
+            assert_eq!(
+                blocked,
+                p.beats(Stage),
+                "{p:?}: blocked iff it outranks the stage contract"
+            );
+        }
+        assert!(
+            Preference.beats(Profile) && !Profile.beats(Preference),
+            "a remembered preference outranks a profile taste, and not the reverse"
+        );
     }
 
     #[test]

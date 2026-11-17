@@ -100,6 +100,8 @@ Every field carries **provenance** (`from`). Every seat carries a **status** com
 
 **Where the plan lives.** The plan grows out of `crew::CrewPlan` (today role → count, `src/crew.rs:34`); it is not a second type beside it. Before dispatch a plan is a draft with its own id in the run store. On dispatch it becomes the **input of the workflow run**, journaled with the run, so the plan id is the run id and there is one durable record. A later `flywheel swarm apply --patch` on a running swarm is a journaled patch event on that run, not a write to a side file.
 
+Honesty note: the shipped code keeps the plan in `agents/<project>.plan.json`, so the last sentence above was the intent, not what was built. `state::PlanRecord` stores the plan value, its base seats, and the ordered `patches` (the apply-event log) as one durable snapshot; the fold rebuilds the desired seats from those patches. The side file is a deliberate captain decision: the plan stays inspectable and patchable across workflow runs and restarts without being trapped in the workflow engine's run lifecycle. D1's single-contract claim is about every entrypoint compiling to one plan VALUE, not about which store holds that value.
+
 ### D2. One precedence rule, applied per field
 
 ```
@@ -397,7 +399,7 @@ Every row below was checked by grepping the named test and mutation at `3af56271
 | 4 | a remembered preference suppresses the question | `prefer_spawn_model_from_preference` | closed, mutation `D6` |
 | 5 | a 429 on an env-pinned seat respawns, keeps pin and reservations, journals one `RebindIntent` | `acceptance5_429_respawn_journals_one_rebind_intent_and_keeps_the_pin` (end to end), `billing_with_evidence_allows_profile_hop`, `is_rate_limited_detects_429` | closed, `acceptance5-429-hop A5` |
 | 6 | a `beads-lifecycle` audit step binds to another seat, and a different model family when one is registered | `acceptance6_lifecycle_audit_binds_a_non_author_and_another_family` (the step, the seat, the family), `seat_binder_reviewer_never_author` | closed, `acceptance6-audit-binding A6` |
-| 7 | V1–V11 pass; `verify-clippy.sh` and `clean-proof.sh --tests` pass | this table | **open where the rows above are open** |
+| 7 | V1–V11 pass; `verify-clippy.sh` and `clean-proof.sh --tests` pass | this table | witnesses above all closed (14/14 `adr0022-gates` mutants RED, `verify-clippy.sh` green); the full `clean-proof.sh --tests` receipt is the captain's gate, per the bd-6setu.20 brief |
 
 What this map does not claim: a green row means a witness exists and a named mutation was seen RED; it does not mean the behaviour is right. The `open`/`partial` rows are the places a reviewer should look first, and no row is closed by prose — each names the spec-qualified mutant that must go RED.
 

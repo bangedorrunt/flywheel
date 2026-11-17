@@ -991,6 +991,56 @@ fn splice_role_models(argv: &mut Vec<String>, specs: &[String]) {
 mod tests {
     use super::*;
 
+    /// ADR-0022 acceptance 2: `briefing --json` carries the plan WITH its
+    /// consent set. A briefing that attaches seats but no consent items asks
+    /// the captain nothing while claiming to have a plan.
+    #[test]
+    fn a_briefing_plan_carries_its_consent_items() {
+        let mut b = Briefing {
+            schema: SCHEMA.into(),
+            objective: "acceptance 2".into(),
+            world: World {
+                project: "probe".into(),
+                ..Default::default()
+            },
+            proposal: Proposal {
+                topology: "swarm".into(),
+                join: false,
+                workflow: "wave-swarm".into(),
+                token: None,
+                stages: Vec::new(),
+                crew: [("coder".to_string(), 1u32)].into_iter().collect(),
+                crew_total: 1,
+                add: Vec::new(),
+                remove: Vec::new(),
+                why: "acceptance 2".into(),
+                argv: Vec::new(),
+                role: None,
+            },
+            alternatives: Vec::new(),
+            questions: Vec::new(),
+            harness_menu: None,
+            stale_build: None,
+            harness_ranking: None,
+            memory_traps: Vec::new(),
+            mode_text: "MODE swarm".into(),
+            required_skills: Vec::new(),
+            plan: None,
+        };
+        let always = crate::swarm_plan::ConsentPolicy {
+            ask: crate::swarm_plan::ConsentAsk::Always,
+            ..Default::default()
+        };
+        attach_consent_plan(&mut b, 5, &always);
+        let plan = b.plan.expect("a crew proposal attaches a plan");
+        assert_eq!(plan.seats.len(), 1, "one seat per crew role");
+        assert!(
+            !plan.needs_consent.is_empty(),
+            "the plan carries the consent items its policy produced: {:?}",
+            plan.needs_consent
+        );
+    }
+
     #[test]
     fn topology_enum_parses_swarm_loop_open_and_supervisor_but_not_join() {
         use toron_core::topology::Topology;

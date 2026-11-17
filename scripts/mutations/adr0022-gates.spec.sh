@@ -24,6 +24,10 @@ TEST_FILTER=(
     plan_machine_jev_missing_key_reaches_resolved
     plan_machine_jev_shrug_reaches_resolved
     timeout_alone_never_allows_rebind
+    needs_consent_lists_jev_field
+    needs_consent_over_budget_lists_estimate
+    the_precedence_ladder_never_lets_a_lower_rung_win
+    a_briefing_plan_carries_its_consent_items
 )
 
 SPAWN=src/cmd/spawn.rs
@@ -52,7 +56,7 @@ mutation "D4  a retired model with no replacement resolves anyway" \
 # D5/V3: a blocked seat never launches. The mutant makes the blocked guard
 # vacuous, so --yes confirms the plan and the seat with a remedy never given
 # goes out.
-mutation "D5  a blocked seat reaches Confirmed under --yes" \
+mutation "V3  a blocked seat reaches Confirmed under --yes" \
     file=$CHART \
     expect=plan_gate_blocked_with_yes_asks_and_names_remedy \
     find='    items.iter().any(|i| i.reason == ConsentReason::Blocked)' \
@@ -91,6 +95,35 @@ mutation "V10  a review step binds its author" \
     expect=seat_binder_reviewer_never_author \
     find='.filter(|s| !is_author(need, &s.pin))' \
     replace='.filter(|_| true)'
+
+# D5: THE RULE, not the gate. A Jev value is asked about; dropping that arm
+# makes the captain launch on a Jev choice nobody confirmed.
+mutation "D5A  a Jev field never enters needs_consent" \
+    file=$PLAN \
+    expect=needs_consent_lists_jev_field \
+    find='                    if field.as_ref().is_some_and(|f| f.from == Provenance::Jev) {' \
+    replace='                    if false {'
+
+# D5 rule 3: an estimate over the policy budget is asked about.
+mutation "D5B  an over-budget plan never enters needs_consent" \
+    file=$PLAN \
+    expect=needs_consent_over_budget_lists_estimate \
+    find='        if est_usd_per_mtok.is_some_and(|est| est > policy.budget_usd_per_mtok) {' \
+    replace='        if false {'
+
+# V7 as the LADDER, not one pair: invert it and every ordered pair fails.
+mutation "V7  the precedence ladder lets a lower rung win" \
+    file=$PLAN \
+    expect=the_precedence_ladder_never_lets_a_lower_rung_win \
+    find='        self.rank() < other.rank()' \
+    replace='        self.rank() > other.rank()'
+
+# A2: briefing carries its consent items, not just seats.
+mutation "A2  a briefing attaches seats but no consent items" \
+    file=src/briefing.rs \
+    expect=a_briefing_plan_carries_its_consent_items \
+    find='    plan.needs_consent = consent_plan::needs_consent(&plan, policy, None, cap);' \
+    replace='    plan.needs_consent = Vec::new();'
 
 # Acceptance 3: a harness patch re-filters the seat's model and clears the
 # consent entry. The mutant drops the patch, so the plan keeps the old harness
