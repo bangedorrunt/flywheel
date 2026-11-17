@@ -1565,6 +1565,58 @@ mod tests {
         assert!(next.queues.is_empty(), "idle pin must not queue");
     }
 
+    /// bd-0uzrq.2: the idle edge rings by ITSELF - exactly once per drained
+    /// window, coalescing several queued classes - and a second idle with no
+    /// new mail rings nothing at all (it re-reads the inbox instead, and the
+    /// already-rung ids are refused by the fold).
+    #[test]
+    fn an_idle_edge_rings_exactly_once_and_a_second_idle_rings_nothing() {
+        let mut model = model_with("BlueRidge");
+        model.statuses.insert("BlueRidge".into(), "working".into());
+        let w1 = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["h","ch-1"]],"content":"@BlueRidge hi"}"#;
+        let w2 = r#"{"kind":9,"id":"cd","tags":[["p","BlueRidge"],["h","ch-2"]],"content":"@BlueRidge yo"}"#;
+        let (m1, a1) = tick(&model, &DoorbellMsg::WatchNdjson { line: w1.into() });
+        let (m2, a2) = tick(&m1, &DoorbellMsg::WatchNdjson { line: w2.into() });
+        for actions in [&a1, &a2] {
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, DoorbellAction::Prompt { .. })),
+                "nothing rings while the pane is working: {actions:?}"
+            );
+        }
+        let (m3, drain) = tick(
+            &m2,
+            &DoorbellMsg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+        );
+        assert_eq!(
+            drain
+                .iter()
+                .filter(|a| matches!(a, DoorbellAction::Prompt { .. }))
+                .count(),
+            1,
+            "two queued classes ring ONCE on the idle edge: {drain:?}"
+        );
+        let (_, again) = tick(
+            &m3,
+            &DoorbellMsg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+        );
+        assert_eq!(
+            again
+                .iter()
+                .filter(|a| matches!(a, DoorbellAction::Prompt { .. }))
+                .count(),
+            0,
+            "a second idle with no new mail rings nothing: {again:?}"
+        );
+    }
+
     #[test]
     fn doorbell_tick_watch_line_queues_working_pin_then_drains() {
         let mut model = model_with("BlueRidge");
