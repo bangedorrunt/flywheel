@@ -1,13 +1,25 @@
 # Sourced by scripts/verify-mutations.sh.
-# bd-0uzrq.2: the idle edge rings by itself, once, and a second idle with no
-# new mail rings nothing. Re-ring on an empty drain and the second idle pages a
-# pane that has nothing to deliver.
+# bd-0uzrq.2: the idle edge rings ONCE per drained window, coalescing every
+# queued class. Ring per queued wake instead and a pane with two classes gets
+# two prompts for one idle edge.
 
 CARGO_ARGS=(-p doorbell-core --lib)
 TEST_FILTER=(an_idle_edge_rings_exactly_once_and_a_second_idle_rings_nothing)
 
-mutation "I1  an empty drain re-rings instead of re-reading the inbox" \
+mutation "I1  the drain rings once per queued wake instead of coalescing" \
     file=crates/doorbell-core/src/lib.rs \
     expect=an_idle_edge_rings_exactly_once_and_a_second_idle_rings_nothing \
-    find='                    actions.push(DoorbellAction::FetchInbox);' \
-    replace='                    actions.push(DoorbellAction::Prompt { pin: pin.clone(), line: "re-read".into() });'
+    find='                    for w in &deferred {
+                        if !w.key.is_empty() {
+                            next.rung.insert(w.key.clone());
+                        }
+                    }' \
+    replace='                    for w in &deferred {
+                        if !w.key.is_empty() {
+                            next.rung.insert(w.key.clone());
+                            actions.push(DoorbellAction::Prompt {
+                                pin: pin.clone(),
+                                line: w.line.clone(),
+                            });
+                        }
+                    }'
