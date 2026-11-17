@@ -37,6 +37,7 @@ fn rows(harness: &str) -> Vec<Row> {
             expect: match row["expect"].as_str().expect("expect") {
                 "empty" => InputLine::Empty,
                 "operator-text" => InputLine::OperatorText,
+                "wake-queued" => InputLine::WakeQueued,
                 other => panic!("unknown expect {other:?}"),
             },
             last_typed: row
@@ -90,8 +91,8 @@ fn every_captured_screen_classifies() {
             );
             assert_eq!(
                 may_inject(got),
-                row.expect != InputLine::OperatorText,
-                "{harness}/{}: only operator text defers a wake",
+                matches!(row.expect, InputLine::Empty | InputLine::Unknown),
+                "{harness}/{}: only an empty or unreadable box may be typed into (operator text and our own queued wake line both defer)",
                 row.file
             );
         }

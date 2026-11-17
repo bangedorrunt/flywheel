@@ -34,3 +34,10 @@ expect = "operator-text"
 # The palette overlay repaints over the input box and the frame is a collision
 # of both layers. The safe answer for an unrecognized non-empty box is defer:
 # the pane belongs to whoever is typing in it.
+
+# SYNTHETIC (bd-8wdgn), not a rex capture: the box reproduced from the live
+# failure holds the doorbell's own queued line. It is NOT operator typing and
+# must not be treated as such.
+[[screen]]
+file = "wake-line-queued.txt"
+expect = "wake-queued"

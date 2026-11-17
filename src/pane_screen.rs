@@ -18,13 +18,31 @@ pub enum InputLine {
     Empty,
     /// the operator has typed something that has not been submitted
     OperatorText,
+    /// the box holds one of OUR OWN wake lines (`[doorbell] …`, `⟦toron⟧ …`).
+    /// Not operator typing: the line is already queued, so a second write is
+    /// both unnecessary and destructive (bd-8wdgn).
+    WakeQueued,
     /// this screen's input box is not recognised (no capture for this harness)
     Unknown,
 }
 
 /// The one rule the wake path asks: may a prompt be written into this pane?
 pub fn may_inject(line: InputLine) -> bool {
-    !matches!(line, InputLine::OperatorText)
+    matches!(line, InputLine::Empty | InputLine::Unknown)
+}
+
+/// The doorbell/toron prefixes its own door writes into a pane. A box holding
+/// one of these is a queued wake line, not operator text (bd-8wdgn).
+pub const WAKE_PREFIXES: &[&str] = &["[doorbell]", "[toron]", "⟦toron⟧"];
+
+fn is_wake_line(content: &str) -> bool {
+    WAKE_PREFIXES.iter().any(|p| content.starts_with(p))
+}
+
+/// For the deferral message: our own line is queued, so say that rather than
+/// accusing the operator of typing.
+pub fn wake_queued(line: InputLine) -> bool {
+    matches!(line, InputLine::WakeQueued)
 }
 
 fn canonical(harness: &str) -> String {
@@ -124,6 +142,9 @@ pub fn input_line_for(harness: &str, tail: &str, last_typed: Option<&str>) -> In
         || last_typed.is_some_and(|typed| !typed.is_empty() && content == typed.trim())
     {
         return InputLine::Empty;
+    }
+    if is_wake_line(content) {
+        return InputLine::WakeQueued;
     }
     InputLine::OperatorText
 }

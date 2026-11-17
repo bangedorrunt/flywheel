@@ -97,6 +97,11 @@ pub fn defer_if_operator_typing(
     if crate::pane_screen::may_inject(input) {
         return Ok(());
     }
+    if crate::pane_screen::wake_queued(input) {
+        return Err(format!(
+            "deferred: a wake line is already queued for {pin}; nothing was typed, and the mail stays queued"
+        ));
+    }
     Err(format!(
         "deferred: operator is typing in {pin}; nothing was typed, and the mail stays queued for the next idle edge"
     ))
@@ -119,6 +124,11 @@ pub fn defer_if_operator_typing_strict(
     })?;
     if crate::pane_screen::may_inject(input) {
         return Ok(());
+    }
+    if crate::pane_screen::wake_queued(input) {
+        return Err(format!(
+            "deferred: a wake line is already queued for {pin}; nothing was typed, and the mail stays queued"
+        ));
     }
     Err(format!(
         "deferred: operator is typing in {pin}; nothing was typed, and the mail stays queued for the next idle edge"
@@ -154,6 +164,37 @@ mod tests {
             .expect_err("operator text must defer");
         assert!(err.starts_with("deferred: operator is typing in "), "{err}");
         assert!(err.contains("nothing was typed"), "{err}");
+    }
+
+    /// bd-8wdgn: a box holding OUR OWN queued wake line is not operator typing.
+    /// It still defers, but it says so - the operator never touched the box.
+    #[test]
+    fn a_queued_wake_line_defers_with_its_own_message() {
+        let wake = opencode_fixture("wake-line-queued");
+        for err in [
+            defer_if_operator_typing(
+                &Fixed(Ok(wake.clone())),
+                "opencode",
+                "block:1",
+                "read-probe",
+            ),
+            defer_if_operator_typing_strict(
+                &Fixed(Ok(wake.clone())),
+                "opencode",
+                "block:1",
+                "read-probe",
+            ),
+        ] {
+            let err = err.expect_err("a queued wake line must defer");
+            assert!(
+                err.starts_with("deferred: a wake line is already queued for "),
+                "the message names the wake line, not the operator: {err}"
+            );
+            assert!(
+                !err.contains("operator is typing"),
+                "the operator is not typing: {err}"
+            );
+        }
     }
 
     /// An empty box (or a harness whose frame we do not know) passes.
