@@ -128,6 +128,7 @@ echo "verify-formal: positive models"
 expect_pass JobLease JobLease
 expect_pass BindBeforePrompt BindBeforePrompt
 expect_pass PlanApply PlanApply
+expect_pass ClaimExclusion ClaimExclusion
 expect_pass Respawn Respawn
 expect_pass DeferredHandoff DeferredHandoff
 expect_pass P2pDelivery P2pDelivery
@@ -147,6 +148,7 @@ expect_violation JobLease JobLease.broken-stale-settle NoStaleSettle
 expect_violation JobLease JobLease.broken-revive-terminal TerminalStable
 expect_violation Respawn Respawn.broken-claim-before-free OneLiveHolder
 expect_violation Respawn Respawn.broken-drop-reservations ReservationsKept
+expect_violation ClaimExclusion ClaimExclusion.broken-allow-author NoSelfReview
 expect_violation PlanApply PlanApply.broken-clobber EveryAppendLands
 expect_violation BindBeforePrompt BindBeforePrompt.broken-prompt-first PromptedImpliesBound
 expect_violation DeferredHandoff DeferredHandoff.broken-memory-only NoLostWake
