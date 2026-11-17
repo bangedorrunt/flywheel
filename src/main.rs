@@ -3076,13 +3076,13 @@ fn main() {
             "upstream_parity": upstream_parity::robot_summary(),
             "commands": [
                 "init spawn add list status decide rebind recover",
-                "ship check <bead> [--json] | ship land <bead> --sha <40hex> --receipt <file> [--project <p>] [--as <pin>] [--message <m>] (one verb: gate -> close -> sync -> release -> commit THIS bead's tracker rows -> check; idempotent, prints the resume command on failure; another lane's dirty tracker row never blocks)",
+                "ship check <bead> [--json] | ship land <bead> --sha <40hex> --receipt <file> [--project <p>] [--as <pin>] [--message <m>] [--repo <dir>] (one verb: gate -> close -> sync -> release -> commit THIS bead's tracker rows -> check; idempotent, prints the resume command on failure; another lane's dirty tracker row never blocks; --repo names the repo holding the citing commit and the receipt's specs when the work lives elsewhere, symmetric with br close --repo; the HEAD-lock race other lanes cause is retried, not surfaced)",
                 "spawn <project> [--kind K=N ...] [--assign PIN=BEAD[,BEAD] ...] [--dry-run --json] [--patch <seat>.<field>=<value> (repeatable; re-resolves the seat with from: user)] [--model harness-default leaves the harness's own model untouched] [--yes] (ADR-0022 plan spawn; see --help for the full flag list)",
                 "retire <pin>... [--project <p>] [--force-working] [--as <pin>] [--json] (bd-rilvn: the thin per-pin stop verb over the seat path — ONE journaled SeatEffect::Retire through Ports::seat closes that pane, the pin's leases are released operator-signed by HOLDER (a sibling on the same bead keeps its lease), then the roster row is deregistered; refuses the captain/operator seat by role and a working pin without --force-working)",
-            "swarm plan <project> [spawn flags] | swarm apply <project> [--patch <seat>.<field>=<value>] [--count <role>=<n>] [--json] | swarm status [<project>] [--json] (ADR-0022 rollout 6 + D7 remainder: plan prints the SAME flywheel-plan.v1 object as `spawn --dry-run --json`; apply is the one mechanism — patch/count -> pure reconciler -> the one `Ports::seat` interpreter, journal-first; fields harness|model|effort|mode|role (role only on apply; spawn rejects it); `--count role=+1` grows the fleet within crew.max; Spawn/InjectRole run live (InjectRole never for review/verify seats); `binding-rebind --model` routes here; status lists live seats with the plane's status)",
+            "swarm plan <project> [spawn flags] | swarm apply <project> [--patch <seat>.<field>=<value>] [--count <role>=<n>] [--yes] [--json] | swarm status [<project>] [--json] (ADR-0022 rollout 6 + D7 remainder: plan prints the SAME flywheel-plan.v1 object as `spawn --dry-run --json`; apply is the one mechanism — patch/count -> pure reconciler -> the one `Ports::seat` interpreter, journal-first; fields harness|model|effort|mode|role (role only on apply; spawn rejects it); `--count role=+1` grows the fleet within crew.max; Spawn/InjectRole run live (InjectRole never for review/verify seats); `binding-rebind --model` routes here; status lists live seats with the plane's status; ADR-0022 D1: every apply is a plan EVENT first - the plan of record is the source of the desired seats, pending events fold in memory and land as ONE write only after every gate, and a planned SPAWN needs --yes)",
             "send interrupt view output watch attach kill",
             "prefer <role.field>=<value> [--project <p>] | prefer --list [--json] | prefer --forget <role.field> [--project <p>] (ADR-0022 D6: standing preferences — project beats always, exact role beats *; set also records a chie lesson)",
-            "crew preview|control|prompt (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker)",
+            "crew preview|control|prompt|inbox --open [--pin <pin>]|done <brief-id> --receipt \"<sha + proof + test tail>\" (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker; a dispatched crew prompt IS a brief and `crew done <brief> --receipt` closes it and wakes the captain, falling back to plane-P mail when the captain has no pane row (both paths dead is a typed error saying the captain heard NOTHING); a wake the pane already holds is not a failure — the mail is stored and the prompt exits 0 as queued)",
             "peer intent|request-release|release-response|review-request (structured P2P directives with reactive ⟦p2p:<verb>⟧ wake dispatch)",
             "captain watch <project> [--interval N] [--json] [--as <pin>] [--stall --stall-minutes N] [--preflight --preflight-mode steer|loop|workflow|cron] (bd-captain-watch-poll-exit-bbwm: harness resume on the captain inbox. The push is escalate@1 mail from the supervisor. This command blocks on that inbox's water and exits with a preview when strictly-newer mail lands; --stall also exits 0 when every bead is closed, or exits 3 when no pane is working and no commit landed for the threshold with work remaining; an unreadable fleet never alarms; --preflight adds an arm that exits 4 with the FIRST failing check and its remedy line, checked at arm time and each poll. One shot: re-arm after each resume)",
             "captain directory <project> [--json] (ADR-0019 D2/D4: read-only sessions, tiers, and per-pin addressability — ok <key> or err <code> — from the pure directory projection over an explicitly selected rex backend; never auto/hc on this path)",
@@ -22019,5 +22019,40 @@ mod boot_prime_tests {
         assert!(line.contains("wait for an assignment"), "{line}");
         assert!(line.contains("Do not read mail"), "{line}");
         assert!(!line.contains("br update"), "{line}");
+    }
+}
+
+#[cfg(test)]
+mod robot_capabilities_text {
+    /// Three capability lines drifted behind the verbs they describe (bd-6setu.20,
+    /// ScarletCove's cross-review). One assertion per string, so the next drift
+    /// is red instead of silent.
+    #[test]
+    fn the_robot_capabilities_text_names_the_live_verbs() {
+        let src = include_str!("main.rs");
+        let start = src.find("if cli.robot_capabilities").expect("arm");
+        let end = src[start..]
+            .find("\n    let cfg = match Config::load()")
+            .expect("arm end");
+        let block = &src[start..start + end];
+        for needle in [
+            // (1) ship land: --repo and the retried HEAD race
+            "ship land <bead> --sha <40hex> --receipt <file> [--project <p>] [--as <pin>] [--message <m>] [--repo <dir>]",
+            "the HEAD-lock race other lanes cause is retried",
+            // (2) swarm apply: --yes and the plan-of-record semantics
+            "[--count <role>=<n>] [--yes] [--json] | swarm status",
+            "every apply is a plan EVENT first",
+            "land as ONE write only after every gate",
+            // (3) crew: inbox, done, the mail fallback, and a queued wake exit 0
+            "crew preview|control|prompt|inbox --open",
+            "crew done <brief> --receipt",
+            "falling back to plane-P mail",
+            "exits 0 as queued",
+        ] {
+            assert!(
+                block.contains(needle),
+                "robot-capabilities must carry {needle:?}"
+            );
+        }
     }
 }
