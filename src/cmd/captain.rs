@@ -1587,6 +1587,50 @@ mod tests {
         assert!(watch.step(&sample(false)).is_empty());
     }
 
+    /// bd-c48to: 30 per-path release notices must not bury a single brief or
+    /// manufacture an idle page. The notices carry a NON-EMPTY subject and no
+    /// flywheel `kind`, which is why the old empty-subject rule missed them.
+    #[test]
+    fn thirty_release_notices_and_one_brief_page_only_on_the_brief() {
+        let crew = std::collections::BTreeSet::from(["CyanCove".to_string()]);
+        let mut rows: Vec<serde_json::Value> = (0..30)
+            .map(|i| {
+                serde_json::json!({
+                    "sender": "a".repeat(64),
+                    "subject": format!("reservation released: crates/file-{i}.rs"),
+                })
+            })
+            .collect();
+        let brief = serde_json::json!({"sender": "SlateHarbor", "subject": "[bd-x] ruling"});
+        rows.push(brief.clone());
+
+        assert_eq!(
+            captain_subjects(&rows, "CyanCove", &crew),
+            vec!["[bd-x] ruling".to_string()],
+            "only the brief is unread work"
+        );
+        let unread = pin_unread(&rows, "CyanCove", &crew, false);
+        assert_eq!(unread.len(), 1, "the idle page sees one item: {unread:?}");
+        assert!(unread[0].contains("ruling"));
+
+        let mut watch = IdleWatch::default();
+        let sample = |working: bool, unread: Vec<String>| {
+            vec![IdleSample {
+                pin: "CyanCove".into(),
+                working,
+                unread,
+            }]
+        };
+        assert!(watch.step(&sample(true, unread.clone())).is_empty());
+        let page = watch.step(&sample(false, unread.clone()));
+        assert_eq!(page.len(), 1, "exactly one page on the idle edge: {page:?}");
+        assert!(
+            page[0].subjects.iter().any(|s| s.contains("ruling")),
+            "the page names the brief, not the release noise: {:?}",
+            page[0].subjects
+        );
+    }
+
     /// A wake the host took and never rang is a brief the captain must hear
     /// about, whether it is still in the handoff file or already journaled —
     /// `pin_unread` is the ONE decision both sources feed.

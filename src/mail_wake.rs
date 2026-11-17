@@ -58,12 +58,21 @@ pub enum WakePlan<'a> {
 /// its throwaway hex sender and empty subject instead.
 pub fn is_system_notice(row: &MailRow) -> bool {
     system_notice_fields(row.kind.as_deref(), &row.subject, &row.sender)
+        || is_release_notice(&row.subject)
 }
 
 /// The field-level classifier both readers share (bd-271ws): the doorbell's
 /// typed sink and `captain watch`'s JSON rows must agree on what is noise.
 pub fn system_notice_fields(kind: Option<&str>, subject: &str, sender: &str) -> bool {
     kind.is_some() || (subject.trim().is_empty() && looks_like_key(sender))
+}
+
+/// bd-c48to: toron's per-path release notices land with a NON-EMPTY subject
+/// ("reservation released: <path>") and no flywheel `kind`, so the old
+/// empty-subject/key rule let them through as briefs. A release notice is
+/// transport chatter whoever sent it - never work a pin must answer.
+pub fn is_release_notice(subject: &str) -> bool {
+    subject.trim_start().starts_with("reservation released:")
 }
 
 /// The same predicate over a wire row (`captain watch` holds `serde_json`
@@ -78,7 +87,7 @@ pub fn is_system_notice_value(row: &serde_json::Value) -> bool {
         .get("sender")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    system_notice_fields(kind, subject, sender)
+    system_notice_fields(kind, subject, sender) || is_release_notice(subject)
 }
 
 fn looks_like_key(sender: &str) -> bool {
