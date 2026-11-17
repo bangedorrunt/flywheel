@@ -997,10 +997,12 @@ const PACK_SUFFIX: &str = ".yaml";
 /// defaults (malformed logs loudly, never silently half-applies).
 pub const THRESHOLDS_ENV: &str = "FLYWHEEL_JEV_THRESHOLDS";
 
-pub fn active_thresholds() -> Thresholds {
-    let raw = match env::var(THRESHOLDS_ENV) {
-        Ok(v) => v,
-        Err(_) => return Thresholds::default(),
+/// Pure parse of the `FLYWHEEL_JEV_THRESHOLDS` payload: `None` (unset) and
+/// malformed values fall back to provisional defaults. No process env read.
+pub fn parse_thresholds(raw: Option<&str>) -> Thresholds {
+    let raw = match raw {
+        Some(v) => v,
+        None => return Thresholds::default(),
     };
     let parts: Vec<&str> = raw.split(',').map(str::trim).collect();
     if parts.len() != 3 {
@@ -1022,6 +1024,13 @@ pub fn active_thresholds() -> Thresholds {
         honesty_gate: nums[1],
         announce_only: nums[2],
     }
+}
+
+/// Env edge: resolve the knob once at the call site and pass the result as
+/// data; policy fns never re-read process env per call.
+pub fn active_thresholds() -> Thresholds {
+    let raw = env::var(THRESHOLDS_ENV).ok();
+    parse_thresholds(raw.as_deref())
 }
 
 /// Pack discovery. XDG `~/.config/flywheel/judgment-packs` is the source of
@@ -1977,8 +1986,8 @@ pub fn suggest_tier_pick(objective: &str) -> Option<&'static str> {
 /// 0.7, captain-tunable). Below the bar the suggestion is NOTHING (not
 /// even the table): a weak live signal is evidence against the table cue,
 /// while a deny (no signal at all) keeps it.
-pub fn suggestion_gate(conf: f64) -> bool {
-    conf >= active_thresholds().announce_only
+pub fn suggestion_gate(conf: f64, t: &Thresholds) -> bool {
+    conf >= t.announce_only
 }
 
 /// One batched candidate score (bd-vlvn): the candidate, its Score level
@@ -2092,6 +2101,7 @@ pub fn live_profile_suggestion<T: Transport>(
     if candidates.is_empty() {
         return Ok(None);
     }
+    let thresholds = active_thresholds();
     let names: Vec<String> = candidates.iter().map(|(n, _)| n.clone()).collect();
     let batch =
         batch_pack_for_candidates(pack, "profile_fit", &names).map_err(JevError::Malformed)?;
@@ -2105,7 +2115,9 @@ pub fn live_profile_suggestion<T: Transport>(
     let scores = split_batched_scores(&answers, &batch, "profile_fit", &names);
     let best = rank_candidate_scores(&scores);
     match best {
-        Some(b) if suggestion_gate(b.confidence) => Ok(Some(format!("@{}", b.candidate))),
+        Some(b) if suggestion_gate(b.confidence, &thresholds) => {
+            Ok(Some(format!("@{}", b.candidate)))
+        }
         _ => Ok(None),
     }
 }
@@ -2124,11 +2136,12 @@ fn ask_depth_band<T: Transport>(
     pack: &QuestionPack,
     goal: &str,
 ) -> Result<Option<String>, JevError> {
+    let thresholds = active_thresholds();
     let mut fields = BTreeMap::new();
     fields.insert("goal.text".to_string(), goal.to_string());
     let slice = build_state_slice(fields);
     let answers = transport.ask(&slice, pack)?;
-    if !suggestion_gate(pack_confidence(&answers)) {
+    if !suggestion_gate(pack_confidence(&answers), &thresholds) {
         return Ok(None);
     }
     let depth = answers.by_question.get("reasoning_depth");
@@ -3556,14 +3569,14 @@ questions:
 
     #[test]
     fn b5_thresholds_knob_parses_or_defaults() {
-        unsafe { env::set_var(THRESHOLDS_ENV, "0.9,0.85,0.7") };
-        let t = active_thresholds();
+        let t = parse_thresholds(Some("0.9, 0.85, 0.7"));
         assert!((t.topology_adjacent - 0.9).abs() < 1e-9);
         assert!((t.honesty_gate - 0.85).abs() < 1e-9);
         assert!((t.announce_only - 0.7).abs() < 1e-9);
-        unsafe { env::set_var(THRESHOLDS_ENV, "junk") };
-        assert!((active_thresholds().honesty_gate - 0.80).abs() < 1e-9);
-        unsafe { env::remove_var(THRESHOLDS_ENV) };
+        assert_eq!(parse_thresholds(Some("junk")).honesty_gate, 0.80);
+        assert_eq!(parse_thresholds(None).honesty_gate, 0.80);
+        assert_eq!(parse_thresholds(Some("0.9,0.85")).honesty_gate, 0.80);
+        assert_eq!(parse_thresholds(Some("0.9,0.85,1.7")).honesty_gate, 0.80);
     }
 
     #[test]
@@ -4006,11 +4019,12 @@ questions:
     /// rejects below it (tracks the captain-tunable bar, default 0.6).
     #[test]
     fn jev_live_suggestion_gate_clears_at_bar() {
-        let bar = active_thresholds().announce_only;
-        assert!(suggestion_gate(bar));
-        assert!(suggestion_gate(1.0));
-        assert!(!suggestion_gate(bar - 0.01));
-        assert!(!suggestion_gate(0.0));
+        let t = parse_thresholds(Some("0.9,0.85,0.7"));
+        let bar = t.announce_only;
+        assert!(suggestion_gate(bar, &t));
+        assert!(suggestion_gate(1.0, &t));
+        assert!(!suggestion_gate(bar - 0.01, &t));
+        assert!(!suggestion_gate(0.0, &t));
     }
 
     /// bd-vlvn: batching clones the Score question per candidate into one
@@ -4093,7 +4107,7 @@ questions:
         let best = rank_candidate_scores(&scores).expect("best");
         assert_eq!(best.candidate, "rust-coder");
         assert_eq!(best.level_name, "strong");
-        assert!(suggestion_gate(best.confidence));
+        assert!(suggestion_gate(best.confidence, &Thresholds::default()));
         assert!(rank_candidate_scores(&[]).is_none());
     }
 
