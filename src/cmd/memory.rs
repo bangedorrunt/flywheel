@@ -194,6 +194,15 @@ pub fn check_trap_queries_strict(
             &mut out,
             run_check_trap(&["--command", q, "--json"], project_dir)?,
         );
+        // The trap guard matches exact argv/path tokens; migrated lessons name
+        // their file slug, so natural prose queries never hit. Recall over the
+        // same Rule/Trap lessons is the general read path (bd-ndbnv).
+        for line in lesson_recall(q, project_dir)? {
+            let line = normalize_line(&line);
+            if !line.is_empty() {
+                out.insert(line.chars().take(240).collect());
+            }
+        }
     }
     if !queries.is_empty() {
         let joined = queries.join(" ");
@@ -268,6 +277,45 @@ fn run_check_trap(args: &[&str], project_dir: Option<&Path>) -> Result<Option<St
         args.join(" "),
         detail
     )
+}
+
+/// Recall Rule/Trap lessons by text — the read path for lessons whose trap
+/// matcher is a slug rather than the natural phrase a preflight query uses.
+fn lesson_recall(query: &str, project_dir: Option<&Path>) -> Result<Vec<String>> {
+    let mut cmd = Command::new(chie_bin());
+    cmd.args(["memory", "recall", query, "--json"]);
+    if let Some(dir) = chie_project(project_dir) {
+        cmd.args(["--project", &dir]);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| anyhow::anyhow!("cannot run chie recall: {e}"))?;
+    if !out.status.success() {
+        let err_text = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let low = err_text.to_ascii_lowercase();
+        if low.contains("unreachable")
+            || low.contains("refused")
+            || low.contains("connect")
+            || low.contains("daemon")
+        {
+            return Ok(Vec::new());
+        }
+        bail!("chie memory recall failed ({query}): {err_text}");
+    }
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    let mut rows = Vec::new();
+    for key in ["conclusions", "events"] {
+        if let Some(arr) = doc.get(key).and_then(serde_json::Value::as_array) {
+            for item in arr {
+                if let Some(content) = item.get("content").and_then(serde_json::Value::as_str)
+                    && (content.contains("Rule:") || content.contains("Trap:"))
+                {
+                    rows.push(content.to_string());
+                }
+            }
+        }
+    }
+    Ok(rows)
 }
 
 fn extract_trap_lines(raw: &str) -> Vec<String> {
@@ -375,32 +423,9 @@ pub fn record_lesson(content: &str, kind: Option<&str>, project_dir: Option<&Pat
 /// that shape and give it a matcher the guard can infer (bd-97uwg).
 fn rule_lesson_event(content: &str) -> String {
     let matcher = trap_matcher(content);
-    let mut event = format!("Rule: {content}\nTrap: `{matcher}` — {content}\n");
-    // A migration's Rule line names a natural-language lesson ("A backoff is
-    // not a rate limit...") while its Trap line names the file slug. The slug
-    // only matches itself, so also index the natural phrase preflight queries
-    // use (bd-ndbnv). One path: record-lesson writes both matchers.
-    let natural = natural_phrase(content);
-    if !natural.is_empty() && natural != matcher {
-        event.push_str(&format!("Trap: `{natural}` — {content}\n"));
-    }
-    event.push_str("Proof: recorded by flywheel memory record-lesson");
-    event
-}
-
-fn natural_phrase(content: &str) -> String {
-    let rule = content
-        .split_once(" breaks when ")
-        .or_else(|| content.split_once(" break when "))
-        .map(|(x, _)| x)
-        .unwrap_or(content);
-    let rule = rule.strip_prefix("Rule:").unwrap_or(rule).trim();
-    let head = rule.split(" — ").next().unwrap_or(rule);
-    let head = head.split(" without ").next().unwrap_or(head);
-    let head = head.split("; do ").next().unwrap_or(head);
-    head.trim()
-        .trim_end_matches(|c: char| !c.is_alphanumeric())
-        .to_ascii_lowercase()
+    format!(
+        "Rule: {content}\nTrap: `{matcher}` — {content}\nProof: recorded by flywheel memory record-lesson"
+    )
 }
 
 fn trap_matcher(content: &str) -> String {

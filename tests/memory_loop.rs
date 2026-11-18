@@ -138,46 +138,65 @@ fn recording_with_as_is_retrievable() {
     );
 }
 
-/// bd-ndbnv: a lesson recorded the migration way (decision kind, slug Trap
-/// line) must also be found by the natural preflight query.
+/// bd-ndbnv: lessons recorded the migration way (decision kind, slug Trap
+/// line) must surface by natural preflight query — across DIFFERENT shapes,
+/// not one fitted phrase.
 #[test]
-fn a_migration_style_lesson_is_check_trap_findable() {
+fn migrated_lessons_are_check_trap_findable_by_natural_query() {
     let sandbox = TestSandbox::new();
-    let lesson = "Rule: A backoff is not a rate limit without single-flight — the incident prose.\nTrap: `a-backoff-is-not-a-rate-limit` — A backoff is not a rate limit without single-flight\nProof: migrated from docs/learnings/a-backoff-is-not-a-rate-limit.md at b06a4ff8^";
-    let recorded = run(
-        &sandbox,
-        &[
-            "memory",
-            "record-lesson",
-            lesson,
-            "--kind",
-            "decision",
-            "--project",
-            "proj",
-            "--json",
-        ],
-    );
-    assert!(
-        text(&recorded).contains("\"recorded\": true"),
-        "migration-style recording failed: {}",
-        text(&recorded)
-    );
-    let found = run(
-        &sandbox,
-        &[
-            "memory",
-            "check-trap",
-            "a backoff is not a rate limit",
-            "--project",
-            "proj",
-            "--json",
-        ],
-    );
-    assert!(
-        text(&found).contains("`a backoff is not a rate limit` —"),
-        "the migrated lesson must surface by natural query: {}",
-        text(&found)
-    );
+    let cases = [
+        (
+            "Rule: A backoff is not a rate limit without single-flight — the incident prose.\nTrap: `a-backoff-is-not-a-rate-limit` — A backoff is not a rate limit without single-flight\nProof: migrated at b06a4ff8^",
+            "backoff single-flight",
+            "incident prose",
+        ),
+        (
+            "Rule: A park is interruption, and the SDK already had the vocabulary — DispatchAcquire Park can hand back.\nTrap: `bd-ynef-park-is-interruption` — A park is interruption\nProof: migrated at b06a4ff8^",
+            "park is interruption",
+            "sdk already had the vocabulary",
+        ),
+        (
+            "Rule: Grilling Jido to toron-workflow port plan, an audit and interview — contracts beat runtime.\nTrap: `jido-port-grilling` — Jido port grilling\nProof: migrated at b06a4ff8^",
+            "jido port grilling",
+            "contracts beat runtime",
+        ),
+        (
+            "Rule: Never deploy without a proof — the close needs a legal ledger verdict.\nTrap: `never-deploy-without-proof` — Never deploy without a proof\nProof: migrated at b06a4ff8^",
+            "never deploy without a proof",
+            "legal ledger verdict",
+        ),
+    ];
+    for (lesson, _, needle) in cases {
+        let recorded = run(
+            &sandbox,
+            &[
+                "memory",
+                "record-lesson",
+                lesson,
+                "--kind",
+                "decision",
+                "--project",
+                "proj",
+                "--json",
+            ],
+        );
+        assert!(
+            text(&recorded).contains("\"recorded\": true"),
+            "recording failed for {needle}: {}",
+            text(&recorded)
+        );
+    }
+    for (_, query, needle) in cases {
+        let found = run(
+            &sandbox,
+            &["memory", "check-trap", query, "--project", "proj", "--json"],
+        );
+        assert!(
+            text(&found).to_ascii_lowercase().contains(needle),
+            "migrated lesson ({needle}) must surface by natural query: {}",
+            text(&found)
+        );
+    }
 }
 
 /// `--project <slug>` and `--project <dir>` name the same chie scope.
