@@ -375,9 +375,32 @@ pub fn record_lesson(content: &str, kind: Option<&str>, project_dir: Option<&Pat
 /// that shape and give it a matcher the guard can infer (bd-97uwg).
 fn rule_lesson_event(content: &str) -> String {
     let matcher = trap_matcher(content);
-    format!(
-        "Rule: {content}\nTrap: `{matcher}` — {content}\nProof: recorded by flywheel memory record-lesson"
-    )
+    let mut event = format!("Rule: {content}\nTrap: `{matcher}` — {content}\n");
+    // A migration's Rule line names a natural-language lesson ("A backoff is
+    // not a rate limit...") while its Trap line names the file slug. The slug
+    // only matches itself, so also index the natural phrase preflight queries
+    // use (bd-ndbnv). One path: record-lesson writes both matchers.
+    let natural = natural_phrase(content);
+    if !natural.is_empty() && natural != matcher {
+        event.push_str(&format!("Trap: `{natural}` — {content}\n"));
+    }
+    event.push_str("Proof: recorded by flywheel memory record-lesson");
+    event
+}
+
+fn natural_phrase(content: &str) -> String {
+    let rule = content
+        .split_once(" breaks when ")
+        .or_else(|| content.split_once(" break when "))
+        .map(|(x, _)| x)
+        .unwrap_or(content);
+    let rule = rule.strip_prefix("Rule:").unwrap_or(rule).trim();
+    let head = rule.split(" — ").next().unwrap_or(rule);
+    let head = head.split(" without ").next().unwrap_or(head);
+    let head = head.split("; do ").next().unwrap_or(head);
+    head.trim()
+        .trim_end_matches(|c: char| !c.is_alphanumeric())
+        .to_ascii_lowercase()
 }
 
 fn trap_matcher(content: &str) -> String {

@@ -138,6 +138,48 @@ fn recording_with_as_is_retrievable() {
     );
 }
 
+/// bd-ndbnv: a lesson recorded the migration way (decision kind, slug Trap
+/// line) must also be found by the natural preflight query.
+#[test]
+fn a_migration_style_lesson_is_check_trap_findable() {
+    let sandbox = TestSandbox::new();
+    let lesson = "Rule: A backoff is not a rate limit without single-flight — the incident prose.\nTrap: `a-backoff-is-not-a-rate-limit` — A backoff is not a rate limit without single-flight\nProof: migrated from docs/learnings/a-backoff-is-not-a-rate-limit.md at b06a4ff8^";
+    let recorded = run(
+        &sandbox,
+        &[
+            "memory",
+            "record-lesson",
+            lesson,
+            "--kind",
+            "decision",
+            "--project",
+            "proj",
+            "--json",
+        ],
+    );
+    assert!(
+        text(&recorded).contains("\"recorded\": true"),
+        "migration-style recording failed: {}",
+        text(&recorded)
+    );
+    let found = run(
+        &sandbox,
+        &[
+            "memory",
+            "check-trap",
+            "a backoff is not a rate limit",
+            "--project",
+            "proj",
+            "--json",
+        ],
+    );
+    assert!(
+        text(&found).contains("`a backoff is not a rate limit` —"),
+        "the migrated lesson must surface by natural query: {}",
+        text(&found)
+    );
+}
+
 /// `--project <slug>` and `--project <dir>` name the same chie scope.
 #[test]
 fn slug_and_directory_scopes_agree() {
