@@ -53,7 +53,7 @@ proof_mutation_base() {
 # commit id on the cache key cannot hit across landings; this is the one place
 # that moves the base forward. Red receipts never count: they prove nothing.
 proof_green_base() {
-  local root="$1" proven="$2" archive="${3:-}" f sha stamp best="" best_stamp=0
+  local root="$1" proven="$2" archive="${3:-}" f sha stamp digits best="" best_stamp=0
   [ -d "$archive" ] || return 0
   for f in "$archive"/*.json; do
     [ -f "$f" ] || continue
@@ -71,8 +71,13 @@ PY
     [ -n "${sha:-}" ] || continue
     [ "$sha" = "$proven" ] && continue
     git -C "$root" merge-base --is-ancestor "$sha" "$proven" 2>/dev/null || continue
-    if [ "${stamp:-0}" -gt "$best_stamp" ]; then
-      best="$sha"; best_stamp="${stamp:-0}"
+    # Real receipts carry PROOF_STAMP as compact ISO ("20261118T041942Z"), not
+    # an integer. Compare DIGITS only: fixed-width ISO sorts chronologically
+    # this way, and a legacy numeric stamp still works.
+    digits="$(printf '%s' "${stamp:-}" | tr -cd '0-9')"
+    [ -n "$digits" ] || digits=0
+    if [ "$digits" -gt "$best_stamp" ]; then
+      best="$sha"; best_stamp="$digits"
     fi
   done
   printf '%s\n' "$best"

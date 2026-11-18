@@ -33,18 +33,18 @@ mkdir -p "$ARCHIVE"
 # shellcheck source=proof-lib.sh
 . "$ROOT/scripts/proof-lib.sh"
 
-receipt() { # $1 sha, $2 ok, $3 stamp
-  printf '{"ok":%s,"sha":"%s","stamp":%s}\n' "$2" "$1" "$3" >"$ARCHIVE/$1.json"
+receipt() { # $1 sha, $2 ok, $3 stamp (PROOF_STAMP is compact ISO)
+  printf '{"ok":%s,"sha":"%s","stamp":"%s"}\n' "$2" "$1" "$3" >"$ARCHIVE/$1.json"
 }
-receipt "$C2" true 100
+receipt "$C2" true "20261118T041900Z"
 [ "$(proof_green_base "$REPO" "$C5" "$ARCHIVE")" = "$C2" ] \
-  || fail "a green ancestor receipt must become the base"
-pass "one green ancestor becomes the base"
+  || fail "a green ancestor receipt with a REAL ISO stamp must become the base"
+pass "one green ancestor with an ISO stamp becomes the base"
 
 # A newer green ancestor wins; a red receipt and a non-ancestor cannot.
-receipt "$C3" true 200
-receipt "$C4" false 999
-receipt "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" true 999
+receipt "$C3" true "20261118T041942Z"
+receipt "$C4" false "20261118T041959Z"
+receipt "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" true "20261118T042000Z"
 [ "$(proof_green_base "$REPO" "$C5" "$ARCHIVE")" = "$C3" ] \
   || fail "the newest green ancestor must win (got $(proof_green_base "$REPO" "$C5" "$ARCHIVE"))"
 pass "newest green ancestor wins; red and non-ancestor ignored"

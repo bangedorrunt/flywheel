@@ -4,7 +4,7 @@
 # also cold-built its own target dir. These mutants restore each regression.
 
 CARGO_ARGS=(--bin flywheel)
-TEST_FILTER=(the_cache_key_covers_spec_target_test_harness_lock_driver_and_siblings clean_proof_scopes_mutations_and_shares_one_target_dir)
+TEST_FILTER=(the_cache_key_covers_spec_target_test_harness_lock_driver_and_siblings clean_proof_scopes_mutations_and_shares_one_target_dir proof_green_base_accepts_iso_stamped_receipts)
 
 mutation "B1  the cache key uses the commit sha again" \
     file=scripts/mutation-cache.py \
@@ -24,3 +24,9 @@ mutation "B3  each mutation export cold-builds again" \
     expect=clean_proof_scopes_mutations_and_shares_one_target_dir \
     find='"VERIFY_MUTATIONS_TARGET_DIR=$TMP/target"' \
     replace='"RUSTFLAGS="'
+
+mutation "B4  a real ISO stamp is compared as an integer again" \
+    file=scripts/proof-lib.sh \
+    expect=proof_green_base_accepts_iso_stamped_receipts \
+    find='    if [ "$digits" -gt "$best_stamp" ]; then' \
+    replace='    if [ "$stamp" -gt "$best_stamp" ]; then'

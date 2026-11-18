@@ -632,6 +632,52 @@ fn clean_proof_scopes_mutations_and_shares_one_target_dir() {
     );
 }
 
+/// Real receipts stamp proofs as compact ISO ("20261118T041942Z"), not as an
+/// integer. The base must still be found; a numeric-only comparison returns
+/// empty and leaves every proof running every spec.
+#[test]
+fn proof_green_base_accepts_iso_stamped_receipts() {
+    let root = repo_root();
+    let script = format!(
+        r#"set -euo pipefail
+d=$(mktemp -d)
+trap 'rm -rf "$d"' EXIT
+git init -q "$d/repo"
+git -C "$d/repo" config user.email proof@test
+git -C "$d/repo" config user.name proof
+echo one >"$d/repo/f"
+git -C "$d/repo" add f
+git -C "$d/repo" commit -qm one
+ancestor=$(git -C "$d/repo" rev-parse HEAD)
+echo two >"$d/repo/f"
+git -C "$d/repo" add f
+git -C "$d/repo" commit -qm two
+proven=$(git -C "$d/repo" rev-parse HEAD)
+mkdir -p "$d/receipts"
+printf '%s' '{{"ok":true,"sha":"'"$ancestor"'","stamp":"20261118T041942Z"}}' >"$d/receipts/r.json"
+. "{root}/scripts/proof-lib.sh"
+proof_green_base "$d/repo" "$proven" "$d/receipts"
+"#,
+        root = root.display()
+    );
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .current_dir(root)
+        .output()
+        .expect("run proof_green_base with an ISO stamp");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(
+        !got.is_empty() && got.len() == 40,
+        "an ISO-stamped green receipt must yield a base sha, got '{got}'"
+    );
+}
+
 #[test]
 fn proof_mutation_inputs_fixture_passes() {
     let out = std::process::Command::new("bash")
