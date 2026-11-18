@@ -140,13 +140,29 @@ fn a_typed_line_defers_the_wake_and_clearing_it_rings() {
 mod registration_tests {
     use super::bootstrap_pin;
 
-    /// bd-oo7zi: the live leg registers its throwaway pin BEFORE the wake.
-    /// A fake `toron` on PATH records the invocation, so no live plane is
-    /// needed to prove the ordering.
+    /// bd-oo7zi: the live leg registers its throwaway pin BEFORE the wake,
+    /// and the DEFAULT pin passes toron's REAL validator (the live rerun
+    /// failed at line 63 because "LiveFivePin" is three words: my first
+    /// fake-toron witness never ran that validator, so it could not see it).
+    /// A fake `toron` records the invocation; the validator is the sibling
+    /// crate's, not a copy of the rule.
     #[test]
-    fn a_wake_registers_its_pin_first() {
+    fn a_wake_registers_a_valid_pin_first() {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _g = LOCK.lock().unwrap();
+        let script = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/scripts/e2e-live-five.sh"
+        ))
+        .expect("e2e-live-five.sh");
+        let marker = "FLYWHEEL_LIVE_PIN:-";
+        let at = script.find(marker).expect("a default pin in the script") + marker.len();
+        let pin: String = script[at..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect();
+        toron_core::nostr::identity::validate_agent_pin(&pin)
+            .expect("the live e2e default must be a real Adjective+Noun pin");
         let dir = std::env::temp_dir().join(format!("fw-pin-register-{}", std::process::id()));
         let bin = dir.join("bin");
         let log = dir.join("calls.log");
@@ -168,11 +184,13 @@ mod registration_tests {
         }
         let old_path = std::env::var("PATH").unwrap_or_default();
         unsafe { std::env::set_var("PATH", format!("{}:{}", bin.display(), old_path)) };
-        bootstrap_pin("LiveFivePin", "e2e-live-five");
+        bootstrap_pin(&pin, "e2e-live-five");
         unsafe { std::env::set_var("PATH", old_path) };
         let calls = std::fs::read_to_string(&log).unwrap();
         assert!(
-            calls.contains("toron agent bootstrap --project e2e-live-five --as LiveFivePin"),
+            calls.contains(&format!(
+                "toron agent bootstrap --project e2e-live-five --as {pin}"
+            )),
             "the pin must be registered before the wake: {calls}"
         );
         let _ = std::fs::remove_dir_all(&dir);
