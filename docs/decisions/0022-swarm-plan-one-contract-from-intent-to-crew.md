@@ -332,7 +332,7 @@ Each phase ships alone and changes no default behaviour until its last step.
 
 ## 6. Acceptance
 
-1. `flywheel spawn proj --gemini --model gemini-2.5-pro --dry-run --json` shows `model.status = honored` and the argv contains `-m gemini-2.5-pro`. The same call with `--harness fx` shows `blocked`.
+1. `flywheel spawn proj --kind gemini=1 --model gemini-2.5-pro --dry-run --json` shows `model.status = honored` and a gemini pane's interactive launch plan carries `-m gemini-2.5-pro`. The same call with `--kind fx=1` shows `blocked`. (This acceptance was first written with `--gemini` / `--harness fx`; those spellings were replaced by `--kind <harness>=<n>`. The behavior is unchanged — only the command text moved.)
 2. `flywheel briefing "<goal>" --json` lists every Jev-filled field with its provenance (`from: jev`) and a non-empty `needs_consent` when Jev changed a profile choice. It does **not** carry a per-field confidence: that number is Jev's own ranking input (`CONFIDENCE_FLOOR` in `src/jev_rank.rs`), consumed inside the ranker and never carried outward, and a plan field with no reader is exactly what D5's `signoff` mistake taught us to refuse.
 3. A patch `reviewer.harness=pi` re-filters the reviewer's model and clears that consent entry.
 4. A remembered preference suppresses the same question in the next session.
@@ -393,7 +393,7 @@ Every row below was checked by grepping the named test and mutation at `3af56271
 
 | # | Claim | Witness | Status |
 |---|---|---|---|
-| 1 | `spawn --gemini --model gemini-2.5-pro` shows honored and the argv carries it; `--harness fx` shows blocked | `acceptance1_gemini_honored_fx_blocked` (both halves, one test) | closed, `acceptance1-harness-pair A1` |
+| 1 | `spawn --kind gemini=1 --model gemini-2.5-pro` shows honored and the interactive launch plan carries `-m gemini-2.5-pro`; `--kind fx=1` shows blocked (originally written `--gemini` / `--harness fx`) | `acceptance1_gemini_honored_fx_blocked` (both halves, one test) | closed, `acceptance1-harness-pair A1` |
 | 2 | `briefing --json` lists Jev-filled fields with provenance and non-empty consent | `attach_consent_plan` + `needs_consent_lists_jev_field` | closed by narrowing (bd-6setu.11): no confidence field, because no consumer reads one |
 | 3 | a harness patch re-filters the model and clears the entry | `plan_patch_harness_refilters_model_and_clears_consent` | closed, mutation `A3` |
 | 4 | a remembered preference suppresses the question | `prefer_spawn_model_from_preference` | closed, mutation `D6` |

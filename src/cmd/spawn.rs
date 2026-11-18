@@ -8718,6 +8718,27 @@ mod acceptance1_harness_pair {
 
     use super::{PlanAsk, build_dry_run_plan, spawn_items_from_plan};
 
+    /// bd-ft30t: the acceptance text names the CLI spelling that exists today,
+    /// while keeping the original spelling as history rather than erasing it.
+    #[test]
+    fn adr_0022_acceptance_text_uses_the_current_kind_spelling() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/decisions/0022-swarm-plan-one-contract-from-intent-to-crew.md");
+        let adr = std::fs::read_to_string(path).expect("ADR-0022 text");
+        assert!(
+            adr.contains("--kind gemini=1"),
+            "the current gemini spelling must be in the acceptance"
+        );
+        assert!(
+            adr.contains("--kind fx=1"),
+            "the current fx spelling must be in the witness table"
+        );
+        assert!(
+            adr.contains("--harness fx"),
+            "the original spelling stays as history"
+        );
+    }
+
     fn registry() -> crate::models::ModelRegistry {
         use crate::models::ModelEntry;
         let mut models = BTreeMap::new();
@@ -8762,11 +8783,15 @@ mod acceptance1_harness_pair {
             crate::swarm_plan::FieldStatus::Honored,
             "gemini honours an explicit model: {field:?}"
         );
-        let args = crate::headless::model_args("gemini", "gemini-2.5-pro", None);
+        // A pane seat launches through interactive_model_plan, not the raw
+        // headless argv helper. Both resolve to the same argv today; asserting
+        // on the launcher keeps this witness on the path a gemini seat uses.
+        let launch = crate::headless::interactive_model_plan("gemini", "gemini-2.5-pro", None);
+        let args = launch.args();
         assert!(
             args.windows(2)
                 .any(|w| w[0] == "-m" && w[1] == "gemini-2.5-pro"),
-            "the launch carries -m gemini-2.5-pro: {args:?}"
+            "the interactive launch carries -m gemini-2.5-pro: {args:?}"
         );
 
         let items = spawn_items_from_plan(vec![("fx".to_string(), 1)], None);

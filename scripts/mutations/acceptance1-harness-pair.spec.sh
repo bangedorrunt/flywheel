@@ -6,13 +6,9 @@
 CARGO_ARGS=(--bin flywheel)
 TEST_FILTER=(acceptance1_gemini_honored_fx_blocked)
 
-mutation "A1  fx grows a model flag it does not have" \
+mutation "A1  a gemini pane drops its interactive model argv" \
     file=src/headless.rs \
     expect=acceptance1_gemini_honored_fx_blocked \
-    find='    let Some(flag) = row.model_flag else {
-        return vec![];
-    };' \
-    replace='    let Some(flag) = Some("-m".to_string()) else {
-        return vec![];
-    };'
+    find='    InteractiveModelPlan::Argv(model_args(harness, model, effort))' \
+    replace='    InteractiveModelPlan::HarnessDefault'
 
