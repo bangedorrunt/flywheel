@@ -1797,7 +1797,11 @@ projects available: {}",
             .filter(|a| live_ids.contains(a.workspace_id.as_str()))
             .cloned()
             .collect();
-        match crate::classify_spawn_workspace(&orphans, &live_agents) {
+        let live_panes: std::collections::HashSet<String> = c
+            .pane_list()
+            .map(|panes| panes.into_iter().map(|p| p.pane_id).collect())
+            .unwrap_or_default();
+        match crate::classify_spawn_workspace(&orphans, &live_agents, &live_panes) {
             crate::SpawnWorkspace::Fresh => {}
             crate::SpawnWorkspace::Add { index } => {
                 let existing = orphans[index].clone();
@@ -2744,7 +2748,11 @@ pub(crate) fn cmd_spawn_rex(
             })
             .collect();
         let live_agents = backend.agent_list().unwrap_or_default();
-        match crate::classify_spawn_workspace(&orphans, &live_agents) {
+        let live_panes: std::collections::HashSet<String> = backend
+            .pane_list(None)
+            .map(|panes| panes.into_iter().map(|p| p.pane_id).collect())
+            .unwrap_or_default();
+        match crate::classify_spawn_workspace(&orphans, &live_agents, &live_panes) {
             crate::SpawnWorkspace::Fresh => {}
             crate::SpawnWorkspace::Add { index } => {
                 let existing = orphans[index].clone();
@@ -4665,14 +4673,33 @@ mod workspace_origin_tests {
     fn empty_workspace_classifies_as_add() {
         let owned = vec![ws("w-empty", "flywheel-demo", 1)];
         assert_eq!(
-            classify_spawn_workspace(&owned, &[]),
+            classify_spawn_workspace(&owned, &[], &std::collections::HashSet::new()),
             SpawnWorkspace::Add { index: 0 },
             "no agent in the workspace means nothing can race the new panes"
         );
         assert_eq!(
-            classify_spawn_workspace(&[], &[]),
+            classify_spawn_workspace(&[], &[], &std::collections::HashSet::new()),
             SpawnWorkspace::Fresh,
             "no owned workspace means a fresh one"
+        );
+    }
+
+    /// bd-89q4r: a labelled agent whose pane is gone is an orphan, not a
+    /// fleet. Only an agent on a pane still in the plane's pane_list counts.
+    #[test]
+    fn labelled_agent_without_a_live_pane_does_not_join() {
+        let owned = vec![ws("w-orphan", "flywheel-demo", 1)];
+        let agents = vec![agent("flywheel-demo-oc-1", "w-orphan")];
+        assert_eq!(
+            classify_spawn_workspace(&owned, &agents, &std::collections::HashSet::new()),
+            SpawnWorkspace::Add { index: 0 },
+            "a stale terminal label must not force --retire-orphans on the next spawn"
+        );
+        let live = std::collections::HashSet::from(["w-orphan:p1".to_string()]);
+        assert_eq!(
+            classify_spawn_workspace(&owned, &agents, &live),
+            SpawnWorkspace::Join,
+            "the same label with a live pane is still the fleet to join"
         );
     }
 
@@ -4681,8 +4708,9 @@ mod workspace_origin_tests {
     fn live_pin_classifies_as_join() {
         let owned = vec![ws("w-live", "flywheel-demo", 2)];
         let agents = vec![agent("flywheel-demo-oc-1", "w-live")];
+        let live = std::collections::HashSet::from(["w-live:p1".to_string()]);
         assert_eq!(
-            classify_spawn_workspace(&owned, &agents),
+            classify_spawn_workspace(&owned, &agents, &live),
             SpawnWorkspace::Join
         );
         // A workspace with no agent alongside a live one still joins.
@@ -4691,7 +4719,7 @@ mod workspace_origin_tests {
             ws("w-live", "flywheel-demo", 2),
         ];
         assert_eq!(
-            classify_spawn_workspace(&owned, &agents),
+            classify_spawn_workspace(&owned, &agents, &live),
             SpawnWorkspace::Join,
             "one live pin makes the project a fleet"
         );

@@ -4801,17 +4801,23 @@ pub(crate) enum SpawnWorkspace {
 }
 
 /// The classify step spawn and `--join` share. A workspace with no agent is
-/// not a stale swarm — nothing there can race a new pane. An agent present,
-/// of any status that survived the dead-pane probe, IS the fleet to join.
+/// not a stale swarm — nothing there can race a new pane. An agent counts as
+/// the fleet ONLY when its pane is still in the plane's `pane_list`: a terminal
+/// label outlives its pane after retire, a crash or a closed rex window, and
+/// treating that orphan as live blocks the next spawn (bd-89q4r).
 pub(crate) fn classify_spawn_workspace(
     owned: &[hc::WorkspaceInfo],
     agents: &[hc::AgentInfo],
+    live_panes: &std::collections::HashSet<String>,
 ) -> SpawnWorkspace {
     if owned.is_empty() {
         return SpawnWorkspace::Fresh;
     }
-    let hosts_agent =
-        |ws: &hc::WorkspaceInfo| agents.iter().any(|a| a.workspace_id == ws.workspace_id);
+    let hosts_agent = |ws: &hc::WorkspaceInfo| {
+        agents
+            .iter()
+            .any(|a| a.workspace_id == ws.workspace_id && live_panes.contains(&a.pane_id))
+    };
     if owned.iter().any(hosts_agent) {
         return SpawnWorkspace::Join;
     }
