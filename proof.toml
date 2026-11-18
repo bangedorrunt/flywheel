@@ -18,10 +18,9 @@ rev = "c5d7cfe4a8510d709c665ba2a00bfb033eb8d11b"
 path = "../elm-effect-rs"
 rev = "3387c446ee5a0a2729274415272587d98d085fb8"
 
-# The last revision a FULL mutation run covered (bd-m5afp). A landing proves
-# only the specs whose target files changed since this pin; a nightly
-# `clean-proof --mutations full` covers everything, and bumping this to that
-# run's sha is what keeps a landing fast without letting proofs lapse. Unset or
-# unknown means every spec runs.
+# bd-b2yg7: the mutation base is derived automatically from the newest GREEN
+# receipt that is an ancestor of the proven sha (archived under
+# $XDG_STATE_HOME/flywheel/clean-proof/receipts). Set `base` only as a manual
+# override; a stale pin re-runs every spec on every landing. Unset means derive.
 [mutations]
-base = "d243d21948ed7d6c4b424b30455fa7dcd04c1001"
+# base = "<sha>"

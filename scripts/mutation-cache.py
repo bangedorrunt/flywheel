@@ -136,7 +136,12 @@ def key_for(read, root: str, spec: str, driver: str, declaring_of) -> str:
         add(h, "testfile:" + path, read(path))
     add(h, "harness", read("scripts/verify-mutations.sh"))
     add(h, "lock", read("Cargo.lock"))
-    add(h, "driver", driver.encode())
+    # bd-b2yg7: the driver rung is the CONTENT of the driver scripts, not the
+    # proven commit sha. A landing that leaves these bytes alone must reuse the
+    # verdict; a change to the driver must move the key. `driver` is kept on the
+    # CLI for callers' compatibility but no longer seeds the hash.
+    add(h, "driver:clean-proof.sh", read("scripts/clean-proof.sh"))
+    add(h, "driver:proof-lib.sh", read("scripts/proof-lib.sh"))
     for name, rev in siblings_from_proof_toml(read):
         add(h, "sibling:" + name, rev.encode())
     for name in missing:

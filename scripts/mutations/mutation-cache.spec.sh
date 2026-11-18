@@ -27,10 +27,10 @@ mutation "C3  the key ignores the mutation harness" \
     find='    add(h, "harness", read("scripts/verify-mutations.sh"))' \
     replace='    (0)'
 
-mutation "C4  the key ignores the driver revision" \
+mutation "C4  the key ignores the driver scripts" \
     file=$CACHE \
     expect=the_cache_key_covers_spec_target_test_harness_lock_driver_and_siblings \
-    find='    add(h, "driver", driver.encode())' \
+    find='    add(h, "driver:clean-proof.sh", read("scripts/clean-proof.sh"))' \
     replace='    (0)'
 
 mutation "C5  a missing witness still counts as a hit" \

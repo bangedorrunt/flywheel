@@ -90,13 +90,17 @@ CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/flywheel/mutation-verdicts"
 
 # bd-3681w: isolate_if_shared makes a ~4-5 GB export per spec, then execs. The
 # path travels to the child in the environment; the child's traps end it.
-VERIFY_MUTATIONS_EXPORT_ROOT="${VERIFY_MUTATIONS_EXPORT_ROOT:-}"
+# bd-b2yg7: capture the handoff ONCE, then drop it from the environment. A
+# nested harness call (a spec lister, a test) must not inherit the cleanup duty
+# and delete the live export its caller is still using.
+OWNED_EXPORT_ROOT="${VERIFY_MUTATIONS_EXPORT_ROOT:-}"
+unset VERIFY_MUTATIONS_EXPORT_ROOT
 cleanup_export() {
-    [ -n "$VERIFY_MUTATIONS_EXPORT_ROOT" ] || return 0
-    [ -d "$VERIFY_MUTATIONS_EXPORT_ROOT" ] || { VERIFY_MUTATIONS_EXPORT_ROOT=""; return 0; }
+    [ -n "$OWNED_EXPORT_ROOT" ] || return 0
+    [ -d "$OWNED_EXPORT_ROOT" ] || { OWNED_EXPORT_ROOT=""; return 0; }
     [ "${VERIFY_MUTATIONS_KEEP_EXPORT:-0}" = 1 ] && return 0
-    rm -rf "$VERIFY_MUTATIONS_EXPORT_ROOT"
-    VERIFY_MUTATIONS_EXPORT_ROOT=""
+    rm -rf "$OWNED_EXPORT_ROOT"
+    OWNED_EXPORT_ROOT=""
 }
 
 # A mutation's stable id is the first token of its label ("C3  a queued …" ->
@@ -532,6 +536,7 @@ isolate_if_shared() {
     export_root="$(mktemp -d "${TMPDIR:-/tmp}/verify-mutations-export.XXXXXX")"
     # Failures before the exec (git archive, overlay, arg rewrite) must not leak
     # either. The exec replaces this process; the child installs its own trap.
+    OWNED_EXPORT_ROOT="$export_root"
     export VERIFY_MUTATIONS_EXPORT_ROOT="$export_root"
     trap cleanup_export EXIT
     export="$export_root/$(basename "$repo_abs")"
@@ -606,13 +611,11 @@ isolate_if_shared() {
             *) toron_bin="$PWD/$TORON_BIN" ;;
         esac
     fi
-    # A mutated build must never ride the shared mbx cache. The export would
-    # inherit a `target` link into it, mbx evicts that directory during a long
-    # run, and the mutation then builds something other than the mutated tree -
-    # which reads as VACUOUS ("this test cannot fail") for a mutant that in fact
-    # turns the test red. Pin a target dir the export owns (bd-6setu.20).
+    # A mutated build must never ride the shared mbx cache (bd-6setu.20).
+    # bd-b2yg7: a caller that owns a whole proof can hand us ONE target dir so
+    # every spec's export shares a warm cache; otherwise this export owns one.
     rm -f "$export/target"
-    export CARGO_TARGET_DIR="$export_root/target"
+    export CARGO_TARGET_DIR="${VERIFY_MUTATIONS_TARGET_DIR:-$export_root/target}"
     echo "verify-mutations: scratch export $export (the shared tree is read only)" >&2
     cd "$export" || exit 2
     if [ -n "$toron_bin" ]; then

@@ -47,6 +47,37 @@ proof_mutation_base() {
   '
 }
 
+# proof_green_base <repo-root> <proven-sha> <receipt-archive-dir>
+# bd-b2yg7: the automatic mutation base is the newest GREEN receipt whose sha is
+# an ancestor of the proven revision. A stale manual pin cannot advance, and a
+# commit id on the cache key cannot hit across landings; this is the one place
+# that moves the base forward. Red receipts never count: they prove nothing.
+proof_green_base() {
+  local root="$1" proven="$2" archive="${3:-}" f sha stamp best="" best_stamp=0
+  [ -d "$archive" ] || return 0
+  for f in "$archive"/*.json; do
+    [ -f "$f" ] || continue
+    # One row per green receipt: "<sha> <stamp>". A malformed file is skipped.
+    read -r sha stamp < <(python3 - "$f" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+    if d.get("ok") is True and d.get("sha"):
+        print(d["sha"], d.get("stamp") or 0)
+except Exception:
+    pass
+PY
+) || continue
+    [ -n "${sha:-}" ] || continue
+    [ "$sha" = "$proven" ] && continue
+    git -C "$root" merge-base --is-ancestor "$sha" "$proven" 2>/dev/null || continue
+    if [ "${stamp:-0}" -gt "$best_stamp" ]; then
+      best="$sha"; best_stamp="${stamp:-0}"
+    fi
+  done
+  printf '%s\n' "$best"
+}
+
 # proof_archive <source-repo> <rev> <dest-dir>
 # Extract one revision from git objects into <dest-dir> (created). Fails loud
 # if the rev is not in that repo.
@@ -158,9 +189,17 @@ receipt = {
     "logs": os.environ.get("PROOF_TMP"),
 }
 path = os.environ["PROOF_RECEIPT"]
+body = json.dumps(receipt, indent=2, sort_keys=True) + "\n"
 with open(path, "w", encoding="utf-8") as fh:
-    json.dump(receipt, fh, indent=2, sort_keys=True)
-    fh.write("\n")
+    fh.write(body)
 print("clean-proof: receipt " + path)
+# bd-b2yg7: archive GREEN receipts so the next proof can advance its mutation
+# base to the newest installed ancestor instead of a stale manual pin.
+if receipt["ok"]:
+    archive = os.environ.get("PROOF_RECEIPT_ARCHIVE")
+    if archive:
+        os.makedirs(archive, exist_ok=True)
+        with open(os.path.join(archive, receipt["sha"] + ".json"), "w", encoding="utf-8") as fh:
+            fh.write(body)
 PY
 }

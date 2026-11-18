@@ -133,6 +133,9 @@ fi
 KEEP=0
 NO_CACHE=0
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/flywheel/mutation-verdicts"
+# bd-b2yg7: green receipts are archived here so a landing can derive its
+# mutation base instead of trusting a pin that never advances.
+RECEIPT_ARCHIVE="${XDG_STATE_HOME:-$HOME/.local/state}/flywheel/clean-proof/receipts"
 MUTATIONS_MODE=""
 RECEIPT_MUTATIONS_BASE=""
 RECEIPT_CHANGED_PATHS=""
@@ -382,14 +385,18 @@ if [ -n "$MUTATIONS_MODE" ] && [ -z "$FAILED_STEP" ]; then
   mut_scoped=0
   mut_changed=""
   if [ "$MUTATIONS_MODE" = changed ]; then
+    # bd-b2yg7: a manual [mutations] base is an OVERRIDE; the normal base is the
+    # newest green receipt that is an ancestor of the proven sha. A pin that
+    # never advances starved the cache and re-ran every spec on each landing.
     mut_base="$(proof_mutation_base "$ROOT" "$PROVEN_SHA")"
+    [ -n "$mut_base" ] || mut_base="$(proof_green_base "$ROOT" "$PROVEN_SHA" "$RECEIPT_ARCHIVE")"
     if [ -n "$mut_base" ] && git -C "$ROOT" cat-file -e "${mut_base}^{commit}" 2>/dev/null; then
       mut_scoped=1
       mut_changed="$(git -C "$ROOT" diff --name-only "$mut_base..$PROVEN_SHA" || true)"
       echo "clean-proof: mutations since $mut_base ($(printf '%s\n' "$mut_changed" | grep -c .) path(s))"
     else
       mut_base=""
-      echo "clean-proof: no [mutations] base in proof.toml — running every spec"
+      echo "clean-proof: no green base yet — running every spec"
     fi
   fi
   RECEIPT_MUTATIONS_BASE="$mut_base"
@@ -429,7 +436,10 @@ if [ -n "$MUTATIONS_MODE" ] && [ -z "$FAILED_STEP" ]; then
     # The proof build is -D warnings; a mutation deliberately leaves dead code
     # (that is what killing a guard looks like), so the witness run must not
     # inherit it or every such mutation reports BUILD-BROKEN.
-    proof_env=(RUSTFLAGS="")
+    # bd-b2yg7: ONE target dir for the whole proof, owned by this export, shared
+    # by every mutation run instead of cold-building a new one per spec. It is
+    # never the shared mbx cache that bd-6setu.20 showed can be evicted mid-run.
+    proof_env=(RUSTFLAGS="" "VERIFY_MUTATIONS_TARGET_DIR=$TMP/target")
     [ -n "$TORON_BIN_BUILT" ] && proof_env+=("TORON_BIN=$TORON_BIN_BUILT")
     env "${proof_env[@]}" bash scripts/verify-mutations.sh "$spec" --cargo "$wrapper" \
       --cache-key "$mut_key" --cache-dir "$CACHE_DIR" \
@@ -524,6 +534,7 @@ mkdir -p "$(dirname "$RECEIPT")"
 PROOF_MUTATIONS_MODE="$MUTATIONS_MODE" \
 PROOF_MUTATIONS_BASE="$RECEIPT_MUTATIONS_BASE" \
 PROOF_CHANGED_PATHS="$RECEIPT_CHANGED_PATHS" \
+PROOF_RECEIPT_ARCHIVE="$RECEIPT_ARCHIVE" \
 proof_write_receipt "$RECEIPT" "$OK" "$PROVEN_SHA" "$SHORT" "$STAMP" "$MODE" "$TMP" \
   "$FAILED_STEP" "$STEP_NAMES" "$STEP_STATUSES" "$SIBLING_RECORDS" "$MUTATION_RECORDS_FILE"
 

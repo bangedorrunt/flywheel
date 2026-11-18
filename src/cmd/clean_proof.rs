@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    // bd-b2yg7: these tests also run INSIDE verify-mutations' scratch exports.
+    // A compile-time manifest dir can point at an export that has already been
+    // cleaned up, so resolve it from the running test's environment instead.
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
 }
 
 fn read_script(name: &str) -> String {
@@ -414,7 +417,7 @@ fn the_cache_key_covers_spec_target_test_harness_lock_driver_and_siblings() {
         write("src/t.rs", "#[test]\nfn a_test() { let _ = 1; }\n")
     });
     step("the harness", &|| {
-        let harness = std::fs::read_to_string(repo_root().join("scripts/verify-mutations.sh"))
+        let harness = std::fs::read_to_string(fx.path().join("scripts/verify-mutations.sh"))
             .unwrap()
             .replace(
                 "VERDICT_VACUOUS=\"VACUOUS\"",
@@ -431,11 +434,22 @@ fn the_cache_key_covers_spec_target_test_harness_lock_driver_and_siblings() {
             "[[sibling]]\npath = \"../toron\"\nrev = \"2222222222222222222222222222222222222222\"\n",
         )
     });
+    // bd-b2yg7: the driver rung is the CONTENT of the driver scripts, not a
+    // commit sha. A new commit with byte-identical scripts must hit the cache;
+    // an edit to the driver code must move the key.
+    write("scripts/clean-proof.sh", "driver v1\n");
+    write("scripts/proof-lib.sh", "lib v1\n");
     let before_driver = fx.key("driver-sha");
-    assert_ne!(
+    assert_eq!(
         before_driver,
         fx.key("another-driver"),
-        "the driver revision moves it"
+        "a commit sha alone must not move the key"
+    );
+    write("scripts/clean-proof.sh", "driver v2\n");
+    assert_ne!(
+        before_driver,
+        fx.key("driver-sha"),
+        "a driver script byte must move the key"
     );
 }
 
@@ -582,6 +596,57 @@ fn the_key_from_a_revision_equals_the_key_from_its_checkout() {
         from_root,
         String::from_utf8_lossy(&from_rev.stdout).trim(),
         "the same tree must key the same from a checkout and from git"
+    );
+}
+
+/// bd-b2yg7: the mutation inputs are content, not a stale pin or a commit id.
+/// The shell fixture drives the real proof-lib helpers and the real mutation
+/// harness; these pins keep clean-proof wired to them.
+#[test]
+fn clean_proof_scopes_mutations_and_shares_one_target_dir() {
+    let script = read_script("scripts/clean-proof.sh");
+    assert!(
+        script.contains("proof_green_base \"$ROOT\" \"$PROVEN_SHA\" \"$RECEIPT_ARCHIVE\""),
+        "the mutation base must come from the newest green receipt"
+    );
+    assert!(
+        script.contains("VERIFY_MUTATIONS_TARGET_DIR=$TMP/target"),
+        "one proof-owned target dir must be shared by every mutation run"
+    );
+    assert!(
+        script.contains("PROOF_RECEIPT_ARCHIVE=\"$RECEIPT_ARCHIVE\""),
+        "green receipts must be archived for the next proof"
+    );
+    let harness = read_script("scripts/verify-mutations.sh");
+    assert!(
+        harness.contains("${VERIFY_MUTATIONS_TARGET_DIR:-$export_root/target}"),
+        "the harness must honour a caller-owned target dir"
+    );
+    let toml = read_script("proof.toml");
+    let active_pin = toml
+        .lines()
+        .any(|line| line.trim_start().starts_with("base ="));
+    assert!(
+        !active_pin,
+        "proof.toml must not carry a stale manual base pin"
+    );
+}
+
+#[test]
+fn proof_mutation_inputs_fixture_passes() {
+    let out = std::process::Command::new("bash")
+        .arg(format!(
+            "{}/scripts/test-proof-mutation-inputs.sh",
+            repo_root().display()
+        ))
+        .current_dir(repo_root())
+        .output()
+        .expect("run scripts/test-proof-mutation-inputs.sh");
+    assert!(
+        out.status.success(),
+        "scripts/test-proof-mutation-inputs.sh failed: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
