@@ -541,6 +541,17 @@ pub(crate) fn retire_with(
             .any(|p| e.mail_identity.as_deref() == Some(p.as_str()))
     });
     crate::state::save_spawn_registry(project, &entries)?;
+    // bd-89q4r: load_spawn_registry falls back to the project-local mirror
+    // when the state registry is empty. Leaving the row there resurrects the
+    // retired seat as idle and makes the next spawn need --retire-orphans.
+    let project_dir = crate::project_dir(cfg, project);
+    let mut mirror = crate::state::load_agent_names(&project_dir);
+    mirror.retain(|e| {
+        !pins
+            .iter()
+            .any(|p| e.mail_identity.as_deref() == Some(p.as_str()))
+    });
+    crate::state::save_agent_names(&project_dir, &mirror)?;
     Ok(RetireOutcome {
         pins: pins.to_vec(),
         released,
@@ -826,6 +837,7 @@ mod tests {
     use super::*;
     use crate::supervisor_host::{MemJournal, Ports, RoundReport, execute};
     use crate::supervisor_program::SupCmd;
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
 
     fn entry(
@@ -1639,6 +1651,47 @@ mod tests {
         let rows = crate::state::load_spawn_registry("demo");
         assert_eq!(rows.len(), 1, "the sibling stays: {rows:?}");
         assert_eq!(rows[0].mail_identity.as_deref(), Some("Beta"));
+    }
+
+    /// bd-89q4r: load_spawn_registry falls back to the project-local mirror
+    /// when the state registry is empty. Retire must clear BOTH, or the gone
+    /// seat comes back as idle and the next spawn needs --retire-orphans.
+    #[test]
+    fn retire_clears_the_project_mirror_too() {
+        let _g = lock_env();
+        let (cfg, dir) = hermetic();
+        // An absolute project makes project_dir_hint (the mirror reader) and
+        // project_dir (the writer) resolve to the same place.
+        let project = dir.path().join("ws/demo").to_string_lossy().to_string();
+        let row = SpawnEntry::profiled("wA:p1", "a-1", "coder", "pi", Some("Alpha".to_string()));
+        crate::state::save_spawn_registry(&project, std::slice::from_ref(&row)).expect("registry");
+        crate::state::save_agent_names(Path::new(&project), std::slice::from_ref(&row))
+            .expect("mirror");
+        assert_eq!(
+            crate::state::load_spawn_registry(&project).len(),
+            1,
+            "the fixture has a row"
+        );
+
+        let mux = FakeMux::default();
+        let mut ports = Fake::default();
+        let mut journal = MemJournal::default();
+        let mut release = |_pin: &str| Ok(1u64);
+        retire_with(
+            &mux,
+            &cfg,
+            &project,
+            &["Alpha".into()],
+            false,
+            &mut journal,
+            &mut ports,
+            &mut release,
+        )
+        .expect("retire ok");
+        assert!(
+            crate::state::load_spawn_registry(&project).is_empty(),
+            "a retired pin must not come back from the project mirror"
+        );
     }
 
     /// ADR-0022 D1 (bd-6setu.3): the retire writes its plan event on the same
