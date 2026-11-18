@@ -52,6 +52,21 @@ fn rex(args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
+/// bd-oo7zi: the throwaway pin must be a REGISTERED toron identity in the
+/// e2e project before any wake tries to address it by name. The pane exists
+/// in rex; its mail identity does not exist in toron until bootstrap runs.
+fn bootstrap_pin(pin: &str, project: &str) {
+    let out = Command::new("toron")
+        .args(["agent", "bootstrap", "--project", project, "--as", pin])
+        .output()
+        .expect("toron agent bootstrap");
+    assert!(
+        out.status.success(),
+        "register {pin} in {project} first: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 fn crew_prompt(pin: &str, project: &str, as_pin: &str, text: &str) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_flywheel"))
         .args([
@@ -79,6 +94,8 @@ fn a_typed_line_defers_the_wake_and_clearing_it_rings() {
         );
         return;
     };
+
+    bootstrap_pin(&pin, &project);
 
     // 1. The operator has half a line: type it, never press Enter.
     rex(&["send", "-s", &session, "--block", &block, "half typed line"]);
@@ -117,4 +134,47 @@ fn a_typed_line_defers_the_wake_and_clearing_it_rings() {
         rang.status.success(),
         "the wake must land and report it: {text}"
     );
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::bootstrap_pin;
+
+    /// bd-oo7zi: the live leg registers its throwaway pin BEFORE the wake.
+    /// A fake `toron` on PATH records the invocation, so no live plane is
+    /// needed to prove the ordering.
+    #[test]
+    fn a_wake_registers_its_pin_first() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("fw-pin-register-{}", std::process::id()));
+        let bin = dir.join("bin");
+        let log = dir.join("calls.log");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            bin.join("toron"),
+            format!(
+                "#!/usr/bin/env bash\necho \"toron $*\" >>{}\nexit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut p = std::fs::metadata(bin.join("toron")).unwrap().permissions();
+            p.set_mode(0o755);
+            std::fs::set_permissions(bin.join("toron"), p).unwrap();
+        }
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        unsafe { std::env::set_var("PATH", format!("{}:{}", bin.display(), old_path)) };
+        bootstrap_pin("LiveFivePin", "e2e-live-five");
+        unsafe { std::env::set_var("PATH", old_path) };
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains("toron agent bootstrap --project e2e-live-five --as LiveFivePin"),
+            "the pin must be registered before the wake: {calls}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
