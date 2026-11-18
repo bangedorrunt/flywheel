@@ -9,5 +9,6 @@ TEST_FILTER=(a_wake_registers_its_pin_first)
 mutation "R1  the live wake skips pin registration" \
     file=tests/live_doorbell_operator_guard.rs \
     expect=a_wake_registers_its_pin_first \
-    find='    bootstrap_pin(&pin, &project);' \
-    replace='    // mutation: the wake runs against an unregistered pin'
+    find='fn bootstrap_pin(pin: &str, project: &str) {' \
+    replace='fn bootstrap_pin(pin: &str, project: &str) {
+    return; // mutation: no bootstrap, so the wake addresses an unknown pin'
