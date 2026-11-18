@@ -247,6 +247,40 @@ fn recalled_lessons_are_deduplicated() {
     );
 }
 
+/// A chie that exits 0 with non-JSON recall output must make check-trap fail,
+/// not silently report "no traps" (bd-ndbnv review point a).
+#[test]
+fn malformed_recall_output_is_a_loud_failure() {
+    let sandbox = TestSandbox::new();
+    let fake = sandbox.bin_dir().join("fake-chie-badjson");
+    std::fs::write(
+        &fake,
+        "#!/usr/bin/env bash\ncase \"$*\" in\n  *recall*) printf 'not json\\n' ;;\n  *) printf '[]\\n' ;;\nesac\nexit 0\n",
+    )
+    .expect("write fake chie");
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut perms = std::fs::metadata(&fake).expect("meta").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake, perms).expect("chmod");
+    let out = sandbox
+        .command(env!("CARGO_BIN_EXE_flywheel"))
+        .env("PATH", sandbox.path_env())
+        .env("FLYWHEEL_CHIE_BIN", fake.to_string_lossy().as_ref())
+        .args(["memory", "check-trap", "cargo test"])
+        .output()
+        .expect("check-trap");
+    assert!(
+        !out.status.success(),
+        "malformed recall JSON must not read clean: {}",
+        text(&out)
+    );
+    assert!(
+        text(&out).contains("recall") || text(&out).contains("JSON"),
+        "the refusal names the bad recall: {}",
+        text(&out)
+    );
+}
+
 /// `--project <slug>` and `--project <dir>` name the same chie scope.
 #[test]
 fn slug_and_directory_scopes_agree() {

@@ -259,6 +259,14 @@ fn chie_project(dir: Option<&Path>) -> Option<String> {
     })
 }
 
+fn chie_unreachable(err: &str) -> bool {
+    let low = err.to_ascii_lowercase();
+    low.contains("unreachable")
+        || low.contains("refused")
+        || low.contains("connect")
+        || low.contains("daemon")
+}
+
 fn run_check_trap(args: &[&str], project_dir: Option<&Path>) -> Result<Option<String>> {
     let mut cmd = Command::new(chie_bin());
     cmd.args(["memory", "check-trap"]);
@@ -275,12 +283,7 @@ fn run_check_trap(args: &[&str], project_dir: Option<&Path>) -> Result<Option<St
         ));
     }
     let err_text = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    let low = err_text.to_ascii_lowercase();
-    if low.contains("unreachable")
-        || low.contains("refused")
-        || low.contains("connect")
-        || low.contains("daemon")
-    {
+    if chie_unreachable(&err_text) {
         return Ok(None);
     }
     let detail = if err_text.is_empty() {
@@ -308,17 +311,13 @@ fn lesson_recall(query: &str, project_dir: Option<&Path>) -> Result<Vec<String>>
         .map_err(|e| anyhow::anyhow!("cannot run chie recall: {e}"))?;
     if !out.status.success() {
         let err_text = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        let low = err_text.to_ascii_lowercase();
-        if low.contains("unreachable")
-            || low.contains("refused")
-            || low.contains("connect")
-            || low.contains("daemon")
-        {
+        if chie_unreachable(&err_text) {
             return Ok(Vec::new());
         }
         bail!("chie memory recall failed ({query}): {err_text}");
     }
-    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| anyhow::anyhow!("chie recall returned invalid JSON: {e}"))?;
     let mut rows = Vec::new();
     let mut seen = BTreeSet::new();
     for key in ["conclusions", "events"] {
