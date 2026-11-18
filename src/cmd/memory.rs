@@ -1,10 +1,10 @@
 //! `flywheel memory` — Chie Memory trap preflight and lesson recording.
 //!
 //! Surfaces known traps/invariants at briefing/claim time and records lessons
-//! back into the memory plane. All chie calls degrade gracefully when the
-//! daemon is absent or unreachable: preflight returns empty, never panics.
+//! back into the memory plane. Only a truly unreachable chie degrades clean;
+//! a usage error is loud, because a check that cannot fail is not a check.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::Subcommand;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -83,7 +83,7 @@ fn cmd_check_trap(
     json: bool,
 ) -> Result<()> {
     let project_dir = project.map(|p| crate::project_dir(cfg, p));
-    let traps = check_trap_queries(&[query.to_string()], project_dir.as_deref());
+    let traps = check_trap_queries_strict(&[query.to_string()], project_dir.as_deref())?;
     if json {
         print_json(&serde_json::json!({
             "ok": true,
@@ -106,11 +106,11 @@ fn cmd_record_lesson(
     content: &str,
     kind: Option<&str>,
     project: Option<&str>,
-    _as_agent: Option<&str>,
+    as_agent: Option<&str>,
     json: bool,
 ) -> Result<()> {
     let project_dir = project.map(|p| crate::project_dir(cfg, p));
-    let recorded = record_lesson(content, kind, project_dir.as_deref());
+    let recorded = record_lesson_with_pin(content, kind, project_dir.as_deref(), as_agent);
     if json {
         print_json(&serde_json::json!({
             "ok": recorded,
@@ -159,9 +159,21 @@ pub fn briefing_traps(
     check_trap_queries(&queries, project_dir)
 }
 
-/// Run `chie memory check-trap` over queries. Returns normalized trap lines.
-/// Any spawn/parse/daemon error => empty (offline fallback).
+/// Briefing preflight view. An unreachable chie is clean; a usage error is
+/// logged and downgraded here so a briefing never fails on a broken tool.
 pub fn check_trap_queries(queries: &[String], project_dir: Option<&Path>) -> Vec<String> {
+    check_trap_queries_strict(queries, project_dir).unwrap_or_else(|e| {
+        eprintln!("flywheel: memory trap check unavailable: {e}");
+        Vec::new()
+    })
+}
+
+/// The strict check used by `flywheel memory check-trap`: a chie usage error is
+/// a loud failure, never a silent "no traps".
+pub fn check_trap_queries_strict(
+    queries: &[String],
+    project_dir: Option<&Path>,
+) -> Result<Vec<String>> {
     let mut out: BTreeSet<String> = BTreeSet::new();
     for q in queries {
         let q = q.trim();
@@ -173,12 +185,14 @@ pub fn check_trap_queries(queries: &[String], project_dir: Option<&Path>) -> Vec
         if path_like {
             merge_lines(
                 &mut out,
-                run_check_trap(&["--path", q, "--json"], project_dir),
+                run_check_trap(&["--path", q, "--json"], project_dir)?,
             );
         }
+        // chie check-trap has ONLY --command and --path. Passing --query makes
+        // it exit 2, which used to read as "no traps" (bd-97uwg).
         merge_lines(
             &mut out,
-            run_check_trap(&["--command", q, "--json"], project_dir),
+            run_check_trap(&["--command", q, "--json"], project_dir)?,
         );
     }
     if !queries.is_empty() {
@@ -186,10 +200,10 @@ pub fn check_trap_queries(queries: &[String], project_dir: Option<&Path>) -> Vec
         let clipped: String = joined.chars().take(400).collect();
         merge_lines(
             &mut out,
-            run_check_trap(&["--command", &clipped, "--json"], project_dir),
+            run_check_trap(&["--command", &clipped, "--json"], project_dir)?,
         );
     }
-    out.into_iter().take(20).collect()
+    Ok(out.into_iter().take(20).collect())
 }
 
 fn merge_lines(out: &mut BTreeSet<String>, raw: Option<String>) {
@@ -210,31 +224,50 @@ fn chie_bin() -> String {
     std::env::var("FLYWHEEL_CHIE_BIN").unwrap_or_else(|_| "chie".to_string())
 }
 
-fn run_check_trap(args: &[&str], project_dir: Option<&Path>) -> Option<String> {
+/// A slug is resolved to a directory by flywheel, but chie interprets a
+/// relative `--project` from its own cwd. Canonicalize so both doors agree
+/// (bd-97uwg).
+fn chie_project(dir: Option<&Path>) -> Option<String> {
+    dir.map(|d| {
+        let abs = std::fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf());
+        abs.to_string_lossy().into_owned()
+    })
+}
+
+fn run_check_trap(args: &[&str], project_dir: Option<&Path>) -> Result<Option<String>> {
     let mut cmd = Command::new(chie_bin());
     cmd.args(["memory", "check-trap"]);
-    if let Some(dir) = project_dir {
-        cmd.args(["--project", &dir.to_string_lossy()]);
+    if let Some(dir) = chie_project(project_dir) {
+        cmd.args(["--project", &dir]);
     }
     cmd.args(args);
-    let out = cmd.output().ok()?;
-    if !out.status.success() {
-        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let err = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
-        if text.is_empty()
-            && (err.contains("connect")
-                || err.contains("unreachable")
-                || err.contains("refused")
-                || err.contains("daemon"))
-        {
-            return None;
-        }
-        if text.is_empty() {
-            return Some(String::new());
-        }
-        return Some(text);
+    let out = cmd
+        .output()
+        .map_err(|e| anyhow::anyhow!("cannot run chie check-trap: {e}"))?;
+    if out.status.success() {
+        return Ok(Some(
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        ));
     }
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    let err_text = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let low = err_text.to_ascii_lowercase();
+    if low.contains("unreachable")
+        || low.contains("refused")
+        || low.contains("connect")
+        || low.contains("daemon")
+    {
+        return Ok(None);
+    }
+    let detail = if err_text.is_empty() {
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    } else {
+        err_text
+    };
+    bail!(
+        "chie memory check-trap failed ({}): {}",
+        args.join(" "),
+        detail
+    )
 }
 
 fn extract_trap_lines(raw: &str) -> Vec<String> {
@@ -292,6 +325,16 @@ fn strings_from_array(arr: &[serde_json::Value]) -> Vec<String> {
     for it in arr {
         if let Some(s) = it.as_str() {
             out.push(s.to_string());
+        } else if let Some(s) = it.get("warning").and_then(|x| x.as_str()) {
+            if let Some(proof) = it
+                .get("proof")
+                .and_then(|x| x.as_str())
+                .filter(|p| !p.is_empty())
+            {
+                out.push(format!("{s} (proof: {proof})"));
+            } else {
+                out.push(s.to_string());
+            }
         } else if let Some(s) = it.get("message").and_then(|x| x.as_str()) {
             out.push(s.to_string());
         } else if let Some(s) = it.get("text").and_then(|x| x.as_str()) {
@@ -324,19 +367,63 @@ fn strings_from_array(arr: &[serde_json::Value]) -> Vec<String> {
 /// Record a lesson in chie memory. Returns true on apparent success, false on
 /// offline/unreachable/error (never panics).
 pub fn record_lesson(content: &str, kind: Option<&str>, project_dir: Option<&Path>) -> bool {
+    record_lesson_with_pin(content, kind, project_dir, None)
+}
+
+/// chie's trap guard only matches Rule/Trap/Proof lessons. A bare chie_remember
+/// event (the old default) is invisible to check-trap, so wrap the lesson in
+/// that shape and give it a matcher the guard can infer (bd-97uwg).
+fn rule_lesson_event(content: &str) -> String {
+    let matcher = trap_matcher(content);
+    format!(
+        "Rule: {content}\nTrap: `{matcher}` — {content}\nProof: recorded by flywheel memory record-lesson"
+    )
+}
+
+fn trap_matcher(content: &str) -> String {
+    if let Some(start) = content.find('`')
+        && let Some(end) = content[start + 1..].find('`')
+    {
+        let token = content[start + 1..start + 1 + end].trim();
+        if !token.is_empty() {
+            return token.to_string();
+        }
+    }
+    let y = content
+        .split_once(" breaks when ")
+        .or_else(|| content.split_once(" break when "))
+        .map(|(_, rest)| rest.split_once("; do ").map(|(y, _)| y).unwrap_or(rest))
+        .unwrap_or(content);
+    let y = y.trim().trim_end_matches(['.', ';', ',', '!']);
+    y.chars().take(120).collect::<String>().trim().to_string()
+}
+
+/// Record a lesson in chie memory attributed to an optional agent pin.
+pub fn record_lesson_with_pin(
+    content: &str,
+    kind: Option<&str>,
+    project_dir: Option<&Path>,
+    pin: Option<&str>,
+) -> bool {
     let content = content.trim();
     if content.is_empty() {
         return false;
     }
     let mut cmd = Command::new(chie_bin());
     cmd.args(["memory", "record"]);
-    if let Some(dir) = project_dir {
-        cmd.args(["--project", &dir.to_string_lossy()]);
+    if let Some(dir) = chie_project(project_dir) {
+        cmd.args(["--project", &dir]);
     }
-    if let Some(k) = kind.map(str::trim).filter(|s| !s.is_empty()) {
-        cmd.args(["--kind", k]);
+    // A default kind that chie can derive into a retrievable rule lesson.
+    let kind = kind
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("error");
+    cmd.args(["--kind", kind]);
+    if let Some(p) = pin.map(str::trim).filter(|s| !s.is_empty()) {
+        cmd.args(["--pin", p]);
     }
-    cmd.arg(content);
+    cmd.arg(rule_lesson_event(content));
     match cmd.output() {
         Ok(out) => out.status.success(),
         Err(_) => false,
@@ -475,6 +562,13 @@ mod tests {
         assert_eq!(b, vec!["watch the lease".to_string()]);
         let c = extract_trap_lines(r#"["alpha","beta"]"#);
         assert_eq!(c, vec!["alpha".to_string(), "beta".to_string()]);
+        let d = extract_trap_lines(
+            r#"[{"rule_id":"e-1","warning":"Strip TMPDIR trailing slash","proof":"proof46"}]"#,
+        );
+        assert_eq!(
+            d,
+            vec!["Strip TMPDIR trailing slash (proof: proof46)".to_string()]
+        );
     }
 
     #[test]
