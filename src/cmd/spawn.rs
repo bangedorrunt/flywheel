@@ -1701,7 +1701,8 @@ projects available: {}",
         );
     }
     let all_agents = c.agent_list()?;
-    let mut probe = Client::connect(Some(&cfg.socket_path())).ok();
+    // bd-1hkt0: liveness comes from the active plane, not the hc socket.
+    let plane_backend = backend::multiplexer_backend(cfg)?;
     let mut dead_owned: Vec<hc::WorkspaceInfo> = Vec::new();
     let mut live_owned: Vec<hc::WorkspaceInfo> = Vec::new();
     for ws in &split.owned {
@@ -1724,7 +1725,7 @@ projects available: {}",
         for a in &ws_agents {
             let kind = a.agent.as_deref().unwrap_or("opencode");
             let name = a.name.as_deref().unwrap_or("<null>");
-            let alive = probe_agent_liveness(&mut probe, &a.pane_id, kind, name);
+            let alive = probe_agent_liveness(plane_backend.as_ref(), &a.pane_id, kind, name);
             if alive != Some(false) {
                 all_dead = false;
                 break;

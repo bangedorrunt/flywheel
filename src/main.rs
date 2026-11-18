@@ -12247,18 +12247,63 @@ const RESPONSIVENESS_WINDOW: Duration = Duration::from_secs(3);
 /// inconclusive (the caller falls back to legacy pane-existence
 /// classification — never a confident "healthy").
 fn probe_agent_liveness(
-    probe: &mut Option<hc::Client>,
+    backend: &dyn backend::MultiplexerBackend,
     pane_id: &str,
     kind: &str,
     name: &str,
 ) -> Option<bool> {
-    let c = probe.as_mut()?;
-    match hc::pane_process_info(c, pane_id) {
-        Ok(pi) => hc::pane_agent_alive(&pi, kind),
-        Err(e) => {
-            eprintln!("flywheel: recover liveness probe for {name} failed: {e:#}");
+    // bd-1hkt0: the plane that owns the pane owns liveness. The hc backend
+    // keeps its byte-identical process fold; rex reads the block's foreground
+    // program. A backend that cannot tell returns None — never a confident
+    // "healthy" from some other plane's socket.
+    match backend.agent_alive(pane_id, kind) {
+        Some(alive) => Some(alive),
+        None => {
+            eprintln!(
+                "flywheel: liveness probe for {name} inconclusive on {}",
+                backend.name()
+            );
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod liveness_backend_tests {
+    use super::probe_agent_liveness;
+
+    struct FakeAlive(bool);
+    impl crate::backend::MultiplexerBackend for FakeAlive {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        fn agent_alive(&self, _pane_id: &str, _kind: &str) -> Option<bool> {
+            Some(self.0)
+        }
+    }
+
+    struct Unknown;
+    impl crate::backend::MultiplexerBackend for Unknown {
+        fn name(&self) -> &'static str {
+            "unknown"
+        }
+    }
+
+    #[test]
+    fn the_probe_asks_only_the_active_backend() {
+        assert_eq!(
+            probe_agent_liveness(&FakeAlive(true), "block:x", "opencode", "Pin"),
+            Some(true)
+        );
+        assert_eq!(
+            probe_agent_liveness(&FakeAlive(false), "block:x", "opencode", "Pin"),
+            Some(false)
+        );
+        assert_eq!(
+            probe_agent_liveness(&Unknown, "block:x", "opencode", "Pin"),
+            None,
+            "a backend that cannot tell is inconclusive, never healthy"
+        );
     }
 }
 
@@ -12383,7 +12428,7 @@ fn recover_seats(
             .iter()
             .find(|a| a.pane_id == *pane_id && a.workspace_id == ws_id);
         let decision = match binding_state(name, live.map(|a| a.name.as_deref())) {
-            BindingState::Intact => match probe_agent_liveness(&mut probe, pane_id, kind, &hname) {
+            BindingState::Intact => match probe_agent_liveness(backend, pane_id, kind, &hname) {
                 Some(false) => RecoverDecision::Respawn {
                     reason: "process-dead",
                 },
