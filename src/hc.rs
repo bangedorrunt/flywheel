@@ -109,6 +109,11 @@ pub fn plane_launch_env(
     // here is not invented.
     for key in [
         "HOME",
+        // bd-xpuky: the pane launches a mise shim (opencode, pi, ...) whose
+        // location is on the SPAWNER's PATH. A rex server started by launchd
+        // has only /usr/bin:/bin:... and cannot resolve it; hc gets this same
+        // map at split time. Carry PATH here so neither plane loses the harness.
+        "PATH",
         "XDG_STATE_HOME",
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
@@ -1523,6 +1528,30 @@ mod plane_launch_env_tests {
             std::env::remove_var("HOME");
             std::env::remove_var("XDG_STATE_HOME");
             std::env::remove_var("TORON_DATA_DIR");
+        }
+    }
+
+    /// bd-xpuky: a mise-installed harness is found only on the SPAWNER's PATH.
+    /// The rex server was started by launchd with /usr/bin:/bin:/usr/sbin:/sbin,
+    /// so without PATH in the map its `env K=V <kind>` cannot resolve opencode.
+    /// hc gets the same map at split time, so one key fixes both planes.
+    #[test]
+    fn env_carries_the_spawners_path_for_both_planes() {
+        let _g = crate::config::lock_env();
+        let prev = std::env::var_os("PATH");
+        let fake = "/tmp/mise/bin:/usr/bin:/bin";
+        unsafe {
+            std::env::set_var("PATH", fake);
+        }
+        let env = plane_launch_env(&cfg(), None);
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some(fake),
+            "the launch env must carry the spawner's PATH, not the server's"
+        );
+        match prev {
+            Some(v) => unsafe { std::env::set_var("PATH", v) },
+            None => unsafe { std::env::remove_var("PATH") },
         }
     }
 

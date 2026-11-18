@@ -6657,6 +6657,23 @@ mod rex_door_tests {
         );
     }
 
+    /// bd-xpuky: the PATH carried by plane_launch_env must reach the one-string
+    /// rex command, or the pane's `env K=V <kind>` still resolves on the
+    /// server's PATH.
+    #[test]
+    fn env_command_carries_the_spawners_path() {
+        let env: BTreeMap<String, String> = [
+            ("PATH".to_string(), "/tmp/mise/bin:/usr/bin".to_string()),
+            ("AGENT_NAME".to_string(), "Pin".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            rex_env_command(&env, "opencode", &[]),
+            "env AGENT_NAME=Pin PATH=/tmp/mise/bin:/usr/bin opencode"
+        );
+    }
+
     #[test]
     fn env_command_without_env_runs_kind_directly() {
         assert_eq!(rex_env_command(&BTreeMap::new(), "pi", &[]), "pi");
