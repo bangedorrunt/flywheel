@@ -119,14 +119,33 @@ fn proof_verify_mutations_never_edits_the_shared_tree() {
 
 /// bd-3681w: a kept proof export is for the captain's install. Letting every
 /// kept `fw-proof.*` directory accumulate filled the disk and killed proof44.
+/// bd-j45zo: exclude the kept export by basename, not by a path string whose
+/// spelling changes when TMPDIR ends in '/'.
 #[test]
 fn proof_clean_proof_keep_prunes_older_exports() {
     let src = std::fs::read_to_string(format!("{}/scripts/clean-proof.sh", root()))
         .expect("scripts/clean-proof.sh");
     assert!(
-        src.contains(r#"-name 'fw-proof.*' ! -path "$TMP" -exec rm -rf {} +"#),
-        "clean-proof must prune older kept fw-proof.* exports (bd-3681w)"
+        src.contains(r#"! -name "$(basename "$TMP")""#),
+        "clean-proof must exclude the kept export by basename (bd-j45zo)"
     );
+    assert!(
+        src.contains(r#"if [ "$status" -eq 0 ]"#),
+        "pruning must run only after a green proof (bd-j45zo)"
+    );
+}
+
+/// bd-j45zo: a trailing-slash TMPDIR made `! -path "$TMP"` delete the export
+/// proof46 had just kept, leaving nothing to install. The shell fixture drives
+/// both that case and the red-proof case with the real cleanup() in play.
+#[test]
+fn proof_clean_proof_keep_survives_trailing_slash_tmpdir() {
+    let status = Command::new("bash")
+        .arg(format!("{}/scripts/test-clean-proof-keep.sh", root()))
+        .current_dir(root())
+        .status()
+        .expect("run scripts/test-clean-proof-keep.sh");
+    assert!(status.success(), "scripts/test-clean-proof-keep.sh failed");
 }
 
 /// bd-6setu.18: a TEST_FILTER that matches no #[test] runs zero tests, so its

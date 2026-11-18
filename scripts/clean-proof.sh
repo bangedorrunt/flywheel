@@ -197,14 +197,27 @@ cleanup() {
   local status=$?
   if [ "$status" -ne 0 ] || [ "$KEEP" -eq 1 ]; then
     echo "clean-proof: kept $TMP" >&2
-    # bd-3681w: a kept export is for the captain's install. Older kept exports
-    # accumulate until the disk fills; keep only the newest.
-    find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'fw-proof.*' ! -path "$TMP" -exec rm -rf {} + 2>/dev/null || true
+    # bd-3681w: a kept export is for the captain's install. Older ones must not
+    # accumulate until the disk fills. bd-j45zo: TMPDIR may end in '/', so $TMP
+    # is .../T//fw-proof.X while find prints .../T/fw-proof.X - excluding by the
+    # path string deletes the export we just kept. Exclude by basename instead.
+    # A red proof keeps the last installable export: prune only on green.
+    if [ "$status" -eq 0 ]; then
+      find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'fw-proof.*' \
+        ! -name "$(basename "$TMP")" -exec rm -rf {} + 2>/dev/null || true
+    fi
   else
     rm -rf "$TMP"
   fi
 }
 trap cleanup EXIT
+
+# Test hook (bd-j45zo): drive the EXIT cleanup without a build. The caller seeds
+# older fw-proof.* dirs and sets TMPDIR (with a trailing slash) to reproduce the
+# exact path spelling that deleted proof46's own kept export.
+if [ -n "${CLEAN_PROOF_KEEP_TEST:-}" ]; then
+  exit "$CLEAN_PROOF_KEEP_TEST"
+fi
 
 mkdir -p "$TMP/flywheel" "$TMP/config" "$TMP/state"
 case "$MODE" in
