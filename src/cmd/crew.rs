@@ -968,6 +968,13 @@ fn cmd_crew_done(
         );
     }
     println!("brief {brief} closed; {wake}");
+    // bd-t5f0v: advisory only, and worded conditionally — a clean skip is a
+    // valid answer and never blocks the close.
+    let bead = book
+        .get(brief)
+        .and_then(|b| b.subject.split_whitespace().find(|w| w.starts_with("bd-")))
+        .unwrap_or(brief);
+    println!("{}", crate::cmd::ship::lesson_advisory(bead));
     Ok(())
 }
 
@@ -1084,8 +1091,20 @@ pub(crate) fn cmd_crew_prompt(
     // replies with the one verb that closes it, and `crew inbox --open` can
     // show what nobody answered.
     let brief = open_brief(project, pin, prompt.lines().next().unwrap_or(prompt))?;
+    let project_dir = crate::project_dir(cfg, project);
+    let traps = if project_dir.is_dir() {
+        crate::cmd::memory::briefing_traps(prompt, Some(project), bead, Some(&project_dir))
+    } else {
+        Vec::new()
+    };
+    let traps_block = crate::cmd::memory::render_traps_section(&traps);
+    let traps_suffix = if traps_block.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{}", traps_block.trim_end())
+    };
     let prompt = format!(
-        "{prompt}\n\n---\nBrief id: {brief}\nReply when done: flywheel crew done {brief} --receipt \"<commit sha + proof receipt + test tail>\" --project {project}"
+        "{prompt}{traps_suffix}\n\n---\nBrief id: {brief}\nReply when done: flywheel crew done {brief} --receipt \"<commit sha + proof receipt + test tail>\" --project {project}"
     );
     let dispatch = PromptDispatch {
         pin: pin.to_string(),

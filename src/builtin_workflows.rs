@@ -531,7 +531,7 @@ graph:
         "ce-compound",
         r#"
 name: ce-compound
-description: "Standalone compound gate: capture the durable learning from a verified bead/wave/session into docs/learnings/inbox/ as tier-perishable — usable from ANY topology (open/loop/swarm). One learning per run; clean_skip is a success."
+description: "Standalone compound gate: capture the durable learning from a verified bead/wave/session into chiebukuro with record-lesson — usable from ANY topology (open/loop/swarm). One learning per run; clean_skip is a success."
 trigger:
   type: webhook
 crew: auto
@@ -552,7 +552,7 @@ steps:
       profile: "@housekeeper"
       phase: compound
       stage: ce-compound
-      task: 'Run the compound gate over: bead {{inputs.bead}} {{inputs.source}}. Depth {{inputs.depth}}: "full" (default) runs the complete gate with all read lanes; "lightweight" captures one learning with minimal probes. Ground in the commit at HEAD, the steer-channel lessons (lesson: lines), and the receipts under .flywheel/receipts/. Read lanes are rg + chie qmd search + chie memory recall (labeled, offline-safe). Qualifying learnings are memory-recorded and filed to docs/learnings/inbox/ as tier: perishable with expires: and provenance (reinforced: stamped today) — never straight to docs/learnings/, never gated on a human at write time. Reply with ONLY the terminal JSON. The terminal signal (inboxed|clean_skip) IS the run verdict — never prose around it. One learning per run.'
+      task: 'Run the compound gate over: bead {{inputs.bead}} {{inputs.source}}. Depth {{inputs.depth}}: "full" (default) runs the complete gate with all recall lanes; "lightweight" captures one learning with minimal probes. Ground in the commit at HEAD, the steer-channel lessons (lesson: lines), and the receipts under .flywheel/receipts/. Recall lanes are chie qmd search + chie memory recall + flywheel memory check-trap (labeled, offline-safe). Qualifying learnings are written with `flywheel memory record-lesson` as one "X breaks when Y; do Z" line — chiebukuro is the ONLY learning store; no repo-side inbox, corpus, or perishable file is written, and no human gate sits at write time. Reply with ONLY the terminal JSON. The terminal signal (recorded|clean_skip) IS the run verdict — never prose around it. One learning per run.'
     on_error: continue
 "#,
     ),
@@ -560,7 +560,7 @@ steps:
         "ce-sweep",
         r#"
 name: ce-sweep
-description: "Learnings maintenance sweep (compound-refresh): Keep / Update / Consolidate / Replace / Delete over docs/learnings/ — a learning contradicting standing-orders or AGENTS.md guidance outranks ordinary staleness; resolve by which side the code follows. Cron-able."
+description: "Learnings maintenance sweep (compound-refresh): Keep / Update / Consolidate / Replace / Forget over recorded chiebukuro lessons with chie memory promote/forget — a lesson contradicting standing-orders or AGENTS.md guidance outranks ordinary staleness; resolve by which side the code follows. Cron-able."
 trigger:
   type: webhook
 crew: auto
@@ -575,7 +575,7 @@ steps:
     assignee: x
     spec:
       profile: "@housekeeper"
-      task: 'SWEEP docs/learnings/: FIRST triage docs/learnings/inbox/ — the human gate sits here, not at write time. Per inbox entry: PROMOTE (move into docs/learnings/, re-tier aging — pinned ONLY for never-decay invariants — re-stamp reinforced: <today>) or ARCHIVE (expired or untrue; archival, never destructive). Then for EACH entry, classify Keep / Update / Consolidate / Replace / Archive (Delete is retired — decay is archival, never destructive). Evidence per verdict: cited paths still exist, cited SHAs still reachable, guidance-layer contradictions (standing-orders / AGENTS.md / skill) named explicitly — a contradiction resolves by which side current code follows, and a wrong guidance FILE is reported, never edited here. High-overlap pairs become ONE canonical doc (oldest path wins, last_updated stamped). TIER RULES: MIGRATION — every entry missing tier/reinforced gains `tier: aging` + `reinforced: <today>` so the GATE projection does not empty on day one. tier: pinned never archives (invariants); tier: aging archives after 30d unreinforced; tier: perishable archives after 7d unreinforced and MUST name a checkable expiry (expires: field in frontmatter). REINFORCE on re-verification: re-stamp `reinforced: <today>` instead of archiving a still-true entry. ARCHIVE = `git mv` to docs/learnings/archive/ (still rg-able, out of the GATE projection) in the same commit. Output a JSON array [{path, verdict, evidence}] and apply the Archives/Consolidates directly in git (one commit, message cites ce-sweep).'
+      task: 'SWEEP chiebukuro lessons with `chie memory recall`: FIRST triage the recorded set — the human gate sits at promotion, not at write time. Per lesson: PROMOTE with `chie memory promote` when durable and still true, or FORGET with `chie memory forget` when expired, superseded, or untrue (never destructive to code). Classify each Keep / Update / Consolidate / Replace / Forget. Evidence per verdict: cited commits and receipts still resolve, guidance-layer contradictions (standing-orders / AGENTS.md / skill) named explicitly — a contradiction resolves by which side current code follows, and a wrong guidance FILE is reported, never edited here. High-overlap lessons become ONE canonical record (oldest wins, reinforced: <today>). REINFORCE on re-verification by re-recording with reinforced: <today> instead of forgetting a still-true lesson. Output a JSON array [{lesson, verdict, evidence}] and apply Promotions/Forgets directly with chie (one commit if a guidance record changes, message cites ce-sweep).'
     on_error: fail_run
 "#,
     ),
@@ -1189,7 +1189,7 @@ steps:
 name: wave-swarm
 compose: true
 shape: pipeline
-description: "The compounded wave swarm. GATE is an engine step (preflight + __wave-gate; a lower open wave holds, an empty ready with work in flight is in-flight, a zero match fails loud); DISPATCH is a foreach over the gate's typed ready set, one awaited job per bead. GATE scopes br ready to one wave via the TYPED wave field (grounding-reads docs/learnings/), holds on any open lower wave, and treats an empty ready with in-flight beads as WORK IN FLIGHT (bd-wave-gate-typed-authority-27et); DISPATCH emits send --stage ce-execute --param payloads (bead/scope/exit/channel/pin/report_file/learnings); OBSERVE escalates to the captain (lesson: line on every escalation) and never adjudicates; REVIEW audits each closed bead's diff against its brief (detection conditions, quoted evidence, autofix classes); VERIFY checks receipts at committed HEAD + VERIFY tails + principles citations + the residual gate (every finding fixed or filed as a bead); COMPOUND captures durable learnings to docs/learnings/ (never blocks); SIGNOFF suspends for captain-only approval. Every stage dispatch awaits its job result (result_timeout 7200s); each witnessed exit is checked against the stage contract, EXECUTE additionally ends on a ledger fact (all wave beads closed, ship check legal each). .done files under .flywheel/wave/ are write-only compat sidecars the RUNNER writes after a witnessed exit (ADR-0021 D4.4); no step writes or reads one. Default crew is planner+coder+reviewer; remix with --crew role:n,role:n (scout/housekeeper optional)."
+description: "The compounded wave swarm. GATE is an engine step (preflight + __wave-gate; a lower open wave holds, an empty ready with work in flight is in-flight, a zero match fails loud); DISPATCH is a foreach over the gate's typed ready set, one awaited job per bead. GATE scopes br ready to one wave via the TYPED wave field (grounding-reads chiebukuro), holds on any open lower wave, and treats an empty ready with in-flight beads as WORK IN FLIGHT (bd-wave-gate-typed-authority-27et); DISPATCH emits send --stage ce-execute --param payloads (bead/scope/exit/channel/pin/report_file/learnings); OBSERVE escalates to the captain (lesson: line on every escalation) and never adjudicates; REVIEW audits each closed bead's diff against its brief (detection conditions, quoted evidence, autofix classes); VERIFY checks receipts at committed HEAD + VERIFY tails + principles citations + the residual gate (every finding fixed or filed as a bead); COMPOUND captures durable learnings to chiebukuro with record-lesson (never blocks); SIGNOFF suspends for captain-only approval. Every stage dispatch awaits its job result (result_timeout 7200s); each witnessed exit is checked against the stage contract, EXECUTE additionally ends on a ledger fact (all wave beads closed, ship check legal each). .done files under .flywheel/wave/ are write-only compat sidecars the RUNNER writes after a witnessed exit (ADR-0021 D4.4); no step writes or reads one. Default crew is planner+coder+reviewer; remix with --crew role:n,role:n (scout/housekeeper optional)."
 trigger:
   type: webhook
 crew:
@@ -1285,7 +1285,7 @@ steps:
       profile: "@planner"
       phase: compound
       stage: ce-compound
-      task: 'Run the compound gate over {{inputs.wave_label}} for {{inputs.objective}}: the wave''s verified solutions + the OBSERVE escalation lessons — memory-record and file what qualifies to docs/learnings/inbox/ (tier: perishable), clean_skip the rest. Report inboxed/clean_skip counts.'
+      task: 'Run the compound gate over {{inputs.wave_label}} for {{inputs.objective}}: the wave''s verified solutions + the OBSERVE escalation lessons — record-lesson what qualifies to chiebukuro, clean_skip the rest. Report recorded/clean_skip counts.'
     on_error: continue
   - name: signoff
     action: request_approval

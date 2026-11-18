@@ -5,7 +5,7 @@
 //! compound spine so every topology compounds from day one:
 //!   - `.flywheel/stages.toml` — the project tier (seed < repo < user < project)
 //!   - `.flywheel/standing-orders.md` — the project fence + compound orders
-//!   - `docs/learnings/README.md` — the learnings corpus convention
+//!   - chiebukuro — the single learning store (record-lesson; no repo-side corpus)
 //!
 //! Re-runnable: existing files are never overwritten (reported as kept).
 
@@ -60,61 +60,12 @@ pub fn artifacts() -> Vec<Artifact> {
   "independently confirmed" — claim corroboration only across separately-dispatched contexts.
 "#,
         },
-        Artifact {
-            rel: "docs/learnings/README.md",
-            content: r#"# Learnings corpus (ADR-0009)
-
-One learning per file, git-tracked, `rg`-able. This is the compound-engineering **return
-arrow**: `ce-brainstorm` / the wave GATE / the brief's LEARNINGS field read it before work;
-the `ce-compound` gate writes to it after verified work; `ce-sweep` maintains it.
-
-## The gate (all three must hold — completion alone never qualifies)
-
-1. **Non-obvious** — the reasoning is not recoverable from the final code, tests, types, or
-   comments.
-2. **Durable** — an invariant, root cause, rejected approach, or convention useful beyond the
-   exact diff.
-3. **Material** — forgetting it would plausibly cause recurrence or substantial rediscovery.
-
-Counterfactual: if the doc vanished, would the next crew redo this investigation? If not,
-`clean_skip`.
-
-## Schema
-
-```markdown
----
-track: bug            # bug | knowledge — decides the sections
-module: src/crew.rs   # open vocabulary, reuse what the corpus already uses
-problem_type: integration_issue
-tags: [dispatch]
-bead: bd-xxxx         # provenance
-created: 2026-09-06
----
-## Symptoms            # bug track: Symptoms / What Didn't Work / Solution /
-## What didn't work    #         Why This Works / Prevention
-## Solution
-## Prevention
-# knowledge track instead: Context / Guidance / When to Apply
-```
-
-- High overlap with an existing entry ⇒ UPDATE it (stamp `last_updated`), never duplicate.
-- A learning contradicting standing-orders/AGENTS.md guidance **outranks ordinary staleness** —
-  resolve by which side current code follows; report a wrong guidance file, never edit it here
-  (`ce-sweep` owns that).
-- The learning ships in the SAME commit as the work that produced it.
-
-## Maintenance
-
-`flywheel workflow run ce-sweep --execute --inputs '{"project":"<slug>"}'` —
-Keep / Update / Consolidate / Replace / Delete, evidence per verdict.
-"#,
-        },
     ]
 }
 
 /// The AGENTS.md pointer `init` suggests (printed, never auto-edited — the
 /// repo owns its instruction file; CE's discoverability rule).
-pub const AGENTS_POINTER: &str = "Learnings live in `docs/learnings/` (ADR-0009) — `rg -il \"<keywords>\" docs/learnings/` before planning; the ce-compound gate decides capture after verified work.";
+pub const AGENTS_POINTER: &str = "Learnings live in chiebukuro (ADR-0009) — `flywheel memory check-trap \"<keywords>\"` before planning; record-lesson the moment a root cause is confirmed, in every mode, bead or not.";
 
 /// Write every missing scaffold artifact under `project_root`. Returns the
 /// (created, kept) relative paths. Pure IO, no prompts, no overwrites.
@@ -148,7 +99,7 @@ mod tests {
     fn scaffold_creates_compound_artifacts() {
         let dir = std::env::temp_dir().join(format!("fw-init-{}", uuid::Uuid::new_v4()));
         let (created, kept) = scaffold(&dir).expect("scaffold");
-        assert_eq!(created.len(), 3, "three artifacts: {created:?}");
+        assert_eq!(created.len(), 2, "two artifacts: {created:?}");
         assert!(kept.is_empty(), "fresh dir keeps nothing");
         let stages = std::fs::read_to_string(dir.join(".flywheel/stages.toml")).unwrap();
         assert!(stages.contains("compound"), "phase vocabulary named");
@@ -158,9 +109,6 @@ mod tests {
             "fence carries compound orders"
         );
         assert!(orders.contains("clean_skip"), "terminal states present");
-        let readme = std::fs::read_to_string(dir.join("docs/learnings/README.md")).unwrap();
-        assert!(readme.contains("clean_skip"), "learning gate present");
-        assert!(readme.contains("ce-sweep"), "maintenance path present");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -169,11 +117,11 @@ mod tests {
     fn scaffold_rerun_keeps_existing() {
         let dir = std::env::temp_dir().join(format!("fw-init-keep-{}", uuid::Uuid::new_v4()));
         let before = scaffold(&dir).expect("first scaffold");
-        assert_eq!(before.0.len(), 3);
+        assert_eq!(before.0.len(), 2);
         std::fs::write(dir.join(".flywheel/stages.toml"), "# MINE\n").unwrap();
         let (created, kept) = scaffold(&dir).expect("second scaffold");
         assert!(created.is_empty(), "nothing created twice");
-        assert_eq!(kept.len(), 3, "all three kept: {kept:?}");
+        assert_eq!(kept.len(), 2, "both kept: {kept:?}");
         let stages = std::fs::read_to_string(dir.join(".flywheel/stages.toml")).unwrap();
         assert_eq!(stages, "# MINE\n", "authored content untouched");
         let _ = std::fs::remove_dir_all(&dir);

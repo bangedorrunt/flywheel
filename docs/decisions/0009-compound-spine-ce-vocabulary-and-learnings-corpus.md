@@ -6,7 +6,7 @@
 | **Date** | 2026-09-06 |
 | **Decision Maker** | Captain (bangedorrunt) |
 | **Relates to** | [ADR-0006](0006-parameterized-stage-payloads-and-wave-scoped-dispatch.md) (stage payloads + wave swarm), [ADR-0008](0008-workflow-compose-topology-agent-optimal-mental-model.md) (compose tokens), toron [ADR-0022](../../toron/docs/decisions/0022-phase-native-orchestration.md) §3.1/§4 (phase vocabulary — amended by this ADR's addendum there), toron ADR-0027 (one-workspace tick), beads ADR-0001 (typed fields), [EveryInc/compound-engineering-plugin](https://github.com/EveryInc/compound-engineering-plugin) (MIT — concepts adopted, no code) |
-| **Governs** | `src/stages.rs` (stage library, PHASES, alias retirement), `src/builtin_workflows.rs` (built-in renames, wave-swarm composition, ce-compound/ce-sweep), `src/crew.rs` + `src/decide.rs` (compose/routing), `src/main.rs` (robot capabilities, help), `docs/learnings/` (project corpus), `integrations/beads-body.md.tpl`, standing orders |
+| **Governs** | `src/stages.rs` (stage library, PHASES, alias retirement), `src/builtin_workflows.rs` (built-in renames, wave-swarm composition, ce-compound/ce-sweep), `src/crew.rs` + `src/decide.rs` (compose/routing), `src/main.rs` (robot capabilities, help), chiebukuro (the project learning store), `integrations/beads-body.md.tpl`, standing orders |
 | **Verification** | `docs/decisions/_scripts/verify-0009.sh` (see §8) |
 
 ---
@@ -28,8 +28,8 @@ audits receipts and close-reason tails, never the artifact — the hole the toro
    `plan-review`/p5), `ce-execute` (was `systematic-execute`/p6), `ce-simplify` (new),
    `ce-review` (was `code-review`/p2), `ce-compound` (new). **The p-code aliases are RETIRED**
    (clean cutover — `send --stage p6` now errors naming the fix; no shims, per project policy).
-2. **D2 — the learnings corpus.** Per-project `docs/learnings/` (git-tracked): bug-track vs
-   knowledge-track docs with frontmatter, one learning per file, `rg`-able — no vector store.
+2. **D2 — the learnings corpus (now chiebukuro).** Learnings live in chiebukuro: bug-track vs
+   knowledge-track entries with frontmatter, one learning per entry, retrieved via `chie` — no vector store of our own.
    The GATE grounding-read + the brief's new LEARNINGS field are the return arrow: run one
    teaches it, run two reads it.
 3. **D3 — the compounded wave-swarm.** The token expands to EIGHT steps:
@@ -67,7 +67,7 @@ until a measured need — its output is an artifact on disk, not a self-report).
 
 | CE concept | Flywheel primitive after this ADR |
 | :--- | :--- |
-| Learning / docs/solutions/ + ce-compound | `docs/learnings/` + `ce-compound` stage/workflow |
+| Learning / docs/solutions/ + ce-compound | chiebukuro (learning store) + `ce-compound` stage/workflow |
 | The return arrow (plans read learnings) | GATE grounding read + brief LEARNINGS field |
 | ce-code-review personas / detection conditions / confidence anchors / independence | `ce-review` stage (evidence-quoted findings, autofix classes, independence rule) |
 | Residual ("durable sink before done") | VERIFY residual gate → `br create` bead id |
@@ -131,7 +131,7 @@ until a measured need — its output is an artifact on disk, not a self-report).
 Bead `bd-4el4` (this change). Files: `src/stages.rs`, `src/builtin_workflows.rs`, `src/crew.rs`,
 `src/decide.rs`, `src/main.rs`, `src/config.rs`, `src/workflow_catalog.rs`, `src/headless.rs`,
 `src/principles.rs`, toron `crates/toron-workflow/src/schema.rs` (+ADR-0022 addendum),
-`docs/learnings/` (README + seed), `.flywheel/standing-orders.md`, `integrations/beads-body.md.tpl`,
+chiebukuro (learning store), `.flywheel/standing-orders.md`, `integrations/beads-body.md.tpl`,
 AGENTS.md / README.md / docs / skill §5 / CHANGELOG.
 
 ## 8. Verification
@@ -143,5 +143,5 @@ AGENTS.md / README.md / docs / skill §5 / CHANGELOG.
 - [ ] `wave_swarm_compose_token_expands_eight_steps_and_lints_clean` — 8 steps, REVIEW@5/ce-review, COMPOUND@7/ce-compound/phase compound, lints clean
 - [ ] `wave_dispatch_briefs_ce_execute_with_learnings` — DISPATCH briefs ce-execute + learnings param
 - [ ] toron-workflow `phase_enum_closed_vocabulary_roundtrip_and_reject` — six values, unknown still fails parse
-- [ ] `docs/learnings/` exists with README + ≥1 seeded learning
+- [ ] chiebukuro holds ≥1 seeded learning
 - [ ] Skill Sync Contract: robot_capabilities `stages`, AGENTS.md, SKILL.md §5, CHANGELOG updated

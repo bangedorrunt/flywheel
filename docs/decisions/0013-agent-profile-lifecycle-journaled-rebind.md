@@ -343,7 +343,7 @@ Honest rescore vs **post-merge tip** `772abd8…` (2026-09-12 ~19:55 AEST). Audi
 | `integrations/peer-aware.md.tpl` | flywheel | **only** full peer-aware body |
 | `integrations/prompts/peer-aware.md.tpl` | flywheel | thin chrome |
 | `scripts/check-peer-aware-sot.sh` | flywheel | CI gate |
-| `docs/learnings/gs-043-profile-fallback-rebind.md` | flywheel | as-is→to-be learning (PR#8) |
+| chiebukuro page `gs-043-profile-fallback-rebind` | flywheel | as-is→to-be learning (PR#8) |
 | toron `workflow_effects` | toron-core | spawn/effect journal when Wave B lands |
 | mailbox receipts | toron-core | message lifecycle only |
 
@@ -391,7 +391,7 @@ Accepted by captain word on this file (2026-09-12). The checklist records the ev
 | Evidence | Path / ref |
 |----------|------------|
 | GS-042 bible | `/home/box/agent-data/grok-ship/reports/GS-042.md` (sha256 `db07a4cb355e66fd20bdc1ce919f79ee1ad4e72fc71fceae6dd960682e671b67`) |
-| GS-043 learning | `docs/learnings/gs-043-profile-fallback-rebind.md` on PR#8 |
+| GS-043 learning | chiebukuro page `gs-043-profile-fallback-rebind` on PR#8 |
 | ADR-0032 | toron `docs/decisions/0032-workflow-engine-honesty-jido-contracts.md` @ `0131edd…` (**Proposed**) |
 | Dual tpl pre-merge | ~9894 B vs ~2890 B on `193d57e…` |
 | Post-merge SoT | ~10810 B SoT + ~1459 B chrome on `772abd8…` |

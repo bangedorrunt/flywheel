@@ -451,7 +451,7 @@ impl StageLibrary {
             ),
             (
                 "ce-brainstorm",
-                "Sharpen a rough objective into REQUIREMENTS before any bead exists (ADR-0009 ce-brainstorm). Ask ONE question at a time, and only questions whose answer changes the artifact — a decision the owner must make, never something the repo can answer. Ground first: read AGENTS.md, the relevant ADRs, and `rg -il \"<objective keywords>\" docs/learnings/` — a prior learning that touches this area carries its constraints in. The output is REQUIREMENTS-ONLY (never implementation): one unified statement of what this must be, explicit non-goals, open questions each naming the decision it blocks, and a data-shape note (what exists to work with). A requirement you cannot test is a wish — every acceptance names its evidence. Post the artifact to the steer channel; reply with ONLY a JSON object {\"target\": \"...\", \"non_goals\": [\"...\"], \"open_questions\": [\"...\"], \"data_shape\": \"...\"}.",
+                "Sharpen a rough objective into REQUIREMENTS before any bead exists (ADR-0009 ce-brainstorm). Ask ONE question at a time, and only questions whose answer changes the artifact — a decision the owner must make, never something the repo can answer. Ground first: read AGENTS.md, the relevant ADRs, and `chie memory recall \"<objective keywords>\"` — a prior learning in chiebukuro carries its constraints in. The output is REQUIREMENTS-ONLY (never implementation): one unified statement of what this must be, explicit non-goals, open questions each naming the decision it blocks, and a data-shape note (what exists to work with). A requirement you cannot test is a wish — every acceptance names its evidence. Post the artifact to the steer channel; reply with ONLY a JSON object {\"target\": \"...\", \"non_goals\": [\"...\"], \"open_questions\": [\"...\"], \"data_shape\": \"...\"}.",
             ),
             (
                 "ce-review",
@@ -475,7 +475,7 @@ impl StageLibrary {
             ),
             (
                 "ce-execute",
-                "Execute the beads via the brief contract. Every dispatched bead carries a filled brief (GOAL / SCOPE / CONTEXT / LEARNINGS / ACCEPTANCE / VERIFY / TIMEBOX / FORBIDDEN / REPORT / PRINCIPLES / STANDING) — the brief IS the work contract, and the lifecycle lives in the standing-orders file named in its STANDING field (read it once before starting; never re-derive it from memory). LEARNINGS carries the docs/learnings/ entries matching this scope — their constraints ride the brief; never re-derive a lesson the corpus already holds. IDEMPOTENT RE-ENTRY: before starting a bead, run its VERIFY at HEAD — already green means already done: mark complete and skip (a resumed wave never redoes shipped work). SIMPLIFY AS YOU GO: after each green VERIFY, one behavior-preserving pass (delete weightless code, collapse one-caller wrappers), then re-run the VERIFY. For each bead: run the VERIFY command from the brief, write the receipt to `.flywheel/receipts/<bead-id>-<sha>.<kind>.txt`, then close only with a REPORT that states status, commit sha (commit BEFORE close; bead id IN the commit message), verdict kind, what you actually ran, deviations, and the PRINCIPLES cited (`<name> — <the decision it changed>`). Principles in force: prove-it-works (the close is not done without a legal ledger row — verify with `flywheel ledger check <bead-id>`; the receipt is evidence, the verdict is the proof), fix-root-causes (reproduce before diagnosing; no silencers), sequence-verifiable-units (each bead ends in a check before the next starts). Prefer delegating to the `beads` subagent when available. If another agent (peer) is working in this project, join its shared room and steer on plane S (ADR-0020): `toron channel join steer-<bead-id> --project <slug> --as \"$AGENT_NAME\"` then accept/claim jobs posted there via `toron job list --state open --project <slug> --as \"$AGENT_NAME\"` + `toron job claim <job-id> --project <slug> --as \"$AGENT_NAME\"` (first claimer wins; a second claimer exits 1). Keep shared work on the room; keep secrets on plane P (`toron mail`). COORDINATION (one board, whole stack): before editing, run `toron reserve conflicts --project <slug> --as \"$AGENT_NAME\" --paths '<file-glob>' --json`; a non-empty report means re-plan or split the file set, or run the one genuinely shared edit under `toron reserve with-lease` — never wait on a lease. Reserve narrow write paths (exclusive) under the captain's project, repo-prefixed when you edit a sibling repo (`toron/src/...`); leases are 180 s heartbeats the loop renews, so a dead lane frees its claim in under three minutes. Peer-first on a real overlap: mail the holder or `flywheel collab`; escalate to the captain only when the holder is silent or a shared build breaks (name the file and the error in the same message). Keep shared crates compiling: land compile-green slices and announce a red shared crate immediately. Release at close with `toron reserve release-by-reason <bead>`. No worktree. If the dispatch names no bead binding (no BEAD line), do NOT act on the TASK-ID: stop and ask the captain for the bead id. Ask-user authority (ADR-0010 D15): never self-answer an ask-user finding. Unambiguous restorations of accepted behavior auto-decide — Publish the corr (journaled) and proceed. Expansions (new guarantee, threat model, architecture, destructive, security) stop the stage, Publish the corr, and park on WaitCorr with the five-element escalation (original criterion, proposed expansion, smallest compliant alternative, accept-vs-decline consequences, recommendation) into OPEN DECISIONS. Only an answer/--verdict closes the call; worker-side auto-close is a LoudMiss. CLAIM/CLOSE CEREMONY for every bead: claim BEFORE work with `br update <id> --claim --actor <your pin>` (the PIN — a registered hc slug folds to its pin — and never a username-class assignee; without `--claim` the atomic guard does not run and a second lane overwrites the first), reserve the narrow files you touch, commit BEFORE close with the bead id IN the commit message, then `br gate report <id> --gate <verdict> --provider <pin> --status pass --to closed` and `br close <id> --commit-sha <sha>`.",
+                "Execute the beads via the brief contract. Every dispatched bead carries a filled brief (GOAL / SCOPE / CONTEXT / LEARNINGS / ACCEPTANCE / VERIFY / TIMEBOX / FORBIDDEN / REPORT / PRINCIPLES / STANDING) — the brief IS the work contract, and the lifecycle lives in the standing-orders file named in its STANDING field (read it once before starting; never re-derive it from memory). LEARNINGS carries the chiebukuro lessons matching this scope — their constraints ride the brief; never re-derive a lesson already recorded. IDEMPOTENT RE-ENTRY: before starting a bead, run its VERIFY at HEAD — already green means already done: mark complete and skip (a resumed wave never redoes shipped work). SIMPLIFY AS YOU GO: after each green VERIFY, one behavior-preserving pass (delete weightless code, collapse one-caller wrappers), then re-run the VERIFY. For each bead: run the VERIFY command from the brief, write the receipt to `.flywheel/receipts/<bead-id>-<sha>.<kind>.txt`, then close only with a REPORT that states status, commit sha (commit BEFORE close; bead id IN the commit message), verdict kind, what you actually ran, deviations, and the PRINCIPLES cited (`<name> — <the decision it changed>`). Principles in force: prove-it-works (the close is not done without a legal ledger row — verify with `flywheel ledger check <bead-id>`; the receipt is evidence, the verdict is the proof), fix-root-causes (reproduce before diagnosing; no silencers), sequence-verifiable-units (each bead ends in a check before the next starts). Prefer delegating to the `beads` subagent when available. If another agent (peer) is working in this project, join its shared room and steer on plane S (ADR-0020): `toron channel join steer-<bead-id> --project <slug> --as \"$AGENT_NAME\"` then accept/claim jobs posted there via `toron job list --state open --project <slug> --as \"$AGENT_NAME\"` + `toron job claim <job-id> --project <slug> --as \"$AGENT_NAME\"` (first claimer wins; a second claimer exits 1). Keep shared work on the room; keep secrets on plane P (`toron mail`). COORDINATION (one board, whole stack): before editing, run `toron reserve conflicts --project <slug> --as \"$AGENT_NAME\" --paths '<file-glob>' --json`; a non-empty report means re-plan or split the file set, or run the one genuinely shared edit under `toron reserve with-lease` — never wait on a lease. Reserve narrow write paths (exclusive) under the captain's project, repo-prefixed when you edit a sibling repo (`toron/src/...`); leases are 180 s heartbeats the loop renews, so a dead lane frees its claim in under three minutes. Peer-first on a real overlap: mail the holder or `flywheel collab`; escalate to the captain only when the holder is silent or a shared build breaks (name the file and the error in the same message). Keep shared crates compiling: land compile-green slices and announce a red shared crate immediately. Release at close with `toron reserve release-by-reason <bead>`. No worktree. If the dispatch names no bead binding (no BEAD line), do NOT act on the TASK-ID: stop and ask the captain for the bead id. Ask-user authority (ADR-0010 D15): never self-answer an ask-user finding. Unambiguous restorations of accepted behavior auto-decide — Publish the corr (journaled) and proceed. Expansions (new guarantee, threat model, architecture, destructive, security) stop the stage, Publish the corr, and park on WaitCorr with the five-element escalation (original criterion, proposed expansion, smallest compliant alternative, accept-vs-decline consequences, recommendation) into OPEN DECISIONS. Only an answer/--verdict closes the call; worker-side auto-close is a LoudMiss. CLAIM/CLOSE CEREMONY for every bead: claim BEFORE work with `br update <id> --claim --actor <your pin>` (the PIN — a registered hc slug folds to its pin — and never a username-class assignee; without `--claim` the atomic guard does not run and a second lane overwrites the first), reserve the narrow files you touch, commit BEFORE close with the bead id IN the commit message, then `br gate report <id> --gate <verdict> --provider <pin> --status pass --to closed` and `br close <id> --commit-sha <sha>`.",
             ),
             (
                 "ce-simplify",
@@ -483,7 +483,7 @@ impl StageLibrary {
             ),
             (
                 "ce-compound",
-                "Compound gate (ADR-0009, bd-iqte): after a VERIFIED solution, decide whether the work produced a durable learning, then capture it. The gate is three-part and ALL must hold: NON-OBVIOUS (the reasoning is not recoverable from the final code, tests, types, or comments), DURABLE (an invariant, root cause, rejected approach, or convention useful beyond this diff), MATERIAL (forgetting it would plausibly cause recurrence or substantial rediscovery). Counterfactual: if the learning vanished, would the next crew redo this investigation? If not, reply {\"terminal\": \"clean_skip\"} — completion alone never qualifies; effort and diff size are not evidence. ONE learning per run. READ LANES (labeled, offline-safe — no web): [corpus] `rg -il \"<keywords>\" docs/learnings/` (inbox/ included), [wiki] `chie qmd search \"<q>\" --agent`, [memory] `chie memory recall` — tag every overlap hit with its lane. High overlap UPDATES the existing doc (add last_updated + re-stamp reinforced: <today> — ADR-0010 D12 reinforcement), never a duplicate. Otherwise WRITE: `chie memory record` the learning, then file `docs/learnings/inbox/<slug>.md` with frontmatter tier: perishable, expires: <checkable date, default created+7d>, reinforced: <today>, provenance: bead + commit SHA + lanes consulted + memory-recorded (contract: docs/learnings/inbox/README.md) — bug track sections: Symptoms / What Didn't Work / Solution / Why This Works / Prevention; knowledge track: Context / Guidance / Why This Matters / When to Apply. PROBE session history first: rg the recent session/channel log for prior learnings on these keywords before claiming novelty — a repeat UPDATES the existing doc, never a duplicate. SELF-CHECK every claim: each sentence asserting a fact about the work must cite the commit, receipt, or command that proves it; an uncited claim is a draft, not a finding. NO human wait at write time — file it and move on; the human gate sits at sweep time (ce-sweep promotes or archives). Reply with ONLY {\"terminal\": \"inboxed|clean_skip\", \"path\": \"...\", \"track\": \"...\"}. A failed capture NEVER blocks the run — report and move on.",
+                "Compound gate (ADR-0009, bd-t5f0v): after a VERIFIED solution, decide whether the work produced a durable learning, then capture it. The gate is three-part and ALL must hold: NON-OBVIOUS (the reasoning is not recoverable from the final code, tests, types, or comments), DURABLE (an invariant, root cause, rejected approach, or convention useful beyond this diff), MATERIAL (forgetting it would plausibly cause recurrence or substantial rediscovery). Counterfactual: if the learning vanished, would the next crew redo this investigation? If not, reply {\"terminal\": \"clean_skip\"} — completion alone never qualifies; effort and diff size are not evidence. ONE learning per run. RECALL FIRST (label each lane): [wiki] `chie qmd search \"<q>\" --agent`, [memory] `chie memory recall`, [traps] `flywheel memory check-trap \"<keywords>\"`. High overlap REINFORCES the existing lesson in place — re-record the updated line, stamped reinforced: <today> (ADR-0010 D12) — never a duplicate. Otherwise WRITE: `flywheel memory record-lesson` one \"X breaks when Y; do Z\" line — in every mode, bead or not — naming the bead and commit where they exist. Chiebukuro is the ONLY learning store: no repo-side corpus or perishable file is written. SELF-CHECK every claim: each sentence asserting a fact about the work must cite the commit, receipt, or command that proves it; an uncited claim is a draft, not a finding. NO human wait at write time — record and move on; maintenance is `chie memory promote` / `chie memory forget` at sweep time (ce-sweep). Reply with ONLY {\"terminal\": \"recorded|clean_skip\", \"lesson\": \"...\"}. A failed capture NEVER blocks the run — report and move on.",
             ),
             (
                 "commit-and-push",
@@ -1144,7 +1144,7 @@ pub fn render_stage(
 /// Learning corpus decay model (bd-fmya). Frontmatter carries
 /// `tier: pinned|aging|perishable` + `reinforced: YYYY-MM-DD` (perishable
 /// docs additionally name a checkable `expires:`). The GATE grounding read
-/// is a BUDGETED PROJECTION of `docs/learnings/`, never the corpus itself
+/// is a BUDGETED PROJECTION of `chie/`, never the corpus itself
 /// (guard-the-context-window); decay is frontmatter, not a prompt
 /// (encode-lessons-in-structure). Archiving is ce-sweep's job — this layer
 /// only ranks + bounds, never deletes.
@@ -1176,7 +1176,7 @@ pub mod learning {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
     #[serde(rename_all = "lowercase")]
     pub enum LearningLane {
-        /// `docs/learnings/` corpus files.
+        /// `chie/` corpus files.
         Corpus,
         /// Curated wiki pages (chiebukuro knowledge plane export).
         Wiki,
@@ -1372,7 +1372,7 @@ mod adr0010_d12_tests {
     fn gate_budget_is_shared_across_corpus_wiki_memory_lanes() {
         let today = d("2026-09-24");
         let entries = vec![
-            lane_entry("docs/learnings/a.md", LearningLane::Corpus, 2000),
+            lane_entry("chie/a.md", LearningLane::Corpus, 2000),
             lane_entry("wiki:attention", LearningLane::Wiki, 2000),
             lane_entry("memory:conclusion-1", LearningLane::Memory, 2000),
         ];
@@ -1429,7 +1429,7 @@ mod adr0010_d12_tests {
         let entries: Vec<LearningEntry> = (0..50)
             .map(|i| {
                 entry(
-                    &format!("docs/learnings/k/l{i:02}.md"),
+                    &format!("chie/k/l{i:02}.md"),
                     LearningTier::Aging,
                     Some("2026-09-07"),
                     100,
@@ -1449,13 +1449,13 @@ mod adr0010_d12_tests {
         let today = d("2026-09-07");
         let entries = vec![
             entry(
-                "docs/learnings/k/stale.md",
+                "chie/k/stale.md",
                 LearningTier::Aging,
                 Some("2026-07-29"),
                 100,
             ),
             entry(
-                "docs/learnings/k/fresh.md",
+                "chie/k/fresh.md",
                 LearningTier::Aging,
                 Some("2026-09-01"),
                 100,
@@ -1474,21 +1474,21 @@ mod adr0010_d12_tests {
     fn adr0010_d12_tier_matrix() {
         let today = d("2026-09-07");
         let entries = vec![
-            entry("docs/learnings/k/pin.md", LearningTier::Pinned, None, 100),
+            entry("chie/k/pin.md", LearningTier::Pinned, None, 100),
             entry(
-                "docs/learnings/k/edge30.md",
+                "chie/k/edge30.md",
                 LearningTier::Aging,
                 Some("2026-08-08"),
                 100,
             ),
             entry(
-                "docs/learnings/k/perish-fresh.md",
+                "chie/k/perish-fresh.md",
                 LearningTier::Perishable,
                 Some("2026-09-03"),
                 100,
             ),
             entry(
-                "docs/learnings/k/perish-old.md",
+                "chie/k/perish-old.md",
                 LearningTier::Perishable,
                 Some("2026-08-20"),
                 100,
@@ -1496,11 +1496,11 @@ mod adr0010_d12_tests {
         ];
         let out = gate_projection(&entries, today, 10_000);
         let paths: Vec<&str> = out.iter().map(|e| e.path.as_str()).collect();
-        assert!(paths.contains(&"docs/learnings/k/pin.md"));
-        assert!(paths.contains(&"docs/learnings/k/edge30.md"));
-        assert!(paths.contains(&"docs/learnings/k/perish-fresh.md"));
-        assert!(!paths.contains(&"docs/learnings/k/perish-old.md"));
-        assert_eq!(paths[0], "docs/learnings/k/perish-fresh.md");
+        assert!(paths.contains(&"chie/k/pin.md"));
+        assert!(paths.contains(&"chie/k/edge30.md"));
+        assert!(paths.contains(&"chie/k/perish-fresh.md"));
+        assert!(!paths.contains(&"chie/k/perish-old.md"));
+        assert_eq!(paths[0], "chie/k/perish-fresh.md");
     }
 
     #[test]

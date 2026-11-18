@@ -42,10 +42,10 @@ notes = "Review remains report-only; phase gates and durable artifacts prevent a
 source = "compound-engineering"
 name = "learning-return-arrow"
 upstream = "ce-compound / ce-compound-refresh and repo-local durable solutions"
-local_surface = "docs/learnings/; src/builtin_workflows.rs; integrations/prompts/loop.md.tpl"
+local_surface = "chiebukuro; src/builtin_workflows.rs; integrations/prompts/loop.md.tpl"
 status = "adopted"
-evidence = ["docs/learnings/README.md", "src/builtin_workflows.rs", "integrations/prompts/loop.md.tpl"]
-notes = "Learnings are project-scoped, frontmatter-indexed, and fed back into the gate/brief rather than copied into a global prompt."
+evidence = ["src/stages.rs", "src/builtin_workflows.rs", "integrations/prompts/loop.md.tpl"]
+notes = "Learnings are recorded in chiebukuro and fed back into the gate/brief rather than copied into a global prompt."
 
 [[capabilities]]
 source = "compound-engineering"

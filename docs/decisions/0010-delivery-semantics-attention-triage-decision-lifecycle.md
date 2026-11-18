@@ -7,7 +7,7 @@
 | **Decision Maker** | Captain (bangedorrunt) |
 | **Authors** | HarborPilot (draft), KeenAuditor (peer review + fold) |
 | **Relates to** | [ADR-0001](0001-event-driven-agent-collaboration-spine.md) (spine, escalation), [ADR-0005](0005-always-on-collab-baseline-and-command-surface.md) (always-on baseline), [ADR-0009](0009-compound-spine-ce-vocabulary-and-learnings-corpus.md) (learnings corpus — extended by D12), toron [ADR-0020](../../../toron/docs/decisions/0020-nostr-two-plane-cli-and-crew-steering.md) (crew steering), toron [ADR-0025](../../../toron/docs/decisions/0025-adopt-graph-dispatch-artifact-reduce-pin-supervision.md) (pin supervision — extended by D3), toron [ADR-0026](../../../toron/docs/decisions/0026-failure-taxonomy-funded-preflight-fallback-chains-mail-health-escalation.md) (failure taxonomy — extended by D5/D8), toron [ADR-0027](../../../toron/docs/decisions/0027-one-workspace-tick-control-plane.md) (one-workspace tick — **amended by D0**; D5 is gated on D0), toron [ADR-0028](../../../toron/docs/decisions/0028-jido-behavior-first-on-wheelhouse-nouns.md) (action schema — extended by D7), beads ADR-0001 (typed fields — **D11 requires a successor ADR in the beads repo**, this ADR does not ship beads schema), [kunchenguid/firstmate](https://github.com/kunchenguid/firstmate) (MIT — concepts adopted, no code; D13 class: commit `50cc24a`) |
-| **Governs (on acceptance)** | `src/workspace.rs` (tick, Msg/Cmd, wake ack, worker state, one live Model), `src/doorbell*.rs` (re-ring ladder, digest), `src/durable.rs` (`poll_mail_digests` deleted as producer; drain + write-liveness), `src/main.rs` (`helm`, `doorbell afk`, `crew control`, `snapshot`, `--fire-and-forget`), `src/send.rs`, `src/snapshot.rs` (new), `src/write_liveness.rs` (new), toron `crates/toron-core/src/mailbox/{receipts,send_tags}.rs` (degraded state, `bead=` tag), `integrations/peer-aware.md.tpl`, captain/steer harness deny lists (D13), `docs/learnings/` (tiering), beads close-gate shape **via the beads successor ADR** |
+| **Governs (on acceptance)** | `src/workspace.rs` (tick, Msg/Cmd, wake ack, worker state, one live Model), `src/doorbell*.rs` (re-ring ladder, digest), `src/durable.rs` (`poll_mail_digests` deleted as producer; drain + write-liveness), `src/main.rs` (`helm`, `doorbell afk`, `crew control`, `snapshot`, `--fire-and-forget`), `src/send.rs`, `src/snapshot.rs` (new), `src/write_liveness.rs` (new), toron `crates/toron-core/src/mailbox/{receipts,send_tags}.rs` (degraded state, `bead=` tag), `integrations/peer-aware.md.tpl`, captain/steer harness deny lists (D13), chiebukuro (learning tiering), beads close-gate shape **via the beads successor ADR** |
 | **Verification** | per-wave gates `verify-0010{a0,a,b,c,d}.sh` authored + all green 2026-09-11 (§13); behavioral fixtures pinned in cargo tests |
 
 ---
@@ -519,7 +519,7 @@ promotion link shows in `br show`; diff beads unaffected.
 
 #### D12 — Tiered learnings decay + bounded grounding projection
 
-**What changes.** `docs/learnings/` frontmatter gains `tier: pinned | aging |
+**What changes.** chiebukuro learning frontmatter gains `tier: pinned | aging |
 perishable` and `reinforced: YYYY-MM-DD`. `ce-compound`/`ce-sweep` maintain
 them: reinforce on re-verification, archive (don't delete) on staleness —
 `aging` 30d, `perishable` 7d and must name a checkable expiry. GATE grounding
@@ -527,7 +527,7 @@ read becomes a bounded projection: top-N by reinforcement recency within
 `FLYWHEEL_GATE_BUDGET` (default ~4k tokens), computed by frontmatter, `rg`-able,
 no vector store (ADR-0009 non-goal preserved).
 
-**Files.** `docs/learnings/` (ce-sweep migration), GATE projection, ce-sweep rules.
+**Files.** chiebukuro (ce-sweep migration), GATE projection, ce-sweep rules.
 
 **Acceptance.** GATE output size bounded under budget with 50 seeded learnings;
 un-reinforced 40d-old aging entry absent from projection, present in corpus.

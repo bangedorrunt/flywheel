@@ -74,7 +74,7 @@ pub fn gate(ready: &[ReadyBead], inprogress: &[ReadyBead], label: &str) -> Resul
 
 impl Gate {
     /// The binding artifact DISPATCH reads. `learnings` is the bounded GATE
-    /// grounding read (ADR-0010 D12): the projected docs/learnings paths the
+    /// grounding read (ADR-0010 D12): the projected chiebukuro paths the
     /// wave carries as constraints. Absent when the corpus projects nothing.
     pub fn artifact(&self, label: &str, learnings: &[String]) -> Value {
         let mut artifact = json!({
@@ -113,10 +113,7 @@ pub(crate) fn cmd(cfg: &crate::config::Config, project: &str, label: &str) -> an
     let ready = crate::load_ready_beads(cfg, project)?;
     let inprogress = crate::load_inprogress_beads(cfg, project)?;
     let decided = gate(&ready, &inprogress, label).map_err(anyhow::Error::msg)?;
-    let projected = learnings(
-        "docs/learnings",
-        crate::cmd::internal::default_gate_budget(),
-    );
+    let projected = learnings("chiebukuro", crate::cmd::internal::default_gate_budget());
     let artifact = decided.artifact(label, &projected);
     let path = crate::project_state::wave_dir(&crate::project_dir(cfg, project))
         .join(format!("{label}-ready.json"));
@@ -204,9 +201,9 @@ mod tests {
             empty.get("learnings").is_none(),
             "no projection = no key, not an empty list: {empty}"
         );
-        let paths = vec!["docs/learnings/inbox/x.md".to_string()];
+        let paths = vec!["chiebukuro/inbox/x.md".to_string()];
         let artifact = g.artifact("wave-2", &paths);
-        assert_eq!(artifact["learnings"][0], "docs/learnings/inbox/x.md");
+        assert_eq!(artifact["learnings"][0], "chiebukuro/inbox/x.md");
     }
 
     /// Only this wave's rows are dispatchable.

@@ -13,7 +13,6 @@ const STAGES: &str = include_str!("../src/stages.rs");
 /// projection's *caller* is this file, not the retired wave-gate prompt.
 const WAVE_GATE: &str = include_str!("../src/cmd/wave_gate.rs");
 const WORKFLOWS: &str = include_str!("../src/builtin_workflows.rs");
-const README: &str = include_str!("../docs/learnings/README.md");
 
 #[test]
 fn adr0010_d12_projection_pure_layer_present() {
@@ -68,20 +67,24 @@ fn adr0010_d12_gate_stage_uses_the_bounded_projection() {
 }
 
 #[test]
-fn adr0010_d12_ce_sweep_backfills_and_archives() {
-    for needle in ["tier: aging", "reinforced:", "archive", "expires:"] {
+fn adr0010_d12_ce_sweep_promotes_and_forgets() {
+    for needle in ["chie memory promote", "chie memory forget", "reinforced:"] {
         assert!(
             WORKFLOWS.contains(needle),
-            "ce-sweep rules missing {needle} (builtin_workflows.rs)"
+            "ce-sweep must maintain chie records ({needle} in builtin_workflows.rs)"
         );
     }
 }
 
 #[test]
-fn adr0010_d12_ce_compound_stamps_tier_and_reinforced() {
+fn adr0010_d12_ce_compound_stamps_reinforced() {
     assert!(
-        WORKFLOWS.contains("reinforced"),
+        STAGES.contains("reinforced: <today>"),
         "ce-compound must stamp reinforced on capture/update"
+    );
+    assert!(
+        WORKFLOWS.contains("record-lesson"),
+        "ce-compound must write with record-lesson"
     );
 }
 
@@ -100,11 +103,11 @@ fn bd_21og_ce_compound_depth_lightweight_or_full_default_full() {
 }
 
 #[test]
-fn adr0010_d12_readme_documents_the_frontmatter() {
+fn adr0010_d12_tier_vocabulary_is_defined_in_the_projection() {
     for needle in ["tier:", "reinforced:", "pinned", "aging", "perishable"] {
         assert!(
-            README.contains(needle),
-            "docs/learnings/README.md missing {needle}"
+            STAGES.contains(needle),
+            "learning tier vocabulary missing {needle} in src/stages.rs"
         );
     }
 }

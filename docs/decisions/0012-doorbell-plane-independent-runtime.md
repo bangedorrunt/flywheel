@@ -327,7 +327,7 @@ Drivers: `separate-before-serializing-shared-state` (cut at `from_doorbell`/`fro
 
 ### Phase 4 — behavior extensions, each behind a config flag, each with its own acceptance
 
-`arrival_triple` (E1/E2 roster semantics), `beads_poller` (E17), `cron_doorbell_sink`, `emit` endpoint + service identities, cross-workspace scopes (`(workspace, corr)` journal keys already v2-ready), wake analytics → `docs/learnings/` via the ce-compound gate (§10.12). Default-off flags keep "no observable change until opted in" true all the way through the migration — the fix for rev 1's D4-vs-Phase-1 contradiction.
+`arrival_triple` (E1/E2 roster semantics), `beads_poller` (E17), `cron_doorbell_sink`, `emit` endpoint + service identities, cross-workspace scopes (`(workspace, corr)` journal keys already v2-ready), wake analytics → chiebukuro via the ce-compound gate (§10.12). Default-off flags keep "no observable change until opted in" true all the way through the migration — the fix for rev 1's D4-vs-Phase-1 contradiction.
 
 ---
 

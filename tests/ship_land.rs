@@ -59,9 +59,12 @@ if cmd == "show":
     status = "open"
     if os.path.exists(os.path.join(state, "status")):
         status = open(os.path.join(state, "status"), encoding="utf-8").read().strip()
+    itype = "bug"
+    if os.path.exists(os.path.join(state, "issue_type")):
+        itype = open(os.path.join(state, "issue_type"), encoding="utf-8").read().strip()
     print(json.dumps({
         "id": bead, "title": "fixture bead", "priority": 1, "status": status,
-        "verify": "cargo test -p demo", "blast": "Normal", "ac_shape": "Checkable",
+        "issue_type": itype, "verify": "cargo test -p demo", "blast": "Normal", "ac_shape": "Checkable",
     }))
 elif cmd == "gate" and argv[1] == "list":
     print(json.dumps({"history": gates()}))
@@ -411,6 +414,42 @@ fn land_refuses_a_sha_that_does_not_cite_the_bead() {
         String::from_utf8_lossy(&out.stderr).contains("does not cite"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// bd-t5f0v: a bug bead's confirmed root cause is a lesson candidate. The nudge
+/// is advisory — the land still exits 0 with no answer.
+#[test]
+fn landing_a_bug_bead_prints_an_advisory_lesson_prompt() {
+    let f = fixture();
+    let out = f.land(&[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("lesson recorded or clean skip?"),
+        "a bug land must nudge a lesson, without blocking: {stdout}"
+    );
+}
+
+/// A non-bug bead gets no nudge — the prompt is not noise on every land.
+#[test]
+fn landing_a_non_bug_bead_prints_no_lesson_prompt() {
+    let f = fixture();
+    std::fs::write(f.state.join("issue_type"), "feature").expect("issue type");
+    let out = f.land(&[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("lesson recorded or clean skip?"),
+        "a feature land must stay quiet: {stdout}"
     );
 }
 

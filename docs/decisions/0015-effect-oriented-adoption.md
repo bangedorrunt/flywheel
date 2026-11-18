@@ -83,7 +83,7 @@ Met 2026-09-19: full bin green (1874 + 1885 runs), clippy gates green, P1–P7 +
 ## 8. Sources
 
 - `~/.agents/skills/effect-oriented/{SKILL.md,references/*.md}`
-- bd-f7oz findings (channel test-channel 9 chunks) + docs/learnings/effect-audit-flywheel-bd-f7oz.md
+- bd-f7oz findings (channel test-channel 9 chunks) + chiebukuro page `effect-audit-flywheel-bd-f7oz`
 - bd-ao2n findings (channel test-channel 7 chunks)
 
 ---

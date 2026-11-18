@@ -839,6 +839,15 @@ fn receipt_is_landable(root: &Path, receipt: &Path, sha: &str) -> Result<()> {
     Ok(())
 }
 
+/// bd-t5f0v: the post-landing nudge. Advisory only — an unanswered prompt is a
+/// clean skip, never a failed land or a blocked brief close.
+pub(crate) fn lesson_advisory(bead: &str) -> String {
+    format!(
+        "lesson recorded or clean skip? If a root cause was confirmed, record-lesson one \
+         \"X breaks when Y; do Z\" line now ({bead}); a clean skip is a valid answer"
+    )
+}
+
 fn ship_land(args: LandArgs<'_>) -> Result<()> {
     let LandArgs {
         cfg,
@@ -1014,6 +1023,21 @@ fn ship_land(args: LandArgs<'_>) -> Result<()> {
         }));
     } else {
         println!("ship land: {bead} landed at {sha}");
+        // bd-t5f0v: a bug bead's confirmed root cause is a lesson candidate.
+        // The prompt is advisory — no answer, no gate, no failure.
+        let shown = run_tool(&dir, "br", &["show", bead, "--json"]).unwrap_or_default();
+        let is_bug = serde_json::from_str::<Value>(&shown)
+            .ok()
+            .and_then(|v| {
+                v.get("issue_type")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .as_deref()
+            == Some("bug");
+        if is_bug {
+            println!("ship land: {}", lesson_advisory(bead));
+        }
     }
     Ok(())
 }

@@ -1,23 +1,21 @@
-// governed-by: bd-iqte — Chiebukuro compound wiring with auto-promote inbox.
-//! ce-compound read lanes (rg+qmd+recall, labeled, offline-safe) + memory
-//! record on write + auto-promote to docs/learnings/inbox/ as
-//! tier-perishable with provenance; ce-sweep reinforces or archives. Human
-//! gate moves write-time to sweep-time per operator decision.
+// governed-by: bd-t5f0v — continual learning on every path; chiebukuro is the ONLY store.
+//! ce-compound read lanes (chie qmd + recall + check-trap, labeled, offline-safe)
+//! + `record-lesson` on write; no repo-side corpus, inbox, or perishable file.
+//!
 //! Test names: ce_compound_* — filtered by `mbx test ce_compound`.
 
 const STAGES: &str = include_str!("../src/stages.rs");
 const WORKFLOWS: &str = include_str!("../src/builtin_workflows.rs");
-const INBOX_README: &str = include_str!("../docs/learnings/inbox/README.md");
 
 #[test]
 fn ce_compound_read_lanes_labeled_offline_safe() {
     for needle in [
-        "rg -il",
         "chie qmd search",
         "chie memory recall",
-        "corpus",
+        "flywheel memory check-trap",
         "wiki",
         "memory",
+        "traps",
     ] {
         assert!(
             STAGES.contains(needle),
@@ -27,42 +25,38 @@ fn ce_compound_read_lanes_labeled_offline_safe() {
 }
 
 #[test]
-fn ce_compound_memory_record_on_write() {
+fn ce_compound_record_lesson_on_write() {
     assert!(
-        STAGES.contains("chie memory record"),
-        "compound must memory-record on write (src/stages.rs)"
+        STAGES.contains("record-lesson"),
+        "compound must write with record-lesson (src/stages.rs)"
+    );
+    assert!(
+        WORKFLOWS.contains("record-lesson"),
+        "the standalone ce-compound workflow must write with record-lesson"
     );
 }
 
 #[test]
-fn ce_compound_auto_promote_inbox_perishable_with_provenance() {
-    for needle in [
-        "docs/learnings/inbox/",
-        "tier: perishable",
-        "expires:",
-        "provenance",
-    ] {
-        assert!(
-            STAGES.contains(needle) || WORKFLOWS.contains(needle),
-            "auto-promote inbox missing {needle:?}"
-        );
+fn ce_compound_has_no_repo_side_corpus_or_inbox() {
+    let retired_path = ["docs/", "learnings"].concat();
+    for text in [STAGES, WORKFLOWS] {
+        for needle in [retired_path.as_str(), "inbox/", "tier: perishable"] {
+            assert!(
+                !text.contains(needle),
+                "the learning store is chiebukuro only; found {needle:?}"
+            );
+        }
     }
-    assert!(
-        INBOX_README.contains("perishable") && INBOX_README.contains("provenance"),
-        "inbox README must state the perishable+provenance contract"
-    );
 }
 
 #[test]
-fn ce_compound_human_gate_at_sweep_not_write() {
+fn ce_compound_sweep_maintenance_is_chie_promote_forget() {
     assert!(
-        STAGES.contains("sweep"),
-        "compound must defer human review to sweep (src/stages.rs)"
+        STAGES.contains("chie memory promote") && STAGES.contains("chie memory forget"),
+        "sweep maintenance must be chie promote/forget (src/stages.rs)"
     );
-    for needle in ["ce-sweep", "inbox"] {
-        assert!(
-            WORKFLOWS.contains(needle),
-            "sweep must triage the inbox ({needle:?} in builtin_workflows.rs)"
-        );
-    }
+    assert!(
+        WORKFLOWS.contains("chie memory promote") && WORKFLOWS.contains("chie memory forget"),
+        "the ce-sweep workflow must maintain chie records"
+    );
 }

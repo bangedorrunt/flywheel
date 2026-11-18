@@ -439,19 +439,19 @@ mbx +nightly-aarch64-apple-darwin test adr0010_d10
         "wave": 2,
         "priority": 2,
         "verify": f"{VERIFY_BIN} adr0010_d12",
-        "principle": "guard-the-context-window — GATE is a budgeted projection of docs/learnings, not the corpus",
+        "principle": "guard-the-context-window — GATE is a budgeted projection of chiebukuro, not the whole store",
         "desc": desc(
             """
 Governed-by: ADR-0010 D12. No vector store (ADR-0009 non-goal).
 
-SCOPE: docs/learnings/ frontmatter gains tier: pinned|aging|perishable and reinforced: YYYY-MM-DD. ce-compound/ce-sweep: reinforce on re-verification, archive (don't delete) — aging 30d, perishable 7d and must name a checkable expiry. GATE grounding read is top-N by reinforcement recency within FLYWHEEL_GATE_BUDGET (~4k tokens), frontmatter + rg. Migration: ce-sweep backfills tier: aging + reinforced: today so GATE does not empty on day one.
+SCOPE: chiebukuro learning frontmatter gains tier: pinned|aging|perishable and reinforced: YYYY-MM-DD. ce-compound/ce-sweep: reinforce on re-verification, archive (don't delete) — aging 30d, perishable 7d and must name a checkable expiry. GATE grounding read is top-N by reinforcement recency within FLYWHEEL_GATE_BUDGET (~4k tokens), frontmatter + rg. Migration: ce-sweep backfills tier: aging + reinforced: today so GATE does not empty on day one.
 
-FILES: docs/learnings/ (ce-sweep), GATE projection in src/stages.rs, ce-sweep rules.
+FILES: chiebukuro (ce-sweep), GATE projection in src/stages.rs, ce-sweep rules.
 
 AC: GATE output bounded under budget with 50 seeded learnings; un-reinforced 40d aging entry absent from projection, present in corpus.
 
 ## PRINCIPLES
-guard-the-context-window — GATE is a budgeted projection of docs/learnings, not the corpus
+guard-the-context-window — GATE is a budgeted projection of chiebukuro, not the whole store
 encode-lessons-in-structure — decay is frontmatter, not a prompt
 
 ## VERIFY

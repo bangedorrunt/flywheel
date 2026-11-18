@@ -754,7 +754,7 @@ struct Cli {
 enum Commands {
     /// Scaffold a project (ensure dir + .beads + the project-scope compound
     /// spine: .flywheel/stages.toml, .flywheel/standing-orders.md,
-    /// docs/learnings/) without spawning
+    /// chiebukuro as the learning store) without spawning
     Init { project: String },
     /// Spawn a swarm (escape hatch). Default multi-lane is
     /// `workflow compose --parts wave-swarm --run`.
@@ -2073,16 +2073,16 @@ enum Commands {
         #[arg(long)]
         role: Option<String>,
     },
-    /// internal: ADR-0010 D12 bounded GATE grounding read. Scans
-    /// docs/learnings/ (tier + reinforced frontmatter), projects the top-N
+    /// internal: ADR-0010 D12 bounded GATE grounding read. Reads the
+    /// chiebukuro learning store, projecting the top-N
     /// entries by reinforcement recency within the token budget (pinned
     /// never decays; aging 30d, perishable 7d unreinforced decays OUT).
     /// The wave-gate stage calls this INSTEAD of a bare corpus rg. Prints
     /// {budget, projected: [{path, tier, reinforced, cost_tokens}]}.
     #[command(name = "__gate-learnings", hide = true)]
     __GateLearnings {
-        /// learnings corpus root (default docs/learnings)
-        #[arg(long, default_value = "docs/learnings")]
+        /// legacy projection root (chiebukuro is the single learning store)
+        #[arg(long, default_value = "chiebukuro")]
         root: String,
         /// token budget (default FLYWHEEL_GATE_BUDGET ~4k, or
         /// FLYWHEEL_GATE_BUDGET env)
@@ -20294,7 +20294,7 @@ mod integration_tests {
                 .description
                 .as_deref()
                 .unwrap()
-                .contains("docs/learnings")
+                .contains("chiebukuro")
         );
     }
 

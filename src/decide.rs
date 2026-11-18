@@ -377,7 +377,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         topology: "swarm",
         gate: RouteGate::Always,
         argv: RouteArgv::WorkflowRun { mode: "pane" },
-        reason: "ce-compound — run the compound gate over verified work (docs/learnings/)",
+        reason: "ce-compound — run the compound gate over verified work (chiebukuro)",
     },
     RouteEntry {
         primitive: "ce-sweep",
@@ -385,7 +385,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         topology: "swarm",
         gate: RouteGate::Always,
         argv: RouteArgv::WorkflowRun { mode: "pane" },
-        reason: "ce-sweep — maintain docs/learnings/ (keep/update/consolidate/delete)",
+        reason: "ce-sweep — maintain chiebukuro lessons (keep/update/consolidate/forget)",
     },
     RouteEntry {
         primitive: "awareness-digest",

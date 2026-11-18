@@ -170,12 +170,11 @@ $CARGO test -p doorbell-rt --lib clock_ 2>&1 | tail -n 2
 pass "clock-jump: order intact, no grant on a backward step, deadlines re-stabilize"
 
 echo "== ADR-0012 Phase 4 analytics (bd-asr2.19) =="
-ART="$ROOT/docs/learnings/doorbell/wake-analytics-2026-09-10.md"
-[ -f "$ART" ] || fail "wake analytics artifact missing"
-grep -q "^track: knowledge" "$ART" || fail "artifact frontmatter track missing"
-grep -q "^reinforced: " "$ART" || fail "artifact reinforcement field missing"
-grep -q "502" "$ART" || fail "artifact has no ring/drop counters"
-pass "wake analytics artifact (frontmatter + reinforcement + counters)"
+ART="$(chie memory recall 'wake analytics' 2>/dev/null)" || fail "wake analytics lesson missing in chiebukuro"
+grep -q "track: knowledge" <<<"$ART" || fail "lesson track missing"
+grep -q "reinforced: " <<<"$ART" || fail "lesson reinforcement field missing"
+grep -q "502" <<<"$ART" || fail "lesson has no ring/drop counters"
+pass "wake analytics lesson (track + reinforcement + counters)"
 
 if [ "$FAIL" -eq 0 ]; then echo "RESULT: PASS"; else echo "RESULT: FAIL"; fi
 exit "$FAIL"

@@ -148,6 +148,6 @@ Ladder: `stage new`, `stage lint`, `stage promote`; `workflow new`, `workflow li
 
 Cron: `flywheel cron lint` then `flywheel daemon start` supervises recurring ticks (`dev.flywheel.cron` runs the `cron start` host loop; `cron start` alone is the foreground form). `cron run <name>` is a 25-second dry-run by default; `--live` force-fires once through the durable-loop runner. Cron YAML authoring mirrors workflow YAML; `ElmCron` ticks off the registry.
 
-After verified work, capture the learning once: `flywheel workflow run ce-compound --execute --inputs '{"source":"<what>"}'`. It files learnings into `docs/learnings/`, which chiebukuro indexes.
+After verified work, capture the learning once: `flywheel workflow run ce-compound --execute --inputs '{"source":"<what>"}'`. It files learnings into chiebukuro, the single learning store.
 
 Binary freshness: compose tokens, new stages, and new flags resolve from the installed binary. After landing workflow-surface changes, rebuild (`mbx +nightly-aarch64-apple-darwin install --path . --force`) and verify from a non-repo cwd.

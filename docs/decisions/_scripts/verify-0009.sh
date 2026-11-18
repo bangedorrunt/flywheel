@@ -17,7 +17,7 @@ ck "wave verify carries residual gate"      "rg -q 'RESIDUAL GATE' src/stages.rs
 ck "wave-swarm token is 8 steps"            "test \"\$(rg -c '  - name: (gate|dispatch|execute|observe|review|verify|compound|signoff)\$' src/builtin_workflows.rs)\" -ge 8"
 ck "ce-compound workflow exists"            "rg -q '\"ce-compound\"' src/builtin_workflows.rs"
 ck "ce-sweep workflow exists"               "rg -q '\"ce-sweep\"' src/builtin_workflows.rs"
-ck "learnings corpus seeded"                "test -f docs/learnings/README.md && test -f docs/learnings/orchestration/crew-done-claims-are-marketing.md"
+ck "learning store is chiebukuro"           "command -v chie >/dev/null 2>&1"
 ck "toron phase enum carries compound"      "rg -q 'Compound' ../toron/crates/toron-workflow/src/schema.rs"
 ck "robot capabilities name ce- stages"     "rg -q '\"ce-compound\"' src/main.rs"
 
