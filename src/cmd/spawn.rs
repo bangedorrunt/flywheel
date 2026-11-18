@@ -1797,8 +1797,11 @@ projects available: {}",
             .filter(|a| live_ids.contains(a.workspace_id.as_str()))
             .cloned()
             .collect();
-        let live_panes: std::collections::HashSet<String> = c
-            .pane_list()
+        // The ACTIVE plane is the truth for pane liveness: a closed rex pane
+        // can linger in the hc client's list and look like a live fleet.
+        let live_panes: std::collections::HashSet<String> = backend::multiplexer_backend(cfg)
+            .ok()
+            .and_then(|b| b.pane_list(None).ok())
             .map(|panes| panes.into_iter().map(|p| p.pane_id).collect())
             .unwrap_or_default();
         match crate::classify_spawn_workspace(&orphans, &live_agents, &live_panes) {
@@ -4700,6 +4703,20 @@ mod workspace_origin_tests {
             classify_spawn_workspace(&owned, &agents, &live),
             SpawnWorkspace::Join,
             "the same label with a live pane is still the fleet to join"
+        );
+    }
+
+    /// The multiplexer's own shell is not a crew pin: a shell-only workspace
+    /// with a live shell pane still takes the Add path (bd-89q4r).
+    #[test]
+    fn shell_only_workspace_classifies_as_add_with_a_live_pane() {
+        let owned = vec![ws("w-shell", "flywheel-demo", 1)];
+        let shell = agent("shell", "w-shell");
+        let live = std::collections::HashSet::from(["w-shell:p1".to_string()]);
+        assert_eq!(
+            classify_spawn_workspace(&owned, &[shell], &live),
+            SpawnWorkspace::Add { index: 0 },
+            "the shell is not the fleet"
         );
     }
 

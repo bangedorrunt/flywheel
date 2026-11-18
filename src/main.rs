@@ -4813,10 +4813,17 @@ pub(crate) fn classify_spawn_workspace(
     if owned.is_empty() {
         return SpawnWorkspace::Fresh;
     }
+    // The multiplexer's own shell lives in the workspace too; it is not a
+    // crew pin and must not make an otherwise empty workspace look occupied.
+    let is_crew = |a: &hc::AgentInfo| {
+        a.name
+            .as_deref()
+            .is_some_and(|n| !n.is_empty() && n != "shell")
+    };
     let hosts_agent = |ws: &hc::WorkspaceInfo| {
-        agents
-            .iter()
-            .any(|a| a.workspace_id == ws.workspace_id && live_panes.contains(&a.pane_id))
+        agents.iter().any(|a| {
+            a.workspace_id == ws.workspace_id && is_crew(a) && live_panes.contains(&a.pane_id)
+        })
     };
     if owned.iter().any(hosts_agent) {
         return SpawnWorkspace::Join;
