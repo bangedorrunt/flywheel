@@ -41,10 +41,12 @@ done
 die() { printf 'e2e-live-five: %s\n' "$*" >&2; exit 2; }
 
 STAMP="$(date +%Y%m%dT%H%M%SZ)"
-SESSION="${FLYWHEEL_LIVE_SESSION:-flywheel-live-$STAMP-$$}"
+PROJECT="${FLYWHEEL_LIVE_PROJECT:-e2e-live-five}"
+# bd-oo7zi: crew prompt resolves the pane by OWNED workspace label - the
+# session must start with flywheel-<project>- or it answers "no flywheel swarm".
+SESSION="${FLYWHEEL_LIVE_SESSION:-flywheel-$PROJECT-$STAMP-$$}"
 BLOCK="${FLYWHEEL_LIVE_BLOCK:-live-five}"
 PIN="${FLYWHEEL_LIVE_PIN:-AmberProbe}"
-PROJECT="${FLYWHEEL_LIVE_PROJECT:-e2e-live-five}"
 AS="${FLYWHEEL_LIVE_AS:-$PIN}"
 RECEIPT="${E2E_LIVE_FIVE_RECEIPT:-/tmp/e2e-live-five-$STAMP.json}"
 

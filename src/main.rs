@@ -22056,3 +22056,34 @@ mod robot_capabilities_text {
         }
     }
 }
+
+#[cfg(test)]
+mod e2e_live_label_tests {
+    /// bd-oo7zi: the throwaway session label must be OWNED by the e2e project,
+    /// or crew prompt refuses the pane with "no flywheel swarm" before the
+    /// wake is even attempted (live proof53, line 111). Non-live witness:
+    /// parse the script's default and feed it to flywheel's own ownership rule.
+    #[test]
+    fn the_live_five_default_session_is_owned_by_its_project() {
+        let script = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/scripts/e2e-live-five.sh"
+        ));
+        let project_marker = "FLYWHEEL_LIVE_PROJECT:-";
+        let p = script.find(project_marker).expect("project default") + project_marker.len();
+        let project: String = script[p..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        let session_marker = "FLYWHEEL_LIVE_SESSION:-flywheel-$PROJECT-";
+        assert!(
+            script.contains(session_marker),
+            "the session default must be owned by the project, got: {session_marker}"
+        );
+        let owned = format!("{}-20260101T000000Z-1", super::swarm_label(&project));
+        assert!(
+            super::workspace_label_is_owned(&project, &owned, None),
+            "flywheel must resolve a session it owns: {owned}"
+        );
+    }
+}
