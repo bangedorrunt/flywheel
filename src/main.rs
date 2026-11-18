@@ -12252,20 +12252,13 @@ fn probe_agent_liveness(
     kind: &str,
     name: &str,
 ) -> Option<bool> {
-    // bd-1hkt0: the plane that owns the pane owns liveness. The hc backend
-    // keeps its byte-identical process fold; rex reads the block's foreground
-    // program. A backend that cannot tell returns None — never a confident
-    // "healthy" from some other plane's socket.
-    match backend.agent_alive(pane_id, kind) {
-        Some(alive) => Some(alive),
-        None => {
-            eprintln!(
-                "flywheel: liveness probe for {name} inconclusive on {}",
-                backend.name()
-            );
-            None
-        }
-    }
+    backend.agent_alive(pane_id, kind).or_else(|| {
+        eprintln!(
+            "flywheel: liveness probe for {name} inconclusive on {}",
+            backend.name()
+        );
+        None
+    })
 }
 
 #[cfg(test)]

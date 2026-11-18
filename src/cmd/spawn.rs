@@ -1701,7 +1701,6 @@ projects available: {}",
         );
     }
     let all_agents = c.agent_list()?;
-    // bd-1hkt0: liveness comes from the active plane, not the hc socket.
     let plane_backend = backend::multiplexer_backend(cfg)?;
     let mut dead_owned: Vec<hc::WorkspaceInfo> = Vec::new();
     let mut live_owned: Vec<hc::WorkspaceInfo> = Vec::new();
