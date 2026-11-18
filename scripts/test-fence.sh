@@ -17,11 +17,12 @@ git -C "$REPO" init -q
 git -C "$REPO" config user.email test@test
 git -C "$REPO" config user.name test
 
-# Stub the two script steps: real ones need the real tree.
+# Stub the script steps: real ones need the real tree.
 printf '#!/usr/bin/env bash\nexit 0\n' >"$REPO/scripts/verify-needles.sh"
 printf '#!/usr/bin/env bash\nexit 0\n' >"$REPO/scripts/verify-clippy.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$REPO/scripts/verify-coverage.sh"
 printf 'fn main() {}\n' >"$REPO/main.rs"
-chmod +x "$REPO/scripts/verify-needles.sh" "$REPO/scripts/verify-clippy.sh"
+chmod +x "$REPO/scripts/verify-needles.sh" "$REPO/scripts/verify-clippy.sh" "$REPO/scripts/verify-coverage.sh"
 
 # bd-gmrxv: a pinned sibling, so the fence's sibling step has something to read.
 SIB="$TMP/sib"
@@ -137,5 +138,44 @@ if FENCE_CARGO="$TMP/bin/cargo" bash "$ROOT/scripts/fence.sh" --repo "$REPO" --s
   fail "a committed dead fn must fail the fence"
 fi
 pass "a dead fn in the commit fails the fence"
+
+git -C "$REPO" rm -q --cached dead.rs
+rm -f "$REPO/dead.rs"
+
+# bd-op4zk: a ledger row citing a mutation the spec no longer declares must die
+# at commit time, not 14 minutes into a proof. The stub models verify-coverage's
+# ledger-ref leg; the point of this witness is that the FENCE runs that leg.
+cat >"$REPO/scripts/verify-coverage.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if grep -q 'spec.sh#DEAD' docs/verification/behaviors.toml 2>/dev/null; then
+  echo "verify-coverage: bad-row: mutation not declared: scripts/mutations/adr0022-gates.spec.sh#DEAD" >&2
+  exit 1
+fi
+exit 0
+SH
+chmod +x "$REPO/scripts/verify-coverage.sh"
+mkdir -p "$REPO/docs/verification"
+printf '[[behavior]]\nid = "bad-row"\nmutations = ["scripts/mutations/adr0022-gates.spec.sh#DEAD"]\n' >"$REPO/docs/verification/behaviors.toml"
+git -C "$REPO" add -A
+git -C "$REPO" commit -qm "dead ledger row bd-op4zk"
+BADLEDGER="$(git -C "$REPO" rev-parse HEAD)"
+out="$(FENCE_CARGO="$TMP/bin/cargo" bash "$ROOT/scripts/fence.sh" --repo "$REPO" --sha "$BADLEDGER" 2>&1)" \
+  && fail "a committed dead ledger row must fail fence --sha"
+case "$out" in
+  *"not declared"*) ;;
+  *) fail "fence --sha must name the dead ledger row: $out" ;;
+esac
+pass "a committed dead ledger row fails fence --sha, naming the row"
+
+printf '[[behavior]]\nid = "staged-row"\nmutations = ["scripts/mutations/adr0022-gates.spec.sh#DEAD"]\n' >"$REPO/docs/verification/behaviors.toml"
+git -C "$REPO" add docs/verification/behaviors.toml scripts/verify-coverage.sh
+out="$(FENCE_CARGO="$TMP/bin/cargo" bash "$ROOT/scripts/fence.sh" --repo "$REPO" --index 2>&1)" \
+  && fail "a staged dead ledger row must fail fence --index"
+case "$out" in
+  *"not declared"*) ;;
+  *) fail "fence --index must name the dead ledger row: $out" ;;
+esac
+pass "a staged dead ledger row fails fence --index, naming the row"
 
 echo "ok"

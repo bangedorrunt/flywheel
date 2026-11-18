@@ -6,8 +6,8 @@
 #   scripts/fence.sh --index        # the STAGED index, as the pre-commit hook
 #
 # Steps, in the proof's order, stopping at the first failure:
-#   verify-needles · build -Dwarnings --all-targets · test --no-run ·
-#   verify-clippy
+#   verify-needles · verify-coverage · build -Dwarnings --all-targets ·
+#   test --no-run · verify-clippy
 # `--index` (bd-4z7mb) fences exactly what a commit would land: `git write-tree`
 # over the staging area, a throwaway commit off HEAD, then needles, the
 # -Dwarnings build and `rustfmt --check` on the staged .rs files. It is the
@@ -72,6 +72,10 @@ cd "$DEST"
 step() { printf 'fence: %s\n' "$1"; }
 step "needles"
 bash scripts/verify-needles.sh
+# bd-op4zk: a ledger row citing a mutation id the spec no longer declares used
+# to die 14 minutes into a proof. Coverage is sub-second; run it at commit time.
+step "coverage ledger"
+bash scripts/verify-coverage.sh
 if [ "$INDEX" = 1 ]; then
     # bd-4z7mb: the commit gate. Clippy runs the same type check as `cargo
     # check` plus the lints, so a clippy-only regression cannot slip past it
