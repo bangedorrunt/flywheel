@@ -1077,7 +1077,7 @@ tests = [
   "src/cmd/spawn.rs::plan_gate_blocked_with_yes_asks_and_names_remedy",
 ]
 mutations = [
-  "scripts/mutations/adr0022-gates.spec.sh#D5",
+  "scripts/mutations/adr0022-gates.spec.sh#V3",
 ]
 
 [[behavior]]
