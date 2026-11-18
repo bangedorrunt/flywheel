@@ -927,12 +927,15 @@ fn cmd_crew_done(
         now_us: now_us(),
     });
     save_briefs(project, &book)?;
-    let reporter = r#as
-        .map(str::to_string)
-        .unwrap_or_else(|| brief.to_string());
+    // bd-9nck5: the mail fallback's sender is an IDENTITY, not a record id.
+    // The one ladder is --as → AGENT_NAME; when neither is bound, the brief's
+    // own pin is the last rung. A brief id has no mail key, so using it made
+    // the fallback fail after the pane wake had already failed.
+    let reporter = crate::authority::select_agent_identity(r#as, &|k| std::env::var(k).ok());
     let mut wake = "replay: the brief was already closed; nothing rang".to_string();
     for effect in &effects {
         let crate::crew_briefs::Effect::WakeCaptain { id, pin } = effect;
+        let reporter = reporter.clone().unwrap_or_else(|| pin.clone());
         let key = crate::project_dir_str(cfg, project)?;
         let Some(captain) = crate::state::captain_pin(project, &key) else {
             wake = "closed; no captain is bound for this project, so nothing rang".to_string();
@@ -1198,6 +1201,75 @@ mod bd_ezlme_tests {
         assert!(text.contains("heard nothing"), "{text}");
         assert!(text.contains("no agents match"), "{text}");
         assert!(text.contains("mail not configured"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod bd_9nck5_tests {
+    /// Drive the VERB, not done_reply_via_mail: the old unit test passed the
+    /// reporter in by hand and so could never see that the verb derived it
+    /// from the brief id. Here no --as is given, and the caller's identity is
+    /// varied only through the AGENT_NAME ladder rung.
+    fn fallback_sender(brief_pin: &str, agent: Option<&str>) -> String {
+        let cfg = crate::config::Config::default();
+        let mail = crate::mail::Mail::from_config(None)
+            .expect("mail facade")
+            .expect("in-process mailbox");
+        let project = format!("crew-sender-{brief_pin}");
+        mail.ensure_project(&project).expect("project");
+        let mut names = vec![brief_pin, "SlateHarbor", &mail.name];
+        if let Some(a) = agent {
+            names.push(a);
+        }
+        for name in names {
+            mail.register_fixture(&project, name, "test", "test", "bd-9nck5")
+                .expect("register");
+        }
+        crate::state::save_captain_alias(&project, "SlateHarbor").expect("captain alias");
+        let brief = super::open_brief(&project, brief_pin, "bd-9nck5 witness").expect("brief");
+
+        match agent {
+            Some(a) => unsafe { std::env::set_var("AGENT_NAME", a) },
+            None => unsafe { std::env::remove_var("AGENT_NAME") },
+        }
+        super::cmd_crew_done(&cfg, &project, &brief, "receipt-9nck5", None)
+            .expect("the done verb must mail the captain when no pane route exists");
+
+        let inbox = mail
+            .inbox(&project, "SlateHarbor", false, 10)
+            .expect("inbox");
+        let rows = crate::mail::inbox_json_rows(&inbox);
+        let subject = format!("[crew] {brief} done");
+        rows.as_array()
+            .and_then(|a| a.iter().find(|r| r["subject"].as_str() == Some(&subject)))
+            .and_then(|r| r["sender"].as_str())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[test]
+    fn the_done_fallback_sender_uses_the_identity_ladder() {
+        let _g = crate::config::lock_env();
+        let prev = std::env::var("AGENT_NAME").ok();
+
+        // No --as and no AGENT_NAME: the brief's own pin is the sender. The
+        // brief ID is a record id, not an identity, and has no mail key.
+        assert_eq!(
+            fallback_sender("BriefPinOne", None),
+            "BriefPinOne",
+            "the brief's pin must be the last rung, never the brief id"
+        );
+        // AGENT_NAME outranks the brief's pin.
+        assert_eq!(
+            fallback_sender("BriefPinTwo", Some("AmbientPin")),
+            "AmbientPin",
+            "AGENT_NAME must outrank the brief's pin"
+        );
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AGENT_NAME", v) },
+            None => unsafe { std::env::remove_var("AGENT_NAME") },
+        }
     }
 }
 
