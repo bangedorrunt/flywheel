@@ -237,6 +237,35 @@ impl Fixture {
         String::from_utf8_lossy(&out).trim().parse().expect("count")
     }
 
+    /// Commit a mutation spec declaring one id, and return the sha it proved.
+    fn commit_spec_declaring(&self, id: &str) -> String {
+        let rel = "scripts/mutations/adr0022-gates.spec.sh";
+        let body = format!(
+            "mutation \"{id}  a decision\" \\\n    file=src/x.rs \\\n    find='a' \\\n    replace='b' \\\n    expect=a_test\n"
+        );
+        std::fs::write(self.repo.join(rel), body).expect("spec");
+        assert!(sh(&self.repo, "git", &["add", rel]).status.success());
+        assert!(
+            sh(
+                &self.repo,
+                "git",
+                &["commit", "-qm", &format!("declare {id} bd-x")]
+            )
+            .status
+            .success()
+        );
+        String::from_utf8_lossy(&sh(&self.repo, "git", &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string()
+    }
+
+    fn write_mutation_receipt(&self, proved: &str, id: &str) {
+        let body = format!(
+            "{{\"ok\":true,\"sha\":\"{proved}\",\"mode\":\"sha\",\"mutations\":[{{\"spec\":\"adr0022-gates.spec.sh\",\"id\":\"{id}\",\"verdict\":\"RED\"}}]}}\n"
+        );
+        std::fs::write(self.state.join("receipt.json"), body).expect("receipt");
+    }
+
     fn released(&self) -> String {
         std::fs::read_to_string(self.state.join("released")).unwrap_or_default()
     }
@@ -382,5 +411,41 @@ fn land_refuses_a_sha_that_does_not_cite_the_bead() {
         String::from_utf8_lossy(&out.stderr).contains("does not cite"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// bd-pgzxn: a receipt witnesses the revision it proved. A later commit may
+/// relabel the mutation (D5 -> D5A/D5B in f34f9b54) without invalidating every
+/// in-flight receipt fleet-wide.
+#[test]
+fn a_receipt_is_checked_at_the_sha_it_proved_not_the_worktree() {
+    let f = fixture();
+    let proved = f.commit_spec_declaring("D5");
+    f.write_mutation_receipt(&proved, "D5");
+    // HEAD now declares only the relabelled id.
+    let _head = f.commit_spec_declaring("D5A");
+
+    let out = f.land_with(&proved, &[]);
+    assert!(
+        out.status.success(),
+        "a receipt citing an id present at its proved sha must still land:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The other half: a receipt citing an id absent even at the proved sha is
+/// still refused. Reading at the proved sha must not turn the check off.
+#[test]
+fn a_receipt_citing_an_id_absent_at_the_proved_sha_still_refuses() {
+    let f = fixture();
+    let proved = f.commit_spec_declaring("D5");
+    f.write_mutation_receipt(&proved, "D9");
+
+    let out = f.land_with(&proved, &[]);
+    assert!(!out.status.success(), "an undeclared id must still refuse");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no longer declares"),
+        "refusal still names the unbound citation: {stderr}"
     );
 }

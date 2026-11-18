@@ -824,9 +824,13 @@ fn receipt_is_landable(root: &Path, receipt: &Path, sha: &str) -> Result<()> {
         if spec == "ad-hoc" {
             continue;
         }
-        let path = root.join("scripts/mutations").join(spec);
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| anyhow!("proof receipt cites {spec}, which does not exist: {e}"))?;
+        // bd-pgzxn: the receipt witnesses the PROVEN revision, so the spec must
+        // be read there. A later relabel in the worktree cannot invalidate a
+        // receipt that legitimately cites the old id.
+        let at = format!("{proved}:scripts/mutations/{spec}");
+        let text = git(root, &["show", &at]).map_err(|e| {
+            anyhow!("proof receipt cites {spec}, which does not exist at {proved}: {e}")
+        })?;
         let needle = format!("mutation \"{id} ");
         if !text.contains(&needle) {
             bail!("proof receipt cites {spec}#{id}, which the spec no longer declares");
@@ -1149,7 +1153,6 @@ live-verified. Record one BEFORE closing."#;
     /// still resolves. A green proof with no witnesses is not a proof.
     #[test]
     fn a_receipt_without_mutation_witnesses_cannot_land() {
-        const SHA: &str = "c0000000000000000000000000000000000000000";
         let repo = tempfile::tempdir().expect("repo");
         std::fs::create_dir_all(repo.path().join("scripts/mutations")).unwrap();
         std::fs::write(
@@ -1157,6 +1160,30 @@ live-verified. Record one BEFORE closing."#;
             "mutation \"D1  a decision\" \\\n    file=src/x.rs \\\n    find='a' \\\n    replace='b' \\\n    expect=a_test\n",
         )
         .unwrap();
+        // The spec must exist at the sha the receipt proves (bd-pgzxn).
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .current_dir(repo.path())
+                .args(["-c", "user.email=t@example.com", "-c", "user.name=T"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(git(&["init", "-q"]));
+        assert!(git(&["add", "scripts/mutations/demo.spec.sh"]));
+        assert!(git(&["commit", "-qm", "declare D1"]));
+        let sha = String::from_utf8(
+            Command::new("git")
+                .current_dir(repo.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
         let receipt = |body: &str| {
             let path = repo.path().join("receipt.json");
             std::fs::write(&path, body).unwrap();
@@ -1169,7 +1196,7 @@ live-verified. Record one BEFORE closing."#;
         };
         let doc = |ok: bool, rows: &[String]| {
             format!(
-                r#"{{"schema":"flywheel-clean-proof.v1","ok":{ok},"failed_step":null,"sha":"{SHA}","mode":"sha","mutations_mode":null,"mutations_base":null,"changed_paths":[],"mutations":[{rows}]}}"#,
+                r#"{{"schema":"flywheel-clean-proof.v1","ok":{ok},"failed_step":null,"sha":"{sha}","mode":"sha","mutations_mode":null,"mutations_base":null,"changed_paths":[],"mutations":[{rows}]}}"#,
                 rows = rows.join(",")
             )
         };
@@ -1177,7 +1204,7 @@ live-verified. Record one BEFORE closing."#;
         let none = receipt(&doc(true, &[]));
         let err = format!(
             "{:#}",
-            receipt_is_landable(repo.path(), &none, SHA).unwrap_err()
+            receipt_is_landable(repo.path(), &none, &sha).unwrap_err()
         );
         assert!(
             err.contains("no mutation run"),
@@ -1185,18 +1212,18 @@ live-verified. Record one BEFORE closing."#;
         );
 
         let legacy = receipt(&format!(
-            r#"{{"ok":true,"sha":"{SHA}","mode":"sha","mutations":["src/x.rs:t:expect=RED:got=RED"]}}"#
+            r#"{{"ok":true,"sha":"{sha}","mode":"sha","mutations":["src/x.rs:t:expect=RED:got=RED"]}}"#
         ));
         let err = format!(
             "{:#}",
-            receipt_is_landable(repo.path(), &legacy, SHA).unwrap_err()
+            receipt_is_landable(repo.path(), &legacy, &sha).unwrap_err()
         );
         assert!(err.contains("legacy mutation row"), "{err}");
 
         let red_is_green = receipt(&doc(true, &[row("demo.spec.sh", "D1", "GREEN", false)]));
         let err = format!(
             "{:#}",
-            receipt_is_landable(repo.path(), &red_is_green, SHA).unwrap_err()
+            receipt_is_landable(repo.path(), &red_is_green, &sha).unwrap_err()
         );
         assert!(
             err.contains("proved GREEN, expected RED"),
@@ -1206,7 +1233,7 @@ live-verified. Record one BEFORE closing."#;
         let dangling = receipt(&doc(true, &[row("demo.spec.sh", "D9", "RED", false)]));
         let err = format!(
             "{:#}",
-            receipt_is_landable(repo.path(), &dangling, SHA).unwrap_err()
+            receipt_is_landable(repo.path(), &dangling, &sha).unwrap_err()
         );
         assert!(
             err.contains("no longer declares"),
@@ -1216,19 +1243,19 @@ live-verified. Record one BEFORE closing."#;
         let not_green = receipt(&doc(false, &[row("demo.spec.sh", "D1", "RED", false)]));
         let err = format!(
             "{:#}",
-            receipt_is_landable(repo.path(), &not_green, SHA).unwrap_err()
+            receipt_is_landable(repo.path(), &not_green, &sha).unwrap_err()
         );
         assert!(err.contains("not green"), "{err}");
 
         let good = receipt(&doc(true, &[row("demo.spec.sh", "D1", "RED", false)]));
-        receipt_is_landable(repo.path(), &good, SHA).expect("a proving receipt lands");
+        receipt_is_landable(repo.path(), &good, &sha).expect("a proving receipt lands");
 
         // A guard expected dead is the other way round and is not a failure.
         let dead = receipt(&doc(
             true,
             &[row("demo.spec.sh", "D1", "DEAD-CONFIRMED", true)],
         ));
-        receipt_is_landable(repo.path(), &dead, SHA).expect("a dead-guard witness lands");
+        receipt_is_landable(repo.path(), &dead, &sha).expect("a dead-guard witness lands");
     }
 
     /// bd-m5afp review (captain re-verify): the receipt must prove the commit
@@ -1417,6 +1444,14 @@ live-verified. Record one BEFORE closing."#;
             Command::new("git")
                 .current_dir(repo.path())
                 .args(["init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .current_dir(repo.path())
+                .args(["add", "scripts/mutations/demo.spec.sh"])
                 .status()
                 .unwrap()
                 .success()
