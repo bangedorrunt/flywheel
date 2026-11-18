@@ -212,7 +212,23 @@ pub fn check_trap_queries_strict(
             run_check_trap(&["--command", &clipped, "--json"], project_dir)?,
         );
     }
-    Ok(out.into_iter().take(20).collect())
+    // Both the trap guard and recall can surface the same lesson several
+    // times (re-records, derived conclusions). Canonicalize once at the edge.
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut rows = Vec::new();
+    for line in out {
+        let key: String = line
+            .trim()
+            .trim_start_matches("Rule: ")
+            .trim()
+            .chars()
+            .take(80)
+            .collect();
+        if seen.insert(key) {
+            rows.push(line);
+        }
+    }
+    Ok(rows.into_iter().take(20).collect())
 }
 
 fn merge_lines(out: &mut BTreeSet<String>, raw: Option<String>) {
@@ -304,13 +320,23 @@ fn lesson_recall(query: &str, project_dir: Option<&Path>) -> Result<Vec<String>>
     }
     let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
     let mut rows = Vec::new();
+    let mut seen = BTreeSet::new();
     for key in ["conclusions", "events"] {
         if let Some(arr) = doc.get(key).and_then(serde_json::Value::as_array) {
             for item in arr {
                 if let Some(content) = item.get("content").and_then(serde_json::Value::as_str)
                     && (content.contains("Rule:") || content.contains("Trap:"))
                 {
-                    rows.push(content.to_string());
+                    // Re-recorded lessons leave duplicate events; the preflight
+                    // view must show each lesson once (bd-ndbnv review point 4).
+                    let canon = content
+                        .trim()
+                        .trim_start_matches("Rule: ")
+                        .trim()
+                        .to_string();
+                    if seen.insert(canon) {
+                        rows.push(content.to_string());
+                    }
                 }
             }
         }

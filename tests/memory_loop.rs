@@ -199,6 +199,54 @@ fn migrated_lessons_are_check_trap_findable_by_natural_query() {
     }
 }
 
+/// Review point 4: repeated records leave duplicate events, but preflight must
+/// show each lesson once.
+#[test]
+fn recalled_lessons_are_deduplicated() {
+    let sandbox = TestSandbox::new();
+    let lesson = "a zebra marker breaks when a dedup probe runs; do keep one lesson";
+    // The live duplicates have different "Rule:" wrapper depths, not identical
+    // text, so the outer BTreeSet in check_trap_queries cannot dedupe them.
+    for content in [
+        lesson,
+        "Rule: a zebra marker breaks when a dedup probe runs; do keep one lesson",
+        "Rule: Rule: a zebra marker breaks when a dedup probe runs; do keep one lesson",
+    ] {
+        let recorded = run(
+            &sandbox,
+            &[
+                "memory",
+                "record-lesson",
+                content,
+                "--project",
+                "proj",
+                "--json",
+            ],
+        );
+        assert!(
+            text(&recorded).contains("\"recorded\": true"),
+            "recording failed: {}",
+            text(&recorded)
+        );
+    }
+    let found = run(
+        &sandbox,
+        &[
+            "memory",
+            "check-trap",
+            "dedup probe",
+            "--project",
+            "proj",
+            "--json",
+        ],
+    );
+    assert!(
+        text(&found).contains("\"count\": 1"),
+        "preflight must show one copy: {}",
+        text(&found)
+    );
+}
+
 /// `--project <slug>` and `--project <dir>` name the same chie scope.
 #[test]
 fn slug_and_directory_scopes_agree() {
