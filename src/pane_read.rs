@@ -4,7 +4,7 @@
 //! this trait so the guard is testable with a fake and so hc and rex answer the
 //! same question — the same shape as `pane_write::PaneTyper` on the write side.
 
-use crate::pane_screen::{InputLine, input_line_for};
+use crate::pane_screen::{InputLine, input_line_for, input_line_for_unknown_harness};
 
 /// Read a pane's current screen tail.
 pub trait PaneReader {
@@ -51,7 +51,16 @@ pub fn gate(
     last_typed: Option<&str>,
 ) -> Result<InputLine, String> {
     let tail = reader.tail(pane_id, 0)?;
-    Ok(input_line_for(harness, &tail, last_typed))
+    // bd-e4gal: a profileless spawn's registry row has no harness, so the
+    // guard gets "" and must not read that as "safe to inject". Classify the
+    // box structurally instead — an unrecognised harness is a DEFER, not a
+    // type, exactly like an unreadable pane.
+    let line = if harness.trim().is_empty() {
+        input_line_for_unknown_harness(&tail, last_typed)
+    } else {
+        input_line_for(harness, &tail, last_typed)
+    };
+    Ok(line)
 }
 
 /// The harness a registered pane runs, or empty (unknown) when the pane has no
@@ -164,6 +173,22 @@ mod tests {
             .expect_err("operator text must defer");
         assert!(err.starts_with("deferred: operator is typing in "), "{err}");
         assert!(err.contains("nothing was typed"), "{err}");
+    }
+
+    /// bd-e4gal: a profileless spawn's registry row has no harness, so the
+    /// guard is handed "". The real captured screen below holds the operator's
+    /// half-typed line inside an opencode box; treating Unknown as injectable
+    /// wrote a wake straight over it. The guard must defer without a harness.
+    #[test]
+    fn an_unknown_harness_defers_when_the_box_holds_operator_text() {
+        let screen = std::fs::read_to_string(format!(
+            "{}/tests/fixtures/pane-screens/opencode/multiline-operator-and-wake.txt",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("captured screen fixture");
+        let err = defer_if_operator_typing(&Fixed(Ok(screen)), "", "block:probe", "e4gal-probe")
+            .expect_err("an unknown harness over typed text must defer, not inject");
+        assert!(err.starts_with("deferred: "), "{err}");
     }
 
     /// bd-8wdgn: a box holding OUR OWN queued wake line is not operator typing.

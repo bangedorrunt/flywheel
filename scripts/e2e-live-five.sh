@@ -75,7 +75,8 @@ resolve_tool() {
 }
 
 REX_BIN="$(resolve_tool rex)" || die "rex not found (PATH, ~/.local/bin, homebrew, /usr/local/bin)"
-CARGO_BIN="$(resolve_tool cargo)" || die "cargo not found"
+CARGO_BIN="${CARGO_BIN:-$(resolve_tool cargo)}" || die "cargo not found"
+FLYWHEEL_BIN="$(resolve_tool flywheel)" || die "flywheel not found"
 if [ -x /usr/bin/python3 ]; then
     PYTHON_BIN=/usr/bin/python3
 else
@@ -111,7 +112,11 @@ fi
 [ -n "$TORON_BIN" ] || die "TORON_BIN not found; name the toron binary"
 
 PLANE_SESSION=""
+SPAWNED_PIN=""
 cleanup() {
+    if [ -n "$SPAWNED_PIN" ] && [ "$KEEP" = 0 ]; then
+        "$FLYWHEEL_BIN" retire "$SPAWNED_PIN" --project e2e-live-five --force-working >/dev/null 2>&1 || true
+    fi
     if [ -n "$PLANE_SESSION" ] && [ "$KEEP" = 0 ]; then
         "$REX_BIN" kill "$PLANE_SESSION" >/dev/null 2>&1 || true
     fi
@@ -141,6 +146,11 @@ PY
 )" || die "cannot parse the created session: $created"
 SESSION_ID="${parsed%%$'\t'*}"
 BLOCK_ID="${parsed##*$'\t'}"
+# bd-oo7zi: flywheel names a rex pane by its BLOCK LABEL, not the session or the
+# window. Rename the throwaway block to the pin so `flywheel send --to PIN`
+# resolves it. (The earlier --window attempt renamed the wrong object.)
+"$REX_BIN" block rename -s "$SESSION" "$BLOCK_ID" "$PIN" >/dev/null 2>&1 \
+    || die "rex could not rename the throwaway block to $PIN"
 PLANE_SESSION="$SESSION"
 export FLYWHEEL_LIVE_SESSION="$SESSION_ID"
 export FLYWHEEL_LIVE_BLOCK="$BLOCK_ID"
@@ -158,12 +168,70 @@ export FLYWHEEL_LIVE_PROJECT="$PROJECT"
 export FLYWHEEL_LIVE_AS="$AS"
 export TORON_BIN
 
+# bd-oo7zi: the operator-typing guard needs a REAL harness pane: a bare zsh box
+# classifies as Unknown, which may_inject allows. Spawn one in THIS project only,
+# read its pin + pane_id from swarm status, and retire it in cleanup.
+spawn_out="$("$FLYWHEEL_BIN" spawn e2e-live-five --oc 1 --model harness-default --escape --yes --retire-orphans 2>&1)" \
+    || die "flywheel spawn failed: $spawn_out"
+seated="$(FLYWHEEL_BIN="$FLYWHEEL_BIN" "$PYTHON_BIN" - <<'PY'
+import json, os, subprocess
+doc = json.loads(subprocess.check_output([
+    os.environ["FLYWHEEL_BIN"], "swarm", "status", "e2e-live-five", "--json"
+], text=True))
+rows = doc.get("seats", doc if isinstance(doc, list) else [])
+for r in rows:
+    if r.get("pin") and r.get("pane_id"):
+        print(f"{r['pin']}\t{r['pane_id']}")
+        break
+PY
+)" || die "cannot read the spawned seat from swarm status"
+SPAWNED_PIN="${seated%%$'\t'*}"
+SPAWNED_PANE="${seated##*$'\t'}"
+SPAWNED_SESSION="$(printf '%s\n' "$spawn_out" | sed -nE 's/.*(session:[^ ]+) created.*/\1/p' | head -1)"
+[ -n "$SPAWNED_PIN" ] || die "swarm status named no pin"
+[ -n "$SPAWNED_SESSION" ] || die "spawn did not name its workspace session"
+
+# A freshly spawned agent stays WORKING while it boots; the send door correctly
+# refuses "not at a prompt". Poll ITS status until it is idle (up to 2 min).
+SPAWNED_STATE=""
+for _ready in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24; do
+    SPAWNED_STATE="$(STATUS_JSON="$("$FLYWHEEL_BIN" swarm status e2e-live-five --json 2>/dev/null)" STATUS_PIN="$SPAWNED_PIN" "$PYTHON_BIN" - <<'PY'
+import json, os
+try:
+    doc = json.loads(os.environ["STATUS_JSON"])
+    rows = doc.get("seats", doc if isinstance(doc, list) else [])
+    print(next((r.get("status") or "") for r in rows if r.get("pin") == os.environ["STATUS_PIN"]))
+except Exception:
+    print("")
+PY
+)"
+    case "$SPAWNED_STATE" in
+        idle | done)
+            if [ "${_idle_seen:-}" = yes ]; then break; fi
+            _idle_seen=yes
+            ;;
+        *) _idle_seen=no ;;
+    esac
+    sleep 5
+done
+
 printf 'e2e-live-five: session %s (block %s), receipt %s\n' "$SESSION_ID" "$BLOCK_ID" "$RECEIPT"
 results=""
 passed=0
 failed=0
 for t in "${TESTS[@]}"; do
     log="/tmp/e2e-live-five-$STAMP-$(basename "$t" .rs).log"
+    if [ "$t" = "tests/live_doorbell_operator_guard.rs" ]; then
+        export FLYWHEEL_LIVE_SESSION="$SPAWNED_SESSION"
+        export FLYWHEEL_LIVE_PIN="$SPAWNED_PIN"
+        export FLYWHEEL_LIVE_BLOCK="$SPAWNED_PANE"
+        export FLYWHEEL_LIVE_AS="$SPAWNED_PIN"
+    else
+        export FLYWHEEL_LIVE_SESSION="$SESSION_ID"
+        export FLYWHEEL_LIVE_PIN="$PIN"
+        export FLYWHEEL_LIVE_BLOCK="$BLOCK_ID"
+        export FLYWHEEL_LIVE_AS="$AS"
+    fi
     if "$CARGO_BIN" test --test "$(basename "$t" .rs)" -- --ignored --nocapture >"$log" 2>&1; then
         printf '  PASS  %s\n' "$t"
         passed=$((passed + 1))

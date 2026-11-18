@@ -1,0 +1,26 @@
+=== bd-e4gal SCREEN AT SEND ===
+     doorbell is the designated wake) and processing the "94 mail owed"         
+     counter (toron next and inbox show 0 actual messages; no ring to           
+     trigger ack duty). Risk: if that counter reflects real owed mail on        
+     another plane, it would only surface on the next doorbell ring — which     
+     this template handles.                                                     
+                                                                                
+     Build · Hy4 flash Free · 2m 5s · 173.6 tok/s                               
+                                                                                
+  ┃                                                                             
+  ┃  half typed lineTASK-ID: task-18e9360b (routing metadata only — not a       
+  ┃  bead id, never `br show` it)                                               
+  ┃  BEAD: none bound by this dispatch — follow the message text; if it         
+  ┃  carries no actionable content, ask the captain for the bead id.            
+  ┃                                                                             
+  ┃  live probe: deferral                                                    ▄  
+  ┃                                                                          █  
+                                                                                
+  ┃                                                                             
+  ┃                                                                             
+  ┃                                                                             
+  ┃  Build auto · Hy4 flash Free OpenCode Go · high                             
+                                                                                
+  ~/workspace/e2e-live-five                        57.5K (5%)  ctrl+p commands  
+                                                                                
+

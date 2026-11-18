@@ -142,6 +142,21 @@ fn is_input_footer(text: &str) -> bool {
         && text.chars().count() <= 80
 }
 
+/// Classify a screen whose harness the registry did not record. A profileless
+/// spawn writes no `harness` (bd-e4gal), so `harness_of` returns "" — guessing
+/// "injectable" from an unrecognised harness is what let a wake land on an
+/// operator's half-typed line. Try each known box reader; the first that
+/// recognises a box decides. Structurally stricter than Unknown, not looser.
+pub fn input_line_for_unknown_harness(tail: &str, last_typed: Option<&str>) -> InputLine {
+    for harness in ["opencode", "claude", "gemini", "pi"] {
+        let line = input_line_for(harness, tail, last_typed);
+        if line != InputLine::Unknown {
+            return line;
+        }
+    }
+    InputLine::Unknown
+}
+
 /// Classify the LAST captured screen (terminal tail) for `harness`.
 ///
 /// `last_typed` is the line the wake path itself wrote: opencode and claude
