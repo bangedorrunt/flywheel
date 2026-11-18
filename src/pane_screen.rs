@@ -70,6 +70,10 @@ fn marker_box(tail: &str, marker: &str, skip: &dyn Fn(&str) -> bool) -> Option<S
     for line in tail.lines().rev() {
         let trimmed = line.trim_start();
         let Some(rest) = trimmed.strip_prefix(marker) else {
+            // The box is the contiguous marker run nearest the bottom.
+            if saw_box && !trimmed.is_empty() {
+                break;
+            }
             continue;
         };
         let text = trim_box_edge(rest.trim());

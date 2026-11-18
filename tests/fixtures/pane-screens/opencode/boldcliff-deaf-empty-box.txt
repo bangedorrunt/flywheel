@@ -1,0 +1,36 @@
+                                           
+    Skipped: full clean-proof (per         
+    order). Note: tests/                   
+    live_doorbell_operator_guard.rs is     
+    now dirty in the shared tree —         
+    another lane's work, not mine.         
+    Risk: none from this change.           
+                                           
+    Build · Hy4 flash Free · 9m 3s ·       
+    193.0 tok/s · 1m 3s ttft               
+                                           
+ ┃                                         
+ ┃  [doorbell] plane-P mail. Pull:         
+ ┃  toron next — run: toron next           
+ ┃                                         
+                                           
+    + 1 command                            
+                                           
+    Pulled BoldCliff: 0 items, cursor      
+    unchanged at 1924. No new mail —       
+    the doorbell ring was stale.           
+                                           
+    Skipped: no gates or tree checks —     
+    nothing arrived and nothing            
+    changed. Risk: none.                 ▄ 
+                                         █ 
+    Build · Hy4 flash Free · 20.1s ·     █ 
+    198.6 tok/s · 9.0s ttft              █ 
+                                           
+ ┃                                         
+ ┃                                         
+ ┃                                         
+ ┃ auto Hy4 flash Free · high              
+                                           
+ …/flywheel:adr-0021-stage-…  520.2K (50%) 
+                                           
