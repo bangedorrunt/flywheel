@@ -51,10 +51,6 @@ pub fn gate(
     last_typed: Option<&str>,
 ) -> Result<InputLine, String> {
     let tail = reader.tail(pane_id, 0)?;
-    // bd-e4gal: a profileless spawn's registry row has no harness, so the
-    // guard gets "" and must not read that as "safe to inject". Classify the
-    // box structurally instead — an unrecognised harness is a DEFER, not a
-    // type, exactly like an unreadable pane.
     let line = if harness.trim().is_empty() {
         input_line_for_unknown_harness(&tail, last_typed)
     } else {
@@ -175,10 +171,7 @@ mod tests {
         assert!(err.contains("nothing was typed"), "{err}");
     }
 
-    /// bd-e4gal: a profileless spawn's registry row has no harness, so the
-    /// guard is handed "". The real captured screen below holds the operator's
-    /// half-typed line inside an opencode box; treating Unknown as injectable
-    /// wrote a wake straight over it. The guard must defer without a harness.
+    /// An unrecorded harness over typed text must defer, not inject.
     #[test]
     fn an_unknown_harness_defers_when_the_box_holds_operator_text() {
         let screen = std::fs::read_to_string(format!(

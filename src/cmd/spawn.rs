@@ -1225,6 +1225,14 @@ pub(crate) fn patched_mode_argv(
     }
 }
 
+/// Records the launched harness when the profile set none.
+pub(crate) fn with_recorded_harness(mut entry: state::SpawnEntry, kind: &str) -> state::SpawnEntry {
+    if entry.harness.is_none() {
+        entry.harness = Some(kind.to_string());
+    }
+    entry
+}
+
 /// Verbatim `add`-accepted flags from a spawn request (bd-gjtcw): the join
 /// hint hands back what the operator asked for, never a guessed harness.
 pub(crate) fn requested_spawn_flags(opts: &SpawnOpts) -> String {
@@ -2203,7 +2211,7 @@ projects available: {}",
             entry.mode = None;
             entry.skills_digest = skills_digest;
             entry.harness_session = captain_directory::capture_harness_session(&kind);
-            registry.push(entry);
+            registry.push(with_recorded_harness(entry, &kind));
             println!(
                 "  {} {}",
                 kind_paint(&kind),
@@ -8862,5 +8870,36 @@ mod acceptance1_harness_pair {
             ),
             other => panic!("fx takes no model flag, so the ask is blocked: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod e4gal_harness_row_tests {
+    use super::with_recorded_harness;
+
+    /// The registry row must carry the harness the pane was launched with.
+    #[test]
+    fn a_profileless_spawn_row_is_found_by_harness_of() {
+        let _home = crate::config::test_state_home();
+        let root = std::env::temp_dir().join(format!("fw-e4gal-{}", std::process::id()));
+        let _override = crate::state::set_registry_root_override(root);
+
+        let row = crate::state::SpawnEntry::with_mail_identity(
+            "block:probe-pane",
+            "AmberProbe",
+            "AmberProbe",
+        );
+        assert!(
+            row.harness.is_none(),
+            "precondition: a profileless constructor leaves harness unset"
+        );
+        let row = with_recorded_harness(row, "opencode");
+        crate::state::save_spawn_registry("e4gal-probe", &[row]).unwrap();
+
+        assert_eq!(
+            crate::pane_read::harness_of("e4gal-probe", "block:probe-pane"),
+            "opencode",
+            "the operator-typing guard must resolve the harness for this exact target pane"
+        );
     }
 }
