@@ -1284,3 +1284,41 @@ tests = [
 mutations = [
   "scripts/mutations/ship-land-legal-gate.spec.sh#R1",
 ]
+
+[[behavior]]
+id = "consent.jev-and-budget-are-asked"
+owner = "src/swarm_plan.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/swarm_plan.rs::needs_consent_lists_jev_field",
+  "src/swarm_plan.rs::needs_consent_over_budget_lists_estimate",
+]
+mutations = [
+  "scripts/mutations/adr0022-gates.spec.sh#D5A",
+  "scripts/mutations/adr0022-gates.spec.sh#D5B",
+]
+
+[[behavior]]
+id = "plan.precedence-ladder-is-a-property"
+owner = "src/swarm_plan.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/swarm_plan.rs::the_precedence_ladder_never_lets_a_lower_rung_win",
+]
+mutations = [
+  "scripts/mutations/adr0022-gates.spec.sh#V7",
+]
+
+[[behavior]]
+id = "briefing.plan-carries-consent"
+owner = "src/briefing.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/briefing.rs::a_briefing_plan_carries_its_consent_items",
+]
+mutations = [
+  "scripts/mutations/adr0022-gates.spec.sh#A2",
+]
