@@ -97,6 +97,47 @@ fn a_plain_lesson_is_retrievable_by_command_and_path() {
     );
 }
 
+/// `--as` must reach chie as --peer (chie has no --pin), and the lesson must
+/// still be retrievable (bd-97uwg).
+#[test]
+fn recording_with_as_is_retrievable() {
+    let sandbox = TestSandbox::new();
+    let recorded = run(
+        &sandbox,
+        &[
+            "memory",
+            "record-lesson",
+            "an unattributed lesson breaks when a pin cannot reach chie; do map --as to --peer",
+            "--as",
+            "BoldCliff",
+            "--project",
+            "proj",
+            "--json",
+        ],
+    );
+    assert!(
+        text(&recorded).contains("\"recorded\": true"),
+        "recording with --as failed: {}",
+        text(&recorded)
+    );
+    let found = run(
+        &sandbox,
+        &[
+            "memory",
+            "check-trap",
+            "a pin cannot reach chie",
+            "--project",
+            "proj",
+            "--json",
+        ],
+    );
+    assert!(
+        text(&found).contains("unattributed lesson"),
+        "the --as lesson must be retrievable: {}",
+        text(&found)
+    );
+}
+
 /// `--project <slug>` and `--project <dir>` name the same chie scope.
 #[test]
 fn slug_and_directory_scopes_agree() {

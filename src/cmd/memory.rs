@@ -421,7 +421,8 @@ pub fn record_lesson_with_pin(
         .unwrap_or("error");
     cmd.args(["--kind", kind]);
     if let Some(p) = pin.map(str::trim).filter(|s| !s.is_empty()) {
-        cmd.args(["--pin", p]);
+        // chie record has --peer, not --pin (bd-97uwg).
+        cmd.args(["--peer", &format!("agent:{p}")]);
     }
     cmd.arg(rule_lesson_event(content));
     match cmd.output() {
