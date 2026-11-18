@@ -41,3 +41,18 @@ expect = "operator-text"
 [[screen]]
 file = "wake-line-queued.txt"
 expect = "wake-queued"
+
+# bd-g4xlr: the current opencode footer ("auto <model> · <effort>") is a status
+# row, not typed text. new-empty-footer is a REAL capture; new-typed-footer is
+# SYNTHETIC - the same frame with one typed line inserted above the footer.
+[[screen]]
+file = "new-empty-footer.txt"
+expect = "wake-queued"
+
+[[screen]]
+file = "new-empty-clean-footer.txt"
+expect = "empty"
+
+[[screen]]
+file = "new-typed-footer.txt"
+expect = "operator-text"

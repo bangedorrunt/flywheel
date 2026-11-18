@@ -110,6 +110,38 @@ fn pi_box(tail: &str) -> Option<String> {
     None
 }
 
+/// A terminal wraps a long wake line; the last box row can be only its tail
+/// ("... toron next"). Recognise it by structure: an earlier wake line on this
+/// screen ends with exactly this fragment, and the fragment is short.
+fn is_wake_continuation(content: &str, tail: &str) -> bool {
+    if content.is_empty() || content.chars().count() > 40 {
+        return false;
+    }
+    let rows: Vec<&str> = tail
+        .lines()
+        .map(|line| line.trim().trim_start_matches('┃').trim())
+        .collect();
+    rows.windows(2)
+        .any(|pair| is_wake_line(pair[0]) && pair[1] == content)
+}
+
+/// A status row drawn in the input box is not operator text (bd-g4xlr).
+///
+/// Structural, not vendor-worded: keybinding hints, or a short dot-separated
+/// `<mode/model> · <effort>` summary. A typed line containing a middle dot is
+/// excluded by the short-token/length limit, so we do not hide real text.
+fn is_input_footer(text: &str) -> bool {
+    if text.starts_with("Build ") || text.contains("shift+tab") {
+        return true;
+    }
+    let parts: Vec<&str> = text.split('·').map(str::trim).collect();
+    parts.len() > 1
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.split_whitespace().count() <= 4)
+        && text.chars().count() <= 80
+}
+
 /// Classify the LAST captured screen (terminal tail) for `harness`.
 ///
 /// `last_typed` is the line the wake path itself wrote: opencode and claude
@@ -118,9 +150,7 @@ fn pi_box(tail: &str) -> Option<String> {
 pub fn input_line_for(harness: &str, tail: &str, last_typed: Option<&str>) -> InputLine {
     let harness = canonical(harness);
     let content: Option<String> = match harness.as_str() {
-        "opencode" => marker_box(tail, "┃", &|text| {
-            text.starts_with("Build ") || text.contains("shift+tab")
-        }),
+        "opencode" => marker_box(tail, "┃", &is_input_footer),
         "claude" => marker_box(tail, "❯", &|_| false),
         "gemini" => marker_box(tail, "│", &|text| !text.starts_with('>')),
         "pi" => pi_box(tail),
@@ -143,7 +173,7 @@ pub fn input_line_for(harness: &str, tail: &str, last_typed: Option<&str>) -> In
     {
         return InputLine::Empty;
     }
-    if is_wake_line(content) {
+    if is_wake_line(content) || is_wake_continuation(content, tail) {
         return InputLine::WakeQueued;
     }
     InputLine::OperatorText

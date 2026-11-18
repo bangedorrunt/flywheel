@@ -1,0 +1,31 @@
+       pin ScarletCove; that identity      
+       has no local key, so the            
+       fallback failed too.                
+                                           
+    I reported both faults to              
+    SlateHarbor directly on a new          
+    thread, since neither automated        
+    path reached them. Did no other        
+    work.                                  
+                                           
+    Build · Hy4 flash Free · 55.2s ·       
+    193.3 tok/s · 14.5s ttft               
+                                           
+ ┃                                         
+ ┃                                         
+                                           
+    + 1 command, 2 thoughts                
+                                           
+    New P1 — from my live report.          
+    Reading the bead and the root          
+    cause.                               █ 
+                                         █ 
+    + 3 commands, 2 thoughts             █ 
+                                           
+ ┃                                         
+ ┃                                         
+ ┃                                         
+ ┃ auto Hy4 flash Free · high              
+                                           
+  ■■■⬝⬝⬝⬝⬝ esc interrupt      190.0K (18%) 
+                                           
