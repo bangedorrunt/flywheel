@@ -228,7 +228,7 @@ use output::{die, dim, error, kind_paint, ok as paint_ok, print_json, status_pai
 use profile::ProfileCatalog;
 use snapshot::robot_snapshot;
 use state::{EventKind, log_event};
-use toron_plane::backend::error::BackendErrorCode;
+use toron_plane::backend::error::{BackendError, BackendErrorCode};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -12246,44 +12246,92 @@ const RESPONSIVENESS_WINDOW: Duration = Duration::from_secs(3);
 /// alive, `Some(false)` = provably dead, `None` = probe unavailable or
 /// inconclusive (the caller falls back to legacy pane-existence
 /// classification — never a confident "healthy").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LivenessOutcome {
+    Answer(bool),
+    Unknown,
+    Unsupported,
+    Failed,
+}
+
+fn classify_liveness(result: Result<Option<bool>, BackendError>) -> LivenessOutcome {
+    match result {
+        Ok(Some(alive)) => LivenessOutcome::Answer(alive),
+        Ok(None) => LivenessOutcome::Unknown,
+        Err(e) if e.code() == &BackendErrorCode::Unsupported => LivenessOutcome::Unsupported,
+        Err(_) => LivenessOutcome::Failed,
+    }
+}
+
 fn probe_agent_liveness(
     backend: &dyn backend::MultiplexerBackend,
     pane_id: &str,
     kind: &str,
     name: &str,
 ) -> Option<bool> {
-    backend.agent_alive(pane_id, kind).or_else(|| {
-        eprintln!(
-            "flywheel: liveness probe for {name} inconclusive on {}",
-            backend.name()
-        );
-        None
-    })
+    match classify_liveness(backend.agent_alive(pane_id, kind)) {
+        LivenessOutcome::Answer(alive) => Some(alive),
+        LivenessOutcome::Unknown => {
+            eprintln!(
+                "flywheel: liveness probe for {name} inconclusive on {}",
+                backend.name()
+            );
+            None
+        }
+        // No probe on this backend is not a failed probe: skip it quietly.
+        LivenessOutcome::Unsupported => None,
+        LivenessOutcome::Failed => {
+            eprintln!(
+                "flywheel: liveness probe for {name} failed on {}",
+                backend.name()
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]
 mod liveness_backend_tests {
-    use super::probe_agent_liveness;
+    use super::{BackendError, LivenessOutcome, classify_liveness, probe_agent_liveness};
 
     struct FakeAlive(bool);
     impl crate::backend::MultiplexerBackend for FakeAlive {
         fn name(&self) -> &'static str {
             "fake"
         }
-        fn agent_alive(&self, _pane_id: &str, _kind: &str) -> Option<bool> {
-            Some(self.0)
+        fn agent_alive(
+            &self,
+            _pane_id: &str,
+            _kind: &str,
+        ) -> Result<Option<bool>, toron_plane::backend::error::BackendError> {
+            Ok(Some(self.0))
         }
     }
 
-    struct Unknown;
-    impl crate::backend::MultiplexerBackend for Unknown {
+    struct Inconclusive;
+    impl crate::backend::MultiplexerBackend for Inconclusive {
         fn name(&self) -> &'static str {
-            "unknown"
+            "inconclusive"
+        }
+        fn agent_alive(
+            &self,
+            _pane_id: &str,
+            _kind: &str,
+        ) -> Result<Option<bool>, toron_plane::backend::error::BackendError> {
+            Ok(None)
+        }
+    }
+
+    /// Inherits the default `Err(Unsupported)` — no liveness probe at all.
+    struct UnsupportedProbe;
+    impl crate::backend::MultiplexerBackend for UnsupportedProbe {
+        fn name(&self) -> &'static str {
+            "unsupported"
         }
     }
 
     #[test]
-    fn the_probe_asks_only_the_active_backend() {
+    fn the_probe_distinguishes_unsupported_from_unknown() {
         assert_eq!(
             probe_agent_liveness(&FakeAlive(true), "block:x", "opencode", "Pin"),
             Some(true)
@@ -12292,10 +12340,29 @@ mod liveness_backend_tests {
             probe_agent_liveness(&FakeAlive(false), "block:x", "opencode", "Pin"),
             Some(false)
         );
+        for backend in [
+            &Inconclusive as &dyn crate::backend::MultiplexerBackend,
+            &UnsupportedProbe,
+        ] {
+            assert_eq!(
+                probe_agent_liveness(backend, "block:x", "opencode", "Pin"),
+                None,
+                "neither unknown nor unsupported is a confident healthy"
+            );
+        }
         assert_eq!(
-            probe_agent_liveness(&Unknown, "block:x", "opencode", "Pin"),
-            None,
-            "a backend that cannot tell is inconclusive, never healthy"
+            classify_liveness(Ok(Some(true))),
+            LivenessOutcome::Answer(true)
+        );
+        assert_eq!(classify_liveness(Ok(None)), LivenessOutcome::Unknown);
+        assert_eq!(
+            classify_liveness(Err(BackendError::unsupported("agent_alive"))),
+            LivenessOutcome::Unsupported,
+            "a backend with no probe is distinct from an inconclusive one"
+        );
+        assert_eq!(
+            classify_liveness(Err(BackendError::timeout("probe"))),
+            LivenessOutcome::Failed
         );
     }
 }

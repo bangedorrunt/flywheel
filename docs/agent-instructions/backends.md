@@ -102,6 +102,22 @@ list.
 
 hc OpenRPC. Socket: `HC_SOCKET_PATH` or `$XDG_STATE_HOME/herdr-core/$HC_SESSION/$HC_SESSION.sock`.
 
+## Backend conformance (bd-egvr6)
+
+`toron_plane::backend::conformance` runs one generic contract over every
+`Backend` impl. All trait methods answer a typed result: `Ok`, `Err(Unsupported)`
+(a capability the backend deliberately lacks), or `Err(other)` (a real failure).
+`agent_alive` is `Result<Option<bool>, BackendError>`: `Ok(Some)` = alive/dead,
+`Ok(None)` = unknown/inconclusive, `Err(Unsupported)` = no probe at all.
+
+Each impl declares a manifest of expected `Unsupported` methods. The suite
+fails both when a declared method answers something other than `Unsupported`
+and when an undeclared method answers `Unsupported`, so a silently-unimplemented
+method cannot pass. It runs unconditionally over the in-memory `MockBackend`;
+`#[ignore]`d, env-gated live runners cover the read-only surface of hc (`HC_BIN`)
+and rex (`REX_BIN_DIR`). `probe_agent_liveness` skips `Unsupported` quietly —
+only `Ok(None)` is an inconclusive probe.
+
 ## Effect-kernel authority
 
 Runtime adapters are the effect boundary. Resolve host identity, paths, configuration, clocks, process paths, and network clients once, then pass them into interpreters. Reducers never read these sources directly. A daemon or remote backend returning no proof yields `unknown` or a loud degraded result, never an invented success. See [effect-kernel discipline](effect-kernel.md).
