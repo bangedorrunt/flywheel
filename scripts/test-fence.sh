@@ -178,4 +178,13 @@ case "$out" in
 esac
 pass "a staged dead ledger row fails fence --index, naming the row"
 
+# bd-1umbz: a worktree's pre-commit hook inherits GIT_DIR pointing at the
+# worktree's gitdir. `git -C <sibling>` still honours GIT_DIR, so the sibling
+# pin archive reads the WRONG repo and dies "rev not found". Simulate that
+# env and require the fence to resolve the sibling from its own path.
+GIT_DIR="$(git -C "$REPO" rev-parse --absolute-git-dir)" \
+FENCE_CARGO="$TMP/bin/cargo" bash "$ROOT/scripts/fence.sh" --repo "$REPO" --sha "$GOOD" >/dev/null 2>&1 \
+  || fail "a worktree GIT_DIR must not misresolve the sibling pin"
+pass "a worktree GIT_DIR does not misresolve the sibling pin"
+
 echo "ok"
