@@ -1342,6 +1342,33 @@ pub fn loop_journal_file(project: &str) -> PathBuf {
         .join(format!("{}.jsonl", state_key(project)))
 }
 
+/// bd-f888z: append the chosen wake route to the per-project wake-route
+/// journal BEFORE the transport runs. `seed` is the idempotent effect key, so a
+/// retried ring records the same key. Best-effort: a journal failure must not
+/// drop the wake.
+pub fn journal_wake_route(pin: &str, seed: &str, route: &str) {
+    let path = crate::config::state_dir().join("wake-routes.jsonl");
+    if let Some(parent) = path.parent()
+        && std::fs::create_dir_all(parent).is_err()
+    {
+        return;
+    }
+    let entry = serde_json::json!({
+        "ts": now_iso(),
+        "pin": pin,
+        "seed": seed,
+        "route": route,
+    });
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{}", serde_json::to_string(&entry).unwrap_or_default());
+    }
+}
+
 pub fn journal_loop_msg(
     project: &str,
     msg: &crate::durable::LoopMsg,

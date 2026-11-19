@@ -56,6 +56,7 @@ TESTS=(
     tests/live_doorbell_operator_guard.rs
     tests/live_event_poll_parity.rs
     tests/live_serialize_worktree.rs
+    tests/live_opencode_api_wake.rs
 )
 
 resolve_tool() {

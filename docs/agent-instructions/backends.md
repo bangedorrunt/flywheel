@@ -11,6 +11,8 @@ Pluggable multiplexer + mail. Spine targets traits, not concretes.
 
 Factory: `src/backend/factory.rs`. Code: `src/backend/`.
 
+bd-f888z: a wake's delivery route is decided once in `harness_caps::wake_route_for` — an opencode seat with a recorded `ses-*` session wakes through `harness_api` (`session.prompt`, delivery `queue`/`steer`, idempotent `msg_`), never by typing into the pane. Any API failure falls back to the plane's Inject sink; the chosen route is journaled before invoke. This is orthogonal to the pane backend below: both hc and rex seats use the same API route decision, and only the Inject fallback differs by plane.
+
 ## Identity vocabulary (ids never match across backends)
 
 | Term | hc | rex | Notes |

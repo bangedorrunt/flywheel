@@ -1233,6 +1233,27 @@ pub(crate) fn with_recorded_harness(mut entry: state::SpawnEntry, kind: &str) ->
     entry
 }
 
+/// bd-f888z: opencode v2 accepts `--session/-s <id>` ("continue, or create if
+/// it does not exist"). Mint a unique session for each opencode seat so its
+/// wakes can ride `session.prompt` instead of typing into the TUI. Returns the
+/// minted id to record in `SpawnEntry.harness_session`; non-opencode seats get
+/// `None` and no argv change.
+pub(crate) fn mint_harness_session(kind: &str, args: &mut Vec<String>) -> Option<String> {
+    if crate::harness_registry::canonical(kind) != "opencode" {
+        return None;
+    }
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let id = format!("ses-{}-{}-{:x}", std::process::id(), now, seq);
+    args.push("--session".to_string());
+    args.push(id.clone());
+    Some(id)
+}
+
 /// Verbatim `add`-accepted flags from a spawn request (bd-gjtcw): the join
 /// hint hands back what the operator asked for, never a guessed harness.
 pub(crate) fn requested_spawn_flags(opts: &SpawnOpts) -> String {
@@ -2090,6 +2111,9 @@ projects available: {}",
             if needs_in_arg_prime(&kind) && !has_peer_prime {
                 agent_args.push(boot_prime_line().to_string());
             }
+            // bd-f888z: mint the opencode session into argv BEFORE launch, then
+            // record it on the SpawnEntry so wakes can ride session.prompt.
+            let harness_session = mint_harness_session(&kind, &mut agent_args);
             let shell_ready = hc::wait_shell_prompt(&c, &pane_id, Duration::from_secs(15));
             if !shell_ready {
                 eprintln!(
@@ -2210,7 +2234,10 @@ projects available: {}",
                 .filter(|e| !e.is_empty());
             entry.mode = None;
             entry.skills_digest = skills_digest;
-            entry.harness_session = captain_directory::capture_harness_session(&kind);
+            // bd-f888z: a minted opencode session wins; otherwise keep the
+            // legacy capture (grok GROK_SESSION_ID).
+            entry.harness_session =
+                harness_session.or_else(|| captain_directory::capture_harness_session(&kind));
             registry.push(with_recorded_harness(entry, &kind));
             println!(
                 "  {} {}",
@@ -2951,6 +2978,8 @@ pub(crate) fn cmd_spawn_rex(
             if needs_in_arg_prime(&kind) && !has_peer_prime {
                 agent_args.push(boot_prime_line().to_string());
             }
+            // bd-f888z: mint the opencode session into argv BEFORE launch.
+            let harness_session = mint_harness_session(&kind, &mut agent_args);
             let command = crate::pane::rex_env_command(&pane_env, &kind, &agent_args);
             let pane_id = if first {
                 toron_plane::backend::superlogical::create_agent_block(
@@ -3056,7 +3085,9 @@ pub(crate) fn cmd_spawn_rex(
                 .as_deref()
                 .and_then(|pname| catalog.get(pname))
                 .and_then(|p| profile::skills_digest(&p.skills));
-            entry.harness_session = captain_directory::capture_harness_session(&kind);
+            // bd-f888z: a minted opencode session wins over legacy capture.
+            entry.harness_session =
+                harness_session.or_else(|| captain_directory::capture_harness_session(&kind));
             registry.push(entry);
             println!("  {} {}", kind_paint(&kind), dim(&format!("({})", pane_id)));
             let exit_code: Option<i32> = launched_status
@@ -3367,6 +3398,23 @@ pub(crate) fn proxy_doorbell_verb(cfg: &Config, verb: &str, extra: &[String]) ->
 mod spawn_profile_plan_tests {
     use super::*;
     use crate::config::lock_env;
+
+    /// bd-f888z: opencode seats get a unique `ses-` session minted into argv,
+    /// recorded on the entry; other harnesses are untouched.
+    #[test]
+    fn opencode_session_minted_into_argv_and_recorded() {
+        let mut args = vec!["--agent".to_string(), "build".to_string()];
+        let sid = mint_harness_session("opencode", &mut args).expect("opencode session");
+        assert!(sid.starts_with("ses-"), "{sid}");
+        assert_eq!(args, vec!["--agent", "build", "--session", sid.as_str()]);
+        let second = mint_harness_session("oc", &mut args).expect("alias session");
+        assert_ne!(sid, second, "each seat gets a unique session");
+
+        let mut pi_args = vec!["--model".to_string(), "x".to_string()];
+        assert_eq!(mint_harness_session("pi", &mut pi_args), None);
+        assert_eq!(pi_args, vec!["--model", "x"], "non-opencode argv untouched");
+    }
+
     use crate::{
         SpawnItem, bare_model_launch, interactive_pane_args, profile_launch_args,
         profile_launch_plan, spawn_items_from_plan, spawn_model_rows,

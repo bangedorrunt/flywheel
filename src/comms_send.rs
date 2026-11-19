@@ -607,9 +607,17 @@ pub(crate) enum SendWake {
 
 /// The one policy the sender asks. Pure; `hook_installed` is the caller's
 /// reading of the operator hook file.
+#[cfg(test)]
 pub(crate) fn send_wake(kind: &str, hook_installed: bool) -> SendWake {
-    match crate::harness_caps::wake_route(kind, hook_installed) {
+    send_wake_for(kind, None, hook_installed)
+}
+
+/// bd-f888z: the API-aware policy. A recorded opencode session selects the API
+/// route (still a real Ring); otherwise the pane route decides.
+pub(crate) fn send_wake_for(kind: &str, session: Option<&str>, hook_installed: bool) -> SendWake {
+    match crate::harness_caps::wake_route_for(kind, session, hook_installed) {
         crate::harness_caps::WakeRoute::Inject { .. } => SendWake::Ring,
+        crate::harness_caps::WakeRoute::Api { .. } => SendWake::Ring,
         crate::harness_caps::WakeRoute::NoDoor(no_door) => {
             SendWake::Skip(crate::harness_caps::no_door_line(&no_door))
         }
@@ -619,21 +627,50 @@ pub(crate) fn send_wake(kind: &str, hook_installed: bool) -> SendWake {
 /// Boundary: ring one recipient with the constant wake line for its head.
 /// A failed ring never re-sends the envelope; the next ring for the same
 /// head is the same line.
+#[cfg(test)]
 pub async fn ring(
     store: &InboxStore,
     panes: &dyn PaneTyper,
     target: &str,
     npub: &str,
 ) -> Result<Wm> {
+    ring_with_route(store, panes, target, npub, None).await
+}
+
+/// bd-f888z: ring with an optional pre-decided route. An `Api` route goes
+/// through the transport; `Inject`/`None` type the pane as before.
+pub async fn ring_with_route(
+    store: &InboxStore,
+    panes: &dyn PaneTyper,
+    target: &str,
+    npub: &str,
+    route: Option<crate::harness_caps::WakeRoute>,
+) -> Result<Wm> {
     let wm = Wm(store.head(npub).await?);
-    crate::pane_write::write(
-        panes,
-        target,
-        &PaneWrite::WakeLine {
-            wm,
-            urgency: Urgency::Normal,
-        },
-    )?;
+    let line = crate::pane_write::wake_line(wm, Urgency::Normal);
+    let typer_line = || {
+        crate::pane_write::write(
+            panes,
+            target,
+            &PaneWrite::WakeLine {
+                wm,
+                urgency: Urgency::Normal,
+            },
+        )
+    };
+    if let Some(crate::harness_caps::WakeRoute::Api { .. }) = &route {
+        let r = route.expect("checked api");
+        crate::harness_caps::harness_api::dispatch(
+            &r,
+            &line,
+            &format!("wm-{:x}", wm.0),
+            target,
+            false,
+            typer_line,
+        )?;
+    } else {
+        typer_line()?;
+    }
     Ok(wm)
 }
 
@@ -764,17 +801,30 @@ pub fn send(cfg: &Config, req: Request<'_>) -> Result<Vec<SentRow>> {
                     if doorbell_owner(&project, ws.as_ref()).is_some() {
                         "left to the doorbell host (budgeted, level-triggered)".to_string()
                     } else {
-                        let kind = crate::state::load_spawn_registry(&project)
+                        let entry = crate::state::load_spawn_registry(&project)
                             .into_iter()
-                            .find(|e| e.mail_identity.as_deref() == Some(pin))
-                            .and_then(|e| e.harness)
+                            .find(|e| e.mail_identity.as_deref() == Some(pin));
+                        let kind = entry
+                            .as_ref()
+                            .and_then(|e| e.harness.as_ref())
+                            .cloned()
                             .unwrap_or_default();
-                        match send_wake(&kind, crate::harness_caps::installed_from_env()) {
+                        let session = entry.and_then(|e| e.harness_session);
+                        match send_wake_for(
+                            &kind,
+                            session.as_deref(),
+                            crate::harness_caps::installed_from_env(),
+                        ) {
                             SendWake::Skip(note) => note,
                             SendWake::Ring => {
                                 let panes = crate::pane_write::HcPanes(c);
-                                match crate::mail::block_on(ring(
-                                    &store, &panes, &target, &row.npub,
+                                let route = Some(crate::harness_caps::wake_route_for(
+                                    &kind,
+                                    session.as_deref(),
+                                    crate::harness_caps::installed_from_env(),
+                                ));
+                                match crate::mail::block_on(ring_with_route(
+                                    &store, &panes, &target, &row.npub, route,
                                 )) {
                                     Ok(wm) => format!("rung wm {:x}", wm.0),
                                     Err(e) => format!("failed: {e:#}"),
@@ -874,16 +924,29 @@ fn wake_via_backend(
         Ok(t) => t,
         Err(e) => return e,
     };
-    let kind = crate::state::load_spawn_registry(project)
+    let entry = crate::state::load_spawn_registry(project)
         .into_iter()
-        .find(|e| e.mail_identity.as_deref() == Some(pin))
-        .and_then(|e| e.harness)
+        .find(|e| e.mail_identity.as_deref() == Some(pin));
+    let kind = entry
+        .as_ref()
+        .and_then(|e| e.harness.as_ref())
+        .cloned()
         .unwrap_or_default();
-    match send_wake(&kind, crate::harness_caps::installed_from_env()) {
+    let session = entry.and_then(|e| e.harness_session);
+    match send_wake_for(
+        &kind,
+        session.as_deref(),
+        crate::harness_caps::installed_from_env(),
+    ) {
         SendWake::Skip(note) => note,
         SendWake::Ring => {
             let panes = crate::pane_write::RexPanes(&*backend);
-            match crate::mail::block_on(ring(store, &panes, &target, npub)) {
+            let route = Some(crate::harness_caps::wake_route_for(
+                &kind,
+                session.as_deref(),
+                crate::harness_caps::installed_from_env(),
+            ));
+            match crate::mail::block_on(ring_with_route(store, &panes, &target, npub, route)) {
                 Ok(wm) => format!("rung wm {:x}", wm.0),
                 Err(e) => format!("failed: {e:#}"),
             }

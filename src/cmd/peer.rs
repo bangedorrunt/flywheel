@@ -420,6 +420,14 @@ fn harness_kind_for_target(project: &str, pane_id: &str, name: Option<&str>) -> 
         .unwrap_or_default()
 }
 
+/// bd-f888z: recorded harness session for the target, driving the API route.
+fn harness_session_for_target(project: &str, pane_id: &str, name: Option<&str>) -> Option<String> {
+    crate::state::load_spawn_registry(project)
+        .into_iter()
+        .find(|e| e.pane_id == pane_id || name.is_some_and(|n| e.name == n))
+        .and_then(|e| e.harness_session)
+}
+
 fn deliver_p2p_wake_hc(
     cfg: &Config,
     directive: &P2pDirective,
@@ -446,7 +454,12 @@ fn deliver_p2p_wake_hc(
     if kind.is_empty() {
         kind = a.agent.as_deref().unwrap_or("").to_string();
     }
-    let route = crate::harness_caps::wake_route(&kind, crate::harness_caps::installed_from_env());
+    let session = harness_session_for_target(&directive.project, &a.pane_id, a.name.as_deref());
+    let route = crate::harness_caps::wake_route_for(
+        &kind,
+        session.as_deref(),
+        crate::harness_caps::installed_from_env(),
+    );
     let line = directive.wake_line(wm);
     if let Err(e) =
         crate::pane_write::write_p2p_wake(&crate::pane_write::HcPanes(&c), &target, &line, route)
@@ -483,7 +496,12 @@ fn deliver_p2p_wake_rex(
     if kind.is_empty() {
         kind = a.agent.as_deref().unwrap_or("").to_string();
     }
-    let route = crate::harness_caps::wake_route(&kind, crate::harness_caps::installed_from_env());
+    let session = harness_session_for_target(&directive.project, &a.pane_id, a.name.as_deref());
+    let route = crate::harness_caps::wake_route_for(
+        &kind,
+        session.as_deref(),
+        crate::harness_caps::installed_from_env(),
+    );
     let line = directive.wake_line(wm);
     if let Err(e) = crate::pane_write::write_p2p_wake(
         &crate::pane_write::RexPanes(&*backend),

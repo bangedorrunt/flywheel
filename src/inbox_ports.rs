@@ -639,47 +639,74 @@ pub(crate) fn ring_wake(
 ) -> Result<RingDone, String> {
     use crate::harness_caps::WakeRoute;
     use crate::pane_write::{PaneWrite, Urgency as U, Wm};
+    let normal = crate::pane_write::wake_line(Wm(wm), U::Normal);
+    if normal != line {
+        return Err("fold line differs from the pane sink's wake line".into());
+    }
+    let is_api = matches!(route, WakeRoute::Api { .. });
+    let interrupt = match &route {
+        WakeRoute::Inject { interrupt } => *interrupt,
+        WakeRoute::NoDoor(no_door) => return Ok(RingDone::NoDoor(*no_door)),
+        WakeRoute::Api { .. } => false,
+    };
+    // The pane-typing fallback. An API wake skips the operator-text guard; an
+    // Inject wake honours it. Both share this one closure (bd-f888z).
+    let inject = || -> anyhow::Result<()> {
+        if !is_api && !crate::pane_screen::may_inject(input) {
+            anyhow::bail!("operator text in input line");
+        }
+        match urgency {
+            Urgency::Urgent => {
+                if interrupt {
+                    crate::pane_write::write(typer, pane_id, &PaneWrite::Interrupt)?;
+                }
+                crate::pane_write::write(
+                    typer,
+                    pane_id,
+                    &PaneWrite::WakeLine {
+                        wm: Wm(wm),
+                        urgency: U::Urgent,
+                    },
+                )?;
+            }
+            Urgency::Normal => {
+                crate::pane_write::write(
+                    typer,
+                    pane_id,
+                    &PaneWrite::WakeLine {
+                        wm: Wm(wm),
+                        urgency: U::Normal,
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    };
+    if is_api {
+        let seed = format!("wm-{wm:x}");
+        let taken = crate::harness_caps::harness_api::dispatch(
+            &route,
+            line,
+            &seed,
+            pane_id,
+            urgency == Urgency::Urgent,
+            inject,
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(match taken {
+            crate::harness_caps::harness_api::RouteTaken::Api
+            | crate::harness_caps::harness_api::RouteTaken::Inject => RingDone::Typed,
+            crate::harness_caps::harness_api::RouteTaken::NoDoor => {
+                RingDone::Deferred("api wake had no door")
+            }
+        });
+    }
     if !crate::pane_screen::may_inject(input) {
         return Ok(RingDone::Deferred(
             "operator text in the input line; the wake stays queued for the next idle edge",
         ));
     }
-    let interrupt = match route {
-        WakeRoute::Inject { interrupt } => interrupt,
-        WakeRoute::NoDoor(no_door) => return Ok(RingDone::NoDoor(no_door)),
-    };
-    let normal = crate::pane_write::wake_line(Wm(wm), U::Normal);
-    if normal != line {
-        return Err("fold line differs from the pane sink's wake line".into());
-    }
-    match urgency {
-        Urgency::Urgent => {
-            if interrupt {
-                crate::pane_write::write(typer, pane_id, &PaneWrite::Interrupt)
-                    .map_err(|e| e.to_string())?;
-            }
-            crate::pane_write::write(
-                typer,
-                pane_id,
-                &PaneWrite::WakeLine {
-                    wm: Wm(wm),
-                    urgency: U::Urgent,
-                },
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        Urgency::Normal => {
-            crate::pane_write::write(
-                typer,
-                pane_id,
-                &PaneWrite::WakeLine {
-                    wm: Wm(wm),
-                    urgency: U::Normal,
-                },
-            )
-            .map_err(|e| e.to_string())?;
-        }
-    }
+    inject().map_err(|e| e.to_string())?;
     Ok(RingDone::Typed)
 }
 
@@ -818,18 +845,26 @@ impl Ports for FlywheelPorts {
 
     fn ring(&mut self, npub: &str, pane_id: &str, wm: u64, line: &str) -> Result<(), String> {
         let urgency = self.urgencies.get(npub).copied().unwrap_or(Urgency::Normal);
-        let kind = crate::state::load_spawn_registry(&self.project)
+        let entry = crate::state::load_spawn_registry(&self.project)
             .into_iter()
-            .find(|e| e.pane_id == pane_id)
-            .and_then(|e| e.harness)
+            .find(|e| e.pane_id == pane_id);
+        let kind = entry
+            .as_ref()
+            .and_then(|e| e.harness.as_ref())
+            .cloned()
             .unwrap_or_default();
+        let session = entry.and_then(|e| e.harness_session);
         // bd-0uzrq.3: the operator supervises through these same panes. Never
         // type over a half-typed line, and never type into a pane we cannot
         // read — a deferral is reported as a refusal, so the wake re-rings on
         // the next idle edge instead of a timer firing into their input.
+        // bd-f888z: an API wake skips this read entirely (ring_wake handles it).
         let input = self.pane_input_line(pane_id, &kind)?;
-        let route =
-            crate::harness_caps::wake_route(&kind, crate::harness_caps::installed_from_env());
+        let route = crate::harness_caps::wake_route_for(
+            &kind,
+            session.as_deref(),
+            crate::harness_caps::installed_from_env(),
+        );
         if !is_rex_block(pane_id) {
             let client = self.client().ok_or("hc unreachable")?;
             return match ring_wake(
@@ -1136,7 +1171,7 @@ mod tests {
             7,
             &fold_line(7),
             urgency_of_envelope(&urgent),
-            interrupt,
+            interrupt.clone(),
             crate::pane_screen::InputLine::Empty,
         )
         .unwrap();

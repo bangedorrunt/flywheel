@@ -9,6 +9,11 @@
 //! Every shipped product row is unverified for `hook`. Nothing here edits an
 //! operator config or runs a harness.
 
+// bd-f888z: declared here (not in the shared main.rs) so the module lands with
+// files this lane owns. The transport port lives beside this capability table.
+#[path = "harness_api.rs"]
+pub mod harness_api;
+
 /// Exact reason a hook may print. No payload is interpolated into it. The
 /// script below spells the same text as a literal in a `&'static str` (a
 /// `concat!` cannot fold a const), so this copy exists for the tests that
@@ -89,6 +94,9 @@ pub struct HarnessCaps {
     pub inject: Capability,
     /// Escape before the urgent line.
     pub interrupt: Capability,
+    /// Delivering a wake through the harness's own server API (opencode v2
+    /// `session.prompt`), not by typing into a TUI pane (bd-f888z).
+    pub api: Capability,
     /// Delivering a steer without injecting it (the hook door).
     pub steer: Capability,
     /// Re-typing into a live pane after a stop.
@@ -111,6 +119,7 @@ impl HarnessCaps {
         }
         for (name, cap) in [
             ("inject", self.inject),
+            ("api", self.api),
             ("interrupt", self.interrupt),
             ("steer", self.steer),
             ("resume", self.resume),
@@ -144,12 +153,19 @@ const FAKE_WITNESS: &str = "fake_harness_denies_once_and_types_no_interrupt";
 ///
 /// bd-6setu.1 (ADR-0022 D3): the harness LIST is the registry's; this is the
 /// policy those rows carry. One name set, one shape, no second vocabulary.
-const fn hc_pane_caps(harness: &'static str) -> HarnessCaps {
+fn hc_pane_caps(harness: &'static str) -> HarnessCaps {
     HarnessCaps {
         harness,
         hook: None,
         verified_by: None,
         inject: Capability::supported(SINK_WITNESS),
+        // bd-f888z: opencode alone has a verified API door (the harness_api
+        // session.prompt witness). Every other hc pane still types.
+        api: if harness == "opencode" {
+            Capability::supported("opencode_wake_rides_the_session_api")
+        } else {
+            Capability::unsupported(Fallback::Explicit)
+        },
         interrupt: Capability::supported(SINK_SHAPE_WITNESS),
         steer: Capability::unsupported(Fallback::Mail),
         resume: Capability::supported(SINK_WITNESS),
@@ -181,6 +197,7 @@ const fn fake_caps() -> HarnessCaps {
         hook: Some("pre_tool_use"),
         verified_by: Some(FAKE_WITNESS),
         inject: Capability::supported(FAKE_WITNESS),
+        api: Capability::unsupported(Fallback::Explicit),
         interrupt: Capability::supported(FAKE_WITNESS),
         steer: Capability::supported(FAKE_WITNESS),
         resume: Capability::supported(FAKE_WITNESS),
@@ -263,10 +280,13 @@ pub struct NoDoor {
 }
 
 /// What a wake does for a harness. Pure; the caller owns the pane sink.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WakeRoute {
     /// Type the wake line. `interrupt` types Escape before it.
     Inject { interrupt: bool },
+    /// Deliver through the harness's own server API into this session (bd-f888z).
+    /// The caller must not type: `prompt(session, text, delivery, msg_id)`.
+    Api { session: String },
     /// No injection door. The caller must not type: the fallback is the
     /// channel, and the wake is reported as skipped rather than as a no-op.
     NoDoor(NoDoor),
@@ -281,8 +301,26 @@ pub enum WakeRoute {
 /// behavior, [`WakeRoute::Inject`], never a silent refusal: bd-9tkm. A row
 /// that records `inject` unsupported is the only producer of
 /// [`WakeRoute::NoDoor`], and it names the fallback.
+#[cfg(test)]
 pub fn wake_route(kind: &str, hook_installed: bool) -> WakeRoute {
-    route_for(row(kind), kind, hook_installed)
+    wake_route_for(kind, None, hook_installed)
+}
+
+/// The API-aware route decision (bd-f888z). A harness with a verified `api`
+/// door AND a recorded harness session wakes through its server API; otherwise
+/// the existing Inject/NoDoor decision stands. Session ids are validated: an
+/// opencode session starts with `ses`, so a bogus recorded value cannot hijack
+/// the route.
+pub fn wake_route_for(kind: &str, session: Option<&str>, hook_installed: bool) -> WakeRoute {
+    let r = row(kind);
+    let api_ok = r.is_some_and(|row| row.api.supported)
+        && session.is_some_and(|s| s.trim_start().starts_with("ses"));
+    if api_ok {
+        return WakeRoute::Api {
+            session: session.expect("checked").trim().to_string(),
+        };
+    }
+    route_for(r, kind, hook_installed)
 }
 
 /// The policy for one row, or for no row (see [`wake_route`]). Split out so a
@@ -526,7 +564,7 @@ mod tests {
         let sink = include_str!("pane_write.rs");
         for row in rows().into_iter().chain(std::iter::once(fake_caps())) {
             row.check().unwrap_or_else(|e| panic!("{e}"));
-            for cap in [row.inject, row.interrupt, row.steer, row.resume] {
+            for cap in [row.inject, row.api, row.interrupt, row.steer, row.resume] {
                 if let Some(witness) = cap.verified_by {
                     assert!(
                         src.contains(&format!("fn {witness}("))
@@ -566,6 +604,39 @@ mod tests {
     /// bd-harness-caps-6r1x + bd-9tkm: a row that records no injection door
     /// gets a typed no-door naming the fallback and the pane sink types
     /// nothing; an unrecorded kind is still an hc pane and still injects.
+    /// Witness for opencode's `api` capability (bd-f888z): the API route is
+    /// chosen ONLY with a valid session, and other harnesses never get it.
+    #[test]
+    fn opencode_wake_rides_the_session_api() {
+        assert_eq!(
+            wake_route_for("opencode", Some("ses-abc123"), false),
+            WakeRoute::Api {
+                session: "ses-abc123".into()
+            }
+        );
+        assert_eq!(
+            wake_route_for("oc", Some("ses-xyz"), false),
+            WakeRoute::Api {
+                session: "ses-xyz".into()
+            }
+        );
+        // No recorded session -> Inject (never a silent NoDoor).
+        assert_eq!(
+            wake_route_for("opencode", None, false),
+            WakeRoute::Inject { interrupt: true }
+        );
+        // A bogus session cannot hijack the route.
+        assert_eq!(
+            wake_route_for("opencode", Some("pane-1"), false),
+            WakeRoute::Inject { interrupt: true }
+        );
+        // A harness without the api door never routes to the API.
+        assert_eq!(
+            wake_route_for("pi", Some("ses-abc"), false),
+            WakeRoute::Inject { interrupt: true }
+        );
+    }
+
     #[test]
     fn wake_falls_back_when_harness_cannot_inject() {
         assert_eq!(

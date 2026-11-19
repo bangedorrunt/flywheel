@@ -108,6 +108,12 @@ pub fn write_p2p_wake(
     use crate::harness_caps::WakeRoute;
     match route {
         WakeRoute::Inject { .. } => typer.prompt(target, line),
+        WakeRoute::Api { .. } => {
+            crate::harness_caps::harness_api::dispatch(&route, line, line, target, false, || {
+                typer.prompt(target, line)
+            })
+            .map(|_| ())
+        }
         WakeRoute::NoDoor(no_door) => anyhow::bail!(
             "wake line could not be delivered to {target}: {}",
             crate::harness_caps::no_door_line(&no_door)

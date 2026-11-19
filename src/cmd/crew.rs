@@ -521,6 +521,15 @@ fn harness_kind_for_target(project: &str, pane_id: &str, name: Option<&str>) -> 
         .unwrap_or_default()
 }
 
+/// bd-f888z: the recorded harness session for a target seat, if any. Drives
+/// the API wake route for opencode seats.
+fn harness_session_for_target(project: &str, pane_id: &str, name: Option<&str>) -> Option<String> {
+    crate::state::load_spawn_registry(project)
+        .into_iter()
+        .find(|e| e.pane_id == pane_id || name.is_some_and(|n| e.name == n))
+        .and_then(|e| e.harness_session)
+}
+
 fn toron_mail_send(dispatch: &PromptDispatch) -> Result<()> {
     let args = dispatch.mail_args();
     let out = Command::new("toron")
@@ -748,7 +757,12 @@ fn deliver_prompt_wake_hc(
     } else {
         kind
     };
-    let route = crate::harness_caps::wake_route(&kind, crate::harness_caps::installed_from_env());
+    let session = harness_session_for_target(project, &a.pane_id, a.name.as_deref());
+    let route = crate::harness_caps::wake_route_for(
+        &kind,
+        session.as_deref(),
+        crate::harness_caps::installed_from_env(),
+    );
     match ring_prompt_wake(
         &crate::pane_write::HcPanes(&c),
         &crate::pane_read::HcReader(&c),
@@ -823,7 +837,12 @@ fn deliver_prompt_wake_rex(
     } else {
         kind
     };
-    let route = crate::harness_caps::wake_route(&kind, crate::harness_caps::installed_from_env());
+    let session = harness_session_for_target(project, &a.pane_id, a.name.as_deref());
+    let route = crate::harness_caps::wake_route_for(
+        &kind,
+        session.as_deref(),
+        crate::harness_caps::installed_from_env(),
+    );
     match ring_prompt_wake(
         &crate::pane_write::RexPanes(&*backend),
         &crate::pane_read::PlaneReader(&*backend),

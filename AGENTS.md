@@ -55,6 +55,10 @@ bash scripts/verify-needles.sh
 # staged .rs). Installed per clone by scripts/hooks/install.sh (core.hooksPath),
 # so a caller staged without its callee dies before HEAD breaks for every lane
 bash scripts/fence.sh --index
+# bd-f888z: opencode wakes ride session.prompt (harness_api), not TUI typing —
+# one route decision in harness_caps; API failure falls back to Inject; journal
+# the route before invoke; msg id is idempotent per (watermark/mail, pin).
+# Spawn mints ses-* into SpawnEntry.harness_session; never type over operator text.
 # mutations alone; runs in its own scratch export, never edits your tree
 bash scripts/verify-mutations.sh scripts/mutations/<spec>.spec.sh
 # crew briefs (bd-0uzrq.4): a dispatched crew prompt IS a brief; the reply
