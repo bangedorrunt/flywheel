@@ -7,8 +7,80 @@
 use anyhow::{Result, bail};
 use clap::Subcommand;
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
+
+const CHIE_SUBPROCESS_TIMEOUT: Duration = Duration::from_millis(1500);
+
+struct ChildGuard(Option<Child>);
+
+impl ChildGuard {
+    fn kill_and_wait(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        self.kill_and_wait();
+    }
+}
+
+fn run_chie_bounded(cmd: &mut Command, timeout: Duration) -> std::io::Result<Output> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("missing stdout pipe"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("missing stderr pipe"))?;
+    let mut guard = ChildGuard(Some(child));
+
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let out_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = done_tx.send(());
+        buf
+    });
+    let err_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+
+    if done_rx.recv_timeout(timeout).is_err() {
+        guard.kill_and_wait();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("chie timed out after {} ms", timeout.as_millis()),
+        ));
+    }
+
+    let status = guard
+        .0
+        .take()
+        .ok_or_else(|| std::io::Error::other("missing child handle"))?
+        .wait()?;
+    let stdout_bytes = out_handle.join().unwrap_or_default();
+    let stderr_bytes = err_handle.join().unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+    })
+}
 
 use crate::config::Config;
 use crate::output::print_json;
@@ -188,11 +260,9 @@ pub fn check_trap_queries_strict(
                 run_check_trap(&["--path", q, "--json"], project_dir)?,
             );
         }
-        // chie check-trap has ONLY --command and --path. Passing --query makes
-        // it exit 2, which used to read as "no traps" (bd-97uwg).
         merge_lines(
             &mut out,
-            run_check_trap(&["--command", q, "--json"], project_dir)?,
+            run_check_trap_with_query_fallback(q, project_dir)?,
         );
         // The trap guard matches exact argv/path tokens; migrated lessons name
         // their file slug, so natural prose queries never hit. Recall over the
@@ -209,7 +279,7 @@ pub fn check_trap_queries_strict(
         let clipped: String = joined.chars().take(400).collect();
         merge_lines(
             &mut out,
-            run_check_trap(&["--command", &clipped, "--json"], project_dir)?,
+            run_check_trap_with_query_fallback(&clipped, project_dir)?,
         );
     }
     // Both the trap guard and recall can surface the same lesson several
@@ -267,6 +337,26 @@ fn chie_unreachable(err: &str) -> bool {
         || low.contains("daemon")
 }
 
+fn run_check_trap_with_query_fallback(
+    query: &str,
+    project_dir: Option<&Path>,
+) -> Result<Option<String>> {
+    match run_check_trap(
+        &["--command", query, "--query", query, "--json"],
+        project_dir,
+    ) {
+        Ok(res) => Ok(res),
+        Err(err) => {
+            let msg = err.to_string();
+            if msg.contains("unexpected argument") && msg.contains("--query") {
+                run_check_trap(&["--command", query, "--json"], project_dir)
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
 fn run_check_trap(args: &[&str], project_dir: Option<&Path>) -> Result<Option<String>> {
     let mut cmd = Command::new(chie_bin());
     cmd.args(["memory", "check-trap"]);
@@ -274,9 +364,11 @@ fn run_check_trap(args: &[&str], project_dir: Option<&Path>) -> Result<Option<St
         cmd.args(["--project", &dir]);
     }
     cmd.args(args);
-    let out = cmd
-        .output()
-        .map_err(|e| anyhow::anyhow!("cannot run chie check-trap: {e}"))?;
+    let out = match run_chie_bounded(&mut cmd, CHIE_SUBPROCESS_TIMEOUT) {
+        Ok(out) => out,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => bail!("cannot run chie check-trap: {e}"),
+    };
     if out.status.success() {
         return Ok(Some(
             String::from_utf8_lossy(&out.stdout).trim().to_string(),
@@ -306,9 +398,11 @@ fn lesson_recall(query: &str, project_dir: Option<&Path>) -> Result<Vec<String>>
     if let Some(dir) = chie_project(project_dir) {
         cmd.args(["--project", &dir]);
     }
-    let out = cmd
-        .output()
-        .map_err(|e| anyhow::anyhow!("cannot run chie recall: {e}"))?;
+    let out = match run_chie_bounded(&mut cmd, CHIE_SUBPROCESS_TIMEOUT) {
+        Ok(out) => out,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => bail!("cannot run chie recall: {e}"),
+    };
     if !out.status.success() {
         let err_text = String::from_utf8_lossy(&out.stderr).trim().to_string();
         if chie_unreachable(&err_text) {
@@ -498,7 +592,7 @@ pub fn record_lesson_with_pin(
         cmd.args(["--peer", &format!("agent:{p}")]);
     }
     cmd.arg(rule_lesson_event(content));
-    match cmd.output() {
+    match run_chie_bounded(&mut cmd, CHIE_SUBPROCESS_TIMEOUT) {
         Ok(out) => out.status.success(),
         Err(_) => false,
     }
@@ -675,6 +769,64 @@ mod tests {
         assert!(
             traps.is_empty(),
             "offline briefing preflight must be empty: {traps:?}"
+        );
+    }
+
+    #[test]
+    fn check_trap_falls_back_when_query_flag_rejected() {
+        let dir = tmpdir("query-fallback");
+        let fake = write_fake_chie(
+            &dir,
+            r#"#!/bin/sh
+if [ "$2" = "recall" ]; then
+  printf '{"conclusions":[],"events":[]}'
+  exit 0
+fi
+if echo "$*" | grep -q -- "--query"; then
+  echo "error: unexpected argument '--query' found" >&2
+  exit 2
+fi
+printf '[{"rule_id":"r-1","warning":"Strip TMPDIR slash"}]'
+"#,
+        );
+        let traps = with_chie_bin(&fake, || {
+            check_trap_queries_strict(&["proof46".to_string()], None).unwrap()
+        });
+        assert_eq!(traps, vec!["Strip TMPDIR slash".to_string()]);
+    }
+
+    #[test]
+    fn run_chie_bounded_kills_hung_subprocess() {
+        let dir = tmpdir("timeout");
+        let slow = write_fake_chie(&dir, "#!/bin/sh\nexec sleep 5\n");
+        let start = std::time::Instant::now();
+        let err = run_chie_bounded(&mut Command::new(slow), Duration::from_millis(80))
+            .expect_err("hung chie should time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn record_lesson_with_pin_forwards_peer_flag() {
+        let dir = tmpdir("record-pin");
+        let log = dir.join("args.txt");
+        let fake = write_fake_chie(
+            &dir,
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\n", log.display()),
+        );
+        let ok = with_chie_bin(&fake, || {
+            record_lesson_with_pin(
+                "Avoid trailing slash",
+                Some("error"),
+                None,
+                Some("QuietLantern"),
+            )
+        });
+        assert!(ok);
+        let recorded = fs::read_to_string(log).unwrap();
+        assert!(
+            recorded.contains("--peer agent:QuietLantern"),
+            "args: {recorded}"
         );
     }
 }
