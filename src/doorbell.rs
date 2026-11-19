@@ -1029,6 +1029,7 @@ pub fn deferred_wake_line() -> String {
 /// rings it. Written under the journal's cross-process lock, and the file is
 /// opened INSIDE the lock, so an append can never land between a drain's read
 /// and its rewrite.
+#[cfg(test)]
 pub fn append_deferred_wake(
     state_dir: &Path,
     project: &str,
@@ -1074,14 +1075,25 @@ pub fn unrung_deferrals(
     state_dir: &Path,
     workspaces: impl IntoIterator<Item = String>,
 ) -> Vec<(String, String)> {
+    unrung_deferrals_after(state_dir, workspaces, &|_pin| None)
+}
+
+/// bd-fwt8r: journal rows without a watermark are legacy and always ring;
+/// a row whose `wm` has been passed by the pin's current cursor is dropped and
+/// journaled as `already-pulled`.
+pub fn unrung_deferrals_after(
+    state_dir: &Path,
+    workspaces: impl IntoIterator<Item = String>,
+    current_wm: &dyn Fn(&str) -> Option<u64>,
+) -> Vec<(String, String)> {
     let wanted: std::collections::BTreeSet<String> = workspaces.into_iter().collect();
     let mut pending: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     for (ws, row) in journal_read_all(state_dir) {
         if !wanted.contains(&ws) {
             continue;
         }
-        let handoff = row
-            .get("executed")
+        let executed = row.get("executed");
+        let handoff = executed
             .and_then(|e| e.get("stage"))
             .and_then(|s| s.as_str())
             == Some("handoff");
@@ -1092,6 +1104,12 @@ pub fn unrung_deferrals(
                 m.get("line").and_then(|l| l.as_str()),
             )
         {
+            let wm = executed.and_then(|e| e.get("wm")).and_then(|w| w.as_u64());
+            if ring_is_already_pulled(current_wm(pin), wm) {
+                journal_already_pulled(state_dir, &ws, pin);
+                pending.remove(pin);
+                continue;
+            }
             pending.insert(pin.to_string(), line.to_string());
         }
         for action in row
@@ -1143,12 +1161,13 @@ pub fn pending_deferred_wakes(state_dir: &Path, project: &str) -> Vec<(String, S
 /// prompts). The taken set moves to `<handoff>.draining` and is removed only
 /// by [`commit_deferred_wakes`], after the host has journaled it: a crash in
 /// between re-takes the same wakes instead of dropping them.
+#[cfg(test)]
 pub fn take_deferred_wakes(
     state_dir: &Path,
     project: &str,
     hosted: &std::collections::BTreeSet<String>,
 ) -> Vec<(String, String)> {
-    take_deferred_wakes_after(state_dir, project, hosted, None)
+    take_deferred_wakes_after(state_dir, project, hosted, &|_pin| None)
 }
 
 /// A dropped ring leaves a durable audit row so a reader can tell "already
@@ -1184,7 +1203,7 @@ pub fn take_deferred_wakes_after(
     state_dir: &Path,
     project: &str,
     hosted: &std::collections::BTreeSet<String>,
-    current_wm: Option<u64>,
+    current_wm: &dyn Fn(&str) -> Option<u64>,
 ) -> Vec<(String, String)> {
     let path = deferred_wakes_path(state_dir, project);
     let draining = path.with_extension("draining");
@@ -1204,7 +1223,7 @@ pub fn take_deferred_wakes_after(
                     v.get("line").and_then(|l| l.as_str()),
                 ) {
                     let wm = v.get("wm").and_then(|w| w.as_u64());
-                    if ring_is_already_pulled(current_wm, wm) {
+                    if ring_is_already_pulled(current_wm(pin), wm) {
                         journal_already_pulled(state_dir, project, pin);
                         continue;
                     }
@@ -1249,12 +1268,26 @@ pub fn take_deferred_wakes_after(
 /// Journal one taken wake with the actions its fold produced, BEFORE
 /// [`commit_deferred_wakes`] removes it: the row is the durable record, and
 /// replaying it reproduces the same audit the live run recorded.
+#[cfg(test)]
 pub fn journal_deferred_wake(
     state_dir: &Path,
     workspace: &str,
     pin: &str,
     line: &str,
     cmds: &[crate::workspace::Cmd],
+) -> std::io::Result<()> {
+    journal_deferred_wake_with_wm(state_dir, workspace, pin, line, cmds, None)
+}
+
+/// bd-fwt8r: carry the ring watermark into the journal so the host's boot
+/// refold can re-check it against the pin's current inbox cursor.
+pub fn journal_deferred_wake_with_wm(
+    state_dir: &Path,
+    workspace: &str,
+    pin: &str,
+    line: &str,
+    cmds: &[crate::workspace::Cmd],
+    wm: Option<u64>,
 ) -> std::io::Result<()> {
     let msg = crate::workspace::Msg::PromptRefused {
         pin: pin.to_string(),
@@ -1265,7 +1298,7 @@ pub fn journal_deferred_wake(
             workspace,
             &serde_json::to_value(&msg).unwrap_or(serde_json::Value::Null),
             &serde_json::to_value(cmds).unwrap_or(serde_json::Value::Null),
-            serde_json::json!({ "stage": "handoff", "pin": pin }),
+            serde_json::json!({ "stage": "handoff", "pin": pin, "wm": wm }),
             std::slice::from_ref(&pin.to_string()),
         )
         .map_err(|e| std::io::Error::other(format!("journal the deferred wake: {e}")))
@@ -1761,6 +1794,24 @@ pub fn wake_state_file(state_dir: &Path, workspace: &str) -> PathBuf {
 
 /// Missing or corrupt file → DEFAULT (never a crash): at-least-once
 /// degrades to re-delivery, which the `[doorbell]` line makes idempotent.
+/// Current inbox watermark for a pin, in unix micros, from the wake state the
+/// host maintains for its plane session. Used at ring time to tell "mail was
+/// pulled after this ring was queued" from "still owed a ring" (bd-fwt8r).
+pub fn pin_cursor_us(state_dir: &Path, workspace: &str, pin: &str) -> Option<u64> {
+    let st = load_wake_state(&wake_state_file(state_dir, workspace));
+    st.since_by_pin
+        .get(pin)
+        .and_then(|stamp| doorbell_core::parse_rfc3339_micros(stamp).ok())
+        .and_then(|us| u64::try_from(us).ok())
+}
+
+pub fn now_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
+
 pub fn load_wake_state(path: &Path) -> WakeState {
     std::fs::read_to_string(path)
         .ok()
@@ -2853,7 +2904,7 @@ mod tests {
         )
         .expect("record");
         // The recipient pulled past the ring's watermark before it rang.
-        let taken = super::take_deferred_wakes_after(&dir, "flywheel", &hosted, Some(11));
+        let taken = super::take_deferred_wakes_after(&dir, "flywheel", &hosted, &|_| Some(11));
         assert!(taken.is_empty(), "a pulled ring must not fire");
         let audit = dir.join(format!(
             "doorbell-already-pulled-{}.jsonl",

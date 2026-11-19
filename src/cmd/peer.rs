@@ -179,11 +179,12 @@ fn defer_busy_p2p_wake(
         eprintln!("note: pane wake failed ({err}); directive delivered to inbox");
         return Ok(());
     }
-    crate::doorbell::append_deferred_wake(
+    crate::doorbell::append_deferred_wake_with_wm(
         &crate::config::state_dir(),
         &directive.project,
         pin,
         line,
+        Some(crate::doorbell::now_micros()),
     )
     .map_err(|e| anyhow::anyhow!("record the deferred p2p wake: {e}"))?;
     eprintln!("peer: pane busy; the doorbell rings this directive at the next prompt");

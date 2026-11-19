@@ -719,11 +719,12 @@ const QUEUED_WAKE: &str = "mail delivered; the doorbell rings at the next prompt
 /// Record the refused wake for the project's dispatcher, in the one line shape
 /// the fold treats as a mail wake.
 fn defer_busy_wake(project: &str, pin: &str) -> Result<()> {
-    crate::doorbell::append_deferred_wake(
+    crate::doorbell::append_deferred_wake_with_wm(
         &crate::config::state_dir(),
         project,
         pin,
         &crate::doorbell::deferred_wake_line(),
+        Some(crate::doorbell::now_micros()),
     )
     .map_err(|e| anyhow!("record the deferred wake: {e}"))
 }

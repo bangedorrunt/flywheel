@@ -988,9 +988,10 @@ impl Host for RtHost {
             let state_dir = crate::config::state_dir();
             if !self.boot_refolded {
                 self.boot_refolded = true;
-                for (pin, line) in crate::doorbell::unrung_deferrals(
+                for (pin, line) in crate::doorbell::unrung_deferrals_after(
                     &state_dir,
                     std::iter::once(self.workspace.clone()),
+                    &|pin| crate::doorbell::pin_cursor_us(&state_dir, &self.workspace, pin),
                 ) {
                     let (next, cmds) = workspace::tick(
                         &self.model,
@@ -1000,21 +1001,25 @@ impl Host for RtHost {
                         },
                     );
                     self.model = next;
-                    if let Err(e) = crate::doorbell::journal_deferred_wake(
+                    if let Err(e) = crate::doorbell::journal_deferred_wake_with_wm(
                         &state_dir,
                         &self.workspace,
                         &pin,
                         &line,
                         &cmds,
+                        Some(crate::doorbell::now_micros()),
                     ) {
                         eprintln!("flywheel: boot refold journal failed: {e}");
                     }
                 }
             }
             let mut journaled = true;
-            for (pin, line) in
-                crate::doorbell::take_deferred_wakes(&state_dir, &self.project, &hosted)
-            {
+            for (pin, line) in crate::doorbell::take_deferred_wakes_after(
+                &state_dir,
+                &self.project,
+                &hosted,
+                &|pin| crate::doorbell::pin_cursor_us(&state_dir, &self.workspace, pin),
+            ) {
                 let (next, cmds) = workspace::tick(
                     &self.model,
                     &workspace::Msg::PromptRefused {
@@ -1023,12 +1028,13 @@ impl Host for RtHost {
                     },
                 );
                 self.model = next;
-                if let Err(e) = crate::doorbell::journal_deferred_wake(
+                if let Err(e) = crate::doorbell::journal_deferred_wake_with_wm(
                     &state_dir,
                     &self.workspace,
                     &pin,
                     &line,
                     &cmds,
+                    Some(crate::doorbell::now_micros()),
                 ) {
                     eprintln!("flywheel: deferred wake journal failed: {e}");
                     journaled = false;
@@ -2472,6 +2478,103 @@ mod off_runtime_tests {
             let _ = host.fetch_inbox_process("SomePin", "last");
             let _ = host.tick(&BrainMsg::Watch(String::new()));
         });
+    }
+
+    /// bd-fwt8r: a ring queued before the recipient pulled the mail must be
+    /// dropped at the idle transition, with a durable already-pulled audit.
+    #[test]
+    fn a_pulled_deferral_does_not_ring_at_idle() {
+        let _home = crate::config::test_state_home();
+        let project = format!("pulled-host-{}", std::process::id());
+        let workspace = format!("session:pulled-{}", std::process::id());
+        let state_dir = crate::config::state_dir();
+        let pin = "BlueRidge";
+        let wm = 1_700_000_000_000_000u64;
+        crate::doorbell::append_deferred_wake_with_wm(
+            &state_dir,
+            &project,
+            pin,
+            &crate::doorbell::deferred_wake_line(),
+            Some(wm),
+        )
+        .expect("queue the deferral");
+        // The recipient pulled mail AFTER the ring was queued.
+        let mut st = crate::doorbell::WakeState::default();
+        st.since_by_pin
+            .insert(pin.to_string(), "2023-11-14T22:14:00.000000Z".to_string());
+        crate::doorbell::save_wake_state(
+            &crate::doorbell::wake_state_file(&state_dir, &workspace),
+            &st,
+        )
+        .expect("save pulled cursor");
+
+        let (tx, _rx) = mpsc::channel(8);
+        let mut host = RtHost::new(Config::default(), &project, &workspace, tx).expect("host");
+        host.tick(&BrainMsg::PlaneStatus {
+            pin: pin.to_string(),
+            status: "working".into(),
+        });
+        let effects = host.tick(&BrainMsg::PlaneStatus {
+            pin: pin.to_string(),
+            status: "idle".into(),
+        });
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::Prompt { pin: p, .. } if p == pin)),
+            "a pulled ring must not prompt: {effects:?}"
+        );
+        let audit = state_dir.join(format!(
+            "doorbell-already-pulled-{}.jsonl",
+            crate::state::state_key(&project)
+        ));
+        let raw = std::fs::read_to_string(audit).expect("already-pulled journal");
+        assert!(raw.contains(pin) && raw.contains("already-pulled"), "{raw}");
+    }
+
+    /// The converse: a deferral whose watermark is still ahead of the pin's
+    /// cursor must ring at idle, as before (bd-fwt8r).
+    #[test]
+    fn an_unpulled_deferral_still_rings_at_idle() {
+        let _home = crate::config::test_state_home();
+        let project = format!("unpulled-host-{}", std::process::id());
+        let workspace = format!("session:unpulled-{}", std::process::id());
+        let state_dir = crate::config::state_dir();
+        let pin = "LilacChapel";
+        let future_wm = u64::MAX;
+        crate::doorbell::append_deferred_wake_with_wm(
+            &state_dir,
+            &project,
+            pin,
+            &crate::doorbell::deferred_wake_line(),
+            Some(future_wm),
+        )
+        .expect("queue the deferral");
+        let mut st = crate::doorbell::WakeState::default();
+        st.since_by_pin
+            .insert(pin.to_string(), "2023-11-14T22:14:00.000000Z".to_string());
+        crate::doorbell::save_wake_state(
+            &crate::doorbell::wake_state_file(&state_dir, &workspace),
+            &st,
+        )
+        .expect("save cursor");
+
+        let (tx, _rx) = mpsc::channel(8);
+        let mut host = RtHost::new(Config::default(), &project, &workspace, tx).expect("host");
+        host.tick(&BrainMsg::PlaneStatus {
+            pin: pin.to_string(),
+            status: "working".into(),
+        });
+        let effects = host.tick(&BrainMsg::PlaneStatus {
+            pin: pin.to_string(),
+            status: "idle".into(),
+        });
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Prompt { pin: p, .. } if p == pin)),
+            "an unpulled deferral must still ring: {effects:?}"
+        );
     }
 
     /// The CLI knows the project, never the dispatcher's plane session id, so
