@@ -146,9 +146,43 @@ fn is_input_footer(text: &str) -> bool {
         && text.chars().count() <= 80
 }
 
-/// An open command palette owns keystrokes; never inject into it.
+/// An open command palette owns keystrokes; never inject into it. Its header
+/// and keybind rows sit in one block directly above the bottom input box.
 fn opencode_palette_open(tail: &str) -> bool {
-    tail.lines().filter(|line| line.contains("ctrl+x")).count() >= 2
+    let lines: Vec<&str> = tail.lines().collect();
+    let is_box = |line: &str| line.trim_start().starts_with('┃');
+    let mut i = lines.len();
+    while i > 0 && !is_box(lines[i - 1]) {
+        i -= 1;
+    }
+    while i > 0 && is_box(lines[i - 1]) {
+        i -= 1;
+    }
+    let mut above: Vec<&str> = Vec::new();
+    while i > 0 && !is_box(lines[i - 1]) {
+        i -= 1;
+        above.push(lines[i]);
+    }
+    let header = above
+        .iter()
+        .any(|line| trim_box_edge(line.trim_start()) == "Search")
+        && above
+            .iter()
+            .any(|line| matches!(trim_box_edge(line.trim_start()), "Suggested" | "Commands"));
+    let keybinds = above
+        .iter()
+        .filter(|line| {
+            line.find("ctrl+x").is_some_and(|at| {
+                line[..at]
+                    .chars()
+                    .rev()
+                    .take_while(|c| c.is_whitespace())
+                    .count()
+                    >= 4
+            })
+        })
+        .count();
+    header && keybinds >= 2
 }
 
 /// Classifies a screen structurally when the registry recorded no harness.

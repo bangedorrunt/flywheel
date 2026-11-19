@@ -60,3 +60,8 @@ expect = "operator-text"
 [[screen]]
 file = "boldcliff-deaf-empty-box.txt"
 expect = "empty"
+
+# SYNTHETIC: keybinds in a doorbell HISTORY bubble must not open the palette.
+[[screen]]
+file = "history-keybind-mentions.txt"
+expect = "empty"
