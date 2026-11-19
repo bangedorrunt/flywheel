@@ -995,6 +995,16 @@ fn inject_budget_path(state_dir: &Path, project: &str) -> PathBuf {
     ))
 }
 
+/// bd-fwt8r: a deferred ring is stale when the recipient's inbox cursor has
+/// already passed the mail that queued it. `None` on either side is inconclusive
+/// — never drop a ring we cannot prove was pulled.
+pub fn ring_is_already_pulled(current_wm: Option<u64>, ring_wm: Option<u64>) -> bool {
+    match (current_wm, ring_wm) {
+        (Some(current), Some(wm)) => current >= wm,
+        _ => false,
+    }
+}
+
 /// A refused wake waiting for a live dispatcher. Keyed by PROJECT: the CLI
 /// cannot know the dispatcher's plane session id, and a workspace key is what
 /// made the deferral invisible to the host. The host that owns the pin takes
@@ -1025,11 +1035,23 @@ pub fn append_deferred_wake(
     pin: &str,
     line: &str,
 ) -> std::io::Result<()> {
+    append_deferred_wake_with_wm(state_dir, project, pin, line, None)
+}
+
+/// bd-fwt8r: same handoff, but records the watermark the ring is about. A
+/// ring-time re-check drops it once the recipient's cursor has passed `wm`.
+pub fn append_deferred_wake_with_wm(
+    state_dir: &Path,
+    project: &str,
+    pin: &str,
+    line: &str,
+    wm: Option<u64>,
+) -> std::io::Result<()> {
     let path = deferred_wakes_path(state_dir, project);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut row = serde_json::json!({ "pin": pin, "line": line }).to_string();
+    let mut row = serde_json::json!({ "pin": pin, "line": line, "wm": wm }).to_string();
     row.push('\n');
     let store = doorbell_rt::FileStore::new(state_dir);
     store.with_file_lock(&path, |_| -> std::io::Result<()> {
@@ -1126,11 +1148,49 @@ pub fn take_deferred_wakes(
     project: &str,
     hosted: &std::collections::BTreeSet<String>,
 ) -> Vec<(String, String)> {
+    take_deferred_wakes_after(state_dir, project, hosted, None)
+}
+
+/// A dropped ring leaves a durable audit row so a reader can tell "already
+/// pulled" from "never queued" (bd-fwt8r).
+fn journal_already_pulled(state_dir: &Path, project: &str, pin: &str) {
+    let path = state_dir.join(format!(
+        "doorbell-already-pulled-{}.jsonl",
+        crate::state::state_key(project)
+    ));
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let mut row = serde_json::json!({
+        "kind": "already-pulled",
+        "project": project,
+        "pin": pin,
+        "at_unix": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    })
+    .to_string();
+    row.push('\n');
+    use std::io::Write;
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(row.as_bytes());
+    }
+}
+
+/// bd-fwt8r: at ring time, drop deferrals whose recorded watermark has already
+/// been passed by the recipient's cursor, journaling each as `already-pulled`.
+pub fn take_deferred_wakes_after(
+    state_dir: &Path,
+    project: &str,
+    hosted: &std::collections::BTreeSet<String>,
+    current_wm: Option<u64>,
+) -> Vec<(String, String)> {
     let path = deferred_wakes_path(state_dir, project);
     let draining = path.with_extension("draining");
     let store = doorbell_rt::FileStore::new(state_dir);
     let taken = store.with_file_lock(&path, |_| -> std::io::Result<Vec<(String, String)>> {
-        let mut all: Vec<(String, String)> = Vec::new();
+        let mut all: Vec<(String, String, Option<u64>)> = Vec::new();
         for source in [&draining, &path] {
             let Ok(raw) = fs::read_to_string(source) else {
                 continue;
@@ -1143,17 +1203,25 @@ pub fn take_deferred_wakes(
                     v.get("pin").and_then(|p| p.as_str()),
                     v.get("line").and_then(|l| l.as_str()),
                 ) {
-                    all.push((pin.to_string(), line.to_string()));
+                    let wm = v.get("wm").and_then(|w| w.as_u64());
+                    if ring_is_already_pulled(current_wm, wm) {
+                        journal_already_pulled(state_dir, project, pin);
+                        continue;
+                    }
+                    all.push((pin.to_string(), line.to_string(), wm));
                 }
             }
             let _ = fs::remove_file(source);
         }
-        let (mine, rest): (Vec<_>, Vec<_>) =
-            all.into_iter().partition(|(pin, _)| hosted.contains(pin));
+        let (mine, rest): (Vec<_>, Vec<_>) = all
+            .into_iter()
+            .partition(|(pin, _, _)| hosted.contains(pin));
         if !rest.is_empty() {
             let mut body = String::new();
-            for (pin, line) in &rest {
-                body.push_str(&serde_json::json!({ "pin": pin, "line": line }).to_string());
+            for (pin, line, wm) in &rest {
+                body.push_str(
+                    &serde_json::json!({ "pin": pin, "line": line, "wm": wm }).to_string(),
+                );
                 body.push('\n');
             }
             fs::write(&path, body)?;
@@ -1162,12 +1230,12 @@ pub fn take_deferred_wakes(
             return Ok(Vec::new());
         }
         let mut body = String::new();
-        for (pin, line) in &mine {
-            body.push_str(&serde_json::json!({ "pin": pin, "line": line }).to_string());
+        for (pin, line, wm) in &mine {
+            body.push_str(&serde_json::json!({ "pin": pin, "line": line, "wm": wm }).to_string());
             body.push('\n');
         }
         fs::write(&draining, body)?;
-        Ok(mine)
+        Ok(mine.into_iter().map(|(pin, line, _)| (pin, line)).collect())
     });
     match taken {
         Ok(Ok(entries)) => entries,
@@ -2742,6 +2810,59 @@ mod tests {
         assert!(
             unrung_deferrals(&dir, ["session:a".to_string()]).is_empty(),
             "a drained wake is never re-rung"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn already_pulled_decision_table() {
+        assert!(
+            super::ring_is_already_pulled(Some(10), Some(10)),
+            "cursor at the ring wm means the mail was pulled"
+        );
+        assert!(
+            super::ring_is_already_pulled(Some(11), Some(10)),
+            "past the ring wm"
+        );
+        assert!(
+            !super::ring_is_already_pulled(Some(9), Some(10)),
+            "behind the ring wm still rings"
+        );
+        assert!(
+            !super::ring_is_already_pulled(None, Some(10)),
+            "no cursor is inconclusive"
+        );
+        assert!(
+            !super::ring_is_already_pulled(Some(10), None),
+            "no ring wm is inconclusive"
+        );
+    }
+
+    #[test]
+    fn a_stale_deferral_is_dropped_and_journaled() {
+        let dir = std::env::temp_dir().join(format!("fw-pulled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hosted: std::collections::BTreeSet<String> =
+            ["BlueRidge".to_string()].into_iter().collect();
+        super::append_deferred_wake_with_wm(
+            &dir,
+            "flywheel",
+            "BlueRidge",
+            &deferred_wake_line(),
+            Some(10),
+        )
+        .expect("record");
+        // The recipient pulled past the ring's watermark before it rang.
+        let taken = super::take_deferred_wakes_after(&dir, "flywheel", &hosted, Some(11));
+        assert!(taken.is_empty(), "a pulled ring must not fire");
+        let audit = dir.join(format!(
+            "doorbell-already-pulled-{}.jsonl",
+            crate::state::state_key("flywheel")
+        ));
+        let raw = std::fs::read_to_string(audit).expect("already-pulled journal");
+        assert!(
+            raw.contains("already-pulled") && raw.contains("BlueRidge"),
+            "{raw}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
