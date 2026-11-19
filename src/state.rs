@@ -3644,7 +3644,6 @@ mod last_sent_tests {
 
     #[test]
     fn load_corrupt_file_returns_empty() {
-        let _g = crate::config::test_state_home();
         let project = "__test_corrupt__";
         let p = last_sent_file(project);
         let _ = std::fs::create_dir_all(p.parent().unwrap());
