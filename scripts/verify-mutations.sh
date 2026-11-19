@@ -286,6 +286,15 @@ snapshot_discard() {
     SNAP_DIR=""
 }
 
+# bd-ura2v: every path that differs from HEAD, staged OR unstaged, plus the
+# untracked ones. A staged-only needle edit is a real change to prove and must
+# be overlaid into the scratch export just like an unstaged one.
+overlay_paths() {
+    local repo="$1"
+    git -C "$repo" diff HEAD --name-only -z
+    git -C "$repo" ls-files -o --exclude-standard -z
+}
+
 # Run the suite. A non-zero exit is data here, not a failure of the harness, so
 # `set -e` is lifted around it rather than letting the exit propagate.
 run_tests() {
@@ -562,7 +571,7 @@ isolate_if_shared() {
         else
             rm -f "$export/$dirty"
         fi
-    done < <(git -C "$repo_abs" ls-files -m -o -d --exclude-standard -z)
+    done < <(overlay_paths "$repo_abs")
     if [ ! -f "$export/scripts/verify-mutations.sh" ]; then
         mkdir -p "$export/scripts"
         cp "$SELF_PATH" "$export/scripts/verify-mutations.sh"
@@ -654,8 +663,10 @@ main() {
     trap on_exit EXIT
     local spec=""
     local original=("$@")
+    local list_overlay=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
+            --list-overlay) [ "$#" -ge 2 ] || { echo "--list-overlay needs a repo" >&2; exit 2; }; list_overlay="$2"; shift ;;
             --self-test) self_test; exit $? ;;
             --cargo) CARGO_BIN="$2"; shift ;;
             --repo) REPO="$2"; shift ;;
@@ -671,6 +682,10 @@ main() {
         esac
         shift
     done
+    if [ -n "$list_overlay" ]; then
+        while IFS= read -r -d '' p; do printf '%s\n' "$p"; done < <(overlay_paths "$list_overlay")
+        exit 0
+    fi
     if [ -z "$spec" ]; then
         echo "a spec file is required unless --self-test is given" >&2
         usage >&2
