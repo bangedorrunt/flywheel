@@ -22,6 +22,13 @@ pub struct Brief {
     pub closed_ts_us: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipt: Option<String>,
+    /// bd-bi0mv: true when `receipt` is canonical typed JSON rather than prose.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub receipt_typed: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// The book, keyed by id in order of opening.
@@ -129,6 +136,7 @@ mod tests {
             opened_ts_us,
             closed_ts_us: None,
             receipt: None,
+            receipt_typed: false,
         }
     }
 

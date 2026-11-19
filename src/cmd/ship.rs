@@ -104,6 +104,13 @@ pub(crate) fn cmd_ship(cfg: &Config, cmd: &ShipCmd) -> Result<()> {
     }
 }
 
+/// bd-bi0mv: typed-receipt existence predicate. A commit exists when git can
+/// resolve it in the named repo; pure from the caller's perspective (no state
+/// mutation), so crew_receipt validation stays effect-law clean.
+pub(crate) fn sha_exists_in(root: &Path, sha: &str) -> bool {
+    git(root, &["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_ok()
+}
+
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
         .arg("-C")
@@ -848,7 +855,7 @@ pub(crate) fn lesson_advisory(bead: &str) -> String {
     )
 }
 
-fn ship_land(args: LandArgs<'_>) -> Result<()> {
+pub(crate) fn ship_land(args: LandArgs<'_>) -> Result<()> {
     let LandArgs {
         cfg,
         bead,

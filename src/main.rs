@@ -36,6 +36,7 @@ mod control;
 mod crew;
 mod crew_briefs;
 mod crew_menu;
+mod crew_receipt;
 mod cron;
 mod daemon;
 mod decide;
