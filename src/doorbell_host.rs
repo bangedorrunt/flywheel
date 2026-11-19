@@ -2514,10 +2514,7 @@ mod off_runtime_tests {
             pin: pin.to_string(),
             status: "working".into(),
         });
-        let effects = host.tick(&BrainMsg::PlaneStatus {
-            pin: pin.to_string(),
-            status: "idle".into(),
-        });
+        let effects = host.tick(&BrainMsg::Sweep { now: 1 });
         assert!(
             !effects
                 .iter()
@@ -2565,10 +2562,7 @@ mod off_runtime_tests {
             pin: pin.to_string(),
             status: "working".into(),
         });
-        let effects = host.tick(&BrainMsg::PlaneStatus {
-            pin: pin.to_string(),
-            status: "idle".into(),
-        });
+        let effects = host.tick(&BrainMsg::Sweep { now: 1 });
         assert!(
             effects
                 .iter()
