@@ -111,6 +111,12 @@ pub(crate) fn sha_exists_in(root: &Path, sha: &str) -> bool {
     git(root, &["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_ok()
 }
 
+/// bd-bi0mv: typed-receipt ancestry predicate — does `descendant` contain
+/// `ancestor` in the named repo?
+pub(crate) fn is_ancestor_in(root: &Path, ancestor: &str, descendant: &str) -> bool {
+    git(root, &["merge-base", "--is-ancestor", ancestor, descendant]).is_ok()
+}
+
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
         .arg("-C")

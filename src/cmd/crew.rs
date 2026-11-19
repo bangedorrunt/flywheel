@@ -948,10 +948,28 @@ fn open_brief(project: &str, pin: &str, subject: &str) -> Result<String> {
 /// The crew's structured reply (bd-0uzrq.4): close the brief, then wake the
 /// captain ONCE. A busy captain defers to the project's dispatcher — the same
 /// contract crews get — and a replayed reply emits nothing.
-/// bd-bi0mv: resolve `--receipt` (text) or `--receipt-json` (typed) into the
-/// string stored on the brief. The typed form is validated and canonicalised;
-/// exactly one source is required.
-fn resolve_receipt(cfg: &Config, text: Option<&str>, json: Option<&str>) -> Result<(String, bool)> {
+struct LiveReceiptChecks {
+    project_dir: std::path::PathBuf,
+}
+
+impl crate::crew_receipt::ReceiptChecks for LiveReceiptChecks {
+    fn bead_exists(&self, id: &str) -> bool {
+        crate::br::Bead::exists(Some(&self.project_dir), id)
+    }
+    fn commit_exists(&self, repo: &std::path::Path, sha: &str) -> bool {
+        crate::cmd::ship::sha_exists_in(repo, sha)
+    }
+    fn is_ancestor(&self, repo: &std::path::Path, ancestor: &str, descendant: &str) -> bool {
+        crate::cmd::ship::is_ancestor_in(repo, ancestor, descendant)
+    }
+}
+
+fn resolve_receipt(
+    cfg: &Config,
+    project: &str,
+    text: Option<&str>,
+    json: Option<&str>,
+) -> Result<(String, bool)> {
     match (text, json) {
         (Some(t), None) => Ok((t.to_string(), false)),
         (None, None) => bail!("crew done needs --receipt or --receipt-json"),
@@ -968,20 +986,11 @@ fn resolve_receipt(cfg: &Config, text: Option<&str>, json: Option<&str>) -> Resu
                 std::fs::read_to_string(source)
                     .map_err(|e| anyhow!("read --receipt-json {source}: {e}"))?
             };
-            let dir = crate::project_dir(cfg, "flywheel");
-            let r = crate::crew_receipt::validate(
-                &raw,
-                |id| crate::br::Bead::exists(Some(&dir), id),
-                |repo, sha| {
-                    let root = if repo == "." {
-                        dir.clone()
-                    } else {
-                        cfg.workspace_root().join(repo.trim_start_matches("../"))
-                    };
-                    crate::cmd::ship::sha_exists_in(&root, sha)
-                },
-            )
-            .map_err(|e| anyhow!("invalid typed receipt ({e})"))?;
+            let checks = LiveReceiptChecks {
+                project_dir: crate::project_dir(cfg, project),
+            };
+            let r = crate::crew_receipt::validate(&raw, &cfg.workspace_root(), project, &checks)
+                .map_err(|e| anyhow!("invalid typed receipt ({e})"))?;
             Ok((crate::crew_receipt::canonical(&r), true))
         }
     }
@@ -995,7 +1004,7 @@ fn cmd_crew_done(
     receipt_json: Option<&str>,
     r#as: Option<&str>,
 ) -> Result<()> {
-    let (receipt, receipt_typed) = resolve_receipt(cfg, receipt_text, receipt_json)?;
+    let (receipt, receipt_typed) = resolve_receipt(cfg, project, receipt_text, receipt_json)?;
     let mut book = load_briefs(project);
     if book.get(brief).is_none() {
         bail!("no such brief: {brief} — see `flywheel crew inbox --open --project {project}`");
@@ -1066,7 +1075,6 @@ fn cmd_crew_done(
         .and_then(|b| b.subject.split_whitespace().find(|w| w.starts_with("bd-")))
         .unwrap_or(brief);
     println!("{}", crate::cmd::ship::lesson_advisory(bead));
-    // bd-bi0mv: name the exact next command, never a vague "you're done".
     if receipt_typed {
         println!(
             "next: flywheel crew land {brief} --proof-receipt <proof.json> --project {project}"
@@ -1098,8 +1106,8 @@ fn cmd_crew_land(
         .ok_or_else(|| anyhow!("brief {brief_id} has an empty receipt"))?;
     let r = crate::crew_receipt::parse(raw)?;
     crate::crew_receipt::validate_structure(&r)?;
-    let mut landed = Vec::new();
-    land_beads(&r, |bead, sha, repo| {
+    let workspace_root = cfg.workspace_root();
+    land_beads(&r, &workspace_root, &project, |bead, sha, repo| {
         crate::cmd::ship::ship_land(crate::cmd::ship::LandArgs {
             cfg,
             bead,
@@ -1109,32 +1117,31 @@ fn cmd_crew_land(
             as_pin,
             message: None,
             dir: None,
-            repo: Some(std::path::Path::new(repo)),
+            repo: Some(repo),
             json: false,
         })
     })?;
-    for (bead, commit) in r.beads.iter().zip(r.commits.iter()) {
-        landed.push((bead.clone(), commit.sha.clone()));
+    for b in &r.beads {
+        println!("next: flywheel ship check {}", b.id);
     }
-    println!(
-        "next: flywheel ship check {}",
-        landed
-            .iter()
-            .map(|(b, s)| format!("{b} (sha {s})"))
-            .collect::<Vec<_>>()
-            .join("; flywheel ship check ")
-    );
     Ok(())
 }
 
-/// Pure land plan: one call per (bead, commit) pair, injected so the
-/// delegation to `ship land` is testable without a live repo (effect law).
-fn land_beads<F>(r: &crate::crew_receipt::CrewReceipt, mut land: F) -> Result<()>
+/// Pure land plan: one call per bead with the SAME resolver validation used,
+/// injected so delegation to `ship land` is testable without a live repo.
+fn land_beads<F>(
+    r: &crate::crew_receipt::CrewReceipt,
+    workspace_root: &std::path::Path,
+    project: &str,
+    mut land: F,
+) -> Result<()>
 where
-    F: FnMut(&str, &str, &str) -> Result<()>,
+    F: FnMut(&str, &str, &std::path::Path) -> Result<()>,
 {
-    for (bead, commit) in r.beads.iter().zip(r.commits.iter()) {
-        land(bead, &commit.sha, &commit.repo)?;
+    for b in &r.beads {
+        let repo = crate::crew_receipt::resolve_repo(workspace_root, project, &b.repo)
+            .map_err(|e| anyhow!("invalid typed receipt ({e})"))?;
+        land(&b.id, &b.sha, &repo)?;
     }
     Ok(())
 }
@@ -1200,8 +1207,6 @@ fn cmd_crew_inbox(
     let book = load_briefs(project);
     let now = now_us();
     let rows = book.open_for(pin, now);
-    // bd-bi0mv: a typed receipt is carried PARSED in the JSON view, so a
-    // captain never hand-parses a sha or bead id out of prose.
     let receipt_json = |b: &crate::crew_briefs::Brief| -> Value {
         match (b.receipt_typed, b.receipt.as_deref()) {
             (true, Some(raw)) => crate::crew_receipt::parse(raw)
@@ -1330,53 +1335,62 @@ pub(crate) fn cmd_crew_prompt(
 mod bd_bi0mv_land_tests {
     use super::land_beads;
 
-    #[test]
-    fn one_land_call_per_bead_with_its_commit_and_repo() {
-        let raw = crate::crew_receipt::parse(&format!(
-            r#"{{"schema":"flywheel-crew-receipt.v1","brief_id":"b","beads":["bd-a","bd-b"],
-                    "commits":[{{"repo":".","sha":"{}"}},{{"repo":"../toron","sha":"{}"}}],
+    fn raw() -> String {
+        format!(
+            r#"{{"schema":"flywheel-crew-receipt.v1","brief_id":"b","beads":[
+                    {{"id":"bd-a","repo":".","sha":"{}"}},
+                    {{"id":"bd-b","repo":"../toron","sha":"{}"}}],
                     "fence":{{"sha":"{}","verdict":"green"}},
                     "tests":{{"cmd":"cargo test","tail":"ok"}}}}"#,
             "a".repeat(40),
             "b".repeat(40),
             "c".repeat(40),
-        ))
-        .expect("parse");
+        )
+    }
+
+    #[test]
+    fn land_targets_the_resolved_repo_not_the_callers_cwd() {
+        let r = crate::crew_receipt::parse(&raw()).expect("parse");
+        let root = std::path::Path::new("/ws");
         let mut calls = Vec::new();
-        land_beads(&raw, |bead, sha, repo| {
-            calls.push((bead.to_string(), sha.to_string(), repo.to_string()));
+        land_beads(&r, root, "flywheel", |bead, sha, repo| {
+            calls.push((bead.to_string(), sha.to_string(), repo.to_path_buf()));
             Ok(())
         })
         .expect("land");
         assert_eq!(
             calls,
             vec![
-                ("bd-a".to_string(), "a".repeat(40), ".".to_string()),
-                ("bd-b".to_string(), "b".repeat(40), "../toron".to_string()),
+                (
+                    "bd-a".to_string(),
+                    "a".repeat(40),
+                    std::path::PathBuf::from("/ws/flywheel")
+                ),
+                (
+                    "bd-b".to_string(),
+                    "b".repeat(40),
+                    std::path::PathBuf::from("/ws/toron")
+                ),
             ]
         );
     }
 
     #[test]
     fn a_failing_land_stops_the_whole_receipt() {
-        let raw = crate::crew_receipt::parse(&format!(
-            r#"{{"schema":"flywheel-crew-receipt.v1","brief_id":"b","beads":["bd-a","bd-b"],
-                    "commits":[{{"repo":".","sha":"{}"}},{{"repo":".","sha":"{}"}}],
-                    "fence":{{"sha":"{}","verdict":"green"}},
-                    "tests":{{"cmd":"cargo test","tail":"ok"}}}}"#,
-            "a".repeat(40),
-            "b".repeat(40),
-            "c".repeat(40),
-        ))
-        .expect("parse");
+        let r = crate::crew_receipt::parse(&raw()).expect("parse");
         let mut seen = Vec::new();
-        let err = land_beads(&raw, |bead, _sha, _repo| {
-            seen.push(bead.to_string());
-            if bead == "bd-a" {
-                anyhow::bail!("gate failed")
-            }
-            Ok(())
-        })
+        let err = land_beads(
+            &r,
+            std::path::Path::new("/ws"),
+            "flywheel",
+            |bead, _sha, _repo| {
+                seen.push(bead.to_string());
+                if bead == "bd-a" {
+                    anyhow::bail!("gate failed")
+                }
+                Ok(())
+            },
+        )
         .expect_err("first land fails");
         assert!(err.to_string().contains("gate failed"));
         assert_eq!(seen, vec!["bd-a"], "a failed land must not land the rest");
