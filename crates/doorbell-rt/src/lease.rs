@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Seconds without a heartbeat before a live-pid lease counts stale.
 pub const LEASE_STALE_SECS: u64 = 90;
@@ -172,6 +173,10 @@ fn macos_process_start(pid: u32) -> Option<u64> {
 }
 
 pub fn pid_alive(pid: u32) -> bool {
+    // The checking process is alive by definition — no `ps` spawn needed.
+    if pid == std::process::id() {
+        return true;
+    }
     if pid <= 1 {
         return false;
     }
@@ -265,6 +270,20 @@ pub fn lease_stale_pure(lease: &OwnerLease, now_unix: u64, inputs: &LeaseInputs)
     now_unix.saturating_sub(lease.heartbeat_unix) > LEASE_STALE_SECS
 }
 
+/// The checking process's own identity, resolved once. `boot_id()` spawns
+/// `sysctl` and `process_start_unix` spawns `ps` on macOS; under a fully
+/// parallel suite those external reads can fail transiently, so two calls
+/// about the same live process can disagree (bd-6v6ec). Cache them once.
+fn self_boot_id() -> &'static str {
+    static BOOT: OnceLock<String> = OnceLock::new();
+    BOOT.get_or_init(boot_id)
+}
+
+fn self_process_start() -> u64 {
+    static START: OnceLock<u64> = OnceLock::new();
+    *START.get_or_init(|| process_start_unix(std::process::id()).unwrap_or_else(unix_now))
+}
+
 /// Stale = different boot OR pid dead OR start mismatch OR heartbeat older
 /// than 90s. Edge: cheap checks first (heartbeat age, boot, legacy stamp
 /// need no subprocess), then pid liveness and start stamp only when those
@@ -275,7 +294,12 @@ pub fn lease_stale(lease: &OwnerLease, now_unix: u64) -> bool {
     if now_unix.saturating_sub(lease.heartbeat_unix) > LEASE_STALE_SECS {
         return true;
     }
-    let current_boot = boot_id();
+    let is_self = lease.pid == std::process::id();
+    let current_boot = if is_self {
+        self_boot_id().to_string()
+    } else {
+        boot_id()
+    };
     if lease.boot_id != current_boot {
         return true;
     }
@@ -283,7 +307,11 @@ pub fn lease_stale(lease: &OwnerLease, now_unix: u64) -> bool {
         return true;
     }
     let alive = pid_alive(lease.pid);
-    let start = process_start_unix(lease.pid);
+    let start = if is_self {
+        Some(self_process_start())
+    } else {
+        process_start_unix(lease.pid)
+    };
     lease_stale_pure(
         lease,
         now_unix,
@@ -327,11 +355,11 @@ pub fn acquire_lease_kind(
     }
     let lease = OwnerLease {
         pid: std::process::id(),
-        boot_id: boot_id(),
+        boot_id: self_boot_id().to_string(),
         host: host_name(),
         started_unix: now_unix,
         heartbeat_unix: now_unix,
-        process_start_unix: process_start_unix(std::process::id()).unwrap_or(now_unix),
+        process_start_unix: self_process_start(),
         kind: kind.map(str::to_string),
     };
     write_lease_at(&path, &lease)?;

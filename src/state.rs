@@ -2310,6 +2310,10 @@ pub fn unregister_loop(project: &str, pid: u32) {
 /// poll, and it lingers in `ps` only until its parent reaps it — treating it
 /// as alive would let a stale registry entry block a takeover forever.
 pub fn pid_alive(pid: u32) -> bool {
+    // The checking process is alive by definition (bd-6v6ec: no `ps` spawn).
+    if pid == std::process::id() {
+        return true;
+    }
     let out = std::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "stat="])
         .output()
