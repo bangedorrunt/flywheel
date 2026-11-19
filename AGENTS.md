@@ -60,9 +60,12 @@ bash scripts/verify-mutations.sh scripts/mutations/<spec>.spec.sh
 # crew briefs (bd-0uzrq.4): a dispatched crew prompt IS a brief; the reply
 # closes it and wakes the captain. A pane wake that cannot resolve the captain
 # (a mail-only identity with no pane row) falls back to plane-P mail; both paths
-# dead is a typed error that says the captain heard NOTHING (bd-ezlme)
-flywheel crew inbox --open [--pin <pin>] [--project p]      # what nobody answered
-flywheel crew done <brief-id> --receipt "<sha + proof + test tail>" [--project p]
+# dead is a typed error that says the captain heard NOTHING (bd-ezlme).
+# bd-bi0mv: prefer typed receipts — --receipt-json validates sha40/beads/green
+# fence, --json carries them parsed, and crew land delegates to ship land.
+flywheel crew inbox --open [--pin <pin>] [--project p] [--json]  # what nobody answered (--json carries parsed receipts)
+flywheel crew done <brief-id> --receipt-json <file|-> [--project p]  # typed flywheel-crew-receipt.v1; --receipt "<text>" stays but is untyped
+flywheel crew land <brief-id> --proof-receipt <proof.json> [--project p]  # lands every bead in a typed receipt via ship land
 # a ring the pane already holds is not a failure: the mail is stored and the
 # prompt exits 0 saying it is queued (bd-8wdgn) — a scripted send never reads a
 # redundant wake as a dead one
