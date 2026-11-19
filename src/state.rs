@@ -1342,11 +1342,10 @@ pub fn loop_journal_file(project: &str) -> PathBuf {
         .join(format!("{}.jsonl", state_key(project)))
 }
 
-/// bd-f888z: append the chosen wake route to the per-project wake-route
-/// journal BEFORE the transport runs. `seed` is the idempotent effect key, so a
-/// retried ring records the same key. Best-effort: a journal failure must not
-/// drop the wake.
-pub fn journal_wake_route(pin: &str, seed: &str, route: &str) {
+/// Append one wake-route event. `phase` is `intent` (before invoke) or
+/// `outcome` (after); `seed` is the idempotent effect key. Bounded like the loop
+/// journal. Best-effort: a journal failure never drops the wake.
+pub fn journal_wake_route(pin: &str, seed: &str, phase: &str, route: &str) {
     let path = crate::config::state_dir().join("wake-routes.jsonl");
     if let Some(parent) = path.parent()
         && std::fs::create_dir_all(parent).is_err()
@@ -1357,6 +1356,7 @@ pub fn journal_wake_route(pin: &str, seed: &str, route: &str) {
         "ts": now_iso(),
         "pin": pin,
         "seed": seed,
+        "phase": phase,
         "route": route,
     });
     use std::io::Write;
@@ -1366,6 +1366,17 @@ pub fn journal_wake_route(pin: &str, seed: &str, route: &str) {
         .open(&path)
     {
         let _ = writeln!(f, "{}", serde_json::to_string(&entry).unwrap_or_default());
+        drop(f);
+    }
+    if let Ok(meta) = std::fs::metadata(&path)
+        && meta.len() > 5 * 1024 * 1024
+        && let Ok(raw) = std::fs::read_to_string(&path)
+    {
+        let lines: Vec<&str> = raw.lines().collect();
+        if lines.len() > 5000 {
+            let keep = lines[lines.len() - 5000..].join("\n") + "\n";
+            let _ = std::fs::write(&path, keep);
+        }
     }
 }
 
@@ -3633,6 +3644,7 @@ mod last_sent_tests {
 
     #[test]
     fn load_corrupt_file_returns_empty() {
+        let _g = crate::config::test_state_home();
         let project = "__test_corrupt__";
         let p = last_sent_file(project);
         let _ = std::fs::create_dir_all(p.parent().unwrap());

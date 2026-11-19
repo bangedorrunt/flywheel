@@ -103,13 +103,14 @@ pub fn write_p2p_wake(
     typer: &dyn PaneTyper,
     target: &str,
     line: &str,
+    pin: &str,
     route: crate::harness_caps::WakeRoute,
 ) -> anyhow::Result<()> {
     use crate::harness_caps::WakeRoute;
     match route {
         WakeRoute::Inject { .. } => typer.prompt(target, line),
         WakeRoute::Api { .. } => {
-            crate::harness_caps::harness_api::dispatch(&route, line, line, target, false, || {
+            crate::harness_api::dispatch(&route, line, line, pin, false, || {
                 typer.prompt(target, line)
             })
             .map(|_| ())

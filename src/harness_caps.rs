@@ -9,11 +9,6 @@
 //! Every shipped product row is unverified for `hook`. Nothing here edits an
 //! operator config or runs a harness.
 
-// bd-f888z: declared here (not in the shared main.rs) so the module lands with
-// files this lane owns. The transport port lives beside this capability table.
-#[path = "harness_api.rs"]
-pub mod harness_api;
-
 /// Exact reason a hook may print. No payload is interpolated into it. The
 /// script below spells the same text as a literal in a `&'static str` (a
 /// `concat!` cannot fold a const), so this copy exists for the tests that

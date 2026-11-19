@@ -29,6 +29,8 @@ pub const SCRUBBED: &[&str] = &[
     "HC_SOCKET_PATH",
     "HC_TERMINAL_ID",
     "AGENT_NAME",
+    "FLYWHEEL_OPENCODE_API_URL",
+    "OPENCODE_SERVER_PASSWORD",
 ];
 
 const SUPERVISOR_SHIMS: [&str; 2] = ["launchctl", "systemctl"];

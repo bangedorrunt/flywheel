@@ -461,9 +461,13 @@ fn deliver_p2p_wake_hc(
         crate::harness_caps::installed_from_env(),
     );
     let line = directive.wake_line(wm);
-    if let Err(e) =
-        crate::pane_write::write_p2p_wake(&crate::pane_write::HcPanes(&c), &target, &line, route)
-    {
+    if let Err(e) = crate::pane_write::write_p2p_wake(
+        &crate::pane_write::HcPanes(&c),
+        &target,
+        &line,
+        pin,
+        route,
+    ) {
         crate::cmd::peer::defer_busy_p2p_wake(directive, pin, &line, &e)?;
     }
     Ok(line)
@@ -507,6 +511,7 @@ fn deliver_p2p_wake_rex(
         &crate::pane_write::RexPanes(&*backend),
         &target,
         &line,
+        pin,
         route,
     ) {
         defer_busy_p2p_wake(directive, pin, &line, &e)?;

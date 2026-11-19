@@ -684,7 +684,7 @@ pub(crate) fn ring_wake(
     };
     if is_api {
         let seed = format!("wm-{wm:x}");
-        let taken = crate::harness_caps::harness_api::dispatch(
+        let taken = crate::harness_api::dispatch(
             &route,
             line,
             &seed,
@@ -694,11 +694,10 @@ pub(crate) fn ring_wake(
         )
         .map_err(|e| e.to_string())?;
         return Ok(match taken {
-            crate::harness_caps::harness_api::RouteTaken::Api
-            | crate::harness_caps::harness_api::RouteTaken::Inject => RingDone::Typed,
-            crate::harness_caps::harness_api::RouteTaken::NoDoor => {
-                RingDone::Deferred("api wake had no door")
+            crate::harness_api::RouteTaken::Api | crate::harness_api::RouteTaken::Inject => {
+                RingDone::Typed
             }
+            crate::harness_api::RouteTaken::NoDoor => RingDone::Deferred("api wake had no door"),
         });
     }
     if !crate::pane_screen::may_inject(input) {
@@ -858,7 +857,6 @@ impl Ports for FlywheelPorts {
         // type over a half-typed line, and never type into a pane we cannot
         // read — a deferral is reported as a refusal, so the wake re-rings on
         // the next idle edge instead of a timer firing into their input.
-        // bd-f888z: an API wake skips this read entirely (ring_wake handles it).
         let input = self.pane_input_line(pane_id, &kind)?;
         let route = crate::harness_caps::wake_route_for(
             &kind,

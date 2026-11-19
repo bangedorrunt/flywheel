@@ -61,6 +61,7 @@ mod effect_journal;
 mod elm;
 mod failure;
 mod fs_util;
+mod harness_api;
 mod harness_caps;
 mod harness_registry;
 mod hc;
@@ -2098,6 +2099,18 @@ enum Commands {
         #[arg(long)]
         memory: Option<String>,
     },
+    /// internal: wake one seat through its harness API (bd-f888z). Resolves the
+    /// pin's recorded session and calls the one dispatch seam; used by the live
+    /// API-wake test. Prints the route taken and the derived msg id.
+    #[command(name = "__wake-api", hide = true)]
+    __WakeApi {
+        project: String,
+        pin: String,
+        text: String,
+        seed: String,
+        #[arg(long)]
+        urgent: bool,
+    },
     /// internal: the project's expected-reply entries (checkpointed leaf —
     /// collab may have written new ones while the loop runs)
     #[command(name = "__expected-replies", hide = true)]
@@ -4074,6 +4087,39 @@ fn main() {
             }
             Err(e) => Err(e),
         },
+        Some(Commands::__WakeApi {
+            project,
+            pin,
+            text,
+            seed,
+            urgent,
+        }) => {
+            let entry = state::load_spawn_registry(project)
+                .into_iter()
+                .find(|e| e.name.as_str() == pin.as_str() || e.mail_identity.as_deref() == Some(pin.as_str()));
+            let kind = entry.as_ref().and_then(|e| e.harness.clone()).unwrap_or_default();
+            let session = entry.and_then(|e| e.harness_session);
+            let session_for_json = session.clone();
+            let route = harness_caps::wake_route_for(
+                &kind,
+                session.as_deref(),
+                harness_caps::installed_from_env(),
+            );
+            let taken = harness_api::dispatch(&route, text, seed, pin, *urgent, || {
+                anyhow::bail!("no inject fallback in __wake-api (API-only probe)")
+            });
+            let msg = harness_api::msg_id(seed, pin);
+            match taken {
+                Ok(t) => {
+                    print_json(&json!({
+                        "ok": true, "route": format!("{t:?}"), "msg_id": msg, "pin": pin,
+                        "session": session_for_json
+                    }));
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
         Some(Commands::__ExpectedReplies { project }) => {
             print_json(&json!({ "entries": state::load_expected_replies(project) }));
             Ok(())

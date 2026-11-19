@@ -2111,8 +2111,6 @@ projects available: {}",
             if needs_in_arg_prime(&kind) && !has_peer_prime {
                 agent_args.push(boot_prime_line().to_string());
             }
-            // bd-f888z: mint the opencode session into argv BEFORE launch, then
-            // record it on the SpawnEntry so wakes can ride session.prompt.
             let harness_session = mint_harness_session(&kind, &mut agent_args);
             let shell_ready = hc::wait_shell_prompt(&c, &pane_id, Duration::from_secs(15));
             if !shell_ready {
@@ -2234,8 +2232,6 @@ projects available: {}",
                 .filter(|e| !e.is_empty());
             entry.mode = None;
             entry.skills_digest = skills_digest;
-            // bd-f888z: a minted opencode session wins; otherwise keep the
-            // legacy capture (grok GROK_SESSION_ID).
             entry.harness_session =
                 harness_session.or_else(|| captain_directory::capture_harness_session(&kind));
             registry.push(with_recorded_harness(entry, &kind));
@@ -2978,7 +2974,6 @@ pub(crate) fn cmd_spawn_rex(
             if needs_in_arg_prime(&kind) && !has_peer_prime {
                 agent_args.push(boot_prime_line().to_string());
             }
-            // bd-f888z: mint the opencode session into argv BEFORE launch.
             let harness_session = mint_harness_session(&kind, &mut agent_args);
             let command = crate::pane::rex_env_command(&pane_env, &kind, &agent_args);
             let pane_id = if first {
@@ -3085,7 +3080,6 @@ pub(crate) fn cmd_spawn_rex(
                 .as_deref()
                 .and_then(|pname| catalog.get(pname))
                 .and_then(|p| profile::skills_digest(&p.skills));
-            // bd-f888z: a minted opencode session wins over legacy capture.
             entry.harness_session =
                 harness_session.or_else(|| captain_directory::capture_harness_session(&kind));
             registry.push(entry);

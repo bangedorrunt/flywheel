@@ -105,42 +105,104 @@ impl HarnessApi for FakeApi {
     }
 }
 
-/// Discover the opencode service URL. Env override first (tests / explicit
-/// operator pin), then `opencode service status` which prints the URL on stdout.
-/// Never a hardcoded port.
-pub fn discover_service_url() -> anyhow::Result<String> {
-    if let Ok(url) = std::env::var("FLYWHEEL_OPENCODE_API_URL") {
-        let url = url.trim().to_string();
-        if !url.is_empty() {
-            return Ok(url.trim_end_matches('/').to_string());
+struct ServiceConfig {
+    url: String,
+    password: Option<String>,
+}
+
+fn discover_uncached() -> anyhow::Result<ServiceConfig> {
+    let mut password = std::env::var("OPENCODE_SERVER_PASSWORD")
+        .ok()
+        .filter(|p| !p.is_empty());
+    let mut url = std::env::var("FLYWHEEL_OPENCODE_API_URL")
+        .ok()
+        .filter(|u| !u.is_empty());
+    if url.is_none() {
+        if let Ok(out) = std::process::Command::new("opencode")
+            .args(["service", "get"])
+            .output()
+            && out.status.success()
+            && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            && let Some(p) = v.get("password").and_then(|p| p.as_str())
+            && !p.is_empty()
+        {
+            password = Some(p.to_string());
+        }
+        let out = std::process::Command::new("opencode")
+            .args(["service", "status"])
+            .output()
+            .map_err(|e| anyhow::anyhow!("cannot run `opencode service status`: {e}"))?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "opencode service status failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        url = Some(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+    let url = url.expect("set above");
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        anyhow::bail!("opencode service URL is not http(s): {url:?}");
+    }
+    Ok(ServiceConfig {
+        url: url.trim_end_matches('/').to_string(),
+        password,
+    })
+}
+
+/// Discover the opencode service config (URL + optional password). Short
+/// per-process cache: service status is a subprocess, so a burst of wakes must
+/// not re-spawn it each time. Env override wins; never a hardcoded port.
+fn discover_service() -> anyhow::Result<ServiceConfig> {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<Option<(Instant, ServiceConfig)>> = Mutex::new(None);
+    const TTL: Duration = Duration::from_secs(30);
+    if let Some(cached) = CACHE.lock().expect("cache lock").as_ref()
+        && cached.0.elapsed() < TTL
+    {
+        return Ok(ServiceConfig {
+            url: cached.1.url.clone(),
+            password: cached.1.password.clone(),
+        });
+    }
+    let found = discover_uncached()?;
+    *CACHE.lock().expect("cache lock") = Some((
+        Instant::now(),
+        ServiceConfig {
+            url: found.url.clone(),
+            password: found.password.clone(),
+        },
+    ));
+    Ok(found)
+}
+
+/// A typed failure the caller treats like any other API failure -> Inject.
+#[derive(Debug)]
+pub enum ApiError {
+    Unauthorized,
+    Other(String),
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiError::Unauthorized => write!(f, "opencode api unauthorized (401)"),
+            ApiError::Other(s) => write!(f, "opencode api failed: {s}"),
         }
     }
-    let out = std::process::Command::new("opencode")
-        .args(["service", "status"])
-        .output()
-        .map_err(|e| anyhow::anyhow!("cannot run `opencode service status`: {e}"))?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "opencode service status failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        anyhow::bail!("opencode service status gave no URL: {url:?}");
-    }
-    Ok(url.trim_end_matches('/').to_string())
 }
+impl std::error::Error for ApiError {}
 
 /// Real HTTP transport: POST /api/session/{session}/prompt with the v2 body.
 pub struct HttpApi {
-    url: String,
+    cfg: ServiceConfig,
 }
 
 impl HttpApi {
     pub fn discover() -> anyhow::Result<Self> {
         Ok(Self {
-            url: discover_service_url()?,
+            cfg: discover_service()?,
         })
     }
 }
@@ -153,16 +215,20 @@ impl HarnessApi for HttpApi {
         delivery: Delivery,
         msg_id: &str,
     ) -> anyhow::Result<()> {
-        let url = format!("{}/api/session/{}/prompt", self.url, session);
+        let url = format!("{}/api/session/{}/prompt", self.cfg.url, session);
         let body = serde_json::json!({
             "text": text,
             "id": msg_id,
             "delivery": delivery.as_str(),
         });
-        ureq::post(&url)
-            .timeout(std::time::Duration::from_secs(5))
-            .send_json(body)
-            .map_err(|e| anyhow::anyhow!("opencode session.prompt failed: {e}"))?;
+        let mut req = ureq::post(&url).timeout(std::time::Duration::from_secs(5));
+        if let Some(pw) = &self.cfg.password {
+            req = req.set("Authorization", &format!("Basic {pw}"));
+        }
+        req.send_json(body).map_err(|e| match e {
+            ureq::Error::Status(401, _) => anyhow::Error::new(ApiError::Unauthorized),
+            other => anyhow::Error::new(ApiError::Other(other.to_string())),
+        })?;
         Ok(())
     }
 }
@@ -180,32 +246,40 @@ pub fn dispatch(
     inject: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<RouteTaken> {
     if let crate::harness_caps::WakeRoute::Api { .. } = route {
-        // Journal the route BEFORE invoking the provider (effect law).
-        crate::state::journal_wake_route(pin, seed, route_tag(route));
-        let api = match HttpApi::discover() {
-            Ok(a) => a,
-            Err(_) => {
-                return deliver(
-                    &api_unavailable(),
-                    route,
-                    text,
-                    &msg_id(seed, pin),
-                    urgent,
-                    inject,
-                );
-            }
-        };
+        crate::state::journal_wake_route(pin, seed, "intent", route_tag(route));
         let id = msg_id(seed, pin);
-        return deliver(&api, route, text, &id, urgent, inject);
+        let (api, discovery_ok): (Box<dyn HarnessApi>, bool) = match HttpApi::discover() {
+            Ok(a) => (Box::new(a), true),
+            Err(_) => (Box::new(api_unavailable()), false),
+        };
+        let taken = deliver(&*api, route, text, &id, urgent, inject)?;
+        crate::state::journal_wake_route(
+            pin,
+            seed,
+            "outcome",
+            route_taken_tag(taken, discovery_ok),
+        );
+        return Ok(taken);
     }
-    deliver(
+    let taken = deliver(
         &api_unavailable(),
         route,
         text,
         &msg_id(seed, pin),
         urgent,
         inject,
-    )
+    )?;
+    crate::state::journal_wake_route(pin, seed, "outcome", route_taken_tag(taken, true));
+    Ok(taken)
+}
+
+fn route_taken_tag(taken: RouteTaken, discovery_ok: bool) -> &'static str {
+    match taken {
+        RouteTaken::Api => "api",
+        RouteTaken::Inject if !discovery_ok => "inject (service down)",
+        RouteTaken::Inject => "inject (api failed)",
+        RouteTaken::NoDoor => "no-door",
+    }
 }
 
 /// A transport that always fails — used when the API route is not selected, so

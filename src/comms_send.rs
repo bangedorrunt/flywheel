@@ -660,7 +660,7 @@ pub async fn ring_with_route(
     };
     if let Some(crate::harness_caps::WakeRoute::Api { .. }) = &route {
         let r = route.expect("checked api");
-        crate::harness_caps::harness_api::dispatch(
+        crate::harness_api::dispatch(
             &r,
             &line,
             &format!("wm-{:x}", wm.0),
