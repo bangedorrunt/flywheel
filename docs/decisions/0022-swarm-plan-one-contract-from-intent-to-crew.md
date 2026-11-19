@@ -1,6 +1,6 @@
 <!-- governed-by: ADR-0007, ADR-0011, ADR-0013, ADR-0016, ADR-0018, ADR-0021, toron ADR-0010, toron ADR-0022, toron ADR-0026, toron ADR-0032, toron ADR-0045 -->
 ---
-status: proposed  # 2026-11-17: implementation map in §8 (D1–D8, V1–V11, acceptance 1–7); not reviewed for acceptance
+status: accepted  # 2026-11-20: accepted by the decision-maker; implementation map in §8 all closed (D1–D8, V1–V11, acceptance 1–7)
 date: 2026-11-13
 decision-makers: Captain (bangedorrunt)
 consulted: |
@@ -25,7 +25,7 @@ builds-on: |
 
 | Field | Value |
 |---|---|
-| **Status** | Proposed (2026-11-13) |
+| **Status** | **Accepted** (2026-11-20; proposed 2026-11-13) |
 | **Governs** | `flywheel-plan.v1`; field provenance and precedence; consent policy; standing preferences; harness adapters; step→seat binding; plan→swarm reconciler |
 | **Companion** | [flywheel ADR-0021](0021-elastic-role-morphing-declarative-topologies-and-capability-contracts.md) decides *what* a step needs and hands back (stage contract, witness). This ADR decides *who* runs it. |
 | **Vocabulary** | ADR-0021 D1: **mode** `open \| swarm`; **swarm** = this plan + its seats + its run; **slot** = model tier (`@cheap` / `@standard` / `@premium`, ADR-0007). This record first called the live object a "fleet" and the tiers "bands"; both words are retired. |

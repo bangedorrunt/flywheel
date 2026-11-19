@@ -1,6 +1,6 @@
 <!-- governed-by: ADR-0005, ADR-0006, ADR-0007, ADR-0008, ADR-0009, ADR-0016, ADR-0018, ADR-0020, ADR-0022, toron ADR-0022, toron ADR-0024, toron ADR-0026, toron ADR-0032 -->
 ---
-status: proposed  # 2026-11-17: implementation map in §6 (D1–D7, acceptance 1–7); not reviewed for acceptance
+status: accepted  # 2026-11-20: accepted by the decision-maker; implementation map in §6 all closed (D1–D7, acceptance 1–7)
 date: 2026-11-12
 revised: 2026-11-13
 decision-makers: Captain (bangedorrunt)
@@ -23,7 +23,7 @@ companion: flywheel ADR-0022 (the swarm plan: who runs each step).
 
 | Field | Value |
 |---|---|
-| **Status** | **Proposed** (draft 2026-11-12; revised in place 2026-11-13) |
+| **Status** | **Accepted** (2026-11-20; draft 2026-11-12; revised in place 2026-11-13) |
 | **Governs** | Mode vs shape vocabulary; `compose:` flag on workflows; the stage contract (phase, mode, context, effort, reads, witness, repeat); `dispatch_job` await on job results; verification of the workflow that runs; stage catalog curation; the plan-polish loop |
 | **Does not amend** | `flywheel → toron-workflow → toron-core`; Tick Law; journal-before-provider; bead close ceremony; SIGNOFF outer-only (ADR-0008) |
 | **Companion** | [flywheel ADR-0022](0022-swarm-plan-one-contract-from-intent-to-crew.md) decides *who* runs a step (seat, harness, model). This ADR decides *what* a step needs and *what it must hand back*. |
