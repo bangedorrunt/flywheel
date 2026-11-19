@@ -28,17 +28,39 @@ cd "$ROOT"
 DRY=0
 KEEP=0
 SELFTEST=0
+CHECK_TARGET=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY=1; shift ;;
         --keep) KEEP=1; shift ;;
         --selftest) SELFTEST=1; shift ;;
+        --check-target) [ $# -ge 2 ] || { echo "e2e-live-five: --check-target needs a dir" >&2; exit 2; }; CHECK_TARGET="$2"; shift 2 ;;
         -h | --help) sed -n '2,26p' "$0"; exit 0 ;;
         *) echo "e2e-live-five: unknown arg: $1" >&2; exit 2 ;;
     esac
 done
 
 die() { printf 'e2e-live-five: %s\n' "$*" >&2; exit 2; }
+
+# bd-o2uol: the five suites run plain cargo against this repo's `target`. An
+# mbx cache cleanup can leave `target` as a symlink to a directory that no
+# longer exists; cargo then fails each of the five tests with a misleading
+# "Not a directory". Diagnose it ONCE, before creating any live pane.
+check_target_link() { # dir -> 0 when target is usable, 1 with one diagnosis line
+    local dir="$1"
+    local target="$dir/target"
+    if [ -L "$target" ] && [ ! -e "$target" ]; then
+        printf 'e2e-live-five: %s is a dangling symlink to %s (mbx cache cleanup?) — remove it or recreate the destination\n' \
+            "$target" "$(readlink "$target")" >&2
+        return 1
+    fi
+    return 0
+}
+
+if [ -n "$CHECK_TARGET" ]; then
+    check_target_link "$CHECK_TARGET"
+    exit $?
+fi
 
 STAMP="$(date +%Y%m%dT%H%M%SZ)"
 PROJECT="${FLYWHEEL_LIVE_PROJECT:-e2e-live-five}"
@@ -109,6 +131,7 @@ EOF
     exit 0
 fi
 
+check_target_link "$ROOT" || exit 2
 [ "${FLYWHEEL_LIVE_E2E:-}" = 1 ] || die "set FLYWHEEL_LIVE_E2E=1 to run the live suites deliberately"
 [ -n "$TORON_BIN" ] || die "TORON_BIN not found; name the toron binary"
 
