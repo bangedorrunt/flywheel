@@ -30,10 +30,8 @@ last_typed = "Reply with exactly: OK"
 
 [[screen]]
 file = "modal.txt"
-expect = "empty"
-# bd-29pj3: the bottom box is empty; the palette overlay's typed line is a
-# separate marker run above, past non-marker lines. The old operator-text
-# expectation came from the walk-past bug, not from text in the input box.
+expect = "operator-text"
+# An open command palette owns keystrokes, even when the input box is empty.
 
 # SYNTHETIC (bd-8wdgn), not a rex capture: the box reproduced from the live
 # failure holds the doorbell's own queued line. It is NOT operator typing and
@@ -45,8 +43,7 @@ expect = "wake-queued"
 # bd-g4xlr: the current opencode footer ("auto <model> · <effort>") is a status
 # row, not typed text. new-empty-footer is a REAL capture; new-typed-footer is
 # SYNTHETIC - the same frame with one typed line inserted above the footer.
-# bd-29pj3: the old doorbell bubble in this capture is history, not a queued
-# wake - the box nearest the bottom is empty.
+# A doorbell bubble above the box is history, not a queued wake.
 [[screen]]
 file = "new-empty-footer.txt"
 expect = "empty"
@@ -59,9 +56,7 @@ expect = "empty"
 file = "new-typed-footer.txt"
 expect = "operator-text"
 
-# bd-29pj3: REAL BoldCliff screen. The input box is EMPTY; the last doorbell
-# bubble is old history separated from the box by non-marker lines. Walking
-# past those lines made every ring defer forever (the seat went deaf).
+# An empty box above a doorbell bubble in history classifies empty.
 [[screen]]
 file = "boldcliff-deaf-empty-box.txt"
 expect = "empty"

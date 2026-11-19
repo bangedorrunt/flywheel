@@ -146,6 +146,11 @@ fn is_input_footer(text: &str) -> bool {
         && text.chars().count() <= 80
 }
 
+/// An open command palette owns keystrokes; never inject into it.
+fn opencode_palette_open(tail: &str) -> bool {
+    tail.lines().filter(|line| line.contains("ctrl+x")).count() >= 2
+}
+
 /// Classifies a screen structurally when the registry recorded no harness.
 pub fn input_line_for_unknown_harness(tail: &str, last_typed: Option<&str>) -> InputLine {
     for harness in ["opencode", "claude", "gemini", "pi"] {
@@ -164,6 +169,9 @@ pub fn input_line_for_unknown_harness(tail: &str, last_typed: Option<&str>) -> I
 /// is not operator typing — measured in the corpus.
 pub fn input_line_for(harness: &str, tail: &str, last_typed: Option<&str>) -> InputLine {
     let harness = canonical(harness);
+    if harness.as_str() == "opencode" && opencode_palette_open(tail) {
+        return InputLine::OperatorText;
+    }
     let content: Option<String> = match harness.as_str() {
         "opencode" => marker_box(tail, "┃", &is_input_footer),
         "claude" => marker_box(tail, "❯", &|_| false),

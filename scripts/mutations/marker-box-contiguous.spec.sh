@@ -1,7 +1,5 @@
 # Sourced by scripts/verify-mutations.sh.
-# bd-29pj3: the box is the contiguous marker run nearest the bottom. Walking
-# past non-marker lines into chat history makes an old doorbell bubble read as
-# a queued wake, so an idle opencode seat defers every ring and goes deaf.
+# The box is the contiguous marker run nearest the bottom.
 
 CARGO_ARGS=(--bin flywheel)
 TEST_FILTER=(every_captured_screen_classifies)
