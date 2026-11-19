@@ -33,6 +33,44 @@ fn is_secret_pattern(body: &str) -> bool {
 
 /// Whether a body is a job-assign: @mention AND p tag, or dispatch_job, or toron job.
 /// `has_p_tag` is whether the `p` tag is set (for gift-wrap paths), `is_dispatch_job`/`is_toron_job` are explicit kind flags.
+/// An @mention is a token `@Pin` at a word boundary, where `Pin` looks like a
+/// pin (capitalised, alphanumeric). A bare `@` in a diff hunk, an email, a
+/// scoped package or a code span is not a mention (bd-bkakk).
+fn mention_pin(body: &str) -> Option<&str> {
+    for (i, ch) in body.char_indices() {
+        if ch != '@' {
+            continue;
+        }
+        let rest = &body[i + 1..];
+        let name = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.len_utf8())
+            .sum::<usize>();
+        if name == 0 {
+            continue;
+        }
+        let pin = &rest[..name];
+        if !pin.as_bytes()[0].is_ascii_uppercase() {
+            continue;
+        }
+        let before = body[..i].chars().next_back();
+        if before.is_some_and(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '/' | ':' | '_' | '-')
+        }) {
+            continue;
+        }
+        let after = rest[name..].chars().next();
+        if after.is_some_and(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '/' | ':' | '_' | '-')
+        }) {
+            continue;
+        }
+        return Some(pin);
+    }
+    None
+}
+
 pub fn is_job_assign_body(
     body: &str,
     has_p_tag: bool,
@@ -42,8 +80,7 @@ pub fn is_job_assign_body(
     if is_dispatch_job || is_toron_job {
         return true;
     }
-    let has_mention = body.contains('@') && body.chars().any(|c| c == '@');
-    has_mention && has_p_tag
+    mention_pin(body).is_some() && has_p_tag
 }
 
 /// Tripwire 1: secret → public (channel post / --plane s)
@@ -242,6 +279,43 @@ mod tests {
         let err =
             check_secret_tripwire(body, None, false, &[], Some("s"), false, true).unwrap_err();
         assert!(err.contains("plane_error"), "raw should not bypass: {err}");
+    }
+
+    #[test]
+    fn plane_route_mention_boundary_table() {
+        let false_positives = [
+            "@@ -63,0 +64 @@",
+            "see diff @@ -1,3 +1,4 @@ for the change",
+            "mail bob@example.com for details",
+            "install @types/node first",
+            "the #[serde(rename)] attribute in prose",
+            "path @home/user is not a pin",
+            "@lowercase is not a pin",
+            "email bob@Alice.com is not a mention",
+            "noreply@Alice is an address, not a mention",
+        ];
+        for body in false_positives {
+            assert!(!super::mention_pin(body).is_some(), "not a mention: {body}");
+            assert!(
+                !is_job_assign_body(body, true, false, false),
+                "false positive must not trip the job plane: {body}"
+            );
+        }
+        let true_mentions = [
+            "@Alice please fix",
+            "thanks, @BoldCliff and @SlateHarbor",
+            "(@ScarletCove) can you look?",
+        ];
+        for body in true_mentions {
+            assert!(
+                super::mention_pin(body).is_some(),
+                "expected a mention: {body}"
+            );
+            assert!(
+                is_job_assign_body(body, true, false, false),
+                "a mention plus the p tag is a job: {body}"
+            );
+        }
     }
 
     #[test]
