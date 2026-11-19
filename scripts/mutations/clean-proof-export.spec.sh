@@ -9,5 +9,5 @@ TEST_FILTER=(the_export_carries_the_commit_not_the_shared_tree)
 mutation "E1  the export copies the dirty tree instead of the commit" \
     file=scripts/proof-lib.sh \
     expect=the_export_carries_the_commit_not_the_shared_tree \
-    find='  git -C "$repo" archive "$rev" | tar -x -C "$dest"' \
+    find='  proof_git -C "$repo" archive "$rev" | tar -x -C "$dest"' \
     replace='  cp -R "$repo/." "$dest"'

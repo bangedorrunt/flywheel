@@ -83,15 +83,25 @@ PY
   printf '%s\n' "$best"
 }
 
+# proof_git: git with worktree-hook env stripped. A pre-commit hook inherits
+# GIT_DIR pointing at the worktree's gitdir; `git -C <repo>` still honours it,
+# so a sibling pin would be read from the WRONG repo (bd-1umbz). Resolving from
+# the path is correct for both the main repo and pinned siblings.
+proof_git() {
+  env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
+      -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
+      git "$@"
+}
+
 # proof_archive <source-repo> <rev> <dest-dir>
 # Extract one revision from git objects into <dest-dir> (created). Fails loud
 # if the rev is not in that repo.
 proof_archive() {
   local repo="$1" rev="$2" dest="$3"
-  git -C "$repo" cat-file -e "${rev}^{commit}" 2>/dev/null \
+  proof_git -C "$repo" cat-file -e "${rev}^{commit}" 2>/dev/null \
     || { echo "proof: rev $rev not found in $repo" >&2; return 1; }
   mkdir -p "$dest"
-  git -C "$repo" archive "$rev" | tar -x -C "$dest"
+  proof_git -C "$repo" archive "$rev" | tar -x -C "$dest"
 }
 
 # proof_apply_mutation <file> <find> <replace>
