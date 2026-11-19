@@ -14,6 +14,147 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// bd-q52vj: a `#[test]` that resolves a state/registry/last_sent path must
+/// hold a hermetic guard. `load_corrupt_file_returns_empty` once wrote into
+/// whatever XDG_STATE_HOME a parallel test's guard had installed, and that
+/// guard's Drop removed the dir mid-write (NotFound). Keep the class out.
+#[test]
+fn state_path_tests_hold_a_hermetic_guard() {
+    const DANGER: &[&str] = &[
+        "last_sent_file(",
+        "spawn_registry_file(",
+        "state_dir(",
+        "agents_dir(",
+        "plan_file(",
+        "save_spawn_registry(",
+        "load_spawn_registry(",
+        "save_agent_names(",
+        "load_agent_names(",
+        "record_sent(",
+        "log_event(",
+    ];
+    const GUARDS: &[&str] = &[
+        "test_state_home",
+        "loops_test_guard",
+        "lock_env",
+        "ENV_LOCK",
+        "set_registry_root_override",
+        "harness_root",
+        "TestSandbox",
+        "apply_test_env",
+        "tempdir",
+        "TempDir",
+        "tempfile",
+        "test_project",
+        "test_home",
+        "sandbox",
+        "UNDER_TEST",
+    ];
+
+    fn has_call(body: &str, name: &str) -> bool {
+        let needle = name.to_string();
+        let mut from = 0;
+        while let Some(at) = body[from..].find(&needle) {
+            let pos = from + at;
+            let prev = pos.checked_sub(1).map(|i| body.as_bytes()[i] as char);
+            if prev.is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_')) {
+                return true;
+            }
+            from = pos + needle.len();
+        }
+        false
+    }
+
+    fn strip(line: &str) -> String {
+        let clean = line.split("//").next().unwrap_or(line).to_string();
+        let mut out = String::new();
+        let mut in_str = false;
+        let mut prev = '\0';
+        for c in clean.chars() {
+            if c == '"' && prev != '\\' {
+                in_str = !in_str;
+                out.push(' ');
+            } else if in_str {
+                out.push(' ');
+            } else {
+                out.push(c);
+            }
+            prev = c;
+        }
+        out
+    }
+
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    walk(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut files,
+    );
+    let mut violations = Vec::new();
+    for file in files {
+        let source = std::fs::read_to_string(&file).expect("read source");
+        let lines: Vec<&str> = source.lines().collect();
+        let mut i = 0;
+        while i < lines.len() {
+            if !lines[i].trim().starts_with("#[test") {
+                i += 1;
+                continue;
+            }
+            let mut j = i + 1;
+            while j < lines.len() && !lines[j].contains("fn ") {
+                j += 1;
+            }
+            if j == lines.len() {
+                break;
+            }
+            let name = lines[j]
+                .split("fn ")
+                .nth(1)
+                .and_then(|s| s.split('(').next())
+                .unwrap_or("?")
+                .to_string();
+            let mut depth = 0i32;
+            let mut started = false;
+            let mut body = String::new();
+            let mut k = j;
+            while k < lines.len() {
+                body.push_str(&strip(lines[k]));
+                for c in strip(lines[k]).chars() {
+                    if c == '{' {
+                        depth += 1;
+                        started = true;
+                    } else if c == '}' {
+                        depth -= 1;
+                    }
+                }
+                if started && depth <= 0 {
+                    break;
+                }
+                k += 1;
+            }
+            if DANGER.iter().any(|p| has_call(&body, p)) && !GUARDS.iter().any(|g| body.contains(g))
+            {
+                violations.push(format!("{}:{}", file.display(), name));
+            }
+            i = k + 1;
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "state-path tests without a hermetic guard: {violations:?}"
+    );
+}
+
 const PROBE_MARKER: &str = "FLYWHEEL_TEST_ENV_PROBE";
 const PROBE: &str = "test_env_contract::operator_home_probe_child";
 
