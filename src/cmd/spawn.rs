@@ -3082,7 +3082,7 @@ pub(crate) fn cmd_spawn_rex(
                 .and_then(|p| profile::skills_digest(&p.skills));
             entry.harness_session =
                 harness_session.or_else(|| captain_directory::capture_harness_session(&kind));
-            registry.push(entry);
+            registry.push(with_recorded_harness(entry, &kind));
             println!("  {} {}", kind_paint(&kind), dim(&format!("({})", pane_id)));
             let exit_code: Option<i32> = launched_status
                 .strip_prefix("exited:")

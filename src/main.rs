@@ -4117,7 +4117,9 @@ fn main() {
                     }));
                     Ok(())
                 }
-                Err(e) => Err(e),
+                Err(e) => Err(anyhow::anyhow!(
+                    "{e} (kind={kind:?}, session={session_for_json:?}, route={route:?})"
+                )),
             }
         }
         Some(Commands::__ExpectedReplies { project }) => {

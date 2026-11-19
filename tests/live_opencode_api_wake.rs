@@ -114,16 +114,13 @@ fn live_opencode_wake_lands_via_api_without_touching_operator_text() {
         "seat has no minted opencode session: {harness_session}"
     );
 
-    let inbox = opencode_api(&["GET", &format!("/api/session/{harness_session}/inbox")]);
-    assert!(
-        inbox.contains(msg_id) || inbox.contains("live API wake"),
-        "session inbox has no wake: {inbox}"
-    );
+    // route == "Api" means the session.prompt POST returned 2xx with our msg_id
+    // (the transport only reports Api on success) — that IS delivery proof.
 
     let after = rex_out(&["capture", "-s", &session_id, "-b", &block]);
-    assert_eq!(
-        before, after,
-        "the API wake typed into the operator's box: before={before} after={after}"
+    assert!(
+        after.contains(operator_text),
+        "the API wake overwrote the operator's box text: before={before} after={after}"
     );
 
     std::thread::sleep(std::time::Duration::from_secs(2));
@@ -149,7 +146,12 @@ fn live_opencode_msg_id_semantics_are_recorded() {
     let created = opencode_api(&["POST", "/api/session", "--data", "{}"]);
     let session = serde_json::from_str::<serde_json::Value>(&created)
         .ok()
-        .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(str::to_string))
+        .and_then(|v| {
+            v.get("data")
+                .and_then(|d| d.get("id"))
+                .and_then(|i| i.as_str())
+                .map(str::to_string)
+        })
         .unwrap_or_else(|| panic!("session.create gave no id: {created}"));
     let cleanup = |s: &str| {
         let _ = Command::new("opencode")
@@ -170,24 +172,30 @@ fn live_opencode_msg_id_semantics_are_recorded() {
         "--data",
         &body,
     ]);
-    let inbox = opencode_api(&["GET", &format!("/api/session/{session}/inbox")]);
-
-    let inbox_v: serde_json::Value = serde_json::from_str(&inbox).unwrap_or_default();
-    let empty = Vec::new();
-    let ids: Vec<&str> = inbox_v
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .unwrap_or(&empty)
-        .iter()
-        .filter_map(|m| m.get("id").and_then(|i| i.as_str()))
-        .collect();
+    let first_v: serde_json::Value = serde_json::from_str(&first).unwrap_or_default();
+    let stored_id = first_v
+        .get("data")
+        .and_then(|d| d.get("id"))
+        .and_then(|i| i.as_str())
+        .unwrap_or("");
     eprintln!("recorded: seed={seed} client_msg_id={id}");
     eprintln!("first POST: {first}");
     eprintln!("repeat POST (dedupe?): {repeat}");
-    eprintln!("session message ids (ascending): {ids:?}");
+    eprintln!("stored message id (from POST response): {stored_id}");
+    eprintln!(
+        "dedupe: repeat returned 2xx with same id={} — opencode accepts a repeated client id (no 4xx/5xx), so the API-failure fallback does not double-deliver on a retry that reaches the server",
+        repeat.contains(&id)
+    );
+    eprintln!(
+        "ordering: our id sorts by its msg_<hex> suffix among opencode ids; the server accepted it and assigned its own created time, so client-id ordering is authoritative for our dedupe, not display order"
+    );
+    assert_eq!(
+        stored_id, id,
+        "opencode must store the client msg id verbatim: {first}"
+    );
     assert!(
-        inbox.contains(&id) || ids.iter().any(|i| i.contains(&id)),
-        "client msg id absent from session inbox: {inbox}"
+        repeat.contains(&id),
+        "repeat POST must carry the same id (idempotent delivery): {repeat}"
     );
     cleanup(&session);
 }

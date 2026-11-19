@@ -99,7 +99,7 @@ resolve_tool() {
 
 REX_BIN="$(resolve_tool rex)" || die "rex not found (PATH, ~/.local/bin, homebrew, /usr/local/bin)"
 CARGO_BIN="${CARGO_BIN:-$(resolve_tool cargo)}" || die "cargo not found"
-FLYWHEEL_BIN="$(resolve_tool flywheel)" || die "flywheel not found"
+FLYWHEEL_BIN="${FLYWHEEL_BIN:-$(resolve_tool flywheel)}" || die "flywheel not found"
 if [ -x /usr/bin/python3 ]; then
     PYTHON_BIN=/usr/bin/python3
 else
@@ -245,7 +245,7 @@ passed=0
 failed=0
 for t in "${TESTS[@]}"; do
     log="/tmp/e2e-live-five-$STAMP-$(basename "$t" .rs).log"
-    if [ "$t" = "tests/live_doorbell_operator_guard.rs" ]; then
+    if [ "$t" = "tests/live_doorbell_operator_guard.rs" ] || [ "$t" = "tests/live_opencode_api_wake.rs" ]; then
         export FLYWHEEL_LIVE_SESSION="$SPAWNED_SESSION"
         export FLYWHEEL_LIVE_PIN="$SPAWNED_PIN"
         export FLYWHEEL_LIVE_BLOCK="$SPAWNED_PANE"
