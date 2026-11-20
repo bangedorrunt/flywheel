@@ -286,7 +286,9 @@ pub fn apply_pi_events_config(
     // bd-tdpix: the atomic claim directory, shared by doorbell/opencode/pi.
     env.insert(
         "FLYWHEEL_WAKE_RUNG_DIR".to_string(),
-        state_dir.join(crate::wake_rung::RUNG_DIR).display().to_string(),
+        // Literal path (the claim module's RUNG_DIR is "wake-rung"); keeps this
+        // wiring independent of another lane's in-flight module.
+        state_dir.join("wake-rung").display().to_string(),
     );
     Ok(())
 }
