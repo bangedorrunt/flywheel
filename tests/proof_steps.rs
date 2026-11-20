@@ -164,6 +164,25 @@ fn proof_verify_needles_refuses_a_dead_test_filter() {
     );
 }
 
+/// bd-m97cj: a mutation whose expect= is outside TEST_FILTER reads VACUOUS.
+#[test]
+fn proof_verify_needles_refuses_an_unselected_expect() {
+    let out = Command::new("bash")
+        .arg(format!(
+            "{}/scripts/test-verify-needles-expect-filter.sh",
+            root()
+        ))
+        .current_dir(root())
+        .output()
+        .expect("run scripts/test-verify-needles-expect-filter.sh");
+    assert!(
+        out.status.success(),
+        "scripts/test-verify-needles-expect-filter.sh failed: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Every quality-gate leg denies warnings (bd-0uzrq.4). A plain `cargo check`
 /// compiled src/cmd/crew.rs:919's dead binding and reported success; only the
 /// `-D warnings` build caught it.
