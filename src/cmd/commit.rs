@@ -139,11 +139,43 @@ fn fence_private_tree(repo: &Path, private: &Git<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Build the private tree on top of `parent`. Called again after a CAS race so
+/// a tree built on the old HEAD can never revert what the other lane landed.
+fn build_tree(private: &Git<'_>, paths: &[String], parent: &str) -> Result<String> {
+    private.ok(&["read-tree", parent])?;
+    private.ok(&add_args(&["add", "--"], paths))?;
+    let staged = private.out(&["diff", "--cached", "--name-only"])?;
+    ensure_only_requested(&staged, paths)?;
+    private.out(&["write-tree"])
+}
+
+/// Never strip or restore a neighbour's hunks: refuse when a named path is
+/// already staged in the shared index, naming it so the holder can be mailed.
+fn refuse_foreign_stage(shared: &Git<'_>, paths: &[String]) -> Result<()> {
+    let staged = shared.out(&["diff", "--cached", "--name-only"])?;
+    let conflict: Vec<&str> = staged
+        .lines()
+        .filter(|line| {
+            paths
+                .iter()
+                .any(|p| *line == p || line.starts_with(&format!("{p}/")))
+        })
+        .collect();
+    if !conflict.is_empty() {
+        bail!(
+            "named path(s) already staged in the shared index (another lane's hunks?): {} — mail the holder, do not strip them",
+            conflict.join(", ")
+        );
+    }
+    Ok(())
+}
+
 /// Commit exactly `paths` from the working tree, returning the new commit sha.
 pub(crate) fn commit_paths(repo: &Path, paths: &[String], message: &str) -> Result<String> {
     validate_paths(paths)?;
     let shared = Git::shared(repo);
     let old_head = shared.out(&["rev-parse", "HEAD"])?;
+    refuse_foreign_stage(&shared, paths)?;
 
     let unique = format!(
         "{}-{}",
@@ -153,11 +185,7 @@ pub(crate) fn commit_paths(repo: &Path, paths: &[String], message: &str) -> Resu
     let index = std::env::temp_dir().join(format!("fw-commit-{unique}"));
     let _guard = IndexGuard(index.clone());
     let private = Git::private(repo, &index);
-    private.ok(&["read-tree", "HEAD"])?;
-    private.ok(&add_args(&["add", "--"], paths))?;
-    let staged = private.out(&["diff", "--cached", "--name-only"])?;
-    ensure_only_requested(&staged, paths)?;
-    let tree = private.out(&["write-tree"])?;
+    let mut tree = build_tree(&private, paths, &old_head)?;
     fence_private_tree(repo, &private)?;
 
     let mut parent = old_head;
@@ -176,6 +204,8 @@ pub(crate) fn commit_paths(repo: &Path, paths: &[String], message: &str) -> Resu
             );
         }
         parent = moved;
+        tree = build_tree(&private, paths, &parent)?;
+        fence_private_tree(repo, &private)?;
     }
     bail!("HEAD moved {MAX_CAS_RETRIES} times; refusing to commit")
 }
@@ -246,7 +276,7 @@ mod tests {
         let dir = scratch_repo("sweep");
         fs::write(dir.join("ours.txt"), "ours\n").unwrap();
         fs::write(dir.join("theirs.txt"), "theirs\n").unwrap();
-        git(&dir, &["add", "ours.txt", "theirs.txt"]);
+        git(&dir, &["add", "theirs.txt"]);
 
         let sha = commit_paths(&dir, &["ours.txt".into()], "ours").unwrap();
 
@@ -316,7 +346,10 @@ mod tests {
             &dir,
             "if [ ! -f race-moved ]; then \
                : > race-moved; \
-               t=$(git rev-parse HEAD^{tree}); \
+               unset GIT_INDEX_FILE; \
+               printf interloper > racer.txt; \
+               git add racer.txt; \
+               t=$(git write-tree); \
                o=$(git rev-parse HEAD); \
                n=$(printf race | git -c user.name=r -c user.email=r@x commit-tree \"$t\" -p \"$o\"); \
                git update-ref HEAD \"$n\" \"$o\"; \
@@ -332,7 +365,31 @@ mod tests {
             "the commit was re-parented onto the moved HEAD"
         );
         assert_eq!(git(&dir, &["log", "-1", "--format=%s", &parent]), "race");
-        assert!(tracked_in_head(&dir, &sha).contains(&"ours.txt".to_string()));
+        let files = tracked_in_head(&dir, &sha);
+        assert!(files.contains(&"ours.txt".to_string()), "{files:?}");
+        assert!(
+            files.contains(&"racer.txt".to_string()),
+            "the other lane's file was reverted by a stale tree: {files:?}"
+        );
+    }
+
+    #[test]
+    fn a_named_path_already_staged_is_refused_not_stripped() {
+        let dir = scratch_repo("staged");
+        fs::write(dir.join("ours.txt"), "ours\n").unwrap();
+        git(&dir, &["add", "ours.txt"]);
+
+        let err = commit_paths(&dir, &["ours.txt".into()], "never").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("ours.txt"),
+            "the error must name the path: {err:#}"
+        );
+        assert!(
+            git(&dir, &["diff", "--cached", "--name-only"])
+                .lines()
+                .any(|line| line == "ours.txt"),
+            "the neighbour's staged hunk must be untouched"
+        );
     }
 
     #[test]

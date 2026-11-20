@@ -10,3 +10,9 @@ mutation "P1  the private index is ignored, git uses the shared index" \
     expect=shared_index_staged_files_are_never_swept \
     find='            cmd.env("GIT_INDEX_FILE", index);' \
     replace='            cmd.env("GIT_INDEX_FILE", Path::new("/dev/null"));'
+
+mutation "P2  a CAS retry reuses the tree built on the old HEAD" \
+    file=src/cmd/commit.rs \
+    expect=concurrent_head_move_is_retried_not_overwritten \
+    find='        tree = build_tree(&private, paths, &parent)?;' \
+    replace='        let _ = &parent;'
