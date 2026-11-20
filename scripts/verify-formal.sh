@@ -1,22 +1,21 @@
 #!/usr/bin/env bash
-# Hand-written TLA+ protocol models run by TLC (ADR-0021 D5.4, ADR-0022 V11).
+# Hand-written TLA+ protocol models checked by everystate (ADR-0021 D5.4,
+# ADR-0022 V11). everystate is a native TLA+ model checker with TLC's .cfg
+# format and exit codes; there is no Java anywhere in this check.
 #
 # Positive models must pass; every negative fixture (a config that removes one
 # fence) must FAIL with the named invariant. Exit 0 only when both expectations
-# hold. TLC and Java are pinned; neither is committed.
+# hold.
 #
-#   bash scripts/verify-formal.sh            # verify
-#   bash scripts/verify-formal.sh --fetch    # fetch the pinned TLC jar first
+#   bash scripts/verify-formal.sh
 #
-# Overrides: FLYWHEEL_JAVA (java binary), FLYWHEEL_TLA_JAR (jar path).
+# Install the pinned checker once:
+#   cargo install everystate --version 0.4.1 --locked
+# Override the binary with FLYWHEEL_EVERYSTATE=/path/to/everystate.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-TLA_VERSION="1.8.0"
-TLA_SHA256="e1f11b75c4b5bc4478ba0ac5cb6ae28e40a01b0016bc33e0aa97da22dfdbcd7f"
-TLA_URL="https://github.com/tlaplus/tlaplus/releases/download/v${TLA_VERSION}/tla2tools.jar"
-CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/flywheel/tla"
-JAR="${FLYWHEEL_TLA_JAR:-$CACHE/tla2tools-${TLA_VERSION}.jar}"
+EVERYSTATE_VERSION="0.4.1"
 MODELS=".agents/skills/verify-protocol-tla/models"
 SELF="$0"
 
@@ -25,100 +24,54 @@ die() {
   exit 1
 }
 
-sha256_of() {
-  if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$1" | cut -d' ' -f1
-  else
-    sha256sum "$1" | cut -d' ' -f1
-  fi
-}
-
-resolve_java() {
-  if [ -n "${FLYWHEEL_JAVA:-}" ]; then
-    [ -x "$FLYWHEEL_JAVA" ] || die "FLYWHEEL_JAVA=$FLYWHEEL_JAVA is not executable"
-    printf '%s\n' "$FLYWHEEL_JAVA"
-    return
-  fi
-  if command -v java >/dev/null 2>&1 && java -version >/dev/null 2>&1; then
-    command -v java
-    return
-  fi
-  local candidate
-  for candidate in "$HOME"/.local/share/mise/installs/java/*/bin/java; do
-    if [ -x "$candidate" ]; then
-      printf '%s\n' "$candidate"
-      return
-    fi
-  done
-  die "no Java runtime found. Install a JDK (mise install java@17, or brew install openjdk@17) and re-run, or set FLYWHEEL_JAVA=/path/to/java"
-}
-
-fetch_jar() {
-  mkdir -p "$CACHE"
-  local tmp="$JAR.download"
-  echo "verify-formal: fetching TLC ${TLA_VERSION} into $JAR" >&2
-  curl -fsSL -o "$tmp" "$TLA_URL" || die "download failed: $TLA_URL"
-  local got
-  got="$(sha256_of "$tmp")"
-  if [ "$got" != "$TLA_SHA256" ]; then
-    rm -f "$tmp"
-    die "tla2tools ${TLA_VERSION} sha256 mismatch: got $got, want $TLA_SHA256"
-  fi
-  mv "$tmp" "$JAR"
-}
-
-if [ "${1:-}" = "--fetch" ]; then
-  fetch_jar
-fi
-
-[ -f "$JAR" ] || die "pinned TLC ${TLA_VERSION} missing at $JAR (want sha256 $TLA_SHA256). Run: bash scripts/verify-formal.sh --fetch"
-[ "$(sha256_of "$JAR")" = "$TLA_SHA256" ] || die "TLC jar at $JAR does not match the pinned sha256 $TLA_SHA256 — delete it and re-run with --fetch"
-
-JAVA="$(resolve_java)"
-echo "verify-formal: java $JAVA"
-echo "verify-formal: TLC ${TLA_VERSION} ($JAR)"
+CHECKER="${FLYWHEEL_EVERYSTATE:-$(command -v everystate || true)}"
+[ -n "$CHECKER" ] && [ -x "$CHECKER" ] ||
+  die "everystate not found. Install it: cargo install everystate --version ${EVERYSTATE_VERSION} --locked"
+got_version="$("$CHECKER" -version 2>&1 | awk '{print $2; exit}')"
+[ "$got_version" = "$EVERYSTATE_VERSION" ] ||
+  die "everystate $got_version at $CHECKER, want the pinned ${EVERYSTATE_VERSION}: cargo install everystate --version ${EVERYSTATE_VERSION} --locked --force"
+echo "verify-formal: everystate ${EVERYSTATE_VERSION} ($CHECKER)"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/flywheel-tla.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
-# TLC writes trace files beside the spec, so each run gets a fresh copy.
-run_tlc() { # model cfg
+# Each run checks a fresh copy in the temp dir, so a check never writes into
+# the repo (bd-wum95). -deadlock: these models stop legitimately at their bounds.
+check() { # model cfg -> prints the JSON verdict line
   local model="$1" cfg="$2" dir="$WORK/$1-$2"
   mkdir -p "$dir"
   cp "$MODELS/$model.tla" "$MODELS/$cfg.cfg" "$dir/"
-  # -metadir keeps TLC's states/ under the temp dir; the run also happens there,
-  # so a check never writes into the repo (bd-wum95).
-  ( cd "$dir" && "$JAVA" -cp "$JAR" tlc2.TLC -workers 1 -deadlock \
-      -metadir "$dir/meta" -config "$cfg.cfg" "$model.tla" ) >"$dir/out.log" 2>&1
+  ( cd "$dir" && "$CHECKER" -json -deadlock -config "$cfg.cfg" "$model.tla" ) >"$dir/out.log" 2>&1 || true
+  tail -1 "$dir/out.log"
 }
 
 passed=0
 failed=0
 
 expect_pass() { # model cfg
-  local model="$1" cfg="$2"
-  if run_tlc "$model" "$cfg" && grep -q "No error has been found" "$WORK/$model-$cfg/out.log"; then
+  local model="$1" cfg="$2" verdict status
+  verdict="$(check "$model" "$cfg")"
+  status="$(printf '%s' "$verdict" | jq -r '.status // "unparsed"' 2>/dev/null || echo unparsed)"
+  if [ "$status" = ok ]; then
     echo "  PASS  $model ($cfg)"
     passed=$((passed + 1))
   else
-    echo "  FAIL  $model ($cfg) — expected a clean run" >&2
+    echo "  FAIL  $model ($cfg) — expected a clean run, got $status" >&2
     tail -20 "$WORK/$model-$cfg/out.log" >&2 || true
     failed=$((failed + 1))
   fi
 }
 
 expect_violation() { # model cfg invariant
-  local model="$1" cfg="$2" invariant="$3"
-  if run_tlc "$model" "$cfg"; then
-    echo "  FAIL  $model ($cfg) — expected $invariant to be violated, TLC exited 0" >&2
-    failed=$((failed + 1))
-    return
-  fi
-  if grep -q "Invariant $invariant is violated" "$WORK/$model-$cfg/out.log"; then
+  local model="$1" cfg="$2" invariant="$3" verdict status name
+  verdict="$(check "$model" "$cfg")"
+  status="$(printf '%s' "$verdict" | jq -r '.status // "unparsed"' 2>/dev/null || echo unparsed)"
+  name="$(printf '%s' "$verdict" | jq -r '.name // ""' 2>/dev/null || true)"
+  if [ "$status" = invariant ] && [ "$name" = "$invariant" ]; then
     echo "  PASS  $model ($cfg) — $invariant violated as expected"
     passed=$((passed + 1))
   else
-    echo "  FAIL  $model ($cfg) — expected $invariant to be violated" >&2
+    echo "  FAIL  $model ($cfg) — expected $invariant to be violated, got $status ${name}" >&2
     tail -20 "$WORK/$model-$cfg/out.log" >&2 || true
     failed=$((failed + 1))
   fi

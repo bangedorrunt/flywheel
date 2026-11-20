@@ -1,14 +1,14 @@
 ---
 name: verify-protocol-tla
-description: Run hand-written TLA+ protocol models with TLC — toron job claim/lease/settle (fencing) and the reconciler respawn's one-live-pane-per-pin plus reservation retention (ADR-0022 V11). Use whenever changing Journal::claim/settle/attempt fencing, job lifecycle handling, envpin respawn ordering, taken-name clearing, or pin reservations on respawn.
+description: Run hand-written TLA+ protocol models with everystate (native, no Java) — toron job claim/lease/settle (fencing) and the reconciler respawn's one-live-pane-per-pin plus reservation retention (ADR-0022 V11). Use whenever changing Journal::claim/settle/attempt fencing, job lifecycle handling, envpin respawn ordering, taken-name clearing, or pin reservations on respawn.
 ---
 
 # Verify Protocol Fences (`flywheel` + sibling `toron`)
 
 Synced to commit: `ccf015a1` (models + `scripts/verify-formal.sh`)
 
-`bash scripts/verify-formal.sh` runs two hand-written TLA+ models with a pinned
-TLC and asserts both directions: the models of the code as written pass, and
+`bash scripts/verify-formal.sh` runs the hand-written TLA+ models with a pinned
+everystate and asserts both directions: the models of the code as written pass, and
 every negative fixture (one fence removed) fails with its named invariant.
 Read any counterexample with `/statechart` — it renders each violation as its
 shortest path in the code's words. No commands from `/statechart` belong here.
@@ -19,37 +19,37 @@ shortest path in the code's words. No commands from `/statechart` belong here.
 - **Plain statement**: When one owner's job lease is still live, a second owner can never take the row; it must wait for the deadline.
 - **TLA+ invariant**: `stolen = FALSE` (`models/JobLease.tla`), where `stolen` is set only by a `Claim` that crossed a live foreign lease.
 - **Rust correspondence**: `check_claim` lease-live arm (`../elm-effect-rs/crates/elm-effect-journal/src/plan.rs`), called by `Journal::claim` (`../toron/crates/toron-core/src/journal.rs:269`).
-- **Negative fixture**: `models/JobLease.broken-steal.cfg` (`Bug = "steal"`) removes the lease-live refusal; TLC reports `NoSteal` violated.
+- **Negative fixture**: `models/JobLease.broken-steal.cfg` (`Bug = "steal"`) removes the lease-live refusal; everystate reports `NoSteal` violated.
 
 ### 2. `NoStaleSettle` — a stale generation never settles
 - **Plain statement**: A worker that lost its lease (older generation) cannot settle the row; only the current generation can.
 - **TLA+ invariant**: `stale_settled = FALSE`, set only by `ZombieSettle`.
 - **Rust correspondence**: `check_settle` generation fence (`../elm-effect-rs/crates/elm-effect-journal/src/plan.rs`), used by `Journal::settle` (`../toron/crates/toron-core/src/journal.rs:303`) and `Journal::attempt` (`:326`).
-- **Negative fixture**: `models/JobLease.broken-stale-settle.cfg` (`Bug = "stale-settle"`); TLC reports `NoStaleSettle` violated.
+- **Negative fixture**: `models/JobLease.broken-stale-settle.cfg` (`Bug = "stale-settle"`); everystate reports `NoStaleSettle` violated.
 
 ### 3. `TerminalStable` — settled or failed work is never revived
 - **Plain statement**: A terminal row (`settled` / `failed`) never changes owner or generation again.
 - **TLA+ invariant**: `revived = FALSE`, set only by `ReviveTerminal`.
 - **Rust correspondence**: `check_claim` and `check_settle` terminal arms (`../elm-effect-rs/crates/elm-effect-journal/src/plan.rs`); the row states are the `EffectState` values journalled by toron job kinds 43001–43006 (`../toron/crates/toron-core/src/job_kinds.rs`).
-- **Negative fixture**: `models/JobLease.broken-revive-terminal.cfg` (`Bug = "revive-terminal"`); TLC reports `TerminalStable` violated.
+- **Negative fixture**: `models/JobLease.broken-revive-terminal.cfg` (`Bug = "revive-terminal"`); everystate reports `TerminalStable` violated.
 
 ### 4. `OneLiveHolder` — at most one live pane holds a pin (ADR-0022 V11)
 - **Plain statement**: A respawn may never leave two live panes holding the same pin: the retired pane's binding is released before the replacement claims the pin, and only then is the old pane closed.
 - **TLA+ invariant**: `Cardinality({p \in Panes : p \in alive /\ holder[p] = Pin}) <= 1` (`models/Respawn.tla`).
 - **Rust correspondence**: the taken-name refusal/clear in `start_agent_with_taken_name_clear` (`src/main.rs:7173`), the respawn order in `envpin_hop_respawn` (`src/main.rs:7840`) and the reroute sites around `SiteHop` (`src/main.rs:7936`), and the reconciler in `src/seat_reconcile.rs`.
-- **Negative fixture**: `models/Respawn.broken-claim-before-free.cfg` (`Bug = "claim-before-free"`) is the ADR's variant that closes the old pane after the new one claims; TLC reports `OneLiveHolder` violated.
+- **Negative fixture**: `models/Respawn.broken-claim-before-free.cfg` (`Bug = "claim-before-free"`) is the ADR's variant that closes the old pane after the new one claims; everystate reports `OneLiveHolder` violated.
 
 ### 5. `ReservationsKept` — a respawn keeps the pin's reservations (ADR-0022 V11)
 - **Plain statement**: Respawning a pin must not drop file reservations it holds.
 - **TLA+ invariant**: `dropped = FALSE` (`models/Respawn.tla`).
 - **Rust correspondence**: the reservation hand-off around `envpin_hop_respawn` / `seat_reconcile` (reservations are keyed by reason bead, not pane).
-- **Negative fixture**: `models/Respawn.broken-drop-reservations.cfg`; TLC reports `ReservationsKept` violated.
+- **Negative fixture**: `models/Respawn.broken-drop-reservations.cfg`; everystate reports `ReservationsKept` violated.
 
 ### 6. `NoClosedRowLost` — a CAS retry never reverts a landed tracker row
 - **Plain statement**: two ship lands (or `flywheel commit`s) CAS on HEAD; when one loses the race and retries, it re-splices its row into the *moved* HEAD, so a row another lander closed in between survives (bd-kz3sc rework 2, bd-aberm).
 - **TLA+ invariant**: `\A a \in Landers : done[a] => own(a) \in headRows` (`models/TrackerCas.tla`).
 - **Rust correspondence**: `commit_tree` CAS loop and `commit_blobs` splice closure (`src/cmd/commit.rs`), `tracker_blobs_for_bead` (`src/cmd/ship.rs`).
-- **Negative fixture**: `models/TrackerCas.broken-stale-splice.cfg` (`Bug = "stale-splice"`) reuses the first splice on retry; TLC reports `NoClosedRowLost` violated.
+- **Negative fixture**: `models/TrackerCas.broken-stale-splice.cfg` (`Bug = "stale-splice"`) reuses the first splice on retry; everystate reports `NoClosedRowLost` violated.
 
 ### 7. `BoundedRetries` / `Termination` — retry loops end
 - **Plain statement**: a lander never retries past `MaxRetries`; every lander eventually either returns ok or exhausts its budget.
@@ -60,15 +60,35 @@ shortest path in the code's words. No commands from `/statechart` belong here.
 
 ```bash
 bash scripts/verify-formal.sh            # verify (positive + negative fixtures)
-bash scripts/verify-formal.sh --fetch    # fetch the pinned TLC jar first
+cargo install everystate --version 0.4.1 --locked   # once, to install the checker
 ```
 
-Pinned tool: TLC 1.8.0, `tla2tools.jar` sha256
-`e1f11b75c4b5bc4478ba0ac5cb6ae28e40a01b0016bc33e0aa97da22dfdbcd7f`, cached at
-`${XDG_CACHE_HOME:-$HOME/.cache}/flywheel/tla/` — never committed. The script
-fails loudly if the jar or a Java runtime is missing; it resolves Java from
-`FLYWHEEL_JAVA`, then `java`, then `~/.local/share/mise/installs/java/*/bin/java`.
+Pinned tool: [everystate](https://github.com/mattzcarey/everystate) 0.4.1, a
+native TLA+ model checker that reads the same `.tla` and TLC `.cfg` files and
+keeps TLC's exit codes. There is no Java, jar, or JVM in this check. The script
+reads `FLYWHEEL_EVERYSTATE`, then `everystate` on `PATH`, and refuses any other
+version. Each run checks a temp copy with `-json -deadlock` and compares the
+JSON verdict (`status`, violated `name`) to the expectation.
 `scripts/clean-proof.sh` runs this script as part of the clean-export proof.
+
+Migration evidence (2026-11-20): every model and negative fixture was run on
+TLC 1.8.0 and on everystate 0.4.1. All 43 checks matched on exit code and on
+the violated invariant, and every passing model matched on its distinct-state
+count. TLC is no longer used anywhere.
+
+Ad hoc: `everystate -json -deadlock -config <cfg>.cfg <Model>.tla` prints one
+JSON line whose `trace` is the shortest counterexample; `-workers auto` searches
+on every core with identical results.
+
+### Trace conformance (planned, bd-uawqo)
+
+A model check verifies the model, not the Rust. `everystate conform -trace
+run.jsonl <Model>.tla` checks a recorded run of the real code against a model.
+Our effect journals already record every live effect in order before it runs, so
+the target is a converter from journal rows to the model's actions and
+variables, fed by an integration test, starting with the doorbell
+deferral/drain (`DeferredQueue`) and the commit CAS (`TrackerCas`). Until that
+lands, the coverage table below is the only link between model and code.
 
 ## Bounds, assumptions, limitations
 

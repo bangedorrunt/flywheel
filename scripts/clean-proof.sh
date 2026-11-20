@@ -5,7 +5,7 @@
 #   build (warnings are errors) · `test --workspace --no-run` (every target,
 #   tests/ included) · full `-p flywheel --bin flywheel` suite · `workflow
 #   verify` with a hermetic XDG_CONFIG_HOME · doorbell crates · verify-clippy ·
-#   verify-formal (TLC) · verify-coverage (the behavior ledger).
+#   verify-formal (everystate) · verify-coverage (the behavior ledger).
 #
 # Siblings come from proof.toml (path + rev), read from the PROVEN revision
 # (bd-gmrxv: a dirty working-tree pin cannot move the proof); their rev is
