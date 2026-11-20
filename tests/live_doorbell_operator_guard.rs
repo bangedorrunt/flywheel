@@ -118,14 +118,17 @@ fn assert_send_target(send_stdout: &str, expected_block_id: &str) -> Result<(), 
     // `flywheel send` prints `{"via":"inbox","sent":[rows]}` (comms_send::
     // rows_json); older forms are a bare row or an array. Find the dispatched
     // row's pane_id in any of them.
-    let rows: Vec<&serde_json::Value> =
-        if let Some(sent) = doc.get("sent").and_then(serde_json::Value::as_array) {
-            sent.iter().collect()
-        } else if let Some(arr) = doc.as_array() {
-            arr.iter().collect()
-        } else {
-            vec![&doc]
-        };
+    let rows: Vec<&serde_json::Value> = if let Some(sent) = doc
+        .get("sent")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| doc.get("results").and_then(serde_json::Value::as_array))
+    {
+        sent.iter().collect()
+    } else if let Some(arr) = doc.as_array() {
+        arr.iter().collect()
+    } else {
+        vec![&doc]
+    };
     let pane = rows
         .iter()
         .filter(|r| {
@@ -138,7 +141,7 @@ fn assert_send_target(send_stdout: &str, expected_block_id: &str) -> Result<(), 
             rows.iter()
                 .find_map(|r| r.get("pane_id").and_then(serde_json::Value::as_str))
         })
-        .ok_or_else(|| "send result has no pane_id".to_string())?;
+        .ok_or_else(|| format!("send result has no pane_id: {doc}"))?;
     if pane != expected_block_id {
         return Err(format!(
             "send dispatched to pane {pane}, not the test block {expected_block_id}"
