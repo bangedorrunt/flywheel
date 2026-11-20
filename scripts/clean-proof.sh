@@ -380,11 +380,13 @@ MUTATION_RECORDS=""
 # proven revision changed since the [mutations] base pin. `full` runs them all;
 # no base (fresh clone, or a project without one) also means all, because a
 # landing that skips proofs silently is worse than a slow one.
-if [ -n "$MUTATIONS_MODE" ] && [ -z "$FAILED_STEP" ]; then
+if [ -z "$FAILED_STEP" ]; then
   mut_base=""
   mut_scoped=0
   mut_changed=""
-  if [ "$MUTATIONS_MODE" = changed ]; then
+  # bd-r7852: even with NO --mutations, resolve the base and changed paths so
+  # the receipt can say "witnesses" and landing can require crew witnesses.
+  if [ "$MUTATIONS_MODE" != full ]; then
     # bd-b2yg7: a manual [mutations] base is an OVERRIDE; the normal base is the
     # newest green receipt that is an ancestor of the proven sha. A pin that
     # never advances starved the cache and re-ran every spec on each landing.
@@ -401,6 +403,7 @@ if [ -n "$MUTATIONS_MODE" ] && [ -z "$FAILED_STEP" ]; then
   fi
   RECEIPT_MUTATIONS_BASE="$mut_base"
   RECEIPT_CHANGED_PATHS="$mut_changed"
+  if [ -n "$MUTATIONS_MODE" ]; then
   wrapper="$TMP/mbx-wrapper"
   {
     printf '#!/usr/bin/env bash\nexec'
@@ -472,6 +475,7 @@ if [ -n "$MUTATIONS_MODE" ] && [ -z "$FAILED_STEP" ]; then
   else
     STEP_STATUSES="$STEP_STATUSES"$'0\n' 
   fi
+  fi
 fi
 
 # Opt-in ad-hoc mutations, applied inside the export only (never the repo).
@@ -533,7 +537,7 @@ OK=0
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 [ -n "$RECEIPT" ] || RECEIPT="${TMPDIR:-/tmp}/clean-proof/${SHORT}-${STAMP}.json"
 mkdir -p "$(dirname "$RECEIPT")"
-PROOF_MUTATIONS_MODE="$MUTATIONS_MODE" \
+PROOF_MUTATIONS_MODE="${MUTATIONS_MODE:-witnesses}" \
 PROOF_MUTATIONS_BASE="$RECEIPT_MUTATIONS_BASE" \
 PROOF_CHANGED_PATHS="$RECEIPT_CHANGED_PATHS" \
 PROOF_RECEIPT_ARCHIVE="$RECEIPT_ARCHIVE" \

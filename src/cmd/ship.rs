@@ -768,7 +768,7 @@ fn receipt_is_landable(root: &Path, receipt: &Path, sha: &str) -> Result<()> {
             .and_then(Value::as_array)
             .map(|rows| rows.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
-        let (Some("changed"), Some(base)) = (mode, base) else {
+        let (Some("changed" | "witnesses"), Some(base)) = (mode, base) else {
             bail!(
                 "proof receipt carries no mutation run: {} — a landing needs witnesses \
                  (`--mutations changed` with a [mutations] base, or `--mutations full`)",
@@ -1733,12 +1733,16 @@ live-verified. Record one BEFORE closing."#;
     }
 
     fn no_mutation_receipt(path: &std::path::Path, sha: &str) {
+        no_mutation_receipt_mode(path, sha, "changed");
+    }
+
+    fn no_mutation_receipt_mode(path: &std::path::Path, sha: &str, mode: &str) {
         let doc = serde_json::json!({
             "ok": true,
             "sha": sha,
             "mode": "sha",
             "mutations": [],
-            "mutations_mode": "changed",
+            "mutations_mode": mode,
             "mutations_base": sha,
             "changed_paths": ["src/lib.rs"],
             "driver_sha": sha,
@@ -1756,6 +1760,27 @@ live-verified. Record one BEFORE closing."#;
             key: key.to_string(),
         });
         store.save(&path).expect("save witness store");
+    }
+
+    #[test]
+    fn a_witness_mode_proof_lands_with_witnesses_and_refuses_without() {
+        let _guard = crate::config::lock_env();
+        let dir = witness_repo();
+        let sha = git_in(dir.path(), &["rev-parse", "HEAD"]);
+        let receipt = dir.path().join("receipt.json");
+        no_mutation_receipt_mode(&receipt, &sha, "witnesses");
+        let err = receipt_is_landable(dir.path(), &receipt, &sha)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("demo.spec.sh"), "without witnesses: {err}");
+
+        let key = cache_key_at(dir.path(), &sha, "scripts/mutations/demo.spec.sh", &sha)
+            .expect("cache key");
+        store_witness(&sha, &key);
+        assert!(
+            receipt_is_landable(dir.path(), &receipt, &sha).is_ok(),
+            "a witness-mode proof with harness witnesses lands"
+        );
     }
 
     #[test]
