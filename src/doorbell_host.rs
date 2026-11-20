@@ -1391,8 +1391,19 @@ impl Host for RtHost {
         // emitted; a lost claim drops the Prompt from this tick. The boot drain
         // carries no event id and is appended after the gate.
         effects.extend(boot_drain_effects);
-        // bd-tdpix: claim at delivery time for EVERY path, including deferred
-        // and boot-drained Prompts that arrive outside the Watch arm.
+        if matches!(msg, BrainMsg::Sweep { .. }) {
+            // bd-tdpix: a conflict Prompt can carry a bus event id, so it must
+            // join the list BEFORE the claim or it bypasses the gate entirely.
+            effects.extend(self.pending_conflict_prompts.drain(..).map(|(pin, line)| {
+                Effect::Prompt {
+                    event_id: doorbell_core::watch_id(&line),
+                    pin,
+                    line,
+                }
+            }));
+        }
+        // bd-tdpix: claim at delivery time for EVERY path, including deferred,
+        // boot-drained and conflict Prompts that arrive outside the Watch arm.
         effects = claim_all_prompts(&config::state_dir(), effects);
         if matches!(msg, BrainMsg::Sweep { .. }) {
             // bd-tdpix: bound the shared claim directory on every sweep.
@@ -1401,13 +1412,6 @@ impl Host for RtHost {
                 crate::wake_rung::WAKE_RUNG_TTL_SECS,
                 unix_now(),
             );
-            effects.extend(self.pending_conflict_prompts.drain(..).map(|(pin, line)| {
-                Effect::Prompt {
-                    event_id: doorbell_core::watch_id(&line),
-                    pin,
-                    line,
-                }
-            }));
             effects.extend(self.stalled_deferrals());
         }
         effects
@@ -2965,6 +2969,51 @@ mod off_runtime_tests {
         ));
         let raw = std::fs::read_to_string(audit).expect("already-pulled journal");
         assert!(raw.contains(pin) && raw.contains("already-pulled"), "{raw}");
+    }
+
+    /// bd-tdpix follow-up: a conflict Prompt raised during a Sweep must claim
+    /// its event before delivery, not after — the native path may have won.
+    #[test]
+    fn a_sweep_conflict_prompt_claims_before_delivery() {
+        let _home = crate::config::test_state_home();
+        let project = format!("sweep-conflict-{}", std::process::id());
+        let workspace = format!("session:sweep-conflict-{}", std::process::id());
+        let state_dir = crate::config::state_dir();
+        let claimed = doorbell_core::doorbell_line_with_event(
+            doorbell_core::EventClass::RequestRelease,
+            "toron next",
+            "evt-conflict-claimed",
+        );
+        let free = doorbell_core::doorbell_line_with_event(
+            doorbell_core::EventClass::RequestRelease,
+            "toron next",
+            "evt-conflict-free",
+        );
+        assert!(crate::wake_rung::claim(&state_dir, "evt-conflict-claimed"));
+        let (tx, _rx) = mpsc::channel(8);
+        let mut host = RtHost::new(Config::default(), &project, &workspace, tx).expect("host");
+        host.pending_conflict_prompts
+            .push(("BlueRidge".into(), claimed));
+        host.pending_conflict_prompts
+            .push(("LilacChapel".into(), free));
+        let effects = host.tick(&BrainMsg::Sweep { now: 1 });
+        let prompt_lines: Vec<String> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Prompt { line, .. } => Some(line.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !prompt_lines
+                .iter()
+                .any(|l| l.contains("evt-conflict-claimed")),
+            "native already claimed this conflict event: {prompt_lines:?}"
+        );
+        assert!(
+            prompt_lines.iter().any(|l| l.contains("evt-conflict-free")),
+            "a free conflict marker must still ring: {prompt_lines:?}"
+        );
     }
 
     /// The converse: a deferral whose watermark is still ahead of the pin's

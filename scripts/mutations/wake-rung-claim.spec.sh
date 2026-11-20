@@ -3,7 +3,7 @@
 # drop the Prompt when it loses the claim.
 
 CARGO_ARGS=(--bin flywheel)
-TEST_FILTER=(n_racing_claimers_produce_exactly_one_winner a_lost_claim_emits_no_prompt a_watch_line_without_a_prompt_leaves_the_claim_free a_real_watch_line_through_the_fold_carries_and_claims_its_event_id)
+TEST_FILTER=(n_racing_claimers_produce_exactly_one_winner a_lost_claim_emits_no_prompt a_watch_line_without_a_prompt_leaves_the_claim_free a_real_watch_line_through_the_fold_carries_and_claims_its_event_id a_sweep_conflict_prompt_claims_before_delivery)
 
 RUNG=src/wake_rung.rs
 HOST=src/doorbell_host.rs
@@ -32,3 +32,9 @@ mutation "T5  the typed event id is dropped (falls back to line comparison)" \
     expect=a_real_watch_line_through_the_fold_carries_and_claims_its_event_id \
     find='                event_id: doorbell_core::watch_id(&line).or_else(|| watch_id.map(str::to_string)),' \
     replace='                event_id: None,'
+
+mutation "T6  a Sweep conflict Prompt bypasses the claim" \
+    file=$HOST \
+    expect=a_sweep_conflict_prompt_claims_before_delivery \
+    find=$'            effects.extend(self.pending_conflict_prompts.drain(..).map(|(pin, line)| {\n                Effect::Prompt {\n                    event_id: doorbell_core::watch_id(&line),\n                    pin,\n                    line,\n                }\n            }));' \
+    replace='            let _ = self.pending_conflict_prompts.drain(..);'
