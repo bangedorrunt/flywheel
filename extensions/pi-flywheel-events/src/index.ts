@@ -12,6 +12,7 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { coalesce, decodeFrame, type EventFrame } from "./decode.ts";
 import { Deduper } from "./dedupe.ts";
+import { claimEvent, sweepRung } from "./claim.ts";
 
 const TOKEN_FILE = "FLYWHEEL_TORON_TOKEN_FILE";
 const URL = process.env.FLYWHEEL_TORON_URL ?? "http://127.0.0.1:18080";
@@ -126,15 +127,6 @@ async function pollOnce(sub: string, cursor: string, token: string): Promise<{ r
   return { raw, cursor: fresh };
 }
 
-async function rungSet(): Promise<ReadonlySet<string>> {
-  const path = process.env.FLYWHEEL_WAKE_RUNG_FILE;
-  if (!path) return new Set();
-  try {
-    const rows = (await readFile(path, "utf8")).trim().split("\n").filter(Boolean);
-    return new Set(rows.map((l) => { try { return String(JSON.parse(l).id ?? ""); } catch { return ""; } }));
-  } catch { return new Set(); }
-}
-
 export default function flywheelEvents(pi: ExtensionAPI): void {
   pi.on("session_start", async () => {
     const deduper = new Deduper(512);
@@ -166,10 +158,16 @@ export default function flywheelEvents(pi: ExtensionAPI): void {
             }
           }
           const frames: EventFrame[] = [];
-          const rung = await rungSet();
+          const rungDir = process.env.FLYWHEEL_WAKE_RUNG_DIR;
+          sweepRung(rungDir ?? "", 3_600, Math.floor(Date.now() / 1000));
           for (const data of page.raw) {
             const f = decodeFrame(data, sub);
-            if (f && deduper.isNew(f.id) && !rung.has(f.id)) frames.push(f);
+            if (!f || !deduper.isNew(f.id)) continue;
+            // Claim BEFORE the ring: O_EXCL is the atomic test-and-set shared
+            // with the doorbell and the opencode proxy (bd-tdpix). A loser
+            // stays silent even if its cursor had not seen this event yet.
+            if (rungDir && !claimEvent(rungDir, f.id)) continue;
+            frames.push(f);
           }
           cursor = page.cursor;
           await saveState({ ...state, cursor, seen: deduper.snapshot() });

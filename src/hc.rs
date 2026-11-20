@@ -283,9 +283,10 @@ pub fn apply_pi_events_config(
         "FLYWHEEL_TORON_TOKEN_FILE".to_string(),
         token_path.display().to_string(),
     );
+    // bd-tdpix: the atomic claim directory, shared by doorbell/opencode/pi.
     env.insert(
-        "FLYWHEEL_WAKE_RUNG_FILE".to_string(),
-        state_dir.join("wake-rung.jsonl").display().to_string(),
+        "FLYWHEEL_WAKE_RUNG_DIR".to_string(),
+        state_dir.join(crate::wake_rung::RUNG_DIR).display().to_string(),
     );
     Ok(())
 }
@@ -3440,7 +3441,7 @@ mod bd_o1z4m_events_config_tests {
         .expect("wire pi events");
         assert_eq!(env["FLYWHEEL_TORON_TOKEN_FILE"], "/tokens/amber");
         assert!(env["PI_CODING_AGENT_DIR"].contains("pi-agents"));
-        assert!(env["FLYWHEEL_WAKE_RUNG_FILE"].ends_with("wake-rung.jsonl"));
+        assert!(env["FLYWHEEL_WAKE_RUNG_DIR"].ends_with("wake-rung"));
         let settings: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(
                 std::path::Path::new(&env["PI_CODING_AGENT_DIR"]).join("settings.json"),
