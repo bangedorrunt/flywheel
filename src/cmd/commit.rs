@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 const MAX_CAS_RETRIES: usize = 5;
 static INDEX_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -63,6 +63,33 @@ impl<'a> Git<'a> {
 
     fn ok(&self, args: &[&str]) -> Result<()> {
         self.out(args).map(|_| ())
+    }
+
+    fn out_stdin(&self, args: &[&str], input: &[u8]) -> Result<String> {
+        use std::io::Write as _;
+        let mut child = self
+            .command(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .with_context(|| format!("git {args:?}"))?;
+        child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| anyhow!("git {args:?} stdin"))?
+            .write_all(input)
+            .map_err(|e| anyhow!("git {args:?} stdin write: {e}"))?;
+        let out = child
+            .wait_with_output()
+            .with_context(|| format!("git {args:?} wait"))?;
+        if !out.status.success() {
+            bail!(
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8(out.stdout)?.trim().to_string())
     }
 }
 
@@ -149,6 +176,30 @@ fn build_tree(private: &Git<'_>, paths: &[String], parent: &str) -> Result<Strin
     private.out(&["write-tree"])
 }
 
+/// Build the private tree from exact blob contents: HEAD's tree, with each
+/// named path replaced by the caller-supplied bytes (bd-kz3sc). The caller
+/// decides which rows those bytes contain — this verb only stages them.
+fn build_blobs_tree(
+    private: &Git<'_>,
+    blobs: &[(String, Vec<u8>)],
+    parent: &str,
+) -> Result<String> {
+    private.ok(&["read-tree", parent])?;
+    let paths: Vec<String> = blobs.iter().map(|(p, _)| p.clone()).collect();
+    for (path, content) in blobs {
+        let sha = private.out_stdin(&["hash-object", "-w", "--stdin"], content)?;
+        private.ok(&[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{sha},{path}"),
+        ])?;
+    }
+    let staged = private.out(&["diff", "--cached", "--name-only"])?;
+    ensure_only_requested(&staged, &paths)?;
+    private.out(&["write-tree"])
+}
+
 /// Never strip or restore a neighbour's hunks: refuse when a named path is
 /// already staged in the shared index, naming it so the holder can be mailed.
 fn refuse_foreign_stage(shared: &Git<'_>, paths: &[String]) -> Result<()> {
@@ -170,9 +221,13 @@ fn refuse_foreign_stage(shared: &Git<'_>, paths: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Commit exactly `paths` from the working tree, returning the new commit sha.
-pub(crate) fn commit_paths(repo: &Path, paths: &[String], message: &str) -> Result<String> {
-    validate_paths(paths)?;
+/// The one private-index fence + CAS path. `build` produces a tree on top of
+/// the named parent; it is called again after a CAS race so a tree built on an
+/// old HEAD can never revert what another lane landed.
+fn commit_tree<F>(repo: &Path, paths: &[String], message: &str, mut build: F) -> Result<String>
+where
+    F: for<'a> FnMut(&Git<'a>, &str) -> Result<String>,
+{
     let shared = Git::shared(repo);
     let old_head = shared.out(&["rev-parse", "HEAD"])?;
     refuse_foreign_stage(&shared, paths)?;
@@ -185,7 +240,7 @@ pub(crate) fn commit_paths(repo: &Path, paths: &[String], message: &str) -> Resu
     let index = std::env::temp_dir().join(format!("fw-commit-{unique}"));
     let _guard = IndexGuard(index.clone());
     let private = Git::private(repo, &index);
-    let mut tree = build_tree(&private, paths, &old_head)?;
+    let mut tree = build(&private, &old_head)?;
     fence_private_tree(repo, &private)?;
 
     let mut parent = old_head;
@@ -193,7 +248,6 @@ pub(crate) fn commit_paths(repo: &Path, paths: &[String], message: &str) -> Resu
         let commit = shared.out(&["commit-tree", &tree, "-p", &parent, "-m", message])?;
         let update = shared.run(&["update-ref", "HEAD", &commit, &parent])?;
         if update.status.success() {
-            shared.ok(&add_args(&["add", "--"], paths))?;
             return Ok(commit);
         }
         let moved = shared.out(&["rev-parse", "HEAD"])?;
@@ -204,10 +258,47 @@ pub(crate) fn commit_paths(repo: &Path, paths: &[String], message: &str) -> Resu
             );
         }
         parent = moved;
-        tree = build_tree(&private, paths, &parent)?;
+        tree = build(&private, &parent)?;
         fence_private_tree(repo, &private)?;
     }
     bail!("HEAD moved {MAX_CAS_RETRIES} times; refusing to commit")
+}
+
+/// Commit exactly `paths` from the working tree, returning the new commit sha.
+pub(crate) fn commit_paths(repo: &Path, paths: &[String], message: &str) -> Result<String> {
+    validate_paths(paths)?;
+    let sha = commit_tree(repo, paths, message, |private, parent| {
+        build_tree(private, paths, parent)
+    })?;
+    Git::shared(repo).ok(&add_args(&["add", "--"], paths))?;
+    Ok(sha)
+}
+
+/// Commit the exact `path -> content` blobs (bd-kz3sc). Used by ship land to
+/// commit ONLY this bead's tracker rows while leaving a neighbour's dirty rows
+/// in the worktree. The shared index is refreshed with the same blobs, so a
+/// neighbour's unstaged rows stay unstaged.
+pub(crate) fn commit_blobs(
+    repo: &Path,
+    blobs: &[(String, Vec<u8>)],
+    message: &str,
+) -> Result<String> {
+    let paths: Vec<String> = blobs.iter().map(|(p, _)| p.clone()).collect();
+    validate_paths(&paths)?;
+    let sha = commit_tree(repo, &paths, message, |private, parent| {
+        build_blobs_tree(private, blobs, parent)
+    })?;
+    let shared = Git::shared(repo);
+    for (path, content) in blobs {
+        let blob = shared.out_stdin(&["hash-object", "-w", "--stdin"], content)?;
+        shared.ok(&[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{blob},{path}"),
+        ])?;
+    }
+    Ok(sha)
 }
 
 pub(crate) fn cmd_commit(paths: &[String], message: &str, repo: Option<&str>) -> Result<()> {

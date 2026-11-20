@@ -549,6 +549,55 @@ fn a_failed_tracker_commit_leaves_the_step_pending_and_a_resume_retries_it() {
     );
 }
 
+/// bd-kz3sc rework: ship land must commit ONLY this bead's tracker rows. A
+/// neighbour's dirty row in the same tracker files stays in the worktree and
+/// never lands under this bead's commit.
+#[test]
+fn a_neighbours_dirty_tracker_row_is_not_committed_with_this_bead() {
+    let f = fixture();
+    let issues = f.repo.join(".beads/issues.jsonl");
+    let gates = f.repo.join(".beads/gates.jsonl");
+    // Another lane left dirty rows in the shared worktree (not in HEAD).
+    let mut issues_body = std::fs::read_to_string(&issues).unwrap_or_default();
+    issues_body.push_str("{\"id\":\"bd-neighbor\",\"status\":\"in_progress\"}\n");
+    std::fs::write(&issues, &issues_body).expect("dirty issues row");
+    let mut gates_body = std::fs::read_to_string(&gates).unwrap_or_default();
+    gates_body.push_str("{\"issue_id\":\"bd-neighbor\",\"passed\":true}\n");
+    std::fs::write(&gates, &gates_body).expect("dirty gates row");
+
+    let out = f.land(&[]);
+    assert!(
+        out.status.success(),
+        "land must still succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let head_issues =
+        String::from_utf8_lossy(&sh(&f.repo, "git", &["show", "HEAD:.beads/issues.jsonl"]).stdout)
+            .to_string();
+    assert!(
+        head_issues.contains("bd-x") && head_issues.contains("closed"),
+        "this bead's closed row is committed: {head_issues}"
+    );
+    assert!(
+        !head_issues.contains("bd-neighbor"),
+        "the neighbour's dirty row must NOT be committed: {head_issues}"
+    );
+    let head_gates =
+        String::from_utf8_lossy(&sh(&f.repo, "git", &["show", "HEAD:.beads/gates.jsonl"]).stdout)
+            .to_string();
+    assert!(
+        !head_gates.contains("bd-neighbor"),
+        "the neighbour's dirty gate row must NOT be committed: {head_gates}"
+    );
+    // The dirty rows are still in the worktree, uncommitted.
+    assert!(
+        std::fs::read_to_string(&issues)
+            .unwrap_or_default()
+            .contains("bd-neighbor"),
+        "the neighbour row stays in the worktree"
+    );
+}
+
 /// bd-kz3sc: with this bead's rows already in HEAD, the commit step is skipped
 /// (no second commit) even when nothing is staged in the worktree.
 #[test]

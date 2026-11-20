@@ -1287,6 +1287,18 @@ mutations = [
 ]
 
 [[behavior]]
+id = "ship.tracker-commit-only-this-beads-rows"
+owner = "src/cmd/ship.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "tests/ship_land.rs::a_neighbours_dirty_tracker_row_is_not_committed_with_this_bead",
+]
+mutations = [
+  "scripts/mutations/ship-land-blobs.spec.sh#B1",
+]
+
+[[behavior]]
 id = "consent.jev-and-budget-are-asked"
 owner = "src/swarm_plan.rs"
 status = "proven"

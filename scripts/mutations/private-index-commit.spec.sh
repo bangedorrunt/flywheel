@@ -14,5 +14,5 @@ mutation "P1  the private index is ignored, git uses the shared index" \
 mutation "P2  a CAS retry reuses the tree built on the old HEAD" \
     file=src/cmd/commit.rs \
     expect=concurrent_head_move_is_retried_not_overwritten \
-    find='        tree = build_tree(&private, paths, &parent)?;' \
+    find='        tree = build(&private, &parent)?;' \
     replace='        let _ = &parent;'

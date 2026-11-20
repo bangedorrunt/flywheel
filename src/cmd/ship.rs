@@ -159,35 +159,95 @@ fn head_names_bead(cwd: &Path, search: &Path, bead: &str) -> Result<bool> {
 /// The tracker rows that belong to ONE bead, in HEAD and in the worktree.
 /// git status is repo-wide, so another lane's uncommitted row must never fail
 /// this bead's ship check (bd-ps6wc).
+fn line_is_bead(line: &str, key: &str, bead: &str) -> bool {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|v| v.get(key).and_then(Value::as_str).map(|id| id == bead))
+        .unwrap_or(false)
+}
+
 fn bead_rows(file: &Path, bead: &str, key: &str) -> Result<Vec<String>> {
     let body = std::fs::read_to_string(file).unwrap_or_default();
-    let needle = format!("\"{key}\":\"{bead}\"");
     Ok(body
         .lines()
-        .filter(|line| line.contains(&needle))
+        .filter(|line| line_is_bead(line, key, bead))
         .map(str::to_string)
         .collect())
 }
 
+fn row_is_closed(line: &str) -> bool {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|v| {
+            v.get("status")
+                .and_then(Value::as_str)
+                .map(|s| s == "closed")
+        })
+        .unwrap_or(false)
+}
+
 /// True when THIS bead's tracker rows are already committed: the worktree rows
-/// for it equal HEAD's rows for it. Other lanes' dirty rows are ignored.
+/// for it equal HEAD's rows for it, and the issue row is CLOSED. Other lanes'
+/// dirty rows are ignored.
 fn bead_rows_committed(dir: &Path, bead: &str) -> Result<bool> {
-    for (path, key) in [
-        (".beads/issues.jsonl", "id"),
-        (".beads/gates.jsonl", "issue_id"),
+    for (path, key, require_closed) in [
+        (".beads/issues.jsonl", "id", true),
+        (".beads/gates.jsonl", "issue_id", false),
     ] {
         let head = git(dir, &["show", &format!("HEAD:{path}")]).unwrap_or_default();
         let head_rows: Vec<String> = head
             .lines()
-            .filter(|line| line.contains(&format!("\"{key}\":\"{bead}\"")))
+            .filter(|line| line_is_bead(line, key, bead))
             .map(str::to_string)
             .collect();
         let work_rows = bead_rows(&dir.join(path), bead, key)?;
         if head_rows != work_rows {
             return Ok(false);
         }
+        if require_closed && !work_rows.iter().any(|line| row_is_closed(line)) {
+            return Ok(false);
+        }
     }
     Ok(true)
+}
+
+/// HEAD's tracker files with ONLY this bead's rows swapped for the worktree
+/// versions (bd-kz3sc rework). A neighbour's dirty rows are never in these
+/// blobs; the commit verb stages the exact bytes into its private index.
+fn tracker_blobs_for_bead(dir: &Path, bead: &str) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut blobs = Vec::new();
+    for (path, key) in [
+        (".beads/issues.jsonl", "id"),
+        (".beads/gates.jsonl", "issue_id"),
+    ] {
+        let head = git(dir, &["show", &format!("HEAD:{path}")]).unwrap_or_default();
+        let work = std::fs::read_to_string(dir.join(path)).unwrap_or_default();
+        let work_rows: Vec<&str> = work
+            .lines()
+            .filter(|line| line_is_bead(line, key, bead))
+            .collect();
+        let mut merged: Vec<String> = Vec::new();
+        let mut inserted = false;
+        for line in head.lines() {
+            if line_is_bead(line, key, bead) {
+                if !inserted {
+                    merged.extend(work_rows.iter().map(|row| (*row).to_string()));
+                    inserted = true;
+                }
+            } else {
+                merged.push(line.to_string());
+            }
+        }
+        if !inserted {
+            merged.extend(work_rows.iter().map(|row| (*row).to_string()));
+        }
+        let mut body = merged.join("\n");
+        if head.ends_with('\n') || !work_rows.is_empty() {
+            body.push('\n');
+        }
+        blobs.push((path.to_string(), body.into_bytes()));
+    }
+    Ok(blobs)
 }
 
 /// Read the tracker snapshot from HEAD, not the live database. A bead that is
@@ -905,25 +965,12 @@ pub(crate) fn ship_land(args: LandArgs<'_>) -> Result<()> {
         Ok(())
     })?;
 
-    // 5. commit only this bead's tracker rows. bd-kz3sc: the step's done-state
-    // comes from HEAD, never from whether staging found a hunk. A failed commit
-    // leaves the rows in the worktree but not HEAD; a resume that trusted the
-    // staging result skipped forever and ship check failed on every rerun.
-    // The private-index verb commits only these paths from the worktree, so a
-    // neighbour's staged files can never be swept into this commit.
     if bead_rows_committed(&dir, &plan.bead)? {
         eprintln!("ship land: tracker rows already committed");
     } else {
         land_step(&plan, "tracker-commit", || {
-            crate::cmd::commit::commit_paths(
-                &dir,
-                &[
-                    ".beads/issues.jsonl".to_string(),
-                    ".beads/gates.jsonl".to_string(),
-                ],
-                &plan.message,
-            )
-            .map(|_| ())
+            let blobs = tracker_blobs_for_bead(&dir, &plan.bead)?;
+            crate::cmd::commit::commit_blobs(&dir, &blobs, &plan.message).map(|_| ())
         })?;
     }
 
