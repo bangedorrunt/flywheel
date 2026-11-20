@@ -25,12 +25,11 @@ impl EventsSource {
         }
     }
 
-    /// Canonical doorbell line used for a mail hint. The hint is payload-free.
+    /// Canonical doorbell line used for a mail hint. `toron next` classifies
+    /// as AtIdle (a real mail wake); `SYSTEM_NOTICE_HINT` would be a silent
+    /// notice that never rings (bd-l5vb2).
     pub fn mail_line() -> String {
-        doorbell_core::doorbell_line(
-            doorbell_core::EventClass::PlanePMail,
-            doorbell_core::SYSTEM_NOTICE_HINT,
-        )
+        doorbell_core::doorbell_line(doorbell_core::EventClass::PlanePMail, "toron next")
     }
 
     /// Journal first: every accepted page yields msgs BEFORE the cursor moves.

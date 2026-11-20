@@ -550,6 +550,25 @@ impl<H: Host> Brain<H> {
                 });
                 self.deliver(effects, "prompt-refused").await;
             }
+            BrainMsg::EventsHint {
+                event_id,
+                pin,
+                line,
+            } => {
+                self.on_events(
+                    &BrainMsg::EventsHint {
+                        event_id,
+                        pin,
+                        line,
+                    },
+                    "events-hint",
+                )
+                .await;
+            }
+            BrainMsg::EventsGap { pin } => {
+                self.on_events(&BrainMsg::EventsGap { pin }, "events-gap")
+                    .await;
+            }
             BrainMsg::InboxFetched { pin, rows } => self.on_inbox_fetched(pin, rows).await,
             BrainMsg::SlaFired { posts } => self.on_sla_fired(posts).await,
             BrainMsg::Degraded { source, reason } => {
@@ -710,6 +729,39 @@ impl<H: Host> Brain<H> {
         let delivered = self.deliver_prompts(injects).await;
         let woke = delivered.first().cloned();
         self.persist_wake(woke.as_deref(), "watch");
+    }
+
+    /// One events hint/gap through the same single budget gate as a watch ring
+    /// (bd-l5vb2). Journal the decided effects BEFORE delivering any prompt,
+    /// so a crash replays from the persisted cursor and the bus event id
+    /// deduper absorbs the duplicate.
+    async fn on_events(&mut self, msg: &BrainMsg, stage: &str) {
+        let effects = self.host.tick(msg);
+        self.absorb_digests(&effects);
+        let raw = self.prompts_of(&effects);
+        let now = self.host.now_unix();
+        let injects = self.gated(raw.clone(), now);
+        let pins: Vec<String> = raw.iter().map(|(p, _)| p.clone()).collect();
+        self.journal(
+            &serde_json::json!({"rt_kind": "Events"}),
+            &effects,
+            serde_json::json!({
+                "stage": stage,
+                "allowed": injects.len(),
+                "gated": raw.len().saturating_sub(injects.len()),
+            }),
+            &pins,
+        );
+        if raw.len() != injects.len() {
+            self.stats.drops += (raw.len() - injects.len()) as u64;
+            self.audit(
+                "budget_drop",
+                serde_json::json!({ "dropped": raw.len() - injects.len() }),
+            );
+        }
+        self.flush_journal("events");
+        let delivered = self.deliver_prompts(injects).await;
+        self.persist_wake(delivered.first().map(String::as_str), "events");
     }
 
     async fn on_status(&mut self, pin: String, status: String) {
@@ -1529,6 +1581,8 @@ fn brain_msg_label(msg: &BrainMsg) -> &'static str {
         BrainMsg::Degraded { .. } => "degraded",
         BrainMsg::Delivered { .. } => "delivered",
         BrainMsg::PromptRefused { .. } => "prompt-refused",
+        BrainMsg::EventsHint { .. } => "events-hint",
+        BrainMsg::EventsGap { .. } => "events-gap",
         BrainMsg::Ask { .. } => "ask",
         BrainMsg::Shutdown => "shutdown",
     }

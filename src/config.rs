@@ -812,6 +812,16 @@ impl Config {
             .unwrap_or_default()
     }
 
+    /// Toron events as an opt-in wake source for harnesses with no inbound
+    /// door (ADR-0039 D8, bd-l5vb2). False unless opted in, so flag-off is
+    /// byte-identical.
+    pub fn doorbell_toron_events(&self) -> bool {
+        self.doorbell
+            .as_ref()
+            .map(|d| d.toron_events)
+            .unwrap_or(false)
+    }
+
     /// Cross-workspace scopes flag (bd-asr2.18, D5): false unless opted in.
     pub fn doorbell_cross_workspace(&self) -> bool {
         self.doorbell

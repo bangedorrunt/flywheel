@@ -297,6 +297,16 @@ impl CoreReducer {
                 line: line.clone(),
             },
             BrainMsg::Died => DoorbellMsg::WatchDied,
+            BrainMsg::EventsHint {
+                event_id,
+                pin,
+                line,
+            } => DoorbellMsg::EventsHint {
+                event_id: event_id.clone(),
+                pin: pin.clone(),
+                line: line.clone(),
+            },
+            BrainMsg::EventsGap { pin } => DoorbellMsg::EventsGap { pin: pin.clone() },
             BrainMsg::Sweep { .. }
             | BrainMsg::RoleBound { .. }
             | BrainMsg::Presence { .. }

@@ -1837,6 +1837,30 @@ impl Host for FileHost {
                     })
                     .collect()
             }
+            BrainMsg::EventsHint {
+                event_id,
+                pin,
+                line,
+            } => {
+                let (next, actions) = doorbell_core::tick(
+                    &self.reducer.model,
+                    &doorbell_core::DoorbellMsg::EventsHint {
+                        event_id: event_id.clone(),
+                        pin: pin.clone(),
+                        line: line.clone(),
+                    },
+                );
+                self.reducer.model = next;
+                self.normalize(actions)
+            }
+            BrainMsg::EventsGap { pin } => {
+                let (next, actions) = doorbell_core::tick(
+                    &self.reducer.model,
+                    &doorbell_core::DoorbellMsg::EventsGap { pin: pin.clone() },
+                );
+                self.reducer.model = next;
+                self.normalize(actions)
+            }
             BrainMsg::Degraded { .. }
             | BrainMsg::Delivered { .. }
             | BrainMsg::Ask { .. }

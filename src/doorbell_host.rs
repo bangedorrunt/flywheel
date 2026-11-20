@@ -31,6 +31,226 @@ type WakeTaskSlot =
 /// still resolves. The 1s liveness poll decides; this only paces the probe.
 const WORKSPACE_PROBE_SECS: u64 = 30;
 
+// ---- bd-l5vb2 U8: toron events as a wake source for no-door harnesses ----
+
+/// Harnesses whose only inbound door is toron events (ADR-0039 D8). Canonical
+/// names; the operator list is gemini, antigravity, grok, codex until each
+/// gains a native door.
+fn events_only_harness(kind: &str) -> bool {
+    matches!(
+        crate::harness_registry::canonical(kind).as_str(),
+        "gemini" | "antigravity" | "grok" | "codex"
+    )
+}
+
+/// The canonical pull line. `toron next` classifies as `AtIdle` (a real mail
+/// wake), so an events hint rings exactly like a wake.sock mail.
+fn events_mail_line() -> String {
+    doorbell_core::doorbell_line(doorbell_core::EventClass::PlanePMail, "toron next")
+}
+
+/// Pure: one events-kernel command -> the brain input that feeds the existing
+/// fold. `JournalCursor` is an effect the interpreter performs, not a brain
+/// input. The gap collapses to ONE digest msg, never a prompt storm.
+fn bridge_cmd_to_brain(pin: &str, cmd: &crate::events_bridge::BridgeCmd) -> Option<BrainMsg> {
+    match cmd {
+        crate::events_bridge::BridgeCmd::JournalCursor(_) => None,
+        crate::events_bridge::BridgeCmd::Emit(notice) => {
+            if notice.event_name == "gap" || notice.event_id.starts_with("gap:") {
+                Some(BrainMsg::EventsGap {
+                    pin: pin.to_string(),
+                })
+            } else {
+                Some(BrainMsg::EventsHint {
+                    event_id: notice.event_id.clone(),
+                    pin: pin.to_string(),
+                    line: events_mail_line(),
+                })
+            }
+        }
+    }
+}
+
+/// Pure fold of one page through the events kernel. The deduper keyed by bus
+/// event id is what makes a seat reached by both wake.sock and events ring
+/// once; the returned cursor is journaled AFTER the msgs are emitted.
+fn fold_events_page(
+    deduper: &mut crate::events_bridge::Deduper,
+    cursor: &mut String,
+    page: &crate::events_bridge::Page,
+    pin: &str,
+) -> (Vec<BrainMsg>, Option<String>) {
+    let cmds = crate::events_bridge::apply_page(deduper, cursor, page);
+    let msgs = cmds
+        .iter()
+        .filter_map(|c| bridge_cmd_to_brain(pin, c))
+        .collect();
+    let journal = cmds.iter().find_map(|c| match c {
+        crate::events_bridge::BridgeCmd::JournalCursor(c) => Some(c.clone()),
+        _ => None,
+    });
+    (msgs, journal)
+}
+
+/// Journal row for an events-source effect. No payload/token ever rides it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EventsJournalOp {
+    Subscribe,
+    Fetch,
+    Cursor(String),
+}
+
+fn events_journal_path(state_dir: &std::path::Path, pin: &str) -> PathBuf {
+    state_dir
+        .join("doorbell")
+        .join(format!("events-{pin}.jsonl"))
+}
+
+fn events_cursor_path(state_dir: &std::path::Path, pin: &str) -> PathBuf {
+    state_dir
+        .join("doorbell")
+        .join(format!("events-{pin}.cursor"))
+}
+
+fn read_events_cursor(state_dir: &std::path::Path, pin: &str) -> String {
+    std::fs::read_to_string(events_cursor_path(state_dir, pin))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn write_events_cursor(state_dir: &std::path::Path, pin: &str, cursor: &str) {
+    let path = events_cursor_path(state_dir, pin);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, cursor);
+}
+
+/// Journal-before-invoke: append the row BEFORE the RPC runs so a crash can
+/// replay from the last cursor; the bus id deduper absorbs the duplicate.
+fn append_events_journal(
+    state_dir: &std::path::Path,
+    pin: &str,
+    op: &EventsJournalOp,
+    now_us: i64,
+) {
+    use std::io::Write as _;
+    let path = events_journal_path(state_dir, pin);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let row = match op {
+        EventsJournalOp::Subscribe => {
+            serde_json::json!({"op":"subscribe","pin":pin,"ts_us":now_us})
+        }
+        EventsJournalOp::Fetch => serde_json::json!({"op":"fetch","pin":pin,"ts_us":now_us}),
+        EventsJournalOp::Cursor(c) => {
+            serde_json::json!({"op":"cursor","pin":pin,"cursor":c,"ts_us":now_us})
+        }
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{row}");
+    }
+}
+
+fn now_us() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+}
+
+/// Stop flag shared by every events pump; set on graceful shutdown.
+static EVENTS_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// One seat's pump. `subscribe` once, then stream with a poll fallback, fold
+/// every page through the pure kernel, emit msgs BEFORE journaling the cursor.
+fn run_events_pump(tx: mpsc::Sender<BrainMsg>, project: String, pin: String, url: String) {
+    let state_dir = config::state_dir();
+    let token_path = crate::events_tokens::token_path(&state_dir, &project, &pin);
+    let name = format!("flywheel-doorbell-{project}-{pin}");
+    let mut client = crate::events_client::ToronEventsClient::new(
+        crate::events_client::UreqRpc::new(&url, &token_path.to_string_lossy()),
+        &name,
+        3_600,
+    );
+    let stopped = || EVENTS_STOP.load(std::sync::atomic::Ordering::Relaxed);
+    while !stopped() {
+        append_events_journal(&state_dir, &pin, &EventsJournalOp::Subscribe, now_us());
+        match client.subscribe() {
+            Ok(_) => break,
+            Err(_) => std::thread::sleep(Duration::from_secs(5)),
+        }
+    }
+    let mut cursor = read_events_cursor(&state_dir, &pin);
+    let mut deduper = crate::events_bridge::Deduper::new(1024);
+    while !stopped() {
+        append_events_journal(&state_dir, &pin, &EventsJournalOp::Fetch, now_us());
+        match client.fetch(&cursor) {
+            Ok(page) => {
+                let (msgs, next) = fold_events_page(&mut deduper, &mut cursor, &page, &pin);
+                for msg in msgs {
+                    if tx.blocking_send(msg).is_err() {
+                        return;
+                    }
+                }
+                if let Some(next) = next {
+                    append_events_journal(
+                        &state_dir,
+                        &pin,
+                        &EventsJournalOp::Cursor(next.clone()),
+                        now_us(),
+                    );
+                    write_events_cursor(&state_dir, &pin, &next);
+                }
+            }
+            Err(_) => {
+                // Fault-as-data: a stream/poll failure is a gap on the next
+                // successful page, not a prompt storm. Back off before retry.
+                let _ = tx.blocking_send(BrainMsg::Degraded {
+                    source: format!("events:{pin}"),
+                    reason: "events fetch failed; will retry".into(),
+                });
+            }
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// Arm one events pump per no-door seat that has a provisioned token. Opt-in
+/// only: with the flag off this spawns nothing, so behaviour is byte-identical.
+fn spawn_events_pumps(cfg: &Config, project: &str, tx: &mpsc::Sender<BrainMsg>) {
+    if !cfg.doorbell_toron_events() {
+        return;
+    }
+    let url = std::env::var("FLYWHEEL_TORON_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:18080".to_string());
+    let state_dir = config::state_dir();
+    EVENTS_STOP.store(false, std::sync::atomic::Ordering::Relaxed);
+    for seat in state::load_spawn_registry(project) {
+        if !seat.harness.as_deref().is_some_and(events_only_harness) {
+            continue;
+        }
+        let Some(pin) = seat.mail_identity.clone() else {
+            continue;
+        };
+        let token_path = crate::events_tokens::token_path(&state_dir, project, &pin);
+        if !token_path.is_file() {
+            continue; // no provisioned token: this seat has no subscription
+        }
+        let tx = tx.clone();
+        let project = project.to_string();
+        let url = url.clone();
+        let pin = pin.clone();
+        std::thread::spawn(move || run_events_pump(tx, project, pin, url));
+    }
+}
+
 /// The embedded host: owns the reducer model and every flywheel-shaped
 /// capability the brain orchestrates.
 pub struct RtHost {
@@ -978,6 +1198,19 @@ impl Host for RtHost {
                 },
                 false,
             ),
+            BrainMsg::EventsHint {
+                event_id,
+                pin,
+                line,
+            } => (
+                workspace::Msg::EventsHint {
+                    event_id: event_id.clone(),
+                    pin: pin.clone(),
+                    line: line.clone(),
+                },
+                false,
+            ),
+            BrainMsg::EventsGap { pin } => (workspace::Msg::EventsGap { pin: pin.clone() }, false),
             BrainMsg::Degraded { .. }
             | BrainMsg::Delivered { .. }
             | BrainMsg::Ask { .. }
@@ -1493,6 +1726,8 @@ async fn run_embedded_async(
             )
         });
     let store = FileStore::new(config::state_dir());
+    // bd-l5vb2: arm the opt-in toron events source alongside wake.sock.
+    spawn_events_pumps(&cfg, workspace, &tx);
     let watch_slot = host.wake_task.clone();
     let bus_fw = wake_forwarder(
         &tx,
@@ -1680,6 +1915,7 @@ async fn run_embedded_async(
         doorbell::retire_workspace(&config::state_dir(), workspace, std::process::id());
     }
     _lease_beat.abort();
+    EVENTS_STOP.store(true, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut g) = watch_slot.lock() {
         let _ = g.take();
     }
@@ -3734,5 +3970,106 @@ mod bd_346jl_binding_tests {
         };
         row.agent_status = status.parse().expect("status");
         row
+    }
+}
+
+#[cfg(test)]
+mod events_source_tests {
+    //! bd-l5vb2: the pure events fold that feeds the single budget gate.
+    //! No socket, clock, env or live daemon — a fake Page drives every case.
+    use super::*;
+    use crate::events_bridge::{BridgeCmd, BridgeEvent, ChannelNotice, Page};
+
+    fn page(id: &str, cursor: &str) -> Page {
+        Page {
+            events: vec![BridgeEvent {
+                id: id.into(),
+                kind: "mail.addressed".into(),
+                payload: String::new(),
+            }],
+            next_cursor: cursor.into(),
+            gap: false,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn the_events_line_is_a_real_mail_wake_not_a_silent_notice() {
+        let line = events_mail_line();
+        assert_eq!(
+            doorbell_core::wake_kind_of_line(&line),
+            doorbell_core::WakeKind::AtIdle,
+            "an events hint must ring like a mail: {line}"
+        );
+    }
+
+    #[test]
+    fn the_same_bus_event_id_rings_once_across_wake_sock_and_events() {
+        let mut deduper = crate::events_bridge::Deduper::new(1024);
+        let mut cursor = String::new();
+        let (first, c1) = fold_events_page(&mut deduper, &mut cursor, &page("bus-e1", "c1"), "P");
+        assert_eq!(c1.as_deref(), Some("c1"));
+        assert_eq!(first.len(), 1);
+        assert!(matches!(
+            &first[0],
+            BrainMsg::EventsHint { event_id, pin, .. }
+                if event_id == "bus-e1" && pin == "P"
+        ));
+        // wake.sock carried the same id: the shared deduper absorbs it.
+        let (second, _) = fold_events_page(&mut deduper, &mut cursor, &page("bus-e1", "c2"), "P");
+        assert!(
+            second.is_empty(),
+            "one mail must not ring twice: {second:?}"
+        );
+    }
+
+    #[test]
+    fn a_gap_collapses_to_one_digest_msg() {
+        let mut deduper = crate::events_bridge::Deduper::new(1024);
+        let mut cursor = String::new();
+        let gap = Page {
+            events: Vec::new(),
+            next_cursor: "fresh".into(),
+            gap: true,
+            truncated: false,
+        };
+        let (msgs, next) = fold_events_page(&mut deduper, &mut cursor, &gap, "P");
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(msgs[0], BrainMsg::EventsGap { .. }));
+        assert_eq!(next.as_deref(), Some("fresh"));
+    }
+
+    #[test]
+    fn a_cursor_command_is_an_effect_not_a_brain_msg() {
+        let cmd = BridgeCmd::JournalCursor("c9".into());
+        assert!(bridge_cmd_to_brain("P", &cmd).is_none());
+        let mail = BridgeCmd::Emit(ChannelNotice {
+            hint: crate::events_bridge::HINT.into(),
+            event_id: "e9".into(),
+            event_name: "mail.addressed".into(),
+            count: 1,
+        });
+        assert!(matches!(
+            bridge_cmd_to_brain("P", &mail),
+            Some(BrainMsg::EventsHint { .. })
+        ));
+    }
+
+    #[test]
+    fn flag_off_is_the_default_so_behaviour_is_byte_identical() {
+        assert!(
+            !crate::config::Config::default().doorbell_toron_events(),
+            "the events source must be opt-in"
+        );
+    }
+
+    #[test]
+    fn only_the_named_no_door_harnesses_get_an_events_pump() {
+        for kind in ["gemini", "antigravity", "grok", "codex", "gk", "cx"] {
+            assert!(events_only_harness(kind), "{kind} has no inbound door");
+        }
+        for kind in ["opencode", "oc", "claude", "pi"] {
+            assert!(!events_only_harness(kind), "{kind} has a native door");
+        }
     }
 }
