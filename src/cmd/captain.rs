@@ -1577,10 +1577,13 @@ mod tests {
     #[test]
     fn both_captain_decisions_use_the_pull_cursor() {
         let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/cmd/captain.rs"));
-        let last_reads = src.matches("\"last\"").count();
         assert!(
-            last_reads >= 2,
-            "the ring read and the idle read must both use since_ts = \"last\" (got {last_reads})"
+            src.contains("inbox_rows(&mail, &key, Some(\"last\"))?"),
+            "the ring read must use the pull cursor"
+        );
+        assert!(
+            src.contains("since_ts: Some(\"last\".to_string()),"),
+            "the idle read must use the pull cursor"
         );
     }
 
