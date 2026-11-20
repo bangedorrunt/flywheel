@@ -59,6 +59,7 @@ mod durable_resume;
 mod durable_transition;
 mod effect_journal;
 mod elm;
+mod events_bridge;
 mod failure;
 mod fs_util;
 mod harness_api;
@@ -1417,6 +1418,19 @@ enum Commands {
     /// grok ~/.grok/config.toml). Idempotent — re-running only updates the
     /// toron entry, never clobbers other servers. (Moved here from the retired
     /// `flywheel toron` demo surface; same args and behavior.)
+    /// stdio MCP server that bridges toron events into a harness's inbound
+    /// channel (ADR-0039 D8, bd-si4b5). Declares claude/channel and emits the
+    /// D2 hint only. Phase A: pure protocol + transport port; Phase B wires the
+    /// real toron events client (bd-o4bgx).
+    #[command(name = "mcp-events", hide = true)]
+    McpEvents {
+        /// subscription id (pin-scoped); the transport keys its cursor on this
+        #[arg(long, default_value = "default")]
+        subscription: String,
+        /// print the initialize result and exit (protocol smoke check)
+        #[arg(long)]
+        probe: bool,
+    },
     #[command(name = "setup-mcp")]
     SetupMcp {
         /// toron MCP server URL (default http://127.0.0.1:18080/mcp)
@@ -3710,6 +3724,14 @@ fn main() {
             msg,
         }) => cmd_assign(&cfg, project, to, beads, msg.as_deref()),
         Some(Commands::Mail { cmd }) => cmd_mail(&cfg, cmd),
+        Some(Commands::McpEvents { subscription, probe }) => {
+            if *probe {
+                print_json(&events_bridge::initialize_result());
+                Ok(())
+            } else {
+                cmd_mcp_events(&cfg, subscription)
+            }
+        }
         Some(Commands::SetupMcp {
             url,
             agents,
@@ -14214,6 +14236,53 @@ mod verify_gate_tests {
         let is_vacuous = is_cargo_test_verify(verify) && passed == Some(0);
         assert!(is_vacuous);
     }
+}
+
+/// bd-si4b5 Phase A: a stdio MCP server that declares claude/channel and speaks
+/// JSON-RPC line protocol. The events transport is a port; Phase B (bd-o4bgx)
+/// supplies the real toron client. Phase A wires a no-op transport so the
+/// protocol seam is real and testable without a live toron events endpoint.
+fn cmd_mcp_events(_cfg: &Config, subscription: &str) -> Result<()> {
+    use std::io::{BufRead, Write};
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let init = events_bridge::initialize_result();
+    for line in stdin.lock().lines() {
+        let line = line?;
+        let req: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let method = req
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let id = req.get("id").cloned();
+        let response = match method {
+            "initialize" => Some((id, init.clone())),
+            "ping" => Some((id, serde_json::json!({}))),
+            "notifications/initialized" => None,
+            _ => Some((
+                id,
+                serde_json::json!({
+                    "error": { "code": -32601, "message": "method not found" }
+                }),
+            )),
+        };
+        if let Some((rid, result)) = response {
+            let mut msg = serde_json::json!({ "jsonrpc": "2.0", "result": result });
+            if let Some(rid) = rid {
+                msg["id"] = rid;
+            } else {
+                msg.as_object_mut().and_then(|m| m.remove("id"));
+            }
+            writeln!(out, "{}", msg)?;
+            out.flush()?;
+        }
+    }
+    let _ = subscription;
+    Ok(())
 }
 
 fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&str>) -> Result<()> {
