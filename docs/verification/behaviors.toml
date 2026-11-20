@@ -1302,6 +1302,19 @@ mutations = [
 ]
 
 [[behavior]]
+id = "doorbell.pull-cursor-consumed"
+owner = "crates/doorbell-core/src/lib.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "crates/doorbell-core/src/lib.rs::a_pulled_mail_event_never_re_rings",
+]
+mutations = [
+  "scripts/mutations/doorbell-pull-cursor.spec.sh#D1",
+  "scripts/mutations/doorbell-pull-cursor.spec.sh#D2",
+]
+
+[[behavior]]
 id = "captain.pull-cursor-consumed"
 owner = "src/cmd/captain.rs"
 status = "proven"

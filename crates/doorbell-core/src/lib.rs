@@ -1001,6 +1001,20 @@ pub struct DoorbellModel {
     /// never produces one, so the entry would sit in RAM forever and die
     /// with the process. `route_or_queue` sends them to the digest instead.
     pub unroutable: BTreeSet<String>,
+    /// Per-pin plane-P pull cursor, in unix micros — the one notion of
+    /// consumed (bd-yc6jf). Fed from the host's `WakeState.since_by_pin`. A
+    /// mail wake whose event time is at or below this cursor was already
+    /// pulled by `toron next` and must not ring an empty wake.
+    #[serde(default)]
+    pub pulled_us: BTreeMap<String, i64>,
+}
+
+/// A mail event at or below the pin's pull cursor is consumed, not a wake
+/// (bd-yc6jf). Pure so one message log can prove a pulled message never rings.
+pub fn already_pulled(pulled_us: &BTreeMap<String, i64>, pin: &str, created_us: i64) -> bool {
+    pulled_us
+        .get(pin)
+        .is_some_and(|cursor| created_us <= *cursor)
 }
 
 /// Per-pin 5/30/3 budget (D1 item 2, D4.5 home).
@@ -1194,7 +1208,20 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 (event_id.clone(), None)
             };
             let line_out = doorbell_line(class, &hint);
+            let created_us = watch_created_at(line).map(|s| (s as i64).saturating_mul(1_000_000));
             for pin in watch_targets(line, &next.index) {
+                // bd-yc6jf: the pull cursor is the one notion of consumed. A
+                // mail event at or below it was already pulled by toron next —
+                // no wake for an empty inbox. Ack-SLA and other urgent kinds
+                // have no inbox row and are never skipped here.
+                if mail && created_us.is_some_and(|us| already_pulled(&next.pulled_us, &pin, us)) {
+                    actions.push(DoorbellAction::Audit {
+                        kind: "already-pulled".into(),
+                        pin: pin.clone(),
+                        detail: format!("mail at {created_us:?} is at or below the pull cursor"),
+                    });
+                    continue;
+                }
                 if unidentified_mail {
                     actions.push(DoorbellAction::Audit {
                         kind: "unidentified_mail_wake".into(),
@@ -1457,6 +1484,57 @@ mod tests {
         m.index.insert_pin(pin.to_string(), None);
         m.statuses.insert(pin.to_string(), "idle".into());
         m
+    }
+
+    /// bd-yc6jf: over ONE message log, once the pin's pull cursor has passed a
+    /// mail event, the doorbell must not ring it again — the same consumed
+    /// fact the captain watch uses. Ack-SLA (non-mail) has no inbox row and is
+    /// never suppressed by the cursor.
+    #[test]
+    fn a_pulled_mail_event_never_re_rings() {
+        let npub = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let mut index = SelfIndex::default();
+        index.insert_pin("BlueRidge".into(), Some(npub.into()));
+        let watch = format!(
+            r#"{{"kind":9,"id":"wake-pulled-1","pubkey":"senderpk","created_at":1700000000,"tags":[["p","{npub}"],["t","flywheel"],["h","thread-1"],["toron-kind","mail-delivered"],["thread","thread-1"],["importance","normal"],["from","SlateHarbor"],["mid","msg-pulled-1"]],"content":"mail"}}"#
+        );
+        let mut fresh = DoorbellModel {
+            index: index.clone(),
+            ..Default::default()
+        };
+        fresh.statuses.insert("BlueRidge".into(), "idle".into());
+        let (_, fresh_actions) = tick(
+            &fresh,
+            &DoorbellMsg::WatchNdjson {
+                line: watch.clone(),
+            },
+        );
+        assert!(
+            fresh_actions
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { pin, .. } if pin == "BlueRidge")),
+            "unpulled mail rings"
+        );
+
+        let mut pulled = fresh.clone();
+        // created_at 1700000000 secs -> 1700000000000000 micros; the pull
+        // cursor at or past that time means the mail was already consumed.
+        pulled
+            .pulled_us
+            .insert("BlueRidge".into(), 1_700_000_000_000_000);
+        let (_, pulled_actions) = tick(&pulled, &DoorbellMsg::WatchNdjson { line: watch });
+        assert!(
+            !pulled_actions
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { pin, .. } if pin == "BlueRidge")),
+            "a pulled message must not re-ring: {pulled_actions:?}"
+        );
+        assert!(
+            pulled_actions.iter().any(
+                |a| matches!(a, DoorbellAction::Audit { kind, .. } if kind == "already-pulled")
+            ),
+            "the skipped wake is audited, never silent"
+        );
     }
 
     #[test]

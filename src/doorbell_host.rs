@@ -1104,6 +1104,20 @@ impl Host for RtHost {
     }
 
     fn tick(&mut self, msg: &BrainMsg) -> Vec<Effect> {
+        // bd-yc6jf: feed the pure fold the one notion of consumed — each
+        // hosted pin's plane-P pull cursor from WakeState.since_by_pin, in
+        // micros. A mail watch at or below it is already pulled and must not
+        // ring an empty wake. Cheap local read; no toron round trip.
+        let state_dir = config::state_dir();
+        for entry in state::load_spawn_registry(&self.project) {
+            let Some(pin) = entry.mail_identity else {
+                continue;
+            };
+            if let Some(cursor) = crate::doorbell::pin_cursor_us(&state_dir, &self.workspace, &pin)
+            {
+                self.model.doorbell.pulled_us.insert(pin, cursor as i64);
+            }
+        }
         let mut boot_drain_effects: Vec<Effect> = Vec::new();
         let (wmsg, drain_waits) = match msg {
             BrainMsg::Watch(line) => (workspace::Msg::WatchNdjson { line: line.clone() }, true),
