@@ -328,11 +328,24 @@ fn strip_lesson_framing(s: &str) -> &str {
     }
 }
 
+/// Where chie appends its trap matcher. Cutting at the FIRST backtick would
+/// merge two distinct lessons whose rule text merely mentions code (`a` vs `b`),
+/// so cut only at the framing chie itself adds (bd-7szny follow-up).
+fn trap_boundary(bare: &str) -> usize {
+    let mut end = bare.len();
+    for marker in [" Trap: `", ": `"] {
+        if let Some(at) = bare.find(marker) {
+            end = end.min(at);
+        }
+    }
+    end
+}
+
 /// The stable identity of a lesson across chie renderings: framing removed,
-/// text after the backticked trap matcher dropped, whitespace normalized.
+/// text after chie's trap matcher dropped, whitespace normalized.
 fn lesson_core(s: &str) -> String {
     let bare = strip_lesson_framing(s);
-    let before_trap = bare.split('`').next().unwrap_or(bare);
+    let before_trap = &bare[..trap_boundary(bare)];
     let mut core = before_trap.trim();
     for suffix in ["Trap:", "Proof:", "Rule:"] {
         if let Some(rest) = core.strip_suffix(suffix) {
@@ -722,6 +735,14 @@ mod tests {
             lesson_core(old),
             "a zebra marker breaks when a dedup probe runs; do keep one lesson"
         );
+    }
+
+    #[test]
+    fn lesson_core_keeps_backticks_inside_the_rule_text() {
+        let a = "Rule: use `a` breaks when a dedup probe runs; do keep alpha";
+        let b = "Rule: use `b` breaks when a dedup probe runs; do keep beta";
+        assert_ne!(lesson_core(a), lesson_core(b));
+        assert!(lesson_core(a).contains("`a`"), "{}", lesson_core(a));
     }
 
     #[test]

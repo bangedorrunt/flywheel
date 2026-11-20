@@ -1,0 +1,17 @@
+{
+  "conclusions": [],
+  "events": [
+    {
+      "content": "Rule: Rule: Rule: a zebra marker breaks when a dedup probe runs; do keep one lesson Trap: `a dedup probe runs` — Rule: Rule: a zebra marker breaks when a dedup probe runs; do keep one lesson Proof: recorded by flywheel memory record-lesson"
+    },
+    {
+      "content": "Rule: Rule: a zebra marker breaks when a dedup probe runs; do keep one lesson: `a dedup probe runs` — Rule: Rule: a zebra marker breaks when a dedup probe runs; (proof: recorded by flywheel memory record-lesson)"
+    },
+    {
+      "content": "Rule: use `a` breaks when a dedup probe runs; do keep alpha"
+    },
+    {
+      "content": "Rule: use `b` breaks when a dedup probe runs; do keep beta"
+    }
+  ]
+}

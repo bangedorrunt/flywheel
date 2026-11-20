@@ -25,12 +25,8 @@ fn text(out: &Output) -> String {
 /// A fake chie: `record` succeeds, `recall` replays the two real trap shapes
 /// (old and new chiebukuro renderings) from a fixture, everything else is
 /// empty. The real installed chie is never spawned (bd-7szny).
-fn fake_chie_with_traps(sandbox: &TestSandbox) -> std::path::PathBuf {
+fn fake_chie_with_fixture(sandbox: &TestSandbox, fixture: &str) -> std::path::PathBuf {
     let fake = sandbox.bin_dir().join("fake-chie-traps");
-    let fixture = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/chie/old-new-traps.json"
-    );
     let script = format!(
         "#!/bin/sh\ncase \"$2\" in\n  record) printf '{{\"recorded\":true}}\\n' ;;\n  recall) cat '{fixture}' ;;\n  *) printf '[]\\n' ;;\nesac\nexit 0\n"
     );
@@ -40,6 +36,16 @@ fn fake_chie_with_traps(sandbox: &TestSandbox) -> std::path::PathBuf {
     perms.set_mode(0o755);
     std::fs::set_permissions(&fake, perms).expect("chmod");
     fake
+}
+
+fn fake_chie_with_traps(sandbox: &TestSandbox) -> std::path::PathBuf {
+    fake_chie_with_fixture(
+        sandbox,
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/chie/old-new-traps.json"
+        ),
+    )
 }
 
 fn run_with_chie(sandbox: &TestSandbox, fake: &std::path::Path, args: &[&str]) -> Output {
@@ -278,6 +284,39 @@ fn recalled_lessons_are_deduplicated() {
         "preflight must show one copy: {}",
         text(&found)
     );
+}
+
+/// Distinct lessons that differ only inside a backticked identifier must both
+/// surface; the old/new rendering of one lesson still dedupes to one (bd-7szny).
+#[test]
+fn distinct_code_lessons_both_surface() {
+    let sandbox = TestSandbox::new();
+    let fake = fake_chie_with_fixture(
+        &sandbox,
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/chie/distinct-code-lessons.json"
+        ),
+    );
+    let found = run_with_chie(
+        &sandbox,
+        &fake,
+        &[
+            "memory",
+            "check-trap",
+            "dedup probe",
+            "--project",
+            "proj",
+            "--json",
+        ],
+    );
+    let out = text(&found);
+    assert!(
+        out.contains("\"count\": 3"),
+        "one duplicate + two distinct: {out}"
+    );
+    assert!(out.contains("use `a`"), "alpha lesson missing: {out}");
+    assert!(out.contains("use `b`"), "beta lesson missing: {out}");
 }
 
 /// A test that shells the real chie is ambient-state dependent: proof67 broke

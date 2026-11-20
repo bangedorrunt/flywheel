@@ -1,12 +1,12 @@
 # Sourced by scripts/verify-mutations.sh.
-# bd-7szny: dedup must key on a normalized lesson core, not the raw chie
-# rendering. Reverting to a raw compare surfaces the same lesson twice.
+# bd-7szny: dedup must cut at chie's trap-matcher framing, not at the first
+# backtick anywhere — code identifiers in the rule text would collide.
 
 CARGO_ARGS=(--test memory_loop)
-TEST_FILTER=(recalled_lessons_are_deduplicated)
+TEST_FILTER=(distinct_code_lessons_both_surface recalled_lessons_are_deduplicated)
 
-mutation "D1  the normalized lesson core is not cut at the trap matcher" \
+mutation "D1  the core is cut at the first backtick instead of the trap boundary" \
     file=src/cmd/memory.rs \
-    expect=recalled_lessons_are_deduplicated \
-    find="    let before_trap = bare.split('\`').next().unwrap_or(bare);" \
-    replace='    let before_trap = bare;'
+    expect=distinct_code_lessons_both_surface \
+    find='    let before_trap = &bare[..trap_boundary(bare)];' \
+    replace="    let before_trap = &bare[..bare.find('\`').unwrap_or(trap_boundary(bare))];"
