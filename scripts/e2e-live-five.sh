@@ -29,12 +29,17 @@ DRY=0
 KEEP=0
 SELFTEST=0
 CHECK_TARGET=""
+CHECK_EXPORT=""
+TARGET_REV="HEAD"
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY=1; shift ;;
         --keep) KEEP=1; shift ;;
         --selftest) SELFTEST=1; shift ;;
+        --sha) [ $# -ge 2 ] || { echo "e2e-live-five: --sha needs a revision" >&2; exit 2; }; TARGET_REV="$2"; shift 2 ;;
+        --head) TARGET_REV="HEAD"; shift ;;
         --check-target) [ $# -ge 2 ] || { echo "e2e-live-five: --check-target needs a dir" >&2; exit 2; }; CHECK_TARGET="$2"; shift 2 ;;
+        --check-export) [ $# -ge 2 ] || { echo "e2e-live-five: --check-export needs a dir" >&2; exit 2; }; CHECK_EXPORT="$2"; shift 2 ;;
         -h | --help) sed -n '2,26p' "$0"; exit 0 ;;
         *) echo "e2e-live-five: unknown arg: $1" >&2; exit 2 ;;
     esac
@@ -57,9 +62,37 @@ check_target_link() { # dir -> 0 when target is usable, 1 with one diagnosis lin
     return 0
 }
 
+# bd-w5tgg: the live leg measures a REVISION, never the shared tree. Archive the
+# named revision and its proof.toml-pinned siblings into a throwaway export and
+# build/run every suite there, so a neighbour's WIP cannot break or fake a leg.
+prepare_export() { # repo-dir -> sets PROVEN_SHA, TEST_REPO, EXPORT_ROOT
+    local repo="$1" rel pin sib_repo
+    # shellcheck source=proof-lib.sh
+    . "$ROOT/scripts/proof-lib.sh"
+    git -C "$repo" cat-file -e "$TARGET_REV^{commit}" 2>/dev/null \
+        || die "rev not found: $TARGET_REV"
+    PROVEN_SHA="$(git -C "$repo" rev-parse "$TARGET_REV")"
+    EXPORT_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/e2e-live-five-export.XXXXXX")"
+    mkdir -p "$EXPORT_ROOT/flywheel"
+    git -C "$repo" archive "$PROVEN_SHA" | tar -x -C "$EXPORT_ROOT/flywheel" \
+        || die "cannot archive $PROVEN_SHA"
+    while IFS=$'\t' read -r rel pin; do
+        [ -n "${rel:-}" ] || continue
+        sib_repo="$(cd "$repo/$rel" && pwd)"
+        proof_archive "$sib_repo" "$pin" "$EXPORT_ROOT/$(basename "$rel")" \
+            || die "cannot archive sibling $rel at $pin"
+    done < <(proof_siblings "$repo" "$PROVEN_SHA")
+    TEST_REPO="$EXPORT_ROOT/flywheel"
+}
+
 if [ -n "$CHECK_TARGET" ]; then
     check_target_link "$CHECK_TARGET"
     exit $?
+fi
+if [ -n "$CHECK_EXPORT" ]; then
+    prepare_export "$CHECK_EXPORT"
+    printf '%s\n%s\n' "$PROVEN_SHA" "$EXPORT_ROOT"
+    exit 0
 fi
 
 STAMP="$(date +%Y%m%dT%H%M%SZ)"
@@ -99,7 +132,9 @@ resolve_tool() {
 
 REX_BIN="$(resolve_tool rex)" || die "rex not found (PATH, ~/.local/bin, homebrew, /usr/local/bin)"
 CARGO_BIN="${CARGO_BIN:-$(resolve_tool cargo)}" || die "cargo not found"
-FLYWHEEL_BIN="${FLYWHEEL_BIN:-$(resolve_tool flywheel)}" || die "flywheel not found"
+# bd-w5tgg: when not named by the caller, flywheel is built from the export
+# below, not resolved from the shared tree's installed shim.
+FLYWHEEL_BIN="${FLYWHEEL_BIN:-}"
 if [ -x /usr/bin/python3 ]; then
     PYTHON_BIN=/usr/bin/python3
 else
@@ -112,6 +147,7 @@ if [ "$DRY" = 1 ]; then
 e2e-live --five --dry-run: nothing is created, nothing runs.
 session:  $SESSION   (then: $REX_BIN kill $SESSION on exit)
 pane:     first pane of $SESSION, block $BLOCK, pin $PIN
+sha:      $(git -C "$ROOT" rev-parse "$TARGET_REV")
 env:      FLYWHEEL_LIVE_E2E=1
           FLYWHEEL_LIVE_SESSION=$SESSION
           FLYWHEEL_LIVE_BLOCK=$BLOCK
@@ -119,7 +155,7 @@ env:      FLYWHEEL_LIVE_E2E=1
           FLYWHEEL_LIVE_PROJECT=$PROJECT
           FLYWHEEL_LIVE_AS=$AS
           TORON_BIN=${TORON_BIN:-<resolve at run time>}
-tests:    ($CARGO_BIN test --test <file> -- --ignored --nocapture)
+tests:    (from a clean export of the sha: $CARGO_BIN test --test <file> -- --ignored --nocapture)
 EOF
     for t in "${TESTS[@]}"; do
         printf '          %s\n' "$t"
@@ -131,13 +167,12 @@ EOF
     exit 0
 fi
 
-check_target_link "$ROOT" || exit 2
 [ "${FLYWHEEL_LIVE_E2E:-}" = 1 ] || die "set FLYWHEEL_LIVE_E2E=1 to run the live suites deliberately"
-[ -n "$TORON_BIN" ] || die "TORON_BIN not found; name the toron binary"
 
 PLANE_SESSION=""
 SPAWNED_PIN=""
 cleanup() {
+    [ -n "${EXPORT_ROOT:-}" ] && rm -rf "$EXPORT_ROOT"
     if [ -n "$SPAWNED_PIN" ] && [ "$KEEP" = 0 ]; then
         "$FLYWHEEL_BIN" retire "$SPAWNED_PIN" --project e2e-live-five --force-working >/dev/null 2>&1 || true
     fi
@@ -183,6 +218,18 @@ if [ "$SELFTEST" = 1 ]; then
     printf 'selftest: session=%s block=%s\n' "$SESSION_ID" "$BLOCK_ID"
     exit 0
 fi
+
+prepare_export "$ROOT"
+check_target_link "$TEST_REPO" || exit 2
+export CARGO_TARGET_DIR="${E2E_LIVE_FIVE_TARGET_DIR:-$EXPORT_ROOT/target}"
+if [ -z "$FLYWHEEL_BIN" ]; then
+    (cd "$TEST_REPO" && "$CARGO_BIN" build -p flywheel --bin flywheel) \
+        || die "cannot build flywheel from the export of $PROVEN_SHA"
+    FLYWHEEL_BIN="$CARGO_TARGET_DIR/debug/flywheel"
+fi
+echo "e2e-live-five: proving $PROVEN_SHA (clean export $TEST_REPO)"
+[ -x "$FLYWHEEL_BIN" ] || die "flywheel binary missing at $FLYWHEEL_BIN"
+[ -n "$TORON_BIN" ] || die "TORON_BIN not found; name the toron binary"
 
 export FLYWHEEL_LIVE_E2E=1
 export FLYWHEEL_LIVE_SESSION="$SESSION_ID"
@@ -256,7 +303,7 @@ for t in "${TESTS[@]}"; do
         export FLYWHEEL_LIVE_BLOCK="$BLOCK_ID"
         export FLYWHEEL_LIVE_AS="$AS"
     fi
-    if "$CARGO_BIN" test --test "$(basename "$t" .rs)" -- --ignored --nocapture >"$log" 2>&1; then
+    if (cd "$TEST_REPO" && "$CARGO_BIN" test --test "$(basename "$t" .rs)" -- --ignored --nocapture >"$log" 2>&1); then
         printf '  PASS  %s\n' "$t"
         passed=$((passed + 1))
         results="$results{\"test\":\"$t\",\"ok\":true,\"log\":\"$log\"},"
@@ -268,7 +315,8 @@ for t in "${TESTS[@]}"; do
 done
 
 {
-    printf '{"schema":"flywheel-e2e-live-five.v1","stamp":"%s",' "$STAMP"
+    printf '{"schema":"flywheel-e2e-live-five.v1","stamp":"%s","sha":"%s",' \
+        "$STAMP" "$PROVEN_SHA"
     printf '"session":"%s","block":"%s","pin":"%s","project":"%s","as":"%s",' \
         "$SESSION" "$BLOCK" "$PIN" "$PROJECT" "$AS"
     printf '"passed":%d,"failed":%d,"results":[%s]}\n' \

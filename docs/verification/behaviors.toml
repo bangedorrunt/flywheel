@@ -1302,6 +1302,18 @@ mutations = [
 ]
 
 [[behavior]]
+id = "proof.live-five-clean-export"
+owner = "scripts/e2e-live-five.sh"
+status = "proven"
+concurrent = false
+tests = [
+  "tests/e2e_live_dry_run.rs::the_live_five_runs_from_a_clean_export",
+]
+mutations = [
+  "scripts/mutations/e2e-live-clean-export.spec.sh#E1",
+]
+
+[[behavior]]
 id = "proof.verify-mutations-pinned-siblings"
 owner = "scripts/verify-mutations.sh"
 status = "proven"

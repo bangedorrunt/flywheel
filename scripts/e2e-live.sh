@@ -43,7 +43,7 @@ while [ $# -gt 0 ]; do
     --head) TARGET_REV="HEAD"; shift ;;
     --mutate) MUTATE=1; shift ;;
     --contention) CONTENTION_ONLY=1; shift ;;
-    --five) exec "$ROOT/scripts/e2e-live-five.sh" "${@:2}" ;;
+    --five) exec "$ROOT/scripts/e2e-live-five.sh" --sha "$TARGET_REV" "${@:2}" ;;
     *) echo "e2e-live: unknown arg: $1" >&2; exit 2 ;;
   esac
 done
