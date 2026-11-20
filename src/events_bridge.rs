@@ -29,10 +29,14 @@ pub struct BridgeEvent {
 pub struct ChannelNotice {
     pub hint: String,
     /// The bus event id (or a synthetic `gap:<cursor>`), so the doorbell/bridge
-    /// pair can dedupe a seat reached by both (ADR-0039 D8).
+    /// pair can dedupe a seat reached by both (ADR-0039 D8). For a coalesced
+    /// burst this is the FIRST event's id.
     pub event_id: String,
     /// The toron catalogue event name, used as `meta.event_name`.
     pub event_name: String,
+    /// How many wake events this one hint stands for (bd-si4b5 Phase B). A
+    /// burst is one hint, not one hint per event.
+    pub count: usize,
 }
 
 /// Toron catalogue names that wake an agent (ADR-0039 D8) — not the invented
@@ -59,7 +63,27 @@ pub fn event_to_notice(event: &BridgeEvent) -> Option<ChannelNotice> {
         hint: HINT.to_string(),
         event_id: event.id.clone(),
         event_name: event.kind.clone(),
+        count: 1,
     })
+}
+
+/// Merge a burst of wake notices into ONE hint (bd-si4b5 Phase B). The first
+/// event's id/name identify the batch; `count` carries the size. Callers dedupe
+/// per event id before this, so a reconnect does not stack the same hint twice.
+pub fn coalesce(notices: Vec<ChannelNotice>) -> Option<ChannelNotice> {
+    let mut iter = notices.into_iter();
+    let mut first = iter.next()?;
+    let mut count = first.count;
+    let mut mixed = false;
+    for notice in iter {
+        count += notice.count;
+        mixed |= notice.event_name != first.event_name;
+    }
+    if mixed {
+        first.event_name = "mixed".to_string();
+    }
+    first.count = count;
+    Some(first)
 }
 
 /// One synthetic gap notice: the server reset and handed back a fresh servable
@@ -69,6 +93,7 @@ pub fn gap_notice(next_cursor: &str) -> ChannelNotice {
         hint: HINT.to_string(),
         event_id: format!("gap:{next_cursor}"),
         event_name: "gap".to_string(),
+        count: 1,
     }
 }
 
@@ -141,12 +166,18 @@ pub fn apply_page(deduper: &mut Deduper, cursor: &mut String, page: &Page) -> Ve
     if page.needs_resync() && deduper.is_new(&format!("gap:{}", page.next_cursor)) {
         cmds.push(BridgeCmd::Emit(gap_notice(&page.next_cursor)));
     }
+    let mut burst: Vec<ChannelNotice> = Vec::new();
     for event in &page.events {
         if deduper.is_new(&event.id)
             && let Some(notice) = event_to_notice(event)
         {
-            cmds.push(BridgeCmd::Emit(notice));
+            burst.push(notice);
         }
+    }
+    // One page or burst is ONE hint, regardless of how many wake events it
+    // carried (bd-si4b5 Phase B). The gap hint stays separate.
+    if let Some(notice) = coalesce(burst) {
+        cmds.push(BridgeCmd::Emit(notice));
     }
     if !page.next_cursor.is_empty() {
         *cursor = page.next_cursor.clone();
@@ -188,7 +219,7 @@ pub trait EventsTransport {
 
 /// One interpreter tick: poll once and fold the page into commands. Pure except
 /// for the injected transport; no clock, env, or global state.
-pub fn tick<T: EventsTransport>(
+pub fn tick<T: EventsTransport + ?Sized>(
     transport: &T,
     subscription: &str,
     deduper: &mut Deduper,
@@ -236,7 +267,8 @@ pub fn notice_to_rpc(notice: &ChannelNotice) -> serde_json::Value {
             "content": notice.hint,
             "meta": {
                 "event_id": notice.event_id,
-                "event_name": notice.event_name
+                "event_name": notice.event_name,
+                "count": notice.count.to_string()
             }
         }
     })
@@ -247,6 +279,9 @@ pub struct BridgeStep {
     pub notifications: Vec<serde_json::Value>,
     pub reconnect_ms: Option<u64>,
     pub dead: bool,
+    /// The pure commands behind the notifications, so the interpreter can
+    /// journal the cursor (emit-first, journal-after) without re-polling.
+    pub cmds: Vec<BridgeCmd>,
 }
 
 /// Timing inputs for a step, bundled so the interpreter call stays small.
@@ -261,7 +296,7 @@ pub struct BridgeTiming {
 /// One full interpreter step: liveness + reconnect timing + a poll + the RPC
 /// notifications. Pure except for the injected transport. This is what the
 /// `mcp-events` loop calls, so every core decision is wired into production.
-pub fn bridge_step<T: EventsTransport>(
+pub fn bridge_step<T: EventsTransport + ?Sized>(
     transport: &T,
     subscription: &str,
     deduper: &mut Deduper,
@@ -277,6 +312,81 @@ pub fn bridge_step<T: EventsTransport>(
         notifications,
         reconnect_ms,
         dead,
+        cmds,
+    })
+}
+
+/// One SEP-3415 stream notification after routing (ADR-0039 D7, bd-si4b5 Phase
+/// B). Pure decode of one SSE `data:` JSON line; the real transport feeds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamFrame {
+    pub method: String,
+    pub event_id: String,
+    pub event_name: String,
+    pub cursor: Option<String>,
+    pub terminated: bool,
+}
+
+/// Decode one `data:` payload from toron's `events/stream` SSE response.
+/// Returns `None` for anything not routed to `subscription` (another sub's
+/// frames, the JSON-RPC result echo, malformed lines). Heartbeats decode with
+/// empty ids so the caller can refresh liveness without emitting a hint.
+pub fn decode_stream_frame(data: &str, subscription: &str) -> Option<StreamFrame> {
+    let v: serde_json::Value = serde_json::from_str(data).ok()?;
+    let method = v.get("method")?.as_str()?.to_string();
+    if !method.starts_with("notifications/events/") {
+        return None;
+    }
+    let params = v.get("params")?;
+    let routed = params
+        .get("_meta")
+        .and_then(|m| m.get("io.modelcontextprotocol/subscriptionId"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if routed != subscription {
+        return None;
+    }
+    let str_field = |key: &str| {
+        params
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let cursor = {
+        let c = str_field("cursor");
+        (!c.is_empty()).then_some(c)
+    };
+    let (event_id, event_name) = match method.as_str() {
+        "notifications/events/event" => {
+            let event = params.get("event").unwrap_or(&serde_json::Value::Null);
+            (
+                event
+                    .get("event_id")
+                    .or_else(|| event.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                event
+                    .get("name")
+                    .or_else(|| event.get("kind"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        }
+        "notifications/events/gap" => (
+            format!("gap:{}", cursor.as_deref().unwrap_or("")),
+            "gap".to_string(),
+        ),
+        _ => (String::new(), String::new()),
+    };
+    Some(StreamFrame {
+        terminated: method == "notifications/events/terminated",
+        method,
+        event_id,
+        event_name,
+        cursor,
     })
 }
 
@@ -335,6 +445,34 @@ mod tests {
         assert!(d.is_new("c")); // evicts a
         assert!(d.is_new("a")); // a is new again
         assert!(!d.is_new("c")); // b and c still remembered
+    }
+
+    #[test]
+    fn a_burst_of_wake_events_is_one_hint_with_a_count() {
+        let mut d = Deduper::new(16);
+        let mut c = "c0".to_string();
+        let cmds = apply_page(
+            &mut d,
+            &mut c,
+            &Page {
+                events: vec![
+                    ev("e1", "mail.addressed"),
+                    ev("e2", "mail.addressed"),
+                    ev("e3", "role.changed"),
+                ],
+                next_cursor: "c1".into(),
+                gap: false,
+                truncated: false,
+            },
+        );
+        let notices = notices_of(&cmds);
+        assert_eq!(notices.len(), 1, "a burst is one hint: {notices:?}");
+        assert_eq!(notices[0].count, 3);
+        assert_eq!(notices[0].event_id, "e1");
+        assert_eq!(notices[0].event_name, "mixed");
+        let rpc = notice_to_rpc(&notices[0]);
+        assert_eq!(rpc["params"]["meta"]["count"], "3");
+        assert!(!rpc.to_string().contains("SECRET BODY"));
     }
 
     #[test]
@@ -469,6 +607,51 @@ mod tests {
             "dead stream schedules reconnect"
         );
         assert_eq!(step.notifications.len(), 1);
+    }
+
+    #[test]
+    fn stream_frames_are_routed_by_subscription_and_decoded() {
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/events/event",
+            "params": {
+                "_meta": {"io.modelcontextprotocol/subscriptionId": "sub-1"},
+                "event": {"event_id": "e7", "name": "mail.addressed", "body": "SECRET"}
+            }
+        })
+        .to_string();
+        let decoded = decode_stream_frame(&frame, "sub-1").expect("routed frame");
+        assert_eq!(decoded.event_id, "e7");
+        assert_eq!(decoded.event_name, "mail.addressed");
+        assert!(!decoded.terminated);
+        assert!(
+            decode_stream_frame(&frame, "other-sub").is_none(),
+            "a frame for another subscription is ignored"
+        );
+        assert!(
+            !format!("{decoded:?}").contains("SECRET"),
+            "the event body never crosses the decode seam"
+        );
+    }
+
+    #[test]
+    fn gap_and_terminated_frames_carry_the_fresh_cursor() {
+        let gap = serde_json::json!({
+            "method": "notifications/events/gap",
+            "params": {"_meta": {"io.modelcontextprotocol/subscriptionId": "s"}, "cursor": "42"}
+        })
+        .to_string();
+        let frame = decode_stream_frame(&gap, "s").expect("gap");
+        assert_eq!(frame.event_id, "gap:42");
+        assert_eq!(frame.cursor.as_deref(), Some("42"));
+        let term = serde_json::json!({
+            "method": "notifications/events/terminated",
+            "params": {"_meta": {"io.modelcontextprotocol/subscriptionId": "s"}, "cursor": "43"}
+        })
+        .to_string();
+        let frame = decode_stream_frame(&term, "s").expect("terminated");
+        assert!(frame.terminated);
+        assert_eq!(frame.cursor.as_deref(), Some("43"));
     }
 
     #[test]

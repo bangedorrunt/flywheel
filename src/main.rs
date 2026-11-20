@@ -60,6 +60,7 @@ mod durable_transition;
 mod effect_journal;
 mod elm;
 mod events_bridge;
+mod events_client;
 mod failure;
 mod fs_util;
 mod harness_api;
@@ -14273,9 +14274,48 @@ fn cmd_mcp_events(_cfg: &Config, subscription: &str) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let transport = events_bridge::NoopTransport;
+
+    // bd-si4b5 Phase B: the real SEP-3415 client is the transport behind the
+    // port. A missing token keeps the stdio seam usable (initialize/probe) but
+    // degrades to the no-op port with a loud stderr note — never a silent lie.
+    let url = std::env::var("FLYWHEEL_TORON_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:18080".to_string());
+    let token = std::env::var("FLYWHEEL_TORON_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    let state_path = config::state_dir().join(format!(
+        "events-bridge-{}.json",
+        subscription
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            })
+            .collect::<String>()
+    ));
+    let mut cursor = std::fs::read_to_string(&state_path).unwrap_or_default();
+    let transport: Box<dyn events_bridge::EventsTransport> = match token {
+        Some(token) => {
+            let mut client = events_client::ToronEventsClient::new(
+                events_client::UreqRpc::new(&url, &token),
+                subscription,
+                86_400, // TTL cap: 24h; refreshed before expiry by the caller.
+            );
+            match client.subscribe() {
+                Ok(_) => Box::new(client),
+                Err(e) => {
+                    eprintln!("flywheel mcp-events: subscribe failed: {e}");
+                    Box::new(events_bridge::NoopTransport)
+                }
+            }
+        }
+        None => {
+            eprintln!("flywheel mcp-events: FLYWHEEL_TORON_TOKEN unset; no events will arrive");
+            Box::new(events_bridge::NoopTransport)
+        }
+    };
     let mut deduper = events_bridge::Deduper::new(1024);
-    let mut cursor = String::new();
     for line in stdin.lock().lines() {
         let line = line?;
         let req: serde_json::Value = match serde_json::from_str(&line) {
@@ -14310,8 +14350,6 @@ fn cmd_mcp_events(_cfg: &Config, subscription: &str) -> Result<()> {
                 out.flush()?;
             }
             "events/poll" => {
-                // Phase A: the one core is exercised against the no-op port;
-                // Phase B (bd-o4bgx) swaps in the real toron transport.
                 let timing = events_bridge::BridgeTiming {
                     last_hb_ms: 0,
                     now_ms: 0,
@@ -14319,23 +14357,37 @@ fn cmd_mcp_events(_cfg: &Config, subscription: &str) -> Result<()> {
                     attempt: 0,
                     rand_unit: 0.0,
                 };
-                if let Ok(step) = events_bridge::bridge_step(
-                    &transport,
+                match events_bridge::bridge_step(
+                    &*transport,
                     subscription,
                     &mut deduper,
                     &mut cursor,
                     &timing,
                 ) {
-                    for notice in step.notifications {
-                        writeln!(out, "{}", notice)?;
+                    Ok(step) => {
+                        // Emit-first, journal-after: a crash between the two
+                        // replays from the old cursor and eventId dedupe absorbs
+                        // the duplicate (ADR-0039 D8).
+                        for notice in step.notifications {
+                            writeln!(out, "{}", notice)?;
+                        }
+                        out.flush()?;
+                        if step
+                            .cmds
+                            .iter()
+                            .any(|c| matches!(c, events_bridge::BridgeCmd::JournalCursor(_)))
+                            && let Err(e) = std::fs::write(&state_path, &cursor)
+                        {
+                            eprintln!("flywheel mcp-events: cursor journal failed: {e}");
+                        }
+                        if step.dead {
+                            eprintln!(
+                                "flywheel mcp-events: stream liveness stale; reconnect in {:?}ms",
+                                step.reconnect_ms
+                            );
+                        }
                     }
-                    if step.dead {
-                        eprintln!(
-                            "flywheel mcp-events: stream liveness stale; reconnect in {:?}ms",
-                            step.reconnect_ms
-                        );
-                    }
-                    out.flush()?;
+                    Err(e) => eprintln!("flywheel mcp-events: poll failed: {e}"),
                 }
                 let mut msg = serde_json::json!({ "jsonrpc": "2.0", "result": {} });
                 if let Some(rid) = id {
@@ -17835,6 +17887,12 @@ fn toron_setup_mcp(
                     let p = home.join(".grok/config.toml");
                     changed.push(upsert_grok_toron(&p, url, dry_run)?);
                 }
+                "claude" => {
+                    // bd-si4b5 Phase B: the Claude channel server is the stdio
+                    // events bridge, not the toron remote MCP endpoint.
+                    let p = home.join(".claude.json");
+                    changed.push(upsert_claude_channel(&p, dry_run)?);
+                }
                 other => {
                     eprintln!(
                         "flywheel: unknown agent kind '{other}' — use opencode,pi,grok (shorts oc,pi,gk)"
@@ -17869,6 +17927,45 @@ fn toron_setup_mcp(
         println!("(--dry-run) would boot toron serve --mcp-http 127.0.0.1:{boot_port}");
     }
     Ok(())
+}
+
+/// The claude/channel MCP server entry (bd-si4b5 Phase B). The bridge runs as
+/// `flywheel mcp-events --subscription <pin>` over stdio; it emits only the D2
+/// hint, never the event body. Kept pure so a unit test pins the wire shape.
+pub(crate) fn claude_channel_server(subscription: &str) -> serde_json::Value {
+    serde_json::json!({
+        "command": "flywheel",
+        "args": ["mcp-events", "--subscription", subscription],
+        "type": "stdio"
+    })
+}
+
+/// Claude Code reads MCP servers from `~/.claude.json` under `mcpServers`.
+/// Idempotent: an unchanged entry is a no-op; a neighbour's servers survive.
+fn upsert_claude_channel(path: &std::path::Path, dry: bool) -> Result<String> {
+    let mut v: serde_json::Value = load_json_or_default(path)?;
+    let obj = v
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("claude config root must be an object"))?;
+    if !obj.contains_key("mcpServers") || !obj["mcpServers"].is_object() {
+        obj.insert("mcpServers".into(), serde_json::json!({}));
+    }
+    let servers = obj["mcpServers"].as_object_mut().expect("ensured above");
+    let subscription =
+        std::env::var("FLYWHEEL_MCP_SUBSCRIPTION").unwrap_or_else(|_| "default".to_string());
+    let want = claude_channel_server(&subscription);
+    let name = "flywheel-events";
+    let action = match servers.get(name) {
+        Some(prev) if prev == &want => return Ok("claude channel unchanged".to_string()),
+        Some(_) => "updated",
+        None => "added",
+    };
+    servers.insert(name.into(), want);
+    if dry {
+        return Ok(format!("claude channel {action} ({})", pretty_path(path)));
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&v)? + "\n")?;
+    Ok(format!("claude channel {action} ({})", pretty_path(path)))
 }
 
 /// opencode: `mcp.toron` in top-level JSON config.
@@ -18093,6 +18190,25 @@ fn setup_flywheel_backend(url: &str, dry: bool) -> Result<String> {
 #[cfg(test)]
 mod setup_mcp_tests {
     use super::*;
+
+    /// bd-si4b5 Phase B: the Claude channel server is the stdio events bridge,
+    /// keyed by the pin subscription, and never carries an event body.
+    #[test]
+    fn claude_channel_server_is_the_stdio_bridge() {
+        let server = super::claude_channel_server("AmberProbe");
+        assert_eq!(server["command"], "flywheel");
+        assert_eq!(server["args"][0], "mcp-events");
+        assert_eq!(server["args"][2], "AmberProbe");
+        assert!(!server.to_string().contains("body"));
+    }
+
+    /// dry-run also covers the Claude channel server without writing.
+    #[test]
+    fn setup_mcp_dry_run_includes_claude() {
+        let _guard = crate::config::lock_env();
+        toron_setup_mcp(Some("http://127.0.0.1:18080/mcp"), "claude", 0, true, false)
+            .expect("dry run never fails");
+    }
 
     /// `flywheel setup-mcp --dry-run` wires nothing: all three agent upserts
     /// run in observation mode, no boot, no flywheel config write.
