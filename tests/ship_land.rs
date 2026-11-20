@@ -280,6 +280,33 @@ impl Fixture {
             .filter(|l| !l.trim().is_empty())
             .count()
     }
+
+    /// bd-kz3sc: make the repo's own commit fence refuse the tracker commit.
+    /// The private-index verb runs this hook, so the commit step fails while
+    /// the closed rows stay in the worktree — the exact stuck state.
+    fn break_tracker_commit(&self) {
+        let hooks = self.repo.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).expect("hooks dir");
+        let path = hooks.join("pre-commit");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\necho injected tracker commit failure >&2\nexit 1\n",
+        )
+        .expect("write hook");
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut perms = std::fs::metadata(&path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod hook");
+    }
+
+    fn restore_tracker_commit(&self) {
+        let _ = std::fs::remove_file(self.repo.join(".git/hooks/pre-commit"));
+    }
+
+    fn closed_row_in_head(&self) -> bool {
+        let out = sh(&self.repo, "git", &["show", "HEAD:.beads/issues.jsonl"]);
+        String::from_utf8_lossy(&out.stdout).contains("\"status\": \"closed\"")
+    }
 }
 
 #[test]
@@ -470,6 +497,78 @@ fn a_receipt_is_checked_at_the_sha_it_proved_not_the_worktree() {
         "a receipt citing an id present at its proved sha must still land:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// bd-kz3sc: a tracker commit that fails must leave the step pending; a resume
+/// derives done-state from HEAD and retries it. The old code trusted the
+/// staging result ("nothing left to stage" == "already committed"), so a
+/// resume after a failed commit skipped the step forever and ship check failed.
+#[test]
+fn a_failed_tracker_commit_leaves_the_step_pending_and_a_resume_retries_it() {
+    let f = fixture();
+    f.break_tracker_commit();
+
+    let first = f.land(&[]);
+    assert!(
+        !first.status.success(),
+        "an injected tracker-commit failure stops land"
+    );
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(
+        stderr.contains("resume: flywheel ship land bd-x"),
+        "the failed commit still prints the resume line: {stderr}"
+    );
+    assert!(
+        !f.closed_row_in_head(),
+        "the failed commit left no closed row in HEAD"
+    );
+    // The closed row IS in the worktree (br close wrote it): the exact state
+    // where trusting "nothing left to stage" says "already committed".
+    let work = std::fs::read_to_string(f.repo.join(".beads/issues.jsonl")).unwrap_or_default();
+    assert!(
+        work.contains("\"status\": \"closed\""),
+        "the closed row is in the worktree but not HEAD"
+    );
+
+    let before = f.head_count();
+    f.restore_tracker_commit();
+    let second = f.land(&[]);
+    assert!(
+        second.status.success(),
+        "resume must retry the tracker commit and land: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(
+        f.closed_row_in_head(),
+        "the resume committed the closed row to HEAD"
+    );
+    assert_eq!(
+        f.head_count(),
+        before + 1,
+        "exactly one tracker commit landed on resume"
+    );
+}
+
+/// bd-kz3sc: with this bead's rows already in HEAD, the commit step is skipped
+/// (no second commit) even when nothing is staged in the worktree.
+#[test]
+fn tracker_commit_is_skipped_when_the_row_is_already_in_head() {
+    let f = fixture();
+    let first = f.land(&[]);
+    assert!(
+        first.status.success(),
+        "first land: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(f.closed_row_in_head(), "row is in HEAD after first land");
+    let before = f.head_count();
+    let again = f.land(&[]);
+    assert!(
+        again.status.success(),
+        "rerun: {}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    assert_eq!(f.head_count(), before, "no second tracker commit");
 }
 
 /// The other half: a receipt citing an id absent even at the proved sha is

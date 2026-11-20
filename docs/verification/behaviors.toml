@@ -1274,15 +1274,16 @@ mutations = [
 ]
 
 [[behavior]]
-id = "ship.head-lock-race-is-retried"
+id = "ship.tracker-commit-state-from-head"
 owner = "src/cmd/ship.rs"
 status = "proven"
 concurrent = false
 tests = [
-  "src/cmd/ship.rs::the_head_lock_race_is_recognised",
+  "tests/ship_land.rs::a_failed_tracker_commit_leaves_the_step_pending_and_a_resume_retries_it",
+  "tests/ship_land.rs::tracker_commit_is_skipped_when_the_row_is_already_in_head",
 ]
 mutations = [
-  "scripts/mutations/ship-land-legal-gate.spec.sh#R1",
+  "scripts/mutations/ship-land-commit-state.spec.sh#L1",
 ]
 
 [[behavior]]

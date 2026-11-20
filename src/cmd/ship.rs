@@ -449,113 +449,6 @@ fn pick_gate(legal: &[String]) -> Option<String> {
     legal.first().cloned()
 }
 
-/// Is this failure the HEAD-lock race (another lane committed mid-land)?
-///
-/// bd-pgfqg: `cannot lock ref HEAD: is at A but expected B` is transient and
-/// the verb must retry itself instead of making the operator rerun.
-fn is_head_lock_race(stderr: &str) -> bool {
-    stderr.contains("cannot lock ref")
-        || (stderr.contains("is at") && stderr.contains("but expected"))
-}
-
-/// Commit this bead's staged tracker rows, retrying the HEAD-lock race.
-///
-/// bd-pgfqg: another lane committing between the gate and this commit makes git
-/// refuse with `cannot lock ref HEAD: is at A but expected B`. That is a race,
-/// not a conflict: the same command succeeds a moment later, so the verb retries
-/// instead of handing the operator a resume line.
-fn commit_with_retry(dir: &Path, message: &str) -> Result<()> {
-    const ATTEMPTS: u8 = 4;
-    let mut last = String::new();
-    for attempt in 0..ATTEMPTS {
-        let out = Command::new("git")
-            .current_dir(dir)
-            .args(["commit", "-qm", message])
-            .output()
-            .map_err(|err| anyhow!("git not found: {err}"))?;
-        if out.status.success() {
-            return Ok(());
-        }
-        last = String::from_utf8_lossy(&out.stderr).to_string();
-        if !is_head_lock_race(&last) {
-            bail!("git commit failed: {}", last.trim());
-        }
-        eprintln!(
-            "ship land: HEAD moved under the tracker commit (attempt {}), retrying",
-            u16::from(attempt) + 1
-        );
-    }
-    bail!("git commit kept losing the HEAD-lock race: {}", last.trim())
-}
-
-/// Stage ONLY the hunks that mention this bead, so another lane's uncommitted
-/// tracker row is never captured (bd-ps6wc). Returns whether anything staged.
-fn stage_bead_hunks(dir: &Path, file: &str, key: &str, bead: &str) -> Result<bool> {
-    // -U3 keeps context so `git apply --cached` can locate the hunk even when
-    // a peer's row shifted the line numbers (bd-ps6wc).
-    let diff = git(dir, &["diff", "-U3", "--", file]).unwrap_or_default();
-    if diff.trim().is_empty() {
-        return Ok(false);
-    }
-    let needle = format!("\"{key}\":\"{bead}\"");
-    let mut header: Vec<&str> = Vec::new();
-    let mut hunks: Vec<Vec<&str>> = Vec::new();
-    let mut current: Option<Vec<&str>> = None;
-    for line in diff.lines() {
-        if line.starts_with("@@") {
-            if let Some(h) = current.take() {
-                hunks.push(h);
-            }
-            current = Some(vec![line]);
-            continue;
-        }
-        match current.as_mut() {
-            Some(h) => h.push(line),
-            None => header.push(line),
-        }
-    }
-    if let Some(h) = current.take() {
-        hunks.push(h);
-    }
-    let keep: Vec<String> = hunks
-        .into_iter()
-        .filter(|h| {
-            h.iter()
-                .filter(|line| line.starts_with('+') || line.starts_with('-'))
-                .any(|line| line.contains(&needle))
-        })
-        .map(|h| h.join("\n"))
-        .collect();
-    if keep.is_empty() {
-        return Ok(false);
-    }
-    let mut patch = header.join("\n");
-    patch.push('\n');
-    patch.push_str(&keep.join("\n"));
-    patch.push('\n');
-
-    let mut child = Command::new("git")
-        .current_dir(dir)
-        .args(["apply", "--cached", "-"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|err| anyhow!("git apply: {err}"))?;
-    use std::io::Write as _;
-    child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| anyhow!("git apply stdin"))?
-        .write_all(patch.as_bytes())
-        .map_err(|err| anyhow!("git apply write: {err}"))?;
-    let status = child
-        .wait()
-        .map_err(|err| anyhow!("git apply wait: {err}"))?;
-    if !status.success() {
-        bail!("git apply --cached failed for {file}");
-    }
-    Ok(true)
-}
-
 pub(crate) struct LandArgs<'a> {
     pub cfg: &'a Config,
     pub bead: &'a str,
@@ -1012,17 +905,26 @@ pub(crate) fn ship_land(args: LandArgs<'_>) -> Result<()> {
         Ok(())
     })?;
 
-    // 5. commit only this bead's tracker rows.
-    let staged_issues = land_step(&plan, "stage-issues", || {
-        stage_bead_hunks(&dir, ".beads/issues.jsonl", "id", &plan.bead)
-    })?;
-    let staged_gates = land_step(&plan, "stage-gates", || {
-        stage_bead_hunks(&dir, ".beads/gates.jsonl", "issue_id", &plan.bead)
-    })?;
-    if staged_issues || staged_gates {
-        land_step(&plan, "commit", || commit_with_retry(&dir, &plan.message))?;
-    } else {
+    // 5. commit only this bead's tracker rows. bd-kz3sc: the step's done-state
+    // comes from HEAD, never from whether staging found a hunk. A failed commit
+    // leaves the rows in the worktree but not HEAD; a resume that trusted the
+    // staging result skipped forever and ship check failed on every rerun.
+    // The private-index verb commits only these paths from the worktree, so a
+    // neighbour's staged files can never be swept into this commit.
+    if bead_rows_committed(&dir, &plan.bead)? {
         eprintln!("ship land: tracker rows already committed");
+    } else {
+        land_step(&plan, "tracker-commit", || {
+            crate::cmd::commit::commit_paths(
+                &dir,
+                &[
+                    ".beads/issues.jsonl".to_string(),
+                    ".beads/gates.jsonl".to_string(),
+                ],
+                &plan.message,
+            )
+            .map(|_| ())
+        })?;
     }
 
     // 6. the gate, last.
@@ -1058,8 +960,8 @@ pub(crate) fn ship_land(args: LandArgs<'_>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        gate_for, head_has_closed_bead, head_names_bead, is_head_lock_race, land_project,
-        parse_legal_gates, pick_gate, receipt_is_landable, status_of,
+        gate_for, head_has_closed_bead, head_names_bead, land_project, parse_legal_gates,
+        pick_gate, receipt_is_landable, status_of,
     };
     use crate::config::Config;
     use std::process::Command;
@@ -1135,19 +1037,6 @@ live-verified. Record one BEFORE closing."#;
         let closed = r#"{"id":"bd-x","status":"closed"}"#;
         assert_eq!(status_of(closed).as_deref(), Some("closed"));
         assert_eq!(status_of("not json"), None);
-    }
-
-    /// bd-pgfqg: the HEAD-lock race is classified as retryable, a real
-    /// conflict is not.
-    #[test]
-    fn the_head_lock_race_is_recognised() {
-        assert!(is_head_lock_race(
-            "error: cannot lock ref 'HEAD': is at abc123 but expected def456"
-        ));
-        assert!(
-            !is_head_lock_race("error: conflicting changes, please commit or stash"),
-            "an unrelated failure must not be retried"
-        );
     }
 
     /// bd-ni0ek: the release project comes from the ONE resolver, never the
