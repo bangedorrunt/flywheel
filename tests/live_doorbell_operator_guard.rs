@@ -115,9 +115,29 @@ fn resolve_block_id(blocks_json: &str, block: &str) -> Result<String, String> {
 fn assert_send_target(send_stdout: &str, expected_block_id: &str) -> Result<(), String> {
     let doc: serde_json::Value = serde_json::from_str(send_stdout.trim())
         .map_err(|e| format!("send result is not json: {e}"))?;
-    let pane = doc
-        .get("pane_id")
-        .and_then(serde_json::Value::as_str)
+    // `flywheel send` prints `{"via":"inbox","sent":[rows]}` (comms_send::
+    // rows_json); older forms are a bare row or an array. Find the dispatched
+    // row's pane_id in any of them.
+    let rows: Vec<&serde_json::Value> =
+        if let Some(sent) = doc.get("sent").and_then(serde_json::Value::as_array) {
+            sent.iter().collect()
+        } else if let Some(arr) = doc.as_array() {
+            arr.iter().collect()
+        } else {
+            vec![&doc]
+        };
+    let pane = rows
+        .iter()
+        .filter(|r| {
+            r.get("dispatched")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
+        .find_map(|r| r.get("pane_id").and_then(serde_json::Value::as_str))
+        .or_else(|| {
+            rows.iter()
+                .find_map(|r| r.get("pane_id").and_then(serde_json::Value::as_str))
+        })
         .ok_or_else(|| "send result has no pane_id".to_string())?;
     if pane != expected_block_id {
         return Err(format!(
@@ -301,6 +321,9 @@ mod send_door_tests {
     fn a_send_to_the_wrong_pane_fails_loudly() {
         let good = r#"{"target":"AmberProbe","pane_id":"block:a","dispatched":true}"#;
         assert!(assert_send_target(good, "block:a").is_ok());
+        // The real comms shape is {"via":"inbox","sent":[rows]}.
+        let wrapped = r#"{"via":"inbox","sent":[{"target":"AmberProbe","pane_id":"block:b","dispatched":false},{"target":"AmberProbe","pane_id":"block:a","dispatched":true}]}"#;
+        assert!(assert_send_target(wrapped, "block:a").is_ok());
         let wrong = r#"{"target":"AmberProbe","pane_id":"block:b","dispatched":true}"#;
         let err = assert_send_target(wrong, "block:a").unwrap_err();
         assert!(err.contains("block:b") && err.contains("block:a"), "{err}");
