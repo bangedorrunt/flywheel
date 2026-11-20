@@ -81,8 +81,31 @@ fn adr0010_d13_template_standing_orders_are_defense_in_depth() {
 
 #[test]
 fn adr0010_d13_no_tracked_claude_only_deny_list() {
+    // bd-b2kaa legitimately ships Claude-compatible HOOK config at
+    // ~/.claude/settings.json. D13 was written for a different thing: no
+    // Claude *permission deny list* may ship from flywheel. Guard that SHAPE —
+    // a `permissions` object carrying `deny`/`deny_list` — whatever path it is
+    // written to, rather than banning a path.
+    fn deny_shape(src: &str) -> bool {
+        let mut rest = src;
+        while let Some(i) = rest.find("\"permissions\"") {
+            let window = &rest[i..(i + 240).min(rest.len())];
+            if window.contains("\"deny\":") || window.contains("\"deny_list\":") {
+                return true;
+            }
+            rest = &rest[i + 13..];
+        }
+        false
+    }
     assert!(
-        !MAIN.contains(".claude/settings"),
-        "no Claude settings deny list may ship from this bead"
+        !deny_shape(&MAIN),
+        "no Claude permissions deny list may ship from this bead"
+    );
+    // Seeded case: the same predicate must reject a real deny list, so the
+    // narrowed guard is not vacuous.
+    let seeded = r#"{"permissions":{"deny":["Bash(*)"]}}"#;
+    assert!(
+        deny_shape(seeded),
+        "the guard must fail on a real deny list"
     );
 }

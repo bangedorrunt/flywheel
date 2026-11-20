@@ -2115,19 +2115,25 @@ projects available: {}",
                 }
             }
             // bd-b2kaa: codex/grok/gemini get their hooks under the SEAT's own
-            // config dir (never the operator's). The same dir is exported as
-            // XDG_CONFIG_HOME so the harness reads the installed hooks.
+            // config dir (never the operator's). Grok discovers hooks at
+            // ~/.claude/settings.json relative to HOME, so its seat HOME is
+            // the per-seat dir; the others use XDG_CONFIG_HOME.
             if let Some(pin) = mail_identity.as_deref()
                 && crate::harness_registry::canonical(&kind) != "opencode"
                 && crate::harness_registry::canonical(&kind) != "pi"
             {
                 let state_dir = crate::config::state_dir();
                 crate::turn_hooks::install(&state_dir, project, pin, &kind)?;
-                let seat_cfg = crate::turn_hooks::seat_config_dir(&state_dir, project, pin);
-                pane_env.insert(
-                    "XDG_CONFIG_HOME".to_string(),
-                    utf8_path(&seat_cfg, "seat config dir")?,
-                );
+                if crate::harness_registry::canonical(&kind) == "grok" {
+                    let seat_home = crate::turn_hooks::seat_home_dir(&state_dir, project, pin);
+                    pane_env.insert("HOME".to_string(), utf8_path(&seat_home, "seat home dir")?);
+                } else {
+                    let seat_cfg = crate::turn_hooks::seat_config_dir(&state_dir, project, pin);
+                    pane_env.insert(
+                        "XDG_CONFIG_HOME".to_string(),
+                        utf8_path(&seat_cfg, "seat config dir")?,
+                    );
+                }
             }
             let pane_id = if first {
                 first = false;
