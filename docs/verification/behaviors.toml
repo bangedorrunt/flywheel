@@ -1302,6 +1302,20 @@ mutations = [
 ]
 
 [[behavior]]
+id = "captain.pull-cursor-consumed"
+owner = "src/cmd/captain.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/captain.rs::a_pulled_message_never_rings_or_pages",
+  "src/cmd/captain.rs::both_captain_decisions_use_the_pull_cursor",
+]
+mutations = [
+  "scripts/mutations/captain-pull-cursor.spec.sh#C1",
+  "scripts/mutations/captain-pull-cursor.spec.sh#C2",
+]
+
+[[behavior]]
 id = "live.doorbell-block-ids"
 owner = "tests/live_doorbell_operator_guard.rs"
 status = "proven"

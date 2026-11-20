@@ -321,7 +321,12 @@ fn idle_sample(
                 key,
                 &pin,
                 &MailInboxFilter {
-                    unread_only: true,
+                    // bd-yc6jf: the idle alarm's "consumed" is the pull cursor
+                    // toron next advances (since_ts = "last"), not the read
+                    // flag, which pulling never sets. A brief already acted on
+                    // is no longer counted as unread.
+                    since_ts: Some("last".to_string()),
+                    unread_only: false,
                     include_bodies: false,
                     limit: 50,
                     ..Default::default()
@@ -537,7 +542,11 @@ fn cmd_captain_watch(
     loop {
         std::thread::sleep(std::time::Duration::from_secs(interval));
 
-        let rows = inbox_rows(&mail, &key, baseline_rfc.as_deref())?;
+        // bd-yc6jf: one notion of consumed — the pull cursor toron next
+        // advances, read here as since_ts = "last". A message the captain has
+        // already pulled is not returned, so it cannot ring an empty wake;
+        // the arm-time baseline still keeps pre-arm backlog quiet.
+        let rows = inbox_rows(&mail, &key, Some("last"))?;
         if let Some(row) = newest_since(&rows, baseline_us) {
             if json_out {
                 print_json(&json!({
@@ -1527,6 +1536,52 @@ mod tests {
             Some("b")
         );
         assert!(matches!(skewed[1].status, Status::Fail(_)));
+    }
+
+    /// bd-yc6jf: over ONE message log, once the pull cursor has passed a
+    /// message it is consumed — neither the ring (`newest_since`) nor the idle
+    /// alarm (`pin_unread`) sees it again, so no empty wake pages the captain.
+    #[test]
+    fn a_pulled_message_never_rings_or_pages() {
+        let log: Vec<serde_json::Value> = [1i64, 2, 3]
+            .into_iter()
+            .map(|us| {
+                serde_json::json!({
+                    "created_ts_us": us,
+                    "sender": "captain",
+                    "subject": format!("brief {us}")
+                })
+            })
+            .collect();
+        // Nothing pulled (baseline 0): the newest row rings.
+        let ring = newest_since(&log, 0).expect("fresh mail rings");
+        assert_eq!(ring["subject"], "brief 3");
+        // Pull cursor past the whole log: consumed, so no ring at all.
+        assert!(
+            newest_since(&log, 3).is_none(),
+            "a pulled message must never re-ring"
+        );
+        // The same cursor drains the idle alarm's subject list.
+        let crew = std::collections::BTreeSet::new();
+        let unpulled: Vec<_> = log
+            .iter()
+            .filter(|r| r["created_ts_us"].as_i64().is_some_and(|us| us > 3))
+            .cloned()
+            .collect();
+        assert!(pin_unread(&unpulled, "CyanCove", &crew, false).is_empty());
+        assert_eq!(pin_unread(&log, "CyanCove", &crew, false).len(), 3);
+    }
+
+    /// bd-yc6jf: both captain decisions read the pull cursor (toron's
+    /// since_ts = "last"), the one notion of consumed, not the read flag.
+    #[test]
+    fn both_captain_decisions_use_the_pull_cursor() {
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/cmd/captain.rs"));
+        let last_reads = src.matches("\"last\"").count();
+        assert!(
+            last_reads >= 2,
+            "the ring read and the idle read must both use since_ts = \"last\" (got {last_reads})"
+        );
     }
 
     /// bd-iscat: a crew that goes working -> idle holding an unread captain
