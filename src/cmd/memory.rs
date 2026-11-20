@@ -287,13 +287,7 @@ pub fn check_trap_queries_strict(
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut rows = Vec::new();
     for line in out {
-        let key: String = line
-            .trim()
-            .trim_start_matches("Rule: ")
-            .trim()
-            .chars()
-            .take(80)
-            .collect();
+        let key = lesson_core(&line);
         if seen.insert(key) {
             rows.push(line);
         }
@@ -313,6 +307,42 @@ fn merge_lines(out: &mut BTreeSet<String>, raw: Option<String>) {
 
 fn normalize_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Strip the framing chie wraps around a stored lesson. Both the old and the
+/// new chiebukuro renderings add `Rule:` repeatedly; a bare lesson is what we
+/// want to send and to compare (bd-7szny).
+fn strip_lesson_framing(s: &str) -> &str {
+    let mut core = s.trim();
+    loop {
+        let before = core;
+        for prefix in ["Rule:", "Trap:", "Proof:"] {
+            if let Some(rest) = core.strip_prefix(prefix) {
+                core = rest.trim_start();
+                break;
+            }
+        }
+        if core.len() == before.len() {
+            return core;
+        }
+    }
+}
+
+/// The stable identity of a lesson across chie renderings: framing removed,
+/// text after the backticked trap matcher dropped, whitespace normalized.
+fn lesson_core(s: &str) -> String {
+    let bare = strip_lesson_framing(s);
+    let before_trap = bare.split('`').next().unwrap_or(bare);
+    let mut core = before_trap.trim();
+    for suffix in ["Trap:", "Proof:", "Rule:"] {
+        if let Some(rest) = core.strip_suffix(suffix) {
+            core = rest.trim_end();
+        }
+    }
+    core.trim_end_matches(['.', ';', ',', ':'])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn chie_bin() -> String {
@@ -422,11 +452,7 @@ fn lesson_recall(query: &str, project_dir: Option<&Path>) -> Result<Vec<String>>
                 {
                     // Re-recorded lessons leave duplicate events; the preflight
                     // view must show each lesson once (bd-ndbnv review point 4).
-                    let canon = content
-                        .trim()
-                        .trim_start_matches("Rule: ")
-                        .trim()
-                        .to_string();
+                    let canon = lesson_core(content);
                     if seen.insert(canon) {
                         rows.push(content.to_string());
                     }
@@ -541,9 +567,10 @@ pub fn record_lesson(content: &str, kind: Option<&str>, project_dir: Option<&Pat
 /// event (the old default) is invisible to check-trap, so wrap the lesson in
 /// that shape and give it a matcher the guard can infer (bd-97uwg).
 fn rule_lesson_event(content: &str) -> String {
-    let matcher = trap_matcher(content);
+    let bare = strip_lesson_framing(content);
+    let matcher = trap_matcher(bare);
     format!(
-        "Rule: {content}\nTrap: `{matcher}` — {content}\nProof: recorded by flywheel memory record-lesson"
+        "Rule: {bare}\nTrap: `{matcher}` — {bare}\nProof: recorded by flywheel memory record-lesson"
     )
 }
 
@@ -684,6 +711,27 @@ mod tests {
             None => unsafe { std::env::remove_var("FLYWHEEL_CHIE_BIN") },
         }
         out
+    }
+
+    #[test]
+    fn lesson_core_dedups_old_and_new_chie_shapes() {
+        let old = "Rule: Rule: Rule: a zebra marker breaks when a dedup probe runs; do keep one lesson Trap: `a dedup probe runs` — Rule: Rule: a zebra marker breaks when a dedup probe runs; do keep one lesson Proof: recorded by flywheel memory record-lesson";
+        let new = "Rule: Rule: a zebra marker breaks when a dedup probe runs; do keep one lesson: `a dedup probe runs` — Rule: Rule: a zebra marker breaks when a dedup probe runs; (proof: recorded by flywheel memory record-lesson)";
+        assert_eq!(lesson_core(old), lesson_core(new));
+        assert_eq!(
+            lesson_core(old),
+            "a zebra marker breaks when a dedup probe runs; do keep one lesson"
+        );
+    }
+
+    #[test]
+    fn rule_lesson_event_sends_a_bare_lesson() {
+        let event = rule_lesson_event("Rule: Rule: remember this; do that");
+        assert!(
+            event.starts_with("Rule: remember this; do that\n"),
+            "{event}"
+        );
+        assert!(!event.contains("Rule: Rule:"), "{event}");
     }
 
     #[test]

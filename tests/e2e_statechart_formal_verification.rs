@@ -20,6 +20,7 @@ struct HermeticEnv {
     data_home: PathBuf,
     runtime_dir: PathBuf,
     toron_data_dir: PathBuf,
+    chie: PathBuf,
 }
 
 impl HermeticEnv {
@@ -32,6 +33,21 @@ impl HermeticEnv {
         let data_home = dir.join("data");
         let runtime_dir = dir.join("runtime");
         let toron_data_dir = dir.join("toron");
+        // bd-7szny: never shell the real chie. This test only needs "no traps",
+        // so a chie that emits empty JSON for every command is sufficient.
+        let chie = dir.join("fake-chie");
+        std::fs::write(
+            &chie,
+            "#!/bin/sh\nprintf '{\"conclusions\":[],\"events\":[]}\\n'\nexit 0\n",
+        )
+        .expect("write fake chie");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut perms = std::fs::metadata(&chie).expect("meta").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&chie, perms).expect("chmod");
+        }
 
         std::fs::create_dir_all(&home).expect("mkdir home");
         std::fs::create_dir_all(&config_home).expect("mkdir config");
@@ -48,6 +64,7 @@ impl HermeticEnv {
             data_home,
             runtime_dir,
             toron_data_dir,
+            chie,
         }
     }
 
@@ -62,6 +79,7 @@ impl HermeticEnv {
             .env("XDG_DATA_HOME", &self.data_home)
             .env("XDG_RUNTIME_DIR", &self.runtime_dir)
             .env("TORON_DATA_DIR", &self.toron_data_dir)
+            .env("FLYWHEEL_CHIE_BIN", &self.chie)
             .output()
             .expect("spawn flywheel command")
     }

@@ -22,6 +22,36 @@ fn text(out: &Output) -> String {
     )
 }
 
+/// A fake chie: `record` succeeds, `recall` replays the two real trap shapes
+/// (old and new chiebukuro renderings) from a fixture, everything else is
+/// empty. The real installed chie is never spawned (bd-7szny).
+fn fake_chie_with_traps(sandbox: &TestSandbox) -> std::path::PathBuf {
+    let fake = sandbox.bin_dir().join("fake-chie-traps");
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/chie/old-new-traps.json"
+    );
+    let script = format!(
+        "#!/bin/sh\ncase \"$2\" in\n  record) printf '{{\"recorded\":true}}\\n' ;;\n  recall) cat '{fixture}' ;;\n  *) printf '[]\\n' ;;\nesac\nexit 0\n"
+    );
+    std::fs::write(&fake, script).expect("write fake chie");
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut perms = std::fs::metadata(&fake).expect("meta").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake, perms).expect("chmod");
+    fake
+}
+
+fn run_with_chie(sandbox: &TestSandbox, fake: &std::path::Path, args: &[&str]) -> Output {
+    sandbox
+        .command(env!("CARGO_BIN_EXE_flywheel"))
+        .env("PATH", sandbox.path_env())
+        .env("FLYWHEEL_CHIE_BIN", fake)
+        .args(args)
+        .output()
+        .expect("spawn flywheel")
+}
+
 /// A plain `record-lesson` (no --kind) writes a Rule/Trap/Proof lesson chie's
 /// guard can match, and the same slug reads it back.
 #[test]
@@ -204,16 +234,18 @@ fn migrated_lessons_are_check_trap_findable_by_natural_query() {
 #[test]
 fn recalled_lessons_are_deduplicated() {
     let sandbox = TestSandbox::new();
+    let fake = fake_chie_with_traps(&sandbox);
     let lesson = "a zebra marker breaks when a dedup probe runs; do keep one lesson";
-    // The live duplicates have different "Rule:" wrapper depths, not identical
-    // text, so the outer BTreeSet in check_trap_queries cannot dedupe them.
+    // The two real renderings from the fixture differ only in "Rule:" depth and
+    // trap framing; they are one lesson and must surface once (bd-7szny).
     for content in [
         lesson,
         "Rule: a zebra marker breaks when a dedup probe runs; do keep one lesson",
         "Rule: Rule: a zebra marker breaks when a dedup probe runs; do keep one lesson",
     ] {
-        let recorded = run(
+        let recorded = run_with_chie(
             &sandbox,
+            &fake,
             &[
                 "memory",
                 "record-lesson",
@@ -229,8 +261,9 @@ fn recalled_lessons_are_deduplicated() {
             text(&recorded)
         );
     }
-    let found = run(
+    let found = run_with_chie(
         &sandbox,
+        &fake,
         &[
             "memory",
             "check-trap",
@@ -245,6 +278,30 @@ fn recalled_lessons_are_deduplicated() {
         "preflight must show one copy: {}",
         text(&found)
     );
+}
+
+/// A test that shells the real chie is ambient-state dependent: proof67 broke
+/// when chiebukuro changed its trap rendering (bd-7szny). Every test file that
+/// actually invokes a memory command must pin FLYWHEEL_CHIE_BIN.
+#[test]
+fn no_test_shells_the_real_chie() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let mut bad = Vec::new();
+    for entry in std::fs::read_dir(format!("{root}/tests")).expect("tests dir") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).expect("read test");
+        let spawns = src.contains("CARGO_BIN_EXE_flywheel") || src.contains("flywheel_bin()");
+        let invokes = spawns
+            && src.contains("\"memory\"")
+            && (src.contains("\"record-lesson\"") || src.contains("\"check-trap\""));
+        if invokes && !src.contains("FLYWHEEL_CHIE_BIN") {
+            bad.push(path.file_name().unwrap().to_string_lossy().to_string());
+        }
+    }
+    assert!(bad.is_empty(), "tests invoking real chie: {bad:?}");
 }
 
 /// A chie that exits 0 with non-JSON recall output must make check-trap fail,
