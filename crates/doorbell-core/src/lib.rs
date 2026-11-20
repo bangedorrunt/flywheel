@@ -902,6 +902,15 @@ pub fn queue_line(
 pub enum DoorbellMsg {
     /// Plane-S watch NDJSON line (`{kind,id,tags,content}`).
     WatchNdjson { line: String },
+    /// A mail.addressed hint from the toron events source, carrying the bus
+    /// event id used as the shared dedupe key across wake.sock/events (U8).
+    EventsHint {
+        event_id: String,
+        pin: String,
+        line: String,
+    },
+    /// The events source lost track: one digest wake, not a prompt storm.
+    EventsGap { pin: String },
     /// Plane-P inbox rows for one pin (raw `fetch_inbox` JSON).
     InboxItems { raw: String, pin: String },
     /// Plane-P sweep path: rows already parsed (no serde round-trip).
@@ -1205,6 +1214,32 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                     line_out.clone(),
                 );
             }
+        }
+        // bd-l5vb2: a harness with no inbound door is reached through the
+        // toron events source. The bus event id is the SAME dedupe key the
+        // wake.sock arm already journals in `rung`, so a seat reached by
+        // both rings gets exactly one prompt.
+        DoorbellMsg::EventsHint {
+            event_id,
+            pin,
+            line,
+        } => {
+            route_or_queue(
+                &mut next,
+                &mut actions,
+                pin,
+                event_id.clone(),
+                None,
+                line.clone(),
+            );
+        }
+        DoorbellMsg::EventsGap { pin } => {
+            // A gap is ONE digest wake, never a prompt storm (U8).
+            actions.push(DoorbellAction::Digest {
+                pin: pin.clone(),
+                line: doorbell_line(EventClass::PlanePMail, "events may have been missed"),
+                why: "events-gap".into(),
+            });
         }
         DoorbellMsg::InboxItems { raw, pin } => {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
@@ -2953,5 +2988,52 @@ mod tests {
         .expect("a notice is journaled as silent, not dropped");
         assert_eq!(class, super::EventClass::PlanePMail);
         assert_eq!(hint, super::SYSTEM_NOTICE_HINT);
+    }
+
+    // ---- bd-l5vb2: one ring per mail across wake.sock + events ----
+
+    fn events_model() -> super::DoorbellModel {
+        let mut model = super::DoorbellModel::default();
+        model.index.insert_pin("AmberProbe".into(), None);
+        model.statuses.insert("AmberProbe".into(), "idle".into());
+        model
+    }
+
+    #[test]
+    fn the_same_bus_event_id_rings_once_across_both_sources() {
+        let mut model = events_model();
+        // wake.sock already rang this bus event; its id is journaled in `rung`.
+        model.rung.insert("bus-e1".into());
+        let line = super::doorbell_line(super::EventClass::PlanePMail, "toron next");
+        let (_, actions) = super::tick(
+            &model,
+            &super::DoorbellMsg::EventsHint {
+                event_id: "bus-e1".into(),
+                pin: "AmberProbe".into(),
+                line,
+            },
+        );
+        assert!(
+            actions
+                .iter()
+                .all(|a| !matches!(a, super::DoorbellAction::Prompt { .. })),
+            "a seat reached by both rings must not ring twice: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn an_events_gap_is_one_digest_not_a_prompt() {
+        let model = events_model();
+        let (_, actions) = super::tick(
+            &model,
+            &super::DoorbellMsg::EventsGap {
+                pin: "AmberProbe".into(),
+            },
+        );
+        assert_eq!(actions.len(), 1, "exactly one digest: {actions:?}");
+        assert!(
+            matches!(actions[0], super::DoorbellAction::Digest { .. }),
+            "{actions:?}"
+        );
     }
 }

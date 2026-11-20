@@ -153,6 +153,16 @@ pub fn replay_msg(v: &serde_json::Value) -> Option<crate::workspace::Msg> {
     }
     if let Ok(dm) = serde_json::from_value::<crate::doorbell_tick::DoorbellMsg>(v.clone()) {
         return Some(match dm {
+            crate::doorbell_tick::DoorbellMsg::EventsHint {
+                event_id,
+                pin,
+                line,
+            } => Msg::EventsHint {
+                event_id,
+                pin,
+                line,
+            },
+            crate::doorbell_tick::DoorbellMsg::EventsGap { pin } => Msg::EventsGap { pin },
             crate::doorbell_tick::DoorbellMsg::WatchNdjson { line } => Msg::WatchNdjson { line },
             crate::doorbell_tick::DoorbellMsg::InboxItems { raw, pin } => {
                 Msg::InboxItems { raw, pin }

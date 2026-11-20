@@ -251,6 +251,10 @@ pub struct DoorbellSection {
     /// opt-in so migration parity holds with the flag off.
     #[serde(default)]
     pub arrival_triple: bool,
+    /// toron events as a wake source for harnesses with no inbound door
+    /// (ADR-0039 D8, bd-l5vb2). Default false — flag-off is byte-identical.
+    #[serde(default)]
+    pub toron_events: bool,
     /// beads-poller sensor (bd-asr2.15, D7; ready-bead lane
     /// bd-ux-papercuts-t2u5): read-only WAL poll of the br sqlite (holds,
     /// issue changes, ready-bead appearances) emitting Fact Msgs. Default
