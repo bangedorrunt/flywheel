@@ -54,7 +54,7 @@ impl UreqRpc {
         token: &str,
         body: &str,
         last_event_id: Option<&str>,
-    ) -> Result<ureq::Response, ureq::Error> {
+    ) -> Result<ureq::Response, Box<ureq::Error>> {
         let mut req = self
             .agent
             .post(&self.endpoint)
@@ -65,13 +65,13 @@ impl UreqRpc {
         if let Some(id) = last_event_id {
             req = req.set("Last-Event-ID", id);
         }
-        req.send_string(body)
+        req.send_string(body).map_err(Box::new)
     }
 
     fn post(&self, body: &str, last_event_id: Option<&str>) -> Result<ureq::Response, String> {
         let token = crate::events_tokens::read_token_file(std::path::Path::new(&self.token_path))?;
         match self.post_once(&token, body, last_event_id) {
-            Err(ureq::Error::Status(401, _)) => {
+            Err(e) if matches!(*e, ureq::Error::Status(401, _)) => {
                 // The token may have been rotated between requests. Re-read the
                 // file; if it changed, retry once with the fresh value.
                 let fresh =
