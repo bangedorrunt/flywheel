@@ -1019,10 +1019,7 @@ fn resolve_receipt(
 /// bd-r7852: persist the typed receipt's RED witnesses so `ship land` can
 /// count them on a no-mutation proof receipt. A malformed store is replaced by
 /// a fresh one rather than trusted.
-fn record_mutation_witnesses(r: &crate::crew_receipt::CrewReceipt) -> Result<()> {
-    let Some(rows) = &r.witnesses else {
-        return Ok(());
-    };
+fn record_mutation_witnesses(rows: &[crate::mutation_witnesses::Witness]) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
@@ -1056,7 +1053,15 @@ fn cmd_crew_done(
                 parsed.brief_id
             );
         }
-        record_mutation_witnesses(&parsed)?;
+        let harness_witnesses = match (&parsed.witness_file, &parsed.witnesses) {
+            (Some(path), _) => crate::crew_receipt::read_witness_file(std::path::Path::new(path))
+                .map_err(|e| anyhow!("invalid witness file ({e})"))?,
+            (None, Some(_)) => bail!(
+                "hand-written witnesses are refused; set witness_file to a file written by verify-mutations.sh"
+            ),
+            (None, None) => Vec::new(),
+        };
+        record_mutation_witnesses(&harness_witnesses)?;
     }
     let effects = book.reduce(crate::crew_briefs::Msg::Done {
         id: brief.to_string(),
@@ -1606,7 +1611,8 @@ mod tests {
             verdict: "RED".to_string(),
             key: "k1".to_string(),
         }]);
-        record_mutation_witnesses(&receipt).expect("record witnesses");
+        let rows = receipt.witnesses.clone().unwrap_or_default();
+        record_mutation_witnesses(&rows).expect("record witnesses");
         let path = crate::config::state_dir().join(crate::mutation_witnesses::STORE_FILE);
         let store = crate::mutation_witnesses::Store::load(&path);
         let rows = store.for_key("k1");

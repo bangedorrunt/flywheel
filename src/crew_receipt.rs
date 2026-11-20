@@ -45,9 +45,13 @@ pub struct CrewReceipt {
     pub tests: Tests,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mutations: Option<Vec<String>>,
-    /// RED mutation witnesses counted at landing (bd-r7852).
+    /// RED mutation witnesses counted at landing (bd-r7852). Hand-typed
+    /// witnesses are refused; `witness_file` must name a file written by
+    /// verify-mutations.sh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub witnesses: Option<Vec<crate::mutation_witnesses::Witness>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub witness_file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
 }
@@ -221,6 +225,33 @@ pub fn canonical(r: &CrewReceipt) -> String {
     serde_json::to_string(r).expect("a parsed receipt always serializes")
 }
 
+/// Read witnesses from a file WRITTEN BY the harness. A hand-typed witness in
+/// the receipt cannot substitute for it (bd-r7852 review).
+pub fn read_witness_file(
+    path: &Path,
+) -> Result<Vec<crate::mutation_witnesses::Witness>, FieldError> {
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        err(
+            "witness_file",
+            &format!("cannot read {}: {e}", path.display()),
+        )
+    })?;
+    let doc: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| err("witness_file", &e.to_string()))?;
+    if doc.get("source").and_then(serde_json::Value::as_str) != Some("verify-mutations.sh") {
+        return Err(err(
+            "witness_file",
+            "witness file was not written by verify-mutations.sh",
+        ));
+    }
+    let rows = doc
+        .get("witnesses")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| err("witness_file", "missing witnesses array"))?;
+    serde_json::from_value(serde_json::Value::Array(rows.clone()))
+        .map_err(|e| err("witness_file", &e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +383,32 @@ mod tests {
     fn a_fence_that_does_not_prove_a_bead_is_refused() {
         let e = validate(&valid_raw(), &root(), "flywheel", &NoAncestor).expect_err("stale fence");
         assert_eq!(e.field, "fence.sha");
+    }
+
+    #[test]
+    fn a_hand_written_witness_file_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("witness.json");
+        std::fs::write(
+            &path,
+            r#"{"witnesses":[{"spec":"s.spec.sh","sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verdict":"RED","key":"forged"}]}"#,
+        )
+        .expect("write forged witness");
+        let err = read_witness_file(&path).expect_err("no source marker");
+        assert_eq!(err.field, "witness_file");
+    }
+
+    #[test]
+    fn a_harness_written_witness_file_is_accepted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("witness.json");
+        std::fs::write(
+            &path,
+            r#"{"schema":"flywheel-mutation-witness.v1","source":"verify-mutations.sh","witnesses":[{"spec":"scripts/mutations/s.spec.sh","sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verdict":"RED","key":"k1"}]}"#,
+        )
+        .expect("write harness witness");
+        let rows = read_witness_file(&path).expect("harness witness accepted");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key, "k1");
     }
 }

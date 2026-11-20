@@ -44,7 +44,7 @@ BUILD="$TMP/build"
     cd "$REPO"
     TMPDIR="$TMP/tmp" VERIFY_MUTATIONS_BUILD_DIR="$BUILD" \
         bash scripts/verify-mutations.sh scripts/mutations/five.spec.sh \
-        --cargo "$FAKE" >"$TMP/run.log" 2>&1
+        --cargo "$FAKE" --witness-out "$TMP/witness.json" >"$TMP/run.log" 2>&1
 ) || {
     echo "test-mutation-witnesses: run failed" >&2
     cat "$TMP/run.log" >&2
@@ -55,6 +55,10 @@ grep -q '5/5 mutations accounted' "$TMP/run.log" \
     || { echo "test-mutation-witnesses: not all five mutants proved" >&2; tail -20 "$TMP/run.log" >&2; exit 1; }
 grep -q 'peak disk' "$TMP/run.log" \
     || { echo "test-mutation-witnesses: peak disk not reported" >&2; exit 1; }
+grep -q '"source": "verify-mutations.sh"' "$TMP/witness.json" \
+    || { echo "test-mutation-witnesses: harness witness file missing" >&2; cat "$TMP/witness.json" >&2; exit 1; }
+grep -q '"verdict": "RED"' "$TMP/witness.json" \
+    || { echo "test-mutation-witnesses: harness witness not RED" >&2; exit 1; }
 [ -f "$BUILD/repo/scripts/verify-mutations.sh" ] \
     || {
         echo "test-mutation-witnesses: no scratch tree" >&2

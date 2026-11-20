@@ -91,6 +91,7 @@ JSON_OUT=""
 LIST_ONLY=0
 LIST_EXPECT=0
 CACHE_KEY=""
+WITNESS_OUT=""
 NO_CACHE=0
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/flywheel/mutation-verdicts"
 
@@ -704,6 +705,7 @@ main() {
             --list) LIST_ONLY=1 ;;
             --list-expect) LIST_ONLY=1; LIST_EXPECT=1 ;;
             --cache-key) CACHE_KEY="$2"; shift ;;
+            --witness-out) WITNESS_OUT="$2"; shift ;;
             --cache-dir) CACHE_DIR="$2"; shift ;;
             --no-cache) NO_CACHE=1 ;;
             -h | --help) usage; exit 0 ;;
@@ -882,6 +884,23 @@ main() {
         "$((proven + dead))" "$total" "$proven" "$dead"
     printf 'verify-mutations: peak disk %s KB in %s\n' \
         "$peak_disk_kb" "${CARGO_TARGET_DIR:-<none>}"
+    if [ -n "$WITNESS_OUT" ] && [ "$restored_ok" = yes ] && [ "$((proven + dead))" -eq "$total" ]; then
+        local witness_spec="$spec" proven_sha
+        case "$witness_spec" in
+            */scripts/mutations/*) witness_spec="scripts/mutations/${witness_spec##*/}" ;;
+        esac
+        proven_sha="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
+        python3 - "$WITNESS_OUT" "$witness_spec" "$CACHE_KEY" "$proven_sha" <<'PY'
+import json, sys
+out, spec, key, sha = sys.argv[1:5]
+with open(out, "w", encoding="utf-8") as fh:
+    json.dump({
+        "schema": "flywheel-mutation-witness.v1",
+        "source": "verify-mutations.sh",
+        "witnesses": [{"spec": spec, "key": key, "sha": sha, "verdict": "RED"}],
+    }, fh)
+PY
+    fi
     [ "$restored_ok" = yes ] && [ "$((proven + dead))" -eq "$total" ]
 }
 

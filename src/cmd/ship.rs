@@ -575,34 +575,40 @@ fn changed_mutation_specs(root: &Path, changed: &[&str]) -> Vec<String> {
         if specs.contains(&full) {
             continue;
         }
-        let Ok(out) = Command::new("bash")
+        // bd-r7852 review: a broken harness must never make a covered path
+        // look uncovered. Spawn failure or non-zero exit falls back to the
+        // spec's own file= declarations and keeps the spec in the witness set.
+        let listed = Command::new("bash")
             .arg("scripts/verify-mutations.sh")
             .arg("--list")
             .arg(&spec)
             .current_dir(root)
-            .output()
-        else {
-            continue;
-        };
-        let listing = String::from_utf8_lossy(&out.stdout);
-        let mut targets: Vec<String> = listing
-            .lines()
-            .filter_map(|row| row.rsplit('\t').next().map(str::to_string))
-            .collect();
-        if targets.is_empty() {
-            // A spec with no CARGO_ARGS cannot be listed; still read its
-            // file= declarations so a target change can never skip a witness.
-            if let Ok(text) = std::fs::read_to_string(&spec) {
-                for token in text.split_whitespace() {
-                    if let Some(path) = token.strip_prefix("file=") {
-                        targets.push(path.trim_end_matches('\\').to_string());
-                    }
+            .output();
+        let mut list_ok = false;
+        let mut targets: Vec<String> = Vec::new();
+        if let Ok(out) = listed
+            && out.status.success()
+        {
+            list_ok = true;
+            let listing = String::from_utf8_lossy(&out.stdout);
+            targets = listing
+                .lines()
+                .filter_map(|row| row.rsplit('\t').next().map(str::to_string))
+                .collect();
+        }
+        if (!list_ok || targets.is_empty())
+            && let Ok(text) = std::fs::read_to_string(&spec)
+        {
+            for token in text.split_whitespace() {
+                if let Some(path) = token.strip_prefix("file=") {
+                    targets.push(path.trim_end_matches('\\').to_string());
                 }
             }
         }
-        if changed
-            .iter()
-            .any(|path| targets.iter().any(|target| target == path))
+        if !list_ok
+            || changed
+                .iter()
+                .any(|path| targets.iter().any(|target| target == path))
         {
             specs.insert(full);
         }
@@ -1778,6 +1784,27 @@ live-verified. Record one BEFORE closing."#;
         assert!(
             err.contains("demo.spec.sh"),
             "the spec must be named: {err}"
+        );
+    }
+
+    #[test]
+    fn a_broken_list_harness_cannot_hide_a_covered_spec() {
+        let _guard = crate::config::lock_env();
+        let dir = witness_repo();
+        std::fs::write(
+            dir.path().join("scripts/verify-mutations.sh"),
+            "#!/bin/sh\nexit 1\n",
+        )
+        .expect("break the lister");
+        let sha = git_in(dir.path(), &["rev-parse", "HEAD"]);
+        let receipt = dir.path().join("receipt.json");
+        no_mutation_receipt(&receipt, &sha);
+        let err = receipt_is_landable(dir.path(), &receipt, &sha)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("demo.spec.sh"),
+            "a non-zero --list must not hide the spec: {err}"
         );
     }
 
