@@ -72,7 +72,7 @@ exit 2
     // The token file lives under the seat's state dir, 0600, plaintext inside.
     let token_file = sandbox
         .root()
-        .join("state/events-tokens/flywheel-ClaudeSeat.token");
+        .join("state/flywheel/events-tokens/flywheel-ClaudeSeat.token");
     assert!(token_file.is_file(), "token file missing: {}", token_file.display());
     assert_eq!(
         std::fs::read_to_string(&token_file).expect("token"),
@@ -108,7 +108,7 @@ exit 2
     );
 
     // The journal has the hash but no plaintext.
-    let journal = std::fs::read_to_string(sandbox.root().join("state/events-token-journal.jsonl"))
+    let journal = std::fs::read_to_string(sandbox.root().join("state/flywheel/events-token-journal.jsonl"))
         .expect("journal");
     assert!(journal.contains("mint-intent") && journal.contains("minted"));
     assert!(

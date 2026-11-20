@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
@@ -176,6 +176,9 @@ impl TokenCli for ToronTokenCli {
 
 fn journal(journal_path: &Path, row: &str, now_us: i64) -> Result<(), String> {
     use std::io::Write as _;
+    if let Some(parent) = journal_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("token journal dir failed: {e}"))?;
+    }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -295,6 +298,31 @@ pub fn rotate<C: TokenCli>(
     Ok(fresh)
 }
 
+/// Read the last `minted` row's hash and expiry from the journal. The rotation
+/// tick uses this as the source of truth for what to revoke and when.
+pub fn last_minted(journal_path: &Path) -> Result<(String, i64), String> {
+    let body = std::fs::read_to_string(journal_path)
+        .map_err(|e| format!("token journal read failed: {e}"))?;
+    for line in body.lines().rev() {
+        let Ok(row) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if row.get("op").and_then(Value::as_str) != Some("minted") {
+            continue;
+        }
+        let hash = row
+            .get("hash")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "minted row has no hash".to_string())?;
+        let expires = row
+            .get("expires_us")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| "minted row has no expires_us".to_string())?;
+        return Ok((hash.to_string(), expires));
+    }
+    Err("no minted row in token journal".to_string())
+}
+
 /// Where the per-seat token lives. Under the seat's state dir, never in the
 /// MCP config (which carries only this path via FLYWHEEL_TORON_TOKEN_FILE).
 pub fn token_path(state_dir: &Path, project: &str, pin: &str) -> PathBuf {
@@ -353,7 +381,7 @@ mod tests {
         let token_file = dir.path().join("seat.token");
         let journal_file = dir.path().join("journal.jsonl");
         let cli = FakeCli {
-            minted: vec![("x".into(), 1)],
+            minted: vec![],
         };
         let state = mint_and_store(
             &cli,
@@ -415,7 +443,7 @@ mod tests {
         let token_file = dir.path().join("seat.token");
         let journal_file = dir.path().join("journal.jsonl");
         let cli = FakeCli {
-            minted: vec![("x".into(), 1)],
+            minted: vec![],
         };
         let plan = RotationPlan {
             revoke_hash: "old-hash".into(),

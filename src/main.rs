@@ -758,6 +758,23 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum EventsTokenCmd {
+    /// Rotate a pin's events token before its TTL and revoke the old hash.
+    Rotate {
+        #[arg(long)]
+        pin: String,
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        token_file: std::path::PathBuf,
+        #[arg(long)]
+        journal: std::path::PathBuf,
+        #[arg(long, default_value_t = events_tokens::ROTATE_BEFORE_SECS)]
+        before_secs: u64,
+    },
+}
+
+#[derive(Subcommand)]
 enum Commands {
     /// Scaffold a project (ensure dir + .beads + the project-scope compound
     /// spine: .flywheel/stages.toml, .flywheel/standing-orders.md,
@@ -1421,6 +1438,12 @@ enum Commands {
     /// channel (ADR-0039 D8, bd-si4b5). Declares claude/channel and emits the
     /// D2 hint only. Phase A: pure protocol + transport port; Phase B wires the
     /// real toron events client (bd-o4bgx).
+    /// Provision/rotate per-seat events tokens (bd-5vi2x; cron rotation tick).
+    #[command(name = "events-token", hide = true)]
+    EventsToken {
+        #[command(subcommand)]
+        cmd: EventsTokenCmd,
+    },
     #[command(name = "mcp-events", hide = true)]
     McpEvents {
         /// subscription id (pin-scoped); the transport keys its cursor on this
@@ -3743,6 +3766,15 @@ fn main() {
             msg,
         }) => cmd_assign(&cfg, project, to, beads, msg.as_deref()),
         Some(Commands::Mail { cmd }) => cmd_mail(&cfg, cmd),
+        Some(Commands::EventsToken { cmd }) => match cmd {
+            EventsTokenCmd::Rotate {
+                pin,
+                project,
+                token_file,
+                journal,
+                before_secs,
+            } => cmd_events_token_rotate(pin, project, token_file, journal, *before_secs),
+        },
         Some(Commands::McpEvents {
             subscription,
             probe,
@@ -14264,6 +14296,39 @@ mod verify_gate_tests {
         let is_vacuous = is_cargo_test_verify(verify) && passed == Some(0);
         assert!(is_vacuous);
     }
+}
+
+/// The rotation tick (bd-5vi2x): re-mint before expiry, then revoke the old
+/// hash. Reads only the journal's hash/expiry — no plaintext in argv or logs.
+fn cmd_events_token_rotate(
+    pin: &str,
+    project: &str,
+    token_file: &std::path::Path,
+    journal: &std::path::Path,
+    before_secs: u64,
+) -> Result<()> {
+    let cli = events_tokens::ToronTokenCli {
+        bin: std::env::var("TORON_BIN").unwrap_or_else(|_| "toron".to_string()),
+    };
+    let now_us = chrono::Utc::now().timestamp_micros();
+    let (old_hash, expires_us) = events_tokens::last_minted(journal)
+        .map_err(|e| anyhow::anyhow!("{e}: {}", journal.display()))?;
+    let state = events_tokens::TokenState {
+        hash: old_hash.clone(),
+        minted_us: 0,
+        expires_us,
+        path: token_file.display().to_string(),
+    };
+    if let Some(plan) =
+        events_tokens::rotation_plan(&state, now_us, (before_secs as i64) * 1_000_000)
+    {
+        events_tokens::rotate(&cli, &plan, pin, project, token_file, journal, now_us)
+            .map_err(|e| anyhow::anyhow!("token rotation failed: {e}"))?;
+        println!("events-token: rotated {pin} (old hash {old_hash} revoked)");
+    } else {
+        println!("events-token: {pin} not due for rotation");
+    }
+    Ok(())
 }
 
 /// bd-si4b5 Phase A: a stdio MCP server that declares claude/channel and speaks
