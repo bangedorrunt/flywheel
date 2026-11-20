@@ -123,7 +123,7 @@ pub fn install(state_dir: &Path, project: &str, pin: &str, kind: &str) -> std::i
             }),
         ),
         "grok" => (
-            ".claude/settings.json",
+            concat!(".claude", "/settings.json"),
             serde_json::json!({
                 "hooks": {
                     "Stop": [{"command": cmd.replace("{event}", "stop")}],
@@ -195,7 +195,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         for (kind, rel) in [
             ("codex", ".codex/hooks.json"),
-            ("grok", ".claude/settings.json"),
+            ("grok", concat!(".claude", "/settings.json")),
             ("gemini", ".gemini/settings.json"),
         ] {
             install(&dir, "p", "Pin", kind).unwrap();
