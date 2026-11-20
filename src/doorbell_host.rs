@@ -2173,7 +2173,13 @@ mod parity_tests {
         let mut model = crate::workspace::WorkspaceModel::default();
         model.doorbell.index.insert_pin("PinA".into(), None);
         model.roles.insert("captain".into(), "PinA".into());
-        model.doorbell.statuses.insert("PinA".into(), "idle".into());
+        let (mut model, _) = crate::workspace::tick(
+            &model,
+            &crate::workspace::Msg::PlaneStatus {
+                pin: "PinA".into(),
+                status: "idle".into(),
+            },
+        );
         model
             .presence
             .insert("PinA".into(), crate::workspace::Presence::from_str("idle"));
