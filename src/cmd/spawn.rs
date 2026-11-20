@@ -1235,11 +1235,19 @@ pub(crate) fn with_recorded_harness(mut entry: state::SpawnEntry, kind: &str) ->
 
 /// bd-f888z: opencode v2 accepts `--session/-s <id>` ("continue, or create if
 /// it does not exist"). Mint a unique session for each opencode seat so its
-/// wakes can ride `session.prompt` instead of typing into the TUI. Returns the
-/// minted id to record in `SpawnEntry.harness_session`; non-opencode seats get
-/// `None` and no argv change.
+/// wakes can ride `session.prompt` instead of typing into the TUI. bd-64qoy:
+/// antigravity's conversation id comes from the agent's own env at spawn and
+/// is recorded as `agy:<id>` for the agentapi door. Other seats get `None`.
 pub(crate) fn mint_harness_session(kind: &str, args: &mut Vec<String>) -> Option<String> {
-    if crate::harness_registry::canonical(kind) != "opencode" {
+    let canonical = crate::harness_registry::canonical(kind);
+    if canonical == "antigravity" {
+        return std::env::var("ANTIGRAVITY_CONVERSATION_ID")
+            .ok()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .map(|id| format!("agy:{id}"));
+    }
+    if canonical != "opencode" {
         return None;
     }
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3424,6 +3432,22 @@ pub(crate) fn proxy_doorbell_verb(cfg: &Config, verb: &str, extra: &[String]) ->
 mod spawn_profile_plan_tests {
     use super::*;
     use crate::config::lock_env;
+
+    /// bd-64qoy: antigravity's conversation id is captured at spawn from the
+    /// agent's own env and recorded as `agy:<id>`; no argv is rewritten.
+    #[test]
+    fn antigravity_conversation_id_captured_at_spawn() {
+        let _env = lock_env();
+        unsafe { std::env::set_var("ANTIGRAVITY_CONVERSATION_ID", "conv-77") };
+        let mut args = vec!["--agent".to_string(), "build".to_string()];
+        assert_eq!(
+            mint_harness_session("agy", &mut args),
+            Some("agy:conv-77".to_string())
+        );
+        assert_eq!(args, vec!["--agent", "build"], "agy argv untouched");
+        unsafe { std::env::set_var("ANTIGRAVITY_CONVERSATION_ID", "") };
+        assert_eq!(mint_harness_session("antigravity", &mut args), None);
+    }
 
     /// bd-f888z: opencode seats get a unique `ses-` session minted into argv,
     /// recorded on the entry; other harnesses are untouched.
