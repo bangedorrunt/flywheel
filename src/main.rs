@@ -14465,17 +14465,9 @@ fn cmd_mcp_events(_cfg: &Config, subscription: &str) -> Result<()> {
                         // replays from the old cursor and eventId dedupe absorbs
                         // the duplicate (ADR-0039 D8).
                         for notice in step.notifications {
-                            let event_id = notice
-                                .get("params")
-                                .and_then(|p| p.get("meta"))
-                                .and_then(|m| m.get("event_id"))
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("");
-                            // bd-o1z4m: one ring per bus event id, even if the
-                            // doorbell fallback also delivers this event.
-                            if event_id.is_empty()
-                                || events_bridge::rung_once(&config::state_dir(), event_id)
-                            {
+                            // bd-o1z4m: one shared rung set with the doorbell
+                            // fallback, keyed by bus event id.
+                            if events_bridge::should_ring(&config::state_dir(), &notice) {
                                 writeln!(out, "{}", notice)?;
                             }
                         }

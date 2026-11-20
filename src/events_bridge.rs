@@ -408,26 +408,40 @@ impl EventsTransport for NoopTransport {
 /// doorbell fallback. `create_new` is the atomic test-and-set, so whichever
 /// path delivers first rings and the other stays silent.
 pub fn rung_once(state_dir: &std::path::Path, event_id: &str) -> bool {
-    let safe: String = event_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let dir = state_dir.join("events-rung");
-    if std::fs::create_dir_all(&dir).is_err() {
+    use std::io::Write as _;
+    let path = state_dir.join("wake-rung.jsonl");
+    let prior = std::fs::read_to_string(&path).unwrap_or_default();
+    if prior
+        .lines()
+        .any(|l| l.contains(&format!("\"id\":\"{event_id}\"")))
+    {
         return false;
     }
-    let path = dir.join(format!("{safe}.rung"));
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .is_ok()
+    let mut rows: Vec<String> = prior.lines().map(str::to_string).collect();
+    rows.push(format!("{{\"id\":\"{event_id}\"}}"));
+    if rows.len() > 2000 {
+        rows.drain(..rows.len() - 2000);
+    }
+    if let Ok(mut file) = std::fs::File::create(&path)
+        && file.write_all((rows.join("\n") + "\n").as_bytes()).is_ok()
+    {
+        return true;
+    }
+    false
+}
+
+/// One decision for both delivery paths: a notice rings only the first time
+/// its bus event id claims the shared rung set. The doorbell (bd-f888z) reads
+/// and writes the SAME file, so a native hint and a fallback prompt for one
+/// event produce one turn, not two.
+pub fn should_ring(state_dir: &std::path::Path, notice: &serde_json::Value) -> bool {
+    let event_id = notice
+        .get("params")
+        .and_then(|p| p.get("meta"))
+        .and_then(|m| m.get("event_id"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    event_id.is_empty() || rung_once(state_dir, event_id)
 }
 
 /// bd-o1z4m: the stdio proxy answers `events/list` locally so opencode's
@@ -791,15 +805,27 @@ mod tests {
     #[test]
     fn one_event_id_rings_once_across_both_paths() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let notice = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/claude/channel",
+            "params": {"content": "hint", "meta": {"event_id": "evt-42"}},
+        });
         assert!(
-            super::rung_once(dir.path(), "evt-42"),
-            "native path rings first"
+            super::should_ring(dir.path(), &notice),
+            "the native stream rings first"
         );
         assert!(
-            !super::rung_once(dir.path(), "evt-42"),
+            !super::should_ring(dir.path(), &notice),
             "the doorbell fallback must stay silent for the same event"
         );
-        assert!(super::rung_once(dir.path(), "evt-43"), "a new event rings");
+        let shared =
+            std::fs::read_to_string(dir.path().join("wake-rung.jsonl")).expect("shared set");
+        assert!(
+            shared.contains("\"id\":\"evt-42\""),
+            "one shared set: {shared}"
+        );
+        let other = serde_json::json!({ "params": { "meta": { "event_id": "evt-43" } } });
+        assert!(super::should_ring(dir.path(), &other), "a new event rings");
     }
 
     #[test]
