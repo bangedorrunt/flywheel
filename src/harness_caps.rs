@@ -154,12 +154,13 @@ fn hc_pane_caps(harness: &'static str) -> HarnessCaps {
         hook: None,
         verified_by: None,
         inject: Capability::supported(SINK_WITNESS),
-        // bd-f888z: opencode alone has a verified API door (the harness_api
-        // session.prompt witness). Every other hc pane still types.
-        api: if harness == "opencode" {
-            Capability::supported("opencode_wake_rides_the_session_api")
-        } else {
-            Capability::unsupported(Fallback::Explicit)
+        // bd-f888z: opencode rides session.prompt; bd-64qoy: antigravity rides
+        // `agy agentapi send-message` when a conversation id was captured at
+        // spawn. Every other hc pane still types.
+        api: match harness {
+            "opencode" => Capability::supported("opencode_wake_rides_the_session_api"),
+            "antigravity" => Capability::supported("antigravity_wake_rides_the_agentapi"),
+            _ => Capability::unsupported(Fallback::Explicit),
         },
         interrupt: Capability::supported(SINK_SHAPE_WITNESS),
         steer: Capability::unsupported(Fallback::Mail),
@@ -301,15 +302,27 @@ pub fn wake_route(kind: &str, hook_installed: bool) -> WakeRoute {
     wake_route_for(kind, None, hook_installed)
 }
 
-/// The API-aware route decision (bd-f888z). A harness with a verified `api`
-/// door AND a recorded harness session wakes through its server API; otherwise
-/// the existing Inject/NoDoor decision stands. Session ids are validated: an
-/// opencode session starts with `ses`, so a bogus recorded value cannot hijack
-/// the route.
+/// A recorded harness session is a verified API door only when its shape
+/// matches the harness that produced it (bd-f888z opencode `ses…`, bd-64qoy
+/// antigravity `agy:<conversation>`). A bogus value cannot hijack the route.
+pub fn api_session_valid(kind: &str, session: Option<&str>) -> bool {
+    let canonical = crate::harness_registry::canonical(kind);
+    session.is_some_and(|s| {
+        let s = s.trim();
+        match canonical.as_str() {
+            "opencode" => s.starts_with("ses") && s.len() > 3,
+            "antigravity" => s.starts_with("agy:") && s.len() > "agy:".len(),
+            _ => false,
+        }
+    })
+}
+
+/// The API-aware route decision (bd-f888z, bd-64qoy). A harness with a
+/// verified `api` door AND a well-shaped recorded session wakes through its
+/// server API; otherwise the existing Inject/NoDoor decision stands.
 pub fn wake_route_for(kind: &str, session: Option<&str>, hook_installed: bool) -> WakeRoute {
     let r = row(kind);
-    let api_ok = r.is_some_and(|row| row.api.supported)
-        && session.is_some_and(|s| s.trim_start().starts_with("ses"));
+    let api_ok = r.is_some_and(|row| row.api.supported) && api_session_valid(kind, session);
     if api_ok {
         return WakeRoute::Api {
             session: session.expect("checked").trim().to_string(),
@@ -630,6 +643,28 @@ mod tests {
             wake_route_for("pi", Some("ses-abc"), false),
             WakeRoute::Inject { interrupt: true }
         );
+    }
+
+    /// bd-64qoy: antigravity gets an API door only with a captured
+    /// `agy:<conversation-id>`; an opencode-shaped session cannot hijack it.
+    #[test]
+    fn antigravity_wake_rides_the_agentapi() {
+        assert_eq!(
+            wake_route_for("agy", Some("agy:conv-42"), false),
+            WakeRoute::Api {
+                session: "agy:conv-42".into()
+            }
+        );
+        assert_eq!(
+            wake_route_for("antigravity", Some("ses-forged"), false),
+            WakeRoute::Inject { interrupt: true }
+        );
+        assert_eq!(
+            wake_route_for("antigravity", None, false),
+            WakeRoute::Inject { interrupt: true }
+        );
+        assert!(!api_session_valid("antigravity", Some("agy:")));
+        assert!(api_session_valid("antigravity", Some("agy:c1")));
     }
 
     #[test]

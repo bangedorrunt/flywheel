@@ -13,8 +13,7 @@ TEST_FILTER=(
 mutation "H1  opencode never selects the API route" \
     file=src/harness_caps.rs \
     expect=opencode_wake_rides_the_session_api \
-    find='    let api_ok = r.is_some_and(|row| row.api.supported)
-        && session.is_some_and(|s| s.trim_start().starts_with("ses"));' \
+    find='    let api_ok = r.is_some_and(|row| row.api.supported) && api_session_valid(kind, session);' \
     replace='    let api_ok = false;'
 
 mutation "H2  API prompt types into the pane instead" \

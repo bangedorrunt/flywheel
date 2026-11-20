@@ -118,6 +118,28 @@ impl HarnessApi for CliApi {
         delivery: Delivery,
         msg_id: &str,
     ) -> anyhow::Result<()> {
+        // bd-64qoy: antigravity's door is `agy agentapi send-message
+        // <conversation> <text>`; `session` carries `agy:<conversation-id>`
+        // captured at spawn. The CLI/env resolve the service; the id is for
+        // the caller's journal, never logged here.
+        if let Some(conversation) = session.strip_prefix("agy:") {
+            if conversation.is_empty() {
+                anyhow::bail!("antigravity api route has an empty conversation id");
+            }
+            let bin =
+                std::env::var("ANTIGRAVITY_AGENTAPI_EXE").unwrap_or_else(|_| "agy".to_string());
+            let out = std::process::Command::new(bin)
+                .args(["agentapi", "send-message", conversation, text])
+                .output()
+                .map_err(|e| anyhow::anyhow!("cannot run `agy agentapi send-message`: {e}"))?;
+            if !out.status.success() {
+                anyhow::bail!(
+                    "agy agentapi send-message failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            return Ok(());
+        }
         let body = serde_json::json!({
             "text": text,
             "id": msg_id,
@@ -256,6 +278,7 @@ pub fn deliver(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness_caps::WakeRoute;
 
     #[test]
     fn msg_id_is_stable_and_idempotent() {
@@ -274,9 +297,8 @@ mod tests {
 
     #[test]
     fn api_route_delivers_without_typing_and_picks_delivery() {
-        use crate::harness_caps::WakeRoute;
         let api = FakeApi::default();
-        let route = WakeRoute::Api {
+        let route = crate::harness_caps::WakeRoute::Api {
             session: "ses-abc".into(),
         };
         let mut typed = false;
@@ -293,10 +315,9 @@ mod tests {
 
     #[test]
     fn api_failure_falls_back_to_inject() {
-        use crate::harness_caps::WakeRoute;
         let api = FakeApi::default();
         api.fail_with();
-        let route = WakeRoute::Api {
+        let route = crate::harness_caps::WakeRoute::Api {
             session: "ses-abc".into(),
         };
         let mut typed = false;
@@ -311,7 +332,6 @@ mod tests {
 
     #[test]
     fn inject_route_only_types() {
-        use crate::harness_caps::WakeRoute;
         let api = FakeApi::default();
         let route = WakeRoute::Inject { interrupt: true };
         let mut typed = false;
@@ -323,6 +343,53 @@ mod tests {
         assert_eq!(taken, RouteTaken::Inject);
         assert!(typed);
         assert!(api.calls().is_empty(), "Inject must not touch the API");
+    }
+
+    /// bd-64qoy: an antigravity agentapi failure falls back to Inject and the
+    /// API is still recorded as attempted; the wake is never lost.
+    #[test]
+    fn an_agy_api_failure_falls_back_to_inject() {
+        let route = crate::harness_caps::WakeRoute::Api {
+            session: "agy:conv-7".into(),
+        };
+        let api = FakeApi::default();
+        api.fail_with();
+        let mut typed = false;
+        let taken = deliver(&api, &route, "wake", "msg_7", false, || {
+            typed = true;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(taken, RouteTaken::Inject);
+        assert!(typed, "a down agentapi must fall back to a typed wake");
+        assert!(api.calls().is_empty(), "the failed call is not a delivery");
+    }
+
+    /// bd-64qoy: the chosen route is journaled BEFORE the transport runs, and
+    /// the outcome after, with the same (seed, pin) idempotency key.
+    #[test]
+    fn dispatch_journals_intent_before_the_provider_and_outcome_after() {
+        let _home = crate::config::test_state_home();
+        let route = crate::harness_caps::WakeRoute::Api {
+            session: "agy:conv-9".into(),
+        };
+        // A real transport that cannot fail: /bin/true stands in for `agy`.
+        unsafe { std::env::set_var("ANTIGRAVITY_AGENTAPI_EXE", "/usr/bin/true") };
+        let taken = dispatch(&route, "wake", "wm-9", "AmberProbe", false, || Ok(())).unwrap();
+        assert_eq!(taken, RouteTaken::Api);
+        let rows = std::fs::read_to_string(crate::config::state_dir().join("wake-routes.jsonl"))
+            .unwrap_or_default();
+        let phases: Vec<String> = rows
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["seed"] == "wm-9" && v["pin"] == "AmberProbe")
+            .filter_map(|v| v["phase"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            phases,
+            vec!["intent".to_string(), "outcome".to_string()],
+            "{rows}"
+        );
     }
 
     #[test]
