@@ -1414,11 +1414,6 @@ enum Commands {
         #[command(subcommand)]
         cmd: MailCmd,
     },
-    /// Auto-wire the toron MCP server into the agent MCP configs
-    /// (opencode ~/.config/opencode/opencode.json, pi ~/.pi/agent/mcp.json,
-    /// grok ~/.grok/config.toml). Idempotent — re-running only updates the
-    /// toron entry, never clobbers other servers. (Moved here from the retired
-    /// `flywheel toron` demo surface; same args and behavior.)
     /// stdio MCP server that bridges toron events into a harness's inbound
     /// channel (ADR-0039 D8, bd-si4b5). Declares claude/channel and emits the
     /// D2 hint only. Phase A: pure protocol + transport port; Phase B wires the
@@ -1435,6 +1430,11 @@ enum Commands {
         #[arg(long)]
         client_version: Option<String>,
     },
+    /// Auto-wire the toron MCP server into the agent MCP configs
+    /// (opencode ~/.config/opencode/opencode.json, pi ~/.pi/agent/mcp.json,
+    /// grok ~/.grok/config.toml). Idempotent — re-running only updates the
+    /// toron entry, never clobbers other servers. (Moved here from the retired
+    /// `flywheel toron` demo surface; same args and behavior.)
     #[command(name = "setup-mcp")]
     SetupMcp {
         /// toron MCP server URL (default http://127.0.0.1:18080/mcp)
