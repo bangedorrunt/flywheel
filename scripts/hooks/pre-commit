@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
-# bd-4z7mb: the commit-time gate. Fences the STAGED index, not the tree, so a
+# bd-4z7mb: fence the STAGED index, not the tree, so a
 # caller staged without its callee dies here instead of breaking HEAD for every
-# lane. Install once per clone: bash scripts/hooks/install.sh
-# Measured on this host, warm: ~55s end to end (cargo clippy, all targets, -D
-# warnings); a cold cache is minutes. Clippy carries the type check too, so it
-# replaces the check leg rather than adding one. The frozen --sha fence still
-# does the full build.
+# lane. Measured on this host, warm: ~55s end to end (cargo clippy, all targets).
+# bd-j1g64: a plain `git commit` is refused — it sweeps another lane's staged
+# hunks. `flywheel commit <paths> -m <msg>` sets a per-invocation nonce for its
+# fence run. Operator escape (explicit): FLYWHEEL_COMMIT_OPERATOR=1.
+if [ -z "${FLYWHEEL_COMMIT_TOKEN:-}" ] && [ "${FLYWHEEL_COMMIT_OPERATOR:-}" != "1" ]; then
+  echo "flywheel: plain git commit refused (shared index can sweep other lanes' stages)" >&2
+  echo "flywheel: use: flywheel commit <paths> -m <msg>" >&2
+  echo "flywheel: operator escape: FLYWHEEL_COMMIT_OPERATOR=1 git commit ..." >&2
+  exit 1
+fi
 exec "$(dirname "$0")/../../scripts/fence.sh" --index
