@@ -1431,6 +1431,9 @@ enum Commands {
         /// print the initialize result and exit (protocol smoke check)
         #[arg(long)]
         probe: bool,
+        /// client protocolVersion to negotiate (--probe only)
+        #[arg(long)]
+        client_version: Option<String>,
     },
     #[command(name = "setup-mcp")]
     SetupMcp {
@@ -3737,9 +3740,13 @@ fn main() {
             msg,
         }) => cmd_assign(&cfg, project, to, beads, msg.as_deref()),
         Some(Commands::Mail { cmd }) => cmd_mail(&cfg, cmd),
-        Some(Commands::McpEvents { subscription, probe }) => {
+        Some(Commands::McpEvents {
+            subscription,
+            probe,
+            client_version,
+        }) => {
             if *probe {
-                print_json(&events_bridge::initialize_result());
+                print_json(&events_bridge::initialize_result(client_version.as_deref()));
                 Ok(())
             } else {
                 cmd_mcp_events(&cfg, subscription)
@@ -14265,7 +14272,9 @@ fn cmd_mcp_events(_cfg: &Config, subscription: &str) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let init = events_bridge::initialize_result();
+    let transport = events_bridge::NoopTransport;
+    let mut deduper = events_bridge::Deduper::new(1024);
+    let mut cursor = String::new();
     for line in stdin.lock().lines() {
         let line = line?;
         let req: serde_json::Value = match serde_json::from_str(&line) {
@@ -14277,29 +14286,77 @@ fn cmd_mcp_events(_cfg: &Config, subscription: &str) -> Result<()> {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
         let id = req.get("id").cloned();
-        let response = match method {
-            "initialize" => Some((id, init.clone())),
-            "ping" => Some((id, serde_json::json!({}))),
-            "notifications/initialized" => None,
-            _ => Some((
-                id,
-                serde_json::json!({
-                    "error": { "code": -32601, "message": "method not found" }
-                }),
-            )),
-        };
-        if let Some((rid, result)) = response {
-            let mut msg = serde_json::json!({ "jsonrpc": "2.0", "result": result });
-            if let Some(rid) = rid {
-                msg["id"] = rid;
-            } else {
-                msg.as_object_mut().and_then(|m| m.remove("id"));
+        match method {
+            "initialize" => {
+                let client_version = req
+                    .get("params")
+                    .and_then(|p| p.get("protocolVersion"))
+                    .and_then(serde_json::Value::as_str);
+                let result = events_bridge::initialize_result(client_version);
+                let mut msg = serde_json::json!({ "jsonrpc": "2.0", "result": result });
+                if let Some(rid) = id {
+                    msg["id"] = rid;
+                }
+                writeln!(out, "{}", msg)?;
+                out.flush()?;
             }
-            writeln!(out, "{}", msg)?;
-            out.flush()?;
+            "ping" => {
+                let mut msg = serde_json::json!({ "jsonrpc": "2.0", "result": {} });
+                if let Some(rid) = id {
+                    msg["id"] = rid;
+                }
+                writeln!(out, "{}", msg)?;
+                out.flush()?;
+            }
+            "events/poll" => {
+                // Phase A: the one core is exercised against the no-op port;
+                // Phase B (bd-o4bgx) swaps in the real toron transport.
+                let timing = events_bridge::BridgeTiming {
+                    last_hb_ms: 0,
+                    now_ms: 0,
+                    interval_ms: 1000,
+                    attempt: 0,
+                    rand_unit: 0.0,
+                };
+                if let Ok(step) = events_bridge::bridge_step(
+                    &transport,
+                    subscription,
+                    &mut deduper,
+                    &mut cursor,
+                    &timing,
+                ) {
+                    for notice in step.notifications {
+                        writeln!(out, "{}", notice)?;
+                    }
+                    if step.dead {
+                        eprintln!(
+                            "flywheel mcp-events: stream liveness stale; reconnect in {:?}ms",
+                            step.reconnect_ms
+                        );
+                    }
+                    out.flush()?;
+                }
+                let mut msg = serde_json::json!({ "jsonrpc": "2.0", "result": {} });
+                if let Some(rid) = id {
+                    msg["id"] = rid;
+                }
+                writeln!(out, "{}", msg)?;
+                out.flush()?;
+            }
+            "notifications/initialized" => {}
+            _ => {
+                let mut msg = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -32601, "message": "method not found" }
+                });
+                if let Some(rid) = id {
+                    msg["id"] = rid;
+                }
+                writeln!(out, "{}", msg)?;
+                out.flush()?;
+            }
         }
     }
-    let _ = subscription;
     Ok(())
 }
 
