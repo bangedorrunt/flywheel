@@ -5,7 +5,7 @@ description: Run hand-written TLA+ protocol models with TLC — toron job claim/
 
 # Verify Protocol Fences (`flywheel` + sibling `toron`)
 
-Synced to commit: `4ba36ec0` (models + `scripts/verify-formal.sh`)
+Synced to commit: `ccf015a1` (models + `scripts/verify-formal.sh`)
 
 `bash scripts/verify-formal.sh` runs two hand-written TLA+ models with a pinned
 TLC and asserts both directions: the models of the code as written pass, and
@@ -45,6 +45,17 @@ shortest path in the code's words. No commands from `/statechart` belong here.
 - **Rust correspondence**: the reservation hand-off around `envpin_hop_respawn` / `seat_reconcile` (reservations are keyed by reason bead, not pane).
 - **Negative fixture**: `models/Respawn.broken-drop-reservations.cfg`; TLC reports `ReservationsKept` violated.
 
+### 6. `NoClosedRowLost` — a CAS retry never reverts a landed tracker row
+- **Plain statement**: two ship lands (or `flywheel commit`s) CAS on HEAD; when one loses the race and retries, it re-splices its row into the *moved* HEAD, so a row another lander closed in between survives (bd-kz3sc rework 2, bd-aberm).
+- **TLA+ invariant**: `\A a \in Landers : done[a] => own(a) \in headRows` (`models/TrackerCas.tla`).
+- **Rust correspondence**: `commit_tree` CAS loop and `commit_blobs` splice closure (`src/cmd/commit.rs`), `tracker_blobs_for_bead` (`src/cmd/ship.rs`).
+- **Negative fixture**: `models/TrackerCas.broken-stale-splice.cfg` (`Bug = "stale-splice"`) reuses the first splice on retry; TLC reports `NoClosedRowLost` violated.
+
+### 7. `BoundedRetries` / `Termination` — retry loops end
+- **Plain statement**: a lander never retries past `MaxRetries`; every lander eventually either returns ok or exhausts its budget.
+- **TLA+ checks**: invariant `BoundedRetries` and temporal property `Termination` in `models/TrackerCas.tla`, asserted by the positive config.
+- **Negative fixture**: none (this is a liveness/termination bound, not a fence).
+
 ## How to run
 
 ```bash
@@ -61,7 +72,7 @@ fails loudly if the jar or a Java runtime is missing; it resolves Java from
 
 ## Bounds, assumptions, limitations
 
-- **Bounds**: `Owners = {o1, o2}`, `LeaseMs = 1`, `MaxTime = 2`, `MaxGen = 3` (JobLease); one pin over panes `{old, new}` (Respawn). Small bounds keep the run under a second.
+- **Bounds**: `Owners = {o1, o2}`, `LeaseMs = 1`, `MaxTime = 2`, `MaxGen = 3` (JobLease); one pin over panes `{old, new}` (Respawn); `Landers = {l1, l2}`, `MaxRetries = 2` (TrackerCas). Small bounds keep each run under a second.
 - **Abstractions**: time is a bounded tick, not a clock; retries, backoff, pane transport (hc/rex), mail, and CLI serialization are out of scope; reservations are one abstract set, not the `bd-…` reason keys; heartbeat/renew is not modelled (leases only expire).
 - **What a passing check does NOT prove**: it does not prove the Rust code matches the model — the coverage table is the review surface for that — nor correctness under more than two owners, more than one pin, or an unbounded generation count.
 
@@ -77,6 +88,9 @@ fails loudly if the jar or a Java runtime is missing; it resolves Java from
 | `start_agent_with_taken_name_clear` | `src/main.rs:7173` | `ClaimNew` guard, `FreeOld` |
 | `envpin_hop_respawn` / `SiteHop` reroute sites | `src/main.rs:7840`, `:7936` | `SpawnNew`, `ClaimNew`, `CloseOld` |
 | reconciler respawn | `src/seat_reconcile.rs` | `CloseOld` (reservations) |
+| `commit_tree` CAS loop | `src/cmd/commit.rs` | `CasOk`, `CasFail`, `Exhaust` |
+| `commit_blobs` splice closure | `src/cmd/commit.rs` | `Refresh` (re-splice on moved parent) |
+| `tracker_blobs_for_bead` | `src/cmd/ship.rs` | `Refresh`, `own(a)` |
 
 ## When to update
 
