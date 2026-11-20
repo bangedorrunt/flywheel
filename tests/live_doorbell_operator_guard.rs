@@ -77,11 +77,61 @@ fn wait_idle(project: &str) {
     panic!("the e2e pane never became idle: {project}");
 }
 
+/// Resolve the throwaway block's concrete id from rex's block list, matching
+/// by id OR label. Ambiguity/zero matches is a typed failure: a live leg that
+/// cannot prove WHICH block it addresses must not type into an arbitrary pane.
+fn resolve_block_id(blocks_json: &str, block: &str) -> Result<String, String> {
+    let doc: serde_json::Value = serde_json::from_str(blocks_json)
+        .map_err(|e| format!("rex block list is not json: {e}"))?;
+    let rows = doc
+        .get("blocks")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "rex block list has no blocks array".to_string())?;
+    let hits: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| {
+            let id = row.get("block_id")?.as_str()?;
+            let label = row
+                .get("label")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if id == block || label == block {
+                Some(id)
+            } else {
+                None
+            }
+        })
+        .collect();
+    match hits.as_slice() {
+        [only] => Ok((*only).to_string()),
+        [] => Err(format!("no live block matches {block:?}")),
+        many => Err(format!("block {block:?} is ambiguous: {many:?}")),
+    }
+}
+
+/// The send result carries the pane it actually dispatched to. Require it to
+/// be the block this test created, so a misdelivery fails loudly instead of
+/// showing up as a confusing screen assertion later.
+fn assert_send_target(send_stdout: &str, expected_block_id: &str) -> Result<(), String> {
+    let doc: serde_json::Value = serde_json::from_str(send_stdout.trim())
+        .map_err(|e| format!("send result is not json: {e}"))?;
+    let pane = doc
+        .get("pane_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "send result has no pane_id".to_string())?;
+    if pane != expected_block_id {
+        return Err(format!(
+            "send dispatched to pane {pane}, not the test block {expected_block_id}"
+        ));
+    }
+    Ok(())
+}
+
 /// What is actually ON the pane, as opposed to send.rs's agent-settle receipt
 /// (a bare zsh pane never settles an agent, so `landed:false` says nothing
 /// about whether the text reached the screen).
-fn pane_capture(session: &str, block: &str) -> String {
-    rex(&["capture", "-s", session, "-b", block])
+fn pane_capture(session: &str, block_id: &str) -> String {
+    rex(&["capture", "-s", session, "-b", block_id])
 }
 
 fn send_probe_with(
@@ -117,8 +167,22 @@ fn a_typed_line_defers_the_wake_and_clearing_it_rings() {
         return;
     };
 
+    // 0. Prove WHICH block we are about to type into and dispatch to. A stale
+    // label or a duplicate block is a hard failure, never a guessed pane.
+    let blocks = rex(&["block", "ls", "-s", &session, "--json"]);
+    let block_id = resolve_block_id(&blocks, &block)
+        .unwrap_or_else(|e| panic!("bd-0kxzw: cannot resolve test block: {e}"));
+    eprintln!("bd-0kxzw: session={session} block_arg={block} block_id={block_id}");
+
     // 1. The operator has half a line: type it, never press Enter.
-    rex(&["send", "-s", &session, "--block", &block, "half typed line"]);
+    rex(&[
+        "send",
+        "-s",
+        &session,
+        "--block",
+        &block_id,
+        "half typed line",
+    ]);
     std::thread::sleep(std::time::Duration::from_millis(800));
 
     // 2. The send door must DEFER — nothing is typed into their line.
@@ -129,6 +193,8 @@ fn a_typed_line_defers_the_wake_and_clearing_it_rings() {
         String::from_utf8_lossy(&deferred.stdout),
         String::from_utf8_lossy(&deferred.stderr)
     );
+    assert_send_target(&String::from_utf8_lossy(&deferred.stdout), &block_id)
+        .unwrap_or_else(|e| panic!("bd-0kxzw: deferred send: {e}"));
     // The send door returns a typed deferral (it does not silently queue like
     // the mail-wake door): nothing was typed, and the command exits non-zero.
     assert!(
@@ -139,7 +205,7 @@ fn a_typed_line_defers_the_wake_and_clearing_it_rings() {
         !deferred.status.success(),
         "a deferred send must not report dispatch: {text}"
     );
-    let before = pane_capture(&session, &block);
+    let before = pane_capture(&session, &block_id);
     if !before.contains("half typed line") || before.contains("live probe: deferral") {
         eprintln!("=== bd-e4gal SCREEN AT SEND ===\n{before}\n=== END SCREEN ===");
         let base = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
@@ -157,7 +223,7 @@ fn a_typed_line_defers_the_wake_and_clearing_it_rings() {
     );
 
     // 3. Clear the line (ctrl+u) and the same send lands.
-    rex(&["send-key", "-s", &session, "--block", &block, "ctrl+u"]);
+    rex(&["send-key", "-s", &session, "--block", &block_id, "ctrl+u"]);
     std::thread::sleep(std::time::Duration::from_millis(800));
     wait_idle(&project);
     let landed = send_probe(&pin, &project, "live probe: ring");
@@ -171,18 +237,76 @@ fn a_typed_line_defers_the_wake_and_clearing_it_rings() {
         "the guard ALLOWS the send once the line is clear: {text}"
     );
     assert!(landed.status.success(), "the send must be accepted: {text}");
+    assert_send_target(&String::from_utf8_lossy(&landed.stdout), &block_id)
+        .unwrap_or_else(|e| panic!("bd-0kxzw: ring send: {e}"));
     // `landed:false` is send.rs's agent-settle receipt (GS-037); a bare zsh
     // pane never settles an agent. The screen is the proof the text landed.
-    let after = pane_capture(&session, &block);
+    // A live agent keeps writing to its own pane, so the wake can be scrolled
+    // off by the next prose burst: poll briefly instead of a one-shot capture.
+    let mut after = String::new();
+    for _ in 0..5 {
+        after = pane_capture(&session, &block_id);
+        if after.contains("live probe: ring") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
     assert!(
         after.contains("live probe: ring"),
-        "the wake must be typed onto the actual pane: {after}"
+        "the wake must be typed onto block {block_id}: {after}"
     );
 }
 
 #[cfg(test)]
 mod send_door_tests {
-    use super::send_probe_with;
+    use super::{assert_send_target, resolve_block_id, send_probe_with};
+
+    /// bd-0kxzw: the capture target must resolve to exactly one live block; a
+    /// stale label or duplicate must fail before any text is typed.
+    #[test]
+    fn the_capture_block_must_resolve_to_one_live_block() {
+        let blocks = r#"{"blocks":[
+            {"block_id":"block:a","label":"AmberProbe"},
+            {"block_id":"block:b","label":"other"}
+        ]}"#;
+        assert_eq!(
+            resolve_block_id(blocks, "AmberProbe").unwrap(),
+            "block:a",
+            "a label resolves to its block id"
+        );
+        assert_eq!(
+            resolve_block_id(blocks, "block:b").unwrap(),
+            "block:b",
+            "an id resolves to itself"
+        );
+        assert!(
+            resolve_block_id(blocks, "missing").is_err(),
+            "a stale block must fail loudly"
+        );
+        let dupe = r#"{"blocks":[
+            {"block_id":"block:a","label":"pin"},
+            {"block_id":"block:b","label":"pin"}
+        ]}"#;
+        assert!(
+            resolve_block_id(dupe, "pin").is_err(),
+            "an ambiguous block must fail loudly"
+        );
+    }
+
+    /// bd-0kxzw: a send dispatched to a different pane is a misdelivery; the
+    /// live leg must name it instead of blaming the screen assertion.
+    #[test]
+    fn a_send_to_the_wrong_pane_fails_loudly() {
+        let good = r#"{"target":"AmberProbe","pane_id":"block:a","dispatched":true}"#;
+        assert!(assert_send_target(good, "block:a").is_ok());
+        let wrong = r#"{"target":"AmberProbe","pane_id":"block:b","dispatched":true}"#;
+        let err = assert_send_target(wrong, "block:a").unwrap_err();
+        assert!(err.contains("block:b") && err.contains("block:a"), "{err}");
+        assert!(
+            assert_send_target("not json", "block:a").is_err(),
+            "a non-json send result must fail loudly"
+        );
+    }
 
     /// bd-oo7zi: flywheel names a rex pane by its BLOCK LABEL, so the harness
     /// must rename the throwaway block to the pin before `send --to PIN` works.

@@ -1302,6 +1302,20 @@ mutations = [
 ]
 
 [[behavior]]
+id = "live.doorbell-block-ids"
+owner = "tests/live_doorbell_operator_guard.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "tests/live_doorbell_operator_guard.rs::the_capture_block_must_resolve_to_one_live_block",
+  "tests/live_doorbell_operator_guard.rs::a_send_to_the_wrong_pane_fails_loudly",
+]
+mutations = [
+  "scripts/mutations/live-doorbell-block-ids.spec.sh#B1",
+  "scripts/mutations/live-doorbell-block-ids.spec.sh#B2",
+]
+
+[[behavior]]
 id = "events.token-provisioning"
 owner = "src/events_tokens.rs"
 status = "proven"
