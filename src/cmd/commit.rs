@@ -232,8 +232,9 @@ fn refuse_foreign_stage(shared: &Git<'_>, paths: &[String]) -> Result<()> {
 /// Warn when the SHARED index holds a staged entry for a path outside this
 /// commit whose blob came from an ancestor of HEAD, not from HEAD: a stale
 /// stage that a later plain commit would revert (bd-j1g64).
-fn warn_stale_stage(shared: &Git<'_>, paths: &[String]) -> Result<()> {
+fn stale_stage_warnings(shared: &Git<'_>, paths: &[String]) -> Result<Vec<String>> {
     let staged = shared.out(&["diff", "--cached", "--name-only"])?;
+    let mut warnings = Vec::new();
     let ancestors = shared
         .out(&["rev-list", "--max-count=32", "HEAD^"])
         .unwrap_or_default(); // a one-commit repo has no ancestor to be stale from
@@ -257,14 +258,21 @@ fn warn_stale_stage(shared: &Git<'_>, paths: &[String]) -> Result<()> {
             if let Ok(blob) = shared.out(&["rev-parse", &format!("{rev}:{line}")])
                 && blob == staged_blob
             {
-                eprintln!(
+                warnings.push(format!(
                     "flywheel commit: WARNING: shared index has a stale stage for {line} \
                      (blob from {rev}, not HEAD) — a later plain commit would revert it; \
                      mail the holder"
-                );
+                ));
                 break;
             }
         }
+    }
+    Ok(warnings)
+}
+
+fn warn_stale_stage(shared: &Git<'_>, paths: &[String]) -> Result<()> {
+    for warning in stale_stage_warnings(shared, paths)? {
+        eprintln!("{warning}");
     }
     Ok(())
 }
@@ -563,6 +571,31 @@ mod tests {
             fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         git(dir, &["config", "core.hooksPath", "scripts/hooks"]);
+    }
+
+    #[test]
+    fn a_stale_shared_stage_is_reported() {
+        let dir = scratch_repo("stale-stage");
+        fs::write(dir.join("base.txt"), "changed\n").unwrap();
+        git(&dir, &["add", "base.txt"]);
+        git(&dir, &["commit", "-qm", "second"]);
+        let old = git(&dir, &["rev-parse", "HEAD^:base.txt"]);
+        git(
+            &dir,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{old},base.txt"),
+            ],
+        );
+        let warnings = stale_stage_warnings(&Git::shared(&dir), &["ours.txt".into()]).unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("base.txt") && w.contains("stale")),
+            "the stale stage must be reported: {warnings:?}"
+        );
     }
 
     #[test]
