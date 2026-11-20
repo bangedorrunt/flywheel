@@ -208,23 +208,71 @@ fn build_blobs_tree(
     private.out(&["write-tree"])
 }
 
-/// Never strip or restore a neighbour's hunks: refuse when a named path is
-/// already staged in the shared index, naming it so the holder can be mailed.
-fn refuse_foreign_stage(shared: &Git<'_>, paths: &[String]) -> Result<()> {
-    let staged = shared.out(&["diff", "--cached", "--name-only"])?;
-    let conflict: Vec<&str> = staged
-        .lines()
-        .filter(|line| {
-            paths
-                .iter()
-                .any(|p| *line == p.as_str() || line.starts_with(format!("{p}/").as_str()))
-        })
-        .collect();
+/// True when `path` is one of the named paths (or below a named directory).
+fn is_named(path: &str, paths: &[String]) -> bool {
+    paths
+        .iter()
+        .any(|p| path == p.as_str() || path.starts_with(format!("{p}/").as_str()))
+}
+
+/// Never strip a neighbour's INTENTIONAL hunks: refuse when a named path is
+/// staged with a blob that is not the old parent's (bd-j1g64). A stage that is
+/// merely the old parent's blob, or a stale deletion, is tolerated and returned
+/// so the caller can point it at the blob this commit lands after CAS.
+fn refuse_foreign_stage(shared: &Git<'_>, paths: &[String], parent: &str) -> Result<Vec<String>> {
+    let staged = shared.out(&["diff", "--cached", "--name-status"])?;
+    let mut stale = Vec::new();
+    let mut conflict = Vec::new();
+    for line in staged.lines() {
+        let mut fields = line.split('\t');
+        let status = fields.next().unwrap_or("");
+        for path in fields {
+            if !is_named(path, paths) {
+                continue;
+            }
+            let stale_delete = status.starts_with('D');
+            let parent_blob = shared
+                .out(&["rev-parse", &format!("{parent}:{path}")])
+                .unwrap_or_default();
+            let staged_blob = shared
+                .out(&["rev-parse", &format!(":{path}")])
+                .unwrap_or_default();
+            if stale_delete || (!parent_blob.is_empty() && staged_blob == parent_blob) {
+                if !stale.iter().any(|p: &String| p == path) {
+                    stale.push(path.to_string());
+                }
+            } else {
+                conflict.push(path.to_string());
+            }
+        }
+    }
     if !conflict.is_empty() {
         bail!(
             "named path(s) already staged in the shared index (another lane's hunks?): {} — mail the holder, do not strip them",
             conflict.join(", ")
         );
+    }
+    Ok(stale)
+}
+
+/// After a successful CAS, point each tolerated stale shared-index entry at
+/// the blob this commit landed. Only paths `refuse_foreign_stage` cleared are
+/// touched, so a neighbour's intentional stage is never overwritten (bd-j1g64).
+fn sync_stale_stage(shared: &Git<'_>, stale: &[String], commit: &str) -> Result<()> {
+    for path in stale {
+        let entry = shared.out(&["ls-tree", commit, "--", path])?;
+        let mut parts = entry.split_whitespace();
+        let mode = parts.next().unwrap_or("100644");
+        let _kind = parts.next();
+        let Some(blob) = parts.next() else {
+            continue; // the commit deleted this path; nothing to stage
+        };
+        shared.ok(&[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("{mode},{blob},{path}"),
+        ])?;
     }
     Ok(())
 }
@@ -286,7 +334,7 @@ where
 {
     let shared = Git::shared(repo);
     let old_head = shared.out(&["rev-parse", "HEAD"])?;
-    refuse_foreign_stage(&shared, paths)?;
+    let stale = refuse_foreign_stage(&shared, paths, &old_head)?;
     warn_stale_stage(&shared, paths)?;
 
     let unique = format!(
@@ -310,6 +358,7 @@ where
         let commit = shared.out(&["commit-tree", &tree, "-p", &parent, "-m", message])?;
         let update = shared.run(&["update-ref", "HEAD", &commit, &parent])?;
         if update.status.success() {
+            sync_stale_stage(&shared, &stale, &commit)?;
             return Ok(commit);
         }
         let moved = shared.out(&["rev-parse", "HEAD"])?;
@@ -547,6 +596,47 @@ mod tests {
                 .lines()
                 .any(|line| line == "ours.txt"),
             "the neighbour's staged hunk must be untouched"
+        );
+    }
+
+    #[test]
+    fn a_stale_stage_on_a_named_path_is_rewritten_to_the_new_blob() {
+        let dir = scratch_repo("stale-sync");
+        let parent_blob = git(&dir, &["rev-parse", "HEAD:base.txt"]);
+        // Stage the parent's blob back into the shared index: a stale stage.
+        git(
+            &dir,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{parent_blob},base.txt"),
+            ],
+        );
+        // The worktree carries the new content this commit lands.
+        fs::write(dir.join("base.txt"), "new\n").unwrap();
+        let sha = commit_paths(&dir, &["base.txt".into()], "new base").unwrap();
+        let new_blob = git(&dir, &["rev-parse", &format!("{sha}:base.txt")]);
+        assert_eq!(
+            git(&dir, &["rev-parse", ":base.txt"]),
+            new_blob,
+            "the stale stage must point at the committed blob"
+        );
+        assert_ne!(new_blob, parent_blob, "the stale blob must be gone");
+    }
+
+    #[test]
+    fn a_stale_delete_on_a_named_path_is_restored_to_the_new_blob() {
+        let dir = scratch_repo("stale-del");
+        // Stage a deletion (a stale delete) of the named path.
+        git(&dir, &["rm", "--cached", "-q", "base.txt"]);
+        fs::write(dir.join("base.txt"), "restored\n").unwrap();
+        let sha = commit_paths(&dir, &["base.txt".into()], "restore").unwrap();
+        let new_blob = git(&dir, &["rev-parse", &format!("{sha}:base.txt")]);
+        assert_eq!(
+            git(&dir, &["rev-parse", ":base.txt"]),
+            new_blob,
+            "the stale delete must be restored to the committed blob"
         );
     }
 
