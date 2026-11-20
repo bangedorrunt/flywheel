@@ -67,13 +67,20 @@ exit 2
         argv.contains("events token mint --pin ClaudeSeat --project flywheel"),
         "mint argv: {argv}"
     );
-    assert!(!argv.contains("SECRET-PLAINTEXT"), "no secret on argv: {argv}");
+    assert!(
+        !argv.contains("SECRET-PLAINTEXT"),
+        "no secret on argv: {argv}"
+    );
 
     // The token file lives under the seat's state dir, 0600, plaintext inside.
     let token_file = sandbox
         .root()
         .join("state/flywheel/events-tokens/flywheel-ClaudeSeat.token");
-    assert!(token_file.is_file(), "token file missing: {}", token_file.display());
+    assert!(
+        token_file.is_file(),
+        "token file missing: {}",
+        token_file.display()
+    );
     assert_eq!(
         std::fs::read_to_string(&token_file).expect("token"),
         "SECRET-PLAINTEXT-42"
@@ -108,8 +115,12 @@ exit 2
     );
 
     // The journal has the hash but no plaintext.
-    let journal = std::fs::read_to_string(sandbox.root().join("state/flywheel/events-token-journal.jsonl"))
-        .expect("journal");
+    let journal = std::fs::read_to_string(
+        sandbox
+            .root()
+            .join("state/flywheel/events-token-journal.jsonl"),
+    )
+    .expect("journal");
     assert!(journal.contains("mint-intent") && journal.contains("minted"));
     assert!(
         !journal.contains("SECRET-PLAINTEXT"),

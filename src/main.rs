@@ -14379,7 +14379,9 @@ fn cmd_mcp_events(_cfg: &Config, subscription: &str) -> Result<()> {
             }
         }
         None => {
-            eprintln!("flywheel mcp-events: FLYWHEEL_TORON_TOKEN_FILE unset; no events will arrive");
+            eprintln!(
+                "flywheel mcp-events: FLYWHEEL_TORON_TOKEN_FILE unset; no events will arrive"
+            );
             Box::new(events_bridge::NoopTransport)
         }
     };
@@ -18000,7 +18002,10 @@ fn toron_setup_mcp(
 /// The claude/channel MCP server entry (bd-si4b5 Phase B). The bridge runs as
 /// `flywheel mcp-events --subscription <pin>` over stdio; it emits only the D2
 /// hint, never the event body. Kept pure so a unit test pins the wire shape.
-pub(crate) fn claude_channel_server(subscription: &str, token_path: Option<&str>) -> serde_json::Value {
+pub(crate) fn claude_channel_server(
+    subscription: &str,
+    token_path: Option<&str>,
+) -> serde_json::Value {
     let mut server = serde_json::json!({
         "command": "flywheel",
         "args": ["mcp-events", "--subscription", subscription],
@@ -18019,8 +18024,7 @@ pub(crate) fn claude_channel_server(subscription: &str, token_path: Option<&str>
 fn upsert_claude_channel(path: &std::path::Path, dry: bool) -> Result<String> {
     let subscription =
         std::env::var("FLYWHEEL_MCP_SUBSCRIPTION").unwrap_or_else(|_| "default".to_string());
-    let project =
-        std::env::var("FLYWHEEL_MCP_PROJECT").unwrap_or_else(|_| "flywheel".to_string());
+    let project = std::env::var("FLYWHEEL_MCP_PROJECT").unwrap_or_else(|_| "flywheel".to_string());
     let token_path = events_tokens::token_path(&config::state_dir(), &project, &subscription);
     let token_path_str = token_path.display().to_string();
 

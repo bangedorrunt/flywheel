@@ -45,15 +45,13 @@ pub struct RotationPlan {
     pub ttl_secs: u64,
 }
 
-pub fn rotation_plan(
-    state: &TokenState,
-    now_us: i64,
-    before_us: i64,
-) -> Option<RotationPlan> {
-    state.needs_rotation(now_us, before_us).then(|| RotationPlan {
-        revoke_hash: state.hash.clone(),
-        ttl_secs: PIN_TTL_SECS,
-    })
+pub fn rotation_plan(state: &TokenState, now_us: i64, before_us: i64) -> Option<RotationPlan> {
+    state
+        .needs_rotation(now_us, before_us)
+        .then(|| RotationPlan {
+            revoke_hash: state.hash.clone(),
+            ttl_secs: PIN_TTL_SECS,
+        })
 }
 
 /// SHA-256 of the plaintext — exactly toron's `hash_token`, so the revoke hash
@@ -109,10 +107,9 @@ impl TokenEvent {
                 "mint-intent",
                 json!({"pin": pin, "project": project, "ttl_secs": ttl_secs}),
             ),
-            Self::Minted { hash, expires_us } => (
-                "minted",
-                json!({"hash": hash, "expires_us": expires_us}),
-            ),
+            Self::Minted { hash, expires_us } => {
+                ("minted", json!({"hash": hash, "expires_us": expires_us}))
+            }
             Self::RevokeIntent { hash } => ("revoke-intent", json!({"hash": hash})),
             Self::Revoked { hash } => ("revoked", json!({"hash": hash})),
         };
@@ -380,9 +377,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let token_file = dir.path().join("seat.token");
         let journal_file = dir.path().join("journal.jsonl");
-        let cli = FakeCli {
-            minted: vec![],
-        };
+        let cli = FakeCli { minted: vec![] };
         let state = mint_and_store(
             &cli,
             "Seat",
@@ -408,7 +403,10 @@ mod tests {
             assert_eq!(mode, 0o600, "the token file must be 0600: {mode:o}");
         }
         let journal = std::fs::read_to_string(&journal_file).expect("journal");
-        assert!(!journal.contains("secret-token"), "no plaintext in journal: {journal}");
+        assert!(
+            !journal.contains("secret-token"),
+            "no plaintext in journal: {journal}"
+        );
         assert!(journal.contains("mint-intent") && journal.contains("minted"));
         assert!(journal.contains(&state.hash));
     }
@@ -442,9 +440,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let token_file = dir.path().join("seat.token");
         let journal_file = dir.path().join("journal.jsonl");
-        let cli = FakeCli {
-            minted: vec![],
-        };
+        let cli = FakeCli { minted: vec![] };
         let plan = RotationPlan {
             revoke_hash: "old-hash".into(),
             ttl_secs: PIN_TTL_SECS,
