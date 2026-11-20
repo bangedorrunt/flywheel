@@ -32,8 +32,8 @@ mutation "P2  stream frames ignore the subscription routing" \
 mutation "P3  a failed stream never falls back to poll" \
     file=src/events_client.rs \
     expect=a_stream_failure_falls_back_to_poll \
-    find='            Ok(None) | Err(_) => {' \
-    replace='            Ok(None) => {'
+    find='                Ok(page_from_poll(&result))' \
+    replace='                Err("poll fallback disabled".to_string())'
 
 mutation "P4  a stream gap frame is dropped" \
     file=src/events_client.rs \
