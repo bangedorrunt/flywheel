@@ -11,7 +11,12 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone)]
 pub enum Effect {
     /// The only delivery intent; sinks translate it (P1 corollary).
-    Prompt { pin: String, line: String },
+    Prompt {
+        pin: String,
+        line: String,
+        /// The bus event id to claim before this Prompt is delivered.
+        event_id: Option<String>,
+    },
     /// Fetch plane-P inbox off-loop; rows re-enter as `InboxFetched`.
     /// Signal only (bd-z5ou): per-pin cursors live in the brain.
     FetchInbox,
@@ -322,7 +327,11 @@ impl CoreReducer {
         actions
             .into_iter()
             .map(|a| match a {
-                DoorbellAction::Prompt { pin, line } => Effect::Prompt { pin, line },
+                DoorbellAction::Prompt { pin, line } => Effect::Prompt {
+                    event_id: doorbell_core::watch_id(&line),
+                    pin,
+                    line,
+                },
                 DoorbellAction::FetchInbox => Effect::FetchInbox,
                 DoorbellAction::CheckAckSla => Effect::CheckAckSla,
                 DoorbellAction::RestartWatch => Effect::RestartWatch,

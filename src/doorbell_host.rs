@@ -1063,6 +1063,7 @@ fn unix_now() -> u64 {
 
 /// bd-tdpix: a LOST atomic claim emits no Prompt. Pure over the effect list so
 /// the ordering (claim before ring) is witnessable without a live host.
+#[cfg(test)]
 pub(crate) fn gate_prompt_on_claim(claimed: bool, effects: Vec<Effect>) -> Vec<Effect> {
     if claimed {
         effects
@@ -1078,28 +1079,40 @@ pub(crate) fn gate_prompt_on_claim(claimed: bool, effects: Vec<Effect>) -> Vec<E
 /// line's Prompt. A deferred-but-gated line leaves the marker free for the
 /// native path to ring; when the deferral later rings, the same line arrives
 /// with a Prompt and claims then (bd-tdpix review).
+#[cfg(test)]
 pub(crate) fn claim_and_gate(
     state_dir: &std::path::Path,
-    line: &str,
+    _line: &str,
     effects: Vec<Effect>,
 ) -> Vec<Effect> {
-    let has_prompt = effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::Prompt { line: pl, .. } if pl == line));
-    if !has_prompt {
-        return effects;
-    }
-    match doorbell_core::watch_id(line) {
-        Some(id) if crate::wake_rung::claim(state_dir, &id) => effects,
-        Some(_) => crate::doorbell_host::gate_prompt_on_claim(false, effects),
-        None => effects,
-    }
+    claim_all_prompts(state_dir, effects)
 }
 
-fn cmds_to_effects(cmds: Vec<workspace::Cmd>) -> Vec<Effect> {
+/// Every Prompt that carries a bus event id claims before delivery —
+/// immediate, deferred, stalled or boot-drained. A lost claim drops only that
+/// Prompt; other effects and id-less Prompts pass through (bd-tdpix).
+pub(crate) fn claim_all_prompts(state_dir: &std::path::Path, effects: Vec<Effect>) -> Vec<Effect> {
+    effects
+        .into_iter()
+        .filter(|effect| match effect {
+            Effect::Prompt {
+                event_id: Some(id), ..
+            } => crate::wake_rung::claim(state_dir, id),
+            _ => true,
+        })
+        .collect()
+}
+
+fn cmds_to_effects(cmds: Vec<workspace::Cmd>, watch_id: Option<&str>) -> Vec<Effect> {
     cmds.into_iter()
         .filter_map(|c| match c {
-            workspace::Cmd::Prompt { pin, line } => Some(Effect::Prompt { pin, line }),
+            workspace::Cmd::Prompt { pin, line } => Some(Effect::Prompt {
+                // The composed line may carry `event=<id>`; otherwise the
+                // immediate Watch id is carried explicitly (bd-tdpix).
+                event_id: doorbell_core::watch_id(&line).or_else(|| watch_id.map(str::to_string)),
+                pin,
+                line,
+            }),
             workspace::Cmd::FetchInbox => Some(Effect::FetchInbox),
             workspace::Cmd::CheckAckSla => Some(Effect::CheckAckSla),
             workspace::Cmd::RestartWatch => Some(Effect::RestartWatch),
@@ -1143,6 +1156,10 @@ impl Host for RtHost {
         // micros. A mail watch at or below it is already pulled and must not
         // ring an empty wake. Cheap local read; no toron round trip.
         let state_dir = config::state_dir();
+        let current_watch_id = match &msg {
+            BrainMsg::Watch(line) => doorbell_core::watch_id(line),
+            _ => None,
+        };
         for entry in state::load_spawn_registry(&self.project) {
             let Some(pin) = entry.mail_identity else {
                 continue;
@@ -1282,7 +1299,7 @@ impl Host for RtHost {
                         },
                     );
                     self.model = next;
-                    boot_drain_effects.extend(cmds_to_effects(drain_cmds));
+                    boot_drain_effects.extend(cmds_to_effects(drain_cmds, None));
                 }
             }
             let mut journaled = true;
@@ -1352,14 +1369,14 @@ impl Host for RtHost {
         {
             eprintln!("flywheel: run-state boundary not recorded: {refusal}");
         }
-        let mut effects = cmds_to_effects(cmds);
+        let mut effects = cmds_to_effects(cmds, current_watch_id.as_deref());
         // bd-tdpix: claim the shared bus-event marker BEFORE any Prompt is
         // emitted; a lost claim drops the Prompt from this tick. The boot drain
         // carries no event id and is appended after the gate.
-        if let BrainMsg::Watch(line) = msg {
-            effects = claim_and_gate(&config::state_dir(), line, effects);
-        }
         effects.extend(boot_drain_effects);
+        // bd-tdpix: claim at delivery time for EVERY path, including deferred
+        // and boot-drained Prompts that arrive outside the Watch arm.
+        effects = claim_all_prompts(&config::state_dir(), effects);
         if matches!(msg, BrainMsg::Sweep { .. }) {
             // bd-tdpix: bound the shared claim directory on every sweep.
             let _ = crate::wake_rung::sweep(
@@ -1367,11 +1384,13 @@ impl Host for RtHost {
                 crate::wake_rung::WAKE_RUNG_TTL_SECS,
                 unix_now(),
             );
-            effects.extend(
-                self.pending_conflict_prompts
-                    .drain(..)
-                    .map(|(pin, line)| Effect::Prompt { pin, line }),
-            );
+            effects.extend(self.pending_conflict_prompts.drain(..).map(|(pin, line)| {
+                Effect::Prompt {
+                    event_id: doorbell_core::watch_id(&line),
+                    pin,
+                    line,
+                }
+            }));
             effects.extend(self.stalled_deferrals());
         }
         effects
@@ -2125,6 +2144,53 @@ mod parity_tests {
     }
 
     #[test]
+    fn a_real_watch_line_through_the_fold_carries_and_claims_its_event_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let line = serde_json::json!({
+            "kind": 9,
+            "id": "bus-fold-42",
+            "tags": [["p", "PinA"], ["toron-kind", "ack-sla-expired"], ["mid", "msg-fold-42"]],
+            "content": "sealed"
+        })
+        .to_string();
+        let mut model = crate::workspace::WorkspaceModel::default();
+        model.doorbell.index.insert_pin("PinA".into(), None);
+        model.roles.insert("captain".into(), "PinA".into());
+        model.doorbell.statuses.insert("PinA".into(), "idle".into());
+        model
+            .presence
+            .insert("PinA".into(), crate::workspace::Presence::from_str("idle"));
+        let (_, cmds) = crate::workspace::tick(
+            &model,
+            &crate::workspace::Msg::WatchNdjson { line: line.clone() },
+        );
+        let effects = super::cmds_to_effects(cmds, Some("bus-fold-42"));
+        let carried = effects.iter().find_map(|effect| match effect {
+            Effect::Prompt { event_id, .. } => event_id.clone(),
+            _ => None,
+        });
+        assert_eq!(
+            carried.as_deref(),
+            Some("bus-fold-42"),
+            "the fold carries the bus id; effects={effects:?}"
+        );
+        // Native already claimed: the doorbell must stay silent for this event.
+        assert!(crate::wake_rung::claim(dir.path(), "bus-fold-42"));
+        let silent = super::claim_all_prompts(dir.path(), effects.clone());
+        assert!(!silent.iter().any(|e| matches!(e, Effect::Prompt { .. })));
+        // With a free marker, the same folded effects ring exactly once.
+        let free = tempfile::tempdir().expect("tempdir");
+        let rang = super::claim_all_prompts(free.path(), effects);
+        assert_eq!(
+            rang.iter()
+                .filter(|e| matches!(e, Effect::Prompt { .. }))
+                .count(),
+            1,
+            "one event -> one ring"
+        );
+    }
+
+    #[test]
     fn a_watch_line_without_a_prompt_leaves_the_claim_free() {
         let dir = tempfile::tempdir().expect("tempdir");
         let line = doorbell_core::doorbell_line_with_event(
@@ -2150,6 +2216,7 @@ mod parity_tests {
             "evt-deferred",
         );
         let effects = vec![Effect::Prompt {
+            event_id: doorbell_core::watch_id(&line),
             pin: "ScarletCove".into(),
             line: line.clone(),
         }];
@@ -2167,6 +2234,7 @@ mod parity_tests {
     fn a_lost_claim_emits_no_prompt() {
         let effects = vec![
             Effect::Prompt {
+                event_id: None,
                 pin: "ScarletCove".into(),
                 line: "wake".into(),
             },

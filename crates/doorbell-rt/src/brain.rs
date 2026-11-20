@@ -682,7 +682,7 @@ impl<H: Host> Brain<H> {
         let raw: Vec<(String, String)> = effects
             .iter()
             .filter_map(|e| match e {
-                Effect::Prompt { pin, line } => Some((pin.clone(), line.clone())),
+                Effect::Prompt { pin, line, .. } => Some((pin.clone(), line.clone())),
                 _ => None,
             })
             .collect();
@@ -979,6 +979,7 @@ impl<H: Host> Brain<H> {
             let line = escalation.line();
             match &captain {
                 Some(pin) => effects.push(Effect::Prompt {
+                    event_id: doorbell_core::watch_id(&line),
                     pin: pin.clone(),
                     line,
                 }),
@@ -1346,7 +1347,7 @@ impl<H: Host> Brain<H> {
             effects
                 .iter()
                 .map(|e| match e {
-                    Effect::Prompt { pin, line } => {
+                    Effect::Prompt { pin, line, .. } => {
                         serde_json::json!({"Prompt": {"pin": pin, "line": line}})
                     }
                     Effect::FetchInbox => {
@@ -1501,7 +1502,7 @@ impl<H: Host> Brain<H> {
         effects
             .iter()
             .filter_map(|e| match e {
-                Effect::Prompt { pin, line } => Some((pin.clone(), line.clone())),
+                Effect::Prompt { pin, line, .. } => Some((pin.clone(), line.clone())),
                 _ => None,
             })
             .collect()
@@ -2561,14 +2562,17 @@ mod tests {
             let mut host = MockHost::new(1_000_000);
             host.script = VecDeque::from(vec![
                 vec![Effect::Prompt {
+                    event_id: None,
                     pin: "p".into(),
                     line: "m1".into(),
                 }],
                 vec![Effect::Prompt {
+                    event_id: None,
                     pin: "p".into(),
                     line: "m2".into(),
                 }],
                 vec![Effect::Prompt {
+                    event_id: None,
                     pin: "p".into(),
                     line: "m3".into(),
                 }],
@@ -2767,6 +2771,7 @@ mod tests {
     #[tokio::test]
     async fn decided_before_delivery_write_ahead() {
         let prompt = Effect::Prompt {
+            event_id: None,
             pin: "p".into(),
             line: "[doorbell] test".into(),
         };
@@ -2885,6 +2890,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_write_ahead_flush_is_named_and_delivery_survives() {
         let prompt = Effect::Prompt {
+            event_id: None,
             pin: "p".into(),
             line: "[doorbell] write-ahead".into(),
         };
@@ -2952,10 +2958,12 @@ mod tests {
             "same-second",
             vec![
                 vec![Effect::Prompt {
+                    event_id: None,
                     pin: "p".into(),
                     line: "first".into(),
                 }],
                 vec![Effect::Prompt {
+                    event_id: None,
                     pin: "p".into(),
                     line: "second".into(),
                 }],
@@ -3071,6 +3079,7 @@ mod tests {
     async fn budget_cuts_fourth_prompt_in_window() {
         let prompts = (0..4)
             .map(|i| Effect::Prompt {
+                event_id: None,
                 pin: "p".into(),
                 line: format!("m{i}"),
             })
@@ -3107,6 +3116,7 @@ mod tests {
     async fn parity_same_log_same_journal_modulo_ts() {
         async fn run_once(tag: &str) -> String {
             let prompt = Effect::Prompt {
+                event_id: None,
                 pin: "p".into(),
                 line: "[doorbell] ring".into(),
             };
@@ -3247,18 +3257,22 @@ mod tests {
             let mut host = MockHost::new(1_000_000);
             host.script = VecDeque::from(vec![
                 vec![Effect::Prompt {
+                    event_id: None,
                     pin: "p".into(),
                     line: "m1".into(),
                 }],
                 vec![Effect::Prompt {
+                    event_id: None,
                     pin: "p".into(),
                     line: "m2".into(),
                 }],
                 vec![Effect::Prompt {
+                    event_id: None,
                     pin: "p".into(),
                     line: "m3".into(),
                 }],
                 vec![Effect::Prompt {
+                    event_id: None,
                     pin: "p".into(),
                     line: "m4".into(),
                 }],
@@ -3349,12 +3363,14 @@ mod tests {
         let t = 1_700_000_000u64;
         let one = |line: &str| {
             vec![Effect::Prompt {
+                event_id: None,
                 pin: "p".into(),
                 line: line.into(),
             }]
         };
         let burn_window: Vec<Effect> = (0..4)
             .map(|i| Effect::Prompt {
+                event_id: None,
                 pin: "p".into(),
                 line: format!("m{i}"),
             })
@@ -3694,6 +3710,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(crate::BRAIN_CAP);
         let mut host = MockHost::new(1_000_000);
         host.script = VecDeque::from(vec![vec![Effect::Prompt {
+            event_id: None,
             pin: "human".into(),
             line: "[doorbell] hold expired".into(),
         }]]);

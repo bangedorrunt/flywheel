@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 fn effect_json(e: &doorbell_rt::Effect) -> Value {
     match e {
-        doorbell_rt::Effect::Prompt { pin, line } => {
+        doorbell_rt::Effect::Prompt { pin, line, .. } => {
             json!({"Prompt": {"pin": pin, "line": line}})
         }
         doorbell_rt::Effect::Digest { pin, line, why } => {

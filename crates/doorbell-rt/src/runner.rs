@@ -230,6 +230,7 @@ mod tests {
         let mut host = MockHost::new(1);
         for i in 0..3 {
             host.script.push_back(vec![Effect::Prompt {
+                event_id: None,
                 pin: "p".into(),
                 line: format!("line-{i}"),
             }]);

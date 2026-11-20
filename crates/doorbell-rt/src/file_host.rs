@@ -1587,7 +1587,7 @@ impl FileHost {
             .into_iter()
             .flat_map(|e| match e {
                 // governed-by: bd-fuql — ONE routing decide: presence ×
-                Effect::Prompt { pin, line } => {
+                Effect::Prompt { pin, line, .. } => {
                     let now = Self::now_unix();
                     let presence_stale = self
                         .presence_ts
@@ -1627,7 +1627,11 @@ impl FileHost {
                     match decision {
                         Some(decision) => match decision {
                             doorbell_core::wake_core::GateDecision::Inject { pin, line } => {
-                                vec![Effect::Prompt { pin, line }]
+                                vec![Effect::Prompt {
+                                    event_id: doorbell_core::watch_id(&line),
+                                    pin,
+                                    line,
+                                }]
                             }
                             doorbell_core::wake_core::GateDecision::Digest { pin, reason } => {
                                 vec![
@@ -1681,7 +1685,11 @@ impl FileHost {
         actions
             .into_iter()
             .map(|a| match a {
-                doorbell_core::DoorbellAction::Prompt { pin, line } => Effect::Prompt { pin, line },
+                doorbell_core::DoorbellAction::Prompt { pin, line } => Effect::Prompt {
+                    event_id: doorbell_core::watch_id(&line),
+                    pin,
+                    line,
+                },
                 doorbell_core::DoorbellAction::FetchInbox => Effect::FetchInbox,
                 doorbell_core::DoorbellAction::CheckAckSla => Effect::CheckAckSla,
                 doorbell_core::DoorbellAction::RestartWatch => Effect::RestartWatch,
@@ -1764,6 +1772,7 @@ impl Host for FileHost {
                     && self.presence.get(&pin) == Some(&PresenceVerdict::Idle)
                 {
                     self.apply_presence_filter(vec![Effect::Prompt {
+                        event_id: None,
                         pin,
                         line: doorbell_core::fact_prompt_line(summary),
                     }])
@@ -1816,9 +1825,11 @@ impl Host for FileHost {
                 actions
                     .into_iter()
                     .map(|a| match a {
-                        doorbell_core::DoorbellAction::Prompt { pin, line } => {
-                            Effect::Prompt { pin, line }
-                        }
+                        doorbell_core::DoorbellAction::Prompt { pin, line } => Effect::Prompt {
+                            event_id: doorbell_core::watch_id(&line),
+                            pin,
+                            line,
+                        },
                         doorbell_core::DoorbellAction::Audit { kind, pin, detail } => {
                             Effect::Audit {
                                 kind,
@@ -3203,7 +3214,7 @@ mod tests {
         });
         assert_eq!(fx.len(), 1, "captain fact over idle must prompt: {fx:?}");
         match &fx[0] {
-            Effect::Prompt { pin, line } => {
+            Effect::Prompt { pin, line, .. } => {
                 assert_eq!(pin, "PinA");
                 assert!(line.contains("[doorbell]"));
             }
@@ -3239,7 +3250,7 @@ mod tests {
         assert!(
             fx.iter().any(|e| matches!(
                 e,
-                Effect::Prompt { pin, line } if pin == "PinA" && line == "[doorbell] bead bd-new ready"
+                Effect::Prompt { event_id: _, pin, line } if pin == "PinA" && line == "[doorbell] bead bd-new ready"
             )),
             "ready-bead event must wake the idle captain: {fx:?}"
         );
