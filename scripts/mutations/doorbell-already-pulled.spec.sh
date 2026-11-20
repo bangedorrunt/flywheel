@@ -3,7 +3,7 @@
 # passed the mail that queued it. Both mutants restore a spurious ring.
 
 CARGO_ARGS=(--bin flywheel)
-TEST_FILTER=(already_pulled_decision_table a_stale_deferral_is_dropped_and_journaled)
+TEST_FILTER=(already_pulled_decision_table a_stale_deferral_is_dropped_and_journaled a_pulled_deferral_does_not_ring_at_idle)
 
 mutation "R1  the cursor comparison is ignored" \
     file=src/doorbell.rs \
