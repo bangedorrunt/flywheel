@@ -14420,6 +14420,31 @@ fn cmd_mcp_events(_cfg: &Config, subscription: &str) -> Result<()> {
                 writeln!(out, "{}", msg)?;
                 out.flush()?;
             }
+            "events/list" => {
+                let mut msg = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "result": events_bridge::native_list_result(),
+                });
+                if let Some(rid) = id {
+                    msg["id"] = rid;
+                }
+                writeln!(out, "{}", msg)?;
+                out.flush()?;
+            }
+            "events/subscribe" => {
+                // The upstream subscription is already open; echo the pin as
+                // the local subscription id (bd-o1z4m).
+                let expires_us = chrono::Utc::now().timestamp_micros() + 86_400_000_000;
+                let mut msg = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "result": events_bridge::native_subscribe_result(subscription, &cursor, expires_us),
+                });
+                if let Some(rid) = id {
+                    msg["id"] = rid;
+                }
+                writeln!(out, "{}", msg)?;
+                out.flush()?;
+            }
             "events/poll" => {
                 let timing = events_bridge::BridgeTiming {
                     last_hb_ms: 0,
@@ -14440,7 +14465,19 @@ fn cmd_mcp_events(_cfg: &Config, subscription: &str) -> Result<()> {
                         // replays from the old cursor and eventId dedupe absorbs
                         // the duplicate (ADR-0039 D8).
                         for notice in step.notifications {
-                            writeln!(out, "{}", notice)?;
+                            let event_id = notice
+                                .get("params")
+                                .and_then(|p| p.get("meta"))
+                                .and_then(|m| m.get("event_id"))
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("");
+                            // bd-o1z4m: one ring per bus event id, even if the
+                            // doorbell fallback also delivers this event.
+                            if event_id.is_empty()
+                                || events_bridge::rung_once(&config::state_dir(), event_id)
+                            {
+                                writeln!(out, "{}", notice)?;
+                            }
                         }
                         out.flush()?;
                         if step

@@ -404,6 +404,72 @@ impl EventsTransport for NoopTransport {
     }
 }
 
+/// bd-o1z4m: claim one ring per bus event id across the native stream and the
+/// doorbell fallback. `create_new` is the atomic test-and-set, so whichever
+/// path delivers first rings and the other stays silent.
+pub fn rung_once(state_dir: &std::path::Path, event_id: &str) -> bool {
+    let safe: String = event_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let dir = state_dir.join("events-rung");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    let path = dir.join(format!("{safe}.rung"));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .is_ok()
+}
+
+/// bd-o1z4m: the stdio proxy answers `events/list` locally so opencode's
+/// native client can discover subscriptions before it subscribes.
+pub fn native_list_result() -> serde_json::Value {
+    let names = [
+        "mail.addressed",
+        "reservation.conflict",
+        "ack_sla_expired",
+        "role.changed",
+        "policy.changed",
+        "gap",
+    ];
+    let rows: Vec<serde_json::Value> = names
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "name": name,
+                "description": name,
+                "delivery": ["poll"],
+                "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}}},
+                "payloadSchema": {"type": "object", "properties": {"event_id": {"type": "string"}}},
+            })
+        })
+        .collect();
+    serde_json::json!({ "events": rows })
+}
+
+/// The local subscription result echoes the pin as the subscription id; the
+/// upstream toron subscription was already opened at proxy startup.
+pub fn native_subscribe_result(
+    subscription: &str,
+    cursor: &str,
+    expires_us: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": subscription,
+        "expiresAt": expires_us,
+        "cursor": cursor,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,6 +741,87 @@ mod tests {
         assert_eq!(modern["protocolVersion"], FALLBACK_REVISION);
         let none = initialize_result(None);
         assert_eq!(none["protocolVersion"], FALLBACK_REVISION);
+    }
+
+    #[test]
+    fn native_proxy_round_trip_against_a_fake_toron() {
+        // initialize -> subscribe -> poll, the three calls opencode's native
+        // client makes against the stdio proxy (bd-o1z4m). No live daemon.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let init = initialize_result(Some(super::MODERN_REVISION));
+        assert!(
+            init["protocolVersion"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "initialize returns a protocol version"
+        );
+        let sub = native_subscribe_result("ScarletCove", "c0", 1234);
+        let (id, _, cursor) =
+            crate::events_client::subscription_from_result(&sub).expect("subscribe result parses");
+        assert_eq!(id, "ScarletCove");
+        assert_eq!(cursor, "c0");
+
+        let server = FakeServer {
+            pages: vec![Page {
+                events: vec![ev("e9", "mail.addressed")],
+                next_cursor: "c1".into(),
+                gap: false,
+                truncated: false,
+            }],
+        };
+        let mut deduper = Deduper::new(8);
+        let mut c = cursor;
+        let timing = BridgeTiming {
+            last_hb_ms: 0,
+            now_ms: 0,
+            interval_ms: 1000,
+            attempt: 0,
+            rand_unit: 0.0,
+        };
+        let step = bridge_step(&server, &id, &mut deduper, &mut c, &timing).expect("poll");
+        assert_eq!(
+            step.notifications.len(),
+            1,
+            "one hint for one addressed mail"
+        );
+        assert!(super::rung_once(dir.path(), "e9"), "native path rings once");
+        assert!(!super::rung_once(dir.path(), "e9"), "fallback stays silent");
+    }
+
+    #[test]
+    fn one_event_id_rings_once_across_both_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(
+            super::rung_once(dir.path(), "evt-42"),
+            "native path rings first"
+        );
+        assert!(
+            !super::rung_once(dir.path(), "evt-42"),
+            "the doorbell fallback must stay silent for the same event"
+        );
+        assert!(super::rung_once(dir.path(), "evt-43"), "a new event rings");
+    }
+
+    #[test]
+    fn native_subscribe_result_matches_the_client_parser() {
+        let v = native_subscribe_result("ScarletCove", "cur-1", 1234);
+        let (id, expires, cursor) = crate::events_client::subscription_from_result(&v)
+            .expect("the proxy result must parse with the real client parser");
+        assert_eq!(id, "ScarletCove");
+        assert_eq!(expires, 1234);
+        assert_eq!(cursor, "cur-1");
+    }
+
+    #[test]
+    fn native_list_result_has_six_hint_only_rows() {
+        let v = native_list_result();
+        let rows = v["events"].as_array().expect("events array");
+        assert_eq!(rows.len(), 6);
+        assert!(
+            rows.iter()
+                .all(|r| { r["payloadSchema"]["properties"]["event_id"]["type"] == "string" }),
+            "hint payload carries an event_id string field"
+        );
     }
 
     #[test]

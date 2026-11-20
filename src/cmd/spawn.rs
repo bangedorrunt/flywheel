@@ -2074,6 +2074,22 @@ projects available: {}",
             if let Some(m) = &env_model_pin {
                 hc::apply_opencode_model_pin(&mut pane_env, m)?;
             }
+            // bd-o1z4m: an opencode seat gets a per-pane events config pointing
+            // at its 0600 token file. No plaintext enters the config or journal;
+            // without a token the doorbell (bd-f888z) fallback stays in charge.
+            if kind == "opencode"
+                && let Some(pin) = mail_identity.as_deref()
+            {
+                let token_path =
+                    crate::events_tokens::token_path(&crate::config::state_dir(), project, pin);
+                if token_path.is_file() {
+                    hc::apply_opencode_events_config(&mut pane_env, pin, &token_path)?;
+                } else {
+                    eprintln!(
+                        "flywheel: warn: no events token for {pin}; opencode seat uses the doorbell fallback"
+                    );
+                }
+            }
             let pane_id = if first {
                 first = false;
                 prev.clone()

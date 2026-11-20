@@ -154,6 +154,66 @@ pub fn apply_opencode_go_api_key_alias(env: &mut std::collections::BTreeMap<Stri
     }
 }
 
+/// bd-o1z4m: the local stdio MCP events server registered in a seat's
+/// opencode config. The config carries only the PATH to the 0600 token file —
+/// never the secret, never a header. `flywheel mcp-events` re-reads that file
+/// on 401 so rotation still works (ADR-0039 D8 deviation from U12).
+pub fn opencode_events_server(
+    subscription: &str,
+    token_path: &std::path::Path,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "local",
+        "command": "flywheel",
+        "args": ["mcp-events", "--subscription", subscription],
+        "env": { "FLYWHEEL_TORON_TOKEN_FILE": token_path.to_string_lossy() },
+    })
+}
+
+/// Merge the events extension switch and the local proxy into THIS pane's
+/// `OPENCODE_CONFIG_CONTENT`. opencode merges config sources, so neither the
+/// operator's global config nor another seat is touched (bd-o1z4m).
+pub fn apply_opencode_events_config(
+    env: &mut std::collections::BTreeMap<String, String>,
+    subscription: &str,
+    token_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    const KEY: &str = "OPENCODE_CONFIG_CONTENT";
+    let mut doc: serde_json::Map<String, serde_json::Value> = match env.get(KEY) {
+        Some(existing) if !existing.trim().is_empty() => {
+            let parsed: serde_json::Value = serde_json::from_str(existing).map_err(|e| {
+                anyhow::anyhow!(
+                    "pane env {KEY} is set but not valid JSON ({e}) — refusing to overwrite it"
+                )
+            })?;
+            match parsed {
+                serde_json::Value::Object(o) => o,
+                other => anyhow::bail!("pane env {KEY} is not a JSON object: {other}"),
+            }
+        }
+        _ => serde_json::Map::new(),
+    };
+    let experimental = doc
+        .entry("experimental".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let obj = experimental
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("experimental config is not an object"))?;
+    obj.insert("mcp_events".to_string(), serde_json::Value::Bool(true));
+    let mcp = doc
+        .entry("mcp".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let servers = mcp
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("mcp config is not an object"))?;
+    servers.insert(
+        "flywheel-events".to_string(),
+        opencode_events_server(subscription, token_path),
+    );
+    env.insert(KEY.to_string(), serde_json::Value::Object(doc).to_string());
+    Ok(())
+}
+
 /// bd-crlx: pin an opencode TUI agent's model for one pane.
 ///
 /// opencode v2's ROOT command (the one the opencode harness launch runs)
@@ -3253,6 +3313,57 @@ mod wait_output_live {
             elapsed < Duration::from_millis(500),
             "matched only after the wait timeout — the read-first check did not run ({elapsed:?})"
         );
+    }
+}
+
+#[cfg(test)]
+mod bd_o1z4m_events_config_tests {
+    use super::{apply_opencode_events_config, opencode_events_server};
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    #[test]
+    fn the_config_carries_only_a_token_path() {
+        let server = opencode_events_server("ScarletCove", Path::new("/tmp/state/tokens/sc.token"));
+        assert_eq!(server["type"], "local");
+        assert_eq!(server["args"][0], "mcp-events");
+        assert_eq!(
+            server["env"]["FLYWHEEL_TORON_TOKEN_FILE"],
+            "/tmp/state/tokens/sc.token"
+        );
+        assert!(!server.to_string().contains("Bearer"));
+    }
+
+    #[test]
+    fn the_pane_config_enables_the_flag_and_merges_existing_content() {
+        let mut env = BTreeMap::from([(
+            "OPENCODE_CONFIG_CONTENT".to_string(),
+            r#"{"model":"opencode/go:small","mcp":{"toron":{"type":"remote"}}}"#.to_string(),
+        )]);
+        apply_opencode_events_config(&mut env, "ScarletCove", Path::new("/tokens/sc"))
+            .expect("merge events config");
+        let doc: serde_json::Value =
+            serde_json::from_str(&env["OPENCODE_CONFIG_CONTENT"]).expect("valid config");
+        assert_eq!(doc["experimental"]["mcp_events"], true);
+        assert_eq!(doc["model"], "opencode/go:small", "other settings survive");
+        assert_eq!(
+            doc["mcp"]["toron"]["type"], "remote",
+            "other MCP servers survive"
+        );
+        assert_eq!(
+            doc["mcp"]["flywheel-events"]["env"]["FLYWHEEL_TORON_TOKEN_FILE"],
+            "/tokens/sc"
+        );
+    }
+
+    #[test]
+    fn a_broken_existing_config_is_refused_not_overwritten() {
+        let mut env = BTreeMap::from([(
+            "OPENCODE_CONFIG_CONTENT".to_string(),
+            "{not json".to_string(),
+        )]);
+        assert!(apply_opencode_events_config(&mut env, "p", Path::new("/t")).is_err());
+        assert_eq!(env["OPENCODE_CONFIG_CONTENT"], "{not json");
     }
 }
 
