@@ -1,0 +1,10 @@
+{
+  "name": "pi-flywheel-events",
+  "version": "0.1.0",
+  "description": "First-party pi extension: toron events -> pi.sendMessage hint (bd-4n2bn, ADR-0039 D8 U11)",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "pi": { "extensions": ["./src/index.ts"] },
+  "scripts": { "test": "node --experimental-strip-types --test test/*.test.ts" }
+}

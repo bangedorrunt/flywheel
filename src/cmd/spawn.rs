@@ -2090,6 +2090,22 @@ projects available: {}",
                     );
                 }
             }
+            // bd-4n2bn: a pi seat gets a per-seat agentDir whose settings load
+            // the first-party events extension; the token is a 0600 file PATH
+            // in the pane env, never plaintext. No token -> doorbell fallback.
+            if kind == "pi"
+                && let Some(pin) = mail_identity.as_deref()
+            {
+                let token_path =
+                    crate::events_tokens::token_path(&crate::config::state_dir(), project, pin);
+                if token_path.is_file() {
+                    hc::apply_pi_events_config(&mut pane_env, project, pin, &token_path)?;
+                } else {
+                    eprintln!(
+                        "flywheel: warn: no events token for {pin}; pi seat uses the doorbell fallback"
+                    );
+                }
+            }
             let pane_id = if first {
                 first = false;
                 prev.clone()

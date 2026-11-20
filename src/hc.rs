@@ -214,6 +214,82 @@ pub fn apply_opencode_events_config(
     Ok(())
 }
 
+/// bd-4n2bn: wire the first-party pi events extension for ONE seat through its
+/// own agentDir. Never touches the operator's ~/.pi: we READ the operator
+/// settings (for model/provider) but write only a per-seat copy under the
+/// flywheel state dir. The token is a PATH in the env, never plaintext.
+pub fn apply_pi_events_config(
+    env: &mut std::collections::BTreeMap<String, String>,
+    project: &str,
+    pin: &str,
+    token_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let source =
+        std::env::var("FLYWHEEL_SOURCE").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string());
+    let extension =
+        std::path::Path::new(&source).join("extensions/pi-flywheel-events/src/index.ts");
+    if !extension.is_file() {
+        anyhow::bail!("pi events extension missing at {}", extension.display());
+    }
+    let sanitize = |s: &str| -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    let state_dir = crate::config::state_dir();
+    let agent_dir = state_dir
+        .join("pi-agents")
+        .join(sanitize(project))
+        .join(sanitize(pin));
+    std::fs::create_dir_all(&agent_dir)?;
+
+    // Merge the operator's settings read-only so the seat keeps its model,
+    // provider and theme; add our extension to `packages` idempotently.
+    let home = std::env::var("HOME").unwrap_or_default();
+    let operator_settings = std::path::Path::new(&home).join(".pi/agent/settings.json");
+    let mut settings: serde_json::Value = std::fs::read_to_string(&operator_settings)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let obj = settings
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("pi settings root is not an object"))?;
+    let packages = obj
+        .entry("packages".to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    let arr = packages
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("pi settings packages is not an array"))?;
+    let want = format!("path:{}", extension.display());
+    if !arr.iter().any(|p| p.as_str() == Some(want.as_str())) {
+        arr.push(serde_json::Value::String(want));
+    }
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        serde_json::to_string_pretty(&settings)? + "\n",
+    )?;
+
+    env.insert(
+        "PI_CODING_AGENT_DIR".to_string(),
+        agent_dir.display().to_string(),
+    );
+    env.insert(
+        "FLYWHEEL_TORON_TOKEN_FILE".to_string(),
+        token_path.display().to_string(),
+    );
+    env.insert(
+        "FLYWHEEL_WAKE_RUNG_FILE".to_string(),
+        state_dir.join("wake-rung.jsonl").display().to_string(),
+    );
+    Ok(())
+}
+
 /// bd-crlx: pin an opencode TUI agent's model for one pane.
 ///
 /// opencode v2's ROOT command (the one the opencode harness launch runs)
@@ -3318,7 +3394,7 @@ mod wait_output_live {
 
 #[cfg(test)]
 mod bd_o1z4m_events_config_tests {
-    use super::{apply_opencode_events_config, opencode_events_server};
+    use super::{apply_opencode_events_config, apply_pi_events_config, opencode_events_server};
     use std::collections::BTreeMap;
     use std::path::Path;
 
@@ -3332,6 +3408,60 @@ mod bd_o1z4m_events_config_tests {
             "/tmp/state/tokens/sc.token"
         );
         assert!(!server.to_string().contains("Bearer"));
+    }
+
+    /// bd-4n2bn: the pi seat's agentDir carries the extension and env carries
+    /// only a TOKEN PATH — no plaintext in config, env or journal.
+    #[test]
+    fn pi_events_config_uses_a_per_seat_agentdir_and_a_token_path() {
+        let _g = crate::config::lock_env();
+        let tmp = std::env::temp_dir().join(format!("fw-pi-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        // The extension must exist for the wiring to succeed.
+        let ext = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("extensions/pi-flywheel-events/src/index.ts");
+        assert!(
+            ext.is_file(),
+            "extension source must be present: {}",
+            ext.display()
+        );
+        unsafe {
+            std::env::set_var("FLYWHEEL_SOURCE", env!("CARGO_MANIFEST_DIR"));
+            std::env::set_var("XDG_STATE_HOME", &tmp);
+            std::env::set_var("HOME", &tmp);
+        }
+        let mut env = BTreeMap::new();
+        apply_pi_events_config(
+            &mut env,
+            "flywheel",
+            "AmberProbe",
+            Path::new("/tokens/amber"),
+        )
+        .expect("wire pi events");
+        assert_eq!(env["FLYWHEEL_TORON_TOKEN_FILE"], "/tokens/amber");
+        assert!(env["PI_CODING_AGENT_DIR"].contains("pi-agents"));
+        assert!(env["FLYWHEEL_WAKE_RUNG_FILE"].ends_with("wake-rung.jsonl"));
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(&env["PI_CODING_AGENT_DIR"]).join("settings.json"),
+            )
+            .expect("seat settings"),
+        )
+        .expect("valid settings");
+        let packages = settings["packages"].as_array().expect("packages array");
+        assert!(
+            packages
+                .iter()
+                .any(|p| p.as_str().is_some_and(|s| s.contains("pi-flywheel-events"))),
+            "the seat loads the first-party extension: {packages:?}"
+        );
+        assert!(
+            !serde_json::to_string(&settings)
+                .expect("json")
+                .contains("/tokens/amber"),
+            "the token path must not be baked into settings"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

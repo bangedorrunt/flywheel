@@ -1302,6 +1302,19 @@ mutations = [
 ]
 
 [[behavior]]
+id = "pi.events-bridge-wiring"
+owner = "src/hc.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/hc.rs::pi_events_config_uses_a_per_seat_agentdir_and_a_token_path",
+]
+mutations = [
+  "scripts/mutations/pi-events-bridge.spec.sh#P1",
+  "scripts/mutations/pi-events-bridge.spec.sh#P2",
+]
+
+[[behavior]]
 id = "doorbell.pull-cursor-consumed"
 owner = "crates/doorbell-core/src/lib.rs"
 status = "proven"
