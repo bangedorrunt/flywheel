@@ -193,8 +193,10 @@ fn a_typed_line_defers_the_wake_and_clearing_it_rings() {
         String::from_utf8_lossy(&deferred.stdout),
         String::from_utf8_lossy(&deferred.stderr)
     );
-    assert_send_target(&String::from_utf8_lossy(&deferred.stdout), &block_id)
-        .unwrap_or_else(|e| panic!("bd-0kxzw: deferred send: {e}"));
+    // A deferred send has EMPTY stdout (no JSON dispatch row) and a typed
+    // refusal on stderr; the pane capture below is its proof that nothing
+    // landed. The dispatched pane id is asserted only on the send that does
+    // dispatch.
     // The send door returns a typed deferral (it does not silently queue like
     // the mail-wake door): nothing was typed, and the command exits non-zero.
     assert!(
