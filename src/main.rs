@@ -47,6 +47,8 @@ mod doorbell_supervise;
 mod doorbell_tick;
 mod durable;
 mod envpin_hop;
+mod turn_hooks;
+mod turn_state;
 #[cfg(test)]
 pub(crate) use envpin_hop::{EnvPinSplitUnsupported, envpin_hop_split};
 pub(crate) use envpin_hop::{
@@ -778,6 +780,16 @@ enum EventsTokenCmd {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Report a harness hook event (bd-b2kaa): writes per-seat turn state and
+    /// prints at most one continuation line. Hooks install this at spawn.
+    Hook {
+        #[arg(long)]
+        event: String,
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        pin: String,
+    },
     /// Scaffold a project (ensure dir + .beads + the project-scope compound
     /// spine: .flywheel/stages.toml, .flywheel/standing-orders.md,
     /// chiebukuro as the learning store) without spawning
@@ -3768,6 +3780,18 @@ fn main() {
             msg,
         }) => cmd_assign(&cfg, project, to, beads, msg.as_deref()),
         Some(Commands::Mail { cmd }) => cmd_mail(&cfg, cmd),
+        Some(Commands::Hook {
+            event,
+            project,
+            pin,
+        }) => {
+            if let Some(line) =
+                crate::turn_hooks::on_event(&config::state_dir(), project, pin, event)
+            {
+                println!("{line}");
+            }
+            Ok(())
+        }
         Some(Commands::EventsToken { cmd }) => match cmd {
             EventsTokenCmd::Rotate {
                 pin,

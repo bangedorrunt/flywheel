@@ -2930,13 +2930,33 @@ pub(crate) fn handle_workspace_cmds(
                     eprintln!("flywheel: [LoudMiss] invoke {corr} ({workflow}): {e:#}");
                 }
             }
-            workspace::Cmd::Prompt { .. }
-            | workspace::Cmd::CheckAckSla
-            | workspace::Cmd::RestartWatch => {}
+            workspace::Cmd::Prompt { pin, .. } => {
+                // The wake was delivered: clear the hook's mail signal.
+                let _ = crate::turn_hooks::write_mail(
+                    &crate::config::state_dir(),
+                    project,
+                    pin,
+                    &crate::turn_hooks::MailSignal::default(),
+                );
+            }
+            workspace::Cmd::CheckAckSla | workspace::Cmd::RestartWatch => {}
             workspace::Cmd::Audit { kind, pin, detail } => {
                 eprintln!("flywheel: [Audit {kind}] {pin}: {detail}");
             }
             workspace::Cmd::Digest { entries } => {
+                // bd-b2kaa: a queued/digested wake is mail waiting for the
+                // harness hooks; the next delivered Prompt clears it.
+                for entry in entries {
+                    let _ = crate::turn_hooks::write_mail(
+                        &crate::config::state_dir(),
+                        project,
+                        &entry.pin,
+                        &crate::turn_hooks::MailSignal {
+                            waiting: true,
+                            urgent: entry.detail.contains("plane-P urgent"),
+                        },
+                    );
+                }
                 let holds = workspace::sorted_holds(workspace_model);
                 let now = chrono::Utc::now().timestamp() as u64;
                 eprintln!(

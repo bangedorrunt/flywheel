@@ -216,6 +216,20 @@ fn spawn_events_pumps(cfg: &Config, project: &str, tx: &mpsc::Sender<BrainMsg>) 
     }
 }
 
+/// Hook-reported turn state beats the plane's screen-derived status while it
+/// is fresh; a stale/missing report leaves the status untouched.
+fn apply_hook_turn_state(project: &str, updates: &mut [BrainMsg]) {
+    let state_dir = config::state_dir();
+    let now = crate::turn_hooks::now_us();
+    for msg in updates.iter_mut() {
+        if let BrainMsg::PlaneStatus { pin, status } = msg
+            && let Some(turn) = crate::turn_hooks::read_turn(&state_dir, project, pin)
+        {
+            *status = crate::turn_state::status_from_turn(status, Some(&turn), now);
+        }
+    }
+}
+
 /// The embedded host: owns the reducer model and every flywheel-shaped
 /// capability the brain orchestrates.
 pub struct RtHost {
@@ -598,6 +612,8 @@ impl RtHost {
                     &pane_ids,
                 );
                 let (updates, unmapped) = Self::presence_updates_for(&agents, &pin_by_pane);
+                let mut updates = updates;
+                apply_hook_turn_state(&self.project, &mut updates);
                 let live_pins: HashSet<String> = agents
                     .iter()
                     .filter_map(|a| pin_by_pane.get(&a.pane_id).cloned())
@@ -663,7 +679,8 @@ impl RtHost {
                     .collect();
                 let pane_ids: Vec<String> = agents.iter().map(|a| a.pane_id.clone()).collect();
                 RtHost::extend_with_pane_bindings(&cfg, &project, &mut pin_by_pane, &pane_ids);
-                let (updates, _) = RtHost::presence_updates_for(&agents, &pin_by_pane);
+                let (mut updates, _) = RtHost::presence_updates_for(&agents, &pin_by_pane);
+                apply_hook_turn_state(&project, &mut updates);
                 for msg in RtHost::changed_statuses(&mut last, updates) {
                     if tx.blocking_send(msg).is_err() {
                         return;
