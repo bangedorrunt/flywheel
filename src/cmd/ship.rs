@@ -1390,7 +1390,7 @@ live-verified. Record one BEFORE closing."#;
             receipt_is_landable(repo.path(), &covered, &sha).unwrap_err()
         );
         assert!(
-            err.contains("has no RED witness"),
+            err.contains("demo.spec.sh"),
             "an uncovered-looking receipt cannot skip a covered file: {err}"
         );
 
