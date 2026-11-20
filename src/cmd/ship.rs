@@ -649,6 +649,35 @@ fn base_is_a_commit(root: &Path, rev: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// bd-r7852: a witness-mode proof cannot advance the mutation base on its own.
+/// Only a landing that actually checked the crew witnesses may write the
+/// witnessed marker the base selector trusts.
+fn record_witnessed_land(plan: &LandPlan) -> Result<()> {
+    let archive = crate::config::state_dir().join("clean-proof/receipts");
+    std::fs::create_dir_all(&archive)?;
+    let doc = serde_json::json!({
+        "ok": true,
+        "sha": plan.sha,
+        "stamp": chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string(),
+        "source": "ship-land",
+        "witnessed": true,
+        "bead": plan.bead,
+    });
+    let path = archive.join(format!("witnessed-{}.json", plan.sha));
+    std::fs::write(path, doc.to_string())?;
+    Ok(())
+}
+
+fn receipt_is_witness_mode(receipt: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(receipt) else {
+        return false;
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    doc.get("mutations_mode").and_then(Value::as_str) == Some("witnesses")
+}
+
 /// The sha a green receipt proved, when it carries one.
 fn receipt_proven_sha(receipt: &Path) -> Option<String> {
     let raw = std::fs::read_to_string(receipt).ok()?;
@@ -1045,6 +1074,12 @@ pub(crate) fn ship_land(args: LandArgs<'_>) -> Result<()> {
         })?;
     }
 
+    // 5.5. a witness-mode landing is the ONLY thing that may advance the base
+    // for a proof that ran no mutants (bd-r7852). The proof never writes this.
+    if receipt_is_witness_mode(&plan.receipt) {
+        record_witnessed_land(&plan)?;
+    }
+
     // 6. the gate, last.
     land_step(&plan, "check", || ship_check(bead, Some(&dir), repo, json))?;
     if json {
@@ -1078,8 +1113,9 @@ pub(crate) fn ship_land(args: LandArgs<'_>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cache_key_at, gate_for, head_has_closed_bead, head_names_bead, land_project,
-        parse_legal_gates, pick_gate, receipt_is_landable, status_of,
+        LandPlan, cache_key_at, gate_for, head_has_closed_bead, head_names_bead, land_project,
+        parse_legal_gates, pick_gate, receipt_is_landable, receipt_is_witness_mode,
+        record_witnessed_land, status_of,
     };
     use crate::config::Config;
     use std::process::Command;
@@ -1760,6 +1796,38 @@ live-verified. Record one BEFORE closing."#;
             key: key.to_string(),
         });
         store.save(&path).expect("save witness store");
+    }
+
+    #[test]
+    fn a_witness_mode_landing_writes_the_base_marker() {
+        let _guard = crate::config::lock_env();
+        let sha = "a".repeat(40);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let receipt = dir.path().join("receipt.json");
+        no_mutation_receipt_mode(&receipt, &sha, "witnesses");
+        assert!(
+            receipt_is_witness_mode(&receipt),
+            "witness-mode receipt detected"
+        );
+        let plan = LandPlan {
+            bead: "bd-x".to_string(),
+            sha: sha.clone(),
+            receipt: receipt.clone(),
+            project: "flywheel".to_string(),
+            pin: "ScarletCove".to_string(),
+            message: "chore: the marker".to_string(),
+            repo: None,
+        };
+        record_witnessed_land(&plan).expect("write marker");
+        let marker = crate::config::state_dir()
+            .join("clean-proof/receipts")
+            .join(format!("witnessed-{sha}.json"));
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(marker).expect("read marker"))
+                .expect("parse marker");
+        assert_eq!(doc["source"], "ship-land");
+        assert_eq!(doc["witnessed"], true);
+        assert_eq!(doc["sha"], sha);
     }
 
     #[test]

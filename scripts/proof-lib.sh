@@ -62,7 +62,22 @@ proof_green_base() {
 import json, sys
 try:
     d = json.load(open(sys.argv[1], encoding="utf-8"))
-    if d.get("ok") is True and d.get("sha"):
+    if d.get("ok") is not True or not d.get("sha"):
+        raise SystemExit
+    # bd-r7852: a green receipt advances the base ONLY when its mutation set
+    # was actually verified — changed|full with every row RED/DEAD-CONFIRMED,
+    # or a witness-mode landing whose marker ship land wrote after checking
+    # every changed spec. A proof alone never writes a witnessed marker.
+    verified = False
+    if d.get("source") == "ship-land" and d.get("witnessed") is True:
+        verified = True
+    elif d.get("mutations_mode") in ("changed", "full"):
+        rows = d.get("mutations") or []
+        verified = bool(rows) and all(
+            isinstance(r, dict) and r.get("verdict") in ("RED", "DEAD-CONFIRMED")
+            for r in rows
+        )
+    if verified:
         print(d["sha"], d.get("stamp") or 0)
 except Exception:
     pass

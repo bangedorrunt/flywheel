@@ -34,7 +34,8 @@ mkdir -p "$ARCHIVE"
 . "$ROOT/scripts/proof-lib.sh"
 
 receipt() { # $1 sha, $2 ok, $3 stamp (PROOF_STAMP is compact ISO)
-  printf '{"ok":%s,"sha":"%s","stamp":"%s"}\n' "$2" "$1" "$3" >"$ARCHIVE/$1.json"
+  printf '{"ok":%s,"sha":"%s","stamp":"%s","mutations_mode":"changed","mutations":[{"verdict":"RED"}]}\n' \
+    "$2" "$1" "$3" >"$ARCHIVE/$1.json"
 }
 receipt "$C2" true "20261118T041900Z"
 [ "$(proof_green_base "$REPO" "$C5" "$ARCHIVE")" = "$C2" ] \
@@ -48,6 +49,21 @@ receipt "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" true "20261118T042000Z"
 [ "$(proof_green_base "$REPO" "$C5" "$ARCHIVE")" = "$C3" ] \
   || fail "the newest green ancestor must win (got $(proof_green_base "$REPO" "$C5" "$ARCHIVE"))"
 pass "newest green ancestor wins; red and non-ancestor ignored"
+
+# bd-r7852: a green receipt whose mutation set was NOT verified must not move
+# the base. A no-mutation witnesses-mode receipt alone cannot vouch for the
+# diff; only a witnessed land marker written by ship land can.
+printf '{"ok":true,"sha":"%s","stamp":"20261119T010000Z","mutations_mode":"witnesses","mutations":[]}\n' \
+  "$C4" >"$ARCHIVE/$C4.json"
+[ "$(proof_green_base "$REPO" "$C5" "$ARCHIVE")" = "$C3" ] \
+  || fail "an unverified no-mutation receipt must not become the base (got $(proof_green_base "$REPO" "$C5" "$ARCHIVE"))"
+pass "no-mutation witnesses receipt cannot advance the base"
+
+printf '{"ok":true,"sha":"%s","stamp":"20261119T020000Z","source":"ship-land","witnessed":true,"bead":"bd-x"}\n' \
+  "$C4" >"$ARCHIVE/witnessed-$C4.json"
+[ "$(proof_green_base "$REPO" "$C5" "$ARCHIVE")" = "$C4" ] \
+  || fail "a landed witness-mode receipt must become the base (got $(proof_green_base "$REPO" "$C5" "$ARCHIVE"))"
+pass "landed witness marker advances the base"
 
 # A manual pin is still an explicit override when present.
 printf '[mutations]\nbase = "%s"\n' "$C1" >"$REPO/proof.toml"
