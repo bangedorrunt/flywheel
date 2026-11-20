@@ -78,17 +78,17 @@ expect_violation() { # model cfg invariant
 }
 
 
-conform_check() { # trace -> prints the exit code; output in $WORK/conform-<name>/out.log
-  local trace="$1" dir="$WORK/conform-$(basename "$trace")" rc=0
+conform_check() { # model trace -> prints the exit code; output in $WORK/conform-<name>/out.log
+  local model="$1" trace="$2" dir="$WORK/conform-$(basename "$trace")" rc=0
   mkdir -p "$dir"
-  cp "$MODELS/DeferredQueue.tla" "$MODELS/DeferredQueue.cfg" "$dir/"
-  ( cd "$dir" && "$CHECKER" conform -trace "$trace" -config DeferredQueue.cfg DeferredQueue.tla ) >"$dir/out.log" 2>&1 || rc=$?
+  cp "$MODELS/$model.tla" "$MODELS/$model.cfg" "$dir/"
+  ( cd "$dir" && "$CHECKER" conform -trace "$trace" -config "$model.cfg" "$model.tla" ) >"$dir/out.log" 2>&1 || rc=$?
   echo "$rc"
 }
 
-expect_conform() { # trace
-  local trace="$1" rc
-  rc="$(conform_check "$trace")"
+expect_conform() { # model trace
+  local model="$1" trace="$2" rc
+  rc="$(conform_check "$model" "$trace")"
   if [ "$rc" = 0 ]; then
     echo "  PASS  conform $(basename "$trace")"
     passed=$((passed + 1))
@@ -99,9 +99,9 @@ expect_conform() { # trace
   fi
 }
 
-expect_nonconform() { # trace expected_rc step_named_in_output
-  local trace="$1" expected="$2" step="$3" rc
-  rc="$(conform_check "$trace")"
+expect_nonconform() { # model trace expected_rc step_named_in_output
+  local model="$1" trace="$2" expected="$3" step="$4" rc
+  rc="$(conform_check "$model" "$trace")"
   if [ "$rc" = "$expected" ] && grep -q "$step" "$WORK/conform-$(basename "$trace")/out.log"; then
     echo "  PASS  conform $(basename "$trace") — exit $rc names $step"
     passed=$((passed + 1))
@@ -163,8 +163,10 @@ expect_violation EventsDedupe EventsDedupe.broken-ring-twice AtMostOnceRing
 
 
 echo "verify-formal: trace conformance (recorded doorbell runs)"
-expect_conform "$PWD/$(dirname "$MODELS")/traces/DeferredQueue.recorded.jsonl"
-expect_nonconform "$PWD/$(dirname "$MODELS")/traces/DeferredQueue.double-ring.jsonl" 20 "Ring"
+expect_conform DeferredQueue "$PWD/$(dirname "$MODELS")/traces/DeferredQueue.recorded.jsonl"
+expect_nonconform DeferredQueue "$PWD/$(dirname "$MODELS")/traces/DeferredQueue.double-ring.jsonl" 20 "Ring"
+expect_conform TrackerCas "$PWD/$(dirname "$MODELS")/traces/TrackerCas.recorded.jsonl"
+expect_nonconform TrackerCas "$PWD/$(dirname "$MODELS")/traces/TrackerCas.stale-splice.jsonl" 20 "CasOk"
 
 # Every model in the directory must be exercised: a new .tla that nobody added
 # an expectation for would otherwise pass silently as "not run".

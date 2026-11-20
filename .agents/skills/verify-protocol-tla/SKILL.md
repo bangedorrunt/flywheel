@@ -98,13 +98,22 @@ it is a faithful recording.
   fixtures; with `FLYWHEEL_EVERYSTATE` set the test runs both checks itself.
 - Fixtures: `models/traces/DeferredQueue.recorded.jsonl` (conforms, exit 0)
   and `models/traces/DeferredQueue.double-ring.jsonl` (a doctored second
-  `Ring`, exit 20 naming the step). Both are wired into `verify-formal.sh` via
-  `expect_conform`/`expect_nonconform`, so `clean-proof.sh` gates on them.
+  `Ring`, exit 20 naming the step), plus `models/traces/TrackerCas.recorded.jsonl`
+  (a REAL two-lander `flywheel commit` race with one CAS retry, recorded by
+  `commit_blobs`) and `models/traces/TrackerCas.stale-splice.jsonl` (the retry
+  skips the re-read `Refresh`, so `CasOk` is rejected with exit 20). All four
+  are wired into `verify-formal.sh` via `expect_conform`/`expect_nonconform`, so
+  `clean-proof.sh` gates on them.
+- The driver test `tests/conformance_deferred_queue.rs` regenerates both
+  DeferredQueue traces from the same real journal; the Converter's ring-twice
+  branch is witnessed by `scripts/mutations/conform-ring-mapping.spec.sh`
+  (breaking it makes the non-conformance witness go RED).
 - No Java: the same pinned `everystate` 0.4.1 binary does model checking and
   conformance.
-
-Coverage is still partial: only the doorbell deferral/drain is recorded today;
-the commit/ship-land CAS (`TrackerCas`) is the next trace to add.
+- LIMITATION: this `everystate conform` matches ACTION names/params but does
+  not enforce recorded variable values. A doctored trace must violate the
+  action sequence (an extra `Ring`, a skipped `Refresh`), not just a state
+  value, to be rejected.
 
 ## Bounds, assumptions, limitations
 

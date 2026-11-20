@@ -114,7 +114,8 @@ fn a_recorded_deferral_restart_and_boot_drain_conforms() {
 
     let good = out_path("CONFORM_TRACE_OUT", "dq-recorded.jsonl");
     let good_jsonl = trace.to_jsonl();
-    if std::env::var("CONFORM_TRACE_OUT").is_err() {
+    if std::env::var("CONFORM_TRACE_OUT").is_err() && std::env::var("FLYWHEEL_EVERYSTATE").is_err()
+    {
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(".agents/skills/verify-protocol-tla/traces/DeferredQueue.recorded.jsonl");
         assert_eq!(
@@ -125,20 +126,18 @@ fn a_recorded_deferral_restart_and_boot_drain_conforms() {
     }
     std::fs::write(&good, &good_jsonl).expect("write trace");
 
-    // Doctored: a second Ring after the queue is empty. The spec forbids it.
-    let mut bad = trace.observations.clone();
-    let mut twice = bad.last().unwrap().clone();
-    twice["action"] = json!("Ring");
-    twice["rings"]["brief"] = json!(2);
-    bad.push(twice);
-    let bad_jsonl = bad
-        .iter()
-        .map(|o| o.to_string())
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n";
+    // Doctored: the same journal converted by the recorder that does not
+    // consume the queue, so the mail rings twice. The spec forbids it.
+    let mut buggy = DeferredQueueTrace::with_ring_twice(true);
+    for row in raw.lines() {
+        let row: Value = serde_json::from_str(row).expect("journal json");
+        buggy.observe(&row);
+    }
+    let bad_jsonl = buggy.to_jsonl();
     let bad_path = out_path("CONFORM_BAD_TRACE_OUT", "dq-double-ring.jsonl");
-    if std::env::var("CONFORM_BAD_TRACE_OUT").is_err() {
+    if std::env::var("CONFORM_BAD_TRACE_OUT").is_err()
+        && std::env::var("FLYWHEEL_EVERYSTATE").is_err()
+    {
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(".agents/skills/verify-protocol-tla/traces/DeferredQueue.double-ring.jsonl");
         assert_eq!(

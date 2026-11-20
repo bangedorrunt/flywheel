@@ -745,4 +745,84 @@ mod tests {
         assert!(commit_paths(&dir, &["/etc/passwd".into()], "no").is_err());
         assert!(commit_paths(&dir, &["../escape".into()], "no").is_err());
     }
+
+    /// bd-uawqo: a REAL two-lander race. `commit_blobs` is called for l1; on
+    /// its first splice it lands l2's commit, so l1's update-ref CAS fails and
+    /// the callback is invoked again on the moved HEAD. The recorded event
+    /// sequence goes through the pure TrackerCas converter.
+    #[test]
+    fn a_real_cas_retry_records_a_tracker_cas_trace() {
+        use doorbell_rt::effect_trace::{TrackerCasTrace, TrackerEvent};
+
+        let dir = scratch_repo("cas-conform");
+        fs::write(dir.join("r1.txt"), "parent\n").unwrap();
+        fs::write(dir.join("r2.txt"), "parent\n").unwrap();
+        commit_paths(&dir, &["r1.txt".into(), "r2.txt".into()], "seed").unwrap();
+
+        let mut events: Vec<TrackerEvent<'static>> = Vec::new();
+        let mut calls = 0;
+        let mut l2_calls = 0;
+        let sha = commit_blobs(
+            &dir,
+            &["r1.txt".into(), "r2.txt".into()],
+            "l1 closes r1",
+            |parent| {
+                calls += 1;
+                if calls == 1 {
+                    events.push(TrackerEvent::Refresh {
+                        lander: "l1",
+                        ver: 0,
+                        splice: vec!["r1"],
+                    });
+                    // The other lander moves HEAD between our read and CAS.
+                    commit_blobs(&dir, &["r2.txt".into()], "l2 closes r2", |_| {
+                        l2_calls += 1;
+                        if l2_calls == 1 {
+                            events.push(TrackerEvent::Refresh {
+                                lander: "l2",
+                                ver: 0,
+                                splice: vec!["r2"],
+                            });
+                        }
+                        Ok(vec![("r2.txt".into(), b"closed by l2\n".to_vec())])
+                    })
+                    .expect("l2 lands");
+                    events.push(TrackerEvent::CasOk { lander: "l2" });
+                    events.push(TrackerEvent::CasFail { lander: "l1" });
+                } else if calls == 2 {
+                    // The re-read sees the moved HEAD; re-splice BOTH rows.
+                    events.push(TrackerEvent::Refresh {
+                        lander: "l1",
+                        ver: 1,
+                        splice: vec!["r1", "r2"],
+                    });
+                }
+                // A third call only refreshes the shared index; no event.
+                let other = format!("{}\n", git(&dir, &["show", &format!("{parent}:r2.txt")]));
+                Ok(vec![
+                    ("r1.txt".into(), b"closed by l1\n".to_vec()),
+                    ("r2.txt".into(), other.into_bytes()),
+                ])
+            },
+        )
+        .expect("l1 lands after a retry");
+        events.push(TrackerEvent::CasOk { lander: "l1" });
+        assert!(calls >= 2, "the CAS must retry at least once: {calls}");
+
+        // Real outcome: both closed rows are in the final HEAD.
+        let head = git(&dir, &["show", &format!("{sha}:r1.txt")]);
+        assert_eq!(head.trim(), "closed by l1");
+        let other = git(&dir, &["show", &format!("{sha}:r2.txt")]);
+        assert_eq!(other.trim(), "closed by l2");
+
+        let mut trace = TrackerCasTrace::new();
+        for event in &events {
+            trace.observe(event);
+        }
+        let last = trace.observations.last().unwrap();
+        assert_eq!(last["headRows"], serde_json::json!(["r1", "r2"]));
+        if let Ok(path) = std::env::var("CAS_TRACE_OUT") {
+            std::fs::write(path, trace.to_jsonl()).expect("write CAS trace");
+        }
+    }
 }

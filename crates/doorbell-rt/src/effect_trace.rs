@@ -24,6 +24,9 @@ fn message_of(line: &str) -> &'static str {
 /// subsequent one names the spec action and the full state after the step.
 pub struct DeferredQueueTrace {
     pub observations: Vec<Value>,
+    /// The doctored recorder that does not consume the queue on a ring, so
+    /// the same mail rings twice (the live double-ring regression).
+    ring_twice: bool,
     arrived: BTreeSet<String>,
     queued: BTreeSet<String>,
     rung: BTreeSet<String>,
@@ -40,8 +43,13 @@ impl Default for DeferredQueueTrace {
 
 impl DeferredQueueTrace {
     pub fn new() -> Self {
+        Self::with_ring_twice(false)
+    }
+
+    pub fn with_ring_twice(ring_twice: bool) -> Self {
         let mut this = Self {
             observations: Vec::new(),
+            ring_twice,
             arrived: BTreeSet::new(),
             queued: BTreeSet::new(),
             rung: BTreeSet::new(),
@@ -116,6 +124,11 @@ impl DeferredQueueTrace {
                     self.ring(m);
                 }
                 self.push(Some("Ring"));
+                if self.ring_twice {
+                    // The regression: the queue was not consumed, so the
+                    // same mail is rung a second time at the same idle edge.
+                    self.push(Some("Ring"));
+                }
             } else {
                 self.push(Some("Idle"));
             }
@@ -245,5 +258,187 @@ mod tests {
         let last = trace.observations.last().unwrap();
         assert_eq!(last["action"], "RereadByTheIdleEdge");
         assert_eq!(last["rings"]["brief"], 0, "a repeated wake never rings");
+    }
+}
+
+// ---- bd-uawqo leg 2: flywheel commit CAS -> TrackerCas observations ----
+
+/// One recorded step of a real `flywheel commit` race. The recorder names the
+/// lander and the state it actually read/spliced; the converter is pure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrackerEvent<'a> {
+    Refresh {
+        lander: &'a str,
+        ver: u64,
+        splice: Vec<&'a str>,
+    },
+    CasFail {
+        lander: &'a str,
+    },
+    CasOk {
+        lander: &'a str,
+    },
+}
+
+/// Running conversion of a CAS run to `TrackerCas.tla` observations. The
+/// initial observation is the model's Init; each later one names the action,
+/// its lander param and the full state after the step.
+pub struct TrackerCasTrace {
+    pub observations: Vec<Value>,
+    head_rows: BTreeSet<String>,
+    ver: u64,
+    phase: BTreeMap<String, String>,
+    read_ver: BTreeMap<String, u64>,
+    splice_rows: BTreeMap<String, Vec<String>>,
+    attempts: BTreeMap<String, u64>,
+    done: BTreeMap<String, bool>,
+}
+
+impl Default for TrackerCasTrace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrackerCasTrace {
+    pub fn new() -> Self {
+        let landers = ["l1", "l2"];
+        let mut this = Self {
+            observations: Vec::new(),
+            head_rows: BTreeSet::new(),
+            ver: 0,
+            phase: landers
+                .iter()
+                .map(|l| (l.to_string(), "init".into()))
+                .collect(),
+            read_ver: landers.iter().map(|l| (l.to_string(), 0)).collect(),
+            splice_rows: landers
+                .iter()
+                .map(|l| (l.to_string(), Vec::new()))
+                .collect(),
+            attempts: landers.iter().map(|l| (l.to_string(), 0)).collect(),
+            done: landers.iter().map(|l| (l.to_string(), false)).collect(),
+        };
+        this.push(None, None);
+        this
+    }
+
+    fn push(&mut self, action: Option<&str>, lander: Option<&str>) {
+        let mut obs = json!({
+            "headRows": self.head_rows.iter().cloned().collect::<Vec<_>>(),
+            "ver": self.ver,
+            "phase": self.phase,
+            "readVer": self.read_ver,
+            "spliceRows": self.splice_rows,
+            "attempts": self.attempts,
+            "done": self.done,
+        });
+        if let Some(action) = action {
+            obs["action"] = json!(action);
+        }
+        if let Some(lander) = lander {
+            obs["params"] = json!([lander]);
+        }
+        self.observations.push(obs);
+    }
+
+    pub fn observe(&mut self, event: &TrackerEvent<'_>) {
+        match event {
+            TrackerEvent::Refresh {
+                lander,
+                ver,
+                splice,
+            } => {
+                self.read_ver.insert(lander.to_string(), *ver);
+                self.splice_rows.insert(
+                    lander.to_string(),
+                    splice.iter().map(|s| s.to_string()).collect(),
+                );
+                self.phase.insert(lander.to_string(), "ready".into());
+                self.push(Some("Refresh"), Some(lander));
+            }
+            TrackerEvent::CasFail { lander } => {
+                let n = self.attempts.get(*lander).copied().unwrap_or(0) + 1;
+                self.attempts.insert(lander.to_string(), n);
+                self.phase.insert(lander.to_string(), "retry".into());
+                self.push(Some("CasFail"), Some(lander));
+            }
+            TrackerEvent::CasOk { lander } => {
+                self.head_rows = self
+                    .splice_rows
+                    .get(*lander)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                self.ver += 1;
+                self.done.insert(lander.to_string(), true);
+                self.phase.insert(lander.to_string(), "done".into());
+                self.push(Some("CasOk"), Some(lander));
+            }
+        }
+    }
+
+    pub fn to_jsonl(&self) -> String {
+        let mut out = String::new();
+        for obs in &self.observations {
+            out.push_str(&obs.to_string());
+            out.push('\n');
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod cas_tests {
+    use super::*;
+
+    #[test]
+    fn a_retry_resplice_keeps_both_closed_rows() {
+        let mut trace = TrackerCasTrace::new();
+        trace.observe(&TrackerEvent::Refresh {
+            lander: "l1",
+            ver: 0,
+            splice: vec!["r1"],
+        });
+        trace.observe(&TrackerEvent::Refresh {
+            lander: "l2",
+            ver: 0,
+            splice: vec!["r2"],
+        });
+        trace.observe(&TrackerEvent::CasOk { lander: "l2" });
+        trace.observe(&TrackerEvent::CasFail { lander: "l1" });
+        trace.observe(&TrackerEvent::Refresh {
+            lander: "l1",
+            ver: 1,
+            splice: vec!["r1", "r2"],
+        });
+        trace.observe(&TrackerEvent::CasOk { lander: "l1" });
+        let last = trace.observations.last().unwrap();
+        assert_eq!(last["headRows"], json!(["r1", "r2"]));
+        assert_eq!(last["ver"], 2);
+        assert_eq!(last["done"]["l1"], true);
+        if let Ok(path) = std::env::var("CAS_TRACE_OUT") {
+            std::fs::write(path, trace.to_jsonl()).expect("write CAS trace");
+        }
+        // Doctored regression: on retry the lander reused the FIRST splice
+        // and did NOT re-read the moved HEAD — so the Refresh step is absent
+        // and CasOk fires from phase "retry". The spec forbids that step.
+        let stale: Vec<Value> = trace
+            .observations
+            .into_iter()
+            .filter(|o| {
+                !(o["action"] == "Refresh" && o["params"] == json!(["l1"]) && o["ver"] == 1)
+            })
+            .collect();
+        let jsonl = stale
+            .iter()
+            .map(|o| o.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        if let Ok(path) = std::env::var("CAS_BAD_TRACE_OUT") {
+            std::fs::write(path, jsonl).expect("write stale-splice trace");
+        }
     }
 }
