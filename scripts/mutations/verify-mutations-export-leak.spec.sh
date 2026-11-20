@@ -11,8 +11,8 @@ TEST_FILTER=(proof_verify_mutations_never_edits_the_shared_tree proof_clean_proo
 mutation "E1  no exit trap removes the scratch export" \
     file=scripts/verify-mutations.sh \
     expect=proof_verify_mutations_never_edits_the_shared_tree \
-    find='    trap on_exit EXIT' \
-    replace='    : # bd-j45zo mutant: no export cleanup trap'
+    find='    rm -rf "$OWNED_EXPORT_ROOT"' \
+    replace='    : # bd-r7852 mutant: no scratch export cleanup'
 
 mutation "E2  exclude the kept export by its path string again" \
     file=scripts/clean-proof.sh \

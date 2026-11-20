@@ -32,8 +32,8 @@ mutation "M2  malformed recall JSON silently becomes empty" \
 mutation "M3  recalled lessons are not deduplicated" \
     file=$MEM \
     expect=recalled_lessons_are_deduplicated \
-    find='        if seen.insert(key) {' \
-    replace='        if seen.insert(key) || true {'
+    find='    seen.insert(lesson_core(raw))' \
+    replace='    true || seen.insert(lesson_core(raw))'
 
 mutation "M4  record-lesson passes chie the invalid --pin flag" \
     file=$MEM \

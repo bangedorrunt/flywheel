@@ -135,11 +135,28 @@ fn a_plain_lesson_is_retrievable_by_command_and_path() {
 
 /// `--as` must reach chie as --peer (chie has no --pin), and the lesson must
 /// still be retrievable (bd-97uwg).
+fn fake_chie_logger(sandbox: &TestSandbox, log: &std::path::Path) -> std::path::PathBuf {
+    let fake = sandbox.bin_dir().join("fake-chie-logger");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\ncase \"$2\" in\n  record) printf '{{\"recorded\":true}}\\n' ;;\n  recall) printf '%s\\n' '{{\"conclusions\":[{{\"content\":\"Rule: an unattributed lesson breaks when a pin cannot reach chie; do map --as to --peer\"}}],\"events\":[]}}' ;;\n  *) printf '[]\\n' ;;\nesac\nexit 0\n",
+        log.display()
+    );
+    std::fs::write(&fake, script).expect("write fake chie logger");
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut perms = std::fs::metadata(&fake).expect("meta").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake, perms).expect("chmod");
+    fake
+}
+
 #[test]
 fn recording_with_as_is_retrievable() {
     let sandbox = TestSandbox::new();
-    let recorded = run(
+    let log = sandbox.bin_dir().join("chie-argv.log");
+    let fake = fake_chie_logger(&sandbox, &log);
+    let recorded = run_with_chie(
         &sandbox,
+        &fake,
         &[
             "memory",
             "record-lesson",
@@ -156,8 +173,15 @@ fn recording_with_as_is_retrievable() {
         "recording with --as failed: {}",
         text(&recorded)
     );
-    let found = run(
+    let argv = std::fs::read_to_string(&log).expect("chie argv log");
+    assert!(
+        argv.contains("--peer agent:BoldCliff"),
+        "--as must map to chie's --peer agent:<pin>: {argv}"
+    );
+    assert!(!argv.contains("--pin"), "chie has no --pin flag: {argv}");
+    let found = run_with_chie(
         &sandbox,
+        &fake,
         &[
             "memory",
             "check-trap",

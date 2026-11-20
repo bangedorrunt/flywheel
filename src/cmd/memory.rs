@@ -287,8 +287,7 @@ pub fn check_trap_queries_strict(
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut rows = Vec::new();
     for line in out {
-        let key = lesson_core(&line);
-        if seen.insert(key) {
+        if insert_lesson_once(&mut seen, &line) {
             rows.push(line);
         }
     }
@@ -356,6 +355,12 @@ fn lesson_core(s: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The ONE lesson-dedup insertion key, shared by chie recall and the final
+/// preflight edge so a mutant that kills dedup turns both layers off (bd-7szny).
+fn insert_lesson_once(seen: &mut BTreeSet<String>, raw: &str) -> bool {
+    seen.insert(lesson_core(raw))
 }
 
 fn chie_bin() -> String {
@@ -465,8 +470,7 @@ fn lesson_recall(query: &str, project_dir: Option<&Path>) -> Result<Vec<String>>
                 {
                     // Re-recorded lessons leave duplicate events; the preflight
                     // view must show each lesson once (bd-ndbnv review point 4).
-                    let canon = lesson_core(content);
-                    if seen.insert(canon) {
+                    if insert_lesson_once(&mut seen, content) {
                         rows.push(content.to_string());
                     }
                 }

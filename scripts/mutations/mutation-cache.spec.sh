@@ -48,10 +48,9 @@ mutation "C6  a cached verdict need not match what the spec expects" \
 mutation "C8  the proof stops computing a cache key" \
     file=$PROOF \
     expect=clean_proof_computes_and_passes_a_cache_key \
-    find='    mut_key=""
-    if [ "$NO_CACHE" -eq 0 ] && [ "$MUTATIONS_MODE" != full ]; then' \
-    replace='    mut_key=""
-    if false; then'
+    find='      mut_key="$(python3 scripts/mutation-cache.py key --root . --spec "$spec" \
+        --driver "${CLEAN_PROOF_DRIVER_SHA:-}" 2>/dev/null || true)"' \
+    replace='      mut_key=""'
 
 mutation "C9  the driver fixture inherits the running proof's environment" \
     file=src/cmd/clean_proof.rs \
