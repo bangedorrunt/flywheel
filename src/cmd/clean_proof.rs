@@ -663,7 +663,7 @@ git -C "$d/repo" add f
 git -C "$d/repo" commit -qm two
 proven=$(git -C "$d/repo" rev-parse HEAD)
 mkdir -p "$d/receipts"
-printf '%s' '{{"ok":true,"sha":"'"$ancestor"'","stamp":"20261118T041942Z"}}' >"$d/receipts/r.json"
+printf '%s' '{{"ok":true,"sha":"'"$ancestor"'","stamp":"20261118T041942Z","mutations_mode":"changed","mutations":[{{"verdict":"RED"}},{{"verdict":"DEAD-CONFIRMED"}}]}}' >"$d/receipts/r.json"
 . "{root}/scripts/proof-lib.sh"
 proof_green_base "$d/repo" "$proven" "$d/receipts"
 "#,

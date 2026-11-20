@@ -34,7 +34,9 @@ mkdir -p "$ARCHIVE"
 . "$ROOT/scripts/proof-lib.sh"
 
 receipt() { # $1 sha, $2 ok, $3 stamp (PROOF_STAMP is compact ISO)
-  printf '{"ok":%s,"sha":"%s","stamp":"%s","mutations_mode":"changed","mutations":[{"verdict":"RED"}]}\n' \
+  # Real receipts (c57eaa28, 5e9c01e6, ...) carry a changed-mode set mixing RED
+  # with DEAD-CONFIRMED rows; both verdicts are verified evidence (bd-r7852).
+  printf '{"ok":%s,"sha":"%s","stamp":"%s","mutations_mode":"changed","mutations":[{"verdict":"RED"},{"verdict":"RED"},{"verdict":"DEAD-CONFIRMED"}]}\n' \
     "$2" "$1" "$3" >"$ARCHIVE/$1.json"
 }
 receipt "$C2" true "20261118T041900Z"
