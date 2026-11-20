@@ -61,6 +61,7 @@ mod effect_journal;
 mod elm;
 mod events_bridge;
 mod events_client;
+mod events_tokens;
 mod failure;
 mod fs_util;
 mod harness_api;
@@ -14280,7 +14281,9 @@ fn cmd_mcp_events(_cfg: &Config, subscription: &str) -> Result<()> {
     // degrades to the no-op port with a loud stderr note — never a silent lie.
     let url = std::env::var("FLYWHEEL_TORON_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:18080".to_string());
-    let token = std::env::var("FLYWHEEL_TORON_TOKEN")
+    // bd-5vi2x: the bridge reads the token FILE, never a plaintext env value.
+    // FLYWHEEL_TORON_TOKEN is still honoured as a fallback for hand-run seats.
+    let token_file = std::env::var("FLYWHEEL_TORON_TOKEN_FILE")
         .ok()
         .filter(|t| !t.is_empty());
     let state_path = config::state_dir().join(format!(
@@ -14295,10 +14298,10 @@ fn cmd_mcp_events(_cfg: &Config, subscription: &str) -> Result<()> {
             .collect::<String>()
     ));
     let mut cursor = std::fs::read_to_string(&state_path).unwrap_or_default();
-    let transport: Box<dyn events_bridge::EventsTransport> = match token {
-        Some(token) => {
+    let transport: Box<dyn events_bridge::EventsTransport> = match token_file {
+        Some(path) => {
             let mut client = events_client::ToronEventsClient::new(
-                events_client::UreqRpc::new(&url, &token),
+                events_client::UreqRpc::new(&url, &path),
                 subscription,
                 86_400, // TTL cap: 24h; refreshed before expiry by the caller.
             );
@@ -14311,7 +14314,7 @@ fn cmd_mcp_events(_cfg: &Config, subscription: &str) -> Result<()> {
             }
         }
         None => {
-            eprintln!("flywheel mcp-events: FLYWHEEL_TORON_TOKEN unset; no events will arrive");
+            eprintln!("flywheel mcp-events: FLYWHEEL_TORON_TOKEN_FILE unset; no events will arrive");
             Box::new(events_bridge::NoopTransport)
         }
     };
@@ -17932,17 +17935,50 @@ fn toron_setup_mcp(
 /// The claude/channel MCP server entry (bd-si4b5 Phase B). The bridge runs as
 /// `flywheel mcp-events --subscription <pin>` over stdio; it emits only the D2
 /// hint, never the event body. Kept pure so a unit test pins the wire shape.
-pub(crate) fn claude_channel_server(subscription: &str) -> serde_json::Value {
-    serde_json::json!({
+pub(crate) fn claude_channel_server(subscription: &str, token_path: Option<&str>) -> serde_json::Value {
+    let mut server = serde_json::json!({
         "command": "flywheel",
         "args": ["mcp-events", "--subscription", subscription],
         "type": "stdio"
-    })
+    });
+    // bd-5vi2x: the config carries only the PATH to the 0600 token file, never
+    // the secret and never a plaintext env value.
+    if let Some(path) = token_path {
+        server["env"] = serde_json::json!({ "FLYWHEEL_TORON_TOKEN_FILE": path });
+    }
+    server
 }
 
 /// Claude Code reads MCP servers from `~/.claude.json` under `mcpServers`.
 /// Idempotent: an unchanged entry is a no-op; a neighbour's servers survive.
 fn upsert_claude_channel(path: &std::path::Path, dry: bool) -> Result<String> {
+    let subscription =
+        std::env::var("FLYWHEEL_MCP_SUBSCRIPTION").unwrap_or_else(|_| "default".to_string());
+    let project =
+        std::env::var("FLYWHEEL_MCP_PROJECT").unwrap_or_else(|_| "flywheel".to_string());
+    let token_path = events_tokens::token_path(&config::state_dir(), &project, &subscription);
+    let token_path_str = token_path.display().to_string();
+
+    // Mint + store BEFORE writing the config: a seat whose config points at a
+    // missing token is worse than one with no bridge at all.
+    if !dry {
+        let cli = events_tokens::ToronTokenCli {
+            bin: std::env::var("TORON_BIN").unwrap_or_else(|_| "toron".to_string()),
+        };
+        let journal = config::state_dir().join("events-token-journal.jsonl");
+        let now_us = chrono::Utc::now().timestamp_micros();
+        events_tokens::mint_and_store(
+            &cli,
+            &subscription,
+            &project,
+            events_tokens::PIN_TTL_SECS,
+            &token_path,
+            &journal,
+            now_us,
+        )
+        .map_err(|e| anyhow::anyhow!("cannot provision events token for {subscription}: {e}"))?;
+    }
+
     let mut v: serde_json::Value = load_json_or_default(path)?;
     let obj = v
         .as_object_mut()
@@ -17951,9 +17987,7 @@ fn upsert_claude_channel(path: &std::path::Path, dry: bool) -> Result<String> {
         obj.insert("mcpServers".into(), serde_json::json!({}));
     }
     let servers = obj["mcpServers"].as_object_mut().expect("ensured above");
-    let subscription =
-        std::env::var("FLYWHEEL_MCP_SUBSCRIPTION").unwrap_or_else(|_| "default".to_string());
-    let want = claude_channel_server(&subscription);
+    let want = claude_channel_server(&subscription, Some(&token_path_str));
     let name = "flywheel-events";
     let action = match servers.get(name) {
         Some(prev) if prev == &want => return Ok("claude channel unchanged".to_string()),
@@ -18195,10 +18229,18 @@ mod setup_mcp_tests {
     /// keyed by the pin subscription, and never carries an event body.
     #[test]
     fn claude_channel_server_is_the_stdio_bridge() {
-        let server = super::claude_channel_server("AmberProbe");
+        let server = super::claude_channel_server("AmberProbe", Some("/state/amber.token"));
         assert_eq!(server["command"], "flywheel");
         assert_eq!(server["args"][0], "mcp-events");
         assert_eq!(server["args"][2], "AmberProbe");
+        assert_eq!(
+            server["env"]["FLYWHEEL_TORON_TOKEN_FILE"],
+            "/state/amber.token"
+        );
+        assert!(
+            !server.to_string().contains("Bearer"),
+            "no plaintext token in the config: {server}"
+        );
         assert!(!server.to_string().contains("body"));
     }
 

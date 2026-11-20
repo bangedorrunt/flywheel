@@ -24,15 +24,17 @@ pub trait EventsRpc: Send {
     ) -> Result<(), String>;
 }
 
-/// Live JSON-RPC over toron's `/mcp` mount. Bearer token on every request.
+/// Live JSON-RPC over toron's `/mcp` mount. The bearer token is read from a
+/// 0600 file on EVERY request (bd-5vi2x) and re-read on 401, so a rotation
+/// takes effect without a restart and never lives in the process env.
 pub struct UreqRpc {
     endpoint: String,
-    token: String,
+    token_path: String,
     agent: ureq::Agent,
 }
 
 impl UreqRpc {
-    pub fn new(url: &str, token: &str) -> Self {
+    pub fn new(url: &str, token_path: &str) -> Self {
         let endpoint = if url.ends_with("/mcp") {
             url.to_string()
         } else {
@@ -40,26 +42,48 @@ impl UreqRpc {
         };
         Self {
             endpoint,
-            token: token.to_string(),
+            token_path: token_path.to_string(),
             agent: ureq::AgentBuilder::new()
                 .timeout(std::time::Duration::from_secs(8))
                 .build(),
         }
     }
 
-    fn post(&self, body: &str, last_event_id: Option<&str>) -> Result<ureq::Response, String> {
+    fn post_once(
+        &self,
+        token: &str,
+        body: &str,
+        last_event_id: Option<&str>,
+    ) -> Result<ureq::Response, ureq::Error> {
         let mut req = self
             .agent
             .post(&self.endpoint)
             .set("Content-Type", "application/json")
             .set("Accept", "application/json, text/event-stream")
             .set("MCP-Protocol-Version", "2026-07-28")
-            .set("Authorization", &format!("Bearer {}", self.token));
+            .set("Authorization", &format!("Bearer {token}"));
         if let Some(id) = last_event_id {
             req = req.set("Last-Event-ID", id);
         }
         req.send_string(body)
-            .map_err(|e| format!("toron events request failed: {e}"))
+    }
+
+    fn post(&self, body: &str, last_event_id: Option<&str>) -> Result<ureq::Response, String> {
+        let token = crate::events_tokens::read_token_file(std::path::Path::new(&self.token_path))?;
+        match self.post_once(&token, body, last_event_id) {
+            Err(ureq::Error::Status(401, _)) => {
+                // The token may have been rotated between requests. Re-read the
+                // file; if it changed, retry once with the fresh value.
+                let fresh =
+                    crate::events_tokens::read_token_file(std::path::Path::new(&self.token_path))?;
+                if fresh == token {
+                    return Err("toron events unauthorized (token unchanged)".to_string());
+                }
+                self.post_once(&fresh, body, last_event_id)
+                    .map_err(|e| format!("toron events request failed after re-read: {e}"))
+            }
+            other => other.map_err(|e| format!("toron events request failed: {e}")),
+        }
     }
 }
 

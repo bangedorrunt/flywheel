@@ -1302,6 +1302,23 @@ mutations = [
 ]
 
 [[behavior]]
+id = "events.token-provisioning"
+owner = "src/events_tokens.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/events_tokens.rs::minted_token_is_0600_and_journal_has_no_plaintext",
+  "src/events_tokens.rs::rotation_triggers_before_expiry_not_after",
+  "src/events_tokens.rs::token_file_is_reread_after_rotation",
+  "src/events_tokens.rs::rotate_revokes_the_old_hash_after_the_new_file_exists",
+]
+mutations = [
+  "scripts/mutations/events-tokens.spec.sh#T1",
+  "scripts/mutations/events-tokens.spec.sh#T2",
+  "scripts/mutations/events-tokens.spec.sh#T3",
+]
+
+[[behavior]]
 id = "events.claude-channel-bridge"
 owner = "src/events_client.rs"
 status = "proven"
