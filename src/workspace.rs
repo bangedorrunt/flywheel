@@ -683,6 +683,17 @@ pub enum Msg {
         pin: String,
         line: String,
     },
+    /// A mail hint from the toron events source (U8). The bus event id is
+    /// the shared dedupe key across wake.sock and events.
+    EventsHint {
+        event_id: String,
+        pin: String,
+        line: String,
+    },
+    /// The events source lost track: one digest wake, never a prompt storm.
+    EventsGap {
+        pin: String,
+    },
     /// Captain/operator injection. Prompts the captain-role pin iff
     /// prompt_allowed, else falls through to the doorbell slice.
     Fact {
@@ -1908,6 +1919,30 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                     pin: pin.clone(),
                     line: line.clone(),
                 },
+            );
+            next.doorbell = dm;
+            cmds.extend(c);
+        }
+        Msg::EventsHint {
+            event_id,
+            pin,
+            line,
+        } => {
+            let (dm, c) = doorbell_slice(
+                &model.doorbell,
+                crate::doorbell_tick::DoorbellMsg::EventsHint {
+                    event_id: event_id.clone(),
+                    pin: pin.clone(),
+                    line: line.clone(),
+                },
+            );
+            next.doorbell = dm;
+            cmds.extend(c);
+        }
+        Msg::EventsGap { pin } => {
+            let (dm, c) = doorbell_slice(
+                &model.doorbell,
+                crate::doorbell_tick::DoorbellMsg::EventsGap { pin: pin.clone() },
             );
             next.doorbell = dm;
             cmds.extend(c);

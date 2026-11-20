@@ -1661,6 +1661,16 @@ pub(crate) fn cmd_doorbell_why(
         } else if let Ok(dm) = serde_json::from_value::<doorbell_tick::DoorbellMsg>(msg_val.clone())
         {
             Some(match dm {
+                doorbell_tick::DoorbellMsg::EventsHint {
+                    event_id,
+                    pin,
+                    line,
+                } => workspace::Msg::EventsHint {
+                    event_id,
+                    pin,
+                    line,
+                },
+                doorbell_tick::DoorbellMsg::EventsGap { pin } => workspace::Msg::EventsGap { pin },
                 doorbell_tick::DoorbellMsg::WatchNdjson { line } => {
                     workspace::Msg::WatchNdjson { line }
                 }

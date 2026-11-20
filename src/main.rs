@@ -61,6 +61,8 @@ mod effect_journal;
 mod elm;
 mod events_bridge;
 mod events_client;
+#[cfg(test)]
+mod events_source;
 mod failure;
 mod fs_util;
 mod harness_api;

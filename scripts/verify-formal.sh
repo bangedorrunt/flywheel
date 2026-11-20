@@ -95,6 +95,7 @@ expect_pass SupervisorRetire SupervisorRetire
 expect_pass PeerContention PeerContention
 expect_pass ReservationBoard ReservationBoard
 expect_pass TrackerCas TrackerCas
+expect_pass EventsDedupe EventsDedupe
 
 echo "verify-formal: negative fixtures (must fail)"
 expect_violation JobLease JobLease.broken-steal NoSteal
@@ -123,6 +124,7 @@ expect_violation PeerContention PeerContention.broken-no-tiebreak AtMostOneHolde
 expect_violation ReservationBoard ReservationBoard.broken-truncated-grants NoGrantWithoutCompleteBoard
 expect_violation ReservationBoard ReservationBoard.broken-no-refresh AtMostOneHolder
 expect_violation TrackerCas TrackerCas.broken-stale-splice NoClosedRowLost
+expect_violation EventsDedupe EventsDedupe.broken-ring-twice AtMostOnceRing
 
 # Every model in the directory must be exercised: a new .tla that nobody added
 # an expectation for would otherwise pass silently as "not run".
