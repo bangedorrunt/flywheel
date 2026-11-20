@@ -9,6 +9,7 @@
 pub mod api;
 pub mod binpath;
 pub mod brain;
+pub mod effect_trace;
 pub mod error;
 pub mod file_host;
 pub mod host;

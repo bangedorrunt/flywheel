@@ -80,15 +80,31 @@ Ad hoc: `everystate -json -deadlock -config <cfg>.cfg <Model>.tla` prints one
 JSON line whose `trace` is the shortest counterexample; `-workers auto` searches
 on every core with identical results.
 
-### Trace conformance (planned, bd-uawqo)
+### Trace conformance (bd-uawqo)
 
 A model check verifies the model, not the Rust. `everystate conform -trace
 run.jsonl <Model>.tla` checks a recorded run of the real code against a model.
-Our effect journals already record every live effect in order before it runs, so
-the target is a converter from journal rows to the model's actions and
-variables, fed by an integration test, starting with the doorbell
-deferral/drain (`DeferredQueue`) and the commit CAS (`TrackerCas`). Until that
-lands, the coverage table below is the only link between model and code.
+The effect journal is already ordered and written before each effect runs, so
+it is a faithful recording.
+
+- Pure converter: `crates/doorbell-rt/src/effect_trace.rs` maps `DeferredQueue`
+  journal rows to observations naming the spec action (`Arrive`,
+  `RereadByTheIdleEdge`, `ReachPrompt`, `Ring`, `Idle`, `Audit`) and the values
+  of every model variable. No clock, socket or env in the converter.
+- Recorder: `tests/conformance_deferred_queue.rs` drives `CoreReducer` through
+  a deferral, a second producer's copy, a watch restart and the boot drain,
+  writes the real journal through `FileStore`, converts it and checks the
+  trace. Set `CONFORM_TRACE_OUT`/`CONFORM_BAD_TRACE_OUT` to regenerate the two
+  fixtures; with `FLYWHEEL_EVERYSTATE` set the test runs both checks itself.
+- Fixtures: `models/traces/DeferredQueue.recorded.jsonl` (conforms, exit 0)
+  and `models/traces/DeferredQueue.double-ring.jsonl` (a doctored second
+  `Ring`, exit 20 naming the step). Both are wired into `verify-formal.sh` via
+  `expect_conform`/`expect_nonconform`, so `clean-proof.sh` gates on them.
+- No Java: the same pinned `everystate` 0.4.1 binary does model checking and
+  conformance.
+
+Coverage is still partial: only the doorbell deferral/drain is recorded today;
+the commit/ship-land CAS (`TrackerCas`) is the next trace to add.
 
 ## Bounds, assumptions, limitations
 

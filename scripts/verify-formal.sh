@@ -77,6 +77,41 @@ expect_violation() { # model cfg invariant
   fi
 }
 
+
+conform_check() { # trace -> prints the exit code; output in $WORK/conform-<name>/out.log
+  local trace="$1" dir="$WORK/conform-$(basename "$trace")" rc=0
+  mkdir -p "$dir"
+  cp "$MODELS/DeferredQueue.tla" "$MODELS/DeferredQueue.cfg" "$dir/"
+  ( cd "$dir" && "$CHECKER" conform -trace "$trace" -config DeferredQueue.cfg DeferredQueue.tla ) >"$dir/out.log" 2>&1 || rc=$?
+  echo "$rc"
+}
+
+expect_conform() { # trace
+  local trace="$1" rc
+  rc="$(conform_check "$trace")"
+  if [ "$rc" = 0 ]; then
+    echo "  PASS  conform $(basename "$trace")"
+    passed=$((passed + 1))
+  else
+    echo "  FAIL  conform $(basename "$trace") — expected 0, got $rc" >&2
+    tail -20 "$WORK/conform-$(basename "$trace")/out.log" >&2 || true
+    failed=$((failed + 1))
+  fi
+}
+
+expect_nonconform() { # trace expected_rc step_named_in_output
+  local trace="$1" expected="$2" step="$3" rc
+  rc="$(conform_check "$trace")"
+  if [ "$rc" = "$expected" ] && grep -q "$step" "$WORK/conform-$(basename "$trace")/out.log"; then
+    echo "  PASS  conform $(basename "$trace") — exit $rc names $step"
+    passed=$((passed + 1))
+  else
+    echo "  FAIL  conform $(basename "$trace") — expected exit $expected with $step, got $rc" >&2
+    tail -20 "$WORK/conform-$(basename "$trace")/out.log" >&2 || true
+    failed=$((failed + 1))
+  fi
+}
+
 echo "verify-formal: positive models"
 expect_pass JobLease JobLease
 expect_pass BindBeforePrompt BindBeforePrompt
@@ -125,6 +160,11 @@ expect_violation ReservationBoard ReservationBoard.broken-truncated-grants NoGra
 expect_violation ReservationBoard ReservationBoard.broken-no-refresh AtMostOneHolder
 expect_violation TrackerCas TrackerCas.broken-stale-splice NoClosedRowLost
 expect_violation EventsDedupe EventsDedupe.broken-ring-twice AtMostOnceRing
+
+
+echo "verify-formal: trace conformance (recorded doorbell runs)"
+expect_conform "$PWD/$(dirname "$MODELS")/traces/DeferredQueue.recorded.jsonl"
+expect_nonconform "$PWD/$(dirname "$MODELS")/traces/DeferredQueue.double-ring.jsonl" 20 "Ring"
 
 # Every model in the directory must be exercised: a new .tla that nobody added
 # an expectation for would otherwise pass silently as "not run".
