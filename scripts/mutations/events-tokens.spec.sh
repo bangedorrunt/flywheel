@@ -18,8 +18,14 @@ mutation "T1  the token file is world-readable" \
 mutation "T2  the plaintext leaks into the mint journal" \
     file=src/events_tokens.rs \
     expect=minted_token_is_0600_and_journal_has_no_plaintext \
-    find='    journal(journal_path, &done, now_us)?;' \
-    replace='    journal(journal_path, &format!("{done} {plaintext}"), now_us)?;'
+    find='    .to_json_line(now_us);
+    journal(journal_path, &done, now_us)?;
+
+    Ok(TokenState {' \
+    replace='    .to_json_line(now_us);
+    journal(journal_path, &format!("{done} {plaintext}"), now_us)?;
+
+    Ok(TokenState {'
 
 mutation "T3  rotation waits until expiry" \
     file=src/events_tokens.rs \
