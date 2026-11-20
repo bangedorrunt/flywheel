@@ -404,36 +404,16 @@ impl EventsTransport for NoopTransport {
     }
 }
 
-/// bd-o1z4m: claim one ring per bus event id across the native stream and the
-/// doorbell fallback. `create_new` is the atomic test-and-set, so whichever
-/// path delivers first rings and the other stays silent.
+/// bd-tdpix: delegate to the ONE atomic claim module shared with the doorbell
+/// and pi extension. O_CREAT|O_EXCL picks exactly one winner per bus event id.
 pub fn rung_once(state_dir: &std::path::Path, event_id: &str) -> bool {
-    use std::io::Write as _;
-    let path = state_dir.join("wake-rung.jsonl");
-    let prior = std::fs::read_to_string(&path).unwrap_or_default();
-    if prior
-        .lines()
-        .any(|l| l.contains(&format!("\"id\":\"{event_id}\"")))
-    {
-        return false;
-    }
-    let mut rows: Vec<String> = prior.lines().map(str::to_string).collect();
-    rows.push(format!("{{\"id\":\"{event_id}\"}}"));
-    if rows.len() > 2000 {
-        rows.drain(..rows.len() - 2000);
-    }
-    if let Ok(mut file) = std::fs::File::create(&path)
-        && file.write_all((rows.join("\n") + "\n").as_bytes()).is_ok()
-    {
-        return true;
-    }
-    false
+    crate::wake_rung::claim(state_dir, event_id)
 }
 
-/// One decision for both delivery paths: a notice rings only the first time
-/// its bus event id claims the shared rung set. The doorbell (bd-f888z) reads
-/// and writes the SAME file, so a native hint and a fallback prompt for one
-/// event produce one turn, not two.
+/// One decision for both delivery paths: a notice rings only when its bus
+/// event id wins the shared atomic claim. The doorbell (bd-f888z) claims the
+/// same marker before it prompts, so a native hint and a fallback prompt for
+/// one event produce one turn, not two.
 pub fn should_ring(state_dir: &std::path::Path, notice: &serde_json::Value) -> bool {
     let event_id = notice
         .get("params")
@@ -818,12 +798,8 @@ mod tests {
             !super::should_ring(dir.path(), &notice),
             "the doorbell fallback must stay silent for the same event"
         );
-        let shared =
-            std::fs::read_to_string(dir.path().join("wake-rung.jsonl")).expect("shared set");
-        assert!(
-            shared.contains("\"id\":\"evt-42\""),
-            "one shared set: {shared}"
-        );
+        let marker = dir.path().join("wake-rung").join("evt-42.rung");
+        assert!(marker.is_file(), "one shared claim marker per bus event id");
         let other = serde_json::json!({ "params": { "meta": { "event_id": "evt-43" } } });
         assert!(super::should_ring(dir.path(), &other), "a new event rings");
     }

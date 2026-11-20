@@ -11,8 +11,12 @@ use doorbell_rt::BrainMsg;
 
 /// Canonical pull line. `toron next` classifies as `AtIdle` (a real mail
 /// wake); `SYSTEM_NOTICE_HINT` would be a silent notice that never rings.
-pub fn mail_line() -> String {
-    doorbell_core::doorbell_line(doorbell_core::EventClass::PlanePMail, "toron next")
+pub fn mail_line(event_id: &str) -> String {
+    doorbell_core::doorbell_line_with_event(
+        doorbell_core::EventClass::PlanePMail,
+        "toron next",
+        event_id,
+    )
 }
 
 /// Pure: one events-kernel command -> the brain input that feeds the existing
@@ -30,7 +34,10 @@ pub fn cmd_to_brain(pin: &str, cmd: &BridgeCmd) -> Option<BrainMsg> {
                 Some(BrainMsg::EventsHint {
                     event_id: notice.event_id.clone(),
                     pin: pin.to_string(),
-                    line: mail_line(),
+                    // bd-tdpix: the watch line MUST carry this same bus event
+                    // id, or the doorbell claims a different key than the
+                    // native paths and both ring.
+                    line: mail_line(&notice.event_id),
                 })
             }
         }
@@ -211,11 +218,34 @@ mod tests {
 
     #[test]
     fn the_events_line_is_a_real_mail_wake_not_a_silent_notice() {
-        let line = mail_line();
+        let line = mail_line("bus-evt");
         assert_eq!(
             doorbell_core::wake_kind_of_line(&line),
             doorbell_core::WakeKind::AtIdle,
             "an events hint must ring like a mail: {line}"
+        );
+    }
+
+    #[test]
+    fn the_watch_line_carries_the_same_bus_event_id() {
+        let msg = cmd_to_brain(
+            "P",
+            &BridgeCmd::Emit(events_bridge::ChannelNotice {
+                event_id: "bus-evt-777".into(),
+                event_name: "mail.addressed".into(),
+                hint: "hint".into(),
+                count: 1,
+            }),
+        )
+        .expect("a hint msg");
+        let BrainMsg::EventsHint { event_id, line, .. } = msg else {
+            panic!("expected EventsHint: {msg:?}");
+        };
+        assert_eq!(event_id, "bus-evt-777");
+        assert_eq!(
+            doorbell_core::watch_id(&line).as_deref(),
+            Some("bus-evt-777"),
+            "the doorbell must claim the same id the native paths claim"
         );
     }
 

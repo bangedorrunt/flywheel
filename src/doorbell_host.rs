@@ -1061,28 +1061,16 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// The one place a workspace `Cmd` becomes a host `Effect`.
-/// bd-4n2bn: append one rung bus-event id to the shared file the pi bridge
-/// reads. Bounded (last 2000 ids) so a long-lived host cannot grow it without
-/// limit. Best-effort: a failed write only risks a duplicate hint, never a
-/// lost wake.
-fn record_rung_id(state_dir: &std::path::Path, id: &str) {
-    use std::io::Write as _;
-    let path = state_dir.join("wake-rung.jsonl");
-    let prior = std::fs::read_to_string(&path).unwrap_or_default();
-    if prior
-        .lines()
-        .any(|l| l.contains(&format!("\"id\":\"{id}\"")))
-    {
-        return;
-    }
-    let mut rows: Vec<String> = prior.lines().map(str::to_string).collect();
-    rows.push(format!("{{\"id\":\"{id}\"}}"));
-    if rows.len() > 2000 {
-        rows.drain(..rows.len() - 2000);
-    }
-    if let Ok(mut file) = std::fs::File::create(&path) {
-        let _ = file.write_all((rows.join("\n") + "\n").as_bytes());
+/// bd-tdpix: a LOST atomic claim emits no Prompt. Pure over the effect list so
+/// the ordering (claim before ring) is witnessable without a live host.
+pub(crate) fn gate_prompt_on_claim(claimed: bool, effects: Vec<Effect>) -> Vec<Effect> {
+    if claimed {
+        effects
+    } else {
+        effects
+            .into_iter()
+            .filter(|effect| !matches!(effect, Effect::Prompt { .. }))
+            .collect()
     }
 }
 
@@ -1343,17 +1331,19 @@ impl Host for RtHost {
             eprintln!("flywheel: run-state boundary not recorded: {refusal}");
         }
         let mut effects = cmds_to_effects(cmds);
-        effects.extend(boot_drain_effects);
-        // bd-4n2bn: share the rung bus-event id with the pi bridge so a seat
-        // reached by the doorbell AND its events stream gets one turn, not two.
-        if effects.iter().any(|e| matches!(e, Effect::Prompt { .. }))
-            && let BrainMsg::Watch(line) = msg
-            && let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
-            && let Some(id) = v.get("id").and_then(serde_json::Value::as_str)
+        // bd-tdpix: claim the shared bus-event marker BEFORE any Prompt is
+        // emitted; a lost claim drops the Prompt from this tick. The boot drain
+        // carries no event id and is appended after the gate.
+        if let BrainMsg::Watch(line) = msg
+            && let Some(id) = doorbell_core::watch_id(line)
         {
-            record_rung_id(&config::state_dir(), id);
+            let claimed = crate::wake_rung::claim(&config::state_dir(), &id);
+            effects = gate_prompt_on_claim(claimed, effects);
         }
+        effects.extend(boot_drain_effects);
         if matches!(msg, BrainMsg::Sweep { .. }) {
+            // bd-tdpix: bound the shared claim directory on every sweep.
+            let _ = crate::wake_rung::sweep(&config::state_dir(), 86_400, unix_now());
             effects.extend(
                 self.pending_conflict_prompts
                     .drain(..)
@@ -2109,6 +2099,22 @@ mod parity_tests {
             "tags": tags, "content": "hello", "created_at": ts
         })
         .to_string()
+    }
+
+    #[test]
+    fn a_lost_claim_emits_no_prompt() {
+        let effects = vec![
+            Effect::Prompt {
+                pin: "ScarletCove".into(),
+                line: "wake".into(),
+            },
+            Effect::FetchInbox,
+        ];
+        let kept = super::gate_prompt_on_claim(false, effects.clone());
+        assert!(!kept.iter().any(|e| matches!(e, Effect::Prompt { .. })));
+        assert!(kept.iter().any(|e| matches!(e, Effect::FetchInbox)));
+        let won = super::gate_prompt_on_claim(true, effects);
+        assert_eq!(won.len(), 2, "a won claim keeps the Prompt");
     }
 
     #[test]

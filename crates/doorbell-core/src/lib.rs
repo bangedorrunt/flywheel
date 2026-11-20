@@ -273,10 +273,21 @@ pub fn watch_pubkey(line: &str) -> Option<String> {
 
 /// Event id on a watch NDJSON line (gap 17 trust: hint carries proof).
 pub fn watch_id(line: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(line).ok()?;
-    v.get("id")
-        .and_then(|p| p.as_str())
-        .map(std::string::ToString::to_string)
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+        && let Some(id) = v.get("id").and_then(|p| p.as_str())
+    {
+        return Some(id.to_string());
+    }
+    // A plain [doorbell] line can carry the bus event id as `event=<id>`
+    // (doorbell_line_with_event). The events extension uses this shape, so the
+    // doorbell claims the SAME id the native stream claims (bd-tdpix).
+    let id = line
+        .split("event=")
+        .nth(1)?
+        .split(['.', ' ', '\n', '\r'])
+        .next()
+        .unwrap_or("");
+    (!id.is_empty()).then(|| id.to_string())
 }
 
 /// `created_at` unix secs on a watch NDJSON line (gap 1 fix: plane-S cursor).

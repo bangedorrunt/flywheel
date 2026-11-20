@@ -142,6 +142,7 @@ mod unanswered_triage;
 mod upstream_parity;
 mod verdict;
 mod wake_liveness;
+mod wake_rung;
 mod work;
 mod workflow_catalog;
 mod workflow_lowering;
