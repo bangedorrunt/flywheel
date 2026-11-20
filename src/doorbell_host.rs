@@ -919,6 +919,7 @@ impl Host for RtHost {
     }
 
     fn tick(&mut self, msg: &BrainMsg) -> Vec<Effect> {
+        let mut boot_drain_effects: Vec<Effect> = Vec::new();
         let (wmsg, drain_waits) = match msg {
             BrainMsg::Watch(line) => (workspace::Msg::WatchNdjson { line: line.clone() }, true),
             BrainMsg::PlaneStatus { pin, status } => (
@@ -988,11 +989,22 @@ impl Host for RtHost {
             let state_dir = crate::config::state_dir();
             if !self.boot_refolded {
                 self.boot_refolded = true;
+                let mut idle_pins: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
                 for (pin, line) in crate::doorbell::unrung_deferrals_after(
                     &state_dir,
                     std::iter::once(self.workspace.clone()),
                     &|pin| crate::doorbell::pin_cursor_us(&state_dir, &self.workspace, pin),
                 ) {
+                    // bd-evuag: a pin already idle during the restart gap never
+                    // produces the working->idle edge the drain relies on. Feed
+                    // the deferral as PromptRefused (queues + status working),
+                    // then synthesize ONE idle edge below so it rings through
+                    // the normal budget and guard.
+                    let idle_at_boot = matches!(
+                        self.model.presence.get(&pin),
+                        Some(workspace::Presence::Idle { .. })
+                    );
                     let (next, cmds) = workspace::tick(
                         &self.model,
                         &workspace::Msg::PromptRefused {
@@ -1011,6 +1023,20 @@ impl Host for RtHost {
                     ) {
                         eprintln!("flywheel: boot refold journal failed: {e}");
                     }
+                    if idle_at_boot {
+                        idle_pins.insert(pin);
+                    }
+                }
+                for pin in idle_pins {
+                    let (next, drain_cmds) = workspace::tick(
+                        &self.model,
+                        &workspace::Msg::PlaneStatus {
+                            pin: pin.clone(),
+                            status: "idle".into(),
+                        },
+                    );
+                    self.model = next;
+                    boot_drain_effects.extend(cmds_to_effects(drain_cmds));
                 }
             }
             let mut journaled = true;
@@ -1081,6 +1107,7 @@ impl Host for RtHost {
             eprintln!("flywheel: run-state boundary not recorded: {refusal}");
         }
         let mut effects = cmds_to_effects(cmds);
+        effects.extend(boot_drain_effects);
         if matches!(msg, BrainMsg::Sweep { .. }) {
             effects.extend(
                 self.pending_conflict_prompts
@@ -2724,16 +2751,14 @@ mod off_runtime_tests {
             status: "idle".into(),
         });
 
-        host.tick(&BrainMsg::Sweep { now: 1 });
-        let effects = host.tick(&BrainMsg::PlaneStatus {
-            pin: "BlueRidge".into(),
-            status: "idle".into(),
-        });
+        // bd-evuag: the pin was already idle at boot, so the refolded wake must
+        // ring AT the boot sweep — no later working->idle edge will arrive.
+        let effects = host.tick(&BrainMsg::Sweep { now: 1 });
         assert!(
             effects
                 .iter()
                 .any(|e| matches!(e, Effect::Prompt { pin, .. } if pin == "BlueRidge")),
-            "the refolded wake rings at the first idle: {effects:?}"
+            "the refolded wake rings at boot: {effects:?}"
         );
 
         // The brain journals the ring; a host tick alone cannot.
@@ -2932,6 +2957,116 @@ mod off_runtime_tests {
             !died_early,
             "the embedded doorbell exited within 4s of starting: {:?}",
             h.join().map(|r| r.map_err(|e| e.to_string()))
+        );
+    }
+}
+
+#[cfg(test)]
+mod boot_drain_tests {
+    //! bd-evuag: a pin that went idle during a host restart keeps its journaled
+    //! deferrals forever if the new host only drains on a working->idle edge.
+    use super::*;
+
+    /// An unpulled deferral for a pin already idle at boot must ring on the
+    /// boot refold sweep — no working->idle edge will ever arrive.
+    #[test]
+    fn boot_refold_drains_a_deferral_for_a_pin_already_idle() {
+        let _home = crate::config::test_state_home();
+        let project = format!("boot-drain-{}", std::process::id());
+        let workspace = format!("session:boot-drain-{}", std::process::id());
+        let state_dir = crate::config::state_dir();
+        let pin = "AmberProbe";
+        let mut st = crate::doorbell::WakeState::default();
+        st.since_by_pin
+            .insert(pin.to_string(), "2023-11-14T22:14:00.000000Z".into());
+        crate::doorbell::save_wake_state(
+            &crate::doorbell::wake_state_file(&state_dir, &workspace),
+            &st,
+        )
+        .expect("save cursor older than the deferral");
+        crate::doorbell::journal_deferred_wake_with_wm(
+            &state_dir,
+            &workspace,
+            pin,
+            &crate::doorbell::deferred_wake_line(),
+            &[],
+            Some(u64::MAX), // unpulled: wm far ahead of the cursor
+        )
+        .expect("journal the handoff deferral");
+        state::save_spawn_registry(
+            &project,
+            &[crate::state::SpawnEntry::with_mail_identity(
+                "block:boot-1".to_string(),
+                "pane-boot-1".to_string(),
+                pin.to_string(),
+            )],
+        )
+        .expect("map pin to a pane");
+
+        let (tx, _rx) = mpsc::channel(8);
+        let mut host = RtHost::new(Config::default(), &project, &workspace, tx).expect("host");
+        // The pin is ALREADY idle at boot (it went idle during the restart gap).
+        host.tick(&BrainMsg::PlaneStatus {
+            pin: pin.to_string(),
+            status: "idle".into(),
+        });
+        let effects = host.tick(&BrainMsg::Sweep { now: 1 });
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Prompt { pin: p, .. } if p == pin)),
+            "an idle-at-boot pin with an unpulled deferral must be drained at boot: {effects:?}"
+        );
+    }
+
+    /// The converse: a deferral already pulled before boot must NOT ring on
+    /// the boot sweep (bd-fwt8r cursor check), even for an idle-at-boot pin.
+    #[test]
+    fn boot_refold_skips_a_deferral_already_pulled_before_boot() {
+        let _home = crate::config::test_state_home();
+        let project = format!("boot-pulled-{}", std::process::id());
+        let workspace = format!("session:boot-pulled-{}", std::process::id());
+        let state_dir = crate::config::state_dir();
+        let pin = "AmberProbe";
+        let mut st = crate::doorbell::WakeState::default();
+        st.since_by_pin
+            .insert(pin.to_string(), "2999-01-01T00:00:00.000000Z".into()); // cursor ahead
+        crate::doorbell::save_wake_state(
+            &crate::doorbell::wake_state_file(&state_dir, &workspace),
+            &st,
+        )
+        .expect("save pulled cursor");
+        crate::doorbell::journal_deferred_wake_with_wm(
+            &state_dir,
+            &workspace,
+            pin,
+            &crate::doorbell::deferred_wake_line(),
+            &[],
+            Some(1),
+        )
+        .expect("journal the handoff deferral");
+        state::save_spawn_registry(
+            &project,
+            &[crate::state::SpawnEntry::with_mail_identity(
+                "block:boot-2".to_string(),
+                "pane-boot-2".to_string(),
+                pin.to_string(),
+            )],
+        )
+        .expect("map pin to a pane");
+
+        let (tx, _rx) = mpsc::channel(8);
+        let mut host = RtHost::new(Config::default(), &project, &workspace, tx).expect("host");
+        host.tick(&BrainMsg::PlaneStatus {
+            pin: pin.to_string(),
+            status: "idle".into(),
+        });
+        let effects = host.tick(&BrainMsg::Sweep { now: 1 });
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::Prompt { pin: p, .. } if p == pin)),
+            "a pulled deferral must not ring at boot: {effects:?}"
         );
     }
 }
