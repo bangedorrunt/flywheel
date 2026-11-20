@@ -196,10 +196,6 @@ impl<R: EventsRpc> ToronEventsClient<R> {
         }
     }
 
-    pub fn subscription_id(&self) -> &str {
-        &self.sub_id
-    }
-
     /// `events/subscribe` with TTL <= 24h. Idempotent per client: a second call
     /// re-subscribes only after expiry (the caller checks `expires_us`).
     pub fn subscribe(&mut self) -> Result<i64, String> {
@@ -368,7 +364,7 @@ mod tests {
         );
         let expires = client.subscribe().expect("subscribe");
         assert_eq!(expires, 9_000_000_000);
-        assert_eq!(client.subscription_id(), "sub-1");
+        assert_eq!(client.sub_id, "sub-1");
     }
 
     #[test]
