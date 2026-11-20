@@ -126,8 +126,12 @@ test can never run by default. Anything else that spawns gets the sandbox.
 - **Clean-export proof.** A green suite over a dirty tree is not a green tree.
   Proof = `git archive HEAD` into a scratch dir and build there. In a dirty
   worktree use `scripts/clean-proof.sh` (throwaway index, intended paths
-  only); `git add` only paths you edited — never `git add -A` (other lanes
-  share the tree). **Prove your commit, not a worktree:** `clean-proof --sha
+  only). **Crew commit verb:** `flywheel commit <paths> -m <msg> [--repo <dir>]`
+  commits exactly the named paths through a private `GIT_INDEX_FILE`, runs the
+  repo's pre-commit fence on that tree, and advances HEAD by CAS retry; a
+  neighbour's staged entries stay untouched. A shared index can sweep them into
+  even `git commit -- <paths>`, so never stage-and-commit in two steps on a
+  shared tree. **Prove your commit, not a worktree:** `clean-proof --sha
   <your sha>` (or a clean export of it) is the crew-facing fence and the
   default, because one shared tree is the rule; a per-pin worktree is not the
   proof's job. A syntax error in the dirty tree must not change the result.

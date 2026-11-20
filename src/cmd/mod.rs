@@ -9,6 +9,7 @@ pub(crate) mod checkpoint;
 #[cfg(test)]
 pub(crate) mod clean_proof;
 pub(crate) mod coalition;
+pub(crate) mod commit;
 pub(crate) mod config;
 pub(crate) mod crew;
 pub(crate) mod cron;
@@ -51,6 +52,7 @@ pub(crate) use backend::{BackendCmd, cmd_backend};
 pub(crate) use captain::{CaptainCmd, cmd_captain};
 pub(crate) use checkpoint::{CheckpointCmd, cmd_checkpoint};
 pub(crate) use coalition::CoalitionCmd;
+pub(crate) use commit::cmd_commit;
 pub(crate) use config::{ConfigCmd, cmd_config};
 pub(crate) use crew::{CrewCmd, cmd_crew};
 pub(crate) use cron::CronCmd;

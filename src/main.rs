@@ -166,13 +166,14 @@ use cmd::{
     CrewCmd, CronCmd, DoorbellCmd, JudgmentCmd, LedgerCmd, LoopCmd, MailCmd, MemoryCmd, ModelCmd,
     PeerCmd, PolicyCmd, PrinciplesCmd, ProfileCmd, RunsCmd, ShipCmd, SlotCmd, SquadCmd, StackCmd,
     StageCmd, StandingOrdersCmd, SwarmCmd, WorkCmd, WorkflowCmd, WorktreeCmd, XprojCmd, cmd_agent,
-    cmd_analytics, cmd_audit, cmd_backend, cmd_captain, cmd_changes, cmd_checkpoint, cmd_config,
-    cmd_crew, cmd_doorbell_digest, cmd_doorbell_gc, cmd_doorbell_inject, cmd_doorbell_introduce,
-    cmd_doorbell_re_inject, cmd_doorbell_roster, cmd_doorbell_start, cmd_doorbell_status,
-    cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_history, cmd_internal_doorbell, cmd_judgment,
-    cmd_ledger, cmd_mail, cmd_memory, cmd_models, cmd_peer, cmd_policy, cmd_prefer, cmd_principles,
-    cmd_resume, cmd_retire, cmd_runs, cmd_ship, cmd_slot, cmd_stack, cmd_stage,
-    cmd_standing_orders, cmd_swarm, cmd_timeline, cmd_work, cmd_worktree, cmd_xproj,
+    cmd_analytics, cmd_audit, cmd_backend, cmd_captain, cmd_changes, cmd_checkpoint, cmd_commit,
+    cmd_config, cmd_crew, cmd_doorbell_digest, cmd_doorbell_gc, cmd_doorbell_inject,
+    cmd_doorbell_introduce, cmd_doorbell_re_inject, cmd_doorbell_roster, cmd_doorbell_start,
+    cmd_doorbell_status, cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_history,
+    cmd_internal_doorbell, cmd_judgment, cmd_ledger, cmd_mail, cmd_memory, cmd_models, cmd_peer,
+    cmd_policy, cmd_prefer, cmd_principles, cmd_resume, cmd_retire, cmd_runs, cmd_ship, cmd_slot,
+    cmd_stack, cmd_stage, cmd_standing_orders, cmd_swarm, cmd_timeline, cmd_work, cmd_worktree,
+    cmd_xproj,
     coalition::cmd_coalition,
     cron::cmd_cron,
     debate::{cmd_debate, cmd_plan_review},
@@ -1749,6 +1750,18 @@ enum Commands {
     Ship {
         #[command(subcommand)]
         cmd: ShipCmd,
+    },
+    /// Commit exactly the named paths through a private git index, so another
+    /// lane's staged files can never be swept in (bd-aberm).
+    Commit {
+        /// repo-relative paths to commit (repeatable)
+        paths: Vec<String>,
+        /// commit message
+        #[arg(short, long)]
+        message: String,
+        /// repo directory (default: current directory)
+        #[arg(long)]
+        repo: Option<String>,
     },
     /// Interactive walkthrough
     Tutorial,
@@ -3903,6 +3916,11 @@ fn main() {
         }
         Some(Commands::Stack { cmd }) => cmd_stack(&cfg, cmd),
         Some(Commands::Ship { cmd }) => cmd_ship(&cfg, cmd),
+        Some(Commands::Commit {
+            paths,
+            message,
+            repo,
+        }) => cmd_commit(paths, message, repo.as_deref()),
         Some(Commands::Tutorial) => cmd_tutorial(),
         #[cfg(feature = "serve")]
         Some(Commands::Daemon { cmd }) => cmd_daemon(&cfg, cmd),
