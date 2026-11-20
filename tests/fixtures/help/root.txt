@@ -9,6 +9,7 @@ User config is `~/.config/flywheel`, or `$XDG_CONFIG_HOME/flywheel`. That direct
 Usage: flywheel [OPTIONS] [COMMAND]
 
 Commands:
+  hook               Report a harness hook event (bd-b2kaa): writes per-seat turn state and prints at most one continuation line. Hooks install this at spawn
   init               Scaffold a project (ensure dir + .beads + the project-scope compound spine: .flywheel/stages.toml, .flywheel/standing-orders.md, chiebukuro as the learning store) without spawning
   spawn              Spawn a swarm (escape hatch). Default multi-lane is `workflow compose --parts wave-swarm --run`
   swarm              ADR-0022 rollout 6: front the plan (`plan`), a live patch (`apply`), and the live seat view (`status`). `plan` prints the same flywheel-plan.v1 object as `spawn --dry-run --json`
