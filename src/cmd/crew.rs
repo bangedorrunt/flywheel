@@ -1016,6 +1016,25 @@ fn resolve_receipt(
     }
 }
 
+/// bd-r7852: persist the typed receipt's RED witnesses so `ship land` can
+/// count them on a no-mutation proof receipt. A malformed store is replaced by
+/// a fresh one rather than trusted.
+fn record_mutation_witnesses(r: &crate::crew_receipt::CrewReceipt) -> Result<()> {
+    let Some(rows) = &r.witnesses else {
+        return Ok(());
+    };
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let path = crate::config::state_dir().join(crate::mutation_witnesses::STORE_FILE);
+    let mut store = crate::mutation_witnesses::Store::load(&path);
+    for witness in rows {
+        store.insert(witness.clone());
+    }
+    store.save(&path)?;
+    Ok(())
+}
+
 fn cmd_crew_done(
     cfg: &Config,
     project: &str,
@@ -1037,6 +1056,7 @@ fn cmd_crew_done(
                 parsed.brief_id
             );
         }
+        record_mutation_witnesses(&parsed)?;
     }
     let effects = book.reduce(crate::crew_briefs::Msg::Done {
         id: brief.to_string(),
@@ -1570,6 +1590,29 @@ mod bd_9nck5_tests {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn crew_done_witnesses_are_written_to_the_store() {
+        let _guard = crate::config::lock_env();
+        let mut receipt = crate::crew_receipt::parse(&format!(
+            r#"{{"schema":"flywheel-crew-receipt.v1","brief_id":"b","beads":[{{"id":"bd-x","repo":".","sha":"{}"}}],"fence":{{"sha":"{}","verdict":"green"}},"tests":{{"cmd":"c","tail":"t"}}}}"#,
+            "a".repeat(40),
+            "a".repeat(40)
+        ))
+        .expect("parse receipt");
+        receipt.witnesses = Some(vec![crate::mutation_witnesses::Witness {
+            spec: "scripts/mutations/demo.spec.sh".to_string(),
+            sha: "a".repeat(40),
+            verdict: "RED".to_string(),
+            key: "k1".to_string(),
+        }]);
+        record_mutation_witnesses(&receipt).expect("record witnesses");
+        let path = crate::config::state_dir().join(crate::mutation_witnesses::STORE_FILE);
+        let store = crate::mutation_witnesses::Store::load(&path);
+        let rows = store.for_key("k1");
+        assert_eq!(rows.len(), 1, "the witness is persisted");
+        assert_eq!(rows[0].spec, "scripts/mutations/demo.spec.sh");
+    }
 
     #[derive(Parser, Debug)]
     struct Cli {

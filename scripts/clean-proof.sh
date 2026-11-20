@@ -439,7 +439,9 @@ if [ -n "$MUTATIONS_MODE" ] && [ -z "$FAILED_STEP" ]; then
     # bd-b2yg7: ONE target dir for the whole proof, owned by this export, shared
     # by every mutation run instead of cold-building a new one per spec. It is
     # never the shared mbx cache that bd-6setu.20 showed can be evicted mid-run.
-    proof_env=(RUSTFLAGS="" "VERIFY_MUTATIONS_TARGET_DIR=$TMP/target")
+    # bd-r7852: ONE scratch tree for the whole proof (siblings exported once),
+    # plus ONE warm build dir. TMP is removed at proof exit.
+    proof_env=(RUSTFLAGS="" "VERIFY_MUTATIONS_TARGET_DIR=$TMP/target" "VERIFY_MUTATIONS_BUILD_DIR=$TMP/mut-tree")
     [ -n "$TORON_BIN_BUILT" ] && proof_env+=("TORON_BIN=$TORON_BIN_BUILT")
     env "${proof_env[@]}" bash scripts/verify-mutations.sh "$spec" --cargo "$wrapper" \
       --cache-key "$mut_key" --cache-dir "$CACHE_DIR" \

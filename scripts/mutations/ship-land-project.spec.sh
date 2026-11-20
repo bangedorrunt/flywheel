@@ -69,8 +69,8 @@ mutation "L10  the gate note leads with the proven sha" \
 mutation "L6  an empty mutation set lands without re-deriving the targets" \
     file=$SHIP \
     expect=a_receipt_is_bound_to_the_commit_it_proved \
-    find='        if let Some(path) = changed.iter().find(|p| spec_targets_include(root, p)) {' \
-    replace='        if let Some(path) = changed.iter().find(|_p| false) {'
+    find='        let specs = changed_mutation_specs(root, &changed);' \
+    replace='        let specs: Vec<String> = Vec::new();'
 
 mutation "L7  a dirty-tree receipt lands a commit" \
     file=$SHIP \

@@ -549,22 +549,30 @@ fn land_project(cfg: &Config, dir: &Path, explicit: Option<&str>) -> Result<Stri
 /// (RED for a live guard, GREEN for a guard believed dead), and every row's
 /// `<spec>#<id>` must still resolve in `scripts/mutations/<spec>` so a receipt
 /// cannot cite a mutation the tree no longer has.
-/// Does any mutation spec target this production file? Re-derived at landing
-/// time from the specs themselves, so a receipt cannot claim "nothing to
-/// re-prove" about a file a spec actually covers.
-fn spec_targets_include(root: &Path, path: &str) -> bool {
-    let harness = root.join("scripts/verify-mutations.sh");
-    if !harness.is_file() {
-        // No harness to re-derive with: assume the path IS covered, so a
-        // missing tool can only make a landing stricter, never skip a witness.
-        return true;
+/// Specs whose verdict a landing must account for: a spec named directly in
+/// the changed paths, or a spec whose target file changed. Re-derived from the
+/// harness, never trusted from the receipt (bd-m5afp, bd-r7852).
+fn changed_mutation_specs(root: &Path, changed: &[&str]) -> Vec<String> {
+    let mut specs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for path in changed {
+        if let Some(name) = path
+            .strip_prefix("scripts/mutations/")
+            .and_then(|s| s.strip_suffix(".spec.sh"))
+        {
+            specs.insert(name.to_string());
+        }
     }
     let Ok(entries) = std::fs::read_dir(root.join("scripts/mutations")) else {
-        return false;
+        return specs.into_iter().collect();
     };
     for entry in entries.filter_map(|e| e.ok()) {
         let spec = entry.path();
         if spec.extension().and_then(|e| e.to_str()) != Some("sh") {
+            continue;
+        }
+        let file = spec.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let full = format!("scripts/mutations/{file}");
+        if specs.contains(&full) {
             continue;
         }
         let Ok(out) = Command::new("bash")
@@ -576,13 +584,52 @@ fn spec_targets_include(root: &Path, path: &str) -> bool {
         else {
             continue;
         };
-        for row in String::from_utf8_lossy(&out.stdout).lines() {
-            if row.rsplit('\t').next() == Some(path) {
-                return true;
+        let listing = String::from_utf8_lossy(&out.stdout);
+        let mut targets: Vec<String> = listing
+            .lines()
+            .filter_map(|row| row.rsplit('\t').next().map(str::to_string))
+            .collect();
+        if targets.is_empty() {
+            // A spec with no CARGO_ARGS cannot be listed; still read its
+            // file= declarations so a target change can never skip a witness.
+            if let Ok(text) = std::fs::read_to_string(&spec) {
+                for token in text.split_whitespace() {
+                    if let Some(path) = token.strip_prefix("file=") {
+                        targets.push(path.trim_end_matches('\\').to_string());
+                    }
+                }
             }
         }
+        if changed
+            .iter()
+            .any(|path| targets.iter().any(|target| target == path))
+        {
+            specs.insert(full);
+        }
     }
-    false
+    specs.into_iter().collect()
+}
+
+/// Every changed spec needs a RED witness on the proven sha or one of its
+/// ancestors, with a content key recomputed from the proven tree. A stale key
+/// (spec or target edited after the witness) cannot count (bd-r7852).
+fn crew_witnesses_cover(root: &Path, proved: &str, driver: &str, specs: &[String]) -> Result<()> {
+    let store_path = crate::config::state_dir().join(crate::mutation_witnesses::STORE_FILE);
+    let store = crate::mutation_witnesses::Store::load(&store_path);
+    for spec in specs {
+        let key = cache_key_at(root, proved, spec, driver)?;
+        let covered = store
+            .for_key(&key)
+            .iter()
+            .any(|w| w.verdict == "RED" && (w.sha == proved || is_ancestor(root, &w.sha, proved)));
+        if !covered {
+            bail!(
+                "changed mutation spec {spec} has no RED witness on {proved} or an ancestor — \
+                 re-run it and close the brief with a typed receipt carrying witnesses"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Is `rev` a commit in this repo?
@@ -725,12 +772,22 @@ fn receipt_is_landable(root: &Path, receipt: &Path, sha: &str) -> Result<()> {
         if !base_is_a_commit(root, base) {
             bail!("proof receipt cites mutations_base {base}, which is not a commit here");
         }
-        if let Some(path) = changed.iter().find(|p| spec_targets_include(root, p)) {
+        // bd-r7852: a no-mutation proof lands when typed crew witnesses cover
+        // every changed spec. The witness store is keyed by a content key
+        // recomputed from the proven sha, so an edit after the witness cannot
+        // vouch for the newer tree.
+        let specs = changed_mutation_specs(root, &changed);
+        if specs.is_empty() {
+            return Ok(());
+        }
+        let driver = doc.get("driver_sha").and_then(Value::as_str).unwrap_or("");
+        if driver.is_empty() {
             bail!(
-                "proof receipt ran no mutation but {path} is a spec target — re-prove with \
-                 `--mutations changed` (its base is too new) or `--mutations full`"
+                "proof receipt carries no driver_sha — need witnesses for {} to land a no-mutation proof",
+                specs.join(", ")
             );
         }
+        crew_witnesses_cover(root, proved, driver, &specs)?;
         return Ok(());
     }
     let Some(rows) = rows_opt else {
@@ -1015,8 +1072,8 @@ pub(crate) fn ship_land(args: LandArgs<'_>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        gate_for, head_has_closed_bead, head_names_bead, land_project, parse_legal_gates,
-        pick_gate, receipt_is_landable, status_of,
+        cache_key_at, gate_for, head_has_closed_bead, head_names_bead, land_project,
+        parse_legal_gates, pick_gate, receipt_is_landable, status_of,
     };
     use crate::config::Config;
     use std::process::Command;
@@ -1329,7 +1386,7 @@ live-verified. Record one BEFORE closing."#;
             receipt_is_landable(repo.path(), &covered, &sha).unwrap_err()
         );
         assert!(
-            err.contains("is a spec target"),
+            err.contains("has no RED witness"),
             "an uncovered-looking receipt cannot skip a covered file: {err}"
         );
 
@@ -1613,6 +1670,138 @@ live-verified. Record one BEFORE closing."#;
         assert!(
             !head_names_bead(store.path(), work.path(), "bd-nobody").unwrap(),
             "no repo carrying the id is still a refusal, not an error"
+        );
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A repo whose mutation spec targets src/lib.rs, with the harness scripts
+    /// the content key needs, committed at one sha.
+    fn witness_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = env!("CARGO_MANIFEST_DIR");
+        for script in ["verify-mutations.sh", "proof-lib.sh", "mutation-cache.py"] {
+            std::fs::create_dir_all(dir.path().join("scripts")).expect("scripts dir");
+            std::fs::copy(
+                format!("{root}/scripts/{script}"),
+                dir.path().join("scripts").join(script),
+            )
+            .expect("copy script");
+        }
+        std::fs::copy(format!("{root}/Cargo.lock"), dir.path().join("Cargo.lock"))
+            .expect("copy lock");
+        std::fs::create_dir_all(dir.path().join("scripts/mutations")).expect("mutations dir");
+        std::fs::write(
+            dir.path().join("scripts/mutations/demo.spec.sh"),
+            "# shellcheck shell=bash\nCARGO_ARGS=(--bin demo)\nTEST_FILTER=(demo_test)\n\nmutation \"D1\" file=src/lib.rs expect=demo_test find='a' replace='b'\n",
+        )
+        .expect("write spec");
+        std::fs::create_dir_all(dir.path().join("src")).expect("src dir");
+        std::fs::write(dir.path().join("src/lib.rs"), "fn demo_test() {}\n").expect("write lib");
+        git_in(dir.path(), &["init", "-q"]);
+        git_in(dir.path(), &["config", "user.email", "witness@example.com"]);
+        git_in(dir.path(), &["config", "user.name", "Witness"]);
+        git_in(dir.path(), &["add", "-A"]);
+        git_in(dir.path(), &["commit", "-qm", "base"]);
+        dir
+    }
+
+    fn no_mutation_receipt(path: &std::path::Path, sha: &str) {
+        let doc = serde_json::json!({
+            "ok": true,
+            "sha": sha,
+            "mode": "sha",
+            "mutations": [],
+            "mutations_mode": "changed",
+            "mutations_base": sha,
+            "changed_paths": ["src/lib.rs"],
+            "driver_sha": sha,
+        });
+        std::fs::write(path, doc.to_string()).expect("write receipt");
+    }
+
+    fn store_witness(sha: &str, key: &str) {
+        let path = crate::config::state_dir().join(crate::mutation_witnesses::STORE_FILE);
+        let mut store = crate::mutation_witnesses::Store::load(&path);
+        store.insert(crate::mutation_witnesses::Witness {
+            spec: "scripts/mutations/demo.spec.sh".to_string(),
+            sha: sha.to_string(),
+            verdict: "RED".to_string(),
+            key: key.to_string(),
+        });
+        store.save(&path).expect("save witness store");
+    }
+
+    #[test]
+    fn a_crew_witness_lands_a_no_mutation_proof() {
+        let _guard = crate::config::lock_env();
+        let dir = witness_repo();
+        let sha = git_in(dir.path(), &["rev-parse", "HEAD"]);
+        let key = cache_key_at(dir.path(), &sha, "scripts/mutations/demo.spec.sh", &sha)
+            .expect("cache key");
+        store_witness(&sha, &key);
+        let receipt = dir.path().join("receipt.json");
+        no_mutation_receipt(&receipt, &sha);
+        assert!(receipt_is_landable(dir.path(), &receipt, &sha).is_ok());
+    }
+
+    #[test]
+    fn a_missing_witness_is_refused_and_names_the_spec() {
+        let _guard = crate::config::lock_env();
+        let dir = witness_repo();
+        let sha = git_in(dir.path(), &["rev-parse", "HEAD"]);
+        let receipt = dir.path().join("receipt.json");
+        no_mutation_receipt(&receipt, &sha);
+        let err = receipt_is_landable(dir.path(), &receipt, &sha)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("demo.spec.sh"),
+            "the spec must be named: {err}"
+        );
+    }
+
+    #[test]
+    fn a_witness_for_an_older_spec_key_is_stale() {
+        let _guard = crate::config::lock_env();
+        let dir = witness_repo();
+        let sha = git_in(dir.path(), &["rev-parse", "HEAD"]);
+        let key = cache_key_at(dir.path(), &sha, "scripts/mutations/demo.spec.sh", &sha)
+            .expect("cache key");
+        store_witness(&sha, &key);
+        // Land a NEW commit that edits the target after the witness: the key
+        // recomputed at that sha no longer matches the recorded one.
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "fn demo_test() { let _ = 1; }\n",
+        )
+        .expect("edit target");
+        git_in(dir.path(), &["add", "src/lib.rs"]);
+        git_in(
+            dir.path(),
+            &["commit", "-qm", "target edited after witness"],
+        );
+        let newer = git_in(dir.path(), &["rev-parse", "HEAD"]);
+        let receipt = dir.path().join("receipt.json");
+        no_mutation_receipt(&receipt, &newer);
+        let err = receipt_is_landable(dir.path(), &receipt, &newer)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("demo.spec.sh"),
+            "the spec must be named: {err}"
         );
     }
 }

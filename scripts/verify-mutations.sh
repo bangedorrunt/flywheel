@@ -547,14 +547,28 @@ isolate_if_shared() {
     git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || return 0
     local repo_abs
     repo_abs="$(cd "$repo" && pwd)"
-    local export_root export
-    export_root="$(mktemp -d "${TMPDIR:-/tmp}/verify-mutations-export.XXXXXX")"
+    local export_root export reuse=0
+    # bd-r7852: a proof owns ONE scratch tree for every spec. Reuse it instead
+    # of exporting HEAD again per mutant run; the proof's temp dir removes it
+    # at exit, so this process must not claim the cleanup trap.
+    if [ -n "${VERIFY_MUTATIONS_BUILD_DIR:-}" ]; then
+        export_root="$VERIFY_MUTATIONS_BUILD_DIR"
+        mkdir -p "$export_root"
+    else
+        export_root="$(mktemp -d "${TMPDIR:-/tmp}/verify-mutations-export.XXXXXX")"
+    fi
+    export="$export_root/$(basename "$repo_abs")"
+    [ -f "$export/scripts/verify-mutations.sh" ] && reuse=1
     # Failures before the exec (git archive, overlay, arg rewrite) must not leak
     # either. The exec replaces this process; the child installs its own trap.
-    OWNED_EXPORT_ROOT="$export_root"
-    export VERIFY_MUTATIONS_EXPORT_ROOT="$export_root"
+    if [ "$reuse" -eq 0 ] && [ -z "${VERIFY_MUTATIONS_BUILD_DIR:-}" ]; then
+        OWNED_EXPORT_ROOT="$export_root"
+    fi
+    if [ -z "${VERIFY_MUTATIONS_BUILD_DIR:-}" ]; then
+        export VERIFY_MUTATIONS_EXPORT_ROOT="$export_root"
+    fi
     trap cleanup_export EXIT
-    export="$export_root/$(basename "$repo_abs")"
+    if [ "$reuse" -eq 0 ]; then
     mkdir -p "$export"
     git -C "$repo" archive HEAD | tar -x -C "$export" || {
         echo "verify-mutations: cannot export HEAD from $repo" >&2
@@ -590,6 +604,7 @@ isolate_if_shared() {
         # The re-exec sources proof-lib.sh beside itself; carry it into the
         # scratch export so a fixture repo without one still exports pins.
         cp "$SELF_DIR/proof-lib.sh" "$export/scripts/proof-lib.sh"
+    fi
     fi
     local out_args=()
     i=0
@@ -775,6 +790,7 @@ main() {
     echo "control green"
 
     local i verdict proven=0 dead=0 alive=0 total="${#M_LABEL[@]}"
+    local peak_disk_kb=0
     for i in $(seq 0 $((total - 1))); do
         snapshot_restore
         if ! grep -qF -- "${M_FIND[$i]}" "$REPO/${M_FILE[$i]}"; then
@@ -810,6 +826,13 @@ main() {
         touch "$REPO/${M_FILE[$i]}"
         local mut_out
         mut_out="$(run_tests)"
+        # bd-r7852: report the largest build tree this run reached, so a proof
+        # receipt can name the disk cost instead of leaving GB behind silently.
+        if [ -n "${CARGO_TARGET_DIR:-}" ] && [ -d "$CARGO_TARGET_DIR" ]; then
+            local now_kb
+            now_kb="$(du -sk "$CARGO_TARGET_DIR" 2>/dev/null | awk '{print $1}')"
+            [ -n "$now_kb" ] && [ "$now_kb" -gt "$peak_disk_kb" ] && peak_disk_kb="$now_kb"
+        fi
         verdict="$(classify "$mut_out" "${M_EXPECT[$i]}")"
         # A green-expected mutation asks the opposite question: this guard is
         # supposed to be dead, so a green suite is the ANSWER and a red one is
@@ -857,6 +880,8 @@ main() {
     # class (nothing MISS/OTHER/VACUOUS/BUILD).
     printf '%s/%s mutations accounted for (%s red, %s dead)\n' \
         "$((proven + dead))" "$total" "$proven" "$dead"
+    printf 'verify-mutations: peak disk %s KB in %s\n' \
+        "$peak_disk_kb" "${CARGO_TARGET_DIR:-<none>}"
     [ "$restored_ok" = yes ] && [ "$((proven + dead))" -eq "$total" ]
 }
 

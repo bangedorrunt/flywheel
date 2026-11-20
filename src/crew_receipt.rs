@@ -45,6 +45,9 @@ pub struct CrewReceipt {
     pub tests: Tests,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mutations: Option<Vec<String>>,
+    /// RED mutation witnesses counted at landing (bd-r7852).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub witnesses: Option<Vec<crate::mutation_witnesses::Witness>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
 }

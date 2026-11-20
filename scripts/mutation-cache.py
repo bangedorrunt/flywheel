@@ -205,6 +205,11 @@ def computed_key(args) -> str:
                 die(f"scripts/verify-mutations.sh does not exist at {args.proven}")
             os.makedirs(os.path.join(tmp, "scripts"), exist_ok=True)
             pathlib.Path(tmp, "scripts/verify-mutations.sh").write_bytes(harness)
+            # The harness sources proof-lib.sh beside itself; carry it too so
+            # --proven key computation can list specs (bd-r7852).
+            proof_lib = git_show("scripts/proof-lib.sh")
+            if proof_lib is not None:
+                pathlib.Path(tmp, "scripts/proof-lib.sh").write_bytes(proof_lib)
             return key_for(git_show, tmp, args.spec, args.driver, declaring)
     if not args.root:
         die("one of --root or --proven is required")
