@@ -159,7 +159,11 @@ export default function flywheelEvents(pi: ExtensionAPI): void {
           }
           const frames: EventFrame[] = [];
           const rungDir = process.env.FLYWHEEL_WAKE_RUNG_DIR;
-          sweepRung(rungDir ?? "", 3_600, Math.floor(Date.now() / 1000));
+          // ONE TTL for every claimer (bd-tdpix): spawn exports the doorbell's
+          // WAKE_RUNG_TTL_SECS so pi never deletes a marker the doorbell needs.
+          const ttlSecs = Number(process.env.FLYWHEEL_WAKE_RUNG_TTL_SECS ?? 86400);
+          sweepRung(rungDir ?? "", Number.isFinite(ttlSecs) && ttlSecs > 0 ? ttlSecs : 86400,
+            Math.floor(Date.now() / 1000));
           for (const data of page.raw) {
             const f = decodeFrame(data, sub);
             if (!f || !deduper.isNew(f.id)) continue;
