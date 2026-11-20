@@ -32,10 +32,11 @@ impl Fixture {
         std::fs::create_dir_all(dir.path().join("scripts/mutations")).unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/x.rs"), target_body).unwrap();
+        std::fs::write(dir.path().join("src/t.rs"), "#[test]\nfn a_test() {}\n").unwrap();
         std::fs::write(
             dir.path().join("scripts/mutations/demo.spec.sh"),
             format!(
-                "mutation \"D1  a decision\" \\\n    file=src/x.rs \\\n    find='{find}' \\\n    replace='other' \\\n    expect=a_test\n"
+                "TEST_FILTER=(a_test)\nmutation \"D1  a decision\" \\\n    file=src/x.rs \\\n    find='{find}' \\\n    replace='other' \\\n    expect=a_test\n"
             ),
         )
         .unwrap();
