@@ -1,0 +1,9 @@
+     ⠋ 3 commands, 2 thoughts                                                                                                                                   ▄                                            
+                                                                                                                                                                     BlackRidge Flywheel setup               
+  ┃                                                                                                                                                                                                          
+  ┃                                                                                                                                                                  Context                              █  
+  ┃                                                                                                                                                                  497,691 tokens                          
+  ┃  Build auto · Hy4 flash Free OpenCode Go · high                                                                                                                  47% used                                
+                                                                                                                                                                                                             
+   ⬝⬝⬝⬝⬝⬝⬝⬝ esc interrupt                                                                                                           497.7K (47%)  ctrl+p commands    …/w…/flywheel:adr-0021-stage-contracts  
+                                                                                                                                                                                                             

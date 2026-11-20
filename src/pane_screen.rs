@@ -60,23 +60,64 @@ fn trim_box_edge(text: &str) -> &str {
     })
 }
 
+/// A marker only counts at the left edge of a row — that is the input box's
+/// border column. A marker inside a sidebar row is not a second input box.
+fn marker_at(line: &str, marker: &str) -> Option<usize> {
+    let at = line.find(marker)?;
+    line[..at].chars().all(char::is_whitespace).then_some(at)
+}
+
+/// The right sidebar draws its own text on the same terminal rows as the input
+/// box, past a wide blank gap. Its first column is the right edge of the input
+/// region: cells at or past it are never typed input (bd-3p7pe). No gap means
+/// no sidebar, and the whole row is input as before.
+fn sidebar_column(tail: &str, marker: &str) -> Option<usize> {
+    let mut bound = None;
+    for line in tail.lines() {
+        let Some(at) = marker_at(line, marker) else {
+            continue;
+        };
+        let bytes = line.as_bytes();
+        let mut i = at + marker.len();
+        while i < bytes.len() {
+            let start = i;
+            while i < bytes.len() && bytes[i] == b' ' {
+                i += 1;
+            }
+            if i - start >= 12 && i < bytes.len() {
+                bound = Some(bound.map_or(i, |b: usize| b.min(i)));
+                break;
+            }
+            if i == start {
+                i += 1;
+            }
+        }
+    }
+    bound
+}
+
 /// The content line of a marker-prefixed input box, scanning up from the tail.
 ///
 /// `skip` drops the footer lines the same box character draws under the input
 /// (opencode prints its model line there). `None` means there is no such box on
 /// screen at all.
 fn marker_box(tail: &str, marker: &str, skip: &dyn Fn(&str) -> bool) -> Option<String> {
+    let right = sidebar_column(tail, marker);
     let mut saw_box = false;
     for line in tail.lines().rev() {
-        let trimmed = line.trim_start();
-        let Some(rest) = trimmed.strip_prefix(marker) else {
+        let Some(at) = marker_at(line, marker) else {
             // The box is the contiguous marker run nearest the bottom.
-            if saw_box && !trimmed.is_empty() {
+            if saw_box && !line.trim().is_empty() {
                 break;
             }
             continue;
         };
-        let text = trim_box_edge(rest.trim());
+        let start = at + marker.len();
+        let end = right.map_or(line.len(), |b| b.min(line.len()));
+        if start > end {
+            continue;
+        }
+        let text = trim_box_edge(line[start..end].trim());
         if skip(text) {
             continue;
         }

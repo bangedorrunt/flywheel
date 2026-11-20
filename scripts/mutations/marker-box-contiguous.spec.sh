@@ -7,7 +7,7 @@ TEST_FILTER=(every_captured_screen_classifies)
 mutation "M1  marker_box walks past non-marker lines into history" \
     file=src/pane_screen.rs \
     expect=every_captured_screen_classifies \
-    find='            if saw_box && !trimmed.is_empty() {
+    find='            if saw_box && !line.trim().is_empty() {
                 break;
             }' \
-    replace='            let _ = (saw_box, trimmed);'
+    replace='            let _ = saw_box;'

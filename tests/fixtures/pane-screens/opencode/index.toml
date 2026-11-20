@@ -65,3 +65,9 @@ expect = "empty"
 [[screen]]
 file = "history-keybind-mentions.txt"
 expect = "empty"
+
+# bd-3p7pe: REAL capture of BlackRidge's pane with the right sidebar open.
+# The sidebar shares input-box rows and used to be read as operator typing.
+[[screen]]
+file = "sidebar-empty-box.txt"
+expect = "empty"
