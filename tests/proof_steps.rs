@@ -27,7 +27,8 @@ fn proof_suite_step_runs_the_tests_directory() {
 
 /// bd-proof-toron-bin: the suite step builds the pinned sibling toron and the
 /// tests that need it pass; the mutation stage runs in verify-mutations' own
-/// scratch export, whose ../toron link points at the WORKSPACE tree. Proven at
+/// scratch export, whose ../toron is now (bd-5j8ri) the PINNED sibling source.
+/// Proven at
 /// f5971320: adr0027-s1-receipts passed the suite and its mutation control
 /// panicked with "toron CLI not found at <export>/flywheel/../toron/...".
 /// clean-proof must hand the built path to the mutation stage, and the
@@ -114,6 +115,25 @@ fn proof_verify_mutations_never_edits_the_shared_tree() {
     assert!(
         status.success(),
         "scripts/test-verify-mutations-isolation.sh failed"
+    );
+}
+
+/// bd-5j8ri: a verify-mutations scratch export must carry the siblings pinned
+/// by the revision under test, so another lane's dirty toron worktree cannot
+/// turn a flywheel mutant green or unbuildable.
+#[test]
+fn proof_verify_mutations_exports_pinned_siblings() {
+    let status = Command::new("bash")
+        .arg(format!(
+            "{}/scripts/test-verify-mutations-pinned-siblings.sh",
+            root()
+        ))
+        .current_dir(root())
+        .status()
+        .expect("run scripts/test-verify-mutations-pinned-siblings.sh");
+    assert!(
+        status.success(),
+        "scripts/test-verify-mutations-pinned-siblings.sh failed"
     );
 }
 

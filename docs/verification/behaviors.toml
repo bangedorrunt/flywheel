@@ -1302,6 +1302,18 @@ mutations = [
 ]
 
 [[behavior]]
+id = "proof.verify-mutations-pinned-siblings"
+owner = "scripts/verify-mutations.sh"
+status = "proven"
+concurrent = false
+tests = [
+  "tests/proof_steps.rs::proof_verify_mutations_exports_pinned_siblings",
+]
+mutations = [
+  "scripts/mutations/verify-mutations-pinned-siblings.spec.sh#P1",
+]
+
+[[behavior]]
 id = "commit.private-index-cas"
 owner = "src/cmd/commit.rs"
 status = "proven"

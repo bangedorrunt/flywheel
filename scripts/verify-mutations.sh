@@ -64,6 +64,12 @@ VERDICT_ABORTED="ABORTED"
 VERDICT_DEAD="DEAD-CONFIRMED"
 VERDICT_ALIVE="STILL-LOAD-BEARING"
 
+# bd-5j8ri: siblings come from the revision under test's proof.toml, exported
+# at their pinned rev like clean-proof and fence --sha, never from the live tree.
+SELF_DIR="$(cd "$(dirname "$SELF_PATH")" && pwd)"
+# shellcheck source=proof-lib.sh
+. "$SELF_DIR/proof-lib.sh"
+
 # Parallel indexed arrays; bash 3.2 has no associative ones.
 M_LABEL=()
 M_FILE=()
@@ -555,13 +561,19 @@ isolate_if_shared() {
         exit 2
     }
     # Sibling path deps (`../toron`, `../elm-effect-rs`) resolve against the
-    # export's parent, so mirror the workspace layout with links.
-    local sibling
-    for sibling in "$(dirname "$repo_abs")"/*; do
-        [ -d "$sibling/.git" ] || continue
-        [ "$sibling" = "$repo_abs" ] && continue
-        ln -sfn "$sibling" "$export_root/$(basename "$sibling")"
-    done
+    # export's parent. Export each at the rev pinned by the revision under test
+    # (bd-5j8ri): another lane's dirty toron worktree must not break a flywheel
+    # mutant run. proof_archive reads git objects, never the live sibling tree.
+    local rel pin sib_repo sib_name
+    while IFS=$'\t' read -r rel pin; do
+        [ -n "${rel:-}" ] || continue
+        sib_repo="$(cd "$repo_abs/$rel" && pwd)"
+        sib_name="$(basename "$rel")"
+        proof_archive "$sib_repo" "$pin" "$export_root/$sib_name" || {
+            echo "verify-mutations: cannot archive sibling $rel at $pin" >&2
+            exit 2
+        }
+    done < <(proof_siblings "$repo" HEAD)
     local dirty
     while IFS= read -r -d '' dirty; do
         [ -n "$dirty" ] || continue
@@ -575,6 +587,9 @@ isolate_if_shared() {
     if [ ! -f "$export/scripts/verify-mutations.sh" ]; then
         mkdir -p "$export/scripts"
         cp "$SELF_PATH" "$export/scripts/verify-mutations.sh"
+        # The re-exec sources proof-lib.sh beside itself; carry it into the
+        # scratch export so a fixture repo without one still exports pins.
+        cp "$SELF_DIR/proof-lib.sh" "$export/scripts/proof-lib.sh"
     fi
     local out_args=()
     i=0
@@ -611,8 +626,8 @@ isolate_if_shared() {
     done
     # bd-proof-toron-bin: a caller (clean-proof) may hand us the sibling CLI it
     # BUILT. That path is outside this export and must survive the re-exec
-    # unchanged; the export's own ../toron link points at the workspace tree,
-    # which is not built. An empty value is not a path, so it is never passed.
+    # unchanged; the exported ../toron is source at its pinned rev, not a built
+    # tree. An empty value is not a path, so it is never passed.
     local toron_bin=""
     if [ -n "${TORON_BIN:-}" ]; then
         case "$TORON_BIN" in
