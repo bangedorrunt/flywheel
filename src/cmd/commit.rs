@@ -13,6 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result, anyhow, bail};
 
 const MAX_CAS_RETRIES: usize = 5;
+/// A shared-index stage is stale (not a neighbour's intent) when its blob was
+/// any first-parent HEAD within this many commits (bd-j8x81 ruling 2).
+const STALE_PARENT_WINDOW: usize = 50;
 static INDEX_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// One git invocation. With `index`, every git command sees only that private
@@ -215,11 +218,28 @@ fn is_named(path: &str, paths: &[String]) -> bool {
         .any(|p| path == p.as_str() || path.starts_with(format!("{p}/").as_str()))
 }
 
+/// Blobs this path held at any first-parent HEAD in the stale window. A stage
+/// matching one of these is an old HEAD, never a neighbour's fresh intent.
+fn ancestor_blobs(shared: &Git<'_>, path: &str) -> Vec<String> {
+    let revs = shared
+        .out(&[
+            "rev-list",
+            "--first-parent",
+            &format!("-{STALE_PARENT_WINDOW}"),
+            "HEAD",
+        ])
+        .unwrap_or_default();
+    revs.lines()
+        .filter_map(|rev| shared.out(&["rev-parse", &format!("{rev}:{path}")]).ok())
+        .filter(|blob| !blob.is_empty())
+        .collect()
+}
+
 /// Never strip a neighbour's INTENTIONAL hunks: refuse when a named path is
-/// staged with a blob that is not the old parent's (bd-j1g64). A stage that is
-/// merely the old parent's blob, or a stale deletion, is tolerated and returned
+/// staged with a blob no first-parent HEAD in the stale window ever held.
+/// A stage matching an old HEAD (or a stale deletion) is tolerated and returned
 /// so the caller can point it at the blob this commit lands after CAS.
-fn refuse_foreign_stage(shared: &Git<'_>, paths: &[String], parent: &str) -> Result<Vec<String>> {
+fn refuse_foreign_stage(shared: &Git<'_>, paths: &[String]) -> Result<Vec<String>> {
     let staged = shared.out(&["diff", "--cached", "--name-status"])?;
     let mut stale = Vec::new();
     let mut conflict = Vec::new();
@@ -231,13 +251,10 @@ fn refuse_foreign_stage(shared: &Git<'_>, paths: &[String], parent: &str) -> Res
                 continue;
             }
             let stale_delete = status.starts_with('D');
-            let parent_blob = shared
-                .out(&["rev-parse", &format!("{parent}:{path}")])
-                .unwrap_or_default();
             let staged_blob = shared
                 .out(&["rev-parse", &format!(":{path}")])
                 .unwrap_or_default();
-            if stale_delete || (!parent_blob.is_empty() && staged_blob == parent_blob) {
+            if stale_delete || ancestor_blobs(shared, path).contains(&staged_blob) {
                 if !stale.iter().any(|p: &String| p == path) {
                     stale.push(path.to_string());
                 }
@@ -334,7 +351,7 @@ where
 {
     let shared = Git::shared(repo);
     let old_head = shared.out(&["rev-parse", "HEAD"])?;
-    let stale = refuse_foreign_stage(&shared, paths, &old_head)?;
+    let stale = refuse_foreign_stage(&shared, paths)?;
     warn_stale_stage(&shared, paths)?;
 
     let unique = format!(
@@ -597,6 +614,33 @@ mod tests {
                 .any(|line| line == "ours.txt"),
             "the neighbour's staged hunk must be untouched"
         );
+    }
+
+    #[test]
+    fn a_stage_three_commits_old_is_tolerated_and_rewritten() {
+        let dir = scratch_repo("stale-three");
+        fs::write(dir.join("ours.txt"), "v1\n").unwrap();
+        commit_paths(&dir, &["ours.txt".into()], "v1").unwrap();
+        let old = git(&dir, &["rev-parse", "HEAD:ours.txt"]);
+        for v in ["v2", "v3", "v4"] {
+            fs::write(dir.join("ours.txt"), format!("{v}\n")).unwrap();
+            commit_paths(&dir, &["ours.txt".into()], v).unwrap();
+        }
+        // The shared index still holds v1 — three commits behind HEAD.
+        git(
+            &dir,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{old},ours.txt"),
+            ],
+        );
+        fs::write(dir.join("ours.txt"), "v5\n").unwrap();
+        let sha = commit_paths(&dir, &["ours.txt".into()], "v5").unwrap();
+        let new_blob = git(&dir, &["rev-parse", &format!("{sha}:ours.txt")]);
+        assert_eq!(git(&dir, &["rev-parse", ":ours.txt"]), new_blob);
+        assert_ne!(new_blob, old);
     }
 
     #[test]
