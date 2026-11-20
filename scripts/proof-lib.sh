@@ -3,6 +3,13 @@
 # (bd-v6j35). Sourced, never executed. Every function is side-effect free
 # unless its name says otherwise.
 
+# bd-xwn96: stop the mutation stage at the first spec that failed to prove
+# every row, unless the caller explicitly asked to keep going. Pure over the
+# two numbers so the decision is witnessable without running a whole proof.
+proof_mutation_stops() {
+  [ "$1" -ne 0 ] && [ "$2" -eq 0 ]
+}
+
 # proof_toml <repo-root> [<rev>]
 # The proof.toml a proof of <rev> must use. With a rev the blob is read from
 # that commit, so another lane's dirty pin cannot move what "proved at <sha>"
@@ -211,6 +218,9 @@ receipt = {
     "stamp": os.environ["PROOF_STAMP"],
     "steps": steps,
     "failed_step": os.environ.get("PROOF_FAILED") or None,
+    # bd-xwn96: when the mutation stage stops at the first unproven spec, name
+    # it here so a caller does not have to read the log to find the cause.
+    "failed_mutation_spec": os.environ.get("PROOF_MUTATION_FAILED_SPEC") or None,
     "siblings": siblings,
     "mutations": mutations,
     "mutations_mode": mutations_mode,

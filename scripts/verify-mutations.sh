@@ -79,6 +79,9 @@ M_EXPECT=()
 # 1 when this mutation must NOT change behaviour: it exists to prove a guard is
 # dead, and green is the answer rather than a failure.
 M_GREEN=()
+# bd-xwn96: each row's final verdict, kept so a crew run can hand the SAME
+# content-keyed cache entry to the proof that clean-proof would write.
+M_VERDICT=()
 
 # Set by the spec before sourcing, defaulted after. Deliberately left UNSET
 # rather than initialised empty: under `set -u`, bash 3.2 treats `${arr[@]}` on
@@ -90,6 +93,8 @@ M_GREEN=()
 JSON_OUT=""
 LIST_ONLY=0
 LIST_EXPECT=0
+# bd-xwn96: a key handed down by the parent arrives as --cache-key; never
+# inherit an ambient CACHE_KEY (nested witness runs must compute their own).
 CACHE_KEY=""
 WITNESS_OUT=""
 NO_CACHE=0
@@ -291,6 +296,24 @@ snapshot_restore() {
 snapshot_discard() {
     [ -n "$SNAP_DIR" ] && rm -rf "$SNAP_DIR"
     SNAP_DIR=""
+}
+
+# bd-xwn96: prove the restore by CONTENT, not by rebuilding and re-running the
+# whole test filter. Hashing exactly the files this spec mutates is a stronger
+# check than a green test (a stale build cache once reported about a mutant
+# that was no longer on disk) and costs a few milliseconds.
+tree_hash() {
+    python3 - "$REPO" "${M_FILE[@]}" <<'PY'
+import hashlib, os, sys
+root, files = sys.argv[1], sys.argv[2:]
+h = hashlib.sha256()
+for rel in files:
+    h.update(rel.encode("utf-8") + b"\0")
+    with open(os.path.join(root, rel), "rb") as fh:
+        h.update(fh.read())
+    h.update(b"\0")
+print(h.hexdigest())
+PY
 }
 
 # bd-ura2v: every path that differs from HEAD, staged OR unstaged, plus the
@@ -605,6 +628,9 @@ isolate_if_shared() {
         # The re-exec sources proof-lib.sh beside itself; carry it into the
         # scratch export so a fixture repo without one still exports pins.
         cp "$SELF_DIR/proof-lib.sh" "$export/scripts/proof-lib.sh"
+        # bd-xwn96: the crew witness cache computes its key here too, so a
+        # fixture repo needs the key helper beside the harness.
+        cp "$SELF_DIR/mutation-cache.py" "$export/scripts/mutation-cache.py"
     fi
     fi
     local out_args=()
@@ -640,6 +666,12 @@ isolate_if_shared() {
                 ;;
         esac
     done
+    # bd-xwn96: hand the pre-isolation key down as an ARG, not an exported env
+    # var — an exported CACHE_KEY would leak into nested witness runs (a spec
+    # that invokes this harness itself) and make them reuse the outer key.
+    if [ -n "$CACHE_KEY" ]; then
+        out_args+=("--cache-key" "$CACHE_KEY")
+    fi
     # bd-proof-toron-bin: a caller (clean-proof) may hand us the sibling CLI it
     # BUILT. That path is outside this export and must survive the re-exec
     # unchanged; the exported ../toron is source at its pinned rev, not a built
@@ -724,6 +756,15 @@ main() {
         exit 2
     fi
 
+    # bd-xwn96: compute the crew's cache key HERE, before the scratch-export
+    # rewrite turns the relative spec path into an absolute one. clean-proof
+    # keys with the same relative path and repo root, so a crew witness lands
+    # under the key the later proof will look up. The exec inherits it.
+    if [ "${LIST_ONLY:-0}" != 1 ] && [ -z "$CACHE_KEY" ] && [ "$NO_CACHE" -eq 0 ]; then
+        CACHE_KEY="$(python3 scripts/mutation-cache.py key --root "$REPO" --spec "$spec" \
+            --driver "${CLEAN_PROOF_DRIVER_SHA:-}" 2>/dev/null || true)"
+    fi
+
     # --list executes nothing, so it must not pay for (or print about) an
     # export: its output is parsed by machine callers.
     if [ "${LIST_ONLY:-0}" != 1 ]; then
@@ -779,6 +820,8 @@ main() {
     trap on_signal INT TERM HUP
     snapshot_save
 
+    local base_hash
+    base_hash="$(tree_hash)"
     printf 'control (unmutated): ...\n'
     local before
     before="$(run_tests)"
@@ -796,6 +839,7 @@ main() {
     for i in $(seq 0 $((total - 1))); do
         snapshot_restore
         if ! grep -qF -- "${M_FIND[$i]}" "$REPO/${M_FILE[$i]}"; then
+            M_VERDICT[$i]="$VERDICT_MISS"
             json_row "$i" "$VERDICT_MISS"
             printf '%-52s %s\n' "${M_LABEL[$i]}" "$VERDICT_MISS"
             continue
@@ -845,10 +889,12 @@ main() {
                 "$VERDICT_VACUOUS") verdict="$VERDICT_DEAD"; dead=$((dead + 1)) ;;
                 "$VERDICT_RED") verdict="$VERDICT_ALIVE" ;;
             esac
+            M_VERDICT[$i]="$verdict"
             json_row "$i" "$verdict"
             printf '%-52s %-13s (guard is dead)\n' "${M_LABEL[$i]}" "$verdict"
             continue
         fi
+        M_VERDICT[$i]="$verdict"
         json_row "$i" "$verdict"
         printf '%-52s %-13s (%s)\n' "${M_LABEL[$i]}" "$verdict" "${M_EXPECT[$i]}"
         case "$verdict" in
@@ -867,9 +913,9 @@ main() {
     done
 
     snapshot_restore
-    local after restored_ok
-    after="$(run_tests)"
-    [ "$(classify "$after" "")" = "$VERDICT_VACUOUS" ] && restored_ok=yes || restored_ok=no
+    local after_hash restored_ok
+    after_hash="$(tree_hash)"
+    [ "$after_hash" = "$base_hash" ] && restored_ok=yes || restored_ok=no
     printf '\ncontrol after restore: %s\n' "$([ "$restored_ok" = yes ] && echo GREEN || echo RED)"
     snapshot_discard
 
@@ -900,6 +946,35 @@ with open(out, "w", encoding="utf-8") as fh:
         "witnesses": [{"spec": spec, "key": key, "sha": sha, "verdict": "RED"}],
     }, fh)
 PY
+    fi
+    # bd-xwn96: hand a green crew run to the shared verdict cache under the
+    # exact key clean-proof derives, so a later proof of the same sha reuses
+    # these witnesses instead of earning them twice. A miss (or a failed run)
+    # writes nothing: the cache may only hold a fully proven spec.
+    if [ "$restored_ok" = yes ] && [ "$((proven + dead))" -eq "$total" ] \
+        && [ -n "$CACHE_KEY" ] && [ "$NO_CACHE" -eq 0 ]; then
+        local rows tmp witness_dir witness proven_sha
+        rows="$(mktemp "${TMPDIR:-/tmp}/vm-rows.XXXXXX")"
+        proven_sha="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
+        for i in $(seq 0 $((total - 1))); do
+            printf '{"spec":"%s","id":"%s","expect_test":"%s","expect_green":%s,"verdict":"%s"}\n' \
+                "$(basename "${SPEC_PATH:-$SPEC_FILE}")" "$(mutation_id "${M_LABEL[$i]}")" \
+                "${M_EXPECT[$i]}" "$([ "${M_GREEN[$i]}" = 1 ] && echo true || echo false)" \
+                "${M_VERDICT[$i]}" >>"$rows"
+        done
+        witness_dir="$CACHE_DIR/witnesses"
+        mkdir -p "$witness_dir"
+        witness="$witness_dir/${proven_sha:-unknown}-$(basename "$spec").json"
+        python3 - "$witness" "$proven_sha" <<'PY'
+import json, sys
+path, sha = sys.argv[1:3]
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump({"schema": "flywheel-mutation-cache-witness.v1", "ok": True, "sha": sha}, fh)
+PY
+        python3 scripts/mutation-cache.py store --dir "$CACHE_DIR" --key "$CACHE_KEY" \
+            --spec "$spec" --rows "$rows" --witness "$witness" \
+            --witness-sha "$proven_sha" >/dev/null 2>&1 || true
+        rm -f "$rows"
     fi
     [ "$restored_ok" = yes ] && [ "$((proven + dead))" -eq "$total" ]
 }

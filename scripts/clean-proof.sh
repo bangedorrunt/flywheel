@@ -23,7 +23,7 @@
 # Usage:
 #   scripts/clean-proof.sh [--sha <rev>] [--head] [--mutate <json>]...
 #                          [--mutations changed|full] [--receipt <path>] [--keep]
-#                          [--no-cache]
+#                          [--no-cache] [--mutations-keep-going]
 #
 #   no selector  : prove the dirty tree (temporary commit from intended paths)
 #   --head       : prove HEAD
@@ -137,6 +137,8 @@ CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/flywheel/mutation-verdicts"
 # mutation base instead of trusting a pin that never advances.
 RECEIPT_ARCHIVE="${XDG_STATE_HOME:-$HOME/.local/state}/flywheel/clean-proof/receipts"
 MUTATIONS_MODE=""
+MUTATIONS_KEEP_GOING=0
+MUT_FAILED_SPEC=""
 RECEIPT_MUTATIONS_BASE=""
 RECEIPT_CHANGED_PATHS=""
 MODE="dirty"
@@ -161,6 +163,9 @@ while [ $# -gt 0 ]; do
     --receipt) [ $# -ge 2 ] || die "--receipt needs a path"; RECEIPT="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
     --no-cache) NO_CACHE=1; shift ;;
+    # bd-xwn96: default is fail-fast; --mutations-keep-going restores the old
+    # "run everything even after a VACUOUS spec" behaviour for triage.
+    --mutations-keep-going) MUTATIONS_KEEP_GOING=1; shift ;;
     --lock-hold-test) [ $# -ge 2 ] || die "--lock-hold-test needs seconds"; LOCK_HOLD_TEST="$2"; shift 2 ;;
     -h|--help) usage 0 ;;
     *) die "unknown arg: $1" ;;
@@ -461,6 +466,13 @@ if [ -z "$FAILED_STEP" ]; then
       echo "clean-proof: $spec did not prove every mutation; log $TMP/mutations-$mut_ran.log" >&2
       tail -20 "$TMP/mutations-$mut_ran.log" >&2 || true
       mut_failed=$((mut_failed + 1))
+      MUT_FAILED_SPEC="$spec"
+      # bd-xwn96: a doomed spec used to cost 40 more spec runs. Stop on the
+      # first one; the receipt names it so the caller knows where to look.
+      if proof_mutation_stops "$mut_status" "$MUTATIONS_KEEP_GOING"; then
+        echo "clean-proof: stopping the mutation stage at $spec (pass --mutations-keep-going to run the rest)" >&2
+        break
+      fi
     fi
   done < <(ordered_specs)
   if [ "$mut_ran" -eq 0 ]; then
@@ -540,6 +552,7 @@ mkdir -p "$(dirname "$RECEIPT")"
 PROOF_MUTATIONS_MODE="${MUTATIONS_MODE:-witnesses}" \
 PROOF_MUTATIONS_BASE="$RECEIPT_MUTATIONS_BASE" \
 PROOF_CHANGED_PATHS="$RECEIPT_CHANGED_PATHS" \
+PROOF_MUTATION_FAILED_SPEC="$MUT_FAILED_SPEC" \
 PROOF_RECEIPT_ARCHIVE="$RECEIPT_ARCHIVE" \
 proof_write_receipt "$RECEIPT" "$OK" "$PROVEN_SHA" "$SHORT" "$STAMP" "$MODE" "$TMP" \
   "$FAILED_STEP" "$STEP_NAMES" "$STEP_STATUSES" "$SIBLING_RECORDS" "$MUTATION_RECORDS_FILE"

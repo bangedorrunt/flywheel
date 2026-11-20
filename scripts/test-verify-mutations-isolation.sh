@@ -14,6 +14,10 @@ trap cleanup EXIT
 # bd-3681w: every spec run makes a ~4-5 GB scratch export. Keep every export this
 # test triggers inside our own sandbox; never touch the operator's real $TMPDIR.
 export TMPDIR="$TMP"
+# A proof wraps this test with its own shared scratch tree. Unset that: this
+# witness is about the harness OWNING and removing its export, which a proof's
+# BUILD_DIR would otherwise make a no-op (and E1 VACUOUS).
+unset VERIFY_MUTATIONS_BUILD_DIR VERIFY_MUTATIONS_EXPORT_ROOT VERIFY_MUTATIONS_IN_EXPORT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
@@ -64,7 +68,8 @@ mkdir -p "$TMP/fake-toron"
 printf '#!/usr/bin/env bash\nexit 0\n' >"$TMP/fake-toron/toron"
 chmod +x "$TMP/fake-toron/toron"
 out="$(TORON_BIN="$TMP/fake-toron/toron" SEE_TORON_FILE="$TMP/seen-toron" \
-  bash "$ROOT/scripts/verify-mutations.sh" spec.sh --cargo "$TMP/bin/fakecargo" 2>&1)" \
+  bash "$ROOT/scripts/verify-mutations.sh" spec.sh --cargo "$TMP/bin/fakecargo" \
+    --no-cache --cache-dir "$TMP/cache" 2>&1)" \
   || { printf '%s\n' "$out" | tail -20 >&2; fail "the harness exited non-zero"; }
 
 [ "$(sum_of)" = "$sum_before" ] || fail "the harness changed src/a.rs in the caller's tree"
@@ -99,7 +104,8 @@ exit 101
 STUB
 chmod +x "$TMP/bin/failcargo"
 set +e
-fail_out="$(bash "$ROOT/scripts/verify-mutations.sh" spec.sh --cargo "$TMP/bin/failcargo" 2>&1)"
+fail_out="$(bash "$ROOT/scripts/verify-mutations.sh" spec.sh --cargo "$TMP/bin/failcargo" \
+  --no-cache --cache-dir "$TMP/cache" 2>&1)"
 fail_rc=$?
 set -e
 [ "$fail_rc" -ne 0 ] || fail "the harness accepted a red control: $fail_out"

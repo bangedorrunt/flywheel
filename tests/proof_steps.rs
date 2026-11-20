@@ -258,3 +258,18 @@ fn proof_mutation_harness_classifies_an_abort() {
         "the ABORTED verdict must name the running test: {text}"
     );
 }
+
+/// bd-xwn96: fail-fast, the receipt's failing-spec field and the shared crew
+/// witness cache are all cheap to prove without a full proof run.
+#[test]
+fn proof_mutation_failfast_and_crew_cache() {
+    let status = Command::new("bash")
+        .arg(format!(
+            "{}/scripts/test-proof-mutation-failfast.sh",
+            root()
+        ))
+        .current_dir(root())
+        .status()
+        .expect("run scripts/test-proof-mutation-failfast.sh");
+    assert!(status.success(), "proof mutation failfast test failed");
+}
