@@ -319,6 +319,11 @@ impl CacheFixture {
         )
         .unwrap();
         std::fs::write(
+            root.join("scripts/proof-lib.sh"),
+            include_str!("../../scripts/proof-lib.sh"),
+        )
+        .unwrap();
+        std::fs::write(
             root.join("scripts/mutation-cache.py"),
             include_str!("../../scripts/mutation-cache.py"),
         )

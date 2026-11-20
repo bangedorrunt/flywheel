@@ -1308,11 +1308,15 @@ live-verified. Record one BEFORE closing."#;
             "mutation \"D1  a decision\" \\\n    file=src/x.rs \\\n    find='a' \\\n    replace='b' \\\n    expect=a_test\n",
         )
         .unwrap();
-        std::fs::copy(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/verify-mutations.sh"),
-            repo.path().join("scripts/verify-mutations.sh"),
-        )
-        .expect("the land gate re-derives targets with the real harness");
+        for script in ["verify-mutations.sh", "proof-lib.sh"] {
+            std::fs::copy(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("scripts")
+                    .join(script),
+                repo.path().join("scripts").join(script),
+            )
+            .expect("the land gate re-derives targets with the real harness");
+        }
         // A real commit so the mutations_base arm can resolve.
         for args in [
             vec!["init", "-q"],
@@ -1451,11 +1455,15 @@ live-verified. Record one BEFORE closing."#;
             "mutation \"D1  a decision\" \\\n    file=src/x.rs \\\n    find='a' \\\n    replace='b' \\\n    expect=a_test\n",
         )
         .unwrap();
-        std::fs::copy(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/verify-mutations.sh"),
-            repo.path().join("scripts/verify-mutations.sh"),
-        )
-        .expect("the land gate re-derives targets with the real harness");
+        for script in ["verify-mutations.sh", "proof-lib.sh"] {
+            std::fs::copy(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("scripts")
+                    .join(script),
+                repo.path().join("scripts").join(script),
+            )
+            .expect("the land gate re-derives targets with the real harness");
+        }
         let commit = |message: &str| {
             assert!(
                 Command::new("git")
