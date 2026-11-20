@@ -444,7 +444,10 @@ fn the_cache_key_covers_spec_target_test_harness_lock_driver_and_siblings() {
     // commit sha. A new commit with byte-identical scripts must hit the cache;
     // an edit to the driver code must move the key.
     write("scripts/clean-proof.sh", "driver v1\n");
-    write("scripts/proof-lib.sh", "lib v1\n");
+    write(
+        "scripts/proof-lib.sh",
+        concat!(include_str!("../../scripts/proof-lib.sh"), "\n# lib v1\n"),
+    );
     let before_driver = fx.key("driver-sha");
     assert_eq!(
         before_driver,
