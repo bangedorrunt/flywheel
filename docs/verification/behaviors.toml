@@ -1293,9 +1293,11 @@ status = "proven"
 concurrent = false
 tests = [
   "tests/ship_land.rs::a_neighbours_dirty_tracker_row_is_not_committed_with_this_bead",
+  "tests/ship_land.rs::a_racer_landing_between_build_and_update_ref_is_not_reverted",
 ]
 mutations = [
   "scripts/mutations/ship-land-blobs.spec.sh#B1",
+  "scripts/mutations/ship-land-race-splice.spec.sh#R1",
 ]
 
 [[behavior]]

@@ -598,6 +598,59 @@ fn a_neighbours_dirty_tracker_row_is_not_committed_with_this_bead() {
     );
 }
 
+/// bd-kz3sc rework 2: a neighbour's ship land that lands between our tree build
+/// and our HEAD update must survive. Each CAS retry re-splices on the moved
+/// parent, so HEAD ends with BOTH beads closed.
+#[test]
+fn a_racer_landing_between_build_and_update_ref_is_not_reverted() {
+    let f = fixture();
+    let hooks = f.repo.join(".git").join("hooks");
+    std::fs::create_dir_all(&hooks).expect("hooks dir");
+    let hook = hooks.join("pre-commit");
+    std::fs::write(
+        &hook,
+        r#"#!/bin/sh
+if [ ! -f racer-done ]; then
+  : > racer-done
+  idx=$(mktemp)
+  GIT_INDEX_FILE="$idx" git read-tree HEAD
+  printf '{"id":"bd-neighbor","status":"closed"}\n' > racer-row.txt
+  blob=$(GIT_INDEX_FILE="$idx" git hash-object -w racer-row.txt)
+  GIT_INDEX_FILE="$idx" git update-index --cacheinfo 100644,"$blob",.beads/issues.jsonl
+  tree=$(GIT_INDEX_FILE="$idx" git write-tree)
+  old=$(git rev-parse HEAD)
+  new=$(git -c user.name=r -c user.email=r@x commit-tree "$tree" -p "$old" -m racer)
+  git update-ref HEAD "$new" "$old"
+  rm -f "$idx" racer-row.txt
+fi
+exit 0
+"#,
+    )
+    .expect("write racer hook");
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut perms = std::fs::metadata(&hook).expect("meta").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&hook, perms).expect("chmod hook");
+
+    let out = f.land(&[]);
+    assert!(
+        out.status.success(),
+        "land must survive the CAS race: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let head_issues =
+        String::from_utf8_lossy(&sh(&f.repo, "git", &["show", "HEAD:.beads/issues.jsonl"]).stdout)
+            .to_string();
+    assert!(
+        head_issues.contains("bd-x") && head_issues.contains("closed"),
+        "this bead is still closed in HEAD: {head_issues}"
+    );
+    assert!(
+        head_issues.contains("bd-neighbor") && head_issues.contains("closed"),
+        "the racer's closed row survived the retry: {head_issues}"
+    );
+}
+
 /// bd-kz3sc: with this bead's rows already in HEAD, the commit step is skipped
 /// (no second commit) even when nothing is staged in the worktree.
 #[test]

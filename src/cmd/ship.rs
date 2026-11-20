@@ -214,13 +214,13 @@ fn bead_rows_committed(dir: &Path, bead: &str) -> Result<bool> {
 /// HEAD's tracker files with ONLY this bead's rows swapped for the worktree
 /// versions (bd-kz3sc rework). A neighbour's dirty rows are never in these
 /// blobs; the commit verb stages the exact bytes into its private index.
-fn tracker_blobs_for_bead(dir: &Path, bead: &str) -> Result<Vec<(String, Vec<u8>)>> {
+fn tracker_blobs_for_bead(dir: &Path, bead: &str, parent: &str) -> Result<Vec<(String, Vec<u8>)>> {
     let mut blobs = Vec::new();
     for (path, key) in [
         (".beads/issues.jsonl", "id"),
         (".beads/gates.jsonl", "issue_id"),
     ] {
-        let head = git(dir, &["show", &format!("HEAD:{path}")]).unwrap_or_default();
+        let head = git(dir, &["show", &format!("{parent}:{path}")]).unwrap_or_default();
         let work = std::fs::read_to_string(dir.join(path)).unwrap_or_default();
         let work_rows: Vec<&str> = work
             .lines()
@@ -969,8 +969,16 @@ pub(crate) fn ship_land(args: LandArgs<'_>) -> Result<()> {
         eprintln!("ship land: tracker rows already committed");
     } else {
         land_step(&plan, "tracker-commit", || {
-            let blobs = tracker_blobs_for_bead(&dir, &plan.bead)?;
-            crate::cmd::commit::commit_blobs(&dir, &blobs, &plan.message).map(|_| ())
+            crate::cmd::commit::commit_blobs(
+                &dir,
+                &[
+                    ".beads/issues.jsonl".to_string(),
+                    ".beads/gates.jsonl".to_string(),
+                ],
+                &plan.message,
+                |parent| tracker_blobs_for_bead(&dir, &plan.bead, parent),
+            )
+            .map(|_| ())
         })?;
     }
 

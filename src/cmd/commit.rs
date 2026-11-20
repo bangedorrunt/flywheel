@@ -274,23 +274,28 @@ pub(crate) fn commit_paths(repo: &Path, paths: &[String], message: &str) -> Resu
     Ok(sha)
 }
 
-/// Commit the exact `path -> content` blobs (bd-kz3sc). Used by ship land to
-/// commit ONLY this bead's tracker rows while leaving a neighbour's dirty rows
-/// in the worktree. The shared index is refreshed with the same blobs, so a
-/// neighbour's unstaged rows stay unstaged.
-pub(crate) fn commit_blobs(
+/// Commit exact `path -> content` blobs produced by `splice(parent)` (bd-kz3sc
+/// rework 2). The splice is recomputed on EVERY CAS retry against the moved
+/// parent, so a neighbour that landed in between is never reverted. The shared
+/// index is refreshed from the final HEAD's splice.
+pub(crate) fn commit_blobs<F>(
     repo: &Path,
-    blobs: &[(String, Vec<u8>)],
+    paths: &[String],
     message: &str,
-) -> Result<String> {
-    let paths: Vec<String> = blobs.iter().map(|(p, _)| p.clone()).collect();
-    validate_paths(&paths)?;
-    let sha = commit_tree(repo, &paths, message, |private, parent| {
-        build_blobs_tree(private, blobs, parent)
+    mut splice: F,
+) -> Result<String>
+where
+    F: FnMut(&str) -> Result<Vec<(String, Vec<u8>)>>,
+{
+    validate_paths(paths)?;
+    let sha = commit_tree(repo, paths, message, |private, parent| {
+        let blobs = splice(parent)?;
+        build_blobs_tree(private, &blobs, parent)
     })?;
     let shared = Git::shared(repo);
-    for (path, content) in blobs {
-        let blob = shared.out_stdin(&["hash-object", "-w", "--stdin"], content)?;
+    let head = shared.out(&["rev-parse", "HEAD"])?;
+    for (path, content) in splice(&head)? {
+        let blob = shared.out_stdin(&["hash-object", "-w", "--stdin"], &content)?;
         shared.ok(&[
             "update-index",
             "--add",
