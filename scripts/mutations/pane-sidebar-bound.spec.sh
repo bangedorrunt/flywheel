@@ -10,3 +10,9 @@ mutation "S1  the sidebar column bound is dropped" \
     expect=every_captured_screen_classifies \
     find='    let right = sidebar_column(tail, marker);' \
     replace='    let right = sidebar_column(tail, marker).filter(|_| false);'
+
+mutation "S2  the char column is sliced as a raw byte offset" \
+    file=src/pane_screen.rs \
+    expect=every_captured_screen_classifies \
+    find=$'    line.char_indices()\n        .nth(col)\n        .map_or(line.len(), |(byte, _)| byte)' \
+    replace='    col.min(line.len())'

@@ -77,23 +77,34 @@ fn sidebar_column(tail: &str, marker: &str) -> Option<usize> {
         let Some(at) = marker_at(line, marker) else {
             continue;
         };
-        let bytes = line.as_bytes();
-        let mut i = at + marker.len();
-        while i < bytes.len() {
-            let start = i;
-            while i < bytes.len() && bytes[i] == b' ' {
-                i += 1;
+        // Count columns in chars, never bytes: this value is applied to other
+        // rows, whose byte offsets differ when the input holds multibyte text.
+        let chars: Vec<char> = line.chars().collect();
+        let mut col = line[..at].chars().count() + marker.chars().count();
+        while col < chars.len() {
+            let start = col;
+            while col < chars.len() && chars[col] == ' ' {
+                col += 1;
             }
-            if i - start >= 12 && i < bytes.len() {
-                bound = Some(bound.map_or(i, |b: usize| b.min(i)));
+            if col - start >= 12 && col < chars.len() {
+                bound = Some(bound.map_or(col, |b: usize| b.min(col)));
                 break;
             }
-            if i == start {
-                i += 1;
+            if col == start {
+                col += 1;
             }
         }
     }
     bound
+}
+
+/// Convert a column from `sidebar_column` to a byte boundary in THIS row. A raw
+/// byte offset from another row can land inside a multibyte character and make
+/// the slice panic, taking the doorbell host down on a wake.
+fn column_boundary(line: &str, col: usize) -> usize {
+    line.char_indices()
+        .nth(col)
+        .map_or(line.len(), |(byte, _)| byte)
 }
 
 /// The content line of a marker-prefixed input box, scanning up from the tail.
@@ -113,7 +124,7 @@ fn marker_box(tail: &str, marker: &str, skip: &dyn Fn(&str) -> bool) -> Option<S
             continue;
         };
         let start = at + marker.len();
-        let end = right.map_or(line.len(), |b| b.min(line.len()));
+        let end = right.map_or(line.len(), |col| column_boundary(line, col));
         if start > end {
             continue;
         }

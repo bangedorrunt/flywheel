@@ -71,3 +71,17 @@ expect = "empty"
 [[screen]]
 file = "sidebar-empty-box.txt"
 expect = "empty"
+
+# bd-3p7pe review: multibyte typed text on a sidebar row. The bound is a char
+# column, converted to this row's own byte boundary before slicing; a raw byte
+# offset from another row would land inside a 3-byte char and panic.
+[[screen]]
+file = "multibyte-with-sidebar.txt"
+expect = "operator-text"
+
+# A 12+ space gap inside typed text is treated as a sidebar edge: the prefix
+# still reads OperatorText, so the guard defers and no wake is lost. The tail
+# after the gap is deliberately not read.
+[[screen]]
+file = "gapped-typed-text.txt"
+expect = "operator-text"
