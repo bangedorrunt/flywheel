@@ -9,6 +9,9 @@
 use std::path::{Path, PathBuf};
 
 pub const RUNG_DIR: &str = "wake-rung";
+/// The ONE marker TTL. Exported to the TS side via FLYWHEEL_WAKE_RUNG_TTL_SECS
+/// so no language sweeps another's marker early (bd-tdpix review).
+pub const WAKE_RUNG_TTL_SECS: u64 = 86_400;
 
 fn marker_path(state_dir: &Path, event_id: &str) -> PathBuf {
     let mut safe: String = event_id

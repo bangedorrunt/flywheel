@@ -1074,6 +1074,28 @@ pub(crate) fn gate_prompt_on_claim(claimed: bool, effects: Vec<Effect>) -> Vec<E
     }
 }
 
+/// A Watch line spends a claim ONLY when this tick is about to emit that
+/// line's Prompt. A deferred-but-gated line leaves the marker free for the
+/// native path to ring; when the deferral later rings, the same line arrives
+/// with a Prompt and claims then (bd-tdpix review).
+pub(crate) fn claim_and_gate(
+    state_dir: &std::path::Path,
+    line: &str,
+    effects: Vec<Effect>,
+) -> Vec<Effect> {
+    let has_prompt = effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Prompt { line: pl, .. } if pl == line));
+    if !has_prompt {
+        return effects;
+    }
+    match doorbell_core::watch_id(line) {
+        Some(id) if crate::wake_rung::claim(state_dir, &id) => effects,
+        Some(_) => crate::doorbell_host::gate_prompt_on_claim(false, effects),
+        None => effects,
+    }
+}
+
 fn cmds_to_effects(cmds: Vec<workspace::Cmd>) -> Vec<Effect> {
     cmds.into_iter()
         .filter_map(|c| match c {
@@ -1334,16 +1356,17 @@ impl Host for RtHost {
         // bd-tdpix: claim the shared bus-event marker BEFORE any Prompt is
         // emitted; a lost claim drops the Prompt from this tick. The boot drain
         // carries no event id and is appended after the gate.
-        if let BrainMsg::Watch(line) = msg
-            && let Some(id) = doorbell_core::watch_id(line)
-        {
-            let claimed = crate::wake_rung::claim(&config::state_dir(), &id);
-            effects = gate_prompt_on_claim(claimed, effects);
+        if let BrainMsg::Watch(line) = msg {
+            effects = claim_and_gate(&config::state_dir(), line, effects);
         }
         effects.extend(boot_drain_effects);
         if matches!(msg, BrainMsg::Sweep { .. }) {
             // bd-tdpix: bound the shared claim directory on every sweep.
-            let _ = crate::wake_rung::sweep(&config::state_dir(), 86_400, unix_now());
+            let _ = crate::wake_rung::sweep(
+                &config::state_dir(),
+                crate::wake_rung::WAKE_RUNG_TTL_SECS,
+                unix_now(),
+            );
             effects.extend(
                 self.pending_conflict_prompts
                     .drain(..)
@@ -2099,6 +2122,45 @@ mod parity_tests {
             "tags": tags, "content": "hello", "created_at": ts
         })
         .to_string()
+    }
+
+    #[test]
+    fn a_watch_line_without_a_prompt_leaves_the_claim_free() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let line = doorbell_core::doorbell_line_with_event(
+            doorbell_core::EventClass::PlanePMail,
+            "toron next",
+            "evt-gated",
+        );
+        let effects = vec![Effect::FetchInbox];
+        let kept = super::claim_and_gate(dir.path(), &line, effects);
+        assert!(!kept.iter().any(|e| matches!(e, Effect::Prompt { .. })));
+        assert!(
+            crate::wake_rung::claim(dir.path(), "evt-gated"),
+            "a deferred/gated line must not spend the marker"
+        );
+    }
+
+    #[test]
+    fn a_deferred_wake_claims_when_it_rings_and_is_silent_if_native_won() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let line = doorbell_core::doorbell_line_with_event(
+            doorbell_core::EventClass::PlanePMail,
+            "toron next",
+            "evt-deferred",
+        );
+        let effects = vec![Effect::Prompt {
+            pin: "ScarletCove".into(),
+            line: line.clone(),
+        }];
+        // The native path claimed first: the deferred ring must stay silent.
+        assert!(crate::wake_rung::claim(dir.path(), "evt-deferred"));
+        let kept = super::claim_and_gate(dir.path(), &line, effects.clone());
+        assert!(!kept.iter().any(|e| matches!(e, Effect::Prompt { .. })));
+        // With the marker free, the same deferred ring wins and emits Prompt.
+        let other = tempfile::tempdir().expect("tempdir");
+        let won = super::claim_and_gate(other.path(), &line, effects);
+        assert!(won.iter().any(|e| matches!(e, Effect::Prompt { .. })));
     }
 
     #[test]

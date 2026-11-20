@@ -98,6 +98,12 @@ pub fn plane_launch_env(
     // reads it to refuse a pane that unset AGENT_NAME instead of mistaking it
     // for the operator's own shell. The operator's shell never carries it.
     env.insert("FLYWHEEL_PANE".to_string(), "1".to_string());
+    // bd-tdpix: ONE rung marker TTL for every language, so the pi extension
+    // never sweeps a doorbell/opencode marker early.
+    env.insert(
+        "FLYWHEEL_WAKE_RUNG_TTL_SECS".to_string(),
+        crate::wake_rung::WAKE_RUNG_TTL_SECS.to_string(),
+    );
     if let Some(pin) = pin.filter(|p| !p.is_empty()) {
         env.insert("AGENT_NAME".to_string(), pin.to_string());
         env.insert("FLYWHEEL_MAIL_AS".to_string(), pin.to_string());
