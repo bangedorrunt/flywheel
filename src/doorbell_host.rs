@@ -32,65 +32,8 @@ type WakeTaskSlot =
 const WORKSPACE_PROBE_SECS: u64 = 30;
 
 // ---- bd-l5vb2 U8: toron events as a wake source for no-door harnesses ----
-
-/// Harnesses whose only inbound door is toron events (ADR-0039 D8). Canonical
-/// names; the operator list is gemini, antigravity, grok, codex until each
-/// gains a native door.
-fn events_only_harness(kind: &str) -> bool {
-    matches!(
-        crate::harness_registry::canonical(kind).as_str(),
-        "gemini" | "antigravity" | "grok" | "codex"
-    )
-}
-
-/// The canonical pull line. `toron next` classifies as `AtIdle` (a real mail
-/// wake), so an events hint rings exactly like a wake.sock mail.
-fn events_mail_line() -> String {
-    doorbell_core::doorbell_line(doorbell_core::EventClass::PlanePMail, "toron next")
-}
-
-/// Pure: one events-kernel command -> the brain input that feeds the existing
-/// fold. `JournalCursor` is an effect the interpreter performs, not a brain
-/// input. The gap collapses to ONE digest msg, never a prompt storm.
-fn bridge_cmd_to_brain(pin: &str, cmd: &crate::events_bridge::BridgeCmd) -> Option<BrainMsg> {
-    match cmd {
-        crate::events_bridge::BridgeCmd::JournalCursor(_) => None,
-        crate::events_bridge::BridgeCmd::Emit(notice) => {
-            if notice.event_name == "gap" || notice.event_id.starts_with("gap:") {
-                Some(BrainMsg::EventsGap {
-                    pin: pin.to_string(),
-                })
-            } else {
-                Some(BrainMsg::EventsHint {
-                    event_id: notice.event_id.clone(),
-                    pin: pin.to_string(),
-                    line: events_mail_line(),
-                })
-            }
-        }
-    }
-}
-
-/// Pure fold of one page through the events kernel. The deduper keyed by bus
-/// event id is what makes a seat reached by both wake.sock and events ring
-/// once; the returned cursor is journaled AFTER the msgs are emitted.
-fn fold_events_page(
-    deduper: &mut crate::events_bridge::Deduper,
-    cursor: &mut String,
-    page: &crate::events_bridge::Page,
-    pin: &str,
-) -> (Vec<BrainMsg>, Option<String>) {
-    let cmds = crate::events_bridge::apply_page(deduper, cursor, page);
-    let msgs = cmds
-        .iter()
-        .filter_map(|c| bridge_cmd_to_brain(pin, c))
-        .collect();
-    let journal = cmds.iter().find_map(|c| match c {
-        crate::events_bridge::BridgeCmd::JournalCursor(c) => Some(c.clone()),
-        _ => None,
-    });
-    (msgs, journal)
-}
+// The PURE mapper/fold lives in `events_source.rs`; this file is the effect
+// layer: journal before invoke, stream/poll transport, cursor persistence.
 
 /// Journal row for an events-source effect. No payload/token ever rides it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -158,6 +101,36 @@ fn append_events_journal(
     }
 }
 
+struct FileEventsJournal<'a> {
+    state_dir: &'a std::path::Path,
+    pin: &'a str,
+}
+
+impl crate::events_source::PumpJournal for FileEventsJournal<'_> {
+    fn row(&mut self, op: &str, cursor: Option<&str>) {
+        let op = match op {
+            "fetch" => EventsJournalOp::Fetch,
+            "cursor" => {
+                let c = cursor.unwrap_or("").to_string();
+                write_events_cursor(self.state_dir, self.pin, &c);
+                EventsJournalOp::Cursor(c)
+            }
+            other => EventsJournalOp::Cursor(other.to_string()),
+        };
+        append_events_journal(self.state_dir, self.pin, &op, now_us());
+    }
+}
+
+struct BrainEventsSink<'a> {
+    tx: &'a mpsc::Sender<BrainMsg>,
+}
+
+impl crate::events_source::PumpSink for BrainEventsSink<'_> {
+    fn send(&mut self, msg: BrainMsg) {
+        let _ = self.tx.blocking_send(msg);
+    }
+}
+
 fn now_us() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -189,34 +162,26 @@ fn run_events_pump(tx: mpsc::Sender<BrainMsg>, project: String, pin: String, url
     }
     let mut cursor = read_events_cursor(&state_dir, &pin);
     let mut deduper = crate::events_bridge::Deduper::new(1024);
+    let mut journal = FileEventsJournal {
+        state_dir: &state_dir,
+        pin: &pin,
+    };
+    let mut sink = BrainEventsSink { tx: &tx };
     while !stopped() {
-        append_events_journal(&state_dir, &pin, &EventsJournalOp::Fetch, now_us());
-        match client.fetch(&cursor) {
-            Ok(page) => {
-                let (msgs, next) = fold_events_page(&mut deduper, &mut cursor, &page, &pin);
-                for msg in msgs {
-                    if tx.blocking_send(msg).is_err() {
-                        return;
-                    }
-                }
-                if let Some(next) = next {
-                    append_events_journal(
-                        &state_dir,
-                        &pin,
-                        &EventsJournalOp::Cursor(next.clone()),
-                        now_us(),
-                    );
-                    write_events_cursor(&state_dir, &pin, &next);
-                }
-            }
-            Err(_) => {
-                // Fault-as-data: a stream/poll failure is a gap on the next
-                // successful page, not a prompt storm. Back off before retry.
-                let _ = tx.blocking_send(BrainMsg::Degraded {
-                    source: format!("events:{pin}"),
-                    reason: "events fetch failed; will retry".into(),
-                });
-            }
+        if crate::events_source::pump_once(
+            &client,
+            &mut cursor,
+            &mut deduper,
+            &pin,
+            &mut journal,
+            &mut sink,
+        )
+        .is_err()
+        {
+            let _ = tx.blocking_send(BrainMsg::Degraded {
+                source: format!("events:{pin}"),
+                reason: "events fetch failed; will retry".into(),
+            });
         }
         std::thread::sleep(Duration::from_secs(2));
     }
@@ -232,17 +197,17 @@ fn spawn_events_pumps(cfg: &Config, project: &str, tx: &mpsc::Sender<BrainMsg>) 
         .unwrap_or_else(|_| "http://127.0.0.1:18080".to_string());
     let state_dir = config::state_dir();
     EVENTS_STOP.store(false, std::sync::atomic::Ordering::Relaxed);
-    for seat in state::load_spawn_registry(project) {
-        if !seat.harness.as_deref().is_some_and(events_only_harness) {
-            continue;
-        }
-        let Some(pin) = seat.mail_identity.clone() else {
-            continue;
-        };
-        let token_path = crate::events_tokens::token_path(&state_dir, project, &pin);
-        if !token_path.is_file() {
-            continue; // no provisioned token: this seat has no subscription
-        }
+    let seats: Vec<(String, Option<String>, bool)> = state::load_spawn_registry(project)
+        .into_iter()
+        .map(|seat| {
+            let pin = seat.mail_identity.clone();
+            let has_token = pin.as_ref().is_some_and(|pin| {
+                crate::events_tokens::token_path(&state_dir, project, pin).is_file()
+            });
+            (seat.harness.clone().unwrap_or_default(), pin, has_token)
+        })
+        .collect();
+    for pin in crate::events_source::seats_to_pump(cfg.doorbell_toron_events(), &seats) {
         let tx = tx.clone();
         let project = project.to_string();
         let url = url.clone();
@@ -3970,106 +3935,5 @@ mod bd_346jl_binding_tests {
         };
         row.agent_status = status.parse().expect("status");
         row
-    }
-}
-
-#[cfg(test)]
-mod events_source_tests {
-    //! bd-l5vb2: the pure events fold that feeds the single budget gate.
-    //! No socket, clock, env or live daemon — a fake Page drives every case.
-    use super::*;
-    use crate::events_bridge::{BridgeCmd, BridgeEvent, ChannelNotice, Page};
-
-    fn page(id: &str, cursor: &str) -> Page {
-        Page {
-            events: vec![BridgeEvent {
-                id: id.into(),
-                kind: "mail.addressed".into(),
-                payload: String::new(),
-            }],
-            next_cursor: cursor.into(),
-            gap: false,
-            truncated: false,
-        }
-    }
-
-    #[test]
-    fn the_events_line_is_a_real_mail_wake_not_a_silent_notice() {
-        let line = events_mail_line();
-        assert_eq!(
-            doorbell_core::wake_kind_of_line(&line),
-            doorbell_core::WakeKind::AtIdle,
-            "an events hint must ring like a mail: {line}"
-        );
-    }
-
-    #[test]
-    fn the_same_bus_event_id_rings_once_across_wake_sock_and_events() {
-        let mut deduper = crate::events_bridge::Deduper::new(1024);
-        let mut cursor = String::new();
-        let (first, c1) = fold_events_page(&mut deduper, &mut cursor, &page("bus-e1", "c1"), "P");
-        assert_eq!(c1.as_deref(), Some("c1"));
-        assert_eq!(first.len(), 1);
-        assert!(matches!(
-            &first[0],
-            BrainMsg::EventsHint { event_id, pin, .. }
-                if event_id == "bus-e1" && pin == "P"
-        ));
-        // wake.sock carried the same id: the shared deduper absorbs it.
-        let (second, _) = fold_events_page(&mut deduper, &mut cursor, &page("bus-e1", "c2"), "P");
-        assert!(
-            second.is_empty(),
-            "one mail must not ring twice: {second:?}"
-        );
-    }
-
-    #[test]
-    fn a_gap_collapses_to_one_digest_msg() {
-        let mut deduper = crate::events_bridge::Deduper::new(1024);
-        let mut cursor = String::new();
-        let gap = Page {
-            events: Vec::new(),
-            next_cursor: "fresh".into(),
-            gap: true,
-            truncated: false,
-        };
-        let (msgs, next) = fold_events_page(&mut deduper, &mut cursor, &gap, "P");
-        assert_eq!(msgs.len(), 1);
-        assert!(matches!(msgs[0], BrainMsg::EventsGap { .. }));
-        assert_eq!(next.as_deref(), Some("fresh"));
-    }
-
-    #[test]
-    fn a_cursor_command_is_an_effect_not_a_brain_msg() {
-        let cmd = BridgeCmd::JournalCursor("c9".into());
-        assert!(bridge_cmd_to_brain("P", &cmd).is_none());
-        let mail = BridgeCmd::Emit(ChannelNotice {
-            hint: crate::events_bridge::HINT.into(),
-            event_id: "e9".into(),
-            event_name: "mail.addressed".into(),
-            count: 1,
-        });
-        assert!(matches!(
-            bridge_cmd_to_brain("P", &mail),
-            Some(BrainMsg::EventsHint { .. })
-        ));
-    }
-
-    #[test]
-    fn flag_off_is_the_default_so_behaviour_is_byte_identical() {
-        assert!(
-            !crate::config::Config::default().doorbell_toron_events(),
-            "the events source must be opt-in"
-        );
-    }
-
-    #[test]
-    fn only_the_named_no_door_harnesses_get_an_events_pump() {
-        for kind in ["gemini", "antigravity", "grok", "codex", "gk", "cx"] {
-            assert!(events_only_harness(kind), "{kind} has no inbound door");
-        }
-        for kind in ["opencode", "oc", "claude", "pi"] {
-            assert!(!events_only_harness(kind), "{kind} has a native door");
-        }
     }
 }

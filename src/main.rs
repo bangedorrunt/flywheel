@@ -61,6 +61,7 @@ mod effect_journal;
 mod elm;
 mod events_bridge;
 mod events_client;
+mod events_source;
 mod events_tokens;
 mod failure;
 mod fs_util;
