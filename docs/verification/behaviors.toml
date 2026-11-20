@@ -1302,6 +1302,25 @@ mutations = [
 ]
 
 [[behavior]]
+id = "events.claude-channel-bridge"
+owner = "src/events_client.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/events_bridge.rs::a_burst_of_wake_events_is_one_hint_with_a_count",
+  "src/events_bridge.rs::stream_frames_are_routed_by_subscription_and_decoded",
+  "src/events_client.rs::a_stream_failure_falls_back_to_poll",
+  "src/events_client.rs::a_gap_stream_frame_is_a_resync_page",
+  "src/main.rs::claude_channel_server_is_the_stdio_bridge",
+]
+mutations = [
+  "scripts/mutations/events-bridge-phaseb.spec.sh#P1",
+  "scripts/mutations/events-bridge-phaseb.spec.sh#P2",
+  "scripts/mutations/events-bridge-phaseb.spec.sh#P3",
+  "scripts/mutations/events-bridge-phaseb.spec.sh#P4",
+]
+
+[[behavior]]
 id = "proof.live-five-clean-export"
 owner = "scripts/e2e-live-five.sh"
 status = "proven"
