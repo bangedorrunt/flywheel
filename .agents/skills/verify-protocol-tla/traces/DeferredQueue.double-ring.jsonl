@@ -5,4 +5,4 @@
 {"action":"Idle","arrived":["brief"],"audited":[],"preempted":[],"queued":["brief"],"rings":{"brief":0,"peer":0},"rung":[],"working":true}
 {"action":"ReachPrompt","arrived":["brief"],"audited":[],"preempted":[],"queued":["brief"],"rings":{"brief":0,"peer":0},"rung":[],"working":false}
 {"action":"Ring","arrived":["brief"],"audited":[],"preempted":[],"queued":[],"rings":{"brief":1,"peer":0},"rung":["brief"],"working":false}
-{"action":"Ring","arrived":["brief"],"audited":[],"preempted":[],"queued":[],"rings":{"brief":2,"peer":0},"rung":["brief"],"working":false}
+{"action":"Ring","arrived":["brief"],"audited":[],"preempted":[],"queued":[],"rings":{"brief":1,"peer":0},"rung":["brief"],"working":false}
