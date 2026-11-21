@@ -158,6 +158,29 @@ fn proof_verify_mutations_exports_pinned_siblings() {
     );
 }
 
+/// bd-08t3o: the pinned-siblings witness must ignore a build dir inherited
+/// from the outer proof, or clean-proof reuses the outer export and the
+/// witness becomes a no-op that fails for the wrong reason.
+#[test]
+fn proof_verify_mutations_ignores_an_inherited_build_dir() {
+    let status = Command::new("bash")
+        .arg(format!(
+            "{}/scripts/test-verify-mutations-pinned-siblings.sh",
+            root()
+        ))
+        .current_dir(root())
+        .env("VERIFY_MUTATIONS_BUILD_DIR", "/tmp/fw-proof-stale/mut-tree")
+        .env("VERIFY_MUTATIONS_TARGET_DIR", "/tmp/fw-proof-stale/target")
+        .env("VERIFY_MUTATIONS_EXPORT_ROOT", "/tmp/fw-proof-stale/export")
+        .env("VERIFY_MUTATIONS_IN_EXPORT", "1")
+        .status()
+        .expect("run pinned-siblings with a proof env");
+    assert!(
+        status.success(),
+        "the witness inherited the proof build dir"
+    );
+}
+
 /// bd-3681w: a kept proof export is for the captain's install. Letting every
 /// kept `fw-proof.*` directory accumulate filled the disk and killed proof44.
 /// bd-j45zo: exclude the kept export by basename, not by a path string whose

@@ -6,6 +6,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/proof-mutation-failfast.XXXXXX")"
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
+# bd-08t3o: a proof's shared scratch tree must not leak into a witness that
+# verifies the harness owns its OWN export (otherwise the witness is a no-op).
+unset VERIFY_MUTATIONS_BUILD_DIR VERIFY_MUTATIONS_EXPORT_ROOT VERIFY_MUTATIONS_IN_EXPORT VERIFY_MUTATIONS_TARGET_DIR
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
