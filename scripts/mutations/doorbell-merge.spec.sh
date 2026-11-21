@@ -48,7 +48,7 @@ mutation "W8  an identified brief folds onto another brief's text" \
 
 mutation "W7  the command text makes two renderings of one message distinct" \
     file=$CORE \
-    expect=the_wake_key_tracks_the_body_not_machine_identity \
+    expect=the_wake_key_ignores_the_watermark_but_not_the_body \
     find='        .split(". Read it with:")' \
     replace='        .split("NEVER_MATCHES")'
 

@@ -2455,7 +2455,7 @@ mod tests {
     /// differ only by it are one message, and two genuinely different ones are
     /// two.
     #[test]
-    fn the_wake_key_tracks_the_body_not_machine_identity() {
+    fn the_wake_key_ignores_the_watermark_but_not_the_body() {
         // bd-ofa1s/bd-tdpix: machine ids never appear in wake prose, so two
         // renderings of one directive share a key and a different path does not.
         let a =
