@@ -850,6 +850,19 @@ fn patched_desired(
             context_warm_allowed: !crate::seat_reconcile::role_is_fresh(&r.role),
         })
         .collect();
+    // bd-01q9d: compute this BEFORE the loop so patch order cannot decide
+    // whether the new harness inherits the old one's model argv.
+    let model_patched: Vec<usize> = patches
+        .iter()
+        .filter_map(|spec| {
+            let p = crate::swarm_plan::parse_patch(spec).ok()?;
+            if p.field != crate::swarm_plan::PatchField::Model {
+                return None;
+            }
+            rows.iter()
+                .position(|r| r.pin == p.seat || r.role.as_str() == p.seat || r.name == p.seat)
+        })
+        .collect();
     for spec in patches {
         let patch = crate::swarm_plan::parse_patch(spec)
             .map_err(|e| anyhow::anyhow!("bad --patch {spec:?}: {e}"))?;
@@ -879,6 +892,9 @@ fn patched_desired(
             match patch.field {
                 crate::swarm_plan::PatchField::Harness => {
                     seat.harness = patch.value.clone().into();
+                    if !model_patched.contains(&i) {
+                        seat.model = None;
+                    }
                 }
                 crate::swarm_plan::PatchField::Model => {
                     seat.model = Some(patch.value.clone());
@@ -2018,6 +2034,36 @@ mod plan_journal_tests {
             pane_id: format!("{pin}-pane"),
             status: "live".into(),
         }
+    }
+
+    /// bd-01q9d: a harness swap carries the OLD model's argv into the new
+    /// harness unless the same apply explicitly patches the model.
+    #[test]
+    fn a_harness_patch_drops_the_old_model() {
+        let mut r = row("Alpha", "coder");
+        r.harness = "opencode".into();
+        r.model = Some("opencode/big-pickle".into());
+        let want = patched_desired(&[r], &["Alpha.harness=pi".into()], &[]).unwrap();
+        assert_eq!(want[0].harness.as_str(), "pi");
+        assert!(
+            want[0].model.is_none(),
+            "pi must not inherit an opencode model: {want:?}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_model_patch_wins_over_the_harness_reset() {
+        let mut r = row("Alpha", "coder");
+        r.harness = "opencode".into();
+        r.model = Some("opencode/big-pickle".into());
+        let want = patched_desired(
+            &[r],
+            &["Alpha.harness=pi".into(), "Alpha.model=pi/fast".into()],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(want[0].harness.as_str(), "pi");
+        assert_eq!(want[0].model.as_deref(), Some("pi/fast"));
     }
 
     fn record_with(events: &[&str]) -> crate::state::PlanRecord {
