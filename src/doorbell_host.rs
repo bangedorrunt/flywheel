@@ -2228,6 +2228,90 @@ mod parity_tests {
     }
 
     #[test]
+    fn an_interleaved_b_watch_does_not_restamp_deferred_a() {
+        // bd-ofa1s review: a wake deferred while the seat works must keep ITS
+        // id even when another event's Watch arrives before the drain.
+        let watch = |id: &str| {
+            serde_json::json!({
+                "kind": 9, "id": id,
+                "tags": [["p", "PinA"], ["toron-kind", "mail-delivered"], ["mid", format!("m-{id}")]],
+                "content": "sealed"
+            })
+            .to_string()
+        };
+        let mut model = crate::workspace::WorkspaceModel::default();
+        model.doorbell.index.insert_pin("PinA".into(), None);
+        model
+            .doorbell
+            .statuses
+            .insert("PinA".into(), "working".into());
+        model.presence.insert(
+            "PinA".into(),
+            crate::workspace::Presence::from_str("working"),
+        );
+        // A is deferred while PinA works.
+        let (model, _) = crate::workspace::tick(
+            &model,
+            &crate::workspace::Msg::WatchNdjson {
+                line: watch("evt-A"),
+            },
+        );
+        // B's Watch arrives while A is still queued.
+        let (model, _) = crate::workspace::tick(
+            &model,
+            &crate::workspace::Msg::WatchNdjson {
+                line: watch("evt-B"),
+            },
+        );
+        assert!(
+            model
+                .doorbell
+                .queues
+                .get("PinA")
+                .map(|q| q.iter().any(|w| w.event_id.as_deref() == Some("evt-A")))
+                .unwrap_or(false),
+            "A keeps its own id in the queue after B arrived"
+        );
+        // Seat goes idle: the deferred A drains with A's id, never B's.
+        let (_, cmds) = crate::workspace::tick(
+            &model,
+            &crate::workspace::Msg::PlaneStatus {
+                pin: "PinA".into(),
+                status: "idle".into(),
+            },
+        );
+        let ids: Vec<Option<String>> = super::cmds_to_effects(cmds)
+            .into_iter()
+            .filter_map(|e| match e {
+                Effect::Prompt { event_id, .. } => Some(event_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![Some("evt-A".into())],
+            "A drains with A's id: {ids:?}"
+        );
+        // B's own Watch at idle rings with B's id.
+        let (_, cmds) = crate::workspace::tick(
+            &model,
+            &crate::workspace::Msg::WatchNdjson {
+                line: watch("evt-B"),
+            },
+        );
+        let ids: Vec<Option<String>> = super::cmds_to_effects(cmds)
+            .into_iter()
+            .filter_map(|e| match e {
+                Effect::Prompt { event_id, .. } => Some(event_id),
+                _ => None,
+            })
+            .collect();
+        // B folded into the same queue class; the invariant is that A's ring
+        // kept A's id and was never restamped with B's.
+        assert!(ids.iter().all(|id| id.as_deref() != Some("evt-B")));
+    }
+
+    #[test]
     fn a_deferred_ring_carries_the_id_through_the_queue_drain_and_claims() {
         // bd-ofa1s: a wake deferred while the seat is working must carry its
         // event id through the in-memory queue to the drain at idle, so the

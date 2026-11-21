@@ -3,7 +3,7 @@
 # drop the Prompt when it loses the claim.
 
 CARGO_ARGS=(--bin flywheel)
-TEST_FILTER=(n_racing_claimers_produce_exactly_one_winner a_lost_claim_emits_no_prompt a_watch_line_without_a_prompt_leaves_the_claim_free a_real_watch_line_through_the_fold_carries_and_claims_its_event_id a_sweep_conflict_prompt_claims_before_delivery a_deferred_ring_carries_the_id_through_the_queue_drain_and_claims)
+TEST_FILTER=(n_racing_claimers_produce_exactly_one_winner a_lost_claim_emits_no_prompt a_watch_line_without_a_prompt_leaves_the_claim_free a_real_watch_line_through_the_fold_carries_and_claims_its_event_id a_sweep_conflict_prompt_claims_before_delivery a_deferred_ring_carries_the_id_through_the_queue_drain_and_claims an_interleaved_b_watch_does_not_restamp_deferred_a)
 
 RUNG=src/wake_rung.rs
 HOST=src/doorbell_host.rs
@@ -44,3 +44,9 @@ mutation "T7  the deferred queue loses the carried event id" \
     expect=a_deferred_ring_carries_the_id_through_the_queue_drain_and_claims \
     find=$'        let queue = next.queues.entry(pin.to_string()).or_default();\n        let fold = queue_line(queue, key, thread, line.clone(), event_id.clone());' \
     replace=$'        let queue = next.queues.entry(pin.to_string()).or_default();\n        let fold = queue_line(queue, key, thread, line.clone(), None);'
+
+mutation "T8  a queued wake is restamped with a fixed tick id" \
+    file=crates/doorbell-core/src/lib.rs \
+    expect=an_interleaved_b_watch_does_not_restamp_deferred_a \
+    find=$'        let queue = next.queues.entry(pin.to_string()).or_default();\n        let fold = queue_line(queue, key, thread, line.clone(), event_id.clone());' \
+    replace=$'        let queue = next.queues.entry(pin.to_string()).or_default();\n        let fold = queue_line(queue, key, thread, line.clone(), Some("evt-B".into()));'
