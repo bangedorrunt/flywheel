@@ -4,7 +4,7 @@
 # test detects.
 
 CARGO_ARGS=(-p flywheel --bin flywheel)
-TEST_FILTER=(only_events_door_harnesses_get_a_token spawn_mints_a_per_pin_token_before_launch respawning_one_seat_never_revokes_another_seat_token)
+TEST_FILTER=(only_events_door_harnesses_get_a_token spawn_mints_a_per_pin_token_before_launch respawning_one_seat_never_revokes_another_seat_token spawn_loop_provisions_a_token_through_the_seam)
 
 mutation "T1  no harness gets an events token" \
     file=src/cmd/spawn.rs \
@@ -24,3 +24,13 @@ mutation "T3  the journal lookup ignores the pin" \
     find='        if row.get("pin").and_then(Value::as_str) != Some(agent)
             || row.get("project").and_then(Value::as_str) != Some(project)' \
     replace='        if row.get("project").and_then(Value::as_str) != Some(project)'
+
+mutation "T4  the spawn loop never mints" \
+    file=src/cmd/spawn.rs \
+    expect=spawn_loop_provisions_a_token_through_the_seam \
+    find='    if let Err(e) = ensure_seat_events_token(cli, state_dir, project, pin, now_us) {
+        eprintln!(
+            "flywheel: warn: events token mint failed for {pin}: {e}; using doorbell fallback"
+        );
+    }' \
+    replace='    let _ = (cli, state_dir, project, pin, now_us);'
