@@ -47,6 +47,15 @@ done
 
 die() { printf 'e2e-live-five: %s\n' "$*" >&2; exit 2; }
 
+# bd-833ya: this script KILLS its project on exit. A live project name here
+# would reap the real fleet's crews, so refuse before creating any session.
+if [ -n "${FLYWHEEL_LIVE_PROJECT+x}" ]; then
+    case "$FLYWHEEL_LIVE_PROJECT" in
+        e2e-*) ;;
+        *) die "FLYWHEEL_LIVE_PROJECT must be a non-empty e2e- throwaway name, got '$FLYWHEEL_LIVE_PROJECT'" ;;
+    esac
+fi
+
 # bd-o2uol: the five suites run plain cargo against this repo's `target`. An
 # mbx cache cleanup can leave `target` as a symlink to a directory that no
 # longer exists; cargo then fails each of the five tests with a misleading
@@ -177,6 +186,10 @@ SPAWNED_PIN=""
 # that supervisor back up. Drop both the registration and the unit.
 retire_throwaway_project() { # project
     local label fw="${FLYWHEEL_BIN:-flywheel}"
+    case "$1" in
+        e2e-*) ;;
+        *) echo "e2e-live-five: refuse to retire non-throwaway project '$1'" >&2; return 0 ;;
+    esac
     "$fw" kill "$1" --force --force-working --reap-crews >/dev/null 2>&1 || true
     label="dev.flywheel.doorbell.$1"
     if [ "$(uname -s)" = Darwin ]; then

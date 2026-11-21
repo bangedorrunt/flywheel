@@ -11,6 +11,8 @@ trap cleanup EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
+GUARD_ONLY=0
+[ "${1:-}" != "--guard" ] || GUARD_ONLY=1
 
 mkdir -p "$TMP/bin" "$TMP/home" "$TMP/xdg"
 # Deny-shims first, so a dry run that tried to boot anything is caught loudly.
@@ -45,6 +47,35 @@ exit 0
 ' "$TMP/flywheel.log" >"$TMP/bin/flywheel"
 chmod +x "$TMP/bin/flywheel"
 
+# bd-833ya: a live project name must abort before any session is created.
+guard_witness() {
+    : >"$TMP/rex.log"
+    : >"$TMP/flywheel.log"
+    : >"$TMP/shims.log"
+    local guard_out
+    guard_out="$(HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg/config" XDG_DATA_HOME="$TMP/xdg/data" \
+        XDG_STATE_HOME="$TMP/xdg/state" XDG_RUNTIME_DIR="$TMP/xdg/run" \
+        E2E_DRY_SHIM_LOG="$TMP/shims.log" PATH="$TMP/bin:$PATH" \
+        FLYWHEEL_LIVE_E2E=1 FLYWHEEL_LIVE_SESSION="guard-session" FLYWHEEL_LIVE_PIN="GuardPin" \
+        FLYWHEEL_LIVE_PROJECT="flywheel" TORON_BIN="$TMP/bin/cargo" \
+        bash "$ROOT/scripts/e2e-live-five.sh" --selftest 2>&1)" &&
+        fail "a live project name must be refused: $guard_out"
+    case "$guard_out" in
+        *"FLYWHEEL_LIVE_PROJECT must be"*) ;;
+        *) fail "the guard must name the refused variable: $guard_out" ;;
+    esac
+    [ ! -s "$TMP/rex.log" ] || fail "the guard must abort before any spawn: $(cat "$TMP/rex.log")"
+    [ ! -s "$TMP/flywheel.log" ] || fail "the guard must never call flywheel kill: $(cat "$TMP/flywheel.log")"
+    [ ! -s "$TMP/shims.log" ] || fail "the guard must never reach the supervisor tools: $(cat "$TMP/shims.log")"
+    pass "a live project name is refused before any spawn or kill"
+}
+
+if [ "$GUARD_ONLY" = 1 ]; then
+    guard_witness
+    echo "ok"
+    exit 0
+fi
+
 out="$(HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg/config" XDG_DATA_HOME="$TMP/xdg/data" \
     XDG_STATE_HOME="$TMP/xdg/state" XDG_RUNTIME_DIR="$TMP/xdg/run" \
     E2E_DRY_SHIM_LOG="$TMP/shims.log" \
@@ -67,6 +98,8 @@ pass "a dry run creates no session (rex was never called)"
 
 [ ! -s "$TMP/shims.log" ] || fail "a dry run reached launchctl/systemctl: $(cat "$TMP/shims.log")"
 pass "a dry run never reaches the supervisor tools"
+
+guard_witness
 
 
 # bd-833ya: seed the throwaway project's registration and supervisor unit, so

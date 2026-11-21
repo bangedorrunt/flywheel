@@ -14,6 +14,19 @@ fn the_live_five_dry_run_plans_without_creating_a_session() {
     assert!(status.success(), "the dry-run witness failed");
 }
 
+/// bd-833ya: a live project name must be refused before any session is made.
+#[test]
+fn the_live_five_refuses_a_non_throwaway_project() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let status = Command::new("bash")
+        .arg(format!("{root}/scripts/test-e2e-live-dry.sh"))
+        .arg("--guard")
+        .current_dir(root)
+        .status()
+        .expect("run scripts/test-e2e-live-dry.sh --guard");
+    assert!(status.success(), "the project guard witness failed");
+}
+
 /// bd-w5tgg: the live five must compile from a clean export of one revision,
 /// never the dirty shared tree. The fixture dirties an unrelated file and
 /// checks the export carries only the commit, with the sha in the receipt.
