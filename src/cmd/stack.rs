@@ -2,8 +2,10 @@
 //! stack. `status` is a native read; `install` delegates to the audited
 //! installer script so there is still exactly one install authority.
 
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use clap::Subcommand;
@@ -43,9 +45,9 @@ pub(crate) enum StackCmd {
     },
 }
 
-pub(crate) fn cmd_stack(_cfg: &Config, cmd: &StackCmd) -> Result<()> {
+pub(crate) fn cmd_stack(cfg: &Config, cmd: &StackCmd) -> Result<()> {
     match cmd {
-        StackCmd::Status { json, check } => stack_status(*json, *check),
+        StackCmd::Status { json, check } => stack_status(cfg, *json, *check),
         StackCmd::Install {
             dry_run,
             no_codesign,
@@ -54,7 +56,7 @@ pub(crate) fn cmd_stack(_cfg: &Config, cmd: &StackCmd) -> Result<()> {
             operator,
         } => {
             if !dry_run {
-                crate::authority::guard_fleet_mutation(_cfg, None, *operator, "stack install")?;
+                crate::authority::guard_fleet_mutation(cfg, None, *operator, "stack install")?;
             }
             stack_install(*dry_run, *no_codesign, *no_restart, *skip_toron)
         }
@@ -199,6 +201,48 @@ fn toron_status() -> (Option<Value>, Option<String>) {
     }
 }
 
+/// bd-4bxtl: the address flywheel actually routes to. `FLYWHEEL_TORON_URL`
+/// wins (the documented override), then `[mail.toron] url`, then toron's
+/// default. A build record is not health — probe the address itself.
+fn toron_addr_from_url(url: &str) -> Option<String> {
+    let (without_scheme, default_port) = if let Some(rest) = url.strip_prefix("https://") {
+        (rest, 443)
+    } else {
+        (url.strip_prefix("http://")?, 18080)
+    };
+    let authority = without_scheme.split('/').next().unwrap_or("");
+    let hostport = authority
+        .rsplit_once('@')
+        .map(|(_, hp)| hp)
+        .unwrap_or(authority);
+    if hostport.is_empty() {
+        return None;
+    }
+    if hostport.contains(':') {
+        Some(hostport.to_string())
+    } else {
+        Some(format!("{hostport}:{default_port}"))
+    }
+}
+
+fn toron_addr(cfg: &Config) -> String {
+    std::env::var("FLYWHEEL_TORON_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| cfg.toron_mail_config().url.clone())
+        .and_then(|url| toron_addr_from_url(&url))
+        .unwrap_or_else(|| "127.0.0.1:18080".to_string())
+}
+
+fn toron_reachable(addr: &str) -> bool {
+    let Ok(addrs) = addr.to_socket_addrs() else {
+        return false;
+    };
+    addrs
+        .into_iter()
+        .any(|sa| TcpStream::connect_timeout(&sa, Duration::from_millis(500)).is_ok())
+}
+
 fn binary_json(binary: &BinaryProbe) -> Value {
     json!({
         "name": binary.name,
@@ -277,7 +321,9 @@ fn events_seats_and_tokens() -> (
     (rows, token_pins)
 }
 
-fn stack_status(json_output: bool, check: bool) -> Result<()> {
+fn stack_status(cfg: &Config, json_output: bool, check: bool) -> Result<()> {
+    let toron_daemon_addr = toron_addr(cfg);
+    let toron_reachable_now = toron_reachable(&toron_daemon_addr);
     let binaries = [
         probe_bin("flywheel"),
         probe_bin("doorbell"),
@@ -349,7 +395,8 @@ fn stack_status(json_output: bool, check: bool) -> Result<()> {
         || flywheel_version_skew
         || !stale_pids.is_empty()
         || toron.is_none()
-        || toron_restart_required;
+        || toron_restart_required
+        || !toron_reachable_now;
 
     if json_output {
         print_json(&json!({
@@ -371,6 +418,8 @@ fn stack_status(json_output: bool, check: bool) -> Result<()> {
                 "stale_live_pids": stale_pids,
             },
             "toron": {
+                "addr": toron_daemon_addr,
+                "reachable": toron_reachable_now,
                 "status": toron,
                 "error": toron_error,
                 "restart_required": toron_restart_required,
@@ -471,6 +520,9 @@ fn stack_status(json_output: bool, check: bool) -> Result<()> {
         }
 
         println!("\n== toron ==");
+        if !toron_reachable_now {
+            println!("daemon down: {toron_daemon_addr} (connection refused)");
+        }
         match &toron {
             Some(status) => {
                 println!(
@@ -508,6 +560,9 @@ fn stack_status(json_output: bool, check: bool) -> Result<()> {
     }
 
     if check && bad {
+        if !toron_reachable_now {
+            bail!("stack is not current: toron daemon not listening at {toron_daemon_addr}");
+        }
         bail!("stack is not current");
     }
     Ok(())
@@ -604,6 +659,41 @@ pub(crate) fn installed_flywheel_version() -> String {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    /// bd-4bxtl: health is the address the daemon answers on, not a build
+    /// record. A stale build record alone must not make `stack: ok`.
+    #[test]
+    fn toron_addr_comes_from_the_url() {
+        assert_eq!(
+            super::toron_addr_from_url("http://127.0.0.1:18080/mcp"),
+            Some("127.0.0.1:18080".to_string())
+        );
+        assert_eq!(
+            super::toron_addr_from_url("http://user:pw@127.0.0.1:9/"),
+            Some("127.0.0.1:9".to_string())
+        );
+        assert_eq!(
+            super::toron_addr_from_url("http://toron.local"),
+            Some("toron.local:18080".to_string())
+        );
+        assert_eq!(super::toron_addr_from_url("not a url/"), None);
+    }
+
+    #[test]
+    fn toron_reachability_fails_closed_on_a_refusing_address() {
+        assert!(
+            !super::toron_reachable("127.0.0.1:1"),
+            "closed port is down"
+        );
+        assert!(
+            !super::toron_reachable("not-an-address"),
+            "bad address is down"
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        assert!(super::toron_reachable(&addr), "a listening daemon is up");
+    }
 
     #[test]
     fn stale_hosts_are_only_live_mismatched_pids() {
