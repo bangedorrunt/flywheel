@@ -143,6 +143,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn turn_state_is_keyed_by_project_then_pin() {
+        let dir = std::env::temp_dir().join(format!("b2kaa-proj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        on_event(&dir, "flywheel", "AmberProbe", "session-start");
+        assert!(
+            turn_path(&dir, "flywheel", "AmberProbe").is_file(),
+            "turn state must live under <project>/<pin>"
+        );
+        assert!(
+            !turn_path(&dir, "AmberProbe", "AmberProbe").is_file(),
+            "the pin must never be used as the project key"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn stop_hook_resets_the_cap_when_no_mail_waits() {
         let dir = std::env::temp_dir().join(format!("b2kaa-stop-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

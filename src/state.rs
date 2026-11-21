@@ -344,6 +344,32 @@ pub fn agents_dir() -> PathBuf {
     state_dir().join("agents")
 }
 
+/// Find a registered seat by its mail pin across all projects. Used by the
+/// harness trampoline, which is account-wide and has no project argument.
+pub fn find_seat_by_pin(pin: &str) -> Option<(String, SpawnEntry)> {
+    let dir = agents_dir();
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(rows) = serde_json::from_str::<Vec<SpawnEntry>>(&raw) else {
+            continue;
+        };
+        if let Some(seat) = rows
+            .into_iter()
+            .find(|s| s.mail_identity.as_deref() == Some(pin))
+        {
+            let project = path.file_stem()?.to_string_lossy().to_string();
+            return Some((project, seat));
+        }
+    }
+    None
+}
+
 pub fn spawn_registry_file(project: &str) -> PathBuf {
     agents_dir().join(format!("{}.json", spawn_registry_key(project)))
 }

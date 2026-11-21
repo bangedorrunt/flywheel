@@ -13,5 +13,5 @@ mutation "I1  uninstall drops every entry, including foreign rex hooks" \
 mutation "I2  the trampoline runs in the operator's own session" \
     file=src/integration.rs \
     expect=trampoline_is_a_noop_outside_a_seat \
-    find='    in_pane && !pin.is_empty() && pin == agent' \
+    find='    in_pane && !pin.is_empty() && seat_harness == Some(harness)' \
     replace='    true'

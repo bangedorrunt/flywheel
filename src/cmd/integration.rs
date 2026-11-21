@@ -117,7 +117,6 @@ pub fn cmd_integration(cfg: &Config, cmd: IntegrationCmd) -> Result<()> {
     } else {
         cmd.args().harness.clone()
     };
-    let pin = std::env::var("AGENT_NAME").unwrap_or_default();
     for kind in harnesses {
         if crate::harness_registry::canonical(&kind) == "claude" {
             println!("claude: plugin delivered per seat by --plugin-dir (no config edit)");
@@ -133,7 +132,11 @@ pub fn cmd_integration(cfg: &Config, cmd: IntegrationCmd) -> Result<()> {
                 } else {
                     serde_json::json!({})
                 };
-                install_entries(&mut config, &pin, events_for(&kind));
+                install_entries(
+                    &mut config,
+                    &crate::harness_registry::canonical(&kind),
+                    events_for(&kind),
+                );
                 write_atomic(&path, &config)?;
                 println!("installed {kind} hooks at {}", path.display());
             }
@@ -143,7 +146,7 @@ pub fn cmd_integration(cfg: &Config, cmd: IntegrationCmd) -> Result<()> {
                     continue;
                 }
                 let mut config = read_json(&path)?;
-                let n = uninstall_entries(&mut config, &pin);
+                let n = uninstall_entries(&mut config, &crate::harness_registry::canonical(&kind));
                 write_atomic(&path, &config)?;
                 println!("removed {n} {kind} hook entry(ies)");
             }
@@ -153,7 +156,11 @@ pub fn cmd_integration(cfg: &Config, cmd: IntegrationCmd) -> Result<()> {
                 } else {
                     serde_json::Value::Null
                 };
-                let state = status_of(&config, &pin, events_for(&kind));
+                let state = status_of(
+                    &config,
+                    &crate::harness_registry::canonical(&kind),
+                    events_for(&kind),
+                );
                 println!("{kind}: {state:?} ({})", path.display());
             }
         }

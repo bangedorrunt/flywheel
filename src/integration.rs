@@ -69,10 +69,11 @@ pub fn uninstall_entries(existing: &mut Value, agent: &str) -> usize {
     removed
 }
 
-/// The trampoline is a silent no-op unless the process is a flywheel seat for
-/// this exact agent. The operator's own sessions carry no FLYWHEEL_PANE.
-pub fn hook_allowed(in_pane: bool, pin: &str, agent: &str) -> bool {
-    in_pane && !pin.is_empty() && pin == agent
+/// The trampoline is keyed to the HARNESS (the config files are account-wide),
+/// not to one pin. It is a silent no-op unless the process is a flywheel seat
+/// whose registered harness matches the harness in the command.
+pub fn hook_allowed(in_pane: bool, pin: &str, harness: &str, seat_harness: Option<&str>) -> bool {
+    in_pane && !pin.is_empty() && seat_harness == Some(harness)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,10 +132,24 @@ mod tests {
 
     #[test]
     fn trampoline_is_a_noop_outside_a_seat() {
-        assert!(!hook_allowed(false, "BlackRidge", "BlackRidge"));
-        assert!(!hook_allowed(true, "", "BlackRidge"));
-        assert!(!hook_allowed(true, "BlackRidge", "SomeoneElse"));
-        assert!(hook_allowed(true, "BlackRidge", "BlackRidge"));
+        assert!(!hook_allowed(false, "BlackRidge", "codex", Some("codex")));
+        assert!(!hook_allowed(true, "", "codex", Some("codex")));
+        assert!(!hook_allowed(true, "BlackRidge", "codex", Some("grok")));
+        assert!(!hook_allowed(true, "BlackRidge", "codex", None));
+        assert!(hook_allowed(true, "BlackRidge", "codex", Some("codex")));
+    }
+
+    #[test]
+    fn one_harness_entry_serves_two_seat_pins() {
+        let mut cfg = serde_json::json!({});
+        install_entries(&mut cfg, "codex", CODEX_EVENTS);
+        let a = status_of(&cfg, "codex", CODEX_EVENTS);
+        let b = status_of(&cfg, "codex", CODEX_EVENTS);
+        assert_eq!(a, b);
+        assert_eq!(a, InstallStatus::Current);
+        // The runtime pin is not in the config; both seats match the harness.
+        assert!(hook_allowed(true, "PinA", "codex", Some("codex")));
+        assert!(hook_allowed(true, "PinB", "codex", Some("codex")));
     }
 
     #[test]

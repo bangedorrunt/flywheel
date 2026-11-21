@@ -3795,13 +3795,15 @@ fn main() {
         Some(Commands::HookTrampoline { event, agent }) => {
             let pin = std::env::var("AGENT_NAME").unwrap_or_default();
             let in_pane = std::env::var("FLYWHEEL_PANE").is_ok_and(|v| !v.is_empty());
-            if crate::integration::hook_allowed(in_pane, &pin, agent)
-                && let Some(line) = crate::turn_hooks::on_event(
-                    &config::state_dir(),
-                    &pin,
-                    &pin,
-                    event,
-                )
+            let seat = state::find_seat_by_pin(&pin);
+            let seat_harness = seat
+                .as_ref()
+                .and_then(|(_, entry)| entry.harness.as_deref())
+                .map(crate::harness_registry::canonical);
+            if crate::integration::hook_allowed(in_pane, &pin, agent, seat_harness.as_deref())
+                && let Some((project, _)) = seat
+                && let Some(line) =
+                    crate::turn_hooks::on_event(&config::state_dir(), &project, &pin, event)
             {
                 println!("{line}");
             }
