@@ -124,6 +124,8 @@ pub trait ReceiptChecks {
     fn bead_exists(&self, id: &str) -> bool;
     fn commit_exists(&self, repo: &Path, sha: &str) -> bool;
     fn is_ancestor(&self, repo: &Path, ancestor: &str, descendant: &str) -> bool;
+    /// bd-1czzw: the commit must cite the bead it closes.
+    fn commit_cites_bead(&self, repo: &Path, sha: &str, bead: &str) -> bool;
 }
 
 pub fn validate_structure(r: &CrewReceipt) -> Result<(), FieldError> {
@@ -187,6 +189,15 @@ where
             return Err(err(
                 &format!("beads[{i}].sha"),
                 &format!("{} not found in {}", b.sha, repo.display()),
+            ));
+        }
+        if !checks.commit_cites_bead(&repo, &b.sha, &b.id) {
+            return Err(err(
+                &format!("beads[{i}].sha"),
+                &format!(
+                    "commit {} does not cite {} — ship land would refuse this row",
+                    b.sha, b.id
+                ),
             ));
         }
         let proved = b.sha == r.fence.sha || checks.is_ancestor(&repo, &b.sha, &r.fence.sha);
@@ -274,7 +285,9 @@ mod tests {
         )
     }
 
-    struct FakeChecks;
+    struct FakeChecks {
+        cites: bool,
+    }
     impl ReceiptChecks for FakeChecks {
         fn bead_exists(&self, _id: &str) -> bool {
             true
@@ -285,6 +298,9 @@ mod tests {
         fn is_ancestor(&self, _repo: &Path, _ancestor: &str, _descendant: &str) -> bool {
             true
         }
+        fn commit_cites_bead(&self, _repo: &Path, _sha: &str, _bead: &str) -> bool {
+            self.cites
+        }
     }
 
     fn root() -> PathBuf {
@@ -293,9 +309,31 @@ mod tests {
 
     #[test]
     fn a_valid_receipt_parses_and_validates() {
-        let r = validate(&valid_raw(), &root(), "flywheel", &FakeChecks).expect("valid");
+        let r = validate(
+            &valid_raw(),
+            &root(),
+            "flywheel",
+            &FakeChecks { cites: true },
+        )
+        .expect("valid");
         assert_eq!(r.beads[0].id, "bd-a");
         assert_eq!(r.fence.verdict, FenceVerdict::Green);
+    }
+
+    /// bd-1czzw: a receipt whose commit message does not name its bead is
+    /// refused at done time, naming both the bead and the sha.
+    #[test]
+    fn an_uncited_commit_is_refused_naming_bead_and_sha() {
+        let e = validate(
+            &valid_raw(),
+            &root(),
+            "flywheel",
+            &FakeChecks { cites: false },
+        )
+        .expect_err("an uncited commit must be refused");
+        let msg = e.to_string();
+        assert!(msg.contains("bd-a"), "names the bead: {msg}");
+        assert!(msg.contains(&"a".repeat(40)), "names the sha: {msg}");
     }
 
     #[test]
@@ -324,7 +362,8 @@ mod tests {
             ),
         ];
         for (label, raw, field) in cases {
-            let e = validate(&raw, &root(), "flywheel", &FakeChecks).expect_err(label);
+            let e =
+                validate(&raw, &root(), "flywheel", &FakeChecks { cites: true }).expect_err(label);
             assert_eq!(e.field, field, "{label}: {e}");
         }
     }
@@ -332,13 +371,14 @@ mod tests {
     #[test]
     fn a_verdict_typo_fails_at_parse() {
         let raw = valid_raw().replace("green", "grean");
-        let e = validate(&raw, &root(), "flywheel", &FakeChecks).expect_err("typo");
+        let e = validate(&raw, &root(), "flywheel", &FakeChecks { cites: true }).expect_err("typo");
         assert_eq!(e.field, "json");
     }
 
     #[test]
     fn malformed_json_names_the_json_field() {
-        let e = validate("not json", &root(), "flywheel", &FakeChecks).expect_err("bad json");
+        let e = validate("not json", &root(), "flywheel", &FakeChecks { cites: true })
+            .expect_err("bad json");
         assert_eq!(e.field, "json");
     }
 
@@ -376,6 +416,9 @@ mod tests {
         }
         fn is_ancestor(&self, _repo: &Path, _ancestor: &str, _descendant: &str) -> bool {
             false
+        }
+        fn commit_cites_bead(&self, _repo: &Path, _sha: &str, _bead: &str) -> bool {
+            true
         }
     }
 

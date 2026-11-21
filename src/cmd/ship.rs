@@ -117,6 +117,16 @@ pub(crate) fn is_ancestor_in(root: &Path, ancestor: &str, descendant: &str) -> b
     git(root, &["merge-base", "--is-ancestor", ancestor, descendant]).is_ok()
 }
 
+/// bd-1czzw: a receipt's commit must NAME its bead. Checked at done time, when
+/// a new commit is still cheap, because ship land refuses an uncited sha and
+/// history cannot be amended.
+pub(crate) fn commit_cites_bead(root: &Path, sha: &str, bead: &str) -> bool {
+    git(root, &["log", "-1", "--format=%B", sha]).is_ok_and(|msg| {
+        msg.split_whitespace()
+            .any(|t| t.trim_matches(|c: char| !c.is_alphanumeric() && c != '-') == bead)
+    })
+}
+
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
         .arg("-C")

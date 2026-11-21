@@ -1003,6 +1003,9 @@ impl crate::crew_receipt::ReceiptChecks for LiveReceiptChecks {
     fn is_ancestor(&self, repo: &std::path::Path, ancestor: &str, descendant: &str) -> bool {
         crate::cmd::ship::is_ancestor_in(repo, ancestor, descendant)
     }
+    fn commit_cites_bead(&self, repo: &std::path::Path, sha: &str, bead: &str) -> bool {
+        crate::cmd::ship::commit_cites_bead(repo, sha, bead)
+    }
 }
 
 fn resolve_receipt(
