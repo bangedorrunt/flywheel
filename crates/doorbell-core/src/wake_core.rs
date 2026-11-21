@@ -33,6 +33,9 @@ use std::fmt::Write as _;
 pub enum PresenceVerdict {
     Idle,
     Busy,
+    /// A permission/question/auth dialog is open: typing would answer it on
+    /// the operator's behalf, so this is never a typing target (bd-6qae0).
+    Blocked,
     Dead,
     Unknown,
 }
@@ -40,7 +43,8 @@ pub enum PresenceVerdict {
 pub fn parse_presence_word(s: &str) -> PresenceVerdict {
     match s.trim().to_ascii_lowercase().as_str() {
         "idle" | "done" => PresenceVerdict::Idle,
-        "working" | "busy" | "blocked" => PresenceVerdict::Busy,
+        "working" | "busy" => PresenceVerdict::Busy,
+        "blocked" => PresenceVerdict::Blocked,
         "dead" | "endpoint-dead" | "endpoint" => PresenceVerdict::Dead,
         _ => PresenceVerdict::Unknown,
     }
@@ -66,6 +70,12 @@ pub fn inject_gate(verdict: PresenceVerdict, urgent: bool) -> InjectGate {
         (PresenceVerdict::Busy, true) => InjectGate::Inject,
         (PresenceVerdict::Busy, false) => {
             InjectGate::Digest("non-injectable presence held wake for digest")
+        }
+        // A blocked pane is showing a dialog; even an urgent line must not be
+        // typed into it (bd-6qae0). An API door is a separate route and is not
+        // represented here — this gate only governs typing.
+        (PresenceVerdict::Blocked, _) => {
+            InjectGate::Digest("blocked pane has no typing target; mail held for digest")
         }
         (PresenceVerdict::Dead, _) => InjectGate::Digest("dead presence held wake for digest"),
         (PresenceVerdict::Unknown, _) => {

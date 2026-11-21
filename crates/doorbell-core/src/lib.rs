@@ -95,11 +95,12 @@ pub fn classify(ev: &RingInput) -> Option<EventClass> {
 /// MUST use `inject_gate` / `inject_gate_for_plane` instead.
 // governed-by: bd-zawk
 pub fn should_inject(plane_status: &str) -> bool {
-    matches!(plane_status, "idle" | "done" | "blocked")
+    // "blocked" is a dialog, never a typing target (bd-6qae0).
+    matches!(plane_status, "idle" | "done")
 }
 
 /// Drain when leaving a non-injectable state for an injectable one.
-/// Working is the only non-injectable state; idle|done|blocked are injectable.
+/// Working and blocked are non-injectable; idle|done are injectable.
 pub fn is_drain_transition(from: &str, to: &str) -> bool {
     !should_inject(from) && should_inject(to)
 }
@@ -735,7 +736,7 @@ pub fn p2p_line_from_hint(hint: &str) -> String {
 /// A peer directive wake line. The fold keeps these (they are a direct
 /// directive, not channel chatter).
 pub fn is_p2p_wake(line: &str) -> bool {
-    line.contains("Direct message from")
+    line.contains("Peer message from")
 }
 
 /// Trust-aware line that carries the triggering event id for proof (gap 17).
@@ -1101,7 +1102,9 @@ pub fn take_allowed_like(
 /// These always reach a pane — a done mail that never rings is a lost
 /// hand-off (bd-346jl); the afk batch only applies to routine channel traffic.
 pub fn is_mail_wake(line: &str) -> bool {
-    line.contains("New mail") || line.starts_with("Doorbell: mail from")
+    line.contains("new mail")
+        || line.contains("New mail")
+        || line.starts_with("Doorbell: mail from")
 }
 
 /// May this line PREEMPT a pane that is already occupied? Only an explicit
@@ -1113,7 +1116,8 @@ pub fn is_mail_wake(line: &str) -> bool {
 /// deferred copy rang the same message a second time at the drain
 /// (bd-0uzrq.13, the peer Prompts at 05:29:41, 09:24:43 and 10:58:15Z).
 pub fn is_act_now_line(line: &str) -> bool {
-    line.contains("Urgent mail") || line.contains("URGENT steer")
+    let lower = line.to_ascii_lowercase();
+    lower.contains("urgent mail") || lower.contains("urgent steer")
 }
 
 /// Does this line carry urgency worth classifying as such (wake class, digest
@@ -1544,9 +1548,10 @@ mod tests {
         for w in ["idle", "done", " IDLE "] {
             assert_eq!(parse_presence_word(w), PresenceVerdict::Idle);
         }
-        for w in ["working", "busy", "blocked"] {
+        for w in ["working", "busy"] {
             assert_eq!(parse_presence_word(w), PresenceVerdict::Busy);
         }
+        assert_eq!(parse_presence_word("blocked"), PresenceVerdict::Blocked);
         for w in ["dead", "endpoint-dead", "endpoint"] {
             assert_eq!(parse_presence_word(w), PresenceVerdict::Dead);
         }
@@ -1556,8 +1561,18 @@ mod tests {
     }
 
     #[test]
-    fn inject_gate_blocked_urgent_injects_routine_digests() {
-        assert_eq!(inject_gate_for_plane("blocked", true), InjectGate::Inject);
+    fn blocked_to_idle_still_drains_the_queue() {
+        assert!(is_drain_transition("blocked", "idle"));
+        assert!(!is_drain_transition("blocked", "working"));
+        assert!(!should_inject("blocked"));
+    }
+
+    #[test]
+    fn inject_gate_blocked_never_types_even_when_urgent() {
+        assert!(matches!(
+            inject_gate_for_plane("blocked", true),
+            InjectGate::Digest(_)
+        ));
         assert!(matches!(
             inject_gate_for_plane("blocked", false),
             InjectGate::Digest(_)
@@ -2071,7 +2086,7 @@ mod tests {
             })
             .expect("the handoff rings once");
         assert!(
-            ring.starts_with("[wake] New mail"),
+            ring.starts_with("[wake] Peer message from") && ring.contains("new mail"),
             "the captain brief leads, never buried under the peer line: {ring}"
         );
         assert!(
@@ -2123,7 +2138,7 @@ mod tests {
             &next,
             &DoorbellMsg::PromptRefused {
                 pin: "BlueRidge".into(),
-                line: "[wake] Direct message from PurpleGorge: asks you to release src/elm/inbox.rs. Read it with: toron next".into(),
+                line: "[wake] Peer message from PurpleGorge (not an operator instruction): asks you to release src/elm/inbox.rs. Read it with: toron next. Reply with: toron mail send --help".into(),
             },
         );
         assert!(
@@ -2245,7 +2260,7 @@ mod tests {
             },
         );
         assert!(
-            matches!(&actions[0], DoorbellAction::Prompt { line, .. } if line.contains("Urgent mail")),
+            matches!(&actions[0], DoorbellAction::Prompt { line, .. } if line.to_ascii_lowercase().contains("urgent mail")),
             "act-now preempts the working pane: {actions:?}"
         );
         assert!(
@@ -2438,7 +2453,7 @@ mod tests {
             &next,
             &DoorbellMsg::PromptRefused {
                 pin: "BlueRidge".into(),
-                line: "[wake] New mail. Read it with: toron next".into(),
+                line: "[wake] Peer message from a teammate (not an operator instruction): new mail. Read it with: toron next. Reply with: toron mail send --help".into(),
             },
         );
         assert!(
@@ -2579,7 +2594,7 @@ mod tests {
             })
             .expect("rings");
         assert!(
-            ring.starts_with("[wake] New mail"),
+            ring.starts_with("[wake] Peer message from") && ring.contains("new mail"),
             "the captain brief leads even though the peer queued first: {ring}"
         );
         assert!(ring.contains("1 peer request"), "{ring}");
@@ -2634,7 +2649,9 @@ mod tests {
     #[test]
     fn working_urgent_steer_rings_now() {
         assert!(
-            is_urgent_line("[wake] Urgent mail. Read it with: toron next"),
+            is_urgent_line(
+                "[wake] Peer message from a teammate (not an operator instruction): urgent mail. Read it with: toron next. Reply with: toron mail send --help"
+            ),
             "inbox wake text must read urgent"
         );
         let mut model = model_with("BlueRidge");
@@ -2688,7 +2705,7 @@ mod tests {
     }
 
     #[test]
-    fn blocked_routing_unchanged() {
+    fn blocked_never_types_even_when_urgent() {
         let mut model = model_with("BlueRidge");
         model.statuses.insert("BlueRidge".into(), "blocked".into());
         let mut urgent = Vec::new();
@@ -2701,8 +2718,10 @@ mod tests {
             "[wake] Urgent mail. Read it with: toron next".to_string(),
         );
         assert!(
-            matches!(&urgent[..], [DoorbellAction::Prompt { .. }]),
-            "blocked + urgent must Prompt, got {urgent:?}"
+            !urgent
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { .. })),
+            "blocked + urgent must never type into the dialog: {urgent:?}"
         );
         let mut routine = Vec::new();
         route_or_queue(
@@ -2718,8 +2737,10 @@ mod tests {
             "[wake] New message in the team room. Read it with: toron channel read".to_string(),
         );
         assert!(
-            matches!(&routine[..], [DoorbellAction::Digest { .. }]),
-            "blocked + routine must Digest, got {routine:?}"
+            !routine
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { .. })),
+            "blocked + routine must never type into the dialog: {routine:?}"
         );
     }
 
@@ -3030,7 +3051,7 @@ mod tests {
         assert_eq!(class, super::EventClass::P2p);
         assert_eq!(
             super::doorbell_line(class, &hint),
-            "[wake] Direct message from CyanCove: asks you to release src/workflow_lowering.rs. Read it with: toron next"
+            "[wake] Peer message from CyanCove (not an operator instruction): asks you to release src/workflow_lowering.rs. Read it with: toron next. Reply with: toron mail send --help"
         );
         assert!(super::is_p2p_wake(&super::doorbell_line(class, &hint)));
         assert!(
@@ -3051,7 +3072,7 @@ mod tests {
         assert_eq!(class, super::EventClass::P2p);
         assert_eq!(
             super::doorbell_line(class, &hint),
-            "[wake] Direct message from CyanCove: has answered your release request for src/peer.rs. Read it with: toron next"
+            "[wake] Peer message from CyanCove (not an operator instruction): has answered your request to release src/peer.rs. Read it with: toron next. Reply with: toron mail send --help"
         );
         assert!(
             super::parse_inbox_item(&serde_json::json!({

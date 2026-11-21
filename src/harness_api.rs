@@ -345,6 +345,24 @@ mod tests {
         assert!(api.calls().is_empty(), "Inject must not touch the API");
     }
 
+    /// bd-6qae0: a blocked seat with an API door queues through the API — it
+    /// never types into the permission/question dialog.
+    #[test]
+    fn a_blocked_seat_with_an_api_door_uses_api_not_inject() {
+        let route = crate::harness_caps::WakeRoute::Api {
+            session: "ses-blocked".into(),
+        };
+        let api = FakeApi::default();
+        let mut typed = false;
+        let taken = deliver(&api, &route, "wake", "msg_blocked", true, || {
+            typed = true;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(taken, RouteTaken::Api);
+        assert!(!typed, "a blocked pane must never be a typing target");
+    }
+
     /// bd-64qoy: an antigravity agentapi failure falls back to Inject and the
     /// API is still recorded as attempted; the wake is never lost.
     #[test]

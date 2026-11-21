@@ -211,6 +211,9 @@ impl Presence {
             doorbell_core::PresenceVerdict::Busy => Self::Busy {
                 source: "presence".into(),
             },
+            doorbell_core::PresenceVerdict::Blocked => Self::Busy {
+                source: "presence-blocked: no typing target".into(),
+            },
             doorbell_core::PresenceVerdict::Idle => Self::Idle {
                 source: "presence".into(),
             },
@@ -4322,7 +4325,7 @@ mod presence_model_tests {
             &m,
             vec![Cmd::Prompt {
                 pin: "B".into(),
-                line: "[wake] New mail. Read it with: toron next".into(),
+                line: "[wake] Peer message from a teammate (not an operator instruction): new mail. Read it with: toron next Reply with: toron mail send --help".into(),
             }],
         );
         assert!(
@@ -4367,10 +4370,9 @@ mod presence_model_tests {
         let mut m = empty_model();
         m.presence.insert("I".into(), Presence::from_str("idle"));
         m.presence.insert("B".into(), Presence::from_str("working"));
-        let urgent = "[wake] Urgent mail. Read it with: toron next";
+        let urgent = "[wake] Peer message from a teammate (not an operator instruction): urgent mail. Read it with: toron next Reply with: toron mail send --help";
         let peer = "[doorbell] request-release. Pull: toron next";
-        let routine =
-            "[wake] New message in the team room. Read it with: toron channel read h=ch-1";
+        let routine = "[wake] Peer message from a teammate (not an operator instruction): a new message in the team room. Read it with: toron channel read h=ch-1 Reply with: toron mail send --help";
         let cmds = vec![
             Cmd::Prompt {
                 pin: "I".into(),
@@ -5867,7 +5869,7 @@ mod adr0010_d5_tests {
         assert_eq!(
             classify_cmd(&Cmd::Prompt {
                 pin: "P".into(),
-                line: "[wake] Urgent mail. Read it with: inbox".into(),
+                line: "[wake] Peer message from a teammate (not an operator instruction): urgent mail. Read it with: inbox Reply with: toron mail send --help".into(),
             }),
             WakeClass::Urgent,
             "urgent lines ring now"
@@ -5875,7 +5877,7 @@ mod adr0010_d5_tests {
         assert_eq!(
             classify_cmd(&Cmd::Prompt {
                 pin: "P".into(),
-                line: "[wake] New message in the team room. Read it with: ch".into(),
+                line: "[wake] Peer message from a teammate (not an operator instruction): a new message in the team room. Read it with: ch Reply with: toron mail send --help".into(),
             }),
             WakeClass::Routine,
             "bd-l72k: addressed kind-9 chatter is routine (zero prompts, counters only)"
