@@ -190,9 +190,11 @@ pub fn deaf_text(pin: &str, wm: u64, cause: DeafCause) -> String {
         DeafCause::NoAnswer => "was rung the whole budget and never ran `toron next`",
         DeafCause::Unbound => "has mail but no verified pane binding",
     };
+    let _ = wm; // machine id stays typed data, never in wake prose (bd-tdpix)
     format!(
-        "⟦toron⟧ DEAF: {} {why} (wm {wm:x}). Check its pane; mail stays in its inbox.",
-        crate::redact::present(pin)
+        "{} No response from {}: {why}. Check its pane; the message stays in its inbox.",
+        doorbell_core::agent_text::WAKE_PREFIX,
+        crate::redact::present(pin),
     )
 }
 
@@ -1184,10 +1186,10 @@ mod tests {
         )
         .unwrap();
         let writes = pane.0.lock().unwrap().clone();
-        let urgent_lines = writes.iter().filter(|w| w.contains("URGENT steer")).count();
+        let urgent_lines = writes.iter().filter(|w| w.contains("Urgent mail")).count();
         assert_eq!(urgent_lines, 1, "{writes:?}");
         assert!(
-            writes.iter().any(|w| w.contains("URGENT steer (wm 7)")),
+            writes.iter().any(|w| w.contains("Urgent mail")),
             "{writes:?}"
         );
         assert_eq!(
@@ -1196,9 +1198,7 @@ mod tests {
             "one interrupt for the urgent observation: {writes:?}"
         );
         assert!(
-            writes
-                .iter()
-                .any(|w| w.contains("new work") && w.contains('8')),
+            writes.iter().any(|w| w.contains("New mail")),
             "the non-steer observation is a normal wake: {writes:?}"
         );
         assert!(

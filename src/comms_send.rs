@@ -1561,7 +1561,7 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(lines[0], lines[1], "the re-ring is the same line");
-        assert!(lines[0].contains("⟦toron⟧") && !lines[0].contains("secret brief body"));
+        assert!(lines[0].contains("[wake]") && !lines[0].contains("secret brief body"));
         assert!(
             !lines[0].contains("Fix the doorbell"),
             "no payload in the pane"

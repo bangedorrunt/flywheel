@@ -3216,7 +3216,7 @@ mod tests {
         match &fx[0] {
             Effect::Prompt { pin, line, .. } => {
                 assert_eq!(pin, "PinA");
-                assert!(line.contains("[doorbell]"));
+                assert!(line.contains("[wake]"));
             }
             other => panic!("expected Prompt, got {other:?}"),
         }
@@ -3250,7 +3250,7 @@ mod tests {
         assert!(
             fx.iter().any(|e| matches!(
                 e,
-                Effect::Prompt { event_id: _, pin, line } if pin == "PinA" && line == "[doorbell] bead bd-new ready"
+                Effect::Prompt { event_id: _, pin, line } if pin == "PinA" && line == "[wake] bead bd-new ready"
             )),
             "ready-bead event must wake the idle captain: {fx:?}"
         );

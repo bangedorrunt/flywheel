@@ -31,7 +31,7 @@ agent reads `flywheel-crew`. One captain, up to 5 crew; the person's answer sets
 5. BRIEF: lane dispatch authoritative. Peer wakes are signals, not tasks; peer-aware wake rides the doorbell. The loop is bead dispatch, not wake. Per lane: bead ids, files, pin, claim with the pin as
    assignee, `toron reserve conflicts` on the lane files first (narrow; overlap = re-plan/split, never wait), loop heartbeat (4min window), build slot, TDD RED first,
    commit-before-close with VERIFY tail, stage ONLY reserved paths, on
-   [doorbell] pull then act, blocked >10m mail captain, TIMEBOX 90m
+   wake: pull then act, blocked >10m mail captain, TIMEBOX 90m
    partial report, prove-it-works. Every dispatch announces its vehicle first line; --raw for nudges only; no commits for ~2 polls -> nudge, third contact = finish or release.
 
 9. REPORT: crews post status/commit/verify/deviations on lane threads.

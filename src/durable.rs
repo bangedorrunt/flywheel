@@ -4514,14 +4514,15 @@ pub fn citable_wake_id(id: Option<&str>) -> bool {
 /// (toron `job list` / `channel read` / `watch`) — a vague "check your
 /// channels" prompt gets acknowledged in-chat and never produces the actual
 /// job claim (bd-pin-public-plane-s-easy.5).
-fn plane_s_wake_prompt(d: &MailDigest) -> String {
+pub(crate) fn plane_s_wake_prompt(d: &MailDigest) -> String {
     let identity = d.mail_identity.as_deref().unwrap_or(d.agent.as_str());
     format!(
-        "PLANE-S WAKE: {} open job(s)/mention(s) on the crew room — a peer posted work for you. \
+        "{} New work on the team room: {} open job(s)/mention(s) — a teammate posted work for you. \
          Claim with `toron job list --project <project> --state open --as {identity}` then \
          `toron job claim <job-id> --project <project> --as {identity}`; read the room with \
          `toron channel read <channel> --project <project> --as {identity}`. Watch for new work: \
-         `toron watch --once --kinds 9,7,43001,20001 --project <project> --as {identity}`.",
+         `toron watch --once --project <project> --as {identity}`.",
+        doorbell_core::agent_text::WAKE_PREFIX,
         d.plane_s,
     )
 }
@@ -11388,7 +11389,7 @@ mod tests {
         match &actions[0] {
             LoopAction::Send { text, .. } => {
                 assert!(
-                    text.contains("PLANE-S WAKE: 2 open job(s)"),
+                    text.contains("[wake] New work on the team room: 2 open job(s)"),
                     "wake prompt must say plane-S: {text}"
                 );
                 assert!(

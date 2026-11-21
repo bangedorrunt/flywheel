@@ -26,7 +26,7 @@ them as implementation work.
    workspace. If the dispatcher is stale, use the documented recovery path.
    A second `/peer-aware-mode` attaches; it never forks a dispatcher.
 
-3. HANDLER: on `[doorbell]`, follow the SoT handler body appended below
+3. HANDLER: on a wake, follow the SoT handler body appended below
    (priority ladder, AUTHORITATIVE open-mode carve-out, pull-then-act).
 
 4. BUDGET: `--budget I/B/P` maps to poll_interval / poll_budget /

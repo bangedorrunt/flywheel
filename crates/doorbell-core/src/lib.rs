@@ -8,6 +8,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+/// The ONE owner of agent-facing wake text (bd-ofa1s).
+pub mod agent_text;
 /// Fenced wake kernel (bd-0nem): Model/Msg/Effect/tick live here.
 pub mod wake_core;
 /// Compat re-exports: decision vocabulary moved into `wake_core` (single
@@ -261,7 +263,7 @@ pub fn fact_captain_pin(roles: &BTreeMap<String, String>) -> Option<String> {
 }
 
 pub fn fact_prompt_line(summary: &str) -> String {
-    format!("[doorbell] {summary}")
+    format!("{} {summary}", agent_text::WAKE_PREFIX)
 }
 
 pub fn watch_pubkey(line: &str) -> Option<String> {
@@ -578,18 +580,18 @@ pub fn parse_rfc3339_micros(ts: &str) -> Result<i64, chrono::ParseError> {
     chrono::DateTime::parse_from_rfc3339(ts).map(|dt| dt.timestamp_micros())
 }
 
-/// One `[doorbell]` line. Body stays pull.
+/// One agent-facing wake line (bd-ofa1s). All text comes from `agent_text`.
 pub fn doorbell_line(class: EventClass, hint: &str) -> String {
-    let kind = match class {
-        EventClass::Channel => "kind 9",
-        EventClass::Job => "kind 43001",
-        EventClass::RequestRelease => "request-release",
-        EventClass::ReservationConflict => "kind 30031",
-        EventClass::PlanePUrgent => "plane-P urgent",
-        EventClass::PlanePMail => "plane-P mail",
-        EventClass::P2p => return p2p_line_from_hint(hint),
-    };
-    format!("[doorbell] {kind}. Pull: {hint}")
+    if class == EventClass::P2p {
+        return p2p_line_from_hint(hint);
+    }
+    agent_text::render(
+        class,
+        &agent_text::WakeCtx {
+            command: hint,
+            ..Default::default()
+        },
+    )
 }
 
 /// The hint that marks a system notice: a `PlanePMail` line carrying it is
@@ -620,7 +622,7 @@ pub enum WakeKind {
     /// Act at idle: a mail wake. Outranks a peer line, so a captain brief is
     /// never buried under peer chatter.
     AtIdle,
-    /// Act now (plane-P urgent, request-release).
+    /// Act now (urgent mail, release request).
     ActNow,
 }
 
@@ -639,19 +641,10 @@ impl WakeKind {
 
 /// Classify a composed or raw ring line.
 pub fn wake_kind_of_line(line: &str) -> WakeKind {
-    if line.starts_with("⟦p2p") {
-        return WakeKind::Peer;
-    }
-    if line.contains("plane-P urgent") || line.contains("request-release") {
-        return WakeKind::ActNow;
-    }
     if line.contains(SYSTEM_NOTICE_HINT) {
         return WakeKind::Notice;
     }
-    if line.contains("plane-P mail") || line.contains("kind 43001") || line.contains("kind 9") {
-        return WakeKind::AtIdle;
-    }
-    WakeKind::Digest
+    agent_text::classify(line)
 }
 
 /// The identity a row's wake carries into the queue.
@@ -700,7 +693,7 @@ pub fn composed_ring(queue: &[QueuedWake]) -> String {
     by_kind.sort_by_key(|w| std::cmp::Reverse(w.kind));
     let head = by_kind[0]
         .line
-        .split(" — run: ")
+        .split(". Read it with:")
         .next()
         .unwrap_or(&by_kind[0].line)
         .trim_end()
@@ -710,10 +703,11 @@ pub fn composed_ring(queue: &[QueuedWake]) -> String {
         .skip(1)
         .map(|w| format!("{} {}", w.count, w.kind.label()))
         .collect();
+    let pull = "Read it with: toron next --project <project> --as <pin>".to_string();
     if rest.is_empty() {
-        return format!("{head} — run: toron next");
+        return format!("{head}. {pull}");
     }
-    format!("{head} + {} — run: toron next", rest.join(" + "))
+    format!("{head} + {}. {pull}", rest.join(" + "))
 }
 
 /// The separator `parse_inbox_item` uses to carry a peer directive's verb,
@@ -725,34 +719,34 @@ pub const P2P_HINT_SEP: char = '\u{1f}';
 pub fn p2p_line_from_hint(hint: &str) -> String {
     let mut parts = hint.split(P2P_HINT_SEP);
     match (parts.next(), parts.next(), parts.next()) {
-        (Some(verb), Some(sender), Some(path)) => {
-            format!("⟦p2p:{verb}⟧ from {sender} for {path} — run: toron next")
-        }
-        _ => "⟦p2p⟧ peer directive — run: toron next".to_string(),
+        (Some(verb), Some(sender), Some(path)) => agent_text::render(
+            EventClass::P2p,
+            &agent_text::WakeCtx {
+                sender,
+                path,
+                command: verb,
+                ..Default::default()
+            },
+        ),
+        _ => agent_text::render(EventClass::P2p, &agent_text::WakeCtx::default()),
     }
 }
 
 /// A peer directive wake line. The fold keeps these (they are a direct
 /// directive, not channel chatter).
 pub fn is_p2p_wake(line: &str) -> bool {
-    line.starts_with("⟦p2p:")
+    line.contains("Direct message from")
 }
 
 /// Trust-aware line that carries the triggering event id for proof (gap 17).
 pub fn doorbell_line_with_event(class: EventClass, hint: &str, event_id: &str) -> String {
-    if event_id.is_empty() {
-        doorbell_line(class, hint)
+    let base = doorbell_line(class, hint);
+    if event_id.is_empty() || class == EventClass::P2p {
+        base
     } else {
-        let kind = match class {
-            EventClass::Channel => "kind 9",
-            EventClass::Job => "kind 43001",
-            EventClass::RequestRelease => "request-release",
-            EventClass::ReservationConflict => "kind 30031",
-            EventClass::PlanePUrgent => "plane-P urgent",
-            EventClass::PlanePMail => "plane-P mail",
-            EventClass::P2p => return p2p_line_from_hint(hint),
-        };
-        format!("[doorbell] {kind} event={event_id}. Pull: {hint}")
+        // event= is machine identity carried in prose; bd-tdpix moves this to
+        // typed Prompt data. Until then the suffix stays for dedupe.
+        format!("{base} event={event_id}")
     }
 }
 
@@ -836,19 +830,16 @@ pub enum Queued {
     Superseded,
 }
 
-/// The identity of a ring line when no message id is available: the line with
-/// its transport decorations stripped, so the inbox producer
-/// (`⟦p2p:request-release⟧ from A for b — run: toron next`) and the CLI
-/// producer (`⟦p2p:request-release⟧ from A for b (wm 382) — run: toron next`)
-/// resolve to the same wake.
+/// The identity of a ring line when no message id is available: the plain
+/// text up to the command. Machine identity is typed data (bd-tdpix), never
+/// parsed out of this prose.
 #[must_use]
 pub fn wake_key(line: &str) -> String {
-    let core = line.split(" — run: ").next().unwrap_or(line).trim_end();
-    let core = match core.rfind(" (wm ") {
-        Some(at) if core.ends_with(')') => &core[..at],
-        _ => core,
-    };
-    core.trim_end().to_string()
+    line.split(". Read it with:")
+        .next()
+        .unwrap_or(line)
+        .trim_end()
+        .to_string()
 }
 
 /// Fold one line into the queue: same class merges (newest line wins, count
@@ -1110,7 +1101,7 @@ pub fn take_allowed_like(
 /// These always reach a pane — a done mail that never rings is a lost
 /// hand-off (bd-346jl); the afk batch only applies to routine channel traffic.
 pub fn is_mail_wake(line: &str) -> bool {
-    line.contains("plane-P mail") || line.starts_with("Doorbell: mail from")
+    line.contains("New mail") || line.starts_with("Doorbell: mail from")
 }
 
 /// May this line PREEMPT a pane that is already occupied? Only an explicit
@@ -1122,17 +1113,17 @@ pub fn is_mail_wake(line: &str) -> bool {
 /// deferred copy rang the same message a second time at the drain
 /// (bd-0uzrq.13, the peer Prompts at 05:29:41, 09:24:43 and 10:58:15Z).
 pub fn is_act_now_line(line: &str) -> bool {
-    line.contains("plane-P urgent") || line.contains("URGENT steer")
+    line.contains("Urgent mail") || line.contains("URGENT steer")
 }
 
 /// Does this line carry urgency worth classifying as such (wake class, digest
 /// escalation)? Broader than [`is_act_now_line`] on purpose: a peer request is
 /// urgent enough to name, never urgent enough to interrupt.
 pub fn is_urgent_line(line: &str) -> bool {
-    line.contains("plane-P urgent")
-        || line.contains("URGENT steer")
-        || line.contains("request-release")
-        || line.contains("kind 30031")
+    matches!(
+        agent_text::classify(line),
+        WakeKind::ActNow | WakeKind::Peer
+    ) || line.contains("URGENT steer")
         || line.contains("ack-sla-expired")
         || line.contains("unacked for")
         || line.starts_with("[reclassify]")
@@ -1596,13 +1587,13 @@ mod tests {
         assert_eq!(fact_captain_pin(&roles).as_deref(), Some("PinW"));
         roles.insert("captain".into(), "PinC".into());
         assert_eq!(fact_captain_pin(&roles).as_deref(), Some("PinC"));
-        assert_eq!(fact_prompt_line("deploy"), "[doorbell] deploy");
+        assert_eq!(fact_prompt_line("deploy"), "[wake] deploy");
         assert!(
             is_urgent_line("[reclassify] vehicle: none (topology=open) — miss"),
             "GS-048 reclassify announce must deliver"
         );
         assert!(!is_urgent_line(
-            "[doorbell] kind 9. Pull: toron channel read"
+            "[wake] New message in the team room. Read it with: toron channel read"
         ));
     }
 
@@ -1682,7 +1673,7 @@ mod tests {
         match &actions[0] {
             DoorbellAction::Prompt { pin, line } => {
                 assert_eq!(pin, "BlueRidge");
-                assert!(line.contains("[doorbell]"));
+                assert!(line.contains("[wake]"));
             }
             other => panic!("expected Prompt, got {other:?}"),
         }
@@ -1996,7 +1987,7 @@ mod tests {
             DoorbellAction::Prompt { pin, line } => {
                 assert_eq!(pin, "BlueRidge");
                 assert_eq!(
-                    line, "wake B — run: toron next",
+                    line, "wake B. Read it with: toron next --project <project> --as <pin>",
                     "one composed ring, and the NEWEST line of the class wins: a \
                      correction replaces the brief it corrects (bd-0uzrq.1)"
                 );
@@ -2080,7 +2071,7 @@ mod tests {
             })
             .expect("the handoff rings once");
         assert!(
-            ring.starts_with("[doorbell] plane-P mail"),
+            ring.starts_with("[wake] New mail"),
             "the captain brief leads, never buried under the peer line: {ring}"
         );
         assert!(
@@ -2132,7 +2123,7 @@ mod tests {
             &next,
             &DoorbellMsg::PromptRefused {
                 pin: "BlueRidge".into(),
-                line: "⟦p2p:request-release⟧ from PurpleGorge for src/elm/inbox.rs (wm 382) — run: toron next".into(),
+                line: "[wake] Direct message from PurpleGorge: asks you to release src/elm/inbox.rs. Read it with: toron next".into(),
             },
         );
         assert!(
@@ -2210,7 +2201,7 @@ mod tests {
             .collect();
         assert_eq!(rings.len(), 1, "exactly one ring at the drain: {drained:?}");
         assert!(
-            rings[0].contains("request-release"),
+            rings[0].contains("asks you to release"),
             "the ring names the peer request: {}",
             rings[0]
         );
@@ -2254,7 +2245,7 @@ mod tests {
             },
         );
         assert!(
-            matches!(&actions[0], DoorbellAction::Prompt { line, .. } if line.contains("plane-P urgent")),
+            matches!(&actions[0], DoorbellAction::Prompt { line, .. } if line.contains("Urgent mail")),
             "act-now preempts the working pane: {actions:?}"
         );
         assert!(
@@ -2447,7 +2438,7 @@ mod tests {
             &next,
             &DoorbellMsg::PromptRefused {
                 pin: "BlueRidge".into(),
-                line: "[doorbell] plane-P mail. Pull: toron next".into(),
+                line: "[wake] New mail. Read it with: toron next".into(),
             },
         );
         assert!(
@@ -2464,10 +2455,15 @@ mod tests {
     /// differ only by it are one message, and two genuinely different ones are
     /// two.
     #[test]
-    fn the_wake_key_ignores_the_watermark_but_not_the_body() {
-        let a = "⟦p2p:request-release⟧ from A for src/x.rs — run: toron next";
-        let b = "⟦p2p:request-release⟧ from A for src/x.rs (wm 382) — run: toron next";
-        let c = "⟦p2p:request-release⟧ from A for src/y.rs — run: toron next";
+    fn the_wake_key_tracks_the_body_not_machine_identity() {
+        // bd-ofa1s/bd-tdpix: machine ids never appear in wake prose, so two
+        // renderings of one directive share a key and a different path does not.
+        let a =
+            "[wake] Direct message from A: asks you to release src/x.rs. Read it with: toron next";
+        let b =
+            "[wake] Direct message from A: asks you to release src/x.rs. Read it with: toron next";
+        let c =
+            "[wake] Direct message from A: asks you to release src/y.rs. Read it with: toron next";
         assert_eq!(wake_key(a), wake_key(b));
         assert_ne!(wake_key(a), wake_key(c));
     }
@@ -2583,7 +2579,7 @@ mod tests {
             })
             .expect("rings");
         assert!(
-            ring.starts_with("[doorbell] plane-P mail"),
+            ring.starts_with("[wake] New mail"),
             "the captain brief leads even though the peer queued first: {ring}"
         );
         assert!(ring.contains("1 peer request"), "{ring}");
@@ -2638,7 +2634,7 @@ mod tests {
     #[test]
     fn working_urgent_steer_rings_now() {
         assert!(
-            is_urgent_line("⟦toron⟧ URGENT steer (wm 7) — run: toron next"),
+            is_urgent_line("[wake] Urgent mail. Read it with: toron next"),
             "inbox wake text must read urgent"
         );
         let mut model = model_with("BlueRidge");
@@ -2648,9 +2644,9 @@ mod tests {
             &mut model,
             &mut actions,
             "BlueRidge",
-            wake_key("⟦toron⟧ URGENT steer (wm 7) — run: toron next"),
+            wake_key("[wake] Urgent mail. Read it with: toron next"),
             None,
-            "⟦toron⟧ URGENT steer (wm 7) — run: toron next".to_string(),
+            "[wake] Urgent mail. Read it with: toron next".to_string(),
         );
         assert!(
             matches!(&actions[..], [DoorbellAction::Prompt { pin, .. }] if pin == "BlueRidge"),
@@ -2675,12 +2671,12 @@ mod tests {
             &mut actions,
             "BlueRidge",
             wake_key(
-                "[doorbell] kind 9. Pull: toron channel read"
+                "[wake] New message in the team room. Read it with: toron channel read"
                     .to_string()
                     .as_str(),
             ),
             None,
-            "[doorbell] kind 9. Pull: toron channel read".to_string(),
+            "[wake] New message in the team room. Read it with: toron channel read".to_string(),
         );
         assert!(
             actions
@@ -2700,9 +2696,9 @@ mod tests {
             &mut model,
             &mut urgent,
             "BlueRidge",
-            wake_key("⟦toron⟧ URGENT steer (wm 7) — run: toron next"),
+            wake_key("[wake] Urgent mail. Read it with: toron next"),
             None,
-            "⟦toron⟧ URGENT steer (wm 7) — run: toron next".to_string(),
+            "[wake] Urgent mail. Read it with: toron next".to_string(),
         );
         assert!(
             matches!(&urgent[..], [DoorbellAction::Prompt { .. }]),
@@ -2714,12 +2710,12 @@ mod tests {
             &mut routine,
             "BlueRidge",
             wake_key(
-                "[doorbell] kind 9. Pull: toron channel read"
+                "[wake] New message in the team room. Read it with: toron channel read"
                     .to_string()
                     .as_str(),
             ),
             None,
-            "[doorbell] kind 9. Pull: toron channel read".to_string(),
+            "[wake] New message in the team room. Read it with: toron channel read".to_string(),
         );
         assert!(
             matches!(&routine[..], [DoorbellAction::Digest { .. }]),
@@ -2738,7 +2734,7 @@ mod tests {
         match &actions[0] {
             DoorbellAction::Digest { pin, line, why } => {
                 assert_eq!(pin, "QuietHeron");
-                assert!(line.contains("[doorbell]"), "the wake line itself: {line}");
+                assert!(line.contains("[wake]"), "the wake line itself: {line}");
                 assert_eq!(why, "no_route", "the skip must name its reason");
             }
             other => panic!("expected Digest, got {other:?}"),
@@ -3034,7 +3030,7 @@ mod tests {
         assert_eq!(class, super::EventClass::P2p);
         assert_eq!(
             super::doorbell_line(class, &hint),
-            "⟦p2p:request-release⟧ from CyanCove for src/workflow_lowering.rs — run: toron next"
+            "[wake] Direct message from CyanCove: asks you to release src/workflow_lowering.rs. Read it with: toron next"
         );
         assert!(super::is_p2p_wake(&super::doorbell_line(class, &hint)));
         assert!(
@@ -3055,7 +3051,7 @@ mod tests {
         assert_eq!(class, super::EventClass::P2p);
         assert_eq!(
             super::doorbell_line(class, &hint),
-            "⟦p2p:release-response⟧ from CyanCove for src/peer.rs — run: toron next"
+            "[wake] Direct message from CyanCove: has answered your release request for src/peer.rs. Read it with: toron next"
         );
         assert!(
             super::parse_inbox_item(&serde_json::json!({

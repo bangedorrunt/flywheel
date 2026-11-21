@@ -912,7 +912,7 @@ mod tests {
             "capable hook types no Interrupt: {fake:?}"
         );
         assert!(
-            fake.iter().any(|w| w.contains("URGENT steer")),
+            fake.iter().any(|w| w.contains("Urgent mail")),
             "the ring stays: {fake:?}"
         );
         assert_eq!(

@@ -25,8 +25,8 @@ mutation "W1  routine mail is dropped at parse again" \
 mutation "W2  the composed ring names only its head" \
     file=$CORE \
     expect=a_peer_wake_never_hides_a_captain_brief \
-    find='    format!("{head} + {} — run: toron next", rest.join(" + "))' \
-    replace='    format!("{head} — run: toron next")'
+    find='    format!("{head} + {}. {pull}", rest.join(" + "))' \
+    replace='    format!("{head}. {pull}")'
 
 mutation "W3  a peer line outranks the captain brief" \
     file=$CORE \
@@ -46,11 +46,11 @@ mutation "W8  an identified brief folds onto another brief's text" \
     find='            !w.key.is_empty() && w.key == key' \
     replace='            w.core == core'
 
-mutation "W7  the watermark makes two renderings of one message distinct" \
+mutation "W7  the command text makes two renderings of one message distinct" \
     file=$CORE \
-    expect=the_wake_key_ignores_the_watermark_but_not_the_body \
-    find='    let core = match core.rfind(" (wm ") {' \
-    replace='    let core = match None::<usize> {'
+    expect=the_wake_key_tracks_the_body_not_machine_identity \
+    find='        .split(". Read it with:")' \
+    replace='        .split("NEVER_MATCHES")'
 
 mutation "W12  the corr fallback is dropped, so a bead correction rings beside its brief" \
     file=$CORE \

@@ -9640,8 +9640,8 @@ mod peer_encoding_tests {
             "peer-aware template must teach since_ts high-water"
         );
         assert!(
-            tpl.contains("[doorbell]"),
-            "ADR-0005: handler wakes on [doorbell], not a poll timer"
+            tpl.contains("[wake]"),
+            "ADR-0005: handler wakes on the [wake] line, not a poll timer"
         );
         assert!(
             !tpl.contains("every {poll_interval_minutes} minutes\n  of idle"),

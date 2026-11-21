@@ -20,7 +20,7 @@ CORE=crates/doorbell-core/src/lib.rs
 mutation "W13  a peer request counts as act-now and preempts the working pane" \
     file=$CORE \
     expect=a_peer_request_waits_for_the_prompt_instead_of_preempting_it \
-    find='    line.contains("plane-P urgent") || line.contains("URGENT steer")
+    find='    line.contains("Urgent mail") || line.contains("URGENT steer")
 }' \
     replace='    is_urgent_line(line)
 }'

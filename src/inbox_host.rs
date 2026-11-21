@@ -1344,7 +1344,7 @@ mod tests {
         );
         assert!(!ports.contains(a) && !ports.contains(b));
         let pw = include_str!("pane_write.rs");
-        assert!(pw.contains("toron_core::wake::wake_line(wm.0)"));
+        assert!(pw.contains("agent_text::render("));
     }
 
     /// Scripted ports: canned observation, recorded rings/notices. No

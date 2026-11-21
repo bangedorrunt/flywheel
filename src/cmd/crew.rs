@@ -1236,7 +1236,7 @@ fn done_reply_via_mail(
         None,
     )?;
     Ok(format!(
-        "captain mailed (plane-P fallback: no pane route to {captain}; {sent})"
+        "reply sent by mail: no live pane route to {captain} ({sent})"
     ))
 }
 
@@ -1470,7 +1470,7 @@ mod bd_ezlme_tests {
             "BlueLake",
         )
         .expect("the fallback mails the captain");
-        assert!(line.contains("plane-P fallback"), "{line}");
+        assert!(line.contains("reply sent by mail"), "{line}");
         let inbox = mail
             .inbox(&project, "SlateHarbor", false, 10)
             .expect("captain inbox");
@@ -1492,11 +1492,11 @@ mod bd_ezlme_tests {
                     "no agents match --to SlateHarbor (available: shell)"
                 ))
             },
-            || Ok("captain mailed (plane-P fallback)".to_string()),
+            || Ok("reply sent by mail".to_string()),
         )
         .expect("the fallback is not a failure");
         assert!(
-            line.contains("plane-P fallback"),
+            line.contains("reply sent by mail"),
             "the reply says which path delivered it: {line}"
         );
         assert!(deferred.is_none(), "a mailed reply is not a deferred wake");
@@ -1811,7 +1811,7 @@ mod tests {
         .expect("an urgent crew prompt must ring");
         assert_eq!(got, crate::inbox_ports::RingDone::Typed);
         let typed = prompt_wake_line(42, true);
-        assert!(typed.contains("URGENT"), "urgent form: {typed}");
+        assert!(typed.contains("Urgent mail"), "urgent form: {typed}");
         assert_eq!(
             writes(&rec),
             vec![
@@ -1977,7 +1977,7 @@ mod tests {
             crate::doorbell::take_deferred_wakes(&crate::config::state_dir(), &project, &hosted),
             vec![(
                 "BlueRidge".to_string(),
-                "[doorbell] plane-P mail. Pull: toron next".to_string()
+                "[wake] New mail. Read it with: toron next".to_string()
             )],
             "the unconsumed wake is on the dispatcher's queue, not lost"
         );
@@ -2054,7 +2054,7 @@ mod tests {
             crate::doorbell::take_deferred_wakes(&crate::config::state_dir(), &project, &hosted),
             vec![(
                 "BlueRidge".to_string(),
-                "[doorbell] plane-P mail. Pull: toron next".to_string()
+                "[wake] New mail. Read it with: toron next".to_string()
             )],
             "the refused wake is on the dispatcher's queue as a mail wake"
         );
@@ -2084,7 +2084,7 @@ mod tests {
         model.doorbell.index.insert_pin("BlueRidge".into(), None);
         let msg = crate::workspace::Msg::PromptRefused {
             pin: "BlueRidge".into(),
-            line: "⟦toron⟧ URGENT steer (wm 1) — run: toron next".into(),
+            line: "[wake] Urgent mail. Read it with: toron next".into(),
         };
         let (model, cmds) = crate::workspace::tick(&model, &msg);
         assert!(

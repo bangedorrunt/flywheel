@@ -500,7 +500,7 @@ pub use doorbell_core::{is_act_now_line, is_urgent_line};
 /// Unknown/unmarked prompts default CaptainRelevant (digest-visible),
 /// never silently routine.
 pub fn is_routine_wake_line(line: &str) -> bool {
-    line.starts_with("[doorbell] kind 9.")
+    line.contains("team room")
 }
 
 /// Classify one emitted cmd for wake spend.
@@ -620,8 +620,13 @@ pub const fn doorbell_ring_max() -> u32 {
 
 /// D1 shrunk prompt: the payload rides the toron message, hc gets
 /// the doorbell only.
-pub fn doorbell_mail_line(unacked: usize, pin: &str, corr: &str) -> String {
-    format!("[doorbell] inbox: {unacked} unacked for {pin}; latest corr={corr}; read + ack")
+pub fn doorbell_mail_line(unacked: usize, pin: &str, _corr: &str) -> String {
+    // bd-ofa1s: name who it is for and the exact command; the correlation id
+    // stays typed data, never buried in prose (bd-tdpix).
+    format!(
+        "{} Urgent mail: {unacked} unacked message(s) for {pin} in project flywheel. Read and reply with: toron next --project flywheel --as {pin}",
+        doorbell_core::agent_text::WAKE_PREFIX
+    )
 }
 
 /// ADR-0010 D1 (bd-w98c residual): pure ladder-registration predicate over
@@ -4317,7 +4322,7 @@ mod presence_model_tests {
             &m,
             vec![Cmd::Prompt {
                 pin: "B".into(),
-                line: "[doorbell] plane-P mail. Pull: toron next".into(),
+                line: "[wake] New mail. Read it with: toron next".into(),
             }],
         );
         assert!(
@@ -4345,7 +4350,7 @@ mod presence_model_tests {
         assert!(
             drained
                 .iter()
-                .any(|c| matches!(c, Cmd::Prompt { line, .. } if line.contains("plane-P mail"))),
+                .any(|c| matches!(c, Cmd::Prompt { line, .. } if line.contains("New mail"))),
             "the held wake rings at the next prompt: {drained:?}"
         );
         assert!(
@@ -4362,9 +4367,10 @@ mod presence_model_tests {
         let mut m = empty_model();
         m.presence.insert("I".into(), Presence::from_str("idle"));
         m.presence.insert("B".into(), Presence::from_str("working"));
-        let urgent = "[doorbell] plane-P urgent. Pull: toron next";
+        let urgent = "[wake] Urgent mail. Read it with: toron next";
         let peer = "[doorbell] request-release. Pull: toron next";
-        let routine = "[doorbell] kind 9. Pull: toron channel read h=ch-1";
+        let routine =
+            "[wake] New message in the team room. Read it with: toron channel read h=ch-1";
         let cmds = vec![
             Cmd::Prompt {
                 pin: "I".into(),
@@ -5235,7 +5241,7 @@ mod adr0010_d1_tests {
     fn adr0010_d1_line_shape_is_shrunk_doorbell() {
         assert_eq!(
             doorbell_mail_line(3, "EmeraldSparrow", "c-9"),
-            "[doorbell] inbox: 3 unacked for EmeraldSparrow; latest corr=c-9; read + ack"
+            "[wake] Urgent mail: 3 unacked message(s) for EmeraldSparrow in project flywheel. Read and reply with: toron next --project flywheel --as EmeraldSparrow"
         );
     }
 
@@ -5338,7 +5344,7 @@ mod adr0010_d1_tests {
         assert!(
             cmds.iter().any(|c| matches!(c, Cmd::Prompt { pin, line }
                 if pin == "P"
-                    && line == "[doorbell] inbox: 1 unacked for P; latest corr=c-1; read + ack")),
+                    && line == "[wake] Urgent mail: 1 unacked message(s) for P in project flywheel. Read and reply with: toron next --project flywheel --as P")),
             "re-ring must prompt the shrunk doorbell line, not the payload: {cmds:?}"
         );
         assert_eq!(next.wake.ladders["c-1"].attempts, 1);
@@ -5502,7 +5508,7 @@ mod adr0010_d1_tests {
         );
         assert!(
             cmds.iter().any(|c| matches!(c, Cmd::Prompt { pin, line }
-                if pin == "WirePin" && line.contains("c-wire") && line.contains("unacked for"))),
+                if pin == "WirePin" && line.contains("unacked message(s) for WirePin"))),
             "wire-registered corr re-rings through the shrunk doorbell line: {cmds:?}"
         );
         assert_eq!(next.wake.ladders["c-wire"].attempts, 1);
@@ -5861,7 +5867,7 @@ mod adr0010_d5_tests {
         assert_eq!(
             classify_cmd(&Cmd::Prompt {
                 pin: "P".into(),
-                line: "[doorbell] plane-P urgent. Pull: inbox".into(),
+                line: "[wake] Urgent mail. Read it with: inbox".into(),
             }),
             WakeClass::Urgent,
             "urgent lines ring now"
@@ -5869,7 +5875,7 @@ mod adr0010_d5_tests {
         assert_eq!(
             classify_cmd(&Cmd::Prompt {
                 pin: "P".into(),
-                line: "[doorbell] kind 9. Pull: ch".into(),
+                line: "[wake] New message in the team room. Read it with: ch".into(),
             }),
             WakeClass::Routine,
             "bd-l72k: addressed kind-9 chatter is routine (zero prompts, counters only)"
@@ -5962,7 +5968,7 @@ mod adr0010_d5_tests {
             m.wake.digests
         );
         assert!(
-            m.wake.digests[0].detail.contains("43001"),
+            m.wake.digests[0].detail.contains("job"),
             "digest entry is the job wake, got {}",
             m.wake.digests[0].detail
         );

@@ -2740,7 +2740,7 @@ mod tests {
         assert_eq!(drained.len(), 2);
         assert!(q.is_empty());
         assert!(
-            drained[0].1.contains("[doorbell]"),
+            drained[0].1.contains("[wake]"),
             "line is a doorbell, got {}",
             drained[0].1
         );
@@ -2800,7 +2800,7 @@ mod tests {
         let out = fanout_now(&rings, &status);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, "LilacChapel");
-        assert!(out[0].1.contains("[doorbell]"));
+        assert!(out[0].1.contains("[wake]"));
     }
 
     /// The handoff is keyed by PROJECT (the CLI knows no dispatcher session),
@@ -3702,7 +3702,7 @@ mod tests {
             "npub p-tag must resolve to pin, got {prompts:?}"
         );
         assert_eq!(prompts[0].0, "BlueRidge");
-        assert!(prompts[0].1.contains("[doorbell]"));
+        assert!(prompts[0].1.contains("[wake]"));
     }
 
     #[test]
@@ -3793,7 +3793,7 @@ mod tests {
             })
             .collect();
         assert_eq!(prompts.len(), 1);
-        assert!(prompts[0].1.contains("[doorbell]"));
+        assert!(prompts[0].1.contains("[wake]"));
         assert!(prompts[0].1.contains("toron next"));
         let raw = r#"{"messages":[{"importance":"urgent","created_ts":"2026-08-20T00:00:02Z"}]}"#;
         assert_eq!(
@@ -4211,8 +4211,11 @@ mod tests {
             &doorbell_line(EventClass::RequestRelease, "toron next"),
             &record,
         );
-        assert!(line.starts_with("[doorbell] request-release."), "{line}");
-        assert!(line.contains("Pull: toron next"), "{line}");
+        assert!(
+            line.starts_with("[wake] A teammate asks you to release"),
+            "{line}"
+        );
+        assert!(line.contains("Read it with: toron next"), "{line}");
         assert!(line.contains("watcher up=1700"), "{line}");
         assert!(line.contains("bin_mtime=1600"), "{line}");
     }

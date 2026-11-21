@@ -18,8 +18,6 @@
 //! `only_the_sink_types_into_panes` (below) fences the source tree: a new
 //! `agent_prompt` / `pane_send_text` call outside this file fails the build.
 
-/// The marker every wake line starts with (redesign §4.1).
-pub const WAKE_MARK: &str = "⟦toron⟧";
 /// How long a typed wake may take to become a turn before it is a typed
 /// failure (bd-0uzrq.16). A turn that starts does so in well under a second
 /// live; the bound only has to outlast a slow paste, never a whole turn.
@@ -84,16 +82,27 @@ pub enum PaneOp {
 }
 
 /// The constant wake line for a watermark (redesign §4.1, §6A.4).
-pub fn wake_line(wm: Wm, urgency: Urgency) -> String {
-    match urgency {
-        Urgency::Normal => toron_core::wake::wake_line(wm.0),
-        Urgency::Urgent => format!("{WAKE_MARK} URGENT steer (wm {:x}) — run: toron next", wm.0),
-    }
+pub fn wake_line(_wm: Wm, urgency: Urgency) -> String {
+    // bd-ofa1s: plain English, no machine ids in prose. The watermark stays
+    // available to the typed `Wm` carrier for dedupe (bd-tdpix).
+    let class = match urgency {
+        Urgency::Normal => doorbell_core::EventClass::PlanePMail,
+        Urgency::Urgent => doorbell_core::EventClass::PlanePUrgent,
+    };
+    doorbell_core::agent_text::render(class, &doorbell_core::agent_text::WakeCtx::default())
 }
 
 /// P2P multiplayer reactive wake dispatch line (bd-p2p-multiplayer-mesh-xf1da).
-pub fn p2p_wake_line(verb: &str, sender: &str, path: &str, wm: u64) -> String {
-    format!("⟦p2p:{verb}⟧ from {sender} for {path} (wm {wm:x}) — run: toron next")
+pub fn p2p_wake_line(verb: &str, sender: &str, path: &str, _wm: u64) -> String {
+    doorbell_core::agent_text::render(
+        doorbell_core::EventClass::P2p,
+        &doorbell_core::agent_text::WakeCtx {
+            command: verb,
+            sender,
+            path,
+            ..Default::default()
+        },
+    )
 }
 
 /// Deliver a P2P wake line through the pane sink, honoring harness wake route.
@@ -414,8 +423,8 @@ mod tests {
         assert_eq!(
             *r.0.borrow(),
             vec![
-                "prompt w1:p1 ⟦toron⟧ new work (wm 7f3a) — run: toron next".to_string(),
-                "prompt w1:p1 ⟦toron⟧ URGENT steer (wm 7) — run: toron next".to_string(),
+                "prompt w1:p1 [wake] New mail. Read it with: toron next".to_string(),
+                "prompt w1:p1 [wake] Urgent mail. Read it with: toron next".to_string(),
                 "keys w1:p1 [\"Escape\"]".to_string(),
                 "close w1:p1".to_string(),
                 format!("prompt w1:p1 {}", launch_bootstrap(Harness::Pi)),
@@ -424,7 +433,10 @@ mod tests {
         );
         for w in &all {
             if let PaneOp::Prompt(line) = render(w) {
-                assert!(line.starts_with(WAKE_MARK) || line == launch_bootstrap(Harness::Other));
+                assert!(
+                    line.starts_with(doorbell_core::agent_text::WAKE_PREFIX)
+                        || line == launch_bootstrap(Harness::Other)
+                );
             }
         }
     }
@@ -444,10 +456,13 @@ mod tests {
     }
 
     #[test]
-    fn the_same_watermark_rings_the_same_line() {
+    fn the_watermark_is_typed_data_not_wake_prose() {
+        // bd-ofa1s/bd-tdpix: machine identity never changes the agent-facing
+        // text; the typed Wm carrier holds it for dedupe.
         let a = wake_line(Wm(41), Urgency::Normal);
         assert_eq!(a, wake_line(Wm(41), Urgency::Normal));
-        assert_ne!(a, wake_line(Wm(42), Urgency::Normal));
+        assert_eq!(a, wake_line(Wm(42), Urgency::Normal));
+        assert!(!a.contains("41") && !a.contains("42"));
     }
 
     fn walk(root: &std::path::Path, rel: &str, out: &mut Vec<(String, String)>) {
@@ -641,10 +656,74 @@ mod tests {
         assert_eq!(
             *backend.0.lock().unwrap(),
             vec![
-                "prompt block:fake-1 ⟦toron⟧ new work (wm 7f3a) — run: toron next".to_string(),
+                "prompt block:fake-1 [wake] New mail. Read it with: toron next".to_string(),
                 "keys block:fake-1 Escape".to_string(),
                 "close block:fake-1".to_string(),
             ]
         );
+    }
+
+    /// bd-ofa1s build fence: no agent-facing string may contain stack jargon.
+    /// Every producer is exercised, plus the two role/task source files.
+    #[test]
+    fn no_jargon_in_any_agent_facing_string() {
+        use doorbell_core::EventClass;
+        use doorbell_core::agent_text::{JARGON_TOKENS, golden_strings};
+
+        let mut lines = golden_strings();
+        for class in [
+            EventClass::Channel,
+            EventClass::Job,
+            EventClass::RequestRelease,
+            EventClass::ReservationConflict,
+            EventClass::PlanePUrgent,
+            EventClass::PlanePMail,
+        ] {
+            lines.push(doorbell_core::doorbell_line(class, "toron next"));
+        }
+        for urgency in [Urgency::Normal, Urgency::Urgent] {
+            lines.push(wake_line(Wm(0x8), urgency));
+        }
+        lines.push(p2p_wake_line(
+            "request-release",
+            "BoldCliff",
+            "src/peer.rs",
+            0x1a,
+        ));
+        lines.push(crate::workspace::doorbell_mail_line(
+            3,
+            "SlateHarbor",
+            "c-9",
+        ));
+        lines.push(crate::doorbell::deferred_wake_line());
+        lines.push(crate::durable::plane_s_wake_prompt(
+            &crate::durable::MailDigest {
+                plane_s: 2,
+                ..Default::default()
+            },
+        ));
+
+        for line in &lines {
+            for token in JARGON_TOKENS {
+                assert!(!line.contains(token), "jargon {token:?} in wake: {line}");
+            }
+        }
+        // Role behaviors and workflow tasks are source constants; strip
+        // comment lines before scanning so prose docs do not trip the fence.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for rel in ["src/profile.rs", "src/builtin_workflows.rs"] {
+            let src = std::fs::read_to_string(root.join(rel)).expect("source file");
+            let body: String = src
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap_or(&src)
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for token in JARGON_TOKENS {
+                assert!(!body.contains(token), "jargon {token:?} in {rel}");
+            }
+        }
     }
 }

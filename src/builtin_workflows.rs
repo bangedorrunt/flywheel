@@ -61,7 +61,7 @@ pub const BUILTIN_WORKFLOWS_YAML: &[(&str, &str)] = &[
         "phase-resolve",
         r#"
 name: phase-resolve
-description: "Phase built-in (resolve): reduce ambiguity to a goal statement. The resolver posts the statement to the project thread (plane P) and replies with the machine-checkable §4.5 report: target, non_goals, blast_radius, open_questions."
+description: "Phase built-in (resolve): reduce ambiguity to a goal statement. The resolver posts the statement to the project thread (private mail) and replies with the machine-checkable §4.5 report: target, non_goals, blast_radius, open_questions."
 trigger:
   type: webhook
 crew: auto
@@ -74,7 +74,7 @@ steps:
     spec:
       profile: "@scout"
       phase: resolve
-      task: 'Resolve the objective into a goal statement. 1) Post the statement to the project thread (toron mail, plane P) with subject [resolve]. 2) Reply with ONLY a JSON object: {"target": "<one sentence>", "non_goals": ["..."], "blast_radius": "<files/areas>", "open_questions": []} — every field present; open_questions may be an empty array. Objective: {{inputs.objective}}'
+      task: 'Resolve the objective into a goal statement. 1) Post the statement to the project thread (private mail) with subject [resolve]. 2) Reply with ONLY a JSON object: {"target": "<one sentence>", "non_goals": ["..."], "blast_radius": "<files/areas>", "open_questions": []} — every field present; open_questions may be an empty array. Objective: {{inputs.objective}}'
     on_error: fail_run
 "#,
     ),

@@ -31,9 +31,9 @@ pub fn may_inject(line: InputLine) -> bool {
     matches!(line, InputLine::Empty | InputLine::Unknown)
 }
 
-/// The doorbell/toron prefixes its own door writes into a pane. A box holding
-/// one of these is a queued wake line, not operator text (bd-8wdgn).
-pub const WAKE_PREFIXES: &[&str] = &["[doorbell]", "[toron]", "⟦toron⟧"];
+/// The ONE neutral marker every agent-facing wake starts with (bd-ofa1s).
+/// A box holding it is a queued wake line, not operator text (bd-8wdgn).
+pub const WAKE_PREFIXES: &[&str] = &[doorbell_core::agent_text::WAKE_PREFIX];
 
 fn is_wake_line(content: &str) -> bool {
     WAKE_PREFIXES.iter().any(|p| content.starts_with(p))

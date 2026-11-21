@@ -59,8 +59,8 @@ fn adr0010_d1_doorbell_line_ctor_present() {
         "D1 (bd-w98c): workspace.rs must define doorbell_mail_line(unacked, pin, corr)"
     );
     assert!(
-        WORKSPACE.contains("unacked for"),
-        "D1 (bd-w98c): doorbell line must render `[doorbell] inbox: <n> unacked for <pin>; latest corr=<c>; read + ack`"
+        WORKSPACE.contains("unacked message(s) for"),
+        "D1 (bd-w98c): doorbell line must render a plain-English unacked-count wake naming the pin"
     );
     let main = main_plus_cmd();
     assert!(
