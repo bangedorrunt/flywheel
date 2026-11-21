@@ -858,6 +858,7 @@ fn red_rows_mail_the_owner_with_log_and_rerun() {
                 ),
             )
             .env("TORON_LOG", &mail_log)
+            .env("AGENT_NAME", "CaptainPin")
             .current_dir(repo)
             .output()
             .expect("run mail_red_owners")
@@ -897,5 +898,30 @@ fn red_rows_mail_the_owner_with_log_and_rerun() {
         std::fs::read_to_string(&mail_log).unwrap_or_default(),
         "",
         "a green proof mails nobody about failures"
+    );
+
+    // bd-1czzw follow-up: the git author ("Test") is not a pin and no bead
+    // assignee resolves, so the mail must go to the captain, never the author.
+    std::fs::write(&br, "#!/bin/sh\nprintf '%s' '{}'\n").unwrap();
+    std::fs::write(
+        &receipt,
+        r#"{"ok":false,"logs":"/logs","mutations":[{"spec":"demo.spec.sh","id":"D1","expect_test":"a_test","verdict":"RED"}]}"#,
+    )
+    .unwrap();
+    std::fs::write(&mail_log, "").unwrap();
+    let out = run();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mailed = std::fs::read_to_string(&mail_log).unwrap_or_default();
+    assert!(
+        mailed.contains("--to CaptainPin"),
+        "captain is the fallback: {mailed}"
+    );
+    assert!(
+        !mailed.contains("--to Test") && !mailed.contains("--to bangedorrunt"),
+        "a git author is never a mailing identity: {mailed}"
     );
 }

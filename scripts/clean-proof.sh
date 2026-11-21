@@ -573,7 +573,7 @@ RECEIPT_CHANGED_PATHS="${RECEIPT_CHANGED_PATHS:-}"
 
 # bd-n21ml: a red proof names the crew that can act on it. Batch one mail per
 # owner (the bead assignee of the last commit touching the spec's target, else
-# its committer) with the log path, cause and exact rerun command. A green
+# the captain) with the log path, cause and exact rerun command. A green
 # receipt mails nobody about failures.
 mail_red_owners() {
   PROOF_RECEIPT="$1" PROOF_REPO="$2" PROOF_PROJECT="$3" PROOF_MAIL_AS="$4" python3 - <<'PY'
@@ -594,21 +594,35 @@ if receipt.get("ok"):
 repo = os.environ.get("PROOF_REPO", ".")
 project = os.environ.get("PROOF_PROJECT", "flywheel")
 sender = os.environ.get("PROOF_MAIL_AS", "Flywheel")
+captain = os.environ.get("AGENT_NAME") or sender
 logs = receipt.get("logs", "")
 
-def owner_for(target):
-    msg = run(["git", "log", "-1", "--format=%B", "--", target])
-    bead = next((t.rstrip(".,;:") for line in msg.splitlines()
+def bead_in(text):
+    return next((t.rstrip(".,;:") for line in text.splitlines()
                  for t in line.replace("(", " ").replace(")", " ").split()
                  if t.startswith("bd-")), "")
-    if bead:
-        try:
-            assignee = json.loads(run(["br", "show", bead, "--json"])).get("assignee")
-            if assignee:
-                return assignee
-        except ValueError:
-            pass
-    return run(["git", "log", "-1", "--format=%an", "--", target]).strip() or "captain"
+
+def pin_for(bead):
+    if not bead:
+        return None
+    try:
+        return json.loads(run(["br", "show", bead, "--json"])).get("assignee") or None
+    except ValueError:
+        return None
+
+def owner_for(target):
+    # bd-1czzw follow-up: a git author is not a mailing identity. Resolve the
+    # bead cited by the last commit touching the target; otherwise the captain.
+    return pin_for(bead_in(run(["git", "log", "-1", "--format=%B", "--", target]))) or captain
+
+def owner_for_step(base):
+    span = f"{base}..HEAD" if base else "-10"
+    msg = run(["git", "log", span, "--format=%B"])
+    for token in (t.rstrip(".,;:") for t in msg.split() if t.startswith("bd-")):
+        pin = pin_for(token)
+        if pin and pin != captain:
+            return pin
+    return captain
 
 rows = []
 for row in receipt.get("mutations", []):
@@ -629,7 +643,7 @@ for row in receipt.get("mutations", []):
 
 failed = receipt.get("failed_step")
 if failed:
-    owner = run(["git", "log", "-1", "--format=%an"]).strip() or "captain"
+    owner = owner_for_step(receipt.get("mutations_base") or receipt.get("sha"))
     log = f"{logs}/{failed}.log" if logs else "(see receipt logs)"
     rows.append((owner, f"clean-proof failed at {failed}\nlog: {log}\nrerun: bash scripts/clean-proof.sh --sha <sha>"))
 
