@@ -16,4 +16,15 @@ fn fence_test_export_witness() {
         status.success(),
         "the fence export witness failed: --test must run in the export, not the tree"
     );
+    // bd-250g4: some crews resolve `bash` to macOS /bin/bash 3.2, which has
+    // no mapfile. The same witness must pass there too.
+    let stock = Command::new("/bin/bash")
+        .arg(format!("{root}/scripts/test-fence.sh"))
+        .current_dir(root)
+        .status()
+        .expect("run scripts/test-fence.sh under /bin/bash");
+    assert!(
+        stock.success(),
+        "the fence witness must also pass under /bin/bash 3.2 (no mapfile)"
+    );
 }

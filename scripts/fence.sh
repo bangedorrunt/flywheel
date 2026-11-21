@@ -167,12 +167,18 @@ run_test_filter() {
 run_changed_modules() {
     [ "$MODULES" -eq 1 ] || return 0
     local files=()
+    # bash 3.2 has no mapfile (ScarletCove hit this on /bin/bash); while-read
+    # keeps the same NUL-safe-enough newline list portable.
     if [ "$INDEX" = 1 ]; then
-        mapfile -t files < <(git -C "$REPO" diff --cached --name-only --diff-filter=ACM -- '*.rs')
+        while IFS= read -r line; do
+            [ -n "$line" ] && files+=("$line")
+        done < <(git -C "$REPO" diff --cached --name-only --diff-filter=ACM -- '*.rs')
     elif [ -n "$PATHS" ]; then
         IFS=',' read -r -a files <<<"$PATHS"
     else
-        mapfile -t files < <(git -C "$REPO" diff --name-only "$SHA" -- '*.rs')
+        while IFS= read -r line; do
+            [ -n "$line" ] && files+=("$line")
+        done < <(git -C "$REPO" diff --name-only "$SHA" -- '*.rs')
     fi
     local f crate args module mods=""
     for f in "${files[@]}"; do
@@ -202,7 +208,10 @@ run_changed_modules() {
                 ;;
             *) continue ;;
         esac
-        mapfile -t mods < <(grep -A1 '#\[cfg(test)\]' "$f" | sed -n 's/^[[:space:]]*mod[[:space:]]\([A-Za-z0-9_]*\)[[:space:]]*{.*/\1/p' | sort -u)
+        mods=()
+        while IFS= read -r line; do
+            [ -n "$line" ] && mods+=("$line")
+        done < <(grep -A1 '#\[cfg(test)\]' "$f" | sed -n 's/^[[:space:]]*mod[[:space:]]\([A-Za-z0-9_]*\)[[:space:]]*{.*/\1/p' | sort -u)
         for m in "${mods[@]}"; do
             step "module ($f :: $m) in export"
             # shellcheck disable=SC2086
