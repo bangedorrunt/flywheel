@@ -111,7 +111,7 @@ run_test_filter() {
     [ -n "$TEST_FILTER" ] || return 0
     step "test ($TEST_FILTER) in export"
     # shellcheck disable=SC2086
-    $CARGO test $TEST_FILTER
+    $CARGO test --tests $TEST_FILTER
 }
 step "needles"
 bash scripts/verify-needles.sh

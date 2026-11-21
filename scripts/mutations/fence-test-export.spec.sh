@@ -9,5 +9,5 @@ TEST_FILTER=(fence_test_export_witness)
 mutation "F1  targeted test runs in the shared tree, not the export" \
     file=scripts/fence.sh \
     expect=fence_test_export_witness \
-    find='    $CARGO test $TEST_FILTER' \
-    replace='    (cd "$REPO" && $CARGO test $TEST_FILTER)'
+    find='    $CARGO test --tests $TEST_FILTER' \
+    replace='    (cd "$REPO" && $CARGO test --tests $TEST_FILTER)'
