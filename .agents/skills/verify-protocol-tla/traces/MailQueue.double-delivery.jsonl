@@ -1,0 +1,5 @@
+{"phase":"idle","queued":false,"delivered":0,"corr":"c-1","attempts":0}
+{"action":"Send","phase":"queued","queued":true,"delivered":0,"corr":"c-1","attempts":0}
+{"action":"Up","phase":"flushing","queued":true,"delivered":0,"corr":"c-1","attempts":1}
+{"action":"Flush","phase":"delivered","queued":false,"delivered":1,"corr":"c-1","attempts":1}
+{"action":"Double","phase":"delivered","queued":false,"delivered":2,"corr":"c-1","attempts":1}

@@ -424,6 +424,15 @@ pub(crate) fn fixture_register(
     block_on(fixture_register_async(mailbox(), project, profile))
 }
 
+/// bd-ys3jp: only a transport outage queues a send. Bad recipients, refusals
+/// and malformed tags must still fail loud at the wrapper boundary.
+fn daemon_outage(e: &anyhow::Error) -> bool {
+    let text = e.to_string();
+    text.contains("daemon unreachable")
+        || text.contains("daemon connect timed out")
+        || text.contains("daemon unresponsive")
+}
+
 #[cfg(test)]
 impl Mail {
     /// Test-fixture registration (see [`fixture_register`]).
@@ -1517,25 +1526,38 @@ impl Mail {
         }
         match &self.backend {
             BackendKind::InProcess => {
-                let result = block_on(mailbox().send_message(&SendMessage {
+                let msg = SendMessage {
                     project_slug: project_key.to_string(),
                     sender_name: self.name.clone(),
-                    to: targets,
+                    to: targets.clone(),
                     subject: subject.to_string(),
                     body_md: body.to_string(),
                     importance: Some(importance.to_string()),
                     ack_required: ack,
                     thread_id: thread_id.map(String::from),
-                    extra_tags,
+                    extra_tags: extra_tags.clone(),
                     ..Default::default()
-                }))?;
-                let mut v = result.to_json();
-                if let Some(w) = wake.filter(|s| !s.is_empty())
-                    && let Some(obj) = v.as_object_mut()
-                {
-                    obj.insert("wake".into(), serde_json::json!(w));
+                };
+                match block_on(mailbox().send_message(&msg)) {
+                    Ok(result) => {
+                        let mut v = result.to_json();
+                        if let Some(w) = wake.filter(|s| !s.is_empty())
+                            && let Some(obj) = v.as_object_mut()
+                        {
+                            obj.insert("wake".into(), serde_json::json!(w));
+                        }
+                        Ok(v)
+                    }
+                    Err(e) if daemon_outage(&e) => self.queue_outage_send(
+                        project_key,
+                        &targets,
+                        subject,
+                        body,
+                        thread_id,
+                        wake,
+                    ),
+                    Err(e) => Err(e),
                 }
-                Ok(v)
             }
             BackendKind::Remote(_) => {
                 let mut args = crate::backend::wire::send_args(
@@ -1551,9 +1573,55 @@ impl Mail {
                 if let Some(w) = wake.filter(|s| !s.is_empty()) {
                     args["wake"] = serde_json::json!(w);
                 }
-                self.call_remote("send_message", args)
+                match self.call_remote("send_message", args) {
+                    Ok(v) => Ok(v),
+                    Err(e) if daemon_outage(&e) => self.queue_outage_send(
+                        project_key,
+                        &targets,
+                        subject,
+                        body,
+                        thread_id,
+                        wake,
+                    ),
+                    Err(e) => Err(e),
+                }
             }
         }
+    }
+
+    /// bd-ys3jp: a wrapper send that cannot reach the daemon is journaled
+    /// locally under a fresh corr; the CLI's next-command flush replays it
+    /// under that corr, so the send is not lost and is not duplicated.
+    fn queue_outage_send(
+        &self,
+        project_key: &str,
+        targets: &[String],
+        subject: &str,
+        body: &str,
+        thread_id: Option<&str>,
+        wake: Option<&str>,
+    ) -> Result<Value> {
+        let corr = toron_core::queued_send::mint_corr();
+        let entry = toron_core::queued_send::QueuedSend {
+            corr: corr.clone(),
+            project: project_key.to_string(),
+            sender: self.name.clone(),
+            to: targets.to_vec(),
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: subject.to_string(),
+            body: body.to_string(),
+            importance: None,
+            thread: thread_id.map(String::from),
+            wake: wake.map(String::from),
+            priority: None,
+            audience: None,
+            result_path: None,
+            verdict: None,
+            created_at_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
+        };
+        toron_core::queued_send::enqueue(&entry)?;
+        Ok(json!({ "delivery": "queued", "corr": corr }))
     }
 
     /// bd-pncn: expand the `all` broadcast token into the project's
@@ -2735,6 +2803,20 @@ fn guard_targets(targets: &[String], mut whois: impl FnMut(&str) -> Option<Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_transport_outages_are_queued() {
+        assert!(daemon_outage(&anyhow::anyhow!(
+            "daemon unreachable at http://127.0.0.1:18080/mcp"
+        )));
+        assert!(daemon_outage(&anyhow::anyhow!(
+            "daemon connect timed out after 10s"
+        )));
+        assert!(!daemon_outage(&anyhow::anyhow!(
+            "no recipients (to/cc/bcc all empty)"
+        )));
+        assert!(!daemon_outage(&anyhow::anyhow!("refusing an empty mail")));
+    }
 
     /// bd-pin-npub-binding-ggym, wiring half: the send door asks whois once per
     /// NAME, never for an explicit npub, and a divergent name refuses the send
