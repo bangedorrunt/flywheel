@@ -573,6 +573,56 @@ mod tests {
         );
     }
 
+    /// bd-cursor-reask-dropped-15ail, through the Elm fold the live path
+    /// uses: a future-dated mail parks and asks once; the stale answer
+    /// rings it instead of parking behind a second ask that no interpreter
+    /// executes. This is the `toron_cursor` filter the bead verify runs.
+    #[test]
+    fn toron_cursor_stale_answer_rings_through_the_fold() {
+        let npub = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let mut index = SelfIndex::default();
+        index.insert_pin("BlueRidge".into(), Some(npub.into()));
+        let watch = format!(
+            r#"{{"kind":9,"id":"wake-skew-elm-1","pubkey":"senderpk","created_at":1800000000,"tags":[["p","{npub}"],["t","flywheel"],["h","thread-1"],["toron-kind","mail-delivered"],["thread","thread-1"],["importance","normal"],["from","SlateHarbor"],["mid","msg-skew-elm-1"]],"content":"mail"}}"#
+        );
+        let model = DoorbellModel {
+            index,
+            statuses: [("BlueRidge".into(), "idle".into())].into(),
+            ..DoorbellModel::default()
+        };
+        let (parked, ask_cmds) =
+            InboxProgram::fold(&model, &DoorbellMsg::WatchNdjson { line: watch });
+        assert_eq!(
+            ask_cmds
+                .iter()
+                .filter(|c| matches!(&c.action, DoorbellAction::ReadToronCursor { .. }))
+                .count(),
+            1,
+            "one ask per burst: {ask_cmds:?}"
+        );
+        let (_, decide_cmds) = InboxProgram::fold(
+            &parked,
+            &DoorbellMsg::ToronCursor {
+                pin: "BlueRidge".into(),
+                cursor_us: Some(1_700_000_000_000_000),
+                read_at_secs: 1_700_000_000,
+            },
+        );
+        assert!(
+            !decide_cmds
+                .iter()
+                .any(|c| matches!(&c.action, DoorbellAction::ReadToronCursor { .. })),
+            "no second ask to drop: {decide_cmds:?}"
+        );
+        assert!(
+            decide_cmds.iter().any(|c| matches!(
+                &c.action,
+                DoorbellAction::Prompt { pin, .. } if pin == "BlueRidge"
+            )),
+            "future-dated mail rings on the stale answer: {decide_cmds:?}"
+        );
+    }
+
     #[test]
     fn the_workspace_slice_and_the_program_fold_the_same_way() {
         let model = DoorbellModel::default();

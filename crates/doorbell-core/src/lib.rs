@@ -930,6 +930,12 @@ pub enum DoorbellMsg {
     /// Periodic tick (60s cadence in the live dispatcher); drives the
     /// Ack-SLA scan effect.
     AckSlaTick { now: u64 },
+    /// Re-fold of a parked mail line after its toron answer landed
+    /// (bd-cursor-reask): identical to WatchNdjson except a stale or
+    /// missing read DECIDES by max(host, toron) instead of parking again —
+    /// the answer in hand is the freshest possible read, so a re-ask could
+    /// never learn more. Never parked, never asked.
+    WatchDecideOnly { line: String },
     /// The toron pull-cursor read re-enters here (pipe pattern): the
     /// interpreter ran `toron inbox cursor` for the pin and answers with
     /// the committed cursor (None when toron could not answer). `read_at`
@@ -1214,7 +1220,10 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
     let mut next = model.clone();
     let mut actions = Vec::new();
     match msg {
-        DoorbellMsg::WatchNdjson { line } => {
+        DoorbellMsg::WatchNdjson { line } | DoorbellMsg::WatchDecideOnly { line } => {
+            // A decide-only re-fold (bd-cursor-reask) decides with the answer
+            // in hand; it never parks and never asks again.
+            let decide_only = matches!(msg, DoorbellMsg::WatchDecideOnly { .. });
             let Some((class, hint)) = parse_watch_ndjson(line, &next.index) else {
                 return (next, actions);
             };
@@ -1295,13 +1304,16 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 // missing or stale read parks the candidate and asks toron
                 // once per burst. A line without event time cannot be
                 // compared, so it rings as today (fail toward delivery).
+                // bd-cursor-reask: a decide-only re-fold never parks — the
+                // answer in hand is the freshest possible read, so it
+                // decides by max(host, toron) even when stale.
                 if mail && let Some(us) = created_us {
                     let created_secs = (us / 1_000_000).max(0) as u64;
                     let fresh = next
                         .toron_cursor
                         .get(&pin)
                         .is_some_and(|t| toron_read_is_fresh(t, created_secs));
-                    if fresh {
+                    if fresh || decide_only {
                         match next.toron_cursor.get(&pin).and_then(|t| t.cursor_us) {
                             Some(tc) if us <= tc => {
                                 actions.push(DoorbellAction::Audit {
@@ -1500,9 +1512,10 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
             read_at_secs,
         } => {
             // bd-yc6jf: record the answer, then re-fold every parked
-            // candidate for this pin through the same watch path — the
-            // parked path and the fresh path share one decision. A stale
-            // answer parks and asks again; it never decides.
+            // candidate for this pin as decide-only — the parked path and
+            // the fresh path share one decision, and a stale answer
+            // decides instead of parking behind a second ask
+            // (bd-cursor-reask).
             next.toron_cursor.insert(
                 pin.clone(),
                 ToronRead {
@@ -1517,7 +1530,7 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 .map(|p| p.line)
                 .collect();
             for line in parked {
-                let (m, a) = tick(&next, &DoorbellMsg::WatchNdjson { line });
+                let (m, a) = tick(&next, &DoorbellMsg::WatchDecideOnly { line });
                 next = m;
                 actions.extend(a);
             }
@@ -1853,7 +1866,9 @@ mod tests {
             a_fail.iter().any(|a| matches!(a, DoorbellAction::Audit { kind, .. } if kind == "toron-cursor-unavailable")),
             "the fallback is audited: {a_fail:?}"
         );
-        // A read answered long before the mail is stale: ask again.
+        // A read answered long before the mail is stale: the answer still
+        // decides (fail-open) instead of parking behind a second ask that
+        // the deliver path would drop — that wedge is bd-cursor-reask.
         let (m2, _) = tick(&model0, &edge());
         let (_, a_stale) = tick(
             &m2,
@@ -1864,16 +1879,71 @@ mod tests {
             },
         );
         assert!(
-            a_stale.iter().any(
-                |a| matches!(a, DoorbellAction::ReadToronCursor { pin } if pin == "BlueRidge")
-            ),
-            "a stale read re-asks instead of deciding: {a_stale:?}"
-        );
-        assert!(
             !a_stale
                 .iter()
+                .any(|a| matches!(a, DoorbellAction::ReadToronCursor { .. })),
+            "a stale answer decides; it never re-asks: {a_stale:?}"
+        );
+        assert!(
+            a_stale
+                .iter()
                 .any(|a| matches!(a, DoorbellAction::Prompt { pin, .. } if pin == "BlueRidge")),
-            "nothing rings before the fresh answer: {a_stale:?}"
+            "uncovered mail rings on the stale answer: {a_stale:?}"
+        );
+    }
+
+    /// bd-cursor-reask-dropped-15ail: TWO rounds under sender clock skew.
+    /// The mail is future-dated (created far ahead of the toron answer),
+    /// so the answer is stale on arrival. Round one parks and asks once;
+    /// round two must RING (fail-open), never park behind a second ask
+    /// that no interpreter executes — that wedge suppressed the pin forever.
+    #[test]
+    fn toron_cursor_stale_answer_rings_instead_of_reasking() {
+        let npub = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let mut index = SelfIndex::default();
+        index.insert_pin("BlueRidge".into(), Some(npub.into()));
+        // created_at far ahead of any honest toron read: sender clock skew.
+        let watch = format!(
+            r#"{{"kind":9,"id":"wake-skew-1","pubkey":"senderpk","created_at":1800000000,"tags":[["p","{npub}"],["t","flywheel"],["h","thread-1"],["toron-kind","mail-delivered"],["thread","thread-1"],["importance","normal"],["from","SlateHarbor"],["mid","msg-skew-1"]],"content":"mail"}}"#
+        );
+        let model0 = DoorbellModel {
+            index: index.clone(),
+            statuses: [("BlueRidge".into(), "idle".into())].into(),
+            ..DoorbellModel::default()
+        };
+        // Round one: park the candidate and ask exactly once.
+        let (m1, a1) = tick(&model0, &DoorbellMsg::WatchNdjson { line: watch });
+        assert_eq!(
+            a1.iter()
+                .filter(|a| matches!(a, DoorbellAction::ReadToronCursor { .. }))
+                .count(),
+            1,
+            "one ask per burst: {a1:?}"
+        );
+        assert!(
+            !a1.iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { pin, .. } if pin == "BlueRidge")),
+            "nothing rings before the answer: {a1:?}"
+        );
+        // Round two: the answer is stale (read long before created), so it
+        // must decide — ring — instead of emitting a second ask.
+        let (_, a2) = tick(
+            &m1,
+            &DoorbellMsg::ToronCursor {
+                pin: "BlueRidge".into(),
+                cursor_us: Some(1_700_000_000_000_000),
+                read_at_secs: 1_700_000_000,
+            },
+        );
+        assert!(
+            !a2.iter()
+                .any(|a| matches!(a, DoorbellAction::ReadToronCursor { .. })),
+            "no second ask to drop: {a2:?}"
+        );
+        assert!(
+            a2.iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { pin, .. } if pin == "BlueRidge")),
+            "future-dated mail rings on the stale answer: {a2:?}"
         );
     }
 

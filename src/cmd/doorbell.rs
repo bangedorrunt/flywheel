@@ -1674,6 +1674,12 @@ pub(crate) fn cmd_doorbell_why(
                 doorbell_tick::DoorbellMsg::WatchNdjson { line } => {
                     workspace::Msg::WatchNdjson { line }
                 }
+                // bd-cursor-reask: an internal refold step; replay treats
+                // it as the fresh watch it decided from (its decision is
+                // journaled on the ToronCursor row either way).
+                doorbell_tick::DoorbellMsg::WatchDecideOnly { line } => {
+                    workspace::Msg::WatchNdjson { line }
+                }
                 doorbell_tick::DoorbellMsg::InboxItems { raw, pin } => {
                     workspace::Msg::InboxItems { raw, pin }
                 }

@@ -164,6 +164,11 @@ pub fn replay_msg(v: &serde_json::Value) -> Option<crate::workspace::Msg> {
             },
             crate::doorbell_tick::DoorbellMsg::EventsGap { pin } => Msg::EventsGap { pin },
             crate::doorbell_tick::DoorbellMsg::WatchNdjson { line } => Msg::WatchNdjson { line },
+            // bd-cursor-reask: internal refold step; replay as the fresh
+            // watch it decided from (see cmd/doorbell.rs).
+            crate::doorbell_tick::DoorbellMsg::WatchDecideOnly { line } => {
+                Msg::WatchNdjson { line }
+            }
             crate::doorbell_tick::DoorbellMsg::InboxItems { raw, pin } => {
                 Msg::InboxItems { raw, pin }
             }

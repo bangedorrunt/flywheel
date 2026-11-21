@@ -663,9 +663,45 @@ impl<H: Host> Brain<H> {
             &serde_json::json!({"rt_kind": "ToronCursor"}),
             &effects,
             serde_json::json!({"stage": "answered"}),
-            &[pin],
+            std::slice::from_ref(&pin),
         );
+        // bd-cursor-reask: a re-ask here would have nowhere to go (deliver
+        // only routes Digest/Prompt), so make it loud instead of dropping
+        // it. Unreachable by construction — the fold never parks a
+        // decide-only re-fold — but a silent drop wedged the pin once.
+        if effects
+            .iter()
+            .any(|e| matches!(e, Effect::ReadToronCursor { .. }))
+        {
+            self.audit("toron-cursor-ask-dropped", serde_json::json!({"pin": pin}));
+        }
         self.deliver(effects, "toron-cursor").await;
+    }
+
+    /// bd-cursor-reask: run the interpreter for every toron-cursor ask in
+    /// these effects and build each answer as a ToronCursor message. The
+    /// caller feeds answers to on_toron_cursor. Synchronous: reading the
+    /// cursor never awaits, so answering can never recurse the dispatch
+    /// loop. Used by the watch hook; on_toron_cursor never calls this —
+    /// the fold never parks a decide-only re-fold, so an answer cannot
+    /// ask again (a stray ask there is a loud audit, never a silent drop).
+    fn answer_cursor_reads(&self, effects: &[Effect]) -> Vec<BrainMsg> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::ReadToronCursor { pin } => Some(pin.clone()),
+                _ => None,
+            })
+            .map(|pin| {
+                let cursor_us = self.host.read_toron_cursor(&pin);
+                let read_at_secs = self.host.now_unix();
+                BrainMsg::ToronCursor {
+                    pin,
+                    cursor_us,
+                    read_at_secs,
+                }
+            })
+            .collect()
     }
 
     async fn on_watch(&mut self, line: String) {
@@ -711,28 +747,11 @@ impl<H: Host> Brain<H> {
         let effects = self.host.tick(&BrainMsg::Watch(line.clone()));
         // bd-yc6jf: answer ring-time toron reads before any Prompt for the
         // parked candidate is delivered. The ask stays in this row (journal
-        // before the provider runs); each answer re-enters through dispatch
-        // so the re-tick's max(host, toron) decision is journaled with the
-        // same value on replay. Fail-open: an unanswered toron rings anyway
-        // and the fold audits the miss.
-        let mut answers = Vec::new();
-        for pin in effects
-            .iter()
-            .filter_map(|e| match e {
-                Effect::ReadToronCursor { pin } => Some(pin.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-        {
-            let cursor_us = self.host.read_toron_cursor(&pin);
-            let read_at_secs = self.host.now_unix();
-            answers.push(BrainMsg::ToronCursor {
-                pin,
-                cursor_us,
-                read_at_secs,
-            });
-        }
-        for answer in answers {
+        // before the provider runs); each answer re-enters through
+        // on_toron_cursor so the re-tick's max(host, toron) decision is
+        // journaled with the same value on replay. Fail-open: an unanswered
+        // toron rings anyway and the fold audits the miss.
+        for answer in self.answer_cursor_reads(&effects) {
             let BrainMsg::ToronCursor {
                 pin,
                 cursor_us,
@@ -2841,6 +2860,29 @@ mod tests {
         assert!(
             journal_kinds("toron-cursor-pipe").contains(&"ToronCursor".to_string()),
             "the answer is journaled before anything it decides"
+        );
+    }
+
+    /// bd-cursor-reask: a re-ask emitted while answering has nowhere to go
+    /// (deliver only routes Digest/Prompt), so it is journaled as a loud
+    /// miss instead of being silently dropped. Unreachable by construction
+    /// — the fold never parks a decide-only re-fold — but the wedge it
+    /// would re-open suppressed a pin forever.
+    #[tokio::test]
+    async fn toron_cursor_reask_while_answering_is_a_loud_miss() {
+        let (mut brain, _rx, _tx) = test_brain(
+            "toron-cursor-loud",
+            vec![vec![Effect::ReadToronCursor {
+                pin: "BlueRidge".into(),
+            }]],
+        );
+        brain
+            .on_toron_cursor("BlueRidge".into(), Some(0), 1_700_000_000)
+            .await;
+        let audit = std::fs::read_to_string(brain.store.audit_file("w")).unwrap_or_default();
+        assert!(
+            audit.contains("toron-cursor-ask-dropped"),
+            "a dropped ask is loud, never silent: {audit}"
         );
     }
 
