@@ -333,6 +333,17 @@ fn proof_mutation_failfast_and_crew_cache() {
     assert!(status.success(), "proof mutation failfast test failed");
 }
 
+/// bd-2gxup: a stale committed Cargo.lock fails the proof at the build step.
+#[test]
+fn a_stale_lockfile_fails_the_proof_build_step() {
+    let status = Command::new("bash")
+        .arg(format!("{}/scripts/test-proof-lock-stale.sh", root()))
+        .current_dir(root())
+        .status()
+        .expect("run scripts/test-proof-lock-stale.sh");
+    assert!(status.success(), "stale Cargo.lock witness failed");
+}
+
 /// bd-9os20: the Claude plugin must load from its installed path and stack.sh
 /// must copy it there; both are checkable without a live Claude seat.
 #[test]

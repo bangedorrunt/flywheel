@@ -48,9 +48,15 @@ mutation "C6  a cached verdict need not match what the spec expects" \
 mutation "C8  the proof stops computing a cache key" \
     file=$PROOF \
     expect=clean_proof_computes_and_passes_a_cache_key \
-    find='      mut_key="$(python3 scripts/mutation-cache.py key --root . --spec "$spec" \
-        --driver "${CLEAN_PROOF_DRIVER_SHA:-}" 2>/dev/null || true)"' \
+    find='      mut_key="$(python3 scripts/mutation-cache.py key --proven "$PROVEN_SHA" --repo "$ROOT" \
+        --spec "$spec" --driver "${CLEAN_PROOF_DRIVER_SHA:-}" 2>/dev/null || true)"' \
     replace='      mut_key=""'
+
+mutation "C10  the proof build accepts a stale Cargo.lock" \
+    file=$PROOF \
+    expect=clean_proof_builds_with_a_locked_lockfile \
+    find='build --workspace --all-targets --locked' \
+    replace='build --workspace --all-targets'
 
 mutation "C9  the driver fixture inherits the running proof's environment" \
     file=src/cmd/clean_proof.rs \

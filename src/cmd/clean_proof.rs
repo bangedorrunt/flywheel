@@ -705,6 +705,17 @@ fn proof_mutation_inputs_fixture_passes() {
     );
 }
 
+/// bd-2gxup: a stale Cargo.lock must fail the proof's build step, not drift
+/// into the mutation cache key after the build rewrites it.
+#[test]
+fn clean_proof_builds_with_a_locked_lockfile() {
+    let script = read_script("scripts/clean-proof.sh");
+    assert!(
+        script.contains("build --workspace --all-targets --locked"),
+        "the proof build must refuse a stale Cargo.lock at the build step"
+    );
+}
+
 /// The cache is only real if the proof passes a key and stores the witness
 /// after the receipt exists. Both fail silently otherwise: everything runs and
 /// nobody notices the cache never fills.
@@ -712,8 +723,8 @@ fn proof_mutation_inputs_fixture_passes() {
 fn clean_proof_computes_and_passes_a_cache_key() {
     let script = read_script("scripts/clean-proof.sh");
     assert!(
-        script.contains("mutation-cache.py key --root ."),
-        "the proof computes each spec's key in the export"
+        script.contains("mutation-cache.py key --proven \"$PROVEN_SHA\" --repo \"$ROOT\""),
+        "the proof computes each spec's key from the proven rev, as ship land does"
     );
     assert!(
         script.contains("--cache-key \"$mut_key\""),

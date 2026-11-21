@@ -357,7 +357,7 @@ export RUSTFLAGS="${RUSTFLAGS:-} -D warnings"
 # costs under a second here instead of 40 minutes after the suite; a clippy
 # error fails before the suite instead of after it.
 run_step verify-needles bash scripts/verify-needles.sh || true
-[ -n "$FAILED_STEP" ] || run_step build "${MBX[@]}" build --workspace --all-targets || true
+[ -n "$FAILED_STEP" ] || run_step build "${MBX[@]}" build --workspace --all-targets --locked || true
 # bd-9dxjt: fail loudly if mbx still turned our target into a symlink into its
 # evictable managed cache. A self-spawning test would then die with ENOENT
 # after a concurrent sweep, and the proof would be blaming the code for a
@@ -464,8 +464,8 @@ if [ -z "$FAILED_STEP" ]; then
     # and --no-cache bypass the cache by design.
     mut_key=""
     if [ "$NO_CACHE" -eq 0 ] && [ "$MUTATIONS_MODE" != full ]; then
-      mut_key="$(python3 scripts/mutation-cache.py key --root . --spec "$spec" \
-        --driver "${CLEAN_PROOF_DRIVER_SHA:-}" 2>/dev/null || true)"
+      mut_key="$(python3 scripts/mutation-cache.py key --proven "$PROVEN_SHA" --repo "$ROOT" \
+        --spec "$spec" --driver "${CLEAN_PROOF_DRIVER_SHA:-}" 2>/dev/null || true)"
     fi
     echo "clean-proof: mutations $spec"
     set +e
