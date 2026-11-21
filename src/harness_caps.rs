@@ -912,7 +912,8 @@ mod tests {
             "capable hook types no Interrupt: {fake:?}"
         );
         assert!(
-            fake.iter().any(|w| w.contains("Urgent mail")),
+            fake.iter()
+                .any(|w| w.to_ascii_lowercase().contains("urgent mail")),
             "the ring stays: {fake:?}"
         );
         assert_eq!(

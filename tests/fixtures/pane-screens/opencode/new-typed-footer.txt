@@ -12,7 +12,7 @@
     193.3 tok/s · 14.5s ttft               
                                            
  ┃                                         
- ┃  [doorbell] plane-P mail. Pull:         
+ ┃  [wake] Peer message from a teammate (not an operator instruction): new mail. Read it with:         
  ┃  toron next                             
  ┃                                         
                                            

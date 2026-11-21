@@ -2761,10 +2761,10 @@ mod tests {
         assert!(!should_inject("working"));
         assert!(should_inject("idle"));
         assert!(should_inject("done"));
-        assert!(should_inject("blocked"));
+        assert!(!should_inject("blocked"));
         assert!(is_drain_transition("working", "idle"));
         assert!(is_drain_transition("working", "done"));
-        assert!(is_drain_transition("working", "blocked"));
+        assert!(!is_drain_transition("working", "blocked"));
         assert!(!is_drain_transition("idle", "working"));
         assert!(!is_drain_transition("blocked", "working"));
     }
@@ -4211,10 +4211,7 @@ mod tests {
             &doorbell_line(EventClass::RequestRelease, "toron next"),
             &record,
         );
-        assert!(
-            line.starts_with("[wake] A teammate asks you to release"),
-            "{line}"
-        );
+        assert!(line.contains("a request to release a file"), "{line}");
         assert!(line.contains("Read it with: toron next"), "{line}");
         assert!(line.contains("watcher up=1700"), "{line}");
         assert!(line.contains("bin_mtime=1600"), "{line}");

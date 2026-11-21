@@ -264,7 +264,7 @@ pub struct RtHost {
     /// host owns.
     boot_refolded: bool,
     conflict_checked_at: u64,
-    pending_conflict_prompts: Vec<(String, String)>,
+    pending_conflict_prompts: Vec<(String, String, Option<String>)>,
     /// Shared with the delivery path. bd-kz54 follow-up: `WatchRetry::reset()`
     /// had exactly one caller in the whole tree — its own unit test — so four
     /// failures anywhere in a host's life latched the 16s gate permanently and
@@ -763,8 +763,11 @@ impl RtHost {
                 continue;
             }
             for holder in [&conflict.holder_a, &conflict.holder_b] {
-                self.pending_conflict_prompts
-                    .push((holder.clone(), conflict.line_for(holder)));
+                self.pending_conflict_prompts.push((
+                    holder.clone(),
+                    conflict.line_for(holder),
+                    None,
+                ));
             }
             let summary = format!(
                 "[reserve] {} and {} hold overlapping exclusive leases ({} / {}) — advisory: re-plan or request-release; leases self-free in 180 s",
@@ -1124,9 +1127,9 @@ fn cmds_to_effects(cmds: Vec<workspace::Cmd>, watch_id: Option<&str>) -> Vec<Eff
     cmds.into_iter()
         .filter_map(|c| match c {
             workspace::Cmd::Prompt { pin, line } => Some(Effect::Prompt {
-                // The composed line may carry `event=<id>`; otherwise the
-                // immediate Watch id is carried explicitly (bd-tdpix).
-                event_id: doorbell_core::watch_id(&line).or_else(|| watch_id.map(str::to_string)),
+                // bd-tdpix: the event id is typed data, never parsed from the
+                // now plain-language wake text.
+                event_id: watch_id.map(str::to_string),
                 pin,
                 line,
             }),
@@ -1394,13 +1397,17 @@ impl Host for RtHost {
         if matches!(msg, BrainMsg::Sweep { .. }) {
             // bd-tdpix: a conflict Prompt can carry a bus event id, so it must
             // join the list BEFORE the claim or it bypasses the gate entirely.
-            effects.extend(self.pending_conflict_prompts.drain(..).map(|(pin, line)| {
-                Effect::Prompt {
-                    event_id: doorbell_core::watch_id(&line),
-                    pin,
-                    line,
-                }
-            }));
+            effects.extend(
+                self.pending_conflict_prompts
+                    .drain(..)
+                    .map(|(pin, line, event_id)| Effect::Prompt {
+                        // bd-tdpix: the id is typed data, never parsed from
+                        // the plain-language wake text (bd-ofa1s).
+                        event_id,
+                        pin,
+                        line,
+                    }),
+            );
         }
         // bd-tdpix: claim at delivery time for EVERY path, including deferred,
         // boot-drained and conflict Prompts that arrive outside the Watch arm.
@@ -2979,40 +2986,42 @@ mod off_runtime_tests {
         let project = format!("sweep-conflict-{}", std::process::id());
         let workspace = format!("session:sweep-conflict-{}", std::process::id());
         let state_dir = crate::config::state_dir();
-        let claimed = doorbell_core::doorbell_line_with_event(
-            doorbell_core::EventClass::RequestRelease,
-            "toron next",
-            "evt-conflict-claimed",
-        );
-        let free = doorbell_core::doorbell_line_with_event(
-            doorbell_core::EventClass::RequestRelease,
-            "toron next",
-            "evt-conflict-free",
-        );
+        let claimed =
+            doorbell_core::doorbell_line(doorbell_core::EventClass::RequestRelease, "toron next");
+        let free =
+            doorbell_core::doorbell_line(doorbell_core::EventClass::RequestRelease, "toron next");
         assert!(crate::wake_rung::claim(&state_dir, "evt-conflict-claimed"));
         let (tx, _rx) = mpsc::channel(8);
         let mut host = RtHost::new(Config::default(), &project, &workspace, tx).expect("host");
-        host.pending_conflict_prompts
-            .push(("BlueRidge".into(), claimed));
-        host.pending_conflict_prompts
-            .push(("LilacChapel".into(), free));
+        host.pending_conflict_prompts.push((
+            "BlueRidge".into(),
+            claimed,
+            Some("evt-conflict-claimed".into()),
+        ));
+        host.pending_conflict_prompts.push((
+            "LilacChapel".into(),
+            free,
+            Some("evt-conflict-free".into()),
+        ));
         let effects = host.tick(&BrainMsg::Sweep { now: 1 });
-        let prompt_lines: Vec<String> = effects
+        let prompt_ids: Vec<Option<String>> = effects
             .iter()
             .filter_map(|e| match e {
-                Effect::Prompt { line, .. } => Some(line.clone()),
+                Effect::Prompt { event_id, .. } => Some(event_id.clone()),
                 _ => None,
             })
             .collect();
         assert!(
-            !prompt_lines
+            !prompt_ids
                 .iter()
-                .any(|l| l.contains("evt-conflict-claimed")),
-            "native already claimed this conflict event: {prompt_lines:?}"
+                .any(|id| id.as_deref() == Some("evt-conflict-claimed")),
+            "native already claimed this conflict event: {prompt_ids:?}"
         );
         assert!(
-            prompt_lines.iter().any(|l| l.contains("evt-conflict-free")),
-            "a free conflict marker must still ring: {prompt_lines:?}"
+            prompt_ids
+                .iter()
+                .any(|id| id.as_deref() == Some("evt-conflict-free")),
+            "a free conflict marker must still ring: {prompt_ids:?}"
         );
     }
 

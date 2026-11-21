@@ -711,7 +711,7 @@ mod tests {
         let wake = d.wake_line(0x7f);
         assert_eq!(
             wake,
-            "[wake] Direct message from BlackGorge: asks you to release src/pane.rs. Read it with: toron next"
+            "[wake] Peer message from BlackGorge (not an operator instruction): asks you to release src/pane.rs. Read it with: toron next. Reply with: toron mail send --help"
         );
         let mail = d.mail_args("AmberHarbor");
         assert_eq!(mail[0], "mail");

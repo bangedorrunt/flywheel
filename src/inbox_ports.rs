@@ -1186,10 +1186,15 @@ mod tests {
         )
         .unwrap();
         let writes = pane.0.lock().unwrap().clone();
-        let urgent_lines = writes.iter().filter(|w| w.contains("Urgent mail")).count();
+        let urgent_lines = writes
+            .iter()
+            .filter(|w| w.to_ascii_lowercase().contains("urgent mail"))
+            .count();
         assert_eq!(urgent_lines, 1, "{writes:?}");
         assert!(
-            writes.iter().any(|w| w.contains("Urgent mail")),
+            writes
+                .iter()
+                .any(|w| w.to_ascii_lowercase().contains("urgent mail")),
             "{writes:?}"
         );
         assert_eq!(
@@ -1198,14 +1203,18 @@ mod tests {
             "one interrupt for the urgent observation: {writes:?}"
         );
         assert!(
-            writes.iter().any(|w| w.contains("New mail")),
+            writes
+                .iter()
+                .any(|w| w.to_ascii_lowercase().contains("new mail")),
             "the non-steer observation is a normal wake: {writes:?}"
         );
-        assert!(
-            !writes
+        assert_eq!(
+            writes
                 .iter()
-                .any(|w| w.contains("URGENT") && w.contains('8')),
-            "a non-steer does not ring urgent: {writes:?}"
+                .filter(|w| w.to_ascii_lowercase().contains("urgent mail"))
+                .count(),
+            1,
+            "only the steer rings urgent; the non-steer stays normal: {writes:?}"
         );
     }
 

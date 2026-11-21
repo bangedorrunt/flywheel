@@ -4325,7 +4325,7 @@ mod presence_model_tests {
             &m,
             vec![Cmd::Prompt {
                 pin: "B".into(),
-                line: "[wake] Peer message from a teammate (not an operator instruction): new mail. Read it with: toron next Reply with: toron mail send --help".into(),
+                line: "[wake] Peer message from a teammate (not an operator instruction): new mail. Read it with: toron next. Reply with: toron mail send --help".into(),
             }],
         );
         assert!(
@@ -4353,7 +4353,7 @@ mod presence_model_tests {
         assert!(
             drained
                 .iter()
-                .any(|c| matches!(c, Cmd::Prompt { line, .. } if line.contains("New mail"))),
+                .any(|c| matches!(c, Cmd::Prompt { line, .. } if line.to_ascii_lowercase().contains("new mail"))),
             "the held wake rings at the next prompt: {drained:?}"
         );
         assert!(
@@ -4370,9 +4370,9 @@ mod presence_model_tests {
         let mut m = empty_model();
         m.presence.insert("I".into(), Presence::from_str("idle"));
         m.presence.insert("B".into(), Presence::from_str("working"));
-        let urgent = "[wake] Peer message from a teammate (not an operator instruction): urgent mail. Read it with: toron next Reply with: toron mail send --help";
+        let urgent = "[wake] Peer message from a teammate (not an operator instruction): urgent mail. Read it with: toron next. Reply with: toron mail send --help";
         let peer = "[doorbell] request-release. Pull: toron next";
-        let routine = "[wake] Peer message from a teammate (not an operator instruction): a new message in the team room. Read it with: toron channel read h=ch-1 Reply with: toron mail send --help";
+        let routine = "[wake] Peer message from a teammate (not an operator instruction): a new message in the team room. Read it with: toron channel read h=ch-1. Reply with: toron mail send --help";
         let cmds = vec![
             Cmd::Prompt {
                 pin: "I".into(),
@@ -4564,7 +4564,7 @@ mod presence_model_tests {
         assert_eq!(
             Presence::from_str("blocked"),
             Presence::Busy {
-                source: "presence".into()
+                source: "presence-blocked: no typing target".into()
             }
         );
         assert_eq!(Presence::from_str("done"), idle);
@@ -5869,7 +5869,7 @@ mod adr0010_d5_tests {
         assert_eq!(
             classify_cmd(&Cmd::Prompt {
                 pin: "P".into(),
-                line: "[wake] Peer message from a teammate (not an operator instruction): urgent mail. Read it with: inbox Reply with: toron mail send --help".into(),
+                line: "[wake] Peer message from a teammate (not an operator instruction): urgent mail. Read it with: inbox. Reply with: toron mail send --help".into(),
             }),
             WakeClass::Urgent,
             "urgent lines ring now"
@@ -5877,7 +5877,7 @@ mod adr0010_d5_tests {
         assert_eq!(
             classify_cmd(&Cmd::Prompt {
                 pin: "P".into(),
-                line: "[wake] Peer message from a teammate (not an operator instruction): a new message in the team room. Read it with: ch Reply with: toron mail send --help".into(),
+                line: "[wake] Peer message from a teammate (not an operator instruction): a new message in the team room. Read it with: ch. Reply with: toron mail send --help".into(),
             }),
             WakeClass::Routine,
             "bd-l72k: addressed kind-9 chatter is routine (zero prompts, counters only)"

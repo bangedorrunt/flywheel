@@ -423,8 +423,8 @@ mod tests {
         assert_eq!(
             *r.0.borrow(),
             vec![
-                "prompt w1:p1 [wake] New mail. Read it with: toron next".to_string(),
-                "prompt w1:p1 [wake] Urgent mail. Read it with: toron next".to_string(),
+                "prompt w1:p1 [wake] Peer message from a teammate (not an operator instruction): new mail. Read it with: toron next. Reply with: toron mail send --help".to_string(),
+                "prompt w1:p1 [wake] Peer message from a teammate (not an operator instruction): urgent mail. Read it with: toron next. Reply with: toron mail send --help".to_string(),
                 "keys w1:p1 [\"Escape\"]".to_string(),
                 "close w1:p1".to_string(),
                 format!("prompt w1:p1 {}", launch_bootstrap(Harness::Pi)),
@@ -656,7 +656,7 @@ mod tests {
         assert_eq!(
             *backend.0.lock().unwrap(),
             vec![
-                "prompt block:fake-1 [wake] New mail. Read it with: toron next".to_string(),
+                "prompt block:fake-1 [wake] Peer message from a teammate (not an operator instruction): new mail. Read it with: toron next. Reply with: toron mail send --help".to_string(),
                 "keys block:fake-1 Escape".to_string(),
                 "close block:fake-1".to_string(),
             ]

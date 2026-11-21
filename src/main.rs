@@ -71,6 +71,7 @@ mod harness_api;
 mod harness_caps;
 mod harness_registry;
 mod hc;
+mod hook_decide;
 mod headless;
 mod health_page;
 mod inbox_host;

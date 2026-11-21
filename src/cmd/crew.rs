@@ -1811,7 +1811,10 @@ mod tests {
         .expect("an urgent crew prompt must ring");
         assert_eq!(got, crate::inbox_ports::RingDone::Typed);
         let typed = prompt_wake_line(42, true);
-        assert!(typed.contains("Urgent mail"), "urgent form: {typed}");
+        assert!(
+            typed.to_ascii_lowercase().contains("urgent mail"),
+            "urgent form: {typed}"
+        );
         assert_eq!(
             writes(&rec),
             vec![
@@ -1977,7 +1980,7 @@ mod tests {
             crate::doorbell::take_deferred_wakes(&crate::config::state_dir(), &project, &hosted),
             vec![(
                 "BlueRidge".to_string(),
-                "[wake] New mail. Read it with: toron next".to_string()
+                "[wake] Peer message from a teammate (not an operator instruction): new mail. Read it with: toron next. Reply with: toron mail send --help".to_string()
             )],
             "the unconsumed wake is on the dispatcher's queue, not lost"
         );
@@ -2054,7 +2057,7 @@ mod tests {
             crate::doorbell::take_deferred_wakes(&crate::config::state_dir(), &project, &hosted),
             vec![(
                 "BlueRidge".to_string(),
-                "[wake] New mail. Read it with: toron next".to_string()
+                "[wake] Peer message from a teammate (not an operator instruction): new mail. Read it with: toron next. Reply with: toron mail send --help".to_string()
             )],
             "the refused wake is on the dispatcher's queue as a mail wake"
         );
@@ -2084,7 +2087,7 @@ mod tests {
         model.doorbell.index.insert_pin("BlueRidge".into(), None);
         let msg = crate::workspace::Msg::PromptRefused {
             pin: "BlueRidge".into(),
-            line: "[wake] Urgent mail. Read it with: toron next".into(),
+            line: "[wake] Peer message from a teammate (not an operator instruction): urgent mail. Read it with: toron next. Reply with: toron mail send --help".into(),
         };
         let (model, cmds) = crate::workspace::tick(&model, &msg);
         assert!(

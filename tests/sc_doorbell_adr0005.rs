@@ -109,7 +109,7 @@ fn sc_d1_kind9_live_npub_p_tag_urgent_rings() {
     let stdin = format!("{presence}\n{kind9}");
     let stdout = run_doorbell_once(&sandbox, &stdin, &["BlueRidge=idle", "LilacChapel=idle"]);
     assert!(
-        stdout.contains("[doorbell]"),
+        stdout.contains("[wake]"),
         "urgent npub line must become a doorbell, got {stdout}"
     );
     assert!(stdout.contains("BlueRidge"), "got {stdout}");
@@ -304,7 +304,7 @@ fn sc_d1_handler_requires_heard_signal() {
 fn sc_d1_peer_template_is_handler_not_timer() {
     let tpl = read("integrations/peer-aware.md.tpl");
     assert!(tpl.contains("{mail_identity}"), "identity prime must stay");
-    assert!(tpl.contains("[doorbell]"), "handler must teach [doorbell]");
+    assert!(tpl.contains("[wake]"), "handler must teach the [wake] line");
     assert!(
         tpl.contains("--since"),
         "pull uses incremental since cursor"

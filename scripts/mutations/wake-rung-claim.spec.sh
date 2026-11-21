@@ -30,11 +30,11 @@ mutation "T3  Prompts stop claiming by event id" \
 mutation "T5  the typed event id is dropped (falls back to line comparison)" \
     file=src/doorbell_host.rs \
     expect=a_real_watch_line_through_the_fold_carries_and_claims_its_event_id \
-    find='                event_id: doorbell_core::watch_id(&line).or_else(|| watch_id.map(str::to_string)),' \
+    find='                event_id: watch_id.map(str::to_string),' \
     replace='                event_id: None,'
 
 mutation "T6  a Sweep conflict Prompt bypasses the claim" \
     file=$HOST \
     expect=a_sweep_conflict_prompt_claims_before_delivery \
-    find=$'            effects.extend(self.pending_conflict_prompts.drain(..).map(|(pin, line)| {\n                Effect::Prompt {\n                    event_id: doorbell_core::watch_id(&line),\n                    pin,\n                    line,\n                }\n            }));' \
-    replace='            let _ = self.pending_conflict_prompts.drain(..);'
+    find='                        event_id,' \
+    replace='                        event_id: None,'
