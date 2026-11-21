@@ -649,6 +649,57 @@ pub fn assemble_with_catalog(
     briefing
 }
 
+/// bd-mww6u: the sticky-open hold is a *provisional* anti-invent guard. A live
+/// fleet or cross-lane contention is evidence that the hold must yield, or a
+/// captain following briefing would steer by raw mail with no stage or
+/// workflow. Returns the evidence when the hold should be released.
+pub fn sticky_hold_evidence(world: &World) -> Option<String> {
+    if world.joinable && world.pin_count > 0 {
+        return Some(format!(
+            "joinable fleet on {} with {} crew pin(s), dispatcher={}",
+            world.project, world.pin_count, world.dispatcher
+        ));
+    }
+    if world.held_paths.len() > 1 {
+        return Some(format!(
+            "{} held paths across lanes, dispatcher={}",
+            world.held_paths.len(),
+            world.dispatcher
+        ));
+    }
+    None
+}
+
+/// Release the sticky hold: keep (or restore) the world-driven vehicle and
+/// say why in plain English. No second topology surface (GS-049).
+pub fn release_sticky_hold(b: &mut Briefing, session: &str, world: &World) {
+    let Some(evidence) = sticky_hold_evidence(world) else {
+        return;
+    };
+    if world.joinable {
+        b.proposal.topology = "swarm".into();
+        b.proposal.join = true;
+        b.proposal.argv = vec!["flywheel".into(), "arrive".into(), world.project.clone()];
+        if let Some(id) = &world.coalition_id {
+            b.proposal.argv.extend(["--coalition".into(), id.clone()]);
+        }
+    } else {
+        b.proposal.topology = "swarm".into();
+        b.proposal.workflow = "coalition-form".into();
+    }
+    b.proposal.why = format!(
+        "session_topology={session} sticky hold released: {evidence} — {} by default",
+        if world.joinable {
+            "join"
+        } else {
+            "coalition-form"
+        }
+    );
+    if let Some(q) = b.questions.iter_mut().find(|q| q.id == "topology") {
+        q.default = "join".to_string();
+    }
+}
+
 /// GS-049: after sticky-open `[reclassify]` announce, briefing must not present
 /// a conflicting second topology surface (dual SoT). Align proposal + question
 /// default with sticky `session_topology`; when sticky-held against any invent
@@ -1042,6 +1093,62 @@ fn splice_role_models(argv: &mut Vec<String>, specs: &[String]) {
 
 #[cfg(test)]
 mod tests {
+    /// bd-mww6u: a sticky-open hold must not hide a live fleet.
+    #[test]
+    fn sticky_hold_yields_to_a_live_fleet() {
+        let world = World {
+            project: "flywheel".into(),
+            dispatcher: "up".into(),
+            joinable: true,
+            pin_count: 4,
+            held_paths: vec!["src/a.rs".into()],
+            ..World::default()
+        };
+        let mut b = assemble("finish the migration", &world, &[], 5, None);
+        b.proposal.topology = "open".into();
+        b.proposal.join = false;
+        release_sticky_hold(&mut b, "open", &world);
+        assert!(
+            b.proposal.join,
+            "a live fleet yields join: {:?}",
+            b.proposal
+        );
+        assert_eq!(b.proposal.topology, "swarm");
+        assert!(!b.proposal.argv.is_empty(), "join carries an arrive argv");
+        assert!(
+            b.proposal.why.contains("sticky hold released")
+                && b.proposal.why.contains("4 crew pin"),
+            "{}",
+            b.proposal.why
+        );
+    }
+
+    #[test]
+    fn sticky_hold_stands_without_a_live_fleet() {
+        let world = solo();
+        assert!(sticky_hold_evidence(&world).is_none());
+    }
+
+    #[test]
+    fn sticky_hold_yields_to_cross_lane_contention() {
+        let world = World {
+            project: "flywheel".into(),
+            dispatcher: "up".into(),
+            joinable: false,
+            held_paths: vec!["src/a.rs".into(), "crates/b/src/lib.rs".into()],
+            ..World::default()
+        };
+        let mut b = assemble("ship it", &world, &[], 5, None);
+        release_sticky_hold(&mut b, "open", &world);
+        assert_eq!(b.proposal.workflow, "coalition-form");
+        assert!(
+            b.proposal.why.contains("sticky hold released")
+                && b.proposal.why.contains("2 held paths"),
+            "{}",
+            b.proposal.why
+        );
+    }
+
     #[test]
     fn objective_model_intent_maps_bare_and_explicit() {
         assert_eq!(

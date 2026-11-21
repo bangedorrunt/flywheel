@@ -11564,7 +11564,11 @@ fn cmd_briefing(
             b.proposal.topology.as_str(),
             explicit.as_deref(),
         );
-        briefing::align_with_session_topology(&mut b, &final_topo, held);
+        if held && briefing::sticky_hold_evidence(&world).is_some() {
+            briefing::release_sticky_hold(&mut b, &final_topo, &world);
+        } else {
+            briefing::align_with_session_topology(&mut b, &final_topo, held);
+        }
     }
     briefing::apply_answers(&mut b, topology, crew, model).map_err(|e| anyhow!(e))?;
     briefing::attach_consent_plan(&mut b, cfg.crew_max(), &cfg.consent_policy());
