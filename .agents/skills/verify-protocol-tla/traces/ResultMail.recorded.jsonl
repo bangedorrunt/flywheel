@@ -1,0 +1,5 @@
+{"rowMails":0,"landMails":0,"rowOwner":"","landOwner":"","green":false,"done":false}
+{"action":"RedRow","params":["o1"],"rowMails":1,"landMails":0,"rowOwner":"o1","landOwner":"","green":false,"done":false}
+{"action":"ProofEnd","rowMails":1,"landMails":0,"rowOwner":"o1","landOwner":"","green":false,"done":false}
+{"action":"Land","params":["o2"],"rowMails":1,"landMails":1,"rowOwner":"o1","landOwner":"o2","green":false,"done":false}
+{"action":"Replay","rowMails":1,"landMails":1,"rowOwner":"o1","landOwner":"o2","green":false,"done":false}
