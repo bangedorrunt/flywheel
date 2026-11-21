@@ -2533,6 +2533,7 @@ impl std::error::Error for BriefError {}
 /// ([`bead_id_from_prompt`]) without parsing prose. The state-file /
 /// ack / lease-renewal contracts carry over from the old prompts
 /// (bd-prompt-state-file, bd-fug, bd-mail-lease-renewal-durable).
+#[allow(dead_code)] // public dispatch helper; loop-mode uses brief_for with an explicit pin
 pub fn build_brief(
     id: &str,
     title: &str,
@@ -2560,7 +2561,7 @@ pub fn build_brief_with(
     if full.len() <= DISPATCH_PROMPT_CAP {
         return Ok(full);
     }
-    let pointer = pointer_brief(id, project, resume);
+    let pointer = pointer_brief_with(id, project, resume, pin, board);
     if pointer.len() <= DISPATCH_PROMPT_CAP {
         return Ok(pointer);
     }
@@ -2647,11 +2648,26 @@ fn fill_brief(
 /// Never truncated, and the `GOAL ` first line keeps the claim-watch bead-id
 /// extractor working ([`bead_id_from_prompt`]).
 pub fn pointer_brief(id: &str, project: &str, resume: bool) -> String {
+    let board = live_reservation_doc(project);
+    let pin = std::env::var("AGENT_NAME").unwrap_or_default();
+    pointer_brief_with(id, project, resume, &pin, board.as_ref())
+}
+
+/// Pure pointer form: the peer section is filled from the same injected board
+/// as the full brief, so an over-cap dispatch never leaks a literal {peers}.
+pub fn pointer_brief_with(
+    id: &str,
+    project: &str,
+    resume: bool,
+    pin: &str,
+    board: Option<&Value>,
+) -> String {
     let verb = if resume { "Resume" } else { "Execute" };
     POINTER_TEMPLATE
         .replace("{verb}", verb)
         .replace("{id}", id)
         .replace("{project}", project)
+        .replace("{peers}", &render_peer_contacts(board, pin))
 }
 
 /// The brief template (ADR-0019 Spec 2 fields). `{id}` / `{goal}` /
@@ -2686,9 +2702,22 @@ FORBIDDEN no new beads; never force-unlock a peer's reservation; no worktree; st
 /// only a bead id too large for even the pointer form panics (ADR-0019
 /// Spec 2 loop bug).
 pub fn brief(id: &str, title: &str, project: &str, resume: bool) -> String {
-    build_brief(id, title, project, resume).expect(
-        "bead brief cannot fit the dispatch cap even as a pointer (ADR-0019 Spec 2 loop bug)",
+    let pin = std::env::var("AGENT_NAME").unwrap_or_default();
+    brief_for(id, title, project, resume, &pin)
+}
+
+/// The target pin is explicit: the loop that dispatches the bead names its
+/// assignee, never the builder's ambient identity (bd-vx9pv F8).
+pub fn brief_for(id: &str, title: &str, project: &str, resume: bool, pin: &str) -> String {
+    build_brief_with(
+        id,
+        title,
+        project,
+        resume,
+        pin,
+        live_reservation_doc(project).as_ref(),
     )
+    .expect("bead brief cannot fit the dispatch cap even as a pointer (ADR-0019 Spec 2 loop bug)")
 }
 
 /// Queue a filled brief for a dispatched bead. Over-cap degrades to the
@@ -10347,6 +10376,19 @@ mod tests {
         assert!(!section.contains("ScarletCove holds"), "{section}");
         // An unreachable board still carries the peer-first rule.
         let empty = render_peer_contacts(None, "ScarletCove");
+        assert!(empty.contains("COORDINATION"), "{empty}");
+    }
+
+    /// bd-vx9pv: the pointer form fills the peer section from the same board
+    /// and never leaks a literal template token, even over the dispatch cap.
+    #[test]
+    fn a_pointer_brief_has_no_literal_peer_token() {
+        let board = json!({"reservations":[{"holder":"BoldCliff","path":"src/a.rs"}]});
+        let pointer = pointer_brief_with("bd-1", "proj", false, "ScarletCove", Some(&board));
+        assert!(!pointer.contains("{peers}"), "{pointer}");
+        assert!(pointer.contains("BoldCliff holds src/a.rs"), "{pointer}");
+        let empty = pointer_brief_with("bd-1", "proj", false, "ScarletCove", None);
+        assert!(!empty.contains("{peers}"), "{empty}");
         assert!(empty.contains("COORDINATION"), "{empty}");
     }
 

@@ -341,14 +341,23 @@ struct CoordinationCtx {
 
 impl CoordinationCtx {
     fn from_env() -> Self {
+        let cfg = crate::config::Config::default();
         let project = std::env::var("FLYWHEEL_PROJECT")
             .ok()
-            .or_else(|| crate::cron::detect_project(&crate::config::Config::default(), None))
+            .or_else(|| crate::cron::detect_project(&cfg, None))
+            .unwrap_or_default();
+        // bd-s3hzg: the captain is a project fact, not a hardcoded pin. An
+        // env override remains for tests and for an operator's one-off run.
+        let project_key =
+            crate::project_dir_str(&cfg, &project).unwrap_or_else(|_| project.clone());
+        let captain = std::env::var("FLYWHEEL_CAPTAIN_PIN")
+            .ok()
+            .or_else(|| crate::state::captain_pin(&project, &project_key))
             .unwrap_or_default();
         Self {
             project,
             requester: std::env::var("AGENT_NAME").unwrap_or_else(|_| "operator".into()),
-            captain: std::env::var("FLYWHEEL_CAPTAIN_PIN").unwrap_or_else(|_| "SlateHarbor".into()),
+            captain,
             notice_store: crate::config::state_dir().join("coordination-notices.jsonl"),
             mailer_bin: std::env::var("FLYWHEEL_MAIL_BIN")
                 .map(PathBuf::from)
@@ -366,11 +375,22 @@ const NOTICE_WINDOW_SECS: u64 = 600;
 /// Send at most one mail per (holder, requester, paths) inside the window.
 /// The holder gets a plain-English notice; the captain gets a copy. A failed
 /// send is a warning, never a reason to let a foreign stage be stripped.
+/// bd-s3hzg F13: the same paths in another project are a different notice.
+fn notice_key(coord: &CoordinationCtx, holder: &str, paths: &[String]) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        coord.project,
+        holder,
+        coord.requester,
+        paths.join(",")
+    )
+}
+
 fn notify_holder(coord: &CoordinationCtx, holder: &str, paths: &[String]) {
     if holder.is_empty() || holder == coord.requester {
         return;
     }
-    let key = format!("{}|{}|{}", holder, coord.requester, paths.join(","));
+    let key = notice_key(coord, holder, paths);
     let seen: Vec<(String, u64)> = fs::read_to_string(&coord.notice_store)
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
@@ -1199,6 +1219,28 @@ mod tests {
         );
     }
 
+    /// bd-s3hzg: a holder/path pair in two projects is two notices.
+    #[test]
+    fn coordination_notice_key_is_project_scoped() {
+        let coord = CoordinationCtx {
+            requester: "ScarletCove".into(),
+            project: "flywheel".into(),
+            captain: "SlateHarbor".into(),
+            notice_store: PathBuf::from("/tmp/unused.json"),
+            mailer_bin: PathBuf::from("flywheel"),
+            now_secs: 0,
+        };
+        let paths = vec!["src/a.rs".to_string()];
+        let a = notice_key(&coord, "BoldCliff", &paths);
+        let other = CoordinationCtx {
+            project: "toron".into(),
+            ..coord
+        };
+        assert_ne!(a, notice_key(&other, "BoldCliff", &paths));
+        assert!(a.contains("flywheel") && a.contains("BoldCliff"));
+    }
+
+    /// bd-s3hzg: a holder/path pair in two projects is two notices.
     /// bd-ahkw1: parse the live/dead split toron already computes for us.
     #[test]
     fn reservation_conflicts_split_live_and_dead_holders() {

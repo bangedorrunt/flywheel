@@ -19,5 +19,5 @@ mutation "P2  the peer notice stops naming the mail-first step" \
 mutation "P3  a brief skips the builder pin instead of the target pin" \
     file=src/durable.rs \
     expect=a_brief_skips_the_target_pin_not_the_builder \
-    find='.replace("{peers}", &render_peer_contacts(board, pin))' \
+    find=$'        .replace("{goal}", &goal)\n        .replace("{id}", id)\n        .replace("{project}", project)\n        .replace("{peers}", &render_peer_contacts(board, pin))' \
     replace='.replace("{peers}", &render_peer_contacts(board, &std::env::var("AGENT_NAME").unwrap_or_default()))'

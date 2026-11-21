@@ -13,7 +13,7 @@ fn run(sandbox: &TestSandbox, args: &[&str]) -> Output {
     if !fake.exists() {
         let store = sandbox.root().join("fake-chie-lessons.jsonl");
         let script = format!(
-            "#!/bin/sh\nSTORE='{}'\ncase \"$2\" in\n  record) for last; do :; done\n    printf '%s\\n' \"$last\" >> \"$STORE\"\n    printf '{{\"recorded\":true}}\\n' ;;\n  recall)\n    printf '{{\"conclusions\":['\n    sep=''\n    while IFS= read -r line; do\n      
+            "#!/bin/sh\nSTORE='{}'\ncase \"$2\" in\n  record) for last; do :; done\n    printf '%s' \"$last\" | tr '\\n' ' ' >> \"$STORE\"\n    printf '\\n' >> \"$STORE\"\n    printf '{{\"recorded\":true}}\\n' ;;\n  recall)\n    printf '{{\"conclusions\":['\n    sep=''\n    while IFS= read -r line; do\n      
         esc=$(printf '%s' \"$line\" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g')\n        printf '%s{{\"content\":\"%s\"}}' \"$sep\" \"$esc\"\n        sep=','\n    done < \"$STORE\" 2>/dev/null\n    printf '],\"events\":[]}}\\n' ;;\n  *) printf '[]\\n' ;;\nesac\nexit 0\n",
             store.display()
         );
@@ -377,7 +377,12 @@ fn no_test_shells_the_real_chie() {
         for body in src.split("#[test]").skip(1) {
             let body = body.split("\n#[test]").next().unwrap_or(body);
             let mut rest = body;
-            while let Some(i) = rest.find(".command(") {
+            let pattern = if rest.contains("Command::new(env!(\"CARGO_BIN_EXE_flywheel\"))") {
+                "Command::new("
+            } else {
+                ".command("
+            };
+            while let Some(i) = rest.find(pattern) {
                 let seg = &rest[i..(i + 1_200).min(rest.len())];
                 if seg.contains("\"memory\"") && !seg.contains("FLYWHEEL_CHIE_BIN") {
                     bad.push(format!(

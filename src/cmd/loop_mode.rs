@@ -213,13 +213,25 @@ fn work_prompts(
     let mut fresh: Vec<&durable::ReadyBead> = Vec::new();
     for bead in inprog {
         if !assigned.contains(&bead.id) {
-            prompts.push(durable::brief(&bead.id, &bead.title, project, true));
+            prompts.push(durable::brief_for(
+                &bead.id,
+                &bead.title,
+                project,
+                true,
+                bead.assignee.as_deref().unwrap_or(""),
+            ));
             fresh.push(bead);
         }
     }
     for bead in ready {
         if !assigned.contains(&bead.id) {
-            prompts.push(durable::brief(&bead.id, &bead.title, project, false));
+            prompts.push(durable::brief_for(
+                &bead.id,
+                &bead.title,
+                project,
+                false,
+                bead.assignee.as_deref().unwrap_or(""),
+            ));
             fresh.push(bead);
         }
     }
