@@ -151,9 +151,12 @@ impl StatechartDefinition for ResultMailProgramDef {
                 node.on(replay).on(finish)
             })
             .state(ResultMailState::Done, |node| {
-                node.transition(ResultMailState::Done).on(|_| true)
+                let stay = node
+                    .transition(ResultMailState::Done)
+                    .on(|_| true);
+                node.on(stay)
             })
-            .final_state(ResultMailState::Done)
+            .final_state(ResultMailState::Done, |node| node)
             .build()
     }
 
