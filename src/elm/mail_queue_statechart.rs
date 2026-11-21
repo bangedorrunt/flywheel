@@ -56,14 +56,16 @@ impl StatechartDefinition for MailQueueProgramDef {
     fn machine() -> Machine<Self::State, Self::Event, Self::Context, Self::Cmd> {
         Machine::builder(MailQueueState::Idle, MailQueueContext::default())
             .state(MailQueueState::Idle, |node| {
-                node.transition(MailQueueState::Queued)
+                let send = node
+                    .transition(MailQueueState::Queued)
                     .on(|e| matches!(e, MailQueueEvent::Send { .. }))
                     .action(|ctx, e, q: &mut ActionQueue<_, _>| {
                         if let MailQueueEvent::Send { corr } = e {
                             ctx.corr = corr.clone();
                             q.exec(MailQueueCmd::Journal { corr: corr.clone() });
                         }
-                    })
+                    });
+                node.on(send)
             })
             .state(MailQueueState::Queued, |node| {
                 let same = node
@@ -95,9 +97,10 @@ impl StatechartDefinition for MailQueueProgramDef {
                 node.on(ok).on(fail)
             })
             .state(MailQueueState::Delivered, |node| {
-                node.transition(MailQueueState::Delivered).on(|_| true)
+                let stay = node.transition(MailQueueState::Delivered).on(|_| true);
+                node.on(stay)
             })
-            .final_state(MailQueueState::Delivered)
+            .final_state(MailQueueState::Delivered, |node| node)
             .build()
     }
 
