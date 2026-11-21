@@ -77,7 +77,7 @@ export const register = (on: any, deps: RegisterDeps = {}) => {
           if (!line) continue;
           const frame = decodeFrame(line, subscriptionId);
           if (!frame || !claimEvent(RUNG, frame.id)) continue;
-          // bd-krzqu: the host has no session.busy. Track the turn ourselves
+          // bd-krzqu: the host exposes no busy flag. Track the turn ourselves
           // from the turn.start/complete/abort hooks registered below.
           const idle = !busy;
           const decision = decide({
