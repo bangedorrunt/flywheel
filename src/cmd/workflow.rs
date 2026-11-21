@@ -244,6 +244,13 @@ pub(crate) enum WorkflowCmd {
         /// pane mode: bind an existing workspace id instead of spawning fresh
         #[arg(long)]
         reuse: Option<String>,
+        /// bd-3ann1: compose onto the live fleet — bind steps to existing
+        /// seats and start a pane only for roles no live seat can fill.
+        #[arg(long)]
+        join: bool,
+        /// bd-3ann1: consent for the new panes a --join plan needs.
+        #[arg(long)]
+        yes: bool,
         /// JSON output
         #[arg(long)]
         json: bool,
@@ -498,6 +505,38 @@ pub(crate) fn workflow_list_full_rows(
 }
 
 /// Dispatched from `main()`; moved from crate root (bd-wave5-main-eviction-d5hht).
+/// bd-3ann1: the live seats an in-flight compose may bind to. Pure projection
+/// of the spawn registry joined to the plane's agent list.
+fn join_live_seats(cfg: &Config, project: &str) -> Vec<crate::seat_binder::LiveSeat> {
+    let registry = crate::state::load_spawn_registry(project);
+    let agents: Vec<(String, String)> = crate::backend::multiplexer_backend(cfg)
+        .ok()
+        .and_then(|b| b.agent_list().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| (a.pane_id, a.agent_status.as_str().to_string()))
+        .collect();
+    let captain = crate::state::captain_pin(
+        project,
+        &crate::project_dir_str(cfg, project).unwrap_or_else(|_| project.to_string()),
+    );
+    crate::cmd::swarm::seat_rows(&registry, &agents, captain.as_deref())
+        .into_iter()
+        .map(|r| crate::seat_binder::LiveSeat {
+            pin: r.pin,
+            role: r.role,
+            harness: r.harness,
+            model: r.model,
+            mode: r.mode,
+            effort: r.effort,
+            placement: crate::seat_binder::SeatPlacement::Pane,
+            idle: matches!(r.status.as_str(), "idle" | "done"),
+            fresh_session: false,
+            idle_since_ms: None,
+        })
+        .collect()
+}
+
 pub(crate) fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
     use toron_workflow::schema::{Action, CrewSpec, Workflow};
     use toron_workflow::{Level, lint_workflow_with_principles};
@@ -1119,6 +1158,8 @@ pub(crate) fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             crew_max,
             allow_crew_expand,
             reuse,
+            join,
+            yes,
             json,
         } => {
             if keep.is_some() && (!*run || *dry_run) {
@@ -1242,6 +1283,33 @@ pub(crate) fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             }
             let composed = crew::apply_role_aliases(&composed, &packed.aliases);
             let crew_plan = packed.as_plan();
+
+            // bd-3ann1: an in-flight compose binds to the seats that are
+            // already live. The plan is printed before consent; nothing here
+            // touches the fleet.
+            let _join_plan = if *join {
+                let project_name = crate::cron::detect_project(cfg, project.as_deref())
+                    .ok_or_else(|| anyhow::anyhow!("workflow compose --join: no project"))?;
+                let seats = join_live_seats(cfg, &project_name);
+                let plan = crate::compose_join::plan_join(
+                    &composed,
+                    &seats,
+                    &crate::compose_join::JoinRoles::default(),
+                    crew_max.unwrap_or(crate::crew::DEFAULT_CREW_MAX) as usize,
+                );
+                if plan.needs_yes && !*yes && !*dry_run {
+                    bail!(
+                        "workflow compose --join: roles {} have no live seat; re-run with --yes to start them",
+                        plan.spawns.join(", ")
+                    );
+                }
+                for line in crate::compose_join::render_preview(&plan) {
+                    eprintln!("flywheel: join {line}");
+                }
+                Some(plan)
+            } else {
+                None
+            };
 
             if *dry_run {
                 let rendered = crew::render_dry_run(&composed, &resolve);

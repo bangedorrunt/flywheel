@@ -31,6 +31,7 @@ mod catalog_tui;
 mod cmd;
 mod coalition;
 mod comms_send;
+mod compose_join;
 mod config;
 mod control;
 mod crew;
