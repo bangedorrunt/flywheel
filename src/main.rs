@@ -8036,6 +8036,20 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// bd-omp-pin: the launch binary for a harness. omp is a mise-managed pi fork;
+/// the repo's mise.toml only pins it for cwd inside flywheel, so a seat launched
+/// from any other project dir would run whatever omp happens to be on PATH.
+/// Resolve the verified build explicitly here, independent of cwd.
+pub(crate) fn harness_launch_binary(kind: &str) -> String {
+    match kind {
+        "omp" => format!(
+            "mise exec github:can1357/oh-my-pi@{} -- omp",
+            crate::harness_registry::OMP_DEFAULT_VERSION
+        ),
+        _ => kind.to_string(),
+    }
+}
+
 /// Render a `[harness.<name>] spawn_cmd` recipe + launch args into a single
 /// shell command. Args are shell-quoted so model ids / boot primes with
 /// spaces survive the pane's shell.

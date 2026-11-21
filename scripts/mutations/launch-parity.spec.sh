@@ -11,8 +11,8 @@ mutation "V8  rex appends a flag the hc argv never sees" \
     expect=rex_and_hc_build_the_same_launch_for_one_seat \
     find='    let mut cmd = vec!["env".to_string()];
     cmd.append(&mut parts);
-    cmd.push(kind.to_string());' \
+    cmd.push(binary);' \
     replace='    let mut cmd = vec!["env".to_string()];
     cmd.append(&mut parts);
-    cmd.push(kind.to_string());
+    cmd.push(binary);
     cmd.push("--rex-only".to_string());'

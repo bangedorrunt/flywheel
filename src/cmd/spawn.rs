@@ -3705,6 +3705,27 @@ mod spawn_profile_plan_tests {
         );
     }
 
+    /// bd-omp-pin: a seat launched from ANY project dir names the pinned omp
+    /// build explicitly, so mise never falls back to a cwd-less PATH omp.
+    #[test]
+    fn omp_pin_survives_a_foreign_project_cwd() {
+        let binary = crate::harness_launch_binary("omp");
+        assert!(
+            binary.contains(&format!(
+                "github:can1357/oh-my-pi@{}",
+                crate::harness_registry::OMP_DEFAULT_VERSION
+            )),
+            "the launch names the verified build, not a bare `omp`: {binary}"
+        );
+        let cmd = crate::pane::rex_env_command(&Default::default(), "omp", &["--flag".into()]);
+        assert!(
+            cmd.contains(crate::harness_registry::OMP_DEFAULT_VERSION),
+            "the rex launch carries the pin too: {cmd}"
+        );
+        // Other harnesses keep their plain binary name.
+        assert_eq!(crate::harness_launch_binary("pi"), "pi");
+    }
+
     /// STRICT routing: a profile model that is NOT a registry id fails the
     /// launch naming the fix — nothing bypasses the registry (the old
     /// passthrough spawned broken bare ids).

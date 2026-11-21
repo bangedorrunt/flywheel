@@ -3894,7 +3894,7 @@ impl Client {
         args: &[String],
     ) -> Result<AgentInfo, BackendError> {
         let _ = name;
-        let line = crate::recipe_launch_command(kind, args);
+        let line = crate::recipe_launch_command(&crate::harness_launch_binary(kind), args);
         self.terminal_send(pane_id, &line, None)?;
         self.agent_get(pane_id)
     }

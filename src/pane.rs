@@ -812,14 +812,17 @@ pub(crate) fn rex_env_command(
         }
         parts.push(format!("{k}={}", rex_quote_env_value(v)));
     }
+    // bd-omp-pin: the pinned build is named explicitly, never resolved from
+    // the seat's cwd (mise.toml covers only the flywheel repo).
+    let binary = crate::harness_launch_binary(kind);
     if parts.is_empty() {
-        let mut cmd = vec![kind.to_string()];
+        let mut cmd = vec![binary];
         cmd.extend(args.iter().cloned());
         return cmd.join(" ");
     }
     let mut cmd = vec!["env".to_string()];
     cmd.append(&mut parts);
-    cmd.push(kind.to_string());
+    cmd.push(binary);
     cmd.extend(args.iter().cloned());
     cmd.join(" ")
 }
