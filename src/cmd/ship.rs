@@ -709,9 +709,22 @@ fn gate_note(sha: &str, proved: &str, cmd: &str, receipt: &Path) -> String {
     )
 }
 
+/// `foo.spec.sh` and `scripts/mutations/foo.spec.sh` name the same spec.
+fn normalize_spec_path(spec: &str) -> String {
+    if spec.contains('/') || spec == "ad-hoc" || spec.is_empty() {
+        spec.to_string()
+    } else {
+        format!("scripts/mutations/{spec}")
+    }
+}
+
 /// The cache key for one spec, recomputed from the PROVEN revision's own
 /// cache script so the working tree cannot vouch for a cache entry (bd-jp9z1.2).
 fn cache_key_at(root: &Path, rev: &str, spec: &str, driver: &str) -> Result<String> {
+    // bd-1y5qq: witness rows cite a BARE spec ("launch-parity.spec.sh") while
+    // receipt rows cite the repo path. Normalise once here so every caller
+    // resolves both shapes against the proven tree.
+    let spec = normalize_spec_path(spec);
     let script = git(root, &["show", &format!("{rev}:scripts/mutation-cache.py")])
         .map_err(|e| anyhow!("cannot read scripts/mutation-cache.py at {rev}: {e}"))?;
     let mut child = Command::new("python3")
@@ -723,7 +736,7 @@ fn cache_key_at(root: &Path, rev: &str, spec: &str, driver: &str) -> Result<Stri
             "--repo",
             &root.display().to_string(),
             "--spec",
-            spec,
+            &spec,
             "--driver",
             driver,
         ])
@@ -885,7 +898,7 @@ fn receipt_is_landable(root: &Path, receipt: &Path, sha: &str) -> Result<()> {
         // bd-pgzxn: the receipt witnesses the PROVEN revision, so the spec must
         // be read there. A later relabel in the worktree cannot invalidate a
         // receipt that legitimately cites the old id.
-        let at = format!("{proved}:scripts/mutations/{spec}");
+        let at = format!("{proved}:{}", normalize_spec_path(spec));
         let text = git(root, &["show", &at]).map_err(|e| {
             anyhow!("proof receipt cites {spec}, which does not exist at {proved}: {e}")
         })?;
@@ -1114,8 +1127,8 @@ pub(crate) fn ship_land(args: LandArgs<'_>) -> Result<()> {
 mod tests {
     use super::{
         LandPlan, cache_key_at, gate_for, head_has_closed_bead, head_names_bead, land_project,
-        parse_legal_gates, pick_gate, receipt_is_landable, receipt_is_witness_mode,
-        record_witnessed_land, status_of,
+        normalize_spec_path, parse_legal_gates, pick_gate, receipt_is_landable,
+        receipt_is_witness_mode, record_witnessed_land, status_of,
     };
     use crate::config::Config;
     use std::process::Command;
@@ -1755,7 +1768,7 @@ live-verified. Record one BEFORE closing."#;
         std::fs::create_dir_all(dir.path().join("scripts/mutations")).expect("mutations dir");
         std::fs::write(
             dir.path().join("scripts/mutations/demo.spec.sh"),
-            "# shellcheck shell=bash\nCARGO_ARGS=(--bin demo)\nTEST_FILTER=(demo_test)\n\nmutation \"D1\" file=src/lib.rs expect=demo_test find='a' replace='b'\n",
+            "# shellcheck shell=bash\nCARGO_ARGS=(--bin demo)\nTEST_FILTER=(demo_test)\n\nmutation \"D1  demo guard\" file=src/lib.rs expect=demo_test find='a' replace='b'\n",
         )
         .expect("write spec");
         std::fs::create_dir_all(dir.path().join("src")).expect("src dir");
@@ -1828,6 +1841,71 @@ live-verified. Record one BEFORE closing."#;
         assert_eq!(doc["source"], "ship-land");
         assert_eq!(doc["witnessed"], true);
         assert_eq!(doc["sha"], sha);
+    }
+
+    /// bd-1y5qq: a witness row cites a bare spec name; it must resolve to the
+    /// same key as the repo path, or every witness-bearing bead fails to land.
+    #[test]
+    fn a_bare_spec_name_resolves_to_the_same_cache_key() {
+        let _guard = crate::config::lock_env();
+        let dir = witness_repo();
+        let sha = git_in(dir.path(), &["rev-parse", "HEAD"]);
+        let full = cache_key_at(dir.path(), &sha, "scripts/mutations/demo.spec.sh", &sha)
+            .expect("full-path key");
+        let bare = cache_key_at(dir.path(), &sha, "demo.spec.sh", &sha)
+            .expect("a bare witness spec must resolve");
+        assert_eq!(full, bare, "both spellings are the same spec");
+        assert_eq!(
+            normalize_spec_path("demo.spec.sh"),
+            "scripts/mutations/demo.spec.sh"
+        );
+        assert_eq!(
+            normalize_spec_path("scripts/mutations/demo.spec.sh"),
+            "scripts/mutations/demo.spec.sh"
+        );
+    }
+
+    /// bd-1y5qq: a cached witness row with a BARE spec name (as the witness
+    /// store writes it) must survive the receipt check, proving proof91's 0/44
+    /// landing failure is gone.
+    #[test]
+    fn a_cached_row_with_a_bare_spec_lands() {
+        let _guard = crate::config::lock_env();
+        let dir = witness_repo();
+        let sha = git_in(dir.path(), &["rev-parse", "HEAD"]);
+        let key = cache_key_at(dir.path(), &sha, "scripts/mutations/demo.spec.sh", &sha)
+            .expect("cache key");
+        let witness = dir.path().join("green-witness.json");
+        std::fs::write(
+            &witness,
+            r#"{"schema":"flywheel-mutation-cache-witness.v1","ok":true}"#,
+        )
+        .expect("write green witness");
+        let receipt = dir.path().join("receipt.json");
+        std::fs::write(
+            &receipt,
+            serde_json::json!({
+                "ok": true,
+                "sha": sha,
+                "mode": "sha",
+                "mutations": [{
+                    "spec": "demo.spec.sh", "id": "D1",
+                    "expect_test": "some_test", "expect_green": false,
+                    "verdict": "RED", "cached": witness.display().to_string(), "key": key,
+                }],
+                "mutations_mode": "changed",
+                "mutations_base": sha,
+                "changed_paths": ["src/lib.rs"],
+                "driver_sha": sha,
+            })
+            .to_string(),
+        )
+        .expect("write receipt");
+        let landed = receipt_is_landable(dir.path(), &receipt, &sha);
+        assert!(
+            landed.is_ok(),
+            "a cached row with a bare spec must land: {landed:?}"
+        );
     }
 
     #[test]
