@@ -241,15 +241,7 @@ pub fn golden_strings() -> Vec<String> {
     ]
     .into_iter()
     .map(|c| render(c, &ctx))
-    .chain([
-        digest("system notice"),
-        coordination_notice(
-            "BoldCliff",
-            "ScarletCove",
-            &["src/a.rs".to_string()],
-            "flywheel",
-        ),
-    ])
+    .chain([digest("system notice")])
     .collect()
 }
 
@@ -301,6 +293,32 @@ mod tests {
         assert!(lines[4].contains("a request to release src/peer.rs"));
         assert!(lines[5].contains("a file reservation conflict on src/peer.rs"));
         assert!(lines[6].contains("src/peer.rs") && lines[6].contains("a request"));
+    }
+
+    /// bd-v7ucf: a holder mail is not a wake class — it has its own golden
+    /// and must still be plain English, name the path and both pins.
+    #[test]
+    fn coordination_notice_is_plain_self_contained_english() {
+        let notice = coordination_notice(
+            "BoldCliff",
+            "ScarletCove",
+            &["src/a.rs".to_string()],
+            "flywheel",
+        );
+        for token in JARGON_TOKENS {
+            assert!(
+                !notice.contains(token),
+                "holder mail has {token:?}: {notice}"
+            );
+        }
+        assert!(notice.contains("BoldCliff"), "{notice}");
+        assert!(notice.contains("ScarletCove"), "{notice}");
+        assert!(notice.contains("src/a.rs"), "{notice}");
+        assert!(notice.contains("flywheel"), "{notice}");
+        assert!(
+            notice.to_ascii_lowercase().contains("read it with"),
+            "{notice}"
+        );
     }
 
     #[test]
