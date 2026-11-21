@@ -1179,7 +1179,7 @@ done
 sub=""
 for arg in "$@"; do
   case "$arg" in
-    program_status|send-key|write) sub=$arg ;;
+    program_status|send-key|write|block.event) sub=$arg ;;
     *target.resolve*) sub=target.resolve ;;
     *list_blocks*) sub=list_blocks ;;
   esac
@@ -1198,6 +1198,9 @@ case "$cmd:$sub" in
     printf '%s\n' '{"records":[{"state":"idle"}]}'
     ;;
   block:write)
+    printf '%s\n' '{}'
+    ;;
+  api:block.event)
     printf '%s\n' '{}'
     ;;
   block:send-key)
@@ -1235,11 +1238,15 @@ esac
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
         out.expect("rex send of one prompt");
         let log = guard.log_text();
-        assert_eq!(
-            log.lines().filter(|l| l.contains("write")).count(),
-            1,
-            "exactly one prompt write:\n{log}"
+        let paste_lines: Vec<&str> = log.lines().filter(|l| l.contains("block.event")).collect();
+        assert_eq!(paste_lines.len(), 1, "exactly one paste prompt:\n{log}");
+        let paste = paste_lines[0];
+        assert!(
+            paste.contains("session:fake-9"),
+            "session id in paste: {paste}"
         );
+        assert!(paste.contains("block:fake-1"), "block id in paste: {paste}");
+        assert!(paste.contains("hello probe"), "text in paste: {paste}");
         assert_eq!(
             log.lines().filter(|l| l.contains("send-key")).count(),
             1,
