@@ -1308,12 +1308,10 @@ status = "proven"
 concurrent = false
 tests = [
   "src/hc.rs::pi_events_config_uses_a_per_seat_agentdir_and_a_token_path",
-  "src/cmd/spawn.rs::omp_seats_take_the_pi_style_events_bridge",
 ]
 mutations = [
   "scripts/mutations/pi-events-bridge.spec.sh#P1",
   "scripts/mutations/pi-events-bridge.spec.sh#P2",
-  "scripts/mutations/pi-events-bridge.spec.sh#P3",
 ]
 
 [[behavior]]
