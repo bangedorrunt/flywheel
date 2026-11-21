@@ -1,0 +1,8 @@
+{
+  "name": "claude-flywheel-plugin",
+  "version": "0.1.0",
+  "description": "First-party Claude Code module: toron wakes as turns, no pane typing (bd-9os20)",
+  "type": "module",
+  "private": true,
+  "scripts": { "test": "node --experimental-strip-types --test test/*.test.ts" }
+}
