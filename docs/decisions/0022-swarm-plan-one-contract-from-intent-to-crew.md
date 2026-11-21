@@ -370,7 +370,7 @@ Every row below was checked by grepping the named test and mutation at `3af56271
 | D5 consent asks only on change | `needs_consent_lists_jev_field`, `needs_consent_over_budget_lists_estimate`, `consent_policy_serializes_in_plan`, `plan_gate_names_items_and_hint`; `signoff` deleted (bd-6setu.4) | `D5A` (Jev never asked), `D5B` (over-budget never asked) — both in `adr0022-gates` | closed by bd-6setu.20: the rule's own witnesses now carry mutants; the blocked-seat mutant is V3's |
 | D6 standing preferences | `prefer_spawn_model_from_preference` | `D6` | closed |
 | D7 reconciler, not a script | `seat_reconcile_precedence_harness_model_one_respawn`, `seat_reconcile_env_model_gives_respawn_fresh`, `seat_reconcile_no_change_gives_keep` | `V5`, `V9` | closed |
-| D8 binder picks the seat | `seat_binder_reviewer_never_author` | `V10` | closed; the dispatch-time binding rows are bd-6setu.2 (`scripts/mutations/dispatch-binding.spec.sh`) |
+| D8 binder picks the seat | `seat_binder_reviewer_never_author`, `join_binds_execute_to_crew_and_spawns_only_a_reviewer`, `a_reviewer_seat_is_never_the_author`, `a_bound_step_dispatches_to_the_pin_with_the_bead_header`, `join_dry_run_binds_without_starting_anything`, `join_run_without_yes_refuses_when_a_spawn_is_needed` | `V10`, `compose-join J1/J2/J3` | closed; the dispatch-time binding rows are bd-6setu.2 (`scripts/mutations/dispatch-binding.spec.sh`); in-flight join (bd-3ann1) binds live seats and rewrites the dispatch to the chosen pin with the BEAD header |
 
 ### Properties
 

@@ -176,6 +176,38 @@ pub fn plan_join(
     }
 }
 
+/// Apply a plan's seat choices to the workflow's dispatch actions: the bound
+/// step really dispatches to that pin (no profile re-spawn) and the mission
+/// carries the BEAD header, so the receiving seat starts at the right work
+/// order through `send --stage <the step's stage>` (bd-3ann1 slice 2).
+pub fn apply_join_bindings(workflow: &Workflow, plan: &JoinPlan, bead: Option<&str>) -> Workflow {
+    let bound: BTreeMap<String, String> = plan
+        .steps
+        .iter()
+        .filter_map(|b| b.pin.as_ref().map(|pin| (b.step.clone(), pin.clone())))
+        .collect();
+    let mut wf = workflow.clone();
+    for step in &mut wf.steps {
+        let name = step.name.clone().unwrap_or_default();
+        let Some(pin) = bound.get(&name) else {
+            continue;
+        };
+        if let Action::DispatchJob { assignee, spec, .. } = &mut step.action {
+            *assignee = pin.clone();
+            spec.profile = None;
+            if let Some(id) = bead.filter(|b| !b.is_empty()) {
+                let header =
+                    format!("BEAD: {id} (the bound work order; `br show {id}` is the contract)");
+                spec.task = Some(match spec.task.take() {
+                    Some(task) => format!("{header}\n{task}"),
+                    None => header,
+                });
+            }
+        }
+    }
+    wf
+}
+
 /// Preview lines for `--dry-run`: every binding is visible before consent.
 pub fn render_preview(plan: &JoinPlan) -> Vec<String> {
     plan.steps
@@ -306,6 +338,39 @@ mod tests {
         assert!(lines[0].contains("seat Alpha"), "{lines:?}");
         assert!(lines[1].contains("NEW PANE"), "{lines:?}");
         assert!(lines[1].contains("reviewer"), "{lines:?}");
+    }
+
+    /// bd-3ann1 slice 2: a bound step dispatches to the chosen pin, keeps its
+    /// stage, and carries the BEAD header instead of spawning a profile.
+    #[test]
+    fn a_bound_step_dispatches_to_the_pin_with_the_bead_header() {
+        let wf = workflow(vec![dispatch_step("execute", "coder", "ce-execute")]);
+        let plan = plan_join(&wf, &four_crew(), &JoinRoles::default(), 8);
+        let bound = apply_join_bindings(&wf, &plan, Some("bd-42"));
+        let Action::DispatchJob { assignee, spec, .. } = &bound.steps[0].action else {
+            panic!("the step must stay a dispatch: {:?}", bound.steps[0]);
+        };
+        assert_eq!(assignee, "Alpha");
+        assert!(spec.profile.is_none(), "no fresh profile spawn: {spec:?}");
+        assert_eq!(spec.stage.as_deref(), Some("ce-execute"));
+        assert!(
+            spec.task
+                .as_deref()
+                .is_some_and(|t| t.starts_with("BEAD: bd-42")),
+            "the bound work order must be named: {spec:?}"
+        );
+    }
+
+    /// bd-3ann1: no bound pin leaves the original dispatch untouched.
+    #[test]
+    fn an_unbound_step_keeps_its_original_dispatch() {
+        let wf = workflow(vec![dispatch_step("review", "reviewer", "ce-review")]);
+        let plan = plan_join(&wf, &four_crew(), &JoinRoles::default(), 8);
+        let bound = apply_join_bindings(&wf, &plan, Some("bd-42"));
+        assert_eq!(
+            format!("{:?}", bound.steps[0]),
+            format!("{:?}", wf.steps[0])
+        );
     }
 
     /// bd-3ann1: always spawning ignores four live crews.

@@ -1287,7 +1287,7 @@ pub(crate) fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // bd-3ann1: an in-flight compose binds to the seats that are
             // already live. The plan is printed before consent; nothing here
             // touches the fleet.
-            let _join_plan = if *join {
+            let join_plan = if *join {
                 let project_name = crate::cron::detect_project(cfg, project.as_deref())
                     .ok_or_else(|| anyhow::anyhow!("workflow compose --join: no project"))?;
                 let seats = join_live_seats(cfg, &project_name);
@@ -1309,6 +1309,16 @@ pub(crate) fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 Some(plan)
             } else {
                 None
+            };
+
+            // bd-3ann1 slice 2: the bound steps really dispatch to their seat,
+            // through the same stage with the bead header, not to a fresh
+            // profile. A dry run renders this document and starts nothing.
+            let composed = if let Some(plan) = &join_plan {
+                let bead = target.split_whitespace().find(|w| w.starts_with("bd-"));
+                crate::compose_join::apply_join_bindings(&composed, plan, bead)
+            } else {
+                composed
             };
 
             if *dry_run {

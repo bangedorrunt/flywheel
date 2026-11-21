@@ -2,7 +2,7 @@
 # and never lets a reviewer audit its own author.
 
 CARGO_ARGS=(--bin flywheel)
-TEST_FILTER=(join_binds_execute_to_crew_and_spawns_only_a_reviewer a_reviewer_seat_is_never_the_author)
+TEST_FILTER=(join_binds_execute_to_crew_and_spawns_only_a_reviewer a_reviewer_seat_is_never_the_author a_bound_step_dispatches_to_the_pin_with_the_bead_header)
 
 mutation "J1  every step spawns a fresh pane" \
     file=src/compose_join.rs \
@@ -15,3 +15,9 @@ mutation "J2  a reviewer may audit its own work" \
     expect=a_reviewer_seat_is_never_the_author \
     find='            reviews_author,' \
     replace='            reviews_author: BTreeSet::new(),'
+
+mutation "J3  a bound step still dispatches to a fresh profile" \
+    file=src/compose_join.rs \
+    expect=a_bound_step_dispatches_to_the_pin_with_the_bead_header \
+    find='            *assignee = pin.clone();' \
+    replace='            let _ = pin;'
