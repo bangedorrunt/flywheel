@@ -195,6 +195,31 @@ pub fn classify(line: &str) -> WakeKind {
     }
 }
 
+/// One plain-English mail body asking a holder to free a path another agent
+/// needs (bd-v7ucf). Names the requester, the paths and the exact read command;
+/// never stack jargon. The same text is copied to the captain.
+pub fn coordination_notice(
+    holder: &str,
+    requester: &str,
+    paths: &[String],
+    project: &str,
+) -> String {
+    let list = paths.join(", ");
+    let scope = if project.is_empty() {
+        String::new()
+    } else {
+        format!(" in project {project}")
+    };
+    let read = if project.is_empty() {
+        "toron next".to_string()
+    } else {
+        format!("toron next --project {project} --as {holder}")
+    };
+    format!(
+        "{holder}: {requester} could not commit {list}{scope} because you hold a file reservation on it. Please release it or reply to their message. Read it with: {read}"
+    )
+}
+
 /// Every canonical golden string. The lint test scans these plus the source
 /// of this module, so a jargon token cannot enter agent-facing text unnoticed.
 pub fn golden_strings() -> Vec<String> {
@@ -216,7 +241,15 @@ pub fn golden_strings() -> Vec<String> {
     ]
     .into_iter()
     .map(|c| render(c, &ctx))
-    .chain([digest("system notice")])
+    .chain([
+        digest("system notice"),
+        coordination_notice(
+            "BoldCliff",
+            "ScarletCove",
+            &["src/a.rs".to_string()],
+            "flywheel",
+        ),
+    ])
     .collect()
 }
 

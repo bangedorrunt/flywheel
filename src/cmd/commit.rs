@@ -286,91 +286,14 @@ fn classify_staged(shared: &Git<'_>, paths: &[String]) -> Result<StagedClass> {
     Ok(class)
 }
 
-/// Mail the holder of a unique staged entry we refused to touch. Best effort:
-/// a missing pin/project or a dead toron degrades to a loud warning, never a
-/// silent skip and never a mutation of the neighbour's stage (bd-himh8).
-fn report_unclassifiable(paths: &[String]) {
-    let (Ok(pin), Ok(project)) = (
-        std::env::var("AGENT_NAME"),
-        std::env::var("FLYWHEEL_PROJECT"),
-    ) else {
-        for path in paths {
-            eprintln!(
-                "flywheel commit: UNIQUE staged content for {path} was left alone; mail the reserving holder"
-            );
-        }
-        return;
-    };
-    for path in paths {
-        let found = Command::new("toron")
-            .args([
-                "reserve",
-                "conflicts",
-                "--project",
-                &project,
-                "--as",
-                &pin,
-                "--paths",
-                path,
-                "--json",
-            ])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
-            .and_then(|v| {
-                v.get("conflicts")?
-                    .as_array()?
-                    .iter()
-                    .filter_map(|c| c.get("holders")?.as_array())
-                    .flatten()
-                    .filter_map(|h| h.as_str().map(str::to_string))
-                    .next()
-            });
-        match found {
-            Some(holder) => {
-                let body = format!(
-                    "flywheel commit left your unique staged change to {path} untouched. Reserve/release or commit it yourself before a plain git commit sweeps it."
-                );
-                let mailed = Command::new("flywheel")
-                    .args([
-                        "mail",
-                        "send",
-                        "--project",
-                        &project,
-                        "--as",
-                        &pin,
-                        "--to",
-                        &holder,
-                        "--subject",
-                        "unique staged path left untouched by flywheel commit",
-                        "--body",
-                        &body,
-                    ])
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-                if !mailed {
-                    eprintln!("flywheel commit: could not mail {holder} about {path}");
-                }
-            }
-            None => eprintln!(
-                "flywheel commit: UNIQUE staged content for {path} has no live reserving holder; mail the last editor"
-            ),
-        }
-    }
-}
-
+/// bd-ahkw1: the live/dead split toron already computes for us.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ReservationVerdict {
-    /// (holder, reservation id) for a hard conflict with a live pin.
     live: Vec<(String, String)>,
-    /// Paths held by a dead or expired pin: safe to revoke.
     dead: Vec<String>,
 }
 
 fn parse_reservations(raw: &str) -> Result<ReservationVerdict> {
-    // bd-ahkw1: an unreadable or empty answer is NEVER "no conflicts".
     let doc: serde_json::Value =
         serde_json::from_str(raw).context("toron reserve conflicts returned no JSON")?;
     let rows = |key: &str| -> Result<Vec<serde_json::Value>> {
@@ -403,6 +326,113 @@ fn parse_reservations(raw: &str) -> Result<ReservationVerdict> {
     Ok(ReservationVerdict { live, dead })
 }
 
+/// Everything needed to turn a coordination warning into one mail to the
+/// holder plus one copy to the captain, deduplicated inside a window
+/// (bd-v7ucf). Built at the CLI edge; tests pass a sandbox-owned fake mailer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CoordinationCtx {
+    requester: String,
+    project: String,
+    captain: String,
+    notice_store: PathBuf,
+    mailer_bin: PathBuf,
+    now_secs: u64,
+}
+
+impl CoordinationCtx {
+    fn from_env() -> Self {
+        let project = std::env::var("FLYWHEEL_PROJECT")
+            .ok()
+            .or_else(|| crate::cron::detect_project(&crate::config::Config::default(), None))
+            .unwrap_or_default();
+        Self {
+            project,
+            requester: std::env::var("AGENT_NAME").unwrap_or_else(|_| "operator".into()),
+            captain: std::env::var("FLYWHEEL_CAPTAIN_PIN").unwrap_or_else(|_| "SlateHarbor".into()),
+            notice_store: crate::config::state_dir().join("coordination-notices.jsonl"),
+            mailer_bin: std::env::var("FLYWHEEL_MAIL_BIN")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("flywheel")),
+            now_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        }
+    }
+}
+
+const NOTICE_WINDOW_SECS: u64 = 600;
+
+/// Send at most one mail per (holder, requester, paths) inside the window.
+/// The holder gets a plain-English notice; the captain gets a copy. A failed
+/// send is a warning, never a reason to let a foreign stage be stripped.
+fn notify_holder(coord: &CoordinationCtx, holder: &str, paths: &[String]) {
+    if holder.is_empty() || holder == coord.requester {
+        return;
+    }
+    let key = format!("{}|{}|{}", holder, coord.requester, paths.join(","));
+    let seen: Vec<(String, u64)> = fs::read_to_string(&coord.notice_store)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    if seen
+        .iter()
+        .any(|(k, ts)| k == &key && coord.now_secs.saturating_sub(*ts) < NOTICE_WINDOW_SECS)
+    {
+        return;
+    }
+    let body = doorbell_core::agent_text::coordination_notice(
+        holder,
+        &coord.requester,
+        paths,
+        &coord.project,
+    );
+    let subject = format!(
+        "flywheel: a file you reserved is needed by {}",
+        coord.requester
+    );
+    let mut sent = true;
+    for to in [holder, coord.captain.as_str()] {
+        let status = Command::new(&coord.mailer_bin)
+            .args([
+                "mail",
+                "send",
+                "--project",
+                &coord.project,
+                "--as",
+                &coord.requester,
+                "--to",
+                to,
+                "--subject",
+                &subject,
+                "--body",
+                &body,
+                "--wake",
+                "tasked",
+            ])
+            .status();
+        if !status.map(|s| s.success()).unwrap_or(false) {
+            sent = false;
+            eprintln!("flywheel commit: could not send coordination mail to {to}");
+        }
+    }
+    if !sent {
+        return;
+    }
+    let mut kept: Vec<(String, u64)> = seen
+        .into_iter()
+        .filter(|(_, ts)| coord.now_secs.saturating_sub(*ts) < NOTICE_WINDOW_SECS)
+        .collect();
+    kept.push((key, coord.now_secs));
+    if let Some(parent) = coord.notice_store.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(
+        &coord.notice_store,
+        serde_json::to_string(&kept).unwrap_or_default(),
+    );
+}
+
 /// Everything the reservation guard needs, gathered ONCE at the CLI edge so
 /// nothing inside the commit path reads or mutates ambient process env. Tests
 /// pass an explicit ctx with a sandbox-owned fake toron (bd-ahkw1 race fix).
@@ -411,6 +441,7 @@ pub(crate) struct ReservationCtx {
     pin: Option<String>,
     project: String,
     toron_bin: PathBuf,
+    coord: Option<CoordinationCtx>,
 }
 
 impl ReservationCtx {
@@ -424,6 +455,7 @@ impl ReservationCtx {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("toron"));
         Self {
+            coord: Some(CoordinationCtx::from_env()),
             pin,
             project,
             toron_bin,
@@ -436,6 +468,60 @@ impl ReservationCtx {
             pin: None,
             project: String::new(),
             toron_bin: PathBuf::from("toron"),
+            coord: None,
+        }
+    }
+}
+
+/// Mail the holder of a unique staged entry we refused to touch (bd-v7ucf).
+/// Best effort: a missing identity, an unreachable toron or a failed send
+/// degrades to a loud warning, never to stripping the neighbour's stage.
+fn report_unclassifiable(paths: &[String], ctx: &ReservationCtx) {
+    let Some((pin, project)) = ctx.pin.as_deref().map(|p| (p, ctx.project.as_str())) else {
+        for path in paths {
+            eprintln!(
+                "flywheel commit: UNIQUE staged content for {path} was left alone; mail the reserving holder"
+            );
+        }
+        return;
+    };
+    for path in paths {
+        let found = Command::new(&ctx.toron_bin)
+            .args([
+                "reserve",
+                "conflicts",
+                "--project",
+                project,
+                "--as",
+                pin,
+                "--paths",
+                path,
+                "--json",
+            ])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+            .and_then(|v| {
+                v.get("conflicts")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|c| c.get("holders")?.as_array())
+                    .flatten()
+                    .filter_map(|h| h.as_str().map(str::to_string))
+                    .next()
+            });
+        match found {
+            Some(holder) => {
+                if let Some(coord) = &ctx.coord {
+                    notify_holder(coord, &holder, std::slice::from_ref(path));
+                } else {
+                    eprintln!("flywheel commit: mail {holder} about the unique stage on {path}");
+                }
+            }
+            None => eprintln!(
+                "flywheel commit: UNIQUE staged content for {path} has no live reserving holder; mail the last editor"
+            ),
         }
     }
 }
@@ -496,6 +582,9 @@ fn guard_commit_reservations(paths: &[String], ctx: &ReservationCtx) -> Result<(
             .status();
     }
     if let Some((holder, id)) = verdict.live.first() {
+        if let Some(coord) = &ctx.coord {
+            notify_holder(coord, holder, paths);
+        }
         bail!(
             "flywheel commit: path reserved exclusively by {holder} (reservation {id}); ask them with `toron reserve request-release --project {project} --as {pin} --target {holder} --reservation-id {id}`"
         );
@@ -631,7 +720,7 @@ where
             class.conflict.join(", ")
         );
     }
-    report_unclassifiable(&class.unclassifiable);
+    report_unclassifiable(&class.unclassifiable, ctx);
 
     let unique = format!(
         "{}-{}",
@@ -1115,6 +1204,7 @@ mod tests {
             pin: Some("ScarletCove".into()),
             project: "flywheel".into(),
             toron_bin: bin,
+            coord: None,
         };
         (ctx, log)
     }
@@ -1189,6 +1279,95 @@ mod tests {
             .to_string();
         assert!(err.contains("toron reserve conflicts failed"), "{err}");
         assert!(err.contains("--no-reservation-check"), "{err}");
+    }
+
+    /// bd-v7ucf: a fake mailer in the sandbox; every argv line is logged.
+    fn fake_mailer(sandbox: &flywheel_test_sandbox::TestSandbox) -> PathBuf {
+        let bin = sandbox.bin_dir().join("fake-mailer");
+        let log = sandbox.root().join("mail.log");
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\nexit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    fn coordination(
+        sandbox: &flywheel_test_sandbox::TestSandbox,
+        now_secs: u64,
+    ) -> CoordinationCtx {
+        CoordinationCtx {
+            requester: "ScarletCove".into(),
+            project: "flywheel".into(),
+            captain: "SlateHarbor".into(),
+            notice_store: sandbox.root().join("notices.json"),
+            mailer_bin: fake_mailer(sandbox),
+            now_secs,
+        }
+    }
+
+    /// bd-v7ucf: B's commit hitting A's lease mails A once (naming the path
+    /// and B), copies the captain, and repeats send nothing in the window.
+    #[test]
+    fn a_foreign_lease_mails_the_holder_once_and_copies_captain() {
+        let sandbox = flywheel_test_sandbox::TestSandbox::new();
+        let (mut ctx, _toron_log) = fake_toron(&sandbox, "hard");
+        ctx.coord = Some(coordination(&sandbox, 1_000));
+        let dir = scratch_repo("coord-mail");
+        fs::write(dir.join("x.rs"), "x\n").unwrap();
+
+        assert!(commit_paths_checked(&dir, &["x.rs".into()], "blocked", false, &ctx).is_err());
+        let log = sandbox.root().join("mail.log");
+        let first = fs::read_to_string(&log).unwrap_or_default();
+        let lines: Vec<&str> = first.lines().collect();
+        assert_eq!(lines.len(), 2, "holder + captain, got: {first}");
+        let holder_line = lines.iter().find(|l| l.contains("--to BoldCliff")).unwrap();
+        assert!(holder_line.contains("--wake tasked"), "{holder_line}");
+        assert!(
+            holder_line.contains("x.rs"),
+            "the path must be named: {holder_line}"
+        );
+        assert!(
+            holder_line.contains("ScarletCove"),
+            "the requester must be named: {holder_line}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("--to SlateHarbor")),
+            "captain copy: {first}"
+        );
+
+        assert!(commit_paths_checked(&dir, &["x.rs".into()], "blocked", false, &ctx).is_err());
+        let second = fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(second, first, "no duplicate mail inside the window");
+    }
+
+    /// bd-v7ucf: past the window the notice is sent again.
+    #[test]
+    fn a_coordination_notice_is_repeated_after_the_window() {
+        let sandbox = flywheel_test_sandbox::TestSandbox::new();
+        let coord = coordination(&sandbox, 1_000);
+        notify_holder(&coord, "BoldCliff", &["x.rs".to_string()]);
+        let log = sandbox.root().join("mail.log");
+        assert_eq!(
+            fs::read_to_string(&log).unwrap_or_default().lines().count(),
+            2
+        );
+
+        let later = CoordinationCtx {
+            now_secs: 1_000 + NOTICE_WINDOW_SECS + 1,
+            ..coord
+        };
+        notify_holder(&later, "BoldCliff", &["x.rs".to_string()]);
+        assert_eq!(
+            fs::read_to_string(&log).unwrap_or_default().lines().count(),
+            4
+        );
     }
 
     /// bd-ahkw1: the escape works but is never silent — the commit records it.
