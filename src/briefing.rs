@@ -308,9 +308,18 @@ pub fn model_intent_from_objective(objective: &str) -> Option<String> {
     None
 }
 
+/// Only spawn/add vehicles carry a per-seat model ask; every other vehicle
+/// (arrive, workflow run/compose, coalition, ...) rejects `--model`.
+fn model_vehicle(argv: &[String]) -> bool {
+    matches!(argv.get(1).map(String::as_str), Some("spawn") | Some("add"))
+}
+
 /// Splice a parsed model intent into the plan argv as an explicit --model ask
 /// (spawn records that as from: user). Idempotent: replaces an earlier one.
 fn splice_model_intent(argv: &mut Vec<String>, objective: &str) {
+    if !model_vehicle(argv) {
+        return;
+    }
     let Some(ask) = model_intent_from_objective(objective) else {
         return;
     };
@@ -700,6 +709,7 @@ pub fn release_sticky_hold(b: &mut Briefing, session: &str, world: &World) {
     } else {
         b.proposal.topology = "swarm".into();
         b.proposal.workflow = "coalition-form".into();
+        b.proposal.argv = vec!["flywheel".into(), "coalition".into(), "form".into()];
     }
     b.proposal.stages = JOIN_STAGES.iter().map(|s| (*s).to_string()).collect();
     b.proposal.why = format!(
@@ -712,7 +722,7 @@ pub fn release_sticky_hold(b: &mut Briefing, session: &str, world: &World) {
         JOIN_STAGES.join(" -> ")
     );
     if let Some(q) = b.questions.iter_mut().find(|q| q.id == "topology") {
-        q.default = "join".to_string();
+        q.default = if world.joinable { "join" } else { "swarm" }.to_string();
     }
 }
 
@@ -1152,6 +1162,34 @@ mod tests {
     }
 
     #[test]
+    fn sticky_hold_contention_releases_a_coalition_argv() {
+        let world = World {
+            project: "flywheel".into(),
+            dispatcher: "up".into(),
+            joinable: false,
+            held_paths: vec!["src/a.rs".into(), "crates/b/src/lib.rs".into()],
+            ..World::default()
+        };
+        let mut b = assemble("fix the login bug", &world, &[], 5, None);
+        assert_ne!(
+            b.proposal.workflow, "coalition-form",
+            "precondition: objective is not already coalition-form"
+        );
+        release_sticky_hold(&mut b, "open", &world);
+        assert_eq!(b.proposal.workflow, "coalition-form");
+        assert_eq!(
+            b.proposal.argv,
+            vec!["flywheel", "coalition", "form"],
+            "release must assign a coalition argv, not keep a stale one"
+        );
+        let q = b.questions.iter().find(|q| q.id == "topology").unwrap();
+        assert_eq!(
+            q.default, "swarm",
+            "topology default must match the released topology, not join"
+        );
+    }
+
+    #[test]
     fn sticky_hold_yields_to_cross_lane_contention() {
         let world = World {
             project: "flywheel".into(),
@@ -1196,6 +1234,22 @@ mod tests {
         assert_eq!(&argv[3..], &["--model", crate::models::HARNESS_DEFAULT]);
         splice_model_intent(&mut argv, "add a pi crew with opencode/x");
         assert_eq!(&argv[3..], &["--model", "opencode/x"], "idempotent replace");
+    }
+
+    #[test]
+    fn briefing_model_intent_never_splices_into_a_non_spawn_vehicle() {
+        let b = assemble("wave-swarm 3 crews with tests", &solo(), &[], 5, None);
+        assert!(
+            !b.proposal.argv.iter().any(|a| a == "--model"),
+            "a workflow vehicle must not carry a model ask: {:?}",
+            b.proposal.argv
+        );
+        let j = assemble("join the fleet with opencode/x", &joinable(), &[], 5, None);
+        assert!(
+            !j.proposal.argv.iter().any(|a| a == "--model"),
+            "an arrive vehicle must not carry a model ask: {:?}",
+            j.proposal.argv
+        );
     }
 
     #[test]
