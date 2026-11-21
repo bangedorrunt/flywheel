@@ -194,7 +194,8 @@ pub fn slot_alias(model: &str) -> Option<&'static str> {
         "cheap" | "free" | "smol" => Some(SLOT_CHEAP),
         "standard" => Some(SLOT_STANDARD),
         "premium" | "slow" | "plan" => Some(SLOT_PREMIUM),
-        "default" => Some(SLOT_STANDARD),
+        // bd-iu00a: "default" is NOT a slot alias. A bare harness means its
+        // own model (HARNESS_DEFAULT); a slot must be named explicitly.
         _ => None,
     }
 }
@@ -609,7 +610,6 @@ impl ModelRegistry {
                 SLOT_CHEAP | "free" | "smol" => Some(SLOT_CHEAP),
                 SLOT_STANDARD => Some(SLOT_STANDARD),
                 SLOT_PREMIUM | "slow" | "plan" => Some(SLOT_PREMIUM),
-                "default" => Some(SLOT_STANDARD),
                 _ => None,
             }
         })?;
@@ -1906,7 +1906,11 @@ mod tests {
         assert_eq!(slot_alias("@free"), Some(SLOT_CHEAP));
         assert_eq!(slot_alias("@smol"), Some(SLOT_CHEAP));
         assert_eq!(slot_alias("@standard"), Some(SLOT_STANDARD));
-        assert_eq!(slot_alias("@default"), Some(SLOT_STANDARD));
+        assert_eq!(
+            slot_alias("@default"),
+            None,
+            "bd-iu00a: default is not a slot"
+        );
         assert_eq!(slot_alias("@premium"), Some(SLOT_PREMIUM));
         assert_eq!(slot_alias("@slow"), Some(SLOT_PREMIUM));
         assert_eq!(slot_alias("@plan"), Some(SLOT_PREMIUM));

@@ -1706,7 +1706,10 @@ mod tests {
             "wA:p1",
             "opencode",
             Some("BlueLake"),
-            reg.as_ref(),
+            crate::cmd::spawn::AddedSeatModel {
+                reg: reg.as_ref(),
+                ask: None,
+            },
         );
         // `record_spawn_entry` keys the absolute project dir; read it back the
         // same way (the hermetic cfg root and the ambient `Config::load` root

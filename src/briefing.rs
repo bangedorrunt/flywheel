@@ -277,6 +277,58 @@ pub fn named_harness(objective: &str) -> Option<&'static str> {
     None
 }
 
+/// bd-iu00a: parse a model intent from the operator's objective. "bare
+/// <harness>" means the harness's own model; "with <model>" or "@tier" names
+/// an explicit model. Returns the ask to record as from: user, or None.
+pub fn model_intent_from_objective(objective: &str) -> Option<String> {
+    let lower = objective.to_ascii_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '@' && c != '/' && c != '-')
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words
+        .windows(2)
+        .any(|w| w[0] == "bare" && crate::harness_registry::spec(w[1]).is_some())
+    {
+        return Some(crate::models::HARNESS_DEFAULT.to_string());
+    }
+    for (i, w) in words.iter().enumerate() {
+        if *w == "with" && i + 1 < words.len() {
+            let next = words[i + 1];
+            if !matches!(next, "a" | "an" | "the" | "model") {
+                return Some(next.to_string());
+            }
+        }
+    }
+    for tier in ["@cheap", "@standard", "@premium"] {
+        if lower.contains(tier) {
+            return Some(tier.to_string());
+        }
+    }
+    None
+}
+
+/// Splice a parsed model intent into the plan argv as an explicit --model ask
+/// (spawn records that as from: user). Idempotent: replaces an earlier one.
+fn splice_model_intent(argv: &mut Vec<String>, objective: &str) {
+    let Some(ask) = model_intent_from_objective(objective) else {
+        return;
+    };
+    let mut i = 0;
+    while i < argv.len() {
+        if argv[i] == "--model" {
+            argv.remove(i);
+            if i < argv.len() {
+                argv.remove(i);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    argv.push("--model".into());
+    argv.push(ask);
+}
+
 fn splice_named_harness(argv: &mut Vec<String>, objective: &str) {
     let Some(kind) = named_harness(objective) else {
         return;
@@ -446,6 +498,7 @@ pub fn assemble_with_catalog(
     }
     splice_project(&mut argv, &world.project);
     splice_named_harness(&mut argv, objective);
+    splice_model_intent(&mut argv, objective);
 
     let mut missing = missing_required_inputs(decision.primitive, objective).to_vec();
     let binds_compose = argv
@@ -575,12 +628,12 @@ pub fn assemble_with_catalog(
             Question {
                 id: "model".into(),
                 options: vec![
-                    "default".into(),
+                    crate::models::HARNESS_DEFAULT.into(),
                     "@cheap".into(),
                     "@standard".into(),
                     "@premium".into(),
                 ],
-                default: "default".into(),
+                default: crate::models::HARNESS_DEFAULT.into(),
             },
         ],
     };
@@ -750,7 +803,7 @@ fn rewrite_sticky_held_argv(
 
 /// Operator remix of the printed questions. Explicit topology is an
 /// AUTHORITATIVE request (sticky-open may flip). `crew` is `N` or `role:n`.
-/// `model` is `default` or an `@slot`. Unknown values fail loud.
+/// `model` is `harness-default` or an `@slot`. Unknown values fail loud.
 pub fn apply_answers(
     b: &mut Briefing,
     topology: Option<&str>,
@@ -789,12 +842,12 @@ pub fn apply_answers(
     }
     if let Some(m) = model {
         let m = m.trim();
-        if !matches!(m, "default" | "@cheap" | "@standard" | "@premium") {
+        if !matches!(m, "harness-default" | "@cheap" | "@standard" | "@premium") {
             return Err(format!(
-                "briefing model {m:?} is not default|@cheap|@standard|@premium"
+                "briefing model {m:?} is not harness-default|@cheap|@standard|@premium"
             ));
         }
-        if m != "default"
+        if m != crate::models::HARNESS_DEFAULT
             && !b.proposal.argv.is_empty()
             && b.proposal.topology == "swarm"
             && !b.proposal.join
@@ -989,6 +1042,41 @@ fn splice_role_models(argv: &mut Vec<String>, specs: &[String]) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn objective_model_intent_maps_bare_and_explicit() {
+        assert_eq!(
+            model_intent_from_objective("add a bare pi crew"),
+            Some(crate::models::HARNESS_DEFAULT.to_string())
+        );
+        assert_eq!(
+            model_intent_from_objective("add a pi crew with opencode/x"),
+            Some("opencode/x".to_string())
+        );
+        assert_eq!(
+            model_intent_from_objective("a cheap coder crew @cheap"),
+            Some("@cheap".to_string())
+        );
+        assert_eq!(model_intent_from_objective("add a crew"), None);
+    }
+
+    #[test]
+    fn objective_model_intent_splices_as_an_explicit_user_ask() {
+        let mut argv = vec!["flywheel".into(), "spawn".into(), "p".into()];
+        splice_model_intent(&mut argv, "add a bare pi crew");
+        assert_eq!(&argv[3..], &["--model", crate::models::HARNESS_DEFAULT]);
+        splice_model_intent(&mut argv, "add a pi crew with opencode/x");
+        assert_eq!(&argv[3..], &["--model", "opencode/x"], "idempotent replace");
+    }
+
+    #[test]
+    fn model_question_offers_harness_default_first() {
+        let b = assemble("add a crew", &solo(), &["coder".into()], 1, None);
+        let q = b.questions.iter().find(|q| q.id == "model").unwrap();
+        assert_eq!(q.options[0], crate::models::HARNESS_DEFAULT);
+        assert_eq!(q.default, crate::models::HARNESS_DEFAULT);
+        assert!(!q.options.iter().any(|o| o == "default"));
+    }
+
     use super::*;
 
     /// ADR-0022 acceptance 2: `briefing --json` carries the plan WITH its

@@ -968,6 +968,10 @@ enum Commands {
         /// bd-koafr: boot assignment per pin (--assign SlateHarbor=bd-a,bd-b).
         #[arg(long = "assign", value_name = "PIN=BEAD[,BEAD]")]
         assign: Vec<String>,
+        /// bd-iu00a: model for the added seats; omitted means harness-default
+        /// (the harness's own model). `--model @standard` names a slot.
+        #[arg(long)]
+        model: Option<String>,
     },
     /// List flywheel swarms and their agents
     List {
@@ -1048,7 +1052,7 @@ enum Commands {
         /// pane budget N or role:n,role:n (binds the crew question)
         #[arg(long)]
         crew: Option<String>,
-        /// model slot: default|@cheap|@standard|@premium (binds the model question)
+        /// model slot: harness-default|@cheap|@standard|@premium (binds the model question)
         #[arg(long)]
         model: Option<String>,
     },
@@ -3356,6 +3360,7 @@ fn main() {
             request_key,
             join_channels,
             assign,
+            model,
         }) => cmd_add(
             &cfg,
             project,
@@ -3366,6 +3371,7 @@ fn main() {
                 request_key: request_key.clone(),
                 join_channels: join_channels.clone(),
                 assign: assign.clone(),
+                model: model.clone(),
             },
         ),
         Some(Commands::List { all }) => cmd_list(&cfg, *all),
@@ -4711,6 +4717,11 @@ fn bare_model_launch(
         crate::models::ModelChoice::Model(id) => id,
     };
     let model = if model.is_empty() {
+        // bd-iu00a: a bare OPEN harness uses its own configured model — no
+        // argv and no env pin. An explicit model or @tier still goes below.
+        if crate::harness_registry::tier_of(harness).is_some_and(|t| t.may_be_asked_for_a_model()) {
+            return Ok((vec![], None));
+        }
         match registry.coupled_default_model(harness) {
             Some(id) => id,
             None if harness == "grok" => {
@@ -11582,7 +11593,7 @@ fn cmd_briefing(
                 .iter()
                 .find(|q| q.id == "model")
                 .map(|q| q.default.as_str())
-                .unwrap_or("default")
+                .unwrap_or(crate::models::HARNESS_DEFAULT)
         );
         let traps_section = crate::cmd::memory::render_traps_section(&b.memory_traps);
         if !traps_section.is_empty() {

@@ -61,15 +61,26 @@ fn dispatcher_workspace<'a>(ws: &'a hc::WorkspaceInfo, label: &'a str) -> &'a st
     }
 }
 
+/// The rex add extras, bundled to keep cmd_add_rex within the arg budget.
+pub(crate) struct RexAddExtras<'a> {
+    pub request_key: Option<&'a str>,
+    pub join_channels: &'a [String],
+    pub model: Option<&'a str>,
+}
+
 pub(crate) fn cmd_add_rex(
     cfg: &Config,
     project: &str,
     counts: &crate::AgentCounts,
     kinds: &[(String, u32)],
     settle_secs: u64,
-    request_key: Option<&str>,
-    join_channels: &[String],
+    extras: RexAddExtras<'_>,
 ) -> Result<()> {
+    let RexAddExtras {
+        request_key,
+        join_channels,
+        model,
+    } = extras;
     crate::check_project_spelling(project, "add")?;
     // A mutating door must not pave over a corrupt fleet: refuse first.
     state::load_spawn_registry_strict(project).map_err(|e| anyhow!("{e}"))?;
@@ -235,7 +246,10 @@ pub(crate) fn cmd_add_rex(
                 &prev,
                 &kind,
                 mail_identity.as_deref(),
-                model_reg.as_ref(),
+                AddedSeatModel {
+                    reg: model_reg.as_ref(),
+                    ask: model,
+                },
             );
             crate::bind_spawn_role(cfg, project, None, short, mail_identity.as_deref())?;
             println!("  {} {}", kind_paint(&kind), prev);
@@ -269,6 +283,26 @@ pub(crate) fn cmd_add_rex(
 /// leave both empty, so `swarm status` showed `-` and the reconciler saw an
 /// empty harness. The model is the harness's fallback route (coupled default,
 /// then the implied slot), the same value a bare spawn would launch.
+/// The model inputs for an added seat: registry plus an optional explicit
+/// ask. One struct keeps `record_added_seat` within clippy's arg budget.
+pub(crate) struct AddedSeatModel<'a> {
+    pub reg: Option<&'a crate::models::ModelRegistry>,
+    pub ask: Option<&'a str>,
+}
+
+impl<'a> AddedSeatModel<'a> {
+    pub fn ask_else_fallback(&self, kind: &str) -> Option<String> {
+        match self.ask.filter(|m| !m.trim().is_empty()) {
+            // bd-iu00a: an explicit --model wins (from: user).
+            Some(ask) => Some(ask.trim().to_string()),
+            None => self
+                .reg
+                .and_then(|r| bare_fallback_model(r, kind))
+                .map(|(choice, _)| choice.as_ask().to_string()),
+        }
+    }
+}
+
 pub(crate) fn record_added_seat(
     cfg: &Config,
     project: &str,
@@ -276,19 +310,14 @@ pub(crate) fn record_added_seat(
     pane_id: &str,
     kind: &str,
     mail_identity: Option<&str>,
-    model_reg: Option<&crate::models::ModelRegistry>,
+    model: AddedSeatModel<'_>,
 ) {
     let mut entry = match mail_identity {
         Some(mid) => state::SpawnEntry::with_mail_identity(pane_id, name, mid),
         None => state::SpawnEntry::legacy(pane_id, name),
     };
     entry.harness = Some(kind.to_string());
-    entry.model = model_reg
-        .and_then(|r| bare_fallback_model(r, kind))
-        .and_then(|(choice, _)| match choice {
-            crate::models::ModelChoice::Model(m) if !m.is_empty() => Some(m),
-            _ => None,
-        });
+    entry.model = model.ask_else_fallback(kind);
     entry.model_pin = entry.model.clone();
     crate::record_spawn_entry(cfg, project, entry);
 }
@@ -303,6 +332,8 @@ pub(crate) struct AddOpts {
     pub request_key: Option<String>,
     pub join_channels: Vec<String>,
     pub assign: Vec<String>,
+    /// bd-iu00a: an optional explicit model ask; None means harness-default.
+    pub model: Option<String>,
 }
 
 pub(crate) fn cmd_add(cfg: &Config, project: &str, opts: AddOpts) -> Result<()> {
@@ -313,6 +344,7 @@ pub(crate) fn cmd_add(cfg: &Config, project: &str, opts: AddOpts) -> Result<()> 
         request_key,
         join_channels,
         assign,
+        model,
     } = opts;
     let counts = &counts;
     let kinds = &kinds;
@@ -342,8 +374,11 @@ pub(crate) fn cmd_add(cfg: &Config, project: &str, opts: AddOpts) -> Result<()> 
             counts,
             kinds,
             settle_secs,
-            request_key,
-            join_channels,
+            RexAddExtras {
+                request_key,
+                join_channels,
+                model: model.as_deref(),
+            },
         );
     }
     let plan = crate::recipe_counts(None, counts, kinds)?;
@@ -514,7 +549,10 @@ pub(crate) fn cmd_add(cfg: &Config, project: &str, opts: AddOpts) -> Result<()> 
                 &agent.pane_id,
                 &kind,
                 mail_identity.as_deref(),
-                model_reg.as_ref(),
+                crate::cmd::spawn::AddedSeatModel {
+                    reg: model_reg.as_ref(),
+                    ask: model.as_deref(),
+                },
             );
             crate::bind_spawn_role(cfg, project, None, short, mail_identity.as_deref())?;
             println!("  {} {}", crate::output::kind_paint(&kind), agent.pane_id);
@@ -1448,6 +1486,14 @@ pub(crate) fn bare_fallback_model(
     {
         return Some((
             ModelChoice::Model(id),
+            crate::swarm_plan::Provenance::HarnessDefault,
+        ));
+    }
+    // bd-iu00a: an OPEN harness with no model ask uses its OWN configured
+    // model. Only a closed/coupled harness keeps the implied slot fallback.
+    if crate::harness_registry::tier_of(harness).is_some_and(|t| t.may_be_asked_for_a_model()) {
+        return Some((
+            ModelChoice::HarnessDefault,
             crate::swarm_plan::Provenance::HarnessDefault,
         ));
     }
@@ -3698,8 +3744,8 @@ mod spawn_profile_plan_tests {
             bare_model_launch("pi", &model_ask(""), "", None)
                 .expect("empty model")
                 .0,
-            vec!["--model", "opencode-go/muse-spark-1.3-contributor"],
-            "bare pi without --model uses the standard slot"
+            Vec::<String>::new(),
+            "bd-iu00a: bare pi without --model uses the harness own model"
         );
     }
 
@@ -3792,15 +3838,15 @@ mod spawn_profile_plan_tests {
         let (args, env_pin) =
             bare_model_launch("opencode", &model_ask(""), "", None).expect("cheap implied");
         assert!(
-            args.is_empty() && env_pin.as_deref() == Some("opencode/big-pickle"),
-            "opencode spawn without --model uses the cheap slot, by env: {args:?} {env_pin:?}"
+            args.is_empty() && env_pin.is_none(),
+            "bd-iu00a: opencode spawn without --model injects nothing: {args:?} {env_pin:?}"
         );
         let (args, env_pin) =
             bare_model_launch("pi", &model_ask(""), "", None).expect("standard implied");
         assert_eq!(
             args,
-            vec!["--model", "opencode-go/muse-spark-1.3-contributor"],
-            "pi spawn without --model uses the standard slot: {args:?}"
+            Vec::<String>::new(),
+            "bd-iu00a: pi spawn without --model injects no model: {args:?}"
         );
         assert_eq!(env_pin, None, "pi rides argv");
         let err = bare_model_launch("grok", &model_ask(""), "", None).expect_err("closed premium");
@@ -8505,6 +8551,44 @@ mod harness_default_model_tests {
             slots,
             user_keys: Default::default(),
             defaults: None,
+        }
+    }
+
+    /// bd-iu00a: a bare spawn of an open harness plans harness-default — no
+    /// slot, no --model in argv, from: harness-default (not user).
+    #[test]
+    fn bare_open_harness_plans_harness_default() {
+        let cfg = crate::config::Config::default();
+        let reg = slot_registry();
+        let catalog = profile::ProfileCatalog::default();
+        let prefs = crate::preferences::PreferenceSet::new();
+        for (short, harness) in [("oc", "opencode"), ("pi", "pi")] {
+            let items = spawn_items_from_plan(vec![(short.to_string(), 1)], None);
+            let plan = build_dry_run_plan(
+                &cfg,
+                &catalog,
+                &reg,
+                &prefs,
+                "test",
+                crate::cmd::spawn::PlanAsk {
+                    items: &items,
+                    bare_model: "",
+                    bare_provider: "",
+                    overrides: &BTreeMap::new(),
+                },
+            )
+            .expect("plan builds");
+            let f = plan.seats[0].model.as_ref().expect("model field");
+            assert_eq!(
+                f.value,
+                crate::models::HARNESS_DEFAULT,
+                "{short}: bare plan"
+            );
+            assert_eq!(f.from, crate::swarm_plan::Provenance::HarnessDefault);
+            let (args, env_pin) = crate::bare_model_launch(harness, &model_ask(&f.value), "", None)
+                .expect("bare launch builds");
+            assert!(args.is_empty(), "{short}: no --model: {args:?}");
+            assert_eq!(env_pin, None, "{short}: no env pin");
         }
     }
 
