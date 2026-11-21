@@ -1,0 +1,5 @@
+{"emitted":[],"lines":0,"exits":0,"exitedOnMail":false}
+{"action":"Mail","params":["m1"],"emitted":["m1"],"lines":1,"exits":0,"exitedOnMail":false}
+{"action":"Stall","params":["s1"],"emitted":["m1","s1"],"lines":2,"exits":0,"exitedOnMail":false}
+{"action":"Preflight","params":["p1"],"emitted":["m1","s1","p1"],"lines":3,"exits":0,"exitedOnMail":false}
+{"action":"ProofDone","params":["pd1"],"emitted":["m1","s1","p1","pd1"],"lines":4,"exits":0,"exitedOnMail":false}

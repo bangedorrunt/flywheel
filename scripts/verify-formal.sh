@@ -132,6 +132,8 @@ expect_pass MailQueue MailQueue
 expect_pass PeerContention PeerContention
 expect_pass ReservationBoard ReservationBoard
 expect_pass ResultMail ResultMail
+expect_pass CaptainWatch CaptainWatch
+expect_pass CaptainWatch CaptainWatch.oneshot
 expect_pass LeaseWaitlist LeaseWaitlist
 expect_pass TrackerCas TrackerCas
 expect_pass EventsDedupe EventsDedupe
@@ -175,6 +177,9 @@ expect_violation MailQueue MailQueue.broken-recorr SameCorr
 expect_violation ResultMail ResultMail.broken-dup-row OwnerNotifiedOnce
 expect_violation ResultMail ResultMail.broken-replay-land LandNotifiedOnce
 expect_violation ResultMail ResultMail.broken-green-mail NoMailOnGreen
+expect_violation CaptainWatch CaptainWatch.broken-drop EveryEventEmitted
+expect_violation CaptainWatch CaptainWatch.broken-exit-on-mail NoExitOnMail
+expect_violation CaptainWatch CaptainWatch.broken-oneshot-emits OneShotUnchanged
 expect_violation TrackerCas TrackerCas.broken-stale-splice NoClosedRowLost
 expect_violation EventsDedupe EventsDedupe.broken-ring-twice AtMostOnceRing
 
@@ -187,6 +192,7 @@ expect_nonconform DeferredQueue "$PWD/$(dirname "$MODELS")/traces/DeferredQueue.
 expect_conform MailQueue "$PWD/$(dirname "$MODELS")/traces/MailQueue.recorded.jsonl"
 expect_nonconform MailQueue "$PWD/$(dirname "$MODELS")/traces/MailQueue.double-delivery.jsonl" 20 "Double"
 expect_conform ResultMail "$PWD/$(dirname "$MODELS")/traces/ResultMail.recorded.jsonl"
+expect_conform CaptainWatch "$PWD/$(dirname "$MODELS")/traces/CaptainWatch.recorded.jsonl"
 expect_conform TrackerCas "$PWD/$(dirname "$MODELS")/traces/TrackerCas.recorded.jsonl"
 expect_nonconform TrackerCas "$PWD/$(dirname "$MODELS")/traces/TrackerCas.stale-splice.jsonl" 20 "CasOk"
 expect_conform LeaseWaitlist "$PWD/$(dirname "$MODELS")/traces/LeaseWaitlist.recorded.jsonl"

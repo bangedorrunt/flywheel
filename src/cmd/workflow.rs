@@ -341,7 +341,7 @@ pub(crate) enum WorkflowCmd {
     /// Check registered statecharts' topology: every state reachable, every reachable leaf can reach
     /// its goal. Guards count as enabled; no model checker runs. Optionally print topology-only TLA+.
     Verify {
-        /// Chart or workflow name: P2PNegotiation, Seat, Plan, LeaseWaitlist, Brief, ResultMail, or a catalog
+        /// Chart or workflow name: P2PNegotiation, Seat, Plan, LeaseWaitlist, Brief, ResultMail, CaptainWatch, or a catalog
         /// workflow (wave-swarm is verified as the workflow now). Omit for all.
         name: Option<String>,
         /// Export compiled TLA+ specification for each verified chart.
@@ -2167,6 +2167,7 @@ fn project_workflow_names(root: &Path) -> BTreeSet<String> {
 
 fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> Result<()> {
     use crate::elm::brief_statechart::build_brief_machine;
+    use crate::elm::captain_watch_statechart::build_captain_watch_machine;
     use crate::elm::lease_waitlist_statechart::build_lease_waitlist_machine;
     use crate::elm::p2p_negotiation::{P2PNegotiationState, build_p2p_negotiation_machine};
     use crate::elm::plan_statechart::build_plan_machine;
@@ -2249,6 +2250,27 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
         )
     }
 
+    fn verify_captain_watch(export_tla: bool) -> WorkflowVerifyChartReport {
+        use toron_core::kernel::StateNodeType;
+        let machine = build_captain_watch_machine();
+        let topology = machine.topology();
+        let is_final = |state: &_| {
+            topology
+                .nodes
+                .get(state)
+                .is_some_and(|node| node.node_type == StateNodeType::Final)
+        };
+        chart_report(
+            "CaptainWatch",
+            &topology,
+            "a final state",
+            is_final,
+            export_tla.then(|| machine.to_tla_named("CaptainWatch")),
+            None,
+            &ChartFindings::default(),
+        )
+    }
+
     fn verify_lease_waitlist(export_tla: bool) -> WorkflowVerifyChartReport {
         use toron_core::kernel::StateNodeType;
         let machine = build_lease_waitlist_machine();
@@ -2302,6 +2324,14 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
     }
     if want_all || matches!(want.as_str(), "plan" | "plan-statechart" | "planstatechart") {
         reports.push(verify_plan(export_tla));
+    }
+    if want_all
+        || matches!(
+            want.as_str(),
+            "captainwatch" | "captain-watch" | "captain-watch-statechart"
+        )
+    {
+        reports.push(verify_captain_watch(export_tla));
     }
     if want_all
         || matches!(
@@ -2369,7 +2399,7 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
     }
     if reports.is_empty() {
         bail!(
-            "unknown statechart {} (expected P2PNegotiation, Seat, Plan, LeaseWaitlist, Brief, ResultMail, or a workflow name)",
+            "unknown statechart {} (expected P2PNegotiation, Seat, Plan, LeaseWaitlist, Brief, ResultMail, CaptainWatch, or a workflow name)",
             name.unwrap_or("")
         );
     }

@@ -57,6 +57,11 @@ pub(crate) enum CaptainCmd {
         /// preflight mode for the arm (steer|loop|workflow|cron)
         #[arg(long, default_value = "loop")]
         preflight_mode: String,
+        /// stream mode: never exit on an event; print one line per mail, stall,
+        /// preflight failure or proof completion so a line-monitor can wake the
+        /// captain per event. One-shot (the default) is unchanged.
+        #[arg(long)]
+        stream: bool,
     },
     /// approve (or deny) a parked hosted steer (ADR-0019 D10): verify the
     /// operator, mail the asker the 4-line body, rehash the payload, and run
@@ -109,6 +114,7 @@ pub(crate) fn cmd_captain(cfg: &Config, cmd: &CaptainCmd) -> Result<()> {
             as_agent,
             preflight,
             preflight_mode,
+            stream,
         } => {
             let pf = if *preflight {
                 Some(preflight::Mode::named(preflight_mode, true).ok_or_else(|| {
@@ -128,6 +134,7 @@ pub(crate) fn cmd_captain(cfg: &Config, cmd: &CaptainCmd) -> Result<()> {
                 *stall_minutes,
                 as_agent.as_deref(),
                 pf,
+                *stream,
             )
         }
         CaptainCmd::Approve {
@@ -361,6 +368,7 @@ fn preflight_arm_exit(
     project: &str,
     mode: preflight::Mode,
     json_out: bool,
+    stream: bool,
 ) -> Option<i32> {
     let checks = preflight::run(cfg, mode, Some(project));
     let (name, msg) = first_failing_check(&checks)?;
@@ -374,7 +382,9 @@ fn preflight_arm_exit(
     } else {
         println!("PREFLIGHT FAILURE in {project}: {name} — {msg}");
     }
-    Some(PREFLIGHT_EXIT)
+    // bd-7ky1v: stream mode is a line source for the harness monitor, never a
+    // one-shot exit. The line is the wake; the watch keeps polling.
+    (!stream).then_some(PREFLIGHT_EXIT)
 }
 
 /// The newest row strictly newer than `baseline_us`, or None. Strict-newer
@@ -498,9 +508,10 @@ fn cmd_captain_watch(
     stall_minutes: u64,
     as_agent: Option<&str>,
     preflight: Option<preflight::Mode>,
+    stream: bool,
 ) -> Result<()> {
     if let Some(mode) = preflight
-        && let Some(code) = preflight_arm_exit(cfg, project, mode, json_out)
+        && let Some(code) = preflight_arm_exit(cfg, project, mode, json_out, stream)
     {
         std::process::exit(code);
     }
@@ -539,6 +550,9 @@ fn cmd_captain_watch(
     let armed_snap =
         crate::snapshot::assemble_with_label(cfg, project, &swarm_label_for(project), armed_now);
     let _ = idle.step(&idle_sample(&mail, project, &key, &armed_snap, &registry)?);
+    // bd-7ky1v: stream mode emits one line per event and never exits. The set
+    // keeps a stall or a repeated preflight failure from printing every poll.
+    let mut emitted: BTreeSet<String> = BTreeSet::new();
     loop {
         std::thread::sleep(std::time::Duration::from_secs(interval));
 
@@ -548,6 +562,29 @@ fn cmd_captain_watch(
         // the arm-time baseline still keeps pre-arm backlog quiet.
         let rows = inbox_rows(&mail, &key, Some("last"))?;
         if let Some(row) = newest_since(&rows, baseline_us) {
+            let sender = row.get("sender").and_then(Value::as_str).unwrap_or("?");
+            let subject = row
+                .get("subject")
+                .and_then(Value::as_str)
+                .unwrap_or("(no subject)");
+            if stream {
+                let key = format!(
+                    "mail:{}",
+                    row.get("id").and_then(Value::as_str).unwrap_or(subject)
+                );
+                if emitted.insert(key) {
+                    if json_out {
+                        print_json(&json!({
+                            "reason": "mail", "project": project,
+                            "sender": sender, "subject": subject,
+                            "water": baseline_rfc, "count": rows.len(),
+                        }));
+                    } else {
+                        println!("mail {sender}: {subject}");
+                    }
+                }
+                continue;
+            }
             if json_out {
                 print_json(&json!({
                     "reason": "mail",
@@ -557,11 +594,6 @@ fn cmd_captain_watch(
                     "newest": row,
                 }));
             } else {
-                let sender = row.get("sender").and_then(Value::as_str).unwrap_or("?");
-                let subject = row
-                    .get("subject")
-                    .and_then(Value::as_str)
-                    .unwrap_or("(no subject)");
                 let thread = row
                     .get("thread_id")
                     .and_then(Value::as_str)
@@ -573,7 +605,7 @@ fn cmd_captain_watch(
         }
 
         if let Some(mode) = preflight
-            && let Some(code) = preflight_arm_exit(cfg, project, mode, json_out)
+            && let Some(code) = preflight_arm_exit(cfg, project, mode, json_out, stream)
         {
             std::process::exit(code);
         }
@@ -587,6 +619,24 @@ fn cmd_captain_watch(
             .into_iter()
             .next()
         {
+            if stream {
+                if emitted.insert(format!("idle:{}", page.pin)) {
+                    if json_out {
+                        print_json(&json!({
+                            "reason": "idle", "project": project,
+                            "pin": page.pin, "subjects": page.subjects,
+                        }));
+                    } else {
+                        println!(
+                            "idle {}: {} unread — {}",
+                            page.pin,
+                            page.subjects.len(),
+                            page.subjects.join(" | ")
+                        );
+                    }
+                }
+                continue;
+            }
             if json_out {
                 print_json(&json!({
                     "reason": "idle",
@@ -623,6 +673,19 @@ fn cmd_captain_watch(
         match stall_verdict(&probe) {
             StallVerdict::Working => continue,
             StallVerdict::AllComplete => {
+                if stream {
+                    if emitted.insert("proof:complete".to_string()) {
+                        if json_out {
+                            print_json(&json!({
+                                "reason": "complete", "project": project,
+                                "work_remaining": false,
+                            }));
+                        } else {
+                            println!("proof finished: all beads complete in {project}");
+                        }
+                    }
+                    continue;
+                }
                 if json_out {
                     print_json(&json!({
                         "reason": "complete",
@@ -638,45 +701,53 @@ fn cmd_captain_watch(
                 let repeats = probe.loop_repeats;
                 let pin = probe.loop_pin.clone().unwrap_or_default();
                 let held = probe.loop_repeat_secs;
-                if json_out {
-                    print_json(&json!({
-                        "reason": "looping",
-                        "project": project,
-                        "pin": pin,
-                        "stall_secs": stall_secs,
-                        "loop_repeats": repeats,
-                        "loop_repeat_secs": held,
-                        "no_commit_secs": probe.last_commit_age_secs.unwrap_or(0),
-                        "work_remaining": true,
-                    }));
-                } else {
-                    println!(
-                        "LOOPING in {project}: {pin} produced the same tail {repeats}x \
-                         over {held}s with no new output — spinning on one error, not progressing"
-                    );
+                if !stream || emitted.insert(format!("looping:{pin}")) {
+                    if json_out {
+                        print_json(&json!({
+                            "reason": "looping",
+                            "project": project,
+                            "pin": pin,
+                            "stall_secs": stall_secs,
+                            "loop_repeats": repeats,
+                            "loop_repeat_secs": held,
+                            "no_commit_secs": probe.last_commit_age_secs.unwrap_or(0),
+                            "work_remaining": true,
+                        }));
+                    } else {
+                        println!(
+                            "LOOPING in {project}: {pin} produced the same tail {repeats}x \
+                             over {held}s with no new output — spinning on one error, not progressing"
+                        );
+                    }
                 }
-                std::process::exit(STALL_EXIT);
+                if !stream {
+                    std::process::exit(STALL_EXIT);
+                }
             }
             StallVerdict::Stalled => {
                 let age = probe.last_commit_age_secs.unwrap_or(0);
-                if json_out {
-                    print_json(&json!({
-                        "reason": "stall",
-                        "project": project,
-                        "stall_secs": stall_secs,
-                        "no_commit_secs": age,
-                        "activity_age_secs": probe.activity_age_secs,
-                        "proof_slot_held": probe.proof_slot_held,
-                        "work_remaining": true,
-                        "panes_working": 0,
-                    }));
-                } else {
-                    println!(
-                        "STALL in {project}: no pane working and no commit for {age}s \
-                         (threshold {stall_secs}s) with work remaining — page the fleet"
-                    );
+                if !stream || emitted.insert("stall".to_string()) {
+                    if json_out {
+                        print_json(&json!({
+                            "reason": "stall",
+                            "project": project,
+                            "stall_secs": stall_secs,
+                            "no_commit_secs": age,
+                            "activity_age_secs": probe.activity_age_secs,
+                            "proof_slot_held": probe.proof_slot_held,
+                            "work_remaining": true,
+                            "panes_working": 0,
+                        }));
+                    } else {
+                        println!(
+                            "STALL in {project}: no pane working and no commit for {age}s \
+                             (threshold {stall_secs}s) with work remaining — page the fleet"
+                        );
+                    }
                 }
-                std::process::exit(STALL_EXIT);
+                if !stream {
+                    std::process::exit(STALL_EXIT);
+                }
             }
         }
     }
@@ -2203,5 +2274,27 @@ mod tests {
             crate::captain_directory::resolve_address(&snap, "bead:bd-1", "LivePin"),
             Err(e) if e.code() == "file_held"
         ));
+    }
+
+    /// bd-7ky1v: the wiring is a source-level contract — one-shot still exits,
+    /// stream mode only emits and keeps polling.
+    #[test]
+    fn captain_watch_stream_wiring_keeps_the_one_shot_exits_guarded() {
+        let src = include_str!("captain.rs");
+        let watch = crate::tripwire::fn_body(src, "cmd_captain_watch");
+        assert!(
+            watch.contains("stream: bool"),
+            "watch takes the stream flag"
+        );
+        assert!(watch.contains("if stream {"), "stream branch emits a line");
+        assert!(
+            watch.contains("if !stream || emitted.insert("),
+            "repeated events are emitted once in stream mode"
+        );
+        let preflight = crate::tripwire::fn_body(src, "preflight_arm_exit");
+        assert!(
+            preflight.contains("(!stream).then_some(PREFLIGHT_EXIT)"),
+            "stream mode never exits on a preflight failure"
+        );
     }
 }

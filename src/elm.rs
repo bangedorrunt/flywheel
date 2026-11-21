@@ -16,6 +16,7 @@
 //! single framework copy in its lockfile.
 
 pub mod brief_statechart;
+pub mod captain_watch_statechart;
 pub mod inbox;
 pub mod leaf;
 pub mod lease_waitlist_statechart;
