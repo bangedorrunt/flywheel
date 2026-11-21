@@ -224,17 +224,21 @@ pub fn apply_opencode_events_config(
 /// own agentDir. Never touches the operator's ~/.pi: we READ the operator
 /// settings (for model/provider) but write only a per-seat copy under the
 /// flywheel state dir. The token is a PATH in the env, never plaintext.
-/// bd-zc7b4: resolve the pi events extension from the build source first
-/// (development), then from the installed data-home copy (after a proof-export
-/// install cleans the source). `None` means "use the doorbell fallback".
+/// bd-zc7b4: resolve the pi events extension. The build source is consulted
+/// ONLY when the caller explicitly names one (FLYWHEEL_SOURCE in dev); the
+/// durable location is the installed copy under the data home. A live seat
+/// must never point into a proof export that is about to be cleaned. `None`
+/// means "use the doorbell fallback".
 pub(crate) fn resolve_pi_extension(
-    source: &str,
+    source: Option<&str>,
     data_home: &std::path::Path,
 ) -> Option<std::path::PathBuf> {
-    let from_source =
-        std::path::Path::new(source).join("extensions/pi-flywheel-events/src/index.ts");
-    if from_source.is_file() {
-        return Some(from_source);
+    if let Some(source) = source {
+        let from_source =
+            std::path::Path::new(source).join("extensions/pi-flywheel-events/src/index.ts");
+        if from_source.is_file() {
+            return Some(from_source);
+        }
     }
     let installed = data_home.join("flywheel/extensions/pi-flywheel-events/src/index.ts");
     if installed.is_file() {
@@ -243,22 +247,33 @@ pub(crate) fn resolve_pi_extension(
     None
 }
 
+/// Edge: read process env once, then delegate to the env-free inner function.
+/// No compile-time CARGO_MANIFEST_DIR default — that path is a proof export.
 pub fn apply_pi_events_config(
     env: &mut std::collections::BTreeMap<String, String>,
     project: &str,
     pin: &str,
     token_path: &std::path::Path,
 ) -> anyhow::Result<()> {
-    let source =
-        std::env::var("FLYWHEEL_SOURCE").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string());
+    let source = std::env::var("FLYWHEEL_SOURCE").ok();
     let data_home = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
         let home = std::env::var("HOME").unwrap_or_default();
         format!("{home}/.local/share")
     });
-    // bd-zc7b4: the proof-export source path is deleted after install, so the
-    // installed copy under the data home is the durable location. A missing
-    // extension is NOT fatal: the doorbell wake stays the fallback.
-    let Some(extension) = resolve_pi_extension(&source, std::path::Path::new(&data_home)) else {
+    apply_pi_events_config_inner(env, project, pin, token_path, source.as_deref(), &data_home)
+}
+
+/// Pure w.r.t. ambient env: the caller supplies the optional source and the
+/// data home. A missing extension is NOT fatal — doorbell stays the fallback.
+pub(crate) fn apply_pi_events_config_inner(
+    env: &mut std::collections::BTreeMap<String, String>,
+    project: &str,
+    pin: &str,
+    token_path: &std::path::Path,
+    source: Option<&str>,
+    data_home: &str,
+) -> anyhow::Result<()> {
+    let Some(extension) = resolve_pi_extension(source, std::path::Path::new(data_home)) else {
         eprintln!(
             "flywheel: pi events extension not found (source or data home); using doorbell fallback"
         );
@@ -3446,19 +3461,19 @@ mod bd_o1z4m_events_config_tests {
         let src = tmp.join("src");
         let data = tmp.join("data");
         let rel = "extensions/pi-flywheel-events/src/index.ts";
-        assert!(super::resolve_pi_extension(src.to_str().unwrap(), &data).is_none());
+        assert!(super::resolve_pi_extension(Some(src.to_str().unwrap()), &data).is_none());
         let installed = data.join("flywheel").join(rel);
         std::fs::create_dir_all(installed.parent().unwrap()).expect("mkdir");
         std::fs::write(&installed, "// installed").expect("write");
         assert_eq!(
-            super::resolve_pi_extension(src.to_str().unwrap(), &data),
+            super::resolve_pi_extension(Some(src.to_str().unwrap()), &data),
             Some(installed.clone())
         );
         let from_source = src.join(rel);
         std::fs::create_dir_all(from_source.parent().unwrap()).expect("mkdir");
         std::fs::write(&from_source, "// source").expect("write");
         assert_eq!(
-            super::resolve_pi_extension(src.to_str().unwrap(), &data),
+            super::resolve_pi_extension(Some(src.to_str().unwrap()), &data),
             Some(from_source)
         );
         let _ = std::fs::remove_dir_all(&tmp);
@@ -3466,35 +3481,20 @@ mod bd_o1z4m_events_config_tests {
 
     #[test]
     fn a_missing_pi_extension_returns_ok_without_a_package_so_the_doorbell_falls_back() {
-        let _g = crate::config::lock_env();
         let tmp = std::env::temp_dir().join(format!("fw-pi-missing-{}", std::process::id()));
         let src = tmp.join("empty-src");
         let data = tmp.join("empty-data");
         std::fs::create_dir_all(&src).expect("mkdir");
         std::fs::create_dir_all(&data).expect("mkdir");
-        let old_source = std::env::var_os("FLYWHEEL_SOURCE");
-        let old_data = std::env::var_os("XDG_DATA_HOME");
-        unsafe {
-            std::env::set_var("FLYWHEEL_SOURCE", &src);
-            std::env::set_var("XDG_DATA_HOME", &data);
-        }
         let mut env = BTreeMap::new();
-        let result = super::apply_pi_events_config(
+        let result = super::apply_pi_events_config_inner(
             &mut env,
             "demo",
             "BoldCliff",
             Path::new("/tmp/state/tokens/sc.token"),
+            Some(src.to_str().unwrap()),
+            data.to_str().unwrap(),
         );
-        unsafe {
-            match old_source {
-                Some(v) => std::env::set_var("FLYWHEEL_SOURCE", v),
-                None => std::env::remove_var("FLYWHEEL_SOURCE"),
-            }
-            match old_data {
-                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-                None => std::env::remove_var("XDG_DATA_HOME"),
-            }
-        }
         assert!(
             result.is_ok(),
             "a missing optional door must not fail spawn: {result:?}"
@@ -3502,6 +3502,34 @@ mod bd_o1z4m_events_config_tests {
         assert!(
             !env.contains_key("PI_CODING_AGENT_DIR"),
             "no pi seat without the extension"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn an_installed_extension_is_used_when_no_source_is_named() {
+        let tmp = std::env::temp_dir().join(format!("fw-pi-installed-{}", std::process::id()));
+        let data = tmp.join("data");
+        let rel = "flywheel/extensions/pi-flywheel-events/src/index.ts";
+        let installed = data.join(rel);
+        std::fs::create_dir_all(installed.parent().unwrap()).expect("mkdir");
+        std::fs::write(&installed, "// installed").expect("write");
+        let mut env = BTreeMap::new();
+        let result = super::apply_pi_events_config_inner(
+            &mut env,
+            "demo",
+            "BoldCliff",
+            Path::new("/tmp/state/tokens/sc.token"),
+            None,
+            data.to_str().unwrap(),
+        );
+        assert!(
+            result.is_ok(),
+            "installed extension must configure the seat: {result:?}"
+        );
+        assert!(
+            env.contains_key("PI_CODING_AGENT_DIR"),
+            "the installed copy yields a pi seat"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
