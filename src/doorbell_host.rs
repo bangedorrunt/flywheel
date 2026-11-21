@@ -2390,11 +2390,8 @@ mod parity_tests {
     #[test]
     fn a_watch_line_without_a_prompt_leaves_the_claim_free() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let line = doorbell_core::doorbell_line_with_event(
-            doorbell_core::EventClass::PlanePMail,
-            "toron next",
-            "evt-gated",
-        );
+        let line =
+            doorbell_core::doorbell_line(doorbell_core::EventClass::PlanePMail, "toron next");
         let effects = vec![Effect::FetchInbox];
         let kept = super::claim_and_gate(dir.path(), &line, effects);
         assert!(!kept.iter().any(|e| matches!(e, Effect::Prompt { .. })));
@@ -2407,11 +2404,8 @@ mod parity_tests {
     #[test]
     fn a_deferred_wake_claims_when_it_rings_and_is_silent_if_native_won() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let line = doorbell_core::doorbell_line_with_event(
-            doorbell_core::EventClass::PlanePMail,
-            "toron next",
-            "evt-deferred",
-        );
+        let line =
+            doorbell_core::doorbell_line(doorbell_core::EventClass::PlanePMail, "toron next");
         let effects = vec![Effect::Prompt {
             // bd-ofa1s: typed id, never parsed from the plain-language line.
             event_id: Some("evt-deferred".into()),

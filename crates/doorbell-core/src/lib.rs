@@ -733,13 +733,6 @@ pub fn is_p2p_wake(line: &str) -> bool {
         || lower.contains("direct message from")
 }
 
-/// Trust-aware line that carries the triggering event id for proof (gap 17).
-pub fn doorbell_line_with_event(class: EventClass, hint: &str, _event_id: &str) -> String {
-    // bd-ofa1s/bd-tdpix: the event id is typed data carried beside the wake;
-    // it is never appended to the plain-language wake text.
-    doorbell_line(class, hint)
-}
-
 /// Parse `--status pin=idle` pairs for the hc-mock (`__doorbell --once`).
 pub fn parse_status_pair(s: &str) -> Option<(String, String)> {
     let (pin, st) = s.split_once('=')?;

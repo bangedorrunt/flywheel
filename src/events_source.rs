@@ -11,12 +11,9 @@ use doorbell_rt::BrainMsg;
 
 /// Canonical pull line. `toron next` classifies as `AtIdle` (a real mail
 /// wake); `SYSTEM_NOTICE_HINT` would be a silent notice that never rings.
-pub fn mail_line(event_id: &str) -> String {
-    doorbell_core::doorbell_line_with_event(
-        doorbell_core::EventClass::PlanePMail,
-        "toron next",
-        event_id,
-    )
+pub fn mail_line() -> String {
+    // bd-ofa1s: the event id rides as typed data on BrainMsg::EventsHint.
+    doorbell_core::doorbell_line(doorbell_core::EventClass::PlanePMail, "toron next")
 }
 
 /// Pure: one events-kernel command -> the brain input that feeds the existing
@@ -34,10 +31,7 @@ pub fn cmd_to_brain(pin: &str, cmd: &BridgeCmd) -> Option<BrainMsg> {
                 Some(BrainMsg::EventsHint {
                     event_id: notice.event_id.clone(),
                     pin: pin.to_string(),
-                    // bd-tdpix: the watch line MUST carry this same bus event
-                    // id, or the doorbell claims a different key than the
-                    // native paths and both ring.
-                    line: mail_line(&notice.event_id),
+                    line: mail_line(),
                 })
             }
         }
@@ -218,7 +212,7 @@ mod tests {
 
     #[test]
     fn the_events_line_is_a_real_mail_wake_not_a_silent_notice() {
-        let line = mail_line("bus-evt");
+        let line = mail_line();
         assert_eq!(
             doorbell_core::wake_kind_of_line(&line),
             doorbell_core::WakeKind::AtIdle,
@@ -243,9 +237,13 @@ mod tests {
         };
         assert_eq!(event_id, "bus-evt-777");
         assert_eq!(
-            doorbell_core::watch_id(&line).as_deref(),
-            Some("bus-evt-777"),
-            "the doorbell must claim the same id the native paths claim"
+            event_id.as_str(),
+            "bus-evt-777",
+            "the id is typed data on EventsHint, never parsed from the line"
+        );
+        assert!(
+            doorbell_core::watch_id(&line).is_none(),
+            "the plain-language wake carries no event id in prose"
         );
     }
 
