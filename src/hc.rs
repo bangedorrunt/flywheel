@@ -260,7 +260,14 @@ pub fn apply_pi_events_config(
         let home = std::env::var("HOME").unwrap_or_default();
         format!("{home}/.local/share")
     });
-    apply_pi_events_config_inner(env, project, pin, token_path, source.as_deref(), &data_home)
+    apply_pi_events_config_inner(
+        env,
+        project,
+        pin,
+        token_path,
+        source.as_deref(),
+        std::path::Path::new(&data_home),
+    )
 }
 
 /// Pure w.r.t. ambient env: the caller supplies the optional source and the
@@ -271,9 +278,9 @@ pub(crate) fn apply_pi_events_config_inner(
     pin: &str,
     token_path: &std::path::Path,
     source: Option<&str>,
-    data_home: &str,
+    data_home: &std::path::Path,
 ) -> anyhow::Result<()> {
-    let Some(extension) = resolve_pi_extension(source, std::path::Path::new(data_home)) else {
+    let Some(extension) = resolve_pi_extension(source, data_home) else {
         eprintln!(
             "flywheel: pi events extension not found (source or data home); using doorbell fallback"
         );
@@ -3493,7 +3500,7 @@ mod bd_o1z4m_events_config_tests {
             "BoldCliff",
             Path::new("/tmp/state/tokens/sc.token"),
             Some(src.to_str().unwrap()),
-            data.to_str().unwrap(),
+            &data,
         );
         assert!(
             result.is_ok(),
@@ -3521,7 +3528,7 @@ mod bd_o1z4m_events_config_tests {
             "BoldCliff",
             Path::new("/tmp/state/tokens/sc.token"),
             None,
-            data.to_str().unwrap(),
+            &data,
         );
         assert!(
             result.is_ok(),
