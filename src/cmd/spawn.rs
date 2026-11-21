@@ -1283,6 +1283,67 @@ pub(crate) fn pi_style_events_kind(kind: &str) -> bool {
     matches!(kind, "pi" | "omp")
 }
 
+/// bd-rrlo2: harnesses whose seats get a per-pin events token minted at
+/// spawn. Config-file bridges (opencode, pi/omp) and the pump's
+/// events-only seats (gemini/antigravity/grok/codex); every other kind
+/// keeps the doorbell fallback and no token file.
+pub(crate) fn has_events_door(kind: &str) -> bool {
+    let canonical = crate::harness_registry::canonical(kind);
+    crate::events_source::events_only_harness(&canonical)
+        || matches!(canonical.as_str(), "opencode" | "pi" | "omp")
+}
+
+/// bd-rrlo2: outcome of the spawn-time token ensure, for logs and tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SeatTokenOutcome {
+    Minted,
+    Rotated,
+    Current,
+}
+
+/// bd-rrlo2: make sure the seat's token file exists before launch, minting
+/// (journaled, 0600, TTL) or rotating via the existing rotation when due.
+/// A missing journal beside an existing file re-mints to heal it. Never
+/// writes plaintext anywhere but the 0600 file.
+pub(crate) fn ensure_seat_events_token<C: crate::events_tokens::TokenCli>(
+    cli: &C,
+    state_dir: &std::path::Path,
+    project: &str,
+    pin: &str,
+    now_us: i64,
+) -> Result<SeatTokenOutcome, String> {
+    use crate::events_tokens as et;
+    let token_path = et::token_path(state_dir, project, pin);
+    let journal = state_dir.join("events-token-journal.jsonl");
+    if token_path.is_file()
+        && let Ok((hash, expires_us)) = et::last_minted(&journal)
+    {
+        let state = et::TokenState {
+            hash,
+            minted_us: 0,
+            expires_us,
+            path: token_path.display().to_string(),
+        };
+        if let Some(plan) =
+            et::rotation_plan(&state, now_us, (et::ROTATE_BEFORE_SECS as i64) * 1_000_000)
+        {
+            et::rotate(cli, &plan, pin, project, &token_path, &journal, now_us)?;
+            return Ok(SeatTokenOutcome::Rotated);
+        }
+        return Ok(SeatTokenOutcome::Current);
+    }
+    et::mint_and_store(
+        cli,
+        pin,
+        project,
+        et::PIN_TTL_SECS,
+        &token_path,
+        &journal,
+        now_us,
+    )?;
+    Ok(SeatTokenOutcome::Minted)
+}
+
 pub(crate) fn mint_harness_session(kind: &str, args: &mut Vec<String>) -> Option<String> {
     if crate::harness_registry::canonical(kind) != "opencode" {
         return None;
@@ -2128,6 +2189,29 @@ projects available: {}",
                 }
             };
             let mut pane_env = hc::plane_launch_env(cfg, mail_identity.as_deref());
+            // bd-rrlo2: mint the per-pin events token before launch so the
+            // config branches below find a file; without one they keep the
+            // doorbell fallback. Fail-open: a mint failure warns and the
+            // seat still spawns.
+            if has_events_door(&kind)
+                && let Some(pin) = mail_identity.as_deref()
+            {
+                let cli = crate::events_tokens::ToronTokenCli {
+                    bin: std::env::var("TORON_BIN").unwrap_or_else(|_| "toron".to_string()),
+                };
+                let now_us = chrono::Utc::now().timestamp_micros();
+                if let Err(e) = ensure_seat_events_token(
+                    &cli,
+                    &crate::config::state_dir(),
+                    project,
+                    pin,
+                    now_us,
+                ) {
+                    eprintln!(
+                        "flywheel: warn: events token mint failed for {pin}: {e}; using doorbell fallback"
+                    );
+                }
+            }
             // bd-9os20/bd-mdpfr: Claude's flywheel plugin is delivered per seat
             // from the installed data dir (ScarletCove copies it in stack.sh).
             if crate::harness_registry::canonical(&kind) == "claude" {
@@ -3538,6 +3622,114 @@ mod spawn_profile_plan_tests {
                 "{kind} keeps its own path"
             );
         }
+    }
+
+    struct FakeMint {
+        calls: std::cell::Cell<usize>,
+    }
+    impl crate::events_tokens::TokenCli for FakeMint {
+        fn mint(&self, _pin: &str, _project: &str, _ttl: u64) -> Result<String, String> {
+            let n = self.calls.get();
+            self.calls.set(n + 1);
+            Ok(format!("secret-token-{n}"))
+        }
+        fn revoke(&self, _hash: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// bd-rrlo2: only harnesses with an events door get a token minted —
+    /// config-file bridges plus the pump's no-door seats.
+    #[test]
+    fn only_events_door_harnesses_get_a_token() {
+        for kind in [
+            "opencode",
+            "oc",
+            "pi",
+            "omp",
+            "gemini",
+            "antigravity",
+            "grok",
+            "codex",
+        ] {
+            assert!(super::has_events_door(kind), "{kind} has an events door");
+        }
+        for kind in ["claude", "codex-unknown", "", "Muse"] {
+            assert!(
+                !super::has_events_door(kind),
+                "{kind} keeps the doorbell fallback"
+            );
+        }
+    }
+
+    /// bd-rrlo2: spawning a pi, opencode and gemini seat mints a 0600 token
+    /// file plus a journal row without plaintext; a second pass reuses the
+    /// file, and an expired token rotates. A skipped mint leaves nothing.
+    #[test]
+    fn spawn_mints_a_per_pin_token_before_launch() {
+        let _home = crate::config::test_state_home();
+        let state = crate::config::state_dir();
+        let cli = FakeMint {
+            calls: std::cell::Cell::new(0),
+        };
+        let now_us = 5_000_000i64;
+        for pin in ["PiSeat", "OpencodeSeat", "GeminiSeat"] {
+            let outcome =
+                super::ensure_seat_events_token(&cli, &state, "demo", pin, now_us).expect("mint");
+            assert_eq!(outcome, super::SeatTokenOutcome::Minted, "{pin}");
+            let token_path = crate::events_tokens::token_path(&state, "demo", pin);
+            assert!(token_path.is_file(), "{pin} token file exists");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = std::fs::metadata(&token_path)
+                    .expect("meta")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o600, "the token file must be 0600: {mode:o}");
+            }
+        }
+        let journal =
+            std::fs::read_to_string(state.join("events-token-journal.jsonl")).expect("journal");
+        assert!(
+            !journal.contains("secret-token"),
+            "the journal carries hashes, never plaintext"
+        );
+        assert!(
+            journal.contains("\"op\":\"minted\""),
+            "every mint is journaled: {journal}"
+        );
+        // A second pass reuses the file: no re-mint.
+        let outcome = super::ensure_seat_events_token(&cli, &state, "demo", "PiSeat", now_us + 1)
+            .expect("reuse");
+        assert_eq!(outcome, super::SeatTokenOutcome::Current);
+        assert_eq!(cli.calls.get(), 3, "no re-mint while current");
+        // An expired token rotates: new file content, revoke covered by
+        // the rotate unit tests.
+        let late = now_us + (crate::events_tokens::PIN_TTL_SECS as i64 + 10) * 1_000_000;
+        let outcome =
+            super::ensure_seat_events_token(&cli, &state, "demo", "PiSeat", late).expect("rotate");
+        assert_eq!(outcome, super::SeatTokenOutcome::Rotated);
+        // The pump sees the minted seats under the default config.
+        let seats = [
+            ("pi", "PiSeat"),
+            ("opencode", "OpencodeSeat"),
+            ("gemini", "GeminiSeat"),
+        ]
+        .into_iter()
+        .map(|(harness, pin)| {
+            let token = crate::events_tokens::token_path(&state, "demo", pin).is_file();
+            (harness.to_string(), Some(pin.to_string()), token)
+        })
+        .collect::<Vec<_>>();
+        let enabled = crate::config::Config::default().doorbell_toron_events();
+        assert!(enabled, "minted tokens switch the default pump on");
+        assert_eq!(
+            crate::events_source::seats_to_pump(enabled, &seats),
+            vec!["GeminiSeat".to_string()],
+            "the pump covers the no-door seat once its token exists (pi/opencode ride their own config)"
+        );
     }
 
     use crate::{

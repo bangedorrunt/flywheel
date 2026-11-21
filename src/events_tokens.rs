@@ -320,6 +320,14 @@ pub fn last_minted(journal_path: &Path) -> Result<(String, i64), String> {
     Err("no minted row in token journal".to_string())
 }
 
+/// Whether any per-pin events token file exists under the state dir
+/// (bd-rrlo2): the doorbell pump turns on by default once tokens exist.
+pub fn any_token_file(state_dir: &Path) -> bool {
+    std::fs::read_dir(state_dir.join("events-tokens"))
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
+}
+
 /// Where the per-seat token lives. Under the seat's state dir, never in the
 /// MCP config (which carries only this path via FLYWHEEL_TORON_TOKEN_FILE).
 pub fn token_path(state_dir: &Path, project: &str, pin: &str) -> PathBuf {

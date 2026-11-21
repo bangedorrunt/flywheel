@@ -208,6 +208,75 @@ fn binary_json(binary: &BinaryProbe) -> Value {
     })
 }
 
+/// bd-rrlo2: seats with an events door but no token file, as
+/// (project label, pin, harness). Pure over rows + the tokened pin set so
+/// the scan stays testable; the live wiring below feeds both halves.
+/// Rows for harnesses without an events door never count as tokenless —
+/// they ride the doorbell by design.
+fn tokenless_events_seats(
+    rows: &[(String, String, String)],
+    token_pins: &std::collections::HashSet<String>,
+) -> Vec<(String, String, String)> {
+    rows.iter()
+        .filter(|(_, pin, harness)| {
+            !token_pins.contains(pin) && crate::cmd::spawn::has_events_door(harness)
+        })
+        .cloned()
+        .collect()
+}
+
+/// bd-rrlo2: every registered events-door seat (project label, pin,
+/// harness) across all project registries, plus every pin with a token
+/// file on disk. A seat is tokenless when its pin names no token file —
+/// matched by pin, never by project slug, so registry-key spellings
+/// cannot manufacture a false missing.
+fn events_seats_and_tokens() -> (
+    Vec<(String, String, String)>,
+    std::collections::HashSet<String>,
+) {
+    let mut rows = Vec::new();
+    let dir = crate::state::agents_dir();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(seats) = serde_json::from_str::<Vec<crate::state::SpawnEntry>>(&raw) else {
+                continue;
+            };
+            let project = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            for seat in seats {
+                let (Some(pin), Some(harness)) = (seat.mail_identity.clone(), seat.harness.clone())
+                else {
+                    continue;
+                };
+                rows.push((project.clone(), pin, harness));
+            }
+        }
+    }
+    let mut token_pins = std::collections::HashSet::new();
+    let token_dir = crate::config::state_dir().join("events-tokens");
+    if let Ok(entries) = std::fs::read_dir(&token_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(stem) = name.strip_suffix(".token") else {
+                continue;
+            };
+            if let Some((_, pin)) = stem.rsplit_once('-') {
+                token_pins.insert(pin.to_string());
+            }
+        }
+    }
+    (rows, token_pins)
+}
+
 fn stack_status(json_output: bool, check: bool) -> Result<()> {
     let binaries = [
         probe_bin("flywheel"),
@@ -263,6 +332,11 @@ fn stack_status(json_output: bool, check: bool) -> Result<()> {
         })
         .unwrap_or_default();
     let (toron, toron_error) = toron_status();
+    // bd-rrlo2: report events-door seats without a token file. Display
+    // only: a missing token degrades a seat to the doorbell fallback, it
+    // never fails the stack.
+    let (seat_rows, token_pins) = events_seats_and_tokens();
+    let tokenless = tokenless_events_seats(&seat_rows, &token_pins);
     let toron_restart_required = toron
         .as_ref()
         .and_then(|value| value.pointer("/build/restart_required"))
@@ -300,6 +374,14 @@ fn stack_status(json_output: bool, check: bool) -> Result<()> {
                 "status": toron,
                 "error": toron_error,
                 "restart_required": toron_restart_required,
+            },
+            "events_tokens": {
+                "missing": tokenless
+                    .iter()
+                    .map(|(project, pin, harness)| {
+                        json!({"project": project, "pin": pin, "harness": harness})
+                    })
+                    .collect::<Vec<_>>(),
             },
         }));
     } else {
@@ -410,6 +492,16 @@ fn stack_status(json_output: bool, check: bool) -> Result<()> {
                 "status unavailable: {}",
                 toron_error.as_deref().unwrap_or("unknown failure")
             ),
+        }
+
+        println!("\n== events tokens ==");
+        if tokenless.is_empty() {
+            println!("all events-door seats have a token");
+        } else {
+            println!("seats without a token (doorbell fallback):");
+            for (project, pin, harness) in &tokenless {
+                println!("  {project} {pin} ({harness})");
+            }
         }
 
         println!("\nstack: {}", if bad { "FAILED" } else { "ok" });
@@ -536,5 +628,44 @@ mod tests {
             ]
         });
         assert!(super::stale_host_pids(&health, "new").is_empty());
+    }
+
+    /// bd-rrlo2: tokenless reporting is a pin-set difference — a seat
+    /// counts as tokened when its pin names any token file, whatever the
+    /// registry-key spelling of its project.
+    #[test]
+    fn tokenless_seats_match_by_pin_not_project() {
+        let rows = vec![
+            (
+                "flywheel".to_string(),
+                "PiPin".to_string(),
+                "pi".to_string(),
+            ),
+            (
+                "other".to_string(),
+                "GemPin".to_string(),
+                "gemini".to_string(),
+            ),
+            (
+                "flywheel".to_string(),
+                "ClaudePin".to_string(),
+                "claude".to_string(),
+            ),
+        ];
+        let tokened: std::collections::HashSet<String> =
+            ["PiPin".to_string()].into_iter().collect();
+        assert_eq!(
+            super::tokenless_events_seats(&rows, &tokened),
+            vec![(
+                "other".to_string(),
+                "GemPin".to_string(),
+                "gemini".to_string()
+            )],
+            "only the tokenless events-door seat is reported"
+        );
+        assert!(
+            super::tokenless_events_seats(&[], &tokened).is_empty(),
+            "no seats, no report"
+        );
     }
 }

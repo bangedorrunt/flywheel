@@ -1317,6 +1317,22 @@ mutations = [
 ]
 
 [[behavior]]
+id = "events-token-mint-on-spawn"
+owner = "src/cmd/spawn.rs"
+status = "proven"
+concurrent = false
+tests = [
+  "src/cmd/spawn.rs::only_events_door_harnesses_get_a_token",
+  "src/cmd/spawn.rs::spawn_mints_a_per_pin_token_before_launch",
+  "src/config.rs::toron_events_default_follows_minted_tokens",
+  "src/cmd/stack.rs::tokenless_seats_match_by_pin_not_project",
+]
+mutations = [
+  "scripts/mutations/events-token-mint.spec.sh#T1",
+  "scripts/mutations/events-token-mint.spec.sh#T2",
+]
+
+[[behavior]]
 id = "doorbell.pull-cursor-consumed"
 owner = "crates/doorbell-core/src/lib.rs"
 status = "proven"

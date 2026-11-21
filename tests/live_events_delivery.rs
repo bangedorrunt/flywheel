@@ -94,6 +94,20 @@ fn one_addressed_mail_reaches_pi_opencode_and_claude_through_events_not_doorbell
     let stamp = std::process::id();
     let tag = format!("znczi-{stamp}");
 
+    // The sandbox HOME has no workspace/<project> dir; scaffold it first so
+    // spawn finds its project (bd-rrlo2). Same cwd as every command below,
+    // so init and spawn resolve the identical project dir.
+    let initiated = sandbox
+        .command(bin)
+        .args(["init", &project])
+        .output()
+        .expect("init project dir");
+    assert!(
+        initiated.status.success(),
+        "init failed: {}",
+        text(&initiated)
+    );
+
     // One throwaway session with all three harnesses. --model harness-default
     // injects no model; --escape/--yes keep this non-interactive.
     let spawned = sandbox

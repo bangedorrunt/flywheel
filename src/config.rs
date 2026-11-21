@@ -816,14 +816,16 @@ impl Config {
             .unwrap_or_default()
     }
 
-    /// Toron events as an opt-in wake source for harnesses with no inbound
-    /// door (ADR-0039 D8, bd-l5vb2). False unless opted in, so flag-off is
-    /// byte-identical.
+    /// Toron events as a wake source for harnesses with no inbound door
+    /// (ADR-0039 D8, bd-l5vb2, bd-rrlo2). On when the flag is set, or by
+    /// default once any per-pin token file exists. A deployment with no
+    /// tokens stays flag-off byte-identical.
     pub fn doorbell_toron_events(&self) -> bool {
         self.doorbell
             .as_ref()
             .map(|d| d.toron_events)
             .unwrap_or(false)
+            || crate::events_tokens::any_token_file(&crate::config::state_dir())
     }
 
     /// bd-sfxu1: rex program_status push. False by default; flag-off is
@@ -1833,6 +1835,26 @@ daily = [
 
     /// 193.2: `state_dir()` honors `XDG_STATE_HOME` first (hermetic state
     /// for tests/prod) — mirror of the XDG_CONFIG_HOME contract.
+    /// bd-rrlo2: the events default follows minted tokens — off with an
+    /// empty token dir, on once any per-pin token file exists. Reads the
+    /// dir directly (no global state), so parallel tests cannot flake.
+    #[test]
+    fn toron_events_default_follows_minted_tokens() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
+        assert!(
+            !crate::events_tokens::any_token_file(&dir),
+            "no tokens: the default stays flag-off"
+        );
+        let tokens = dir.join("events-tokens");
+        std::fs::create_dir_all(&tokens).expect("token dir");
+        std::fs::write(tokens.join("demo-AmberProbe.token"), "s3").expect("token");
+        assert!(
+            crate::events_tokens::any_token_file(&dir),
+            "a minted token switches the default pump on"
+        );
+    }
+
     #[test]
     fn state_dir_honors_xdg_state_home() {
         let _g = lock_env();
