@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { HINT, coalesce, decodeFrame } from "../src/decode.ts";
+import { HINT, URGENT_HINT, coalesce, decodeFrame } from "../src/decode.ts";
 
 const SUB = "sub-1";
 const frame = (name: string, extra: object = {}) => JSON.stringify({
@@ -31,6 +31,13 @@ test("urgent mail and ack-sla steer; normal mail follows up", () => {
     "steer",
   );
   assert.equal(coalesce([decodeFrame(frame("ack_sla_expired"), SUB)!])!.deliverAs, "steer");
+});
+
+test("the hint is agent_text wording, urgent uses the urgent line", () => {
+  assert.equal(HINT, "[wake] new mail. Read it with: toron next");
+  assert.equal(URGENT_HINT, "[wake] urgent mail. Read it with: toron next");
+  const urgent = coalesce([decodeFrame(frame("mail.addressed", { priority: "urgent" }), SUB)!])!;
+  assert.equal(urgent.hint, URGENT_HINT);
 });
 
 test("a burst coalesces to one hint carrying count and first id", () => {

@@ -1,7 +1,10 @@
 // Pure decode of toron SEP-3415 events into a D2 hint (bd-4n2bn, ADR-0039 D8).
 // No mail body is ever returned — only the event id/name and the fixed hint.
 
-export const HINT = "mail pending, run toron next";
+// bd-w32ho: agent_text::render wording (WAKE_PREFIX + plain English + read
+// command), not bespoke jargon. The Rust golden pins the same strings.
+export const HINT = "[wake] new mail. Read it with: toron next";
+export const URGENT_HINT = "[wake] urgent mail. Read it with: toron next";
 
 /** Toron catalogue names that wake an agent. Heartbeats/active/terminated/gap
  * are notifications, not work. */
@@ -61,7 +64,7 @@ export function coalesce(frames: EventFrame[]): HintNotice | null {
   if (frames.length === 0) return null;
   const urgent = frames.some((f) => f.urgent);
   return {
-    hint: HINT,
+    hint: urgent ? URGENT_HINT : HINT,
     deliverAs: urgent ? "steer" : "followUp",
     count: frames.length,
     firstId: frames[0].id,
