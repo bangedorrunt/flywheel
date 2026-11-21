@@ -36,6 +36,8 @@ INDEX=0
 TEST_FILTER=""
 PATHS=""
 MODULES=0
+PIN="${FLYWHEEL_FENCE_PIN:-${AGENT_NAME:-crew}}"
+SWEEP_AGE_SECS="${FENCE_SWEEP_AGE_SECS:-14400}" # 4h: another crew's export is never young
 CARGO="${FENCE_CARGO:-mbx +nightly-aarch64-apple-darwin}"
 RUSTFMT="${FENCE_RUSTFMT:-rustup run nightly-aarch64-apple-darwin rustfmt --edition 2024}"
 
@@ -66,23 +68,57 @@ if [ "$INDEX" = 1 ]; then
 else
     SHA="$(git -C "$REPO" rev-parse "$REV")"
 fi
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/fence.XXXXXX")"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/fence.${PIN}.XXXXXX")"
+# bd-250g4: a live lock marks a running fence. Never sweep a dir that holds one.
+LOCK="$TMP/.fence-running.lock"
+: >"$LOCK"
+
+export_is_live() {
+    local dir="$1"
+    [ -f "$dir/.fence-running.lock" ] && return 0
+    if command -v lsof >/dev/null 2>&1 \
+        && lsof +D "$dir" >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+sweep_kept_exports() {
+    local dir age now
+    now="$(date +%s)"
+    # Only OUR PIN's older exports, or ANY export older than a few hours.
+    # bd-8jakq's sweep-all deleted concurrent crews' kept exports mid-test.
+    for dir in "${TMPDIR:-/tmp}"/fence.*; do
+        [ -d "$dir" ] || continue
+        [ "$dir" = "$TMP" ] && continue
+        case "$(basename "$dir")" in
+            fence."$PIN".*) ;;
+            *)
+                age=$((now - $(stat -f %m "$dir" 2>/dev/null || echo 0)))
+                [ "$age" -ge "$SWEEP_AGE_SECS" ] || continue
+                ;;
+        esac
+        export_is_live "$dir" && continue
+        rm -rf "$dir"
+    done
+}
+
 cleanup() {
-    local status=$?
+    local status="${FENCE_TEST_STATUS:-$?}"
+    rm -f "$LOCK"
     if [ "$KEEP" -eq 1 ] || [ "$status" -ne 0 ]; then
         echo "fence: kept $TMP" >&2
-        # bd-8jakq: a kept export is for the next targeted run. On a green
-        # fence, prune older ones so they do not pile up. Exclude by BASENAME:
-        # TMPDIR may end in '/', so the path string can mis-match (bd-j45zo).
-        if [ "$status" -eq 0 ]; then
-            find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'fence.*' \
-                ! -name "$(basename "$TMP")" -exec rm -rf {} + 2>/dev/null || true
-        fi
+        [ "$status" -eq 0 ] && sweep_kept_exports
     else
         rm -rf "$TMP"
     fi
 }
 trap cleanup EXIT
+# bd-250g4: test hook — drive the sweep policy without a real build.
+if [ -n "${FENCE_SWEEP_TEST:-}" ]; then
+    FENCE_TEST_STATUS="${FENCE_SWEEP_TEST_STATUS:-0}" cleanup
+    exit "${FENCE_SWEEP_TEST_STATUS:-0}"
+fi
 
 # shellcheck source=proof-lib.sh
 . "$ROOT/scripts/proof-lib.sh"

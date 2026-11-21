@@ -250,4 +250,23 @@ grep -q 'cmd::spawn::spawn_profile_plan_tests::' "$TMP/args.log" \
     || fail "the derived module filter must be run: $(cat "$TMP/args.log")"
 pass "--modules runs every test module of a changed file"
 
+# bd-250g4: the sweep must never delete another crew's kept export.
+SW="$TMP/sweep"
+mkdir -p "$SW"
+mkdir -p "$SW/fence.OtherPin.AAAA" "$SW/fence.Locked.CCCC" "$SW/fence.Stale.DDDD"
+: >"$SW/fence.Locked.CCCC/.fence-running.lock"
+touch -t 202001010000 "$SW/fence.Stale.DDDD"
+run_sweep() {
+    ( export TMPDIR="$SW" FLYWHEEL_FENCE_PIN="$1"
+      FENCE_SWEEP_TEST=0 bash "$ROOT/scripts/fence.sh" --repo "$REPO" --sha "$GOOD" --keep \
+        >/dev/null 2>&1 ) || fail "sweep hook failed"
+}
+run_sweep BlackRidge
+[ -d "$SW/fence.OtherPin.AAAA" ] || fail "another pin's fresh export was deleted"
+[ -d "$SW/fence.Locked.CCCC" ] || fail "an export with a live lock was deleted"
+[ ! -d "$SW/fence.Stale.DDDD" ] || fail "a stale export was not swept"
+count_blackridge="$(find "$SW" -maxdepth 1 -type d -name 'fence.BlackRidge.*' | wc -l | tr -d ' ')"
+[ "$count_blackridge" = 1 ] || fail "expected exactly this pin's current export, got $count_blackridge"
+pass "the sweep keeps other pins and locked exports, drops stale ones"
+
 echo "ok"
