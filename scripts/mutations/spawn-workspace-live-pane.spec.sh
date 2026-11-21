@@ -10,7 +10,7 @@ mutation "W1  a stale agent label counts as a live seat" \
     file=src/main.rs \
     expect=labelled_agent_without_a_live_pane_does_not_join \
     find='a.workspace_id == ws.workspace_id && is_crew(a) && live_panes.contains(&a.pane_id)' \
-    replace='a.workspace_id == ws.workspace_id && live_panes.contains(&a.pane_id)'
+    replace='a.workspace_id == ws.workspace_id && is_crew(a)'
 
 mutation "W2  the multiplexer shell counts as a crew seat" \
     file=src/main.rs \
