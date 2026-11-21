@@ -649,6 +649,20 @@ pub fn assemble_with_catalog(
     briefing
 }
 
+/// bd-mww6u: the stage chain a released join/coalition fleet runs once it has
+/// bound to the live seats (same order as the robot-capabilities stage list).
+pub const JOIN_STAGES: &[&str] = &[
+    "ce-brainstorm",
+    "ce-plan",
+    "ce-plan-review",
+    "ce-execute",
+    "ce-simplify",
+    "ce-review",
+    "ce-evaluate",
+    "ce-compound",
+    "commit-and-push",
+];
+
 /// bd-mww6u: the sticky-open hold is a *provisional* anti-invent guard. A live
 /// fleet or cross-lane contention is evidence that the hold must yield, or a
 /// captain following briefing would steer by raw mail with no stage or
@@ -687,13 +701,15 @@ pub fn release_sticky_hold(b: &mut Briefing, session: &str, world: &World) {
         b.proposal.topology = "swarm".into();
         b.proposal.workflow = "coalition-form".into();
     }
+    b.proposal.stages = JOIN_STAGES.iter().map(|s| (*s).to_string()).collect();
     b.proposal.why = format!(
-        "session_topology={session} sticky hold released: {evidence} — {} by default",
+        "session_topology={session} sticky hold released: {evidence} — {} by default, stages {}",
         if world.joinable {
             "join"
         } else {
             "coalition-form"
-        }
+        },
+        JOIN_STAGES.join(" -> ")
     );
     if let Some(q) = b.questions.iter_mut().find(|q| q.id == "topology") {
         q.default = "join".to_string();
@@ -1116,6 +1132,12 @@ mod tests {
         assert_eq!(b.proposal.topology, "swarm");
         assert!(!b.proposal.argv.is_empty(), "join carries an arrive argv");
         assert!(
+            b.proposal.stages.len() == JOIN_STAGES.len()
+                && b.proposal.stages.contains(&"ce-execute".to_string()),
+            "join carries the stage chain: {:?}",
+            b.proposal.stages
+        );
+        assert!(
             b.proposal.why.contains("sticky hold released")
                 && b.proposal.why.contains("4 crew pin"),
             "{}",
@@ -1141,6 +1163,7 @@ mod tests {
         let mut b = assemble("ship it", &world, &[], 5, None);
         release_sticky_hold(&mut b, "open", &world);
         assert_eq!(b.proposal.workflow, "coalition-form");
+        assert!(!b.proposal.stages.is_empty(), "coalition carries stages");
         assert!(
             b.proposal.why.contains("sticky hold released")
                 && b.proposal.why.contains("2 held paths"),
