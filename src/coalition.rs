@@ -1839,6 +1839,7 @@ steps:
     /// auto-coalesce — affiliation is the gate.
     #[test]
     fn detector_e2e_affiliated_crew_does_not_coalesce() {
+        let _home = crate::config::test_state_home();
         let root = std::env::temp_dir().join(format!("fw-coal-aff-{}", uuid::Uuid::new_v4()));
         let data = std::env::temp_dir().join(format!("fw-coal-aff-data-{}", uuid::Uuid::new_v4()));
         let store = CoalitionStore::open_at("det-aff", root.clone(), data.clone())
@@ -1893,6 +1894,7 @@ steps:
     /// both boards; disband releases reservations in BOTH projects.
     #[test]
     fn xproj_coalition_scopes_intents_per_project_and_disband_cleans_both() {
+        let _home = crate::config::test_state_home();
         let root = std::env::temp_dir().join(format!("fw-coal-xproj-{}", uuid::Uuid::new_v4()));
         let data =
             std::env::temp_dir().join(format!("fw-coal-xproj-data-{}", uuid::Uuid::new_v4()));
@@ -2045,6 +2047,7 @@ steps:
     /// the project it is scoped to — form refuses an unregistered crew.
     #[test]
     fn xproj_coalition_requires_member_registered_in_own_project() {
+        let _home = crate::config::test_state_home();
         let root = std::env::temp_dir().join(format!("fw-coal-xproj-rej-{}", uuid::Uuid::new_v4()));
         let data =
             std::env::temp_dir().join(format!("fw-coal-xproj-rej-data-{}", uuid::Uuid::new_v4()));
@@ -2126,6 +2129,7 @@ steps:
     /// `__run-headless`; the channel landing is this pure surface.)
     #[test]
     fn leaf_result_lands_in_coalition_channel() {
+        let _home = crate::config::test_state_home();
         let root = std::env::temp_dir().join(format!("fw-coal-leaf-{}", uuid::Uuid::new_v4()));
         let data = std::env::temp_dir().join(format!("fw-coal-leaf-data-{}", uuid::Uuid::new_v4()));
         let store = CoalitionStore::open_at("leaf-e2e", root.clone(), data.clone())
@@ -2187,6 +2191,7 @@ steps:
     /// full view survives JSON round-trips (agents parse it clean).
     #[test]
     fn status_observability_shows_roles_ttl_frozen_negotiations() {
+        let _home = crate::config::test_state_home();
         let root = std::env::temp_dir().join(format!("fw-coal-obs-{}", uuid::Uuid::new_v4()));
         let data = std::env::temp_dir().join(format!("fw-coal-obs-data-{}", uuid::Uuid::new_v4()));
         let store = CoalitionStore::open_at("obs-e2e", root.clone(), data.clone())
@@ -2285,6 +2290,7 @@ steps:
     /// join is idempotent and a non-member still cannot reserve.
     #[test]
     fn dynamic_join_reads_board_and_acquires_non_overlapping_scope() {
+        let _home = crate::config::test_state_home();
         let root = std::env::temp_dir().join(format!("fw-coal-join-{}", uuid::Uuid::new_v4()));
         let data = std::env::temp_dir().join(format!("fw-coal-join-data-{}", uuid::Uuid::new_v4()));
         let store = CoalitionStore::open_at("join-e2e", root.clone(), data.clone())
@@ -2363,6 +2369,7 @@ steps:
     /// leave + the TTL window).
     #[test]
     fn dynamic_leave_clears_departed_member_without_manual_cleanup() {
+        let _home = crate::config::test_state_home();
         let root = std::env::temp_dir().join(format!("fw-coal-leave-{}", uuid::Uuid::new_v4()));
         let data =
             std::env::temp_dir().join(format!("fw-coal-leave-data-{}", uuid::Uuid::new_v4()));
@@ -2443,5 +2450,32 @@ steps:
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// proof78 flake: `form()` writes a run log under `config::state_dir()`.
+    /// A test that forms a coalition without `test_state_home()` borrows the
+    /// ambient XDG_STATE_HOME another test's guard can remove mid-run. The
+    /// needles are assembled so this scanner does not match itself.
+    #[test]
+    fn every_coalition_forming_test_takes_the_state_home_guard() {
+        let src = include_str!("coalition.rs");
+        let form = concat!(".fo", "rm(");
+        let guards = [concat!("test_state_ho", "me()"), concat!("lock_en", "v()")];
+        let offenders: Vec<String> = src
+            .split("#[test]")
+            .skip(1)
+            .filter(|body| body.contains(form) && !guards.iter().any(|g| body.contains(g)))
+            .map(|body| {
+                body.split("fn ")
+                    .nth(1)
+                    .and_then(|rest| rest.split('(').next())
+                    .unwrap_or("?")
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "test(s) form a coalition without test_state_home(): {offenders:?}"
+        );
     }
 }
