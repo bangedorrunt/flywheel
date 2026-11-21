@@ -10,11 +10,11 @@ mutation "W1  the plugin stops using the local mcp-events proxy" \
     find=$'      "mcp-events",\n      "--subscription",' \
     replace=$'      "events/poll",\n      "--subscription",'
 
-mutation "W2  the decoder reads the old frame fields" \
+mutation "W2  the decoder reverts to the occurrence method" \
     file=plugins/claude-flywheel/src/decode.ts \
     expect=claude_plugin_speaks_real_events_surface \
-    find='event.eventId ?? event.event_id ?? event.id' \
-    replace='event.id ?? event.identifier'
+    find='PROXY_METHOD = "notifications/claude/channel"' \
+    replace='PROXY_METHOD = "notifications/events/event"'
 
 mutation "W3  the hint drops the neutral wake prefix" \
     file=plugins/claude-flywheel/src/wake_prefix.ts \

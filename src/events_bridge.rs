@@ -12,8 +12,10 @@
 
 use std::collections::{HashSet, VecDeque};
 
-/// The D2 hint. Only this text crosses into the harness — never the body.
-pub const HINT: &str = "mail pending, run toron next";
+/// The hint. Only this text crosses into the harness — never the body.
+/// bd-krzqu: agent_text wording — neutral `[wake]` prefix and the exact read
+/// command — so Claude seats get the same plain-English line other doors do.
+pub const HINT: &str = "[wake] new mail. Read it with: toron next";
 
 /// Minimum event shape a bridge needs. `payload` is intentionally opaque: the
 /// mapper must not read or forward it.
@@ -848,5 +850,20 @@ mod tests {
         assert_eq!(rpc["params"]["meta"]["event_name"], "mail.addressed");
         assert!(rpc.get("eventId").is_none(), "no top-level eventId: {rpc}");
         assert!(!rpc.to_string().contains("SECRET BODY"), "{rpc}");
+    }
+
+    /// bd-krzqu: the Claude plugin test must drive the frame the proxy really
+    /// emits, never a hand-written one. This pins the checked-in fixture to
+    /// `notice_to_rpc` itself, so a wire change cannot leave the plugin test
+    /// green against a dead contract.
+    #[test]
+    fn proxy_notice_fixture_is_the_real_renderer_output() {
+        let n = event_to_notice(&ev("evt-proxy-1", "mail.addressed")).expect("wake event maps");
+        let real = notice_to_rpc(&n);
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../plugins/claude-flywheel/test/fixtures/proxy-notice.json"
+        ))
+        .expect("fixture is JSON");
+        assert_eq!(real, fixture, "the fixture must be the proxy's real frame");
     }
 }

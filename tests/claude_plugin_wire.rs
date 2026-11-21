@@ -24,17 +24,28 @@ fn claude_plugin_speaks_real_events_surface() {
         register.contains("\"mcp-events\","),
         "the local proxy owns the token; the plugin never reads it"
     );
+    // bd-krzqu: the ONE wire contract is the proxy's notifications/claude/channel
+    // frame with bus ids in params.meta and the rendered hint in params.content.
     assert!(
-        decode.contains("event.eventId ?? event.event_id ?? event.id"),
-        "toron occurrences carry eventId, not id/content"
+        decode.contains("PROXY_METHOD = \"notifications/claude/channel\""),
+        "decode the frame the proxy really emits"
     );
     assert!(
-        decode.contains("subscriptionId"),
-        "frames are routed by subscriptionId"
+        decode.contains("meta.event_id") && decode.contains("meta.event_name"),
+        "the bus ids come from params.meta"
+    );
+    assert!(
+        decode.contains("params.content"),
+        "the rendered hint comes from params.content"
     );
     assert!(
         !decode.contains("content.includes"),
         "urgency comes from a typed field, never body text"
+    );
+    let fixture = read("plugins/claude-flywheel/test/fixtures/proxy-notice.json");
+    assert!(
+        fixture.contains("\"method\": \"notifications/claude/channel\""),
+        "the captured frame uses the real method"
     );
     assert!(
         hint.contains("WAKE_PREFIX"),

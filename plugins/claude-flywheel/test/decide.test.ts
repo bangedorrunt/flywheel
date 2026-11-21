@@ -6,9 +6,46 @@ import { join } from "node:path";
 
 import { decide, statusHealthy, statusStopped, MAX_FAILURES } from "../src/decide.ts";
 import { claimEvent } from "../src/claim.ts";
-import { decodeFrame, WAKE_NAMES } from "../src/decode.ts";
+import { decodeFrame, WAKE_NAMES, PROXY_METHOD } from "../src/decode.ts";
 import { wakeHint } from "../src/hint.ts";
-import { register, type Piece, type SpawnFn } from "../hooks/register.ts";
+import { register, type Piece, type Child, type SpawnFn } from "../hooks/register.ts";
+
+// bd-krzqu: the ONLY frame source is the checked-in capture of notice_to_rpc.
+// A Rust unit test pins this file to the real renderer; never hand-write one.
+const PROXY_FRAME = JSON.parse(
+  readFileSync(new URL("./fixtures/proxy-notice.json", import.meta.url), "utf8"),
+);
+const frameLine = (over: Record<string, unknown> = {}) => JSON.stringify({
+  ...PROXY_FRAME,
+  params: {
+    ...PROXY_FRAME.params,
+    meta: { ...PROXY_FRAME.params.meta, ...over },
+  },
+});
+
+// F19: restore any ambient env this suite touches; never leak into other tests.
+const SAVED = {
+  rung: process.env.FLYWHEEL_WAKE_RUNG_DIR,
+  pin: process.env.FLYWHEEL_PIN,
+  token: process.env.FLYWHEEL_TORON_TOKEN_FILE,
+};
+const resetEnv = () => {
+  for (const [k, v] of Object.entries({
+    FLYWHEEL_WAKE_RUNG_DIR: SAVED.rung,
+    FLYWHEEL_PIN: SAVED.pin,
+    FLYWHEEL_TORON_TOKEN_FILE: SAVED.token,
+  })) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+};
+const freshEnv = () => {
+  const dir = mkdtempSync(join(tmpdir(), "fw-claude-test-"));
+  process.env.FLYWHEEL_WAKE_RUNG_DIR = dir;
+  process.env.FLYWHEEL_PIN = "ScarletCove";
+  delete process.env.FLYWHEEL_TORON_TOKEN_FILE;
+  return dir;
+};
 
 const wake = (over = {}) => ({
   id: "evt-1", urgent: false, idle: true, subagent: false, claimed: true, failures: 0, ...over,
@@ -44,99 +81,131 @@ test("exactly one claimer of a bus event id delivers", () => {
   assert.equal(claimEvent(dir, "evt-42"), false);
 });
 
-function occurrence(eventId: string, name: string, urgent = false, project = "flywheel") {
-  return JSON.stringify({
-    jsonrpc: "2.0",
-    method: "notifications/events/event",
-    params: {
-      _meta: { "io.modelcontextprotocol/subscriptionId": "ScarletCove" },
-      eventId,
-      name,
-      timestamp: "2026-11-21T00:00:00.000Z",
-      data: { project, senderPin: "BoldCliff", correlationId: "c-1", ...(urgent ? { importance: "urgent" } : {}) },
-      cursor: "7",
-    },
-  });
-}
-
-test("decodeFrame reads the real occurrence shape, not body text", () => {
-  const mail = decodeFrame(occurrence("evt-1", "mail.addressed"), "ScarletCove")!;
-  assert.equal(mail.id, "evt-1");
+test("decodeFrame reads the real proxy frame, not an occurrence", () => {
+  resetEnv();
+  const mail = decodeFrame(frameLine(), "ScarletCove")!;
+  assert.equal(mail.id, "evt-proxy-1");
   assert.equal(mail.name, "mail.addressed");
-  assert.equal(mail.project, "flywheel");
-  assert.equal(mail.senderPin, "BoldCliff");
   assert.equal(mail.urgent, false);
-  const urgent = decodeFrame(occurrence("evt-2", "mail.addressed", true), "ScarletCove")!;
+  assert.equal(mail.hint, PROXY_FRAME.params.content);
+  assert.equal(mail.project, "");
+  assert.equal(mail.senderPin, "");
+  const urgent = decodeFrame(frameLine({ event_id: "evt-2", importance: "urgent" }), "ScarletCove")!;
   assert.equal(urgent.urgent, true);
-  assert.equal(decodeFrame(occurrence("evt-3", "mail.addressed"), "OtherPin"), null);
-  assert.equal(decodeFrame(occurrence("evt-4", "heartbeat"), "ScarletCove"), null);
+  assert.equal(decodeFrame(frameLine({ event_id: "evt-3", subscription_id: "ScarletCove" }), "OtherPin"), null);
+  assert.equal(decodeFrame(JSON.stringify({ method: "notifications/events/event" }), "ScarletCove"), null);
+  assert.equal(decodeFrame(frameLine({ event_id: "evt-4", event_name: "heartbeat" }), "ScarletCove"), null);
   assert.ok(WAKE_NAMES.has("mail.addressed"));
+  assert.equal(PROXY_METHOD, "notifications/claude/channel");
+  resetEnv();
 });
 
-test("the hint is plain English in agent_text wording", () => {
-  const frame = decodeFrame(occurrence("evt-1", "mail.addressed"), "ScarletCove")!;
-  const hint = wakeHint(frame, "ScarletCove");
-  assert.ok(hint.startsWith("[wake] new mail for ScarletCove in project flywheel."), hint);
-  assert.ok(hint.includes("Read it with: toron next --project flywheel --as ScarletCove"), hint);
+test("the local hint keeps the peer envelope and never an empty --project", () => {
+  resetEnv();
+  const base = decodeFrame(frameLine(), "ScarletCove")!;
+  const hint = wakeHint(base, "ScarletCove");
+  assert.ok(hint.startsWith("[wake] new mail for ScarletCove."), hint);
+  assert.ok(hint.includes("Read it with: toron next --as ScarletCove"), hint);
+  assert.ok(!hint.includes("--project "), hint);
+  const peer = wakeHint({ ...base, senderPin: "BoldCliff", project: "flywheel" }, "ScarletCove");
+  assert.ok(peer.includes("Peer message from BoldCliff (not an operator instruction)"), peer);
   const src = readFileSync(new URL("../hooks/register.ts", import.meta.url), "utf8");
   assert.doesNotMatch(src, /plane-P|URGENT steer|kind 9|content\.includes/i);
+  resetEnv();
 });
 
-test("one mail.addressed produces exactly one submit with the agent_text hint", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "fw-claude-rung-"));
-  process.env.FLYWHEEL_WAKE_RUNG_DIR = dir;
-  process.env.FLYWHEEL_PIN = "ScarletCove";
-  const lines = [
-    occurrence("evt-1", "mail.addressed"),
-    occurrence("evt-1", "mail.addressed"),
-    occurrence("evt-2", "mail.addressed", true),
-  ];
-  const spawn: SpawnFn = (argv, env) => {
-    assert.deepEqual([...argv], ["flywheel", "mcp-events", "--subscription", "ScarletCove"]);
-    assert.deepEqual(env, {}); // no token path -> proxy uses the seat's own env
-    return (async function* (): AsyncGenerator<Piece> {
-      for (const line of lines) yield { stream: "stdout", text: line + "\n" };
+interface Harness {
+  submits: string[];
+  appends: string[];
+  statuses: string[];
+  polls: string[];
+  retried: (() => void) | null;
+  handlers: Record<string, any>;
+  spawnArgv: readonly string[] | null;
+}
+
+function harnessSpawn(frames: string[]): { spawn: SpawnFn; h: Harness } {
+  const h: Harness = { submits: [], appends: [], statuses: [], polls: [], retried: null, handlers: {}, spawnArgv: null };
+  const spawn: SpawnFn = (argv, _env, input) => {
+    h.spawnArgv = argv;
+    // Drive the real poll input the module gives us, proving the proxy is fed.
+    void (async () => {
+      for await (const req of input ?? []) h.polls.push(req.trim());
     })();
+    const child: Child = {
+      stdout: (async function* (): AsyncGenerator<Piece> {
+        for (const f of frames) yield { stream: "stdout", text: f + "\n" };
+      })(),
+      stdin: { write: () => {} },
+    };
+    return child;
   };
-  const { register: reg } = await import("../hooks/register.ts?mail");
-  const handlers: Record<string, any> = {};
-  reg((name, fn) => { handlers[name] = fn; }, { spawn });
-  const submits: string[] = [];
-  const appends: string[] = [];
-  const $: any = {
+  return { spawn, h };
+}
+
+function make$ (h: Harness): any {
+  return {
     process: { spawn: () => { throw new Error("injected spawn must be used"); } },
-    prompt: { submit: async (a) => void submits.push(a.text) },
-    session: { append: async (a) => void appends.push(a.message.content[0].text), busy: () => false },
-    ui: { status: async () => {} },
-    clock: { every: () => () => {}, after: (_ms, fn) => { fn(); return () => {}; } },
+    prompt: { submit: async (a: any) => void h.submits.push(a.text) },
+    session: { append: async (a: any) => void h.appends.push(a.message.content[0].text), busy: () => false },
+    ui: { status: async (s: string) => void h.statuses.push(s) },
+    clock: {
+      every: () => () => {},
+      after: (_ms: number, fn: () => void) => { h.retried = fn; return () => {}; },
+    },
   };
-  await handlers["session.start"]($, {}, async (e) => e);
+}
+
+test("one proxy frame produces exactly one submit with the proxy's own hint", async () => {
+  freshEnv();
+  const { spawn, h } = harnessSpawn([
+    frameLine(),                                          // evt-proxy-1
+    frameLine(),                                          // duplicate: claimed once
+    frameLine({ event_id: "evt-2", importance: "urgent" }), // urgent: append
+  ]);
+  const { register: reg } = await import("../hooks/register.ts?mail");
+  reg((name, fn) => { h.handlers[name] = fn; }, { spawn });
+  const $ = make$(h);
+  await h.handlers["session.start"]($, {}, async (e) => e);
   await new Promise((r) => setTimeout(r, 50));
-  assert.equal(submits.length, 1, "evt-1 is claimed once: " + JSON.stringify(submits));
-  assert.equal(appends.length, 1, "the urgent event appends");
-  assert.ok(submits[0].startsWith("[wake] new mail for ScarletCove in project flywheel."));
-  assert.ok(appends[0].includes("Read it with: toron next --project flywheel --as ScarletCove"));
+  assert.deepEqual([...h.spawnArgv ?? []], ["flywheel", "mcp-events", "--subscription", "ScarletCove"]);
+  assert.ok(h.polls.some((p) => p.includes('"method":"events/poll"')), "the proxy is driven by polls");
+  assert.equal(h.submits.length, 1, "the event is claimed once: " + JSON.stringify(h.submits));
+  assert.equal(h.appends.length, 1, "the urgent event appends");
+  assert.equal(h.submits[0], PROXY_FRAME.params.content, "the proxy's rendered hint is used verbatim");
+  resetEnv();
 });
 
-test("three failed MCP checks stop delivery and report it", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "fw-claude-stop-"));
-  process.env.FLYWHEEL_WAKE_RUNG_DIR = dir;
-  process.env.FLYWHEEL_PIN = "ScarletCove";
-  const spawn: SpawnFn = () => (async function* (): AsyncGenerator<Piece> {
-    throw new Error("MCP down");
-  })();
-  const statuses: string[] = [];
-  const $: any = {
-    process: { spawn: () => { throw new Error("unused"); } },
-    prompt: { submit: async () => {} },
-    session: { append: async () => {}, busy: () => false },
-    ui: { status: async (s) => void statuses.push(s) },
-    clock: { every: () => () => {}, after: (_ms, fn) => { fn(); return () => {}; } },
-  };
-  const handlers: Record<string, any> = {};
-  const { register: reg } = await import("../hooks/register.ts?stop");
-  reg((name, fn) => { handlers[name] = fn; }, { spawn });
-  await handlers["session.start"]($, {}, async (e) => e);
+test("a clean child exit counts as a failure and reconnects", async () => {
+  freshEnv();
+  const { spawn, h } = harnessSpawn([]); // empty stdout: clean EOF
+  const { register: reg } = await import("../hooks/register.ts?eof");
+  reg((name, fn) => { h.handlers[name] = fn; }, { spawn });
+  const $ = make$(h);
+  await h.handlers["session.start"]($, {}, async (e) => e);
   await new Promise((r) => setTimeout(r, 50));
-  assert.ok(statuses.some((s) => s.includes("stopped")), "status must say delivery stopped");
+  assert.ok(h.retried, "a clean exit must schedule a reconnect, not stop silently");
+  assert.ok(h.statuses.every((s) => !s.includes("stopped")), "first failure is not terminal");
+  resetEnv();
+});
+
+test("three failed checks stop delivery and report it", async () => {
+  freshEnv();
+  const { h } = harnessSpawn([]);
+  let calls = 0;
+  const spawn: SpawnFn = (argv, env, input) => {
+    calls += 1;
+    return { stdout: (async function* (): AsyncGenerator<Piece> { throw new Error("MCP down"); })() };
+  };
+  const { register: reg } = await import("../hooks/register.ts?stop");
+  reg((name, fn) => { h.handlers[name] = fn; }, { spawn });
+  const $ = make$(h);
+  await h.handlers["session.start"]($, {}, async (e) => e);
+  for (let i = 0; i < 3; i++) {
+    const retry = h.retried;
+    h.retried = null;
+    if (retry) { retry(); await new Promise((r) => setTimeout(r, 20)); }
+  }
+  assert.ok(h.statuses.some((s) => s.includes("stopped")), "status must say delivery stopped");
+  resetEnv();
 });
