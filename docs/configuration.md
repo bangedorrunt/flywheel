@@ -41,13 +41,13 @@ or leave it; there is no "disable builtin" flag. Exact merge points:
 
 ```toml
 [doorbell]
-url = "http://127.0.0.1:18980"  # presence selects the daemon host; absent = embedded
-beads_poller = true              # ready-bead/hold sensor, default on (false opts out)
+url = "http://127.0.0.1:18080"  # unified toron daemon (ADR-0020); absent = embedded
+beads_poller = true             # ready-bead/hold sensor, default on (false opts out)
 cron_doorbell_sink = false
 ```
 
 Also supported: `[mail.toron]` url+token, `[backend]` multiplexer/mail,
-`[backend]` multiplexer/mail, `[crew] max` (default 5), `[loop]`
+`[crew] max` (default 5), `[loop]`
 thresholds (unknown_diagnose, respawn_budget, detect_grace, drain_grace,
 claim_nudge), `socket_path`, `workspace_root`,
 `on_captain_death` (stop | continue | adopt), `kinds`, `verifier_family_override`. Full annotated
@@ -159,16 +159,15 @@ ladder: CLI > `TORON_*` env > `./.toron.toml` > `~/.config/toron/`
 | toron | `toron serve` | 18080 | `com.toron.serve` | mail, reservations, pins, workflow host. One writer |
 | flywheel | `flywheel serve` | 8787 | `dev.flywheel.daemon` | HTTP window: health, snapshot, send, events. Not a second mail store |
 | flywheel cron | `flywheel cron start` | — | `dev.flywheel.cron` | cron ticks (30s `ElmCron`), the doorbell-supervisor minute schedule, and the host-native awareness digest (15 min, no agent), from the project root |
-| doorbell | `doorbell serve` | 18980 | `com.doorbell.serve` | the only wake while this port answers |
+| doorbell (wake plane D) | `toron serve` | 18080 | `com.toron.serve` | consolidated into toron (ADR-0020); no separate daemon or port |
 
 All units are launchd-persisted (macOS) / systemd user (Linux).
 `dev.flywheel.cron` is separate from `dev.flywheel.daemon` so a crashed HTTP
 daemon cannot stop ticks and a stuck cron body cannot take down the HTTP
 surface; both are `RunAtLoad` with restart-on-failure, and both are driven by
 `flywheel daemon start|stop|restart|status`.
-Ports, pidfiles (`{flywheel,doorbell}.pid`), sockets and units are
-disjoint — daemons never fight over binds (second binder exits 0 over a
-healthy doorbell peer, hard-fails naming a squatter).
+Ports, pidfiles (`flywheel.pid`), sockets and units are disjoint — daemons
+never fight over binds (a second binder hard-fails naming a squatter).
 
 Shared surface (one tree, partitioned): everything lives under the ONE
 state dir (`~/.local/state/flywheel`). `doorbell/` holds pid/gen/project/
