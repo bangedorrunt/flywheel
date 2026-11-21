@@ -172,10 +172,28 @@ fi
 
 PLANE_SESSION=""
 SPAWNED_PIN=""
+# bd-833ya: spawn installs a per-project doorbell supervisor. Retiring the
+# seats alone leaves the project registered, and the next stack install boots
+# that supervisor back up. Drop both the registration and the unit.
+retire_throwaway_project() { # project
+    local label fw="${FLYWHEEL_BIN:-flywheel}"
+    "$fw" kill "$1" --force --force-working --reap-crews >/dev/null 2>&1 || true
+    label="dev.flywheel.doorbell.$1"
+    if [ "$(uname -s)" = Darwin ]; then
+        launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+        rm -f "$HOME/Library/LaunchAgents/$label.plist"
+    else
+        systemctl --user disable --now "$1.service" >/dev/null 2>&1 || true
+        rm -f "$HOME/.config/systemd/user/$1.service"
+    fi
+}
 cleanup() {
     [ -n "${EXPORT_ROOT:-}" ] && rm -rf "$EXPORT_ROOT"
     if [ -n "$SPAWNED_PIN" ] && [ "$KEEP" = 0 ]; then
         "$FLYWHEEL_BIN" retire "$SPAWNED_PIN" --project e2e-live-five --force-working >/dev/null 2>&1 || true
+    fi
+    if [ "$KEEP" = 0 ]; then
+        retire_throwaway_project "$PROJECT"
     fi
     if [ -n "$PLANE_SESSION" ] && [ "$KEEP" = 0 ]; then
         "$REX_BIN" kill "$PLANE_SESSION" >/dev/null 2>&1 || true

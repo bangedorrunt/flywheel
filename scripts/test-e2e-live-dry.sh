@@ -34,6 +34,16 @@ exit 0
 chmod +x "$TMP/bin/rex"
 printf '#!/usr/bin/env bash\necho "cargo $*" >>"%s"\nexit 0\n' "$TMP/cargo.log" >"$TMP/bin/cargo"
 chmod +x "$TMP/bin/cargo"
+# bd-833ya: a fake flywheel that records the cleanup verb and deregisters the
+# throwaway project, so the witness can assert no project survives the run.
+printf '#!/usr/bin/env bash
+echo "flywheel $*" >>"%s"
+if [ "$1" = kill ]; then
+  rm -f "$XDG_STATE_HOME/flywheel/agents/$2.json"
+fi
+exit 0
+' "$TMP/flywheel.log" >"$TMP/bin/flywheel"
+chmod +x "$TMP/bin/flywheel"
 
 out="$(HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg/config" XDG_DATA_HOME="$TMP/xdg/data" \
     XDG_STATE_HOME="$TMP/xdg/state" XDG_RUNTIME_DIR="$TMP/xdg/run" \
@@ -59,6 +69,12 @@ pass "a dry run creates no session (rex was never called)"
 pass "a dry run never reaches the supervisor tools"
 
 
+# bd-833ya: seed the throwaway project's registration and supervisor unit, so
+# cleanup is witnessed to remove both on a run that tears down its session.
+mkdir -p "$TMP/xdg/state/flywheel/agents" "$TMP/home/Library/LaunchAgents"
+printf '[]\n' >"$TMP/xdg/state/flywheel/agents/e2e-live-five.json"
+printf '<plist/>\n' >"$TMP/home/Library/LaunchAgents/dev.flywheel.doorbell.e2e-live-five.plist"
+
 # --selftest drives the create + parse + teardown against the fake rex, so the
 # session.create JSON parse is witnessed without a live server.
 self_out="$(HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg/config" XDG_DATA_HOME="$TMP/xdg/data" \
@@ -75,5 +91,17 @@ pass "session.create's JSON is parsed into the session and block ids"
 grep -q "rex new self-session --json" "$TMP/rex.log" || fail "rex new must be by label: $(cat "$TMP/rex.log")"
 grep -q "rex kill self-session" "$TMP/rex.log" || fail "the session must be torn down: $(cat "$TMP/rex.log")"
 pass "the session is created by label and killed by label"
+
+grep -q "flywheel kill e2e-live-five --force --force-working --reap-crews" "$TMP/flywheel.log" \
+    || fail "cleanup must retire the throwaway project: $(cat "$TMP/flywheel.log")"
+[ ! -e "$TMP/xdg/state/flywheel/agents/e2e-live-five.json" ] \
+    || fail "the throwaway project must not survive the run"
+pass "cleanup deregisters the throwaway project"
+
+grep -q "launchctl bootout gui/.*/dev.flywheel.doorbell.e2e-live-five" "$TMP/shims.log" \
+    || fail "cleanup must boot out the throwaway supervisor: $(cat "$TMP/shims.log")"
+[ ! -e "$TMP/home/Library/LaunchAgents/dev.flywheel.doorbell.e2e-live-five.plist" ] \
+    || fail "the throwaway supervisor unit must be removed"
+pass "cleanup boots out and removes the throwaway doorbell unit"
 
 echo "ok"
