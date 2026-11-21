@@ -503,6 +503,53 @@ mod tests {
         );
     }
 
+    /// bd-yc6jf: a mail event at or below the pin's pull cursor is consumed —
+    /// the Elm fold rings nothing for it and audits already-pulled instead.
+    /// The live path shares this fold, so a pulled mail never pages the
+    /// captain with an empty wake.
+    #[test]
+    fn a_pulled_mail_event_rings_nothing_through_the_fold() {
+        let npub = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let mut index = SelfIndex::default();
+        index.insert_pin("BlueRidge".into(), Some(npub.into()));
+        let watch = format!(
+            r#"{{"kind":9,"id":"wake-pulled-elm-1","pubkey":"senderpk","created_at":1700000000,"tags":[["p","{npub}"],["t","flywheel"],["h","thread-1"],["toron-kind","mail-delivered"],["thread","thread-1"],["importance","normal"],["from","SlateHarbor"],["mid","msg-pulled-elm-1"]],"content":"mail"}}"#
+        );
+        let edge = DoorbellMsg::WatchNdjson { line: watch };
+        let mut unpulled = DoorbellModel {
+            index: index.clone(),
+            ..DoorbellModel::default()
+        };
+        unpulled.statuses.insert("BlueRidge".into(), "idle".into());
+        let (_, unpulled_commands) = InboxProgram::fold(&unpulled, &edge);
+        assert!(
+            unpulled_commands.iter().any(|c| matches!(
+                &c.action,
+                DoorbellAction::Prompt { pin, .. } if pin == "BlueRidge"
+            )),
+            "unpulled mail rings: {unpulled_commands:?}"
+        );
+        let mut pulled = unpulled.clone();
+        pulled
+            .pulled_us
+            .insert("BlueRidge".into(), 1_700_000_000_000_000);
+        let (_, pulled_commands) = InboxProgram::fold(&pulled, &edge);
+        assert!(
+            !pulled_commands.iter().any(|c| matches!(
+                &c.action,
+                DoorbellAction::Prompt { pin, .. } if pin == "BlueRidge"
+            )),
+            "a pulled message must not re-ring: {pulled_commands:?}"
+        );
+        assert!(
+            pulled_commands.iter().any(|c| matches!(
+                &c.action,
+                DoorbellAction::Audit { kind, .. } if kind == "already-pulled"
+            )),
+            "the skipped wake is audited, never silent: {pulled_commands:?}"
+        );
+    }
+
     #[test]
     fn the_workspace_slice_and_the_program_fold_the_same_way() {
         let model = DoorbellModel::default();
