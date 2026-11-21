@@ -27,7 +27,7 @@ bash scripts/verify-needles.sh            # every mutation find= matches once; e
 bash scripts/verify-mutations.sh scripts/mutations/<spec>.spec.sh
 
 # commit and pre-mail check
-flywheel commit <paths> -m <msg> [--repo <dir>] [--allow-empty]
+flywheel commit <paths> -m <msg> [--repo <dir>] [--allow-empty] [--keep-lease]
 bash scripts/fence.sh --sha <sha>         # needles, -Dwarnings build, no-run, clippy on that commit
 bash scripts/fence.sh --paths a.rs,b.rs --test cmd::spawn::  # targeted tests in a clean export (bd-8jakq)
 

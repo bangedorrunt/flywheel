@@ -706,7 +706,8 @@ enum ReservationMode {
     /// Programmatic commits (tests, ship land) that do not carry a seat pin.
     Skip,
     /// CLI commit: enforce, unless the operator took the recorded escape.
-    Enforce { escape: bool },
+    /// `keep_lease` skips the post-success release so a hold can span commits.
+    Enforce { escape: bool, keep_lease: bool },
 }
 
 fn guard_nonempty(
@@ -745,11 +746,11 @@ where
     let old_head = shared.out(&["rev-parse", "HEAD"])?;
     let message = match mode {
         ReservationMode::Skip => message.to_string(),
-        ReservationMode::Enforce { escape: false } => {
+        ReservationMode::Enforce { escape: false, .. } => {
             guard_commit_reservations(paths, ctx)?;
             message.to_string()
         }
-        ReservationMode::Enforce { escape: true } => {
+        ReservationMode::Enforce { escape: true, .. } => {
             // The escape is never silent: the commit itself says it was used.
             format!("{message}\n\nflywheel-reservation-check: skipped")
         }
@@ -786,7 +787,13 @@ where
         let update = shared.run(&["update-ref", "HEAD", &commit, &parent])?;
         if update.status.success() {
             sync_stale_stage(&shared, &class.stale, &commit)?;
-            if matches!(mode, ReservationMode::Enforce { .. }) {
+            if matches!(
+                mode,
+                ReservationMode::Enforce {
+                    keep_lease: false,
+                    ..
+                }
+            ) {
                 release_own_reservations(paths, ctx);
             }
             return Ok(commit);
@@ -850,6 +857,7 @@ pub(crate) fn commit_paths_checked(
     message: &str,
     no_reservation_check: bool,
     allow_empty: bool,
+    keep_lease: bool,
     ctx: &ReservationCtx,
 ) -> Result<String> {
     commit_paths_mode(
@@ -859,6 +867,7 @@ pub(crate) fn commit_paths_checked(
         ctx,
         ReservationMode::Enforce {
             escape: no_reservation_check,
+            keep_lease,
         },
         allow_empty,
     )
@@ -910,6 +919,7 @@ pub(crate) fn cmd_commit(
     repo: Option<&str>,
     no_reservation_check: bool,
     allow_empty: bool,
+    keep_lease: bool,
 ) -> Result<()> {
     let repo_arg = repo.unwrap_or(".");
     let repo = fs::canonicalize(repo_arg).with_context(|| format!("repo dir {repo_arg}"))?;
@@ -920,6 +930,7 @@ pub(crate) fn cmd_commit(
         message,
         no_reservation_check,
         allow_empty,
+        keep_lease,
         &ctx,
     )?;
     println!("commit {}", &sha[..sha.len().min(12)]);
@@ -1301,9 +1312,10 @@ mod tests {
         let (ctx, log) = fake_toron(&sandbox, "hard");
         let dir = scratch_repo("reserve-live");
         fs::write(dir.join("x.rs"), "x\n").unwrap();
-        let err = commit_paths_checked(&dir, &["x.rs".into()], "blocked", false, false, &ctx)
-            .unwrap_err()
-            .to_string();
+        let err =
+            commit_paths_checked(&dir, &["x.rs".into()], "blocked", false, false, false, &ctx)
+                .unwrap_err()
+                .to_string();
         assert!(err.contains("BoldCliff"), "{err}");
         assert!(err.contains("toron reserve request-release"), "{err}");
         assert!(err.contains("r1"), "{err}");
@@ -1322,7 +1334,7 @@ mod tests {
         let (ctx, log) = fake_toron(&sandbox, "dead");
         let dir = scratch_repo("reserve-dead");
         fs::write(dir.join("x.rs"), "x\n").unwrap();
-        commit_paths_checked(&dir, &["x.rs".into()], "ok", false, false, &ctx).unwrap();
+        commit_paths_checked(&dir, &["x.rs".into()], "ok", false, false, false, &ctx).unwrap();
         let calls = fs::read_to_string(&log).unwrap_or_default();
         assert!(
             calls.contains("reserve force-release"),
@@ -1335,6 +1347,22 @@ mod tests {
         assert!(calls.contains("x.rs"), "{calls}");
     }
 
+    /// bd-u1n91: --keep-lease keeps the hold across commits; the default path
+    /// still releases it (witnessed by the neighbouring test).
+    #[test]
+    fn keep_lease_leaves_the_committed_paths_held() {
+        let sandbox = flywheel_test_sandbox::TestSandbox::new();
+        let (ctx, log) = fake_toron(&sandbox, "dead");
+        let dir = scratch_repo("reserve-keep");
+        fs::write(dir.join("x.rs"), "x\n").unwrap();
+        commit_paths_checked(&dir, &["x.rs".into()], "keep", false, false, true, &ctx).unwrap();
+        let calls = fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !calls.contains("reserve release "),
+            "--keep-lease must not release: {calls}"
+        );
+    }
+
     /// bd-ahkw1 hole 1: no pin is NOT consent — refuse and say how to escape.
     #[test]
     fn a_missing_pin_refuses_and_names_the_escape() {
@@ -1343,7 +1371,7 @@ mod tests {
         ctx.pin = None;
         let dir = scratch_repo("reserve-nopin");
         fs::write(dir.join("x.rs"), "x\n").unwrap();
-        let err = commit_paths_checked(&dir, &["x.rs".into()], "no pin", false, false, &ctx)
+        let err = commit_paths_checked(&dir, &["x.rs".into()], "no pin", false, false, false, &ctx)
             .unwrap_err()
             .to_string();
         assert!(err.contains("AGENT_NAME"), "{err}");
@@ -1358,7 +1386,7 @@ mod tests {
         let (ctx, _log) = fake_toron(&sandbox, "fail");
         let dir = scratch_repo("reserve-unreadable");
         fs::write(dir.join("x.rs"), "x\n").unwrap();
-        let err = commit_paths_checked(&dir, &["x.rs".into()], "fail", false, false, &ctx)
+        let err = commit_paths_checked(&dir, &["x.rs".into()], "fail", false, false, false, &ctx)
             .unwrap_err()
             .to_string();
         assert!(err.contains("toron reserve conflicts failed"), "{err}");
@@ -1407,7 +1435,8 @@ mod tests {
         fs::write(dir.join("x.rs"), "x\n").unwrap();
 
         assert!(
-            commit_paths_checked(&dir, &["x.rs".into()], "blocked", false, false, &ctx).is_err()
+            commit_paths_checked(&dir, &["x.rs".into()], "blocked", false, false, false, &ctx)
+                .is_err()
         );
         let log = sandbox.root().join("mail.log");
         let first = fs::read_to_string(&log).unwrap_or_default();
@@ -1429,7 +1458,8 @@ mod tests {
         );
 
         assert!(
-            commit_paths_checked(&dir, &["x.rs".into()], "blocked", false, false, &ctx).is_err()
+            commit_paths_checked(&dir, &["x.rs".into()], "blocked", false, false, false, &ctx)
+                .is_err()
         );
         let second = fs::read_to_string(&log).unwrap_or_default();
         assert_eq!(second, first, "no duplicate mail inside the window");
@@ -1467,7 +1497,8 @@ mod tests {
         let dir = scratch_repo("reserve-escape");
         fs::write(dir.join("x.rs"), "x\n").unwrap();
         let sha =
-            commit_paths_checked(&dir, &["x.rs".into()], "override", true, false, &ctx).unwrap();
+            commit_paths_checked(&dir, &["x.rs".into()], "override", true, false, false, &ctx)
+                .unwrap();
         let msg = git(&dir, &["log", "-1", "--pretty=%B", &sha]);
         assert!(
             msg.contains("flywheel-reservation-check: skipped"),

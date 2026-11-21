@@ -1849,6 +1849,9 @@ enum Commands {
         /// allow a commit whose tree equals HEAD (bd-62ei8)
         #[arg(long)]
         allow_empty: bool,
+        /// keep the committed paths' leases instead of handing them off (bd-u1n91)
+        #[arg(long)]
+        keep_lease: bool,
     },
     /// Interactive walkthrough
     Tutorial,
@@ -3204,7 +3207,7 @@ fn main() {
             "upstream_parity": upstream_parity::robot_summary(),
             "commands": [
                 "init spawn add list status decide rebind recover",
-                "commit <paths> -m <msg> [--repo <dir>] [--no-reservation-check] [--allow-empty] (bd-aberm private-index commit of exactly those paths; bd-62ei8 refuses when the private tree equals HEAD — name the unchanged paths — unless --allow-empty)",
+                "commit <paths> -m <msg> [--repo <dir>] [--no-reservation-check] [--allow-empty] [--keep-lease] (bd-aberm private-index commit of exactly those paths; bd-62ei8 refuses when the private tree equals HEAD — name the unchanged paths — unless --allow-empty; bd-u1n91 releases committed leases on success unless --keep-lease)",
                 "ship check <bead> [--json] | ship land <bead> --sha <40hex> --receipt <file> [--project <p>] [--as <pin>] [--message <m>] [--repo <dir>] (one verb: gate -> close -> sync -> release -> commit THIS bead's tracker rows -> check; idempotent, prints the resume command on failure; another lane's dirty tracker row never blocks; --repo names the repo holding the citing commit and the receipt's specs when the work lives elsewhere, symmetric with br close --repo; the HEAD-lock race other lanes cause is retried, not surfaced)",
                 "spawn <project> [--kind K=N ...] [--assign PIN=BEAD[,BEAD] ...] [--dry-run --json] [--patch <seat>.<field>=<value> (repeatable; re-resolves the seat with from: user)] [--model harness-default leaves the harness's own model untouched] [--yes] (ADR-0022 plan spawn; see --help for the full flag list)",
                 "retire <pin>... [--project <p>] [--force-working] [--as <pin>] [--json] (bd-rilvn: the thin per-pin stop verb over the seat path — ONE journaled SeatEffect::Retire through Ports::seat closes that pane, the pin's leases are released operator-signed by HOLDER (a sibling on the same bead keeps its lease), then the roster row is deregistered; refuses the captain/operator seat by role and a working pin without --force-working)",
@@ -4078,7 +4081,15 @@ fn main() {
             repo,
             no_reservation_check,
             allow_empty,
-        }) => cmd_commit(paths, message, repo.as_deref(), *no_reservation_check, *allow_empty),
+            keep_lease,
+        }) => cmd_commit(
+            paths,
+            message,
+            repo.as_deref(),
+            *no_reservation_check,
+            *allow_empty,
+            *keep_lease,
+        ),
         Some(Commands::Tutorial) => cmd_tutorial(),
         #[cfg(feature = "serve")]
         Some(Commands::Daemon { cmd }) => cmd_daemon(&cfg, cmd),
