@@ -1,92 +1,121 @@
-// bd-9os20: first-party Claude Code module. Follows toron events through
-// Claude Code's own MCP connection ($.mcp.call), so the plugin holds no token.
-// One bus event -> one claim (bd-tdpix wake-rung) -> one delivery: prompt.submit
-// for mail on an idle seat, session.append for urgent mail mid-turn. Wakes to
-// subagent sessions are dropped. No keystrokes are ever sent to a pane.
+// bd-9os20/bd-gu288: first-party Claude Code module. The local
+// `flywheel mcp-events` proxy owns the toron token and speaks the real
+// events/* JSON-RPC methods; this module only reads its notification stream,
+// claims each event, and starts a turn. No token, no typing, no body text.
 
 import { claimEvent } from "../src/claim.ts";
-import { decide, statusHealthy, MAX_FAILURES } from "../src/decide.ts";
+import { decide } from "../src/decide.ts";
+import { decodeFrame } from "../src/decode.ts";
+import { wakeHint } from "../src/hint.ts";
 
-const POLL_MS = 15_000;
 const RUNG = process.env.FLYWHEEL_WAKE_RUNG_DIR || "";
 
-function hint(id: string, urgent: boolean): string {
-  return `[flywheel] ${urgent ? "Urgent mail" : "Mail"} event=${id}. Pull: toron next — run: toron next`;
+export interface Piece {
+  stream: string;
+  text: string;
+}
+export type SpawnFn = (
+  argv: readonly string[],
+  env: Record<string, string | undefined>,
+) => AsyncIterable<Piece>;
+
+export interface RegisterDeps {
+  spawn?: SpawnFn;
+  flywheelBin?: string;
 }
 
-export const register = (on) => {
+export const register = (on: any, deps: RegisterDeps = {}) => {
   let failures = 0;
   let stopped = false;
-  let clearTimer = null;
   let pin = "";
+  let clearTimer: (() => void) | null = null;
 
   const status = async ($, text) => {
     try {
       await $.ui.status(text);
     } catch {
-      // status is advisory; a missing status surface never loses a wake
+      // advisory status surface; never lose a wake because it is missing
     }
   };
 
-  async function poll($) {
-    if (stopped || !pin || !RUNG) return;
+  let startChild = (_$: any) => {};
+
+  const consume = async ($, child: AsyncIterable<Piece>, subscriptionId: string) => {
+    let buffer = "";
     try {
-      const frames =
-        (await $.mcp.call({
-          server: "toron",
-          tool: "events/poll",
-          arguments: { name: "mail.addressed", pin },
-        })) || [];
-      failures = 0;
-      for (const frame of frames) {
-        const id = String(frame.id ?? "");
-        if (!id || !claimEvent(RUNG, id)) continue;
-        const content = String(frame.content ?? "");
-        const urgent =
-          content.includes("plane-P urgent") ||
-          content.includes("URGENT steer") ||
-          content.includes("request-release");
-        const idle =
-          typeof $.session?.busy === "function" ? !$.session.busy() : true;
-        const decision = decide({
-          id,
-          urgent,
-          idle,
-          subagent: Boolean(frame.subagent),
-          claimed: true,
-          failures,
-        });
-        if (decision.action === "submit") {
-          await $.prompt.submit({ text: hint(id, urgent) });
-        } else if (decision.action === "append") {
-          await $.session.append({
-            message: { type: "user", content: [{ type: "text", text: hint(id, urgent) }] },
+      for await (const piece of child) {
+        if (piece.stream !== "stdout") continue;
+        buffer += piece.text;
+        let at: number;
+        while ((at = buffer.indexOf("\n")) >= 0) {
+          const line = buffer.slice(0, at);
+          buffer = buffer.slice(at + 1);
+          const frame = decodeFrame(line, subscriptionId);
+          if (!frame || !claimEvent(RUNG, frame.id)) continue;
+          const idle = typeof $.session?.busy === "function" ? !$.session.busy() : true;
+          const decision = decide({
+            id: frame.id,
+            urgent: frame.urgent,
+            idle,
+            subagent: false,
+            claimed: true,
+            failures,
           });
+          const hint = wakeHint(frame, pin);
+          if (decision.action === "submit") await $.prompt.submit({ text: hint });
+          else if (decision.action === "append") {
+            await $.session.append({
+              message: { type: "user", content: [{ type: "text", text: hint }] },
+            });
+          }
+          failures = 0;
+          await status($, decision.status);
         }
-        await status($, decision.status);
       }
     } catch {
       failures += 1;
-      if (failures >= MAX_FAILURES) {
+      if (failures >= 3) {
         stopped = true;
         if (clearTimer) clearTimer();
-        await status($, `flywheel wake delivery stopped: ${failures} failed checks (check toron MCP)`);
+        await status($, "flywheel wake delivery stopped: 3 failed checks (check the toron connection)");
+      } else if (!stopped) {
+        // A dead proxy is one failed check, not the end of delivery: reconnect
+        // and count again. Three consecutive failures stop with a status line.
+        const retry = () => void startChild($);
+        if (typeof $.clock?.after === "function") $.clock.after(0, retry);
+        else setTimeout(retry, 0);
       }
     }
-  }
+  };
+
+  startChild = ($) => {
+    const tokenPath = process.env.FLYWHEEL_TORON_TOKEN_FILE;
+    const env = tokenPath ? { FLYWHEEL_TORON_TOKEN_FILE: tokenPath } : {};
+    const argv: readonly string[] = [
+      deps.flywheelBin ?? "flywheel",
+      "mcp-events",
+      "--subscription",
+      pin,
+    ];
+    const child = deps.spawn
+      ? deps.spawn(argv, env)
+      : ($.process.spawn({ argv, env }) as AsyncIterable<Piece>);
+    void consume($, child, pin);
+  };
 
   on("session.start", async ($, event, next) => {
     pin = process.env.FLYWHEEL_PIN || "";
     failures = 0;
     stopped = false;
-    await status($, statusHealthy());
+    if (stopped || !pin || !RUNG) return next(event);
+    await status($, "flywheel wake delivery active");
+    // The proxy echoes the pin as its subscription id (native_subscribe_result).
+    startChild($);
     if (clearTimer) clearTimer();
-    clearTimer = $.clock.every(POLL_MS, () => void poll($));
+    clearTimer = $.clock.every(15_000, () => void status($, "flywheel wake delivery active"));
     return next(event);
   });
 
-  // No delivery state lives here: the engine already drops a submit when the
-  // operator typed first, and subagent wakes are dropped in decide().
   on("prompt.submit", async ($, event, next) => next(event));
   on("session.append", async ($, event, next) => next(event));
 };
