@@ -1917,6 +1917,18 @@ pub fn audit_file(state_dir: &Path, workspace: &str) -> PathBuf {
         .join(format!("{workspace}.audit.jsonl"))
 }
 
+/// bd-6qae0: only the once-per-episode blocked notice goes to the captain as
+/// a fact; ordinary audit rows stay in the journal.
+pub fn should_notify_captain(kind: &str) -> bool {
+    kind == "blocked_notice"
+}
+
+/// bd-6qae0: the captain's copy of a blocked-seat notice. The detail is the
+/// plain-language text from agent_text; prefix names the class for the reader.
+pub fn captain_fact_for_blocked(detail: &str) -> String {
+    format!("[blocked seat] {detail}")
+}
+
 pub fn audit_append(state_dir: &Path, workspace: &str, entry: serde_json::Value) {
     use std::io::Write;
     let path = audit_file(state_dir, workspace);
@@ -2538,6 +2550,16 @@ pub fn write_unanswered(path: &Path, pins: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn blocked_notice_becomes_a_captain_fact() {
+        let detail = "AmberProbe is waiting on a permission prompt. The mail is held; clear the prompt, then run toron next.";
+        let fact = super::captain_fact_for_blocked(detail);
+        assert!(fact.contains("AmberProbe") && fact.contains("permission prompt"));
+        assert!(fact.starts_with("[blocked seat]"));
+        assert!(super::should_notify_captain("blocked_notice"));
+        assert!(!super::should_notify_captain("queued"));
+    }
+
     /// bd-0gup: the inject budget must be charged under ONE lock.
     ///
     /// The old code did an unlocked load -> check -> `std::fs::write`

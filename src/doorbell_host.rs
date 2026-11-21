@@ -1387,6 +1387,17 @@ impl Host for RtHost {
             &self.cfg,
             drain_waits,
         );
+        // bd-6qae0: a held mail must reach the CAPTAIN as a plain-language
+        // fact, not only as an audit row the human never reads.
+        for cmd in &cmds {
+            if let workspace::Cmd::Audit { kind, detail, .. } = cmd
+                && crate::doorbell::should_notify_captain(kind)
+            {
+                let _ = self.brain_tx.try_send(BrainMsg::Fact {
+                    summary: crate::doorbell::captain_fact_for_blocked(detail),
+                });
+            }
+        }
         if let Some(recorder) = self.state_log.as_ref()
             && let Err(refusal) = recorder.enqueue(&self.model, &[])
         {
