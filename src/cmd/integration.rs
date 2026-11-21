@@ -57,6 +57,46 @@ fn codex_hooks() -> PathBuf {
         .join("hooks.json")
 }
 
+fn codex_config() -> PathBuf {
+    std::env::var("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".codex"))
+        .join("config.toml")
+}
+
+/// Pure TOML edit: make sure `[features] hooks = true` is present, preserving
+/// every other line. Codex needs this flag for its hook files to run.
+pub fn with_codex_hooks_flag(text: &str) -> String {
+    let mut in_features = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_features = t == "[features]";
+            continue;
+        }
+        if in_features
+            && t.starts_with("hooks")
+            && t.split('=')
+                .nth(1)
+                .is_some_and(|v| v.trim().trim_matches('"') == "true")
+        {
+            return text.to_string();
+        }
+    }
+    let mut out = text.trim_end_matches('\n').to_string();
+    if let Some(at) = out.find("[features]") {
+        let after = at + "[features]".len();
+        out.insert_str(after, "\nhooks = true");
+    } else {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("[features]\nhooks = true");
+    }
+    out.push('\n');
+    out
+}
+
 fn grok_hooks() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".grok/hooks/flywheel.json")
 }
@@ -138,6 +178,11 @@ pub fn cmd_integration(cfg: &Config, cmd: IntegrationCmd) -> Result<()> {
                     events_for(&kind),
                 );
                 write_atomic(&path, &config)?;
+                if crate::harness_registry::canonical(&kind) == "codex" {
+                    let cfg_path = codex_config();
+                    let raw = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+                    std::fs::write(&cfg_path, with_codex_hooks_flag(&raw))?;
+                }
                 println!("installed {kind} hooks at {}", path.display());
             }
             IntegrationCmd::Uninstall { .. } => {
@@ -166,4 +211,29 @@ pub fn cmd_integration(cfg: &Config, cmd: IntegrationCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_hooks_flag_is_added_once_and_preserves_other_config() {
+        let original = "[model]\nname = \"gpt\"\n";
+        let with = with_codex_hooks_flag(original);
+        assert!(with.contains("[features]\nhooks = true"));
+        assert!(with.contains("[model]\nname = \"gpt\""));
+        assert_eq!(
+            with_codex_hooks_flag(&with),
+            with,
+            "install twice is idempotent"
+        );
+    }
+
+    #[test]
+    fn codex_hooks_flag_uses_an_existing_features_section() {
+        let original = "[features]\nother = true\n";
+        let with = with_codex_hooks_flag(original);
+        assert_eq!(with, "[features]\nhooks = true\nother = true\n");
+    }
 }
