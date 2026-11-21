@@ -223,6 +223,10 @@ cleanup() {
       find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'fw-proof.*' \
         ! -name "$(basename "$TMP")" -exec rm -rf {} + 2>/dev/null || true
     fi
+    # bd-9dxjt: a kept export keeps only logs, receipt and source. The real
+    # proof-owned target dirs are multi-GB; drop them on this exit path too so
+    # --keep never piles up a target per export (the disk was at 87%).
+    rm -rf "$TMP/target" "$TMP/toron/target"
   else
     rm -rf "$TMP"
   fi
@@ -233,6 +237,11 @@ trap cleanup EXIT
 # older fw-proof.* dirs and sets TMPDIR (with a trailing slash) to reproduce the
 # exact path spelling that deleted proof46's own kept export.
 if [ -n "${CLEAN_PROOF_KEEP_TEST:-}" ]; then
+  # bd-9dxjt: seed fake proof-owned target dirs so the EXIT cleanup's target
+  # removal is exercised without a real multi-GB build.
+  mkdir -p "$TMP/target" "$TMP/toron/target"
+  printf 'target\n' >"$TMP/target/marker"
+  printf 'toron\n' >"$TMP/toron/target/marker"
   exit "$CLEAN_PROOF_KEEP_TEST"
 fi
 

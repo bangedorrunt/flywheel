@@ -13,7 +13,11 @@ Ops crib: `~/.agents/skills/flywheel/SKILL.md`. Detail lives under
 Rust runs through mbx. Prefix every cargo command with
 `mbx +nightly-aarch64-apple-darwin` (bare `cargo` misparses under the mbx shim),
 and never set `CARGO_TARGET_DIR`: mbx shares one managed target and cache across
-the fleet.
+the fleet. The only exceptions are proof-owned, ephemeral exports —
+`clean-proof.sh`, `verify-mutations.sh` and `e2e-live.sh` set it to a real target
+dir under their throwaway `$TMP` so a concurrent lane's `mbx gc` cannot evict
+their test binaries mid-run (bd-9dxjt). Crews do not copy this into normal
+builds.
 
 ```bash
 # develop and test (targeted: -p <crate> <filter>)

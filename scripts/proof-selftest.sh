@@ -147,6 +147,23 @@ else
   fail "changed-mode receipt does not record how the set was chosen"
 fi
 
+# --- 5. --keep drops the multi-GB target dirs but keeps the rest (bd-9dxjt) ---
+# A kept proof export must keep only logs/receipt/source; the real target dirs
+# are multi-GB and would pile up one per --keep on a nearly-full disk.
+keepbase="$TMP/keep-hook"
+mkdir -p "$keepbase"
+unset CLEAN_PROOF_SLOTTED CLEAN_PROOF_SNAPSHOTTED CLEAN_PROOF_SNAPSHOT_DIR
+CLEAN_PROOF_KEEP_TEST=0 TMPDIR="$keepbase/" CLEAN_PROOF_REPO_ROOT="$ROOT" \
+  CLEAN_PROOF_LOCK_FILE="$TMP/keep.lock" \
+  bash "$ROOT/scripts/clean-proof.sh" --keep >/dev/null 2>&1 || true
+kept="$(find "$keepbase" -maxdepth 1 -type d -name 'fw-proof.*' 2>/dev/null | head -1)"
+if [ -n "$kept" ] && [ ! -e "$kept/target" ] && [ ! -e "$kept/toron/target" ] \
+   && [ -f "$kept/cache-stores.tsv" ]; then
+  pass "--keep drops the proof-owned target dirs, keeps the other artifacts"
+else
+  fail "--keep must drop target dirs and keep logs/receipt/source (bd-9dxjt)"
+fi
+
 if [ "$FAILED" -ne 0 ]; then
   echo "proof-selftest: FAILED" >&2
   exit 1

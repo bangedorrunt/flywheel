@@ -49,6 +49,12 @@ esac
 CURRENT="${dirs[0]}"
 pass "trailing-slash TMPDIR: old export pruned, current kept"
 
+# bd-9dxjt: --keep keeps logs/receipt/source but not the multi-GB target dirs.
+[ -f "$CURRENT/cache-stores.tsv" ] || fail "kept export lost its non-target artifacts"
+[ ! -e "$CURRENT/target" ] || fail "kept export still holds the proof-owned target dir"
+[ ! -e "$CURRENT/toron/target" ] || fail "kept export still holds the sibling target dir"
+pass "kept export drops target dirs, keeps the rest"
+
 # --- a red proof must leave the previous kept export intact ---
 printf 'previous\n' >"$CURRENT/marker"
 run_proof 1
