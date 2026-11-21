@@ -18,7 +18,7 @@
 
 | Verb | Workflow | Cron | Recipe/Squad | Profile |
 |---|---|---|---|---|
-| **create** | `flywheel workflow new <name>` + edit YAML | `flywheel cron add <name> --template <wf> --cron "30 3 * * 0" --owner housekeeper` | add `[recipes.<name>]` to `~/.config/flywheel/recipes.toml` | `flywheel profile create <name> --harness ... --model ... --behavior ...` |
+| **create** | `flywheel workflow new <name>` + edit YAML | add `~/.config/flywheel/crons/<name>.yaml` (or `<project>/.flywheel/crons/`) then `flywheel cron lint` | add `[recipes.<name>]` to `~/.config/flywheel/recipes.toml` | `flywheel profile create <name> --harness ... --model ... --behavior ...` |
 | **list** | `flywheel workflow list` | `flywheel cron list` | `flywheel squad list` | `flywheel profile list` |
 | **show** | `flywheel workflow show <name>` | `flywheel cron show <name>` | `flywheel squad show <name>` | `flywheel profile show <name>` |
 | **execute** | `flywheel workflow run <name> --execute [--inputs '{}'] [--crew auto]` | `flywheel cron start` (runs the registry) | `flywheel squad spawn <name>` | `flywheel profile run <name> [--workflow <wf>]` |
@@ -303,15 +303,20 @@ lifecycle delivery.
 Smart cron (ADR-0005 Spec 3 + ADR-0010 Spec E): a schedule owned by a profile that reports
 failure → bead → escalation. Cron defaults to **headless** (no workspace churn; structured logs).
 
-```bash
-# Register a cron bound to a workflow + owner profile
-flywheel cron add weekly-docker-upgrade \
-  --template docker-upgrade \
-  --cron "30 3 * * 0" \
-  --owner housekeeper \
-  --scope host \
-  --mode headless          # ADR-0010: headless (default) | pane
+```yaml
+# Author a cron in ~/.config/flywheel/crons/weekly-docker-upgrade.yaml
+# (or <project>/.flywheel/crons/)
+name: weekly-docker-upgrade
+schedule: "30 3 * * 0"
+owner: housekeeper
+scope: host
+mode: headless                # ADR-0010: headless (default) | pane
+steps:
+  - { name: upgrade, action: call_workflow, workflow: docker-upgrade }
+```
 
+```bash
+flywheel cron lint             # gate the registry
 # Inspect + control
 flywheel cron list --json
 flywheel cron show weekly-docker-upgrade
@@ -346,7 +351,7 @@ restart with `latest` catch-up.
 ```bash
 flywheel model list                       # the registry
 flywheel model show claude-sonnet-4
-flywheel model add <id> --provider anthropic --cost-in 3 --cost-out 15 --caps "code,reason"
+flywheel model add <id> --provider anthropic --cost-in-per-mtok 3 --cost-out-per-mtok 15 --caps "code,reason"
 flywheel model remove <id>
 ```
 `Profile.model` resolves against this registry; the resolved model is injected at spawn via the
@@ -379,7 +384,7 @@ Headless run logs (`runs/*.jsonl`) feed this view; pane runs feed from the proje
 | run a reusable multi-step procedure once | `flywheel workflow run <name> --execute` |
 | run a procedure in solo durable mode | `/loop-mode` / `flywheel loop-mode run <project>` |
 | run a procedure in captain-led multi-crew mode | `/swarm-mode` / `flywheel steer ...` |
-| run that procedure on a schedule, unattended | `flywheel cron add ...` + `flywheel cron start` |
+| run that procedure on a schedule, unattended | author a cron YAML + `flywheel cron lint`, then `flywheel cron start` |
 | spawn a fixed team shape repeatedly | define a recipe/squad → `flywheel squad spawn <name>` |
 | fan out N agents on one step | `parallel over: "@crew.<role>"` in a workflow |
 | add a new role/persona | `flywheel profile create <name> ...` |

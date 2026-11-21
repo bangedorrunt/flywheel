@@ -114,7 +114,7 @@ Hard rules:
 flywheel workflow list                 # name, source (builtin|catalog), trigger, crew
 flywheel workflow show <name>          # full definition
 flywheel workflow lint                 # ALL workflows; exit 0 clean, 1 blocking, 2 parse error
-flywheel workflow lint --only <name>   # one workflow
+flywheel workflow lint <name>   # one workflow
 ```
 
 ### 3.2 Run a workflow (SHIPPED)
@@ -208,7 +208,7 @@ is missing catalog:
 ```bash
 flywheel workflow new <name>    # scaffold a catalog entry
 # write the YAML (start from the composed shape), then:
-flywheel workflow lint --only <name>
+flywheel workflow lint <name>
 ```
 
 SHIPPED (W6): `--keep <name>` automates graduation from a green composed
@@ -255,7 +255,7 @@ findings." No single catalog workflow does both in sequence.
 3. Write the YAML into the scaffolded catalog entry, translating the parts:
    two `dispatch_job` steps (assignee `@scout` / `@coder`, the same stage
    bodies), outputs chained via `{{steps.<name>.output}}`.
-4. `flywheel workflow lint --only explore-then-fix` → exit 0.
+4. `flywheel workflow lint explore-then-fix` → exit 0.
 5. Dry-run once, then it is catalog: future agents hit Tutorial A.
 
 ---
@@ -399,7 +399,7 @@ claim.
 ## 10. Quick reference
 
 ```bash
-flywheel workflow list | show <n> | lint [--only <n>]
+flywheel workflow list | show <n> | lint [<n>]
 flywheel workflow run <n> [--execute --mode headless|pane --project <p>] [--inputs '<json>']
 flywheel workflow compose "<target>" [--base <wf>] [--parts a,b] [--agent] [--run --project <p>]
 flywheel workflow seed [--json]       # copy built-ins into the user tier, never overwrite
