@@ -43,9 +43,8 @@ pub fn seat_config_dir(state_dir: &Path, project: &str, pin: &str) -> PathBuf {
     seat_dir(state_dir, project, pin).join("config")
 }
 
-/// Grok discovers hooks from `~/.claude/settings.json` — HOME, not
-/// XDG_CONFIG_HOME (grok's embedded "Hook Locations" doc). Give the grok seat
-/// its own HOME so that path is the seat's, never the operator's.
+/// A per-seat HOME for harnesses that resolve config from `os.homedir()`
+/// (gemini) or `~/.claude`/`~/.codex`. Never the operator's HOME.
 pub fn seat_home_dir(state_dir: &Path, project: &str, pin: &str) -> PathBuf {
     seat_dir(state_dir, project, pin).join("home")
 }
@@ -127,9 +126,11 @@ pub fn install(state_dir: &Path, project: &str, pin: &str, kind: &str) -> std::i
     let canonical = crate::harness_registry::canonical(kind);
     let cmd = format!("flywheel hook {{event}} --project {project} --pin {pin}");
     let (base, rel, body) = match canonical.as_str() {
+        // CODEX_HOME points at the seat config dir; codex reads
+        // $CODEX_HOME/hooks.json (default ~/.codex/hooks.json).
         "codex" => (
             seat_config_dir(state_dir, project, pin),
-            ".codex/hooks.json",
+            "hooks.json",
             serde_json::json!({
                 "hooks": {
                     "Stop": [{"command": cmd.replace("{event}", "stop")}],
@@ -139,11 +140,12 @@ pub fn install(state_dir: &Path, project: &str, pin: &str, kind: &str) -> std::i
                 }
             }),
         ),
-        // Grok reads ~/.claude/settings.json from HOME, in the "hooks":
-        // [{ "hooks": [{ "type": "command", "command": … }] }] shape.
+        // Grok's "Hook Locations" doc lists $GROK_HOME/hooks/*.json as a
+        // global source. GROK_HOME relocates the config dir WITHOUT changing
+        // HOME, so credentials/git/ssh stay on the operator's HOME.
         "grok" => (
-            seat_home_dir(state_dir, project, pin),
-            ".claude/settings.json",
+            seat_config_dir(state_dir, project, pin),
+            "hooks/flywheel.json",
             serde_json::json!({
                 "hooks": {
                     "Stop": [{"hooks": [{"type": "command", "command": cmd.replace("{event}", "stop")}]}],
@@ -152,8 +154,11 @@ pub fn install(state_dir: &Path, project: &str, pin: &str, kind: &str) -> std::i
                 }
             }),
         ),
+        // Gemini CLI resolves settings at path.join(os.homedir(), ".gemini",
+        // "settings.json") in its dist (Notifications.js), so the seat HOME
+        // carries a copy of the operator's ~/.gemini/settings.json plus hooks.
         "gemini" => (
-            seat_config_dir(state_dir, project, pin),
+            seat_home_dir(state_dir, project, pin),
             ".gemini/settings.json",
             serde_json::json!({
                 "hooks": {
@@ -171,6 +176,36 @@ pub fn install(state_dir: &Path, project: &str, pin: &str, kind: &str) -> std::i
         ));
     }
     let path = base.join(rel);
+    // Seed harness-own config from the operator home so login/auth settings
+    // survive the relocated config dir. Copies, never symlinks: a harness that
+    // writes its config must not mutate the operator's file.
+    if canonical == "grok"
+        && let Ok(home) = std::env::var("HOME")
+    {
+        let from = std::path::Path::new(&home).join(".grok/config.toml");
+        let to = base.join("config.toml");
+        if !to.exists()
+            && let Ok(raw) = std::fs::read(&from)
+        {
+            let _ = std::fs::create_dir_all(&base);
+            let _ = std::fs::write(to, raw);
+        }
+    }
+    if canonical == "gemini"
+        && let Ok(home) = std::env::var("HOME")
+    {
+        let from = std::path::Path::new(&home).join(".gemini/settings.json");
+        let mut merged = std::fs::read_to_string(&from)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .unwrap_or_default();
+        if let (Some(dst), Some(src)) = (merged.as_object_mut(), body.as_object()) {
+            for (key, value) in src {
+                dst.insert(key.clone(), value.clone());
+            }
+        }
+        return write_json(&path, &merged);
+    }
     write_json(&path, &body)
 }
 
@@ -221,19 +256,15 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("b2kaa-install-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         for (kind, base, rel) in [
-            (
-                "codex",
-                seat_config_dir(&dir, "p", "Pin"),
-                ".codex/hooks.json",
-            ),
+            ("codex", seat_config_dir(&dir, "p", "Pin"), "hooks.json"),
             (
                 "grok",
-                seat_home_dir(&dir, "p", "Pin"),
-                ".claude/settings.json",
+                seat_config_dir(&dir, "p", "Pin"),
+                "hooks/flywheel.json",
             ),
             (
                 "gemini",
-                seat_config_dir(&dir, "p", "Pin"),
+                seat_home_dir(&dir, "p", "Pin"),
                 ".gemini/settings.json",
             ),
         ] {
@@ -244,7 +275,7 @@ mod tests {
         // Grok's config carries no permissions deny list — the ADR-0010 D13
         // guard checks the shape, not the path.
         let grok: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(seat_home_dir(&dir, "p", "Pin").join(".claude/settings.json"))
+            &std::fs::read_to_string(seat_config_dir(&dir, "p", "Pin").join("hooks/flywheel.json"))
                 .unwrap(),
         )
         .unwrap();

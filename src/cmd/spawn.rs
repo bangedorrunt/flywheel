@@ -2124,15 +2124,25 @@ projects available: {}",
             {
                 let state_dir = crate::config::state_dir();
                 crate::turn_hooks::install(&state_dir, project, pin, &kind)?;
-                if crate::harness_registry::canonical(&kind) == "grok" {
+                let canonical = crate::harness_registry::canonical(&kind);
+                let seat_cfg = crate::turn_hooks::seat_config_dir(&state_dir, project, pin);
+                if canonical == "grok" {
+                    // GROK_HOME relocates grok's config dir (and its
+                    // hooks/*.json source) without changing HOME.
+                    pane_env.insert(
+                        "GROK_HOME".to_string(),
+                        utf8_path(&seat_cfg, "seat grok home")?,
+                    );
+                } else if canonical == "codex" {
+                    pane_env.insert(
+                        "CODEX_HOME".to_string(),
+                        utf8_path(&seat_cfg, "seat codex home")?,
+                    );
+                } else {
+                    // Gemini resolves settings from os.homedir()/.gemini, so
+                    // only its HOME is per-seat; auth files are seeded there.
                     let seat_home = crate::turn_hooks::seat_home_dir(&state_dir, project, pin);
                     pane_env.insert("HOME".to_string(), utf8_path(&seat_home, "seat home dir")?);
-                } else {
-                    let seat_cfg = crate::turn_hooks::seat_config_dir(&state_dir, project, pin);
-                    pane_env.insert(
-                        "XDG_CONFIG_HOME".to_string(),
-                        utf8_path(&seat_cfg, "seat config dir")?,
-                    );
                 }
             }
             let pane_id = if first {
