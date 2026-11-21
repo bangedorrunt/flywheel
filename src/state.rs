@@ -370,6 +370,26 @@ pub fn find_seat_by_pin(pin: &str) -> Option<(String, SpawnEntry)> {
     None
 }
 
+/// Record a harness session id (e.g. `agy:<conversation>`) on a seat row from
+/// the seat's own hook report (bd-edva3). No spawner-env read.
+pub fn record_harness_session(project: &str, pin: &str, session: &str) -> bool {
+    let path = spawn_registry_file(project);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(mut rows) = serde_json::from_str::<Vec<SpawnEntry>>(&raw) else {
+        return false;
+    };
+    let Some(seat) = rows
+        .iter_mut()
+        .find(|s| s.mail_identity.as_deref() == Some(pin))
+    else {
+        return false;
+    };
+    seat.harness_session = Some(session.to_string());
+    save_spawn_registry(project, &rows).is_ok()
+}
+
 pub fn spawn_registry_file(project: &str) -> PathBuf {
     agents_dir().join(format!("{}.json", spawn_registry_key(project)))
 }

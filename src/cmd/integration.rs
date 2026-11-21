@@ -138,6 +138,9 @@ fn write_atomic(path: &Path, value: &serde_json::Value) -> Result<()> {
 
 fn events_for(kind: &str) -> &'static [&'static str] {
     match crate::harness_registry::canonical(kind).as_str() {
+        // bd-edva3: antigravity learns the conversation id from a
+        // PreInvocation hook report, not from the spawner's environment.
+        "antigravity" => &["PreInvocation", "Stop", "PostToolUse"],
         "codex" => CODEX_EVENTS,
         "grok" => &["Stop", "PostToolUse", "SessionEnd"],
         _ => CLAUDE_EVENTS,

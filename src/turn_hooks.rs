@@ -100,6 +100,20 @@ fn read_mail(state_dir: &Path, project: &str, pin: &str) -> MailSignal {
     read_json(&mail_path(state_dir, project, pin)).unwrap_or_default()
 }
 
+/// Parse the conversation id from an antigravity PreInvocation hook payload
+/// (stdin JSON). The id is typed data, never guessed from the spawner env.
+pub fn conversation_id_from_payload(stdin: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(stdin).ok()?;
+    for key in ["conversationId", "conversation_id", "conversation"] {
+        if let Some(id) = v.get(key).and_then(serde_json::Value::as_str)
+            && !id.trim().is_empty()
+        {
+            return Some(id.trim().to_string());
+        }
+    }
+    None
+}
+
 /// One hook invocation. Returns the plain-language line the harness should
 /// inject, if any; the caller prints it and the harness continues the turn.
 pub fn on_event(state_dir: &Path, project: &str, pin: &str, event: &str) -> Option<String> {
@@ -141,6 +155,19 @@ pub fn on_event(state_dir: &Path, project: &str, pin: &str, event: &str) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversation_id_comes_from_the_hook_payload() {
+        assert_eq!(
+            conversation_id_from_payload(r#"{"conversationId":"conv-42"}"#),
+            Some("conv-42".to_string())
+        );
+        assert_eq!(conversation_id_from_payload("not json"), None);
+        assert_eq!(
+            conversation_id_from_payload(r#"{"conversationId":""}"#),
+            None
+        );
+    }
 
     #[test]
     fn turn_state_is_keyed_by_project_then_pin() {

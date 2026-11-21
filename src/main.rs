@@ -3802,10 +3802,21 @@ fn main() {
                 .map(crate::harness_registry::canonical);
             if crate::integration::hook_allowed(in_pane, &pin, agent, seat_harness.as_deref())
                 && let Some((project, _)) = seat
-                && let Some(line) =
-                    crate::turn_hooks::on_event(&config::state_dir(), &project, &pin, event)
             {
-                println!("{line}");
+                if event == "PreInvocation" {
+                    use std::io::Read as _;
+                    let mut payload = String::new();
+                    let _ = std::io::stdin().read_to_string(&mut payload);
+                    if let Some(id) = crate::turn_hooks::conversation_id_from_payload(&payload) {
+                        state::record_harness_session(&project, &pin, &format!("agy:{id}"));
+                    }
+                    return;
+                }
+                if let Some(line) =
+                    crate::turn_hooks::on_event(&config::state_dir(), &project, &pin, event)
+                {
+                    println!("{line}");
+                }
             }
             Ok(())
         }
