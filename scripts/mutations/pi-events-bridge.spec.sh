@@ -12,7 +12,7 @@ mutation "P1  a plaintext token env replaces the file path" \
         "FLYWHEEL_TORON_TOKEN_FILE".to_string(),
         token_path.display().to_string(),
     );' \
-    replace='    env.insert("FLYWHEEL_TORON_TOKEN".to_string(), "literal-token".to_string());'
+    replace=$'    let _ = &token_path;\n    env.insert("FLYWHEEL_TORON_TOKEN".to_string(), "literal-token".to_string());'
 
 mutation "P2  the seat settings no longer load the extension" \
     file=src/hc.rs \
