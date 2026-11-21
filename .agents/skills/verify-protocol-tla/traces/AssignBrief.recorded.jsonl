@@ -1,0 +1,6 @@
+{"holders":[],"live":[],"notified":[],"withdrawnPins":[]}
+{"action":"Assign","holders":[],"live":[],"notified":[],"params":["p1",false],"withdrawnPins":[]}
+{"action":"Brief","holders":["p1"],"live":["b1"],"notified":[],"params":["b1"],"withdrawnPins":[]}
+{"action":"Assign","holders":["p1"],"live":["b1"],"notified":[],"params":["p2",true],"withdrawnPins":[]}
+{"action":"Brief","holders":["p2"],"live":["b2"],"notified":["p1"],"params":["b2"],"withdrawnPins":["p1"]}
+{"action":"Done","holders":[],"live":[],"notified":["p1"],"params":["b2"],"withdrawnPins":["p1"]}

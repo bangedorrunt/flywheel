@@ -1,0 +1,4 @@
+{"holders":[],"live":[],"notified":[],"withdrawnPins":[]}
+{"action":"Assign","holders":[],"live":[],"notified":[],"params":["p1",false],"withdrawnPins":[]}
+{"action":"Brief","holders":["p1"],"live":["b1"],"notified":[],"params":["b1"],"withdrawnPins":[]}
+{"action":"Brief","holders":["p1"],"live":["b1"],"notified":[],"params":["b1"],"withdrawnPins":[]}

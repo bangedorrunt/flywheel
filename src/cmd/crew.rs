@@ -930,6 +930,12 @@ fn load_briefs(project: &str) -> crate::crew_briefs::BriefBook {
         .unwrap_or_default()
 }
 
+/// The live brief on a bead thread, if any. The assign gate reads this:
+/// a bead with a live brief is held until it is done or withdrawn.
+pub(crate) fn live_brief_for_bead(project: &str, bead: &str) -> Option<crate::crew_briefs::Brief> {
+    load_briefs(project).live_for_bead(bead).cloned()
+}
+
 fn save_briefs(project: &str, book: &crate::crew_briefs::BriefBook) -> Result<()> {
     let path = briefs_path(project);
     if let Some(parent) = path.parent() {
@@ -948,9 +954,20 @@ fn now_us() -> u64 {
 }
 
 /// Record a dispatch as a brief and append the id the crew replies with.
-fn open_brief(project: &str, pin: &str, subject: &str) -> Result<String> {
+/// On a bead thread the live brief is replaced: the new brief carries
+/// `supersedes` naming the old id, and the book marks the old one
+/// withdrawn so `crew inbox --open` only ever shows the live one.
+fn open_brief(
+    project: &str,
+    pin: &str,
+    subject: &str,
+    bead: Option<&str>,
+) -> Result<(String, Option<String>)> {
     let mut book = load_briefs(project);
     let id = format!("{}-{}", pin, now_us());
+    let superseded = bead
+        .and_then(|b| book.live_for_bead(b))
+        .map(|b| b.id.clone());
     let brief = crate::crew_briefs::Brief {
         id: id.clone(),
         pin: pin.to_string(),
@@ -959,10 +976,14 @@ fn open_brief(project: &str, pin: &str, subject: &str) -> Result<String> {
         closed_ts_us: None,
         receipt: None,
         receipt_typed: false,
+        bead: bead.map(str::to_string),
+        supersedes: superseded.clone(),
+        withdrawn_ts_us: None,
     };
-    book.reduce(crate::crew_briefs::Msg::Opened(brief));
+    let now = now_us();
+    book.reduce(crate::crew_briefs::Msg::Opened { brief, now_us: now });
     save_briefs(project, &book)?;
-    Ok(id)
+    Ok((id, superseded))
 }
 
 /// The crew's structured reply (bd-0uzrq.4): close the brief, then wake the
@@ -1323,7 +1344,8 @@ pub(crate) fn cmd_crew_prompt(
     // bd-0uzrq.4: the dispatch IS a brief. Its id rides the body so the crew
     // replies with the one verb that closes it, and `crew inbox --open` can
     // show what nobody answered.
-    let brief = open_brief(project, pin, prompt.lines().next().unwrap_or(prompt))?;
+    let (brief, superseded) =
+        open_brief(project, pin, prompt.lines().next().unwrap_or(prompt), bead)?;
     let project_dir = crate::project_dir(cfg, project);
     let traps = if project_dir.is_dir() {
         crate::cmd::memory::briefing_traps(prompt, Some(project), bead, Some(&project_dir))
@@ -1336,8 +1358,11 @@ pub(crate) fn cmd_crew_prompt(
     } else {
         format!("\n\n{}", traps_block.trim_end())
     };
+    let supersedes_line = superseded
+        .map(|old| format!("\nSupersedes: {old}"))
+        .unwrap_or_default();
     let prompt = format!(
-        "{prompt}{traps_suffix}\n\n---\nBrief id: {brief}\nReply when done: flywheel crew done {brief} --receipt \"<commit sha + proof receipt + test tail>\" --project {project}"
+        "{prompt}{traps_suffix}\n\n---\nBrief id: {brief}{supersedes_line}\nReply when done: flywheel crew done {brief} --receipt \"<commit sha + proof receipt + test tail>\" --project {project}"
     );
     let dispatch = PromptDispatch {
         pin: pin.to_string(),
@@ -1544,7 +1569,8 @@ mod bd_9nck5_tests {
                 .expect("register");
         }
         crate::state::save_captain_alias(&project, "SlateHarbor").expect("captain alias");
-        let brief = super::open_brief(&project, brief_pin, "bd-9nck5 witness").expect("brief");
+        let (brief, _) =
+            super::open_brief(&project, brief_pin, "bd-9nck5 witness", None).expect("brief");
 
         match agent {
             Some(a) => unsafe { std::env::set_var("AGENT_NAME", a) },

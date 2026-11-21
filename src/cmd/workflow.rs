@@ -341,7 +341,7 @@ pub(crate) enum WorkflowCmd {
     /// Check registered statecharts' topology: every state reachable, every reachable leaf can reach
     /// its goal. Guards count as enabled; no model checker runs. Optionally print topology-only TLA+.
     Verify {
-        /// Chart or workflow name: P2PNegotiation, Seat, Plan, or a catalog
+        /// Chart or workflow name: P2PNegotiation, Seat, Plan, LeaseWaitlist, Brief, ResultMail, or a catalog
         /// workflow (wave-swarm is verified as the workflow now). Omit for all.
         name: Option<String>,
         /// Export compiled TLA+ specification for each verified chart.
@@ -2166,8 +2166,11 @@ fn project_workflow_names(root: &Path) -> BTreeSet<String> {
 }
 
 fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> Result<()> {
+    use crate::elm::brief_statechart::build_brief_machine;
+    use crate::elm::lease_waitlist_statechart::build_lease_waitlist_machine;
     use crate::elm::p2p_negotiation::{P2PNegotiationState, build_p2p_negotiation_machine};
     use crate::elm::plan_statechart::build_plan_machine;
+    use crate::elm::result_mail_statechart::build_result_mail_machine;
     use crate::elm::seat_statechart::build_seat_machine;
 
     fn verify_p2p(export_tla: bool) -> WorkflowVerifyChartReport {
@@ -2199,6 +2202,69 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
             "a final state",
             is_final,
             export_tla.then(|| machine.to_tla_named("Seat")),
+            None,
+            &ChartFindings::default(),
+        )
+    }
+
+    fn verify_brief(export_tla: bool) -> WorkflowVerifyChartReport {
+        use toron_core::kernel::StateNodeType;
+        let machine = build_brief_machine();
+        let topology = machine.topology();
+        let is_final = |state: &_| {
+            topology
+                .nodes
+                .get(state)
+                .is_some_and(|node| node.node_type == StateNodeType::Final)
+        };
+        chart_report(
+            "Brief",
+            &topology,
+            "a final state",
+            is_final,
+            export_tla.then(|| machine.to_tla_named("Brief")),
+            None,
+            &ChartFindings::default(),
+        )
+    }
+
+    fn verify_result_mail(export_tla: bool) -> WorkflowVerifyChartReport {
+        use toron_core::kernel::StateNodeType;
+        let machine = build_result_mail_machine();
+        let topology = machine.topology();
+        let is_final = |state: &_| {
+            topology
+                .nodes
+                .get(state)
+                .is_some_and(|node| node.node_type == StateNodeType::Final)
+        };
+        chart_report(
+            "ResultMail",
+            &topology,
+            "a final state",
+            is_final,
+            export_tla.then(|| machine.to_tla_named("ResultMail")),
+            None,
+            &ChartFindings::default(),
+        )
+    }
+
+    fn verify_lease_waitlist(export_tla: bool) -> WorkflowVerifyChartReport {
+        use toron_core::kernel::StateNodeType;
+        let machine = build_lease_waitlist_machine();
+        let topology = machine.topology();
+        let is_final = |state: &_| {
+            topology
+                .nodes
+                .get(state)
+                .is_some_and(|node| node.node_type == StateNodeType::Final)
+        };
+        chart_report(
+            "LeaseWaitlist",
+            &topology,
+            "a final state",
+            is_final,
+            export_tla.then(|| machine.to_tla_named("LeaseWaitlist")),
             None,
             &ChartFindings::default(),
         )
@@ -2236,6 +2302,30 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
     }
     if want_all || matches!(want.as_str(), "plan" | "plan-statechart" | "planstatechart") {
         reports.push(verify_plan(export_tla));
+    }
+    if want_all
+        || matches!(
+            want.as_str(),
+            "leasewaitlist" | "lease-waitlist" | "lease-waitlist-statechart"
+        )
+    {
+        reports.push(verify_lease_waitlist(export_tla));
+    }
+    if want_all
+        || matches!(
+            want.as_str(),
+            "resultmail" | "result-mail" | "result-mail-statechart"
+        )
+    {
+        reports.push(verify_result_mail(export_tla));
+    }
+    if want_all
+        || matches!(
+            want.as_str(),
+            "brief" | "brief-statechart" | "briefstatechart"
+        )
+    {
+        reports.push(verify_brief(export_tla));
     }
     // Catalog workflows (ADR-0021 D5.2 slice A, bd-36zlq): one chart report
     // per lowered workflow from the layered catalog — builtins, then the
@@ -2279,7 +2369,7 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
     }
     if reports.is_empty() {
         bail!(
-            "unknown statechart {} (expected P2PNegotiation, Seat, Plan, or a workflow name)",
+            "unknown statechart {} (expected P2PNegotiation, Seat, Plan, LeaseWaitlist, Brief, ResultMail, or a workflow name)",
             name.unwrap_or("")
         );
     }

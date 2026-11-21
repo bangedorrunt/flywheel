@@ -12,6 +12,9 @@
 use serde::{Deserialize, Serialize};
 
 /// One brief: the id the crew replies with, who it went to, and when.
+/// A brief sent on a bead thread carries `bead` plus the id it replaces
+/// in `supersedes`; the replaced brief is marked `withdrawn_ts_us` and
+/// leaves the open list so a crew never acts on a stale instruction.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Brief {
     pub id: String,
@@ -25,6 +28,15 @@ pub struct Brief {
     /// bd-bi0mv: true when `receipt` is canonical typed JSON rather than prose.
     #[serde(default, skip_serializing_if = "is_false")]
     pub receipt_typed: bool,
+    /// The bead thread this brief was sent on, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bead: Option<String>,
+    /// The older brief on the same bead this one replaces, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    /// When this brief was withdrawn by a newer one on the same bead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withdrawn_ts_us: Option<u64>,
 }
 
 fn is_false(v: &bool) -> bool {
@@ -41,7 +53,10 @@ pub struct BriefBook {
 /// What can happen to the book.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Msg {
-    Opened(Brief),
+    Opened {
+        brief: Brief,
+        now_us: u64,
+    },
     /// The crew's structured reply. `receipt` is what proved the work.
     Done {
         id: String,
@@ -69,10 +84,20 @@ pub struct OpenBrief {
 impl BriefBook {
     pub fn reduce(&mut self, msg: Msg) -> Vec<Effect> {
         match msg {
-            Msg::Opened(brief) => {
+            Msg::Opened { brief, now_us } => {
                 if self.briefs.iter().any(|b| b.id == brief.id) {
                     // A replayed open is not a second brief.
                     return Vec::new();
+                }
+                if let Some(bead) = brief.bead.as_deref() {
+                    for b in self.briefs.iter_mut() {
+                        if b.bead.as_deref() == Some(bead)
+                            && b.closed_ts_us.is_none()
+                            && b.withdrawn_ts_us.is_none()
+                        {
+                            b.withdrawn_ts_us = Some(now_us);
+                        }
+                    }
                 }
                 self.briefs.push(brief);
                 Vec::new()
@@ -100,14 +125,14 @@ impl BriefBook {
         }
     }
 
-    /// Every brief with no reply yet, oldest first, with its age. `pin`
-    /// narrows to one crew: "what is outstanding for THIS pin".
+    /// Every brief with no reply yet that no newer brief withdrew,
+    /// oldest first, with its age. `pin` narrows to one crew.
     pub fn open_for(&self, pin: Option<&str>, now_us: u64) -> Vec<OpenBrief> {
         let mut rows: Vec<OpenBrief> = self
             .briefs
             .iter()
             .filter(|b| pin.is_none_or(|p| b.pin == p))
-            .filter(|b| b.closed_ts_us.is_none())
+            .filter(|b| b.closed_ts_us.is_none() && b.withdrawn_ts_us.is_none())
             .map(|b| OpenBrief {
                 id: b.id.clone(),
                 pin: b.pin.clone(),
@@ -121,6 +146,15 @@ impl BriefBook {
 
     pub fn get(&self, id: &str) -> Option<&Brief> {
         self.briefs.iter().find(|b| b.id == id)
+    }
+
+    /// The live brief on a bead thread, if any: not closed, not withdrawn.
+    pub fn live_for_bead(&self, bead: &str) -> Option<&Brief> {
+        self.briefs.iter().find(|b| {
+            b.bead.as_deref() == Some(bead)
+                && b.closed_ts_us.is_none()
+                && b.withdrawn_ts_us.is_none()
+        })
     }
 }
 
@@ -137,6 +171,9 @@ mod tests {
             closed_ts_us: None,
             receipt: None,
             receipt_typed: false,
+            bead: None,
+            supersedes: None,
+            withdrawn_ts_us: None,
         }
     }
 
@@ -145,7 +182,10 @@ mod tests {
     #[test]
     fn an_unanswered_brief_ages_into_the_open_list() {
         let mut book = BriefBook::default();
-        book.reduce(Msg::Opened(brief("b1", "FrostyCreek", 1_000_000_000)));
+        book.reduce(Msg::Opened {
+            brief: brief("b1", "FrostyCreek", 1_000_000_000),
+            now_us: 1_000_000_000,
+        });
         let open = book.open_for(None, 1_000_000_000 + 90 * 1_000_000);
         assert_eq!(open.len(), 1, "{open:?}");
         assert_eq!(open[0].pin, "FrostyCreek");
@@ -157,7 +197,10 @@ mod tests {
     #[test]
     fn a_done_reply_closes_the_brief_and_wakes_the_captain_once() {
         let mut book = BriefBook::default();
-        book.reduce(Msg::Opened(brief("b1", "FrostyCreek", 1)));
+        book.reduce(Msg::Opened {
+            brief: brief("b1", "FrostyCreek", 1),
+            now_us: 1,
+        });
         let effects = book.reduce(Msg::Done {
             id: "b1".into(),
             receipt: "commit abc123, proof green".into(),
@@ -184,7 +227,10 @@ mod tests {
     #[test]
     fn a_replayed_reply_emits_nothing() {
         let mut book = BriefBook::default();
-        book.reduce(Msg::Opened(brief("b1", "FrostyCreek", 1)));
+        book.reduce(Msg::Opened {
+            brief: brief("b1", "FrostyCreek", 1),
+            now_us: 1,
+        });
         let first = book.reduce(Msg::Done {
             id: "b1".into(),
             receipt: "once".into(),
@@ -226,9 +272,18 @@ mod tests {
     #[test]
     fn the_open_list_filters_to_one_pin() {
         let mut book = BriefBook::default();
-        book.reduce(Msg::Opened(brief("a1", "FrostyCreek", 1)));
-        book.reduce(Msg::Opened(brief("a2", "BoldBay", 1)));
-        book.reduce(Msg::Opened(brief("a3", "FrostyCreek", 1)));
+        book.reduce(Msg::Opened {
+            brief: brief("a1", "FrostyCreek", 1),
+            now_us: 1,
+        });
+        book.reduce(Msg::Opened {
+            brief: brief("a2", "BoldBay", 1),
+            now_us: 1,
+        });
+        book.reduce(Msg::Opened {
+            brief: brief("a3", "FrostyCreek", 1),
+            now_us: 1,
+        });
         assert_eq!(
             book.open_for(None, 2).len(),
             3,
@@ -242,6 +297,238 @@ mod tests {
         assert!(
             book.open_for(Some("Nobody"), 2).is_empty(),
             "an unknown pin has no briefs"
+        );
+    }
+
+    fn bead_brief(id: &str, pin: &str, bead: &str, opened: u64) -> Brief {
+        Brief {
+            id: id.to_string(),
+            pin: pin.to_string(),
+            subject: format!("brief {id}"),
+            opened_ts_us: opened,
+            closed_ts_us: None,
+            receipt: None,
+            receipt_typed: false,
+            bead: Some(bead.to_string()),
+            supersedes: None,
+            withdrawn_ts_us: None,
+        }
+    }
+
+    /// A newer brief on the same bead withdraws the live one, so the crew
+    /// only ever sees one live instruction per bead.
+    #[test]
+    fn a_newer_brief_on_the_same_bead_withdraws_the_live_one() {
+        let mut book = BriefBook::default();
+        book.reduce(Msg::Opened {
+            brief: bead_brief("old", "FrostyCreek", "bd-x", 1),
+            now_us: 1,
+        });
+        book.reduce(Msg::Opened {
+            brief: bead_brief("new", "BoldBay", "bd-x", 2),
+            now_us: 2,
+        });
+        let open = book.open_for(None, 3);
+        assert_eq!(
+            open.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["new"],
+            "the older brief leaves the open list: {open:?}"
+        );
+        assert_eq!(
+            book.get("old").and_then(|b| b.withdrawn_ts_us),
+            Some(2),
+            "the older brief is marked withdrawn"
+        );
+        assert_eq!(
+            book.live_for_bead("bd-x").map(|b| b.id.as_str()),
+            Some("new")
+        );
+    }
+
+    /// Briefs on different beads never withdraw each other.
+    #[test]
+    fn briefs_on_different_beads_stay_live_together() {
+        let mut book = BriefBook::default();
+        book.reduce(Msg::Opened {
+            brief: bead_brief("one", "FrostyCreek", "bd-1", 1),
+            now_us: 1,
+        });
+        book.reduce(Msg::Opened {
+            brief: bead_brief("two", "BoldBay", "bd-2", 2),
+            now_us: 2,
+        });
+        assert_eq!(book.open_for(None, 3).len(), 2);
+    }
+
+    /// bd-vk0do: a real book run (open, supersede, done) conforms to
+    /// AssignBrief; briefing the live id twice is rejected naming Brief.
+    /// With FLYWHEEL_EVERYSTATE set the checker runs, so a plain
+    /// `cargo test` proves the trace end to end.
+    #[test]
+    fn a_recorded_open_supersede_done_conforms() {
+        use serde_json::json;
+
+        fn holders_of(book: &BriefBook) -> Vec<&str> {
+            let mut holders: Vec<&str> = book
+                .briefs
+                .iter()
+                .filter(|b| b.closed_ts_us.is_none() && b.withdrawn_ts_us.is_none())
+                .filter(|b| {
+                    book.live_for_bead("bd-x").map(|l| l.id.as_str()) == Some(b.id.as_str())
+                })
+                .map(|b| b.pin.as_str())
+                .collect();
+            holders.sort();
+            holders.dedup();
+            holders
+        }
+        fn live_of(book: &BriefBook) -> Vec<&str> {
+            let mut live: Vec<&str> = book
+                .briefs
+                .iter()
+                .filter(|b| b.closed_ts_us.is_none() && b.withdrawn_ts_us.is_none())
+                .filter(|b| b.bead.as_deref() == Some("bd-x"))
+                .map(|b| b.id.as_str())
+                .collect();
+            live.sort();
+            live
+        }
+        fn withdrawn_of(book: &BriefBook) -> Vec<&str> {
+            let mut withdrawn: Vec<&str> = book
+                .briefs
+                .iter()
+                .filter(|b| b.withdrawn_ts_us.is_some())
+                .map(|b| b.pin.as_str())
+                .collect();
+            withdrawn.sort();
+            withdrawn
+        }
+        fn obs(book: &BriefBook, action: &str, params: serde_json::Value) -> serde_json::Value {
+            json!({
+                "action": action,
+                "params": params,
+                "holders": holders_of(book),
+                "live": live_of(book),
+                "withdrawnPins": withdrawn_of(book),
+                "notified": withdrawn_of(book),
+            })
+        }
+
+        let mut book = BriefBook::default();
+        let mut trace = vec![json!({
+            "holders": [], "live": [], "withdrawnPins": [], "notified": [],
+        })];
+        // Open for A: the grant, then the brief.
+        trace.push(obs(&book, "Assign", json!(["p1", false])));
+        book.reduce(Msg::Opened {
+            brief: bead_brief("b1", "p1", "bd-x", 1),
+            now_us: 1,
+        });
+        trace.push(obs(&book, "Brief", json!(["b1"])));
+        // Open for B: a re-grant that withdraws, then the superseding brief.
+        trace.push(obs(&book, "Assign", json!(["p2", true])));
+        book.reduce(Msg::Opened {
+            brief: bead_brief("b2", "p2", "bd-x", 2),
+            now_us: 2,
+        });
+        trace.push(obs(&book, "Brief", json!(["b2"])));
+        // Close the live brief.
+        book.reduce(Msg::Done {
+            id: "b2".into(),
+            receipt: "done".into(),
+            now_us: 3,
+        });
+        trace.push(obs(&book, "Done", json!(["b2"])));
+
+        let actions: Vec<&str> = trace
+            .iter()
+            .skip(1)
+            .filter_map(|o| o["action"].as_str())
+            .collect();
+        assert_eq!(
+            actions,
+            vec!["Assign", "Brief", "Assign", "Brief", "Done"],
+            "the run grants, briefs, re-grants, supersedes, closes: {actions:?}"
+        );
+
+        let to_jsonl = |trace: &[serde_json::Value]| {
+            trace
+                .iter()
+                .map(|o| serde_json::to_string(o).expect("json"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"
+        };
+        let out_path = |var: &str, fallback: &str| {
+            std::env::var(var)
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::env::temp_dir().join(fallback))
+        };
+        let good_jsonl = to_jsonl(&trace);
+        let good = out_path("CONFORM_TRACE_OUT", "ab-recorded.jsonl");
+        if std::env::var("CONFORM_TRACE_OUT").is_err()
+            && std::env::var("FLYWHEEL_EVERYSTATE").is_err()
+        {
+            let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(".agents/skills/verify-protocol-tla/traces/AssignBrief.recorded.jsonl");
+            assert_eq!(
+                std::fs::read_to_string(&fixture).expect("checked-in recorded trace"),
+                good_jsonl,
+                "the recorded trace drifted from the real run; regenerate the fixture"
+            );
+        }
+        std::fs::write(&good, &good_jsonl).expect("write trace");
+
+        // Doctored: brief the live id twice. The spec forbids it.
+        let mut bad = trace[..3].to_vec();
+        bad.push(trace[2].clone());
+        let bad_jsonl = to_jsonl(&bad);
+        let bad_path = out_path("CONFORM_BAD_TRACE_OUT", "ab-double-brief.jsonl");
+        if std::env::var("CONFORM_BAD_TRACE_OUT").is_err()
+            && std::env::var("FLYWHEEL_EVERYSTATE").is_err()
+        {
+            let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(".agents/skills/verify-protocol-tla/traces/AssignBrief.double-brief.jsonl");
+            assert_eq!(
+                std::fs::read_to_string(&fixture).expect("checked-in doctored trace"),
+                bad_jsonl,
+                "the doctored trace drifted; regenerate the fixture"
+            );
+        }
+        std::fs::write(&bad_path, bad_jsonl).expect("write bad trace");
+
+        let Some(checker) = std::env::var("FLYWHEEL_EVERYSTATE").ok() else {
+            return;
+        };
+        let models = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".agents/skills/verify-protocol-tla/models");
+        let run = |trace: &std::path::Path| {
+            std::process::Command::new(&checker)
+                .arg("conform")
+                .arg("-trace")
+                .arg(trace)
+                .arg("-config")
+                .arg(models.join("AssignBrief.cfg"))
+                .arg(models.join("AssignBrief.tla"))
+                .output()
+                .expect("everystate conform")
+        };
+        let ok = run(&good);
+        assert!(
+            ok.status.success(),
+            "recorded trace must conform: {}",
+            String::from_utf8_lossy(&ok.stdout)
+        );
+        let bad_out = run(&bad_path);
+        assert_eq!(bad_out.status.code(), Some(20), "double brief must fail");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&bad_out.stdout),
+            String::from_utf8_lossy(&bad_out.stderr)
+        );
+        assert!(
+            text.contains("Brief"),
+            "the rejection names the step: {text}"
         );
     }
 }

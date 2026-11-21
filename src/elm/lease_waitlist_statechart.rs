@@ -204,50 +204,50 @@ pub fn build_lease_waitlist_machine() -> Machine<LeaseState, LeaseEvent, LeaseCo
     LeaseWaitlistProgramDef::machine()
 }
 
-/// Pure projection of one statechart step into `LeaseWaitlist.tla` variable
-/// names for `everystate conform`. No clock, socket or env here — the driver
-/// test owns the file write.
-#[must_use]
-pub fn conform_step(event: &LeaseEvent, ctx: &LeaseContext) -> serde_json::Value {
-    let (action, params) = match event {
-        LeaseEvent::Acquire { pin } => (
-            if ctx.notified.contains(pin) {
-                "Queue"
-            } else {
-                "AcquireFree"
-            },
-            vec![pin.clone()],
-        ),
-        LeaseEvent::Release { source } => ("Release", vec![source.clone()]),
-        LeaseEvent::Expire => ("Release", vec!["ttl".to_string()]),
-        LeaseEvent::Withdraw { pin } => ("Withdraw", vec![pin.clone()]),
-        LeaseEvent::Retire => ("Retire", vec![]),
-    };
-    let pad = |v: &Vec<String>| -> Vec<String> {
-        let mut out = v.clone();
-        while out.len() < 2 {
-            out.push("none".into());
-        }
-        out
-    };
-    serde_json::json!({
-        "action": action,
-        "params": params,
-        "holder": ctx.holder.iter().cloned().collect::<Vec<_>>(),
-        "arr": pad(&ctx.notified),
-        "arrLen": ctx.notified.len(),
-        "srv": pad(&ctx.served),
-        "srvLen": ctx.served.len(),
-        "queued": ctx.queue,
-        "arrived": ctx.notified,
-        "notified": ctx.notified,
-        "badRelease": [],
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pure projection of one statechart step into `LeaseWaitlist.tla`
+    /// variable names for `everystate conform`. No clock, socket or env
+    /// here — the driver test owns the file write.
+    #[must_use]
+    fn conform_step(event: &LeaseEvent, ctx: &LeaseContext) -> serde_json::Value {
+        let (action, params) = match event {
+            LeaseEvent::Acquire { pin } => (
+                if ctx.notified.contains(pin) {
+                    "Queue"
+                } else {
+                    "AcquireFree"
+                },
+                vec![pin.clone()],
+            ),
+            LeaseEvent::Release { source } => ("Release", vec![source.clone()]),
+            LeaseEvent::Expire => ("Release", vec!["ttl".to_string()]),
+            LeaseEvent::Withdraw { pin } => ("Withdraw", vec![pin.clone()]),
+            LeaseEvent::Retire => ("Retire", vec![]),
+        };
+        let pad = |v: &Vec<String>| -> Vec<String> {
+            let mut out = v.clone();
+            while out.len() < 2 {
+                out.push("none".into());
+            }
+            out
+        };
+        serde_json::json!({
+            "action": action,
+            "params": params,
+            "holder": ctx.holder.iter().cloned().collect::<Vec<_>>(),
+            "arr": pad(&ctx.notified),
+            "arrLen": ctx.notified.len(),
+            "srv": pad(&ctx.served),
+            "srvLen": ctx.served.len(),
+            "queued": ctx.queue,
+            "arrived": ctx.notified,
+            "notified": ctx.notified,
+            "badRelease": [],
+        })
+    }
 
     #[test]
     fn one_message_log_hands_off_fifo_and_accounts_for_every_waiter() {

@@ -117,6 +117,7 @@ expect_pass JobLease JobLease
 expect_pass BindBeforePrompt BindBeforePrompt
 expect_pass PlanApply PlanApply
 expect_pass ClaimExclusion ClaimExclusion
+expect_pass AssignBrief AssignBrief
 expect_pass Respawn Respawn
 expect_pass DeferredHandoff DeferredHandoff
 expect_pass P2pDelivery P2pDelivery
@@ -127,8 +128,11 @@ expect_pass DispatcherReap DispatcherReap
 expect_pass JournalAppend JournalAppend
 expect_pass JournalRotate JournalRotate
 expect_pass SupervisorRetire SupervisorRetire
+expect_pass MailQueue MailQueue
 expect_pass PeerContention PeerContention
 expect_pass ReservationBoard ReservationBoard
+expect_pass ResultMail ResultMail
+expect_pass LeaseWaitlist LeaseWaitlist
 expect_pass TrackerCas TrackerCas
 expect_pass EventsDedupe EventsDedupe
 
@@ -139,6 +143,9 @@ expect_violation JobLease JobLease.broken-revive-terminal TerminalStable
 expect_violation Respawn Respawn.broken-claim-before-free OneLiveHolder
 expect_violation Respawn Respawn.broken-drop-reservations ReservationsKept
 expect_violation ClaimExclusion ClaimExclusion.broken-allow-author NoSelfReview
+expect_violation AssignBrief AssignBrief.broken-double-claim OneClaimant
+expect_violation AssignBrief AssignBrief.broken-no-withdraw OneLiveBrief
+expect_violation AssignBrief AssignBrief.broken-silent-reassign WithdrawalDelivered
 expect_violation PlanApply PlanApply.broken-clobber EveryAppendLands
 expect_violation BindBeforePrompt BindBeforePrompt.broken-prompt-first PromptedImpliesBound
 expect_violation DeferredHandoff DeferredHandoff.broken-memory-only NoLostWake
@@ -158,15 +165,32 @@ expect_violation SupervisorRetire SupervisorRetire.broken-delete-on-failure Plis
 expect_violation PeerContention PeerContention.broken-no-tiebreak AtMostOneHolder
 expect_violation ReservationBoard ReservationBoard.broken-truncated-grants NoGrantWithoutCompleteBoard
 expect_violation ReservationBoard ReservationBoard.broken-no-refresh AtMostOneHolder
+expect_violation LeaseWaitlist LeaseWaitlist.broken-double-holder OneHolder
+expect_violation LeaseWaitlist LeaseWaitlist.broken-lifo FifoHandoff
+expect_violation LeaseWaitlist LeaseWaitlist.broken-drop-waiter NoLostWaiter
+expect_violation LeaseWaitlist LeaseWaitlist.broken-no-ttl HandoffOnEveryRelease
+expect_violation MailQueue MailQueue.broken-double ExactlyOnce
+expect_violation MailQueue MailQueue.broken-memory-only NoLostSend
+expect_violation MailQueue MailQueue.broken-recorr SameCorr
+expect_violation ResultMail ResultMail.broken-dup-row OwnerNotifiedOnce
+expect_violation ResultMail ResultMail.broken-replay-land LandNotifiedOnce
+expect_violation ResultMail ResultMail.broken-green-mail NoMailOnGreen
 expect_violation TrackerCas TrackerCas.broken-stale-splice NoClosedRowLost
 expect_violation EventsDedupe EventsDedupe.broken-ring-twice AtMostOnceRing
 
 
 echo "verify-formal: trace conformance (recorded doorbell runs)"
 expect_conform DeferredQueue "$PWD/$(dirname "$MODELS")/traces/DeferredQueue.recorded.jsonl"
+expect_conform AssignBrief "$PWD/$(dirname "$MODELS")/traces/AssignBrief.recorded.jsonl"
+expect_nonconform AssignBrief "$PWD/$(dirname "$MODELS")/traces/AssignBrief.double-brief.jsonl" 20 "Brief"
 expect_nonconform DeferredQueue "$PWD/$(dirname "$MODELS")/traces/DeferredQueue.double-ring.jsonl" 20 "Ring"
+expect_conform MailQueue "$PWD/$(dirname "$MODELS")/traces/MailQueue.recorded.jsonl"
+expect_nonconform MailQueue "$PWD/$(dirname "$MODELS")/traces/MailQueue.double-delivery.jsonl" 20 "Double"
+expect_conform ResultMail "$PWD/$(dirname "$MODELS")/traces/ResultMail.recorded.jsonl"
 expect_conform TrackerCas "$PWD/$(dirname "$MODELS")/traces/TrackerCas.recorded.jsonl"
 expect_nonconform TrackerCas "$PWD/$(dirname "$MODELS")/traces/TrackerCas.stale-splice.jsonl" 20 "CasOk"
+expect_conform LeaseWaitlist "$PWD/$(dirname "$MODELS")/traces/LeaseWaitlist.recorded.jsonl"
+expect_nonconform LeaseWaitlist "$PWD/$(dirname "$MODELS")/traces/LeaseWaitlist.no-holder-release.jsonl" 20 "Release"
 
 # Every model in the directory must be exercised: a new .tla that nobody added
 # an expectation for would otherwise pass silently as "not run".

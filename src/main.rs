@@ -1472,6 +1472,10 @@ enum Commands {
         /// optional extra instruction for the agents
         #[arg(long)]
         msg: Option<String>,
+        /// replace the current holder: refuse becomes a withdrawal mail
+        /// to the old holder instead of an error (bd-vk0do)
+        #[arg(long)]
+        reassign: bool,
     },
     /// toron mail coordination surfaces
     Mail {
@@ -3210,6 +3214,7 @@ fn main() {
                 "commit <paths> -m <msg> [--repo <dir>] [--no-reservation-check] [--allow-empty] [--keep-lease] (bd-aberm private-index commit of exactly those paths; bd-62ei8 refuses when the private tree equals HEAD — name the unchanged paths — unless --allow-empty; bd-u1n91 releases committed leases on success unless --keep-lease)",
                 "ship check <bead> [--json] | ship land <bead> --sha <40hex> --receipt <file> [--project <p>] [--as <pin>] [--message <m>] [--repo <dir>] (one verb: gate -> close -> sync -> release -> commit THIS bead's tracker rows -> check; idempotent, prints the resume command on failure; another lane's dirty tracker row never blocks; --repo names the repo holding the citing commit and the receipt's specs when the work lives elsewhere, symmetric with br close --repo; the HEAD-lock race other lanes cause is retried, not surfaced)",
                 "spawn <project> [--kind K=N ...] [--assign PIN=BEAD[,BEAD] ...] [--dry-run --json] [--patch <seat>.<field>=<value> (repeatable; re-resolves the seat with from: user)] [--model harness-default leaves the harness's own model untouched] [--yes] (ADR-0022 plan spawn; see --help for the full flag list)",
+                "assign <project> --to <pin> --beads <bd> [--msg <m>] [--reassign] (bd-vk0do: refuses with '<pin> holds <path> for <bead>' when a lease, intent or live brief on the bead belongs to another pin; --reassign mails that holder a withdrawal and proceeds)",
                 "retire <pin>... [--project <p>] [--force-working] [--as <pin>] [--json] (bd-rilvn: the thin per-pin stop verb over the seat path — ONE journaled SeatEffect::Retire through Ports::seat closes that pane, the pin's leases are released operator-signed by HOLDER (a sibling on the same bead keeps its lease), then the roster row is deregistered; refuses the captain/operator seat by role and a working pin without --force-working)",
             "swarm plan <project> [spawn flags] | swarm apply <project> [--patch <seat>.<field>=<value>] [--count <role>=<n>] [--yes] [--dry-run] [--json] | seat adopt <pin> --pane <block> [--session <id>] | swarm status [<project>] [--json] (ADR-0022 rollout 6 + D7 remainder: plan prints the SAME flywheel-plan.v1 object as `spawn --dry-run --json`; apply is the one mechanism — patch/count -> pure reconciler -> the one `Ports::seat` interpreter, journal-first; fields harness|model|effort|mode|role (role only on apply; spawn rejects it); `--count role=+1` grows the fleet within crew.max; Spawn/InjectRole run live (InjectRole never for review/verify seats); `binding-rebind --model` routes here; status lists live seats with the plane's status; ADR-0022 D1: every apply is a plan EVENT first - the plan of record is the source of the desired seats, pending events fold in memory and land as ONE write only after every gate, and a planned SPAWN needs --yes)",
             "send interrupt view output watch attach kill",
@@ -3839,7 +3844,8 @@ fn main() {
             to,
             beads,
             msg,
-        }) => cmd_assign(&cfg, project, to, beads, msg.as_deref()),
+            reassign,
+        }) => cmd_assign(&cfg, project, to, beads, msg.as_deref(), *reassign),
         Some(Commands::Mail { cmd }) => cmd_mail(&cfg, cmd),
         Some(Commands::HookTrampoline { event, agent }) => {
             let pin = std::env::var("AGENT_NAME").unwrap_or_default();
@@ -14698,7 +14704,66 @@ fn cmd_mcp_events(_cfg: &Config, subscription: &str, follow: bool) -> Result<()>
     Ok(())
 }
 
-fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&str>) -> Result<()> {
+/// One reason an assign must refuse: who holds the bead and through what.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BeadHold {
+    pub holder: String,
+    pub path: String,
+    pub via: &'static str,
+}
+
+/// A lease or intent row the assign gate reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GateLease {
+    pub holder: String,
+    pub path: String,
+    pub reason: String,
+    pub expires_us: Option<i64>,
+}
+
+/// bd-vk0do: an assign refuses when another pin holds the bead — through a
+/// lease or intent whose reason is the bead, or through a live brief on the
+/// bead thread. Pure so the refusal is a unit test, not a live race.
+pub(crate) fn assign_holds(
+    leases: &[GateLease],
+    live_brief: Option<(&str, &str)>,
+    bead: &str,
+    targets: &[String],
+    now_us: i64,
+) -> Vec<BeadHold> {
+    let mut out = Vec::new();
+    for lease in leases {
+        if lease.reason == bead
+            && !targets.iter().any(|t| t == &lease.holder)
+            && lease.expires_us.is_none_or(|e| e > now_us)
+        {
+            out.push(BeadHold {
+                holder: lease.holder.clone(),
+                path: lease.path.clone(),
+                via: "lease",
+            });
+        }
+    }
+    if let Some((pin, id)) = live_brief
+        && !targets.iter().any(|t| t == pin)
+    {
+        out.push(BeadHold {
+            holder: pin.to_string(),
+            path: format!("brief:{id}"),
+            via: "brief",
+        });
+    }
+    out
+}
+
+fn cmd_assign(
+    cfg: &Config,
+    project: &str,
+    to: &str,
+    beads: &str,
+    msg: Option<&str>,
+    reassign: bool,
+) -> Result<()> {
     let mail = mail::Mail::from_config(Some(&cfg.toron_mail_config()))?.ok_or_else(|| {
         anyhow!(
             "agent-mail (toron) not configured — set [mail.toron] url in {}",
@@ -14741,6 +14806,65 @@ fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&s
         bail!(
             "no agent-mail identities found for {project} (register first: flywheel mail agents)"
         );
+    }
+    // bd-vk0do: a bead another pin holds refuses unless --reassign, which
+    // mails the old holder a withdrawal instead of failing.
+    let now_us = chrono::Utc::now().timestamp_micros();
+    let leases: Vec<GateLease> = mail
+        .list_active(&key, None, None)
+        .ok()
+        .and_then(|v| v.get("reservations")?.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| {
+            Some(GateLease {
+                holder: r.get("holder")?.as_str()?.to_string(),
+                path: r.get("path")?.as_str()?.to_string(),
+                reason: r.get("reason")?.as_str()?.to_string(),
+                expires_us: r.get("expires_ts_us").and_then(|v| v.as_i64()),
+            })
+        })
+        .collect();
+    for bead in &bead_ids {
+        let live = crate::cmd::crew::live_brief_for_bead(project, bead);
+        let holds = assign_holds(
+            &leases,
+            live.as_ref().map(|b| (b.pin.as_str(), b.id.as_str())),
+            bead,
+            &targets,
+            now_us,
+        );
+        if holds.is_empty() {
+            continue;
+        }
+        if !reassign {
+            let lines: Vec<String> = holds
+                .iter()
+                .map(|h| format!("{} holds {} for {}", h.holder, h.path, bead))
+                .collect();
+            bail!(
+                "assign refused: {}\n(re-run with --reassign to withdraw and replace the holder)",
+                lines.join("; ")
+            );
+        }
+        let mut warned = std::collections::BTreeSet::new();
+        for hold in &holds {
+            if !warned.insert(hold.holder.clone()) || targets.iter().any(|t| t == &hold.holder) {
+                continue;
+            }
+            mail.send(
+                &key,
+                std::slice::from_ref(&hold.holder),
+                &format!("[withdraw] {} → {}", project_base(project), bead),
+                &format!(
+                    "{bead} is reassigned to {}; stand down — your brief is withdrawn.",
+                    targets.join(", ")
+                ),
+                "high",
+                true,
+                Some(bead),
+            )?;
+        }
     }
     let subject = format!(
         "[assign] {} → {}",
@@ -15744,6 +15868,83 @@ mod wake_identity_tests {
         let picked = newest_urgent(&urgent, rows.first()).expect("fallback");
         assert_eq!(picked.get("id").and_then(|i| i.as_str()), Some("n1"));
         assert!(newest_urgent(&[], None).is_none());
+    }
+
+    /// bd-vk0do: a bead held by another pin refuses — through a lease
+    /// whose reason is the bead, or through a live brief on its thread.
+    /// The holder itself, an expired lease, and a foreign bead never block.
+    #[test]
+    fn vk0do_assign_refuses_a_bead_another_pin_holds() {
+        let leases = vec![
+            GateLease {
+                holder: "TealCove".into(),
+                path: "src/cmd/spawn.rs".into(),
+                reason: "bd-rrlo2".into(),
+                expires_us: Some(9_000_000),
+            },
+            GateLease {
+                holder: "TealCove".into(),
+                path: "src/old.rs".into(),
+                reason: "bd-old".into(),
+                expires_us: Some(1_000),
+            },
+        ];
+        let holds = assign_holds(
+            &leases,
+            Some(("BoldBay", "BoldBay-9")),
+            "bd-rrlo2",
+            &["CalmCliff".to_string()],
+            5_000_000,
+        );
+        assert_eq!(
+            holds,
+            vec![
+                BeadHold {
+                    holder: "TealCove".into(),
+                    path: "src/cmd/spawn.rs".into(),
+                    via: "lease",
+                },
+                BeadHold {
+                    holder: "BoldBay".into(),
+                    path: "brief:BoldBay-9".into(),
+                    via: "brief",
+                },
+            ],
+            "a live lease and a live brief both block: {holds:?}"
+        );
+        assert!(
+            assign_holds(
+                &leases,
+                None,
+                "bd-rrlo2",
+                &["TealCove".to_string()],
+                5_000_000,
+            )
+            .is_empty(),
+            "the holder itself re-assigns clean"
+        );
+        assert!(
+            assign_holds(
+                &leases,
+                None,
+                "bd-rrlo2",
+                &["Nobody".to_string()],
+                99_000_000,
+            )
+            .is_empty(),
+            "an expired lease never blocks"
+        );
+        assert!(
+            assign_holds(
+                &leases,
+                None,
+                "bd-other",
+                &["Nobody".to_string()],
+                5_000_000,
+            )
+            .is_empty(),
+            "a foreign bead never blocks"
+        );
     }
 
     /// bd-kryk: a system/transport notification (reservation release —
