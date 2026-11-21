@@ -27,6 +27,57 @@ use tokio::sync::mpsc;
 type WakeTaskSlot =
     Arc<Mutex<Option<(tokio::task::AbortHandle, Arc<std::sync::atomic::AtomicBool>)>>>;
 
+/// bd-8uozb: backoff between push re-arm attempts (2/4/8/16/32 s, capped).
+pub(crate) fn push_rearm_backoff(failures: u32) -> Duration {
+    Duration::from_secs(2u64 << failures.min(4))
+}
+
+/// bd-8uozb: while push is alive, the 30 s reconciliation poll suffices; the
+/// moment it dies we fall back to the 3 s poll so an urgent wake is not held
+/// for half a minute for the rest of the host's life.
+pub(crate) fn presence_poll_secs(push_enabled: bool, push_alive: bool) -> u64 {
+    if push_enabled && push_alive { 30 } else { 3 }
+}
+
+/// Drive one push subscription to its end, then re-arm with backoff. Everything
+/// touching the plane is injected so a test can hand out a finite stream and
+/// prove the re-arm. `on_event` returns false to end the loop (shutdown).
+pub(crate) fn run_push_with_rearm(
+    mut subscribe: impl FnMut() -> Result<Box<dyn toron_plane::backend::EventStream>, String>,
+    mut on_event: impl FnMut(toron_plane::backend::BackendEvent) -> bool,
+    mut sleep: impl FnMut(Duration),
+    alive: &std::sync::atomic::AtomicBool,
+) {
+    use std::sync::atomic::Ordering;
+    let mut failures = 0u32;
+    loop {
+        match subscribe() {
+            Ok(mut stream) => {
+                failures = 0;
+                alive.store(true, Ordering::Relaxed);
+                loop {
+                    match stream.read_event() {
+                        Ok(Some(ev)) => {
+                            if !on_event(ev) {
+                                return;
+                            }
+                        }
+                        Ok(None) => break, // stream ended; re-arm
+                        Err(e) => {
+                            eprintln!("flywheel doorbell: rex status stream error ({e:#})");
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => eprintln!("flywheel doorbell: rex status subscribe failed ({e:#})"),
+        }
+        alive.store(false, Ordering::Relaxed);
+        sleep(push_rearm_backoff(failures));
+        failures = failures.saturating_add(1);
+    }
+}
+
 /// bd-gefp: how often the embedded host asks the plane whether its workspace
 /// still resolves. The 1s liveness poll decides; this only paces the probe.
 const WORKSPACE_PROBE_SECS: u64 = 30;
@@ -668,35 +719,43 @@ impl RtHost {
         // flag is on. The poll below stays as a slow reconciliation fallback;
         // with the flag off nothing here changes (byte-identical).
         let push_enabled = cfg.doorbell_program_status_push();
+        let push_alive = Arc::new(std::sync::atomic::AtomicBool::new(false));
         if push_enabled {
             let push_tx = tx.clone();
             let push_cfg = cfg.clone();
             let push_project = project.clone();
             let push_panes = pane_ids.clone();
+            let alive = push_alive.clone();
             std::thread::spawn(move || {
-                let filters: Vec<_> = push_panes
-                    .iter()
-                    .map(|(pane, _)| {
-                        toron_plane::backend::types::Subscription::agent_status_changed(
-                            pane.clone(),
-                        )
-                    })
-                    .collect();
-                let backend = match crate::backend::factory::multiplexer_backend(&push_cfg) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        eprintln!("flywheel doorbell: rex status push unavailable ({e:#})");
-                        return;
-                    }
+                let subscribe = || -> Result<Box<dyn toron_plane::backend::EventStream>, String> {
+                    let panes: Vec<_> = {
+                        let mut seen: Vec<String> =
+                            push_panes.iter().map(|(p, _)| p.clone()).collect();
+                        seen.extend(
+                            state::load_spawn_registry(&push_project)
+                                .iter()
+                                .filter(|e| !e.pane_id.is_empty())
+                                .map(|e| e.pane_id.clone()),
+                        );
+                        seen.sort();
+                        seen.dedup();
+                        seen
+                    };
+                    let filters: Vec<_> = panes
+                        .iter()
+                        .map(|pane| {
+                            toron_plane::backend::types::Subscription::agent_status_changed(
+                                pane.clone(),
+                            )
+                        })
+                        .collect();
+                    let backend = crate::backend::factory::multiplexer_backend(&push_cfg)
+                        .map_err(|e| format!("rex status push unavailable ({e:#})"))?;
+                    backend
+                        .subscribe(&filters)
+                        .map_err(|e| format!("rex status subscribe failed ({e:#})"))
                 };
-                let mut stream = match backend.subscribe(&filters) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("flywheel doorbell: rex status subscribe failed ({e:#})");
-                        return;
-                    }
-                };
-                loop {
+                let on_event = |ev: toron_plane::backend::BackendEvent| {
                     let pin_by_pane: HashMap<String, String> =
                         state::load_spawn_registry(&push_project)
                             .iter()
@@ -705,21 +764,12 @@ impl RtHost {
                                 e.mail_identity.clone().map(|pin| (e.pane_id.clone(), pin))
                             })
                             .collect();
-                    match stream.read_event() {
-                        Ok(Some(ev)) => {
-                            if let Some(msg) = RtHost::program_status_to_brain(&ev, &pin_by_pane)
-                                && push_tx.blocking_send(msg).is_err()
-                            {
-                                return;
-                            }
-                        }
-                        Ok(None) => return, // stream ended; the poll reconciles
-                        Err(e) => {
-                            eprintln!("flywheel doorbell: rex status stream error ({e:#})");
-                            return;
-                        }
+                    match RtHost::program_status_to_brain(&ev, &pin_by_pane) {
+                        Some(msg) => push_tx.blocking_send(msg).is_ok(),
+                        None => true,
                     }
-                }
+                };
+                run_push_with_rearm(subscribe, on_event, std::thread::sleep, &alive);
             });
         }
         std::thread::spawn(move || {
@@ -730,7 +780,10 @@ impl RtHost {
             // never drained.
             let mut last: HashMap<String, String> = HashMap::new();
             loop {
-                std::thread::sleep(Duration::from_secs(if push_enabled { 30 } else { 3 }));
+                // bd-8uozb: the slow 30 s cadence is only while push is alive.
+                // A dead push re-arms with backoff and we drop to 3 s meanwhile.
+                let alive = push_alive.load(std::sync::atomic::Ordering::Relaxed);
+                std::thread::sleep(Duration::from_secs(presence_poll_secs(push_enabled, alive)));
                 let Ok(backend) = crate::backend::factory::multiplexer_backend(&cfg) else {
                     continue;
                 };
@@ -4586,5 +4639,85 @@ mod bd_346jl_binding_tests {
         };
         row.agent_status = status.parse().expect("status");
         row
+    }
+}
+
+#[cfg(test)]
+mod bd_8uozb_rearm_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use toron_plane::backend::{BackendError, EventStream};
+
+    struct FakeStream {
+        events: VecDeque<toron_plane::backend::BackendEvent>,
+    }
+    impl EventStream for FakeStream {
+        fn read_event(
+            &mut self,
+        ) -> Result<Option<toron_plane::backend::BackendEvent>, BackendError> {
+            Ok(self.events.pop_front())
+        }
+    }
+
+    fn status_event() -> toron_plane::backend::BackendEvent {
+        toron_plane::backend::BackendEvent::ProgramStatusChanged {
+            pane: "block:probe".into(),
+            agent: None,
+            status: toron_core::pane_types::AgentStatus::Idle,
+            state: Some("idle".into()),
+            kind: None,
+            id: None,
+        }
+    }
+
+    #[test]
+    fn a_push_stream_that_ends_rearms_and_restores_the_fast_poll() {
+        let alive = AtomicBool::new(false);
+        let subscribes = RefCell::new(0u32);
+        let sleeps: RefCell<Vec<Duration>> = RefCell::new(Vec::new());
+        let delivered = RefCell::new(0u32);
+
+        run_push_with_rearm(
+            || {
+                *subscribes.borrow_mut() += 1;
+                match *subscribes.borrow() {
+                    1 => Ok(Box::new(FakeStream {
+                        events: VecDeque::new(),
+                    }) as Box<dyn EventStream>), // ends immediately
+                    2 => Ok(Box::new(FakeStream {
+                        events: VecDeque::from([status_event()]),
+                    })),
+                    n => Err(format!("unexpected subscribe #{n}")),
+                }
+            },
+            |_ev| {
+                *delivered.borrow_mut() += 1;
+                false // stop after the first delivered event
+            },
+            |d| sleeps.borrow_mut().push(d),
+            &alive,
+        );
+
+        assert_eq!(*subscribes.borrow(), 2, "a dead stream must re-subscribe");
+        assert_eq!(*delivered.borrow(), 1, "the re-armed stream delivers");
+        assert!(!sleeps.borrow().is_empty(), "re-arm backs off");
+        assert_eq!(sleeps.borrow()[0], push_rearm_backoff(0));
+        assert_eq!(presence_poll_secs(true, false), 3, "dead push -> fast poll");
+        assert_eq!(presence_poll_secs(true, true), 30, "live push -> slow poll");
+        assert_eq!(
+            presence_poll_secs(false, true),
+            3,
+            "push disabled -> fast poll"
+        );
+        assert!(alive.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn rearm_backoff_is_bounded() {
+        assert_eq!(push_rearm_backoff(0), Duration::from_secs(2));
+        assert_eq!(push_rearm_backoff(3), Duration::from_secs(16));
+        assert_eq!(push_rearm_backoff(99), Duration::from_secs(32));
     }
 }
