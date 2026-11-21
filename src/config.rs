@@ -255,6 +255,10 @@ pub struct DoorbellSection {
     /// (ADR-0039 D8, bd-l5vb2). Default false — flag-off is byte-identical.
     #[serde(default)]
     pub toron_events: bool,
+    /// rex `program_status_changed` push as the authoritative status source
+    /// (bd-sfxu1). Default false — flag-off keeps the 3s poll byte-identical.
+    #[serde(default)]
+    pub program_status_push: bool,
     /// beads-poller sensor (bd-asr2.15, D7; ready-bead lane
     /// bd-ux-papercuts-t2u5): read-only WAL poll of the br sqlite (holds,
     /// issue changes, ready-bead appearances) emitting Fact Msgs. Default
@@ -819,6 +823,15 @@ impl Config {
         self.doorbell
             .as_ref()
             .map(|d| d.toron_events)
+            .unwrap_or(false)
+    }
+
+    /// bd-sfxu1: rex program_status push. False by default; flag-off is
+    /// byte-identical (the 3s poll stays the only status source).
+    pub fn doorbell_program_status_push(&self) -> bool {
+        self.doorbell
+            .as_ref()
+            .map(|d| d.program_status_push)
             .unwrap_or(false)
     }
 
@@ -2319,5 +2332,15 @@ daily = [
 
         let guard = lock_env();
         drop(guard);
+    }
+
+    #[cfg(test)]
+    mod program_status_push_tests {
+        use super::*;
+
+        #[test]
+        fn program_status_push_is_off_by_default_so_behaviour_is_byte_identical() {
+            assert!(!Config::default().doorbell_program_status_push());
+        }
     }
 }

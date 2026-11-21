@@ -664,6 +664,64 @@ impl RtHost {
         let tx = self.status_lane();
         let cfg = self.cfg.clone();
         let project = self.project.clone();
+        // bd-sfxu1: push `program_status_changed` is authoritative when the
+        // flag is on. The poll below stays as a slow reconciliation fallback;
+        // with the flag off nothing here changes (byte-identical).
+        let push_enabled = cfg.doorbell_program_status_push();
+        if push_enabled {
+            let push_tx = tx.clone();
+            let push_cfg = cfg.clone();
+            let push_project = project.clone();
+            let push_panes = pane_ids.clone();
+            std::thread::spawn(move || {
+                let filters: Vec<_> = push_panes
+                    .iter()
+                    .map(|(pane, _)| {
+                        toron_plane::backend::types::Subscription::agent_status_changed(
+                            pane.clone(),
+                        )
+                    })
+                    .collect();
+                let backend = match crate::backend::factory::multiplexer_backend(&push_cfg) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("flywheel doorbell: rex status push unavailable ({e:#})");
+                        return;
+                    }
+                };
+                let mut stream = match backend.subscribe(&filters) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("flywheel doorbell: rex status subscribe failed ({e:#})");
+                        return;
+                    }
+                };
+                loop {
+                    let pin_by_pane: HashMap<String, String> =
+                        state::load_spawn_registry(&push_project)
+                            .iter()
+                            .filter(|e| !e.pane_id.is_empty())
+                            .filter_map(|e| {
+                                e.mail_identity.clone().map(|pin| (e.pane_id.clone(), pin))
+                            })
+                            .collect();
+                    match stream.read_event() {
+                        Ok(Some(ev)) => {
+                            if let Some(msg) = RtHost::program_status_to_brain(&ev, &pin_by_pane)
+                                && push_tx.blocking_send(msg).is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Ok(None) => return, // stream ended; the poll reconciles
+                        Err(e) => {
+                            eprintln!("flywheel doorbell: rex status stream error ({e:#})");
+                            return;
+                        }
+                    }
+                }
+            });
+        }
         std::thread::spawn(move || {
             // Transitions only: the brain channel is bounded and every repeated
             // row is one more stale status the fold must chew through. Live
@@ -672,7 +730,7 @@ impl RtHost {
             // never drained.
             let mut last: HashMap<String, String> = HashMap::new();
             loop {
-                std::thread::sleep(Duration::from_secs(3));
+                std::thread::sleep(Duration::from_secs(if push_enabled { 30 } else { 3 }));
                 let Ok(backend) = crate::backend::factory::multiplexer_backend(&cfg) else {
                     continue;
                 };
@@ -698,6 +756,32 @@ impl RtHost {
                 }
             }
         });
+    }
+
+    /// bd-sfxu1: one rex `program_status_changed` event -> one typed status
+    /// message. No poll, no screen scrape. OSC `error` is reported as an error
+    /// status (never done or idle) so the fold cannot inject into that pane.
+    /// `kind` is carried in the event and is what gates blocked typing.
+    pub(crate) fn program_status_to_brain(
+        ev: &toron_plane::backend::BackendEvent,
+        pin_by_pane: &HashMap<String, String>,
+    ) -> Option<BrainMsg> {
+        match ev {
+            toron_plane::backend::BackendEvent::ProgramStatusChanged {
+                pane,
+                status,
+                state,
+                ..
+            } => {
+                let pin = pin_by_pane.get(pane.as_str())?.clone();
+                let status = match state.as_deref() {
+                    Some("error") => "error".to_string(),
+                    _ => status.as_str().to_string(),
+                };
+                Some(BrainMsg::PlaneStatus { pin, status })
+            }
+            _ => None,
+        }
     }
 
     /// Keep only the statuses that differ from the last cycle's, recording the
@@ -2812,6 +2896,43 @@ mod presence_producer_tests {
     //! loud audit instead of silently skipped.
     use super::*;
     use toron_core::pane_types::{AgentInfo, AgentStatus};
+
+    #[test]
+    fn a_program_status_changed_event_flips_status_without_a_poll_and_gates_blocked_typing() {
+        let line = r#"{"type":"session_event","payload":{"event":{"type":"program_status_changed","payload":{"block_id":"block:seat","label":"BoldCliff","record":{"state":"blocked","kind":"permission","id":"opencode-1"}}}}}"#;
+        let ev = toron_plane::backend::rex_cli::rex_map::event_from_line(line);
+        let mut panes = HashMap::new();
+        panes.insert("block:seat".to_string(), "BoldCliff".to_string());
+        let msg = RtHost::program_status_to_brain(&ev, &panes).expect("mapped push event");
+        match &msg {
+            BrainMsg::PlaneStatus { pin, status } => {
+                assert_eq!(pin, "BoldCliff");
+                assert_eq!(status, "blocked");
+            }
+            other => panic!("expected a typed status, got {other:?}"),
+        }
+        // The blocked status gates typing: the fold emits no Prompt for an
+        // urgent wake while the seat is blocked.
+        let mut model = crate::workspace::WorkspaceModel::default();
+        model.doorbell.index.insert_pin("BoldCliff".into(), None);
+        model
+            .doorbell
+            .statuses
+            .insert("BoldCliff".into(), "blocked".into());
+        let (_, cmds) = crate::workspace::tick(
+            &model,
+            &crate::workspace::Msg::PlaneStatus {
+                pin: "BoldCliff".into(),
+                status: "blocked".into(),
+            },
+        );
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, crate::workspace::Cmd::Prompt { .. })),
+            "blocked+kind from the push event must gate typing"
+        );
+    }
 
     fn row(pane: &str, status: AgentStatus) -> AgentInfo {
         AgentInfo {
