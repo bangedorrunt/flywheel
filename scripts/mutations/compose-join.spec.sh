@@ -1,0 +1,17 @@
+# Sourced by scripts/verify-mutations.sh. bd-3ann1: join binds to live seats
+# and never lets a reviewer audit its own author.
+
+CARGO_ARGS=(--bin flywheel)
+TEST_FILTER=(join_binds_execute_to_crew_and_spawns_only_a_reviewer a_reviewer_seat_is_never_the_author)
+
+mutation "J1  every step spawns a fresh pane" \
+    file=src/compose_join.rs \
+    expect=join_binds_execute_to_crew_and_spawns_only_a_reviewer \
+    find=$'            Binding::Reuse { pin }\n            | Binding::FreshSession { pin }\n            | Binding::Other { pin }\n            | Binding::Patch { pin, .. } => (Some(pin), false, false),\n            Binding::Spawn => (None, true, false),' \
+    replace=$'            Binding::Reuse { pin }\n            | Binding::FreshSession { pin }\n            | Binding::Other { pin }\n            | Binding::Patch { pin, .. } => (None, true, false),\n            Binding::Spawn => (None, true, false),'
+
+mutation "J2  a reviewer may audit its own work" \
+    file=src/compose_join.rs \
+    expect=a_reviewer_seat_is_never_the_author \
+    find='            reviews_author,' \
+    replace='            reviews_author: BTreeSet::new(),'
