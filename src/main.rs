@@ -1834,6 +1834,9 @@ enum Commands {
         /// repo directory (default: current directory)
         #[arg(long)]
         repo: Option<String>,
+        /// skip the reservation guard (recorded in the commit message) — bd-ahkw1
+        #[arg(long)]
+        no_reservation_check: bool,
     },
     /// Interactive walkthrough
     Tutorial,
@@ -4056,7 +4059,8 @@ fn main() {
             paths,
             message,
             repo,
-        }) => cmd_commit(paths, message, repo.as_deref()),
+            no_reservation_check,
+        }) => cmd_commit(paths, message, repo.as_deref(), *no_reservation_check),
         Some(Commands::Tutorial) => cmd_tutorial(),
         #[cfg(feature = "serve")]
         Some(Commands::Daemon { cmd }) => cmd_daemon(&cfg, cmd),

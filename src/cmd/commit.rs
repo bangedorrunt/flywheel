@@ -369,15 +369,17 @@ struct ReservationVerdict {
     dead: Vec<String>,
 }
 
-fn parse_reservations(raw: &str) -> ReservationVerdict {
-    let doc: serde_json::Value = serde_json::from_str(raw).unwrap_or_default();
-    let rows = |key: &str| {
+fn parse_reservations(raw: &str) -> Result<ReservationVerdict> {
+    // bd-ahkw1: an unreadable or empty answer is NEVER "no conflicts".
+    let doc: serde_json::Value =
+        serde_json::from_str(raw).context("toron reserve conflicts returned no JSON")?;
+    let rows = |key: &str| -> Result<Vec<serde_json::Value>> {
         doc.get(key)
             .and_then(|v| v.as_array())
             .cloned()
-            .unwrap_or_default()
+            .with_context(|| format!("toron reserve conflicts has no {key} array"))
     };
-    let live = rows("conflicts")
+    let live = rows("conflicts")?
         .iter()
         .filter_map(|row| {
             Some((
@@ -394,55 +396,98 @@ fn parse_reservations(raw: &str) -> ReservationVerdict {
             ))
         })
         .collect();
-    let dead = rows("soft_conflicts")
+    let dead = rows("soft_conflicts")?
         .iter()
         .filter_map(|row| row.get("path")?.as_str().map(str::to_string))
         .collect();
-    ReservationVerdict { live, dead }
+    Ok(ReservationVerdict { live, dead })
 }
 
-fn reservation_context() -> Option<(String, String)> {
-    let pin = std::env::var("AGENT_NAME").ok()?;
-    let project = std::env::var("FLYWHEEL_PROJECT")
-        .ok()
-        .or_else(|| crate::cron::detect_project(&crate::config::Config::default(), None))?;
-    (!pin.is_empty()).then_some((pin, project))
+/// Everything the reservation guard needs, gathered ONCE at the CLI edge so
+/// nothing inside the commit path reads or mutates ambient process env. Tests
+/// pass an explicit ctx with a sandbox-owned fake toron (bd-ahkw1 race fix).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReservationCtx {
+    pin: Option<String>,
+    project: String,
+    toron_bin: PathBuf,
+}
+
+impl ReservationCtx {
+    fn from_env() -> Self {
+        let pin = std::env::var("AGENT_NAME").ok().filter(|p| !p.is_empty());
+        let project = std::env::var("FLYWHEEL_PROJECT")
+            .ok()
+            .or_else(|| crate::cron::detect_project(&crate::config::Config::default(), None))
+            .unwrap_or_default();
+        let toron_bin = std::env::var("FLYWHEEL_TORON_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("toron"));
+        Self {
+            pin,
+            project,
+            toron_bin,
+        }
+    }
+
+    /// Programmatic commits (tests, ship land) carry no seat identity.
+    fn skip() -> Self {
+        Self {
+            pin: None,
+            project: String::new(),
+            toron_bin: PathBuf::from("toron"),
+        }
+    }
 }
 
 /// bd-ahkw1: refuse a path exclusively held by another live pin, naming the
 /// holder and the exact request-release call. Dead leases are revoked first.
-fn guard_commit_reservations(paths: &[String]) -> Result<()> {
-    let Some((pin, project)) = reservation_context() else {
-        return Ok(());
-    };
-    let toron = std::env::var("FLYWHEEL_TORON_BIN").unwrap_or_else(|_| "toron".into());
-    let raw = Command::new(&toron)
+const RESERVATION_ESCAPE: &str =
+    "pass --no-reservation-check to commit anyway (recorded in the commit message)";
+
+fn guard_commit_reservations(paths: &[String], ctx: &ReservationCtx) -> Result<()> {
+    // bd-ahkw1: no identity is NOT consent. Refuse and say how to identify or
+    // escape, instead of silently skipping every lease.
+    let pin = ctx.pin.as_deref().ok_or_else(|| {
+        anyhow!("flywheel commit: no AGENT_NAME/--as identity; set it or {RESERVATION_ESCAPE}")
+    })?;
+    let project = &ctx.project;
+    let out = Command::new(&ctx.toron_bin)
         .args([
             "reserve",
             "conflicts",
             "--project",
-            &project,
+            project,
             "--as",
-            &pin,
+            pin,
             "--paths",
             &paths.join(","),
             "--json",
         ])
         .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
-    let verdict = parse_reservations(&raw);
+        .with_context(|| {
+            format!("flywheel commit: cannot reach toron reserve conflicts; {RESERVATION_ESCAPE}")
+        })?;
+    // bd-ahkw1: a failed or unreadable answer is NEVER treated as no conflicts.
+    if !out.status.success() {
+        bail!(
+            "flywheel commit: toron reserve conflicts failed ({}); {RESERVATION_ESCAPE}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let verdict = parse_reservations(&raw).map_err(|e| {
+        anyhow!("flywheel commit: cannot read reservation answer ({e:#}); {RESERVATION_ESCAPE}")
+    })?;
     for path in &verdict.dead {
-        let _ = Command::new(&toron)
+        let _ = Command::new(&ctx.toron_bin)
             .args([
                 "reserve",
                 "force-release",
                 "--project",
-                &project,
+                project,
                 "--as",
-                &pin,
+                pin,
                 "--path",
                 path,
                 "--note",
@@ -460,19 +505,19 @@ fn guard_commit_reservations(paths: &[String]) -> Result<()> {
 
 /// bd-ahkw1: a successful commit frees the committer's own leases on the paths
 /// it landed; a refused or failed commit keeps them.
-fn release_own_reservations(paths: &[String]) {
-    let Some((pin, project)) = reservation_context() else {
+fn release_own_reservations(paths: &[String], ctx: &ReservationCtx) {
+    let Some(pin) = ctx.pin.as_deref() else {
         return;
     };
-    let toron = std::env::var("FLYWHEEL_TORON_BIN").unwrap_or_else(|_| "toron".into());
-    let _ = Command::new(&toron)
+    let project = &ctx.project;
+    let _ = Command::new(&ctx.toron_bin)
         .args([
             "reserve",
             "release",
             "--project",
-            &project,
+            project,
             "--as",
-            &pin,
+            pin,
             "--paths",
             &paths.join(","),
         ])
@@ -547,13 +592,38 @@ fn stale_stage_warnings(shared: &Git<'_>, paths: &[String]) -> Result<Vec<String
 /// The one private-index fence + CAS path. `build` produces a tree on top of
 /// the named parent; it is called again after a CAS race so a tree built on an
 /// old HEAD can never revert what another lane landed.
-fn commit_tree<F>(repo: &Path, paths: &[String], message: &str, mut build: F) -> Result<String>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReservationMode {
+    /// Programmatic commits (tests, ship land) that do not carry a seat pin.
+    Skip,
+    /// CLI commit: enforce, unless the operator took the recorded escape.
+    Enforce { escape: bool },
+}
+
+fn commit_tree<F>(
+    repo: &Path,
+    paths: &[String],
+    message: &str,
+    ctx: &ReservationCtx,
+    mode: ReservationMode,
+    mut build: F,
+) -> Result<String>
 where
     F: for<'a> FnMut(&Git<'a>, &str) -> Result<String>,
 {
     let shared = Git::shared(repo);
     let old_head = shared.out(&["rev-parse", "HEAD"])?;
-    guard_commit_reservations(paths)?;
+    let message = match mode {
+        ReservationMode::Skip => message.to_string(),
+        ReservationMode::Enforce { escape: false } => {
+            guard_commit_reservations(paths, ctx)?;
+            message.to_string()
+        }
+        ReservationMode::Enforce { escape: true } => {
+            // The escape is never silent: the commit itself says it was used.
+            format!("{message}\n\nflywheel-reservation-check: skipped")
+        }
+    };
     let class = classify_staged(&shared, paths)?;
     if !class.conflict.is_empty() {
         bail!(
@@ -581,11 +651,13 @@ where
 
     let mut parent = old_head;
     for _ in 0..MAX_CAS_RETRIES {
-        let commit = shared.out(&["commit-tree", &tree, "-p", &parent, "-m", message])?;
+        let commit = shared.out(&["commit-tree", &tree, "-p", &parent, "-m", &message])?;
         let update = shared.run(&["update-ref", "HEAD", &commit, &parent])?;
         if update.status.success() {
             sync_stale_stage(&shared, &class.stale, &commit)?;
-            release_own_reservations(paths);
+            if matches!(mode, ReservationMode::Enforce { .. }) {
+                release_own_reservations(paths, ctx);
+            }
             return Ok(commit);
         }
         let moved = shared.out(&["rev-parse", "HEAD"])?;
@@ -603,13 +675,51 @@ where
 }
 
 /// Commit exactly `paths` from the working tree, returning the new commit sha.
-pub(crate) fn commit_paths(repo: &Path, paths: &[String], message: &str) -> Result<String> {
+fn commit_paths_mode(
+    repo: &Path,
+    paths: &[String],
+    message: &str,
+    ctx: &ReservationCtx,
+    mode: ReservationMode,
+) -> Result<String> {
     validate_paths(paths)?;
-    let sha = commit_tree(repo, paths, message, |private, parent| {
+    let sha = commit_tree(repo, paths, message, ctx, mode, |private, parent| {
         build_tree(private, paths, parent)
     })?;
     Git::shared(repo).ok(&add_args(&["add", "--"], paths))?;
     Ok(sha)
+}
+
+/// Programmatic commit without a seat pin (tests only).
+#[cfg(test)]
+fn commit_paths(repo: &Path, paths: &[String], message: &str) -> Result<String> {
+    commit_paths_mode(
+        repo,
+        paths,
+        message,
+        &ReservationCtx::skip(),
+        ReservationMode::Skip,
+    )
+}
+
+/// CLI commit: enforce reservations unless the operator took the recorded
+/// escape (bd-ahkw1).
+pub(crate) fn commit_paths_checked(
+    repo: &Path,
+    paths: &[String],
+    message: &str,
+    no_reservation_check: bool,
+    ctx: &ReservationCtx,
+) -> Result<String> {
+    commit_paths_mode(
+        repo,
+        paths,
+        message,
+        ctx,
+        ReservationMode::Enforce {
+            escape: no_reservation_check,
+        },
+    )
 }
 
 /// Commit exact `path -> content` blobs produced by `splice(parent)` (bd-kz3sc
@@ -626,10 +736,17 @@ where
     F: FnMut(&str) -> Result<Vec<(String, Vec<u8>)>>,
 {
     validate_paths(paths)?;
-    let sha = commit_tree(repo, paths, message, |private, parent| {
-        let blobs = splice(parent)?;
-        build_blobs_tree(private, &blobs, parent)
-    })?;
+    let sha = commit_tree(
+        repo,
+        paths,
+        message,
+        &ReservationCtx::skip(),
+        ReservationMode::Skip,
+        |private, parent| {
+            let blobs = splice(parent)?;
+            build_blobs_tree(private, &blobs, parent)
+        },
+    )?;
     let shared = Git::shared(repo);
     let head = shared.out(&["rev-parse", "HEAD"])?;
     for (path, content) in splice(&head)? {
@@ -644,10 +761,16 @@ where
     Ok(sha)
 }
 
-pub(crate) fn cmd_commit(paths: &[String], message: &str, repo: Option<&str>) -> Result<()> {
+pub(crate) fn cmd_commit(
+    paths: &[String],
+    message: &str,
+    repo: Option<&str>,
+    no_reservation_check: bool,
+) -> Result<()> {
     let repo_arg = repo.unwrap_or(".");
     let repo = fs::canonicalize(repo_arg).with_context(|| format!("repo dir {repo_arg}"))?;
-    let sha = commit_paths(&repo, paths, message)?;
+    let ctx = ReservationCtx::from_env();
+    let sha = commit_paths_checked(&repo, paths, message, no_reservation_check, &ctx)?;
     println!("commit {}", &sha[..sha.len().min(12)]);
     Ok(())
 }
@@ -950,67 +1073,61 @@ mod tests {
     fn reservation_conflicts_split_live_and_dead_holders() {
         let v = parse_reservations(
             r#"{"conflicts":[{"holders":["BoldCliff"],"reservation_ids":["r1"],"path":"x.rs"}],"soft_conflicts":[{"holders":["BuffyLark"],"reservation_ids":["r2"],"path":"old.rs"}]}"#,
-        );
+        )
+        .unwrap();
         assert_eq!(v.live, vec![("BoldCliff".into(), "r1".into())]);
         assert_eq!(v.dead, vec!["old.rs".to_string()]);
     }
 
-    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
-    impl EnvRestore {
-        fn take(names: &[&'static str]) -> Self {
-            Self(names.iter().map(|n| (*n, std::env::var_os(n))).collect())
-        }
-    }
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            for (name, value) in &self.0 {
-                match value {
-                    Some(v) => unsafe { std::env::set_var(name, v) },
-                    None => unsafe { std::env::remove_var(name) },
-                }
+    /// A fake toron owned by a TestSandbox: no process env is touched. `mode`
+    /// is baked into the script, and every argv line is logged so a test can
+    /// assert exactly which lease calls happened (bd-ahkw1 race fix).
+    fn fake_toron(
+        sandbox: &flywheel_test_sandbox::TestSandbox,
+        mode: &str,
+    ) -> (ReservationCtx, PathBuf) {
+        let bin = sandbox.bin_dir().join("fake-toron");
+        let log = sandbox.root().join("toron-calls.log");
+        let answer = match mode {
+            "hard" => {
+                r#"{"conflicts":[{"holders":["BoldCliff"],"reservation_ids":["r1"],"path":"x.rs"}],"soft_conflicts":[]}"#
             }
-        }
-    }
-
-    fn fake_toron(dir: &Path, hard: bool) -> (PathBuf, PathBuf) {
-        let bin = dir.join("fake-toron");
-        let log = dir.join("toron-calls.log");
+            _ => {
+                r#"{"conflicts":[],"soft_conflicts":[{"holders":["BuffyLark"],"reservation_ids":["r2"],"path":"old.rs"}]}"#
+            }
+        };
+        let arm = match mode {
+            "fail" => "echo 'toron down' >&2; exit 1 ;;".to_string(),
+            "badjson" => "printf '%s' 'not json' ;;".to_string(),
+            _ => format!("printf '%s' '{answer}' ;;"),
+        };
         fs::write(
             &bin,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\ncase \"$1 $2\" in\n  \"reserve conflicts\") if [ \"${{FAKE_HARD:-0}}\" = 1 ]; then printf '%s' '{{\"conflicts\":[{{\"holders\":[\"BoldCliff\"],\"reservation_ids\":[\"r1\"],\"path\":\"x.rs\"}}],\"soft_conflicts\":[]}}'; else printf '%s' '{{\"conflicts\":[],\"soft_conflicts\":[{{\"holders\":[\"BuffyLark\"],\"reservation_ids\":[\"r2\"],\"path\":\"old.rs\"}}]}}'; fi ;;\nesac\nexit 0\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\ncase \"$1 $2\" in\n  \"reserve conflicts\") {arm}\nesac\nexit 0\n",
                 log.display()
             ),
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
-        if hard {
-            unsafe { std::env::set_var("FAKE_HARD", "1") };
-        } else {
-            unsafe { std::env::set_var("FAKE_HARD", "0") };
-        }
-        (bin, log)
+        let ctx = ReservationCtx {
+            pin: Some("ScarletCove".into()),
+            project: "flywheel".into(),
+            toron_bin: bin,
+        };
+        (ctx, log)
     }
 
     /// bd-ahkw1: a live exclusive lease blocks the commit and names the
     /// holder plus the exact request-release command.
     #[test]
     fn a_live_reservation_refuses_the_commit() {
-        let _g = crate::config::lock_env();
-        let _env = EnvRestore::take(&[
-            "FLYWHEEL_TORON_BIN",
-            "AGENT_NAME",
-            "FLYWHEEL_PROJECT",
-            "FAKE_HARD",
-        ]);
+        let sandbox = flywheel_test_sandbox::TestSandbox::new();
+        let (ctx, log) = fake_toron(&sandbox, "hard");
         let dir = scratch_repo("reserve-live");
-        let (bin, log) = fake_toron(&dir, true);
-        unsafe { std::env::set_var("FLYWHEEL_TORON_BIN", &bin) };
-        unsafe { std::env::set_var("AGENT_NAME", "ScarletCove") };
-        unsafe { std::env::set_var("FLYWHEEL_PROJECT", "flywheel") };
         fs::write(dir.join("x.rs"), "x\n").unwrap();
-        let err = commit_paths(&dir, &["x.rs".into()], "blocked")
+        let err = commit_paths_checked(&dir, &["x.rs".into()], "blocked", false, &ctx)
             .unwrap_err()
             .to_string();
         assert!(err.contains("BoldCliff"), "{err}");
@@ -1027,20 +1144,11 @@ mod tests {
     /// committer's own leases on exactly the committed paths.
     #[test]
     fn a_dead_lease_is_cleared_and_a_success_releases_own() {
-        let _g = crate::config::lock_env();
-        let _env = EnvRestore::take(&[
-            "FLYWHEEL_TORON_BIN",
-            "AGENT_NAME",
-            "FLYWHEEL_PROJECT",
-            "FAKE_HARD",
-        ]);
+        let sandbox = flywheel_test_sandbox::TestSandbox::new();
+        let (ctx, log) = fake_toron(&sandbox, "dead");
         let dir = scratch_repo("reserve-dead");
-        let (bin, log) = fake_toron(&dir, false);
-        unsafe { std::env::set_var("FLYWHEEL_TORON_BIN", &bin) };
-        unsafe { std::env::set_var("AGENT_NAME", "ScarletCove") };
-        unsafe { std::env::set_var("FLYWHEEL_PROJECT", "flywheel") };
         fs::write(dir.join("x.rs"), "x\n").unwrap();
-        commit_paths(&dir, &["x.rs".into()], "ok").unwrap();
+        commit_paths_checked(&dir, &["x.rs".into()], "ok", false, &ctx).unwrap();
         let calls = fs::read_to_string(&log).unwrap_or_default();
         assert!(
             calls.contains("reserve force-release"),
@@ -1051,6 +1159,52 @@ mod tests {
             "own lease survived: {calls}"
         );
         assert!(calls.contains("x.rs"), "{calls}");
+    }
+
+    /// bd-ahkw1 hole 1: no pin is NOT consent — refuse and say how to escape.
+    #[test]
+    fn a_missing_pin_refuses_and_names_the_escape() {
+        let sandbox = flywheel_test_sandbox::TestSandbox::new();
+        let (mut ctx, _log) = fake_toron(&sandbox, "hard");
+        ctx.pin = None;
+        let dir = scratch_repo("reserve-nopin");
+        fs::write(dir.join("x.rs"), "x\n").unwrap();
+        let err = commit_paths_checked(&dir, &["x.rs".into()], "no pin", false, &ctx)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("AGENT_NAME"), "{err}");
+        assert!(err.contains("--no-reservation-check"), "{err}");
+    }
+
+    /// bd-ahkw1 hole 2: toron failing or answering with garbage must refuse,
+    /// never be read as "no conflicts".
+    #[test]
+    fn an_unanswerable_toron_refuses_instead_of_passing() {
+        let sandbox = flywheel_test_sandbox::TestSandbox::new();
+        let (ctx, _log) = fake_toron(&sandbox, "fail");
+        let dir = scratch_repo("reserve-unreadable");
+        fs::write(dir.join("x.rs"), "x\n").unwrap();
+        let err = commit_paths_checked(&dir, &["x.rs".into()], "fail", false, &ctx)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("toron reserve conflicts failed"), "{err}");
+        assert!(err.contains("--no-reservation-check"), "{err}");
+    }
+
+    /// bd-ahkw1: the escape works but is never silent — the commit records it.
+    #[test]
+    fn the_recorded_escape_allows_a_commit_without_a_pin() {
+        let sandbox = flywheel_test_sandbox::TestSandbox::new();
+        let (mut ctx, _log) = fake_toron(&sandbox, "hard");
+        ctx.pin = None;
+        let dir = scratch_repo("reserve-escape");
+        fs::write(dir.join("x.rs"), "x\n").unwrap();
+        let sha = commit_paths_checked(&dir, &["x.rs".into()], "override", true, &ctx).unwrap();
+        let msg = git(&dir, &["log", "-1", "--pretty=%B", &sha]);
+        assert!(
+            msg.contains("flywheel-reservation-check: skipped"),
+            "the escape must be recorded in the commit: {msg}"
+        );
     }
 
     fn install_real_hook(dir: &Path) {
