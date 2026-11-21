@@ -4,6 +4,14 @@
 #
 #   scripts/fence.sh [--sha <rev>] [--repo <dir>] [--keep]
 #   scripts/fence.sh --index        # the STAGED index, as the pre-commit hook
+#   scripts/fence.sh --paths a.rs,b.rs --test cmd::spawn::   # bd-8jakq
+#
+# `--test <filter>` runs that test filter INSIDE the throwaway export (after
+# the fail-fast build), so another lane's uncommitted WIP in the shared tree
+# cannot break your targeted tests. `--paths` overlays a not-yet-staged set of
+# working-tree paths on HEAD for that export; without it the export is the
+# named revision. The export is removed on exit; a kept one is swept on the
+# next green run so old exports do not pile up.
 #
 # Steps, in the proof's order, stopping at the first failure:
 #   verify-needles · verify-coverage · build -Dwarnings --all-targets ·
@@ -22,6 +30,8 @@ REPO="$ROOT"
 REV="HEAD"
 KEEP=0
 INDEX=0
+TEST_FILTER=""
+PATHS=""
 CARGO="${FENCE_CARGO:-mbx +nightly-aarch64-apple-darwin}"
 RUSTFMT="${FENCE_RUSTFMT:-rustup run nightly-aarch64-apple-darwin rustfmt --edition 2024}"
 
@@ -31,7 +41,9 @@ while [ $# -gt 0 ]; do
         --repo) REPO="$2"; shift ;;
         --index) INDEX=1 ;;
         --keep) KEEP=1 ;;
-        -h | --help) sed -n '2,22p' "$0"; exit 0 ;;
+        --test) TEST_FILTER="$2"; shift ;;
+        --paths) PATHS="$2"; shift ;;
+        -h | --help) sed -n '2,26p' "$0"; exit 0 ;;
         *) echo "fence: unknown arg: $1" >&2; exit 2 ;;
     esac
     shift
@@ -50,13 +62,38 @@ else
     SHA="$(git -C "$REPO" rev-parse "$REV")"
 fi
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/fence.XXXXXX")"
-cleanup() { [ "$KEEP" -eq 1 ] || rm -rf "$TMP"; }
+cleanup() {
+    local status=$?
+    if [ "$KEEP" -eq 1 ] || [ "$status" -ne 0 ]; then
+        echo "fence: kept $TMP" >&2
+        # bd-8jakq: a kept export is for the next targeted run. On a green
+        # fence, prune older ones so they do not pile up. Exclude by BASENAME:
+        # TMPDIR may end in '/', so the path string can mis-match (bd-j45zo).
+        if [ "$status" -eq 0 ]; then
+            find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'fence.*' \
+                ! -name "$(basename "$TMP")" -exec rm -rf {} + 2>/dev/null || true
+        fi
+    else
+        rm -rf "$TMP"
+    fi
+}
 trap cleanup EXIT
 
 # shellcheck source=proof-lib.sh
 . "$ROOT/scripts/proof-lib.sh"
 DEST="$TMP/flywheel"
 proof_archive "$REPO" "$SHA" "$DEST" || { echo "fence: cannot export $SHA" >&2; exit 1; }
+# bd-8jakq: an unstaged path set is overlaid on the revision's export, so a
+# red shared tree cannot change what the targeted tests see.
+if [ -n "$PATHS" ]; then
+    IFS=',' read -r -a overlay <<<"$PATHS"
+    for rel in "${overlay[@]}"; do
+        [ -n "$rel" ] || continue
+        [ -f "$REPO/$rel" ] || { echo "fence: overlay path missing: $rel" >&2; exit 2; }
+        mkdir -p "$DEST/$(dirname "$rel")"
+        cp "$REPO/$rel" "$DEST/$rel"
+    done
+fi
 # The fence proves the COMMIT, not the tree, including the pins: the siblings
 # come from the fenced revision's proof.toml (bd-gmrxv), never from the working
 # tree, so a shared tree's dirty pin cannot change what "GREEN at <sha>" covers.
@@ -70,6 +107,12 @@ echo "fence: $SHA exported to $DEST"
 cd "$DEST"
 
 step() { printf 'fence: %s\n' "$1"; }
+run_test_filter() {
+    [ -n "$TEST_FILTER" ] || return 0
+    step "test ($TEST_FILTER) in export"
+    # shellcheck disable=SC2086
+    $CARGO test $TEST_FILTER
+}
 step "needles"
 bash scripts/verify-needles.sh
 # bd-op4zk: a ledger row citing a mutation id the spec no longer declares used
@@ -98,6 +141,7 @@ if [ "$INDEX" = 1 ]; then
         # shellcheck disable=SC2086
         $RUSTFMT --check "$f"
     done
+    run_test_filter
     echo "fence: $SHA GREEN (index)"
     exit 0
 fi
@@ -106,4 +150,5 @@ step "test --no-run (every target)"
 $CARGO test --workspace --no-run
 step "clippy"
 bash scripts/verify-clippy.sh
+run_test_filter
 echo "fence: $SHA GREEN"

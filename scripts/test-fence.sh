@@ -48,6 +48,14 @@ GOOD="$(git -C "$REPO" rev-parse HEAD)"
 cat >"$TMP/bin/cargo" <<'SH'
 #!/usr/bin/env bash
 echo "$1" >>"${FAKE_CARGO_LOG:-/dev/null}"
+printf '%s\n' "$PWD" >>"${FAKE_CWD_LOG:-/dev/null}"
+# bd-8jakq: a targeted test in the TREE sees this uncommitted WIP; the same
+# filter in the clean export does not. A mutation that runs tests in the tree
+# turns the new test RED.
+if [ "$1" = test ] && [ -e broken.rs ]; then
+  echo "error: broken.rs is uncommitted WIP in the tree" >&2
+  exit 1
+fi
 if [ "$1" = clippy ] && [ -e clippy_only.rs ]; then
   echo "error: very complex type used. Consider factoring parts into \`type\` definitions" >&2
   exit 1
@@ -186,5 +194,30 @@ GIT_DIR="$(git -C "$REPO" rev-parse --absolute-git-dir)" \
 FENCE_CARGO="$TMP/bin/cargo" bash "$ROOT/scripts/fence.sh" --repo "$REPO" --sha "$GOOD" >/dev/null 2>&1 \
   || fail "a worktree GIT_DIR must not misresolve the sibling pin"
 pass "a worktree GIT_DIR does not misresolve the sibling pin"
+
+# bd-8jakq: --test runs the filter inside the export, so another lane's
+# uncommitted WIP in the shared tree cannot break it. The same filter in the
+# tree fails by construction (the fake cargo sees broken.rs).
+printf 'fn broken() {}\n' >"$REPO/broken.rs"
+: >"$TMP/cwd.log"
+out="$(FAKE_CWD_LOG="$TMP/cwd.log" FENCE_CARGO="$TMP/bin/cargo" \
+    bash "$ROOT/scripts/fence.sh" --repo "$REPO" --sha "$GOOD" --test broken_test 2>&1)" \
+  || fail "a test filter must run in the clean export: $out"
+grep -q 'test (broken_test) in export' <<<"$out" || fail "the export test step must be named: $out"
+grep -q '/fence\.' "$TMP/cwd.log" || fail "the test must execute inside the export: $(cat "$TMP/cwd.log")"
+pass "--test runs the filter inside the export, not the red tree"
+
+# The same filter in the tree does fail — proving the export leg is the thing
+# under test, not a vacuous pass.
+(cd "$REPO" && bash "$TMP/bin/cargo" test broken_test >/dev/null 2>&1) \
+  && fail "the same filter in the tree must fail on uncommitted WIP"
+pass "the same filter fails in the tree"
+
+# --paths overlays a not-yet-staged working-tree path on the revision export.
+printf 'fn a_test() {}\n' >"$REPO/a.rs"
+FENCE_CARGO="$TMP/bin/cargo" bash "$ROOT/scripts/fence.sh" --repo "$REPO" --sha "$GOOD" \
+    --paths a.rs --test a_test >/dev/null 2>&1 \
+  || fail "--paths must overlay an unstaged path for the export"
+pass "--paths overlays an unstaged path"
 
 echo "ok"

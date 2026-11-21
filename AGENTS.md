@@ -29,6 +29,7 @@ bash scripts/verify-mutations.sh scripts/mutations/<spec>.spec.sh
 # commit and pre-mail check
 flywheel commit <paths> -m <msg> [--repo <dir>] [--allow-empty]
 bash scripts/fence.sh --sha <sha>         # needles, -Dwarnings build, no-run, clippy on that commit
+bash scripts/fence.sh --paths a.rs,b.rs --test cmd::spawn::  # targeted tests in a clean export (bd-8jakq)
 
 # captain: prove, install, land
 bash scripts/clean-proof.sh --sha <rev> --mutations changed --keep --receipt /tmp/<dir>/r.json
@@ -68,7 +69,12 @@ exports or scratch target dirs.
   `stash`, `checkout --`, `restore`, `reset`, `rebase` or `--amend`.
 - Before you mail a sha, run `scripts/fence.sh --sha <sha>` plus the targeted
   tests and the mutation specs covering the paths you changed. Do not run the
-  full workspace suite; the captain's proof does.
+  full workspace suite; the captain's proof does. When the shared tree is red
+  from another lane's WIP, run the targeted tests IN a clean export with
+  `fence.sh --paths <changed-files> --test <filter>` (or `--sha <sha> --test
+  <filter>` after committing); never wait on the shared tree to compile. The
+  export is removed on exit; `--keep` retains it for a mutation spec and older
+  kept exports are swept on the next green fence.
 - The captain proves a revision in one clean export (`clean-proof.sh --sha`),
   installs only from a green proof's kept export, and lands with `ship land`.
   The mutation stage stops at the first spec that does not prove every row.
