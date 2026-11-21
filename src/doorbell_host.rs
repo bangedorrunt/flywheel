@@ -2934,6 +2934,21 @@ mod presence_producer_tests {
         );
     }
 
+    #[test]
+    fn an_osc_error_event_is_reported_as_error_never_idle_or_done() {
+        let line = r#"{"type":"session_event","payload":{"event":{"type":"program_status_changed","payload":{"block_id":"block:seat","label":"BoldCliff","record":{"state":"error","id":"opencode-1"}}}}}"#;
+        let ev = toron_plane::backend::rex_cli::rex_map::event_from_line(line);
+        let mut panes = HashMap::new();
+        panes.insert("block:seat".to_string(), "BoldCliff".to_string());
+        let msg = RtHost::program_status_to_brain(&ev, &panes).expect("mapped error event");
+        match msg {
+            BrainMsg::PlaneStatus { status, .. } => {
+                assert_eq!(status, "error", "an OSC error is never done or idle");
+            }
+            other => panic!("expected a typed status, got {other:?}"),
+        }
+    }
+
     fn row(pane: &str, status: AgentStatus) -> AgentInfo {
         AgentInfo {
             agent: Some("agent".into()),
