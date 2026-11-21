@@ -20,6 +20,7 @@ mutation "I1  the drain rings once per queued wake instead of coalescing" \
                             actions.push(DoorbellAction::Prompt {
                                 pin: pin.clone(),
                                 line: w.line.clone(),
+                                event_id: w.event_id.clone(),
                             });
                         }
                     }'
