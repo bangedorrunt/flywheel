@@ -7,7 +7,8 @@ const frame = (name: string, extra: object = {}) => JSON.stringify({
   method: "notifications/events/event",
   params: {
     _meta: { "io.modelcontextprotocol/subscriptionId": SUB },
-    event: { event_id: `${name}-id`, name, body: "SECRET MAIL BODY", ...extra },
+    eventId: `${name}-id`, name, timestamp: "2026-07-28T00:00:00Z",
+    data: { body: "SECRET MAIL BODY", ...extra },
   },
 });
 

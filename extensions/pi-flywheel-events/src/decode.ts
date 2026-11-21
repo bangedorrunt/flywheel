@@ -33,12 +33,16 @@ export function decodeFrame(data: string, subscriptionId: string): EventFrame | 
   const p = v.params ?? {};
   const routed = p?._meta?.["io.modelcontextprotocol/subscriptionId"];
   if (routed !== subscriptionId) return null;
-  const event = p.event ?? {};
+  // Final: occurrence fields are the params themselves. Tolerate the old
+  // nested `event` during the transition (G13 constraint a).
+  const event = p.event ?? p;
+  const payload = event.data ?? {};
   const name = String(event.name ?? event.kind ?? "");
   if (!WAKE_NAMES.has(name)) return null;
-  const id = String(event.event_id ?? event.id ?? "");
+  const id = String(event.eventId ?? event.event_id ?? event.id ?? "");
   if (!id) return null;
-  const urgent = event.priority === "urgent" || event.importance === "urgent" || name === "ack_sla_expired";
+  const urgent = payload.priority === "urgent" || payload.importance === "urgent"
+    || event.priority === "urgent" || name === "ack_sla_expired";
   return { id, name, urgent };
 }
 

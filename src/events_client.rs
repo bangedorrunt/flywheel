@@ -96,7 +96,8 @@ impl EventsRpc for UreqRpc {
     ) -> Result<serde_json::Value, String> {
         let id = 1u64;
         let body = serde_json::json!({
-            "jsonrpc": "2.0", "id": id, "method": method, "params": params,
+            "jsonrpc": "2.0", "id": id, "method": method,
+            "params": with_client_caps(params),
         })
         .to_string();
         let resp = self.post(&body, last_event_id)?;
@@ -118,7 +119,8 @@ impl EventsRpc for UreqRpc {
         on_data: &mut dyn FnMut(&str),
     ) -> Result<(), String> {
         let body = serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "method": "events/stream", "params": params,
+            "jsonrpc": "2.0", "id": 1, "method": "events/stream",
+            "params": with_client_caps(params),
         })
         .to_string();
         let resp = self.post(&body, last_event_id)?;
@@ -153,6 +155,33 @@ pub fn subscription_from_result(v: &serde_json::Value) -> Result<(String, i64, S
         })
         .unwrap_or_default();
     Ok((id.to_string(), expires, cursor))
+}
+
+/// SEP-3415 Final G10: every events/* request declares the extension in
+/// `params._meta["io.modelcontextprotocol/clientCapabilities"]`.
+pub fn with_client_caps(params: serde_json::Value) -> serde_json::Value {
+    let mut p = params;
+    let meta = p
+        .as_object_mut()
+        .unwrap()
+        .entry("_meta")
+        .or_insert_with(|| serde_json::json!({}));
+    let caps = meta
+        .as_object_mut()
+        .unwrap()
+        .entry("io.modelcontextprotocol/clientCapabilities")
+        .or_insert_with(|| serde_json::json!({}));
+    caps.as_object_mut()
+        .unwrap()
+        .entry("extensions")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .unwrap()
+        .insert(
+            "io.modelcontextprotocol/events".into(),
+            serde_json::json!({}),
+        );
+    p
 }
 
 /// Pure parse of an `events/poll` result into the kernel's `Page`.

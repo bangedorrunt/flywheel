@@ -47,7 +47,20 @@ async function rpc(method: string, params: object, token: string, id = 1): Promi
       "MCP-Protocol-Version": "2026-07-28",
       authorization: `Bearer ${token}`,
     },
-    body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
+    // SEP-3415 Final G10: declare the events extension on every request so the
+    // server may enforce gating without breaking this client.
+    body: JSON.stringify({
+      jsonrpc: "2.0", id, method,
+      params: {
+        ...params,
+        _meta: {
+          ...(params as any)._meta,
+          "io.modelcontextprotocol/clientCapabilities": {
+            extensions: { "io.modelcontextprotocol/events": {} },
+          },
+        },
+      },
+    }),
   });
   if (res.status === 401) throw new Error("401");
   const body = await res.text();
@@ -79,7 +92,13 @@ async function streamOnce(
         authorization: `Bearer ${token}`,
         "last-event-id": cursor,
       },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "events/stream", params: { subscriptionId: sub, cursor } }),
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 1, method: "events/stream",
+        params: {
+          subscriptionId: sub, cursor,
+          _meta: { "io.modelcontextprotocol/clientCapabilities": { extensions: { "io.modelcontextprotocol/events": {} } } },
+        },
+      }),
     });
     if (res.status === 401) return null;
     if (!res.ok || !res.body) return null;
