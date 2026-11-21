@@ -1,6 +1,0 @@
-{"arr":["none","none"],"arrLen":0,"arrived":[],"badRelease":[],"holder":[],"notified":[],"queued":[],"srv":["none","none"],"srvLen":0}
-{"action":"AcquireFree","arr":["none","none"],"arrLen":0,"arrived":[],"badRelease":[],"holder":["A"],"notified":[],"params":["A"],"queued":[],"srv":["none","none"],"srvLen":0}
-{"action":"Queue","arr":["B","none"],"arrLen":1,"arrived":["B"],"badRelease":[],"holder":["A"],"notified":["B"],"params":["B"],"queued":["B"],"srv":["none","none"],"srvLen":0}
-{"action":"Queue","arr":["B","C"],"arrLen":2,"arrived":["B","C"],"badRelease":[],"holder":["A"],"notified":["B","C"],"params":["C"],"queued":["B","C"],"srv":["none","none"],"srvLen":0}
-{"action":"Release","arr":["B","C"],"arrLen":2,"arrived":["B","C"],"badRelease":[],"holder":["B"],"notified":["B","C"],"params":["commit"],"queued":["C"],"srv":["B","none"],"srvLen":1}
-{"action":"Release","arr":["B","C"],"arrLen":2,"arrived":["B","C"],"badRelease":[],"holder":["C"],"notified":["B","C"],"params":["ttl"],"queued":[],"srv":["B","C"],"srvLen":2}

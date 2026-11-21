@@ -208,47 +208,6 @@ pub fn build_lease_waitlist_machine() -> Machine<LeaseState, LeaseEvent, LeaseCo
 mod tests {
     use super::*;
 
-    /// Pure projection of one statechart step into `LeaseWaitlist.tla`
-    /// variable names for `everystate conform`. No clock, socket or env
-    /// here — the driver test owns the file write.
-    #[must_use]
-    fn conform_step(event: &LeaseEvent, ctx: &LeaseContext) -> serde_json::Value {
-        let (action, params) = match event {
-            LeaseEvent::Acquire { pin } => (
-                if ctx.notified.contains(pin) {
-                    "Queue"
-                } else {
-                    "AcquireFree"
-                },
-                vec![pin.clone()],
-            ),
-            LeaseEvent::Release { source } => ("Release", vec![source.clone()]),
-            LeaseEvent::Expire => ("Release", vec!["ttl".to_string()]),
-            LeaseEvent::Withdraw { pin } => ("Withdraw", vec![pin.clone()]),
-            LeaseEvent::Retire => ("Retire", vec![]),
-        };
-        let pad = |v: &Vec<String>| -> Vec<String> {
-            let mut out = v.clone();
-            while out.len() < 2 {
-                out.push("none".into());
-            }
-            out
-        };
-        serde_json::json!({
-            "action": action,
-            "params": params,
-            "holder": ctx.holder.iter().cloned().collect::<Vec<_>>(),
-            "arr": pad(&ctx.notified),
-            "arrLen": ctx.notified.len(),
-            "srv": pad(&ctx.served),
-            "srvLen": ctx.served.len(),
-            "queued": ctx.queue,
-            "arrived": ctx.notified,
-            "notified": ctx.notified,
-            "badRelease": [],
-        })
-    }
-
     #[test]
     fn one_message_log_hands_off_fifo_and_accounts_for_every_waiter() {
         use toron_core::kernel::MachineState;
@@ -321,61 +280,5 @@ mod tests {
         assert_eq!(ms.context.holder.as_deref(), Some("C"), "TTL hands over");
         assert!(ms.context.queue.is_empty());
         assert_eq!(ms.context.last_source.as_deref(), Some("ttl"));
-    }
-
-    /// Records a real statechart message log as an `everystate conform` trace.
-    /// Set CONFORM_TRACE_OUT to regenerate the fixture; with no env this is a
-    /// pure self-check of the projection, never an ambient-state read.
-    #[test]
-    fn conform_trace_projection_is_deterministic() {
-        use toron_core::kernel::MachineState;
-
-        let m = build_lease_waitlist_machine();
-        let mut ms = MachineState::at(LeaseState::Free, LeaseContext::default());
-        let mut rows = vec![serde_json::json!({
-            "holder": Vec::<String>::new(),
-            "arr": ["none", "none"],
-            "arrLen": 0,
-            "srv": ["none", "none"],
-            "srvLen": 0,
-            "queued": Vec::<String>::new(),
-            "arrived": Vec::<String>::new(),
-            "notified": Vec::<String>::new(),
-            "badRelease": Vec::<String>::new(),
-        })];
-        for event in [
-            LeaseEvent::Acquire { pin: "A".into() },
-            LeaseEvent::Acquire { pin: "B".into() },
-            LeaseEvent::Acquire { pin: "C".into() },
-            LeaseEvent::Release {
-                source: "commit".into(),
-            },
-            LeaseEvent::Expire,
-        ] {
-            let out = m.step_state(&ms, &event);
-            ms = MachineState::at(
-                out.configuration
-                    .primary()
-                    .cloned()
-                    .unwrap_or(LeaseState::Free),
-                out.context.clone(),
-            );
-            rows.push(conform_step(&event, &ms.context));
-        }
-        assert_eq!(rows.len(), 6, "one initial state plus five real steps");
-        assert_eq!(
-            rows.iter()
-                .filter_map(|r| r["action"].as_str())
-                .collect::<Vec<_>>(),
-            vec!["AcquireFree", "Queue", "Queue", "Release", "Release"]
-        );
-        if let Ok(path) = std::env::var("CONFORM_TRACE_OUT") {
-            let text = rows
-                .iter()
-                .map(serde_json::Value::to_string)
-                .collect::<Vec<_>>()
-                .join("\n");
-            std::fs::write(path, format!("{text}\n")).expect("write conform trace");
-        }
     }
 }

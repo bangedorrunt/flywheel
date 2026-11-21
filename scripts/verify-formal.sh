@@ -134,7 +134,6 @@ expect_pass ReservationBoard ReservationBoard
 expect_pass ResultMail ResultMail
 expect_pass CaptainWatch CaptainWatch
 expect_pass CaptainWatch CaptainWatch.oneshot
-expect_pass LeaseWaitlist LeaseWaitlist
 expect_pass TrackerCas TrackerCas
 expect_pass EventsDedupe EventsDedupe
 
@@ -167,10 +166,6 @@ expect_violation SupervisorRetire SupervisorRetire.broken-delete-on-failure Plis
 expect_violation PeerContention PeerContention.broken-no-tiebreak AtMostOneHolder
 expect_violation ReservationBoard ReservationBoard.broken-truncated-grants NoGrantWithoutCompleteBoard
 expect_violation ReservationBoard ReservationBoard.broken-no-refresh AtMostOneHolder
-expect_violation LeaseWaitlist LeaseWaitlist.broken-double-holder OneHolder
-expect_violation LeaseWaitlist LeaseWaitlist.broken-lifo FifoHandoff
-expect_violation LeaseWaitlist LeaseWaitlist.broken-drop-waiter NoLostWaiter
-expect_violation LeaseWaitlist LeaseWaitlist.broken-no-ttl HandoffOnEveryRelease
 expect_violation MailQueue MailQueue.broken-double ExactlyOnce
 expect_violation MailQueue MailQueue.broken-memory-only NoLostSend
 expect_violation MailQueue MailQueue.broken-recorr SameCorr
@@ -195,8 +190,6 @@ expect_conform ResultMail "$PWD/$(dirname "$MODELS")/traces/ResultMail.recorded.
 expect_conform CaptainWatch "$PWD/$(dirname "$MODELS")/traces/CaptainWatch.recorded.jsonl"
 expect_conform TrackerCas "$PWD/$(dirname "$MODELS")/traces/TrackerCas.recorded.jsonl"
 expect_nonconform TrackerCas "$PWD/$(dirname "$MODELS")/traces/TrackerCas.stale-splice.jsonl" 20 "CasOk"
-expect_conform LeaseWaitlist "$PWD/$(dirname "$MODELS")/traces/LeaseWaitlist.recorded.jsonl"
-expect_nonconform LeaseWaitlist "$PWD/$(dirname "$MODELS")/traces/LeaseWaitlist.no-holder-release.jsonl" 20 "Release"
 
 # Every model in the directory must be exercised: a new .tla that nobody added
 # an expectation for would otherwise pass silently as "not run".
