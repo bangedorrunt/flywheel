@@ -344,6 +344,17 @@ do_install() {
     run cp -R "$plugin_src" "$plugin_dir"
   fi
 
+  # bd-zc7b4: the pi events extension must survive proof-export cleanup, so
+  # install it beside the Claude plugin under the durable data home.
+  ext_src="$FLYWHEEL_SOURCE/extensions/pi-flywheel-events"
+  ext_dir="${XDG_DATA_HOME:-$HOME/.local/share}/flywheel/extensions/pi-flywheel-events"
+  if [ -f "$ext_src/src/index.ts" ]; then
+    echo "installing pi events extension into $ext_dir"
+    run mkdir -p "${ext_dir%/*}"
+    run rm -rf "$ext_dir"
+    run cp -R "$ext_src" "$ext_dir"
+  fi
+
   if [ "$(uname -s)" = "Darwin" ] && [ "$NO_CODESIGN" -eq 0 ]; then
     while IFS= read -r bin; do
       if [ "$SKIP_TORON" -eq 1 ] && [ "${bin##*/}" = "toron" ]; then
