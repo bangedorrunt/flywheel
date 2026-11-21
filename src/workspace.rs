@@ -755,6 +755,14 @@ pub enum Msg {
     Sweep {
         now: u64,
     },
+    /// A toron pull-cursor read re-enters here (pipe pattern) and folds
+    /// straight into the doorbell slice (bd-yc6jf). Decides parked mail by
+    /// max(host cursor, toron cursor); unanswered toron rings anyway.
+    ToronCursor {
+        pin: String,
+        cursor_us: Option<i64>,
+        read_at_secs: u64,
+    },
     /// Write-through of one durable receipt: inserts the assignment cache
     /// AND emits SqliteUpsert for the same corr (never one without the other).
     Receipt {
@@ -836,6 +844,9 @@ pub enum Cmd {
     /// Effect runs the fetch; rows re-enter tick as InboxRows.
     /// Signal only (bd-z5ou): per-pin cursors live in the brain.
     FetchInbox,
+    /// Effect runs `toron inbox cursor`; the answer re-enters tick as
+    /// ToronCursor (bd-yc6jf). Signal only, like FetchInbox.
+    ReadToronCursor { pin: String },
     /// Caller-applied dispatcher effects (no tick-side content).
     CheckAckSla,
     /// Caller-applied dispatcher effects (no tick-side content).
@@ -952,6 +963,9 @@ impl Cmd {
                 event_id,
             },
             crate::doorbell_tick::DoorbellAction::FetchInbox => Self::FetchInbox,
+            crate::doorbell_tick::DoorbellAction::ReadToronCursor { pin } => {
+                Self::ReadToronCursor { pin }
+            }
             crate::doorbell_tick::DoorbellAction::CheckAckSla => Self::CheckAckSla,
             crate::doorbell_tick::DoorbellAction::RestartWatch => Self::RestartWatch,
             crate::doorbell_tick::DoorbellAction::FactMiss { why } => Self::FactMiss { why },
@@ -2004,6 +2018,22 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             } else {
                 cmds.extend(c);
             }
+        }
+        Msg::ToronCursor {
+            pin,
+            cursor_us,
+            read_at_secs,
+        } => {
+            let (dm, c) = doorbell_slice(
+                &model.doorbell,
+                crate::doorbell_tick::DoorbellMsg::ToronCursor {
+                    pin: pin.clone(),
+                    cursor_us: *cursor_us,
+                    read_at_secs: *read_at_secs,
+                },
+            );
+            next.doorbell = dm;
+            cmds.extend(c);
         }
         Msg::AckSlaTick { now } => {
             let (dm, c) = doorbell_slice(
@@ -6857,6 +6887,7 @@ impl CmdTrait for Cmd {
     fn durability(&self) -> Durability {
         match self {
             Cmd::FetchInbox
+            | Cmd::ReadToronCursor { .. }
             | Cmd::CheckAckSla
             | Cmd::RestartWatch
             | Cmd::FactMiss { .. }

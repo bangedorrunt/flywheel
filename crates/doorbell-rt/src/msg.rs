@@ -29,6 +29,13 @@ pub enum BrainMsg {
     },
     /// Ack-SLA scan results re-enter here (pipe pattern).
     SlaFired { posts: Vec<String> },
+    /// A toron pull-cursor read re-enters here (pipe pattern): the pin's
+    /// committed cursor, or None when toron could not answer (bd-yc6jf).
+    ToronCursor {
+        pin: String,
+        cursor_us: Option<i64>,
+        read_at_secs: u64,
+    },
     /// Fault-as-data: sensor/sink death, never fatal to the runtime.
     Degraded { source: String, reason: String },
     /// F5: delivery receipt — worker confirms adapter.send succeeded.

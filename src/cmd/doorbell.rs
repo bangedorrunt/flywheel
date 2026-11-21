@@ -1693,6 +1693,15 @@ pub(crate) fn cmd_doorbell_why(
                     event_id,
                 },
                 doorbell_tick::DoorbellMsg::Fact { summary } => workspace::Msg::Fact { summary },
+                doorbell_tick::DoorbellMsg::ToronCursor {
+                    pin,
+                    cursor_us,
+                    read_at_secs,
+                } => workspace::Msg::ToronCursor {
+                    pin,
+                    cursor_us,
+                    read_at_secs,
+                },
                 doorbell_tick::DoorbellMsg::AckSlaTick { now } => {
                     workspace::Msg::AckSlaTick { now }
                 }
@@ -2945,7 +2954,12 @@ pub(crate) fn handle_workspace_cmds(
                     &crate::turn_hooks::MailSignal::default(),
                 );
             }
-            workspace::Cmd::CheckAckSla | workspace::Cmd::RestartWatch => {}
+            workspace::Cmd::CheckAckSla
+            | workspace::Cmd::RestartWatch
+            | workspace::Cmd::ReadToronCursor { .. } => {}
+            // ReadToronCursor is answered by the brain dispatch (ToronCursor row), never by
+            // this drain: a parked candidate here resolves when the full
+            // log replays, not from local drain work.
             workspace::Cmd::Audit { kind, pin, detail } => {
                 eprintln!("flywheel: [Audit {kind}] {pin}: {detail}");
             }

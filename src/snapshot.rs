@@ -183,6 +183,15 @@ pub fn replay_msg(v: &serde_json::Value) -> Option<crate::workspace::Msg> {
                 event_id,
             },
             crate::doorbell_tick::DoorbellMsg::Fact { summary } => Msg::Fact { summary },
+            crate::doorbell_tick::DoorbellMsg::ToronCursor {
+                pin,
+                cursor_us,
+                read_at_secs,
+            } => Msg::ToronCursor {
+                pin,
+                cursor_us,
+                read_at_secs,
+            },
             crate::doorbell_tick::DoorbellMsg::AckSlaTick { now } => Msg::AckSlaTick { now },
             crate::doorbell_tick::DoorbellMsg::WatchDied => Msg::WatchDied,
         });

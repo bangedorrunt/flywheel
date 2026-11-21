@@ -20,6 +20,9 @@ pub enum Effect {
     /// Fetch plane-P inbox off-loop; rows re-enter as `InboxFetched`.
     /// Signal only (bd-z5ou): per-pin cursors live in the brain.
     FetchInbox,
+    /// Read the pin's committed toron pull cursor; the answer re-enters
+    /// as `ToronCursor` (bd-yc6jf). Emitted at most once per parked burst.
+    ReadToronCursor { pin: String },
     /// Run the ack-SLA scan; results re-enter as `SlaFired`.
     CheckAckSla,
     /// Restart the watch child with backoff.
@@ -59,6 +62,14 @@ pub trait Host: Send {
     /// Plane-P inbox rows for one pin (F6: shared borrow — fetch needs no
     /// &mut; pipe worker in .5 calls this off-loop, immediate here).
     fn fetch_inbox(&self, pin: &str, since: &str) -> Vec<serde_json::Value>;
+    /// The pin's committed toron pull cursor in rumor-time micros, or None
+    /// when toron cannot answer (bd-yc6jf). Fail-open by contract: the
+    /// caller rings anyway and audits the miss. Default is None — a host
+    /// without a toron subprocess never suppresses a wake it cannot prove
+    /// consumed.
+    fn read_toron_cursor(&self, _pin: &str) -> Option<i64> {
+        None
+    }
     fn scan_ack_sla(&mut self) -> Vec<String>;
     /// Fetch the inbox rows for `pins` and hand them to the brain.
     ///
@@ -190,6 +201,9 @@ pub struct MockHost {
     pub unroutable: std::collections::BTreeSet<String>,
     /// Pin → npub, for hear-tracker seeding (`Host::pin_npub`).
     pub npubs: std::collections::BTreeMap<String, String>,
+    /// Scripted toron cursor answer for `read_toron_cursor` (bd-yc6jf tests).
+    /// None models toron not answering (fail-open: ring anyway).
+    pub toron_cursor: Option<i64>,
     /// Inbox probes served (bd-0uzrq.20): the fake host's fetch counter, so a
     /// test can prove the backoff bounds the work instead of trusting a
     /// journal row that only the non-empty fetches produce.
@@ -210,6 +224,7 @@ impl MockHost {
             statuses: Default::default(),
             unroutable: Default::default(),
             npubs: Default::default(),
+            toron_cursor: None,
             fetch_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -253,6 +268,10 @@ impl Host for MockHost {
             .get(&(pin.to_string(), since.to_string()))
             .cloned()
             .unwrap_or_default()
+    }
+
+    fn read_toron_cursor(&self, _pin: &str) -> Option<i64> {
+        self.toron_cursor
     }
 
     fn pins(&self) -> Vec<String> {
@@ -317,6 +336,15 @@ impl CoreReducer {
                 line: line.clone(),
             },
             BrainMsg::EventsGap { pin } => DoorbellMsg::EventsGap { pin: pin.clone() },
+            BrainMsg::ToronCursor {
+                pin,
+                cursor_us,
+                read_at_secs,
+            } => DoorbellMsg::ToronCursor {
+                pin: pin.clone(),
+                cursor_us: *cursor_us,
+                read_at_secs: *read_at_secs,
+            },
             BrainMsg::Sweep { .. }
             | BrainMsg::RoleBound { .. }
             | BrainMsg::Presence { .. }
@@ -342,6 +370,7 @@ impl CoreReducer {
                     line,
                 },
                 DoorbellAction::FetchInbox => Effect::FetchInbox,
+                DoorbellAction::ReadToronCursor { pin } => Effect::ReadToronCursor { pin },
                 DoorbellAction::CheckAckSla => Effect::CheckAckSla,
                 DoorbellAction::RestartWatch => Effect::RestartWatch,
                 DoorbellAction::FactMiss { why } => Effect::Audit {

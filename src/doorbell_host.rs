@@ -138,6 +138,16 @@ fn now_us() -> i64 {
         .unwrap_or(0)
 }
 
+/// Parse `toron inbox cursor` stdout into rumor-time micros (bd-yc6jf).
+/// None on any shape failure — the caller rings anyway (fail-open), so a
+/// broken read degrades to the old behavior, never to a dropped wake.
+fn parse_toron_cursor(raw: &[u8]) -> Option<i64> {
+    serde_json::from_slice::<serde_json::Value>(raw)
+        .ok()?
+        .get("cursor_us")?
+        .as_i64()
+}
+
 /// Stop flag shared by every events pump; set on graceful shutdown.
 static EVENTS_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1138,6 +1148,7 @@ fn cmds_to_effects(cmds: Vec<workspace::Cmd>) -> Vec<Effect> {
                 line,
             }),
             workspace::Cmd::FetchInbox => Some(Effect::FetchInbox),
+            workspace::Cmd::ReadToronCursor { pin } => Some(Effect::ReadToronCursor { pin }),
             workspace::Cmd::CheckAckSla => Some(Effect::CheckAckSla),
             workspace::Cmd::RestartWatch => Some(Effect::RestartWatch),
             workspace::Cmd::FactMiss { why } => Some(Effect::Audit {
@@ -1221,6 +1232,18 @@ impl Host for RtHost {
                 }
             }
             BrainMsg::AckSlaTick { now } => (workspace::Msg::AckSlaTick { now: *now }, false),
+            BrainMsg::ToronCursor {
+                pin,
+                cursor_us,
+                read_at_secs,
+            } => (
+                workspace::Msg::ToronCursor {
+                    pin: pin.clone(),
+                    cursor_us: *cursor_us,
+                    read_at_secs: *read_at_secs,
+                },
+                false,
+            ),
             BrainMsg::Presence { pin, state } => (
                 workspace::Msg::Presence {
                     pin: pin.clone(),
@@ -1460,6 +1483,29 @@ impl Host for RtHost {
     /// answers is still reported unanswered forever.
     fn pin_npub(&self, pin: &str) -> Option<String> {
         self.model.doorbell.index.npub(pin).map(str::to_string)
+    }
+
+    /// The pin's committed toron pull cursor (bd-yc6jf): fail-open None on
+    /// any spawn, exit, or shape failure — the fold rings anyway and audits
+    /// the miss, so a broken read degrades to the old behavior, never to
+    /// a dropped wake.
+    fn read_toron_cursor(&self, pin: &str) -> Option<i64> {
+        let output = std::process::Command::new("toron")
+            .args([
+                "inbox",
+                "cursor",
+                "--project",
+                &self.project,
+                "--as",
+                pin,
+                "--json",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        parse_toron_cursor(&output.stdout)
     }
 
     /// Fetch-only slice of the old sweep arm (classify + prompt moved to
@@ -2124,6 +2170,35 @@ mod stale_retire_tests {
             msg.contains("supervisor restarts"),
             "the error must name the restart contract: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod toron_cursor_parse_tests {
+    //! bd-yc6jf: the cursor parse is total — any shape failure is None
+    //! (fail-open: ring anyway), never a panic, never a wrong number.
+
+    #[test]
+    fn valid_cursor_parses_to_micros() {
+        assert_eq!(
+            super::parse_toron_cursor(
+                br#"{"project":"flywheel","agent":"BlueRidge","cursor_us":1700000000000000}"#
+            ),
+            Some(1_700_000_000_000_000)
+        );
+    }
+
+    #[test]
+    fn any_shape_failure_is_none() {
+        for raw in [
+            &b""[..],
+            b"not json",
+            br#"{"cursor_us": "a lot"}"#,
+            br#"{"cursor_us": 1.5}"#,
+            br#"{"other": 1}"#,
+        ] {
+            assert_eq!(super::parse_toron_cursor(raw), None, "fail-open");
+        }
     }
 }
 
@@ -3915,12 +3990,15 @@ impl Interpret<crate::workspace::WorkspaceProgram> for DurableInterpret {
                     })
                     .provide_from(services)
             }
-            crate::workspace::Cmd::FetchInbox | crate::workspace::Cmd::CheckAckSla => {
+            crate::workspace::Cmd::FetchInbox
+            | crate::workspace::Cmd::CheckAckSla
+            | crate::workspace::Cmd::ReadToronCursor { .. } => {
                 let Some(services) = services else {
                     return Self::interpret(cmd);
                 };
                 let kind: &'static str = match cmd {
                     crate::workspace::Cmd::FetchInbox => "fetch_inbox",
+                    crate::workspace::Cmd::ReadToronCursor { .. } => "read_toron_cursor",
                     _ => "check_ack_sla",
                 };
                 let q = quiet();

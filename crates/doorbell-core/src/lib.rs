@@ -930,6 +930,16 @@ pub enum DoorbellMsg {
     /// Periodic tick (60s cadence in the live dispatcher); drives the
     /// Ack-SLA scan effect.
     AckSlaTick { now: u64 },
+    /// The toron pull-cursor read re-enters here (pipe pattern): the
+    /// interpreter ran `toron inbox cursor` for the pin and answers with
+    /// the committed cursor (None when toron could not answer). `read_at`
+    /// is the answer's wall-clock stamp, journaled so the 5s reuse window
+    /// replays deterministically (bd-yc6jf).
+    ToronCursor {
+        pin: String,
+        cursor_us: Option<i64>,
+        read_at_secs: u64,
+    },
     /// The watch child died; supervisor must restart (never exit).
     WatchDied,
 }
@@ -952,6 +962,13 @@ pub enum DoorbellAction {
     /// Effect: run `check_ack_sla_expired` for the project (toron mailbox).
     /// Overdue wakes re-enter as WatchNdjson Msgs via plane S.
     CheckAckSla,
+    /// Effect: read the pin's committed toron pull cursor (`toron inbox
+    /// cursor`); the answer re-enters as `ToronCursor` (bd-yc6jf). Emitted
+    /// at most once per parked burst — a coalesced re-ask needs a fresh
+    /// stale verdict, never a second action for the same wait.
+    ReadToronCursor {
+        pin: String,
+    },
     RestartWatch,
     FactMiss {
         why: String,
@@ -1015,6 +1032,19 @@ pub struct DoorbellModel {
     /// pulled by `toron next` and must not ring an empty wake.
     #[serde(default)]
     pub pulled_us: BTreeMap<String, i64>,
+    /// Pins with an unanswered toron-cursor read (bd-yc6jf): a burst of
+    /// mail for one of these parks without a second ask.
+    #[serde(default)]
+    pub cursor_inflight: std::collections::BTreeSet<String>,
+    /// The latest answered toron pull-cursor read per pin (bd-yc6jf).
+    /// Freshness is judged against each mail's own event time, so the
+    /// 5s reuse window replays deterministically.
+    #[serde(default)]
+    pub toron_cursor: BTreeMap<String, ToronRead>,
+    /// Mail ring candidates parked while their pin's toron read is in
+    /// flight (bd-yc6jf). Re-folded as watch lines when the answer lands.
+    #[serde(default)]
+    pub parked_mail: Vec<ParkedMail>,
 }
 
 /// A mail event at or below the pin's pull cursor is consumed, not a wake
@@ -1023,6 +1053,33 @@ pub fn already_pulled(pulled_us: &BTreeMap<String, i64>, pin: &str, created_us: 
     pulled_us
         .get(pin)
         .is_some_and(|cursor| created_us <= *cursor)
+}
+
+/// One answered toron pull-cursor read (bd-yc6jf). `cursor_us` is None
+/// when toron could not answer — cached like a value so a failing toron
+/// costs one read per window, not one per mail. `read_at_secs` is the
+/// answer's stamp; freshness is judged against each mail's own event
+/// time, keeping the reuse window replay-deterministic.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ToronRead {
+    pub cursor_us: Option<i64>,
+    pub read_at_secs: u64,
+}
+
+/// A mail ring candidate parked while its pin's toron read is in flight
+/// (bd-yc6jf). Re-folded as a watch line when the answer lands, so the
+/// parked path and the fresh path share one decision.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ParkedMail {
+    pub pin: String,
+    pub line: String,
+}
+
+/// A cached toron read is fresh for a mail when the read answered no
+/// more than 5s before the mail's own event time (bd-yc6jf). Both
+/// stamps are journaled, so the verdict replays exactly.
+pub fn toron_read_is_fresh(read: &ToronRead, created_secs: u64) -> bool {
+    read.read_at_secs.saturating_add(5) >= created_secs
 }
 
 /// Per-pin 5/30/3 budget (D1 item 2, D4.5 home).
@@ -1233,6 +1290,50 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                     });
                     continue;
                 }
+                // bd-yc6jf: the toron cursor is the second half of the one
+                // notion. A fresh read decides by max(host, toron); a
+                // missing or stale read parks the candidate and asks toron
+                // once per burst. A line without event time cannot be
+                // compared, so it rings as today (fail toward delivery).
+                if mail && let Some(us) = created_us {
+                    let created_secs = (us / 1_000_000).max(0) as u64;
+                    let fresh = next
+                        .toron_cursor
+                        .get(&pin)
+                        .is_some_and(|t| toron_read_is_fresh(t, created_secs));
+                    if fresh {
+                        match next.toron_cursor.get(&pin).and_then(|t| t.cursor_us) {
+                            Some(tc) if us <= tc => {
+                                actions.push(DoorbellAction::Audit {
+                                    kind: "already-pulled".into(),
+                                    pin: pin.clone(),
+                                    detail: format!(
+                                        "mail at {created_us:?} is at or below the toron cursor"
+                                    ),
+                                });
+                                continue;
+                            }
+                            None => {
+                                actions.push(DoorbellAction::Audit {
+                                    kind: "toron-cursor-unavailable".into(),
+                                    pin: pin.clone(),
+                                    detail: "toron could not answer; ringing toward delivery"
+                                        .into(),
+                                });
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        if next.cursor_inflight.insert(pin.clone()) {
+                            actions.push(DoorbellAction::ReadToronCursor { pin: pin.clone() });
+                        }
+                        next.parked_mail.push(ParkedMail {
+                            pin: pin.clone(),
+                            line: line.clone(),
+                        });
+                        continue;
+                    }
+                }
                 if unidentified_mail {
                     actions.push(DoorbellAction::Audit {
                         kind: "unidentified_mail_wake".into(),
@@ -1393,6 +1494,34 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
             actions.push(DoorbellAction::CheckAckSla);
             actions.push(DoorbellAction::FetchInbox);
         }
+        DoorbellMsg::ToronCursor {
+            pin,
+            cursor_us,
+            read_at_secs,
+        } => {
+            // bd-yc6jf: record the answer, then re-fold every parked
+            // candidate for this pin through the same watch path — the
+            // parked path and the fresh path share one decision. A stale
+            // answer parks and asks again; it never decides.
+            next.toron_cursor.insert(
+                pin.clone(),
+                ToronRead {
+                    cursor_us: *cursor_us,
+                    read_at_secs: *read_at_secs,
+                },
+            );
+            next.cursor_inflight.remove(pin);
+            let parked: Vec<String> = next
+                .parked_mail
+                .extract_if(.., |p| p.pin == *pin)
+                .map(|p| p.line)
+                .collect();
+            for line in parked {
+                let (m, a) = tick(&next, &DoorbellMsg::WatchNdjson { line });
+                next = m;
+                actions.extend(a);
+            }
+        }
         DoorbellMsg::WatchDied => {
             actions.push(DoorbellAction::RestartWatch);
         }
@@ -1506,6 +1635,7 @@ impl DoorbellAction {
             Self::Prompt { pin, .. } => format!("prompt {pin}"),
             Self::FetchInbox => "fetch-inbox".into(),
             Self::CheckAckSla => "check-ack-sla".into(),
+            Self::ReadToronCursor { pin } => format!("read-toron-cursor {pin}"),
             Self::RestartWatch => "restart-watch".into(),
             Self::FactMiss { why } => format!("fact-miss {why}"),
             Self::Audit { kind, pin, .. } => format!("audit {kind} {pin}"),
@@ -1542,17 +1672,39 @@ mod tests {
             ..Default::default()
         };
         fresh.statuses.insert("BlueRidge".into(), "idle".into());
-        let (_, fresh_actions) = tick(
+        // bd-yc6jf: a ring candidate asks toron first — no Prompt yet.
+        let (asked, ask_actions) = tick(
             &fresh,
             &DoorbellMsg::WatchNdjson {
                 line: watch.clone(),
             },
         );
         assert!(
+            ask_actions.iter().any(
+                |a| matches!(a, DoorbellAction::ReadToronCursor { pin } if pin == "BlueRidge")
+            ),
+            "a ring candidate asks toron: {ask_actions:?}"
+        );
+        assert!(
+            !ask_actions
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { pin, .. } if pin == "BlueRidge")),
+            "nothing rings before the answer: {ask_actions:?}"
+        );
+        // The toron answer is behind the mail: the parked ring fires.
+        let (_, fresh_actions) = tick(
+            &asked,
+            &DoorbellMsg::ToronCursor {
+                pin: "BlueRidge".into(),
+                cursor_us: Some(0),
+                read_at_secs: 1_700_000_000,
+            },
+        );
+        assert!(
             fresh_actions
                 .iter()
                 .any(|a| matches!(a, DoorbellAction::Prompt { pin, .. } if pin == "BlueRidge")),
-            "unpulled mail rings"
+            "unpulled mail rings once toron answers behind it: {fresh_actions:?}"
         );
 
         let mut pulled = fresh.clone();
@@ -1565,6 +1717,12 @@ mod tests {
         assert!(
             !pulled_actions
                 .iter()
+                .any(|a| matches!(a, DoorbellAction::ReadToronCursor { .. })),
+            "the host cursor short-circuits before any ask: {pulled_actions:?}"
+        );
+        assert!(
+            !pulled_actions
+                .iter()
                 .any(|a| matches!(a, DoorbellAction::Prompt { pin, .. } if pin == "BlueRidge")),
             "a pulled message must not re-ring: {pulled_actions:?}"
         );
@@ -1573,6 +1731,149 @@ mod tests {
                 |a| matches!(a, DoorbellAction::Audit { kind, .. } if kind == "already-pulled")
             ),
             "the skipped wake is audited, never silent"
+        );
+    }
+
+    /// bd-yc6jf: ONE message log. A mail watch with no usable toron read
+    /// parks the ring and asks toron exactly once per burst; the answered
+    /// read then decides by max(host cursor, toron cursor): covered mail
+    /// drops with an audit, uncovered mail rings, an unanswered toron
+    /// rings anyway with an audit. A read older than 5s by event time
+    /// re-asks; a dateless line rings as today (no ask without event time).
+    #[test]
+    fn a_cli_pull_at_or_after_created_at_suppresses_the_next_ring() {
+        let npub = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let mut index = SelfIndex::default();
+        index.insert_pin("BlueRidge".into(), Some(npub.into()));
+        let watch = format!(
+            r#"{{"kind":9,"id":"wake-cursor-1","pubkey":"senderpk","created_at":1700000000,"tags":[["p","{npub}"],["t","flywheel"],["h","thread-1"],["toron-kind","mail-delivered"],["thread","thread-1"],["importance","normal"],["from","SlateHarbor"],["mid","msg-cursor-1"]],"content":"mail"}}"#
+        );
+        let edge = || DoorbellMsg::WatchNdjson {
+            line: watch.clone(),
+        };
+        let model0 = DoorbellModel {
+            index: index.clone(),
+            statuses: [("BlueRidge".into(), "idle".into())].into(),
+            ..DoorbellModel::default()
+        };
+        // No toron read yet: park the candidate and ask exactly once.
+        let (m1, a1) = tick(&model0, &edge());
+        assert!(
+            a1.iter().any(
+                |a| matches!(a, DoorbellAction::ReadToronCursor { pin } if pin == "BlueRidge")
+            ),
+            "a ring candidate asks toron: {a1:?}"
+        );
+        assert!(
+            !a1.iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { pin, .. } if pin == "BlueRidge")),
+            "nothing rings before the answer: {a1:?}"
+        );
+        // A burst while the read is in flight coalesces: still one ask.
+        let (m2, a2) = tick(&m1, &edge());
+        assert_eq!(
+            a2.iter()
+                .filter(|a| matches!(a, DoorbellAction::ReadToronCursor { .. }))
+                .count(),
+            0,
+            "a burst asks once: {a2:?}"
+        );
+        // The CLI pull covered the mail: the parked ring drops, audited.
+        let (m3, a3) = tick(
+            &m2,
+            &DoorbellMsg::ToronCursor {
+                pin: "BlueRidge".into(),
+                cursor_us: Some(1_700_000_000_000_000),
+                read_at_secs: 1_700_000_000,
+            },
+        );
+        assert!(
+            !a3.iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { pin, .. } if pin == "BlueRidge")),
+            "covered mail never rings: {a3:?}"
+        );
+        assert!(
+            a3.iter().any(
+                |a| matches!(a, DoorbellAction::Audit { kind, .. } if kind == "already-pulled")
+            ),
+            "the drop is audited: {a3:?}"
+        );
+        // A later mail inside the 5s window decides from the cache: no ask.
+        let watch2 = format!(
+            r#"{{"kind":9,"id":"wake-cursor-1b","pubkey":"senderpk","created_at":1700000000,"tags":[["p","{npub}"],["t","flywheel"],["h","thread-1"],["toron-kind","mail-delivered"],["thread","thread-1"],["importance","normal"],["from","SlateHarbor"],["mid","msg-cursor-1b"]],"content":"mail"}}"#
+        );
+        let (m4, a4) = tick(&m3, &DoorbellMsg::WatchNdjson { line: watch2 });
+        assert!(
+            !a4.iter()
+                .any(|a| matches!(a, DoorbellAction::ReadToronCursor { .. })),
+            "a fresh read is reused: {a4:?}"
+        );
+        assert!(
+            !a4.iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { pin, .. } if pin == "BlueRidge")),
+            "still covered: {a4:?}"
+        );
+        let _ = m4;
+    }
+
+    /// bd-yc6jf: an unanswered toron rings anyway (fail toward delivery),
+    /// and a read older than 5s by event time re-asks.
+    #[test]
+    fn an_unanswered_toron_rings_anyway_and_a_stale_read_reasks() {
+        let npub = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let mut index = SelfIndex::default();
+        index.insert_pin("BlueRidge".into(), Some(npub.into()));
+        let watch = format!(
+            r#"{{"kind":9,"id":"wake-cursor-2","pubkey":"senderpk","created_at":1700000000,"tags":[["p","{npub}"],["t","flywheel"],["h","thread-1"],["toron-kind","mail-delivered"],["thread","thread-1"],["importance","normal"],["from","SlateHarbor"],["mid","msg-cursor-2"]],"content":"mail"}}"#
+        );
+        let edge = || DoorbellMsg::WatchNdjson {
+            line: watch.clone(),
+        };
+        let model0 = DoorbellModel {
+            index: index.clone(),
+            statuses: [("BlueRidge".into(), "idle".into())].into(),
+            ..DoorbellModel::default()
+        };
+        let (m1, _) = tick(&model0, &edge());
+        let (_, a_fail) = tick(
+            &m1,
+            &DoorbellMsg::ToronCursor {
+                pin: "BlueRidge".into(),
+                cursor_us: None,
+                read_at_secs: 1_700_000_000,
+            },
+        );
+        assert!(
+            a_fail
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { pin, .. } if pin == "BlueRidge")),
+            "no answer still rings: {a_fail:?}"
+        );
+        assert!(
+            a_fail.iter().any(|a| matches!(a, DoorbellAction::Audit { kind, .. } if kind == "toron-cursor-unavailable")),
+            "the fallback is audited: {a_fail:?}"
+        );
+        // A read answered long before the mail is stale: ask again.
+        let (m2, _) = tick(&model0, &edge());
+        let (_, a_stale) = tick(
+            &m2,
+            &DoorbellMsg::ToronCursor {
+                pin: "BlueRidge".into(),
+                cursor_us: Some(1),
+                read_at_secs: 1_699_999_000,
+            },
+        );
+        assert!(
+            a_stale.iter().any(
+                |a| matches!(a, DoorbellAction::ReadToronCursor { pin } if pin == "BlueRidge")
+            ),
+            "a stale read re-asks instead of deciding: {a_stale:?}"
+        );
+        assert!(
+            !a_stale
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { pin, .. } if pin == "BlueRidge")),
+            "nothing rings before the fresh answer: {a_stale:?}"
         );
     }
 
@@ -3002,10 +3303,27 @@ mod tests {
             watch_targets(&watch, &model.index),
             vec!["BlueRidge".to_string()]
         );
-        let (next, actions) = tick(&model, &DoorbellMsg::WatchNdjson { line: watch });
+        let (next, actions) = tick(
+            &model,
+            &DoorbellMsg::WatchNdjson {
+                line: watch.clone(),
+            },
+        );
+        assert!(
+            matches!(&actions[..], [DoorbellAction::ReadToronCursor { pin }] if pin == "BlueRidge"),
+            "a ring candidate asks toron before ringing: {actions:?}"
+        );
+        let (next, actions) = tick(
+            &next,
+            &DoorbellMsg::ToronCursor {
+                pin: "BlueRidge".into(),
+                cursor_us: Some(0),
+                read_at_secs: 1_700_000_000,
+            },
+        );
         assert!(
             matches!(&actions[..], [DoorbellAction::Prompt { pin, line, .. }] if pin == "BlueRidge" && line.contains("toron next")),
-            "hex-npub p tag with mid must ring idle pin: {actions:?}"
+            "hex-npub p tag with mid must ring idle pin once toron answers behind it: {actions:?}"
         );
         assert!(next.rung.contains("msg-hex-1"));
     }

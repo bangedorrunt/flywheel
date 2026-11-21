@@ -574,6 +574,13 @@ impl<H: Host> Brain<H> {
                 self.on_events(&BrainMsg::EventsGap { pin }, "events-gap")
                     .await;
             }
+            BrainMsg::ToronCursor {
+                pin,
+                cursor_us,
+                read_at_secs,
+            } => {
+                self.on_toron_cursor(pin, cursor_us, read_at_secs).await;
+            }
             BrainMsg::InboxFetched { pin, rows } => self.on_inbox_fetched(pin, rows).await,
             BrainMsg::SlaFired { posts } => self.on_sla_fired(posts).await,
             BrainMsg::Degraded { source, reason } => {
@@ -642,6 +649,25 @@ impl<H: Host> Brain<H> {
         }
     }
 
+    /// A toron pull-cursor answer re-enters here (bd-yc6jf): fold the parked
+    /// mail by max(host cursor, toron cursor), journal the decision, then
+    /// deliver. Shared by the watch hook and `dispatch` so the decision is
+    /// journaled with the same value on replay either way.
+    async fn on_toron_cursor(&mut self, pin: String, cursor_us: Option<i64>, read_at_secs: u64) {
+        let effects = self.host.tick(&BrainMsg::ToronCursor {
+            pin: pin.clone(),
+            cursor_us,
+            read_at_secs,
+        });
+        self.journal(
+            &serde_json::json!({"rt_kind": "ToronCursor"}),
+            &effects,
+            serde_json::json!({"stage": "answered"}),
+            &[pin],
+        );
+        self.deliver(effects, "toron-cursor").await;
+    }
+
     async fn on_watch(&mut self, line: String) {
         let id = watch_line_id(&line);
         let redelivered = id
@@ -683,6 +709,40 @@ impl<H: Host> Brain<H> {
         }
         *self.stats.rings_by_class.entry("watch".into()).or_default() += 1;
         let effects = self.host.tick(&BrainMsg::Watch(line.clone()));
+        // bd-yc6jf: answer ring-time toron reads before any Prompt for the
+        // parked candidate is delivered. The ask stays in this row (journal
+        // before the provider runs); each answer re-enters through dispatch
+        // so the re-tick's max(host, toron) decision is journaled with the
+        // same value on replay. Fail-open: an unanswered toron rings anyway
+        // and the fold audits the miss.
+        let mut answers = Vec::new();
+        for pin in effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::ReadToronCursor { pin } => Some(pin.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+        {
+            let cursor_us = self.host.read_toron_cursor(&pin);
+            let read_at_secs = self.host.now_unix();
+            answers.push(BrainMsg::ToronCursor {
+                pin,
+                cursor_us,
+                read_at_secs,
+            });
+        }
+        for answer in answers {
+            let BrainMsg::ToronCursor {
+                pin,
+                cursor_us,
+                read_at_secs,
+            } = answer
+            else {
+                continue;
+            };
+            self.on_toron_cursor(pin, cursor_us, read_at_secs).await;
+        }
         self.absorb_digests(&effects);
         let raw: Vec<(String, String)> = effects
             .iter()
@@ -1358,6 +1418,9 @@ impl<H: Host> Brain<H> {
                     Effect::FetchInbox => {
                         serde_json::json!("FetchInbox")
                     }
+                    Effect::ReadToronCursor { pin } => {
+                        serde_json::json!({"ReadToronCursor": {"pin": pin}})
+                    }
                     Effect::CheckAckSla => serde_json::json!("CheckAckSla"),
                     Effect::RestartWatch => serde_json::json!("RestartWatch"),
                     Effect::Audit { kind, pin, detail } => {
@@ -1584,6 +1647,7 @@ fn brain_msg_label(msg: &BrainMsg) -> &'static str {
         BrainMsg::Presence { .. } => "presence",
         BrainMsg::InboxFetched { .. } => "inbox-fetched",
         BrainMsg::SlaFired { .. } => "sla-fired",
+        BrainMsg::ToronCursor { .. } => "toron-cursor",
         BrainMsg::Degraded { .. } => "degraded",
         BrainMsg::Delivered { .. } => "delivered",
         BrainMsg::PromptRefused { .. } => "prompt-refused",
@@ -2742,6 +2806,41 @@ mod tests {
             brain.host.tick_log[1].starts_with("InboxFetched"),
             "rows re-enter as InboxFetched: {:?}",
             brain.host.tick_log
+        );
+    }
+
+    /// bd-yc6jf: a ring-time toron ask re-enters through dispatch. Scripted
+    /// folds (the fold's own max() decision is pinned in doorbell-core);
+    /// the brain owns the ask-answer-re-dispatch wiring and journals the
+    /// answer row before anything it decides is delivered.
+    #[tokio::test]
+    async fn toron_cursor_answer_reenters_through_dispatch() {
+        let (mut brain, _rx, _tx) = test_brain(
+            "toron-cursor-pipe",
+            vec![
+                vec![Effect::ReadToronCursor {
+                    pin: "BlueRidge".into(),
+                }],
+                vec![],
+            ],
+        );
+        brain.host.toron_cursor = Some(1_700_000_000_000_000);
+        brain.dispatch(BrainMsg::Watch("{\"kind\":9}".into())).await;
+        assert_eq!(
+            brain.host.tick_log.len(),
+            2,
+            "watch asks, answer re-ticks: {:?}",
+            brain.host.tick_log
+        );
+        assert!(
+            brain.host.tick_log[1].contains("ToronCursor")
+                && brain.host.tick_log[1].contains("Some(1700000000000000)"),
+            "the answered cursor feeds the re-tick: {:?}",
+            brain.host.tick_log
+        );
+        assert!(
+            journal_kinds("toron-cursor-pipe").contains(&"ToronCursor".to_string()),
+            "the answer is journaled before anything it decides"
         );
     }
 

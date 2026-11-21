@@ -163,6 +163,9 @@ impl InboxCmd {
                 format!("wake:fact-miss:{}", fnv1a64(why))
             }
             DoorbellAction::FetchInbox => "wake:fetch-inbox".into(),
+            DoorbellAction::ReadToronCursor { pin } => {
+                format!("wake:read-toron-cursor:{pin}")
+            }
             DoorbellAction::CheckAckSla => "wake:check-ack-sla".into(),
             DoorbellAction::RestartWatch => "wake:restart-watch".into(),
         }
@@ -176,6 +179,7 @@ impl InboxCmd {
             DoorbellAction::Audit { kind, .. } => format!("audit {kind}"),
             DoorbellAction::FactMiss { .. } => "fact-miss".into(),
             DoorbellAction::FetchInbox => "fetch-inbox".into(),
+            DoorbellAction::ReadToronCursor { pin } => format!("read-toron-cursor {pin}"),
             DoorbellAction::CheckAckSla => "check-ack-sla".into(),
             DoorbellAction::RestartWatch => "restart-watch".into(),
         }
@@ -505,8 +509,9 @@ mod tests {
 
     /// bd-yc6jf: a mail event at or below the pin's pull cursor is consumed —
     /// the Elm fold rings nothing for it and audits already-pulled instead.
-    /// The live path shares this fold, so a pulled mail never pages the
-    /// captain with an empty wake.
+    /// A candidate with no usable cursor asks toron first and rings once
+    /// the answer lands behind the mail. The live path shares this fold,
+    /// so a pulled mail never pages the captain with an empty wake.
     #[test]
     fn a_pulled_mail_event_rings_nothing_through_the_fold() {
         let npub = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
@@ -525,9 +530,27 @@ mod tests {
         assert!(
             unpulled_commands.iter().any(|c| matches!(
                 &c.action,
+                DoorbellAction::ReadToronCursor { pin } if pin == "BlueRidge"
+            )),
+            "a ring candidate asks toron first: {unpulled_commands:?}"
+        );
+        // The parked candidate decides when the toron answer lands: an
+        // answer behind the mail rings.
+        let (parked, _) = InboxProgram::fold(&unpulled, &edge);
+        let (_, decided_commands) = InboxProgram::fold(
+            &parked,
+            &DoorbellMsg::ToronCursor {
+                pin: "BlueRidge".into(),
+                cursor_us: Some(0),
+                read_at_secs: 1_700_000_000,
+            },
+        );
+        assert!(
+            decided_commands.iter().any(|c| matches!(
+                &c.action,
                 DoorbellAction::Prompt { pin, .. } if pin == "BlueRidge"
             )),
-            "unpulled mail rings: {unpulled_commands:?}"
+            "unpulled mail rings once toron answers behind it: {decided_commands:?}"
         );
         let mut pulled = unpulled.clone();
         pulled

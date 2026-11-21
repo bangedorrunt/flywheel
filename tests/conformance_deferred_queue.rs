@@ -26,6 +26,9 @@ fn effect_json(e: &doorbell_rt::Effect) -> Value {
             json!({"Audit": {"kind": kind, "pin": pin, "detail": detail}})
         }
         doorbell_rt::Effect::FetchInbox => json!("FetchInbox"),
+        doorbell_rt::Effect::ReadToronCursor { pin } => {
+            json!({"ReadToronCursor": {"pin": pin}})
+        }
         doorbell_rt::Effect::CheckAckSla => json!("CheckAckSla"),
         doorbell_rt::Effect::RestartWatch => json!("RestartWatch"),
     }

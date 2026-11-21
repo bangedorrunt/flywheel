@@ -1695,6 +1695,9 @@ impl FileHost {
                     line,
                 },
                 doorbell_core::DoorbellAction::FetchInbox => Effect::FetchInbox,
+                doorbell_core::DoorbellAction::ReadToronCursor { pin } => {
+                    Effect::ReadToronCursor { pin }
+                }
                 doorbell_core::DoorbellAction::CheckAckSla => Effect::CheckAckSla,
                 doorbell_core::DoorbellAction::RestartWatch => Effect::RestartWatch,
                 doorbell_core::DoorbellAction::FactMiss { why } => Effect::Audit {
@@ -1760,6 +1763,22 @@ impl Host for FileHost {
                 self.normalize(actions)
             }
             BrainMsg::Sweep { .. } => vec![Effect::FetchInbox],
+            BrainMsg::ToronCursor {
+                pin,
+                cursor_us,
+                read_at_secs,
+            } => {
+                let (next, actions) = doorbell_core::tick(
+                    &self.reducer.model,
+                    &doorbell_core::DoorbellMsg::ToronCursor {
+                        pin: pin.clone(),
+                        cursor_us: *cursor_us,
+                        read_at_secs: *read_at_secs,
+                    },
+                );
+                self.reducer.model = next;
+                self.normalize(actions)
+            }
             BrainMsg::RoleBound { role, pin } => {
                 self.roles.insert(role.clone(), pin.clone());
                 Vec::new()
