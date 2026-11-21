@@ -22702,7 +22702,7 @@ mod robot_capabilities_text {
             "ship land <bead> --sha <40hex> --receipt <file> [--project <p>] [--as <pin>] [--message <m>] [--repo <dir>]",
             "the HEAD-lock race other lanes cause is retried",
             // (2) swarm apply: --yes and the plan-of-record semantics
-            "[--count <role>=<n>] [--yes] [--json] | swarm status",
+            "[--count <role>=<n>] [--yes] [--dry-run] [--json] | seat adopt <pin> --pane <block>",
             "every apply is a plan EVENT first",
             "land as ONE write only after every gate",
             // (3) crew: inbox, done, the mail fallback, and a queued wake exit 0
