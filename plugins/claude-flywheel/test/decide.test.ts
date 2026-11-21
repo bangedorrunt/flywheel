@@ -53,7 +53,7 @@ function occurrence(eventId: string, name: string, urgent = false, project = "fl
       eventId,
       name,
       timestamp: "2026-11-21T00:00:00.000Z",
-      data: { project, senderPin: "BoldCliff", correlationId: "c-1", priority: urgent ? "urgent" : "normal" },
+      data: { project, senderPin: "BoldCliff", correlationId: "c-1", ...(urgent ? { importance: "urgent" } : {}) },
       cursor: "7",
     },
   });
