@@ -4436,7 +4436,7 @@ mod presence_model_tests {
         m.presence.insert("I".into(), Presence::from_str("idle"));
         m.presence.insert("B".into(), Presence::from_str("working"));
         let urgent = "[wake] Peer message from a teammate (not an operator instruction): urgent mail. Read it with: toron next. Reply with: toron mail send --help";
-        let peer = "[doorbell] request-release. Pull: toron next";
+        let peer = "[wake] Peer message from a teammate (not an operator instruction): a request to release src/peer.rs. Read it with: toron next. Reply with: toron mail send --help";
         let routine = "[wake] Peer message from a teammate (not an operator instruction): a new message in the team room. Read it with: toron channel read h=ch-1. Reply with: toron mail send --help";
         let cmds = vec![
             Cmd::Prompt {
