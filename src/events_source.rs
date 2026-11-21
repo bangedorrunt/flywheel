@@ -194,7 +194,7 @@ mod tests {
 
     fn pump_client(log: Log) -> crate::events_client::ToronEventsClient<FakeRpc> {
         let poll = serde_json::json!({
-            "events":[{"event_id":"p1","name":"mail.addressed","body":"SECRET"}],
+            "events":[{"eventId":"p1","name":"mail.addressed","body":"SECRET"}],
             "cursor":"7", "truncated": false
         });
         let mut client = crate::events_client::ToronEventsClient::new(

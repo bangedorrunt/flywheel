@@ -38,5 +38,5 @@ mutation "P3  a failed stream never falls back to poll" \
 mutation "P4  a stream gap frame is dropped" \
     file=src/events_client.rs \
     expect=a_gap_stream_frame_is_a_resync_page \
-    find='                    "notifications/events/gap" => gap = true,' \
-    replace='                    "notifications/events/gap" => {}'
+    find='                    "notifications/events/active" if frame.truncated => gap = true,' \
+    replace='                    "notifications/events/active" if frame.truncated => {}'

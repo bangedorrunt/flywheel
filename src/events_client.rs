@@ -164,7 +164,8 @@ pub fn page_from_poll(v: &serde_json::Value) -> Page {
             rows.iter()
                 .filter_map(|row| {
                     let id = row
-                        .get("event_id")
+                        .get("eventId")
+                        .or_else(|| row.get("event_id"))
                         .or_else(|| row.get("id"))
                         .and_then(serde_json::Value::as_str)?;
                     let kind = row
@@ -289,7 +290,7 @@ impl<R: EventsRpc> ToronEventsClient<R> {
                             payload: String::new(),
                         });
                     }
-                    "notifications/events/gap" => gap = true,
+                    "notifications/events/active" if frame.truncated => gap = true,
                     _ => {}
                 }
                 if (gap || terminated)
@@ -397,7 +398,7 @@ mod tests {
             serde_json::json!({
                 "method":"notifications/events/event",
                 "params":{"_meta":{"io.modelcontextprotocol/subscriptionId":"sub-1"},
-                          "event":{"event_id":"e1","name":"mail.addressed","body":"SECRET BODY"}}
+                          "event":{"eventId":"e1","name":"mail.addressed","body":"SECRET BODY"}}
             })
             .to_string(),
         ];
@@ -416,7 +417,7 @@ mod tests {
     #[test]
     fn a_stream_failure_falls_back_to_poll() {
         let poll = serde_json::json!({
-            "events":[{"event_id":"p1","name":"role.changed","body":"SECRET"}],
+            "events":[{"eventId":"p1","name":"role.changed","body":"SECRET"}],
             "cursor":"7", "truncated": false
         });
         let mut client = ToronEventsClient::new(
@@ -436,8 +437,8 @@ mod tests {
     fn a_gap_stream_frame_is_a_resync_page() {
         let frames =
             vec![serde_json::json!({
-            "method":"notifications/events/gap",
-            "params":{"_meta":{"io.modelcontextprotocol/subscriptionId":"sub-1"},"cursor":"42"}
+            "method":"notifications/events/active",
+            "params":{"_meta":{"io.modelcontextprotocol/subscriptionId":"sub-1"},"cursor":"42","truncated":true,"heartbeatMs":15000}
         }).to_string()];
         let mut client = ToronEventsClient::new(
             rpc(Ok(frames), Ok(serde_json::Value::Null)),

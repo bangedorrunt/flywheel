@@ -325,6 +325,8 @@ pub struct StreamFrame {
     pub event_name: String,
     pub cursor: Option<String>,
     pub terminated: bool,
+    /// Final: a gap rides on `notifications/events/active` with truncated=true.
+    pub truncated: bool,
 }
 
 /// Decode one `data:` payload from toron's `events/stream` SSE response.
@@ -359,10 +361,13 @@ pub fn decode_stream_frame(data: &str, subscription: &str) -> Option<StreamFrame
     };
     let (event_id, event_name) = match method.as_str() {
         "notifications/events/event" => {
-            let event = params.get("event").unwrap_or(&serde_json::Value::Null);
+            // Final: occurrence fields are the params themselves; tolerate the
+            // old nested "event" during the transition (G13 constraint a).
+            let event = params.get("event").unwrap_or(params);
             (
                 event
-                    .get("event_id")
+                    .get("eventId")
+                    .or_else(|| event.get("event_id"))
                     .or_else(|| event.get("id"))
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
@@ -375,7 +380,7 @@ pub fn decode_stream_frame(data: &str, subscription: &str) -> Option<StreamFrame
                     .to_string(),
             )
         }
-        "notifications/events/gap" => (
+        "notifications/events/active" => (
             format!("gap:{}", cursor.as_deref().unwrap_or("")),
             "gap".to_string(),
         ),
@@ -383,6 +388,10 @@ pub fn decode_stream_frame(data: &str, subscription: &str) -> Option<StreamFrame
     };
     Some(StreamFrame {
         terminated: method == "notifications/events/terminated",
+        truncated: params
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
         method,
         event_id,
         event_name,
@@ -697,8 +706,8 @@ mod tests {
     #[test]
     fn gap_and_terminated_frames_carry_the_fresh_cursor() {
         let gap = serde_json::json!({
-            "method": "notifications/events/gap",
-            "params": {"_meta": {"io.modelcontextprotocol/subscriptionId": "s"}, "cursor": "42"}
+            "method": "notifications/events/active",
+            "params": {"_meta": {"io.modelcontextprotocol/subscriptionId": "s"}, "cursor": "42", "truncated": true, "heartbeatMs": 15000}
         })
         .to_string();
         let frame = decode_stream_frame(&gap, "s").expect("gap");
