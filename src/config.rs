@@ -821,11 +821,15 @@ impl Config {
     /// default once any per-pin token file exists. A deployment with no
     /// tokens stays flag-off byte-identical.
     pub fn doorbell_toron_events(&self) -> bool {
+        self.doorbell_toron_events_in(&crate::config::state_dir())
+    }
+
+    pub(crate) fn doorbell_toron_events_in(&self, state_dir: &std::path::Path) -> bool {
         self.doorbell
             .as_ref()
             .map(|d| d.toron_events)
             .unwrap_or(false)
-            || crate::events_tokens::any_token_file(&crate::config::state_dir())
+            || crate::events_tokens::any_token_file(state_dir)
     }
 
     /// bd-sfxu1: rex program_status push. False by default; flag-off is

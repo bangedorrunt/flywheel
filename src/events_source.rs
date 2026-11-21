@@ -375,10 +375,20 @@ mod tests {
 
     #[test]
     fn flag_off_is_the_default_so_behaviour_is_byte_identical() {
+        let empty = tempfile::tempdir().expect("tempdir");
         assert!(
-            !crate::config::Config::default().doorbell_toron_events(),
-            "the events source must be opt-in"
+            !crate::config::Config::default().doorbell_toron_events_in(empty.path()),
+            "with no minted token the events source stays off"
         );
+    }
+
+    #[test]
+    fn a_minted_token_turns_the_events_default_on() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let token = crate::events_tokens::token_path(state.path(), "p", "Pin");
+        std::fs::create_dir_all(token.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&token, "t").expect("write token");
+        assert!(crate::config::Config::default().doorbell_toron_events_in(state.path()));
     }
 
     #[test]

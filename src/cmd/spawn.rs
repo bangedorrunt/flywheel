@@ -3734,7 +3734,7 @@ mod spawn_profile_plan_tests {
             (harness.to_string(), Some(pin.to_string()), token)
         })
         .collect::<Vec<_>>();
-        let enabled = crate::config::Config::default().doorbell_toron_events();
+        let enabled = crate::config::Config::default().doorbell_toron_events_in(&state);
         assert!(enabled, "minted tokens switch the default pump on");
         assert!(
             !crate::events_tokens::token_path(&state, "demo", "ClaudeSeat").is_file(),
