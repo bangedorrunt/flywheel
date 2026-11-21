@@ -61,8 +61,8 @@ fn claude_plugin_speaks_real_events_surface() {
         "spawn mcp-events in self-driving mode: host stdin is closed after one string"
     );
     assert!(
-        !register.contains("session.busy"),
-        "the host API has no session.busy"
+        !register.contains("$.session.busy") && !register.contains("session?.busy"),
+        "no call to the absent host busy flag"
     );
     assert!(
         register.contains("turn.start")

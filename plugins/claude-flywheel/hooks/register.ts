@@ -138,7 +138,7 @@ export const register = (on: any, deps: RegisterDeps = {}) => {
     return next(event);
   });
 
-  // The host API has no session.busy; these three hooks are the turn state.
+  // The host exposes no busy flag; these three hooks are the turn state.
   on("turn.start", async (_$, event, next) => { busy = true; return next(event); });
   on("turn.complete", async (_$, event, next) => { busy = false; return next(event); });
   on("turn.abort", async (_$, event, next) => { busy = false; return next(event); });
