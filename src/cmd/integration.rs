@@ -50,18 +50,30 @@ impl IntegrationCmd {
     }
 }
 
-fn codex_hooks() -> PathBuf {
-    std::env::var("CODEX_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".codex"))
-        .join("hooks.json")
+/// Where the installer reads/writes. Pure data so tests exercise a temp HOME
+/// without setting process env (bd-mdpfr).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct IntegrationPaths {
+    pub(crate) home: PathBuf,
+    pub(crate) codex_home: PathBuf,
 }
 
-fn codex_config() -> PathBuf {
-    std::env::var("CODEX_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".codex"))
-        .join("config.toml")
+impl IntegrationPaths {
+    pub(crate) fn from_env() -> Self {
+        let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+        let codex_home = std::env::var("CODEX_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home.join(".codex"));
+        Self { home, codex_home }
+    }
+}
+
+fn codex_hooks(p: &IntegrationPaths) -> PathBuf {
+    p.codex_home.join("hooks.json")
+}
+
+fn codex_config(p: &IntegrationPaths) -> PathBuf {
+    p.codex_home.join("config.toml")
 }
 
 /// Pure TOML edit: make sure `[features] hooks = true` is present, preserving
@@ -97,22 +109,22 @@ pub fn with_codex_hooks_flag(text: &str) -> String {
     out
 }
 
-fn grok_hooks() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".grok/hooks/flywheel.json")
+fn grok_hooks(p: &IntegrationPaths) -> PathBuf {
+    p.home.join(".grok/hooks/flywheel.json")
 }
 
-fn gemini_hooks() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".gemini/config/hooks.json")
+fn gemini_hooks(p: &IntegrationPaths) -> PathBuf {
+    p.home.join(".gemini/config/hooks.json")
 }
 
-fn target(kind: &str) -> Option<PathBuf> {
+fn target(kind: &str, p: &IntegrationPaths) -> Option<PathBuf> {
     match crate::harness_registry::canonical(kind).as_str() {
         // bd-9os20: the Claude plugin is delivered per seat with
         // `--plugin-dir` by stack.sh + spawn, not by editing ~/.claude.
         "claude" => None,
-        "codex" => Some(codex_hooks()),
-        "grok" => Some(grok_hooks()),
-        "antigravity" | "gemini" => Some(gemini_hooks()),
+        "codex" => Some(codex_hooks(p)),
+        "grok" => Some(grok_hooks(p)),
+        "antigravity" | "gemini" => Some(gemini_hooks(p)),
         _ => None,
     }
 }
@@ -160,12 +172,22 @@ pub fn cmd_integration(cfg: &Config, cmd: IntegrationCmd) -> Result<()> {
     } else {
         cmd.args().harness.clone()
     };
+    apply_integration(&cmd, &harnesses, &IntegrationPaths::from_env())
+}
+
+/// Pure over an injected path map: the whole install/uninstall/status cycle a
+/// temp-HOME test exercises without any process env (bd-mdpfr).
+fn apply_integration(
+    cmd: &IntegrationCmd,
+    harnesses: &[String],
+    paths: &IntegrationPaths,
+) -> Result<()> {
     for kind in harnesses {
-        if crate::harness_registry::canonical(&kind) == "claude" {
+        if crate::harness_registry::canonical(kind) == "claude" {
             println!("claude: plugin delivered per seat by --plugin-dir (no config edit)");
             continue;
         }
-        let Some(path) = target(&kind) else {
+        let Some(path) = target(kind, paths) else {
             bail!("unsupported harness: {kind}");
         };
         match &cmd {
@@ -177,12 +199,12 @@ pub fn cmd_integration(cfg: &Config, cmd: IntegrationCmd) -> Result<()> {
                 };
                 install_entries(
                     &mut config,
-                    &crate::harness_registry::canonical(&kind),
-                    events_for(&kind),
+                    &crate::harness_registry::canonical(kind),
+                    events_for(kind),
                 );
                 write_atomic(&path, &config)?;
-                if crate::harness_registry::canonical(&kind) == "codex" {
-                    let cfg_path = codex_config();
+                if crate::harness_registry::canonical(kind) == "codex" {
+                    let cfg_path = codex_config(paths);
                     let raw = std::fs::read_to_string(&cfg_path).unwrap_or_default();
                     std::fs::write(&cfg_path, with_codex_hooks_flag(&raw))?;
                 }
@@ -194,7 +216,7 @@ pub fn cmd_integration(cfg: &Config, cmd: IntegrationCmd) -> Result<()> {
                     continue;
                 }
                 let mut config = read_json(&path)?;
-                let n = uninstall_entries(&mut config, &crate::harness_registry::canonical(&kind));
+                let n = uninstall_entries(&mut config, &crate::harness_registry::canonical(kind));
                 write_atomic(&path, &config)?;
                 println!("removed {n} {kind} hook entry(ies)");
             }
@@ -206,8 +228,8 @@ pub fn cmd_integration(cfg: &Config, cmd: IntegrationCmd) -> Result<()> {
                 };
                 let state = status_of(
                     &config,
-                    &crate::harness_registry::canonical(&kind),
-                    events_for(&kind),
+                    &crate::harness_registry::canonical(kind),
+                    events_for(kind),
                 );
                 println!("{kind}: {state:?} ({})", path.display());
             }
@@ -219,6 +241,100 @@ pub fn cmd_integration(cfg: &Config, cmd: IntegrationCmd) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_paths(tag: &str) -> (std::path::PathBuf, IntegrationPaths) {
+        let home = std::env::temp_dir().join(format!("integration-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let paths = IntegrationPaths {
+            home: home.clone(),
+            codex_home: home.join(".codex"),
+        };
+        (home, paths)
+    }
+
+    #[test]
+    fn install_writes_under_temp_home_and_is_idempotent() {
+        let (home, paths) = temp_paths("install");
+        for dir in [".codex", ".grok/hooks", ".gemini/config"] {
+            std::fs::create_dir_all(home.join(dir)).unwrap();
+        }
+        let harnesses = vec!["codex".into(), "grok".into(), "gemini".into()];
+        let install = IntegrationCmd::Install {
+            args: IntegrationArgs {
+                harness: vec![],
+                operator: false,
+            },
+        };
+        apply_integration(&install, &harnesses, &paths).unwrap();
+        assert!(home.join(".codex/hooks.json").is_file());
+        assert!(home.join(".grok/hooks/flywheel.json").is_file());
+        assert!(home.join(".gemini/config/hooks.json").is_file());
+        assert_eq!(
+            std::fs::read_to_string(codex_config(&paths)).unwrap(),
+            "[features]\nhooks = true\n"
+        );
+        // Install twice changes nothing.
+        let before: Vec<_> = harnesses
+            .iter()
+            .map(|h| std::fs::read(target(h, &paths).unwrap()).unwrap())
+            .collect();
+        apply_integration(&install, &harnesses, &paths).unwrap();
+        let after: Vec<_> = harnesses
+            .iter()
+            .map(|h| std::fs::read(target(h, &paths).unwrap()).unwrap())
+            .collect();
+        assert_eq!(before, after, "install twice is byte-identical");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn install_refuses_when_the_config_dir_is_missing() {
+        let (home, paths) = temp_paths("refuse");
+        // No .codex dir created: install must refuse, not mkdir it.
+        let install = IntegrationCmd::Install {
+            args: IntegrationArgs {
+                harness: vec!["codex".into()],
+                operator: false,
+            },
+        };
+        assert!(apply_integration(&install, &["codex".into()], &paths).is_err());
+        assert!(!home.join(".codex/hooks.json").exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn uninstall_restores_and_status_tracks() {
+        let (home, paths) = temp_paths("uninstall");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        let rex = serde_json::json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "rex session-start", "timeout": 5}]}]}});
+        std::fs::write(codex_hooks(&paths), rex.to_string()).unwrap();
+        let harnesses = vec!["codex".into()];
+        let install = IntegrationCmd::Install {
+            args: IntegrationArgs {
+                harness: vec![],
+                operator: false,
+            },
+        };
+        apply_integration(&install, &harnesses, &paths).unwrap();
+        let status = IntegrationCmd::Status {
+            args: IntegrationArgs {
+                harness: vec![],
+                operator: false,
+            },
+        };
+        apply_integration(&status, &harnesses, &paths).unwrap();
+        let uninstall = IntegrationCmd::Uninstall {
+            args: IntegrationArgs {
+                harness: vec![],
+                operator: false,
+            },
+        };
+        apply_integration(&uninstall, &harnesses, &paths).unwrap();
+        let restored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(codex_hooks(&paths)).unwrap()).unwrap();
+        assert_eq!(restored, rex, "rex entry survives byte-for-byte");
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn codex_hooks_flag_is_added_once_and_preserves_other_config() {
