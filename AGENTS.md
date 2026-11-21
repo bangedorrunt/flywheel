@@ -69,12 +69,11 @@ exports or scratch target dirs.
   `stash`, `checkout --`, `restore`, `reset`, `rebase` or `--amend`.
 - Before you mail a sha, run `scripts/fence.sh --sha <sha>` plus the targeted
   tests and the mutation specs covering the paths you changed. Do not run the
-  full workspace suite; the captain's proof does. When the shared tree is red
-  from another lane's WIP, run the targeted tests IN a clean export with
-  `fence.sh --paths <changed-files> --test <filter>` (or `--sha <sha> --test
-  <filter>` after committing); never wait on the shared tree to compile. The
-  export is removed on exit; `--keep` retains it for a mutation spec and older
-  kept exports are swept on the next green fence.
+  full workspace suite; the captain's proof does. Run those tests in the shared
+  tree. When it is red from another lane's WIP, mail that lane's holder first.
+  Use `fence.sh --paths <changed-files> --test <filter>` only as a last resort.
+  It builds a whole clean export, so never pass `--keep` for routine work: kept
+  exports each hold a full build and fill the disk.
 - The captain proves a revision in one clean export (`clean-proof.sh --sha`),
   installs only from a green proof's kept export, and lands with `ship land`.
   The mutation stage stops at the first spec that does not prove every row.
