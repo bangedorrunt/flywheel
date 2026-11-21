@@ -2571,8 +2571,7 @@ mod tests {
         // renderings of one directive share a key and a different path does not.
         let a =
             "[wake] Direct message from A: asks you to release src/x.rs. Read it with: toron next";
-        let b =
-            "[wake] Direct message from A: asks you to release src/x.rs. Read it with: toron next";
+        let b = "[wake] Direct message from A: asks you to release src/x.rs. Read it with: toron next --project flywheel --as A";
         let c =
             "[wake] Direct message from A: asks you to release src/y.rs. Read it with: toron next";
         assert_eq!(wake_key(a), wake_key(b));
