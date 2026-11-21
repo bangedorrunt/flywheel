@@ -1,6 +1,6 @@
 <!-- governed-by: ADR-0007, ADR-0011, ADR-0013, ADR-0016, ADR-0018, ADR-0021, toron ADR-0010, toron ADR-0022, toron ADR-0026, toron ADR-0032, toron ADR-0045 -->
 ---
-status: accepted  # 2026-11-20: accepted by the decision-maker; implementation map in §8 all closed (D1–D8, V1–V11, acceptance 1–7)
+status: accepted  # 2026-11-20 accepted; 2026-11-22 status corrected (bd-g5cp6): D8's pure binder is wired in compose --join, not in ordinary dispatch (see §8 note)
 date: 2026-11-13
 decision-makers: Captain (bangedorrunt)
 consulted: |
@@ -25,7 +25,7 @@ builds-on: |
 
 | Field | Value |
 |---|---|
-| **Status** | **Accepted** (2026-11-20; proposed 2026-11-13) |
+| **Status** | **Accepted** (2026-11-20; proposed 2026-11-13). 2026-11-22 correction (bd-g5cp6): in-flight `compose --join` calls `seat_binder::bind` (`src/compose_join.rs:226`), while ordinary dispatch chooses the seat with `pane.rs::review_bind` (`src/pane.rs:1559`) and journals the binding before the prompt (`src/pane.rs:1862`, bd-6setu.2). The pure fold is not the dispatcher for every step; the live join turn is unverified (bd-3ann1). |
 | **Governs** | `flywheel-plan.v1`; field provenance and precedence; consent policy; standing preferences; harness adapters; step→seat binding; plan→swarm reconciler |
 | **Companion** | [flywheel ADR-0021](0021-elastic-role-morphing-declarative-topologies-and-capability-contracts.md) decides *what* a step needs and hands back (stage contract, witness). This ADR decides *who* runs it. |
 | **Vocabulary** | ADR-0021 D1: **mode** `open \| swarm`; **swarm** = this plan + its seats + its run; **slot** = model tier (`@cheap` / `@standard` / `@premium`, ADR-0007). This record first called the live object a "fleet" and the tiers "bands"; both words are retired. |
@@ -370,7 +370,7 @@ Every row below was checked by grepping the named test and mutation at `3af56271
 | D5 consent asks only on change | `needs_consent_lists_jev_field`, `needs_consent_over_budget_lists_estimate`, `consent_policy_serializes_in_plan`, `plan_gate_names_items_and_hint`; `signoff` deleted (bd-6setu.4) | `D5A` (Jev never asked), `D5B` (over-budget never asked) — both in `adr0022-gates` | closed by bd-6setu.20: the rule's own witnesses now carry mutants; the blocked-seat mutant is V3's |
 | D6 standing preferences | `prefer_spawn_model_from_preference` | `D6` | closed |
 | D7 reconciler, not a script | `seat_reconcile_precedence_harness_model_one_respawn`, `seat_reconcile_env_model_gives_respawn_fresh`, `seat_reconcile_no_change_gives_keep` | `V5`, `V9` | closed |
-| D8 binder picks the seat | `seat_binder_reviewer_never_author`, `join_binds_execute_to_crew_and_spawns_only_a_reviewer`, `a_reviewer_seat_is_never_the_author`, `a_bound_step_dispatches_to_the_pin_with_the_bead_header`, `join_dry_run_binds_without_starting_anything`, `join_run_without_yes_refuses_when_a_spawn_is_needed` | `V10`, `compose-join J1/J2/J3` | closed; the dispatch-time binding rows are bd-6setu.2 (`scripts/mutations/dispatch-binding.spec.sh`); in-flight join (bd-3ann1) binds live seats and rewrites the dispatch to the chosen pin with the BEAD header |
+| D8 binder picks the seat | `seat_binder_reviewer_never_author`, `join_binds_execute_to_crew_and_spawns_only_a_reviewer`, `a_reviewer_seat_is_never_the_author`, `a_bound_step_dispatches_to_the_pin_with_the_bead_header`, `join_dry_run_binds_without_starting_anything`, `join_run_without_yes_refuses_when_a_spawn_is_needed` | `V10`, `compose-join J1/J2/J3` | wired today: `src/compose_join.rs:226` calls `seat_binder::bind` for in-flight join and rewrites the dispatch to the chosen pin with a BEAD header; `src/pane.rs:1862` journals one binding row before the prompt (bd-6setu.2). Remaining gap: ordinary dispatch uses `src/pane.rs:1559` `review_bind`, not the pure fold, and the live end-to-end join turn has not passed (bd-3ann1). |
 
 ### Properties
 
@@ -402,4 +402,8 @@ Every row below was checked by grepping the named test and mutation at `3af56271
 | 7 | V1–V11 pass; `verify-clippy.sh` and `clean-proof.sh --tests` pass | this table | witnesses above all closed (14/14 `adr0022-gates` mutants RED, `verify-clippy.sh` green); the full `clean-proof.sh --tests` receipt is the captain's gate, per the bd-6setu.20 brief |
 
 What this map does not claim: a green row means a witness exists and a named mutation was seen RED; it does not mean the behaviour is right. The `open`/`partial` rows are the places a reviewer should look first, and no row is closed by prose — each names the spec-qualified mutant that must go RED.
+
+### 2026-11-22 status note (bd-g5cp6)
+
+D8's decision text is unchanged. The wired path today is narrower than "every dispatch binds through the pure fold": `src/compose_join.rs:226` calls `seat_binder::bind` for `compose --join`, `src/pane.rs:1559` `review_bind` chooses the seat on ordinary dispatch with authors read from the journal (`src/pane.rs:1740`), and `src/pane.rs:1862` journals the chosen binding before the prompt (bd-6setu.2). The live end-to-end join turn remains unverified (bd-3ann1). Only Status lines and this note were edited.
 
