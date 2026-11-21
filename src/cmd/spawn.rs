@@ -203,11 +203,14 @@ pub(crate) fn cmd_add_rex(
                 crate::refuse_unpinned_spawn(&name, None, backend::mail_backend(cfg).is_ok())?;
             }
             let identity = mail_identity.as_deref().unwrap_or(&name);
-            let mut add_args: Vec<String> = Vec::new();
+            let (mut add_args, env_model_pin) = add_model_launch(&kind, model)?;
             if crate::needs_in_arg_prime(&kind) {
                 add_args.push(crate::boot_prime_line().to_string());
             }
-            let pane_env = crate::hc::plane_launch_env(cfg, mail_identity.as_deref());
+            let mut pane_env = crate::hc::plane_launch_env(cfg, mail_identity.as_deref());
+            if let Some(m) = &env_model_pin {
+                crate::hc::apply_opencode_model_pin(&mut pane_env, m)?;
+            }
             let cwd = crate::utf8_path(&dir, "workspace dir")?;
             let split_pane = backend
                 .pane_split(&prev, "down", Some(&cwd))
@@ -301,6 +304,21 @@ impl<'a> AddedSeatModel<'a> {
                 .map(|(choice, _)| choice.as_ask().to_string()),
         }
     }
+}
+
+/// bd-syne9: an explicit `--model` on `add` must reach the launch, not just
+/// the registry. Mirrors the bare spawn lane — argv where the harness takes a
+/// flag, pane env where it does not (opencode's root rejects `--model`).
+fn add_model_launch(kind: &str, ask: Option<&str>) -> Result<(Vec<String>, Option<String>)> {
+    let Some(ask) = ask.filter(|m| !m.trim().is_empty()) else {
+        return Ok((Vec::new(), None));
+    };
+    crate::bare_model_launch(
+        kind,
+        &crate::models::ModelChoice::parse(ask.trim()),
+        "",
+        None,
+    )
 }
 
 pub(crate) fn record_added_seat(
@@ -478,7 +496,11 @@ pub(crate) fn cmd_add(cfg: &Config, project: &str, opts: AddOpts) -> Result<()> 
             if mail_identity.is_none() {
                 crate::refuse_unpinned_spawn(&name, None, backend::mail_backend(cfg).is_ok())?;
             }
-            let pane_env = crate::hc::plane_launch_env(cfg, mail_identity.as_deref());
+            let (launch_args, env_model_pin) = add_model_launch(&kind, model.as_deref())?;
+            let mut pane_env = crate::hc::plane_launch_env(cfg, mail_identity.as_deref());
+            if let Some(m) = &env_model_pin {
+                crate::hc::apply_opencode_model_pin(&mut pane_env, m)?;
+            }
             let p = crate::hc::pane_split(
                 &c,
                 &prev,
@@ -487,7 +509,7 @@ pub(crate) fn cmd_add(cfg: &Config, project: &str, opts: AddOpts) -> Result<()> 
                 Some(&pane_env),
             )?;
             prev = p.pane_id.clone();
-            let mut add_args: Vec<String> = Vec::new();
+            let mut add_args: Vec<String> = launch_args;
             if crate::needs_in_arg_prime(&kind) {
                 add_args.push(crate::boot_prime_line().to_string());
             }
@@ -9431,5 +9453,61 @@ mod e4gal_harness_row_tests {
             "opencode",
             "the operator-typing guard must resolve the harness for this exact target pane"
         );
+    }
+}
+
+#[cfg(test)]
+mod add_model_launch_tests {
+    use super::add_model_launch;
+
+    #[test]
+    fn add_model_reaches_the_launch_argv_for_a_flagged_harness() {
+        let (args, env_pin) = add_model_launch("pi", Some("zai/glm-5.2")).expect("pi launch");
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--model" && w[1] == "zai/glm-5.2"),
+            "the launched argv must carry the ask: {args:?}"
+        );
+        assert_eq!(env_pin, None);
+    }
+
+    #[test]
+    fn add_model_reaches_the_pane_env_for_opencode() {
+        let (args, env_pin) = add_model_launch("opencode", Some("opencode-go/deepseek-v4.1-flash"))
+            .expect("opencode launch");
+        assert!(
+            !args.iter().any(|a| a == "--model"),
+            "opencode's root rejects --model: {args:?}"
+        );
+        assert_eq!(
+            env_pin.as_deref(),
+            Some("opencode-go/deepseek-v4.1-flash"),
+            "the model must ride the pane env where argv cannot carry it"
+        );
+    }
+
+    #[test]
+    fn add_without_a_model_keeps_the_harness_default() {
+        let (args, env_pin) = add_model_launch("pi", None).expect("no model");
+        assert!(args.is_empty());
+        assert_eq!(env_pin, None);
+    }
+
+    #[test]
+    fn both_add_paths_wire_the_model_into_launch() {
+        let src = include_str!("spawn.rs");
+        for (name, body) in [
+            ("rex", crate::tripwire::fn_body(src, "cmd_add_rex")),
+            ("hc", crate::tripwire::fn_body(src, "cmd_add")),
+        ] {
+            assert!(
+                body.contains("add_model_launch("),
+                "{name} add must compute the model launch"
+            );
+            assert!(
+                body.contains("apply_opencode_model_pin("),
+                "{name} add must pin an env-delivered model"
+            );
+        }
     }
 }
