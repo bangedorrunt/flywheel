@@ -690,6 +690,7 @@ pub enum Msg {
     PromptRefused {
         pin: String,
         line: String,
+        event_id: Option<String>,
     },
     /// A mail hint from the toron events source (U8). The bus event id is
     /// the shared dedupe key across wake.sock and events.
@@ -827,7 +828,11 @@ pub enum Msg {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Cmd {
     /// Inject iff prompt_allowed (E5 gate). Line always starts "[doorbell]".
-    Prompt { pin: String, line: String },
+    Prompt {
+        pin: String,
+        line: String,
+        event_id: Option<String>,
+    },
     /// Effect runs the fetch; rows re-enter tick as InboxRows.
     /// Signal only (bd-z5ou): per-pin cursors live in the brain.
     FetchInbox,
@@ -937,9 +942,15 @@ impl Cmd {
     /// a new action variant landed (bd-bk9t's `Digest`).
     pub(crate) fn from_doorbell(a: crate::doorbell_tick::DoorbellAction) -> Self {
         match a {
-            crate::doorbell_tick::DoorbellAction::Prompt { pin, line } => {
-                Self::Prompt { pin, line }
-            }
+            crate::doorbell_tick::DoorbellAction::Prompt {
+                pin,
+                line,
+                event_id,
+            } => Self::Prompt {
+                pin,
+                line,
+                event_id,
+            },
             crate::doorbell_tick::DoorbellAction::FetchInbox => Self::FetchInbox,
             crate::doorbell_tick::DoorbellAction::CheckAckSla => Self::CheckAckSla,
             crate::doorbell_tick::DoorbellAction::RestartWatch => Self::RestartWatch,
@@ -1396,20 +1407,31 @@ pub fn expand_reclassify_cmds(
 /// become an audit row and vanish, so the wake rang only when the doorbell's own
 /// status map next transitioned — minutes later, or never. The caller re-enters
 /// the held lines through the typed deferral ([`Msg::PromptRefused`]), which
+/// A wake held for a busy pane: pin, rendered line, typed event id.
+type HeldWake = (String, String, Option<String>);
+
 /// queues them and journals the merge.
-fn filter_prompts(model: &WorkspaceModel, cmds: Vec<Cmd>) -> (Vec<Cmd>, Vec<(String, String)>) {
+fn filter_prompts(model: &WorkspaceModel, cmds: Vec<Cmd>) -> (Vec<Cmd>, Vec<HeldWake>) {
     let mut keep = Vec::new();
     let mut held = Vec::new();
     for c in cmds {
         match c {
-            Cmd::Prompt { pin, line } => {
+            Cmd::Prompt {
+                pin,
+                line,
+                event_id,
+            } => {
                 if prompt_allowed(model, &pin)
                     || (is_act_now_line(&line)
                         && matches!(model.presence.get(&pin), Some(Presence::Busy { .. })))
                 {
-                    keep.push(Cmd::Prompt { pin, line });
+                    keep.push(Cmd::Prompt {
+                        pin,
+                        line,
+                        event_id,
+                    });
                 } else {
-                    held.push((pin, line));
+                    held.push((pin, line, event_id));
                 }
             }
             other => keep.push(other),
@@ -1425,12 +1447,13 @@ fn hold_filtered(model: &WorkspaceModel, cmds: Vec<Cmd>) -> (WorkspaceModel, Vec
     let (keep, held) = filter_prompts(model, cmds);
     let mut next = model.clone();
     let mut out = keep;
-    for (pin, line) in held {
+    for (pin, line, event_id) in held {
         let (dm, c) = doorbell_slice(
             &next.doorbell,
             crate::doorbell_tick::DoorbellMsg::PromptRefused {
                 pin: pin.clone(),
                 line: line.clone(),
+                event_id: event_id.clone(),
             },
         );
         next.doorbell = dm;
@@ -1920,12 +1943,17 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             next = m2;
             cmds.extend(c);
         }
-        Msg::PromptRefused { pin, line } => {
+        Msg::PromptRefused {
+            pin,
+            line,
+            event_id,
+        } => {
             let (dm, c) = doorbell_slice(
                 &model.doorbell,
                 crate::doorbell_tick::DoorbellMsg::PromptRefused {
                     pin: pin.clone(),
                     line: line.clone(),
+                    event_id: event_id.clone(),
                 },
             );
             next.doorbell = dm;
@@ -1968,6 +1996,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                     cmds.push(Cmd::Prompt {
                         pin,
                         line: doorbell_core::fact_prompt_line(summary),
+                        event_id: None,
                     });
                 } else {
                     cmds.extend(c);
@@ -2006,6 +2035,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                         cmds.push(Cmd::Prompt {
                             pin: entry.pin.clone(),
                             line: doorbell_mail_line(1, &entry.pin, &corr),
+                            event_id: None,
                         });
                         if let Some(e) = next.wake.ladders.get_mut(&corr) {
                             e.attempts = attempt + 1;
@@ -2277,6 +2307,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                     cmds.push(Cmd::Prompt {
                         pin: pin.clone(),
                         line: line.clone(),
+                        event_id: None,
                     });
                 } else {
                     cmds.push(Cmd::Audit {
@@ -2299,7 +2330,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
 
     let mut replays: Vec<Cmd> = Vec::new();
     for cmd in &cmds {
-        if let Cmd::Prompt { pin, line } = cmd {
+        if let Cmd::Prompt { pin, line, .. } = cmd {
             if !is_urgent_line(line) {
                 continue;
             }
@@ -2308,12 +2339,13 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 for e in entries {
                     if e.seq > watermark
                         && e.line != *line
-                        && !cmds.iter().any(|c| matches!(c, Cmd::Prompt { pin: p, line: l } if p == pin && l == &e.line))
-                        && !replays.iter().any(|c| matches!(c, Cmd::Prompt { pin: p, line: l } if p == pin && l == &e.line))
+                        && !cmds.iter().any(|c| matches!(c, Cmd::Prompt { pin: p, line: l, .. } if p == pin && l == &e.line))
+                        && !replays.iter().any(|c| matches!(c, Cmd::Prompt { pin: p, line: l, .. } if p == pin && l == &e.line))
                     {
                         let line = Cmd::Prompt {
                             pin: pin.clone(),
                             line: e.line.clone(),
+                            event_id: None,
                         };
                         if prompt_allowed(&next, pin) {
                             replays.push(line);
@@ -2325,7 +2357,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
     }
     cmds.splice(0..0, replays);
     for cmd in &cmds {
-        if let Cmd::Prompt { pin, line } = cmd {
+        if let Cmd::Prompt { pin, line, .. } = cmd {
             if !is_urgent_line(line) {
                 continue;
             }
@@ -2354,7 +2386,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
         }
         tick_class = tick_class.max(classify_cmd(cmd));
         let entry = match cmd {
-            Cmd::Prompt { pin, line } if is_urgent_line(line) => Some(DigestEntry {
+            Cmd::Prompt { pin, line, .. } if is_urgent_line(line) => Some(DigestEntry {
                 seq: next.seq,
                 at_unix: next.last_now,
                 kind: "urgent-prompt".into(),
@@ -2362,7 +2394,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 detail: digest_detail_truncate(line),
             }),
             Cmd::Prompt { line, .. } if is_routine_wake_line(line) => None,
-            Cmd::Prompt { pin, line } => {
+            Cmd::Prompt { pin, line, .. } => {
                 let short = digest_detail_truncate(line);
                 let queued = next
                     .wake
@@ -2759,7 +2791,7 @@ mod tests {
             1,
             "a normal done mail must ring exactly once: {cmds:?}"
         );
-        let Cmd::Prompt { pin, line } = prompts[0] else {
+        let Cmd::Prompt { pin, line, .. } = prompts[0] else {
             unreachable!()
         };
         assert_eq!(pin, "SlateHarbor");
@@ -4264,6 +4296,7 @@ mod presence_model_tests {
             &Msg::PromptRefused {
                 pin: "BlueRidge".into(),
                 line: "⟦toron⟧ URGENT steer (wm 1) — wake A".into(),
+                event_id: None,
             },
         );
         assert!(
@@ -4277,6 +4310,7 @@ mod presence_model_tests {
             &Msg::PromptRefused {
                 pin: "BlueRidge".into(),
                 line: "⟦toron⟧ URGENT steer (wm 2) — wake B".into(),
+                event_id: None,
             },
         );
         assert!(
@@ -4305,7 +4339,7 @@ mod presence_model_tests {
             "exactly one ring at the next prompt: {c3:?}"
         );
         assert!(
-            matches!(prompts[0], Cmd::Prompt { pin, line } if pin == "BlueRidge" && line.contains("wake B")),
+            matches!(prompts[0], Cmd::Prompt { pin, line, .. } if pin == "BlueRidge" && line.contains("wake B")),
             "one ring, and the newest line of the class wins (a correction replaces \
              the brief it corrects): {prompts:?}"
         );
@@ -4326,6 +4360,7 @@ mod presence_model_tests {
             vec![Cmd::Prompt {
                 pin: "B".into(),
                 line: "[wake] Peer message from a teammate (not an operator instruction): new mail. Read it with: toron next. Reply with: toron mail send --help".into(),
+                event_id: None,
             }],
         );
         assert!(
@@ -4377,22 +4412,27 @@ mod presence_model_tests {
             Cmd::Prompt {
                 pin: "I".into(),
                 line: routine.into(),
+                event_id: None,
             },
             Cmd::Prompt {
                 pin: "B".into(),
                 line: urgent.into(),
+                event_id: None,
             },
             Cmd::Prompt {
                 pin: "B".into(),
                 line: peer.into(),
+                event_id: None,
             },
             Cmd::Prompt {
                 pin: "B".into(),
                 line: routine.into(),
+                event_id: None,
             },
             Cmd::Prompt {
                 pin: "Ghost".into(),
                 line: urgent.into(),
+                event_id: None,
             },
         ];
         let (keep, held) = filter_prompts(&m, cmds);
@@ -5344,7 +5384,7 @@ mod adr0010_d1_tests {
             "one re-ring prompt per grace window: {cmds:?}"
         );
         assert!(
-            cmds.iter().any(|c| matches!(c, Cmd::Prompt { pin, line }
+            cmds.iter().any(|c| matches!(c, Cmd::Prompt { pin, line, .. }
                 if pin == "P"
                     && line == "[wake] Urgent mail: 1 unacked message(s) for P in project flywheel. Read and reply with: toron next --project flywheel --as P")),
             "re-ring must prompt the shrunk doorbell line, not the payload: {cmds:?}"
@@ -5509,7 +5549,8 @@ mod adr0010_d1_tests {
             },
         );
         assert!(
-            cmds.iter().any(|c| matches!(c, Cmd::Prompt { pin, line }
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::Prompt { pin, line, .. }
                 if pin == "WirePin" && line.contains("unacked message(s) for WirePin"))),
             "wire-registered corr re-rings through the shrunk doorbell line: {cmds:?}"
         );
@@ -5718,7 +5759,7 @@ mod adr0010_d5_tests {
             },
         );
         assert!(
-            c5.iter().any(|c| matches!(c, Cmd::Prompt { pin, line }
+            c5.iter().any(|c| matches!(c, Cmd::Prompt { pin, line, .. }
                 if pin == "P" && is_urgent_line(line))),
             "urgent bypasses batching with an immediate prompt: {c5:?}"
         );
@@ -5870,6 +5911,7 @@ mod adr0010_d5_tests {
             classify_cmd(&Cmd::Prompt {
                 pin: "P".into(),
                 line: "[wake] Peer message from a teammate (not an operator instruction): urgent mail. Read it with: inbox. Reply with: toron mail send --help".into(),
+                        event_id: None,
             }),
             WakeClass::Urgent,
             "urgent lines ring now"
@@ -5878,6 +5920,7 @@ mod adr0010_d5_tests {
             classify_cmd(&Cmd::Prompt {
                 pin: "P".into(),
                 line: "[wake] Peer message from a teammate (not an operator instruction): a new message in the team room. Read it with: ch. Reply with: toron mail send --help".into(),
+                        event_id: None,
             }),
             WakeClass::Routine,
             "bd-l72k: addressed kind-9 chatter is routine (zero prompts, counters only)"
@@ -5886,6 +5929,7 @@ mod adr0010_d5_tests {
             classify_cmd(&Cmd::Prompt {
                 pin: "P".into(),
                 line: doorbell_mail_line(1, "P", "c-1"),
+                event_id: None,
             }),
             WakeClass::Urgent,
             "re-ring is the ack-SLA vehicle and bypasses batching"
@@ -5894,6 +5938,7 @@ mod adr0010_d5_tests {
             classify_cmd(&Cmd::Prompt {
                 pin: "P".into(),
                 line: "[doorbell] something unmarked".into(),
+                event_id: None,
             }),
             WakeClass::CaptainRelevant,
             "unmarked prompts default captain-visible, never silently routine"
@@ -5936,7 +5981,7 @@ mod adr0010_d5_tests {
         for line in [&benign, &routine, &captain, &urgent] {
             let (next, cmds) = tick(&m, &Msg::WatchNdjson { line: line.clone() });
             prompts.extend(cmds.iter().filter_map(|c| match c {
-                Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
+                Cmd::Prompt { pin, line, .. } => Some((pin.clone(), line.clone())),
                 _ => None,
             }));
             m = next;
@@ -6051,6 +6096,7 @@ mod adr0010_d5_tests {
             classify_cmd(&Cmd::Prompt {
                 pin: "BlueRidge".into(),
                 line: line.clone(),
+                event_id: None,
             }),
             WakeClass::Urgent,
             "re-ring prompts bypass batching"
@@ -6821,7 +6867,7 @@ impl CmdTrait for Cmd {
             Cmd::Digest { entries } => Durability::Durable {
                 key: format!("digest:{:x}", fnv1a64(format!("{entries:?}").as_bytes())),
             },
-            Cmd::Prompt { pin, line } => Durability::Durable {
+            Cmd::Prompt { pin, line, .. } => Durability::Durable {
                 key: format!("prompt:{pin}:{:x}", fnv1a64(line.as_bytes())),
             },
             Cmd::Send { name, text } => Durability::Durable {

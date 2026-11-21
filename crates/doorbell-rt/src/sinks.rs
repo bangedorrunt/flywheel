@@ -366,6 +366,7 @@ async fn worker_loop(
                     .send(BrainMsg::PromptRefused {
                         pin: pin.clone(),
                         line: line.clone(),
+                        event_id: None,
                     })
                     .await;
                 continue;
@@ -1064,7 +1065,7 @@ mod tests {
         let mut degraded = 0;
         while let Ok(msg) = deg_rx.try_recv() {
             match msg {
-                BrainMsg::PromptRefused { pin, line } => deferred.push((pin, line)),
+                BrainMsg::PromptRefused { pin, line, .. } => deferred.push((pin, line)),
                 BrainMsg::Degraded { .. } => degraded += 1,
                 _ => {}
             }

@@ -543,10 +543,15 @@ impl<H: Host> Brain<H> {
                 });
                 self.deliver(effects, "presence").await;
             }
-            BrainMsg::PromptRefused { pin, line } => {
+            BrainMsg::PromptRefused {
+                pin,
+                line,
+                event_id,
+            } => {
                 let effects = self.host.tick(&BrainMsg::PromptRefused {
                     pin: pin.clone(),
                     line: line.clone(),
+                    event_id: event_id.clone(),
                 });
                 self.deliver(effects, "prompt-refused").await;
             }

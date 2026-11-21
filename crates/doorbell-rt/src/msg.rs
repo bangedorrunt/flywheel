@@ -36,7 +36,11 @@ pub enum BrainMsg {
     Delivered { pin: String },
     /// bd-9mjla: the pane refused the prompt as busy; the reducer keeps the
     /// wake (one per pin) and rings it once at the next at-prompt status.
-    PromptRefused { pin: String, line: String },
+    PromptRefused {
+        pin: String,
+        line: String,
+        event_id: Option<String>,
+    },
     /// A toron events mail hint for a no-door seat (bd-l5vb2). The bus event
     /// id is the single dedupe key shared with wake.sock.
     EventsHint {

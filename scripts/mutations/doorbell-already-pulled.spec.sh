@@ -20,12 +20,12 @@ mutation "R2  a behind cursor is treated as pulled" \
 mutation "R3  the host passes no cursor at ring time" \
     file=src/doorbell_host.rs \
     expect=a_pulled_deferral_does_not_ring_at_idle \
-    find='            for (pin, line) in crate::doorbell::take_deferred_wakes_after(
+    find='            for (pin, line, event_id) in crate::doorbell::take_deferred_wakes_after(
                 &state_dir,
                 &self.project,
                 &hosted,
                 &|pin| crate::doorbell::pin_cursor_us(&state_dir, &self.workspace, pin),' \
-    replace='            for (pin, line) in crate::doorbell::take_deferred_wakes_after(
+    replace='            for (pin, line, event_id) in crate::doorbell::take_deferred_wakes_after(
                 &state_dir,
                 &self.project,
                 &hosted,

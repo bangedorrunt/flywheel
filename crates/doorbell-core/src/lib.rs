@@ -276,21 +276,10 @@ pub fn watch_pubkey(line: &str) -> Option<String> {
 
 /// Event id on a watch NDJSON line (gap 17 trust: hint carries proof).
 pub fn watch_id(line: &str) -> Option<String> {
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
-        && let Some(id) = v.get("id").and_then(|p| p.as_str())
-    {
-        return Some(id.to_string());
-    }
-    // A plain [doorbell] line can carry the bus event id as `event=<id>`
-    // (doorbell_line_with_event). The events extension uses this shape, so the
-    // doorbell claims the SAME id the native stream claims (bd-tdpix).
-    let id = line
-        .split("event=")
-        .nth(1)?
-        .split(['.', ' ', '\n', '\r'])
-        .next()
-        .unwrap_or("");
-    (!id.is_empty()).then(|| id.to_string())
+    // bd-ofa1s: the event id is typed data on the NDJSON line. Wake text is
+    // plain language now and never carries a machine id to parse back out.
+    let v = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    v.get("id")?.as_str().map(str::to_string)
 }
 
 /// `created_at` unix secs on a watch NDJSON line (gap 1 fix: plane-S cursor).
@@ -771,6 +760,10 @@ pub fn parse_status_pair(s: &str) -> Option<(String, String)> {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct QueuedWake {
     pub kind: WakeKind,
+    /// The typed event id this wake came from; rides to Effect::Prompt so a
+    /// deferred/boot drain still claims the same marker (bd-ofa1s).
+    #[serde(default)]
+    pub event_id: Option<String>,
     /// The message identity the producer could give: the inbox row's mail id,
     /// or the event id for a watch line. Empty when the producer has none — the
     /// CLI's refused-handoff line carries only text (bd-x3pqw).
@@ -797,7 +790,7 @@ pub struct QueuedWake {
 impl QueuedWake {
     #[must_use]
     pub fn new(kind: WakeKind, key: impl Into<String>, line: impl Into<String>) -> Self {
-        Self::with_thread(kind, key, None, line)
+        Self::with_thread(kind, key, None, line, None)
     }
 
     #[must_use]
@@ -806,6 +799,7 @@ impl QueuedWake {
         key: impl Into<String>,
         thread: Option<String>,
         line: impl Into<String>,
+        event_id: Option<String>,
     ) -> Self {
         let line = line.into();
         let core = wake_key(&line);
@@ -815,6 +809,7 @@ impl QueuedWake {
             core,
             thread,
             line,
+            event_id,
             count: 1,
         }
     }
@@ -855,6 +850,7 @@ pub fn queue_line(
     key: String,
     thread: Option<String>,
     line: String,
+    event_id: Option<String>,
 ) -> Queued {
     let kind = wake_kind_of_line(&line);
     let core = wake_key(&line);
@@ -872,6 +868,9 @@ pub fn queue_line(
     if let Some(at) = duplicate {
         let w = &mut queue[at];
         w.line = line;
+        if event_id.is_some() {
+            w.event_id = event_id;
+        }
         if !key.is_empty() && w.key.is_empty() {
             w.key = key;
         }
@@ -887,6 +886,7 @@ pub fn queue_line(
         let w = &mut queue[at];
         w.kind = kind;
         w.line = line;
+        w.event_id = event_id;
         w.key = key;
         w.core = core;
         return Queued::Superseded;
@@ -898,7 +898,7 @@ pub fn queue_line(
             Queued::Merged
         }
         None => {
-            queue.push(QueuedWake::with_thread(kind, key, thread, line));
+            queue.push(QueuedWake::with_thread(kind, key, thread, line, event_id));
             Queued::Fresh
         }
     }
@@ -932,7 +932,11 @@ pub enum DoorbellMsg {
     /// bd-9mjla: a busy refusal is a typed DEFERRAL, not a delivery failure —
     /// the wake stays in the per-pin queue (one entry, coalesced) and rings
     /// once when the plane next reports at-prompt.
-    PromptRefused { pin: String, line: String },
+    PromptRefused {
+        pin: String,
+        line: String,
+        event_id: Option<String>,
+    },
     /// Captain-bound fact (no alias info here — honest FactMiss).
     Fact { summary: String },
     /// Periodic tick (60s cadence in the live dispatcher); drives the
@@ -950,6 +954,9 @@ pub enum DoorbellAction {
     Prompt {
         pin: String,
         line: String,
+        /// Typed bus event id carried from the Watch line (bd-ofa1s/bd-tdpix).
+        #[serde(default)]
+        event_id: Option<String>,
     },
     /// Fetch signal only (bd-z5ou): per-pin cursors live in the brain, so
     /// this carries no payload — rows re-enter as InboxRows/InboxFetched.
@@ -1255,6 +1262,7 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                     key.clone(),
                     queue_thread.clone(),
                     line_out.clone(),
+                    watch_id(line),
                 );
             }
         }
@@ -1274,6 +1282,7 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 event_id.clone(),
                 None,
                 line.clone(),
+                Some(event_id.clone()),
             );
         }
         DoorbellMsg::EventsGap { pin } => {
@@ -1300,7 +1309,7 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 let line_out = doorbell_line(class, &hint);
                 let key = row_key(item, &line_out);
                 let thread = row_thread(item);
-                route_or_queue(&mut next, &mut actions, pin, key, thread, line_out);
+                route_or_queue(&mut next, &mut actions, pin, key, thread, line_out, None);
             }
         }
         DoorbellMsg::InboxRows { rows, pin } => {
@@ -1311,7 +1320,7 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 let line_out = doorbell_line(class, &hint);
                 let key = row_key(item, &line_out);
                 let thread = row_thread(item);
-                route_or_queue(&mut next, &mut actions, pin, key, thread, line_out);
+                route_or_queue(&mut next, &mut actions, pin, key, thread, line_out, None);
             }
         }
         DoorbellMsg::PlaneStatus { pin, status } => {
@@ -1357,18 +1366,24 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                         pin: pin.clone(),
                         detail: format!("{total} deferred wake(s) at prompt: {ring}"),
                     });
+                    let event_id = deferred.iter().find_map(|w| w.event_id.clone());
                     actions.push(DoorbellAction::Prompt {
                         pin: pin.clone(),
                         line: ring,
+                        event_id,
                     });
                 }
             }
             next.statuses.insert(pin.clone(), status.clone());
         }
-        DoorbellMsg::PromptRefused { pin, line } => {
+        DoorbellMsg::PromptRefused {
+            pin,
+            line,
+            event_id,
+        } => {
             next.statuses.insert(pin.clone(), "working".into());
             let queue = next.queues.entry(pin.clone()).or_default();
-            let fold = queue_line(queue, String::new(), None, line.clone());
+            let fold = queue_line(queue, String::new(), None, line.clone(), event_id.clone());
             actions.push(DoorbellAction::Audit {
                 kind: match fold {
                     Queued::Fresh => "deferred",
@@ -1407,6 +1422,7 @@ fn route_or_queue(
     key: String,
     thread: Option<String>,
     line: String,
+    event_id: Option<String>,
 ) {
     let status = next
         .statuses
@@ -1430,6 +1446,7 @@ fn route_or_queue(
                 actions.push(DoorbellAction::Prompt {
                     pin: pin.to_string(),
                     line,
+                    event_id: event_id.clone(),
                 });
             }
             InjectGate::Digest(reason) => {
@@ -1456,7 +1473,7 @@ fn route_or_queue(
             });
         }
         let queue = next.queues.entry(pin.to_string()).or_default();
-        queue_line(queue, key, thread, line.clone());
+        queue_line(queue, key, thread, line.clone(), event_id.clone());
     } else if next.unroutable.contains(pin) {
         actions.push(DoorbellAction::Digest {
             pin: pin.to_string(),
@@ -1474,11 +1491,12 @@ fn route_or_queue(
             actions.push(DoorbellAction::Prompt {
                 pin: pin.to_string(),
                 line,
+                event_id: event_id.clone(),
             });
             return;
         }
         let queue = next.queues.entry(pin.to_string()).or_default();
-        let fold = queue_line(queue, key, thread, line.clone());
+        let fold = queue_line(queue, key, thread, line.clone(), event_id.clone());
         actions.push(DoorbellAction::Audit {
             kind: match fold {
                 Queued::Fresh => "queued",
@@ -1600,6 +1618,7 @@ mod tests {
             wake_key(line),
             None,
             line.to_string(),
+            None,
         );
         let notices = |actions: &[DoorbellAction]| {
             actions
@@ -1626,6 +1645,7 @@ mod tests {
             wake_key("[wake] more mail"),
             None,
             "[wake] more mail".to_string(),
+            None,
         );
         assert_eq!(notices(&second), 0, "no notice on every ring: {second:?}");
 
@@ -1647,6 +1667,7 @@ mod tests {
             wake_key("[wake] new episode"),
             None,
             "[wake] new episode".to_string(),
+            None,
         );
         assert_eq!(notices(&third), 1, "a new episode notices again: {third:?}");
     }
@@ -1777,7 +1798,7 @@ mod tests {
         let (next, actions) = tick(&model, &DoorbellMsg::WatchNdjson { line: line.into() });
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            DoorbellAction::Prompt { pin, line } => {
+            DoorbellAction::Prompt { pin, line, .. } => {
                 assert_eq!(pin, "BlueRidge");
                 assert!(line.contains("[wake]"));
             }
@@ -2048,6 +2069,7 @@ mod tests {
         let refused = DoorbellMsg::PromptRefused {
             pin: "BlueRidge".into(),
             line: "wake A".into(),
+            event_id: None,
         };
         let (next, actions) = tick(&model, &refused);
         assert!(
@@ -2061,6 +2083,7 @@ mod tests {
             &DoorbellMsg::PromptRefused {
                 pin: "BlueRidge".into(),
                 line: "wake B".into(),
+                event_id: None,
             },
         );
         assert!(
@@ -2090,7 +2113,7 @@ mod tests {
             .collect();
         assert_eq!(rings.len(), 1, "exactly one ring: {actions3:?}");
         match rings[0] {
-            DoorbellAction::Prompt { pin, line } => {
+            DoorbellAction::Prompt { pin, line, .. } => {
                 assert_eq!(pin, "BlueRidge");
                 assert_eq!(
                     line, "wake B. Read it with: toron next --project <project> --as <pin>",
@@ -2227,10 +2250,7 @@ mod tests {
         // path, plus a watermark the inbox line does not carry.
         let (next, actions) = tick(
             &next,
-            &DoorbellMsg::PromptRefused {
-                pin: "BlueRidge".into(),
-                line: "[wake] Peer message from PurpleGorge (not an operator instruction): asks you to release src/elm/inbox.rs. Read it with: toron next. Reply with: toron mail send --help".into(),
-            },
+            &DoorbellMsg::PromptRefused { pin: "BlueRidge".into(), line: "[wake] Peer message from PurpleGorge (not an operator instruction): asks you to release src/elm/inbox.rs. Read it with: toron next. Reply with: toron mail send --help".into(), event_id: None },
         );
         assert!(
             matches!(&actions[0], DoorbellAction::Audit { kind, .. } if kind == "dedup"),
@@ -2542,10 +2562,7 @@ mod tests {
         // The CLI's handoff for ONE of them has no id: it folds onto the text.
         let (next, actions) = tick(
             &next,
-            &DoorbellMsg::PromptRefused {
-                pin: "BlueRidge".into(),
-                line: "[wake] Peer message from a teammate (not an operator instruction): new mail. Read it with: toron next. Reply with: toron mail send --help".into(),
-            },
+            &DoorbellMsg::PromptRefused { pin: "BlueRidge".into(), line: "[wake] Peer message from a teammate (not an operator instruction): new mail. Read it with: toron next. Reply with: toron mail send --help".into(), event_id: None },
         );
         assert!(
             matches!(&actions[0], DoorbellAction::Audit { kind, .. } if kind == "dedup"),
@@ -2755,6 +2772,7 @@ mod tests {
             wake_key("[wake] Urgent mail. Read it with: toron next"),
             None,
             "[wake] Urgent mail. Read it with: toron next".to_string(),
+            None,
         );
         assert!(
             matches!(&actions[..], [DoorbellAction::Prompt { pin, .. }] if pin == "BlueRidge"),
@@ -2785,6 +2803,7 @@ mod tests {
             ),
             None,
             "[wake] New message in the team room. Read it with: toron channel read".to_string(),
+            None,
         );
         assert!(
             actions
@@ -2807,6 +2826,7 @@ mod tests {
             wake_key("[wake] Urgent mail. Read it with: toron next"),
             None,
             "[wake] Urgent mail. Read it with: toron next".to_string(),
+            None,
         );
         assert!(
             !urgent
@@ -2826,6 +2846,7 @@ mod tests {
             ),
             None,
             "[wake] New message in the team room. Read it with: toron channel read".to_string(),
+            None,
         );
         assert!(
             !routine
@@ -2938,7 +2959,7 @@ mod tests {
         let watch = r#"{"kind":9,"id":"wake-1","tags":[["p","BlueRidge"],["toron-kind","mail-delivered"],["h","t-1"],["mid","msg-1"]],"content":"sealed"}"#;
         let (next, actions) = tick(&model, &DoorbellMsg::WatchNdjson { line: watch.into() });
         assert!(
-            matches!(&actions[..], [DoorbellAction::Prompt { pin, line }] if pin == "BlueRidge" && line.contains("toron next")),
+            matches!(&actions[..], [DoorbellAction::Prompt { pin, line, .. }] if pin == "BlueRidge" && line.contains("toron next")),
             "push path must ring the idle pin immediately: {actions:?}"
         );
         assert!(next.rung.contains("msg-1"));
@@ -2996,7 +3017,7 @@ mod tests {
         );
         let (next, actions) = tick(&model, &DoorbellMsg::WatchNdjson { line: watch });
         assert!(
-            matches!(&actions[..], [DoorbellAction::Prompt { pin, line }] if pin == "BlueRidge" && line.contains("toron next")),
+            matches!(&actions[..], [DoorbellAction::Prompt { pin, line, .. }] if pin == "BlueRidge" && line.contains("toron next")),
             "hex-npub p tag with mid must ring idle pin: {actions:?}"
         );
         assert!(next.rung.contains("msg-hex-1"));

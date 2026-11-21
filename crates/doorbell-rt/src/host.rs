@@ -297,9 +297,14 @@ impl CoreReducer {
                 summary: summary.clone(),
             },
             BrainMsg::AckSlaTick { now } => DoorbellMsg::AckSlaTick { now: *now },
-            BrainMsg::PromptRefused { pin, line } => DoorbellMsg::PromptRefused {
+            BrainMsg::PromptRefused {
+                pin,
+                line,
+                event_id,
+            } => DoorbellMsg::PromptRefused {
                 pin: pin.clone(),
                 line: line.clone(),
+                event_id: event_id.clone(),
             },
             BrainMsg::Died => DoorbellMsg::WatchDied,
             BrainMsg::EventsHint {
@@ -327,8 +332,12 @@ impl CoreReducer {
         actions
             .into_iter()
             .map(|a| match a {
-                DoorbellAction::Prompt { pin, line } => Effect::Prompt {
-                    event_id: doorbell_core::watch_id(&line),
+                DoorbellAction::Prompt {
+                    pin,
+                    line,
+                    event_id,
+                } => Effect::Prompt {
+                    event_id,
                     pin,
                     line,
                 },

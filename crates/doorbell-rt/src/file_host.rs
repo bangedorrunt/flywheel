@@ -1685,8 +1685,12 @@ impl FileHost {
         actions
             .into_iter()
             .map(|a| match a {
-                doorbell_core::DoorbellAction::Prompt { pin, line } => Effect::Prompt {
-                    event_id: doorbell_core::watch_id(&line),
+                doorbell_core::DoorbellAction::Prompt {
+                    pin,
+                    line,
+                    event_id,
+                } => Effect::Prompt {
+                    event_id,
                     pin,
                     line,
                 },
@@ -1813,20 +1817,29 @@ impl Host for FileHost {
                 },
                 Effect::FetchInbox,
             ],
-            BrainMsg::PromptRefused { pin, line } => {
+            BrainMsg::PromptRefused {
+                pin,
+                line,
+                event_id,
+            } => {
                 let (next, actions) = doorbell_core::tick(
                     &self.reducer.model,
                     &doorbell_core::DoorbellMsg::PromptRefused {
                         pin: pin.clone(),
                         line: line.clone(),
+                        event_id: event_id.clone(),
                     },
                 );
                 self.reducer.model = next;
                 actions
                     .into_iter()
                     .map(|a| match a {
-                        doorbell_core::DoorbellAction::Prompt { pin, line } => Effect::Prompt {
-                            event_id: doorbell_core::watch_id(&line),
+                        doorbell_core::DoorbellAction::Prompt {
+                            pin,
+                            line,
+                            event_id,
+                        } => Effect::Prompt {
+                            event_id,
                             pin,
                             line,
                         },

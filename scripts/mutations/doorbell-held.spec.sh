@@ -17,15 +17,15 @@ WORKSPACE=src/workspace.rs
 mutation "H1  a held prompt is audited away instead of queued" \
     file=$WORKSPACE \
     expect=a_held_prompt_is_queued_not_dropped \
-    find='    for (pin, line) in held {' \
-    replace='    for (pin, line) in Vec::<(String, String)>::new() {'
+    find='    for (pin, line, event_id) in held {' \
+    replace='    for (pin, line, event_id) in Vec::<(String, String, Option<String>)>::new() {'
 
 mutation "H2  a held prompt is promoted to a busy pane anyway" \
     file=$WORKSPACE \
     expect=a_held_prompt_is_queued_not_dropped \
     find='                } else {
-                    held.push((pin, line));
+                    held.push((pin, line, event_id));
                 }' \
     replace='                } else {
-                    keep.push(Cmd::Prompt { pin, line });
+                    keep.push(Cmd::Prompt { pin, line, event_id });
                 }'

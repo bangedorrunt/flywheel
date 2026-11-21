@@ -759,7 +759,7 @@ mod tests {
             ["StormyDesert".to_string()].into_iter().collect();
         assert_eq!(
             crate::doorbell::take_deferred_wakes(&crate::config::state_dir(), &project, &hosted),
-            vec![("StormyDesert".to_string(), line.clone())],
+            vec![("StormyDesert".to_string(), line.clone(), None)],
             "the p2p line is on the handoff"
         );
         crate::doorbell::commit_deferred_wakes(&crate::config::state_dir(), &project);

@@ -1166,7 +1166,7 @@ pub fn take_deferred_wakes(
     state_dir: &Path,
     project: &str,
     hosted: &std::collections::BTreeSet<String>,
-) -> Vec<(String, String)> {
+) -> Vec<(String, String, Option<String>)> {
     take_deferred_wakes_after(state_dir, project, hosted, &|_pin| None)
 }
 
@@ -1204,12 +1204,12 @@ pub fn take_deferred_wakes_after(
     project: &str,
     hosted: &std::collections::BTreeSet<String>,
     current_wm: &dyn Fn(&str) -> Option<u64>,
-) -> Vec<(String, String)> {
+) -> Vec<(String, String, Option<String>)> {
     let path = deferred_wakes_path(state_dir, project);
     let draining = path.with_extension("draining");
     let store = doorbell_rt::FileStore::new(state_dir);
-    let taken = store.with_file_lock(&path, |_| -> std::io::Result<Vec<(String, String)>> {
-        let mut all: Vec<(String, String, Option<u64>)> = Vec::new();
+    let taken = store.with_file_lock(&path, |_| -> std::io::Result<Vec<(String, String, Option<String>)>> {
+        let mut all: Vec<(String, String, Option<u64>, Option<String>)> = Vec::new();
         for source in [&draining, &path] {
             let Ok(raw) = fs::read_to_string(source) else {
                 continue;
@@ -1223,23 +1223,24 @@ pub fn take_deferred_wakes_after(
                     v.get("line").and_then(|l| l.as_str()),
                 ) {
                     let wm = v.get("wm").and_then(|w| w.as_u64());
+                    let event_id = v.get("event_id").and_then(|e| e.as_str()).map(str::to_string);
                     if ring_is_already_pulled(current_wm(pin), wm) {
                         journal_already_pulled(state_dir, project, pin);
                         continue;
                     }
-                    all.push((pin.to_string(), line.to_string(), wm));
+                    all.push((pin.to_string(), line.to_string(), wm, event_id));
                 }
             }
             let _ = fs::remove_file(source);
         }
         let (mine, rest): (Vec<_>, Vec<_>) = all
             .into_iter()
-            .partition(|(pin, _, _)| hosted.contains(pin));
+            .partition(|(pin, _, _, _)| hosted.contains(pin));
         if !rest.is_empty() {
             let mut body = String::new();
-            for (pin, line, wm) in &rest {
+            for (pin, line, wm, event_id) in &rest {
                 body.push_str(
-                    &serde_json::json!({ "pin": pin, "line": line, "wm": wm }).to_string(),
+                    &serde_json::json!({ "pin": pin, "line": line, "wm": wm, "event_id": event_id }).to_string(),
                 );
                 body.push('\n');
             }
@@ -1249,12 +1250,12 @@ pub fn take_deferred_wakes_after(
             return Ok(Vec::new());
         }
         let mut body = String::new();
-        for (pin, line, wm) in &mine {
-            body.push_str(&serde_json::json!({ "pin": pin, "line": line, "wm": wm }).to_string());
+        for (pin, line, wm, event_id) in &mine {
+            body.push_str(&serde_json::json!({ "pin": pin, "line": line, "wm": wm, "event_id": event_id }).to_string());
             body.push('\n');
         }
         fs::write(&draining, body)?;
-        Ok(mine.into_iter().map(|(pin, line, _)| (pin, line)).collect())
+        Ok(mine.into_iter().map(|(pin, line, _, event_id)| (pin, line, event_id)).collect())
     });
     match taken {
         Ok(Ok(entries)) => entries,
@@ -1289,16 +1290,21 @@ pub fn journal_deferred_wake_with_wm(
     cmds: &[crate::workspace::Cmd],
     wm: Option<u64>,
 ) -> std::io::Result<()> {
+    let event_id = cmds.iter().find_map(|c| match c {
+        crate::workspace::Cmd::Prompt { event_id, .. } => event_id.clone(),
+        _ => None,
+    });
     let msg = crate::workspace::Msg::PromptRefused {
         pin: pin.to_string(),
         line: line.to_string(),
+        event_id: event_id.clone(),
     };
     doorbell_rt::FileStore::new(state_dir)
         .append_journal(
             workspace,
             &serde_json::to_value(&msg).unwrap_or(serde_json::Value::Null),
             &serde_json::to_value(cmds).unwrap_or(serde_json::Value::Null),
-            serde_json::json!({ "stage": "handoff", "pin": pin, "wm": wm }),
+            serde_json::json!({ "stage": "handoff", "pin": pin, "wm": wm, "event_id": event_id }),
             std::slice::from_ref(&pin.to_string()),
         )
         .map_err(|e| std::io::Error::other(format!("journal the deferred wake: {e}")))
@@ -2037,7 +2043,7 @@ pub fn once_json(stdin: &str, status_by_pin: &BTreeMap<String, String>) -> Strin
         let (next, cmds) = crate::workspace::tick(&model, &msg);
         model = next;
         for a in cmds {
-            if let crate::workspace::Cmd::Prompt { pin, line } = a {
+            if let crate::workspace::Cmd::Prompt { pin, line, .. } = a {
                 rows.push(serde_json::json!({"pin": pin, "line": line}));
             }
         }
@@ -2820,6 +2826,7 @@ mod tests {
         let refused = |pin: &str| crate::workspace::Msg::PromptRefused {
             pin: pin.to_string(),
             line: line.clone(),
+            event_id: None,
         };
         journal_append_workspace(
             &dir,
@@ -2935,7 +2942,7 @@ mod tests {
         let mine = take_deferred_wakes(&dir, "flywheel", &hosted);
         assert_eq!(
             mine,
-            vec![("BlueRidge".to_string(), line.clone())],
+            vec![("BlueRidge".to_string(), line.clone(), None)],
             "the host takes its own pin's wake"
         );
         let cmds = vec![crate::workspace::Cmd::Audit {
@@ -2956,7 +2963,7 @@ mod tests {
         );
         assert_eq!(
             left,
-            vec![("LilacChapel".to_string(), line.clone())],
+            vec![("LilacChapel".to_string(), line.clone(), None)],
             "the foreign pin's wake survived for the host that owns it"
         );
         assert!(
@@ -3057,7 +3064,9 @@ mod tests {
         let prompts: Vec<_> = cmds
             .iter()
             .filter_map(|c| match c {
-                crate::workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
+                crate::workspace::Cmd::Prompt { pin, line, .. } => {
+                    Some((pin.clone(), line.clone()))
+                }
                 _ => None,
             })
             .collect();
@@ -3581,7 +3590,9 @@ mod tests {
         let urgent_prompts: Vec<_> = cmds2
             .iter()
             .filter_map(|c| match c {
-                crate::workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
+                crate::workspace::Cmd::Prompt { pin, line, .. } => {
+                    Some((pin.clone(), line.clone()))
+                }
                 _ => None,
             })
             .collect();
@@ -3625,7 +3636,9 @@ mod tests {
         let prompts: Vec<_> = cmds
             .iter()
             .filter_map(|c| match c {
-                crate::workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
+                crate::workspace::Cmd::Prompt { pin, line, .. } => {
+                    Some((pin.clone(), line.clone()))
+                }
                 _ => None,
             })
             .collect();
@@ -3646,7 +3659,9 @@ mod tests {
         let drained: Vec<_> = cmds2
             .iter()
             .filter_map(|c| match c {
-                crate::workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
+                crate::workspace::Cmd::Prompt { pin, line, .. } => {
+                    Some((pin.clone(), line.clone()))
+                }
                 _ => None,
             })
             .collect();
@@ -3692,7 +3707,9 @@ mod tests {
         let prompts: Vec<_> = cmds
             .iter()
             .filter_map(|c| match c {
-                crate::workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
+                crate::workspace::Cmd::Prompt { pin, line, .. } => {
+                    Some((pin.clone(), line.clone()))
+                }
                 _ => None,
             })
             .collect();
@@ -3788,7 +3805,9 @@ mod tests {
         let prompts: Vec<_> = cmds
             .iter()
             .filter_map(|c| match c {
-                crate::workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
+                crate::workspace::Cmd::Prompt { pin, line, .. } => {
+                    Some((pin.clone(), line.clone()))
+                }
                 _ => None,
             })
             .collect();
@@ -4504,6 +4523,7 @@ mod tests {
         let actions = vec![crate::doorbell_tick::DoorbellAction::Prompt {
             pin: "BlueRidge".into(),
             line: "[doorbell] test".into(),
+            event_id: None,
         }];
         journal_append(
             &dir,

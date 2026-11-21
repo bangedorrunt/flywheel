@@ -1978,10 +1978,7 @@ mod tests {
             ["BlueRidge".to_string()].into_iter().collect();
         assert_eq!(
             crate::doorbell::take_deferred_wakes(&crate::config::state_dir(), &project, &hosted),
-            vec![(
-                "BlueRidge".to_string(),
-                "[wake] Peer message from a teammate (not an operator instruction): new mail. Read it with: toron next. Reply with: toron mail send --help".to_string()
-            )],
+            vec![("BlueRidge".to_string(), "[wake] Peer message from a teammate (not an operator instruction): new mail. Read it with: toron next. Reply with: toron mail send --help".to_string(), None)],
             "the unconsumed wake is on the dispatcher's queue, not lost"
         );
     }
@@ -2055,10 +2052,7 @@ mod tests {
             ["BlueRidge".to_string()].into_iter().collect();
         assert_eq!(
             crate::doorbell::take_deferred_wakes(&crate::config::state_dir(), &project, &hosted),
-            vec![(
-                "BlueRidge".to_string(),
-                "[wake] Peer message from a teammate (not an operator instruction): new mail. Read it with: toron next. Reply with: toron mail send --help".to_string()
-            )],
+            vec![("BlueRidge".to_string(), "[wake] Peer message from a teammate (not an operator instruction): new mail. Read it with: toron next. Reply with: toron mail send --help".to_string(), None)],
             "the refused wake is on the dispatcher's queue as a mail wake"
         );
     }
@@ -2085,10 +2079,7 @@ mod tests {
     fn a_busy_crew_prompt_rings_once_at_the_next_prompt() {
         let mut model = crate::workspace::WorkspaceModel::default();
         model.doorbell.index.insert_pin("BlueRidge".into(), None);
-        let msg = crate::workspace::Msg::PromptRefused {
-            pin: "BlueRidge".into(),
-            line: "[wake] Peer message from a teammate (not an operator instruction): urgent mail. Read it with: toron next. Reply with: toron mail send --help".into(),
-        };
+        let msg = crate::workspace::Msg::PromptRefused { pin: "BlueRidge".into(), line: "[wake] Peer message from a teammate (not an operator instruction): urgent mail. Read it with: toron next. Reply with: toron mail send --help".into(), event_id: None };
         let (model, cmds) = crate::workspace::tick(&model, &msg);
         assert!(
             !cmds

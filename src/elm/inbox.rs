@@ -150,7 +150,7 @@ impl InboxCmd {
     /// hash per wake on the doorbell's hot path buys nothing.
     pub fn key(&self) -> String {
         match &self.action {
-            DoorbellAction::Prompt { pin, line } => {
+            DoorbellAction::Prompt { pin, line, .. } => {
                 format!("wake:prompt:{pin}:{}", fnv1a64(line))
             }
             DoorbellAction::Digest { pin, line, .. } => {
@@ -243,6 +243,7 @@ fn route_action(decision: &GateDecision, input: &RouteInput) -> InboxCmd {
         GateDecision::Inject { pin, line } => DoorbellAction::Prompt {
             pin: pin.clone(),
             line: line.clone(),
+            event_id: None,
         },
         GateDecision::Digest { pin, reason } => DoorbellAction::Digest {
             pin: pin.clone(),
@@ -593,6 +594,7 @@ mod tests {
         let cmd = InboxCmd::dispatch(DoorbellAction::Prompt {
             pin: "EmeraldSparrow".into(),
             line: "[doorbell] wake".into(),
+            event_id: None,
         });
         let exit = Runtime::run(InboxInterpret::interpret_in_env(
             &cmd,
@@ -627,6 +629,7 @@ mod tests {
         let cmd = InboxCmd::dispatch(DoorbellAction::Prompt {
             pin: "EmeraldSparrow".into(),
             line: "[doorbell] wake".into(),
+            event_id: None,
         });
         let exit = Runtime::run(InboxInterpret::interpret_in_env(
             &cmd,
@@ -774,6 +777,7 @@ mod tests {
         let delivery = InboxCmd::dispatch(DoorbellAction::Prompt {
             pin: "EmeraldSparrow".into(),
             line: "[doorbell] wake".into(),
+            event_id: None,
         });
         assert_eq!(
             delivery.durability(),
@@ -784,6 +788,7 @@ mod tests {
         let again = InboxCmd::dispatch(DoorbellAction::Prompt {
             pin: "EmeraldSparrow".into(),
             line: "[doorbell] wake".into(),
+            event_id: None,
         });
         assert_eq!(delivery.key(), again.key());
     }

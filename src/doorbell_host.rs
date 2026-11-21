@@ -1123,13 +1123,17 @@ pub(crate) fn claim_all_prompts(state_dir: &std::path::Path, effects: Vec<Effect
         .collect()
 }
 
-fn cmds_to_effects(cmds: Vec<workspace::Cmd>, watch_id: Option<&str>) -> Vec<Effect> {
+fn cmds_to_effects(cmds: Vec<workspace::Cmd>) -> Vec<Effect> {
     cmds.into_iter()
         .filter_map(|c| match c {
-            workspace::Cmd::Prompt { pin, line } => Some(Effect::Prompt {
-                // bd-tdpix: the event id is typed data, never parsed from the
-                // now plain-language wake text.
-                event_id: watch_id.map(str::to_string),
+            workspace::Cmd::Prompt {
+                pin,
+                line,
+                event_id,
+            } => Some(Effect::Prompt {
+                // bd-ofa1s/bd-tdpix: the id is typed data carried from the
+                // Watch line, never parsed from plain-language wake text.
+                event_id,
                 pin,
                 line,
             }),
@@ -1176,10 +1180,6 @@ impl Host for RtHost {
         // micros. A mail watch at or below it is already pulled and must not
         // ring an empty wake. Cheap local read; no toron round trip.
         let state_dir = config::state_dir();
-        let current_watch_id = match &msg {
-            BrainMsg::Watch(line) => doorbell_core::watch_id(line),
-            _ => None,
-        };
         for entry in state::load_spawn_registry(&self.project) {
             let Some(pin) = entry.mail_identity else {
                 continue;
@@ -1241,10 +1241,11 @@ impl Host for RtHost {
                 },
                 false,
             ),
-            BrainMsg::PromptRefused { pin, line } => (
+            BrainMsg::PromptRefused { pin, line, .. } => (
                 workspace::Msg::PromptRefused {
                     pin: pin.clone(),
                     line: line.clone(),
+                    event_id: None,
                 },
                 false,
             ),
@@ -1293,6 +1294,7 @@ impl Host for RtHost {
                         &workspace::Msg::PromptRefused {
                             pin: pin.clone(),
                             line: line.clone(),
+                            event_id: None,
                         },
                     );
                     self.model = next;
@@ -1319,11 +1321,11 @@ impl Host for RtHost {
                         },
                     );
                     self.model = next;
-                    boot_drain_effects.extend(cmds_to_effects(drain_cmds, None));
+                    boot_drain_effects.extend(cmds_to_effects(drain_cmds));
                 }
             }
             let mut journaled = true;
-            for (pin, line) in crate::doorbell::take_deferred_wakes_after(
+            for (pin, line, event_id) in crate::doorbell::take_deferred_wakes_after(
                 &state_dir,
                 &self.project,
                 &hosted,
@@ -1334,6 +1336,7 @@ impl Host for RtHost {
                     &workspace::Msg::PromptRefused {
                         pin: pin.clone(),
                         line: line.clone(),
+                        event_id: event_id.clone(),
                     },
                 );
                 self.model = next;
@@ -1389,7 +1392,7 @@ impl Host for RtHost {
         {
             eprintln!("flywheel: run-state boundary not recorded: {refusal}");
         }
-        let mut effects = cmds_to_effects(cmds, current_watch_id.as_deref());
+        let mut effects = cmds_to_effects(cmds);
         // bd-tdpix: claim the shared bus-event marker BEFORE any Prompt is
         // emitted; a lost claim drops the Prompt from this tick. The boot drain
         // carries no event id and is appended after the gate.
@@ -2198,7 +2201,7 @@ mod parity_tests {
             &model,
             &crate::workspace::Msg::WatchNdjson { line: line.clone() },
         );
-        let effects = super::cmds_to_effects(cmds, Some("bus-fold-42"));
+        let effects = super::cmds_to_effects(cmds);
         let carried = effects.iter().find_map(|effect| match effect {
             Effect::Prompt { event_id, .. } => event_id.clone(),
             _ => None,
@@ -2221,6 +2224,82 @@ mod parity_tests {
                 .count(),
             1,
             "one event -> one ring"
+        );
+    }
+
+    #[test]
+    fn a_deferred_ring_carries_the_id_through_the_queue_drain_and_claims() {
+        // bd-ofa1s: a wake deferred while the seat is working must carry its
+        // event id through the in-memory queue to the drain at idle, so the
+        // claim gate sees it (free marker rings once; taken marker stays quiet).
+        let line = serde_json::json!({
+            "kind": 9,
+            "id": "evt-def-claim",
+            "tags": [["p", "PinA"], ["toron-kind", "mail-delivered"], ["mid", "msg-def"]],
+            "content": "sealed"
+        })
+        .to_string();
+        let mut model = crate::workspace::WorkspaceModel::default();
+        model.doorbell.index.insert_pin("PinA".into(), None);
+        model
+            .doorbell
+            .statuses
+            .insert("PinA".into(), "working".into());
+        model.presence.insert(
+            "PinA".into(),
+            crate::workspace::Presence::from_str("working"),
+        );
+        // Working seat: the wake is held in the queue with its typed id.
+        let (mut model, _) = crate::workspace::tick(
+            &model,
+            &crate::workspace::Msg::WatchNdjson { line: line.clone() },
+        );
+        let held = model
+            .doorbell
+            .queues
+            .get("PinA")
+            .expect("the working seat holds the wake");
+        assert!(
+            held.iter()
+                .any(|w| w.event_id.as_deref() == Some("evt-def-claim")),
+            "the typed id rides in the queue entry: {held:?}"
+        );
+        // Idle: the queued wake drains into a Prompt carrying the same id.
+        model
+            .presence
+            .insert("PinA".into(), crate::workspace::Presence::from_str("idle"));
+        let (_, cmds) = crate::workspace::tick(
+            &model,
+            &crate::workspace::Msg::PlaneStatus {
+                pin: "PinA".into(),
+                status: "idle".into(),
+            },
+        );
+        let effects = super::cmds_to_effects(cmds);
+        let carried = effects.iter().find_map(|e| match e {
+            Effect::Prompt { event_id, .. } => event_id.clone(),
+            _ => None,
+        });
+        assert_eq!(
+            carried.as_deref(),
+            Some("evt-def-claim"),
+            "the drain carries the typed id: {effects:?}"
+        );
+        let free = tempfile::tempdir().expect("tempdir");
+        let rang = super::claim_all_prompts(free.path(), effects.clone());
+        assert_eq!(
+            rang.iter()
+                .filter(|e| matches!(e, Effect::Prompt { .. }))
+                .count(),
+            1,
+            "a free marker rings exactly once"
+        );
+        let taken = tempfile::tempdir().expect("tempdir");
+        assert!(crate::wake_rung::claim(taken.path(), "evt-def-claim"));
+        let silent = super::claim_all_prompts(taken.path(), effects);
+        assert!(
+            !silent.iter().any(|e| matches!(e, Effect::Prompt { .. })),
+            "a marker the native path already claimed stays silent"
         );
     }
 
@@ -2250,7 +2329,8 @@ mod parity_tests {
             "evt-deferred",
         );
         let effects = vec![Effect::Prompt {
-            event_id: doorbell_core::watch_id(&line),
+            // bd-ofa1s: typed id, never parsed from the plain-language line.
+            event_id: Some("evt-deferred".into()),
             pin: "ScarletCove".into(),
             line: line.clone(),
         }];
@@ -3243,6 +3323,7 @@ mod off_runtime_tests {
                 workspace::Cmd::Prompt {
                     pin: "BlueRidge".into(),
                     line: crate::doorbell::deferred_wake_line(),
+                    event_id: None,
                 },
             ],
             serde_json::json!({ "stage": "drain" }),
@@ -3731,7 +3812,7 @@ impl Interpret<crate::workspace::WorkspaceProgram> for DurableInterpret {
                     })
                     .provide_from(services)
             }
-            crate::workspace::Cmd::Prompt { pin, line } => {
+            crate::workspace::Cmd::Prompt { pin, line, .. } => {
                 let Some(services) = services else {
                     return Self::interpret(cmd);
                 };
@@ -3999,6 +4080,7 @@ mod durable_tests {
         let cmd = workspace::Cmd::Prompt {
             pin: "p".into(),
             line: "[doorbell] hello".into(),
+            event_id: None,
         };
         let exit = Runtime::run(DurableInterpret::interpret_in_env(&cmd, rt.context()));
         let Exit::Success(msg) = exit else {
@@ -4019,6 +4101,7 @@ mod durable_tests {
         let cmd = workspace::Cmd::Prompt {
             pin: "p".into(),
             line: "[doorbell] hello".into(),
+            event_id: None,
         };
         let exit = Runtime::run(DurableInterpret::interpret_in_env(&cmd, rt.context()));
         let Exit::Failure(cause) = exit else {
@@ -4034,6 +4117,7 @@ mod durable_tests {
         let cmd = workspace::Cmd::Prompt {
             pin: "p".into(),
             line: "[doorbell] hello".into(),
+            event_id: None,
         };
         assert!(!Runtime::run(DurableInterpret::interpret(&cmd)).is_success());
         assert!(!Runtime::run(DurableInterpret::interpret_in_env(&cmd, None)).is_success());
