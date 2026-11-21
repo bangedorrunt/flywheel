@@ -24,12 +24,18 @@ pub struct BridgeEvent {
     pub id: String,
     pub kind: String,
     pub payload: String,
+    /// bd-cdite: typed urgency from the occurrence's data.importance. Never
+    /// parsed out of the body; `None` when the producer did not supply it.
+    pub importance: Option<String>,
 }
 
 /// What a bridge sends into the harness inbound door. No body field exists.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChannelNotice {
     pub hint: String,
+    /// bd-cdite: carried to the plugin as meta.importance so urgency is typed
+    /// end to end, never inferred from the hint's words.
+    pub importance: Option<String>,
     /// The bus event id (or a synthetic `gap:<cursor>`), so the doorbell/bridge
     /// pair can dedupe a seat reached by both (ADR-0039 D8). For a coalesced
     /// burst this is the FIRST event's id.
@@ -65,6 +71,7 @@ pub fn event_to_notice(event: &BridgeEvent) -> Option<ChannelNotice> {
         hint: HINT.to_string(),
         event_id: event.id.clone(),
         event_name: event.kind.clone(),
+        importance: event.importance.clone(),
         count: 1,
     })
 }
@@ -80,6 +87,11 @@ pub fn coalesce(notices: Vec<ChannelNotice>) -> Option<ChannelNotice> {
     for notice in iter {
         count += notice.count;
         mixed |= notice.event_name != first.event_name;
+        // bd-cdite: a burst with any urgent mail stays urgent; dropping the bit
+        // here would downgrade it at the plugin.
+        if notice.importance.as_deref() == Some("urgent") {
+            first.importance = Some("urgent".to_string());
+        }
     }
     if mixed {
         first.event_name = "mixed".to_string();
@@ -95,6 +107,7 @@ pub fn gap_notice(next_cursor: &str) -> ChannelNotice {
         hint: HINT.to_string(),
         event_id: format!("gap:{next_cursor}"),
         event_name: "gap".to_string(),
+        importance: None,
         count: 1,
     }
 }
@@ -262,16 +275,22 @@ pub fn initialize_result(client_version: Option<&str>) -> serde_json::Value {
 /// content is the hint STRING (not an array) and meta carries the ids. Never
 /// the event body.
 pub fn notice_to_rpc(notice: &ChannelNotice) -> serde_json::Value {
+    let mut meta = serde_json::json!({
+        "event_id": notice.event_id,
+        "event_name": notice.event_name,
+        "count": notice.count.to_string()
+    });
+    // bd-cdite: carry typed urgency across the wire. The plugin reads
+    // meta.importance; absent means normal.
+    if let Some(importance) = &notice.importance {
+        meta["importance"] = serde_json::json!(importance);
+    }
     serde_json::json!({
         "jsonrpc": "2.0",
         "method": "notifications/claude/channel",
         "params": {
             "content": notice.hint,
-            "meta": {
-                "event_id": notice.event_id,
-                "event_name": notice.event_name,
-                "count": notice.count.to_string()
-            }
+            "meta": meta
         }
     })
 }
@@ -325,6 +344,8 @@ pub struct StreamFrame {
     pub method: String,
     pub event_id: String,
     pub event_name: String,
+    /// bd-cdite: occurrence data.importance, forwarded to BridgeEvent.
+    pub importance: Option<String>,
     pub cursor: Option<String>,
     pub terminated: bool,
     /// Final: a gap rides on `notifications/events/active` with truncated=true.
@@ -361,32 +382,38 @@ pub fn decode_stream_frame(data: &str, subscription: &str) -> Option<StreamFrame
         let c = str_field("cursor");
         (!c.is_empty()).then_some(c)
     };
-    let (event_id, event_name) = match method.as_str() {
+    let (event_id, event_name, importance) = match method.as_str() {
         "notifications/events/event" => {
             // Final: occurrence fields are the params themselves; tolerate the
             // old nested "event" during the transition (G13 constraint a).
             let event = params.get("event").unwrap_or(params);
-            (
-                event
-                    .get("eventId")
-                    .or_else(|| event.get("event_id"))
-                    .or_else(|| event.get("id"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                event
-                    .get("name")
-                    .or_else(|| event.get("kind"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-            )
+            let id = event
+                .get("eventId")
+                .or_else(|| event.get("event_id"))
+                .or_else(|| event.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let name = event
+                .get("name")
+                .or_else(|| event.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            // bd-cdite: the occurrence carries typed urgency in data.importance.
+            let importance = event
+                .get("data")
+                .and_then(|d| d.get("importance"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            (id, name, importance)
         }
         "notifications/events/active" => (
             format!("gap:{}", cursor.as_deref().unwrap_or("")),
             "gap".to_string(),
+            None,
         ),
-        _ => (String::new(), String::new()),
+        _ => (String::new(), String::new(), None),
     };
     Some(StreamFrame {
         terminated: method == "notifications/events/terminated",
@@ -397,6 +424,7 @@ pub fn decode_stream_frame(data: &str, subscription: &str) -> Option<StreamFrame
         method,
         event_id,
         event_name,
+        importance,
         cursor,
     })
 }
@@ -484,6 +512,7 @@ mod tests {
             id: id.into(),
             kind: kind.into(),
             payload: "SECRET BODY MUST NOT LEAK".into(),
+            importance: None,
         }
     }
 
@@ -865,5 +894,57 @@ mod tests {
         ))
         .expect("fixture is JSON");
         assert_eq!(real, fixture, "the fixture must be the proxy's real frame");
+    }
+
+    /// bd-cdite: importance from an urgent occurrence survives decode -> notice
+    /// -> JSON-RPC meta. This is the flywheel half of the typed urgency chain.
+    #[test]
+    fn occurrence_importance_survives_the_bridge_to_the_wire() {
+        let occurrence = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/events/event",
+            "params": {
+                "_meta": { "io.modelcontextprotocol/subscriptionId": "ScarletCove" },
+                "eventId": "evt-urgent-1",
+                "name": "mail.addressed",
+                "data": { "project": "flywheel", "importance": "urgent" },
+                "cursor": "7"
+            }
+        })
+        .to_string();
+        let frame = decode_stream_frame(&occurrence, "ScarletCove").expect("frame decodes");
+        assert_eq!(frame.importance.as_deref(), Some("urgent"));
+        let notice = event_to_notice(&BridgeEvent {
+            id: frame.event_id,
+            kind: frame.event_name,
+            payload: String::new(),
+            importance: frame.importance,
+        })
+        .expect("wake event maps");
+        assert_eq!(notice.importance.as_deref(), Some("urgent"));
+        let rpc = notice_to_rpc(&notice);
+        assert_eq!(rpc["params"]["meta"]["importance"], "urgent");
+
+        // The checked-in urgent fixture is the proxy's real frame too.
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../plugins/claude-flywheel/test/fixtures/proxy-notice-urgent.json"
+        ))
+        .expect("fixture is JSON");
+        assert_eq!(
+            rpc, fixture,
+            "the urgent fixture must be the proxy's real frame"
+        );
+    }
+
+    #[test]
+    fn coalescing_a_burst_keeps_an_urgent_member_urgent() {
+        let mut urgent = ev("e-urgent", "mail.addressed");
+        urgent.importance = Some("urgent".into());
+        let notices = vec![
+            event_to_notice(&ev("e1", "mail.addressed")).unwrap(),
+            event_to_notice(&urgent).unwrap(),
+        ];
+        let merged = coalesce(notices).expect("coalesced");
+        assert_eq!(merged.importance.as_deref(), Some("urgent"));
     }
 }

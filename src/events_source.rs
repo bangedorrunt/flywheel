@@ -131,6 +131,7 @@ mod tests {
                 id: id.into(),
                 kind: "mail.addressed".into(),
                 payload: String::new(),
+                importance: None,
             }],
             next_cursor: cursor.into(),
             gap: false,
@@ -228,6 +229,7 @@ mod tests {
                 event_id: "bus-evt-777".into(),
                 event_name: "mail.addressed".into(),
                 hint: "hint".into(),
+                importance: None,
                 count: 1,
             }),
         )
@@ -298,6 +300,7 @@ mod tests {
             hint: events_bridge::HINT.into(),
             event_id: "e9".into(),
             event_name: "mail.addressed".into(),
+            importance: None,
             count: 1,
         });
         assert!(matches!(

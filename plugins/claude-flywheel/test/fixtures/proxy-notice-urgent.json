@@ -1,0 +1,13 @@
+{
+  "jsonrpc": "2.0",
+  "method": "notifications/claude/channel",
+  "params": {
+    "content": "[wake] new mail. Read it with: toron next",
+    "meta": {
+      "event_id": "evt-urgent-1",
+      "event_name": "mail.addressed",
+      "count": "1",
+      "importance": "urgent"
+    }
+  }
+}

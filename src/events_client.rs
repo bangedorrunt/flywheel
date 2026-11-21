@@ -223,6 +223,11 @@ pub fn page_from_poll(v: &serde_json::Value) -> Page {
                         // Keep only ids: the body is never carried past this
                         // seam, so a log or a hint cannot leak it (ADR-0039 D8).
                         payload: serde_json::json!({"event_id": id, "name": kind}).to_string(),
+                        importance: row
+                            .get("data")
+                            .and_then(|d| d.get("importance"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
                     })
                 })
                 .collect()
@@ -333,6 +338,7 @@ impl<R: EventsRpc> ToronEventsClient<R> {
                             id: frame.event_id,
                             kind: frame.event_name,
                             payload: String::new(),
+                            importance: frame.importance,
                         });
                     }
                     "notifications/events/active" if frame.truncated => gap = true,
