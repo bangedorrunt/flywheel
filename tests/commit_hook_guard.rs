@@ -1,9 +1,12 @@
 //! bd-j1g64: the remainder of bd-aberm/bd-himh8 — a temp clone with each
 //! repo's hook installed must refuse a plain git commit with the flywheel
 //! commit hint. The nonce path is already proven by src/cmd/commit.rs.
+//! Every built-binary spawn goes through TestSandbox (test-sandbox law).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+
+use flywheel_test_sandbox::TestSandbox;
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
@@ -18,9 +21,8 @@ fn git(dir: &Path, args: &[&str]) -> Output {
         .expect("git")
 }
 
-fn scratch(tag: &str, hook_source: &Path) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("fw-hook-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+fn scratch(tag: &str, hook_source: &Path, root: &Path) -> PathBuf {
+    let dir = root.join(tag);
     std::fs::create_dir_all(dir.join("scripts/hooks")).unwrap();
     assert!(git(&dir, &["init", "-q"]).status.success());
     assert!(
@@ -62,7 +64,12 @@ fn plain_commit(dir: &Path) -> String {
 
 #[test]
 fn flywheel_hook_refuses_a_plain_commit_with_the_hint() {
-    let dir = scratch("flywheel", &root().join("scripts/hooks/pre-commit"));
+    let sandbox = TestSandbox::new();
+    let dir = scratch(
+        "flywheel",
+        &root().join("scripts/hooks/pre-commit"),
+        sandbox.root(),
+    );
     let err = plain_commit(&dir);
     assert!(err.contains("flywheel commit"), "{err}");
     assert!(err.contains("shared index"), "{err}");
@@ -70,8 +77,9 @@ fn flywheel_hook_refuses_a_plain_commit_with_the_hint() {
 
 #[test]
 fn toron_hook_refuses_a_plain_commit_with_the_repo_hint() {
+    let sandbox = TestSandbox::new();
     let hook = root().join("../toron/scripts/hooks/pre-commit");
-    let dir = scratch("toron", &hook);
+    let dir = scratch("toron", &hook, sandbox.root());
     let err = plain_commit(&dir);
     assert!(err.contains("flywheel commit"), "{err}");
     assert!(err.contains("--repo ../toron"), "{err}");
@@ -80,11 +88,24 @@ fn toron_hook_refuses_a_plain_commit_with_the_repo_hint() {
 #[test]
 fn a_stale_staged_entry_is_reported_not_silently_healed() {
     // bd-himh8 heals a stale stage; bd-j1g64 requires the unique case to be
-    // reported. Reuse a temp repo and assert the warning names the path.
-    let dir = scratch("stale", &root().join("scripts/hooks/pre-commit"));
+    // reported. The built binary runs under TestSandbox: no ambient HOME,
+    // XDG dirs, toron store or routing env reaches it.
+    let sandbox = TestSandbox::new();
+    let dir = scratch(
+        "stale",
+        &root().join("scripts/hooks/pre-commit"),
+        sandbox.root(),
+    );
     std::fs::write(dir.join("unique.txt"), "a neighbour's work\n").unwrap();
     assert!(git(&dir, &["add", "unique.txt"]).status.success());
-    let out = Command::new(env!("CARGO_BIN_EXE_flywheel"))
+    let path = format!(
+        "{}:{}",
+        sandbox.bin_dir().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = sandbox
+        .command(env!("CARGO_BIN_EXE_flywheel"))
+        .env("PATH", path)
         .current_dir(&dir)
         .args([
             "commit",
