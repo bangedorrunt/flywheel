@@ -25,6 +25,27 @@ fn proof_suite_step_runs_the_tests_directory() {
     );
 }
 
+/// bd-9dxjt: the proof must build into a REAL target dir it owns. mbx's default
+/// `target` is a symlink into its shared managed cache, which any lane's `mbx
+/// gc` can evict mid-proof; the suite's self-spawning tests (`current_exe`)
+/// then fail with ENOENT because their binary was unlinked under a running
+/// process. A proof-owned CARGO_TARGET_DIR is not a managed target, so no sweep
+/// can reach it. This asserts the structural guard, not the code under test.
+#[test]
+fn proof_builds_into_a_target_dir_it_owns() {
+    let clean = std::fs::read_to_string(format!("{}/scripts/clean-proof.sh", root()))
+        .expect("scripts/clean-proof.sh");
+    assert!(
+        clean.contains(r#"export CARGO_TARGET_DIR="$TMP/target""#),
+        "the proof must export a real, proof-owned CARGO_TARGET_DIR (bd-9dxjt); \
+         mbx's managed target is a symlink a concurrent sweep can evict"
+    );
+    assert!(
+        clean.contains(r#"[ -L "$CARGO_TARGET_DIR" ]"#),
+        "the proof must fail loudly if mbx turned the target back into a swept symlink"
+    );
+}
+
 /// bd-proof-toron-bin: the suite step builds the pinned sibling toron and the
 /// tests that need it pass; the mutation stage runs in verify-mutations' own
 /// scratch export, whose ../toron is now (bd-5j8ri) the PINNED sibling source.

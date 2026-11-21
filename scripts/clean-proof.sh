@@ -199,6 +199,15 @@ else
 fi
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/fw-proof.XXXXXX")"
+
+# bd-9dxjt: build into a REAL target dir the proof owns. By default mbx makes
+# `target` a symlink into its shared managed cache, which ANY lane's `mbx gc`
+# can evict mid-proof: the suite's self-spawning tests (current_exe) then fail
+# with ENOENT because their binary was unlinked under a running process. A real
+# CARGO_TARGET_DIR is not a registered managed target, so no sweep can reach
+# our test binaries. Same carve-out verify-mutations.sh and e2e-live.sh use.
+export CARGO_TARGET_DIR="$TMP/target"
+
 CACHE_STORES="$TMP/cache-stores.tsv"
 : >"$CACHE_STORES"
 cleanup() {
@@ -340,6 +349,13 @@ export RUSTFLAGS="${RUSTFLAGS:-} -D warnings"
 # error fails before the suite instead of after it.
 run_step verify-needles bash scripts/verify-needles.sh || true
 [ -n "$FAILED_STEP" ] || run_step build "${MBX[@]}" build --workspace --all-targets || true
+# bd-9dxjt: fail loudly if mbx still turned our target into a symlink into its
+# evictable managed cache. A self-spawning test would then die with ENOENT
+# after a concurrent sweep, and the proof would be blaming the code for a
+# neighbour's gc. The target must be a real directory the proof owns.
+if [ -z "$FAILED_STEP" ] && [ -L "$CARGO_TARGET_DIR" ]; then
+  die "proof target is a symlink into mbx's swept cache, not a real dir ($CARGO_TARGET_DIR)"
+fi
 [ -n "$FAILED_STEP" ] || run_step no-run "${MBX[@]}" test --workspace --no-run || true
 [ -n "$FAILED_STEP" ] || run_step verify-clippy bash scripts/verify-clippy.sh || true
 # bd-jp9z1.5: the suite now executes the tests/ targets, and
@@ -362,7 +378,10 @@ TORON_BIN_BUILT=""
 if [ ! -f "$TMP/toron/Cargo.toml" ]; then
   echo "clean-proof: no sibling toron to build; integration tests that need it are ignored"
 elif [ -z "$FAILED_STEP" ]; then
-  run_step sibling-toron "${MBX[@]}" build --manifest-path "$TMP/toron/Cargo.toml" -p toron-cli || true
+  # bd-9dxjt: this sibling keeps its own proof-owned real target dir too; with
+  # CARGO_TARGET_DIR exported above, pin it here so the copied CLI stays at the
+  # path the mutation stage (and proof_steps/T3) expect.
+  run_step sibling-toron env "CARGO_TARGET_DIR=$TMP/toron/target" "${MBX[@]}" build --manifest-path "$TMP/toron/Cargo.toml" -p toron-cli || true
   if [ -x "$TMP/toron/target/debug/toron" ]; then
     mkdir -p "$TMP/bin"
     cp "$TMP/toron/target/debug/toron" "$TMP/bin/toron"

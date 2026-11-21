@@ -44,3 +44,14 @@ mutation "T3  the built toron is handed over from the evictable target dir" \
     expect=proof_mutation_stage_hands_the_built_toron_to_the_mutations \
     find='    TORON_BIN_BUILT="$TMP/bin/toron"' \
     replace='    TORON_BIN_BUILT="$TMP/toron/target/debug/toron"'
+
+# bd-9dxjt: without a proof-owned target dir, the suite's self-spawning tests
+# load current_exe from mbx's managed target, which a concurrent sweep evicts
+# (ENOENT). P1 removes the real target dir so the proof build rides the shared,
+# sweepable cache again.
+
+mutation "P1  the proof builds into mbx's sweepable managed target" \
+    file=scripts/clean-proof.sh \
+    expect=proof_builds_into_a_target_dir_it_owns \
+    find='export CARGO_TARGET_DIR="$TMP/target"' \
+    replace=': # bd-9dxjt: no proof-owned target dir'
