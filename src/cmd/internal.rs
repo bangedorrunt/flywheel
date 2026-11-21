@@ -1101,18 +1101,23 @@ pub(crate) fn respawn_binding(
         }
         pane
     };
+    // bd-01q9d: read the seat's recorded session BEFORE building argv. A
+    // respawn keeps the opencode conversation by default; a fresh one is an
+    // explicit choice, not the side effect of a patch.
+    let recorded = project_dir_str(cfg, project).ok().and_then(|key| {
+        state::load_spawn_registry(&key)
+            .into_iter()
+            .find(|e| e.name == name)
+    });
     let args = match to {
-        Some(want) => binding_args(want).0,
+        Some(want) => crate::cmd::swarm::respawn_args_with_session(
+            want.harness.as_str(),
+            binding_args(want).0,
+            recorded.as_ref().and_then(|e| e.harness_session.as_deref()),
+        ),
         None => respawn_launch_args(cfg, project, name, kind),
     };
-    let profile = project_dir_str(cfg, project)
-        .ok()
-        .and_then(|key| {
-            state::load_spawn_registry(&key)
-                .into_iter()
-                .find(|e| e.name == name)
-        })
-        .and_then(|e| e.profile);
+    let profile = recorded.and_then(|e| e.profile);
     let fresh = if launched {
         backend
             .agent_list()?

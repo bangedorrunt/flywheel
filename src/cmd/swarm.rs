@@ -69,6 +69,9 @@ pub(crate) enum SwarmCmd {
         /// way `spawn` needs --yes past the consent gate
         #[arg(long)]
         yes: bool,
+        /// bd-01q9d: show the seat effects without running any of them
+        #[arg(long)]
+        dry_run: bool,
     },
     /// List live seats with status
     Status {
@@ -112,7 +115,8 @@ pub(crate) fn cmd_swarm(cfg: &Config, cmd: &SwarmCmd) -> Result<()> {
             count,
             json,
             yes,
-        } => cmd_swarm_apply(cfg, project, patch, count, *json, *yes),
+            dry_run,
+        } => cmd_swarm_apply(cfg, project, patch, count, *json, *yes, *dry_run),
         SwarmCmd::Status { project, json } => {
             let project = crate::cron::detect_project(cfg, project.as_deref()).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -306,6 +310,7 @@ pub(crate) fn cmd_swarm_apply(
     counts: &[String],
     json: bool,
     yes: bool,
+    dry_run: bool,
 ) -> Result<()> {
     let registry = crate::state::load_spawn_registry(project);
     if registry.is_empty() {
@@ -381,16 +386,27 @@ pub(crate) fn cmd_swarm_apply(
         return Ok(());
     }
 
-    // ADR-0022 D1 condition 3: a planned SPAWN starts a new pane, so it takes
-    // the same consent a spawn does. Without --yes the apply refuses and names
-    // what it would start; nothing runs.
-    let spawns = planned_spawns(&applied);
-    if !spawns.is_empty() && !yes {
-        bail!(
-            "swarm apply: the plan calls for {} seat(s) the fleet lacks ({}); re-run with --yes to spawn them",
-            spawns.len(),
-            spawns.join(", ")
-        );
+    // bd-01q9d: a respawn discards a live agent's context just as a new pane
+    // does. Every such effect needs --yes, and the refusal names every seat a
+    // role-scoped patch would hit. A dry run previews without consent or work.
+    let need = consent_required(&applied);
+    if dry_run {
+        if json {
+            print_json(&json!({
+                "project": project,
+                "dry_run": true,
+                "effects": applied.iter().map(effect_json).collect::<Vec<_>>(),
+                "consent_required": need,
+            }));
+        } else {
+            for effect in &applied {
+                println!("would {}", effect_line(effect));
+            }
+        }
+        return Ok(());
+    }
+    if !need.is_empty() && !yes {
+        return Err(consent_refusal(&need));
     }
     // bd-6setu.15 M2: with execution switched off nothing runs, so the plan must
     // not advance either — the record would otherwise claim seats no effect
@@ -440,6 +456,57 @@ pub(crate) fn cmd_swarm_apply(
         }
     }
     Ok(())
+}
+
+/// bd-01q9d: rebind one registry row to a pane that is ALREADY live. Pure over
+/// the rows so a wrong pin or empty pane is a typed refusal, never a quiet
+/// overwrite of a seat someone else is using.
+pub(crate) fn adopt_entry(
+    entries: &mut [crate::state::SpawnEntry],
+    pin: &str,
+    pane: &str,
+    session: Option<&str>,
+) -> Result<()> {
+    if pane.trim().is_empty() {
+        bail!("seat adopt: --pane is required and must be non-empty");
+    }
+    let entry = entries
+        .iter_mut()
+        .find(|e| e.mail_identity.as_deref() == Some(pin) || e.name == pin)
+        .ok_or_else(|| anyhow::anyhow!("seat adopt: no seat for {pin}"))?;
+    entry.pane_id = pane.to_string();
+    if let Some(id) = session {
+        entry.harness_session = Some(id.to_string());
+    }
+    Ok(())
+}
+
+/// bd-01q9d: journaled wrapper around [`adopt_entry`]. The intent lands before
+/// the registry write; a failed or held journal never rebinds blind.
+pub(crate) fn seat_adopt(
+    project: &str,
+    pin: &str,
+    pane: &str,
+    session: Option<&str>,
+) -> Result<()> {
+    use crate::supervisor_host::{Begin, EffectJournal, ToronEffectJournal};
+    let key = format!("seat-adopt:{pin}");
+    let mut journal = ToronEffectJournal::open(&format!("plan:{project}"), "seat-adopt")?;
+    let begin = journal.begin(&key);
+    let generation = match begin {
+        Begin::Run(n) => n,
+        Begin::Skip => return Ok(()),
+        Begin::Unavailable(e) | Begin::Held(e) => {
+            bail!("seat adopt {pin}: journal refused the claim ({e})")
+        }
+    };
+    let mut entries = crate::state::load_spawn_registry(project);
+    let result = adopt_entry(&mut entries, pin, pane, session);
+    if result.is_ok() {
+        crate::state::save_spawn_registry(project, &entries)?;
+    }
+    journal.finish(&key, generation, result.is_ok());
+    result
 }
 
 /// One `flywheel retire` run's outcome.
@@ -706,6 +773,7 @@ pub(crate) fn fold_plan(record: &crate::state::PlanRecord) -> Result<Vec<Desired
 
 /// The seats an apply would START. A spawn is the one effect that adds a pane,
 /// so it is the one that needs consent.
+#[cfg(test)]
 pub(crate) fn planned_spawns(applied: &[SeatEffect]) -> Vec<String> {
     applied
         .iter()
@@ -714,6 +782,44 @@ pub(crate) fn planned_spawns(applied: &[SeatEffect]) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// bd-01q9d: every effect that discards a live agent's context needs consent,
+/// not just a new-pane Spawn. The names are what the refusal shows the operator.
+pub(crate) fn consent_required(applied: &[SeatEffect]) -> Vec<String> {
+    applied
+        .iter()
+        .filter_map(|e| match e {
+            SeatEffect::Spawn { role, count } => Some(format!("spawn {role} x{count}")),
+            SeatEffect::Respawn { pin, .. } => Some(pin.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+pub(crate) fn consent_refusal(need: &[String]) -> anyhow::Error {
+    anyhow::anyhow!(
+        "swarm apply: {} seat change(s) would drop live context ({}); re-run with --yes to confirm",
+        need.len(),
+        need.join(", ")
+    )
+}
+
+/// bd-01q9d: a respawn of an opencode seat reuses its recorded session id, so
+/// the new pane resumes the conversation instead of minting a fresh one.
+pub(crate) fn respawn_args_with_session(
+    harness: &str,
+    mut args: Vec<String>,
+    session: Option<&str>,
+) -> Vec<String> {
+    if crate::harness_registry::canonical(harness) == "opencode"
+        && let Some(id) = session
+        && !id.is_empty()
+    {
+        args.push("--session".to_string());
+        args.push(id.to_string());
+    }
+    args
 }
 
 /// The base a legacy (pre-plan) swarm mints: the seats it actually runs. A
@@ -2041,6 +2147,56 @@ mod planned_spawn_tests {
         }
     }
 
+    /// bd-01q9d: a role-scoped patch respawns EVERY seat in the role. Without
+    /// --yes the apply must refuse and name all of them, not just spawn one.
+    #[test]
+    fn a_role_patch_without_yes_names_every_respawn() {
+        let effects = vec![
+            crate::seat_reconcile::SeatEffect::Respawn {
+                pin: "PinOne".into(),
+                fields: vec![crate::seat_reconcile::SeatField::Harness],
+                context_fresh: false,
+                to: None,
+            },
+            crate::seat_reconcile::SeatEffect::Respawn {
+                pin: "PinTwo".into(),
+                fields: vec![crate::seat_reconcile::SeatField::Harness],
+                context_fresh: false,
+                to: None,
+            },
+            crate::seat_reconcile::SeatEffect::Respawn {
+                pin: "PinThree".into(),
+                fields: vec![crate::seat_reconcile::SeatField::Harness],
+                context_fresh: false,
+                to: None,
+            },
+        ];
+        let need = super::consent_required(&effects);
+        assert_eq!(need, vec!["PinOne", "PinTwo", "PinThree"]);
+        let err = super::consent_refusal(&need).to_string();
+        assert!(err.contains("--yes"), "{err}");
+        for pin in ["PinOne", "PinTwo", "PinThree"] {
+            assert!(err.contains(pin), "refusal must name {pin}: {err}");
+        }
+        assert!(
+            super::consent_required(&[crate::seat_reconcile::SeatEffect::Keep { pin: "P".into() }])
+                .is_empty()
+        );
+    }
+
+    /// bd-01q9d: a respawn into the same seat keeps the recorded opencode
+    /// session by default — the conversation is context, not a fresh pane.
+    #[test]
+    fn a_respawn_keeps_the_recorded_harness_session() {
+        let session = "ses-old-123";
+        let args =
+            super::respawn_args_with_session("opencode", vec!["--model".into()], Some(session));
+        assert!(args.iter().any(|a| a == "--session"), "{args:?}");
+        assert!(args.iter().any(|a| a == session), "{args:?}");
+        let fresh = super::respawn_args_with_session("opencode", vec!["--model".into()], None);
+        assert!(!fresh.iter().any(|a| a == "--session"), "{fresh:?}");
+    }
+
     /// ADR-0022 D1 condition 3: a seat the journal plans but the fleet lacks is
     /// a PLANNED SPAWN - named, and gated by --yes - never a silent pane.
     #[test]
@@ -2109,6 +2265,153 @@ mod apply_gate_tests {
         root
     }
 
+    /// bd-01q9d: three coder seats, all live, all hit by one role patch.
+    fn seeded_three(project: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("fw-apply-three-{}-{}", project, std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _ = crate::state::set_registry_root_override(root.clone());
+        let pins = ["PinOne", "PinTwo", "PinThree"];
+        let entries: Vec<_> = pins
+            .iter()
+            .enumerate()
+            .map(|(i, pin)| {
+                crate::state::SpawnEntry::profiled(
+                    format!("wA:p{}", i + 1),
+                    (*pin).to_string(),
+                    "coder",
+                    "opencode",
+                    Some((*pin).to_string()),
+                )
+            })
+            .collect();
+        crate::state::save_spawn_registry(project, &entries).expect("seed registry");
+        let base: Vec<serde_json::Value> = pins
+            .iter()
+            .enumerate()
+            .map(|(i, pin)| {
+                serde_json::json!({
+                    "pin": pin, "name": pin, "role": "coder", "harness": "opencode",
+                    "model": null, "effort": null, "mode": null,
+                    "pane_id": format!("wA:p{}", i + 1), "status": "idle"
+                })
+            })
+            .collect();
+        crate::state::save_plan(
+            project,
+            &crate::state::PlanRecord {
+                id: "plan-three".to_string(),
+                plan: crate::swarm_plan::Plan::new("swarm"),
+                base: Some(serde_json::json!(base)),
+                patches: Vec::new(),
+            },
+        )
+        .expect("seed plan");
+        root
+    }
+
+    /// bd-01q9d: a role patch over three live seats must refuse without --yes
+    /// and name every pin it would respawn.
+    #[test]
+    fn a_role_patch_without_yes_refuses_and_names_all_three_pins() {
+        let _g = crate::config::lock_env();
+        let project = "applythree";
+        let root = seeded_three(project);
+        let before = std::fs::read(crate::state::plan_file(project)).unwrap();
+        let err = cmd_swarm_apply(
+            &crate::config::Config::default(),
+            project,
+            &["coder.harness=pi".to_string()],
+            &[],
+            false,
+            false,
+            false,
+        )
+        .expect_err("a role respawn without --yes must refuse");
+        for pin in ["PinOne", "PinTwo", "PinThree"] {
+            assert!(
+                err.to_string().contains(pin),
+                "refusal must name {pin}: {err}"
+            );
+        }
+        assert_eq!(
+            before,
+            std::fs::read(crate::state::plan_file(project)).unwrap(),
+            "the refused apply advanced the plan"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// bd-01q9d: adopting a seat moves its registry row to a live rex block
+    /// and the doorbell's block verifier accepts the new binding.
+    #[test]
+    fn seat_adopt_rebinds_the_pane_and_rex_block_verifies() {
+        let _g = crate::config::lock_env();
+        let project = "applyadopt";
+        let root = seeded(project);
+        let mut entries = crate::state::load_spawn_registry(project);
+        super::adopt_entry(&mut entries, "PinOne", "block:01a1e1c0", Some("ses-live-1"))
+            .expect("adopt the live pane");
+        let row = entries
+            .iter()
+            .find(|e| e.mail_identity.as_deref() == Some("PinOne"))
+            .expect("seeded seat");
+        assert_eq!(row.pane_id, "block:01a1e1c0");
+        assert_eq!(row.harness_session.as_deref(), Some("ses-live-1"));
+
+        let pane = crate::hc::PaneInfo {
+            pane_id: row.pane_id.clone(),
+            terminal_id: "term-1".into(),
+            workspace_id: "wA".into(),
+            tab_id: "wA:t1".into(),
+            focused: false,
+            agent_status: crate::hc::AgentStatus::Idle,
+            revision: 0,
+            title: None,
+            cwd: None,
+            agent: None,
+            agent_session: None,
+            display_agent: None,
+            foreground_cwd: None,
+            label: Some("PinOne".into()),
+            scroll: None,
+            state_labels: serde_json::Map::new(),
+            terminal_title: None,
+            terminal_title_stripped: None,
+            tokens: serde_json::Map::new(),
+        };
+        let bind = crate::inbox_ports::verify_rex_block(&pane, "PinOne", "npub1test");
+        assert!(bind.verified, "the adopted rex block must verify: {bind:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// bd-01q9d: --dry-run previews the same effects but leaves the plan of
+    /// record and the fleet untouched.
+    #[test]
+    fn a_dry_run_apply_emits_no_effects_and_advances_no_plan() {
+        let _g = crate::config::lock_env();
+        let project = "applydry";
+        let root = seeded_three(project);
+        let path = crate::state::plan_file(project);
+        let before = std::fs::read(&path).unwrap();
+        cmd_swarm_apply(
+            &crate::config::Config::default(),
+            project,
+            &["coder.harness=pi".to_string()],
+            &[],
+            true,
+            false,
+            true,
+        )
+        .expect("a dry run never needs consent");
+        assert_eq!(
+            before,
+            std::fs::read(&path).unwrap(),
+            "dry run wrote the plan"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// bd-6setu.15 H1/M2: a refused or suppressed apply must not advance the
     /// plan record. The file is the witness: byte-identical across the attempt.
     #[test]
@@ -2121,7 +2424,7 @@ mod apply_gate_tests {
 
         let cfg = crate::config::Config::default();
         let counts = vec!["coder=+1".to_string()];
-        let err = cmd_swarm_apply(&cfg, project, &[], &counts, false, false)
+        let err = cmd_swarm_apply(&cfg, project, &[], &counts, false, false, false)
             .expect_err("a planned spawn without --yes must refuse");
         assert!(
             err.to_string().contains("--yes"),
