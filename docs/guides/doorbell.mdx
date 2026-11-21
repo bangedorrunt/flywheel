@@ -1,19 +1,21 @@
 ---
 title: The doorbell
-description: The wake plane. A supervised daemon turns room posts, mentions, and jobs into one prompt line, with journals that survive crashes.
+description: The wake plane. Wake hosting runs in the toron daemon; room posts, mentions, jobs and events become one [wake] line, with journals that survive crashes.
 ---
 
-Nothing pushes into an agent's head; agents are woken. The doorbell follows the ADR-0016 effect-kernel boundary: observations become `Msg`, `doorbell-core::tick` returns commands, and `doorbell-rt` interprets them. Wake is plane D, consolidated directly into the toron daemon on `127.0.0.1:18080` (port `:18980` is retired per ADR-0020). `doorbell-core` is a pure tick reducer; `doorbell-rt` wires brain, sensors, and sinks within the unified Toron serve runtime. Spawn records a subscription row and defers to a healthy daemon, starting one when `[doorbell]` is configured and none is running (`FLYWHEEL_NO_DOORBELL_ENSURE=1` opts out); only then does an embedded degraded mode run locally, with a WARNING naming the remediation. `flywheel kill` never touches the daemon.
+Nothing pushes into an agent's head; agents are woken. The doorbell follows the ADR-0016 effect-kernel boundary: observations become `Msg`, `doorbell-core::tick` returns commands, and `doorbell-rt` interprets them. Wake is plane D, consolidated directly into the toron daemon on `127.0.0.1:18080` (port `:18980` is retired per ADR-0020); there is no standalone doorbell daemon. `doorbell-core` is a pure tick reducer; `doorbell-rt` wires brain, sensors, and sinks within the unified Toron serve runtime. Spawning a swarm installs a per-project launch agent (`dev.flywheel.doorbell.<project>`) that runs `flywheel doorbell supervise <project>`; `flywheel stack install` keeps those agents current, and `flywheel daemon start` covers only the flywheel daemon (serve + cron), not the wake plane.
+
+Every line an agent reads in a pane is rendered by `doorbell-core::agent_text` and begins with the single `[wake]` marker — that module is the only owner of wake wording, and a build-time jargon lint keeps stack vocabulary out of it. Seats with an events door ride the ADR-0039 `events/*` path when a per-pin token exists; without a token they warn at spawn and use the doorbell as the fallback. `FLYWHEEL_NO_DOORBELL_ENSURE=1` opts out of starting a down host; only then does an embedded degraded mode run locally, with a WARNING naming the remediation. `flywheel kill` never touches the daemon.
 
 ```mermaid
 sequenceDiagram
-    participant W as watched plane (kind 9, mention, job)
-    participant DB as doorbell / toron daemon (18080)
+    participant W as watched plane (room post, mention, job, event)
+    participant DB as toron daemon (18080)
     participant A as agent pane
     W->>DB: event lands
     DB->>DB: journal it (seq-stamped, at-least-once)
-    DB->>A: hc send with one [doorbell] line
-    A->>DB: presence working (20001), or one kind-9 line within 120s
+    DB->>A: pane write with one [wake] line
+    A->>DB: presence working, or a room post within 120s
     Note over A: silence marks the pin unanswered
 ```
 
@@ -25,10 +27,10 @@ See [Functional effect kernel](./effect-kernel) for the reducer/interpreter laws
 
 - Wake stamps (`last_wake`) come only from real observations: plane status or delivered prompt pins. Planned injects never forge them.
 - A pane wake is a **mail** event (`kind 9/14` on the wake bus) carried by the flywheel inbox host. `doorbell inject` journals a Fact for the digest only: the core reducer answers every `Fact` with `fact_miss`, so an inject never rings a pane on either plane.
-- **Who hosts under the comms flag.** `doorbell serve` stays standby: it holds no workspace and types nothing (`mode: standby`, `hosted: []` is healthy, not degraded). Each workspace is hosted by its own `flywheel __doorbell` loop, which owns the workspace lease and runs the brain + bus watch that types the pane. A daemon that armed hosts under comms took the lease as `no-text`, the local loop deferred to it as an inbox-only pane writer, and the workspace went deaf to ordinary `toron mail send` — this is why the daemon refuses to host while comms is on.
+- **Who hosts under the comms flag.** The toron daemon holds no workspace and types nothing when comms is on (`mode: standby`, `hosted: []` is healthy, not degraded). Each workspace is hosted by its own `flywheel __doorbell` loop or its per-project supervise agent, which owns the workspace lease and runs the brain + bus watch that writes the pane. A host that armed workspaces under comms took the lease as `no-text`, the local loop deferred to it as an inbox-only pane writer, and the workspace went deaf to ordinary `toron mail send` — this is why hosting refuses to take over while comms is on.
 - One live workspace model per workspace; sends are doorbell-with-inbox; waiters park on `WaitCorr` until a receipt drains them (on ndjson and sweep).
 - Budgets 5/30/3 are dispatcher-enforced.
-- After `[doorbell]`, publish presence `working` or post one kind-9 line within 120 seconds, or the pin is `unanswered`.
+- After `[wake]`, publish presence `working` or post a room line within 120 seconds, or the pin is `unanswered`.
 - Journals (v2, rotated, seq-stamped) and subscriptions persist, so pending wakes survive crashes at-least-once.
 - Cursors hold rather than skip: a high-water only advances on input it could read, a cursor-less pin backfills from the 24h floor, and a position older than retention is named (`first foldable seq` / `first replayable seq`). The rules live in [effect-kernel discipline](../agent-instructions/effect-kernel).
 - `flywheel doorbell why <project> <pin> --seq <n> --corr <id>` folds the tick from default and explains a named wake.
@@ -60,17 +62,20 @@ sensor bus.
 
 ## Hosting (how a subscription becomes a wake)
 
-Subscriptions alone wake nothing — a hosted loop does. The daemon hosts a
-Brain loop per `(project, workspace)` from two sources: boot `--host p/w`
-pairs (baked into the launchd/systemd unit, so reboots keep them) and
-auto-host: every 60s the daemon hosts every subscribed pair it can name
-(lease-fenced — it never steals a live writer) and reaps spawn-scoped rows
-silent for 7 days. `standby` with zero subscriptions is the only quiet
-state; `standby_with_known_workspaces` is degraded and names the arming
-verb. `flywheel kill` drops its spawn's rows (lifecycle symmetry);
-operator rows outlive swarms. After `flywheel stack install` rewrites a
-doorbell unit definition, reload it (`bootout` + `bootstrap`) or the reboot
-runs the old hosts.
+Subscriptions alone wake nothing — a hosted loop does. Wake hosting lives in
+the toron daemon on `:18080`; the per-project launch agent
+(`dev.flywheel.doorbell.<project>`) runs `flywheel doorbell supervise
+<project>`, which calls `doorbell start` once a minute to keep its hosts
+armed. `doorbell start` records the requested `(project, workspace)` arms in
+state (a running daemon applies them on restart) and passes `--host p/w` to
+the daemon; it also ensures a local dispatcher when the daemon is not the
+wake path. A host is lease-fenced — it never steals a live writer — and
+reaps spawn-scoped rows silent for 7 days. `standby` with zero subscriptions
+is the only quiet state; `standby_with_known_workspaces` is degraded and
+names the arming verb. `flywheel kill` drops its spawn's rows (lifecycle
+symmetry); operator rows outlive swarms. `flywheel stack install` keeps the
+per-project launch agents current; reload a rewritten unit (`bootout` +
+`bootstrap`) or the reboot runs the old hosts.
 
 **A subscription buys you the sweep and an address — not a route.** The
 hosted loop unions subscribed identities into the pin set it sweeps and
@@ -172,35 +177,24 @@ hosting (`/health`), can it exec its CLIs (`/health.binaries`), is the pin
 in the sweep set (`since_by_pin` in `doorbell-wake-<ws>.json`), and is it
 subscribed? The journal is the only surface that answers all four.
 
-## What the daemon execs (CLI resolution)
+## What hosts the brain (and where `/health` comes from)
 
-The daemon shells out to `toron` (bus watch + inbox fetch) and `hc`
-(prompt sink). It is normally started by launchd/systemd, whose `PATH` is
-`/usr/bin:/bin:/usr/sbin:/sbin` — neither tool is there, and a bare-name
-spawn fails as an ordinary child death: the watcher respawns on the retry
-gate forever and every inbox fetch audits `toron spawn/timeout failed`,
-while `/health` still says `mode: hosted`.
+The wake brain runs inside the toron daemon, so there is no second daemon to
+resolve or supervise. `flywheel doorbell status` and `curl
+127.0.0.1:18080/health` read the same daemon state: `mode`, `hosted`,
+`injection`, `degraded`, and `wake`. The per-project launch agents are kept
+current by `flywheel stack install`; `flywheel daemon start` supervises only
+the flywheel daemon (serve + cron).
 
-So the daemon resolves both to an absolute path at startup, first hit wins:
-
-1. `PATH`
-2. `~/.cargo/bin`
-3. `~/.local/bin`
-4. beside its own binary (dev checkouts, co-install)
-5. `~/.local/share/mise/shims` **last**
-
-Shims go last on purpose: a mise shim is a dispatcher that must infer a
-tool version from env and cwd, so under launchd it dies with
-`mise ERROR No version is set for shim: toron` — a resolved-looking path
-that cannot run. Set `DOORBELL_TORON_BIN` / `DOORBELL_HC_BIN` to pin an
-explicit binary; an override is used verbatim. `doorbell serve` logs the
-resolved pair on startup and `/health.binaries` reports it:
-
-```json
-"binaries": { "toron": "/Users/me/.cargo/bin/toron",
-              "hc": "/Users/me/.local/bin/hc",
-              "resolved": { "toron": true, "hc": true } }
-```
+A local dispatcher still needs the plane tools on its `PATH` (`hc` for pane
+status and writes, `toron` for mail and jobs). Under launchd/systemd the
+inherited `PATH` is minimal, so the dispatcher resolves both to absolute
+paths at startup, first hit wins: `PATH`, `~/.cargo/bin`, `~/.local/bin`,
+beside its own binary, then `~/.local/share/mise/shims` **last** (a mise
+shim is a dispatcher that infers a version from env and cwd, and dies under
+launchd with `mise ERROR No version is set for shim: …`). An unresolved tool
+shows up as `cli_unresolved` in `/health.degraded` — wakes will not be
+delivered.
 
 ### Reading `/health.degraded`
 
@@ -222,9 +216,9 @@ plane's own files rather than tracked in RAM, so it survives a restart:
 
 ### Reading `/health.wake`
 
-GS-062 (PR #16) puts wake-pipe liveness on both operator doorbell `/health`
-(`:18080` unified daemon, legacy `:18980`) and flywheel `serve` `/health`. The object is the same shape on
-both surfaces:
+GS-062 (PR #16) puts wake-pipe liveness on both the unified toron daemon
+`/health` (`:18080`) and flywheel `serve` `/health`. The object is the same
+shape on both surfaces:
 
 ```json
 "wake": {
@@ -316,22 +310,21 @@ now counts it:
 `panes_seen` counts panes in **any** status on purpose: a fleet caught
 mid-work (every pane `working`) is healthy — the durable queue holds the
 wake and drains on the next `idle` — so only `panes_seen == 0` with
-`pins > 0` degrades. `doorbell serve` also says it out loud when it starts
-hosting:
+`pins > 0` degrades. The host also says it out loud when it starts hosting:
 
-```
-doorbell serve: hosting flywheel/flywheel-flywheel — 3 pin(s), 0 pane(s) on the plane, 0 injectable now
-doorbell serve: WARNING hosting flywheel/flywheel-flywheel — 3 pin(s) but the plane knows none of their
+```text
+hosting flywheel/flywheel-flywheel — 3 pin(s), 0 pane(s) on the plane, 0 injectable now
+WARNING hosting flywheel/flywheel-flywheel — 3 pin(s) but the plane knows none of their
   panes: NO wake can be injected here (inbox wakes queue/digest instead). Start agents (`hc run --bg`)
   or fix the stale registry
 ```
 
 ## Commands
 
-Verbs live in two places: `flywheel doorbell …` (the operator surface —
-status/start/stop/re-inject/afk/digest/why/inject/subscribe) and the
-`doorbell` binary itself (the daemon: start/stop/restart/status/install/
-serve/migrate/ping).
+The operator surface is `flywheel doorbell …`:
+status/start/stop/re-inject/afk/digest/why/inject/subscribe/subscriptions/
+unsubscribe/gc. Wake hosting itself is the toron daemon; there is no
+separate doorbell daemon binary to install or boot.
 
 | Need | Command |
 |---|---|
@@ -346,4 +339,4 @@ serve/migrate/ping).
 
 Cross-project wake is a captain hold: `br hold --kind captain --corr external:<proj>:<bead> <your-bead>` rings once when the foreign bead closes; you still resolve the hold.
 
-A foreign owner on port 18080 or legacy 18980 fails `doorbell start` loud ("answered by foreign owner, not child <pid>"). That is a port conflict, not corruption: stop the foreign holder or relocate the daemon.
+A foreign owner on port 18080 fails `flywheel doorbell start` loud ("answered by foreign owner, not child <pid>"). That is a port conflict, not corruption: stop the foreign holder or relocate the daemon.
