@@ -1,8 +1,8 @@
 // bd-9os20/bd-gu288/bd-krzqu: first-party Claude Code module. The local
-// `flywheel mcp-events` proxy owns the toron token and speaks the real
-// events/* JSON-RPC methods; this module drives its stdin with `events/poll`,
-// reads the notifications it emits, claims each event, and starts a turn. No
-// token, no typing, no body text.
+// `flywheel mcp-events --follow` proxy owns the toron token, polls internally,
+// and writes notifications/claude/channel frames to stdout. This module only
+// reads them, claims each event, and starts a turn. No token, no typing, no
+// body text, no stdin driving (the host's spawn input is a one-shot string).
 
 import { claimEvent } from "../src/claim.ts";
 import { decide } from "../src/decide.ts";
@@ -10,7 +10,6 @@ import { decodeFrame } from "../src/decode.ts";
 import { wakeHint } from "../src/hint.ts";
 
 const RUNG = process.env.FLYWHEEL_WAKE_RUNG_DIR || "";
-const POLL_MS = 1000;
 
 export interface Piece {
   stream: string;
@@ -18,13 +17,11 @@ export interface Piece {
 }
 export interface Child {
   stdout: AsyncIterable<Piece>;
-  stdin?: { write(text: string): void };
 }
 /** A fake may return just the stdout stream; the real spawn returns a Child. */
 export type SpawnFn = (
   argv: readonly string[],
   env: Record<string, string | undefined>,
-  input?: AsyncIterable<string>,
 ) => Child | AsyncIterable<Piece>;
 
 export interface RegisterDeps {
@@ -33,43 +30,14 @@ export interface RegisterDeps {
 }
 
 const asChild = (c: Child | AsyncIterable<Piece>): Child =>
-  Symbol.asyncIterator in c ? { stdout: c as AsyncIterable<Piece> } : (c as Child);
-
-/** A stdio poll stream that ends when its child does (bd-krzqu F3). */
-function pollInput() {
-  const queue: string[] = [];
-  let done = false;
-  let wake: (() => void) | null = null;
-  const stream = (async function* (): AsyncGenerator<string> {
-    while (!done) {
-      while (queue.length) yield queue.shift()!;
-      if (done) break;
-      await new Promise<void>((r) => { wake = r; });
-    }
-  })();
-  return {
-    stream,
-    poll: () => {
-      queue.push(JSON.stringify({
-        jsonrpc: "2.0", id: Date.now(), method: "events/poll", params: {},
-      }) + "\n");
-      wake?.();
-      wake = null;
-    },
-    end: () => {
-      done = true;
-      wake?.();
-      wake = null;
-    },
-  };
-}
+  Symbol.asyncIterator in c ? { stdout: c as AsyncIterable<Piece> } : c;
 
 export const register = (on: any, deps: RegisterDeps = {}) => {
   let failures = 0;
   let stopped = false;
   let pin = "";
+  let busy = false;
   let clearTimer: (() => void) | null = null;
-  let stopChild: (() => void) | null = null;
 
   const status = async ($, text) => {
     try {
@@ -109,7 +77,9 @@ export const register = (on: any, deps: RegisterDeps = {}) => {
           if (!line) continue;
           const frame = decodeFrame(line, subscriptionId);
           if (!frame || !claimEvent(RUNG, frame.id)) continue;
-          const idle = typeof $.session?.busy === "function" ? !$.session.busy() : true;
+          // bd-krzqu: the host has no session.busy. Track the turn ourselves
+          // from the turn.start/complete/abort hooks registered below.
+          const idle = !busy;
           const decision = decide({
             id: frame.id,
             urgent: frame.urgent,
@@ -132,13 +102,10 @@ export const register = (on: any, deps: RegisterDeps = {}) => {
         }
       }
       // F11: a proxy that exits cleanly is a failed check, not success. Without
-      // this, a closed stdin ends the stream normally and delivery stops silent.
+      // this, a closed stdout ends the stream normally and delivery stops silent.
       await fail($);
     } catch {
       await fail($);
-    } finally {
-      // This child is gone: close its poll stream so the stdin driver ends too.
-      stopChild?.();
     }
   };
 
@@ -150,15 +117,11 @@ export const register = (on: any, deps: RegisterDeps = {}) => {
       "mcp-events",
       "--subscription",
       pin,
+      "--follow",
     ];
-    stopChild?.();
-    const polls = pollInput();
-    const timer = setInterval(polls.poll, POLL_MS);
-    stopChild = () => { clearInterval(timer); polls.end(); };
-    polls.poll();
     const child = deps.spawn
-      ? asChild(deps.spawn(argv, env, polls.stream))
-      : asChild($.process.spawn({ argv, env, input: polls.stream }) as Child);
+      ? asChild(deps.spawn(argv, env))
+      : asChild($.process.spawn({ argv, env }) as Child);
     void consume($, child, pin);
   };
 
@@ -166,14 +129,19 @@ export const register = (on: any, deps: RegisterDeps = {}) => {
     pin = process.env.FLYWHEEL_PIN || "";
     failures = 0;
     stopped = false;
+    busy = false;
     if (stopped || !pin || !RUNG) return next(event);
     await status($, "flywheel wake delivery active");
-    // The proxy echoes the pin as its subscription id (native_subscribe_result).
     startChild($);
     if (clearTimer) clearTimer();
     clearTimer = $.clock.every(15_000, () => void status($, "flywheel wake delivery active"));
     return next(event);
   });
+
+  // The host API has no session.busy; these three hooks are the turn state.
+  on("turn.start", async (_$, event, next) => { busy = true; return next(event); });
+  on("turn.complete", async (_$, event, next) => { busy = false; return next(event); });
+  on("turn.abort", async (_$, event, next) => { busy = false; return next(event); });
 
   on("prompt.submit", async ($, event, next) => next(event));
   on("session.append", async ($, event, next) => next(event));

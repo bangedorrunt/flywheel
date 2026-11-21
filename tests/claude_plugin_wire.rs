@@ -53,6 +53,28 @@ fn claude_plugin_speaks_real_events_surface() {
     );
     assert!(prefix.contains("[wake]"), "agent_text's neutral prefix");
 
+    // bd-krzqu blockers: the host's process.spawn takes a one-shot stdin STRING,
+    // so the proxy must self-drive with --follow; and session.busy does not
+    // exist, so turn state comes from the turn.* hooks.
+    assert!(
+        register.contains("\"--follow\""),
+        "spawn mcp-events in self-driving mode: host stdin is closed after one string"
+    );
+    assert!(
+        !register.contains("session.busy"),
+        "the host API has no session.busy"
+    );
+    assert!(
+        register.contains("turn.start")
+            && register.contains("turn.complete")
+            && register.contains("turn.abort"),
+        "track the turn with the real host hooks"
+    );
+    let main = read("src/main.rs");
+    assert!(
+        main.contains("if follow {") && main.contains("mcp_events_poll_once("),
+        "mcp-events must poll internally in --follow mode"
+    );
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     assert!(
         !root.join("src/hook_decide.rs").exists(),

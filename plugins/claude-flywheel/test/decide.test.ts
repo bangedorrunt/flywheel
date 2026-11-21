@@ -118,27 +118,20 @@ interface Harness {
   submits: string[];
   appends: string[];
   statuses: string[];
-  polls: string[];
   retried: (() => void) | null;
   handlers: Record<string, any>;
   spawnArgv: readonly string[] | null;
 }
 
 function harnessSpawn(frames: string[]): { spawn: SpawnFn; h: Harness } {
-  const h: Harness = { submits: [], appends: [], statuses: [], polls: [], retried: null, handlers: {}, spawnArgv: null };
-  const spawn: SpawnFn = (argv, _env, input) => {
+  const h: Harness = { submits: [], appends: [], statuses: [], retried: null, handlers: {}, spawnArgv: null };
+  const spawn: SpawnFn = (argv, _env) => {
     h.spawnArgv = argv;
-    // Drive the real poll input the module gives us, proving the proxy is fed.
-    void (async () => {
-      for await (const req of input ?? []) h.polls.push(req.trim());
-    })();
-    const child: Child = {
+    return {
       stdout: (async function* (): AsyncGenerator<Piece> {
         for (const f of frames) yield { stream: "stdout", text: f + "\n" };
       })(),
-      stdin: { write: () => {} },
     };
-    return child;
   };
   return { spawn, h };
 }
@@ -147,7 +140,7 @@ function make$ (h: Harness): any {
   return {
     process: { spawn: () => { throw new Error("injected spawn must be used"); } },
     prompt: { submit: async (a: any) => void h.submits.push(a.text) },
-    session: { append: async (a: any) => void h.appends.push(a.message.content[0].text), busy: () => false },
+    session: { append: async (a: any) => void h.appends.push(a.message.content[0].text) },
     ui: { status: async (s: string) => void h.statuses.push(s) },
     clock: {
       every: () => () => {},
@@ -168,8 +161,7 @@ test("one proxy frame produces exactly one submit with the proxy's own hint", as
   const $ = make$(h);
   await h.handlers["session.start"]($, {}, async (e) => e);
   await new Promise((r) => setTimeout(r, 50));
-  assert.deepEqual([...h.spawnArgv ?? []], ["flywheel", "mcp-events", "--subscription", "ScarletCove"]);
-  assert.ok(h.polls.some((p) => p.includes('"method":"events/poll"')), "the proxy is driven by polls");
+  assert.deepEqual([...h.spawnArgv ?? []], ["flywheel", "mcp-events", "--subscription", "ScarletCove", "--follow"]);
   assert.equal(h.submits.length, 1, "the event is claimed once: " + JSON.stringify(h.submits));
   assert.equal(h.appends.length, 1, "the urgent event appends");
   assert.equal(h.submits[0], PROXY_FRAME.params.content, "the proxy's rendered hint is used verbatim");
@@ -185,6 +177,50 @@ test("multiple frames in one stdout chunk are all decoded", async () => {
   await h.handlers["session.start"](make$(h), {}, async (e) => e);
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(h.submits.length, 2, "both frames in the chunk must be delivered");
+  resetEnv();
+});
+
+test("turn.start defers mid-turn; turn.complete restores idle", async () => {
+  // Mid-turn: urgent appends, normal is dropped. Frames are gated so the turn
+  // hook is set before the child can deliver them.
+  freshEnv();
+  let emit!: () => void;
+  const gate = new Promise<void>((r) => { emit = r; });
+  const midHarness = (() => {
+    const h: Harness = { submits: [], appends: [], statuses: [], retried: null, handlers: {}, spawnArgv: null };
+    const spawn: SpawnFn = () => ({
+      stdout: (async function* (): AsyncGenerator<Piece> {
+        await gate;
+        for (const f of [frameLine({ event_id: "evt-mid", importance: "urgent" }), frameLine({ event_id: "evt-normal" })]) {
+          yield { stream: "stdout", text: f + "\n" };
+        }
+      })(),
+    });
+    return { h, spawn };
+  })();
+  const regMid = (await import("../hooks/register.ts?turn-mid")).register;
+  regMid((name, fn) => { midHarness.h.handlers[name] = fn; }, { spawn: midHarness.spawn });
+  const $mid = make$(midHarness.h);
+  await midHarness.h.handlers["session.start"]($mid, {}, async (e) => e);
+  await midHarness.h.handlers["turn.start"]($mid, {}, async (e) => e);
+  emit();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(midHarness.h.appends.length, 1, "urgent mid-turn appends");
+  assert.equal(midHarness.h.submits.length, 0, "normal mid-turn defers");
+  assert.ok($mid.session.busy === undefined, "fake host has no session.busy (real API)");
+  resetEnv();
+
+  // After turn.complete: normal mail submits again.
+  freshEnv();
+  const after = harnessSpawn([frameLine({ event_id: "evt-after" })]);
+  const regAfter = (await import("../hooks/register.ts?turn-after")).register;
+  regAfter((name, fn) => { after.h.handlers[name] = fn; }, { spawn: after.spawn });
+  const $after = make$(after.h);
+  await after.h.handlers["session.start"]($after, {}, async (e) => e);
+  await after.h.handlers["turn.start"]($after, {}, async (e) => e);
+  await after.h.handlers["turn.complete"]($after, {}, async (e) => e);
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(after.h.submits.length, 1, "normal mail submits once idle");
   resetEnv();
 });
 

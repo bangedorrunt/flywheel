@@ -1499,6 +1499,10 @@ enum Commands {
         /// client protocolVersion to negotiate (--probe only)
         #[arg(long)]
         client_version: Option<String>,
+        /// self-driving mode: poll internally and write notifications to stdout
+        /// with no stdin (bd-krzqu; Claude plugin spawn input is a one-shot string)
+        #[arg(long)]
+        follow: bool,
     },
     /// Auto-wire the toron MCP server into the agent MCP configs
     /// (opencode ~/.config/opencode/opencode.json, pi ~/.pi/agent/mcp.json,
@@ -3887,12 +3891,13 @@ fn main() {
             subscription,
             probe,
             client_version,
+            follow,
         }) => {
             if *probe {
                 print_json(&events_bridge::initialize_result(client_version.as_deref()));
                 Ok(())
             } else {
-                cmd_mcp_events(&cfg, subscription)
+                cmd_mcp_events(&cfg, subscription, *follow)
             }
         }
         Some(Commands::SetupMcp {
@@ -14461,7 +14466,53 @@ fn cmd_events_token_rotate(
 /// JSON-RPC line protocol. The events transport is a port; Phase B (bd-o4bgx)
 /// supplies the real toron client. Phase A wires a no-op transport so the
 /// protocol seam is real and testable without a live toron events endpoint.
-fn cmd_mcp_events(_cfg: &Config, subscription: &str) -> Result<()> {
+/// One poll step: emit the fresh notifications and journal the cursor. Shared
+/// by the stdin JSON-RPC loop and `--follow` (bd-krzqu) so the two doors cannot
+/// drift on emit-first/journal-after.
+fn mcp_events_poll_once(
+    transport: &dyn events_bridge::EventsTransport,
+    subscription: &str,
+    deduper: &mut events_bridge::Deduper,
+    cursor: &mut String,
+    state_path: &std::path::Path,
+    out: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    let timing = events_bridge::BridgeTiming {
+        last_hb_ms: 0,
+        now_ms: 0,
+        interval_ms: 1000,
+        attempt: 0,
+        rand_unit: 0.0,
+    };
+    match events_bridge::bridge_step(transport, subscription, deduper, cursor, &timing) {
+        Ok(step) => {
+            for notice in step.notifications {
+                if events_bridge::should_ring(&config::state_dir(), &notice) {
+                    writeln!(out, "{}", notice)?;
+                }
+            }
+            out.flush()?;
+            if step
+                .cmds
+                .iter()
+                .any(|c| matches!(c, events_bridge::BridgeCmd::JournalCursor(_)))
+                && let Err(e) = std::fs::write(state_path, &cursor)
+            {
+                eprintln!("flywheel mcp-events: cursor journal failed: {e}");
+            }
+            if step.dead {
+                eprintln!(
+                    "flywheel mcp-events: stream liveness stale; reconnect in {:?}ms",
+                    step.reconnect_ms
+                );
+            }
+        }
+        Err(e) => eprintln!("flywheel mcp-events: poll failed: {e}"),
+    }
+    Ok(())
+}
+
+fn cmd_mcp_events(_cfg: &Config, subscription: &str, follow: bool) -> Result<()> {
     use std::io::{BufRead, Write};
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -14512,6 +14563,25 @@ fn cmd_mcp_events(_cfg: &Config, subscription: &str) -> Result<()> {
         }
     };
     let mut deduper = events_bridge::Deduper::new(1024);
+
+    // bd-krzqu: the Claude plugin's process.spawn takes a one-shot stdin STRING
+    // that is closed after writing, so it cannot drive a line-based JSON-RPC
+    // server. --follow drives the same poll internally and writes only the
+    // notifications/claude/channel frames to stdout; no stdin, no request ids.
+    if follow {
+        loop {
+            mcp_events_poll_once(
+                &*transport,
+                subscription,
+                &mut deduper,
+                &mut cursor,
+                &state_path,
+                &mut out,
+            )?;
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+        }
+    }
+
     for line in stdin.lock().lines() {
         let line = line?;
         let req: serde_json::Value = match serde_json::from_str(&line) {
@@ -14571,49 +14641,14 @@ fn cmd_mcp_events(_cfg: &Config, subscription: &str) -> Result<()> {
                 out.flush()?;
             }
             "events/poll" => {
-                let timing = events_bridge::BridgeTiming {
-                    last_hb_ms: 0,
-                    now_ms: 0,
-                    interval_ms: 1000,
-                    attempt: 0,
-                    rand_unit: 0.0,
-                };
-                match events_bridge::bridge_step(
+                mcp_events_poll_once(
                     &*transport,
                     subscription,
                     &mut deduper,
                     &mut cursor,
-                    &timing,
-                ) {
-                    Ok(step) => {
-                        // Emit-first, journal-after: a crash between the two
-                        // replays from the old cursor and eventId dedupe absorbs
-                        // the duplicate (ADR-0039 D8).
-                        for notice in step.notifications {
-                            // bd-o1z4m: one shared rung set with the doorbell
-                            // fallback, keyed by bus event id.
-                            if events_bridge::should_ring(&config::state_dir(), &notice) {
-                                writeln!(out, "{}", notice)?;
-                            }
-                        }
-                        out.flush()?;
-                        if step
-                            .cmds
-                            .iter()
-                            .any(|c| matches!(c, events_bridge::BridgeCmd::JournalCursor(_)))
-                            && let Err(e) = std::fs::write(&state_path, &cursor)
-                        {
-                            eprintln!("flywheel mcp-events: cursor journal failed: {e}");
-                        }
-                        if step.dead {
-                            eprintln!(
-                                "flywheel mcp-events: stream liveness stale; reconnect in {:?}ms",
-                                step.reconnect_ms
-                            );
-                        }
-                    }
-                    Err(e) => eprintln!("flywheel mcp-events: poll failed: {e}"),
-                }
+                    &state_path,
+                    &mut out,
+                )?;
                 let mut msg = serde_json::json!({ "jsonrpc": "2.0", "result": {} });
                 if let Some(rid) = id {
                     msg["id"] = rid;
