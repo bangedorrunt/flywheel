@@ -15,11 +15,24 @@ import { register, type Piece, type Child, type SpawnFn } from "../hooks/registe
 const PROXY_FRAME = JSON.parse(
   readFileSync(new URL("./fixtures/proxy-notice.json", import.meta.url), "utf8"),
 );
+// bd-cdite: the urgent frame is ALSO a pinned capture of notice_to_rpc, not a
+// hand-written importance field. A Rust test asserts both fixtures match the
+// real renderer.
+const URGENT_FRAME = JSON.parse(
+  readFileSync(new URL("./fixtures/proxy-notice-urgent.json", import.meta.url), "utf8"),
+);
 const frameLine = (over: Record<string, unknown> = {}) => JSON.stringify({
   ...PROXY_FRAME,
   params: {
     ...PROXY_FRAME.params,
     meta: { ...PROXY_FRAME.params.meta, ...over },
+  },
+});
+const urgentLine = (id = "evt-urgent-1") => JSON.stringify({
+  ...URGENT_FRAME,
+  params: {
+    ...URGENT_FRAME.params,
+    meta: { ...URGENT_FRAME.params.meta, event_id: id },
   },
 });
 
@@ -90,7 +103,7 @@ test("decodeFrame reads the real proxy frame, not an occurrence", () => {
   assert.equal(mail.hint, PROXY_FRAME.params.content);
   assert.equal(mail.project, "");
   assert.equal(mail.senderPin, "");
-  const urgent = decodeFrame(frameLine({ event_id: "evt-2", importance: "urgent" }), "ScarletCove")!;
+  const urgent = decodeFrame(urgentLine("evt-2"), "ScarletCove")!;
   assert.equal(urgent.urgent, true);
   assert.equal(decodeFrame(frameLine({ event_id: "evt-3", subscription_id: "ScarletCove" }), "OtherPin"), null);
   assert.equal(decodeFrame(JSON.stringify({ method: "notifications/events/event" }), "ScarletCove"), null);
@@ -154,7 +167,7 @@ test("one proxy frame produces exactly one submit with the proxy's own hint", as
   const { spawn, h } = harnessSpawn([
     frameLine(),                                          // evt-proxy-1
     frameLine(),                                          // duplicate: claimed once
-    frameLine({ event_id: "evt-2", importance: "urgent" }), // urgent: append
+    urgentLine("evt-2"), // urgent: append
   ]);
   const { register: reg } = await import("../hooks/register.ts?mail");
   reg((name, fn) => { h.handlers[name] = fn; }, { spawn });
@@ -191,7 +204,7 @@ test("turn.start defers mid-turn; turn.complete restores idle", async () => {
     const spawn: SpawnFn = () => ({
       stdout: (async function* (): AsyncGenerator<Piece> {
         await gate;
-        for (const f of [frameLine({ event_id: "evt-mid", importance: "urgent" }), frameLine({ event_id: "evt-normal" })]) {
+        for (const f of [urgentLine("evt-mid"), frameLine({ event_id: "evt-normal" })]) {
           yield { stream: "stdout", text: f + "\n" };
         }
       })(),
