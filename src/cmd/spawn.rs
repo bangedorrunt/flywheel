@@ -3776,8 +3776,8 @@ mod spawn_profile_plan_tests {
         );
         assert_eq!(
             env_pin.as_deref(),
-            Some("opencode/big-pickle"),
-            "the implied cheap slot must still reach the pane, by env"
+            None,
+            "bd-iu00a: the implied cheap slot is now harness-default, so no env pin"
         );
         let (args, env_pin) = bare_model_launch(
             "opencode",
@@ -8007,7 +8007,19 @@ mod plan_patch_spawn_tests {
             .iter()
             .find(|s| s.role == "opencode")
             .expect("opencode seat");
-        assert!(r.model.is_none(), "other roles untouched: {:?}", r.model);
+        // bd-iu00a: a bare open seat now carries harness-default by default.
+        // The patch must not leak into it as from:user — that is the real
+        // 'untouched' contract.
+        assert_eq!(
+            r.model.as_ref().expect("model field").value,
+            crate::models::HARNESS_DEFAULT,
+            "other roles unchanged by the patch: {:?}",
+            r.model
+        );
+        assert_eq!(
+            r.model.as_ref().expect("model field").from,
+            crate::swarm_plan::Provenance::HarnessDefault
+        );
     }
 
     /// Rework defect 1: a model patch must reach the launch argv/env through
@@ -8475,9 +8487,9 @@ mod resolver_property_tests {
             &test_prefs(&[]),
             &[bare_item("pi")],
             "",
-            "s/m",
-            Provenance::Slot,
-            "slot wins with no user or preference",
+            crate::models::HARNESS_DEFAULT,
+            Provenance::HarnessDefault,
+            "bd-iu00a: the IMPLIED slot yields to harness-default; an explicit @slot still wins",
         );
         v7.check(
             &test_prefs(&[("coder.model", "a/m")]),
