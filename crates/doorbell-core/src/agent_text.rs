@@ -220,6 +220,15 @@ pub fn coordination_notice(
     )
 }
 
+/// One plain-English line naming the peer to contact about paths they hold
+/// (bd-pezon). The captain is copied only on silence or a shared-build break.
+pub fn peer_contact_notice(holder: &str, paths: &[String]) -> String {
+    format!(
+        "{holder} holds {}: mail {holder} first (flywheel collab), and copy the captain only if they stay silent or the shared build breaks",
+        paths.join(", ")
+    )
+}
+
 /// Every canonical golden string. The lint test scans these plus the source
 /// of this module, so a jargon token cannot enter agent-facing text unnoticed.
 pub fn golden_strings() -> Vec<String> {
@@ -318,6 +327,24 @@ mod tests {
         assert!(
             notice.to_ascii_lowercase().contains("read it with"),
             "{notice}"
+        );
+    }
+
+    /// bd-pezon: a peer contact line is plain English and names both holder
+    /// and paths; it is not a wake class so it has its own test.
+    #[test]
+    fn peer_contact_notice_is_plain_self_contained_english() {
+        let line = peer_contact_notice("BoldCliff", &["src/a.rs".into(), "src/b.rs".into()]);
+        for token in JARGON_TOKENS {
+            assert!(!line.contains(token), "peer line has {token:?}: {line}");
+        }
+        assert!(
+            line.contains("BoldCliff") && line.contains("src/a.rs") && line.contains("src/b.rs")
+        );
+        assert!(line.contains("mail BoldCliff first"), "{line}");
+        assert!(
+            line.contains("copy the captain only if they stay silent"),
+            "{line}"
         );
     }
 

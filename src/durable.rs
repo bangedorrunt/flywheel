@@ -2552,6 +2552,56 @@ pub fn build_brief(
     })
 }
 
+/// The peer contacts for a project's live file reservations, rendered in
+/// plain English (bd-pezon). Best effort: an unreachable toron degrades to
+/// the generic peer-first rule, never to silence. Grouped by holder so one
+/// path area produces one line, and deduped by path.
+fn peer_contacts_section(project: &str) -> String {
+    let toron = std::env::var("FLYWHEEL_TORON_BIN").unwrap_or_else(|_| "toron".into());
+    let me = std::env::var("AGENT_NAME").unwrap_or_default();
+    let doc = Command::new(toron)
+        .args(["reserve", "list", "--project", project, "--json"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok());
+    render_peer_contacts(doc.as_ref(), &me)
+}
+
+/// Pure peer grouping + rendering. A test passes the reservation board JSON
+/// directly; no ambient toron or process env is touched (bd-pezon).
+fn render_peer_contacts(doc: Option<&Value>, me: &str) -> String {
+    let mut by_holder: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    if let Some(rows) = doc
+        .and_then(|d| d.get("reservations"))
+        .and_then(Value::as_array)
+    {
+        for row in rows {
+            let (Some(holder), Some(path)) = (
+                row.get("holder").and_then(Value::as_str),
+                row.get("path").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            if holder == me || path.is_empty() {
+                continue;
+            }
+            let entry = by_holder.entry(holder.to_string()).or_default();
+            if !entry.contains(&path.to_string()) {
+                entry.push(path.to_string());
+            }
+        }
+    }
+    let mut lines = vec!["COORDINATION: mail holder first; captain if silent.".to_string()];
+    for (holder, paths) in by_holder {
+        lines.push(format!(
+            "  {}",
+            doorbell_core::agent_text::peer_contact_notice(&holder, &paths)
+        ));
+    }
+    lines.join("\n")
+}
+
 /// Fill the full brief template. No cap check here — [`build_brief`] owns the
 /// degrade decision.
 fn fill_brief(id: &str, title: &str, project: &str, resume: bool) -> String {
@@ -2564,6 +2614,7 @@ fn fill_brief(id: &str, title: &str, project: &str, resume: bool) -> String {
         .replace("{goal}", &goal)
         .replace("{id}", id)
         .replace("{project}", project)
+        .replace("{peers}", &peer_contacts_section(project))
 }
 
 /// The pointer brief (bd-dispatch-cap-conditioning-l7jh): the degraded form
@@ -2593,6 +2644,7 @@ TIMEBOX ~90 min; expiry → partial findings + deviations, never a silent extens
 FORBIDDEN DO NOT create new beads — report scope gaps in the thread. Never force-unlock a peer's reservation. No worktree. Stay inside SCOPE.
 REPORT status; commit sha (commit BEFORE close; bead id {id} IN the message); verdict; what you ran; deviations; PRINCIPLES. Then mail the captain thread_id={id}, subject [{id}] done, same fields — one report, two channels (close reason durable; mail = captain's).
 PRINCIPLES each line `<principle-name> — <the decision it changed>`; names only. REQUIRED for priority <= 2 beads — a name with no decision clause is a skip (cargo-cult citation).
+{peers}
 STANDING {project}/.flywheel/standing-orders.md + ~/.config/flywheel/standing-orders.md (lifecycle: claim → reserve → announce → execute → verify → close → sync → commit) — BY PATH ONLY.
 DIRT POLICY dirt outside source/, tests/, benches/, Cargo.toml, Cargo.lock, and pinned toolchains blocks a receipt; .beads/, .flywheel/, and editor artifacts never do (note + proceed); anything else dirty: post-and-stop.
 CONTRACTS renew your own file reservations (toron `renew_file_reservations`; the orchestrator cannot renew on your behalf). When a message has ack_required=true, call `acknowledge_message` after acting — the orchestrator cannot ack on your behalf. Above ~80% context: write {"context_pct": <pct>, "ts": "<now RFC3339>"} to .flywheel/agent-state/{AGENT_NAME}.json (best-effort), finish + sync this bead, reply exactly CONTEXT_LIMIT."#;
@@ -2603,6 +2655,7 @@ CONTRACTS renew your own file reservations (toron `renew_file_reservations`; the
 const POINTER_TEMPLATE: &str = r#"GOAL {verb} {id}: full brief OVER CAP — read it with `br show {id}` (acceptance criteria + ## VERIFY fence).
 SCOPE may-write only paths you hold an exclusive reservation on (reason={id}).
 VERIFY run the bead's ## VERIFY command; REPORT status, commit sha (bead id {id} IN the commit message), verdict, what you ran, deviations, PRINCIPLES cited; then mail the captain on thread_id={id}, subject [{id}] done.
+{peers}
 STANDING {project}/.flywheel/standing-orders.md (lifecycle) — by path only.
 FORBIDDEN no new beads; never force-unlock a peer's reservation; no worktree; stay inside SCOPE. Above ~80% context → CONTEXT_LIMIT per standing orders."#;
 
@@ -10197,6 +10250,34 @@ mod tests {
 
     fn resume_brief(id: &str, title: &str) -> String {
         build_brief(id, title, "flywheel", true).expect("brief fits the dispatch cap")
+    }
+
+    /// bd-pezon: the peer section names the holder of each reserved path and
+    /// tells the crew to mail them first. Only the peer's own pin is skipped.
+    #[test]
+    fn peer_section_names_holders_and_skips_self() {
+        let board = json!({
+            "reservations": [
+                {"holder": "BoldCliff", "path": "src/cmd/memory.rs"},
+                {"holder": "BoldCliff", "path": "src/cmd/crew.rs"},
+                {"holder": "ScarletCove", "path": "src/durable.rs"},
+            ]
+        });
+        let section = render_peer_contacts(Some(&board), "ScarletCove");
+        assert!(
+            section.contains("BoldCliff holds src/cmd/memory.rs"),
+            "{section}"
+        );
+        assert!(section.contains("src/cmd/crew.rs"), "{section}");
+        assert!(section.contains("mail BoldCliff first"), "{section}");
+        assert!(
+            section.contains("copy the captain only if they stay silent"),
+            "{section}"
+        );
+        assert!(!section.contains("ScarletCove holds"), "{section}");
+        // An unreachable board still carries the peer-first rule.
+        let empty = render_peer_contacts(None, "ScarletCove");
+        assert!(empty.contains("COORDINATION"), "{empty}");
     }
 
     /// ADR-0019 Spec 2: a resume brief is the same filled template with the
