@@ -17,10 +17,15 @@ pub(crate) fn looks_like_pane_id(pin: &str) -> bool {
 }
 
 pub(crate) fn fleet_joinable(dispatcher: &str, pins: &[crate::snapshot::PinRow]) -> bool {
-    dispatcher == "up"
-        || pins
-            .iter()
-            .any(|pin| !looks_like_pane_id(&pin.pin) && !pin.pin.is_empty())
+    let any_named = pins
+        .iter()
+        .any(|pin| !looks_like_pane_id(&pin.pin) && !pin.pin.is_empty());
+    if !any_named {
+        return dispatcher == "up";
+    }
+    // bd-s109e: reboot-killed panes leave the registry intact but are absent.
+    pins.iter()
+        .any(|pin| !looks_like_pane_id(&pin.pin) && !pin.pin.is_empty() && pin.status != "dead")
 }
 
 pub(crate) fn coalition_is_live(created_at: &str, now_unix: u64) -> bool {
@@ -76,6 +81,43 @@ pub(crate) fn bearings_line(snap: &Snapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seat(name: &str, status: &str) -> crate::snapshot::PinRow {
+        crate::snapshot::PinRow {
+            pin: name.into(),
+            status: status.into(),
+            verdict: String::new(),
+            source: "hc".into(),
+            since: String::new(),
+            bead: None,
+            reservations: Vec::new(),
+            pane_id: format!("{name}-pane"),
+            kind: None,
+            cwd: None,
+            pending: false,
+            npub: None,
+            last_active_ts_us: None,
+            identity_pin: None,
+            observed_pin: None,
+        }
+    }
+
+    #[test]
+    fn dead_registered_seats_are_not_a_joinable_fleet() {
+        let dead = vec![
+            seat("CrewOne", "dead"),
+            seat("CrewTwo", "dead"),
+            seat("CrewThree", "dead"),
+        ];
+        assert!(
+            !fleet_joinable("up", &dead),
+            "a dispatcher with only dead seats is not a fleet to join"
+        );
+        let mut mixed = dead;
+        mixed.push(seat("CrewLive", "idle"));
+        assert!(fleet_joinable("up", &mixed), "one live seat is joinable");
+        assert!(fleet_joinable("absent", &mixed));
+    }
 
     #[test]
     fn bearings_are_deterministic_and_surface_degradation() {
