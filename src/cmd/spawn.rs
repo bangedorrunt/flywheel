@@ -1316,7 +1316,7 @@ pub(crate) fn ensure_seat_events_token<C: crate::events_tokens::TokenCli>(
     let token_path = et::token_path(state_dir, project, pin);
     let journal = state_dir.join("events-token-journal.jsonl");
     if token_path.is_file()
-        && let Ok((hash, expires_us)) = et::last_minted(&journal)
+        && let Ok((hash, expires_us)) = et::last_minted(&journal, project, pin)
     {
         let state = et::TokenState {
             hash,
@@ -3673,7 +3673,17 @@ mod spawn_profile_plan_tests {
             calls: std::cell::Cell::new(0),
         };
         let now_us = 5_000_000i64;
-        for pin in ["PiSeat", "OpencodeSeat", "GeminiSeat"] {
+        // Through the same gate the spawn loop uses: doors get tokens,
+        // other harnesses keep the doorbell fallback and no file.
+        for (kind, pin) in [
+            ("pi", "PiSeat"),
+            ("opencode", "OpencodeSeat"),
+            ("gemini", "GemSeat"),
+            ("claude", "ClaudeSeat"),
+        ] {
+            if !super::has_events_door(kind) {
+                continue;
+            }
             let outcome =
                 super::ensure_seat_events_token(&cli, &state, "demo", pin, now_us).expect("mint");
             assert_eq!(outcome, super::SeatTokenOutcome::Minted, "{pin}");
@@ -3715,7 +3725,8 @@ mod spawn_profile_plan_tests {
         let seats = [
             ("pi", "PiSeat"),
             ("opencode", "OpencodeSeat"),
-            ("gemini", "GeminiSeat"),
+            ("gemini", "GemSeat"),
+            ("claude", "ClaudeSeat"),
         ]
         .into_iter()
         .map(|(harness, pin)| {
@@ -3725,11 +3736,60 @@ mod spawn_profile_plan_tests {
         .collect::<Vec<_>>();
         let enabled = crate::config::Config::default().doorbell_toron_events();
         assert!(enabled, "minted tokens switch the default pump on");
+        assert!(
+            !crate::events_tokens::token_path(&state, "demo", "ClaudeSeat").is_file(),
+            "no door, no token file"
+        );
         assert_eq!(
             crate::events_source::seats_to_pump(enabled, &seats),
-            vec!["GeminiSeat".to_string()],
+            vec!["GemSeat".to_string()],
             "the pump covers the no-door seat once its token exists (pi/opencode ride their own config)"
         );
+    }
+
+    /// bd-u7m1y: re-spawning one seat must never revoke another seat's
+    /// token. Mint B then A (A's row is the global last), expire both,
+    /// re-ensure B: only B rotates — A's file and hash are untouched.
+    #[test]
+    fn respawning_one_seat_never_revokes_another_seat_token() {
+        let _home = crate::config::test_state_home();
+        let state = crate::config::state_dir();
+        let cli = FakeMint {
+            calls: std::cell::Cell::new(0),
+        };
+        let t0 = 5_000_000i64;
+        let late = t0 + (crate::events_tokens::PIN_TTL_SECS as i64 + 10) * 1_000_000;
+        for pin in ["SeatB", "SeatA"] {
+            let outcome =
+                super::ensure_seat_events_token(&cli, &state, "demo", pin, t0).expect("mint");
+            assert_eq!(outcome, super::SeatTokenOutcome::Minted, "{pin}");
+        }
+        let file_a0 =
+            std::fs::read_to_string(crate::events_tokens::token_path(&state, "demo", "SeatA"))
+                .expect("A token file");
+        let hash_a = crate::events_tokens::token_hash(&file_a0);
+        // Re-spawn B with both tokens expired: only B may rotate.
+        let outcome =
+            super::ensure_seat_events_token(&cli, &state, "demo", "SeatB", late).expect("re");
+        assert_eq!(outcome, super::SeatTokenOutcome::Rotated);
+        assert_eq!(
+            std::fs::read_to_string(crate::events_tokens::token_path(&state, "demo", "SeatA"))
+                .expect("A token file"),
+            file_a0,
+            "A keeps its plaintext"
+        );
+        let journal =
+            std::fs::read_to_string(state.join("events-token-journal.jsonl")).expect("journal");
+        assert!(
+            !journal
+                .lines()
+                .any(|l| l.contains("revok") && l.contains(&hash_a)),
+            "A's hash is never revoked"
+        );
+        let file_b =
+            std::fs::read_to_string(crate::events_tokens::token_path(&state, "demo", "SeatB"))
+                .expect("B token file");
+        assert_ne!(file_b, file_a0, "B got a fresh token");
     }
 
     use crate::{

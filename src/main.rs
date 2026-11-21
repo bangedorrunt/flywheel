@@ -14456,7 +14456,7 @@ fn cmd_events_token_rotate(
         bin: std::env::var("TORON_BIN").unwrap_or_else(|_| "toron".to_string()),
     };
     let now_us = chrono::Utc::now().timestamp_micros();
-    let (old_hash, expires_us) = events_tokens::last_minted(journal)
+    let (old_hash, expires_us) = events_tokens::last_minted(journal, project, pin)
         .map_err(|e| anyhow::anyhow!("{e}: {}", journal.display()))?;
     let state = events_tokens::TokenState {
         hash: old_hash.clone(),

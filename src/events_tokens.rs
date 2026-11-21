@@ -85,6 +85,8 @@ pub enum TokenEvent {
         ttl_secs: u64,
     },
     Minted {
+        pin: String,
+        project: String,
         hash: String,
         expires_us: i64,
     },
@@ -107,9 +109,15 @@ impl TokenEvent {
                 "mint-intent",
                 json!({"pin": pin, "project": project, "ttl_secs": ttl_secs}),
             ),
-            Self::Minted { hash, expires_us } => {
-                ("minted", json!({"hash": hash, "expires_us": expires_us}))
-            }
+            Self::Minted {
+                pin,
+                project,
+                hash,
+                expires_us,
+            } => (
+                "minted",
+                json!({"pin": pin, "project": project, "hash": hash, "expires_us": expires_us}),
+            ),
             Self::RevokeIntent { hash } => ("revoke-intent", json!({"hash": hash})),
             Self::Revoked { hash } => ("revoked", json!({"hash": hash})),
         };
@@ -247,6 +255,8 @@ pub fn mint_and_store<C: TokenCli>(
     write_token_file(token_path, &plaintext)?;
     let hash = token_hash(&plaintext);
     let done = TokenEvent::Minted {
+        pin: pin.to_string(),
+        project: project.to_string(),
         hash: hash.clone(),
         expires_us: now_us.saturating_add((ttl_secs as i64).saturating_mul(1_000_000)),
     }
@@ -295,9 +305,15 @@ pub fn rotate<C: TokenCli>(
     Ok(fresh)
 }
 
-/// Read the last `minted` row's hash and expiry from the journal. The rotation
-/// tick uses this as the source of truth for what to revoke and when.
-pub fn last_minted(journal_path: &Path) -> Result<(String, i64), String> {
+/// Read the last `minted` row's hash and expiry for one pin from the
+/// journal (bd-u7m1y): a global last row belongs to whoever minted last,
+/// so revoking it can kill a different running seat. Rows predating the
+/// per-pin field carry no pin and never match — re-mint heals those.
+pub fn last_minted(
+    journal_path: &Path,
+    project: &str,
+    agent: &str,
+) -> Result<(String, i64), String> {
     let body = std::fs::read_to_string(journal_path)
         .map_err(|e| format!("token journal read failed: {e}"))?;
     for line in body.lines().rev() {
@@ -305,6 +321,11 @@ pub fn last_minted(journal_path: &Path) -> Result<(String, i64), String> {
             continue;
         };
         if row.get("op").and_then(Value::as_str) != Some("minted") {
+            continue;
+        }
+        if row.get("pin").and_then(Value::as_str) != Some(agent)
+            || row.get("project").and_then(Value::as_str) != Some(project)
+        {
             continue;
         }
         let hash = row
@@ -317,7 +338,9 @@ pub fn last_minted(journal_path: &Path) -> Result<(String, i64), String> {
             .ok_or_else(|| "minted row has no expires_us".to_string())?;
         return Ok((hash.to_string(), expires));
     }
-    Err("no minted row in token journal".to_string())
+    Err(format!(
+        "no minted row in token journal for {project}/{agent}"
+    ))
 }
 
 /// Whether any per-pin events token file exists under the state dir
