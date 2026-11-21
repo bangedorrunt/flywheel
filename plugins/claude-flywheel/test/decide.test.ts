@@ -176,6 +176,18 @@ test("one proxy frame produces exactly one submit with the proxy's own hint", as
   resetEnv();
 });
 
+test("multiple frames in one stdout chunk are all decoded", async () => {
+  freshEnv();
+  const two = frameLine() + "\n" + frameLine({ event_id: "evt-second" });
+  const { spawn, h } = harnessSpawn([two]);
+  const { register: reg } = await import("../hooks/register.ts?chunk");
+  reg((name, fn) => { h.handlers[name] = fn; }, { spawn });
+  await h.handlers["session.start"](make$(h), {}, async (e) => e);
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(h.submits.length, 2, "both frames in the chunk must be delivered");
+  resetEnv();
+});
+
 test("a clean child exit counts as a failure and reconnects", async () => {
   freshEnv();
   const { spawn, h } = harnessSpawn([]); // empty stdout: clean EOF
