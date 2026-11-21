@@ -112,6 +112,7 @@ TESTS=(
     tests/live_event_poll_parity.rs
     tests/live_serialize_worktree.rs
     tests/live_opencode_api_wake.rs
+    tests/live_events_delivery.rs
 )
 
 resolve_tool() {
@@ -237,6 +238,9 @@ export FLYWHEEL_LIVE_BLOCK="$BLOCK_ID"
 export FLYWHEEL_LIVE_PIN="$PIN"
 export FLYWHEEL_LIVE_PROJECT="$PROJECT"
 export FLYWHEEL_LIVE_AS="$AS"
+# bd-znczi: the events-delivery witness reads the doorbell's per-pin events
+# journal and ring journal from the daemon state dir (toron-core's state_dir).
+export FLYWHEEL_LIVE_STATE_DIR="${FLYWHEEL_LIVE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/toron}"
 export TORON_BIN
 
 # bd-oo7zi: the operator-typing guard needs a REAL harness pane: a bare zsh box
