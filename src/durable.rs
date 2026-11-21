@@ -2539,7 +2539,24 @@ pub fn build_brief(
     project: &str,
     resume: bool,
 ) -> std::result::Result<String, BriefError> {
-    let full = fill_brief(id, title, project, resume);
+    // Live edge only. Tests use build_brief_with with a fixed board so no
+    // test shells toron (bd-pezon follow-up).
+    let pin = std::env::var("AGENT_NAME").unwrap_or_default();
+    let board = live_reservation_doc(project);
+    build_brief_with(id, title, project, resume, &pin, board.as_ref())
+}
+
+/// Pure brief build: the target pin and reservation board are supplied by the
+/// caller, so a test never reads the operator's live reservations (bd-pezon).
+pub fn build_brief_with(
+    id: &str,
+    title: &str,
+    project: &str,
+    resume: bool,
+    pin: &str,
+    board: Option<&Value>,
+) -> std::result::Result<String, BriefError> {
+    let full = fill_brief(id, title, project, resume, pin, board);
     if full.len() <= DISPATCH_PROMPT_CAP {
         return Ok(full);
     }
@@ -2556,16 +2573,14 @@ pub fn build_brief(
 /// plain English (bd-pezon). Best effort: an unreachable toron degrades to
 /// the generic peer-first rule, never to silence. Grouped by holder so one
 /// path area produces one line, and deduped by path.
-fn peer_contacts_section(project: &str) -> String {
+fn live_reservation_doc(project: &str) -> Option<Value> {
     let toron = std::env::var("FLYWHEEL_TORON_BIN").unwrap_or_else(|_| "toron".into());
-    let me = std::env::var("AGENT_NAME").unwrap_or_default();
-    let doc = Command::new(toron)
+    Command::new(toron)
         .args(["reserve", "list", "--project", project, "--json"])
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok());
-    render_peer_contacts(doc.as_ref(), &me)
+        .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok())
 }
 
 /// Pure peer grouping + rendering. A test passes the reservation board JSON
@@ -2604,7 +2619,14 @@ fn render_peer_contacts(doc: Option<&Value>, me: &str) -> String {
 
 /// Fill the full brief template. No cap check here — [`build_brief`] owns the
 /// degrade decision.
-fn fill_brief(id: &str, title: &str, project: &str, resume: bool) -> String {
+fn fill_brief(
+    id: &str,
+    title: &str,
+    project: &str,
+    resume: bool,
+    pin: &str,
+    board: Option<&Value>,
+) -> String {
     let goal = if resume {
         format!("Resume {id}: {title}")
     } else {
@@ -2614,7 +2636,7 @@ fn fill_brief(id: &str, title: &str, project: &str, resume: bool) -> String {
         .replace("{goal}", &goal)
         .replace("{id}", id)
         .replace("{project}", project)
-        .replace("{peers}", &peer_contacts_section(project))
+        .replace("{peers}", &render_peer_contacts(board, pin))
 }
 
 /// The pointer brief (bd-dispatch-cap-conditioning-l7jh): the degraded form
@@ -2681,8 +2703,34 @@ fn queue_brief(
     project: &str,
     resume: bool,
     front: bool,
+    pin: &str,
 ) {
-    match build_brief(id, title, project, resume) {
+    // The one live edge: read the board here, never inside a test-driven fold.
+    let board = live_reservation_doc(project);
+    queue_brief_with(
+        queue,
+        id,
+        title,
+        project,
+        resume,
+        front,
+        pin,
+        board.as_ref(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // the brief inputs are flat call-site data
+fn queue_brief_with(
+    queue: &mut Vec<String>,
+    id: &str,
+    title: &str,
+    project: &str,
+    resume: bool,
+    front: bool,
+    pin: &str,
+    board: Option<&Value>,
+) {
+    match build_brief_with(id, title, project, resume, pin, board) {
         Ok(b) => {
             if front {
                 queue.insert(0, b);
@@ -6690,6 +6738,7 @@ async fn swarm_loop(
                     &params.project,
                     true,
                     false,
+                    bead.assignee.as_deref().unwrap_or(""),
                 );
                 assigned.push(bead.id.clone());
             }
@@ -6897,6 +6946,7 @@ async fn swarm_loop(
                         &params.project,
                         false,
                         false,
+                        bead.assignee.as_deref().unwrap_or(""),
                     );
                     assigned.push(bead.id.clone());
                 }
@@ -6999,6 +7049,7 @@ async fn swarm_loop(
                                     &params.project,
                                     false,
                                     true,
+                                    "",
                                 );
                             }
                         }
@@ -7061,6 +7112,7 @@ async fn swarm_loop(
                                     &params.project,
                                     true,
                                     true,
+                                    "",
                                 );
                             }
                         }
@@ -10242,6 +10294,24 @@ mod tests {
         assert_eq!(f.get("unk"), Some(&1));
     }
 
+    // bd-pezon follow-up: tests must not call the live toron edge. Shadow the
+    // imported build_brief with a fixed reservation board and explicit pin.
+    fn build_brief(
+        id: &str,
+        title: &str,
+        project: &str,
+        resume: bool,
+    ) -> std::result::Result<String, BriefError> {
+        super::build_brief_with(
+            id,
+            title,
+            project,
+            resume,
+            "ScarletCove",
+            Some(&json!({ "reservations": [] })),
+        )
+    }
+
     /// ADR-0019 Spec 2 test helpers: filled briefs (fresh + resume) that fit
     /// the dispatch cap.
     fn brief(id: &str, title: &str) -> String {
@@ -10278,6 +10348,25 @@ mod tests {
         // An unreachable board still carries the peer-first rule.
         let empty = render_peer_contacts(None, "ScarletCove");
         assert!(empty.contains("COORDINATION"), "{empty}");
+    }
+
+    /// bd-pezon follow-up: the RECEIVING pin is skipped, not the builder's
+    /// ambient identity. A crew must never be told to mail itself.
+    #[test]
+    fn a_brief_skips_the_target_pin_not_the_builder() {
+        let board = json!({
+            "reservations": [
+                {"holder": "BoldCliff", "path": "src/a.rs"},
+                {"holder": "ScarletCove", "path": "src/b.rs"},
+            ]
+        });
+        let brief =
+            build_brief_with("bd-1", "title", "proj", false, "BoldCliff", Some(&board)).unwrap();
+        assert!(brief.contains("ScarletCove holds src/b.rs"), "{brief}");
+        assert!(
+            !brief.contains("BoldCliff holds"),
+            "told to mail itself: {brief}"
+        );
     }
 
     /// ADR-0019 Spec 2: a resume brief is the same filled template with the
@@ -10621,7 +10710,7 @@ mod tests {
         );
         let mut q: Vec<String> = Vec::new();
         let title = "y".repeat(DISPATCH_PROMPT_CAP);
-        queue_brief(&mut q, id, &title, "proj", false, false);
+        queue_brief_with(&mut q, id, &title, "proj", false, false, "", None);
         assert_eq!(q.len(), 1, "over-cap dispatch stays queued (pointer brief)");
         assert!(q[0].starts_with("GOAL "), "pointer keeps the GOAL contract");
         assert!(q[0].contains("OVER CAP") && q[0].contains(id));
