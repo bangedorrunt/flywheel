@@ -155,12 +155,10 @@ fn replay_transcript_drives_real_host() {
         "only the idle addressed pin prompts, once per urgent ring, got {injects}"
     );
     for r in rows {
+        let line = r["line"].as_str().unwrap_or_default();
         assert!(
-            r["line"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("[doorbell]"),
-            "urgent ring must render a doorbell pull line, got {r}"
+            line.starts_with(doorbell_core::agent_text::WAKE_PREFIX) && line.contains("toron next"),
+            "urgent ring must render a wake line that names the pull command, got {r}"
         );
     }
 
