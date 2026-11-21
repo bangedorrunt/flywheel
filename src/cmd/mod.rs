@@ -18,6 +18,7 @@ pub(crate) mod daemon;
 pub(crate) mod debate;
 pub(crate) mod doorbell;
 pub(crate) mod history;
+pub(crate) mod integration;
 pub(crate) mod internal;
 pub(crate) mod judgment;
 pub(crate) mod ledger;

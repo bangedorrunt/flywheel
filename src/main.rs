@@ -47,6 +47,7 @@ mod doorbell_supervise;
 mod doorbell_tick;
 mod durable;
 mod envpin_hop;
+mod integration;
 mod turn_hooks;
 mod turn_state;
 #[cfg(test)]
@@ -780,6 +781,13 @@ enum EventsTokenCmd {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Harness trampoline entry point (bd-mdpfr); no-ops outside a seat.
+    #[command(name = "__hook")]
+    HookTrampoline {
+        event: String,
+        #[arg(long)]
+        agent: String,
+    },
     /// Report a harness hook event (bd-b2kaa): writes per-seat turn state and
     /// prints at most one continuation line. Hooks install this at spawn.
     Hook {
@@ -1604,6 +1612,10 @@ enum Commands {
     /// those verbs). Kinds: opencode|pi|grok|omp|pa (shorts oc|pi|gk accepted);
     /// omit to list kinds. Re-run after a flywheel rebuild to refresh.
     Integration {
+        /// bd-mdpfr operator-run hook installer subcommand; omit for the
+        /// legacy slash-command generator.
+        #[command(subcommand)]
+        cmd: Option<crate::cmd::integration::IntegrationCmd>,
         /// agent kind: opencode|pi|grok|omp|pa (shorts oc|pi|gk accepted);
         /// omit to list kinds
         kind: Option<String>,
@@ -3780,6 +3792,21 @@ fn main() {
             msg,
         }) => cmd_assign(&cfg, project, to, beads, msg.as_deref()),
         Some(Commands::Mail { cmd }) => cmd_mail(&cfg, cmd),
+        Some(Commands::HookTrampoline { event, agent }) => {
+            let pin = std::env::var("AGENT_NAME").unwrap_or_default();
+            let in_pane = std::env::var("FLYWHEEL_PANE").is_ok_and(|v| !v.is_empty());
+            if crate::integration::hook_allowed(in_pane, &pin, agent)
+                && let Some(line) = crate::turn_hooks::on_event(
+                    &config::state_dir(),
+                    &pin,
+                    &pin,
+                    event,
+                )
+            {
+                println!("{line}");
+            }
+            Ok(())
+        }
         Some(Commands::Hook {
             event,
             project,
@@ -3868,8 +3895,9 @@ fn main() {
             *json,
             project.as_deref(),
         ),
-        Some(Commands::Integration { kind, out }) => {
-            cmd_integration(kind.as_deref(), out.as_deref())
+        Some(Commands::Integration { cmd, kind, out }) => match cmd {
+            Some(icmd) => crate::cmd::integration::cmd_integration(&cfg, icmd.clone()),
+            None => cmd_integration(kind.as_deref(), out.as_deref()),
         }
         Some(Commands::Config { cmd }) => cmd_config(&cfg, cmd),
         Some(Commands::Backend { cmd }) => cmd_backend(&cfg, cmd),
