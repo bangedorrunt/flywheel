@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
-use toron_workflow::schema::{Action, Workflow};
+use toron_workflow::schema::{Action, Step, Workflow};
 
 use crate::seat_binder::{Binding, LiveSeat, StepNeed, bind};
 use crate::stages::StageContext;
@@ -105,6 +105,73 @@ fn normalized_seats(seats: &[LiveSeat], roles: &JoinRoles) -> Vec<LiveSeat> {
         .collect()
 }
 
+fn step(action: Action, name: Option<&str>) -> Step {
+    Step {
+        name: name.map(str::to_string),
+        guard: None,
+        on_error: toron_workflow::schema::StepOnError::Continue,
+        build_slot: false,
+        action,
+    }
+}
+
+/// Every dispatch step, including nested foreach/parallel/retry/branch steps
+/// and graph nodes (bd-sfkm8 F14). A plan must bind and count all of them.
+fn collect_steps(steps: &[Step], out: &mut Vec<Step>) {
+    for step in steps {
+        out.push(step.clone());
+        match &step.action {
+            Action::Retry { step, .. }
+            | Action::Foreach { each: step, .. }
+            | Action::Parallel { each: step, .. } => collect_steps(std::slice::from_ref(step), out),
+            Action::Branch {
+                then, else_steps, ..
+            } => {
+                collect_steps(then, out);
+                collect_steps(else_steps, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn apply_to_steps(steps: &mut [Step], bound: &BTreeMap<String, String>, bead: Option<&str>) {
+    for step in steps {
+        let name = step.name.clone().unwrap_or_default();
+        if let Some(pin) = bound.get(&name)
+            && let Action::DispatchJob { assignee, spec, .. } = &mut step.action
+        {
+            *assignee = pin.clone();
+            spec.extra.insert(
+                "target_pin".to_string(),
+                serde_json::Value::String(pin.clone()),
+            );
+            if let Some(id) = bead.filter(|b| !b.is_empty()) {
+                let header =
+                    format!("BEAD: {id} (the bound work order; `br show {id}` is the contract)");
+                spec.task = Some(match spec.task.take() {
+                    Some(task) => format!("{header}\n{task}"),
+                    None => header,
+                });
+            }
+        }
+        match &mut step.action {
+            Action::Retry { step, .. }
+            | Action::Foreach { each: step, .. }
+            | Action::Parallel { each: step, .. } => {
+                apply_to_steps(std::slice::from_mut(step), bound, bead)
+            }
+            Action::Branch {
+                then, else_steps, ..
+            } => {
+                apply_to_steps(then, bound, bead);
+                apply_to_steps(else_steps, bound, bead);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Decide every step's seat without touching the fleet. Deterministic: seats
 /// are sorted by pin inside the binder, so a replay makes the same choices.
 pub fn plan_join(
@@ -120,7 +187,17 @@ pub fn plan_join(
     };
     let mut steps = Vec::new();
     let mut spawns = Vec::new();
-    for step in &workflow.steps {
+    let mut all_steps = Vec::new();
+    collect_steps(&workflow.steps, &mut all_steps);
+    if let Some(graph) = &workflow.graph {
+        for node in graph.nodes.values() {
+            collect_steps(
+                std::slice::from_ref(&step(node.action.clone(), None)),
+                &mut all_steps,
+            );
+        }
+    }
+    for step in &all_steps {
         let Some(raw_role) = step_role(step) else {
             continue;
         };
@@ -187,23 +264,15 @@ pub fn apply_join_bindings(workflow: &Workflow, plan: &JoinPlan, bead: Option<&s
         .filter_map(|b| b.pin.as_ref().map(|pin| (b.step.clone(), pin.clone())))
         .collect();
     let mut wf = workflow.clone();
-    for step in &mut wf.steps {
-        let name = step.name.clone().unwrap_or_default();
-        let Some(pin) = bound.get(&name) else {
-            continue;
-        };
-        if let Action::DispatchJob { assignee, spec, .. } = &mut step.action {
-            *assignee = pin.clone();
-            spec.profile = None;
-            if let Some(id) = bead.filter(|b| !b.is_empty()) {
-                let header =
-                    format!("BEAD: {id} (the bound work order; `br show {id}` is the contract)");
-                spec.task = Some(match spec.task.take() {
-                    Some(task) => format!("{header}\n{task}"),
-                    None => header,
-                });
-            }
+    apply_to_steps(&mut wf.steps, &bound, bead);
+    if let Some(graph) = wf.graph.as_mut() {
+        let mut actions: Vec<Action> = graph.nodes.values().map(|n| n.action.clone()).collect();
+        let mut steps: Vec<Step> = actions.iter().map(|a| step(a.clone(), None)).collect();
+        apply_to_steps(&mut steps, &bound, bead);
+        for (node, step) in graph.nodes.values_mut().zip(steps.iter()) {
+            node.action = step.action.clone();
         }
+        actions.clear();
     }
     wf
 }
@@ -217,8 +286,10 @@ pub fn render_preview(plan: &JoinPlan) -> Vec<String> {
                 format!("seat {pin}")
             } else if b.spawn {
                 "NEW PANE (needs --yes)".to_string()
+            } else if b.wait {
+                "no available seat (wait)".to_string()
             } else {
-                "no available seat".to_string()
+                "no seat".to_string()
             };
             format!(
                 "{} ({}): {}",
@@ -370,6 +441,49 @@ mod tests {
         assert_eq!(
             format!("{:?}", bound.steps[0]),
             format!("{:?}", wf.steps[0])
+        );
+    }
+
+    /// bd-sfkm8 F14/F18: a nested dispatch is bound and counted, and a wait
+    /// binding is named in the preview instead of being silently dropped.
+    #[test]
+    fn nested_steps_are_bound_and_waits_are_previewed() {
+        let nested = Step {
+            name: Some("review".into()),
+            guard: None,
+            on_error: toron_workflow::schema::StepOnError::Continue,
+            build_slot: false,
+            action: Action::Foreach {
+                over: "1".into(),
+                each: Box::new(dispatch_step("execute", "coder", "ce-execute")),
+            },
+        };
+        let wf = workflow(vec![nested]);
+        let plan = plan_join(&wf, &four_crew(), &JoinRoles::default(), 8);
+        let names: Vec<&str> = plan.steps.iter().map(|b| b.step.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["review", "execute"],
+            "nested dispatch: {names:?}"
+        );
+        assert!(plan.steps[1].pin.is_some());
+
+        let waiting = JoinPlan {
+            steps: vec![StepBinding {
+                step: "blocked".into(),
+                role: "coder".into(),
+                pin: None,
+                stage: None,
+                spawn: false,
+                wait: true,
+            }],
+            spawns: Vec::new(),
+            needs_yes: false,
+        };
+        assert!(
+            render_preview(&waiting)[0].contains("wait"),
+            "a wait must be visible: {:?}",
+            render_preview(&waiting)
         );
     }
 

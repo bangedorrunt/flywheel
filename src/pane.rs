@@ -1738,24 +1738,49 @@ pub fn pane_dispatch_scoped(
         }
     };
     let bound = review_bind(profile_name, spec, entries, crew_max, &journal_authors);
-    let bound_entry: Option<SpawnEntry> = match &bound {
-        Some(crate::seat_binder::Binding::Reuse { pin })
-        | Some(crate::seat_binder::Binding::FreshSession { pin })
-        | Some(crate::seat_binder::Binding::Other { pin })
-        | Some(crate::seat_binder::Binding::Patch { pin, .. }) => entries
-            .entries()
-            .iter()
-            .find(|e| e.mail_identity.as_deref() == Some(pin.as_str()))
-            .cloned(),
-        Some(crate::seat_binder::Binding::Wait { reason }) => bail!(
-            "pane dispatch: @{profile_name} waits for a seat ({reason}); the step is bounded by \
-             its no_claim_timeout and never borrows another role"
-        ),
-        Some(crate::seat_binder::Binding::Spawn) => bail!(
-            "pane dispatch: @{profile_name} needs a new seat — Spawn goes through the seat \
-             interpreter (Ports::seat), not a second dispatch path"
-        ),
-        Some(crate::seat_binder::Binding::Headless) | None => None,
+    // bd-sfkm8: an in-flight join binds a step to a live pin. The spec keeps
+    // its profile so this runner can resolve it; `target_pin` is a typed
+    // dispatch override, not a second dispatch path. A pin that no longer
+    // exists fails loud instead of silently re-spawning a fresh seat.
+    let target_pin = spec
+        .extra
+        .get("target_pin")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    // bd-sfkm8: an in-flight join binds a step to a live pin. The spec keeps
+    // its profile so this runner can resolve it; `target_pin` is a typed
+    // dispatch override, not a second dispatch path. A missing pin fails loud.
+    let bound_entry: Option<SpawnEntry> = if let Some(pin) = target_pin {
+        Some(
+            entries
+                .entries()
+                .iter()
+                .find(|e| e.mail_identity.as_deref() == Some(pin))
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!("pane dispatch: bound pin {pin} has no live seat (recompose the join)")
+                })?,
+        )
+    } else {
+        match &bound {
+            Some(crate::seat_binder::Binding::Reuse { pin })
+            | Some(crate::seat_binder::Binding::FreshSession { pin })
+            | Some(crate::seat_binder::Binding::Other { pin })
+            | Some(crate::seat_binder::Binding::Patch { pin, .. }) => entries
+                .entries()
+                .iter()
+                .find(|e| e.mail_identity.as_deref() == Some(pin.as_str()))
+                .cloned(),
+            Some(crate::seat_binder::Binding::Wait { reason }) => bail!(
+                "pane dispatch: @{profile_name} waits for a seat ({reason}); the step is bounded by \
+                 its no_claim_timeout and never borrows another role"
+            ),
+            Some(crate::seat_binder::Binding::Spawn) => bail!(
+                "pane dispatch: @{profile_name} needs a new seat — Spawn goes through the seat \
+                 interpreter (Ports::seat), not a second dispatch path"
+            ),
+            Some(crate::seat_binder::Binding::Headless) | None => None,
+        }
     };
     let mut override_entry: Option<&SpawnEntry> = None;
     if let Some(override_h) = headless::dispatch_spec_harness(spec)
@@ -5565,6 +5590,82 @@ mod tests {
             msg.contains("overrides harness=opencode but no crew pane runs it"),
             "{msg}"
         );
+    }
+
+    /// bd-sfkm8: the real pane runner reaches the pin chosen by an in-flight
+    /// join, with the profile still resolvable. A missing pin fails loud.
+    #[test]
+    fn a_join_bound_step_dispatches_to_the_chosen_pin() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "fw-join-pin-{}-{}.toml",
+            std::process::id(),
+            CTR.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::write(&path, "[profiles.coder]\nharness = \"pi\"\n").unwrap();
+        let catalog = ProfileCatalog::load_from(Some(&path)).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let entries = as_live(vec![
+            crew_row("w1:p1", "alpha-seat", "coder", "Alpha", ""),
+            crew_row("w2:p2", "bravo-seat", "coder", "Bravo", ""),
+        ]);
+        let step = toron_workflow::schema::Step {
+            name: Some("execute".into()),
+            action: Action::DispatchJob {
+                assignee: "x".into(),
+                spec: toron_workflow::schema::DispatchSpec {
+                    profile: Some("@coder".into()),
+                    stage: Some("ce-execute".into()),
+                    ..Default::default()
+                },
+                channel: None,
+                await_: None,
+                no_claim_timeout: 600,
+                result_timeout: None,
+            },
+            guard: None,
+            on_error: toron_workflow::schema::StepOnError::Continue,
+            build_slot: false,
+        };
+        let wf = toron_workflow::schema::Workflow {
+            name: "joined".into(),
+            description: None,
+            trigger: None,
+            policy: None,
+            guard: None,
+            steps: vec![step],
+            graph: None,
+            inputs: Vec::new(),
+            crew: None,
+            principles: Vec::new(),
+        };
+        let plan = crate::compose_join::JoinPlan {
+            steps: vec![crate::compose_join::StepBinding {
+                step: "execute".into(),
+                role: "coder".into(),
+                pin: Some("Bravo".into()),
+                stage: Some("ce-execute".into()),
+                spawn: false,
+                wait: false,
+            }],
+            spawns: Vec::new(),
+            needs_yes: false,
+        };
+        let bound = crate::compose_join::apply_join_bindings(&wf, &plan, Some("bd-42"));
+        let Action::DispatchJob { assignee, spec, .. } = &bound.steps[0].action else {
+            panic!("bound step must stay a dispatch");
+        };
+        assert_eq!(assignee, "Bravo");
+        assert_eq!(
+            spec.profile.as_deref(),
+            Some("@coder"),
+            "profile must resolve"
+        );
+        let action = bound.steps[0].action.clone();
+        let out = pane_dispatch(&catalog, "proj", "wf", &json!({}), &entries, &action, None)
+            .expect("the bound step must dispatch");
+        assert_eq!(out["agent"], "bravo-seat", "runner must reach Bravo: {out}");
     }
 
     /// Test fixture: defaults layered with `[profiles.reviewer] harness = H`
