@@ -1366,9 +1366,6 @@ pub(crate) fn ensure_seat_events_token<C: crate::events_tokens::TokenCli>(
     Ok(SeatTokenOutcome::Minted)
 }
 
-/// bd-rrlo2 F3: the spawn loop's mint seam. Doors get a journaled 0600
-/// token before launch; other harnesses keep the doorbell fallback, and a
-/// mint failure warns without stopping the spawn.
 pub(crate) fn provision_seat_events_token<C: crate::events_tokens::TokenCli>(
     cli: &C,
     state_dir: &std::path::Path,
@@ -1385,6 +1382,18 @@ pub(crate) fn provision_seat_events_token<C: crate::events_tokens::TokenCli>(
             "flywheel: warn: events token mint failed for {pin}: {e}; using doorbell fallback"
         );
     }
+}
+
+pub(crate) fn provision_seat_before_launch<C: crate::events_tokens::TokenCli>(
+    cli: &C,
+    state_dir: &std::path::Path,
+    project: &str,
+    kind: &str,
+    pin: Option<&str>,
+    now_us: i64,
+) {
+    let Some(pin) = pin else { return };
+    provision_seat_events_token(cli, state_dir, project, kind, pin, now_us);
 }
 
 pub(crate) fn mint_harness_session(kind: &str, args: &mut Vec<String>) -> Option<String> {
@@ -2236,17 +2245,17 @@ projects available: {}",
             // config branches below find a file; without one they keep the
             // doorbell fallback. Fail-open: a mint failure warns and the
             // seat still spawns.
-            if let Some(pin) = mail_identity.as_deref() {
+            {
                 let cli = crate::events_tokens::ToronTokenCli {
                     bin: std::env::var("TORON_BIN").unwrap_or_else(|_| "toron".to_string()),
                 };
                 let now_us = chrono::Utc::now().timestamp_micros();
-                provision_seat_events_token(
+                provision_seat_before_launch(
                     &cli,
                     &crate::config::state_dir(),
                     project,
                     &kind,
-                    pin,
+                    mail_identity.as_deref(),
                     now_us,
                 );
             }
@@ -3785,8 +3794,6 @@ mod spawn_profile_plan_tests {
         );
     }
 
-    /// bd-rrlo2 F3: the spawn loop provisions through this seam — deleting
-    /// the mint leaves the seat tokenless.
     #[test]
     fn spawn_loop_provisions_a_token_through_the_seam() {
         let _home = crate::config::test_state_home();
@@ -3795,17 +3802,25 @@ mod spawn_profile_plan_tests {
             calls: std::cell::Cell::new(0),
         };
         let now_us = 5_000_000i64;
-        super::provision_seat_events_token(&cli, &state, "demo", "pi", "SeamPi", now_us);
+        super::provision_seat_before_launch(&cli, &state, "demo", "pi", Some("SeamPi"), now_us);
         assert!(
             crate::events_tokens::token_path(&state, "demo", "SeamPi").is_file(),
-            "the spawn seam mints a token for an events-door harness"
+            "the spawn step mints a token for an events-door harness"
         );
-        super::provision_seat_events_token(&cli, &state, "demo", "claude", "SeamClaude", now_us);
+        super::provision_seat_before_launch(
+            &cli,
+            &state,
+            "demo",
+            "claude",
+            Some("SeamClaude"),
+            now_us,
+        );
         assert!(
             !crate::events_tokens::token_path(&state, "demo", "SeamClaude").is_file(),
             "no door, no token file"
         );
-        assert_eq!(cli.calls.get(), 1, "exactly one mint for the two seats");
+        super::provision_seat_before_launch(&cli, &state, "demo", "pi", None, now_us);
+        assert_eq!(cli.calls.get(), 1, "exactly one mint for the three seats");
     }
 
     /// bd-u7m1y: re-spawning one seat must never revoke another seat's

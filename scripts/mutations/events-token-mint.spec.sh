@@ -25,12 +25,9 @@ mutation "T3  the journal lookup ignores the pin" \
             || row.get("project").and_then(Value::as_str) != Some(project)' \
     replace='        if row.get("project").and_then(Value::as_str) != Some(project)'
 
-mutation "T4  the spawn loop never mints" \
+mutation "T4  the spawn step never reaches the seam" \
     file=src/cmd/spawn.rs \
     expect=spawn_loop_provisions_a_token_through_the_seam \
-    find='    if let Err(e) = ensure_seat_events_token(cli, state_dir, project, pin, now_us) {
-        eprintln!(
-            "flywheel: warn: events token mint failed for {pin}: {e}; using doorbell fallback"
-        );
-    }' \
-    replace='    let _ = (cli, state_dir, project, pin, now_us);'
+    find='    let Some(pin) = pin else { return };
+    provision_seat_events_token(cli, state_dir, project, kind, pin, now_us);' \
+    replace='    let _ = (cli, state_dir, project, kind, pin, now_us);'
