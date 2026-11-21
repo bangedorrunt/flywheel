@@ -1738,10 +1738,6 @@ pub fn pane_dispatch_scoped(
         }
     };
     let bound = review_bind(profile_name, spec, entries, crew_max, &journal_authors);
-    // bd-sfkm8: an in-flight join binds a step to a live pin. The spec keeps
-    // its profile so this runner can resolve it; `target_pin` is a typed
-    // dispatch override, not a second dispatch path. A pin that no longer
-    // exists fails loud instead of silently re-spawning a fresh seat.
     let target_pin = spec
         .extra
         .get("target_pin")

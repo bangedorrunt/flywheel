@@ -2574,14 +2574,29 @@ pub fn build_brief_with(
 /// plain English (bd-pezon). Best effort: an unreachable toron degrades to
 /// the generic peer-first rule, never to silence. Grouped by holder so one
 /// path area produces one line, and deduped by path.
+/// A hung toron must never block brief assembly: the same bounded-process
+/// helper the chie path uses kills the process group on timeout.
+pub(crate) const RESERVATION_WATCHDOG: std::time::Duration =
+    std::time::Duration::from_millis(1_500);
+
 fn live_reservation_doc(project: &str) -> Option<Value> {
     let toron = std::env::var("FLYWHEEL_TORON_BIN").unwrap_or_else(|_| "toron".into());
-    Command::new(toron)
-        .args(["reserve", "list", "--project", project, "--json"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok())
+    live_reservation_doc_with(&toron, project, RESERVATION_WATCHDOG)
+}
+
+/// Injectable binary + watchdog so a timeout is testable without process env.
+fn live_reservation_doc_with(
+    toron: &str,
+    project: &str,
+    watchdog: std::time::Duration,
+) -> Option<Value> {
+    let mut cmd = Command::new(toron);
+    cmd.args(["reserve", "list", "--project", project, "--json"]);
+    let out = toron_core::proc::run_bounded(&mut cmd, watchdog).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&out.stdout).ok()
 }
 
 /// Pure peer grouping + rendering. A test passes the reservation board JSON
@@ -10377,6 +10392,36 @@ mod tests {
         // An unreachable board still carries the peer-first rule.
         let empty = render_peer_contacts(None, "ScarletCove");
         assert!(empty.contains("COORDINATION"), "{empty}");
+    }
+
+    /// bd-followup F17: a hung toron degrades to the peer-first rule instead
+    /// of parking every dispatch behind an unbounded subprocess.
+    #[test]
+    fn a_hung_reservation_source_degrades_to_peer_first() {
+        let dir = std::env::temp_dir().join(format!(
+            "fw-hung-toron-{}-{}",
+            std::process::id(),
+            std::process::id() % 997
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("hung-toron");
+        std::fs::write(&fake, "#!/bin/sh\nsleep 30\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let start = std::time::Instant::now();
+        let doc = live_reservation_doc_with(
+            fake.to_str().unwrap(),
+            "proj",
+            std::time::Duration::from_millis(200),
+        );
+        assert!(doc.is_none(), "a timeout is not a reservation board");
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+        let line = render_peer_contacts(None, "ScarletCove");
+        assert!(line.contains("COORDINATION"), "{line}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// bd-vx9pv: the pointer form fills the peer section from the same board
