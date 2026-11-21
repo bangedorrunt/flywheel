@@ -2087,6 +2087,10 @@ projects available: {}",
                     };
                     plan.args
                         .extend(patched_mode_argv(&overrides, item.short.as_str(), &kind));
+                    // bd-t2z0b: say which verified tool build this seat gets.
+                    if let Some(v) = &plan.version {
+                        eprintln!("flywheel: {name}: {kind} pinned to v{v} (mise.toml)");
+                    }
                     let model_pin = match crate::models::ModelChoice::parse(&plan.model) {
                         crate::models::ModelChoice::HarnessDefault => None,
                         crate::models::ModelChoice::Model(_) => Some(plan.model),
@@ -3027,6 +3031,10 @@ pub(crate) fn cmd_spawn_rex(
                     let mut plan = profile_launch_plan(&kind, &shadow, None)?;
                     plan.args
                         .extend(patched_mode_argv(&overrides, item.short.as_str(), &kind));
+                    // bd-t2z0b: say which verified tool build this seat gets.
+                    if let Some(v) = &plan.version {
+                        eprintln!("flywheel: {name}: {kind} pinned to v{v} (mise.toml)");
+                    }
                     let model_pin = match crate::models::ModelChoice::parse(&plan.model) {
                         crate::models::ModelChoice::HarnessDefault => None,
                         crate::models::ModelChoice::Model(_) => Some(plan.model),
@@ -3683,6 +3691,40 @@ mod spawn_profile_plan_tests {
         let (args, pin) = (&plan.args, &plan.model);
         assert_eq!(pin, "zai/glm-5.3");
         assert_eq!(*args, vec!["--model", "zai/glm-5.3"]);
+    }
+
+    /// bd-t2z0b: an omp spawn plan with no version names the pinned pi-fork
+    /// build (18.2.5), and the repo's `mise.toml` pins that same build so the
+    /// shim resolves it for the live seat. A drift between the two is a bug:
+    /// the seat would launch a build whose PI_CODING_AGENT_DIR support was
+    /// never verified.
+    #[test]
+    fn omp_with_no_version_uses_the_pinned_default() {
+        let _g = lock_env();
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
+        let plan =
+            profile_launch_plan("omp", &profile("omp", "zai/glm-5.3"), None).expect("omp plan");
+        assert_eq!(
+            plan.version.as_deref(),
+            Some(crate::harness_registry::OMP_DEFAULT_VERSION),
+            "a bare omp spawn must record the pinned default version"
+        );
+        let mise = std::fs::read_to_string(format!("{}/mise.toml", env!("CARGO_MANIFEST_DIR")))
+            .expect("repo mise.toml");
+        assert!(
+            mise.contains(&format!(
+                "github:can1357/oh-my-pi\" = \"{}\"",
+                crate::harness_registry::OMP_DEFAULT_VERSION
+            )),
+            "mise.toml must pin the same omp build OMP_DEFAULT_VERSION names"
+        );
+        // Other harnesses carry no tool-version pin.
+        let pi = profile_launch_plan("pi", &profile("pi", "zai/glm-5.3"), None).expect("pi plan");
+        assert!(
+            pi.version.is_none(),
+            "no guessed version for an unpinned harness"
+        );
     }
 
     /// STRICT routing: a profile model that is NOT a registry id fails the

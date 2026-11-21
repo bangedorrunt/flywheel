@@ -1,0 +1,6 @@
+# bd-t2z0b: pin the omp (oh-my-pi) pi-fork build that honours
+# PI_CODING_AGENT_DIR, verified in 18.2.5. Seats launch from this project dir,
+# so the omp shim resolves this build for every spawn. Keep in sync with
+# harness_registry::OMP_DEFAULT_VERSION.
+[tools]
+"github:can1357/oh-my-pi" = "18.2.5"

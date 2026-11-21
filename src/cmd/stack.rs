@@ -213,6 +213,9 @@ fn stack_status(json_output: bool, check: bool) -> Result<()> {
         probe_bin("flywheel"),
         probe_bin("doorbell"),
         probe_bin("toron"),
+        // bd-t2z0b: report the pinned omp (pi-fork) build. Seats launch from the
+        // project dir, whose mise.toml pins it, so the shim resolves it here.
+        probe_bin("omp"),
     ];
     let installed_hash = binaries[0]
         .path

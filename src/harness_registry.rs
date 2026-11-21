@@ -55,6 +55,21 @@ pub const SLOT_CHEAP: &str = "cheap";
 pub const SLOT_STANDARD: &str = "standard";
 pub const SLOT_PREMIUM: &str = "premium";
 
+/// bd-t2z0b: the pinned omp build. 18.2.5 is the pi fork whose binary was
+/// verified to honour `PI_CODING_AGENT_DIR`, which the events bridge rides.
+/// `mise.toml` pins the same version so the shim resolves it for a live seat.
+pub const OMP_DEFAULT_VERSION: &str = "18.2.5";
+
+/// The pinned tool version a harness launches when its profile names none.
+/// `None` for every harness without a verified pin — never a guessed default.
+#[must_use]
+pub fn pinned_version(harness: &str) -> Option<&'static str> {
+    match harness {
+        "omp" => Some(OMP_DEFAULT_VERSION),
+        _ => None,
+    }
+}
+
 /// One harness, named once.
 #[derive(Debug, Clone, Copy)]
 pub struct HarnessSpec {

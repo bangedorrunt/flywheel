@@ -4815,6 +4815,11 @@ pub(crate) struct ProfileLaunchPlan {
     /// flag, so the pin must ALSO travel via pane env
     /// (`hc::apply_opencode_model_pin`).
     pub env_model_pin: Option<String>,
+    /// bd-t2z0b: the pinned tool version for a harness with a verified pin
+    /// (omp). `None` for harnesses with no pin. The spawn's `mise.toml` makes
+    /// the shim resolve this build; the plan records it so status and tests
+    /// can assert which build a seat gets.
+    pub version: Option<String>,
 }
 
 pub(crate) fn profile_launch_plan(
@@ -4853,6 +4858,7 @@ pub(crate) fn profile_launch_plan(
         args,
         model,
         env_model_pin,
+        version: crate::harness_registry::pinned_version(&harness).map(str::to_string),
     })
 }
 
