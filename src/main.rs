@@ -799,7 +799,7 @@ enum Commands {
         cmd: SeatCmd,
     },
     /// Harness trampoline entry point (bd-mdpfr); no-ops outside a seat.
-    #[command(name = "__hook")]
+    #[command(name = "__hook", hide = true)]
     HookTrampoline {
         event: String,
         #[arg(long)]
