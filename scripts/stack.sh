@@ -334,6 +334,16 @@ do_install() {
     run "${CARGO_CMD_ARR[@]}" install --path "$TORON_SOURCE_RESOLVED/crates/toron-cli" --force
   fi
 
+  # bd-9os20: seats load the plugin with --plugin-dir, so install from this export.
+  plugin_src="$FLYWHEEL_SOURCE/plugins/claude-flywheel"
+  plugin_dir="${XDG_DATA_HOME:-$HOME/.local/share}/flywheel/plugins/claude-flywheel"
+  if [ -f "$plugin_src/hooks/hooks.json" ]; then
+    echo "installing Claude wake plugin into $plugin_dir"
+    run mkdir -p "${plugin_dir%/*}"
+    run rm -rf "$plugin_dir"
+    run cp -R "$plugin_src" "$plugin_dir"
+  fi
+
   if [ "$(uname -s)" = "Darwin" ] && [ "$NO_CODESIGN" -eq 0 ]; then
     while IFS= read -r bin; do
       if [ "$SKIP_TORON" -eq 1 ] && [ "${bin##*/}" = "toron" ]; then

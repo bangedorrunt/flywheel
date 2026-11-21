@@ -273,3 +273,15 @@ fn proof_mutation_failfast_and_crew_cache() {
         .expect("run scripts/test-proof-mutation-failfast.sh");
     assert!(status.success(), "proof mutation failfast test failed");
 }
+
+/// bd-9os20: the Claude plugin must load from its installed path and stack.sh
+/// must copy it there; both are checkable without a live Claude seat.
+#[test]
+fn proof_claude_plugin_loads_and_installs_to_plugin_dir() {
+    let status = Command::new("bash")
+        .arg(format!("{}/scripts/test-claude-plugin-load.sh", root()))
+        .current_dir(root())
+        .status()
+        .expect("run scripts/test-claude-plugin-load.sh");
+    assert!(status.success(), "claude plugin load test failed");
+}
