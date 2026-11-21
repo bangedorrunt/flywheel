@@ -361,6 +361,124 @@ fn report_unclassifiable(paths: &[String]) {
     }
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReservationVerdict {
+    /// (holder, reservation id) for a hard conflict with a live pin.
+    live: Vec<(String, String)>,
+    /// Paths held by a dead or expired pin: safe to revoke.
+    dead: Vec<String>,
+}
+
+fn parse_reservations(raw: &str) -> ReservationVerdict {
+    let doc: serde_json::Value = serde_json::from_str(raw).unwrap_or_default();
+    let rows = |key: &str| {
+        doc.get(key)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let live = rows("conflicts")
+        .iter()
+        .filter_map(|row| {
+            Some((
+                row.get("holders")?
+                    .as_array()?
+                    .first()?
+                    .as_str()?
+                    .to_string(),
+                row.get("reservation_ids")?
+                    .as_array()?
+                    .first()?
+                    .as_str()?
+                    .to_string(),
+            ))
+        })
+        .collect();
+    let dead = rows("soft_conflicts")
+        .iter()
+        .filter_map(|row| row.get("path")?.as_str().map(str::to_string))
+        .collect();
+    ReservationVerdict { live, dead }
+}
+
+fn reservation_context() -> Option<(String, String)> {
+    let pin = std::env::var("AGENT_NAME").ok()?;
+    let project = std::env::var("FLYWHEEL_PROJECT")
+        .ok()
+        .or_else(|| crate::cron::detect_project(&crate::config::Config::default(), None))?;
+    (!pin.is_empty()).then_some((pin, project))
+}
+
+/// bd-ahkw1: refuse a path exclusively held by another live pin, naming the
+/// holder and the exact request-release call. Dead leases are revoked first.
+fn guard_commit_reservations(paths: &[String]) -> Result<()> {
+    let Some((pin, project)) = reservation_context() else {
+        return Ok(());
+    };
+    let toron = std::env::var("FLYWHEEL_TORON_BIN").unwrap_or_else(|_| "toron".into());
+    let raw = Command::new(&toron)
+        .args([
+            "reserve",
+            "conflicts",
+            "--project",
+            &project,
+            "--as",
+            &pin,
+            "--paths",
+            &paths.join(","),
+            "--json",
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    let verdict = parse_reservations(&raw);
+    for path in &verdict.dead {
+        let _ = Command::new(&toron)
+            .args([
+                "reserve",
+                "force-release",
+                "--project",
+                &project,
+                "--as",
+                &pin,
+                "--path",
+                path,
+                "--note",
+                "dead reservation holder",
+            ])
+            .status();
+    }
+    if let Some((holder, id)) = verdict.live.first() {
+        bail!(
+            "flywheel commit: path reserved exclusively by {holder} (reservation {id}); ask them with `toron reserve request-release --project {project} --as {pin} --target {holder} --reservation-id {id}`"
+        );
+    }
+    Ok(())
+}
+
+/// bd-ahkw1: a successful commit frees the committer's own leases on the paths
+/// it landed; a refused or failed commit keeps them.
+fn release_own_reservations(paths: &[String]) {
+    let Some((pin, project)) = reservation_context() else {
+        return;
+    };
+    let toron = std::env::var("FLYWHEEL_TORON_BIN").unwrap_or_else(|_| "toron".into());
+    let _ = Command::new(&toron)
+        .args([
+            "reserve",
+            "release",
+            "--project",
+            &project,
+            "--as",
+            &pin,
+            "--paths",
+            &paths.join(","),
+        ])
+        .status();
+}
+
 /// After a successful CAS, point every stale shared-index entry (any path,
 /// not just the committed ones) at the blob HEAD now holds. Unique stages are
 /// never in this list, so a neighbour's intent survives (bd-himh8).
@@ -435,6 +553,7 @@ where
 {
     let shared = Git::shared(repo);
     let old_head = shared.out(&["rev-parse", "HEAD"])?;
+    guard_commit_reservations(paths)?;
     let class = classify_staged(&shared, paths)?;
     if !class.conflict.is_empty() {
         bail!(
@@ -466,6 +585,7 @@ where
         let update = shared.run(&["update-ref", "HEAD", &commit, &parent])?;
         if update.status.success() {
             sync_stale_stage(&shared, &class.stale, &commit)?;
+            release_own_reservations(paths);
             return Ok(commit);
         }
         let moved = shared.out(&["rev-parse", "HEAD"])?;
@@ -823,6 +943,114 @@ mod tests {
             staged.lines().any(|p| p == "d.rs"),
             "unique stage was stripped: {staged}"
         );
+    }
+
+    /// bd-ahkw1: parse the live/dead split toron already computes for us.
+    #[test]
+    fn reservation_conflicts_split_live_and_dead_holders() {
+        let v = parse_reservations(
+            r#"{"conflicts":[{"holders":["BoldCliff"],"reservation_ids":["r1"],"path":"x.rs"}],"soft_conflicts":[{"holders":["BuffyLark"],"reservation_ids":["r2"],"path":"old.rs"}]}"#,
+        );
+        assert_eq!(v.live, vec![("BoldCliff".into(), "r1".into())]);
+        assert_eq!(v.dead, vec!["old.rs".to_string()]);
+    }
+
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl EnvRestore {
+        fn take(names: &[&'static str]) -> Self {
+            Self(names.iter().map(|n| (*n, std::env::var_os(n))).collect())
+        }
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                match value {
+                    Some(v) => unsafe { std::env::set_var(name, v) },
+                    None => unsafe { std::env::remove_var(name) },
+                }
+            }
+        }
+    }
+
+    fn fake_toron(dir: &Path, hard: bool) -> (PathBuf, PathBuf) {
+        let bin = dir.join("fake-toron");
+        let log = dir.join("toron-calls.log");
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\ncase \"$1 $2\" in\n  \"reserve conflicts\") if [ \"${{FAKE_HARD:-0}}\" = 1 ]; then printf '%s' '{{\"conflicts\":[{{\"holders\":[\"BoldCliff\"],\"reservation_ids\":[\"r1\"],\"path\":\"x.rs\"}}],\"soft_conflicts\":[]}}'; else printf '%s' '{{\"conflicts\":[],\"soft_conflicts\":[{{\"holders\":[\"BuffyLark\"],\"reservation_ids\":[\"r2\"],\"path\":\"old.rs\"}}]}}'; fi ;;\nesac\nexit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        if hard {
+            unsafe { std::env::set_var("FAKE_HARD", "1") };
+        } else {
+            unsafe { std::env::set_var("FAKE_HARD", "0") };
+        }
+        (bin, log)
+    }
+
+    /// bd-ahkw1: a live exclusive lease blocks the commit and names the
+    /// holder plus the exact request-release command.
+    #[test]
+    fn a_live_reservation_refuses_the_commit() {
+        let _g = crate::config::lock_env();
+        let _env = EnvRestore::take(&[
+            "FLYWHEEL_TORON_BIN",
+            "AGENT_NAME",
+            "FLYWHEEL_PROJECT",
+            "FAKE_HARD",
+        ]);
+        let dir = scratch_repo("reserve-live");
+        let (bin, log) = fake_toron(&dir, true);
+        unsafe { std::env::set_var("FLYWHEEL_TORON_BIN", &bin) };
+        unsafe { std::env::set_var("AGENT_NAME", "ScarletCove") };
+        unsafe { std::env::set_var("FLYWHEEL_PROJECT", "flywheel") };
+        fs::write(dir.join("x.rs"), "x\n").unwrap();
+        let err = commit_paths(&dir, &["x.rs".into()], "blocked")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("BoldCliff"), "{err}");
+        assert!(err.contains("toron reserve request-release"), "{err}");
+        assert!(err.contains("r1"), "{err}");
+        let calls = fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !calls.contains("reserve release"),
+            "a refused commit freed a lease: {calls}"
+        );
+    }
+
+    /// bd-ahkw1: a dead lease is cleared, and a successful commit frees the
+    /// committer's own leases on exactly the committed paths.
+    #[test]
+    fn a_dead_lease_is_cleared_and_a_success_releases_own() {
+        let _g = crate::config::lock_env();
+        let _env = EnvRestore::take(&[
+            "FLYWHEEL_TORON_BIN",
+            "AGENT_NAME",
+            "FLYWHEEL_PROJECT",
+            "FAKE_HARD",
+        ]);
+        let dir = scratch_repo("reserve-dead");
+        let (bin, log) = fake_toron(&dir, false);
+        unsafe { std::env::set_var("FLYWHEEL_TORON_BIN", &bin) };
+        unsafe { std::env::set_var("AGENT_NAME", "ScarletCove") };
+        unsafe { std::env::set_var("FLYWHEEL_PROJECT", "flywheel") };
+        fs::write(dir.join("x.rs"), "x\n").unwrap();
+        commit_paths(&dir, &["x.rs".into()], "ok").unwrap();
+        let calls = fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            calls.contains("reserve force-release"),
+            "dead lease survived: {calls}"
+        );
+        assert!(
+            calls.contains("reserve release "),
+            "own lease survived: {calls}"
+        );
+        assert!(calls.contains("x.rs"), "{calls}");
     }
 
     fn install_real_hook(dir: &Path) {
