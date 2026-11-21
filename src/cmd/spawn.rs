@@ -2079,6 +2079,16 @@ projects available: {}",
                 }
             };
             let mut pane_env = hc::plane_launch_env(cfg, mail_identity.as_deref());
+            // bd-9os20/bd-mdpfr: Claude's flywheel plugin is delivered per seat
+            // from the installed data dir (ScarletCove copies it in stack.sh).
+            if crate::harness_registry::canonical(&kind) == "claude" {
+                let data_home = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    format!("{home}/.local/share")
+                });
+                agent_args.push("--plugin-dir".to_string());
+                agent_args.push(format!("{data_home}/flywheel/plugins/claude-flywheel"));
+            }
             if let Some(m) = &env_model_pin {
                 hc::apply_opencode_model_pin(&mut pane_env, m)?;
             }

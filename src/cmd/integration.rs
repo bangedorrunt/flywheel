@@ -50,15 +50,6 @@ impl IntegrationCmd {
     }
 }
 
-fn claude_settings() -> PathBuf {
-    std::env::var("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".claude")
-        })
-        .join("settings.json")
-}
-
 fn codex_hooks() -> PathBuf {
     std::env::var("CODEX_HOME")
         .map(PathBuf::from)
@@ -76,7 +67,9 @@ fn gemini_hooks() -> PathBuf {
 
 fn target(kind: &str) -> Option<PathBuf> {
     match crate::harness_registry::canonical(kind).as_str() {
-        "claude" => Some(claude_settings()),
+        // bd-9os20: the Claude plugin is delivered per seat with
+        // `--plugin-dir` by stack.sh + spawn, not by editing ~/.claude.
+        "claude" => None,
         "codex" => Some(codex_hooks()),
         "grok" => Some(grok_hooks()),
         "antigravity" | "gemini" => Some(gemini_hooks()),
@@ -126,6 +119,10 @@ pub fn cmd_integration(cfg: &Config, cmd: IntegrationCmd) -> Result<()> {
     };
     let pin = std::env::var("AGENT_NAME").unwrap_or_default();
     for kind in harnesses {
+        if crate::harness_registry::canonical(&kind) == "claude" {
+            println!("claude: plugin delivered per seat by --plugin-dir (no config edit)");
+            continue;
+        }
         let Some(path) = target(&kind) else {
             bail!("unsupported harness: {kind}");
         };
