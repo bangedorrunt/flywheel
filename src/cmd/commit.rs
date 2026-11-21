@@ -689,12 +689,33 @@ enum ReservationMode {
     Enforce { escape: bool },
 }
 
+fn guard_nonempty(
+    shared: &Git<'_>,
+    tree: &str,
+    parent: &str,
+    paths: &[String],
+    allow_empty: bool,
+) -> Result<()> {
+    if allow_empty {
+        return Ok(());
+    }
+    let head_tree = shared.out(&["rev-parse", &format!("{parent}^{{tree}}")])?;
+    if tree == head_tree {
+        bail!(
+            "no change in named path(s): {} — refusing an empty commit (use --allow-empty)",
+            paths.join(", ")
+        );
+    }
+    Ok(())
+}
+
 fn commit_tree<F>(
     repo: &Path,
     paths: &[String],
     message: &str,
     ctx: &ReservationCtx,
     mode: ReservationMode,
+    allow_empty: bool,
     mut build: F,
 ) -> Result<String>
 where
@@ -736,6 +757,7 @@ where
     let _guard = IndexGuard(index.clone());
     let private = Git::private(repo, &index);
     let mut tree = build(&private, &old_head)?;
+    guard_nonempty(&shared, &tree, &old_head, paths, allow_empty)?;
     fence_private_tree(repo, &private, &nonce)?;
 
     let mut parent = old_head;
@@ -758,6 +780,7 @@ where
         }
         parent = moved;
         tree = build(&private, &parent)?;
+        guard_nonempty(&shared, &tree, &parent, paths, allow_empty)?;
         fence_private_tree(repo, &private, &nonce)?;
     }
     bail!("HEAD moved {MAX_CAS_RETRIES} times; refusing to commit")
@@ -770,11 +793,18 @@ fn commit_paths_mode(
     message: &str,
     ctx: &ReservationCtx,
     mode: ReservationMode,
+    allow_empty: bool,
 ) -> Result<String> {
     validate_paths(paths)?;
-    let sha = commit_tree(repo, paths, message, ctx, mode, |private, parent| {
-        build_tree(private, paths, parent)
-    })?;
+    let sha = commit_tree(
+        repo,
+        paths,
+        message,
+        ctx,
+        mode,
+        allow_empty,
+        |private, parent| build_tree(private, paths, parent),
+    )?;
     Git::shared(repo).ok(&add_args(&["add", "--"], paths))?;
     Ok(sha)
 }
@@ -788,6 +818,7 @@ fn commit_paths(repo: &Path, paths: &[String], message: &str) -> Result<String> 
         message,
         &ReservationCtx::skip(),
         ReservationMode::Skip,
+        true,
     )
 }
 
@@ -798,6 +829,7 @@ pub(crate) fn commit_paths_checked(
     paths: &[String],
     message: &str,
     no_reservation_check: bool,
+    allow_empty: bool,
     ctx: &ReservationCtx,
 ) -> Result<String> {
     commit_paths_mode(
@@ -808,6 +840,7 @@ pub(crate) fn commit_paths_checked(
         ReservationMode::Enforce {
             escape: no_reservation_check,
         },
+        allow_empty,
     )
 }
 
@@ -831,6 +864,7 @@ where
         message,
         &ReservationCtx::skip(),
         ReservationMode::Skip,
+        true,
         |private, parent| {
             let blobs = splice(parent)?;
             build_blobs_tree(private, &blobs, parent)
@@ -855,11 +889,19 @@ pub(crate) fn cmd_commit(
     message: &str,
     repo: Option<&str>,
     no_reservation_check: bool,
+    allow_empty: bool,
 ) -> Result<()> {
     let repo_arg = repo.unwrap_or(".");
     let repo = fs::canonicalize(repo_arg).with_context(|| format!("repo dir {repo_arg}"))?;
     let ctx = ReservationCtx::from_env();
-    let sha = commit_paths_checked(&repo, paths, message, no_reservation_check, &ctx)?;
+    let sha = commit_paths_checked(
+        &repo,
+        paths,
+        message,
+        no_reservation_check,
+        allow_empty,
+        &ctx,
+    )?;
     println!("commit {}", &sha[..sha.len().min(12)]);
     Ok(())
 }
@@ -1217,7 +1259,7 @@ mod tests {
         let (ctx, log) = fake_toron(&sandbox, "hard");
         let dir = scratch_repo("reserve-live");
         fs::write(dir.join("x.rs"), "x\n").unwrap();
-        let err = commit_paths_checked(&dir, &["x.rs".into()], "blocked", false, &ctx)
+        let err = commit_paths_checked(&dir, &["x.rs".into()], "blocked", false, false, &ctx)
             .unwrap_err()
             .to_string();
         assert!(err.contains("BoldCliff"), "{err}");
@@ -1238,7 +1280,7 @@ mod tests {
         let (ctx, log) = fake_toron(&sandbox, "dead");
         let dir = scratch_repo("reserve-dead");
         fs::write(dir.join("x.rs"), "x\n").unwrap();
-        commit_paths_checked(&dir, &["x.rs".into()], "ok", false, &ctx).unwrap();
+        commit_paths_checked(&dir, &["x.rs".into()], "ok", false, false, &ctx).unwrap();
         let calls = fs::read_to_string(&log).unwrap_or_default();
         assert!(
             calls.contains("reserve force-release"),
@@ -1259,7 +1301,7 @@ mod tests {
         ctx.pin = None;
         let dir = scratch_repo("reserve-nopin");
         fs::write(dir.join("x.rs"), "x\n").unwrap();
-        let err = commit_paths_checked(&dir, &["x.rs".into()], "no pin", false, &ctx)
+        let err = commit_paths_checked(&dir, &["x.rs".into()], "no pin", false, false, &ctx)
             .unwrap_err()
             .to_string();
         assert!(err.contains("AGENT_NAME"), "{err}");
@@ -1274,7 +1316,7 @@ mod tests {
         let (ctx, _log) = fake_toron(&sandbox, "fail");
         let dir = scratch_repo("reserve-unreadable");
         fs::write(dir.join("x.rs"), "x\n").unwrap();
-        let err = commit_paths_checked(&dir, &["x.rs".into()], "fail", false, &ctx)
+        let err = commit_paths_checked(&dir, &["x.rs".into()], "fail", false, false, &ctx)
             .unwrap_err()
             .to_string();
         assert!(err.contains("toron reserve conflicts failed"), "{err}");
@@ -1322,7 +1364,9 @@ mod tests {
         let dir = scratch_repo("coord-mail");
         fs::write(dir.join("x.rs"), "x\n").unwrap();
 
-        assert!(commit_paths_checked(&dir, &["x.rs".into()], "blocked", false, &ctx).is_err());
+        assert!(
+            commit_paths_checked(&dir, &["x.rs".into()], "blocked", false, false, &ctx).is_err()
+        );
         let log = sandbox.root().join("mail.log");
         let first = fs::read_to_string(&log).unwrap_or_default();
         let lines: Vec<&str> = first.lines().collect();
@@ -1342,7 +1386,9 @@ mod tests {
             "captain copy: {first}"
         );
 
-        assert!(commit_paths_checked(&dir, &["x.rs".into()], "blocked", false, &ctx).is_err());
+        assert!(
+            commit_paths_checked(&dir, &["x.rs".into()], "blocked", false, false, &ctx).is_err()
+        );
         let second = fs::read_to_string(&log).unwrap_or_default();
         assert_eq!(second, first, "no duplicate mail inside the window");
     }
@@ -1378,7 +1424,8 @@ mod tests {
         ctx.pin = None;
         let dir = scratch_repo("reserve-escape");
         fs::write(dir.join("x.rs"), "x\n").unwrap();
-        let sha = commit_paths_checked(&dir, &["x.rs".into()], "override", true, &ctx).unwrap();
+        let sha =
+            commit_paths_checked(&dir, &["x.rs".into()], "override", true, false, &ctx).unwrap();
         let msg = git(&dir, &["log", "-1", "--pretty=%B", &sha]);
         assert!(
             msg.contains("flywheel-reservation-check: skipped"),
@@ -1483,6 +1530,45 @@ mod tests {
         fs::write(dir.join("ours.txt"), "ours\n").unwrap();
         let sha = commit_paths(&dir, &["ours.txt".into()], "ours").unwrap();
         assert_eq!(git(&dir, &["rev-parse", "HEAD"]), sha);
+    }
+
+    /// bd-62ei8: a commit whose tree equals HEAD is refused (naming the
+    /// unchanged paths) unless --allow-empty is given.
+    #[test]
+    fn an_unchanged_path_refuses_an_empty_commit_unless_allowed() {
+        let dir = scratch_repo("empty-guard");
+        fs::write(dir.join("a.rs"), "a\n").unwrap();
+        commit_paths(&dir, &["a.rs".into()], "add a").unwrap();
+
+        let err = commit_paths_mode(
+            &dir,
+            &["a.rs".into()],
+            "no change",
+            &ReservationCtx::skip(),
+            ReservationMode::Skip,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("a.rs"),
+            "error must name the unchanged path: {err}"
+        );
+        assert!(
+            err.contains("empty"),
+            "error must explain the refusal: {err}"
+        );
+
+        let sha = commit_paths_mode(
+            &dir,
+            &["a.rs".into()],
+            "allowed empty",
+            &ReservationCtx::skip(),
+            ReservationMode::Skip,
+            true,
+        )
+        .expect("--allow-empty must commit");
+        assert!(!sha.is_empty());
     }
 
     #[test]

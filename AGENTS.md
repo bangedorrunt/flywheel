@@ -23,7 +23,7 @@ bash scripts/verify-needles.sh            # every mutation find= matches once; e
 bash scripts/verify-mutations.sh scripts/mutations/<spec>.spec.sh
 
 # commit and pre-mail check
-flywheel commit <paths> -m <msg> [--repo <dir>]
+flywheel commit <paths> -m <msg> [--repo <dir>] [--allow-empty]
 bash scripts/fence.sh --sha <sha>         # needles, -Dwarnings build, no-run, clippy on that commit
 
 # captain: prove, install, land
@@ -59,7 +59,8 @@ exports or scratch target dirs.
   build, mail its holder.
 - Commit only with `flywheel commit <paths>`. It commits exactly those paths
   through a private index, runs the pre-commit fence and advances HEAD by CAS,
-  so a neighbour's staged entries are never swept in. Never `git add -A`,
+  so a neighbour's staged entries are never swept in. It refuses an empty tree
+  (names the unchanged paths) unless `--allow-empty`. Never `git add -A`,
   `stash`, `checkout --`, `restore`, `reset`, `rebase` or `--amend`.
 - Before you mail a sha, run `scripts/fence.sh --sha <sha>` plus the targeted
   tests and the mutation specs covering the paths you changed. Do not run the
