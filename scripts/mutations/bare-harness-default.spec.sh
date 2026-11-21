@@ -24,8 +24,11 @@ mutation "U1  bare fallback restores the implied slot" \
 mutation "U2  the objective parser ignores bare/explicit model intent" \
     file=src/briefing.rs \
     expect=objective_model_intent_maps_bare_and_explicit \
-    find='pub fn model_intent_from_objective(objective: &str) -> Option<String> {' \
-    replace='pub fn model_intent_from_objective(_objective: &str) -> Option<String> { None }'
+    find='pub fn model_intent_from_objective(objective: &str) -> Option<String> {
+    let lower = objective.to_ascii_lowercase();' \
+    replace='pub fn model_intent_from_objective(objective: &str) -> Option<String> {
+    if true { return None; }
+    let lower = objective.to_ascii_lowercase();'
 
 mutation "U3  @default maps back to the standard slot" \
     file=src/models.rs \
