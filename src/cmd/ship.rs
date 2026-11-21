@@ -919,6 +919,54 @@ pub(crate) fn lesson_advisory(bead: &str) -> String {
     )
 }
 
+/// bd-n21ml: the landing notice carries the bead and sha, correlated so the
+/// crew's inbox threads it with the work that produced the commit.
+fn landed_mail_args(
+    project: &str,
+    as_pin: &str,
+    to_pin: &str,
+    bead: &str,
+    sha: &str,
+) -> Vec<String> {
+    vec![
+        "mail".into(),
+        "send".into(),
+        "--project".into(),
+        project.into(),
+        "--as".into(),
+        as_pin.into(),
+        "--to".into(),
+        to_pin.into(),
+        "--subject".into(),
+        format!("[ship land] {bead} landed"),
+        "--body".into(),
+        format!("{bead} landed at {sha}."),
+        "--corr".into(),
+        bead.into(),
+    ]
+}
+
+/// bd-n21ml: results flow to the crew that can act on them. A replay of a land
+/// must not resend, so the caller only invokes this on a fresh close.
+fn mail_landed_to_assignee(dir: &Path, plan: &LandPlan, sha: &str) {
+    let shown = run_tool(dir, "br", &["show", &plan.bead, "--json"]).unwrap_or_default();
+    let Some(to) = serde_json::from_str::<Value>(&shown)
+        .ok()
+        .and_then(|v| v["assignee"].as_str().map(str::to_string))
+        .filter(|pin| !pin.is_empty())
+    else {
+        return;
+    };
+    let args = landed_mail_args(&plan.project, &plan.pin, &to, &plan.bead, sha);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    if let Err(e) = run_tool(dir, "toron", &refs) {
+        eprintln!(
+            "ship land: warn: could not mail {to} about {}: {e:#}",
+            plan.bead
+        );
+    }
+}
+
 pub(crate) fn ship_land(args: LandArgs<'_>) -> Result<()> {
     let LandArgs {
         cfg,
@@ -1025,7 +1073,8 @@ pub(crate) fn ship_land(args: LandArgs<'_>) -> Result<()> {
     }
 
     // 2. close.
-    if bead_is_closed(&dir, &plan)? {
+    let was_closed = bead_is_closed(&dir, &plan)?;
+    if was_closed {
         eprintln!("ship land: {} already closed", plan.bead);
     } else {
         land_step(&plan, "close", || {
@@ -1095,6 +1144,11 @@ pub(crate) fn ship_land(args: LandArgs<'_>) -> Result<()> {
 
     // 6. the gate, last.
     land_step(&plan, "check", || ship_check(bead, Some(&dir), repo, json))?;
+
+    // 7. bd-n21ml: one notice to the crew that wrote the commit, never on replay.
+    if !was_closed {
+        mail_landed_to_assignee(&dir, &plan, sha);
+    }
     if json {
         print_json(&json!({
             "schema": "flywheel-ship-land.v1",
@@ -1127,7 +1181,7 @@ pub(crate) fn ship_land(args: LandArgs<'_>) -> Result<()> {
 mod tests {
     use super::{
         LandPlan, cache_key_at, gate_for, head_has_closed_bead, head_names_bead, land_project,
-        normalize_spec_path, parse_legal_gates, pick_gate, receipt_is_landable,
+        landed_mail_args, normalize_spec_path, parse_legal_gates, pick_gate, receipt_is_landable,
         receipt_is_witness_mode, record_witnessed_land, status_of,
     };
     use crate::config::Config;
@@ -1150,6 +1204,41 @@ mod tests {
             );
         }
         dir
+    }
+
+    #[test]
+    fn landed_notice_names_the_bead_sha_and_assignee() {
+        let args = landed_mail_args(
+            "flywheel",
+            "SlateHarbor",
+            "PurpleRidge",
+            "bd-n21ml",
+            "abc123def456",
+        );
+        assert!(args.windows(2).any(|w| w == ["--to", "PurpleRidge"]));
+        assert!(args.windows(2).any(|w| w == ["--as", "SlateHarbor"]));
+        assert!(args.windows(2).any(|w| w == ["--corr", "bd-n21ml"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w[1].contains("bd-n21ml landed at abc123def456")),
+            "the body names the landed sha: {args:?}"
+        );
+    }
+
+    #[test]
+    fn ship_land_sends_exactly_one_landed_notice() {
+        let src = include_str!("ship.rs");
+        let body = crate::tripwire::fn_body(src, "ship_land");
+        assert_eq!(
+            body.matches("mail_landed_to_assignee(").count(),
+            1,
+            "one notice on a fresh land; replay is gated by was_closed"
+        );
+        let sender = crate::tripwire::fn_body(src, "mail_landed_to_assignee");
+        assert!(
+            sender.contains("landed_mail_args("),
+            "the notice must carry the bead/sha body"
+        );
     }
 
     /// bd-42vhw: the gate name comes from the bead's OWN legal set, which br
