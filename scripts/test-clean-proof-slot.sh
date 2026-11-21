@@ -15,6 +15,22 @@ export CLEAN_PROOF_LOCK_FILE="$TMP/clean-proof.lock"
 # would skip the flock re-exec (overlap) and the snapshot re-exec (making the
 # S2 mutation indistinguishable from its control).
 unset CLEAN_PROOF_SLOTTED CLEAN_PROOF_SNAPSHOTTED CLEAN_PROOF_SNAPSHOT_DIR
+# bd-xwn96: a mutation spec runs this test from a git-archive export, which has
+# no .git. clean-proof refuses a repo it cannot resolve, so hand it a throwaway
+# git repo. The script under test still comes from $ROOT/scripts (the overlay
+# carries the mutation there); only the repo root is borrowed.
+FAKE="$TMP/fakerepo"
+mkdir -p "$FAKE/scripts"
+cp "$ROOT/scripts/clean-proof.sh" "$FAKE/scripts/clean-proof.sh"
+cp "$ROOT/scripts/proof-lib.sh" "$FAKE/scripts/proof-lib.sh"
+chmod +x "$FAKE/scripts/clean-proof.sh"
+git -C "$FAKE" init -q
+git -C "$FAKE" config user.email test@test
+git -C "$FAKE" config user.name test
+git -C "$FAKE" add scripts/clean-proof.sh scripts/proof-lib.sh
+git -C "$FAKE" commit -qm init
+export CLEAN_PROOF_REPO_ROOT="$FAKE"
+
 MARKER="$TMP/markers.txt"
 export CLEAN_PROOF_LOCK_TEST_MARKER="$MARKER"
 
@@ -78,18 +94,6 @@ PY
 pass "killed holder frees slot promptly"
 
 # --- Case 3: edit source script mid-run; run completes on snapshot copy ---
-FAKE="$TMP/fakerepo"
-mkdir -p "$FAKE/scripts"
-cp "$ROOT/scripts/clean-proof.sh" "$FAKE/scripts/clean-proof.sh"
-cp "$ROOT/scripts/proof-lib.sh" "$FAKE/scripts/proof-lib.sh"
-chmod +x "$FAKE/scripts/clean-proof.sh"
-
-git -C "$FAKE" init -q
-git -C "$FAKE" config user.email test@test
-git -C "$FAKE" config user.name test
-git -C "$FAKE" add scripts/clean-proof.sh scripts/proof-lib.sh
-git -C "$FAKE" commit -qm init
-
 : >"$TMP/marker3.txt"
 CLEAN_PROOF_LOCK_FILE="$TMP/clean-proof3.lock" \
 CLEAN_PROOF_LOCK_TEST_MARKER="$TMP/marker3.txt" \
