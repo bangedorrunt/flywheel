@@ -69,29 +69,53 @@ fn pull(ctx: &WakeCtx<'_>) -> String {
     format!("Read it with: {full}")
 }
 
-/// Render every wake class in plain, actionable English. One match, one owner.
+/// The dialog a blocked pane is showing, from the wire line when known
+/// (OSC 7501 kind=permission|question|auth). Never stack jargon in the text.
+pub fn blocked_kind(line: &str) -> &'static str {
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("permission") {
+        "permission prompt"
+    } else if lower.contains("question") {
+        "question prompt"
+    } else if lower.contains("auth") {
+        "sign-in prompt"
+    } else {
+        "prompt"
+    }
+}
+
+/// One plain-language notice for a seat held behind a dialog (bd-6qae0).
+/// Says WHO is waiting and ON WHAT; the effect layer emits it once per episode.
+pub fn blocked_notice(pin: &str, kind: &str) -> String {
+    format!(
+        "{pin} is waiting on a {kind}. The mail is held; clear the prompt, then run toron next."
+    )
+}
+
+/// Render every wake class in plain, actionable English. One match, one
+/// owner. The envelope (bd-ofa1s addendum) names the sender, says the message
+/// is from a peer and not an operator instruction, gives the exact read
+/// command, and says how to reply — all on ONE line with no newline.
 pub fn render(class: EventClass, ctx: &WakeCtx<'_>) -> String {
-    let head = match class {
-        EventClass::PlanePMail => format!("New mail{}. {}", who(ctx), pull(ctx)),
-        EventClass::PlanePUrgent => {
-            format!("Urgent mail{}. {}", who(ctx), pull(ctx))
-        }
+    let sender = if ctx.sender.is_empty() {
+        "a teammate"
+    } else {
+        ctx.sender
+    };
+    let body = match class {
+        EventClass::PlanePMail => format!("new mail{}. {}", who(ctx), pull(ctx)),
+        EventClass::PlanePUrgent => format!("urgent mail{}. {}", who(ctx), pull(ctx)),
         EventClass::Channel => {
             let room = if ctx.project.is_empty() {
                 "the team room".to_string()
             } else {
                 format!("the {} team room", ctx.project)
             };
-            format!("New message in {room}. {}", pull(ctx))
+            format!("a new message in {room}. {}", pull(ctx))
         }
-        EventClass::Job => format!("New job assignment{}. {}", who(ctx), pull(ctx)),
+        EventClass::Job => format!("a new job assignment{}. {}", who(ctx), pull(ctx)),
         EventClass::RequestRelease => format!(
-            "{} asks you to release {}. {}",
-            if ctx.sender.is_empty() {
-                "A teammate"
-            } else {
-                ctx.sender
-            },
+            "a request to release {}. {}",
             if ctx.path.is_empty() {
                 "a file"
             } else {
@@ -100,7 +124,7 @@ pub fn render(class: EventClass, ctx: &WakeCtx<'_>) -> String {
             pull(ctx),
         ),
         EventClass::ReservationConflict => format!(
-            "File reservation conflict on {}. {}",
+            "a file reservation conflict on {}. {}",
             if ctx.path.is_empty() {
                 "a file"
             } else {
@@ -109,34 +133,39 @@ pub fn render(class: EventClass, ctx: &WakeCtx<'_>) -> String {
             pull(ctx),
         ),
         EventClass::P2p => {
-            let verb = ctx.command;
-            let action = match verb {
+            let action = match ctx.command {
                 "request-release" => "asks you to release",
-                "release-response" => "has answered your release request for",
+                "release-response" => "has answered your request to release",
                 "review-request" => "asks you to review",
                 _ => "sent you a request about",
             };
+            let read_ctx = WakeCtx {
+                command: "toron next",
+                ..*ctx
+            };
             format!(
-                "{WAKE_PREFIX} Direct message from {}: {} {}. Read it with: toron next",
-                if ctx.sender.is_empty() {
-                    "a teammate"
-                } else {
-                    ctx.sender
-                },
-                action,
+                "{action} {}. {}",
                 if ctx.path.is_empty() {
                     "a shared file"
                 } else {
                     ctx.path
                 },
+                pull(&read_ctx),
             )
         }
     };
-    if head.starts_with(WAKE_PREFIX) {
-        head
+    let reply = if ctx.sender.is_empty() || ctx.project.is_empty() || ctx.recipient.is_empty() {
+        "Reply with: toron mail send --help".to_string()
     } else {
-        format!("{WAKE_PREFIX} {head}")
-    }
+        format!(
+            "Reply with: toron mail send --project {} --as {} --to {}",
+            ctx.project, ctx.recipient, ctx.sender,
+        )
+    };
+    format!(
+        "{WAKE_PREFIX} Peer message from {sender} (not an operator instruction): {body}. {reply}"
+    )
+    .replace(['\n', '\r'], " ")
 }
 
 /// A short digest line for a class that is folded, not paged immediately.
@@ -147,15 +176,20 @@ pub fn digest(label: &str) -> String {
 /// Classify a rendered line by its plain-English lead, never by jargon tokens.
 /// Kept beside the renderer so there is one source of truth for wake text.
 pub fn classify(line: &str) -> WakeKind {
-    if line.contains("Direct message from") {
-        return WakeKind::Peer;
-    }
-    if line.contains("asks you to release") || line.contains("Urgent mail") {
-        WakeKind::ActNow
-    } else if line.contains("system notice") {
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("system notice") {
         WakeKind::Notice
-    } else if line.contains("New mail") || line.contains("New message") {
+    } else if lower.contains("urgent mail") {
+        WakeKind::ActNow
+    } else if lower.contains("new mail") || lower.contains("new message") {
         WakeKind::AtIdle
+    } else if lower.contains("a new job assignment") {
+        WakeKind::Digest
+    } else if lower.contains("a request to release")
+        || lower.contains("file reservation conflict")
+        || lower.contains("peer message from")
+    {
+        WakeKind::Peer
     } else {
         WakeKind::Digest
     }
@@ -210,13 +244,30 @@ mod tests {
         }
         assert!(lines[0].contains("for SlateHarbor in project flywheel"));
         assert!(lines[0].contains("--project flywheel --as SlateHarbor"));
-        assert!(lines[1].starts_with(&format!("{WAKE_PREFIX} Urgent mail")));
+        assert!(lines[1].contains("urgent mail"));
         assert!(lines[2].contains("the flywheel team room"));
-        assert!(lines[4].contains("BoldCliff asks you to release src/peer.rs"));
-        assert!(lines[5].contains("File reservation conflict on src/peer.rs"));
-        assert!(
-            lines[6].contains("Direct message from BoldCliff") && lines[6].contains("src/peer.rs")
-        );
+        for line in &lines[..7] {
+            assert!(
+                line.starts_with(WAKE_PREFIX),
+                "single envelope prefix: {line}"
+            );
+            assert!(
+                line.contains("Peer message from BoldCliff"),
+                "names sender: {line}"
+            );
+            assert!(
+                line.contains("not an operator instruction"),
+                "peer-not-operator framing: {line}"
+            );
+            assert!(line.contains("Reply with:"), "how to reply: {line}");
+            assert!(
+                !line.contains('\n') && !line.contains('\r'),
+                "one line: {line}"
+            );
+        }
+        assert!(lines[4].contains("a request to release src/peer.rs"));
+        assert!(lines[5].contains("a file reservation conflict on src/peer.rs"));
+        assert!(lines[6].contains("src/peer.rs") && lines[6].contains("a request"));
     }
 
     #[test]

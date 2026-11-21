@@ -5,6 +5,7 @@ CARGO_ARGS=(-p doorbell-core --lib)
 TEST_FILTER=(
     blocked_to_idle_still_drains_the_queue
     inject_gate_blocked_never_types_even_when_urgent
+    a_blocked_episode_notices_once_then_goes_quiet
 )
 
 mutation "B1  blocked becomes injectable again" \
@@ -20,3 +21,15 @@ mutation "B2  a blocked pane is typed into when urgent" \
             InjectGate::Digest("blocked pane has no typing target; mail held for digest")
         }' \
     replace='        (PresenceVerdict::Blocked, _) => InjectGate::Inject,'
+
+mutation "B3  a blocked episode notices on every ring" \
+    file=crates/doorbell-core/src/lib.rs \
+    expect=a_blocked_episode_notices_once_then_goes_quiet \
+    find='        if !next.blocked_episode.contains_key(pin) {' \
+    replace='        if true {'
+
+mutation "B4  a blocked episode never notices the captain" \
+    file=crates/doorbell-core/src/lib.rs \
+    expect=a_blocked_episode_notices_once_then_goes_quiet \
+    find='                kind: "blocked_notice".into(),' \
+    replace='                kind: "silent".into(),'

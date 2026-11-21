@@ -736,7 +736,12 @@ pub fn p2p_line_from_hint(hint: &str) -> String {
 /// A peer directive wake line. The fold keeps these (they are a direct
 /// directive, not channel chatter).
 pub fn is_p2p_wake(line: &str) -> bool {
-    line.contains("Peer message from")
+    let lower = line.to_ascii_lowercase();
+    lower.contains("asks you to release")
+        || lower.contains("a request about")
+        || lower.contains("answered your request")
+        || lower.contains("asks you to review")
+        || lower.contains("direct message from")
 }
 
 /// Trust-aware line that carries the triggering event id for proof (gap 17).
@@ -990,6 +995,11 @@ pub struct DoorbellModel {
     pub rung: std::collections::BTreeSet<String>,
     /// Last-known hc status per pin.
     pub statuses: BTreeMap<String, String>,
+    /// Pins currently held behind a dialog, with the kind we last saw. One
+    /// plain-language notice per episode; cleared on the next status away
+    /// from blocked (bd-6qae0).
+    #[serde(default)]
+    pub blocked_episode: BTreeMap<String, String>,
     /// Pins (+npubs) this dispatcher owns.
     pub index: SelfIndex,
     /// Per-pin prompt budgets (D4.5, bd-asr2.9): durable model state,
@@ -1310,6 +1320,9 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 .get(pin)
                 .cloned()
                 .unwrap_or_else(|| "unknown".into());
+            if status != "blocked" {
+                next.blocked_episode.remove(pin);
+            }
             if is_drain_transition(&from, status) {
                 let deferred = next
                     .queues
@@ -1430,6 +1443,20 @@ fn route_or_queue(
                 });
             }
         }
+    } else if status == "blocked" {
+        // One plain-language notice per blocked episode: the captain learns
+        // which seat is held and on what, without a notice on every ring.
+        let kind = agent_text::blocked_kind(&line).to_string();
+        if !next.blocked_episode.contains_key(pin) {
+            next.blocked_episode.insert(pin.to_string(), kind.clone());
+            actions.push(DoorbellAction::Audit {
+                kind: "blocked_notice".into(),
+                pin: pin.to_string(),
+                detail: agent_text::blocked_notice(pin, &kind),
+            });
+        }
+        let queue = next.queues.entry(pin.to_string()).or_default();
+        queue_line(queue, key, thread, line.clone());
     } else if next.unroutable.contains(pin) {
         actions.push(DoorbellAction::Digest {
             pin: pin.to_string(),
@@ -1558,6 +1585,70 @@ mod tests {
         for w in ["", "mystery", "null"] {
             assert_eq!(parse_presence_word(w), PresenceVerdict::Unknown);
         }
+    }
+
+    #[test]
+    fn a_blocked_episode_notices_once_then_goes_quiet() {
+        let mut model = model_with("BlueRidge");
+        model.statuses.insert("BlueRidge".into(), "blocked".into());
+        let line = "[wake] mail. permission prompt is open";
+        let mut first = Vec::new();
+        route_or_queue(
+            &mut model,
+            &mut first,
+            "BlueRidge",
+            wake_key(line),
+            None,
+            line.to_string(),
+        );
+        let notices = |actions: &[DoorbellAction]| {
+            actions
+                .iter()
+                .filter(
+                    |a| matches!(a, DoorbellAction::Audit { kind, .. } if kind == "blocked_notice"),
+                )
+                .count()
+        };
+        assert_eq!(notices(&first), 1, "one notice for the episode: {first:?}");
+        assert!(
+            first.iter().any(|a| matches!(
+                a,
+                DoorbellAction::Audit { detail, .. }
+                    if detail.contains("BlueRidge") && detail.contains("permission prompt")
+            )),
+            "the notice must name the seat and the dialog: {first:?}"
+        );
+        let mut second = Vec::new();
+        route_or_queue(
+            &mut model,
+            &mut second,
+            "BlueRidge",
+            wake_key("[wake] more mail"),
+            None,
+            "[wake] more mail".to_string(),
+        );
+        assert_eq!(notices(&second), 0, "no notice on every ring: {second:?}");
+
+        // A new episode (after blocked -> idle) gets one fresh notice.
+        let (next, _) = tick(
+            &model,
+            &DoorbellMsg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+        );
+        model = next;
+        model.statuses.insert("BlueRidge".into(), "blocked".into());
+        let mut third = Vec::new();
+        route_or_queue(
+            &mut model,
+            &mut third,
+            "BlueRidge",
+            wake_key("[wake] new episode"),
+            None,
+            "[wake] new episode".to_string(),
+        );
+        assert_eq!(notices(&third), 1, "a new episode notices again: {third:?}");
     }
 
     #[test]
