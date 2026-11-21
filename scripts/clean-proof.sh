@@ -571,6 +571,86 @@ touch "$MUTATION_RECORDS_FILE"
 RECEIPT_MUTATIONS_BASE="${RECEIPT_MUTATIONS_BASE:-}"
 RECEIPT_CHANGED_PATHS="${RECEIPT_CHANGED_PATHS:-}"
 
+# bd-n21ml: a red proof names the crew that can act on it. Batch one mail per
+# owner (the bead assignee of the last commit touching the spec's target, else
+# its committer) with the log path, cause and exact rerun command. A green
+# receipt mails nobody about failures.
+mail_red_owners() {
+  PROOF_RECEIPT="$1" PROOF_REPO="$2" PROOF_PROJECT="$3" PROOF_MAIL_AS="$4" python3 - <<'PY'
+import json, os, subprocess
+
+def run(args):
+    try:
+        return subprocess.run(args, cwd=os.environ.get("PROOF_REPO", "."),
+                              capture_output=True, text=True, check=False).stdout
+    except OSError:
+        return ""
+
+with open(os.environ["PROOF_RECEIPT"], encoding="utf-8") as fh:
+    receipt = json.load(fh)
+if receipt.get("ok"):
+    raise SystemExit(0)
+
+repo = os.environ.get("PROOF_REPO", ".")
+project = os.environ.get("PROOF_PROJECT", "flywheel")
+sender = os.environ.get("PROOF_MAIL_AS", "Flywheel")
+logs = receipt.get("logs", "")
+
+def owner_for(target):
+    msg = run(["git", "log", "-1", "--format=%B", "--", target])
+    bead = next((t.rstrip(".,;:") for line in msg.splitlines()
+                 for t in line.replace("(", " ").replace(")", " ").split()
+                 if t.startswith("bd-")), "")
+    if bead:
+        try:
+            assignee = json.loads(run(["br", "show", bead, "--json"])).get("assignee")
+            if assignee:
+                return assignee
+        except ValueError:
+            pass
+    return run(["git", "log", "-1", "--format=%an", "--", target]).strip() or "captain"
+
+rows = []
+for row in receipt.get("mutations", []):
+    if not isinstance(row, dict) or row.get("verdict") != "RED":
+        continue
+    spec = row.get("spec", "")
+    target = spec
+    spec_path = os.path.join(repo, "scripts/mutations", spec)
+    if os.path.isfile(spec_path):
+        for line in open(spec_path, encoding="utf-8"):
+            if line.strip().startswith("file="):
+                target = line.strip().split("=", 1)[1].strip()
+                break
+    cause = f"{spec}#{row.get('id', '')} {row.get('expect_test', '')} RED"
+    log = f"{logs}/mutations-{spec}.log" if logs else "(see receipt logs)"
+    rerun = f"bash scripts/verify-mutations.sh scripts/mutations/{spec} --cargo mbx"
+    rows.append((owner_for(target), f"{cause}\nlog: {log}\nrerun: {rerun}"))
+
+failed = receipt.get("failed_step")
+if failed:
+    owner = run(["git", "log", "-1", "--format=%an"]).strip() or "captain"
+    log = f"{logs}/{failed}.log" if logs else "(see receipt logs)"
+    rows.append((owner, f"clean-proof failed at {failed}\nlog: {log}\nrerun: bash scripts/clean-proof.sh --sha <sha>"))
+
+batched = {}
+for owner, body in rows:
+    batched.setdefault(owner, []).append(body)
+for owner, bodies in sorted(batched.items()):
+    args = ["toron", "mail", "send", "--project", project, "--as", sender, "--to", owner,
+            "--subject", f"[clean-proof] {len(bodies)} red row(s)",
+            "--body", "\n\n".join(bodies)]
+    try:
+        out = subprocess.run(args, cwd=repo, capture_output=True, text=True, check=False)
+        if out.returncode:
+            print(f"clean-proof: warn: red mail to {owner} failed: {out.stderr.strip()}")
+        else:
+            print(f"clean-proof: mailed {len(bodies)} red row(s) to {owner}")
+    except OSError as exc:
+        print(f"clean-proof: warn: red mail to {owner} skipped: {exc}")
+PY
+}
+
 OK=0
 [ -n "$FAILED_STEP" ] && OK=1
 
@@ -584,6 +664,11 @@ PROOF_MUTATION_FAILED_SPEC="$MUT_FAILED_SPEC" \
 PROOF_RECEIPT_ARCHIVE="$RECEIPT_ARCHIVE" \
 proof_write_receipt "$RECEIPT" "$OK" "$PROVEN_SHA" "$SHORT" "$STAMP" "$MODE" "$TMP" \
   "$FAILED_STEP" "$STEP_NAMES" "$STEP_STATUSES" "$SIBLING_RECORDS" "$MUTATION_RECORDS_FILE"
+
+# bd-n21ml: route red rows to their owners once the receipt exists. Never fail
+# a proof because a mail could not be delivered.
+mail_red_owners "$RECEIPT" "$ROOT" "${CLEAN_PROOF_PROJECT:-flywheel}" \
+  "${FLYWHEEL_MAIL_AS:-Flywheel}" || true
 
 # bd-jp9z1.2: the witness for a freshly proved spec is THIS receipt, so the
 # entries are written only after it exists.

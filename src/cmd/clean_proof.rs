@@ -757,3 +757,145 @@ fn the_beads_ledger_guard_reads_trailers_not_prose() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// bd-n21ml: lift the mailer out of the script so a fixture receipt can be
+/// routed without running a forty-minute proof.
+fn mail_red_owners_source() -> String {
+    let script = read_script("scripts/clean-proof.sh");
+    let start = script
+        .find("\nmail_red_owners() {")
+        .expect("clean-proof.sh defines mail_red_owners")
+        + 1;
+    let end = script[start..]
+        .find("\n}\n")
+        .expect("mail_red_owners is a closed function")
+        + start
+        + 2;
+    script[start..end].to_string()
+}
+
+fn git_in(dir: &std::path::Path, args: &[&str]) {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn red_rows_mail_the_owner_with_log_and_rerun() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    git_in(repo, &["init", "-q"]);
+    git_in(repo, &["config", "user.email", "t@example.com"]);
+    git_in(repo, &["config", "user.name", "Test"]);
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::create_dir_all(repo.join("scripts/mutations")).unwrap();
+    std::fs::write(repo.join("src/owned.rs"), "fn x() {}\n").unwrap();
+    std::fs::write(
+        repo.join("scripts/mutations/demo.spec.sh"),
+        "# fixture\nfile=src/owned.rs\n",
+    )
+    .unwrap();
+    git_in(
+        repo,
+        &["add", "src/owned.rs", "scripts/mutations/demo.spec.sh"],
+    );
+    git_in(repo, &["commit", "-q", "-m", "fix: bd-owner1 demo"]);
+
+    let bin = repo.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let br = bin.join("br");
+    std::fs::write(
+        &br,
+        "#!/bin/sh\nprintf '%s' '{\"assignee\":\"CrewOwner\"}'\n",
+    )
+    .unwrap();
+    let toron = bin.join("toron");
+    std::fs::write(
+        &toron,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$TORON_LOG\"\n",
+    )
+    .unwrap();
+    for shim in [&br, &toron] {
+        let mut perms = std::fs::metadata(shim).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(shim, perms).unwrap();
+    }
+
+    let receipt = repo.join("receipt.json");
+    std::fs::write(
+        &receipt,
+        r#"{"ok":false,"logs":"/logs","mutations":[{"spec":"demo.spec.sh","id":"D1","expect_test":"a_test","verdict":"RED"}]}"#,
+    )
+    .unwrap();
+    let mail_log = dir.path().join("mail.log");
+    let function = mail_red_owners_source();
+    let sourced = dir.path().join("mailfn.sh");
+    std::fs::write(&sourced, &function).unwrap();
+
+    let run = || {
+        Command::new("bash")
+            .arg("-c")
+            .arg(". \"$1\"; mail_red_owners \"$2\" \"$3\" flywheel Flywheel")
+            .arg("--")
+            .arg(&sourced)
+            .arg(&receipt)
+            .arg(repo)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("TORON_LOG", &mail_log)
+            .current_dir(repo)
+            .output()
+            .expect("run mail_red_owners")
+    };
+
+    let out = run();
+    assert!(
+        out.status.success(),
+        "mailer must not fail the proof: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mailed = std::fs::read_to_string(&mail_log).unwrap_or_default();
+    assert!(
+        mailed.contains("--to CrewOwner"),
+        "owner got the mail: {mailed}"
+    );
+    assert!(
+        mailed.contains("/logs/mutations-demo.spec.sh.log"),
+        "log path: {mailed}"
+    );
+    assert!(
+        mailed.contains(
+            "bash scripts/verify-mutations.sh scripts/mutations/demo.spec.sh --cargo mbx"
+        ),
+        "exact rerun command: {mailed}"
+    );
+
+    std::fs::write(&receipt, r#"{"ok":true,"logs":"/logs","mutations":[]}"#).unwrap();
+    std::fs::write(&mail_log, "").unwrap();
+    let out = run();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&mail_log).unwrap_or_default(),
+        "",
+        "a green proof mails nobody about failures"
+    );
+}
