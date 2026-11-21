@@ -3221,7 +3221,7 @@ fn main() {
             "prefer <role.field>=<value> [--project <p>] | prefer --list [--json] | prefer --forget <role.field> [--project <p>] (ADR-0022 D6: standing preferences — project beats always, exact role beats *; set also records a chie lesson)",
             "crew preview|control|prompt|inbox --open [--pin <pin>]|done <brief-id> --receipt \"<sha + proof + test tail>\" (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker; a dispatched crew prompt IS a brief and `crew done <brief> --receipt` closes it and wakes the captain, falling back to plane-P mail when the captain has no pane row (both paths dead is a typed error saying the captain heard NOTHING); a wake the pane already holds is not a failure — the mail is stored and the prompt exits 0 as queued)",
             "peer intent|request-release|release-response|review-request (structured P2P directives with reactive ⟦p2p:<verb>⟧ wake dispatch)",
-            "captain watch <project> [--interval N] [--json] [--as <pin>] [--stall --stall-minutes N] [--preflight --preflight-mode steer|loop|workflow|cron] (bd-captain-watch-poll-exit-bbwm: harness resume on the captain inbox. The push is escalate@1 mail from the supervisor. This command blocks on that inbox's water and exits with a preview when strictly-newer mail lands; --stall also exits 0 when every bead is closed, or exits 3 when no pane is working and no commit landed for the threshold with work remaining; an unreadable fleet never alarms; --preflight adds an arm that exits 4 with the FIRST failing check and its remedy line, checked at arm time and each poll. One shot: re-arm after each resume)",
+            "captain watch <project> [--interval N] [--json] [--as <pin>] [--stall --stall-minutes N] [--preflight --preflight-mode steer|loop|workflow|cron] [--stream] (bd-captain-watch-poll-exit-bbwm, bd-7ky1v: harness resume on the captain inbox. The push is escalate@1 mail from the supervisor. This command blocks on that inbox's water and exits with a preview when strictly-newer mail lands; --stall also exits 0 when every bead is closed, or exits 3 when no pane is working and no commit landed for the threshold with work remaining; an unreadable fleet never alarms; --preflight adds an arm that exits 4 with the FIRST failing check and its remedy line, checked at arm time and each poll. One shot: re-arm after each resume. --stream never exits on an event; it prints ONE line per mail/stall/preflight/proof event for a line-monitor to wake the captain; the one-shot default is unchanged)",
             "captain directory <project> [--json] (ADR-0019 D2/D4: read-only sessions, tiers, and per-pin addressability — ok <key> or err <code> — from the pure directory projection over an explicitly selected rex backend; never auto/hc on this path)",
             "captain approve <project> --request-key <key> --decision approve|deny [--note <text>] --as <operator-pin> (ADR-0019 D10: verify the operator via whois, mail the asker the 4-line body, fetch-back verify, rehash the payload, run it or settle denied; missing row, self-approval, or unverified sender is approval_mismatch, never a dispatch)",
             "loop-mode run (--resume replays a killed run's checkpoints; default is FRESH) / supervise (child-process --once pass cadence, stops after 3 consecutive failures; a dead-stop probe each pass emits ONE loud escalation + one captain page when no pane is working and no commit landed for --stall-minutes, default 45, with work remaining — a recovering fleet clears it without a second; bd-pane-wedge-detect-respawn-pnyi: a per-pane wedge probe reads each registered pin's pane tail + process liveness and pages ONCE per wedge naming the pin, the pane, and the parked error line, cleared when a commit lands — hc exposes no CPU counter, so zero-CPU is read as its observable equivalent, process still alive + nothing moved) / status/list/prune/doctor/replay/why work assign collab xproj mail steer ledger principles artifacts judgment",
@@ -18530,7 +18530,20 @@ fn upsert_pi_toron(path: &std::path::Path, url: &str, dry: bool) -> Result<Strin
         .as_object_mut()
         .expect("mcpServers object ensured just above");
     let prev = servers.get("toron").cloned();
-    let want = serde_json::json!({"url":url,"directTools":true});
+    // bd-958by: pi-mcp-adapter defaults to `legacy` unless the entry pins a
+    // version. Merge into an existing entry so other server keys survive.
+    let want = match prev.as_ref().and_then(|v| v.as_object()) {
+        Some(existing) => {
+            let mut merged = existing.clone();
+            merged.insert("url".into(), serde_json::json!(url));
+            merged.insert("directTools".into(), serde_json::json!(true));
+            merged.insert("protocolVersion".into(), serde_json::json!("2026-07-28"));
+            serde_json::Value::Object(merged)
+        }
+        None => serde_json::json!({
+            "url":url, "directTools":true, "protocolVersion":"2026-07-28"
+        }),
+    };
     let action = if prev.is_some() {
         if prev.as_ref() == Some(&want) {
             return Ok("pi unchanged".to_string());
@@ -18735,6 +18748,41 @@ mod setup_mcp_tests {
         let _guard = crate::config::lock_env();
         toron_setup_mcp(Some("http://127.0.0.1:18080/mcp"), "claude", 0, true, false)
             .expect("dry run never fails");
+    }
+
+    /// bd-958by: a new pi entry pins the draft protocol so pi-mcp-adapter does
+    /// not fall back to `legacy`, and an existing entry is upgraded in place.
+    #[test]
+    fn setup_mcp_pi_entry_pins_protocol_version() {
+        let path = std::env::temp_dir().join(format!("fw-setup-mcp-pi-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        upsert_pi_toron(&path, "http://127.0.0.1:18080/mcp", false).expect("new pi entry");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("written")).unwrap();
+        assert_eq!(
+            v["mcpServers"]["toron"]["protocolVersion"],
+            serde_json::json!("2026-07-28")
+        );
+
+        let existing = serde_json::json!({
+            "mcpServers": {
+                "toron": {"url": "http://old/mcp", "directTools": true},
+                "other": {"url": "http://other/mcp"}
+            }
+        });
+        std::fs::write(&path, existing.to_string()).unwrap();
+        upsert_pi_toron(&path, "http://127.0.0.1:18080/mcp", false).expect("upgrade pi entry");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("written")).unwrap();
+        assert_eq!(
+            v["mcpServers"]["toron"]["protocolVersion"],
+            serde_json::json!("2026-07-28")
+        );
+        assert_eq!(
+            v["mcpServers"]["other"],
+            serde_json::json!({"url": "http://other/mcp"})
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     /// `flywheel setup-mcp --dry-run` wires nothing: all three agent upserts
