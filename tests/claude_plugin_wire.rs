@@ -21,11 +21,11 @@ fn claude_plugin_speaks_real_events_surface() {
         "events/* are JSON-RPC methods, never MCP tools"
     );
     assert!(
-        register.contains("mcp-events"),
+        register.contains("\"mcp-events\","),
         "the local proxy owns the token; the plugin never reads it"
     );
     assert!(
-        decode.contains("eventId"),
+        decode.contains("event.eventId ?? event.event_id ?? event.id"),
         "toron occurrences carry eventId, not id/content"
     );
     assert!(
