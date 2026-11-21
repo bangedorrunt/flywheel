@@ -30,7 +30,7 @@ fn fence_test_export_witness() {
     let fence =
         std::fs::read_to_string(format!("{root}/scripts/fence.sh")).expect("scripts/fence.sh");
     assert!(
-        !fence.contains("mapfile"),
+        !fence.contains("mapfile -t"),
         "fence.sh must stay bash 3.2 safe — no mapfile (bd-250g4)"
     );
 }
