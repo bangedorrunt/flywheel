@@ -152,8 +152,12 @@ fi
 # are multi-GB and would pile up one per --keep on a nearly-full disk.
 keepbase="$TMP/keep-hook"
 mkdir -p "$keepbase"
+# clean-proof checks ROOT is a git repo before the test hook; a proof export is
+# a git archive with no .git, so point it at a throwaway repo like the keep test.
+keeprepo="$TMP/keep-gitrepo"
+git init -q "$keeprepo"
 unset CLEAN_PROOF_SLOTTED CLEAN_PROOF_SNAPSHOTTED CLEAN_PROOF_SNAPSHOT_DIR
-CLEAN_PROOF_KEEP_TEST=0 TMPDIR="$keepbase/" CLEAN_PROOF_REPO_ROOT="$ROOT" \
+CLEAN_PROOF_KEEP_TEST=0 TMPDIR="$keepbase/" CLEAN_PROOF_REPO_ROOT="$keeprepo" \
   CLEAN_PROOF_LOCK_FILE="$TMP/keep.lock" \
   bash "$ROOT/scripts/clean-proof.sh" --keep >/dev/null 2>&1 || true
 kept="$(find "$keepbase" -maxdepth 1 -type d -name 'fw-proof.*' 2>/dev/null | head -1)"
