@@ -2169,6 +2169,7 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
     use crate::elm::brief_statechart::build_brief_machine;
     use crate::elm::captain_watch_statechart::build_captain_watch_machine;
     use crate::elm::lease_waitlist_statechart::build_lease_waitlist_machine;
+    use crate::elm::mail_queue_statechart::build_mail_queue_machine;
     use crate::elm::p2p_negotiation::{P2PNegotiationState, build_p2p_negotiation_machine};
     use crate::elm::plan_statechart::build_plan_machine;
     use crate::elm::result_mail_statechart::build_result_mail_machine;
@@ -2292,6 +2293,27 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
         )
     }
 
+    fn verify_mail_queue(export_tla: bool) -> WorkflowVerifyChartReport {
+        use toron_core::kernel::StateNodeType;
+        let machine = build_mail_queue_machine();
+        let topology = machine.topology();
+        let is_final = |state: &_| {
+            topology
+                .nodes
+                .get(state)
+                .is_some_and(|node| node.node_type == StateNodeType::Final)
+        };
+        chart_report(
+            "MailQueue",
+            &topology,
+            "a final state",
+            is_final,
+            export_tla.then(|| machine.to_tla_named("MailQueue")),
+            None,
+            &ChartFindings::default(),
+        )
+    }
+
     fn verify_plan(export_tla: bool) -> WorkflowVerifyChartReport {
         use toron_core::kernel::StateNodeType;
         let machine = build_plan_machine();
@@ -2340,6 +2362,14 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
         )
     {
         reports.push(verify_lease_waitlist(export_tla));
+    }
+    if want_all
+        || matches!(
+            want.as_str(),
+            "mailqueue" | "mail-queue" | "mail-queue-statechart"
+        )
+    {
+        reports.push(verify_mail_queue(export_tla));
     }
     if want_all
         || matches!(
