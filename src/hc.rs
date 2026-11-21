@@ -1259,7 +1259,13 @@ fn push_from_backend(
             || allowed.contains(toron_plane::backend::hc::strip_id_prefix(pane.as_str()))
     };
     match ev {
-        BackendEvent::AgentStatusChanged {
+        BackendEvent::ProgramStatusChanged {
+            pane,
+            agent,
+            status,
+            ..
+        }
+        | BackendEvent::AgentStatusChanged {
             pane,
             agent,
             status,

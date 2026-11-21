@@ -170,13 +170,24 @@ fn summarize_status_event(
     seq: &mut u64,
 ) -> Option<StatusEventItem> {
     use toron_plane::backend::BackendEvent::{
-        AgentDetected, AgentStatusChanged, EventsLost, PaneExited, Raw,
+        AgentDetected, AgentStatusChanged, EventsLost, PaneExited, ProgramStatusChanged, Raw,
     };
     let (event_type, pane_id, agent, status) = match ev {
         AgentStatusChanged {
             pane,
             agent,
             status,
+        } => (
+            "pane.agent_status_changed",
+            pane.as_str().to_string(),
+            agent.clone(),
+            status.as_str().to_string(),
+        ),
+        ProgramStatusChanged {
+            pane,
+            agent,
+            status,
+            ..
         } => (
             "pane.agent_status_changed",
             pane.as_str().to_string(),
