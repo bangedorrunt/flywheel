@@ -422,7 +422,16 @@ mod tests {
             panic!("the step must stay a dispatch: {:?}", bound.steps[0]);
         };
         assert_eq!(assignee, "Alpha");
-        assert!(spec.profile.is_none(), "no fresh profile spawn: {spec:?}");
+        assert_eq!(
+            spec.profile.as_deref(),
+            Some("@coder"),
+            "profile must resolve: {spec:?}"
+        );
+        assert_eq!(
+            spec.extra.get("target_pin").and_then(|v| v.as_str()),
+            Some("Alpha"),
+            "the pin must be a typed dispatch override: {spec:?}"
+        );
         assert_eq!(spec.stage.as_deref(), Some("ce-execute"));
         assert!(
             spec.task
@@ -463,10 +472,10 @@ mod tests {
         let names: Vec<&str> = plan.steps.iter().map(|b| b.step.as_str()).collect();
         assert_eq!(
             names,
-            vec!["review", "execute"],
-            "nested dispatch: {names:?}"
+            vec!["execute"],
+            "the nested dispatch is the bindable step: {names:?}"
         );
-        assert!(plan.steps[1].pin.is_some());
+        assert_eq!(plan.steps[0].pin.as_deref(), Some("Alpha"));
 
         let waiting = JoinPlan {
             steps: vec![StepBinding {
