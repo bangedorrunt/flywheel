@@ -3857,6 +3857,19 @@ mod tests {
     }
 
     #[test]
+    fn the_fourth_prompt_in_thirty_minutes_is_digested() {
+        // ADR default PinBudget = 3 prompts / 30 min. The 4th mail in the
+        // window must be dropped by take_allowed (the caller digests it).
+        let mut budgets = BTreeMap::new();
+        let injects: Vec<(String, String)> = (1..=4)
+            .map(|i| ("PinA".to_string(), format!("mail {i}")))
+            .collect();
+        let allowed = take_allowed(injects, &mut budgets, 1_000);
+        assert_eq!(allowed.len(), 3, "the 4th prompt is over budget");
+        assert_eq!(allowed[2].1, "mail 3");
+    }
+
+    #[test]
     fn budget_stops_after_max_prompts() {
         let mut budgets = BTreeMap::new();
         budgets.insert("BlueRidge".into(), PinBudget::new(30, 1, 0));
