@@ -27,4 +27,10 @@ fn fence_test_export_witness() {
         stock.success(),
         "the fence witness must also pass under /bin/bash 3.2 (no mapfile)"
     );
+    let fence =
+        std::fs::read_to_string(format!("{root}/scripts/fence.sh")).expect("scripts/fence.sh");
+    assert!(
+        !fence.contains("mapfile"),
+        "fence.sh must stay bash 3.2 safe — no mapfile (bd-250g4)"
+    );
 }
