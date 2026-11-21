@@ -38,6 +38,7 @@ flywheel integration install|uninstall|status [harness...]   # operator/captain 
 flywheel crew inbox --open [--pin <pin>] [--project p] [--json]
 flywheel crew done <brief-id> --receipt-json <file|-> [--project p]
 flywheel crew land <brief-id> --proof-receipt <proof.json> [--project p]
+flywheel workflow compose --parts <token> --join [--dry-run|--run --yes]   # bind to live seats (bd-3ann1)
 flywheel swarm plan|apply|status <project> ...
 flywheel seat adopt <pin> --pane <block> [--session <id>]   # re-bind a seat to a live pane (bd-01q9d)
 flywheel retire <pin>... [--project p] [--force-working]
