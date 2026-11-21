@@ -48,6 +48,7 @@ GOOD="$(git -C "$REPO" rev-parse HEAD)"
 cat >"$TMP/bin/cargo" <<'SH'
 #!/usr/bin/env bash
 echo "$1" >>"${FAKE_CARGO_LOG:-/dev/null}"
+printf '%s\n' "$*" >>"${FAKE_ARGS_LOG:-/dev/null}"
 printf '%s\n' "$PWD" >>"${FAKE_CWD_LOG:-/dev/null}"
 # bd-8jakq: a targeted test in the TREE sees this uncommitted WIP; the same
 # filter in the clean export does not. A mutation that runs tests in the tree
@@ -219,5 +220,34 @@ FENCE_CARGO="$TMP/bin/cargo" bash "$ROOT/scripts/fence.sh" --repo "$REPO" --sha 
     --paths a.rs --test a_test >/dev/null 2>&1 \
   || fail "--paths must overlay an unstaged path for the export"
 pass "--paths overlays an unstaged path"
+
+# bd-8jakq addition (1): the static test-sandbox guard runs before the build.
+printf '#!/usr/bin/env bash\n[ ! -e "%s/sandbox-offense" ] || { echo "test-sandbox: unsandboxed spawn" >&2; exit 1; }\nexit 0\n' "$REPO" >"$TMP/sandbox-check.sh"
+chmod +x "$TMP/sandbox-check.sh"
+FENCE_SANDBOX_CHECK="$TMP/sandbox-check.sh" FENCE_CARGO="$TMP/bin/cargo" \
+    bash "$ROOT/scripts/fence.sh" --repo "$REPO" --sha "$GOOD" >/dev/null 2>&1 \
+    || fail "the sandbox guard passes when there is no offense"
+touch "$REPO/sandbox-offense"
+if FENCE_SANDBOX_CHECK="$TMP/sandbox-check.sh" FENCE_CARGO="$TMP/bin/cargo" \
+    bash "$ROOT/scripts/fence.sh" --repo "$REPO" --sha "$GOOD" >/dev/null 2>&1; then
+    fail "the fence must refuse an unsandboxed spawn"
+fi
+rm -f "$REPO/sandbox-offense"
+pass "the test-sandbox guard gates the fence"
+
+# bd-8jakq addition (2): --modules derives each changed file's #[cfg(test)]
+# modules and runs them in the export. A fixture cmd/spawn.rs with one test
+# module must produce that exact filter in the cargo log.
+mkdir -p "$REPO/src/cmd"
+printf 'fn main() {}\n' >"$REPO/src/main.rs"
+printf '#[cfg(test)]\nmod spawn_profile_plan_tests { fn t() {} }\n' >"$REPO/src/cmd/spawn.rs"
+: >"$TMP/args.log"
+FENCE_CARGO="$TMP/bin/cargo" FAKE_ARGS_LOG="$TMP/args.log" \
+    bash "$ROOT/scripts/fence.sh" --repo "$REPO" --sha "$GOOD" \
+    --paths src/cmd/spawn.rs --modules >/dev/null 2>&1 \
+    || fail "--modules must run the derived module: $(cat "$TMP/args.log")"
+grep -q 'cmd::spawn::spawn_profile_plan_tests::' "$TMP/args.log" \
+    || fail "the derived module filter must be run: $(cat "$TMP/args.log")"
+pass "--modules runs every test module of a changed file"
 
 echo "ok"

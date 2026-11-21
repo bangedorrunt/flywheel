@@ -10,8 +10,11 @@
 # the fail-fast build), so another lane's uncommitted WIP in the shared tree
 # cannot break your targeted tests. `--paths` overlays a not-yet-staged set of
 # working-tree paths on HEAD for that export; without it the export is the
-# named revision. The export is removed on exit; a kept one is swept on the
-# next green run so old exports do not pile up.
+# named revision. `--modules` derives the test modules of each changed .rs file
+# and runs every one of them in the export (bd-8jakq comments: proof86 died on
+# four tests a single added filter missed). The static test-sandbox guard runs
+# before the build (proof89). The export is removed on exit; a kept one is
+# swept on the next green run so old exports do not pile up.
 #
 # Steps, in the proof's order, stopping at the first failure:
 #   verify-needles · verify-coverage · build -Dwarnings --all-targets ·
@@ -32,6 +35,7 @@ KEEP=0
 INDEX=0
 TEST_FILTER=""
 PATHS=""
+MODULES=0
 CARGO="${FENCE_CARGO:-mbx +nightly-aarch64-apple-darwin}"
 RUSTFMT="${FENCE_RUSTFMT:-rustup run nightly-aarch64-apple-darwin rustfmt --edition 2024}"
 
@@ -43,6 +47,7 @@ while [ $# -gt 0 ]; do
         --keep) KEEP=1 ;;
         --test) TEST_FILTER="$2"; shift ;;
         --paths) PATHS="$2"; shift ;;
+        --modules) MODULES=1 ;;
         -h | --help) sed -n '2,26p' "$0"; exit 0 ;;
         *) echo "fence: unknown arg: $1" >&2; exit 2 ;;
     esac
@@ -107,11 +112,68 @@ echo "fence: $SHA exported to $DEST"
 cd "$DEST"
 
 step() { printf 'fence: %s\n' "$1"; }
+# bd-8jakq: static and cheap; proof89 died on an unsandboxed spawn the fence
+# passed. This guard reads the shared tree's tests, so run it before cd DEST.
+step "test sandbox guard"
+SANDBOX_CHECK="${FENCE_SANDBOX_CHECK:-$ROOT/scripts/check-test-sandbox.sh}"
+bash "$SANDBOX_CHECK"
+
 run_test_filter() {
     [ -n "$TEST_FILTER" ] || return 0
     step "test ($TEST_FILTER) in export"
     # shellcheck disable=SC2086
     $CARGO test --tests $TEST_FILTER
+}
+
+# bd-8jakq: every `#[cfg(test)] mod X` in a changed file is a test module of
+# that file. Run each in the export so a green added filter cannot hide a red
+# sibling module (proof86). Pure derivation from the path + source text.
+run_changed_modules() {
+    [ "$MODULES" -eq 1 ] || return 0
+    local files=()
+    if [ "$INDEX" = 1 ]; then
+        mapfile -t files < <(git -C "$REPO" diff --cached --name-only --diff-filter=ACM -- '*.rs')
+    elif [ -n "$PATHS" ]; then
+        IFS=',' read -r -a files <<<"$PATHS"
+    else
+        mapfile -t files < <(git -C "$REPO" diff --name-only "$SHA" -- '*.rs')
+    fi
+    local f crate args module mods=""
+    for f in "${files[@]}"; do
+        [ -f "$f" ] || continue
+        case "$f" in
+            crates/*/src/lib.rs)
+                crate="$(printf '%s' "$f" | cut -d/ -f2)"
+                args="-p $crate --lib"
+                module=""
+                ;;
+            crates/*/src/*.rs)
+                crate="$(printf '%s' "$f" | cut -d/ -f2)"
+                args="-p $crate --lib"
+                module="$(basename "$f" .rs)::"
+                ;;
+            src/main.rs)
+                args="-p flywheel --bin flywheel"
+                module=""
+                ;;
+            src/cmd/*.rs)
+                args="-p flywheel --bin flywheel"
+                module="cmd::$(basename "$f" .rs)::"
+                ;;
+            src/*.rs)
+                args="-p flywheel --bin flywheel"
+                module="$(basename "$f" .rs)::"
+                ;;
+            *) continue ;;
+        esac
+        mapfile -t mods < <(grep -A1 '#\[cfg(test)\]' "$f" | sed -n 's/^[[:space:]]*mod[[:space:]]\([A-Za-z0-9_]*\)[[:space:]]*{.*/\1/p' | sort -u)
+        for m in "${mods[@]}"; do
+            step "module ($f :: $m) in export"
+            # shellcheck disable=SC2086
+            $CARGO test $args "${module}${m}::" \
+                || { echo "fence: module $f::$m failed" >&2; return 1; }
+        done
+    done
 }
 step "needles"
 bash scripts/verify-needles.sh
@@ -141,6 +203,7 @@ if [ "$INDEX" = 1 ]; then
         # shellcheck disable=SC2086
         $RUSTFMT --check "$f"
     done
+    run_changed_modules
     run_test_filter
     echo "fence: $SHA GREEN (index)"
     exit 0
@@ -150,5 +213,6 @@ step "test --no-run (every target)"
 $CARGO test --workspace --no-run
 step "clippy"
 bash scripts/verify-clippy.sh
+run_changed_modules
 run_test_filter
 echo "fence: $SHA GREEN"
