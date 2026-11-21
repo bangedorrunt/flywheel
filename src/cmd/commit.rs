@@ -218,10 +218,23 @@ fn is_named(path: &str, paths: &[String]) -> bool {
         .any(|p| path == p.as_str() || path.starts_with(format!("{p}/").as_str()))
 }
 
-/// Blobs this path held at any first-parent HEAD in the stale window. A stage
-/// matching one of these is an old HEAD, never a neighbour's fresh intent.
-fn ancestor_blobs(shared: &Git<'_>, path: &str) -> Vec<String> {
-    let revs = shared
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StagedClass {
+    /// Named paths carrying unique content: this commit refuses.
+    conflict: Vec<String>,
+    /// Every stale entry in the whole index (named or not): heal after CAS.
+    stale: Vec<String>,
+    /// Unnamed entries with unique content: leave alone and mail the holder.
+    unclassifiable: Vec<String>,
+}
+
+/// Classify EVERY staged entry in the shared index, not just the paths being
+/// committed. A stage is stale when its blob is one a first-parent HEAD held in
+/// the window, or a staged deletion whose file is unchanged in HEAD and on
+/// disk; neither carries unique work (bd-himh8).
+fn classify_staged(shared: &Git<'_>, paths: &[String]) -> Result<StagedClass> {
+    let staged = shared.out(&["diff", "--cached", "--name-status"])?;
+    let ancestors = shared
         .out(&[
             "rev-list",
             "--first-parent",
@@ -229,52 +242,128 @@ fn ancestor_blobs(shared: &Git<'_>, path: &str) -> Vec<String> {
             "HEAD",
         ])
         .unwrap_or_default();
-    revs.lines()
-        .filter_map(|rev| shared.out(&["rev-parse", &format!("{rev}:{path}")]).ok())
-        .filter(|blob| !blob.is_empty())
-        .collect()
-}
-
-/// Never strip a neighbour's INTENTIONAL hunks: refuse when a named path is
-/// staged with a blob no first-parent HEAD in the stale window ever held.
-/// A stage matching an old HEAD (or a stale deletion) is tolerated and returned
-/// so the caller can point it at the blob this commit lands after CAS.
-fn refuse_foreign_stage(shared: &Git<'_>, paths: &[String]) -> Result<Vec<String>> {
-    let staged = shared.out(&["diff", "--cached", "--name-status"])?;
-    let mut stale = Vec::new();
-    let mut conflict = Vec::new();
+    let mut class = StagedClass::default();
     for line in staged.lines() {
         let mut fields = line.split('\t');
         let status = fields.next().unwrap_or("");
         for path in fields {
-            if !is_named(path, paths) {
-                continue;
-            }
-            let stale_delete = status.starts_with('D');
-            let staged_blob = shared
+            let named = is_named(path, paths);
+            let head_blob = shared.out(&["rev-parse", &format!("HEAD:{path}")]).ok();
+            let stage_blob = shared
                 .out(&["rev-parse", &format!(":{path}")])
                 .unwrap_or_default();
-            if stale_delete || ancestor_blobs(shared, path).contains(&staged_blob) {
-                if !stale.iter().any(|p: &String| p == path) {
-                    stale.push(path.to_string());
+            // A named path being re-created is the existing commit contract;
+            // an unnamed one is only stale when the disk copy still equals HEAD.
+            let stale_delete = status.starts_with('D')
+                && head_blob.is_some()
+                && (named
+                    || std::fs::read(shared.repo.join(path))
+                        .ok()
+                        .is_some_and(|raw| {
+                            shared
+                                .out_stdin(&["hash-object", "--stdin"], &raw)
+                                .unwrap_or_default()
+                                == head_blob.clone().unwrap_or_default()
+                        }));
+            let stale_blob = !stage_blob.is_empty()
+                && ancestors.lines().any(|rev| {
+                    shared
+                        .out(&["rev-parse", &format!("{rev}:{path}")])
+                        .unwrap_or_default()
+                        == stage_blob
+                });
+            if stale_delete || stale_blob {
+                if !class.stale.iter().any(|p: &String| p == path) {
+                    class.stale.push(path.to_string());
                 }
+            } else if named {
+                class.conflict.push(path.to_string());
             } else {
-                conflict.push(path.to_string());
+                class.unclassifiable.push(path.to_string());
             }
         }
     }
-    if !conflict.is_empty() {
-        bail!(
-            "named path(s) already staged in the shared index (another lane's hunks?): {} — mail the holder, do not strip them",
-            conflict.join(", ")
-        );
-    }
-    Ok(stale)
+    Ok(class)
 }
 
-/// After a successful CAS, point each tolerated stale shared-index entry at
-/// the blob this commit landed. Only paths `refuse_foreign_stage` cleared are
-/// touched, so a neighbour's intentional stage is never overwritten (bd-j1g64).
+/// Mail the holder of a unique staged entry we refused to touch. Best effort:
+/// a missing pin/project or a dead toron degrades to a loud warning, never a
+/// silent skip and never a mutation of the neighbour's stage (bd-himh8).
+fn report_unclassifiable(paths: &[String]) {
+    let (Ok(pin), Ok(project)) = (
+        std::env::var("AGENT_NAME"),
+        std::env::var("FLYWHEEL_PROJECT"),
+    ) else {
+        for path in paths {
+            eprintln!(
+                "flywheel commit: UNIQUE staged content for {path} was left alone; mail the reserving holder"
+            );
+        }
+        return;
+    };
+    for path in paths {
+        let found = Command::new("toron")
+            .args([
+                "reserve",
+                "conflicts",
+                "--project",
+                &project,
+                "--as",
+                &pin,
+                "--paths",
+                path,
+                "--json",
+            ])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+            .and_then(|v| {
+                v.get("conflicts")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|c| c.get("holders")?.as_array())
+                    .flatten()
+                    .filter_map(|h| h.as_str().map(str::to_string))
+                    .next()
+            });
+        match found {
+            Some(holder) => {
+                let body = format!(
+                    "flywheel commit left your unique staged change to {path} untouched. Reserve/release or commit it yourself before a plain git commit sweeps it."
+                );
+                let mailed = Command::new("flywheel")
+                    .args([
+                        "mail",
+                        "send",
+                        "--project",
+                        &project,
+                        "--as",
+                        &pin,
+                        "--to",
+                        &holder,
+                        "--subject",
+                        "unique staged path left untouched by flywheel commit",
+                        "--body",
+                        &body,
+                    ])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !mailed {
+                    eprintln!("flywheel commit: could not mail {holder} about {path}");
+                }
+            }
+            None => eprintln!(
+                "flywheel commit: UNIQUE staged content for {path} has no live reserving holder; mail the last editor"
+            ),
+        }
+    }
+}
+
+/// After a successful CAS, point every stale shared-index entry (any path,
+/// not just the committed ones) at the blob HEAD now holds. Unique stages are
+/// never in this list, so a neighbour's intent survives (bd-himh8).
 fn sync_stale_stage(shared: &Git<'_>, stale: &[String], commit: &str) -> Result<()> {
     for path in stale {
         let entry = shared.out(&["ls-tree", commit, "--", path])?;
@@ -282,7 +371,8 @@ fn sync_stale_stage(shared: &Git<'_>, stale: &[String], commit: &str) -> Result<
         let mode = parts.next().unwrap_or("100644");
         let _kind = parts.next();
         let Some(blob) = parts.next() else {
-            continue; // the commit deleted this path; nothing to stage
+            shared.ok(&["update-index", "--force-remove", "--", path])?;
+            continue;
         };
         shared.ok(&[
             "update-index",
@@ -297,6 +387,7 @@ fn sync_stale_stage(shared: &Git<'_>, stale: &[String], commit: &str) -> Result<
 /// Warn when the SHARED index holds a staged entry for a path outside this
 /// commit whose blob came from an ancestor of HEAD, not from HEAD: a stale
 /// stage that a later plain commit would revert (bd-j1g64).
+#[cfg(test)]
 fn stale_stage_warnings(shared: &Git<'_>, paths: &[String]) -> Result<Vec<String>> {
     let staged = shared.out(&["diff", "--cached", "--name-only"])?;
     let mut warnings = Vec::new();
@@ -335,13 +426,6 @@ fn stale_stage_warnings(shared: &Git<'_>, paths: &[String]) -> Result<Vec<String
     Ok(warnings)
 }
 
-fn warn_stale_stage(shared: &Git<'_>, paths: &[String]) -> Result<()> {
-    for warning in stale_stage_warnings(shared, paths)? {
-        eprintln!("{warning}");
-    }
-    Ok(())
-}
-
 /// The one private-index fence + CAS path. `build` produces a tree on top of
 /// the named parent; it is called again after a CAS race so a tree built on an
 /// old HEAD can never revert what another lane landed.
@@ -351,8 +435,14 @@ where
 {
     let shared = Git::shared(repo);
     let old_head = shared.out(&["rev-parse", "HEAD"])?;
-    let stale = refuse_foreign_stage(&shared, paths)?;
-    warn_stale_stage(&shared, paths)?;
+    let class = classify_staged(&shared, paths)?;
+    if !class.conflict.is_empty() {
+        bail!(
+            "named path(s) already staged in the shared index (another lane's hunks?): {} — mail the holder, do not strip them",
+            class.conflict.join(", ")
+        );
+    }
+    report_unclassifiable(&class.unclassifiable);
 
     let unique = format!(
         "{}-{}",
@@ -375,7 +465,7 @@ where
         let commit = shared.out(&["commit-tree", &tree, "-p", &parent, "-m", message])?;
         let update = shared.run(&["update-ref", "HEAD", &commit, &parent])?;
         if update.status.success() {
-            sync_stale_stage(&shared, &stale, &commit)?;
+            sync_stale_stage(&shared, &class.stale, &commit)?;
             return Ok(commit);
         }
         let moved = shared.out(&["rev-parse", "HEAD"])?;
@@ -681,6 +771,57 @@ mod tests {
             git(&dir, &["rev-parse", ":base.txt"]),
             new_blob,
             "the stale delete must be restored to the committed blob"
+        );
+    }
+
+    /// bd-himh8: stale stages on OTHER paths are healed after the CAS, while
+    /// an entry with unique staged content is left exactly alone and reported.
+    #[test]
+    fn stale_stages_outside_the_committed_paths_are_healed() {
+        let dir = scratch_repo("heal-all");
+        fs::write(dir.join("a.rs"), "a1\n").unwrap();
+        fs::write(dir.join("b.rs"), "b1\n").unwrap();
+        git(&dir, &["add", "a.rs", "b.rs"]);
+        git(&dir, &["commit", "-qm", "c1"]);
+        fs::write(dir.join("a.rs"), "a2\n").unwrap();
+        git(&dir, &["add", "a.rs"]);
+        git(&dir, &["commit", "-qm", "c2"]);
+
+        let old_a = git(&dir, &["rev-parse", "HEAD^:a.rs"]);
+        git(
+            &dir,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{old_a},a.rs"),
+            ],
+        );
+        // b.rs exists unchanged in HEAD and on disk: staged deletion is stale.
+        git(&dir, &["rm", "--cached", "-q", "b.rs"]);
+        // d.rs carries unique content nobody committed: must survive the heal.
+        fs::write(dir.join("d.rs"), "unique\n").unwrap();
+        git(&dir, &["add", "d.rs"]);
+        fs::write(dir.join("c.rs"), "c\n").unwrap();
+
+        let class = classify_staged(&Git::shared(&dir), &["c.rs".to_string()]).unwrap();
+        assert!(class.stale.contains(&"a.rs".to_string()), "{class:?}");
+        assert!(class.stale.contains(&"b.rs".to_string()), "{class:?}");
+        assert_eq!(class.unclassifiable, vec!["d.rs".to_string()], "{class:?}");
+
+        commit_paths(&dir, &["c.rs".to_string()], "add c").unwrap();
+        let staged = git(&dir, &["diff", "--cached", "--name-only"]);
+        assert!(
+            !staged.lines().any(|p| p == "a.rs"),
+            "a.rs still stale: {staged}"
+        );
+        assert!(
+            !staged.lines().any(|p| p == "b.rs"),
+            "b.rs still deleted: {staged}"
+        );
+        assert!(
+            staged.lines().any(|p| p == "d.rs"),
+            "unique stage was stripped: {staged}"
         );
     }
 
