@@ -158,6 +158,21 @@ fn proof_verify_mutations_exports_pinned_siblings() {
     );
 }
 
+/// bd-feu67: a mutation is proof only when the NAMED test failed, not when
+/// its name appears in a passing line beside another test's failure.
+#[test]
+fn proof_verify_mutations_credits_only_the_named_test() {
+    let status = Command::new("bash")
+        .arg(format!(
+            "{}/scripts/test-verify-mutations-expected-test.sh",
+            root()
+        ))
+        .current_dir(root())
+        .status()
+        .expect("run expected-test witness");
+    assert!(status.success(), "expected-test verdict witness failed");
+}
+
 /// bd-08t3o: the pinned-siblings witness must ignore a build dir inherited
 /// from the outer proof, or clean-proof reuses the outer export and the
 /// witness becomes a no-op that fails for the wrong reason.

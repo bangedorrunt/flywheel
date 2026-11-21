@@ -192,13 +192,39 @@ classify() {
     esac
     case "$out" in
         *"test result: FAILED"*)
-            case "$out" in
-                *"$expect"*) printf '%s\n' "$VERDICT_RED" ;;
-                *) printf '%s\n' "$VERDICT_OTHER" ;;
-            esac
+            if expected_test_failed "$out" "$expect"; then
+                printf '%s\n' "$VERDICT_RED"
+            else
+                printf '%s\n' "$VERDICT_OTHER"
+            fi
             ;;
         *) printf '%s\n' "$VERDICT_VACUOUS" ;;
     esac
+}
+
+# bd-feu67: RED means the NAMED test failed, not merely that its name
+# appeared in a passing line while some other test broke. Cargo reports a
+# failed test either on its `test ... FAILED` line or in the `failures:`
+# summary block; a name in a passing line is not evidence.
+expected_test_failed() {
+    local out="$1" expect="$2" line in_failures=0
+    while IFS= read -r line; do
+        case "$line" in
+            test*"$expect"*FAILED*) return 0 ;;
+        esac
+    done <<<"$out"
+    while IFS= read -r line; do
+        case "$line" in
+            failures:*) in_failures=1; continue ;;
+            "test result:"*) in_failures=0 ;;
+        esac
+        if [ "$in_failures" -eq 1 ]; then
+            case "$line" in
+                *"$expect"*) return 0 ;;
+            esac
+        fi
+    done <<<"$out"
+    return 1
 }
 
 # Called by the spec. Named key=value arguments so a 17-mutation spec reads as
