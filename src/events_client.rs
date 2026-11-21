@@ -33,6 +33,31 @@ pub struct UreqRpc {
     agent: ureq::Agent,
 }
 
+/// bd-5vi2x: a revoked/rotated token yields a 401; re-read the 0600 file and
+/// retry ONCE with the fresh value. Generic so the revoke path is testable with
+/// a fake sender (no live daemon). Never logs the token.
+pub fn post_with_token_reread<T, E>(
+    token_path: &std::path::Path,
+    mut send: impl FnMut(&str) -> Result<T, E>,
+    is_unauthorized: impl Fn(&E) -> bool,
+) -> Result<T, String>
+where
+    E: std::fmt::Display,
+{
+    let token = crate::events_tokens::read_token_file(token_path)?;
+    match send(&token) {
+        Ok(v) => Ok(v),
+        Err(e) if is_unauthorized(&e) => {
+            let fresh = crate::events_tokens::read_token_file(token_path)?;
+            if fresh == token {
+                return Err("toron events unauthorized (token unchanged)".to_string());
+            }
+            send(&fresh).map_err(|e| format!("toron events request failed after re-read: {e}"))
+        }
+        Err(e) => Err(format!("toron events request failed: {e}")),
+    }
+}
+
 impl UreqRpc {
     pub fn new(url: &str, token_path: &str) -> Self {
         let endpoint = if url.ends_with("/mcp") {
@@ -69,21 +94,12 @@ impl UreqRpc {
     }
 
     fn post(&self, body: &str, last_event_id: Option<&str>) -> Result<ureq::Response, String> {
-        let token = crate::events_tokens::read_token_file(std::path::Path::new(&self.token_path))?;
-        match self.post_once(&token, body, last_event_id) {
-            Err(e) if matches!(*e, ureq::Error::Status(401, _)) => {
-                // The token may have been rotated between requests. Re-read the
-                // file; if it changed, retry once with the fresh value.
-                let fresh =
-                    crate::events_tokens::read_token_file(std::path::Path::new(&self.token_path))?;
-                if fresh == token {
-                    return Err("toron events unauthorized (token unchanged)".to_string());
-                }
-                self.post_once(&fresh, body, last_event_id)
-                    .map_err(|e| format!("toron events request failed after re-read: {e}"))
-            }
-            other => other.map_err(|e| format!("toron events request failed: {e}")),
-        }
+        let path = std::path::Path::new(&self.token_path);
+        post_with_token_reread(
+            path,
+            |token| self.post_once(token, body, last_event_id),
+            |e| matches!(**e, ureq::Error::Status(401, _)),
+        )
     }
 }
 
@@ -478,5 +494,30 @@ mod tests {
         let page = client.fetch("0").expect("fetch");
         assert!(page.gap);
         assert_eq!(page.next_cursor, "42");
+    }
+
+    #[test]
+    fn a_revoked_token_401_reloads_the_file_and_retries_with_the_fresh_one() {
+        let dir = std::env::temp_dir().join(format!("fw-revoke-reread-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("seat.token");
+        crate::events_tokens::write_token_file(&path, "revoked").expect("write revoked");
+        let mut seen = Vec::new();
+        let result: Result<&str, String> = post_with_token_reread(
+            &path,
+            |token| {
+                seen.push(token.to_string());
+                if token == "revoked" {
+                    crate::events_tokens::write_token_file(&path, "fresh").expect("fresh token");
+                    Err("401")
+                } else {
+                    Ok("ok")
+                }
+            },
+            |e| *e == "401",
+        );
+        assert_eq!(result.unwrap(), "ok");
+        assert_eq!(seen, vec!["revoked", "fresh"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
