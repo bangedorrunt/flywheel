@@ -8,13 +8,13 @@ TEST_FILTER=(a_live_reservation_refuses_the_commit a_dead_lease_is_cleared_and_a
 mutation "R1  commit ignores a live foreign lease" \
     file=src/cmd/commit.rs \
     expect=a_live_reservation_refuses_the_commit \
-    find='            guard_commit_reservations(paths, ctx)?;' \
+    find='            guard_commit_reservations(repo, paths, ctx)?;' \
     replace='            let _ = (paths, ctx);'
 
 mutation "R2  a successful commit keeps its own leases" \
     file=src/cmd/commit.rs \
     expect=a_dead_lease_is_cleared_and_a_success_releases_own \
-    find='                release_own_reservations(paths, ctx);' \
+    find='                release_own_reservations(repo, paths, ctx);' \
     replace='                let _ = (paths, ctx);'
 
 mutation "R3  a missing pin silently skips the guard" \

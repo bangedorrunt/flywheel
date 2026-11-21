@@ -551,13 +551,18 @@ fn report_unclassifiable(paths: &[String], ctx: &ReservationCtx) {
 const RESERVATION_ESCAPE: &str =
     "pass --no-reservation-check to commit anyway (recorded in the commit message)";
 
-fn guard_commit_reservations(paths: &[String], ctx: &ReservationCtx) -> Result<()> {
+fn guard_commit_reservations(repo: &Path, paths: &[String], ctx: &ReservationCtx) -> Result<()> {
     // bd-ahkw1: no identity is NOT consent. Refuse and say how to identify or
     // escape, instead of silently skipping every lease.
     let pin = ctx.pin.as_deref().ok_or_else(|| {
         anyhow!("flywheel commit: no AGENT_NAME/--as identity; set it or {RESERVATION_ESCAPE}")
     })?;
     let project = &ctx.project;
+    // bd-kam8b: the board keys sibling lanes relative to the project dir,
+    // so the check must ask about the project-relative paths, not the
+    // repo-relative ones.
+    let root = board_workspace_root();
+    let check = reservation_paths(project, &root, repo, paths);
     let out = Command::new(&ctx.toron_bin)
         .args([
             "reserve",
@@ -567,7 +572,7 @@ fn guard_commit_reservations(paths: &[String], ctx: &ReservationCtx) -> Result<(
             "--as",
             pin,
             "--paths",
-            &paths.join(","),
+            &check.join(","),
             "--json",
         ])
         .output()
@@ -612,13 +617,95 @@ fn guard_commit_reservations(paths: &[String], ctx: &ReservationCtx) -> Result<(
     Ok(())
 }
 
+/// Relative path from `base` to `target`, with `..` for each level the base
+/// must climb. Returns None when either side is not absolute or they share
+/// no ancestor — the caller then passes paths through untouched rather than
+/// inventing a prefix.
+fn relative_path(base: &Path, target: &Path) -> Option<PathBuf> {
+    if !(base.is_absolute() && target.is_absolute()) {
+        return None;
+    }
+    let mut base_comps = base.components();
+    let mut target_comps = target.components();
+    // Consume the common prefix (at least the root always matches when both
+    // are absolute on the same drive). Zero consumed means unrelated roots:
+    // invent nothing.
+    let mut shared = 0u32;
+    loop {
+        match (base_comps.clone().next(), target_comps.clone().next()) {
+            (Some(a), Some(b)) if a == b => {
+                base_comps.next();
+                target_comps.next();
+                shared += 1;
+            }
+            _ => break,
+        }
+    }
+    if shared == 0 {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for _ in base_comps {
+        out.push("..");
+    }
+    out.extend(target_comps);
+    Some(out)
+}
+
+/// bd-kam8b: the reservation board keys sibling lanes relative to the
+/// project dir (`../toron/...`), but a commit names repo-relative paths. Map
+/// each committed path to its project-relative form — the repo dir relative
+/// to the project dir, joined with the path — so the check and the release
+/// match what the board holds. The project repo itself maps to no prefix.
+pub(crate) fn reservation_paths(
+    project: &str,
+    workspace_root: &Path,
+    repo: &Path,
+    paths: &[String],
+) -> Vec<String> {
+    let base = Path::new(project);
+    let project_dir = if base.is_absolute() {
+        base.to_path_buf()
+    } else {
+        workspace_root.join(base)
+    };
+    // Only repos inside the workspace map at all: anything else (or the
+    // workspace root itself) passes through rather than inventing `../..`.
+    if repo
+        .strip_prefix(workspace_root)
+        .map(|rel| rel.as_os_str().is_empty())
+        .unwrap_or(true)
+    {
+        return paths.to_vec();
+    }
+    let prefix = relative_path(&project_dir, repo)
+        .filter(|rel| !rel.as_os_str().is_empty())
+        .map(|rel| rel.to_string_lossy().into_owned());
+    let Some(prefix) = prefix else {
+        return paths.to_vec();
+    };
+    paths.iter().map(|p| format!("{prefix}/{p}")).collect()
+}
+
+/// The workspace root the reservation board is keyed under: the loaded
+/// config, so FLYWHEEL_ROOT (and the test sandbox) takes effect.
+fn board_workspace_root() -> PathBuf {
+    crate::config::Config::load()
+        .map(|c| c.workspace_root())
+        .unwrap_or_else(|_| crate::config::Config::default().workspace_root())
+}
+
 /// bd-ahkw1: a successful commit frees the committer's own leases on the paths
 /// it landed; a refused or failed commit keeps them.
-fn release_own_reservations(paths: &[String], ctx: &ReservationCtx) {
+fn release_own_reservations(repo: &Path, paths: &[String], ctx: &ReservationCtx) {
     let Some(pin) = ctx.pin.as_deref() else {
         return;
     };
     let project = &ctx.project;
+    // bd-kam8b: release the project-relative paths the board holds, not the
+    // repo-relative ones the commit named.
+    let root = board_workspace_root();
+    let release = reservation_paths(project, &root, repo, paths);
     let _ = Command::new(&ctx.toron_bin)
         .args([
             "reserve",
@@ -628,7 +715,7 @@ fn release_own_reservations(paths: &[String], ctx: &ReservationCtx) {
             "--as",
             pin,
             "--paths",
-            &paths.join(","),
+            &release.join(","),
         ])
         .status();
 }
@@ -747,7 +834,7 @@ where
     let message = match mode {
         ReservationMode::Skip => message.to_string(),
         ReservationMode::Enforce { escape: false, .. } => {
-            guard_commit_reservations(paths, ctx)?;
+            guard_commit_reservations(repo, paths, ctx)?;
             message.to_string()
         }
         ReservationMode::Enforce { escape: true, .. } => {
@@ -794,7 +881,7 @@ where
                     ..
                 }
             ) {
-                release_own_reservations(paths, ctx);
+                release_own_reservations(repo, paths, ctx);
             }
             return Ok(commit);
         }
@@ -988,6 +1075,33 @@ mod tests {
             .lines()
             .map(str::to_string)
             .collect()
+    }
+
+    /// bd-kam8b: sibling-repo paths map project-relative for the board,
+    /// while the project repo itself and anything outside it pass through
+    /// untouched.
+    #[test]
+    fn sibling_paths_map_repo_prefixed_for_the_board() {
+        let root = PathBuf::from("/ws");
+        let sibling = PathBuf::from("/ws/toron");
+        let main = PathBuf::from("/ws/flywheel");
+        let paths = vec!["crates/toron-cli/src/main.rs".to_string()];
+        assert_eq!(
+            reservation_paths("flywheel", &root, &sibling, &paths),
+            vec!["../toron/crates/toron-cli/src/main.rs".to_string()],
+            "sibling lanes reserve project-relative"
+        );
+        assert_eq!(
+            reservation_paths("flywheel", &root, &main, &paths),
+            paths,
+            "the project repo itself is unprefixed"
+        );
+        assert_eq!(
+            reservation_paths("flywheel", &root, &PathBuf::from("/elsewhere/repo"), &paths),
+            paths,
+            "outside the project dir there is nothing to map against"
+        );
+        assert!(reservation_paths("flywheel", &root, &root, &paths) == paths);
     }
 
     #[test]
@@ -1345,6 +1459,57 @@ mod tests {
             "own lease survived: {calls}"
         );
         assert!(calls.contains("x.rs"), "{calls}");
+    }
+
+    /// bd-kam8b: a commit from a sibling repo checks and releases the
+    /// project-relative paths the board holds, not the repo-relative ones
+    /// it named.
+    #[test]
+    fn sibling_commit_checks_and_releases_prefixed_paths() {
+        let sandbox = flywheel_test_sandbox::TestSandbox::new();
+        let (ctx, log) = fake_toron(&sandbox, "soft");
+        let home = sandbox.root().join("home");
+        unsafe { std::env::set_var("FLYWHEEL_ROOT", home.join("workspace")) };
+        let repo = home.join("workspace").join("toron");
+        fs::create_dir_all(repo.join("hooks")).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.name", "Test Agent"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "core.hooksPath", "hooks"]);
+        fs::write(repo.join("base.txt"), "base\n").unwrap();
+        git(&repo, &["add", "base.txt"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        hook(&repo, "exit 0");
+        fs::create_dir_all(repo.join("crates")).unwrap();
+        fs::write(repo.join("crates/x.rs"), "x\n").unwrap();
+        commit_paths_checked(
+            &repo,
+            &["crates/x.rs".into()],
+            "ok",
+            false,
+            false,
+            false,
+            &ctx,
+        )
+        .unwrap();
+        let calls = fs::read_to_string(&log).unwrap_or_default();
+        let conflicts = calls
+            .lines()
+            .find(|l| l.starts_with("reserve conflicts"))
+            .unwrap_or("");
+        let release = calls
+            .lines()
+            .find(|l| l.starts_with("reserve release "))
+            .unwrap_or("");
+        assert!(
+            conflicts.contains("../toron/crates/x.rs"),
+            "the check asked about the repo-relative path: {calls}"
+        );
+        assert!(
+            release.contains("../toron/crates/x.rs"),
+            "the release freed the repo-relative path: {calls}"
+        );
+        unsafe { std::env::remove_var("FLYWHEEL_ROOT") };
     }
 
     /// bd-u1n91: --keep-lease keeps the hold across commits; the default path
