@@ -1276,6 +1276,13 @@ pub(crate) fn with_recorded_harness(mut entry: state::SpawnEntry, kind: &str) ->
 /// wakes can ride `session.prompt` instead of typing into the TUI. bd-edva3:
 /// antigravity's conversation id is learned from the SEAT by a PreInvocation
 /// hook, never from the spawner's environment. Other seats get `None`.
+/// bd-4n2bn: harnesses whose seats take the pi-style per-seat agentDir
+/// events bridge. omp is a pi fork honoring PI_CODING_AGENT_DIR (verified
+/// in the omp 18.2.5 binary strings); opencode has its own config path.
+pub(crate) fn pi_style_events_kind(kind: &str) -> bool {
+    matches!(kind, "pi" | "omp")
+}
+
 pub(crate) fn mint_harness_session(kind: &str, args: &mut Vec<String>) -> Option<String> {
     if crate::harness_registry::canonical(kind) != "opencode" {
         return None;
@@ -2150,10 +2157,11 @@ projects available: {}",
                     );
                 }
             }
-            // bd-4n2bn: a pi seat gets a per-seat agentDir whose settings load
-            // the first-party events extension; the token is a 0600 file PATH
-            // in the pane env, never plaintext. No token -> doorbell fallback.
-            if kind == "pi"
+            // bd-4n2bn: pi and omp seats get a per-seat agentDir whose settings
+            // load the first-party events extension; the token is a 0600 file
+            // PATH in the pane env, never plaintext. No token -> doorbell
+            // fallback. omp is a pi fork honoring PI_CODING_AGENT_DIR.
+            if pi_style_events_kind(&kind)
                 && let Some(pin) = mail_identity.as_deref()
             {
                 let token_path =
@@ -2162,7 +2170,7 @@ projects available: {}",
                     hc::apply_pi_events_config(&mut pane_env, project, pin, &token_path)?;
                 } else {
                     eprintln!(
-                        "flywheel: warn: no events token for {pin}; pi seat uses the doorbell fallback"
+                        "flywheel: warn: no events token for {pin}; {kind} seat uses the doorbell fallback"
                     );
                 }
             }
@@ -3516,6 +3524,20 @@ mod spawn_profile_plan_tests {
         let mut pi_args = vec!["--model".to_string(), "x".to_string()];
         assert_eq!(mint_harness_session("pi", &mut pi_args), None);
         assert_eq!(pi_args, vec!["--model", "x"], "non-opencode argv untouched");
+    }
+
+    /// bd-4n2bn: omp seats ride the pi-style agentDir bridge (same env the
+    /// fork honors); every other kind keeps the doorbell fallback.
+    #[test]
+    fn omp_seats_take_the_pi_style_events_bridge() {
+        assert!(super::pi_style_events_kind("pi"));
+        assert!(super::pi_style_events_kind("omp"));
+        for kind in ["opencode", "oc", "claude", "codex", "grok", ""] {
+            assert!(
+                !super::pi_style_events_kind(kind),
+                "{kind} keeps its own path"
+            );
+        }
     }
 
     use crate::{
