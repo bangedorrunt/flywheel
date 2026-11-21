@@ -6,9 +6,27 @@ use flywheel_test_sandbox::TestSandbox;
 use std::process::Output;
 
 fn run(sandbox: &TestSandbox, args: &[&str]) -> Output {
+    // bd-7szny: EVERY memory command in this file goes through a fake chie.
+    // Without this the real installed binary runs under a temp HOME and the
+    // proof depends on the operator's chiebukuro version.
+    let fake = sandbox.bin_dir().join("fake-chie");
+    if !fake.exists() {
+        let store = sandbox.root().join("fake-chie-lessons.jsonl");
+        let script = format!(
+            "#!/bin/sh\nSTORE='{}'\ncase \"$2\" in\n  record) for last; do :; done\n    printf '%s\\n' \"$last\" >> \"$STORE\"\n    printf '{{\"recorded\":true}}\\n' ;;\n  recall)\n    printf '{{\"conclusions\":['\n    sep=''\n    while IFS= read -r line; do\n      
+        esc=$(printf '%s' \"$line\" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g')\n        printf '%s{{\"content\":\"%s\"}}' \"$sep\" \"$esc\"\n        sep=','\n    done < \"$STORE\" 2>/dev/null\n    printf '],\"events\":[]}}\\n' ;;\n  *) printf '[]\\n' ;;\nesac\nexit 0\n",
+            store.display()
+        );
+        std::fs::write(&fake, script).expect("write fake chie");
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut perms = std::fs::metadata(&fake).expect("meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake, perms).expect("chmod");
+    }
     sandbox
         .command(env!("CARGO_BIN_EXE_flywheel"))
         .env("PATH", sandbox.path_env())
+        .env("FLYWHEEL_CHIE_BIN", &fake)
         .args(args)
         .output()
         .expect("spawn flywheel")
@@ -113,19 +131,17 @@ fn a_plain_lesson_is_retrievable_by_command_and_path() {
         .status
         .success()
     );
-    let path_hit = sandbox
-        .command(env!("CARGO_BIN_EXE_flywheel"))
-        .env("PATH", sandbox.path_env())
-        .args([
+    let path_hit = run(
+        &sandbox,
+        &[
             "memory",
             "check-trap",
             "src/cmd/memory.rs",
             "--project",
             "proj",
             "--json",
-        ])
-        .output()
-        .expect("path check");
+        ],
+    );
     assert!(
         text(&path_hit).contains("ambient config leaks"),
         "a path-named lesson must come back by path: {}",
@@ -356,12 +372,22 @@ fn no_test_shells_the_real_chie() {
             continue;
         }
         let src = std::fs::read_to_string(&path).expect("read test");
-        let spawns = src.contains("CARGO_BIN_EXE_flywheel") || src.contains("flywheel_bin()");
-        let invokes = spawns
-            && src.contains("\"memory\"")
-            && (src.contains("\"record-lesson\"") || src.contains("\"check-trap\""));
-        if invokes && !src.contains("FLYWHEEL_CHIE_BIN") {
-            bad.push(path.file_name().unwrap().to_string_lossy().to_string());
+        // A helper that pins FLYWHEEL_CHIE_BIN is not enough: an inline
+        // spawn in any single test still reaches the operator's chie.
+        for body in src.split("#[test]").skip(1) {
+            let body = body.split("\n#[test]").next().unwrap_or(body);
+            let mut rest = body;
+            while let Some(i) = rest.find(".command(") {
+                let seg = &rest[i..(i + 1_200).min(rest.len())];
+                if seg.contains("\"memory\"") && !seg.contains("FLYWHEEL_CHIE_BIN") {
+                    bad.push(format!(
+                        "{}:{}",
+                        path.file_name().unwrap().to_string_lossy(),
+                        body.lines().next().unwrap_or("<test>").trim()
+                    ));
+                }
+                rest = &rest[i + 9..];
+            }
         }
     }
     assert!(bad.is_empty(), "tests invoking real chie: {bad:?}");
@@ -430,6 +456,7 @@ fn slug_and_directory_scopes_agree() {
     let by_slug = sandbox
         .command(env!("CARGO_BIN_EXE_flywheel"))
         .env("PATH", sandbox.path_env())
+        .env("FLYWHEEL_CHIE_BIN", sandbox.bin_dir().join("fake-chie"))
         .env("FLYWHEEL_ROOT", sandbox_root.as_ref())
         .args([
             "memory",

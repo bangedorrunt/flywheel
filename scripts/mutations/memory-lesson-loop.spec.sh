@@ -8,6 +8,7 @@ TEST_FILTER=(
     malformed_recall_output_is_a_loud_failure
     recalled_lessons_are_deduplicated
     recording_with_as_is_retrievable
+    no_test_shells_the_real_chie
 )
 
 MEM=src/cmd/memory.rs
@@ -40,3 +41,9 @@ mutation "M4  record-lesson passes chie the invalid --pin flag" \
     expect=recording_with_as_is_retrievable \
     find='        cmd.args(["--peer", &format!("agent:{p}")]);' \
     replace='        cmd.args(["--pin", p]);'
+
+mutation "N1  an inline memory test drops the fake chie" \
+    file=tests/memory_loop.rs \
+    expect=no_test_shells_the_real_chie \
+    find='.env("FLYWHEEL_CHIE_BIN", sandbox.bin_dir().join("fake-chie"))' \
+    replace='.env("FLYWHEEL_UNUSED", "x")'
