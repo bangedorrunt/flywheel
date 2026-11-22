@@ -937,6 +937,18 @@ pub(crate) fn live_brief_for_bead(project: &str, bead: &str) -> Option<crate::cr
     load_briefs(project).live_for_bead(bead).cloned()
 }
 
+/// The bead of this pin's live brief, used as the auto-lease reason so the
+/// normal bead-close release also frees pre-edit leases (bd-lk0kt rework).
+pub(crate) fn current_bead_for_pin(project: &str, pin: &str) -> Option<String> {
+    load_briefs(project)
+        .briefs
+        .iter()
+        .find(|brief| {
+            brief.pin == pin && brief.closed_ts_us.is_none() && brief.withdrawn_ts_us.is_none()
+        })
+        .and_then(|brief| brief.bead.clone())
+}
+
 fn save_briefs(project: &str, book: &crate::crew_briefs::BriefBook) -> Result<()> {
     let path = briefs_path(project);
     if let Some(parent) = path.parent() {

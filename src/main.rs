@@ -3878,16 +3878,30 @@ fn main() {
                     use std::io::Read as _;
                     let mut payload = String::new();
                     let _ = std::io::stdin().read_to_string(&mut payload);
+                    let tool = crate::pre_edit::tool_name_from_payload(&payload)
+                        .unwrap_or_default();
+                    if !crate::pre_edit::is_write_tool(&tool) {
+                        return; // Read/Grep/Glob never take a lease.
+                    }
                     if let Some(path) = crate::pre_edit::path_from_payload(&payload) {
                         let root = crate::pre_edit::workspace_root();
                         let lease = crate::pre_edit::lease_path(&path, &root.to_string_lossy());
-                        match crate::pre_edit::acquire(&project, &pin, &lease, None) {
-                            Ok(holder) if !holder.is_empty() => println!(
-                                "{}",
-                                crate::pre_edit::blocked_message(&lease, &holder)
-                            ),
+                        let reason = crate::pre_edit::lease_reason(&project, &pin);
+                        match crate::pre_edit::acquire(&project, &pin, &lease, Some(&reason)) {
+                            Ok(holder) if !holder.is_empty() => {
+                                // Claude blocks an edit on exit 2; the stderr
+                                // line is shown to the model. A queued waiter
+                                // must never let the write proceed.
+                                eprintln!(
+                                    "{}",
+                                    crate::pre_edit::blocked_message(&lease, &holder)
+                                );
+                                std::process::exit(crate::pre_edit::block_exit_code(&holder));
+                            }
                             Ok(_) => {}
-                            Err(e) => eprintln!("flywheel: pre-edit lease: {e}"),
+                            Err(e) => {
+                                eprintln!("flywheel: pre-edit lease: {e}; failing open")
+                            }
                         }
                     }
                     return;

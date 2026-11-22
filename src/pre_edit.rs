@@ -8,6 +8,38 @@ use std::process::Command;
 
 use anyhow::{Result, bail};
 
+/// The tool being invoked. PreToolUse fires for EVERY tool; a read carrying a
+/// `file_path` must never take a lease (bd-lk0kt rework).
+pub fn tool_name_from_payload(payload: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    for key in ["tool_name", "tool", "name"] {
+        if let Some(name) = value[key].as_str()
+            && !name.is_empty()
+        {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// Write tools across the harnesses flywheel installs. Reads, greps and
+/// globs are deliberately absent.
+pub fn is_write_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "Edit"
+            | "Write"
+            | "MultiEdit"
+            | "NotebookEdit"
+            | "apply_patch"
+            | "str_replace_editor"
+            | "create_file"
+            | "write_file"
+            | "replace_in_file"
+            | "patch"
+    )
+}
+
 /// Pull the edited path out of a harness hook payload. Claude sends
 /// `tool_input.file_path`; other harnesses use `file_path` or `path`.
 pub fn path_from_payload(payload: &str) -> Option<String> {
@@ -38,11 +70,21 @@ pub fn lease_path(path: &str, workspace: &str) -> String {
         }
         return path.to_string();
     }
-    if path.starts_with("../") || !path.contains('/') {
-        return path.to_string();
-    }
-    // A relative path with a directory is already project-relative.
     path.to_string()
+}
+
+/// The seat's live brief bead, or a stable fallback that `crew done` and
+/// `ship land release-by-reason` also know how to free (bd-lk0kt rework).
+pub fn lease_reason(project: &str, pin: &str) -> String {
+    crate::cmd::crew::current_bead_for_pin(project, pin)
+        .filter(|bead| !bead.is_empty())
+        .unwrap_or_else(|| format!("pre-edit:{pin}"))
+}
+
+/// Claude's PreToolUse contract: exit 2 denies the write; 0 lets it proceed.
+#[must_use]
+pub fn block_exit_code(holder: &str) -> i32 {
+    if holder.is_empty() { 0 } else { 2 }
 }
 
 pub fn blocked_message(path: &str, holder: &str) -> String {
@@ -109,6 +151,43 @@ mod tests {
             Some("../toron/src/lib.rs".into())
         );
         assert_eq!(path_from_payload("not json"), None);
+    }
+
+    #[test]
+    fn only_write_tools_are_leased() {
+        let read = r#"{"tool_name":"Read","tool_input":{"file_path":"src/main.rs"}}"#;
+        assert_eq!(tool_name_from_payload(read).as_deref(), Some("Read"));
+        assert!(!is_write_tool("Read"));
+        assert!(!is_write_tool("Grep"));
+        assert!(!is_write_tool("Glob"));
+        let write = r#"{"tool_name":"Edit","tool_input":{"file_path":"src/main.rs"}}"#;
+        assert_eq!(tool_name_from_payload(write).as_deref(), Some("Edit"));
+        assert!(is_write_tool("Edit"));
+        assert!(is_write_tool("Write"));
+    }
+
+    #[test]
+    fn lease_reason_falls_back_to_a_releasable_name() {
+        let reason = lease_reason("no-such-project-for-pre-edit", "Alpha");
+        assert_eq!(reason, "pre-edit:Alpha");
+    }
+
+    #[test]
+    fn the_hook_filters_write_tools_at_the_door() {
+        let main = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
+        )
+        .unwrap();
+        assert!(
+            main.contains("if !crate::pre_edit::is_write_tool(&tool)"),
+            "PreToolUse must ignore reads before taking any lease"
+        );
+    }
+
+    #[test]
+    fn a_held_path_denies_the_edit() {
+        assert_eq!(block_exit_code("TealCove"), 2);
+        assert_eq!(block_exit_code(""), 0);
     }
 
     #[test]
