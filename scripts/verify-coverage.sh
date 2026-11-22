@@ -14,20 +14,25 @@
 # an unledgered module is REPORTED, never silently ignored, and --strict turns
 # the report into a failure once the seed is complete.
 #
-# Usage: scripts/verify-coverage.sh [--strict] [--json]
+# Usage: scripts/verify-coverage.sh [--strict] [--json] [--repo <dir>]
 set -euo pipefail
-cd "$(dirname "$0")/.."
 
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
 STRICT=0
 JSON=0
-for arg in "$@"; do
-  case "$arg" in
+while [ "$#" -gt 0 ]; do
+  case "$1" in
     --strict) STRICT=1 ;;
     --json) JSON=1 ;;
+    --repo)
+      [ "$#" -ge 2 ] || { echo "verify-coverage: --repo needs a directory" >&2; exit 2; }
+      REPO="$2"; shift ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
-    *) echo "verify-coverage: unknown argument $arg" >&2; exit 2 ;;
+    *) echo "verify-coverage: unknown argument $1" >&2; exit 2 ;;
   esac
+  shift
 done
+cd "$REPO"
 
 LEDGER="docs/verification/behaviors.toml"
 [ -f "$LEDGER" ] || { echo "verify-coverage: missing $LEDGER" >&2; exit 1; }

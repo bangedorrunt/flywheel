@@ -10,6 +10,9 @@ pub(crate) mod checkpoint;
 pub(crate) mod clean_proof;
 pub(crate) mod coalition;
 pub(crate) mod commit;
+#[cfg(test)]
+#[path = "../commit_needles_tests.rs"]
+pub(crate) mod commit_needles_tests;
 pub(crate) mod config;
 pub(crate) mod crew;
 pub(crate) mod cron;

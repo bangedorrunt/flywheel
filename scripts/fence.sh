@@ -221,11 +221,14 @@ run_changed_modules() {
     done
 }
 step "needles"
-bash scripts/verify-needles.sh
+# bd-npaqu: read the tree being fenced (HEAD plus the private index), never
+# the shared working copy — one lane's dirty edit must not refuse another's
+# commit. The export is built from the same tree the commit will land.
+bash "$ROOT/scripts/verify-needles.sh" --repo "$DEST"
 # bd-op4zk: a ledger row citing a mutation id the spec no longer declares used
 # to die 14 minutes into a proof. Coverage is sub-second; run it at commit time.
 step "coverage ledger"
-bash scripts/verify-coverage.sh
+bash "$ROOT/scripts/verify-coverage.sh" --repo "$DEST"
 if [ "$INDEX" = 1 ]; then
     # bd-4z7mb: the commit gate. Clippy runs the same type check as `cargo
     # check` plus the lints, so a clippy-only regression cannot slip past it
