@@ -341,7 +341,7 @@ pub(crate) enum WorkflowCmd {
     /// Check registered statecharts' topology: every state reachable, every reachable leaf can reach
     /// its goal. Guards count as enabled; no model checker runs. Optionally print topology-only TLA+.
     Verify {
-        /// Chart or workflow name: P2PNegotiation, Seat, Plan, LeaseWaitlist, Brief, ResultMail, CaptainWatch, DeadlockWatch, or a catalog
+        /// Chart or workflow name: P2PNegotiation, Seat, Plan, LeaseWaitlist, Brief, ResultMail, CaptainWatch, DeadlockWatch, WorkUnit, or a catalog
         /// workflow (wave-swarm is verified as the workflow now). Omit for all.
         name: Option<String>,
         /// Export compiled TLA+ specification for each verified chart.
@@ -2176,6 +2176,7 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
     use crate::elm::plan_statechart::build_plan_machine;
     use crate::elm::result_mail_statechart::build_result_mail_machine;
     use crate::elm::seat_statechart::build_seat_machine;
+    use crate::elm::work_unit_statechart::build_work_unit_machine;
 
     fn verify_p2p(export_tla: bool) -> WorkflowVerifyChartReport {
         let machine = build_p2p_negotiation_machine();
@@ -2206,6 +2207,27 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
             "a final state",
             is_final,
             export_tla.then(|| machine.to_tla_named("Seat")),
+            None,
+            &ChartFindings::default(),
+        )
+    }
+
+    fn verify_work_unit(export_tla: bool) -> WorkflowVerifyChartReport {
+        use toron_core::kernel::StateNodeType;
+        let machine = build_work_unit_machine();
+        let topology = machine.topology();
+        let is_final = |state: &_| {
+            topology
+                .nodes
+                .get(state)
+                .is_some_and(|node| node.node_type == StateNodeType::Final)
+        };
+        chart_report(
+            "WorkUnit",
+            &topology,
+            "a final state",
+            is_final,
+            export_tla.then(|| machine.to_tla_named("WorkUnit")),
             None,
             &ChartFindings::default(),
         )
@@ -2442,6 +2464,14 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
     if want_all
         || matches!(
             want.as_str(),
+            "workunit" | "work-unit" | "work-unit-statechart"
+        )
+    {
+        reports.push(verify_work_unit(export_tla));
+    }
+    if want_all
+        || matches!(
+            want.as_str(),
             "deadlockwatch" | "deadlock-watch" | "deadlock-watch-statechart"
         )
     {
@@ -2489,7 +2519,7 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
     }
     if reports.is_empty() {
         bail!(
-            "unknown statechart {} (expected P2PNegotiation, Seat, Plan, LeaseWaitlist, DirtyLease, Brief, ResultMail, CaptainWatch, DeadlockWatch, or a workflow name)",
+            "unknown statechart {} (expected P2PNegotiation, Seat, Plan, LeaseWaitlist, DirtyLease, Brief, ResultMail, CaptainWatch, DeadlockWatch, WorkUnit, or a workflow name)",
             name.unwrap_or("")
         );
     }

@@ -1,0 +1,5 @@
+{"beadCreated":false,"closeCount":0,"closed":"","handedOff":false,"kind":"none","verified":false}
+{"action":"BindAdHoc","beadCreated":false,"closeCount":0,"closed":"","handedOff":false,"kind":"adhoc","verified":false}
+{"action":"Handoff","beadCreated":true,"closeCount":0,"closed":"","handedOff":true,"kind":"adhoc","verified":false}
+{"action":"Verify","beadCreated":true,"closeCount":0,"closed":"","handedOff":true,"kind":"adhoc","verified":true}
+{"action":"CloseAdHoc","beadCreated":true,"closeCount":1,"closed":"commit","handedOff":true,"kind":"adhoc","verified":true}

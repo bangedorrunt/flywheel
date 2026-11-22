@@ -27,6 +27,7 @@ pub mod p2p_negotiation;
 pub mod plan_statechart;
 pub mod result_mail_statechart;
 pub mod seat_statechart;
+pub mod work_unit_statechart;
 
 use crate::decide::{Snapshot, decide};
 use serde::{Deserialize, Serialize};

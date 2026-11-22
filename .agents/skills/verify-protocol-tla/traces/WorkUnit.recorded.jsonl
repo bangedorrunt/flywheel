@@ -1,0 +1,4 @@
+{"beadCreated":false,"closeCount":0,"closed":"","handedOff":false,"kind":"none","verified":false}
+{"action":"BindBead","beadCreated":false,"closeCount":0,"closed":"","handedOff":false,"kind":"bead","verified":false}
+{"action":"Verify","beadCreated":false,"closeCount":0,"closed":"","handedOff":false,"kind":"bead","verified":true}
+{"action":"CloseBead","beadCreated":false,"closeCount":1,"closed":"ship","handedOff":false,"kind":"bead","verified":true}

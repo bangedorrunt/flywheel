@@ -151,7 +151,8 @@ echo "verify-formal: trace conformance (recorded doorbell runs)"
 for trace in "$TRACES"/*.recorded.jsonl; do
   [ -f "$trace" ] || continue
   name="$(basename "$trace" .recorded.jsonl)"
-  expect_conform "$name" "$trace"
+  model="${name%%.*}"
+  expect_conform "$model" "$trace"
 done
 for trace in "$TRACES"/*.jsonl; do
   [ -f "$trace" ] || continue
