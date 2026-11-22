@@ -3,7 +3,7 @@
 # Dropping overlap, cycle close-out, or aging must turn the matching test RED.
 
 CARGO_ARGS=(-p flywheel --bin flywheel)
-TEST_FILTER=(overlapping_leases_form_a_two_pin_cycle disjoint_leases_stay_out_of_the_graph a_collab_wait_against_a_lease_edge_is_a_cycle unknown_askers_count_as_waits_not_cycles reported_cycles_do_not_page_twice)
+TEST_FILTER=(overlapping_leases_form_a_two_pin_cycle disjoint_leases_stay_out_of_the_graph a_collab_wait_against_a_lease_edge_is_a_cycle unknown_askers_count_as_waits_not_cycles reported_cycles_do_not_page_twice dead_waiters_and_answered_threads_stay_silent)
 
 mutation "D1  disjoint leases also wait" \
     file=src/deadlock.rs \
@@ -26,3 +26,17 @@ mutation "D3  waits never age" \
     expect=unknown_askers_count_as_waits_not_cycles \
     find='(|t| now_us.saturating_sub(t) >= threshold_us)' \
     replace='(|_| false)'
+
+mutation "D4  dead waiters qualify" \
+    file=src/deadlock.rs \
+    expect=unknown_askers_count_as_waits_not_cycles \
+    find='    if !live.contains(&asker) {' \
+    replace='    if false {'
+
+mutation "D5  replies never satisfy" \
+    file=src/cmd/deadlock.rs \
+    expect=dead_waiters_and_answered_threads_stay_silent \
+    find='    let answered = rows.iter().any(|(id, from, ts)| {
+        *from == askee && Some(*id) != head && ask_ts.is_none_or(|hts| *ts > hts)
+    });' \
+    replace='    let answered = false;'

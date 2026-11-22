@@ -5,7 +5,7 @@
 use anyhow::Result;
 
 use crate::deadlock::{
-    CollabWait, LiveLease, cycle_key, find_cycles, lease_edges, long_waits, unreported, wait_key,
+    LiveLease, cycle_key, find_cycles, lease_edges, long_waits, unreported, wait_key,
 };
 
 /// Reported findings already mailed: cycle keys and wait keys.
@@ -48,6 +48,31 @@ fn parse_created_us(iso: &str) -> Option<i64> {
         .map(|dt| dt.timestamp_micros())
 }
 
+/// Pure core of [`resolve_asker`]: given (id, sender, ts) rows, who asked
+/// and did the askee reply after the question? A reply counts only when it
+/// is newer than the ask it answers.
+fn thread_verdict(
+    rows: &[(&str, &str, i64)],
+    askee: &str,
+    head: Option<&str>,
+) -> (Option<String>, bool) {
+    let ask_ts: Option<i64> = head
+        .and_then(|h| rows.iter().find(|(id, _, _)| *id == h))
+        .map(|(_, _, ts)| *ts);
+    let asker = head
+        .and_then(|h| rows.iter().find(|(id, _, _)| *id == h))
+        .map(|(_, from, _)| from.to_string())
+        .or_else(|| {
+            rows.iter()
+                .min_by_key(|(_, _, ts)| *ts)
+                .map(|(_, from, _)| from.to_string())
+        });
+    let answered = rows.iter().any(|(id, from, ts)| {
+        *from == askee && Some(*id) != head && ask_ts.is_none_or(|hts| *ts > hts)
+    });
+    (asker, answered)
+}
+
 /// The asker behind an open collab ask: the sender of the thread's question
 /// (the row whose id matches `head`, else the thread's earliest message).
 /// Best-effort — a thread the checker cannot read leaves the asker unknown,
@@ -76,41 +101,25 @@ fn resolve_asker(
         Ok(v) => v,
         Err(_) => return (None, false),
     };
-    let rows: Vec<&serde_json::Value> = found
+    let rows: Vec<(&str, &str, i64)> = found
         .get("result")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| {
+                    Some((
+                        m.get("id")?.as_str()?,
+                        m.get("from")?.as_str()?,
+                        m.get("created_ts_us")?.as_i64()?,
+                    ))
+                })
+                .collect()
+        })
         .unwrap_or_default();
     if rows.is_empty() {
         return (None, false);
     }
-    let newest = rows
-        .iter()
-        .max_by_key(|m| m.get("created_ts_us").and_then(|t| t.as_i64()).unwrap_or(0));
-    let answered = newest.is_some_and(|m| {
-        m.get("from").and_then(|f| f.as_str()) == Some(askee)
-            && m.get("id").and_then(|i| i.as_str()) != head
-    });
-    if let Some(head) = head
-        && let Some(ask) = rows
-            .iter()
-            .find(|m| m.get("id").and_then(|i| i.as_str()) == Some(head))
-    {
-        return (
-            ask.get("from").and_then(|s| s.as_str()).map(str::to_string),
-            answered,
-        );
-    }
-    let earliest = rows
-        .iter()
-        .min_by_key(|m| m.get("created_ts_us").and_then(|t| t.as_i64()).unwrap_or(0));
-    (
-        earliest
-            .and_then(|m| m.get("from"))
-            .and_then(|s| s.as_str())
-            .map(str::to_string),
-        answered,
-    )
+    thread_verdict(&rows, askee, head)
 }
 
 /// `flywheel deadlock check`: page the captain once per wait-for cycle and
@@ -163,8 +172,13 @@ pub(crate) fn cmd_deadlock_check(project: &str, wait_minutes: u64) -> Result<()>
     let mut edges = lease_edges(&leases);
 
     // Open collab asks are the answer side: resolve each asker through its
-    // thread, best-effort, and drop rows whose reply already landed (the
-    // registry is append-only; a satisfied ask is stale, not open).
+    // thread, keep only live pins asking within the last day, and drop rows
+    // whose reply already landed (the registry is append-only; a satisfied
+    // ask is stale, not open).
+    let live: std::collections::BTreeSet<String> = crate::state::load_spawn_registry(project)
+        .into_iter()
+        .filter_map(|e| e.mail_identity)
+        .collect();
     for expected in crate::state::load_expected_replies(project) {
         let (asker, answered) = resolve_asker(
             &mail,
@@ -177,12 +191,16 @@ pub(crate) fn cmd_deadlock_check(project: &str, wait_minutes: u64) -> Result<()>
             continue;
         }
         let since_us = parse_created_us(&expected.created_ts).unwrap_or(now_us);
-        edges.extend(crate::deadlock::collab_edges(&[CollabWait {
+        if let Some(wait) = crate::deadlock::qualify_wait(
             asker,
-            askee: expected.agent,
-            thread: expected.thread,
+            &expected.agent,
+            &expected.thread,
             since_us,
-        }]));
+            &live,
+            now_us,
+        ) {
+            edges.extend(crate::deadlock::collab_edges(&[wait]));
+        }
     }
 
     let cycles = find_cycles(&edges);
@@ -247,12 +265,37 @@ pub(crate) fn cmd_deadlock_check(project: &str, wait_minutes: u64) -> Result<()>
 
 #[cfg(test)]
 mod tests {
+    use super::thread_verdict;
+
     /// Cycle keys are stable regardless of discovery order.
     #[test]
     fn cycle_keys_sort_members() {
         assert_eq!(
             crate::deadlock::cycle_key(&["B".to_string(), "A".to_string()]),
             "cycle:B>A"
+        );
+    }
+
+    /// A dead waiter pages nothing, and a thread the askee already answered
+    /// in reads as satisfied, not open. Both stay silent.
+    #[test]
+    fn dead_waiters_and_answered_threads_stay_silent() {
+        // The askee replied after the ask: satisfied.
+        let (asker, answered) =
+            thread_verdict(&[("q1", "A", 100), ("r1", "B", 200)], "B", Some("q1"));
+        assert_eq!(asker.as_deref(), Some("A"));
+        assert!(answered, "B's newer reply satisfies the ask");
+        // Only the ask is on the thread: still open, asker known.
+        let (asker, answered) = thread_verdict(&[("q1", "A", 100)], "B", Some("q1"));
+        assert_eq!(asker.as_deref(), Some("A"));
+        assert!(!answered, "no reply yet");
+        // The dead-waiter half lives in qualify_wait; here the shape check:
+        // an answered ask never becomes a wait the captain sees.
+        let live: std::collections::BTreeSet<String> = ["Nobody".to_string()].into_iter().collect();
+        assert!(
+            crate::deadlock::qualify_wait(Some("Ghost".into()), "B", "t", 100, &live, 200)
+                .is_none(),
+            "a dead waiter never qualifies"
         );
     }
 }

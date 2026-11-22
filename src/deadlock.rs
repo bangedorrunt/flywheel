@@ -78,18 +78,49 @@ pub fn lease_edges(leases: &[LiveLease]) -> Vec<WaitEdge> {
     edges.into_iter().collect()
 }
 
-/// Collab edges: every open ask waits on its askee. An unknown asker is
-/// the `(unknown)` node: out-edges only, so it can never close a cycle it
-/// does not belong to, but its age still pages.
+/// A wait older than this is stale history, not a live deadlock: the fleet
+/// turns over faster than a day, and no session that old is still running.
+/// (bd-v4dcv: ignore threads older than the waiter's session or a day.)
+pub const MAX_WAIT_AGE_US: i64 = 24 * 3600 * 1_000_000;
+
+/// Keep an open collab ask only when it can page someone real: the asker is
+/// known, holds a live pin, and asked within the last day. Anything else is
+/// dropped before it can name a stranger, a dead pin, or ancient history.
+pub fn qualify_wait(
+    asker: Option<String>,
+    askee: &str,
+    thread: &str,
+    since_us: i64,
+    live: &BTreeSet<String>,
+    now_us: i64,
+) -> Option<CollabWait> {
+    let asker = asker?;
+    if !live.contains(&asker) {
+        return None;
+    }
+    if now_us.saturating_sub(since_us) > MAX_WAIT_AGE_US {
+        return None;
+    }
+    Some(CollabWait {
+        asker: Some(asker),
+        askee: askee.to_string(),
+        thread: thread.to_string(),
+        since_us,
+    })
+}
+
+/// Collab edges: every qualified open ask waits on its askee.
 pub fn collab_edges(waits: &[CollabWait]) -> Vec<WaitEdge> {
     waits
         .iter()
-        .map(|w| WaitEdge {
-            waiter: w.asker.clone().unwrap_or_else(|| "(unknown)".to_string()),
-            holder: w.askee.clone(),
-            resource: format!("thread:{}", w.thread),
-            kind: WaitKind::Collab,
-            since_us: Some(w.since_us),
+        .filter_map(|w| {
+            w.asker.as_ref().map(|asker| WaitEdge {
+                waiter: asker.clone(),
+                holder: w.askee.clone(),
+                resource: format!("thread:{}", w.thread),
+                kind: WaitKind::Collab,
+                since_us: Some(w.since_us),
+            })
         })
         .collect()
 }
@@ -269,15 +300,21 @@ mod tests {
         assert_eq!(cycles, vec![vec!["A".to_string(), "B".to_string()]]);
     }
 
-    /// Unknown askers never close a cycle (the `(unknown)` node has no
-    /// in-edges), but their age still pages.
+    /// Unknown, dead, and ancient waiters never become waits: no page, no
+    /// cycle. A live pin asking within the last day still pages on age.
     #[test]
     fn unknown_askers_count_as_waits_not_cycles() {
-        let edges = collab_edges(&[collab(None, "B", "t1", 100)]);
+        let live: BTreeSet<String> = ["A".to_string()].into_iter().collect();
+        assert!(qualify_wait(None, "B", "t1", 100, &live, 200).is_none());
+        assert!(qualify_wait(Some("Ghost".into()), "B", "t1", 100, &live, 200).is_none());
+        assert!(qualify_wait(Some("A".into()), "B", "t1", 0, &live, MAX_WAIT_AGE_US + 1).is_none());
+        let qualified = qualify_wait(Some("A".into()), "B", "t1", 100, &live, 200)
+            .expect("live, known, fresh asker qualifies");
+        let edges = collab_edges(&[qualified]);
         assert_eq!(edges.len(), 1);
-        assert!(find_cycles(&edges).is_empty(), "no in-edge, no cycle");
+        assert!(find_cycles(&edges).is_empty(), "a lone edge is no cycle");
         let long = long_waits(&edges, 100 + 60_000_001, 60_000_000);
-        assert_eq!(long.len(), 1, "the unknown wait still pages on age");
+        assert_eq!(long.len(), 1, "a qualifying wait still pages on age");
     }
 
     /// Reported cycles never page twice.
