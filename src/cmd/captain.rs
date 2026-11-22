@@ -2012,10 +2012,11 @@ mod tests {
         );
         assert_eq!(
             stall_verdict(&StallProbe {
-                loop_repeats: LOOP_REPEATS - 1,
+                loop_repeats: 2,
                 ..base.clone()
             }),
-            StallVerdict::Working
+            StallVerdict::Working,
+            "two identical tails are not yet a loop"
         );
         assert_eq!(
             stall_verdict(&StallProbe {
