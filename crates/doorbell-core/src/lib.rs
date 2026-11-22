@@ -1716,9 +1716,15 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 actions.extend(a);
             }
             // bd-ba4nl: decide a queue parked at the idle edge using THIS
-            // drain-time read, never the arrival-time one.
-            if let Some(slot) = next.draining.remove(pin)
-                && read_at_secs.saturating_mul(1_000_000) >= slot.stamp_us
+            // drain-time read, never the arrival-time one. Compare in whole
+            // seconds (the answer carries read_at_secs, the drain stamp may
+            // have sub-second precision), and leave the slot in place when
+            // the answer is stale so a late arrival does not lose the queue.
+            if next
+                .draining
+                .get(pin)
+                .is_some_and(|slot| *read_at_secs >= slot.stamp_us / 1_000_000)
+                && let Some(slot) = next.draining.remove(pin)
             {
                 next.cursor_inflight.remove(pin);
                 let mut deliverable = Vec::new();

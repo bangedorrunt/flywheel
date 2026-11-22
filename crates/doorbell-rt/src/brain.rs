@@ -854,6 +854,22 @@ impl<H: Host> Brain<H> {
             pin: pin.clone(),
             status: status.clone(),
         });
+        // bd-ba4nl: at an idle edge the core parks mail wakes and asks for a
+        // drain-time toron read. The watch hook is not on this path, so answer
+        // it here through the host's reader (the fake reader in the host test,
+        // the toron CLI in production). A reader with no answer leaves the
+        // slot parked for the Sweep bound — fail toward delivery, never a
+        // silent drop of the whole queue.
+        for effect in &effects {
+            let Effect::ReadToronCursor { pin } = effect else {
+                continue;
+            };
+            if let Some(cursor_us) = self.host.read_toron_cursor(pin) {
+                let read_at_secs = self.host.now_unix();
+                self.on_toron_cursor(pin.clone(), Some(cursor_us), read_at_secs)
+                    .await;
+            }
+        }
         self.absorb_digests(&effects);
         let raw = self.prompts_of(&effects);
         let now = self.host.now_unix();
@@ -2883,6 +2899,274 @@ mod tests {
         assert!(
             audit.contains("toron-cursor-ask-dropped"),
             "a dropped ask is loud, never silent: {audit}"
+        );
+    }
+
+    /// bd-ba4nl host-level fake toron: the brain's `Host` seam backed by the
+    /// REAL doorbell-core reducer, with a fake clock and a fake cursor reader.
+    /// The test drives the production dispatch path (InboxFetched →
+    /// PlaneStatus → Sweep), so it proves the drain-time read is asked and
+    /// answered through the host, never reused from arrival time.
+    struct DrainHost {
+        model: doorbell_core::DoorbellModel,
+        now_secs: u64,
+        cursor: Option<i64>,
+        effects: Vec<Vec<Effect>>,
+    }
+
+    impl DrainHost {
+        fn new(now_secs: u64, cursor: Option<i64>) -> Self {
+            let model = doorbell_core::DoorbellModel {
+                project: "flywheel".into(),
+                ..Default::default()
+            };
+            Self {
+                model,
+                now_secs,
+                cursor,
+                effects: Vec::new(),
+            }
+        }
+        fn recent(&self, from: usize) -> Vec<&Effect> {
+            self.effects[from..].iter().flatten().collect()
+        }
+    }
+
+    impl Host for DrainHost {
+        fn tick(&mut self, msg: &BrainMsg) -> Vec<Effect> {
+            use doorbell_core::{DoorbellAction as A, DoorbellMsg as M};
+            let core_msg = match msg {
+                BrainMsg::Watch(line) => M::WatchNdjson { line: line.clone() },
+                BrainMsg::PlaneStatus { pin, status } => M::PlaneStatus {
+                    pin: pin.clone(),
+                    status: status.clone(),
+                    now_us: self.now_secs.saturating_mul(1_000_000),
+                },
+                BrainMsg::Sweep { now } => M::Sweep {
+                    now_us: now.saturating_mul(1_000_000),
+                },
+                BrainMsg::ToronCursor {
+                    pin,
+                    cursor_us,
+                    read_at_secs,
+                } => M::ToronCursor {
+                    pin: pin.clone(),
+                    cursor_us: *cursor_us,
+                    read_at_secs: *read_at_secs,
+                },
+                BrainMsg::InboxFetched { pin, rows } => M::InboxRows {
+                    pin: pin.clone(),
+                    rows: rows.clone(),
+                },
+                _ => return Vec::new(),
+            };
+            let (next, actions) = doorbell_core::tick(&self.model, &core_msg);
+            self.model = next;
+            let effects: Vec<Effect> = actions
+                .into_iter()
+                .map(|a| match a {
+                    A::Prompt {
+                        pin,
+                        line,
+                        event_id,
+                    } => Effect::Prompt {
+                        pin,
+                        line,
+                        event_id,
+                    },
+                    A::FetchInbox => Effect::FetchInbox,
+                    A::ReadToronCursor { pin } => Effect::ReadToronCursor { pin },
+                    A::CheckAckSla => Effect::CheckAckSla,
+                    A::RestartWatch => Effect::RestartWatch,
+                    A::Audit { kind, pin, detail } => Effect::Audit {
+                        kind,
+                        pin,
+                        detail: serde_json::json!(detail),
+                    },
+                    A::Digest { pin, line, why } => Effect::Digest { pin, line, why },
+                    A::FactMiss { why } => Effect::Audit {
+                        kind: "fact_miss".into(),
+                        pin: String::new(),
+                        detail: serde_json::json!({ "why": why }),
+                    },
+                })
+                .collect();
+            self.effects.push(effects.clone());
+            effects
+        }
+        fn now_unix(&self) -> u64 {
+            self.now_secs
+        }
+        fn read_toron_cursor(&self, _pin: &str) -> Option<i64> {
+            self.cursor
+        }
+        fn fetch_inbox(&self, _pin: &str, _since: &str) -> Vec<serde_json::Value> {
+            Vec::new()
+        }
+        fn scan_ack_sla(&mut self) -> Vec<String> {
+            Vec::new()
+        }
+        fn restart_wake(&mut self) -> bool {
+            false
+        }
+    }
+
+    fn drain_brain(now_secs: u64, cursor: Option<i64>, name: &str) -> Brain<DrainHost> {
+        let dir = std::env::temp_dir().join(format!("dbrt-drain-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tx, _rx) = tokio::sync::mpsc::channel(crate::BRAIN_CAP);
+        Brain::new(
+            BrainConfig::new("bd-ba4nl"),
+            DrainHost::new(now_secs, cursor),
+            FileStore::new(dir),
+            SinkManager::new(tx),
+        )
+    }
+
+    async fn queue_mail_wake(brain: &mut Brain<DrainHost>, pin: &str, created_us: i64) {
+        brain
+            .host
+            .model
+            .statuses
+            .insert(pin.to_string(), "working".to_string());
+        let row = serde_json::json!({
+            "created_ts_us": created_us,
+            "importance": "normal",
+            "wake": "tasked",
+            "sender": "SlateHarbor",
+            "subject": "mail",
+            "body": "body",
+        });
+        brain
+            .dispatch(BrainMsg::InboxFetched {
+                pin: pin.to_string(),
+                rows: vec![row],
+            })
+            .await;
+    }
+
+    /// (1) The fake cursor is past the row at DRAIN time (not arrival time):
+    /// the drain asks for a fresh read, the host answers it, and the mail is
+    /// dropped with one already-pulled audit — no Prompt at all.
+    #[tokio::test]
+    async fn host_drain_read_past_the_row_drops_the_mail_wake() {
+        let now = 1_700_000_000u64;
+        let row_us = 1_699_999_900_000_000i64;
+        let mut brain = drain_brain(now, Some(row_us + 1), "drop");
+        queue_mail_wake(&mut brain, "BlueRidge", row_us).await;
+        assert!(
+            !brain
+                .host
+                .effects
+                .iter()
+                .flatten()
+                .any(|e| matches!(e, Effect::Prompt { .. })),
+            "a wake queued while busy must not ring yet"
+        );
+        let from = brain.host.effects.len();
+        brain
+            .dispatch(BrainMsg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            })
+            .await;
+        let recent = brain.host.recent(from);
+        assert!(
+            recent
+                .iter()
+                .any(|e| matches!(e, Effect::ReadToronCursor { pin } if pin == "BlueRidge")),
+            "the drain must ask toron for a READ NOW: {recent:?}"
+        );
+        assert!(
+            !recent.iter().any(|e| matches!(e, Effect::Prompt { .. })),
+            "mail past the drain-time cursor must not ring: {recent:?}"
+        );
+        assert_eq!(
+            recent
+                .iter()
+                .filter(|e| matches!(e, Effect::Audit { kind, .. } if kind == "already-pulled"))
+                .count(),
+            1,
+            "exactly one already-pulled audit: {recent:?}"
+        );
+    }
+
+    /// (2) Same flow with the cursor still below the row: the drain-time read
+    /// says unread, so exactly one Prompt is delivered.
+    #[tokio::test]
+    async fn host_drain_read_below_the_row_rings_once() {
+        let now = 1_700_000_000u64;
+        let row_us = 1_699_999_900_000_000i64;
+        let mut brain = drain_brain(now, Some(row_us - 1), "ring");
+        queue_mail_wake(&mut brain, "BlueRidge", row_us).await;
+        let from = brain.host.effects.len();
+        brain
+            .dispatch(BrainMsg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            })
+            .await;
+        let prompts = brain
+            .host
+            .recent(from)
+            .into_iter()
+            .filter(|e| matches!(e, Effect::Prompt { .. }))
+            .count();
+        assert_eq!(prompts, 1, "an unread drain-time mail rings once");
+    }
+
+    /// (3) The reader never answers: the queue stays parked (no ring at the
+    /// idle edge, nor before the bound) and one Prompt fires only after a
+    /// Sweep past 3s, with the loud toron-cursor-unavailable audit.
+    #[tokio::test]
+    async fn host_drain_with_no_read_rings_only_after_the_bound() {
+        let now = 1_700_000_000u64;
+        let row_us = 1_699_999_900_000_000i64;
+        let mut brain = drain_brain(now, None, "timeout");
+        queue_mail_wake(&mut brain, "BlueRidge", row_us).await;
+        let from = brain.host.effects.len();
+        brain
+            .dispatch(BrainMsg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            })
+            .await;
+        let recent = brain.host.recent(from);
+        assert!(
+            recent
+                .iter()
+                .any(|e| matches!(e, Effect::ReadToronCursor { .. })),
+            "the drain must ask even when no reader is available: {recent:?}"
+        );
+        assert!(
+            !recent.iter().any(|e| matches!(e, Effect::Prompt { .. })),
+            "without an answer the queue is parked, not dropped or rung: {recent:?}"
+        );
+        brain.dispatch(BrainMsg::Sweep { now: now + 2 }).await;
+        assert!(
+            !brain
+                .host
+                .recent(from)
+                .iter()
+                .any(|e| matches!(e, Effect::Prompt { .. })),
+            "2s is inside the 3s bound: still parked"
+        );
+        brain.dispatch(BrainMsg::Sweep { now: now + 4 }).await;
+        let recent = brain.host.recent(from);
+        assert_eq!(
+            recent
+                .iter()
+                .filter(|e| matches!(e, Effect::Prompt { .. }))
+                .count(),
+            1,
+            "past the bound, exactly one fail-toward-delivery ring: {recent:?}"
+        );
+        assert!(
+            recent.iter().any(|e| matches!(
+                e,
+                Effect::Audit { kind, .. } if kind == "toron-cursor-unavailable"
+            )),
+            "the timeout ring is loud: {recent:?}"
         );
     }
 
