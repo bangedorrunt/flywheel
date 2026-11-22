@@ -109,13 +109,23 @@ fn proof_reservation_board_model_fences_the_grant() {
     let formal = std::fs::read_to_string(format!("{}/scripts/verify-formal.sh", root()))
         .expect("scripts/verify-formal.sh");
     assert!(
-        formal.contains("expect_pass ReservationBoard ReservationBoard"),
-        "the model must run positively in verify-formal"
+        formal.contains("for tla in \"$MODELS\"/*.tla"),
+        "the model must be discovered positively in verify-formal"
     );
-    for broken in ["broken-truncated-grants", "broken-no-refresh"] {
-        assert!(
-            formal.contains(&format!("ReservationBoard.{broken}")),
-            "the {broken} fixture must be expected to violate its invariant"
+    assert!(
+        formal.contains("for cfg in \"$MODELS\"/*.broken-*.cfg"),
+        "broken cfgs must be discovered in verify-formal"
+    );
+    for (broken, invariant) in [
+        ("broken-truncated-grants", "NoGrantWithoutCompleteBoard"),
+        ("broken-no-refresh", "AtMostOneHolder"),
+    ] {
+        let cfg = std::fs::read_to_string(format!("{models}/ReservationBoard.{broken}.cfg"))
+            .unwrap_or_else(|_| panic!("the {broken} fixture must exist"));
+        assert_eq!(
+            cfg.lines().next(),
+            Some(format!("\\* expect: {invariant}").as_str()),
+            "the {broken} fixture must name {invariant} on its first line"
         );
     }
 }

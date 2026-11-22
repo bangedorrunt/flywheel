@@ -16,7 +16,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 EVERYSTATE_VERSION="0.4.1"
-MODELS=".agents/skills/verify-protocol-tla/models"
+MODELS="${FLYWHEEL_FORMAL_MODELS_DIR:-.agents/skills/verify-protocol-tla/models}"
+TRACES="${FLYWHEEL_FORMAL_TRACES_DIR:-$(dirname "$MODELS")/traces}"
+case "$TRACES" in
+  /*) ;;
+  *) TRACES="$PWD/$TRACES" ;;
+esac
 SELF="$0"
 
 die() {
@@ -113,89 +118,51 @@ expect_nonconform() { # model trace expected_rc step_named_in_output
 }
 
 echo "verify-formal: positive models"
-expect_pass JobLease JobLease
-expect_pass BindBeforePrompt BindBeforePrompt
-expect_pass PlanApply PlanApply
-expect_pass ClaimExclusion ClaimExclusion
-expect_pass AssignBrief AssignBrief
-expect_pass Respawn Respawn
-expect_pass DeferredHandoff DeferredHandoff
-expect_pass P2pDelivery P2pDelivery
-expect_pass DeferredQueue DeferredQueue
-expect_pass DeferredQueueLanes DeferredQueueLanes
-expect_pass DoorbellMailPush DoorbellMailPush
-expect_pass DispatcherReap DispatcherReap
-expect_pass JournalAppend JournalAppend
-expect_pass JournalRotate JournalRotate
-expect_pass SupervisorRetire SupervisorRetire
-expect_pass MailQueue MailQueue
-expect_pass PeerContention PeerContention
-expect_pass ReservationBoard ReservationBoard
-expect_pass ResultMail ResultMail
-expect_pass CaptainWatch CaptainWatch
-expect_pass CaptainWatch CaptainWatch.oneshot
-expect_pass TrackerCas TrackerCas
-expect_pass EventsDedupe EventsDedupe
+# Discovery, not a hand list: <M>.tla + <M>.cfg (or <M>.<variant>.cfg) is a
+# positive run. Adding a model is adding files, never editing this script.
+for tla in "$MODELS"/*.tla; do
+  [ -f "$tla" ] || continue
+  model="$(basename "$tla" .tla)"
+  for cfg in "$MODELS"/*.cfg; do
+    [ -f "$cfg" ] || continue
+    cfg_name="$(basename "$cfg" .cfg)"
+    case "$cfg_name" in
+      "$model" | "$model".*) ;;
+      *) continue ;;
+    esac
+    case "$cfg_name" in
+      *.broken-*) continue ;;
+    esac
+    expect_pass "$model" "$cfg_name"
+  done
+done
 
 echo "verify-formal: negative fixtures (must fail)"
-expect_violation JobLease JobLease.broken-steal NoSteal
-expect_violation JobLease JobLease.broken-stale-settle NoStaleSettle
-expect_violation JobLease JobLease.broken-revive-terminal TerminalStable
-expect_violation Respawn Respawn.broken-claim-before-free OneLiveHolder
-expect_violation Respawn Respawn.broken-drop-reservations ReservationsKept
-expect_violation ClaimExclusion ClaimExclusion.broken-allow-author NoSelfReview
-expect_violation AssignBrief AssignBrief.broken-double-claim OneClaimant
-expect_violation AssignBrief AssignBrief.broken-no-withdraw OneLiveBrief
-expect_violation AssignBrief AssignBrief.broken-silent-reassign WithdrawalDelivered
-expect_violation PlanApply PlanApply.broken-clobber EveryAppendLands
-expect_violation BindBeforePrompt BindBeforePrompt.broken-prompt-first PromptedImpliesBound
-expect_violation DeferredHandoff DeferredHandoff.broken-memory-only NoLostWake
-expect_violation P2pDelivery P2pDelivery.broken-drop-on-busy EveryDirectiveReachesTargetOrIsJournaledPending
-expect_violation DeferredQueue DeferredQueue.broken-ring-twice AtMostOnceRung
-expect_violation DeferredQueue DeferredQueue.broken-strand EveryWakeAccounted
-expect_violation DeferredQueue DeferredQueue.broken-preempt-any OnlyActNowPreempts
-expect_violation DeferredQueue DeferredQueue.broken-preempt-unrecorded AtMostOnceRung
-expect_violation DeferredQueueLanes DeferredQueueLanes.broken-drain-unreceived EveryWakeAccounted
-expect_violation DoorbellMailPush DoorbellMailPush.broken-thread-rung EveryWakeAccounted
-expect_violation DispatcherReap DispatcherReap.broken-fallback-reap NeverReapOnFallback
-expect_violation DispatcherReap DispatcherReap.broken-reap-live-session NeverReapLiveSession
-expect_violation DispatcherReap DispatcherReap.broken-label-dropped LabelOnlyDoorKept
-expect_violation JournalAppend JournalAppend.broken-interleave NoTornRow
-expect_violation JournalRotate JournalRotate.broken-unlocked NoLostRow
-expect_violation SupervisorRetire SupervisorRetire.broken-delete-on-failure PlistOnlyWhenGone
-expect_violation PeerContention PeerContention.broken-no-tiebreak AtMostOneHolder
-expect_violation ReservationBoard ReservationBoard.broken-truncated-grants NoGrantWithoutCompleteBoard
-expect_violation ReservationBoard ReservationBoard.broken-no-refresh AtMostOneHolder
-expect_violation MailQueue MailQueue.broken-double ExactlyOnce
-expect_violation MailQueue MailQueue.broken-memory-only NoLostSend
-expect_violation MailQueue MailQueue.broken-recorr SameCorr
-expect_violation ResultMail ResultMail.broken-dup-row OwnerNotifiedOnce
-expect_violation ResultMail ResultMail.broken-replay-land LandNotifiedOnce
-expect_violation ResultMail ResultMail.broken-green-mail NoMailOnGreen
-expect_violation CaptainWatch CaptainWatch.broken-drop EveryEventEmitted
-expect_violation CaptainWatch CaptainWatch.broken-exit-on-mail NoExitOnMail
-expect_violation CaptainWatch CaptainWatch.broken-oneshot-emits OneShotUnchanged
-expect_violation TrackerCas TrackerCas.broken-stale-splice NoClosedRowLost
-expect_violation EventsDedupe EventsDedupe.broken-ring-twice AtMostOnceRing
-
+for cfg in "$MODELS"/*.broken-*.cfg; do
+  [ -f "$cfg" ] || continue
+  name="$(basename "$cfg" .cfg)"
+  model="${name%%.*}"
+  invariant="$(head -1 "$cfg" | sed -n 's/^\\\* expect: //p')"
+  [ -n "$invariant" ] || die "$name has no first-line '\\* expect: <Invariant>'"
+  expect_violation "$model" "$name" "$invariant"
+done
 
 echo "verify-formal: trace conformance (recorded doorbell runs)"
-expect_conform DeferredQueue "$PWD/$(dirname "$MODELS")/traces/DeferredQueue.recorded.jsonl"
-expect_conform AssignBrief "$PWD/$(dirname "$MODELS")/traces/AssignBrief.recorded.jsonl"
-expect_nonconform AssignBrief "$PWD/$(dirname "$MODELS")/traces/AssignBrief.double-brief.jsonl" 20 "Brief"
-expect_nonconform DeferredQueue "$PWD/$(dirname "$MODELS")/traces/DeferredQueue.double-ring.jsonl" 20 "Ring"
-expect_conform MailQueue "$PWD/$(dirname "$MODELS")/traces/MailQueue.recorded.jsonl"
-expect_nonconform MailQueue "$PWD/$(dirname "$MODELS")/traces/MailQueue.double-delivery.jsonl" 20 "Double"
-expect_conform ResultMail "$PWD/$(dirname "$MODELS")/traces/ResultMail.recorded.jsonl"
-expect_conform CaptainWatch "$PWD/$(dirname "$MODELS")/traces/CaptainWatch.recorded.jsonl"
-expect_conform TrackerCas "$PWD/$(dirname "$MODELS")/traces/TrackerCas.recorded.jsonl"
-expect_nonconform TrackerCas "$PWD/$(dirname "$MODELS")/traces/TrackerCas.stale-splice.jsonl" 20 "CasOk"
-
-# Every model in the directory must be exercised: a new .tla that nobody added
-# an expectation for would otherwise pass silently as "not run".
-for model in "$MODELS"/*.tla; do
-  name="$(basename "$model" .tla)"
-  grep -q "expect_pass $name $name$" "$SELF" || die "model $name has no positive expectation"
+for trace in "$TRACES"/*.recorded.jsonl; do
+  [ -f "$trace" ] || continue
+  name="$(basename "$trace" .recorded.jsonl)"
+  expect_conform "$name" "$trace"
+done
+for trace in "$TRACES"/*.jsonl; do
+  [ -f "$trace" ] || continue
+  case "$(basename "$trace")" in
+    *.recorded.jsonl) continue ;;
+  esac
+  name="$(basename "$trace")"
+  model="${name%%.*}"
+  step="$(tail -1 "$trace" | jq -r '.action // empty' 2>/dev/null || true)"
+  [ -n "$step" ] || die "$name has no final action to name"
+  expect_nonconform "$model" "$trace" 20 "$step"
 done
 
 echo "verify-formal: ${passed} passed, ${failed} failed"

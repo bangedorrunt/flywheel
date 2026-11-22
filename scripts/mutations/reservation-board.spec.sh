@@ -13,7 +13,7 @@ mutation "B1  a grant no longer needs an empty board" \
     replace='[] OTHER                    -> v.status = "complete" /\ v.seen = {}'
 
 mutation "B2  the truncated-read violation is unregistered" \
-    file=scripts/verify-formal.sh \
+    file=.agents/skills/verify-protocol-tla/models/ReservationBoard.broken-truncated-grants.cfg \
     expect=proof_reservation_board_model_fences_the_grant \
-    find='expect_violation ReservationBoard ReservationBoard.broken-truncated-grants NoGrantWithoutCompleteBoard' \
-    replace='true  # mutation: the truncated-read violation is not checked'
+    find='\* expect: NoGrantWithoutCompleteBoard' \
+    replace='\* expect: AtMostOneHolder'
