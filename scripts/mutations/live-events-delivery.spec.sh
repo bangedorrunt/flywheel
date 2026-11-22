@@ -17,5 +17,5 @@ mutation "G1  the e2e runner drops the events-delivery witness" \
 mutation "G2  the live witness loses its ignore discipline" \
     file=tests/live_events_delivery.rs \
     expect=live_events_delivery_is_gated_and_every_test_is_ignored \
-    find=$'#[test]\n#[ignore = "gated live: FLYWHEEL_LIVE_E2E=1, bd-rrlo2 token mint, a throwaway rex session"]' \
-    replace=$'#[ignore = "gated live: FLYWHEEL_LIVE_E2E=1, bd-rrlo2 token mint, a throwaway rex session"]\n#[test]'
+    find=$'#[test]\n#[ignore = "gated live: FLYWHEEL_LIVE_E2E=1, run only via scripts/e2e-live-five.sh"]' \
+    replace=$'#[ignore = "gated live: FLYWHEEL_LIVE_E2E=1, run only via scripts/e2e-live-five.sh"]\n#[test]'
