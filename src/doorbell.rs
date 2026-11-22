@@ -4580,6 +4580,7 @@ mod tests {
         let msg = crate::doorbell_tick::DoorbellMsg::PlaneStatus {
             pin: "BlueRidge".into(),
             status: "idle".into(),
+            now_us: 1_700_000_000_000_000,
         };
         let actions = vec![crate::doorbell_tick::DoorbellAction::Prompt {
             pin: "BlueRidge".into(),

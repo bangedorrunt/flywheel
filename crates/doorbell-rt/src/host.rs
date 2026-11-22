@@ -311,6 +311,10 @@ impl CoreReducer {
             BrainMsg::PlaneStatus { pin, status } => DoorbellMsg::PlaneStatus {
                 pin: pin.clone(),
                 status: status.clone(),
+                now_us: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_micros() as u64)
+                    .unwrap_or_default(),
             },
             BrainMsg::Fact { summary } => DoorbellMsg::Fact {
                 summary: summary.clone(),
@@ -345,8 +349,10 @@ impl CoreReducer {
                 cursor_us: *cursor_us,
                 read_at_secs: *read_at_secs,
             },
-            BrainMsg::Sweep { .. }
-            | BrainMsg::RoleBound { .. }
+            BrainMsg::Sweep { now } => DoorbellMsg::Sweep {
+                now_us: now.saturating_mul(1_000_000),
+            },
+            BrainMsg::RoleBound { .. }
             | BrainMsg::Presence { .. }
             | BrainMsg::InboxFetched { .. }
             | BrainMsg::SlaFired { .. }

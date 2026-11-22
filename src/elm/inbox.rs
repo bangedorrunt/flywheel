@@ -494,6 +494,7 @@ mod tests {
         let edge = DoorbellMsg::PlaneStatus {
             pin: "EmeraldSparrow".into(),
             status: "idle".into(),
+            now_us: 1_700_000_000_000_000,
         };
         let (next, actions) = doorbell_core::tick(&model.dispatcher, &edge);
         let update = InboxProgram::update(&model, &InboxMsg::Edge(edge));
@@ -629,6 +630,7 @@ mod tests {
         let edge = DoorbellMsg::PlaneStatus {
             pin: "EmeraldSparrow".into(),
             status: "idle".into(),
+            now_us: 1_700_000_000_000_000,
         };
         let (next, commands) = InboxProgram::fold(&model, &edge);
         let inbox = InboxModel {
@@ -646,10 +648,12 @@ mod tests {
             InboxMsg::Edge(DoorbellMsg::PlaneStatus {
                 pin: "EmeraldSparrow".into(),
                 status: "working".into(),
+                now_us: 1_700_000_000_000_000,
             }),
             InboxMsg::Edge(DoorbellMsg::PlaneStatus {
                 pin: "EmeraldSparrow".into(),
                 status: "idle".into(),
+                now_us: 1_700_000_000_000_000,
             }),
         ];
         let first: Vec<_> = log

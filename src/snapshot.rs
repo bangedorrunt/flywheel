@@ -175,9 +175,10 @@ pub fn replay_msg(v: &serde_json::Value) -> Option<crate::workspace::Msg> {
             crate::doorbell_tick::DoorbellMsg::InboxRows { rows, pin } => {
                 Msg::InboxRows { rows, pin }
             }
-            crate::doorbell_tick::DoorbellMsg::PlaneStatus { pin, status } => {
+            crate::doorbell_tick::DoorbellMsg::PlaneStatus { pin, status, .. } => {
                 Msg::PlaneStatus { pin, status }
             }
+            crate::doorbell_tick::DoorbellMsg::Sweep { .. } => return None,
             crate::doorbell_tick::DoorbellMsg::PromptRefused {
                 pin,
                 line,

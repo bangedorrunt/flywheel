@@ -1686,9 +1686,10 @@ pub(crate) fn cmd_doorbell_why(
                 doorbell_tick::DoorbellMsg::InboxRows { rows, pin } => {
                     workspace::Msg::InboxRows { rows, pin }
                 }
-                doorbell_tick::DoorbellMsg::PlaneStatus { pin, status } => {
+                doorbell_tick::DoorbellMsg::PlaneStatus { pin, status, .. } => {
                     workspace::Msg::PlaneStatus { pin, status }
                 }
+                doorbell_tick::DoorbellMsg::Sweep { .. } => return Ok(()),
                 doorbell_tick::DoorbellMsg::PromptRefused {
                     pin,
                     line,

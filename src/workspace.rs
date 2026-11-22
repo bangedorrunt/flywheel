@@ -1939,6 +1939,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 crate::doorbell_tick::DoorbellMsg::PlaneStatus {
                     pin: pin.clone(),
                     status: status.clone(),
+                    now_us: crate::doorbell::now_micros(),
                 },
             );
             next.doorbell = dm;

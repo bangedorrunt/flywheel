@@ -1749,6 +1749,10 @@ impl Host for FileHost {
                     &doorbell_core::DoorbellMsg::PlaneStatus {
                         pin: pin.clone(),
                         status: status.clone(),
+                        now_us: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_micros() as u64)
+                            .unwrap_or_default(),
                     },
                 );
                 self.reducer.model = next;

@@ -940,7 +940,9 @@ pub fn queue_line(
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DoorbellMsg {
     /// Plane-S watch NDJSON line (`{kind,id,tags,content}`).
-    WatchNdjson { line: String },
+    WatchNdjson {
+        line: String,
+    },
     /// A mail.addressed hint from the toron events source, carrying the bus
     /// event id used as the shared dedupe key across wake.sock/events (U8).
     EventsHint {
@@ -949,16 +951,30 @@ pub enum DoorbellMsg {
         line: String,
     },
     /// The events source lost track: one digest wake, not a prompt storm.
-    EventsGap { pin: String },
+    EventsGap {
+        pin: String,
+    },
     /// Plane-P inbox rows for one pin (raw `fetch_inbox` JSON).
-    InboxItems { raw: String, pin: String },
+    InboxItems {
+        raw: String,
+        pin: String,
+    },
     /// Plane-P sweep path: rows already parsed (no serde round-trip).
     InboxRows {
         rows: Vec<serde_json::Value>,
         pin: String,
     },
     /// Hc status change for one pin.
-    PlaneStatus { pin: String, status: String },
+    PlaneStatus {
+        pin: String,
+        status: String,
+        /// Drain time supplied by the host, so a drain-time cursor read has a
+        /// stamp to be compared against (bd-ba4nl). No clock in the core.
+        now_us: u64,
+    },
+    Sweep {
+        now_us: u64,
+    },
     /// The pane refused a Prompt because it is mid-turn ("not at a prompt").
     /// bd-9mjla: a busy refusal is a typed DEFERRAL, not a delivery failure —
     /// the wake stays in the per-pin queue (one entry, coalesced) and rings
@@ -969,16 +985,22 @@ pub enum DoorbellMsg {
         event_id: Option<String>,
     },
     /// Captain-bound fact (no alias info here — honest FactMiss).
-    Fact { summary: String },
+    Fact {
+        summary: String,
+    },
     /// Periodic tick (60s cadence in the live dispatcher); drives the
     /// Ack-SLA scan effect.
-    AckSlaTick { now: u64 },
+    AckSlaTick {
+        now: u64,
+    },
     /// Re-fold of a parked mail line after its toron answer landed
     /// (bd-cursor-reask): identical to WatchNdjson except a stale or
     /// missing read DECIDES by max(host, toron) instead of parking again —
     /// the answer in hand is the freshest possible read, so a re-ask could
     /// never learn more. Never parked, never asked.
-    WatchDecideOnly { line: String },
+    WatchDecideOnly {
+        line: String,
+    },
     /// The toron pull-cursor read re-enters here (pipe pattern): the
     /// interpreter ran `toron inbox cursor` for the pin and answers with
     /// the committed cursor (None when toron could not answer). `read_at`
@@ -1043,6 +1065,17 @@ pub enum DoorbellAction {
 /// checkpoint log in toron-core. Serialization is a CAPABILITY here, not a
 /// behaviour change: every field is a plain map/set of primitives, so a
 /// round trip is exact. The reducer stays pure and untouched.
+/// A queue moved out of the normal slots at the idle edge, waiting for a
+/// toron READ taken at drain time (bd-ba4nl). `stamp_us` is the drain time.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Draining {
+    pub stamp_us: u64,
+    pub wakes: Vec<QueuedWake>,
+}
+
+/// How long a drain waits for the toron read before ringing toward delivery.
+pub const DRAIN_CURSOR_BOUND_US: u64 = 3_000_000;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DoorbellModel {
     /// Project this dispatcher belongs to; used to render the real pull door
@@ -1054,6 +1087,9 @@ pub struct DoorbellModel {
     /// Coalescing is by class, never silent: a merge bumps `count` and journals
     /// `merged`, and the ring names every class it carries (bd-0uzrq.8).
     pub queues: BTreeMap<String, Vec<QueuedWake>>,
+    /// Mail queues parked at the idle edge awaiting a fresh toron read.
+    #[serde(default)]
+    pub draining: BTreeMap<String, Draining>,
     /// Message ids already rung (or digested) for this dispatcher. The idle
     /// edge re-reads the inbox (bd-0uzrq.2), so the fold must know what it has
     /// already delivered or a still-unread row would ring on every transition.
@@ -1536,7 +1572,11 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 );
             }
         }
-        DoorbellMsg::PlaneStatus { pin, status } => {
+        DoorbellMsg::PlaneStatus {
+            pin,
+            status,
+            now_us,
+        } => {
             let from = next
                 .statuses
                 .get(pin)
@@ -1551,84 +1591,72 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                     .get_mut(pin)
                     .map(std::mem::take)
                     .unwrap_or_default();
-                // bd-ba4nl: re-check at drain time. A pin may have pulled its
-                // mail after the wake was queued; ringing now wakes an empty
-                // inbox. Non-mail urgent kinds have no created time and are
-                // never dropped here.
-                let mut deferred = Vec::new();
-                for wake in taken {
-                    if wake.created_us.is_some() && is_mail_wake(&wake.line) {
-                        let decided = wake.created_us.and_then(|us| {
-                            next_toron_cursor_consumed(
-                                &next,
-                                pin,
-                                us,
-                                (us / 1_000_000).max(0) as u64,
-                            )
-                        });
-                        match decided {
-                            Some(true) => {
-                                actions.push(DoorbellAction::Audit {
-                                    kind: "already-pulled".into(),
-                                    pin: pin.clone(),
-                                    detail: format!(
-                                        "drained mail at {:?} is at or below the toron read cursor",
-                                        wake.created_us
-                                    ),
-                                });
-                                continue;
-                            }
-                            None => {
-                                // No fresh toron read: fail toward delivery.
-                                actions.push(DoorbellAction::Audit {
-                                    kind: "toron-cursor-unavailable".into(),
-                                    pin: pin.clone(),
-                                    detail: "toron could not answer; ringing toward delivery"
-                                        .into(),
-                                });
-                            }
-                            Some(false) => {}
-                        }
+                // bd-ba4nl: a read taken when the mail ARRIVED is stale at the
+                // idle edge. Park the queue, ask toron for a READ NOW, and
+                // decide on that answer (or the sweep timeout).
+                if taken
+                    .iter()
+                    .any(|w| w.created_us.is_some() && is_mail_wake(&w.line))
+                {
+                    if next.cursor_inflight.insert(pin.clone()) {
+                        actions.push(DoorbellAction::ReadToronCursor { pin: pin.clone() });
                     }
-                    deferred.push(wake);
-                }
-                let total: u32 = deferred.iter().map(|w| w.count).sum();
-                if deferred.is_empty() {
-                    // bd-0uzrq.2: the pane is at a prompt and the queue knows
-                    // nothing. The wake may never have been queued (mail sent
-                    // while this dispatcher was down, or lost between the
-                    // journal append and the file rewrite), so the doorbell
-                    // asks for the inbox itself. Already-rung ids are refused
-                    // by the fold, so a re-read is free.
-                    actions.push(DoorbellAction::FetchInbox);
-                } else if deferred.iter().all(|w| w.kind == WakeKind::Notice) {
-                    // Machine notices never ring, even alone.
-                    actions.push(DoorbellAction::Audit {
-                        kind: "silent".into(),
-                        pin: pin.clone(),
-                        detail: format!("{total} system notice(s) dropped at prompt"),
-                    });
+                    next.draining.insert(
+                        pin.clone(),
+                        Draining {
+                            stamp_us: *now_us,
+                            wakes: taken,
+                        },
+                    );
                 } else {
-                    for w in &deferred {
-                        if !w.key.is_empty() {
-                            next.rung.insert(w.key.clone());
-                        }
+                    let deferred = taken;
+                    let total: u32 = deferred.iter().map(|w| w.count).sum();
+                    if deferred.is_empty() {
+                        actions.push(DoorbellAction::FetchInbox);
+                    } else if deferred.iter().all(|w| w.kind == WakeKind::Notice) {
+                        actions.push(DoorbellAction::Audit {
+                            kind: "silent".into(),
+                            pin: pin.clone(),
+                            detail: format!("{total} system notice(s) dropped at prompt"),
+                        });
+                    } else {
+                        ring_draining(&mut next, &mut actions, pin, deferred, None);
+                        actions.push(DoorbellAction::Audit {
+                            kind: "drained".into(),
+                            pin: pin.clone(),
+                            detail: format!("{total} deferred wake(s) at prompt"),
+                        });
                     }
-                    let ring = composed_ring(&deferred);
-                    actions.push(DoorbellAction::Audit {
-                        kind: "drained".into(),
-                        pin: pin.clone(),
-                        detail: format!("{total} deferred wake(s) at prompt: {ring}"),
-                    });
-                    let event_id = deferred.iter().find_map(|w| w.event_id.clone());
-                    actions.push(DoorbellAction::Prompt {
-                        pin: pin.clone(),
-                        line: ring,
-                        event_id,
-                    });
                 }
+            } else if status == "working"
+                && let Some(draining) = next.draining.remove(pin)
+            {
+                next.queues
+                    .entry(pin.clone())
+                    .or_default()
+                    .extend(draining.wakes);
             }
             next.statuses.insert(pin.clone(), status.clone());
+        }
+        DoorbellMsg::Sweep { now_us } => {
+            let pins: Vec<String> = next
+                .draining
+                .iter()
+                .filter(|(_, slot)| now_us.saturating_sub(slot.stamp_us) > DRAIN_CURSOR_BOUND_US)
+                .map(|(pin, _)| pin.clone())
+                .collect();
+            for pin in pins {
+                let Some(slot) = next.draining.remove(&pin) else {
+                    continue;
+                };
+                next.cursor_inflight.remove(&pin);
+                actions.push(DoorbellAction::Audit {
+                    kind: "toron-cursor-unavailable".into(),
+                    pin: pin.clone(),
+                    detail: "no drain-time toron read; ringing toward delivery".into(),
+                });
+                ring_draining(&mut next, &mut actions, &pin, slot.wakes, None);
+            }
         }
         DoorbellMsg::PromptRefused {
             pin,
@@ -1687,12 +1715,62 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 next = m;
                 actions.extend(a);
             }
+            // bd-ba4nl: decide a queue parked at the idle edge using THIS
+            // drain-time read, never the arrival-time one.
+            if let Some(slot) = next.draining.remove(pin)
+                && read_at_secs.saturating_mul(1_000_000) >= slot.stamp_us
+            {
+                next.cursor_inflight.remove(pin);
+                let mut deliverable = Vec::new();
+                for wake in slot.wakes {
+                    if wake
+                        .created_us
+                        .is_some_and(|us| cursor_us.is_some_and(|cursor| us <= cursor))
+                    {
+                        actions.push(DoorbellAction::Audit {
+                            kind: "already-pulled".into(),
+                            pin: pin.clone(),
+                            detail: format!(
+                                "drained mail at {:?} is at or below the drain-time toron read",
+                                wake.created_us
+                            ),
+                        });
+                    } else {
+                        deliverable.push(wake);
+                    }
+                }
+                ring_draining(&mut next, &mut actions, pin, deliverable, None);
+            }
         }
         DoorbellMsg::WatchDied => {
             actions.push(DoorbellAction::RestartWatch);
         }
     }
     (next, actions)
+}
+
+/// Ring one composed line for a set of dequeued wakes (bd-ba4nl).
+fn ring_draining(
+    next: &mut DoorbellModel,
+    actions: &mut Vec<DoorbellAction>,
+    pin: &str,
+    wakes: Vec<QueuedWake>,
+    event_id: Option<String>,
+) {
+    if wakes.is_empty() {
+        return;
+    }
+    for wake in &wakes {
+        if !wake.key.is_empty() {
+            next.rung.insert(wake.key.clone());
+        }
+    }
+    let line = composed_ring(&wakes);
+    actions.push(DoorbellAction::Prompt {
+        pin: pin.to_string(),
+        line,
+        event_id: event_id.or_else(|| wakes.iter().find_map(|w| w.event_id.clone())),
+    });
 }
 
 /// Idle/done panes get a Prompt now; blocked+act-now prompts while
@@ -2181,6 +2259,7 @@ mod tests {
             &DoorbellMsg::PlaneStatus {
                 pin: "BlueRidge".into(),
                 status: "idle".into(),
+                now_us: 1_700_000_000_000_000,
             },
         );
         model = next;
@@ -2270,13 +2349,29 @@ mod tests {
                 read_at_secs: 1,
             },
         );
-        let (_, drained) = tick(
+        let (parked, drained) = tick(
             &pulled,
             &DoorbellMsg::PlaneStatus {
                 pin: "BlueRidge".into(),
                 status: "idle".into(),
+                now_us: 1_700_000_000_000_000,
             },
         );
+        assert!(
+            drained
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::ReadToronCursor { .. })),
+            "the drain must ask for a READ NOW: {drained:?}"
+        );
+        let (_, answered) = tick(
+            &parked,
+            &DoorbellMsg::ToronCursor {
+                pin: "BlueRidge".into(),
+                cursor_us: Some(2_000_000),
+                read_at_secs: 1_700_000_000,
+            },
+        );
+        let drained = [drained, answered].concat();
         assert!(
             !drained
                 .iter()
@@ -2289,6 +2384,103 @@ mod tests {
                 DoorbellAction::Audit { kind, .. } if kind == "already-pulled"
             )),
             "the drain drop must be audited: {drained:?}"
+        );
+    }
+
+    #[test]
+    fn a_drain_time_read_drops_mail_pulled_after_arrival() {
+        let mut model = model_with("BlueRidge");
+        model.statuses.insert("BlueRidge".into(), "working".into());
+        let row = serde_json::json!({
+            "created_ts_us": 1_000_000_i64,
+            "importance": "normal",
+            "wake": "tasked",
+            "sender": "SlateHarbor",
+            "subject": "mail",
+            "body": "body",
+        });
+        let (queued, _) = tick(
+            &model,
+            &DoorbellMsg::InboxRows {
+                rows: vec![row],
+                pin: "BlueRidge".into(),
+            },
+        );
+        let (parked, at_drain) = tick(
+            &queued,
+            &DoorbellMsg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+                now_us: 1_700_000_000_000_000,
+            },
+        );
+        assert!(
+            at_drain
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::ReadToronCursor { .. })),
+            "drain must ask toron for a fresh read: {at_drain:?}"
+        );
+        let (_, answered) = tick(
+            &parked,
+            &DoorbellMsg::ToronCursor {
+                pin: "BlueRidge".into(),
+                cursor_us: Some(2_000_000),
+                read_at_secs: 1_700_000_000,
+            },
+        );
+        assert!(
+            !answered
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { .. })),
+            "a mail pulled after arrival must not ring: {answered:?}"
+        );
+        assert!(
+            answered.iter().any(|a| matches!(
+                a,
+                DoorbellAction::Audit { kind, .. } if kind == "already-pulled"
+            )),
+            "the drop must be audited: {answered:?}"
+        );
+    }
+
+    #[test]
+    fn a_drain_without_a_read_rings_after_the_bound() {
+        let mut model = model_with("BlueRidge");
+        model.statuses.insert("BlueRidge".into(), "working".into());
+        let row = serde_json::json!({
+            "created_ts_us": 1_000_000_i64,
+            "importance": "normal",
+            "wake": "tasked",
+            "sender": "SlateHarbor",
+            "subject": "mail",
+            "body": "body",
+        });
+        let (queued, _) = tick(
+            &model,
+            &DoorbellMsg::InboxRows {
+                rows: vec![row],
+                pin: "BlueRidge".into(),
+            },
+        );
+        let (parked, _) = tick(
+            &queued,
+            &DoorbellMsg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+                now_us: 1_700_000_000_000_000,
+            },
+        );
+        let (_, timed_out) = tick(
+            &parked,
+            &DoorbellMsg::Sweep {
+                now_us: 1_700_000_004_000_000,
+            },
+        );
+        assert!(
+            timed_out
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { .. })),
+            "no answer within the bound must ring toward delivery: {timed_out:?}"
         );
     }
 
@@ -2507,6 +2699,7 @@ mod tests {
             &DoorbellMsg::PlaneStatus {
                 pin: "BlueRidge".into(),
                 status: "idle".into(),
+                now_us: 1_700_000_000_000_000,
             },
         );
         assert_eq!(
@@ -2522,6 +2715,7 @@ mod tests {
             &DoorbellMsg::PlaneStatus {
                 pin: "BlueRidge".into(),
                 status: "idle".into(),
+                now_us: 1_700_000_000_000_000,
             },
         );
         assert_eq!(
@@ -2552,6 +2746,7 @@ mod tests {
             &DoorbellMsg::PlaneStatus {
                 pin: "BlueRidge".into(),
                 status: "idle".into(),
+                now_us: 1_700_000_000_000_000,
             },
         );
         assert_eq!(
@@ -2595,6 +2790,7 @@ mod tests {
             &DoorbellMsg::PlaneStatus {
                 pin: "BlueRidge".into(),
                 status: "idle".into(),
+                now_us: 1_700_000_000_000_000,
             },
         );
         assert!(
@@ -2780,6 +2976,7 @@ mod tests {
             &DoorbellMsg::PlaneStatus {
                 pin: "BlueRidge".into(),
                 status: "idle".into(),
+                now_us: 1_700_000_000_000_000,
             },
         );
         let rings: Vec<&DoorbellAction> = actions3
@@ -2817,6 +3014,7 @@ mod tests {
             &DoorbellMsg::PlaneStatus {
                 pin: "BlueRidge".into(),
                 status: "idle".into(),
+                now_us: 1_700_000_000_000_000,
             },
         );
         assert!(actions4.is_empty(), "terminal state emits nothing");
@@ -2865,6 +3063,7 @@ mod tests {
             &DoorbellMsg::PlaneStatus {
                 pin: "BlueRidge".into(),
                 status: "idle".into(),
+                now_us: 1_700_000_000_000_000,
             },
         );
         let ring = drained
@@ -2942,6 +3141,7 @@ mod tests {
             &DoorbellMsg::PlaneStatus {
                 pin: "BlueRidge".into(),
                 status: "idle".into(),
+                now_us: 1_700_000_000_000_000,
             },
         );
         let rings = drained
@@ -2991,6 +3191,7 @@ mod tests {
             &DoorbellMsg::PlaneStatus {
                 pin: "BlueRidge".into(),
                 status: "idle".into(),
+                now_us: 1_700_000_000_000_000,
             },
         );
         let rings: Vec<&String> = drained
@@ -3128,6 +3329,7 @@ mod tests {
             &DoorbellMsg::PlaneStatus {
                 pin: "BlueRidge".into(),
                 status: "idle".into(),
+                now_us: 1_700_000_000_000_000,
             },
         );
         assert!(
@@ -3279,6 +3481,7 @@ mod tests {
             &DoorbellMsg::PlaneStatus {
                 pin: "BlueRidge".into(),
                 status: "idle".into(),
+                now_us: 1_700_000_000_000_000,
             },
         );
         assert!(
@@ -3314,6 +3517,7 @@ mod tests {
             &DoorbellMsg::PlaneStatus {
                 pin: "BlueRidge".into(),
                 status: "idle".into(),
+                now_us: 1_700_000_000_000_000,
             },
         );
         assert!(
@@ -3366,6 +3570,7 @@ mod tests {
             &DoorbellMsg::PlaneStatus {
                 pin: "BlueRidge".into(),
                 status: "idle".into(),
+                now_us: 1_700_000_000_000_000,
             },
         );
         let ring = drained
@@ -3407,6 +3612,7 @@ mod tests {
             &DoorbellMsg::PlaneStatus {
                 pin: "BlueRidge".into(),
                 status: "idle".into(),
+                now_us: 1_700_000_000_000_000,
             },
         );
         assert!(
