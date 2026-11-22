@@ -1,0 +1,5 @@
+{"alerted":["cycle:A>B","wait:C>D:thread:t-old"],"alerts":["cycle:A>B","wait:C>D:thread:t-old"],"missed":[],"tick":0}
+{"action":"Sweep","alerted":["cycle:A>B","wait:C>D:thread:t-old"],"alerts":["cycle:A>B","wait:C>D:thread:t-old"],"missed":[],"tick":1}
+{"action":"Sweep","alerted":["cycle:A>B","wait:C>D:thread:t-old"],"alerts":["cycle:A>B","wait:C>D:thread:t-old"],"missed":[],"tick":2}
+{"action":"Sweep","alerted":["cycle:A>B","wait:C>D:thread:t-old"],"alerts":["cycle:A>B","wait:C>D:thread:t-old"],"missed":[],"tick":3}
+{"action":"FalseAlert","alerted":["cycle:A>B","wait:C>D:thread:t-old"],"alerts":["cycle:A>B","wait:C>D:thread:t-old"],"missed":[],"tick":3}

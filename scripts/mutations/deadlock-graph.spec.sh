@@ -40,3 +40,9 @@ mutation "D5  replies never satisfy" \
         *from == askee && Some(*id) != head && ask_ts.is_none_or(|hts| *ts > hts)
     });' \
     replace='    let answered = false;'
+
+mutation "D6  day-old waits still page" \
+    file=src/deadlock.rs \
+    expect=unknown_askers_count_as_waits_not_cycles \
+    find='    if now_us.saturating_sub(since_us) > MAX_WAIT_AGE_US {' \
+    replace='    if false {'

@@ -331,4 +331,128 @@ mod tests {
         let (new2, _) = unreported(&cycles, &[], &reported);
         assert!(new2.is_empty(), "already reported: {new2:?}");
     }
+
+    /// bd-v4dcv: the conformance trace is generated from a real run of the
+    /// kernel — the fixture graph through lease_edges/collab_edges, swept
+    /// with find_cycles and long_waits — and checked against DeadlockWatch.
+    /// With FLYWHEEL_EVERYSTATE set the test also runs the checker itself,
+    /// so a plain `cargo test` proves the trace end to end.
+    #[test]
+    fn conformance_trace_matches_the_model() {
+        let live: BTreeSet<String> = ["A", "B", "C", "D", "E", "F"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let mut edges = lease_edges(&[lease("A", "src/x.rs"), lease("B", "src/x.rs")]);
+        // now ~= 2.7h: C->D is hours old (pages), E->F is 30s old (quiet).
+        let now = 10_000_000_000i64;
+        for (asker, askee, thread, since) in [
+            ("C", "D", "t-old", 100),
+            ("E", "F", "t-young", now - 30_000_000),
+        ] {
+            if let Some(w) = qualify_wait(Some(asker.to_string()), askee, thread, since, &live, now)
+            {
+                edges.extend(collab_edges(&[w]));
+            }
+        }
+        let cycles = find_cycles(&edges);
+        assert_eq!(cycles, vec![vec!["A".to_string(), "B".to_string()]]);
+        let waits = long_waits(&edges, now, 60_000_000);
+        assert!(
+            waits.iter().any(|w| w.holder == "D"),
+            "the old wait pages: {waits:?}"
+        );
+        assert!(
+            waits.iter().all(|w| w.holder != "F"),
+            "the young wait stays silent: {waits:?}"
+        );
+        let mut alerted: Vec<String> = cycles.iter().map(|c| cycle_key(c)).collect();
+        alerted.extend(waits.iter().map(|w| wait_key(w)));
+        alerted.sort();
+        let line = |action: Option<&str>, tick: i64| {
+            let mut o = serde_json::json!({
+                "alerted": alerted,
+                "alerts": alerted,
+                "missed": [],
+                "tick": tick,
+            });
+            if let Some(action) = action {
+                o["action"] = serde_json::Value::String(action.to_string());
+            }
+            serde_json::to_string(&o).expect("trace line serializes")
+        };
+        let good = [
+            line(None, 0),
+            line(Some("Sweep"), 1),
+            line(Some("Sweep"), 2),
+            line(Some("Sweep"), 3),
+        ]
+        .join("\n")
+            + "\n";
+        let bad = good.clone() + &line(Some("FalseAlert"), 3) + "\n";
+        let out_path = |var: &str, fallback: &str| {
+            std::env::var(var)
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::env::temp_dir().join(fallback))
+        };
+        let good_path = out_path("CONFORM_TRACE_OUT", "dw-recorded.jsonl");
+        if std::env::var("CONFORM_TRACE_OUT").is_err()
+            && std::env::var("FLYWHEEL_EVERYSTATE").is_err()
+        {
+            let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(".agents/skills/verify-protocol-tla/traces/DeadlockWatch.recorded.jsonl");
+            assert_eq!(
+                std::fs::read_to_string(&fixture).expect("checked-in recorded trace"),
+                good,
+                "the recorded trace drifted from the real run; regenerate the fixture"
+            );
+        }
+        std::fs::write(&good_path, &good).expect("write trace");
+        let bad_path = out_path("CONFORM_BAD_TRACE_OUT", "dw-false-alert.jsonl");
+        if std::env::var("CONFORM_BAD_TRACE_OUT").is_err()
+            && std::env::var("FLYWHEEL_EVERYSTATE").is_err()
+        {
+            let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(".agents/skills/verify-protocol-tla/traces/DeadlockWatch.false-alert.jsonl");
+            assert_eq!(
+                std::fs::read_to_string(&fixture).expect("checked-in doctored trace"),
+                bad,
+                "the doctored trace drifted; regenerate the fixture"
+            );
+        }
+        std::fs::write(&bad_path, &bad).expect("write bad trace");
+        let Some(checker) = std::env::var("FLYWHEEL_EVERYSTATE").ok() else {
+            return;
+        };
+        let models = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".agents/skills/verify-protocol-tla/models");
+        let run = |trace: &std::path::Path| {
+            std::process::Command::new(&checker)
+                .arg("conform")
+                .arg("-trace")
+                .arg(trace)
+                .arg("-config")
+                .arg(models.join("DeadlockWatch.cfg"))
+                .arg(models.join("DeadlockWatch.tla"))
+                .output()
+                .expect("everystate conform")
+        };
+        let ok = run(&good_path);
+        assert!(
+            ok.status.success(),
+            "recorded trace must conform: {}",
+            String::from_utf8_lossy(&ok.stdout)
+        );
+        let bad_out = run(&bad_path);
+        assert_eq!(bad_out.status.code(), Some(20), "a false alert must fail");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&bad_out.stdout),
+            String::from_utf8_lossy(&bad_out.stderr)
+        );
+        assert!(
+            text.contains("FalseAlert"),
+            "the rejection names the step: {text}"
+        );
+    }
 }

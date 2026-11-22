@@ -341,7 +341,7 @@ pub(crate) enum WorkflowCmd {
     /// Check registered statecharts' topology: every state reachable, every reachable leaf can reach
     /// its goal. Guards count as enabled; no model checker runs. Optionally print topology-only TLA+.
     Verify {
-        /// Chart or workflow name: P2PNegotiation, Seat, Plan, LeaseWaitlist, Brief, ResultMail, CaptainWatch, or a catalog
+        /// Chart or workflow name: P2PNegotiation, Seat, Plan, LeaseWaitlist, Brief, ResultMail, CaptainWatch, DeadlockWatch, or a catalog
         /// workflow (wave-swarm is verified as the workflow now). Omit for all.
         name: Option<String>,
         /// Export compiled TLA+ specification for each verified chart.
@@ -2168,6 +2168,7 @@ fn project_workflow_names(root: &Path) -> BTreeSet<String> {
 fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> Result<()> {
     use crate::elm::brief_statechart::build_brief_machine;
     use crate::elm::captain_watch_statechart::build_captain_watch_machine;
+    use crate::elm::deadlock_watch_statechart::build_deadlock_watch_machine;
     use crate::elm::lease_dirty_statechart::build_dirty_lease_machine;
     use crate::elm::lease_waitlist_statechart::build_lease_waitlist_machine;
     use crate::elm::mail_queue_statechart::build_mail_queue_machine;
@@ -2226,6 +2227,27 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
             "a final state",
             is_final,
             export_tla.then(|| machine.to_tla_named("Brief")),
+            None,
+            &ChartFindings::default(),
+        )
+    }
+
+    fn verify_deadlock_watch(export_tla: bool) -> WorkflowVerifyChartReport {
+        use toron_core::kernel::StateNodeType;
+        let machine = build_deadlock_watch_machine();
+        let topology = machine.topology();
+        let is_final = |state: &_| {
+            topology
+                .nodes
+                .get(state)
+                .is_some_and(|node| node.node_type == StateNodeType::Final)
+        };
+        chart_report(
+            "DeadlockWatch",
+            &topology,
+            "a final state",
+            is_final,
+            export_tla.then(|| machine.to_tla_named("DeadlockWatch")),
             None,
             &ChartFindings::default(),
         )
@@ -2417,6 +2439,14 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
     {
         reports.push(verify_brief(export_tla));
     }
+    if want_all
+        || matches!(
+            want.as_str(),
+            "deadlockwatch" | "deadlock-watch" | "deadlock-watch-statechart"
+        )
+    {
+        reports.push(verify_deadlock_watch(export_tla));
+    }
     // Catalog workflows (ADR-0021 D5.2 slice A, bd-36zlq): one chart report
     // per lowered workflow from the layered catalog — builtins, then the
     // user tier, then the project tier — so a file-tier copy verifies as
@@ -2459,7 +2489,7 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
     }
     if reports.is_empty() {
         bail!(
-            "unknown statechart {} (expected P2PNegotiation, Seat, Plan, LeaseWaitlist, DirtyLease, Brief, ResultMail, CaptainWatch, or a workflow name)",
+            "unknown statechart {} (expected P2PNegotiation, Seat, Plan, LeaseWaitlist, DirtyLease, Brief, ResultMail, CaptainWatch, DeadlockWatch, or a workflow name)",
             name.unwrap_or("")
         );
     }

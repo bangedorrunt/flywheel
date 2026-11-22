@@ -17,6 +17,7 @@
 
 pub mod brief_statechart;
 pub mod captain_watch_statechart;
+pub mod deadlock_watch_statechart;
 pub mod inbox;
 pub mod leaf;
 pub mod lease_dirty_statechart;
