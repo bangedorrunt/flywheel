@@ -54,6 +54,7 @@ Commands:
   standing-orders    standing orders (ADR-0019 Spec 2): regen the GENERATED global file (~/.config/flywheel/standing-orders.md) from the registry + wave-1 criticals; project fences (<project>/.flywheel/standing-orders.md) are authored and preserved byte-identical
   work               Work-graph surfaces (bv/br pass-through)
   assign             Assign beads to agents via mail (toron default)
+  deadlock           Deadlock watch: page the captain once per wait-for cycle and once per wait older than the threshold (bd-v4dcv)
   mail               toron mail coordination surfaces
   setup-mcp          Auto-wire the toron MCP server into the agent MCP configs (opencode ~/.config/opencode/opencode.json, pi ~/.pi/agent/mcp.json, grok ~/.grok/config.toml). Idempotent — re-running only updates the toron entry, never clobbers other servers. (Moved here from the retired `flywheel toron` demo surface; same args and behavior.)
   collab             ask a peer a question over mail and wait for the in-thread reply (the real-time collab primitive: send urgent + block for the answer)
