@@ -29,6 +29,35 @@ use serde_json::{Value, json};
 /// Protocol version spoken by the client (toron's rmcp server prefers it).
 const PROTOCOL_VERSION: &str = "2026-07-28";
 
+/// Streamable HTTP allows BOTH a bare JSON document and an event stream
+/// (`data:` frames with optional `id:`/`retry:` lines and empty separator
+/// events). toron 1.7.2 answers `initialize` with SSE, so parsing only JSON
+/// makes every remote call fail before the handshake completes (bd-1o41y).
+fn parse_response(label: &str, method: &str, body: &str) -> Result<Value> {
+    let text = body.trim();
+    if text.starts_with('{') {
+        return serde_json::from_str(text)
+            .with_context(|| format!("{label} MCP {method}: non-JSON: {text}"));
+    }
+    for frame in body.split("\n\n") {
+        let data = frame
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if data.is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(&data)
+            .with_context(|| format!("{label} MCP {method}: SSE data is not JSON: {data}"))?;
+        if value.get("result").is_some() || value.get("error").is_some() {
+            return Ok(value);
+        }
+    }
+    bail!("{label} MCP {method}: no JSON or SSE result in response: {body}")
+}
+
 /// Which server a client targets. Drives error-string labels only — the wire
 /// envelope is identical across servers (ADR-0003 V1). Single variant since
 /// bd-euav (toron only); kept as an enum so error labels stay explicit.
@@ -281,9 +310,10 @@ impl McpClient {
                 resp.status()
             )));
         }
-        let value: Value = resp
-            .into_json()
-            .map_err(|e| McpError::Tool(anyhow::anyhow!("{label} MCP {method}: non-JSON: {e}")))?;
+        let body = resp
+            .into_string()
+            .map_err(|e| McpError::Transport(anyhow::anyhow!("{label} MCP {method}: {e}")))?;
+        let value = parse_response(label, method, &body).map_err(McpError::Tool)?;
 
         if let Some(err) = value.get("error") {
             let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
@@ -371,6 +401,49 @@ mod tests {
             body
         )
         .into_bytes()
+    }
+
+    fn sse_http(status_line: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn sse_data_frames_and_plain_json_are_both_parsed() {
+        let sse = "id: 1\nretry: 100\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-25\"}}\n\n";
+        let value = super::parse_response("toron", "initialize", sse).expect("SSE parsed");
+        assert_eq!(value["result"]["protocolVersion"], "2025-11-25");
+
+        let json = r#"{"jsonrpc":"2.0","id":2,"result":{"ok":true}}"#;
+        let value = super::parse_response("toron", "tools/call", json).expect("JSON parsed");
+        assert_eq!(value["result"]["ok"], true);
+    }
+
+    #[test]
+    fn remote_client_survives_an_sse_initialize() {
+        let base = serve_raw(|req| {
+            let req = String::from_utf8_lossy(req);
+            if req.contains("\"initialize\"") {
+                sse_http(
+                    "200 OK",
+                    "id: 1\nretry: 100\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{}}}\n\n",
+                )
+            } else {
+                http(
+                    "200 OK",
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"ok\":true}"}]}}"#,
+                )
+            }
+        });
+        let client = McpClient::new(&base, None, ServerKind::Toron).expect("client");
+        let out = client
+            .call_tool("health_check", json!({}))
+            .expect("SSE handshake then JSON tool result");
+        assert_eq!(out["ok"], true, "tool result parsed: {out}");
     }
 
     #[test]
