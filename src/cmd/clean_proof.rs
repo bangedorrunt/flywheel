@@ -960,7 +960,7 @@ fn a_failing_sibling_suite_fails_the_step_naming_it() {
     let mbx = bin.join("mbx");
     std::fs::write(
         &mbx,
-        "#!/bin/sh\nif [ \"$1\" = test ]; then echo 'test catalog_shapes ... FAILED'; exit 1; fi\nexit 0\n",
+        "#!/bin/sh\nif [ \"$1\" = test ]; then echo \"$*\" >> \"$ARGS_LOG\"; echo 'test catalog_shapes ... FAILED'; echo 'test tools_list_fresh ... FAILED'; exit 1; fi\nexit 0\n",
     )
     .unwrap();
     let mut perms = std::fs::metadata(&mbx).unwrap().permissions();
@@ -987,6 +987,7 @@ echo "FAILED=$FAILED_STEP"
     )
     .unwrap();
     let steps_log = tmp.join("steps.log");
+    let args_log = tmp.join("args.log");
 
     let out = Command::new("bash")
         .arg(&driver)
@@ -994,6 +995,7 @@ echo "FAILED=$FAILED_STEP"
         .arg(&mbx)
         .arg(&steps_log)
         .arg(&sourced)
+        .env("ARGS_LOG", &args_log)
         .output()
         .expect("run sibling_tests");
     assert!(
@@ -1008,7 +1010,17 @@ echo "FAILED=$FAILED_STEP"
     );
     assert!(
         log.contains("catalog_shapes"),
-        "sibling test failure carried: {log}"
+        "first sibling red carried: {log}"
+    );
+    assert!(
+        log.contains("tools_list_fresh"),
+        "every red sibling test is listed, not just the first: {log}"
+    );
+    assert!(
+        std::fs::read_to_string(&args_log)
+            .unwrap_or_default()
+            .contains("--no-fail-fast"),
+        "the sibling suite asks for all failures"
     );
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("FAILED=sibling-toron-tests"),

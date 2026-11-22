@@ -362,7 +362,8 @@ sibling_tests() { # reads sibling names on stdin
     [ -z "$FAILED_STEP" ] || break
     [ -f "$TMP/$sib_name/Cargo.toml" ] || continue
     run_step "sibling-$sib_name-tests" env "CARGO_TARGET_DIR=$TMP/$sib_name/test-target" \
-      "${MBX[@]}" test --manifest-path "$TMP/$sib_name/Cargo.toml" --workspace || true
+      "${MBX[@]}" test --manifest-path "$TMP/$sib_name/Cargo.toml" --workspace \
+      --no-fail-fast || true
   done
 }
 
