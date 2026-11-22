@@ -150,8 +150,14 @@ fn one_addressed_mail_reaches_pi_opencode_and_claude_through_events_not_doorbell
 
     // bd-rrlo2 guard: the spawn loop must have minted a 0600 per-pin token
     // before launch. No token means every seat is on the doorbell fallback.
+    let flywheel_state = std::env::var("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state")
+        })
+        .join("flywheel");
     for pin in &pins {
-        let token = state_dir
+        let token = flywheel_state
             .join("events-tokens")
             .join(format!("{project}-{pin}.token"));
         assert!(
