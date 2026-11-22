@@ -142,6 +142,17 @@ fn one_addressed_mail_reaches_pi_opencode_and_claude_through_events_not_doorbell
         .filter_map(|s| json_field(s, &["pin"]))
         .collect();
     assert_eq!(pins.len(), 3, "each seat must carry a pin");
+    // Claude has no MCP events door; only the pi/opencode seats get a per-pin
+    // token. Assert the mint guard on those seats, not on every harness.
+    let door_pins: Vec<String> = seats
+        .iter()
+        .filter(|s| {
+            json_field(s, &["harness"])
+                .is_some_and(|h| matches!(h.as_str(), "pi" | "opencode" | "omp"))
+        })
+        .filter_map(|s| json_field(s, &["pin"]))
+        .collect();
+    assert_eq!(door_pins.len(), 2, "pi and opencode must have events doors");
     let _cleanup = Cleanup {
         bin: bin.clone(),
         project: project.clone(),
@@ -156,7 +167,7 @@ fn one_addressed_mail_reaches_pi_opencode_and_claude_through_events_not_doorbell
             PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state")
         })
         .join("flywheel");
-    for pin in &pins {
+    for pin in &door_pins {
         let token = flywheel_state
             .join("events-tokens")
             .join(format!("{project}-{pin}.token"));
@@ -177,7 +188,7 @@ fn one_addressed_mail_reaches_pi_opencode_and_claude_through_events_not_doorbell
     }
 
     let doorbell_journal_dir = state_dir.join("doorbell").join("journals");
-    for (i, pin) in pins.iter().enumerate() {
+    for (i, pin) in door_pins.iter().enumerate() {
         let marker = format!("{tag}-{i}");
         let sent = run(&bin, &["send", &project, &marker, "--to", pin, "--raw"]);
         assert!(sent.status.success(), "send failed: {}", text(&sent));
