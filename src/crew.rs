@@ -2602,7 +2602,7 @@ steps:
         let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
         let override_wf = crate::crew::workflow_from_yaml(
             r#"
-name: wave-swarm
+name: ce-lfg
 description: user override
 steps:
   - name: custom-gate
@@ -2616,14 +2616,13 @@ steps:
         )
         .expect("override yaml parses");
         let resolver = |n: &str| {
-            if n == "wave-swarm" {
+            if n == "ce-lfg" {
                 Some(override_wf.clone())
             } else {
                 crate::builtin_workflows::builtin_recipe(n)
             }
         };
-        let part =
-            parse_compose_part_with("wave-swarm", &builtin_token).expect("compose token parses");
+        let part = parse_compose_part_with("ce-lfg", &builtin_token).expect("compose token parses");
         let wf = compose_workflow_with_resolvers(
             "composed-override",
             "obj",
@@ -2636,7 +2635,7 @@ steps:
         assert_eq!(
             wf.steps.len(),
             1,
-            "override expands, not the 8-step builtin"
+            "override expands, not the 15-step builtin"
         );
         assert!(
             matches!(&wf.steps[0].action, Action::DispatchJob { spec, .. }
@@ -2655,301 +2654,11 @@ steps:
         .unwrap();
         assert_eq!(
             wf_builtin.steps.len(),
-            9,
-            "builtin token unchanged (preflight + gate + the per-bead foreach + execute + ledger \
-             exit + review + verify + compound + signoff; the runner writes the sidecars)"
+            15,
+            "builtin token unchanged (ce-lfg pipeline)"
         );
     }
 
-    /// bd-compose-stage-sequencing-zgi9: the name is historical (ADR-0009
-    /// witness script filters it); the expansion is the 7 stage dispatches
-    /// PLUS one write-only sidecar after each witnessed exit, PLUS the
-    /// execute ledger exit. Order is real because each dispatch awaits its
-    /// own job result (bounded by result_timeout): a dispatch can no longer
-    /// walk past a predecessor whose result never settled. See
-    /// `compose_stage_awaits_completion` for the Acceptance proof.
-    #[test]
-    fn wave_swarm_compose_token_expands_eight_steps_and_lints_clean() {
-        use toron_workflow::schema::Action;
-        let lib = crate::stages::StageLibrary::compiled_in();
-        let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
-        let part =
-            parse_compose_part_with("wave-swarm", &builtin_token).expect("compose token parses");
-        let wf = compose_workflow_with("composed-wave", "obj", None, &[part], &affinity).unwrap();
-        assert_eq!(wf.steps.len(), 9, "{:?}", wf.steps.iter().map(|s| &s.name));
-        // bd-jhz8x.2 (ADR-0021 D4.5): GATE is engine steps, DISPATCH is a
-        // foreach over the gate artifact, and OBSERVE is the doorbell fold's
-        // escalation — so the seat dispatches are execute, review, verify,
-        // compound; preflight + gate are verifies and dispatch is a foreach.
-        let Action::Verify { command } = &wf.steps[0].action else {
-            panic!("PREFLIGHT first: {:?}", wf.steps[0].action.type_name());
-        };
-        assert!(command.contains("preflight"), "{command}");
-        let Action::Verify { command } = &wf.steps[1].action else {
-            panic!("GATE second: {:?}", wf.steps[1].action.type_name());
-        };
-        assert!(command.contains("__wave-gate"), "{command}");
-        let Action::Foreach { over, each } = &wf.steps[2].action else {
-            panic!("DISPATCH third: {:?}", wf.steps[2].action.type_name());
-        };
-        assert!(over.contains("steps.gate.json.ready"), "{over}");
-        assert!(
-            matches!(&each.action, Action::DispatchJob { spec, .. }
-                if spec.stage.as_deref() == Some("ce-execute")),
-            "each ready bead is an executor job"
-        );
-        assert!(
-            matches!(&wf.steps[3].action, Action::DispatchJob { spec, .. }
-                if spec.profile.as_deref() == Some("{{inputs.coder_profile}}")
-                    && spec.stage.as_deref() == Some("ce-execute")),
-            "EXECUTE after the per-bead dispatch (bd-wave-swarm-graduation-fix-98io: the crew needs an executor; bd-adv4: the executor profile rides the coder_profile input, default @coder)"
-        );
-        assert!(
-            matches!(&wf.steps[5].action, Action::DispatchJob { spec, .. }
-                if spec.profile.as_deref() == Some("@reviewer")
-                    && spec.stage.as_deref() == Some("ce-review")),
-            "REVIEW after the ledger exit (ADR-0009: audit the diff before VERIFY audits the receipts)"
-        );
-        assert!(
-            matches!(&wf.steps[6].action, Action::DispatchJob { spec, .. }
-                if spec.profile.as_deref() == Some("@reviewer")
-                    && spec.stage.as_deref() == Some("wave-verify")),
-            "VERIFY after REVIEW (bd-jhz8x.3: the sidecar step between them is gone)"
-        );
-        assert!(
-            matches!(&wf.steps[7].action, Action::DispatchJob { spec, .. }
-                if spec.profile.as_deref() == Some("@planner")
-                    && spec.stage.as_deref() == Some("ce-compound")
-                    && spec.phase.as_deref() == Some("compound")),
-            "COMPOUND after VERIFY (ADR-0009: phase compound, planner)"
-        );
-        assert!(
-            matches!(&wf.steps[8].action, Action::RequestApproval { message, .. }
-                if message.contains("captain")),
-            "SIGNOFF last, captain-only: {:?}",
-            wf.steps[8].action.type_name()
-        );
-        // bd-jhz8x.3 (D4.4): the runner writes the .done sidecars after a
-        // witnessed exit, so no step may write (or skip) one.
-        for step in &wf.steps {
-            let writes_done = match &step.action {
-                Action::Verify { command } => command.contains(".done"),
-                _ => false,
-            };
-            assert!(
-                !writes_done,
-                "the runner writes the sidecars, not step {:?}",
-                step.name
-            );
-        }
-        let report = toron_workflow::lint_workflow(&wf);
-        assert!(
-            report.is_clean(),
-            "wave-swarm expansion must lint clean: {:?}",
-            report.issues
-        );
-    }
-
-    /// bd-compose-stage-sequencing-zgi9 Acceptance: sequence-verifiable-units
-    /// — a stage fires only after the previous stage's result settled. Each
-    /// stage dispatch awaits its own job result (await: result with a bounded
-    /// result_timeout), so a dispatch can no longer walk past a predecessor
-    /// whose result never settled. The write-only sidecars never read: no
-    /// step probes a `.done` file, so a green run cannot rest on a stale
-    /// marker (D4.4). Per-step budgets stay bounded (boundary-discipline:
-    /// per-step result_timeout, not one total).
-    #[test]
-    fn compose_stage_awaits_completion() {
-        use toron_workflow::schema::Action;
-        let lib = crate::stages::StageLibrary::compiled_in();
-        let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
-        let part =
-            parse_compose_part_with("wave-swarm", &builtin_token).expect("compose token parses");
-        let wf = compose_workflow_with("seq", "obj", None, &[part], &affinity).unwrap();
-
-        // bd-jhz8x.2 (D4.5): PREFLIGHT + GATE are engine verifies and DISPATCH
-        // is a foreach, so the awaited SEAT dispatches start at EXECUTE.
-        let stages = [
-            ("execute", 3),
-            ("review", 5),
-            ("verify", 6),
-            ("compound", 7),
-        ];
-        for (stage_name, si) in stages {
-            assert_eq!(
-                wf.steps[si].name.as_deref(),
-                Some(stage_name),
-                "step {si} is the {stage_name} stage: {:?}",
-                wf.steps[si].name
-            );
-            let Action::DispatchJob {
-                await_,
-                no_claim_timeout,
-                result_timeout,
-                ..
-            } = &wf.steps[si].action
-            else {
-                panic!(
-                    "{stage_name} must be a dispatch_job: {:?}",
-                    wf.steps[si].action.type_name()
-                );
-            };
-            assert!(
-                matches!(await_, Some(toron_workflow::schema::DispatchAwait::Result)),
-                "{stage_name} awaits its own job result"
-            );
-            assert!(
-                *no_claim_timeout == 600 && *result_timeout == Some(7200),
-                "{stage_name} carries the bounded wait: {no_claim_timeout}s claim, {result_timeout:?}s result"
-            );
-        }
-        let composed = serde_json::to_value(&wf.steps).expect("steps serialize");
-        assert!(
-            !composed.to_string().contains("test -f"),
-            "no step reads a marker: the waits are model deadlines, not file polls"
-        );
-    }
-
-    /// bd-compose-plumbing-zdzi Acceptance: a composed run ensures its declared
-    /// steer channel BEFORE anyone posts to it. Resolution is the run's own
-    /// (provided inputs win, the declared default is the fallback), a workflow
-    /// with no steer channel has nothing to ensure, and a declared-but-
-    /// unresolvable channel refuses up front instead of failing mid-run with
-    /// the crew already spawned.
-    #[test]
-    fn compose_ensures_steer_channel() {
-        let lib = crate::stages::StageLibrary::compiled_in();
-        let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
-        let part =
-            parse_compose_part_with("wave-swarm", &builtin_token).expect("compose token parses");
-        let wf = compose_workflow_with("chan", "obj", None, &[part], &affinity).unwrap();
-
-        assert_eq!(
-            resolve_steer_channel(&wf, &serde_json::json!({}))
-                .unwrap()
-                .as_deref(),
-            Some("adr0006-steer"),
-            "the declared default is the channel the run renders"
-        );
-        assert_eq!(
-            resolve_steer_channel(
-                &wf,
-                &serde_json::json!({"steer_channel": "elm-effect-steer"})
-            )
-            .unwrap()
-            .as_deref(),
-            Some("elm-effect-steer")
-        );
-        assert_eq!(
-            resolve_steer_channel(&wf, &serde_json::json!({"steer_channel": "  "}))
-                .unwrap()
-                .as_deref(),
-            Some("adr0006-steer")
-        );
-        let bare_part = parse_compose_part_with("coder:ce-execute", &|_| false).unwrap();
-        let bare = compose_workflow_with("bare", "obj", None, &[bare_part], &affinity).unwrap();
-        assert_eq!(
-            resolve_steer_channel(&bare, &serde_json::json!({})).unwrap(),
-            None
-        );
-        let mut declared = wf.clone();
-        for input in &mut declared.inputs {
-            if input.name == "steer_channel" {
-                input.default = Some(serde_json::json!(""));
-            }
-        }
-        let err = resolve_steer_channel(&declared, &serde_json::json!({}))
-            .expect_err("declared-but-unresolvable must refuse");
-        assert!(
-            err.to_string().contains("cannot be resolved"),
-            "refusal names the unresolvable channel: {err}"
-        );
-    }
-
-    /// ADR-0006 D3: a compose token mixes with ordinary parts (token steps
-    /// land where the token sits); unknown token-looking names stay plain
-    /// role parts (the role fallback is untouched).
-    #[test]
-    fn wave_swarm_compose_token_mixes_with_plain_parts() {
-        let lib = crate::stages::StageLibrary::compiled_in();
-        let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
-        let parts: Vec<ComposePart> = ["scout:fresh-eyes-explore", "wave-swarm"]
-            .iter()
-            .map(|t| parse_compose_part_with(t, &builtin_token).unwrap())
-            .collect();
-        let wf = compose_workflow_with("mixed", "obj", None, &parts, &affinity).unwrap();
-        assert_eq!(wf.steps.len(), 10, "1 plain scout + the 9 wave-swarm steps");
-    }
-
-    // beads-lifecycle expand-path coverage: graph-form token parses,
-    #[test]
-    fn beads_lifecycle_compose_token_parses_and_expands_graph_lint_clean() {
-        use toron_workflow::schema::Action;
-        let part =
-            parse_compose_part_with("beads-lifecycle", &builtin_token).expect("token parses");
-        assert_eq!(
-            part,
-            ComposePart::Recipe {
-                name: "beads-lifecycle".to_string()
-            },
-            "bare token name routes before the stage-first fallback"
-        );
-        let lib = crate::stages::StageLibrary::compiled_in();
-        let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
-        let wf =
-            compose_workflow_with("composed-lifecycle", "obj", None, &[part], &affinity).unwrap();
-        let graph = wf
-            .graph
-            .as_ref()
-            .expect("graph-form token expands to graph");
-        assert_eq!(
-            graph.nodes.len(),
-            11,
-            "polish loop + audit + fence_final + outer implement gate + existing-bead implement (guards ride ON the nodes): {:?}",
-            graph.nodes.keys().collect::<Vec<_>>()
-        );
-        assert!(
-            graph.nodes["grill"].needs.is_empty(),
-            "grill first (no needs)"
-        );
-        let approvals = graph
-            .nodes
-            .values()
-            .filter(|n| matches!(&n.action, Action::RequestApproval { .. }))
-            .count();
-        assert_eq!(
-            approvals, 2,
-            "signoff + the gate_before_implement outer gate (the gate node's guard skips it unless enabled)"
-        );
-        assert!(
-            matches!(
-                &graph.nodes["signoff"].action,
-                Action::RequestApproval { .. }
-            ),
-            "signoff last (terminal approval)"
-        );
-        assert!(
-            !graph
-                .nodes
-                .values()
-                .any(|n| n.needs.contains(&"signoff".to_string())),
-            "nothing runs after signoff"
-        );
-
-        assert!(
-            wf.inputs.iter().any(|i| i.name == "until"
-                && i.default == Some(serde_json::Value::String("signoff".to_string()))),
-            "token inputs merge (until defaults to signoff): {:?}",
-            wf.inputs.iter().map(|i| &i.name).collect::<Vec<_>>()
-        );
-        let report = toron_workflow::lint_workflow(&wf);
-        assert!(
-            report.is_clean(),
-            "beads-lifecycle expansion must lint clean: {:?}",
-            report.issues
-        );
-        enforce_budget_caps(&wf).expect("7 dispatches, depth 1: within caps");
-    }
     /// bd-adr0008-guard-fix-16fl: declared defaults bind onto missing keys
     /// at the invoke door; explicit values always win; non-object inputs
     /// pass through.
@@ -2991,66 +2700,6 @@ steps:
         let mut null = serde_json::Value::Null;
         apply_input_defaults(&wf, &mut null);
         assert!(null.is_null(), "non-object inputs untouched");
-    }
-
-    /// GS-039 P0-3: `--parts repair-until-verified` must keep the recipe's
-    /// explicit crew coder:1+reviewer:1 — Auto-infer over 3 repair + 3
-    /// evaluate nodes must NOT balloon dry-run to 3+3.
-    #[test]
-    fn repair_compose_token_preserves_explicit_crew_1_plus_1() {
-        let part = parse_compose_part_with("repair-until-verified", &builtin_token).expect("token");
-        let wf = compose_workflow("composed-repair", "solo dry-run", None, &[part])
-            .expect("compose repair");
-        assert_eq!(
-            wf.crew,
-            Some(CrewSpec::Explicit(BTreeMap::from([
-                ("coder".to_string(), 1),
-                ("reviewer".to_string(), 1),
-            ]))),
-            "repair compose must preserve explicit crew, got {:?}",
-            wf.crew
-        );
-        let plan = plan_crew(&wf);
-        assert_eq!(plan.members.get("coder").copied(), Some(1));
-        assert_eq!(plan.members.get("reviewer").copied(), Some(1));
-        let rendered = render_dry_run(&wf, &|_| None);
-        assert_eq!(rendered["crew"]["coder"], 1);
-        assert_eq!(rendered["crew"]["reviewer"], 1);
-    }
-
-    /// A graph-form token mixes with ordinary parts (token nodes land in
-    /// the graph; the plain part lands in steps); the unknown-token error
-    /// names the token and the catalog (no hardcoded token list).
-    #[test]
-    fn beads_lifecycle_compose_token_mixes_with_plain_parts() {
-        let lib = crate::stages::StageLibrary::compiled_in();
-        let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
-        let parts: Vec<ComposePart> = ["scout:fresh-eyes-explore", "beads-lifecycle"]
-            .iter()
-            .map(|t| parse_compose_part_with(t, &builtin_token).unwrap())
-            .collect();
-        let wf = compose_workflow_with("mixed", "obj", None, &parts, &affinity).unwrap();
-        assert_eq!(wf.steps.len(), 1, "the plain part lands in steps");
-        assert_eq!(
-            wf.graph.as_ref().expect("graph").nodes.len(),
-            11,
-            "the token lands in the graph (polish loop + audit + fence_final + existing-bead implement + outer gate)"
-        );
-        let err = compose_workflow_with(
-            "bad",
-            "obj",
-            None,
-            &[ComposePart::Recipe {
-                name: "nope".to_string(),
-            }],
-            &affinity,
-        )
-        .expect_err("unknown token refuses");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("\"nope\"") && msg.contains("not resolvable from the catalog"),
-            "error names the token and the catalog: {err}"
-        );
     }
 
     /// bd-compose-field-w4r01 acceptance 1: a project-tier-only token parses

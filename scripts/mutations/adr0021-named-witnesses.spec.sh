@@ -12,6 +12,7 @@ TEST_FILTER=(
     workflow_lowering_approval_without_timeout_fails
     stage_contract_judge_arms_without_arms_fails
     ce_lfg_no_marker_reads
+    graph_dispatch_missing_witness_fails_at_result_timeout
     durable_body_witness_fail_goes_to_on_error
     durable_body_witness_missing_report_fails
 )
@@ -88,6 +89,27 @@ mutation "J1  judge-arms stops declaring its arms read" \
 
 # X1 — A3: the graph node's own deadline is dropped, so a coder that never
 # writes a witness waits forever instead of failing at result_timeout.
+mutation "X1  a graph dispatch's await loses its deadline" \
+    file=src/durable_body.rs \
+    expect=graph_dispatch_missing_witness_fails_at_result_timeout \
+    find='                    let (deadline, claimed) = match run.model().node_state.get(&node) {
+                        Some(toron_workflow::engine::durable::NodeState::AwaitingJob {
+                            claim_deadline_ms,
+                            result_deadline_ms,
+                            claimed,
+                            ..
+                        }) => {
+                            if *claimed {
+                                (*result_deadline_ms, true)
+                            } else {
+                                (*claim_deadline_ms, false)
+                            }
+                        }
+                        _ => (None, false),
+                    };' \
+    replace='                    let (deadline, claimed) = (None, false);'
+
+# W1 — D4.2: a failing witness settles instead of failing through on_error.
 mutation "W1  a failing witness settles as success" \
     file=src/durable_body.rs \
     expect=durable_body_witness_fail_goes_to_on_error \

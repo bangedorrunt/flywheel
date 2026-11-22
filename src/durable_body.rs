@@ -1661,27 +1661,18 @@ mod tests {
         let _ = std::fs::remove_file(&db);
     }
 
-    fn wave_swarm_workflow() -> toron_workflow::schema::Workflow {
-        crate::builtin_workflows::builtin_workflows()["ce-lfg"].clone()
-    }
-
-    fn wave_swarm_trigger() -> serde_json::Value {
-        serde_json::json!({"inputs": {
-            "objective": "prove the wave ends on witnesses",
-            "wave_label": "wave-1",
-            "steer_channel": "adr0006-steer",
-            "data_shape": "",
-            "direct": false,
-            "track": true,
-            "wave": true,
-            "polish": false,
-            "captain_pin": "",
-            "coder_profile": "@coder",
-        }})
-    }
-
-    fn wave_swarm_seams(watcher: JobWatcher) -> BodySeams {
-        BodySeams {
+    /// ADR-0021 acceptance #3 (bd-ihiqo.5 port): a graph dispatch whose job
+    /// never claims fails typed at the claim deadline. The inline graph
+    /// exercises the graph WatchJob arm; the frozen clock proves milliseconds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graph_dispatch_missing_witness_fails_at_result_timeout() {
+        let (store, db) = watch_test_store("graph-timeout").await;
+        let wf = toron_workflow::schema::parse_workflow(
+            "name: graph-watch-timeout\ngraph:\n  nodes:\n    j:\n      action: dispatch_job\n      assignee: x\n      await: result\n      no_claim_timeout: 1\n      result_timeout: 60\n      spec: { task: hi }\n",
+        )
+        .expect("parse graph dispatch await");
+        let (watcher, _queue) = queue_watcher(vec![]);
+        let seams = BodySeams {
             leaf: LeafSeams {
                 async_runner: Some(receipt_runner()),
                 sync_runner: None,
@@ -1690,130 +1681,41 @@ mod tests {
             },
             launcher: None,
             job_watcher: Some(watcher),
-            // Compiled-in seed catalog, not the operator's user tier: the
-            // test pins the shipped witnesses, not ambient config.
-            witness: Some(crate::stages::StageLibrary::compiled_in().witness_checker()),
+            witness: None,
             sidecar_root: None,
             clock: frozen_clock(),
             spawn_resolver: None,
             resolve_child: None,
-        }
-    }
-
-    /// The production seam: an async runner owns every leaf, and the verify
-    /// result arrives as the invocation's `provider_result` (the effect_runner
-    /// maps it back). The gate's `json` is what DISPATCH consumes.
-    fn verify_runner(gate: serde_json::Value) -> toron_workflow::engine::AsyncEffectRunner {
-        use toron_workflow::schema::Action;
-        Arc::new(move |inv: &toron_workflow::engine::ActionInvocation| {
-            let value = match &inv.action {
-                Action::Verify { command } if command.contains("__wave-gate") => gate.clone(),
-                Action::Verify { .. } => serde_json::json!({"ok": true, "exit": 0, "json": null}),
-                _ => serde_json::json!({"ok": true, "job_id": "job-1", "published": true}),
-            };
-            Box::pin(async move { Ok(value) })
-                as std::pin::Pin<
-                    Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
-                >
-        })
-    }
-
-    /// ADR-0021 acceptance #3: a coder that never writes a witness fails
-    /// with a typed error naming the step that dispatched it. The watcher
-    /// never settles; the frozen clock proves milliseconds.
-    ///
-    /// bd-jhz8x.5: this is the wave-level witness for the graph model's
-    /// awaiting-job state — it was ignored from the day the hole was found
-    /// until the graph model watched jobs, and it must never be ignored again.
-    /// bd-ihiqo.5: wave-swarm deleted in 38→10 merge; fixture gone (uses
-    /// ce-lfg now, but ce-lfg has no await steps for this harness). Ignored
-    /// pending a ce-lfg-based witness harness; durable timeout behavior is
-    /// covered by graph_child_call deadline assertions.
-    #[ignore]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn wave_swarm_missing_witness_fails_at_result_timeout() {
-        let (store, db) = watch_test_store("wave-timeout").await;
-        // The wave shape is the shipped one; only the per-bead claim bound is
-        // shortened, because the clock is frozen and the real timer is what the
-        // test would otherwise wait out (600s).
-        let mut wf = wave_swarm_workflow();
-        // ce-lfg adds a polish loop that graph lowering cannot sequence; this
-        // test is about dispatch-job deadline witnessing, so drop loop steps.
-        wf.steps
-            .retain(|step| !matches!(step.action, toron_workflow::schema::Action::Loop { .. }));
-        for step in &mut wf.steps {
-            if let toron_workflow::schema::Action::Foreach { each, .. } = &mut step.action
-                && let toron_workflow::schema::Action::DispatchJob {
-                    no_claim_timeout, ..
-                } = &mut each.action
-            {
-                *no_claim_timeout = 1;
+        };
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            drive(
+                &store,
+                "graph-timeout-1",
+                &wf,
+                serde_json::json!({}),
+                &seams,
+            ),
+        )
+        .await
+        .expect("an unclaimed graph dispatch must fail fast");
+        // A graph node's typed failure lands in the node's output, not as a
+        // top-level BodyOutcome::Failed; the deadline still names the wait.
+        let text = match outcome {
+            BodyOutcome::Failed { error, step } => {
+                assert_eq!(step.as_deref(), Some("j"));
+                error
             }
-        }
-        let (watcher, _queue) = queue_watcher(vec![]);
-        let mut seams = wave_swarm_seams(watcher);
-        seams.leaf.async_runner = Some(verify_runner(serde_json::json!({
-            "ok": true,
-            "exit": 0,
-            "json": {
-                "held": false,
-                "blockers": [],
-                "in_flight": [],
-                "ready": [{"id": "bd-a", "title": "t", "verify": "true", "priority": 1}],
-            },
-        })));
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            drive(&store, "wave-timeout-1", &wf, wave_swarm_trigger(), &seams),
-        )
-        .await
-        .expect("an unsettled wave must fail fast");
-        let BodyOutcome::Failed { error, step } = outcome else {
-            panic!("a witness-less wave never succeeds: {outcome:?}");
+            BodyOutcome::Completed(value) => {
+                let node = value.get("j").expect("the dispatching node is named");
+                assert_eq!(node["ok"], serde_json::json!(false));
+                node["error"].as_str().expect("typed error").to_string()
+            }
         };
         assert!(
-            error.contains("no claim") || error.contains("timed out"),
-            "typed timeout names the wait: {error}"
+            text.contains("no claim") || text.contains("timed out"),
+            "typed timeout names the wait: {text}"
         );
-        assert!(
-            step.as_deref().is_some_and(|s| s.contains("dispatch")),
-            "the step that dispatched is named: {step:?}"
-        );
-        let _ = std::fs::remove_file(&db);
-    }
-
-    /// A held gate is a FAILING verify now (D4.5: GATE is an engine step, not
-    /// a seat), so the run stops naming the gate step and never dispatches a
-    /// bead — held is a typed failure, never silent success.
-    /// bd-ihiqo.5: wave-swarm deleted in 38→10 merge; ignored pending a
-    /// ce-lfg-based harness (same rationale as above).
-    #[ignore]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn wave_swarm_held_gate_fails_at_the_gate_step() {
-        let (store, db) = watch_test_store("wave-held").await;
-        let wf = wave_swarm_workflow();
-        let (watcher, _queue) = queue_watcher(vec![]);
-        let mut seams = wave_swarm_seams(watcher);
-        seams.leaf.async_runner = Some(verify_runner(serde_json::json!({
-            "ok": false,
-            "exit": 1,
-            "error": "[gate] held: wave-0 still open",
-            "json": null,
-        })));
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            drive(&store, "wave-held-1", &wf, wave_swarm_trigger(), &seams),
-        )
-        .await
-        .expect("a held gate must fail fast");
-        let BodyOutcome::Failed { error, step } = outcome else {
-            panic!("a held gate never succeeds: {outcome:?}");
-        };
-        assert!(
-            error.contains("gate"),
-            "refusal names the gate step: {error}"
-        );
-        assert_eq!(step.as_deref(), Some("gate"));
         let _ = std::fs::remove_file(&db);
     }
 

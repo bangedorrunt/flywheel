@@ -104,6 +104,8 @@ steps:
         "ce-lfg",
         r#"
 name: ce-lfg
+compose: true
+shape: pipeline
 description: "The go pipeline: ideate → plan (gated unless direct) → track (unless direct) → implement (single build or wave dispatch) → review → verify → ship. Replaces goal, goal-direct, ship, the phase-* chain, plan-direct, ce-plan(+review), beads, beads-lifecycle, wave-swarm and feature."
 trigger:
   type: webhook

@@ -3082,15 +3082,15 @@ mod workflow_cli_lint_tests {
     #[test]
     fn workflow_lowering_verify_row_reports_bounded_warnings() {
         let wfs = builtin_workflows::builtin_workflows();
-        let wf = wfs.get("wave-swarm").expect("wave-swarm cataloged");
+        let wf = wfs.get("ce-lfg").expect("ce-lfg cataloged");
         let report = verify_catalog_workflow(
-            "wave-swarm",
+            "ce-lfg",
             wf,
             "builtin",
             &crate::stages::StageLibrary::compiled_in(),
             false,
         );
-        assert!(report.ok, "wave-swarm row stays ok: {:?}", report.errors);
+        assert!(report.ok, "ce-lfg row stays ok: {:?}", report.errors);
         assert!(report.errors.is_empty());
         assert!(
             report.warnings.is_empty(),
