@@ -338,9 +338,11 @@ concurrent = false
 tests = [
   "src/plan_fence.rs::coverage_shrink_names_every_dropped_requirement",
   "src/plan_fence.rs::the_coverage_fence_seeds_once_and_never_shrinks",
+  "src/builtin_workflows.rs::ce_lfg_polish_requires_coverage",
 ]
 mutations = [
   "scripts/mutations/coverage-fence.spec.sh#C1",
+  "scripts/mutations/coverage-fence.spec.sh#W1",
 ]
 
 [[behavior]]

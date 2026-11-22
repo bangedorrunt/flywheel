@@ -4524,18 +4524,13 @@ mod acceptance6_audit_binding {
     /// preferred over the author's own.
     #[test]
     fn acceptance6_lifecycle_audit_binds_a_non_author_and_another_family() {
-        let token = |name: &str| {
-            crate::workflow_catalog::builtin_meta(name)
-                .compose
-                .unwrap_or(false)
-        };
-        let part = super::parse_compose_part_with("beads-lifecycle", &token).expect("token parses");
-        let lib = crate::stages::StageLibrary::compiled_in();
-        let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
-        let wf = super::compose_workflow_with("composed-life", "obj", None, &[part], &affinity)
-            .expect("lifecycle expands");
-        let graph = wf.graph.as_ref().expect("graph-form token");
-        let audit = graph.nodes.get("audit").expect("audit node");
+        let wfs = crate::builtin_workflows::builtin_workflows();
+        let wf = &wfs["ce-lfg"];
+        let audit = wf
+            .steps
+            .iter()
+            .find(|s| s.name.as_deref() == Some("audit"))
+            .expect("audit step");
         let Action::DispatchJob { spec, .. } = &audit.action else {
             panic!("audit is a dispatch_job: {:?}", audit.action.type_name());
         };

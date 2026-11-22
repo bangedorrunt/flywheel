@@ -112,6 +112,8 @@ inputs:
   - name: objective
   - name: data_shape
     default: ""
+  - name: captain_pin
+    default: ""
   - name: direct
     default: false
   - name: track
@@ -155,7 +157,7 @@ steps:
   - name: polish
     action: loop
     max: 3
-    until: steps_polish_ok == true
+    until: steps_polish_ok == true && steps_coverage_ok == true
     on_error: fail_run
     body:
       - name: polish-round
@@ -166,6 +168,20 @@ steps:
           stage: "plan-polish"
           task: 'Polish round for {{inputs.objective}}.'
         on_error: fail_run
+      - name: coverage
+        action: verify
+        command: 'flywheel __plan-fence coverage'
+        on_error: continue
+  - name: audit
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@reviewer"
+      stage: "plan-polish"
+      context: fresh
+      plan: "{{steps.plan}}"
+      task: 'AUDIT MODE for {{inputs.objective}}: read-only, do NOT edit beads, return findings JSON only.'
+    on_error: fail_run
   - name: gate
     action: request_approval
     message: "Approve plan for {{inputs.objective}}?"
@@ -190,6 +206,10 @@ steps:
         stage: "ce-execute"
         task: 'Wave bead {{item}} for {{inputs.objective}}: claim, build with TDD, commit with the bead id, verify and close.'
       on_error: fail_run
+  - name: execute-exit
+    action: verify
+    command: 'IDS=$(br list --all --json | jq -r ''.issues[] | select(.status != "closed") | .id''); if [ -n "$IDS" ]; then echo "execute exit refused: wave still open: $IDS"; exit 1; fi; MEMBERS=$(br list --all --json | jq -r ''.issues[] | select((.labels // [] | index("wave-2")) or .wave == 2) | .id''); if [ -z "$MEMBERS" ]; then echo "wave matched zero beads"; exit 1; fi; for id in $MEMBERS; do flywheel ship check $id || exit 1; done'
+    on_error: fail_run
   - name: implement
     action: dispatch_job
     assignee: x
@@ -919,6 +939,52 @@ mod tests {
         }
     }
 
+    /// ce-lfg polish loop requires coverage (ported W1 invariant).
+    #[test]
+    fn ce_lfg_polish_requires_coverage() {
+        let yaml = BUILTIN_WORKFLOWS_YAML
+            .iter()
+            .find(|(n, _)| *n == "ce-lfg")
+            .map(|(_, y)| *y)
+            .unwrap();
+        assert!(
+            yaml.contains("steps_coverage_ok"),
+            "polish until must require coverage"
+        );
+        assert!(
+            yaml.contains("- name: coverage"),
+            "polish loop must have a coverage step"
+        );
+    }
+
+    /// ce-lfg wave exit refuses while open (ported E3 invariant).
+    #[test]
+    fn ce_lfg_wave_exit_refuses_while_open() {
+        let yaml = BUILTIN_WORKFLOWS_YAML
+            .iter()
+            .find(|(n, _)| *n == "ce-lfg")
+            .map(|(_, y)| *y)
+            .unwrap();
+        assert!(
+            yaml.contains("execute exit refused"),
+            "wave exit must refuse while open"
+        );
+        assert!(
+            yaml.contains("- name: execute-exit"),
+            "wave path must have an execute-exit step"
+        );
+    }
+
+    /// ce-lfg carries no .done marker reads (ported M1 invariant).
+    #[test]
+    fn ce_lfg_no_marker_reads() {
+        let wfs = builtin_workflows();
+        let wf = &wfs["ce-lfg"];
+        let json = serde_json::to_value(&wf.steps).expect("steps serialize");
+        let text = json.to_string();
+        assert!(!text.contains("test -f"), "no step reads a marker: {text}");
+    }
+
     /// The periodic digest is host-native (`awareness::tick`): paying an agent
     /// every 15 minutes to re-read local state is the cost this removes. The
     /// catalog entry stays as the ON-DEMAND narrative, so it must not carry a
@@ -1190,8 +1256,8 @@ graph:
     /// The br fake prints fixture JSON and honors --all versus the default
     /// exclude-closed; the flywheel fake passes or fails `ship check` per
     /// id. The rendered command runs via sh -c.
-    #[allow(dead_code)]
-    fn wave_swarm_execute_exit_runs_against_ledger_notest() {
+    #[test]
+    fn wave_swarm_execute_exit_runs_against_ledger() {
         use std::os::unix::fs::PermissionsExt;
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1215,7 +1281,7 @@ graph:
         );
         exe(
             "br",
-            "#!/bin/sh\nif [ \"$1\" = \"list\" ]; then\n  all=0\n  for a in \"$@\"; do [ \"$a\" = \"--all\" ] && all=1; done\n  jq --argjson all \"$all\" '[.issues[] | select($all == 1 or .status != \"closed\") | del(.wave)] | {issues: .}' \"$BR_FIXTURE\"\n  exit $?\nfi\nif [ \"$1\" = \"show\" ]; then\n  shift\n  ids=\"\"\n  for a in \"$@\"; do case \"$a\" in --*) ;; *) ids=\"$ids,\\\"$a\\\"\";; esac; done\n  jq --argjson ids \"[${ids#,}]\" '[(if type == \"object\" then .issues else . end)[] | select(.id as $id | $ids | index($id))]' \"$BR_FIXTURE_ROWS\"\n  exit $?\nfi\necho \"fake br: unknown op $1\" >&2\nexit 2\n",
+            "#!/bin/sh\nif [ \"$1\" = \"list\" ]; then\n  all=0\n  for a in \"$@\"; do [ \"$a\" = \"--all\" ] && all=1; done\n  jq --argjson all \"$all\" '[.issues[] | select($all == 1 or .status != \"closed\")] | {issues: .}' \"$BR_FIXTURE\"\n  exit $?\nfi\nif [ \"$1\" = \"show\" ]; then\n  shift\n  ids=\"\"\n  for a in \"$@\"; do case \"$a\" in --*) ;; *) ids=\"$ids,\\\"$a\\\"\";; esac; done\n  jq --argjson ids \"[${ids#,}]\" '[(if type == \"object\" then .issues else . end)[] | select(.id as $id | $ids | index($id))]' \"$BR_FIXTURE_ROWS\"\n  exit $?\nfi\necho \"fake br: unknown op $1\" >&2\nexit 2\n",
         );
         exe(
             "flywheel",
@@ -1232,11 +1298,11 @@ graph:
                 std::env::var("PATH").unwrap_or_default()
             );
             let wfs = builtin_workflows();
-            let wave = &wfs["wave-swarm"];
+            let wave = &wfs["ce-lfg"];
             let exit = wave
                 .steps
                 .iter()
-                .find(|s| s.name.as_deref() == Some("execute_exit"))
+                .find(|s| s.name.as_deref() == Some("execute-exit"))
                 .expect("execute_exit");
             let command = match &exit.action {
                 toron_workflow::schema::Action::Verify { command } => {
@@ -1289,7 +1355,11 @@ graph:
             ]}"#,
             "",
         );
-        assert!(!out.status.success(), "an open bead fails the exit");
+        assert!(
+            !out.status.success(),
+            "an open bead fails the exit: {}",
+            text_of(&out)
+        );
         assert!(
             text_of(&out).contains("bd-b"),
             "the open bead is named: {}",
